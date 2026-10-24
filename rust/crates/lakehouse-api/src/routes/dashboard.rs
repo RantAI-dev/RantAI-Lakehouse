@@ -3471,7 +3471,9 @@ pub(crate) async fn build_chart_file(
     )
     .await
     .map_err(|err| {
-        ApiError::Unprocessable(crate::policy_engine::enforcement_error_message(&err).to_owned())
+        ApiError::Unprocessable(
+            crate::routes::support::enforcement_message_for(&statement, &err).to_owned(),
+        )
     })?;
     let mut stream = state
         .clickhouse

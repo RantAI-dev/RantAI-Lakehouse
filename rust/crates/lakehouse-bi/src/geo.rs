@@ -56,6 +56,41 @@ pub const MIN_TOLERANCE: f64 = 0.000_01;
 /// Last tolerance tried, in degrees (about five kilometres).
 pub const MAX_TOLERANCE: f64 = 0.05;
 
+/// An uploaded map as the formula compiler sees it (`BI-16` part C3): enough
+/// to resolve the map a `RegionOf` call names, nothing of its boundaries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpatialMap {
+    /// `m_` and 12 lower-case hex digits, made by the server.
+    pub id: String,
+    /// The label people know the map by.
+    pub name: String,
+    /// Whether the engine holds the map's region lookup (its polygon
+    /// dictionary was created and loaded). A map without one cannot be used by
+    /// `RegionOf`; the compiler says so.
+    pub region_lookup: bool,
+}
+
+/// Whether `id` has the shape the server makes (`m_` and 12 lower-case hex
+/// digits), so it is safe to build an identifier from.
+#[must_use]
+pub fn is_map_id(id: &str) -> bool {
+    id.strip_prefix("m_").is_some_and(|rest| {
+        rest.len() == 12
+            && rest
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
+/// The engine name of a map's polygon dictionary, or `None` for anything that
+/// is not a server-made map id. This is the one place an identifier is built
+/// from a map id; the id is checked by [`is_map_id`] first, so no text of a
+/// formula or a request can reach a statement through it.
+#[must_use]
+pub fn dictionary_name(id: &str) -> Option<String> {
+    is_map_id(id).then(|| format!("console.geo_dict_{id}"))
+}
+
 /// A longitude/latitude pair; extra members (altitude) are read and dropped.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct Position([f64; 2]);

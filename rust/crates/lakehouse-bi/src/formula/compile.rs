@@ -732,6 +732,10 @@ impl Cx<'_> {
         if info.name == "Fixed" {
             return self.fixed(node, nodes);
         }
+        // BI-16 part C3: the spatial functions read a literal (a unit, a map).
+        if info.category == "spatial" {
+            return self.spatial(info.name, node, nodes);
+        }
         let mut args = Vec::with_capacity(nodes.len());
         for n in nodes {
             args.push(self.node(n)?);
@@ -761,6 +765,99 @@ impl Cx<'_> {
             (sql, ty, level)
         };
         Ok(Typed { sql, ty, level })
+    }
+}
+
+impl Cx<'_> {
+    /// `Distance` and `RegionOf` (`BI-16` part C3, plan D7). Both are row-level.
+    ///
+    /// `Distance(lat1, lon1, lat2, lon2[, unit])` is the engine's
+    /// `geoDistance(lon1, lat1, lon2, lat2)` (metres on WGS 84), divided by
+    /// 1000 for `'km'`. `RegionOf(map, lat, lon)` is a lookup in the map's
+    /// polygon dictionary: the map is a literal resolved here, against the
+    /// maps the context carries, to a server-made id, and the dictionary name
+    /// is built only from that id ([`crate::geo::dictionary_name`]), never from
+    /// the text of the formula.
+    fn spatial(&mut self, name: &str, call: &Node, nodes: &[Node]) -> Result<Typed, FormulaError> {
+        let numeric = |cx: &mut Self, n: &Node| -> Result<Typed, FormulaError> {
+            let t = cx.node(n)?;
+            want(&t, n, FType::Number)?;
+            Ok(t)
+        };
+        if name == "Distance" {
+            let unit = match nodes.get(4) {
+                Some(n) => unit_of(n, &["m", "km"])?,
+                None => "m",
+            };
+            let (lat1, lon1) = (numeric(self, &nodes[0])?, numeric(self, &nodes[1])?);
+            let (lat2, lon2) = (numeric(self, &nodes[2])?, numeric(self, &nodes[3])?);
+            let level = join_levels(&[
+                (&lat1, &nodes[0]),
+                (&lon1, &nodes[1]),
+                (&lat2, &nodes[2]),
+                (&lon2, &nodes[3]),
+            ])?;
+            let metres = format!(
+                "geoDistance(toFloat64({}), toFloat64({}), toFloat64({}), toFloat64({}))",
+                lon1.sql, lat1.sql, lon2.sql, lat2.sql
+            );
+            let sql = if unit == "km" {
+                format!("({metres} / 1000)")
+            } else {
+                metres
+            };
+            return Ok(Typed {
+                sql,
+                ty: FType::Number,
+                level,
+            });
+        }
+        if name != "RegionOf" {
+            return Err(unsupported(call));
+        }
+        let Kind::Str(wanted) = &nodes[0].kind else {
+            return Err(err(
+                &nodes[0],
+                "write the map as text: its name or its id, for example RegionOf('Sales regions', lat, lon).",
+            ));
+        };
+        let wanted = wanted.trim();
+        let maps = self.scope.time.maps();
+        let found = maps
+            .iter()
+            .find(|m| m.id == wanted)
+            .or_else(|| maps.iter().find(|m| m.name.eq_ignore_ascii_case(wanted)));
+        let Some(map) = found else {
+            return Err(err(
+                &nodes[0],
+                format!(
+                    "there is no map called '{}'; use the name of an uploaded map (Admin > Maps).",
+                    clip(wanted)
+                ),
+            ));
+        };
+        let dictionary = crate::geo::dictionary_name(&map.id)
+            .filter(|_| map.region_lookup)
+            .ok_or_else(|| {
+                err(
+                    &nodes[0],
+                    format!(
+                        "RegionOf is not available for the map '{}': its region lookup could not be set up on the data engine. Upload the map again, or ask an administrator.",
+                        clip(&map.name)
+                    ),
+                )
+            })?;
+        let (lat, lon) = (numeric(self, &nodes[1])?, numeric(self, &nodes[2])?);
+        let level = join_levels(&[(&lat, &nodes[1]), (&lon, &nodes[2])])?;
+        let sql = format!(
+            "dictGetOrDefault('{dictionary}', 'name', (toFloat64({}), toFloat64({})), '')",
+            lon.sql, lat.sql
+        );
+        Ok(Typed {
+            sql,
+            ty: FType::Text,
+            level,
+        })
     }
 }
 
@@ -1213,14 +1310,127 @@ mod tests {
         .collect()
     }
 
+    fn sample_maps() -> Vec<crate::geo::SpatialMap> {
+        let map = |id: &str, name: &str, ready: bool| crate::geo::SpatialMap {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            region_lookup: ready,
+        };
+        vec![
+            map("m_0123456789ab", "Sales regions", true),
+            map("m_ba9876543210", "Old map", false),
+            map("m_aaaaaaaaaaaa", "a) OR 1=1 --", true),
+        ]
+    }
+
     fn run(formula: &str) -> Result<Compiled, FormulaError> {
         let cols = sample_columns();
-        let time = TimeContext::default();
+        let time = TimeContext::default().with_maps(sample_maps());
         compile(formula, &Scope::new(&cols, &time), None)
     }
 
     fn ok(formula: &str) -> Compiled {
         run(formula).unwrap_or_else(|e| panic!("{formula}: {e}"))
+    }
+
+    /// `BI-16` part C3 (plan D7): `Distance` is the engine's `geoDistance` in
+    /// metres, divided for km, over four numbers.
+    #[test]
+    fn distance_is_geodistance_in_metres_or_km() {
+        assert_eq!(
+            ok("Distance(amount, qty, -6.9, 107.6)").sql,
+            "geoDistance(toFloat64(qty), toFloat64(amount), toFloat64(107.6), toFloat64((-6.9)))"
+        );
+        assert_eq!(
+            ok("Distance(1, 2, 3, 4, 'm')").sql,
+            ok("Distance(1, 2, 3, 4)").sql
+        );
+        assert!(ok("Distance(1, 2, 3, 4, 'KM')").sql.ends_with(" / 1000)"));
+        assert_eq!(ok("Distance(amount, qty, 1, 2)").level, Level::Row);
+        assert!(
+            run("Distance(1, 2, 3, 4, 'mile')")
+                .unwrap_err()
+                .message
+                .contains("not a unit")
+        );
+        assert!(
+            run("Distance(label, qty, 1, 2)")
+                .unwrap_err()
+                .message
+                .contains("expected a number")
+        );
+        assert!(
+            run("Distance(1, 2, 3)")
+                .unwrap_err()
+                .message
+                .contains("takes 4 to 5")
+        );
+        assert!(run("Sum(Distance(amount, qty, 1, 2))").is_ok());
+    }
+
+    /// `RegionOf` resolves its map literal against the uploaded maps, and the
+    /// dictionary name is built from the server-made id alone.
+    #[test]
+    fn region_of_names_the_dictionary_of_the_map_it_resolves() {
+        let by_name = ok("RegionOf('sales REGIONS', amount, qty)");
+        assert_eq!(
+            by_name.sql,
+            "dictGetOrDefault('console.geo_dict_m_0123456789ab', 'name', (toFloat64(qty), toFloat64(amount)), '')"
+        );
+        assert_eq!(by_name.ty, FType::Text);
+        assert_eq!(
+            ok("RegionOf('m_0123456789ab', amount, qty)").sql,
+            by_name.sql
+        );
+        // A map named like an injection is found by that name and still only its id reaches the statement.
+        let odd = ok("RegionOf('a) OR 1=1 --', 1, 2)");
+        assert!(
+            odd.sql
+                .starts_with("dictGetOrDefault('console.geo_dict_m_aaaaaaaaaaaa', "),
+            "{}",
+            odd.sql
+        );
+        assert!(!odd.sql.contains("OR 1=1"));
+    }
+
+    #[test]
+    fn region_of_refuses_an_unknown_a_not_ready_and_a_computed_map() {
+        assert!(
+            run("RegionOf('Nowhere', 1, 2)")
+                .unwrap_err()
+                .message
+                .contains("no map called 'Nowhere'")
+        );
+        let not_ready = run("RegionOf('Old map', 1, 2)").unwrap_err();
+        assert!(
+            not_ready
+                .message
+                .contains("RegionOf is not available for the map 'Old map'"),
+            "{}",
+            not_ready.message
+        );
+        assert!(
+            run("RegionOf(label, 1, 2)")
+                .unwrap_err()
+                .message
+                .contains("write the map as text")
+        );
+        assert!(
+            run("RegionOf('Sales regions', label, 2)")
+                .unwrap_err()
+                .message
+                .contains("expected a number")
+        );
+        // With no maps at all (a context nobody filled) nothing resolves.
+        let cols = sample_columns();
+        let none = TimeContext::default();
+        let e = compile(
+            "RegionOf('Sales regions', 1, 2)",
+            &Scope::new(&cols, &none),
+            None,
+        )
+        .unwrap_err();
+        assert!(e.message.contains("no map called"));
     }
 
     fn err_at(formula: &str) -> FormulaError {

@@ -50,6 +50,7 @@ they fall in. There is no way to add a chart type of one's own.
 
 - Uploaded borders are drawn simplified; very fine borders lose detail on screen, but `RegionOf` uses the full borders.
 - 1,000 bars per Gantt chart.
+- **`RegionOf` is not available to a role that has a data policy** (a mask or a row filter anywhere): the data engine's policy check refuses every dictionary lookup of such a role, because it cannot see where a dictionary reads from, and the role is told so in a sentence that names `RegionOf`. Signed by the owner, 2026-10-24 (option B); a narrow exemption for the console's own map dictionaries is a follow-up for the security team. `Distance` has no such limit.
 - Country maps are first-level regions only (states, provinces); finer levels need an uploaded file, as Indonesia's regencies are today.
 
 ## Asking the assistant

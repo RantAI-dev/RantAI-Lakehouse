@@ -122,6 +122,15 @@ The feature page's table, plus these build decisions.
   LIFETIME(0)` (exact DDL per the must-verify below), and drops it on
   delete. The spatial join is then a calculated field grouped or filtered
   like any column.
+- **D8a RegionOf and data policies (signed by the owner, 2026-10-24).** The
+  policy rewrite refuses every `dictGet*` call of a caller who has any
+  authored obligation (`sql_rewrite::DictOrJoinFunctionDenied`), because a
+  dictionary's source cannot be seen from the query text. **Signed by the
+  owner, 2026-10-24: C3 `RegionOf` option B** (works for callers without
+  obligations; a caller with a data policy gets a clear English refusal naming
+  `RegionOf`); the narrow exemption for the server-made `console.geo_dict_*`
+  dictionaries (option A) is a backlog follow-up for the security team. No
+  change to `sql_rewrite.rs` or `policy_engine.rs` in this part.
 
 ### C4 Custom charts (only after the owner's yes)
 
