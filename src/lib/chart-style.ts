@@ -90,6 +90,8 @@ export type StyleFields = {
   tooltip?: { fields: string[] }
   conditional?: CondRule[]
   clusters?: ClusterSetting
+  /** `gantt` (BI-16 part C1, plan section 7): `false` hides the line at today; absent means shown. T1 validates it. */
+  todayLine?: boolean
 }
 
 /** Limits the server enforces; the builder uses them to stop early. */

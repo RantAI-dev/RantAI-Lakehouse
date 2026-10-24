@@ -301,7 +301,7 @@ function GanttBody({
 }) {
   const reporting = useReporting();
   const drawn = ganttOption({
-    rows: cell.rows, dark, timeZone: reporting.timeZone, reversedRows: cell.reversedRows,
+    rows: cell.rows, dark, timeZone: reporting.timeZone, reversedRows: cell.reversedRows, todayLine: def?.todayLine,
     colors: resolvePalette(def?.colors, reporting.companyPalette),
   });
   if ("message" in drawn) {

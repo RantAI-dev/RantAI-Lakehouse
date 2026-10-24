@@ -367,6 +367,13 @@ export function FormatSection({ rules, style, onChange, valueNames, seriesNames,
           ) : null}
         </Group>
       ) : null}
+      {rules.todayLine ? (
+        <Group title="Today line">
+          <span className="flex items-center gap-2 text-xs">
+            <Switch size="sm" checked={style.todayLine !== false} onCheckedChange={(c) => set({ todayLine: c === true ? undefined : false })} aria-label="Today line" /> Show a line at today
+          </span>
+        </Group>
+      ) : null}
       {rules.labels ? (
         <Group title="Labels">
           <span className="flex items-center gap-2 text-xs">

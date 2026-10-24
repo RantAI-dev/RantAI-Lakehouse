@@ -28,6 +28,8 @@ export type FormatRules = {
   referenceLines: boolean
   /** `BI-17` part B: colour points by cluster (scatter and bubble only). */
   clusters: boolean
+  /** `BI-16` part C1: the Gantt chart's line at today can be switched off. */
+  todayLine: boolean
 }
 
 export type FormatState = { kind: string; breakdown: boolean; measures: number }
@@ -57,6 +59,7 @@ export function formatRules(s: FormatState): FormatRules {
     conditional: ["table", "pivot", "kpi"].includes(s.kind),
     referenceLines: LINE_KINDS.includes(s.kind),
     clusters: CLUSTER_KINDS.includes(s.kind),
+    todayLine: s.kind === "gantt",
   }
 }
 
@@ -74,6 +77,7 @@ export function styleFromDef(def: StyleFields | undefined): StyleFields {
   if (def.tooltip) out.tooltip = { fields: [...def.tooltip.fields] }
   if (def.conditional) out.conditional = def.conditional.map((r) => ({ ...r, rule: { ...r.rule } }))
   if (def.clusters) out.clusters = { ...def.clusters }
+  if (def.todayLine === false) out.todayLine = false
   return out
 }
 
@@ -172,6 +176,8 @@ export function stylePayload(style: StyleFields, rules: FormatRules): StyleField
   if (rules.clusters && (k === "auto" || (Number.isInteger(k) && (k as number) >= MIN_CLUSTERS && (k as number) <= MAX_CLUSTERS))) {
     out.clusters = { k: k as "auto" | number }
   }
+  // Only the switched-off line is stored: absent is the default, shown.
+  if (rules.todayLine && style.todayLine === false) out.todayLine = false
   if (rules.conditional) {
     const rows = (style.conditional ?? []).flatMap((r) => { const c = cleanRule(r); return c ? [c] : [] })
     if (rows.length) out.conditional = rows

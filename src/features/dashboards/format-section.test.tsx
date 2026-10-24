@@ -1,7 +1,7 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock } from "bun:test"
 import type { CondRule, StyleFields, ValueFormat } from "@/lib/chart-style"
-import { formatRules } from "@/lib/style-draft"
+import { formatRules, styleFromDef, stylePayload } from "@/lib/style-draft"
 import { ConditionalEditor, FormatSection, ValueFormatEditor } from "./format-section"
 
 afterEach(cleanup)
@@ -142,5 +142,31 @@ describe("Clusters (BI-17 part B)", () => {
   it("is not offered on a chart kind that cannot cluster", () => {
     render(section({}, () => {}, formatRules({ kind: "bar", breakdown: false, measures: 1 })))
     expect(screen.queryByRole("switch", { name: "Colour points by cluster" })).toBeNull()
+  })
+})
+
+describe("FormatSection Gantt today line (BI-16 part C1)", () => {
+  const gantt = formatRules({ kind: "gantt", breakdown: false, measures: 0 })
+
+  it("is on by default, switches off as todayLine false, and back on by dropping the field", () => {
+    const onChange = mock<(s: StyleFields) => void>(() => {})
+    const { rerender } = render(<FormatSection rules={gantt} style={{}} onChange={onChange} valueNames={[]} seriesNames={[]} paletteValue="default" />)
+    const sw = screen.getByRole("switch", { name: "Today line" })
+    expect(sw.getAttribute("aria-checked")).toBe("true")
+    fireEvent.click(sw)
+    expect(onChange.mock.calls[0]![0].todayLine).toBe(false)
+    rerender(<FormatSection rules={gantt} style={{ todayLine: false }} onChange={onChange} valueNames={[]} seriesNames={[]} paletteValue="default" />)
+    expect(screen.getByRole("switch", { name: "Today line" }).getAttribute("aria-checked")).toBe("false")
+    fireEvent.click(screen.getByRole("switch", { name: "Today line" }))
+    expect(onChange.mock.calls[1]![0].todayLine).toBeUndefined()
+  })
+
+  it("is offered on a Gantt chart only, and is sent only when off", () => {
+    render(<FormatSection rules={formatRules({ kind: "bar", breakdown: false, measures: 1 })} style={{}} onChange={() => {}} valueNames={["v"]} seriesNames={[]} paletteValue="default" />)
+    expect(screen.queryByRole("switch", { name: "Today line" })).toBeNull()
+    expect(stylePayload({ todayLine: false }, gantt)).toEqual({ todayLine: false })
+    expect(stylePayload({ todayLine: true }, gantt)).toEqual({})
+    expect(stylePayload({ todayLine: false }, formatRules({ kind: "bar", breakdown: false, measures: 1 }))).toEqual({})
+    expect(styleFromDef({ todayLine: false })).toEqual({ todayLine: false })
   })
 })

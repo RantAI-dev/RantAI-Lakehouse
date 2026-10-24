@@ -92,6 +92,8 @@ export type GanttInput = {
   now?: number;
   /** Rows the server left out because their end is before their start (`reversedRows` on the result). */
   reversedRows?: number;
+  /** `false` (the chart's `todayLine` style field) leaves the line out; absent draws it. */
+  todayLine?: boolean;
 };
 
 export type GanttDrawn =
@@ -178,7 +180,7 @@ export function ganttOption(i: GanttInput): GanttDrawn {
   const lo = Math.min(...shown.map((b) => b.start));
   const hi = Math.max(...shown.map((b) => b.end));
   const today = wallClockMs(i.now ?? Date.now(), i.timeZone);
-  const todayDrawn = today >= lo && today <= hi;
+  const todayDrawn = i.todayLine !== false && today >= lo && today <= hi;
 
   const series: EChartsOption["series"] = (grouped ? groups : [""]).map((g): CustomSeriesOption => {
     const color = colorOf(g);

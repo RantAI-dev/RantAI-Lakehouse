@@ -78,6 +78,12 @@ describe("ganttOption", () => {
     expect(seriesOf(outside).some((s) => s.markLine)).toBe(false)
   })
 
+  it("leaves the line at today out when the chart's todayLine is false", () => {
+    const rows = [row("A", null, "2026-03-01", "2026-03-20")]
+    expect(drawn(ganttOption({ rows, dark: false, timeZone: "UTC", now: NOW, todayLine: false })).todayDrawn).toBe(false)
+    expect(drawn(ganttOption({ rows, dark: false, timeZone: "UTC", now: NOW, todayLine: true })).todayDrawn).toBe(true)
+  })
+
   it("shades the bar by its progress and leaves a bar without progress solid", () => {
     const api = (progress: number | string) => ({
       value: (dim: number) => [0, 0, 100, progress as number][dim],
