@@ -45,9 +45,10 @@ table (`routes/catalog_governance.rs:206`).
 
 ## Asking the assistant
 
-Not an assistant feature. The chat's tools go through the same gate. The one change in the assistant's files is a
-single line in `routes/ai/tools/mod.rs`, so that the chat's saved-query list knows who asks (owner's exception,
-2026-10-23, while #204 holds that file). The AI team reviews that line.
+Not an assistant feature. The chat's tools go through the same gate. The only changes in the assistant's files are
+the two dispatch lines in `routes/ai/tools/mod.rs` (the chat's `save_query` and `list_saved_queries`), so that the
+chat's saved-query tools know who asks (owner's exception, 2026-10-23 for the one line, extended to both on
+2026-10-24, while #204 holds that file). The AI team reviews those lines.
 
 ## Decisions
 
