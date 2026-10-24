@@ -476,11 +476,34 @@ async fn maintenance(ch: &ChClient) -> Result<Value, GovError> {
     Ok(json!({ "maintenance": runs }))
 }
 
+/// The `table_name` value `bronze_meta.maintenance_run` (and
+/// `bronze_meta.maintenance_verb_run`) record for a table a caller
+/// addresses as `{ns}/{table}`.
+///
+/// Every writer records the catalog's own two-part name, never the bare
+/// one: the Bronze maintenance job (`dagster/dispar_orchestrate/
+/// maintenance.py::_run_maintenance_for_table`, fed `bronze.<table>` by
+/// `discover_bronze_tables`), `gold_export.py` (`gold.<mart>`) and
+/// `agent_runs.py` (`agent_employee.<id>`). A namespace whose writer were
+/// to record a bare name would need this function changed — that is the
+/// one place the rule lives, so both readers below agree with the writer
+/// (AGENTS.md rule 4). `OPS-9`: before this helper, both readers filtered
+/// on the bare name from the URL, so a Bronze table never showed the run
+/// the job had recorded for it.
+pub(crate) fn maintenance_history_table_name(ns: &str, table: &str) -> String {
+    format!("{ns}.{table}")
+}
+
 /// Builds the `SELECT` behind [`latest_maintenance_run`]. `table_name`
 /// narrows to one table (`WHERE table_name = {SqlLiteral} ... LIMIT 1`);
 /// `None` keeps the all-tables query byte-identical to what
 /// `GET /api/governance/maintenance` has always run (`ORDER BY run_at DESC
 /// LIMIT 500`, no `WHERE`).
+///
+/// A caller narrowing to ONE table passes the name
+/// [`maintenance_history_table_name`] built from the `{ns}`/`{table}` it
+/// was asked about — the qualified name the writer recorded (see that
+/// function's doc comment for why a bare name matches no row).
 fn maintenance_run_query(table_name: Option<&str>) -> String {
     const COLUMNS: &str = "table_name, run_at, \
         toString(dry_run_deleted_data_files) dry_data, \
@@ -1897,6 +1920,50 @@ mod tests {
         let sql = maintenance_run_query(Some("o'rders"));
 
         assert!(sql.contains("WHERE table_name = 'o''rders'"));
+    }
+
+    /// `OPS-9`: the per-table read narrows on the qualified name the
+    /// maintenance job records ([`maintenance_history_table_name`]), which
+    /// is what makes a Bronze table's last run visible at all.
+    #[test]
+    fn maintenance_run_query_for_one_bronze_table_filters_the_qualified_name() {
+        let sql = maintenance_run_query(Some(&maintenance_history_table_name("bronze", "orders")));
+
+        assert!(sql.contains("WHERE table_name = 'bronze.orders'"));
+        assert!(sql.contains("ORDER BY run_at DESC LIMIT 1"));
+    }
+
+    /// `OPS-9`, on the wire: the narrowed query `ClickHouse` receives is
+    /// the qualified name, proven by a mock that only answers that SQL.
+    #[tokio::test]
+    async fn latest_maintenance_run_for_one_table_sends_the_qualified_recorded_name() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::body_string_contains(
+                "table_name = 'bronze.orders'",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{
+                    "table_name": "bronze.orders",
+                    "run_at": "2026-01-01T00:00:00Z",
+                    "dry_data": "0", "dry_manifests": "0",
+                    "applied_data": "1", "applied_manifests": "0",
+                    "skipped_verbs": "",
+                }],
+            })))
+            .mount(&server)
+            .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+
+        let rows = latest_maintenance_run(
+            &ch,
+            Some(&maintenance_history_table_name("bronze", "orders")),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["tableName"], json!("bronze.orders"));
     }
 
     /// Real precedent, cited in this task's plan: `lakehouse-clickhouse/

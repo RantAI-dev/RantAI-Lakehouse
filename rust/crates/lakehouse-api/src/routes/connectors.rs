@@ -427,14 +427,23 @@ const HOST_CHANGE_NEEDS_CREDENTIALS: &str = "This connector connects using its h
      its credentials.";
 
 /// `SEC-14` (decision D4): the refusal for `PATCH` changing `host` on a
-/// connector that dials from that column — a row with no adapter (the
-/// original `kind` dispatch reads `<user>@<host>:<port>/<database>` from it)
-/// and a `files` row (the S3 probe reads `<endpoint>|<bucket>`). For every
-/// other adapter the column is a label: the dial comes from `dial`, which
-/// has its own guarded route. A `host` equal to the stored one (ignoring
-/// case and padding) changes nothing and is accepted.
+/// connector that dials from that column — only a row with no adapter (the
+/// original `kind` dispatch reads `<user>@<host>:<port>/<database>` from
+/// it). A `host` equal to the stored one (ignoring case and padding)
+/// changes nothing and is accepted.
+///
+/// `SEC-25` (b): a `files` row used to be refused here too, on the reading
+/// that its probe dials `<endpoint>|<bucket>` from `host`. Since `SRC-6` it
+/// does not: a `files` connector's target is `dial.protocol`,
+/// `dial.endpoint` (null for public S3) and `dial.bucket`
+/// (`ingest_spec::TargetIdentity`), and its `host` column is a label. A
+/// `host` change therefore sends no stored credential anywhere, and the
+/// refusal protected nothing while blocking a harmless rename; the guarded
+/// route for where a `files` connector points is `PUT
+/// /api/connectors/{id}/ingest-spec` (a re-point there needs the slots it
+/// reads).
 fn host_change_refusal(stored: &ConnectorDialInfo, new_host: &str) -> Option<ApiError> {
-    let dials_from_host = matches!(stored.adapter.as_deref(), None | Some("files"));
+    let dials_from_host = stored.adapter.is_none();
     (dials_from_host && !stored.host.trim().eq_ignore_ascii_case(new_host.trim()))
         .then(|| ApiError::Conflict(HOST_CHANGE_NEEDS_CREDENTIALS.to_owned()))
 }
@@ -3563,8 +3572,12 @@ async fn refuse_uploaded_targets(state: &AppState, source_objects: &Value) -> Re
 /// whatever `dial` names. So a save that changes the connector's target
 /// identity ([`lakehouse_store::ingest_spec::is_repoint`]: adapter, host,
 /// port, database, endpoint, bucket, base URL, brokers…) must carry every
-/// credential slot the new `dial` reads, in `credential`. Without them it
-/// is refused with a fixed 409 ([`REPOINT_NEEDS_CREDENTIALS`]) BEFORE the
+/// credential slot the new `dial` reads, in `credential`. A dial that reads
+/// none (`SEC-25`: Kafka with auth `none`, whose `secret_field_names` entry
+/// is empty) has no secret that could travel, so such a re-point needs no
+/// credential at all and is written with no swaps. A re-point that leaves
+/// out a slot it reads is refused with a fixed 409
+/// ([`REPOINT_NEEDS_CREDENTIALS`]) BEFORE the
 /// save-time address check and before any connection: nothing is resolved,
 /// dialled or written. With them the new settings are probed with those
 /// credentials alone (a [`crate::connector_secret_store::CandidateSecretResolver`],
@@ -3576,7 +3589,8 @@ async fn refuse_uploaded_targets(state: &AppState, source_objects: &Value) -> Re
 ///
 /// The assistant's `set_ingest_spec` tool calls this handler with no
 /// principal and never forwards a `credential`, so it reaches the 409 for a
-/// re-point and cannot carry a secret.
+/// re-point and cannot carry a secret (a re-point onto a dial that reads no
+/// credential, `SEC-25`, saves nothing secret either).
 ///
 /// # Errors
 ///
@@ -3650,15 +3664,23 @@ pub async fn ingest_spec_put(
     let repoint =
         lakehouse_store::ingest_spec::is_repoint(stored.adapter.as_deref(), &stored.dial, &dial);
     let required = credential_slots_read(&body.adapter, &dial);
-    if repoint
-        && !body.credential.as_ref().is_some_and(|credential| {
+    // `SEC-25` (a): a dial that reads NO credential slot (Kafka with auth
+    // `none`, `secret_field_names` returns an empty list) needs none to be
+    // re-pointed — there is no secret that could travel to the new host, so
+    // `slots_cover(0, ..)` is true. The refusal used to be keyed on "a
+    // credential object was sent", which made such a connector impossible to
+    // move: 409 without one, and 400 ("there is none to send") with one.
+    let covered = body
+        .credential
+        .as_ref()
+        .map_or(required == 0, |credential| {
             slots_cover(
                 required,
                 credential.primary.is_some(),
                 credential.secondary.is_some(),
             )
-        })
-    {
+        });
+    if repoint && !covered {
         return Err(ApiError::Conflict(REPOINT_NEEDS_CREDENTIALS.to_owned()).into());
     }
 
@@ -3677,7 +3699,18 @@ pub async fn ingest_spec_put(
             state.config.oauth_settings(),
         )
         .await?;
-        return match connectors::set_ingest_spec(pool(&state)?, &id, &input).await {
+        // `SEC-25` (a): the one no-credential re-point the product allows is
+        // onto a dial that reads no slot, and it still has to go through
+        // `repoint_ingest_spec`, because `set_ingest_spec` refuses every
+        // change of target (that refusal is the defence in depth behind the
+        // route's own check). No swaps: there is no slot to move, and the
+        // store reads an empty `swaps` against zero fields as covering them.
+        let saved = if repoint && required == 0 {
+            connectors::repoint_ingest_spec(pool(&state)?, &id, &input, &[]).await
+        } else {
+            connectors::set_ingest_spec(pool(&state)?, &id, &input).await
+        };
+        return match saved {
             Ok(spec) => Ok(ApiJson(IngestSpecResponse::new(
                 spec,
                 time::OffsetDateTime::now_utc(),
@@ -5689,27 +5722,27 @@ mod tests {
         info
     }
 
-    /// `SEC-14` (D4): a connector that dials from its `host` column cannot
-    /// have it changed through `PATCH`; one that dials from `dial` can (the
-    /// column is a label), and so can a `PATCH` that repeats the stored
-    /// value.
+    /// `SEC-14` (D4), narrowed by `SEC-25` (b): only a connector that dials
+    /// from its `host` column (no adapter — the legacy `kind` dispatch)
+    /// cannot have it changed through `PATCH`. A connector WITH an adapter
+    /// dials from `dial`, so the column is a label — including `files`,
+    /// whose target since `SRC-6` is `dial.protocol`/`dial.endpoint`/
+    /// `dial.bucket`, never `host` (the old rule refused it and protected
+    /// nothing). Repeating the stored value is accepted either way.
     #[test]
     fn host_change_refusal_covers_the_rows_that_dial_from_host() {
         let legacy = host_row(None, "lakehouse@db:5432/lakehouse");
-        let files = host_row(Some("files"), "http://rustfs:9000|bucket");
         let sql = host_row(Some("sql"), "label");
 
-        for stored in [&legacy, &files] {
-            let err = host_change_refusal(stored, "lakehouse@other:5432/lakehouse")
-                .expect("a changed host must be refused");
-            let ApiError::Conflict(message) = err else {
-                panic!("expected 409");
-            };
-            assert_eq!(message, HOST_CHANGE_NEEDS_CREDENTIALS);
-        }
+        let err = host_change_refusal(&legacy, "lakehouse@other:5432/lakehouse")
+            .expect("a changed host must be refused");
+        let ApiError::Conflict(message) = err else {
+            panic!("expected 409");
+        };
+        assert_eq!(message, HOST_CHANGE_NEEDS_CREDENTIALS);
         assert!(host_change_refusal(&legacy, " LAKEHOUSE@db:5432/lakehouse ").is_none());
         assert!(host_change_refusal(&sql, "another label").is_none());
-        for adapter in ["cdc", "rest", "sheets", "mongodb", "kafka", "sftp"] {
+        for adapter in ["files", "cdc", "rest", "sheets", "mongodb", "kafka", "sftp"] {
             assert!(host_change_refusal(&host_row(Some(adapter), "x"), "y").is_none());
         }
     }

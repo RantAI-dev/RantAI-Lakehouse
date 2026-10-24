@@ -271,7 +271,7 @@ guessed.
 | `OIDC_TOKEN_URL` | Token endpoint of the OIDC provider, used to exchange an authorization code for tokens. Read ONLY from this var, never from a request | unset (browser SSO login stays off) | No |
 | `OIDC_REDIRECT_URI` | This deployment's fixed callback URL, registered with the OIDC provider ahead of time. Read ONLY from this var, never from a request, so a caller can never redirect a login or override the callback URL | unset (browser SSO login stays off) | No |
 | `ORACLE_CDC_LOGMINER_ENABLED` | Names the extension point for Oracle CDC via Debezium LogMiner. This build ships no Oracle LogMiner template, so Oracle CDC connectors are refused either way; the flag changes only the explanation (`docs/adr/0008-initial-snapshot-backfill.md`) | `false` | No |
-| `DATABASE_URL` | Postgres connection string for Phase 2 OLTP storage | `postgres://lakehouse:lakehouse@localhost:5432/lakehouse` | No (but a wrong/unreachable value means every Phase 2 route returns 503 — see below) |
+| `DATABASE_URL` | Postgres connection string for Phase 2 OLTP storage | unset (no Postgres pool; every Phase 2 route returns 503 — see below) | No (but a wrong/unreachable value means every Phase 2 route returns 503 — see below) |
 
 These are also read by `lakehouse-api` (`config.rs`, and `routes/mod.rs` for
 the chat timeout); they were missing from the table above until 2026-10-15

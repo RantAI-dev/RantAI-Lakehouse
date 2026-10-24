@@ -3,6 +3,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use lakehouse_auth::openfga::LakekeeperAdminClient;
 use lakehouse_auth::throttle::ThrottlePolicy;
@@ -92,6 +93,21 @@ pub struct AppState {
     /// see `routes::identity::pool`, the first (and so far only) reader of
     /// this field.
     pub pg: Option<Arc<PgPool>>,
+    /// Whether the start-up step has confirmed the application database is
+    /// usable at this build's schema version (`OPS-4`, `main::
+    /// bring_database_up`). Starts `false`: nothing has proven the schema
+    /// yet, so `GET /health` reports the database as unavailable until
+    /// migrations applied or a later retry succeeded (fail closed,
+    /// AGENTS.md principle 3).
+    ///
+    /// Not a live probe: this is the last answer the start-up step or its
+    /// retry loop gave, so a database lost AFTER boot keeps answering
+    /// `ok` here until the process restarts. A per-request probe would
+    /// have to be a bounded `SELECT 1` on its own short timeout — `GET
+    /// /health` is polled by the ops gates, and a probe that waits on a
+    /// dead database's default 30 s acquire timeout would stall them.
+    /// `docs/OPERATIONS.md` records that limit.
+    pub db_ready: Arc<AtomicBool>,
     /// Resolves a connector's `secretRef` to an actual credential value —
     /// [`crate::connector_probe`]'s only source of one, per ADR 0002 (see
     /// its "Restricting connector secretRefs" addendum). **Deliberately
@@ -603,6 +619,39 @@ fn oidc_config(config: &Config) -> Option<OidcConfig> {
     })
 }
 
+/// The Phase 2 Postgres pool, or `None` when there is nothing to connect to.
+///
+/// `SEC-37`: [`Config::database_url`] has no default, so unset (empty) means
+/// "no Postgres pool" outright — never a made-up localhost DSN holding a
+/// credential written in the repository. `main` logs its own warning for the
+/// `None` case and every Phase 2 route answers 503. `connect_lazy` performs
+/// no I/O, so this never blocks on Postgres being down; a malformed URL is
+/// logged and degrades the same way.
+fn postgres_pool(config: &Config) -> Option<Arc<PgPool>> {
+    if config.database_url.is_empty() {
+        return None;
+    }
+    match lakehouse_store::connect_lazy(&config.database_url) {
+        Ok(pool) => Some(Arc::new(pool)),
+        Err(err) => {
+            tracing::warn!(%err, "DATABASE_URL is not a valid Postgres connection string; Phase 2 routes will report the database as unavailable");
+            None
+        }
+    }
+}
+
+/// The login-throttle policy [`AppState::new`] stores (`SEC-5`): the three
+/// configured numbers, converted to the shape the login handler reads.
+/// A free function only so the state constructor stays inside clippy's
+/// line budget as the state grows; behaviour is unchanged.
+fn login_throttle_policy(config: &Config) -> ThrottlePolicy {
+    ThrottlePolicy {
+        max_failures: config.login_max_failures,
+        window: Duration::seconds(i64::from(config.login_failure_window_secs)),
+        lockout: Duration::seconds(i64::from(config.login_lockout_secs)),
+    }
+}
+
 impl AppState {
     /// Build application state from a resolved [`Config`].
     #[must_use]
@@ -625,16 +674,10 @@ impl AppState {
         );
         // `connect_lazy` performs no I/O, so this never blocks on, or fails
         // because of, Postgres being down — see the field doc comment and
-        // `lakehouse_store::connect_lazy`'s. It can only fail on a
-        // malformed `DATABASE_URL`, which is logged and degrades to `None`
-        // rather than aborting startup.
-        let pg = match lakehouse_store::connect_lazy(&config.database_url) {
-            Ok(pool) => Some(Arc::new(pool)),
-            Err(err) => {
-                tracing::warn!(%err, "DATABASE_URL is not a valid Postgres connection string; Phase 2 routes will report the database as unavailable");
-                None
-            }
-        };
+        // `lakehouse_store::connect_lazy`'s; a malformed URL is logged and
+        // degrades to `None` rather than aborting startup. See
+        // [`postgres_pool`] for the `SEC-37` "unset means no pool" rule.
+        let pg = postgres_pool(&config);
         let auth = pg.as_ref().map(|pool| AuthState {
             local: Arc::new(LocalPasswordAuthenticator::new((**pool).clone())),
             session: Arc::new(SessionAuthenticator::new((**pool).clone())),
@@ -695,11 +738,7 @@ impl AppState {
         let secret_manager = config.secret_manager.clone();
         warn_if_no_reference_prefixes(&secret_manager);
         let secrets_keyring = connector_secrets_keyring(&config);
-        let throttle_policy = ThrottlePolicy {
-            max_failures: config.login_max_failures,
-            window: Duration::seconds(i64::from(config.login_failure_window_secs)),
-            lockout: Duration::seconds(i64::from(config.login_lockout_secs)),
-        };
+        let throttle_policy = login_throttle_policy(&config);
         let upload_receive = ReceiveLimiter::new(
             config.upload_max_concurrent_per_user,
             config.upload_max_concurrent,
@@ -710,6 +749,7 @@ impl AppState {
             dagster: Arc::new(dagster),
             llm: Arc::new(llm),
             pg,
+            db_ready: Arc::new(AtomicBool::new(false)),
             connector_secret_resolver: connector_secret_resolver(
                 EnvSecretResolver::new(),
                 &secrets_dir,
@@ -747,6 +787,23 @@ impl AppState {
             return sender.clone();
         }
         crate::webhook_guard::sender(&self.config)
+    }
+
+    /// Whether `GET /health` should report the application database as
+    /// usable (`OPS-4`): no pool is never ready, and a pool is ready only
+    /// after [`Self::mark_database_ready`].
+    #[must_use]
+    pub fn database_ready(&self) -> bool {
+        self.pg.is_some() && self.db_ready.load(Ordering::Relaxed)
+    }
+
+    /// Records that the start-up step confirmed the application database's
+    /// schema is at this build's version (`OPS-4`). Set once, from `main::
+    /// bring_database_up` or its retry loop; nothing clears it, since the
+    /// only way to lose the database after that is a per-request failure
+    /// this flag deliberately does not track (see [`Self::db_ready`]).
+    pub fn mark_database_ready(&self) {
+        self.db_ready.store(true, Ordering::Relaxed);
     }
 }
 
@@ -911,22 +968,22 @@ mod tests {
         assert_eq!(latencies.p95_ms(), Some(1.0));
     }
 
-    /// The boot-behavior guarantee this module exists to provide: building
-    /// `AppState` never blocks on, or fails because of, Postgres being
-    /// unreachable — the default `DATABASE_URL` points at `localhost:5432`,
-    /// which is not running in this test process, and `AppState::new` must
-    /// still return synchronously with a populated `pg` pool.
+    /// The `SEC-37` boot guarantee: an unset `DATABASE_URL` means "no
+    /// Postgres pool", not a made-up localhost DSN built from a credential
+    /// written in the repository. `AppState::new` must return synchronously
+    /// with `pg: None` — the same state the malformed-URL case below
+    /// reaches — and `main` turns that into its "no Postgres pool
+    /// configured" warning.
     ///
-    /// `#[tokio::test]` (not plain `#[test]`), even though `AppState::new`
-    /// itself is synchronous: `sqlx`'s lazy pool sets up an idle-connection
-    /// reaper against the ambient Tokio runtime as part of construction, so
-    /// it needs one present — exactly the situation it runs in for real,
-    /// since `main` only ever calls this from inside `#[tokio::main]`.
+    /// `#[tokio::test]` (not plain `#[test]`), matching the malformed-URL
+    /// test below and the only way `main` ever calls `AppState::new` (from
+    /// inside `#[tokio::main]`).
     #[tokio::test]
-    async fn app_state_boots_with_default_database_url_and_no_live_postgres() {
+    async fn app_state_has_no_pool_when_database_url_is_unset() {
         let cfg = Config::from_map(&HashMap::new()).unwrap();
+        assert_eq!(cfg.database_url, "");
         let state = AppState::new(cfg);
-        assert!(state.pg.is_some());
+        assert!(state.pg.is_none());
     }
 
     /// The one failure mode `connect_lazy` actually has: a `DATABASE_URL`

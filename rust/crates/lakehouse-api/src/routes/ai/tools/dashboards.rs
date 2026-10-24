@@ -11,7 +11,7 @@ use lakehouse_clickhouse::ChClient;
 use serde_json::{Map, Value, json};
 
 use super::arg_str;
-use super::look::FORMAT_FIELDS;
+use super::look::{FORMAT_FIELDS, check_layers_name_a_source, wrong_field};
 use crate::routes::dashboard_organise::{
     Gate, drop_tile, place_new_chart, require_chart_board, require_editable_chart, snapshot_as,
     viewer_of,
@@ -40,8 +40,27 @@ pub(super) fn refused(gate: Gate) -> Value {
 /// Parse a tool call's raw args `Value` into a [`ChartInput`], the same way
 /// `args as unknown as ChartInput` casts in `ai-tools.ts` (no validation at
 /// this boundary — `spec_from_input` validates for real).
+///
+/// A call that does not read names the field to blame when one field alone is
+/// to blame, as `format_chart` does for its own fields: serde's words say
+/// what was found and not where it was found, so the model has to know which
+/// of its arguments to fix. Two fields of the wrong shape name none, and the
+/// error is serde's own words.
 fn parse_chart_input(args: &Map<String, Value>) -> Result<ChartInput, String> {
-    serde_json::from_value(Value::Object(args.clone())).map_err(|e| e.to_string())
+    let def = Value::Object(args.clone());
+    match serde_json::from_value::<ChartInput>(def.clone()) {
+        Ok(input) => Ok(input),
+        Err(cause) => {
+            let cause = cause.to_string();
+            // The candidates are the call's own top-level keys: a chart's
+            // arguments are flat on the wire.
+            let candidates: Vec<&str> = args.keys().map(String::as_str).collect();
+            match wrong_field(&def, &candidates).filter(|field| !cause.contains(*field)) {
+                Some(field) => Err(format!("\"{field}\": {cause}")),
+                None => Err(cause),
+            }
+        }
+    }
 }
 
 /// The call's args with the formatting the call does not name filled in from
@@ -206,6 +225,9 @@ pub(super) async fn create_chart(
         Ok(i) => i,
         Err(e) => return json!({ "error": e }),
     };
+    if let Err(sentence) = check_layers_name_a_source(&input) {
+        return json!({ "error": sentence });
+    }
     // BI-17 part A, decision 6 (`PR #199 review M SHOULD-FIX BI-17 4`): a new
     // chart in a deployment with a company palette draws with it. A palette
     // the model chose is kept, and a chart that already exists keeps what it
@@ -291,6 +313,9 @@ pub(super) async fn check_chart_draft(
         Ok(i) => i,
         Err(e) => return Some(json!({ "error": e })),
     };
+    if let Err(sentence) = check_layers_name_a_source(&input) {
+        return Some(json!({ "error": sentence }));
+    }
     match store::spec_from_input(ch, &input, ChartSource::Ai, "ai", id, time).await {
         Ok(_) => None,
         Err(err) => Some(upstream_error::bi(&upstream_error::DATABASE, &err).to_json()),
@@ -330,6 +355,9 @@ pub(super) async fn update_chart(
         Ok(i) => i,
         Err(e) => return json!({ "error": e }),
     };
+    if let Err(sentence) = check_layers_name_a_source(&input) {
+        return json!({ "error": sentence });
+    }
     if let Err(err) = require_chart_board(ch, input.board.as_deref(), &viewer).await {
         return refused(err);
     }
@@ -488,6 +516,27 @@ pub(super) async fn list_charts(ch: &ChClient, principal: Option<&Principal>) ->
             "source": c.source,
             "board": c.board,
         });
+        // The formatting the chart holds, as it is stored: the fields it
+        // does not hold stay out, so a chart with no formatting lists an
+        // empty style. A `StyleFields` holds no map without a string key
+        // and no float JSON cannot hold, so the serialisation cannot fail;
+        // the fallback says the style is unknown, not that it is empty.
+        entry["style"] = serde_json::to_value(&c.def.style).unwrap_or(Value::Null);
+        // The reference lines it holds, when it has any.
+        if let Some(lines) = c
+            .def
+            .shape
+            .reference_lines
+            .as_ref()
+            .filter(|lines| !lines.is_empty())
+        {
+            entry["referenceLines"] = serde_json::to_value(lines).unwrap_or(Value::Null);
+        }
+        // The names its series can take: the keys a series colour and a
+        // value format are stored under. A chart with a breakdown draws one
+        // series per data value, so the name it draws is the measure and
+        // not a series.
+        entry["seriesNames"] = json!(store::drawn_names(&c.spec.y));
         let tab = match boards.iter().find(|b| b.id == c.board) {
             Some(board) => tab_of_chart(board, &c.spec.id),
             None => None,
@@ -905,6 +954,36 @@ mod tests {
             .collect()
     }
 
+    /// A layer that names no source is refused before the assistant saves it,
+    /// and the refusal names the arguments its model sends.
+    #[tokio::test]
+    async fn create_chart_refuses_a_layer_with_no_data_source() {
+        let server = mart_server().await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let reply = create_chart(
+            &ch,
+            None,
+            &arguments(json!({
+                "title": "Visitors", "kind": "bar", "mart": "mart_x",
+                "dimension": "province", "measures": ["visitors"],
+                "layers": [{
+                    "dimension": "province", "measures": ["visitors"],
+                    "draw": "line", "axis": "right",
+                }],
+            })),
+            None,
+            &lakehouse_bi::grain::TimeContext::default(),
+        )
+        .await;
+        assert_eq!(
+            reply,
+            json!({
+                "error": "question 1: the layer names no data source: send its mart or sqlSource."
+            }),
+            "{reply}"
+        );
+    }
+
     /// `PR #199 review M SHOULD-FIX BI-17 4` (decision M5): a new chart in a
     /// deployment with a company palette draws with it. A palette the model
     /// chose is kept.
@@ -1147,6 +1226,65 @@ mod tests {
         assert_eq!(
             bar["error"],
             json!("goal is only for a progress bar and a bullet graph.")
+        );
+    }
+
+    /// A call whose args do not read names the field to blame: serde's words
+    /// say what was found and not where it was found, so the model has to
+    /// know which of its arguments to fix. The bands of a bullet graph are
+    /// numbers, and the model sent objects.
+    #[tokio::test]
+    async fn a_chart_call_with_bands_of_objects_names_the_field_to_fix() {
+        let server = mart_server().await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let reply = create_chart(
+            &ch,
+            None,
+            &arguments(json!({
+                "title": "Visitors against target", "kind": "bullet", "mart": "mart_x",
+                "dimension": "province", "measures": ["visitors", "target"],
+                "goal": { "measure": "target" },
+                "bands": [{ "value": 1000, "label": "Target" }],
+            })),
+            None,
+            &lakehouse_bi::grain::TimeContext::default(),
+        )
+        .await;
+        assert_eq!(
+            reply["error"],
+            json!("\"bands\": invalid type: map, expected f64"),
+            "{reply}"
+        );
+    }
+
+    /// Two fields of the wrong shape name none: there is nothing to single
+    /// out, so the error is serde's own words, as it was before.
+    #[tokio::test]
+    async fn a_chart_call_with_two_fields_of_the_wrong_shape_names_none() {
+        let server = mart_server().await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let args = arguments(json!({
+            "title": "Visitors against target", "kind": "bullet", "mart": "mart_x",
+            "dimension": "province", "measures": ["visitors", "target"],
+            "goal": { "measure": 5 },
+            "bands": [{ "value": 1000, "label": "Target" }],
+        }));
+        let reply = create_chart(
+            &ch,
+            None,
+            &args,
+            None,
+            &lakehouse_bi::grain::TimeContext::default(),
+        )
+        .await;
+        // The error is serde's own words, with no field's name in front.
+        let serde_own = serde_json::from_value::<ChartInput>(Value::Object(args.clone()))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(reply["error"], json!(serde_own), "{reply}");
+        assert!(
+            !reply["error"].as_str().unwrap().contains("\"bands\""),
+            "{reply}"
         );
     }
 
@@ -1453,6 +1591,65 @@ mod tests {
         assert!(row.contains("mart_x"), "{row}");
     }
 
+    /// The assistant's model sends `"mart": null` for "no mart". It reads as
+    /// no mart, so the chart's own mart is kept and the reply says so.
+    #[tokio::test]
+    async fn an_update_that_sends_a_null_mart_keeps_the_stored_mart() {
+        let server = stored_chart_server(json!({
+            "title": "Visitors",
+            "kind": "bar",
+            "mart": "mart_x",
+            "dimension": "province",
+            "measures": ["visitors"],
+            "board": "b_board",
+        }))
+        .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let reply = update_chart(
+            &ch,
+            Some(&person(7)),
+            &rename_call(json!({ "mart": null })),
+            &lakehouse_bi::grain::TimeContext::default(),
+        )
+        .await;
+        assert_eq!(reply["updated"], json!(true), "{reply}");
+        assert_eq!(reply["mart"], json!("mart_x"), "{reply}");
+        assert_eq!(reply["sourceKept"], json!(true), "{reply}");
+        let row = chart_row(&sent(&server).await);
+        assert!(row.contains("mart_x"), "{row}");
+    }
+
+    /// A static kind takes no source: turning a mart chart into a text tile
+    /// carries nothing over, and the reply does not say a source was kept.
+    #[tokio::test]
+    async fn an_update_that_turns_a_chart_into_text_carries_no_source() {
+        let server = stored_chart_server(json!({
+            "title": "Visitors",
+            "kind": "bar",
+            "mart": "mart_x",
+            "dimension": "province",
+            "measures": ["visitors"],
+            "board": "b_board",
+        }))
+        .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let mut args = rename_call(json!({ "kind": "text", "text": "A note" }));
+        args.remove("mart");
+        let reply = update_chart(
+            &ch,
+            Some(&person(7)),
+            &args,
+            &lakehouse_bi::grain::TimeContext::default(),
+        )
+        .await;
+        assert_eq!(reply["updated"], json!(true), "{reply}");
+        assert_eq!(reply["kind"], json!("text"), "{reply}");
+        assert!(reply.get("sourceKept").is_none(), "{reply}");
+        let row = chart_row(&sent(&server).await);
+        assert!(row.contains("A note"), "{row}");
+        assert!(!row.contains("mart_x"), "{row}");
+    }
+
     /// A call that names a SQL source keeps it: the chart's own mart is not
     /// carried over, so the two are never named at once.
     #[tokio::test]
@@ -1552,5 +1749,71 @@ mod tests {
         let chart = &reply["charts"][0];
         assert_eq!(chart["board"], json!("b_board"), "{reply}");
         assert_eq!(chart["tab"], json!("tab_a"), "{reply}");
+    }
+
+    /// A chart is listed with the formatting it holds and the names its
+    /// series can take: the number format, the series colour and the
+    /// reference line a call can name, and the name a series colour is
+    /// keyed by.
+    #[tokio::test]
+    async fn the_assistant_lists_the_formatting_and_the_series_names_of_a_chart() {
+        let server = stored_chart_server(json!({
+            "title": "Visitors",
+            "kind": "bar",
+            "mart": "mart_x",
+            "dimension": "province",
+            "measures": ["visitors"],
+            "board": "b_board",
+            "format": { "style": "number", "decimals": 0 },
+            "colors": { "series": { "visitors": "#112233" } },
+            "referenceLines": [{ "value": 1000.0, "label": "Target" }],
+        }))
+        .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let reply = list_charts(&ch, Some(&person(7))).await;
+        let chart = &reply["charts"][0];
+        assert_eq!(
+            chart["style"]["format"],
+            json!({ "style": "number", "decimals": 0 }),
+            "{reply}"
+        );
+        assert_eq!(
+            chart["style"]["colors"]["series"]["visitors"],
+            json!("#112233"),
+            "{reply}"
+        );
+        assert_eq!(
+            chart["referenceLines"][0]["value"],
+            json!(1000.0),
+            "{reply}"
+        );
+        assert_eq!(
+            chart["referenceLines"][0]["label"],
+            json!("Target"),
+            "{reply}"
+        );
+        assert_eq!(chart["seriesNames"], json!(["visitors"]), "{reply}");
+    }
+
+    /// A chart with no formatting lists an empty style and no reference
+    /// lines: the fields a chart does not hold stay out of the entry, and
+    /// the names its series can take are still listed.
+    #[tokio::test]
+    async fn the_assistant_lists_a_chart_with_no_formatting_as_an_empty_style() {
+        let server = stored_chart_server(json!({
+            "title": "Visitors",
+            "kind": "bar",
+            "mart": "mart_x",
+            "dimension": "province",
+            "measures": ["visitors"],
+            "board": "b_board",
+        }))
+        .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let reply = list_charts(&ch, Some(&person(7))).await;
+        let chart = &reply["charts"][0];
+        assert_eq!(chart["style"], json!({}), "{reply}");
+        assert!(chart.get("referenceLines").is_none(), "{reply}");
+        assert_eq!(chart["seriesNames"], json!(["visitors"]), "{reply}");
     }
 }

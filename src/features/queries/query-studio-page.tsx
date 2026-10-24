@@ -8,6 +8,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { HistoryQuickList, SavedQuickList } from "./query-context-lists"
 import { NaturalLanguagePanel } from "./nl-panel"
 import { QueryResultsSection } from "./query-results-section"
+import { QueryResultTabs } from "./query-result-tabs"
 import { QueryStudioTabs } from "./query-studio-tabs"
 import { ExplainCard, FixCard, FixWithAiButton } from "./sql-help-card"
 import { IcebergTimeTravelControls } from "./time-travel-controls"
@@ -17,6 +18,8 @@ import { SaveSqlSourceSheet } from "./save-sql-source-sheet"
 import { useAuth } from "@/features/auth/auth-provider"
 import { useCopilot } from "@/features/copilot/use-copilot"
 import { summarizeQuery } from "@/lib/page-context-summary"
+import { SchemaBrowser } from "./schema-browser"
+import { QueryTabBar } from "./query-tab-bar"
 import { SqlPanel } from "./sql-panel"
 import { useQueryStudio } from "./use-query-studio"
 
@@ -26,6 +29,7 @@ export function QueryStudioPage() {
   const studio = useQueryStudio()
   const [saveOpen, setSaveOpen] = React.useState(false)
   const [sourceOpen, setSourceOpen] = React.useState(false)
+  const [schemaOpen, setSchemaOpen] = React.useState(false)
   const { hasPermission } = useAuth()
   const canAuthorSources = hasPermission("dashboard:sql")
 
@@ -34,7 +38,11 @@ export function QueryStudioPage() {
   // context on every keystroke.
   const { setPageContext } = useCopilot()
   const deferredSql = React.useDeferredValue(studio.sql)
-  const lastResult = studio.runAct.data
+  // The rows on screen are the open statement's own: a statement that
+  // never ran shows nothing, and the assistant reads the same rows the
+  // person sees.
+  const openRun = studio.activeRun
+  const lastResult = openRun?.status === "done" ? openRun.result : null
   React.useEffect(() => {
     setPageContext({
       key: "query",
@@ -72,11 +80,30 @@ export function QueryStudioPage() {
               <NaturalLanguagePanel studio={studio} />
             </TabsContent>
             <TabsContent value="sql" className="mt-3 space-y-3">
-              <SqlPanel
-                studio={studio}
-                onSave={() => setSaveOpen(true)}
-                onSaveAsSource={canAuthorSources ? () => setSourceOpen(true) : undefined}
-              />
+              {/* The query tabs sit inside the SQL tab, above the editor:
+                  the natural-language and SQL choice stays as it was. */}
+              <QueryTabBar studio={studio} />
+              {/* The browser sits beside the editor and never replaces it:
+                  whatever the catalog answers, the editor keeps its width
+                  and stays usable. */}
+              <div
+                className={
+                  schemaOpen ? "grid gap-3 lg:grid-cols-[minmax(0,1fr)_300px]" : undefined
+                }
+              >
+                <div className="min-w-0">
+                  <SqlPanel
+                    studio={studio}
+                    onSave={() => setSaveOpen(true)}
+                    onSaveAsSource={canAuthorSources ? () => setSourceOpen(true) : undefined}
+                    onToggleSchema={() => setSchemaOpen((open) => !open)}
+                    schemaOpen={schemaOpen}
+                  />
+                </div>
+                {schemaOpen ? (
+                  <SchemaBrowser studio={studio} onClose={() => setSchemaOpen(false)} />
+                ) : null}
+              </div>
               {/*
                * Iceberg time travel: pins one version of the raw tables
                * through a query setting. Shown whatever the engine, and
@@ -90,24 +117,6 @@ export function QueryStudioPage() {
               />
             </TabsContent>
           </Tabs>
-          {studio.runAct.status === "error" ? (
-            <div className="space-y-2">
-              <ErrorState
-                error={studio.runAct.error}
-                onRetry={() => void studio.runQuery()}
-              />
-              {/*
-               * Fix with AI works for ClickHouse only: the check that makes a
-               * proposal safe to show runs as EXPLAIN PLAN, which Trino lacks.
-               * Plan 16 lifts this. The reason is the button's title.
-               */}
-              <FixWithAiButton
-                engine={studio.engine}
-                busy={studio.fix.busy}
-                onFix={() => void studio.fix.run(studio.runAct.error?.message ?? "")}
-              />
-            </div>
-          ) : null}
           {studio.explain.error ? (
             <ErrorState error={studio.explain.error} />
           ) : studio.explain.result !== null ? (
@@ -118,13 +127,44 @@ export function QueryStudioPage() {
           ) : studio.fix.result ? (
             <FixCard
               outcome={studio.fix.result}
-              editorSql={studio.sql}
+              editorSql={studio.fix.statement?.text ?? studio.sql}
               onAccept={studio.fix.accept}
               onReject={studio.fix.reject}
             />
           ) : null}
-          {studio.runAct.data ? (
-            <QueryResultsSection result={studio.runAct.data} />
+          {/* The result of a run: one tab per statement, and the outcome of
+              the statement that is open on it. */}
+          {studio.activeRuns.length > 1 ? <QueryResultTabs studio={studio} /> : null}
+          {openRun?.status === "done" ? (
+            <QueryResultsSection result={openRun.result} />
+          ) : null}
+          {openRun?.status === "error" ? (
+            <div className="space-y-2">
+              <ErrorState
+                error={openRun.error}
+                onRetry={() => void studio.runQuery()}
+              />
+              {/*
+               * Fix with AI works for ClickHouse only: the check that makes a
+               * proposal safe to show runs as EXPLAIN PLAN, which Trino lacks.
+               * Plan 16 lifts this. The reason is the button's title.
+               */}
+              <FixWithAiButton
+                engine={studio.engine}
+                busy={studio.fix.busy}
+                onFix={() => void studio.fix.run(openRun.error.message, openRun.statement)}
+              />
+            </div>
+          ) : null}
+          {openRun?.status === "not-run" ? (
+            <p className="text-sm text-muted-foreground">
+              Not run: the batch stopped at the failure before this statement.
+            </p>
+          ) : null}
+          {openRun?.status === "pending" || openRun?.status === "running" ? (
+            <p className="text-sm text-muted-foreground" role="status">
+              Running…
+            </p>
           ) : null}
         </div>
         <div className="space-y-3">
@@ -144,13 +184,17 @@ export function QueryStudioPage() {
       <SaveQuerySheet
         open={saveOpen}
         onOpenChange={setSaveOpen}
-        sql={studio.sql}
+        sql={studio.targetStatement?.text ?? ""}
         saving={studio.saveAct.status === "pending"}
         error={studio.saveAct.error?.message ?? null}
         onSave={studio.save}
       />
       {canAuthorSources ? (
-        <SaveSqlSourceSheet open={sourceOpen} onOpenChange={setSourceOpen} sql={studio.sql} />
+        <SaveSqlSourceSheet
+          open={sourceOpen}
+          onOpenChange={setSourceOpen}
+          sql={studio.targetStatement?.text ?? ""}
+        />
       ) : null}
     </div>
   )
