@@ -64,34 +64,80 @@ pub struct NeedsProjection;
 pub struct Ready;
 
 /// `SETTINGS` appended to every statement built over a [`Relation::Sql`]:
-/// the same 2 000-row cap as Query Studio (`routes/query.rs`
-/// `MAX_RESULT_ROWS`), enforced by `ClickHouse` rather than by truncating
-/// afterwards, and a 30 s execution limit. Why 30 s: Superset's SQL Lab
-/// default (`SQLLAB_TIMEOUT`), and below the API's 60 s route/HTTP timeout,
-/// so `ClickHouse` cancels the query itself instead of it running on after
-/// the client gave up (measured: `max_execution_time = 1` on a 1e11-row
-/// scan fails with `TIMEOUT_EXCEEDED` after 1.00 s on `ClickHouse` 26.8).
+/// the same 2 000-row cap as Query Studio (`routes/query.rs`), enforced by
+/// `ClickHouse` rather than by truncating afterwards, and a 60 s execution
+/// limit. These are the **defaults** of the administrator's query limits
+/// (`BI-5`, migration `0101`; `lakehouse_store::query_limits::QueryLimits::
+/// default` pins the same numbers): the API swaps this text for the numbers
+/// of the request's limits with [`with_run_settings`] before the statement
+/// runs, because the text is also stored with a saved chart and a change of
+/// the setting must reach charts that were saved before it. The text stays
+/// in the statement, not only in URL settings, because a statement-level
+/// `SETTINGS` overrides URL settings (`SEC-21`). The time limit is below the
+/// API's route deadline, so `ClickHouse` cancels the query itself instead of
+/// it running on after the client gave up (measured: `max_execution_time = 1`
+/// on a 1e11-row scan fails with `TIMEOUT_EXCEEDED` after 1.00 s on
+/// `ClickHouse` 26.8).
 pub const SQL_SOURCE_SETTINGS: &str =
-    " SETTINGS max_result_rows = 2000, result_overflow_mode = 'break', max_execution_time = 30";
+    " SETTINGS max_result_rows = 2000, result_overflow_mode = 'break', max_execution_time = 60";
 
-/// `statement` with the SQL-source cap of a tile ([`SQL_SOURCE_SETTINGS`]:
-/// 2 000 rows, 30 seconds) swapped for a download's: `max_rows` rows and 280
-/// seconds, below the 300-second timeout of the download's stream (`BI-1`,
-/// plan decision D6). A separate path on purpose: a tile keeps its cap, only a
-/// whole-result download lifts it. A statement over a mart, which carries no
-/// such cap, comes back unchanged; settings added after the cap
+/// `statement` with the SQL-source cap of a tile ([`SQL_SOURCE_SETTINGS`])
+/// swapped for `max_rows` rows and `seconds` seconds: the one body behind a
+/// tile's configured limits (`BI-5` plan D3) and a download's
+/// ([`with_export_settings`]). A statement over a mart, which carries no such
+/// cap, comes back unchanged; settings added after the cap
 /// (`prefer_column_name_to_alias`, ...) are kept.
 #[must_use]
-pub fn with_export_settings(statement: &str, max_rows: u32) -> String {
+pub fn with_run_settings(statement: &str, max_rows: u32, seconds: u32) -> String {
     let Some(at) = statement.rfind(SQL_SOURCE_SETTINGS) else {
         return statement.to_owned();
     };
     format!(
         "{} SETTINGS max_result_rows = {max_rows}, result_overflow_mode = 'break', \
-         max_execution_time = 280{}",
+         max_execution_time = {seconds}{}",
         &statement[..at],
         &statement[at + SQL_SOURCE_SETTINGS.len()..]
     )
+}
+
+/// `statement` with the SQL-source cap of a tile swapped for a download's:
+/// `max_rows` rows and 280 seconds, below the 300-second timeout of the
+/// download's stream (`BI-1`, plan decision D6). A separate path on purpose:
+/// a tile keeps its cap, only a whole-result download lifts it.
+#[must_use]
+pub fn with_export_settings(statement: &str, max_rows: u32) -> String {
+    with_run_settings(statement, max_rows, 280)
+}
+
+/// A point-map statement (`build_points_sql`, `grid_points_sql`) with the
+/// number of points it keeps swapped for `points`, the administrator's map
+/// limit (`BI-5`): `LIMIT n` is the statement's last clause before any
+/// `SETTINGS`. Over a SQL source the limit is also held to `source_rows`, the
+/// source's row cap, for the reason [`point_limit`] gives (a `LIMIT` above the
+/// cap would be cut by the engine at an unpredictable block). A statement that
+/// does not end that way comes back unchanged: the API calls this only for
+/// point maps, and the tests below pin the shape against what the builders
+/// write.
+#[must_use]
+pub fn with_point_limit(statement: &str, points: u32, source_rows: u32) -> String {
+    const LIMIT: &str = " LIMIT ";
+    let Some(at) = statement.rfind(LIMIT) else {
+        return statement.to_owned();
+    };
+    let after = &statement[at + LIMIT.len()..];
+    let digits_end = after
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(after.len());
+    let (digits, rest) = after.split_at(digits_end);
+    if digits.is_empty() || !(rest.is_empty() || rest.starts_with(" SETTINGS")) {
+        return statement.to_owned();
+    }
+    let limit = if rest.contains(SQL_SOURCE_SETTINGS) {
+        points.min(source_rows)
+    } else {
+        points
+    };
+    format!("{}{LIMIT}{limit}{rest}", &statement[..at])
 }
 
 /// Where a chart's rows come from.
@@ -4982,5 +5028,53 @@ mod tests {
         assert!(!got.contains("= 2000"));
         // A mart statement has no cap to lift.
         assert_eq!(with_export_settings("SELECT 1", 5), "SELECT 1");
+    }
+
+    #[test]
+    fn the_run_settings_swap_the_source_cap_and_leave_a_mart_statement_alone() {
+        let sql =
+            format!("SELECT 1 FROM (SELECT 1\n) AS src{SQL_SOURCE_SETTINGS}, join_use_nulls = 1");
+        assert_eq!(
+            with_run_settings(&sql, 501, 90),
+            "SELECT 1 FROM (SELECT 1\n) AS src SETTINGS max_result_rows = 501, \
+             result_overflow_mode = 'break', max_execution_time = 90, join_use_nulls = 1"
+        );
+        assert_eq!(with_run_settings("SELECT 1", 5, 5), "SELECT 1");
+        // The default text swapped for the default numbers is the same text.
+        let own = format!("SELECT 1{SQL_SOURCE_SETTINGS}");
+        assert_eq!(with_run_settings(&own, 2000, 60), own);
+    }
+
+    #[test]
+    fn a_point_statement_takes_the_map_limit_and_never_exceeds_a_source_cap() {
+        let mart = Relation::Mart(Ident::new("mart_x").unwrap());
+        let (lat, lon, m) = (
+            Ident::new("lat").unwrap(),
+            Ident::new("lon").unwrap(),
+            Ident::new("visitors").unwrap(),
+        );
+        let sql = build_points_sql(&mart, (&lat, &lon), None, &m, Aggregate::Count, &[]);
+        assert!(sql.ends_with(" LIMIT 5000"), "{sql}");
+        assert!(with_point_limit(&sql, 800, 2000).ends_with(" LIMIT 800"));
+        assert!(with_point_limit(&sql, 50_000, 2000).ends_with(" LIMIT 50000"));
+
+        let source = Relation::Sql("SELECT 1 AS lat, 2 AS lon, 3 AS visitors".to_owned());
+        let sql = build_points_sql(&source, (&lat, &lon), None, &m, Aggregate::Count, &[]);
+        assert!(sql.contains(" LIMIT 2000 SETTINGS"), "{sql}");
+        let swapped = with_point_limit(&sql, 50_000, 3000);
+        assert!(swapped.contains(" LIMIT 3000 SETTINGS"), "{swapped}");
+        assert!(swapped.ends_with(SQL_SOURCE_SETTINGS), "{swapped}");
+        assert!(with_point_limit(&sql, 100, 3000).contains(" LIMIT 100 SETTINGS"));
+    }
+
+    #[test]
+    fn a_statement_that_does_not_end_in_a_limit_is_left_unchanged_by_the_point_swap() {
+        for sql in [
+            "SELECT 1",
+            "SELECT a FROM t LIMIT 5 OFFSET 3",
+            "SELECT a FROM t LIMIT x",
+        ] {
+            assert_eq!(with_point_limit(sql, 10, 10), sql);
+        }
     }
 }

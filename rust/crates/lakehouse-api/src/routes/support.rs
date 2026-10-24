@@ -235,6 +235,7 @@ pub(crate) async fn run_spec_sql(
     let result = match try_run_spec_sql(ch, sql, roles, placeholders, obligations).await {
         Ok(result) => result,
         Err(SpecRunFailure::Refused(message)) => json!({ "error": message }),
+        Err(SpecRunFailure::Tile(answer)) => answer,
         // SEC-11: a tile on a public or embed link is read by someone with
         // no sign-in; the database's text goes to the log under the id.
         Err(SpecRunFailure::Clickhouse(err)) => {
@@ -250,6 +251,11 @@ pub(crate) async fn run_spec_sql(
 pub(crate) enum SpecRunFailure {
     /// Refused by the policy rewrite before any query ran; the text is fixed.
     Refused(&'static str),
+    /// The query ended on a limit or a Stop (`BI-5` plan D6): the tile's
+    /// whole answer, with a fixed sentence and, for the time limit, a `limit`
+    /// object. Built here so every caller says the same thing and none of
+    /// them sees the engine's text.
+    Tile(Value),
     /// `ClickHouse` failed on the rewritten SQL.
     Clickhouse(ChError),
 }
@@ -282,12 +288,88 @@ pub(crate) async fn try_run_spec_sql(
     .map_err(|err| {
         SpecRunFailure::Refused(crate::policy_engine::enforcement_error_message(&err))
     })?;
-    let r = ch
-        .query(&rewritten, None)
+    // BI-5 (plan D3): the statement runs under the caller's limits. The
+    // SQL-source cap in the text is swapped for the configured numbers (it is
+    // also stored with the chart, so the stored text cannot carry them), and
+    // the same numbers travel as URL settings, with the query id a Stop finds
+    // it by. One row more than the cap is asked for, so a cut is told from an
+    // exact fit.
+    let run = crate::query_limits::QueryRun::current_or_detached();
+    let limits = run.limits().await.map_err(|err| {
+        tracing::error!(error = %err, "the query limits could not be read");
+        SpecRunFailure::Refused("The query limits could not be read.")
+    })?;
+    let seconds = u32::try_from(limits.timeout_seconds()).unwrap_or(u32::MAX);
+    let rewritten = lakehouse_bi::builder::with_run_settings(
+        &rewritten,
+        limits.chart_rows.saturating_add(1),
+        seconds,
+    );
+    let options = run.options(&limits, limits.chart_rows);
+    let mut r = ch
+        .query_with_options(&rewritten, &options, None)
         .await
-        .map_err(SpecRunFailure::Clickhouse)?;
+        .map_err(|err| tile_failure(err, &limits))?;
     let columns: Vec<String> = r.meta.iter().map(|m| m.name.clone()).collect();
-    Ok(json!({ "columns": columns, "rows": r.data }))
+    // The engine was asked for `chart_rows + 1` rows and `break`s at the end
+    // of a block, so a result of more than `chart_rows + 1` rows was cut (a
+    // block is whole, it does not end one row past the cap). Exactly
+    // `chart_rows + 1` is a complete result that is one row over: it is kept
+    // as it is, because pivots and previews read one row past their own cap
+    // to tell whether they cut (`pivot_trim`, `preview_rows`), and trimming
+    // here would blind them.
+    let cut = r.data.len() > limits.chart_rows as usize + 1;
+    if cut {
+        r.data.truncate(limits.chart_rows as usize);
+    }
+    let mut out = json!({ "columns": columns, "rows": r.data });
+    if cut {
+        out["limitHit"] = limits.rows_limit_json(limits.chart_rows);
+    }
+    Ok(out)
+}
+
+/// A `ClickHouse` failure of a tile query as the tile's failure: the engine
+/// stopping the query at the time limit and a Stop (`KILL QUERY`) each get a
+/// fixed answer (plan D6); anything else stays for the caller to classify.
+fn tile_failure(err: ChError, limits: &crate::query_limits::TileLimits) -> SpecRunFailure {
+    if err.is_time_limit() {
+        SpecRunFailure::Tile(json!({
+            "error": crate::query_limits::time_sentence("chart", limits),
+            "limit": limits.time_limit_json(),
+        }))
+    } else if err.is_killed_on_engine() {
+        SpecRunFailure::Tile(json!({ "error": crate::query_limits::STOPPED_SENTENCE }))
+    } else {
+        SpecRunFailure::Clickhouse(err)
+    }
+}
+
+/// `filtered` with the point-map limit of the caller's query limits
+/// (`BI-5`, feature decision 2) in place of the builder's fixed 5,000, for a
+/// `pointmap` or `geoheat`; any other kind comes back as it is. When the
+/// limits cannot be read the statement is left as built, and the run itself
+/// then refuses with the fixed sentence (`try_run_spec_sql`), so a failure
+/// here changes nothing the reader sees.
+pub(crate) async fn with_map_limit(
+    mut filtered: FilteredSql,
+    kind: lakehouse_bi::specs::ChartKind,
+) -> FilteredSql {
+    use lakehouse_bi::specs::ChartKind;
+    if !matches!(kind, ChartKind::Pointmap | ChartKind::Geoheat) {
+        return filtered;
+    }
+    if let Ok(limits) = crate::query_limits::QueryRun::current_or_detached()
+        .limits()
+        .await
+    {
+        filtered.sql = lakehouse_bi::builder::with_point_limit(
+            &filtered.sql,
+            limits.map_points,
+            limits.chart_rows,
+        );
+    }
+    filtered
 }
 
 /// The dashboard SQL sources the given charts read, by id — one
@@ -627,7 +709,7 @@ async fn add_bins(
             Err(SpecRunFailure::Clickhouse(err)) => {
                 let _logged = upstream_error::report_ch(&upstream_error::TILE, &err);
             }
-            Err(SpecRunFailure::Refused(_)) => {}
+            Err(SpecRunFailure::Refused(_) | SpecRunFailure::Tile(_)) => {}
         }
     }
     if !out.is_empty() {
@@ -722,7 +804,7 @@ pub(crate) async fn annotate_table(
                     // a reference id, nothing of it in the response.
                     let _logged = upstream_error::report_ch(&upstream_error::TILE, &err);
                 }
-                Err(SpecRunFailure::Refused(_)) => {}
+                Err(SpecRunFailure::Refused(_) | SpecRunFailure::Tile(_)) => {}
             }
         }
         Some(TableRead::Pivot { row_cap }) => {
@@ -827,7 +909,7 @@ pub(crate) async fn preview_rows(
         )?;
         shown = match try_run_spec_sql(ch, &sql, roles, placeholders, obligations).await {
             Ok(rows) => rows,
-            Err(SpecRunFailure::Refused(_)) => return None,
+            Err(SpecRunFailure::Refused(_) | SpecRunFailure::Tile(_)) => return None,
             Err(SpecRunFailure::Clickhouse(err)) => {
                 let _logged = upstream_error::report_ch(&upstream_error::TILE, &err);
                 return None;
@@ -1149,6 +1231,105 @@ mod run_spec_sql_enforcement {
         assert!(
             !val.to_string().contains("planted-marker"),
             "the database's text reached the tile: {val:?}"
+        );
+        Ok(())
+    }
+
+    /// BI-5 (plan D6): the engine stopping a tile at the time limit (code 159)
+    /// or a Stop (code 394) is a fixed sentence, with the limit for the first,
+    /// and never the engine's text.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_tile_the_time_limit_or_a_stop_ended_says_so_without_the_engines_text(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        for (body, expected_error, has_limit) in [
+            (
+                "Code: 159. DB::Exception: planted-marker Timeout exceeded (TIMEOUT_EXCEEDED)",
+                "This chart stopped after 60 seconds, the limit for this install.",
+                true,
+            ),
+            (
+                "Code: 394. DB::Exception: planted-marker Query was cancelled (QUERY_WAS_CANCELLED)",
+                "Stopped",
+                false,
+            ),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(500).set_body_string(body))
+                .mount(&server)
+                .await;
+            let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+            let obligations = PolicyEngineObligations::new(Some(&pool), &ch);
+            let (_, val) = run_spec_sql(
+                &ch,
+                "c",
+                "SELECT 1 AS n",
+                &[],
+                &PlaceholderValues::none(),
+                &obligations,
+            )
+            .await;
+            assert_eq!(val["error"], expected_error);
+            assert_eq!(
+                val["limit"],
+                if has_limit {
+                    serde_json::json!({"kind": "time", "value": 60, "source": {"kind": "install"}})
+                } else {
+                    serde_json::Value::Null
+                }
+            );
+            assert!(!val.to_string().contains("planted-marker"), "{val}");
+        }
+        Ok(())
+    }
+
+    /// BI-5 (plan D3): a tile query carries the time limit, the row cap plus
+    /// one, a query id and the cancel-on-close setting as URL settings, and
+    /// the SQL source's cap in the text follows the same numbers.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_tile_query_sends_its_limits_and_its_id_as_url_settings(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"meta":[{"name":"n","type":"UInt8"}],"data":[{"n":1}],"rows":1}"#,
+            ))
+            .mount(&server)
+            .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let obligations = PolicyEngineObligations::new(Some(&pool), &ch);
+        let sql = format!(
+            "SELECT 1 AS n{}",
+            lakehouse_bi::builder::SQL_SOURCE_SETTINGS
+        );
+        let (_, val) = run_spec_sql(
+            &ch,
+            "c",
+            &sql,
+            &[],
+            &PlaceholderValues::none(),
+            &obligations,
+        )
+        .await;
+        assert_eq!(val["rows"].as_array().map(Vec::len), Some(1));
+        let requests = server.received_requests().await.unwrap();
+        let url = requests[0].url.clone();
+        let q: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(q["max_execution_time"], "60");
+        assert_eq!(q["max_result_rows"], "2001");
+        assert_eq!(q["result_overflow_mode"], "break");
+        assert_eq!(q["cancel_http_readonly_queries_on_client_close"], "1");
+        assert!(
+            q["query_id"].starts_with(crate::query_limits::ANONYMOUS_PRINCIPAL),
+            "a detached run names the nil principal: {}",
+            q["query_id"]
+        );
+        let body = String::from_utf8(requests[0].body.clone()).unwrap();
+        assert!(
+            body.contains("max_result_rows = 2001") && body.contains("max_execution_time = 60"),
+            "{body}"
         );
         Ok(())
     }

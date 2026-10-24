@@ -1200,6 +1200,8 @@ async fn render_board_payload(
                     read_ref,
                 ) {
                     Ok(filtered) => {
+                        let filtered =
+                            crate::routes::support::with_map_limit(filtered, c.spec.kind).await;
                         let (id, mut val) = run_spec_sql(
                             ch,
                             &c.spec.id,

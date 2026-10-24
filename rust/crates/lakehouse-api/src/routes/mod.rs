@@ -1305,6 +1305,12 @@ pub fn router(state: AppState) -> Router {
         // OUTER layer) so a slow session/permission check while a caller
         // has the connection open still counts against the request's
         // deadline instead of running unbounded outside it.
+        // `BI-5`: the run every query of this request belongs to. Inside
+        // `auth_gate` so the principal it names is already there.
+        .layer(from_fn_with_state(
+            state.clone(),
+            crate::query_limits::scope_middleware,
+        ))
         .layer(from_fn_with_state(state.clone(), auth_gate))
         .layer(from_fn(timeout_middleware))
         .with_state(state)

@@ -7258,7 +7258,7 @@ mod tests {
             spec.spec.sql,
             "SELECT place, visitors FROM (\nSELECT day, seen_at, place, visitors FROM serving.mart_x\n) AS src \
              ORDER BY visitors DESC, place, visitors LIMIT 50 OFFSET 0 \
-             SETTINGS max_result_rows = 2000, result_overflow_mode = 'break', max_execution_time = 30"
+             SETTINGS max_result_rows = 2000, result_overflow_mode = 'break', max_execution_time = 60"
         );
         assert_eq!(spec.def.tables.table_mode.as_deref(), Some("rows"));
         assert!(spec.def.measures.is_empty() && spec.def.dimension.is_empty());

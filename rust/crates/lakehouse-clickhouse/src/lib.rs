@@ -101,6 +101,74 @@ pub enum ChError {
     Cancelled,
 }
 
+impl ChError {
+    /// The `ClickHouse` error code of a [`ChError::Server`] body such as
+    /// `Code: 159. DB::Exception: Timeout exceeded ...`, if it has that
+    /// shape. The text itself is for the log only (SEC-11); callers branch on
+    /// the code and write their own sentence.
+    #[must_use]
+    pub fn server_code(&self) -> Option<u32> {
+        let Self::Server(text) = self else {
+            return None;
+        };
+        let rest = text.trim_start().strip_prefix("Code: ")?;
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        digits.parse().ok()
+    }
+
+    /// Whether the engine stopped the query for running past its
+    /// `max_execution_time` (`TIMEOUT_EXCEEDED`, code 159).
+    #[must_use]
+    pub fn is_time_limit(&self) -> bool {
+        self.server_code() == Some(TIMEOUT_EXCEEDED)
+    }
+
+    /// Whether the query was killed on the engine (`QUERY_WAS_CANCELLED`,
+    /// code 394), for example by `KILL QUERY` after a Stop.
+    #[must_use]
+    pub fn is_killed_on_engine(&self) -> bool {
+        self.server_code() == Some(QUERY_WAS_CANCELLED)
+    }
+}
+
+/// `ClickHouse` error code `TIMEOUT_EXCEEDED`.
+pub const TIMEOUT_EXCEEDED: u32 = 159;
+/// `ClickHouse` error code `QUERY_WAS_CANCELLED`.
+pub const QUERY_WAS_CANCELLED: u32 = 394;
+
+/// How far past the engine's own limit the HTTP request waits (`BI-5` plan
+/// D3): the engine stops the query at `max_execution_time` and answers with
+/// its error, and this margin keeps the client from giving up first and
+/// turning that answer into a bare transport timeout.
+pub const LIMIT_MARGIN: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// What one limited, identified query asks of the engine (`BI-5` plan D3).
+///
+/// Every field is a URL setting of that one request, not text in the SQL, so
+/// the statement the caller wrote is the statement that runs. (A statement-
+/// level `SETTINGS` clause overrides these; the SQL source's own cap is kept
+/// in the statement for that reason, see `lakehouse_bi::builder`.)
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QueryOptions {
+    /// `max_execution_time`: the engine stops the query after this long. Also
+    /// sets the request's own timeout to this plus [`LIMIT_MARGIN`].
+    pub max_execution_time: Option<std::time::Duration>,
+    /// `max_result_rows` with `result_overflow_mode = break`: pass the number
+    /// of rows to keep plus one to learn whether the engine had more.
+    pub max_result_rows: Option<u64>,
+    /// `query_id`: lets `KILL QUERY WHERE query_id ...` find this query.
+    pub query_id: Option<String>,
+}
+
+impl QueryOptions {
+    /// The request's own timeout: the time limit plus [`LIMIT_MARGIN`], or
+    /// `None` (the client's default) without a limit.
+    #[must_use]
+    pub fn request_timeout(&self) -> Option<std::time::Duration> {
+        self.max_execution_time.map(|limit| limit + LIMIT_MARGIN)
+    }
+}
+
 impl From<reqwest::Error> for ChError {
     fn from(err: reqwest::Error) -> Self {
         Self::Transport(err)
@@ -182,7 +250,7 @@ impl ChClient {
         sql: &str,
         cancel: Option<&CancellationToken>,
     ) -> Result<ChResult, ChError> {
-        self.query_with_settings(sql, &[], cancel).await
+        self.query_with_settings(sql, &[], None, cancel).await
     }
 
     /// Run `sql` like [`ChClient::query`], but ask the engine to stop
@@ -206,38 +274,96 @@ impl ChClient {
         max_result_rows: usize,
         cancel: Option<&CancellationToken>,
     ) -> Result<ChResult, ChError> {
-        let max_result_rows = max_result_rows.to_string();
-        self.query_with_settings(
+        self.query_with_options(
             sql,
-            &[
-                ("max_result_rows", &max_result_rows),
-                ("result_overflow_mode", "break"),
-            ],
+            &QueryOptions {
+                max_result_rows: Some(u64::try_from(max_result_rows).unwrap_or(u64::MAX)),
+                ..QueryOptions::default()
+            },
             cancel,
         )
         .await
     }
 
-    /// The body of [`ChClient::query`] and [`ChClient::query_limited`]:
-    /// `settings` are sent as URL parameters of this request only.
+    /// Run `sql` like [`ChClient::query`] under the limits and identity of
+    /// `options` (`BI-5` plan D3): `max_execution_time`, `max_result_rows`
+    /// (with `result_overflow_mode = break`) and `query_id` travel as URL
+    /// settings of this request, together with
+    /// `cancel_http_readonly_queries_on_client_close = 1`, so the engine also
+    /// ends the query when this request is dropped (the pattern
+    /// [`ChClient::query_stream`] already uses).
+    ///
+    /// `wait_end_of_query = 1` is sent with a time limit: without it the
+    /// engine may already have written part of the JSON body when the limit
+    /// hits, and the error arrives as text after a `200`, which the parse
+    /// below would read as an empty result instead of an error.
+    ///
+    /// When `max_execution_time` is set the request's own timeout is that
+    /// plus [`LIMIT_MARGIN`], replacing the client's fixed 60 s for this call
+    /// only.
+    ///
+    /// # Errors
+    ///
+    /// See [`ChClient::query`]. A query the engine stopped for its time limit
+    /// is a [`ChError::Server`] for which [`ChError::is_time_limit`] holds.
+    pub async fn query_with_options(
+        &self,
+        sql: &str,
+        options: &QueryOptions,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<ChResult, ChError> {
+        let mut settings: Vec<(&str, String)> = Vec::new();
+        if let Some(limit) = options.max_execution_time {
+            // Whole seconds, rounded up: a limit is never shortened.
+            settings.push((
+                "max_execution_time",
+                limit
+                    .as_secs()
+                    .saturating_add(u64::from(limit.subsec_nanos() > 0))
+                    .to_string(),
+            ));
+            settings.push(("wait_end_of_query", "1".to_owned()));
+        }
+        if let Some(rows) = options.max_result_rows {
+            settings.push(("max_result_rows", rows.to_string()));
+            settings.push(("result_overflow_mode", "break".to_owned()));
+        }
+        if let Some(id) = &options.query_id {
+            settings.push(("query_id", id.clone()));
+        }
+        settings.push((
+            "cancel_http_readonly_queries_on_client_close",
+            "1".to_owned(),
+        ));
+        let borrowed: Vec<(&str, &str)> = settings.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        self.query_with_settings(sql, &borrowed, options.request_timeout(), cancel)
+            .await
+    }
+
+    /// The body of [`ChClient::query`] and [`ChClient::query_with_options`]:
+    /// `settings` are sent as URL parameters of this request only, and
+    /// `timeout`, when given, replaces the client's default for it.
     async fn query_with_settings(
         &self,
         sql: &str,
         settings: &[(&str, &str)],
+        timeout: Option<std::time::Duration>,
         cancel: Option<&CancellationToken>,
     ) -> Result<ChResult, ChError> {
         let body = build_query_body(sql);
         let fut = async {
-            let response = self
+            let mut request = self
                 .client
                 .post(&self.url)
                 .query(settings)
                 .basic_auth(&self.user, Some(&self.password))
                 .header(CONTENT_TYPE, "text/plain; charset=utf-8")
                 .header(CACHE_CONTROL, "no-store")
-                .body(body)
-                .send()
-                .await?;
+                .body(body);
+            if let Some(timeout) = timeout {
+                request = request.timeout(timeout);
+            }
+            let response = request.send().await?;
             let status = response.status();
             let text = response.text().await?;
             if !status.is_success() {
@@ -1006,5 +1132,112 @@ mod tests {
 
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests[0].url.query(), None);
+    }
+
+    // -- query_with_options (BI-5 plan D3) ---------------------------------
+
+    #[tokio::test]
+    async fn query_with_options_sends_the_limits_the_id_and_the_cancel_setting_as_url_parameters() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(query_param("max_execution_time", "45"))
+            .and(query_param("max_result_rows", "2001"))
+            .and(query_param("result_overflow_mode", "break"))
+            .and(query_param("query_id", "u:r:1"))
+            .and(query_param(
+                "cancel_http_readonly_queries_on_client_close",
+                "1",
+            ))
+            .and(query_param("wait_end_of_query", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"meta":[{"name":"n","type":"UInt64"}],"data":[{"n":1}],"rows":1}"#,
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let options = QueryOptions {
+            max_execution_time: Some(std::time::Duration::from_secs(45)),
+            max_result_rows: Some(2001),
+            query_id: Some("u:r:1".to_owned()),
+        };
+        let result = client(&server.uri())
+            .query_with_options("SELECT n FROM t", &options, None)
+            .await
+            .unwrap();
+        assert_eq!(result.rows, 1);
+        let requests = server.received_requests().await.unwrap();
+        let body = String::from_utf8(requests[0].body.clone()).unwrap();
+        assert!(
+            !body.contains("SETTINGS"),
+            "the SQL text stays as written: {body}"
+        );
+    }
+
+    #[test]
+    fn the_request_waits_the_limit_plus_ten_seconds_and_a_call_without_a_limit_keeps_the_client_default()
+     {
+        let limited = QueryOptions {
+            max_execution_time: Some(std::time::Duration::from_secs(300)),
+            ..QueryOptions::default()
+        };
+        assert_eq!(
+            limited.request_timeout(),
+            Some(std::time::Duration::from_secs(310))
+        );
+        assert_eq!(QueryOptions::default().request_timeout(), None);
+    }
+
+    #[tokio::test]
+    async fn a_limit_given_in_fractions_of_a_second_is_rounded_up() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(query_param("max_execution_time", "2"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("Ok."))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let options = QueryOptions {
+            max_execution_time: Some(std::time::Duration::from_millis(1500)),
+            ..QueryOptions::default()
+        };
+        client(&server.uri())
+            .query_with_options("SELECT 1", &options, None)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_engine_error_is_classified_by_its_code_and_never_by_its_text() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500).set_body_string(
+                "Code: 159. DB::Exception: Timeout exceeded: elapsed 1.0 seconds, maximum: 1. (TIMEOUT_EXCEEDED)",
+            ))
+            .mount(&server)
+            .await;
+        let err = client(&server.uri())
+            .query("SELECT 1", None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.server_code(), Some(159));
+        assert!(err.is_time_limit());
+        assert!(!err.is_killed_on_engine());
+
+        assert!(
+            ChError::Server(
+                "Code: 394. DB::Exception: Query was cancelled. (QUERY_WAS_CANCELLED)".to_owned()
+            )
+            .is_killed_on_engine()
+        );
+        assert_eq!(
+            ChError::Server("Code: 62. DB::Exception: Syntax error".to_owned()).server_code(),
+            Some(62)
+        );
+        assert_eq!(
+            ChError::Server("ClickHouse HTTP 500".to_owned()).server_code(),
+            None
+        );
+        assert_eq!(ChError::Cancelled.server_code(), None);
     }
 }

@@ -468,6 +468,7 @@ async fn get_body(
                 Ok(filtered) => filtered,
                 Err(msg) => return (c.spec.id.clone(), json!({ "error": msg })),
             };
+            let filtered = crate::routes::support::with_map_limit(filtered, c.spec.kind).await;
             let (id, mut val) = run_spec_sql(
                 ch,
                 &c.spec.id,
@@ -6500,8 +6501,8 @@ mod records_pages {
         let (rows, count) = page_and_count(&server).await;
         assert!(rows.contains("channel = 'web'"), "{rows}");
         // The source's cap rides on the count too.
-        assert!(count.contains("max_execution_time = 30"), "{count}");
-        assert!(rows.contains("max_execution_time = 30"), "{rows}");
+        assert!(count.contains("max_execution_time = 60"), "{count}");
+        assert!(rows.contains("max_execution_time = 60"), "{rows}");
     }
 
     #[tokio::test]
