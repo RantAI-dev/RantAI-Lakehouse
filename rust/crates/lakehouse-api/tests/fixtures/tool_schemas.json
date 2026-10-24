@@ -7289,5 +7289,16 @@
         ]
       }
     }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "list_maps",
+      "description": "List the maps a geomap, pointmap or geoheat chart can be drawn on: the ones that ship with the console (Jakarta, Indonesia, the world, and the states or provinces of any country) and the ones an administrator uploaded, with the id to put in `map` and a label. Call it before setting `map`.",
+      "parameters": {
+        "type": "object",
+        "properties": {}
+      }
+    }
   }
 ]

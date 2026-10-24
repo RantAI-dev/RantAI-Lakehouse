@@ -369,6 +369,22 @@ Commits: `75997369` (T1), `0f34504e` (T2, with the demo seed). Rust; verified wi
 
 **Demo data for the Gantt QA:** `ops/demo/mart_demo_projects.sql` (15 tasks, three teams, two reversed rows). The repo has no seed for `mart_demo_map_points`, so this one is a hand-run script; it writes to ClickHouse only when someone runs it (dev stack only, `DROP TABLE IF EXISTS` then create).
 
+### C2b Uploaded maps, server half (T5, T6, T7; developer, branch `feat/bi-phase-6`)
+
+Commits: T5 `a109bf98`, T6 `fb096312`, T7 (next commit, `list_maps`). Rust plus one line of TypeScript (`capabilities.ts`). Checked with `cargo test -p lakehouse-bi geo::` (9 passed) and `cargo clippy ... --all-targets -- -D warnings` on `lakehouse-bi`, `lakehouse-store` and `lakehouse-api` (clean); the store and route integration tests and the `lakehouse-api` lib tests were **not run locally** (disk): CI is the check.
+
+**Deviations from D5, for the reviewer**
+- **No `geo`/`geojson` crates.** `lakehouse_bi::geo` has its own Douglas-Peucker pass (rings stay closed and never drop below a triangle, positions rounded to five decimals, tolerance doubled from about a metre up to about 5 km until the written file is at most 5 MB, else a sentence). Reasons: the disk this was built on, and no change to `cargo deny` / `cargo audit`. The contract (a closed ring, at most 5 MB) is the same; it does not preserve topology between rings (neighbouring borders may show hairline gaps, which the feature page already says). A 30 MB fixture generated in the test (1.3 M positions) simplifies under 5 MB.
+- **Migration `0100_geo_map.sql`** (the plan says "next free above 0098"; `0099` is on main, `0098_public_links` on `feat/bi-phase-4b`).
+- **No gzip column.** The file is stored as `bytea` (at most 5 MB, CHECK-ed); Postgres compresses large values itself.
+- **`console.geo_region` (ClickHouse) is not created here.** Its only reader is part C3 (`RegionOf`, T9); creating an empty table now would be dead code. T9 owns it.
+- **No tenant column**, per the plan ("visible to everyone who can make charts"). In a multi-tenant installation every tenant sees every uploaded map; say so if that is not wanted.
+- No audit event is written for upload, rename or delete (the plan does not ask for one); easy to add if the owner wants it.
+
+**Contract with the console (met):** `GET /api/maps` -> `{ maps: [{ id, name, nameProperty, regionCount, createdAt, createdBy }] }`; `POST` multipart `name`, `nameProperty`, `file` -> 201 and the map, 400 with the sentence (413 does not exist in `ApiError`, so the over-50-MB refusal is a 400 with the console's own sentence, read before parsing); `PATCH` `{ name }` -> the map; `DELETE` -> `{ ok: true }` or 409 `{ error, charts: [{ chartId, chartTitle, dashboardId, dashboardTitle }] }` (only charts the caller may see are named; a delete the chart store cannot check is refused); `GET /api/maps/{id}/geojson` -> `properties.name` on every feature, `ETag` (Postgres `md5`), 304 on `If-None-Match`, `Cache-Control: private, max-age=3600`. All five routes are in `POLICY_TABLE` (GET reads `RequiresAuth`; the rest `settings:write`), so the table-driven `route_auth` / `route_policy` tests cover them both ways; `/api/maps` has the upload timeout.
+
+**T7.** `list_maps` (Read, `dashboard:read`): the four fixed built-in maps by id and label, the rule for the per-country ids (`adm1-<iso3 lower>`), and the uploaded maps from Postgres. The tool count is 107 (pin updated), the fixture has the tool appended, the tool is in the dashboard domain of the prompt (`list_maps` beside `list_charts`; no new keyword, so it is offered when the conversation already is about charts) and in `capabilities.ts`. Not done: a tool test that lists an uploaded map (needs Postgres in the lib test state), the `AI-15` case.
+
 ## 8. Review (planner appends, one entry per part)
 
 Planner, 2026-10-24: the console's Gantt assumptions are the contract for T1 (result columns `task`, `group`, `start`, `end`, `progress`; optional `reversedRows`; dates as report-zone strings). Feature decision 2's "today line can be switched off" becomes a style field `todayLine: false` (planner default). The console adds the switch, and T1 validates the field.

@@ -606,6 +606,7 @@ const DOMAINS: &[Domain] = &[
         ],
         tools: &[
             "list_charts",
+            "list_maps",
             "list_sql_sources",
             "suggest_join",
             "suggest_dashboard",

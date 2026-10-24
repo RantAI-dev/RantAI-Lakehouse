@@ -162,6 +162,8 @@ pub(super) fn handles(name: &str) -> bool {
     super::metrics::handles(name)
         // BI-18 part C: the tab tools ride the same guard arm.
         || super::tabs::handles(name)
+        // BI-16 part C2: the map list rides it too.
+        || super::maps::handles(name)
         || matches!(
             name,
             "list_formula_functions"
@@ -194,6 +196,9 @@ pub(super) async fn run(
     }
     if super::tabs::handles(name) {
         return super::tabs::run(state, principal, name, args).await;
+    }
+    if super::maps::handles(name) {
+        return super::maps::list_maps(state).await;
     }
     match name {
         "list_formula_functions" => list_formula_functions(),

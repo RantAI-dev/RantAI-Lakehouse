@@ -618,6 +618,12 @@ fn suggest_dashboard_schema() -> Value {
         "parameters": { "type": "object", "properties": {} } } })
 }
 
+fn list_maps_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "list_maps",
+        "description": "List the maps a geomap, pointmap or geoheat chart can be drawn on: the ones that ship with the console (Jakarta, Indonesia, the world, and the states or provinces of any country) and the ones an administrator uploaded, with the id to put in `map` and a label. Call it before setting `map`.",
+        "parameters": { "type": "object", "properties": {} } } })
+}
+
 fn list_charts_schema() -> Value {
     json!({ "type": "function", "function": { "name": "list_charts",
         "description": "List the chart cards saved on dashboards.",
@@ -2383,6 +2389,15 @@ pub static TOOLS: &[ToolSpec] = &[
         risk: Risk::Read,
         permission: "query:read",
     },
+    // BI-16 part C2 (D10): the maps a chart can be drawn on, built-in and
+    // uploaded. Reading mirrors `GET /api/maps` (any signed-in caller), and the
+    // dashboard tools need `dashboard:read` anyway.
+    ToolSpec {
+        name: "list_maps",
+        schema: list_maps_schema,
+        risk: Risk::Read,
+        permission: "dashboard:read",
+    },
 ];
 
 /// The `OpenAI`-compatible `tools` schema array, matching
@@ -2455,8 +2470,8 @@ mod tests {
         // `export_dashboard` and `export_chart` (`AI-10`, with `BI-1`)
         // + `create_report_subscription`, `list_report_subscriptions`,
         // `update_report_subscription` and `delete_report_subscription`
-        // (`AI-10`, with `RPT-1`).
-        assert_eq!(tool_schemas().len(), 106);
+        // (`AI-10`, with `RPT-1`) + `list_maps` (`BI-16` part C2, `AI-5`).
+        assert_eq!(tool_schemas().len(), 107);
     }
 
     /// `RPT-1` (with `AI-10`): the report tools have the console's permission,
