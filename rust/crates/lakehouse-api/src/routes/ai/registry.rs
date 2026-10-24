@@ -631,6 +631,19 @@ fn list_sql_sources_schema() -> Value {
         "parameters": { "type": "object", "properties": {} } } })
 }
 
+fn get_query_limits_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "get_query_limits",
+        "description": "The time and row limits that apply to the person you are talking to: how long a chart or Query Studio query may run (timeoutSeconds), rows a chart reads (chartRows), points a map shows (mapPoints), rows Query Studio returns (studioRows), and where the time limit comes from (source: the install, or one of their roles). Use it to answer \"what are my query limits?\" and \"why did this chart time out?\". You cannot change limits: an administrator does, in Admin > Settings > Query limits.",
+        "parameters": { "type": "object", "properties": {} } } })
+}
+
+fn stop_query_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "stop_query",
+        "description": "Stop the person's own running queries on the engine (\"stop the running query\"). With runId (a UUID, the run of a dashboard load or a Query Studio run) it ends that run; without it, it ends every query of this person that is running now. It never touches anyone else's queries. Answers how many were stopped (0: nothing was running).",
+        "parameters": { "type": "object", "properties": {
+            "runId": { "type": "string", "description": "UUID of one run; omit to stop all of the person's running queries" } } } } })
+}
+
 fn delete_chart_schema() -> Value {
     json!({ "type": "function", "function": { "name": "delete_chart",
         "description": "Delete one saved chart card (by id). Built-in charts cannot be deleted. Needs human approval before it runs.",
@@ -1782,6 +1795,25 @@ pub static TOOLS: &[ToolSpec] = &[
         risk: Risk::Read,
         permission: "dashboard:read",
     },
+    // Read-only: reports the limits that apply to the person (`BI-5`, D7).
+    ToolSpec {
+        name: "get_query_limits",
+        schema: get_query_limits_schema,
+        risk: Risk::Read,
+        permission: "",
+    },
+    // `Risk::Read` although it kills queries (`BI-5`, D7): it can only end the
+    // caller's OWN running queries (the pattern's principal part is the
+    // authenticated person, never an argument), it changes no data and
+    // nothing needs to be approved or undone; the same call the Stop button
+    // makes. Killing someone else's query is `kill_query`, which needs
+    // `workload:cancel` and approval.
+    ToolSpec {
+        name: "stop_query",
+        schema: stop_query_schema,
+        risk: Risk::Read,
+        permission: "",
+    },
     ToolSpec {
         name: "delete_chart",
         schema: delete_chart_schema,
@@ -2448,7 +2480,7 @@ mod tests {
         // + `create_report_subscription`, `list_report_subscriptions`,
         // `update_report_subscription` and `delete_report_subscription`
         // (`AI-10`, with `RPT-1`).
-        assert_eq!(tool_schemas().len(), 106);
+        assert_eq!(tool_schemas().len(), 108);
     }
 
     /// `RPT-1` (with `AI-10`): the report tools have the console's permission,
@@ -2919,6 +2951,9 @@ mod tests {
             offered_names,
             vec![
                 "get_quality".to_owned(),
+                // BI-5: both limits tools need only a sign-in.
+                "get_query_limits".to_owned(),
+                "stop_query".to_owned(),
                 "list_alert_rules".to_owned(),
                 "get_audit_history".to_owned(),
                 "list_classification_rules".to_owned(),

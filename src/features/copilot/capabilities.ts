@@ -26,6 +26,8 @@ export const CAPABILITIES: Capability[] = [
     tools: ["run_sql", "ask_user", "list_datasets", "describe_dataset", "get_lineage", "get_quality", "describe_mart",
       // BI-2 / AI-7: a question for a number is answered from a named metric when one matches, in Ask mode too.
       "list_metrics", "describe_metric", "query_metric",
+      // BI-5: the limits that apply to the person, and Stop for their own running queries. Read-only, so Ask mode offers them too.
+      "get_query_limits", "stop_query",
       // BI-1 / AI-10: "give me this dashboard as a PDF" is a question, not a change: a link, in Ask mode too.
       "export_dashboard", "export_chart",
       // RPT-1 / AI-10: listing one's scheduled reports is a question too.

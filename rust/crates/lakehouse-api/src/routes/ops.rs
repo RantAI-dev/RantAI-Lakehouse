@@ -418,6 +418,10 @@ pub(crate) enum KillTarget<'a> {
     /// checks the run id is one, so the pattern cannot hold a `LIKE`
     /// wildcard, a quote or anyone else's prefix.
     OwnRun(String),
+    /// Every query whose id starts `<principal uuid>:`, that is every run of
+    /// the caller: the assistant's `stop_query` with no run named. Built only
+    /// by [`KillTarget::own_all`], from a `Uuid`.
+    OwnAll(String),
 }
 
 impl KillTarget<'_> {
@@ -427,11 +431,16 @@ impl KillTarget<'_> {
         Some(KillTarget::OwnRun(format!("{principal}:{run}:%")))
     }
 
+    /// All of the caller's own running queries (`stop_query` without a run).
+    pub(crate) fn own_all(principal: uuid::Uuid) -> KillTarget<'static> {
+        KillTarget::OwnAll(format!("{principal}:%"))
+    }
+
     /// The `WHERE` condition that selects the target's queries.
     fn condition(&self) -> String {
         match self {
             Self::Exact(id) => format!("query_id = {}", SqlLiteral::from(*id)),
-            Self::OwnRun(pattern) => {
+            Self::OwnRun(pattern) | Self::OwnAll(pattern) => {
                 format!("query_id LIKE {}", SqlLiteral::from(pattern.as_str()))
             }
         }
@@ -455,7 +464,7 @@ impl KillTarget<'_> {
 /// module-level safety note in the Task 2.6 brief: no `KILL QUERY` may run
 /// against the live cluster during this work.
 pub(crate) fn kill_query_sql(target: &KillTarget<'_>) -> String {
-    let asynchronous = matches!(target, KillTarget::OwnRun(_));
+    let asynchronous = !matches!(target, KillTarget::Exact(_));
     format!(
         "KILL QUERY WHERE {}{}",
         target.condition(),
