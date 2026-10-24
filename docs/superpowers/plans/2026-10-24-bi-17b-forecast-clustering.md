@@ -220,4 +220,19 @@ Checks on the final commit: `bun run typecheck` exit 0; `bun run lint` 0 errors,
 
 Process note: two sessions resumed this task at once for a while and both wrote to the worktree; the committed `src/lib/kmeans.ts` (`kmeans({ points, k })`) is the other session's version of T3, not the `cluster(points, k)` the T3 handoff above describes. The T3 handoff text predates that and should be read against the file.
 
+### T1 Validation and assistant schema (developer, branch `feat/bi-phase-6`)
+
+Written after T2 to T4 because the owner's QA hit "body JSON is invalid" on saving a chart with a Forecast line: the console sent `kind: "forecast"`, `horizon` and `clusters`, which the server refused as unknown. Commits: `f42c7077` (`lakehouse-bi`), `7274a470` (the AI files and the fixture).
+
+- `params.rs`: `LineKind::Forecast` (`is_computed`), `ReferenceLine.horizon` and `ResolvedLine.horizon` (`Option<u32>`, left out when absent, so an old chart writes back byte for byte; tested). `check_reference_lines`: horizon 1 to 60 (`MAX_FORECAST_HORIZON`), at most one forecast, kinds bar/line/area/stacked/combo (not hbar), no breakdown, no `value`/`to`, `horizon` refused on other kinds, `measure` allowed. The breakdown sentence of the other computed kinds is unchanged.
+- `shape.rs`: `RelationCheck.truncated_grain`, set in `store.rs` from the chart's grain; `check_against_relation` refuses a forecast whose date column has no minute-to-year time grain (a part of the date such as weekday does not count). This is the "kind and dimension" check D1 asks for, placed where the relation is known.
+- `style.rs`: `StyleFields.clusters: Option<Clusters { k: ClusterCount }>`; `ClusterCount` is `"auto"` or a number on the wire (custom serde; a number too large for `u8` is kept as 255 so `check_style` refuses it with its own sentence). Only scatter and bubble; 2 to 10 (`check_clusters`, split out for clippy `too_many_lines`). `deny_unknown_fields` on `Clusters`.
+- AI files, minimal: `registry.rs` `reference_lines_schema` (kind `forecast`, `horizon`) and `style_properties` (`clusters`; shared by create_chart, update_chart and format_chart, so all three fixtures change); `look.rs` `FORMAT_FIELDS` gains `clusters` (10 to 11). `tests/fixtures/tool_schemas.json` regenerated with the ignored writer test; the diff is only those additions. Tool count unchanged. Not touched: the prompt, `capabilities.ts`, the AI-15 cases (T5).
+
+Tests: `lakehouse-bi` 552 passed, 0 failed, 3 ignored (new: forecast line checks incl. every refusal, round trip with `horizon` and resolved line, clusters checks and round trip, the forecast grain check); `lakehouse-api` lib `routes::ai` 402 passed, 1 ignored (new: `a_forecast_line_and_clusters_are_saved_and_checked`; two field-list pins updated); `--test ai_tool` 21 passed (run before the last look.rs test was added; the fixture did not change after). `cargo fmt --check` clean; `cargo clippy --workspace --all-targets -- -D warnings` exit 0 (without `--all-features`, as asked). All with `CARGO_TARGET_DIR=/home/hv/.cache/lakehouse-uiux-target CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0`, one command at a time, `--test-threads=1`, sources touched before each run.
+
+Not verified: a real save through the API against ClickHouse (needs the stack; the validation is unit-tested); `sec11_guard`/`route_auth` were not run (no route was added or changed). A first clippy run showed errors in `lakehouse-api` about `store::move_board` and `set_board_public` that do not exist in this tree; they were a stale artifact from another worktree in the shared target dir and vanished on the next run after touching the sources.
+
+Disk: the root disk dropped to 9.0 GB free during the last combined run (under the 10 GB line you set); I stopped cargo after it finished. The shared target dir is 7.7 GB before these runs.
+
 ## 8. Review (planner appends)
