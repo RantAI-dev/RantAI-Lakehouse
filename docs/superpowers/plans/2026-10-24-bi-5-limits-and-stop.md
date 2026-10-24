@@ -244,6 +244,29 @@ Merged `origin/feat/bi-phase-4b` (QS-1, the Query Studio editor) into the branch
 - `bun run test`: 2610 pass, 0 fail (2611 tests, 270 files).
 - Not verified: a real browser; a server with the cancel route (T4 is not built); the webpack build.
 
+### Handoff (server T1-T5, T7), developer, branch `feat/bi-phase-5`
+
+Commits: `2c7207b1` T1 settings, `27400302` T2 engine options, `b937755a` T3 deadlines, `c23331bd` T4 cancel, `9cf44c94` T5 assistant, `95dcfc77` T2 follow-up found by T7, `3b57dee9` T7 `docs/plans/BI-5-RESULT.md`; `origin/feat/bi-phase-4b` merged twice (`50ed5d31`, `5b2c36ab`). Migration is `0101_query_limits.sql`. The console contract of section 7's T6 handoff is met as written (`/api/settings/limits` GET/PUT, `limit` on a time-limited tile, `limitHit` on a row-cut tile result, `X-Run-Id`, `POST /api/query/cancel { runId }` answering `{ stopped }`).
+
+**Deviations (the planner accepted the first two in the coordinator's note):**
+1. D3: the SQL-source `SETTINGS` text is swapped at run time (`builder::with_run_settings`, one body with `with_export_settings`) and the point-map `LIMIT` by `builder::with_point_limit`, not `Relation::settings(limits)`: a saved chart stores that text, and `ReadContext` has about 30 literal construction sites. The run (principal, `X-Run-Id`, counter) is a task-local set by `query_limits::scope_middleware`; tiles run on the request's task. `SQL_SOURCE_SETTINGS` now says 60 s (the new default); the pinned texts follow. The pin tying `SQL_SOURCE_MAX_ROWS` to the text stays, and a new test ties the builder text, `QueryLimits::default` and migration 0101's defaults.
+2. D4: board routes get the 35-minute cap as the middleware deadline and the handler's `ceil(tiles/6) x limit + 15 s` decides (a one-limit middleware deadline would cut a two-round board first); `/api/query/run` gets the longest limit + 15 s. Written at `deadline_for`.
+3. D7: `stop_query` with no `runId` stops all of the person's running queries, not only those started in the chat (query ids do not say which surface started them).
+4. A tile query is cut when more than `chart_rows + 1` rows come back (the engine is asked for one more than the cap; exactly cap + 1 is kept, because pivots and previews read one past their own cap to say they cut).
+
+**Found by T7 (see `docs/plans/BI-5-RESULT.md`):** `cancel_http_readonly_queries_on_client_close` alone does NOT cancel a buffered `FORMAT JSON` query when the client leaves (still running after 40 s); progress headers make it go in 0.5 to 3 s, so `query_with_options` sends them. With progress headers the time-limit error arrives as an HTTP 200 body; the client now reads that as an error instead of an empty result. Both are fixed in `95dcfc77`.
+
+**Limits of this slice (backlog follow-ups):** the SQL source preview in the editor keeps the default text and does not follow the setting; a tile cut at the map-point limit carries no `limitHit` marker; a board-deadline end-to-end test with a mock engine is not written (the mechanism, `tile_pool::run_tiles_until`, and `board_deadline` have unit tests).
+
+**Commands run (from `rust/`, `CARGO_TARGET_DIR=/home/hv/.cache/lakehouse-uiux-target CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0`, under `flock`):**
+- `cargo fmt --check`: clean.
+- `cargo clippy -p lakehouse-store -p lakehouse-api --all-targets -- -D warnings` (T1) and `-p lakehouse-clickhouse -p lakehouse-bi -p lakehouse-api` (T2, T3): clean on the 1.96 toolchain. On 1.99.1 `-p lakehouse-api` reports three lints in code that is not BI-5's (`dashboard.rs:196` and `render.rs:152` `result_large_err`, `export.rs:484` `unused_async_trait_impl`); the BI-5 lints on 1.99 (`Duration::from_mins`, `assert_is_empty`) are fixed. `-p lakehouse-clickhouse --all-targets -- -D warnings` clean on 1.99.1 after the follow-up.
+- `cargo test -p lakehouse-clickhouse --lib`: 33 passed. `-p lakehouse-bi --lib`: 554 passed, 3 ignored (T2). `-p lakehouse-api --lib` with filters: `query_limits` 12 passed (T1); `run_spec_sql_enforcement` 6 passed; `routes::dashboard routes::query routes::embed routes::layers support query_limits` 327 passed, 16 ignored; `tile_pool query_limits routes::tests route_timeout routes::dashboard routes::embed` 217 passed; `routes::ops query_limits route_policy policy::` 83 passed; `routes::ai routes::ops tools:: prompt` 460 passed, 1 ignored; the ignored `write_tool_schema_fixture` run once (count pin now 108).
+- `bun test src/features/copilot`: 73 pass. `python3 -I -m unittest` on `ops/ai_eval/test_ai_eval.py`: 165 OK (the new case is `limits_why_timed_out`).
+- T7: scripts against a throwaway ClickHouse 26.8 container (removed afterwards).
+
+**Not verified:** every integration test (`tests/query_limits.rs` in the store, `tests/query_limits_route.rs`, `tests/query_cancel_route.rs`, the new `route_auth.rs` cases, `sec11_guard`, `ai_tool`) was written but not run here, per the machine rules; CI on #245 runs them. The full workspace clippy/test on 1.99.1. The end-to-end Stop timing through console, proxy and API, whether a browser abort reaches the API through the Next rewrite, and the API ClickHouse user's `KILL QUERY` grant (section 5 items) are *not verified*. The webpack build. The AI-15 run itself (the case is added, not run).
+
 ## 8. Review (planner appends)
 
 Planner, 2026-10-24: the console's shapes are accepted as the contract for the Rust tasks (the `/api/settings/limits` GET/PUT shape, the failed tile's `limit`, `X-Run-Id`, `POST /api/query/cancel`). The row-cut marker on a tile result is named **`limitHit`**, because `limit` is already a raw table's page size. T1 to T5 build to these shapes.
