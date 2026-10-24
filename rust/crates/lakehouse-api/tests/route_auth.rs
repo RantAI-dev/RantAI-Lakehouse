@@ -2717,3 +2717,44 @@ async fn the_public_link_routes_are_gated_in_both_directions() {
         );
     }
 }
+
+/// `BI-26` (D5, D8): the values route is public (the signed token is the
+/// credential: with no token it answers 400, never 401 or 403, and nothing is
+/// read), and the settings route is `dashboard:write`: no session is 401,
+/// `dashboard:read` alone is 403, `dashboard:write` gets past the gate.
+#[tokio::test]
+async fn the_embed_values_and_settings_routes_are_gated_in_both_directions() {
+    let TestApp { router, pool } = spin_up().await;
+    let policy_of = |method: &str, path: &str| {
+        POLICY_TABLE
+            .iter()
+            .find(|(m, p, _)| *m == method && *p == path)
+            .map(|(_, _, policy)| *policy)
+    };
+    assert_eq!(policy_of("POST", "/api/embed/values"), Some(Policy::Public));
+    let resp =
+        request_with_cookie_and_body(&router, "POST", "/api/embed/values", "", b"{}".to_vec())
+            .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let path = "/api/dashboard/embed-settings";
+    assert_eq!(
+        policy_of("PUT", path),
+        Some(Policy::RequiresPermission("dashboard:write"))
+    );
+    let body = br#"{"board":"b_x","filterModes":{}}"#.to_vec();
+    let resp = request_with_cookie_and_body(&router, "PUT", path, "", body.clone()).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let reader = create_principal_with_permissions(&pool, "dashboard:read").await;
+    let cookie = session_cookie_for_user(&pool, reader).await;
+    let resp = request_with_cookie_and_body(&router, "PUT", path, &cookie, body.clone()).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let writer = create_principal_with_permissions(&pool, "dashboard:write").await;
+    let cookie = session_cookie_for_user(&pool, writer).await;
+    let resp = request_with_cookie_and_body(&router, "PUT", path, &cookie, body).await;
+    assert!(
+        resp.status() != StatusCode::UNAUTHORIZED && resp.status() != StatusCode::FORBIDDEN,
+        "a writer got {}",
+        resp.status()
+    );
+}

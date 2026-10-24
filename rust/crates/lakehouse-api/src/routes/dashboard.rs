@@ -3574,9 +3574,24 @@ pub struct ValuesQuery {
     filters: Option<String>,
 }
 
+impl ValuesQuery {
+    /// The query of a signed embed's dropdown (`BI-26` plan D5): `column` over
+    /// the relations `board`'s charts read, narrowed by `filters` (JSON list).
+    pub(crate) fn for_board(column: &str, board: &str, filters: String) -> Self {
+        Self {
+            column: Some(column.to_owned()),
+            q: None,
+            board: Some(board.to_owned()),
+            filters: Some(filters),
+        }
+    }
+}
+
 /// Values a list returns at most; one more is fetched to know whether the
 /// list was cut.
 const VALUES_LIMIT: usize = 200;
+/// The most values a signed embed's dropdown lists (`BI-26` plan D5).
+pub(crate) const EMBED_VALUES_LIMIT: usize = 1_000;
 /// Longest search text, in characters.
 const VALUES_SEARCH_MAX_CHARS: usize = 200;
 
@@ -3651,12 +3666,12 @@ fn values_select(
 }
 
 /// The statement over every relation's `SELECT`, fetching one value more
-/// than [`VALUES_LIMIT`] so the caller can tell the list was cut.
-fn values_statement(selects: &[String], settings: &str) -> String {
+/// than `limit` so the caller can tell the list was cut.
+fn values_statement(selects: &[String], settings: &str, limit: usize) -> String {
     let union = selects.join(" UNION DISTINCT ");
     format!(
         "SELECT v FROM ({union}) WHERE v != '' ORDER BY v LIMIT {}{settings}",
-        VALUES_LIMIT + 1
+        limit + 1
     )
 }
 
@@ -3752,6 +3767,29 @@ async fn values_for_roles(
     obligations: &PolicyEngineObligations<'_>,
     time: &TimeContext,
 ) -> Result<Value, ApiError> {
+    values_with_limit(
+        ch,
+        q,
+        (roles, viewer),
+        (placeholders, obligations, time),
+        VALUES_LIMIT,
+    )
+    .await
+}
+
+/// [`values_for_roles`] with the list's limit chosen by the caller: the
+/// dashboard's picker lists 200, a signed embed's dropdown 1,000 (`BI-26`).
+pub(crate) async fn values_with_limit(
+    ch: &ChClient,
+    q: ValuesQuery,
+    (roles, viewer): (&[String], &Viewer),
+    (placeholders, obligations, time): (
+        &crate::sql_rewrite::PlaceholderValues,
+        &PolicyEngineObligations<'_>,
+        &TimeContext,
+    ),
+    limit: usize,
+) -> Result<Value, ApiError> {
     let column = strip_non_ident(q.column.as_deref().unwrap_or(""));
     if column.is_empty() {
         return Err(ApiError::BadRequest("column is required".to_owned()));
@@ -3802,7 +3840,7 @@ async fn values_for_roles(
     if selects.is_empty() {
         return Ok(empty());
     }
-    let sql = values_statement(&selects, settings);
+    let sql = values_statement(&selects, settings, limit);
     let rewritten = crate::policy_engine::rewrite_sql_for_roles(
         &sql,
         &sqlparser::dialect::ClickHouseDialect {},
@@ -3822,8 +3860,8 @@ async fn values_for_roles(
         .iter()
         .filter_map(|r| r.get("v").and_then(Value::as_str).map(ToOwned::to_owned))
         .collect();
-    let truncated = values.len() > VALUES_LIMIT;
-    values.truncate(VALUES_LIMIT);
+    let truncated = values.len() > limit;
+    values.truncate(limit);
     Ok(json!({ "column": column, "values": values, "truncated": truncated }))
 }
 
@@ -4201,6 +4239,9 @@ fn push_table_fields(def: &ChartInput, out: &mut Vec<(&'static str, Value)>) {
 pub struct EmbedInfoQuery {
     #[serde(default)]
     board: Option<String>,
+    /// `BI-26`: sign the sample for this chart instead of the dashboard.
+    #[serde(default)]
+    chart: Option<String>,
 }
 
 /// `GET /api/dashboard/embed-info` — this board's embed status and a
@@ -4241,7 +4282,7 @@ pub async fn embed_info(
         )
             .into_response();
     }
-    match embed_info_body(&state, &id, &viewer_of(&principal)).await {
+    match embed_info_body(&state, &id, q.chart.as_deref(), &viewer_of(&principal)).await {
         Ok(Some(body)) => (StatusCode::OK, ApiJson(body)).into_response(),
         Ok(None) => (
             StatusCode::NOT_FOUND,
@@ -4259,6 +4300,7 @@ pub async fn embed_info(
 async fn embed_info_body(
     state: &AppState,
     id: &str,
+    chart: Option<&str>,
     viewer: &Viewer,
 ) -> Result<Option<Value>, lakehouse_clickhouse::ChError> {
     let Some(board) = store::get_board(&state.clickhouse, id, viewer).await? else {
@@ -4277,6 +4319,16 @@ async fn embed_info_body(
         "maxLifetimeSeconds": max_lifetime,
         "revokedBefore": revoked_before,
         "allowedOrigins": board.embed_access.origins,
+        // BI-26 (D8): each filter column's embed mode and the columns that
+        // can be given one (the board's saved filters), for the Share dialog.
+        "filterModes": board.embed_access.filter_modes,
+        "filterColumns": board
+            .filters
+            .iter()
+            .flatten()
+            .filter(|f| !f.column.is_empty())
+            .map(|f| f.column.clone())
+            .collect::<std::collections::BTreeSet<_>>(),
     });
     let with_access = |mut body: Value| {
         if let (Some(map), Some(extra)) = (body.as_object_mut(), access.as_object()) {
@@ -4301,12 +4353,26 @@ async fn embed_info_body(
         reason = "a lifetime limit in seconds; far below 2^53"
     )]
     let lifetime = 3600.0_f64.min(max_lifetime as f64);
+    // BI-26 (D8): a sample for one chart names it (and not the dashboard); the
+    // locked filters' saved values ride as `params`, so the sample is not
+    // refused for a locked value it forgot (feature decision 6).
+    let named_chart = match chart {
+        Some(c)
+            if store::list_stored_charts(&state.clickhouse, viewer)
+                .await?
+                .iter()
+                .any(|s| s.spec.id == c && s.board == id) =>
+        {
+            Some(c.to_owned())
+        }
+        _ => None,
+    };
     let claims = lakehouse_embed::EmbedClaims {
         resource: Some(lakehouse_embed::EmbedResource {
-            chart: None,
-            dashboard: Some(id.to_owned()),
+            dashboard: named_chart.is_none().then(|| id.to_owned()),
+            chart: named_chart,
         }),
-        params: Some(HashMap::new()),
+        params: Some(locked_sample_params(&board)),
         exp: Some(iat + lifetime),
         // SEC-12: a token must carry `iat` and `exp`; the sample also gets a
         // `jti` so the Share dialog can show a token that can be withdrawn.
@@ -4323,6 +4389,23 @@ async fn embed_info_body(
         "supported": true,
         "sampleToken": sample_token,
     }))))
+}
+
+/// The `params` of a sample token: for each filter whose embed mode is locked,
+/// its saved value (an `in` filter's values) under its column.
+fn locked_sample_params(board: &lakehouse_bi::store::Board) -> HashMap<String, Value> {
+    use lakehouse_bi::embed_access::FilterMode;
+    board
+        .filters
+        .iter()
+        .flatten()
+        .filter(|f| {
+            !f.column.is_empty()
+                && board.embed_access.mode_of(&f.column) == FilterMode::Locked
+                && !f.values.is_empty()
+        })
+        .map(|f| (f.column.clone(), json!(f.values)))
+        .collect()
 }
 
 fn now_unix_seconds() -> f64 {

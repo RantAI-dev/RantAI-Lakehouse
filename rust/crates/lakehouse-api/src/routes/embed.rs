@@ -179,6 +179,35 @@ pub(crate) async fn subject_of(
     }
 }
 
+/// Verify a signed token (`SEC-12`): the secret is configuration only, and an
+/// unset one means signed embedding is unavailable, said plainly (nothing is
+/// generated or stored); every other failure is the one fixed message, the
+/// reason going to the log only. Shared by `data` and `values`.
+fn verified_claims(
+    state: &AppState,
+    jwt: &str,
+) -> Result<lakehouse_embed::EmbedClaims, Box<Response>> {
+    let Some(secret) = state.config.embed_secret.as_deref() else {
+        return Err(Box::new(
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                ApiJson(json!({ "error": EMBEDDING_NOT_CONFIGURED })),
+            )
+                .into_response(),
+        ));
+    };
+    lakehouse_embed::verify_embed(
+        jwt,
+        secret,
+        state.config.embed_token_max_lifetime_seconds,
+        lakehouse_embed::unix_now(),
+    )
+    .map_err(|reason| {
+        tracing::info!(%reason, "signed embed token refused");
+        Box::new(token_refused())
+    })
+}
+
 /// What every signed read checks about its token's dashboard, once: what the
 /// token names ([`subject_of`]), that embedding is on for it, and that the
 /// token has not been withdrawn. Returns the dashboard and the subject, or the
@@ -186,35 +215,42 @@ pub(crate) async fn subject_of(
 async fn admit(
     state: &AppState,
     claims: &lakehouse_embed::EmbedClaims,
-) -> Result<(Board, Subject), Response> {
+) -> Result<(Board, Subject), Box<Response>> {
     let subject = match subject_of(&state.clickhouse, claims.resource.as_ref()).await {
         Ok(Some(subject)) => subject,
-        Ok(None) => return Err(token_refused()),
+        Ok(None) => return Err(Box::new(token_refused())),
         Err(err) => {
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ApiJson(upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json()),
-            )
-                .into_response());
-        }
-    };
-    let board =
-        match store::get_board(&state.clickhouse, &subject.board_id, &Viewer::anonymous()).await {
-            Ok(b) => b,
-            Err(err) => {
-                return Err((
+            return Err(Box::new(
+                (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     ApiJson(upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json()),
                 )
-                    .into_response());
-            }
-        };
+                    .into_response(),
+            ));
+        }
+    };
+    let board = match store::get_board(&state.clickhouse, &subject.board_id, &Viewer::anonymous())
+        .await
+    {
+        Ok(b) => b,
+        Err(err) => {
+            return Err(Box::new(
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ApiJson(upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json()),
+                )
+                    .into_response(),
+            ));
+        }
+    };
     let Some(board) = board.filter(|b| b.embed_enabled.unwrap_or(false)) else {
-        return Err((
-            StatusCode::FORBIDDEN,
-            ApiJson(json!({ "error": "embedding_disabled" })),
-        )
-            .into_response());
+        return Err(Box::new(
+            (
+                StatusCode::FORBIDDEN,
+                ApiJson(json!({ "error": "embedding_disabled" })),
+            )
+                .into_response(),
+        ));
     };
     // SEC-12: withdrawal is read on every request — the board's embed events
     // are aggregated on each read, with no cache in this process — so
@@ -228,7 +264,7 @@ async fn admit(
         claims.iat.unwrap_or(f64::NEG_INFINITY),
         claims.jti.as_deref(),
     ) {
-        return Err(token_refused());
+        return Err(Box::new(token_refused()));
     }
     Ok((board, subject))
 }
@@ -249,33 +285,13 @@ pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
             .into_response();
     };
 
-    // SEC-12: the secret is configuration only. Unset means signed embedding
-    // is unavailable, said plainly; nothing is generated or stored.
-    let Some(secret) = state.config.embed_secret.as_deref() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            ApiJson(json!({ "error": EMBEDDING_NOT_CONFIGURED })),
-        )
-            .into_response();
-    };
-    let claims = match lakehouse_embed::verify_embed(
-        &jwt,
-        secret,
-        state.config.embed_token_max_lifetime_seconds,
-        lakehouse_embed::unix_now(),
-    ) {
+    let claims = match verified_claims(&state, &jwt) {
         Ok(claims) => claims,
-        Err(reason) => {
-            // SEC-12: the reason is for the log only; the response is one
-            // fixed message so a caller cannot tell which check failed.
-            tracing::info!(%reason, "signed embed token refused");
-            return token_refused();
-        }
+        Err(refusal) => return *refusal,
     };
-
     let (board, subject) = match admit(&state, &claims).await {
         Ok(admitted) => admitted,
-        Err(refusal) => return refusal,
+        Err(refusal) => return *refusal,
     };
     let board_id = subject.board_id.clone();
 
@@ -286,11 +302,18 @@ pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
     {
         return (StatusCode::BAD_REQUEST, ApiJson(json!({ "error": msg }))).into_response();
     }
+    // A chart token gets that chart and nothing else, so it has no dropdown of
+    // the dashboard's values: its editable filters read as hidden.
+    let viewer_values = if subject.only_chart.is_some() {
+        &[][..]
+    } else {
+        viewer_filters.as_deref().unwrap_or_default()
+    };
     let resolved = match resolve_embed_filters(
         board.filters.as_deref().unwrap_or_default(),
         &board.embed_access,
         claims.params.as_ref(),
-        viewer_filters.as_deref().unwrap_or_default(),
+        viewer_values,
     ) {
         Ok(resolved) => resolved,
         Err(column) => {
@@ -300,6 +323,11 @@ pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
         }
     };
     let filters = resolved.filters;
+    let editable = if subject.only_chart.is_some() {
+        Vec::new()
+    } else {
+        resolved.editable
+    };
 
     let time = match crate::routes::settings::time_context(&state).await {
         Ok(t) => t,
@@ -320,7 +348,7 @@ pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
         &filters,
         &time,
         subject.only_chart.as_deref(),
-        &resolved.editable,
+        &editable,
     )
     .await;
     match payload {
@@ -334,6 +362,170 @@ pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
         )
             .into_response(),
     }
+}
+
+/// `{ jwt, column }` — the `POST /api/embed/values` body shape.
+#[derive(Debug, Default, Deserialize)]
+struct EmbedValuesBody {
+    #[serde(default)]
+    jwt: Option<String>,
+    #[serde(default)]
+    column: Option<String>,
+}
+
+/// `POST /api/embed/values` — the values an editable filter's dropdown lists
+/// (`BI-26` plan D5). Public: the token is the credential.
+///
+/// Every token check of `data` runs first (`verified_claims`, `admit`), then the
+/// column must be editable for this token (a locked or hidden column, a column
+/// the token set, and any column of a chart token are refused). The values come
+/// from the same query as the dashboard picker, read as the fixed viewer role,
+/// with the token's locked values and the board's saved values applied, so a
+/// dropdown never lists a region the token locked away. At most 1,000 values.
+///
+/// # Errors
+///
+/// `400` without a token or a column; the one token message for a bad token;
+/// `403 filter_not_editable` for a column the viewer may not change;
+/// `503` without `EMBED_SECRET`.
+pub async fn values(State(state): State<AppState>, body: Bytes) -> Response {
+    let parsed = serde_json::from_slice::<EmbedValuesBody>(&body).unwrap_or_default();
+    let (Some(jwt), Some(column)) = (
+        parsed.jwt.filter(|s| !s.is_empty()),
+        parsed.column.filter(|s| !s.is_empty()),
+    ) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            ApiJson(json!({ "error": "jwt and column are required" })),
+        )
+            .into_response();
+    };
+    let claims = match verified_claims(&state, &jwt) {
+        Ok(claims) => claims,
+        Err(refusal) => return *refusal,
+    };
+    let (board, subject) = match admit(&state, &claims).await {
+        Ok(admitted) => admitted,
+        Err(refusal) => return *refusal,
+    };
+    let Ok(resolved) = resolve_embed_filters(
+        board.filters.as_deref().unwrap_or_default(),
+        &board.embed_access,
+        claims.params.as_ref(),
+        &[],
+    ) else {
+        return token_refused();
+    };
+    if subject.only_chart.is_some() || !resolved.editable.contains(&column) {
+        return (
+            StatusCode::FORBIDDEN,
+            ApiJson(json!({ "error": "filter_not_editable" })),
+        )
+            .into_response();
+    }
+    let filters_json = serde_json::to_string(&resolved.filters).unwrap_or_else(|_| "[]".to_owned());
+    let time = match crate::routes::settings::time_context(&state).await {
+        Ok(t) => t,
+        Err(err) => return crate::error::ApiRejection(err).into_response(),
+    };
+    let roles = [EMBED_VIEWER_ROLE.to_owned()];
+    let obligations = PolicyEngineObligations::from_state(&state);
+    match crate::routes::dashboard::values_with_limit(
+        &state.clickhouse,
+        crate::routes::dashboard::ValuesQuery::for_board(&column, &subject.board_id, filters_json),
+        (&roles, &Viewer::anonymous()),
+        (
+            &crate::sql_rewrite::PlaceholderValues::none(),
+            &obligations,
+            &time,
+        ),
+        crate::routes::dashboard::EMBED_VALUES_LIMIT,
+    )
+    .await
+    {
+        Ok(found) => (StatusCode::OK, ApiJson(found)).into_response(),
+        Err(err) => crate::error::ApiRejection(err).into_response(),
+    }
+}
+
+/// `{ board, filterModes }` — the `PUT /api/dashboard/embed-settings` body.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SettingsBody {
+    board: String,
+    filter_modes: std::collections::BTreeMap<String, lakehouse_bi::embed_access::FilterMode>,
+}
+
+/// `PUT /api/dashboard/embed-settings` — set each filter's embed mode
+/// (`BI-26` plan D8). Needs `dashboard:write` until `BI-19` part B (feature
+/// decision 11: manage on the dashboard). The columns must be the dashboard's
+/// saved filters; the change is audited (`dashboard.embed_settings`) before it
+/// is made.
+///
+/// # Errors
+///
+/// `400` for a body of another shape, the built-in dashboard, a column that is
+/// no filter of the dashboard, or modes the store refuses; `404` for a
+/// dashboard the caller cannot see; `503` when the change cannot be audited.
+pub async fn put_settings(
+    State(state): State<AppState>,
+    axum::Extension(principal): axum::Extension<lakehouse_auth::Principal>,
+    body: Bytes,
+) -> ApiResult<ApiJson<Value>> {
+    let parsed: SettingsBody = serde_json::from_slice(&body).map_err(|_| {
+        ApiError::BadRequest(
+            "body must be {\"board\": string, \"filterModes\": {column: \"locked\"|\"editable\"|\"hidden\"}}"
+                .to_owned(),
+        )
+    })?;
+    let id = parsed.board.trim();
+    if id.is_empty() || id == store::DEFAULT_BOARD_ID {
+        return Err(ApiError::BadRequest("invalid dashboard".to_owned()).into());
+    }
+    let board = store::get_board(
+        &state.clickhouse,
+        id,
+        &crate::routes::dashboard_organise::viewer_of(&principal),
+    )
+    .await
+    .map_err(|err| {
+        upstream_error::ch_error_as(
+            &upstream_error::DATABASE,
+            &err,
+            upstream_error::FailedAs::Internal,
+        )
+    })?
+    .ok_or_else(|| ApiError::NotFound("dashboard not found.".to_owned()))?;
+    let known: std::collections::BTreeSet<&str> = board
+        .filters
+        .iter()
+        .flatten()
+        .map(|f| f.column.as_str())
+        .collect();
+    if parsed
+        .filter_modes
+        .keys()
+        .any(|c| !known.contains(c.as_str()))
+    {
+        return Err(ApiError::BadRequest(
+            "A mode can only be set for a filter the dashboard has.".to_owned(),
+        )
+        .into());
+    }
+    crate::routes::dashboard::record_download_audit(
+        &state,
+        &principal,
+        ("dashboard.embed_settings", "dashboard", &board.id),
+        json!({ "filterModes": parsed.filter_modes }),
+    )
+    .await
+    .map_err(|_| ApiError::Unavailable("the audit store is unavailable".to_owned()))?;
+    store::set_board_embed_filter_modes(&state.clickhouse, &board.id, &parsed.filter_modes)
+        .await
+        .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
+    Ok(ApiJson(
+        json!({ "ok": true, "filterModes": parsed.filter_modes }),
+    ))
 }
 
 /// Body of `POST /api/embed/frame`: the token the embed page was opened

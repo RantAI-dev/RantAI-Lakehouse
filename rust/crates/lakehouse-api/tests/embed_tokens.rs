@@ -370,7 +370,12 @@ impl Respond for FakeCh {
             return rows(vec![
                 json!({ "table": "mart_x", "name": "region", "type": "String" }),
                 json!({ "table": "mart_x", "name": "visitors", "type": "Int64" }),
+                json!({ "table": "mart_x", "name": "year", "type": "String" }),
             ]);
+        }
+        // BI-26 T3: the dropdown query answers two values.
+        if sql.starts_with("SELECT v FROM (") {
+            return rows(vec![json!({ "v": "Bali" }), json!({ "v": "Java" })]);
         }
         ResponseTemplate::new(200).set_body_string(
             "Ok.
@@ -1354,4 +1359,187 @@ async fn an_invalid_viewer_filter_is_a_400() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert!(fake.tile_statements().is_empty());
+}
+
+// ── BI-26 T3: values route, settings route, sample token ───────────────
+
+const REGION_AND_YEAR: &str = r#"[{"column":"region","op":"in","values":["Bali"]},{"column":"year","op":"in","values":["2024"]}]"#;
+
+/// `region` editable, `year` locked, both saved; `hidden` is not chosen.
+fn dropdown_board() -> FakeCh {
+    let fake = FakeCh::new(&json!({ "filters_json": REGION_AND_YEAR }));
+    fake.add_chart("u_one", BOARD, "Visitors by region");
+    fake.add_modes(BOARD, &json!({ "region": "editable", "year": "locked" }));
+    fake
+}
+
+async fn embed_values(app: &TestApp, jwt: &str, column: &str) -> (StatusCode, Value) {
+    send(
+        &app.router,
+        Request::builder()
+            .method("POST")
+            .uri("/api/embed/values")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({ "jwt": jwt, "column": column }).to_string(),
+            ))
+            .unwrap(),
+    )
+    .await
+}
+
+fn value_statements(fake: &FakeCh) -> Vec<String> {
+    fake.statements()
+        .into_iter()
+        .filter(|s| s.starts_with("SELECT v FROM ("))
+        .collect()
+}
+
+#[tokio::test]
+async fn the_values_of_an_editable_filter_are_listed_with_the_locked_filter_applied() {
+    let fake = dropdown_board();
+    let ch = fake.serve().await;
+    let app = app(&ch, Some(SECRET)).await;
+    let jwt = token_with(Some(json!({ "year": "2024" })));
+
+    let (status, body) = embed_values(&app, &jwt, "region").await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["values"], json!(["Bali", "Java"]));
+    let sent = value_statements(&fake);
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    // The token's locked year narrows the list; the column's own saved value
+    // does not (the viewer is choosing it); the list is capped at 1,000.
+    assert!(sent[0].contains("2024"), "{}", sent[0]);
+    assert!(!sent[0].contains("Bali"), "{}", sent[0]);
+    assert!(sent[0].contains("LIMIT 1001"), "{}", sent[0]);
+}
+
+#[tokio::test]
+async fn the_values_route_refuses_what_the_token_does_not_let_the_viewer_change() {
+    let fake = dropdown_board();
+    let ch = fake.serve().await;
+    let app = app(&ch, Some(SECRET)).await;
+    let jwt = token_with(Some(json!({ "year": "2024" })));
+    // A locked column, and one that is no filter at all.
+    for column in ["year", "visitors"] {
+        let (status, body) = embed_values(&app, &jwt, column).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{column}: {body}");
+    }
+    // A locked value missing from the token is the one token refusal.
+    let (status, body) = embed_values(&app, &token_with(None), "region").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(body["error"], "embed token is invalid or expired");
+    // The token set the column itself: decision 7, no dropdown for it.
+    let (status, _) = embed_values(
+        &app,
+        &token_with(Some(json!({ "year": "2024", "region": "Bali" }))),
+        "region",
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    // A chart token gets no dropdown of the dashboard's values.
+    let (status, _) = embed_values(&app, &chart_token("u_one", None), "region").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    // A bad token and a missing column.
+    let (status, _) = embed_values(&app, "not.a.token", "region").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _) = embed_values(&app, &jwt, "").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(value_statements(&fake).is_empty(), "no value was read");
+}
+
+#[tokio::test]
+async fn embed_settings_need_dashboard_write_name_real_filters_and_are_audited() {
+    let fake = dropdown_board();
+    let ch = fake.serve().await;
+    let app = app(&ch, Some(SECRET)).await;
+    let put = |perms: &'static str, body: Value| {
+        let app = &app;
+        async move {
+            as_user(
+                app,
+                perms,
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/dashboard/embed-settings")
+                    .header("content-type", "application/json"),
+                Body::from(body.to_string()),
+            )
+            .await
+        }
+    };
+    let modes =
+        json!({ "board": BOARD, "filterModes": { "region": "editable", "year": "locked" } });
+    let (status, _) = put("dashboard:read", modes.clone()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(
+        fake.statements()
+            .iter()
+            .all(|s| !s.contains("'filter_modes'"))
+    );
+
+    let (status, body) = put("dashboard:write", modes).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let writes: Vec<String> = fake
+        .statements()
+        .into_iter()
+        .filter(|s| {
+            s.starts_with("INSERT INTO console.bi_board_embed_event")
+                && s.contains("'filter_modes'")
+        })
+        .collect();
+    assert_eq!(writes.len(), 1, "{writes:?}");
+    let (audited,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM audit_event WHERE action = 'dashboard.embed_settings'",
+    )
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
+    assert_eq!(audited, 1);
+
+    // A column the dashboard has no filter on, an unknown mode, the built-in board.
+    for bad in [
+        json!({ "board": BOARD, "filterModes": { "nope": "locked" } }),
+        json!({ "board": BOARD, "filterModes": { "region": "wide-open" } }),
+        json!({ "board": "default", "filterModes": {} }),
+    ] {
+        let (status, _) = put("dashboard:write", bad.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
+    }
+}
+
+#[tokio::test]
+async fn the_sample_token_carries_the_chart_when_asked_and_the_locked_values_it_needs() {
+    let fake = dropdown_board();
+    let ch = fake.serve().await;
+    let app = app(&ch, Some(SECRET)).await;
+    let sample = |chart: &str| {
+        let app = &app;
+        let uri = format!("/api/dashboard/embed-info?board={BOARD}{chart}");
+        async move {
+            as_user(
+                app,
+                "dashboard:read",
+                Request::builder().uri(uri),
+                Body::empty(),
+            )
+            .await
+        }
+    };
+    // The dashboard sample is not refused for the locked year it would forget.
+    let (status, info) = sample("").await;
+    assert_eq!(status, StatusCode::OK, "{info}");
+    assert_eq!(
+        info["filterModes"],
+        json!({ "region": "editable", "year": "locked" })
+    );
+    assert_eq!(info["filterColumns"], json!(["region", "year"]));
+    let (status, whole) = embed_data(&app, info["sampleToken"].as_str().unwrap()).await;
+    assert_eq!(status, StatusCode::OK, "{whole}");
+    // A chart sample names the chart and reads that chart alone.
+    let (_, info) = sample("&chart=u_one").await;
+    let (status, one) = embed_data(&app, info["sampleToken"].as_str().unwrap()).await;
+    assert_eq!(status, StatusCode::OK, "{one}");
+    assert_eq!(one["onlyChart"], "u_one");
 }

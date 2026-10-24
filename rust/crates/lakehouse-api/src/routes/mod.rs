@@ -1213,6 +1213,13 @@ pub fn router(state: AppState) -> Router {
             "/api/embed/frame",
             axum::routing::post(embed::frame_origins),
         )
+        // BI-26 (D5): the dropdown values of an editable filter, token-gated.
+        .route("/api/embed/values", axum::routing::post(embed::values))
+        // BI-26 (D8): each filter's embed mode.
+        .route(
+            "/api/dashboard/embed-settings",
+            axum::routing::put(embed::put_settings),
+        )
         .route(
             "/api/dashboard/embed-revoke",
             axum::routing::post(embed::revoke_token),
