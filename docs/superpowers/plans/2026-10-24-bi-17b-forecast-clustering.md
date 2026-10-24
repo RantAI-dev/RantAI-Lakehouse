@@ -252,3 +252,10 @@ Commits: `1ad9c43c` (F1), `24159b24` (F2). TypeScript only.
 Checks: `bun run typecheck` exit 0; `bun run lint` 0 errors, 9 warnings; `bun run test` 2519 pass, 1 skip, 0 fail (258 files).
 
 ## 8. Review (planner appends)
+
+### Owner's browser QA, 2026-10-24
+
+Passed:
+- The forecast on "Visitors over time" grouped by month: level-only model, 95 % band, the horizon cut to the 14-period history, and every choice explained in the note. The daily grain refuses with the true reason (276 of 428 days empty).
+- Clusters on a scatter of place by average lon and lat: 3 groups chosen automatically, with the note.
+- F1 and F2 fixed. F2 (scatter without a Y row) is also on `main` and closes when this phase merges.
