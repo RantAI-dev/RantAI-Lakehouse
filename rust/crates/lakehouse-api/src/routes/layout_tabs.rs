@@ -396,7 +396,7 @@ async fn a_tie_to_a_missing_tab_and_a_delete_that_strands_a_tile_or_a_tie_are_re
         json!([{ "id": "a", "title": "x" }, { "id": "a", "title": "y" }]),
     ] {
         let bad = edit(json!({ "id": "b1", "tabs": tabs }));
-        assert!(!rejected(check_tab_rules(&ch, "b1", &bad).await).is_empty());
+        assert_ne!(rejected(check_tab_rules(&ch, "b1", &bad).await), "");
     }
     let long_phone = edit(json!({ "id": "b1", "phoneLayout": [{ "id": "c_a", "h": 0 }] }));
     assert!(rejected(check_tab_rules(&ch, "b1", &long_phone).await).contains("rows high"));

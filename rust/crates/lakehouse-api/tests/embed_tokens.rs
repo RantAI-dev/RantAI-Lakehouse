@@ -764,7 +764,7 @@ async fn withdrawing_one_token_stores_its_jti_and_keeps_the_rest_of_the_board_st
     assert!(insert.contains("to-withdraw"), "{insert}");
     // SEC-12 (PR #105 review SHOULD-FIX 1): withdrawing does not touch the
     // board row.
-    assert!(fake.inserts_into_board().is_empty());
+    assert_eq!(fake.inserts_into_board(), [] as [std::string::String; 0]);
 }
 
 #[tokio::test]
@@ -801,7 +801,7 @@ async fn a_token_without_a_jti_cannot_be_withdrawn_singly_and_the_answer_says_so
     let message = body["error"].as_str().unwrap();
     assert!(message.contains("no id (jti)"), "{message}");
     assert!(message.contains("withdraw all"), "{message}");
-    assert!(fake.inserts_into_board().is_empty());
+    assert_eq!(fake.inserts_into_board(), [] as [std::string::String; 0]);
 }
 
 #[tokio::test]
@@ -837,7 +837,7 @@ async fn withdrawing_refuses_a_bad_token_a_token_for_another_board_and_a_bare_jt
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert!(fake.inserts_into_board().is_empty());
+    assert_eq!(fake.inserts_into_board(), [] as [std::string::String; 0]);
 }
 
 #[tokio::test]
@@ -867,7 +867,7 @@ async fn withdraw_all_writes_the_instant_and_an_unrelated_edit_does_not_reset_it
     );
     // SEC-12 (PR #105 review SHOULD-FIX 1): revoke_all inserts into the
     // event table and does not touch bi_board.
-    assert!(fake.inserts_into_board().is_empty());
+    assert_eq!(fake.inserts_into_board(), [] as [std::string::String; 0]);
 
     // A rename afterwards writes the board row, but contains none of the embed columns.
     fake.set(BOARD, "embed_revoked_before", &json!(stored.to_string()));
@@ -904,7 +904,7 @@ async fn withdraw_all_can_only_be_true() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert!(fake.inserts_into_board().is_empty());
+    assert_eq!(fake.inserts_into_board(), [] as [std::string::String; 0]);
 }
 
 // ── T4: allowed sites and the frame answer ─────────────────────────────
@@ -940,7 +940,7 @@ async fn allowed_sites_are_validated_normalised_and_stored() {
         json!(["https://app.customer.example", "http://localhost:3000"])
     );
     assert!(fake.inserts_into_embed_events()[0].contains("https://app.customer.example"));
-    assert!(fake.inserts_into_board().is_empty());
+    assert_eq!(fake.inserts_into_board(), [] as [std::string::String; 0]);
 
     for bad in [
         json!(["https://*.customer.example"]),
@@ -971,7 +971,7 @@ async fn editing_allowed_sites_needs_dashboard_write() {
     let app = app(&ch, Some(SECRET)).await;
     let (status, _) = put_origins(&app, "dashboard:read", json!(["https://a.example"])).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
-    assert!(fake.inserts_into_board().is_empty());
+    assert_eq!(fake.inserts_into_board(), [] as [std::string::String; 0]);
 }
 
 #[tokio::test]

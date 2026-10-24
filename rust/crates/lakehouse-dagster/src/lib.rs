@@ -4255,7 +4255,10 @@ mod tests {
             "error text must not be carried"
         );
         // A schedule that does not exist has no ticks, not an error.
-        assert!(schedule_ticks_from(&json!({ "__typename": "ScheduleNotFoundError" })).is_empty());
+        assert_eq!(
+            schedule_ticks_from(&json!({ "__typename": "ScheduleNotFoundError" })),
+            [] as [ScheduleTick; 0]
+        );
     }
 
     /// R3 plan 2a BLOCKER regression: `sensor_ticks` selects
@@ -4291,7 +4294,10 @@ mod tests {
             "Dagster error text must not be carried in the response"
         );
         // A sensor that does not exist has no ticks, not an error.
-        assert!(sensor_ticks_from(&json!({ "__typename": "SensorNotFoundError" })).is_empty());
+        assert_eq!(
+            sensor_ticks_from(&json!({ "__typename": "SensorNotFoundError" })),
+            [] as [ScheduleTick; 0]
+        );
     }
 
     #[tokio::test]
@@ -4899,7 +4905,10 @@ mod tests {
                 "ClickHouse lake.y".to_owned()
             ]
         );
-        assert!(metadata_lines(&entries, "reads").is_empty());
+        assert_eq!(
+            metadata_lines(&entries, "reads"),
+            [] as [std::string::String; 0]
+        );
     }
 
     /// An op reporting metadata with none of the three recognized labels

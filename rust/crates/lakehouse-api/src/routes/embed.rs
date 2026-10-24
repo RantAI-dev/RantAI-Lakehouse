@@ -1253,7 +1253,10 @@ mod tests {
 
     #[test]
     fn params_to_filters_none_yields_empty() {
-        assert!(params_to_filters(None).is_empty());
+        assert_eq!(
+            params_to_filters(None),
+            [] as [lakehouse_bi::filters::FilterDef; 0]
+        );
     }
 
     #[test]

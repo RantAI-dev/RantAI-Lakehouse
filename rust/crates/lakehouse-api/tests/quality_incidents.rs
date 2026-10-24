@@ -203,7 +203,10 @@ async fn a_passing_run_opens_nothing_and_leaves_an_open_incident_open() {
     )
     .await;
     assert_eq!(run["status"], "passed");
-    assert!(incidents(&router, &cookie, "open").await.is_empty());
+    assert_eq!(
+        incidents(&router, &cookie, "open").await,
+        [] as [serde_json::Value; 0]
+    );
 
     let strict = rule(&pool, "email_strict", "email not null >= 90%").await;
     call(
@@ -312,7 +315,10 @@ async fn resolving_needs_a_reason_and_an_open_incident() {
     .await;
     assert_eq!(code, StatusCode::NOT_FOUND);
 
-    assert!(incidents(&router, &cookie, "open").await.is_empty());
+    assert_eq!(
+        incidents(&router, &cookie, "open").await,
+        [] as [serde_json::Value; 0]
+    );
     assert_eq!(incidents(&router, &cookie, "resolved").await.len(), 1);
     assert_eq!(incidents(&router, &cookie, "all").await.len(), 1);
 
@@ -400,7 +406,10 @@ async fn deleting_a_rule_resolves_its_open_incidents() {
     )
     .await;
     assert_eq!(code, StatusCode::OK);
-    assert!(incidents(&router, &cookie, "open").await.is_empty());
+    assert_eq!(
+        incidents(&router, &cookie, "open").await,
+        [] as [serde_json::Value; 0]
+    );
     let resolved = incidents(&router, &cookie, "resolved").await;
     assert_eq!(resolved.len(), 1);
     assert_eq!(resolved[0]["resolution"], "rule deleted");

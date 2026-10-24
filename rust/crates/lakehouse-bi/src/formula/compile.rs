@@ -2045,7 +2045,11 @@ mod tests {
         assert!(c.reads.contains("amount"));
         // A grand total needs no columns.
         let total = in_chart("Sum(amount) / Fixed(Sum(amount))", by_label()).unwrap();
-        assert!(total.staged.fixed[0].columns.is_empty());
+        assert!(
+            total.staged.fixed[0].columns.is_empty(),
+            "{:?}",
+            total.staged.fixed[0].columns
+        );
     }
 
     #[test]

@@ -3190,8 +3190,8 @@ mod tests {
         // measure/agg/threshold/board are cleared for this kind — a
         // Freshness rule is target-only, nothing else on the row means
         // anything for it.
-        assert!(normalized.measure.is_empty());
-        assert!(normalized.board.is_empty());
+        assert_eq!(normalized.measure, "");
+        assert_eq!(normalized.board, "");
     }
 
     #[test]
@@ -4938,7 +4938,7 @@ mod tests {
             .map(|r| String::from_utf8_lossy(&r.body).into_owned())
             .filter(|s| s.contains("FROM console.bi_board FINAL WHERE is_deleted = 0"))
             .collect();
-        assert!(!reads.is_empty());
+        assert_ne!(reads, [] as [std::string::String; 0]);
         assert!(
             reads.iter().all(|r| r.contains("owner_id = ''")),
             "{reads:?}"

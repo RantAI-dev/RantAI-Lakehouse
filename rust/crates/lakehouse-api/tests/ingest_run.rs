@@ -884,7 +884,10 @@ async fn a_bad_run_body_is_a_400_and_launches_nothing() {
         let (status, answer) = post_run(&app, &cookie, "conn-bad-body", Some(body)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {answer}");
     }
-    assert!(launched_configs(&server).await.is_empty());
+    assert_eq!(
+        launched_configs(&server).await,
+        [] as [serde_json::Value; 0]
+    );
 }
 
 /// A table the connector does not load is a 404 with a fixed text that repeats
@@ -902,7 +905,10 @@ async fn a_table_the_connector_does_not_load_is_a_404_with_a_fixed_message() {
 
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(answer["error"], "This connector does not load that table.");
-    assert!(launched_configs(&server).await.is_empty());
+    assert_eq!(
+        launched_configs(&server).await,
+        [] as [serde_json::Value; 0]
+    );
 }
 
 /// `SRC-8` observation step: a table that waits for a schema decision cannot be
@@ -937,7 +943,10 @@ async fn a_table_that_waits_for_a_schema_decision_cannot_be_refreshed_or_cleared
             "{action}"
         );
     }
-    assert!(launched_configs(&server).await.is_empty());
+    assert_eq!(
+        launched_configs(&server).await,
+        [] as [serde_json::Value; 0]
+    );
 
     let body = json!({"object": "public.items", "action": "clear"}).to_string();
     let (status, answer) = post_run(&app, &cookie, "conn-waits", Some(&body)).await;
@@ -984,7 +993,10 @@ async fn the_409s_for_a_run_going_and_a_paused_connector_are_answered_before_the
     let (status, answer) = post_run(&app, &cookie, "conn-paused-table", Some(&body)).await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert!(answer["error"].as_str().unwrap().contains("paused"));
-    assert!(launched_configs(&server).await.is_empty());
+    assert_eq!(
+        launched_configs(&server).await,
+        [] as [serde_json::Value; 0]
+    );
 }
 
 /// A `cdc` connector answers the honest `supported: false` also for a run of one
@@ -1029,5 +1041,8 @@ async fn a_run_of_one_table_needs_connector_manage() {
     let (status, _) = post_run(&app, &cookie, "conn-no-permission", Some(&body)).await;
 
     assert_eq!(status, StatusCode::FORBIDDEN);
-    assert!(launched_configs(&server).await.is_empty());
+    assert_eq!(
+        launched_configs(&server).await,
+        [] as [serde_json::Value; 0]
+    );
 }

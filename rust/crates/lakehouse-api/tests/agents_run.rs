@@ -181,7 +181,10 @@ async fn valid_token_runs_the_employee_to_a_terminal_status_with_steps() {
     assert_eq!(run["employeeId"], json!("emp-headless-01"));
     assert_eq!(run["trigger"], json!("schedule"));
     assert_eq!(run["status"], json!("succeeded"));
-    assert!(!run["steps"].as_array().unwrap().is_empty());
+    assert_ne!(
+        run["steps"].as_array().unwrap().as_slice(),
+        &[] as &[serde_json::Value]
+    );
 }
 
 /// Wrong/absent token AND no principal at all → 401.
@@ -484,7 +487,7 @@ async fn run_employee_permission_ceiling_is_the_employees_own_not_the_triggering
             e.run_id.as_deref() == Some(run_id.as_str()) && e.action == "list_saved_queries"
         })
         .collect();
-    assert!(!for_this_run.is_empty());
+    assert_ne!(for_this_run, [] as [&lakehouse_store::audit::AuditEvent; 0]);
     assert!(for_this_run.iter().all(|e| e.outcome == "refused"));
 }
 
@@ -568,7 +571,7 @@ async fn llm_unavailable_ends_the_run_failed_without_a_panic() {
     let body = json_body(resp).await;
     assert_eq!(body["run"]["status"], json!("failed"));
     let steps = body["run"]["steps"].as_array().unwrap();
-    assert!(!steps.is_empty());
+    assert_ne!(steps.as_slice(), &[] as &[serde_json::Value]);
     assert_eq!(steps[0]["status"], json!("failed"));
 }
 

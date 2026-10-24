@@ -620,7 +620,7 @@ mod tests {
             access.is_withdrawn(4_000_000_000.0, None),
             "every token is refused"
         );
-        assert!(access.origins.is_empty());
+        assert!(access.origins.is_empty(), "{:?}", access.origins);
     }
 
     #[test]

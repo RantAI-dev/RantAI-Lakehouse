@@ -996,9 +996,12 @@ mod tests {
 
         run(&state, &mut HashSet::new()).await;
 
-        assert!(model_requests(&llm).await.is_empty());
+        assert_eq!(model_requests(&llm).await, [] as [std::string::String; 0]);
         assert!(ch.received_requests().await.unwrap().is_empty());
-        assert!(semantic::list_all(&pool).await.unwrap().is_empty());
+        assert_eq!(
+            semantic::list_all(&pool).await.unwrap(),
+            [] as [lakehouse_store::semantic::SemanticEntry; 0]
+        );
     }
 
     #[sqlx::test(migrations = "../../migrations")]
@@ -1006,11 +1009,11 @@ mod tests {
         let ch = clickhouse(&[("serving", "alpha")]).await;
         let llm = model_answering(chat_ok(GOOD_REPLY)).await;
         let state = state_with(&pool, &ch, &llm, &[("LLM_KEY", "")]);
-        assert!(state.config.llm_key.is_empty());
+        assert_eq!(state.config.llm_key, "");
 
         run(&state, &mut HashSet::new()).await;
 
-        assert!(model_requests(&llm).await.is_empty());
+        assert_eq!(model_requests(&llm).await, [] as [std::string::String; 0]);
         assert!(ch.received_requests().await.unwrap().is_empty());
     }
 
@@ -1028,7 +1031,7 @@ mod tests {
 
         run(&state, &mut HashSet::new()).await;
 
-        assert!(model_requests(&llm).await.is_empty());
+        assert_eq!(model_requests(&llm).await, [] as [std::string::String; 0]);
         assert!(ch.received_requests().await.unwrap().is_empty());
     }
 
