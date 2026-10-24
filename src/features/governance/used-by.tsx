@@ -32,6 +32,9 @@ export function UsedBy({ table, size = "sm" }: { readonly table: string; readonl
         <Skeleton className="h-16 w-full" />
       ) : state.status === "error" ? (
         <ErrorState error={state.error} onRetry={state.reload} />
+      ) : state.data && !Array.isArray(state.data.charts) ? (
+        // An answer without the list is no answer: say so rather than draw an empty list (principle 2).
+        <p role="status" className="text-sm text-muted-foreground">Used by could not be read just now.</p>
       ) : state.data && !state.data.supported ? (
         <EmptyState title="Not available" description="Chart lineage is not recorded on this deployment." className="py-4" />
       ) : state.data && state.data.charts.length === 0 && state.data.hiddenCount === 0 ? (

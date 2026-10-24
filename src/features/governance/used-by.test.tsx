@@ -64,6 +64,12 @@ describe("UsedBy (BI-14)", () => {
     expect(screen.queryByText("No chart reads this table")).toBeNull()
   })
 
+  it("does not crash or claim 'none' on an answer without a chart list", async () => {
+    answer({ nodes: [], edges: [] })
+    render(<UsedBy table="serving.t" />)
+    expect(await screen.findByText("Used by could not be read just now.")).toBeTruthy()
+  })
+
   it("gives a person without lineage:read the sentence and asks for nothing", () => {
     permitted = false
     answer({})
