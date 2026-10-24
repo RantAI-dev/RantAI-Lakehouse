@@ -153,7 +153,10 @@ REFUSAL_CUES = (
 )
 
 # Words that appear in almost any Indonesian answer and almost never in an
-# English one; three or more distinct hits reads as Indonesian.
+# English one, and the words a short confirmation is built of ("sudah siap",
+# "tinjau pratinjaunya di bawah lalu konfirmasi"): a short answer carries too
+# few of the common words to reach three, so the words such an answer uses
+# count as markers too. Three or more distinct hits reads as Indonesian.
 INDONESIAN_MARKERS = (
     "yang",
     "dan",
@@ -180,6 +183,14 @@ INDONESIAN_MARKERS = (
     "ke",
     "usaha",
     "berdasarkan",
+    "sudah",
+    "siap",
+    "silakan",
+    "lalu",
+    "bawah",
+    "tinjau",
+    "periksa",
+    "konfirmasi",
 )
 
 RAW_ERROR_PATTERNS = (r"DB::Exception", r"Code: \d+", r"\bstack trace\b", r"SQLSTATE")

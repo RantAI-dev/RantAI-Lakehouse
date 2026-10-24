@@ -4,7 +4,8 @@ No network: every test calls pure functions or a fake session. The seams are
 the functions the harness runs in order: `run_case` (one case, its turns, its
 setup and its cleanup), `pass_rule` and `verdict` (how runs become a case and
 a set), `confirm_body` (the request the console sends), `cleanup_plan` (what
-the `finally` deletes), `expect_state_problems` (the state check), and `main`
+the `finally` deletes), `expect_state_problems` (the state check),
+`looks_indonesian` (which language an answer is in), and `main`
 (the exit codes).
 
 The 28 existing cases must score as they did before the dashboard features:
@@ -1568,6 +1569,68 @@ class ToolArgsMatchTest(unittest.TestCase):
             m.tool_args_match({"filters": [{"region": "São Paulo"}]}, {"filters": "São Paulo"})
         )
         self.assertFalse(m.tool_args_match({"regions": ["Berlin"]}, {"regions": "São Paulo"}))
+
+
+# ── the language check: which answer reads Indonesian ────────────────────
+
+
+# The short confirmations the assistant gives after a draft. Each is too short
+# to carry three of the common words, so the words such an answer is built of
+# are markers too.
+SHORT_INDONESIAN_ANSWERS = (
+    "Draft grafiknya sudah siap — tinjau pratinjaunya di bawah lalu konfirmasi.",
+    "Draft grafik garis sudah siap — tinjau pratinjaunya di bawah lalu konfirmasi.",
+    "Draft grafiknya sudah siap — silakan tinjau pratinjaunya di bawah lalu konfirmasi.",
+    "Draft grafiknya sudah siap — periksa pratinjaunya dan konfirmasi.",
+    "Draft grafik batang **Pengunjung Mancanegara per Negara** sudah siap — tinjau pratinjaunya di bawah lalu konfirmasi.",
+    "Draft grafiknya sudah siap — cek pratinjau di bawah lalu konfirmasi ya.",
+)
+
+# Every English answer the tests in this file use, and where it comes from.
+ENGLISH_ANSWERS_THE_TESTS_USE = (
+    # `ScoreCaseTests.body` and `ScoreCaseTests.refused`
+    "Done.",
+    "I can't create charts here.",
+    "Charts can't read a Silver table directly.",
+    "I cannot do that in ask mode.",
+    "I can not draw that.",
+    "I am not able to change the board.",
+    "I can’t create charts here.",
+    "That isn’t available.",
+    "Here is the chart you asked for.",
+    # `TraceChecksTests`
+    "I have queued this in Approvals for you.",
+    "It is waiting in Approvals.",
+    "No such chart.",
+    # the answers the `run_case` tests script
+    "Drafted.",
+    "Renamed.",
+    "ok",
+    # the saved run the rescore test replays
+    "There is no data for that. Malaysia 1234 bar chart mart_event 1,234 tahun",
+    # the draft answer the assistant gives in English
+    "The chart draft is ready — review the preview below and confirm.",
+)
+
+
+class LanguageTests(unittest.TestCase):
+    def test_the_short_indonesian_answers_read_indonesian(self) -> None:
+        for answer in SHORT_INDONESIAN_ANSWERS:
+            self.assertTrue(m.looks_indonesian(answer), answer)
+
+    def test_the_english_answers_the_tests_use_read_english(self) -> None:
+        for answer in ENGLISH_ANSWERS_THE_TESTS_USE:
+            self.assertFalse(m.looks_indonesian(answer), answer)
+
+    def test_the_marker_set_carries_the_words_a_short_confirmation_uses(self) -> None:
+        # The set is pinned here so that dropping one of these words fails the
+        # suite instead of silently changing what reads as Indonesian.
+        for word in ("sudah", "siap", "silakan", "lalu", "bawah", "tinjau", "periksa", "konfirmasi"):
+            self.assertIn(word, m.INDONESIAN_MARKERS, word)
+
+    def test_three_markers_read_indonesian_and_two_do_not(self) -> None:
+        self.assertTrue(m.looks_indonesian("Draft sudah siap lalu."))
+        self.assertFalse(m.looks_indonesian("Draft sudah siap."))
 
 
 if __name__ == "__main__":
