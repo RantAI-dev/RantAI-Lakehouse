@@ -68,7 +68,10 @@ async fn a_subscription_round_trips_with_its_schedule_values_and_recipients(
     assert!(!made.paused && made.consecutive_failures == 0);
     assert_eq!(get(&pool, made.id).await.unwrap(), Some(made.clone()));
     assert_eq!(list_for_board(&pool, "main").await.unwrap().len(), 1);
-    assert!(list_for_board(&pool, "other").await.unwrap().is_empty());
+    assert_eq!(
+        list_for_board(&pool, "other").await.unwrap(),
+        [] as [lakehouse_store::report_subscriptions::Subscription; 0]
+    );
     assert_eq!(list_for_owner(&pool, owner).await.unwrap().len(), 1);
 
     let got = recipients(&pool, made.id).await.unwrap();
@@ -231,11 +234,9 @@ async fn claiming_takes_only_due_unpaused_rows_and_moves_them_forward(
         "the stored time moved forward"
     );
     // A second claim finds nothing: a missed run happens once.
-    assert!(
-        claim_due(&pool, now, 5, |_| Some(next))
-            .await
-            .unwrap()
-            .is_empty()
+    assert_eq!(
+        claim_due(&pool, now, 5, |_| Some(next)).await.unwrap(),
+        [] as [lakehouse_store::report_subscriptions::Subscription; 0]
     );
     Ok(())
 }
@@ -345,7 +346,10 @@ async fn a_row_whose_schedule_cannot_be_worked_out_is_paused_with_a_reason(
     let s = create(&pool, &new_sub(owner, "a", now - Duration::minutes(1)))
         .await
         .unwrap();
-    assert!(claim_due(&pool, now, 5, |_| None).await.unwrap().is_empty());
+    assert_eq!(
+        claim_due(&pool, now, 5, |_| None).await.unwrap(),
+        [] as [lakehouse_store::report_subscriptions::Subscription; 0]
+    );
     let stored = get(&pool, s.id).await.unwrap().unwrap();
     assert!(stored.paused);
     assert_eq!(stored.paused_reason.as_deref(), Some(UNSCHEDULABLE_REASON));
@@ -491,8 +495,14 @@ async fn deliveries_are_listed_newest_first_and_the_old_ones_are_pruned(
     // Deleting a subscription takes its recipients and deliveries along.
     assert!(delete(&pool, a.id).await.unwrap());
     assert!(!delete(&pool, a.id).await.unwrap());
-    assert!(list_deliveries(&pool, a.id, 10).await.unwrap().is_empty());
-    assert!(recipients(&pool, a.id).await.unwrap().is_empty());
+    assert_eq!(
+        list_deliveries(&pool, a.id, 10).await.unwrap(),
+        [] as [lakehouse_store::report_subscriptions::Delivery; 0]
+    );
+    assert_eq!(
+        recipients(&pool, a.id).await.unwrap(),
+        [] as [lakehouse_store::report_subscriptions::RecipientRow; 0]
+    );
     Ok(())
 }
 

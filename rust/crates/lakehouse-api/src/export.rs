@@ -481,12 +481,17 @@ mod tests {
         fn types(&self) -> &[String] {
             &self.types
         }
-        async fn next_row(&mut self) -> Result<Option<Vec<Value>>, ChError> {
+        // A plain `fn` returning a finished future, not an `async fn`: the
+        // generator has nothing to await (clippy's `unused_async_trait_impl`,
+        // PR #204 CI, REL-9).
+        fn next_row(
+            &mut self,
+        ) -> impl std::future::Future<Output = Result<Option<Vec<Value>>, ChError>> + Send {
             if self.next >= self.total {
-                return Ok(None);
+                return std::future::ready(Ok(None));
             }
             self.next += 1;
-            Ok(Some((self.make)(self.next)))
+            std::future::ready(Ok(Some((self.make)(self.next))))
         }
     }
 
