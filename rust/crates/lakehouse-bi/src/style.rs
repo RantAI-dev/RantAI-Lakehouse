@@ -860,18 +860,7 @@ pub fn check_style(def: &ChartInput) -> Result<(), String> {
             key_ok(f, "a tooltip field")?;
         }
     }
-    if let Some(clusters) = &style.clusters {
-        if !matches!(kind, ChartKind::Scatter | ChartKind::Bubble) {
-            return Err(wrong("clusters", "a scatter or bubble chart"));
-        }
-        if let ClusterCount::Fixed(k) = clusters.k
-            && !(MIN_CLUSTERS..=MAX_CLUSTERS).contains(&k)
-        {
-            return Err(format!(
-                "clusters take \"auto\" or a number from {MIN_CLUSTERS} to {MAX_CLUSTERS}."
-            ));
-        }
-    }
+    check_clusters(style, kind)?;
     if !style.conditional.is_empty() {
         if !takes_conditional(kind) {
             return Err(wrong("conditional colours", "a table, pivot or KPI"));
@@ -884,6 +873,25 @@ pub fn check_style(def: &ChartInput) -> Result<(), String> {
         for rule in &style.conditional {
             check_rule(rule)?;
         }
+    }
+    Ok(())
+}
+
+/// `BI-17` part B (plan D2): clusters are for a scatter or bubble chart and
+/// take "auto" or 2 to 10 groups.
+fn check_clusters(style: &StyleFields, kind: ChartKind) -> Result<(), String> {
+    let Some(clusters) = &style.clusters else {
+        return Ok(());
+    };
+    if !matches!(kind, ChartKind::Scatter | ChartKind::Bubble) {
+        return Err("clusters is only for a scatter or bubble chart.".to_owned());
+    }
+    if let ClusterCount::Fixed(k) = clusters.k
+        && !(MIN_CLUSTERS..=MAX_CLUSTERS).contains(&k)
+    {
+        return Err(format!(
+            "clusters take \"auto\" or a number from {MIN_CLUSTERS} to {MAX_CLUSTERS}."
+        ));
     }
     Ok(())
 }

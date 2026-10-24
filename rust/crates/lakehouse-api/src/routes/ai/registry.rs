@@ -438,8 +438,9 @@ fn describe_mart_schema() -> Value {
 /// parameter value, a line computed from the rows on screen, or a band.
 fn reference_lines_schema() -> Value {
     json!({ "type": "array", "maxItems": 5, "items": { "type": "object", "properties": {
-        "kind": { "type": "string", "enum": ["value", "average", "median", "min", "max", "trend", "band"],
-            "description": "value (default): a line at `value`; average, median, min, max: computed from the rows the chart shows; trend: a linear trend over them; band: a shaded band from `value` to `to`" },
+        "kind": { "type": "string", "enum": ["value", "average", "median", "min", "max", "trend", "band", "forecast"],
+            "description": "value (default): a line at `value`; average, median, min, max: computed from the rows the chart shows; trend: a linear trend over them; band: a shaded band from `value` to `to`; forecast: the series continued `horizon` periods ahead with a 95 % band (bar, line, area, stacked, combo with the date dimension grouped by minute to year, no breakdown, at most one per chart)" },
+        "horizon": { "type": "integer", "minimum": 1, "maximum": 60, "description": "forecast only, required: how many periods ahead" },
         "value": { "oneOf": [ { "type": "number" }, param_ref_schema() ], "description": "where on the value axis: a number, or {param: <a number parameter>}. Required for kind value and band; leave out for a computed line" },
         "to": { "oneOf": [ { "type": "number" }, param_ref_schema() ], "description": "band only: the other edge" },
         "label": { "type": "string", "description": "at most 60 characters" },
@@ -495,7 +496,10 @@ fn style_properties() -> Value {
             "rule": { "type": "object", "description": "{type:\"compare\",op:lt|le|gt|ge|eq|ne,value}, {type:\"between\",from,to}, {type:\"contains\",text} or {type:\"range\",colors:[2 or 3 #rrggbb]}" },
             "color": { "type": "string", "description": "#rrggbb; not for a range" },
             "target": { "type": "string", "enum": ["cell", "text"] } }, "required": ["column", "rule"] },
-            "description": "table, pivot and kpi only: colour a cell or the value by a rule, for example below 1,000 in red" }
+            "description": "table, pivot and kpi only: colour a cell or the value by a rule, for example below 1,000 in red" },
+        "clusters": { "type": ["object", "null"], "properties": {
+            "k": { "oneOf": [ { "type": "string", "enum": ["auto"] }, { "type": "integer", "minimum": 2, "maximum": 10 } ], "description": "\"auto\" (the console picks from 2 to 10) or a number of groups" } }, "required": ["k"],
+            "description": "scatter and bubble only: colour the points by cluster (k-means over the points on screen)" }
     })
 }
 
@@ -2557,7 +2561,7 @@ mod tests {
         // and format_chart cannot drift, and every field is a field of `lakehouse_bi::style`.
         let style = style_properties();
         let style = style.as_object().expect("an object");
-        assert_eq!(style.len(), 9);
+        assert_eq!(style.len(), 10);
         for tool in ["create_chart", "update_chart", "format_chart"] {
             let schema = (find(tool).expect("registered tool").schema)();
             let properties = &schema["function"]["parameters"]["properties"];

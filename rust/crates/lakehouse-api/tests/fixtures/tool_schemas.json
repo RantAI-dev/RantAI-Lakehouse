@@ -498,9 +498,16 @@
                     "min",
                     "max",
                     "trend",
-                    "band"
+                    "band",
+                    "forecast"
                   ],
-                  "description": "value (default): a line at `value`; average, median, min, max: computed from the rows the chart shows; trend: a linear trend over them; band: a shaded band from `value` to `to`"
+                  "description": "value (default): a line at `value`; average, median, min, max: computed from the rows the chart shows; trend: a linear trend over them; band: a shaded band from `value` to `to`; forecast: the series continued `horizon` periods ahead with a 95 % band (bar, line, area, stacked, combo with the date dimension grouped by minute to year, no breakdown, at most one per chart)"
+                },
+                "horizon": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 60,
+                  "description": "forecast only, required: how many periods ahead"
                 },
                 "value": {
                   "oneOf": [
@@ -1671,6 +1678,34 @@
               ]
             },
             "description": "table, pivot and kpi only: colour a cell or the value by a rule, for example below 1,000 in red"
+          },
+          "clusters": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "properties": {
+              "k": {
+                "oneOf": [
+                  {
+                    "type": "string",
+                    "enum": [
+                      "auto"
+                    ]
+                  },
+                  {
+                    "type": "integer",
+                    "minimum": 2,
+                    "maximum": 10
+                  }
+                ],
+                "description": "\"auto\" (the console picks from 2 to 10) or a number of groups"
+              }
+            },
+            "required": [
+              "k"
+            ],
+            "description": "scatter and bubble only: colour the points by cluster (k-means over the points on screen)"
           },
           "goal": {
             "oneOf": [
@@ -2092,9 +2127,16 @@
                     "min",
                     "max",
                     "trend",
-                    "band"
+                    "band",
+                    "forecast"
                   ],
-                  "description": "value (default): a line at `value`; average, median, min, max: computed from the rows the chart shows; trend: a linear trend over them; band: a shaded band from `value` to `to`"
+                  "description": "value (default): a line at `value`; average, median, min, max: computed from the rows the chart shows; trend: a linear trend over them; band: a shaded band from `value` to `to`; forecast: the series continued `horizon` periods ahead with a 95 % band (bar, line, area, stacked, combo with the date dimension grouped by minute to year, no breakdown, at most one per chart)"
+                },
+                "horizon": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 60,
+                  "description": "forecast only, required: how many periods ahead"
                 },
                 "value": {
                   "oneOf": [
@@ -3265,6 +3307,34 @@
               ]
             },
             "description": "table, pivot and kpi only: colour a cell or the value by a rule, for example below 1,000 in red"
+          },
+          "clusters": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "properties": {
+              "k": {
+                "oneOf": [
+                  {
+                    "type": "string",
+                    "enum": [
+                      "auto"
+                    ]
+                  },
+                  {
+                    "type": "integer",
+                    "minimum": 2,
+                    "maximum": 10
+                  }
+                ],
+                "description": "\"auto\" (the console picks from 2 to 10) or a number of groups"
+              }
+            },
+            "required": [
+              "k"
+            ],
+            "description": "scatter and bubble only: colour the points by cluster (k-means over the points on screen)"
           },
           "goal": {
             "oneOf": [
@@ -3707,6 +3777,34 @@
             },
             "description": "table, pivot and kpi only: colour a cell or the value by a rule, for example below 1,000 in red"
           },
+          "clusters": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "properties": {
+              "k": {
+                "oneOf": [
+                  {
+                    "type": "string",
+                    "enum": [
+                      "auto"
+                    ]
+                  },
+                  {
+                    "type": "integer",
+                    "minimum": 2,
+                    "maximum": 10
+                  }
+                ],
+                "description": "\"auto\" (the console picks from 2 to 10) or a number of groups"
+              }
+            },
+            "required": [
+              "k"
+            ],
+            "description": "scatter and bubble only: colour the points by cluster (k-means over the points on screen)"
+          },
           "referenceLines": {
             "type": "array",
             "maxItems": 5,
@@ -3722,9 +3820,16 @@
                     "min",
                     "max",
                     "trend",
-                    "band"
+                    "band",
+                    "forecast"
                   ],
-                  "description": "value (default): a line at `value`; average, median, min, max: computed from the rows the chart shows; trend: a linear trend over them; band: a shaded band from `value` to `to`"
+                  "description": "value (default): a line at `value`; average, median, min, max: computed from the rows the chart shows; trend: a linear trend over them; band: a shaded band from `value` to `to`; forecast: the series continued `horizon` periods ahead with a 95 % band (bar, line, area, stacked, combo with the date dimension grouped by minute to year, no breakdown, at most one per chart)"
+                },
+                "horizon": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 60,
+                  "description": "forecast only, required: how many periods ahead"
                 },
                 "value": {
                   "oneOf": [
