@@ -399,6 +399,41 @@ browser; the AI-15 run itself (case `dash_make_chart_always_fresh` added, not ru
 workspace clippy and test run. `system.parts.modification_time` was checked on ClickHouse
 26.8.9.10 (BI-4-RESULT 4.1): it moves on insert and on `CREATE OR REPLACE TABLE ... AS SELECT`.
 
+### Review fixes (part B), developer: Sonnet, 2026-10-25
+
+Commits on `feat/bi-phase-5`: `4573bfe5` (P-B1, P-S1, P-S2, P-S5, with the `max_mb_from` warning of
+P-S4), `49c069a9` (P-S3, P-S6), `7ed9096b` (P-S4: compose and `tile_pool`).
+
+- **P-B1.** `sql_rewrite::reads_beyond_tables` finds clock/random functions; `CacheScope::with_zone`
+  (set from `time.zone()` in the dashboard, embed and metric paths) gives the report zone; an entry
+  with `day_bound` is used only when `computed_at` and now fall on one calendar day in that zone
+  (`jiff`, already a workspace dependency, bundled database). No zone: never served. Test with the
+  mock clock: 23:55 to 00:05 Jakarta misses, a plain statement is served.
+- **P-S1.** `dictGet*`/`joinGet*`/`IN <table>` add an unwatchable print; `BI-4-RESULT` 4.2 corrected.
+- **P-S2.** `NotStored` is now `Retry | Answer | Failed`; cut, over-8 MB and time-limit outcomes are
+  shared through moka's `Arc` error, Stop and engine errors make a follower compute. New test; the
+  failed-tile test now fails the leader with `STOPPED_SENTENCE`.
+- **P-S3, P-S6.** Masking test asserts `remembered == (i >= 2)` and two engine requests per order;
+  `tests/ai_cache_rule.rs` reads back `bi_board.cache_json` and the chart's `shape.cache`.
+- **P-S4.** Two `${VAR:-}` lines in the API environment; both parsers warn on a non-numeric value.
+- **P-S5.** Comment fixed; module doc has the replicated `system.parts` sentence.
+- Consequence to know: a statement that does not parse is treated as unwatchable and clock-bound
+  (never trusted); the `refreshing_one_chart` test now uses real SQL.
+
+Commands (from `rust/`, shared target dir, under `flock`): `cargo fmt --check` clean;
+`cargo clippy -p lakehouse-api --all-targets --all-features -- -D warnings` clean (after touching
+every `lib.rs`); `cargo test -p lakehouse-api --lib -- result_cache tile_pool tools::limits
+clock_random time_grain::a_second routes::query_cancel`: 37 passed, 0 failed (the `time_grain` and
+`query_cancel` filters matched nothing that runs without Postgres). `docker compose --profile '*'
+config --quiet` with throwaway values in the command only: exit 0.
+
+*Not verified:* `docker compose up` on the API profile (rule 8; shared VM, the reviewer does it);
+every `#[sqlx::test]` and integration file (no local Postgres): the masking test change in
+`support.rs`, `tests/ai_cache_rule.rs` (written, compiled by clippy `--all-targets`, never run; its
+mock rows are modelled on `ai_export_tools.rs` and may need a tweak in CI), the dashboard
+`a_second_open_is_remembered...`; the full workspace run; `cargo deny`/`cargo audit`; the lockfile
+change is `jiff` added to `lakehouse-api`'s dependency list (no new package).
+
 ## 8. Review (planner appends)
 
 ### Review of part B (T3–T8), planner, 2026-10-25

@@ -334,6 +334,26 @@ Commands (from `rust/`, shared target, `CARGO_BUILD_JOBS=2`, `CARGO_INCREMENTAL=
 full workspace clippy and test; the board-deadline test above; the browser abort; the `KILL` grant;
 the webpack build.
 
+### Re-review fixes R1, R2, developer: Sonnet, 2026-10-25
+
+Commits on `feat/bi-phase-5`: `43e34c9b` (R1), `5aaa2fc7` (R2).
+
+- **R1.** `build_and_send` loads the owner, then runs the rest (`deliver`) inside
+  `query_limits::scope_if_missing(state, Some(&owner), ...)`, boxed. New integration test
+  `a_scheduled_delivery_asks_the_engine_as_the_owner_under_the_saved_limits` (saves a 17-second
+  limit, checks every tile query's `query_id` starts with the owner's id and carries
+  `max_execution_time=17`).
+- **R2.** `query_cancel::stop_own_queries` (mark the run, count, always send the kill) is used by
+  `POST /api/query/cancel` and by `stop_query`; only `routes/ai/tools/limits.rs` was touched under
+  `routes/ai/`. Unit test: `stop_query` with a `runId` marks the run (`is_stopped`) and sends the
+  kill when the count is 0.
+
+Commands: as in the BI-4 entry (fmt clean, clippy `--all-targets --all-features -D warnings` clean,
+37 lib tests passed including `tools::limits`).
+
+*Not verified:* the R1 integration test and the rest of `tests/report_runner.rs` (needs Postgres;
+written and compiled only); the full workspace run; `route_auth`/`sec11_guard` were not re-run.
+
 ## 8. Review (planner appends)
 
 Planner, 2026-10-24: the console's shapes are accepted as the contract for the Rust tasks (the `/api/settings/limits` GET/PUT shape, the failed tile's `limit`, `X-Run-Id`, `POST /api/query/cancel`). The row-cut marker on a tile result is named **`limitHit`**, because `limit` is already a raw table's page size. T1 to T5 build to these shapes.
