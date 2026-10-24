@@ -36,6 +36,10 @@ const TABLE_FUNCTION_DENIED: &str =
 async fn spin_up_with_clickhouse(ch_uri: &str) -> TestApp {
     let mut overrides = HashMap::new();
     overrides.insert("CH_URL".to_owned(), ch_uri.to_owned());
+    overrides.insert(
+        "CATALOG_TENANT_ID".to_owned(),
+        "11111111-1111-4111-8111-000000000001".to_owned(),
+    );
     spin_up_with_env(&overrides).await
 }
 
@@ -73,6 +77,14 @@ async fn mount_columns_then_explain(ch: &MockServer) {
 
 async fn estimate_as_reader(app: &TestApp, sql: &str) -> (StatusCode, String) {
     let user = create_principal_with_permissions(&app.pool, "query:read").await;
+    // The shared catalog belongs to one tenant, and the query path is
+    // scoped to the tenant: this principal is put in the catalog's own.
+    sqlx::query("INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2::uuid)")
+        .bind(user)
+        .bind("11111111-1111-4111-8111-000000000001")
+        .execute(&app.pool)
+        .await
+        .expect("attach the fixture principal to the catalog's tenant");
     let cookie = session_cookie_for_user(&app.pool, user).await;
     let resp = app
         .router

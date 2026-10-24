@@ -2549,10 +2549,27 @@ mod tests {
             )
         }
 
+        /// The state these tests run against: the seeded deployment's
+        /// database, the mock engine, and the shared catalog's own
+        /// tenant — the query path is scoped to the tenant, and the
+        /// catalog's gate admits only that tenant's members.
+        fn state_for(pool: &PgPool, ch_url: &str) -> AppState {
+            let mut env = HashMap::new();
+            env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
+            env.insert("CH_URL".to_owned(), ch_url.to_owned());
+            env.insert("CATALOG_TENANT_ID".to_owned(), CATALOG_TENANT_ID.to_owned());
+            AppState::new(Config::from_map(&env).expect("valid config from a map"))
+        }
+
+        /// The shared catalog belongs to one tenant, and the query path
+        /// is scoped to the tenant: this fixture principal is the
+        /// catalog's own member, so the shared tables stay reachable.
+        const CATALOG_TENANT_ID: &str = "11111111-1111-4111-8111-000000000001";
+
         fn analyst_principal() -> Extension<Principal> {
             Extension(Principal {
                 id: PrincipalId::User(Uuid::nil()),
-                tenant_ids: Vec::new(),
+                tenant_ids: vec![uuid::uuid!("11111111-1111-4111-8111-000000000001")],
                 display_name: "alice".to_owned(),
                 permissions: PermissionSet::parse("query:read"),
                 provider: "session".to_owned(),
@@ -2642,10 +2659,7 @@ mod tests {
             let server = MockServer::start().await;
             mount_governed_table_responses(&server).await;
 
-            let mut env = HashMap::new();
-            env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
-            env.insert("CH_URL".to_owned(), server.uri());
-            let state = AppState::new(Config::from_map(&env).expect("valid config from a map"));
+            let state = state_for(&pool, &server.uri());
 
             let body = Bytes::from(json!({ "sql": "SELECT * FROM serving.mart_x" }).to_string());
             let result = run(State(state), Some(analyst_principal()), body).await;
@@ -2685,10 +2699,7 @@ mod tests {
             pool: PgPool,
         ) -> sqlx::Result<()> {
             let server = MockServer::start().await;
-            let mut env = HashMap::new();
-            env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
-            env.insert("CH_URL".to_owned(), server.uri());
-            let state = AppState::new(Config::from_map(&env).expect("valid config from a map"));
+            let state = state_for(&pool, &server.uri());
 
             let result = check_statement_would_run(
                 &state,
@@ -2717,10 +2728,7 @@ mod tests {
             pool: PgPool,
         ) -> sqlx::Result<()> {
             let server = MockServer::start().await;
-            let mut env = HashMap::new();
-            env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
-            env.insert("CH_URL".to_owned(), server.uri());
-            let state = AppState::new(Config::from_map(&env).expect("valid config from a map"));
+            let state = state_for(&pool, &server.uri());
 
             let result = check_statement_would_run(
                 &state,
@@ -2774,10 +2782,7 @@ mod tests {
 
             let server = MockServer::start().await;
             mount_governed_table_responses(&server).await;
-            let mut env = HashMap::new();
-            env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
-            env.insert("CH_URL".to_owned(), server.uri());
-            let state = AppState::new(Config::from_map(&env).expect("valid config from a map"));
+            let state = state_for(&pool, &server.uri());
 
             let result = check_statement_would_run(
                 &state,
@@ -2847,10 +2852,7 @@ mod tests {
 
             let server = MockServer::start().await;
             mount_governed_table_responses(&server).await;
-            let mut env = HashMap::new();
-            env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
-            env.insert("CH_URL".to_owned(), server.uri());
-            let state = AppState::new(Config::from_map(&env).expect("valid config from a map"));
+            let state = state_for(&pool, &server.uri());
 
             check_statement_would_run(
                 &state,
@@ -2882,10 +2884,7 @@ mod tests {
             pool: PgPool,
         ) -> sqlx::Result<()> {
             let server = MockServer::start().await;
-            let mut env = HashMap::new();
-            env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
-            env.insert("CH_URL".to_owned(), server.uri());
-            let state = AppState::new(Config::from_map(&env).expect("valid config from a map"));
+            let state = state_for(&pool, &server.uri());
 
             let result =
                 check_statement_would_run(&state, &analyst_principal().0, "SELECT 1", "trino")
@@ -2912,10 +2911,7 @@ mod tests {
             // No mocks mounted at all — any request reaching `ClickHouse`
             // fails with a connection/404 error, which would itself prove
             // the refusal came too late.
-            let mut env = HashMap::new();
-            env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
-            env.insert("CH_URL".to_owned(), server.uri());
-            let state = AppState::new(Config::from_map(&env).expect("valid config from a map"));
+            let state = state_for(&pool, &server.uri());
 
             let body = Bytes::from(json!({ "sql": "SELECT * FROM url('h','CSV')" }).to_string());
             let result = run(State(state), Some(analyst_principal()), body).await;
