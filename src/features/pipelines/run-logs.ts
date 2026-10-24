@@ -96,7 +96,11 @@ export function failureLines(lines: readonly LogLine[], max = 3): LogLine[] {
  * line, so the pipeline id in front of it is dropped) or `null` when the
  * log holds none -- the caller then says "The run failed; see the run log".
  */
-const OUR_REASON = /(config rejected:|refused:)\s*([^"]*)/
+// PR review (BLD-7, SHOULD-FIX 2): anchored to the factory's own prefix,
+// `authored pipeline '<id>' config rejected:` / `... refused:`. A bare
+// `refused:` also matched upstream text such as a driver's "Connection
+// refused: ..." and showed it as the reason.
+const OUR_REASON = /authored pipeline '[^']*' (config rejected:|refused:)\s*([^"]*)/
 
 export function classifiedFailureReason(lines: readonly LogLine[]): string | null {
   for (const line of failureLines(lines, 6)) {

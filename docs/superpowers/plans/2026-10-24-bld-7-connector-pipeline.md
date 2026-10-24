@@ -225,3 +225,33 @@ Notes for the reviewer:
 ## Review
 
 (planner appends here)
+
+### Review round 1 (planner, 2026-10-24)
+
+Diff read against the plan at `8dbf7751`. Decisions 1-8 are followed. The
+six reported interpretations are accepted: reading
+`GET /api/connectors/{id}/ingest-spec` is the existing read the connector
+page uses (decision 5 asked for no new endpoint, and none was added); the
+create test's `sourceTable: "orders"` keeps its tenant assertion; the
+`BLD-8` cause was the client poll effect, and the fix is at that effect;
+the two form behaviours are stated at the code; the compose note is a doc
+gap for `AGENTS.md`, not this PR. No `BLOCKER`.
+
+- **SHOULD-FIX 1 (fixed by the planner).** `update` checked decision 2
+  only for a newly submitted `connectorId`. A body that left the connector
+  out kept it, but could move the source to a table that connector never
+  loads; `restore_version` had the same gap (it keeps the connector and
+  replays an older source). Both now check the connector the row ends
+  with. Test:
+  `update_refuses_moving_a_kept_connectors_pipeline_to_a_table_it_does_not_load`.
+- **SHOULD-FIX 2 (fixed by the planner).** `classifiedFailureReason`
+  matched a bare `refused:`, so a driver's "Connection refused: ..." was
+  shown as the reason, against decision 6. The pattern is now anchored to
+  the factory's own `authored pipeline '<id>' config rejected:` /
+  `refused:` prefix; the upstream-text test gained that line.
+- **Nit (fixed).** The refusal sentence put backticks around `bronze`; the
+  console shows it as plain text, so they are gone.
+
+The developer's workspace clippy and test, and the full `bun test src`,
+did not finish on this machine (disk, lock); the planner's full run below
+is the one that counts.

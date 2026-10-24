@@ -168,6 +168,8 @@ describe("the classified failure reason (BLD-8 decision 6)", () => {
       line("ERROR", "export of 'x' failed: 401 Client Error", "export_gold_mart[x]"),
       line("ERROR", "clickhouse: Code: 60. Table silver.orders does not exist", "authored_pl_x"),
       line("ERROR", 'Execution of step "authored_pl_x" failed.'),
+      // PR review (BLD-7, SHOULD-FIX 2): a driver's "refused:" is not ours.
+      line("ERROR", "clickhouse: Connection refused: clickhouse:8123", "authored_pl_x"),
     ]
     expect(classifiedFailureReason(upstream)).toBeNull()
   })

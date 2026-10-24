@@ -527,7 +527,7 @@ pub const CONNECTOR_HAS_NO_TABLES: &str =
 /// [`validate_connector_source`]; the rest of the sentence is fixed so
 /// create and update say the same thing.
 const CONNECTOR_SOURCE_REFUSED_PREFIX: &str = "A pipeline with a connector reads one of that connector's Bronze tables: \
-     choose `bronze` and one of: ";
+     choose bronze and one of: ";
 const CONNECTOR_SOURCE_REFUSED_SUFFIX: &str = ". To read another table, choose No connector.";
 
 /// `BLD-7` / decision 2 + `DEC-15`: whether a pipeline may name
@@ -1617,18 +1617,36 @@ pub async fn update(
             .map(|id| id.trim().to_owned())
             .filter(|id| !id.is_empty())
     });
-    if let Some(Some(connector_id)) = connector_change.as_ref() {
-        let current = pipelines::get_pipeline(pool, &id)
-            .await?
-            .ok_or_else(|| ApiError::NotFound(format!("Pipeline {id} not found")))?;
-        crate::routes::pipelines::require_connector_in_tenant(
-            pool,
-            connector_id,
-            current.tenant_id,
-        )
-        .await?;
-        validate_connector_source(pool, connector_id, &body.source_zone, &body.source_table)
+    //
+    // PR review (BLD-7, SHOULD-FIX 1): an absent `connectorId` keeps the
+    // stored one, and the source may still change in the same body, so the
+    // rule is checked against the connector the row will END with, not
+    // only a newly submitted one. Otherwise an edit could point a
+    // connector's pipeline at a table that connector never loads.
+    match connector_change.as_ref() {
+        Some(Some(connector_id)) => {
+            let current = pipelines::get_pipeline(pool, &id)
+                .await?
+                .ok_or_else(|| ApiError::NotFound(format!("Pipeline {id} not found")))?;
+            crate::routes::pipelines::require_connector_in_tenant(
+                pool,
+                connector_id,
+                current.tenant_id,
+            )
             .await?;
+            validate_connector_source(pool, connector_id, &body.source_zone, &body.source_table)
+                .await?;
+        }
+        Some(None) => {}
+        None => {
+            let current = pipelines::get_pipeline(pool, &id)
+                .await?
+                .ok_or_else(|| ApiError::NotFound(format!("Pipeline {id} not found")))?;
+            if let Some(kept) = current.connector_id.as_deref() {
+                validate_connector_source(pool, kept, &body.source_zone, &body.source_table)
+                    .await?;
+            }
+        }
     }
     // Dagster unreachable degrades to "no Dagster upstreams accepted"
     // (empty list) rather than 500ing the update — see
@@ -1850,6 +1868,15 @@ pub async fn restore_version(
     // Bronze-target refusal above is re-applied here). Always `Some(...)`: a
     // restore always carries the snapshot's chain.
     validate_per_table_upstream(&snapshot.source_zone, Some(&snapshot.depends_on))?;
+    // PR review (BLD-7, SHOULD-FIX 1): a restore keeps the row's current
+    // connector (`connector_id: None` below) but replays the snapshot's
+    // source, which may predate the connector. Hold it to the same rule.
+    if let Some(current) = pipelines::get_pipeline(pool, &id).await?
+        && let Some(kept) = current.connector_id.as_deref()
+    {
+        validate_connector_source(pool, kept, &snapshot.source_zone, &snapshot.source_table)
+            .await?;
+    }
     let dagster_jobs = match state.dagster.list_jobs().await {
         Ok(j) => j,
         Err(err) => {
@@ -3720,6 +3747,43 @@ mod tests {
                 stored.connector_id.as_deref(),
                 Some(SEED_CONNECTOR),
                 "an absent connectorId means unchanged, not cleared"
+            );
+        }
+
+        /// PR review (BLD-7, SHOULD-FIX 1): the body keeps the stored
+        /// connector by leaving `connectorId` out, but moves the source to a
+        /// table that connector never loads. The rule holds for the
+        /// connector the row ends with, so this is refused and nothing is
+        /// written.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn update_refuses_moving_a_kept_connectors_pipeline_to_a_table_it_does_not_load(
+            pool: sqlx::PgPool,
+        ) {
+            let created =
+                stored_pipeline(&pool, "pl-keep-move", "orders", Some(SEED_CONNECTOR)).await;
+
+            let err = call_update(
+                &pool,
+                &created.id,
+                body(&json!({ "sourceTable": "not_one_of_its_tables" })),
+            )
+            .await
+            .expect_err("the kept connector does not load that table");
+
+            assert_eq!(err.0.status(), 400);
+            assert!(
+                err.0
+                    .to_string()
+                    .contains("reads one of that connector's Bronze tables"),
+                "the refusal is the same fixed sentence"
+            );
+            let stored = pipelines::get_pipeline(&pool, &created.id)
+                .await
+                .expect("get_pipeline")
+                .expect("the row still exists");
+            assert_eq!(
+                stored.source, "bronze.orders",
+                "a refused update writes nothing"
             );
         }
 
