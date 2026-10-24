@@ -88,7 +88,10 @@ croner = { version = "4" }
 sqlparser = "0.63"
 
 [workspace.lints.rust]
-future-incompatible = "warn"
+# `future_incompatible` with an underscore: Cargo 1.99 warns that the
+# hyphenated `future-incompatible` spelling is deprecated and will not work
+# in a future edition (REL-9). Same lint, same level.
+future_incompatible = "warn"
 nonstandard_style = { level = "deny", priority = -1 }
 missing_docs = "warn"
 
