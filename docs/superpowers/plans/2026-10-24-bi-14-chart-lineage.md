@@ -171,4 +171,25 @@ at build time, check every branch (`0098`+ are being taken by `BI-19`).
 
 ## 7. Handoff (developer appends)
 
+### T5 Console (developer, branch `feat/bi-phase-6`; Rust T1 to T4 not built)
+
+Commit: `130a46eb` feat(dashboards): BI-14 chart lineage in the console (T5). TypeScript only; no cargo command, no Rust change.
+
+Built (feature decisions 1, 5, 6, 7; plan D7): the item "Where does this come from" on the tile menu of each stored (non-built-in) chart; `chart-lineage-panel.tsx` (path as a vertical list, kind and refresh time per step, "Not recorded" where there is no record, the columns behind each field or "No column mapping recorded", coverage lines, "Open in lineage" to `/lineage?focus=chart:<id>`); `features/governance/used-by.tsx` ("Used by": chart, dashboard, how it reads the table, "and N more you do not have access to") on the asset page's lineage tab and on the lineage page for a table focus; the lineage page labels chart, SQL source, metric and upload nodes. Contracts: `dashboardService.chartLineage(id)` and `governanceService.getUsedBy(table)`. Owner decision Q6: without `lineage:read` the panel and the list show "Lineage needs the lineage permission; ask your administrator." and call nothing; a 403 from the server shows the same sentence. The menu item is shown to everyone who sees the chart. Embeds and public links do not use the dashboard page, so they have no item (not tested: no embed test renders the tile menu).
+
+**Contract for T2 and T3 (the plan names the fields, not their shapes where noted):**
+- `GET /api/dashboard/charts/{id}/lineage` answers `{ chart: { id, title }, steps: [{ id, kind, label, refreshedAt?, refreshSource?, notRecorded? }], edges: [{ id, from, to, kind, evidence? }], fields: [{ field, columns: [{ table, column, via }] }], coverage: string[], supported: boolean }`. `chart` as an object with id and title is my choice (D1 names `chart` only). `kind` is one of `chart`, `sql_source`, `metric`, `gold`, `silver`, `bronze`, `connector`, `upload`, `pipeline`. `steps` come in path order, the chart first, the connector or upload last. `refreshedAt` is an ISO 8601 instant, shown in the report zone; `refreshSource` is a short phrase ("last Gold build", "Iceberg last update", "last connector run", "upload time"); with `notRecorded: true` there is no `refreshedAt`. `via` names the step that produced the column ("Gold build", "formula", "SQL source"). 403 with `{ error }` without `lineage:read`; 404 for a chart the person cannot see.
+- `GET /api/governance/lineage/used-by?table=serving.x` answers `{ supported, table, charts: [{ chartId, chartTitle, dashboardId, dashboardTitle, via }], hiddenCount, truncated? }` with `via` one of `direct`, `sql_source`, `metric`; at most 200 charts; `truncated` true when more matched. The chart row reuses the column-lineage `charts` field names. The dashboard link is `/dashboards?board=<dashboardId>`.
+- Graph nodes (T1): ids `chart:<id>` and `metric:<id>`; node `kind` `chart`, `sql_source` or `metric`. The console only labels them; a focus on a chart id draws what the server returns.
+
+Not built: the lineage page's chart nodes are labelled but the page has no chart-specific view; focus input still takes a typed id.
+
+Checks (from `/home/hv/lakehouse-phase6-build`, run once on the three commits of this session: Gantt switch, BI-14 console, C2b console):
+- `bun run typecheck`: exit 0. `bun run lint`: 0 errors, 9 warnings, none in these files.
+- `bun test src` (summary lines only): 2570 pass, 1 skip, 0 fail (265 files).
+- An earlier full run after `130a46eb` showed 558 failures, all from my change: `asset-detail-tabs.test.tsx` stubs every `/api/governance/lineage*` path with the lineage graph, so "Used by" got a graph with no `charts`, threw in render and tore down the DOM for the file. Fixed in the next commit (a malformed answer is "could not be read just now", and the stub answers the used-by route); no failure was pre-existing.
+- New tests: `chart-lineage-panel.test.tsx` 6, `used-by.test.tsx` 7 (panel steps and refresh times, "Not recorded", columns, link, refusal sentence both ways, failure message; list, hidden count, none, malformed answer).
+- Not verified: the webpack build; the panel in a browser; the tile menu item itself (no test renders the dashboard tile menu).
+
+
 ## 8. Review (planner appends)

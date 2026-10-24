@@ -335,6 +335,26 @@ Checks (from `/home/hv/lakehouse-phase6-build`):
 - Not verified: the webpack build; a Gantt drawn in a real canvas (the tests hand the option to a mocked `EChart`, and the geometry of a bar is tested through `ganttBarItem` with a stub API); the `markLine` on the empty line series.
 
 
+### C1 Gantt today-line switch, and C2b Admin > Maps (console halves; developer, branch `feat/bi-phase-6`)
+
+Commits: `b410aa54` feat(dashboards): BI-16 C1 Gantt "Today line" switch (todayLine style field); the fix `Used by` guard and the C2b commit `feat(maps): BI-16 C2b Admin > Maps` follow it in the log. TypeScript only; no cargo command, no Rust change.
+
+**Gantt switch.** `todayLine?: boolean` on `StyleFields`; `FormatRules.todayLine` (Gantt only); a "Today line" switch in the format section, on by default; only `todayLine: false` is stored or sent (`stylePayload`, `styleFromDef`); `ganttOption` leaves the line out when it is false. Tests in `format-section.test.tsx` and `gantt-option.test.tsx`. T1 validates the field; until then the server rejects it with the gantt kind.
+
+**C2b console (T8), contract for T5/T6 (the plan names routes and permissions, not JSON; these shapes are the console's choice).** Types are in `src/services/contracts/maps.ts`, the client in `src/services/clients/maps.ts`.
+- `GET /api/maps` answers `{ maps: [{ id, name, nameProperty, regionCount, createdAt, createdBy? }] }`; `id` is `m_` and 12 lower-case hex digits (the console draws any id of that form without the list).
+- `POST /api/maps`: multipart with `name`, `nameProperty` and `file`; answers the map. A refused file answers 400 or 413 with `{ error }` as a plain sentence the console shows as is.
+- `PATCH /api/maps/{id}` `{ name }` answers the map. `DELETE /api/maps/{id}` answers `{ ok: true }`, or 409 with `{ error, charts: [{ chartId, chartTitle, dashboardId, dashboardTitle }] }` when a chart uses the map.
+- `GET /api/maps/{id}/geojson` must answer the simplified file with the chosen name property **copied to `properties.name` on every feature**, so `ensureMap` reads it like a built-in map (it reads `properties.name`). The console fetches it through `apiFetch`, comment at the site.
+- Owner decision Q4: the form refuses a file over 50 MB before reading it ("This file is over 50 MB. Simplify it or split it, then upload again."), and says the file is simplified to 5 MB or less for drawing.
+
+Built: Admin > Maps (`features/admin/maps-page.tsx`, route `/admin/maps`, sidebar entry): upload with the name property chosen from the first feature's properties (only the first 1 MB is read, `lib/geojson-head.ts`), list, rename, delete (a refused delete lists the charts); read-only text without `settings:write`. Uploaded maps in the chart builder's map select under "Uploaded by your administrator" (`use-map-catalogue.ts`, `map-picker.tsx`); `MapEntry.uploaded`, region level `uploaded` (names matched as typed, ignoring case, accents and spacing). The sidebar entry is shown to everyone who sees Administration; the server refuses what `settings:write` does not allow.
+
+Server pieces still needed: T5 (validation), T6 (the five routes, storage), T7 (`list_maps`, assistant), T1 and T2 for Gantt. A pin or grid map on an uploaded id has no console test beyond the catalogue (D6 asks one; it needs T6's save to be meaningful).
+
+Checks (from `/home/hv/lakehouse-phase6-build`): `bun run typecheck` exit 0; `bun run lint` 0 errors, 9 warnings, none in these files; `bun test src` (summary only): 2570 pass, 1 skip, 0 fail (265 files). New tests: `maps-page.test.tsx` 8, `geojson-head.test.ts` 8, `uploaded-maps.test.tsx` 4, plus the Gantt switch tests. Not verified: the webpack build, an upload against a real server, a map drawn from an uploaded file in a browser.
+
+
 ## 8. Review (planner appends, one entry per part)
 
 Planner, 2026-10-24: the console's Gantt assumptions are the contract for T1 (result columns `task`, `group`, `start`, `end`, `progress`; optional `reversedRows`; dates as report-zone strings). Feature decision 2's "today line can be switched off" becomes a style field `todayLine: false` (planner default). The console adds the switch, and T1 validates the field.
