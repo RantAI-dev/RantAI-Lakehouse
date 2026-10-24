@@ -332,3 +332,21 @@ async fn purging_an_item_drops_its_rules_and_its_mark_and_no_one_elses(
     assert_eq!(marks[0].item_id, "b2");
     Ok(())
 }
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn names_are_found_for_the_people_and_roles_that_exist(pool: PgPool) -> sqlx::Result<()> {
+    use lakehouse_store::dashboard_access::{role_names, search_roles, user_names};
+    let ann = user(&pool, "ann").await;
+    let readers = role(&pool, "report-readers").await;
+    let people = user_names(&pool, &[ann, Uuid::new_v4()]).await.unwrap();
+    assert_eq!(people.len(), 1);
+    assert_eq!(people[0].1, "ann");
+    assert_eq!(
+        role_names(&pool, &[readers]).await.unwrap(),
+        vec![(readers, "report-readers".to_owned())]
+    );
+    // `%` and `_` in the needle are literal.
+    assert_eq!(search_roles(&pool, "report", 10).await.unwrap().len(), 1);
+    assert_eq!(search_roles(&pool, "%", 10).await.unwrap().len(), 0);
+    Ok(())
+}

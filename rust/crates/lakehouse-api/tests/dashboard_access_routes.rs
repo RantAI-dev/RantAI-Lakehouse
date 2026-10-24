@@ -26,8 +26,14 @@ use common::{
     TestApp, create_principal_with_permissions, session_cookie_for_user, spin_up_with_env,
 };
 
-/// The dashboards the stand-in store holds: `(id, folder)`.
-const BOARDS: [(&str, &str); 3] = [("b1", ""), ("b2", ""), ("b_secret", "f1")];
+/// The dashboards the stand-in store holds: `(id, folder, owner)`. `b_private`
+/// is somebody else's personal dashboard.
+const BOARDS: [(&str, &str, &str); 4] = [
+    ("b1", "", ""),
+    ("b2", "", ""),
+    ("b_secret", "f1", ""),
+    ("b_private", "fp_x", "someone-else"),
+];
 
 /// The ids named by `AND id IN (...)` or `AND id NOT IN (...)` in a statement,
 /// if it carries one.
@@ -57,17 +63,24 @@ impl Respond for Store {
         } else if sql.contains("SELECT id, folder_id, owner_id FROM console.bi_board") {
             BOARDS
                 .iter()
-                .map(|(id, folder)| json!({ "id": id, "folder_id": folder, "owner_id": "" }))
+                .map(|(id, folder, owner)| json!({ "id": id, "folder_id": folder, "owner_id": owner }))
                 .collect()
         } else if sql.contains("FROM console.bi_board FINAL") {
             let only = listed(&sql, "AND id IN (");
             let hidden = listed(&sql, "AND id NOT IN (").unwrap_or_default();
+            let by_id = sql.find("AND id='").map(|at| {
+                let rest = &sql[at + "AND id='".len()..];
+                rest[..rest.find('\'').unwrap_or(rest.len())].to_owned()
+            });
             BOARDS
                 .iter()
-                .filter(|(id, _)| only.as_ref().is_none_or(|o| o.iter().any(|i| i == id)))
-                .filter(|(id, _)| !hidden.iter().any(|h| h == id))
-                .map(|(id, folder)| {
-                    json!({ "id": id, "name": format!("Board {id}"), "folder_id": folder, "owner_id": "" })
+                .filter(|(id, _, _)| only.as_ref().is_none_or(|o| o.iter().any(|i| i == id)))
+                .filter(|(id, _, _)| !hidden.iter().any(|h| h == id))
+                // A read by id (`AND id='b1'`) answers that dashboard only.
+                .filter(|(id, _, _)| by_id.as_ref().is_none_or(|wanted| wanted == id))
+                .filter(|(_, _, owner)| owner.is_empty() || sql.contains(&format!("owner_id = '{owner}'")) || !sql.contains("owner_id = ''"))
+                .map(|(id, folder, owner)| {
+                    json!({ "id": id, "name": format!("Board {id}"), "folder_id": folder, "owner_id": owner })
                 })
                 .collect()
         } else {
@@ -208,4 +221,151 @@ async fn a_restricted_folder_hides_its_dashboards_from_a_viewer_who_is_not_liste
     assert!(ids(&body).contains(&"b_secret".to_owned()), "{body}");
     let (status, _) = get(&router, &cookie, "/api/dashboard?board=b_secret").await;
     assert_eq!(status, StatusCode::OK);
+}
+
+async fn put(router: &axum::Router, cookie: &str, body: &Value) -> (StatusCode, Value) {
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/dashboard/access")
+                .header("cookie", cookie)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+#[tokio::test]
+async fn only_somebody_who_manages_a_dashboard_reads_or_changes_its_permissions() {
+    let (router, pool, _ch) = app().await;
+    let manager = create_principal_with_permissions(&pool, "dashboard:read, dashboard:write").await;
+    let reader = create_principal_with_permissions(&pool, "dashboard:read").await;
+    let nobody = create_principal_with_permissions(&pool, "query:read").await;
+    let guest = create_principal_with_permissions(&pool, "query:read").await;
+    replace_item(&pool, "board", "b1", &[view_for(guest)], false, None)
+        .await
+        .unwrap();
+    let get_access = "/api/dashboard/access?kind=board&id=b1";
+
+    // A manager reads it.
+    let cookie = session_cookie_for_user(&pool, manager).await;
+    let (status, body) = get(&router, &cookie, get_access).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["yourLevel"], "manage");
+    assert_eq!(body["rules"].as_array().unwrap().len(), 1, "{body}");
+
+    // Somebody who can see it and does not manage it is refused; somebody who
+    // cannot see it, and an id that does not exist, get the same 404.
+    let cookie = session_cookie_for_user(&pool, reader).await;
+    assert_eq!(get(&router, &cookie, get_access).await.0, StatusCode::OK);
+    let cookie = session_cookie_for_user(&pool, guest).await;
+    assert_eq!(
+        get(&router, &cookie, get_access).await.0,
+        StatusCode::FORBIDDEN
+    );
+    let hidden = get(&router, &cookie, "/api/dashboard/access?kind=board&id=b2").await;
+    let unknown = get(&router, &cookie, "/api/dashboard/access?kind=board&id=nope").await;
+    assert_eq!(hidden.0, StatusCode::NOT_FOUND);
+    assert_eq!(
+        hidden, unknown,
+        "an existing dashboard and an unknown id answer alike"
+    );
+
+    // Neither permission nor rule.
+    let cookie = session_cookie_for_user(&pool, nobody).await;
+    assert_eq!(
+        get(&router, &cookie, get_access).await.0,
+        StatusCode::FORBIDDEN
+    );
+    let (status, _) = put(
+        &router,
+        &cookie,
+        &json!({ "kind": "board", "id": "b1", "rules": [], "restricted": true }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(
+        lakehouse_store::dashboard_access::restriction_for_item(&pool, "board", "b1")
+            .await
+            .unwrap()
+            .is_none(),
+        "a refused change wrote nothing"
+    );
+}
+
+#[tokio::test]
+async fn a_manager_replaces_the_rules_and_the_change_is_audited_and_the_refusals_hold() {
+    let (router, pool, _ch) = app().await;
+    let manager = create_principal_with_permissions(&pool, "dashboard:read, dashboard:write").await;
+    let ann = create_principal_with_permissions(&pool, "query:read").await;
+    let cookie = session_cookie_for_user(&pool, manager).await;
+    let ok = put(
+        &router,
+        &cookie,
+        &json!({
+            "kind": "board", "id": "b2", "restricted": true,
+            "rules": [{ "userId": ann, "level": "view" }],
+        }),
+    )
+    .await;
+    assert_eq!(ok.0, StatusCode::OK, "{}", ok.1);
+    assert_eq!(ok.1["restricted"], true);
+    assert_eq!(ok.1["rules"][0]["id"], json!(ann));
+    let audited: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_event WHERE action = 'dashboard.access_change' AND resource_id = 'b2'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(audited, 1);
+
+    // Ann now reads b2 and nothing else.
+    let ann_cookie = session_cookie_for_user(&pool, ann).await;
+    let (_, list) = get(&router, &ann_cookie, "/api/dashboard/boards").await;
+    assert_eq!(ids(&list), ["b2"]);
+
+    // Refusals: an unknown person, a person twice, the built-in dashboard,
+    // somebody else's personal dashboard (which does not exist for the manager).
+    for (body, expected) in [
+        (
+            json!({ "kind": "board", "id": "b2", "restricted": false,
+                    "rules": [{ "userId": Uuid::new_v4(), "level": "view" }] }),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!({ "kind": "board", "id": "b2", "restricted": false,
+                    "rules": [{ "userId": ann, "level": "view" }, { "userId": ann, "level": "edit" }] }),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!({ "kind": "board", "id": "default", "restricted": false, "rules": [] }),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!({ "kind": "board", "id": "b_private", "restricted": false, "rules": [] }),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            json!({ "kind": "chart", "id": "b2", "restricted": false, "rules": [] }),
+            StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        let (status, body_out) = put(&router, &cookie, &body).await;
+        assert_eq!(status, expected, "{body}: {body_out}");
+    }
+    // The failed attempts changed nothing.
+    let rules = lakehouse_store::dashboard_access::rules_for_item(&pool, "board", "b2")
+        .await
+        .unwrap();
+    assert_eq!(rules.len(), 1);
 }

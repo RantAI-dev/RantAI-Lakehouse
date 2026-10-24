@@ -2578,6 +2578,43 @@ async fn the_moved_dashboard_reads_are_refused_without_a_rule_and_pass_with_one(
     }
 }
 
+/// BI-19 part B1 (plan D10): the permissions routes are `RequiresAuth` at the
+/// router and "manage on the item" in the handler. Both ways: no session is
+/// 401, no `dashboard:read` and no rule is 403, and a principal holding
+/// `dashboard:read` + `dashboard:write` (manage on every unrestricted item) is
+/// past the guard (what follows is the harness's unreachable `ClickHouse`).
+#[tokio::test]
+async fn the_access_routes_need_manage_on_the_item_both_ways() {
+    let TestApp { router, pool } = spin_up().await;
+    let uri = "/api/dashboard/access?kind=board&id=b1";
+    let manager =
+        common::create_principal_with_permissions(&pool, "dashboard:read, dashboard:write").await;
+    let nobody = common::create_principal_with_permissions(&pool, "query:read").await;
+    for method in ["GET", "PUT"] {
+        assert_eq!(
+            POLICY_TABLE
+                .iter()
+                .find(|(m, p, _)| *m == method && *p == "/api/dashboard/access")
+                .map(|(_, _, policy)| *policy),
+            Some(Policy::RequiresAuth),
+            "{method}"
+        );
+        let anonymous = request_with_cookie(&router, method, uri, "").await;
+        assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED, "{method}");
+        let cookie = common::session_cookie_for_user(&pool, nobody).await;
+        let body = br#"{"kind":"board","id":"b1","rules":[],"restricted":false}"#.to_vec();
+        let resp = request_with_cookie_and_body(&router, method, uri, &cookie, body.clone()).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{method} (nobody)");
+        let cookie = common::session_cookie_for_user(&pool, manager).await;
+        let resp = request_with_cookie_and_body(&router, method, uri, &cookie, body).await;
+        assert!(
+            resp.status() != StatusCode::UNAUTHORIZED && resp.status() != StatusCode::FORBIDDEN,
+            "{method}: a manager must get past the guard, got {}",
+            resp.status()
+        );
+    }
+}
+
 /// BI-11: parameters are read with `dashboard:read` and defined, changed and
 /// deleted with `dashboard:write`. Asserted both ways for every method: a
 /// reader gets past the gate on `GET` and is refused on the writes, a writer

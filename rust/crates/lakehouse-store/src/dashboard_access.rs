@@ -235,3 +235,58 @@ pub async fn replace_item(
 pub async fn delete_item(pool: &PgPool, item_kind: &str, item_id: &str) -> Result<(), StoreError> {
     replace_item(pool, item_kind, item_id, &[], false, None).await
 }
+
+/// Names for the grantees of a list of rules, for the People tab: `(id, name,
+/// email)` for each person that still exists.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the query fails.
+pub async fn user_names(
+    pool: &PgPool,
+    ids: &[Uuid],
+) -> Result<Vec<(Uuid, String, String)>, StoreError> {
+    Ok(
+        sqlx::query_as("SELECT id, name, email FROM app_user WHERE id = ANY($1)")
+            .bind(ids)
+            .fetch_all(pool)
+            .await?,
+    )
+}
+
+/// `(id, name)` for each of these roles that still exists.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the query fails.
+pub async fn role_names(pool: &PgPool, ids: &[Uuid]) -> Result<Vec<(Uuid, String)>, StoreError> {
+    Ok(
+        sqlx::query_as("SELECT id, name FROM role WHERE id = ANY($1)")
+            .bind(ids)
+            .fetch_all(pool)
+            .await?,
+    )
+}
+
+/// Roles whose name contains `needle`, for the picker, at most `limit`.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the query fails.
+pub async fn search_roles(
+    pool: &PgPool,
+    needle: &str,
+    limit: i64,
+) -> Result<Vec<(Uuid, String)>, StoreError> {
+    let escaped = needle
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    Ok(
+        sqlx::query_as("SELECT id, name FROM role WHERE name ILIKE $1 ORDER BY name LIMIT $2")
+            .bind(format!("%{escaped}%"))
+            .bind(limit)
+            .fetch_all(pool)
+            .await?,
+    )
+}

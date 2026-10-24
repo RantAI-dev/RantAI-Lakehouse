@@ -1235,6 +1235,15 @@ pub fn router(state: AppState) -> Router {
             axum::routing::post(public_links::unlock),
         )
         // BI-19 part A (D5): make, change and end a dashboard's public link.
+        // BI-19 part B1 (plan D10): who has what on a dashboard or folder.
+        .route(
+            "/api/dashboard/access",
+            get(dashboard_access::get_access).put(dashboard_access::put_access),
+        )
+        .route(
+            "/api/dashboard/access-preview",
+            get(dashboard_access::access_preview),
+        )
         .route(
             "/api/dashboard/public-link",
             get(public_links::get_link)

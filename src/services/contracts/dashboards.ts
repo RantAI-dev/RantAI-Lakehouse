@@ -144,6 +144,18 @@ export type DashboardService = {
   /** End the link at once. */
   endPublicLink(board: string, signal?: AbortSignal): Promise<void>
   /**
+   * `BI-19` part B: who has what on a dashboard or folder. Needs manage on the
+   * item; anything else arrives as the server's sentence (403 for one the
+   * caller can see and does not manage, 404 for one they cannot see).
+   */
+  getAccess(kind: AccessKind, id: string, signal?: AbortSignal): Promise<ItemAccess>
+  /** Replace the item's rules and its "only the people listed" mark. */
+  saveAccess(input: ItemAccessInput, signal?: AbortSignal): Promise<ItemAccess>
+  /** People and roles for the picker; at most 20 people. */
+  findGrantees(query: string, signal?: AbortSignal): Promise<GranteeMatches>
+  /** Who gains and who loses sight of a dashboard when it moves to `folderId` (`""` = root). */
+  previewMove(board: string, folderId: string, signal?: AbortSignal): Promise<MoveEffect>
+  /**
    * Replace the sites allowed to frame the board's embed pages. The server
    * validates and normalises them; a refusal arrives as `invalid_request`
    * carrying its message. Resolves to the list that was stored. Needs
@@ -320,6 +332,58 @@ export type PublicLinkInput = {
   expiresAt: string
   password?: string | null
   newLink?: boolean
+}
+
+/** What a person may do with a dashboard or folder (`BI-19` part B, decision B1). */
+export type AccessLevel = "view" | "edit" | "manage"
+export type AccessKind = "board" | "folder"
+
+/** One rule: a level for a person or a role. `email` is only on a person. */
+export type AccessGrantee = {
+  kind: "user" | "role"
+  id: string
+  name: string
+  email?: string
+  /** `| string` widening: a level this console does not know is shown, not dropped. */
+  level: AccessLevel | string
+}
+
+/** A rule that reaches the item from a folder above it. */
+export type InheritedGrantee = AccessGrantee & { folderId: string; folderName: string }
+
+/** `GET /api/dashboard/access`. */
+export type ItemAccess = {
+  kind: AccessKind
+  id: string
+  yourLevel: AccessLevel | string
+  /** Marked "only the people listed" (feature B3). */
+  restricted: boolean
+  rules: AccessGrantee[]
+  inherited: InheritedGrantee[]
+  /** Folders above that are marked: the item is restricted by them. */
+  restrictedAbove: { folderId: string; folderName: string }[]
+}
+
+export type ItemAccessInput = {
+  kind: AccessKind
+  id: string
+  restricted: boolean
+  rules: { userId?: string; roleId?: string; level: AccessLevel }[]
+}
+
+export type GranteeMatches = {
+  people: { id: string; name: string; email: string }[]
+  roles: { id: string; name: string }[]
+}
+
+/** `GET /api/dashboard/access-preview` (feature B7). */
+export type MoveEffect = {
+  gains: { kind: "user" | "role"; id: string; name: string }[]
+  loses: { kind: "user" | "role"; id: string; name: string }[]
+  /** Everyone whose role gives them the dashboard stops seeing it (the destination is restricted). */
+  startingPointLoses: boolean
+  /** Everyone whose role gives them the dashboard starts seeing it (it leaves a restricted folder). */
+  startingPointGains: boolean
 }
 
 export type CreateBoardInput = {

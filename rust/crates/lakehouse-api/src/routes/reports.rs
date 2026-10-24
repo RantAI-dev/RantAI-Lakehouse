@@ -783,6 +783,11 @@ pub async fn deliveries(
 pub struct PickerQuery {
     #[serde(default)]
     q: Option<String>,
+    /// `1`: also list roles whose name matches, for the permissions picker
+    /// (`BI-19` part B). Roles are shown only to somebody with
+    /// `dashboard:write`: the report picker stays as narrow as it was.
+    #[serde(default)]
+    roles: Option<String>,
 }
 
 /// `GET /api/reports/recipients?q=` — active users' names and addresses for the
@@ -805,10 +810,22 @@ pub async fn recipients(
     )
     .await
     .map_err(|e| store_failed(&e))?;
+    let roles = if q.roles.as_deref() == Some("1") && principal.has("dashboard:write") {
+        lakehouse_store::dashboard_access::search_roles(
+            pool_of(&state)?,
+            q.q.as_deref().unwrap_or("").trim(),
+            PICKER_LIMIT,
+        )
+        .await
+        .map_err(|e| store_failed(&e))?
+    } else {
+        Vec::new()
+    };
     Ok(ApiJson(json!({
         "items": found.iter().map(|(id, name, email)| json!({
             "id": id, "name": name, "email": email,
         })).collect::<Vec<_>>(),
+        "roles": roles.iter().map(|(id, name)| json!({ "id": id, "name": name })).collect::<Vec<_>>(),
     })))
 }
 

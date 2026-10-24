@@ -647,6 +647,16 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // what a viewer may do, so it is a write (manage on the dashboard once
     // `BI-19` part B ships, feature decision 11).
     ("PUT",    "/api/dashboard/embed-settings", Policy::RequiresPermission("dashboard:write")),
+    // BI-19 part B1 (D10): the permissions of a dashboard or folder. "Signed in"
+    // at the router and "manage on the item" in the handler
+    // (`dashboard_access::managed_subject`), because a person can manage one
+    // dashboard by a rule without holding `dashboard:write`; somebody with
+    // neither `dashboard:read` nor a rule gets 403 there.
+    ("GET",    "/api/dashboard/access",       Policy::RequiresAuth),
+    ("PUT",    "/api/dashboard/access",       Policy::RequiresAuth),
+    // The move dialog's "who gains and who loses access" (feature B7): manage
+    // on the dashboard, in the handler, like the access routes.
+    ("GET",    "/api/dashboard/access-preview", Policy::RequiresAuth),
     // BI-19 part A (D5): making, changing and ending a dashboard's public link
     // changes who can read it, so all three are writes (reading its state is
     // too: the response carries the link's token). Part B of the plan moves
