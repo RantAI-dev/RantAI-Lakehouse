@@ -90,6 +90,22 @@ used to read a non-JSON `200` body as an empty result, which would have shown a 
 as an empty chart. `ChClient` now reads a body that is the engine's exception as a
 `ChError::Server` (`body_is_exception`; a bare `Ok.` stays an empty result).
 
+### E6: `max_result_rows` + `result_overflow_mode = 'break'` cut only the final result, not subqueries
+
+Measured by the planner (BI-5 review S5, 2026-10-25) on the dev `ClickHouse` 26.8.9.10 with
+`max_result_rows = 2001, result_overflow_mode = 'break'`:
+
+| Statement | Answer | Whole? |
+| --- | --- | --- |
+| `SELECT sum(x), count() FROM (SELECT number x FROM numbers(10000))` | `49995000, 10000` | yes |
+| a filter `x IN (SELECT ... 5000 rows)` | `5000` | yes |
+| `count()` over a 100,000-row `GROUP BY` subquery | `100000` | yes |
+
+Only the final result is cut. A tile that aggregates over a larger subquery gets the right
+aggregate; a tile whose final result is longer than the cap gets its first rows and the
+`limitHit` marker. (The per-kind cap of the review's B1 does not change this: it moves the
+outer cap for point maps and pivots only.)
+
 ## Other items of section 5
 
 - Does a browser abort reach the API through the Next rewrite (the handler future dropped)?

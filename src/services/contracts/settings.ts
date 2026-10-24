@@ -92,10 +92,10 @@ export type RoleTimeLimit = { roleId: string; timeoutSeconds: number }
 export type LimitSource = { kind: "install" } | { kind: "role"; name: string }
 
 export type QueryLimits = {
-  /** The install's values. */
-  install: QueryLimitValues
-  /** The roles that have a time limit of their own. */
-  roles: RoleTimeLimit[]
+  /** The install's values; sent only to a holder of `settings:write` (feature decision 6; `BI-5` review S6). */
+  install?: QueryLimitValues
+  /** The roles that have a time limit of their own; sent only to a holder of `settings:write`. */
+  roles?: RoleTimeLimit[]
   /** What applies to the caller, resolved by the server from their roles. */
   effective: QueryLimitValues & { source: LimitSource }
 }

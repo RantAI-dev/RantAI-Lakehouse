@@ -44,17 +44,28 @@ async fn nothing_saved_reads_the_feature_defaults_with_the_install_as_source() {
     let cookie = session_cookie_for_user(&pool, user).await;
     let (status, body) = call(&router, "GET", &cookie, "").await;
     assert_eq!(status, StatusCode::OK);
+    // BI-5 review S6: a reader without settings:write is told what applies to
+    // them, not the install's numbers or which roles have a limit of their own.
     assert_eq!(
         body,
         json!({
-            "install": {"timeoutSeconds": 60, "chartRows": 2000, "mapPoints": 5000, "studioRows": 2000},
-            "roles": [],
             "effective": {
                 "timeoutSeconds": 60, "chartRows": 2000, "mapPoints": 5000, "studioRows": 2000,
                 "source": {"kind": "install"}
             }
         })
     );
+    // The administrator's read adds both.
+    let admin = create_principal_with_permissions(&pool, "settings:write").await;
+    let cookie = session_cookie_for_user(&pool, admin).await;
+    let (status, full) = call(&router, "GET", &cookie, "").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        full["install"],
+        json!({"timeoutSeconds": 60, "chartRows": 2000, "mapPoints": 5000, "studioRows": 2000})
+    );
+    assert_eq!(full["roles"], json!([]));
+    assert_eq!(full["effective"], body["effective"]);
 }
 
 #[tokio::test]

@@ -137,16 +137,25 @@ fn role_json(r: &RoleLimit) -> Value {
     json!({ "roleId": r.role_id, "timeoutSeconds": r.timeout_seconds })
 }
 
-fn body_json(snap: &Snapshot, principal: &Principal) -> Value {
+/// The body of a read. `BI-5` review S6 (feature decision 6): the install's
+/// numbers and the roles that have a limit of their own are the administrator's
+/// to read; everyone else is told the limits that apply to them (`effective`)
+/// and nothing about other roles. `all` is whether the caller may see the rest.
+fn body_json(snap: &Snapshot, principal: &Principal, all: bool) -> Value {
+    let effective = snap.effective_for(principal).to_json();
+    if !all {
+        return json!({ "effective": effective });
+    }
     json!({
         "install": install_json(&snap.install),
         "roles": snap.roles.iter().map(role_json).collect::<Vec<_>>(),
-        "effective": snap.effective_for(principal).to_json(),
+        "effective": effective,
     })
 }
 
-/// `GET /api/settings/limits` — the install's limits, the roles that have a
-/// time limit of their own, and the limits that apply to the caller.
+/// `GET /api/settings/limits` — the limits that apply to the caller, and, to a
+/// holder of `settings:write` only, the install's limits and the roles that have
+/// a time limit of their own (`BI-5` review S6).
 ///
 /// # Errors
 ///
@@ -156,7 +165,11 @@ pub async fn get_limits(
     Extension(principal): Extension<Principal>,
 ) -> ApiResult<ApiJson<Value>> {
     let snap = snapshot(&state).await?;
-    Ok(ApiJson(body_json(&snap, &principal)))
+    Ok(ApiJson(body_json(
+        &snap,
+        &principal,
+        principal.permissions.has("settings:write"),
+    )))
 }
 
 /// `PUT /api/settings/limits` — save `{ install, roles }`.
@@ -205,7 +218,7 @@ pub async fn put_limits(
     // process, see the new numbers (plan D2).
     state.query_limits.clear();
     let snap = snapshot(&state).await?;
-    Ok(ApiJson(body_json(&snap, &principal)))
+    Ok(ApiJson(body_json(&snap, &principal, true)))
 }
 
 #[cfg(test)]
