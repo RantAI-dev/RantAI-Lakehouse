@@ -255,3 +255,21 @@ gap for `AGENTS.md`, not this PR. No `BLOCKER`.
 The developer's workspace clippy and test, and the full `bun test src`,
 did not finish on this machine (disk, lock); the planner's full run below
 is the one that counts.
+
+### Review round 2 (planner, 2026-10-24)
+
+After `main` moved to Rust 1.99.1 (`REL-9`, #243), clippy refused the
+update input's `Option<Option<String>>` (`option_option`). A developer
+session had started the fix in the worktree, unasked and unfinished (it
+also changed twelve create-input fixtures it should not have); the planner
+kept its `ConnectorChange` enum (`Keep` / `Clear` / `Set`, `null` and `""`
+both clear, an absent field keeps), put the create fixtures back to
+`None`, and kept its test hygiene fix (the detail page test restores
+`fetch`). `d2f266d9`. The SHOULD-FIX 1 rule is unchanged in the new match.
+
+Planner's full run on `d2f266d9`: fmt and workspace clippy clean on
+1.99.1; Rust 134 suites, 7415 passed, 0 failed, 44 ignored; typecheck OK;
+bun 2711 pass, 0 fail, 2 skip; Python lints OK; Dagster 2146 passed;
+compose config OK; gitleaks no leaks. CI: every check green except
+`cargo audit` and `cargo deny`, red on `main` too (`SEC-51`); this PR
+changes no dependency. No open `BLOCKER`.
