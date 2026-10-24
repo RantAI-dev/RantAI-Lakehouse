@@ -42,7 +42,7 @@ function mockApi(opts: { items?: ReportSubscription[]; emailSetUp?: boolean; pdf
 
 const props = {
   open: true, onOpenChange: () => {}, board: "b1", dashName: "Sales",
-  charts: [{ id: "c1", title: "Visits" }, { id: "c2", title: "Revenue" }],
+  charts: [{ id: "c1", title: "Visits", grouped: true }, { id: "c2", title: "Revenue", grouped: false }],
   readState: { filters: [{ column: "region", values: ["Bali"] }], params: null, grain: null },
   reportZone: "Asia/Jakarta",
 }
@@ -51,6 +51,19 @@ beforeEach(() => { localStorage.clear() })
 afterEach(() => { global.fetch = originalFetch; cleanup() })
 
 describe("SubscriptionsDialog", () => {
+
+  it("says next to Skip when empty that a dashboard with only single-value charts is always sent (RPT-1 QA fix Q3)", async () => {
+    mockApi()
+    const single = [{ id: "c2", title: "Revenue", grouped: false }]
+    const { unmount } = render(<SubscriptionsDialog {...props} charts={single} />)
+    fireEvent.click(await screen.findByRole("button", { name: "New subscription" }))
+    expect(await screen.findByText(/no chart that groups or lists rows, so it is always sent/)).toBeDefined()
+    unmount()
+    render(<SubscriptionsDialog {...props} />)
+    fireEvent.click(await screen.findByRole("button", { name: "New subscription" }))
+    await screen.findByLabelText(/Skip when empty/)
+    expect(screen.queryByText(/no chart that groups or lists rows/)).toBeNull()
+  })
   it("lists a subscription with its schedule in words, recipients, attachments and last send", async () => {
     mockApi({ items: [sub] })
     render(<SubscriptionsDialog {...props} />)

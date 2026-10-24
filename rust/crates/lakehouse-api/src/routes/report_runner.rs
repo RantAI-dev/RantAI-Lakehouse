@@ -685,6 +685,12 @@ async fn is_empty_report(
 }
 
 /// The pure half of [`is_empty_report`].
+///
+/// RPT-1 QA fix Q3: a single-value chart (see [`is_single_value`]) is left out
+/// like a static card. An aggregate with no grouping returns one row even over
+/// no data (`sum` of no rows is `0`), so counting it made "Skip when empty"
+/// unable to skip a dashboard with a KPI. The report is skipped when every
+/// grouped or listing chart is empty; a dashboard with none never skips.
 fn every_data_chart_is_empty(payload: &Value) -> bool {
     let Some(charts) = payload.get("charts").and_then(Value::as_array) else {
         return false;
@@ -696,7 +702,7 @@ fn every_data_chart_is_empty(payload: &Value) -> bool {
             .cloned()
             .and_then(|k| serde_json::from_value::<ChartKind>(k).ok())
             .is_some_and(ChartKind::is_static);
-        if is_static {
+        if is_static || is_single_value(chart) {
             continue;
         }
         let Some(id) = chart.get("id").and_then(Value::as_str) else {
@@ -713,6 +719,37 @@ fn every_data_chart_is_empty(payload: &Value) -> bool {
         }
     }
     data_charts > 0
+}
+
+/// Whether a chart of the payload yields one row whatever the data: a KPI, a
+/// progress bar, a gauge, or any chart whose definition has no dimension (a
+/// bullet graph without a category). A raw table and a pivot also have no
+/// dimension but list rows of their own, so they are not single-value. The
+/// console's Subscriptions dialog applies the same rule
+/// (`isSingleValueChart` in `src/lib/dashboard-tabs.ts`); keep the two in step.
+/// RPT-1 QA fix Q3.
+fn is_single_value(chart: &Value) -> bool {
+    let Some(kind) = chart.get("kind").and_then(Value::as_str) else {
+        return false;
+    };
+    match kind {
+        "kpi" | "progress" | "gauge" => true,
+        "table" | "pivot" => false,
+        _ => {
+            // The stored definition names the dimension; a chart without one
+            // (a built-in) is read by the `x` of its render spec. A parameter
+            // slot is an object: the chart groups by something.
+            let dimension = chart
+                .get("def")
+                .and_then(|d| d.get("dimension"))
+                .or_else(|| chart.get("x"));
+            match dimension {
+                None | Some(Value::Null) => true,
+                Some(Value::String(s)) => s.is_empty(),
+                Some(_) => false,
+            }
+        }
+    }
 }
 
 // ── Files ────────────────────────────────────────────────────────────────
@@ -1476,7 +1513,8 @@ mod tests {
         let payload = |results: Value| {
             json!({
                 "charts": [
-                    { "id": "c1", "kind": "bar" },
+                    // RPT-1 QA fix Q3: a bar with no dimension would be single-value.
+                    { "id": "c1", "kind": "bar", "def": { "dimension": "region" } },
                     { "id": "t1", "kind": "text" },
                     { "id": "c2", "kind": "table" },
                 ],
@@ -1503,6 +1541,60 @@ mod tests {
             "charts": [{ "id": "t1", "kind": "text" }], "results": {}
         })));
         assert!(!every_data_chart_is_empty(&json!({})));
+    }
+
+    #[test]
+    fn a_single_value_chart_does_not_count_when_the_grouped_charts_are_empty() {
+        // RPT-1 QA fix Q3: the KPI returns one row (`0`) over no data.
+        let one_row = || json!({ "columns": ["v"], "rows": [{ "v": 0 }] });
+        let empty = || json!({ "columns": [], "rows": [] });
+        let payload =
+            |charts: Value, results: Value| json!({ "charts": charts, "results": results });
+        // A KPI plus an empty bar: skip.
+        assert!(every_data_chart_is_empty(&payload(
+            json!([
+                { "id": "k", "kind": "kpi", "def": { "dimension": "" } },
+                { "id": "b", "kind": "bar", "def": { "dimension": "region" } },
+            ]),
+            json!({ "k": one_row(), "b": empty() })
+        )));
+        // Progress, gauge, a bullet without a category and a chart without a
+        // dimension are single-value too.
+        assert!(every_data_chart_is_empty(&payload(
+            json!([
+                { "id": "p", "kind": "progress" },
+                { "id": "g", "kind": "gauge" },
+                { "id": "u", "kind": "bullet", "def": { "dimension": "" } },
+                { "id": "n", "kind": "bar", "def": {} },
+                { "id": "b", "kind": "bar", "def": { "dimension": "region" } },
+            ]),
+            json!({ "p": one_row(), "g": one_row(), "u": one_row(), "n": one_row(), "b": empty() })
+        )));
+        // Only single-value charts: nothing to judge, never skip.
+        assert!(!every_data_chart_is_empty(&payload(
+            json!([
+                { "id": "k", "kind": "kpi" },
+                { "id": "u", "kind": "bullet", "def": { "dimension": "" } },
+            ]),
+            json!({ "k": empty(), "u": empty() })
+        )));
+        // One grouped chart with rows: send.
+        assert!(!every_data_chart_is_empty(&payload(
+            json!([
+                { "id": "k", "kind": "kpi" },
+                { "id": "b", "kind": "bar", "def": { "dimension": "region" } },
+            ]),
+            json!({ "k": empty(), "b": { "columns": ["a"], "rows": [{ "a": 1 }] } })
+        )));
+        // A bullet with a category groups; a raw table lists rows although it
+        // has no dimension.
+        assert!(every_data_chart_is_empty(&payload(
+            json!([
+                { "id": "u", "kind": "bullet", "def": { "dimension": "place" } },
+                { "id": "t", "kind": "table", "def": { "dimension": "" } },
+            ]),
+            json!({ "u": empty(), "t": empty() })
+        )));
     }
 
     #[test]

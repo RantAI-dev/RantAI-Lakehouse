@@ -31,7 +31,8 @@ export const EMAIL_NOT_SET_UP = "Email is not set up on this deployment.";
 
 const selectClass = "h-8 rounded-md border border-input bg-background px-2 text-sm";
 
-type DashboardChart = { readonly id: string; readonly title: string };
+/** `grouped`: the chart groups or lists rows, so "Skip when empty" can judge it (RPT-1 QA fix Q3). */
+type DashboardChart = { readonly id: string; readonly title: string; readonly grouped: boolean };
 
 /** The dashboard's ⋯ > "Subscriptions…": the list, and the form to create or change one. */
 export function SubscriptionsDialog({
@@ -368,6 +369,10 @@ function SubscriptionForm({
           <input type="checkbox" checked={skip} onChange={(e) => setSkip(e.target.checked)} />
           Skip when empty: send nothing when every chart has no rows
         </Label>
+        {/* RPT-1 QA fix Q3: single-value tiles always have a value, so they are not judged. */}
+        {charts.some((c) => c.grouped) ? null : (
+          <p className="text-xs text-muted-foreground">This dashboard has no chart that groups or lists rows, so it is always sent: a single-value chart (a KPI, a progress bar, a gauge) always has a value.</p>
+        )}
       </fieldset>
 
       <fieldset className="flex flex-col gap-2">

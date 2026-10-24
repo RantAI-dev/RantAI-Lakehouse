@@ -28,7 +28,7 @@ import { extractViewFiltersFromChat } from "@/lib/dashboard-view-filter-from-cha
 import { canDrill, drillTarget, offersTileRecords, type ChartClickHandler, type ClickSpec } from "@/lib/chart-click";
 import type { ChartRenderSpec, ChartSource } from "@/lib/dashboard-specs";
 import {
-  TAB_PARAM, addTab, bottomOfTab, defaultTileHeight, deleteTab, filtersOnTab, isStaticKind, moveTab, moveTileToTab, placeUnboxed, renameTab, selectedTab, tabOf, tilesOnTab, withTabParam, type TabEdit,
+  TAB_PARAM, addTab, bottomOfTab, defaultTileHeight, deleteTab, filtersOnTab, isSingleValueChart, isStaticKind, moveTab, moveTileToTab, placeUnboxed, renameTab, selectedTab, tabOf, tilesOnTab, withTabParam, type TabEdit,
 } from "@/lib/dashboard-tabs";
 import type { BoardTab, LayoutMap, PhoneTile } from "@/services";
 import type { ChartClick, FilterDef, FilterField } from "@/services/clients/bi-store";
@@ -1347,7 +1347,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
           onOpenChange={setSubsOpen}
           board={board}
           dashName={dashName}
-          charts={(data?.charts ?? []).filter((c) => c.def && !isStaticKind(c.kind)).map((c) => ({ id: c.id, title: c.title }))}
+          charts={(data?.charts ?? []).filter((c) => c.def && !isStaticKind(c.kind)).map((c) => ({ id: c.id, title: c.title, grouped: !isSingleValueChart(c.kind, c.def) }))}
           readState={readState()}
           reportZone={data?.reporting?.timeZone ?? "UTC"}
         />
