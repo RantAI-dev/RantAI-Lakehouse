@@ -382,3 +382,18 @@ Commits read with `git show` at `e0076536`; the reviewer did not run cargo. Secu
   - Small notes: the one post-deadline poll, the memo race inside 30 s, `to_u32`'s fallback (unreachable through the `CHECK`s), `body_is_exception` only after a failed parse, and progress headers ≤ 80.
 
 Verdict: not ready to merge until B1 and B2 are fixed; then S1–S4 and S6–S9.
+
+### Re-review of the server fixes, planner, 2026-10-25
+
+- **B1 closed:** `rows_cap` + `with_tile_rows`, applied in the dashboard, embed/public and preview paths, with a test. The cap is in the BI-4 key.
+- **B2 closed for the chat and the agents.**
+  - **SHOULD-FIX R1:** the report runner calls `payload_for` from its spawned loop (`report_runner.rs:1257` → `:681`) with no run, so scheduled reports use the nil principal and `Snapshot::default()`. Wrap the delivery in `query_limits::scope_if_missing(state, Some(owner), …)`. Test: a delivery sends the owner's query id and the configured `max_execution_time`.
+- **S1 closed.**
+- **S2 closed for the route.**
+  - **SHOULD-FIX R2:** the assistant's `stop_query` (`ai/tools/limits.rs:58-86`) is a second copy of the cancel logic, with no stopped mark and still `if stopped > 0` (rule 4). Make one helper for both. Test: `stop_query` with a `runId` makes a later tile of that run answer "Stopped".
+- **S3, S4, S5, S6, S9 closed.**
+  - Accepted note on S4: a mart-based grouped export is not cut at `chart_rows`. It is the same rewritten statement, so nothing leaks.
+- **S7 partly done, accepted:** the board-deadline end-to-end test is replaced by the `tile_pool` unit test plus a QA step in `BI-5-AC2`.
+- **S8 open:** the `KILL` grant and the click-to-gone time, at QA.
+
+Verdict: B1 and B2 are fixed; R1 and R2 are SHOULD-FIX; the new integration tests must run green before merge.

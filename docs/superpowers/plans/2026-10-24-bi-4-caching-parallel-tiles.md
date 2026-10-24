@@ -400,3 +400,45 @@ workspace clippy and test run. `system.parts.modification_time` was checked on C
 26.8.9.10 (BI-4-RESULT 4.1): it moves on insert and on `CREATE OR REPLACE TABLE ... AS SELECT`.
 
 ## 8. Review (planner appends)
+
+### Review of part B (T3–T8), planner, 2026-10-25
+
+Read at `4590a3f2`. The key is complete and no result leaks between people:
+- **Key contents.** Engine, the statement after `rewrite_sql_for_roles` and `with_run_settings`, `max_execution_time`/`max_result_rows`. The text carries masks, row filters, the expanded principal and tenant values, filters, parameters and the embed role.
+- **Refusal.** It happens inside the rewrite, before the lookup.
+- **Coalescing.** Safe. An aborted leader hands over (`moka` `EnclosingFutureAborted`), and a Stopped leader makes followers compute for themselves.
+
+- **BLOCKER P-B1, relative-date tiles are served across midnight.**
+  - `toDate(now('<tz>'))` keeps the same text day to day, and the default rule keeps the entry up to 24 h while the fingerprint holds.
+  - Failure: a mart built nightly serves "Today" or "This month" from the previous day or month.
+  - Fix: a statement calling a clock or random function (`now`, `now64`, `today`, `yesterday`, `rand*`, `generateUUID*`, …) is unwatchable (the 10-min bound or the person's minutes) and never served across a calendar-day boundary in the report time zone.
+  - Test (mock clock): 23:55 → 00:05 misses; a statement with no clock function is still served.
+- **SHOULD-FIX P-S1, data read outside `FROM`/`JOIN` is not watched.** `dictGet*`/`joinGet*` and `IN <table>` name no table factor.
+  - Fix: any of them adds an unwatchable print (reuse `is_dict_or_join_function`).
+  - Correct `BI-4-RESULT` §4.2's "a wrapping can only shorten a result's life".
+  - Add a test.
+- **SHOULD-FIX P-S2, followers recompute after a leader outcome that was not stored** (`result_cache.rs:541-549`).
+  - Effect: on a cut, over-8 MB or time-limit outcome, followers wait and then run the same statement again; a timed-out follower ends as "Not reached in time".
+  - Fix: share the leader's deterministic outcome (cut, too big, time limit) through an `Arc` error. Only Stop and transient errors make a follower compute itself.
+  - Adjust `a_tile_waiting_on_a_failed_tile_asks_the_engine_itself`, and add a cut case.
+- **SHOULD-FIX P-S3, the masking test can pass without the cache being used** (`support.rs:1296`). Assert `remembered == (i >= 2)`, and count engine requests (2 per order).
+- **SHOULD-FIX P-S4, the memory setting cannot be set in the deployment, and a typo is silent.**
+  - Add `RESULT_CACHE_MAX_MB: ${RESULT_CACHE_MAX_MB:-}` and `TILE_CONCURRENCY_MAX: ${TILE_CONCURRENCY_MAX:-}` to the API's compose environment.
+  - Warn in the log when a value is set but is not a number (`max_mb_from` silently gives 256 today).
+  - Compose proof: `config --quiet`. A real `up` is not possible on this shared VM tonight; record *not verified* (rule 8) and the reviewer does it before merge.
+- **SHOULD-FIX P-S5, a comment contradicts the code** (`result_cache.rs:535-538`, "computing again" vs `Refused`). Fix the comment (rule 1).
+- **SHOULD-FIX P-S6, no test for the T6 acceptance "rule set on the board".** Confirm `set_cache_rule`, then read back `bi_board.cache_json` and a chart's `shape.cache`.
+- **Must be green in CI:** `cargo deny`/`cargo audit` with `moka` (AGENTS step 6).
+- **Accepted:**
+  - the memory bounds;
+  - a failed fingerprint read computes and does not store;
+  - views, MVs, `Distributed` and empty tables are unwatchable, and the one-second same-row-count replace is recorded;
+  - add one sentence to the module doc on replicated `system.parts`;
+  - `fresh=` only on `GET /api/dashboard` (not embed or public, deviation 3);
+  - `set_cache_rule` as `WriteLow` (consistent with DEC-8);
+  - deviations 1, 2, 4, 6–10;
+  - migration 0110;
+  - no new routes;
+  - the 3-second target is honestly not measured.
+
+Verdict: not ready until P-B1 is fixed; then P-S1–P-S6, and the integration files must run.
