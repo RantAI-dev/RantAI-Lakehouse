@@ -44,6 +44,7 @@ pub mod connector_probe_result;
 pub mod connector_run;
 pub mod connector_type;
 pub mod connectors;
+pub mod dashboard_access;
 pub mod error;
 pub mod gold_publication;
 pub mod governance;
