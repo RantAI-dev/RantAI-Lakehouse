@@ -44,11 +44,19 @@ const PROCESS_LIMIT_RANGE: (usize, usize) = (4, 128);
 /// Unset, empty or unparseable gives [`TILES_PER_PROCESS`].
 #[must_use]
 pub fn process_limit_from(raw: Option<&str>) -> usize {
-    raw.map(str::trim)
-        .and_then(|s| s.parse::<usize>().ok())
-        .map_or(TILES_PER_PROCESS, |n| {
-            n.clamp(PROCESS_LIMIT_RANGE.0, PROCESS_LIMIT_RANGE.1)
-        })
+    let trimmed = raw.map(str::trim).filter(|s| !s.is_empty());
+    match trimmed.map(str::parse::<usize>) {
+        Some(Ok(n)) => n.clamp(PROCESS_LIMIT_RANGE.0, PROCESS_LIMIT_RANGE.1),
+        Some(Err(_)) => {
+            // BI-4 B review P-S4: a typo must not pass for the default.
+            tracing::warn!(
+                default = TILES_PER_PROCESS,
+                "TILE_CONCURRENCY_MAX is not a whole number; using the default"
+            );
+            TILES_PER_PROCESS
+        }
+        None => TILES_PER_PROCESS,
+    }
 }
 
 /// The semaphore `AppState::tile_slots` holds, sized from the environment.
