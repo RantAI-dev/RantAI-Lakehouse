@@ -217,11 +217,11 @@ async fn every_load_is_recorded_and_a_young_table_says_it_is_learning() {
         learning["message"],
         "learning: 0 days and 1 load so far; anomalies start after 14 days and 5 loads"
     );
-    assert!(
+    assert_eq!(
         quality::list(&app.pool, StatusFilter::Open, None)
             .await
-            .unwrap()
-            .is_empty()
+            .unwrap(),
+        [] as [lakehouse_store::quality::QualityIncident; 0]
     );
 }
 
@@ -295,10 +295,10 @@ async fn a_load_of_the_usual_size_opens_nothing() {
     app.load_orders_clean("run-h3").await;
     app.wait_for_loads("silver.orders_clean", 11).await;
     tokio::time::sleep(Duration::from_millis(600)).await;
-    assert!(
+    assert_eq!(
         quality::list(&app.pool, StatusFilter::Open, None)
             .await
-            .unwrap()
-            .is_empty()
+            .unwrap(),
+        [] as [lakehouse_store::quality::QualityIncident; 0]
     );
 }

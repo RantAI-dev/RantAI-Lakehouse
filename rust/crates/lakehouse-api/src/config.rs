@@ -1926,7 +1926,7 @@ mod tests {
     #[test]
     fn connector_probe_allowed_cidrs_parses_the_list_and_refuses_a_bad_entry() {
         let cfg = Config::from_map(&map(&[])).unwrap();
-        assert!(cfg.connector_probe_allowed_cidrs.is_empty());
+        assert_eq!(cfg.connector_probe_allowed_cidrs, [] as [ipnet::IpNet; 0]);
         assert_eq!(
             cfg.connector_internal_hosts(),
             crate::internal_hosts::InternalHosts::NONE
@@ -1954,7 +1954,7 @@ mod tests {
     #[test]
     fn webhook_allowed_cidrs_allow_exactly_the_listed_hosts_and_refuse_a_bad_entry() {
         let cfg = Config::from_map(&map(&[])).unwrap();
-        assert!(cfg.webhook_allowed_cidrs.is_empty());
+        assert_eq!(cfg.webhook_allowed_cidrs, [] as [ipnet::IpNet; 0]);
         assert!(
             !cfg.webhook_internal_hosts()
                 .permits(&"192.168.18.205".parse().unwrap())
