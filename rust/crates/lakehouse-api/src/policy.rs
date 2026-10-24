@@ -295,6 +295,11 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // same permission; charts and dashboards in the answer are listed only
     // to `dashboard:read` inside the handler.
     ("GET",  "/api/governance/lineage/columns", Policy::RequiresPermission("lineage:read")),
+    // BI-14 (D5, owner decision Q6): the charts that read a table, and (D1)
+    // where one chart comes from. Both read the lineage graph, so they need
+    // `lineage:read`, not `dashboard:read`: a dashboard viewer sees no lineage.
+    ("GET",  "/api/governance/lineage/used-by", Policy::RequiresPermission("lineage:read")),
+    ("GET",  "/api/dashboard/charts/{id}/lineage", Policy::RequiresPermission("lineage:read")),
     // WS3 item 17: surfaces per-connector ingest history, the same
     // audience as the base `/api/connectors` routes above.
     ("GET",  "/api/governance/ingest-runs", Policy::RequiresPermission("connector:manage")),

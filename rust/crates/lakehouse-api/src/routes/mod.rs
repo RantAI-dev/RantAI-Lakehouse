@@ -491,6 +491,11 @@ fn governance_static_router() -> Router<AppState> {
             "/api/governance/lineage/columns",
             get(governance::column_lineage),
         )
+        // BI-14 (D5): the charts that read a table. Static, ahead of `{kind}`.
+        .route(
+            "/api/governance/lineage/used-by",
+            get(lineage::used_by::used_by),
+        )
         // DATA-14 (F2): quality incidents. Static segments, mounted ahead of
         // `/api/governance/quality/{id}` and the `{kind}` capture.
         .route(
@@ -1203,6 +1208,11 @@ pub fn router(state: AppState) -> Router {
         .route("/api/dashboard/export", get(dashboard::export))
         .route("/api/dashboard/table-export", get(dashboard::table_export))
         .route("/api/dashboard/chart-export", get(dashboard::chart_export))
+        // BI-14 (D1): where a chart comes from. `lineage:read` (owner decision Q6).
+        .route(
+            "/api/dashboard/charts/{id}/lineage",
+            get(lineage::charts::chart_lineage),
+        )
         .route("/api/dashboard/export/pdf", get(pdf_export::export_pdf))
         .route("/api/dashboard/embed-info", get(dashboard::embed_info))
         .route("/api/embed/data", axum::routing::post(embed::data))
