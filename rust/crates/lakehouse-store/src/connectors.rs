@@ -1400,6 +1400,38 @@ fn removed_object_names(before: &serde_json::Value, after: &serde_json::Value) -
         .collect()
 }
 
+/// One string field of a stored `source_objects` entry, or `None` when the
+/// entry is not an object or the field is absent/null/non-string.
+///
+/// One reader for the many places that ask a `source_objects` entry for a
+/// name or a target (`BLD-7` decision 2 asks this module for a connector's
+/// ingest targets rather than parsing the JSON a second time, `AGENTS.md`
+/// rule 4).
+fn source_object_text(object: &serde_json::Value, key: &str) -> Option<String> {
+    object
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+}
+
+/// The Bronze table (`source_objects[].target`) of every object a connector
+/// ingests, in the stored order.
+///
+/// `BLD-7` decision 2: a pipeline that names a connector may read only one
+/// of these tables, because they are the ones that connector's ingest job
+/// actually writes. A connector with no ingest spec yet, or whose
+/// `source_objects` is not an array, has no targets — the caller reports
+/// that honestly instead of inventing a table.
+#[must_use]
+pub fn ingest_targets(source_objects: &serde_json::Value) -> Vec<String> {
+    source_objects
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|object| source_object_text(object, "target"))
+        .collect()
+}
+
 /// One table [`append_source_objects_in`] is asked to add to a connector.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceObjectAddition {
@@ -1472,12 +1504,7 @@ pub(crate) async fn append_source_objects_in(
             "the connector's source objects are not a list".to_owned(),
         ));
     };
-    let text = |object: &serde_json::Value, key: &str| -> Option<String> {
-        object
-            .get(key)
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned)
-    };
+    let text = source_object_text;
     let mut names: std::collections::HashSet<String> =
         objects.iter().filter_map(|o| text(o, "name")).collect();
     let mut targets: std::collections::HashSet<String> =

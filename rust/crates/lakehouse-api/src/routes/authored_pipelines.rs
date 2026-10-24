@@ -512,6 +512,63 @@ const PER_TABLE_UPSTREAMS: [(&str, &str); 2] = [
     (super::connectors::INGEST_JOB, INGEST_UPSTREAM_REFUSED),
 ];
 
+/// `BLD-7` / decision 2: a connector on a pipeline means *where its data
+/// came from*, never a second read path (`DEC-15`). Such a pipeline reads
+/// one of that connector's Bronze tables — the tables its ingest job
+/// actually writes — and nothing else.
+///
+/// A connector that has not loaded anything yet cannot be a source yet.
+/// The wording says what to do, not merely what is wrong.
+pub const CONNECTOR_HAS_NO_TABLES: &str =
+    "This connector has not loaded any table yet; run its ingest first.";
+
+/// `BLD-7` / decision 2, the refusal for a zone/table that is not one of
+/// the connector's ingest targets. The list is appended by
+/// [`validate_connector_source`]; the rest of the sentence is fixed so
+/// create and update say the same thing.
+const CONNECTOR_SOURCE_REFUSED_PREFIX: &str = "A pipeline with a connector reads one of that connector's Bronze tables: \
+     choose bronze and one of: ";
+const CONNECTOR_SOURCE_REFUSED_SUFFIX: &str = ". To read another table, choose No connector.";
+
+/// `BLD-7` / decision 2 + `DEC-15`: whether a pipeline may name
+/// `connector_id` with this source. The connector must already be
+/// verified to be in the caller's tenant (the routes run that check
+/// first), so this only reads its ingest targets.
+///
+/// `source_zone` must be `bronze` and `source_table` must be one of the
+/// connector's `source_objects[].target` values — the tables that
+/// connector's ingest job writes. Anything else is a 400 naming the
+/// tables that would be accepted, because a connector's data can only be
+/// read where it was loaded (there is no direct source read: `DEC-15`).
+///
+/// # Errors
+///
+/// [`ApiRejection`] with 400 carrying [`CONNECTOR_HAS_NO_TABLES`] when the
+/// connector has no ingest targets, or the fixed
+/// [`CONNECTOR_SOURCE_REFUSED_PREFIX`] sentence listing them otherwise.
+pub async fn validate_connector_source(
+    pool: &PgPool,
+    connector_id: &str,
+    source_zone: &str,
+    source_table: &str,
+) -> Result<(), ApiRejection> {
+    let spec = lakehouse_store::connectors::get_ingest_spec(pool, connector_id).await?;
+    let targets = spec.as_ref().map_or_else(Vec::new, |spec| {
+        lakehouse_store::connectors::ingest_targets(&spec.source_objects)
+    });
+    if targets.is_empty() {
+        return Err(ApiError::BadRequest(CONNECTOR_HAS_NO_TABLES.to_owned()).into());
+    }
+    if source_zone == "bronze" && targets.iter().any(|target| target == source_table) {
+        return Ok(());
+    }
+    Err(ApiError::BadRequest(format!(
+        "{CONNECTOR_SOURCE_REFUSED_PREFIX}{}{CONNECTOR_SOURCE_REFUSED_SUFFIX}",
+        targets.join(", ")
+    ))
+    .into())
+}
+
 /// BLD-4 / D2 + DATA-19 / D2: whether `depends_on` may list a per-table
 /// upstream (`file_ingest_job`, `ingest_job`) given the pipeline's
 /// `source_zone`.
@@ -1461,6 +1518,29 @@ pub struct UpdateBody {
     /// list is refused with 400 and writes nothing.
     #[serde(default)]
     depends_on: Option<Vec<String>>,
+    /// The pipeline's connector (`BLD-9` / decision 7). Three states, and
+    /// all three are meaningful: absent keeps the stored connector (a
+    /// save that does not mention it), JSON `null` clears it, and a
+    /// non-empty string sets or replaces it. `Some("")` is treated as
+    /// `null` — a form that submits an empty picker means "no connector".
+    ///
+    /// A plain `Option<String>` cannot tell "absent" from "null" (both
+    /// arrive as `None`), which is why this is a double option with
+    /// [`deserialize_connector_id`] behind it.
+    #[serde(default, deserialize_with = "deserialize_connector_id")]
+    connector_id: Option<Option<String>>,
+}
+
+/// Read a present `connectorId` as `Some(value)` — `null` included, as
+/// `Some(None)` — so [`UpdateBody::connector_id`] can distinguish "the
+/// body did not mention it" (`None`, `#[serde(default)]`) from "clear it"
+/// (`Some(None)`). Serde's own `Option<Option<T>>` cannot: both shapes
+/// deserialize to `None` without a helper.
+fn deserialize_connector_id<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(Some)
 }
 
 fn authored_only(id: &str) -> Result<(), ApiRejection> {
@@ -1520,6 +1600,54 @@ pub async fn update(
     // stored chain is kept, so there is nothing new to check.
     validate_per_table_upstream(&body.source_zone, body.depends_on.as_deref())?;
     let pool = crate::routes::pipelines::pool(&state)?;
+    // BLD-9 / decision 7: `connectorId` is optional on this route, and the
+    // three cases differ. Absent (`None`) leaves the stored connector
+    // alone, exactly like `owner`/`max_retries`; `null` or an empty string
+    // clears it; a value sets or replaces it. Decision 2 applies to a
+    // value: the connector must be one the pipeline's own tenant owns, and
+    // the source must be one of ITS Bronze tables -- the same sentence
+    // `create` answers with, from the same helper.
+    //
+    // The tenant is the PIPELINE's, not the caller's: `in_scope` above
+    // already refused a row the caller cannot touch, and a Platform Admin
+    // editing another tenant's pipeline must still be held to that row's
+    // tenant, or an edit could attach a connector across tenants.
+    let connector_change = body.connector_id.map(|submitted| {
+        submitted
+            .map(|id| id.trim().to_owned())
+            .filter(|id| !id.is_empty())
+    });
+    //
+    // PR review (BLD-7, SHOULD-FIX 1): an absent `connectorId` keeps the
+    // stored one, and the source may still change in the same body, so the
+    // rule is checked against the connector the row will END with, not
+    // only a newly submitted one. Otherwise an edit could point a
+    // connector's pipeline at a table that connector never loads.
+    match connector_change.as_ref() {
+        Some(Some(connector_id)) => {
+            let current = pipelines::get_pipeline(pool, &id)
+                .await?
+                .ok_or_else(|| ApiError::NotFound(format!("Pipeline {id} not found")))?;
+            crate::routes::pipelines::require_connector_in_tenant(
+                pool,
+                connector_id,
+                current.tenant_id,
+            )
+            .await?;
+            validate_connector_source(pool, connector_id, &body.source_zone, &body.source_table)
+                .await?;
+        }
+        Some(None) => {}
+        None => {
+            let current = pipelines::get_pipeline(pool, &id)
+                .await?
+                .ok_or_else(|| ApiError::NotFound(format!("Pipeline {id} not found")))?;
+            if let Some(kept) = current.connector_id.as_deref() {
+                validate_connector_source(pool, kept, &body.source_zone, &body.source_table)
+                    .await?;
+            }
+        }
+    }
     // Dagster unreachable degrades to "no Dagster upstreams accepted"
     // (empty list) rather than 500ing the update — see
     // `routes::pipelines::create`'s identical treatment. The rule
@@ -1572,6 +1700,7 @@ pub async fn update(
         description: body.description.filter(|d| !d.trim().is_empty()),
         max_retries: body.max_retries,
         depends_on: body.depends_on,
+        connector_id: connector_change,
     };
     let updated = pipelines::update_pipeline(pool, &id, &input, Some(principal.id.uuid()))
         .await?
@@ -1739,6 +1868,15 @@ pub async fn restore_version(
     // Bronze-target refusal above is re-applied here). Always `Some(...)`: a
     // restore always carries the snapshot's chain.
     validate_per_table_upstream(&snapshot.source_zone, Some(&snapshot.depends_on))?;
+    // PR review (BLD-7, SHOULD-FIX 1): a restore keeps the row's current
+    // connector (`connector_id: None` below) but replays the snapshot's
+    // source, which may predate the connector. Hold it to the same rule.
+    if let Some(current) = pipelines::get_pipeline(pool, &id).await?
+        && let Some(kept) = current.connector_id.as_deref()
+    {
+        validate_connector_source(pool, kept, &snapshot.source_zone, &snapshot.source_table)
+            .await?;
+    }
     let dagster_jobs = match state.dagster.list_jobs().await {
         Ok(j) => j,
         Err(err) => {
@@ -1779,6 +1917,12 @@ pub async fn restore_version(
         // restored chain and not the stored chain (which is what
         // `None` would do). PR #57 review F1.8.
         depends_on: Some(snapshot.depends_on.clone()),
+        // BLD-9 / decision 7: a version snapshot holds the editable
+        // definition, not the connector, so a restore leaves whatever
+        // connector the pipeline has now alone -- same posture as
+        // `name`/`status` above. Clearing it here would silently break
+        // a pipeline the restore never touched.
+        connector_id: None,
     };
     let updated = pipelines::restore_pipeline(pool, &id, &input, Some(principal.id.uuid()))
         .await?
@@ -2479,7 +2623,7 @@ mod tests {
         /// host/port/user/database from the pool's own connect
         /// options, the same shape every other route-level
         /// `sqlx::test` in this crate uses.
-        fn database_url_for(pool: &sqlx::PgPool) -> String {
+        pub(super) fn database_url_for(pool: &sqlx::PgPool) -> String {
             let options = pool.connect_options();
             format!(
                 "postgres://{}:postgres@{}:{}/{}",
@@ -2517,7 +2661,7 @@ mod tests {
         /// takes the wiremock `uri`) — the bare `state_for` here only
         /// stands for callers that explicitly opt out of Dagster-side
         /// state. New tests should prefer the wiremock variant.
-        fn state_for(pool: &sqlx::PgPool) -> AppState {
+        pub(super) fn state_for(pool: &sqlx::PgPool) -> AppState {
             let mut env = HashMap::new();
             env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
             AppState::new(Config::from_map(&env).expect("a valid test Config"))
@@ -2946,7 +3090,7 @@ mod tests {
             )
         }
 
-        fn state_for(pool: &sqlx::PgPool) -> AppState {
+        pub(super) fn state_for(pool: &sqlx::PgPool) -> AppState {
             let mut env = HashMap::new();
             env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
             AppState::new(Config::from_map(&env).expect("a valid test Config"))
@@ -3301,7 +3445,7 @@ mod tests {
             )
         }
 
-        fn state_for(pool: &sqlx::PgPool) -> AppState {
+        pub(super) fn state_for(pool: &sqlx::PgPool) -> AppState {
             let mut env = HashMap::new();
             env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
             AppState::new(Config::from_map(&env).expect("a valid test Config"))
@@ -3402,6 +3546,337 @@ mod tests {
             assert_eq!(
                 versions.0, 1,
                 "the refused restore must not have written a `restored` version row"
+            );
+        }
+    }
+
+    /// BLD-9 / decision 7: `PUT /api/pipelines/{id}` changes the connector.
+    ///
+    /// The three body shapes mean three different writes -- absent keeps
+    /// the stored connector, `null`/`""` clears it, a value sets or
+    /// replaces it -- and a value is held to decision 2 with the same
+    /// sentence `POST` answers with. Same fixture shape as the modules
+    /// above (a stored row, a `*:*` principal, the stored row read back),
+    /// because "refused" has to mean "wrote nothing" too.
+    mod connector_change_on_update {
+        use lakehouse_store::pipelines::{self, CreatePipelineInput};
+        use lakehouse_test_support as _;
+
+        use super::*;
+        use crate::routes::authored_pipelines::tests::bronze_target_is_refused as fixtures;
+
+        /// The connector the seed's own ingest spec loads (`orders`,
+        /// migration `0034`), and the one that starts with none.
+        const SEED_CONNECTOR: &str = "conn-pg-lakehouse";
+        const EMPTY_CONNECTOR: &str = "conn-s3-warehouse";
+
+        /// A stored row in the seeded tenant, reading `bronze.orders` and
+        /// optionally already carrying a connector -- seeded through the
+        /// store so each test starts from a legal row.
+        async fn stored_pipeline(
+            pool: &sqlx::PgPool,
+            name: &str,
+            source_table: &str,
+            connector_id: Option<&str>,
+        ) -> pipelines::Pipeline {
+            let input = CreatePipelineInput {
+                name: name.to_owned(),
+                kind: "batch".to_owned(),
+                source_zone: "bronze".to_owned(),
+                source_table: source_table.to_owned(),
+                incremental_column: None,
+                transforms: Vec::new(),
+                fbic_enabled: false,
+                target_zone: "silver".to_owned(),
+                target_table: "t".to_owned(),
+                schedule: "manual".to_owned(),
+                owner: None,
+                description: None,
+                max_retries: None,
+                tenant_id: Some("11111111-1111-4111-8111-000000000001".parse().unwrap()),
+                depends_on: Vec::new(),
+                connector_id: connector_id.map(str::to_owned),
+                id: None,
+                target_lag: None,
+                run_as: None,
+            };
+            pipelines::create_pipeline(pool, &input, None)
+                .await
+                .expect("seed the row the update rewrites")
+        }
+
+        /// The update body, with `connector` merged in as the caller
+        /// shapes it (absent, `null`, `""` or an id).
+        fn body(connector: &Value) -> Bytes {
+            let mut body = json!({
+                "kind": "batch",
+                "sourceZone": "bronze",
+                "sourceTable": "orders",
+                "targetZone": "silver",
+                "targetTable": "t",
+                "schedule": "manual",
+                "transforms": [],
+            });
+            if let (Some(fields), Some(extra)) = (body.as_object_mut(), connector.as_object()) {
+                fields.extend(extra.clone());
+            }
+            Bytes::from(serde_json::to_vec(&body).expect("serialize"))
+        }
+
+        /// `update` answers `ApiResult<ApiJson<Value>>` -- the 200 is the
+        /// `Ok` itself (`ApiRejection` carries the error status).
+        async fn call_update(
+            pool: &sqlx::PgPool,
+            id: &str,
+            body: Bytes,
+        ) -> Result<ApiJson<Value>, ApiRejection> {
+            update(
+                State(fixtures::state_for(pool)),
+                Extension(unrestricted_principal()),
+                HeaderMap::new(),
+                Path(id.to_owned()),
+                body,
+            )
+            .await
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn update_sets_a_connector_then_clears_it_with_null_or_an_empty_string(
+            pool: sqlx::PgPool,
+        ) {
+            let created = stored_pipeline(&pool, "pl-set-connector", "orders", None).await;
+
+            let ApiJson(stored) = call_update(
+                &pool,
+                &created.id,
+                body(&json!({ "connectorId": SEED_CONNECTOR })),
+            )
+            .await
+            .expect("a connector whose table the source names must be accepted");
+            assert_eq!(stored["connectorId"], SEED_CONNECTOR);
+
+            let ApiJson(cleared) =
+                call_update(&pool, &created.id, body(&json!({ "connectorId": null })))
+                    .await
+                    .expect("null clears the connector");
+            assert!(
+                cleared.get("connectorId").is_none(),
+                "a cleared connector is absent from the payload, got: {cleared}"
+            );
+
+            call_update(
+                &pool,
+                &created.id,
+                body(&json!({ "connectorId": SEED_CONNECTOR })),
+            )
+            .await
+            .expect("setting it again");
+
+            let ApiJson(cleared) =
+                call_update(&pool, &created.id, body(&json!({ "connectorId": "" })))
+                    .await
+                    .expect("an empty string means No connector, the same as null");
+            assert!(cleared.get("connectorId").is_none());
+
+            let stored = pipelines::get_pipeline(&pool, &created.id)
+                .await
+                .expect("get_pipeline")
+                .expect("the row still exists");
+            assert_eq!(stored.connector_id, None);
+            assert_eq!(
+                stored.source, "bronze.orders",
+                "clearing the connector leaves the source alone"
+            );
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn update_changes_the_connector_and_its_table_together(pool: sqlx::PgPool) {
+            let created =
+                stored_pipeline(&pool, "pl-change-connector", "orders", Some(SEED_CONNECTOR)).await;
+
+            // The seed's second connector starts with no ingest spec
+            // (`0034`: `[]`). Give it one, so a successful CHANGE is
+            // possible at all -- the only other seeded connector would
+            // otherwise answer "has not loaded any table yet".
+            sqlx::query(
+                "UPDATE connector SET source_objects = \
+                 '[{\"name\":\"landing/orders.csv\",\"target\":\"files_orders\"}]'::jsonb \
+                 WHERE id = $1",
+            )
+            .bind(EMPTY_CONNECTOR)
+            .execute(&pool)
+            .await
+            .expect("seed an ingest target on the second connector");
+
+            let ApiJson(stored) = call_update(
+                &pool,
+                &created.id,
+                body(&json!({
+                    "connectorId": EMPTY_CONNECTOR,
+                    "sourceTable": "files_orders",
+                })),
+            )
+            .await
+            .expect("the new connector loads the table the body names");
+            assert_eq!(stored["connectorId"], EMPTY_CONNECTOR);
+            assert_eq!(stored["source"], "bronze.files_orders");
+
+            let stored = pipelines::get_pipeline(&pool, &created.id)
+                .await
+                .expect("get_pipeline")
+                .expect("the row still exists");
+            assert_eq!(stored.connector_id.as_deref(), Some(EMPTY_CONNECTOR));
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn update_leaves_the_stored_connector_alone_when_the_body_omits_it(
+            pool: sqlx::PgPool,
+        ) {
+            let created =
+                stored_pipeline(&pool, "pl-keep-connector", "orders", Some(SEED_CONNECTOR)).await;
+
+            call_update(&pool, &created.id, body(&json!({})))
+                .await
+                .expect("a body that does not mention the connector is accepted");
+
+            let stored = pipelines::get_pipeline(&pool, &created.id)
+                .await
+                .expect("get_pipeline")
+                .expect("the row still exists");
+            assert_eq!(
+                stored.connector_id.as_deref(),
+                Some(SEED_CONNECTOR),
+                "an absent connectorId means unchanged, not cleared"
+            );
+        }
+
+        /// PR review (BLD-7, SHOULD-FIX 1): the body keeps the stored
+        /// connector by leaving `connectorId` out, but moves the source to a
+        /// table that connector never loads. The rule holds for the
+        /// connector the row ends with, so this is refused and nothing is
+        /// written.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn update_refuses_moving_a_kept_connectors_pipeline_to_a_table_it_does_not_load(
+            pool: sqlx::PgPool,
+        ) {
+            let created =
+                stored_pipeline(&pool, "pl-keep-move", "orders", Some(SEED_CONNECTOR)).await;
+
+            let err = call_update(
+                &pool,
+                &created.id,
+                body(&json!({ "sourceTable": "not_one_of_its_tables" })),
+            )
+            .await
+            .expect_err("the kept connector does not load that table");
+
+            assert_eq!(err.0.status(), 400);
+            assert!(
+                err.0
+                    .to_string()
+                    .contains("reads one of that connector's Bronze tables"),
+                "the refusal is the same fixed sentence"
+            );
+            let stored = pipelines::get_pipeline(&pool, &created.id)
+                .await
+                .expect("get_pipeline")
+                .expect("the row still exists");
+            assert_eq!(
+                stored.source, "bronze.orders",
+                "a refused update writes nothing"
+            );
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn update_refuses_a_non_bronze_source_for_a_connector_before_writing(
+            pool: sqlx::PgPool,
+        ) {
+            let created = stored_pipeline(&pool, "pl-refuse-zone", "orders", None).await;
+
+            let err = call_update(
+                &pool,
+                &created.id,
+                // silver.orders: one of the connector's tables by name,
+                // but not where that connector's data lives.
+                Bytes::from(
+                    serde_json::to_vec(&json!({
+                        "kind": "batch",
+                        "sourceZone": "silver",
+                        "sourceTable": "orders",
+                        "targetZone": "silver",
+                        "targetTable": "t",
+                        "schedule": "manual",
+                        "transforms": [],
+                        "connectorId": SEED_CONNECTOR,
+                    }))
+                    .expect("serialize"),
+                ),
+            )
+            .await
+            .expect_err("a connector on a silver source must be refused");
+
+            assert_eq!(err.0.status(), 400);
+            let message = err.0.to_string();
+            assert!(
+                message.contains("reads one of that connector's Bronze tables"),
+                "the refusal is the decision-2 sentence, got: {message}"
+            );
+
+            let stored = pipelines::get_pipeline(&pool, &created.id)
+                .await
+                .expect("get_pipeline")
+                .expect("the row still exists");
+            assert_eq!(
+                stored.connector_id, None,
+                "a refused update must not store the connector"
+            );
+            assert_eq!(stored.source, "bronze.orders");
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn update_refuses_a_bronze_table_the_connector_does_not_load(pool: sqlx::PgPool) {
+            let created = stored_pipeline(&pool, "pl-refuse-table", "orders", None).await;
+
+            let err = call_update(
+                &pool,
+                &created.id,
+                body(&json!({
+                    "connectorId": SEED_CONNECTOR,
+                    "sourceTable": "not_one_of_its_tables",
+                })),
+            )
+            .await
+            .expect_err("a table outside the connector's targets must be refused");
+
+            assert_eq!(err.0.status(), 400);
+            assert!(
+                err.0
+                    .to_string()
+                    .contains("reads one of that connector's Bronze tables"),
+                "the refusal is the same fixed sentence"
+            );
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn update_refuses_a_connector_that_is_not_in_the_pipelines_tenant(
+            pool: sqlx::PgPool,
+        ) {
+            let created = stored_pipeline(&pool, "pl-refuse-unknown", "orders", None).await;
+
+            let err = call_update(
+                &pool,
+                &created.id,
+                body(&json!({ "connectorId": "no-such-connector" })),
+            )
+            .await
+            .expect_err("an unknown connector must be refused");
+
+            assert_eq!(err.0.status(), 400);
+            assert!(
+                err.0
+                    .to_string()
+                    .contains("is not a connector in your tenant"),
+                "the tenant check answers first and says so"
             );
         }
     }
@@ -3579,6 +4054,7 @@ mod tests {
                 description: None,
                 max_retries: None,
                 depends_on: Some(vec![crate::routes::uploads::FILE_INGEST_JOB.to_owned()]),
+                connector_id: None,
             };
             pipelines::update_pipeline(&pool, &created.id, &pre_refusal, None)
                 .await
@@ -3634,6 +4110,7 @@ mod tests {
                 description: None,
                 max_retries: None,
                 depends_on: Some(vec![crate::routes::connectors::INGEST_JOB.to_owned()]),
+                connector_id: None,
             };
             pipelines::update_pipeline(&pool, &created.id, &pre_refusal, None)
                 .await

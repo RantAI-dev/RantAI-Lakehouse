@@ -267,13 +267,19 @@ BRONZE_TARGET_REFUSED_REASON = (
     "a pipeline cannot write to bronze; bronze is written by ingestion"
 )
 
-CONNECTOR_SOURCE_UNSUPPORTED_REASON = (
-    "connector-sourced authored pipelines are not executed by this build: WS4 "
-    "item E3 implements the direct ClickHouse-zone-to-ClickHouse-zone read/"
-    "write path only. Wiring WS3's four adapters.*.build_source modules "
-    "(sql/files/rest/sheets) plus secret resolution and a bulk ClickHouse "
-    "load is real, separate integration work this task does not fake with an "
-    "empty or partial read -- reported here as an honest run failure instead."
+# BLD-7 / decision 3 + `DEC-15`: a pipeline's `connectorId` says where its
+# data came from, never that the run should read the source again. The API
+# refuses a connector on anything but one of that connector's Bronze tables
+# on create/update, so a row that still names another zone predates that
+# rule (or reached the table another way). Such a row is refused here with
+# a fixed message that says what to edit: reading the zone it stores would
+# be the second, direct read path `DEC-15` rules out, and running it
+# silently would hide the mismatch.
+CONNECTOR_SOURCE_NOT_BRONZE_REASON = (
+    "this pipeline names a connector but its source zone is not bronze: a "
+    "pipeline made from a connector reads one of that connector's Bronze "
+    "tables. Edit the pipeline: choose bronze and one of the connector's "
+    "tables, or clear its connector."
 )
 
 
@@ -698,11 +704,16 @@ def _op_for_pipeline(pipeline: dict[str, Any]) -> Any:
                 for t in definition.get("transforms", [])
             ]
 
-            connector_id = definition.get("connectorId")
-            if connector_id:
-                raise AuthoredJobError(CONNECTOR_SOURCE_UNSUPPORTED_REASON)
-
             source_zone = definition["sourceZone"]
+            # BLD-7 / decision 3: a connector means the data came from that
+            # connector's Bronze table, and the run reads `sourceZone.
+            # sourceTable` exactly as any other Bronze pipeline does. A row
+            # whose connector sits on a non-Bronze source cannot run: there
+            # is no direct source read (`DEC-15`). Kept deliberately narrow
+            # so every row the API accepts today keeps running unchanged.
+            if definition.get("connectorId") and source_zone != "bronze":
+                raise AuthoredJobError(CONNECTOR_SOURCE_NOT_BRONZE_REASON)
+
             source_table = definition["sourceTable"]
             target_zone = definition["targetZone"]
             target_table = definition["targetTable"]

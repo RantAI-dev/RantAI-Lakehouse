@@ -1112,6 +1112,15 @@ pub struct UpdatePipelineInput {
     /// `dependsOn` in the body defaults to `None` via
     /// `#[serde(default)]`.
     pub depends_on: Option<Vec<String>>,
+    /// The pipeline's ingress connector (`BLD-9` / decision 7).
+    /// Three states, because they mean three different writes:
+    /// `None` leaves the stored connector alone (a body that does not
+    /// mention it), `Some(None)` clears it, and `Some(Some(id))` sets
+    /// or replaces it. The route has already checked the target
+    /// connector is in the pipeline's tenant and that the source is one
+    /// of its Bronze tables (`validate_connector_source`), so this
+    /// function never stores a connector the run would refuse.
+    pub connector_id: Option<Option<String>>,
 }
 
 /// Replace an authored pipeline's definition. Its status is left as it
@@ -1191,9 +1200,18 @@ async fn update_pipeline_with_event(
         "UPDATE pipeline_definition SET kind = $2, source = $3, target = $4, schedule = $5, \
          description = $6, incremental_column = $7, fbic_enabled = $8, transforms = $9, \
 owner = COALESCE($10, owner), max_retries = COALESCE($11, max_retries), \
-         depends_on = COALESCE($12, depends_on) \
+         depends_on = COALESCE($12, depends_on), \
+         connector_id = CASE WHEN $13 THEN $14 ELSE connector_id END \
          WHERE id = $1 RETURNING {FULL_PIPELINE_COLUMNS}"
     );
+    // BLD-9 / decision 7: `connector_id` cannot use the `COALESCE` shape
+    // the columns above use, because "clear it" (`NULL`) and "leave it
+    // alone" are different requests and both would bind `NULL`. The
+    // boolean says whether this write touches the column at all; the
+    // text is the value (typed `NULL` when clearing, so the column's
+    // foreign key holds).
+    let connector_set = input.connector_id.is_some();
+    let connector_value = input.connector_id.clone().flatten();
     let mut tx = pool.begin().await?;
     let row: Option<FullPipelineRow> = sqlx::query_as(&sql)
         .bind(id)
@@ -1212,6 +1230,8 @@ owner = COALESCE($10, owner), max_retries = COALESCE($11, max_retries), \
         // keeps the stored chain. `Some(vec![])` binds as the empty
         // array and clears the chain explicitly.
         .bind(&input.depends_on)
+        .bind(connector_set)
+        .bind(&connector_value)
         .fetch_optional(&mut *tx)
         .await?;
     let Some(row) = row else {
