@@ -186,7 +186,8 @@ pub async fn list_users(pool: &PgPool, filter: &UserFilter) -> Result<Vec<User>,
                  WHERE ut.user_id = u.id AND t.slug = $2)) \
          ORDER BY u.created_at DESC, u.name"
     );
-    let rows: Vec<UserRow> = sqlx::query_as(&sql)
+    // safe: only the constant `USER_SELECT` is formatted in; values are bound.
+    let rows: Vec<UserRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(filter.status.as_deref())
         .bind(filter.tenant_slug.as_deref())
         .fetch_all(pool)
@@ -202,7 +203,8 @@ pub async fn list_users(pool: &PgPool, filter: &UserFilter) -> Result<Vec<User>,
 /// a UUID at all), or [`StoreError::Database`] on any other failure.
 pub async fn get_user(pool: &PgPool, id: &str) -> Result<User, StoreError> {
     let sql = format!("{USER_SELECT} WHERE u.id = $1");
-    let row: UserRow = sqlx::query_as(&sql)
+    // safe: only the constant `USER_SELECT` is formatted in; values are bound.
+    let row: UserRow = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(parse_id(id)?)
         .fetch_one(pool)
         .await?;
@@ -477,7 +479,10 @@ const ROLE_SELECT: &str = "SELECT r.id, r.name, r.permissions, r.description, \
 /// Returns [`StoreError::Database`] if the query fails.
 pub async fn list_roles(pool: &PgPool) -> Result<Vec<Role>, StoreError> {
     let sql = format!("{ROLE_SELECT} ORDER BY r.created_at DESC, r.name");
-    let rows: Vec<RoleRow> = sqlx::query_as(&sql).fetch_all(pool).await?;
+    // safe: only the constant `ROLE_SELECT` is formatted in; values are bound.
+    let rows: Vec<RoleRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+        .fetch_all(pool)
+        .await?;
     Ok(rows.into_iter().map(Role::from).collect())
 }
 
@@ -489,7 +494,8 @@ pub async fn list_roles(pool: &PgPool) -> Result<Vec<Role>, StoreError> {
 /// a UUID), or [`StoreError::Database`] on any other failure.
 pub async fn get_role(pool: &PgPool, id: &str) -> Result<Role, StoreError> {
     let sql = format!("{ROLE_SELECT} WHERE r.id = $1");
-    let row: RoleRow = sqlx::query_as(&sql)
+    // safe: only the constant `ROLE_SELECT` is formatted in; values are bound.
+    let row: RoleRow = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(parse_id(id)?)
         .fetch_one(pool)
         .await?;
@@ -712,7 +718,8 @@ pub async fn list_tenants(pool: &PgPool, filter: &TenantFilter) -> Result<Vec<Te
         "{TENANT_SELECT} WHERE ($1::text IS NULL OR t.plan = $1) \
          ORDER BY t.created_at DESC, t.name"
     );
-    let rows: Vec<TenantRow> = sqlx::query_as(&sql)
+    // safe: only the constant `TENANT_SELECT` is formatted in; values are bound.
+    let rows: Vec<TenantRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(filter.plan.as_deref())
         .fetch_all(pool)
         .await?;
@@ -727,7 +734,8 @@ pub async fn list_tenants(pool: &PgPool, filter: &TenantFilter) -> Result<Vec<Te
 /// not a UUID), or [`StoreError::Database`] on any other failure.
 pub async fn get_tenant(pool: &PgPool, id: &str) -> Result<Tenant, StoreError> {
     let sql = format!("{TENANT_SELECT} WHERE t.id = $1");
-    let row: TenantRow = sqlx::query_as(&sql)
+    // safe: only the constant `TENANT_SELECT` is formatted in; values are bound.
+    let row: TenantRow = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(parse_id(id)?)
         .fetch_one(pool)
         .await?;
@@ -811,7 +819,11 @@ pub async fn create_tenant(pool: &PgPool, input: &CreateTenantInput) -> Result<T
 /// Returns [`StoreError::Database`] if the query fails.
 pub async fn find_tenant_by_slug(pool: &PgPool, slug: &str) -> Result<Option<Tenant>, StoreError> {
     let sql = format!("{TENANT_SELECT} WHERE t.slug = $1");
-    let row: Option<TenantRow> = sqlx::query_as(&sql).bind(slug).fetch_optional(pool).await?;
+    // safe: only the constant `TENANT_SELECT` is formatted in; values are bound.
+    let row: Option<TenantRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+        .bind(slug)
+        .fetch_optional(pool)
+        .await?;
     Ok(row.map(Tenant::from))
 }
 
@@ -990,7 +1002,8 @@ pub async fn list_service_identities(
         "{SERVICE_IDENTITY_SELECT} WHERE ($1::text IS NULL OR s.environment = $1) \
          ORDER BY s.created_at DESC, s.name"
     );
-    let rows: Vec<ServiceIdentityRow> = sqlx::query_as(&sql)
+    // safe: only the constant `SERVICE_IDENTITY_SELECT` is formatted in; values are bound.
+    let rows: Vec<ServiceIdentityRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(filter.environment.as_deref())
         .fetch_all(pool)
         .await?;
@@ -1005,7 +1018,8 @@ pub async fn list_service_identities(
 /// not a UUID), or [`StoreError::Database`] on any other failure.
 pub async fn get_service_identity(pool: &PgPool, id: &str) -> Result<ServiceIdentity, StoreError> {
     let sql = format!("{SERVICE_IDENTITY_SELECT} WHERE s.id = $1");
-    let row: ServiceIdentityRow = sqlx::query_as(&sql)
+    // safe: only the constant `SERVICE_IDENTITY_SELECT` is formatted in; values are bound.
+    let row: ServiceIdentityRow = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(parse_id(id)?)
         .fetch_one(pool)
         .await?;
