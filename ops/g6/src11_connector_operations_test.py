@@ -119,7 +119,10 @@ DUE_UNTIL = "2028-02-29T02:00:00Z"
 
 RUN_TIMEOUT_S = 150
 # The run sensor ticks every 30 s and reports a finished run to the API, which
-# is where a failed run is counted (`connector_run_event`).
+# is where a failed run is counted (`connector_run_event`). 150 s is five of
+# those ticks: enough for one report to arrive and be counted, and not a
+# number that hides a report that never comes (OPS-10: what failed step c was
+# an ordering problem, not a slow report — see `step_auto_disable`).
 SENSOR_WAIT_S = 150
 # What a log must never hold (principle 4): the driver's own words and its
 # class names, plus the secret the gate set (added per call).
@@ -321,6 +324,39 @@ def runs_of(connector_id: str) -> list[dict]:
 
 def run_record(connector_id: str, run_id: str) -> dict | None:
     return next((r for r in runs_of(connector_id) if r["runId"] == run_id), None)
+
+
+def pause_diagnostics(connector_id: str, run_ids: list[str]) -> str:
+    """What a step-c pause timeout must say (OPS-10): the connector's streak,
+    its pause, and each failed run's record. A timeout says whether the runs
+    were never counted, or counted and then reset by a success reported after
+    them (`lastRunSuccessAt` names that case), instead of only "timed out".
+    Every read is best effort: a diagnostic that fails must not replace the
+    timeout it explains."""
+    try:
+        detail = connector_detail(connector_id)
+        facts = (
+            f"failureStreak={detail.get('failureStreak')!r} pausedAt={detail.get('pausedAt')!r} "
+            f"pausedReason={detail.get('pausedReason')!r} lastRunSuccessAt={detail.get('lastRunSuccessAt')!r} "
+            f"lastRunFailureAt={detail.get('lastRunFailureAt')!r}"
+        )
+    except (OpsGateFailure, requests.RequestException) as exc:
+        facts = f"the connector could not be read: {exc}"
+    runs: list[str] = []
+    for run_id in run_ids:
+        try:
+            record = run_record(connector_id, run_id)
+        except (OpsGateFailure, requests.RequestException) as exc:
+            runs.append(f"{run_id}: unreadable ({exc})")
+            continue
+        if record is None:
+            runs.append(f"{run_id}: no record")
+            continue
+        runs.append(
+            f"{run_id}: status={record.get('status')!r} endReason={record.get('endReason')!r} "
+            f"startedAt={record.get('startedAt')!r} endedAt={record.get('endedAt')!r}"
+        )
+    return f"{facts}; runs: " + ", ".join(runs)
 
 
 def run_log(connector_id: str, run_id: str) -> dict | None:
@@ -612,19 +648,45 @@ def step_auto_disable(state: dict, sfx: str, rule_path: str, receiver: src17.Rec
     if rows != 2:
         raise OpsGateFailure(f"expected 2 rows in bronze.{bronze} after the first load, got {rows}")
     state["rows"] = rows
+    # OPS-10: the first load's SUCCESS must be *counted* (its streak reset
+    # applied) before the failures start. The failure and success reports come
+    # from two independent Dagster sensors on the same 30 s tick
+    # (`pipeline_events.py`), and the API applies each report in the order it
+    # arrives — `connectors::record_run_once` writes `failure_streak` from the
+    # arriving outcome, not from the run's end time. So a success reported
+    # after the first failure resets the streak that failure just started, and
+    # the failures after it never reach the threshold. That is what failed this
+    # step on `main` at `c78c9faa` (job 120318461712): run 1's failure was
+    # reported at 08:33:49, the first load's success at 08:33:54, and runs 2
+    # and 3 at 08:34:19, leaving a streak of 2 and no pause. `lastRunSuccessAt`
+    # is written by the same statement that resets the streak, so once it is
+    # there no older success report is still in flight.
+    poll(
+        "the first load to be counted on the connector (lastRunSuccessAt)",
+        lambda: (lambda d: d if d.get("lastRunSuccessAt") else None)(connector_detail(connector_id)),
+        SENSOR_WAIT_S, interval_s=3.0,
+    )
     if connector_id not in ingestible_ids(due=True):
         raise OpsGateFailure("the connector is not in the due list before it is paused")
 
     matrix._write_credential_file(derived, "g11-wrong-" + secrets.token_hex(6))
+    failed: list[str] = []
     for number in range(1, threshold + 1):
         run_id = launch_run(connector_id)
+        failed.append(run_id)
         wait_dagster(run_id, "FAILURE", f"failing run {number} of {threshold}")
         say(f"c. failed run {number} of {threshold}: {run_id}")
-    detail = poll(
-        "the connector to be paused by the failures",
-        lambda: (lambda d: d if d.get("pausedAt") else None)(connector_detail(connector_id)),
-        SENSOR_WAIT_S, interval_s=5.0,
-    )
+    try:
+        detail = poll(
+            "the connector to be paused by the failures",
+            lambda: (lambda d: d if d.get("pausedAt") else None)(connector_detail(connector_id)),
+            SENSOR_WAIT_S, interval_s=5.0,
+        )
+    except OpsGateFailure as exc:
+        # OPS-10: a timeout must carry the reason, not only the number of
+        # seconds, so the next red run says why. The timeout's own message
+        # stays at the front of the new one: it names what was waited for.
+        raise OpsGateFailure(f"{exc}; {pause_diagnostics(connector_id, failed)}") from exc
     expected_reason = f"Paused after {threshold} failed runs in a row"
     if detail.get("pausedReason") != expected_reason:
         raise OpsGateFailure(f"expected the pause reason {expected_reason!r}, got {detail.get('pausedReason')!r}")

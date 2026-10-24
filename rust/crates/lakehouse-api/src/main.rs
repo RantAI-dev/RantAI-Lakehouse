@@ -102,23 +102,14 @@ async fn run() -> anyhow::Result<()> {
     // wrote and remove the leftovers of an interrupted change.
     seal_connector_secrets_at_startup(&state).await?;
 
-    // Bring the OLTP schema up to date before serving. `migrate` is idempotent
-    // (`sqlx` records applied versions in `_sqlx_migrations`), so this is safe
-    // on every boot.
-    //
-    // A failure is logged rather than fatal, matching the reasoning on
-    // `AppState::pg`: the Phase 1 routes (catalog, overview, query, storage)
-    // only need ClickHouse and Dagster, and an unreachable Postgres must not
-    // take the whole console down. The Phase 2 routes then degrade to 503 via
-    // `StoreError::Unavailable` instead of serving an empty schema.
-    if let Some(pool) = state.pg.as_ref() {
-        match lakehouse_store::migrate(pool).await {
-            Ok(()) => tracing::info!("database migrations applied"),
-            Err(err) => tracing::error!(%err, "failed to apply database migrations"),
-        }
-    } else {
-        tracing::warn!("no Postgres pool configured; Phase 2 routes will be unavailable");
-    }
+    // OPS-4: the application database's start-up step. `migrate` is
+    // idempotent (`sqlx` records applied versions in `_sqlx_migrations`),
+    // so running it on every boot is safe. The two ways it can fail are
+    // NOT the same thing, and `bring_database_up` decides between them:
+    // a reachable database whose schema is not this build's version stops
+    // the process, while an unreachable one degrades (Phase 1 routes
+    // serve) and retries loudly. See that function's doc comment.
+    bring_database_up(&state).await?;
 
     // Task 3.2: idempotently seed the one bootstrap admin, from
     // `AUTH_BOOTSTRAP_EMAIL`/`AUTH_BOOTSTRAP_PASSWORD` — see
@@ -200,6 +191,164 @@ async fn run() -> anyhow::Result<()> {
         .context("server error")?;
 
     Ok(())
+}
+
+/// How often [`spawn_database_retry`] re-checks an unreachable application
+/// database (`OPS-4` decision 2). 60 s: long enough that a Postgres
+/// restarting under compose is back before the second or third attempt,
+/// short enough that an operator watching the log sees a fresh error every
+/// minute instead of one line they scroll past. A constant, not an env
+/// knob: nothing measured suggests another value, and a knob here would be
+/// a way to silence the loud degrade.
+const DATABASE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The fixed line the start-up path and the retry loop log when the
+/// database ANSWERED and its schema is not this build's version (`OPS-4`
+/// decision 1) — the cause is in the logged error, this line is the one
+/// an operator greps for.
+const DATABASE_SCHEMA_MISMATCH: &str =
+    "the application database is not at this build's schema version";
+
+/// What the start-up migration step decided (`OPS-4`).
+enum DatabaseStartup {
+    /// The database answered and its schema is at this build's version.
+    Ready,
+    /// The database could not be reached at all; the error is kept for the
+    /// log. Serve the Phase 1 routes and retry (decision 2).
+    Unreachable(lakehouse_store::StoreError),
+}
+
+/// `OPS-4`: bring the application database up to this build's schema
+/// version before serving, or decide how to serve without it.
+///
+/// * **No pool at all** (a `DATABASE_URL` that did not parse): every Phase
+///   2 route answers `503`; log it as an error, since a deployment that
+///   lost its database configuration has no working login either.
+/// * **A reachable database that refuses the migrations** (version
+///   mismatch, a failed statement, a changed checksum): refuse to start,
+///   non-zero exit, error logged (decision 1). PRs #106 and #199 showed
+///   what serving anyway costs: sqlx stops at the first mismatch, every
+///   newer route answers `500`, and the process looks healthy. Failing
+///   closed is the only honest option — compose restarts it and the log
+///   says why every time.
+/// * **An unreachable database**: keep the Phase 1 routes serving and
+///   retry loudly (decision 2). This is the pre-`OPS-4` behaviour, minus
+///   the silence: `spawn_database_retry` logs an error every
+///   [`DATABASE_RETRY_INTERVAL`] until a connection succeeds, and
+///   `GET /health` reports the database as unavailable meanwhile.
+///
+/// # Errors
+/// Returns the refusal of decision 1 (the schema is not at this build's
+/// version); nothing else in this function fails.
+async fn bring_database_up(state: &AppState) -> anyhow::Result<()> {
+    let Some(pool) = state.pg.as_deref() else {
+        tracing::error!(
+            "no Postgres pool is configured (DATABASE_URL did not parse); the application \
+             database is unavailable and every Phase 2 route answers 503"
+        );
+        return Ok(());
+    };
+    match migration_outcome(lakehouse_store::migrate(pool).await) {
+        Ok(DatabaseStartup::Ready) => {
+            state.mark_database_ready();
+            tracing::info!("database migrations applied");
+            Ok(())
+        }
+        Ok(DatabaseStartup::Unreachable(err)) => {
+            tracing::error!(
+                error = ?err,
+                "application database is unreachable; serving Phase 1 routes only and \
+                 retrying every {} s until it answers",
+                DATABASE_RETRY_INTERVAL.as_secs()
+            );
+            spawn_database_retry(state.clone());
+            Ok(())
+        }
+        Err(err) => {
+            tracing::error!(error = ?err, "failed to apply database migrations");
+            anyhow::bail!("{DATABASE_SCHEMA_MISMATCH}; refusing to start")
+        }
+    }
+}
+
+/// The decision [`bring_database_up`] takes from one `migrate` result,
+/// split from the I/O so a unit test can drive both outcomes without a
+/// database (and so no library code ever calls `process::exit`): the
+/// caller's `?` is what turns the refusal into a non-zero exit.
+fn migration_outcome(
+    result: Result<(), lakehouse_store::StoreError>,
+) -> Result<DatabaseStartup, lakehouse_store::StoreError> {
+    match result {
+        Ok(()) => Ok(DatabaseStartup::Ready),
+        Err(err) if is_unreachable_database(&err) => Ok(DatabaseStartup::Unreachable(err)),
+        Err(err) => Err(err),
+    }
+}
+
+/// Whether `err` is Postgres saying it could not be reached at all, rather
+/// than answering and refusing this build's migrations (`OPS-4`).
+///
+/// Walks the source chain because `lakehouse_store::migrate` wraps a
+/// connect failure twice (`StoreError::Migration` -> `MigrateError::
+/// Execute` -> `sqlx::Error`). The class itself is
+/// [`upstream_error::class_of_sqlx`] (AGENTS.md rule 4): that is this
+/// crate's one definition of "unreachable Postgres" — an I/O failure, a
+/// closed or exhausted pool — and it reads types, never error text.
+fn is_unreachable_database(err: &lakehouse_store::StoreError) -> bool {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(error) = current {
+        if let Some(sqlx_err) = error.downcast_ref::<sqlx::Error>() {
+            return upstream_error::class_of_sqlx(sqlx_err) == upstream_error::Class::Unavailable;
+        }
+        current = error.source();
+    }
+    false
+}
+
+/// `OPS-4` decision 2: keep saying so, every [`DATABASE_RETRY_INTERVAL`],
+/// until the database answers.
+///
+/// A retry that reaches a database whose schema is NOT at this build's
+/// version stops instead of retrying forever: a schema mismatch does not
+/// heal by waiting, and a task spawned after start-up cannot refuse a
+/// start that already happened. It logs the same fixed line the start-up
+/// path refuses with, and `/health` keeps reporting the database
+/// unavailable — the honest state, without pretending a restart loop is
+/// the answer.
+fn spawn_database_retry(state: AppState) {
+    tokio::spawn(async move {
+        let Some(pool) = state.pg.clone() else {
+            return;
+        };
+        loop {
+            tokio::time::sleep(DATABASE_RETRY_INTERVAL).await;
+            match migration_outcome(lakehouse_store::migrate(&pool).await) {
+                Ok(DatabaseStartup::Ready) => {
+                    state.mark_database_ready();
+                    tracing::info!(
+                        "application database is reachable again; migrations applied and \
+                         GET /health reports it usable"
+                    );
+                    return;
+                }
+                Ok(DatabaseStartup::Unreachable(err)) => {
+                    tracing::error!(
+                        error = ?err,
+                        "application database is still unreachable; Phase 2 routes stay \
+                         unavailable; retrying in {} s",
+                        DATABASE_RETRY_INTERVAL.as_secs()
+                    );
+                }
+                Err(err) => {
+                    tracing::error!(
+                        error = ?err,
+                        "{DATABASE_SCHEMA_MISMATCH}; Phase 2 routes stay unavailable"
+                    );
+                    return;
+                }
+            }
+        }
+    });
 }
 
 /// `SRC-12` decisions 4, 9: the start-up pass over the managed credential
@@ -987,9 +1136,20 @@ mod tests {
 
     use super::*;
 
+    /// `OPS-4` decision 2: with no pool the body names the database as
+    /// unavailable, so an operator reads "up but degraded" instead of a
+    /// green check over a database nothing can use. The status code stays
+    /// `200`: the Phase 1 routes answer, and the ops gates poll this
+    /// endpoint for a `200` to decide the API is up.
+    ///
+    /// `DATABASE_URL` is set to something `connect_lazy` rejects, which is
+    /// the only way `AppState::pg` is `None` — see
+    /// `app_state_degrades_to_no_pool_on_malformed_database_url`.
     #[tokio::test]
-    async fn health_returns_200_ok() {
-        let cfg = Config::from_map(&std::collections::HashMap::new()).unwrap();
+    async fn health_reports_the_database_unavailable_with_no_pool() {
+        let mut env = std::collections::HashMap::new();
+        env.insert("DATABASE_URL".to_owned(), "not a postgres url".to_owned());
+        let cfg = Config::from_map(&env).unwrap();
         let app = routes::router(AppState::new(cfg));
 
         let response = app
@@ -1004,7 +1164,95 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        assert_eq!(&bytes[..], b"ok");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["status"], "ok");
+        assert_eq!(body["database"], "unavailable");
+    }
+
+    /// The other half of the same answer: once the start-up step confirmed
+    /// the schema (`mark_database_ready`), `/health` says so — otherwise
+    /// the field could be a constant `unavailable` and nobody would know.
+    #[tokio::test]
+    async fn health_reports_the_database_ok_once_the_startup_step_confirmed_it() {
+        // `SEC-37` (PR #238 merge of `main`): `DATABASE_URL` has no default
+        // any more, so the test names a throwaway DSN for its lazy pool
+        // (`connect_lazy` does no I/O), as `route_policy_tests` does.
+        let env = std::collections::HashMap::from([(
+            "DATABASE_URL".to_owned(),
+            "postgres://test:test@127.0.0.1:5432/test".to_owned(),
+        )]);
+        let cfg = Config::from_map(&env).unwrap();
+        let state = AppState::new(cfg);
+        assert!(
+            state.pg.is_some(),
+            "a parsable DATABASE_URL gives a lazy pool"
+        );
+        state.mark_database_ready();
+        let app = routes::router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["database"], "ok");
+    }
+
+    /// `OPS-4` decision 1: a database that ANSWERED and refused this
+    /// build's migrations makes the start-up step an error, which `run`'s
+    /// `?` turns into a non-zero exit — the point of the fix (PRs #106 and
+    /// #199 served a mismatched schema and answered `500` on every newer
+    /// route).
+    ///
+    /// A `MigrateError` cannot be built variant by variant outside `sqlx`
+    /// (`#[non_exhaustive]`), but `From<sqlx::Error>` is public, and
+    /// `Protocol` is a non-connection failure — exactly the shape a
+    /// migration whose statement failed comes back in.
+    #[test]
+    fn a_migration_that_fails_against_a_reachable_database_refuses_to_start() {
+        let refused = lakehouse_store::StoreError::Migration(sqlx::migrate::MigrateError::from(
+            sqlx::Error::Protocol("migration 0042 failed".to_owned()),
+        ));
+
+        let outcome = migration_outcome(Err(refused));
+
+        assert!(
+            outcome.is_err(),
+            "a refused migration must stop start-up, not serve a schema the code cannot use"
+        );
+    }
+
+    /// `OPS-4` decision 2: an unreachable database degrades instead — and
+    /// the real shape `migrate` returns wraps the connect error twice, so
+    /// the classifier has to follow `source` to find it.
+    #[test]
+    fn an_unreachable_database_degrades_instead_of_refusing_to_start() {
+        let io = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused");
+        let direct = lakehouse_store::StoreError::Database(sqlx::Error::Io(io));
+        assert!(matches!(
+            migration_outcome(Err(direct)),
+            Ok(DatabaseStartup::Unreachable(_))
+        ));
+
+        let io = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused");
+        let wrapped = lakehouse_store::StoreError::Migration(sqlx::migrate::MigrateError::from(
+            sqlx::Error::Io(io),
+        ));
+        assert!(
+            matches!(
+                migration_outcome(Err(wrapped)),
+                Ok(DatabaseStartup::Unreachable(_))
+            ),
+            "the connect error is two `source` hops down: StoreError -> MigrateError -> sqlx::Error"
+        );
     }
 
     /// Build a fresh router for a registration test. Each test gets its own

@@ -963,7 +963,13 @@ pub fn check_style_names<S: std::hash::BuildHasher>(
 /// it says what the chart does have, so the names are there to pick from. A
 /// chart with many columns would drown the sentence, so the list stops and
 /// counts the rest.
-fn returns_list(known: &HashSet<&str>) -> String {
+///
+/// `pub` because the assistant's own tools refuse a name the same way
+/// (`format_chart` refuses a series key the chart does not draw). The hasher
+/// is generalized like [`check_style_names`]'s, so a caller may pass a set of
+/// its own.
+#[must_use]
+pub fn returns_list<S: std::hash::BuildHasher>(known: &HashSet<&str, S>) -> String {
     let mut names: Vec<&str> = known.iter().copied().collect();
     names.sort_unstable();
     let listed = names.len().min(MAX_LISTED_NAMES);

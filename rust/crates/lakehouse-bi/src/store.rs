@@ -294,6 +294,20 @@ pub struct StoredChartSpec {
     pub created_at: Option<String>,
 }
 
+/// Read [`ChartInput::mart`]: a string as it is, and `null` as the empty
+/// string, which is what an absent `mart` already is.
+///
+/// Any other type (a number, an object) is still a decode error, because
+/// `Option<String>` accepts only a string or `null`.
+///
+/// # Errors
+///
+/// The deserializer's own error, when the value is neither a string nor
+/// `null`: a number or an object is refused.
+fn deserialize_mart<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 /// High-level input (from the AI tool / UI builder) — the server assembles
 /// its SQL.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -311,7 +325,11 @@ pub struct ChartInput {
     /// downstream validation (which mirrors `specFromInput` in
     /// `bi-store.ts`) produce the proper Indonesian error message instead
     /// of failing at deserialization with "missing field `mart`".
-    #[serde(default)]
+    ///
+    /// `null` reads as no mart, like an absent field: the assistant's model
+    /// sends `null` for "no mart", and the update path then carries the
+    /// stored source over, as it does when `mart` is absent.
+    #[serde(default, deserialize_with = "deserialize_mart")]
     pub mart: String,
     /// Dashboard SQL source id, the alternative to `mart` (exactly one of
     /// the two for every kind but `text`). `camelCase` on the wire like the
@@ -4249,14 +4267,21 @@ pub async fn spec_from_input(
     Ok(spec)
 }
 
+/// The names the chart's series can take: the names the chart draws, which
+/// are the keys `colors.series` and `valueFormats` are stored under.
+#[must_use]
+pub fn drawn_names(y: &crate::specs::ChartY) -> Vec<String> {
+    match y {
+        crate::specs::ChartY::Single(y) => vec![y.clone()],
+        crate::specs::ChartY::Multi(ys) => ys.clone(),
+    }
+}
+
 /// BI-18 part C review fix (BLOCKER) R24: series colours are keyed by the name
 /// the chart draws, whichever path saved them (builder, `create_chart`,
 /// `update_chart`, `format_chart`: all end in [`spec_from_input`]).
 fn key_look_by_drawn_names(spec: &mut StoredChartSpec) {
-    let drawn: Vec<String> = match &spec.spec.y {
-        crate::specs::ChartY::Single(y) => vec![y.clone()],
-        crate::specs::ChartY::Multi(ys) => ys.clone(),
-    };
+    let drawn = drawn_names(&spec.spec.y);
     crate::style::key_series_by_drawn_name(&mut spec.def, &drawn);
 }
 
@@ -6710,6 +6735,38 @@ mod tests {
         assert!(input.measures.is_empty());
     }
 
+    /// `"mart": null` reads as no mart, a mart that is neither a string nor
+    /// `null` is still refused, and the field still writes as a plain string.
+    #[test]
+    fn chart_input_reads_a_null_mart_as_no_mart_and_refuses_a_number() {
+        let null: ChartInput = serde_json::from_value(
+            serde_json::json!({ "title": "t", "kind": "text", "mart": null }),
+        )
+        .expect("a null mart decodes");
+        assert_eq!(null.mart, "");
+        let named: ChartInput = serde_json::from_value(
+            serde_json::json!({ "title": "t", "kind": "bar", "mart": "mart_x" }),
+        )
+        .expect("a named mart decodes");
+        assert_eq!(named.mart, "mart_x");
+        // A number is refused as it was before `null` was read as no mart:
+        // the assistant's model must send a name or nothing, not a number.
+        let number = serde_json::from_value::<ChartInput>(
+            serde_json::json!({ "title": "t", "kind": "bar", "mart": 7 }),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(number.contains("expected a string"), "{number}");
+        let object = serde_json::from_value::<ChartInput>(
+            serde_json::json!({ "title": "t", "kind": "bar", "mart": { "name": "mart_x" } }),
+        );
+        assert!(object.is_err(), "{object:?}");
+        assert_eq!(
+            serde_json::to_value(&null).expect("serializes")["mart"],
+            serde_json::json!("")
+        );
+    }
+
     /// Same D1 regression, for `kind: "kpi"`: the tool schema doesn't
     /// require `dimension` (KPIs are dimensionless), so a schema-valid call
     /// omits it — decoding must not fail on that either.
@@ -7664,6 +7721,30 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.to_string(), "invalid mart name: bad name");
+    }
+
+    /// The store keeps the console's wording: `crate::layers::check_definition`
+    /// refuses it, and that check is outside this change.
+    #[tokio::test]
+    async fn a_layer_with_no_data_source_keeps_the_consoles_wording() {
+        let server = MockServer::start().await;
+        let ch = client(&server.uri());
+        let input: ChartInput = serde_json::from_value(serde_json::json!({
+            "title": "Visitors", "kind": "bar", "mart": "mart_a",
+            "dimension": "province", "measures": ["visitors"],
+            "layers": [{
+                "dimension": "province", "measures": ["visitors"],
+                "draw": "line", "axis": "right",
+            }],
+        }))
+        .unwrap();
+        let err = spec_from_input(&ch, &input, ChartSource::Ai, "ai", None, &DEFAULT_TIME)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "question 1: choose a table or a SQL source."
+        );
     }
 
     #[test]

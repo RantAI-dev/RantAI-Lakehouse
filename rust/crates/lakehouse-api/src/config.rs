@@ -451,10 +451,13 @@ pub struct Config {
     /// `auth_identity.provider`. Default `"default"`.
     pub oidc_provider_name: String,
     /// Explicit override for the JWKS endpoint URL. `None` when unset, in
-    /// which case `crate::state::AppState::new` derives
-    /// `"{issuer}/.well-known/jwks.json"` — the conventional `OIDC`
-    /// discovery-document location every provider this crate documents
-    /// (Okta, Entra, Google, Keycloak) publishes at.
+    /// which case `SEC-38` applies: the address is the `jwks_uri` from the
+    /// provider's discovery document
+    /// (`{issuer}/.well-known/openid-configuration`), read on the first
+    /// key lookup and cached with the key set. Set this only when a
+    /// provider's discovery document is unavailable or names a key set
+    /// this deployment cannot reach; an explicit value is used exactly as
+    /// given and no discovery request is made.
     pub oidc_jwks_url: Option<String>,
     /// Whether an unrecognized `OIDC` subject is allowed to provision a new
     /// `app_user`. Default `false` — see
@@ -564,15 +567,22 @@ pub struct Config {
     /// [`Self::rustfs_access_key_secret_ref`].
     pub rustfs_secret_key_secret_ref: Option<String>,
     /// Postgres connection string for Phase 2 OLTP storage (`lakehouse-store`).
-    /// Default `"postgres://lakehouse:lakehouse@localhost:5432/lakehouse"`
-    /// (`??` semantics, like every other URL field here). Rust/Phase-2-only:
-    /// no TypeScript equivalent exists, since Phase 1 never wrote to
-    /// persistent storage. An unreachable or misconfigured Postgres is
-    /// deliberately NOT a boot-time failure — see the doc comment on
-    /// `lakehouse_store::connect_lazy` — so, unlike `port`, this field has
-    /// no dedicated [`ConfigError`] variant either; whatever string is here
-    /// is handed to `connect_lazy` as-is and any problem with it surfaces
-    /// lazily, at first use, as an ordinary request-time error.
+    /// **No default** (`SEC-37`): unset (or empty) is `""`, which
+    /// [`crate::state::AppState::new`] turns into "no Postgres pool" — the
+    /// state `main` already handles with a warning and every Phase 2 route
+    /// answers 503 for. It used to default to a `localhost:5432` DSN whose
+    /// user and password were both written in the repository — a default
+    /// credential (`AGENTS.md` rule 5); compose always sets `DATABASE_URL`
+    /// (built from the must-set `POSTGRES_PASSWORD`), so only a run outside
+    /// compose can reach the unset state. Rust/Phase-2-only: no TypeScript
+    /// equivalent exists, since Phase 1 never wrote to persistent storage.
+    /// An unreachable or
+    /// misconfigured Postgres is deliberately NOT a boot-time failure — see
+    /// the doc comment on `lakehouse_store::connect_lazy` — so, unlike
+    /// `port`, this field has no dedicated [`ConfigError`] variant either;
+    /// whatever non-empty string is here is handed to `connect_lazy` as-is
+    /// and any problem with it surfaces lazily, at first use, as an ordinary
+    /// request-time error.
     pub database_url: String,
     /// ADR 0010/0011 — path to a file holding the `gold-export` Lakekeeper
     /// principal's pre-minted static bearer token (`iceberg-catalog-rest`'s
@@ -1420,11 +1430,7 @@ impl Config {
             ),
             rustfs_access_key_secret_ref: truthy(env, "RUSTFS_ACCESS_KEY_SECRET_REF"),
             rustfs_secret_key_secret_ref: truthy(env, "RUSTFS_SECRET_KEY_SECRET_REF"),
-            database_url: or_default(
-                env,
-                "DATABASE_URL",
-                "postgres://lakehouse:lakehouse@localhost:5432/lakehouse",
-            ),
+            database_url: or_default(env, "DATABASE_URL", ""),
             lakekeeper_gold_export_token_file: or_default(
                 env,
                 "LAKEKEEPER_GOLD_EXPORT_TOKEN_FILE",
@@ -1666,10 +1672,12 @@ mod tests {
         assert_eq!(cfg.smtp_user, None);
         assert_eq!(cfg.smtp_pass, "");
         assert_eq!(cfg.smtp_from, "rantai-lake@localhost");
-        assert_eq!(
-            cfg.database_url,
-            "postgres://lakehouse:lakehouse@localhost:5432/lakehouse"
-        );
+        // `SEC-37`: no default credentials in code. Unset `DATABASE_URL` is
+        // an empty string, and means exactly "no Postgres pool" — the same
+        // state a malformed URL already degrades to, handled by `main`'s own
+        // warning. It must NOT be turned into a made-up localhost DSN with a
+        // known password.
+        assert_eq!(cfg.database_url, "");
         assert_eq!(cfg.lakekeeper_catalog_uri, "http://localhost:8181/catalog");
         assert_eq!(cfg.lakekeeper_warehouse, "default");
         assert_eq!(cfg.iceberg_query_db, None);

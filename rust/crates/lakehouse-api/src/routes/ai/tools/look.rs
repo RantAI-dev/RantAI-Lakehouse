@@ -1,5 +1,7 @@
 //! Formatting tools (`BI-17` part A, with `AI-8`): `format_chart` and
-//! `set_dashboard_theme`.
+//! `set_dashboard_theme`, and the helpers the chart tools share: the field
+//! whose shape is wrong (`wrong_field`) and the refusal of a layer that names
+//! no data source (`check_layers_name_a_source`).
 //!
 //! # Posture
 //!
@@ -10,8 +12,11 @@
 //! `null` clears one, a field not named is kept), and saves the whole chart
 //! through the same builder and the same checks as `update_chart`
 //! (`spec_from_input`, `lakehouse_bi::style::check_style`), so the assistant
-//! cannot save what the console's builder would refuse and a refusal is the
-//! console's own sentence. It does not relabel the chart's author.
+//! cannot save what the console's builder would refuse and a refusal from the
+//! store is the console's own sentence. A layer that names no data source is
+//! refused in the assistant's own words: the store applies the console's check
+//! in `lakehouse_bi::layers`, which names the console's arguments, while a
+//! model sends `mart` or `sqlSource`. It does not relabel the chart's author.
 //!
 //! `set_dashboard_theme` saves a dashboard's theme and font through the console
 //! route's own handler (`routes::dashboard::boards_update`), which checks the
@@ -26,8 +31,11 @@ use axum::body::Bytes;
 use axum::extract::State;
 use lakehouse_auth::Principal;
 use lakehouse_bi::access::Viewer;
+use lakehouse_bi::specs::{ChartKind, ChartY};
 use lakehouse_bi::store::{self, ChartInput};
+use lakehouse_bi::style::ChartColors;
 use serde_json::{Map, Value, json};
+use std::collections::{BTreeMap, HashSet};
 
 use super::{api_result_to_value, arg_str};
 use crate::routes::dashboard;
@@ -132,28 +140,33 @@ pub(crate) fn merge_format(
     Ok(merged)
 }
 
-/// The formatting field whose shape is wrong, when one field alone is to
-/// blame.
+/// The field whose shape is wrong, when one field alone is to blame.
 ///
 /// A definition that does not read names no field: serde says what it found,
-/// not where it found it. Taking each formatting field out of the definition
+/// not where it found it. Taking each candidate field out of the definition
 /// and reading what is left tells which one is to blame, for the definition
 /// reads again once the wrong field is gone. Two wrong fields leave nothing
 /// to single out, so no field is named.
-fn wrong_format_field(def: &Value) -> Option<&'static str> {
+///
+/// The candidates are a parameter because the fields that can be to blame are
+/// the ones the caller named: the formatting fields for `format_chart`, the
+/// top-level keys of the call for a chart call. A candidate the definition
+/// does not hold changes nothing when it is taken out, so it can never be
+/// named.
+pub(super) fn wrong_field<'a>(def: &Value, candidates: &[&'a str]) -> Option<&'a str> {
     let fields = def.as_object()?;
-    let mut wrong: Option<&'static str> = None;
-    for field in FORMAT_FIELDS {
-        if !fields.contains_key(field) {
+    let mut wrong: Option<&'a str> = None;
+    for field in candidates {
+        if !fields.contains_key(*field) {
             continue;
         }
         let mut without = fields.clone();
-        without.remove(field);
+        without.remove(*field);
         if serde_json::from_value::<ChartInput>(Value::Object(without)).is_ok() {
             if wrong.is_some() {
                 return None;
             }
-            wrong = Some(field);
+            wrong = Some(*field);
         }
     }
     wrong
@@ -166,11 +179,135 @@ fn wrong_format_field(def: &Value) -> Option<&'static str> {
 /// say what was found and not where it was found: the model has to know
 /// which of its arguments to fix.
 fn wrong_shape_sentence(def: &Value, cause: &str) -> String {
-    let named = wrong_format_field(def).filter(|field| !cause.contains(*field));
+    let named = wrong_field(def, &FORMAT_FIELDS).filter(|field| !cause.contains(*field));
     match named {
         Some(field) => format!("a formatting field has the wrong shape: \"{field}\": {cause}"),
         None => format!("a formatting field has the wrong shape: {cause}"),
     }
+}
+
+/// The kinds whose marks are coloured by item name and not by series: the
+/// console colours the marks of a pie, a rose, a funnel and a treemap by the
+/// name of the data value (`src/features/dashboards/style-option.ts:237`), so
+/// a series key names a mark for these and says nothing about the chart's
+/// measures.
+const KINDS_NAMING_MARKS: [ChartKind; 4] = [
+    ChartKind::Pie,
+    ChartKind::Rose,
+    ChartKind::Funnel,
+    ChartKind::Treemap,
+];
+
+/// Check that every layer names a data source before the assistant saves it.
+///
+/// The console's sentence is unchanged in `lakehouse_bi::layers`, whose
+/// check is outside this change. The assistant's model is the caller that has
+/// to learn which arguments to send, so its refusal names `mart` and
+/// `sqlSource`.
+///
+/// # Errors
+///
+/// The sentence for the model, naming the first layer that names no mart
+/// and no SQL source.
+pub(super) fn check_layers_name_a_source(input: &ChartInput) -> Result<(), String> {
+    for (i, layer) in input.shape.layers_list().iter().enumerate() {
+        let names_mart = !layer.mart.trim().is_empty();
+        let names_sql = layer
+            .sql_source
+            .as_deref()
+            .is_some_and(|source| !source.trim().is_empty());
+        if !names_mart && !names_sql {
+            return Err(format!(
+                "question {}: the layer names no data source: send its mart or sqlSource.",
+                i + 1
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Check the series keys the call names against the names the chart draws.
+///
+/// The keys are the call's own: a key the stored chart holds is not the
+/// call's doing, and a chart saved before this rule existed may hold one the
+/// chart cannot draw.
+///
+/// # Errors
+///
+/// The sentence for the model: a key the chart does not draw, with the names
+/// the chart does draw.
+fn check_series_keys(
+    def: &ChartInput,
+    y: &ChartY,
+    args: &Map<String, Value>,
+) -> Result<(), String> {
+    let Some(series) = args
+        .get("colors")
+        .and_then(Value::as_object)
+        .and_then(|colors| colors.get("series"))
+        .and_then(Value::as_object)
+    else {
+        return Ok(());
+    };
+    // A chart with a breakdown draws one series per data value, a chart that
+    // reads a parameter draws names that are known only once the parameter is
+    // resolved, and a chart that colours its marks by item name takes a key
+    // that names a mark and not a series: none of them can be checked
+    // against the chart's measures.
+    if def.breakdown.as_deref().is_some_and(|b| !b.is_empty())
+        || def.uses_params()
+        || KINDS_NAMING_MARKS.contains(&def.kind)
+    {
+        return Ok(());
+    }
+    let drawn = store::drawn_names(y);
+    let known: HashSet<&str> = drawn
+        .iter()
+        .map(String::as_str)
+        .filter(|n| !n.is_empty())
+        .collect();
+    // A chart that draws no named series has nothing to check a key against: the
+    // list of names would be empty and the sentence would end in "it draws: .".
+    if known.is_empty() {
+        return Ok(());
+    }
+    for (key, colour) in series {
+        if draws_key(def, &drawn, key, colour.as_str().unwrap_or_default()) {
+            continue;
+        }
+        return Err(format!(
+            "colors.series names \"{key}\", which the chart does not draw; it draws: {}.",
+            lakehouse_bi::style::returns_list(&known)
+        ));
+    }
+    Ok(())
+}
+
+/// Whether the chart draws the series key `key`: the key is one of the names
+/// the chart draws, or the server's own rewrite (`key_series_by_drawn_name`)
+/// turns it into one (a measure's column, `<aggregate>_<column>`).
+///
+/// The rewrite moves a key instead of saying which key it would move, so the
+/// chart is copied with that one key in it and the copy is rewritten: what is
+/// left in the copy names a series the chart draws. One key at a time, so
+/// that the rewrite's "the drawn name already holds a colour" rule cannot
+/// hide a second key of the call.
+fn draws_key(def: &ChartInput, drawn: &[String], key: &str, colour: &str) -> bool {
+    if drawn.iter().any(|name| name == key) {
+        return true;
+    }
+    let mut copy = def.clone();
+    copy.style.colors = Some(ChartColors {
+        series: BTreeMap::from([(key.to_owned(), colour.to_owned())]),
+        ..Default::default()
+    });
+    lakehouse_bi::style::key_series_by_drawn_name(&mut copy, drawn);
+    copy.style.colors.as_ref().is_some_and(|colors| {
+        colors
+            .series
+            .keys()
+            .any(|name| drawn.iter().any(|drawn| drawn == name))
+    })
 }
 
 async fn format_chart(
@@ -207,6 +344,14 @@ async fn format_chart(
         Ok(m) => m,
         Err(sentence) => return json!({ "error": sentence }),
     };
+    if let Err(sentence) = check_layers_name_a_source(&merged) {
+        return json!({ "error": sentence });
+    }
+    // A series key the chart cannot draw colours nothing, so the call is
+    // refused here: nothing is saved yet.
+    if let Err(sentence) = check_series_keys(&stored.def, &stored.spec.y, args) {
+        return json!({ "error": sentence });
+    }
     // BI-9: a chart's SQL is built with the report time zone (a deployment setting).
     let Ok(time) = crate::routes::settings::time_context(state).await else {
         return json!({ "error": "The reporting settings could not be read." });
@@ -320,15 +465,24 @@ mod tests {
     }
 
     fn stored() -> ChartInput {
-        serde_json::from_value(json!({
+        stored_with(&json!({}))
+    }
+
+    /// The stored chart the tests use, with the fields `extra` adds or
+    /// replaces.
+    fn stored_with(extra: &Value) -> ChartInput {
+        let mut base = json!({
             "title": "Visitors", "mart": "mart_wisman", "kind": "bar",
             "dimension": "province", "measures": ["visitors"], "limit": 20, "order": "desc",
             "board": "b1", "click": { "kind": "url", "url": "https://example.com/{value}" },
             "format": { "style": "number", "decimals": 1 },
             "referenceLines": [{ "value": 1000.0, "label": "Goal" }],
             "colors": { "palette": "muted" },
-        }))
-        .unwrap()
+        });
+        for (key, value) in extra.as_object().unwrap() {
+            base[key] = value.clone();
+        }
+        serde_json::from_value(base).unwrap()
     }
 
     fn args(v: Value) -> Map<String, Value> {
@@ -584,5 +738,220 @@ mod tests {
             "a purged chart and a chart that never existed answer the same"
         );
         assert_eq!(purged_reply["error"], json!("this tile does not exist"));
+    }
+
+    /// The chart the series tests use: two measures, each with an aggregate
+    /// of its own, so the names it draws are `sum_jumlah` and `sum_wisman`.
+    fn two_measures() -> ChartInput {
+        stored_with(&json!({
+            "measures": [
+                { "column": "jumlah", "aggregate": "sum" },
+                { "column": "wisman", "aggregate": "sum" },
+            ],
+        }))
+    }
+
+    /// The names that chart draws.
+    fn two_drawn() -> ChartY {
+        ChartY::Multi(vec!["sum_jumlah".to_owned(), "sum_wisman".to_owned()])
+    }
+
+    /// A series key the chart does not draw colours nothing, so the call is
+    /// refused: the refusal names the key and the names the chart draws, so
+    /// the model can pick one of them.
+    #[test]
+    fn a_series_key_the_chart_does_not_draw_is_refused_with_the_names_it_draws() {
+        let e = check_series_keys(
+            &two_measures(),
+            &two_drawn(),
+            &args(json!({ "chart": "c1", "colors": { "series": { "Total": "#00aa00" } } })),
+        )
+        .unwrap_err();
+        assert_eq!(
+            e,
+            "colors.series names \"Total\", which the chart does not draw; it draws: sum_jumlah, sum_wisman."
+        );
+    }
+
+    /// A layer with no source is refused before the assistant saves it, and
+    /// the refusal names the arguments its model sends.
+    #[test]
+    fn a_layer_with_no_data_source_is_refused_with_what_to_send() {
+        let input: ChartInput = serde_json::from_value(json!({
+            "title": "Visitors", "kind": "bar", "mart": "mart_a",
+            "dimension": "province", "measures": ["visitors"],
+            "layers": [{
+                "dimension": "province", "measures": ["visitors"],
+                "draw": "line", "axis": "right",
+            }],
+        }))
+        .unwrap();
+        assert_eq!(
+            check_layers_name_a_source(&input).unwrap_err(),
+            "question 1: the layer names no data source: send its mart or sqlSource."
+        );
+    }
+
+    /// A layer that names a mart is not refused.
+    #[test]
+    fn a_layer_that_names_a_mart_is_not_refused() {
+        let input: ChartInput = serde_json::from_value(json!({
+            "title": "Visitors", "kind": "bar", "mart": "mart_a",
+            "dimension": "province", "measures": ["visitors"],
+            "layers": [{
+                "mart": "mart_b", "dimension": "province", "measures": ["visitors"],
+                "draw": "line", "axis": "right",
+            }],
+        }))
+        .unwrap();
+        check_layers_name_a_source(&input).unwrap();
+    }
+
+    /// A layer that names a SQL source is not refused.
+    #[test]
+    fn a_layer_that_names_a_sql_source_is_not_refused() {
+        let input: ChartInput = serde_json::from_value(json!({
+            "title": "Visitors", "kind": "bar", "mart": "mart_a",
+            "dimension": "province", "measures": ["visitors"],
+            "layers": [{
+                "sqlSource": "source_b", "dimension": "province", "measures": ["visitors"],
+                "draw": "line", "axis": "right",
+            }],
+        }))
+        .unwrap();
+        check_layers_name_a_source(&input).unwrap();
+    }
+
+    /// The refusal names the layer that has no source, counted as the layers
+    /// were given.
+    #[test]
+    fn the_refusal_names_the_second_layer_when_the_first_names_a_source() {
+        let input: ChartInput = serde_json::from_value(json!({
+            "title": "Visitors", "kind": "bar", "mart": "mart_a",
+            "dimension": "province", "measures": ["visitors"],
+            "layers": [
+                {
+                    "mart": "mart_b", "dimension": "province", "measures": ["visitors"],
+                    "draw": "line", "axis": "right",
+                },
+                {
+                    "dimension": "province", "measures": ["visitors"],
+                    "draw": "line", "axis": "right",
+                },
+            ],
+        }))
+        .unwrap();
+        assert_eq!(
+            check_layers_name_a_source(&input).unwrap_err(),
+            "question 2: the layer names no data source: send its mart or sqlSource."
+        );
+    }
+
+    /// A chart that draws no named series has nothing to check a series key
+    /// against.
+    #[test]
+    fn a_chart_that_draws_no_named_series_accepts_any_key() {
+        check_series_keys(
+            &two_measures(),
+            &ChartY::Multi(Vec::new()),
+            &args(json!({ "chart": "c1", "colors": { "series": { "Total": "#00aa00" } } })),
+        )
+        .unwrap_or_else(|e| panic!("a key is refused: {e}"));
+    }
+
+    /// A key the server's own rewrite turns into a drawn name is accepted:
+    /// the column a measure reads and the name its result column is called.
+    #[test]
+    fn a_measure_column_key_is_accepted() {
+        for key in ["jumlah", "sum_jumlah", "wisman", "sum_wisman"] {
+            check_series_keys(
+                &two_measures(),
+                &two_drawn(),
+                &args(json!({ "chart": "c1", "colors": { "series": { (key): "#00aa00" } } })),
+            )
+            .unwrap_or_else(|e| panic!("{key} is refused: {e}"));
+        }
+    }
+
+    /// A chart that draws one series per data value takes any key: its
+    /// series are unknown until the data is read.
+    #[test]
+    fn a_breakdown_chart_accepts_any_key() {
+        check_series_keys(
+            &stored_with(&json!({ "breakdown": "gender" })),
+            &ChartY::Single("visitors".to_owned()),
+            &args(json!({ "chart": "c1", "colors": { "series": { "Total": "#00aa00" } } })),
+        )
+        .unwrap_or_else(|e| panic!("a key is refused: {e}"));
+    }
+
+    /// A chart that colours its marks by item name takes any key: the key
+    /// names a mark and not a series.
+    #[test]
+    fn a_pie_accepts_any_key() {
+        check_series_keys(
+            &stored_with(&json!({ "kind": "pie" })),
+            &ChartY::Single("visitors".to_owned()),
+            &args(json!({ "chart": "c1", "colors": { "series": { "Total": "#00aa00" } } })),
+        )
+        .unwrap_or_else(|e| panic!("a key is refused: {e}"));
+    }
+
+    /// A key the stored chart holds is not the call's doing: a call that
+    /// names another field is not refused for it.
+    #[test]
+    fn a_stored_series_key_is_not_refused_when_the_call_names_another_field() {
+        let def = stored_with(&json!({ "colors": { "series": { "Total": "#00aa00" } } }));
+        check_series_keys(
+            &def,
+            &ChartY::Single("visitors".to_owned()),
+            &args(json!({ "chart": "c1", "colors": { "palette": "muted" } })),
+        )
+        .unwrap_or_else(|e| panic!("a stored key is refused: {e}"));
+    }
+
+    /// The row the store answers with: the chart's own row and the document
+    /// it holds.
+    fn stored_chart_row(def: &Value, y: &str) -> Value {
+        json!({
+            "id": "c1",
+            "is_deleted": 0,
+            "board": "default",
+            "created_by": "ai",
+            "created_at": "2026-10-22 00:00:00",
+            "spec_json": json!({
+                "spec": {
+                    "id": "c1",
+                    "title": "Visitors",
+                    "kind": "bar",
+                    "mart": "mart_wisman",
+                    "sql": "SELECT province, sum(visitors) AS visitors FROM serving.mart_wisman GROUP BY province",
+                    "x": "province",
+                    "y": y,
+                },
+                "def": def,
+            })
+            .to_string(),
+        })
+    }
+
+    /// The tool answers a series key the chart cannot draw with the sentence
+    /// that names the key and the names the chart draws, and saves nothing.
+    #[tokio::test]
+    async fn a_series_key_the_chart_cannot_draw_is_refused_by_the_tool() {
+        let server = engine(vec![stored_chart_row(
+            &serde_json::to_value(stored()).unwrap(),
+            "visitors",
+        )])
+        .await;
+        let call = args(json!({ "chart": "c1", "colors": { "series": { "Total": "#00aa00" } } }));
+        let reply = Box::pin(format_chart(&state_for(&server), None, &call)).await;
+        assert_eq!(
+            reply["error"],
+            json!(
+                "colors.series names \"Total\", which the chart does not draw; it draws: visitors."
+            ),
+            "{reply}"
+        );
     }
 }

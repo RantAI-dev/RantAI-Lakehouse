@@ -2844,7 +2844,7 @@ async fn install_insert_attempt_probe(pool: &PgPool) -> sqlx::Result<()> {
 /// of inferred. This fails if either is removed: unsorted input plus a
 /// duplicated id comes out as `pl-a, pl-m, pl-z` inserted once each, in
 /// that order. With the sort removed the attempts arrive `pl-z, pl-a,
-/// pl-a, pl-m`; with the dedup removed `pl-a` is attempted twice.
+/// pl-m, pl-a`; with the dedup removed `pl-a` is attempted twice.
 #[sqlx::test(migrations = "../../migrations")]
 async fn lock_lag_states_ordered_attempts_each_missing_row_once_in_sorted_order(
     pool: PgPool,
