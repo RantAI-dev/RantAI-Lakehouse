@@ -307,4 +307,24 @@ with `grep -n "\.query\w*("` over `routes/dashboard*.rs`, `embed.rs`,
   (`ch.query` on the editor's unsaved SQL). They are findings for D3, not
   defects in part A.
 
+### Part A after merging `origin/feat/bi-phase-4b` (merge `224a0ee2`)
+
+Resolution (details in the merge commit body): `render_board_payload` keeps
+BI-26's `only_chart` and `editable` and part A's pool; `time` and `tile_slots`
+travel as one tuple to stay under the 8-argument clippy threshold; the pooled
+tile loop uses 4b's `rendered_chart`; a chart token's single tile goes through
+the pool. `public_links.rs` calls neither `get_body` nor `render_board_payload`.
+
+Run after the merge:
+- `cargo test -p lakehouse-api --lib -- embed dashboard tile_pool --test-threads=1`:
+  232 passed, 0 failed, 3 ignored.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`: one
+  error, `too_many_lines` (103/100) on 4b's test
+  `a_board_saved_with_a_typed_filter_renders_publicly_with_it_applied`, grown by
+  the tile-slot tuple in its call. Fixed with an `allow` and a reason; clippy
+  NOT re-run after the fix.
+- NOT run (disk fell to 8.4 GB, under the 9 GB floor): `embed_tokens`,
+  `route_auth`, `sec11_guard`, `public_links` integration files, and the clippy
+  re-run.
+
 ## 8. Review (planner appends)

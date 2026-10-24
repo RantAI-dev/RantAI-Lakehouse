@@ -1355,6 +1355,12 @@ mod typed_filters {
     }
 
     #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one fixture board and its assertions in a single scenario; \
+                  it was 100 lines on BI-26's branch and the BI-4 tile-slot \
+                  tuple in its call took it to 103"
+    )]
     async fn a_board_saved_with_a_typed_filter_renders_publicly_with_it_applied() {
         let server = MockServer::start().await;
         let spec = json!({
