@@ -848,7 +848,7 @@ mod tests {
             ],
         );
         assert_eq!(objects[0].primary_key, ["y", "x"]);
-        assert!(objects[1].primary_key.is_empty());
+        assert_eq!(objects[1].primary_key, [] as [std::string::String; 0]);
     }
 
     #[sqlx::test(migrations = "../../migrations")]
@@ -873,6 +873,6 @@ mod tests {
             "key order, not column order"
         );
         let unkeyed = objects.iter().find(|o| o.name == "public.unkeyed").unwrap();
-        assert!(unkeyed.primary_key.is_empty());
+        assert_eq!(unkeyed.primary_key, [] as [std::string::String; 0]);
     }
 }

@@ -198,16 +198,19 @@ cargo deny check licenses
 
 ### Rust toolchain / MSRV
 
-The workspace declares `rust-version = "1.88"` in `rust/Cargo.toml` — that's
-the real floor this code has been verified to compile on (`Cargo.lock`
-pulls in `time@0.3.55`, which needs rustc >= 1.88, plus
-`testcontainers`/`etcetera`/`ferroid` transitively pushing past the raw
-edition-2024 minimum of `1.85`; see `rust/Cargo.toml`'s comment and
-`docs/CI.md` for how that was verified). `rust/rust-toolchain.toml` pins
-the toolchain actually used for local dev/CI (currently `1.96.1`, newer
-than the MSRV floor) so contributors and CI build with the same compiler;
-`rustup` will fetch it automatically the first time you run `cargo` inside
-`rust/`.
+`rust/Cargo.toml`'s `rust-version` is `1.99` and equals the
+`rust/rust-toolchain.toml` pin (`channel = "1.99.1"`): since REL-9
+(product-owner decision D1, 2026-10-17) the minimum the workspace promises
+is the latest stable — `sqlx` 0.9, which `SEC-41` needs, requires rustc
+1.94, so a held-over lower promise could not be kept — rather than a
+dependency's floor. `rustup` fetches the pinned toolchain automatically on
+the first `cargo` run inside `rust/`, so contributors and CI build with
+one compiler. The CI `msrv` job proves the floor one patch below the pin
+by running `cargo +1.99.0 check --workspace --all-targets --locked` in
+`rust/`; the `+` is load-bearing because the `rust-toolchain.toml` pin
+would otherwise override the toolchain that job installs (rustup
+precedence) and rebuild the job on the pin instead of the floor. See
+`docs/CI.md`.
 
 ## Configuration
 

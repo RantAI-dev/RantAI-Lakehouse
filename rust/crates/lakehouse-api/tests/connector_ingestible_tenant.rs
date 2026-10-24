@@ -182,5 +182,5 @@ async fn an_x_tenant_the_caller_is_not_in_is_not_found() {
     let bayu = session_cookie_for_seeded_user(&app.pool, "bayu@meridian.example").await;
     let (status, ids) = ingestible(&app, ("cookie", &bayu), Some(RETAIL)).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
-    assert!(ids.is_empty());
+    assert_eq!(ids, [] as [std::string::String; 0]);
 }

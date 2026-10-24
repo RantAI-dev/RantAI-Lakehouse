@@ -704,7 +704,7 @@ async fn authenticate_with_nonce_accepts_a_token_whose_nonce_claim_matches(
     // This fixture's `OidcConfig` carries no `role_map`
     // (`authenticator`'s own construction), so there is nothing to map —
     // `mapped_role_names` must be empty, not fabricated.
-    assert!(login.mapped_role_names.is_empty());
+    assert_eq!(login.mapped_role_names, [] as [std::string::String; 0]);
     // An ordinary token carries the groups claim (or none at all), so no
     // overage caveat applies (`SEC-39`).
     assert!(login.notice.is_none());

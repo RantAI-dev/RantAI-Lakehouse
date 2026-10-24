@@ -594,7 +594,7 @@ mod tests {
         assert_eq!(summary.status, "success");
         assert_eq!(summary.copies_kept, Some(7));
         assert!(summary.oldest_kept_exported_at.is_some());
-        assert!(!summary.finished_at.is_empty());
+        assert_ne!(summary.finished_at, "");
         assert_eq!(summary.reason, None);
     }
 

@@ -509,6 +509,16 @@ fn history_of(messages: &[IncomingMessage]) -> Vec<LlmMessage> {
 
 /// Validates the body and assembles the system prompt, history and the tool
 /// list for this principal and mode. A bad body is a ready 400 response.
+///
+/// Clippy 1.98 taught `result_large_err` to look at `async fn`s
+/// (rust-clippy#17130), which surfaced this signature: the `Err` is a ready
+/// `Response` the handler returns verbatim. Boxing it would change that
+/// contract and every call site for an allocation only on the error path,
+/// so the signature stays (REL-9, decision D2).
+#[allow(
+    clippy::result_large_err,
+    reason = "the Err is a ready Response the handler returns verbatim; boxing it would change this contract and every call site, for no gain on the success path"
+)]
 async fn prepare_chat(
     state: &AppState,
     principal: Option<&Principal>,

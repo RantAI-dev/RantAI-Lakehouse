@@ -1846,12 +1846,12 @@ mod tests {
                 .collect()
         };
         // 59 minutes on: neither. An hour on: the hourly one only. A day on: both.
-        assert!(ids("2026-10-01T09:59:59Z").is_empty());
+        assert_eq!(ids("2026-10-01T09:59:59Z"), [] as [std::string::String; 0]);
         assert_eq!(ids("2026-10-01T10:00:00Z"), vec!["hourly"]);
         assert_eq!(ids("2026-10-02T08:59:59Z"), vec!["hourly"]);
         assert_eq!(ids("2026-10-02T09:00:00Z"), vec!["daily", "hourly"]);
         // A clock that cannot be read runs nothing rather than everything.
-        assert!(ids("not a time").is_empty());
+        assert_eq!(ids("not a time"), [] as [std::string::String; 0]);
     }
 
     /// Longest-waiting first, across tables with different intervals.

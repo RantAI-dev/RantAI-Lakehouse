@@ -1730,7 +1730,7 @@ mod tests {
         assert_eq!(run_sql.usage_count_30d, 0);
         assert_eq!(run_sql.risk, "Read");
         assert_eq!(run_sql.permission, "query:read");
-        assert!(!run_sql.description.is_empty());
+        assert_ne!(run_sql.description, "");
     }
 
     #[test]

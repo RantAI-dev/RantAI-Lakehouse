@@ -1153,13 +1153,12 @@ mod tests {
             charts_using_metric(&charts, (SourceKind::Mart, "mart_x"), (&fields, &c), name)
         };
         assert_eq!(used("total"), vec!["bare", "marked"]);
-        assert!(used("v2").is_empty());
+        assert!(used("v2").is_empty(), "{:?}", used("v2"));
         // A metric that has a column's name never claims the column's users.
         let clash = catalog_entries(&[metric("v", "Sum(w)", vec![])], &[]);
-        assert!(
-            charts_using_metric(&charts, (SourceKind::Mart, "mart_x"), (&clash, &c), "v")
-                .is_empty()
-        );
+        let column_users =
+            charts_using_metric(&charts, (SourceKind::Mart, "mart_x"), (&clash, &c), "v");
+        assert!(column_users.is_empty(), "{column_users:?}");
     }
 
     #[test]

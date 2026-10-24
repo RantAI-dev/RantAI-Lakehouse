@@ -119,7 +119,7 @@ async fn get_definition_reports_absent_optional_fields_honestly(pool: PgPool) ->
         .expect("definition should exist");
 
     assert_eq!(definition.incremental_column, None);
-    assert!(definition.transforms.is_empty());
+    assert_eq!(definition.transforms, [] as [std::string::String; 0]);
     assert!(!definition.fbic_enabled);
     Ok(())
 }

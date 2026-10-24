@@ -2932,6 +2932,14 @@ pub async fn run_finished_event(
 /// not loaded (marked ready while it was down, say) gets one reload; if
 /// the job is still missing, 409 says so rather than a launch error that
 /// reads like a bad job name.
+// `result_large_err` now reports `async fn`s too (clippy 1.98,
+// rust-clippy#17130). The `Err` here is a ready `Response` the route returns
+// verbatim, so boxing it would change this helper's contract and every call
+// site for an allocation only on the error path (REL-9, decision D2).
+#[allow(
+    clippy::result_large_err,
+    reason = "the Err is a ready Response the route returns verbatim; boxing it would change every call site for no gain on the success path"
+)]
 async fn authored_launch_target(state: &AppState, id: &str) -> Result<String, Response> {
     let pool = pool(state).map_err(|err| ApiRejection(err).into_response())?;
     let pipeline = pipelines::get_pipeline(pool, id)
@@ -3852,6 +3860,12 @@ fn schedule_mutation_body(job: &DgJob, paused: bool) -> Value {
 /// `pipeline_run_pipeline_name` surfaces as 503 with the FIXED body
 /// `{"error": "orchestrator error"}` and the detail only to `tracing`
 /// (PR #80 review BLOCKER 1, AGENTS.md principle 4).
+// Same reason as `authored_launch_target` above: the `Err` is the ready
+// rejection the caller returns, not a value it inspects (REL-9, D2).
+#[allow(
+    clippy::result_large_err,
+    reason = "the Err is a ready Response the route returns verbatim; boxing it would change every call site for no gain on the success path"
+)]
 async fn enforce_run_id_pipeline_scope(
     state: &AppState,
     principal: &Principal,
@@ -5460,7 +5474,10 @@ mod tests {
                 "dispar_orchestrate/maintenance.py::run_bronze_maintenance"
             );
             assert_eq!(ops[0]["commit"], "unknown");
-            assert!(v["config"].as_array().expect("config array").is_empty());
+            assert_eq!(
+                v["config"].as_array().expect("config array").as_slice(),
+                &[] as &[serde_json::Value]
+            );
             assert!(v["definition"].is_null());
         }
 
@@ -6549,7 +6566,10 @@ mod tests {
             // "failed", never the raw Dagster string.
             assert_eq!(steps[0]["status"], "failed");
             assert!(steps[0]["startMs"].is_number());
-            assert!(steps[0]["materializations"].as_array().unwrap().is_empty());
+            assert_eq!(
+                steps[0]["materializations"].as_array().unwrap().as_slice(),
+                &[] as &[serde_json::Value]
+            );
         }
 
         #[tokio::test]
@@ -9274,9 +9294,12 @@ mod tests {
         /// the caller sent a non-object (or no body at all).
         #[test]
         fn top_level_keys_for_non_objects_is_empty() {
-            assert!(top_level_keys(&Value::Null).is_empty());
-            assert!(top_level_keys(&json!([])).is_empty());
-            assert!(top_level_keys(&json!("string")).is_empty());
+            assert_eq!(top_level_keys(&Value::Null), [] as [std::string::String; 0]);
+            assert_eq!(top_level_keys(&json!([])), [] as [std::string::String; 0]);
+            assert_eq!(
+                top_level_keys(&json!("string")),
+                [] as [std::string::String; 0]
+            );
         }
     }
 

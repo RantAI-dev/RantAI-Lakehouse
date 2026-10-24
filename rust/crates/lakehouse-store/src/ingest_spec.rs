@@ -3598,7 +3598,8 @@ mod target_identity_tests {
             validate_excluded_columns(&sql_dial_of("oracle"), &objects),
             Ok(())
         );
-        assert!(inactive_exclusions(&objects).is_empty());
+        let inactive = inactive_exclusions(&objects);
+        assert!(inactive.is_empty(), "{inactive:?}");
     }
 
     /// `SRC-11` D11: a key column of a deduplicating or history table and the

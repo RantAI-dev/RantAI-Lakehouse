@@ -2575,8 +2575,10 @@ mod tests {
         let before = serde_json::json!([{"name": "a.t"}, {"name": "b.t"}, {"nope": 1}]);
         let after = serde_json::json!([{"name": "b.t"}, {"name": "c.t"}]);
         assert_eq!(super::removed_object_names(&before, &after), ["a.t"]);
-        assert!(super::removed_object_names(&before, &before).is_empty());
-        assert!(super::removed_object_names(&serde_json::Value::Null, &after).is_empty());
+        let unchanged = super::removed_object_names(&before, &before);
+        assert!(unchanged.is_empty(), "{unchanged:?}");
+        let from_null = super::removed_object_names(&serde_json::Value::Null, &after);
+        assert!(from_null.is_empty(), "{from_null:?}");
     }
 
     #[test]
