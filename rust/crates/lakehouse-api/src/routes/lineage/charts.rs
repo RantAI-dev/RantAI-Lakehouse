@@ -688,7 +688,7 @@ mod tests {
         let reads = reads_of(&def(&json!({})), &[]);
         assert_eq!(reads.marts.iter().collect::<Vec<_>>(), ["mart_visits"]);
         let joined = def(
-            &json!({ "joins": [{ "mart": "serving.mart_rooms", "type": "left", "on": [{ "left": "province", "right": "province" }] }] }),
+            &json!({ "joins": [{ "mart": "serving.mart_rooms", "type": "left", "on": [{ "left": "province", "op": "=", "right": "province" }] }] }),
         );
         assert_eq!(reads_of(&joined, &[]).marts.len(), 2);
         let from_source = def(&json!({ "mart": "", "sqlSource": "s_1" }));
