@@ -2795,8 +2795,10 @@ async fn run_records(
         )
         .await
         .map_err(|err| {
+            // BI-16 C3 review S6: the English `RegionOf` sentence, not the
+            // fixed one, when the refused statement does a region lookup.
             ApiError::Unprocessable(
-                crate::policy_engine::enforcement_error_message(&err).to_owned(),
+                crate::routes::support::enforcement_message_for(&statement, &err).to_owned(),
             )
         })
     };
@@ -3808,7 +3810,10 @@ async fn values_for_roles(
     )
     .await
     .map_err(|err| {
-        ApiError::Unprocessable(crate::policy_engine::enforcement_error_message(&err).to_owned())
+        // BI-16 C3 review S6 (as in `run_records`).
+        ApiError::Unprocessable(
+            crate::routes::support::enforcement_message_for(&sql, &err).to_owned(),
+        )
     })?;
     let rows = ch
         .rows(&rewritten, None)
