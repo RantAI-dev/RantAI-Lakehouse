@@ -235,4 +235,33 @@ the webpack build. No dependency change planned.
 
 ## 7. Handoff (developer appends)
 
+### BI-26 T1 to T4 (T5 and T7 not done, T6 skipped), branch `feat/bi-phase-4b`
+
+**Skipped on purpose.** T6 (the assistant, AI-11 embed half) touches
+`routes/ai/registry.rs`, `gate.rs`, `prompt.rs` and `mod.rs`, which the AI team
+is working in; it is coordinated with them later. Nothing in `routes/ai/` or
+`capabilities.ts` was touched.
+
+**Migrations: none.** Filter modes are a `filter_modes` event in
+`console.bi_board_embed_event`, with the JSON object kept in the existing
+`origins_json` text column (no new column, no Postgres table).
+
+**Commits.**
+- T1 `028c23ac` chart tokens. Verified: `lakehouse-embed` lib 23, `embed_tokens` 25, `sec11_guard` 4, `lakehouse-api` lib filter `embed` 14, clippy on `lakehouse-embed` and `lakehouse-api` clean.
+- T2 `8fb7aff4` filter modes and their resolution. Verified: `lakehouse-bi` lib filter `embed_access store::tests` 110, `embed_tokens` 30, clippy on `lakehouse-bi` and `lakehouse-api` clean.
+- T3 (commit "BI-26 T3 ... NOT VERIFIED") values route, settings route, sample token. **Not verified: nothing has run on this commit.** The tests are written (`embed_tokens` values, settings and sample token tests; `route_auth` `the_embed_values_and_settings_routes_are_gated_in_both_directions`; the policy count test is now 11, renamed `exactly_eleven_public_entries_exist`). The run was stopped when disk fell to 8.8 GB (floor 10 GB).
+- T4 `0383ed18` the embed look, editable filters and height messages (console). Verified: `bun test src/features/dashboards src/lib src/features/admin src/services` 1472 pass; typecheck clean; lint 0 errors. Webpack build not run.
+
+**Anchors.** Re-verified by symbol; all found: `EmbedResource`, `verify_embed`, `routes/embed.rs` `data`, `frame_origins`, `revoke_token`, `render_board_payload`, `board_body`, `params_to_filters`, `console.bi_board_embed_event`, `embed_access_from_aggregate_rows`, `values_for_roles`, `filter_fields`, `embed_info_body`. Section 5: the dashboard page sends filters as a JSON array of `FilterDef` (camelCase); D4 takes the same shape. #201's event table is in this branch.
+
+**Deviations and decisions to confirm.**
+- Filter modes are stored in `origins_json` (see above).
+- A chart token has no editable filters and gets no values route (403): its payload is that chart alone, and the dropdown reads the whole dashboard's relations. Plan silent on this.
+- An editable filter must be one of the board's saved filters (`board.filters`). The dashboard drops a filter that filters nothing when saved, so a filter with no saved value cannot be made editable.
+- The dropdown is single-choice (`in` with one value, or All) for any column kind; date and number ranges are not offered.
+- Single-chart embeds fill the frame and send no height messages; only the whole dashboard does.
+- `lakehouse_bi` `ValuesQuery` got a `for_board` constructor and `values_with_limit` (the dashboard's 200 stays; the embed's is 1,000).
+
+**Not done.** T5 (Share dialog), T7 (CHANGELOG), the final checks the coordinator listed (workspace clippy, `public_links`, full TS lint of T5), and a browser check of AC1 to AC7.
+
 ## 8. Review (planner appends)
