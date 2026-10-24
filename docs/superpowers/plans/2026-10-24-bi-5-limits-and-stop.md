@@ -206,4 +206,32 @@ lint, tests of the files touched; the webpack build after T6.
 
 ## 7. Handoff (developer appends)
 
+### T6 Console (developer, branch `feat/bi-phase-5`; Rust T1 to T5 and T7 not built)
+
+Commit: `bef364f4` BI-5 feat(console): query limits settings, Stop, and limit messages on tiles (T6). TypeScript only; no cargo command run, no Rust change.
+
+Built (feature decisions 1, 2, 4, 5; plan D1, D5, D6): Admin > Settings > Query limits (`features/admin/query-limits-settings.tsx`, rendered under the reporting settings in `app/(admin)/admin/settings/page.tsx`); `X-Run-Id` and `queryService.cancel(runId)` in contract and client; Stop in Query Studio (`use-query-studio.ts` `stopRun`: cancel best effort, then abort; Trino is only aborted and the button's title says so) and a Stop button on a loading dashboard (`dashboard-page.tsx`, "Stopped" sentence, tiles on screen kept); tile sentences for time and rows (`lib/query-limits.ts`, `tile-body.tsx`); the SQL source sheet and panel print the effective limits from the setting, and no number when they cannot be read (`hooks/use-effective-limits.ts`).
+
+**Not on the server yet (the console calls or reads each of these):**
+- `GET /api/settings/limits` and `PUT /api/settings/limits` (T1). Until then the settings section shows its read error with Retry, and the SQL source texts print no number.
+- `POST /api/query/cancel { runId }` answering `{ stopped: n }` (T4). Until then Stop calls it, gets a 404 that is swallowed, and aborts the request, so the query keeps running on the engine. The Stop tooltip on ClickHouse says "Ends the query on the engine" and is only true once T4 lands.
+- The `X-Run-Id` request header on `/api/query/run` and `/api/dashboard` (D5); the server ignores it today.
+- `limit` on a failed tile and a row-cut marker on a tile result (D6, T2); no tile carries either today, so the new sentences are never shown against this server.
+
+**Shapes I had to choose (the plan names fields but not the JSON; T1/T2 must return exactly these or the console changes):**
+- `GET`: `{ install: { timeoutSeconds, chartRows, mapPoints, studioRows }, roles: [{ roleId, timeoutSeconds }], effective: { timeoutSeconds, chartRows, mapPoints, studioRows, source } }`, with `source` = `{ kind: "install" }` or `{ kind: "role", name }` (D2's `Install | Role(name)`). `PUT` body: `{ install, roles }` (a role not listed has no limit of its own); answers the same shape as `GET`.
+- Failed tile (D6): `{ error, errorId?, limit: { kind: "time", value: seconds, source } }`.
+- Cut tile: D6 says "a tile result carries `limit`", but a raw table's result already has a numeric `limit` (its page size, `Rows.limit`). The console reads the row-cut object as `limitHit: { kind: "rows", value, source }` on the result. T2 must use that name or the plan must choose another; this is a plan conflict, not a decision of mine.
+- Ranges and defaults are in `lib/query-limits.ts` from the feature page (time 10 to 1,800 s, default 60; chart rows 100 to 100,000, default 2,000; map points 100 to 50,000, default 5,000; Query Studio rows 100 to 100,000, default 2,000). The form only says the range; the server has the last word.
+
+Left out: the tile message for "the running query was stopped on the engine" (QUERY_WAS_CANCELLED) other than the page-level "Stopped": the plan gives no per-tile shape for it. Trino's Stop has no component test (the engine select is not driven in the page test); the rule is one condition in `stopRun`. The assistant tools (T5) and the measurement (T7) are not part of this handoff.
+
+Checks (from `/home/hv/lakehouse-phase5-build`):
+- `bun run typecheck`: exit 0.
+- `bun run lint`: 0 errors, 9 warnings, none in a file of this commit.
+- `bun test` of the new and touched files: `src/lib/query-limits.test.ts` and `src/features/admin/query-limits-settings.test.tsx` 12 pass; `src/services/clients/queries.test.ts`, `src/features/queries/query-studio-stop.test.tsx`, `src/features/dashboards/tile-limits.test.tsx` 28 pass; `src/features/dashboards/dashboard-stop.test.tsx` 1 pass; all 0 fail.
+- `bun run test`: 2455 pass, 1 skip, 0 fail (255 files).
+- Not verified: the webpack build (plan asks for it after T6); any of this in a real browser or against a server that has the routes; the settings page layout (two sections stacked in one page).
+
+
 ## 8. Review (planner appends)
