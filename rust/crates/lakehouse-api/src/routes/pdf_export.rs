@@ -31,7 +31,7 @@ use crate::pdf::{Orientation, Paper, PdfError, convert_url};
 use crate::routes::dashboard::{
     classify_dashboard_ch_error, file_slug, pdf_supported, record_download_audit,
 };
-use crate::routes::dashboard_organise::viewer_of;
+use crate::routes::dashboard_access::viewer_for;
 use crate::state::AppState;
 use crate::upstream_error::{self, Context, FailedAs};
 
@@ -212,6 +212,10 @@ pub async fn export_pdf(
     Extension(principal): Extension<Principal>,
     Query(q): Query<PdfQuery>,
 ) -> ApiResult<Response> {
+    // BI-19 part B1 (plan D8): the router floor is "signed in", so the entry
+    // check comes first and a caller with neither `dashboard:read` nor a rule
+    // is refused before anything else is looked at.
+    let viewer = viewer_for(&state, &principal).await?;
     // BI-1 review fix (SHOULD-FIX) R3: the print view reads as a person (their
     // roles, their masks), and a service identity is not one; refuse it here,
     // in a sentence, instead of printing a page that cannot load.
@@ -247,11 +251,17 @@ pub async fn export_pdf(
     // The board must be one this person can see (a trashed board and another
     // person's personal board read as missing). The built-in board has no row
     // until someone saves it.
-    let viewer = viewer_of(&principal);
+    // Through the caller's rules (resolved above), and the built-in board only
+    // for somebody with a starting point.
     let board = store::get_board(&state.clickhouse, board_id, &viewer)
         .await
         .map_err(|err| classify_dashboard_ch_error(&err))?;
-    if board.is_none() && board_id != store::DEFAULT_BOARD_ID {
+    let missing = if board_id == store::DEFAULT_BOARD_ID {
+        !viewer.sees_builtin()
+    } else {
+        board.is_none()
+    };
+    if missing {
         return Err(ApiError::NotFound("this dashboard does not exist".to_owned()).into());
     }
     let name = board.as_ref().map_or("Main", |b| b.name.as_str());

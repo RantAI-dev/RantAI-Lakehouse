@@ -69,7 +69,7 @@ use crate::routes::dashboard::{
     ChartExportQuery, DashboardQuery, build_chart_file, export_file_name, payload_for,
     record_download_audit,
 };
-use crate::routes::dashboard_organise::viewer_of;
+use crate::routes::dashboard_access::viewer_for;
 use crate::routes::pdf_export::{DashboardValues, PdfFailure, PdfJob, make_pdf};
 use crate::state::AppState;
 
@@ -420,10 +420,20 @@ async fn build_and_send(
     {
         return Err(stop(OWNER_NO_ACCESS));
     }
-    let board = store::get_board(&state.clickhouse, &sub.board, &viewer_of(&owner))
+    // BI-19 part B1: the owner's rules decide, not only their starting point:
+    // a report is never sent from a dashboard its owner can no longer see.
+    let viewer = viewer_for(state, &owner)
         .await
         .map_err(|_| stop(DASHBOARD_UNREADABLE))?;
-    if board.is_none() && sub.board != store::DEFAULT_BOARD_ID {
+    let board = store::get_board(&state.clickhouse, &sub.board, &viewer)
+        .await
+        .map_err(|_| stop(DASHBOARD_UNREADABLE))?;
+    let gone = if sub.board == store::DEFAULT_BOARD_ID {
+        !viewer.sees_builtin()
+    } else {
+        board.is_none()
+    };
+    if gone {
         return Err(stop(BOARD_GONE));
     }
     let board_name = board

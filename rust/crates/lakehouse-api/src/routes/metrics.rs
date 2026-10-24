@@ -43,6 +43,7 @@ use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::policy_engine::PolicyEngineObligations;
 use crate::routes::calc_fields::{Resolved, author_name, resolve};
+use crate::routes::dashboard_access::require_entitled;
 use crate::state::AppState;
 use crate::upstream_error;
 
@@ -341,6 +342,20 @@ async fn source_reads(ch: &ChClient, shown: &[MetricDef]) -> Vec<SourceRead> {
         read.push((key, (fields, cols)));
     }
     read
+}
+
+/// The route's handler: [`list`] behind the entry check of `BI-19` part B1
+/// (plan D8). The router floor is "signed in"; this refuses somebody who holds
+/// neither `dashboard:read` nor a rule naming them or one of their roles. Kept
+/// apart from [`list`] because the assistant calls that one directly, after
+/// its own gate.
+pub async fn list_guarded(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    query: Query<ListQuery>,
+) -> ApiResult<ApiJson<Value>> {
+    require_entitled(&state, &principal).await?;
+    list(State(state), Some(Extension(principal)), query).await
 }
 
 /// `GET /api/dashboard/metrics[?mart=|source=]` — the metrics, each with the
@@ -720,6 +735,20 @@ pub(crate) async fn value_query(
 }
 
 // ── segments ────────────────────────────────────────────────────────────
+
+/// The route's handler: [`list_segments`] behind the entry check of `BI-19` part B1
+/// (plan D8). The router floor is "signed in"; this refuses somebody who holds
+/// neither `dashboard:read` nor a rule naming them or one of their roles. Kept
+/// apart from [`list_segments`] because the assistant calls that one directly, after
+/// its own gate.
+pub async fn list_segments_guarded(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    query: Query<ListQuery>,
+) -> ApiResult<ApiJson<Value>> {
+    require_entitled(&state, &principal).await?;
+    list_segments(State(state), query).await
+}
 
 /// `GET /api/dashboard/segments[?mart=|source=]` — the segments.
 ///

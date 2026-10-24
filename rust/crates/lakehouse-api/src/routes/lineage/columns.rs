@@ -515,10 +515,14 @@ pub(crate) async fn read(
                 .collect();
             // A chart may read the starting column itself.
             reached.insert((table, column.to_owned()));
-            let viewer = crate::routes::dashboard_organise::viewer_of(principal);
-            match dependent_charts(state, &reached, &viewer).await {
-                Ok(charts) => body["charts"] = Value::Array(charts),
-                Err(()) => body["chartsUnavailable"] = Value::Bool(true),
+            // BI-19 part B1: through the caller's rules; if they cannot be
+            // read the charts are reported unavailable, never unfiltered.
+            match crate::routes::dashboard_access::viewer_for(state, principal).await {
+                Ok(viewer) => match dependent_charts(state, &reached, &viewer).await {
+                    Ok(charts) => body["charts"] = Value::Array(charts),
+                    Err(()) => body["chartsUnavailable"] = Value::Bool(true),
+                },
+                Err(_unreadable) => body["chartsUnavailable"] = Value::Bool(true),
             }
         } else {
             body["chartsHidden"] = Value::Bool(true);

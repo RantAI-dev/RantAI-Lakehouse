@@ -1345,6 +1345,38 @@ pub async fn board_row_state(ch: &ChClient, id: &str) -> Result<Option<(u8, Stri
     }))
 }
 
+/// Where every dashboard sits, the trash included (removed-for-good rows are
+/// left out): the input [`crate::access::AccessMap::viewer`] needs to turn
+/// rules on folders and dashboards into the ids a [`Viewer`] is limited by.
+/// The built-in board is not in it. Read as the server, never from a request.
+///
+/// # Errors
+///
+/// Returns [`ChError`] on a `ClickHouse` failure.
+pub async fn board_placements(
+    ch: &ChClient,
+) -> Result<Vec<crate::access::BoardPlacement>, ChError> {
+    ensure_bi_table(ch).await?;
+    let rows = ch
+        .rows(
+            &format!(
+                "SELECT id, folder_id, owner_id FROM console.bi_board FINAL \
+                 WHERE is_deleted != 1 AND id != {}",
+                SqlLiteral::from(DEFAULT_BOARD_ID)
+            ),
+            None,
+        )
+        .await?;
+    Ok(rows
+        .iter()
+        .map(|r| crate::access::BoardPlacement {
+            id: row_str(r, "id").to_owned(),
+            folder_id: row_str(r, "folder_id").to_owned(),
+            owner_id: row_str(r, "owner_id").to_owned(),
+        })
+        .collect())
+}
+
 /// The same for a chart id: its latest row's `is_deleted` and the board it is
 /// on. `None` when the id never had a row.
 ///

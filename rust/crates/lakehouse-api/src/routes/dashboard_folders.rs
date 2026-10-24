@@ -175,7 +175,10 @@ pub async fn list(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
 ) -> ApiResult<ApiJson<Value>> {
-    let all = folders::list_folders(&state.clickhouse, &viewer_of(&principal))
+    // BI-19 part B1 (plan D8): the folders the caller's rules and starting
+    // point leave them; the router floor is "signed in".
+    let viewer = crate::routes::dashboard_access::viewer_for(&state, &principal).await?;
+    let all = folders::list_folders(&state.clickhouse, &viewer)
         .await
         .map_err(|err| classify_ch_error(&err))?;
     Ok(ApiJson(json!({ "folders": all })))

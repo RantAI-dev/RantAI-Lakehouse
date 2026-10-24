@@ -2242,7 +2242,9 @@ async fn the_table_export_needs_dashboard_read_and_not_query_read() {
             .iter()
             .find(|(m, p, _)| *m == "GET" && *p == "/api/dashboard/table-export")
             .map(|(_, _, policy)| *policy),
-        Some(Policy::RequiresPermission("dashboard:read"))
+        // BI-19 part B1 (plan D8): "signed in" at the router, `dashboard:read`
+        // or a rule in the handler (see `the_moved_dashboard_reads_are_refused_without_a_rule_and_pass_with_one`).
+        Some(Policy::RequiresAuth)
     );
     let viewer = common::create_principal_with_permissions(&pool, "dashboard:read").await;
     let cookie = common::session_cookie_for_user(&pool, viewer).await;
@@ -2280,7 +2282,9 @@ async fn the_chart_export_needs_dashboard_read_and_not_query_read() {
             .iter()
             .find(|(m, p, _)| *m == "GET" && *p == "/api/dashboard/chart-export")
             .map(|(_, _, policy)| *policy),
-        Some(Policy::RequiresPermission("dashboard:read"))
+        // BI-19 part B1 (plan D8): "signed in" at the router, `dashboard:read`
+        // or a rule in the handler (see `the_moved_dashboard_reads_are_refused_without_a_rule_and_pass_with_one`).
+        Some(Policy::RequiresAuth)
     );
     let uri = "/api/dashboard/chart-export?chart=x&format=xlsx";
     let viewer = common::create_principal_with_permissions(&pool, "dashboard:read").await;
@@ -2391,7 +2395,12 @@ async fn hierarchies_are_read_with_dashboard_read_and_defined_with_dashboard_wri
                 .iter()
                 .find(|(m, p, _)| *m == method && *p == "/api/dashboard/hierarchies")
                 .map(|(_, _, policy)| *policy),
-            Some(Policy::RequiresPermission(needs)),
+            // BI-19 part B1: the read is "signed in" plus the handler's entry check.
+            Some(if needs == "dashboard:read" {
+                Policy::RequiresAuth
+            } else {
+                Policy::RequiresPermission(needs)
+            }),
             "{method}"
         );
         let allowed = if needs == "dashboard:read" {
@@ -2449,7 +2458,12 @@ async fn history_trash_personal_space_favourites_and_search_have_the_right_permi
                 .iter()
                 .find(|(m, p, _)| *m == method && *p == path)
                 .map(|(_, _, policy)| *policy),
-            Some(Policy::RequiresPermission(needs)),
+            // BI-19 part B1: the reads are "signed in" plus the handler's entry check.
+            Some(if needs == "dashboard:read" {
+                Policy::RequiresAuth
+            } else {
+                Policy::RequiresPermission(needs)
+            }),
             "{method} {path}"
         );
         let (allowed, other) = if needs == "dashboard:read" {
@@ -2480,6 +2494,90 @@ async fn history_trash_personal_space_favourites_and_search_have_the_right_permi
     }
 }
 
+/// BI-19 part B1 (plan D8): the reads a person needs to see a dashboard are
+/// `RequiresAuth` at the router and refuse in the handler. Asserted both ways
+/// for every moved row: a principal with no `dashboard:read` and no rule is
+/// refused with 403 (as before the floor moved), one holding only
+/// `dashboard:write` is refused too (it was never a way to read), and one with
+/// no permission at all but a rule on one dashboard gets past the guard (what
+/// follows is the unreachable `ClickHouse` of this harness, never 401/403).
+#[tokio::test]
+async fn the_moved_dashboard_reads_are_refused_without_a_rule_and_pass_with_one() {
+    let TestApp { router, pool } = spin_up().await;
+    let moved: [(&str, &str); 20] = [
+        ("GET", "/api/dashboard"),
+        ("GET", "/api/dashboard/boards"),
+        ("GET", "/api/dashboard/folders"),
+        ("GET", "/api/dashboard/versions?board=b1"),
+        ("GET", "/api/dashboard/shortcuts"),
+        ("PUT", "/api/dashboard/favourites"),
+        ("POST", "/api/dashboard/recent"),
+        ("GET", "/api/dashboard/search?q=a"),
+        ("GET", "/api/dashboard/records?mart=m"),
+        ("GET", "/api/dashboard/values?mart=m&column=c"),
+        ("GET", "/api/dashboard/export"),
+        ("GET", "/api/dashboard/table-export?chart=x"),
+        ("GET", "/api/dashboard/chart-export?chart=x&format=xlsx"),
+        ("GET", "/api/dashboard/export/pdf?board=b1"),
+        ("GET", "/api/dashboard/fields"),
+        ("GET", "/api/dashboard/metrics"),
+        ("GET", "/api/dashboard/segments"),
+        ("GET", "/api/dashboard/params"),
+        ("GET", "/api/dashboard/calc-fields?mart=m"),
+        ("GET", "/api/dashboard/hierarchies?mart=m"),
+    ];
+    let nothing = common::create_principal_with_permissions(&pool, "query:read").await;
+    let writer = common::create_principal_with_permissions(&pool, "dashboard:write").await;
+    let ruled = common::create_principal_with_permissions(&pool, "query:read").await;
+    lakehouse_store::dashboard_access::replace_item(
+        &pool,
+        "board",
+        "b1",
+        &[lakehouse_store::dashboard_access::NewRule {
+            user_id: Some(ruled),
+            role_id: None,
+            level: "view".to_owned(),
+        }],
+        false,
+        None,
+    )
+    .await
+    .expect("give the principal view on one dashboard");
+    for (method, uri) in moved {
+        let path = uri.split('?').next().unwrap_or(uri);
+        assert_eq!(
+            POLICY_TABLE
+                .iter()
+                .find(|(m, p, _)| *m == method && *p == path)
+                .map(|(_, _, policy)| *policy),
+            Some(Policy::RequiresAuth),
+            "{method} {path}"
+        );
+        let anonymous = request_with_cookie(&router, method, uri, "").await;
+        assert_eq!(
+            anonymous.status(),
+            StatusCode::UNAUTHORIZED,
+            "{method} {uri}"
+        );
+        for who in [nothing, writer] {
+            let cookie = common::session_cookie_for_user(&pool, who).await;
+            let resp = request_with_cookie(&router, method, uri, &cookie).await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "{method} {uri}: no dashboard:read and no rule"
+            );
+        }
+        let cookie = common::session_cookie_for_user(&pool, ruled).await;
+        let resp = request_with_cookie(&router, method, uri, &cookie).await;
+        assert!(
+            resp.status() != StatusCode::UNAUTHORIZED && resp.status() != StatusCode::FORBIDDEN,
+            "{method} {uri}: a rule must get past the guard, got {}",
+            resp.status()
+        );
+    }
+}
+
 /// BI-11: parameters are read with `dashboard:read` and defined, changed and
 /// deleted with `dashboard:write`. Asserted both ways for every method: a
 /// reader gets past the gate on `GET` and is refused on the writes, a writer
@@ -2505,7 +2603,12 @@ async fn parameters_are_read_with_dashboard_read_and_defined_with_dashboard_writ
                 .iter()
                 .find(|(m, p, _)| *m == method && *p == "/api/dashboard/params")
                 .map(|(_, _, policy)| *policy),
-            Some(Policy::RequiresPermission(needs)),
+            // BI-19 part B1: the read is "signed in" plus the handler's entry check.
+            Some(if needs == "dashboard:read" {
+                Policy::RequiresAuth
+            } else {
+                Policy::RequiresPermission(needs)
+            }),
             "{method}"
         );
         let allowed = if needs == "dashboard:read" {
@@ -2557,7 +2660,9 @@ async fn the_pdf_export_needs_dashboard_read_and_not_query_read() {
             .iter()
             .find(|(m, p, _)| *m == "GET" && *p == "/api/dashboard/export/pdf")
             .map(|(_, _, policy)| *policy),
-        Some(Policy::RequiresPermission("dashboard:read"))
+        // BI-19 part B1 (plan D8): "signed in" at the router, `dashboard:read`
+        // or a rule in the handler (see `the_moved_dashboard_reads_are_refused_without_a_rule_and_pass_with_one`).
+        Some(Policy::RequiresAuth)
     );
     let uri = "/api/dashboard/export/pdf?board=x";
     let viewer = common::create_principal_with_permissions(&pool, "dashboard:read").await;

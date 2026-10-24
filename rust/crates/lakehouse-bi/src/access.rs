@@ -268,6 +268,14 @@ impl Viewer {
         self.sees(owner) && (self.all || self.boards.allows(id))
     }
 
+    /// Whether the built-in dashboard (and the built-in tiles on `board=all`)
+    /// is shown. It has no rule of its own, so it belongs to the starting
+    /// point: somebody who sees only what they were given does not see it.
+    #[must_use]
+    pub fn sees_builtin(&self) -> bool {
+        self.all || !matches!(self.boards, Scope::Only(_))
+    }
+
     /// Whether the folder `id`, owned by `owner` (`""` = nobody), is visible.
     #[must_use]
     pub fn sees_folder(&self, id: &str, owner: &str) -> bool {
@@ -775,6 +783,19 @@ mod tests {
         assert!(!viewer.sees_board("never-existed", ""));
         // The built-in board has no rule, so it is not theirs either.
         assert!(!viewer.sees_board("main", ""));
+    }
+
+    #[test]
+    fn the_built_in_dashboard_belongs_to_the_starting_point() {
+        let only = map(None, &[], &[grant(ItemKind::Board, "b1", Level::View)], &[])
+            .viewer(&[placed("b1", "", "")])
+            .unwrap();
+        assert!(!only.sees_builtin());
+        let start = map(Some(Level::View), &[], &[], &[(ItemKind::Board, "b1")])
+            .viewer(&[placed("b1", "", "")])
+            .unwrap();
+        assert!(start.sees_builtin());
+        assert!(Viewer::anonymous().sees_builtin());
     }
 
     #[test]

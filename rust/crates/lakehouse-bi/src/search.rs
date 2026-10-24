@@ -91,7 +91,9 @@ async fn find(ch: &ChClient, viewer: &Viewer, text: &str) -> Result<Vec<Entry>, 
         })
         .collect();
     // The built-in board has no row; it matches by its name like the rest.
-    if "main".contains(&text.to_lowercase()) {
+    // BI-19 part B1: and belongs to the starting point, like the rest of the
+    // permissions.
+    if viewer.sees_builtin() && "main".contains(&text.to_lowercase()) {
         out.insert(
             0,
             Entry {

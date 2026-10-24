@@ -26,6 +26,7 @@ use serde_json::{Value, json};
 use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::routes::calc_fields::{author_name, classify_ch, resolve};
+use crate::routes::dashboard_access::require_entitled;
 use crate::state::AppState;
 
 /// `GET` query: exactly one of `mart` and `source`.
@@ -66,6 +67,20 @@ pub struct Body {
 fn parse_body(body: &Bytes) -> Result<Body, ApiError> {
     serde_json::from_slice(body)
         .map_err(|_unparsed| ApiError::BadRequest("body JSON is invalid".to_owned()))
+}
+
+/// The route's handler: [`list`] behind the entry check of `BI-19` part B1
+/// (plan D8). The router floor is "signed in"; this refuses somebody who holds
+/// neither `dashboard:read` nor a rule naming them or one of their roles. Kept
+/// apart from [`list`] because the assistant calls that one directly, after
+/// its own gate.
+pub async fn list_guarded(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    query: Query<ListQuery>,
+) -> ApiResult<ApiJson<Value>> {
+    require_entitled(&state, &principal).await?;
+    list(State(state), query).await
 }
 
 /// `GET /api/dashboard/hierarchies?mart=|source=` — the hierarchies of one

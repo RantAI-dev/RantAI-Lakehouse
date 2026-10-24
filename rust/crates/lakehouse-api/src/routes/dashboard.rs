@@ -31,9 +31,10 @@ use serde_json::{Map, Value, json};
 use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::policy_engine::PolicyEngineObligations;
+use crate::routes::dashboard_access::{require_entitled, viewer_for};
 use crate::routes::dashboard_organise::{
-    drop_tile, place_new_chart, require_board, require_chart_board, require_editable_chart,
-    snapshot, viewer_of, visible_live_chart_board,
+    BOARD_NOT_FOUND, drop_tile, place_new_chart, require_board, require_chart_board,
+    require_editable_chart, snapshot, viewer_of, visible_live_chart_board,
 };
 use crate::routes::support::{
     effective_chart, is_numeric_type, mart_columns, render_stored_spec, run_spec_sql, sources_for,
@@ -90,6 +91,10 @@ impl DashboardQuery {
 enum BodyError {
     Store(lakehouse_clickhouse::ChError),
     Params(ApiError),
+    /// The dashboard asked for is not one the caller may see (`BI-19` part B1):
+    /// unknown, in the trash, private to somebody else, or outside what their
+    /// rules give. One answer for all, so an id guess learns nothing.
+    NotFound,
 }
 
 impl From<lakehouse_clickhouse::ChError> for BodyError {
@@ -203,6 +208,12 @@ pub(crate) async fn payload_for(
             .collect(),
     };
     let reject = |err: ApiError| crate::error::ApiRejection(err).into_response();
+    // BI-18 part C, part 2: a board in the trash or in somebody else's
+    // personal space reads as a board that does not exist. BI-19 part B1: so
+    // does one the caller's rules leave out, and the caller who holds no
+    // `dashboard:read` and no rule is refused here (the router floor is "signed
+    // in", plan D8).
+    let viewer = viewer_for(state, principal).await.map_err(reject)?;
     // BI-18: a malformed `filters` used to be ignored without a word, which
     // showed an unfiltered dashboard for a filter the caller believed was on.
     let param_filters = parse_filters_param(q.filters.as_deref()).map_err(reject)?;
@@ -216,9 +227,6 @@ pub(crate) async fn payload_for(
         .await
         .map_err(reject)?;
     let obligations = PolicyEngineObligations::from_state(state);
-    // BI-18 part C, part 2: a board in the trash or in somebody else's
-    // personal space reads as a board that does not exist.
-    let viewer = viewer_of(principal);
     match get_body(
         &state.clickhouse,
         q,
@@ -252,6 +260,7 @@ pub(crate) async fn payload_for(
             Ok(body)
         }
         Err(BodyError::Params(err)) => Err(reject(err)),
+        Err(BodyError::NotFound) => Err(reject(ApiError::NotFound(BOARD_NOT_FOUND.to_owned()))),
         Err(BodyError::Store(err)) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             ApiJson(upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json()),
@@ -314,6 +323,23 @@ async fn get_body(
         .iter()
         .find(|b| b.id == board)
         .or(default_row.as_ref());
+    // BI-19 part B1 (plan D8): a dashboard the caller may not see is a 404,
+    // whether it is unknown, trashed, private or left out by their rules. A
+    // store failure above leaves `boards` empty and has already been recorded,
+    // so it is not mistaken for a missing dashboard. The built-in board and
+    // `all` (which adds the built-in tiles) are shown only to somebody with a
+    // starting point.
+    if store_error.is_none() {
+        let is_builtin = board == store::DEFAULT_BOARD_ID || board == "all";
+        let visible = if is_builtin {
+            viewer.sees_builtin()
+        } else {
+            board_obj.is_some()
+        };
+        if !visible {
+            return Err(BodyError::NotFound);
+        }
+    }
     let layout = board_obj.and_then(|b| b.layout.clone()).unwrap_or_default();
     // BI-18 part C: the tabs decide which filters each tile is given.
     let tabs: Vec<lakehouse_bi::layout::Tab> =
@@ -714,7 +740,12 @@ pub async fn specs_list(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
 ) -> Response {
-    match store::list_stored_charts(&state.clickhouse, &viewer_of(&principal)).await {
+    // BI-19 part B1: the charts of a restricted dashboard are not the caller's.
+    let viewer = match viewer_for(&state, &principal).await {
+        Ok(viewer) => viewer,
+        Err(err) => return crate::error::ApiRejection(err).into_response(),
+    };
+    match store::list_stored_charts(&state.clickhouse, &viewer).await {
         Ok(stored) => {
             let charts: Vec<Value> = stored.iter().map(render_stored_chart).collect();
             (StatusCode::OK, ApiJson(json!({ "charts": charts }))).into_response()
@@ -1041,7 +1072,11 @@ pub async fn boards_list(
     Extension(principal): Extension<Principal>,
 ) -> Response {
     let ch = &state.clickhouse;
-    let viewer = viewer_of(&principal);
+    // BI-19 part B1: the list holds the dashboards the caller's rules leave them.
+    let viewer = match viewer_for(&state, &principal).await {
+        Ok(viewer) => viewer,
+        Err(err) => return crate::error::ApiRejection(err).into_response(),
+    };
     let (boards, stored) = match tokio::try_join!(
         store::list_boards(ch, &viewer),
         store::list_stored_charts(ch, &viewer)
@@ -1063,13 +1098,18 @@ pub async fn boards_list(
     // catalogue means this tenant's BUILTIN_DASHBOARD_SPEC never loaded, so
     // the built-in board has no tiles to report.
     let builtin_tiles = CHARTS.len() + KPIS.len();
-    let mut out = vec![json!({
-        "id": store::DEFAULT_BOARD_ID,
-        "name": "Main",
-        "layout": {},
-        "chartCount": builtin_tiles + counts.get(store::DEFAULT_BOARD_ID).copied().unwrap_or(0),
-        "builtin": true,
-    })];
+    // The built-in board has no rule of its own: it belongs to the starting
+    // point, so somebody who sees only what they were given does not get it.
+    let mut out = Vec::new();
+    if viewer.sees_builtin() {
+        out.push(json!({
+            "id": store::DEFAULT_BOARD_ID,
+            "name": "Main",
+            "layout": {},
+            "chartCount": builtin_tiles + counts.get(store::DEFAULT_BOARD_ID).copied().unwrap_or(0),
+            "builtin": true,
+        }));
+    }
     // BI-19 part A (plan D1): the list's "public" mark and the delete warning
     // read the live links from Postgres, never the dashboard row. `Board` does
     // not serialise its old `public_token`, so a board without a live link has
@@ -1728,6 +1768,11 @@ pub async fn fields(
     headers: HeaderMap,
     Query(q): Query<FieldsQuery>,
 ) -> Response {
+    // BI-19 part B1 (plan D8): the router floor is "signed in"; somebody with
+    // neither `dashboard:read` nor a rule is refused here.
+    if let Err(err) = require_entitled(&state, &principal).await {
+        return crate::error::ApiRejection(err).into_response();
+    }
     if let Some(id) = q.source.as_deref() {
         return match source_fields_body(&state.clickhouse, id).await {
             Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
@@ -2233,6 +2278,8 @@ pub async fn records(
     Extension(principal): Extension<Principal>,
     Query(q): Query<RecordsQuery>,
 ) -> ApiResult<ApiJson<Value>> {
+    // BI-19 part B1 (plan D8): the entry check and the caller's rules first.
+    let viewer = viewer_for(&state, &principal).await?;
     let placeholders = crate::sql_rewrite::PlaceholderValues {
         principal_id: Some(principal.id.uuid().to_string()),
         principal_tenant_ids: principal
@@ -2248,7 +2295,7 @@ pub async fn records(
     records_for_roles(
         &state.clickhouse,
         q,
-        (&principal.role_names, &viewer_of(&principal)),
+        (&principal.role_names, &viewer),
         &placeholders,
         &obligations,
         &time,
@@ -3373,7 +3420,7 @@ async fn export_tile_statement(
         .map(str::trim)
         .filter(|c| !c.is_empty())
         .ok_or_else(|| ApiError::BadRequest("chart is required".to_owned()))?;
-    let viewer = viewer_of(principal);
+    let viewer = viewer_for(state, principal).await?;
     let chart = store::list_stored_charts(ch, &viewer)
         .await
         .map_err(|err| classify_dashboard_ch_error(&err))?
@@ -3611,6 +3658,8 @@ pub async fn values(
     Extension(principal): Extension<Principal>,
     Query(q): Query<ValuesQuery>,
 ) -> ApiResult<ApiJson<Value>> {
+    // BI-19 part B1 (plan D8): the entry check and the caller's rules first.
+    let viewer = viewer_for(&state, &principal).await?;
     let placeholders = crate::sql_rewrite::PlaceholderValues {
         principal_id: Some(principal.id.uuid().to_string()),
         principal_tenant_ids: principal
@@ -3624,7 +3673,7 @@ pub async fn values(
     values_for_roles(
         &state.clickhouse,
         q,
-        (&principal.role_names, &viewer_of(&principal)),
+        (&principal.role_names, &viewer),
         &placeholders,
         &obligations,
         &time,
@@ -3880,7 +3929,7 @@ pub async fn export(
 ) -> ApiResult<Response> {
     // The file is the caller's view of the dashboards: no deleted board or
     // chart, and no other user's personal space (BI-18 part C, part 2).
-    let viewer = viewer_of(&principal);
+    let viewer = viewer_for(&state, &principal).await?;
     let (charts, boards, default_row) = tokio::try_join!(
         store::list_stored_charts(&state.clickhouse, &viewer),
         store::list_boards(&state.clickhouse, &viewer),
@@ -3898,12 +3947,15 @@ pub async fn export(
     out.push_str("# RantAI Lakehouse — dashboard as code\n");
     out.push_str("# boards & chart specs, exported from console.bi_chart\n\n");
     out.push_str("boards:\n");
-    out.push_str(&yaml_board(
-        store::DEFAULT_BOARD_ID,
-        "Main",
-        default_row.as_ref().and_then(|b| b.layout.as_ref()),
-        default_row.as_ref().and_then(|b| b.params.as_deref()),
-    ));
+    // The built-in board is part of the starting point (BI-19 part B1).
+    if viewer.sees_builtin() {
+        out.push_str(&yaml_board(
+            store::DEFAULT_BOARD_ID,
+            "Main",
+            default_row.as_ref().and_then(|b| b.layout.as_ref()),
+            default_row.as_ref().and_then(|b| b.params.as_deref()),
+        ));
+    }
     for b in &boards {
         out.push_str(&yaml_board(
             &b.id,
@@ -4282,7 +4334,11 @@ pub async fn embed_info(
         )
             .into_response();
     }
-    match embed_info_body(&state, &id, q.chart.as_deref(), &viewer_of(&principal)).await {
+    let viewer = match viewer_for(&state, &principal).await {
+        Ok(viewer) => viewer,
+        Err(err) => return crate::error::ApiRejection(err).into_response(),
+    };
+    match embed_info_body(&state, &id, q.chart.as_deref(), &viewer).await {
         Ok(Some(body)) => (StatusCode::OK, ApiJson(body)).into_response(),
         Ok(None) => (
             StatusCode::NOT_FOUND,
@@ -5505,7 +5561,15 @@ mod typed_filters {
             ],
         )
         .await;
-        answer(server, "FROM console.bi_board FINAL", &["id"], vec![]).await;
+        // The board exists: a dashboard the store does not list is a 404 now
+        // (BI-19 part B1), as it is for a dashboard the caller may not see.
+        answer(
+            server,
+            "FROM console.bi_board FINAL",
+            &["id", "name"],
+            vec![json!({ "id": "b1", "name": "Board one" })],
+        )
+        .await;
         answer(
             server,
             "FROM console.bi_source FINAL",

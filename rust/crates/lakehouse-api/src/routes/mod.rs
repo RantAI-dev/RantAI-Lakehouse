@@ -28,6 +28,7 @@ mod connector_oauth;
 mod connector_runs;
 mod connectors;
 mod dashboard;
+pub(crate) mod dashboard_access;
 mod dashboard_folders;
 pub(crate) mod dashboard_organise;
 mod dashboard_sources;
@@ -1128,7 +1129,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/api/dashboard/calc-fields",
-            get(calc_fields::list)
+            get(calc_fields::list_guarded)
                 .post(calc_fields::create)
                 .put(calc_fields::update)
                 .delete(calc_fields::delete),
@@ -1143,7 +1144,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/api/dashboard/metrics",
-            get(metrics::list)
+            get(metrics::list_guarded)
                 .post(metrics::create)
                 .put(metrics::update)
                 .delete(metrics::delete),
@@ -1155,21 +1156,21 @@ pub fn router(state: AppState) -> Router {
         .route("/api/dashboard/metrics/{id}/usage", get(metrics::usage))
         .route(
             "/api/dashboard/segments",
-            get(metrics::list_segments)
+            get(metrics::list_segments_guarded)
                 .post(metrics::create_segment)
                 .put(metrics::update_segment)
                 .delete(metrics::delete_segment),
         )
         .route(
             "/api/dashboard/hierarchies",
-            get(hierarchies::list)
+            get(hierarchies::list_guarded)
                 .post(hierarchies::create)
                 .put(hierarchies::update)
                 .delete(hierarchies::delete),
         )
         .route(
             "/api/dashboard/params",
-            get(params::list)
+            get(params::list_guarded)
                 .post(params::create)
                 .put(params::update)
                 .delete(params::delete),
