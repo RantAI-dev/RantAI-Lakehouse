@@ -2097,12 +2097,10 @@ mod access_request_tests {
             here[0].granted_by.as_deref(),
             Some("admin@tenant-a.invalid")
         );
-        assert!(
-            super::list_asset_grants(&pool, "silver.other")
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        let grants = super::list_asset_grants(&pool, "silver.other")
+            .await
+            .unwrap();
+        assert!(grants.is_empty(), "{grants:?}");
         Ok(())
     }
 
@@ -2161,12 +2159,10 @@ mod access_request_tests {
             .expect("the grant is in force");
         assert_eq!(revoked.permission, "query:read");
         assert_eq!(revoked.user, "user2@tenant-a.invalid");
-        assert!(
-            super::list_asset_grants(&pool, "silver.orders")
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        let grants = super::list_asset_grants(&pool, "silver.orders")
+            .await
+            .unwrap();
+        assert!(grants.is_empty(), "{grants:?}");
         assert!(
             super::revoke_asset_grant(&pool, "silver.orders", &made.id, admin)
                 .await
