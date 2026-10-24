@@ -314,4 +314,25 @@ Checks (all from `/home/hv/lakehouse-phase6-build`):
 - Existing behaviour: `natural-earth-maps.test.tsx` pins the three Indonesian/Jakarta catalogue entries, the two defaults, the credit text, and draws Jakarta (no map set) and `id-provinces` through `GeoChart` with the old name rules.
 
 
+### C1 Gantt, console half (developer, branch `feat/bi-phase-6`)
+
+Commit: `75a9cf46` feat(dashboards): BI-16 C1 Gantt chart in the console (T3). TypeScript only; no cargo command run, no Rust change. **T1 (kind and statement) and T2 (assistant) are not built: the server rejects the `gantt` kind on save and on preview until T1 lands**, so the builder can fill the fields and the tile can draw, but a real chart cannot be saved or read yet.
+
+What it does (plan D1, D3): `gantt` in `ChartKind` and the builder's type list (group "Schedule"); `features/dashboards/gantt-option.ts` (the option builder: ECharts `custom` series, one per group, colours from the chart's palette; time axis in UTC over naive wall times; line at today from `wallClockMs` in the report zone, drawn only inside the tasks' range; progress shading; first 1,000 tasks by start with "Showing the first 1,000 tasks by start"; reversed-row and undated-row notes; HTML tooltip with escaped task and group); `GanttBody` in `tile-body.tsx`; `GanttFields` (start, end, progress) in `type-b-fields.tsx`. The task is the `dimension`, the group the `breakdown`; `start`, `end`, `progress` are flat on the chart in `TypeDefFields` (so the preview key, the edit round trip and the draft preview carry them like `lat`/`lon`). A Gantt has no measure, aggregate, sort or limit in the builder. Drill: a bar reports its task as the hit name, so the default `drillTarget` filters on the task column.
+
+Assumptions to check against T1 (the plan leaves them open):
+- Result columns are D2's aliases `task`, `group`, `start`, `end`, `progress`; the tile reads exactly these names, not `spec.x`.
+- The count of rows with `end < start` (D2: "a second count ... for the note") is read from an optional `reversedRows` on the tile result (`Rows.reversedRows`); absent means no note. T1 must return it under that name, or this changes.
+- Start and end arrive as `YYYY-MM-DD` or `YYYY-MM-DD HH:MM:SS` strings in the report zone; the zone conversion is the server's.
+- Not built because the plan's D1 to D3 do not define a field for it: the switch that turns the today line off (feature decision 2 says "can be switched off"). The line is always on while today is in range. A field (`today`) would need T1 first.
+- The line at today is a `markLine` on an empty `line` series, because a `custom` series has no mark lines of its own to rely on. Not seen in a real browser (see below).
+
+Checks (from `/home/hv/lakehouse-phase6-build`):
+- `bun run typecheck`: exit 0.
+- `bun run lint`: 0 errors, 10 warnings, none in a file of this commit.
+- `bun test src/features/dashboards/gantt`: 17 pass, 0 fail (option: bars start to end and axis order, date-time reading, groups coloured with a legend, today in the report zone and out of range, progress shading, 1,000 cut with note, reversed note, empty message, escaped tooltip; tile: notes, no data, drill target; builder: type offered, fields round trip with no measure/order/limit sent, start and end required).
+- `bun run test`: 2536 pass, 1 skip, 0 fail (260 files).
+- Not verified: the webpack build; a Gantt drawn in a real canvas (the tests hand the option to a mocked `EChart`, and the geometry of a bar is tested through `ganttBarItem` with a stub API); the `markLine` on the empty line series.
+
+
 ## 8. Review (planner appends, one entry per part)
