@@ -581,6 +581,13 @@ fn board_body(
 /// [`data`] and [`public_dashboard`]: every stored chart belonging to
 /// `board_id`, filtered by `filters` (never by caller-supplied years —
 /// neither route accepts a `year` parameter).
+#[allow(
+    clippy::too_many_lines,
+    reason = "one pipeline (read the board's charts and sources, run every tile \
+              through `tile_pool`, assemble the payload); the per-tile future \
+              borrows eleven locals, so a helper would need as many \
+              parameters as the body has lines it saves"
+)]
 async fn render_board_payload(
     ch: &ChClient,
     obligations: &PolicyEngineObligations<'_>,

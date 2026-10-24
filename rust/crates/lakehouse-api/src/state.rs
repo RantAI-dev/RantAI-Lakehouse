@@ -618,6 +618,12 @@ fn oidc_config(config: &Config) -> Option<OidcConfig> {
 impl AppState {
     /// Build application state from a resolved [`Config`].
     #[must_use]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one struct literal naming every shared handle, a line per \
+                  field; `tile_slots` (BI-4 part A) is the line that took it \
+                  from 100 to 101"
+    )]
     pub fn new(config: Config) -> Self {
         let clickhouse = Arc::new(ChClient::new(
             config.ch_url.clone(),

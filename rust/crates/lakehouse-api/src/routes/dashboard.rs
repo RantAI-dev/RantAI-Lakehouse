@@ -5558,7 +5558,7 @@ mod typed_filters {
         .await;
         let arrivals = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         Mock::given(method("POST"))
-            .and(body_string_contains("serving."))
+            .and(body_string_contains("FROM serving.mart_"))
             .respond_with(SlowTile {
                 arrivals: arrivals.clone(),
             })
@@ -5567,7 +5567,13 @@ mod typed_filters {
         answer_rest(&server).await;
 
         let started = std::time::Instant::now();
-        let body = dashboard(&server, "").await;
+        // A filter makes each tile send a statement of its own over its mart
+        // (without one a stored chart sends its saved `SELECT 1`).
+        let body = dashboard(
+            &server,
+            r#"[{"column":"visitors","op":"between","min":"0"}]"#,
+        )
+        .await;
         let took = started.elapsed();
 
         let results = body["results"].as_object().expect("results");

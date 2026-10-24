@@ -238,4 +238,55 @@ build after T7.
 
 ## 7. Handoff (developer appends)
 
+### Part A (parallel tiles), developer: Sonnet
+
+Commits on `feat/bi-phase-5`: T1 `22b34c23` (tiles side by side), then the fix
+commit and the T2 commit that follow it in `git log` (test fixture fix, clippy
+allows, `ops/bench/dashboard_open_bench.py`, `docs/plans/BI-4-RESULT.md`).
+
+What changed: `src/tile_pool.rs` (`run_tiles`, 6 per request; `tile_slots`
+semaphore, `TILE_CONCURRENCY_MAX`, default 24, clamped 4..=128);
+`AppState.tile_slots`; `get_body` and `embed::render_board_payload` run each
+tile as one future; the wrong "parallel tile execution" allow reason on
+`get_body` is corrected.
+
+Deviations from the plan (the planner decides):
+- `FuturesOrdered` refilled by hand (= `buffered(6)`) instead of
+  `buffer_unordered(6)`: it keeps the tile order, so the payload JSON is
+  identical. A stream-combinator closure made the handlers' futures fail the
+  `Send` check, hence the hand-written loop.
+- `get_body` gets the semaphore as a fourth tuple member (it was at the
+  argument limit); its test callers pass a fresh 24-permit semaphore.
+- The built-in KPIs/charts and stored charts now run in one batch, after
+  `sources_for`: a `sources_for` failure now skips the built-in queries
+  instead of running them first. Output is unchanged.
+- The plan's `wiremock` test measures the call as a whole (under 1.5 s) and
+  the arrival of the first six queries; it does not count requests in flight
+  in the mock. The in-flight bound is proved in `tile_pool::tests` with a paused
+  clock (peak 6; two boards peak at the process bound).
+- "Results identical to the sequential run" is checked as payload key order
+  and per-tile values on a fixture, not against a run of the removed old code.
+- `#[allow(clippy::too_many_lines)]` with reasons on `render_board_payload`
+  and `AppState::new` (the second crossed 100 by one line).
+
+Commands run (this VM, shared target, `CARGO_BUILD_JOBS=2`, `CARGO_INCREMENTAL=0`):
+- `cargo check -p lakehouse-api --lib --tests`: exit 0.
+- `cargo test -p lakehouse-api --lib -- dashboard embed tile_pool --test-threads=1`:
+  229 passed, 0 failed, 3 ignored (before the clippy allows were added).
+- `cargo test -p lakehouse-api --lib -- twelve_slow_tiles --test-threads=1`:
+  1 passed (0.70 s).
+- `cargo fmt --check`: clean on the final tree.
+
+NOT verified:
+- `cargo clippy --workspace --all-targets -- -D warnings`: the one run found
+  two `too_many_lines` errors (`render_board_payload` 130/100, `AppState::new`
+  101/100) and nothing else; both now carry an `allow` with a reason, but
+  clippy was NOT re-run after that (disk fell under 10 GB and the run was stopped).
+- Integration files `dashboard_export`, `embed_tokens`, `route_auth`,
+  `sec11_guard`: not run (same reason). The `route_auth` and `sec11_guard`
+  files should not be affected (no route or error path changed), but that is
+  an expectation, not a result.
+- The plan's section 5 grep for direct `ch.query(` around `try_run_spec_sql`:
+  not done. Real-engine before/after timing: not measured; see `docs/plans/BI-4-RESULT.md`.
+
 ## 8. Review (planner appends)
