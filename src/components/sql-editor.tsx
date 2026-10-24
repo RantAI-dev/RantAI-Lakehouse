@@ -4,6 +4,7 @@ import * as React from "react"
 import { useTheme } from "next-themes"
 import CodeMirror, { EditorView } from "@uiw/react-codemirror"
 import { sql } from "@codemirror/lang-sql"
+import type { Extension } from "@codemirror/state"
 import { cn } from "@/lib/utils"
 
 /**
@@ -30,6 +31,12 @@ export type SqlSchema = Record<string, string[]>
  * @param minHeight Editor min-height (CSS string), default `220px`
  * @param wrap Soft-wrap long lines instead of scrolling sideways; off by
  *   default so Query Studio is unchanged
+ * @param onView Called with the editor's view when the editor is created,
+ *   so the caller can read the selection and insert text at the cursor
+ * @param extensions Extra CodeMirror extensions, appended to the ones this
+ *   component builds. The caller decides their order, and keeps the array's
+ *   identity: a new array on every render reconfigures the editor on every
+ *   keystroke
  */
 export function SqlEditor({
   value,
@@ -38,6 +45,8 @@ export function SqlEditor({
   className,
   minHeight = "220px",
   wrap = false,
+  onView,
+  extensions,
 }: {
   value: string
   onChange: (v: string) => void
@@ -45,19 +54,23 @@ export function SqlEditor({
   className?: string
   minHeight?: string
   wrap?: boolean
+  onView?: (view: EditorView) => void
+  extensions?: Extension[]
 }) {
   const { resolvedTheme } = useTheme()
   const cmTheme = resolvedTheme === "dark" ? "dark" : "light"
 
   // Ekstensi dibuat ulang hanya saat skema berubah. Membuat array baru tiap
   // render akan memaksa CodeMirror me-rekonfigurasi editor pada setiap
-  // ketikan.
-  const extensions = React.useMemo(
+  // ketikan. Extensi dari pemanggil ikut di sini, dalam urutan yang
+  // pemanggil pilih.
+  const editorExtensions = React.useMemo(
     () => [
       sql(schema ? { schema, upperCaseKeywords: true } : undefined),
       ...(wrap ? [EditorView.lineWrapping] : []),
+      ...(extensions ?? []),
     ],
-    [schema, wrap]
+    [schema, wrap, extensions]
   )
 
   return (
@@ -70,8 +83,9 @@ export function SqlEditor({
       <CodeMirror
         value={value}
         height={minHeight}
-        extensions={extensions}
+        extensions={editorExtensions}
         onChange={onChange}
+        onCreateEditor={(view) => onView?.(view)}
         theme={cmTheme}
         basicSetup={{
           lineNumbers: true,

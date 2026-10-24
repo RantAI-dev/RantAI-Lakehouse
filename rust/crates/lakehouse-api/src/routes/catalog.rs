@@ -3460,6 +3460,11 @@ pub async fn access_request(
 /// single fan-out handler whose in-handler `kind` branch a future edit
 /// could silently skip.
 ///
+/// `SEC-45`: holding `access:approve` is not enough to APPROVE a request —
+/// the approver must hold the permission the request asks for, the same
+/// rule a direct grant obeys (`routes::catalog_grants::create`, `PR #106
+/// review R1 BLOCKER 4`). Rejecting needs no permission of its own.
+///
 /// `GRANT_DAYS`: how long an approved access request's [`AccessGrant`]
 /// lasts. Fixed rather than caller-supplied (no field in the request or
 /// decide body names it) — a requester/approver cannot negotiate their
@@ -3484,6 +3489,12 @@ type DecideAccessRequestBody = crate::routes::agents::DecideApprovalBody;
 /// - `403` [`ApiError::PermissionDenied`] if the deciding principal is the SAME
 ///   person who requested this access — self-approval is refused, proven
 ///   by a real test (WS7 plan's own acceptance criterion for this task).
+/// - `403` [`ApiError::PermissionDenied`] if the decision is an approval and
+///   the deciding principal does NOT hold the permission the request asks
+///   for (`SEC-45`) — an approver may only approve a permission they hold
+///   themselves, the same rule a direct grant obeys
+///   ([`crate::routes::catalog_grants::create`]). A rejection needs no
+///   permission of its own: it gives nothing away.
 /// - `409` [`ApiError::Conflict`] if the request has already been decided.
 /// - `503`/`500` as [`lakehouse_store::StoreError`] classifies.
 pub async fn decide_access_request(
@@ -3521,6 +3532,27 @@ pub async fn decide_access_request(
             "tidak boleh menyetujui permintaan akses milik sendiri".to_owned(),
         )
         .into());
+    }
+    // SEC-45: an approver may only approve a permission they hold
+    // themselves — the same rule `routes::catalog_grants::create` applies
+    // to a direct grant (`PR #106 review R1 BLOCKER 4`), so holding
+    // `access:approve` alone never widens anybody's permissions. Checked
+    // BEFORE the store call, so a refused approval writes no status, no
+    // grant and no audit row: nothing changes. REJECTING stays allowed —
+    // it gives nothing away.
+    if decision == lakehouse_store::agents::Decision::Approved {
+        // The permission asked for is the approval's own `action`, stored
+        // as `access:<permission>` (`create_access_request`'s shape). A row
+        // whose `action` is not shaped that way is refused as well: fail
+        // closed — an approver whose permission cannot be read cannot be
+        // shown to hold it.
+        let requested = existing.action.strip_prefix("access:").unwrap_or_default();
+        if !principal.has(requested) {
+            return Err(ApiError::PermissionDenied(
+                "you cannot approve a permission you do not hold".to_owned(),
+            )
+            .into());
+        }
     }
 
     let grant = match lakehouse_store::agents::decide_access_request(

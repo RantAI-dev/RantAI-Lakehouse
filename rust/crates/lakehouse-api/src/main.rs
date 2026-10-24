@@ -1169,9 +1169,19 @@ mod tests {
     /// the field could be a constant `unavailable` and nobody would know.
     #[tokio::test]
     async fn health_reports_the_database_ok_once_the_startup_step_confirmed_it() {
-        let cfg = Config::from_map(&std::collections::HashMap::new()).unwrap();
+        // `SEC-37` (PR #238 merge of `main`): `DATABASE_URL` has no default
+        // any more, so the test names a throwaway DSN for its lazy pool
+        // (`connect_lazy` does no I/O), as `route_policy_tests` does.
+        let env = std::collections::HashMap::from([(
+            "DATABASE_URL".to_owned(),
+            "postgres://test:test@127.0.0.1:5432/test".to_owned(),
+        )]);
+        let cfg = Config::from_map(&env).unwrap();
         let state = AppState::new(cfg);
-        assert!(state.pg.is_some(), "the default config has a parsable URL");
+        assert!(
+            state.pg.is_some(),
+            "a parsable DATABASE_URL gives a lazy pool"
+        );
         state.mark_database_ready();
         let app = routes::router(state);
 

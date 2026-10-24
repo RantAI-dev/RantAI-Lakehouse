@@ -630,6 +630,27 @@ fn oidc_config(config: &Config) -> Option<OidcConfig> {
     Some(oidc)
 }
 
+/// The Phase 2 Postgres pool, or `None` when there is nothing to connect to.
+///
+/// `SEC-37`: [`Config::database_url`] has no default, so unset (empty) means
+/// "no Postgres pool" outright — never a made-up localhost DSN holding a
+/// credential written in the repository. `main` logs its own warning for the
+/// `None` case and every Phase 2 route answers 503. `connect_lazy` performs
+/// no I/O, so this never blocks on Postgres being down; a malformed URL is
+/// logged and degrades the same way.
+fn postgres_pool(config: &Config) -> Option<Arc<PgPool>> {
+    if config.database_url.is_empty() {
+        return None;
+    }
+    match lakehouse_store::connect_lazy(&config.database_url) {
+        Ok(pool) => Some(Arc::new(pool)),
+        Err(err) => {
+            tracing::warn!(%err, "DATABASE_URL is not a valid Postgres connection string; Phase 2 routes will report the database as unavailable");
+            None
+        }
+    }
+}
+
 /// The login-throttle policy [`AppState::new`] stores (`SEC-5`): the three
 /// configured numbers, converted to the shape the login handler reads.
 /// A free function only so the state constructor stays inside clippy's
@@ -664,16 +685,10 @@ impl AppState {
         );
         // `connect_lazy` performs no I/O, so this never blocks on, or fails
         // because of, Postgres being down — see the field doc comment and
-        // `lakehouse_store::connect_lazy`'s. It can only fail on a
-        // malformed `DATABASE_URL`, which is logged and degrades to `None`
-        // rather than aborting startup.
-        let pg = match lakehouse_store::connect_lazy(&config.database_url) {
-            Ok(pool) => Some(Arc::new(pool)),
-            Err(err) => {
-                tracing::warn!(%err, "DATABASE_URL is not a valid Postgres connection string; Phase 2 routes will report the database as unavailable");
-                None
-            }
-        };
+        // `lakehouse_store::connect_lazy`'s; a malformed URL is logged and
+        // degrades to `None` rather than aborting startup. See
+        // [`postgres_pool`] for the `SEC-37` "unset means no pool" rule.
+        let pg = postgres_pool(&config);
         let auth = pg.as_ref().map(|pool| AuthState {
             local: Arc::new(LocalPasswordAuthenticator::new((**pool).clone())),
             session: Arc::new(SessionAuthenticator::new((**pool).clone())),
@@ -964,22 +979,22 @@ mod tests {
         assert_eq!(latencies.p95_ms(), Some(1.0));
     }
 
-    /// The boot-behavior guarantee this module exists to provide: building
-    /// `AppState` never blocks on, or fails because of, Postgres being
-    /// unreachable — the default `DATABASE_URL` points at `localhost:5432`,
-    /// which is not running in this test process, and `AppState::new` must
-    /// still return synchronously with a populated `pg` pool.
+    /// The `SEC-37` boot guarantee: an unset `DATABASE_URL` means "no
+    /// Postgres pool", not a made-up localhost DSN built from a credential
+    /// written in the repository. `AppState::new` must return synchronously
+    /// with `pg: None` — the same state the malformed-URL case below
+    /// reaches — and `main` turns that into its "no Postgres pool
+    /// configured" warning.
     ///
-    /// `#[tokio::test]` (not plain `#[test]`), even though `AppState::new`
-    /// itself is synchronous: `sqlx`'s lazy pool sets up an idle-connection
-    /// reaper against the ambient Tokio runtime as part of construction, so
-    /// it needs one present — exactly the situation it runs in for real,
-    /// since `main` only ever calls this from inside `#[tokio::main]`.
+    /// `#[tokio::test]` (not plain `#[test]`), matching the malformed-URL
+    /// test below and the only way `main` ever calls `AppState::new` (from
+    /// inside `#[tokio::main]`).
     #[tokio::test]
-    async fn app_state_boots_with_default_database_url_and_no_live_postgres() {
+    async fn app_state_has_no_pool_when_database_url_is_unset() {
         let cfg = Config::from_map(&HashMap::new()).unwrap();
+        assert_eq!(cfg.database_url, "");
         let state = AppState::new(cfg);
-        assert!(state.pg.is_some());
+        assert!(state.pg.is_none());
     }
 
     /// The one failure mode `connect_lazy` actually has: a `DATABASE_URL`

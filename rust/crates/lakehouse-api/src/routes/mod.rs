@@ -1424,8 +1424,23 @@ mod route_policy_tests {
     use crate::policy::{POLICY_TABLE, Policy};
     use crate::state::AppState;
 
+    /// A router whose state can AUTHENTICATE, with nothing to connect to.
+    ///
+    /// `SEC-37`: an unset `DATABASE_URL` now means "no Postgres pool", and
+    /// without one [`crate::auth::AuthenticatedPrincipal`] refuses every
+    /// protected route with 503 before it looks at the request — the honest
+    /// answer for a deployment that cannot check a credential, but it hides
+    /// the 401 this test exists to observe (a `RequiresAuth` entry with no
+    /// credential presented). So the state is built the way the old default
+    /// DSN built it: a LAZY pool (`connect_lazy` does no I/O) at a
+    /// throwaway address this test never dials, since the no-credential
+    /// path never reaches it.
     fn test_router() -> axum::Router {
-        let cfg = Config::from_map(&std::collections::HashMap::new()).unwrap();
+        let env = std::collections::HashMap::from([(
+            "DATABASE_URL".to_owned(),
+            "postgres://test:test@127.0.0.1:5432/test".to_owned(),
+        )]);
+        let cfg = Config::from_map(&env).unwrap();
         super::router(AppState::new(cfg))
     }
 
