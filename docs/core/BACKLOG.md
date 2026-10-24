@@ -159,7 +159,7 @@ estimate (S, M, L), which the base has no field for.
 | `SRC-9` | Task | Gate tests for every advertised connector (Oracle, SFTP, MySQL CDC, SQL Server CDC); the upload gate in CI | Data | P2 | Done | #114 | `reference/competitive-comparison.md` (Data matrix) |
 | `SRC-10` | Feature | More load modes: deduplicate on a key, keep history (SCD type 2), refresh or clear one table | Data | P2 | In Acceptance | #115 | `reference/competitive-comparison.md` (Data matrix) |
 | `SRC-11` | Feature | Connector operations: automatic retries with backoff, a log view per run, column choice. | Data | P2 | In Acceptance | [#144](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/144) | `reference/competitive-comparison.md` (Data matrix) |
-| `SRC-32` | Task | Auto-pause (`SRC-11` D3) can under-count "N failed runs in a row": `record_run_once` applies each run report in arrival order, and the failure and success reports come from two independent Dagster sensors, so a success reported after a later run's failure resets the streak that failure started. Seen in `g6-ops` on `main` at `c78c9faa`, where the connector never paused; `OPS-10` made the gate wait for the counted success, so the gate no longer exercises this ordering. Apply a report only when its run ended after the last counted one (or order by run end time), with a store test for the late-success case. Found by `OPS-10` | Data | P2 | Todo |  | `rust/crates/lakehouse-store/src/connectors.rs` (`record_run_once`) |
+| `SRC-32` | Task | Auto-pause (`SRC-11` D3) can under-count "N failed runs in a row": `record_run_once` applies each run report in arrival order, and the failure and success reports come from two independent Dagster sensors, so a success reported after a later run's failure resets the streak that failure started. Seen in `g6-ops` on `main` at `c78c9faa`, where the connector never paused; `OPS-10` made the gate wait for the counted success, so the gate no longer exercises this ordering. Apply a report only when its run ended after the last counted one (or order by run end time), with a store test for the late-success case. Found by `OPS-10` | Data | P2 | Done | [#252](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/252) | `rust/crates/lakehouse-store/src/connectors.rs` (`record_run_once`) |
 | `SRC-12` | Feature | Credentials done properly: external secret managers, encryption at rest, OAuth sign-in. | Data | P2 | In Acceptance | [#144](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/144) | `reference/competitive-comparison.md` (Data matrix) |
 | `SRC-13` | Feature | Table discovery for every source type, not only databases. | Data | P2 | In Acceptance | [#144](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/144) | `reference/competitive-comparison.md` (Data matrix) |
 | `SRC-15` | Feature | Load a SQL column whose type changed to one its Bronze column cannot hold (integer to text, text to a number, a changed decimal) into a second column when the change is approved. Today such a change cannot be approved and the table waits (`SRC-8`, decision 10). Starts after the g6 gate has shown the loader's behaviour on a real database. No spec yet | Data | P3 | Idea |  | `features/source-schema-changes.md` |
@@ -321,7 +321,7 @@ parity), built after it.
 
 **Ready to start** (Todo, Planned or Idea, nothing open blocks it; Idea items still need a spec):
 
-`ADM-1`, `ADM-2`, `AI-21`, `AI-22`, `BI-1`, `BI-14`, `BI-20`, `BI-27`, `BI-28`, `BI-29`, `BI-3`, `BI-30`, `BI-31`, `BI-32`, `BI-33`, `BI-4`, `BI-5`, `BIZ-1`, `BIZ-2`, `BLD-10`, `BLD-6`, `DATA-18`, `DATA-20`, `DATA-21`, `DATA-22`, `DATA-23`, `DATA-24`, `DATA-25`, `DATA-26`, `DATA-27`, `DATA-4`, `DATA-5`, `DATA-6`, `DATA-8`, `DOC-2`, `GOV-1`, `GOV-3`, `GOV-5`, `INT-2`, `OPS-2`, `OPS-3`, `OPS-6`, `OPS-8`, `QA-1`, `QRY-1`, `QS-2`, `QS-3`, `QS-4`, `REL-1`, `REL-2`, `REL-4`, `REL-7`, `SEC-22`, `SEC-34`, `SEC-4`, `SEC-40`, `SEC-41`, `SEC-50`, `SEC-7`, `SRC-15`, `SRC-18`, `SRC-2`, `SRC-22`, `SRC-23`, `SRC-24`, `SRC-25`, `SRC-26`, `SRC-27`, `SRC-28`, `SRC-30`, `SRC-31`, `SRC-32`, `SRC-33`, `SRC-5`, `VER-1`
+`ADM-1`, `ADM-2`, `AI-21`, `AI-22`, `BI-1`, `BI-14`, `BI-20`, `BI-27`, `BI-28`, `BI-29`, `BI-3`, `BI-30`, `BI-31`, `BI-32`, `BI-33`, `BI-4`, `BI-5`, `BIZ-1`, `BIZ-2`, `BLD-10`, `BLD-6`, `DATA-18`, `DATA-20`, `DATA-21`, `DATA-22`, `DATA-23`, `DATA-24`, `DATA-25`, `DATA-26`, `DATA-27`, `DATA-4`, `DATA-5`, `DATA-6`, `DATA-8`, `DOC-2`, `GOV-1`, `GOV-3`, `GOV-5`, `INT-2`, `OPS-2`, `OPS-3`, `OPS-6`, `OPS-8`, `QA-1`, `QRY-1`, `QS-2`, `QS-3`, `QS-4`, `REL-1`, `REL-2`, `REL-4`, `REL-7`, `SEC-22`, `SEC-34`, `SEC-4`, `SEC-40`, `SEC-41`, `SEC-50`, `SEC-7`, `SRC-15`, `SRC-18`, `SRC-2`, `SRC-22`, `SRC-23`, `SRC-24`, `SRC-25`, `SRC-26`, `SRC-27`, `SRC-28`, `SRC-30`, `SRC-31`, `SRC-33`, `SRC-5`, `VER-1`
 
 ## Dates
 
@@ -390,7 +390,7 @@ set by the product owner and are left empty until they are.
 | `SEC-25` | 2026-10-23 | 2026-10-24 | |
 | `SEC-38` | 2026-10-23 | 2026-10-24 | |
 | `SEC-39` | 2026-10-23 | 2026-10-24 | |
-| `SRC-32` | | | |
+| `SRC-32` | 2026-10-24 | 2026-10-24 | |
 | `SEC-3` | 2026-10-16 | 2026-10-16 | |
 | `REL-5` | 2026-10-16 | 2026-10-16 | |
 | `OPS-1` | 2026-10-15 | 2026-10-16 | |

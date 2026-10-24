@@ -275,3 +275,21 @@ the API's logic: `== Some(REPEATED_FAILURE_STREAK)` is already false for
   the API's `matched` would have been 2 — reasoning, not a measurement.
 - No TypeScript, Python, Dagster, compose or gate checks: the commit touches
   two Rust crates and `CHANGELOG.md` only.
+
+### Round 2 and planner's verification (2026-10-24)
+
+BLOCKER 1 fixed in `4b2a9bc6`: a late report's dedupe row keeps
+`failure_streak = NULL` and `record_run_once` answers `None` for it and
+its retries, so `routes/load_alerts.rs`'s `== Some(REPEATED_FAILURE_STREAK)`
+cannot fire; cited at both sites. The new store test reads the stored
+column and the retry; the API test shows the repeated-failure rule posts
+once for the real third failure and not again for the late one, while the
+plain failure alert still fires. Two existing late-report tests changed
+`Some(1)`/`Some(0)` to `None`: the review changed that answer, their
+subject (the connector's state) is unchanged, so rule 2 holds.
+
+`review/review-pr.sh` on `d5d9e67a`: fmt and workspace clippy OK; Rust
+134 suites, **7424 passed, 0 failed**, 44 ignored; typecheck OK; bun
+2711 passed, 0 failed, 2 skipped; Python lints OK; Dagster 2146 passed;
+compose config OK; gitleaks no leaks. `main` merged in at `ffa035fe`
+(clean). No open `BLOCKER`.
