@@ -798,7 +798,10 @@ mod tests {
         let reply = delete_chart(&ch, Some(&person(7)), &args).await;
         assert_eq!(reply["error"], json!("this tile does not exist"), "{reply}");
         assert!(reply.get("deleted").is_none(), "{reply}");
-        assert!(writes(&sent(&server).await).is_empty());
+        assert_eq!(
+            writes(&sent(&server).await),
+            [] as [&std::string::String; 0]
+        );
     }
 
     #[tokio::test]
@@ -855,7 +858,10 @@ mod tests {
         )
         .await;
         assert_eq!(reply["error"], json!("dashboard not found."));
-        assert!(writes(&sent(&server).await).is_empty());
+        assert_eq!(
+            writes(&sent(&server).await),
+            [] as [&std::string::String; 0]
+        );
     }
 
     // ── BI-16 part B (AI-5): progress, histogram, bullet, image and web ─────

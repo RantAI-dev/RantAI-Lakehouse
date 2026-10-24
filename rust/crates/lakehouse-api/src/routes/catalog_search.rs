@@ -435,7 +435,7 @@ mod tests {
                 "{term}"
             );
         }
-        assert!(find(&assets, "revenue").is_empty());
+        assert_eq!(find(&assets, "revenue"), [] as [serde_json::Value; 0]);
     }
 
     // Carried over from `filter_assets_by_query_*` in `catalog.rs`
@@ -536,7 +536,10 @@ mod tests {
     #[test]
     fn a_word_that_matches_nothing_excludes_the_asset_even_when_another_word_matches() {
         let assets = explorer_fixture();
-        assert!(find(&assets, "restoran zzzzzz").is_empty());
+        assert_eq!(
+            find(&assets, "restoran zzzzzz"),
+            [] as [serde_json::Value; 0]
+        );
         assert_eq!(
             ids(&find(&assets, "restoran agregat")),
             vec!["gold.restoran"]
@@ -570,8 +573,8 @@ mod tests {
         let assets = revenue();
         // Under 4 characters, and `rev` is the name besides: the typed word
         // must not be matched approximately against "rev".
-        assert!(find(&assets, "rvn").is_empty());
-        assert!(find(&assets, "ravanue").is_empty());
+        assert_eq!(find(&assets, "rvn"), [] as [serde_json::Value; 0]);
+        assert_eq!(find(&assets, "ravanue"), [] as [serde_json::Value; 0]);
     }
 
     #[test]
@@ -594,9 +597,12 @@ mod tests {
         );
         assert_eq!(find(&assets, "silver.ordrs").len(), 1);
         // `xx` is under 4 characters and is not in the column: no match.
-        assert!(search(&assets, &columns, &UsageIndex::new(), "custmer_xx").is_empty());
+        assert_eq!(
+            search(&assets, &columns, &UsageIndex::new(), "custmer_xx"),
+            [] as [serde_json::Value; 0]
+        );
         // No letter or digit: nothing to match.
-        assert!(find(&assets, "___").is_empty());
+        assert_eq!(find(&assets, "___"), [] as [serde_json::Value; 0]);
     }
 
     #[test]
@@ -632,7 +638,7 @@ mod tests {
             typo.iter()
                 .all(|h| h["matchedOn"]["approximate"] == json!(true))
         );
-        assert!(!typo.is_empty());
+        assert_ne!(typo, [] as [serde_json::Value; 0]);
     }
 
     #[test]
@@ -735,7 +741,7 @@ mod tests {
             find(&assets, "one two three four five six seven eight nine").len(),
             1
         );
-        assert!(find(&assets, "nine").is_empty());
+        assert_eq!(find(&assets, "nine"), [] as [serde_json::Value; 0]);
     }
 
     // `DATA-11` review `SHOULD-FIX 8` changed this test (rule 2: the rule it

@@ -1606,7 +1606,7 @@ mod tests {
         assert_eq!(usage["avgLatencyMs"], 0);
         assert_eq!(usage["frequentUsers"], json!([]));
         assert_eq!(usage["frequentQueries"], json!([]));
-        assert!(recent.is_empty());
+        assert_eq!(recent, [] as [serde_json::Value; 0]);
     }
 
     /// `DATA-15` F2: queries that differ only in their literals are one
@@ -2063,7 +2063,10 @@ mod tests {
         let c = classify(&other, &tables(&["silver.orders"]));
         assert_eq!(c.level, "internal");
         assert!(!c.from_rule);
-        assert!(c.columns.is_empty());
+        assert_eq!(
+            c.columns,
+            [] as [(std::string::String, std::string::String); 0]
+        );
     }
 
     /// The newest rule wins, so a mistake is fixed by adding the right

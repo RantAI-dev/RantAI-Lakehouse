@@ -1432,10 +1432,12 @@ fn parse_s3_host(host: &str) -> Option<(&str, &str)> {
 pub(crate) fn parse_endpoint_host_port(endpoint: &str) -> Option<(&str, u16)> {
     let (authority, default_port) = if let Some(rest) = endpoint.strip_prefix("https://") {
         (rest, 443)
-    } else if let Some(rest) = endpoint.strip_prefix("http://") {
-        (rest, 80)
     } else {
-        return None;
+        // REL-9: `?` on the remaining prefix says the same thing as the
+        // explicit `else { return None; }` it replaced (clippy's
+        // `question_mark` under 1.99); an endpoint with neither scheme is
+        // not a URL this function understands.
+        (endpoint.strip_prefix("http://")?, 80)
     };
     let authority = authority.split(['/', '?', '#']).next()?;
     if authority.is_empty() {

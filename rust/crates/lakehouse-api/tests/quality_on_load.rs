@@ -325,7 +325,7 @@ async fn a_failed_run_triggers_nothing() {
     let (status, _) = app.run_finished("run-p3", &job_name(&id)).await;
     assert_eq!(status, StatusCode::CONFLICT);
     App::settle().await;
-    assert!(app.incident_assets().await.is_empty());
+    assert_eq!(app.incident_assets().await, [] as [std::string::String; 0]);
     assert_eq!(app.followups_recorded().await, 0);
     assert_eq!(app.count_checks().await, 0);
 }
@@ -422,7 +422,7 @@ async fn a_paused_connector_run_follows_up_no_tables() {
     assert_eq!(status, StatusCode::OK, "{body}");
     App::settle().await;
     assert_eq!(app.followups_recorded().await, 0);
-    assert!(app.incident_assets().await.is_empty());
+    assert_eq!(app.incident_assets().await, [] as [std::string::String; 0]);
 }
 
 // PR #106 review R1 BLOCKER 3
@@ -484,7 +484,7 @@ async fn a_failed_connector_run_triggers_nothing() {
     let (status, _) = app.run_finished("run-c2", "ingest_job").await;
     assert_eq!(status, StatusCode::CONFLICT);
     App::settle().await;
-    assert!(app.incident_assets().await.is_empty());
+    assert_eq!(app.incident_assets().await, [] as [std::string::String; 0]);
     assert_eq!(app.followups_recorded().await, 0);
 }
 
@@ -547,7 +547,7 @@ async fn an_upload_run_that_did_not_succeed_triggers_nothing() {
 
     app.run_finished("run-u2", "file_ingest_job").await;
     App::settle().await;
-    assert!(app.incident_assets().await.is_empty());
+    assert_eq!(app.incident_assets().await, [] as [std::string::String; 0]);
     assert_eq!(app.followups_recorded().await, 0);
 }
 
