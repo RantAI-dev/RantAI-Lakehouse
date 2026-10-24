@@ -1345,7 +1345,10 @@ mod run_spec_sql_enforcement {
             let cache = std::sync::Arc::new(crate::result_cache::ResultCache::new(8));
             // Each viewer twice: the second read of a viewer is the remembered
             // one and must still be that viewer's own.
-            for roles in [order[0], order[1], order[0], order[1]] {
+            for (i, roles) in [order[0], order[1], order[0], order[1]]
+                .into_iter()
+                .enumerate()
+            {
                 let scope = crate::result_cache::CacheScope::new(
                     std::sync::Arc::clone(&cache),
                     lakehouse_bi::cache_rule::CacheRule::Follow,
@@ -1369,7 +1372,22 @@ mod run_spec_sql_enforcement {
                     "ann@example.test"
                 };
                 assert_eq!(val["rows"][0]["email"], expected, "{roles:?}");
+                // BI-4 B review P-S3: the first read of each viewer computes,
+                // the second is the remembered one. Without this the test
+                // would pass with the cache switched off.
+                assert_eq!(
+                    val["remembered"],
+                    serde_json::json!(i >= 2),
+                    "read {i}: {roles:?}"
+                );
             }
+            // Two statements (one per viewer), each asked once.
+            let requests = server.received_requests().await.expect("recorded");
+            let asked = requests
+                .iter()
+                .filter(|r| !String::from_utf8_lossy(&r.body).contains("system."))
+                .count();
+            assert_eq!(asked, 2, "one engine request per viewer, not per read");
         }
         Ok(())
     }
