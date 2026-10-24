@@ -4668,6 +4668,7 @@ fn check_shaping(
             dimension: &input.dimension,
             breakdown: input.breakdown.as_deref().unwrap_or(""),
             grained: grain.is_some(),
+            truncated_grain: grain.is_some_and(Grain::is_truncation),
         },
     )
     .map_err(BiError::Validation)?;

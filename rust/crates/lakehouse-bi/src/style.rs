@@ -433,7 +433,63 @@ pub struct StyleFields {
     /// Conditional colours of a table, a pivot or a KPI.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conditional: Vec<CondRule>,
+    /// Colour the points of a scatter or bubble chart by cluster (`BI-17`
+    /// part B, plan D2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clusters: Option<Clusters>,
 }
+
+/// How many clusters: the console picks (`auto`), or a whole number of 2 to
+/// [`MAX_CLUSTERS`]. On the wire `"auto"` or the number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClusterCount {
+    /// Chosen by the console from the points on screen.
+    Auto,
+    /// Exactly this many (checked by [`check_style`]).
+    Fixed(u8),
+}
+
+impl Serialize for ClusterCount {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Auto => serializer.serialize_str("auto"),
+            Self::Fixed(k) => serializer.serialize_u8(*k),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ClusterCount {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Text(String),
+            Number(u64),
+        }
+        match Raw::deserialize(deserializer)? {
+            Raw::Text(t) if t == "auto" => Ok(Self::Auto),
+            Raw::Text(_) => Err(serde::de::Error::custom(
+                "clusters k is \"auto\" or a number from 2 to 10",
+            )),
+            // A number that does not fit is kept as the largest value so that
+            // `check_style` refuses it with its own sentence.
+            Raw::Number(n) => Ok(Self::Fixed(u8::try_from(n).unwrap_or(u8::MAX))),
+        }
+    }
+}
+
+/// The clusters setting of a scatter or bubble chart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Clusters {
+    /// The number of groups.
+    pub k: ClusterCount,
+}
+
+/// Fewest and most clusters a chart may ask for.
+pub const MIN_CLUSTERS: u8 = 2;
+/// See [`MIN_CLUSTERS`].
+pub const MAX_CLUSTERS: u8 = 10;
 
 impl StyleFields {
     /// Whether any field is set.
@@ -804,6 +860,18 @@ pub fn check_style(def: &ChartInput) -> Result<(), String> {
             key_ok(f, "a tooltip field")?;
         }
     }
+    if let Some(clusters) = &style.clusters {
+        if !matches!(kind, ChartKind::Scatter | ChartKind::Bubble) {
+            return Err(wrong("clusters", "a scatter or bubble chart"));
+        }
+        if let ClusterCount::Fixed(k) = clusters.k
+            && !(MIN_CLUSTERS..=MAX_CLUSTERS).contains(&k)
+        {
+            return Err(format!(
+                "clusters take \"auto\" or a number from {MIN_CLUSTERS} to {MAX_CLUSTERS}."
+            ));
+        }
+    }
     if !style.conditional.is_empty() {
         if !takes_conditional(kind) {
             return Err(wrong("conditional colours", "a table, pivot or KPI"));
@@ -1093,6 +1161,55 @@ mod tests {
         assert!(e.contains("tooltip fields is only for"), "{e}");
         let e = refused(&json!({"kind": "pie", "annotations": [note(1)]}));
         assert!(e.contains("a note is only for"), "{e}");
+    }
+
+    /// `BI-17` part B (plan D2): clusters are for a scatter or bubble chart,
+    /// "auto" or 2 to 10 groups.
+    #[test]
+    fn clusters_are_for_scatter_and_bubble_charts_with_auto_or_2_to_10_groups() {
+        for kind in ["scatter", "bubble"] {
+            for k in [json!("auto"), json!(2), json!(10)] {
+                check_style(&chart(&json!({"kind": kind, "clusters": {"k": k}}))).unwrap();
+            }
+        }
+        for k in [json!(1), json!(11), json!(0), json!(300)] {
+            let e = refused(&json!({"kind": "scatter", "clusters": {"k": k}}));
+            assert!(e.contains("\"auto\" or a number from 2 to 10"), "{k}: {e}");
+        }
+        let e = refused(&json!({"kind": "bar", "clusters": {"k": "auto"}}));
+        assert!(
+            e.contains("clusters is only for a scatter or bubble chart"),
+            "{e}"
+        );
+        for bad in [
+            json!({"k": "many"}),
+            json!({"k": -1}),
+            json!({"k": 2.5}),
+            json!({}),
+            json!({"k": 3, "x": 1}),
+        ] {
+            let mut base = json!({"title": "t", "mart": "m", "kind": "scatter", "dimension": "p", "measures": ["v"]});
+            base["clusters"] = bad.clone();
+            assert!(serde_json::from_value::<ChartInput>(base).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn clusters_write_back_as_they_were_read_and_an_old_chart_writes_none() {
+        for k in [json!("auto"), json!(4)] {
+            let c = chart(&json!({"kind": "scatter", "clusters": {"k": k}}));
+            assert_eq!(
+                serde_json::to_value(&c.style).unwrap(),
+                json!({"clusters": {"k": k}})
+            );
+        }
+        let old = chart(&json!({"kind": "scatter"}));
+        assert!(!old.style.is_used());
+        assert!(
+            !serde_json::to_string(&old.style)
+                .unwrap()
+                .contains("clusters")
+        );
     }
 
     #[test]
