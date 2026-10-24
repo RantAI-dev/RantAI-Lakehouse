@@ -1,6 +1,6 @@
 import type { EChartsOption } from "echarts";
 import { forecast, isRefusal, type Forecast } from "@/lib/forecast";
-import { addPeriods, bucketEnd, futureLabels, layPeriods, wallClockMs, type Periods } from "@/lib/forecast-periods";
+import { bucketEnd, futureLabels, layPeriods, parseBucket, wallClockMs, type Periods } from "@/lib/forecast-periods";
 import { isTruncation, type Grain } from "@/lib/time-grain";
 
 /**
@@ -32,6 +32,8 @@ export type ForecastPlan = {
   periods: Periods | null;
   /** Labels of the periods ahead, `result.point.length` of them. */
   labels: string[];
+  /** How many of the chart's rows are the history the forecast continues. */
+  rowsUsed?: number;
   /** The line under the chart. */
   note: string;
 };
@@ -60,9 +62,11 @@ export function planForecast(horizon: number, values: readonly number[], src: Fo
   if (isRefusal(result)) {
     plan = { result, periods: laid, labels: [], note: result.refused };
   } else {
-    // The first forecast period follows the last one used, which is the one before the unfinished period when that was left out.
-    const lastUsed = result.droppedCurrent ? addPeriods(grain, laid.last, -1) : laid.last;
-    plan = { result, periods: laid, labels: futureLabels(grain, lastUsed, result.point.length), note: [`Forecast: ${result.label}, 95 % band.`, ...result.notes].join(" ") };
+    // The first forecast period follows the last period the fit used (`lastIndex`): not "now", and not the end of the range.
+    const lastUsed = parseBucket(laid.starts[result.lastIndex]) ?? laid.last;
+    // The rows up to it are the actuals the forecast continues; later rows (an unfinished or empty end) stay as drawn.
+    const rowsUsed = laid.values.slice(0, result.lastIndex + 1).filter((v) => v !== null).length;
+    plan = { result, periods: laid, labels: futureLabels(grain, lastUsed, result.point.length), rowsUsed, note: [`Forecast: ${result.label}, 95 % band.`, ...result.notes].join(" ") };
   }
   if (cache.size > 24) cache.clear();
   cache.set(key, plan);
@@ -90,10 +94,15 @@ export function withForecastSeries(
   const rows = (Array.isArray(option.xAxis) ? (option.xAxis[0] as Obj) : (option.xAxis as Obj))?.data as unknown[] | undefined;
   if (!rows) return option;
   const h = result.point.length;
-  // Position of the first forecast period: after the last period the fit used.
-  const start = rows.length - (result.droppedCurrent ? 1 : 0);
-  const lastActual = opts.actual[start - 1];
-  // Categories beyond the axis's end are the periods ahead; one that the unfinished period already holds is not repeated.
+  // Position of the first forecast period: after the last row the fit used. When rows follow it
+  // (an unfinished period left out) the forecast sits on the category of the next period if the
+  // axis already has it, else after all the rows.
+  const used = plan.rowsUsed ?? rows.length;
+  const nextLabel = plan.labels[0];
+  const onAxis = used < rows.length && String(rows[used]) === nextLabel;
+  const start = used < rows.length && !onAxis ? rows.length : used;
+  const lastActual = start === used ? opts.actual[start - 1] : undefined;
+  // Categories beyond the axis's end are the periods ahead; one the axis already holds is not repeated.
   const extra = plan.labels.slice(Math.max(0, rows.length - start));
   const nulls = (n: number) => Array<number | null>(n).fill(null);
   const pad = (head: (number | null)[]) => [...nulls(start - 1), ...head];

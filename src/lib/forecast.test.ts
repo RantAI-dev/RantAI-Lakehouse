@@ -80,7 +80,7 @@ const gappy = (n: number, gaps: number) => {
 }
 
 test("12 % of periods missing is refused", () => {
-  assert.match(refusal(forecast({ values: gappy(50, 6), grain: "year", horizon: 3 })), /6 of 50 periods have no value, more than 10 %/)
+  assert.match(refusal(forecast({ values: gappy(50, 6), grain: "year", horizon: 3 })), /6 of the 50 periods from the first to the last have no data, more than 10 %/)
 })
 
 test("8 % missing is filled in a straight line and counted", () => {
@@ -91,10 +91,15 @@ test("8 % missing is filled in a straight line and counted", () => {
   assert.ok(solo.notes.some((n) => n.includes("1 period without a value was filled")))
 })
 
-test("a last period with no value is refused, leading gaps are trimmed", () => {
-  assert.match(refusal(forecast({ values: [1, 2, 3, 4, 5, 6, null], grain: "year", horizon: 2 })), /latest period has no value/)
+test("empty periods at either end are trimmed, not refused (BI-17 B QA fix F1)", () => {
   const r = ok(forecast({ values: [null, null, 1, 2, 3, 4, 5, 6, 7, 8], grain: "year", horizon: 2 }))
   assert.equal(r.periodsUsed, 8)
+  assert.equal(r.firstIndex, 2)
+  const end = ok(forecast({ values: [1, 2, 3, 4, 5, 6, null, null], grain: "year", horizon: 2 }))
+  assert.equal(end.periodsUsed, 6)
+  assert.equal(end.lastIndex, 5)
+  assert.ok(end.notes.includes("2 empty periods at the end are left out."))
+  assert.match(refusal(forecast({ values: [null, null, null], grain: "year", horizon: 2 })), /at least 5 periods; this chart has 0/)
 })
 
 test("the unfinished current period is left out, by a fake clock", () => {

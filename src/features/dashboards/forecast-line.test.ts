@@ -1,6 +1,7 @@
 import assert from "node:assert/strict"
 import test from "node:test"
 import reference from "@/lib/forecast-reference.json"
+import { bucketLabel } from "@/lib/time-grain"
 import { buildOption, forecastNote, withReferenceLines, type LineContext } from "./chart-option"
 
 // BI-17 part B, T4 (plan D4): the forecast is drawn from the rows on screen.
@@ -19,7 +20,7 @@ const NOW = Date.UTC(2027, 5, 20) // 20 June 2027, well after the data ends
 function chart(opts: { kind?: "line" | "bar" | "area"; values?: number[]; buckets?: string[]; grain?: string; now?: number; breakdown?: boolean; line?: Obj } = {}) {
   const values = opts.values ?? AIR
   const buckets = opts.buckets ?? months(values.length, 2026, 12)
-  const labels = buckets.map((b) => b.slice(0, 7))
+  const labels = buckets.map((b) => bucketLabel((opts.grain ?? "month") as never, b))
   const rows = labels.map((x, i) => ({ x, v: values[i] }))
   const built = buildOption({ kind: opts.kind ?? "line", x: "x", y: "v" }, rows, false)
   const line = { kind: "forecast", horizon: 6, ...(opts.line ?? {}) } as never
@@ -39,7 +40,7 @@ test("a monthly line gets six future months, a dashed line and a stacked band", 
   assert.equal(option.series.length, 4)
   const [actual, lower, width, point] = option.series
   assert.equal((actual.data as unknown[]).length, 48)
-  assert.deepEqual(option.xAxis.data.slice(-8), ["2026-11", "2026-12", "Jan 2027", "Feb 2027", "Mar 2027", "Apr 2027", "May 2027", "Jun 2027"])
+  assert.deepEqual(option.xAxis.data.slice(-8), ["Nov 2026", "Dec 2026", "Jan 2027", "Feb 2027", "Mar 2027", "Apr 2027", "May 2027", "Jun 2027"])
   assert.equal(option.xAxis.data.length, 54)
   // The line starts on the last actual point and runs six periods; the band is stacked under it.
   const data = point.data as (number | null)[]
@@ -126,4 +127,57 @@ test("a chart with no forecast line gets no forecast series, labels or note", ()
   assert.equal(out.xAxis.data.length, 48)
   assert.equal(forecastNote(undefined, undefined, false), undefined)
   assert.equal(forecastNote([{ kind: "average" } as never], { values: () => AIR }, false), undefined)
+})
+
+// BI-17 B QA fix F1/F2: "Visitors over time (BI-9 QA)" is a daily line chart of
+// 153 rows over about 14 months whose last row (2026-11-12) is after today
+// (2026-10-24). Most days have no row, so the honest answer is the gap rule;
+// it used to say "The latest period has no value" because the last row was
+// dropped as unfinished and the day before it had no row.
+function sparseDaily(): { buckets: string[]; values: number[] } {
+  const buckets: string[] = []
+  const end = Date.UTC(2026, 10, 12)
+  // 153 distinct days, roughly every 2.8 days back from 12 Nov 2026.
+  for (let i = 0; i < 153; i++) buckets.unshift(new Date(end - Math.round(i * 2.8) * 86_400_000).toISOString().slice(0, 10))
+  const unique = [...new Set(buckets)]
+  return { buckets: unique, values: unique.map((_, i) => 8000 + (i % 7) * 100 + i * 5) }
+}
+const TODAY = Date.UTC(2026, 9, 24, 9, 0)
+
+test("a sparse daily chart that ends in the future says the days are missing, not that the latest period is empty", () => {
+  const { buckets, values } = sparseDaily()
+  const { note, option, built } = chart({ values, buckets, grain: "day", now: TODAY, line: { horizon: 30 } })
+  assert.match(note ?? "", /of the \d+ periods from the first to the last have no data, more than 10 %/)
+  assert.match(note ?? "", /coarser period \(for example month\)/)
+  assert.doesNotMatch(note ?? "", /latest period/)
+  assert.equal(option.series.length, (built.series as unknown[]).length)
+})
+
+test("the same data grouped by month forecasts", () => {
+  const { buckets, values } = sparseDaily()
+  const byMonth = new Map<string, number>()
+  buckets.forEach((b, i) => byMonth.set(`${b.slice(0, 7)}-01`, (byMonth.get(`${b.slice(0, 7)}-01`) ?? 0) + values[i]))
+  const months = [...byMonth.keys()]
+  const { note, option } = chart({ values: [...byMonth.values()], buckets: months, grain: "month", now: TODAY, line: { horizon: 6 } })
+  assert.ok(note?.startsWith("Forecast: "))
+  assert.equal(option.series.length, 4)
+  assert.ok(note?.includes("current period is not finished"))
+})
+
+test("a dense daily chart that ends in the future and on a day with no row continues from its last day with data", () => {
+  // 100 consecutive days, then the last row two days after a one-day gap, dated after today.
+  const start = Date.UTC(2026, 6, 1)
+  const buckets = Array.from({ length: 100 }, (_, i) => new Date(start + i * 86_400_000).toISOString().slice(0, 10))
+  const values = buckets.map((_, i) => 5000 + 20 * i + (i % 7) * 50)
+  buckets.push(new Date(start + 102 * 86_400_000).toISOString().slice(0, 10)) // 2026-10-11 + 2 days
+  values.push(7000)
+  const { note, option } = chart({ values, buckets, grain: "day", now: Date.UTC(2026, 9, 11, 9), line: { horizon: 5 } })
+  assert.ok(note?.startsWith("Forecast: "))
+  assert.equal(option.series.length, 4)
+  // History ended on the last day with data before the unfinished one; the forecast follows that day.
+  assert.match(note ?? "", /current period is not finished/)
+  assert.match(note ?? "", /2 empty periods at the end are left out/)
+  // The last day with data is 8 Oct, so the first day ahead is 9 Oct (the axis keeps the unfinished 11 Oct row as drawn).
+  const labels = option.xAxis.data
+  assert.equal(labels[labels.length - 5], "2026-10-09")
 })

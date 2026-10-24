@@ -76,6 +76,9 @@ export type Forecast = {
   upper: number[]
   /** Periods the fit used, after the unfinished one was left out and gaps were filled. */
   periodsUsed: number
+  /** Indexes into `input.values` of the first and last period the fit used. */
+  firstIndex: number
+  lastIndex: number
   /** Periods without a value that were filled in a straight line. */
   filled: number
   droppedCurrent: boolean
@@ -307,10 +310,17 @@ export function forecast(input: ForecastInput): Forecast | ForecastRefusal {
     notes.push("The current period is not finished and is left out.")
   }
   const isValue = (v: number | null) => typeof v === "number" && Number.isFinite(v)
-  while (values.length && !isValue(values[0])) values.shift()
-  if (values.length && !isValue(values[values.length - 1])) {
-    return { refused: "The latest period has no value, so there is nothing to forecast from." }
-  }
+  // BI-17 B QA fix F1: the history runs from the first to the last period that
+  // has a value. Empty periods at either end are not data (a daily chart with
+  // a row for only some days can end on an empty day once the unfinished one
+  // is left out), so they are trimmed, not refused; gaps inside keep the 10 %
+  // rule below. The forecast then continues from the last period with a value.
+  let firstIndex = 0
+  while (values.length && !isValue(values[0])) { values.shift(); firstIndex++ }
+  let trimmedEnd = 0
+  while (values.length && !isValue(values[values.length - 1])) { values.pop(); trimmedEnd++ }
+  if (trimmedEnd > 0) notes.push(`${trimmedEnd} empty ${trimmedEnd === 1 ? "period" : "periods"} at the end ${trimmedEnd === 1 ? "is" : "are"} left out.`)
+  const lastIndex = firstIndex + values.length - 1
   const n = values.length
   if (n < MIN_PERIODS) {
     const left = droppedCurrent ? " (the unfinished current period is left out)" : ""
@@ -318,8 +328,10 @@ export function forecast(input: ForecastInput): Forecast | ForecastRefusal {
   }
   const missing = values.filter((v) => !isValue(v)).length
   if (missing / n > MAX_GAP_SHARE) {
+    // F1: say what is true: the rows skip too many periods. A coarser grouping has fewer empty ones.
+    const finer = ["minute", "hour", "day", "week"].includes(String(input.grain))
     return {
-      refused: `${missing} of ${n} periods have no value, more than ${Math.round(MAX_GAP_SHARE * 100)} %; a forecast would be guessing.`,
+      refused: `${missing} of the ${n} periods from the first to the last have no data, more than ${Math.round(MAX_GAP_SHARE * 100)} %, so a forecast would be guessing.${finer ? " Group the dates by a coarser period (for example month) to forecast this chart." : ""}`,
     }
   }
   const { y, filled } = interpolate(values)
@@ -377,6 +389,8 @@ export function forecast(input: ForecastInput): Forecast | ForecastRefusal {
     lower,
     upper,
     periodsUsed: n,
+    firstIndex,
+    lastIndex,
     filled,
     droppedCurrent,
     notes,
