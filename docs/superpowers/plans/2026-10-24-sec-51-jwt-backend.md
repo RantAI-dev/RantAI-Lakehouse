@@ -150,3 +150,13 @@ change in `Cargo.lock` is sixteen removals, `crypto-bigint` among them
 (`grep` = 0). `rsa` stays, so the `RUSTSEC-2023-0071` ignores stay. No
 `BLOCKER`. The developer's T2 proof stopped at the disk guard; the
 planner's full run below replaces it.
+
+### Planner's verification (2026-10-24)
+
+On `d9f61f44`: fmt and workspace clippy clean on 1.99.1; Rust 134 suites,
+7393 passed, 0 failed, 44 ignored; typecheck OK; bun 2690 pass, 0 fail,
+2 skip; Python lints OK; Dagster 2144 passed; compose config OK; gitleaks
+no leaks. CI on `7eac7a07` (after merging `main`, #247): every check
+green, `cargo audit` and `cargo deny` included; `SRC-3 (A)` failed once
+on a registry 502 while pulling images and passed on re-run. No open
+`BLOCKER`.
