@@ -1655,6 +1655,14 @@ pub trait SqlGate: Send + Sync {
     /// A fixed, non-leaking refusal message when `sql` may not run; the
     /// caller skips that value rather than running anything else.
     async fn gate(&self, sql: &str) -> Result<String, String>;
+
+    /// Whether dashboard `board_id` is restricted ("only the people listed",
+    /// itself or through a folder above it). A digest leaves the console to
+    /// whoever the rule names, outside the dashboard's rules, so a restricted
+    /// board's digest is skipped, not sent (`BI-19` B1 review R6, owner
+    /// decision Q-R12). No default: an implementer must answer, and answer
+    /// `true` when it cannot tell (fail closed).
+    async fn board_restricted(&self, board_id: &str) -> bool;
 }
 
 /// Plan 1f pure helper: "is this pipeline currently late?" Lives here
@@ -2527,6 +2535,15 @@ async fn run_digest(
     rule: &AlertRule,
 ) -> RunResult {
     let board = rule.board.as_deref().unwrap_or("");
+    // BI-19 B1 review R6: a restricted dashboard's digest is not sent outside
+    // the console; the run records why instead of delivering.
+    if gate.board_restricted(board).await {
+        return skipped(
+            rule,
+            "The dashboard is restricted to the people listed, so its digest is not sent outside the console."
+                .to_owned(),
+        );
+    }
     match digest_text(ch, gate, board).await {
         Ok(text) => {
             let title = format!("📊 Digest: {}", rule.name);
@@ -2727,6 +2744,9 @@ mod tests {
         async fn gate(&self, sql: &str) -> Result<String, String> {
             Ok(format!("{sql} /* GOVERNED */"))
         }
+        async fn board_restricted(&self, _board_id: &str) -> bool {
+            false
+        }
     }
 
     struct RefuseGate;
@@ -2734,6 +2754,9 @@ mod tests {
     impl SqlGate for RefuseGate {
         async fn gate(&self, _sql: &str) -> Result<String, String> {
             Err("refused by policy".to_owned())
+        }
+        async fn board_restricted(&self, _board_id: &str) -> bool {
+            false
         }
     }
 
@@ -4314,6 +4337,21 @@ mod tests {
         async fn gate(&self, sql: &str) -> Result<String, String> {
             Ok(sql.to_owned())
         }
+        async fn board_restricted(&self, _board_id: &str) -> bool {
+            false
+        }
+    }
+
+    /// `BI-19` B1 review R6: answers that every board is restricted.
+    struct RestrictedGate;
+    #[async_trait::async_trait]
+    impl SqlGate for RestrictedGate {
+        async fn gate(&self, sql: &str) -> Result<String, String> {
+            Ok(sql.to_owned())
+        }
+        async fn board_restricted(&self, _board_id: &str) -> bool {
+            true
+        }
     }
 
     /// Against the dev engine: the metric `total_visitors_demo` (`Sum([visitors])`
@@ -4895,6 +4933,37 @@ mod tests {
     /// somebody's personal space is "not found" there (the statement carries the
     /// owner restriction, so the store never hands the row back), and so is one
     /// in the trash (`is_deleted = 0`); the digest says so and sends no numbers.
+    /// `BI-19` B1 review R6 / owner decision Q-R12: a digest of a restricted
+    /// dashboard is skipped with a reason, and nothing is read or sent.
+    #[tokio::test]
+    async fn a_digest_of_a_restricted_dashboard_is_skipped_with_a_reason() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": [], "data": [], "rows": 0,
+            })))
+            .mount(&server)
+            .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let http = test_webhook_sender();
+        let email = no_smtp_email_sender();
+        let mut rule = freshness_rule("t");
+        rule.kind = AlertKind::Digest;
+        rule.board = Some("b_restricted".to_owned());
+        let result = run_one(&ch, &http, &email, None, None, &RestrictedGate, &rule).await;
+        assert!(!result.fired);
+        assert!(
+            result
+                .skipped
+                .as_deref()
+                .is_some_and(|r| r.contains("restricted")),
+            "{:?}",
+            result.skipped
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn a_digest_of_a_private_or_deleted_dashboard_is_not_found() {
         use wiremock::matchers::{body_string_contains, method};

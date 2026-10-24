@@ -444,9 +444,7 @@ async fn build_and_send(
     let rows = subscriptions::recipients(pool, sub.id)
         .await
         .map_err(|_| stop(DATABASE_DOWN))?;
-    let allowed_users =
-        users_who_may_receive(state, &rows, &owner, &settings.download_denied_roles).await;
-    let audience = audience_of(&rows, &settings.report_allowed_domains, &allowed_users);
+    let audience = audience_for(state, &rows, &owner, (&sub.board, &settings)).await;
     if audience.addresses.is_empty() {
         return Err(stop(NOBODY_LEFT));
     }
@@ -601,6 +599,37 @@ fn audience_of(
     }
 }
 
+/// Who the report goes to, `build_and_send`'s recipients step: the console
+/// users who may receive it today and the outside addresses still allowed.
+///
+/// `BI-19` B1 owner decision Q-R12: a restricted dashboard's report goes only to
+/// console users who see it; with no domain allowed, no outside address is
+/// addressed, and each is counted as left out (the note says why). A store that
+/// cannot answer counts as restricted (fail closed).
+async fn audience_for(
+    state: &AppState,
+    rows: &[RecipientRow],
+    owner: &Principal,
+    (board, settings): (&str, &crate::routes::settings::FormatSettings),
+) -> Audience {
+    let allowed_users =
+        users_who_may_receive(state, rows, owner, (board, &settings.download_denied_roles)).await;
+    let restricted = crate::routes::dashboard_access::board_is_restricted(
+        state.pg.as_deref(),
+        &state.clickhouse,
+        board,
+    )
+    .await
+    .unwrap_or(true);
+    let no_domains: &[String] = &[];
+    let domains = if restricted {
+        no_domains
+    } else {
+        &settings.report_allowed_domains
+    };
+    audience_of(rows, domains, &allowed_users)
+}
+
 /// The console recipients who may be sent this report today (`RPT-1` review fix
 /// (SHOULD-FIX) R8; planner default, the owner confirms at the QA): they can
 /// still view dashboards, their roles may download, and, when the owner belongs
@@ -610,7 +639,7 @@ async fn users_who_may_receive(
     state: &AppState,
     rows: &[RecipientRow],
     owner: &Principal,
-    denied_roles: &[String],
+    (board, denied_roles): (&str, &[String]),
 ) -> std::collections::HashSet<uuid::Uuid> {
     let mut allowed = std::collections::HashSet::new();
     for id in rows.iter().filter_map(|r| r.user_id) {
@@ -623,7 +652,18 @@ async fn users_who_may_receive(
                 .tenant_ids
                 .iter()
                 .any(|t| owner.tenant_ids.contains(t));
+        // BI-19 B1 review R12: the recipient's own resolved reach decides, not
+        // only `dashboard:read`: somebody the rules leave out of a restricted
+        // dashboard is not sent its report. A failure to resolve leaves them out.
+        let sees_board = match viewer_for(state, &person).await {
+            Ok(viewer) if board == store::DEFAULT_BOARD_ID => viewer.sees_builtin(),
+            Ok(viewer) => store::get_board(&state.clickhouse, board, &viewer)
+                .await
+                .is_ok_and(|found| found.is_some()),
+            Err(_) => false,
+        };
         if person.has("dashboard:read")
+            && sees_board
             && crate::routes::settings::may_download(&person, denied_roles)
             && shares_a_tenant
         {
@@ -635,11 +675,11 @@ async fn users_who_may_receive(
 
 fn left_out_recipients(count: usize) -> String {
     if count == 1 {
-        "1 recipient was left out: they are disabled, may no longer view or download dashboards, are outside the owner's tenants, or their domain is no longer allowed."
+        "1 recipient was left out: they are disabled, may no longer view or download dashboards, are outside the owner's tenants, cannot see a restricted dashboard, or their domain is no longer allowed."
             .to_owned()
     } else {
         format!(
-            "{count} recipients were left out: they are disabled, may no longer view or download dashboards, are outside the owner's tenants, or their domain is no longer allowed."
+            "{count} recipients were left out: they are disabled, may no longer view or download dashboards, are outside the owner's tenants, cannot see a restricted dashboard, or their domain is no longer allowed."
         )
     }
 }
@@ -1398,6 +1438,23 @@ mod tests {
         assert_eq!(none.addresses, ["press@partner.example"]);
         assert_eq!(none.outside, ["press@partner.example"]);
         assert_eq!(none.left_out, 4);
+    }
+
+    /// BI-19 B1 owner decision Q-R12: for a restricted dashboard the runner
+    /// passes no allowed domain, so every outside address is left out and
+    /// counted while the console users who may receive it still get it.
+    #[test]
+    fn a_restricted_dashboards_report_leaves_out_every_outside_address() {
+        let rows = vec![
+            user_row("active", "ann@company.example"),
+            outside_row("press@partner.example"),
+        ];
+        let everyone: std::collections::HashSet<uuid::Uuid> =
+            rows.iter().filter_map(|r| r.user_id).collect();
+        let got = audience_of(&rows, &[], &everyone);
+        assert_eq!(got.addresses, ["ann@company.example"]);
+        assert_eq!(got.outside, Vec::<String>::new());
+        assert_eq!(got.left_out, 1);
     }
 
     #[test]

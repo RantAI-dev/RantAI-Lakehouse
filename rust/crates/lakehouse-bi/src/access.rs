@@ -229,6 +229,20 @@ impl Viewer {
         }
     }
 
+    /// Somebody who sees no dashboard at all: no unowned board, no personal
+    /// space, no folder. For the callers that need a viewer but hold neither
+    /// `dashboard:read` nor a rule (`BI-19` B1 review R3), where the baseline
+    /// would show them what they must not see. Fails closed.
+    #[must_use]
+    pub fn nothing() -> Self {
+        Self {
+            id: String::new(),
+            all: false,
+            boards: Scope::Only(Vec::new()),
+            folders: Scope::Only(Vec::new()),
+        }
+    }
+
     /// The server itself, for the work that must see every row: the
     /// version snapshot, the trash sweep, the cascade of a delete. Never built
     /// from a request.
@@ -446,6 +460,17 @@ impl AccessMap {
         }
     }
 
+    /// Whether the dashboard `id` in folder `folder_id` is restricted, by its
+    /// own mark or by a folder above it. What leaves the console to people
+    /// outside the rules (a digest, a report to an outside address) is refused
+    /// for such a dashboard (`BI-19` B1 owner decision Q-R12). A corrupt
+    /// folder chain counts as restricted (fail closed).
+    #[must_use]
+    pub fn board_is_restricted(&self, id: &str, folder_id: &str) -> bool {
+        self.path(ItemKind::Board, id, folder_id)
+            .is_none_or(|path| path.iter().any(|item| self.marks.contains(item)))
+    }
+
     fn owner_level(&self, owner: &str) -> Option<Level> {
         (!self.user_id.is_empty() && owner == self.user_id).then_some(Level::Manage)
     }
@@ -471,9 +496,23 @@ impl AccessMap {
 
     fn resolve(&self, kind: ItemKind, id: &str, folder_id: &str) -> Option<Level> {
         let path = self.path(kind, id, folder_id)?;
-        let restricted = path.iter().any(|item| self.marks.contains(item));
-        let from_start = if restricted { None } else { self.baseline };
-        let from_rules = path.iter().filter_map(|item| self.grants.get(item)).max();
+        // BI-19 B1 owner decision Q-R14: a restriction also ends the rules
+        // inherited from above it. Going up from the item, the rules count up
+        // to and including the nearest restricted item on the path (the first
+        // mark): "only the people listed" is a fresh list, so
+        // managing a parent folder never opens a restricted child. Without a
+        // mark the whole path counts, as before.
+        let nearest_mark = path.iter().position(|item| self.marks.contains(item));
+        let from_start = if nearest_mark.is_some() {
+            None
+        } else {
+            self.baseline
+        };
+        let counted = nearest_mark.map_or(path.len(), |i| i + 1);
+        let from_rules = path[..counted]
+            .iter()
+            .filter_map(|item| self.grants.get(item))
+            .max();
         from_start.into_iter().chain(from_rules.copied()).max()
     }
 
@@ -664,6 +703,66 @@ mod tests {
         );
         assert_eq!(m.level_for_board("secret", "f1", ""), None);
         assert_eq!(m.level_for_board("open", "f1", ""), Some(Level::View));
+    }
+
+    /// BI-19 B1 owner decision Q-R14: a restriction ends the rules inherited
+    /// from above it.
+    #[test]
+    fn a_rule_on_a_parent_folder_does_not_open_a_restricted_child() {
+        let grants = [grant(ItemKind::Folder, "f1", Level::Manage)];
+        // The person manages f1 through a rule: f1 and an unrestricted f2
+        // below it are theirs, a restricted f3 below that is not.
+        let m = map(None, &four_levels(), &grants, &[(ItemKind::Folder, "f3")]);
+        assert_eq!(m.level_for_folder("f1"), Some(Level::Manage));
+        assert_eq!(m.level_for_folder("f2"), Some(Level::Manage));
+        assert_eq!(m.level_for_folder("f3"), None);
+        assert_eq!(m.level_for_board("deep", "f4", ""), None);
+        // A restricted dashboard directly under f1 is closed too, and a rule
+        // on the dashboard itself, or on a restricted item between, opens it.
+        let m = map(None, &four_levels(), &grants, &[(ItemKind::Board, "b1")]);
+        assert_eq!(m.level_for_board("b1", "f2", ""), None);
+        assert_eq!(m.level_for_board("b2", "f2", ""), Some(Level::Manage));
+        let mut with_own = grants.to_vec();
+        with_own.push(grant(ItemKind::Board, "b1", Level::View));
+        let m = map(None, &four_levels(), &with_own, &[(ItemKind::Board, "b1")]);
+        assert_eq!(m.level_for_board("b1", "f2", ""), Some(Level::View));
+        // A rule above the nearest restricted item does not count, but one on
+        // a restricted item between the target and the top still does.
+        let mid = [grant(ItemKind::Folder, "f2", Level::Edit)];
+        let m = map(
+            None,
+            &four_levels(),
+            &[mid[0].clone(), grant(ItemKind::Folder, "f1", Level::Manage)],
+            &[(ItemKind::Folder, "f2"), (ItemKind::Folder, "f4")],
+        );
+        assert_eq!(m.level_for_board("b", "f4", ""), None);
+        assert_eq!(m.level_for_board("b", "f3", ""), Some(Level::Edit));
+    }
+
+    /// BI-19 B1 review R3: the viewer for somebody with neither a starting
+    /// point nor a rule sees no dashboard, chart or folder at all.
+    #[test]
+    fn the_nothing_viewer_sees_no_dashboard_and_no_folder() {
+        let v = Viewer::nothing();
+        assert!(!v.sees_board("b1", ""));
+        assert!(!v.sees_folder("f1", ""));
+        assert!(!v.sees_builtin());
+        assert!(v.owner_clause().contains("1 = 0"), "{}", v.owner_clause());
+        assert!(v.chart_clause().contains("1 = 0"), "{}", v.chart_clause());
+    }
+
+    #[test]
+    fn a_dashboard_is_restricted_by_its_own_mark_or_a_folder_above() {
+        let m = map(
+            Some(Level::View),
+            &four_levels(),
+            &[],
+            &[(ItemKind::Folder, "f2"), (ItemKind::Board, "b9")],
+        );
+        assert!(m.board_is_restricted("b1", "f3"));
+        assert!(m.board_is_restricted("b9", "f1"));
+        assert!(!m.board_is_restricted("b1", "f1"));
+        assert!(!m.board_is_restricted("b1", ""));
     }
 
     #[test]

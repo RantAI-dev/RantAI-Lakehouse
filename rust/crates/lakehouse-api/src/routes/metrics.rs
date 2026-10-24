@@ -392,12 +392,13 @@ pub async fn list(
     // The counts and the SQL sources' titles are a courtesy: when they cannot
     // be read the list still answers.
     // The count is of the charts the caller may see (BI-18 part C, part 2).
-    let charts = store::list_stored_charts(
-        ch,
-        &crate::routes::calc_fields::viewer_or_anonymous(principal.as_ref()),
-    )
-    .await
-    .unwrap_or_default();
+    // BI-19 B1 review R3: the resolved viewer; a failure to resolve it counts nothing.
+    let viewer = crate::routes::dashboard_access::usage_viewer(&state, principal.as_ref())
+        .await
+        .unwrap_or_else(|_| lakehouse_bi::access::Viewer::nothing());
+    let charts = store::list_stored_charts(ch, &viewer)
+        .await
+        .unwrap_or_default();
     let titles: std::collections::HashMap<String, String> = lakehouse_bi::sources::list_sources(ch)
         .await
         .unwrap_or_default()
@@ -567,7 +568,9 @@ pub async fn delete(
     let used = metric_usage(
         ch,
         &current,
-        &crate::routes::calc_fields::viewer_or_anonymous(principal.as_ref()),
+        // BI-19 B1 review R3: the resolved viewer, so a restricted dashboard
+        // is "a dashboard you cannot see", not its title.
+        &crate::routes::dashboard_access::usage_viewer(&state, principal.as_ref()).await?,
     )
     .await?;
     if !used.is_empty() {
@@ -601,7 +604,9 @@ pub async fn usage(
     let used = metric_usage(
         ch,
         &current,
-        &crate::routes::calc_fields::viewer_or_anonymous(principal.as_ref()),
+        // BI-19 B1 review R3: the resolved viewer, so a restricted dashboard
+        // is "a dashboard you cannot see", not its title.
+        &crate::routes::dashboard_access::usage_viewer(&state, principal.as_ref()).await?,
     )
     .await?;
     Ok(ApiJson(json!({
@@ -904,7 +909,9 @@ pub async fn delete_segment(
     let used = segment_usage(
         ch,
         &current,
-        &crate::routes::calc_fields::viewer_or_anonymous(principal.as_ref()),
+        // BI-19 B1 review R3: the resolved viewer, so a restricted dashboard
+        // is "a dashboard you cannot see", not its title.
+        &crate::routes::dashboard_access::usage_viewer(&state, principal.as_ref()).await?,
     )
     .await?;
     if !used.is_empty() {

@@ -11,9 +11,13 @@ import {
   dashboardService, type AccessKind, type AccessLevel, type GranteeMatches, type ItemAccess,
 } from "@/services";
 
-/** `BI-19` part B, feature B9: said next to the switch, because it surprises people. */
+/**
+ * `BI-19` part B, feature B9: said next to the switch, because it surprises
+ * people. The last sentence is BI-19 B1 owner decision Q-R14 (a restriction ends
+ * the rules inherited from above it).
+ */
 export const RESTRICTION_NOTE =
-  "Only the people and roles listed can open this. A public link or an embed on it keeps working: a manager made it on purpose.";
+  "Only the people and roles listed can open this. A public link or an embed on it keeps working: a manager made it on purpose. Permissions given on folders above it no longer apply to it.";
 
 /** What the page shows for a level word (an unknown word is shown as it is). */
 export function levelLabel(level: string): string {

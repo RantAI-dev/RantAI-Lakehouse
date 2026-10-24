@@ -150,7 +150,36 @@ pub(crate) async fn viewer_for(
     state: &AppState,
     principal: &Principal,
 ) -> Result<Viewer, ApiError> {
-    let baseline = baseline_of(principal);
+    resolve(state, principal, baseline_of(principal)).await
+}
+
+/// [`viewer_for`] for the write handlers' visibility check (`BI-19` B1 review
+/// R5, option a): the same resolution, so a dashboard the caller's rules and
+/// the restrictions leave out is a 404 for a writer too (it was reachable
+/// through duplicate, the public link, move and revert, several of which are
+/// reads in effect). The one difference is the starting point: a writer who
+/// holds `dashboard:write` without `dashboard:read` keeps the reach those
+/// routes always gave them (every unrestricted dashboard), not the 403 a read
+/// gives, so no existing writer is newly refused; a restriction still takes it
+/// away. The levels (view, edit, manage) are checked in T8.
+///
+/// # Errors
+///
+/// As [`viewer_for`].
+pub(crate) async fn viewer_for_write(
+    state: &AppState,
+    principal: &Principal,
+) -> Result<Viewer, ApiError> {
+    let baseline = baseline_of(principal)
+        .or_else(|| principal.has("dashboard:write").then_some(Level::Manage));
+    resolve(state, principal, baseline).await
+}
+
+async fn resolve(
+    state: &AppState,
+    principal: &Principal,
+    baseline: Option<Level>,
+) -> Result<Viewer, ApiError> {
     let (grants, marks) = read_rules(state, principal).await?;
     if baseline.is_none() && grants.is_empty() {
         return Err(refused());
@@ -177,6 +206,86 @@ pub(crate) async fn viewer_for(
     )
     .viewer(&placements)
     .map_err(too_many)
+}
+
+/// Whether dashboard `board_id` is restricted ("only the people listed"):
+/// by its own mark or a folder above it. What leaves the console to people the
+/// rules do not name (a digest, a report to an outside address) is refused for
+/// such a dashboard (`BI-19` B1 review R6/R12, owner decision Q-R12). Without
+/// Postgres nothing could have been marked; an unknown dashboard is not
+/// restricted (the caller's own checks answer it).
+///
+/// # Errors
+///
+/// The classified store error; the caller treats it as "restricted".
+pub(crate) async fn board_is_restricted(
+    pg: Option<&lakehouse_store::PgPool>,
+    ch: &lakehouse_clickhouse::ChClient,
+    board_id: &str,
+) -> Result<bool, ApiError> {
+    let Some(pg) = pg else {
+        return Ok(false);
+    };
+    let marks: Vec<(ItemKind, String)> = rules::all_restrictions(pg)
+        .await
+        .map_err(|e| store_failed(&e))?
+        .iter()
+        .filter_map(|m| Some((ItemKind::parse(&m.item_kind)?, m.item_id.clone())))
+        .collect();
+    if marks.is_empty() {
+        return Ok(false);
+    }
+    let Some(board) = store::get_board(ch, board_id, &Viewer::system())
+        .await
+        .map_err(|e| classify_ch_error(&e))?
+    else {
+        return Ok(false);
+    };
+    let tree = folders::list_folders(ch, &Viewer::system())
+        .await
+        .map_err(|e| classify_ch_error(&e))?;
+    let folder_id = board.folder_id.unwrap_or_default();
+    Ok(
+        AccessMap::new(String::new(), false, None, &tree, &[], &marks)
+            .board_is_restricted(board_id, &folder_id),
+    )
+}
+
+/// The viewer for the places that only *count or name* what uses something
+/// (metric, field, parameter and source usage, delete conflicts), `BI-19` B1
+/// review R3. A caller who holds neither `dashboard:read` nor a rule (a
+/// `metric:write` holder, say) is not refused, as it is not a dashboard read,
+/// but sees no dashboard: every chart of a dashboard they cannot see turns
+/// into "a dashboard you cannot see", never its title (never the baseline).
+/// With nobody attached the answer is the same.
+///
+/// # Errors
+///
+/// 503/500 as [`viewer_for`] when the rules cannot be read or are too many;
+/// the caller then gets no answer rather than a wider one.
+pub(crate) async fn usage_viewer(
+    state: &AppState,
+    principal: Option<&Extension<Principal>>,
+) -> Result<Viewer, ApiError> {
+    match principal {
+        Some(Extension(principal)) => usage_viewer_of(state, principal).await,
+        None => Ok(Viewer::nothing()),
+    }
+}
+
+/// [`usage_viewer`] for a handler that always has a principal.
+///
+/// # Errors
+///
+/// As [`usage_viewer`].
+pub(crate) async fn usage_viewer_of(
+    state: &AppState,
+    principal: &Principal,
+) -> Result<Viewer, ApiError> {
+    match viewer_for(state, principal).await {
+        Err(ApiError::PermissionDenied(_)) => Ok(Viewer::nothing()),
+        other => other,
+    }
 }
 
 // ── Who may see and change a dashboard's permissions (T7, plan D10) ────────
@@ -349,9 +458,6 @@ async fn access_json(state: &AppState, subject: &Subject) -> Result<Value, ApiEr
         .await
         .map_err(|e| store_failed(&e))?;
     let above_ids: Vec<String> = subject.ancestors.iter().map(|f| f.id.clone()).collect();
-    let inherited = rules::rules_for_items(pool, "folder", &above_ids)
-        .await
-        .map_err(|e| store_failed(&e))?;
     let marked_above: HashSet<String> = rules::all_restrictions(pool)
         .await
         .map_err(|e| store_failed(&e))?
@@ -359,6 +465,22 @@ async fn access_json(state: &AppState, subject: &Subject) -> Result<Value, ApiEr
         .filter(|m| m.item_kind == "folder" && above_ids.contains(&m.item_id))
         .map(|m| m.item_id)
         .collect();
+    // BI-19 B1 owner decision Q-R14: a restriction ends the rules inherited
+    // from above it, as `AccessMap` resolves them. An item that is itself
+    // restricted inherits nothing; otherwise the folders count up to and
+    // including the nearest restricted one (ancestors are nearest first).
+    let inherited_from: Vec<String> = if own_mark.is_some() {
+        Vec::new()
+    } else {
+        let end = above_ids
+            .iter()
+            .position(|id| marked_above.contains(id))
+            .map_or(above_ids.len(), |i| i + 1);
+        above_ids[..end].to_vec()
+    };
+    let inherited = rules::rules_for_items(pool, "folder", &inherited_from)
+        .await
+        .map_err(|e| store_failed(&e))?;
     let users: Vec<Uuid> = own
         .iter()
         .chain(&inherited)
@@ -518,6 +640,51 @@ pub async fn put_access(
     let (new_rules, levels) = checked_rules(&parsed.rules)?;
     check_levels(subject.level, &levels)?;
     let pool = pool_of(&state)?;
+    // BI-19 B1 review R11: every person and role must exist before anything is
+    // audited, so a refused change leaves no "access_change" event behind.
+    let wanted_users: Vec<Uuid> = new_rules.iter().filter_map(|r| r.user_id).collect();
+    let wanted_roles: Vec<Uuid> = new_rules.iter().filter_map(|r| r.role_id).collect();
+    let (found_users, found_roles) = (
+        rules::user_names(pool, &wanted_users)
+            .await
+            .map_err(|e| store_failed(&e))?,
+        rules::role_names(pool, &wanted_roles)
+            .await
+            .map_err(|e| store_failed(&e))?,
+    );
+    if wanted_users
+        .iter()
+        .any(|u| !found_users.iter().any(|(id, _, _)| id == u))
+        || wanted_roles
+            .iter()
+            .any(|r| !found_roles.iter().any(|(id, _)| id == r))
+    {
+        return Err(ApiError::BadRequest(UNKNOWN_GRANTEE.to_owned()).into());
+    }
+    let before = rules::rules_for_item(pool, kind.as_str(), &subject.id)
+        .await
+        .map_err(|e| store_failed(&e))?;
+    let was_restricted = rules::restriction_for_item(pool, kind.as_str(), &subject.id)
+        .await
+        .map_err(|e| store_failed(&e))?
+        .is_some();
+    // Ids and levels only: no names, no addresses in the audit trail.
+    let listed = |rows: &[(Option<Uuid>, Option<Uuid>, String)]| -> Vec<Value> {
+        rows.iter()
+            .map(|(user, role, level)| match user {
+                Some(id) => json!({ "kind": "user", "id": id, "level": level }),
+                None => json!({ "kind": "role", "id": role, "level": level }),
+            })
+            .collect()
+    };
+    let before_rows: Vec<_> = before
+        .iter()
+        .map(|r| (r.user_id, r.role_id, r.level.clone()))
+        .collect();
+    let after_rows: Vec<_> = new_rules
+        .iter()
+        .map(|r| (r.user_id, r.role_id, r.level.clone()))
+        .collect();
     crate::routes::dashboard::record_download_audit(
         &state,
         &principal,
@@ -530,7 +697,12 @@ pub async fn put_access(
             },
             &subject.id,
         ),
-        json!({ "rules": new_rules.len(), "restricted": parsed.restricted }),
+        json!({
+            "before": listed(&before_rows),
+            "after": listed(&after_rows),
+            "wasRestricted": was_restricted,
+            "restricted": parsed.restricted,
+        }),
     )
     .await
     .map_err(|_| ApiError::Unavailable(AUDIT_DOWN.to_owned()))?;

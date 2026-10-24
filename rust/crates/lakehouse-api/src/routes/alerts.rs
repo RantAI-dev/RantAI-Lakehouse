@@ -336,6 +336,73 @@ pub(crate) async fn authorise_existing_rule(
     }
 }
 
+/// The refusal for a digest of a restricted dashboard (owner decision Q-R12).
+const RESTRICTED_DIGEST: &str =
+    "A restricted dashboard's digest cannot be sent outside the console, so it cannot be saved.";
+
+/// `BI-19` B1 review R6 and owner decision Q-R12: a `digest` rule reads a
+/// dashboard and sends it to a mailbox or webhook, so saving one needs the
+/// dashboard visible to the caller (the same 404 as an unknown one otherwise)
+/// and not restricted ("only the people listed", itself or through a folder
+/// above it): the digest would go to people the rules do not name. Fails
+/// closed: a store that cannot answer refuses the save.
+async fn authorise_digest_board(
+    state: &AppState,
+    principal: Option<&Principal>,
+    id: Option<&str>,
+    input: &AlertRuleInput,
+) -> Result<(), ApiError> {
+    let stored = match id {
+        Some(id) => lakehouse_alerts::get_rule(&state.clickhouse, id)
+            .await
+            .map_err(|err| {
+                tracing::warn!(%err, "an alert rule could not be read before a change");
+                ApiError::Unavailable("the alert rules could not be read".to_owned())
+            })?,
+        None => None,
+    };
+    let is_digest = match input.kind.as_deref() {
+        Some(kind) => kind == "digest",
+        None => stored.as_ref().is_some_and(|r| r.kind == AlertKind::Digest),
+    };
+    if !is_digest {
+        return Ok(());
+    }
+    let board = input
+        .board
+        .as_deref()
+        .map(str::trim)
+        .filter(|b| !b.is_empty())
+        .or_else(|| stored.as_ref().and_then(|r| r.board.as_deref()))
+        .unwrap_or_default();
+    if board.is_empty() || board == lakehouse_bi::store::DEFAULT_BOARD_ID {
+        return Ok(());
+    }
+    let Some(principal) = principal else {
+        return Err(ApiError::unauthorized());
+    };
+    let viewer = crate::routes::dashboard_access::viewer_for(state, principal).await?;
+    let seen = lakehouse_bi::store::get_board(&state.clickhouse, board, &viewer)
+        .await
+        .map_err(|err| crate::routes::dashboard_folders::classify_ch_error(&err))?;
+    if seen.is_none() {
+        return Err(ApiError::NotFound(
+            crate::routes::dashboard_organise::BOARD_NOT_FOUND.to_owned(),
+        ));
+    }
+    let restricted = crate::routes::dashboard_access::board_is_restricted(
+        state.pg.as_deref(),
+        &state.clickhouse,
+        board,
+    )
+    .await
+    .unwrap_or(true);
+    if restricted {
+        return Err(ApiError::BadRequest(RESTRICTED_DIGEST.to_owned()));
+    }
+    Ok(())
+}
+
 /// `POST /api/alerts` — create a rule.
 ///
 /// # Errors
@@ -355,6 +422,13 @@ pub async fn create(
         principal.as_ref().map(|Extension(p)| p),
         input.kind.as_deref(),
         input.connector.as_deref(),
+    )
+    .await?;
+    authorise_digest_board(
+        &state,
+        principal.as_ref().map(|Extension(p)| p),
+        None,
+        &input,
     )
     .await?;
     let rule =
@@ -387,6 +461,13 @@ pub async fn update(
         &state,
         principal.as_ref().map(|Extension(p)| p),
         &id,
+        &input,
+    )
+    .await?;
+    authorise_digest_board(
+        &state,
+        principal.as_ref().map(|Extension(p)| p),
+        Some(&id),
         &input,
     )
     .await?;
@@ -650,6 +731,14 @@ impl SqlGate for ApiSqlGate<'_> {
         )
         .await
         .map_err(|err| crate::policy_engine::enforcement_error_message(&err).to_owned())
+    }
+
+    async fn board_restricted(&self, board_id: &str) -> bool {
+        // BI-19 B1 review R6: fail closed, a store that cannot answer counts as
+        // restricted (the digest is skipped, not sent).
+        crate::routes::dashboard_access::board_is_restricted(self.pg, self.ch, board_id)
+            .await
+            .unwrap_or(true)
     }
 }
 

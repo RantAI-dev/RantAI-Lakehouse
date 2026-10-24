@@ -64,7 +64,6 @@ use time::{Duration, OffsetDateTime};
 
 use crate::error::{ApiRejection, ApiResult};
 use crate::json::ApiJson;
-use crate::routes::dashboard_organise::viewer_of;
 use crate::state::AppState;
 use crate::upstream_error;
 
@@ -500,7 +499,11 @@ pub(crate) async fn managed_board(
     if id.is_empty() || id == store::DEFAULT_BOARD_ID {
         return Err(ApiError::BadRequest("invalid dashboard".to_owned()));
     }
-    store::get_board(&state.clickhouse, id, &viewer_of(principal))
+    // BI-19 B1 review R5: the resolved viewer, so a dashboard the caller's rules
+    // and the restrictions leave out is the same 404 as an unknown one (the
+    // GET returns, and the PUT makes, a live token).
+    let viewer = crate::routes::dashboard_access::viewer_for_write(state, principal).await?;
+    store::get_board(&state.clickhouse, id, &viewer)
         .await
         .map_err(|err| {
             upstream_error::ch_error_as(

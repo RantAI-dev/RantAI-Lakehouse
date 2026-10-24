@@ -35,7 +35,6 @@ use serde_json::{Value, json};
 
 use crate::error::ApiResult;
 use crate::json::ApiJson;
-use crate::routes::dashboard_organise::viewer_of;
 use crate::state::AppState;
 use crate::upstream_error;
 
@@ -197,7 +196,10 @@ pub async fn create(
 ) -> ApiResult<ApiJson<Value>> {
     let body: CreateBody = parse(&body)?;
     let ch = &state.clickhouse;
-    let all = folders::list_folders(ch, &viewer_of(&principal))
+    // BI-19 B1 review R5: the resolved viewer, so a folder the caller cannot see
+    // is a 404 whatever they try to do with it.
+    let viewer = crate::routes::dashboard_access::viewer_for_write(&state, &principal).await?;
+    let all = folders::list_folders(ch, &viewer)
         .await
         .map_err(|err| classify_ch_error(&err))?;
     let parent = body.parent_id.unwrap_or_default().trim().to_owned();
@@ -234,7 +236,10 @@ pub async fn update(
     let body: UpdateBody = parse(&body)?;
     let id = required_id(body.id.as_deref())?;
     let ch = &state.clickhouse;
-    let all = folders::list_folders(ch, &viewer_of(&principal))
+    // BI-19 B1 review R5: the resolved viewer, so a folder the caller cannot see
+    // is a 404 whatever they try to do with it.
+    let viewer = crate::routes::dashboard_access::viewer_for_write(&state, &principal).await?;
+    let all = folders::list_folders(ch, &viewer)
         .await
         .map_err(|err| classify_ch_error(&err))?;
     let current = all
@@ -282,7 +287,10 @@ pub async fn delete(
 ) -> ApiResult<ApiJson<Value>> {
     let id = required_id(q.id.as_deref())?;
     let ch = &state.clickhouse;
-    let all = folders::list_folders(ch, &viewer_of(&principal))
+    // BI-19 B1 review R5: the resolved viewer, so a folder the caller cannot see
+    // is a 404 whatever they try to do with it.
+    let viewer = crate::routes::dashboard_access::viewer_for_write(&state, &principal).await?;
+    let all = folders::list_folders(ch, &viewer)
         .await
         .map_err(|err| classify_ch_error(&err))?;
     let Some(folder) = all.iter().find(|f| f.id == id) else {
@@ -294,7 +302,10 @@ pub async fn delete(
     let subfolders = all.iter().filter(|f| f.parent_id == id).count();
     // An ordinary folder never holds a private dashboard, so counting what the
     // caller may see is counting all of it.
-    let boards = store::list_boards(ch, &viewer_of(&principal))
+    // R5: a folder may now hold a dashboard the caller cannot see (a restriction
+    // below it), and deleting the folder would orphan it, so the count is of
+    // every dashboard in it, not of the ones this caller sees.
+    let boards = store::list_boards(ch, &Viewer::system())
         .await
         .map_err(|err| classify_ch_error(&err))?
         .iter()
@@ -316,6 +327,15 @@ pub async fn delete(
     folders::delete_folder(ch, &id)
         .await
         .map_err(|err| classify_ch_error(&err))?;
+    // BI-19 B1 review R8: a deleted folder takes its rules and mark with it, so
+    // they cannot be attached to an id that is reused or read again.
+    if let Some(pg) = state.pg.as_deref() {
+        lakehouse_store::dashboard_access::delete_item(pg, "folder", &id)
+            .await
+            .map_err(|err| {
+                crate::upstream_error::internal_error(&crate::upstream_error::STORE, &err)
+            })?;
+    }
     Ok(ApiJson(json!({ "ok": true })))
 }
 

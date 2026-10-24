@@ -1634,7 +1634,7 @@ async fn a_parameter_shown_on_a_private_dashboard_blocks_its_delete_without_nami
     .await;
     let outcome = super::super::params::delete(
         State(state_for(&server)),
-        Some(Extension(person(ME, "dashboard:write"))),
+        Some(Extension(person(ME, "dashboard:read, dashboard:write"))),
         Query(serde_json::from_value(json!({ "id": "p_1" })).unwrap()),
     )
     .await;
@@ -1721,7 +1721,7 @@ async fn a_sql_source_used_by_a_private_chart_cannot_be_deleted_and_the_chart_is
     .await;
     let outcome = super::super::dashboard_sources::delete(
         State(state_for(&server)),
-        Extension(person(ME, "dashboard:write")),
+        Extension(person(ME, "dashboard:read, dashboard:write")),
         Query(serde_json::from_value(json!({ "id": "s_1" })).unwrap()),
     )
     .await;

@@ -272,7 +272,8 @@ pub async fn delete(
         .ok_or_else(|| ApiError::NotFound("parameter not found.".to_owned()))?;
     // A store that cannot be read refuses the delete: nothing can be shown to
     // be unused.
-    let viewer = crate::routes::calc_fields::viewer_or_anonymous(principal.as_ref());
+    // BI-19 B1 review R3: the resolved viewer, not the baseline.
+    let viewer = crate::routes::dashboard_access::usage_viewer(&state, principal.as_ref()).await?;
     let system = lakehouse_bi::access::Viewer::system();
     let (all_fields, seen, default_row) = tokio::try_join!(
         fields::list_fields(ch),

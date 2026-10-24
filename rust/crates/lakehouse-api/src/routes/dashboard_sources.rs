@@ -314,12 +314,11 @@ pub async fn delete(
         .await
         .map_err(|err| classify_ch_error(&err))?;
     if !sources::charts_using_source(&all, &id).is_empty() {
-        let mine = store::list_stored_charts(
-            ch,
-            &crate::routes::dashboard_organise::viewer_of(&principal),
-        )
-        .await
-        .map_err(|err| classify_ch_error(&err))?;
+        // BI-19 B1 review R3: the resolved viewer, not the baseline.
+        let viewer = crate::routes::dashboard_access::usage_viewer_of(&state, &principal).await?;
+        let mine = store::list_stored_charts(ch, &viewer)
+            .await
+            .map_err(|err| classify_ch_error(&err))?;
         let users = sources::charts_using_source(&mine, &id);
         let message = if users.is_empty() {
             "SQL source is still used by a dashboard you cannot see.".to_owned()

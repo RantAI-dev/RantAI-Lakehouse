@@ -76,6 +76,8 @@ impl Respond for Store {
                 .iter()
                 .filter(|(id, _, _)| only.as_ref().is_none_or(|o| o.iter().any(|i| i == id)))
                 .filter(|(id, _, _)| !hidden.iter().any(|h| h == id))
+                // An empty "only" list is `AND 1 = 0`: nothing.
+                .filter(|_| !sql.contains("AND 1 = 0"))
                 // A read by id (`AND id='b1'`) answers that dashboard only.
                 .filter(|(id, _, _)| by_id.as_ref().is_none_or(|wanted| wanted == id))
                 .filter(|(_, _, owner)| owner.is_empty() || sql.contains(&format!("owner_id = '{owner}'")) || !sql.contains("owner_id = ''"))
@@ -266,8 +268,13 @@ async fn only_somebody_who_manages_a_dashboard_reads_or_changes_its_permissions(
 
     // Somebody who can see it and does not manage it is refused; somebody who
     // cannot see it, and an id that does not exist, get the same 404.
+    // BI-19 B1 review R10: this asserted 200 although the comment and
+    // `managed_subject` say 403 (a reader holds view, not manage); corrected.
     let cookie = session_cookie_for_user(&pool, reader).await;
-    assert_eq!(get(&router, &cookie, get_access).await.0, StatusCode::OK);
+    assert_eq!(
+        get(&router, &cookie, get_access).await.0,
+        StatusCode::FORBIDDEN
+    );
     let cookie = session_cookie_for_user(&pool, guest).await;
     assert_eq!(
         get(&router, &cookie, get_access).await.0,
@@ -368,4 +375,258 @@ async fn a_manager_replaces_the_rules_and_the_change_is_audited_and_the_refusals
         .await
         .unwrap();
     assert_eq!(rules.len(), 1);
+}
+
+// ── BI-19 B1 review R1 to R6 ───────────────────────────────────────────────
+
+async fn send(
+    router: &axum::Router,
+    cookie: &str,
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+) -> (StatusCode, Value) {
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("cookie", cookie)
+                .header("content-type", "application/json")
+                .body(body.map_or_else(Body::empty, |b| Body::from(b.to_string())))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+/// `f1` is restricted to nobody in particular; `b_secret` sits in it.
+async fn restricted_folder(pool: &PgPool) {
+    replace_item(pool, "folder", "f1", &[], true, None)
+        .await
+        .unwrap();
+}
+
+/// R1: the assistant's `list_boards` shows an unlisted `dashboard:read`
+/// holder what the console shows them, not the restricted dashboard.
+#[tokio::test]
+async fn the_assistant_does_not_list_a_restricted_dashboard_to_an_unlisted_reader() {
+    let (router, pool, _ch) = app().await;
+    restricted_folder(&pool).await;
+    let reader = create_principal_with_permissions(&pool, "dashboard:read").await;
+    let cookie = session_cookie_for_user(&pool, reader).await;
+    let (status, body) = send(
+        &router,
+        &cookie,
+        "POST",
+        "/api/ai/tool",
+        Some(json!({ "tool": "list_boards", "args": {}, "mode": "ask" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let text = body["result"].to_string();
+    assert!(text.contains("b1"), "{text}");
+    assert!(!text.contains("b_secret"), "{text}");
+}
+
+/// R5: a writer who is not listed reaches a restricted dashboard through no
+/// write route: the public link, a move and a duplicate answer as for an id
+/// that does not exist.
+#[tokio::test]
+async fn an_unlisted_writer_gets_the_unknown_dashboard_answer_for_a_restricted_one() {
+    let (router, pool, _ch) = app().await;
+    restricted_folder(&pool).await;
+    let writer = create_principal_with_permissions(&pool, "dashboard:read, dashboard:write").await;
+    let cookie = session_cookie_for_user(&pool, writer).await;
+
+    for (method, uri, body) in [
+        ("GET", "/api/dashboard/public-link?board={}", None),
+        (
+            "POST",
+            "/api/dashboard/boards",
+            Some(json!({ "duplicate": "{}" })),
+        ),
+        (
+            "PUT",
+            "/api/dashboard/boards",
+            Some(json!({ "id": "{}", "folderId": "" })),
+        ),
+    ] {
+        let fill = |id: &str| {
+            (
+                uri.replace("{}", id),
+                body.as_ref().map(|b| {
+                    serde_json::from_str::<Value>(&b.to_string().replace("{}", id)).unwrap()
+                }),
+            )
+        };
+        let (hidden_uri, hidden_body) = fill("b_secret");
+        let (nope_uri, nope_body) = fill("nope");
+        let hidden = send(&router, &cookie, method, &hidden_uri, hidden_body).await;
+        let unknown = send(&router, &cookie, method, &nope_uri, nope_body).await;
+        assert!(hidden.0.is_client_error(), "{method} {uri}: {hidden:?}");
+        assert_eq!(hidden, unknown, "{method} {uri}");
+    }
+}
+
+/// R4: somebody who holds only a rule cannot read any mart through `records`
+/// or `values` without naming what they were given.
+#[tokio::test]
+async fn a_rule_only_person_cannot_read_any_mart_through_records_or_values() {
+    let (router, pool, _ch) = app().await;
+    let guest = create_principal_with_permissions(&pool, "query:read").await;
+    replace_item(&pool, "board", "b1", &[view_for(guest)], false, None)
+        .await
+        .unwrap();
+    let cookie = session_cookie_for_user(&pool, guest).await;
+    for uri in [
+        "/api/dashboard/records?mart=other",
+        "/api/dashboard/values?column=province",
+        "/api/dashboard/values?column=province&board=all",
+    ] {
+        let (status, body) = send(&router, &cookie, "GET", uri, None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{uri}: {body}");
+    }
+    // A board they were not given is the unknown-dashboard answer.
+    let (status, _) = send(
+        &router,
+        &cookie,
+        "GET",
+        "/api/dashboard/values?column=province&board=b2",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// R2: a drill of a chart the caller cannot see is the unknown-chart answer,
+/// and any other preview still needs `dashboard:read`.
+#[tokio::test]
+async fn a_drill_preview_is_a_404_for_an_unseen_chart_and_other_previews_need_read() {
+    let (router, pool, _ch) = app().await;
+    restricted_folder(&pool).await;
+    let guest = create_principal_with_permissions(&pool, "query:read").await;
+    replace_item(&pool, "board", "b1", &[view_for(guest)], false, None)
+        .await
+        .unwrap();
+    let cookie = session_cookie_for_user(&pool, guest).await;
+    let preview = "/api/dashboard/specs/preview";
+    let hidden = send(
+        &router,
+        &cookie,
+        "POST",
+        preview,
+        Some(json!({ "drillOf": "c_on_secret", "level": 1 })),
+    )
+    .await;
+    let unknown = send(
+        &router,
+        &cookie,
+        "POST",
+        preview,
+        Some(json!({ "drillOf": "c_nope", "level": 1 })),
+    )
+    .await;
+    assert_eq!(hidden.0, StatusCode::NOT_FOUND, "{hidden:?}");
+    assert_eq!(hidden, unknown);
+    let (status, _) = send(
+        &router,
+        &cookie,
+        "POST",
+        preview,
+        Some(json!({ "title": "t", "kind": "bar", "mart": "m" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+/// R6: an outsider (not listed on the restricted folder) cannot create a
+/// digest of a dashboard in it.
+#[tokio::test]
+async fn an_unlisted_person_cannot_create_a_digest_of_a_restricted_dashboard() {
+    let (router, pool, _ch) = app().await;
+    restricted_folder(&pool).await;
+    let outsider = create_principal_with_permissions(&pool, "dashboard:read, alert:write").await;
+    let cookie = session_cookie_for_user(&pool, outsider).await;
+    let digest = |board: &str| {
+        json!({
+            "name": "Weekly", "kind": "digest", "board": board,
+            "channel": "email", "target": "x@example.test",
+        })
+    };
+    let hidden = send(
+        &router,
+        &cookie,
+        "POST",
+        "/api/alerts",
+        Some(digest("b_secret")),
+    )
+    .await;
+    let unknown = send(
+        &router,
+        &cookie,
+        "POST",
+        "/api/alerts",
+        Some(digest("nope")),
+    )
+    .await;
+    assert_eq!(hidden.0, StatusCode::NOT_FOUND, "{hidden:?}");
+    assert_eq!(hidden, unknown);
+}
+
+/// Q-R12: a listed person can see the restricted dashboard but still cannot
+/// send its digest outside the console.
+#[tokio::test]
+async fn even_a_listed_person_cannot_save_a_digest_of_a_restricted_dashboard() {
+    let (router, pool, _ch) = app().await;
+    let insider = create_principal_with_permissions(&pool, "dashboard:read, alert:write").await;
+    replace_item(&pool, "folder", "f1", &[view_for(insider)], true, None)
+        .await
+        .unwrap();
+    let cookie = session_cookie_for_user(&pool, insider).await;
+    let (status, body) = send(
+        &router,
+        &cookie,
+        "POST",
+        "/api/alerts",
+        Some(json!({
+            "name": "Weekly", "kind": "digest", "board": "b_secret",
+            "channel": "email", "target": "x@example.test",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+}
+
+/// Q-R14: managing a parent folder through a rule does not open a restricted
+/// child.
+#[tokio::test]
+async fn a_manager_of_the_parent_folder_does_not_reach_a_restricted_child() {
+    let (router, pool, _ch) = app().await;
+    let guest = create_principal_with_permissions(&pool, "query:read").await;
+    // The rule is on the dashboard's own folder `f1`; the dashboard itself is
+    // restricted with an empty list, which ends what `f1` gives.
+    replace_item(&pool, "folder", "f1", &[view_for(guest)], false, None)
+        .await
+        .unwrap();
+    replace_item(&pool, "board", "b_secret", &[], true, None)
+        .await
+        .unwrap();
+    let cookie = session_cookie_for_user(&pool, guest).await;
+    let (status, _) = send(
+        &router,
+        &cookie,
+        "GET",
+        "/api/dashboard?board=b_secret",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }

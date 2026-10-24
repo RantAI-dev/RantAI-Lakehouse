@@ -154,17 +154,6 @@ fn problem_json(problem: &FormulaError) -> Value {
     })
 }
 
-/// Who is asking, for the personal space: the signed-in caller, or nobody in
-/// particular when no principal is attached.
-pub(crate) fn viewer_or_anonymous(
-    principal: Option<&Extension<Principal>>,
-) -> lakehouse_bi::access::Viewer {
-    // Fail closed: with nobody attached the caller sees no personal space.
-    principal.map_or_else(lakehouse_bi::access::Viewer::anonymous, |Extension(p)| {
-        crate::routes::dashboard_organise::viewer_of(p)
-    })
-}
-
 pub(crate) fn author_name(principal: Option<&Extension<Principal>>) -> String {
     principal.map_or_else(String::new, |Extension(p)| p.display_name.clone())
 }
@@ -411,7 +400,8 @@ pub async fn update(
 ) -> ApiResult<ApiJson<Value>> {
     let parsed = parse_body(&body)?;
     let ch = &state.clickhouse;
-    let viewer = viewer_or_anonymous(principal.as_ref());
+    // BI-19 B1 review R3: the resolved viewer, not the baseline.
+    let viewer = crate::routes::dashboard_access::usage_viewer(&state, principal.as_ref()).await?;
     let id = parsed
         .id
         .as_deref()
@@ -505,7 +495,8 @@ pub async fn delete(
     Query(q): Query<IdQuery>,
 ) -> ApiResult<ApiJson<Value>> {
     let ch = &state.clickhouse;
-    let viewer = viewer_or_anonymous(principal.as_ref());
+    // BI-19 B1 review R3: the resolved viewer, not the baseline.
+    let viewer = crate::routes::dashboard_access::usage_viewer(&state, principal.as_ref()).await?;
     let id =
         q.id.as_deref()
             .map(str::trim)

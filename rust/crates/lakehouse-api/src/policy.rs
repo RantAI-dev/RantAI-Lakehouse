@@ -545,7 +545,9 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     //    write floors. ─────────────────────────────────────────────────────
     ("GET",    "/api/dashboard",              Policy::RequiresAuth),
     ("GET",    "/api/dashboard/specs",        Policy::RequiresPermission("dashboard:read")),
-    ("POST",   "/api/dashboard/specs/preview", Policy::RequiresPermission("dashboard:read")),
+    // BI-19 B1 review R2/R9: a drill goes through the resolved viewer; any other
+    // preview needs `dashboard:read`, checked in the handler.
+    ("POST",   "/api/dashboard/specs/preview", Policy::RequiresAuth),
     ("POST",   "/api/dashboard/specs",        Policy::RequiresPermission("dashboard:write")),
     ("PUT",    "/api/dashboard/specs",        Policy::RequiresPermission("dashboard:write")),
     ("DELETE", "/api/dashboard/specs",        Policy::RequiresPermission("dashboard:write")),
@@ -566,7 +568,9 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("POST",   "/api/dashboard/personal",        Policy::RequiresPermission("dashboard:write")),
     ("GET",    "/api/dashboard/versions",        Policy::RequiresAuth),
     ("POST",   "/api/dashboard/versions/revert", Policy::RequiresPermission("dashboard:write")),
-    ("GET",    "/api/dashboard/trash",           Policy::RequiresPermission("dashboard:read")),
+    // BI-19 B1 review R9: the handler resolves the viewer (403 for a caller with
+    // neither `dashboard:read` nor a rule), so a rule-only person can open Trash.
+    ("GET",    "/api/dashboard/trash",           Policy::RequiresAuth),
     ("POST",   "/api/dashboard/trash/restore",   Policy::RequiresPermission("dashboard:write")),
     ("GET",    "/api/dashboard/shortcuts",       Policy::RequiresAuth),
     ("PUT",    "/api/dashboard/favourites",      Policy::RequiresAuth),

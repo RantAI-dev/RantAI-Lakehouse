@@ -648,7 +648,9 @@ pub async fn revert(
         );
     }
     let ch = &state.clickhouse;
-    require_board(ch, id, &viewer_of(&principal)).await?;
+    // BI-19 B1 review R5: the resolved viewer, so a restricted dashboard is a 404.
+    let viewer = crate::routes::dashboard_access::viewer_for_write(&state, &principal).await?;
+    require_board(ch, id, &viewer).await?;
     let Some(stored) = versions::load(ch, id, body.version)
         .await
         .map_err(|err| classify_ch_error(&err))?
@@ -752,7 +754,8 @@ pub async fn trash_restore(
         return Err(ApiError::BadRequest("id is required.".to_owned()).into());
     }
     let ch = &state.clickhouse;
-    let viewer = viewer_of(&principal);
+    // BI-19 B1 review R5: the resolved viewer, so a restricted dashboard is a 404.
+    let viewer = crate::routes::dashboard_access::viewer_for_write(&state, &principal).await?;
     let outcome = match Kind::parse(body.kind.trim()) {
         Some(Kind::Board) => trash::restore_board(ch, id, &viewer).await,
         Some(Kind::Chart) => trash::restore_chart(ch, id, &viewer).await,

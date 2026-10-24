@@ -2504,7 +2504,7 @@ async fn history_trash_personal_space_favourites_and_search_have_the_right_permi
 #[tokio::test]
 async fn the_moved_dashboard_reads_are_refused_without_a_rule_and_pass_with_one() {
     let TestApp { router, pool } = spin_up().await;
-    let moved: [(&str, &str); 20] = [
+    let moved: [(&str, &str); 21] = [
         ("GET", "/api/dashboard"),
         ("GET", "/api/dashboard/boards"),
         ("GET", "/api/dashboard/folders"),
@@ -2513,8 +2513,9 @@ async fn the_moved_dashboard_reads_are_refused_without_a_rule_and_pass_with_one(
         ("PUT", "/api/dashboard/favourites"),
         ("POST", "/api/dashboard/recent"),
         ("GET", "/api/dashboard/search?q=a"),
-        ("GET", "/api/dashboard/records?mart=m"),
-        ("GET", "/api/dashboard/values?mart=m&column=c"),
+        // BI-19 B1 review R4: a rule alone must name a tile / a dashboard.
+        ("GET", "/api/dashboard/records?mart=m&chart=x"),
+        ("GET", "/api/dashboard/values?mart=m&column=c&board=b1"),
         ("GET", "/api/dashboard/export"),
         ("GET", "/api/dashboard/table-export?chart=x"),
         ("GET", "/api/dashboard/chart-export?chart=x&format=xlsx"),
@@ -2525,6 +2526,8 @@ async fn the_moved_dashboard_reads_are_refused_without_a_rule_and_pass_with_one(
         ("GET", "/api/dashboard/params"),
         ("GET", "/api/dashboard/calc-fields?mart=m"),
         ("GET", "/api/dashboard/hierarchies?mart=m"),
+        // BI-19 B1 review R9: the Trash dialog works for a rule-only person.
+        ("GET", "/api/dashboard/trash"),
     ];
     let nothing = common::create_principal_with_permissions(&pool, "query:read").await;
     let writer = common::create_principal_with_permissions(&pool, "dashboard:write").await;
@@ -2898,5 +2901,68 @@ async fn the_embed_values_and_settings_routes_are_gated_in_both_directions() {
         resp.status() != StatusCode::UNAUTHORIZED && resp.status() != StatusCode::FORBIDDEN,
         "a writer got {}",
         resp.status()
+    );
+}
+
+/// BI-19 B1 review R2/R9: `POST /api/dashboard/specs/preview` is "signed in"
+/// at the router. A drill goes through the resolved viewer (a rule is enough);
+/// any other preview reads any table and needs `dashboard:read` in the handler.
+#[tokio::test]
+async fn the_spec_preview_lets_a_rule_drill_but_only_dashboard_read_preview_anything() {
+    let TestApp { router, pool } = spin_up().await;
+    assert_eq!(
+        POLICY_TABLE
+            .iter()
+            .find(|(m, p, _)| *m == "POST" && *p == "/api/dashboard/specs/preview")
+            .map(|(_, _, policy)| *policy),
+        Some(Policy::RequiresAuth)
+    );
+    let nothing = common::create_principal_with_permissions(&pool, "query:read").await;
+    let ruled = common::create_principal_with_permissions(&pool, "query:read").await;
+    lakehouse_store::dashboard_access::replace_item(
+        &pool,
+        "board",
+        "b1",
+        &[lakehouse_store::dashboard_access::NewRule {
+            user_id: Some(ruled),
+            role_id: None,
+            level: "view".to_owned(),
+        }],
+        false,
+        None,
+    )
+    .await
+    .expect("give the principal view on one dashboard");
+    let post = |cookie: String, body: &'static str| {
+        let router = router.clone();
+        async move {
+            router
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/dashboard/specs/preview")
+                        .header("cookie", cookie)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+        }
+    };
+    let drill = r#"{"drillOf":"c1","level":1}"#;
+    let plain = r#"{"title":"t","kind":"bar","mart":"m"}"#;
+    let nobody = common::session_cookie_for_user(&pool, nothing).await;
+    let guest = common::session_cookie_for_user(&pool, ruled).await;
+    // No permission and no rule: refused before anything is read.
+    assert_eq!(post(nobody.clone(), drill).await, StatusCode::FORBIDDEN);
+    assert_eq!(post(nobody, plain).await, StatusCode::FORBIDDEN);
+    // A rule alone: the plain preview is refused, a drill gets past the guard.
+    assert_eq!(post(guest.clone(), plain).await, StatusCode::FORBIDDEN);
+    let status = post(guest, drill).await;
+    assert!(
+        status != StatusCode::UNAUTHORIZED && status != StatusCode::FORBIDDEN,
+        "a drill must get past the guard, got {status}"
     );
 }
