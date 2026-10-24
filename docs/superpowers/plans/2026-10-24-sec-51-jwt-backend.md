@@ -139,3 +139,14 @@ then the workspace clippy and `cargo test --workspace`, then commit the
 ## Review
 
 (planner appends here)
+
+### Review round 1 (planner, 2026-10-24)
+
+The decision-2 mismatch is accepted: the one added entry, `untrusted`
+0.7.1, comes from `aws-lc-rs`'s default features that `jsonwebtoken`
+enables and offers no switch for; it has no dependencies, its licence is
+ISC (allowed in `rust/deny.toml`), and no crate changes version. The other
+change in `Cargo.lock` is sixteen removals, `crypto-bigint` among them
+(`grep` = 0). `rsa` stays, so the `RUSTSEC-2023-0071` ignores stay. No
+`BLOCKER`. The developer's T2 proof stopped at the disk guard; the
+planner's full run below replaces it.
