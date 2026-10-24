@@ -812,7 +812,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.rows, 0);
-        assert!(result.data.is_empty());
+        assert_eq!(
+            result.data,
+            [] as [serde_json::Map<std::string::String, serde_json::Value>; 0]
+        );
         assert!(result.meta.is_empty());
     }
 

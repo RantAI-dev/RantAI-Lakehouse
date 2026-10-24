@@ -210,12 +210,19 @@ mod tests {
     }
 
     impl SecretResolver for CountingResolver {
-        async fn resolve(&self, secret_ref: &str) -> Result<SecretValue, SecretError> {
+        // A plain `fn` returning a finished future, not an `async fn`: the
+        // counter bump has nothing to await (clippy's
+        // `unused_async_trait_impl`, REL-9), matching
+        // `EnvSecretResolver::resolve_now` in `lakehouse_core::secret`.
+        fn resolve(
+            &self,
+            secret_ref: &str,
+        ) -> impl std::future::Future<Output = Result<SecretValue, SecretError>> + Send {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            Err(SecretError::NotFound {
+            std::future::ready(Err(SecretError::NotFound {
                 secret_ref: secret_ref.to_owned(),
                 resolver: "counting",
-            })
+            }))
         }
     }
 

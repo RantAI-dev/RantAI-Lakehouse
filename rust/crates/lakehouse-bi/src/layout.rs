@@ -914,7 +914,7 @@ mod tests {
         let layout = layout_of(&[("a", Some("t_a"), 0, 5)]);
         let (left, moved, filters) =
             delete_tab(&tabs, &layout, &[tied(Some(&["t_a"]))], "t_a").unwrap();
-        assert!(left.is_empty());
+        assert!(left.is_empty(), "{left:?}");
         assert_eq!(moved["a"].tab, None);
         assert_eq!(filters[0].tabs, None);
     }

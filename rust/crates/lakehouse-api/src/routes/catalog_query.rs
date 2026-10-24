@@ -710,7 +710,10 @@ mod tests {
         for operator in ["lt", "lte", "gt", "gte"] {
             assert!(tag_hits(operator, &["m"]).is_empty(), "{operator}");
         }
-        assert!(tag_hits("isBetween", &["a", "z"]).is_empty());
+        assert_eq!(
+            tag_hits("isBetween", &["a", "z"]),
+            [] as [std::string::String; 0]
+        );
     }
 
     #[test]
@@ -827,7 +830,7 @@ mod tests {
             &[filter("layer", "bogusOperator", &["Silver"])],
             JoinOperator::And,
         );
-        assert!(hits.is_empty());
+        assert_eq!(hits, [] as [serde_json::Value; 0]);
     }
 
     // --- join operator ----------------------------------------------
@@ -1005,7 +1008,7 @@ mod tests {
     fn paginate_past_the_end_is_empty_not_an_error() {
         // How infinite scroll terminates: the client stops once a page
         // comes back shorter than `pageSize`.
-        assert!(paginate(&fixture(), 99, 50).is_empty());
+        assert_eq!(paginate(&fixture(), 99, 50), [] as [serde_json::Value; 0]);
     }
 
     #[test]
