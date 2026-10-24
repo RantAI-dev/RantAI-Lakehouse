@@ -184,4 +184,31 @@ way.
 
 ## Review
 
-(planner appends here)
+### Round 1 (planner, 2026-10-24)
+
+Reviewed `4fae3c09`..`c5a44524`. The SQL is right: every `CASE` reads the
+pre-update row, `RETURNING`'s `counted` reads the other outcome's
+timestamp, which this statement never changes, and `GREATEST` keeps each
+time moving forward. Tests cover the five cases of T1. The developer's
+handoff numbers stand pending the planner's own run.
+
+**BLOCKER 1 (the developer's "decision needed", answered).** A late
+failure stores the connector's current streak on its own dedupe row
+(plan decision 4, my wording), so a late failure arriving while the
+connector sits at 3 raises `connector_repeated_failure` ("3 runs in a
+row; the latest is run X") for a run that produced none of the three, on
+the first report and again on a retry after a rule-store failure (the
+retry path reads the stored streak). Decision 4 is changed: **a late
+report produced no streak, so its dedupe row stores `failure_streak =
+NULL` and `RunRecord::failure_streak` is `None` for it** (first report
+and retries alike). Then `routes/load_alerts.rs:535`
+(`== Some(REPEATED_FAILURE_STREAK)`) cannot fire for it, and
+`auto_disabled` stays `false` as now; the plain "run failed" alert still
+fires, which is true (the run did fail). Update the doc of
+`RunRecord::failure_streak` (today: "`None` only for a run counted before
+`0069`") to name the second case, cite this finding at the change, and
+add store tests: a late failure's `record_run_once` answer and its retry
+both have `failure_streak == None`; and an API test in `load_alerts`
+(pattern of its existing tests) that a late failure arriving with the
+connector at streak 3 raises no `connector_repeated_failure` alert
+instance. No migration (the column is already nullable).
