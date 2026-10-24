@@ -571,6 +571,6 @@ async fn saved_queries_are_listed_per_tenant(pool: PgPool) -> sqlx::Result<()> {
 
     // A caller in no tenant reads no row at all.
     let none = list_saved(&pool, SavedQueryScope::None).await.unwrap();
-    assert!(none.is_empty());
+    assert_eq!(none, [] as [lakehouse_store::queries::SavedQuery; 0]);
     Ok(())
 }
