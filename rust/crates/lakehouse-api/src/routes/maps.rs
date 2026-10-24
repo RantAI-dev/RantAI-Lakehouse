@@ -32,7 +32,10 @@
 //! viewer, so the check sees every chart. The 409 names only the charts the
 //! caller may see (as the SQL-source delete does): a chart on somebody's
 //! personal board still blocks the delete but is not named. A chart store
-//! that cannot be read blocks the delete too (the check fails closed).
+//! that cannot be read blocks the delete too (the check fails closed). A
+//! calculated field whose `RegionOf` names the map, by id or by name, blocks it
+//! the same way (`fields` in the 409; BI-16 C3 review S3). A rename is not
+//! checked: it breaks fields that name the map by its label, so use the id.
 
 use axum::Extension;
 use axum::extract::multipart::{Multipart, MultipartError, MultipartRejection};
@@ -322,8 +325,9 @@ pub async fn create(
 /// Creates the map's region lookup on the engine (`console.geo_region` rows,
 /// then the polygon dictionary, loaded at once) and records that it exists.
 ///
-/// *Not verified on a running engine* (the statements follow the `ClickHouse`
-/// documentation; see `lakehouse_bi::geo::dictionary_ddl`). Any failure is
+/// Verified on a throwaway `ClickHouse` 26.8.9.10 with a password on the user
+/// (`docs/plans/BI-16C-RESULT.md`); the dictionary reads as the API's own
+/// engine user. Any failure is
 /// logged under a reference id, undone as far as it can be, and leaves the
 /// flag off: the map stays usable for drawing, and the formula compiler tells
 /// `RegionOf` that the map has no lookup.
@@ -340,7 +344,11 @@ async fn enable_region_lookup(
             ch.exec(statement, None).await?;
         }
         for sql in [
-            lakehouse_bi::geo::dictionary_ddl(&map.id),
+            lakehouse_bi::geo::dictionary_ddl(
+                &map.id,
+                &state.config.ch_user,
+                &state.config.ch_password,
+            ),
             lakehouse_bi::geo::reload_dictionary_sql(&map.id),
         ]
         .into_iter()
@@ -352,10 +360,17 @@ async fn enable_region_lookup(
     };
     match steps.await {
         Ok(()) => match geo_map::set_region_lookup(pool, &map.id, true).await {
-            Ok(()) => GeoMap {
+            Ok(true) => GeoMap {
                 region_lookup: true,
                 ..map
             },
+            // BI-16 C3 review S4: the map was deleted while its upload was
+            // still setting the lookup up; the delete could not drop what did
+            // not exist yet, so drop it here and answer with the flag off.
+            Ok(false) => {
+                remove_region_lookup(state, &map.id).await;
+                map
+            }
             Err(err) => {
                 tracing::warn!(%err, "a map's region lookup was created but could not be recorded");
                 remove_region_lookup(state, &map.id).await;
@@ -544,6 +559,35 @@ pub async fn delete(
         return Ok((
             StatusCode::CONFLICT,
             ApiJson(json!({ "error": message, "charts": charts })),
+        ));
+    }
+    // BI-16 C3 review S3: a calculated field whose `RegionOf` names the map
+    // (by id or by name) would fall back to its stored SQL and fail with a
+    // generic database error once the dictionary is gone. A field store that
+    // cannot be read blocks the delete too (fail closed).
+    let named_by: Vec<String> = lakehouse_bi::fields::list_fields(ch)
+        .await
+        .map_err(|err| upstream_error::ch_error(&upstream_error::DATABASE, &err))?
+        .into_iter()
+        .filter(lakehouse_bi::fields::FieldDef::is_formula_field)
+        .filter(|f| {
+            lakehouse_bi::formula::compile::region_maps_in(&f.formula)
+                .iter()
+                .any(|m| m == &id || m.eq_ignore_ascii_case(&existing.name))
+        })
+        .map(|f| f.name)
+        .collect();
+    if !named_by.is_empty() {
+        return Ok((
+            StatusCode::CONFLICT,
+            ApiJson(json!({
+                "error": format!(
+                    "This map is still used by {} calculated field(s) through RegionOf: {}. Change them first.",
+                    named_by.len(),
+                    named_by.join(", ")
+                ),
+                "fields": named_by,
+            })),
         ));
     }
     geo_map::delete(pool, &id)
