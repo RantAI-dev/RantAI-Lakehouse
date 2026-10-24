@@ -838,6 +838,15 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("GET",  "/api/uploads/{id}/preview",    Policy::RequiresPermission("connector:manage")),
     ("POST", "/api/uploads/{id}/ingest",     Policy::RequiresPermission("connector:manage")),
 
+    // ── Uploaded maps (`BI-16` part C2b, plan D5): a map is visible to
+    //    everyone who can make charts, so reading is `RequiresAuth`; only
+    //    `settings:write` uploads, renames or deletes one. ──────────────────
+    ("GET",  "/api/maps",                    Policy::RequiresAuth),
+    ("POST", "/api/maps",                    Policy::RequiresPermission("settings:write")),
+    ("GET",  "/api/maps/{id}/geojson",       Policy::RequiresAuth),
+    ("PATCH", "/api/maps/{id}",              Policy::RequiresPermission("settings:write")),
+    ("DELETE", "/api/maps/{id}",             Policy::RequiresPermission("settings:write")),
+
     // ── Knowledge: no seeded resource — auth only. ───────────────────────
     ("GET",  "/api/knowledge/sources",       Policy::RequiresAuth),
     ("POST", "/api/knowledge/sources",       Policy::RequiresAuth),

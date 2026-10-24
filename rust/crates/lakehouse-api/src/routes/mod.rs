@@ -48,6 +48,7 @@ mod lakehouse;
 pub(crate) mod layers;
 mod lineage;
 mod load_alerts;
+mod maps;
 pub(crate) mod metrics;
 mod notifications;
 mod ops;
@@ -172,7 +173,7 @@ const PDF_REQUEST_TIMEOUT: Duration = Duration::from_secs(60 + 70 + 10);
 fn route_timeout(path: &str) -> Duration {
     match path {
         "/api/ai/chat" => *AI_CHAT_TIMEOUT,
-        "/api/uploads" => UPLOAD_REQUEST_TIMEOUT,
+        "/api/uploads" | "/api/maps" => UPLOAD_REQUEST_TIMEOUT,
         "/api/dashboard/chart-export" | "/api/dashboard/table-export" => EXPORT_REQUEST_TIMEOUT,
         "/api/dashboard/export/pdf" => PDF_REQUEST_TIMEOUT,
         // RPT-1: "Send now" makes the PDF and the chart files in the request,
@@ -859,6 +860,25 @@ fn uploads_router(state: &AppState) -> Router<AppState> {
         .merge(per_upload)
 }
 
+/// The `/api/maps/*` sub-router (`BI-16` part C2b): `POST /api/maps` alone
+/// takes the larger body ([`maps::MAX_REQUEST_BODY_BYTES`]), as
+/// `POST /api/uploads` does; the layer on that one method router keeps the
+/// raised limit off every other route.
+fn maps_router() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/api/maps",
+            axum::routing::post(maps::create)
+                .layer(DefaultBodyLimit::max(maps::MAX_REQUEST_BODY_BYTES))
+                .get(maps::list),
+        )
+        .route(
+            "/api/maps/{id}",
+            axum::routing::patch(maps::rename).delete(maps::delete),
+        )
+        .route("/api/maps/{id}/geojson", get(maps::geojson))
+}
+
 /// The `/api/identity/*` sub-router (Phase 2 identity domain), split out
 /// for the same `clippy::too_many_lines` reason as [`pipelines_router`].
 ///
@@ -1261,6 +1281,7 @@ pub fn router(state: AppState) -> Router {
         // ADR 0014: files uploaded from the console and loaded into raw
         // tables. Tenant-scoped like connectors.
         .merge(uploads_router(&state))
+        .merge(maps_router())
         // Phase 2, Task 2.8: knowledge sources and vector jobs (metadata
         // only — no `search` route here, see `routes::knowledge`'s module
         // doc comment).
