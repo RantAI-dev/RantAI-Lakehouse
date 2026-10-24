@@ -212,6 +212,87 @@ async fn post_sql_for_tenant(
     (status, body)
 }
 
+/// The console's own saved-query list.
+async fn get_saved(router: &axum::Router, cookie: &str) -> (StatusCode, Value) {
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/query/saved")
+                .header("cookie", cookie)
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("router never fails a request outright");
+    let status = resp.status();
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.expect("body");
+    let body = serde_json::from_slice(&bytes)
+        .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()));
+    (status, body)
+}
+
+/// The console's own "save this statement" button.
+async fn post_saved(
+    router: &axum::Router,
+    cookie: &str,
+    title: &str,
+    sql: &str,
+) -> (StatusCode, Value) {
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/query/saved")
+                .header("cookie", cookie)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "title": title, "sql": sql }).to_string(),
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("router never fails a request outright");
+    let status = resp.status();
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.expect("body");
+    let body = serde_json::from_slice(&bytes)
+        .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()));
+    (status, body)
+}
+
+/// One of the chat's tools, called the way the chat calls it.
+async fn call_tool(router: &axum::Router, cookie: &str, tool: &str, args: Value) -> Value {
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/ai/tool")
+                .header("cookie", cookie)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "tool": tool, "args": args, "mode": "build" }).to_string(),
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("router never fails a request outright");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.expect("body");
+    serde_json::from_slice(&bytes).expect("a JSON body")
+}
+
+/// The titles in a saved-query list.
+fn titles(list: &Value) -> Vec<String> {
+    list.as_array()
+        .expect("a list of saved queries")
+        .iter()
+        .filter_map(|q| q.get("title").and_then(Value::as_str).map(str::to_owned))
+        .collect()
+}
+
 /// The download of a run, as the console asks for it.
 async fn download_csv(router: &axum::Router, cookie: &str, id: &str) -> (StatusCode, Value) {
     let resp = router
@@ -431,4 +512,79 @@ async fn the_x_tenant_header_selects_the_tenant_that_may_read_the_table() {
     let (status, body) = post_sql(&router, &cookie, "/api/query/run", OWNED_STATEMENT).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
     assert_eq!(body["error"], REFUSAL, "{body}");
+}
+
+#[tokio::test]
+async fn a_saved_query_of_another_tenant_is_not_listed_and_cannot_be_run() {
+    let ch = MockServer::start().await;
+    mount_engine(&ch).await;
+    let TestApp { router, pool } = spin_up_with_clickhouse(&ch.uri()).await;
+    let owner_cookie = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+    let other_cookie = session_cookie_for_seeded_user(&pool, "sari@meridian.example").await;
+
+    // The catalog's own tenant saves a query.
+    let (status, body) = post_saved(
+        &router,
+        &owner_cookie,
+        "Group revenue",
+        "SELECT * FROM serving.mart_pelanggan",
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let saved_id = body["id"]
+        .as_str()
+        .expect("the saved query's id")
+        .to_owned();
+
+    // Another tenant's list holds neither that query nor the rows that
+    // belong to no tenant: those are the catalog's own.
+    let (status, body) = get_saved(&router, &other_cookie).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        !titles(&body).contains(&"Group revenue".to_owned()),
+        "another tenant's saved query must not be listed: {body}"
+    );
+    assert!(
+        titles(&body).is_empty(),
+        "the rows that belong to no tenant are the catalog's own: {body}"
+    );
+
+    // The chat's own list says the same.
+    let listed = call_tool(&router, &other_cookie, "list_saved_queries", json!({})).await;
+    let queries = listed["result"]["queries"]
+        .as_array()
+        .expect("the tool's list of saved queries");
+    assert!(
+        queries.is_empty(),
+        "another tenant's saved query must not be listed: {listed}"
+    );
+
+    // And the chat cannot run it by id: it is not found at all.
+    let ran = call_tool(
+        &router,
+        &other_cookie,
+        "run_saved_query",
+        json!({ "id": saved_id }),
+    )
+    .await;
+    assert_eq!(ran["outcome"], json!("failed"), "{ran}");
+    assert_eq!(
+        ran["result"]["error"],
+        json!("saved query tidak ditemukan"),
+        "{ran}"
+    );
+
+    // The catalog's own tenant sees its query, and the rows that belong
+    // to no tenant.
+    let (status, body) = get_saved(&router, &owner_cookie).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let listed = titles(&body);
+    assert!(
+        listed.contains(&"Group revenue".to_owned()),
+        "the catalog's tenant sees its own query: {body}"
+    );
+    assert!(
+        listed.len() > 1,
+        "the rows that belong to no tenant are the catalog's own: {body}"
+    );
 }

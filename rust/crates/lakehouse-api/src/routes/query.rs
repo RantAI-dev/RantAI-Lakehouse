@@ -299,6 +299,43 @@ async fn resolve_reach(
     })
 }
 
+/// `SEC-20`: the saved queries the caller may read.
+///
+/// The same reach the same request resolves for the tables a statement
+/// may read (see [`resolve_reach`]), asked once and answered once: the
+/// caller's tenant, whether that tenant owns the shared catalog, and
+/// whether the deployment holds a single tenant at all. A saved query
+/// belongs to the tenant that wrote it, so the reach over tables and the
+/// reach over saved queries end in the same place — and there is only
+/// one rule that says which tenant a request acts as
+/// ([`crate::tenant_scope::resolve`]).
+///
+/// # Errors
+///
+/// The same as [`resolve_reach`]: 404 for an `X-Tenant` header the
+/// caller does not belong to, 503 when the count cannot be read.
+pub(crate) async fn saved_query_scope(
+    state: &AppState,
+    principal: &Principal,
+    headers: &HeaderMap,
+) -> Result<queries::SavedQueryScope, ApiError> {
+    Ok(match resolve_reach(state, principal, headers).await? {
+        // Every permission, or a deployment with one tenant: every row.
+        TenantReach::All => queries::SavedQueryScope::All,
+        // One tenant's rows; the rows that belong to no tenant are the
+        // shared catalog's own, and the catalog's tenant reads them.
+        TenantReach::Tenant {
+            tenant_id,
+            owns_catalog,
+        } => queries::SavedQueryScope::Tenant {
+            tenant_id,
+            include_tenantless: owns_catalog,
+        },
+        // A caller in no tenant owns no saved query and reads none.
+        TenantReach::NoTenant => queries::SavedQueryScope::None,
+    })
+}
+
 /// `SEC-20`: how many tenants the deployment holds.
 ///
 /// `None` when there is no database to count: the shared catalog's own
@@ -1384,13 +1421,28 @@ fn pool(state: &AppState) -> Result<&PgPool, ApiError> {
     })
 }
 
-/// `GET /api/query/saved` — every saved query.
+/// `GET /api/query/saved` — the caller's tenant's saved queries.
+///
+/// `SEC-20`: a saved query is a statement somebody wrote against their
+/// own data, so it belongs to the tenant that wrote it. The list holds
+/// the caller's tenant's rows, and the rows that belong to no tenant
+/// when that tenant owns the shared catalog (see [`saved_query_scope`]).
 ///
 /// # Errors
 ///
-/// 503 if no pool is configured; 500 on a database failure.
-pub async fn list_saved(State(state): State<AppState>) -> ApiResult<ApiJson<Vec<SavedQuery>>> {
-    Ok(ApiJson(queries::list_saved(pool(&state)?).await?))
+/// 401 when nobody is signed in — a saved query belongs to a tenant, so
+/// there is no sensible answer for "everybody's"; 404 for an `X-Tenant`
+/// header the caller does not belong to; 503 if no pool is configured;
+/// 500 on a database failure.
+pub async fn list_saved(
+    State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
+    headers: HeaderMap,
+) -> ApiResult<ApiJson<Vec<SavedQuery>>> {
+    let Extension(principal) =
+        principal.ok_or_else(|| ApiError::Unauthorized("sign in required".to_owned()))?;
+    let scope = saved_query_scope(&state, &principal, &headers).await?;
+    Ok(ApiJson(queries::list_saved(pool(&state)?, scope).await?))
 }
 
 /// `GET /api/query/history` — the caller's own recent query executions,
@@ -1428,18 +1480,23 @@ pub struct CreateSavedQueryBody {
 
 /// `POST /api/query/saved` — save the SQL in the editor under a name.
 ///
-/// Saved queries are shared: the whole team sees them, which is what makes
-/// them worth saving. The author is recorded all the same.
+/// `SEC-20`: a saved query belongs to the tenant that wrote it. The
+/// tenant is the one the request acts as — the `X-Tenant` header when the
+/// caller sends one, the caller's first tenant otherwise — and the row is
+/// that tenant's alone; the rows that belong to no tenant are the shared
+/// catalog's own. The author is recorded all the same.
 ///
 /// # Errors
 ///
 /// 400 on a malformed body or a blank title/SQL; 401 when nobody is signed
-/// in; 422 when the SQL is not read-only — a saved query is run through the
-/// same guard as anything else, so refusing it here is better than storing
+/// in; 404 for an `X-Tenant` header the caller does not belong to; 422
+/// when the SQL is not read-only — a saved query is run through the same
+/// guard as anything else, so refusing it here is better than storing
 /// something that can never run; 503/500 as above.
 pub async fn create_saved(
     State(state): State<AppState>,
     principal: Option<Extension<Principal>>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<(StatusCode, ApiJson<SavedQuery>)> {
     let body: CreateSavedQueryBody = serde_json::from_slice(&body)
@@ -1456,6 +1513,18 @@ pub async fn create_saved(
         .into());
     }
     let owner_id = caller_id(principal.as_ref())?;
+    // The tenant the row belongs to is the tenant the request acts as,
+    // answered by the one resolver every caller without a header gets
+    // (`tenant_scope::resolve`). A caller in no tenant writes a row that
+    // belongs to no tenant: nobody can say whose query it is, so it is
+    // not anybody's to read but the shared catalog's owner's.
+    let tenant_id = crate::tenant_scope::resolve(
+        principal
+            .as_ref()
+            .map(|Extension(p)| p)
+            .ok_or_else(|| ApiError::Unauthorized("sign in required".to_owned()))?,
+        &headers,
+    )?;
     let owner = principal.map_or_else(|| "anonymous".to_owned(), |Extension(p)| p.display_name);
     let saved = queries::create_saved_query(
         pool(&state)?,
@@ -1464,6 +1533,7 @@ pub async fn create_saved(
         &owner,
         &body.tags,
         Some(owner_id),
+        tenant_id,
     )
     .await?;
     Ok((StatusCode::CREATED, ApiJson(saved)))

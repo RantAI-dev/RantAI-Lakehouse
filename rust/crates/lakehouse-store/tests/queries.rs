@@ -21,8 +21,8 @@ use lakehouse_test_support as _;
 
 use lakehouse_store::audit::{NewAuditEvent, insert as insert_audit_event};
 use lakehouse_store::queries::{
-    RecordHistoryInput, get_history_item, history_mentioning, history_recent, list_history,
-    list_saved, record_history,
+    RecordHistoryInput, SavedQueryScope, create_saved_query, get_history_item, history_mentioning,
+    history_recent, list_history, list_saved, record_history,
 };
 use sqlx::PgPool;
 use time::OffsetDateTime;
@@ -34,7 +34,7 @@ use uuid::Uuid;
 /// examples a new user could open both failed on Run).
 #[sqlx::test(migrations = "../../migrations")]
 async fn seed_populates_saved_queries(pool: PgPool) -> sqlx::Result<()> {
-    let saved = list_saved(&pool).await.unwrap();
+    let saved = list_saved(&pool, SavedQueryScope::All).await.unwrap();
     assert_eq!(saved.len(), 2);
     assert!(
         saved
@@ -473,5 +473,100 @@ async fn history_recent_is_newest_first_and_respects_days_and_limit(
     let wide = history_recent(&pool, 30, 100).await.unwrap();
     assert_eq!(wide.len(), 4);
     assert_eq!(wide.last().map(String::as_str), Some("SELECT 'old'"));
+    Ok(())
+}
+
+/// The two tenants the seeded identity migration creates, and the row
+/// that belongs to neither of them.
+const GROUP_TENANT: &str = "11111111-1111-4111-8111-000000000001";
+const RETAIL_TENANT: &str = "11111111-1111-4111-8111-000000000002";
+
+fn tenant(raw: &str) -> Uuid {
+    Uuid::parse_str(raw).expect("a seeded tenant id")
+}
+
+/// `SEC-20`: a saved query belongs to the tenant that wrote it. One
+/// tenant's rows are that tenant's alone; the rows that belong to no
+/// tenant (the ones written before the column existed) are read only by
+/// the tenant that owns the shared catalog; and a caller in no tenant
+/// reads none.
+#[sqlx::test(migrations = "../../migrations")]
+async fn saved_queries_are_listed_per_tenant(pool: PgPool) -> sqlx::Result<()> {
+    let group = tenant(GROUP_TENANT);
+    let retail = tenant(RETAIL_TENANT);
+
+    let groups = create_saved_query(
+        &pool,
+        "Group query",
+        "SELECT 1",
+        "Rina",
+        &[],
+        None,
+        Some(group),
+    )
+    .await
+    .unwrap();
+    let retails = create_saved_query(
+        &pool,
+        "Retail query",
+        "SELECT 2",
+        "Sari",
+        &[],
+        None,
+        Some(retail),
+    )
+    .await
+    .unwrap();
+
+    // Every row: the two seeded ones (no tenant), and the two written
+    // here.
+    let all = list_saved(&pool, SavedQueryScope::All).await.unwrap();
+    assert_eq!(all.len(), 4);
+
+    // One tenant's rows, and only that tenant's.
+    let own = list_saved(
+        &pool,
+        SavedQueryScope::Tenant {
+            tenant_id: group,
+            include_tenantless: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(own.len(), 1);
+    assert_eq!(own[0].id, groups.id);
+
+    let own = list_saved(
+        &pool,
+        SavedQueryScope::Tenant {
+            tenant_id: retail,
+            include_tenantless: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(own.len(), 1);
+    assert_eq!(own[0].id, retails.id);
+
+    // The same tenant, reading the rows that belong to no tenant as
+    // well: the seeded ones.
+    let own_and_untagged = list_saved(
+        &pool,
+        SavedQueryScope::Tenant {
+            tenant_id: retail,
+            include_tenantless: true,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(own_and_untagged.len(), 3);
+    assert!(
+        own_and_untagged.iter().any(|q| q.id == retails.id),
+        "the tenant's own row is in its own list"
+    );
+
+    // A caller in no tenant reads no row at all.
+    let none = list_saved(&pool, SavedQueryScope::None).await.unwrap();
+    assert!(none.is_empty());
     Ok(())
 }
