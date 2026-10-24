@@ -406,21 +406,45 @@ async fn build_and_send(
     sub: &Subscription,
     manual: bool,
 ) -> Result<(Outcome, usize), Stop> {
-    let pool = state.pg.as_deref().ok_or_else(|| stop(DATABASE_DOWN))?;
+    if state.pg.is_none() {
+        return Err(stop(DATABASE_DOWN));
+    }
     // Checked first: no point making a PDF nobody can send.
     if !mailer.is_configured() {
         return Err(stop(EMAIL_NOT_SET_UP));
     }
     let owner = load_owner(state, sub).await?;
+    // BI-5 re-review R1: this runs from the spawned runner loop, outside any
+    // request, so without a scope the owner's tiles ran as the nil principal
+    // under the compiled-in limits. The delivery runs as the owner, with the
+    // install's limits read from the settings. The future is boxed: it holds
+    // the whole render.
+    crate::query_limits::scope_if_missing(
+        state,
+        Some(&owner),
+        Box::pin(deliver(state, mailer, sub, manual, &owner)),
+    )
+    .await
+}
+
+/// The rest of [`build_and_send`], as `owner`, inside the owner's query run.
+async fn deliver(
+    state: &AppState,
+    mailer: &dyn ReportMailer,
+    sub: &Subscription,
+    manual: bool,
+    owner: &Principal,
+) -> Result<(Outcome, usize), Stop> {
+    let pool = state.pg.as_deref().ok_or_else(|| stop(DATABASE_DOWN))?;
     let settings = crate::routes::settings::format_settings(state)
         .await
         .map_err(|_| stop(DATABASE_DOWN))?;
     if !owner.has("dashboard:read")
-        || !crate::routes::settings::may_download(&owner, &settings.download_denied_roles)
+        || !crate::routes::settings::may_download(owner, &settings.download_denied_roles)
     {
         return Err(stop(OWNER_NO_ACCESS));
     }
-    let board = store::get_board(&state.clickhouse, &sub.board, &viewer_of(&owner))
+    let board = store::get_board(&state.clickhouse, &sub.board, &viewer_of(owner))
         .await
         .map_err(|_| stop(DASHBOARD_UNREADABLE))?;
     if board.is_none() && sub.board != store::DEFAULT_BOARD_ID {
@@ -435,7 +459,7 @@ async fn build_and_send(
         .await
         .map_err(|_| stop(DATABASE_DOWN))?;
     let allowed_users =
-        users_who_may_receive(state, &rows, &owner, &settings.download_denied_roles).await;
+        users_who_may_receive(state, &rows, owner, &settings.download_denied_roles).await;
     let audience = audience_of(&rows, &settings.report_allowed_domains, &allowed_users);
     if audience.addresses.is_empty() {
         return Err(stop(NOBODY_LEFT));
@@ -443,7 +467,7 @@ async fn build_and_send(
 
     let texts = ValueTexts::of(sub);
     let values = texts.as_values();
-    if sub.skip_when_empty && is_empty_report(state, &owner, sub, &values).await? {
+    if sub.skip_when_empty && is_empty_report(state, owner, sub, &values).await? {
         return Ok((
             Outcome::Skipped(EVERY_CHART_EMPTY.to_owned()),
             audience.addresses.len(),
@@ -457,7 +481,7 @@ async fn build_and_send(
         outside: audience.outside.clone(),
         origin: if manual { "manual" } else { "schedule" },
     };
-    let files = attach(state, &owner, sub, (&spec, &values), (&board_name, who)).await?;
+    let files = attach(state, owner, sub, (&spec, &values), (&board_name, who)).await?;
 
     let now = OffsetDateTime::now_utc();
     let date = lakehouse_store::report_schedule::local_date(&sub.time_zone, now)

@@ -34,6 +34,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 indexmap = { version = "2", features = ["serde"] }
 hmac = "0.13"
 sha2 = "0.11"
+# In-process store of remembered dashboard results (`BI-4` part B). Already in
+# `Cargo.lock` (0.12.16, via `iceberg`) with the `future` feature, so it adds no crate.
+moka = { version = "0.12.16", default-features = false, features = ["future"] }
 base64 = "0.23"
 rand = "0.10"
 # `SRC-12` decision 4: AES-256-GCM for managed connector credentials at rest

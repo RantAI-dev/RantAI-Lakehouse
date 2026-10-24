@@ -185,6 +185,12 @@ services:
       # 30..1800). Raise it only for a slow self-hosted model, e.g. a
       # small model on CPU; see routes/mod.rs `AI_CHAT_TIMEOUT`.
       AI_CHAT_TIMEOUT_SECS: ${AI_CHAT_TIMEOUT_SECS:-}
+      # BI-4 B review P-S4: the dashboard memory (megabytes, default 256, 0
+      # remembers nothing, clamped to 4096) and how many tiles the process
+      # computes at once (default 24, clamped 4..128). Empty is unset; a
+      # value that is not a number is logged at start and the default is used.
+      RESULT_CACHE_MAX_MB: ${RESULT_CACHE_MAX_MB:-}
+      TILE_CONCURRENCY_MAX: ${TILE_CONCURRENCY_MAX:-}
       # Reply language for a chat message too short to detect: `id`
       # (Indonesian) or `en` (English). Empty means unset; any other value
       # stops the API at start (see config.rs).

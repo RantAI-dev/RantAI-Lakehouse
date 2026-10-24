@@ -7,7 +7,8 @@
 //! administrator's setting in Admin > Settings > Query limits.
 //!
 //! `stop_query` ends the person's own running queries on the engine, through
-//! the same builder the Stop button's route uses (`ops::KillTarget`). It is
+//! the same function the Stop button's route uses
+//! (`query_cancel::stop_own_queries`). It is
 //! `Risk::Read` although it kills: it can only end the caller's own work (the
 //! principal part of the pattern is the authenticated person's id, never an
 //! argument), it writes nothing, and a stopped query is simply asked again.
@@ -18,7 +19,7 @@ use lakehouse_auth::Principal;
 use serde_json::{Map, Value, json};
 
 use super::arg_str;
-use crate::routes::ops::{KillTarget, kill_query_sql};
+use crate::routes::query_cancel::{StopFailure, stop_own_queries};
 use crate::state::AppState;
 use crate::upstream_error;
 
@@ -56,35 +57,17 @@ async fn get_query_limits(state: &AppState, principal: &Principal) -> Value {
 }
 
 async fn stop_query(state: &AppState, principal: &Principal, args: &Map<String, Value>) -> Value {
+    // BI-5 re-review R2: the same function as `POST /api/query/cancel`, so the
+    // run is marked stopped and the kill is sent whatever the count.
     let run_id = arg_str(args, "runId");
-    let target = if run_id.is_empty() {
-        KillTarget::own_all(principal.id.uuid())
-    } else if let Some(target) = KillTarget::own_run(principal.id.uuid(), &run_id) {
-        target
-    } else {
-        return json!({ "error": "runId must be a UUID." });
-    };
-    let ch = &state.clickhouse;
-    let counted = match ch.rows(&target.count_sql(), None).await {
-        Ok(rows) => rows,
-        Err(err) => {
-            return upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json();
+    let run = Some(run_id.as_str()).filter(|id| !id.is_empty());
+    match stop_own_queries(&state.clickhouse, principal.id.uuid(), run).await {
+        Ok(stopped) => json!({ "stopped": stopped }),
+        Err(StopFailure::NotAUuid) => json!({ "error": "runId must be a UUID." }),
+        Err(StopFailure::Engine(err)) => {
+            upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json()
         }
-    };
-    let stopped = counted
-        .first()
-        .and_then(|row| row.get("n"))
-        .and_then(|n| {
-            n.as_u64()
-                .or_else(|| n.as_str().and_then(|t| t.parse().ok()))
-        })
-        .unwrap_or(0);
-    if stopped > 0
-        && let Err(err) = ch.exec(&kill_query_sql(&target), None).await
-    {
-        return upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json();
     }
-    json!({ "stopped": stopped })
 }
 
 #[cfg(test)]
@@ -205,5 +188,50 @@ mod tests {
         )
         .await;
         assert_eq!(got, json!({ "error": "runId must be a UUID." }));
+    }
+
+    /// `BI-5` re-review R2: the tool is the route's own function, so a run it
+    /// stops is marked (a later tile of that run answers "Stopped"), and the
+    /// kill goes out even when nothing was counted running.
+    #[tokio::test]
+    async fn stop_query_with_a_run_id_marks_the_run_and_kills_even_when_none_was_counted() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("count()"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"meta":[{"name":"n","type":"UInt64"}],"data":[{"n":"0"}],"rows":1}"#,
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("KILL QUERY"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("Ok."))
+            .mount(&server)
+            .await;
+        let state = state_on(Some(&server.uri()));
+        let me = uuid::Uuid::parse_str("33333333-3333-4333-8333-333333333333").unwrap();
+        let run_id = "44444444-4444-4444-8444-444444444444";
+        let who = person(me);
+        let before = crate::query_limits::QueryRun::for_request(&state, Some(&who), Some(run_id));
+        assert!(!before.is_stopped());
+
+        let mut args = Map::new();
+        args.insert("runId".to_owned(), json!(run_id));
+        let got = run(&state, Some(&who), "stop_query", &args).await;
+        assert_eq!(got, json!({ "stopped": 0 }));
+
+        let after = crate::query_limits::QueryRun::for_request(&state, Some(&who), Some(run_id));
+        assert!(
+            after.is_stopped(),
+            "a later tile of the run answers Stopped"
+        );
+        let kills = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| String::from_utf8_lossy(&r.body).starts_with("KILL"))
+            .count();
+        assert_eq!(kills, 1, "the kill is sent even when the count was 0");
     }
 }

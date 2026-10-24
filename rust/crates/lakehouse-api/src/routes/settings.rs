@@ -78,12 +78,16 @@ const DOWNLOAD_ROLES_REFUSED: &str = "downloadDeniedRoles must name roles that e
 /// domain names (`RPT-1`, D8).
 const REPORT_DOMAINS_REFUSED: &str = "reportAllowedDomains must be at most 50 domain names such as example.com, with no wildcard, address or path.";
 
+/// What the person is told when `resultCache` is not a freshness rule or its
+/// minutes are out of range (`BI-4` part B, feature decision 2).
+const RESULT_CACHE_REFUSED: &str = "resultCache must be {\"mode\": \"default\"} or {\"mode\": \"fresh\"}, or {\"mode\": \"minutes\", \"minutes\": a whole number from 1 to 1440}.";
+
 /// What the person is told when their roles may not download (`BI-1`, D7).
 pub(crate) const DOWNLOADS_OFF: &str = "Downloads are switched off for your role.";
 
 /// What the person is told when the body is not the two fields.
 const BODY_SHAPE: &str = "body must be {\"timeZone\": string, \"weekStart\": \"monday\"|\"sunday\", \
-\"numberLocale\"?: \"en-US\"|\"id-ID\", \"companyPalette\"?: [\"#rrggbb\", ...], \"fonts\"?: [string, ...], \"contentSites\"?: [\"https://host\", ...], \"downloadDeniedRoles\"?: [string, ...], \"reportAllowedDomains\"?: [string, ...], \"publicLinksEnabled\"?: boolean}";
+\"numberLocale\"?: \"en-US\"|\"id-ID\", \"companyPalette\"?: [\"#rrggbb\", ...], \"fonts\"?: [string, ...], \"contentSites\"?: [\"https://host\", ...], \"downloadDeniedRoles\"?: [string, ...], \"reportAllowedDomains\"?: [string, ...], \"publicLinksEnabled\"?: boolean, \"resultCache\"?: {\"mode\": \"default\"|\"fresh\"|\"minutes\", \"minutes\"?: number}}";
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -97,6 +101,9 @@ struct SettingsBody {
     download_denied_roles: Option<Vec<String>>,
     report_allowed_domains: Option<Vec<String>>,
     public_links_enabled: Option<bool>,
+    /// `BI-4` part B: absent keeps the stored rule. Read as raw JSON so a
+    /// malformed rule gets [`RESULT_CACHE_REFUSED`], not the body-shape text.
+    result_cache: Option<Value>,
 }
 
 /// The formatting half of the settings, as the console reads it.
@@ -119,6 +126,11 @@ pub(crate) struct FormatSettings {
     /// [`Self::to_json`]: an anonymous reader has no use for it, and an
     /// administrator reads it through `body_json`.
     pub public_links_enabled: bool,
+    /// The install's freshness rule for remembered dashboard results (`BI-4`
+    /// part B). Not part of [`Self::to_json`]: the dashboard payload carries
+    /// the board's effective rule as `cacheRule`; the settings screen reads
+    /// this one through `body_json`.
+    pub result_cache: lakehouse_bi::cache_rule::CacheRule,
 }
 
 impl Default for FormatSettings {
@@ -133,6 +145,7 @@ impl Default for FormatSettings {
             download_denied_roles: Vec::new(),
             report_allowed_domains: Vec::new(),
             public_links_enabled: true,
+            result_cache: lakehouse_bi::cache_rule::CacheRule::Follow,
         }
     }
 }
@@ -147,6 +160,13 @@ impl FormatSettings {
             download_denied_roles: row.download_denied_roles.clone(),
             report_allowed_domains: row.report_allowed_domains.clone(),
             public_links_enabled: row.public_links_enabled,
+            // A stored pair the CHECKs should have refused reads as "always
+            // fresh" (fail closed), never as the default.
+            result_cache: lakehouse_bi::cache_rule::CacheRule::parse(
+                &row.result_cache_mode,
+                row.result_cache_minutes.map(i64::from),
+            )
+            .unwrap_or(lakehouse_bi::cache_rule::CacheRule::Fresh),
         }
     }
 
@@ -327,6 +347,12 @@ fn checked_formatting(
         public_links_enabled: parsed
             .public_links_enabled
             .unwrap_or(current.public_links_enabled),
+        result_cache: match &parsed.result_cache {
+            // A fixed sentence: the rule is the caller's own text.
+            Some(raw) => serde_json::from_value(raw.clone())
+                .map_err(|_| ApiError::BadRequest(RESULT_CACHE_REFUSED.to_owned()))?,
+            None => current.result_cache,
+        },
     })
 }
 
@@ -487,6 +513,7 @@ fn body_json(ctx: &TimeContext, format: &FormatSettings, saved: bool) -> Value {
         "downloadDeniedRoles": format.download_denied_roles,
         "reportAllowedDomains": format.report_allowed_domains,
         "publicLinksEnabled": format.public_links_enabled,
+        "resultCache": format.result_cache.to_json(),
     });
     if let (Some(map), Value::Object(fields)) = (body.as_object_mut(), format.to_json()) {
         map.extend(fields);
@@ -571,6 +598,11 @@ pub async fn put_reporting(
             download_denied_roles: format.download_denied_roles,
             report_allowed_domains: format.report_allowed_domains,
             public_links_enabled: format.public_links_enabled,
+            result_cache_mode: format.result_cache.mode().to_owned(),
+            result_cache_minutes: format
+                .result_cache
+                .minutes()
+                .and_then(|m| i32::try_from(m).ok()),
         },
         &principal.id.uuid().to_string(),
     )
@@ -643,6 +675,7 @@ mod tests {
                 "numberLocale": "en-US", "companyPalette": [],
                 "fonts": ["inter", "ibm-plex-sans", "source-serif", "jetbrains-mono", "system"],
                 "contentSites": [], "downloadDeniedRoles": [], "reportAllowedDomains": [], "publicLinksEnabled": true,
+                "resultCache": {"mode": "default"},
             })
         );
         assert_eq!(
@@ -668,6 +701,7 @@ mod tests {
             download_denied_roles: vec!["Viewer".to_owned()],
             report_allowed_domains: vec!["example.com".to_owned()],
             public_links_enabled: false,
+            result_cache: lakehouse_bi::cache_rule::CacheRule::Minutes(45),
         };
         assert_eq!(
             checked_formatting(&body(""), &current, None).unwrap(),
@@ -698,6 +732,48 @@ mod tests {
             body_json(&TimeContext::default(), &off, true)["publicLinksEnabled"],
             json!(false)
         );
+    }
+
+    /// `BI-4` part B T3: the install's freshness rule is kept when the body
+    /// does not send it, changed when it does, and refused with one sentence
+    /// when its minutes are out of range or it is not a rule.
+    #[test]
+    fn the_result_cache_rule_is_kept_changed_and_refused_with_a_sentence() {
+        use lakehouse_bi::cache_rule::CacheRule;
+        let first = FormatSettings::default();
+        assert_eq!(first.result_cache, CacheRule::Follow);
+        let set = checked_formatting(
+            &body(r#","resultCache":{"mode":"minutes","minutes":30}"#),
+            &first,
+            None,
+        )
+        .unwrap();
+        assert_eq!(set.result_cache, CacheRule::Minutes(30));
+        assert_eq!(
+            checked_formatting(&body(""), &set, None)
+                .unwrap()
+                .result_cache,
+            CacheRule::Minutes(30),
+            "a body without the rule keeps it"
+        );
+        assert_eq!(
+            body_json(&TimeContext::default(), &set, true)["resultCache"],
+            json!({"mode": "minutes", "minutes": 30})
+        );
+        for bad in [
+            r#","resultCache":{"mode":"minutes","minutes":0}"#,
+            r#","resultCache":{"mode":"minutes","minutes":1441}"#,
+            r#","resultCache":{"mode":"minutes"}"#,
+            r#","resultCache":{"mode":"fresh","minutes":5}"#,
+            r#","resultCache":{"mode":"sometimes"}"#,
+            r#","resultCache":"fresh""#,
+        ] {
+            let err = checked_formatting(&body(bad), &set, None).unwrap_err();
+            assert!(
+                matches!(&err, ApiError::BadRequest(m) if m == RESULT_CACHE_REFUSED),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

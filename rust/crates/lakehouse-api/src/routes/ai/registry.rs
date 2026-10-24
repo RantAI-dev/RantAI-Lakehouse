@@ -545,6 +545,17 @@ fn set_dashboard_theme_schema() -> Value {
             "required": ["board"] } } })
 }
 
+fn set_cache_rule_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "set_cache_rule",
+        "description": "Set how long a dashboard's or a chart's results may be remembered instead of computed again (\"Make this chart always fresh\"). Give a board (list_boards) or a chart (list_charts), one of the two. rule: default follows the level above (a chart follows its dashboard, a dashboard follows the install's setting in Admin > Settings), fresh computes every time, minutes remembers for `minutes` (1 to 1440). The narrowest rule set wins. Not for the built-in dashboard; set it on one of its charts or duplicate it first. The install's own rule is set by an administrator in Admin > Settings, not here. A result is also recomputed whenever the data under it changes, whatever the rule.",
+        "parameters": { "type": "object", "properties": {
+            "board": { "type": "string", "description": "the dashboard id (list_boards)" },
+            "chart": { "type": "string", "description": "the chart id (list_charts)" },
+            "rule": { "type": "string", "enum": ["default", "fresh", "minutes"] },
+            "minutes": { "type": "number", "description": "with rule minutes: 1 to 1440" } },
+            "required": ["rule"] } } })
+}
+
 fn create_chart_schema() -> Value {
     with_type_properties(with_style_properties(with_shape_properties(
         with_table_properties(
@@ -1771,6 +1782,12 @@ pub static TOOLS: &[ToolSpec] = &[
         permission: "dashboard:write",
     },
     ToolSpec {
+        name: "set_cache_rule",
+        schema: set_cache_rule_schema,
+        risk: Risk::WriteLow,
+        permission: "dashboard:write",
+    },
+    ToolSpec {
         name: "create_board",
         schema: create_board_schema,
         risk: Risk::WriteLow,
@@ -2503,8 +2520,9 @@ mod tests {
         // + `create_report_subscription`, `list_report_subscriptions`,
         // `update_report_subscription` and `delete_report_subscription`
         // (`AI-10`, with `RPT-1`) + `list_maps` (`BI-16` part C2, `AI-5`)
-        // + `get_query_limits` and `stop_query` (`BI-5`).
-        assert_eq!(tool_schemas().len(), 109);
+        // + `get_query_limits` and `stop_query` (`BI-5`)
+        // + `set_cache_rule` (`BI-4` part B).
+        assert_eq!(tool_schemas().len(), 110);
     }
 
     /// `RPT-1` (with `AI-10`): the report tools have the console's permission,

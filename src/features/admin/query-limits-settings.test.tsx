@@ -95,4 +95,15 @@ describe("Admin > Settings > Query limits (BI-5)", () => {
     expect(await screen.findByRole("button", { name: /retry|try again/i })).toBeTruthy()
     expect(screen.queryByLabelText(/Time limit \(seconds\)/)).toBeNull()
   })
+
+  it("shows a reader without settings:write only the limits that apply to them (BI-5 review S6)", async () => {
+    global.fetch = mock(async (input: RequestInfo | URL) => {
+      if (String(input).includes("/api/identity/roles")) return json([])
+      return json({ effective: LIMITS.effective })
+    }) as unknown as typeof fetch
+    render(<QueryLimitsForm canWrite={false} />)
+    expect((await screen.findByText(/For you: 300 seconds to run/)).textContent).toContain("the limit for Analyst")
+    expect(screen.queryByLabelText(/Time limit \(seconds\)/)).toBeNull()
+    expect(screen.queryByRole("button", { name: "Save limits" })).toBeNull()
+  })
 })

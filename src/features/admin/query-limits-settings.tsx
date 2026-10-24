@@ -18,13 +18,13 @@ const FIELDS = Object.keys(LIMIT_RANGES) as LimitField[]
 type Draft = Record<LimitField, string>
 type RoleRow = { roleId: string; timeoutSeconds: string }
 
-const draftOf = (l: QueryLimits): Draft => ({
+const draftOf = (l: QueryLimits & { install: NonNullable<QueryLimits["install"]> }): Draft => ({
   timeoutSeconds: String(l.install.timeoutSeconds),
   chartRows: String(l.install.chartRows),
   mapPoints: String(l.install.mapPoints),
   studioRows: String(l.install.studioRows),
 })
-const rowsOf = (l: QueryLimits): RoleRow[] => l.roles.map((r) => ({ roleId: r.roleId, timeoutSeconds: String(r.timeoutSeconds) }))
+const rowsOf = (l: QueryLimits): RoleRow[] => (l.roles ?? []).map((r) => ({ roleId: r.roleId, timeoutSeconds: String(r.timeoutSeconds) }))
 
 /**
  * Admin > Settings > Query limits (`BI-5`, feature decisions 1, 2 and 6): how
@@ -57,8 +57,9 @@ export function QueryLimitsForm({ canWrite }: { canWrite: boolean }) {
 
   const loaded = state.status === "success" ? state.data : null
   React.useEffect(() => {
-    if (loaded) {
-      setDraft(draftOf(loaded))
+    // A reader without settings:write gets only what applies to them (no install row, no role rows).
+    if (loaded?.install) {
+      setDraft(draftOf({ ...loaded, install: loaded.install }))
       setRows(rowsOf(loaded))
     }
   }, [loaded])
@@ -74,9 +75,9 @@ export function QueryLimitsForm({ canWrite }: { canWrite: boolean }) {
       ].filter((p): p is string => p !== null)
     : []
   const changed =
-    loaded !== null &&
+    loaded?.install !== undefined &&
     draft !== null &&
-    (JSON.stringify(draft) !== JSON.stringify(draftOf(loaded)) || JSON.stringify(rows) !== JSON.stringify(rowsOf(loaded)))
+    (JSON.stringify(draft) !== JSON.stringify(draftOf({ ...loaded, install: loaded.install })) || JSON.stringify(rows) !== JSON.stringify(rowsOf(loaded)))
 
   async function handleSave() {
     if (!draft || problems.length) return
@@ -92,6 +93,15 @@ export function QueryLimitsForm({ canWrite }: { canWrite: boolean }) {
     if (result) state.reload()
   }
 
+  // What applies to the caller; the only thing a reader without settings:write is sent (BI-5 review S6).
+  const forYou = loaded ? (
+    <p className="text-xs text-muted-foreground" data-slot="effective-limits">
+            For you: {loaded.effective.timeoutSeconds.toLocaleString("en-US")} seconds to run, {loaded.effective.chartRows.toLocaleString("en-US")} rows
+            a chart reads, {loaded.effective.mapPoints.toLocaleString("en-US")} points on a map, {loaded.effective.studioRows.toLocaleString("en-US")} rows in
+            Query Studio ({loaded.effective.source.kind === "role" ? `the limit for ${loaded.effective.source.name}` : "the limit for this install"}).
+          </p>
+  ) : null
+
   return (
     <section className="flex max-w-sm flex-col gap-4" aria-labelledby="settings-limits">
       <h2 id="settings-limits" className="text-sm font-medium">
@@ -99,13 +109,10 @@ export function QueryLimitsForm({ canWrite }: { canWrite: boolean }) {
       </h2>
       {state.status === "loading" ? <LoadingSkeleton /> : null}
       {state.status === "error" ? <ErrorState error={state.error} onRetry={state.reload} /> : null}
+      {loaded && !draft ? forYou : null}
       {loaded && draft ? (
         <>
-          <p className="text-xs text-muted-foreground" data-slot="effective-limits">
-            For you: {loaded.effective.timeoutSeconds.toLocaleString("en-US")} seconds to run, {loaded.effective.chartRows.toLocaleString("en-US")} rows
-            a chart reads, {loaded.effective.mapPoints.toLocaleString("en-US")} points on a map, {loaded.effective.studioRows.toLocaleString("en-US")} rows in
-            Query Studio ({loaded.effective.source.kind === "role" ? `the limit for ${loaded.effective.source.name}` : "the limit for this install"}).
-          </p>
+          {forYou}
           {FIELDS.map((field) => {
             const r = LIMIT_RANGES[field]
             const problem = limitProblem(field, draft[field])

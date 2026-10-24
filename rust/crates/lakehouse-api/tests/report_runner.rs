@@ -226,7 +226,8 @@ struct F {
     owner: Uuid,
     owner_role: String,
     colleague: Uuid,
-    _ch_server: MockServer,
+    /// Read by the R1 test for the URL parameters of the tile queries.
+    ch_server: MockServer,
 }
 
 async fn person(pool: &PgPool, name: &str, role_id: Uuid) -> Uuid {
@@ -308,7 +309,7 @@ async fn fixture(pdf: ResponseTemplate, configured: bool) -> F {
         owner,
         owner_role,
         colleague,
-        _ch_server: ch_server,
+        ch_server,
     }
 }
 
@@ -409,6 +410,56 @@ async fn a_due_subscription_is_sent_once_with_its_files_and_recorded_as_sent() {
     let stored = subs::get(&f.pool, sub.id).await.unwrap().unwrap();
     assert!(stored.next_run_at > OffsetDateTime::now_utc());
     assert_eq!(stored.consecutive_failures, 0);
+}
+
+/// `BI-5` re-review R1: the runner calls the tiles from its own spawned loop,
+/// outside any request. The tiles must run as the owner (the query id starts
+/// with the owner's id, so Stop and the process list can name them) under the
+/// limits an administrator saved, not the nil principal and the compiled-in
+/// defaults.
+#[tokio::test]
+async fn a_scheduled_delivery_asks_the_engine_as_the_owner_under_the_saved_limits() {
+    let f = fixture(ok_pdf(), true).await;
+    lakehouse_store::query_limits::save(
+        &f.pool,
+        &lakehouse_store::query_limits::QueryLimits {
+            timeout_seconds: 17,
+            ..Default::default()
+        },
+        &[],
+        "test",
+    )
+    .await
+    .unwrap();
+    // `skip_when_empty` reads the dashboard's tiles (`payload_for`).
+    let _sub = subscription(&f, |s| s.skip_when_empty = true).await;
+
+    assert_eq!(tick(&f.state, &f.mailer).await, 1);
+    let own_prefix = format!("{}:", f.owner);
+    let tile_queries: Vec<_> = f
+        .ch_server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|r| {
+            let param = |name: &str| {
+                r.url
+                    .query_pairs()
+                    .find(|(k, _)| k == name)
+                    .map(|(_, v)| v.into_owned())
+            };
+            param("query_id").map(|id| (id, param("max_execution_time")))
+        })
+        .collect();
+    assert!(
+        !tile_queries.is_empty(),
+        "the delivery sent tile queries with a query id"
+    );
+    for (id, seconds) in &tile_queries {
+        assert!(id.starts_with(&own_prefix), "{id} is not the owner's run");
+        assert_eq!(seconds.as_deref(), Some("17"), "{id}");
+    }
 }
 
 /// The subject carries today's date in the subscription's zone; the test reads

@@ -547,6 +547,13 @@ pub struct ShapeFields {
     /// has layers (`BI-13`).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub axis: Option<String>,
+    /// How long this chart's result may be remembered (`BI-4` part B, feature
+    /// decision 2): the narrowest rule set wins over the dashboard's and the
+    /// install's. `None` follows the dashboard. A value outside its range does
+    /// not deserialise (see [`crate::cache_rule::CacheRule`]), so no chart is
+    /// saved with one.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub cache: Option<crate::cache_rule::CacheRule>,
     /// Set on the synthetic chart a layer is read as (`BI-13`): the builder
     /// then always rebuilds its statement from the definition (a layer has no
     /// stored statement to fall back to) and a table calculation is refused.

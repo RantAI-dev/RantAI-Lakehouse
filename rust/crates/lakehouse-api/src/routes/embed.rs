@@ -407,15 +407,22 @@ pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
         Ok(f) => f,
         Err(err) => return crate::error::ApiRejection(err).into_response(),
     };
-    let payload = render_board_payload(
-        &state.clickhouse,
-        &PolicyEngineObligations::from_state(&state),
-        &board,
-        &board_id,
-        &filters,
-        (&time, &state.tile_slots),
-        subject.only_chart.as_deref(),
-        &editable,
+    let payload = crate::result_cache::scoped(
+        crate::result_cache::CacheScope::new(
+            std::sync::Arc::clone(&state.result_cache),
+            format.result_cache,
+            crate::result_cache::Fresh::No,
+        ),
+        render_board_payload(
+            &state.clickhouse,
+            &PolicyEngineObligations::from_state(&state),
+            &board,
+            &board_id,
+            &filters,
+            (&time, &state.tile_slots),
+            subject.only_chart.as_deref(),
+            &editable,
+        ),
     )
     .await;
     match payload {
@@ -836,15 +843,22 @@ pub async fn public_dashboard(
         Ok(f) => f,
         Err(err) => return crate::error::ApiRejection(err).into_response(),
     };
-    let payload = render_board_payload(
-        &state.clickhouse,
-        &PolicyEngineObligations::from_state(&state),
-        &board,
-        &board_id,
-        &filters,
-        (&time, &state.tile_slots),
-        None,
-        &[],
+    let payload = crate::result_cache::scoped(
+        crate::result_cache::CacheScope::new(
+            std::sync::Arc::clone(&state.result_cache),
+            format.result_cache,
+            crate::result_cache::Fresh::No,
+        ),
+        render_board_payload(
+            &state.clickhouse,
+            &PolicyEngineObligations::from_state(&state),
+            &board,
+            &board_id,
+            &filters,
+            (&time, &state.tile_slots),
+            None,
+            &[],
+        ),
     )
     .await;
     match payload {
@@ -1173,79 +1187,88 @@ async fn render_board_payload(
         .iter()
         .map(|original| {
             let original: &StoredChartSpec = original;
-            Box::pin(async move {
-                let tile_filters = tile_filters(board, filters, &original.spec.id);
-                let effective = crate::routes::support::effective_chart(
-                    original,
-                    cols_ref,
-                    sources_ref,
-                    read_ref,
-                );
-                let c = match &effective {
-                    Ok(e) => &**e,
-                    Err(msg) => {
-                        return (
-                            original.spec.id.clone(),
-                            json!({ "error": msg }),
-                            embed_rendered(original, original),
-                        );
-                    }
-                };
-                let val = match stored_chart_sql(
-                    c,
-                    &[],
-                    &tile_filters,
-                    cols_ref,
-                    sources_ref,
-                    read_ref,
-                ) {
-                    Ok(filtered) => {
-                        let filtered =
-                            crate::routes::support::with_map_limit(filtered, c.spec.kind).await;
-                        let (id, mut val) = run_spec_sql(
-                            ch,
-                            &c.spec.id,
-                            &filtered.sql,
-                            roles_ref,
-                            placeholders_ref,
-                            obligations,
-                        )
-                        .await;
-                        crate::routes::support::annotate_params(&mut val, c, values_ref);
-                        crate::routes::support::annotate_grain(&mut val, &filtered, c);
-                        // BI-16 part A: the first page of a raw table, with
-                        // its total; an embed and a public link offer no
-                        // paging.
-                        crate::routes::support::annotate_table(
-                            ch,
-                            &mut val,
-                            &filtered,
-                            (roles_ref, placeholders_ref, obligations),
-                        )
-                        .await;
-                        let tile_ctx = crate::routes::layers::LayerContext {
-                            filters: &tile_filters,
-                            ..*layer_ctx_ref
-                        };
-                        crate::routes::layers::annotate_layers(
-                            &tile_ctx,
-                            &mut val,
-                            c,
-                            filtered.grain,
-                        )
-                        .await;
-                        annotate_metric_labels(
-                            &mut val,
-                            c,
-                            catalog_ref,
-                            Some((cols_ref, sources_ref)),
-                        );
-                        (id, val)
-                    }
-                    Err(msg) => (c.spec.id.clone(), json!({ "error": msg })),
-                };
-                (val.0, val.1, rendered_chart(original, c))
-            }) as futures::future::BoxFuture<'_, (String, Value, Value)>
+            // BI-4 part B: the chart's own freshness rule narrows the board's.
+            Box::pin(crate::result_cache::in_chart(
+                (Some(original.spec.id.as_str()), original.def.shape.cache),
+                async move {
+                    let tile_filters = tile_filters(board, filters, &original.spec.id);
+                    let effective = crate::routes::support::effective_chart(
+                        original,
+                        cols_ref,
+                        sources_ref,
+                        read_ref,
+                    );
+                    let c = match &effective {
+                        Ok(e) => &**e,
+                        Err(msg) => {
+                            return (
+                                original.spec.id.clone(),
+                                json!({ "error": msg }),
+                                embed_rendered(original, original),
+                            );
+                        }
+                    };
+                    let val = match stored_chart_sql(
+                        c,
+                        &[],
+                        &tile_filters,
+                        cols_ref,
+                        sources_ref,
+                        read_ref,
+                    ) {
+                        Ok(filtered) => {
+                            let filtered =
+                                crate::routes::support::with_map_limit(filtered, c.spec.kind).await;
+                            // BI-5 review B1: the rows this kind may read.
+                            let (id, mut val) = crate::routes::support::with_tile_rows(
+                                c.spec.kind,
+                                &filtered.sql,
+                                run_spec_sql(
+                                    ch,
+                                    &c.spec.id,
+                                    &filtered.sql,
+                                    roles_ref,
+                                    placeholders_ref,
+                                    obligations,
+                                ),
+                            )
+                            .await;
+                            crate::routes::support::annotate_params(&mut val, c, values_ref);
+                            crate::routes::support::annotate_grain(&mut val, &filtered, c);
+                            // BI-16 part A: the first page of a raw table, with
+                            // its total; an embed and a public link offer no
+                            // paging.
+                            crate::routes::support::annotate_table(
+                                ch,
+                                &mut val,
+                                &filtered,
+                                (roles_ref, placeholders_ref, obligations),
+                            )
+                            .await;
+                            let tile_ctx = crate::routes::layers::LayerContext {
+                                filters: &tile_filters,
+                                ..*layer_ctx_ref
+                            };
+                            crate::routes::layers::annotate_layers(
+                                &tile_ctx,
+                                &mut val,
+                                c,
+                                filtered.grain,
+                            )
+                            .await;
+                            annotate_metric_labels(
+                                &mut val,
+                                c,
+                                catalog_ref,
+                                Some((cols_ref, sources_ref)),
+                            );
+                            (id, val)
+                        }
+                        Err(msg) => (c.spec.id.clone(), json!({ "error": msg })),
+                    };
+                    (val.0, val.1, rendered_chart(original, c))
+                },
+            )) as futures::future::BoxFuture<'_, (String, Value, Value)>
         })
         .collect();
     // BI-5 (plan D4): the same board deadline as the dashboard payload.
@@ -1266,9 +1289,24 @@ async fn render_board_payload(
             embed_rendered(original, original),
         )
     };
-    for (id, val, rendered) in
-        crate::tile_pool::run_tiles_until(tile_slots, tiles, deadline, &unreached).await
-    {
+    // BI-4 part B: the scope the handler opened, narrowed to the board's own
+    // rule; the embed viewer's masks are in each statement, so equal viewers
+    // share a result and different ones never do.
+    let running = crate::tile_pool::run_tiles_until(tile_slots, tiles, deadline, &unreached);
+    let finished = match crate::result_cache::current() {
+        Some(scope) => {
+            let candidates = cols.keys().map(|mart| format!("serving.{mart}")).collect();
+            crate::result_cache::scoped(
+                scope
+                    .for_board(board.cache, candidates)
+                    .with_zone(time.zone()),
+                running,
+            )
+            .await
+        }
+        None => running.await,
+    };
+    for (id, val, rendered) in finished {
         results.insert(id, val);
         charts_out.push(rendered);
     }
@@ -1444,6 +1482,7 @@ mod typed_filters {
             phone_layout: None,
             theme: None,
             font: None,
+            cache: None,
             created_at: None,
             updated_at: None,
             public_token: None,
@@ -1596,6 +1635,7 @@ mod typed_filters {
             }]),
             theme: Some("dark".to_owned()),
             font: Some("inter".to_owned()),
+            cache: None,
             created_at: None,
             updated_at: None,
             public_token: None,
@@ -1705,6 +1745,7 @@ mod typed_filters {
             phone_layout: None,
             theme: None,
             font: None,
+            cache: None,
             created_at: None,
             updated_at: None,
             public_token: None,
@@ -1807,6 +1848,7 @@ mod typed_filters {
             phone_layout: None,
             theme: None,
             font: None,
+            cache: None,
             created_at: None,
             updated_at: None,
             public_token: None,

@@ -45,6 +45,9 @@ export type Rows = {
    * `limit` object is on a failed tile (`TileFailure.limit`). Not on the server yet: T2 must return it under this name or this changes.
    */
   limitHit?: TileLimit;
+  /** When the engine computed these rows (RFC 3339, UTC) and whether this answer came from memory (`BI-4` part B). */
+  computedAt?: string;
+  remembered?: boolean;
   /** A raw table's first page: the rows its pages walk through, the page size and the offset. Absent when the count could not be read (BI-16). */
   total?: number;
   limit?: number;

@@ -1372,7 +1372,7 @@ async fn an_invalid_viewer_filter_is_a_400() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert!(fake.tile_statements().is_empty());
+    assert_eq!(fake.tile_statements(), [] as [String; 0]);
 }
 
 // ── BI-26 T3: values route, settings route, sample token ───────────────

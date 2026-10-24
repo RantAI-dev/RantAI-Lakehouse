@@ -3961,6 +3961,41 @@
   {
     "type": "function",
     "function": {
+      "name": "set_cache_rule",
+      "description": "Set how long a dashboard's or a chart's results may be remembered instead of computed again (\"Make this chart always fresh\"). Give a board (list_boards) or a chart (list_charts), one of the two. rule: default follows the level above (a chart follows its dashboard, a dashboard follows the install's setting in Admin > Settings), fresh computes every time, minutes remembers for `minutes` (1 to 1440). The narrowest rule set wins. Not for the built-in dashboard; set it on one of its charts or duplicate it first. The install's own rule is set by an administrator in Admin > Settings, not here. A result is also recomputed whenever the data under it changes, whatever the rule.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "board": {
+            "type": "string",
+            "description": "the dashboard id (list_boards)"
+          },
+          "chart": {
+            "type": "string",
+            "description": "the chart id (list_charts)"
+          },
+          "rule": {
+            "type": "string",
+            "enum": [
+              "default",
+              "fresh",
+              "minutes"
+            ]
+          },
+          "minutes": {
+            "type": "number",
+            "description": "with rule minutes: 1 to 1440"
+          }
+        },
+        "required": [
+          "rule"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
       "name": "create_board",
       "description": "Create a new named dashboard (board). Returns its id for create_chart.",
       "parameters": {

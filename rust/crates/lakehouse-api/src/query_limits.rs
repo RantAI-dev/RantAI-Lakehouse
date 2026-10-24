@@ -229,6 +229,55 @@ pub const ANONYMOUS_PRINCIPAL: &str = "00000000-0000-0000-0000-000000000000";
 
 tokio::task_local! {
     static CURRENT: Arc<QueryRun>;
+    /// The rows the tile being read may return when its kind reads more than a
+    /// chart does (`BI-5` review B1): a point map its map limit, a pivot its own
+    /// cap. Set around one tile's queries by [`with_row_cap`].
+    static ROW_CAP: u32;
+}
+
+/// Runs the caller pressed Stop on, by `<principal uuid>:<run id>`, and when.
+/// `BI-5` review S2: a board of more than six tiles starts its next round of
+/// queries after the first round was killed, unless the browser's abort reaches
+/// the handler; a tile checks this before it sends a query and answers "Stopped".
+/// In process and short-lived by design: a mark only matters while its run is
+/// still in the handler, and a restart ends every run anyway.
+static STOPPED_RUNS: std::sync::LazyLock<Mutex<std::collections::HashMap<String, Instant>>> =
+    std::sync::LazyLock::new(Mutex::default);
+
+/// How long a stopped mark is kept. A run is a page load or a Run press; none
+/// outlasts the 35-minute board deadline, and 40 minutes covers it.
+const STOPPED_MARK_TTL: Duration = Duration::from_mins(40);
+
+/// Most marks kept; the oldest go first. A mark is a few dozen bytes, so this
+/// bounds memory against someone who presses Stop in a loop.
+const STOPPED_MARKS_MAX: usize = 10_000;
+
+/// Record that `principal` stopped the run `run_id` (a UUID, checked by the
+/// caller of the route).
+pub fn mark_stopped(principal: Uuid, run_id: Uuid) {
+    let mut marks = STOPPED_RUNS.lock().unwrap_or_else(PoisonError::into_inner);
+    marks.retain(|_, at| at.elapsed() < STOPPED_MARK_TTL);
+    if marks.len() >= STOPPED_MARKS_MAX
+        && let Some(oldest) = marks
+            .iter()
+            .min_by_key(|(_, at)| **at)
+            .map(|(k, _)| k.clone())
+    {
+        marks.remove(&oldest);
+    }
+    marks.insert(format!("{principal}:{run_id}"), Instant::now());
+}
+
+/// Run `fut` with `rows` as the most its queries may return, in place of the
+/// chart row limit when `rows` is higher.
+pub async fn with_row_cap<F: std::future::Future>(rows: u32, fut: F) -> F::Output {
+    ROW_CAP.scope(rows, fut).await
+}
+
+/// The cap [`with_row_cap`] set for the tile being read, if any.
+#[must_use]
+pub fn row_cap_override() -> Option<u32> {
+    ROW_CAP.try_with(|rows| *rows).ok()
 }
 
 /// The identity and limits context of the queries one request sends.
@@ -289,6 +338,16 @@ impl QueryRun {
             .unwrap_or_else(|_| Arc::new(Self::detached()))
     }
 
+    /// Whether the caller pressed Stop on this run (`BI-5` review S2).
+    #[must_use]
+    pub fn is_stopped(&self) -> bool {
+        STOPPED_RUNS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&format!("{}:{}", self.principal, self.run_id))
+            .is_some_and(|at| at.elapsed() < STOPPED_MARK_TTL)
+    }
+
     /// The run id (a UUID in its hyphenated form).
     #[cfg(test)]
     #[must_use]
@@ -328,9 +387,27 @@ impl QueryRun {
     }
 }
 
-/// Run `fut` with `run` as the current run.
-pub async fn scope<F: std::future::Future>(run: QueryRun, fut: F) -> F::Output {
-    CURRENT.scope(Arc::new(run), fut).await
+/// Run `fut` with `run` as the current run. A spawned task starts with no run
+/// (a task-local does not cross `tokio::spawn`), so a handler that spawns takes
+/// [`QueryRun::current_or_detached`] first and hands it here (`BI-5` review B2).
+pub async fn scope<F: std::future::Future>(run: impl Into<Arc<QueryRun>>, fut: F) -> F::Output {
+    CURRENT.scope(run.into(), fut).await
+}
+
+/// Run `fut` under the current run when there is one; otherwise (a scheduled
+/// or background run, no request) under a run for `principal` with the
+/// install's limits read from the settings, not the compiled-in defaults
+/// (`BI-5` review B2: a detached run used `Snapshot::default()`).
+pub async fn scope_if_missing<F: std::future::Future>(
+    state: &AppState,
+    principal: Option<&Principal>,
+    fut: F,
+) -> F::Output {
+    if CURRENT.try_with(|_| ()).is_ok() {
+        fut.await
+    } else {
+        scope(QueryRun::for_request(state, principal, None), fut).await
+    }
 }
 
 /// Middleware: give every request its [`QueryRun`], from the principal the

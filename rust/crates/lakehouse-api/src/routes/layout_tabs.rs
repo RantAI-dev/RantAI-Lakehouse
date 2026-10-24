@@ -114,6 +114,7 @@ async fn dashboard(server: &MockServer, filters: &str) -> Value {
         filters: Some(filters.to_owned()),
         grain: None,
         params: None,
+        fresh: None,
     };
     let parsed = parse_filters_param(q.filters.as_deref()).expect("valid filters");
     get_body(
@@ -647,6 +648,7 @@ mod verify {
             filters: None,
             grain: None,
             params: None,
+            fresh: None,
         };
         let obligations = PolicyEngineObligations::new(None, ch);
         get_body(

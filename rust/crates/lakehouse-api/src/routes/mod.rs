@@ -198,11 +198,17 @@ fn limit_bearing(path: &str) -> bool {
 
 /// The routes that answer a whole board: tiles run six at a time, so one can
 /// need several rounds of the time limit.
+///
+/// `BI-5` review S1: only the routes that run a whole board's tiles. The embed
+/// frame and values routes and a public link's `unlock` run no tile, so they
+/// keep the ordinary deadline.
 fn is_board_path(path: &str) -> bool {
     path == "/api/dashboard"
         || path == "/api/render/data"
-        || path.starts_with("/api/embed/")
-        || path.starts_with("/api/public/dashboard/")
+        || path == "/api/embed/data"
+        || path
+            .strip_prefix("/api/public/dashboard/")
+            .is_some_and(|token| !token.is_empty() && !token.contains('/'))
 }
 
 /// The deadline of `path` given the install's longest configured time limit
@@ -1522,7 +1528,16 @@ mod tests {
             );
             assert_eq!(deadline_for(board, None), route_timeout(board), "{board}");
         }
-        for other in ["/api/dashboard/export", "/api/catalog", "/api/ai/chat"] {
+        // BI-5 review S1: routes under the board prefixes that run no tile.
+        for other in [
+            "/api/dashboard/export",
+            "/api/catalog",
+            "/api/ai/chat",
+            "/api/embed/frame",
+            "/api/embed/values",
+            "/api/public/dashboard/abc/unlock",
+            "/api/public/dashboard/",
+        ] {
             assert_eq!(
                 deadline_for(other, longest),
                 route_timeout(other),

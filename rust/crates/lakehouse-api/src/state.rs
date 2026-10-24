@@ -231,6 +231,10 @@ pub struct AppState {
     /// computed at once per process, across every request (`BI-4` part A,
     /// plan D2); a request also caps itself at 6. Shared across clones.
     pub tile_slots: Arc<tokio::sync::Semaphore>,
+    /// Remembered dashboard results (`BI-4` part B), at most
+    /// `RESULT_CACHE_MAX_MB` (default 256) per process; 0 remembers nothing.
+    /// Read once, when the state is built. Shared across clones.
+    pub result_cache: Arc<crate::result_cache::ResultCache>,
     /// The 30-second memo of the query limits (`BI-5` plan D2), so a
     /// dashboard does not read Postgres per tile. Shared across clones.
     pub query_limits: crate::query_limits::QueryLimitsMemo,
@@ -684,7 +688,7 @@ impl AppState {
     #[allow(
         clippy::too_many_lines,
         reason = "one struct literal naming every shared handle, a line per \
-                  field; `tile_slots` (BI-4 part A) and `query_limits` (BI-5) are \
+                  field; `tile_slots` (BI-4 part A), `result_cache` (part B) and `query_limits` (BI-5) are \
                   the lines that took it from 100 to 102"
     )]
     pub fn new(config: Config) -> Self {
@@ -805,6 +809,11 @@ impl AppState {
             upload_receive,
             pdf_slots: Arc::new(tokio::sync::Semaphore::new(PDF_AT_ONCE)),
             tile_slots: Arc::new(crate::tile_pool::slots_from_env()),
+            result_cache: Arc::new(crate::result_cache::ResultCache::new(
+                crate::result_cache::max_mb_from(
+                    std::env::var("RESULT_CACHE_MAX_MB").ok().as_deref(),
+                ),
+            )),
             query_limits: crate::query_limits::QueryLimitsMemo::default(),
             #[cfg(test)]
             webhook_sender_override: None,

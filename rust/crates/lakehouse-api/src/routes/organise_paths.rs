@@ -184,6 +184,7 @@ async fn payload(server: &MockServer, viewer: &Viewer, board: &str) -> Value {
         filters: None,
         grain: None,
         params: None,
+        fresh: None,
     };
     get_body(
         &ch,
