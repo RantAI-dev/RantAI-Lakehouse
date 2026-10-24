@@ -196,7 +196,8 @@ estimate (S, M, L), which the base has no field for.
 | `SEC-18` | Task | No default credentials in compose (`lakehouse`, `rustfsadmin`); must-set secrets use `${X:?}` (rule 5) | Administration & Security | P2 | Done | #83 | `docker-compose.yml` |
 | `SEC-37` | Task | Default credentials left in code after `SEC-18`: `rustfsadmin` fallbacks in `ops/g3/g3_loadgen.py`, `ops/g6/g6_ingest_matrix_test.py` and `dagster/dispar_orchestrate/dlt_pipeline.py`, and `postgres://lakehouse:lakehouse@localhost` as `DATABASE_URL`'s default in `lakehouse-api` `config.rs`. Compose always sets them now, so none is reached in a compose start | Administration & Security | P2 | Done | [#238](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/238) | PR #83 review |
 | `SEC-19` | Task | The query cost estimate runs raw SQL without the read-only check or table-function block, and returns database error text. The error-text half is met by `SEC-11`'s query-author exception. The author sees the engine's diagnosis with the version and addresses trimmed, and other routes still answer the fixed message | Administration & Security | P2 | Done | #203 | `routes/query.rs` |
-| `SEC-20` | Task | Queries are not scoped to the tenant: no tenant gate on query runs; saved queries listed for everyone | Administration & Security | P2 | Todo |  | `routes/query.rs` |
+| `SEC-20` | Task | Queries are not scoped to the tenant: no tenant gate on query runs; saved queries listed for everyone | Administration & Security | P2 | In Progress |  | `routes/query.rs` |
+| `SEC-50` | Task | Dashboards, gold export, alerts and authored pipelines are not scoped to the tenant: they call the role rewrite directly, not the query path that `SEC-20` gates | Administration & Security | P2 | Todo |  | `routes/dashboard.rs` |
 | `SEC-21` | Task | Downloads re-run SQL rewritten for an older policy; whole results buffered before the 2,000-row cut | Administration & Security | P2 | Done | #203 | `routes/query.rs` |
 | `SEC-12` | Feature | Embed tokens: require an expiry, allow revocation, keep the signing secret out of plain text, set a frame-ancestors policy | Administration & Security | P2 | In Acceptance | #105, #201 | `lakehouse-embed` |
 | `SEC-25` | Task | Connector security follow-ups: a connector that signs in with no credential (Kafka, auth `none`) can never be re-pointed (409 without a credential, 400 with one); the PATCH-`host` rule and its doc for `files` connectors are stale since `SRC-6`; the `SEC-15` refusal message has runs of spaces | Administration & Security | P2 | Done | [#238](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/238) | `superpowers/plans/2026-10-12-delivery-review.md` |
@@ -299,7 +300,8 @@ parity), built after it.
 | `QS-5` | Planned | `BI-18` (the dashboard date filter) | `AI-12` (variables part) |
 | `REL-9` | Todo | — | `SEC-41` |
 | `SEC-14` | Building | `SEC-41` (part B) | `SRC-4` (credentials) |
-| `SEC-20` | Todo | — | `QS-3` |
+| `SEC-20` | In Progress | — | `QS-3` |
+| `SEC-50` | Todo | — | — |
 | `SEC-41` | Todo | `REL-9` | `SEC-14` (part B) |
 | `AI-10` | Planned | `RPT-1`, `BI-1` | — |
 | `AI-11` | Planned | `BI-19`, `BI-26`, `DEC-8` | — |
@@ -326,6 +328,7 @@ set by the product owner and are left empty until they are.
 
 | ID | Started | Shipped | Due |
 | --- | --- | --- | --- |
+| `SEC-20` | 2026-10-24 | | |
 | `DATA-1` | 2026-10-02 | 2026-10-03 | |
 | `SEC-2` | 2026-10-02 | 2026-10-03 | |
 | `SEC-5` | 2026-10-02 | 2026-10-03 | |
