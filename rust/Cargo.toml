@@ -4,12 +4,15 @@ members = ["crates/*"]
 
 [workspace.package]
 edition = "2024"
-# Real floor, not the edition-2024 minimum (1.85). Verified by building
-# --locked against progressively newer toolchains: 1.85 fails because
-# testcontainers/testcontainers-modules require 1.88, time/time-core/
-# time-macros require 1.88.0, etcetera requires 1.87.0, and ferroid
-# requires 1.85.1. 1.88.0 builds clean. See docs/CI.md.
-rust-version = "1.88"
+# Floor, not the edition-2024 minimum (1.85). Since REL-9 (product-owner
+# decision D1, 2026-10-17) the floor is the latest stable, same release as
+# the `rust-toolchain.toml` pin: `sqlx` 0.9 — which `SEC-41` needs —
+# requires rustc 1.94, so a held-over lower promise could not be kept, and
+# the owner chose to move pin and floor together rather than chase
+# dependency floors. The CI `msrv` job checks it one patch below the pin
+# with `cargo +1.99.0 check --workspace --all-targets --locked`. See
+# docs/CI.md.
+rust-version = "1.99"
 license = "AGPL-3.0-or-later"
 
 [workspace.dependencies]
@@ -85,7 +88,10 @@ croner = { version = "4" }
 sqlparser = "0.63"
 
 [workspace.lints.rust]
-future-incompatible = "warn"
+# `future_incompatible` with an underscore: Cargo 1.99 warns that the
+# hyphenated `future-incompatible` spelling is deprecated and will not work
+# in a future edition (REL-9). Same lint, same level.
+future_incompatible = "warn"
 nonstandard_style = { level = "deny", priority = -1 }
 missing_docs = "warn"
 

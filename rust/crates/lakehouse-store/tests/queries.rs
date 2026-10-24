@@ -50,7 +50,10 @@ async fn seed_populates_saved_queries(pool: PgPool) -> sqlx::Result<()> {
 #[sqlx::test(migrations = "../../migrations")]
 async fn record_history_round_trips_through_list(pool: PgPool) -> sqlx::Result<()> {
     let owner = Uuid::new_v4();
-    assert!(list_history(&pool, owner).await.unwrap().is_empty());
+    assert_eq!(
+        list_history(&pool, owner).await.unwrap(),
+        [] as [lakehouse_store::queries::QueryHistoryItem; 0]
+    );
 
     record_history(
         &pool,
@@ -80,11 +83,9 @@ async fn record_history_round_trips_through_list(pool: PgPool) -> sqlx::Result<(
 
     // Another user's history is not this user's: the rows are private to
     // whoever ran them.
-    assert!(
-        list_history(&pool, Uuid::new_v4())
-            .await
-            .unwrap()
-            .is_empty()
+    assert_eq!(
+        list_history(&pool, Uuid::new_v4()).await.unwrap(),
+        [] as [lakehouse_store::queries::QueryHistoryItem; 0]
     );
     Ok(())
 }
@@ -418,7 +419,10 @@ async fn history_mentioning_finds_queries_by_substring_across_users(
     );
 
     // Nothing to look for is nothing found, not everything.
-    assert!(history_mentioning(&pool, 7, &[]).await.unwrap().is_empty());
+    assert_eq!(
+        history_mentioning(&pool, 7, &[]).await.unwrap(),
+        [] as [lakehouse_store::queries::HistoryMention; 0]
+    );
     Ok(())
 }
 
@@ -567,6 +571,6 @@ async fn saved_queries_are_listed_per_tenant(pool: PgPool) -> sqlx::Result<()> {
 
     // A caller in no tenant reads no row at all.
     let none = list_saved(&pool, SavedQueryScope::None).await.unwrap();
-    assert!(none.is_empty());
+    assert_eq!(none, [] as [lakehouse_store::queries::SavedQuery; 0]);
     Ok(())
 }

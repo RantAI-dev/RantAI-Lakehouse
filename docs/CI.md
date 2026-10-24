@@ -141,21 +141,23 @@ evicted: reduce what `rust-cache` stores before anything else (CI-SPEED-PLAN §9
 
 ## MSRV
 
-`rust/Cargo.toml`'s `rust-version` is `1.88`, not the edition-2024 floor of
-`1.85`. This was verified empirically, not assumed: building `--locked`
-against 1.85.0 fails because `testcontainers`/`testcontainers-modules`
-require rustc 1.88, `time`/`time-core`/`time-macros` require 1.88.0,
-`etcetera` requires 1.87.0, and `ferroid` requires 1.85.1. Building against
-1.88.0 succeeds.
+`rust/Cargo.toml`'s `rust-version` is `1.99` (REL-9, product-owner decision
+D1, 2026-10-17), the same release as the `rust-toolchain.toml` pin. The
+floor is deliberately not a dependency's minimum: `sqlx` 0.9 — which
+`SEC-41` needs — requires rustc 1.94, so a held-over lower promise could
+not be kept, and the owner moved pin and floor to the latest stable
+together. The MSRV stays proven, not assumed: the CI `msrv` job runs
+`cargo +1.99.0 check --workspace --all-targets --locked` in `rust/`, one
+patch below the pin.
 
-In CI, the `msrv` job runs a dedicated `cargo check --workspace --all-targets --locked`
-under toolchain `1.88.0` to verify compatibility without duplicating test run
-times, while the full test suite runs under `stable`.
-
-`rust-toolchain.toml` pins `1.96.1` — intentionally newer than the MSRV. That
-file is what CI's `fmt`/`clippy`/`build` jobs and local dev actually build
-with; the MSRV check job exists specifically to catch MSRV regressions that the
-day-to-day toolchain wouldn't.
+The `+1.99.0` is load-bearing. `rust-toolchain.toml` beats anything a
+checkout action installs as the *default* toolchain (rustup precedence:
+command-line `+` spec > `RUSTUP_TOOLCHAIN` env > `rust-toolchain.toml` >
+default), so a plain `cargo check` in a job that installs `1.99.0` would
+compile the workspace on the pin instead of the floor — which is what the
+old job did. The same precedence means CI's `fmt`/`clippy`/`build`/`test`
+jobs, which install `stable`, actually build with the pin; local dev does
+too, so one compiler everywhere.
 
 ## `history-scan`: baselined, red only on a new finding
 

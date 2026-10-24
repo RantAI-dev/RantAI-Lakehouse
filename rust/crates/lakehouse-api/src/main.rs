@@ -1076,7 +1076,7 @@ fn spawn_run_log_cleanup(state: &AppState) {
         return;
     };
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(86_400));
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_hours(24));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;

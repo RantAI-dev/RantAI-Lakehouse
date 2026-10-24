@@ -3641,7 +3641,7 @@ mod tests {
     fn split_db_table_empty_table_for_bare_db() {
         let (db, table) = split_db_table("silver");
         assert_eq!(db, "silver");
-        assert!(table.is_empty());
+        assert_eq!(table, "");
     }
 
     #[test]
@@ -4069,9 +4069,9 @@ mod tests {
             description: Some(description.to_owned()),
             governed_tags: None,
         };
-        assert!(
-            changed_annotation_fields(Some(&before), &body("Data Platform", " Orders ", &["pii"]))
-                .is_empty()
+        assert_eq!(
+            changed_annotation_fields(Some(&before), &body("Data Platform", " Orders ", &["pii"])),
+            [] as [&str; 0]
         );
         assert_eq!(
             changed_annotation_fields(Some(&before), &body("Finance", "Orders", &[])),
@@ -4219,7 +4219,10 @@ mod tests {
             silver_downstream("orders", true),
             vec![json!({ "id": "silver.orders", "name": "silver.orders" })]
         );
-        assert!(silver_downstream("orders", false).is_empty());
+        assert_eq!(
+            silver_downstream("orders", false),
+            [] as [serde_json::Value; 0]
+        );
 
         // A Silver model is listed as its own asset once Bronze itself is
         // readable; on a deployment where it is not, the dataset's page IS
@@ -4333,7 +4336,10 @@ mod tests {
     fn iceberg_candidates_excludes_a_seed_like_name_absent_from_the_listing() {
         let pairs = vec![("commerce-orders".to_owned(), "commerce_orders".to_owned())];
         let bronze_tables: HashSet<String> = HashSet::new();
-        assert!(iceberg_candidates(&pairs, &bronze_tables).is_empty());
+        assert_eq!(
+            iceberg_candidates(&pairs, &bronze_tables),
+            [] as [(std::string::String, std::string::String); 0]
+        );
     }
 
     #[test]
@@ -4352,7 +4358,10 @@ mod tests {
             ("a".to_owned(), "a".to_owned()),
             ("b".to_owned(), "b".to_owned()),
         ];
-        assert!(iceberg_candidates(&pairs, &HashSet::new()).is_empty());
+        assert_eq!(
+            iceberg_candidates(&pairs, &HashSet::new()),
+            [] as [(std::string::String, std::string::String); 0]
+        );
     }
 
     fn bronze_row_with_id(slug: &str) -> Value {

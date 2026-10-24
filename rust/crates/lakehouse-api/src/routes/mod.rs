@@ -1315,7 +1315,7 @@ mod tests {
         assert_eq!(chat_timeout_from(Some("abc")), Duration::from_secs(120));
         assert_eq!(chat_timeout_from(Some("600")), Duration::from_secs(600));
         assert_eq!(chat_timeout_from(Some("5")), Duration::from_secs(30));
-        assert_eq!(chat_timeout_from(Some("99999")), Duration::from_secs(1800));
+        assert_eq!(chat_timeout_from(Some("99999")), Duration::from_mins(30));
     }
 
     #[test]

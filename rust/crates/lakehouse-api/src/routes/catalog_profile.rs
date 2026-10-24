@@ -462,7 +462,7 @@ mod tests {
             exact_top_values(Some(&arr)),
             vec![json!({ "value": "3", "count": 2 })]
         );
-        assert!(exact_top_values(None).is_empty());
+        assert_eq!(exact_top_values(None), [] as [serde_json::Value; 0]);
     }
 
     #[test]
