@@ -235,3 +235,5 @@ Checks (from `/home/hv/lakehouse-phase5-build`):
 
 
 ## 8. Review (planner appends)
+
+Planner, 2026-10-24: the console's shapes are accepted as the contract for the Rust tasks (the `/api/settings/limits` GET/PUT shape, the failed tile's `limit`, `X-Run-Id`, `POST /api/query/cancel`). The row-cut marker on a tile result is named **`limitHit`**, because `limit` is already a raw table's page size. T1 to T5 build to these shapes.
