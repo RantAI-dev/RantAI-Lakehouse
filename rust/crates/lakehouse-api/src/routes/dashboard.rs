@@ -674,6 +674,8 @@ async fn get_body(
         // else the install's), which the console states under the Refresh
         // button; `null` when the caller opened no cache scope.
         "cacheRule": cache_rule,
+        // The board's own rule, for the Freshness dialog; `null` follows the install.
+        "boardCacheRule": board_obj.and_then(|b| b.cache).map(lakehouse_bi::cache_rule::CacheRule::to_json),
         // BI-11: the controls the board shows (the definition and this read's
         // value), the value each has without a request (the saved default the
         // console compares with), and every parameter's value for this read.

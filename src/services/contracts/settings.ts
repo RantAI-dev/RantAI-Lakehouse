@@ -1,3 +1,5 @@
+import type { CacheRule } from "@/lib/result-cache"
+
 /**
  * `GET`/`PUT /api/settings/reporting` (`BI-9`): the report time zone and the
  * first day of the week, one pair for the whole deployment. Grouping a
@@ -47,6 +49,12 @@ export type ReportingSettings = {
    * not expired.
    */
   publicLinksEnabled: boolean
+  /**
+   * How long dashboards may show remembered results for the whole install
+   * (`BI-4` part B): `{mode: "default"}`, `{mode: "fresh"}` or
+   * `{mode: "minutes", minutes}`. Absent from an older server: the default.
+   */
+  resultCache?: CacheRule
 }
 
 /**
@@ -54,7 +62,7 @@ export type ReportingSettings = {
  * the value stored, so a caller that only changes the zone is unaffected.
  */
 export type ReportingSettingsInput = Pick<ReportingSettings, "timeZone" | "weekStart"> &
-  Partial<Pick<ReportingSettings, "numberLocale" | "companyPalette" | "fonts" | "contentSites" | "downloadDeniedRoles" | "reportAllowedDomains" | "publicLinksEnabled">>
+  Partial<Pick<ReportingSettings, "numberLocale" | "companyPalette" | "fonts" | "contentSites" | "downloadDeniedRoles" | "reportAllowedDomains" | "publicLinksEnabled" | "resultCache">>
 
 /**
  * `GET`/`PUT /api/settings/limits` (`BI-5`, plan D1, D2): the time and row

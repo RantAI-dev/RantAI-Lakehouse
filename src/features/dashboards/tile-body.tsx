@@ -34,6 +34,7 @@ import { ImageCard, WebCard } from "./content-cards";
 import { bulletOption, histogramOption } from "./type-b-option";
 import { resolvePalette } from "@/lib/chart-palettes";
 import { limitSentence } from "@/lib/query-limits";
+import { dataFromLabel } from "@/lib/result-cache";
 
 type Cell = Rows | TileFailure;
 function hasRows(c: Cell | undefined): c is Rows {
@@ -70,12 +71,16 @@ type TileBodyProps = {
  * remember to.
  */
 export function TileBody(props: TileBodyProps) {
+  const reporting = useReporting();
   const cut = hasRows(props.cell) && props.cell.limitHit?.kind === "rows" ? limitSentence(props.cell.limitHit) : null;
-  if (!cut) return <TileBodyOf {...props} />;
+  // BI-4 part B (feature decision 5): "Data from 10:42", and "remembered" when it came from memory.
+  const from = hasRows(props.cell) ? dataFromLabel(props.cell.computedAt, reporting.timeZone, props.cell.remembered) : null;
+  if (!cut && !from) return <TileBodyOf {...props} />;
   return (
     <div className="flex h-full min-h-0 flex-col">
       <div className="min-h-0 flex-1"><TileBodyOf {...props} /></div>
-      <p className="px-1 pt-1 text-[11px] text-muted-foreground">{cut}</p>
+      {cut ? <p className="px-1 pt-1 text-[11px] text-muted-foreground">{cut}</p> : null}
+      {from ? <p className="px-1 pt-1 text-[11px] text-muted-foreground" data-slot="data-from">{from}</p> : null}
     </div>
   );
 }
