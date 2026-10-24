@@ -57,12 +57,28 @@ async fn send(router: &axum::Router, request: Request<Body>) -> (StatusCode, Str
 #[tokio::test]
 async fn the_public_dashboard_link_never_carries_the_database_text() {
     let ch = failing_clickhouse().await;
-    let TestApp { router, .. } = app_over(&ch).await;
+    let TestApp { router, pool } = app_over(&ch).await;
+    // PR #235 CI: BI-19 made a public link a Postgres record, and an unknown
+    // token answers 404 before `ClickHouse` is asked anything, so the old
+    // "some-token" no longer reached the data path this test exists for
+    // (SEC-11). A live link without a password sends the request on to the
+    // board read, which fails over the stand-in.
+    let token = "p_sec11_live_link_token";
+    lakehouse_store::public_links::replace(
+        &pool,
+        "b_sec11",
+        token,
+        time::OffsetDateTime::now_utc() + time::Duration::days(1),
+        None,
+        None,
+    )
+    .await
+    .expect("store a live public link");
 
     let (status, body) = send(
         &router,
         Request::builder()
-            .uri("/api/public/dashboard/some-token")
+            .uri(format!("/api/public/dashboard/{token}"))
             .body(Body::empty())
             .expect("build request"),
     )
