@@ -32,10 +32,16 @@ import { AuthProvider } from "@/features/auth/auth-provider"
 import type { PipelineDetail, PipelineRun } from "@/services/contracts/pipelines"
 import { PipelineDetailPage } from "./pipeline-detail-page"
 
+const originalFetch = global.fetch
+
 afterEach(() => {
   // `mock.restore()` is deliberately NOT called: it would unregister the
-  // `next/navigation` module mock above between tests. Each test installs
-  // its own `fetch` stub, which is what carries the state under test.
+  // `next/navigation` module mock above between tests. The fetch stub IS
+  // put back, though: `spyOn(globalThis, "fetch")` stays installed
+  // otherwise, and `bun test` runs every file in one process, so the next
+  // file's own `spyOn` would see this file's calls (`PR #247 CI`:
+  // `column-lineage.test.tsx` counted 26 fetch calls it never made).
+  global.fetch = originalFetch
   cleanup()
 })
 
@@ -164,15 +170,22 @@ describe("the pipeline page's run state (BLD-8)", () => {
     renderPage()
 
     // A longer wait than the 1 s default: this machine runs several
-    // builds at once, and the log read is a second round trip.
+    // builds at once, and the log read is a second round trip. The
+    // callout renders while that read is still in flight ("Reading the
+    // log for the error…"), so the reason itself is awaited rather than
+    // read from the first paint.
     const callout = await screen.findByRole("note", undefined, { timeout: 8000 })
-    expect(callout.textContent).toContain(
-      "config rejected: this pipeline names a connector but its source zone is not bronze"
+    await waitFor(
+      () =>
+        expect(callout.textContent).toContain(
+          "config rejected: this pipeline names a connector but its source zone is not bronze"
+        ),
+      { timeout: 8000 }
     )
     // The wrapper's own text (the `Failure(description=…)` shape) is not
     // what the reader gets.
     expect(callout.textContent).not.toContain("Failure(description=")
-  })
+  }, 20_000)
 
   it("withholds upstream error text and points at the run log instead", async () => {
     stubApi({
@@ -185,12 +198,17 @@ describe("the pipeline page's run state (BLD-8)", () => {
     renderPage()
 
     // A longer wait than the 1 s default: this machine runs several
-    // builds at once, and the log read is a second round trip.
+    // builds at once, and the log read is a second round trip. The
+    // callout renders before the log answers, so the fixed sentence is
+    // awaited rather than read from the first paint.
     const callout = await screen.findByRole("note", undefined, { timeout: 8000 })
-    expect(callout.textContent).toContain("The run failed; see the run log.")
+    await waitFor(
+      () => expect(callout.textContent).toContain("The run failed; see the run log."),
+      { timeout: 8000 }
+    )
     // The log panel still shows the engine's words (that is what a log is);
     // the reason above it does not repeat them.
     expect(callout.textContent).not.toContain("Code: 60")
     expect(screen.getByRole("button", { name: /show errors in the log/i })).toBeTruthy()
-  })
+  }, 20_000)
 })

@@ -66,7 +66,7 @@ use axum::response::{IntoResponse, Response};
 use lakehouse_auth::{Principal, PrincipalId};
 use lakehouse_core::ApiError;
 use lakehouse_store::PgPool;
-use lakehouse_store::pipelines::{self, UpdatePipelineInput};
+use lakehouse_store::pipelines::{self, ConnectorChange, UpdatePipelineInput};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -1521,26 +1521,16 @@ pub struct UpdateBody {
     /// The pipeline's connector (`BLD-9` / decision 7). Three states, and
     /// all three are meaningful: absent keeps the stored connector (a
     /// save that does not mention it), JSON `null` clears it, and a
-    /// non-empty string sets or replaces it. `Some("")` is treated as
+    /// non-empty string sets or replaces it. An empty string is treated as
     /// `null` — a form that submits an empty picker means "no connector".
     ///
-    /// A plain `Option<String>` cannot tell "absent" from "null" (both
-    /// arrive as `None`), which is why this is a double option with
-    /// [`deserialize_connector_id`] behind it.
-    #[serde(default, deserialize_with = "deserialize_connector_id")]
-    connector_id: Option<Option<String>>,
-}
-
-/// Read a present `connectorId` as `Some(value)` — `null` included, as
-/// `Some(None)` — so [`UpdateBody::connector_id`] can distinguish "the
-/// body did not mention it" (`None`, `#[serde(default)]`) from "clear it"
-/// (`Some(None)`). Serde's own `Option<Option<T>>` cannot: both shapes
-/// deserialize to `None` without a helper.
-fn deserialize_connector_id<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    Option::<String>::deserialize(deserializer).map(Some)
+    /// The field is [`ConnectorChange`], not an `Option<Option<String>>`:
+    /// serde cannot tell "absent" from "null" with the latter without a
+    /// custom helper, and `clippy::option_option` refuses that shape
+    /// (`PR #247 CI`). `#[serde(default)]` is what makes "absent" mean
+    /// [`ConnectorChange::Keep`].
+    #[serde(default)]
+    connector_id: ConnectorChange,
 }
 
 fn authored_only(id: &str) -> Result<(), ApiRejection> {
@@ -1612,19 +1602,15 @@ pub async fn update(
     // already refused a row the caller cannot touch, and a Platform Admin
     // editing another tenant's pipeline must still be held to that row's
     // tenant, or an edit could attach a connector across tenants.
-    let connector_change = body.connector_id.map(|submitted| {
-        submitted
-            .map(|id| id.trim().to_owned())
-            .filter(|id| !id.is_empty())
-    });
+    let connector_change = body.connector_id;
     //
     // PR review (BLD-7, SHOULD-FIX 1): an absent `connectorId` keeps the
     // stored one, and the source may still change in the same body, so the
     // rule is checked against the connector the row will END with, not
     // only a newly submitted one. Otherwise an edit could point a
     // connector's pipeline at a table that connector never loads.
-    match connector_change.as_ref() {
-        Some(Some(connector_id)) => {
+    match &connector_change {
+        ConnectorChange::Set(connector_id) => {
             let current = pipelines::get_pipeline(pool, &id)
                 .await?
                 .ok_or_else(|| ApiError::NotFound(format!("Pipeline {id} not found")))?;
@@ -1637,8 +1623,8 @@ pub async fn update(
             validate_connector_source(pool, connector_id, &body.source_zone, &body.source_table)
                 .await?;
         }
-        Some(None) => {}
-        None => {
+        ConnectorChange::Clear => {}
+        ConnectorChange::Keep => {
             let current = pipelines::get_pipeline(pool, &id)
                 .await?
                 .ok_or_else(|| ApiError::NotFound(format!("Pipeline {id} not found")))?;
@@ -1869,7 +1855,7 @@ pub async fn restore_version(
     // restore always carries the snapshot's chain.
     validate_per_table_upstream(&snapshot.source_zone, Some(&snapshot.depends_on))?;
     // PR review (BLD-7, SHOULD-FIX 1): a restore keeps the row's current
-    // connector (`connector_id: None` below) but replays the snapshot's
+    // connector (`ConnectorChange::Keep` below) but replays the snapshot's
     // source, which may predate the connector. Hold it to the same rule.
     if let Some(current) = pipelines::get_pipeline(pool, &id).await?
         && let Some(kept) = current.connector_id.as_deref()
@@ -1922,7 +1908,7 @@ pub async fn restore_version(
         // connector the pipeline has now alone -- same posture as
         // `name`/`status` above. Clearing it here would silently break
         // a pipeline the restore never touched.
-        connector_id: None,
+        connector_id: ConnectorChange::Keep,
     };
     let updated = pipelines::restore_pipeline(pool, &id, &input, Some(principal.id.uuid()))
         .await?
@@ -4054,7 +4040,7 @@ mod tests {
                 description: None,
                 max_retries: None,
                 depends_on: Some(vec![crate::routes::uploads::FILE_INGEST_JOB.to_owned()]),
-                connector_id: None,
+                connector_id: ConnectorChange::Keep,
             };
             pipelines::update_pipeline(&pool, &created.id, &pre_refusal, None)
                 .await
@@ -4110,7 +4096,7 @@ mod tests {
                 description: None,
                 max_retries: None,
                 depends_on: Some(vec![crate::routes::connectors::INGEST_JOB.to_owned()]),
-                connector_id: None,
+                connector_id: ConnectorChange::Keep,
             };
             pipelines::update_pipeline(&pool, &created.id, &pre_refusal, None)
                 .await

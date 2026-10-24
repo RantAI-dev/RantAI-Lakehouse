@@ -1113,14 +1113,50 @@ pub struct UpdatePipelineInput {
     /// `#[serde(default)]`.
     pub depends_on: Option<Vec<String>>,
     /// The pipeline's ingress connector (`BLD-9` / decision 7).
-    /// Three states, because they mean three different writes:
-    /// `None` leaves the stored connector alone (a body that does not
-    /// mention it), `Some(None)` clears it, and `Some(Some(id))` sets
-    /// or replaces it. The route has already checked the target
-    /// connector is in the pipeline's tenant and that the source is one
-    /// of its Bronze tables (`validate_connector_source`), so this
-    /// function never stores a connector the run would refuse.
-    pub connector_id: Option<Option<String>>,
+    ///
+    /// Three states, because they mean three different writes. An
+    /// `Option<Option<String>>` says the same thing, but it is exactly the
+    /// shape `clippy::option_option` refuses (`PR #247 CI`): a reader has to
+    /// remember which `None` is "leave it alone" and which is "clear it".
+    /// The route has already checked a `Set` connector is in the pipeline's
+    /// tenant and that the source is one of its Bronze tables
+    /// (`validate_connector_source`), so this function never stores a
+    /// connector the run would refuse.
+    pub connector_id: ConnectorChange,
+}
+
+/// What a `PUT /api/pipelines/{id}` asked to do with a pipeline's connector
+/// (`BLD-9` / decision 7).
+///
+/// It is also the wire shape of `connectorId` on that route: `#[serde(default)]`
+/// on the field makes an absent key [`Self::Keep`], JSON `null` deserializes
+/// to [`Self::Clear`], and a string to [`Self::Set`] (trimmed; an empty
+/// string means "no connector"). One enum for the meaning and the wire,
+/// instead of an `Option<Option<String>>` the compiler's own lints refuse
+/// (`PR #247 CI`, `clippy::option_option`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ConnectorChange {
+    /// The body did not mention `connectorId`: keep the stored connector.
+    #[default]
+    Keep,
+    /// The body sent `null` (or an empty string): store none.
+    Clear,
+    /// The body named a connector: set or replace it.
+    Set(String),
+}
+
+impl<'de> serde::Deserialize<'de> for ConnectorChange {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let submitted = Option::<String>::deserialize(deserializer)?;
+        Ok(match submitted {
+            None => Self::Clear,
+            Some(id) if id.trim().is_empty() => Self::Clear,
+            Some(id) => Self::Set(id.trim().to_owned()),
+        })
+    }
 }
 
 /// Replace an authored pipeline's definition. Its status is left as it
@@ -1209,9 +1245,13 @@ owner = COALESCE($10, owner), max_retries = COALESCE($11, max_retries), \
     // alone" are different requests and both would bind `NULL`. The
     // boolean says whether this write touches the column at all; the
     // text is the value (typed `NULL` when clearing, so the column's
-    // foreign key holds).
-    let connector_set = input.connector_id.is_some();
-    let connector_value = input.connector_id.clone().flatten();
+    // foreign key holds). `ConnectorChange` carries the three states, so
+    // this match is the only place they turn into SQL.
+    let (connector_set, connector_value) = match &input.connector_id {
+        ConnectorChange::Keep => (false, None),
+        ConnectorChange::Clear => (true, None),
+        ConnectorChange::Set(connector_id) => (true, Some(connector_id.clone())),
+    };
     let mut tx = pool.begin().await?;
     let row: Option<FullPipelineRow> = sqlx::query_as(&sql)
         .bind(id)
