@@ -279,6 +279,11 @@ pub(super) async fn add_dashboard_nodes(
     shared: bool,
     g: &mut Graph,
 ) {
+    // BI-14 review BLOCKER B1: chart, SQL source and metric names are
+    // dashboard objects; without `dashboard:read` the graph stays tables only.
+    if !principal.has("dashboard:read") {
+        return;
+    }
     let viewer = viewer_of(principal);
     let dash = match load(&state.clickhouse, &viewer).await {
         Ok(dash) => dash,
@@ -564,6 +569,11 @@ pub(crate) async fn read(
     headers: &HeaderMap,
     chart_id: &str,
 ) -> Result<Value, ApiError> {
+    // BI-14 review BLOCKER B1: without `dashboard:read` no chart is named, so
+    // the answer is the one an unknown id gets.
+    if !principal.has("dashboard:read") {
+        return Err(ApiError::NotFound(NOT_FOUND.to_owned()));
+    }
     let ch = &state.clickhouse;
     let dash = load(ch, &viewer_of(principal))
         .await

@@ -15,7 +15,10 @@
 //!
 //! # Who is listed
 //!
-//! Charts come through the caller's [`Viewer`], so a chart in somebody else's
+//! Only a caller with `dashboard:read` is told any chart's name (`BI-14` review
+//! BLOCKER B1): the route needs `lineage:read`, which does not carry the right
+//! to see dashboards, so without `dashboard:read` every match is counted in
+//! `hiddenCount` and none is named. Charts come through the caller's [`Viewer`], so a chart in somebody else's
 //! personal space is not named. It is counted: `hiddenCount` is the number of
 //! charts that match for the system viewer and not for the caller, with no
 //! name, so the answer says "and N more you do not have access to" without
@@ -154,7 +157,14 @@ pub(crate) async fn read(
             })
             .collect()
     };
-    let mine = matching(&visible);
+    // BI-14 review BLOCKER B1: a chart is named only to a caller with
+    // `dashboard:read`, as the SQL-source mappings are; a `lineage:read`-only
+    // caller gets the count and no names.
+    let mine = if principal.has("dashboard:read") {
+        matching(&visible)
+    } else {
+        Vec::new()
+    };
     let hidden = matching(&everyone).len().saturating_sub(mine.len());
     let titles: HashMap<&str, &str> = boards
         .iter()

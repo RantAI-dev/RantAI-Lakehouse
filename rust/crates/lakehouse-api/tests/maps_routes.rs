@@ -175,6 +175,22 @@ async fn an_administrator_uploads_lists_reads_renames_and_the_file_is_tagged() {
     .await;
     assert_eq!(renamed.status, StatusCode::OK);
     assert_eq!(renamed.json()["name"], json!("Regions"));
+    // BI-16 review SHOULD-FIX S1: the upload and the rename are audited with the map's id and name, never the file.
+    let events: Vec<(String, Option<String>, Value)> = sqlx::query_as(
+        "SELECT action, resource_id, args FROM audit_event WHERE resource_kind = 'map' ORDER BY at, id",
+    )
+    .fetch_all(&app.pool)
+    .await
+    .unwrap();
+    let actions: Vec<&str> = events.iter().map(|e| e.0.as_str()).collect();
+    assert_eq!(actions, ["map_upload", "map_rename"], "{events:?}");
+    assert_eq!(events[0].1.as_deref(), Some(id.as_str()));
+    assert_eq!(events[1].2, json!({ "name": "Regions" }));
+    assert!(
+        !events
+            .iter()
+            .any(|e| e.2.to_string().contains("FeatureCollection"))
+    );
     let twin = upload(&app, &cookie, "REGIONS").await;
     assert_eq!(twin.status, StatusCode::CONFLICT);
     assert_eq!(

@@ -385,6 +385,10 @@ Commits: T5 `a109bf98`, T6 `fb096312`, T7 (next commit, `list_maps`). Rust plus 
 
 **T7.** `list_maps` (Read, `dashboard:read`): the four fixed built-in maps by id and label, the rule for the per-country ids (`adm1-<iso3 lower>`), and the uploaded maps from Postgres. The tool count is 107 (pin updated), the fixture has the tool appended, the tool is in the dashboard domain of the prompt (`list_maps` beside `list_charts`; no new keyword, so it is offered when the conversation already is about charts) and in `capabilities.ts`. Not done: a tool test that lists an uploaded map (needs Postgres in the lib test state), the `AI-15` case.
 
+### Review fix S1 (developer)
+
+SHOULD-FIX S1 fixed: upload, rename and delete of a map each record an audit event (`map_upload`, `map_rename`, `map_delete`; resource kind `map`, the map id, args `{ "name": ... }`, never the file), best effort like the upload events (a failed audit write never fails the write). Extended `maps_routes.rs` (reads `audit_event` after an upload and a rename). Clippy clean; test not run locally (CI).
+
 ## 8. Review (planner appends, one entry per part)
 
 Planner, 2026-10-24: the console's Gantt assumptions are the contract for T1 (result columns `task`, `group`, `start`, `end`, `progress`; optional `reversedRows`; dates as report-zone strings). Feature decision 2's "today line can be switched off" becomes a style field `todayLine: false` (planner default). The console adds the switch, and T1 validates the field.

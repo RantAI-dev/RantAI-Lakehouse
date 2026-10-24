@@ -204,6 +204,10 @@ One commit for the three tasks (they share `routes/lineage/charts.rs` and the mo
 
 Both routes are in `POLICY_TABLE`, so the table-driven `route_auth` and `route_policy` tests cover them both ways. Q6 is applied as signed: a dashboard viewer without `lineage:read` gets a 403. Open points for the planner: (1) the lineage page now lists dashboard objects that a `lineage:read` holder without `dashboard:read` can also see by name (the charts the `Viewer` allows, as the plan says); say if that should require `dashboard:read` as the SQL-source mappings do; (2) the Bronze refresh time as above. `AI-13` (T4) is not built.
 
+### Review fix B1 (developer)
+
+BLOCKER B1 fixed: `used-by` names a chart only to a caller with `dashboard:read`; a `lineage:read`-only caller gets `charts: []` and every match in `hiddenCount`. The same rule applies to the other two places that name charts: the chart nodes on the lineage page (`add_dashboard_nodes` adds none without `dashboard:read`) and the chart route (404 "No such chart.", as for an unknown id). Route test `a_caller_with_lineage_read_only_is_told_no_chart_names` (used-by, chart route, lineage page, and the named case with both permissions). Clippy clean; the test was not run locally (CI). The Bronze and upload refresh gap stays `notRecorded`, as decided.
+
 ## 8. Review (planner appends)
 
 ### Review of T1–T3 (server, `6498398e`), planner, 2026-10-24

@@ -45,6 +45,7 @@ use lakehouse_bi::store;
 use lakehouse_core::ApiError;
 use lakehouse_store::PgPool;
 use lakehouse_store::StoreError;
+use lakehouse_store::audit::{self as store_audit, NewAuditEvent};
 use lakehouse_store::geo_map::{self, GeoMap, NewGeoMap};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -108,6 +109,29 @@ fn pool(state: &AppState) -> Result<&PgPool, ApiError> {
                 .to_owned(),
         )
     })
+}
+
+/// `BI-16` review SHOULD-FIX S1: one audit event per map write, with the map's
+/// id and name and never the file. Best effort, like the upload events: a
+/// failed audit write never fails, or undoes, the write it records.
+async fn audit(pool: &PgPool, principal: &Principal, action: &str, id: &str, name: &str) {
+    let event = NewAuditEvent {
+        principal_id: Some(principal.id.uuid().to_string()),
+        principal_kind: Some(principal.kind_for_audit().to_owned()),
+        actor_label: Some(principal.display_name.clone()),
+        action: action.to_owned(),
+        resource_kind: Some("map".to_owned()),
+        resource_id: Some(id.to_owned()),
+        args: Some(json!({ "name": name })),
+        outcome: "executed".to_owned(),
+        detail: None,
+        run_id: None,
+        approval_id: None,
+        session_id: None,
+    };
+    if let Err(err) = store_audit::insert(pool, event).await {
+        tracing::warn!(%err, action, "failed to record a map audit event");
+    }
 }
 
 fn store_failed(err: &dyn std::fmt::Display) -> ApiError {
@@ -261,6 +285,7 @@ pub async fn create(
         StoreError::Conflict => ApiError::Conflict(NAME_TAKEN.to_owned()),
         other => store_failed(&other),
     })?;
+    audit(pool, &principal, "map_upload", &created.id, &created.name).await;
     Ok((
         StatusCode::CREATED,
         ApiJson(MapViewOut(MapView::from_row(created))),
@@ -336,6 +361,7 @@ struct RenameBody {
 /// taken; 503 without a Postgres pool.
 pub async fn rename(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Path(id): Path<String>,
     body: axum::body::Bytes,
 ) -> ApiResult<ApiJson<MapViewOut>> {
@@ -345,13 +371,15 @@ pub async fn rename(
     let body: RenameBody =
         serde_json::from_slice(&body).map_err(|_| ApiError::BadRequest(BAD_BODY.to_owned()))?;
     let name = clean_name(&body.name)?;
-    let renamed = geo_map::rename(pool(&state)?, &id, &name)
+    let pool = pool(&state)?;
+    let renamed = geo_map::rename(pool, &id, &name)
         .await
         .map_err(|err| match err {
             StoreError::Conflict => ApiError::Conflict(NAME_TAKEN.to_owned()),
             other => store_failed(&other),
         })?
         .ok_or_else(|| ApiError::NotFound(NOT_FOUND.to_owned()))?;
+    audit(pool, &principal, "map_rename", &renamed.id, &renamed.name).await;
     Ok(ApiJson(MapViewOut(MapView::from_row(renamed))))
 }
 
@@ -371,13 +399,12 @@ pub async fn delete(
         return Err(ApiError::NotFound(NOT_FOUND.to_owned()).into());
     }
     let pool = pool(&state)?;
-    if geo_map::get(pool, &id)
+    let Some(existing) = geo_map::get(pool, &id)
         .await
         .map_err(|err| store_failed(&err))?
-        .is_none()
-    {
+    else {
         return Err(ApiError::NotFound(NOT_FOUND.to_owned()).into());
-    }
+    };
     let ch = &state.clickhouse;
     let uses = |charts: &[store::StoredChartSpec]| -> Vec<(String, String, String)> {
         charts
@@ -428,5 +455,6 @@ pub async fn delete(
     geo_map::delete(pool, &id)
         .await
         .map_err(|err| store_failed(&err))?;
+    audit(pool, &principal, "map_delete", &id, &existing.name).await;
     Ok((StatusCode::OK, ApiJson(json!({ "ok": true }))))
 }

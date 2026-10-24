@@ -246,3 +246,45 @@ async fn used_by_lists_the_charts_that_read_a_table_and_a_bad_table_is_a_400() {
         assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {body}");
     }
 }
+
+/// `BI-14` review BLOCKER B1: `lineage:read` alone does not name a chart.
+#[tokio::test]
+async fn a_caller_with_lineage_read_only_is_told_no_chart_names() {
+    let stack = Stack::start().await;
+    rows(
+        &stack.ch,
+        "FROM console.bi_chart",
+        vec![chart_row("c_1", "Visitors", "b_1", "ui")],
+    )
+    .await;
+    let cookie = stack.caller("lineage:read").await;
+    let (status, body) = stack
+        .get(
+            &cookie,
+            "/api/governance/lineage/used-by?table=serving.mart_visits",
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["charts"], json!([]));
+    assert_eq!(body["hiddenCount"], json!(1));
+    assert!(!body.to_string().contains("Visitors"), "{body}");
+    let (status, body) = stack
+        .get(&cookie, "/api/dashboard/charts/c_1/lineage")
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    // The lineage page names no chart either.
+    let (status, graph) = stack
+        .get(&cookie, "/api/governance/lineage?focus=serving.mart_visits")
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!graph.to_string().contains("Visitors"), "{graph}");
+    // With `dashboard:read` as well, the chart is named.
+    let both = stack.caller("lineage:read,dashboard:read").await;
+    let (_, named) = stack
+        .get(
+            &both,
+            "/api/governance/lineage/used-by?table=serving.mart_visits",
+        )
+        .await;
+    assert_eq!(named["charts"][0]["chartTitle"], json!("Visitors"));
+}
