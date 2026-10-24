@@ -531,7 +531,9 @@ async fn deliver_failure_alerts(
     // The run's own streak (kept on its dedupe row), not the
     // connector's current one: a retry of the third run's report
     // still fires "3 in a row", once, and a later run's streak
-    // never fires it for this one.
+    // never fires it for this one. A late report keeps `NULL` there
+    // (`SRC-32` review round 1, BLOCKER 1): it produced none of the
+    // streak the connector stands at, so it must not claim it.
     if recorded.failure_streak == Some(REPEATED_FAILURE_STREAK) {
         let text = format!(
             "{who} has failed {REPEATED_FAILURE_STREAK} runs in a row; the latest is run {run_id}. View: {link}"
@@ -799,16 +801,43 @@ mod tests {
         /// The orchestrator knows `run_id`: it ran `connector` and ended in
         /// `status`.
         async fn knows_run(&self, run_id: &str, connector: Option<&str>, status: &str) {
+            self.knows_run_at(run_id, connector, status, 2000.0).await;
+        }
+
+        /// As [`Self::knows_run`], with the run's end time given: `SRC-32`'s
+        /// out-of-order tests need two runs whose end times differ. Every
+        /// other test uses the end time above, which makes its runs
+        /// simultaneous and so never late.
+        async fn knows_run_at(
+            &self,
+            run_id: &str,
+            connector: Option<&str>,
+            status: &str,
+            end_time: f64,
+        ) {
             let config = connector.map_or_else(
                 || json!({}),
                 |c| json!({ "ops": { "run_ingest": { "config": { "connector_id": c } } } }),
             );
-            self.knows_run_config(run_id, config, status).await;
+            self.knows_run_ending_at(run_id, config, status, end_time)
+                .await;
         }
 
         /// As [`Self::knows_run`], with the whole run config given (a run of
         /// one table carries `object` and `action` beside the connector id).
         async fn knows_run_config(&self, run_id: &str, config: Value, status: &str) {
+            self.knows_run_ending_at(run_id, config, status, 2000.0)
+                .await;
+        }
+
+        /// As [`Self::knows_run_config`], with the run's end time as well.
+        async fn knows_run_ending_at(
+            &self,
+            run_id: &str,
+            config: Value,
+            status: &str,
+            end_time: f64,
+        ) {
             Mock::given(method("POST"))
                 .and(body_string_contains("runOrError"))
                 .and(body_string_contains(run_id))
@@ -823,7 +852,7 @@ mod tests {
                 .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                     "data": { "pipelineRunOrError": {
                         "__typename": "Run", "status": status,
-                        "startTime": 1000.0, "endTime": 2000.0, "stepStats": []
+                        "startTime": 1000.0, "endTime": end_time, "stepStats": []
                     } }
                 })))
                 .mount(&self.dagster)
@@ -1127,6 +1156,71 @@ mod tests {
         assert_eq!(repeated.len(), 1);
         assert!(repeated[0].contains("run-3"), "{}", repeated[0]);
         assert_eq!(streak(&pool).await, ("unhealthy".to_owned(), 4));
+    }
+
+    /// `SRC-32` review round 1, BLOCKER 1: a failure that ended before a
+    /// counted success is late, and it produced none of the streak the
+    /// connector stands at, so it raises no `connector_repeated_failure`
+    /// ("3 runs in a row; the latest is run 1" would name a run that ended
+    /// before those three) and writes no second instance. The plain failure
+    /// alert still fires, which is true: the run did fail.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_late_failure_at_streak_three_raises_no_repeated_failure_alert(pool: sqlx::PgPool) {
+        let h = harness(
+            &pool,
+            &[
+                ("al-f", "connector_failure", CONNECTOR),
+                ("al-r", "connector_repeated_failure", CONNECTOR),
+            ],
+        )
+        .await;
+        // The success ends at the same time as the failures, so none of them
+        // is late and the connector reaches streak 3.
+        h.knows_run("run-2", Some(CONNECTOR), "SUCCESS").await;
+        run_finished_event(
+            State(h.state.clone()),
+            Extension(service()),
+            body("run-2", "ingest_job"),
+        )
+        .await
+        .expect("accepted");
+        for run in ["run-3", "run-4", "run-5"] {
+            h.knows_run(run, Some(CONNECTOR), "FAILURE").await;
+            h.failed(run).await;
+        }
+        assert_eq!(streak(&pool).await, ("unhealthy".to_owned(), 3));
+        assert_eq!(
+            h.posts_to("al-r").await.len(),
+            1,
+            "the third failure in a row raises it"
+        );
+        assert_eq!(h.posts_to("al-f").await.len(), 3);
+
+        // Run 1's failure ended at 500.0, before the success at 2000.0.
+        h.knows_run_at("run-1", Some(CONNECTOR), "FAILURE", 500.0)
+            .await;
+        let late = h.failed("run-1").await;
+        assert_eq!(
+            late["matched"], 1,
+            "the plain failure rule and nothing else"
+        );
+        assert_eq!(h.posts_to("al-f").await.len(), 4);
+        assert_eq!(
+            h.posts_to("al-r").await.len(),
+            1,
+            "the late failure raises no repeated-failure alert"
+        );
+        let (instances,): (i64,) =
+            sqlx::query_as("SELECT count(*) FROM alert_instance WHERE rule_id = 'al-r'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(instances, 1, "and it writes no second instance");
+        assert_eq!(
+            streak(&pool).await,
+            ("unhealthy".to_owned(), 3),
+            "the late failure leaves the connector's state alone"
+        );
     }
 
     /// A success clears the streak, and delivers `connector_success` only

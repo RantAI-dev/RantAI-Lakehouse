@@ -1725,8 +1725,12 @@ pub struct RunRecord {
     /// that was already counted (nothing was changed).
     pub first_seen: bool,
     /// The connector's failure streak right after THIS run was counted: the
-    /// value of the first report, also returned to its retries. `None` only
-    /// for a run counted before `0069` kept it.
+    /// value of the first report, also returned to its retries. `None` when
+    /// the run counted no failure of its own: a run counted before `0069`
+    /// kept the streak, and a late report (`SRC-32` review round 1,
+    /// BLOCKER 1), whose run ended before the state the connector's streak
+    /// describes, so it must not raise "3 in a row" for failures it did not
+    /// produce. A late success is `None` for the same reason.
     pub failure_streak: Option<i32>,
     /// `true` when THIS run's failure paused the connector (`SRC-11` D3): the
     /// streak reached the auto-disable threshold and nothing had paused the
@@ -1755,9 +1759,12 @@ pub struct RunRecord {
 /// neither the streak nor the health ([`RECORD_RUN_SQL`] says how "late" is
 /// decided): the connector's state describes its latest run, so a success
 /// reported after a later failure must not clear the count that failure
-/// started. The run's dedupe row still gets the streak the connector holds at
-/// that moment, its own run time moves forward, and the retry of that report
-/// answers the same way.
+/// started. A late report produced none of the count it would have read, so
+/// its dedupe row keeps `failure_streak = NULL` and its answer (and its
+/// retry's) is `None` (`SRC-32` review round 1, BLOCKER 1): reading the
+/// connector's streak into the row would make the API raise "3 in a row" for
+/// a run that ended before those failures. The run's own run time still moves
+/// forward, and the retry of that report answers the same way.
 ///
 /// # Auto-disable (`SRC-11` decision D3)
 ///
@@ -1832,12 +1839,19 @@ pub async fn record_run_once(
         // Dropping `tx` rolls the dedupe row back with it.
         return Err(StoreError::NotFound);
     };
+    // `SRC-32` review round 1, BLOCKER 1: a late report counted no failure,
+    // so its dedupe row keeps `NULL` instead of the connector's streak. The
+    // retry path above reads this column, and `routes::load_alerts` raises
+    // `connector_repeated_failure` off it: a run that ended before the
+    // failures that make up the streak must not raise "3 in a row" for them,
+    // on the first report or on a retry.
+    let counted_streak = counted.then_some(failure_streak);
     sqlx::query(
         "UPDATE pipeline_run_event SET failure_streak = $3 WHERE run_id = $1 AND kind = $2",
     )
     .bind(run_id)
     .bind(kind)
-    .bind(failure_streak)
+    .bind(counted_streak)
     .execute(&mut *tx)
     .await?;
     // `SRC-11` D3: the pause and its dedupe row are part of counting the run.
@@ -1871,7 +1885,7 @@ pub async fn record_run_once(
     tx.commit().await?;
     Ok(RunRecord {
         first_seen: true,
-        failure_streak: Some(failure_streak),
+        failure_streak: counted_streak,
         auto_disabled,
     })
 }

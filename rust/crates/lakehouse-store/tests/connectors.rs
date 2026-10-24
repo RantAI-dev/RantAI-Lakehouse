@@ -2169,9 +2169,8 @@ async fn a_success_reported_after_a_later_failure_keeps_the_streak_and_the_healt
         .unwrap();
     assert!(late.first_seen);
     assert_eq!(
-        late.failure_streak,
-        Some(1),
-        "a late success reads the streak the later failure set"
+        late.failure_streak, None,
+        "a late success produced no count of its own (`SRC-32` review round 1, BLOCKER 1)"
     );
     assert!(!late.auto_disabled);
 
@@ -2240,9 +2239,8 @@ async fn a_failure_reported_after_a_later_success_counts_nothing_and_pauses_noth
         .await
         .unwrap();
     assert_eq!(
-        late.failure_streak,
-        Some(0),
-        "the later success still decides the count"
+        late.failure_streak, None,
+        "the later success still decides the count, and a late failure counted none of it"
     );
     assert!(!late.auto_disabled, "a late failure never pauses");
 
@@ -2254,7 +2252,79 @@ async fn a_failure_reported_after_a_later_success_counts_nothing_and_pauses_noth
     Ok(())
 }
 
-/// `SRC-32`: a run time only moves forward. A success reported after a newer
+/// `SRC-32` review round 1, BLOCKER 1: a late report produced none of the
+/// count it would have read, so its dedupe row stores no streak and the first
+/// report and its retry both answer `None`. The API raises "3 in a row" off
+/// that per-run value, and a run that ended before those failures must not
+/// raise it for them.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_late_failure_stores_no_streak_on_its_row_and_its_retry_reads_none(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let id = "conn-pg-lakehouse";
+    let (t1, t2) = (ended_at(0), ended_at(60));
+    record_run_once(&pool, "run-2", id, "success", true, t2, 3)
+        .await
+        .unwrap();
+    for (run, at) in [
+        ("run-3", ended_at(120)),
+        ("run-4", ended_at(180)),
+        ("run-5", ended_at(240)),
+    ] {
+        let r = record_run_once(&pool, run, id, "failure", false, at, 3)
+            .await
+            .unwrap();
+        assert!(r.first_seen, "{run}");
+    }
+    assert_eq!(
+        streak_and_health(&pool, id).await,
+        (3, "unhealthy".to_owned())
+    );
+
+    // Run 1's failure ended before the success at `t2`, so it is late even
+    // though the connector's streak stands at 3.
+    let late = record_run_once(&pool, "run-1", id, "failure", false, t1, 3)
+        .await
+        .unwrap();
+    assert!(late.first_seen);
+    assert_eq!(
+        late.failure_streak, None,
+        "a late failure produced no count of its own"
+    );
+    assert!(!late.auto_disabled);
+    assert_eq!(
+        streak_and_health(&pool, id).await,
+        (3, "unhealthy".to_owned()),
+        "the later failures still decide the connector's state"
+    );
+
+    let stored: Option<i32> = sqlx::query_scalar(
+        "SELECT failure_streak FROM pipeline_run_event WHERE run_id = $1 AND kind = 'failure'",
+    )
+    .bind("run-1")
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(stored, None, "the dedupe row keeps no streak");
+
+    let retry = record_run_once(&pool, "run-1", id, "failure", false, t1, 3)
+        .await
+        .unwrap();
+    assert!(!retry.first_seen);
+    assert_eq!(
+        retry.failure_streak, None,
+        "its retry reads the same empty streak back"
+    );
+    Ok(())
+}
+
+/// The connector's `failure_streak` and `health`, as the store left them.
+async fn streak_and_health(pool: &PgPool, id: &str) -> (i32, String) {
+    sqlx::query_as("SELECT failure_streak, health FROM connector WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("the connector row")
+}
 /// success leaves the recorded time at the newer one, and two failures
 /// reported out of order both count (their order between themselves does not
 /// matter).
