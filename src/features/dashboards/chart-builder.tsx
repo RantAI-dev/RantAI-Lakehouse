@@ -507,7 +507,10 @@ export function ChartBuilder({
   );
   const metricRow = measureRows.find((r) => isMetricColumn(r.column));
   const pickedMetric = metricRow ? (fields?.metrics ?? []).find((m) => m.name === metricNameOf(metricRow.column)) : undefined;
-  // Fix the number of measure rows to what the kind takes.
+  // Fix the number of measure rows to what the kind takes. BI-17 B QA fix F2: it also runs when the
+  // rows themselves change length, because picking the data source (and resetting the form) puts
+  // back one blank row, which left a scatter with an X metric and no Y metric.
+  const measureRowCount = measureRows.length;
   React.useEffect(() => {
     setMeasureRows((rows) => {
       if (rows.length === Math.min(Math.max(rows.length, limits.min), limits.max || 1) && rows.length >= limits.min) return rows;
@@ -515,7 +518,7 @@ export function ChartBuilder({
       while (next.length < limits.min) next.push({ column: "", aggregate: "" });
       return next;
     });
-  }, [limits.min, limits.max]);
+  }, [limits.min, limits.max, measureRowCount]);
   const sourceColumns = React.useMemo<SourceColumns>(() => ({
     all: [...(fields?.dimensions ?? []), ...(fields?.measures ?? [])],
     dates: Object.entries(fields?.kinds ?? {}).filter(([, k]) => k === "date" || k === "datetime").map(([name]) => name),
