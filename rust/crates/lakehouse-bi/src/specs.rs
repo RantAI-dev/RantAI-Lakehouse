@@ -570,8 +570,8 @@ mod tests {
     #[test]
     fn parse_builtin_dashboard_spec_defaults_both_arrays_when_absent() {
         let spec = parse_builtin_dashboard_spec("{}").unwrap();
-        assert!(spec.kpis.is_empty());
-        assert!(spec.charts.is_empty());
+        assert!(spec.kpis.is_empty(), "{:?}", spec.kpis);
+        assert!(spec.charts.is_empty(), "{:?}", spec.charts);
     }
 
     #[test]
