@@ -42,7 +42,9 @@ const NOTICES: Record<string, string> = {
 export function SsoNotice() {
   const params = useSearchParams();
   const code = params.get(SSO_NOTICE_PARAM);
-  const text = code ? NOTICES[code] : undefined;
+  // Own keys only: a hand-typed `?ssoNotice=toString` must not reach
+  // `Object.prototype` (PR review, `SEC-39`).
+  const text = code && Object.hasOwn(NOTICES, code) ? NOTICES[code] : undefined;
   if (!text) return null;
 
   return (

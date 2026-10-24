@@ -821,9 +821,14 @@ const OIDC_NOTICE_PARAM: &str = "ssoNotice";
 /// already carried. `next` has already passed `is_safe_relative_path`
 /// (inside [`oidc_start`], before it was written to the flow cookie), so
 /// this only adds a fixed parameter name and an allowlisted code.
+///
+/// `is_safe_relative_path` allows a `#fragment`, so the parameter goes
+/// before it: after the `#` it would be part of the fragment, which the
+/// console's `useSearchParams` never reads (PR review, `SEC-39`).
 fn path_with_notice(next: &str, code: &str) -> String {
-    let separator = if next.contains('?') { '&' } else { '?' };
-    format!("{next}{separator}{OIDC_NOTICE_PARAM}={code}")
+    let (path, fragment) = next.find('#').map_or((next, ""), |at| next.split_at(at));
+    let separator = if path.contains('?') { '&' } else { '?' };
+    format!("{path}{separator}{OIDC_NOTICE_PARAM}={code}{fragment}")
 }
 
 /// The one field this handler reads from the token endpoint's response.
@@ -1336,6 +1341,28 @@ mod tests {
             .unwrap();
         let decoded = decode_flow_cookie(set_cookie);
         assert_eq!(decoded.next, "/dashboards/main");
+    }
+
+    #[test]
+    fn path_with_notice_keeps_the_query_and_puts_the_notice_before_a_fragment() {
+        // PR review (`SEC-39`): `next` may carry a query and a fragment;
+        // the notice joins the query and never lands inside the fragment.
+        assert_eq!(
+            path_with_notice("/", "group_overage"),
+            "/?ssoNotice=group_overage"
+        );
+        assert_eq!(
+            path_with_notice("/dashboards?tab=1", "group_overage"),
+            "/dashboards?tab=1&ssoNotice=group_overage"
+        );
+        assert_eq!(
+            path_with_notice("/dashboards#chart-2", "group_overage"),
+            "/dashboards?ssoNotice=group_overage#chart-2"
+        );
+        assert_eq!(
+            path_with_notice("/d?tab=1#x?y", "group_overage"),
+            "/d?tab=1&ssoNotice=group_overage#x?y"
+        );
     }
 
     #[test]

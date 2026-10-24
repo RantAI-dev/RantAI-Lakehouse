@@ -21,7 +21,9 @@ afterEach(() => {
 
 describe("SsoNotice (SEC-39)", () => {
   it("shows the fixed group-overage notice when the callback asked for it", () => {
-    currentParams = new URLSearchParams({ [SSO_NOTICE_PARAM]: "group_overage" });
+    currentParams = new URLSearchParams({
+      [SSO_NOTICE_PARAM]: "group_overage",
+    });
     render(<SsoNotice />);
     expect(screen.getByRole("status").textContent).toContain(
       "Your account is in more groups than the sign-in token can list, so no group-based role was applied.",
@@ -34,8 +36,20 @@ describe("SsoNotice (SEC-39)", () => {
   });
 
   it("shows nothing for a code it does not know", () => {
-    currentParams = new URLSearchParams({ [SSO_NOTICE_PARAM]: "something-else" });
+    currentParams = new URLSearchParams({
+      [SSO_NOTICE_PARAM]: "something-else",
+    });
     render(<SsoNotice />);
     expect(screen.queryByRole("status")).toBeNull();
+  });
+
+  it("shows nothing for a code that only exists on the object prototype", () => {
+    // PR review: `NOTICES["toString"]` is inherited, not a notice.
+    for (const code of ["toString", "constructor", "__proto__"]) {
+      currentParams = new URLSearchParams({ [SSO_NOTICE_PARAM]: code });
+      render(<SsoNotice />);
+      expect(screen.queryByRole("status")).toBeNull();
+      cleanup();
+    }
   });
 });
