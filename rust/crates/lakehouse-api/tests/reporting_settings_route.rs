@@ -24,7 +24,7 @@ use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const BODY_SHAPE: &str = "body must be {\"timeZone\": string, \"weekStart\": \"monday\"|\"sunday\", \
-\"numberLocale\"?: \"en-US\"|\"id-ID\", \"companyPalette\"?: [\"#rrggbb\", ...], \"fonts\"?: [string, ...], \"contentSites\"?: [\"https://host\", ...], \"downloadDeniedRoles\"?: [string, ...], \"reportAllowedDomains\"?: [string, ...]}";
+\"numberLocale\"?: \"en-US\"|\"id-ID\", \"companyPalette\"?: [\"#rrggbb\", ...], \"fonts\"?: [string, ...], \"contentSites\"?: [\"https://host\", ...], \"downloadDeniedRoles\"?: [string, ...], \"reportAllowedDomains\"?: [string, ...], \"publicLinksEnabled\"?: boolean}";
 
 /// What a deployment that never saved formatting reads back.
 fn formatting_defaults(mut body: Value) -> Value {
@@ -40,6 +40,7 @@ fn formatting_defaults(mut body: Value) -> Value {
     body["contentSites"] = json!([]);
     body["downloadDeniedRoles"] = json!([]);
     body["reportAllowedDomains"] = json!([]);
+    body["publicLinksEnabled"] = json!(true);
     body
 }
 
