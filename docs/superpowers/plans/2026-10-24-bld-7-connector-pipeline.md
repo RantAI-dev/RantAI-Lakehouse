@@ -136,7 +136,91 @@ the FBIC switch (`BLD-10`), any new sensor, the assistant's pipeline tool.
 
 ## Handoff
 
-(developer appends here)
+### 2026-10-24 — T1 to T6 (`fix/bld-7-connector-pipeline`)
+
+Commits, in plan order:
+
+- `BLD-7 T1` — `create` applies decision 2 through one helper
+  (`routes::authored_pipelines::validate_connector_source`, shared with T4)
+  plus `lakehouse_store::connectors::ingest_targets` (one reader for
+  `source_objects[].target`, the old closure refactored onto it).
+- `BLD-7 T2` — the blanket connector guard in `authored_factory.py` is gone;
+  the narrow guard for a connector on a non-Bronze source has a new fixed
+  reason that says to edit the pipeline. `grep -rn "WS4 item E3" dagster` is
+  empty.
+- `BLD-7 T3` — the `?connectorId=` form: zone fixed to bronze, table picker
+  from that connector's ingest targets (`connectorService.getIngestSpec`, the
+  route the connector page already reads; `listConnectors` carries no
+  `sourceObjects`), "run after this connector loads the table" switch ON and
+  its `ingest_job` in `dependsOn`. Rules in
+  `src/features/pipelines/pipeline-connector-trigger.ts`.
+- `BLD-9 T4` — `PUT` takes `connectorId` (absent / `null` / empty / value),
+  held to decision 2 against the pipeline's own tenant; store writes the
+  tri-state with a `CASE` on a boolean; restore leaves the connector alone.
+  The edit form gets the picker with "No connector".
+- `BLD-8 T5` — two fixes. The run-list poll effect depended on the whole
+  `useService` object, which is new on every render; the page re-renders
+  every second while a run is live, so the timer never fired and an ended
+  run stayed "Running". It now depends on `runsStatus`. The failure reason
+  is classified: our own `config rejected: …` / `refused: …` descriptions
+  are shown, anything else says "The run failed; see the run log". No
+  migration.
+- `BLD-7 T6` — `docs/core/features/uploads-feed-pipelines.md`, section "A
+  connector's tables feed pipelines".
+
+Commands actually run (this worktree, `CARGO_TARGET_DIR` shared,
+`cargo-locked … -j 2`):
+
+| Command | Result |
+| --- | --- |
+| `cargo check -p lakehouse-store -p lakehouse-api` (T1) | `EXIT=0`, 2m10s |
+| `cargo check -p lakehouse-store -p lakehouse-api --all-targets` (T4) | `EXIT=0`, 3m37s |
+| `cargo test -p lakehouse-api connector` | `280 passed; 0 failed` (twice: lib + bin), `API_EXIT=0` |
+| `cargo test -p lakehouse-store --test pipelines` | `60 passed; 0 failed`, `STORE_EXIT=0` |
+| `cargo fmt --check` | clean |
+| `bun run typecheck` | `EXIT=0` |
+| `bun run lint` | `0 errors, 7 warnings` (all pre-existing, untouched files) |
+| `bun test src/features/pipelines` | `103 pass, 0 fail` (run three times: 102/1, then 103/0 twice — the one failure was the BLD-8 poll test under a 1 s default while the machine was building; its waits are now 8–10 s) |
+| `python3 ops/lint/check_intra_package_imports.py` | `OK` |
+| `python3 ops/lint/check_bare_iceberg_count.py` | `R11 guard: … none found` |
+| `(cd dagster && python -m pytest dispar_orchestrate/test_authored_factory.py -q)` | `107 passed` |
+| `(cd dagster && python -m pytest dispar_orchestrate -q)` (full) | `2146 passed, 33 subtests passed in 1037.02s`, `PYTEST_EXIT=0` |
+| `docker compose --profile '*' config --quiet` | `EXIT=0` with throwaway values for `POSTGRES_PASSWORD`, `RUSTFS_ACCESS_KEY`, `RUSTFS_SECRET_KEY`, `LAKEKEEPER_ENCRYPTION_KEY` **and `CONNECTOR_SECRETS_KEY`** (a fifth must-set variable the AGENTS.md block does not list) |
+
+Not verified, with the reason:
+
+- **Full workspace `cargo clippy --workspace --all-targets --all-features --
+  -D warnings` and `cargo test --workspace`**: started, killed at 33 min when
+  `df -h /` reached **4.1 GB free (100% used)**; `cargo-target` was 181 GB.
+  I killed only my own processes (the wrapper and its cargo), then ran
+  `/home/shiro/bin/cargo-target-prune.sh 15 25`, which took free space to
+  25 GB. The full block needs ~88 GB of artifacts on this box, so it cannot
+  run here until more is free; the reviewer's run is the next attempt.
+  Nothing in the change is unbuilt: the two crates touched were checked with
+  `--all-targets`, and their tests ran (numbers above).
+- **Full `bun test src`**: queued under
+  `/home/shiro/rantai/.heavy.lock` three times; the lock was held by another
+  worktree's review runs (`review-pr.sh /home/shiro/rantai/wt-rel9`, a
+  `cargo test -j` at a time), and `df -h /` fell to 4–16 GB free while they
+  built. Cancelled (`BUNTEST_EXIT=143`) rather than keep competing for the
+  lock. The scoped `bun test src/features/pipelines` run above covers every
+  test file this branch touches, and `bun run typecheck`/`bun run lint` ran
+  over the whole tree; the reviewer's own run is the full one.
+- **`docker compose up`**: not run; no compose file changed.
+
+Notes for the reviewer:
+
+- Decision 8: the assistant still sends `connector_id: None`
+  (`routes/ai/tools/pipelines.rs`), untouched.
+- Two interpretations, both at the code with a comment: (a) a pipeline with a
+  connector shows the connector-load switch instead of the DATA-19 upload
+  switch, because the connector is what loads that table; a stored
+  `file_ingest_job` is dropped on save there; (b) clearing a connector does
+  not rewrite the rest of `dependsOn` (`ingest_job` stays, and is legal on a
+  Bronze source).
+- The BLD-8 regression test was checked against the old dependency: it fails
+  (10 s timeout) with `[anyLive, reloadRuns, runsState]` and passes with
+  `[anyLive, reloadRuns, runsStatus]`.
 
 ## Review
 
