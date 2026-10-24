@@ -112,7 +112,75 @@ manual resume, any migration.
 
 ## Handoff
 
-(developer appends here)
+### 2026-10-24 — developer, slice 1 (T1–T3)
+
+**Commits** (branch `fix/src-32-late-run-report`, base `022e3608`):
+
+- `4fae3c09` `fix(store): SRC-32, a late run report no longer undoes a later run`
+  — `RECORD_RUN_SQL`, the doc comments of the SQL / `record_run_once` /
+  `record_run_result` / `RunHealth`, the `counted` gate on the pause, and the
+  six store tests in `rust/crates/lakehouse-store/tests/connectors.rs`.
+- `d3d6ed21` `docs(changelog): SRC-32, a late run report does not undo a later run`
+  — the `### Fixed` line under `## [Unreleased]`. No product code: T2 found
+  nothing in the API to change (below).
+
+**T1 — what the SQL does.** One `UPDATE ... RETURNING`, still one statement,
+with `$2` the outcome and `$3` the run end. A report is late when
+`last_run_failure_at > $3` (success) or `last_run_success_at > $3` (failure);
+`NULL` and equal times are not late. A late report keeps `failure_streak` and
+`health`, writes its own timestamp with `GREATEST` (so a time never moves
+back), and returns `counted = false`; only `counted` failures reach the pause.
+The third column is read inside `record_run_once` and never leaves the store:
+`RunRecord` is unchanged (decision 4's "no new public field").
+`record_run_result` discards the counted column and its `RunHealth` answer for
+a late report is the connector's state, as its doc now says.
+
+**T1 checks** (all from `/home/shiro/rantai/wt-src32/rust`):
+
+- `cargo fmt --check` — no diff.
+- `/home/shiro/rantai/bin/cargo-locked clippy -j 2 -p lakehouse-store --all-targets -- -D warnings` — exit 0.
+- `… cargo-locked test -j 2 -p lakehouse-store --test connectors` — **61 passed, 0 failed** (26.08 s), including the six new tests (`a_success_reported_after_a_later_failure_keeps_the_streak_and_the_health`, `a_late_success_between_failures_does_not_stop_the_third_from_pausing`, `a_failure_reported_after_a_later_success_counts_nothing_and_pauses_nothing`, `an_older_report_never_moves_its_own_run_time_back`, `a_failure_and_a_success_that_ended_at_the_same_time_reset_the_count`, `record_run_result_reports_a_late_success_as_the_connectors_state`). No existing test was changed.
+
+**T2 — the API needs no change.** `routes/load_alerts.rs` passes
+`run_end(info.end_time)` straight through and reads `last_run_failure_at` only
+to assert that a time was stamped (`:888`), so neither depends on the old
+update order. Its tests give every run of a sequence the same `endTime`
+(2000.0, `knows_run_config`), which is not late. Checks:
+
+- `… cargo-locked clippy -j 2 -p lakehouse-api --all-targets -- -D warnings` — exit 0 (3 m 59 s).
+- `… cargo-locked test -j 2 -p lakehouse-api load_alerts` — **21 passed, 0 failed** (twice: the unit and the crate test binaries), 0 failed elsewhere as filtered out.
+
+**T3 — full Rust block**, from `rust/`, on `d3d6ed21`:
+
+- `cargo fmt --check` — no diff.
+- `… cargo-locked clippy -j 2 --workspace --all-targets --all-features -- -D warnings` — exit 0 (2 m 16 s).
+- `… cargo-locked test -j 2 --workspace` — exit 0: **134 test binaries, 7 421 passed, 0 failed, 44 ignored** (logs in `/home/shiro/rantai/review/src32-dev-t3-*.log`).
+- `git status` — clean after the two commits; nothing generated staged, no `target/`, no `__pycache__/`.
+
+**Not verified, and why.**
+
+- The new tests were not run against the pre-fix `RECORD_RUN_SQL` (no
+  revert-and-test run: a second workspace rebuild for the store crate). By
+  construction the `g6-ops` test needs arrival order to pass — with the old
+  statement `S1` sets the streak to 0, so `F4` reaches 2 and does not pause —
+  but that is reasoning, not a measurement.
+- No TypeScript, Python, Dagster, compose or gate checks: the slice touches
+  `connectors.rs`, the store test file and `CHANGELOG.md` only.
+- No real Dagster sensor run and no `g6-ops` rerun: the ordering is proven by
+  the store tests against Postgres, not by the orchestrator.
+
+**Decision needed (planner), found while doing T2.** `deliver_failure_alerts`
+still raises `connector_repeated_failure` from
+`recorded.failure_streak == Some(REPEATED_FAILURE_STREAK)`
+(`routes/load_alerts.rs:535`). For a late failure the store now stores the
+connector's unchanged streak, so a late failure that arrives while the
+connector sits at 3 raises "3 runs in a row; the latest is run X" for a run
+that ended earlier and produced none of the three — and a second
+`alert_instance` row. Decision 4 covers the pause only, so this was left as
+it is; gating it needs the counted flag on `RunRecord` (or an equivalent),
+which decision 4 allows but does not decide. A retry never reaches that code
+(the alerted marker returns first), so the retry path needs no answer either
+way.
 
 ## Review
 
