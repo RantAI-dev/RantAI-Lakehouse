@@ -327,4 +327,78 @@ Run after the merge:
   `route_auth`, `sec11_guard`, `public_links` integration files, and the clippy
   re-run.
 
+### Part B (server and console as built), developer: Sonnet
+
+Commits on `feat/bi-phase-5`: T3 `e6c821da` (+ `0e833172` test literals), T4 `a971fbff`,
+T5 `1190f5a5`, T6 `e0076536`, T7 `6fbe1fe7`, T8 the BI-4-RESULT part B commit that follows.
+`origin/feat/bi-phase-4b` merged twice (`dbdb6638`, `995c1d24`).
+
+**Migration number: `0110_result_cache_rule.sql`** (not 0103: BI-19 part B takes 0103+; 0098-0102 taken).
+
+**Deviations (the planner decides):**
+1. **D3, the scope is a task-local, not a `TileEngine` parameter.** `result_cache::CacheScope`
+   is opened by `payload_for` (dashboard, PDF print view) and the two embed/public handlers
+   with `scoped(..)`, narrowed by `get_body` / `render_board_payload` to the board's rule and
+   by `in_chart` to the chart's. `try_run_spec_sql` reads it with `current()`. Reason: about
+   twenty call sites (and every test) would change, and the safe default is better: a call
+   with no scope (Query Studio, preview, export, SQL-source preview, `records_for_roles`) is
+   never remembered. The key, the choke point and "no caller can read around it" are as D3/D4.
+2. **D6, "one fingerprint query per request"** holds when the board's marts are known: `get_body`
+   and `render_board_payload` pass every `serving.<mart>` of the board as candidates, so the
+   first tile's fingerprint read covers them all (test: 1 query for 3 concurrent tiles). A
+   table outside the candidates costs one more query. A table with no active part (empty table)
+   is absent from `system.parts` and so counts as unwatchable (10 minutes).
+3. **`fresh` is not read from embed or public-link requests** (plan T5 says all four reads): a
+   reader with no sign-in could otherwise force the engine to recompute a board. The PDF render
+   reads through `payload_for` with no `fresh`. Planner to confirm.
+4. **`fresh=<chart id>[,id]`** (besides `fresh=1`) exists for "Refresh this tile"; the plan had
+   no per-tile read.
+5. **`set_cache_rule` is `WriteLow`** (the chat's confirmation, like `format_chart` and
+   `set_dashboard_theme`), not `WriteHigh`: the plan says "write risk class, needs approval" and
+   the feature page says "asks for approval like the other dashboard writes", which are
+   confirmations. Change the `ToolSpec` risk if an approval queue is meant.
+6. Under an explicit `minutes` rule the unwatchable bound is the person's minutes (they asked
+   for N); under the default it is 10 minutes.
+7. A version restore does not carry the dashboard's rule (`BoardFields` unchanged); it keeps the live one.
+8. `query_metric` / `value_query` open their own scope under the install's rule (one more
+   settings read); it is boxed because the future crossed the `large_futures` size.
+9. Extra payload key `boardCacheRule` (the board's own rule) for the Freshness dialog.
+10. A stored board rule that does not parse reads as "always fresh" (fail closed).
+
+**What never reaches memory:** errors (time limit, Stop, engine), a result the row cap cut
+(`limitHit`: BI-5 D6), over 8 MB, a statement whose tables could not be named, anything computed
+while the fingerprint read failed. A cancelled run inserts nothing (test:
+`a_cancelled_computation_leaves_nothing_behind`). The key is SHA-256 of engine, the rewritten
+statement (which carries the person's masks and expanded principal values) and
+`max_execution_time` / `max_result_rows`; the text also carries the row cap and the time cap.
+**Open (BI-5 review B1):** the point-map `LIMIT` and the pivot's own cap are in the statement
+text today only where the builder wrote them there; the planner asked that the per-kind cap be
+part of the key, which is handled in the BI-5 review fixes.
+
+**Commands run** (from `rust/`, shared target, `CARGO_BUILD_JOBS=2`, `CARGO_INCREMENTAL=0`,
+under `flock`; 1.99.1):
+- `cargo fmt --check -p lakehouse-bi -p lakehouse-store -p lakehouse-api`: clean.
+- `cargo clippy -p lakehouse-bi -p lakehouse-store -p lakehouse-api --all-targets --all-features -- -D warnings`:
+  clean for `lakehouse-api` after the 4b lint fixes were merged (last run at T7); the bi/store
+  crates were clean at T3.
+- `cargo test -p lakehouse-bi --lib cache`: 4 passed; `ensure_bi_table`: 1 passed.
+- `cargo test -p lakehouse-api --lib -- result_cache`: 21 passed (incl. the fingerprint, key,
+  coalescing, cancel and per-chart tests); with `routes::dashboard routes::embed routes::support
+  tile_pool routes::settings routes::layout_tabs routes::organise`: 253 passed, 3 ignored (this
+  includes the `sqlx::test` masking test `a_masked_and_an_unmasked_viewer_never_share_a_remembered_result`
+  in both orders and `a_second_open_is_remembered_and_fresh_computes_again`, which ran here).
+- `cargo test -p lakehouse-api --lib -- routes::ai routes::metrics routes::tests`: 432 passed, 1 ignored;
+  the ignored `write_tool_schema_fixture` run once (count pin 109).
+- `bun run typecheck`: exit 0. `bun run lint`: 0 errors, 9 warnings (none in these files).
+  `bun run test`: 2650 pass, 1 skip, 0 fail (2651 tests, 276 files). `python3 -m unittest
+  test_ai_eval` (from `ops/ai_eval`): 165 OK.
+
+**Not verified:** every integration test file (`reporting_settings` in the store,
+`reporting_settings_route`, the new `ai_tool` cases) was written, compiled by clippy
+`--all-targets`, not run; `route_auth`, `sec11_guard`; `cargo deny` / `cargo audit`; the webpack
+build; the 3-second target and any real-engine timing (BI-4-RESULT section 4.2); the console in a
+browser; the AI-15 run itself (case `dash_make_chart_always_fresh` added, not run); a full
+workspace clippy and test run. `system.parts.modification_time` was checked on ClickHouse
+26.8.9.10 (BI-4-RESULT 4.1): it moves on insert and on `CREATE OR REPLACE TABLE ... AS SELECT`.
+
 ## 8. Review (planner appends)
