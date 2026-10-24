@@ -264,29 +264,84 @@ async fn resolve_reach(
         .await?
         .is_some();
     let tenant = crate::tenant_scope::resolve(principal, headers)?;
-    Ok(match (refused, tenant) {
-        // The shared catalog is open to this caller: it may read the
-        // shared tables, and its own tenant's uploads besides.
+    // The count is read only when the gate admitted the caller: a
+    // refusal decides the reach on its own, and the query path is hot.
+    //
+    // It is read AFTER the gate's own read, so the later answer is the
+    // one that decides: a deployment that gained a tenant between the
+    // two reads is scoped, not unscoped.
+    let tenant_count = if refused {
+        None
+    } else {
+        deployment_tenant_count(state).await?
+    };
+    Ok(reach_from(
+        refused,
+        tenant,
+        tenant_count,
+        state.config.catalog_tenant_id,
+    ))
+}
+
+/// `SEC-20`: the reach, as a pure function of the answers the request has.
+///
+/// The answers are the shared catalog's own gate (refused or not), the
+/// caller's tenant ([`crate::tenant_scope::resolve`]), how many tenants
+/// the deployment holds, and which tenant owns the shared catalog
+/// (`CATALOG_TENANT_ID`).
+///
+/// An answer that cannot be confirmed narrows the reach. A gate that
+/// admitted the caller is not proof that the caller owns the shared
+/// catalog: the gate admits a caller for two reasons (the caller owns the
+/// catalog, or the deployment holds a single tenant), and the count it
+/// read may be older than this request's. So the ownership is checked
+/// against the setting that names the catalog's tenant, and the count is
+/// read again. A deployment that grew a tenant in between is scoped,
+/// never unscoped — the narrowing is the safe direction, because the
+/// shared tables and the other tenants' uploads are the things to keep.
+fn reach_from(
+    refused: bool,
+    tenant: Option<Uuid>,
+    tenant_count: Option<i64>,
+    catalog_tenant_id: Option<Uuid>,
+) -> TenantReach {
+    let one_tenant = tenant_count.is_some_and(|count| count <= 1);
+    match (refused, tenant) {
+        // The shared catalog is open to this caller.
         (false, Some(tenant_id)) => {
-            // The gate admits the caller for one of two reasons: it owns
-            // the shared catalog, or the deployment holds a single tenant
-            // and there is no other tenant's table to reach. The second
-            // changes nothing at all, so the count is asked for.
-            if deployment_tenant_count(state)
-                .await?
-                .is_some_and(|count| count <= 1)
-            {
+            if one_tenant {
+                // A deployment with a single tenant holds no other
+                // tenant's table to reach: the gate changes nothing.
                 TenantReach::All
-            } else {
+            } else if catalog_tenant_id == Some(tenant_id) {
+                // The caller is the tenant that owns the shared catalog.
                 TenantReach::Tenant {
                     tenant_id,
                     owns_catalog: true,
                 }
+            } else {
+                // The gate admitted the caller, but the caller is not the
+                // tenant that owns the shared catalog: the gate must have
+                // read a smaller count than this request did. Fail
+                // closed — the shared tables are not the caller's.
+                TenantReach::Tenant {
+                    tenant_id,
+                    owns_catalog: false,
+                }
             }
         }
-        // No tenant of the caller's and nothing to scope (a deployment
-        // with one tenant, or none): the gate changes nothing.
-        (false, None) => TenantReach::All,
+        // The gate admitted a caller that belongs to no tenant, so it
+        // read a deployment with a single tenant.
+        (false, None) => {
+            if one_tenant {
+                TenantReach::All
+            } else {
+                // The deployment grew a tenant since the gate read its
+                // count: a caller that belongs to no tenant owns no table
+                // and reads no shared one.
+                TenantReach::NoTenant
+            }
+        }
         // The shared catalog is closed to this caller: only the uploads
         // its own tenant claimed are its own.
         (true, Some(tenant_id)) => TenantReach::Tenant {
@@ -296,7 +351,7 @@ async fn resolve_reach(
         // A caller with no tenant in a deployment that has more than
         // one: it owns no upload and may read no shared table.
         (true, None) => TenantReach::NoTenant,
-    })
+    }
 }
 
 /// `SEC-20`: the saved queries the caller may read.
@@ -3430,8 +3485,8 @@ mod tenant_scope_tests {
     use uuid::Uuid;
 
     use super::{
-        TenantReach, first_unreachable, raw_table_name, referenced_table_names, table_is_reachable,
-        table_not_available,
+        TenantReach, first_unreachable, raw_table_name, reach_from, referenced_table_names,
+        table_is_reachable, table_not_available,
     };
 
     const TENANT_A: Uuid = Uuid::from_u128(1);
@@ -3550,6 +3605,70 @@ mod tenant_scope_tests {
         assert_eq!(
             err.to_string(),
             "Table not found or not available to your organisation: bronze.orders"
+        );
+    }
+
+    #[test]
+    fn a_deployment_with_one_tenant_reaches_everything() {
+        assert_eq!(
+            reach_from(false, Some(TENANT_A), Some(1), None),
+            TenantReach::All
+        );
+        assert_eq!(reach_from(false, None, Some(1), None), TenantReach::All);
+    }
+
+    #[test]
+    fn the_catalogs_own_tenant_owns_the_shared_tables() {
+        assert_eq!(
+            reach_from(false, Some(TENANT_A), Some(2), Some(TENANT_A)),
+            TenantReach::Tenant {
+                tenant_id: TENANT_A,
+                owns_catalog: true,
+            }
+        );
+    }
+
+    #[test]
+    fn a_gate_that_admits_a_caller_that_does_not_own_the_catalog_is_narrowed() {
+        // The gate read a smaller count than this request did: the
+        // shared tables are the catalog tenant's, not the caller's.
+        assert_eq!(
+            reach_from(false, Some(TENANT_B), Some(2), Some(TENANT_A)),
+            TenantReach::Tenant {
+                tenant_id: TENANT_B,
+                owns_catalog: false,
+            }
+        );
+        // And a caller that belongs to no tenant reaches nothing at all.
+        assert_eq!(
+            reach_from(false, None, Some(2), Some(TENANT_A)),
+            TenantReach::NoTenant
+        );
+    }
+
+    #[test]
+    fn a_closed_gate_keeps_the_caller_to_its_own_tenant() {
+        assert_eq!(
+            reach_from(true, Some(TENANT_B), Some(2), Some(TENANT_A)),
+            TenantReach::Tenant {
+                tenant_id: TENANT_B,
+                owns_catalog: false,
+            }
+        );
+        assert_eq!(
+            reach_from(true, None, Some(2), Some(TENANT_A)),
+            TenantReach::NoTenant
+        );
+    }
+
+    #[test]
+    fn an_unknown_tenant_count_is_never_the_one_tenant_case() {
+        assert_eq!(
+            reach_from(false, Some(TENANT_A), None, None),
+            TenantReach::Tenant {
+                tenant_id: TENANT_A,
+                owns_catalog: false,
+            }
         );
     }
 }
