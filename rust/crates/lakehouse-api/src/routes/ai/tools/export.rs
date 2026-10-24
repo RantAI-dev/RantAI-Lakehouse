@@ -112,17 +112,17 @@ fn check_view_names(
     params: Option<&[String]>,
     columns: Option<&std::collections::BTreeSet<String>>,
 ) -> Result<(), String> {
-    if let (Some(params), Some(given)) = (params, args.get("params").and_then(Value::as_object)) {
-        if let Some(unknown) = given.keys().find(|k| !params.iter().any(|p| p == *k)) {
-            let known = if params.is_empty() {
-                "none".to_owned()
-            } else {
-                params.join(", ")
-            };
-            return Err(format!(
-                "There is no parameter named {unknown:?}. The parameters are: {known}. Use one of these names exactly, or leave params out."
-            ));
-        }
+    if let (Some(params), Some(given)) = (params, args.get("params").and_then(Value::as_object))
+        && let Some(unknown) = given.keys().find(|k| !params.iter().any(|p| p == *k))
+    {
+        let known = if params.is_empty() {
+            "none".to_owned()
+        } else {
+            params.join(", ")
+        };
+        return Err(format!(
+            "There is no parameter named {unknown:?}. The parameters are: {known}. Use one of these names exactly, or leave params out."
+        ));
     }
     let (Some(columns), Some(filters)) = (columns, args.get("filters").and_then(Value::as_array))
     else {
