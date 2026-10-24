@@ -270,3 +270,48 @@ Commits: `2c7207b1` T1 settings, `27400302` T2 engine options, `b937755a` T3 dea
 ## 8. Review (planner appends)
 
 Planner, 2026-10-24: the console's shapes are accepted as the contract for the Rust tasks (the `/api/settings/limits` GET/PUT shape, the failed tile's `limit`, `X-Run-Id`, `POST /api/query/cancel`). The row-cut marker on a tile result is named **`limitHit`**, because `limit` is already a raw table's page size. T1 to T5 build to these shapes.
+
+### Review of the server half (T1–T5, T7), planner, 2026-10-25
+
+Commits read with `git show` at `e0076536`; the reviewer did not run cargo. Security is clean:
+- **Cancel scope.** `KillTarget::own_run` builds its pattern only from the caller's own UUID plus a run id parsed as a UUID, and binds it via `SqlLiteral`. The principal comes from the session, and `deny_unknown_fields` is on.
+- **`X-Run-Id`.** A missing or invalid value gets a fresh UUID.
+- **SQL text.** Saved SQL sources cannot carry `SETTINGS`, and `with_run_settings` rewrites only the builder's own clause.
+- **Standards.** SEC-11 holds, both routes are in `POLICY_TABLE` and `route_auth`, there are `# Errors` docs, and no `unwrap` outside tests.
+
+- **BLOCKER B1, point maps and pivots are cut at `chart_rows`.**
+  - Where: `routes/support.rs:316`/`:329`. `try_run_spec_sql` sends `max_result_rows = chart_rows + 1`, then truncates to `chart_rows` with `limitHit: rows`. That happens after `with_map_limit` set a point map's `LIMIT` to `map_points`.
+  - Effect at the defaults: a mart point map shows 2,000 of 5,000 points and says "rows", so decision 2's map setting does nothing above `chart_rows`. A mart pivot's own cap (`pivot_row_cap`, up to 10,000) is cut to 2,000.
+  - Fix: pass the cap per kind: `map_points` for `Pointmap`/`Geoheat`, and the pivot's own cap for pivots (planner decision: pivots keep the cap they had before BI-5; no behaviour change for them).
+  - Test: a mart point map of 3,000 rows comes back whole with no `limitHit`.
+- **BLOCKER B2, the assistant's queries ignore the settings and cannot be stopped.**
+  - Where: `routes/ai/mod.rs:1158–1177`. `stream_chat` runs `run_chat` in `tokio::spawn`, which drops the task-local. `run_sql` then falls back to `QueryRun::current_or_detached()`: nil principal, no roles, `Snapshot::default()`.
+  - Effect: the chat runs at the compiled defaults whatever the administrator set, and `stop_query` cannot find its `000…:` queries.
+  - Fix: capture the run before the spawn and run the spawned future inside `query_limits::scope(...)` (let `scope` take an `Arc`). Make `detached()` read the install snapshot when `AppState` is available.
+  - Test: a streamed chat `run_sql` sends `query_id=<user>:` and the role's `max_execution_time`.
+- **SHOULD-FIX S1, `is_board_path` gives a 35-min outer deadline to non-board routes** (`routes/mod.rs:200`, `:218`): `/api/embed/frame`, `/api/embed/values`, `/api/public/dashboard/{token}/unlock`. Match only whole-board routes (`/api/dashboard`, `/api/render/data`, `/api/embed/data`, `GET /api/public/dashboard/{token}`), and assert `route_timeout` for the other three.
+- **SHOULD-FIX S2, Stop and later tile rounds.**
+  - On a board with more than 6 tiles, the next round may start new queries after Stop, unless the browser abort reaches the handler through the Next rewrite (*not verified*).
+  - Fix: add a short-lived stopped mark per (principal, run) that `try_run_spec_sql` checks before sending (answer "Stopped"). Send the `KILL` even when the count is 0.
+  - Verify at QA on a board of more than 6 slow tiles (`BI-5-AC2`).
+- **SHOULD-FIX S3, `with_run_settings`/`with_export_settings` only match the current default text** (`lakehouse-bi/src/builder.rs:91`).
+  - Effect: statements saved with the pre-BI-5 `max_execution_time = 30` keep the old limits and lose `BI-1`'s 1,000,000-row export lift.
+  - Fix: match the clause with any numbers, and add tests with the old text.
+- **SHOULD-FIX S4, a grouped export no longer matches its tile** (`routes/dashboard.rs:3566`, `export_statement_settings`). Apply the caller's limits there too, so the file holds what the tile shows.
+- **Accepted, measured S5.** Does `max_result_rows` + `break` cut subqueries?
+  - Measured by the planner on the dev ClickHouse 26.8.9.10 with `max_result_rows=2001, result_overflow_mode='break'`:
+    - `SELECT sum(x), count() FROM (SELECT number x FROM numbers(10000))` → `49995000, 10000` (whole);
+    - an `IN (SELECT … 5000 rows)` filter → `5000` (whole);
+    - `count()` over a 100,000-row `GROUP BY` subquery → `100000` (whole).
+  - Only the final result is cut. Record this as E6 in `docs/plans/BI-5-RESULT.md`.
+- **SHOULD-FIX S6, `GET /api/settings/limits` returns more than decision 6 allows** (`routes/query_limits.rs:140`). Return `install` and `roles` only to `settings:write`; others get `effective` only. Update the console and the route test.
+- **SHOULD-FIX S7, missing acceptance tests.**
+  - T3's board-deadline route test with a mock engine: the finished tiles plus "Not reached in time".
+  - A router-level test that `X-Run-Id` reaches the engine: `/api/query/run` sends `query_id=<user>:<run>:0` and the role's `max_execution_time`.
+- **SHOULD-FIX S8, still not verified on the real stack:** the API ClickHouse user's `KILL QUERY` grant, and the click-to-gone time. Close both at QA (`BI-5-AC2`). `BI-5-RESULT.md` says *not verified* until then.
+- **SHOULD-FIX S9, the prompt line is in Build mode only** (`SYSTEM_BUILD_SUFFIX`), but both tools are offered in Ask mode and the AI-15 case runs in Ask mode. Move the line into the shared prompt.
+- **Accepted:**
+  - Deviations: D3 (task-local + text swap; conditional on B2 and S3), D4 (35-min middleware cap, the handler decides; conditional on S1), D7 (`stop_query` with no `runId` stops all of the caller's own queries; narrowing, DEC-8), and the row cut at `chart_rows + 1`.
+  - Small notes: the one post-deadline poll, the memo race inside 30 s, `to_u32`'s fallback (unreachable through the `CHECK`s), `body_is_exception` only after a failed parse, and progress headers ≤ 80.
+
+Verdict: not ready to merge until B1 and B2 are fixed; then S1–S4 and S6–S9.
