@@ -78,7 +78,7 @@ person to approve first).
 | A1 | Every public link expires. You choose 1, 7, 30 or 90 days or a date; 30 days is preselected; a year is the most | Spec (30 days, proposed); the one-year cap is a planner default | Signed by the owner, 2026-10-18 |
 | A2 | Links that exist today get an expiry 30 days after the upgrade. The Share dialog says so | Planner default | Signed by the owner, 2026-10-18 |
 | A3 | A password is optional, at least 8 characters, and is stored only as a one-way hash. The owner cannot read it back, only replace it | Planner default | Owner to confirm at QA |
-| A4 | Five wrong passwords on one link within 15 minutes lock that link's password page for 15 minutes. The lock looks the same as a wrong password | Planner default (the sign-in lock's numbers) | Owner to confirm at QA |
+| A4 | Five wrong passwords on one link within 15 minutes lock that link's password page for 15 minutes. After the fifth wrong try, and while the lock lasts, the page says "Too many wrong tries. Try again in 15 minutes." (a fixed code, no time left), so a visitor with the right password can tell why it fails. Changed by the owner on 2026-10-24 at the browser QA; before, the lock looked like a wrong password. A5 is unchanged | Planner default (the sign-in lock's numbers); owner's change 2026-10-24 | Signed by the owner, 2026-10-24 (the lock message); the numbers: owner to confirm |
 | A5 | An expired, switched-off or unknown link all show the same "This link does not work" page. Nobody can tell which | Planner default | Owner to confirm at QA |
 | A6 | One public link per dashboard. Making a new one ends the old one | Planner default | Owner to confirm at QA |
 | A7 | An administrator can switch public links off for everyone (Admin > Settings). It is on at first, as today. Switching it off stops every link at once; switching it on again brings back the links that have not expired | Planner default | Signed by the owner, 2026-10-18 |
@@ -111,7 +111,7 @@ person to approve first).
 
 ## Limits to tell a customer
 
-- A public link with a password can be locked for 15 minutes by someone guessing. The owner can make a new link.
+- A public link with a password can be locked for 15 minutes by someone guessing, and the page then says so to everyone who tries. The owner can make a new link.
 - Permissions are per person or per role. There are no groups.
 - An alert looks at one number every 15 minutes. A spike that comes and goes between two checks is not seen.
 - A PNG needs the PDF service (`BI-1`).

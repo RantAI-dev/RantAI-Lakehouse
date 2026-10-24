@@ -1,9 +1,10 @@
-//! The deployment's reporting settings (migrations `0070`, `0086`, `0087`, `0088` and `0089`): the
+//! The deployment's reporting settings (migrations `0070`, `0086`, `0087`, `0088`, `0089` and `0098`): the
 //! report time zone, the first day of the week, and (`BI-17` part A) the
 //! number locale, the company palette and the allowed fonts, and (`BI-16`
 //! part B) the sites image and web cards may load from, and (`BI-1`) the
 //! roles that may not download, and (`RPT-1`) the outside
-//! email domains a report may go to.
+//! email domains a report may go to, and (`BI-19` part A) the switch for
+//! public links.
 //!
 //! At most one row exists (`singleton`). No row is not an error: it means the
 //! deployment never saved the settings, and the caller supplies the defaults
@@ -39,6 +40,9 @@ pub struct ReportingSettings {
     /// migration `0089`): lower-case names, at most 50. Empty: no report
     /// leaves the company.
     pub report_allowed_domains: Vec<String>,
+    /// Whether public links work at all (`BI-19` part A, migration `0098`,
+    /// feature A7). `true` until an administrator switches it off.
+    pub public_links_enabled: bool,
 }
 
 /// The saved settings, or `None` when the deployment never saved them.
@@ -49,7 +53,7 @@ pub struct ReportingSettings {
 pub async fn get(pool: &PgPool) -> Result<Option<ReportingSettings>, StoreError> {
     Ok(sqlx::query_as(
         "SELECT time_zone, week_start, number_locale, company_palette, fonts, content_sites, \
-             download_denied_roles, report_allowed_domains FROM reporting_settings",
+             download_denied_roles, report_allowed_domains, public_links_enabled FROM reporting_settings",
     )
     .fetch_optional(pool)
     .await?)
@@ -70,16 +74,17 @@ pub async fn upsert(
     Ok(sqlx::query_as(
         "INSERT INTO reporting_settings \
              (singleton, time_zone, week_start, number_locale, company_palette, fonts, content_sites, \
-              download_denied_roles, report_allowed_domains, updated_at, updated_by) \
-         VALUES (TRUE, $1, $2, $3, $4, $5, $6, $7, $8, now(), $9) \
+              download_denied_roles, report_allowed_domains, public_links_enabled, updated_at, updated_by) \
+         VALUES (TRUE, $1, $2, $3, $4, $5, $6, $7, $8, $9, now(), $10) \
          ON CONFLICT (singleton) DO UPDATE SET time_zone = EXCLUDED.time_zone, \
          week_start = EXCLUDED.week_start, number_locale = EXCLUDED.number_locale, \
          company_palette = EXCLUDED.company_palette, fonts = EXCLUDED.fonts, \
          content_sites = EXCLUDED.content_sites, \
          download_denied_roles = EXCLUDED.download_denied_roles, \
-         report_allowed_domains = EXCLUDED.report_allowed_domains, updated_at = now(), updated_by = EXCLUDED.updated_by \
+         report_allowed_domains = EXCLUDED.report_allowed_domains, \
+         public_links_enabled = EXCLUDED.public_links_enabled, updated_at = now(), updated_by = EXCLUDED.updated_by \
          RETURNING time_zone, week_start, number_locale, company_palette, fonts, \
-         content_sites, download_denied_roles, report_allowed_domains",
+         content_sites, download_denied_roles, report_allowed_domains, public_links_enabled",
     )
     .bind(&settings.time_zone)
     .bind(&settings.week_start)
@@ -89,6 +94,7 @@ pub async fn upsert(
     .bind(&settings.content_sites)
     .bind(&settings.download_denied_roles)
     .bind(&settings.report_allowed_domains)
+    .bind(settings.public_links_enabled)
     .bind(updated_by)
     .fetch_one(pool)
     .await?)

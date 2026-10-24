@@ -7,13 +7,13 @@ import {
 } from "./embed-frame"
 
 describe("frameAncestorsPolicy", () => {
-  it("an empty list is frame-ancestors 'none'", () => {
-    expect(frameAncestorsPolicy([])).toBe("frame-ancestors 'none'")
+  it("an empty list lets only the console's own origin frame it (BI-26 review fix R4: the Share dialog's preview)", () => {
+    expect(frameAncestorsPolicy([])).toBe("frame-ancestors 'self'")
   })
 
   it("a list is the sites, in order", () => {
     expect(frameAncestorsPolicy(["https://app.customer.example", "http://localhost:3000"])).toBe(
-      "frame-ancestors https://app.customer.example http://localhost:3000",
+      "frame-ancestors 'self' https://app.customer.example http://localhost:3000",
     )
   })
 
@@ -31,11 +31,11 @@ describe("frameAncestorsPolicy", () => {
         null,
         "https://ok.example",
       ]),
-    ).toBe("frame-ancestors https://ok.example")
+    ).toBe("frame-ancestors 'self' https://ok.example")
   })
 
-  it("a list with nothing acceptable, or no list at all, is frame-ancestors 'none'", () => {
-    expect(frameAncestorsPolicy(["*"])).toBe(FRAME_ANCESTORS_NONE)
+  it("a list with nothing acceptable is only 'self'; no list at all is frame-ancestors 'none'", () => {
+    expect(frameAncestorsPolicy(["*"])).toBe("frame-ancestors 'self'")
     expect(frameAncestorsPolicy(undefined)).toBe(FRAME_ANCESTORS_NONE)
     expect(frameAncestorsPolicy("https://a.example")).toBe(FRAME_ANCESTORS_NONE)
     expect(frameAncestorsPolicy({ origins: [] })).toBe(FRAME_ANCESTORS_NONE)
@@ -43,9 +43,9 @@ describe("frameAncestorsPolicy", () => {
 
   it("lists no more than twenty sites, once each", () => {
     const many = Array.from({ length: 25 }, (_, i) => `https://s${i}.example`)
-    expect(frameAncestorsPolicy(many).split(" ").length).toBe(1 + 20)
+    expect(frameAncestorsPolicy(many).split(" ").length).toBe(2 + 20)
     expect(frameAncestorsPolicy(["https://a.example", "https://a.example"])).toBe(
-      "frame-ancestors https://a.example",
+      "frame-ancestors 'self' https://a.example",
     )
   })
 })
@@ -76,17 +76,17 @@ describe("embedFramePolicy", () => {
       return ["https://app.customer.example"]
     })
     expect(asked).toEqual([{ kind: "jwt", value: "a.b.c" }])
-    expect(policy).toBe("frame-ancestors https://app.customer.example")
+    expect(policy).toBe("frame-ancestors 'self' https://app.customer.example")
   })
 
-  it("an empty list from the API is frame-ancestors 'none'", async () => {
-    expect(await embedFramePolicy("/embed/dashboard/p_x", async () => [])).toBe("frame-ancestors 'none'")
+  it("an empty list from the API is only 'self'", async () => {
+    expect(await embedFramePolicy("/embed/dashboard/p_x", async () => [])).toBe("frame-ancestors 'self'")
   })
 
   it("an unknown token is whatever the API says for it, which is an empty list", async () => {
     // The API answers {"origins": []} for a token it does not know; the
-    // header is then 'none', the same as a board with no sites listed.
-    expect(await embedFramePolicy("/embed/signed/unknown.token.x", async () => [])).toBe(FRAME_ANCESTORS_NONE)
+    // header is then only 'self', the same as a board with no sites listed.
+    expect(await embedFramePolicy("/embed/signed/unknown.token.x", async () => [])).toBe("frame-ancestors 'self'")
   })
 
   it("a failing API is frame-ancestors 'none', not an error and not open", async () => {

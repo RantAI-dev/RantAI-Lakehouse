@@ -24,6 +24,7 @@ fn settings(zone: &str, week: &str) -> ReportingSettings {
         content_sites: Vec::new(),
         download_denied_roles: Vec::new(),
         report_allowed_domains: Vec::new(),
+        public_links_enabled: true,
     }
 }
 
@@ -111,6 +112,7 @@ async fn the_formatting_settings_round_trip_and_a_row_saved_before_them_keeps_th
     ];
     chosen.download_denied_roles = vec!["Viewer".to_owned(), "Guest".to_owned()];
     chosen.report_allowed_domains = vec!["example.com".to_owned(), "partner.example".to_owned()];
+    chosen.public_links_enabled = false;
     assert_eq!(upsert(&pool, &chosen, "u").await.expect("upsert"), chosen);
     assert_eq!(get(&pool).await.expect("get"), Some(chosen));
     Ok(())

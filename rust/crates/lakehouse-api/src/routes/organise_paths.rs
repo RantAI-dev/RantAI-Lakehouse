@@ -767,7 +767,9 @@ async fn embeds_and_public_links_read_as_nobody() {
     let server = engine(vec![]).await;
     let ch = client(&server);
     let nobody = Viewer::anonymous();
-    let _ = lakehouse_bi::store::get_board_by_token(&ch, "p_token").await;
+    // The links a public page opens are read from Postgres now (BI-19 part A);
+    // what is left of the old column, read once at start, is read as nobody too.
+    let _ = lakehouse_bi::store::legacy_public_links(&ch).await;
     let _ = lakehouse_bi::store::get_board(&ch, "b1", &nobody).await;
     let _ = lakehouse_bi::store::list_stored_charts(&ch, &nobody).await;
     let reads = sent(&server, "FROM console.bi_board FINAL WHERE is_deleted = 0").await;
@@ -1505,7 +1507,8 @@ async fn moving_a_shared_board_into_a_personal_space_is_refused() {
     ])
     .await;
     let ch = client(&server);
-    let refused = lakehouse_bi::store::move_board(&ch, "b1", "fp_me")
+    // BI-19 part A: the link is in Postgres, so the caller says it has one.
+    let refused = lakehouse_bi::store::move_board(&ch, "b1", "fp_me", true)
         .await
         .unwrap_err();
     assert!(
@@ -1524,10 +1527,9 @@ async fn moving_a_shared_board_into_a_personal_space_is_refused() {
     )])
     .await;
     let ch = client(&server);
-    let refused = lakehouse_bi::store::set_board_public(&ch, "b2", true)
-        .await
-        .unwrap_err();
-    assert!(refused.to_string().contains("personal space"), "{refused}");
+    // The public link of a personal-space board is refused by `PUT
+    // /api/dashboard/public-link` (tests/public_links.rs); the embed switch is
+    // still the store's.
     let refused = lakehouse_bi::store::set_board_embed(&ch, "b2", true)
         .await
         .unwrap_err();
@@ -2623,7 +2625,9 @@ mod engine {
         let draft = store::create_board(&ch, "Secret draft", "", "Me")
             .await
             .unwrap();
-        store::move_board(&ch, &draft.id, &mine.id).await.unwrap();
+        store::move_board(&ch, &draft.id, &mine.id, false)
+            .await
+            .unwrap();
         let c_draft = add_chart(&ch, &draft.id, "Hotels in the draft").await;
 
         // ── The personal space: who sees what ────────────────────────────
@@ -2686,20 +2690,9 @@ mod engine {
         assert!(search::search(&ch, &me, "%").await.unwrap().is_empty());
         assert!(search::search(&ch, &me, "a_c").await.unwrap().is_empty());
         // A draft cannot be shared, and a shared dashboard cannot be hidden by moving it.
-        let refused = store::set_board_public(&ch, &draft.id, true)
-            .await
-            .unwrap_err();
-        assert!(refused.to_string().contains("personal space"), "{refused}");
-        let token = store::set_board_public(&ch, &shared.id, true)
-            .await
-            .unwrap();
-        assert!(
-            store::get_board_by_token(&ch, &token)
-                .await
-                .unwrap()
-                .is_some()
-        );
-        let refused = store::move_board(&ch, &shared.id, &mine.id)
+        // (A draft cannot be given a public link: `PUT /api/dashboard/public-link`
+        // refuses it, tests/public_links.rs. The link itself is in Postgres now.)
+        let refused = store::move_board(&ch, &shared.id, &mine.id, true)
             .await
             .unwrap_err();
         assert!(
@@ -2707,10 +2700,12 @@ mod engine {
             "{refused}"
         );
         // Filing it out of the space makes it everyone's.
-        store::move_board(&ch, &draft.id, "").await.unwrap();
+        store::move_board(&ch, &draft.id, "", false).await.unwrap();
         assert!(board_ids(&ch, &you).await.contains(&draft.id));
         assert!(chart_ids(&ch, &you).await.contains(&c_draft));
-        store::move_board(&ch, &draft.id, &mine.id).await.unwrap();
+        store::move_board(&ch, &draft.id, &mine.id, false)
+            .await
+            .unwrap();
         assert!(!chart_ids(&ch, &you).await.contains(&c_draft));
 
         // ── The trash: nothing read leaves a deleted item in ─────────────
@@ -2723,13 +2718,6 @@ mod engine {
                 .await
                 .unwrap()
                 .is_none()
-        );
-        assert!(
-            store::get_board_by_token(&ch, &token)
-                .await
-                .unwrap()
-                .is_none(),
-            "a deleted board's public link is dead"
         );
         assert!(
             !hit_ids(search::search(&ch, &you, "Shared overview").await.unwrap())
@@ -2777,12 +2765,6 @@ mod engine {
         assert_eq!(back.charts, 1);
         assert!(board_ids(&ch, &you).await.contains(&shared.id));
         assert!(chart_ids(&ch, &you).await.contains(&c_shared));
-        assert!(
-            store::get_board_by_token(&ch, &token)
-                .await
-                .unwrap()
-                .is_some()
-        );
         assert!(
             trash::restore_board(&ch, &shared.id, &you).await.is_err(),
             "twice is refused"
