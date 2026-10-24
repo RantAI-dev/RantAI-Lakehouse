@@ -235,4 +235,20 @@ Not verified: a real save through the API against ClickHouse (needs the stack; t
 
 Disk: the root disk dropped to 9.0 GB free during the last combined run (under the 10 GB line you set); I stopped cargo after it finished. The shared target dir is 7.7 GB before these runs.
 
+### BI-17 B QA fix F1/F2 (developer, branch `feat/bi-phase-6`)
+
+Commits: `1ad9c43c` (F1), `24159b24` (F2). TypeScript only.
+
+**F1, the forecast on "Visitors over time (BI-9 QA)".** Read-only check on the dev ClickHouse: `serving.mart_demo_map_points` has 237 rows on **153 distinct days** between 2025-09-03 and 2026-11-12, a span of **436 days** (the last row is after today, 2026-10-24). So 65 % of the days have no row.
+- Cause of the message: the last row's period is unfinished (it ends after now) and was dropped; the day before it has no row, so the new last period was empty and the rule "the latest period has no value" refused. The latest period is now the last period that has a value (empty periods at either end are trimmed and noted under the chart), not "now" and not the end of the range. Gaps inside keep the 10 % rule.
+- On this chart the true reason for a refusal is the gap rule, and the sentence now says it: "N of the M periods from the first to the last have no data, more than 10 %, so a forecast would be guessing. Group the dates by a coarser period (for example month) to forecast this chart." (the hint only for minute, hour, day, week).
+- **Which chart a forecast works on:** the same chart at **month** grain (about 15 monthly buckets, the last one unfinished and left out; fewer than 24, so no seasons: level or level and trend). Tested on a series shaped like it (153 daily rows over 14 months, last row after `now`): daily is refused with the gap sentence, the same data by month forecasts, and a dense daily series that ends on an empty day forecasts from its last day with data. Not run against the live chart.
+- Drawing follows the last used row: the forecast sits on the next period's category when the axis already has it (the unfinished row), else after all rows; a leftover test that depended on the old rule was updated.
+
+**F2, scatter without a Y metric.** Not caused by BI-17 B: the same lines are on `feat/bi-phase-4` and `origin/main` (`onSourceChange` and `reset` put back one blank measure row, introduced with the SQL sources, `2a99998b`). The effect that sets the number of measure rows to what the kind takes only re-ran when the kind's limits changed, so choosing Scatter first and the data source after left one row. It now also runs when the row count changes (this also covers bubble, combo and stacked). Component tests: scatter and bubble show X, Y (and Size) when the kind is picked after the source and before it. The server requires a size for a bubble chart (`store.rs`: "needs 3 measures (X, Y, size)"), so the size stays required for bubble; "optional size" would be a Rust change.
+
+**Demo scatter on `mart_demo_map_points`** (columns: place, kab_kota, provinsi, lat, lon, visitors, category, visit_date): the only numbers are `lat`, `lon` and `visitors`. A sensible clusters demo is a scatter with dimension `place`, X = lon (avg), Y = lat (avg): the places fall into geographic groups; a bubble adds `visitors` (sum) as the size. There are 237 rows for fewer places, so check the number of places first (clusters need at least 6 points).
+
+Checks: `bun run typecheck` exit 0; `bun run lint` 0 errors, 9 warnings; `bun run test` 2519 pass, 1 skip, 0 fail (258 files).
+
 ## 8. Review (planner appends)
