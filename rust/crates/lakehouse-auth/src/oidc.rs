@@ -738,7 +738,7 @@ mod tests {
             name: None,
             extra: HashMap::new(),
         };
-        assert!(claims.groups("groups").is_empty());
+        assert_eq!(claims.groups("groups"), [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -752,6 +752,6 @@ mod tests {
                 Value::String("not-an-array".to_owned()),
             )]),
         };
-        assert!(claims.groups("groups").is_empty());
+        assert_eq!(claims.groups("groups"), [] as [std::string::String; 0]);
     }
 }
