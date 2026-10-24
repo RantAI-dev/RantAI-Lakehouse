@@ -81,7 +81,10 @@ async fn an_expired_link_is_not_returned_by_the_live_lookup_but_is_still_listed_
             .unwrap()
             .is_none()
     );
-    assert!(live_tokens(&pool).await.unwrap().is_empty());
+    assert_eq!(
+        live_tokens(&pool).await.unwrap(),
+        [] as [(String, String); 0]
+    );
     assert!(
         get_for_board(&pool, "b_1").await.unwrap().is_some(),
         "the Share dialog can still say it has expired"
