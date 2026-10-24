@@ -55,7 +55,7 @@ mod token;
 pub use authenticator::Authenticator;
 pub use credential::Credential;
 pub use error::AuthError;
-pub use oidc::{OidcAuthenticator, OidcConfig};
+pub use oidc::{OidcAuthenticator, OidcConfig, OidcLogin, SignInNotice};
 pub use password::LocalPasswordAuthenticator;
 pub use permissions::PermissionSet;
 pub use principal::{Principal, PrincipalId};

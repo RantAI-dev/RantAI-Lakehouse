@@ -114,4 +114,28 @@ describe("QueryStudioPage Stop (BI-5)", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Stop" }))
     expect(signal?.aborted).toBe(true)
   })
+
+  it("sends each Run all statement its own id, and Stop cancels the one in flight and leaves the rest not run", async () => {
+    stubNetwork()
+    const seen: Array<{ runId?: string; signal?: AbortSignal }> = []
+    spyOn(queryService, "run").mockImplementation(((_s: string, options: { runId?: string }, signal?: AbortSignal) => {
+      seen.push({ runId: options.runId, signal })
+      return new Promise(() => {})
+    }) as never)
+    const cancel = spyOn(queryService, "cancel").mockResolvedValue({ stopped: 1 })
+    seedDraft("SELECT 1;\nSELECT 2;")
+    renderPage()
+
+    const runButton = await screen.findByRole("button", { name: "Run all" })
+    await waitFor(() => expect((runButton as HTMLButtonElement).disabled).toBe(false))
+    fireEvent.click(runButton)
+    fireEvent.click(await screen.findByRole("button", { name: "Stop" }))
+
+    // The first statement was the one in flight; the second never started.
+    expect(seen.length).toBe(1)
+    expect(cancel).toHaveBeenCalledTimes(1)
+    expect(cancel.mock.calls[0][0]).toBe(seen[0].runId as string)
+    expect(seen[0].signal?.aborted).toBe(true)
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Stop" })).toBeNull())
+  })
 })

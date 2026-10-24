@@ -11,6 +11,7 @@ import { CopilotSidebar } from "@/features/copilot/copilot-sidebar";
 import { CopilotProvider } from "@/features/copilot/use-copilot";
 import { CommandPalette } from "@/components/command-palette";
 import { isPublicPath, useAuth } from "@/features/auth/auth-provider";
+import { SsoNotice } from "@/features/auth/sso-notice";
 import { AppShellSkeleton } from "@/components/app-shell/app-shell-skeleton";
 
 /**
@@ -70,6 +71,15 @@ function AuthenticatedFrame({ children }: Readonly<{ children: React.ReactNode }
               !dockHiddenOn(pathname) && "pb-24 sm:pb-24 lg:pb-28",
             )}
           >
+            {/* `SEC-39`: the SSO callback redirects into the console with
+                a notice code in the query when the sign-in succeeded with
+                a caveat (a group overage on Entra ID). Mounted once here
+                so every landing page shows it; `useSearchParams` needs the
+                boundary even though this whole tree is a client
+                component. */}
+            <React.Suspense fallback={null}>
+              <SsoNotice />
+            </React.Suspense>
             {children}
           </main>
           <CopilotSidebar />

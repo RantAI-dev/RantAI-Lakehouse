@@ -319,3 +319,14 @@ Read-only review against the plan, the feature page and the handoff. Checked fin
   - Rename the audit helper call, or comment on it.
 
 **Decisions accepted:** filter modes in `origins_json` (no migration); a chart token has no editable filters and gets 403 from the values route; editable filters must be saved filters (with R1); the single-choice dropdown for `in` filters (with R3); a single chart sends no height messages (with R5).
+
+### Owner's browser QA, 2026-10-24
+
+Passed:
+- Turning signed embedding on.
+- One chart with its picker, and its preview.
+- The dark look with our name hidden.
+- An editable `provinsi` filter, which shows a value picker in the preview.
+- The settings are kept after reopening.
+
+BI-26 QA passed.

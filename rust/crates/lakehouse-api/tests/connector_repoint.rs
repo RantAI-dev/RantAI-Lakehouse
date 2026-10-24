@@ -221,6 +221,59 @@ async fn seed_legacy(pool: &PgPool, id: &str) {
     .expect("seed a legacy connector");
 }
 
+/// A `files` connector: since `SRC-6` it dials `dial.endpoint` (null here:
+/// public S3) and `dial.bucket`, never its `host` column — the column is a
+/// label (`SEC-25` (b)).
+async fn seed_files(pool: &PgPool, id: &str) {
+    sqlx::query(
+        "INSERT INTO connector (id, tenant_id, name, type, direction, host, secret_ref, \
+         secret_ref_secondary, environment, tenant, adapter, ingest_mode, dial) VALUES ($1, $2, \
+         'repoint files', 'Object storage', 'source', 'rustfs:9000', \
+         'env:CONNECTOR_S3_ACCESS_KEY', 'env:CONNECTOR_S3_SECRET_KEY', 'production', \
+         'meridian', 'files', 'batch', $3)",
+    )
+    .bind(id)
+    .bind(MERIDIAN_GROUP.parse::<uuid::Uuid>().unwrap())
+    .bind(json!({
+        "protocol": "s3", "bucket": "lakehouse-warehouse", "format": "csv",
+    }))
+    .execute(pool)
+    .await
+    .expect("seed a files connector");
+}
+
+fn kafka_spec(auth: &Value, bootstrap: &str) -> Value {
+    json!({
+        "adapter": "kafka",
+        "ingestMode": "stream",
+        "dial": {
+            "bootstrapServers": [bootstrap],
+            "topic": "events",
+            "auth": auth,
+            "groupId": "lakehouse",
+            "microBatchSeconds": 30,
+        },
+        "sourceObjects": [],
+    })
+}
+
+/// A `kafka` connector of Meridian Group with the given auth shape and
+/// bootstrap broker.
+async fn seed_kafka(pool: &PgPool, id: &str, spec: &Value) {
+    sqlx::query(
+        "INSERT INTO connector (id, tenant_id, name, type, direction, host, secret_ref, \
+         environment, tenant, adapter, ingest_mode, dial) VALUES ($1, $2, 'repoint kafka', \
+         'Kafka', 'source', 'unused', 'env:CONNECTOR_KAFKA_PASSWORD', 'production', \
+         'meridian', 'kafka', 'stream', $3)",
+    )
+    .bind(id)
+    .bind(MERIDIAN_GROUP.parse::<uuid::Uuid>().unwrap())
+    .bind(spec["dial"].clone())
+    .execute(pool)
+    .await
+    .expect("seed a kafka connector");
+}
+
 async fn dial_of(pool: &PgPool, id: &str) -> Value {
     sqlx::query_scalar("SELECT dial FROM connector WHERE id = $1")
         .bind(id)
@@ -600,6 +653,64 @@ async fn a_credential_request_with_a_re_pointing_dial_needs_every_slot() {
     assert_eq!(stored_files(&fx), 0);
 }
 
+// ── A dial that reads no credential (`SEC-25` a) ─────────────────────────
+
+/// `SEC-25` (a): Kafka with auth `none` reads zero credential slots
+/// (`secret_field_names("kafka", Some("none"))` is empty), so a re-point has
+/// no secret that could reach the new broker and must be allowed without
+/// one. It used to be impossible to move: 409 without a credential, and 400
+/// ("this connection signs in with no credential, so there is none to send")
+/// with one.
+#[tokio::test]
+async fn a_kafka_connector_with_no_authentication_is_re_pointed_without_a_credential() {
+    let fx = fixture(true).await;
+    let none = json!({ "type": "none" });
+    seed_kafka(
+        &fx.app.pool,
+        "conn-sec25-kafka-none",
+        &kafka_spec(&none, "broker-a:9092"),
+    )
+    .await;
+
+    let (status, body) = put_spec(
+        &fx,
+        "conn-sec25-kafka-none",
+        kafka_spec(&none, "broker-b:9093"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        dial_of(&fx.app.pool, "conn-sec25-kafka-none").await["bootstrapServers"],
+        json!(["broker-b:9093"])
+    );
+}
+
+/// The other half: a Kafka connector that DOES sign in (SASL/PLAIN reads one
+/// slot) still needs that credential in the re-point request, or the stored
+/// password would travel to the new broker.
+#[tokio::test]
+async fn a_kafka_connector_with_sasl_still_needs_its_credential_to_re_point() {
+    let fx = fixture(true).await;
+    let sasl = json!({ "type": "sasl_plain", "username": "lakehouse" });
+    seed_kafka(
+        &fx.app.pool,
+        "conn-sec25-kafka-sasl",
+        &kafka_spec(&sasl, "broker-a:9092"),
+    )
+    .await;
+    let before = dial_of(&fx.app.pool, "conn-sec25-kafka-sasl").await;
+
+    let (status, body) = put_spec(
+        &fx,
+        "conn-sec25-kafka-sasl",
+        kafka_spec(&sasl, "broker-b:9093"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"], REPOINT_REFUSAL);
+    assert_eq!(dial_of(&fx.app.pool, "conn-sec25-kafka-sasl").await, before);
+}
+
 // ── PATCH host ───────────────────────────────────────────────────────────
 
 /// `PATCH` `host` on a connector that dials from that column (one with no
@@ -646,6 +757,26 @@ async fn patching_the_host_of_a_connector_that_dials_from_it_is_refused() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
+
+    // `SEC-25` (b): a `files` row is the same — since `SRC-6` its target is
+    // `dial.protocol`/`dial.endpoint`/`dial.bucket`, so changing the `host`
+    // column sends its stored S3 keys nowhere. The old rule refused it and
+    // protected nothing.
+    seed_files(&fx.app.pool, "conn-sec25-files").await;
+    let (status, body) = send(
+        &fx,
+        "PATCH",
+        "/api/connectors/conn-sec25-files",
+        Some(json!({ "host": "another-object-store:9000" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let host: String = sqlx::query_scalar("SELECT host FROM connector WHERE id = $1")
+        .bind("conn-sec25-files")
+        .fetch_one(&fx.app.pool)
+        .await
+        .unwrap();
+    assert_eq!(host, "another-object-store:9000");
 }
 
 // ── The assistant ────────────────────────────────────────────────────────

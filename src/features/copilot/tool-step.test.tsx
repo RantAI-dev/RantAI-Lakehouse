@@ -88,17 +88,19 @@ describe("ToolStepCard export links (BI-1, AI-10)", () => {
     expect(toolLabel("delete_report_subscription")).toBe("Delete scheduled report")
   })
 
-  it("renders a download link to the console's own PDF route", () => {
-    render(<ToolStepCard step={step("export_dashboard", { url: "/api/dashboard/export/pdf?board=b1&paper=a4&orientation=portrait", fileName: "Sales-2026-10-17.pdf" })} />)
-    fireEvent.click(screen.getByRole("button"))
+  // BI-1 QA fix A1: the Download button is on the card itself, collapsed or not,
+  // and its address is the tool result's own `url`.
+  it("shows a Download button on the collapsed card, built from the tool result's url", () => {
+    render(<ToolStepCard step={{ tool: "export_dashboard", args: { board: "b1", url: "/api/dashboard/export/pdf?evil=1" }, ok: true, result: { url: "/api/dashboard/export/pdf?board=b1&paper=a4&orientation=portrait", fileName: "Sales-2026-10-17.pdf" } }} />)
     const link = screen.getByRole("link", { name: /Download Sales-2026-10-17\.pdf/ }) as HTMLAnchorElement
     expect(link.getAttribute("href")).toBe("/api/dashboard/export/pdf?board=b1&paper=a4&orientation=portrait")
     expect(link.hasAttribute("download")).toBe(true)
+    // The details stay collapsed.
+    expect(screen.getByRole("button").getAttribute("aria-expanded")).toBe("false")
   })
 
-  it("renders a download link for a chart's data", () => {
+  it("renders a download button for a chart's data", () => {
     render(<ToolStepCard step={step("export_chart", { url: "/api/dashboard/chart-export?chart=c1&format=xlsx&values=raw", fileName: "Visits.xlsx" })} />)
-    fireEvent.click(screen.getByRole("button"))
     expect((screen.getByRole("link") as HTMLAnchorElement).getAttribute("href")).toContain("/api/dashboard/chart-export?chart=c1")
   })
 
