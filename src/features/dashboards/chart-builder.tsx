@@ -71,7 +71,8 @@ import {
 } from "@/lib/time-grain";
 import { cn } from "@/lib/utils";
 import { MapPicker } from "./map-picker";
-import { DEFAULT_CHOROPLETH_MAP, DEFAULT_POINT_MAP, MAP_CATALOGUE, mapCredit } from "./echarts-maps";
+import { DEFAULT_CHOROPLETH_MAP, DEFAULT_POINT_MAP, mapCredit } from "./echarts-maps";
+import { useMapCatalogue } from "./use-map-catalogue";
 import { SqlRowsTable, SqlSourcePanel } from "./sql-source-panel";
 import { selectedMart, type Mart } from "./mart-marks";
 import { JoinsSection, type JoinTableInfo } from "./joins-section";
@@ -234,7 +235,6 @@ function withCalculated(base: Fields, columns: string[], calculated: CalcField[]
 /** Map id → label for the base-ui select (see KIND_LABELS). */
 const NO_LABEL_ITEMS: Record<string, string> = { [NO_BREAKDOWN]: "— no label —" };
 const SPAN_LABELS: Record<string, string> = { "1": "Half width", "2": "Full width" };
-const MAP_LABELS: Record<string, string> = Object.fromEntries(MAP_CATALOGUE.map((m) => [m.id, m.label]));
 /** Whether the viewport is at least `px` wide; false on the server. */
 function useMinWidth(px: number): boolean {
   const query = `(min-width: ${px}px)`;
@@ -482,6 +482,9 @@ export function ChartBuilder({
   const isBullet = kind === "bullet";
   // BI-16 part C1 (plan D1): the task is the dimension, the group the breakdown, the start, end and progress columns are the type draft's.
   const isGantt = kind === "gantt";
+  // BI-16 C2b: the bundled maps and the uploaded ones, by name.
+  const mapCatalogue = useMapCatalogue();
+  const mapLabels = React.useMemo<Record<string, string>>(() => Object.fromEntries(mapCatalogue.map((m) => [m.id, m.label])), [mapCatalogue]);
   const isSingle = isKpi || isGauge || isProgress;         // no dimension (single number)
   const isHeatmap = kind === "heatmap";
   // Kinds drawn from the breakdown shape (x, series, value): a 2nd
@@ -957,7 +960,7 @@ export function ChartBuilder({
     groupings: shape.groupings.map((g) => g.column), rowColumns: tableDraft.columns,
     pivot: { rows: tableDraft.pivotRows, columns: tableDraft.pivotColumns, values: tableDraft.pivotValues.filter((v) => v.column).map((v) => v.column) },
     measures: measureRows.filter((r) => r.column).map((r) => measureLabel(limits.own ? r : { ...r, aggregate: "" }, wholeMeasure, aggregate)),
-    mapLabel: isMap ? MAP_LABELS[effectiveMap] ?? "" : "", lat, lon,
+    mapLabel: isMap ? mapLabels[effectiveMap] ?? "" : "", lat, lon,
     sort: rules.sort === "choice" ? sortLabels[shape.sortChoice] ?? "" : rules.sort === "by-date" ? "by date" : rules.sort === "by-category" ? "by category" : "",
     limit: rules.limit ? (limitParamName ? "param" : Math.min(limit, maxLimit)) : null,
     filters: rules.filters ? shape.filters.length : 0, other: shape.other && rules.other.shown,
@@ -1398,7 +1401,7 @@ export function ChartBuilder({
             <div className="grid gap-1.5">
               <Label>Map</Label>
               {/* BI-16 C2a follow-up (planner, picker search): about 250 maps need a search. */}
-              <MapPicker maps={MAP_CATALOGUE} value={effectiveMap} onChange={setMapId} />
+              <MapPicker maps={mapCatalogue} value={effectiveMap} onChange={setMapId} />
               {mapCredit(effectiveMap) ? <p className="text-xs text-muted-foreground">{mapCredit(effectiveMap)}</p> : null}
               {isChoropleth ? (
                 <p className="text-xs text-muted-foreground">The region column is matched to the map by name; rows that match no region are counted under the map.</p>

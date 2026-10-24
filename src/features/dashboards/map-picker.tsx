@@ -22,7 +22,8 @@ export function MapPicker({ maps, value, onChange }: {
 }) {
   const [open, setOpen] = React.useState(false);
   const pinned = PINNED_IDS.flatMap((id) => maps.find((m) => m.id === id) ?? []);
-  const rest = maps.filter((m) => !PINNED_IDS.includes(m.id));
+  const rest = maps.filter((m) => !PINNED_IDS.includes(m.id) && !m.uploaded);
+  const uploaded = maps.filter((m) => m.uploaded);
   const current = maps.find((m) => m.id === value);
 
   const item = (m: MapEntry) => (
@@ -45,6 +46,7 @@ export function MapPicker({ maps, value, onChange }: {
           <CommandInput placeholder="Search maps" aria-label="Search maps" />
           <CommandList>
             <CommandEmpty>No map matches.</CommandEmpty>
+            {uploaded.length > 0 ? <CommandGroup heading="Uploaded by your administrator">{uploaded.map(item)}</CommandGroup> : null}
             <CommandGroup heading="Indonesia">{pinned.map(item)}</CommandGroup>
             <CommandGroup heading="World and countries">{rest.map(item)}</CommandGroup>
           </CommandList>

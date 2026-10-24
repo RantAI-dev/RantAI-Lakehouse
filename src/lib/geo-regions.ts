@@ -18,7 +18,7 @@
  * kabupaten/kota, countries of the world map, or the states/provinces of a
  * country map (BI-16 C2a, decision D4).
  */
-export type RegionLevel = "city" | "province" | "regency" | "country" | "subdivision"
+export type RegionLevel = "city" | "province" | "regency" | "country" | "subdivision" | "uploaded"
 
 export type RegionValue = { name: string; value: number }
 
@@ -117,7 +117,8 @@ function candidate(raw: string, level: RegionLevel): string {
   if (level === "city") return plain(normalizeJakartaArea(raw))
   const s = plain(raw)
   if (level === "country") return COUNTRY_ALIASES[s] ?? s
-  if (level === "subdivision") return s
+  // An uploaded map (BI-16 C2b) has the names its owner chose: matched as they are, ignoring case, accents and spacing.
+  if (level === "subdivision" || level === "uploaded") return s
   if (level === "province") {
     const bare = s.replace(PROVINCE_PREFIX, "")
     return PROVINCE_ALIASES[bare] ?? bare
