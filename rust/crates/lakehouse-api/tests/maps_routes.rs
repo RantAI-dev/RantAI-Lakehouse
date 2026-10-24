@@ -16,7 +16,14 @@ use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
-use common::{TestApp, create_principal_with_permissions, session_cookie_for_user, spin_up};
+use std::collections::HashMap;
+
+use wiremock::matchers::{body_string_contains, method};
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
+use common::{
+    TestApp, create_principal_with_permissions, session_cookie_for_user, spin_up, spin_up_with_env,
+};
 
 const FILE: &str = r#"{"type":"FeatureCollection","features":[
  {"type":"Feature","properties":{"NAME":"North"},"geometry":{"type":"Polygon","coordinates":[[[0,0],[1,0],[1,1],[0,1],[0,0]]]}},
@@ -314,4 +321,168 @@ async fn a_delete_that_cannot_check_the_charts_fails_closed_and_keeps_the_map() 
     assert!(!reply.status.is_success(), "{}", reply.status);
     let listed = send(&app, &cookie, "GET", "/api/maps", None, &[]).await;
     assert_eq!(listed.json()["maps"].as_array().unwrap().len(), 1);
+}
+
+// ── the region lookup on a mock engine (`BI-16` C3 review S5 a, S3) ──────
+
+/// An app whose engine is a mock that answers every statement with an empty
+/// result, except the ones a test mounts first.
+async fn with_engine() -> (TestApp, MockServer) {
+    let engine = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({ "meta": [], "data": [], "rows": 0 })),
+        )
+        .mount(&engine)
+        .await;
+    let env = HashMap::from([("CH_URL".to_owned(), engine.uri())]);
+    (spin_up_with_env(&env).await, engine)
+}
+
+async fn statements(engine: &MockServer) -> Vec<String> {
+    engine
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+        .collect()
+}
+
+fn position(sent: &[String], needle: &str) -> usize {
+    sent.iter()
+        .position(|s| s.contains(needle))
+        .unwrap_or_else(|| panic!("no statement contains {needle:?}: {sent:?}"))
+}
+
+async fn region_lookup_of(app: &TestApp, id: &str) -> Option<bool> {
+    sqlx::query_scalar("SELECT region_lookup FROM geo_map WHERE id = $1")
+        .bind(id)
+        .fetch_optional(&app.pool)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn an_upload_creates_the_region_lookup_in_order_and_a_delete_drops_it() {
+    let (app, engine) = with_engine().await;
+    let cookie = admin(&app).await;
+    let made = upload(&app, &cookie, "Sales regions").await;
+    assert_eq!(made.status, StatusCode::CREATED);
+    let id = made.json()["id"].as_str().unwrap().to_owned();
+    let sent = statements(&engine).await;
+    let order = [
+        position(&sent, "CREATE TABLE IF NOT EXISTS console.geo_region"),
+        position(&sent, "INSERT INTO console.geo_region"),
+        position(
+            &sent,
+            &format!("CREATE DICTIONARY IF NOT EXISTS console.geo_dict_{id}"),
+        ),
+        position(
+            &sent,
+            &format!("SYSTEM RELOAD DICTIONARY console.geo_dict_{id}"),
+        ),
+    ];
+    assert!(order.windows(2).all(|w| w[0] < w[1]), "{order:?}");
+    // The full boundaries, both regions, and the dictionary reads as the engine user.
+    assert!(sent[order[1]].contains("North") && sent[order[1]].contains("South"));
+    assert!(
+        sent[order[2]].contains("USER 'default' PASSWORD '' QUERY"),
+        "{}",
+        sent[order[2]]
+    );
+    assert_eq!(region_lookup_of(&app, &id).await, Some(true));
+
+    let gone = send(
+        &app,
+        &cookie,
+        "DELETE",
+        &format!("/api/maps/{id}"),
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(gone.status, StatusCode::OK);
+    let sent = statements(&engine).await;
+    position(
+        &sent,
+        &format!("DROP DICTIONARY IF EXISTS console.geo_dict_{id}"),
+    );
+    position(
+        &sent,
+        &format!("ALTER TABLE console.geo_region DELETE WHERE map_id = '{id}'"),
+    );
+    assert_eq!(region_lookup_of(&app, &id).await, None);
+}
+
+#[tokio::test]
+async fn an_engine_that_refuses_the_dictionary_still_gives_201_with_the_lookup_off_and_undone() {
+    let (app, engine) = with_engine().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("CREATE DICTIONARY"))
+        .respond_with(
+            ResponseTemplate::new(500).set_body_string("Code: 36. DB::Exception: refused"),
+        )
+        .with_priority(1)
+        .mount(&engine)
+        .await;
+    let cookie = admin(&app).await;
+    let made = upload(&app, &cookie, "Sales regions").await;
+    assert_eq!(made.status, StatusCode::CREATED);
+    // Upstream text never reaches the caller (SEC-11).
+    assert!(!String::from_utf8_lossy(&made.body).contains("DB::Exception"));
+    let id = made.json()["id"].as_str().unwrap().to_owned();
+    assert_eq!(region_lookup_of(&app, &id).await, Some(false));
+    let sent = statements(&engine).await;
+    position(
+        &sent,
+        &format!("DROP DICTIONARY IF EXISTS console.geo_dict_{id}"),
+    );
+    position(
+        &sent,
+        &format!("ALTER TABLE console.geo_region DELETE WHERE map_id = '{id}'"),
+    );
+}
+
+#[tokio::test]
+async fn a_calculated_field_that_names_the_map_blocks_its_delete_by_id_or_by_name() {
+    // BI-16 C3 review S3.
+    for formula in [
+        "RegionOf('Sales regions', lat, lon)",
+        "RegionOf('{id}', lat, lon)",
+    ] {
+        let (app, engine) = with_engine().await;
+        let cookie = admin(&app).await;
+        let id = upload(&app, &cookie, "Sales regions").await.json()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let row = json!({
+            "id": "f_00000001", "source_kind": "mart", "source_id": "mart_visits",
+            "name": "region", "formula": formula.replace("{id}", &id), "level": "row",
+            "data_type": "text", "created_by": "", "updated_at": "2026-10-01 10:00:00",
+        });
+        Mock::given(method("POST"))
+            .and(body_string_contains("FROM console.bi_field"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "meta": [], "data": [row], "rows": 1 })),
+            )
+            .with_priority(1)
+            .mount(&engine)
+            .await;
+        let reply = send(
+            &app,
+            &cookie,
+            "DELETE",
+            &format!("/api/maps/{id}"),
+            None,
+            &[],
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::CONFLICT, "{formula}");
+        assert_eq!(reply.json()["fields"], json!(["region"]));
+        assert!(reply.json()["error"].as_str().unwrap().contains("RegionOf"));
+        assert_eq!(region_lookup_of(&app, &id).await, Some(true));
+    }
 }

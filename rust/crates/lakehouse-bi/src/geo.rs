@@ -305,20 +305,49 @@ pub const REGION_TABLE_DDL: &str = "CREATE TABLE IF NOT EXISTS console.geo_regio
 (map_id String, name String, polygon Array(Array(Array(Tuple(Float64, Float64))))) \
 ENGINE = MergeTree ORDER BY (map_id, name)";
 
+/// A `ClickHouse` string literal: backslash and quote escaped, so a user name
+/// or password cannot leave the literal.
+fn string_literal(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('\'');
+    for c in text.chars() {
+        if matches!(c, '\\' | '\'') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('\'');
+    out
+}
+
 /// The statement that creates a map's polygon dictionary, or `None` for an
-/// `id` that is not server-made (the id is the only thing put in the text).
+/// `id` that is not server-made (the id is the only thing put in the text
+/// besides the credentials).
 ///
-/// *Not verified on a running engine*: written from the `ClickHouse`
-/// documentation for polygon dictionaries (key `Array(Array(Array(Array(
-/// Float64))))`, `LAYOUT(POLYGON())`, a `CLICKHOUSE` source with a `QUERY`),
-/// and the caller treats any failure as "no lookup for this map".
+/// The dictionary reads `console.geo_region` through a local `CLICKHOUSE`
+/// source, which connects as the `default` user unless told otherwise, so on a
+/// stack where `default` has a password the dictionary could not load
+/// (BI-16 C3 review S1). `user` and `password` are the API's own
+/// (`CH_USER`/`CH_PASSWORD`), written as escaped literals. Measured on
+/// `ClickHouse` 26.8.9.10 (`docs/plans/BI-16C-RESULT.md`): the password is
+/// shown as `[HIDDEN]` by `SHOW CREATE DICTIONARY`, `system.dictionaries` and
+/// `system.tables` and is masked in `system.query_log`, but it is stored in
+/// clear in the engine's own metadata file, which stays on the engine's volume
+/// and goes with the dictionary when its map is deleted.
+///
+/// The key is `Array(Array(Array(Tuple(Float64, Float64))))`, the type of
+/// [`REGION_TABLE_DDL`]'s `polygon` column: the engine refuses the
+/// `Array(Array(Array(Array(Float64))))` of its documentation against a
+/// `Tuple` column (BI-16 C3 review S2, measured).
 #[must_use]
-pub fn dictionary_ddl(id: &str) -> Option<String> {
+pub fn dictionary_ddl(id: &str, user: &str, password: &str) -> Option<String> {
     let name = dictionary_name(id)?;
+    let user = string_literal(user);
+    let password = string_literal(password);
     Some(format!(
-        "CREATE DICTIONARY IF NOT EXISTS {name} (key Array(Array(Array(Array(Float64)))), name String) \
+        "CREATE DICTIONARY IF NOT EXISTS {name} (key Array(Array(Array(Tuple(Float64, Float64)))), name String) \
          PRIMARY KEY key \
-         SOURCE(CLICKHOUSE(QUERY 'SELECT polygon AS key, name FROM console.geo_region WHERE map_id = ''{id}''')) \
+         SOURCE(CLICKHOUSE(USER {user} PASSWORD {password} QUERY 'SELECT polygon AS key, name FROM console.geo_region WHERE map_id = ''{id}''')) \
          LAYOUT(POLYGON()) LIFETIME(0)"
     ))
 }
@@ -740,9 +769,24 @@ mod tests {
     }
 
     #[test]
+    fn the_dictionary_reads_as_the_given_user_with_an_escaped_password_and_the_tables_key_type() {
+        // BI-16 C3 review S1 and S2.
+        let ddl = dictionary_ddl("m_0123456789ab", "api", "a'b\\c").unwrap();
+        assert!(
+            ddl.contains(r"USER 'api' PASSWORD 'a\'b\\c' QUERY"),
+            "{ddl}"
+        );
+        assert!(
+            ddl.contains("(key Array(Array(Array(Tuple(Float64, Float64)))), name String)"),
+            "{ddl}"
+        );
+        assert!(REGION_TABLE_DDL.contains("polygon Array(Array(Array(Tuple(Float64, Float64))))"));
+    }
+
+    #[test]
     fn the_engine_statements_are_built_from_a_server_made_id_only() {
         let id = "m_0123456789ab";
-        let ddl = dictionary_ddl(id).unwrap();
+        let ddl = dictionary_ddl(id, "default", "").unwrap();
         assert!(
             ddl.starts_with("CREATE DICTIONARY IF NOT EXISTS console.geo_dict_m_0123456789ab "),
             "{ddl}"
@@ -774,7 +818,7 @@ mod tests {
             "x_0123456789ab",
         ] {
             assert!(
-                dictionary_ddl(bad).is_none() && drop_dictionary_sql(bad).is_none(),
+                dictionary_ddl(bad, "default", "").is_none() && drop_dictionary_sql(bad).is_none(),
                 "{bad}"
             );
             assert!(

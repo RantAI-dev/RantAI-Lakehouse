@@ -50,9 +50,11 @@ async fn a_map_round_trips_and_a_name_is_unique_ignoring_case(pool: PgPool) {
     assert_eq!(stored.etag.len(), 32);
     // The region lookup is off until the engine has it (migration 0102).
     assert!(!made.region_lookup);
-    geo_map::set_region_lookup(&pool, "m_0123456789ab", true)
-        .await
-        .unwrap();
+    assert!(
+        geo_map::set_region_lookup(&pool, "m_0123456789ab", true)
+            .await
+            .unwrap()
+    );
     assert!(
         get(&pool, "m_0123456789ab")
             .await
@@ -92,5 +94,21 @@ async fn the_table_refuses_an_id_that_is_not_server_made_and_a_file_over_5_mb(po
         insert(&pool, &new("m_0123456789ab", "A", &big))
             .await
             .is_err()
+    );
+}
+
+/// BI-16 C3 review S4: an upload that finishes after its map was deleted must
+/// learn that nothing was updated.
+#[sqlx::test(migrations = "../../migrations")]
+async fn setting_the_region_lookup_of_a_deleted_map_says_nothing_was_updated(pool: PgPool) {
+    let file = br#"{"type":"FeatureCollection","features":[]}"#;
+    insert(&pool, &new("m_0123456789ab", "Sales regions", file))
+        .await
+        .unwrap();
+    assert!(delete(&pool, "m_0123456789ab").await.unwrap());
+    assert!(
+        !geo_map::set_region_lookup(&pool, "m_0123456789ab", true)
+            .await
+            .unwrap()
     );
 }

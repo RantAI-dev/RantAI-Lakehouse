@@ -129,18 +129,21 @@ pub async fn rename(pool: &PgPool, id: &str, name: &str) -> Result<Option<GeoMap
         .await?)
 }
 
-/// Record whether the map's region lookup exists on the engine.
+/// Record whether the map's region lookup exists on the engine; whether a row
+/// was updated. `false` means the map is gone (deleted while its upload was
+/// still setting the lookup up), so the caller must remove what it created
+/// (`BI-16` C3 review S4).
 ///
 /// # Errors
 ///
 /// [`StoreError::Database`] on a database failure.
-pub async fn set_region_lookup(pool: &PgPool, id: &str, ready: bool) -> Result<(), StoreError> {
-    sqlx::query("UPDATE geo_map SET region_lookup = $2 WHERE id = $1")
+pub async fn set_region_lookup(pool: &PgPool, id: &str, ready: bool) -> Result<bool, StoreError> {
+    let done = sqlx::query("UPDATE geo_map SET region_lookup = $2 WHERE id = $1")
         .bind(id)
         .bind(ready)
         .execute(pool)
         .await?;
-    Ok(())
+    Ok(done.rows_affected() > 0)
 }
 
 /// Delete a map; whether a row was removed.

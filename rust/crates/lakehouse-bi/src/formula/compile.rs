@@ -367,6 +367,41 @@ pub fn params_in(formula: &str) -> BTreeSet<String> {
     out
 }
 
+/// The maps a formula's `RegionOf` calls name (the text of the first argument,
+/// an id or a name), by syntax alone: what the delete-in-use rule of a map needs
+/// (`BI-16` C3 review S3). A formula that does not parse names none.
+#[must_use]
+pub fn region_maps_in(formula: &str) -> BTreeSet<String> {
+    fn walk(n: &Node, out: &mut BTreeSet<String>) {
+        match &n.kind {
+            Kind::Call { name, args } => {
+                if name.eq_ignore_ascii_case("RegionOf")
+                    && let Some(Node {
+                        kind: Kind::Str(map),
+                        ..
+                    }) = args.first()
+                {
+                    out.insert(map.trim().to_owned());
+                }
+                for a in args {
+                    walk(a, out);
+                }
+            }
+            Kind::Neg(a) | Kind::Not(a) => walk(a, out),
+            Kind::Bin(_, l, r) => {
+                walk(l, out);
+                walk(r, out);
+            }
+            Kind::Num(_) | Kind::Str(_) | Kind::Bool(_) | Kind::Name(_) | Kind::Param(_) => {}
+        }
+    }
+    let mut out = BTreeSet::new();
+    if let Ok(tree) = parse(formula) {
+        walk(&tree, &mut out);
+    }
+    out
+}
+
 /// A number as SQL, from its parsed value: whole numbers as integers, the rest
 /// through Rust's shortest round-trip form (digits, `.`, `e`, `-`, nothing
 /// else).
@@ -797,9 +832,32 @@ impl Cx<'_> {
                 (&lat2, &nodes[2]),
                 (&lon2, &nodes[3]),
             ])?;
+            // BI-16 C3 review S7: the engine does not refuse out-of-range
+            // coordinates (measured on 26.8.9.10: `geoDistance(200, 100, 0, 0)`
+            // returns 8963269), so a literal outside the range is refused
+            // here and any other value outside it gives NULL, not a number.
+            for (n, limit, what) in [
+                (&nodes[0], 90.0, "latitude"),
+                (&nodes[1], 180.0, "longitude"),
+                (&nodes[2], 90.0, "latitude"),
+                (&nodes[3], 180.0, "longitude"),
+            ] {
+                if let Some(v) = literal_number(n).filter(|v| v.abs() > limit) {
+                    return Err(err(
+                        n,
+                        format!(
+                            "{v} is not a valid {what}; use degrees between -{limit} and {limit}."
+                        ),
+                    ));
+                }
+            }
             let metres = format!(
-                "geoDistance(toFloat64({}), toFloat64({}), toFloat64({}), toFloat64({}))",
-                lon1.sql, lat1.sql, lon2.sql, lat2.sql
+                "if(abs(toFloat64({lat1})) <= 90 AND abs(toFloat64({lat2})) <= 90 AND abs(toFloat64({lon1})) <= 180 AND abs(toFloat64({lon2})) <= 180, \
+                 geoDistance(toFloat64({lon1}), toFloat64({lat1}), toFloat64({lon2}), toFloat64({lat2})), NULL)",
+                lat1 = lat1.sql,
+                lon1 = lon1.sql,
+                lat2 = lat2.sql,
+                lon2 = lon2.sql,
             );
             let sql = if unit == "km" {
                 format!("({metres} / 1000)")
@@ -1339,7 +1397,8 @@ mod tests {
     fn distance_is_geodistance_in_metres_or_km() {
         assert_eq!(
             ok("Distance(amount, qty, -6.9, 107.6)").sql,
-            "geoDistance(toFloat64(qty), toFloat64(amount), toFloat64(107.6), toFloat64((-6.9)))"
+            "if(abs(toFloat64(amount)) <= 90 AND abs(toFloat64((-6.9))) <= 90 AND abs(toFloat64(qty)) <= 180 AND abs(toFloat64(107.6)) <= 180, \
+             geoDistance(toFloat64(qty), toFloat64(amount), toFloat64(107.6), toFloat64((-6.9))), NULL)"
         );
         assert_eq!(
             ok("Distance(1, 2, 3, 4, 'm')").sql,
@@ -1366,6 +1425,46 @@ mod tests {
                 .contains("takes 4 to 5")
         );
         assert!(run("Sum(Distance(amount, qty, 1, 2))").is_ok());
+    }
+
+    /// BI-16 C3 review S7: the engine answers an out-of-range coordinate with
+    /// a number (measured), so a literal outside the range is refused and a
+    /// computed one is guarded.
+    #[test]
+    fn region_maps_in_lists_the_maps_regionof_names() {
+        // BI-16 C3 review S3.
+        let found = region_maps_in(
+            "If(RegionOf(' Sales regions ', a, b) = 'X', RegionOf('m_0123456789ab', a, b), regionof('Other', 1, 2))",
+        );
+        assert_eq!(
+            found.into_iter().collect::<Vec<_>>(),
+            ["Other", "Sales regions", "m_0123456789ab"]
+        );
+        assert!(region_maps_in("Sum(amount)").is_empty());
+        assert!(region_maps_in("RegionOf(").is_empty());
+    }
+
+    #[test]
+    fn distance_refuses_out_of_range_literals_and_guards_the_rest() {
+        for (formula, what) in [
+            ("Distance(91, 0, 0, 0)", "latitude"),
+            ("Distance(0, -181, 0, 0)", "longitude"),
+            ("Distance(0, 0, -90.5, 0)", "latitude"),
+            ("Distance(0, 0, 0, 200)", "longitude"),
+        ] {
+            let message = run(formula).unwrap_err().message;
+            assert!(
+                message.contains(&format!("not a valid {what}")),
+                "{message}"
+            );
+        }
+        assert!(run("Distance(90, 180, -90, -180)").is_ok());
+        let guarded = ok("Distance(amount, qty, 1, 2)").sql;
+        assert!(
+            guarded.starts_with("if(abs(toFloat64(amount)) <= 90"),
+            "{guarded}"
+        );
+        assert!(guarded.ends_with(", NULL)"), "{guarded}");
     }
 
     /// `RegionOf` resolves its map literal against the uploaded maps, and the
@@ -2408,5 +2507,113 @@ mod tests {
             lines.push(format!("-- {src}"));
         }
         std::fs::write(path, lines.join("\n")).unwrap();
+    }
+
+    /// `BI-16` C3 review S5 (b): the live proof of `RegionOf` and `Distance`
+    /// on a real engine, ignored by default (it needs `LIVE_CH_URL`, and
+    /// `LIVE_CH_USER`/`LIVE_CH_PASSWORD` when the user has a password; use a
+    /// THROWAWAY engine, it creates `console.geo_region` and a dictionary and
+    /// drops the dictionary at the end). Run with
+    /// `cargo test -p lakehouse-bi --lib live_region_of -- --ignored`.
+    ///
+    /// The provinces file is the one the console bundles
+    /// (`public/geo/id-provinces.geojson`, 34 provinces). Published figure for
+    /// `Distance`: Soekarno-Hatta airport (CGK, -6.1256, 106.6559) to Husein
+    /// Sastranegara airport (BDO, -6.9006, 107.5763) is 133 km (82.7 mi) by
+    /// Vincenty's formula according to airmilescalculator.com
+    /// (<https://www.airmilescalculator.com/distance/bdo-to-cgk/>); the test
+    /// allows 1 %.
+    #[tokio::test]
+    #[ignore = "needs a throwaway ClickHouse: set LIVE_CH_URL (see the doc comment)"]
+    async fn live_region_of_names_three_provinces_and_distance_matches_a_published_figure() {
+        use lakehouse_clickhouse::ChClient;
+        let url = std::env::var("LIVE_CH_URL").expect("LIVE_CH_URL");
+        let user = std::env::var("LIVE_CH_USER").unwrap_or_else(|_| "default".to_owned());
+        let password = std::env::var("LIVE_CH_PASSWORD").unwrap_or_default();
+        let ch = ChClient::new(url, user.clone(), password.clone());
+        let id = "m_cccccccccccc";
+        let file = include_bytes!("../../../../../public/geo/id-provinces.geojson");
+        let checked = crate::geo::validate(file, "name").unwrap();
+        ch.exec("CREATE DATABASE IF NOT EXISTS console", None)
+            .await
+            .unwrap();
+        ch.exec(crate::geo::REGION_TABLE_DDL, None).await.unwrap();
+        ch.exec(&crate::geo::delete_regions_sql(id).unwrap(), None)
+            .await
+            .unwrap();
+        for insert in checked.region_inserts(id).unwrap() {
+            ch.exec(&insert, None).await.unwrap();
+        }
+        ch.exec(&crate::geo::drop_dictionary_sql(id).unwrap(), None)
+            .await
+            .unwrap();
+        ch.exec(
+            &crate::geo::dictionary_ddl(id, &user, &password).unwrap(),
+            None,
+        )
+        .await
+        .unwrap();
+        ch.exec(&crate::geo::reload_dictionary_sql(id).unwrap(), None)
+            .await
+            .unwrap();
+
+        let cols = sample_columns();
+        let time = TimeContext::default().with_maps(vec![crate::geo::SpatialMap {
+            id: id.to_owned(),
+            name: "Provinces".to_owned(),
+            region_lookup: true,
+        }]);
+        let compile_live = |formula: &str| {
+            compile(formula, &Scope::new(&cols, &time), None)
+                .unwrap_or_else(|e| panic!("{formula}: {e}"))
+                .sql
+        };
+        // amount is the latitude, qty the longitude.
+        let region = compile_live("RegionOf('Provinces', amount, qty)");
+        for (lat, lon, province) in [
+            (-6.2088, 106.8456, "Dki Jakarta"),
+            (-6.9175, 107.6191, "Jawa Barat"),
+            (-8.65, 115.2167, "Bali"),
+        ] {
+            let rows = ch
+                .rows(
+                    &format!("SELECT {region} AS r FROM (SELECT {lat} AS amount, {lon} AS qty)"),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(rows[0]["r"], province, "{lat}, {lon}");
+        }
+        let sea = ch
+            .rows(
+                &format!("SELECT {region} AS r FROM (SELECT -30.0 AS amount, 90.0 AS qty)"),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(sea[0]["r"], "", "a point in the open sea names no province");
+
+        let km = compile_live("Distance(-6.1256, 106.6559, -6.9006, 107.5763, 'km')");
+        let rows = ch.rows(&format!("SELECT {km} AS d"), None).await.unwrap();
+        let measured = rows[0]["d"].as_f64().unwrap();
+        assert!(
+            (measured - 133.0).abs() / 133.0 < 0.01,
+            "{measured} km against the published 133 km"
+        );
+        let bad = compile_live("Distance(amount, qty, 0, 0, 'km')");
+        let rows = ch
+            .rows(
+                &format!("SELECT {bad} AS d FROM (SELECT 200 AS amount, 100 AS qty)"),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(rows[0]["d"].is_null(), "out-of-range input gives NULL");
+        ch.exec(&crate::geo::drop_dictionary_sql(id).unwrap(), None)
+            .await
+            .unwrap();
+        ch.exec(&crate::geo::delete_regions_sql(id).unwrap(), None)
+            .await
+            .unwrap();
     }
 }
