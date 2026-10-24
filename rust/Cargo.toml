@@ -73,10 +73,15 @@ subtle = "2"
 # with NEITHER backend enabled by default; `CryptoProvider::get_default()`
 # panics at runtime ("Could not automatically determine the process-level
 # CryptoProvider...") unless exactly one of `rust_crypto`/`aws_lc_rs` is
-# selected. Chose `rust_crypto` (pure-Rust, no new C dependency) to match
-# every other crypto crate already in this workspace (sha2, hmac, argon2,
-# rand are all RustCrypto-ecosystem).
-jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto", "use_pem"] }
+# selected. Chose `rust_crypto` then (pure-Rust); switched to `aws_lc_rs`
+# for SEC-51, because `rust_crypto` pulls `p256`/`p384` -> `ecdsa` ->
+# `elliptic-curve`, which pins `crypto-bigint` ^0.5, and that version is
+# `RUSTSEC-2026-0387` (timing variability in modular reduction) with no
+# patched 0.5 release. `aws_lc_rs` adds no C dependency here: `aws-lc-rs`
+# is already compiled into this workspace through `object_store`/`rustls`.
+# Exactly one backend must stay selected -- selecting both would link two
+# providers and fail to build.
+jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs", "use_pem"] }
 # `lakehouse-api::next_run` (WS4 item G2) is the first workstream to land
 # this dependency -- WS5 also needs cron-next-occurrence computation and
 # reuses this same entry rather than adding a second one (programme rule:
