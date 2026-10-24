@@ -286,10 +286,19 @@ impl EnvSecretResolver {
             None => std::env::var(key).ok(),
         }
     }
-}
 
-impl SecretResolver for EnvSecretResolver {
-    async fn resolve(&self, secret_ref: &str) -> Result<SecretValue, SecretError> {
+    /// The body of [`SecretResolver::resolve`]. A plain `fn`, not `async fn`:
+    /// the environment lookup never awaits, so `resolve` hands this result to
+    /// `std::future::ready` rather than buying a future that is already
+    /// finished (clippy's `unused_async_trait_impl`, added in clippy 1.98 —
+    /// REL-9).
+    ///
+    /// # Errors
+    ///
+    /// [`SecretError::UnsupportedRef`] for a ref without the `env:` prefix or
+    /// with an empty variable name; [`SecretError::NotFound`] when the
+    /// variable is unset.
+    fn resolve_now(&self, secret_ref: &str) -> Result<SecretValue, SecretError> {
         let Some(var_name) = secret_ref.strip_prefix(ENV_SECRET_REF_PREFIX) else {
             return Err(SecretError::UnsupportedRef {
                 secret_ref: secret_ref.to_owned(),
@@ -308,6 +317,15 @@ impl SecretResolver for EnvSecretResolver {
                 secret_ref: secret_ref.to_owned(),
                 resolver: "env",
             })
+    }
+}
+
+impl SecretResolver for EnvSecretResolver {
+    fn resolve(
+        &self,
+        secret_ref: &str,
+    ) -> impl std::future::Future<Output = Result<SecretValue, SecretError>> + Send {
+        std::future::ready(self.resolve_now(secret_ref))
     }
 }
 
@@ -515,10 +533,18 @@ impl FileSecretResolver {
             resolver: "file",
         })
     }
-}
 
-impl SecretResolver for FileSecretResolver {
-    async fn resolve(&self, secret_ref: &str) -> Result<SecretValue, SecretError> {
+    /// The body of [`SecretResolver::resolve`], a plain `fn` for the same
+    /// reason as [`EnvSecretResolver::resolve_now`]: a file read is
+    /// synchronous, so the trait's future is `std::future::ready` of this
+    /// result, not an `async fn` with nothing to await (clippy's
+    /// `unused_async_trait_impl`, added in clippy 1.98 — REL-9).
+    ///
+    /// # Errors
+    ///
+    /// [`SecretError::UnsupportedRef`] for a wrong scheme or an unreadable
+    /// file; [`SecretError::NotFound`] for bytes that are not UTF-8.
+    fn resolve_now(&self, secret_ref: &str) -> Result<SecretValue, SecretError> {
         let bytes = self.read_confined(secret_ref)?;
         // Not UTF-8 is "nothing usable here", as `read_to_string` reported.
         let contents = String::from_utf8(bytes).map_err(|_| SecretError::NotFound {
@@ -526,6 +552,15 @@ impl SecretResolver for FileSecretResolver {
             resolver: "file",
         })?;
         Ok(SecretValue::new(contents.trim().to_owned()))
+    }
+}
+
+impl SecretResolver for FileSecretResolver {
+    fn resolve(
+        &self,
+        secret_ref: &str,
+    ) -> impl std::future::Future<Output = Result<SecretValue, SecretError>> + Send {
+        std::future::ready(self.resolve_now(secret_ref))
     }
 }
 
