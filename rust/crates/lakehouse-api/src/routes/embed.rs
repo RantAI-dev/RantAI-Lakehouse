@@ -1219,13 +1219,18 @@ async fn render_board_payload(
                         Ok(filtered) => {
                             let filtered =
                                 crate::routes::support::with_map_limit(filtered, c.spec.kind).await;
-                            let (id, mut val) = run_spec_sql(
-                                ch,
-                                &c.spec.id,
+                            // BI-5 review B1: the rows this kind may read.
+                            let (id, mut val) = crate::routes::support::with_tile_rows(
+                                c.spec.kind,
                                 &filtered.sql,
-                                roles_ref,
-                                placeholders_ref,
-                                obligations,
+                                run_spec_sql(
+                                    ch,
+                                    &c.spec.id,
+                                    &filtered.sql,
+                                    roles_ref,
+                                    placeholders_ref,
+                                    obligations,
+                                ),
                             )
                             .await;
                             crate::routes::support::annotate_params(&mut val, c, values_ref);

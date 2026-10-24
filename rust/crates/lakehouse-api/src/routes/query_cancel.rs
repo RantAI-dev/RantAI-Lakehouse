@@ -53,6 +53,12 @@ pub async fn cancel(
         serde_json::from_slice(&body).map_err(|_| ApiError::BadRequest(BODY_SHAPE.to_owned()))?;
     let target = KillTarget::own_run(principal.id.uuid(), &parsed.run_id)
         .ok_or_else(|| ApiError::BadRequest("runId must be a UUID.".to_owned()))?;
+    // BI-5 review S2: the run is marked first, so a tile that has not sent its
+    // query yet (the next round of a board of more than six) answers "Stopped"
+    // instead of starting. `own_run` has already checked the id is a UUID.
+    if let Ok(run) = uuid::Uuid::parse_str(parsed.run_id.trim()) {
+        crate::query_limits::mark_stopped(principal.id.uuid(), run);
+    }
     let ch = &state.clickhouse;
     let counted = ch
         .rows(&target.count_sql(), None)
@@ -66,10 +72,11 @@ pub async fn cancel(
                 .or_else(|| n.as_str().and_then(|t| t.parse().ok()))
         })
         .unwrap_or(0);
-    if stopped > 0 {
-        ch.exec(&kill_query_sql(&target), None)
-            .await
-            .map_err(|err| upstream_error::ch_error(&upstream_error::DATABASE, &err))?;
-    }
+    // Sent even when the count is 0: a query can start between the count and
+    // here (a tile of the next round), and `KILL` of nothing is harmless
+    // (`BI-5` review S2).
+    ch.exec(&kill_query_sql(&target), None)
+        .await
+        .map_err(|err| upstream_error::ch_error(&upstream_error::DATABASE, &err))?;
     Ok(ApiJson(json!({ "stopped": stopped })))
 }

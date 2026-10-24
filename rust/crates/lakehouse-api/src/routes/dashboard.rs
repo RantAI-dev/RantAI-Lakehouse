@@ -512,13 +512,18 @@ async fn get_body(
                     Err(msg) => return (c.spec.id.clone(), json!({ "error": msg })),
                 };
                 let filtered = crate::routes::support::with_map_limit(filtered, c.spec.kind).await;
-                let (id, mut val) = run_spec_sql(
-                    ch,
-                    &c.spec.id,
+                // BI-5 review B1: the rows this kind may read.
+                let (id, mut val) = crate::routes::support::with_tile_rows(
+                    c.spec.kind,
                     &filtered.sql,
-                    roles,
-                    placeholders,
-                    obligations,
+                    run_spec_sql(
+                        ch,
+                        &c.spec.id,
+                        &filtered.sql,
+                        roles,
+                        placeholders,
+                        obligations,
+                    ),
                 )
                 .await;
                 let skipped = &filtered.skipped;
@@ -902,6 +907,10 @@ pub async fn specs_create(
 /// ("dashboard:read")` guarantees a real `Extension<Principal>`, whose
 /// `role_names`/id/tenant ids are threaded into [`run_spec_sql`] so a
 /// preview is masked/row-filtered exactly like the persisted tile would be.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one straight-line handler (parse, build the spec, run it as the viewer, annotate); the BI-5 review B1 row-cap wrapper took it from 100 to 103"
+)]
 pub async fn specs_preview(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -952,13 +961,18 @@ pub async fn specs_preview(
             .collect(),
     };
     let obligations = PolicyEngineObligations::from_state(&state);
-    let (_, mut result) = run_spec_sql(
-        &state.clickhouse,
-        &spec.spec.id,
+    // BI-5 review B1: the preview reads as many rows as the tile will.
+    let (_, mut result) = crate::routes::support::with_tile_rows(
+        spec.spec.kind,
         &spec.spec.sql,
-        &principal.role_names,
-        &placeholders,
-        &obligations,
+        run_spec_sql(
+            &state.clickhouse,
+            &spec.spec.id,
+            &spec.spec.sql,
+            &principal.role_names,
+            &placeholders,
+            &obligations,
+        ),
     )
     .await;
     crate::routes::support::annotate_saved_grain(&mut result, &spec);
@@ -3554,20 +3568,37 @@ async fn export_tile_statement(
             grouped_export_statement(ch, (&viewer, &chart), q, &dashboard_filters, &time).await?;
         (statement, HashMap::new())
     };
+    // BI-5 review S4: a grouped file holds what the tile shows, so it runs under
+    // the same limits the tile ran under. An unreadable setting leaves the text.
+    let limits = crate::query_limits::QueryRun::current_or_detached()
+        .limits()
+        .await
+        .ok();
     Ok((
         chart,
-        export_statement_settings(rows_mode, statement),
+        export_statement_settings(rows_mode, statement, limits.as_ref()),
         labels,
     ))
 }
 
 /// The statement as the download sends it. A raw table's rows lift a SQL
-/// source's 2 000-row cap to the download's (D6); a grouped tile stays byte for
-/// byte the tile's own statement, because a grouped chart exports its own result
-/// (feature decision 8; `BI-1` review fix (SHOULD-FIX) R4).
-fn export_statement_settings(rows_mode: bool, statement: String) -> String {
+/// source's 2 000-row cap to the download's (D6); a grouped tile is the tile's own statement, run under
+/// the caller's limits like the tile (`BI-5` review S4), because a grouped chart
+/// exports its own result (feature decision 8; `BI-1` review fix (SHOULD-FIX) R4).
+fn export_statement_settings(
+    rows_mode: bool,
+    statement: String,
+    limits: Option<&crate::query_limits::TileLimits>,
+) -> String {
     if rows_mode {
         lakehouse_bi::builder::with_export_settings(&statement, crate::export::EXPORT_ROW_CAP + 1)
+    } else if let Some(limits) = limits {
+        // The tile's own statement is run with these numbers (`try_run_spec_sql`).
+        lakehouse_bi::builder::with_run_settings(
+            &statement,
+            limits.chart_rows.saturating_add(1),
+            u32::try_from(limits.timeout_seconds()).unwrap_or(u32::MAX),
+        )
     } else {
         statement
     }
@@ -4588,11 +4619,29 @@ mod tests {
             "SELECT region, sum(n) AS n FROM (SELECT 1\n) AS src GROUP BY region{}",
             lakehouse_bi::builder::SQL_SOURCE_SETTINGS
         );
-        assert_eq!(export_statement_settings(false, tile.clone()), tile);
-        let rows = export_statement_settings(true, tile.clone());
+        assert_eq!(export_statement_settings(false, tile.clone(), None), tile);
+        let rows = export_statement_settings(true, tile.clone(), None);
         assert_ne!(rows, tile);
         assert!(rows.contains("max_result_rows = 1000001"), "{rows}");
         assert!(!rows.contains("max_result_rows = 2000"), "{rows}");
+    }
+
+    /// `BI-5` review S4: a grouped file runs under the caller's limits, as the
+    /// tile does, so an administrator's change reaches the file too.
+    #[test]
+    fn a_grouped_download_takes_the_callers_limits_like_its_tile() {
+        let tile = format!(
+            "SELECT region, sum(n) AS n FROM (SELECT 1\n) AS src GROUP BY region{}",
+            lakehouse_bi::builder::SQL_SOURCE_SETTINGS
+        );
+        let mut limits = crate::query_limits::Snapshot::default().effective_for_roles(&[]);
+        limits.chart_rows = 500;
+        limits.timeout = std::time::Duration::from_secs(120);
+        let got = export_statement_settings(false, tile, Some(&limits));
+        assert!(
+            got.contains("max_result_rows = 501") && got.contains("max_execution_time = 120"),
+            "{got}"
+        );
     }
 
     #[test]

@@ -312,8 +312,22 @@ pub(crate) async fn try_run_spec_sql(
         limits.chart_rows.saturating_add(1),
         seconds,
     );
+    // BI-5 review B1: a point map reads up to the map limit and a pivot up to
+    // its own cap, set around the tile by `with_tile_rows`; every other kind
+    // stays at the chart row limit. Only the outer cap moves: the SQL-source
+    // `SETTINGS` text above keeps the chart row limit.
+    let rows_cap = limits
+        .chart_rows
+        .max(crate::query_limits::row_cap_override().unwrap_or(0));
     let execute = || async {
-        let options = run.options(&limits, limits.chart_rows);
+        // BI-5 review S2: Stop was pressed on this run while the tile waited
+        // for its round; it asks the engine nothing.
+        if run.is_stopped() {
+            return Err(SpecRunFailure::Tile(
+                json!({ "error": crate::query_limits::STOPPED_SENTENCE }),
+            ));
+        }
+        let options = run.options(&limits, rows_cap);
         let mut r = ch
             .query_with_options(&rewritten, &options, None)
             .await
@@ -326,13 +340,13 @@ pub(crate) async fn try_run_spec_sql(
         // it is kept as it is, because pivots and previews read one row past
         // their own cap to tell whether they cut (`pivot_trim`,
         // `preview_rows`), and trimming here would blind them.
-        let cut = r.data.len() > limits.chart_rows as usize + 1;
+        let cut = r.data.len() > rows_cap as usize + 1;
         if cut {
-            r.data.truncate(limits.chart_rows as usize);
+            r.data.truncate(rows_cap as usize);
         }
         let mut out = json!({ "columns": columns, "rows": r.data });
         if cut {
-            out["limitHit"] = limits.rows_limit_json(limits.chart_rows);
+            out["limitHit"] = limits.rows_limit_json(rows_cap);
         }
         Ok::<_, SpecRunFailure>(crate::result_cache::Computed {
             value: out,
@@ -352,7 +366,7 @@ pub(crate) async fn try_run_spec_sql(
             "max_execution_time",
             u64::try_from(limits.timeout.as_millis()).unwrap_or(u64::MAX),
         ),
-        ("max_result_rows", u64::from(limits.chart_rows) + 1),
+        ("max_result_rows", u64::from(rows_cap) + 1),
     ];
     let mut answer = scope
         .run(ch, (&rewritten, &settings), tables, execute)
@@ -388,6 +402,41 @@ fn tile_failure(err: ChError, limits: &crate::query_limits::TileLimits) -> SpecR
     } else {
         SpecRunFailure::Clickhouse(err)
     }
+}
+
+/// Run `fut` (one tile's queries) with the rows its kind may read (`BI-5`
+/// review B1): a `pointmap` or `geoheat` reads up to the administrator's map
+/// limit, a `pivot` up to the cap its own statement carries (its `LIMIT`, one
+/// above `pivot_row_cap`, which the pivot trims itself); any other kind runs as
+/// it is, at the chart row limit. `sql` is the tile's statement as built.
+pub(crate) fn with_tile_rows<'a, T: Send + 'a>(
+    kind: lakehouse_bi::specs::ChartKind,
+    sql: &'a str,
+    fut: impl std::future::Future<Output = T> + Send + 'a,
+) -> futures::future::BoxFuture<'a, T> {
+    use lakehouse_bi::specs::ChartKind;
+    // Boxed: the tile query's future is large (it holds the cache and the
+    // engine call), and awaiting it by value in every tile pipeline trips
+    // `clippy::large_futures` there.
+    Box::pin(async move {
+        let cap = match kind {
+            ChartKind::Pointmap | ChartKind::Geoheat => {
+                crate::query_limits::QueryRun::current_or_detached()
+                    .limits()
+                    .await
+                    .ok()
+                    .map(|limits| limits.map_points)
+            }
+            ChartKind::Pivot => {
+                lakehouse_bi::builder::trailing_limit(sql).map(|limit| limit.saturating_sub(1))
+            }
+            _ => None,
+        };
+        match cap {
+            Some(rows) => crate::query_limits::with_row_cap(rows, fut).await,
+            None => fut.await,
+        }
+    })
 }
 
 /// `filtered` with the point-map limit of the caller's query limits
@@ -1462,6 +1511,100 @@ mod run_spec_sql_enforcement {
             body.contains("max_result_rows = 2001") && body.contains("max_execution_time = 60"),
             "{body}"
         );
+        Ok(())
+    }
+
+    /// `BI-5` review B1: a point map reads up to the map limit and a pivot up to
+    /// its own cap, with no row-cut marker, while a chart of any other kind is
+    /// still cut at the chart row limit.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_point_map_and_a_pivot_read_past_the_chart_row_limit_and_a_bar_does_not(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        use lakehouse_bi::specs::ChartKind;
+        let many = |n: usize| {
+            let data: Vec<_> = (0..n).map(|i| serde_json::json!({ "n": i })).collect();
+            serde_json::json!({ "meta": [{"name": "n", "type": "UInt32"}], "data": data, "rows": n })
+        };
+        for (kind, sql, rows, expect_cap, cut) in [
+            (
+                ChartKind::Pointmap,
+                "SELECT n FROM serving.m LIMIT 5000",
+                3000,
+                "5001",
+                false,
+            ),
+            (
+                ChartKind::Pivot,
+                "SELECT n FROM serving.m LIMIT 10001",
+                10001,
+                "10001",
+                false,
+            ),
+            (
+                ChartKind::Bar,
+                "SELECT n FROM serving.m LIMIT 5000",
+                3000,
+                "2001",
+                true,
+            ),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(many(rows)))
+                .mount(&server)
+                .await;
+            let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+            let obligations = PolicyEngineObligations::new(Some(&pool), &ch);
+            let (_, val) = super::with_tile_rows(
+                kind,
+                sql,
+                run_spec_sql(&ch, "c", sql, &[], &PlaceholderValues::none(), &obligations),
+            )
+            .await;
+            let requests = server.received_requests().await.unwrap();
+            let run = requests
+                .iter()
+                .find(|r| r.url.query_pairs().any(|(k, _)| k == "query_id"))
+                .expect("the tile query was sent");
+            let q: std::collections::HashMap<_, _> = run.url.query_pairs().into_owned().collect();
+            assert_eq!(q["max_result_rows"], expect_cap, "{kind:?}");
+            assert_eq!(val.get("limitHit").is_some(), cut, "{kind:?}: {val}");
+            let kept = val["rows"].as_array().map(Vec::len);
+            assert_eq!(kept, Some(if cut { 2000 } else { rows }), "{kind:?}");
+        }
+        Ok(())
+    }
+
+    /// `BI-5` review S2: a tile that has not sent its query when Stop is pressed
+    /// on its run answers "Stopped" and asks the engine nothing.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_tile_of_a_stopped_run_sends_no_query(pool: PgPool) -> sqlx::Result<()> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"meta":[{"name":"n","type":"UInt8"}],"data":[{"n":1}],"rows":1}"#,
+            ))
+            .mount(&server)
+            .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let obligations = PolicyEngineObligations::new(Some(&pool), &ch);
+        let run = crate::query_limits::QueryRun::detached();
+        let id = uuid::Uuid::parse_str(run.run_id()).unwrap();
+        let none = PlaceholderValues::none();
+        let ask = |run: crate::query_limits::QueryRun| {
+            crate::query_limits::scope(
+                run,
+                run_spec_sql(&ch, "c", "SELECT 1 AS n", &[], &none, &obligations),
+            )
+        };
+        crate::query_limits::mark_stopped(uuid::Uuid::nil(), id);
+        let (_, val) = ask(run).await;
+        assert_eq!(val["error"], "Stopped");
+        assert!(server.received_requests().await.unwrap().is_empty());
+        // Another run of the same person is not affected.
+        let (_, other) = ask(crate::query_limits::QueryRun::detached()).await;
+        assert_eq!(other["rows"].as_array().map(Vec::len), Some(1));
         Ok(())
     }
 

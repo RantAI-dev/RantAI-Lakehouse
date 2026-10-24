@@ -89,15 +89,48 @@ pub const SQL_SOURCE_SETTINGS: &str =
 /// (`prefer_column_name_to_alias`, ...) are kept.
 #[must_use]
 pub fn with_run_settings(statement: &str, max_rows: u32, seconds: u32) -> String {
-    let Some(at) = statement.rfind(SQL_SOURCE_SETTINGS) else {
+    let Some((start, end)) = find_source_settings(statement) else {
         return statement.to_owned();
     };
     format!(
         "{} SETTINGS max_result_rows = {max_rows}, result_overflow_mode = 'break', \
          max_execution_time = {seconds}{}",
-        &statement[..at],
-        &statement[at + SQL_SOURCE_SETTINGS.len()..]
+        &statement[..start],
+        &statement[end..]
     )
+}
+
+/// Where the SQL-source cap sits in `statement` (`BI-5` review S3): the last
+/// ` SETTINGS max_result_rows = <n>, result_overflow_mode = 'break',
+/// max_execution_time = <n>` with **any** two numbers, not only today's
+/// defaults. A chart saved before `BI-5` stores the text with
+/// `max_execution_time = 30`, and a chart saved under another default would
+/// store that one; matching only the current text left those on their old
+/// limits (and kept `BI-1`'s export lift off them). Returns the byte range of
+/// the clause, from the space before `SETTINGS` to the end of the last number.
+fn find_source_settings(statement: &str) -> Option<(usize, usize)> {
+    const HEAD: &str = " SETTINGS max_result_rows = ";
+    const MIDDLE: &str = ", result_overflow_mode = 'break', max_execution_time = ";
+    let mut search_end = statement.len();
+    while let Some(start) = statement[..search_end].rfind(HEAD) {
+        let digits = |from: usize| {
+            statement[from..]
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(statement.len() - from)
+        };
+        let rows_at = start + HEAD.len();
+        let rows_len = digits(rows_at);
+        let middle_at = rows_at + rows_len;
+        if rows_len > 0 && statement[middle_at..].starts_with(MIDDLE) {
+            let seconds_at = middle_at + MIDDLE.len();
+            let seconds_len = digits(seconds_at);
+            if seconds_len > 0 {
+                return Some((start, seconds_at + seconds_len));
+            }
+        }
+        search_end = start;
+    }
+    None
 }
 
 /// `statement` with the SQL-source cap of a tile swapped for a download's:
@@ -120,24 +153,45 @@ pub fn with_export_settings(statement: &str, max_rows: u32) -> String {
 /// write.
 #[must_use]
 pub fn with_point_limit(statement: &str, points: u32, source_rows: u32) -> String {
-    const LIMIT: &str = " LIMIT ";
-    let Some(at) = statement.rfind(LIMIT) else {
+    let Some((at, _, rest)) = trailing_limit_parts(statement) else {
         return statement.to_owned();
     };
-    let after = &statement[at + LIMIT.len()..];
+    let limit = if find_source_settings(rest).is_some() {
+        points.min(source_rows)
+    } else {
+        points
+    };
+    format!("{}{LIMIT_KEYWORD}{limit}{rest}", &statement[..at])
+}
+
+const LIMIT_KEYWORD: &str = " LIMIT ";
+
+/// Where the builder's own last `LIMIT n` sits in `statement`: the byte where
+/// ` LIMIT ` starts, the digits' length and the text after the digits, which is
+/// empty or begins ` SETTINGS`. `None` when the statement ends otherwise (a
+/// text the builder did not write).
+fn trailing_limit_parts(statement: &str) -> Option<(usize, usize, &str)> {
+    let at = statement.rfind(LIMIT_KEYWORD)?;
+    let after = &statement[at + LIMIT_KEYWORD.len()..];
     let digits_end = after
         .find(|c: char| !c.is_ascii_digit())
         .unwrap_or(after.len());
     let (digits, rest) = after.split_at(digits_end);
     if digits.is_empty() || !(rest.is_empty() || rest.starts_with(" SETTINGS")) {
-        return statement.to_owned();
+        return None;
     }
-    let limit = if rest.contains(SQL_SOURCE_SETTINGS) {
-        points.min(source_rows)
-    } else {
-        points
-    };
-    format!("{}{LIMIT}{limit}{rest}", &statement[..at])
+    Some((at, digits.len(), rest))
+}
+
+/// The number of the builder's own last `LIMIT n` (`BI-5` review B1): what a
+/// pivot's statement says it may return, so the per-run row cap can stand at
+/// the pivot's own cap and not at the chart cap. `None` for a text that does not
+/// end in one.
+#[must_use]
+pub fn trailing_limit(statement: &str) -> Option<u32> {
+    let (at, len, _) = trailing_limit_parts(statement)?;
+    let start = at + LIMIT_KEYWORD.len();
+    statement[start..start + len].parse().ok()
 }
 
 /// Where a chart's rows come from.
@@ -5040,6 +5094,40 @@ mod tests {
         // The default text swapped for the default numbers is the same text.
         let own = format!("SELECT 1{SQL_SOURCE_SETTINGS}");
         assert_eq!(with_run_settings(&own, 2000, 60), own);
+    }
+
+    /// `BI-5` review S3: a chart saved before `BI-5` stores the cap with
+    /// `max_execution_time = 30` (and any other default would store its own);
+    /// both swaps still reach it, and `BI-1`'s export lift with them.
+    #[test]
+    fn the_run_settings_find_a_source_cap_written_with_other_numbers() {
+        let old = "SELECT 1 FROM (SELECT 1\n) AS src SETTINGS max_result_rows = 2000, \
+                   result_overflow_mode = 'break', max_execution_time = 30";
+        assert_eq!(
+            with_run_settings(old, 501, 90),
+            "SELECT 1 FROM (SELECT 1\n) AS src SETTINGS max_result_rows = 501, \
+             result_overflow_mode = 'break', max_execution_time = 90"
+        );
+        let lifted = with_export_settings(old, 1_000_000);
+        assert!(
+            lifted.contains("max_result_rows = 1000000")
+                && lifted.contains("max_execution_time = 280"),
+            "{lifted}"
+        );
+        // A point statement over such a source is still held to the source cap.
+        let points = format!(
+            "SELECT x FROM (SELECT 1) AS src LIMIT 5000{}",
+            &old[old.find(" SETTINGS").unwrap_or(0)..]
+        );
+        assert!(with_point_limit(&points, 5000, 2000).contains(" LIMIT 2000 SETTINGS"));
+        // Not a cap of ours: a different clause is left alone.
+        let other = "SELECT 1 SETTINGS max_result_rows = 5, max_execution_time = 3";
+        assert_eq!(with_run_settings(other, 9, 9), other);
+        // The last clause is the one swapped, never a similar text inside the source.
+        let inner = format!("SELECT '{old}' AS t{SQL_SOURCE_SETTINGS}");
+        assert!(with_run_settings(&inner, 7, 7).ends_with(
+            "max_result_rows = 7, result_overflow_mode = 'break', max_execution_time = 7"
+        ));
     }
 
     #[test]

@@ -188,3 +188,61 @@ async fn a_streamed_chat_sends_deltas_then_the_checked_answer() {
     let done = events.iter().position(|e| e["type"] == "done");
     assert!(first_delta < done, "deltas arrive before done: {events:?}");
 }
+
+/// `BI-5` review B2: the chat's tools run in a spawned task; `run_sql` there
+/// must still send the signed-in person's query id (so Stop can find it) and
+/// the configured limits, not the nil principal's compiled-in ones.
+#[tokio::test]
+async fn a_streamed_chats_run_sql_carries_the_callers_query_id_and_the_limit_settings() {
+    let (llm, ch) = mock_backends().await;
+    let mut env = std::collections::HashMap::new();
+    env.insert("LLM_URL".to_owned(), llm.uri());
+    env.insert("CH_URL".to_owned(), ch.uri());
+    let TestApp { router, pool } = spin_up_with_env(&env).await;
+    // The install's time limit, changed from the default 60.
+    sqlx::query("UPDATE query_limits SET timeout_seconds = 90")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let cookie = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/ai/chat")
+                .header("content-type", "application/json")
+                .header("cookie", &cookie)
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "stream": true,
+                        "messages": [{ "role": "user", "content": "berapa baris di mart_x?" }],
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let _ = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let requests = ch.received_requests().await.unwrap();
+    let real: Vec<_> = requests
+        .iter()
+        .filter(|r| !String::from_utf8_lossy(&r.body).contains("EXPLAIN AST"))
+        .filter(|r| r.url.query_pairs().any(|(k, _)| k == "query_id"))
+        .collect();
+    assert!(
+        !real.is_empty(),
+        "run_sql reached the engine with a query id"
+    );
+    for r in real {
+        let q: std::collections::HashMap<_, _> = r.url.query_pairs().into_owned().collect();
+        assert!(
+            !q["query_id"].starts_with("00000000-0000-0000-0000-000000000000"),
+            "the caller's id, not the nil principal's: {}",
+            q["query_id"]
+        );
+        assert_eq!(q["max_execution_time"], "90", "the configured limit");
+    }
+}
