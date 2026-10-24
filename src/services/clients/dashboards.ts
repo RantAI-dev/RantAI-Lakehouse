@@ -248,9 +248,9 @@ export const clickhouseDashboardService: DashboardService = {
 
   // SEC-12. The server's messages for these are fixed and ours, so they are
   // shown as they come (`request` carries `error` into the `ServiceError`).
-  async getEmbedInfo(board, signal) {
+  async getEmbedInfo(board, signal, chart) {
     const json = await request<Partial<EmbedInfo>>(
-      `/api/dashboard/embed-info?board=${encodeURIComponent(board)}`,
+      `/api/dashboard/embed-info?board=${encodeURIComponent(board)}${chart ? `&chart=${encodeURIComponent(chart)}` : ""}`,
       { cache: "no-store", signal },
       "Embedding state could not be loaded"
     )
@@ -262,7 +262,28 @@ export const clickhouseDashboardService: DashboardService = {
       maxLifetimeSeconds: json.maxLifetimeSeconds ?? 86_400,
       revokedBefore: json.revokedBefore ?? null,
       allowedOrigins: json.allowedOrigins ?? [],
+      filterModes: json.filterModes ?? {},
+      filterColumns: json.filterColumns ?? [],
     }
+  },
+  async setEmbedFilterModes(board, modes, signal) {
+    const res = await apiFetch("/api/dashboard/embed-settings", {
+      method: "PUT",
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ board, filterModes: modes }),
+      signal,
+    })
+    await checkedWrite<{ ok: boolean }>(res)
+  },
+  async listBoardCharts(board, signal) {
+    const json = await request<{ charts?: { id: string; title?: string; board?: string }[] }>(
+      "/api/dashboard/specs",
+      { cache: "no-store", signal },
+      "The charts could not be loaded"
+    )
+    return (json.charts ?? [])
+      .filter((c) => c.board === board)
+      .map((c) => ({ id: c.id, title: c.title ?? c.id }))
   },
   // BI-19 part A. The server's sentences are ours, so they are shown as they come.
   async getPublicLink(board, signal) {

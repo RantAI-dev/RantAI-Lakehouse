@@ -12,9 +12,10 @@ import { apiFetch } from "@/services/http";
 import { dashboardService, type EmbedInfo } from "@/services";
 import { copyText as copyToClipboard } from "@/lib/copy-text";
 import { PublicLinkPanel } from "./public-link-panel";
-import { AllowedSitesEditor, Disclosure, WithdrawTokens } from "./embed-access-panel";
+import { AllowedSitesEditor, WithdrawTokens } from "./embed-access-panel";
 import { Input } from "@/components/ui/input";
-import { signSnippet as buildSignSnippet, tokenRules } from "./share-embed";
+import { tokenRules } from "./share-embed";
+import { EmbedSettingsPanel } from "./embed-settings-panel";
 
 async function putBoard(body: Record<string, unknown>): Promise<Record<string, unknown>> {
   const res = await apiFetch("/api/dashboard/boards", {
@@ -92,7 +93,6 @@ export function ShareDialog({
 
   const origin = typeof window !== "undefined" ? window.location.origin : "";
   const signedPreviewUrl = sampleToken ? `${origin}/embed/signed/${sampleToken}` : "";
-  const signSnippet = buildSignSnippet({ board, origin, maxLifetimeSeconds: info.maxLifetimeSeconds });
 
   const copyLabel = (k: string, label: string) => (
     <>
@@ -148,15 +148,7 @@ export function ShareDialog({
                   </div>
                 </div>
 
-                <Disclosure title="How to sign a token">
-                  <p className="text-[11px] text-muted-foreground">The signing secret stays on your server and is never sent to the console. Set <code className="rounded bg-muted px-1 font-mono">EMBED_SECRET</code> there to the same value the backend uses.</p>
-                  <div className="rounded-md border border-border bg-background p-2">
-                    <code className="block max-h-40 overflow-auto whitespace-pre font-mono text-[11px] leading-relaxed text-foreground">{signSnippet}</code>
-                  </div>
-                  <Button size="sm" variant="outline" onClick={() => void copyText(signSnippet, "snippet")}>
-                    {copyLabel("snippet", "Copy code")}
-                  </Button>
-                </Disclosure>
+                <EmbedSettingsPanel board={board} info={info} origin={origin} onInfo={setInfo} />
 
                 <WithdrawTokens board={board} revokedBefore={info.revokedBefore}
                   onRevokedAll={(at) => setInfo((cur) => ({ ...cur, revokedBefore: at }))} />

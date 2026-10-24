@@ -77,7 +77,7 @@ export const dashboardService = clickhouseDashboardService
  * (`PR #199 review M SHOULD-FIX BI-16 7`).
  */
 export type {
-  Board, BoardTab, EmbedInfo, LayoutMap, PhoneTile, PublicLink, PublicLinkState, TileBox,
+  Board, BoardChart, BoardTab, EmbedInfo, FilterMode, LayoutMap, PhoneTile, PublicLink, PublicLinkState, TileBox,
 } from "./contracts/dashboards"
 /** Calculated fields of a mart or SQL source (BI-8). */
 export const calcFieldService = calcFieldClientService

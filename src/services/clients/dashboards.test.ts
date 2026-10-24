@@ -82,7 +82,34 @@ describe("embed state (SEC-12)", () => {
       maxLifetimeSeconds: 3600,
       revokedBefore: 1_700_000_000,
       allowedOrigins: ["https://app.example.com"],
+      filterModes: {},
+      filterColumns: [],
     })
+  })
+
+  it("getEmbedInfo asks for a chart's sample and reads the modes (BI-26)", async () => {
+    const calls = stubFetch(() =>
+      json({ enabled: true, supported: true, maxLifetimeSeconds: 3600, revokedBefore: null, allowedOrigins: [], filterModes: { region: "locked" }, filterColumns: ["region", "year"] }),
+    )
+    const info = await clickhouseDashboardService.getEmbedInfo("b_1", undefined, "u 1")
+    expect(calls[0].url).toBe("/api/dashboard/embed-info?board=b_1&chart=u%201")
+    expect(info.filterModes).toEqual({ region: "locked" })
+    expect(info.filterColumns).toEqual(["region", "year"])
+  })
+
+  it("setEmbedFilterModes puts the modes and surfaces a refusal's sentence (BI-26)", async () => {
+    const calls = stubFetch(() => json({ ok: true }))
+    await clickhouseDashboardService.setEmbedFilterModes("b_1", { region: "editable" })
+    expect(calls[0].url).toBe("/api/dashboard/embed-settings")
+    expect(calls[0].init.method).toBe("PUT")
+    expect(sent(calls[0])).toEqual({ board: "b_1", filterModes: { region: "editable" } })
+    stubFetch(() => json({ error: "A mode can only be set for a filter the dashboard has." }, 400))
+    await expect(clickhouseDashboardService.setEmbedFilterModes("b_1", { nope: "locked" })).rejects.toThrow("A mode can only be set")
+  })
+
+  it("listBoardCharts keeps only the charts of the dashboard (BI-26)", async () => {
+    stubFetch(() => json({ charts: [{ id: "u1", title: "A", board: "b_1" }, { id: "u2", title: "B", board: "b_2" }, { id: "u3", board: "b_1" }] }))
+    expect(await clickhouseDashboardService.listBoardCharts("b_1")).toEqual([{ id: "u1", title: "A" }, { id: "u3", title: "u3" }])
   })
 
   it("getEmbedInfo reports an unconfigured server with its reason and no sample token", async () => {

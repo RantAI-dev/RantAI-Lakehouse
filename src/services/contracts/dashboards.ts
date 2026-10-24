@@ -132,7 +132,11 @@ export type DashboardService = {
    * a sample token, what has been withdrawn and which sites may frame it.
    * Needs `dashboard:read`.
    */
-  getEmbedInfo(board: string, signal?: AbortSignal): Promise<EmbedInfo>
+  getEmbedInfo(board: string, signal?: AbortSignal, chart?: string): Promise<EmbedInfo>
+  /** `BI-26`: save each filter's embed mode. Needs `dashboard:write`. */
+  setEmbedFilterModes(board: string, modes: Record<string, FilterMode>, signal?: AbortSignal): Promise<void>
+  /** `BI-26`: the charts of a dashboard, for the chart picker of the embed section. */
+  listBoardCharts(board: string, signal?: AbortSignal): Promise<BoardChart[]>
   /** `BI-19` part A. Needs `dashboard:write`. */
   getPublicLink(board: string, signal?: AbortSignal): Promise<PublicLinkState>
   /** Make a link or change its expiry or password; refusals carry the server's sentence. */
@@ -271,7 +275,17 @@ export type EmbedInfo = {
   revokedBefore: number | null
   /** Sites allowed to frame the embed pages. */
   allowedOrigins: string[]
+  /** `BI-26`: each filter column's embed mode; a column not listed is hidden. */
+  filterModes?: Record<string, FilterMode>
+  /** `BI-26`: the dashboard's saved filter columns, the ones that can be given a mode. */
+  filterColumns?: string[]
 }
+
+/** What a viewer of a signed embed may do with one dashboard filter (`BI-26`). */
+export type FilterMode = "locked" | "editable" | "hidden"
+
+/** A chart of a dashboard, for the embed chart picker. */
+export type BoardChart = { id: string; title: string }
 
 /**
  * A dashboard's public link (`BI-19` part A), from `GET`/`PUT
