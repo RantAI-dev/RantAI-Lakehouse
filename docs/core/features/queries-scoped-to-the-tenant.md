@@ -68,6 +68,12 @@ chat's saved-query tools know who asks (owner's exception, 2026-10-23 for the on
 - Silver and Gold tables belong to the shared catalog, not to a tenant. With more than one tenant, only the
   tenant that owns the catalog can query them.
 - A refused table reads "not found or not available to your organisation", whether it exists or not.
+- The chat sends no tenant header, so it acts as your first tenant. Query Studio can act as another tenant
+  (the header), so the two can read different tables and different saved queries.
+- A saved query that belongs to no tenant — written before tenants existed, or by a principal with no tenant —
+  is listed for the tenant that owns the shared catalog.
+- On a dataset's page, the "used by" list is resolved against your first tenant while the page's own gate is
+  resolved against the header's tenant, so with a header naming a second tenant the two can disagree.
 
 ## Acceptance checklist
 
