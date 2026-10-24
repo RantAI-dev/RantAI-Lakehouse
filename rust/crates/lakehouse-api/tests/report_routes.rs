@@ -465,7 +465,11 @@ async fn only_the_owner_or_an_administrator_changes_pauses_sends_or_deletes() {
         None,
     )
     .await;
-    assert!(list["items"].as_array().unwrap().is_empty());
+    assert!(
+        list["items"].as_array().unwrap().is_empty(),
+        "{:?}",
+        list["items"]
+    );
     for (verb, uri, b) in [
         ("GET", one.clone(), None),
         ("PUT", one.clone(), Some(body(recipients.clone()))),
@@ -639,7 +643,11 @@ async fn the_recipient_picker_lists_only_active_people_at_most_twenty_with_name_
         None,
     )
     .await;
-    assert!(none["items"].as_array().unwrap().is_empty());
+    assert!(
+        none["items"].as_array().unwrap().is_empty(),
+        "{:?}",
+        none["items"]
+    );
     // Somebody who may not download cannot browse people.
     let nobody = create_principal_with_permissions(&f.app.pool, "query:read").await;
     let cookie = session_cookie_for_user(&f.app.pool, nobody).await;

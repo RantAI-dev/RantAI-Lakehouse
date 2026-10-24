@@ -164,7 +164,10 @@ async fn the_quoted_request_creates_a_monday_pdf_subscription_for_the_person_aft
     // Without Confirm nothing is created and the summary says what would be.
     let pending = tool(&f, "create_report_subscription", monday_pdf()).await;
     assert_eq!(pending["outcome"], "needs_confirmation", "{pending}");
-    assert!(all(&f.app.pool).await.is_empty());
+    assert_eq!(
+        all(&f.app.pool).await,
+        [] as [lakehouse_store::report_subscriptions::Subscription; 0]
+    );
 
     let mut confirmed = monday_pdf();
     confirmed["confirmed"] = json!(true);
@@ -331,7 +334,10 @@ async fn an_approver_who_may_not_download_cannot_release_the_report() {
             .contains("Downloads are switched off"),
         "{decided}"
     );
-    assert!(all(&f.app.pool).await.is_empty());
+    assert_eq!(
+        all(&f.app.pool).await,
+        [] as [lakehouse_store::report_subscriptions::Subscription; 0]
+    );
 }
 
 #[tokio::test]
@@ -402,7 +408,10 @@ async fn updating_and_listing_work_on_the_callers_own_and_a_delete_waits_for_app
     // approves does not need to own it.
     let decided = approve(&f, &approval, &f.approver_cookie).await;
     assert_eq!(decided["result"]["deleted"], json!(true), "{decided}");
-    assert!(all(&f.app.pool).await.is_empty());
+    assert_eq!(
+        all(&f.app.pool).await,
+        [] as [lakehouse_store::report_subscriptions::Subscription; 0]
+    );
 }
 
 #[tokio::test]
@@ -425,7 +434,10 @@ async fn an_administrator_approver_deletes_the_requesters_subscription() {
     let admin_cookie = session_cookie_for_user(&f.app.pool, admin).await;
     let decided = approve(&f, &approval, &admin_cookie).await;
     assert_eq!(decided["result"]["deleted"], json!(true), "{decided}");
-    assert!(all(&f.app.pool).await.is_empty());
+    assert_eq!(
+        all(&f.app.pool).await,
+        [] as [lakehouse_store::report_subscriptions::Subscription; 0]
+    );
 }
 
 #[tokio::test]
@@ -445,7 +457,11 @@ async fn someone_elses_subscription_is_not_found_to_the_assistant_and_a_stranger
         json!({ "tool": "list_report_subscriptions", "args": {}, "mode": "build" }),
     )
     .await;
-    assert!(listed["result"]["items"].as_array().unwrap().is_empty());
+    assert!(
+        listed["result"]["items"].as_array().unwrap().is_empty(),
+        "{:?}",
+        listed["result"]["items"]
+    );
     let refused = post(
         &f,
         "/api/ai/tool",

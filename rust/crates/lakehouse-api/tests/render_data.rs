@@ -298,7 +298,7 @@ async fn the_tiles_are_read_with_the_masks_of_the_person_not_the_embed_viewer() 
         .filter(|s| s.contains("serving.mart_x") && !s.contains("system."))
         .cloned()
         .collect();
-    assert!(!owner_tiles.is_empty());
+    assert_ne!(owner_tiles, [] as [String; 0]);
     assert!(
         owner_tiles
             .iter()
@@ -316,7 +316,7 @@ async fn the_tiles_are_read_with_the_masks_of_the_person_not_the_embed_viewer() 
         .filter(|s| s.contains("serving.mart_x") && !s.contains("system."))
         .cloned()
         .collect();
-    assert!(!other_tiles.is_empty());
+    assert_ne!(other_tiles, [] as [String; 0]);
     assert!(
         other_tiles.iter().all(|s| !s.contains("replaceRegexpOne")),
         "{other_tiles:?}"

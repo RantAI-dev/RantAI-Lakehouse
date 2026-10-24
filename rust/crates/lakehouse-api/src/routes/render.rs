@@ -146,6 +146,14 @@ fn render_block(requested_by: &str, claims: &lakehouse_embed::RenderClaims) -> V
 
 /// The person a token names, as they are now: `None` for a disabled or deleted
 /// person (or an id that is not a user's), a response for a store failure.
+// `result_large_err` now reports `async fn`s too (clippy 1.98,
+// rust-clippy#17130). The `Err` is a ready `Response` the caller returns
+// verbatim, so boxing it would change this contract and every call site for
+// an allocation only on the error path (PR #204 CI, REL-9 decision D2).
+#[allow(
+    clippy::result_large_err,
+    reason = "the Err is a ready Response the caller returns verbatim; boxing it would change every call site for no gain on the success path"
+)]
 pub(crate) async fn principal_of(
     state: &AppState,
     id: &str,
