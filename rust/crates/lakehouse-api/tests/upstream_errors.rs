@@ -88,8 +88,15 @@ async fn the_public_dashboard_link_never_carries_the_database_text() {
     assert!(!body.contains(MARKER), "the database text leaked: {body}");
     assert!(!body.contains("version 0.0.0"), "{body}");
     let json: Value = serde_json::from_str(&body).expect("a JSON body");
-    assert_eq!(json["error"], "The database request failed.");
-    assert!(json["errorId"].is_string(), "{body}");
+    // PR #235 CI: `ApiError::Internal` renders `{ "error": "<message>
+    // Reference: <id>" }` (the `UpstreamFailure` Display); there is no
+    // separate `errorId` field on this route, so the id is read from the
+    // message.
+    let message = json["error"].as_str().expect("an error message");
+    let reference = message
+        .strip_prefix("The database request failed. Reference: ")
+        .unwrap_or_else(|| panic!("not the fixed message with a reference: {body}"));
+    assert!(!reference.trim().is_empty(), "{body}");
 }
 
 #[tokio::test]
