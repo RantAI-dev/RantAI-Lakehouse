@@ -25,8 +25,8 @@
 //! switch is off all answer the same `404 {"error":"not_found"}` (feature A5):
 //! nobody can use the page to find out which links exist or ever did. A link
 //! with a password and no valid ticket answers `401 password_required` with no
-//! dashboard name and no data. A wrong password and a locked link answer the
-//! same `401 wrong_password` (feature A4).
+//! dashboard name and no data. A wrong password answers `401 wrong_password`; a locked link
+//! answers `401 locked` (feature A4, as changed on 2026-10-24).
 //!
 //! # Passwords
 //!
@@ -307,6 +307,21 @@ fn wrong_password() -> Response {
         .into_response()
 }
 
+/// `401 {"error":"locked"}`: the link's password page is locked. BI-19 part A
+/// QA fix P2 (decision A4 as changed by the owner on 2026-10-24): a locked link
+/// says so, because a visitor with the right password could not otherwise tell
+/// why it fails. Nothing else is in the body, not even how long is left; a
+/// guesser already knows the link has a password, and the sign-in page says the
+/// same of a locked account. The 404 of an unknown, expired or switched-off link
+/// is unchanged (A5).
+fn locked() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        ApiJson(json!({ "error": "locked" })),
+    )
+        .into_response()
+}
+
 fn rejection(err: impl Into<ApiError>) -> Response {
     ApiRejection(err.into()).into_response()
 }
@@ -316,12 +331,12 @@ fn rejection(err: impl Into<ApiError>) -> Response {
 /// keeps for the browser session and sends as `X-Public-Link-Ticket`.
 ///
 /// Public: the token and the password are the credentials. A locked link
-/// answers exactly as a wrong password does and never reaches the hasher.
+/// answers `401 locked` and never reaches the hasher.
 ///
 /// # Errors
 ///
 /// `404 not_found` for a link that does not work; `400 no_password` for a link
-/// without one; `401 wrong_password`; `400` for a body that is not
+/// without one; `401 wrong_password`, or `401 locked` once five tries are used; `400` for a body that is not
 /// `{password}`; `503` without a database.
 pub async fn unlock(
     State(state): State<AppState>,
@@ -354,13 +369,13 @@ pub async fn unlock(
     // checked, in one atomic statement. Counting after the hash let any number
     // of simultaneous guesses pass the lock check together, and each cost a
     // full Argon2 run. Only the first `LOCK_FAILURES` tries of a window reach
-    // the verifier; the rest answer as a wrong password without hashing.
+    // the verifier; the rest answer `locked` without hashing.
     let attempt = match throttle::record_attempt(pool, &key, &lock_policy()).await {
         Ok((n, _locked_until)) => n,
         Err(err) => return rejection(err),
     };
     if attempt > LOCK_FAILURES {
-        return wrong_password();
+        return locked();
     }
     let password = Secret::new(parsed.password);
     let verified = tokio::task::spawn_blocking(move || {
@@ -375,6 +390,8 @@ pub async fn unlock(
             if let Err(err) = record_lock(pool, &open.link.board_id).await {
                 tracing::warn!(%err, "failed to record dashboard.public_link_locked");
             }
+            // The fifth wrong try is the one that locks the link: say so now.
+            return locked();
         }
         return wrong_password();
     }

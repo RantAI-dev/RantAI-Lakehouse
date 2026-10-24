@@ -65,14 +65,18 @@ export async function openPublic<T>(token: string, ticket?: string): Promise<Ope
 }
 
 /** Trade the password for a ticket and keep it for the session. */
-export async function unlockPublic(token: string, password: string): Promise<"ok" | "wrong" | "gone" | "error"> {
+export async function unlockPublic(token: string, password: string): Promise<"ok" | "wrong" | "locked" | "gone" | "error"> {
   const res = await fetch(`/api/public/dashboard/${encodeURIComponent(token)}/unlock`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ password }),
   });
   if (res.status === 404) return "gone";
-  if (res.status === 401) return "wrong";
+  if (res.status === 401) {
+    // BI-19 part A QA fix P2: a locked link says so, by a fixed code and nothing else.
+    const refusal = await res.json().catch(() => null);
+    return refusal?.error === "locked" ? "locked" : "wrong";
+  }
   if (!res.ok) return "error";
   const body = await res.json().catch(() => null);
   if (typeof body?.ticket !== "string") return "error";
@@ -90,10 +94,20 @@ export function LinkGone() {
   );
 }
 
+/** What the password page says for each refusal (BI-19 part A QA fix P2). */
+export const WRONG_PASSWORD = "That password did not work.";
+export const LINK_LOCKED = "Too many wrong tries. Try again in 15 minutes.";
+
+export function refusalMessage(result: "wrong" | "locked" | "gone" | "error"): string {
+  if (result === "locked") return LINK_LOCKED;
+  if (result === "error") return "Could not check the password. Please try again later.";
+  return WRONG_PASSWORD;
+}
+
 /**
- * The password page. A wrong password and a locked link read the same here as
- * they do on the server: "That password did not work." The field has a
- * show/hide toggle (BI-19 part A QA fix P1).
+ * The password page. A wrong password reads "That password did not work."; a
+ * locked link says so (BI-19 part A QA fix P2, decision A4 as changed by the
+ * owner). The field has a show/hide toggle (QA fix P1).
  */
 export function PasswordGate({ token, onOpen }: { readonly token: string; readonly onOpen: () => void }) {
   const [password, setPassword] = React.useState("");
@@ -108,7 +122,7 @@ export function PasswordGate({ token, onOpen }: { readonly token: string; readon
     try {
       const result = await unlockPublic(token, password);
       if (result === "ok") { onOpen(); return; }
-      setMessage(result === "error" ? "Could not check the password. Please try again later." : "That password did not work.");
+      setMessage(refusalMessage(result));
       if (result === "gone") onOpen();
     } catch {
       setMessage("Could not check the password. Please try again later.");

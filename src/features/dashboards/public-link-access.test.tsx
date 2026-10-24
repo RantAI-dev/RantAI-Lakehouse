@@ -1,6 +1,6 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test"
-import { readTicket } from "./public-link-access"
+import { LINK_LOCKED, readTicket, refusalMessage } from "./public-link-access"
 
 // happy-dom has no base URL for `next/image`'s logo, which is not under test.
 mock.module("next/image", () => ({ default: () => null }))
@@ -82,5 +82,21 @@ describe("a public link in the browser (BI-19 part A)", () => {
     expect(field.type).toBe("text")
     fireEvent.click(screen.getByRole("button", { name: "Hide password" }))
     expect(field.type).toBe("password")
+  })
+
+  // BI-19 part A QA fix P2.
+  it("says a locked link is locked, in the fixed sentence", async () => {
+    stub((url) => (url.endsWith("/unlock") ? json({ error: "locked" }, 401) : json({ error: "password_required" }, 401)))
+    render(<PublicDashboard token="p_pw" />)
+    fireEvent.change(await screen.findByLabelText("Password"), { target: { value: "whatever it is" } })
+    fireEvent.click(screen.getByRole("button", { name: "Open" }))
+    await waitFor(() => expect(screen.getByRole("alert").textContent).toBe("Too many wrong tries. Try again in 15 minutes."))
+  })
+
+  it("words each refusal: wrong, locked, a failed check", () => {
+    expect(LINK_LOCKED).toBe("Too many wrong tries. Try again in 15 minutes.")
+    expect(refusalMessage("locked")).toBe(LINK_LOCKED)
+    expect(refusalMessage("wrong")).toBe("That password did not work.")
+    expect(refusalMessage("error")).toContain("Could not check")
   })
 })

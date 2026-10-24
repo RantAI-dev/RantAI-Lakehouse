@@ -441,24 +441,43 @@ async fn a_password_link_needs_a_ticket_and_a_new_password_ends_the_old_tickets(
 }
 
 #[tokio::test]
-async fn five_wrong_passwords_lock_the_link_and_the_lock_looks_like_a_wrong_password() {
+async fn five_wrong_passwords_lock_the_link_and_a_locked_link_says_so() {
     let f = one_board().await;
     let w = writer(&f).await;
     let (_, made) = put(&f, &w, json!({ "password": "correct horse" })).await;
     let token = made["link"]["token"].as_str().unwrap().to_owned();
-    let wrong = unlock(&f, &token, "nope nope nope").await;
+    let wrong = json!({ "error": "wrong_password" });
+    let locked = json!({ "error": "locked" });
+    // Four wrong tries read as wrong passwords.
     for _ in 0..4 {
-        assert_eq!(unlock(&f, &token, "nope nope nope").await, wrong);
+        let (status, body) = unlock(&f, &token, "nope nope nope").await;
+        assert_eq!(
+            (status, json_of(&body)),
+            (StatusCode::UNAUTHORIZED, wrong.clone())
+        );
     }
-    // The sixth try has the right password and is still refused, byte for byte
-    // as a wrong one.
-    assert_eq!(unlock(&f, &token, "correct horse").await, wrong);
+    // BI-19 part A QA fix P2: the fifth wrong try locks the link and says so,
+    // with a fixed code and nothing else (no time left).
+    let (status, fifth) = unlock(&f, &token, "nope nope nope").await;
+    assert_eq!(
+        (status, json_of(&fifth)),
+        (StatusCode::UNAUTHORIZED, locked.clone())
+    );
+    // The sixth try has the right password and is still refused, as locked,
+    // byte for byte the same.
+    assert_eq!(unlock(&f, &token, "correct horse").await, (status, fifth));
     // The lock passes.
     sqlx::query("UPDATE login_throttle SET locked_until = now() - interval '1 second'")
         .execute(&f.app.pool)
         .await
         .unwrap();
     assert_eq!(unlock(&f, &token, "correct horse").await.0, StatusCode::OK);
+    // A5 is unchanged: a made-up link is still the one 404.
+    let (status, body) = unlock(&f, "p_made_up_token_x", "x").await;
+    assert_eq!(
+        (status, json_of(&body)),
+        (StatusCode::NOT_FOUND, json!({ "error": "not_found" }))
+    );
     let (locks,): (i64,) = sqlx::query_as(
         "SELECT count(*) FROM audit_event WHERE action = 'dashboard.public_link_locked'",
     )
@@ -651,10 +670,18 @@ async fn twenty_simultaneous_guesses_are_all_counted_and_all_refused() {
     let guesses = (0..20).map(|_| unlock(&f, &token, "wrong guess number"));
     let answers = futures::future::join_all(guesses).await;
     assert_eq!(answers.len(), 20);
+    // Four read as wrong passwords at most (the order they arrive in is not
+    // fixed); the rest, the fifth included, say the link is locked.
+    let mut locked = 0;
     for (status, body) in &answers {
         assert_eq!(*status, StatusCode::UNAUTHORIZED);
-        assert_eq!(json_of(body), json!({ "error": "wrong_password" }));
+        match json_of(body)["error"].as_str() {
+            Some("locked") => locked += 1,
+            Some("wrong_password") => {}
+            other => panic!("unexpected answer {other:?}"),
+        }
     }
+    assert!(locked >= 16, "{locked} of 20 said locked");
     let (counted,): (i32,) = sqlx::query_as("SELECT failures FROM login_throttle")
         .fetch_one(&f.app.pool)
         .await
