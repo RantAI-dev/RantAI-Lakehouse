@@ -3230,7 +3230,11 @@ pub async fn create(
 /// unknown id, another tenant's connector and an unassigned one get the
 /// same answer, so this is no oracle for which connector ids exist. A
 /// creator in no tenant owns no connector, so it cannot name one.
-async fn require_connector_in_tenant(
+///
+/// `BLD-9` / decision 7 calls this from `PUT` too, with the PIPELINE's
+/// tenant (the row `in_scope` already vouched for), so an edit cannot
+/// attach a connector from another tenant.
+pub(crate) async fn require_connector_in_tenant(
     pool: &PgPool,
     connector_id: &str,
     tenant_id: Option<Uuid>,

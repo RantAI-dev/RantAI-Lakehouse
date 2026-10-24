@@ -170,6 +170,12 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
     const targets = connectorSpec.data.sourceObjects.map((object) => object.target).filter(Boolean)
     return Array.from(new Set(targets)).sort()
   }, [hasConnector, connectorSpec.status, connectorSpec.data])
+  // BLD-7 decision 5: the table sent is one of the picker's targets. A
+  // stored table that is not (a legacy row, or a connector picked in the
+  // edit form just now) reads as "nothing chosen" rather than being sent
+  // back for a 400 the user cannot see the cause of.
+  const sourceTableShown =
+    hasConnector && !connectorTargets.includes(sourceTable) ? "" : sourceTable
   // DATA-19 D3: the one `dependsOn` control, shown only for a Bronze
   // source. The stored chain is `existing.dependsOn` — it may hold
   // upstreams this switch knows nothing about, and they are carried
@@ -214,6 +220,17 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
     [sourceZoneForLookup, zoneIsIceberg]
   )
   const [description, setDescription] = React.useState(existing?.description ?? "")
+  // The chain both entry points send: DATA-19's upload job and BLD-7's
+  // connector load, each switch owning exactly one entry. One helper so a
+  // create and a save cannot disagree about what the switches mean.
+  function dependsOnFor(zone: string): string[] {
+    return withConnectorLoadTrigger(
+      withReuploadTrigger(existing?.dependsOn, zone, hasConnector ? false : reuploadOn),
+      zone,
+      hasConnector,
+      connectorLoadOn
+    )
+  }
   const create = useServiceAction(
     withNotify(
       existing
@@ -234,11 +251,17 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
                 targetTable: input.targetTable,
                 schedule: input.schedule,
                 description: input.description,
-                // DATA-19 D3: the switch, resolved into the chain. Sent
-                // on every save, so switching it off CLEARS a stored
-                // `file_ingest_job` instead of leaving it behind (an
-                // omitted field would have kept the stored chain).
-                dependsOn: withReuploadTrigger(existing.dependsOn, input.sourceZone, reuploadOn),
+                // DATA-19 D3 + BLD-7 D4: both switches, resolved into
+                // the chain by one helper. Sent on every save, so
+                // switching one off CLEARS its stored upstream instead
+                // of leaving it behind (an omitted field would have kept
+                // the stored chain).
+                dependsOn: dependsOnFor(input.sourceZone),
+                // BLD-9 / decision 7: sent on every save, so "No
+                // connector" clears the stored one -- an omitted field
+                // would mean "unchanged" and the connector could never
+                // be removed from the console.
+                connectorId: connectorId.trim() || null,
               },
               signal
             )
@@ -264,7 +287,7 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
   const canProceed = React.useMemo(() => {
     if (step === 0) {
       return Boolean(
-        name.trim() && sourceZoneShown.trim() && sourceTable.trim() && incrementalColumn.trim()
+        name.trim() && sourceZoneShown.trim() && sourceTableShown.trim() && incrementalColumn.trim()
       )
     }
     if (step === 1) return transformDrafts.length > 0 || fbicEnabled
@@ -275,7 +298,7 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
     step,
     name,
     sourceZoneShown,
-    sourceTable,
+    sourceTableShown,
     incrementalColumn,
     transformDrafts,
     fbicEnabled,
@@ -299,7 +322,7 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
       name: name.trim(),
       kind,
       sourceZone: sourceZoneShown.trim(),
-      sourceTable: sourceTable.trim(),
+      sourceTable: sourceTableShown.trim(),
       incrementalColumn: incrementalColumn.trim(),
       transforms: transformDrafts.map(renderTransformDraft),
       fbicEnabled,
@@ -313,12 +336,7 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
       // BLD-7 decision 4: a pipeline with a connector is woken by that
       // connector's load instead, so the upload job is dropped there --
       // its table is loaded by the connector, not by an upload.
-      dependsOn: withConnectorLoadTrigger(
-        withReuploadTrigger(existing?.dependsOn, sourceZoneShown.trim(), hasConnector ? false : reuploadOn),
-        sourceZoneShown.trim(),
-        hasConnector,
-        connectorLoadOn
-      ),
+      dependsOn: dependsOnFor(sourceZoneShown.trim()),
     })
     // Straight to the pipeline's own page, where it can be marked ready
     // and run; the list is one click away.
@@ -412,16 +430,18 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
                   aria-label="Source zone, fixed to bronze by the connector"
                 />
               ) : (
-                <Input value={sourceZone} onChange={(e) => setSourceZone(e.target.value)} />
+                <Input
+                  value={sourceZone}
+                  onChange={(e) => setSourceZone(e.target.value)}
+                  aria-label="Source zone"
+                />
               )}
             </Field>
             <Field label="Connector" className="sm:col-span-2">
-              {existing ? (
-                // `PUT /api/pipelines/{id}` does not change the connector.
-                <div className="rounded-lg border border-border px-3 py-1.5 font-mono text-sm text-muted-foreground">
-                  {def?.connectorId ?? "No connector"}
-                </div>
-              ) : connectorIdFromUrl ? (
+              {!existing && connectorIdFromUrl ? (
+                // The connector page's own entry: the connector is the
+                // page the user came from, so it is shown with a way back
+                // rather than a picker that could silently drop it.
                 <div className="flex items-center justify-between rounded-lg border border-border px-3 py-1.5 text-sm">
                   <span className="font-mono">{connectorIdFromUrl}</span>
                   <Button variant="outline" size="sm" render={<Link href="/connectors" />}>
@@ -429,8 +449,15 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
                   </Button>
                 </div>
               ) : (
+                // BLD-9 / decision 7: the edit form picks the connector,
+                // and "No connector" is a real choice -- it sends `null`,
+                // which clears the stored one. A pipeline with a
+                // connector reads that connector's Bronze tables
+                // (decision 5), and the source fields above switch to
+                // that shape as soon as one is picked here.
                 <select
                   className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
+                  aria-label="Connector"
                   value={connectorId}
                   onChange={(e) => setConnectorId(e.target.value)}
                 >
@@ -479,7 +506,7 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
                   <select
                     className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
                     aria-label="Source table, one of this connector's tables"
-                    value={sourceTable}
+                    value={sourceTableShown}
                     onChange={(e) => setSourceTable(e.target.value)}
                   >
                     <option value="">Choose one of the connector&apos;s tables</option>
@@ -525,7 +552,7 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
                   <p className="text-sm font-medium">Run after this connector loads the table</p>
                   <p className="text-xs text-muted-foreground">
                     When the connector&apos;s ingest loads{" "}
-                    <span className="font-mono">{BRONZE_ZONE}.{sourceTable.trim() || "…"}</span>, this
+                    <span className="font-mono">{BRONZE_ZONE}.{sourceTableShown.trim() || "…"}</span>, this
                     pipeline runs. Each pipeline waits for its own table only.
                   </p>
                 </div>
@@ -774,7 +801,7 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
                 items: [
                   { label: "Name", value: name },
                   { label: "Kind", value: kind },
-                  { label: "Source", value: `${sourceZoneShown}.${sourceTable}` },
+                  { label: "Source", value: `${sourceZoneShown}.${sourceTableShown}` },
                   { label: "Incremental column", value: incrementalColumn },
                   { label: "Connector", value: connectorId || "None" },
                   ...(hasConnector

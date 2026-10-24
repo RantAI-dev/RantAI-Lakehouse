@@ -42,6 +42,7 @@ const sent: { method: string; path: string; body: Record<string, unknown> }[] = 
 /** The connector a QA report made its pipeline from, and its ingest targets. */
 const SEED_CONNECTOR = "conn-pg-lakehouse"
 let ingestTargets: { name: string; target: string }[] = []
+let connectorList: { id: string; name: string }[] = []
 
 function jsonResponse(body: unknown) {
   return new Response(JSON.stringify(body), {
@@ -72,6 +73,7 @@ beforeEach(() => {
     { name: "public.orders", target: "orders" },
     { name: "public.customers", target: "customers" },
   ]
+  connectorList = [{ id: SEED_CONNECTOR, name: "Lakehouse OLTP (Postgres)" }]
   global.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input)
     const method = init?.method ?? "GET"
@@ -92,10 +94,7 @@ beforeEach(() => {
       })
     }
     if (url.startsWith("/api/connectors")) {
-      return new Response(JSON.stringify([]), {
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-      })
+      return jsonResponse(connectorList)
     }
     if (url.startsWith("/api/lakehouse/namespaces")) {
       return new Response(JSON.stringify({ namespaces: [{ name: "bronze", tableCount: { value: 2, measured: true } }] }), {
@@ -349,5 +348,76 @@ describe("the connector page's Create pipeline entry (BLD-7)", () => {
     const zone = screen.getByDisplayValue("bronze") as HTMLInputElement
     expect(zone.disabled).toBe(false)
     expect(connectorSwitch()).toBeNull()
+  })
+})
+
+describe("changing a pipeline's connector on the edit form (BLD-9)", () => {
+  const connectorPicker = () =>
+    screen.getByRole("combobox", { name: "Connector" }) as HTMLSelectElement
+  const zoneInput = () =>
+    screen.getByRole("textbox", { name: /^source zone/i }) as HTMLInputElement
+
+  it("offers every connector and No connector, and sends null when the connector is cleared", async () => {
+    const stored = existing({
+      dependsOn: ["ingest_job", "pl-raw-loads-2"],
+      definition: {
+        ...existing().definition!,
+        // The connector's own table, as `BLD-7` requires.
+        sourceTable: "orders",
+        connectorId: SEED_CONNECTOR,
+      },
+    })
+    render(<PipelineEditor existing={stored} />)
+
+    await waitFor(() => expect(connectorPicker().value).toBe(SEED_CONNECTOR))
+    expect(Array.from(connectorPicker().options).map((o) => o.value)).toEqual([
+      "",
+      SEED_CONNECTOR,
+    ])
+    // With a connector the zone is fixed to bronze (decision 5).
+    expect(zoneInput().value).toBe("bronze")
+    expect(zoneInput().disabled).toBe(true)
+
+    fireEvent.change(connectorPicker(), { target: { value: "" } })
+    // "No connector" is a real choice: the zone becomes editable again.
+    await waitFor(() => expect(zoneInput().disabled).toBe(false))
+
+    await walkToReview()
+    fireEvent.click(screen.getByRole("button", { name: /save changes/i }))
+    await waitFor(() => expect(sent.some((c) => c.method === "PUT")).toBe(true))
+    const save = sent.find((c) => c.method === "PUT")
+    expect(save?.body.connectorId).toBeNull()
+    // Clearing the connector does not rewrite the rest of the chain: the
+    // form owns one upstream at a time, and `ingest_job` is still accepted
+    // on a Bronze source.
+    expect(save?.body.dependsOn).toEqual(["ingest_job", "pl-raw-loads-2"])
+  })
+
+  it("sets the connector picked in the edit form", async () => {
+    // A Bronze source whose table the connector loads, so the API will
+    // accept the pair.
+    const stored = existing({
+      definition: { ...existing().definition!, sourceTable: "orders" },
+      dependsOn: ["file_ingest_job"],
+    })
+    render(<PipelineEditor existing={stored} />)
+
+    await waitFor(() => expect(connectorPicker().value).toBe(""))
+    fireEvent.change(connectorPicker(), { target: { value: SEED_CONNECTOR } })
+    // The source switches to the connector's shape as soon as it is picked:
+    // zone fixed, table from the connector's own targets.
+    await waitFor(() => expect(zoneInput().value).toBe("bronze"))
+    expect(zoneInput().disabled).toBe(true)
+    fireEvent.change(screen.getByRole("combobox", { name: /^source table/i }), {
+      target: { value: "orders" },
+    })
+
+    await walkToReview()
+    fireEvent.click(screen.getByRole("button", { name: /save changes/i }))
+    await waitFor(() => expect(sent.some((c) => c.method === "PUT")).toBe(true))
+    const save = sent.find((c) => c.method === "PUT")
+    expect(save?.body.connectorId).toBe(SEED_CONNECTOR)
+    expect(save?.body.sourceZone).toBe("bronze")
+    expect(save?.body.sourceTable).toBe("orders")
   })
 })
