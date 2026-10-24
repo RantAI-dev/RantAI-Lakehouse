@@ -11,6 +11,7 @@ import {
   CheckCircle,
   ChevronDown,
   Clock,
+  Download,
   Database,
   GitBranch,
   Hammer,
@@ -73,7 +74,30 @@ export const TOOL_LABEL: Record<string, string> = {
   move_chart: "Move chart",
   set_board_view_filters: "Set view filters",
   save_board_filters: "Save default filters",
+  // BI-1 / AI-10: the link opens the same download the dashboard's menu makes.
+  export_dashboard: "Export dashboard",
+  export_chart: "Export chart data",
+  // RPT-1 / AI-10: scheduled reports by email.
+  create_report_subscription: "Schedule report",
+  list_report_subscriptions: "List scheduled reports",
+  update_report_subscription: "Change scheduled report",
+  delete_report_subscription: "Delete scheduled report",
 };
+
+/**
+ * The only addresses an export step may link to: the console's own download
+ * routes (`BI-1`). A result is data from the server, but the card never turns
+ * an arbitrary string into a link.
+ */
+const EXPORT_LINK = /^\/api\/dashboard\/(export\/pdf|chart-export)\?/;
+
+/** A tool result that is a download link (`export_dashboard`, `export_chart`), or null. */
+export function exportLink(tool: string, result: unknown): { url: string; fileName: string } | null {
+  if (tool !== "export_dashboard" && tool !== "export_chart") return null;
+  const r = asObj(result);
+  if (typeof r.url !== "string" || !EXPORT_LINK.test(r.url)) return null;
+  return { url: r.url, fileName: typeof r.fileName === "string" ? r.fileName : "download" };
+}
 
 /**
  * The board the dashboard page is showing, extracted from `/dashboards/<id>`.
@@ -339,6 +363,26 @@ function StepBody({ step }: { step: ToolStep }) {
   );
 }
 
+/**
+ * The Download button of an export result (BI-1 QA fix A1). A plain link to the
+ * console's own download route: the browser sends the person's session with it,
+ * so the file is made when they open it, with their permissions (AI-10, D9).
+ */
+function ExportDownload({ link }: { link: { url: string; fileName: string } }) {
+  return (
+    <div className="mb-1 ml-7 flex flex-wrap items-center gap-2 text-[11px]">
+      <a
+        href={link.url}
+        download={link.fileName}
+        className="inline-flex items-center gap-1.5 rounded-md border border-border bg-background px-2.5 py-1 font-medium text-foreground hover:bg-muted"
+      >
+        <Download className="size-3.5" aria-hidden /> Download {link.fileName}
+      </a>
+      <span className="text-muted-foreground">Made when you open it, with your permissions.</span>
+    </div>
+  );
+}
+
 /** Icon per tool family, as in the RantAI-Agents tool indicator. */
 function ToolIcon({ tool }: { tool: string }) {
   const cls = "size-3 shrink-0";
@@ -424,6 +468,10 @@ export function ToolStepCard({ step }: { step: ToolStep }) {
   const [open, setOpen] = React.useState(pending);
   const [raw, setRaw] = React.useState(false);
   const summary = inputSummary(step.args);
+  // BI-1 QA fix A1: an export result is a Download button built from the tool's own
+  // `url`, shown on the card itself (not inside the collapsed details), never from
+  // text the model wrote.
+  const download = exportLink(tool, step.result);
   return (
     <div className="my-0.5">
       <button
@@ -471,6 +519,7 @@ export function ToolStepCard({ step }: { step: ToolStep }) {
           aria-hidden
         />
       </button>
+      {download ? <ExportDownload link={download} /> : null}
       <AnimatePresence initial={false}>
         {open ? (
           <motion.div

@@ -61,11 +61,13 @@ export function downloadRowsCsv(title: string, data: Rows): void {
 
 /** The numbers behind one chart, with a CSV download. */
 export function TileDataDialog({
-  title, cell, onClose,
+  title, cell, onClose, canDownload = true,
 }: {
   readonly title: string;
   readonly cell: Cell | undefined;
   readonly onClose: () => void;
+  /** False when every role of the viewer is switched off from downloading (BI-1 review fix (SHOULD-FIX) R6): the CSV button is not offered. */
+  readonly canDownload?: boolean;
 }) {
   return (
     <Dialog open onOpenChange={(o) => { if (!o) onClose(); }}>
@@ -78,9 +80,11 @@ export function TileDataDialog({
             <RowsTable columns={visibleColumns(cell.columns)} rows={cell.rows} />
             <div className="flex items-center justify-between">
               <p className="text-[11px] text-muted-foreground">{cell.rows.length} rows</p>
-              <Button size="sm" variant="outline" onClick={() => downloadRowsCsv(title, cell)}>
-                <Download className="size-4" /> Download CSV
-              </Button>
+              {canDownload ? (
+                <Button size="sm" variant="outline" onClick={() => downloadRowsCsv(title, cell)}>
+                  <Download className="size-4" /> Download CSV
+                </Button>
+              ) : null}
             </div>
           </>
         ) : (

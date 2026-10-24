@@ -15,7 +15,7 @@ import type {
   UpdateBoardInput,
   VersionHistory,
 } from "../contracts/dashboards"
-import type { EmbedInfo } from "../contracts/dashboards"
+import type { EmbedInfo, PublicLink, PublicLinkState } from "../contracts/dashboards"
 import { apiFetch } from "../http"
 import { ServiceError, type ServiceErrorCode } from "../errors"
 
@@ -248,9 +248,9 @@ export const clickhouseDashboardService: DashboardService = {
 
   // SEC-12. The server's messages for these are fixed and ours, so they are
   // shown as they come (`request` carries `error` into the `ServiceError`).
-  async getEmbedInfo(board, signal) {
+  async getEmbedInfo(board, signal, chart) {
     const json = await request<Partial<EmbedInfo>>(
-      `/api/dashboard/embed-info?board=${encodeURIComponent(board)}`,
+      `/api/dashboard/embed-info?board=${encodeURIComponent(board)}${chart ? `&chart=${encodeURIComponent(chart)}` : ""}`,
       { cache: "no-store", signal },
       "Embedding state could not be loaded"
     )
@@ -262,7 +262,55 @@ export const clickhouseDashboardService: DashboardService = {
       maxLifetimeSeconds: json.maxLifetimeSeconds ?? 86_400,
       revokedBefore: json.revokedBefore ?? null,
       allowedOrigins: json.allowedOrigins ?? [],
+      filterModes: json.filterModes ?? {},
+      filterColumns: json.filterColumns ?? [],
+      hiddenOnlyColumns: json.hiddenOnlyColumns ?? [],
     }
+  },
+  async setEmbedFilterModes(board, modes, signal) {
+    const res = await apiFetch("/api/dashboard/embed-settings", {
+      method: "PUT",
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ board, filterModes: modes }),
+      signal,
+    })
+    await checkedWrite<{ ok: boolean }>(res)
+  },
+  async listBoardCharts(board, signal) {
+    const json = await request<{ charts?: { id: string; title?: string; board?: string }[] }>(
+      "/api/dashboard/specs",
+      { cache: "no-store", signal },
+      "The charts could not be loaded"
+    )
+    return (json.charts ?? [])
+      .filter((c) => c.board === board)
+      .map((c) => ({ id: c.id, title: c.title ?? c.id }))
+  },
+  // BI-19 part A. The server's sentences are ours, so they are shown as they come.
+  async getPublicLink(board, signal) {
+    const json = await request<Partial<PublicLinkState>>(
+      `/api/dashboard/public-link?board=${encodeURIComponent(board)}`,
+      { cache: "no-store", signal },
+      "The public link could not be loaded"
+    )
+    return { enabled: json.enabled !== false, link: json.link ?? null }
+  },
+  async savePublicLink(input, signal) {
+    const res = await apiFetch("/api/dashboard/public-link", {
+      method: "PUT",
+      headers: JSON_HEADERS,
+      body: JSON.stringify(input),
+      signal,
+    })
+    const json = await checkedWrite<{ link: PublicLink }>(res)
+    return json.link
+  },
+  async endPublicLink(board, signal) {
+    const res = await apiFetch(`/api/dashboard/public-link?board=${encodeURIComponent(board)}`, {
+      method: "DELETE",
+      signal,
+    })
+    await checkedWrite<{ ok: boolean }>(res)
   },
   async setEmbedOrigins(board, origins, signal) {
     const json = await request<{ embedOrigins?: string[] }>(

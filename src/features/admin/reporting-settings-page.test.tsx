@@ -23,6 +23,12 @@ function mockSettings(current: unknown, putStatus = 200): Call[] {
   const calls: Call[] = []
   global.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url
+    if (url.includes("/api/identity/roles")) {
+      return jsonResponse([
+        { id: "1", name: "Analyst", members: 1, permissions: "", description: "" },
+        { id: "2", name: "Viewer", members: 1, permissions: "", description: "" },
+      ])
+    }
     if (!url.includes("/api/settings/reporting")) return new Response("{}", { status: 200 })
     const method = (init?.method ?? "GET").toUpperCase()
     calls.push({ method, body: typeof init?.body === "string" ? init.body : null })
@@ -49,6 +55,9 @@ const DEFAULTS = {
   companyPalette: [],
   fonts: ["inter", "ibm-plex-sans", "source-serif", "jetbrains-mono", "system"],
   contentSites: [],
+  downloadDeniedRoles: [],
+  reportAllowedDomains: [],
+  publicLinksEnabled: true,
 }
 
 describe("ReportingSettingsForm", () => {
@@ -95,7 +104,23 @@ describe("ReportingSettingsForm", () => {
       companyPalette: [],
       fonts: DEFAULTS.fonts,
       contentSites: [],
+      downloadDeniedRoles: [],
+      reportAllowedDomains: [],
+      publicLinksEnabled: true,
     })
+  })
+
+  it("switches public links off for everyone on Save and warns first", async () => {
+    const calls = mockSettings(DEFAULTS)
+    render(<ReportingSettingsForm canWrite zoneList={zoneList} />)
+    const box = (await screen.findByLabelText("Allow public links")) as HTMLElement
+    await waitFor(() => expect(box.getAttribute("aria-checked")).toBe("true"))
+    fireEvent.click(box)
+    await screen.findByText("Saving this stops every public link now.")
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+    await waitFor(() => expect(calls.some((c) => c.method === "PUT")).toBe(true))
+    const put = calls.find((c) => c.method === "PUT")
+    expect(JSON.parse(put?.body ?? "{}").publicLinksEnabled).toBe(false)
   })
 
   it("adds a palette colour, refuses a single colour, and saves the palette and the fonts", async () => {
@@ -161,5 +186,79 @@ describe("ReportingSettingsForm", () => {
     expect(await screen.findByText("https://img.example")).toBeDefined()
     expect(screen.queryByRole("button", { name: "Add site" })).toBeNull()
     expect(screen.queryByRole("button", { name: "Remove https://img.example" })).toBeNull()
+  })
+
+  it("lists the roles that may not download, saves the chosen ones, and shows them read-only without settings:write", async () => {
+    const calls = mockSettings({ ...DEFAULTS, downloadDeniedRoles: ["Viewer"] })
+    render(<ReportingSettingsForm canWrite zoneList={zoneList} />)
+    expect(await screen.findByRole("heading", { name: "Downloads" })).toBeDefined()
+    const viewer = (await screen.findByRole("checkbox", { name: "Viewer" })) as HTMLElement
+    await waitFor(() => expect(viewer.getAttribute("aria-checked")).toBe("true"))
+    fireEvent.click(screen.getByRole("checkbox", { name: "Analyst" }))
+    const save = screen.getByRole("button", { name: "Save" }) as HTMLButtonElement
+    await waitFor(() => expect(save.disabled).toBe(false))
+    fireEvent.click(save)
+    await waitFor(() => expect(calls.some((c) => c.method === "PUT")).toBe(true))
+    const sent = JSON.parse(calls.find((c) => c.method === "PUT")?.body ?? "{}")
+    expect(sent.downloadDeniedRoles).toEqual(["Analyst", "Viewer"])
+
+    cleanup()
+    mockSettings({ ...DEFAULTS, downloadDeniedRoles: ["Viewer"] })
+    render(<ReportingSettingsForm canWrite={false} zoneList={zoneList} />)
+    const readOnly = (await screen.findByRole("checkbox", { name: "Viewer" })) as HTMLElement
+    expect(readOnly.getAttribute("aria-disabled") === "true" || readOnly.hasAttribute("disabled")).toBe(true)
+  })
+
+  it("adds and removes an outside report domain, refuses a wildcard or an address, and saves the list", async () => {
+    const calls = mockSettings({ ...DEFAULTS, reportAllowedDomains: ["partner.example"] })
+    render(<ReportingSettingsForm canWrite zoneList={zoneList} />)
+    const input = (await screen.findByLabelText("Report domain")) as HTMLInputElement
+    await screen.findByText("partner.example")
+    const add = screen.getByRole("button", { name: "Add domain" }) as HTMLButtonElement
+    for (const bad of ["*.example.com", "ann@example.com", "https://example.com", "example"]) {
+      fireEvent.change(input, { target: { value: bad } })
+      expect(add.disabled).toBe(true)
+    }
+    fireEvent.change(input, { target: { value: "Another.Example" } })
+    expect(add.disabled).toBe(false)
+    fireEvent.click(add)
+    expect(screen.getByText("another.example")).toBeDefined()
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+    await waitFor(() => expect(calls.some((c) => c.method === "PUT")).toBe(true))
+    const sent = JSON.parse(calls.find((c) => c.method === "PUT")?.body ?? "{}")
+    expect(sent.reportAllowedDomains).toEqual(["another.example", "partner.example"])
+  })
+
+  it("lists the report domains read-only without settings:write", async () => {
+    mockSettings({ ...DEFAULTS, reportAllowedDomains: ["partner.example"] })
+    render(<ReportingSettingsForm canWrite={false} zoneList={zoneList} />)
+    await screen.findByText("partner.example")
+    expect(screen.queryByLabelText("Report domain")).toBeNull()
+    expect(screen.queryByRole("button", { name: "Remove partner.example" })).toBeNull()
+  })
+
+  it("says Unsaved changes next to Save for a palette colour, a content site and a report domain, and clears it after Save (RPT-1 QA fix Q2)", async () => {
+    mockSettings(DEFAULTS)
+    render(<ReportingSettingsForm canWrite zoneList={zoneList} />)
+    const colour = (await screen.findByLabelText("Palette colour")) as HTMLInputElement
+    await waitFor(() => expect((screen.getByLabelText("Report time zone") as HTMLInputElement).value).toBe("Asia/Jakarta"))
+    expect(screen.queryByText("Unsaved changes")).toBeNull()
+
+    fireEvent.change(screen.getByLabelText("Report domain"), { target: { value: "partner.example.com" } })
+    fireEvent.click(screen.getByRole("button", { name: "Add domain" }))
+    // One note in the section and one next to Save.
+    expect(screen.getAllByText("Unsaved changes").length).toBe(2)
+    fireEvent.click(screen.getByRole("button", { name: "Remove partner.example.com" }))
+    expect(screen.queryByText("Unsaved changes")).toBeNull()
+
+    fireEvent.change(screen.getByLabelText("Content site"), { target: { value: "https://images.example.com" } })
+    fireEvent.click(screen.getByRole("button", { name: "Add site" }))
+    expect(screen.getAllByText("Unsaved changes").length).toBe(2)
+    fireEvent.click(screen.getByRole("button", { name: "Remove https://images.example.com" }))
+    expect(screen.queryByText("Unsaved changes")).toBeNull()
+
+    fireEvent.change(colour, { target: { value: "#112233" } })
+    fireEvent.click(screen.getByRole("button", { name: "Add colour" }))
+    expect(screen.getAllByText("Unsaved changes").length).toBe(2)
   })
 })

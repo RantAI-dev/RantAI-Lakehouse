@@ -504,7 +504,7 @@ fn check_run_token(
 /// `run_alert_rule` tool delivers through the exact same `SmtpConfig` the
 /// `/api/alerts/run` route builds, rather than a second, possibly-drifting
 /// copy of this six-field mapping.
-pub(in crate::routes) fn smtp_config(config: &Config) -> SmtpConfig {
+pub(crate) fn smtp_config(config: &Config) -> SmtpConfig {
     SmtpConfig {
         host: config.smtp_host.clone(),
         port: config.smtp_port,

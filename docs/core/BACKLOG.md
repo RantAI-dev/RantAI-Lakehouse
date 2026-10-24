@@ -268,6 +268,8 @@ estimate (S, M, L), which the base has no field for.
 | `BI-31` | Task | Close out `BI` phase 2 (#160) for acceptance: (1) the owner signs the decision rows still marked "Owner to confirm at QA" on `chart-builder-questions.md`, `joins-without-sql.md`, `bins-groups-hierarchies.md`, `parameters.md`, `combined-charts.md` and `reusable-metrics.md`, with the date; (2) answer the two open questions in the `BI-2` plan (does a seeded role hold `metric:write`; are metric and segment definitions readable by everyone with `dashboard:read`); (3) one check on a running stack with a masked and row-filtered role across a join, a drill-down and an embed. Found in the #160 review | Dashboards | P2 | Todo |  | #160 review |
 | `BI-32` | Task | While the assistant is answering, a chart's reference-line label (for example "Target 20,000") moves again and again, though the chart itself stays still: the tile re-renders with the streamed message. Keep the label still until the board really changes. Cosmetic; left over from the phase 3 QA (`BI-18` part C review R29, owner's QA 2026-10-18) | Dashboards | P3 | Todo |  | `BI-18` part C plan, R29 |
 | `BI-33` | Task | `#199` follow-ups from its last review (round O, `superpowers/plans/2026-10-14-bi-18c-layout.md`): the AI-15 case `dash_map_charts_in_separate_tab` can fail when the assistant is right (its setup has only the map chart; add a second chart); the XSS test misses the sankey edge, boxplot outlier and scatter-label branches; a comment in `chart-option.ts` says ECharts' `encodeHTMLContent` is off by default, but it never applies to a series formatter | Dashboards | P2 | Todo |  | `#199` review round O |
+| `BI-34` | Task | Downloads (`BI-1`) have no memory setting and no concurrency limit, unlike the PDF's two slots, and an XLSX file's rows are written on the async worker: set `max_memory_usage` on export statements, limit concurrent downloads per process, and move the per-row XLSX writes to `spawn_blocking`. From the `BI-1` review (N3, R10 follow-up), 2026-10-17 | Dashboards | P2 | Todo |  | `BI-1` plan, review 2 |
+| `BI-35` | Task | Scheduled reports (`RPT-1`) follow-ups from its review, 2026-10-18: a requester who holds `agent:approve` can approve their own outside send; "Send now" has no rate limit; a report over the 310 s route budget is cut with nothing recorded; the subscriptions dialog calls the service directly instead of `useServiceAction`; console Delete of a subscription has no confirm step | Dashboards | P2 | Todo |  | `RPT-1` plan, review 1 |
 | `OPS-11` | Task | Next.js 16.4 (on `main`) blocks the dev server's own resources for any origin but `localhost`, so a console dev server opened by a LAN address never finishes loading. Read the allowed dev origins from an environment variable (`allowedDevOrigins`), empty by default, and document it in `.env.example`. Found at the phase 3 QA, 2026-10-17 | Operations | P3 | Done | #229 | phase 3 QA |
 | `OPS-4` | Task | Fail loudly when the application database is unreachable | Platform | P3 | Done | [#234](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/234) | `docs/OPERATIONS.md` |
 | `OPS-6` | Feature | Log and trace viewer | Operations | P3 | Idea |  | `docs/archive/FEATURE_COVERAGE.md` |
@@ -297,7 +299,7 @@ parity), built after it.
 | `BI-26` | Planned | `BI-18` (locking a dashboard filter in an embed) | `AI-11` |
 | `BLD-1` | Building | — | `REL-6` |
 | `DATA-4` | Planned | — | `DATA-3` |
-| `DEC-8` | Open (decision) | — | `AI-11` |
+| `DEC-8` | Decided | — | `AI-11` |
 | `QS-5` | Planned | `BI-18` (the dashboard date filter) | `AI-12` (variables part) |
 | `REL-9` | Todo | — | `SEC-41` |
 | `SEC-14` | Building | `SEC-41` (part B) | `SRC-4` (credentials) |
@@ -319,7 +321,7 @@ parity), built after it.
 
 **Ready to start** (Todo, Planned or Idea, nothing open blocks it; Idea items still need a spec):
 
-`ADM-1`, `ADM-2`, `AI-21`, `AI-22`, `BI-1`, `BI-14`, `BI-20`, `BI-27`, `BI-28`, `BI-29`, `BI-3`, `BI-30`, `BI-31`, `BI-32`, `BI-33`, `BI-4`, `BI-5`, `BIZ-1`, `BIZ-2`, `BLD-6`, `DATA-18`, `DATA-20`, `DATA-21`, `DATA-22`, `DATA-23`, `DATA-24`, `DATA-25`, `DATA-26`, `DATA-27`, `DATA-4`, `DATA-5`, `DATA-6`, `DATA-8`, `DOC-2`, `GOV-1`, `GOV-3`, `GOV-5`, `INT-2`, `OPS-2`, `OPS-3`, `OPS-6`, `OPS-8`, `QA-1`, `QRY-1`, `QS-2`, `QS-4`, `REL-1`, `REL-2`, `REL-4`, `REL-7`, `REL-9`, `SEC-20`, `SEC-22`, `SEC-34`, `SEC-4`, `SEC-40`, `SEC-47`, `SEC-7`, `SRC-15`, `SRC-18`, `SRC-2`, `SRC-22`, `SRC-23`, `SRC-24`, `SRC-25`, `SRC-26`, `SRC-27`, `SRC-28`, `SRC-30`, `SRC-31`, `SRC-32`, `SRC-5`, `VER-1`
+`ADM-1`, `ADM-2`, `AI-21`, `AI-22`, `BI-1`, `BI-14`, `BI-20`, `BI-27`, `BI-28`, `BI-29`, `BI-3`, `BI-30`, `BI-31`, `BI-32`, `BI-33`, `BI-34`, `BI-35`, `BI-4`, `BI-5`, `BIZ-1`, `BIZ-2`, `BLD-6`, `DATA-18`, `DATA-20`, `DATA-21`, `DATA-22`, `DATA-23`, `DATA-24`, `DATA-25`, `DATA-26`, `DATA-27`, `DATA-4`, `DATA-5`, `DATA-6`, `DATA-8`, `DOC-2`, `GOV-1`, `GOV-3`, `GOV-5`, `INT-2`, `OPS-2`, `OPS-3`, `OPS-6`, `OPS-8`, `QA-1`, `QRY-1`, `QS-2`, `QS-4`, `REL-1`, `REL-2`, `REL-4`, `REL-7`, `REL-9`, `SEC-20`, `SEC-22`, `SEC-34`, `SEC-4`, `SEC-40`, `SEC-47`, `SEC-7`, `SRC-15`, `SRC-18`, `SRC-2`, `SRC-22`, `SRC-23`, `SRC-24`, `SRC-25`, `SRC-26`, `SRC-27`, `SRC-28`, `SRC-30`, `SRC-31`, `SRC-32`, `SRC-5`, `VER-1`
 
 ## Dates
 
@@ -454,7 +456,6 @@ rejected** with the date.
 | `DEC-4` | Train and serve models | Build · No | No | Product owner |
 | `DEC-5` | Mobile app | Build · No | No | Product owner |
 | `DEC-6` | Share data with another organisation | Build · Defer · No | Defer | Product owner |
-| `DEC-8` | Which assistant actions need human approval before they run (today: deletions and pauses) | Add: make a dashboard public or embeddable · change who can see a dashboard · email outside the company · delete a dashboard — each on or off | Add all four | Product owner |
 | `DEC-10` | Data and Query Studio edge cases: entity-relationship diagram, a no-code connector builder, business glossary and domains, table favourites, real-time query co-editing, Git for queries | Drop · Defer · Build, each of the six | Drop or defer all six | Product owner |
 | `INT-1` | Digital employees | Build · Park | Parked (product owner, 2026-10-02) | Product owner |
 
@@ -477,6 +478,7 @@ rejected** with the date.
 | `DEC-12` | Name staff as Owner and Acceptor in the public repo | Decided: no. The repo names the module; the base holds the person through the module's owner | 2026-10-09 |
 | `DEC-13` | Query Studio as a module in the base | Decided: yes, its own module | 2026-10-09 |
 | `DEC-14` | Priority of `SEC-14` and `SEC-15` | Decided: P0 | 2026-10-09 |
+| `DEC-8` | Which assistant actions need human approval before they run | Decided: besides deletions and pauses, all four wait for approval: making a dashboard public or embeddable, changing who can see a dashboard, emailing outside the company, deleting a dashboard. Refined 2026-10-18: an action that only narrows access (switching a public link off, withdrawing embed tokens) needs a confirm in the chat, not an approver | 2026-10-17, 2026-10-18 |
 | `DEC-9` | How to get SaaS connectors | Decided: dlt verified sources where one exists (Salesforce, HubSpot, Zendesk, Google Analytics); the other six call the adapter's `SaasSession` directly, because a dlt `rest_api` source over a plain `requests` session cannot carry AD3's same-origin link rule and address check or the bounded `Retry-After` (amended during the build, accepted at the slice 3 and 4 reviews); all on the existing dlt loader | 2026-10-19 |
 | `SEC-9` | The natural-language query endpoints run the model's SQL without masking or row filters, and need only a sign-in | Done: PR #78. The endpoints were removed; plain-language queries now route through the chat which applies masking and row filters via the policy rewriter. Hardening after Done, in PR #105 (`8b67ee2`): the assistant's `run_sql` refuses a statement the policy forbids before sending anything to `ClickHouse` (it used to send `EXPLAIN AST` first) | 2026-10-07 |
 | `SEC-11` (agent endpoints) | The agent endpoints return raw database error text | Done: PR #78. The endpoints were removed | 2026-10-07 |

@@ -18,3 +18,8 @@ test("isPublicPath keeps the three existing public surfaces public", () => {
     assert.equal(isPublicPath(path), true, path)
   }
 })
+
+test("isPublicPath lets the PDF print view render without a session (BI-1)", () => {
+  assert.equal(isPublicPath("/render/dashboard/some.token"), true)
+  assert.equal(isPublicPath("/renderer"), false)
+})

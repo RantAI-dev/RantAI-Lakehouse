@@ -555,8 +555,12 @@ pub struct Board {
     /// dialog and the parity corpus already read.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub updated_at: Option<String>,
-    /// Public read-only share token, when enabled.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
+    /// The public link token the row carried before `BI-19` part A moved links
+    /// to Postgres (migration `0098`). Nothing reads it for sharing any more and
+    /// it is never serialised: the live link is `lakehouse_store::public_links`.
+    /// It is still carried through a save because every save is a full-row
+    /// INSERT, and the start-up copy of old links reads it until it has run.
+    #[serde(skip_serializing, default)]
     pub public_token: Option<String>,
     /// Whether signed (JWT) embedding is enabled.
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -635,7 +639,9 @@ fn new_chart_id() -> String {
     format!("u_{}", random_hex(4))
 }
 
-fn new_public_token() -> String {
+/// A fresh public link token (`p_` and 32 hex characters, 128 random bits).
+#[must_use]
+pub fn new_public_token() -> String {
     format!("p_{}", random_hex(16))
 }
 
@@ -1045,7 +1051,9 @@ async fn ensure_bi_table_uncached(ch: &ChClient) -> Result<(), ChError> {
     // aggregation:
     // - `revoked_before` = `max(revoked_before)` over `revoke_all` events;
     // - withdrawn tokens = `jti` with `max(exp)` over unexpired `withdraw` events;
-    // - allowed origins = newest `origins` event (`argMax` on `at`).
+    // - allowed origins = newest `origins` event (`argMax` on `at`);
+    // - filter modes = newest `filter_modes` event (its JSON object is kept in
+    //   `origins_json`, BI-26 D2).
     ch.exec(
         "CREATE TABLE IF NOT EXISTS console.bi_board_embed_event (\n\
            board_id String, kind LowCardinality(String),\n\
@@ -1198,7 +1206,7 @@ const BOARD_COLS: &str = "id, name, description, created_by, layout_json, filter
 pub(crate) const BOARD_KEEP_COLS: &str = "id, name, description, created_by, layout_json, filters_json, public_token, embed_enabled, folder_id, refresh_seconds, grain, params_json, tabs_json, phone_layout_json, theme, font, owner_id";
 
 /// A board in the personal space cannot be shared. Move it to a folder first.
-const PERSONAL_NOT_SHAREABLE: &str =
+pub const PERSONAL_NOT_SHAREABLE: &str =
     "A dashboard in the personal space cannot be shared. Move it to a folder first.";
 
 fn parse_layout(s: &str) -> LayoutMap {
@@ -1580,10 +1588,11 @@ async fn save_board_patch(
         .filters
         .or(board.filters.as_deref())
         .unwrap_or(&empty_filters);
-    let public_token = patch
-        .public_token
-        .or(board.public_token.as_deref())
-        .unwrap_or("");
+    // BI-19 part A (plan D2): a save no longer decides anything about a public
+    // link. The live link is in Postgres; this is only the old column carried
+    // forward unchanged so the full-row INSERT does not blank it before the
+    // start-up copy has read it.
+    let public_token = board.public_token.as_deref().unwrap_or("");
     let embed_enabled = patch
         .embed_enabled
         .unwrap_or_else(|| board.embed_enabled.unwrap_or(false));
@@ -1646,7 +1655,6 @@ struct BoardPatch<'a> {
     created_by: Option<&'a str>,
     layout: Option<&'a LayoutMap>,
     filters: Option<&'a [FilterDef]>,
-    public_token: Option<&'a str>,
     embed_enabled: Option<bool>,
     folder_id: Option<&'a str>,
     owner_id: Option<&'a str>,
@@ -1717,20 +1725,27 @@ pub async fn describe_board(ch: &ChClient, id: &str, description: &str) -> Resul
 /// link or signed embeds on cannot go into the personal space: a draft that
 /// is shared is not a draft, and the link would keep working for everyone
 /// else, so the move is refused until sharing is turned off.
+/// `has_public_link` is whether the board has a link in Postgres (`BI-19` part
+/// A, plan D5): the link no longer lives on the board row, so the caller asks
+/// `lakehouse_store::public_links` and says so here.
 ///
 /// # Errors
 ///
 /// Returns [`BiError::Validation`] if the board does not exist or is shared
 /// and the folder is a personal space, or [`BiError::Clickhouse`] on a
 /// `ClickHouse` failure.
-pub async fn move_board(ch: &ChClient, id: &str, folder_id: &str) -> Result<(), BiError> {
+pub async fn move_board(
+    ch: &ChClient,
+    id: &str,
+    folder_id: &str,
+    has_public_link: bool,
+) -> Result<(), BiError> {
     ensure_bi_table(ch).await?;
     let board = get_board(ch, id, &Viewer::system())
         .await?
         .ok_or_else(|| BiError::Validation("dashboard not found.".to_owned()))?;
     let owner = crate::folders::folder_owner(ch, folder_id).await?;
-    let shared = board.embed_enabled == Some(true)
-        || board.public_token.as_deref().is_some_and(|t| !t.is_empty());
+    let shared = board.embed_enabled == Some(true) || has_public_link;
     if !owner.is_empty() && shared {
         return Err(BiError::Validation(
             "Turn off sharing before moving a dashboard to the personal space.".to_owned(),
@@ -2184,45 +2199,6 @@ pub async fn restore_board_fields(
     Ok(())
 }
 
-/// Enable/disable the public read-only share link for a board. `enable =
-/// true` mints a token if one doesn't already exist; `enable = false` clears
-/// it (revoke). Returns the active token (`""` if revoked). Ports
-/// `setBoardPublic`.
-///
-/// # Errors
-///
-/// Returns [`BiError::Validation`] if the board does not exist, or
-/// [`BiError::Clickhouse`] on a `ClickHouse` failure.
-pub async fn set_board_public(ch: &ChClient, id: &str, enable: bool) -> Result<String, BiError> {
-    ensure_bi_table(ch).await?;
-    let board = get_board(ch, id, &Viewer::system())
-        .await?
-        .ok_or_else(|| BiError::Validation("dashboard not found.".to_owned()))?;
-    if enable && board.owner_id.is_some() {
-        return Err(BiError::Validation(PERSONAL_NOT_SHAREABLE.to_owned()));
-    }
-    let token = if enable {
-        let existing = board.public_token.clone().unwrap_or_default();
-        if existing.is_empty() {
-            new_public_token()
-        } else {
-            existing
-        }
-    } else {
-        String::new()
-    };
-    save_board_patch(
-        ch,
-        &board,
-        BoardPatch {
-            public_token: Some(&token),
-            ..Default::default()
-        },
-    )
-    .await?;
-    Ok(token)
-}
-
 /// Enable/disable signed (JWT) embedding for a board. Ports `setBoardEmbed`.
 ///
 /// # Errors
@@ -2280,6 +2256,7 @@ pub(crate) fn embed_access_from_aggregate_rows(
 ) -> EmbedAccess {
     let mut revoked_before: u64 = 0;
     let mut origins = Vec::new();
+    let mut filter_modes = std::collections::BTreeMap::new();
     let mut withdrawn_map: std::collections::BTreeMap<String, u64> =
         std::collections::BTreeMap::new();
 
@@ -2294,6 +2271,18 @@ pub(crate) fn embed_access_from_aggregate_rows(
             let origins_json = row_str(row, "origins_json").trim();
             if let Ok(list) = serde_json::from_str::<Vec<String>>(origins_json) {
                 origins = list;
+            }
+        } else if kind == "filter_modes" {
+            // BI-26 (D2): the newest `filter_modes` event, kept in the same
+            // `origins_json` column (a JSON text column) so the table needs no
+            // new column. An unreadable one leaves every filter hidden, which
+            // is the safe mode.
+            let text = row_str(row, "origins_json").trim();
+            if let Ok(modes) = serde_json::from_str::<
+                std::collections::BTreeMap<String, crate::embed_access::FilterMode>,
+            >(text)
+            {
+                filter_modes = modes;
             }
         } else if kind == "withdraw" {
             let jti = row_str(row, "jti");
@@ -2317,6 +2306,7 @@ pub(crate) fn embed_access_from_aggregate_rows(
         revoked_before,
         withdrawn,
         origins,
+        filter_modes,
     }
 }
 
@@ -2335,6 +2325,24 @@ pub async fn get_board_embed_access(ch: &ChClient, board_id: &str) -> Result<Emb
     );
     let rows = ch.rows(&sql, None).await?;
     Ok(embed_access_from_aggregate_rows(&rows))
+}
+
+/// Whether a token id has been withdrawn on ANY dashboard (`BI-26` review fix
+/// (SHOULD-FIX) R2). A chart token is withdrawn through the dashboard its chart
+/// is on; if the chart is moved, the withdrawal stays on the old dashboard's
+/// events, so a chart token is also checked against every dashboard's.
+///
+/// # Errors
+///
+/// Returns [`ChError`] on a `ClickHouse` failure.
+pub async fn jti_withdrawn_anywhere(ch: &ChClient, jti: &str) -> Result<bool, ChError> {
+    ensure_bi_table(ch).await?;
+    let sql = format!(
+        "SELECT count() AS n FROM console.bi_board_embed_event WHERE kind='withdraw' AND jti={}",
+        SqlLiteral::from(jti)
+    );
+    let rows = ch.rows(&sql, None).await?;
+    Ok(rows.first().map_or(0, |r| row_u64(r, "n")) > 0)
 }
 
 /// Replace the sites allowed to frame a board's embed pages (`SEC-12`).
@@ -2367,6 +2375,35 @@ pub async fn set_board_embed_origins(
     );
     ch.exec(&sql, None).await?;
     Ok(origins)
+}
+
+/// Replace the embed mode of a board's filters (`BI-26`, plan D2): an event in
+/// `console.bi_board_embed_event`, so a dashboard save cannot bring an old set
+/// back (`SEC-12` decision 8). The newest event wins. Returns what was stored.
+///
+/// # Errors
+///
+/// [`BiError::Validation`] if the board does not exist or the modes are not
+/// acceptable ([`embed_access::validate_filter_modes`]);
+/// [`BiError::Clickhouse`] on a `ClickHouse` failure.
+pub async fn set_board_embed_filter_modes(
+    ch: &ChClient,
+    id: &str,
+    modes: &std::collections::BTreeMap<String, embed_access::FilterMode>,
+) -> Result<(), BiError> {
+    embed_access::validate_filter_modes(modes).map_err(BiError::Validation)?;
+    ensure_bi_table(ch).await?;
+    if !board_exists(ch, id).await? {
+        return Err(BiError::Validation("dashboard not found.".to_owned()));
+    }
+    let json = serde_json::to_string(modes).unwrap_or_else(|_| "{}".to_owned());
+    let sql = format!(
+        "INSERT INTO console.bi_board_embed_event (board_id, kind, origins_json) VALUES ({}, 'filter_modes', {})",
+        SqlLiteral::from(id),
+        SqlLiteral::from(json),
+    );
+    ch.exec(&sql, None).await?;
+    Ok(())
 }
 
 /// "Withdraw all embed tokens" for a board (`SEC-12`): every token whose
@@ -2452,32 +2489,33 @@ pub async fn withdraw_embed_token(
     Ok(())
 }
 
-/// Fetch a board by its public share token (read-only, no auth). `None` if
-/// blank or not shared. Ports `getBoardByToken`.
+/// The public links that live dashboards carried in their own row before
+/// `BI-19` part A moved links to Postgres (migration `0098`): `(board id,
+/// token)` for every live dashboard with a non-empty `public_token`, outside
+/// the personal space. Read once, at start, to copy them (feature A2); nothing
+/// else reads that column any more.
 ///
 /// # Errors
 ///
 /// Returns [`ChError`] on a `ClickHouse` failure.
-pub async fn get_board_by_token(ch: &ChClient, token: &str) -> Result<Option<Board>, ChError> {
+pub async fn legacy_public_links(ch: &ChClient) -> Result<Vec<(String, String)>, ChError> {
     ensure_bi_table(ch).await?;
-    let t = token.trim();
-    if t.is_empty() {
-        return Ok(None);
-    }
-    // A public link is read by nobody in particular, so a board in the
-    // personal space is out of reach even if a link was issued before it was
-    // moved there (`move_board` refuses that move; this is the second lock).
     let sql = format!(
-        "SELECT {BOARD_COLS} FROM console.bi_board FINAL WHERE is_deleted = 0 AND public_token={}{} LIMIT 1",
-        SqlLiteral::from(t),
+        "SELECT id, public_token FROM console.bi_board FINAL \
+         WHERE is_deleted = 0 AND public_token != ''{}",
         Viewer::anonymous().owner_clause()
     );
     let rows = ch.rows(&sql, None).await?;
-    let Some(mut board) = rows.first().map(row_to_board) else {
-        return Ok(None);
-    };
-    board.embed_access = get_board_embed_access(ch, &board.id).await?;
-    Ok(Some(board))
+    Ok(rows
+        .iter()
+        .map(|r| {
+            (
+                row_str(r, "id").to_owned(),
+                row_str(r, "public_token").to_owned(),
+            )
+        })
+        .filter(|(id, token)| !id.is_empty() && !token.is_empty())
+        .collect())
 }
 
 /// Move a board and every chart on it to the trash (`BI-18` part C, part 2).
@@ -6042,6 +6080,35 @@ mod tests {
         ]
     }
 
+    /// `BI-26` plan D2: the filter modes are the newest `filter_modes` event
+    /// (the aggregate query gives one row per kind and `jti`, `argMax` on
+    /// `at`); no such event leaves every filter hidden; an unreadable one too.
+    #[test]
+    fn the_aggregate_read_takes_the_filter_modes_event_and_hides_what_it_cannot_read() {
+        use crate::embed_access::FilterMode;
+        let modes = |json: &str| {
+            serde_json::json!({ "kind": "filter_modes", "origins_json": json })
+                .as_object()
+                .unwrap()
+                .clone()
+        };
+        let access = embed_access_from_aggregate_rows(&[modes(
+            r#"{"region":"locked","year":"editable","city":"hidden"}"#,
+        )]);
+        assert_eq!(access.mode_of("region"), FilterMode::Locked);
+        assert_eq!(access.mode_of("year"), FilterMode::Editable);
+        assert_eq!(access.mode_of("city"), FilterMode::Hidden);
+        assert_eq!(access.mode_of("not_listed"), FilterMode::Hidden);
+        assert_eq!(
+            embed_access_from_aggregate_rows(&[]).mode_of("region"),
+            FilterMode::Hidden
+        );
+        let unreadable = embed_access_from_aggregate_rows(&[modes("not json")]);
+        assert!(unreadable.filter_modes.is_empty());
+        // The modes ride in the origins column but are not origins.
+        assert!(access.origins.is_empty());
+    }
+
     /// PR #105 review SHOULD-FIX 1 / acceptance check (b):
     /// the aggregate read maps rows from `console.bi_board_embed_event` to
     /// `EmbedAccess` (max `revoked_before`, union of `jti` with max `exp`,
@@ -6562,7 +6629,9 @@ mod tests {
         assert_eq!(json.get("updatedAt").unwrap(), "2026-01-02 00:00:00");
         assert_eq!(json.get("createdBy").unwrap(), "Bootstrap Admin");
         assert_eq!(json.get("description").unwrap(), "Ringkasan kunjungan");
-        assert_eq!(json.get("publicToken").unwrap(), "p_abc");
+        // BI-19 part A: the old column is never serialised; the live link is
+        // read from Postgres and added by the dashboard list.
+        assert!(json.get("publicToken").is_none());
         assert_eq!(json.get("embedEnabled").unwrap(), true);
         assert_eq!(json.get("folderId").unwrap(), "f_1");
         // A board nobody owns carries no owner key (BI-18 part C, part 2).
