@@ -985,7 +985,11 @@ jobs:
   g10-sso:
     name: Rust · G10 Keycloak SSO sign-in
     needs: [changes, images]
-    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
+    # Same trigger as every other acceptance gate (`g3a-dagster`, `g6-*`):
+    # `scripts/ci/required_gate.sh` requires acceptance gates when Dagster
+    # changed, so a trigger without `dagster` skipped this job and failed
+    # `ci-required` on every Dagster-only PR (found on #251, `SEC-52`).
+    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
