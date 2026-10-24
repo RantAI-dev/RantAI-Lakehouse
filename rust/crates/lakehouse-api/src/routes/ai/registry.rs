@@ -125,7 +125,8 @@ fn chart_kind_enum() -> Value {
         "histogram",
         "bullet",
         "image",
-        "web"
+        "web",
+        "gantt"
     ])
 }
 
@@ -147,7 +148,10 @@ fn with_type_properties(mut schema: Value) -> Value {
             "count": { "type": "integer", "minimum": 1, "maximum": 100, "description": "at most this many ranges" } },
             "description": "histogram only: give a width or a count, not both; leave out for about 20 ranges chosen automatically. The number column is `dimension`; a histogram takes no measures, breakdown, limit or order" },
         "url": { "type": "string", "description": "image and web only (required): an https address on a site an administrator allows in Admin > Settings; any other address is refused" },
-        "alt": { "type": "string", "maxLength": 200, "description": "image only (required): a short description of the picture for screen readers" }
+        "alt": { "type": "string", "maxLength": 200, "description": "image only (required): a short description of the picture for screen readers" },
+        "start": { "type": "string", "description": "gantt only (required): the date or date-time column a task starts at. A Gantt chart draws one bar per task: `dimension` is the task column, `breakdown` the optional group (colour), and `start`, `end` and the optional `progress` name columns; it takes no measures, aggregate, limit or order and shows the first 1,000 tasks by start" },
+        "end": { "type": "string", "description": "gantt only (required): the date or date-time column a task ends at; a row that ends before it starts is left out and counted" },
+        "progress": { "type": "string", "description": "gantt only (optional): a number column drawn as the share of the bar done" }
     });
     if let Some(props) = schema
         .pointer_mut("/function/parameters/properties")
@@ -2750,10 +2754,19 @@ mod tests {
             let schema = (find(tool).expect("registered tool").schema)();
             let properties = &schema["function"]["parameters"]["properties"];
             let kinds = properties["kind"]["enum"].as_array().unwrap();
-            for kind in ["progress", "histogram", "bullet", "image", "web"] {
+            for kind in ["progress", "histogram", "bullet", "image", "web", "gantt"] {
                 assert!(kinds.iter().any(|k| k == kind), "{tool} lacks kind {kind}");
             }
-            for field in ["goal", "bands", "histogram", "url", "alt"] {
+            for field in [
+                "goal",
+                "bands",
+                "histogram",
+                "url",
+                "alt",
+                "start",
+                "end",
+                "progress",
+            ] {
                 assert!(properties.get(field).is_some(), "{tool} lacks {field}");
             }
             assert_eq!(
@@ -2773,7 +2786,16 @@ mod tests {
         // `format_chart` changes only the look: it takes none of them.
         let format = (find("format_chart").expect("registered tool").schema)();
         let props = &format["function"]["parameters"]["properties"];
-        for field in ["goal", "bands", "histogram", "url", "alt"] {
+        for field in [
+            "goal",
+            "bands",
+            "histogram",
+            "url",
+            "alt",
+            "start",
+            "end",
+            "progress",
+        ] {
             assert!(props.get(field).is_none(), "format_chart took {field}");
         }
     }

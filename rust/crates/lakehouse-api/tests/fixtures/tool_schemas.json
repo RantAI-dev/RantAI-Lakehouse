@@ -190,7 +190,8 @@
               "histogram",
               "bullet",
               "image",
-              "web"
+              "web",
+              "gantt"
             ]
           },
           "sqlSource": {
@@ -1759,6 +1760,18 @@
             "type": "string",
             "maxLength": 200,
             "description": "image only (required): a short description of the picture for screen readers"
+          },
+          "start": {
+            "type": "string",
+            "description": "gantt only (required): the date or date-time column a task starts at. A Gantt chart draws one bar per task: `dimension` is the task column, `breakdown` the optional group (colour), and `start`, `end` and the optional `progress` name columns; it takes no measures, aggregate, limit or order and shows the first 1,000 tasks by start"
+          },
+          "end": {
+            "type": "string",
+            "description": "gantt only (required): the date or date-time column a task ends at; a row that ends before it starts is left out and counted"
+          },
+          "progress": {
+            "type": "string",
+            "description": "gantt only (optional): a number column drawn as the share of the bar done"
           }
         },
         "required": [
@@ -1822,7 +1835,8 @@
               "histogram",
               "bullet",
               "image",
-              "web"
+              "web",
+              "gantt"
             ]
           },
           "sqlSource": {
@@ -3388,6 +3402,18 @@
             "type": "string",
             "maxLength": 200,
             "description": "image only (required): a short description of the picture for screen readers"
+          },
+          "start": {
+            "type": "string",
+            "description": "gantt only (required): the date or date-time column a task starts at. A Gantt chart draws one bar per task: `dimension` is the task column, `breakdown` the optional group (colour), and `start`, `end` and the optional `progress` name columns; it takes no measures, aggregate, limit or order and shows the first 1,000 tasks by start"
+          },
+          "end": {
+            "type": "string",
+            "description": "gantt only (required): the date or date-time column a task ends at; a row that ends before it starts is left out and counted"
+          },
+          "progress": {
+            "type": "string",
+            "description": "gantt only (optional): a number column drawn as the share of the bar done"
           }
         },
         "required": [
