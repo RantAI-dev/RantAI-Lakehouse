@@ -294,7 +294,32 @@ pub(crate) async fn authorise_rule_update(
         input.connector.as_deref(),
     )
     .await?;
-    authorise_existing_rule(state, principal, id).await
+    authorise_existing_rule(state, principal, id).await?;
+    // BI-19 B1 review R6 (assistant path): the one place both the route and the
+    // assistant's `update_alert_rule` pass through.
+    authorise_digest_board(state, principal, Some(id), input).await
+}
+
+/// [`authorise_rule_scope`] plus the digest check for a rule being created:
+/// the one guard the `POST /api/alerts` route and the assistant's
+/// `create_alert_rule` both call (`BI-19` B1 review R6, assistant path).
+///
+/// # Errors
+///
+/// As [`authorise_rule_scope`] and `authorise_digest_board`.
+pub(crate) async fn authorise_rule_create(
+    state: &AppState,
+    principal: Option<&Principal>,
+    input: &AlertRuleInput,
+) -> Result<(), ApiError> {
+    authorise_rule_scope(
+        state,
+        principal,
+        input.kind.as_deref(),
+        input.connector.as_deref(),
+    )
+    .await?;
+    authorise_digest_board(state, principal, None, input).await
 }
 
 /// The check on a stored rule that an update or a delete acts on (`SRC-7`
@@ -417,20 +442,7 @@ pub async fn create(
     body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
     let input = parse_body(&body)?;
-    authorise_rule_scope(
-        &state,
-        principal.as_ref().map(|Extension(p)| p),
-        input.kind.as_deref(),
-        input.connector.as_deref(),
-    )
-    .await?;
-    authorise_digest_board(
-        &state,
-        principal.as_ref().map(|Extension(p)| p),
-        None,
-        &input,
-    )
-    .await?;
+    authorise_rule_create(&state, principal.as_ref().map(|Extension(p)| p), &input).await?;
     let rule =
         lakehouse_alerts::save_rule(&state.clickhouse, &state.webhook_sender(), &input, None)
             .await
@@ -461,13 +473,6 @@ pub async fn update(
         &state,
         principal.as_ref().map(|Extension(p)| p),
         &id,
-        &input,
-    )
-    .await?;
-    authorise_digest_board(
-        &state,
-        principal.as_ref().map(|Extension(p)| p),
-        Some(&id),
         &input,
     )
     .await?;

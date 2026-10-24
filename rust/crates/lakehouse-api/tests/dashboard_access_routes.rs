@@ -630,3 +630,38 @@ async fn a_manager_of_the_parent_folder_does_not_reach_a_restricted_child() {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
+
+/// R6 (assistant path): the assistant's `create_alert_rule` with `type=digest`
+/// goes through the same guard as the route, so a restricted dashboard's digest
+/// is refused whoever asks (the unlisted get the unknown-dashboard answer).
+#[tokio::test]
+async fn the_assistant_cannot_save_a_digest_of_a_restricted_dashboard() {
+    let (router, pool, _ch) = app().await;
+    let insider = create_principal_with_permissions(&pool, "dashboard:read, alert:write").await;
+    let outsider = create_principal_with_permissions(&pool, "dashboard:read, alert:write").await;
+    replace_item(&pool, "folder", "f1", &[view_for(insider)], true, None)
+        .await
+        .unwrap();
+    for (who, expect) in [(insider, "restricted"), (outsider, "not found")] {
+        let cookie = session_cookie_for_user(&pool, who).await;
+        let (status, body) = send(
+            &router,
+            &cookie,
+            "POST",
+            "/api/ai/tool",
+            Some(json!({
+                "tool": "create_alert_rule",
+                "args": {
+                    "name": "Weekly", "type": "digest", "board": "b_secret",
+                    "channel": "email", "target": "x@example.test", "confirmed": true,
+                },
+                "mode": "build",
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let text = body.to_string().to_lowercase();
+        assert!(text.contains(expect), "{text}");
+        assert!(!text.contains("\"ok\":true"), "{text}");
+    }
+}

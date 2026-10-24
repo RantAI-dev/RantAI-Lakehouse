@@ -64,14 +64,9 @@ pub(super) async fn create_alert_rule(
     // `SRC-7` D7: the copilot saves through `save_rule` directly, so it must
     // pass the same scope check the HTTP route does; otherwise it would be a
     // way around it.
-    if let Err(err) = crate::routes::alerts::authorise_rule_scope(
-        state,
-        principal,
-        input.kind.as_deref(),
-        input.connector.as_deref(),
-    )
-    .await
-    {
+    // BI-19 B1 review R6 (assistant path): the same create guard, which now also
+    // refuses a digest of a board the caller cannot see or that is restricted.
+    if let Err(err) = crate::routes::alerts::authorise_rule_create(state, principal, &input).await {
         return json!({ "error": err.to_string() });
     }
     // SEC-10: `save_rule` checks the webhook target with the same sender and
