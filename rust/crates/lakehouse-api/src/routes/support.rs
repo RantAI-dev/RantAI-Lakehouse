@@ -248,6 +248,7 @@ pub(crate) async fn run_spec_sql(
 /// Why [`try_run_spec_sql`] produced no rows. Kept apart so a caller whose
 /// responses must not carry `ClickHouse` text can classify the second kind
 /// itself; [`run_spec_sql`] keeps the tile behaviour of showing both.
+#[derive(Debug)]
 pub(crate) enum SpecRunFailure {
     /// Refused by the policy rewrite before any query ran; the text is fixed.
     Refused(&'static str),
@@ -300,33 +301,63 @@ pub(crate) async fn try_run_spec_sql(
         SpecRunFailure::Refused("The query limits could not be read.")
     })?;
     let seconds = u32::try_from(limits.timeout_seconds()).unwrap_or(u32::MAX);
+    // BI-4 part B: the tables are named on the rewritten statement (after the
+    // masks wrapped the governed ones), the one the engine would run.
+    let tables = crate::sql_rewrite::referenced_tables(
+        &rewritten,
+        &sqlparser::dialect::ClickHouseDialect {},
+    );
     let rewritten = lakehouse_bi::builder::with_run_settings(
         &rewritten,
         limits.chart_rows.saturating_add(1),
         seconds,
     );
-    let options = run.options(&limits, limits.chart_rows);
-    let mut r = ch
-        .query_with_options(&rewritten, &options, None)
+    let execute = || async {
+        let options = run.options(&limits, limits.chart_rows);
+        let mut r = ch
+            .query_with_options(&rewritten, &options, None)
+            .await
+            .map_err(|err| tile_failure(err, &limits))?;
+        let columns: Vec<String> = r.meta.iter().map(|m| m.name.clone()).collect();
+        // The engine was asked for `chart_rows + 1` rows and `break`s at the
+        // end of a block, so a result of more than `chart_rows + 1` rows was
+        // cut (a block is whole, it does not end one row past the cap).
+        // Exactly `chart_rows + 1` is a complete result that is one row over:
+        // it is kept as it is, because pivots and previews read one row past
+        // their own cap to tell whether they cut (`pivot_trim`,
+        // `preview_rows`), and trimming here would blind them.
+        let cut = r.data.len() > limits.chart_rows as usize + 1;
+        if cut {
+            r.data.truncate(limits.chart_rows as usize);
+        }
+        let mut out = json!({ "columns": columns, "rows": r.data });
+        if cut {
+            out["limitHit"] = limits.rows_limit_json(limits.chart_rows);
+        }
+        Ok::<_, SpecRunFailure>(crate::result_cache::Computed {
+            value: out,
+            // A cut result is answered, never remembered (BI-5 plan D6).
+            complete: !cut,
+        })
+    };
+    // BI-4 part B (plan D3, D4): the one place a remembered result is looked
+    // up. The key is the statement as the engine receives it plus the limit
+    // settings it runs under, so a different mask, a different principal
+    // filter or a different limit is a different key.
+    let Some(scope) = crate::result_cache::current() else {
+        return execute().await.map(|done| done.value);
+    };
+    let settings = [
+        (
+            "max_execution_time",
+            u64::try_from(limits.timeout.as_millis()).unwrap_or(u64::MAX),
+        ),
+        ("max_result_rows", u64::from(limits.chart_rows) + 1),
+    ];
+    scope
+        .run(ch, (&rewritten, &settings), tables, execute)
         .await
-        .map_err(|err| tile_failure(err, &limits))?;
-    let columns: Vec<String> = r.meta.iter().map(|m| m.name.clone()).collect();
-    // The engine was asked for `chart_rows + 1` rows and `break`s at the end
-    // of a block, so a result of more than `chart_rows + 1` rows was cut (a
-    // block is whole, it does not end one row past the cap). Exactly
-    // `chart_rows + 1` is a complete result that is one row over: it is kept
-    // as it is, because pivots and previews read one row past their own cap
-    // to tell whether they cut (`pivot_trim`, `preview_rows`), and trimming
-    // here would blind them.
-    let cut = r.data.len() > limits.chart_rows as usize + 1;
-    if cut {
-        r.data.truncate(limits.chart_rows as usize);
-    }
-    let mut out = json!({ "columns": columns, "rows": r.data });
-    if cut {
-        out["limitHit"] = limits.rows_limit_json(limits.chart_rows);
-    }
-    Ok(out)
+        .map(|answer| answer.value)
 }
 
 /// A `ClickHouse` failure of a tile query as the tile's failure: the engine
@@ -1191,6 +1222,92 @@ mod run_spec_sql_enforcement {
                     .contains("replaceRegexpOne(toString(`email`)")),
             "expected ClickHouse to receive the masked/rewritten query, never the raw one"
         );
+        Ok(())
+    }
+
+    /// `BI-4` part B T4 (feature decision 4, `BI-4-AC2`): a masked viewer and
+    /// an unmasked one open the same tile one after the other, in both orders,
+    /// through one shared memory. Each sees only their own values, because the
+    /// masks are in the statement the key is made of.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_masked_and_an_unmasked_viewer_never_share_a_remembered_result(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        governance::create_policy(
+            &pool,
+            &CreatePolicyInput {
+                name: "dashboard-tile-cache-masking-test".to_owned(),
+                kind: "Row filter".to_owned(),
+                subjects: "Analyst".to_owned(),
+                resources: "silver.customers".to_owned(),
+                effect: "Permit with obligation".to_owned(),
+                conditions: Some(
+                    r#"{"roles":["Analyst"],"table":"silver.customers","mask":["email"]}"#
+                        .to_owned(),
+                ),
+                activate: true,
+                owner: None,
+            },
+        )
+        .await
+        .expect("seeding the governing policy must succeed");
+        let analyst = vec!["Analyst".to_owned()];
+        let admin = vec!["Admin".to_owned()];
+        for order in [[&analyst, &admin], [&admin, &analyst]] {
+            let server = MockServer::start().await;
+            // Nothing in `system.parts`: the table is not watched, which is
+            // enough for the entry to be stored and found again.
+            Mock::given(method("POST"))
+                .and(body_string_contains("system.parts"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "meta": [], "data": [], "rows": 0,
+                })))
+                .mount(&server)
+                .await;
+            mount_masked_customers_responses(&server).await;
+            Mock::given(method("POST"))
+                .and(body_string_contains("silver.customers"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "meta": [
+                        {"name": "id", "type": "UInt64"},
+                        {"name": "email", "type": "String"},
+                    ],
+                    "data": [{"id": "1", "email": "ann@example.test"}],
+                    "rows": 1,
+                })))
+                .mount(&server)
+                .await;
+            let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+            let obligations = PolicyEngineObligations::new(Some(&pool), &ch);
+            let cache = std::sync::Arc::new(crate::result_cache::ResultCache::new(8));
+            // Each viewer twice: the second read of a viewer is the remembered
+            // one and must still be that viewer's own.
+            for roles in [order[0], order[1], order[0], order[1]] {
+                let scope = crate::result_cache::CacheScope::new(
+                    std::sync::Arc::clone(&cache),
+                    lakehouse_bi::cache_rule::CacheRule::Follow,
+                    false,
+                );
+                let (_, val) = crate::result_cache::scoped(
+                    scope,
+                    run_spec_sql(
+                        &ch,
+                        "chart1",
+                        "SELECT id, email FROM silver.customers",
+                        roles,
+                        &PlaceholderValues::none(),
+                        &obligations,
+                    ),
+                )
+                .await;
+                let expected = if roles == &analyst {
+                    "***"
+                } else {
+                    "ann@example.test"
+                };
+                assert_eq!(val["rows"][0]["email"], expected, "{roles:?}");
+            }
+        }
         Ok(())
     }
 

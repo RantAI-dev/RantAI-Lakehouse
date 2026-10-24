@@ -38,6 +38,7 @@ hmac = { workspace = true }
 # dev-dependencies it was only in so far.
 jsonwebtoken = { workspace = true }
 sha2 = { workspace = true }
+moka = { workspace = true }
 base64 = { workspace = true }
 # Builds the IdP authorize-endpoint redirect URL with `Url::query_pairs_mut`
 # rather than hand-formatting a query string — see the workspace `Cargo.toml`

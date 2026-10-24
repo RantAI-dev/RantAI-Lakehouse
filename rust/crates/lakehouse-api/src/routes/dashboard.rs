@@ -223,14 +223,24 @@ pub(crate) async fn payload_for(
     // BI-18 part C, part 2: a board in the trash or in somebody else's
     // personal space reads as a board that does not exist.
     let viewer = viewer_of(principal);
-    match get_body(
-        &state.clickhouse,
-        q,
-        param_filters,
-        &principal.role_names,
-        &placeholders,
-        &obligations,
-        (&time, requested, &viewer, &state.tile_slots),
+    // BI-4 part B: open the scope remembered results are looked up in, with
+    // the install's rule; `get_body` narrows it to the board's and the charts'.
+    let scope = crate::result_cache::CacheScope::new(
+        std::sync::Arc::clone(&state.result_cache),
+        format.result_cache,
+        false,
+    );
+    match crate::result_cache::scoped(
+        scope,
+        get_body(
+            &state.clickhouse,
+            q,
+            param_filters,
+            &principal.role_names,
+            &placeholders,
+            &obligations,
+            (&time, requested, &viewer, &state.tile_slots),
+        ),
     )
     .await
     {
@@ -394,6 +404,16 @@ async fn get_body(
     let cols = mart_columns(ch).await?;
 
     let sources = sources_for(ch, stored_for_board.iter().copied()).await?;
+    // BI-4 part B: the scope the handler opened, narrowed to this board's own
+    // rule and told the marts the board reads, so their fingerprints are read
+    // in one query. With no scope open (a caller that did not ask) nothing is
+    // remembered.
+    let cache_scope = crate::result_cache::current().map(|scope| {
+        scope.for_board(
+            board_obj.and_then(|b| b.cache),
+            cols.keys().map(|mart| format!("serving.{mart}")).collect(),
+        )
+    });
     // BI-13: the questions of a combined chart are asked as the viewer, one
     // statement each; their sources are read here, once, and a read that fails
     // only fails the questions that need it.
@@ -445,76 +465,85 @@ async fn get_body(
     for c in &stored_for_board {
         let c: &StoredChartSpec = c;
         tile_ids.push(c.spec.id.clone());
-        tiles.push(Box::pin(async move {
-            // BI-11: the chart as this read sees it, every parameter replaced
-            // by its value; a value that does not fit is this tile's plain
-            // sentence.
-            let c = match effective_chart(c, cols_ref, sources_ref, read_ref) {
-                Ok(effective) => effective,
-                Err(msg) => return (c.spec.id.clone(), json!({ "error": msg })),
-            };
-            let c = &*c;
-            // BI-18 part C: a filter tied to other tabs is not given to this
-            // tile, and so is not reported as skipped on it either.
-            let tile_filters = lakehouse_bi::layout::filters_for_chart(
-                filters_ref,
-                tabs_ref,
-                layout_ref,
-                &c.spec.id,
-            );
-            let tile_layer_ctx = crate::routes::layers::LayerContext {
-                filters: &tile_filters,
-                ..*layer_ctx_ref
-            };
-            let filtered = match stored_chart_sql(
-                c,
-                years_ref,
-                &tile_filters,
-                cols_ref,
-                sources_ref,
-                read_ref,
-            ) {
-                Ok(filtered) => filtered,
-                Err(msg) => return (c.spec.id.clone(), json!({ "error": msg })),
-            };
-            let filtered = crate::routes::support::with_map_limit(filtered, c.spec.kind).await;
-            let (id, mut val) = run_spec_sql(
-                ch,
-                &c.spec.id,
-                &filtered.sql,
-                roles,
-                placeholders,
-                obligations,
-            )
-            .await;
-            let skipped = &filtered.skipped;
-            crate::routes::support::annotate_params(&mut val, c, values_ref);
-            crate::routes::support::annotate_grain(&mut val, &filtered, c);
-            crate::routes::support::annotate_table(
-                ch,
-                &mut val,
-                &filtered,
-                (roles, placeholders, obligations),
-            )
-            .await;
-            crate::routes::layers::annotate_layers(&tile_layer_ctx, &mut val, c, filtered.grain)
+        let chart_rule = c.def.shape.cache;
+        tiles.push(Box::pin(crate::result_cache::in_chart(
+            chart_rule,
+            async move {
+                // BI-11: the chart as this read sees it, every parameter replaced
+                // by its value; a value that does not fit is this tile's plain
+                // sentence.
+                let c = match effective_chart(c, cols_ref, sources_ref, read_ref) {
+                    Ok(effective) => effective,
+                    Err(msg) => return (c.spec.id.clone(), json!({ "error": msg })),
+                };
+                let c = &*c;
+                // BI-18 part C: a filter tied to other tabs is not given to this
+                // tile, and so is not reported as skipped on it either.
+                let tile_filters = lakehouse_bi::layout::filters_for_chart(
+                    filters_ref,
+                    tabs_ref,
+                    layout_ref,
+                    &c.spec.id,
+                );
+                let tile_layer_ctx = crate::routes::layers::LayerContext {
+                    filters: &tile_filters,
+                    ..*layer_ctx_ref
+                };
+                let filtered = match stored_chart_sql(
+                    c,
+                    years_ref,
+                    &tile_filters,
+                    cols_ref,
+                    sources_ref,
+                    read_ref,
+                ) {
+                    Ok(filtered) => filtered,
+                    Err(msg) => return (c.spec.id.clone(), json!({ "error": msg })),
+                };
+                let filtered = crate::routes::support::with_map_limit(filtered, c.spec.kind).await;
+                let (id, mut val) = run_spec_sql(
+                    ch,
+                    &c.spec.id,
+                    &filtered.sql,
+                    roles,
+                    placeholders,
+                    obligations,
+                )
                 .await;
-            crate::routes::support::annotate_metric_labels(
-                &mut val,
-                c,
-                catalog_ref,
-                Some((cols_ref, sources_ref)),
-            );
-            // The tile still renders; this only lets it say which active
-            // filters its data cannot honour (no such column, or a type that
-            // does not fit).
-            if !skipped.is_empty()
-                && let Value::Object(tile) = &mut val
-            {
-                tile.insert("filtersSkipped".to_owned(), json!(skipped));
-            }
-            (id, val)
-        }));
+                let skipped = &filtered.skipped;
+                crate::routes::support::annotate_params(&mut val, c, values_ref);
+                crate::routes::support::annotate_grain(&mut val, &filtered, c);
+                crate::routes::support::annotate_table(
+                    ch,
+                    &mut val,
+                    &filtered,
+                    (roles, placeholders, obligations),
+                )
+                .await;
+                crate::routes::layers::annotate_layers(
+                    &tile_layer_ctx,
+                    &mut val,
+                    c,
+                    filtered.grain,
+                )
+                .await;
+                crate::routes::support::annotate_metric_labels(
+                    &mut val,
+                    c,
+                    catalog_ref,
+                    Some((cols_ref, sources_ref)),
+                );
+                // The tile still renders; this only lets it say which active
+                // filters its data cannot honour (no such column, or a type that
+                // does not fit).
+                if !skipped.is_empty()
+                    && let Value::Object(tile) = &mut val
+                {
+                    tile.insert("filtersSkipped".to_owned(), json!(skipped));
+                }
+                (id, val)
+            },
+        )));
     }
     let mut results = Map::new();
     // BI-5 (plan D4): a board that outlasts `ceil(tiles / 6)` rounds of the
@@ -535,9 +564,12 @@ async fn get_body(
             json!({ "error": crate::query_limits::NOT_REACHED_SENTENCE }),
         )
     };
-    for (id, val) in
-        crate::tile_pool::run_tiles_until(tile_slots, tiles, deadline, &unreached).await
-    {
+    let running = crate::tile_pool::run_tiles_until(tile_slots, tiles, deadline, &unreached);
+    let finished = match cache_scope {
+        Some(scope) => crate::result_cache::scoped(scope, running).await,
+        None => running.await,
+    };
+    for (id, val) in finished {
         results.insert(id, val);
     }
 

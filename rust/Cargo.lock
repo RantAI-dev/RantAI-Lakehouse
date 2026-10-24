@@ -2514,6 +2514,7 @@ dependencies = [
  "lakehouse-store",
  "lakehouse-test-support",
  "lakehouse-trino",
+ "moka",
  "object_store",
  "parquet",
  "rand 0.10.3",
