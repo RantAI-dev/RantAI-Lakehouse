@@ -14,9 +14,13 @@
 //! # One write replaces an item's whole state
 //!
 //! [`replace_item`] deletes the item's rules and mark and inserts the new ones
-//! in one transaction. Nobody ever reads a half-replaced list, and a second
-//! manager saving at the same time waits for the first and then replaces it
-//! (last writer wins, as for every other settings form here).
+//! in one transaction, after taking a transaction-scoped advisory lock keyed
+//! on the item (`BI-19` B1 review R7). Nobody ever reads a half-replaced list,
+//! and a second manager saving at the same time waits for the first and then
+//! replaces it (last writer wins, as for every other settings form here).
+//! Without the lock, READ COMMITTED lets two replaces each delete what they
+//! saw and each insert theirs, so the result is the union of both lists or a
+//! unique-key conflict; the lock makes the claim above true.
 
 use sqlx::{FromRow, PgPool};
 use time::OffsetDateTime;
@@ -187,6 +191,11 @@ pub async fn replace_item(
     granted_by: Option<Uuid>,
 ) -> Result<(), StoreError> {
     let mut tx = pool.begin().await?;
+    // BI-19 B1 review R7: one writer per item at a time; released at commit.
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!("{item_kind}:{item_id}"))
+        .execute(&mut *tx)
+        .await?;
     sqlx::query("DELETE FROM dashboard_access_rule WHERE item_kind = $1 AND item_id = $2")
         .bind(item_kind)
         .bind(item_id)

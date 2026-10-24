@@ -102,12 +102,17 @@ pub struct Restored {
 }
 
 /// What a sweep removed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
 pub struct Purged {
     /// Dashboards removed for good.
     pub boards: usize,
     /// Charts removed for good.
     pub charts: usize,
+    /// The ids of the dashboards removed, so the caller can drop what is kept
+    /// about them elsewhere (their permission rules in Postgres, `BI-19` B1
+    /// review R8).
+    #[serde(skip)]
+    pub board_ids: Vec<String>,
 }
 
 fn row_str<'a>(row: &'a serde_json::Map<String, Value>, key: &str) -> &'a str {
@@ -473,6 +478,7 @@ pub async fn purge_expired(ch: &ChClient) -> Result<Purged, ChError> {
     Ok(Purged {
         boards: boards.len(),
         charts: charts.len(),
+        board_ids: boards,
     })
 }
 

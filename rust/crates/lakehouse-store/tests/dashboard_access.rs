@@ -350,3 +350,33 @@ async fn names_are_found_for_the_people_and_roles_that_exist(pool: PgPool) -> sq
     assert_eq!(search_roles(&pool, "%", 10).await.unwrap().len(), 0);
     Ok(())
 }
+
+/// `BI-19` B1 review R7: two managers replacing one item at the same moment
+/// leave exactly one of the two lists (the later writer's), never their union
+/// and never a conflict error.
+#[sqlx::test(migrations = "../../migrations")]
+async fn two_concurrent_replacements_leave_exactly_one_list(pool: PgPool) -> sqlx::Result<()> {
+    let ann = user(&pool, "ann").await;
+    let bob = user(&pool, "bob").await;
+    let cy = user(&pool, "cy").await;
+    let first_list = [for_user(ann, "view")];
+    let second_list = [for_user(bob, "view"), for_user(cy, "view")];
+    for _ in 0..20 {
+        let (a, b) = tokio::join!(
+            replace_item(&pool, "board", "b1", &first_list, false, None),
+            replace_item(&pool, "board", "b1", &second_list, true, None),
+        );
+        a.unwrap();
+        b.unwrap();
+        let rules = rules_for_item(&pool, "board", "b1").await.unwrap();
+        let marked = restriction_for_item(&pool, "board", "b1")
+            .await
+            .unwrap()
+            .is_some();
+        // Either the first list alone and no mark, or the second alone and the mark.
+        let first = rules.len() == 1 && rules[0].user_id == Some(ann) && !marked;
+        let second = rules.len() == 2 && rules.iter().all(|r| r.user_id != Some(ann)) && marked;
+        assert!(first || second, "{rules:?} marked={marked}");
+    }
+    Ok(())
+}

@@ -1047,6 +1047,7 @@ fn spawn_auth_cleanup(state: &AppState) {
 /// never takes the process down.
 fn spawn_trash_sweep(state: &AppState) {
     let ch = state.clickhouse.clone();
+    let pg = state.pg.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(3600));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1054,6 +1055,21 @@ fn spawn_trash_sweep(state: &AppState) {
             interval.tick().await;
             match lakehouse_bi::trash::purge_expired(&ch).await {
                 Ok(purged) if purged.boards + purged.charts > 0 => {
+                    // BI-19 B1 review R8: a dashboard removed for good takes its
+                    // permission rules and mark with it (migration 0103 says so).
+                    // The ids are tombstoned by now, so a failure here is logged
+                    // and cannot be retried; the leftover rows name an id that
+                    // no dashboard has any more.
+                    if let Some(pg) = pg.as_deref() {
+                        for id in &purged.board_ids {
+                            if let Err(err) =
+                                lakehouse_store::dashboard_access::delete_item(pg, "board", id)
+                                    .await
+                            {
+                                tracing::warn!(%err, "permission rules of a purged dashboard were not removed");
+                            }
+                        }
+                    }
                     tracing::info!(
                         boards = purged.boards,
                         charts = purged.charts,
