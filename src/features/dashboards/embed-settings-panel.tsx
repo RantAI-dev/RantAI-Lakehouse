@@ -46,6 +46,9 @@ export function EmbedSettingsPanel({
   const [transparent, setTransparent] = React.useState(false);
   const saved = info.filterModes ?? {};
   const columns = info.filterColumns ?? [];
+  // BI-26 review fix R3: a filter that does not pick values (a range, a
+  // relative date, a text match) has nothing to lock or to offer in a dropdown.
+  const hiddenOnly = new Set(info.hiddenOnlyColumns ?? []);
   const [draft, setDraft] = React.useState<Record<string, FilterMode>>(saved);
   const [busy, setBusy] = React.useState(false);
   const [message, setMessage] = React.useState<string | null>(null);
@@ -156,8 +159,9 @@ export function EmbedSettingsPanel({
                   onChange={(e) => setDraft((cur) => ({ ...cur, [c]: e.target.value as FilterMode }))}
                   title={MODES.find((m) => m.value === modeOf(c))?.hint}
                   className="h-7 rounded-md border border-border bg-background px-2 text-xs">
-                  {MODES.map((m) => <option key={m.value} value={m.value}>{m.label}</option>)}
+                  {MODES.filter((m) => !hiddenOnly.has(c) || m.value === "hidden").map((m) => <option key={m.value} value={m.value}>{m.label}</option>)}
                 </select>
+                {hiddenOnly.has(c) ? <span className="text-[10px] text-muted-foreground">not a list of values</span> : null}
               </li>
             ))}
           </ul>

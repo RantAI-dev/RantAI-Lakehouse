@@ -279,6 +279,8 @@ export type EmbedInfo = {
   filterModes?: Record<string, FilterMode>
   /** `BI-26`: the dashboard's saved filter columns, the ones that can be given a mode. */
   filterColumns?: string[]
+  /** `BI-26` review fix R3: filter columns that do not pick values; they can only be hidden. */
+  hiddenOnlyColumns?: string[]
 }
 
 /** What a viewer of a signed embed may do with one dashboard filter (`BI-26`). */

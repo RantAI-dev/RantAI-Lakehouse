@@ -42,12 +42,14 @@ async function fetchEmbedInfo(board: string): Promise<EmbedInfo | null> {
 
 /** Public link, iframe embed and signed embedding for one user dashboard. */
 export function ShareDialog({
-  board, dashName, open, onOpenChange,
+  board, dashName, open, onOpenChange, canWrite = true,
 }: {
   readonly board: string;
   readonly dashName: string;
   readonly open: boolean;
   readonly onOpenChange: (open: boolean) => void;
+  /** Whether the caller may save filter modes; the server checks it too (`dashboard:write`). */
+  readonly canWrite?: boolean;
 }) {
   const [info, setInfo] = React.useState<EmbedInfo>(EMPTY_INFO);
   const [infoState, setInfoState] = React.useState<"loading" | "ready" | "failed">("loading");
@@ -148,7 +150,7 @@ export function ShareDialog({
                   </div>
                 </div>
 
-                <EmbedSettingsPanel board={board} info={info} origin={origin} onInfo={setInfo} />
+                <EmbedSettingsPanel board={board} info={info} origin={origin} canWrite={canWrite} onInfo={setInfo} />
 
                 <WithdrawTokens board={board} revokedBefore={info.revokedBefore}
                   onRevokedAll={(at) => setInfo((cur) => ({ ...cur, revokedBefore: at }))} />

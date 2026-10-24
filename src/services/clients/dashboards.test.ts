@@ -84,6 +84,7 @@ describe("embed state (SEC-12)", () => {
       allowedOrigins: ["https://app.example.com"],
       filterModes: {},
       filterColumns: [],
+      hiddenOnlyColumns: [],
     })
   })
 

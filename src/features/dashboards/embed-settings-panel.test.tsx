@@ -111,4 +111,20 @@ describe("EmbedSettingsPanel (BI-26 D9)", () => {
     expect(signText()).toContain('+ token + "?theme=dark&logo=none&background=transparent"')
     expect(signText()).toContain("rantai-embed:size")
   })
+
+  it("offers only Hidden for a filter that does not pick values (BI-26 review fix R3)", async () => {
+    stub()
+    render(<EmbedSettingsPanel board="b_1" info={{ ...INFO, hiddenOnlyColumns: ["year"] }} origin="https://lake.example" onInfo={() => {}} />)
+    const year = screen.getByLabelText("Mode of year") as HTMLSelectElement
+    expect(Array.from(year.options).map((o) => o.value)).toEqual(["hidden"])
+    const region = screen.getByLabelText("Mode of region") as HTMLSelectElement
+    expect(Array.from(region.options).map((o) => o.value)).toEqual(["locked", "editable", "hidden"])
+    expect(screen.getByText("not a list of values")).toBeDefined()
+  })
+
+  it("cannot save modes without the write right", async () => {
+    stub()
+    render(<EmbedSettingsPanel board="b_1" info={INFO} origin="https://lake.example" canWrite={false} onInfo={() => {}} />)
+    expect((screen.getByLabelText("Mode of year") as HTMLSelectElement).disabled).toBe(true)
+  })
 })

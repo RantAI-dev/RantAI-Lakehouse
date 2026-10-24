@@ -264,6 +264,7 @@ export const clickhouseDashboardService: DashboardService = {
       allowedOrigins: json.allowedOrigins ?? [],
       filterModes: json.filterModes ?? {},
       filterColumns: json.filterColumns ?? [],
+      hiddenOnlyColumns: json.hiddenOnlyColumns ?? [],
     }
   },
   async setEmbedFilterModes(board, modes, signal) {
