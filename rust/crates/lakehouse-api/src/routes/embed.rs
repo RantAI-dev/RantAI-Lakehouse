@@ -1597,6 +1597,7 @@ mod typed_filters {
             }]),
             theme: Some("dark".to_owned()),
             font: Some("inter".to_owned()),
+            cache: None,
             created_at: None,
             updated_at: None,
             public_token: None,

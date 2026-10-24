@@ -675,6 +675,7 @@ mod tests {
             download_denied_roles: vec!["Viewer".to_owned()],
             report_allowed_domains: vec!["example.com".to_owned()],
             public_links_enabled: false,
+            result_cache: lakehouse_bi::cache_rule::CacheRule::Minutes(45),
         };
         assert_eq!(
             checked_formatting(&body(""), &current, None).unwrap(),
