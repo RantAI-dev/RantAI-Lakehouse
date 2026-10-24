@@ -274,3 +274,35 @@ is working in; it is coordinated with them later. Nothing in `routes/ai/` or
 - **Shared-target note:** run `find .../debug/deps -type f -perm -u+x -mmin +10 -size +5M -delete` before cargo steps to keep disk up.
 
 ## 8. Review (planner appends)
+
+## 8. Review 1 (planner, 2026-10-24, `028c23ac..76b87392`)
+
+Read-only review against the plan, the feature page and the handoff. Checked fine: chart-token isolation; locked values cannot be overridden; the values route is bounded, masked and bound; hidden filters stay out of the payload; withdrawals and expiry; SEC-11; `POLICY_TABLE` and `route_auth`; independence from public links.
+
+- **R1 BLOCKER: a locked filter can never show a value outside the saved one.**
+  - `resolve_embed_filters` keeps the saved filter and ANDs the token's value onto it. A board saved with `Bali` and a token for `Java` gives an empty dashboard.
+  - Decision (reading feature decisions 5 and 7): for a column that is locked, or editable and set by the token, the token's value **replaces** the saved filter. Hidden columns stay ANDed, as today, so old tokens (owner answer 16) do not change.
+  - Same in the values route.
+  - Test: saved Bali plus a Java token shows Java rows, and no Bali predicate is sent.
+- **R2 SHOULD-FIX: moving a chart drops its tokens' withdrawals.**
+  - Decision: a chart token's `jti` withdrawal is checked across every board's events. A board-wide "withdraw all" applies to the board the chart is on now; the feature page states this limit.
+  - Test: withdraw on A, move the chart to B, and the token is refused.
+- **R3 SHOULD-FIX: locked and editable work only for `in` filters.**
+  - Decision: `put_settings` refuses `locked` or `editable` for any other operator with a fixed sentence, and the dialog offers only "hidden" for those filters with a note.
+  - Test: the refusal.
+- **R4 SHOULD-FIX: the Share dialog's preview frame is blocked by `frame-ancestors`.**
+  - Decision: embed pages also allow `'self'` (the console's own origin) in `frameAncestorsPolicy`; the comment says why.
+  - Test: the policy string.
+- **R5 SHOULD-FIX: a chart token can post one height message from the skeleton.**
+  - Decision: enable the height hook only when the payload is loaded and it is not a single chart.
+  - Test: no message before the payload arrives.
+- **R6 SHOULD-FIX: two guards are written a second time (rule 4).**
+  - `put_settings` must reuse `public_links::managed_board` (make it `pub(crate)`).
+  - `resolve_frame_origins` must reuse `verified_claims` and `admit`, mapping any refusal to `[]`.
+- **NOTE:**
+  - A "why" comment on `fetchFrameOrigins` (no session, so no `apiFetch`).
+  - `filtersSkipped` may name a hidden filter's column in combined charts. This predates BI-26; strip it from embed payloads (small).
+  - Pass the Share dialog's write flag to `EmbedSettingsPanel`.
+  - Rename the audit helper call, or comment on it.
+
+**Decisions accepted:** filter modes in `origins_json` (no migration); a chart token has no editable filters and gets 403 from the values route; editable filters must be saved filters (with R1); the single-choice dropdown for `in` filters (with R3); a single chart sends no height messages (with R5).
