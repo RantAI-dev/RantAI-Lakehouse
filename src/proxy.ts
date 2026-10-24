@@ -1,54 +1,133 @@
 import { NextResponse } from "next/server"
 import type { NextRequest } from "next/server"
-import { embedFramePolicy, type EmbedPageToken } from "@/lib/embed-frame"
+import {
+  ASK_TIMEOUT_MS,
+  CSP_HEADER,
+  NONCE_HEADER,
+  contentSecurityPolicy,
+  contentSiteReader,
+  newNonce,
+} from "@/lib/csp"
+import { embedFrame, type EmbedPageToken } from "@/lib/embed-frame"
 
 /**
- * SEC-12: the embed pages say which sites may frame them.
+ * The console's `Content-Security-Policy` for every page (`SEC-47`), and the
+ * embed pages' `frame-ancestors` (`SEC-12`).
  *
- * A page component cannot set a response header, and `next.config` headers
- * are static, but the allowed sites differ per dashboard and come from the
- * token the page was opened with. So this runs before `/embed/*` is served,
- * asks the API (`POST /api/embed/frame`, public, answers only an origin list
- * and the same empty list for a bad token) and sets
- * `Content-Security-Policy: frame-ancestors ...`. Nothing else in the console
- * is matched or changed here.
+ * One policy per request, built by `src/lib/csp.ts` with a fresh nonce: Next
+ * reads the nonce back from the request-side header this sets and puts it on
+ * its own inline scripts, and `'strict-dynamic'` lets those scripts load the
+ * page's chunks. That only happens while a page is rendered per request, so
+ * `src/app/layout.tsx` forces dynamic rendering for every route; a page
+ * prerendered at build time would carry scripts without a nonce and a browser
+ * would refuse all of them.
  *
- * Fails closed: an API that cannot be reached, answers slowly or answers
- * anything but a list gives `frame-ancestors 'none'`.
+ * The sites `img-src` and `frame-src` allow are `BI-16` part B's content
+ * sites, so a redirect from an allowed site to anywhere else is refused by
+ * the browser:
+ *
+ * - A console page asks `GET /api/settings/reporting` with the request's own
+ *   cookie (the list is one per deployment, but reading it needs a session),
+ *   reuses the answer for a minute, and gets no extra site from a failure.
+ * - An embed page asks `POST /api/embed/frame` instead, as it already does
+ *   for `frame-ancestors`, and gets that board's content sites with it: an
+ *   embed visitor has no session, and the whole deployment list is not
+ *   theirs to learn (`PR #199 review M SHOULD-FIX BI-16 1`).
+ *
+ * Both calls fail closed: an unreachable, slow or refusing API, a refused
+ * token, or an answer of the wrong shape means `frame-ancestors 'none'` and
+ * no site beyond the page's own origin.
+ *
+ * Neither call is `apiFetch` (`PR #105 review SHOULD-FIX 2`): that is the
+ * browser-side choke point — it attaches `X-Tenant` from `localStorage` and
+ * turns a `401` into a redirect to `/login` — and neither exists here, where
+ * the proxy runs on the server before any page code. The `/api` rewrite in
+ * `next.config.ts` applies to a browser navigation, not to a server-side
+ * fetch, so this asks `RUST_API_URL` directly (read at run time).
  */
 
-/** Longer than this and the page is simply not frameable. */
-const ASK_TIMEOUT_MS = 3_000
+/** The API this console serves; the same target `next.config.ts` rewrites `/api` to. */
+function apiBase(): string {
+  return process.env.RUST_API_URL ?? "http://localhost:8080"
+}
 
-async function allowedOrigins(token: EmbedPageToken): Promise<unknown> {
-  // Same target the `/api` rewrite in next.config.ts proxies to.
-  const base = process.env.RUST_API_URL ?? "http://localhost:8080"
-  // Not `apiFetch` (`PR #105 review SHOULD-FIX 2`): that is the browser-side
-  // choke point — it attaches `X-Tenant` from `localStorage` and turns a `401`
-  // into a redirect to `/login` — and neither exists in middleware, which runs
-  // on the server before any page code. The `/api` rewrite in next.config.ts
-  // applies to a browser navigation, not to a server-side fetch, so this asks
-  // the API origin directly. No cookie is forwarded on purpose: the endpoint
-  // is public and takes the embed token in the body. The answer does not
-  // depend on a session — an embed visitor has none, and gets the board's
-  // allowed sites; `frame-ancestors 'none'` is what a refused token, a board
-  // with no allowed site, or an unreachable API gets.
-  const res = await fetch(`${base}/api/embed/frame`, {
+/** `POST /api/embed/frame`: the page's allowed framing sites and content sites. */
+async function askFrame(token: EmbedPageToken): Promise<unknown> {
+  const res = await fetch(`${apiBase()}/api/embed/frame`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ [token.kind]: token.value }),
     cache: "no-store",
     signal: AbortSignal.timeout(ASK_TIMEOUT_MS),
   })
-  if (!res.ok) return []
-  return ((await res.json()) as { origins?: unknown }).origins
+  return res.ok ? await res.json() : null
+}
+
+/**
+ * `GET /api/settings/reporting` with the visitor's cookie. `contentSiteReader`
+ * owns the timeout, the one-minute cache and the fail-closed answer; an
+ * anonymous request has no cookie, gets `401` and no extra site.
+ */
+const readContentSites = contentSiteReader((cookie, signal) =>
+  fetch(`${apiBase()}/api/settings/reporting`, {
+    headers: cookie === "" ? undefined : { cookie },
+    cache: "no-store",
+    signal,
+  }),
+)
+
+/** Whether `pathname` is (or is under) the embed pages, which get the board's own list. */
+function isEmbedPath(pathname: string): boolean {
+  return pathname === "/embed" || pathname.startsWith("/embed/")
 }
 
 export async function proxy(request: NextRequest) {
-  const policy = await embedFramePolicy(request.nextUrl.pathname, allowedOrigins)
-  const response = NextResponse.next()
-  response.headers.set("Content-Security-Policy", policy)
+  const nonce = newNonce()
+  const development = process.env.NODE_ENV === "development"
+  const { pathname } = request.nextUrl
+
+  let policy: string
+  if (isEmbedPath(pathname)) {
+    const frame = await embedFrame(pathname, askFrame)
+    policy = contentSecurityPolicy({
+      nonce,
+      development,
+      contentSites: frame.contentSites,
+      frameAncestors: frame.origins,
+    })
+  } else {
+    policy = contentSecurityPolicy({
+      nonce,
+      development,
+      contentSites: await readContentSites(request.headers.get("cookie") ?? ""),
+    })
+  }
+
+  const requestHeaders = new Headers(request.headers)
+  // The guide's request-side copy: Next parses the nonce from the policy
+  // header, and app code can read it from `x-nonce` for a `<Script>` of its
+  // own (the console renders none today).
+  requestHeaders.set(NONCE_HEADER, nonce)
+  requestHeaders.set(CSP_HEADER, policy)
+  const response = NextResponse.next({ request: { headers: requestHeaders } })
+  response.headers.set(CSP_HEADER, policy)
   return response
 }
 
-export const config = { matcher: ["/embed/:path*"] }
+/*
+ * Every page, not the API's own answers (`/api` is the Rust service), not
+ * Next's compiled assets, and not a prefetch — a prefetch is a payload, never
+ * a document, and asking the settings API for one would double the calls per
+ * navigation (Next's CSP guide recommends the same filter).
+ */
+export const config = {
+  matcher: [
+    {
+      source: "/((?!api|_next/static|_next/image|favicon.ico).*)",
+      missing: [
+        { type: "header", key: "next-router-prefetch" },
+        { type: "header", key: "purpose", value: "prefetch" },
+      ],
+    },
+  ],
+}
