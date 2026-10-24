@@ -273,6 +273,19 @@ is working in; it is coordinated with them later. Nothing in `routes/ai/` or
 - **Not done / not verified:** T6 (assistant), a browser check of AC1 to AC7 (a real `ResizeObserver` in a real host page; the preview frame; the dropdown against a real ClickHouse), the webpack build.
 - **Shared-target note:** run `find .../debug/deps -type f -perm -u+x -mmin +10 -size +5M -delete` before cargo steps to keep disk up.
 
+### Fix round 1 (BI-26), after "Review 1"
+
+One commit per finding, each citing "BI-26 review fix (...) Rn" at the fix site.
+- **R1 BLOCKER** (`resolve_embed_filters`): for a column that is locked, or editable and set by the token, the token's value replaces the saved filter; hidden stays ANDed (old tokens read as before). The values route uses the same function. Tests: saved Bali + token Java for locked, editable and hidden (no Bali predicate for the first two, both for hidden); the dropdown of another filter sees 2025, not the saved 2024.
+- **R2** `store::jti_withdrawn_anywhere`: a chart token's `jti` is checked on every dashboard's events. Test: withdraw on A, move the chart to B, the token is still refused and another token of the chart works. The feature page's limits say a "withdraw all" is the dashboard's.
+- **R3** `put_settings` refuses locked/editable for a filter whose operator is not `in` (fixed sentence); embed-info lists `hiddenOnlyColumns`; the dialog offers only Hidden for them, with a note. Tests: the refusal for both modes with nothing stored, the list, the panel's options.
+- **R4** `frameAncestorsPolicy` always starts with `'self'`; an unreadable list and a path with no token stay `'none'`. Tests: the policy strings.
+- **R5** the height hook is enabled only when the payload has loaded and is not a single chart. Tests: nothing is posted while the data request is pending, one message follows; a chart token posts nothing.
+- **R6** `put_settings` uses `public_links::managed_board` (`pub(crate)`); `resolve_frame_origins` uses `verified_claims` and `admit` and maps any refusal to an empty list.
+- **NOTES taken:** a "why" comment on `fetchFrameOrigins`; `strip_hidden_skips` removes a hidden filter's column from `filtersSkipped` in signed embeds (unit test); the dialog's write flag goes to the panel (`canWrite`, default true); a comment on the audit helper. **R3, R6 and the NOTES are one Rust commit** (they edit the same functions in `routes/embed.rs`), with the console half of R3 in its own commit.
+
+**Checks run:** `embed_tokens` 38 pass; `lakehouse-api` lib filter `embed` 15; `sec11_guard` 4. **Not run (disk fell to 8.8 GB, floor 9 GB, and the run was stopped):** `route_auth` on the final tree (no route or policy row changed in this round), clippy on `lakehouse-api` and `lakehouse-bi` for R1 to R6 (the T3 clippy was clean before them), `cargo fmt --check` (package-level fmt was run after each edit), the workspace clippy. TS: `bun test src/features/dashboards src/lib src/features/admin src/services src/proxy.test.ts` 1491 pass, 0 fail; typecheck clean.
+
 ## 8. Review (planner appends)
 
 ## 8. Review 1 (planner, 2026-10-24, `028c23ac..76b87392`)
