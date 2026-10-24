@@ -420,12 +420,16 @@ async fn get_body(
     let (filters_ref, tabs_ref, layout_ref) = (&filters, &tabs, &layout);
     let (values_ref, catalog_ref, layer_ctx_ref) = (&loaded.values, &field_catalog, &layer_ctx);
     let mut tiles: Vec<futures::future::BoxFuture<'_, (String, Value)>> = Vec::new();
+    // BI-5 (plan D4): the tile ids in `tiles` order, so a tile the board's
+    // deadline cut off can still be named.
+    let mut tile_ids: Vec<String> = Vec::new();
     if on_default {
         for (id, sql_text, mart) in KPIS
             .iter()
             .map(|k| (&k.id, &k.sql, &k.mart))
             .chain(CHARTS.iter().map(|c| (&c.id, &c.sql, &c.mart)))
         {
+            tile_ids.push(id.clone());
             tiles.push(Box::pin(async move {
                 let sql = lakehouse_bi::builder::apply_builtin_year_filter(
                     sql_text, mart, years_ref, cols_ref,
@@ -436,6 +440,7 @@ async fn get_body(
     }
     for c in &stored_for_board {
         let c: &StoredChartSpec = c;
+        tile_ids.push(c.spec.id.clone());
         tiles.push(Box::pin(async move {
             // BI-11: the chart as this read sees it, every parameter replaced
             // by its value; a value that does not fit is this tile's plain
@@ -508,7 +513,27 @@ async fn get_body(
         }));
     }
     let mut results = Map::new();
-    for (id, val) in crate::tile_pool::run_tiles(tile_slots, tiles).await {
+    // BI-5 (plan D4): a board that outlasts `ceil(tiles / 6)` rounds of the
+    // caller's time limit answers the tiles that finished and says "not
+    // reached in time" for the rest, rather than a bare 408.
+    let run = crate::query_limits::QueryRun::current_or_detached();
+    let limit = run
+        .limits()
+        .await
+        .map_or(crate::query_limits::BOARD_DEADLINE_CAP, |limits| {
+            limits.timeout
+        });
+    let deadline =
+        tokio::time::Instant::now() + crate::query_limits::board_deadline(tiles.len(), limit);
+    let unreached = |i: usize| {
+        (
+            tile_ids[i].clone(),
+            json!({ "error": crate::query_limits::NOT_REACHED_SENTENCE }),
+        )
+    };
+    for (id, val) in
+        crate::tile_pool::run_tiles_until(tile_slots, tiles, deadline, &unreached).await
+    {
         results.insert(id, val);
     }
 

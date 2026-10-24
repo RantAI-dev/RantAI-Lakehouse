@@ -1248,7 +1248,27 @@ async fn render_board_payload(
             }) as futures::future::BoxFuture<'_, (String, Value, Value)>
         })
         .collect();
-    for (id, val, rendered) in crate::tile_pool::run_tiles(tile_slots, tiles).await {
+    // BI-5 (plan D4): the same board deadline as the dashboard payload.
+    let run = crate::query_limits::QueryRun::current_or_detached();
+    let limit = run
+        .limits()
+        .await
+        .map_or(crate::query_limits::BOARD_DEADLINE_CAP, |limits| {
+            limits.timeout
+        });
+    let deadline =
+        tokio::time::Instant::now() + crate::query_limits::board_deadline(tiles.len(), limit);
+    let unreached = |i: usize| {
+        let original: &StoredChartSpec = stored_for_board[i];
+        (
+            original.spec.id.clone(),
+            json!({ "error": crate::query_limits::NOT_REACHED_SENTENCE }),
+            embed_rendered(original, original),
+        )
+    };
+    for (id, val, rendered) in
+        crate::tile_pool::run_tiles_until(tile_slots, tiles, deadline, &unreached).await
+    {
         results.insert(id, val);
         charts_out.push(rendered);
     }

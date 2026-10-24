@@ -82,6 +82,34 @@ pub async fn run_tiles<'a, T>(slots: &'a Semaphore, tiles: Vec<BoxFuture<'a, T>>
     out
 }
 
+/// [`run_tiles`] with a deadline (`BI-5` plan D4): a tile that has not finished
+/// when `deadline` passes is dropped, which also ends its engine query (the
+/// request carries `cancel_http_readonly_queries_on_client_close`), and its
+/// place in the output is `unreached(index)`, so the caller answers the tiles
+/// that did finish and says "not reached in time" for the rest instead of a
+/// bare 408 (principle 2). A tile still waiting for a permit when the deadline
+/// passes is not started.
+pub async fn run_tiles_until<'a, T: 'a>(
+    slots: &'a Semaphore,
+    tiles: Vec<BoxFuture<'a, T>>,
+    deadline: tokio::time::Instant,
+    unreached: &'a (dyn Fn(usize) -> T + Send + Sync),
+) -> Vec<T> {
+    let bounded: Vec<BoxFuture<'a, T>> = tiles
+        .into_iter()
+        .enumerate()
+        .map(|(i, tile)| {
+            Box::pin(async move {
+                match tokio::time::timeout_at(deadline, tile).await {
+                    Ok(done) => done,
+                    Err(_elapsed) => unreached(i),
+                }
+            }) as BoxFuture<'a, T>
+        })
+        .collect();
+    run_tiles(slots, bounded).await
+}
+
 /// One tile under one permit. A named function, not a closure, so the
 /// compiler keeps the tile's lifetime tied to `slots` (a closure here made the
 /// request handlers' futures fail the `Send` check).
@@ -165,5 +193,24 @@ mod tests {
         assert_eq!(process_limit_from(Some(" 40 ")), 40);
         assert_eq!(process_limit_from(Some("1")), 4);
         assert_eq!(process_limit_from(Some("100000")), 128);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tiles_past_the_deadline_are_replaced_by_the_unreached_value_in_order() {
+        let slots = Semaphore::new(TILES_PER_PROCESS);
+        let tiles: Vec<BoxFuture<'_, i64>> = (0..3_i64)
+            .map(|i| {
+                Box::pin(async move {
+                    tokio::time::sleep(Duration::from_secs(if i == 1 { 100 } else { 1 })).await;
+                    i
+                }) as BoxFuture<'_, i64>
+            })
+            .collect();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let out = run_tiles_until(&slots, tiles, deadline, &|i| {
+            -100 - i64::try_from(i).unwrap_or(0)
+        })
+        .await;
+        assert_eq!(out, vec![0, -101, 2]);
     }
 }

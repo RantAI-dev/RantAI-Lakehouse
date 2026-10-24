@@ -138,6 +138,21 @@ impl Snapshot {
         }
     }
 
+    /// The longest time limit anyone can have: the install's or any role's.
+    /// The route deadline of a limit-bearing route is this plus
+    /// [`DEADLINE_MARGIN`] (plan D4).
+    #[must_use]
+    pub fn longest_timeout(&self) -> Duration {
+        let longest = self
+            .roles
+            .iter()
+            .map(|r| r.timeout_seconds)
+            .chain(std::iter::once(self.install.timeout_seconds))
+            .max()
+            .unwrap_or(self.install.timeout_seconds);
+        Duration::from_secs(u64::from(to_u32(longest)))
+    }
+
     /// The limits for `principal`.
     #[must_use]
     pub fn effective_for(&self, principal: &Principal) -> TileLimits {
@@ -336,6 +351,29 @@ pub async fn scope_middleware(State(state): State<AppState>, req: Request, next:
     scope(run, next.run(req)).await
 }
 
+/// The most a board request may take (plan D4): 35 minutes, the 30-minute
+/// ceiling of the time limit plus the margin below.
+pub const BOARD_DEADLINE_CAP: Duration = Duration::from_secs(35 * 60);
+
+/// What the deadline adds to the time the tiles may need, for the answer.
+pub const DEADLINE_MARGIN: Duration = Duration::from_secs(15);
+
+/// How long a board of `tiles` tiles may take (plan D4): the tiles run
+/// `TILES_PER_REQUEST` at a time, so it needs `ceil(tiles / 6)` rounds of the
+/// time limit, plus the margin, never more than [`BOARD_DEADLINE_CAP`].
+#[must_use]
+pub fn board_deadline(tiles: usize, limit: Duration) -> Duration {
+    let rounds = u32::try_from(tiles.div_ceil(crate::tile_pool::TILES_PER_REQUEST).max(1))
+        .unwrap_or(u32::MAX);
+    limit
+        .saturating_mul(rounds)
+        .saturating_add(DEADLINE_MARGIN)
+        .min(BOARD_DEADLINE_CAP)
+}
+
+/// What a tile says when the board's deadline passed before it finished.
+pub const NOT_REACHED_SENTENCE: &str = "Not reached in time.";
+
 /// The sentence of a tile or statement the time limit ended (plan D6): it
 /// names the limit and where it came from, and never the engine's text.
 #[must_use]
@@ -451,6 +489,16 @@ mod tests {
     }
 
     #[test]
+    fn the_longest_timeout_covers_the_install_and_every_role() {
+        let snap = snapshot_with(vec![role("A", 30), role("B", 600)]);
+        assert_eq!(snap.longest_timeout(), Duration::from_secs(600));
+        assert_eq!(
+            snapshot_with(vec![role("A", 30)]).longest_timeout(),
+            Duration::from_secs(60)
+        );
+    }
+
+    #[test]
     fn the_memo_serves_a_read_until_it_is_cleared() {
         let memo = QueryLimitsMemo::default();
         assert!(!memo.is_warm());
@@ -507,6 +555,19 @@ mod tests {
         );
         limits.source = LimitSource::Role("Analyst".to_owned());
         assert!(time_sentence("query", &limits).ends_with("the limit for your role."));
+    }
+
+    #[test]
+    fn a_boards_deadline_is_rounds_of_the_limit_plus_fifteen_seconds_capped() {
+        let limit = Duration::from_secs(60);
+        assert_eq!(board_deadline(0, limit), Duration::from_secs(75));
+        assert_eq!(board_deadline(6, limit), Duration::from_secs(75));
+        assert_eq!(board_deadline(7, limit), Duration::from_secs(135));
+        assert_eq!(board_deadline(13, limit), Duration::from_secs(195));
+        assert_eq!(
+            board_deadline(600, Duration::from_secs(1800)),
+            BOARD_DEADLINE_CAP
+        );
     }
 
     #[test]
