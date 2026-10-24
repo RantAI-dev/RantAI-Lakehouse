@@ -183,6 +183,32 @@ describe("height messages (BI-26 D7, decision 9)", () => {
     expect(posted.length).toBe(2)
   })
 
+  it("posts nothing while the payload is still loading, then the real height (BI-26 review fix R5)", async () => {
+    const { posted } = frameUnderTest()
+    let release: () => void = () => {}
+    const gate = new Promise<void>((r) => { release = r })
+    global.fetch = mock(async (input: RequestInfo | URL) => {
+      if (String(input) === "/api/embed/frame") return json({ origins: ["https://a.example"] })
+      await gate
+      return json(payload())
+    }) as unknown as typeof fetch
+    render(<EmbedView jwt="j" />)
+    await new Promise((r) => setTimeout(r, 400))
+    expect(posted.length).toBe(0)
+    release()
+    await screen.findByTestId("tile")
+    await waitFor(() => expect(posted.length).toBe(1), { timeout: 2000 })
+  })
+
+  it("posts nothing for a chart token, whose payload says it is one chart (BI-26 review fix R5)", async () => {
+    const { posted } = frameUnderTest()
+    serve({ origins: ["https://a.example"], data: payload({ onlyChart: "c1" }) })
+    render(<EmbedView jwt="j" />)
+    await screen.findByText("Visits")
+    await new Promise((r) => setTimeout(r, 350))
+    expect(posted.length).toBe(0)
+  })
+
   it("posts nothing when no site is allowed", async () => {
     const { posted } = frameUnderTest()
     serve({ origins: [] })

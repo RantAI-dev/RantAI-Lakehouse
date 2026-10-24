@@ -63,6 +63,9 @@ export function useEmbedHeight(
  * the token the page was opened with (the same answer `src/proxy.ts` turns into
  * `frame-ancestors`). Any failure is no site, so nothing is posted.
  */
+// Deliberately NOT `apiFetch`: the viewer of an embed has no session, and the
+// route is public (the token is the credential); `apiFetch`'s 401 -> /login
+// redirect would be wrong for them (BI-26 review NOTE).
 export async function fetchFrameOrigins(body: { jwt?: string; token?: string }): Promise<string[]> {
   try {
     const res = await fetch("/api/embed/frame", {

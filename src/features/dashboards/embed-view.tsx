@@ -127,7 +127,10 @@ export function EmbedView({
   }, [token, jwt]);
   // The whole dashboard reports its content height; a single chart fills the
   // frame it is given, so it has no height of its own to report.
-  useEmbedHeight(measured, frameOrigins, !(chartId ?? data?.onlyChart));
+  // BI-26 review fix (SHOULD-FIX) R5: only once the payload has arrived, so the
+  // loading skeleton's height is never posted as the dashboard's, and never for
+  // a single chart (whether the token is a chart token is known only from the payload).
+  useEmbedHeight(measured, frameOrigins, state === "ok" && data !== null && !(chartId ?? data.onlyChart));
 
   if (state === "password") {
     return <PasswordGate token={token ?? ""} onOpen={() => { setState("loading"); setAttempt((n) => n + 1); }} />;
