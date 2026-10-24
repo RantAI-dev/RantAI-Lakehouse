@@ -512,6 +512,63 @@ const PER_TABLE_UPSTREAMS: [(&str, &str); 2] = [
     (super::connectors::INGEST_JOB, INGEST_UPSTREAM_REFUSED),
 ];
 
+/// `BLD-7` / decision 2: a connector on a pipeline means *where its data
+/// came from*, never a second read path (`DEC-15`). Such a pipeline reads
+/// one of that connector's Bronze tables — the tables its ingest job
+/// actually writes — and nothing else.
+///
+/// A connector that has not loaded anything yet cannot be a source yet.
+/// The wording says what to do, not merely what is wrong.
+pub const CONNECTOR_HAS_NO_TABLES: &str =
+    "This connector has not loaded any table yet; run its ingest first.";
+
+/// `BLD-7` / decision 2, the refusal for a zone/table that is not one of
+/// the connector's ingest targets. The list is appended by
+/// [`validate_connector_source`]; the rest of the sentence is fixed so
+/// create and update say the same thing.
+const CONNECTOR_SOURCE_REFUSED_PREFIX: &str = "A pipeline with a connector reads one of that connector's Bronze tables: \
+     choose `bronze` and one of: ";
+const CONNECTOR_SOURCE_REFUSED_SUFFIX: &str = ". To read another table, choose No connector.";
+
+/// `BLD-7` / decision 2 + `DEC-15`: whether a pipeline may name
+/// `connector_id` with this source. The connector must already be
+/// verified to be in the caller's tenant (the routes run that check
+/// first), so this only reads its ingest targets.
+///
+/// `source_zone` must be `bronze` and `source_table` must be one of the
+/// connector's `source_objects[].target` values — the tables that
+/// connector's ingest job writes. Anything else is a 400 naming the
+/// tables that would be accepted, because a connector's data can only be
+/// read where it was loaded (there is no direct source read: `DEC-15`).
+///
+/// # Errors
+///
+/// [`ApiRejection`] with 400 carrying [`CONNECTOR_HAS_NO_TABLES`] when the
+/// connector has no ingest targets, or the fixed
+/// [`CONNECTOR_SOURCE_REFUSED_PREFIX`] sentence listing them otherwise.
+pub async fn validate_connector_source(
+    pool: &PgPool,
+    connector_id: &str,
+    source_zone: &str,
+    source_table: &str,
+) -> Result<(), ApiRejection> {
+    let spec = lakehouse_store::connectors::get_ingest_spec(pool, connector_id).await?;
+    let targets = spec.as_ref().map_or_else(Vec::new, |spec| {
+        lakehouse_store::connectors::ingest_targets(&spec.source_objects)
+    });
+    if targets.is_empty() {
+        return Err(ApiError::BadRequest(CONNECTOR_HAS_NO_TABLES.to_owned()).into());
+    }
+    if source_zone == "bronze" && targets.iter().any(|target| target == source_table) {
+        return Ok(());
+    }
+    Err(ApiError::BadRequest(format!(
+        "{CONNECTOR_SOURCE_REFUSED_PREFIX}{}{CONNECTOR_SOURCE_REFUSED_SUFFIX}",
+        targets.join(", ")
+    ))
+    .into())
+}
+
 /// BLD-4 / D2 + DATA-19 / D2: whether `depends_on` may list a per-table
 /// upstream (`file_ingest_job`, `ingest_job`) given the pipeline's
 /// `source_zone`.
