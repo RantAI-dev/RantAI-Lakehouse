@@ -160,6 +160,17 @@ pub struct QueryOptions {
     pub query_id: Option<String>,
 }
 
+/// Most progress headers one limited request may receive; hyper's client
+/// refuses a response with more than 100 headers in all.
+const PROGRESS_HEADERS_MAX: u128 = 80;
+
+/// The milliseconds between progress headers for a query allowed to run
+/// `limit`: one second, or more for a long limit so the count stays at most
+/// [`PROGRESS_HEADERS_MAX`].
+fn progress_interval_ms(limit: std::time::Duration) -> u128 {
+    (limit.as_millis() / PROGRESS_HEADERS_MAX).max(1000)
+}
+
 impl QueryOptions {
     /// The request's own timeout: the time limit plus [`LIMIT_MARGIN`], or
     /// `None` (the client's default) without a limit.
@@ -323,6 +334,20 @@ impl ChClient {
                     .to_string(),
             ));
             settings.push(("wait_end_of_query", "1".to_owned()));
+            // `cancel_http_readonly_queries_on_client_close` only takes effect
+            // when the server writes to the connection and finds it closed; a
+            // buffered `SELECT count()` writes nothing until it ends, so the
+            // query ran on after the client left (measured on `ClickHouse`
+            // 26.8, `docs/plans/BI-5-RESULT.md` E2). Progress headers give the
+            // server something to write: with them the query was gone 0.5 to
+            // 1 s after the client closed. hyper reads at most 100 response
+            // headers, so the interval is stretched until a limit's headers
+            // stay under `PROGRESS_HEADERS_MAX`.
+            settings.push(("send_progress_in_http_headers", "1".to_owned()));
+            settings.push((
+                "http_headers_progress_interval_ms",
+                progress_interval_ms(limit).to_string(),
+            ));
         }
         if let Some(rows) = options.max_result_rows {
             settings.push(("max_result_rows", rows.to_string()));
@@ -372,7 +397,19 @@ impl ChClient {
             // Non-tabular statements (e.g. issued without a SELECT) return a
             // bare `Ok.` body — not JSON. Treat that as an empty result
             // rather than an error, matching the TS client's try/catch.
-            Ok(serde_json::from_str::<ChResult>(&text).unwrap_or_default())
+            match serde_json::from_str::<ChResult>(&text) {
+                Ok(result) => Ok(result),
+                // Once progress headers have gone out the status line is
+                // already `200`, so an error that comes later (the time
+                // limit, a kill) arrives as the body (measured on
+                // `ClickHouse` 26.8, `docs/plans/BI-5-RESULT.md` E5). Read as
+                // "not JSON, so empty" it would turn a stopped query into an
+                // empty result.
+                Err(_) if body_is_exception(&text) => {
+                    Err(ChError::Server(server_error_message(status, &text)))
+                }
+                Err(_) => Ok(ChResult::default()),
+            }
         };
         run_cancellable(fut, cancel).await
     }
@@ -716,6 +753,16 @@ fn has_trailing_format_clause(trimmed: &str) -> bool {
 /// the `u` flag: `[A-Za-z0-9_]`.
 fn is_ascii_word_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_'
+}
+
+/// Whether a `200` body is the engine's exception text (`Code: 159. ...`),
+/// alone or after the part of the result that was written before it hit.
+fn body_is_exception(text: &str) -> bool {
+    text.trim_start().starts_with("Code: ")
+        || text
+            .lines()
+            .last()
+            .is_some_and(|last| last.starts_with("Code: ") && last.contains("DB::Exception"))
 }
 
 /// The message for a non-2xx `ClickHouse` response: the trimmed body, or a
@@ -1152,6 +1199,8 @@ mod tests {
                 "1",
             ))
             .and(query_param("wait_end_of_query", "1"))
+            .and(query_param("send_progress_in_http_headers", "1"))
+            .and(query_param("http_headers_progress_interval_ms", "1000"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
                 r#"{"meta":[{"name":"n","type":"UInt64"}],"data":[{"n":1}],"rows":1}"#,
             ))
@@ -1189,6 +1238,46 @@ mod tests {
             Some(std::time::Duration::from_secs(310))
         );
         assert_eq!(QueryOptions::default().request_timeout(), None);
+    }
+
+    #[test]
+    fn progress_headers_stay_under_the_header_cap_for_every_allowed_limit() {
+        for seconds in [10_u64, 60, 600, 1800] {
+            let limit = std::time::Duration::from_secs(seconds);
+            let interval = progress_interval_ms(limit);
+            assert!(interval >= 1000);
+            assert!(
+                limit.as_millis() / interval <= PROGRESS_HEADERS_MAX,
+                "{seconds}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_exception_that_arrives_in_a_200_body_is_an_error_not_an_empty_result() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "Code: 159. DB::Exception: Timeout exceeded: elapsed 10000.343 ms, maximum: 10000. (TIMEOUT_EXCEEDED)",
+            ))
+            .mount(&server)
+            .await;
+        let err = client(&server.uri())
+            .query("SELECT 1", None)
+            .await
+            .unwrap_err();
+        assert!(err.is_time_limit(), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_bare_ok_body_is_still_an_empty_result() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("Ok."))
+            .mount(&server)
+            .await;
+        let result = client(&server.uri()).query("SELECT 1", None).await.unwrap();
+        assert_eq!(result.rows, 0);
     }
 
     #[tokio::test]
