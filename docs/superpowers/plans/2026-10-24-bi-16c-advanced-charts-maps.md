@@ -336,3 +336,5 @@ Checks (from `/home/hv/lakehouse-phase6-build`):
 
 
 ## 8. Review (planner appends, one entry per part)
+
+Planner, 2026-10-24: the console's Gantt assumptions are the contract for T1 (result columns `task`, `group`, `start`, `end`, `progress`; optional `reversedRows`; dates as report-zone strings). Feature decision 2's "today line can be switched off" becomes a style field `todayLine: false` (planner default). The console adds the switch, and T1 validates the field.
