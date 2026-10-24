@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test"
 import {
-  embedFramePolicy,
+  embedFrame,
   embedPageToken,
   frameAncestorsPolicy,
   FRAME_ANCESTORS_NONE,
@@ -68,42 +68,76 @@ describe("embedPageToken", () => {
   })
 })
 
-describe("embedFramePolicy", () => {
-  it("asks the API with the page's token and turns the answer into the header", async () => {
+describe("embedFrame", () => {
+  it("asks the API with the page's token and turns the answer into the header's two lists", async () => {
     const asked: unknown[] = []
-    const policy = await embedFramePolicy("/embed/signed/a.b.c", async (token) => {
+    const frame = await embedFrame("/embed/signed/a.b.c", async (token) => {
       asked.push(token)
-      return ["https://app.customer.example"]
+      return {
+        origins: ["https://app.customer.example"],
+        contentSites: ["https://img.example", "https://cdn.example:8443"],
+      }
     })
     expect(asked).toEqual([{ kind: "jwt", value: "a.b.c" }])
-    expect(policy).toBe("frame-ancestors https://app.customer.example")
+    expect(frame).toEqual({
+      origins: ["https://app.customer.example"],
+      contentSites: ["https://img.example", "https://cdn.example:8443"],
+    })
   })
 
-  it("an empty list from the API is frame-ancestors 'none'", async () => {
-    expect(await embedFramePolicy("/embed/dashboard/p_x", async () => [])).toBe("frame-ancestors 'none'")
+  it("an empty answer from the API is no origin and no content site", async () => {
+    expect(await embedFrame("/embed/dashboard/p_x", async () => ({ origins: [], contentSites: [] }))).toEqual({
+      origins: [],
+      contentSites: [],
+    })
   })
 
-  it("an unknown token is whatever the API says for it, which is an empty list", async () => {
-    // The API answers {"origins": []} for a token it does not know; the
-    // header is then 'none', the same as a board with no sites listed.
-    expect(await embedFramePolicy("/embed/signed/unknown.token.x", async () => [])).toBe(FRAME_ANCESTORS_NONE)
+  it("an origin list that is not plain origins frames nothing, whatever else came with it", async () => {
+    const frame = await embedFrame("/embed/signed/a.b.c", async () => ({
+      origins: ["*", "https://ok.example"],
+      contentSites: ["https://img.example"],
+    }))
+    expect(frame.origins).toEqual(["https://ok.example"])
+    expect(frame.contentSites).toEqual(["https://img.example"])
   })
 
-  it("a failing API is frame-ancestors 'none', not an error and not open", async () => {
+  it("an unknown token is whatever the API says for it, which is the empty answer", async () => {
+    // The API answers {"origins": [], "contentSites": []} for a token it does
+    // not know; that is the same as a board with no sites listed.
+    expect(
+      await embedFrame("/embed/signed/unknown.token.x", async () => ({ origins: [], contentSites: [] })),
+    ).toEqual({ origins: [], contentSites: [] })
+  })
+
+  it("a failing API is no origin and no site, not an error and not open", async () => {
     const failing = async () => {
       throw new Error("connection refused")
     }
-    expect(await embedFramePolicy("/embed/signed/a.b.c", failing)).toBe(FRAME_ANCESTORS_NONE)
-    expect(await embedFramePolicy("/embed/signed/a.b.c", async () => "not a list")).toBe(FRAME_ANCESTORS_NONE)
+    expect(await embedFrame("/embed/signed/a.b.c", failing)).toEqual({ origins: [], contentSites: [] })
+    expect(await embedFrame("/embed/signed/a.b.c", async () => "not an object")).toEqual({
+      origins: [],
+      contentSites: [],
+    })
+    expect(await embedFrame("/embed/signed/a.b.c", async () => null)).toEqual({ origins: [], contentSites: [] })
+  })
+
+  it("a body with no content sites is no site, and a non-string entry is dropped", async () => {
+    expect(await embedFrame("/embed/signed/a.b.c", async () => ({ origins: ["https://a.example"] }))).toEqual({
+      origins: ["https://a.example"],
+      contentSites: [],
+    })
+    expect(
+      await embedFrame("/embed/signed/a.b.c", async () => ({ origins: [], contentSites: [7, null, "https://a.example"] })),
+    ).toEqual({ origins: [], contentSites: ["https://a.example"] })
   })
 
   it("a path with no token never asks the API", async () => {
     let asked = false
-    const policy = await embedFramePolicy("/embed/whatever", async () => {
+    const frame = await embedFrame("/embed/whatever", async () => {
       asked = true
-      return ["https://a.example"]
+      return { origins: ["https://a.example"], contentSites: ["https://img.example"] }
     })
     expect(asked).toBe(false)
-    expect(policy).toBe(FRAME_ANCESTORS_NONE)
+    expect(frame).toEqual({ origins: [], contentSites: [] })
   })
 })
