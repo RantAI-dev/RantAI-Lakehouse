@@ -264,4 +264,13 @@ is working in; it is coordinated with them later. Nothing in `routes/ai/` or
 
 **Not done.** T5 (Share dialog), T7 (CHANGELOG), the final checks the coordinator listed (workspace clippy, `public_links`, full TS lint of T5), and a browser check of AC1 to AC7.
 
+### BI-26 T3 verified, T5 and T7 done (final handoff)
+
+- **T3** is now verified (commit "T3 follow-up" fixes one ordering bug the run found: a chart token on a board with a locked filter got 401 instead of 403 from the values route). `cargo test -p lakehouse-api --test embed_tokens -- --test-threads=1` 34 pass; `--test route_auth -- --test-threads=2` 61 pass (includes `the_embed_values_and_settings_routes_are_gated_in_both_directions` and the public count of 11); `--test sec11_guard` 4; `--test public_links -- --test-threads=1` 10; `cargo fmt --check` clean; `cargo clippy --workspace --all-targets -- -D warnings` clean.
+- **T5** `bccc8013` the Share dialog (`embed-settings-panel.tsx`): dashboard or one chart, look options, filter modes (saved, marked unsaved until saved), a preview frame loaded on request, the signing example naming every saved locked filter, and the host snippet with the ten-line listener. `bun test src/features/dashboards src/lib src/features/admin src/services` 1485 pass, 0 fail; typecheck clean; lint 0 errors. Webpack build not run (disk; CI runs it).
+- **T7** `3bd4a258` CHANGELOG entries for BI-26 (with the `?chart=` limit and the snippet) and for BI-19 part A.
+- **Decisions accepted by the coordinator:** filter modes in `origins_json` (no migration); a chart token has no editable filters and no values route; an editable filter must be a saved dashboard filter; the dropdown is single choice; a single chart fills its frame and sends no height.
+- **Not done / not verified:** T6 (assistant), a browser check of AC1 to AC7 (a real `ResizeObserver` in a real host page; the preview frame; the dropdown against a real ClickHouse), the webpack build.
+- **Shared-target note:** run `find .../debug/deps -type f -perm -u+x -mmin +10 -size +5M -delete` before cargo steps to keep disk up.
+
 ## 8. Review (planner appends)
