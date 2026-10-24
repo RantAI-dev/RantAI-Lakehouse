@@ -205,3 +205,11 @@ One commit for the three tasks (they share `routes/lineage/charts.rs` and the mo
 Both routes are in `POLICY_TABLE`, so the table-driven `route_auth` and `route_policy` tests cover them both ways. Q6 is applied as signed: a dashboard viewer without `lineage:read` gets a 403. Open points for the planner: (1) the lineage page now lists dashboard objects that a `lineage:read` holder without `dashboard:read` can also see by name (the charts the `Viewer` allows, as the plan says); say if that should require `dashboard:read` as the SQL-source mappings do; (2) the Bronze refresh time as above. `AI-13` (T4) is not built.
 
 ## 8. Review (planner appends)
+
+### Review of T1–T3 (server, `6498398e`), planner, 2026-10-24
+
+Read against the plan and the handoff; CI on #246 is the build check (local integration tests not run, disk).
+
+- **BLOCKER B1, used-by names charts without `dashboard:read`.** `GET /api/governance/lineage/used-by` (and the chart nodes on the lineage page) list chart names to a `lineage:read` holder who lacks `dashboard:read`. Fail closed, as the SQL-source mappings already do: without `dashboard:read` no chart is named; they are counted in `hiddenCount` only. Add a route test for a `lineage:read`-only caller.
+- **Accepted, D3 gap:** the Bronze Iceberg refresh time and an upload's claim time are `notRecorded` with the `coverage` line, not read. That is the honest answer (AGENTS rule 14); no catalog-helper refactor in this PR. The planner records the follow-up in the backlog.
+- **Accepted:** T1–T3 in one commit (shared module declarations would not compile split). AI-13 (T4) stays out of this slice.

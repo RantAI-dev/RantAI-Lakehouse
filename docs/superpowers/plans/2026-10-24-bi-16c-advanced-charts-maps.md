@@ -388,3 +388,9 @@ Commits: T5 `a109bf98`, T6 `fb096312`, T7 (next commit, `list_maps`). Rust plus 
 ## 8. Review (planner appends, one entry per part)
 
 Planner, 2026-10-24: the console's Gantt assumptions are the contract for T1 (result columns `task`, `group`, `start`, `end`, `progress`; optional `reversedRows`; dates as report-zone strings). Feature decision 2's "today line can be switched off" becomes a style field `todayLine: false` (planner default). The console adds the switch, and T1 validates the field.
+
+### Review of C2b T5–T7 (server, `a109bf98`, `fb096312`, `e06018c0`), planner, 2026-10-24
+
+- **Accepted, no `geo`/`geojson` crates:** our own Douglas-Peucker in `lakehouse_bi::geo` keeps the contract (closed rings, at most 5 MB) and leaves `cargo deny`/`cargo audit` unchanged, which also keeps #246 a PR that touches no dependencies while `SEC-51` is red. Hairline gaps between neighbouring borders are already a stated limit.
+- **SHOULD-FIX S1, audit the map writes.** Upload, rename and delete of a map change what every tenant's charts can draw; other administrator writes in `routes/` record an audit event. Record one per write (map id and name, never the file), the same way the existing admin routes do.
+- **Accepted:** no tenant column (as planned), no gzip (Postgres compresses), `console.geo_region` left to C3 T9; migration `0100` (0099 is on `main`, 0098 on `feat/bi-phase-4b`).
