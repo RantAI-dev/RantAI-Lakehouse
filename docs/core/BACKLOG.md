@@ -90,6 +90,8 @@ estimate (S, M, L), which the base has no field for.
 | `SEC-47` | Task | The console sends no Content-Security-Policy. With an `img-src`/`frame-src` policy, image and web cards (`BI-16` part B) could only load from the administrator's allowed sites even after a redirect; today the list checks the address as written | Administration & Security | P2 | Todo |  | `#199` review (`BI-16` part B, decision D4) |
 | `SEC-48` | Task | `cargo audit` and `cargo deny` went red on 2026-10-23: `ctutils` 0.4.2 (pulled in by the RustCrypto crates) generated non-constant-time masks and `u128` comparisons (`RUSTSEC-2026-0385`). Bumped to the patched 0.4.4 in `Cargo.lock`; no code change | Administration & Security | P1 | Done | #230 | Security check on #224, 2026-10-23 |
 | `SRC-16` | Task | A connector loaded after the fact (files, REST, MongoDB, Kafka, SFTP) on the "pause" policy stays paused for good after its first change: nothing waits for approval, so nothing can lift it. Also a pending change that Approve refuses keeps the connector paused after every other change is approved | Data | P1 | Done | #120 | `superpowers/plans/2026-10-12-delivery-review.md` (`SRC-8` BLOCKER) |
+| `BLD-7` | Task | A pipeline made from a connector's page cannot run: *Create pipeline* fills in the connector, the API accepts it, and every run with a connector set is refused (`authored_factory.py`, `CONNECTOR_SOURCE_UNSUPPORTED_REASON`) after the pipeline was saved as ready. The connector becomes where the data came from, never a second way to read the source (`DEC-15`): such a pipeline reads one of that connector's Bronze tables, checked on create and update with a clear refusal otherwise; the run reads it like any Bronze source; the connector page opens the form with Bronze and the connector's own tables to pick from, and the pipeline runs after that table's load | Build | P1 | Todo |  | QA report 2026-10-23 (connector-sourced pipeline) |
+| `BLD-8` | Task | A failed pipeline run gives no reason in the console, and the page says "Running" for a run that failed after 5 seconds. Show the run's real state and its failure reason (the fixed, classified text, never upstream detail) on the pipeline page | Build | P1 | Todo |  | QA report 2026-10-23 (connector-sourced pipeline) |
 
 ## Next (P2)
 
@@ -227,6 +229,7 @@ estimate (S, M, L), which the base has no field for.
 | `AI-21` | Feature | The assistant undoes its last dashboard change in one step. | AI Copilot | P2 | Planned |  | `AI-1` spec |
 | `AI-22` | Task | The assistant warns about a deprecated mart and names its replacement, as the chart builder does: `describe_mart` returns the marks, but nothing tells or tests the assistant to use them (no `AI-15` request) | AI Copilot | P2 | Todo |  | `#106` review round 1 (repo 3) |
 | `SRC-27` | Task | Test Workday Reports and NetSuite on real accounts, then make them supported (a migration like `0096` and their `coverage.json` entries). Both are built and pass the `g6-saas` gate against mocks, but their wire details come from documentation that could not be read or confirmed: Workday's token request, `Report_Entry` shape and host forms (`SRC-3` slice 6 SHOULD-FIX 15); NetSuite's revocation address, who-am-i path and 100,000-row limit. Needs a Workday tenant and a NetSuite account from the product owner (`SRC-3` decision 10, acceptance check `SRC-3-AC1`) | Data | P2 | Todo |  | `plans/SRC-3-RESULT.md` |
+| `BLD-9` | Task | A pipeline's connector cannot be changed or cleared after it is created: `PUT /api/pipelines/{id}` has no `connector_id` and the field is read-only in Edit, so a wrong one means delete and re-create. Allow it in the update, with `BLD-7`'s check. **Blocked by `BLD-7`** | Build | P2 | Todo |  | QA report 2026-10-23 (connector-sourced pipeline) |
 
 ## Later (P3)
 
@@ -271,6 +274,8 @@ estimate (S, M, L), which the base has no field for.
 | `OPS-6` | Feature | Log and trace viewer | Operations | P3 | Idea |  | `docs/archive/FEATURE_COVERAGE.md` |
 | `BIZ-1` | Feature | Enterprise edition | Business | P3 | Idea |  | PRODUCT §1 |
 | `BIZ-2` | Feature | Hosted cloud version | Business | P3 | Idea |  | PRODUCT §1 |
+| `BLD-10` | Task | The pipeline form shows "FBIC" as on although nothing runs it (the job only logs that no enrichment route exists), and with it on a pipeline saves with no transform and copies its source as is. Say it is not available, or hide it, and require one transform or say the pipeline is a plain copy | Build | P3 | Todo |  | QA report 2026-10-23 (connector-sourced pipeline) |
+| `SRC-33` | Task | Drop or hash chosen columns during ingest, so a client that may not keep raw personal data still gets a Bronze table, masked before it is written. Build when a client asks (`DEC-15`) | Data | P3 | Todo |  | `DEC-15` |
 
 ## Dependencies
 
@@ -294,6 +299,7 @@ parity), built after it.
 | `BI-19` | Planned | `RPT-1` (digest schedules) | `AI-11` |
 | `BI-26` | Planned | `BI-18` (locking a dashboard filter in an embed) | `AI-11` |
 | `BLD-1` | Building | — | `REL-6` |
+| `BLD-7` | Todo | — | `BLD-9` |
 | `DATA-4` | Planned | — | `DATA-3` |
 | `DEC-8` | Open (decision) | — | `AI-11` |
 | `QS-5` | Planned | `BI-18` (the dashboard date filter) | `AI-12` (variables part) |
@@ -309,6 +315,7 @@ parity), built after it.
 | `AI-5` | Building | `BI-16` (per chart type as it lands) | — |
 | `AI-8` | Building | `BI-17` | — |
 | `AI-9` | Building | `BI-18` (templates part) | — |
+| `BLD-9` | Todo | `BLD-7` | — |
 | `DATA-3` | Planned | `DATA-4` | — |
 | `QS-3` | Planned | `SEC-20` | — |
 | `REL-6` | Todo | `BLD-1` | — |
@@ -316,7 +323,7 @@ parity), built after it.
 
 **Ready to start** (Todo, Planned or Idea, nothing open blocks it; Idea items still need a spec):
 
-`ADM-1`, `ADM-2`, `AI-21`, `AI-22`, `BI-1`, `BI-14`, `BI-20`, `BI-27`, `BI-28`, `BI-29`, `BI-3`, `BI-30`, `BI-31`, `BI-32`, `BI-33`, `BI-4`, `BI-5`, `BIZ-1`, `BIZ-2`, `BLD-6`, `DATA-18`, `DATA-20`, `DATA-21`, `DATA-22`, `DATA-23`, `DATA-24`, `DATA-25`, `DATA-26`, `DATA-27`, `DATA-4`, `DATA-5`, `DATA-6`, `DATA-8`, `DOC-2`, `GOV-1`, `GOV-3`, `GOV-5`, `INT-2`, `OPS-2`, `OPS-3`, `OPS-6`, `OPS-8`, `QA-1`, `QRY-1`, `QS-2`, `QS-4`, `REL-1`, `REL-2`, `REL-4`, `REL-7`, `REL-9`, `SEC-20`, `SEC-22`, `SEC-34`, `SEC-38`, `SEC-39`, `SEC-4`, `SEC-40`, `SEC-47`, `SEC-7`, `SRC-15`, `SRC-18`, `SRC-2`, `SRC-22`, `SRC-23`, `SRC-24`, `SRC-25`, `SRC-26`, `SRC-27`, `SRC-28`, `SRC-30`, `SRC-31`, `SRC-32`, `SRC-5`, `VER-1`
+`ADM-1`, `ADM-2`, `AI-21`, `AI-22`, `BI-1`, `BI-14`, `BI-20`, `BI-27`, `BI-28`, `BI-29`, `BI-3`, `BI-30`, `BI-31`, `BI-32`, `BI-33`, `BI-4`, `BI-5`, `BIZ-1`, `BIZ-2`, `BLD-10`, `BLD-6`, `BLD-7`, `BLD-8`, `DATA-18`, `DATA-20`, `DATA-21`, `DATA-22`, `DATA-23`, `DATA-24`, `DATA-25`, `DATA-26`, `DATA-27`, `DATA-4`, `DATA-5`, `DATA-6`, `DATA-8`, `DOC-2`, `GOV-1`, `GOV-3`, `GOV-5`, `INT-2`, `OPS-2`, `OPS-3`, `OPS-6`, `OPS-8`, `QA-1`, `QRY-1`, `QS-2`, `QS-4`, `REL-1`, `REL-2`, `REL-4`, `REL-7`, `REL-9`, `SEC-20`, `SEC-22`, `SEC-34`, `SEC-38`, `SEC-39`, `SEC-4`, `SEC-40`, `SEC-47`, `SEC-7`, `SRC-15`, `SRC-18`, `SRC-2`, `SRC-22`, `SRC-23`, `SRC-24`, `SRC-25`, `SRC-26`, `SRC-27`, `SRC-28`, `SRC-30`, `SRC-31`, `SRC-32`, `SRC-33`, `SRC-5`, `VER-1`
 
 ## Dates
 
@@ -431,6 +438,11 @@ set by the product owner and are left empty until they are.
 | `AI-8` | 2026-10-15 | | |
 | `AI-9` | 2026-10-14 | | |
 | `SRC-3` | 2026-10-19 | 2026-10-23 | |
+| `BLD-7` | 2026-10-24 | | |
+| `BLD-8` | 2026-10-24 | | |
+| `BLD-9` | | | |
+| `BLD-10` | | | |
+| `SRC-33` | | | |
 
 ## Decide
 
@@ -474,6 +486,7 @@ rejected** with the date.
 | `DEC-9` | How to get SaaS connectors | Decided: dlt verified sources where one exists (Salesforce, HubSpot, Zendesk, Google Analytics); the other six call the adapter's `SaasSession` directly, because a dlt `rest_api` source over a plain `requests` session cannot carry AD3's same-origin link rule and address check or the bounded `Retry-After` (amended during the build, accepted at the slice 3 and 4 reviews); all on the existing dlt loader | 2026-10-19 |
 | `SEC-9` | The natural-language query endpoints run the model's SQL without masking or row filters, and need only a sign-in | Done: PR #78. The endpoints were removed; plain-language queries now route through the chat which applies masking and row filters via the policy rewriter. Hardening after Done, in PR #105 (`8b67ee2`): the assistant's `run_sql` refuses a statement the policy forbids before sending anything to `ClickHouse` (it used to send `EXPLAIN AST` first) | 2026-10-07 |
 | `SEC-11` (agent endpoints) | The agent endpoints return raw database error text | Done: PR #78. The endpoints were removed | 2026-10-07 |
+| `DEC-15` | Read a source straight into Silver, skipping Bronze (QA report 2026-10-23) | Rejected: Bronze stays the one landing zone. It lets Silver be rebuilt without reading the client's database again, keeps one raw copy for audit and lineage, and keeps one path for secrets, address checks and load modes (Ingest). Reopen if a client may not keep raw data and `SRC-33` is not enough | 2026-10-24 |
 
 ## Specs
 
