@@ -1662,23 +1662,61 @@ pub fn is_auto_disable_pause_reason(reason: &str) -> bool {
 /// What [`record_run_result`] leaves on the connector row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunHealth {
-    /// `"healthy"` after a success, `"degraded"` for 1 or 2 failures in a
-    /// row, `"unhealthy"` from [`REPEATED_FAILURE_STREAK`].
+    /// `"healthy"` after a counted success, `"degraded"` for 1 or 2 failures in
+    /// a row, `"unhealthy"` from [`REPEATED_FAILURE_STREAK`]. A late report
+    /// (`SRC-32`) leaves it as it was.
     pub health: String,
-    /// Failed runs since the last success, after this result.
+    /// Failed runs since the last counted success, after this result. A late
+    /// report (`SRC-32`) leaves it as it was.
     pub failure_streak: i32,
 }
 
 /// The statement behind [`record_run_result`] and [`record_run_once`]: one
 /// `UPDATE ... RETURNING` for the run facts, the streak and the health.
+///
+/// # A report that arrives out of order (`SRC-32`)
+///
+/// The failure and the success of a connector's runs come from two
+/// independent sensors, so one report can arrive after a report for a later
+/// run. A report is **late** when the connector has already counted a run of
+/// the *other* outcome that ended strictly later: a success is late when
+/// `last_run_failure_at > $3`, a failure when `last_run_success_at > $3`.
+/// `NULL` never makes a report late; equal times are not late.
+///
+/// A late report changes neither `failure_streak` nor `health`, because the
+/// run it describes ended before the one the connector's state describes: a
+/// success reported after a later failure cannot set the count of a run that
+/// already ended back to 0 (`SRC-32`, the `g6-ops` sequence in which the
+/// connector never paused). It still records its own run, and the recorded
+/// time only moves forward: `GREATEST` keeps an older report of the same
+/// outcome from moving `last_run_success_at`/`last_run_failure_at` back.
+///
+/// The third column says whether this report counted, which is what keeps a
+/// late failure from pausing the connector (`SRC-11` D3 in
+/// [`record_run_once`]). In Postgres every right-hand side of `SET` reads the
+/// row's old values, so all the `CASE`s above judge one snapshot; `RETURNING`
+/// reads the new row, where this statement leaves the other outcome's
+/// timestamp untouched, so it judges the same snapshot.
 const RECORD_RUN_SQL: &str = "UPDATE connector SET \
-                 last_run_success_at = CASE WHEN $2 THEN $3 ELSE last_run_success_at END, \
-                 last_run_failure_at = CASE WHEN $2 THEN last_run_failure_at ELSE $3 END, \
-                 failure_streak = CASE WHEN $2 THEN 0 ELSE failure_streak + 1 END, \
-                 health = CASE WHEN $2 THEN 'healthy' \
-                               WHEN failure_streak + 1 >= $4 THEN 'unhealthy' \
-                               ELSE 'degraded' END \
-               WHERE id = $1 RETURNING health, failure_streak";
+                 last_run_success_at = CASE WHEN $2 \
+                   THEN GREATEST(last_run_success_at, $3) ELSE last_run_success_at END, \
+                 last_run_failure_at = CASE WHEN $2 \
+                   THEN last_run_failure_at ELSE GREATEST(last_run_failure_at, $3) END, \
+                 failure_streak = CASE \
+                   WHEN $2 AND last_run_failure_at > $3 THEN failure_streak \
+                   WHEN $2 THEN 0 \
+                   WHEN last_run_success_at > $3 THEN failure_streak \
+                   ELSE failure_streak + 1 END, \
+                 health = CASE \
+                   WHEN $2 AND last_run_failure_at > $3 THEN health \
+                   WHEN $2 THEN 'healthy' \
+                   WHEN last_run_success_at > $3 THEN health \
+                   WHEN failure_streak + 1 >= $4 THEN 'unhealthy' \
+                   ELSE 'degraded' END \
+               WHERE id = $1 \
+               RETURNING health, failure_streak, \
+                 CASE WHEN $2 THEN last_run_failure_at IS NULL OR last_run_failure_at <= $3 \
+                      ELSE last_run_success_at IS NULL OR last_run_success_at <= $3 END";
 
 /// What [`record_run_once`] found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1711,11 +1749,22 @@ pub struct RunRecord {
 /// `kind` is the dedupe kind of the outcome (`"failure"` or `"success"`,
 /// `routes::load_alerts::Outcome::event_kind`).
 ///
+/// # A report that arrives late (`SRC-32`)
+///
+/// A report whose run ended before a counted run of the other outcome changes
+/// neither the streak nor the health ([`RECORD_RUN_SQL`] says how "late" is
+/// decided): the connector's state describes its latest run, so a success
+/// reported after a later failure must not clear the count that failure
+/// started. The run's dedupe row still gets the streak the connector holds at
+/// that moment, its own run time moves forward, and the retry of that report
+/// answers the same way.
+///
 /// # Auto-disable (`SRC-11` decision D3)
 ///
-/// A failed run that brings the streak to `auto_disable_after` or more pauses
-/// the connector, in the same transaction as the count, with
-/// [`auto_disable_pause_reason`]. It pauses once: a connector that is already
+/// A counted failed run that brings the streak to `auto_disable_after` or more
+/// pauses the connector, in the same transaction as the count, with
+/// [`auto_disable_pause_reason`]. A late failure never pauses: the streak it
+/// reads is the one a later run already reached. It pauses once: a connector that is already
 /// paused (by the schema-change policy, say) keeps its pause and its reason,
 /// and the run is not reported as having disabled it. When this run did pause
 /// it, a dedupe row `(run_id, "auto_disabled")` is written with it, so
@@ -1772,14 +1821,14 @@ pub async fn record_run_once(
             auto_disabled,
         });
     }
-    let row: Option<(String, i32)> = sqlx::query_as(RECORD_RUN_SQL)
+    let row: Option<(String, i32, bool)> = sqlx::query_as(RECORD_RUN_SQL)
         .bind(id)
         .bind(succeeded)
         .bind(at)
         .bind(REPEATED_FAILURE_STREAK)
         .fetch_optional(&mut *tx)
         .await?;
-    let Some((_health, failure_streak)) = row else {
+    let Some((_health, failure_streak, counted)) = row else {
         // Dropping `tx` rolls the dedupe row back with it.
         return Err(StoreError::NotFound);
     };
@@ -1793,8 +1842,10 @@ pub async fn record_run_once(
     .await?;
     // `SRC-11` D3: the pause and its dedupe row are part of counting the run.
     // `paused_at IS NULL` makes it pause once, and leave another pause alone.
+    // `counted` keeps a late report (`SRC-32`) from pausing: the streak it
+    // reads is the one a later run already reached.
     let mut auto_disabled = false;
-    if !succeeded && failure_streak >= auto_disable_after {
+    if counted && !succeeded && failure_streak >= auto_disable_after {
         let paused: Option<(String,)> = sqlx::query_as(
             "UPDATE connector SET paused_reason = $2, paused_at = $3 \
              WHERE id = $1 AND paused_at IS NULL RETURNING id",
@@ -1891,6 +1942,12 @@ pub async fn resume_connector(pool: &PgPool, id: &str) -> Result<ResumeOutcome, 
 /// [`REPEATED_FAILURE_STREAK`], `unhealthy` from it. `at` is the caller's
 /// run-end time; nothing is stamped that was not reported.
 ///
+/// A report whose run ended before a counted run of the other outcome changes
+/// neither the streak nor the health, and moves its own run time forward only
+/// ([`RECORD_RUN_SQL`], `SRC-32`): the answer describes the connector's latest
+/// run, so a late success does not read as `"healthy"` on a connector whose
+/// later run failed.
+///
 /// This function counts every call. The run report does not use it directly:
 /// it goes through [`record_run_once`], which dedupes the run in the same
 /// transaction (`SRC-17` F2).
@@ -1905,14 +1962,14 @@ pub async fn record_run_result(
     succeeded: bool,
     at: OffsetDateTime,
 ) -> Result<RunHealth, StoreError> {
-    let row: Option<(String, i32)> = sqlx::query_as(RECORD_RUN_SQL)
+    let row: Option<(String, i32, bool)> = sqlx::query_as(RECORD_RUN_SQL)
         .bind(id)
         .bind(succeeded)
         .bind(at)
         .bind(REPEATED_FAILURE_STREAK)
         .fetch_optional(pool)
         .await?;
-    let Some((health, failure_streak)) = row else {
+    let Some((health, failure_streak, _counted)) = row else {
         return Err(StoreError::NotFound);
     };
     Ok(RunHealth {
