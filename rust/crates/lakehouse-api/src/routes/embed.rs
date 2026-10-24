@@ -68,6 +68,49 @@ fn token_refused() -> Response {
         .into_response()
 }
 
+/// What a verified token names, resolved to its dashboard (`BI-26` plan D1).
+pub(crate) struct Subject {
+    /// The dashboard every board check (embedding on, withdrawal, allowed
+    /// sites) is made on. For a chart token, the chart's own dashboard.
+    pub board_id: String,
+    /// The one chart a chart token may read; `None` for a dashboard token.
+    pub only_chart: Option<String>,
+}
+
+/// Resolve what a token names. `None` is a refusal and the caller answers it
+/// with the one token message: the token names nothing, or both a dashboard and
+/// a chart, or a chart that is unknown, in the trash or on a personal board
+/// (the chart is looked up as nobody in particular, like the payload). One
+/// helper for `data`, `frame_origins` and `revoke_token` (AGENTS rule 4).
+///
+/// # Errors
+///
+/// [`lakehouse_clickhouse::ChError`] when the chart list cannot be read.
+pub(crate) async fn subject_of(
+    ch: &ChClient,
+    resource: Option<&lakehouse_embed::EmbedResource>,
+) -> Result<Option<Subject>, lakehouse_clickhouse::ChError> {
+    match resource.and_then(lakehouse_embed::EmbedResource::target) {
+        Some(lakehouse_embed::EmbedTarget::Dashboard(id)) => Ok(Some(Subject {
+            board_id: id.to_owned(),
+            only_chart: None,
+        })),
+        Some(lakehouse_embed::EmbedTarget::Chart(id)) => {
+            let stored = store::list_stored_charts(ch, &Viewer::anonymous()).await?;
+            Ok(stored.iter().find(|c| c.spec.id == id).map(|c| Subject {
+                // A chart with no board is on the built-in dashboard.
+                board_id: if c.board.is_empty() {
+                    store::DEFAULT_BOARD_ID.to_owned()
+                } else {
+                    c.board.clone()
+                },
+                only_chart: Some(id.to_owned()),
+            }))
+        }
+        None => Ok(None),
+    }
+}
+
 /// `POST /api/embed/data` — signed-embed (Metabase-style) dashboard data.
 pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
     // `try { jwt = String((await req.json())?.jwt ?? "") } catch { /* ignore */ }`
@@ -109,13 +152,18 @@ pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
         }
     };
 
-    let Some(board_id) = claims
-        .resource
-        .and_then(|r| r.dashboard)
-        .filter(|d| !d.is_empty())
-    else {
-        return token_refused();
+    let subject = match subject_of(&state.clickhouse, claims.resource.as_ref()).await {
+        Ok(Some(subject)) => subject,
+        Ok(None) => return token_refused(),
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ApiJson(upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json()),
+            )
+                .into_response();
+        }
     };
+    let board_id = subject.board_id;
 
     let board = match store::get_board(&state.clickhouse, &board_id, &Viewer::anonymous()).await {
         Ok(b) => b,
@@ -170,6 +218,7 @@ pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
         &board_id,
         &filters,
         &time,
+        subject.only_chart.as_deref(),
     )
     .await;
     match payload {
@@ -231,7 +280,16 @@ async fn resolve_frame_origins(state: &AppState, body: FrameBody) -> Result<Vec<
         ) else {
             return Ok(Vec::new());
         };
-        let Some(board_id) = claims.resource.and_then(|r| r.dashboard) else {
+        let subject = subject_of(&state.clickhouse, claims.resource.as_ref())
+            .await
+            .map_err(|err| {
+                upstream_error::ch_error_as(
+                    &upstream_error::DATABASE,
+                    &err,
+                    upstream_error::FailedAs::Internal,
+                )
+            })?;
+        let Some(Subject { board_id, .. }) = subject else {
             return Ok(Vec::new());
         };
         let board = store::get_board(&state.clickhouse, &board_id, &Viewer::anonymous())
@@ -315,11 +373,12 @@ pub async fn revoke_token(State(state): State<AppState>, body: Bytes) -> ApiResu
         tracing::info!(%reason, "embed token to withdraw refused");
         ApiError::BadRequest(TOKEN_REFUSED.to_owned())
     })?;
-    let for_board = claims
-        .resource
-        .as_ref()
-        .and_then(|r| r.dashboard.as_deref());
-    if for_board != Some(board) {
+    // BI-26 (D1): a chart token is withdrawn through its chart's dashboard.
+    let for_board = subject_of(&state.clickhouse, claims.resource.as_ref())
+        .await
+        .map_err(|err| crate::routes::dashboard_folders::classify_ch_error(&err))?
+        .map(|s| s.board_id);
+    if for_board.as_deref() != Some(board) {
         return Err(
             ApiError::BadRequest("that token is for a different dashboard.".to_owned()).into(),
         );
@@ -439,6 +498,7 @@ pub async fn public_dashboard(
         &board_id,
         &filters,
         &time,
+        None,
     )
     .await;
     match payload {
@@ -562,7 +622,11 @@ fn board_body(
     charts: &[Value],
     results: &serde_json::Map<String, Value>,
     time: &lakehouse_bi::grain::TimeContext,
+    only_chart: Option<&str>,
 ) -> Value {
+    if let Some(chart) = only_chart {
+        return chart_body(board, charts, results, time, chart);
+    }
     let mut body = json!({
         "board": { "id": board.id, "name": board.name },
         "layout": layout_json(board),
@@ -593,6 +657,36 @@ fn board_body(
     body
 }
 
+/// The payload of a chart token (`BI-26` plan D1): that chart's spec and result
+/// and nothing that names another: no dashboard name, no other chart id in a
+/// layout, no tabs, no phone layout. `onlyChart` tells the page to draw the one
+/// chart filling the frame. The dashboard's theme and font still apply.
+fn chart_body(
+    board: &Board,
+    charts: &[Value],
+    results: &serde_json::Map<String, Value>,
+    time: &lakehouse_bi::grain::TimeContext,
+    chart: &str,
+) -> Value {
+    let mut body = json!({
+        "board": { "id": board.id },
+        "layout": {},
+        "charts": charts,
+        "results": results,
+        "onlyChart": chart,
+        "reporting": { "timeZone": time.zone(), "weekStart": time.week_start().as_str() },
+    });
+    if let Some(board_obj) = body["board"].as_object_mut() {
+        if let Some(theme) = &board.theme {
+            board_obj.insert("theme".to_owned(), json!(theme));
+        }
+        if let Some(font) = &board.font {
+            board_obj.insert("font".to_owned(), json!(font));
+        }
+    }
+    body
+}
+
 /// Shared `{ board, layout, charts, results }` assembly for both
 /// [`data`] and [`public_dashboard`]: every stored chart belonging to
 /// `board_id`, filtered by `filters` (never by caller-supplied years —
@@ -604,6 +698,7 @@ async fn render_board_payload(
     board_id: &str,
     filters: &[FilterDef],
     time: &lakehouse_bi::grain::TimeContext,
+    only_chart: Option<&str>,
 ) -> Result<Value, lakehouse_clickhouse::ChError> {
     let roles = [EMBED_VIEWER_ROLE.to_owned()];
     let placeholders = crate::sql_rewrite::PlaceholderValues::none();
@@ -614,11 +709,13 @@ async fn render_board_payload(
     let stored_for_board: Vec<&StoredChartSpec> = stored
         .iter()
         .filter(|c| {
-            if c.board.is_empty() {
-                board_id == "default"
-            } else {
-                c.board == board_id
-            }
+            // BI-26 (D1): a chart token reads that chart and no other.
+            only_chart.is_none_or(|only| c.spec.id == only)
+                && if c.board.is_empty() {
+                    board_id == "default"
+                } else {
+                    c.board == board_id
+                }
         })
         .collect();
 
@@ -719,7 +816,7 @@ async fn render_board_payload(
         charts_out.push(rendered);
     }
 
-    Ok(board_body(board, &charts_out, &results, time))
+    Ok(board_body(board, &charts_out, &results, time, only_chart))
 }
 
 #[cfg(test)]
@@ -859,6 +956,7 @@ mod typed_filters {
             "b1",
             &filters,
             &lakehouse_bi::grain::TimeContext::default(),
+            None,
         )
         .await
         .unwrap();
@@ -1005,6 +1103,7 @@ mod typed_filters {
             "b1",
             &filters,
             &lakehouse_bi::grain::TimeContext::default(),
+            None,
         )
         .await
         .unwrap();
@@ -1112,6 +1211,7 @@ mod typed_filters {
             "b1",
             &locked,
             &lakehouse_bi::grain::TimeContext::default(),
+            None,
         )
         .await
         .unwrap();
@@ -1211,6 +1311,7 @@ mod typed_filters {
             "b1",
             &[],
             &time,
+            None,
         )
         .await
         .unwrap();

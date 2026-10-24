@@ -42,6 +42,8 @@ struct FakeCh {
     boards: Arc<Mutex<Vec<Value>>>,
     events: Arc<Mutex<Vec<Value>>>,
     log: Arc<Mutex<Vec<String>>>,
+    /// Stored chart rows (`BI-26`); empty unless a test adds some.
+    charts: Arc<Mutex<Vec<Value>>>,
 }
 
 fn seed_events_from_board(b: &Value) -> Vec<Value> {
@@ -132,6 +134,7 @@ impl FakeCh {
             boards: Arc::new(Mutex::new(boards)),
             events: Arc::new(Mutex::new(events)),
             log: Arc::new(Mutex::new(Vec::new())),
+            charts: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -171,6 +174,23 @@ impl FakeCh {
                 b[field] = value.clone();
             }
         }
+    }
+
+    /// A stored chart row (`BI-26`): `id` titled `title` on `board`.
+    fn add_chart(&self, id: &str, board: &str, title: &str) {
+        let spec = json!({
+            "id": id, "title": title, "kind": "bar", "mart": "mart_x",
+            "sql": "SELECT stored", "x": "region", "y": "visitors"
+        });
+        let def = json!({
+            "title": title, "mart": "mart_x", "kind": "bar",
+            "dimension": "region", "measures": ["visitors"]
+        });
+        self.charts.lock().unwrap().push(json!({
+            "id": id, "board": board, "created_by": "ui",
+            "created_at": "2026-01-01 00:00:00",
+            "spec_json": json!({ "spec": spec, "def": def, "hasYear": false }).to_string(),
+        }));
     }
 
     fn statements(&self) -> Vec<String> {
@@ -324,7 +344,7 @@ impl Respond for FakeCh {
             return rows(found);
         }
         if sql.contains("FROM console.bi_chart") {
-            return rows(vec![]);
+            return rows(self.charts.lock().unwrap().clone());
         }
         ResponseTemplate::new(200).set_body_string(
             "Ok.
@@ -356,6 +376,7 @@ fn token(board: &str, iat: f64, exp: f64, jti: Option<&str>) -> String {
     sign_embed(
         &EmbedClaims {
             resource: Some(EmbedResource {
+                chart: None,
                 dashboard: Some(board.to_owned()),
             }),
             params: None,
@@ -503,6 +524,7 @@ async fn every_kind_of_refused_token_gets_the_same_status_and_body() {
     let no_exp = sign_embed(
         &EmbedClaims {
             resource: Some(EmbedResource {
+                chart: None,
                 dashboard: Some(BOARD.to_owned()),
             }),
             iat: Some(now),
@@ -513,6 +535,7 @@ async fn every_kind_of_refused_token_gets_the_same_status_and_body() {
     let no_iat = sign_embed(
         &EmbedClaims {
             resource: Some(EmbedResource {
+                chart: None,
                 dashboard: Some(BOARD.to_owned()),
             }),
             exp: Some(now + 60.0),
@@ -1013,4 +1036,129 @@ async fn the_frame_answer_without_a_secret_is_empty_not_an_error() {
         frame(&app, json!({ "jwt": token_issued(5.0, None) })).await,
         (StatusCode::OK, json!({ "origins": [] }))
     );
+}
+
+// ── BI-26 T1: chart tokens ─────────────────────────────────────────────
+
+fn chart_token(chart: &str, jti: Option<&str>) -> String {
+    let iat = (unix_now() - 5.0).floor();
+    sign_embed(
+        &EmbedClaims {
+            resource: Some(EmbedResource {
+                chart: Some(chart.to_owned()),
+                dashboard: None,
+            }),
+            params: None,
+            exp: Some(iat + 3600.0),
+            iat: Some(iat),
+            jti: jti.map(str::to_owned),
+        },
+        SECRET,
+    )
+}
+
+fn two_charts(fake: &FakeCh) {
+    fake.add_chart("u_one", BOARD, "Visitors by region");
+    fake.add_chart("u_two", BOARD, "Secret revenue");
+}
+
+#[tokio::test]
+async fn a_chart_token_reads_that_chart_and_nothing_that_names_another() {
+    let fake = FakeCh::new(&json!({ "name": "Whole board name" }));
+    two_charts(&fake);
+    let ch = fake.serve().await;
+    let app = app(&ch, Some(SECRET)).await;
+
+    let (status, body) = embed_data(&app, &chart_token("u_one", None)).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let charts = body["charts"].as_array().unwrap();
+    assert_eq!(charts.len(), 1, "{body}");
+    assert_eq!(charts[0]["id"], "u_one");
+    assert_eq!(body["onlyChart"], "u_one");
+    assert_eq!(body["layout"], json!({}));
+    assert!(body.get("tabs").is_none() && body.get("phoneLayout").is_none());
+    let text = body.to_string();
+    for other in ["u_two", "Secret revenue", "Whole board name"] {
+        assert!(
+            !text.contains(other),
+            "{other} is in the chart payload: {text}"
+        );
+    }
+    // A dashboard token for the same board still reads both.
+    let (_, whole) = embed_data(&app, &token_issued(5.0, None)).await;
+    assert_eq!(whole["charts"].as_array().unwrap().len(), 2, "{whole}");
+}
+
+#[tokio::test]
+async fn a_token_naming_both_neither_or_an_unknown_chart_is_refused_alike() {
+    let fake = FakeCh::new(&json!({}));
+    two_charts(&fake);
+    let ch = fake.serve().await;
+    let app = app(&ch, Some(SECRET)).await;
+    let iat = (unix_now() - 5.0).floor();
+    let signed = |dashboard: Option<&str>, chart: Option<&str>| {
+        sign_embed(
+            &EmbedClaims {
+                resource: Some(EmbedResource {
+                    chart: chart.map(str::to_owned),
+                    dashboard: dashboard.map(str::to_owned),
+                }),
+                params: None,
+                exp: Some(iat + 3600.0),
+                iat: Some(iat),
+                jti: None,
+            },
+            SECRET,
+        )
+    };
+    let refused = [
+        signed(Some(BOARD), Some("u_one")),
+        signed(None, None),
+        signed(None, Some("u_not_a_chart")),
+    ];
+    for jwt in refused {
+        let (status, body) = embed_data(&app, &jwt).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+        assert_eq!(body["error"], "embed token is invalid or expired");
+    }
+}
+
+#[tokio::test]
+async fn a_chart_token_obeys_the_boards_embed_switch_and_withdrawal() {
+    let off = FakeCh::with_boards(vec![board_row(BOARD, &json!({ "embed_enabled": "0" }))]);
+    two_charts(&off);
+    let ch = off.serve().await;
+    let app_off = app(&ch, Some(SECRET)).await;
+    let (status, _) = embed_data(&app_off, &chart_token("u_one", None)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let withdrawn = FakeCh::new(&json!({ "embed_revoked_before": u64::MAX.to_string() }));
+    two_charts(&withdrawn);
+    let ch2 = withdrawn.serve().await;
+    let app_w = app(&ch2, Some(SECRET)).await;
+    let (status, _) = embed_data(&app_w, &chart_token("u_one", None)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn a_chart_token_is_framed_and_withdrawn_through_its_charts_board() {
+    let fake = FakeCh::new(&json!({ "embed_origins_json": r#"["https://app.customer.example"]"# }));
+    two_charts(&fake);
+    let ch = fake.serve().await;
+    let app = app(&ch, Some(SECRET)).await;
+    let jwt = chart_token("u_one", Some("one-id"));
+    assert_eq!(
+        frame(&app, json!({ "jwt": jwt })).await,
+        (
+            StatusCode::OK,
+            json!({ "origins": ["https://app.customer.example"] })
+        )
+    );
+    let (status, body) = revoke_one(&app, "dashboard:write", BOARD, &jwt).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["withdrawn"], "one-id");
+    // The same token cannot be withdrawn through another board.
+    let (status, _) = revoke_one(&app, "dashboard:write", "b_other", &jwt).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 }

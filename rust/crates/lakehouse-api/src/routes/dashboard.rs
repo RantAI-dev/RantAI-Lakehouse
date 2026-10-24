@@ -4303,6 +4303,7 @@ async fn embed_info_body(
     let lifetime = 3600.0_f64.min(max_lifetime as f64);
     let claims = lakehouse_embed::EmbedClaims {
         resource: Some(lakehouse_embed::EmbedResource {
+            chart: None,
             dashboard: Some(id.to_owned()),
         }),
         params: Some(HashMap::new()),
