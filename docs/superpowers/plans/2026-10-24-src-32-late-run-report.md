@@ -212,3 +212,66 @@ both have `failure_streak == None`; and an API test in `load_alerts`
 (pattern of its existing tests) that a late failure arriving with the
 connector at streak 3 raises no `connector_repeated_failure` alert
 instance. No migration (the column is already nullable).
+
+### 2026-10-24 — developer, handoff (round 1 fix)
+
+**Commit.** `4b2a9bc6` `fix(store): SRC-32, a late run report keeps no
+streak of its own` — `SRC-32 review round 1 BLOCKER 1`.
+
+**What changed.** `record_run_once` stores `counted.then_some(failure_streak)`
+on the dedupe row and returns the same value, so a late report's row keeps
+`failure_streak = NULL`, `RunRecord::failure_streak` is `None` for it, and its
+retry reads the same `None` back (the retry path already read the column). The
+docs of `RunRecord::failure_streak` and `record_run_once` name the second
+`None` case and cite the finding; `deliver_failure_alerts`' comment says why
+`None` cannot fire the repeated-failure rule. No migration, and no change to
+the API's logic: `== Some(REPEATED_FAILURE_STREAK)` is already false for
+`None`, and `auto_disabled` stays `false` as before. The plain
+`connector_failure` alert still fires for a late failure.
+
+**Tests.**
+
+- Store: new
+  `a_late_failure_stores_no_streak_on_its_row_and_its_retry_reads_none`
+  (connector at streak 3 from three later failures, a late failure then
+  answers `None`, stores no streak, its retry reads `None`, and the
+  connector's streak and health are unchanged). Two existing late-report
+  tests changed their expectation from `Some(1)`/`Some(0)` to `None`, because
+  the review changed what the answer is; their subject (the connector's
+  state) is unchanged.
+- API: `a_late_failure_at_streak_three_raises_no_repeated_failure_alert` in
+  `load_alerts`: success at 2000.0, three failures at 2000.0 (streak 3, the
+  repeated rule fires once), then run 1's failure at 500.0 — late: `matched`
+  is 1 (the plain rule), `al-r` keeps its one post and its one
+  `alert_instance`, and the connector stays `("unhealthy", 3)`. The harness
+  gained `knows_run_at` and `knows_run_ending_at` (end time first;
+  `knows_run`/`knows_run_config` keep 2000.0), so two runs can end at
+  different times.
+
+**Checks**, from `/home/shiro/rantai/wt-src32/rust`, on `4b2a9bc6`:
+
+- `cargo fmt --check` — no diff (`cargo fmt` ran once on the new code first).
+- `/home/shiro/rantai/bin/cargo-locked clippy -j 2 -p lakehouse-store -p
+  lakehouse-api --all-targets -- -D warnings` — exit 0, 3 m 45 s
+  (`/home/shiro/rantai/review/src32-dev-r2-clippy.log`).
+- `… cargo-locked test -j 2 -p lakehouse-store --test connectors` — **62
+  passed, 0 failed** (24.04 s), the 61 of round 1 plus the new test
+  (`/home/shiro/rantai/review/src32-dev-r2-store-test.log`).
+- `… cargo-locked test -j 2 -p lakehouse-api load_alerts` — **22 passed, 0
+  failed**, twice (the unit and the crate test binaries; 10.09 s and 9.87 s),
+  including the new test, 0 failed elsewhere as filtered out
+  (`/home/shiro/rantai/review/src32-dev-r2-api-test.log`).
+- Waited about 25 minutes for `/home/shiro/rantai/.heavy.lock` before the API
+  test run (another worktree's pytest held it). Nothing was killed or
+  pre-empted.
+
+**Not verified, and why.**
+
+- No full workspace run: the task scopes this round to the two crates and the
+  reviewer runs the full block.
+- The new tests were not run against the pre-fix code (that needs a rebuild of
+  the pre-fix tree). By construction a late failure's row held the
+  connector's streak before, so the store answer would have been `Some(3)` and
+  the API's `matched` would have been 2 — reasoning, not a measurement.
+- No TypeScript, Python, Dagster, compose or gate checks: the commit touches
+  two Rust crates and `CHANGELOG.md` only.
