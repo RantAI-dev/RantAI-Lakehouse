@@ -714,7 +714,9 @@ def run_setup(
     cfg: Config, session: requests.Session, setup: list[dict[str, Any]]
 ) -> tuple[dict[str, str], list[dict[str, str]]]:
     """Make the case's own objects through the API. Returns the ids saved under
-    each name and the objects created, for cleanup."""
+    each name and the objects created, for cleanup. A call without an `id_at`
+    only changes what an earlier call made: it saves no name and adds nothing
+    for the cleanup to delete."""
     names: dict[str, str] = {}
     created: list[dict[str, str]] = []
     for call in setup:
@@ -726,6 +728,11 @@ def run_setup(
         )
         if resp.status_code >= 400:
             raise SetupError(f"setup {call.get('name', call['path'])}: HTTP {resp.status_code}")
+        if not call.get("id_at"):
+            # A call that only changes what an earlier call made (the tabs of
+            # a board) replies without an id: it saves no name, and the
+            # cleanup must not delete the object the earlier call created.
+            continue
         body = resp.json()
         found = dig(body, call["id_at"])
         if not found:
