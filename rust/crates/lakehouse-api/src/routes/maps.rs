@@ -211,12 +211,30 @@ async fn read_form(mut form: Multipart) -> Result<Form, ApiError> {
 }
 
 /// Validate and simplify on a blocking thread; the refusal's own sentence is the 400.
-async fn check_and_simplify(file: Vec<u8>, property: String) -> Result<(Vec<u8>, usize), ApiError> {
+/// What one upload produces: the file the console draws, the number of
+/// regions, and the statements that put the full boundaries on the engine.
+struct Processed {
+    simplified: Vec<u8>,
+    regions: usize,
+    inserts: Vec<String>,
+}
+
+async fn check_and_simplify(
+    file: Vec<u8>,
+    property: String,
+    id: String,
+) -> Result<Processed, ApiError> {
     let done = tokio::task::spawn_blocking(move || {
         let checked = lakehouse_bi::geo::validate(&file, &property)?;
         drop(file);
-        let count = checked.regions.len();
-        lakehouse_bi::geo::simplify(&checked).map(|bytes| (bytes, count))
+        let inserts = checked
+            .region_inserts(&id)
+            .ok_or_else(|| TASK_FAILED.to_owned())?;
+        lakehouse_bi::geo::simplify(&checked).map(|simplified| Processed {
+            simplified,
+            regions: checked.regions.len(),
+            inserts,
+        })
     })
     .await;
     match done {
@@ -267,8 +285,12 @@ pub async fn create(
         return Err(ApiError::BadRequest(TOO_LARGE.to_owned()).into());
     }
     let property = form.name_property.trim().to_owned();
-    let (bytes, regions) = check_and_simplify(form.file, property.clone()).await?;
     let id = format!("m_{}", &Uuid::new_v4().simple().to_string()[..12]);
+    let Processed {
+        simplified: bytes,
+        regions,
+        inserts,
+    } = check_and_simplify(form.file, property.clone(), id.clone()).await?;
     let created = geo_map::insert(
         pool,
         &NewGeoMap {
@@ -286,10 +308,81 @@ pub async fn create(
         other => store_failed(&other),
     })?;
     audit(pool, &principal, "map_upload", &created.id, &created.name).await;
+    // BI-16 part C3 (D8): the region lookup is set up after the map is saved
+    // and never fails the upload; without it the map still draws and
+    // `RegionOf` says it is not available for this map.
+    let created = enable_region_lookup(&state, pool, created, &inserts).await;
     Ok((
         StatusCode::CREATED,
         ApiJson(MapViewOut(MapView::from_row(created))),
     ))
+}
+
+/// Creates the map's region lookup on the engine (`console.geo_region` rows,
+/// then the polygon dictionary, loaded at once) and records that it exists.
+///
+/// *Not verified on a running engine* (the statements follow the `ClickHouse`
+/// documentation; see `lakehouse_bi::geo::dictionary_ddl`). Any failure is
+/// logged under a reference id, undone as far as it can be, and leaves the
+/// flag off: the map stays usable for drawing, and the formula compiler tells
+/// `RegionOf` that the map has no lookup.
+async fn enable_region_lookup(
+    state: &AppState,
+    pool: &PgPool,
+    map: GeoMap,
+    inserts: &[String],
+) -> GeoMap {
+    let ch = &state.clickhouse;
+    let steps = async {
+        ch.exec(lakehouse_bi::geo::REGION_TABLE_DDL, None).await?;
+        for statement in inserts {
+            ch.exec(statement, None).await?;
+        }
+        for sql in [
+            lakehouse_bi::geo::dictionary_ddl(&map.id),
+            lakehouse_bi::geo::reload_dictionary_sql(&map.id),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            ch.exec(&sql, None).await?;
+        }
+        Ok::<(), lakehouse_clickhouse::ChError>(())
+    };
+    match steps.await {
+        Ok(()) => match geo_map::set_region_lookup(pool, &map.id, true).await {
+            Ok(()) => GeoMap {
+                region_lookup: true,
+                ..map
+            },
+            Err(err) => {
+                tracing::warn!(%err, "a map's region lookup was created but could not be recorded");
+                remove_region_lookup(state, &map.id).await;
+                map
+            }
+        },
+        Err(err) => {
+            let _logged = upstream_error::report_ch(&upstream_error::DATABASE, &err);
+            remove_region_lookup(state, &map.id).await;
+            map
+        }
+    }
+}
+
+/// Removes a map's dictionary and region rows, best effort: a map that is gone
+/// (or whose lookup failed halfway) must not leave boundaries behind.
+async fn remove_region_lookup(state: &AppState, id: &str) {
+    for sql in [
+        lakehouse_bi::geo::drop_dictionary_sql(id),
+        lakehouse_bi::geo::delete_regions_sql(id),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Err(err) = state.clickhouse.exec(&sql, None).await {
+            let _logged = upstream_error::report_ch(&upstream_error::DATABASE, &err);
+        }
+    }
 }
 
 /// The body of a map answer: the map itself, not wrapped.
@@ -456,5 +549,6 @@ pub async fn delete(
         .await
         .map_err(|err| store_failed(&err))?;
     audit(pool, &principal, "map_delete", &id, &existing.name).await;
+    remove_region_lookup(&state, &id).await;
     Ok((StatusCode::OK, ApiJson(json!({ "ok": true }))))
 }

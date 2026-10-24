@@ -294,6 +294,107 @@ pub fn validate(bytes: &[u8], name_property: &str) -> Result<CheckedMap, String>
     Ok(CheckedMap { regions })
 }
 
+// ── the region lookup on the engine (`BI-16` part C3, plan D8) ───────────
+
+/// The table that holds every uploaded map's full boundaries, one row per
+/// region, for the polygon dictionaries to read. Created the way the console's
+/// other engine tables are (`CREATE TABLE IF NOT EXISTS`), by the first upload
+/// that needs it. Policies cannot cover it: it holds boundaries, never rows of
+/// data.
+pub const REGION_TABLE_DDL: &str = "CREATE TABLE IF NOT EXISTS console.geo_region \
+(map_id String, name String, polygon Array(Array(Array(Tuple(Float64, Float64))))) \
+ENGINE = MergeTree ORDER BY (map_id, name)";
+
+/// The statement that creates a map's polygon dictionary, or `None` for an
+/// `id` that is not server-made (the id is the only thing put in the text).
+///
+/// *Not verified on a running engine*: written from the `ClickHouse`
+/// documentation for polygon dictionaries (key `Array(Array(Array(Array(
+/// Float64))))`, `LAYOUT(POLYGON())`, a `CLICKHOUSE` source with a `QUERY`),
+/// and the caller treats any failure as "no lookup for this map".
+#[must_use]
+pub fn dictionary_ddl(id: &str) -> Option<String> {
+    let name = dictionary_name(id)?;
+    Some(format!(
+        "CREATE DICTIONARY IF NOT EXISTS {name} (key Array(Array(Array(Array(Float64)))), name String) \
+         PRIMARY KEY key \
+         SOURCE(CLICKHOUSE(QUERY 'SELECT polygon AS key, name FROM console.geo_region WHERE map_id = ''{id}''')) \
+         LAYOUT(POLYGON()) LIFETIME(0)"
+    ))
+}
+
+/// Loads the dictionary now, so a source the engine cannot read fails here and
+/// not on a chart's first read.
+#[must_use]
+pub fn reload_dictionary_sql(id: &str) -> Option<String> {
+    Some(format!("SYSTEM RELOAD DICTIONARY {}", dictionary_name(id)?))
+}
+
+/// Drops a map's dictionary.
+#[must_use]
+pub fn drop_dictionary_sql(id: &str) -> Option<String> {
+    Some(format!(
+        "DROP DICTIONARY IF EXISTS {}",
+        dictionary_name(id)?
+    ))
+}
+
+/// Removes a map's rows from [`REGION_TABLE_DDL`]'s table.
+#[must_use]
+pub fn delete_regions_sql(id: &str) -> Option<String> {
+    is_map_id(id).then(|| {
+        format!("ALTER TABLE console.geo_region DELETE WHERE map_id = '{id}' SETTINGS mutations_sync = 1")
+    })
+}
+
+#[derive(Serialize)]
+struct RegionRow<'a> {
+    map_id: &'a str,
+    name: &'a str,
+    polygon: &'a [Polygon],
+}
+
+/// Most regions, and most bytes, one insert statement carries.
+const INSERT_REGIONS: usize = 100;
+const INSERT_BYTES: usize = 8 * 1024 * 1024;
+
+impl CheckedMap {
+    /// The `INSERT` statements that put this map's full boundaries (not the
+    /// simplified ones: `RegionOf` answers against the real borders) into
+    /// [`REGION_TABLE_DDL`]'s table, `JSONEachRow`, in chunks of at most 100
+    /// regions and about 8 MB. `None` for an `id` that is not server-made.
+    #[must_use]
+    pub fn region_inserts(&self, id: &str) -> Option<Vec<String>> {
+        if !is_map_id(id) {
+            return None;
+        }
+        let head = "INSERT INTO console.geo_region (map_id, name, polygon) FORMAT JSONEachRow\n";
+        let mut out = Vec::new();
+        let mut body = String::new();
+        let mut count = 0;
+        for region in &self.regions {
+            let row = RegionRow {
+                map_id: id,
+                name: &region.name,
+                polygon: &region.polygons,
+            };
+            let line = serde_json::to_string(&row).ok()?;
+            if count > 0 && (count >= INSERT_REGIONS || body.len() + line.len() > INSERT_BYTES) {
+                out.push(format!("{head}{body}"));
+                body.clear();
+                count = 0;
+            }
+            body.push_str(&line);
+            body.push('\n');
+            count += 1;
+        }
+        if count > 0 {
+            out.push(format!("{head}{body}"));
+        }
+        Some(out)
+    }
+}
+
 // ── simplification ──────────────────────────────────────────────────────
 
 fn round5(x: f64) -> f64 {
@@ -636,6 +737,77 @@ mod tests {
             .as_array()
             .unwrap();
         assert!(ring.len() > 3 && ring.first() == ring.last());
+    }
+
+    #[test]
+    fn the_engine_statements_are_built_from_a_server_made_id_only() {
+        let id = "m_0123456789ab";
+        let ddl = dictionary_ddl(id).unwrap();
+        assert!(
+            ddl.starts_with("CREATE DICTIONARY IF NOT EXISTS console.geo_dict_m_0123456789ab "),
+            "{ddl}"
+        );
+        assert!(
+            ddl.contains("LAYOUT(POLYGON())") && ddl.contains("WHERE map_id = ''m_0123456789ab''"),
+            "{ddl}"
+        );
+        assert_eq!(
+            drop_dictionary_sql(id).unwrap(),
+            "DROP DICTIONARY IF EXISTS console.geo_dict_m_0123456789ab"
+        );
+        assert!(
+            reload_dictionary_sql(id)
+                .unwrap()
+                .ends_with("geo_dict_m_0123456789ab")
+        );
+        assert!(
+            delete_regions_sql(id)
+                .unwrap()
+                .contains("map_id = 'm_0123456789ab'")
+        );
+        for bad in [
+            "",
+            "m_x",
+            "m_0123456789AB",
+            "m_0123456789ab'; DROP",
+            "../m_0123456789ab",
+            "x_0123456789ab",
+        ] {
+            assert!(
+                dictionary_ddl(bad).is_none() && drop_dictionary_sql(bad).is_none(),
+                "{bad}"
+            );
+            assert!(
+                reload_dictionary_sql(bad).is_none() && delete_regions_sql(bad).is_none(),
+                "{bad}"
+            );
+            assert!(
+                CheckedMap {
+                    regions: Vec::new()
+                }
+                .region_inserts(bad)
+                .is_none(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn region_rows_carry_the_full_boundaries_in_chunks() {
+        let features: Vec<Value> = (0..250)
+            .map(|i| feature(json!(format!("r{i}")), square(f64::from(i % 100), 0.0, 0.5)))
+            .collect();
+        let map = validate(&file(&features), "NAME").unwrap();
+        let inserts = map.region_inserts("m_0123456789ab").unwrap();
+        assert_eq!(inserts.len(), 3, "100 + 100 + 50 regions");
+        let head = "INSERT INTO console.geo_region (map_id, name, polygon) FORMAT JSONEachRow\n";
+        assert!(inserts.iter().all(|s| s.starts_with(head)));
+        let first: Value = serde_json::from_str(inserts[0].lines().nth(1).unwrap()).unwrap();
+        assert_eq!(first["map_id"], "m_0123456789ab");
+        assert_eq!(first["name"], "r0");
+        // MultiPolygon > polygon > ring > [lon, lat].
+        assert_eq!(first["polygon"][0][0][0], json!([0.0, 0.0]));
+        assert_eq!(inserts[2].lines().count(), 51);
     }
 
     #[test]

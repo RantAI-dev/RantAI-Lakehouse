@@ -48,6 +48,18 @@ async fn a_map_round_trips_and_a_name_is_unique_ignoring_case(pool: PgPool) {
         .unwrap();
     assert_eq!(stored.geojson, file);
     assert_eq!(stored.etag.len(), 32);
+    // The region lookup is off until the engine has it (migration 0102).
+    assert!(!made.region_lookup);
+    geo_map::set_region_lookup(&pool, "m_0123456789ab", true)
+        .await
+        .unwrap();
+    assert!(
+        get(&pool, "m_0123456789ab")
+            .await
+            .unwrap()
+            .unwrap()
+            .region_lookup
+    );
     let twin = insert(&pool, &new("m_ba9876543210", "SALES REGIONS", file)).await;
     assert!(matches!(twin, Err(StoreError::Conflict)));
     let renamed = rename(&pool, "m_0123456789ab", "Regions")

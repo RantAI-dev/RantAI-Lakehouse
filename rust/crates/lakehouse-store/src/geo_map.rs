@@ -25,6 +25,9 @@ pub struct GeoMap {
     pub created_by: String,
     /// When it was uploaded.
     pub created_at: OffsetDateTime,
+    /// Whether the data engine holds the map's region lookup (its polygon
+    /// dictionary was created and loaded): what `RegionOf` needs (migration `0102`).
+    pub region_lookup: bool,
 }
 
 /// A map to store.
@@ -44,7 +47,7 @@ pub struct NewGeoMap<'a> {
     pub created_by: &'a str,
 }
 
-const COLS: &str = "id, name, name_property, region_count, created_by, created_at";
+const COLS: &str = "id, name, name_property, region_count, created_by, created_at, region_lookup";
 
 /// Store a map and return it.
 ///
@@ -124,6 +127,20 @@ pub async fn rename(pool: &PgPool, id: &str, name: &str) -> Result<Option<GeoMap
         .bind(name)
         .fetch_optional(pool)
         .await?)
+}
+
+/// Record whether the map's region lookup exists on the engine.
+///
+/// # Errors
+///
+/// [`StoreError::Database`] on a database failure.
+pub async fn set_region_lookup(pool: &PgPool, id: &str, ready: bool) -> Result<(), StoreError> {
+    sqlx::query("UPDATE geo_map SET region_lookup = $2 WHERE id = $1")
+        .bind(id)
+        .bind(ready)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 /// Delete a map; whether a row was removed.

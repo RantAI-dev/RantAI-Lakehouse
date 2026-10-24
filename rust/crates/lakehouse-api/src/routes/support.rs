@@ -1268,7 +1268,10 @@ mod region_of_refusal {
     #[test]
     fn a_denied_region_lookup_names_region_of_and_other_dictionary_calls_keep_the_fixed_message() {
         let lookup = "SELECT dictGetOrDefault('console.geo_dict_m_0123456789ab', 'name', (lon, lat), '') FROM t";
-        assert_eq!(enforcement_message_for(lookup, &denied()), REGION_OF_REFUSED);
+        assert_eq!(
+            enforcement_message_for(lookup, &denied()),
+            REGION_OF_REFUSED
+        );
         assert!(REGION_OF_REFUSED.starts_with("RegionOf is not available to you"));
         let other = "SELECT dictGet('crm.people', 'email', id) FROM t";
         assert_eq!(
