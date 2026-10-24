@@ -1441,7 +1441,8 @@ async fn adding_a_governance_rule_without_governance_write_is_refused_and_stores
         ),
     ];
     for (kind, table, body) in cases {
-        // `table` is a constant from the array above, never user input.
+        // safe: only the constant `table` from the array above is formatted
+        // in; never user input.
         let count_sql = format!("SELECT count(*) FROM {table}");
         let before: i64 = sqlx::query_scalar(&count_sql)
             .fetch_one(&pool)
