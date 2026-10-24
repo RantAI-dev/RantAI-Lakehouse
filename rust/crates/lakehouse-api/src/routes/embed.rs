@@ -408,6 +408,15 @@ pub async fn values(State(state): State<AppState>, body: Bytes) -> Response {
         Ok(admitted) => admitted,
         Err(refusal) => return *refusal,
     };
+    // A chart token gets no dropdown of the dashboard's values, whatever else
+    // its token lacks (checked first, so the answer does not depend on it).
+    if subject.only_chart.is_some() {
+        return (
+            StatusCode::FORBIDDEN,
+            ApiJson(json!({ "error": "filter_not_editable" })),
+        )
+            .into_response();
+    }
     let Ok(resolved) = resolve_embed_filters(
         board.filters.as_deref().unwrap_or_default(),
         &board.embed_access,
@@ -416,7 +425,7 @@ pub async fn values(State(state): State<AppState>, body: Bytes) -> Response {
     ) else {
         return token_refused();
     };
-    if subject.only_chart.is_some() || !resolved.editable.contains(&column) {
+    if !resolved.editable.contains(&column) {
         return (
             StatusCode::FORBIDDEN,
             ApiJson(json!({ "error": "filter_not_editable" })),
