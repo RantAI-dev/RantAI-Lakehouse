@@ -283,6 +283,29 @@ async fn admit(
     ) {
         return Err(Box::new(token_refused()));
     }
+    // BI-26 review fix (SHOULD-FIX) R2: a chart token's own withdrawal follows the
+    // chart. It is written on the dashboard the chart was on, so it is looked up
+    // on every dashboard's events (a "withdraw all" is the dashboard's, and
+    // applies to the dashboard the chart is on now).
+    if subject.only_chart.is_some()
+        && let Some(jti) = claims.jti.as_deref()
+    {
+        match store::jti_withdrawn_anywhere(&state.clickhouse, jti).await {
+            Ok(false) => {}
+            Ok(true) => return Err(Box::new(token_refused())),
+            Err(err) => {
+                return Err(Box::new(
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        ApiJson(
+                            upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json(),
+                        ),
+                    )
+                        .into_response(),
+                ));
+            }
+        }
+    }
     Ok((board, subject))
 }
 

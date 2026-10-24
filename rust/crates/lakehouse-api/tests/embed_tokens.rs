@@ -318,6 +318,20 @@ impl Respond for FakeCh {
                 .collect();
             return rows(found);
         }
+        // BI-26 review fix R2: one token id, across every dashboard's events.
+        if sql.contains("kind='withdraw' AND jti=") {
+            let n = self
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| {
+                    e["kind"] == "withdraw"
+                        && sql.contains(&format!("jti='{}'", e["jti"].as_str().unwrap_or("-")))
+                })
+                .count();
+            return rows(vec![json!({ "n": n.to_string() })]);
+        }
         // SEC-12 (PR #105 review SHOULD-FIX 1): the embed access state is read
         // by aggregating the append-only event table, never from the row.
         if sql.contains("FROM console.bi_board_embed_event") {
@@ -1586,5 +1600,32 @@ async fn the_dropdown_of_another_filter_sees_the_tokens_value_not_the_saved_one(
         sent[0].contains("2025") && !sent[0].contains("2024"),
         "{}",
         sent[0]
+    );
+}
+
+#[tokio::test]
+async fn a_withdrawn_chart_token_stays_withdrawn_after_its_chart_moves_to_another_dashboard() {
+    // BI-26 review fix (SHOULD-FIX) R2.
+    let fake = FakeCh::with_boards(vec![
+        board_row("b_a", &json!({})),
+        board_row("b_b", &json!({})),
+    ]);
+    fake.add_chart("u_one", "b_a", "Visitors");
+    let ch = fake.serve().await;
+    let app = app(&ch, Some(SECRET)).await;
+    let jwt = chart_token("u_one", Some("move-me"));
+    assert_eq!(embed_data(&app, &jwt).await.0, StatusCode::OK);
+    let (status, body) = revoke_one(&app, "dashboard:write", "b_a", &jwt).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(embed_data(&app, &jwt).await.0, StatusCode::UNAUTHORIZED);
+    // The chart moves to dashboard B; the withdrawal was written on A.
+    fake.charts.lock().unwrap()[0]["board"] = json!("b_b");
+    assert_eq!(embed_data(&app, &jwt).await.0, StatusCode::UNAUTHORIZED);
+    // Another token of the same chart is not affected.
+    assert_eq!(
+        embed_data(&app, &chart_token("u_one", Some("another")))
+            .await
+            .0,
+        StatusCode::OK
     );
 }

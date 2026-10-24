@@ -2309,6 +2309,24 @@ pub async fn get_board_embed_access(ch: &ChClient, board_id: &str) -> Result<Emb
     Ok(embed_access_from_aggregate_rows(&rows))
 }
 
+/// Whether a token id has been withdrawn on ANY dashboard (`BI-26` review fix
+/// (SHOULD-FIX) R2). A chart token is withdrawn through the dashboard its chart
+/// is on; if the chart is moved, the withdrawal stays on the old dashboard's
+/// events, so a chart token is also checked against every dashboard's.
+///
+/// # Errors
+///
+/// Returns [`ChError`] on a `ClickHouse` failure.
+pub async fn jti_withdrawn_anywhere(ch: &ChClient, jti: &str) -> Result<bool, ChError> {
+    ensure_bi_table(ch).await?;
+    let sql = format!(
+        "SELECT count() AS n FROM console.bi_board_embed_event WHERE kind='withdraw' AND jti={}",
+        SqlLiteral::from(jti)
+    );
+    let rows = ch.rows(&sql, None).await?;
+    Ok(rows.first().map_or(0, |r| row_u64(r, "n")) > 0)
+}
+
 /// Replace the sites allowed to frame a board's embed pages (`SEC-12`).
 /// Returns the normalised list that was stored.
 ///
