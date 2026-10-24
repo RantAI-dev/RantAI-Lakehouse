@@ -63,7 +63,7 @@ gen_b64() {
 filled=""
 for var in POSTGRES_PASSWORD RUSTFS_ACCESS_KEY RUSTFS_SECRET_KEY \
   LAKEKEEPER_ENCRYPTION_KEY SEAWEEDFS_ACCESS_KEY SEAWEEDFS_SECRET_KEY \
-  AUTH_BOOTSTRAP_PASSWORD; do
+  AUTH_BOOTSTRAP_PASSWORD RENDER_TOKEN_SECRET; do
   # Only an empty assignment is filled: a value already in the example is
   # never replaced. The value travels in the environment, not in argv, so
   # it does not show up in `ps`.

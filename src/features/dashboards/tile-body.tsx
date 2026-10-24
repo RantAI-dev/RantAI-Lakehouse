@@ -8,7 +8,7 @@ import { ErrorWithReference } from "@/components/error-reference";
 import type { TileFailure } from "@/services/contracts/dashboards";
 import { MiniMarkdown } from "@/features/copilot/mini-markdown";
 import { EChart } from "./echart";
-import { buildOption, fmtInt, withReferenceLines } from "./chart-option";
+import { buildOption, clusterNote, fmtInt, forecastNote, withReferenceLines } from "./chart-option";
 import { buildCombinedOption, cutLayers, failedLayers } from "./combined-option";
 import { takesLayers, type LayerDef } from "@/lib/chart-layers";
 import { GeoChart } from "./geo-chart";
@@ -32,6 +32,7 @@ import { HISTOGRAM_ROW_CAP, MAX_BULLETS, type TypeDefFields } from "@/lib/type-b
 import { ProgressCard } from "./progress-card";
 import { ImageCard, WebCard } from "./content-cards";
 import { bulletOption, histogramOption } from "./type-b-option";
+import { ganttOption } from "./gantt-option";
 import { resolvePalette } from "@/lib/chart-palettes";
 
 type Cell = Rows | TileFailure;
@@ -110,6 +111,14 @@ export function TileBody({
     return <TypeBBody spec={spec} cell={cell} def={def} bins={bins} measureLabels={measureLabels} dark={dark} />;
   }
 
+  // BI-16 part C1 (plan D3): the Gantt chart draws its own rows (task, group, start, end, progress), not the category shape of the charts below.
+  if (spec.kind === "gantt") {
+    if (!hasRows(cell) || (cell.rows.length === 0 && !cell.reversedRows)) {
+      return <p className="grid h-full place-items-center text-xs text-muted-foreground">No data.</p>;
+    }
+    return <GanttBody cell={cell} def={def} dark={dark} onDataClick={onDataClick} />;
+  }
+
   if (spec.kind === "table") {
     if (!hasRows(cell) || cell.rows.length === 0) {
       return <p className="grid h-full place-items-center text-xs text-muted-foreground">No data.</p>;
@@ -168,27 +177,30 @@ export function TileBody({
       return <p role="status" className="grid h-full place-items-center px-3 text-center text-xs text-muted-foreground">{styled.message}.</p>;
     }
     const fmtOf = (column?: string) => style?.valueFormats?.[column ?? yCols[0] ?? ""] ?? style?.format;
-    const option = withReferenceLines(
-      styled.option,
-      cell.referenceLines, spec.kind === "hbar", dark,
-      {
-        values: (measure) => rows.map((r) => Number(r[measure ?? yCols[0] ?? ""] ?? 0)),
-        format: (measure, v) => formatValue(v, fmtOf(measure), locale, decimals),
-        cutOff: !!cell.truncated,
-      },
-      cols,
-    );
+    const lineCtx = {
+      values: (measure?: string) => rows.map((r) => Number(r[measure ?? yCols[0] ?? ""] ?? 0)),
+      format: (measure: string | undefined, v: number) => formatValue(v, fmtOf(measure), locale, decimals),
+      cutOff: !!cell.truncated,
+      // BI-17 part B: a forecast finds the periods ahead from the raw buckets and the report zone.
+      buckets: { grain, raw: rawRows.map((r) => r[spec.x]), timeZone: reporting.timeZone, breakdown: !!spec.series },
+    };
+    const option = withReferenceLines(styled.option, cell.referenceLines, spec.kind === "hbar", dark, lineCtx, cols);
+    // BI-17 part B: what the chart says under itself about a forecast or about clusters.
+    const forecastSentence = forecastNote(cell.referenceLines, lineCtx, spec.kind === "hbar") ?? clusterNote(spec, rows, style);
     const chart = (
       <EChart option={hideLegend ? { ...option, legend: { show: false } } : option} height="100%"
         onDataClick={onDataClick ? (hit, pos) => onDataClick(hit, pos, { rows: rawRows, labelledRows: rows, grain: grain ?? undefined, otherLabels, bin: bins[spec.x] }) : undefined} />
     );
-    if (!styled.hiddenNotes) return chart;
+    if (!styled.hiddenNotes && !forecastSentence) return chart;
     return (
       <div className="flex h-full min-h-0 flex-col">
         <div className="min-h-0 flex-1">{chart}</div>
-        <p className="px-1 pt-1 text-[11px] text-muted-foreground">
-          {styled.hiddenNotes} {styled.hiddenNotes === 1 ? "note" : "notes"} not shown: {styled.hiddenNotes === 1 ? "its point is" : "their points are"} not in the result
-        </p>
+        {styled.hiddenNotes ? (
+          <p className="px-1 pt-1 text-[11px] text-muted-foreground">
+            {styled.hiddenNotes} {styled.hiddenNotes === 1 ? "note" : "notes"} not shown: {styled.hiddenNotes === 1 ? "its point is" : "their points are"} not in the result
+          </p>
+        ) : null}
+        {forecastSentence ? <p className="px-1 pt-1 text-[11px] text-muted-foreground">{forecastSentence}</p> : null}
       </div>
     );
   }
@@ -269,6 +281,38 @@ function TypeBBody({
       {drawn.more > 0 ? (
         <p className="px-1 pt-1 text-[11px] text-muted-foreground">{drawn.more} more not shown (the first {MAX_BULLETS} are drawn)</p>
       ) : null}
+    </div>
+  );
+}
+
+/**
+ * The Gantt chart (`BI-16` part C1, plan D3): bars from start to end, coloured
+ * by group, a line at today in the report time zone, and the notes the plan
+ * names under the chart (more than 1,000 tasks, rows that end before they
+ * start). A click on a bar names its task, so the drill lists that task's rows.
+ */
+function GanttBody({
+  cell, def, dark, onDataClick,
+}: {
+  cell: Rows;
+  def: (StyleFields & TypeDefFields) | undefined;
+  dark: boolean;
+  onDataClick?: ChartClickHandler;
+}) {
+  const reporting = useReporting();
+  const drawn = ganttOption({
+    rows: cell.rows, dark, timeZone: reporting.timeZone, reversedRows: cell.reversedRows, todayLine: def?.todayLine,
+    colors: resolvePalette(def?.colors, reporting.companyPalette),
+  });
+  if ("message" in drawn) {
+    return <p role="status" className="grid h-full place-items-center px-3 text-center text-xs text-muted-foreground">{drawn.message}.</p>;
+  }
+  return (
+    <div className="flex h-full min-h-0 flex-col">
+      <div className="min-h-0 flex-1">
+        <EChart option={drawn.option} height="100%" onDataClick={onDataClick ? (hit, pos) => onDataClick(hit, pos, { rows: cell.rows }) : undefined} />
+      </div>
+      {drawn.notes.map((note) => <p key={note} className="px-1 pt-1 text-[11px] text-muted-foreground">{note}.</p>)}
     </div>
   );
 }

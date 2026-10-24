@@ -85,6 +85,9 @@ fn add_rows(g: &mut Graph, rows: &[Map<String, Value>]) {
             "built by {statement} on {} UTC (system.query_log)",
             text(row, "at")
         );
+        // BI-14 (D3): the same record answers "when was this table last refreshed".
+        g.refreshed
+            .insert(to.clone(), (text(row, "at"), "last build in the query log"));
         for name in text(row, "read").lines() {
             let Some((from, label, kind)) = source(name) else {
                 continue;

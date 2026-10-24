@@ -646,6 +646,9 @@ fn is_grouped_kind(kind: ChartKind) -> bool {
             | ChartKind::Progress
             | ChartKind::Histogram
             | ChartKind::Bullet
+            // BI-16 part C1: a Gantt chart has its own statement (tasks with a
+            // start and an end), so no sort, "Other" or own-aggregate measure.
+            | ChartKind::Gantt
             | ChartKind::Kpi
             | ChartKind::Gauge
             | ChartKind::Boxplot
@@ -884,6 +887,9 @@ pub struct RelationCheck<'a> {
     pub breakdown: &'a str,
     /// Whether the chart carries a time grain on its dimension.
     pub grained: bool,
+    /// Whether that grain cuts the date into buckets (minute to year), as a
+    /// forecast needs, rather than reading a part of it (weekday, month of year).
+    pub truncated_grain: bool,
 }
 
 /// The checks that need the relation: the chart's own filters apply to its
@@ -935,6 +941,19 @@ pub fn check_against_relation(
     {
         return Err(
             "a chart with a table calculation keeps its order and its groups: no sort, 'Other' or groupings."
+                .to_owned(),
+        );
+    }
+    // `BI-17` part B (plan D1): a forecast extends a run of buckets.
+    if shape
+        .reference_lines
+        .iter()
+        .flatten()
+        .any(|l| l.kind == crate::params::LineKind::Forecast)
+        && !check.truncated_grain
+    {
+        return Err(
+            "a forecast needs the chart's dates grouped by a minute, hour, day, week, month, quarter or year: set a time grain on the date column."
                 .to_owned(),
         );
     }
@@ -1369,6 +1388,7 @@ mod tests {
             dimension,
             breakdown: "",
             grained: false,
+            truncated_grain: false,
         }
     }
 
@@ -1391,6 +1411,34 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("listed twice"), "{err}");
+    }
+
+    /// `BI-17` part B (plan D1): a forecast extends a run of date buckets, so
+    /// the date column needs a truncating time grain.
+    #[test]
+    fn a_forecast_needs_a_truncating_time_grain_on_the_dimension() {
+        let c = cols(&[("d", ColumnKind::Date), ("stay", ColumnKind::Number)]);
+        let from = Relation::Mart(Ident::new("m").unwrap());
+        let t = time();
+        let list = measures(r#"["stay"]"#);
+        let with_forecast: ShapeFields =
+            serde_json::from_str(r#"{"referenceLines":[{"kind":"forecast","horizon":6}]}"#)
+                .unwrap();
+        let mut check = relation_check(&c, &from, &t, "d");
+        let err = check_against_relation(&list, &with_forecast, &check).unwrap_err();
+        assert!(
+            err.contains("a forecast needs the chart's dates grouped"),
+            "{err}"
+        );
+        // A part of the date (weekday, month of the year) is a grain but not a run of buckets.
+        check.grained = true;
+        let err = check_against_relation(&list, &with_forecast, &check).unwrap_err();
+        assert!(err.contains("a forecast needs"), "{err}");
+        check.truncated_grain = true;
+        assert!(check_against_relation(&list, &with_forecast, &check).is_ok());
+        // A chart with no forecast is not asked for a grain.
+        let plain = relation_check(&c, &from, &t, "d");
+        assert!(check_against_relation(&list, &ShapeFields::default(), &plain).is_ok());
     }
 
     #[test]

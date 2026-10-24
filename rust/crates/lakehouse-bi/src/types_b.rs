@@ -233,6 +233,16 @@ pub struct TypeFields {
     /// `image`: the description for screen readers.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub alt: Option<String>,
+    /// `gantt`: the column a task starts at (a date or date-time), required
+    /// (`BI-16` part C1, plan D1).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub start: Option<String>,
+    /// `gantt`: the column a task ends at (a date or date-time), required.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub end: Option<String>,
+    /// `gantt`: an optional number column, 0 to 100 or 0 to 1, drawn as shading.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub progress: Option<String>,
 }
 
 #[allow(
@@ -271,6 +281,9 @@ impl TypeFields {
             || self.histogram.is_some()
             || self.url.is_some()
             || self.alt.is_some()
+            || self.start.is_some()
+            || self.end.is_some()
+            || self.progress.is_some()
     }
 
     /// The second measure's column when the goal is a value.
@@ -350,7 +363,13 @@ pub fn check_fields(input: &ChartInput) -> Result<(), String> {
         "alt",
         "an image",
     )?;
+    only(
+        (f.start.is_some() || f.end.is_some() || f.progress.is_some()) && kind != ChartKind::Gantt,
+        "start, end and progress",
+        "a Gantt chart",
+    )?;
     match kind {
+        ChartKind::Gantt => check_gantt(input),
         ChartKind::Progress | ChartKind::Bullet => check_goal_and_bands(input),
         ChartKind::Histogram => check_histogram(input),
         ChartKind::Image | ChartKind::Web => check_card(input),
@@ -402,6 +421,49 @@ fn check_goal_and_bands(input: &ChartInput) -> Result<(), String> {
                 "the limits of the bands must go up, each above the one before.".to_owned(),
             );
         }
+    }
+    Ok(())
+}
+
+/// A column name with its blanks trimmed; blank is none.
+fn named(v: Option<&str>) -> Option<&str> {
+    v.map(str::trim).filter(|c| !c.is_empty())
+}
+
+/// A Gantt chart (`BI-16` part C1, plan D1): its task column is the
+/// dimension, its group the breakdown, and `start`, `end` (and `progress`)
+/// name columns. It has no measure and no sort of its own; the statement
+/// orders by start and keeps the first 1,001 rows. That the columns exist and
+/// are dates and a number needs the relation ([`crate::store`]).
+fn check_gantt(input: &ChartInput) -> Result<(), String> {
+    let f = &input.types;
+    if input.dimension.is_empty() {
+        return Err("a Gantt chart needs the task column, as its dimension.".to_owned());
+    }
+    let (Some(start), Some(end)) = (named(f.start.as_deref()), named(f.end.as_deref())) else {
+        return Err("a Gantt chart needs a start column and an end column.".to_owned());
+    };
+    if start == end {
+        return Err("a Gantt chart's start and end must be two different columns.".to_owned());
+    }
+    if f.progress.is_some() && named(f.progress.as_deref()).is_none() {
+        return Err(
+            "the progress column of a Gantt chart is empty: choose one or remove it.".to_owned(),
+        );
+    }
+    if !input.measures.is_empty() {
+        return Err(
+            "a Gantt chart takes no measure: it draws the start and end columns.".to_owned(),
+        );
+    }
+    if input.aggregate.is_some() || input.limit.is_some() || input.order.is_some() {
+        return Err(
+            "a Gantt chart takes no aggregate, limit or order; it shows the first 1,000 tasks by start."
+                .to_owned(),
+        );
+    }
+    if input.grain.is_some() {
+        return Err("a Gantt chart has no time grain: its dates are the bars' ends.".to_owned());
     }
     Ok(())
 }
@@ -977,5 +1039,144 @@ mod tests {
             assert_eq!(got.sql, "");
             assert!(got.skipped.is_empty() && got.bins.is_empty());
         }
+    }
+
+    // ── the Gantt chart (BI-16 part C1) ─────────────────────────────────
+
+    fn gantt(extra: &serde_json::Value) -> serde_json::Value {
+        let mut base = serde_json::json!({
+            "kind": "gantt", "dimension": "task", "start": "begins", "end": "ends",
+        });
+        base.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        base
+    }
+
+    #[test]
+    fn a_gantt_chart_needs_its_task_start_and_end_and_nothing_to_aggregate() {
+        check_fields(&input(gantt(&serde_json::json!({})))).unwrap();
+        check_fields(&input(gantt(
+            &serde_json::json!({"breakdown": "team", "progress": "done"}),
+        )))
+        .unwrap();
+        for (extra, why) in [
+            (serde_json::json!({"dimension": ""}), "task column"),
+            (
+                serde_json::json!({"end": null}),
+                "start column and an end column",
+            ),
+            (
+                serde_json::json!({"start": " "}),
+                "start column and an end column",
+            ),
+            (
+                serde_json::json!({"end": "begins"}),
+                "two different columns",
+            ),
+            (serde_json::json!({"progress": ""}), "progress column"),
+            (serde_json::json!({"measures": ["visitors"]}), "no measure"),
+            (serde_json::json!({"aggregate": "sum"}), "no aggregate"),
+            (
+                serde_json::json!({"limit": 5}),
+                "no aggregate, limit or order",
+            ),
+            (serde_json::json!({"grain": "month"}), "no time grain"),
+        ] {
+            let e = refused(gantt(&extra));
+            assert!(e.contains(why), "{extra}: {e}");
+        }
+        // The fields are refused on any other kind.
+        let e = refused(serde_json::json!({"kind": "bar", "dimension": "p", "start": "s"}));
+        assert!(
+            e.contains("start, end and progress is only for a Gantt chart"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn a_gantt_chart_writes_back_as_it_was_read_and_other_charts_write_none() {
+        let wire = serde_json::json!({
+            "title": "t", "mart": "m", "kind": "gantt", "dimension": "task", "breakdown": "team",
+            "start": "begins", "end": "ends", "progress": "done", "todayLine": false,
+        });
+        let chart: ChartInput = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(chart.style.today_line, Some(false));
+        let back = serde_json::to_value(&chart).unwrap();
+        for key in ["start", "end", "progress", "todayLine", "breakdown"] {
+            assert_eq!(back[key], wire[key], "{key}");
+        }
+        let bar = serde_json::to_value(input(serde_json::json!({"kind": "bar"}))).unwrap();
+        for key in ["start", "end", "progress", "todayLine"] {
+            assert!(bar.get(key).is_none(), "{key}");
+        }
+        let e = crate::style::check_style(&input(
+            serde_json::json!({"kind": "bar", "todayLine": false}),
+        ))
+        .unwrap_err();
+        assert!(
+            e.contains("the today line is only for a Gantt chart"),
+            "{e}"
+        );
+        crate::style::check_style(&chart).unwrap();
+    }
+
+    fn gantt_columns() -> HashMap<String, RelationColumns> {
+        let cols: RelationColumns = [
+            ("task", ColumnKind::Text),
+            ("team", ColumnKind::Text),
+            ("begins", ColumnKind::Date),
+            ("ends", ColumnKind::DateTime),
+            ("done", ColumnKind::Number),
+            ("province", ColumnKind::Text),
+        ]
+        .into_iter()
+        .map(|(n, k)| (n.to_owned(), k))
+        .collect();
+        HashMap::from([("mart_x".to_owned(), cols)])
+    }
+
+    #[test]
+    fn the_gantt_statement_keeps_the_first_1001_tasks_and_counts_the_reversed_rows() {
+        let spec = stored(
+            ChartKind::Gantt,
+            &gantt(&serde_json::json!({"breakdown": "team", "progress": "done"})),
+        );
+        let time = TimeContext::default();
+        let got = sql_with_filters_report(
+            &spec,
+            &[],
+            &[filter(r#"{"column":"province","values":["Bali"]}"#)],
+            &gantt_columns(),
+            &ReadContext::new(&time),
+        );
+        let sql = &got.sql;
+        assert!(
+            sql.starts_with(
+                "SELECT __t AS `task`, __g AS `group`, min(__s) AS `start`, max(__e) AS `end`, avg(__p) AS `progress` FROM (SELECT task AS __t, team AS __g, begins AS __s, toTimeZone(ends, "
+            ),
+            "{sql}"
+        );
+        // The dashboard filter sits under the rename, on the raw rows; reversed rows are left out; first 1,001 by start.
+        assert!(
+            sql.contains("FROM serving.mart_x WHERE province IN ('Bali')) WHERE __e >= __s"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("GROUP BY __t, __g ORDER BY min(__s), __t LIMIT 1001"),
+            "{sql}"
+        );
+        let Some(crate::builder::TableRead::Reversed { count_sql }) = got.table else {
+            panic!("a Gantt chart carries the count of its reversed rows");
+        };
+        assert!(count_sql.starts_with("SELECT count() AS n FROM serving.mart_x WHERE province IN ('Bali') AND toTimeZone(ends, "), "{count_sql}");
+        assert!(count_sql.contains(") < begins"), "{count_sql}");
+
+        // Without a group the group column is the empty string, and without progress there is none.
+        let plain = stored(ChartKind::Gantt, &gantt(&serde_json::json!({})));
+        let got =
+            sql_with_filters_report(&plain, &[], &[], &gantt_columns(), &ReadContext::new(&time));
+        assert!(got.sql.contains("'' AS __g"), "{}", got.sql);
+        assert!(!got.sql.contains("progress"), "{}", got.sql);
     }
 }

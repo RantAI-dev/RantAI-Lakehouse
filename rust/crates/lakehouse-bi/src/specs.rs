@@ -76,6 +76,9 @@ pub enum ChartKind {
     /// A value, a target marker and up to three bands, for one value or one
     /// per category (`BI-16` part B).
     Bullet,
+    /// Tasks drawn as bars from a `start` column to an `end` column, one row
+    /// per task (`x`), coloured by group (`series`) (`BI-16` part C1).
+    Gantt,
     /// A picture from an allowed site (`BI-16` part B; no SQL).
     Image,
     /// A web page from an allowed site in a sandboxed frame (`BI-16` part B;

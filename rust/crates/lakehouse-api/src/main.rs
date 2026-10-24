@@ -21,6 +21,7 @@ mod connector_secret_store;
 mod csv_export;
 mod csv_safe;
 mod error;
+mod export;
 mod gold_export;
 mod gold_export_history;
 mod gold_lock;
@@ -30,6 +31,7 @@ mod json;
 mod lakehouse_catalog;
 mod lakekeeper_token;
 mod next_run;
+mod pdf;
 mod pipeline_lag;
 mod pipeline_source;
 mod policy;
@@ -171,6 +173,9 @@ async fn run() -> anyhow::Result<()> {
     // SRC-11 D5/D6: the daily removal of run log lines and attempts older
     // than 30 days.
     spawn_run_log_cleanup(&state);
+    // RPT-1 D3: the scheduled-report runner (a tick every minute, a daily
+    // 90-day cleanup of deliveries).
+    routes::report_runner::spawn(&state);
 
     let app = routes::router(state);
 

@@ -190,7 +190,8 @@
               "histogram",
               "bullet",
               "image",
-              "web"
+              "web",
+              "gantt"
             ]
           },
           "sqlSource": {
@@ -498,9 +499,16 @@
                     "min",
                     "max",
                     "trend",
-                    "band"
+                    "band",
+                    "forecast"
                   ],
-                  "description": "value (default): a line at `value`; average, median, min, max: computed from the rows the chart shows; trend: a linear trend over them; band: a shaded band from `value` to `to`"
+                  "description": "value (default): a line at `value`; average, median, min, max: computed from the rows the chart shows; trend: a linear trend over them; band: a shaded band from `value` to `to`; forecast: the series continued `horizon` periods ahead with a 95 % band (bar, line, area, stacked, combo with the date dimension grouped by minute to year, no breakdown, at most one per chart)"
+                },
+                "horizon": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 60,
+                  "description": "forecast only, required: how many periods ahead"
                 },
                 "value": {
                   "oneOf": [
@@ -1672,6 +1680,34 @@
             },
             "description": "table, pivot and kpi only: colour a cell or the value by a rule, for example below 1,000 in red"
           },
+          "clusters": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "properties": {
+              "k": {
+                "oneOf": [
+                  {
+                    "type": "string",
+                    "enum": [
+                      "auto"
+                    ]
+                  },
+                  {
+                    "type": "integer",
+                    "minimum": 2,
+                    "maximum": 10
+                  }
+                ],
+                "description": "\"auto\" (the console picks from 2 to 10) or a number of groups"
+              }
+            },
+            "required": [
+              "k"
+            ],
+            "description": "scatter and bubble only: colour the points by cluster (k-means over the points on screen)"
+          },
           "goal": {
             "oneOf": [
               {
@@ -1724,6 +1760,18 @@
             "type": "string",
             "maxLength": 200,
             "description": "image only (required): a short description of the picture for screen readers"
+          },
+          "start": {
+            "type": "string",
+            "description": "gantt only (required): the date or date-time column a task starts at. A Gantt chart draws one bar per task: `dimension` is the task column, `breakdown` the optional group (colour), and `start`, `end` and the optional `progress` name columns; it takes no measures, aggregate, limit or order and shows the first 1,000 tasks by start"
+          },
+          "end": {
+            "type": "string",
+            "description": "gantt only (required): the date or date-time column a task ends at; a row that ends before it starts is left out and counted"
+          },
+          "progress": {
+            "type": "string",
+            "description": "gantt only (optional): a number column drawn as the share of the bar done"
           }
         },
         "required": [
@@ -1787,7 +1835,8 @@
               "histogram",
               "bullet",
               "image",
-              "web"
+              "web",
+              "gantt"
             ]
           },
           "sqlSource": {
@@ -2092,9 +2141,16 @@
                     "min",
                     "max",
                     "trend",
-                    "band"
+                    "band",
+                    "forecast"
                   ],
-                  "description": "value (default): a line at `value`; average, median, min, max: computed from the rows the chart shows; trend: a linear trend over them; band: a shaded band from `value` to `to`"
+                  "description": "value (default): a line at `value`; average, median, min, max: computed from the rows the chart shows; trend: a linear trend over them; band: a shaded band from `value` to `to`; forecast: the series continued `horizon` periods ahead with a 95 % band (bar, line, area, stacked, combo with the date dimension grouped by minute to year, no breakdown, at most one per chart)"
+                },
+                "horizon": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 60,
+                  "description": "forecast only, required: how many periods ahead"
                 },
                 "value": {
                   "oneOf": [
@@ -3266,6 +3322,34 @@
             },
             "description": "table, pivot and kpi only: colour a cell or the value by a rule, for example below 1,000 in red"
           },
+          "clusters": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "properties": {
+              "k": {
+                "oneOf": [
+                  {
+                    "type": "string",
+                    "enum": [
+                      "auto"
+                    ]
+                  },
+                  {
+                    "type": "integer",
+                    "minimum": 2,
+                    "maximum": 10
+                  }
+                ],
+                "description": "\"auto\" (the console picks from 2 to 10) or a number of groups"
+              }
+            },
+            "required": [
+              "k"
+            ],
+            "description": "scatter and bubble only: colour the points by cluster (k-means over the points on screen)"
+          },
           "goal": {
             "oneOf": [
               {
@@ -3318,6 +3402,18 @@
             "type": "string",
             "maxLength": 200,
             "description": "image only (required): a short description of the picture for screen readers"
+          },
+          "start": {
+            "type": "string",
+            "description": "gantt only (required): the date or date-time column a task starts at. A Gantt chart draws one bar per task: `dimension` is the task column, `breakdown` the optional group (colour), and `start`, `end` and the optional `progress` name columns; it takes no measures, aggregate, limit or order and shows the first 1,000 tasks by start"
+          },
+          "end": {
+            "type": "string",
+            "description": "gantt only (required): the date or date-time column a task ends at; a row that ends before it starts is left out and counted"
+          },
+          "progress": {
+            "type": "string",
+            "description": "gantt only (optional): a number column drawn as the share of the bar done"
           }
         },
         "required": [
@@ -3707,6 +3803,34 @@
             },
             "description": "table, pivot and kpi only: colour a cell or the value by a rule, for example below 1,000 in red"
           },
+          "clusters": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "properties": {
+              "k": {
+                "oneOf": [
+                  {
+                    "type": "string",
+                    "enum": [
+                      "auto"
+                    ]
+                  },
+                  {
+                    "type": "integer",
+                    "minimum": 2,
+                    "maximum": 10
+                  }
+                ],
+                "description": "\"auto\" (the console picks from 2 to 10) or a number of groups"
+              }
+            },
+            "required": [
+              "k"
+            ],
+            "description": "scatter and bubble only: colour the points by cluster (k-means over the points on screen)"
+          },
           "referenceLines": {
             "type": "array",
             "maxItems": 5,
@@ -3722,9 +3846,16 @@
                     "min",
                     "max",
                     "trend",
-                    "band"
+                    "band",
+                    "forecast"
                   ],
-                  "description": "value (default): a line at `value`; average, median, min, max: computed from the rows the chart shows; trend: a linear trend over them; band: a shaded band from `value` to `to`"
+                  "description": "value (default): a line at `value`; average, median, min, max: computed from the rows the chart shows; trend: a linear trend over them; band: a shaded band from `value` to `to`; forecast: the series continued `horizon` periods ahead with a 95 % band (bar, line, area, stacked, combo with the date dimension grouped by minute to year, no breakdown, at most one per chart)"
+                },
+                "horizon": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 60,
+                  "description": "forecast only, required: how many periods ahead"
                 },
                 "value": {
                   "oneOf": [
@@ -6662,6 +6793,439 @@
   {
     "type": "function",
     "function": {
+      "name": "export_dashboard",
+      "description": "Give a link that downloads a dashboard as a PDF, every tab with the filters applied. Nothing is made until the person opens the link, and it is made with their permissions. Use the board id from list_boards.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "board": {
+            "type": "string",
+            "description": "the dashboard's id, from list_boards"
+          },
+          "filters": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            },
+            "description": "the filters in force on the page, copied from the page context's raw JSON, so the file matches the screen; leave out when there are none"
+          },
+          "params": {
+            "type": "object",
+            "description": "the parameter values in force, name to value, if the page context lists any"
+          },
+          "grain": {
+            "type": "string",
+            "enum": [
+              "minute",
+              "hour",
+              "day",
+              "week",
+              "month",
+              "quarter",
+              "year"
+            ],
+            "description": "the dashboard's time grain switch if the page context shows one"
+          },
+          "format": {
+            "type": "string",
+            "enum": [
+              "pdf"
+            ],
+            "description": "pdf, the default"
+          },
+          "paper": {
+            "type": "string",
+            "enum": [
+              "a4",
+              "letter"
+            ],
+            "description": "default a4"
+          },
+          "orientation": {
+            "type": "string",
+            "enum": [
+              "portrait",
+              "landscape"
+            ],
+            "description": "default portrait"
+          }
+        },
+        "required": [
+          "board"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "export_chart",
+      "description": "Give a link that downloads one chart's data as Excel or CSV (up to 1,000,000 rows). Nothing is made until the person opens the link, and it is made with their permissions. Use the chart id from list_charts.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "chart": {
+            "type": "string",
+            "description": "the chart's id, from list_charts"
+          },
+          "filters": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            },
+            "description": "the filters in force on the page, copied from the page context's raw JSON, so the file matches the screen; leave out when there are none"
+          },
+          "params": {
+            "type": "object",
+            "description": "the parameter values in force, name to value, if the page context lists any"
+          },
+          "grain": {
+            "type": "string",
+            "enum": [
+              "minute",
+              "hour",
+              "day",
+              "week",
+              "month",
+              "quarter",
+              "year"
+            ],
+            "description": "the dashboard's time grain switch if the page context shows one"
+          },
+          "format": {
+            "type": "string",
+            "enum": [
+              "xlsx",
+              "csv"
+            ]
+          },
+          "values": {
+            "type": "string",
+            "enum": [
+              "formatted",
+              "raw"
+            ],
+            "description": "formatted as on the chart (default) or the raw values"
+          }
+        },
+        "required": [
+          "chart",
+          "format"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "create_report_subscription",
+      "description": "Send a dashboard by email on a schedule, as a PDF and/or chosen charts' data as Excel or CSV. By default it is sent to the person asking alone, who confirms with the Confirm button. Naming any other recipient (`recipients`) needs a human's approval first, and an outside address works only on a domain an administrator allowed in Admin > Settings. The report is made with the asking person's own permissions, masking and row filters, and every recipient sees the same data.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "board": {
+            "type": "string",
+            "description": "the dashboard's id, from list_boards"
+          },
+          "schedule": {
+            "type": "object",
+            "description": "when it is sent, in the time zone given (default: the report time zone). kind hourly: minute; daily: hour, minute; weekly: weekday 1 (Monday) to 7 (Sunday), hour, minute; monthly: monthDay 1 to 28 or \"last\", hour, minute",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "hourly",
+                  "daily",
+                  "weekly",
+                  "monthly"
+                ]
+              },
+              "minute": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 59
+              },
+              "hour": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 23
+              },
+              "weekday": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 7
+              },
+              "monthDay": {
+                "description": "1 to 28, or the word last"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "timeZone": {
+            "type": "string",
+            "description": "an IANA zone such as Asia/Jakarta; leave out for the report time zone"
+          },
+          "pdf": {
+            "type": "boolean",
+            "description": "attach the dashboard as a PDF; true for a request such as \"send me this dashboard as a PDF\""
+          },
+          "paper": {
+            "type": "string",
+            "enum": [
+              "a4",
+              "letter"
+            ],
+            "description": "default a4"
+          },
+          "orientation": {
+            "type": "string",
+            "enum": [
+              "portrait",
+              "landscape"
+            ],
+            "description": "default portrait"
+          },
+          "charts": {
+            "type": "array",
+            "maxItems": 10,
+            "items": {
+              "type": "object",
+              "properties": {
+                "chart": {
+                  "type": "string",
+                  "description": "a data chart's id on this dashboard, from list_charts"
+                },
+                "format": {
+                  "type": "string",
+                  "enum": [
+                    "xlsx",
+                    "csv"
+                  ]
+                },
+                "values": {
+                  "type": "string",
+                  "enum": [
+                    "formatted",
+                    "raw"
+                  ]
+                }
+              },
+              "required": [
+                "chart",
+                "format"
+              ]
+            },
+            "description": "charts whose data is attached as files"
+          },
+          "filters": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            },
+            "description": "the filters this report uses, copied from the page context's raw JSON; leave out for none"
+          },
+          "params": {
+            "type": "object",
+            "description": "parameter values, name to value"
+          },
+          "grain": {
+            "type": "string",
+            "enum": [
+              "minute",
+              "hour",
+              "day",
+              "week",
+              "month",
+              "quarter",
+              "year"
+            ]
+          },
+          "skipWhenEmpty": {
+            "type": "boolean",
+            "description": "send nothing when every chart has no rows"
+          },
+          "sendToMe": {
+            "type": "boolean",
+            "description": "send to the person asking; default true"
+          },
+          "recipients": {
+            "type": "array",
+            "maxItems": 49,
+            "items": {
+              "type": "object",
+              "properties": {
+                "userId": {
+                  "type": "string",
+                  "description": "a console user's id"
+                },
+                "email": {
+                  "type": "string",
+                  "description": "an outside address"
+                }
+              }
+            },
+            "description": "OTHER recipients; naming any makes the call wait for human approval"
+          }
+        },
+        "required": [
+          "board",
+          "schedule"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "list_report_subscriptions",
+      "description": "List the scheduled reports the person set up: their schedule, what they attach, who gets them and whether they are paused.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "board": {
+            "type": "string",
+            "description": "only this dashboard's, optional"
+          }
+        }
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "update_report_subscription",
+      "description": "Change a scheduled report the person set up: the schedule, time zone, attachments, filters or recipients, or pause or resume it. Give only what changes; everything left out stays. Naming recipients in `recipients` needs a human's approval.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "the subscription's id, from list_report_subscriptions"
+          },
+          "schedule": {
+            "type": "object",
+            "description": "when it is sent, in the time zone given (default: the report time zone). kind hourly: minute; daily: hour, minute; weekly: weekday 1 (Monday) to 7 (Sunday), hour, minute; monthly: monthDay 1 to 28 or \"last\", hour, minute",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "hourly",
+                  "daily",
+                  "weekly",
+                  "monthly"
+                ]
+              },
+              "minute": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 59
+              },
+              "hour": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 23
+              },
+              "weekday": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 7
+              },
+              "monthDay": {
+                "description": "1 to 28, or the word last"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "timeZone": {
+            "type": "string"
+          },
+          "pdf": {
+            "type": "boolean"
+          },
+          "paper": {
+            "type": "string",
+            "enum": [
+              "a4",
+              "letter"
+            ]
+          },
+          "orientation": {
+            "type": "string",
+            "enum": [
+              "portrait",
+              "landscape"
+            ]
+          },
+          "charts": {
+            "type": "array",
+            "maxItems": 10,
+            "items": {
+              "type": "object"
+            },
+            "description": "the full list of chart files; replaces the current one"
+          },
+          "filters": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "params": {
+            "type": "object"
+          },
+          "grain": {
+            "type": "string"
+          },
+          "skipWhenEmpty": {
+            "type": "boolean"
+          },
+          "sendToMe": {
+            "type": "boolean"
+          },
+          "recipients": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            },
+            "description": "replaces the recipients; naming others needs approval"
+          },
+          "paused": {
+            "type": "boolean",
+            "description": "true pauses, false resumes"
+          }
+        },
+        "required": [
+          "id"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "delete_report_subscription",
+      "description": "Delete a scheduled report. Needs human approval, like every deletion.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "the subscription's id, from list_report_subscriptions"
+          }
+        },
+        "required": [
+          "id"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
       "name": "ask_user",
       "description": "Ask the user which reading of an unclear word they mean, with two to four options taken from the DATA MAP. Use it only when a word fits two or more tables, columns or values and nothing in the DATA MAP or THIS USER'S WORDS settles it. Ask once, run no query in that turn, and write nothing else after the call.",
       "parameters": {
@@ -6723,6 +7287,17 @@
           "reason",
           "engine"
         ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "list_maps",
+      "description": "List the maps a geomap, pointmap or geoheat chart can be drawn on: the ones that ship with the console (Jakarta, Indonesia, the world, and the states or provinces of any country) and the ones an administrator uploaded, with the id to put in `map` and a label. Call it before setting `map`.",
+      "parameters": {
+        "type": "object",
+        "properties": {}
       }
     }
   }

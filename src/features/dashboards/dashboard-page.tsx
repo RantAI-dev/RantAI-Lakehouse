@@ -3,7 +3,7 @@
 import * as React from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { useTheme } from "next-themes";
-import { ArrowRightLeft, ChartColumn, Download, Heading, Maximize2, Minus, MousePointerClick, Move, Moon, Pencil, Plus, Smartphone, SlidersHorizontal, Sparkles, Table2, Trash2, Rows3 } from "lucide-react";
+import { ArrowRightLeft, ChartColumn, Download, GitFork, Heading, Maximize2, Minus, MousePointerClick, Move, Moon, Pencil, Plus, Smartphone, SlidersHorizontal, Sparkles, Table2, Trash2, Rows3 } from "lucide-react";
 import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog";
 import { PageHeader } from "@/components/patterns/page-header";
 import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@rantai/design-system/ui/empty";
@@ -28,7 +28,7 @@ import { extractViewFiltersFromChat } from "@/lib/dashboard-view-filter-from-cha
 import { canDrill, drillTarget, offersTileRecords, type ChartClickHandler, type ClickSpec } from "@/lib/chart-click";
 import type { ChartRenderSpec, ChartSource } from "@/lib/dashboard-specs";
 import {
-  TAB_PARAM, addTab, bottomOfTab, defaultTileHeight, deleteTab, filtersOnTab, moveTab, moveTileToTab, placeUnboxed, renameTab, selectedTab, tabOf, tilesOnTab, withTabParam, type TabEdit,
+  TAB_PARAM, addTab, bottomOfTab, defaultTileHeight, deleteTab, filtersOnTab, isSingleValueChart, isStaticKind, moveTab, moveTileToTab, placeUnboxed, renameTab, selectedTab, tabOf, tilesOnTab, withTabParam, type TabEdit,
 } from "@/lib/dashboard-tabs";
 import type { BoardTab, LayoutMap, PhoneTile } from "@/services";
 import type { ChartClick, FilterDef, FilterField } from "@/services/clients/bi-store";
@@ -57,6 +57,7 @@ import { GrainMarkers } from "./grain-marker";
 import { OwnFiltersMarker } from "./filters/own-filters-marker";
 import { GrainSwitch } from "./grain-switch";
 import { ReportingProvider } from "./reporting-context";
+import { ChartLineagePanel } from "./chart-lineage-panel";
 import { FilterBar } from "./filters/filter-bar";
 import { SkippedFiltersMarker } from "./filters/skipped-marker";
 import { DashboardGrid, type GridItem, type TileMenuItem } from "./dashboard-grid";
@@ -71,7 +72,10 @@ import type { RecordsRequest } from "./records";
 import { forgetLastBoard, rememberLastBoard } from "./last-board";
 import { ShareDialog } from "./share-dialog";
 import { TileBody } from "./tile-body";
-import { downloadTableExport, exportNotice } from "./table-export";
+import { exportNotice } from "./table-export";
+import { downloadChartData, downloadDashboardPdf, downloadMenuKind, type DataChoice, type PdfChoice, type ReadState } from "./chart-download";
+import { DownloadDataDialog, DownloadPdfDialog } from "./download-dialogs";
+import { SubscriptionsDialog } from "./subscriptions-dialog";
 import { TileDataDialog, TileExpandDialog, downloadRowsCsv, hasRows, type Cell } from "./tile-dialogs";
 
 /**
@@ -101,6 +105,10 @@ type Payload = {
   grain?: string; appliedGrain?: string | null;
   /** The zone and first weekday the buckets were cut with (BI-9). */
   reporting?: ReportingContext;
+  /** False when every role of the viewer is switched off from downloading (BI-1); the download items are hidden. Absent from an older server: allowed. */
+  canDownload?: boolean;
+  /** False when the deployment has no PDF renderer (`BI-1`, feature decision 6). Absent from an older server: not offered. */
+  pdfSupported?: boolean;
   /** The dashboard's own theme and font (BI-17 part A); absent when it follows the console. */
   theme?: string; font?: string;
   /** The parameters the board shows with this response's value, the value each has saved (or by default), and every value in force (BI-11). */
@@ -242,6 +250,8 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   const [records, setRecords] = React.useState<RecordsRequest | null>(null);
   // Tiles whose saved click destination the viewer set aside for the drill menu (this session only).
   const [menuTiles, setMenuTiles] = React.useState<ReadonlySet<string>>(new Set());
+  // BI-14: the chart whose "Where does this come from" panel is open.
+  const [lineageChart, setLineageChart] = React.useState<{ id: string; title: string } | null>(null);
   const [tileDialog, setTileDialog] = React.useState<{ kind: "data" | "expand"; id: string } | null>(null);
   // Only the newest load may write state. Creating a dashboard fires a
   // reload of the board being left and then navigates to the new one; the
@@ -913,14 +923,16 @@ export function DashboardPage({ boardId }: { boardId: string }) {
 
   // The sort a viewer chose on a raw table, by tile, so its export follows the tile.
   const tableSorts = React.useRef<Record<string, { column: string; dir: "asc" | "desc" }>>({});
-  async function exportRawTable(id: string) {
-    try {
-      const done = await downloadTableExport(id, filters, tableSorts.current[id], paramsQuery(data?.appliedParams ?? null));
-      const note = exportNotice(done);
-      if (done.cut) notifyInfo(note.message, note.description); else notifySuccess(note.message);
-    } catch (e) {
-      notifyFailure("The export failed", e instanceof Error ? e.message : undefined);
-    }
+  // BI-1: what the page sent to read the dashboard, sent again with a download, so the file holds what is on screen.
+  const readState = (): ReadState => ({ filters, params: paramsQuery(data?.appliedParams ?? null), grain: grainQuery(gChoice) });
+  const canDownload = data?.canDownload !== false;
+  const [pdfOpen, setPdfOpen] = React.useState(false);
+  const [subsOpen, setSubsOpen] = React.useState(false);
+  const [dataFor, setDataFor] = React.useState<{ id: string; title: string } | null>(null);
+  async function downloadData(id: string, choice: DataChoice) {
+    const done = await downloadChartData(id, choice, readState(), tableSorts.current[id]);
+    const note = exportNotice(done);
+    if (done.cut) notifyInfo(note.message, note.description); else notifySuccess(note.message);
   }
 
   // Build the tiles for the grid.
@@ -951,6 +963,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
     const clickSpec = clickSpecOf(spec, level);
     const drillable = !edit && canDrill(clickSpec);
     const own = spec.source !== "builtin";
+    const downloadKind = downloadMenuKind({ own, hasRows: hasRows(cell) && cell.rows.length > 0 }, canDownload);
     const write = chartWriteItems({
       canWrite, own, hasDef: Boolean(spec.def),
       onEdit: () => setEditing({ id: spec.id, def: spec.def as ChartDef }),
@@ -967,17 +980,20 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       ...((offersTileRecords(spec.kind) || spec.def?.steps?.length) && (spec.mart || spec.sqlSource)
         ? [{ label: "View records", icon: <Table2 />, onSelect: () => openRecords({ title: spec.title, mart: spec.mart, sqlSource: spec.sqlSource, chart: ownFilterChart(spec) }, spec.source === "builtin", NO_FILTERS, spec.id) }]
         : []),
+      // BI-14 (decision 1, Q6): everyone who sees a stored chart gets the item; the panel says what a person without `lineage:read` may do.
+      ...(own ? [{ label: "Where does this come from", icon: <GitFork />, onSelect: () => setLineageChart({ id: spec.id, title: spec.title }) }] : []),
       // BI-9: a chart grouped by a part of the date (a weekday) has no rows to
       // list or range to filter; the menu says why instead of leaving the click dead.
       ...(hasRows(cell) && isGrain(cell.grain) && !isTruncation(cell.grain)
         ? [{ label: "Why clicking does nothing", icon: <MousePointerClick />, onSelect: () => notifyInfo("Nothing to open from this value", PART_NO_CLICK_REASON) }]
         : []),
-      // BI-16A T8: a raw table exports its whole result (every row, the tile's
-      // filters and sort), from the server; other tiles keep the rows on screen.
-      ...(hasRows(cell) && cell.rows.length && own && spec.kind === "table" && spec.def?.tableMode === "rows"
-        ? [{ label: "Download CSV (all rows)", icon: <Download />, onSelect: () => void exportRawTable(spec.id) }]
-        : hasRows(cell) && cell.rows.length
-          ? [{ label: "Download CSV", icon: <Download />, onSelect: () => downloadRowsCsv(spec.title, cell) }]
+      // BI-1: a chart of the board downloads its whole result from the server, as
+      // Excel or CSV, formatted or raw. A built-in tile has no stored definition to
+      // read and keeps the rows on screen as CSV.
+      ...(downloadKind === "data"
+        ? [{ label: "Download data…", icon: <Download />, onSelect: () => setDataFor({ id: spec.id, title: spec.title }) }]
+        : downloadKind === "csv"
+          ? [{ label: "Download CSV", icon: <Download />, onSelect: () => hasRows(cell) && downloadRowsCsv(spec.title, cell) }]
           : []),
       ...write.edit,
       ...moveItems(spec.id),
@@ -1100,6 +1116,10 @@ export function DashboardPage({ boardId }: { boardId: string }) {
               onRename={() => setRenameOpen(true)}
               onShare={() => setShareOpen(true)}
               onExportPdf={exportPdf}
+              onDownloadPdf={() => setPdfOpen(true)}
+              onSubscriptions={() => setSubsOpen(true)}
+              pdfSupported={data?.pdfSupported === true}
+              canDownload={canDownload}
               onDuplicate={() => void duplicateDashboard()}
               onDelete={() => void deleteDashboard()}
             />
@@ -1304,7 +1324,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       {noteFor ? <NoteDialog point={noteFor.point} saving={savingNote} error={noteError} onSave={(t) => void saveNote(t)} onClose={() => setNoteFor(null)} /> : null}
 
       {tileDialog?.kind === "data" && dialogSpec ? (
-        <TileDataDialog title={dialogSpec.title} cell={data?.results[dialogSpec.id]} onClose={() => setTileDialog(null)} />
+        <TileDataDialog title={dialogSpec.title} cell={data?.results[dialogSpec.id]} onClose={() => setTileDialog(null)} canDownload={canDownload} />
       ) : null}
       {tileDialog?.kind === "expand" && dialogSpec ? (
         <TileExpandDialog spec={dialogSpec} cell={data?.results[dialogSpec.id]} dark={dark} onClose={() => setTileDialog(null)} />
@@ -1326,6 +1346,36 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       {renameOpen ? (
         <RenameDashboardDialog open={renameOpen} onOpenChange={setRenameOpen} currentName={dashName} onSave={(n) => void renameDashboard(n)} />
       ) : null}
+      {subsOpen ? (
+        <SubscriptionsDialog
+          open={subsOpen}
+          onOpenChange={setSubsOpen}
+          board={board}
+          dashName={dashName}
+          charts={(data?.charts ?? []).filter((c) => c.def && !isStaticKind(c.kind)).map((c) => ({ id: c.id, title: c.title, grouped: !isSingleValueChart(c.kind, c.def) }))}
+          readState={readState()}
+          reportZone={data?.reporting?.timeZone ?? "UTC"}
+        />
+      ) : null}
+      {pdfOpen ? (
+        <DownloadPdfDialog
+          open={pdfOpen}
+          onOpenChange={setPdfOpen}
+          onDownload={async (choice: PdfChoice) => {
+            const fileName = await downloadDashboardPdf(board, choice, readState());
+            notifySuccess("PDF downloaded", fileName);
+          }}
+        />
+      ) : null}
+      {dataFor ? (
+        <DownloadDataDialog
+          open
+          onOpenChange={(next) => { if (!next) setDataFor(null); }}
+          title={dataFor.title}
+          onDownload={(choice) => downloadData(dataFor.id, choice)}
+        />
+      ) : null}
+      <ChartLineagePanel chart={lineageChart} onOpenChange={(next) => { if (!next) setLineageChart(null); }} />
     </div>
     </ReportingProvider>
   );

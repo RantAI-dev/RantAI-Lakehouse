@@ -223,6 +223,10 @@ pub struct AppState {
     /// Counts the files being received by `POST /api/uploads` (`SEC-17`),
     /// per user and in total. Shared across clones; always populated.
     pub upload_receive: ReceiveLimiter,
+    /// At most [`PDF_AT_ONCE`] PDFs are made at once per process (`BI-1` D5,
+    /// feature decision 5); a third request waits for a slot. Shared across
+    /// clones.
+    pub pdf_slots: Arc<tokio::sync::Semaphore>,
     /// Test seam for the alert webhook sender (merge of `SEC-10` into the
     /// `SRC-17` delivery tests): those tests deliver to a `wiremock`
     /// listener on loopback, which the real address policy refuses by
@@ -231,6 +235,10 @@ pub struct AppState {
     #[cfg(test)]
     pub webhook_sender_override: Option<lakehouse_notify::WebhookSender>,
 }
+
+/// PDFs made at once per API process (`BI-1` D5). Chromium is heavy, and the
+/// Gotenberg container has 1 GiB; a third request waits its turn.
+pub const PDF_AT_ONCE: usize = 2;
 
 /// Build the admin-scoped [`LakekeeperAdminClient`] from the token file at
 /// `token_path`, or `None` when this deployment has no usable admin token.
@@ -667,17 +675,16 @@ impl AppState {
     /// Build application state from a resolved [`Config`].
     #[must_use]
     pub fn new(config: Config) -> Self {
-        let clickhouse = ChClient::new(
+        let clickhouse = Arc::new(ChClient::new(
             config.ch_url.clone(),
             config.ch_user.clone(),
             config.ch_password.clone(),
-        );
+        ));
         let dagster = DgClient::with_repository(
             config.dagster_url.clone(),
             config.dagster_repo.clone(),
             config.dagster_location.clone(),
         );
-        let clickhouse = Arc::new(clickhouse);
         let llm = LlmClient::new(
             config.llm_url.clone(),
             config.llm_model.clone(),
@@ -783,6 +790,7 @@ impl AppState {
             lakekeeper_admin,
             throttle_policy: Arc::new(throttle_policy),
             upload_receive,
+            pdf_slots: Arc::new(tokio::sync::Semaphore::new(PDF_AT_ONCE)),
             #[cfg(test)]
             webhook_sender_override: None,
         }

@@ -858,6 +858,9 @@ pub enum LineKind {
     Trend,
     /// A band between two values, `value` and `to`.
     Band,
+    /// A forecast of the series, `horizon` periods ahead (`BI-17` part B,
+    /// plan D1). Computed by the console from the rows on screen.
+    Forecast,
 }
 
 impl LineKind {
@@ -866,7 +869,7 @@ impl LineKind {
     pub fn is_computed(self) -> bool {
         matches!(
             self,
-            Self::Average | Self::Median | Self::Min | Self::Max | Self::Trend
+            Self::Average | Self::Median | Self::Min | Self::Max | Self::Trend | Self::Forecast
         )
     }
 
@@ -906,6 +909,10 @@ pub struct ReferenceLine {
     /// first.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub measure: Option<String>,
+    /// A forecast's periods ahead, 1 to [`MAX_FORECAST_HORIZON`]; only on a
+    /// `forecast` line (`BI-17` part B).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub horizon: Option<u32>,
 }
 
 impl ReferenceLine {
@@ -955,10 +962,58 @@ fn takes_param_slots(def: &ChartInput) -> bool {
             | ChartKind::Web
             | ChartKind::Progress
             | ChartKind::Histogram
+            | ChartKind::Gantt
             | ChartKind::Bullet
     ) && def.shape.steps.is_none()
         && def.shape.groupings.is_none()
         && !def.tables.is_rows_mode(def.kind)
+}
+
+/// Most periods a forecast looks ahead (`BI-17` part B, plan D1).
+pub const MAX_FORECAST_HORIZON: u32 = 60;
+
+/// The kinds that can draw a forecast: a series over a category axis. A
+/// horizontal bar chart has none to extend.
+fn takes_forecast(kind: ChartKind) -> bool {
+    matches!(
+        kind,
+        ChartKind::Bar | ChartKind::Line | ChartKind::Area | ChartKind::Stacked | ChartKind::Combo
+    )
+}
+
+/// The checks that belong to a `forecast` line (`BI-17` part B, plan D1): one
+/// per chart, a horizon of 1 to 60, a kind with a time axis and no breakdown
+/// (a forecast describes one series). That the dimension is a date with a
+/// time grain needs the relation and is checked in
+/// [`crate::shape::check_against_relation`].
+fn check_forecast_lines(def: &ChartInput, lines: &[ReferenceLine]) -> Result<(), String> {
+    let forecasts: Vec<&ReferenceLine> = lines
+        .iter()
+        .filter(|l| l.kind == LineKind::Forecast)
+        .collect();
+    if forecasts.is_empty() {
+        return Ok(());
+    }
+    if forecasts.len() > 1 {
+        return Err("a chart has at most one forecast.".to_owned());
+    }
+    if !takes_forecast(def.kind) {
+        return Err(
+            "a forecast is for a bar, line, area, stacked or combo chart over dates.".to_owned(),
+        );
+    }
+    if def.breakdown.is_some() {
+        return Err(
+            "a forecast describes one series: remove the breakdown to forecast this chart."
+                .to_owned(),
+        );
+    }
+    match forecasts[0].horizon {
+        Some(h) if (1..=MAX_FORECAST_HORIZON).contains(&h) => Ok(()),
+        _ => Err(format!(
+            "a forecast needs a horizon of 1 to {MAX_FORECAST_HORIZON} periods."
+        )),
+    }
 }
 
 /// Check a chart's reference lines: the kinds that take them, how many, and
@@ -989,12 +1044,17 @@ pub fn check_reference_lines(def: &ChartInput) -> Result<(), String> {
     // are the groups side by side, so the average, the median, the minimum,
     // the maximum and the trend would mix the groups. A goal and a band are
     // values of their own and stay allowed.
-    if def.breakdown.is_some() && lines.iter().any(|l| l.kind.is_computed()) {
+    if def.breakdown.is_some()
+        && lines
+            .iter()
+            .any(|l| l.kind.is_computed() && l.kind != LineKind::Forecast)
+    {
         return Err(
             "an average, median, minimum, maximum or trend line cannot be drawn on a chart with a breakdown: it would mix the groups."
                 .to_owned(),
         );
     }
+    check_forecast_lines(def, lines)?;
     let results = def.measures.result_names();
     for line in lines {
         let check_value = |v: &LineValue| match v {
@@ -1013,6 +1073,9 @@ pub fn check_reference_lines(def: &ChartInput) -> Result<(), String> {
             (LineKind::Band, None, _) | (LineKind::Band, _, None) => {
                 return Err("a band needs a value and a second value.".to_owned());
             }
+            (LineKind::Forecast, Some(_), _) => {
+                return Err("a forecast is computed: leave its value out.".to_owned());
+            }
             (kind, Some(_), _) if kind.is_computed() => {
                 return Err("an average, median, minimum, maximum or trend line is computed: leave its value out.".to_owned());
             }
@@ -1028,6 +1091,9 @@ pub fn check_reference_lines(def: &ChartInput) -> Result<(), String> {
             && a >= b
         {
             return Err("a band starts at its lower value.".to_owned());
+        }
+        if line.horizon.is_some() && line.kind != LineKind::Forecast {
+            return Err("a horizon is only for a forecast.".to_owned());
         }
         if let Some(c) = &line.color
             && !crate::formatting::is_hex_color(c)
@@ -1385,6 +1451,9 @@ pub struct ResolvedLine {
     /// The value a computed line describes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub measure: Option<String>,
+    /// Periods ahead of a forecast line.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub horizon: Option<u32>,
 }
 
 /// The reference lines of `def` with the values of this read. A line whose
@@ -1416,6 +1485,7 @@ pub fn reference_lines(def: &ChartInput, params: &ParamValues) -> Vec<ResolvedLi
                 label: line.label.clone(),
                 color: line.color.clone(),
                 measure: line.measure.clone(),
+                horizon: line.horizon,
             })
         })
         .collect()
@@ -1913,6 +1983,7 @@ mod tests {
                     label: Some("Goal".to_owned()),
                     color: None,
                     measure: None,
+                    horizon: None,
                 },
                 ResolvedLine {
                     kind: LineKind::Value,
@@ -1921,6 +1992,7 @@ mod tests {
                     label: None,
                     color: None,
                     measure: None,
+                    horizon: None,
                 },
             ]
         );
@@ -1974,6 +2046,100 @@ mod tests {
             assert!(e.contains(why), "{lines}: {e}");
         }
         assert!(serde_json::from_value::<ReferenceLine>(json!({ "kind": "wave" })).is_err());
+    }
+
+    /// `BI-17` part B (plan D1): the forecast line and its horizon.
+    #[test]
+    fn a_forecast_line_needs_a_horizon_of_1_to_60_and_is_checked_by_kind() {
+        let check = |extra: Value, lines: Value| {
+            let mut def = json!({ "referenceLines": lines });
+            for (k, v) in extra.as_object().unwrap() {
+                def[k] = v.clone();
+            }
+            check_reference_lines(&chart(&def).def)
+        };
+        let ok = json!([{ "kind": "forecast", "horizon": 6 }]);
+        assert!(check(json!({}), ok.clone()).is_ok());
+        assert!(check(json!({}), json!([{ "kind": "forecast", "horizon": 1, "measure": "visitors", "label": "Outlook" }])).is_ok());
+        assert!(check(json!({}), json!([{ "kind": "forecast", "horizon": 60 }])).is_ok());
+        for (extra, lines, why) in [
+            (
+                json!({}),
+                json!([{ "kind": "forecast" }]),
+                "horizon of 1 to 60",
+            ),
+            (
+                json!({}),
+                json!([{ "kind": "forecast", "horizon": 0 }]),
+                "horizon of 1 to 60",
+            ),
+            (
+                json!({}),
+                json!([{ "kind": "forecast", "horizon": 61 }]),
+                "horizon of 1 to 60",
+            ),
+            (
+                json!({}),
+                json!([{ "kind": "forecast", "horizon": 3, "value": 5 }]),
+                "computed",
+            ),
+            (
+                json!({}),
+                json!([{ "kind": "forecast", "horizon": 3 }, { "kind": "forecast", "horizon": 4 }]),
+                "at most one forecast",
+            ),
+            (
+                json!({}),
+                json!([{ "kind": "average", "horizon": 3 }]),
+                "only for a forecast",
+            ),
+            (
+                json!({ "kind": "hbar" }),
+                ok.clone(),
+                "bar, line, area, stacked or combo",
+            ),
+            (
+                json!({ "kind": "pie" }),
+                ok.clone(),
+                "reference lines are for",
+            ),
+            (
+                json!({ "breakdown": "tahun" }),
+                ok.clone(),
+                "remove the breakdown",
+            ),
+            (
+                json!({}),
+                json!([{ "kind": "forecast", "horizon": 3, "measure": "ghost" }]),
+                "not one of the chart's values",
+            ),
+        ] {
+            let e = check(extra.clone(), lines.clone()).unwrap_err();
+            assert!(e.contains(why), "{extra} {lines}: {e}");
+        }
+        for kind in ["bar", "line", "area", "stacked", "combo"] {
+            assert!(check(json!({ "kind": kind }), ok.clone()).is_ok(), "{kind}");
+        }
+    }
+
+    #[test]
+    fn a_forecast_line_round_trips_and_resolves_with_its_horizon() {
+        let stored = json!([{ "kind": "forecast", "horizon": 12, "label": "Outlook" }]);
+        let c = chart(&json!({ "referenceLines": stored }));
+        let lines = c.def.shape.reference_lines.as_ref().unwrap();
+        assert_eq!(serde_json::to_value(lines).unwrap(), stored);
+        let resolved = reference_lines(&c.def, &ParamValues::default());
+        assert_eq!(
+            serde_json::to_value(&resolved).unwrap(),
+            json!([{ "kind": "forecast", "label": "Outlook", "horizon": 12 }])
+        );
+        // A chart saved before forecasts writes no horizon.
+        let old = chart(&json!({ "referenceLines": [{ "value": 5.0 }] }));
+        assert!(
+            !serde_json::to_string(&old.def.shape.reference_lines)
+                .unwrap()
+                .contains("horizon")
+        );
     }
 
     /// `PR #199 review M BLOCKER 3` (decision M1): a computed line would mix

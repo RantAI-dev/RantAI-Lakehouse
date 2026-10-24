@@ -33,6 +33,11 @@ export type Rows = {
   grainSkipped?: string;
   /** More buckets existed than the chart's limit; the latest are shown (BI-9). A pivot: more cells than it may return, so the first are shown (BI-16). */
   truncated?: boolean;
+  /**
+   * `gantt` (BI-16 part C1, plan D2): how many rows the statement left out because their end is before their start. The plan leaves the
+   * shape of this count to T1; the tile reads it when present and says nothing when it is absent.
+   */
+  reversedRows?: number;
   /** A raw table's first page: the rows its pages walk through, the page size and the offset. Absent when the count could not be read (BI-16). */
   total?: number;
   limit?: number;
@@ -61,11 +66,13 @@ export function downloadRowsCsv(title: string, data: Rows): void {
 
 /** The numbers behind one chart, with a CSV download. */
 export function TileDataDialog({
-  title, cell, onClose,
+  title, cell, onClose, canDownload = true,
 }: {
   readonly title: string;
   readonly cell: Cell | undefined;
   readonly onClose: () => void;
+  /** False when every role of the viewer is switched off from downloading (BI-1 review fix (SHOULD-FIX) R6): the CSV button is not offered. */
+  readonly canDownload?: boolean;
 }) {
   return (
     <Dialog open onOpenChange={(o) => { if (!o) onClose(); }}>
@@ -78,9 +85,11 @@ export function TileDataDialog({
             <RowsTable columns={visibleColumns(cell.columns)} rows={cell.rows} />
             <div className="flex items-center justify-between">
               <p className="text-[11px] text-muted-foreground">{cell.rows.length} rows</p>
-              <Button size="sm" variant="outline" onClick={() => downloadRowsCsv(title, cell)}>
-                <Download className="size-4" /> Download CSV
-              </Button>
+              {canDownload ? (
+                <Button size="sm" variant="outline" onClick={() => downloadRowsCsv(title, cell)}>
+                  <Download className="size-4" /> Download CSV
+                </Button>
+              ) : null}
             </div>
           </>
         ) : (

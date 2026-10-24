@@ -29,6 +29,9 @@ export const COMPANY_PALETTE_MAX = 12
 /** The most content sites a deployment may list; mirrors `MAX_CONTENT_SITES`. */
 export const MAX_CONTENT_SITES = 50
 
+/** Most outside email domains a scheduled report may be allowed to (`RPT-1`, D8). */
+export const MAX_REPORT_DOMAINS = 50
+
 /** Whether `s` is `#rrggbb`, the only colour form the server accepts. */
 export function isHexColor(s: string): boolean {
   return /^#[0-9a-fA-F]{6}$/.test(s)
