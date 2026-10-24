@@ -121,8 +121,19 @@ pub(super) async fn run_saved_query(
     // copilot-run saved query is recorded under the real user in
     // `query_history`, exactly like a console-run query.
     let extension = Some(Extension(principal.clone()));
-    api_result_to_value(crate::routes::query::run(State(state.clone()), extension, body).await)
-        .await
+    // The chat sends no `X-Tenant` header, so the tenant is the caller's
+    // first one — the same answer `tenant_scope::resolve` gives every
+    // caller without headers.
+    api_result_to_value(
+        crate::routes::query::run(
+            State(state.clone()),
+            extension,
+            axum::http::HeaderMap::new(),
+            body,
+        )
+        .await,
+    )
+    .await
 }
 
 #[cfg(test)]

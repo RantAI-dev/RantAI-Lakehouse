@@ -756,6 +756,12 @@ const MAX_RESULT_ROWS: usize = 2_000;
 ///   the request is refused before anything runs. The route is
 ///   policy-gated (`Policy::RequiresPermission("query:read")`), so this is
 ///   defense in depth, the same shape `routes::gold::export` uses.
+/// - 404 [`ApiError::NotFound`] when the statement reads a table the
+///   caller's tenant may not read: the fixed sentence of
+///   [`table_not_available`], the same whether the table belongs to
+///   another tenant or does not exist at all (`SEC-20`). Never a 403:
+///   Query Studio's Run all reads a 403 as "this user may not run
+///   anything" and would refuse the other statements too.
 /// - 422 [`ApiError::Unprocessable`] when `sql` fails [`is_read_only`] (any
 ///   engine) or [`is_trino_safe`] (`engine: "trino"` only), or when the
 ///   engine itself rejects the query, or `sql_rewrite::enforce` refuses it
@@ -768,6 +774,7 @@ const MAX_RESULT_ROWS: usize = 2_000;
 pub async fn run(
     State(state): State<AppState>,
     principal: Option<Extension<Principal>>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
     let parsed = parse_body(&body)?;
@@ -813,7 +820,8 @@ pub async fn run(
     // `download` re-rewrites it for the caller's roles at that time), while
     // `rewritten` is what the engine runs and the audit event records
     // (`SEC-21`, `SEC-33`).
-    let rewritten = rewrite_sql_for_principal(&state, &statement, &engine, &p).await?;
+    let rewritten =
+        rewrite_sql_for_principal_with_headers(&state, &statement, &engine, &p, &headers).await?;
     // SEC-21: a statement's own `SETTINGS` would override the cap the run
     // sends with the request. Trino has no such settings in its client.
     if !is_trino_engine(&engine) {
@@ -1156,7 +1164,9 @@ pub async fn estimate(
     // status and fixed message and is never sent to the engine. The planner
     // reports the tables the statement reads, which the rewrite does not
     // change, so the sources shown are what the run would show.
-    let rewritten = rewrite_sql_for_principal(&state, &sql, "clickhouse", &principal).await?;
+    let rewritten =
+        rewrite_sql_for_principal_with_headers(&state, &sql, "clickhouse", &principal, &headers)
+            .await?;
     // SEC-21: the same settings rule as the run, on the statement the engine
     // is sent.
     refuse_unlisted_settings(&rewritten)?;
@@ -1607,6 +1617,7 @@ pub async fn download(
     Path(id): Path<String>,
     Query(query): Query<DownloadQuery>,
     principal: Option<Extension<Principal>>,
+    headers: HeaderMap,
 ) -> ApiResult<Response> {
     let (format_clause, content_type, extension) = match query.format.as_str() {
         "csv" => ("CSV", "text/csv", "csv"),
@@ -1657,7 +1668,9 @@ pub async fn download(
     let Some(Extension(caller)) = principal.as_ref() else {
         return Err(ApiError::NotFound("query run not found".to_owned()).into());
     };
-    let rewritten = rewrite_sql_for_principal(&state, &item.sql, &item.engine, caller).await?;
+    let rewritten =
+        rewrite_sql_for_principal_with_headers(&state, &item.sql, &item.engine, caller, &headers)
+            .await?;
     // SEC-21: the stored statement may carry a setting recorded before the
     // rule. The cap added below is appended after this check and stays.
     refuse_unlisted_settings(&rewritten)?;
@@ -2563,6 +2576,7 @@ mod tests {
             let result = run(
                 State(state),
                 Some(principal_with_display_name("alice")),
+                HeaderMap::new(),
                 trino_body(sql),
             )
             .await;
@@ -2655,6 +2669,7 @@ mod tests {
             let ApiJson(value) = run(
                 State(state),
                 Some(principal_with_display_name("alice")),
+                HeaderMap::new(),
                 trino_body("SELECT 1"),
             )
             .await
@@ -2686,6 +2701,7 @@ mod tests {
             let result = run(
                 State(state),
                 Some(principal_with_display_name("trino-maintenance")),
+                HeaderMap::new(),
                 trino_body("SELECT 1"),
             )
             .await;
@@ -2700,7 +2716,7 @@ mod tests {
         async fn missing_principal_is_refused_before_reaching_trino() {
             let server = MockServer::start().await;
             let state = test_state_with_trino(&server.uri());
-            let result = run(State(state), None, trino_body("SELECT 1")).await;
+            let result = run(State(state), None, HeaderMap::new(), trino_body("SELECT 1")).await;
             let err = result.expect_err("no principal must be refused");
             assert_eq!(err.0.status(), 401);
             assert_eq!(
@@ -2763,7 +2779,7 @@ mod tests {
             let server = MockServer::start().await;
             let state = test_state_with_trino(&server.uri());
             let body = Bytes::from(r#"{"sql": "SELECT 1"}"#);
-            let err = run(State(state), None, body)
+            let err = run(State(state), None, HeaderMap::new(), body)
                 .await
                 .expect_err("no principal must be refused");
             assert_eq!(err.0.status(), 401);
@@ -3053,7 +3069,13 @@ mod tests {
             let state = state_for(&pool, &server.uri());
 
             let body = Bytes::from(json!({ "sql": "SELECT * FROM serving.mart_x" }).to_string());
-            let result = run(State(state), Some(analyst_principal()), body).await;
+            let result = run(
+                State(state),
+                Some(analyst_principal()),
+                HeaderMap::new(),
+                body,
+            )
+            .await;
             assert!(
                 result.is_ok(),
                 "expected a successful, masked run: {result:?}"
@@ -3305,7 +3327,13 @@ mod tests {
             let state = state_for(&pool, &server.uri());
 
             let body = Bytes::from(json!({ "sql": "SELECT * FROM url('h','CSV')" }).to_string());
-            let result = run(State(state), Some(analyst_principal()), body).await;
+            let result = run(
+                State(state),
+                Some(analyst_principal()),
+                HeaderMap::new(),
+                body,
+            )
+            .await;
             let err = result.expect_err("a table function must be refused");
             assert_eq!(err.into_response().status(), 422);
 

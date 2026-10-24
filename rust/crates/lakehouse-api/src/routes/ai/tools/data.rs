@@ -115,7 +115,13 @@ pub(super) async fn run_sql(
     let body = axum::body::Bytes::from(json!({ "sql": sql }).to_string());
     let extension = Some(axum::Extension(principal.clone()));
     let result = api_result_to_value(
-        crate::routes::query::run(axum::extract::State(state.clone()), extension, body).await,
+        crate::routes::query::run(
+            axum::extract::State(state.clone()),
+            extension,
+            axum::http::HeaderMap::new(),
+            body,
+        )
+        .await,
     )
     .await;
     compact_query_result(result)
