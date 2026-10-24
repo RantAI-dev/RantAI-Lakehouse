@@ -72,6 +72,33 @@ fn token_refused() -> Response {
         .into_response()
 }
 
+/// Take the column of a hidden filter out of every tile's `filtersSkipped`
+/// (`BI-26` review NOTE): a tile that says which active filters it could not
+/// honour would otherwise name a filter the viewer is not meant to know of.
+/// Locked and editable filters, which the viewer knows, stay. Signed embeds only.
+fn strip_hidden_skips(body: &mut Value, access: &lakehouse_bi::embed_access::EmbedAccess) {
+    use lakehouse_bi::embed_access::FilterMode;
+    let Some(results) = body.get_mut("results").and_then(Value::as_object_mut) else {
+        return;
+    };
+    for tile in results.values_mut() {
+        let Some(list) = tile.get_mut("filtersSkipped").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        list.retain(|skipped| {
+            skipped
+                .get("column")
+                .and_then(Value::as_str)
+                .is_none_or(|column| access.mode_of(column) != FilterMode::Hidden)
+        });
+        if list.is_empty()
+            && let Some(map) = tile.as_object_mut()
+        {
+            map.remove("filtersSkipped");
+        }
+    }
+}
+
 /// The filters of one signed-embed read (`BI-26` plan D3).
 struct ResolvedFilters {
     /// What the tiles are filtered by.
@@ -394,6 +421,7 @@ pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
     match payload {
         Ok(mut body) => {
             crate::routes::settings::add_formatting_for_anonymous(&mut body, &format);
+            strip_hidden_skips(&mut body, &board.embed_access);
             (StatusCode::OK, ApiJson(body)).into_response()
         }
         Err(err) => (
@@ -497,6 +525,10 @@ pub async fn values(State(state): State<AppState>, body: Bytes) -> Response {
     }
 }
 
+/// What a manager is told when a filter that does not pick values is made
+/// locked or editable (`BI-26` review fix R3).
+const ONLY_VALUE_FILTERS: &str = "Only a filter that picks values can be locked or editable in an embed. Leave the others hidden.";
+
 /// `{ board, filterModes }` — the `PUT /api/dashboard/embed-settings` body.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -527,24 +559,10 @@ pub async fn put_settings(
                 .to_owned(),
         )
     })?;
-    let id = parsed.board.trim();
-    if id.is_empty() || id == store::DEFAULT_BOARD_ID {
-        return Err(ApiError::BadRequest("invalid dashboard".to_owned()).into());
-    }
-    let board = store::get_board(
-        &state.clickhouse,
-        id,
-        &crate::routes::dashboard_organise::viewer_of(&principal),
-    )
-    .await
-    .map_err(|err| {
-        upstream_error::ch_error_as(
-            &upstream_error::DATABASE,
-            &err,
-            upstream_error::FailedAs::Internal,
-        )
-    })?
-    .ok_or_else(|| ApiError::NotFound("dashboard not found.".to_owned()))?;
+    // BI-26 review fix (SHOULD-FIX) R6: the one guard for "a dashboard a manager
+    // names and may see" (`public_links::managed_board`), not a second copy.
+    let board =
+        crate::routes::public_links::managed_board(&state, &principal, Some(&parsed.board)).await?;
     let known: std::collections::BTreeSet<&str> = board
         .filters
         .iter()
@@ -561,6 +579,24 @@ pub async fn put_settings(
         )
         .into());
     }
+    // BI-26 review fix (SHOULD-FIX) R3: locked and editable work for a filter that
+    // picks values (`in`). A range, a relative date or a text match has no value a
+    // token can set or a dropdown can offer, so it can only be hidden.
+    let not_values: std::collections::BTreeSet<&str> = board
+        .filters
+        .iter()
+        .flatten()
+        .filter(|f| !f.op.is_in())
+        .map(|f| f.column.as_str())
+        .collect();
+    if parsed.filter_modes.iter().any(|(column, mode)| {
+        *mode != lakehouse_bi::embed_access::FilterMode::Hidden
+            && not_values.contains(column.as_str())
+    }) {
+        return Err(ApiError::BadRequest(ONLY_VALUE_FILTERS.to_owned()).into());
+    }
+    // The audit helper is the download audit's single writer; the action name
+    // and the arguments make the record this change's own (BI-26 review NOTE).
     crate::routes::dashboard::record_download_audit(
         &state,
         &principal,
@@ -610,50 +646,16 @@ pub async fn frame_origins(State(state): State<AppState>, body: Bytes) -> Respon
 
 async fn resolve_frame_origins(state: &AppState, body: FrameBody) -> Result<Vec<String>, ApiError> {
     if let Some(jwt) = body.jwt.filter(|s| !s.is_empty()) {
-        // Same verification `data` applies, so a token that would be refused
-        // there is not given a framing list here.
-        let Some(secret) = state.config.embed_secret.as_deref() else {
+        // BI-26 review fix (SHOULD-FIX) R6: the same checks `data` makes
+        // (`verified_claims`, `admit`), not a second copy; a token that would be
+        // refused there is given no framing list, whatever the reason.
+        let Ok(claims) = verified_claims(state, &jwt) else {
             return Ok(Vec::new());
         };
-        let Ok(claims) = lakehouse_embed::verify_embed(
-            &jwt,
-            secret,
-            state.config.embed_token_max_lifetime_seconds,
-            lakehouse_embed::unix_now(),
-        ) else {
-            return Ok(Vec::new());
-        };
-        let subject = subject_of(&state.clickhouse, claims.resource.as_ref())
-            .await
-            .map_err(|err| {
-                upstream_error::ch_error_as(
-                    &upstream_error::DATABASE,
-                    &err,
-                    upstream_error::FailedAs::Internal,
-                )
-            })?;
-        let Some(Subject { board_id, .. }) = subject else {
-            return Ok(Vec::new());
-        };
-        let board = store::get_board(&state.clickhouse, &board_id, &Viewer::anonymous())
-            .await
-            .map_err(|err| {
-                upstream_error::ch_error_as(
-                    &upstream_error::DATABASE,
-                    &err,
-                    upstream_error::FailedAs::Internal,
-                )
-            })?;
-        return Ok(board
-            .filter(|b| {
-                b.embed_enabled.unwrap_or(false)
-                    && !b.embed_access.is_withdrawn(
-                        claims.iat.unwrap_or(f64::NEG_INFINITY),
-                        claims.jti.as_deref(),
-                    )
-            })
-            .map(|b| b.embed_access.origins)
-            .unwrap_or_default());
+        return Ok(match admit(state, &claims).await {
+            Ok((board, _)) => board.embed_access.origins,
+            Err(_) => Vec::new(),
+        });
     }
     if let Some(token) = body.token.filter(|s| !s.is_empty()) {
         // BI-19 part A (D3): a link that does not work frames nowhere, like a
@@ -1217,6 +1219,37 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    /// `BI-26` review NOTE: a tile does not name a hidden filter in `filtersSkipped`.
+    #[test]
+    fn a_hidden_filters_column_is_taken_out_of_the_skipped_list_and_the_others_stay() {
+        use lakehouse_bi::embed_access::{EmbedAccess, FilterMode};
+        let mut access = EmbedAccess::default();
+        access
+            .filter_modes
+            .insert("region".to_owned(), FilterMode::Locked);
+        access
+            .filter_modes
+            .insert("year".to_owned(), FilterMode::Editable);
+        let mut body = json!({ "results": {
+            "c1": { "rows": [], "filtersSkipped": [
+                { "column": "region", "reason": "no_column" },
+                { "column": "year", "reason": "no_column" },
+                { "column": "secret_column", "reason": "no_column" } ] },
+            "c2": { "rows": [], "filtersSkipped": [{ "column": "secret_column", "reason": "no_column" }] },
+            "c3": { "rows": [] }
+        }});
+        strip_hidden_skips(&mut body, &access);
+        let kept: Vec<&str> = body["results"]["c1"]["filtersSkipped"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["column"].as_str().unwrap())
+            .collect();
+        assert_eq!(kept, ["region", "year"]);
+        assert!(body["results"]["c2"].get("filtersSkipped").is_none());
+        assert!(body["results"]["c3"].get("filtersSkipped").is_none());
+    }
 
     #[test]
     fn params_to_filters_none_yields_empty() {

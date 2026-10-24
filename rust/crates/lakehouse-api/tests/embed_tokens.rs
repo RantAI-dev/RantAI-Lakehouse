@@ -1629,3 +1629,51 @@ async fn a_withdrawn_chart_token_stays_withdrawn_after_its_chart_moves_to_anothe
         StatusCode::OK
     );
 }
+
+#[tokio::test]
+async fn only_a_filter_that_picks_values_can_be_locked_or_editable() {
+    // BI-26 review fix (SHOULD-FIX) R3: `year` is a range, `region` an `in`.
+    let fake = FakeCh::new(&json!({
+        "filters_json": r#"[{"column":"region","op":"in","values":["Bali"]},{"column":"year","op":"between","min":"2020","max":"2024"}]"#
+    }));
+    fake.add_chart("u_one", BOARD, "Visitors by region");
+    let ch = fake.serve().await;
+    let app = app(&ch, Some(SECRET)).await;
+    let put = |modes: Value| {
+        let app = &app;
+        async move {
+            as_user(
+                app,
+                "dashboard:write",
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/dashboard/embed-settings")
+                    .header("content-type", "application/json"),
+                Body::from(json!({ "board": BOARD, "filterModes": modes }).to_string()),
+            )
+            .await
+        }
+    };
+    for mode in ["locked", "editable"] {
+        let (status, body) = put(json!({ "year": mode })).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{mode}: {body}");
+        assert!(body["error"].as_str().unwrap().contains("picks values"));
+    }
+    assert!(
+        fake.statements()
+            .iter()
+            .all(|s| !s.contains("'filter_modes'")),
+        "nothing was stored"
+    );
+    let (status, _) = put(json!({ "year": "hidden", "region": "editable" })).await;
+    assert_eq!(status, StatusCode::OK);
+    // The dialog is told which filters can only be hidden.
+    let (_, info) = as_user(
+        &app,
+        "dashboard:read",
+        Request::builder().uri(format!("/api/dashboard/embed-info?board={BOARD}")),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(info["hiddenOnlyColumns"], json!(["year"]));
+}

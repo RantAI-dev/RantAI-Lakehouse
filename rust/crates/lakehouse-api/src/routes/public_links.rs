@@ -489,8 +489,9 @@ fn link_json(link: &PublicLink) -> Value {
 
 /// The dashboard a management call is about: named, not the built-in one, and
 /// visible to the caller (an unknown, trashed or somebody else's personal board
-/// is the same "not found").
-async fn managed_board(
+/// is the same "not found"). Shared with the embed settings route (`BI-26`
+/// review fix R6, rule 4).
+pub(crate) async fn managed_board(
     state: &AppState,
     principal: &Principal,
     id: Option<&str>,

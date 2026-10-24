@@ -4322,6 +4322,15 @@ async fn embed_info_body(
         // BI-26 (D8): each filter column's embed mode and the columns that
         // can be given one (the board's saved filters), for the Share dialog.
         "filterModes": board.embed_access.filter_modes,
+        // BI-26 review fix R3: filters that do not pick values (a range, a
+        // relative date, a text match) can only be hidden in an embed.
+        "hiddenOnlyColumns": board
+            .filters
+            .iter()
+            .flatten()
+            .filter(|f| !f.column.is_empty() && !f.op.is_in())
+            .map(|f| f.column.clone())
+            .collect::<std::collections::BTreeSet<_>>(),
         "filterColumns": board
             .filters
             .iter()
