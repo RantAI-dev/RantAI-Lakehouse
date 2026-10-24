@@ -83,14 +83,16 @@ estimate (S, M, L), which the base has no field for.
 | `SEC-30` | Task | The Security workflow is red on `main`: `rustls` 0.23.45 has four advisories published 2026-10-14 (`RUSTSEC-2026-0346` `Debug` exposes TLS secrets, `-0347` buffered data sent after an ECH rejection, `-0348` certificate decompression can allocate 1 GiB before authentication, `-0349` an unauthenticated ServerHello can downgrade later connections). Update to `rustls` >= 0.23.46. Until then a pull request that touches dependencies cannot merge (`AGENTS.md`, step 6) | Administration & Security | P1 | Done | #159 | CI on `main` at `c9a8d56f`, re-run 2026-10-14; named in the PR #155 review |
 | `SEC-35` | Task | The lineage route shows every tenant's connectors and pipelines to a caller who belongs to no tenant: `tenant_scope::resolve` returns `None` for such a caller, and `lineage::add_tenant_owned` passes it on as "no filter", against `tenant_scope`'s own rule (no tenant means an empty list). Being fixed with `DATA-19` (review BLOCKER 1), which also covers the upload edges it adds; check the other callers of `ConnectorFilter { tenant_id: None }` for the same mistake. Fixed in #165 (`DATA-19` review BLOCKER 1). | Administration & Security | P1 | Done | #165 | `DATA-19` review, round 1 |
 | `SEC-36` | Task | The full-history `gitleaks` scan runs `git fetch --all`, so it scans every branch, not only `main` and the PR: test values pushed on an open branch turn it red on `main` and on every PR. Since 2026-10-15 it is red with 20 `generic-api-key` findings, all on `feat/phase-1-rest` (#144, `SRC-12`/`SRC-13`): `CONNECTOR_SECRETS_KEY=` in `ci.yml` and the AES vector fixture `connector_secret_vector.json`. #144 must either use values the rule does not match or add exact fingerprints with proof (`SEC-1`) before it merges; then decide whether the scan should cover only `main` plus the PR head. On #144 since 2026-10-15: no key-shaped literal is committed any more (CI generates its keys at run time, the test vector describes its key), and the 22 historical findings are baselined by exact fingerprint with proof in `.gitleaksignore`; the full-history scan of the branch reports none. The scope question was settled by #172 (the history scan checks `main` and the PR, a daily scan checks every branch); the baseline stays needed for #144's own history | Administration & Security | P1 | Done | #172, #144 | `DATA-2` review (PR #164) |
-| `REL-9` | Task | Move the Rust toolchain and the declared minimum from 1.96.1 and 1.88 to the latest stable (1.99.1), and prove the code is safe on it: every compatibility note in the 1.97–1.99 release notes checked, every new warning fixed | Delivery | P1 | Todo |  | [spec](specs/rel-9.md) |
+| `REL-9` | Task | Move the Rust toolchain and the declared minimum from 1.96.1 and 1.88 to the latest stable (1.99.1), and prove the code is safe on it: every compatibility note in the 1.97–1.99 release notes checked, every new warning fixed | Delivery | P1 | Done | [#243](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/243) | [spec](specs/rel-9.md) |
 | `SEC-41` | Task | Upgrade `sqlx` to 0.9: 0.8.6 cannot verify a CA when it dials an IP (it misses rustls' `NotValidForNameContext`), so `SEC-14` part B's `VerifyCa` dials fail. `mysql-rsa` stays off; each run-time query string is wrapped in `AssertSqlSafe` with its reason. **Blocked by `REL-9`** | Administration & Security | P1 | Todo |  | [spec](specs/sec-41.md) |
 | `SEC-42` | Task | `cargo audit` and `cargo deny` are red on `main` since 2026-10-16: `zip` 8.6.0 (through `calamine` 0.36.1, the workbook reader) has `RUSTSEC-2026-0367`, `-0368`, `-0369`, fixed in `zip` 9.0.0, and no `calamine` release accepts `zip` 9 yet. All three are in `extract` (writing an archive to disk); `calamine` only reads entries and never calls it (checked in its 0.36.1 source). Ignore the three IDs in `rust/deny.toml` and the `cargo audit` step, each with that reason and a note to drop it when `calamine` moves to `zip` 9 | Administration & Security | P1 | Done | #196 | `security.yml` on `main` |
 | `SEC-46` | Task | `cargo audit` and `cargo deny` went red on `main` on 2026-10-21: bundled root certificates still trusted distrusted emSign intermediates (`RUSTSEC-2026-0381`, `-0382`, `-0383`). `rustls-webpki`, `webpki-root-certs` and `webpki-roots` 1.x bumped; `-0381` on the `webpki-roots` 0.26 shim (re-exports 1.x, pulled only by `sqlx-core` 0.8) ignored until `SEC-41` | Administration & Security | P1 | Done | #219 | Security workflow re-run on `main`, 2026-10-21 |
 | `SEC-47` | Task | The console sends no Content-Security-Policy. With an `img-src`/`frame-src` policy, image and web cards (`BI-16` part B) could only load from the administrator's allowed sites even after a redirect; today the list checks the address as written | Administration & Security | P2 | Todo |  | `#199` review (`BI-16` part B, decision D4) |
 | `SEC-48` | Task | `cargo audit` and `cargo deny` went red on 2026-10-23: `ctutils` 0.4.2 (pulled in by the RustCrypto crates) generated non-constant-time masks and `u128` comparisons (`RUSTSEC-2026-0385`). Bumped to the patched 0.4.4 in `Cargo.lock`; no code change | Administration & Security | P1 | Done | #230 | Security check on #224, 2026-10-23 |
-| `SEC-51` | Task | `cargo audit` and `cargo deny` went red on `main` on 2026-10-24: `crypto-bigint` 0.5.5 (via `elliptic-curve` 0.13.8 <- `p256`/`p384` 0.13 <- `jsonwebtoken` 11.1.0) has timing variability in operations meant to be constant-time (`RUSTSEC-2026-0387`), fixed in `crypto-bigint` >= 0.7.6. `elliptic-curve` 0.13 pins `crypto-bigint` ^0.5, so the fix needs `elliptic-curve` 0.14 with `p256`/`p384` 0.14, and `jsonwebtoken` 11.1.0, the newest release, still requires `p256` ^0.13.2: the fix waits on an upstream `jsonwebtoken` release. Until then a pull request that touches dependencies cannot merge (`AGENTS.md`, step 6) | Administration & Security | P1 | Todo |  | Security workflow on `main` at `21af4276`, 2026-10-24 |
+| `SEC-51` | Task | `cargo audit` and `cargo deny` went red on `main` on 2026-10-24: `crypto-bigint` 0.5.5 (via `elliptic-curve` 0.13.8 <- `p256`/`p384` 0.13 <- `jsonwebtoken` 11.1.0) has timing variability in operations meant to be constant-time (`RUSTSEC-2026-0387`), fixed in `crypto-bigint` >= 0.7.6. `elliptic-curve` 0.13 pins `crypto-bigint` ^0.5, so the fix needs `elliptic-curve` 0.14 with `p256`/`p384` 0.14, and `jsonwebtoken` 11.1.0, the newest release, still requires `p256` ^0.13.2: no bump fixes it. A fix that needs no upstream release: `p256`/`p384` are optional in `jsonwebtoken` 11.1.0 and come only with its `rust_crypto` feature, so switching the backend to `aws_lc_rs` (`aws-lc-rs` is already in `Cargo.lock`) drops them and this crate; rewrite the workspace `Cargo.toml` comment that chose `rust_crypto`. An ignore is not enough: we sign with EC private keys (`connector_probe/saas.rs`, `EncodingKey::from_ec_pem`). Until then a pull request that touches dependencies cannot merge (`AGENTS.md`, step 6) | Administration & Security | P1 | Done | [#249](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/249) | Security workflow on `main` at `21af4276`, 2026-10-24 |
 | `SRC-16` | Task | A connector loaded after the fact (files, REST, MongoDB, Kafka, SFTP) on the "pause" policy stays paused for good after its first change: nothing waits for approval, so nothing can lift it. Also a pending change that Approve refuses keeps the connector paused after every other change is approved | Data | P1 | Done | #120 | `superpowers/plans/2026-10-12-delivery-review.md` (`SRC-8` BLOCKER) |
+| `BLD-7` | Task | A pipeline made from a connector's page cannot run: *Create pipeline* fills in the connector, the API accepts it, and every run with a connector set is refused (`authored_factory.py`, `CONNECTOR_SOURCE_UNSUPPORTED_REASON`) after the pipeline was saved as ready. The connector becomes where the data came from, never a second way to read the source (`DEC-15`): such a pipeline reads one of that connector's Bronze tables, checked on create and update with a clear refusal otherwise; the run reads it like any Bronze source; the connector page opens the form with Bronze and the connector's own tables to pick from, and the pipeline runs after that table's load | Build | P1 | Done | [#247](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/247) | QA report 2026-10-23 (connector-sourced pipeline) |
+| `BLD-8` | Task | A failed pipeline run gives no reason in the console, and the page says "Running" for a run that failed after 5 seconds. Show the run's real state and its failure reason (the fixed, classified text, never upstream detail) on the pipeline page | Build | P1 | Done | [#247](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/247) | QA report 2026-10-23 (connector-sourced pipeline) |
 
 ## Next (P2)
 
@@ -229,6 +231,7 @@ estimate (S, M, L), which the base has no field for.
 | `AI-21` | Feature | The assistant undoes its last dashboard change in one step. | AI Copilot | P2 | Planned |  | `AI-1` spec |
 | `AI-22` | Task | The assistant warns about a deprecated mart and names its replacement, as the chart builder does: `describe_mart` returns the marks, but nothing tells or tests the assistant to use them (no `AI-15` request) | AI Copilot | P2 | Todo |  | `#106` review round 1 (repo 3) |
 | `SRC-27` | Task | Test Workday Reports and NetSuite on real accounts, then make them supported (a migration like `0096` and their `coverage.json` entries). Both are built and pass the `g6-saas` gate against mocks, but their wire details come from documentation that could not be read or confirmed: Workday's token request, `Report_Entry` shape and host forms (`SRC-3` slice 6 SHOULD-FIX 15); NetSuite's revocation address, who-am-i path and 100,000-row limit. Needs a Workday tenant and a NetSuite account from the product owner (`SRC-3` decision 10, acceptance check `SRC-3-AC1`) | Data | P2 | Todo |  | `plans/SRC-3-RESULT.md` |
+| `BLD-9` | Task | A pipeline's connector cannot be changed or cleared after it is created: `PUT /api/pipelines/{id}` has no `connector_id` and the field is read-only in Edit, so a wrong one means delete and re-create. Allow it in the update, with `BLD-7`'s check. **Blocked by `BLD-7`** | Build | P2 | Done | [#247](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/247) | QA report 2026-10-23 (connector-sourced pipeline) |
 
 ## Later (P3)
 
@@ -273,6 +276,8 @@ estimate (S, M, L), which the base has no field for.
 | `OPS-6` | Feature | Log and trace viewer | Operations | P3 | Idea |  | `docs/archive/FEATURE_COVERAGE.md` |
 | `BIZ-1` | Feature | Enterprise edition | Business | P3 | Idea |  | PRODUCT §1 |
 | `BIZ-2` | Feature | Hosted cloud version | Business | P3 | Idea |  | PRODUCT §1 |
+| `BLD-10` | Task | The pipeline form shows "FBIC" as on although nothing runs it (the job only logs that no enrichment route exists), and with it on a pipeline saves with no transform and copies its source as is. Say it is not available, or hide it, and require one transform or say the pipeline is a plain copy | Build | P3 | Todo |  | QA report 2026-10-23 (connector-sourced pipeline) |
+| `SRC-33` | Task | Drop or hash chosen columns during ingest, so a client that may not keep raw personal data still gets a Bronze table, masked before it is written. Build when a client asks (`DEC-15`) | Data | P3 | Todo |  | `DEC-15` |
 
 ## Dependencies
 
@@ -299,11 +304,8 @@ parity), built after it.
 | `DATA-4` | Planned | — | `DATA-3` |
 | `DEC-8` | Open (decision) | — | `AI-11` |
 | `QS-5` | Planned | `BI-18` (the dashboard date filter) | `AI-12` (variables part) |
-| `REL-9` | Todo | — | `SEC-41` |
 | `SEC-14` | Building | `SEC-41` (part B) | `SRC-4` (credentials) |
-| `SEC-20` | Done | — | `QS-3` |
-| `SEC-50` | Todo | — | — |
-| `SEC-41` | Todo | `REL-9` | `SEC-14` (part B) |
+| `SEC-41` | Todo | — | `SEC-14` (part B) |
 | `AI-10` | Planned | `RPT-1`, `BI-1` | — |
 | `AI-11` | Planned | `BI-19`, `BI-26`, `DEC-8` | — |
 | `AI-12` | Building | `QS-5` (variables part) | — |
@@ -313,13 +315,12 @@ parity), built after it.
 | `AI-8` | Building | `BI-17` | — |
 | `AI-9` | Building | `BI-18` (templates part) | — |
 | `DATA-3` | Planned | `DATA-4` | — |
-| `QS-3` | Planned | `SEC-20` | — |
 | `REL-6` | Todo | `BLD-1` | — |
 | `SRC-4` | Planned | `SEC-14` (credentials) | — |
 
 **Ready to start** (Todo, Planned or Idea, nothing open blocks it; Idea items still need a spec):
 
-`ADM-1`, `ADM-2`, `AI-21`, `AI-22`, `BI-1`, `BI-14`, `BI-20`, `BI-27`, `BI-28`, `BI-29`, `BI-3`, `BI-30`, `BI-31`, `BI-32`, `BI-33`, `BI-4`, `BI-5`, `BIZ-1`, `BIZ-2`, `BLD-6`, `DATA-18`, `DATA-20`, `DATA-21`, `DATA-22`, `DATA-23`, `DATA-24`, `DATA-25`, `DATA-26`, `DATA-27`, `DATA-4`, `DATA-5`, `DATA-6`, `DATA-8`, `DOC-2`, `GOV-1`, `GOV-3`, `GOV-5`, `INT-2`, `OPS-2`, `OPS-3`, `OPS-6`, `OPS-8`, `QA-1`, `QRY-1`, `QS-2`, `QS-4`, `QS-5`, `REL-1`, `REL-2`, `REL-4`, `REL-7`, `REL-9`, `SEC-22`, `SEC-34`, `SEC-4`, `SEC-40`, `SEC-47`, `SEC-7`, `SRC-15`, `SRC-18`, `SRC-2`, `SRC-22`, `SRC-23`, `SRC-24`, `SRC-25`, `SRC-26`, `SRC-27`, `SRC-28`, `SRC-30`, `SRC-31`, `SRC-32`, `SRC-5`, `VER-1`
+`ADM-1`, `ADM-2`, `AI-21`, `AI-22`, `BI-1`, `BI-14`, `BI-20`, `BI-27`, `BI-28`, `BI-29`, `BI-3`, `BI-30`, `BI-31`, `BI-32`, `BI-33`, `BI-4`, `BI-5`, `BIZ-1`, `BIZ-2`, `BLD-10`, `BLD-6`, `DATA-18`, `DATA-20`, `DATA-21`, `DATA-22`, `DATA-23`, `DATA-24`, `DATA-25`, `DATA-26`, `DATA-27`, `DATA-4`, `DATA-5`, `DATA-6`, `DATA-8`, `DOC-2`, `GOV-1`, `GOV-3`, `GOV-5`, `INT-2`, `OPS-2`, `OPS-3`, `OPS-6`, `OPS-8`, `QA-1`, `QRY-1`, `QS-2`, `QS-3`, `QS-4`, `QS-5`, `REL-1`, `REL-2`, `REL-4`, `REL-7`, `SEC-22`, `SEC-34`, `SEC-4`, `SEC-40`, `SEC-41`, `SEC-47`, `SEC-50`, `SEC-7`, `SRC-15`, `SRC-18`, `SRC-2`, `SRC-22`, `SRC-23`, `SRC-24`, `SRC-25`, `SRC-26`, `SRC-27`, `SRC-28`, `SRC-30`, `SRC-31`, `SRC-32`, `SRC-33`, `SRC-5`, `VER-1`
 
 ## Dates
 
@@ -365,7 +366,7 @@ set by the product owner and are left empty until they are.
 | `SRC-20` | 2026-10-14 | 2026-10-14 | |
 | `DATA-10` | 2026-10-14 | 2026-10-14 | |
 | `SEC-30` | 2026-10-14 | 2026-10-15 | |
-| `REL-9` | 2026-10-17 | | |
+| `REL-9` | 2026-10-17 | 2026-10-24 | |
 | `SEC-41` | 2026-10-17 | | |
 | `SEC-42` | 2026-10-17 | 2026-10-17 | |
 | `OPS-7` | 2026-10-15 | 2026-10-16 | |
@@ -438,6 +439,12 @@ set by the product owner and are left empty until they are.
 | `AI-8` | 2026-10-15 | | |
 | `AI-9` | 2026-10-14 | | |
 | `SRC-3` | 2026-10-19 | 2026-10-23 | |
+| `BLD-7` | 2026-10-24 | 2026-10-24 | |
+| `BLD-8` | 2026-10-24 | 2026-10-24 | |
+| `BLD-9` | 2026-10-24 | 2026-10-24 | |
+| `BLD-10` | | | |
+| `SRC-33` | | | |
+| `SEC-51` | 2026-10-24 | 2026-10-24 | |
 
 ## Decide
 
@@ -481,6 +488,7 @@ rejected** with the date.
 | `DEC-9` | How to get SaaS connectors | Decided: dlt verified sources where one exists (Salesforce, HubSpot, Zendesk, Google Analytics); the other six call the adapter's `SaasSession` directly, because a dlt `rest_api` source over a plain `requests` session cannot carry AD3's same-origin link rule and address check or the bounded `Retry-After` (amended during the build, accepted at the slice 3 and 4 reviews); all on the existing dlt loader | 2026-10-19 |
 | `SEC-9` | The natural-language query endpoints run the model's SQL without masking or row filters, and need only a sign-in | Done: PR #78. The endpoints were removed; plain-language queries now route through the chat which applies masking and row filters via the policy rewriter. Hardening after Done, in PR #105 (`8b67ee2`): the assistant's `run_sql` refuses a statement the policy forbids before sending anything to `ClickHouse` (it used to send `EXPLAIN AST` first) | 2026-10-07 |
 | `SEC-11` (agent endpoints) | The agent endpoints return raw database error text | Done: PR #78. The endpoints were removed | 2026-10-07 |
+| `DEC-15` | Read a source straight into Silver, skipping Bronze (QA report 2026-10-23) | Rejected: Bronze stays the one landing zone. It lets Silver be rebuilt without reading the client's database again, keeps one raw copy for audit and lineage, and keeps one path for secrets, address checks and load modes (Ingest). Reopen if a client may not keep raw data and `SRC-33` is not enough | 2026-10-24 |
 
 ## Specs
 

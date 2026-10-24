@@ -71,7 +71,7 @@ async fn a_freshly_issued_token_verifies_with_the_identitys_scopes_as_permission
     assert!(principal.has("query:read"));
     assert!(principal.has("catalog:read"));
     assert!(!principal.has("pipeline:run"));
-    assert!(principal.tenant_ids.is_empty());
+    assert_eq!(principal.tenant_ids, [] as [uuid::Uuid; 0]);
     Ok(())
 }
 
@@ -84,7 +84,7 @@ async fn role_names_empty_for_a_service_principal(pool: PgPool) -> sqlx::Result<
     let token = create_service_credential(&pool, service_id).await.unwrap();
 
     let principal = verify_service_token(&pool, &token).await.unwrap();
-    assert!(principal.role_names.is_empty());
+    assert_eq!(principal.role_names, [] as [std::string::String; 0]);
     Ok(())
 }
 

@@ -1350,7 +1350,10 @@ services:
 
   g1-test-runner:
     profiles: ["test"]
-    image: rust:1.96.1-slim
+    # Same pin as `rust/rust-toolchain.toml` (`channel = "1.99.1"`),
+    # `rust/Dockerfile`, and CI's `stable`-job resolution through that
+    # file, so acceptance and CI compile with one compiler.
+    image: rust:1.99.1-slim
     working_dir: /workspace
     volumes:
       - ./rust:/workspace

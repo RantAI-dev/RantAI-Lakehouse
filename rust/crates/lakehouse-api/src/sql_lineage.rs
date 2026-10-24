@@ -892,7 +892,7 @@ mod tests {
                 t("p", "silver.orders.Amount", "expression"),
             ]
         );
-        assert!(l.partial.is_empty());
+        assert_eq!(l.partial, [] as [crate::sql_lineage::PartialOutput; 0]);
         assert_eq!(l.target, None);
     }
 
@@ -936,7 +936,7 @@ mod tests {
     #[test]
     fn an_unqualified_column_in_two_tables_is_partial_not_guessed() {
         let l = run("SELECT id FROM silver.orders o JOIN silver.users u ON o.id = u.id");
-        assert!(l.mappings.is_empty());
+        assert_eq!(l.mappings, [] as [crate::sql_lineage::Mapping; 0]);
         assert_eq!(
             reasons(&l),
             vec![(
@@ -950,7 +950,7 @@ mod tests {
     #[test]
     fn one_table_known_one_unknown_makes_an_unqualified_column_ambiguous() {
         let l = run("SELECT Amount FROM silver.orders o JOIN silver.unknown u ON o.id = u.id");
-        assert!(l.mappings.is_empty());
+        assert_eq!(l.mappings, [] as [crate::sql_lineage::Mapping; 0]);
         assert_eq!(
             reasons(&l),
             vec![(
@@ -963,7 +963,7 @@ mod tests {
     #[test]
     fn an_unknown_qualifier_is_partial() {
         let l = run("SELECT x.id FROM silver.orders o");
-        assert!(l.mappings.is_empty());
+        assert_eq!(l.mappings, [] as [crate::sql_lineage::Mapping; 0]);
         assert_eq!(
             reasons(&l),
             vec![(
@@ -993,7 +993,7 @@ mod tests {
     #[test]
     fn a_star_over_a_table_with_unknown_columns_is_partial() {
         let l = run("SELECT * FROM lake.bronze.raw");
-        assert!(l.mappings.is_empty());
+        assert_eq!(l.mappings, [] as [crate::sql_lineage::Mapping; 0]);
         assert_eq!(
             reasons(&l),
             vec![(
@@ -1006,7 +1006,7 @@ mod tests {
     #[test]
     fn a_star_with_options_is_partial() {
         let l = run("SELECT * EXCEPT (id) FROM silver.orders");
-        assert!(l.mappings.is_empty());
+        assert_eq!(l.mappings, [] as [crate::sql_lineage::Mapping; 0]);
         assert_eq!(l.partial.len(), 1);
         assert_eq!(l.partial[0].reason, MSG_WILDCARD_OPTIONS);
     }
@@ -1041,14 +1041,14 @@ mod tests {
         let func = run("SELECT x FROM numbers(10)");
         assert_eq!(func.partial[0].reason, MSG_TABLE_FUNCTION);
         for l in [&cte, &sub, &func] {
-            assert!(l.mappings.is_empty());
+            assert_eq!(l.mappings, [] as [crate::sql_lineage::Mapping; 0]);
         }
     }
 
     #[test]
     fn a_union_makes_every_output_of_the_left_branch_partial() {
         let l = run("SELECT id, name FROM silver.users UNION ALL SELECT id, id FROM silver.orders");
-        assert!(l.mappings.is_empty());
+        assert_eq!(l.mappings, [] as [crate::sql_lineage::Mapping; 0]);
         assert_eq!(
             reasons(&l),
             vec![
@@ -1071,7 +1071,7 @@ mod tests {
     #[test]
     fn an_unaliased_expression_is_partial_and_a_constant_is_neither() {
         let l = run("SELECT sum(Amount), 1 AS one, now() AS at FROM silver.orders");
-        assert!(l.mappings.is_empty());
+        assert_eq!(l.mappings, [] as [crate::sql_lineage::Mapping; 0]);
         assert_eq!(
             reasons(&l),
             vec![("sum(Amount)".to_owned(), MSG_UNNAMED.to_owned())]

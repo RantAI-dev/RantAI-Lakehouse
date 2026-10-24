@@ -4295,7 +4295,10 @@ mod tests {
     fn connector_runs_ignores_a_run_without_a_connector_id() {
         let mut run = dg_run("run-1", "SUCCESS", "conn-a");
         run.run_config = json!({});
-        assert!(connector_runs(&[run], "conn-a").is_empty());
+        assert_eq!(
+            connector_runs(&[run], "conn-a"),
+            [] as [crate::routes::connectors::ConnectorIngestRun; 0]
+        );
     }
 
     use axum::body::to_bytes;

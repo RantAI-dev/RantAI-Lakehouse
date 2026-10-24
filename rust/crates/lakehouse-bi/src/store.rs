@@ -8156,7 +8156,7 @@ mod tests {
             let ok = built(kind, Some("  Sales by region  ")).unwrap();
             assert_eq!(ok.spec.text.as_deref(), Some("Sales by region"));
             assert_eq!(ok.spec.sql, "", "a section tile has no statement");
-            assert!(ok.def.mart.is_empty());
+            assert_eq!(ok.def.mart, "");
             for bad in [
                 None,
                 Some("   "),
@@ -8388,7 +8388,7 @@ mod tests {
         assert_eq!(chart.created_by.as_deref(), Some("Ann"));
         // No mart in the definition is what makes the builder serve the
         // fixed statement as written.
-        assert!(chart.def.mart.is_empty());
+        assert_eq!(chart.def.mart, "");
         let sql = crate::builder::sql_with_filters(
             &chart,
             &[],

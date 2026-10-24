@@ -2004,8 +2004,8 @@ mod access_request_tests {
     /// all. Quoted failure text (`cargo test -p lakehouse-store
     /// agents::create_access_request 2>&1 | tail -30` against the pre-E1/E2
     /// state): `error[E0433]: failed to resolve: use of undeclared type
-    /// \`NewAccessRequest\`` / `error[E0425]: cannot find function
-    /// \`create_access_request\` in this scope`.
+    /// NewAccessRequest` / `error[E0425]: cannot find function
+    /// create_access_request in this scope`.
     #[sqlx::test(migrations = "../../migrations")]
     async fn create_access_request_inserts_a_pending_approval_with_kind_access(
         pool: PgPool,
@@ -2034,8 +2034,8 @@ mod access_request_tests {
     /// `decide_access_request`/`AccessGrant` did not exist at all. Quoted
     /// failure text (`cargo test -p lakehouse-store
     /// agents::decide_access_request 2>&1 | tail -30` against the pre-E3
-    /// state): `error[E0425]: cannot find function \`decide_access_request\`
-    /// in this scope`.
+    /// state): ``error[E0425]: cannot find function `decide_access_request`
+    /// in this scope``.
     #[sqlx::test(migrations = "../../migrations")]
     async fn decide_access_request_approved_creates_a_time_bounded_grant(
         pool: PgPool,
@@ -2097,12 +2097,10 @@ mod access_request_tests {
             here[0].granted_by.as_deref(),
             Some("admin@tenant-a.invalid")
         );
-        assert!(
-            super::list_asset_grants(&pool, "silver.other")
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        let grants = super::list_asset_grants(&pool, "silver.other")
+            .await
+            .unwrap();
+        assert!(grants.is_empty(), "{grants:?}");
         Ok(())
     }
 
@@ -2161,12 +2159,10 @@ mod access_request_tests {
             .expect("the grant is in force");
         assert_eq!(revoked.permission, "query:read");
         assert_eq!(revoked.user, "user2@tenant-a.invalid");
-        assert!(
-            super::list_asset_grants(&pool, "silver.orders")
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        let grants = super::list_asset_grants(&pool, "silver.orders")
+            .await
+            .unwrap();
+        assert!(grants.is_empty(), "{grants:?}");
         assert!(
             super::revoke_asset_grant(&pool, "silver.orders", &made.id, admin)
                 .await
