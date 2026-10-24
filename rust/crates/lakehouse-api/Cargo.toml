@@ -33,9 +33,9 @@ lakehouse-auth = { path = "../lakehouse-auth" }
 # workspace for `lakehouse-embed`; written here instead of the AWS SDK).
 hmac = { workspace = true }
 # `secret_manager::gcp`: signs the service account's RS256 JWT for the
-# documented token exchange (already a workspace dependency, `rust_crypto`
-# backend, as `lakehouse-auth` uses it); moved here from the dev-dependencies
-# it was only in so far.
+# documented token exchange (already a workspace dependency, `aws_lc_rs`
+# backend since SEC-51, as `lakehouse-auth` uses it); moved here from the
+# dev-dependencies it was only in so far.
 jsonwebtoken = { workspace = true }
 sha2 = { workspace = true }
 base64 = { workspace = true }

@@ -13,7 +13,7 @@ const SNIPPET_MAX_COLUMNS = 12
 type Target = Pick<AssetDetail, "layer" | "type" | "tableName" | "namespace" | "name" | "queryTarget">
 
 /** A simple identifier needs no quoting; anything else (spaces, dashes) does. */
-function quoteIdent(part: string) {
+export function quoteIdent(part: string) {
   return /^[A-Za-z_][A-Za-z0-9_]*$/.test(part) ? part : `"${part.replace(/"/g, '""')}"`
 }
 

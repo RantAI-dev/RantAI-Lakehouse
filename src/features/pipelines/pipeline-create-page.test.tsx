@@ -1,17 +1,23 @@
 // The pipeline editor's re-upload switch and source-table suggestions
-// (DATA-19 D3 and D4), rendered. The pure rules behind both are pinned in
-// `pipeline-reupload-trigger.test.ts`; what is proved HERE is the wiring:
-// that the switch exists only for a Bronze source, that it carries the
-// STORED chain through a save, that switching it off clears the upload
-// upstream, and that the source-table suggestions come from the
-// lakehouse client's own namespace listing rather than a hardcoded list.
+// (DATA-19 D3 and D4), rendered, and the connector-page entry (BLD-7
+// decisions 4 and 5). The pure rules behind the switches are pinned in
+// `pipeline-reupload-trigger.test.ts` and
+// `pipeline-connector-trigger.test.ts`; what is proved HERE is the
+// wiring: that the switch exists only for a Bronze source, that it
+// carries the STORED chain through a save, that switching it off clears
+// the upload upstream, that the source-table suggestions come from the
+// lakehouse client's own namespace listing rather than a hardcoded list,
+// and that `?connectorId=` fixes the zone, picks from that connector's
+// ingest targets and chains its load.
 //
 // Everything below the fetch is real: the real service clients, the real
 // `apiFetch`, the real component. Only `fetch` is stubbed.
 const pushed: string[] = []
+/** The query string `useSearchParams` answers with; each test sets it. */
+let search = ""
 mock.module("next/navigation", () => ({
   usePathname: () => "/pipelines/create",
-  useSearchParams: () => new URLSearchParams(""),
+  useSearchParams: () => new URLSearchParams(search),
   useRouter: () => ({
     push: (to: string) => {
       pushed.push(to)
@@ -33,6 +39,18 @@ const originalFetch = global.fetch
 /** Every body the form sent, by method and path. */
 const sent: { method: string; path: string; body: Record<string, unknown> }[] = []
 
+/** The connector a QA report made its pipeline from, and its ingest targets. */
+const SEED_CONNECTOR = "conn-pg-lakehouse"
+let ingestTargets: { name: string; target: string }[] = []
+let connectorList: { id: string; name: string }[] = []
+
+function jsonResponse(body: unknown) {
+  return new Response(JSON.stringify(body), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  })
+}
+
 /** One Bronze table, the way `/api/lakehouse/tables` answers for it. */
 function table(name: string) {
   return {
@@ -50,17 +68,33 @@ function table(name: string) {
 beforeEach(() => {
   sent.length = 0
   pushed.length = 0
+  search = ""
+  ingestTargets = [
+    { name: "public.orders", target: "orders" },
+    { name: "public.customers", target: "customers" },
+  ]
+  connectorList = [{ id: SEED_CONNECTOR, name: "Lakehouse OLTP (Postgres)" }]
   global.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input)
     const method = init?.method ?? "GET"
     let body: Record<string, unknown> = {}
     if (typeof init?.body === "string") body = JSON.parse(init.body)
     sent.push({ method, path: url.split("?")[0] ?? url, body })
-    if (url.startsWith("/api/connectors")) {
-      return new Response(JSON.stringify([]), {
-        status: 200,
-        headers: { "Content-Type": "application/json" },
+    if (url.includes("/ingest-spec")) {
+      // BLD-7 decision 5: the connector the page already reads through
+      // `connectorService` answers with its ingest targets.
+      return jsonResponse({
+        adapter: "sql",
+        ingestMode: "batch",
+        dial: {},
+        sourceObjects: ingestTargets,
+        scheduleCron: null,
+        secretRefs: { primary: "env:POSTGRES_PASSWORD", secondary: null },
+        nextRunAt: null,
       })
+    }
+    if (url.startsWith("/api/connectors")) {
+      return jsonResponse(connectorList)
     }
     if (url.startsWith("/api/lakehouse/namespaces")) {
       return new Response(JSON.stringify({ namespaces: [{ name: "bronze", tableCount: { value: 2, measured: true } }] }), {
@@ -228,5 +262,162 @@ describe("source-table suggestions in the pipeline editor", () => {
     // Typing is still allowed: a datalist filters, it never narrows.
     fireEvent.change(input, { target: { value: "typed_by_hand" } })
     expect((input as HTMLInputElement).value).toBe("typed_by_hand")
+  })
+})
+
+describe("the connector page's Create pipeline entry (BLD-7)", () => {
+  const connectorSwitch = () =>
+    screen.queryByRole("switch", { name: /connector loads the table/i })
+  const sourceZoneInput = () =>
+    screen.getByRole("textbox", { name: /^source zone/i }) as HTMLInputElement
+  const sourceTablePicker = () =>
+    screen.getByRole("combobox", { name: /^source table/i }) as HTMLSelectElement
+
+  beforeEach(() => {
+    search = `connectorId=${SEED_CONNECTOR}`
+  })
+
+  it("fixes the zone to bronze, offers only that connector's tables, and switches the trigger to its load", async () => {
+    render(<PipelineEditor />)
+
+    // Zone: shown, not editable (decision 5).
+    await waitFor(() => expect(sourceZoneInput().value).toBe("bronze"))
+    expect(sourceZoneInput().disabled).toBe(true)
+    expect(sourceZoneInput().readOnly).toBe(true)
+
+    // Table: exactly the connector's ingest targets, plus "choose one".
+    await waitFor(() =>
+      expect(Array.from(sourceTablePicker().options).map((o) => o.value)).toEqual([
+        "",
+        "customers",
+        "orders",
+      ])
+    )
+
+    // Trigger: the connector's load, ON by default; the upload switch
+    // belongs to a table this pipeline uploads, not to a connector's.
+    expect(connectorSwitch()?.getAttribute("aria-checked")).toBe("true")
+    expect(reuploadSwitch()).toBeNull()
+  })
+
+  it("sends the chosen table and the connector's load as the pipeline's upstream", async () => {
+    render(<PipelineEditor />)
+    fireEvent.change(screen.getByPlaceholderText("orders_hourly_rollup"), {
+      target: { value: "northwind_orders_clean" },
+    })
+    await waitFor(() => expect(sourceTablePicker().options.length).toBe(3))
+    fireEvent.change(sourceTablePicker(), { target: { value: "orders" } })
+
+    await advance()
+    fireEvent.change(screen.getByPlaceholderText("order_id"), { target: { value: "id" } })
+    fireEvent.click(screen.getByRole("button", { name: /add transform/i }))
+    await advance()
+    fireEvent.change(screen.getByPlaceholderText("orders_hourly"), {
+      target: { value: "northwind_orders" },
+    })
+    await advance()
+    await advance()
+
+    fireEvent.click(screen.getByRole("button", { name: /create pipeline/i }))
+    await waitFor(() => expect(sent.some((c) => c.method === "POST")).toBe(true))
+    const body = sent.find((c) => c.method === "POST")?.body
+    expect(body?.sourceZone).toBe("bronze")
+    expect(body?.sourceTable).toBe("orders")
+    expect(body?.connectorId).toBe(SEED_CONNECTOR)
+    // Decision 4: the pipeline runs after that table's load, and the
+    // upload job is not part of a connector-sourced pipeline.
+    expect(body?.dependsOn).toEqual(["ingest_job"])
+  })
+
+  it("says to run the ingest first, and links to the Ingest tab, when the connector has loaded nothing", async () => {
+    ingestTargets = []
+    render(<PipelineEditor />)
+    expect(await screen.findByText(/has not loaded any table yet/)).not.toBeNull()
+    const link = screen.getByRole("link", { name: /open its ingest tab/i })
+    expect(link.getAttribute("href")).toBe(`/connectors/${SEED_CONNECTOR}?tab=ingest`)
+    // No picker to choose from, so the step cannot be left.
+    expect(screen.queryByRole("combobox", { name: /^source table/i })).toBeNull()
+  })
+
+  it("keeps the plain form when there is no connector in the URL", async () => {
+    search = ""
+    render(<PipelineEditor />)
+    await waitFor(() => expect(reuploadSwitch()).not.toBeNull())
+    // The zone is the ordinary editable field, and the connector-load
+    // switch is not offered on a pipeline that has no connector.
+    const zone = screen.getByDisplayValue("bronze") as HTMLInputElement
+    expect(zone.disabled).toBe(false)
+    expect(connectorSwitch()).toBeNull()
+  })
+})
+
+describe("changing a pipeline's connector on the edit form (BLD-9)", () => {
+  const connectorPicker = () =>
+    screen.getByRole("combobox", { name: "Connector" }) as HTMLSelectElement
+  const zoneInput = () =>
+    screen.getByRole("textbox", { name: /^source zone/i }) as HTMLInputElement
+
+  it("offers every connector and No connector, and sends null when the connector is cleared", async () => {
+    const stored = existing({
+      dependsOn: ["ingest_job", "pl-raw-loads-2"],
+      definition: {
+        ...existing().definition!,
+        // The connector's own table, as `BLD-7` requires.
+        sourceTable: "orders",
+        connectorId: SEED_CONNECTOR,
+      },
+    })
+    render(<PipelineEditor existing={stored} />)
+
+    await waitFor(() => expect(connectorPicker().value).toBe(SEED_CONNECTOR))
+    expect(Array.from(connectorPicker().options).map((o) => o.value)).toEqual([
+      "",
+      SEED_CONNECTOR,
+    ])
+    // With a connector the zone is fixed to bronze (decision 5).
+    expect(zoneInput().value).toBe("bronze")
+    expect(zoneInput().disabled).toBe(true)
+
+    fireEvent.change(connectorPicker(), { target: { value: "" } })
+    // "No connector" is a real choice: the zone becomes editable again.
+    await waitFor(() => expect(zoneInput().disabled).toBe(false))
+
+    await walkToReview()
+    fireEvent.click(screen.getByRole("button", { name: /save changes/i }))
+    await waitFor(() => expect(sent.some((c) => c.method === "PUT")).toBe(true))
+    const save = sent.find((c) => c.method === "PUT")
+    expect(save?.body.connectorId).toBeNull()
+    // Clearing the connector does not rewrite the rest of the chain: the
+    // form owns one upstream at a time, and `ingest_job` is still accepted
+    // on a Bronze source.
+    expect(save?.body.dependsOn).toEqual(["ingest_job", "pl-raw-loads-2"])
+  })
+
+  it("sets the connector picked in the edit form", async () => {
+    // A Bronze source whose table the connector loads, so the API will
+    // accept the pair.
+    const stored = existing({
+      definition: { ...existing().definition!, sourceTable: "orders" },
+      dependsOn: ["file_ingest_job"],
+    })
+    render(<PipelineEditor existing={stored} />)
+
+    await waitFor(() => expect(connectorPicker().value).toBe(""))
+    fireEvent.change(connectorPicker(), { target: { value: SEED_CONNECTOR } })
+    // The source switches to the connector's shape as soon as it is picked:
+    // zone fixed, table from the connector's own targets.
+    await waitFor(() => expect(zoneInput().value).toBe("bronze"))
+    expect(zoneInput().disabled).toBe(true)
+    fireEvent.change(screen.getByRole("combobox", { name: /^source table/i }), {
+      target: { value: "orders" },
+    })
+
+    await walkToReview()
+    fireEvent.click(screen.getByRole("button", { name: /save changes/i }))
+    await waitFor(() => expect(sent.some((c) => c.method === "PUT")).toBe(true))
+    const save = sent.find((c) => c.method === "PUT")
+    expect(save?.body.connectorId).toBe(SEED_CONNECTOR)
+    expect(save?.body.sourceZone).toBe("bronze")
+    expect(save?.body.sourceTable).toBe("orders")
   })
 })

@@ -71,6 +71,18 @@ def reports(monkeypatch) -> list:
     return sent
 
 
+@pytest.fixture(autouse=True)
+def connector_s3_test_credentials(monkeypatch) -> None:
+    """`SEC-37`: `BronzeIngestConfig.from_env` (and `GoldExportConfig`'s)
+    REQUIRE the two connector-scoped S3 credentials — the `rustfsadmin`
+    fallback is gone. Most unit tests never reach S3 but still build the
+    config (the factory, the sink adapter), so the suite supplies throwaway
+    values here; a test that asserts the missing-variable error removes one
+    itself, and so does `mock.patch.dict(..., clear=True)`."""
+    monkeypatch.setenv("CONNECTOR_S3_ACCESS_KEY", "test-access-key")
+    monkeypatch.setenv("CONNECTOR_S3_SECRET_KEY", "test-secret-key")
+
+
 class FakeManagerHttp:
     """Replaces `secret_manager.requests.request` (`SRC-12` part B): canned
     answers by method and URL, every call recorded, no network. A request no

@@ -902,7 +902,7 @@ mod tests {
             .unwrap()
             .rollback()
             .await;
-        assert!(listing(dir.path()).is_empty());
+        assert_eq!(listing(dir.path()), [] as [std::string::String; 0]);
     }
 
     /// A bad value anywhere in the pair stages nothing at all.
@@ -915,7 +915,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, SecretStoreError::InvalidValue(_)));
-        assert!(listing(dir.path()).is_empty());
+        assert_eq!(listing(dir.path()), [] as [std::string::String; 0]);
     }
 
     #[tokio::test]
@@ -1103,7 +1103,7 @@ mod tests {
 
         assert_eq!(report.sealed, [name]);
         assert_eq!(report.leftovers_removed.len(), 2);
-        assert!(report.unreadable.is_empty());
+        assert_eq!(report.unreadable, [] as [std::string::String; 0]);
         assert_eq!(read_opened(dir.path().join(name)).unwrap(), "plain-pass");
         assert_eq!(
             listing(dir.path()),
@@ -1172,7 +1172,7 @@ mod tests {
         assert_eq!(before.unchanged, 2);
         let report = changing.reseal_all().await.unwrap();
         assert_eq!(report.resealed.len(), 2);
-        assert!(report.unreadable.is_empty());
+        assert_eq!(report.unreadable, [] as [std::string::String; 0]);
 
         let only_new = ring_with(&new, None);
         let only_old = ring_with(&old, None);
@@ -1187,7 +1187,7 @@ mod tests {
 
         // Running it again finds nothing to do.
         let again = changing.reseal_all().await.unwrap();
-        assert!(again.resealed.is_empty());
+        assert_eq!(again.resealed, [] as [std::string::String; 0]);
         assert_eq!(again.unchanged, 2);
         assert_eq!(listing(dir.path()).len(), 2);
     }
@@ -1214,7 +1214,7 @@ mod tests {
             assert!(store.stage(&pair("conn-s3", "a", "b")).await.is_err());
             assert!(store.startup_pass().await.is_err());
         }
-        assert!(listing(dir.path()).is_empty());
+        assert_eq!(listing(dir.path()), [] as [std::string::String; 0]);
     }
 
     /// Decision 4: the sealed file does not open when copied under another

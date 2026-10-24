@@ -4653,7 +4653,7 @@ mod values_enforcement {
             .map(|r| String::from_utf8_lossy(&r.body).into_owned())
             .filter(|b| b.contains("DISTINCT"))
             .collect();
-        assert!(!distinct_queries.is_empty());
+        assert_ne!(distinct_queries, [] as [std::string::String; 0]);
         assert!(
             distinct_queries
                 .iter()
@@ -4751,7 +4751,7 @@ mod values_enforcement {
             .map(|r| String::from_utf8_lossy(&r.body).into_owned())
             .filter(|b| b.contains("DISTINCT"))
             .collect();
-        assert!(!reads.is_empty());
+        assert_ne!(reads, [] as [std::string::String; 0]);
         for sql in &reads {
             // The search runs over the masked source, so typing a clear value
             // cannot confirm that it exists behind the mask.
@@ -5140,7 +5140,7 @@ mod typed_filters {
             .iter()
             .filter(|s| s.contains("GROUP BY kab") && s.contains("WHERE kab IN"))
             .collect();
-        assert!(!tiles.is_empty());
+        assert_ne!(tiles, [] as [&std::string::String; 0]);
         for sql in tiles {
             assert!(sql.contains(&format!("kab IN ({list})")), "{sql}");
             assert!(
@@ -5290,7 +5290,7 @@ mod typed_filters {
         // The rewrite writes a literal in its own escaping (`\\` and `\'`).
         let literal = "'50%_\\\\\\'x\\\\'";
         let reads = value_reads(&server).await;
-        assert!(!reads.is_empty());
+        assert_ne!(reads, [] as [std::string::String; 0]);
         for sql in &reads {
             assert!(sql.contains("positionCaseInsensitiveUTF8"), "{sql}");
             assert!(sql.contains(literal), "{sql} lacks {literal}");
@@ -5364,7 +5364,7 @@ mod typed_filters {
         .unwrap();
         assert_eq!(body["values"], json!(["Ubud"]));
         let reads = value_reads(&server).await;
-        assert!(!reads.is_empty());
+        assert_ne!(reads, [] as [std::string::String; 0]);
         // `mart_a` has `provinsi`, so it is narrowed; `mart_b` lacks it and
         // is read whole.
         assert!(
@@ -5457,7 +5457,7 @@ mod typed_filters {
         .await
         .unwrap();
         assert_eq!(body["values"], json!([]));
-        assert!(value_reads(&server).await.is_empty());
+        assert_eq!(value_reads(&server).await, [] as [std::string::String; 0]);
     }
 }
 
