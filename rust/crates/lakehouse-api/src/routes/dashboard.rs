@@ -1334,7 +1334,18 @@ struct BoardEditBody {
     /// one of the fonts an administrator allows in Admin > Settings.
     #[serde(default)]
     font: Option<String>,
+    /// How long the board's tiles may be served from remembered results
+    /// (`BI-4` part B): `{"mode": "default"|"fresh"|"minutes", "minutes"?}`.
+    /// `default` clears the board's own rule. Raw JSON so a malformed rule
+    /// gets [`CACHE_RULE_REFUSED`]. Not part of a version (see
+    /// `store::update_board_cache`).
+    #[serde(default)]
+    cache: Option<Value>,
 }
+
+/// What a person is told when a board's or a chart's freshness rule is not
+/// one (`BI-4` part B, feature decision 2).
+pub(crate) const CACHE_RULE_REFUSED: &str = "The freshness rule must be {\"mode\": \"default\"} or {\"mode\": \"fresh\"}, or {\"mode\": \"minutes\", \"minutes\": a whole number from 1 to 1440}.";
 
 impl BoardEditBody {
     /// Whether the body changes what a version holds (`BI-18` part C, part 2):
@@ -1376,6 +1387,8 @@ fn board_edit_allowed(body: &BoardEditBody) -> bool {
                 // and the built-in board is code, not a saved dashboard.
                 && body.theme.is_none()
                 && body.font.is_none()
+                // BI-4 part B: the built-in board follows the install's rule.
+                && body.cache.is_none()
         }
         Some(_) => true,
     }
@@ -1485,6 +1498,26 @@ async fn check_theme_and_font(state: &AppState, parsed: &BoardEditBody) -> Resul
     }
 }
 
+/// The board edit's freshness rule (`BI-4` part B), `None` when the body does
+/// not send one.
+///
+/// # Errors
+///
+/// 400 with [`CACHE_RULE_REFUSED`] (a fixed sentence; the rule is the caller's
+/// own text) when the value is not a rule or its minutes are out of range.
+fn checked_cache_rule(
+    parsed: &BoardEditBody,
+) -> Result<Option<lakehouse_bi::cache_rule::CacheRule>, ApiError> {
+    parsed
+        .cache
+        .as_ref()
+        .map(|raw| {
+            serde_json::from_value(raw.clone())
+                .map_err(|_| ApiError::BadRequest(CACHE_RULE_REFUSED.to_owned()))
+        })
+        .transpose()
+}
+
 /// The error of a board write: a board that is not there any more (deleted
 /// while the edit was on its way) is refused with its own sentence, and the
 /// store's failure keeps the mapping the write had before
@@ -1520,6 +1553,12 @@ async fn save_tabs_and_phone_layout(
     // BI-17 part A: the theme and font ride with the other presentation saves.
     if parsed.theme.is_some() || parsed.font.is_some() {
         store::update_board_theme(ch, id, parsed.theme.as_deref(), parsed.font.as_deref())
+            .await
+            .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
+    }
+    // BI-4 part B: the freshness rule, already parsed by `checked_cache_rule`.
+    if let Some(rule) = checked_cache_rule(parsed)? {
+        store::update_board_cache(ch, id, rule)
             .await
             .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
     }
@@ -1661,6 +1700,8 @@ pub async fn boards_update(
     }
     check_tab_rules(ch, &id, &parsed).await?;
     check_theme_and_font(&state, &parsed).await?;
+    // Before the first write, like the checks above: a bad rule changes nothing.
+    checked_cache_rule(&parsed)?;
     let refresh = checked_refresh(parsed.refresh_seconds)?;
     let checked_params =
         crate::routes::params::check_board_params_opt(ch, parsed.params.as_deref()).await?;
