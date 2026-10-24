@@ -288,7 +288,7 @@ async fn a_person_is_found_by_their_own_rules_and_those_of_their_roles(
     )
     .await
     .unwrap();
-    let mut mine: Vec<_> = rules_for_grantee(&pool, ann, &[readers])
+    let mut mine: Vec<_> = rules_for_grantee(&pool, ann, &["readers".to_owned()])
         .await
         .unwrap()
         .into_iter()

@@ -89,8 +89,9 @@ pub async fn rules_for_item(
     .await?)
 }
 
-/// The rules that name this person or one of these roles, on any item: what
-/// every dashboard request needs to know about the caller.
+/// The rules that name this person or a role they hold (`role_names`, as the
+/// principal carries them; role names are unique), on any item: what every
+/// dashboard request needs to know about the caller.
 ///
 /// # Errors
 ///
@@ -98,14 +99,15 @@ pub async fn rules_for_item(
 pub async fn rules_for_grantee(
     pool: &PgPool,
     user_id: Uuid,
-    role_ids: &[Uuid],
+    role_names: &[String],
 ) -> Result<Vec<AccessRule>, StoreError> {
     Ok(sqlx::query_as(&format!(
         "SELECT {RULE_COLUMNS} FROM dashboard_access_rule \
-         WHERE user_id = $1 OR role_id = ANY($2)"
+         WHERE user_id = $1 \
+            OR role_id IN (SELECT id FROM role WHERE name = ANY($2))"
     ))
     .bind(user_id)
-    .bind(role_ids)
+    .bind(role_names)
     .fetch_all(pool)
     .await?)
 }
