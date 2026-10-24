@@ -277,16 +277,34 @@ Commands run (this VM, shared target, `CARGO_BUILD_JOBS=2`, `CARGO_INCREMENTAL=0
   1 passed (0.70 s).
 - `cargo fmt --check`: clean on the final tree.
 
-NOT verified:
-- `cargo clippy --workspace --all-targets -- -D warnings`: the one run found
-  two `too_many_lines` errors (`render_board_payload` 130/100, `AppState::new`
-  101/100) and nothing else; both now carry an `allow` with a reason, but
-  clippy was NOT re-run after that (disk fell under 10 GB and the run was stopped).
-- Integration files `dashboard_export`, `embed_tokens`, `route_auth`,
-  `sec11_guard`: not run (same reason). The `route_auth` and `sec11_guard`
-  files should not be affected (no route or error path changed), but that is
-  an expectation, not a result.
-- The plan's section 5 grep for direct `ch.query(` around `try_run_spec_sql`:
-  not done. Real-engine before/after timing: not measured; see `docs/plans/BI-4-RESULT.md`.
+Verified after the allows (second round):
+- `cargo test -p lakehouse-api --lib -- dashboard embed tile_pool --test-threads=1`:
+  229 passed, 0 failed, 3 ignored.
+- `cargo clippy --workspace --all-targets -- -D warnings`: exit 0 (without
+  `--all-features`).
+- `cargo test -p lakehouse-api --test dashboard_export -- --test-threads=1`:
+  10 passed, 0 failed.
+
+NOT verified (disk fell under 9 GB and the run was stopped, again):
+- `cargo test -p lakehouse-api --test embed_tokens`, `--test route_auth` and
+  `--test sec11_guard`: not run. No route, policy-table entry or error path
+  changed, so a break is not expected, but that is an expectation, not a result.
+- Clippy with `--all-features` (the AGENTS.md block): not run.
+- Real-engine before/after timing: not measured; see `docs/plans/BI-4-RESULT.md`.
+
+Plan section 5 grep (direct engine calls around `try_run_spec_sql`), done
+with `grep -n "\.query\w*("` over `routes/dashboard*.rs`, `embed.rs`,
+`layers.rs`, `support.rs`, `metrics.rs`, `render.rs`, `params.rs`:
+- Tile path (`get_body`, `render_board_payload`, `layers.rs`, `annotate_*`):
+  no direct call; all go through `run_spec_sql`/`try_run_spec_sql`
+  (`support.rs`, the one `.query(&rewritten, None)` inside it).
+- Direct calls found, none on the dashboard-payload path, each after its own
+  `rewrite_sql_for_roles` (or the SQL-source rewrite), so part B must decide
+  for each whether it is cached or stays fresh:
+  `dashboard.rs` `records_for_roles` (`ch.query` rows and `ch.rows` count, the
+  drill-through/table paging read), `dashboard.rs` chart export
+  (`query_stream`, `EXPORT_TIMEOUT`), `dashboard_sources.rs` SQL-source preview
+  (`ch.query` on the editor's unsaved SQL). They are findings for D3, not
+  defects in part A.
 
 ## 8. Review (planner appends)
