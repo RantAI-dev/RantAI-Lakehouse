@@ -63,6 +63,13 @@ pub struct DashboardQuery {
     /// not named here takes the board's saved value, else its default.
     #[serde(default)]
     params: Option<String>,
+    /// BI-4 part B (feature decision 6): `fresh=1` computes every tile and
+    /// replaces what was remembered; `fresh=<chart id>[,<chart id>]` does so
+    /// for those charts only ("Refresh this tile"). Not read from an embed or
+    /// a public link: a reader with no sign-in cannot force the engine to
+    /// recompute a board.
+    #[serde(default)]
+    fresh: Option<String>,
 }
 
 impl DashboardQuery {
@@ -80,6 +87,7 @@ impl DashboardQuery {
             filters: filters.map(str::to_owned),
             grain: grain.map(str::to_owned),
             params: params.map(str::to_owned),
+            fresh: None,
         }
     }
 }
@@ -228,7 +236,7 @@ pub(crate) async fn payload_for(
     let scope = crate::result_cache::CacheScope::new(
         std::sync::Arc::clone(&state.result_cache),
         format.result_cache,
-        false,
+        crate::result_cache::Fresh::parse(q.fresh.as_deref()),
     );
     match crate::result_cache::scoped(
         scope,
@@ -414,6 +422,9 @@ async fn get_body(
             cols.keys().map(|mart| format!("serving.{mart}")).collect(),
         )
     });
+    let cache_rule = cache_scope
+        .as_ref()
+        .map_or(Value::Null, |scope| scope.rule().to_json());
     // BI-13: the questions of a combined chart are asked as the viewer, one
     // statement each; their sources are read here, once, and a read that fails
     // only fails the questions that need it.
@@ -467,7 +478,7 @@ async fn get_body(
         tile_ids.push(c.spec.id.clone());
         let chart_rule = c.def.shape.cache;
         tiles.push(Box::pin(crate::result_cache::in_chart(
-            chart_rule,
+            (Some(c.spec.id.as_str()), chart_rule),
             async move {
                 // BI-11: the chart as this read sees it, every parameter replaced
                 // by its value; a value that does not fit is this tile's plain
@@ -659,6 +670,10 @@ async fn get_body(
         // BI-18·B: the interval an editor saved; 0 when none, so the
         // console starts from "off" without a second request.
         "refreshSeconds": board_obj.and_then(|b| b.refresh_seconds).unwrap_or(0),
+        // BI-4 part B: the freshness rule in force for this board (its own,
+        // else the install's), which the console states under the Refresh
+        // button; `null` when the caller opened no cache scope.
+        "cacheRule": cache_rule,
         // BI-11: the controls the board shows (the definition and this read's
         // value), the value each has without a request (the saved default the
         // console compares with), and every parameter's value for this read.
@@ -5685,6 +5700,7 @@ mod typed_filters {
             filters: Some(filters.to_owned()),
             grain: None,
             params: None,
+            fresh: None,
         };
         let parsed = parse_filters_param(q.filters.as_deref()).expect("valid filters");
         get_body(
@@ -6949,6 +6965,7 @@ mod time_grain {
             filters: None,
             grain: requested.map(|g| g.as_str().to_owned()),
             params: None,
+            fresh: None,
         };
         get_body(
             &ch,
@@ -7014,6 +7031,49 @@ mod time_grain {
         assert_eq!(body["appliedGrain"], json!("month"));
     }
 
+    /// `BI-4` part B T5 (plan D8, `BI-4-AC1`): the second open is served from
+    /// memory and says so, with the first open's `computedAt`; `fresh=1`
+    /// computes again; the payload names the rule in force.
+    #[tokio::test]
+    async fn a_second_open_is_remembered_and_fresh_computes_again() {
+        use crate::result_cache::{CacheScope, Fresh, ResultCache, scoped};
+        let server = MockServer::start().await;
+        mount_board(&server, "").await;
+        let cache = std::sync::Arc::new(ResultCache::new(8));
+        let time = TimeContext::default();
+        let open = |fresh: Fresh| {
+            scoped(
+                CacheScope::new(
+                    std::sync::Arc::clone(&cache),
+                    lakehouse_bi::cache_rule::CacheRule::Follow,
+                    fresh,
+                ),
+                dashboard(&server, None, &time),
+            )
+        };
+        let first = open(Fresh::No).await;
+        let second = open(Fresh::No).await;
+        let forced = open(Fresh::parse(Some("1"))).await;
+        let tiles: Vec<&String> = first["results"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .filter(|(_, v)| v.get("computedAt").is_some())
+            .map(|(id, _)| id)
+            .collect();
+        assert!(!tiles.is_empty(), "{first}");
+        for id in tiles {
+            assert_eq!(first["results"][id]["remembered"], json!(false), "{id}");
+            assert_eq!(second["results"][id]["remembered"], json!(true), "{id}");
+            assert_eq!(
+                second["results"][id]["computedAt"], first["results"][id]["computedAt"],
+                "{id}"
+            );
+            assert_eq!(forced["results"][id]["remembered"], json!(false), "{id}");
+        }
+        assert_eq!(first["cacheRule"], json!({ "mode": "default" }));
+    }
+
     #[tokio::test]
     async fn own_sets_the_saved_grain_aside_for_this_view() {
         let server = MockServer::start().await;
@@ -7026,6 +7086,7 @@ mod time_grain {
             filters: None,
             grain: Some("own".to_owned()),
             params: None,
+            fresh: None,
         };
         let body = get_body(
             &ch,
@@ -7417,6 +7478,7 @@ mod table_tiles {
             filters: None,
             grain: None,
             params: None,
+            fresh: None,
         };
         get_body(
             &ch,

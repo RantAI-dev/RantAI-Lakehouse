@@ -131,6 +131,60 @@ impl Effective {
     }
 }
 
+impl Effective {
+    /// The rule as the payload's `cacheRule` says it.
+    #[must_use]
+    pub fn to_json(self) -> Value {
+        match self {
+            Self::Off => CacheRule::Fresh.to_json(),
+            Self::Default => CacheRule::Follow.to_json(),
+            Self::Minutes(n) => CacheRule::Minutes(n).to_json(),
+        }
+    }
+}
+
+/// What a read asks to be computed fresh (`fresh=` on `GET /api/dashboard`,
+/// feature decision 6).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Fresh {
+    /// Use what is remembered.
+    #[default]
+    No,
+    /// `fresh=1`: every tile of the read is computed and replaces its entry.
+    All,
+    /// `fresh=<chart id>[,<chart id>...]`: only these charts ("Refresh this
+    /// tile").
+    Charts(Vec<String>),
+}
+
+impl Fresh {
+    /// The query value: absent or empty is [`Self::No`], `1` or `true` is
+    /// [`Self::All`], anything else is a comma list of chart ids.
+    #[must_use]
+    pub fn parse(raw: Option<&str>) -> Self {
+        let raw = raw.map(str::trim).unwrap_or_default();
+        match raw {
+            "" => Self::No,
+            "1" | "true" => Self::All,
+            list => Self::Charts(
+                list.split(',')
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_owned)
+                    .collect(),
+            ),
+        }
+    }
+
+    fn covers(&self, chart: Option<&str>) -> bool {
+        match (self, chart) {
+            (Self::All, _) => true,
+            (Self::Charts(ids), Some(id)) => ids.iter().any(|x| x == id),
+            _ => false,
+        }
+    }
+}
+
 /// A table named in a statement: `schema.table`, or a bare `table` of the
 /// connection's default database (`sql_rewrite::canonicalize`).
 type TableName = String;
@@ -267,7 +321,9 @@ pub struct CacheScope {
     shared: Arc<Shared>,
     board: CacheRule,
     chart: CacheRule,
-    fresh: bool,
+    fresh: Arc<Fresh>,
+    /// Whether the chart being read skips the lookup (see [`Fresh`]).
+    bypass: bool,
 }
 
 struct Shared {
@@ -296,21 +352,24 @@ pub async fn scoped<F: Future>(scope: CacheScope, fut: F) -> F::Output {
 
 /// Run `fut` under the current scope narrowed to one chart's own rule; with no
 /// scope open it just runs (and so remembers nothing).
-pub async fn in_chart<F: Future>(chart: Option<CacheRule>, fut: F) -> F::Output {
+pub async fn in_chart<F: Future>(
+    (id, rule): (Option<&str>, Option<CacheRule>),
+    fut: F,
+) -> F::Output {
     match current() {
-        Some(scope) => scoped(scope.for_chart(chart), fut).await,
+        Some(scope) => scoped(scope.for_chart(id, rule), fut).await,
         None => fut.await,
     }
 }
 
 impl CacheScope {
     /// A scope for one request, opened by the handler that serves it. `fresh`
-    /// is `fresh=1` on the read: nothing is looked up, and what is computed
-    /// replaces what was remembered. The dashboard's and the charts' own rules
+    /// is what the read asked to bypass: nothing is looked up for it, and what
+    /// is computed replaces what was remembered. The dashboard's and the charts' own rules
     /// are added by [`Self::for_board`] and [`Self::for_chart`] once the board
     /// is read.
     #[must_use]
-    pub fn new(cache: Arc<ResultCache>, install: CacheRule, fresh: bool) -> Self {
+    pub fn new(cache: Arc<ResultCache>, install: CacheRule, fresh: Fresh) -> Self {
         Self {
             shared: Arc::new(Shared {
                 cache,
@@ -320,7 +379,8 @@ impl CacheScope {
             }),
             board: CacheRule::Follow,
             chart: CacheRule::Follow,
-            fresh,
+            bypass: fresh == Fresh::All,
+            fresh: Arc::new(fresh),
         }
     }
 
@@ -339,16 +399,19 @@ impl CacheScope {
             }),
             board: board.unwrap_or(CacheRule::Follow),
             chart: CacheRule::Follow,
-            fresh: self.fresh,
+            bypass: *self.fresh == Fresh::All,
+            fresh: Arc::clone(&self.fresh),
         }
     }
 
-    /// The same request, narrowed to one chart's own rule (`None` follows the
-    /// dashboard).
+    /// The same request, narrowed to one chart: its own rule (`None` follows
+    /// the dashboard) and whether this read asked it to be fresh. `id` is
+    /// `None` for a built-in tile.
     #[must_use]
-    pub fn for_chart(&self, chart: Option<CacheRule>) -> Self {
+    pub fn for_chart(&self, id: Option<&str>, rule: Option<CacheRule>) -> Self {
         Self {
-            chart: chart.unwrap_or(CacheRule::Follow),
+            chart: rule.unwrap_or(CacheRule::Follow),
+            bypass: self.fresh.covers(id),
             ..self.clone()
         }
     }
@@ -402,7 +465,7 @@ impl CacheScope {
             return uncached(compute).await;
         };
         let key = key(ENGINE, statement, settings);
-        if self.fresh {
+        if self.bypass {
             entries.invalidate(&key).await;
         } else if let Some(entry) = entries.get(&key).await {
             if self.valid(&entry, &prints, now) {

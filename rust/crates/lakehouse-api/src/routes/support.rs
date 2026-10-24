@@ -354,10 +354,24 @@ pub(crate) async fn try_run_spec_sql(
         ),
         ("max_result_rows", u64::from(limits.chart_rows) + 1),
     ];
-    scope
+    let mut answer = scope
         .run(ch, (&rewritten, &settings), tables, execute)
-        .await
-        .map(|answer| answer.value)
+        .await?;
+    // BI-4 part B (plan D8): when the engine computed the answer and whether
+    // it came from memory, for the tile to say. Only where a scope is open:
+    // a call with none (Query Studio, a preview) keeps the shape it had.
+    if let Value::Object(map) = &mut answer.value {
+        map.insert(
+            "computedAt".to_owned(),
+            json!(
+                answer
+                    .computed_at
+                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            ),
+        );
+        map.insert("remembered".to_owned(), json!(answer.remembered));
+    }
+    Ok(answer.value)
 }
 
 /// A `ClickHouse` failure of a tile query as the tile's failure: the engine
@@ -1286,7 +1300,7 @@ mod run_spec_sql_enforcement {
                 let scope = crate::result_cache::CacheScope::new(
                     std::sync::Arc::clone(&cache),
                     lakehouse_bi::cache_rule::CacheRule::Follow,
-                    false,
+                    crate::result_cache::Fresh::No,
                 );
                 let (_, val) = crate::result_cache::scoped(
                     scope,

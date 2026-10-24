@@ -11,7 +11,7 @@ use wiremock::matchers::{body_string_contains, method};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 use super::{
-    CacheScope, Computed, Effective, MAX_ENTRY_BYTES, ResultCache, UNWATCHABLE_BOUND, key,
+    CacheScope, Computed, Effective, Fresh, MAX_ENTRY_BYTES, ResultCache, UNWATCHABLE_BOUND, key,
     max_mb_from,
 };
 use crate::routes::support::SpecRunFailure;
@@ -78,7 +78,12 @@ async fn engine(parts: &Arc<Parts>) -> (MockServer, Arc<ChClient>) {
 }
 
 fn scope(cache: &Arc<ResultCache>, rules: (CacheRule, CacheRule), fresh: bool) -> CacheScope {
-    CacheScope::new(Arc::clone(cache), rules.0, fresh).for_board(Some(rules.1), Vec::new())
+    CacheScope::new(
+        Arc::clone(cache),
+        rules.0,
+        if fresh { Fresh::All } else { Fresh::No },
+    )
+    .for_board(Some(rules.1), Vec::new())
 }
 
 const SETTINGS: [(&str, u64); 2] = [("max_execution_time", 60_000), ("max_result_rows", 2001)];
@@ -547,9 +552,12 @@ async fn a_chart_rule_narrows_the_dashboards() {
     let cache = Arc::new(ResultCache::new(8));
     let runs = Arc::new(AtomicUsize::new(0));
     let board = scope(&cache, (CacheRule::Follow, CacheRule::Minutes(30)), false);
-    let live = board.for_chart(Some(CacheRule::Fresh));
+    let live = board.for_chart(Some("c1"), Some(CacheRule::Fresh));
     assert_eq!(live.rule(), Effective::Off);
-    assert_eq!(board.for_chart(None).rule(), Effective::Minutes(30));
+    assert_eq!(
+        board.for_chart(Some("c1"), None).rule(),
+        Effective::Minutes(30)
+    );
     for _ in 0..2 {
         live.run(
             &ch,
@@ -632,7 +640,7 @@ async fn two_tiles_with_one_statement_run_one_query_and_one_request_reads_finger
     let (_server, ch) = engine(&parts).await;
     let cache = Arc::new(ResultCache::new(8));
     let runs = Arc::new(AtomicUsize::new(0));
-    let request = CacheScope::new(Arc::clone(&cache), CacheRule::Follow, false).for_board(
+    let request = CacheScope::new(Arc::clone(&cache), CacheRule::Follow, Fresh::No).for_board(
         None,
         vec![
             "serving.mart_sales".to_owned(),
@@ -752,4 +760,65 @@ async fn a_cancelled_computation_leaves_nothing_behind() {
         .unwrap();
     assert!(!answer.remembered);
     assert_eq!(runs.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn the_fresh_parameter_means_all_tiles_or_the_charts_it_names() {
+    assert_eq!(Fresh::parse(None), Fresh::No);
+    assert_eq!(Fresh::parse(Some("")), Fresh::No);
+    assert_eq!(Fresh::parse(Some("1")), Fresh::All);
+    assert_eq!(Fresh::parse(Some("true")), Fresh::All);
+    let some = Fresh::parse(Some("c1, c2,"));
+    assert_eq!(some, Fresh::Charts(vec!["c1".to_owned(), "c2".to_owned()]));
+    assert!(some.covers(Some("c2")) && !some.covers(Some("c3")) && !some.covers(None));
+    assert!(Fresh::All.covers(None) && !Fresh::No.covers(Some("c1")));
+}
+
+#[tokio::test]
+async fn refreshing_one_chart_recomputes_that_chart_and_leaves_the_others_remembered() {
+    let parts = Arc::new(Parts::default());
+    parts.set("serving", "mart_sales", "2026-10-24 08:00:00", "10");
+    let (_server, ch) = engine(&parts).await;
+    let (now, read) = clock();
+    let cache = Arc::new(ResultCache::with_clock(8, read));
+    let runs = Arc::new(AtomicUsize::new(0));
+    let request = |fresh: Fresh| {
+        CacheScope::new(Arc::clone(&cache), CacheRule::Follow, fresh).for_board(None, Vec::new())
+    };
+    for sql in ["A", "B"] {
+        request(Fresh::No)
+            .for_chart(Some(sql), None)
+            .run(
+                &ch,
+                (sql, &SETTINGS),
+                Some(tables()),
+                counted(&runs, rows(1), true),
+            )
+            .await
+            .unwrap();
+    }
+    *now.lock().unwrap() += Span::minutes(1);
+    let only_a = request(Fresh::parse(Some("A")));
+    let a = only_a
+        .for_chart(Some("A"), None)
+        .run(
+            &ch,
+            ("A", &SETTINGS),
+            Some(tables()),
+            counted(&runs, rows(2), true),
+        )
+        .await
+        .unwrap();
+    let b = only_a
+        .for_chart(Some("B"), None)
+        .run(
+            &ch,
+            ("B", &SETTINGS),
+            Some(tables()),
+            counted(&runs, rows(2), true),
+        )
+        .await
+        .unwrap();
+    assert!(!a.remembered && b.remembered);
+    assert_eq!(runs.load(Ordering::SeqCst), 3);
 }

@@ -411,7 +411,7 @@ pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
         crate::result_cache::CacheScope::new(
             std::sync::Arc::clone(&state.result_cache),
             format.result_cache,
-            false,
+            crate::result_cache::Fresh::No,
         ),
         render_board_payload(
             &state.clickhouse,
@@ -847,7 +847,7 @@ pub async fn public_dashboard(
         crate::result_cache::CacheScope::new(
             std::sync::Arc::clone(&state.result_cache),
             format.result_cache,
-            false,
+            crate::result_cache::Fresh::No,
         ),
         render_board_payload(
             &state.clickhouse,
@@ -1189,7 +1189,7 @@ async fn render_board_payload(
             let original: &StoredChartSpec = original;
             // BI-4 part B: the chart's own freshness rule narrows the board's.
             Box::pin(crate::result_cache::in_chart(
-                original.def.shape.cache,
+                (Some(original.spec.id.as_str()), original.def.shape.cache),
                 async move {
                     let tile_filters = tile_filters(board, filters, &original.spec.id);
                     let effective = crate::routes::support::effective_chart(
