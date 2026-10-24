@@ -210,7 +210,6 @@ async fn read_form(mut form: Multipart) -> Result<Form, ApiError> {
     })
 }
 
-/// Validate and simplify on a blocking thread; the refusal's own sentence is the 400.
 /// What one upload produces: the file the console draws, the number of
 /// regions, and the statements that put the full boundaries on the engine.
 struct Processed {
@@ -219,6 +218,8 @@ struct Processed {
     inserts: Vec<String>,
 }
 
+/// Validate and simplify on a blocking thread; the refusal's own sentence is the 400.
+/// BI-16 C3 review S8: this comment had slid onto [`Processed`].
 async fn check_and_simplify(
     file: Vec<u8>,
     property: String,
