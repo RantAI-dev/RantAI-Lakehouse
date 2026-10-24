@@ -30,6 +30,16 @@ impl Respond for Store {
             let n = data.len();
             ResponseTemplate::new(200).set_body_json(json!({ "meta": [], "data": data, "rows": n }))
         };
+        // The dashboard's defined parameters (BI-1 QA fix A1: names are checked).
+        if sql.contains("FROM console.bi_param") {
+            let def = |name: &str| {
+                json!({
+                    "id": format!("p_{name}"), "name": name, "created_by": "t", "updated_at": "2026-01-01 00:00:00",
+                    "def_json": json!({ "id": "", "name": name, "label": name, "type": "number", "default": 5 }).to_string(),
+                })
+            };
+            return rows(vec![def("top"), def("ukuran_demo")]);
+        }
         if sql.contains("FROM console.bi_chart") {
             let spec = json!({
                 "id": "c_visits", "title": "Visits by place", "kind": "bar", "mart": "mart_x",
@@ -387,4 +397,44 @@ async fn the_links_carry_the_pages_filters_parameters_and_grain() {
     )
     .await;
     assert!(bad["result"]["error"].is_string(), "{bad}");
+}
+
+/// BI-1 QA fix A1: a garbled parameter name is refused with the right names,
+/// not carried into a link that fails when it is opened.
+#[tokio::test]
+async fn a_parameter_the_dashboard_does_not_have_is_refused_with_the_right_names() {
+    let (app, _ch, cookie) = app(true).await;
+    for (tool, args) in [
+        (
+            "export_dashboard",
+            json!({ "board": BOARD, "params": { "ukuren_demo": 3 } }),
+        ),
+        (
+            "export_chart",
+            json!({ "chart": "c_visits", "format": "csv", "params": { "ukuren_demo": 3 } }),
+        ),
+    ] {
+        let body = call(&app, &cookie, tool, args, "ask").await;
+        let error = body["result"]["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("ukuren_demo") && error.contains("top, ukuran_demo"),
+            "{tool}: {body}"
+        );
+        assert!(
+            body["result"].get("url").is_none(),
+            "no link for a refused call"
+        );
+    }
+    let ok = call(
+        &app,
+        &cookie,
+        "export_dashboard",
+        json!({ "board": BOARD, "params": { "ukuran_demo": 3 } }),
+        "ask",
+    )
+    .await;
+    assert!(
+        ok["result"]["url"].as_str().unwrap().contains("params="),
+        "{ok}"
+    );
 }

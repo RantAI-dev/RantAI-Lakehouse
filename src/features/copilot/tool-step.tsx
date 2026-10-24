@@ -255,24 +255,6 @@ function StepBody({ step }: { step: ToolStep }) {
     );
   }
 
-  const download = exportLink(step.tool, step.result);
-  if (download) {
-    // A plain link: the browser sends the person's own session with it, so the
-    // file is made when they open it, with their permissions (AI-10, D9).
-    return (
-      <div className="mt-1 flex flex-wrap items-center gap-2 text-[11px]">
-        <a
-          href={download.url}
-          download={download.fileName}
-          className="inline-flex items-center gap-1.5 rounded-md border border-border bg-background px-2.5 py-1 font-medium text-foreground hover:bg-muted"
-        >
-          <Download className="size-3.5" aria-hidden /> Download {download.fileName}
-        </a>
-        <span className="text-muted-foreground">Made when you open it, with your permissions.</span>
-      </div>
-    );
-  }
-
   if (step.tool === "get_quality" && Array.isArray(res.summary)) {
     return <QualityChips summary={res.summary as { verdict: string; n: string }[]} />;
   }
@@ -381,6 +363,26 @@ function StepBody({ step }: { step: ToolStep }) {
   );
 }
 
+/**
+ * The Download button of an export result (BI-1 QA fix A1). A plain link to the
+ * console's own download route: the browser sends the person's session with it,
+ * so the file is made when they open it, with their permissions (AI-10, D9).
+ */
+function ExportDownload({ link }: { link: { url: string; fileName: string } }) {
+  return (
+    <div className="mb-1 ml-7 flex flex-wrap items-center gap-2 text-[11px]">
+      <a
+        href={link.url}
+        download={link.fileName}
+        className="inline-flex items-center gap-1.5 rounded-md border border-border bg-background px-2.5 py-1 font-medium text-foreground hover:bg-muted"
+      >
+        <Download className="size-3.5" aria-hidden /> Download {link.fileName}
+      </a>
+      <span className="text-muted-foreground">Made when you open it, with your permissions.</span>
+    </div>
+  );
+}
+
 /** Icon per tool family, as in the RantAI-Agents tool indicator. */
 function ToolIcon({ tool }: { tool: string }) {
   const cls = "size-3 shrink-0";
@@ -466,6 +468,10 @@ export function ToolStepCard({ step }: { step: ToolStep }) {
   const [open, setOpen] = React.useState(pending);
   const [raw, setRaw] = React.useState(false);
   const summary = inputSummary(step.args);
+  // BI-1 QA fix A1: an export result is a Download button built from the tool's own
+  // `url`, shown on the card itself (not inside the collapsed details), never from
+  // text the model wrote.
+  const download = exportLink(tool, step.result);
   return (
     <div className="my-0.5">
       <button
@@ -513,6 +519,7 @@ export function ToolStepCard({ step }: { step: ToolStep }) {
           aria-hidden
         />
       </button>
+      {download ? <ExportDownload link={download} /> : null}
       <AnimatePresence initial={false}>
         {open ? (
           <motion.div
