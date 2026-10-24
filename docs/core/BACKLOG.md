@@ -89,6 +89,7 @@ estimate (S, M, L), which the base has no field for.
 | `SEC-46` | Task | `cargo audit` and `cargo deny` went red on `main` on 2026-10-21: bundled root certificates still trusted distrusted emSign intermediates (`RUSTSEC-2026-0381`, `-0382`, `-0383`). `rustls-webpki`, `webpki-root-certs` and `webpki-roots` 1.x bumped; `-0381` on the `webpki-roots` 0.26 shim (re-exports 1.x, pulled only by `sqlx-core` 0.8) ignored until `SEC-41` | Administration & Security | P1 | Done | #219 | Security workflow re-run on `main`, 2026-10-21 |
 | `SEC-47` | Task | The console sends no Content-Security-Policy. With an `img-src`/`frame-src` policy, image and web cards (`BI-16` part B) could only load from the administrator's allowed sites even after a redirect; today the list checks the address as written | Administration & Security | P2 | Todo |  | `#199` review (`BI-16` part B, decision D4) |
 | `SEC-48` | Task | `cargo audit` and `cargo deny` went red on 2026-10-23: `ctutils` 0.4.2 (pulled in by the RustCrypto crates) generated non-constant-time masks and `u128` comparisons (`RUSTSEC-2026-0385`). Bumped to the patched 0.4.4 in `Cargo.lock`; no code change | Administration & Security | P1 | Done | #230 | Security check on #224, 2026-10-23 |
+| `SEC-51` | Task | `cargo audit` and `cargo deny` went red on `main` on 2026-10-24: `crypto-bigint` 0.5.5 (via `elliptic-curve` 0.13.8 <- `p256`/`p384` 0.13 <- `jsonwebtoken` 11.1.0) has timing variability in operations meant to be constant-time (`RUSTSEC-2026-0387`), fixed in `crypto-bigint` >= 0.7.6. `elliptic-curve` 0.13 pins `crypto-bigint` ^0.5, so the fix needs `elliptic-curve` 0.14 with `p256`/`p384` 0.14, and `jsonwebtoken` 11.1.0, the newest release, still requires `p256` ^0.13.2: the fix waits on an upstream `jsonwebtoken` release. Until then a pull request that touches dependencies cannot merge (`AGENTS.md`, step 6) | Administration & Security | P1 | Todo |  | Security workflow on `main` at `21af4276`, 2026-10-24 |
 | `SRC-16` | Task | A connector loaded after the fact (files, REST, MongoDB, Kafka, SFTP) on the "pause" policy stays paused for good after its first change: nothing waits for approval, so nothing can lift it. Also a pending change that Approve refuses keeps the connector paused after every other change is approved | Data | P1 | Done | #120 | `superpowers/plans/2026-10-12-delivery-review.md` (`SRC-8` BLOCKER) |
 | `SEC-49` | Task | `cargo audit` and `cargo deny` went red on 2026-10-24: `crypto-bigint` 0.5.5 has timing variability in operations meant to be constant-time (`RUSTSEC-2026-0387`). It is pulled in by `jsonwebtoken` through `p256`, `ecdsa` and `elliptic-curve` 0.13. Only 0.7.6 is patched, and `elliptic-curve` 0.13 needs 0.5, so no bump fixes it. We sign with EC private keys (`connector_probe/saas.rs`, `EncodingKey::from_ec_pem`), so an ignore is not enough: switch `jsonwebtoken`'s backend from `rust_crypto` to `aws_lc_rs` (`aws-lc-rs` is already in `Cargo.lock`), which drops `p256` and this crate, and rewrite the `Cargo.toml` comment that chose `rust_crypto`. Found on PR #243, not caused by it | Administration & Security | P1 | Todo |  | CI on PR #243, 2026-10-24 |
 
@@ -197,7 +198,8 @@ estimate (S, M, L), which the base has no field for.
 | `SEC-18` | Task | No default credentials in compose (`lakehouse`, `rustfsadmin`); must-set secrets use `${X:?}` (rule 5) | Administration & Security | P2 | Done | #83 | `docker-compose.yml` |
 | `SEC-37` | Task | Default credentials left in code after `SEC-18`: `rustfsadmin` fallbacks in `ops/g3/g3_loadgen.py`, `ops/g6/g6_ingest_matrix_test.py` and `dagster/dispar_orchestrate/dlt_pipeline.py`, and `postgres://lakehouse:lakehouse@localhost` as `DATABASE_URL`'s default in `lakehouse-api` `config.rs`. Compose always sets them now, so none is reached in a compose start | Administration & Security | P2 | Done | [#238](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/238) | PR #83 review |
 | `SEC-19` | Task | The query cost estimate runs raw SQL without the read-only check or table-function block, and returns database error text. The error-text half is met by `SEC-11`'s query-author exception. The author sees the engine's diagnosis with the version and addresses trimmed, and other routes still answer the fixed message | Administration & Security | P2 | Done | #203 | `routes/query.rs` |
-| `SEC-20` | Task | Queries are not scoped to the tenant: no tenant gate on query runs; saved queries listed for everyone | Administration & Security | P2 | Todo |  | `routes/query.rs` |
+| `SEC-20` | Task | Queries are not scoped to the tenant: no tenant gate on query runs; saved queries listed for everyone | Administration & Security | P2 | Done | #244 | `routes/query.rs` |
+| `SEC-50` | Task | Dashboards, gold export, alerts and authored pipelines are not scoped to the tenant: they call the role rewrite directly, not the query path that `SEC-20` gates | Administration & Security | P2 | Todo |  | `routes/dashboard.rs` |
 | `SEC-21` | Task | Downloads re-run SQL rewritten for an older policy; whole results buffered before the 2,000-row cut | Administration & Security | P2 | Done | #203 | `routes/query.rs` |
 | `SEC-12` | Feature | Embed tokens: require an expiry, allow revocation, keep the signing secret out of plain text, set a frame-ancestors policy | Administration & Security | P2 | In Acceptance | #105, #201 | `lakehouse-embed` |
 | `SEC-25` | Task | Connector security follow-ups: a connector that signs in with no credential (Kafka, auth `none`) can never be re-pointed (409 without a credential, 400 with one); the PATCH-`host` rule and its doc for `files` connectors are stale since `SRC-6`; the `SEC-15` refusal message has runs of spaces | Administration & Security | P2 | Done | [#238](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/238) | `superpowers/plans/2026-10-12-delivery-review.md` |
@@ -301,7 +303,8 @@ parity), built after it.
 | `QS-5` | Planned | `BI-18` (the dashboard date filter) | `AI-12` (variables part) |
 | `REL-9` | Todo | — | `SEC-41` |
 | `SEC-14` | Building | `SEC-41` (part B) | `SRC-4` (credentials) |
-| `SEC-20` | Todo | — | `QS-3` |
+| `SEC-20` | Done | — | `QS-3` |
+| `SEC-50` | Todo | — | — |
 | `SEC-41` | Todo | `REL-9` | `SEC-14` (part B) |
 | `AI-10` | Planned | `RPT-1`, `BI-1` | — |
 | `AI-11` | Planned | `BI-19`, `BI-26`, `DEC-8` | — |
@@ -329,6 +332,7 @@ set by the product owner and are left empty until they are.
 
 | ID | Started | Shipped | Due |
 | --- | --- | --- | --- |
+| `SEC-20` | 2026-10-24 | 2026-10-24 | |
 | `DATA-1` | 2026-10-02 | 2026-10-03 | |
 | `SEC-2` | 2026-10-02 | 2026-10-03 | |
 | `SEC-5` | 2026-10-02 | 2026-10-03 | |

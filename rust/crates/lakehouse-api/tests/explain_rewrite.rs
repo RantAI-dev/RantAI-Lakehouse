@@ -81,6 +81,12 @@ async fn seed_mask(pool: &PgPool, role: &str) {
 async fn app(ch: &MockServer) -> (axum::Router, PgPool, String) {
     let mut overrides = std::collections::HashMap::new();
     overrides.insert("CH_URL".to_owned(), ch.uri());
+    // The shared catalog belongs to one tenant, and the query path is
+    // scoped to the tenant: this principal must be the catalog's own.
+    overrides.insert(
+        "CATALOG_TENANT_ID".to_owned(),
+        "11111111-1111-4111-8111-000000000001".to_owned(),
+    );
     let TestApp { router, pool } = spin_up_with_env(&overrides).await;
     let cookie = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
     (router, pool, cookie)

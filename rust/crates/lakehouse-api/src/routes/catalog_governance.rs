@@ -203,7 +203,30 @@ pub(crate) async fn dependents(
     if principal.has("query:read")
         && let Some(pg) = state.pg.as_deref()
     {
-        match lakehouse_store::queries::list_saved(pg).await {
+        // `SEC-20`: the saved queries listed here are the caller's
+        // tenant's, and the rows that belong to no tenant when that
+        // tenant owns the shared catalog. The dependents list resolves
+        // its own scope: the catalog route has no `X-Tenant` header to
+        // pass, so the tenant is the caller's first one. A scope that
+        // cannot be resolved lists no saved query — the list fails
+        // closed.
+        let scope = match crate::routes::query::saved_query_scope(
+            state,
+            principal,
+            &axum::http::HeaderMap::new(),
+        )
+        .await
+        {
+            Ok(scope) => scope,
+            Err(err) => {
+                tracing::warn!(
+                    ?err,
+                    "catalog detail: the saved query scope could not be resolved"
+                );
+                lakehouse_store::queries::SavedQueryScope::None
+            }
+        };
+        match lakehouse_store::queries::list_saved(pg, scope).await {
             Ok(saved) => out.extend(
                 saved
                     .iter()
