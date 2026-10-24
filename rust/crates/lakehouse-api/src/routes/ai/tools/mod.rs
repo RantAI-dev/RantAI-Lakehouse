@@ -7,7 +7,8 @@
 //!   buttons.
 //! - [`propose`] — `propose_sql`, a corrected statement checked for the
 //!   caller and shown to the person, never run.
-//! - [`look`] — `format_chart`, `set_dashboard_theme` (`BI-17` part A).
+//! - [`look`] — `format_chart`, `set_dashboard_theme` (`BI-17` part A) and
+//!   `set_cache_rule` (`BI-4` part B).
 //! - [`dashboards`] — `create_chart`, `update_chart`, `delete_chart`,
 //!   `create_board`, `list_boards`, `list_charts`, `list_sql_sources`,
 //!   `suggest_dashboard`.

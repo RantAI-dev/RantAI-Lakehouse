@@ -22,6 +22,11 @@ describe("toolsFromCaps", () => {
     }
   })
 
+  it("offers set_cache_rule with the Dashboard Builder in build mode and not in ask mode (BI-4)", () => {
+    expect(toolsFromCaps(new Set(["dashboard"]), "build")).toContain("set_cache_rule")
+    expect(toolsFromCaps(new Set(["dashboard"]), "ask")).not.toContain("set_cache_rule")
+  })
+
   it("does not offer ask_user when Query Data is off", () => {
     expect(toolsFromCaps(new Set(["dashboard"]), "build")).not.toContain("ask_user")
   })

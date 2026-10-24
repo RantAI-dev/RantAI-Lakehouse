@@ -706,13 +706,28 @@ pub(crate) async fn value_query(
             .collect(),
     };
     let obligations = PolicyEngineObligations::from_state(state);
-    let (_, mut answer) = crate::routes::support::run_spec_sql(
-        ch,
-        &chart.spec.id,
-        &filtered.sql,
-        &principal.role_names,
-        &placeholders,
-        &obligations,
+    // BI-4 part B (feature page, "Asking the assistant"): a metric's number
+    // is read through the same memory as a tile, under the install's rule, and
+    // says `computedAt` and `remembered` like a tile does.
+    let install = crate::routes::settings::format_settings(state)
+        .await?
+        .result_cache;
+    let scope = crate::result_cache::CacheScope::new(
+        std::sync::Arc::clone(&state.result_cache),
+        install,
+        crate::result_cache::Fresh::No,
+    )
+    .for_board(None, Vec::new());
+    let (_, mut answer) = crate::result_cache::scoped(
+        scope,
+        crate::routes::support::run_spec_sql(
+            ch,
+            &chart.spec.id,
+            &filtered.sql,
+            &principal.role_names,
+            &placeholders,
+            &obligations,
+        ),
     )
     .await;
     crate::routes::support::annotate_grain(&mut answer, &filtered, &chart);

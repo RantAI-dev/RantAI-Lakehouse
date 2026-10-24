@@ -887,3 +887,84 @@ async fn ask_mode_refuses_the_five_writers_and_allows_set_board_view_filters() {
     let body = json_body(resp).await;
     assert_ne!(body["outcome"], json!("refused"));
 }
+
+// ── BI-4 part B: set_cache_rule ─────────────────────────────────────────
+
+/// `set_cache_rule` (WriteLow): without `confirmed: true` the gate returns
+/// `needs_confirmation` with a summary that names the board and nothing is
+/// saved (`AI-x-AC1`: it asks first).
+#[tokio::test]
+async fn set_cache_rule_without_confirmed_asks_first_and_names_the_board() {
+    let TestApp { router, pool } = spin_up().await;
+    let cookie = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+    let resp = post_tool(
+        &router,
+        Some(&cookie),
+        json!({
+            "tool": "set_cache_rule",
+            "args": { "board": "b-fresh", "rule": "fresh" },
+            "mode": "build"
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["outcome"], json!("needs_confirmation"));
+    assert!(
+        body["result"]["summary"]
+            .as_str()
+            .is_some_and(|s| s.contains("b-fresh")),
+        "{}",
+        body["result"]["summary"]
+    );
+}
+
+/// A rule the console would refuse is refused with the same sentence before
+/// anything is read or saved, and the audit row names the board.
+#[tokio::test]
+async fn set_cache_rule_refuses_minutes_out_of_range_with_the_console_sentence() {
+    let TestApp { router, pool } = spin_up().await;
+    let cookie = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+    let resp = post_tool(
+        &router,
+        Some(&cookie),
+        json!({
+            "tool": "set_cache_rule",
+            "args": { "board": "b-fresh", "rule": "minutes", "minutes": 5000, "confirmed": true },
+            "mode": "build"
+        }),
+    )
+    .await;
+    let body = json_body(resp).await;
+    assert_eq!(
+        body["result"]["error"],
+        json!("Remember for between 1 minute and 24 hours (1 to 1440 minutes).")
+    );
+    let events = list(&pool, AuditFilter::default()).await.expect("audit");
+    let ours: Vec<_> = events
+        .iter()
+        .filter(|e| e.action == "set_cache_rule")
+        .collect();
+    assert_eq!(ours.len(), 1);
+    assert_eq!(ours[0].resource_kind.as_deref(), Some("board"));
+}
+
+/// Someone without `dashboard:write` is refused before the tool runs.
+#[tokio::test]
+async fn set_cache_rule_is_refused_without_dashboard_write() {
+    let TestApp { router, pool } = spin_up().await;
+    let user = common::create_principal_with_permissions(&pool, "dashboard:read").await;
+    let cookie = common::session_cookie_for_user(&pool, user).await;
+    let resp = post_tool(
+        &router,
+        Some(&cookie),
+        json!({
+            "tool": "set_cache_rule",
+            "args": { "board": "b-fresh", "rule": "fresh", "confirmed": true },
+            "mode": "build"
+        }),
+    )
+    .await;
+    let body = json_body(resp).await;
+    assert_eq!(body["outcome"], json!("refused"));
+}
