@@ -371,9 +371,7 @@ while the fingerprint read failed. A cancelled run inserts nothing (test:
 `a_cancelled_computation_leaves_nothing_behind`). The key is SHA-256 of engine, the rewritten
 statement (which carries the person's masks and expanded principal values) and
 `max_execution_time` / `max_result_rows`; the text also carries the row cap and the time cap.
-**Open (BI-5 review B1):** the point-map `LIMIT` and the pivot's own cap are in the statement
-text today only where the builder wrote them there; the planner asked that the per-kind cap be
-part of the key, which is handled in the BI-5 review fixes.
+**BI-5 review B1** (done in `f3db9aad`): the per-kind cap (`map_points` for point maps, the pivot's own cap) moves the outer `max_result_rows`, and that number is in the key.
 
 **Commands run** (from `rust/`, shared target, `CARGO_BUILD_JOBS=2`, `CARGO_INCREMENTAL=0`,
 under `flock`; 1.99.1):

@@ -267,6 +267,73 @@ Commits: `2c7207b1` T1 settings, `27400302` T2 engine options, `b937755a` T3 dea
 
 **Not verified:** every integration test (`tests/query_limits.rs` in the store, `tests/query_limits_route.rs`, `tests/query_cancel_route.rs`, the new `route_auth.rs` cases, `sec11_guard`, `ai_tool`) was written but not run here, per the machine rules; CI on #245 runs them. The full workspace clippy/test on 1.99.1. The end-to-end Stop timing through console, proxy and API, whether a browser abort reaches the API through the Next rewrite, and the API ClickHouse user's `KILL QUERY` grant (section 5 items) are *not verified*. The webpack build. The AI-15 run itself (the case is added, not run).
 
+### Review fixes (server), developer: Sonnet, 2026-10-25
+
+Commits: `f3db9aad` (B1, B2, S1, S2, S3, S4, S7 server part) and `57ea84a6` (S6, S9, S5/E6).
+
+- **B1.** `support::with_tile_rows` wraps the tile's `run_spec_sql` (dashboard, embed/public, builder
+  preview) and sets `query_limits::with_row_cap`: `map_points` for `pointmap`/`geoheat`, the
+  statement's own trailing `LIMIT` minus 1 for `pivot` (`builder::trailing_limit`; the pivot's
+  `pivot_row_cap`, up to 10,000), nothing for any other kind. `try_run_spec_sql` uses
+  `max(chart_rows, cap)` for the outer `max_result_rows`, the cut check, the truncation and
+  `limitHit`; the SQL-source `SETTINGS` text keeps `chart_rows + 1` (a map over a SQL source is still
+  held to the source cap). The cap is in `max_result_rows`, so it is in the BI-4 cache key. Test:
+  `a_point_map_and_a_pivot_read_past_the_chart_row_limit_and_a_bar_does_not`.
+- **B2.** `stream_chat` takes `QueryRun::current_or_detached()` in the request task and runs the
+  spawned chat in `query_limits::scope` (which now takes `impl Into<Arc<QueryRun>>`). For a run
+  with no request at all (a scheduled headless agent) `run_headless_loop` is a thin wrapper that
+  uses `scope_if_missing`, a run built with `QueryRun::for_request(state, principal, None)`: the
+  install snapshot and the agent's roles, not `Snapshot::default()`. `QueryRun::detached()` itself
+  is unchanged (it has no `AppState` to read from); the callers that can have one now use the new
+  function. Test: `a_streamed_chats_run_sql_carries_the_callers_query_id_and_the_limit_settings`.
+- **S1.** `is_board_path` matches `/api/dashboard`, `/api/render/data`, `/api/embed/data` and
+  `/api/public/dashboard/{token}` (one segment) only; `route_timeout` asserted for `/api/embed/frame`,
+  `/api/embed/values`, `.../unlock`.
+- **S2.** `query_limits::mark_stopped` (in-process map, 40-minute TTL, 10,000 marks) is set by the
+  cancel route before it asks the engine; `try_run_spec_sql` answers `Stopped` for a marked run
+  before it sends. The `KILL` is now sent even when the count is 0. Test:
+  `a_tile_of_a_stopped_run_sends_no_query`. The browser-abort question stays *not verified* (QA).
+- **S3.** `builder::find_source_settings` matches the cap with any two numbers; used by
+  `with_run_settings` (so `with_export_settings`) and `with_point_limit`. Test with the pre-BI-5
+  text (`max_execution_time = 30`).
+- **S4.** `export_statement_settings` takes the caller's limits and applies them to a grouped
+  download. Test: `a_grouped_download_takes_the_callers_limits_like_its_tile`.
+- **S5.** `docs/plans/BI-5-RESULT.md` E6, with the planner's numbers.
+- **S6.** `GET /api/settings/limits` sends `install` and `roles` only when the caller holds
+  `settings:write`; the console's `QueryLimits.install/roles` are optional and a reader sees
+  "For you: ..." only. Route test and a console test.
+- **S7.** `tests/query_run_limits.rs`: `/api/query/run` with `X-Run-Id` sends
+  `query_id=<user>:<run>:0` and the role's `max_execution_time`. **Not written:** the board
+  deadline end-to-end test with a mock engine. The deadline is `ceil(tiles/6) x limit + 15 s` with a
+  10 s minimum limit, so the test would run at least 35 s of real time (a paused clock does not
+  hold with a real socket in the loop); the mechanism (`run_tiles_until`, `board_deadline`) keeps
+  its unit tests.
+- **S8.** Unchanged: *not verified* until QA.
+- **S9.** The limits/Stop sentences (and the BI-4 `computedAt` read) are in `SYSTEM_ASK_SUFFIX` and
+  `SYSTEM_BUILD_SUFFIX` through one `macro_rules!` + `concat!`. They are **not** in `SYSTEM_BASE`:
+  `routes::ai::tests::the_base_prompt_is_byte_for_byte_what_it_was` pins that measured prompt
+  (length and FNV hash) and failed when the line was first moved there; the pin was kept.
+
+Large-future note: `with_tile_rows` returns a `BoxFuture` and `query_metric` boxes `value_query`
+because the tile query's future grew past the `clippy::large_futures` size with the cache.
+
+Commands (from `rust/`, shared target, `CARGO_BUILD_JOBS=2`, `CARGO_INCREMENTAL=0`, under `flock`,
+1.99.1; `touch crates/*/src/lib.rs` before clippy):
+- `cargo fmt -p lakehouse-api -p lakehouse-bi`; `cargo clippy -p lakehouse-bi -p lakehouse-api
+  --all-targets --all-features -- -D warnings`: clean (last run after the S9 change, `-p
+  lakehouse-api`; `lakehouse-bi` after S3).
+- `cargo test -p lakehouse-bi --lib builder`: 119 passed.
+- `cargo test -p lakehouse-api --lib -- routes::support routes::ai query_limits routes::dashboard
+  routes::embed`: 655 passed, 4 ignored (earlier run with `routes::agents routes::tests` added: 683
+  passed before the two failures it found, now fixed).
+- `bun run typecheck` 0 errors; `bun test src/features/admin src/features/dashboards
+  src/features/copilot src/lib src/services`: 1662 pass, 0 fail.
+
+*Not verified:* the new integration files (`tests/query_run_limits.rs`, the added cases in
+`ai_chat_stream.rs` and `query_limits_route.rs`) compiled by clippy `--all-targets`, not run; the
+full workspace clippy and test; the board-deadline test above; the browser abort; the `KILL` grant;
+the webpack build.
+
 ## 8. Review (planner appends)
 
 Planner, 2026-10-24: the console's shapes are accepted as the contract for the Rust tasks (the `/api/settings/limits` GET/PUT shape, the failed tile's `limit`, `X-Run-Id`, `POST /api/query/cancel`). The row-cut marker on a tile result is named **`limitHit`**, because `limit` is already a raw table's page size. T1 to T5 build to these shapes.
