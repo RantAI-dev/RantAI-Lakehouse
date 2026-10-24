@@ -32,6 +32,7 @@ import { HISTOGRAM_ROW_CAP, MAX_BULLETS, type TypeDefFields } from "@/lib/type-b
 import { ProgressCard } from "./progress-card";
 import { ImageCard, WebCard } from "./content-cards";
 import { bulletOption, histogramOption } from "./type-b-option";
+import { ganttOption } from "./gantt-option";
 import { resolvePalette } from "@/lib/chart-palettes";
 
 type Cell = Rows | TileFailure;
@@ -108,6 +109,14 @@ export function TileBody({
       return <p className="grid h-full place-items-center text-xs text-muted-foreground">No data.</p>;
     }
     return <TypeBBody spec={spec} cell={cell} def={def} bins={bins} measureLabels={measureLabels} dark={dark} />;
+  }
+
+  // BI-16 part C1 (plan D3): the Gantt chart draws its own rows (task, group, start, end, progress), not the category shape of the charts below.
+  if (spec.kind === "gantt") {
+    if (!hasRows(cell) || (cell.rows.length === 0 && !cell.reversedRows)) {
+      return <p className="grid h-full place-items-center text-xs text-muted-foreground">No data.</p>;
+    }
+    return <GanttBody cell={cell} def={def} dark={dark} onDataClick={onDataClick} />;
   }
 
   if (spec.kind === "table") {
@@ -272,6 +281,38 @@ function TypeBBody({
       {drawn.more > 0 ? (
         <p className="px-1 pt-1 text-[11px] text-muted-foreground">{drawn.more} more not shown (the first {MAX_BULLETS} are drawn)</p>
       ) : null}
+    </div>
+  );
+}
+
+/**
+ * The Gantt chart (`BI-16` part C1, plan D3): bars from start to end, coloured
+ * by group, a line at today in the report time zone, and the notes the plan
+ * names under the chart (more than 1,000 tasks, rows that end before they
+ * start). A click on a bar names its task, so the drill lists that task's rows.
+ */
+function GanttBody({
+  cell, def, dark, onDataClick,
+}: {
+  cell: Rows;
+  def: (StyleFields & TypeDefFields) | undefined;
+  dark: boolean;
+  onDataClick?: ChartClickHandler;
+}) {
+  const reporting = useReporting();
+  const drawn = ganttOption({
+    rows: cell.rows, dark, timeZone: reporting.timeZone, reversedRows: cell.reversedRows,
+    colors: resolvePalette(def?.colors, reporting.companyPalette),
+  });
+  if ("message" in drawn) {
+    return <p role="status" className="grid h-full place-items-center px-3 text-center text-xs text-muted-foreground">{drawn.message}.</p>;
+  }
+  return (
+    <div className="flex h-full min-h-0 flex-col">
+      <div className="min-h-0 flex-1">
+        <EChart option={drawn.option} height="100%" onDataClick={onDataClick ? (hit, pos) => onDataClick(hit, pos, { rows: cell.rows }) : undefined} />
+      </div>
+      {drawn.notes.map((note) => <p key={note} className="px-1 pt-1 text-[11px] text-muted-foreground">{note}.</p>)}
     </div>
   );
 }
