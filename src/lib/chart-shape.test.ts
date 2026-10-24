@@ -4,7 +4,7 @@ import test from "node:test"
 import {
   columnRef, metricColumn, effectiveOrder, entriesFromRows, isOtherRow, labelOtherRows, measureLabel, measureLimits, parseSortChoice,
   resultName, rowsFromEntries, shapeDraftFromDef, shapePayload, shapeProblems, sortChoiceOf, sortOptions,
-  tileMeasureLabels, usesGroupings, emptyShapeDraft, effectiveAggregate, storedAggregate, type MeasureEntry,
+  tileMeasureLabels, withResolvedSlots, usesGroupings, emptyShapeDraft, effectiveAggregate, storedAggregate, type MeasureEntry,
 } from "./chart-shape"
 
 test("a plain name stays a name and an own aggregate becomes an object", () => {
@@ -141,6 +141,22 @@ test("a tile labels a measure with its own aggregate by position", () => {
   // A calculated aggregate kept its name: no label to add.
   assert.deepEqual(tileMeasureLabels([{ column: "ratio", aggregate: "avg" }], "ratio"), {})
   assert.deepEqual(tileMeasureLabels(undefined, "v"), {})
+})
+
+// BI-19 part A QA fix P3: a public link opened a board whose charts hold a metric
+// measure and a parameter slot, and the page crashed ("name.startsWith is not a
+// function"), because the public payload did not carry `resolved`.
+test("a tile with a metric measure and a parameter slot is labelled, with or without the resolved columns", () => {
+  const stored = [{ metric: "total_visitors_demo" }, { aggregate: "sum", column: { param: "which" } }] as unknown as MeasureEntry[]
+  // Without `resolved` (the old public payload): no crash, the metric reads by its label, the slot has none.
+  const bare = tileMeasureLabels(stored, ["total_visitors_demo", "sum_which"], undefined, { total_visitors_demo: "Total visitors" })
+  assert.deepEqual(bare, { total_visitors_demo: "Total visitors" })
+  // Through the steps branch too.
+  assert.doesNotThrow(() => tileMeasureLabels(stored, "x", [{ summarise: { by: [], measures: [] } }] as never))
+  // With `resolved` (what the server now sends on a public link): the column the parameter took is labelled.
+  const def = withResolvedSlots({ measures: stored }, { measures: [{ metric: "total_visitors_demo" }, { aggregate: "sum", column: "stay" }] })
+  const labels = tileMeasureLabels(def?.measures, ["total_visitors_demo", "sum_stay"], undefined, { total_visitors_demo: "Total visitors" })
+  assert.deepEqual(labels, { total_visitors_demo: "Total visitors", sum_stay: "sum of stay" })
 })
 
 // ── BI-6 part 2: steps ───────────────────────────────────────────────────

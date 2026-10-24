@@ -230,7 +230,7 @@ pub(crate) async fn payload_for(
         &principal.role_names,
         &placeholders,
         &obligations,
-        (&time, requested, &viewer),
+        (&time, requested, &viewer, &state.tile_slots),
     )
     .await
     {
@@ -267,9 +267,10 @@ pub(crate) async fn payload_for(
 #[allow(
     clippy::too_many_lines,
     reason = "one straight-line port of a single large TS handler (spec \
-              merge -> filter application -> parallel tile execution); \
-              splitting it up would scatter one pipeline across helpers \
-              with no independent reuse"
+              merge -> filter application -> tile execution, which BI-4 \
+              part A runs side by side through `tile_pool`); splitting it \
+              up would scatter one pipeline across helpers with no \
+              independent reuse"
 )]
 async fn get_body(
     ch: &ChClient,
@@ -278,7 +279,12 @@ async fn get_body(
     roles: &[String],
     placeholders: &crate::sql_rewrite::PlaceholderValues,
     obligations: &PolicyEngineObligations<'_>,
-    (time, requested_grain, viewer): (&TimeContext, GrainRequest, &Viewer),
+    (time, requested_grain, viewer, tile_slots): (
+        &TimeContext,
+        GrainRequest,
+        &Viewer,
+        &tokio::sync::Semaphore,
+    ),
 ) -> Result<Value, BodyError> {
     let board = q.board.clone().unwrap_or_else(|| "default".to_owned());
     let years: Vec<i64> = q
@@ -387,21 +393,6 @@ async fn get_body(
     // the board reads, not only the ones an active filter touches.
     let cols = mart_columns(ch).await?;
 
-    let mut results = Map::new();
-    if on_default {
-        for k in KPIS.iter() {
-            let sql =
-                lakehouse_bi::builder::apply_builtin_year_filter(&k.sql, &k.mart, &years, &cols);
-            let (id, val) = run_spec_sql(ch, &k.id, &sql, roles, placeholders, obligations).await;
-            results.insert(id, val);
-        }
-        for c in CHARTS.iter() {
-            let sql =
-                lakehouse_bi::builder::apply_builtin_year_filter(&c.sql, &c.mart, &years, &cols);
-            let (id, val) = run_spec_sql(ch, &c.id, &sql, roles, placeholders, obligations).await;
-            results.insert(id, val);
-        }
-    }
     let sources = sources_for(ch, stored_for_board.iter().copied()).await?;
     // BI-13: the questions of a combined chart are asked as the viewer, one
     // statement each; their sources are read here, once, and a read that fails
@@ -423,65 +414,130 @@ async fn get_body(
         layer_sources: &layer_sources,
         read: &read,
     };
-    for c in &stored_for_board {
-        // BI-11: the chart as this read sees it, every parameter replaced by
-        // its value; a value that does not fit is this tile's plain sentence.
-        let c = match effective_chart(c, &cols, &sources, &read) {
-            Ok(effective) => effective,
-            Err(msg) => {
-                results.insert(c.spec.id.clone(), json!({ "error": msg }));
-                continue;
-            }
-        };
-        let c = &*c;
-        // BI-18 part C: a filter tied to other tabs is not given to this tile,
-        // and so is not reported as skipped on it either.
-        let tile_filters =
-            lakehouse_bi::layout::filters_for_chart(&filters, &tabs, &layout, &c.spec.id);
-        let tile_layer_ctx = crate::routes::layers::LayerContext {
-            filters: &tile_filters,
-            ..layer_ctx
-        };
-        let filtered = match stored_chart_sql(c, &years, &tile_filters, &cols, &sources, &read) {
-            Ok(filtered) => filtered,
-            Err(msg) => {
-                results.insert(c.spec.id.clone(), json!({ "error": msg }));
-                continue;
-            }
-        };
-        let (id, mut val) = run_spec_sql(
-            ch,
-            &c.spec.id,
-            &filtered.sql,
-            roles,
-            placeholders,
-            obligations,
-        )
-        .await;
-        let skipped = &filtered.skipped;
-        crate::routes::support::annotate_params(&mut val, c, &loaded.values);
-        crate::routes::support::annotate_grain(&mut val, &filtered, c);
-        crate::routes::support::annotate_table(
-            ch,
-            &mut val,
-            &filtered,
-            (roles, placeholders, obligations),
-        )
-        .await;
-        crate::routes::layers::annotate_layers(&tile_layer_ctx, &mut val, c, filtered.grain).await;
-        crate::routes::support::annotate_metric_labels(
-            &mut val,
-            c,
-            &field_catalog,
-            Some((&cols, &sources)),
-        );
-        // The tile still renders; this only lets it say which active filters
-        // its data cannot honour (no such column, or a type that does not fit).
-        if !skipped.is_empty()
-            && let Value::Object(tile) = &mut val
+    // BI-4 part A (plan D1/D2): every tile is one future, run up to 6 at once
+    // for this request and under the process's `tile_slots`. A tile's masks
+    // and row filters are applied inside its own pipeline, as before, and its
+    // failure is its own `error` value, so no tile can fail another. The
+    // outputs come back in this order (built-ins, then stored charts), which
+    // is the order the sequential loops inserted them in.
+    let (years_ref, cols_ref, sources_ref, read_ref) = (&years, &cols, &sources, &read);
+    let (filters_ref, tabs_ref, layout_ref) = (&filters, &tabs, &layout);
+    let (values_ref, catalog_ref, layer_ctx_ref) = (&loaded.values, &field_catalog, &layer_ctx);
+    let mut tiles: Vec<futures::future::BoxFuture<'_, (String, Value)>> = Vec::new();
+    // BI-5 (plan D4): the tile ids in `tiles` order, so a tile the board's
+    // deadline cut off can still be named.
+    let mut tile_ids: Vec<String> = Vec::new();
+    if on_default {
+        for (id, sql_text, mart) in KPIS
+            .iter()
+            .map(|k| (&k.id, &k.sql, &k.mart))
+            .chain(CHARTS.iter().map(|c| (&c.id, &c.sql, &c.mart)))
         {
-            tile.insert("filtersSkipped".to_owned(), json!(skipped));
+            tile_ids.push(id.clone());
+            tiles.push(Box::pin(async move {
+                let sql = lakehouse_bi::builder::apply_builtin_year_filter(
+                    sql_text, mart, years_ref, cols_ref,
+                );
+                run_spec_sql(ch, id, &sql, roles, placeholders, obligations).await
+            }));
         }
+    }
+    for c in &stored_for_board {
+        let c: &StoredChartSpec = c;
+        tile_ids.push(c.spec.id.clone());
+        tiles.push(Box::pin(async move {
+            // BI-11: the chart as this read sees it, every parameter replaced
+            // by its value; a value that does not fit is this tile's plain
+            // sentence.
+            let c = match effective_chart(c, cols_ref, sources_ref, read_ref) {
+                Ok(effective) => effective,
+                Err(msg) => return (c.spec.id.clone(), json!({ "error": msg })),
+            };
+            let c = &*c;
+            // BI-18 part C: a filter tied to other tabs is not given to this
+            // tile, and so is not reported as skipped on it either.
+            let tile_filters = lakehouse_bi::layout::filters_for_chart(
+                filters_ref,
+                tabs_ref,
+                layout_ref,
+                &c.spec.id,
+            );
+            let tile_layer_ctx = crate::routes::layers::LayerContext {
+                filters: &tile_filters,
+                ..*layer_ctx_ref
+            };
+            let filtered = match stored_chart_sql(
+                c,
+                years_ref,
+                &tile_filters,
+                cols_ref,
+                sources_ref,
+                read_ref,
+            ) {
+                Ok(filtered) => filtered,
+                Err(msg) => return (c.spec.id.clone(), json!({ "error": msg })),
+            };
+            let filtered = crate::routes::support::with_map_limit(filtered, c.spec.kind).await;
+            let (id, mut val) = run_spec_sql(
+                ch,
+                &c.spec.id,
+                &filtered.sql,
+                roles,
+                placeholders,
+                obligations,
+            )
+            .await;
+            let skipped = &filtered.skipped;
+            crate::routes::support::annotate_params(&mut val, c, values_ref);
+            crate::routes::support::annotate_grain(&mut val, &filtered, c);
+            crate::routes::support::annotate_table(
+                ch,
+                &mut val,
+                &filtered,
+                (roles, placeholders, obligations),
+            )
+            .await;
+            crate::routes::layers::annotate_layers(&tile_layer_ctx, &mut val, c, filtered.grain)
+                .await;
+            crate::routes::support::annotate_metric_labels(
+                &mut val,
+                c,
+                catalog_ref,
+                Some((cols_ref, sources_ref)),
+            );
+            // The tile still renders; this only lets it say which active
+            // filters its data cannot honour (no such column, or a type that
+            // does not fit).
+            if !skipped.is_empty()
+                && let Value::Object(tile) = &mut val
+            {
+                tile.insert("filtersSkipped".to_owned(), json!(skipped));
+            }
+            (id, val)
+        }));
+    }
+    let mut results = Map::new();
+    // BI-5 (plan D4): a board that outlasts `ceil(tiles / 6)` rounds of the
+    // caller's time limit answers the tiles that finished and says "not
+    // reached in time" for the rest, rather than a bare 408.
+    let run = crate::query_limits::QueryRun::current_or_detached();
+    let limit = run
+        .limits()
+        .await
+        .map_or(crate::query_limits::BOARD_DEADLINE_CAP, |limits| {
+            limits.timeout
+        });
+    let deadline =
+        tokio::time::Instant::now() + crate::query_limits::board_deadline(tiles.len(), limit);
+    let unreached = |i: usize| {
+        (
+            tile_ids[i].clone(),
+            json!({ "error": crate::query_limits::NOT_REACHED_SENTENCE }),
+        )
+    };
+    for (id, val) in
+        crate::tile_pool::run_tiles_until(tile_slots, tiles, deadline, &unreached).await
+    {
         results.insert(id, val);
     }
 
@@ -544,12 +600,7 @@ async fn get_body(
         if let Ok(e) = &effective
             && lakehouse_bi::params::changes_statement(&c.def)
         {
-            rendered["resolved"] = json!({
-                "dimension": e.def.dimension,
-                "breakdown": e.def.breakdown,
-                "measures": e.def.measures,
-                "limit": e.def.limit_value(),
-            });
+            rendered["resolved"] = crate::routes::support::resolved_json(e);
         }
         charts_out.push(rendered);
     }
@@ -647,7 +698,7 @@ fn parse_filters_param(raw: Option<&str>) -> Result<Option<Vec<FilterDef>>, ApiE
 ///
 /// When two relations disagree on a column's kind the first chart's wins;
 /// the tiles it does not fit report `wrong_type` rather than being coerced.
-fn filter_fields(
+pub(crate) fn filter_fields(
     charts: &[&StoredChartSpec],
     mart_cols: &HashMap<String, RelationColumns>,
     sources: &HashMap<String, lakehouse_bi::sources::SqlSource>,
@@ -1079,6 +1130,11 @@ pub async fn boards_list(
         "chartCount": builtin_tiles + counts.get(store::DEFAULT_BOARD_ID).copied().unwrap_or(0),
         "builtin": true,
     })];
+    // BI-19 part A (plan D1): the list's "public" mark and the delete warning
+    // read the live links from Postgres, never the dashboard row. `Board` does
+    // not serialise its old `public_token`, so a board without a live link has
+    // no `publicToken` at all.
+    let links = crate::routes::public_links::live_tokens(&state).await;
     out.extend(boards.iter().map(|b| {
         let mut value = serde_json::to_value(b).unwrap_or_else(|_| json!({}));
         if let Some(obj) = value.as_object_mut() {
@@ -1087,6 +1143,9 @@ pub async fn boards_list(
                 json!(counts.get(b.id.as_str()).copied().unwrap_or(0)),
             );
             obj.insert("builtin".to_owned(), json!(false));
+            if let Some(token) = links.get(b.id.as_str()) {
+                obj.insert("publicToken".to_owned(), json!(token));
+            }
         }
         value
     }));
@@ -1191,7 +1250,7 @@ pub async fn boards_create(
         // insert, so moving it into another folder is a change of place, not
         // the first time it is given an owner.
         if !folder_id.is_empty() {
-            store::move_board(&state.clickhouse, &board.id, &folder_id)
+            store::move_board(&state.clickhouse, &board.id, &folder_id, false)
                 .await
                 .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
             board.folder_id = Some(folder_id);
@@ -1206,7 +1265,7 @@ pub async fn boards_create(
             )
             .await
             .map_err(|err| crate::routes::dashboard_folders::classify_ch_error(&err))?;
-            store::move_board(&state.clickhouse, &board.id, &mine.id)
+            store::move_board(&state.clickhouse, &board.id, &mine.id, false)
                 .await
                 .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
             board.folder_id = Some(mine.id);
@@ -1232,6 +1291,9 @@ struct BoardEditBody {
     layout: Option<LayoutMap>,
     #[serde(default)]
     filters: Option<Vec<FilterDef>>,
+    /// Refused (`BI-19` part A, plan D5): public links are made, changed and
+    /// ended through `/api/dashboard/public-link`. The field stays so a console
+    /// opened before the upgrade gets this sentence and not a silent `ok`.
     #[serde(default)]
     public: Option<bool>,
     #[serde(default)]
@@ -1533,18 +1595,22 @@ async fn save_grain_and_params(
 /// File board `id` in `folder_id` (`""` = the root), if `viewer` may use that
 /// folder: another user's personal space is refused (`BI-18` part C, part 2).
 async fn file_in_folder(
-    ch: &ChClient,
+    state: &AppState,
     id: &str,
     folder_id: &str,
     viewer: &Viewer,
 ) -> Result<(), ApiError> {
+    let ch = &state.clickhouse;
     crate::routes::dashboard_folders::ensure_folder_usable(ch, folder_id, viewer).await?;
-    store::move_board(ch, id, folder_id)
+    // BI-19 part A (plan D5): the link is in Postgres now, so the rule "a shared
+    // dashboard cannot go into the personal space" asks there.
+    let has_link = crate::routes::public_links::has_link(state, id).await?;
+    store::move_board(ch, id, folder_id, has_link)
         .await
         .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))
 }
 
-/// `PUT /api/dashboard/boards` — rename/relayout/re-filter/publish/embed a
+/// `PUT /api/dashboard/boards` — rename/relayout/re-filter/embed a
 /// board.
 ///
 /// The built-in `"default"` board accepts a layout only: it has no name,
@@ -1573,6 +1639,14 @@ pub async fn boards_update(
     };
     if !board_edit_allowed(&parsed) {
         return Err(ApiError::BadRequest("invalid dashboard".to_owned()).into());
+    }
+    if parsed.public.is_some() {
+        // BI-19 part A (plan D5): a save no longer touches a public link, so a
+        // body that still asks for one must not look as if it worked.
+        return Err(ApiError::BadRequest(
+            "Public links are made from Share, with an expiry. Reload the page.".to_owned(),
+        )
+        .into());
     }
     let id = parsed.id.clone().unwrap_or_default();
     let ch = &state.clickhouse;
@@ -1631,7 +1705,7 @@ pub async fn boards_update(
             .map_err(|err| board_write_error(&err))?;
     }
     if let Some(folder_id) = &parsed.folder_id {
-        file_in_folder(ch, &id, folder_id.trim(), &viewer).await?;
+        file_in_folder(&state, &id, folder_id.trim(), &viewer).await?;
     }
     // BI-18 part C, part 2: one version per request that changed the content.
     let changes_content = parsed.changes_content();
@@ -1639,7 +1713,7 @@ pub async fn boards_update(
         snapshot(ch, &id, &principal).await;
     }
     // SEC-12. Merged into whichever response below is returned, so a body
-    // that also sets `public` or `embed` still reports them.
+    // that also sets `embed` still reports them.
     let embed_access = apply_embed_access(ch, &id, &parsed).await?;
     let with_embed_access = |mut body: Value| {
         if let Some(map) = body.as_object_mut() {
@@ -1647,14 +1721,6 @@ pub async fn boards_update(
         }
         body
     };
-    if let Some(public) = parsed.public {
-        let token = store::set_board_public(ch, &id, public)
-            .await
-            .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
-        return Ok(ApiJson(with_embed_access(
-            json!({ "ok": true, "publicToken": token }),
-        )));
-    }
     if let Some(embed) = parsed.embed {
         let enabled = store::set_board_embed(ch, &id, embed)
             .await
@@ -3570,9 +3636,24 @@ pub struct ValuesQuery {
     filters: Option<String>,
 }
 
+impl ValuesQuery {
+    /// The query of a signed embed's dropdown (`BI-26` plan D5): `column` over
+    /// the relations `board`'s charts read, narrowed by `filters` (JSON list).
+    pub(crate) fn for_board(column: &str, board: &str, filters: String) -> Self {
+        Self {
+            column: Some(column.to_owned()),
+            q: None,
+            board: Some(board.to_owned()),
+            filters: Some(filters),
+        }
+    }
+}
+
 /// Values a list returns at most; one more is fetched to know whether the
 /// list was cut.
 const VALUES_LIMIT: usize = 200;
+/// The most values a signed embed's dropdown lists (`BI-26` plan D5).
+pub(crate) const EMBED_VALUES_LIMIT: usize = 1_000;
 /// Longest search text, in characters.
 const VALUES_SEARCH_MAX_CHARS: usize = 200;
 
@@ -3647,12 +3728,12 @@ fn values_select(
 }
 
 /// The statement over every relation's `SELECT`, fetching one value more
-/// than [`VALUES_LIMIT`] so the caller can tell the list was cut.
-fn values_statement(selects: &[String], settings: &str) -> String {
+/// than `limit` so the caller can tell the list was cut.
+fn values_statement(selects: &[String], settings: &str, limit: usize) -> String {
     let union = selects.join(" UNION DISTINCT ");
     format!(
         "SELECT v FROM ({union}) WHERE v != '' ORDER BY v LIMIT {}{settings}",
-        VALUES_LIMIT + 1
+        limit + 1
     )
 }
 
@@ -3748,6 +3829,29 @@ async fn values_for_roles(
     obligations: &PolicyEngineObligations<'_>,
     time: &TimeContext,
 ) -> Result<Value, ApiError> {
+    values_with_limit(
+        ch,
+        q,
+        (roles, viewer),
+        (placeholders, obligations, time),
+        VALUES_LIMIT,
+    )
+    .await
+}
+
+/// [`values_for_roles`] with the list's limit chosen by the caller: the
+/// dashboard's picker lists 200, a signed embed's dropdown 1,000 (`BI-26`).
+pub(crate) async fn values_with_limit(
+    ch: &ChClient,
+    q: ValuesQuery,
+    (roles, viewer): (&[String], &Viewer),
+    (placeholders, obligations, time): (
+        &crate::sql_rewrite::PlaceholderValues,
+        &PolicyEngineObligations<'_>,
+        &TimeContext,
+    ),
+    limit: usize,
+) -> Result<Value, ApiError> {
     let column = strip_non_ident(q.column.as_deref().unwrap_or(""));
     if column.is_empty() {
         return Err(ApiError::BadRequest("column is required".to_owned()));
@@ -3798,7 +3902,7 @@ async fn values_for_roles(
     if selects.is_empty() {
         return Ok(empty());
     }
-    let sql = values_statement(&selects, settings);
+    let sql = values_statement(&selects, settings, limit);
     let rewritten = crate::policy_engine::rewrite_sql_for_roles(
         &sql,
         &sqlparser::dialect::ClickHouseDialect {},
@@ -3818,8 +3922,8 @@ async fn values_for_roles(
         .iter()
         .filter_map(|r| r.get("v").and_then(Value::as_str).map(ToOwned::to_owned))
         .collect();
-    let truncated = values.len() > VALUES_LIMIT;
-    values.truncate(VALUES_LIMIT);
+    let truncated = values.len() > limit;
+    values.truncate(limit);
     Ok(json!({ "column": column, "values": values, "truncated": truncated }))
 }
 
@@ -4206,6 +4310,9 @@ fn push_table_fields(def: &ChartInput, out: &mut Vec<(&'static str, Value)>) {
 pub struct EmbedInfoQuery {
     #[serde(default)]
     board: Option<String>,
+    /// `BI-26`: sign the sample for this chart instead of the dashboard.
+    #[serde(default)]
+    chart: Option<String>,
 }
 
 /// `GET /api/dashboard/embed-info` — this board's embed status and a
@@ -4246,7 +4353,7 @@ pub async fn embed_info(
         )
             .into_response();
     }
-    match embed_info_body(&state, &id, &viewer_of(&principal)).await {
+    match embed_info_body(&state, &id, q.chart.as_deref(), &viewer_of(&principal)).await {
         Ok(Some(body)) => (StatusCode::OK, ApiJson(body)).into_response(),
         Ok(None) => (
             StatusCode::NOT_FOUND,
@@ -4264,6 +4371,7 @@ pub async fn embed_info(
 async fn embed_info_body(
     state: &AppState,
     id: &str,
+    chart: Option<&str>,
     viewer: &Viewer,
 ) -> Result<Option<Value>, lakehouse_clickhouse::ChError> {
     let Some(board) = store::get_board(&state.clickhouse, id, viewer).await? else {
@@ -4282,6 +4390,25 @@ async fn embed_info_body(
         "maxLifetimeSeconds": max_lifetime,
         "revokedBefore": revoked_before,
         "allowedOrigins": board.embed_access.origins,
+        // BI-26 (D8): each filter column's embed mode and the columns that
+        // can be given one (the board's saved filters), for the Share dialog.
+        "filterModes": board.embed_access.filter_modes,
+        // BI-26 review fix R3: filters that do not pick values (a range, a
+        // relative date, a text match) can only be hidden in an embed.
+        "hiddenOnlyColumns": board
+            .filters
+            .iter()
+            .flatten()
+            .filter(|f| !f.column.is_empty() && !f.op.is_in())
+            .map(|f| f.column.clone())
+            .collect::<std::collections::BTreeSet<_>>(),
+        "filterColumns": board
+            .filters
+            .iter()
+            .flatten()
+            .filter(|f| !f.column.is_empty())
+            .map(|f| f.column.clone())
+            .collect::<std::collections::BTreeSet<_>>(),
     });
     let with_access = |mut body: Value| {
         if let (Some(map), Some(extra)) = (body.as_object_mut(), access.as_object()) {
@@ -4306,11 +4433,26 @@ async fn embed_info_body(
         reason = "a lifetime limit in seconds; far below 2^53"
     )]
     let lifetime = 3600.0_f64.min(max_lifetime as f64);
+    // BI-26 (D8): a sample for one chart names it (and not the dashboard); the
+    // locked filters' saved values ride as `params`, so the sample is not
+    // refused for a locked value it forgot (feature decision 6).
+    let named_chart = match chart {
+        Some(c)
+            if store::list_stored_charts(&state.clickhouse, viewer)
+                .await?
+                .iter()
+                .any(|s| s.spec.id == c && s.board == id) =>
+        {
+            Some(c.to_owned())
+        }
+        _ => None,
+    };
     let claims = lakehouse_embed::EmbedClaims {
         resource: Some(lakehouse_embed::EmbedResource {
-            dashboard: Some(id.to_owned()),
+            dashboard: named_chart.is_none().then(|| id.to_owned()),
+            chart: named_chart,
         }),
-        params: Some(HashMap::new()),
+        params: Some(locked_sample_params(&board)),
         exp: Some(iat + lifetime),
         // SEC-12: a token must carry `iat` and `exp`; the sample also gets a
         // `jti` so the Share dialog can show a token that can be withdrawn.
@@ -4327,6 +4469,23 @@ async fn embed_info_body(
         "supported": true,
         "sampleToken": sample_token,
     }))))
+}
+
+/// The `params` of a sample token: for each filter whose embed mode is locked,
+/// its saved value (an `in` filter's values) under its column.
+fn locked_sample_params(board: &lakehouse_bi::store::Board) -> HashMap<String, Value> {
+    use lakehouse_bi::embed_access::FilterMode;
+    board
+        .filters
+        .iter()
+        .flatten()
+        .filter(|f| {
+            !f.column.is_empty()
+                && board.embed_access.mode_of(&f.column) == FilterMode::Locked
+                && !f.values.is_empty()
+        })
+        .map(|f| (f.column.clone(), json!(f.values)))
+        .collect()
 }
 
 fn now_unix_seconds() -> f64 {
@@ -5477,10 +5636,119 @@ mod typed_filters {
                 &lakehouse_bi::grain::TimeContext::default(),
                 GrainRequest::Saved,
                 &lakehouse_bi::access::Viewer::system(),
+                &tokio::sync::Semaphore::new(crate::tile_pool::TILES_PER_PROCESS),
             ),
         )
         .await
         .expect("the payload builds")
+    }
+
+    /// Answers a tile query after 300 ms and records when it arrived, so a
+    /// test can see how many tiles were in flight together.
+    struct SlowTile {
+        arrivals: std::sync::Arc<std::sync::Mutex<Vec<std::time::Instant>>>,
+    }
+
+    impl wiremock::Respond for SlowTile {
+        fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+            let text = String::from_utf8_lossy(&request.body);
+            if text.contains("mart_bad") {
+                return ResponseTemplate::new(500).set_body_string("boom");
+            }
+            self.arrivals
+                .lock()
+                .expect("arrivals lock")
+                .push(std::time::Instant::now());
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_millis(300))
+                .set_body_json(json!({
+                    "meta": [{ "name": "kab", "type": "String" }, { "name": "visitors", "type": "UInt32" }],
+                    "data": [{ "kab": "a", "visitors": 1 }],
+                    "rows": 1,
+                }))
+        }
+    }
+
+    /// BI-4 part A (plan D1/T1): twelve 300 ms tiles are answered in two
+    /// rounds of six, in chart order, and a tile whose query fails does not
+    /// fail the others.
+    #[tokio::test]
+    async fn twelve_slow_tiles_load_six_at_a_time_in_order_and_one_failure_stays_its_own() {
+        let server = MockServer::start().await;
+        let mut charts: Vec<Value> = (0..12)
+            .map(|i| chart_row(&format!("c{i:02}"), "b1", "mart_a", None))
+            .collect();
+        charts[8] = chart_row("c08", "b1", "mart_bad", None);
+        answer(
+            &server,
+            "FROM console.bi_chart FINAL",
+            &["id", "board", "created_by", "created_at", "spec_json"],
+            charts,
+        )
+        .await;
+        answer(&server, "FROM console.bi_board FINAL", &["id"], vec![]).await;
+        answer(&server, "FROM console.bi_source FINAL", &["id"], vec![]).await;
+        let mut cols = mart_column_rows("mart_a", &[("visitors", "UInt32"), ("kab", "String")]);
+        cols.extend(mart_column_rows(
+            "mart_bad",
+            &[("visitors", "UInt32"), ("kab", "String")],
+        ));
+        answer(
+            &server,
+            "SELECT table, name, type FROM system.columns",
+            &["table", "name", "type"],
+            cols,
+        )
+        .await;
+        let arrivals = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        Mock::given(method("POST"))
+            .and(body_string_contains("FROM serving.mart_"))
+            .respond_with(SlowTile {
+                arrivals: arrivals.clone(),
+            })
+            .mount(&server)
+            .await;
+        answer_rest(&server).await;
+
+        let started = std::time::Instant::now();
+        // A filter makes each tile send a statement of its own over its mart
+        // (without one a stored chart sends its saved `SELECT 1`).
+        let body = dashboard(
+            &server,
+            r#"[{"column":"visitors","op":"between","min":"0"}]"#,
+        )
+        .await;
+        let took = started.elapsed();
+
+        let results = body["results"].as_object().expect("results");
+        let ids: Vec<&String> = results.keys().collect();
+        let expected: Vec<String> = (0..12).map(|i| format!("c{i:02}")).collect();
+        assert_eq!(ids, expected.iter().collect::<Vec<_>>(), "chart order");
+        assert!(
+            results["c08"].get("error").is_some(),
+            "{:?}",
+            results["c08"]
+        );
+        for id in expected.iter().filter(|id| *id != "c08") {
+            assert!(
+                results[id].get("error").is_none(),
+                "{id}: {:?}",
+                results[id]
+            );
+            assert_eq!(results[id]["rows"][0]["visitors"], 1, "{id}");
+        }
+        // Eleven 300 ms tiles one after another take 3.3 s.
+        assert!(took < std::time::Duration::from_millis(1500), "{took:?}");
+        let times = arrivals.lock().expect("arrivals lock").clone();
+        assert_eq!(times.len(), 11, "every healthy tile asked once");
+        let first = *times.iter().min().expect("a tile query");
+        let in_first_wave = times
+            .iter()
+            .filter(|t| t.duration_since(first) < std::time::Duration::from_millis(200))
+            .count();
+        // Six start together; the 7th cannot start until one finishes (300 ms).
+        // The failing tile (c08) is in the second wave, so the first has six.
+        assert_eq!(in_first_wave, 6, "six tiles in the first wave");
     }
 
     #[test]
@@ -6273,8 +6541,8 @@ mod records_pages {
         let (rows, count) = page_and_count(&server).await;
         assert!(rows.contains("channel = 'web'"), "{rows}");
         // The source's cap rides on the count too.
-        assert!(count.contains("max_execution_time = 30"), "{count}");
-        assert!(rows.contains("max_execution_time = 30"), "{rows}");
+        assert!(count.contains("max_execution_time = 60"), "{count}");
+        assert!(rows.contains("max_execution_time = 60"), "{rows}");
     }
 
     #[tokio::test]
@@ -6631,6 +6899,7 @@ mod time_grain {
                 time,
                 requested.into(),
                 &lakehouse_bi::access::Viewer::system(),
+                &tokio::sync::Semaphore::new(crate::tile_pool::TILES_PER_PROCESS),
             ),
         )
         .await
@@ -6707,6 +6976,7 @@ mod time_grain {
                 &TimeContext::default(),
                 super::GrainRequest::Own,
                 &lakehouse_bi::access::Viewer::system(),
+                &tokio::sync::Semaphore::new(crate::tile_pool::TILES_PER_PROCESS),
             ),
         )
         .await
@@ -7097,6 +7367,7 @@ mod table_tiles {
                 &TimeContext::default(),
                 GrainRequest::Saved,
                 &lakehouse_bi::access::Viewer::system(),
+                &tokio::sync::Semaphore::new(crate::tile_pool::TILES_PER_PROCESS),
             ),
         )
         .await

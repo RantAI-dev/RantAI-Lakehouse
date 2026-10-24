@@ -227,6 +227,13 @@ pub struct AppState {
     /// feature decision 5); a third request waits for a slot. Shared across
     /// clones.
     pub pdf_slots: Arc<tokio::sync::Semaphore>,
+    /// At most `TILE_CONCURRENCY_MAX` (default 24) dashboard tiles are
+    /// computed at once per process, across every request (`BI-4` part A,
+    /// plan D2); a request also caps itself at 6. Shared across clones.
+    pub tile_slots: Arc<tokio::sync::Semaphore>,
+    /// The 30-second memo of the query limits (`BI-5` plan D2), so a
+    /// dashboard does not read Postgres per tile. Shared across clones.
+    pub query_limits: crate::query_limits::QueryLimitsMemo,
     /// Test seam for the alert webhook sender (merge of `SEC-10` into the
     /// `SRC-17` delivery tests): those tests deliver to a `wiremock`
     /// listener on loopback, which the real address policy refuses by
@@ -674,6 +681,12 @@ fn login_throttle_policy(config: &Config) -> ThrottlePolicy {
 impl AppState {
     /// Build application state from a resolved [`Config`].
     #[must_use]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one struct literal naming every shared handle, a line per \
+                  field; `tile_slots` (BI-4 part A) and `query_limits` (BI-5) are \
+                  the lines that took it from 100 to 102"
+    )]
     pub fn new(config: Config) -> Self {
         let clickhouse = Arc::new(ChClient::new(
             config.ch_url.clone(),
@@ -791,6 +804,8 @@ impl AppState {
             throttle_policy: Arc::new(throttle_policy),
             upload_receive,
             pdf_slots: Arc::new(tokio::sync::Semaphore::new(PDF_AT_ONCE)),
+            tile_slots: Arc::new(crate::tile_pool::slots_from_env()),
+            query_limits: crate::query_limits::QueryLimitsMemo::default(),
             #[cfg(test)]
             webhook_sender_override: None,
         }

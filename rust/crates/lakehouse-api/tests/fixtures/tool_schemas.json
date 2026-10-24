@@ -4051,6 +4051,33 @@
   {
     "type": "function",
     "function": {
+      "name": "get_query_limits",
+      "description": "The time and row limits that apply to the person you are talking to: how long a chart or Query Studio query may run (timeoutSeconds), rows a chart reads (chartRows), points a map shows (mapPoints), rows Query Studio returns (studioRows), and where the time limit comes from (source: the install, or one of their roles). Use it to answer \"what are my query limits?\" and \"why did this chart time out?\". You cannot change limits: an administrator does, in Admin > Settings > Query limits.",
+      "parameters": {
+        "type": "object",
+        "properties": {}
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "stop_query",
+      "description": "Stop the person's own running queries on the engine (\"stop the running query\"). With runId (a UUID, the run of a dashboard load or a Query Studio run) it ends that run; without it, it ends every query of this person that is running now. It never touches anyone else's queries. Answers how many were stopped (0: nothing was running).",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "runId": {
+            "type": "string",
+            "description": "UUID of one run; omit to stop all of the person's running queries"
+          }
+        }
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
       "name": "delete_chart",
       "description": "Delete one saved chart card (by id). Built-in charts cannot be deleted. Needs human approval before it runs.",
       "parameters": {

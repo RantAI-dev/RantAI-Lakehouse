@@ -127,6 +127,7 @@ async fn dashboard(server: &MockServer, filters: &str) -> Value {
             &lakehouse_bi::grain::TimeContext::default(),
             GrainRequest::Saved,
             &Viewer::system(),
+            &tokio::sync::Semaphore::new(crate::tile_pool::TILES_PER_PROCESS),
         ),
     )
     .await
@@ -659,6 +660,7 @@ mod verify {
                 &lakehouse_bi::grain::TimeContext::default(),
                 GrainRequest::Saved,
                 &Viewer::system(),
+                &tokio::sync::Semaphore::new(crate::tile_pool::TILES_PER_PROCESS),
             ),
         )
         .await

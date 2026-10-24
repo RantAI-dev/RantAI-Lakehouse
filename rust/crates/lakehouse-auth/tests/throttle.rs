@@ -199,3 +199,66 @@ async fn a_failure_after_the_lock_expires_starts_the_count_fresh(pool: PgPool) {
         "the second failure after expiry must lock again"
     );
 }
+
+/// `BI-19` part A review fix (BLOCKER) R1: however many attempts arrive at once,
+/// only `max_failures` of them are told to go on to the (slow) verification.
+#[sqlx::test(migrations = "../../migrations")]
+async fn twenty_concurrent_attempts_let_at_most_five_through_to_the_verifier(pool: PgPool) {
+    let key = Arc::new(throttle::key_for("public-link:burst"));
+    let pool = Arc::new(pool);
+    let mut tasks = Vec::new();
+    for _ in 0..20 {
+        let (pool, key) = (Arc::clone(&pool), Arc::clone(&key));
+        tasks.push(tokio::spawn(async move {
+            throttle::record_attempt(&pool, &key, &policy())
+                .await
+                .unwrap()
+                .0
+        }));
+    }
+    let mut counts = Vec::new();
+    for t in tasks {
+        counts.push(t.await.unwrap());
+    }
+    counts.sort_unstable();
+    assert_eq!(
+        counts,
+        (1..=20).collect::<Vec<u32>>(),
+        "each is counted once"
+    );
+    assert_eq!(counts.iter().filter(|c| **c <= 5).count(), 5);
+    assert!(throttle::locked_until(&pool, &key).await.unwrap().is_some());
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_attempt_counts_the_lock_holds_and_clear_or_expiry_starts_again(pool: PgPool) {
+    let key = throttle::key_for("public-link:b_1");
+    for n in 1..=7 {
+        let (count, locked) = throttle::record_attempt(&pool, &key, &policy())
+            .await
+            .unwrap();
+        assert_eq!(count, n);
+        assert_eq!(locked.is_some(), n >= 5, "the fifth try sets the lock");
+    }
+    assert!(throttle::locked_until(&pool, &key).await.unwrap().is_some());
+    sqlx::query("UPDATE login_throttle SET locked_until = now() - interval '1 second'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        throttle::record_attempt(&pool, &key, &policy())
+            .await
+            .unwrap()
+            .0,
+        1
+    );
+    assert!(throttle::locked_until(&pool, &key).await.unwrap().is_none());
+    throttle::clear(&pool, &key).await.unwrap();
+    assert_eq!(
+        throttle::record_attempt(&pool, &key, &policy())
+            .await
+            .unwrap()
+            .0,
+        1
+    );
+}

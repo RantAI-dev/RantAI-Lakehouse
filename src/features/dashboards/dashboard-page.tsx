@@ -3,7 +3,7 @@
 import * as React from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { useTheme } from "next-themes";
-import { ArrowRightLeft, ChartColumn, Download, GitFork, Heading, Maximize2, Minus, MousePointerClick, Move, Moon, Pencil, Plus, Smartphone, SlidersHorizontal, Sparkles, Table2, Trash2, Rows3 } from "lucide-react";
+import { ArrowRightLeft, ChartColumn, Download, GitFork, Heading, Maximize2, Minus, MousePointerClick, Move, Moon, Pencil, Plus, Smartphone, SlidersHorizontal, Sparkles, Square, Table2, Trash2, Rows3 } from "lucide-react";
 import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog";
 import { PageHeader } from "@/components/patterns/page-header";
 import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@rantai/design-system/ui/empty";
@@ -35,7 +35,9 @@ import type { ChartClick, FilterDef, FilterField } from "@/services/clients/bi-s
 import { useAuth } from "@/features/auth/auth-provider";
 import { useCopilot } from "@/features/copilot/use-copilot";
 import { useService } from "@/hooks/use-service";
-import { dashboardService } from "@/services";
+import { dashboardService, queryService } from "@/services";
+import { newRunId, RUN_ID_HEADER } from "@/lib/run-id";
+import { STOPPED_SENTENCE } from "@/lib/query-limits";
 import { apiFetch } from "@/services/http";
 import { useAutoRefresh } from "./auto-refresh";
 import { BoardSwitcher } from "./board-switcher";
@@ -258,9 +260,14 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   // old board's response (slower: it runs the built-in tiles) used to land
   // last and paint its charts under the new dashboard's name.
   const loadSeq = React.useRef(0);
+  // BI-5 (plan D5): the run in flight, so Stop can end its queries on the engine and abort the request.
+  const runRef = React.useRef<{ runId: string; controller: AbortController } | null>(null);
+  const [stopped, setStopped] = React.useState(false);
   const load = React.useCallback(async (): Promise<Payload | undefined> => {
     const seq = ++loadSeq.current;
-    setLoading(true); setError(null);
+    const run = { runId: newRunId(), controller: new AbortController() };
+    runRef.current = run;
+    setLoading(true); setError(null); setStopped(false);
     try {
       const q = new URLSearchParams({ board });
       // A parameter that is not a filter list is ignored: the saved default shows.
@@ -270,7 +277,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       if (grainAsked) q.set("grain", grainAsked);
       const paramsAsked = paramsQuery(pValues);
       if (paramsAsked) q.set("params", paramsAsked);
-      const res = await apiFetch(`/api/dashboard?${q.toString()}`, { cache: "no-store" });
+      const res = await apiFetch(`/api/dashboard?${q.toString()}`, { cache: "no-store", headers: { [RUN_ID_HEADER]: run.runId }, signal: run.controller.signal });
       const json = (await res.json()) as Payload;
       if (seq !== loadSeq.current) return undefined;
       if (!res.ok) throw new Error((json as { error?: string }).error ?? "Failed to load dashboard");
@@ -280,12 +287,29 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       setPhone(json.phoneLayout);
       return json;
     } catch (e) {
+      // Stop is an answer, not an error: the tiles that were already on screen stay, and the page says "Stopped".
+      if (run.controller.signal.aborted) {
+        if (seq === loadSeq.current) setStopped(true);
+        return undefined;
+      }
       if (seq === loadSeq.current) setError(e instanceof Error ? e.message : String(e));
       return undefined;
     } finally {
       if (seq === loadSeq.current) setLoading(false);
     }
   }, [board, fParam, gChoice, pValues]);
+
+  /**
+   * Stop on a dashboard that is still loading (BI-5 decision 4): ask the server to end this
+   * run's queries on the engine, then abort the request. The cancel call is best effort (the
+   * route lands with T4 of the BI-5 plan; until then it answers 404): the abort always happens.
+   */
+  const stopLoading = React.useCallback(() => {
+    const run = runRef.current;
+    if (!run) return;
+    void queryService.cancel(run.runId).catch(() => undefined);
+    run.controller.abort();
+  }, []);
 
   // Switching dashboard starts in view mode; the switcher navigates without
   // `f`, so the new board opens on its own default.
@@ -1097,6 +1121,11 @@ export function DashboardPage({ boardId }: { boardId: string }) {
                 }}
               />
             ) : null}
+            {loading ? (
+              <Button size="sm" variant="outline" onClick={stopLoading}>
+                <Square className="size-4" aria-hidden /> Stop
+              </Button>
+            ) : null}
             <DashboardActionsMenu
               isDefault={isDefault}
               canWrite={canWrite}
@@ -1180,9 +1209,12 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       ) : null}
 
       {/* Canvas */}
+      {stopped ? (
+        <p role="status" className="text-sm text-muted-foreground">{STOPPED_SENTENCE}. Press Refresh to load the dashboard again.</p>
+      ) : null}
       {loading && charts.length === 0 ? (
         <DashboardTilesSkeleton />
-      ) : !loading && charts.length === 0 ? (
+      ) : !loading && charts.length === 0 && !stopped ? (
         <Empty className="border border-dashed">
           <EmptyHeader>
             <EmptyMedia variant="icon">

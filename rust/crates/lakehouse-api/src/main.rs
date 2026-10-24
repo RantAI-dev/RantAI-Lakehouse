@@ -36,6 +36,7 @@ mod pipeline_lag;
 mod pipeline_source;
 mod policy;
 mod policy_engine;
+mod query_limits;
 mod routes;
 mod rustfs_client;
 mod secret_crypto;
@@ -46,6 +47,7 @@ mod sql_rewrite;
 mod state;
 mod tenant;
 mod tenant_scope;
+mod tile_pool;
 mod transform_grammar;
 mod upload_limits;
 mod upload_parquet;
@@ -176,6 +178,9 @@ async fn run() -> anyhow::Result<()> {
     // RPT-1 D3: the scheduled-report runner (a tick every minute, a daily
     // 90-day cleanup of deliveries).
     routes::report_runner::spawn(&state);
+    // BI-19 part A (D2): the public links dashboards carried before links
+    // moved to Postgres, copied once, each expiring in 30 days.
+    routes::public_links::spawn_legacy_copy(&state);
 
     let app = routes::router(state);
 

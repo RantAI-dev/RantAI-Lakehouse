@@ -1,19 +1,21 @@
 "use client";
 
 import * as React from "react";
-import { Check, Code2, Copy, Globe, KeyRound, Link2, Share2 } from "lucide-react";
+import { Check, Copy, KeyRound, Share2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   Dialog, DialogClose, DialogContent, DialogFooter, DialogHeader, DialogTitle,
 } from "@/components/ui/dialog";
 import { Switch } from "@/components/ui/switch";
 import { apiFetch } from "@/services/http";
-import { dashboardService } from "@/services";
-import type { EmbedInfo } from "@/services/contracts/dashboards";
+// BI-19 part A review fix (SHOULD-FIX) R4: features import `@/services` only.
+import { dashboardService, type EmbedInfo } from "@/services";
 import { copyText as copyToClipboard } from "@/lib/copy-text";
-import { AllowedSitesEditor, Disclosure, WithdrawTokens } from "./embed-access-panel";
+import { PublicLinkPanel } from "./public-link-panel";
+import { AllowedSitesEditor, WithdrawTokens } from "./embed-access-panel";
 import { Input } from "@/components/ui/input";
-import { signSnippet as buildSignSnippet, tokenRules } from "./share-embed";
+import { tokenRules } from "./share-embed";
+import { EmbedSettingsPanel } from "./embed-settings-panel";
 
 async function putBoard(body: Record<string, unknown>): Promise<Record<string, unknown>> {
   const res = await apiFetch("/api/dashboard/boards", {
@@ -40,14 +42,15 @@ async function fetchEmbedInfo(board: string): Promise<EmbedInfo | null> {
 
 /** Public link, iframe embed and signed embedding for one user dashboard. */
 export function ShareDialog({
-  board, dashName, open, onOpenChange,
+  board, dashName, open, onOpenChange, canWrite = true,
 }: {
   readonly board: string;
   readonly dashName: string;
   readonly open: boolean;
   readonly onOpenChange: (open: boolean) => void;
+  /** Whether the caller may save filter modes; the server checks it too (`dashboard:write`). */
+  readonly canWrite?: boolean;
 }) {
-  const [shareToken, setShareToken] = React.useState("");
   const [info, setInfo] = React.useState<EmbedInfo>(EMPTY_INFO);
   const [infoState, setInfoState] = React.useState<"loading" | "ready" | "failed">("loading");
   const embedEnabled = info.enabled;
@@ -63,14 +66,6 @@ export function ShareDialog({
     setCopied(false);
     setInfoState("loading");
     void (async () => {
-      try {
-        const res = await apiFetch("/api/dashboard/boards", { cache: "no-store" });
-        const json = await res.json();
-        const b = (json?.boards ?? []).find((x: { id: string; publicToken?: string }) => x.id === board);
-        if (!cancelled) setShareToken(b?.publicToken ?? "");
-      } catch {
-        if (!cancelled) setShareToken("");
-      }
       const loaded = await fetchEmbedInfo(board);
       if (cancelled) return;
       setInfo(loaded ?? EMPTY_INFO);
@@ -78,15 +73,6 @@ export function ShareDialog({
     })();
     return () => { cancelled = true; };
   }, [open, board]);
-
-  async function setPublic(enable: boolean) {
-    setBusy(true);
-    try {
-      const json = await putBoard({ id: board, public: enable });
-      setShareToken(typeof json.publicToken === "string" ? json.publicToken : "");
-      setCopied(false);
-    } finally { setBusy(false); }
-  }
 
   async function setEmbed(enable: boolean) {
     setBusy(true);
@@ -108,13 +94,7 @@ export function ShareDialog({
   }
 
   const origin = typeof window !== "undefined" ? window.location.origin : "";
-  const shareUrl = shareToken ? `${origin}/public/dashboard/${shareToken}` : "";
-  const embedDashUrl = shareToken ? `${origin}/embed/dashboard/${shareToken}` : "";
-  const embedIframe = shareToken
-    ? `<iframe src="${embedDashUrl}" width="100%" height="600" frameborder="0" style="border:1px solid #e5e7eb;border-radius:12px" title="Rantai Lake dashboard"></iframe>`
-    : "";
   const signedPreviewUrl = sampleToken ? `${origin}/embed/signed/${sampleToken}` : "";
-  const signSnippet = buildSignSnippet({ board, origin, maxLifetimeSeconds: info.maxLifetimeSeconds });
 
   const copyLabel = (k: string, label: string) => (
     <>
@@ -130,55 +110,7 @@ export function ShareDialog({
           <DialogTitle className="flex items-center gap-2"><Share2 className="size-4" /> Share “{dashName}”</DialogTitle>
         </DialogHeader>
         <div className="space-y-3">
-          <div className="flex items-start gap-3 rounded-lg border border-border bg-muted/30 p-3">
-            <Globe className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
-            <div className="min-w-0 flex-1">
-              <p className="text-sm font-medium">Public link</p>
-              <p className="text-xs text-muted-foreground">Anyone with the link can view this dashboard read-only, no sign-in.</p>
-            </div>
-            <Switch checked={Boolean(shareToken)} disabled={busy} onCheckedChange={(v) => void setPublic(v)} aria-label="Public link" />
-          </div>
-
-          {shareToken ? (
-            <div className="space-y-3">
-              <div className="space-y-1.5">
-                <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">Public link</p>
-                <div className="flex items-center gap-2">
-                  <div className="flex min-w-0 flex-1 items-center gap-2 rounded-md border border-border bg-background px-2.5 py-2">
-                    <Link2 className="size-3.5 shrink-0 text-muted-foreground" />
-                    <span className="truncate text-xs text-foreground">{shareUrl}</span>
-                  </div>
-                  <Button size="sm" variant="outline" onClick={() => void copyText(shareUrl, "link")}>
-                    {copyLabel("link", "Copy")}
-                  </Button>
-                </div>
-                <a href={shareUrl} target="_blank" rel="noopener noreferrer" className="inline-block text-xs font-medium text-primary hover:underline">Open preview ↗</a>
-              </div>
-
-              <div className="space-y-1.5">
-                <p className="flex items-center gap-1.5 text-[11px] font-medium uppercase tracking-wide text-muted-foreground"><Code2 className="size-3.5" /> Embed in a website</p>
-                <div className="rounded-md border border-border bg-muted/30 p-2">
-                  <code className="block max-h-20 overflow-auto whitespace-pre-wrap break-all font-mono text-[11px] leading-relaxed text-foreground">{embedIframe}</code>
-                </div>
-                <div className="flex items-center gap-2">
-                  <Button size="sm" variant="outline" onClick={() => void copyText(embedIframe, "embed")}>
-                    {copyLabel("embed", "Copy iframe")}
-                  </Button>
-                  <a href={embedDashUrl} target="_blank" rel="noopener noreferrer" className="text-xs font-medium text-primary hover:underline">Preview embed ↗</a>
-                </div>
-                <p className="text-[11px] text-muted-foreground">One chart only? Append <code className="rounded bg-muted px-1 font-mono">?chart=&lt;id&gt;</code> to the embed URL.</p>
-              </div>
-
-              <div className="flex items-center justify-between gap-2 border-t border-border pt-2">
-                <button onClick={() => void setPublic(false)} disabled={busy} className="text-xs text-destructive hover:underline disabled:opacity-50">Revoke link</button>
-              </div>
-              <p className="rounded-md bg-amber-500/5 px-2.5 py-1.5 text-[11px] text-amber-600 dark:text-amber-400">
-                Works wherever the server is reachable. For the public internet, expose the server (e.g. Cloudflare Tunnel / reverse proxy).
-              </p>
-            </div>
-          ) : (
-            <p className="text-xs text-muted-foreground">Turn on the switch to generate a shareable link.</p>
-          )}
+          <PublicLinkPanel board={board} />
 
           <div className="space-y-2 rounded-lg border border-border bg-muted/20 p-3">
             <div className="flex items-start gap-3">
@@ -218,15 +150,7 @@ export function ShareDialog({
                   </div>
                 </div>
 
-                <Disclosure title="How to sign a token">
-                  <p className="text-[11px] text-muted-foreground">The signing secret stays on your server and is never sent to the console. Set <code className="rounded bg-muted px-1 font-mono">EMBED_SECRET</code> there to the same value the backend uses.</p>
-                  <div className="rounded-md border border-border bg-background p-2">
-                    <code className="block max-h-40 overflow-auto whitespace-pre font-mono text-[11px] leading-relaxed text-foreground">{signSnippet}</code>
-                  </div>
-                  <Button size="sm" variant="outline" onClick={() => void copyText(signSnippet, "snippet")}>
-                    {copyLabel("snippet", "Copy code")}
-                  </Button>
-                </Disclosure>
+                <EmbedSettingsPanel board={board} info={info} origin={origin} canWrite={canWrite} onInfo={setInfo} />
 
                 <WithdrawTokens board={board} revokedBefore={info.revokedBefore}
                   onRevokedAll={(at) => setInfo((cur) => ({ ...cur, revokedBefore: at }))} />

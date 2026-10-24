@@ -15,6 +15,7 @@ import { selectedTab } from "@/lib/dashboard-tabs";
 import type { BoardTab, LayoutMap, PhoneTile } from "@/services";
 import { TabBar } from "./tab-bar";
 import type { TileFailure } from "@/services/contracts/dashboards";
+import { LinkGone, PasswordGate, openPublic } from "./public-link-access";
 
 type Cell = { columns: string[]; rows: Record<string, unknown>[] } | TileFailure;
 type Payload = {
@@ -46,36 +47,34 @@ export function PublicDashboard({ token }: { token: string }) {
   const dark = look.dark;
   const fixedTheme = look.className !== "";
   const [tabId, setTabId] = React.useState<string | null>(null);
-  const [state, setState] = React.useState<"loading" | "ok" | "notfound" | "error">("loading");
+  const [state, setState] = React.useState<"loading" | "ok" | "notfound" | "password" | "error">("loading");
+  // Bumped when the password page succeeds, so the dashboard is asked for again.
+  const [attempt, setAttempt] = React.useState(0);
 
   React.useEffect(() => {
     let alive = true;
     (async () => {
       try {
-        // Deliberately NOT `apiFetch`: this is the unauthenticated public
-        // share view. A 401/403/404 here means "no such share", rendered
-        // below as not-found — `apiFetch`'s 401 -> /login redirect would be
-        // wrong for a viewer who has no account to log into.
-        const res = await fetch(`/api/public/dashboard/${encodeURIComponent(token)}`, { cache: "no-store" });
+        // `openPublic` is deliberately NOT `apiFetch`: this is the
+        // unauthenticated public share view, and `apiFetch`'s 401 -> /login
+        // redirect would be wrong for a viewer who has no account.
+        const result = await openPublic<Payload>(token);
         if (!alive) return;
-        if (res.status === 404) { setState("notfound"); return; }
-        if (!res.ok) { setState("error"); return; }
-        setData(await res.json());
+        if (result.kind === "gone") { setState("notfound"); return; }
+        if (result.kind === "password") { setState("password"); return; }
+        if (result.kind === "error") { setState("error"); return; }
+        setData(result.data);
         setState("ok");
       } catch {
         if (alive) setState("error");
       }
     })();
     return () => { alive = false; };
-  }, [token]);
+  }, [token, attempt]);
 
-  if (state === "notfound") {
-    return (
-      <Centered>
-        <p className="text-lg font-semibold">Dashboard not available</p>
-        <p className="mt-1 text-sm text-muted-foreground">This link has been revoked or never existed.</p>
-      </Centered>
-    );
+  if (state === "notfound") return <LinkGone />;
+  if (state === "password") {
+    return <PasswordGate token={token} onOpen={() => { setState("loading"); setAttempt((n) => n + 1); }} />;
   }
   if (state === "error") {
     return (

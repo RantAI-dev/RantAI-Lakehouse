@@ -625,6 +625,12 @@
     "expect_state": [
       {"path": "/api/dashboard/specs", "list": "charts", "where": {"kind": "bullet", "def.goal": 1000}, "count": 1}
     ]
+  },
+  {
+    "id": "limits_why_timed_out",
+    "mode": "ask",
+    "turns": ["Why did this chart time out?"],
+    "expect_tool": {"name": "get_query_limits"}
   }
   ,{
     "id": "calc_distance_to_bandung",

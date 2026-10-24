@@ -292,3 +292,32 @@ describe("clickhouseQueryService.proposeFix request", () => {
     expect(calls).toHaveLength(1)
   })
 })
+
+describe("Stop (BI-5 plan D5)", () => {
+  it("sends the run id as X-Run-Id with the run", async () => {
+    const calls = stubFetch(() => json({ id: "r", columns: [], rows: [] }))
+    await clickhouseQueryService.run("SELECT 1", { engine: "clickhouse", runId: "7f0c0f0e-3c7e-4a3e-9d4f-0a1b2c3d4e5f" })
+    expect(calls[0].url).toBe("/api/query/run")
+    expect(new Headers(calls[0].init.headers).get("X-Run-Id")).toBe("7f0c0f0e-3c7e-4a3e-9d4f-0a1b2c3d4e5f")
+    expect(JSON.parse(String(calls[0].init.body))).toEqual({ sql: "SELECT 1", engine: "clickhouse" })
+  })
+
+  it("sends no X-Run-Id when the caller has none", async () => {
+    const calls = stubFetch(() => json({ id: "r", columns: [], rows: [] }))
+    await clickhouseQueryService.run("SELECT 1", { engine: "clickhouse" })
+    expect(new Headers(calls[0].init.headers).has("X-Run-Id")).toBe(false)
+  })
+
+  it("posts the run id to the cancel route and returns how many queries it stopped", async () => {
+    const calls = stubFetch(() => json({ stopped: 2 }))
+    expect(await clickhouseQueryService.cancel("7f0c0f0e-3c7e-4a3e-9d4f-0a1b2c3d4e5f")).toEqual({ stopped: 2 })
+    expect(calls[0].url).toBe("/api/query/cancel")
+    expect(calls[0].init.method).toBe("POST")
+    expect(JSON.parse(String(calls[0].init.body))).toEqual({ runId: "7f0c0f0e-3c7e-4a3e-9d4f-0a1b2c3d4e5f" })
+  })
+
+  it("reports a missing cancel route as not found", async () => {
+    stubFetch(() => json({ error: "Not found" }, 404))
+    expect((await rejection(clickhouseQueryService.cancel("7f0c0f0e-3c7e-4a3e-9d4f-0a1b2c3d4e5f"))).code).toBe("not_found")
+  })
+})

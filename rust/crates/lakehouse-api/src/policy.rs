@@ -160,7 +160,17 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // token is the credential; it answers only an origin list, and the same
     // empty list for a token that is invalid.
     ("POST", "/api/embed/frame",                  Policy::Public),
+    // BI-26 (D5): the values of an editable filter's dropdown. Public because the
+    // signed token is the credential; it answers only for a column that is
+    // editable for that token, as the fixed viewer role, with the token's
+    // locked values applied.
+    ("POST", "/api/embed/values",                 Policy::Public),
     ("GET",  "/api/public/dashboard/{token}",     Policy::Public),
+    // BI-19 part A (D4): trade a public link's password for a ticket. Public
+    // because the visitor has no account; the token and the password are the
+    // credentials, five wrong tries lock the link for 15 minutes, and a locked
+    // link, a wrong password and a made-up token all fail alike.
+    ("POST", "/api/public/dashboard/{token}/unlock", Policy::Public),
     ("POST", "/api/auth/login",                   Policy::Public),
     // Redirect-only, grants nothing — it only ever
     // 302s to a fixed, config-sourced IdP URL and sets a single-use flow
@@ -623,6 +633,17 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // SEC-12: withdrawing a token changes who can read the dashboard, so it
     // is a write, like the embed toggle on `PUT /api/dashboard/boards`.
     ("POST",   "/api/dashboard/embed-revoke", Policy::RequiresPermission("dashboard:write")),
+    // BI-26 (D8): which filters an embed viewer sees, changes or never sees is
+    // what a viewer may do, so it is a write (manage on the dashboard once
+    // `BI-19` part B ships, feature decision 11).
+    ("PUT",    "/api/dashboard/embed-settings", Policy::RequiresPermission("dashboard:write")),
+    // BI-19 part A (D5): making, changing and ending a dashboard's public link
+    // changes who can read it, so all three are writes (reading its state is
+    // too: the response carries the link's token). Part B of the plan moves
+    // these to "manage on the dashboard" with a handler check.
+    ("GET",    "/api/dashboard/public-link",  Policy::RequiresPermission("dashboard:write")),
+    ("PUT",    "/api/dashboard/public-link",  Policy::RequiresPermission("dashboard:write")),
+    ("DELETE", "/api/dashboard/public-link",  Policy::RequiresPermission("dashboard:write")),
 
     // ── Reporting settings (`BI-9`, `routes::settings`). Reading is auth-only:
     //    the console needs the zone and the first day to label every date
@@ -634,6 +655,12 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     //    `settings_write_needs_no_seed_change_and_no_seeded_role_has_it`. ────
     ("GET",    "/api/settings/reporting",     Policy::RequiresAuth),
     ("PUT",    "/api/settings/reporting",     Policy::RequiresPermission("settings:write")),
+    // ── Query limits (`BI-5`, `routes::query_limits`): anyone signed in reads
+    //    the limits that apply to them; changing them is `settings:write`. ──
+    ("GET",    "/api/settings/limits",        Policy::RequiresAuth),
+    // Stop: any login, because the route only ever ends the caller's own run.
+    ("POST",   "/api/query/cancel",           Policy::RequiresAuth),
+    ("PUT",    "/api/settings/limits",        Policy::RequiresPermission("settings:write")),
 
     // ── Agent / AI: no seeded resource for free-form ask/chat — auth only.
     ("POST", "/api/ai/chat",             Policy::RequiresAuth),
@@ -1143,7 +1170,7 @@ mod tests {
     }
 
     #[test]
-    fn exactly_nine_public_entries_exist() {
+    fn exactly_eleven_public_entries_exist() {
         // Pre-existing drift found while landing the `/api/auth/providers`
         // route: this assertion was still pinned at 4 even though the two
         // earlier OIDC public routes (`/api/auth/oidc/start`,
@@ -1160,7 +1187,11 @@ mod tests {
         // SEC-12 added `POST /api/embed/frame`: 7 -> 8.
         // BI-1 (D3) added `POST /api/render/data`, the PDF print view's data
         // route, authenticated by its signed render token: 8 -> 9.
-        assert_eq!(public_count, 9);
+        // BI-19 part A (D4) added `POST /api/public/dashboard/{token}/unlock`,
+        // where a public link's password is traded for a ticket: 9 -> 10.
+        // BI-26 (D5) added `POST /api/embed/values`, the dropdown of an
+        // editable embed filter, authenticated by the signed token: 10 -> 11.
+        assert_eq!(public_count, 11);
     }
 
     /// SEC-23 (F1): adding a governance rule needs `governance:write`, the

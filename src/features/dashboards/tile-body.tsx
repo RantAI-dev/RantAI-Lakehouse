@@ -34,16 +34,14 @@ import { ImageCard, WebCard } from "./content-cards";
 import { bulletOption, histogramOption } from "./type-b-option";
 import { ganttOption } from "./gantt-option";
 import { resolvePalette } from "@/lib/chart-palettes";
+import { limitSentence } from "@/lib/query-limits";
 
 type Cell = Rows | TileFailure;
 function hasRows(c: Cell | undefined): c is Rows {
   return !!c && "rows" in c;
 }
 
-/** Render a tile's body per its kind: text / kpi / table / chart. */
-export function TileBody({
-  spec, cell, dark, loading, onDataClick, hideLegend, paging, onTableSort,
-}: {
+type TileBodyProps = {
   spec: ChartRenderSpec & { text?: string; caption?: string };
   cell: Cell | undefined;
   dark: boolean;
@@ -64,7 +62,28 @@ export function TileBody({
   paging?: { filters: FilterDef[] };
   /** A raw table reports the sort the viewer chose (for the whole-result export). */
   onTableSort?: (sort: { column: string; dir: "asc" | "desc" }) => void;
-}) {
+};
+
+/**
+ * Render a tile's body per its kind: text / kpi / table / chart. A tile cut at
+ * the row limit says so under itself, with the limit that cut it (`BI-5`
+ * feature decision 5): the same sentence for every kind, so no kind has to
+ * remember to.
+ */
+export function TileBody(props: TileBodyProps) {
+  const cut = hasRows(props.cell) && props.cell.limitHit?.kind === "rows" ? limitSentence(props.cell.limitHit) : null;
+  if (!cut) return <TileBodyOf {...props} />;
+  return (
+    <div className="flex h-full min-h-0 flex-col">
+      <div className="min-h-0 flex-1"><TileBodyOf {...props} /></div>
+      <p className="px-1 pt-1 text-[11px] text-muted-foreground">{cut}</p>
+    </div>
+  );
+}
+
+function TileBodyOf({
+  spec, cell, dark, loading, onDataClick, hideLegend, paging, onTableSort,
+}: TileBodyProps) {
   const reporting = useReporting();
   // `def` is the stored definition (typed `unknown` on the shared spec): the
   // fields of raw tables, pivots and KPI comparisons are read from it (BI-16 part A).
@@ -80,6 +99,10 @@ export function TileBody({
   if (spec.kind === "image") return <ImageCard def={def} title={spec.title} />;
   if (spec.kind === "web") return <WebCard def={def} title={spec.title} />;
   if (cell && "error" in cell) {
+    // BI-5 (feature decision 5): a tile the time limit ended says the limit, not the engine's error.
+    if (cell.limit?.kind === "time") {
+      return <p role="status" className="grid h-full place-items-center px-2 text-center text-xs text-muted-foreground">{limitSentence(cell.limit)}</p>;
+    }
     return (
       <p className="grid h-full place-items-center px-2 text-center text-xs text-destructive">
         <ErrorWithReference message={cell.error} errorId={cell.errorId} />

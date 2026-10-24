@@ -1465,7 +1465,7 @@ mod tests {
             "{}",
             got.sql
         );
-        assert!(got.sql.ends_with("SETTINGS max_result_rows = 2000, result_overflow_mode = 'break', max_execution_time = 30"));
+        assert!(got.sql.ends_with("SETTINGS max_result_rows = 2000, result_overflow_mode = 'break', max_execution_time = 60"));
         s.def.measures = vec!["bad".to_owned()].into();
         assert!(
             sql_for_sql_source_report(

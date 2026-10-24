@@ -9,6 +9,12 @@ describe("toolsFromCaps", () => {
     expect(toolsFromCaps(new Set(["data"]), "build")).toContain("ask_user")
   })
 
+  it("offers the query-limit tools with Query Data in both modes (BI-5)", () => {
+    for (const mode of ["ask", "build"] as const) {
+      for (const tool of ["get_query_limits", "stop_query"]) expect(toolsFromCaps(new Set(["data"]), mode)).toContain(tool)
+    }
+  })
+
   it("offers the read-only metric tools with Query Data in both modes (AI-7)", () => {
     for (const mode of ["ask", "build"] as const) {
       for (const tool of ["list_metrics", "describe_metric", "query_metric"]) expect(toolsFromCaps(new Set(["data"]), mode)).toContain(tool)
