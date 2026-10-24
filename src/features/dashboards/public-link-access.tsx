@@ -1,6 +1,7 @@
 "use client";
 
 import * as React from "react";
+import { Eye, EyeOff } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 
@@ -91,10 +92,12 @@ export function LinkGone() {
 
 /**
  * The password page. A wrong password and a locked link read the same here as
- * they do on the server: "That password did not work."
+ * they do on the server: "That password did not work." The field has a
+ * show/hide toggle (BI-19 part A QA fix P1).
  */
 export function PasswordGate({ token, onOpen }: { readonly token: string; readonly onOpen: () => void }) {
   const [password, setPassword] = React.useState("");
+  const [shown, setShown] = React.useState(false);
   const [busy, setBusy] = React.useState(false);
   const [message, setMessage] = React.useState<string | null>(null);
 
@@ -116,8 +119,14 @@ export function PasswordGate({ token, onOpen }: { readonly token: string; readon
     <div className="grid min-h-[60vh] place-content-center px-4">
       <form onSubmit={(e) => void submit(e)} className="flex w-72 flex-col gap-3 text-center">
         <p className="text-lg font-semibold">This dashboard needs a password</p>
-        <Input type="password" aria-label="Password" autoComplete="off" autoFocus value={password}
-          onChange={(e) => setPassword(e.target.value)} />
+        <div className="flex items-center gap-2">
+          <Input type={shown ? "text" : "password"} aria-label="Password" autoComplete="off" autoFocus value={password}
+            onChange={(e) => setPassword(e.target.value)} />
+          <Button type="button" variant="outline" size="sm" aria-pressed={shown}
+            aria-label={shown ? "Hide password" : "Show password"} onClick={() => setShown((v) => !v)}>
+            {shown ? <EyeOff className="size-4" /> : <Eye className="size-4" />}
+          </Button>
+        </div>
         <Button type="submit" disabled={busy || password.length === 0}>Open</Button>
         {message ? <p role="alert" className="text-xs text-destructive">{message}</p> : null}
       </form>

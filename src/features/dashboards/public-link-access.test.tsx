@@ -71,4 +71,16 @@ describe("a public link in the browser (BI-19 part A)", () => {
       if (spy) Object.defineProperty(window, "sessionStorage", spy)
     }
   })
+
+  // BI-19 part A QA fix P1.
+  it("lets the visitor see what they typed, with a labelled toggle", async () => {
+    stub(() => json({ error: "password_required" }, 401))
+    render(<PublicDashboard token="p_pw" />)
+    const field = (await screen.findByLabelText("Password")) as HTMLInputElement
+    expect(field.type).toBe("password")
+    fireEvent.click(screen.getByRole("button", { name: "Show password" }))
+    expect(field.type).toBe("text")
+    fireEvent.click(screen.getByRole("button", { name: "Hide password" }))
+    expect(field.type).toBe("password")
+  })
 })
