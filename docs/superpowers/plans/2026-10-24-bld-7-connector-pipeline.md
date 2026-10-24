@@ -112,10 +112,12 @@
   clear, refused by the T1 rule).
 - **T5 `BLD-8`.** Decision 6, with tests for an ended run never showing
   "Running" and for the reason shown or withheld.
-- **T6 Docs.** The pipeline feature page in `docs/core/features/` (find it
-  by grepping for "Create pipeline" or "authored pipeline") says what a
-  connector on a pipeline means and that direct source reads are not
-  supported (`DEC-15`). Do not edit `docs/core/BACKLOG.md` status/PR; the
+- **T6 Docs.** No feature page covers authored pipelines in general;
+  `docs/core/features/uploads-feed-pipelines.md` is the closest (an upload
+  feeding a pipeline, `DATA-19`). Add a short section there, "A
+  connector's tables feed pipelines", saying what a connector on a
+  pipeline means, that it runs after that table's load, and that direct
+  source reads are not supported (`DEC-15`). Do not edit `docs/core/BACKLOG.md` status/PR; the
   planner does.
 
 ## Verification before handoff
