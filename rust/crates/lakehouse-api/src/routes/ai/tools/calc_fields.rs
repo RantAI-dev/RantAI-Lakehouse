@@ -234,3 +234,28 @@ pub(super) async fn run(
         other => json!({ "error": format!("unknown tool: {other}") }),
     }
 }
+
+#[cfg(test)]
+mod spatial_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    /// `BI-16` part C3 (T10): the function list the assistant reads has both
+    /// spatial functions, with their help.
+    #[test]
+    fn list_formula_functions_lists_distance_and_region_of() {
+        let listed = super::list_formula_functions();
+        let functions = listed["functions"].as_array().expect("the function list");
+        for name in ["Distance", "RegionOf"] {
+            let entry = functions
+                .iter()
+                .find(|f| f["name"] == name)
+                .unwrap_or_else(|| panic!("{name} is not listed"));
+            assert_eq!(entry["category"], "spatial");
+            assert!(
+                entry["signature"]
+                    .as_str()
+                    .is_some_and(|s| s.starts_with(name))
+            );
+        }
+    }
+}
