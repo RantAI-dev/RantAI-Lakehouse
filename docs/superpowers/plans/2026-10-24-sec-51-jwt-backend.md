@@ -64,7 +64,77 @@ Any other dependency bump, `SEC-41` (sqlx), removing `rsa`.
 
 ## Handoff
 
-(developer appends here)
+### Developer: T1 committed, T2 blocked by the disk guard
+
+Worktree `/home/shiro/rantai/wt-sec51`, branch `fix/sec-51-jwt-backend`,
+base `origin/main` at `c3468ed5`. The two edits the previous (lost) session
+left uncommitted in `rust/Cargo.toml` and
+`rust/crates/lakehouse-api/Cargo.toml` were kept as they were.
+
+**T1 — commit `3cb827a`** (`build(deps): switch jsonwebtoken to the
+aws-lc-rs backend (SEC-51)`; decisions 1-3):
+
+- `cargo update -p jsonwebtoken --precise 11.1.0` (no compile) wrote the
+  new lockfile.
+- `git diff --stat rust/Cargo.lock`: `1 file changed, 10 insertions(+),
+  198 deletions(-)`.
+- Removed packages (16): `base16ct`, `crypto-bigint` 0.5.5,
+  `curve25519-dalek`, `curve25519-dalek-derive`, `ecdsa`, `ed25519`,
+  `ed25519-dalek`, `elliptic-curve`, `ff`, `fiat-crypto`, `group`,
+  `p256`, `p384`, `primeorder`, `rfc6979`, `sec1`.
+- `grep -c 'name = "crypto-bigint"' rust/Cargo.lock` -> `0`.
+- `cargo deny check advisories` -> `advisories ok`, exit 0. It also prints
+  `warning[advisory-not-detected]` for the existing `RUSTSEC-2026-0381`
+  ignore at `rust/deny.toml:74`; that is the config's own warning, not this
+  diff (nothing in `deny.toml` changed).
+- `cargo fmt --check` -> OK.
+- `/home/shiro/rantai/bin/cargo-locked check -j 2 -p lakehouse-auth
+  -p lakehouse-api --all-targets` -> exit 0, `Finished ... in 3m 48s`.
+
+**Decision 2 mismatch — needs the planner.** The lock diff is not
+removals-only. `aws-lc-rs`'s default features (`ring-io`,
+`ring-sig-verify`) became active with `jsonwebtoken`'s `aws_lc_rs` feature
+(upstream enables `aws-lc-rs` with its defaults and offers no switch), so
+the lock gains exactly one package entry:
+
+```text
+[[package]]
+name = "untrusted"
+version = "0.7.1"
+```
+
+no dependencies, 4 lines. No crate changes version; the rest of the diff is
+dependency-edge movement (`jsonwebtoken`, `aws-lc-rs`, `generic-array`
+dropping `zeroize`) or the `untrusted 0.9.0` disambiguation for
+`ring`/`rustls`. Avoiding it would need a `[patch]` or an upstream
+`default-features = false`, both outside this plan; I did not edit decision
+2 and did not add anything else.
+
+**T2 — what ran before the stop:**
+
+- `/home/shiro/rantai/bin/cargo-locked test -j 2 -p lakehouse-auth` ->
+  exit 0, 8 test binaries, **133 passed, 0 failed, 1 ignored** (the 63 s
+  binary is `oidc.rs`'s wiremock `/jwks` + `/token` round trip).
+- `cargo test -j 2 -p lakehouse-api saas` was still compiling
+  `lakehouse-api` when the stop happened; no test from it ran.
+
+**Not verified, and why:** the `lakehouse-api` runs filtered to `saas`,
+`secret_manager` and `oidc`, the workspace clippy
+(`-j 2 --workspace --all-targets --all-features -- -D warnings`) and
+`cargo test -j 2 --workspace` were not run. `df -h /` fell from 129 GB
+free at the start to 2.3 GB free (100 % used) during the session, while a
+concurrent full review run was using the same machine; the machine rule
+stops work below 15 GB free, so I terminated my own background chain and
+stopped. I did not touch any other worktree, process, container, image or
+volume, and ran no `cargo clean`. The T2 `CHANGELOG.md` line is written in
+the worktree but **uncommitted** for the same reason: it sits first under
+`## [Unreleased]` / `### Security`, says the lock loses 16 package entries
+and gains `untrusted` 0.7.1, and names the algorithms the existing tests
+cover.
+
+Restart once free space is back: run the three `lakehouse-api` filters,
+then the workspace clippy and `cargo test --workspace`, then commit the
+`CHANGELOG.md` line as T2. `BACKLOG.md` was not touched.
 
 ## Review
 
