@@ -57,7 +57,7 @@ use super::dashboards::refused;
 use crate::routes::dashboard::{self, IdQuery};
 use crate::routes::dashboard_organise::{
     drop_tile, place_new_chart, require_board, require_chart_board, require_editable_chart,
-    snapshot, viewer_of,
+    snapshot,
 };
 use crate::state::AppState;
 
@@ -209,7 +209,11 @@ pub(super) async fn arrange_board(
     // Merge of main into phase 3: a dashboard the caller cannot see (in the
     // trash, in somebody else's personal space, unknown) is "not found" before
     // anything of it is read.
-    let viewer = viewer_of(principal);
+    // BI-19 B1 review R1: the resolved viewer (rules and restrictions), not the baseline.
+    let viewer = match super::viewer_for_write(state, Some(principal)).await {
+        Ok(viewer) => viewer,
+        Err(error) => return error,
+    };
     if board != store::DEFAULT_BOARD_ID
         && let Err(gate) = require_board(&state.clickhouse, &board, &viewer).await
     {
@@ -362,7 +366,11 @@ pub(super) async fn move_chart(
     }
 
     let ch = &state.clickhouse;
-    let viewer = viewer_of(principal);
+    // BI-19 B1 review R1: the resolved viewer (rules and restrictions), not the baseline.
+    let viewer = match super::viewer_for_write(state, Some(principal)).await {
+        Ok(viewer) => viewer,
+        Err(error) => return error,
+    };
     // A chart in the trash or on a board the caller cannot see, and a target
     // in the trash or in somebody else's personal space, are "not found".
     if let Err(gate) = require_editable_chart(ch, &id, &viewer).await {

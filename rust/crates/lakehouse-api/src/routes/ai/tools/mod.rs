@@ -57,6 +57,7 @@ mod tabs;
 
 use axum::response::{IntoResponse, Response};
 use lakehouse_auth::Principal;
+use lakehouse_bi::access::Viewer;
 use serde_json::{Map, Value, json};
 
 use super::registry;
@@ -160,23 +161,37 @@ pub(in crate::routes) async fn run_tool(
         "get_build_status" => pipelines::get_build_status(&state.dagster).await,
         "describe_mart" => data::describe_mart(state, principal, args).await,
         "create_chart" | "update_chart" => {
+            // BI-19 B1 review R1: the chart gates read as the resolved viewer.
+            let viewer = match viewer_for_write(state, principal).await {
+                Ok(viewer) => viewer,
+                Err(error) => return error,
+            };
             // BI-9: a chart's SQL is built with the report time zone (a deployment setting).
             let Ok(time) = crate::routes::settings::time_context(state).await else {
                 // The cause was logged under a reference by `time_context`.
                 return json!({ "error": "The reporting settings could not be read." });
             };
             if name == "create_chart" {
-                dashboards::create_chart(ch, principal, args, None, &time).await
+                dashboards::create_chart(ch, &viewer, principal, args, None, &time).await
             } else {
-                dashboards::update_chart(ch, principal, args, &time).await
+                dashboards::update_chart(ch, &viewer, principal, args, &time).await
             }
         }
         "create_board" => dashboards::create_board(ch, principal, args).await,
-        "list_boards" => dashboards::list_boards(ch, principal).await,
+        "list_boards" => match viewer_for(state, principal).await {
+            Ok(viewer) => dashboards::list_boards(ch, &viewer).await,
+            Err(error) => error,
+        },
         "suggest_dashboard" => dashboards::suggest_dashboard(ch).await,
-        "list_charts" => dashboards::list_charts(ch, principal).await,
+        "list_charts" => match viewer_for(state, principal).await {
+            Ok(viewer) => dashboards::list_charts(ch, &viewer).await,
+            Err(error) => error,
+        },
         "list_sql_sources" | "suggest_join" => dashboards::chart_sources(ch, name, args).await,
-        "delete_chart" => dashboards::delete_chart(ch, principal, args).await,
+        "delete_chart" => match viewer_for_write(state, principal).await {
+            Ok(viewer) => dashboards::delete_chart(ch, &viewer, principal, args).await,
+            Err(error) => error,
+        },
         n if look::handles(n) => look::run(state, principal, name, args).await,
         n if export::handles(n) => export::run(state, principal, name, args).await,
         n if reports::handles(n) => reports::run(state, principal, name, args).await,
@@ -244,6 +259,42 @@ pub(in crate::routes) async fn run_tool(
             )
         }
     }
+}
+
+/// Who a dashboard tool reads as: the caller's viewer after their rules, the
+/// restrictions and their starting point (`BI-19` B1 review R1; before this the
+/// tools used the baseline and showed a restricted dashboard to any
+/// `dashboard:read` holder). With nobody attached the viewer is anonymous (no
+/// personal space, nothing in the trash). A refusal or a store failure is a
+/// tool error with no fallback to the baseline; the error text is the
+/// classified `ApiError` one (SEC-11).
+pub(super) async fn viewer_for(
+    state: &AppState,
+    principal: Option<&Principal>,
+) -> Result<Viewer, Value> {
+    let Some(principal) = principal else {
+        return Ok(Viewer::anonymous());
+    };
+    crate::routes::dashboard_access::viewer_for(state, principal)
+        .await
+        .map_err(|err| json!({ "error": err.to_string() }))
+}
+
+/// [`viewer_for`] for the tools that write (create, update and delete a chart,
+/// arrange a board, move a chart, the tab tools): the tool's own gate asks for
+/// `dashboard:write`, so the starting point is the write one, exactly as for the
+/// write routes (`dashboard_access::viewer_for_write`, `BI-19` B1 review R5).
+/// A restricted dashboard stays out of reach for somebody the rules leave out.
+pub(super) async fn viewer_for_write(
+    state: &AppState,
+    principal: Option<&Principal>,
+) -> Result<Viewer, Value> {
+    let Some(principal) = principal else {
+        return Ok(Viewer::anonymous());
+    };
+    crate::routes::dashboard_access::viewer_for_write(state, principal)
+        .await
+        .map_err(|err| json!({ "error": err.to_string() }))
 }
 
 /// Checks a chart call before the gate offers it as a draft (plan 18). `None`

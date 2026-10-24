@@ -39,7 +39,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use super::{api_result_to_value, arg_str};
 use crate::routes::dashboard;
-use crate::routes::dashboard_organise::{require_editable_chart, snapshot_as, viewer_of};
+use crate::routes::dashboard_organise::{require_editable_chart, snapshot_as};
 use crate::state::AppState;
 use crate::upstream_error;
 
@@ -319,7 +319,11 @@ async fn format_chart(
         return json!({ "error": "chart is required (an id from list_charts)." });
     }
     let ch = &state.clickhouse;
-    let viewer: Viewer = principal.map_or_else(Viewer::anonymous, viewer_of);
+    // BI-19 B1 review R1: the resolved viewer, not the baseline.
+    let viewer: Viewer = match super::viewer_for_write(state, principal).await {
+        Ok(viewer) => viewer,
+        Err(error) => return error,
+    };
     // A chart in the trash, one purged for good, or one on somebody else's
     // personal board cannot be edited, and all three answer like a chart
     // that never existed.

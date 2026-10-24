@@ -14,16 +14,9 @@ use super::arg_str;
 use super::look::{FORMAT_FIELDS, check_layers_name_a_source, wrong_field};
 use crate::routes::dashboard_organise::{
     Gate, drop_tile, place_new_chart, require_chart_board, require_editable_chart, snapshot_as,
-    viewer_of,
 };
 use crate::routes::support::is_numeric_type;
 use crate::upstream_error;
-
-/// Who the tools read as: the signed-in person, or nobody in particular when
-/// none is attached (fail closed: no personal space, nothing in the trash).
-fn viewer_for(principal: Option<&Principal>) -> Viewer {
-    principal.map_or_else(Viewer::anonymous, viewer_of)
-}
 
 /// The tool's error for a refused dashboard or chart: the route's own
 /// sentence, or, for a store that could not be read, the fixed message with
@@ -216,6 +209,7 @@ fn tab_of_chart<'a>(board: &'a store::Board, chart_id: &str) -> Option<&'a str> 
 
 pub(super) async fn create_chart(
     ch: &ChClient,
+    viewer: &Viewer,
     principal: Option<&Principal>,
     args: &Map<String, Value>,
     id: Option<String>,
@@ -253,8 +247,7 @@ pub(super) async fn create_chart(
     }
     // BI-18 part C, part 2: not onto a dashboard in the trash or in somebody
     // else's personal space.
-    if let Err(err) = require_chart_board(ch, input.board.as_deref(), &viewer_for(principal)).await
-    {
+    if let Err(err) = require_chart_board(ch, input.board.as_deref(), viewer).await {
         return refused(err);
     }
     match store::spec_from_input(ch, &input, ChartSource::Ai, "ai", id, time).await {
@@ -324,6 +317,7 @@ pub(super) async fn check_chart_draft(
 
 pub(super) async fn update_chart(
     ch: &ChClient,
+    viewer: &Viewer,
     principal: Option<&Principal>,
     args: &Map<String, Value>,
     time: &lakehouse_bi::grain::TimeContext,
@@ -336,8 +330,7 @@ pub(super) async fn update_chart(
     // the chart's stored definition and the board it is on.
     // BI-18 part C, part 2: a chart in the trash or on somebody else's
     // personal board cannot be edited, nor moved onto such a board.
-    let viewer = viewer_for(principal);
-    let old_board = match require_editable_chart(ch, &id, &viewer).await {
+    let old_board = match require_editable_chart(ch, &id, viewer).await {
         Ok(board) => board,
         Err(gate) => return refused(gate),
     };
@@ -345,7 +338,7 @@ pub(super) async fn update_chart(
     // chart the caller may not see, so this reads only what the caller may.
     // The read is boxed, so this future does not carry every chart on the
     // board.
-    let kept = match Box::pin(kept_formatting(ch, &viewer, Some(id.as_str()), args)).await {
+    let kept = match Box::pin(kept_formatting(ch, viewer, Some(id.as_str()), args)).await {
         Ok(kept) => kept,
         Err(reply) => return reply,
     };
@@ -358,7 +351,7 @@ pub(super) async fn update_chart(
     if let Err(sentence) = check_layers_name_a_source(&input) {
         return json!({ "error": sentence });
     }
-    if let Err(err) = require_chart_board(ch, input.board.as_deref(), &viewer).await {
+    if let Err(err) = require_chart_board(ch, input.board.as_deref(), viewer).await {
         return refused(err);
     }
     // The chart stays on the board it is on when the call does not name one:
@@ -431,8 +424,9 @@ pub(super) async fn create_board(
     }
 }
 
-pub(super) async fn list_boards(ch: &ChClient, principal: Option<&Principal>) -> Value {
-    match store::list_boards(ch, &viewer_for(principal)).await {
+/// `viewer` is the caller's resolved one (`super::viewer_for`, `BI-19` B1 review R1).
+pub(super) async fn list_boards(ch: &ChClient, viewer: &Viewer) -> Value {
+    match store::list_boards(ch, viewer).await {
         Ok(boards) => {
             let mut out = vec![json!({ "id": "default", "name": "Main" })];
             // BI-18 part C: a board's tabs, when it has any, so the assistant can name them.
@@ -496,15 +490,15 @@ pub(super) async fn suggest_dashboard(ch: &ChClient) -> Value {
     json!({ "marts": out })
 }
 
-pub(super) async fn list_charts(ch: &ChClient, principal: Option<&Principal>) -> Value {
-    let viewer = viewer_for(principal);
-    let charts = match store::list_stored_charts(ch, &viewer).await {
+/// `viewer` is the caller's resolved one (`super::viewer_for`, `BI-19` B1 review R1).
+pub(super) async fn list_charts(ch: &ChClient, viewer: &Viewer) -> Value {
+    let charts = match store::list_stored_charts(ch, viewer).await {
         Ok(charts) => charts,
         Err(err) => return upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json(),
     };
     // The boards, for the tab each chart sits on. A board the viewer may not
     // see is not in the list, so its charts are listed without a tab.
-    let boards = match store::list_boards(ch, &viewer).await {
+    let boards = match store::list_boards(ch, viewer).await {
         Ok(boards) => boards,
         Err(err) => return upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json(),
     };
@@ -619,6 +613,7 @@ pub(super) async fn list_sql_sources(ch: &ChClient) -> Value {
 
 pub(super) async fn delete_chart(
     ch: &ChClient,
+    viewer: &Viewer,
     principal: Option<&Principal>,
     args: &Map<String, Value>,
 ) -> Value {
@@ -629,7 +624,7 @@ pub(super) async fn delete_chart(
     // BI-18 part C, part 2: a chart the person cannot see is answered like one
     // that does not exist, and nothing is deleted. A deleted chart goes to the
     // trash, restorable for 30 days.
-    let board = match require_editable_chart(ch, &id, &viewer_for(principal)).await {
+    let board = match require_editable_chart(ch, &id, viewer).await {
         Ok(board) => board,
         Err(gate) => return refused(gate),
     };
@@ -653,6 +648,15 @@ mod tests {
 
     use super::*;
 
+    /// The tests' stand-in for `super::viewer_for`: the baseline reading, as
+    /// no rule exists in a unit test.
+    fn as_viewer(principal: Option<&Principal>) -> Viewer {
+        principal.map_or_else(
+            Viewer::anonymous,
+            crate::routes::dashboard_organise::viewer_of,
+        )
+    }
+
     /// SEC-11: the assistant's dashboard tools never relay `ClickHouse`'s
     /// text; they return a fixed message and a reference id.
     #[tokio::test]
@@ -667,10 +671,10 @@ mod tests {
         let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
 
         for result in [
-            list_boards(&ch, None).await,
-            list_charts(&ch, None).await,
+            list_boards(&ch, &as_viewer(None)).await,
+            list_charts(&ch, &as_viewer(None)).await,
             suggest_dashboard(&ch).await,
-            delete_chart(&ch, None, &{
+            delete_chart(&ch, &as_viewer(None), None, &{
                 let mut a = Map::new();
                 a.insert("id".to_owned(), json!("c1"));
                 a
@@ -763,9 +767,9 @@ mod tests {
         let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
         let me = person(7);
         let id = uuid::Uuid::from_u128(7).to_string();
-        let _ = list_boards(&ch, Some(&me)).await;
-        let _ = list_charts(&ch, Some(&me)).await;
-        let _ = list_boards(&ch, None).await;
+        let _ = list_boards(&ch, &as_viewer(Some(&me))).await;
+        let _ = list_charts(&ch, &as_viewer(Some(&me))).await;
+        let _ = list_boards(&ch, &as_viewer(None)).await;
         let all = sent(&server).await;
         let boards: Vec<&String> = all
             .iter()
@@ -822,7 +826,7 @@ mod tests {
         let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
         let mut args = Map::new();
         args.insert("id".to_owned(), json!("c_private"));
-        let reply = delete_chart(&ch, Some(&person(7)), &args).await;
+        let reply = delete_chart(&ch, &as_viewer(Some(&person(7))), Some(&person(7)), &args).await;
         assert_eq!(reply["error"], json!("this tile does not exist"), "{reply}");
         assert!(reply.get("deleted").is_none(), "{reply}");
         let all = sent(&server).await;
@@ -844,7 +848,7 @@ mod tests {
         let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
         let mut args = Map::new();
         args.insert("id".to_owned(), json!("c_missing"));
-        let reply = delete_chart(&ch, Some(&person(7)), &args).await;
+        let reply = delete_chart(&ch, &as_viewer(Some(&person(7))), Some(&person(7)), &args).await;
         assert_eq!(reply["error"], json!("this tile does not exist"), "{reply}");
         assert!(reply.get("deleted").is_none(), "{reply}");
         assert_eq!(
@@ -866,7 +870,7 @@ mod tests {
         let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
         let mut args = Map::new();
         args.insert("id".to_owned(), json!("c_mine"));
-        let reply = delete_chart(&ch, Some(&person(7)), &args).await;
+        let reply = delete_chart(&ch, &as_viewer(Some(&person(7))), Some(&person(7)), &args).await;
         assert_eq!(reply["deleted"], json!(true));
         let all = sent(&server).await;
         let copy = writes(&all)
@@ -900,6 +904,7 @@ mod tests {
         }
         let reply = create_chart(
             &ch,
+            &as_viewer(Some(&person(7))),
             Some(&person(7)),
             &args,
             None,
@@ -962,6 +967,7 @@ mod tests {
         let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
         let reply = create_chart(
             &ch,
+            &as_viewer(None),
             None,
             &arguments(json!({
                 "title": "Visitors", "kind": "bar", "mart": "mart_x",
@@ -995,6 +1001,7 @@ mod tests {
         let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
         let created = create_chart(
             &ch,
+            &as_viewer(None),
             None,
             &arguments(json!({
                 "title": "Visitors", "kind": "bar", "mart": "mart_x",
@@ -1016,6 +1023,7 @@ mod tests {
         let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
         let created = create_chart(
             &ch,
+            &as_viewer(None),
             None,
             &arguments(json!({
                 "title": "Visitors", "kind": "bar", "mart": "mart_x",
@@ -1061,7 +1069,8 @@ mod tests {
             }
             let server = mart_server().await;
             let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
-            let created = create_chart(&ch, None, &arguments(body), None, &time).await;
+            let created =
+                create_chart(&ch, &as_viewer(None), None, &arguments(body), None, &time).await;
             assert_eq!(created["created"], json!(true), "{kind}: {created}");
             let all = sent(&server).await;
             let stored = writes(&all);
@@ -1079,6 +1088,7 @@ mod tests {
         let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
         let reply = create_chart(
             &ch,
+            &as_viewer(None),
             None,
             &arguments(json!({
                 "title": "Visitors against 1,000,000", "kind": "progress", "mart": "mart_x",
@@ -1105,6 +1115,7 @@ mod tests {
         // A goal that is a second value, and a goal that is missing.
         let valued = create_chart(
             &ch,
+            &as_viewer(None),
             None,
             &arguments(json!({
                 "title": "Against target", "kind": "progress", "mart": "mart_x",
@@ -1117,6 +1128,7 @@ mod tests {
         assert_eq!(valued["created"], json!(true), "{valued}");
         let none = create_chart(
             &ch,
+            &as_viewer(None),
             None,
             &arguments(json!({
                 "title": "No goal", "kind": "progress", "mart": "mart_x", "measures": ["visitors"],
@@ -1140,6 +1152,7 @@ mod tests {
         let time = lakehouse_bi::grain::TimeContext::default();
         let auto = create_chart(
             &ch,
+            &as_viewer(None),
             None,
             &arguments(json!({
                 "title": "How hotel prices are spread", "kind": "histogram", "mart": "mart_x",
@@ -1152,6 +1165,7 @@ mod tests {
         assert_eq!(auto["created"], json!(true), "{auto}");
         let ten = create_chart(
             &ch,
+            &as_viewer(None),
             None,
             &arguments(json!({
                 "title": "In ten ranges", "kind": "histogram", "mart": "mart_x",
@@ -1185,7 +1199,8 @@ mod tests {
                 .as_object_mut()
                 .unwrap()
                 .extend(extra.as_object().unwrap().clone());
-            let reply = create_chart(&ch, None, &arguments(input), None, &time).await;
+            let reply =
+                create_chart(&ch, &as_viewer(None), None, &arguments(input), None, &time).await;
             assert!(
                 reply["error"].as_str().unwrap().contains(sentence),
                 "{reply}"
@@ -1201,6 +1216,7 @@ mod tests {
         let time = lakehouse_bi::grain::TimeContext::default();
         let bullet = create_chart(
             &ch,
+            &as_viewer(None),
             None,
             &arguments(json!({
                 "title": "Visitors against target", "kind": "bullet", "mart": "mart_x",
@@ -1214,6 +1230,7 @@ mod tests {
         assert_eq!(bullet["created"], json!(true), "{bullet}");
         let bar = create_chart(
             &ch,
+            &as_viewer(None),
             None,
             &arguments(json!({
                 "title": "t", "kind": "bar", "mart": "mart_x", "dimension": "province",
@@ -1239,6 +1256,7 @@ mod tests {
         let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
         let reply = create_chart(
             &ch,
+            &as_viewer(None),
             None,
             &arguments(json!({
                 "title": "Visitors against target", "kind": "bullet", "mart": "mart_x",
@@ -1271,6 +1289,7 @@ mod tests {
         }));
         let reply = create_chart(
             &ch,
+            &as_viewer(None),
             None,
             &args,
             None,
@@ -1301,6 +1320,7 @@ mod tests {
         let allowed = sites(&["https://img.example"]);
         let created = create_chart(
             &ch,
+            &as_viewer(None),
             None,
             &image("https://img.example/logo.png"),
             None,
@@ -1313,7 +1333,8 @@ mod tests {
             "http://img.example/logo.png",
             "https://img.example@evil.example/logo.png",
         ] {
-            let refused = create_chart(&ch, None, &image(url), None, &allowed).await;
+            let refused =
+                create_chart(&ch, &as_viewer(None), None, &image(url), None, &allowed).await;
             assert_eq!(
                 refused["error"],
                 json!(lakehouse_bi::types_b::CONTENT_SITE_REFUSED),
@@ -1324,6 +1345,7 @@ mod tests {
         // With no site listed nothing can be created; update_chart is checked too.
         let none = create_chart(
             &ch,
+            &as_viewer(None),
             None,
             &image("https://img.example/logo.png"),
             None,
@@ -1342,13 +1364,14 @@ mod tests {
         .await;
         let mut update = image("https://other.example/logo.png");
         update.insert("id".to_owned(), json!("c_1"));
-        let refused = update_chart(&ch, None, &update, &allowed).await;
+        let refused = update_chart(&ch, &as_viewer(None), None, &update, &allowed).await;
         assert_eq!(
             refused["error"],
             json!(lakehouse_bi::types_b::CONTENT_SITE_REFUSED)
         );
         let web = create_chart(
             &ch,
+            &as_viewer(None),
             None,
             &arguments(
                 json!({ "title": "Status", "kind": "web", "url": "https://img.example/status" }),
@@ -1457,6 +1480,7 @@ mod tests {
         let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
         let reply = update_chart(
             &ch,
+            &as_viewer(Some(&person(7))),
             Some(&person(7)),
             &rename_call(json!({})),
             &lakehouse_bi::grain::TimeContext::default(),
@@ -1488,6 +1512,7 @@ mod tests {
         let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
         let reply = update_chart(
             &ch,
+            &as_viewer(Some(&person(7))),
             Some(&person(7)),
             &rename_call(json!({ "colors": null })),
             &lakehouse_bi::grain::TimeContext::default(),
@@ -1517,6 +1542,7 @@ mod tests {
         let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
         let reply = update_chart(
             &ch,
+            &as_viewer(Some(&person(7))),
             Some(&person(7)),
             &rename_call(json!({ "kind": "table" })),
             &lakehouse_bi::grain::TimeContext::default(),
@@ -1549,7 +1575,14 @@ mod tests {
         let args = rename_call(json!({}));
         let time = lakehouse_bi::grain::TimeContext::default();
         let draft = check_chart_draft(&ch, &args, Some("c_1".to_owned()), &time).await;
-        let saved = update_chart(&ch, Some(&person(7)), &args, &time).await;
+        let saved = update_chart(
+            &ch,
+            &as_viewer(Some(&person(7))),
+            Some(&person(7)),
+            &args,
+            &time,
+        )
+        .await;
         let draft = draft.expect("the draft is refused");
         assert_eq!(
             draft["error"],
@@ -1579,6 +1612,7 @@ mod tests {
         args.remove("mart");
         let reply = update_chart(
             &ch,
+            &as_viewer(Some(&person(7))),
             Some(&person(7)),
             &args,
             &lakehouse_bi::grain::TimeContext::default(),
@@ -1607,6 +1641,7 @@ mod tests {
         let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
         let reply = update_chart(
             &ch,
+            &as_viewer(Some(&person(7))),
             Some(&person(7)),
             &rename_call(json!({ "mart": null })),
             &lakehouse_bi::grain::TimeContext::default(),
@@ -1637,6 +1672,7 @@ mod tests {
         args.remove("mart");
         let reply = update_chart(
             &ch,
+            &as_viewer(Some(&person(7))),
             Some(&person(7)),
             &args,
             &lakehouse_bi::grain::TimeContext::default(),
@@ -1668,6 +1704,7 @@ mod tests {
         args.remove("mart");
         let reply = update_chart(
             &ch,
+            &as_viewer(Some(&person(7))),
             Some(&person(7)),
             &args,
             &lakehouse_bi::grain::TimeContext::default(),
@@ -1745,7 +1782,7 @@ mod tests {
         .await;
         rest(&server).await;
         let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
-        let reply = list_charts(&ch, Some(&person(7))).await;
+        let reply = list_charts(&ch, &as_viewer(Some(&person(7)))).await;
         let chart = &reply["charts"][0];
         assert_eq!(chart["board"], json!("b_board"), "{reply}");
         assert_eq!(chart["tab"], json!("tab_a"), "{reply}");
@@ -1770,7 +1807,7 @@ mod tests {
         }))
         .await;
         let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
-        let reply = list_charts(&ch, Some(&person(7))).await;
+        let reply = list_charts(&ch, &as_viewer(Some(&person(7)))).await;
         let chart = &reply["charts"][0];
         assert_eq!(
             chart["style"]["format"],
@@ -1810,7 +1847,7 @@ mod tests {
         }))
         .await;
         let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
-        let reply = list_charts(&ch, Some(&person(7))).await;
+        let reply = list_charts(&ch, &as_viewer(Some(&person(7)))).await;
         let chart = &reply["charts"][0];
         assert_eq!(chart["style"], json!({}), "{reply}");
         assert!(chart.get("referenceLines").is_none(), "{reply}");
