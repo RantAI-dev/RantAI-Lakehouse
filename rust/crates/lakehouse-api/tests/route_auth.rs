@@ -2758,3 +2758,42 @@ async fn the_embed_values_and_settings_routes_are_gated_in_both_directions() {
         resp.status()
     );
 }
+
+// ── Query limits (BI-5) ─────────────────────────────────────────────────
+
+/// `GET /api/settings/limits` is open to any login and `PUT` needs
+/// `settings:write`, asserted both ways: a principal without it is refused
+/// the write (403) and nothing is stored, one holding it alone is past the
+/// gate (an empty body then answers 400, not 401/403), and a principal with
+/// no permission at all may still read.
+#[tokio::test]
+async fn the_query_limits_routes_are_gated_in_both_directions() {
+    let TestApp { router, pool } = common::spin_up().await;
+    let plain = create_principal_with_permissions(&pool, "dashboard:read").await;
+    let admin = create_principal_with_permissions(&pool, "settings:write").await;
+    let plain_cookie = session_cookie_for_user(&pool, plain).await;
+    let admin_cookie = session_cookie_for_user(&pool, admin).await;
+
+    let read = request_with_cookie(&router, "GET", "/api/settings/limits", &plain_cookie).await;
+    assert_eq!(read.status(), StatusCode::OK, "any login may read");
+    let refused = request_with_cookie(&router, "PUT", "/api/settings/limits", &plain_cookie).await;
+    assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+    let reached = request_with_cookie(&router, "PUT", "/api/settings/limits", &admin_cookie).await;
+    assert_eq!(
+        reached.status(),
+        StatusCode::BAD_REQUEST,
+        "settings:write reaches the handler, which refuses the empty body"
+    );
+    let anonymous = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/settings/limits")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("router answers");
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+}

@@ -36,6 +36,7 @@ mod pipeline_lag;
 mod pipeline_source;
 mod policy;
 mod policy_engine;
+mod query_limits;
 mod routes;
 mod rustfs_client;
 mod secret_crypto;

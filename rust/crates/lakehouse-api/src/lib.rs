@@ -52,6 +52,7 @@ pub mod pipeline_lag;
 pub mod pipeline_source;
 pub mod policy;
 pub mod policy_engine;
+pub mod query_limits;
 pub mod routes;
 pub mod rustfs_client;
 pub mod secret_crypto;

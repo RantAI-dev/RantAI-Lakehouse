@@ -61,6 +61,7 @@ mod quality_incidents;
 mod quality_load;
 mod quality_schedules;
 mod query;
+mod query_limits;
 mod schema_changes;
 pub(crate) mod schema_versions;
 mod settings;
@@ -1273,6 +1274,12 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/settings/reporting",
             get(settings::get_reporting).put(settings::put_reporting),
+        )
+        // Time and row limits of charts and Query Studio (`BI-5`); see
+        // `routes::query_limits`.
+        .route(
+            "/api/settings/limits",
+            get(query_limits::get_limits).put(query_limits::put_limits),
         )
         // Phase 2 identity domain.
         .merge(identity_router())
