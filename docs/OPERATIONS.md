@@ -1224,11 +1224,18 @@ token. Entra's issuer and endpoints are per tenant:
 **Limits.** Entra's `groups` claim carries group **object ids** (GUIDs), not
 names, so `OIDC_ROLE_MAP` keys are those GUIDs. When a user is in more groups
 than the claim can hold, Entra replaces the claim with an overage marker
-(`_claim_names`/`_claim_sources`, or `hasgroups`) and the group list must be
-fetched from Microsoft Graph instead — the console does not follow that, so a
-role mapping for such a user silently does not apply. (Microsoft docs:
+(`_claim_names`/`_claim_sources`, or `hasgroups` in the implicit flow) and
+the group list must be fetched from Microsoft Graph instead — the console
+does not follow that. `SEC-39` makes the case visible rather than silent:
+the code flow this deployment uses carries `_claim_names`, so the sign-in
+still succeeds, a `warn` line records the user and provider (never the
+token or the claim source), and the console shows: "Your account is in more
+groups than the sign-in token can list, so no group-based role was applied.
+Ask an administrator to assign your role directly or to limit the groups
+sent in the token." Following the Graph link to apply the mapped role
+remains the full fix and is not built. (Microsoft docs:
 <https://learn.microsoft.com/en-us/entra/identity-platform/access-token-claims-reference>,
-the `groups` and overage claims.) Backlog `SEC-39` makes this case visible.
+the `groups` and overage claims.)
 
 ### Google
 

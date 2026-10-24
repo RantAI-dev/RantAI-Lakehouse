@@ -41,6 +41,9 @@
 //! * JIT provisioning is opt-in, default off — [`OidcConfig::jit_provisioning`].
 //! * Claim-to-role mapping — [`OidcAuthenticator::mapped_permissions`]; see
 //!   its doc comment for the union-with-local-roles precedence rule and why.
+//! * A group overage is said, not silent — [`OidcClaims::has_claim_overage`]
+//!   detects the marker a provider sends instead of the groups claim, and
+//!   [`OidcLogin::notice`] carries the caveat the console shows (`SEC-39`).
 
 use std::collections::HashMap;
 use std::sync::RwLock;
@@ -108,6 +111,13 @@ const DEFAULT_JWKS_TTL: StdDuration = StdDuration::from_secs(300);
 /// keys at a `jwks_uri` named there; neither serves a key set at the
 /// `{issuer}/.well-known/jwks.json` path this module used to assume.
 const DISCOVERY_PATH: &str = "/.well-known/openid-configuration";
+
+/// The claim `OpenID Connect` providers use to say that another claim's
+/// values did not fit in the token and live in a separate source instead —
+/// Entra ID's "overage". `_claim_names` names the claim (and a source
+/// key), `_claim_sources` holds the source's location. `SEC-39` reads only
+/// the presence of the marker, never the source it names.
+const CLAIM_NAMES: &str = "_claim_names";
 
 /// The default `leeway` (in seconds) applied to `exp`/`nbf` validation when
 /// [`OidcConfig::clock_skew_seconds`] is not overridden. Matches
@@ -591,6 +601,61 @@ impl OidcClaims {
             _ => Vec::new(),
         }
     }
+
+    /// Whether `claim_name` was replaced by an overage marker: the token
+    /// carries `_claim_names` with a member named `claim_name`, and the
+    /// values live in the source it names instead of in the claim itself
+    /// (`SEC-39`; Entra ID's "group overage"). The marker's source URL in
+    /// `_claim_sources` is deliberately never read or logged — following it
+    /// is the Microsoft Graph call that is out of scope.
+    ///
+    /// A marker for a different claim (say `roles` while this deployment
+    /// maps `groups`) is not an overage here: [`Self::groups`] would have
+    /// found the claim itself.
+    fn has_claim_overage(&self, claim_name: &str) -> bool {
+        self.extra
+            .get(CLAIM_NAMES)
+            .and_then(Value::as_object)
+            .is_some_and(|names| names.contains_key(claim_name))
+    }
+}
+
+/// A caveat about a browser sign-in that nevertheless succeeded (`SEC-39`).
+///
+/// The API sends [`Self::code`] to the console and the console owns the
+/// sentence (`src/features/auth/sso-notice.tsx`), so the wording lives in
+/// exactly one place and a code cannot drift into prose on one side only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignInNotice {
+    /// The provider replaced the groups claim with an overage marker, so
+    /// no group-based role could be mapped for this sign-in. Signing in
+    /// still succeeds: refusing would lock out a user who also holds roles
+    /// granted in the console (`SEC-39`, decision 2).
+    GroupOverage,
+}
+
+impl SignInNotice {
+    /// The fixed code the console maps to its own sentence.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::GroupOverage => "group_overage",
+        }
+    }
+}
+
+/// What [`OidcAuthenticator::authenticate_with_nonce`] resolved for a
+/// browser sign-in: the principal, the role names its groups mapped to, and
+/// any caveat the console should show (`SEC-39`).
+#[derive(Debug)]
+pub struct OidcLogin {
+    /// The authenticated user.
+    pub principal: Principal,
+    /// The role names mapped from the token's groups — persisted onto the
+    /// session row by `routes::auth::oidc_callback`.
+    pub mapped_role_names: Vec<String>,
+    /// The caveat to show to the user, if this sign-in had one.
+    pub notice: Option<SignInNotice>,
 }
 
 /// [`Authenticator`] for [`Credential::Bearer`] — the concrete `OIDC`
@@ -744,15 +809,25 @@ impl OidcAuthenticator {
     ///
     /// # Return value
     ///
-    /// Also returns the mapped role NAMES [`Self::mapped_role_names`]
-    /// computed for this login (empty when [`OidcConfig::role_map`] is
-    /// unset or none of `claims`' groups matched it) — the caller
-    /// (`routes::auth::oidc_callback`) persists these on the new session
-    /// row so [`crate::session::validate_session`] can keep resolving them
-    /// on every later request, per `mapped_permissions`' own doc comment
-    /// ("for the lifetime of that login"). The returned [`Principal`]'s
-    /// permissions already include them for this one response, same as
-    /// before — the session-row copy is for every request after this one.
+    /// An [`OidcLogin`]: the [`Principal`] (whose permissions already
+    /// include this login's mapped roles for this one response), the mapped
+    /// role NAMES [`Self::mapped_role_names`] computed for this login
+    /// (empty when [`OidcConfig::role_map`] is unset or none of `claims`'
+    /// groups matched it) — the caller (`routes::auth::oidc_callback`)
+    /// persists those names on the new session row so
+    /// [`crate::session::validate_session`] can keep resolving them on
+    /// every later request, per `mapped_permissions`' own doc comment
+    /// ("for the lifetime of that login") — and any [`SignInNotice`].
+    ///
+    /// # Group overage (`SEC-39`)
+    ///
+    /// When the provider replaced the configured groups claim with an
+    /// overage marker ([`OidcClaims::has_claim_overage`]), no group-based
+    /// role can be mapped: the login still succeeds (decision 2 — refusing
+    /// would lock out a user who also holds roles granted in the console),
+    /// a `warn` line records the user id and provider (never the token and
+    /// never the marker's claim-source URL), and the returned notice tells
+    /// the console to say so.
     ///
     /// # Errors
     ///
@@ -765,7 +840,7 @@ impl OidcAuthenticator {
         &self,
         token: &Secret,
         expected_nonce: &str,
-    ) -> Result<(Principal, Vec<String>), AuthError> {
+    ) -> Result<OidcLogin, AuthError> {
         let claims = self.validate_token(token.expose()).await?;
         let actual_nonce = claims
             .extra
@@ -775,9 +850,23 @@ impl OidcAuthenticator {
         if actual_nonce != expected_nonce {
             return Err(AuthError::InvalidCredentials);
         }
+        let group_overage = claims.has_claim_overage(&self.config.groups_claim);
         let principal = self.resolve_principal(&claims).await?;
         let mapped_role_names = self.mapped_role_names(&claims);
-        Ok((principal, mapped_role_names))
+        if group_overage {
+            // `SEC-39`, decision 3: the user's id and the provider, nothing
+            // from the token and nothing from `_claim_sources`.
+            tracing::warn!(
+                user_id = %principal.id.uuid(),
+                provider = %self.provider_label,
+                "OIDC sign-in carried a group overage marker; no group-based role was applied"
+            );
+        }
+        Ok(OidcLogin {
+            principal,
+            mapped_role_names,
+            notice: group_overage.then_some(SignInNotice::GroupOverage),
+        })
     }
 
     /// Create (or link to an existing, same-email) `app_user` for `claims`,
@@ -949,6 +1038,39 @@ mod tests {
             "file:///etc/passwd",
             "https://issuer.example"
         ));
+    }
+
+    /// `SEC-39`, decision 1: `_claim_names` naming the configured groups
+    /// claim is the overage marker. A token that carries `groups` is not an
+    /// overage, and a marker for some other claim (say `roles`, while this
+    /// deployment maps `groups`) is not this deployment's concern.
+    #[test]
+    fn a_group_overage_marker_is_detected_and_a_present_groups_claim_is_not() {
+        let overage: OidcClaims = serde_json::from_value(serde_json::json!({
+            "sub": "user-1",
+            "_claim_names": {"groups": "src1"},
+            "_claim_sources": {"src1": {"endpoint": "https://graph.example/v1.0/me"}},
+        }))
+        .expect("a token carrying an overage marker");
+        assert!(overage.has_claim_overage("groups"));
+        assert!(
+            overage.groups("groups").is_empty(),
+            "an overage marker stands in for the group list, so none is read"
+        );
+
+        let present: OidcClaims = serde_json::from_value(serde_json::json!({
+            "sub": "user-1",
+            "groups": ["lakehouse-admins"],
+        }))
+        .expect("a token carrying a groups claim");
+        assert!(!present.has_claim_overage("groups"));
+
+        let other_claim: OidcClaims = serde_json::from_value(serde_json::json!({
+            "sub": "user-1",
+            "_claim_names": {"roles": "src1"},
+        }))
+        .expect("a token carrying a marker for another claim");
+        assert!(!other_claim.has_claim_overage("groups"));
     }
 
     #[test]

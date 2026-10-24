@@ -29,6 +29,7 @@
 // by the linker before its ctor section is ever considered).
 use lakehouse_test_support as _;
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use base64::Engine;
@@ -37,7 +38,7 @@ use jsonwebtoken::jwk::{
 };
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use lakehouse_auth::oidc::{JwksClient, OidcAuthenticator};
-use lakehouse_auth::{AuthError, Authenticator, Credential, OidcConfig, Secret};
+use lakehouse_auth::{AuthError, Authenticator, Credential, OidcConfig, Secret, SignInNotice};
 use rsa::RsaPrivateKey;
 use rsa::pkcs1::{EncodeRsaPrivateKey, LineEnding};
 use rsa::traits::PublicKeyParts;
@@ -121,6 +122,11 @@ struct Claims<'a> {
     groups: Option<Vec<&'a str>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     nonce: Option<&'a str>,
+    /// Entra ID's overage marker (`SEC-39`): names each claim whose values
+    /// did not fit in the token, so the claim itself is absent. `None` for
+    /// every ordinary test token.
+    #[serde(rename = "_claim_names", skip_serializing_if = "Option::is_none")]
+    claim_names: Option<HashMap<&'a str, &'a str>>,
 }
 
 impl<'a> Claims<'a> {
@@ -135,6 +141,7 @@ impl<'a> Claims<'a> {
             name: None,
             groups: None,
             nonce: None,
+            claim_names: None,
         }
     }
 }
@@ -687,17 +694,20 @@ async fn authenticate_with_nonce_accepts_a_token_whose_nonce_claim_matches(
 ) -> sqlx::Result<()> {
     let (_server, auth, key) = test_authenticator(pool).await;
     let token = mint_test_id_token(&key, "user-1", "nonce-xyz");
-    let (principal, mapped_role_names) = auth
+    let login = auth
         .authenticate_with_nonce(&Secret::new(token), "nonce-xyz")
         .await
         .expect("a matching nonce must be accepted");
     // `oidc:test` — this file's existing config fixture (`authenticator`'s
     // `OidcConfig::new(ISSUER, CLIENT_ID, "test", ..)`), not `oidc:okta`.
-    assert_eq!(principal.provider, "oidc:test");
+    assert_eq!(login.principal.provider, "oidc:test");
     // This fixture's `OidcConfig` carries no `role_map`
     // (`authenticator`'s own construction), so there is nothing to map —
     // `mapped_role_names` must be empty, not fabricated.
-    assert!(mapped_role_names.is_empty());
+    assert!(login.mapped_role_names.is_empty());
+    // An ordinary token carries the groups claim (or none at all), so no
+    // overage caveat applies (`SEC-39`).
+    assert!(login.notice.is_none());
     Ok(())
 }
 
@@ -737,12 +747,62 @@ async fn authenticate_with_nonce_returns_the_mapped_role_names(pool: PgPool) -> 
     claims.nonce = Some("nonce-role-names");
     let token = sign(&claims, &key, Algorithm::RS256);
 
-    let (principal, mapped_role_names) = auth
+    let login = auth
         .authenticate_with_nonce(&Secret::new(token), "nonce-role-names")
         .await
         .expect("a matching nonce must be accepted");
-    assert_eq!(mapped_role_names, vec!["Platform Admin".to_owned()]);
-    assert!(principal.has("identity:write"));
+    assert_eq!(login.mapped_role_names, vec!["Platform Admin".to_owned()]);
+    assert!(login.principal.has("identity:write"));
+    Ok(())
+}
+
+/// `SEC-39`: a token carrying `_claim_names` instead of `groups` — the
+/// marker Entra ID sends for a user in more groups than the claim can hold
+/// — still signs in (decision 2), maps no role, and comes back with the
+/// `GroupOverage` notice the console shows. Same fixture as
+/// `authenticate_with_nonce_returns_the_mapped_role_names`, with the group
+/// list replaced by the marker.
+#[sqlx::test(migrations = "../../migrations")]
+async fn authenticate_with_nonce_reports_a_group_overage_and_maps_no_role(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let server = MockServer::start().await;
+    let key = TestKey::generate("kid-1");
+    mount_jwks(&server, &[&key]).await;
+
+    let jwks_url = format!("{}/jwks", server.uri());
+    let mut config = OidcConfig::new(ISSUER, CLIENT_ID, "test", jwks_url.clone());
+    config.jit_provisioning = false;
+    config
+        .role_map
+        .insert("lakehouse-admins".to_owned(), "Platform Admin".to_owned());
+    sqlx::query(
+        "INSERT INTO auth_identity (provider, external_subject, app_user_id, password_hash) \
+         VALUES ('oidc:test', 'rina-oidc-subject-5', $1, NULL)",
+    )
+    .bind(uuid::Uuid::parse_str(RINA).unwrap())
+    .execute(&pool)
+    .await?;
+
+    let jwks = JwksClient::with_ttl(jwks_url, Duration::from_secs(300));
+    let auth = OidcAuthenticator::with_jwks_client(config, jwks, pool);
+
+    let mut claims = Claims::valid("rina-oidc-subject-5");
+    claims.groups = None;
+    claims.claim_names = Some(HashMap::from([("groups", "src1")]));
+    claims.nonce = Some("nonce-overage");
+    let token = sign(&claims, &key, Algorithm::RS256);
+
+    let login = auth
+        .authenticate_with_nonce(&Secret::new(token), "nonce-overage")
+        .await
+        .expect("an overage does not refuse the sign-in");
+    assert_eq!(login.notice, Some(SignInNotice::GroupOverage));
+    assert!(
+        login.mapped_role_names.is_empty(),
+        "an overage marker carries no group list, so no role can map"
+    );
+    assert!(!login.principal.has("identity:write"));
     Ok(())
 }
 
