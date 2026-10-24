@@ -54,6 +54,23 @@
 //! for [`UNWATCHABLE_BOUND`] under the default rule, or for the person's
 //! minutes when they set them. A fingerprint that cannot be read counts as
 //! "changed": the result is computed fresh and not stored.
+//!
+//! The table fingerprint cannot vouch for everything a statement reads
+//! (`BI-4` B review P-B1, P-S1). A statement that calls a clock or random
+//! function (`now`, `today`, `rand*`, `generateUUID*`, ...) or reads data
+//! through a name no `FROM`/`JOIN` carries (`dictGet*`, `joinGet*`,
+//! `IN <table>`) gets an unwatchable print, so it lives for
+//! [`UNWATCHABLE_BOUND`] or the person's minutes. A clock statement is also
+//! never served across a calendar-day boundary in the report time zone
+//! ([`CacheScope::with_zone`]): "Today" and "This month" are
+//! `toDate(now('<zone>'))`, a text that is the same every day, so without
+//! the day check a nightly mart would show yesterday's "Today" for 24 hours.
+//! With no zone known, a clock statement is never served from memory.
+//!
+//! `system.parts` is read on the node that answers the query. On a replicated
+//! table a replica that has not fetched a part yet reports an older
+//! fingerprint, which can only make a result look older than it is (a miss),
+//! never fresher.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -95,9 +112,19 @@ const ENGINE: &str = "clickhouse";
 /// [`DEFAULT_MAX_MB`].
 #[must_use]
 pub fn max_mb_from(raw: Option<&str>) -> u64 {
-    raw.map(str::trim)
-        .and_then(|s| s.parse::<u64>().ok())
-        .map_or(DEFAULT_MAX_MB, |n| n.min(MAX_MB_LIMIT))
+    let trimmed = raw.map(str::trim).filter(|s| !s.is_empty());
+    match trimmed.map(str::parse::<u64>) {
+        Some(Ok(n)) => n.min(MAX_MB_LIMIT),
+        Some(Err(_)) => {
+            // BI-4 B review P-S4: a typo must not pass for the default.
+            tracing::warn!(
+                default_mb = DEFAULT_MAX_MB,
+                "RESULT_CACHE_MAX_MB is not a whole number; using the default"
+            );
+            DEFAULT_MAX_MB
+        }
+        None => DEFAULT_MAX_MB,
+    }
 }
 
 /// The clock the validity check reads; tests replace it.
@@ -207,6 +234,9 @@ struct CachedResult {
     value: Value,
     computed_at: DateTime<Utc>,
     prints: Prints,
+    /// The statement calls a clock or random function: not served across a
+    /// calendar day in the report time zone (`BI-4` B review P-B1).
+    day_bound: bool,
     bytes: usize,
 }
 
@@ -324,6 +354,9 @@ pub struct CacheScope {
     fresh: Arc<Fresh>,
     /// Whether the chart being read skips the lookup (see [`Fresh`]).
     bypass: bool,
+    /// The report time zone: where a calendar day ends for a statement that
+    /// calls a clock function. `None` serves such a statement never.
+    zone: Option<Arc<str>>,
 }
 
 struct Shared {
@@ -381,6 +414,16 @@ impl CacheScope {
             chart: CacheRule::Follow,
             bypass: fresh == Fresh::All,
             fresh: Arc::new(fresh),
+            zone: None,
+        }
+    }
+
+    /// The same request, told the report time zone (`BI-4` B review P-B1).
+    #[must_use]
+    pub fn with_zone(self, zone: &str) -> Self {
+        Self {
+            zone: Some(Arc::from(zone)),
+            ..self
         }
     }
 
@@ -401,6 +444,7 @@ impl CacheScope {
             chart: CacheRule::Follow,
             bypass: *self.fresh == Fresh::All,
             fresh: Arc::clone(&self.fresh),
+            zone: self.zone.clone(),
         }
     }
 
@@ -460,10 +504,11 @@ impl CacheScope {
         let mut names = tables;
         names.sort();
         names.dedup();
-        let Some(prints) = self.prints_of(ch, &names).await else {
+        let Some(mut prints) = self.prints_of(ch, &names).await else {
             // Fail closed: compute fresh, store nothing.
             return uncached(compute).await;
         };
+        let day_bound = add_unwatchable_reads(&mut prints, statement);
         let key = key(ENGINE, statement, settings);
         if self.bypass {
             entries.invalidate(&key).await;
@@ -488,30 +533,13 @@ impl CacheScope {
                 leader.store(true, Ordering::SeqCst);
                 let Some(compute) = work.lock().unwrap_or_else(PoisonError::into_inner).take()
                 else {
-                    return Err(NotStored);
+                    return Err(NotStored::Retry);
                 };
-                match compute().await {
-                    Ok(done) => {
-                        let bytes = done.value.to_string().len();
-                        if done.complete && bytes <= MAX_ENTRY_BYTES {
-                            Ok(Arc::new(CachedResult {
-                                value: done.value,
-                                computed_at: (cache.clock)(),
-                                prints,
-                                bytes,
-                            }))
-                        } else {
-                            *outcome.lock().unwrap_or_else(PoisonError::into_inner) =
-                                Some(Ok(done.value));
-                            Err(NotStored)
-                        }
-                    }
-                    Err(failure) => {
-                        *outcome.lock().unwrap_or_else(PoisonError::into_inner) =
-                            Some(Err(failure));
-                        Err(NotStored)
-                    }
-                }
+                settle(
+                    compute().await,
+                    &outcome,
+                    (prints, day_bound, (cache.clock)()),
+                )
             })
             .await;
         match stored {
@@ -533,20 +561,30 @@ impl CacheScope {
                     }),
                     Some(Err(failure)) => Err(failure),
                     // Unreachable by construction (the leader sets one of the
-                    // two before it returns `NotStored`); computing again is
-                    // the safe answer rather than inventing a result.
+                    // two before it returns `NotStored`); the tile answers
+                    // `Refused` rather than inventing a result.
                     None => Err(SpecRunFailure::Refused("The result could not be read.")),
                 }
             }
-            // The tile this one waited for did not produce a result to keep
-            // (it failed or was cut); this tile asks the engine itself.
-            Err(_) => {
-                let take = work.lock().unwrap_or_else(PoisonError::into_inner).take();
-                match take {
-                    Some(compute) => uncached(compute).await,
-                    None => Err(SpecRunFailure::Refused("The result could not be read.")),
+            // BI-4 B review P-S2: the leader's deterministic outcome, shared.
+            Err(shared) => match &*shared {
+                NotStored::Answer(value) => Ok(Answer {
+                    value: value.clone(),
+                    computed_at: now,
+                    remembered: false,
+                }),
+                NotStored::Failed(tile) => Err(SpecRunFailure::Tile(tile.clone())),
+                // The tile this one waited for was stopped or failed on the
+                // engine: that is its own run's outcome, so this tile asks the
+                // engine itself.
+                NotStored::Retry => {
+                    let take = work.lock().unwrap_or_else(PoisonError::into_inner).take();
+                    match take {
+                        Some(compute) => uncached(compute).await,
+                        None => Err(SpecRunFailure::Refused("The result could not be read.")),
+                    }
                 }
-            }
+            },
         }
     }
 
@@ -562,7 +600,11 @@ impl CacheScope {
             Effective::Default => OUTER_TTL,
             Effective::Minutes(n) => Duration::from_secs(u64::from(n) * 60),
         };
-        age < bound && entry.prints == *prints
+        // BI-4 B review P-B1: a clock statement is not carried over midnight
+        // of the report time zone, whatever its age.
+        let same_day =
+            !entry.day_bound || same_day_in_zone(self.zone.as_deref(), entry.computed_at, now);
+        age < bound && same_day && entry.prints == *prints
     }
 
     /// The fingerprint of `names`, or `None` when it cannot be read.
@@ -590,10 +632,97 @@ impl CacheScope {
     }
 }
 
-/// Why an entry was not stored; carries nothing because the leader keeps the
-/// real outcome.
+/// BI-4 B review P-B1, P-S1: what the table names do not show. Each adds a
+/// print `system.parts` cannot answer, which is what makes the entry
+/// unwatchable (short-lived). Returns whether the statement calls a clock or
+/// random function (so it is also bound to one calendar day).
+fn add_unwatchable_reads(prints: &mut Prints, statement: &str) -> bool {
+    let beyond = crate::sql_rewrite::reads_beyond_tables(
+        statement,
+        &sqlparser::dialect::ClickHouseDialect {},
+    );
+    if beyond.outside_from {
+        prints.push(("(dictionary, join or IN table read)".to_owned(), None));
+    }
+    if beyond.clock_or_random {
+        prints.push(("(clock or random function)".to_owned(), None));
+    }
+    beyond.clock_or_random
+}
+
+/// What a finished computation becomes: an entry to keep, or a [`NotStored`]
+/// for the tiles that waited. The leader's own outcome goes into `outcome`
+/// whole, because a follower only gets the shareable part.
+fn settle(
+    result: Result<Computed, SpecRunFailure>,
+    outcome: &Mutex<Option<Result<Value, SpecRunFailure>>>,
+    (prints, day_bound, computed_at): (Prints, bool, DateTime<Utc>),
+) -> Result<Arc<CachedResult>, NotStored> {
+    let mut slot = outcome.lock().unwrap_or_else(PoisonError::into_inner);
+    match result {
+        Ok(done) => {
+            let bytes = done.value.to_string().len();
+            if done.complete && bytes <= MAX_ENTRY_BYTES {
+                Ok(Arc::new(CachedResult {
+                    value: done.value,
+                    computed_at,
+                    prints,
+                    day_bound,
+                    bytes,
+                }))
+            } else {
+                // BI-4 B review P-S2: a cut or over-size result is the same
+                // for every tile that waited, so they share it instead of
+                // asking the engine again.
+                *slot = Some(Ok(done.value.clone()));
+                Err(NotStored::Answer(done.value))
+            }
+        }
+        Err(failure) => {
+            // BI-4 B review P-S2: a time limit is deterministic for this
+            // statement and settings, so followers get it too; a Stop or an
+            // engine error is this run's own, so they ask for themselves.
+            let shared = match &failure {
+                SpecRunFailure::Tile(tile)
+                    if tile.get("error").and_then(Value::as_str)
+                        != Some(crate::query_limits::STOPPED_SENTENCE) =>
+                {
+                    NotStored::Failed(tile.clone())
+                }
+                _ => NotStored::Retry,
+            };
+            *slot = Some(Err(failure));
+            Err(shared)
+        }
+    }
+}
+
+/// Whether `a` and `b` fall on one calendar day in `zone`. An absent or
+/// unknown zone answers `false`: the day cannot be told, so nothing is reused.
+fn same_day_in_zone(zone: Option<&str>, a: DateTime<Utc>, b: DateTime<Utc>) -> bool {
+    let Some(Ok(tz)) = zone.map(jiff::tz::TimeZone::get) else {
+        return false;
+    };
+    let day = |t: DateTime<Utc>| {
+        jiff::Timestamp::from_second(t.timestamp())
+            .ok()
+            .map(|ts| ts.to_zoned(tz.clone()).date())
+    };
+    matches!((day(a), day(b)), (Some(x), Some(y)) if x == y)
+}
+
+/// Why an entry was not stored. A follower of the computation gets this
+/// through moka's shared error, so only what is the same for every waiting
+/// tile travels in it; the leader keeps its own real outcome.
 #[derive(Debug)]
-struct NotStored;
+enum NotStored {
+    /// The leader was stopped or failed on the engine: followers compute.
+    Retry,
+    /// A result that was answered but not kept (cut, over the size bound).
+    Answer(Value),
+    /// A tile failure that holds for every tile (the time limit).
+    Failed(Value),
+}
 
 /// One `system.parts` read for `names`. A failed read is logged (the text
 /// stays in the log, never in a response) and answers `None`.

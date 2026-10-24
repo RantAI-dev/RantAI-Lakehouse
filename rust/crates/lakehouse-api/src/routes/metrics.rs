@@ -717,7 +717,8 @@ pub(crate) async fn value_query(
         install,
         crate::result_cache::Fresh::No,
     )
-    .for_board(None, Vec::new());
+    .for_board(None, Vec::new())
+    .with_zone(time.zone());
     let (_, mut answer) = crate::result_cache::scoped(
         scope,
         crate::routes::support::run_spec_sql(

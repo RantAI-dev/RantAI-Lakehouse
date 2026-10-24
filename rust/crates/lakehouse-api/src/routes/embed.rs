@@ -1296,7 +1296,13 @@ async fn render_board_payload(
     let finished = match crate::result_cache::current() {
         Some(scope) => {
             let candidates = cols.keys().map(|mart| format!("serving.{mart}")).collect();
-            crate::result_cache::scoped(scope.for_board(board.cache, candidates), running).await
+            crate::result_cache::scoped(
+                scope
+                    .for_board(board.cache, candidates)
+                    .with_zone(time.zone()),
+                running,
+            )
+            .await
         }
         None => running.await,
     };

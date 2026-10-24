@@ -696,7 +696,9 @@ async fn a_tile_waiting_on_a_failed_tile_asks_the_engine_itself() {
         move || async move {
             runs.fetch_add(1, Ordering::SeqCst);
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            Err::<Computed, _>(SpecRunFailure::Tile(json!({"error": "stopped"})))
+            Err::<Computed, _>(SpecRunFailure::Tile(
+                json!({"error": crate::query_limits::STOPPED_SENTENCE}),
+            ))
         }
     };
     let ok = {
@@ -785,12 +787,13 @@ async fn refreshing_one_chart_recomputes_that_chart_and_leaves_the_others_rememb
     let request = |fresh: Fresh| {
         CacheScope::new(Arc::clone(&cache), CacheRule::Follow, fresh).for_board(None, Vec::new())
     };
-    for sql in ["A", "B"] {
+    // Real SQL: a statement that does not parse is never trusted (P-B1).
+    for id in ["A", "B"] {
         request(Fresh::No)
-            .for_chart(Some(sql), None)
+            .for_chart(Some(id), None)
             .run(
                 &ch,
-                (sql, &SETTINGS),
+                (&format!("SELECT '{id}'"), &SETTINGS),
                 Some(tables()),
                 counted(&runs, rows(1), true),
             )
@@ -803,7 +806,7 @@ async fn refreshing_one_chart_recomputes_that_chart_and_leaves_the_others_rememb
         .for_chart(Some("A"), None)
         .run(
             &ch,
-            ("A", &SETTINGS),
+            ("SELECT 'A'", &SETTINGS),
             Some(tables()),
             counted(&runs, rows(2), true),
         )
@@ -813,7 +816,7 @@ async fn refreshing_one_chart_recomputes_that_chart_and_leaves_the_others_rememb
         .for_chart(Some("B"), None)
         .run(
             &ch,
-            ("B", &SETTINGS),
+            ("SELECT 'B'", &SETTINGS),
             Some(tables()),
             counted(&runs, rows(2), true),
         )
@@ -821,4 +824,215 @@ async fn refreshing_one_chart_recomputes_that_chart_and_leaves_the_others_rememb
         .unwrap();
     assert!(!a.remembered && b.remembered);
     assert_eq!(runs.load(Ordering::SeqCst), 3);
+}
+
+/// Reads `statement` once through a scope in the `Asia/Jakarta` report zone
+/// and says whether it came from memory.
+async fn read_in_jakarta(
+    cache: &Arc<ResultCache>,
+    ch: &Arc<ChClient>,
+    runs: &Arc<AtomicUsize>,
+    statement: &str,
+    rules: (CacheRule, CacheRule),
+) -> bool {
+    scope(cache, rules, false)
+        .with_zone("Asia/Jakarta")
+        .run(
+            ch,
+            (statement, &SETTINGS),
+            Some(tables()),
+            counted(runs, rows(1), true),
+        )
+        .await
+        .unwrap()
+        .remembered
+}
+
+/// BI-4 B review P-B1: "Today" is `toDate(now('<zone>'))`, the same text every
+/// day, and a nightly mart's fingerprint does not move at midnight.
+#[tokio::test]
+async fn a_statement_with_a_clock_function_is_not_served_across_midnight_in_the_report_zone() {
+    let parts = Arc::new(Parts::default());
+    parts.set("serving", "mart_sales", "2026-10-24 08:00:00", "10");
+    let (_server, ch) = engine(&parts).await;
+    let (now, read) = clock();
+    let cache = Arc::new(ResultCache::with_clock(8, read));
+    let runs = Arc::new(AtomicUsize::new(0));
+    let today = "SELECT count() FROM serving.mart_sales WHERE d = toDate(now('Asia/Jakarta'))";
+    let plain = "SELECT count() FROM serving.mart_sales";
+    // 23:55 in Jakarta (UTC+7) on 2026-10-24.
+    *now.lock().unwrap() = Utc.with_ymd_and_hms(2026, 10, 24, 16, 55, 0).unwrap();
+    assert!(!read_in_jakarta(&cache, &ch, &runs, today, defaults()).await);
+    assert!(!read_in_jakarta(&cache, &ch, &runs, plain, defaults()).await);
+    // Still the same day, a few minutes on.
+    *now.lock().unwrap() = Utc.with_ymd_and_hms(2026, 10, 24, 16, 58, 0).unwrap();
+    assert!(
+        read_in_jakarta(&cache, &ch, &runs, today, defaults()).await,
+        "same calendar day: served"
+    );
+    // 00:05 on the next day in Jakarta; both are inside the ten-minute bound
+    // and the fingerprint is unchanged.
+    *now.lock().unwrap() = Utc.with_ymd_and_hms(2026, 10, 24, 17, 3, 0).unwrap();
+    assert!(
+        !read_in_jakarta(&cache, &ch, &runs, today, defaults()).await,
+        "the day changed in the report zone: computed again"
+    );
+    assert!(
+        read_in_jakarta(&cache, &ch, &runs, plain, defaults()).await,
+        "a statement with no clock function is still served"
+    );
+}
+
+#[tokio::test]
+async fn a_clock_statement_with_no_zone_known_is_never_served() {
+    let parts = Arc::new(Parts::default());
+    parts.set("serving", "mart_sales", "2026-10-24 08:00:00", "10");
+    let (_server, ch) = engine(&parts).await;
+    let cache = Arc::new(ResultCache::new(8));
+    let runs = Arc::new(AtomicUsize::new(0));
+    for _ in 0..2 {
+        let answer = scope(&cache, defaults(), false)
+            .run(
+                &ch,
+                ("SELECT rand()", &SETTINGS),
+                Some(tables()),
+                counted(&runs, rows(1), true),
+            )
+            .await
+            .unwrap();
+        assert!(!answer.remembered);
+    }
+    assert_eq!(runs.load(Ordering::SeqCst), 2);
+}
+
+/// BI-4 B review P-S1: data read through a dictionary, a `Join` table or
+/// `IN <table>` is not in any `FROM`, so the fingerprint cannot watch it.
+#[tokio::test]
+async fn a_statement_reading_through_a_dictionary_or_in_table_is_bounded_like_an_unwatchable_one() {
+    let parts = Arc::new(Parts::default());
+    parts.set("serving", "mart_sales", "2026-10-24 08:00:00", "10");
+    let (_server, ch) = engine(&parts).await;
+    for statement in [
+        "SELECT dictGet('d', 'v', toUInt64(1)) FROM serving.mart_sales",
+        "SELECT joinGet('j', 'v', 1) FROM serving.mart_sales",
+        "SELECT count() FROM serving.mart_sales WHERE id IN other_table",
+    ] {
+        let (now, read) = clock();
+        let cache = Arc::new(ResultCache::with_clock(8, read));
+        let runs = Arc::new(AtomicUsize::new(0));
+        assert!(!read_in_jakarta(&cache, &ch, &runs, statement, defaults()).await);
+        *now.lock().unwrap() += Span::minutes(11);
+        assert!(
+            !read_in_jakarta(&cache, &ch, &runs, statement, defaults()).await,
+            "past ten minutes, though the fingerprint of its FROM table is unchanged: {statement}"
+        );
+    }
+}
+
+#[test]
+fn clock_random_and_outside_from_reads_are_told_from_plain_statements() {
+    use crate::sql_rewrite::{BeyondTables, reads_beyond_tables};
+    let dialect = sqlparser::dialect::ClickHouseDialect {};
+    let clock = |sql| reads_beyond_tables(sql, &dialect).clock_or_random;
+    assert!(clock("SELECT toDate(now('UTC'))"));
+    assert!(clock("SELECT today()"));
+    assert!(clock("SELECT now64(3)"));
+    assert!(clock("SELECT rand() % 3"));
+    assert!(clock("SELECT randCanonical()"));
+    assert!(clock("SELECT generateUUIDv4()"));
+    assert!(!clock("SELECT toDate(created) FROM serving.t"));
+    assert_eq!(
+        reads_beyond_tables("SELECT sum(x) FROM serving.t", &dialect),
+        BeyondTables::default()
+    );
+    assert!(reads_beyond_tables("SELECT dictGetString('d','a',1)", &dialect).outside_from);
+    assert!(reads_beyond_tables("SELECT 1 FROM t WHERE a IN other", &dialect).outside_from);
+    // Unparseable: nothing can be said, so nothing is trusted.
+    let unknown = reads_beyond_tables("SELEKT", &dialect);
+    assert!(unknown.clock_or_random && unknown.outside_from);
+}
+
+/// BI-4 B review P-S2: what the leader's outcome is for every waiting tile
+/// (a time limit, a cut result) is shared; only a Stop or an engine error is
+/// the leader's own.
+#[tokio::test]
+async fn tiles_waiting_on_a_time_limit_or_a_cut_share_the_leaders_outcome() {
+    let parts = Arc::new(Parts::default());
+    parts.set("serving", "mart_sales", "2026-10-24 08:00:00", "10");
+    let (_server, ch) = engine(&parts).await;
+    let cache = Arc::new(ResultCache::new(8));
+    let runs = Arc::new(AtomicUsize::new(0));
+    let request = scope(&cache, defaults(), false);
+    let slow_limit = {
+        let runs = Arc::clone(&runs);
+        move || async move {
+            runs.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            Err::<Computed, _>(SpecRunFailure::Tile(
+                json!({"error": "Took longer than 60 seconds", "limit": {"kind": "time"}}),
+            ))
+        }
+    };
+    let follower = |n: &Arc<AtomicUsize>| {
+        let n = Arc::clone(n);
+        move || async move {
+            n.fetch_add(1, Ordering::SeqCst);
+            Ok(Computed {
+                value: rows(9),
+                complete: true,
+            })
+        }
+    };
+    let (leader, waiter) = tokio::join!(
+        request.run(&ch, ("SELECT 1", &SETTINGS), Some(tables()), slow_limit),
+        async {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            request
+                .run(
+                    &ch,
+                    ("SELECT 1", &SETTINGS),
+                    Some(tables()),
+                    follower(&runs),
+                )
+                .await
+        },
+    );
+    assert!(matches!(leader, Err(SpecRunFailure::Tile(_))));
+    match waiter {
+        Err(SpecRunFailure::Tile(tile)) => assert_eq!(tile["limit"]["kind"], "time"),
+        other => panic!("the waiter should share the time limit, got {other:?}"),
+    }
+    assert_eq!(runs.load(Ordering::SeqCst), 1, "the engine was asked once");
+
+    // A cut result: answered to both, asked once, stored by neither.
+    let runs = Arc::new(AtomicUsize::new(0));
+    let cut = {
+        let runs = Arc::clone(&runs);
+        move || async move {
+            runs.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            Ok(Computed {
+                value: json!({"columns": ["n"], "rows": [], "limitHit": {"kind": "rows"}}),
+                complete: false,
+            })
+        }
+    };
+    let (a, b) = tokio::join!(
+        request.run(&ch, ("SELECT 2", &SETTINGS), Some(tables()), cut),
+        async {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            request
+                .run(
+                    &ch,
+                    ("SELECT 2", &SETTINGS),
+                    Some(tables()),
+                    follower(&runs),
+                )
+                .await
+        },
+    );
+    let (a, b) = (a.unwrap(), b.unwrap());
+    assert_eq!(a.value, b.value, "the follower got the leader's cut result");
+    assert_eq!(runs.load(Ordering::SeqCst), 1, "the engine was asked once");
+    assert_eq!(cache.entry_count().await, 0);
 }

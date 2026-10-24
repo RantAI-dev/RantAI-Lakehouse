@@ -417,10 +417,13 @@ async fn get_body(
     // in one query. With no scope open (a caller that did not ask) nothing is
     // remembered.
     let cache_scope = crate::result_cache::current().map(|scope| {
-        scope.for_board(
-            board_obj.and_then(|b| b.cache),
-            cols.keys().map(|mart| format!("serving.{mart}")).collect(),
-        )
+        scope
+            .for_board(
+                board_obj.and_then(|b| b.cache),
+                cols.keys().map(|mart| format!("serving.{mart}")).collect(),
+            )
+            // BI-4 B review P-B1: where a calendar day ends for "Today" tiles.
+            .with_zone(time.zone())
     });
     let cache_rule = cache_scope
         .as_ref()

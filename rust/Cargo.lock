@@ -2500,6 +2500,7 @@ dependencies = [
  "hmac 0.13.0",
  "iceberg",
  "ipnet",
+ "jiff",
  "jsonwebtoken",
  "lakehouse-alerts",
  "lakehouse-auth",

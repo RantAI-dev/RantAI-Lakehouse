@@ -105,8 +105,13 @@ empty.
 - That `referenced_tables` on the rewritten statement names the physical tables when masking
   wraps them: the cache reads them from the same rewritten statement the engine runs, and a
   table it cannot find in `system.parts` is treated as unwatchable (10 minutes), so a wrapping
-  can only shorten a result's life, never lengthen it. Whether a masked tile reaches the
-  watchable path was not checked against a real policy.
+  can only shorten a result's life, never lengthen it. **Correction (BI-4 B review P-S1):**
+  that holds only for data read through a `FROM`/`JOIN` factor. Data read through
+  `dictGet*`/`joinGet*` or `IN <table>` names no table factor, so the fingerprint could not
+  see it; since the review such a statement gets an unwatchable print of its own (10 minutes
+  or the person's minutes), and a statement that calls a clock or random function is also
+  never served across a calendar day in the report time zone (P-B1). Whether a masked tile
+  reaches the watchable path was not checked against a real policy.
 - `cargo deny check` and `cargo audit` for the `moka` dependency: not run (no tool on this
   machine). `moka` 0.12.16 with only the `future` feature was already in `Cargo.lock` through
   `iceberg`; the lockfile change is the one line that adds `moka` to `lakehouse-api`'s
