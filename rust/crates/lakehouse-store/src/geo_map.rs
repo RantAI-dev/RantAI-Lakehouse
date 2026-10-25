@@ -60,7 +60,8 @@ pub async fn insert(pool: &PgPool, map: &NewGeoMap<'_>) -> Result<GeoMap, StoreE
         "INSERT INTO geo_map (id, name, name_property, region_count, geojson, created_by) \
          VALUES ($1, $2, $3, $4, $5, $6) RETURNING {COLS}"
     );
-    Ok(sqlx::query_as(&sql)
+    // safe: only the constant `COLS` is formatted in; values are bound (SEC-41).
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(map.id)
         .bind(map.name)
         .bind(map.name_property)
@@ -78,7 +79,8 @@ pub async fn insert(pool: &PgPool, map: &NewGeoMap<'_>) -> Result<GeoMap, StoreE
 /// [`StoreError::Database`] on a database failure.
 pub async fn list(pool: &PgPool) -> Result<Vec<GeoMap>, StoreError> {
     let sql = format!("SELECT {COLS} FROM geo_map ORDER BY created_at, id");
-    Ok(sqlx::query_as(&sql).fetch_all(pool).await?)
+    // safe: only the constant `COLS` is formatted in; values are bound (SEC-41).
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str())).fetch_all(pool).await?)
 }
 
 /// One map without its file, or `None`.
@@ -88,7 +90,8 @@ pub async fn list(pool: &PgPool) -> Result<Vec<GeoMap>, StoreError> {
 /// [`StoreError::Database`] on a database failure.
 pub async fn get(pool: &PgPool, id: &str) -> Result<Option<GeoMap>, StoreError> {
     let sql = format!("SELECT {COLS} FROM geo_map WHERE id = $1");
-    Ok(sqlx::query_as(&sql).bind(id).fetch_optional(pool).await?)
+    // safe: only the constant `COLS` is formatted in; values are bound (SEC-41).
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str())).bind(id).fetch_optional(pool).await?)
 }
 
 /// A map's simplified file and a tag that changes when the file does.
@@ -122,7 +125,8 @@ pub async fn file(pool: &PgPool, id: &str) -> Result<Option<GeoFile>, StoreError
 /// otherwise.
 pub async fn rename(pool: &PgPool, id: &str, name: &str) -> Result<Option<GeoMap>, StoreError> {
     let sql = format!("UPDATE geo_map SET name = $2 WHERE id = $1 RETURNING {COLS}");
-    Ok(sqlx::query_as(&sql)
+    // safe: only the constant `COLS` is formatted in; values are bound (SEC-41).
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(id)
         .bind(name)
         .fetch_optional(pool)
