@@ -523,19 +523,31 @@ pub struct RecordHistoryInput<'a> {
     pub engine: &'a str,
     /// Whether the result was served (partly) from cache.
     pub cache_assisted: bool,
+    /// The tables the statement names as written, as the caller parsed
+    /// them. Empty for a statement that does not parse, and for every row
+    /// recorded before the column existed (migration
+    /// `0111_query_history_detail.sql` backfills nothing).
+    pub tables_read: &'a [String],
+    /// The exact text the response carried for a failed or refused run —
+    /// fixed and classified before it is stored, the same text the
+    /// caller's screen showed. `None` where there is nothing to say: a
+    /// completed run, and every row recorded before the column existed.
+    pub message: Option<&'a str>,
 }
 
 /// Record one query execution.
 ///
 /// # Non-fatal by design
 ///
-/// This is called from `routes::query::run` *after* a query has already
-/// succeeded against `ClickHouse` and a response has been built for the
-/// caller. A logging write failing (no pool configured, Postgres down,
-/// whatever) must never turn an otherwise-successful query into an error
-/// response — so `routes::query::run` calls this, gets a `Result`, and on
-/// `Err` logs a warning and still returns the successful `QueryResult`
-/// unchanged. The `Result` is returned rather than swallowed *here* so
+/// This is called from `routes::query::run` once the run has an answer —
+/// a completed run after its result is built, and (since the history
+/// page, `QS-4`) a refused or failed run before its error response goes
+/// out, carrying the same message that response does. A logging write
+/// failing (no pool configured, Postgres down, whatever) must never turn
+/// an otherwise-settled run into a different response — so
+/// `routes::query::run` calls this, gets a `Result`, and on `Err` logs a
+/// warning and still returns the response it had built, success or not.
+/// The `Result` is returned rather than swallowed *here* so
 /// that decision stays visible at the call site instead of this function
 /// silently deciding it for every caller (a test, for instance, very much
 /// wants to see the error).
@@ -550,8 +562,8 @@ pub async fn record_history(
     sqlx::query(
         "INSERT INTO query_history \
          (id, sql, user_name, status, duration_ms, scanned_bytes, cost_units, \
-          workload_class, engine, cache_assisted, owner_id) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+          workload_class, engine, cache_assisted, owner_id, tables_read, message) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
          ON CONFLICT (id) DO NOTHING",
     )
     .bind(input.id)
@@ -565,6 +577,8 @@ pub async fn record_history(
     .bind(input.engine)
     .bind(input.cache_assisted)
     .bind(input.owner_id)
+    .bind(input.tables_read)
+    .bind(input.message)
     .execute(pool)
     .await?;
     Ok(())

@@ -69,6 +69,8 @@ async fn record_history_round_trips_through_list(pool: PgPool) -> sqlx::Result<(
             workload_class: "hot-analytics",
             engine: "hot-store",
             cache_assisted: false,
+            tables_read: &[],
+            message: None,
         },
     )
     .await
@@ -109,6 +111,8 @@ async fn record_history_is_idempotent_per_id(pool: PgPool) -> sqlx::Result<()> {
         workload_class: "hot-analytics",
         engine: "hot-store",
         cache_assisted: false,
+        tables_read: &[],
+        message: None,
     };
     record_history(&pool, &input).await.unwrap();
     record_history(&pool, &input).await.unwrap();
@@ -151,6 +155,8 @@ async fn history_item_has_no_audit_id_without_a_real_event(pool: PgPool) -> sqlx
             workload_class: "hot-analytics",
             engine: "hot-store",
             cache_assisted: false,
+            tables_read: &[],
+            message: None,
         },
     )
     .await
@@ -182,6 +188,8 @@ async fn history_item_resolves_the_real_audit_event_id(pool: PgPool) -> sqlx::Re
             workload_class: "hot-analytics",
             engine: "hot-store",
             cache_assisted: false,
+            tables_read: &[],
+            message: None,
         },
     )
     .await
@@ -243,6 +251,8 @@ async fn history_item_uses_the_newest_of_several_events_without_duplicating_the_
             workload_class: "hot-analytics",
             engine: "hot-store",
             cache_assisted: false,
+            tables_read: &[],
+            message: None,
         },
     )
     .await
@@ -292,6 +302,8 @@ async fn record_history_carries_the_real_engine_and_is_scoped_by_owner_id(
             workload_class: "hot-analytics",
             engine: "trino",
             cache_assisted: false,
+            tables_read: &[],
+            message: None,
         },
     )
     .await
@@ -322,6 +334,8 @@ async fn get_history_item_fetches_one_row_by_id(pool: PgPool) -> sqlx::Result<()
             workload_class: "hot-analytics",
             engine: "clickhouse",
             cache_assisted: false,
+            tables_read: &[],
+            message: None,
         },
     )
     .await
@@ -376,6 +390,8 @@ async fn history_mentioning_finds_queries_by_substring_across_users(
                     workload_class: "hot-analytics",
                     engine: "hot-store",
                     cache_assisted: false,
+                    tables_read: &[],
+                    message: None,
                 },
             )
             .await
@@ -452,6 +468,8 @@ async fn history_recent_is_newest_first_and_respects_days_and_limit(
                 workload_class: "hot-analytics",
                 engine: "hot-store",
                 cache_assisted: false,
+                tables_read: &[],
+                message: None,
             },
         )
         .await

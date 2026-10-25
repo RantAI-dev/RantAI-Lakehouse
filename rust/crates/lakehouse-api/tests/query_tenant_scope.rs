@@ -335,6 +335,8 @@ async fn insert_history_row(pool: &PgPool, id: &str, sql: &str, owner: Uuid) {
         workload_class: "hot-analytics",
         engine: "clickhouse",
         cache_assisted: false,
+        tables_read: &[],
+        message: None,
     };
     record_history(pool, &input)
         .await
@@ -380,7 +382,7 @@ async fn leave_one_tenant(pool: &PgPool, caller: Uuid) {
 }
 
 #[tokio::test]
-async fn another_tenants_upload_table_is_refused_and_nothing_is_recorded_or_asked() {
+async fn another_tenants_upload_table_is_refused_recorded_and_never_asked() {
     let ch = MockServer::start().await;
     mount_engine(&ch).await;
     let TestApp { router, pool } = spin_up_with_clickhouse(&ch.uri()).await;
@@ -393,8 +395,8 @@ async fn another_tenants_upload_table_is_refused_and_nothing_is_recorded_or_aske
     assert_eq!(body["error"], REFUSAL, "{body}");
     assert_eq!(
         history_rows(&pool).await,
-        0,
-        "a refused run is not a run: nothing may be recorded"
+        1,
+        "the refusal is a run the history now records (`QS-4`, decision 3)"
     );
     assert_eq!(
         engine_requests(&ch).await,

@@ -825,11 +825,18 @@ const MAX_RESULT_ROWS: usize = 2_000;
 /// `ClickHouse` (`engine` absent or `"clickhouse"`) or `Trino`
 /// (`engine: "trino"`, WS2 §4) and return it in `QueryResult` shape.
 ///
-/// Every successful run is written to the audit trail and to the caller's
-/// query history (best-effort — see `queries::record_history`'s doc
-/// comment). A refused or failed run is answered with an error and is NOT
-/// separately recorded here; the audit trail's own refusal path is what
-/// WS7 built for enforcement decisions, not this route's history write.
+/// Every run that reaches an answer is recorded, best-effort (see
+/// `queries::record_history`'s doc comment): a completed run in the audit
+/// trail and in the caller's query history, as before; a refused run as
+/// history status `blocked` and a failed engine call as `failed`, each
+/// with the exact message the response carries and the tables the
+/// statement names (`QS-4`). A run whose body does not parse, whose `sql`
+/// is empty, or that has no principal is not recorded — nobody, or
+/// nothing, to record; a run the caller stops is not recorded either,
+/// because the server is not told (Stop closes the browser's request;
+/// `QS-2` is what stops a query on the server). The audit trail's own
+/// refusal path stays what WS7 built it for: enforcement decisions, not
+/// this route's history write.
 ///
 /// # Errors
 ///
@@ -863,6 +870,15 @@ const MAX_RESULT_ROWS: usize = 2_000;
 ///   Requirement 1), or, on `ClickHouse`, when the statement names a setting
 ///   other than `iceberg_snapshot_id` (`SEC-21`).
 /// - 503 [`ApiError::Unavailable`] when `Trino` is unreachable or times out.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one linear guard order (read-only, principal, Trino keywords, \
+              policy rewrite, settings, engine), each guard now ending in the \
+              same best-effort history record that `record_blocked` and \
+              `record_uncompleted_run` carry; splitting the guards into \
+              helpers would scatter an order whose sequence is the route's \
+              correctness, for a threshold, not a real seam"
+)]
 pub async fn run(
     State(state): State<AppState>,
     principal: Option<Extension<Principal>>,
@@ -874,12 +890,26 @@ pub async fn run(
         Some(s) if !s.is_empty() => s,
         _ => return Err(ApiError::BadRequest("sql is required".to_owned()).into()),
     };
+    // The engine is only a request field, so reading it before the guards
+    // changes nothing about which refusal a request meets. It is needed
+    // here for `tables_read`: the statement's tables are parsed with the
+    // dialect of the engine it names (the same parser the policy step
+    // uses), and the history row records them whether the run completes,
+    // fails or is refused (`QS-4`, decisions 3 and 4).
+    let engine = parsed.engine.as_deref().unwrap_or("clickhouse").to_owned();
+    let tables_read = referenced_table_names(&statement, is_trino_engine(&engine));
+
     if !is_read_only(&statement) {
-        return Err(ApiError::Unprocessable(
+        let refusal = ApiError::Unprocessable(
             "Only read queries (SELECT/SHOW/DESCRIBE/EXPLAIN) are allowed in Query Studio."
                 .to_owned(),
-        )
-        .into());
+        );
+        // No principal, no row: nobody to record the refusal against
+        // (`QS-4`, decision 3).
+        if let Some(Extension(p)) = &principal {
+            record_blocked(&state, p, &statement, &engine, &tables_read, &refusal).await;
+        }
+        return Err(refusal.into());
     }
 
     // See this function's doc comment: there is no honest value left to
@@ -891,14 +921,14 @@ pub async fn run(
     };
     let user_id = p.id.uuid().to_string();
 
-    let engine = parsed.engine.as_deref().unwrap_or("clickhouse").to_owned();
     if engine == "trino" && !is_trino_safe(&statement) {
-        return Err(ApiError::Unprocessable(
+        let refusal = ApiError::Unprocessable(
             "This statement is not permitted against Trino (write, session, or procedure \
              keyword detected)."
                 .to_owned(),
-        )
-        .into());
+        );
+        record_blocked(&state, &p, &statement, &engine, &tables_read, &refusal).await;
+        return Err(refusal.into());
     }
 
     // WS7 item C2: every ad hoc SQL surface is rewritten through the same
@@ -913,18 +943,64 @@ pub async fn run(
     // `rewritten` is what the engine runs and the audit event records
     // (`SEC-21`, `SEC-33`).
     let rewritten =
-        rewrite_sql_for_principal_with_headers(&state, &statement, &engine, &p, &headers).await?;
+        match rewrite_sql_for_principal_with_headers(&state, &statement, &engine, &p, &headers)
+            .await
+        {
+            Ok(rewritten) => rewritten,
+            Err(err) => {
+                // A 4xx from the rewrite is the gate refusing (the policy, the
+                // tenant's tables, the caller's own tenant header); a 5xx is
+                // the service failing while asking. The history row says
+                // which.
+                let status: &'static str = if err.status() < 500 {
+                    "blocked"
+                } else {
+                    "failed"
+                };
+                record_uncompleted_run(
+                    &state,
+                    &p,
+                    &statement,
+                    &engine,
+                    status,
+                    &err.to_string(),
+                    &tables_read,
+                    0,
+                )
+                .await;
+                return Err(err.into());
+            }
+        };
     // SEC-21: a statement's own `SETTINGS` would override the cap the run
     // sends with the request. Trino has no such settings in its client.
-    if !is_trino_engine(&engine) {
-        refuse_unlisted_settings(&rewritten)?;
+    if !is_trino_engine(&engine)
+        && let Err(refusal) = refuse_unlisted_settings(&rewritten)
+    {
+        record_blocked(&state, &p, &statement, &engine, &tables_read, &refusal).await;
+        return Err(refusal.into());
     }
 
     let started = Instant::now();
     let started_epoch_ms = epoch_ms();
 
     let (columns, mut rows, duration_ms, scanned_bytes) =
-        execute_query_against_engine(&state, &engine, &rewritten, &user_id, started).await?;
+        match execute_query_against_engine(&state, &engine, &rewritten, &user_id, started).await {
+            Ok(result) => result,
+            Err(err) => {
+                record_uncompleted_run(
+                    &state,
+                    &p,
+                    &statement,
+                    &engine,
+                    "failed",
+                    &err.to_string(),
+                    &tables_read,
+                    started.elapsed().as_millis(),
+                )
+                .await;
+                return Err(err.into());
+            }
+        };
 
     // The console renders every row it receives, so an unbounded `SELECT *`
     // used to be enough to freeze the tab — see `MAX_RESULT_ROWS`'s own doc
@@ -983,6 +1059,8 @@ pub async fn run(
             workload_class: "hot-analytics",
             engine: &engine,
             cache_assisted: false,
+            tables_read: &tables_read,
+            message: None,
         };
         if let Err(err) = queries::record_history(pool, &input).await {
             tracing::warn!(%err, "failed to record query history (query itself succeeded)");
@@ -1000,6 +1078,89 @@ pub async fn run(
         cost_units,
         &engine,
     )))
+}
+
+/// `QS-4` (the history page, decision 3): the one place records a run
+/// that did not complete.
+///
+/// The read-only guard, the Trino keyword check, the policy rewrite, the
+/// tenant gate and the settings guard record `blocked`; the engine's own
+/// error records `failed`. `message` is the exact text the response
+/// carries — an `ApiError`'s response body is `{"error": err.to_string()}`
+/// (`error.rs`), so the row and the caller's screen can never disagree,
+/// and the engine's own text reaches the row only the way it reached the
+/// response: already fixed and classified. Best-effort, the same posture
+/// as the completed write: a failed write is logged and never turns into
+/// an error response.
+///
+/// A refusal carries no measured numbers — nothing executed — so its
+/// duration is 0 and nothing was scanned or spent. An engine failure
+/// carries the time the failed attempt took, measured by the caller,
+/// where `started` is already in scope; nothing was scanned and nothing
+/// was spent that anyone reported.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "an attempt's elapsed milliseconds are wall-clock milliseconds; \
+              a duration that outlives i64's range outlives the service"
+)]
+async fn record_uncompleted_run(
+    state: &AppState,
+    principal: &Principal,
+    statement: &str,
+    engine: &str,
+    status: &'static str,
+    message: &str,
+    tables_read: &[String],
+    duration_ms: u128,
+) {
+    let Some(pool) = state.pg.as_deref() else {
+        return;
+    };
+    let user_id = principal.id.uuid().to_string();
+    let id = format!("q-{}", epoch_ms());
+    let input = RecordHistoryInput {
+        id: &id,
+        sql: statement,
+        user: &user_id,
+        owner_id: Some(principal.id.uuid()),
+        status,
+        duration_ms: duration_ms as i64,
+        scanned_bytes: 0,
+        cost_units: 0.0,
+        workload_class: "hot-analytics",
+        engine,
+        cache_assisted: false,
+        tables_read,
+        message: Some(message),
+    };
+    if let Err(err) = queries::record_history(pool, &input).await {
+        tracing::warn!(%err, "failed to record the refused or failed run");
+    }
+}
+
+/// The guard's shape of [`record_uncompleted_run`]: a refusal before the
+/// engine is asked is `blocked`, took no time, and its message is the
+/// refusal the response carries. One wrapper, so the guards' call sites
+/// stay one line and the five of them cannot drift apart.
+async fn record_blocked(
+    state: &AppState,
+    principal: &Principal,
+    statement: &str,
+    engine: &str,
+    tables_read: &[String],
+    refusal: &ApiError,
+) {
+    record_uncompleted_run(
+        state,
+        principal,
+        statement,
+        engine,
+        "blocked",
+        &refusal.to_string(),
+        tables_read,
+        0,
+    )
+    .await;
 }
 
 /// Built once per query run, unit-tested without a `ClickHouse`/Postgres
