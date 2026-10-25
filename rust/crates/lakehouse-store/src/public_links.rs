@@ -110,9 +110,10 @@ pub async fn get_for_board(
     pool: &PgPool,
     board_id: &str,
 ) -> Result<Option<PublicLink>, StoreError> {
-    Ok(sqlx::query_as(&format!(
+    // safe: only the constant `COLUMNS` is formatted in; values are bound (SEC-41).
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {COLUMNS} FROM dashboard_public_link WHERE board_id = $1"
-    ))
+    )))
     .bind(board_id)
     .fetch_optional(pool)
     .await?)
@@ -129,9 +130,10 @@ pub async fn get_live_by_token(
     pool: &PgPool,
     token: &str,
 ) -> Result<Option<PublicLink>, StoreError> {
-    Ok(sqlx::query_as(&format!(
+    // safe: only the constant `COLUMNS` is formatted in; values are bound (SEC-41).
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {COLUMNS} FROM dashboard_public_link WHERE token = $1 AND expires_at > now()"
-    ))
+    )))
     .bind(token)
     .fetch_optional(pool)
     .await?)
@@ -181,7 +183,8 @@ pub async fn replace(
         .bind(board_id)
         .execute(&mut *tx)
         .await?;
-    let link = sqlx::query_as(&format!(
+    // safe: only the constant `COLUMNS` is formatted in; values are bound (SEC-41).
+    let link = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "INSERT INTO dashboard_public_link (board_id, token, expires_at, password_hash, created_by) \
          VALUES ($1, $2, $3, $4, $5) \
          ON CONFLICT (board_id) DO UPDATE SET token = EXCLUDED.token, \
@@ -189,7 +192,7 @@ pub async fn replace(
              password_version = dashboard_public_link.password_version + 1, \
              created_by = EXCLUDED.created_by, created_at = now(), updated_at = now() \
          RETURNING {COLUMNS}"
-    ))
+    )))
     .bind(board_id)
     .bind(token)
     .bind(expires_at)
@@ -221,13 +224,14 @@ pub async fn update(
         PasswordChange::Remove => (true, None),
         PasswordChange::Set(hash) => (true, Some(hash.as_str())),
     };
-    Ok(sqlx::query_as(&format!(
+    // safe: only the constant `COLUMNS` is formatted in; values are bound (SEC-41).
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "UPDATE dashboard_public_link SET expires_at = $2, \
              password_hash = CASE WHEN $3 THEN $4 ELSE password_hash END, \
              password_version = password_version + CASE WHEN $3 THEN 1 ELSE 0 END, \
              updated_at = now() \
          WHERE board_id = $1 AND expires_at > now() RETURNING {COLUMNS}"
-    ))
+    )))
     .bind(board_id)
     .bind(expires_at)
     .bind(change)
