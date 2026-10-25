@@ -982,7 +982,7 @@ mod tests {
                 "{name}: {reply}"
             );
         }
-        assert!(sent(&server).await.is_empty());
+        assert_eq!(sent(&server).await, [] as [std::string::String; 0]);
     }
 
     /// `delete_board` moves the board and its charts to the trash exactly as

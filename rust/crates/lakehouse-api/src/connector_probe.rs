@@ -1180,9 +1180,18 @@ pub(crate) async fn connect_pinned(approved: &Approved) -> std::io::Result<tokio
 /// The refusal text for a host that resolves to an address
 /// [`is_blocked_ip`] covers. Names the caller's own `host` string, never the
 /// address it resolved to (`SEC-15`, feature page decision 6).
+///
+/// `SEC-25` (c): the literal used to be one long line with the line breaks
+/// (and their indentation) spelled as runs of spaces, so every user and log
+/// reader saw "which this          installation". The `\` continuations
+/// below keep the same sentence with single spaces.
 fn refused_internal_message(host: &str) -> String {
     format!(
-        "refusing to dial {host:?}: it resolves to a private/internal address, which this          installation does not allow connection tests to reach (an operator can list its          network in CONNECTOR_PROBE_ALLOWED_CIDRS, or set          CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS=true to allow every internal address for a          trusted internal deployment)"
+        "refusing to dial {host:?}: it resolves to a private/internal address, which this \
+         installation does not allow connection tests to reach (an operator can list its \
+         network in CONNECTOR_PROBE_ALLOWED_CIDRS, or set \
+         CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS=true to allow every internal address for a \
+         trusted internal deployment)"
     )
 }
 
@@ -1432,10 +1441,12 @@ fn parse_s3_host(host: &str) -> Option<(&str, &str)> {
 pub(crate) fn parse_endpoint_host_port(endpoint: &str) -> Option<(&str, u16)> {
     let (authority, default_port) = if let Some(rest) = endpoint.strip_prefix("https://") {
         (rest, 443)
-    } else if let Some(rest) = endpoint.strip_prefix("http://") {
-        (rest, 80)
     } else {
-        return None;
+        // REL-9: `?` on the remaining prefix says the same thing as the
+        // explicit `else { return None; }` it replaced (clippy's
+        // `question_mark` under 1.99); an endpoint with neither scheme is
+        // not a URL this function understands.
+        (endpoint.strip_prefix("http://")?, 80)
     };
     let authority = authority.split(['/', '?', '#']).next()?;
     if authority.is_empty() {
@@ -2111,6 +2122,22 @@ mod tests {
         assert!(!outcome.ok);
         assert!(outcome.latency_ms.is_none());
         assert!(outcome.message.contains("dial is invalid"));
+    }
+
+    /// `SEC-25` (c): the refusal a person and a log reader see must have
+    /// single spaces. The literal used to spell its line breaks as runs of
+    /// spaces ("which this          installation"), so this asserts the
+    /// WHOLE sentence, not a `contains`.
+    #[test]
+    fn the_private_address_refusal_reads_with_single_spaces() {
+        assert_eq!(
+            refused_internal_message("db.internal"),
+            "refusing to dial \"db.internal\": it resolves to a private/internal address, \
+             which this installation does not allow connection tests to reach (an operator \
+             can list its network in CONNECTOR_PROBE_ALLOWED_CIDRS, or set \
+             CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS=true to allow every internal address for \
+             a trusted internal deployment)"
+        );
     }
 
     #[test]

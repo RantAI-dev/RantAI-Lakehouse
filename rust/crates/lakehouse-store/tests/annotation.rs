@@ -113,7 +113,7 @@ async fn upsert_replaces_an_existing_annotation(pool: PgPool) -> sqlx::Result<()
         .expect("row present");
     assert_eq!(got.owner.as_deref(), Some("new-owner"));
     assert_eq!(got.steward.as_deref(), Some("new-steward"));
-    assert!(got.tags.is_empty());
+    assert_eq!(got.tags, [] as [std::string::String; 0]);
     assert_eq!(got.description, None);
     Ok(())
 }
@@ -273,7 +273,7 @@ async fn a_certified_mark_round_trips(pool: PgPool) -> sqlx::Result<()> {
     assert_eq!(got.certification_note, None);
     assert_eq!(got.replacement_asset_id, None);
     // An asset with no annotation row gets one with empty details.
-    assert!(got.tags.is_empty());
+    assert_eq!(got.tags, [] as [std::string::String; 0]);
     assert_eq!(got.owner, None);
     Ok(())
 }

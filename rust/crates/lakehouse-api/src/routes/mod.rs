@@ -66,7 +66,7 @@ mod uploads;
 use std::time::Duration;
 
 use axum::Router;
-use axum::extract::{DefaultBodyLimit, Request};
+use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::{Next, from_fn, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
@@ -1236,9 +1236,36 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// `GET /health` — a plain liveness check, no dependencies.
-async fn health() -> &'static str {
-    "ok"
+/// `GET /health` — liveness, plus whether the application database is
+/// usable (`OPS-4` decision 2).
+///
+/// Answers `200` whenever this process can answer at all. With no usable
+/// Postgres it still serves every Phase 1 route (catalog, overview, query,
+/// storage), and the ops gates (`ops/g*/`) poll this endpoint for a `200`
+/// to decide the API is up — a non-`200` would report the whole API as
+/// down while most of it answers. The body carries the database's state
+/// instead, so "up but degraded" is visible rather than a green check over
+/// a schema the code cannot use.
+async fn health(State(state): State<AppState>) -> ApiJson<HealthBody> {
+    ApiJson(HealthBody {
+        status: "ok",
+        database: if state.database_ready() {
+            "ok"
+        } else {
+            "unavailable"
+        },
+    })
+}
+
+/// [`health`]'s body. `status` is `ok` for any process that answers this
+/// route; `database` is `ok` only once the start-up step confirmed the
+/// schema is at this build's version (`crate::state::AppState::
+/// database_ready`), and `unavailable` otherwise — no pool at all, an
+/// unreachable one, or one that refused the migrations.
+#[derive(Debug, Serialize)]
+struct HealthBody {
+    status: &'static str,
+    database: &'static str,
 }
 
 /// The JSON body shape a request-timeout response takes — same
@@ -1288,7 +1315,7 @@ mod tests {
         assert_eq!(chat_timeout_from(Some("abc")), Duration::from_secs(120));
         assert_eq!(chat_timeout_from(Some("600")), Duration::from_secs(600));
         assert_eq!(chat_timeout_from(Some("5")), Duration::from_secs(30));
-        assert_eq!(chat_timeout_from(Some("99999")), Duration::from_secs(1800));
+        assert_eq!(chat_timeout_from(Some("99999")), Duration::from_mins(30));
     }
 
     #[test]
@@ -1397,8 +1424,23 @@ mod route_policy_tests {
     use crate::policy::{POLICY_TABLE, Policy};
     use crate::state::AppState;
 
+    /// A router whose state can AUTHENTICATE, with nothing to connect to.
+    ///
+    /// `SEC-37`: an unset `DATABASE_URL` now means "no Postgres pool", and
+    /// without one [`crate::auth::AuthenticatedPrincipal`] refuses every
+    /// protected route with 503 before it looks at the request — the honest
+    /// answer for a deployment that cannot check a credential, but it hides
+    /// the 401 this test exists to observe (a `RequiresAuth` entry with no
+    /// credential presented). So the state is built the way the old default
+    /// DSN built it: a LAZY pool (`connect_lazy` does no I/O) at a
+    /// throwaway address this test never dials, since the no-credential
+    /// path never reaches it.
     fn test_router() -> axum::Router {
-        let cfg = Config::from_map(&std::collections::HashMap::new()).unwrap();
+        let env = std::collections::HashMap::from([(
+            "DATABASE_URL".to_owned(),
+            "postgres://test:test@127.0.0.1:5432/test".to_owned(),
+        )]);
+        let cfg = Config::from_map(&env).unwrap();
         super::router(AppState::new(cfg))
     }
 

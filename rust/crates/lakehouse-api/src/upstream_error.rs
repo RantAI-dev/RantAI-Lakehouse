@@ -340,18 +340,30 @@ pub fn report_ch(ctx: &Context, err: &ChError) -> UpstreamFailure {
     report(ctx, class, err)
 }
 
-/// [`report`] for a Postgres error: an unreachable database, a closed or
+/// The class of a Postgres error: an unreachable database, a closed or
 /// exhausted pool and an I/O failure are [`Class::Unavailable`]; everything
 /// else is [`Class::Failed`].
+///
+/// Split out of [`report_sqlx`] so a caller that has to DECIDE on the class
+/// rather than report-and-convert can ask the same question:
+/// `main::is_unreachable_database` does, for `OPS-4`'s start-up choice
+/// between "refuse to start" (the database answered and the migration
+/// failed) and "degrade and retry" (it could not be reached at all).
 #[must_use]
-pub fn report_sqlx(ctx: &Context, err: &sqlx::Error) -> UpstreamFailure {
-    let class = match err {
+pub fn class_of_sqlx(err: &sqlx::Error) -> Class {
+    match err {
         sqlx::Error::Io(_)
         | sqlx::Error::PoolTimedOut
         | sqlx::Error::PoolClosed
         | sqlx::Error::WorkerCrashed => Class::Unavailable,
         _ => Class::Failed,
-    };
+    }
+}
+
+/// [`report`] for a Postgres error, classed by [`class_of_sqlx`].
+#[must_use]
+pub fn report_sqlx(ctx: &Context, err: &sqlx::Error) -> UpstreamFailure {
+    let class = class_of_sqlx(err);
     report(ctx, class, err)
 }
 

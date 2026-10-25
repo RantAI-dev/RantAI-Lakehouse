@@ -72,6 +72,25 @@ def _env(name: str, default: str) -> str:
     return value if value else default
 
 
+def _required_env(name: str) -> str:
+    """Read `name`, stopping the script when it is unset or empty.
+
+    `SEC-37`: this script used to fall back to the literal `rustfsadmin` for
+    the two S3 credentials. A credential written into the code is one an
+    operator never chose (`AGENTS.md` rule 5); compose always sets these two
+    on the container this script runs in, so a missing value is a
+    misconfiguration. Name it and exit non-zero (`SystemExit` is a gate
+    script's own config-error exit) instead of dialling the warehouse with a
+    guessed key.
+    """
+    value = _env(name, "")
+    if not value:
+        raise SystemExit(
+            f"{name} must be set (SEC-37: no default credentials in code)"
+        )
+    return value
+
+
 def _lakekeeper_token() -> str:
     """R1 (ADR 0011): Lakekeeper authorization is enforced by default in
     this stack (no "allow-all" mode) -- a bare unauthenticated `RestCatalog`
@@ -104,13 +123,15 @@ def _catalog():
         # (`CONNECTOR_S3_ACCESS_KEY`/`CONNECTOR_S3_SECRET_KEY`, set in
         # `docker-compose.yml`'s `dagster-code-location` env block — this
         # script runs INSIDE that same container per `docs/plans/
-        # G3-RESULT.md`). Those vars default to the RustFS root key only
+        # G3-RESULT.md`). Those vars point at the RustFS root key there only
         # because this stack's RustFS version has no non-proprietary-API
         # way to mint a narrower S3 identity (see `dlt_pipeline.py`'s
         # matching comment) — a deployment that can provision one only
-        # needs to set the two vars, no script change.
-        "s3.access-key-id": _env("CONNECTOR_S3_ACCESS_KEY", "rustfsadmin"),
-        "s3.secret-access-key": _env("CONNECTOR_S3_SECRET_KEY", "rustfsadmin"),
+        # needs to set the two vars, no script change. `SEC-37`: they are
+        # REQUIRED here; the old `rustfsadmin` fallback is gone, so an
+        # unset value stops this script rather than dialling with it.
+        "s3.access-key-id": _required_env("CONNECTOR_S3_ACCESS_KEY"),
+        "s3.secret-access-key": _required_env("CONNECTOR_S3_SECRET_KEY"),
         "s3.region": "us-east-1",
         "s3.path-style-access": "true",
         "s3.force-virtual-addressing": "false",

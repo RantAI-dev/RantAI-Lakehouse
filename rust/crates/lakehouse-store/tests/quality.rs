@@ -278,7 +278,10 @@ async fn a_schedule_is_kept_per_table_and_replaced_by_the_next_one(
     pool: PgPool,
 ) -> sqlx::Result<()> {
     // No row is the default: nothing listed.
-    assert!(list_schedules(&pool).await.unwrap().is_empty());
+    assert_eq!(
+        list_schedules(&pool).await.unwrap(),
+        [] as [lakehouse_store::quality::QualitySchedule; 0]
+    );
 
     let first = put_schedule(&pool, " Silver.Orders ", ScheduleMode::Interval, 180, USER)
         .await
