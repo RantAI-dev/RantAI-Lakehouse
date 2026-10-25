@@ -235,7 +235,7 @@ export function useQueryStudio() {
     queryService.saveQuery(input, signal)
   )
   const savedState = useService((s) => queryService.listSaved(s), [])
-  const historyState = useService((s) => queryService.listHistory(s), [])
+  const historyState = useService((s) => queryService.listHistory(undefined, s), [])
 
   // The tables the catalog shows, from the real catalog so suggestions
   // cannot drift from what exists.
