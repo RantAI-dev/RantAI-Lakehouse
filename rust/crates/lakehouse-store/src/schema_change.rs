@@ -694,7 +694,8 @@ async fn insert_change_row(
          DO UPDATE SET after_value = EXCLUDED.after_value, breaking = EXCLUDED.breaking \
          RETURNING {COLUMNS}, (xmax = 0) AS inserted"
     );
-    let row: SchemaChangeInserted = sqlx::query_as(&sql)
+    // safe: only the constant `COLUMNS` is formatted in; values are bound.
+    let row: SchemaChangeInserted = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(id)
         .bind(connector_id)
         .bind(object_name)
@@ -936,7 +937,8 @@ pub async fn list_pending(
         "SELECT {CHANGE_COLUMNS} FROM connector_schema_change \
          WHERE connector_id = $1 AND status = 'pending' ORDER BY detected_at, id LIMIT $2"
     );
-    let mut rows: Vec<SchemaChange> = sqlx::query_as(&sql)
+    // safe: only the constant `CHANGE_COLUMNS` is formatted in; values are bound.
+    let mut rows: Vec<SchemaChange> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(connector_id)
         .bind(PENDING_LIST_LIMIT)
         .fetch_all(pool)
@@ -965,7 +967,8 @@ pub async fn list_recent(
          WHERE connector_id = $1 AND status <> 'pending' \
          ORDER BY detected_at DESC, id DESC LIMIT $2"
     );
-    let mut rows: Vec<SchemaChange> = sqlx::query_as(&sql)
+    // safe: only the constant `CHANGE_COLUMNS` is formatted in; values are bound.
+    let mut rows: Vec<SchemaChange> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(connector_id)
         .bind(limit)
         .fetch_all(pool)
@@ -1279,7 +1282,8 @@ async fn lift_pause_if_nothing_waits(
         "SELECT {CHANGE_COLUMNS} FROM connector_schema_change \
          WHERE connector_id = $1 AND status = 'pending'"
     );
-    let mut pending: Vec<SchemaChange> = sqlx::query_as(&sql)
+    // safe: only the constant `CHANGE_COLUMNS` is formatted in; values are bound.
+    let mut pending: Vec<SchemaChange> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(connector_id)
         .fetch_all(&mut *tx)
         .await?;
@@ -1387,7 +1391,8 @@ pub async fn approve_object(
         "SELECT {CHANGE_COLUMNS} FROM connector_schema_change \
          WHERE connector_id = $1 AND object_name = $2 AND status = 'pending'"
     );
-    let pending: Vec<SchemaChange> = sqlx::query_as(&pending_sql)
+    // safe: only the constant `CHANGE_COLUMNS` is formatted in; values are bound.
+    let pending: Vec<SchemaChange> = sqlx::query_as(sqlx::AssertSqlSafe(pending_sql.as_str()))
         .bind(connector_id)
         .bind(object_name)
         .fetch_all(&mut *tx)
@@ -1413,7 +1418,8 @@ pub async fn approve_object(
          WHERE connector_id = $1 AND object_name = $2 AND status = 'pending' \
          RETURNING {CHANGE_COLUMNS}"
     );
-    let mut approved: Vec<SchemaChange> = sqlx::query_as(&sql)
+    // safe: only the constant `CHANGE_COLUMNS` is formatted in; values are bound.
+    let mut approved: Vec<SchemaChange> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(connector_id)
         .bind(object_name)
         .bind(decided_by)

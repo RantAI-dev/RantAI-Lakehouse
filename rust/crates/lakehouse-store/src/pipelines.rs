@@ -699,7 +699,8 @@ pub async fn list_pipelines(
          WHERE ($2 OR ($1::uuid IS NOT NULL AND tenant_id = $1)) \
          ORDER BY created_at DESC"
     );
-    let rows: Vec<PipelineRow> = sqlx::query_as(&sql)
+    // safe: only the constant `PIPELINE_COLUMNS` is formatted in; values are bound.
+    let rows: Vec<PipelineRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(filter.tenant_id)
         .bind(filter.all_tenants)
         .fetch_all(pool)
@@ -778,7 +779,11 @@ pub async fn assign_run_as(pool: &PgPool, id: &str, run_as: Uuid) -> Result<(), 
 /// Returns [`StoreError::Database`] if the query fails.
 pub async fn get_pipeline(pool: &PgPool, id: &str) -> Result<Option<Pipeline>, StoreError> {
     let sql = format!("SELECT {PIPELINE_COLUMNS} FROM pipeline_definition WHERE id = $1");
-    let row: Option<PipelineRow> = sqlx::query_as(&sql).bind(id).fetch_optional(pool).await?;
+    // safe: only the constant `PIPELINE_COLUMNS` is formatted in; values are bound.
+    let row: Option<PipelineRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
     Ok(row.map(Pipeline::from))
 }
 
@@ -1016,7 +1021,8 @@ schedule, description, incremental_column, fbic_enabled, transforms, \
          RETURNING {FULL_PIPELINE_COLUMNS}"
     );
     let mut tx = pool.begin().await?;
-    let row: FullPipelineRow = sqlx::query_as(&sql)
+    // safe: only the constant `FULL_PIPELINE_COLUMNS` is formatted in; values are bound.
+    let row: FullPipelineRow = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(&id)
         .bind(&input.name)
         .bind(&input.kind)
@@ -1253,7 +1259,8 @@ owner = COALESCE($10, owner), max_retries = COALESCE($11, max_retries), \
         ConnectorChange::Set(connector_id) => (true, Some(connector_id.clone())),
     };
     let mut tx = pool.begin().await?;
-    let row: Option<FullPipelineRow> = sqlx::query_as(&sql)
+    // safe: only the constant `FULL_PIPELINE_COLUMNS` is formatted in; values are bound.
+    let row: Option<FullPipelineRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(id)
         .bind(&input.kind)
         .bind(&source)
@@ -1335,9 +1342,10 @@ pub async fn delete_pipeline(
     // waits on it and then reads the same final state we are about to
     // delete, so the deleted-version row's snapshot is the stable
     // last-known state, not whatever it was at the moment of the SELECT.
-    let row: Option<FullPipelineRow> = sqlx::query_as(&format!(
+    // safe: only the constant `FULL_PIPELINE_COLUMNS` is formatted in; values are bound.
+    let row: Option<FullPipelineRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {FULL_PIPELINE_COLUMNS} FROM pipeline_definition WHERE id = $1 FOR UPDATE"
-    ))
+    )))
     .bind(id)
     .fetch_optional(&mut *tx)
     .await?;
@@ -1673,7 +1681,8 @@ pub async fn set_status(
     let sql = format!(
         "UPDATE pipeline_definition SET status = $2 WHERE id = $1 RETURNING {PIPELINE_COLUMNS}"
     );
-    let row: Option<PipelineRow> = sqlx::query_as(&sql)
+    // safe: only the constant `PIPELINE_COLUMNS` is formatted in; values are bound.
+    let row: Option<PipelineRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(id)
         .bind(status)
         .fetch_optional(pool)
@@ -1892,7 +1901,8 @@ pub async fn get_lag_state(
     pipeline_id: &str,
 ) -> Result<Option<PipelineLagState>, StoreError> {
     let sql = format!("SELECT {LAG_STATE_COLUMNS} FROM pipeline_lag_state WHERE pipeline_id = $1");
-    let row: Option<LagStateRow> = sqlx::query_as(&sql)
+    // safe: only the constant `LAG_STATE_COLUMNS` is formatted in; values are bound.
+    let row: Option<LagStateRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(pipeline_id)
         .fetch_optional(pool)
         .await?;
@@ -1972,7 +1982,8 @@ pub async fn list_lag_states(
     }
     let sql =
         format!("SELECT {LAG_STATE_COLUMNS} FROM pipeline_lag_state WHERE pipeline_id = ANY($1)");
-    let rows: Vec<LagStateRow> = sqlx::query_as(&sql)
+    // safe: only the constant `LAG_STATE_COLUMNS` is formatted in; values are bound.
+    let rows: Vec<LagStateRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(pipeline_ids)
         .fetch_all(pool)
         .await?;
@@ -2034,7 +2045,8 @@ pub async fn upsert_lag_state_conn(
             behind_streak = EXCLUDED.behind_streak \
          RETURNING {LAG_STATE_COLUMNS}"
     );
-    let row: LagStateRow = sqlx::query_as(&sql)
+    // safe: only the constant `LAG_STATE_COLUMNS` is formatted in; values are bound.
+    let row: LagStateRow = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(&update.pipeline_id)
         .bind(update.tenant_id)
         .bind(&update.consumed_tokens)
@@ -2105,7 +2117,8 @@ pub async fn lock_lag_states_ordered(
         "SELECT {LAG_STATE_COLUMNS} FROM pipeline_lag_state WHERE pipeline_id = ANY($1) \
          ORDER BY pipeline_id FOR UPDATE"
     );
-    let rows: Vec<LagStateRow> = sqlx::query_as(&sql)
+    // safe: only the constant `LAG_STATE_COLUMNS` is formatted in; values are bound.
+    let rows: Vec<LagStateRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(&ordered)
         .fetch_all(&mut *conn)
         .await?;
@@ -2162,7 +2175,8 @@ pub async fn set_target_lag(
          SET target_lag_seconds = $2, target_lag_downstream = $3 \
          WHERE id = $1 RETURNING {PIPELINE_COLUMNS}"
     );
-    let row: Option<PipelineRow> = sqlx::query_as(&sql)
+    // safe: only the constant `PIPELINE_COLUMNS` is formatted in; values are bound.
+    let row: Option<PipelineRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(id)
         .bind(seconds)
         .bind(downstream)
@@ -2298,7 +2312,8 @@ pub async fn upstream_downstream_pipelines_conn(
     let sql = format!(
         "SELECT {PIPELINE_COLUMNS} FROM pipeline_definition          WHERE target_lag_downstream = true            AND tenant_id = $4            AND id != $1            AND (target = ANY($2) OR id = ANY($3))          ORDER BY id"
     );
-    let rows: Vec<PipelineRow> = sqlx::query_as(&sql)
+    // safe: only the constant `PIPELINE_COLUMNS` is formatted in; values are bound.
+    let rows: Vec<PipelineRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(&pipeline.id)
         .bind(&input_tables)
         .bind(&pipeline.depends_on)
