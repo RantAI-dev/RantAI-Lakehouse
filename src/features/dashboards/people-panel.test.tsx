@@ -1,7 +1,7 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock } from "bun:test"
 import { MoveEffectNote } from "./folder-dialogs"
-import { PeoplePanel, RESTRICTION_NOTE } from "./people-panel"
+import { NOBODY_MANAGES_NOTE, PeoplePanel, RESTRICTION_NOTE } from "./people-panel"
 
 const originalFetch = global.fetch
 
@@ -109,6 +109,27 @@ describe("PeoplePanel (BI-19 part B1)", () => {
     stub({ ...ACCESS, restrictedAbove: [{ folderId: "f1", folderName: "Finance" }] })
     render(<PeoplePanel kind="board" id="b_1" />)
     await screen.findByText(/Already limited to the people listed by the folder “Finance”/)
+  })
+})
+
+describe("PeoplePanel warning (BI-19 B2 review note)", () => {
+  it("warns when it is restricted and nobody listed can manage, and not when somebody can", async () => {
+    stub({ ...ACCESS, restricted: true })
+    render(<PeoplePanel kind="board" id="b_1" />)
+    await screen.findByText("Dewi")
+    expect(screen.getByText(NOBODY_MANAGES_NOTE)).toBeTruthy()
+    cleanup()
+    stub({ ...ACCESS, restricted: true, rules: [{ ...ACCESS.rules[0], level: "manage" }] })
+    render(<PeoplePanel kind="board" id="b_1" />)
+    await screen.findByText("Dewi")
+    expect(screen.queryByText(NOBODY_MANAGES_NOTE)).toBeNull()
+  })
+
+  it("does not warn while the item is not restricted", async () => {
+    stub(ACCESS)
+    render(<PeoplePanel kind="board" id="b_1" />)
+    await screen.findByText("Dewi")
+    expect(screen.queryByText(NOBODY_MANAGES_NOTE)).toBeNull()
   })
 })
 

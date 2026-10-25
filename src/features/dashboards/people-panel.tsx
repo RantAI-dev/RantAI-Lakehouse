@@ -25,6 +25,15 @@ export function levelLabel(level: string): string {
   return level === "view" ? "Can view" : level === "edit" ? "Can edit" : level === "manage" ? "Can manage" : level;
 }
 
+/**
+ * `BI-19` B2 review note: a manager can restrict an item without listing
+ * themselves, and a manager of a sub-folder can cut off the manager of the
+ * folder above it. Said when "only the people listed" is on and nobody listed can
+ * manage, because that is when the person saving can lose the item.
+ */
+export const NOBODY_MANAGES_NOTE =
+  "Nobody listed can manage this. Add yourself, or a role you hold, with “Can manage”, or you may lose access to it when you save. Administrators always keep access.";
+
 const LEVELS: readonly DashboardLevel[] = ["view", "edit", "manage"];
 
 type Row = { kind: "user" | "role"; id: string; name: string; email?: string; level: AccessLevel | string };
@@ -134,6 +143,10 @@ export function PeoplePanel({ kind, id }: { readonly kind: AccessKind; readonly 
         </div>
         <Switch checked={restricted} onCheckedChange={setRestricted} aria-label="Only the people listed" disabled={busy} />
       </div>
+
+      {restricted && !rows.some((r) => r.level === "manage") ? (
+        <p role="alert" className="text-[11px] text-amber-600 dark:text-amber-400">{NOBODY_MANAGES_NOTE}</p>
+      ) : null}
 
       {access.restrictedAbove.length > 0 ? (
         <p role="status" className="text-[11px] text-amber-600 dark:text-amber-400">
