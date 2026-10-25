@@ -210,10 +210,14 @@ async fn build_state_and_pool(overrides: &HashMap<String, String>) -> (AppState,
         .expect("connect to the test-support admin database");
 
     let db_name = format!("lakehouse_api_test_{}", Uuid::new_v4().simple());
-    sqlx::query(&format!(r#"CREATE DATABASE "{db_name}""#))
-        .execute(&admin_pool)
-        .await
-        .expect("create a fresh per-test database");
+    // safe: `db_name` is this helper's own prefix plus a lowercase-hex UUID;
+    // no caller text reaches the statement.
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        r#"CREATE DATABASE "{db_name}""#
+    )))
+    .execute(&admin_pool)
+    .await
+    .expect("create a fresh per-test database");
     admin_pool.close().await;
 
     let db_url = swap_database_name(&base_url, &db_name);

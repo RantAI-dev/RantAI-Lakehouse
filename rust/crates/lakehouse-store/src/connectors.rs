@@ -372,7 +372,8 @@ pub async fn list_connectors(
          WHERE ($1::uuid IS NULL OR tenant_id = $1) \
          ORDER BY created_at DESC"
     );
-    let rows: Vec<ConnectorRow> = sqlx::query_as(&sql)
+    // safe: only the constant `CONNECTOR_COLUMNS` is formatted in; values are bound.
+    let rows: Vec<ConnectorRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(filter.tenant_id)
         .fetch_all(pool)
         .await?;
@@ -495,7 +496,11 @@ pub async fn assign_tenant(pool: &PgPool, id: &str, tenant_id: Uuid) -> Result<(
 /// Returns [`StoreError::Database`] if a query fails.
 pub async fn get_connector(pool: &PgPool, id: &str) -> Result<Option<ConnectorDetail>, StoreError> {
     let sql = format!("SELECT {CONNECTOR_COLUMNS} FROM connector WHERE id = $1");
-    let row: Option<ConnectorRow> = sqlx::query_as(&sql).bind(id).fetch_optional(pool).await?;
+    // safe: only the constant `CONNECTOR_COLUMNS` is formatted in; values are bound.
+    let row: Option<ConnectorRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
     let Some(row) = row else {
         return Ok(None);
     };
@@ -896,7 +901,8 @@ pub async fn create_connector(
          VALUES ($1, $2, $3, $4, 'unknown', $5, $6, $7, $8, $9, $10, $11, $12) \
          RETURNING {CONNECTOR_COLUMNS}"
     );
-    let row: ConnectorRow = sqlx::query_as(&sql)
+    // safe: only the constant `CONNECTOR_COLUMNS` is formatted in; values are bound.
+    let row: ConnectorRow = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(&id)
         .bind(&input.name)
         .bind(&input.kind)
@@ -2553,7 +2559,8 @@ pub async fn update_connector(
            schema_change_policy = COALESCE($7, schema_change_policy) \
          WHERE id = $1 RETURNING {CONNECTOR_COLUMNS}"
     );
-    let row: Option<ConnectorRow> = sqlx::query_as(&sql)
+    // safe: only the constant `CONNECTOR_COLUMNS` is formatted in; values are bound.
+    let row: Option<ConnectorRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(id)
         .bind(input.name.as_deref())
         .bind(input.direction.as_deref())

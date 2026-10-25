@@ -740,7 +740,8 @@ pub async fn list_runs(
         "SELECT {RUN_COLUMNS} FROM connector_run WHERE connector_id = $1 \
          ORDER BY started_at DESC, run_id DESC LIMIT $2"
     );
-    let rows: Vec<RunRow> = sqlx::query_as(&sql)
+    // safe: only the constant `RUN_COLUMNS` is formatted in; values are bound.
+    let rows: Vec<RunRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(connector_id)
         .bind(limit)
         .fetch_all(pool)
@@ -854,7 +855,8 @@ pub async fn get_run_log(
 ) -> Result<Option<RunLog>, StoreError> {
     let sql =
         format!("SELECT {RUN_COLUMNS} FROM connector_run WHERE run_id = $1 AND connector_id = $2");
-    let run: Option<RunRow> = sqlx::query_as(&sql)
+    // safe: only the constant `RUN_COLUMNS` is formatted in; values are bound.
+    let run: Option<RunRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(run_id)
         .bind(connector_id)
         .fetch_optional(pool)
