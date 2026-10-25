@@ -11,7 +11,9 @@ import { useReporting } from "./reporting-context";
  * this read gave it (`reporting.contentSites`, the same in the console, a public
  * link and a signed embed). A site removed from the list since the card was
  * saved renders the message and mounts no `img` and no `iframe`, so nothing is
- * requested. No Content-Security-Policy backs this up in the browser yet.
+ * requested. Since `SEC-47` the browser backs this up as well: the page's
+ * `Content-Security-Policy` limits `img-src` and `frame-src` to those same
+ * sites, so a redirect from an allowed site is refused too.
  */
 
 function Blocked({ message }: { readonly message: string }) {
