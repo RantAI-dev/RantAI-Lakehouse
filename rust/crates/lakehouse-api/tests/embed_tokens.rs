@@ -1376,7 +1376,16 @@ async fn a_chart_token_obeys_the_boards_embed_switch_and_withdrawal() {
 
 #[tokio::test]
 async fn a_chart_token_is_framed_and_withdrawn_through_its_charts_board() {
-    let fake = FakeCh::new(&json!({ "embed_origins_json": r#"["https://app.customer.example"]"# }));
+    // BI-19 B2 (PR #250 CI): `b_other` must exist, because an unknown board
+    // answers 404 before the body is judged; the 400 below is the
+    // "different dashboard" refusal for a caller who may act on both boards.
+    let fake = FakeCh::with_boards(vec![
+        board_row(
+            BOARD,
+            &json!({ "embed_origins_json": r#"["https://app.customer.example"]"# }),
+        ),
+        board_row("b_other", &json!({})),
+    ]);
     two_charts(&fake);
     let ch = fake.serve().await;
     let app = app(&ch, Some(SECRET)).await;
@@ -1720,9 +1729,11 @@ async fn the_sample_token_carries_the_chart_when_asked_and_the_locked_values_it_
         let app = &app;
         let uri = format!("/api/dashboard/embed-info?board={BOARD}{chart}");
         async move {
+            // BI-19 B2 (PR #250 CI): `embed-info` mints a sample token, so it
+            // needs manage on the dashboard; `dashboard:write` holds it.
             as_user(
                 app,
-                "dashboard:read",
+                "dashboard:write",
                 Request::builder().uri(uri),
                 Body::empty(),
             )
