@@ -95,8 +95,12 @@ async fn stop_kills_only_the_callers_own_prefix_and_counts_what_was_running() {
     assert!(sent.iter().all(|b| !b.contains(OTHER_PERSON)));
 }
 
+// BI-5 review S2 (PR #245 CI): Stop always sends the kill, even when the
+// count is 0, because a query can start between the count and the kill and
+// `KILL` of nothing is harmless. The run's stopped mark is set by the same
+// `stop_own_queries` and is asserted in `routes/ai/tools/limits.rs`.
 #[tokio::test]
-async fn nothing_running_is_stopped_zero_and_sends_no_kill() {
+async fn nothing_running_is_stopped_zero_and_still_sends_a_kill_for_only_the_callers_own_run() {
     let server = engine(0).await;
     let mut env = HashMap::new();
     env.insert("CH_URL".to_owned(), server.uri());
@@ -106,7 +110,16 @@ async fn nothing_running_is_stopped_zero_and_sends_no_kill() {
     let (status, body) = stop(&router, &cookie, &json!({ "runId": RUN }).to_string()).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, json!({ "stopped": 0 }));
-    assert!(bodies(&server).await.iter().all(|b| !b.starts_with("KILL")));
+
+    let sent = bodies(&server).await;
+    let kills: Vec<&String> = sent.iter().filter(|b| b.starts_with("KILL")).collect();
+    assert_eq!(
+        kills,
+        vec![&format!(
+            "KILL QUERY WHERE query_id LIKE '{user}:{RUN}:%' ASYNC"
+        )]
+    );
+    assert!(sent.iter().all(|b| !b.contains(OTHER_PERSON)));
 }
 
 #[tokio::test]

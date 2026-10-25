@@ -378,6 +378,21 @@ review these added Ask-mode sentences (Assistant parity):**
 > data was computed) and remembered (true when it came from memory), so for "how fresh is this
 > dashboard?" read them from the data and say the time.
 
+### PR #245 CI: `query_cancel_route.rs` encoded the pre-review Stop (developer)
+
+`nothing_running_is_stopped_zero_and_sends_no_kill` asserted that no `KILL` is sent when the count
+is 0. That is the behaviour before BI-5 review S2 / re-review R2, which decided Stop always sends the
+kill (a query can start between the count and the kill; `KILL` of nothing is harmless). The test was
+wrong, not the product. Renamed to
+`nothing_running_is_stopped_zero_and_still_sends_a_kill_for_only_the_callers_own_run`: it now asserts
+`{stopped: 0}`, exactly one `KILL`, that it is `KILL QUERY WHERE query_id LIKE '<caller>:<run>:%'
+ASYNC`, and that no request names another person. The stopped mark is not asserted here (the
+integration app exposes no `AppState`); it is set by the same `stop_own_queries` and asserted in
+`routes/ai/tools/limits.rs`.
+
+**Not verified:** this test was not compiled or run, and the full `cargo test -p lakehouse-api` sweep
+was not run, because `df -h /` showed 3.8 GB free (below the 5 GB stop line).
+
 ## 8. Review (planner appends)
 
 Planner, 2026-10-24: the console's shapes are accepted as the contract for the Rust tasks (the `/api/settings/limits` GET/PUT shape, the failed tile's `limit`, `X-Run-Id`, `POST /api/query/cancel`). The row-cut marker on a tile result is named **`limitHit`**, because `limit` is already a raw table's page size. T1 to T5 build to these shapes.
