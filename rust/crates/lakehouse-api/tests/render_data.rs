@@ -340,11 +340,10 @@ async fn a_personal_board_prints_for_its_owner_only() {
         None,
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{theirs}");
-    assert!(
-        theirs["charts"].as_array().unwrap().is_empty(),
-        "another person's personal board has no tiles for them: {theirs}"
-    );
+    // BI-19 B1 (PR #250 CI): another person's personal board reads as a board
+    // that does not exist (the same 404 as `GET /api/dashboard`), where it once
+    // printed an empty page. The product is right; the old expectation was not.
+    assert_eq!(status, StatusCode::NOT_FOUND, "{theirs}");
 }
 
 #[tokio::test]
