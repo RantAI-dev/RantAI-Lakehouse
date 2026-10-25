@@ -183,6 +183,8 @@ export function measureLimits(kind: string, rowsMode = false): { min: number; ma
       return { min: 3, max: 3, own: true }
     // BI-16 part B: a histogram counts the rows of its dimension and takes no measure.
     case "histogram":
+    // BI-16 part C1 (plan D1): a Gantt chart has a start and an end instead of a measure.
+    case "gantt":
       return { min: 0, max: 0, own: false }
     default:
       return { min: 1, max: 1, own: false }
@@ -198,7 +200,7 @@ export function takesOther(kind: string, rowsMode = false): boolean {
 /** Kinds whose statement is a plain `GROUP BY`, the only ones a sort applies to. */
 export function takesSort(kind: string, rowsMode = false): boolean {
   if (rowsMode) return false
-  return !["text", "kpi", "gauge", "boxplot", "pointmap", "geoheat", "pivot", "progress", "histogram", "bullet", "image", "web"].includes(kind)
+  return !["text", "kpi", "gauge", "boxplot", "pointmap", "geoheat", "pivot", "progress", "histogram", "bullet", "image", "web", "gantt"].includes(kind)
 }
 
 // ── the sort choice ──────────────────────────────────────────────────────

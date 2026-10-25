@@ -204,6 +204,29 @@ export type ColumnLineage = {
   chartsUnavailable?: boolean
 }
 
+/**
+ * One chart that reads a table (`BI-14` plan D5): directly, or through a SQL
+ * source or a metric (`via`). Same names as `ColumnChart`, plus how it reads it.
+ */
+export type UsedByChart = ColumnChart & { via: "direct" | "sql_source" | "metric" | string }
+
+/**
+ * `GET /api/governance/lineage/used-by?table=` (`BI-14` plan D5, `lineage:read`):
+ * the charts the caller may see that read a table, up to 200, and how many more
+ * exist that the caller may not see (never named). **Not on the server yet**
+ * (T3 of the BI-14 plan); the field names are the console's choice and are the
+ * contract for T3.
+ */
+export type UsedBy = {
+  supported: boolean
+  table: string
+  charts: UsedByChart[]
+  /** Charts the caller cannot see ("and 3 more you do not have access to"). */
+  hiddenCount: number
+  /** True when more than 200 charts matched and only the first 200 are listed. */
+  truncated?: boolean
+}
+
 export type LineageGraph = {
   focus: string
   nodes: { id: string; label: string; kind: string }[]
@@ -328,6 +351,8 @@ export interface GovernanceService {
    * built from it (`down`); needs `lineage:read`, and charts need
    * `dashboard:read`.
    */
+  /** The charts that read a table (`BI-14` plan D5); needs `lineage:read`. */
+  getUsedBy(table: string, signal?: AbortSignal): Promise<UsedBy>
   getColumnLineage(
     table: string,
     column: string,

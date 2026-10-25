@@ -642,6 +642,18 @@ mod tests {
         }
     }
 
+    /// A role with no authored obligation anywhere.
+    struct NoObligations;
+
+    impl ObligationsSource for NoObligations {
+        fn obligations_for(&self, _table: &str, _roles: &[String]) -> Option<TableObligations> {
+            None
+        }
+        fn has_any_obligation(&self, _roles: &[String]) -> bool {
+            false
+        }
+    }
+
     fn rewrite(sql: &str, policy: &OneTable) -> Result<String, RewriteError> {
         enforce(
             sql,
@@ -921,7 +933,16 @@ mod tests {
         .into_iter()
         .map(|(n, k)| (n.to_owned(), k))
         .collect();
-        let time = TimeContext::default();
+        // `RegionOf` resolves its map literal against the uploaded maps, so the
+        // context carries one named exactly as the catalog example says (PR #246
+        // CI). Its compiled form reads the map's dictionary through a string
+        // literal in `dictGetOrDefault`, not through a `FROM`, so the
+        // "only its own table" assertions below stay unchanged and still cover it.
+        let time = TimeContext::default().with_maps(vec![lakehouse_bi::geo::SpatialMap {
+            id: "m_0123456789ab".to_owned(),
+            name: "Sales regions".to_owned(),
+            region_lookup: true,
+        }]);
         let policy = OneTable {
             table: "serving.t",
             mask: vec!["label"],
@@ -931,6 +952,37 @@ mod tests {
         for f in lakehouse_bi::formula::catalog::CATALOG {
             let c = compile(f.example, &Scope::new(&columns, &time), None).unwrap();
             let sql = format!("SELECT {} AS v FROM serving.t", c.sql);
+            // PR #246 CI: `RegionOf` compiles to `dictGetOrDefault`, which the
+            // role rewrite refuses for any principal with an authored
+            // obligation; the catalog says "Not available to a role that has a
+            // data policy", so refusal is the specified behaviour, not a gap.
+            // The example is still checked on both sides: refused under the
+            // policy, and, for a role with no obligation, passed through
+            // reading only its own table (the dictionary is named in a string
+            // literal, never a `FROM`).
+            if c.sql.contains("dictGet") {
+                assert!(
+                    matches!(
+                        rewrite(&sql, &policy),
+                        Err(RewriteError::DictOrJoinFunctionDenied { .. })
+                    ),
+                    "{}: {sql}",
+                    f.name
+                );
+                let free = enforce(
+                    &sql,
+                    &ClickHouseDialect {},
+                    &["analyst".to_owned()],
+                    &PlaceholderValues::none(),
+                    &NoObligations,
+                    &NoViews,
+                )
+                .unwrap_or_else(|failure| panic!("{}: {failure}\n{sql}", f.name));
+                let tables =
+                    crate::sql_rewrite::referenced_tables(&free, &ClickHouseDialect {}).unwrap();
+                assert_eq!(tables, vec!["serving.t".to_owned()], "{}", f.name);
+                continue;
+            }
             let out = rewrite(&sql, &policy).unwrap_or_else(|failure| {
                 panic!("{}: {failure}\n{sql}", f.name);
             });

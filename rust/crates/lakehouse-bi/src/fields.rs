@@ -621,6 +621,7 @@ fn takes_aggregate_measure(def: &ChartInput) -> bool {
         ChartKind::Gauge | ChartKind::Progress | ChartKind::Bullet => true,
         ChartKind::Boxplot
         | ChartKind::Histogram
+        | ChartKind::Gantt
         | ChartKind::Pointmap
         | ChartKind::Geoheat
         | ChartKind::Pivot

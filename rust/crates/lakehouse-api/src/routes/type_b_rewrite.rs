@@ -139,3 +139,23 @@ fn a_bullet_per_category_with_a_goal_value_stays_governed() {
         }
     });
 }
+
+/// `BI-16` part C1: a Gantt chart's statement reads the table once, under the
+/// rename of its columns, with the dashboard's predicates inside; the role
+/// rewrite must govern that read like any other.
+#[test]
+fn a_gantt_statement_reads_the_table_only_through_its_governed_projection() {
+    on_worker_stack(|| {
+        let spec = typed(
+            "gantt",
+            &json!({
+                "dimension": "place", "breakdown": "category",
+                "start": "visit_date", "end": "visit_date",
+            }),
+        );
+        let dash = [dashboard_filter(
+            r#"{"column":"category","values":["Office","Retail"]}"#,
+        )];
+        governed("gantt, filtered", &spec, &dash, &only_jakarta());
+    });
+}

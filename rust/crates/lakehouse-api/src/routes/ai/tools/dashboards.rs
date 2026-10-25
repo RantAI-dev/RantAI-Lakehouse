@@ -1235,6 +1235,56 @@ mod tests {
         }
     }
 
+    /// `BI-16` part C1 (`AI-5`): "Show the project plan as a Gantt chart" is a
+    /// task column, a start and an end; a start that is not a date is refused
+    /// in the console's words.
+    #[tokio::test]
+    async fn the_request_to_show_the_project_plan_creates_a_gantt_chart() {
+        let server = MockServer::start().await;
+        rows(&server, "FROM system.tables", vec![json!({ "n": "1" })]).await;
+        rows(
+            &server,
+            "FROM system.columns",
+            vec![
+                json!({ "name": "task", "type": "String" }),
+                json!({ "name": "team", "type": "String" }),
+                json!({ "name": "begins", "type": "Date" }),
+                json!({ "name": "ends", "type": "Date" }),
+                json!({ "name": "done", "type": "Float64" }),
+            ],
+        )
+        .await;
+        rest(&server).await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let time = lakehouse_bi::grain::TimeContext::default();
+        let plan = json!({
+            "title": "Project plan", "kind": "gantt", "mart": "mart_x", "dimension": "task",
+            "breakdown": "team", "start": "begins", "end": "ends", "progress": "done",
+        });
+        let made = create_chart(&ch, None, &arguments(plan.clone()), None, &time).await;
+        assert_eq!(made["created"], json!(true), "{made}");
+        let all = sent(&server).await;
+        let ran = statements(&all);
+        assert!(ran[0].contains("WHERE __e >= __s"), "{}", ran[0]);
+        for (extra, sentence) in [
+            (json!({ "start": "team" }), "not a date or date-time column"),
+            (json!({ "progress": "team" }), "not a number column"),
+            (json!({ "end": null }), "start column and an end column"),
+            (json!({ "measures": ["done"] }), "no measure"),
+        ] {
+            let mut input = plan.clone();
+            input
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let reply = create_chart(&ch, None, &arguments(input), None, &time).await;
+            assert!(
+                reply["error"].as_str().unwrap().contains(sentence),
+                "{reply}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn a_bullet_graph_per_province_with_bands_is_created_and_a_goal_on_a_bar_chart_is_refused()
      {

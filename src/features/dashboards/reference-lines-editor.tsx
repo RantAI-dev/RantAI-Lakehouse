@@ -5,13 +5,13 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { LINE_KINDS, MAX_REFERENCE_LINES, isComputedLine, type LineKind, type ParamDef, type RefLineDraft } from "@/lib/params";
+import { DEFAULT_FORECAST_HORIZON, LINE_KINDS, MAX_FORECAST_HORIZON, MAX_REFERENCE_LINES, MIN_FORECAST_HORIZON, isComputedLine, type LineKind, type ParamDef, type RefLineDraft } from "@/lib/params";
 import { ColourInput } from "./colour-input";
 
 const FIXED = "__fixed__";
 const FIRST = "__first__";
 const KIND_LABELS: Record<LineKind, string> = {
-  value: "A value", average: "Average", median: "Median", min: "Minimum", max: "Maximum", trend: "Linear trend", band: "A band",
+  value: "A value", average: "Average", median: "Median", min: "Minimum", max: "Maximum", trend: "Linear trend", band: "A band", forecast: "Forecast",
 };
 
 /**
@@ -22,15 +22,20 @@ const KIND_LABELS: Record<LineKind, string> = {
  * parameter. `valueNames` lets a computed line say which value it describes.
  */
 export function ReferenceLinesEditor({
-  value, onChange, numberParams, valueNames = [],
+  value, onChange, numberParams, valueNames = [], takesForecast = true,
 }: {
   readonly value: readonly RefLineDraft[];
   readonly onChange: (next: RefLineDraft[]) => void;
   readonly numberParams: readonly ParamDef[];
   readonly valueNames?: readonly string[];
+  /** `BI-17` part B: false for a chart kind that cannot draw a forecast (a horizontal bar chart). */
+  readonly takesForecast?: boolean;
 }) {
   const set = (i: number, patch: Partial<RefLineDraft>) => onChange(value.map((l, j) => (j === i ? { ...l, ...patch } : l)));
   const items: Record<string, string> = { [FIXED]: "A number", ...Object.fromEntries(numberParams.map((p) => [p.name, p.label || p.name])) };
+  // At most one forecast per chart (plan D1): the kind is offered again only to the line that has it.
+  const forecastAt = value.findIndex((l) => l.kind === "forecast");
+  const offered = (i: number) => LINE_KINDS.filter((k) => k !== "forecast" || (takesForecast && (forecastAt < 0 || forecastAt === i)));
   return (
     <div className="grid gap-1.5">
       <Label>Reference lines</Label>
@@ -62,13 +67,22 @@ export function ReferenceLinesEditor({
         };
         return (
           <div key={i} className="flex flex-wrap items-center gap-1.5">
-            <Select value={kind} items={KIND_LABELS} onValueChange={(v) => set(i, { kind: (v ?? "value") as LineKind })}>
+            <Select value={kind} items={KIND_LABELS} onValueChange={(v) => {
+              const next = (v ?? "value") as LineKind;
+              set(i, next === "forecast" && !line.horizon ? { kind: next, horizon: String(DEFAULT_FORECAST_HORIZON) } : { kind: next });
+            }}>
               <SelectTrigger className="w-32 shrink-0" aria-label={`Line ${i + 1} kind`}><SelectValue /></SelectTrigger>
               <SelectContent>
-                {LINE_KINDS.map((k) => <SelectItem key={k} value={k}>{KIND_LABELS[k]}</SelectItem>)}
+                {offered(i).map((k) => <SelectItem key={k} value={k}>{KIND_LABELS[k]}</SelectItem>)}
               </SelectContent>
             </Select>
             {computed ? null : edge("from")}
+            {kind === "forecast" ? (
+              <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                <Input className="h-8 w-16" type="number" min={MIN_FORECAST_HORIZON} max={MAX_FORECAST_HORIZON} step={1} value={line.horizon ?? ""} placeholder="6" aria-label={`Line ${i + 1} horizon`} onChange={(e) => set(i, { horizon: e.target.value })} />
+                periods ahead
+              </span>
+            ) : null}
             {kind === "band" ? edge("to") : null}
             {computed && valueNames.length > 1 ? (
               <Select value={line.measure || FIRST} items={{ [FIRST]: "First value", ...Object.fromEntries(valueNames.map((n) => [n, n])) }} onValueChange={(v) => set(i, { measure: v && v !== FIRST ? v : undefined })}>

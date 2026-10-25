@@ -54,7 +54,12 @@ export function GeoChart({ spec, rows, dark, onDataClick, format, locale, byValu
     return (
       <div className="grid h-full place-content-center px-4 text-center text-xs text-muted-foreground">
         <p className="font-medium text-foreground">Map data not loaded</p>
-        <p className="mt-1">Add <code className="rounded bg-muted px-1 font-mono">public{entry.url}</code> to enable this map.</p>
+        {entry.uploaded ? (
+          // BI-16 C2b QA fix Q1: an uploaded map has no file under public/; it is gone (deleted) or unreadable.
+          <p className="mt-1">This uploaded map no longer exists or cannot be read. Pick another map in the chart settings.</p>
+        ) : (
+          <p className="mt-1">Add <code className="rounded bg-muted px-1 font-mono">public{entry.url}</code> to enable this map.</p>
+        )}
       </div>
     );
   }

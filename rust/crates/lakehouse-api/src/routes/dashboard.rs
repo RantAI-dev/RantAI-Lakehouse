@@ -3070,8 +3070,10 @@ async fn run_records(
         )
         .await
         .map_err(|err| {
+            // BI-16 C3 review S6: the English `RegionOf` sentence, not the
+            // fixed one, when the refused statement does a region lookup.
             ApiError::Unprocessable(
-                crate::policy_engine::enforcement_error_message(&err).to_owned(),
+                crate::routes::support::enforcement_message_for(&statement, &err).to_owned(),
             )
         })
     };
@@ -3750,7 +3752,9 @@ pub(crate) async fn build_chart_file(
     )
     .await
     .map_err(|err| {
-        ApiError::Unprocessable(crate::policy_engine::enforcement_error_message(&err).to_owned())
+        ApiError::Unprocessable(
+            crate::routes::support::enforcement_message_for(&statement, &err).to_owned(),
+        )
     })?;
     let mut stream = state
         .clickhouse
@@ -4142,7 +4146,10 @@ pub(crate) async fn values_with_limit(
     )
     .await
     .map_err(|err| {
-        ApiError::Unprocessable(crate::policy_engine::enforcement_error_message(&err).to_owned())
+        // BI-16 C3 review S6 (as in `run_records`).
+        ApiError::Unprocessable(
+            crate::routes::support::enforcement_message_for(&sql, &err).to_owned(),
+        )
     })?;
     let rows = ch
         .rows(&rewritten, None)
@@ -4490,7 +4497,16 @@ fn push_shape_fields(def: &ChartInput, out: &mut Vec<(&'static str, Value)>) {
 /// the address and description of an image or web card), present only on the
 /// charts that carry them.
 fn push_type_fields(def: &ChartInput, out: &mut Vec<(&'static str, Value)>) {
-    const NAMES: [&str; 5] = ["goal", "bands", "histogram", "url", "alt"];
+    const NAMES: [&str; 8] = [
+        "goal",
+        "bands",
+        "histogram",
+        "url",
+        "alt",
+        "start",
+        "end",
+        "progress",
+    ];
     let Ok(Value::Object(fields)) = serde_json::to_value(&def.types) else {
         return;
     };

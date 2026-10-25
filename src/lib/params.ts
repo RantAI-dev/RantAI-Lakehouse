@@ -169,13 +169,22 @@ export function numberParams(defs: readonly ParamDef[]): ParamDef[] {
 
 /** A reference line as the builder holds it. `param` set means the line follows that parameter. */
 /** What a reference line marks (`BI-17` part A); mirrors `lakehouse_bi::params::LineKind`. */
-export const LINE_KINDS = ["value", "average", "median", "min", "max", "trend", "band"] as const
+export const LINE_KINDS = ["value", "average", "median", "min", "max", "trend", "band", "forecast"] as const
 export type LineKind = (typeof LINE_KINDS)[number]
 
 /** Whether the console computes the line from the rows on screen. */
 export function isComputedLine(kind: LineKind | string | undefined): boolean {
-  return kind === "average" || kind === "median" || kind === "min" || kind === "max" || kind === "trend"
+  return kind === "average" || kind === "median" || kind === "min" || kind === "max" || kind === "trend" || kind === "forecast"
 }
+
+/**
+ * `BI-17` part B (plan D1): a forecast looks 1 to 60 periods ahead, and a chart
+ * has at most one. Mirrors `lakehouse_bi::params` `ReferenceLine.horizon`; the
+ * server check lands with T1, so until then these limits are the console's only.
+ */
+export const MIN_FORECAST_HORIZON = 1
+export const MAX_FORECAST_HORIZON = 60
+export const DEFAULT_FORECAST_HORIZON = 6
 
 /**
  * A line as the builder edits it. `kind` and the fields after it are
@@ -191,6 +200,8 @@ export type RefLineDraft = {
   toParam?: string
   color?: string
   measure?: string
+  /** A forecast's periods ahead (`BI-17` part B), as typed. */
+  horizon?: string
 }
 
 /** A line as the server stores it; `value` is absent on a computed line. */
@@ -201,6 +212,8 @@ export type RefLineDef = {
   label?: string
   color?: string
   measure?: string
+  /** Periods ahead of a `forecast` line (`BI-17` part B, D1). */
+  horizon?: number
 }
 
 function edge(v: number | { param: string } | undefined): { text: string; param: string } {
@@ -220,6 +233,7 @@ export function refLinesFromDef(lines: readonly RefLineDef[] | undefined): RefLi
       ...(l.to !== undefined ? { to: to.text, toParam: to.param } : {}),
       ...(l.color ? { color: l.color } : {}),
       ...(l.measure ? { measure: l.measure } : {}),
+      ...(l.horizon !== undefined ? { horizon: String(l.horizon) } : {}),
     }
   })
 }
@@ -236,6 +250,7 @@ function edgePayload(text: string | undefined, param: string | undefined): numbe
  */
 export function refLinesPayload(rows: readonly RefLineDraft[]): RefLineDef[] {
   const out: RefLineDef[] = []
+  let forecasts = 0
   for (const r of rows.slice(0, MAX_REFERENCE_LINES)) {
     const label = r.label.trim()
     const kind = r.kind ?? "value"
@@ -243,6 +258,14 @@ export function refLinesPayload(rows: readonly RefLineDraft[]): RefLineDef[] {
       ...(label ? { label } : {}),
       ...(r.color ? { color: r.color } : {}),
       ...(isComputedLine(kind) && r.measure ? { measure: r.measure } : {}),
+    }
+    if (kind === "forecast") {
+      // At most one per chart, and only with a whole number of periods in range (D1).
+      const horizon = Number(r.horizon)
+      if (forecasts > 0 || !Number.isInteger(horizon) || horizon < MIN_FORECAST_HORIZON || horizon > MAX_FORECAST_HORIZON) continue
+      forecasts += 1
+      out.push({ kind, horizon, ...rest })
+      continue
     }
     if (isComputedLine(kind)) {
       out.push({ kind, ...rest })
