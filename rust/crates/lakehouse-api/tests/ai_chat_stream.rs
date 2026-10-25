@@ -87,9 +87,14 @@ async fn mock_backends() -> (MockServer, MockServer) {
     let ch = MockServer::start().await;
     Mock::given(method("POST"))
         .and(body_string_contains("EXPLAIN AST"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "data": [{"explain": "SelectWithUnionQuery (children 1)\n ExpressionList ...\n"}],
-        })))
+        // `dry_run_sql` reads `EXPLAIN AST`'s default text format (its first
+        // line names the statement kind), not a JSON envelope. BI-5 review B2
+        // (PR #245 CI): the JSON body made the dry run refuse the statement, so
+        // `run_sql` never reached the engine and the B2 test saw no query id.
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("SelectWithUnionQuery (children 1)\n ExpressionList ...\n"),
+        )
         .mount(&ch)
         .await;
     Mock::given(method("POST"))
