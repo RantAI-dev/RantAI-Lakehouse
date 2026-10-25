@@ -663,9 +663,11 @@ impl Stack {
                 .unwrap()
                 .unwrap();
         }
-        sqlx::query(&format!(
+        // safe: `age` is one of this test file's own interval literals
+        // ("10 seconds", "1 hour", ...), never caller text.
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "UPDATE file_upload SET updated_at = now() - interval '{age}' WHERE id = $1"
-        ))
+        )))
         .bind(id)
         .execute(&self.app.pool)
         .await

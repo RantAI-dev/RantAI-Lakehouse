@@ -6,7 +6,7 @@ members = ["crates/*"]
 edition = "2024"
 # Floor, not the edition-2024 minimum (1.85). Since REL-9 (product-owner
 # decision D1, 2026-10-17) the floor is the latest stable, same release as
-# the `rust-toolchain.toml` pin: `sqlx` 0.9 — which `SEC-41` needs —
+# the `rust-toolchain.toml` pin: `sqlx` 0.9 — which `SEC-41` lands —
 # requires rustc 1.94, so a held-over lower promise could not be kept, and
 # the owner chose to move pin and floor together rather than chase
 # dependency floors. The CI `msrv` job checks it one patch below the pin
@@ -67,7 +67,17 @@ lettre = { version = "0.11", default-features = false, features = ["smtp-transpo
 wiremock = "0.6"
 tempfile = "3"
 tokio-util = "0.7"
-sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "mysql", "uuid", "time", "json", "macros", "migrate"] }
+# `SEC-41` decision 1: `sqlx` 0.9 dropped the combined `runtime-tokio-rustls`
+# feature; `runtime-tokio` + `tls-rustls` is the same pair of things it meant
+# (`tls-rustls` = `tls-rustls-ring` = `tls-rustls-ring-webpki`: rustls' ring
+# provider with webpki roots), so a connector dial uses the same crypto
+# provider and the same root store as under 0.8. `default-features = false`
+# because 0.9's default set adds `any`, which this workspace never uses
+# (`sqlx::Any`/`AnyPool` appear nowhere); `mysql-rsa` stays off (`SEC-41`
+# decision 3 / spec D3), so a MySQL server with no TLS that asks for a
+# SHA-2 password plugin is refused rather than sent an RSA-encrypted
+# password, and `rsa` leaves the API binary.
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "mysql", "uuid", "time", "json", "macros", "migrate"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 async-trait = "0.1"
 argon2 = "0.6"

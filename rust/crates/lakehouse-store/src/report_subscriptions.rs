@@ -203,7 +203,8 @@ pub async fn create(pool: &PgPool, new: &NewSubscription) -> Result<Subscription
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
          RETURNING {SUBSCRIPTION_COLUMNS}"
     );
-    let row: Subscription = sqlx::query_as(&sql)
+    // safe: only constant column lists are formatted in; values are bound (SEC-41).
+    let row: Subscription = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(&new.board)
         .bind(new.owner_id)
         .bind(parts.kind)
@@ -245,7 +246,8 @@ pub async fn update(
          grain = $11, skip_when_empty = $12, next_run_at = $13, updated_at = now() \
          WHERE id = $1 RETURNING {SUBSCRIPTION_COLUMNS}"
     );
-    let row: Option<Subscription> = sqlx::query_as(&sql)
+    // safe: only constant column lists are formatted in; values are bound (SEC-41).
+    let row: Option<Subscription> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(id)
         .bind(parts.kind)
         .bind(parts.minute)
@@ -276,7 +278,8 @@ pub async fn update(
 /// [`StoreError::Database`] if the query fails.
 pub async fn get(pool: &PgPool, id: Uuid) -> Result<Option<Subscription>, StoreError> {
     let sql = format!("SELECT {SUBSCRIPTION_COLUMNS} FROM report_subscription WHERE id = $1");
-    Ok(sqlx::query_as(&sql).bind(id).fetch_optional(pool).await?)
+    // safe: only constant column lists are formatted in; values are bound (SEC-41).
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str())).bind(id).fetch_optional(pool).await?)
 }
 
 /// The subscriptions of one dashboard, oldest first.
@@ -289,7 +292,8 @@ pub async fn list_for_board(pool: &PgPool, board: &str) -> Result<Vec<Subscripti
         "SELECT {SUBSCRIPTION_COLUMNS} FROM report_subscription WHERE board = $1 \
          ORDER BY created_at, id"
     );
-    Ok(sqlx::query_as(&sql).bind(board).fetch_all(pool).await?)
+    // safe: only constant column lists are formatted in; values are bound (SEC-41).
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str())).bind(board).fetch_all(pool).await?)
 }
 
 /// The subscriptions a person owns, oldest first (the assistant's list).
@@ -302,7 +306,8 @@ pub async fn list_for_owner(pool: &PgPool, owner: Uuid) -> Result<Vec<Subscripti
         "SELECT {SUBSCRIPTION_COLUMNS} FROM report_subscription WHERE owner_id = $1 \
          ORDER BY created_at, id"
     );
-    Ok(sqlx::query_as(&sql).bind(owner).fetch_all(pool).await?)
+    // safe: only constant column lists are formatted in; values are bound (SEC-41).
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str())).bind(owner).fetch_all(pool).await?)
 }
 
 /// A subscription's recipients, user recipients with their current name,
@@ -366,7 +371,8 @@ pub async fn set_paused(
              updated_at = now() WHERE id = $1 RETURNING {SUBSCRIPTION_COLUMNS}"
         )
     };
-    Ok(sqlx::query_as(&sql)
+    // safe: only constant column lists are formatted in; values are bound (SEC-41).
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(id)
         .bind(reason)
         .bind(resume_at)
@@ -420,7 +426,8 @@ where
          WHERE NOT paused AND next_run_at <= $1 ORDER BY next_run_at, id LIMIT $2 \
          FOR UPDATE SKIP LOCKED"
     );
-    let due: Vec<Subscription> = sqlx::query_as(&sql)
+    // safe: only constant column lists are formatted in; values are bound (SEC-41).
+    let due: Vec<Subscription> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(now)
         .bind(limit)
         .fetch_all(&mut *tx)
@@ -525,7 +532,8 @@ pub async fn record_delivery(pool: &PgPool, new: &NewDelivery) -> Result<Deliver
         "INSERT INTO report_delivery (subscription_id, started_at, finished_at, status, origin, \
          recipient_count, reason) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING {DELIVERY_COLUMNS}"
     );
-    Ok(sqlx::query_as(&sql)
+    // safe: only constant column lists are formatted in; values are bound (SEC-41).
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(new.subscription_id)
         .bind(new.started_at)
         .bind(new.finished_at)
@@ -551,7 +559,8 @@ pub async fn list_deliveries(
         "SELECT {DELIVERY_COLUMNS} FROM report_delivery WHERE subscription_id = $1 \
          ORDER BY started_at DESC, id LIMIT $2"
     );
-    Ok(sqlx::query_as(&sql)
+    // safe: only constant column lists are formatted in; values are bound (SEC-41).
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(subscription)
         .bind(limit)
         .fetch_all(pool)
@@ -572,7 +581,8 @@ pub async fn last_deliveries(
         "SELECT DISTINCT ON (subscription_id) {DELIVERY_COLUMNS} FROM report_delivery \
          WHERE subscription_id = ANY($1) ORDER BY subscription_id, started_at DESC, id"
     );
-    Ok(sqlx::query_as(&sql)
+    // safe: only constant column lists are formatted in; values are bound (SEC-41).
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(subscriptions)
         .fetch_all(pool)
         .await?)

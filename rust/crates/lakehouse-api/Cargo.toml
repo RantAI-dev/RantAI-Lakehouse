@@ -185,8 +185,11 @@ lakehouse-notify = { path = "../lakehouse-notify", features = ["test-support"] }
 async-trait = { workspace = true }
 # `#[tokio::test(start_paused = true)]` for `bounded::run_with_budget`'s
 # deterministic budget/timeout tests (WS2 §4) — a real `sleep` would make
-# those tests slow and, at the margins, flaky.
-tokio = { workspace = true, features = ["test-util"] }
+# those tests slow and, at the margins, flaky. `net`/`io-util` are for
+# `tests/sec41_verify_ca.rs`'s TLS terminator (a loopback `TcpListener` and
+# `copy_bidirectional`), which is the only thing in this crate's tests that
+# needs a socket of its own.
+tokio = { workspace = true, features = ["test-util", "net", "io-util"] }
 # `tests/gold_publication.rs` (DATA-1) proves the per-mart publication
 # routes' ClickHouse-backed halves (404 for an unknown mart, skip-when-
 # unchanged for `?ifChanged=true`) against a REAL `ClickHouse` — the same
@@ -213,6 +216,22 @@ testcontainers-modules = { version = "0.15", features = ["clickhouse"] }
 rsa = "0.9"
 
 tempfile = { workspace = true }
+# `SEC-41` decision 7 / AC1: `tests/sec41_verify_ca.rs` puts a TLS
+# terminator in front of the shared test Postgres (answer `SSLRequest` with
+# `S`, then rustls, then forward bytes) and needs a certificate chain per
+# test. No certificate is committed to this repository: `.gitleaksignore`'s
+# history (SEC-36) reads a committed private key as a leak, so the chain is
+# minted at test time. `rcgen` with `ring` and no `crypto`/`pem` defaults,
+# matching this workspace's one rustls provider story (the `rustls` feature
+# `sqlx-core` turns on); MIT OR Apache-2.0. Its `yasna` dependency is the
+# only package it adds to `Cargo.lock`.
+rcgen = { version = "0.13", default-features = false, features = ["ring"] }
+# The terminator's own TLS server side, and the provider named explicitly so
+# it does not depend on which rustls consumer set the process default first.
+# Both are already in `Cargo.lock` (through `reqwest`/`object_store`/
+# `sqlx-core`); these are the first DIRECT uses here.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 
 [lints]
 workspace = true
