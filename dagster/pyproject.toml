@@ -35,15 +35,24 @@ dependencies = [
     "s3fs==2026.7.0",
     # Tier 2 ingestion adapters (mongodb, oracle, kafka stream micro-batch,
     # sftp). Verified installable for this image's interpreter
-    # (python:3.12-slim, dagster/Dockerfile) via
-    # `curl -s https://pypi.org/pypi/<pkg>/<ver>/json` on 2026-09-18: all
-    # four releases exist and each publishes a cp312 (or pure-Python
-    # py3-none-any) wheel, so none needs a source build. Newer releases
-    # exist upstream today (pymongo 4.18.1, oracledb 26.0.0, paramiko
-    # 5.0.0) but these exact pins are still real, installable releases for
-    # this interpreter, so they are kept as specified rather than bumped
-    # without a reason recorded here.
-    "pymongo==4.9.2",
+    # (python:3.12-slim, dagster/Dockerfile): each publishes a cp312 (or
+    # pure-Python py3-none-any) wheel, so none needs a source build --
+    # `oracledb`/`paramiko` checked through PyPI's JSON API on 2026-09-18,
+    # `pymongo` 4.18.2 on 2026-10-24.
+    # `pymongo` moved 4.9.2 -> 4.18.2 for `SEC-52`: 4.9.2 carries two high
+    # advisories -- GHSA-v4x9-3549-crwv (heap out-of-bounds write when
+    # encoding a BSON document) and GHSA-vp6j-j7w5-5xjj (host injection
+    # through percent-encoded delimiters in a connection string) -- plus two
+    # moderate ones (GHSA-qx36-8mw2-4r3x, GHSA-8fvv-fgr5-f8ch), and 4.18.2
+    # fixes all four. Checked against PyPI on 2026-10-24: 4.18.2 needs
+    # Python >= 3.9 and ships the cp312 manylinux x86_64 wheel this image
+    # installs. The one cost is a higher server floor: 4.14 dropped MongoDB
+    # 4.0 and 4.18 dropped 4.2, so a source must run MongoDB 4.4+; the
+    # adapter reads `find` and collection names, which every supported
+    # release carries.
+    # `oracledb` and `paramiko` stay as they are: out of `SEC-52`'s scope,
+    # and `paramiko` 3.5.0's low advisory has no fixed release to move to.
+    "pymongo==4.18.2",
     "oracledb==2.5.1",
     # adapters/sql.py builds mysql+pymysql / mssql+pyodbc connection
     # strings for the mysql/mariadb/mssql drivers, but neither driver
