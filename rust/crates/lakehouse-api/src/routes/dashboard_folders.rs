@@ -336,16 +336,31 @@ pub async fn delete(
         .iter()
         .filter(|b| b.folder_id.as_deref() == Some(id.as_str()))
         .count();
+    // BI-19 B2 review B2-2: a dashboard in the trash still names this folder
+    // and comes back into it, so deleting the folder (and its mark, R8) would
+    // hand a restricted dashboard to everyone in the trash. The trash counts.
+    let trashed = store::board_placements(ch)
+        .await
+        .map_err(|err| classify_ch_error(&err))?
+        .iter()
+        .filter(|p| p.folder_id == id)
+        .count()
+        .saturating_sub(boards);
     let source_count = sources::list_sources(ch)
         .await
         .map_err(|err| classify_ch_error(&err))?
         .iter()
         .filter(|s| s.folder_id == id)
         .count();
-    if subfolders + boards + source_count > 0 {
+    if subfolders + boards + trashed + source_count > 0 {
+        let in_trash = if trashed > 0 {
+            format!(" and {trashed} dashboard(s) in the trash (empty the trash or move them first)")
+        } else {
+            String::new()
+        };
         return Err(ApiError::Conflict(format!(
             "folder is not empty: {subfolders} subfolder(s), {boards} dashboard(s), \
-             {source_count} SQL source(s). Move or delete them first."
+             {source_count} SQL source(s){in_trash}. Move or delete them first."
         ))
         .into());
     }

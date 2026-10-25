@@ -773,7 +773,22 @@ pub async fn trash_restore(
         .await
         .map_err(|err| classify_ch_error(&err))?;
     match Kind::parse(body.kind.trim()) {
-        Some(Kind::Board) => scope.refuse_below(&placements, id, Level::Manage)?,
+        Some(Kind::Board) => {
+            scope.refuse_below(&placements, id, Level::Manage)?;
+            // BI-19 B2 review B2-2: a dashboard whose folder is gone goes back
+            // to the root (`trash::restore_board`), which is a place the caller
+            // must be allowed to file into, not a way around the folder's rules.
+            if let Some(placement) = placements.iter().find(|p| p.id == id)
+                && !placement.folder_id.is_empty()
+            {
+                let live = lakehouse_bi::folders::list_folders(ch, &Viewer::system())
+                    .await
+                    .map_err(|err| classify_ch_error(&err))?;
+                if !live.iter().any(|f| f.id == placement.folder_id) {
+                    scope.require_root(Level::Edit)?;
+                }
+            }
+        }
         Some(Kind::Chart) => {
             if let Some((_, board)) = store::chart_row_state(ch, id)
                 .await
