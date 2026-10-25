@@ -206,7 +206,8 @@ pub async fn insert(pool: &PgPool, event: NewAuditEvent) -> Result<AuditEvent, S
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
          RETURNING {AUDIT_COLUMNS}"
     );
-    let row: AuditRow = sqlx::query_as(&sql)
+    // safe: only the constant `AUDIT_COLUMNS` is formatted in; values are bound.
+    let row: AuditRow = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(&id)
         .bind(&event.principal_id)
         .bind(&event.principal_kind)
@@ -272,7 +273,8 @@ pub async fn list(pool: &PgPool, filter: AuditFilter) -> Result<Vec<AuditEvent>,
          ORDER BY at DESC \
          LIMIT $5"
     );
-    let rows: Vec<AuditRow> = sqlx::query_as(&sql)
+    // safe: only the constant `AUDIT_COLUMNS` is formatted in; values are bound.
+    let rows: Vec<AuditRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(&filter.resource_kind)
         .bind(&filter.resource_id)
         .bind(&filter.principal_id)
@@ -305,7 +307,8 @@ pub async fn list_for_resources(
          ORDER BY at DESC \
          LIMIT $3"
     );
-    let rows: Vec<AuditRow> = sqlx::query_as(&sql)
+    // safe: only the constant `AUDIT_COLUMNS` is formatted in; values are bound.
+    let rows: Vec<AuditRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(resource_kind)
         .bind(resource_ids)
         .bind(limit)

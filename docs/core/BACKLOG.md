@@ -84,7 +84,7 @@ estimate (S, M, L), which the base has no field for.
 | `SEC-35` | Task | The lineage route shows every tenant's connectors and pipelines to a caller who belongs to no tenant: `tenant_scope::resolve` returns `None` for such a caller, and `lineage::add_tenant_owned` passes it on as "no filter", against `tenant_scope`'s own rule (no tenant means an empty list). Being fixed with `DATA-19` (review BLOCKER 1), which also covers the upload edges it adds; check the other callers of `ConnectorFilter { tenant_id: None }` for the same mistake. Fixed in #165 (`DATA-19` review BLOCKER 1). | Administration & Security | P1 | Done | #165 | `DATA-19` review, round 1 |
 | `SEC-36` | Task | The full-history `gitleaks` scan runs `git fetch --all`, so it scans every branch, not only `main` and the PR: test values pushed on an open branch turn it red on `main` and on every PR. Since 2026-10-15 it is red with 20 `generic-api-key` findings, all on `feat/phase-1-rest` (#144, `SRC-12`/`SRC-13`): `CONNECTOR_SECRETS_KEY=` in `ci.yml` and the AES vector fixture `connector_secret_vector.json`. #144 must either use values the rule does not match or add exact fingerprints with proof (`SEC-1`) before it merges; then decide whether the scan should cover only `main` plus the PR head. On #144 since 2026-10-15: no key-shaped literal is committed any more (CI generates its keys at run time, the test vector describes its key), and the 22 historical findings are baselined by exact fingerprint with proof in `.gitleaksignore`; the full-history scan of the branch reports none. The scope question was settled by #172 (the history scan checks `main` and the PR, a daily scan checks every branch); the baseline stays needed for #144's own history | Administration & Security | P1 | Done | #172, #144 | `DATA-2` review (PR #164) |
 | `REL-9` | Task | Move the Rust toolchain and the declared minimum from 1.96.1 and 1.88 to the latest stable (1.99.1), and prove the code is safe on it: every compatibility note in the 1.97–1.99 release notes checked, every new warning fixed | Delivery | P1 | Done | [#243](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/243) | [spec](specs/rel-9.md) |
-| `SEC-41` | Task | Upgrade `sqlx` to 0.9: 0.8.6 cannot verify a CA when it dials an IP (it misses rustls' `NotValidForNameContext`), so `SEC-14` part B's `VerifyCa` dials fail. `mysql-rsa` stays off; each run-time query string is wrapped in `AssertSqlSafe` with its reason. **Blocked by `REL-9`** | Administration & Security | P1 | Todo |  | [spec](specs/sec-41.md) |
+| `SEC-41` | Task | Upgrade `sqlx` to 0.9: 0.8.6 cannot verify a CA when it dials an IP (it misses rustls' `NotValidForNameContext`), so `SEC-14` part B's `VerifyCa` dials fail. `mysql-rsa` stays off; each run-time query string is wrapped in `AssertSqlSafe` with its reason. **Blocked by `REL-9`** | Administration & Security | P1 | Done | [#253](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/253) | [spec](specs/sec-41.md) |
 | `SEC-42` | Task | `cargo audit` and `cargo deny` are red on `main` since 2026-10-16: `zip` 8.6.0 (through `calamine` 0.36.1, the workbook reader) has `RUSTSEC-2026-0367`, `-0368`, `-0369`, fixed in `zip` 9.0.0, and no `calamine` release accepts `zip` 9 yet. All three are in `extract` (writing an archive to disk); `calamine` only reads entries and never calls it (checked in its 0.36.1 source). Ignore the three IDs in `rust/deny.toml` and the `cargo audit` step, each with that reason and a note to drop it when `calamine` moves to `zip` 9 | Administration & Security | P1 | Done | #196 | `security.yml` on `main` |
 | `SEC-46` | Task | `cargo audit` and `cargo deny` went red on `main` on 2026-10-21: bundled root certificates still trusted distrusted emSign intermediates (`RUSTSEC-2026-0381`, `-0382`, `-0383`). `rustls-webpki`, `webpki-root-certs` and `webpki-roots` 1.x bumped; `-0381` on the `webpki-roots` 0.26 shim (re-exports 1.x, pulled only by `sqlx-core` 0.8) ignored until `SEC-41` | Administration & Security | P1 | Done | #219 | Security workflow re-run on `main`, 2026-10-21 |
 | `SEC-47` | Task | The console sends no Content-Security-Policy. With an `img-src`/`frame-src` policy, image and web cards (`BI-16` part B) could only load from the administrator's allowed sites even after a redirect; today the list checks the address as written | Administration & Security | P2 | Done | [#233](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/233) | `#199` review (`BI-16` part B, decision D4) |
@@ -307,8 +307,7 @@ parity), built after it.
 | `DATA-4` | Planned | — | `DATA-3` |
 | `DEC-8` | Decided | — | `AI-11` |
 | `QS-5` | Planned | `BI-18` (the dashboard date filter) | `AI-12` (variables part) |
-| `SEC-14` | Building | `SEC-41` (part B) | `SRC-4` (credentials) |
-| `SEC-41` | Todo | — | `SEC-14` (part B) |
+| `SEC-14` | Building | — | `SRC-4` (credentials) |
 | `AI-10` | Planned | `RPT-1`, `BI-1` | — |
 | `AI-11` | Planned | `BI-19`, `BI-26`, `DEC-8` | — |
 | `AI-12` | Building | `QS-5` (variables part) | — |
@@ -323,7 +322,7 @@ parity), built after it.
 
 **Ready to start** (Todo, Planned or Idea, nothing open blocks it; Idea items still need a spec):
 
-`ADM-1`, `ADM-2`, `AI-21`, `AI-22`, `BI-1`, `BI-14`, `BI-20`, `BI-27`, `BI-28`, `BI-29`, `BI-3`, `BI-30`, `BI-31`, `BI-32`, `BI-33`, `BI-34`, `BI-35`, `BI-4`, `BI-5`, `BIZ-1`, `BIZ-2`, `BLD-10`, `BLD-6`, `DATA-18`, `DATA-20`, `DATA-21`, `DATA-22`, `DATA-23`, `DATA-24`, `DATA-25`, `DATA-26`, `DATA-27`, `DATA-4`, `DATA-5`, `DATA-6`, `DATA-8`, `DOC-2`, `GOV-1`, `GOV-3`, `GOV-5`, `INT-2`, `OPS-2`, `OPS-3`, `OPS-6`, `OPS-8`, `QA-1`, `QRY-1`, `QS-2`, `QS-3`, `QS-4`, `REL-1`, `REL-2`, `REL-4`, `REL-7`, `SEC-22`, `SEC-34`, `SEC-4`, `SEC-40`, `SEC-41`, `SEC-50`, `SEC-7`, `SRC-15`, `SRC-18`, `SRC-2`, `SRC-22`, `SRC-23`, `SRC-24`, `SRC-25`, `SRC-26`, `SRC-27`, `SRC-28`, `SRC-30`, `SRC-31`, `SRC-33`, `SRC-5`, `VER-1`
+`ADM-1`, `ADM-2`, `AI-21`, `AI-22`, `BI-1`, `BI-14`, `BI-20`, `BI-27`, `BI-28`, `BI-29`, `BI-3`, `BI-30`, `BI-31`, `BI-32`, `BI-33`, `BI-34`, `BI-35`, `BI-4`, `BI-5`, `BIZ-1`, `BIZ-2`, `BLD-10`, `BLD-6`, `DATA-18`, `DATA-20`, `DATA-21`, `DATA-22`, `DATA-23`, `DATA-24`, `DATA-25`, `DATA-26`, `DATA-27`, `DATA-4`, `DATA-5`, `DATA-6`, `DATA-8`, `DOC-2`, `GOV-1`, `GOV-3`, `GOV-5`, `INT-2`, `OPS-2`, `OPS-3`, `OPS-6`, `OPS-8`, `QA-1`, `QRY-1`, `QS-2`, `QS-3`, `QS-4`, `REL-1`, `REL-2`, `REL-4`, `REL-7`, `SEC-22`, `SEC-34`, `SEC-4`, `SEC-40`, `SEC-50`, `SEC-7`, `SRC-15`, `SRC-18`, `SRC-2`, `SRC-22`, `SRC-23`, `SRC-24`, `SRC-25`, `SRC-26`, `SRC-27`, `SRC-28`, `SRC-30`, `SRC-31`, `SRC-33`, `SRC-5`, `VER-1`
 
 ## Dates
 
@@ -369,7 +368,7 @@ set by the product owner and are left empty until they are.
 | `DATA-10` | 2026-10-14 | 2026-10-14 | |
 | `SEC-30` | 2026-10-14 | 2026-10-15 | |
 | `REL-9` | 2026-10-17 | 2026-10-24 | |
-| `SEC-41` | 2026-10-17 | | |
+| `SEC-41` | 2026-10-17 | 2026-10-25 | |
 | `SEC-42` | 2026-10-17 | 2026-10-17 | |
 | `OPS-7` | 2026-10-15 | 2026-10-16 | |
 | `SEC-19` | | 2026-10-17 | |
@@ -392,7 +391,7 @@ set by the product owner and are left empty until they are.
 | `SEC-25` | 2026-10-23 | 2026-10-24 | |
 | `SEC-38` | 2026-10-23 | 2026-10-24 | |
 | `SEC-39` | 2026-10-23 | 2026-10-24 | |
-| `SRC-32` | 2026-10-24 | 2026-10-24 | |
+| `SRC-32` | 2026-10-24 | 2026-10-25 | |
 | `SEC-3` | 2026-10-16 | 2026-10-16 | |
 | `REL-5` | 2026-10-16 | 2026-10-16 | |
 | `OPS-1` | 2026-10-15 | 2026-10-16 | |

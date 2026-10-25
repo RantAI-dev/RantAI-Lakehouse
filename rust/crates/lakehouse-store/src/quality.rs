@@ -220,7 +220,8 @@ pub async fn list(
          ORDER BY i.opened_at DESC, i.id LIMIT {MAX_INCIDENTS}",
         columns()
     );
-    let rows = sqlx::query_as::<_, QualityIncident>(&sql)
+    // safe: `columns()`, `JOINS` and `MAX_INCIDENTS` are constant literals; values are bound.
+    let rows = sqlx::query_as::<_, QualityIncident>(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(wanted)
         .bind(asset.map(|a| a.trim().to_lowercase()))
         .fetch_all(pool)
@@ -277,7 +278,8 @@ pub async fn resolve(
     .execute(pool)
     .await?;
     let sql = format!("SELECT {} {JOINS} WHERE i.id = $1", columns());
-    let row = sqlx::query_as::<_, QualityIncident>(&sql)
+    // safe: `columns()` and `JOINS` are constant literals; values are bound.
+    let row = sqlx::query_as::<_, QualityIncident>(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(id)
         .fetch_optional(pool)
         .await?;
@@ -385,9 +387,12 @@ const SCHEDULE_SELECT: &str = "SELECT s.asset, s.mode, s.interval_minutes, u.nam
 /// [`StoreError::Database`] if the query fails.
 pub async fn list_schedules(pool: &PgPool) -> Result<Vec<QualitySchedule>, StoreError> {
     let sql = format!("{SCHEDULE_SELECT} ORDER BY s.asset");
-    Ok(sqlx::query_as::<_, QualitySchedule>(&sql)
-        .fetch_all(pool)
-        .await?)
+    // safe: only the constant `SCHEDULE_SELECT` is formatted in; values are bound.
+    Ok(
+        sqlx::query_as::<_, QualitySchedule>(sqlx::AssertSqlSafe(sql.as_str()))
+            .fetch_all(pool)
+            .await?,
+    )
 }
 
 /// Sets the schedule of `asset`.
@@ -430,10 +435,13 @@ pub async fn put_schedule(
     .execute(pool)
     .await?;
     let sql = format!("{SCHEDULE_SELECT} WHERE s.asset = $1");
-    Ok(sqlx::query_as::<_, QualitySchedule>(&sql)
-        .bind(&asset)
-        .fetch_one(pool)
-        .await?)
+    // safe: only the constant `SCHEDULE_SELECT` is formatted in; values are bound.
+    Ok(
+        sqlx::query_as::<_, QualitySchedule>(sqlx::AssertSqlSafe(sql.as_str()))
+            .bind(&asset)
+            .fetch_one(pool)
+            .await?,
+    )
 }
 
 // ── Load history ───────────────────────────────────────────────────────
