@@ -279,7 +279,10 @@ pub async fn update(
 pub async fn get(pool: &PgPool, id: Uuid) -> Result<Option<Subscription>, StoreError> {
     let sql = format!("SELECT {SUBSCRIPTION_COLUMNS} FROM report_subscription WHERE id = $1");
     // safe: only constant column lists are formatted in; values are bound (SEC-41).
-    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str())).bind(id).fetch_optional(pool).await?)
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+        .bind(id)
+        .fetch_optional(pool)
+        .await?)
 }
 
 /// The subscriptions of one dashboard, oldest first.
@@ -293,7 +296,10 @@ pub async fn list_for_board(pool: &PgPool, board: &str) -> Result<Vec<Subscripti
          ORDER BY created_at, id"
     );
     // safe: only constant column lists are formatted in; values are bound (SEC-41).
-    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str())).bind(board).fetch_all(pool).await?)
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+        .bind(board)
+        .fetch_all(pool)
+        .await?)
 }
 
 /// The subscriptions a person owns, oldest first (the assistant's list).
@@ -307,7 +313,10 @@ pub async fn list_for_owner(pool: &PgPool, owner: Uuid) -> Result<Vec<Subscripti
          ORDER BY created_at, id"
     );
     // safe: only constant column lists are formatted in; values are bound (SEC-41).
-    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str())).bind(owner).fetch_all(pool).await?)
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+        .bind(owner)
+        .fetch_all(pool)
+        .await?)
 }
 
 /// A subscription's recipients, user recipients with their current name,
