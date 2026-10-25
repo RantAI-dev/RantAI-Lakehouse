@@ -662,8 +662,12 @@ async fn users_who_may_receive(
                 .is_ok_and(|found| found.is_some()),
             Err(_) => false,
         };
-        if person.has("dashboard:read")
-            && sees_board
+        // BI-19 B2 review S3: no `dashboard:read` term. A person who holds only a
+        // rule on this dashboard has no starting point, and the resolved viewer
+        // above already refuses (fails closed) somebody with neither a starting
+        // point nor a rule, so the term could only leave out the rule-only
+        // viewer the owner decision Q-R12 means to include.
+        if sees_board
             && crate::routes::settings::may_download(&person, denied_roles)
             && shares_a_tenant
         {

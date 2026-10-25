@@ -1017,3 +1017,47 @@ async fn send_now_failures_do_not_email_the_owner_and_no_email_setup_is_not_coun
     assert_eq!(stored.consecutive_failures, 0);
     assert!(!stored.paused);
 }
+
+/// `BI-19` B2 review S3: somebody who holds only a view rule on a restricted
+/// dashboard (no `dashboard:read`) is sent its report, like anybody else the
+/// rules let in; the outside address is still left out.
+#[tokio::test]
+async fn a_rule_only_viewer_of_a_restricted_dashboard_is_sent_its_report() {
+    let f = fixture(ok_pdf(), true).await;
+    let rule_only = Uuid::new_v4();
+    sqlx::query("INSERT INTO role (id, name, permissions, description) VALUES ($1, 'Rule Only', '', 'test')")
+        .bind(rule_only)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE app_user_role SET role_id = $1 WHERE user_id = $2")
+        .bind(rule_only)
+        .bind(f.colleague)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    lakehouse_store::dashboard_access::replace_item(
+        &f.pool,
+        "board",
+        BOARD,
+        &[lakehouse_store::dashboard_access::NewRule {
+            user_id: Some(f.colleague),
+            role_id: None,
+            level: "view".to_owned(),
+        }],
+        true,
+        None,
+    )
+    .await
+    .unwrap();
+    let _sub = subscription(&f, |_| {}).await;
+
+    tick(&f.state, &f.mailer).await;
+    let reports = f.mailer.reports();
+    assert_eq!(reports.len(), 1, "the report goes out");
+    assert_eq!(
+        reports[0].bcc,
+        ["colleague@company.example"],
+        "the rule-only viewer gets it; the outside address is left out"
+    );
+}
