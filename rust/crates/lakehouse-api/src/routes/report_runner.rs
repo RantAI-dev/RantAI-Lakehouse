@@ -701,7 +701,11 @@ async fn is_empty_report(
     sub: &Subscription,
     values: &DashboardValues<'_>,
 ) -> Result<bool, Stop> {
-    let query = DashboardQuery::for_render(&sub.board, values.filters, values.params, values.grain);
+    // PR #245 CI (BI-4 part B): `payload_for` reads through the result cache,
+    // so a first empty read was served again after rows arrived and the report
+    // stayed skipped. The emptiness check always reads fresh.
+    let query = DashboardQuery::for_render(&sub.board, values.filters, values.params, values.grain)
+        .fresh_all();
     let payload = payload_for(state, owner, &query)
         .await
         .map_err(|_| stop(DASHBOARD_UNREADABLE))?;

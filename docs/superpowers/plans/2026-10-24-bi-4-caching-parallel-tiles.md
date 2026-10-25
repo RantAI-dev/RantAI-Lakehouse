@@ -434,6 +434,14 @@ mock rows are modelled on `ai_export_tools.rs` and may need a tweak in CI), the 
 `a_second_open_is_remembered...`; the full workspace run; `cargo deny`/`cargo audit`; the lockfile
 change is `jiff` added to `lakehouse-api`'s dependency list (no new package).
 
+**PR #245 CI fix (RPT-1 skip when empty).** `tests/report_runner.rs::skip_when_empty_sends_nothing_and_records_the_skip`
+failed at its second half: the runner's `is_empty_report` reads through `payload_for`, which since part B
+opens a `CacheScope`, so the empty read of the first tick was remembered and the second tick (rows now
+present) was skipped again. The test was right; the product was wrong: a send/skip decision must not rest
+on a remembered answer. `is_empty_report` now reads with `DashboardQuery::fresh_all()` (`fresh=1`). Part B
+had not listed the report runner among the callers of `payload_for`; check any other non-request caller
+that decides from the numbers.
+
 ## 8. Review (planner appends)
 
 ### Review of part B (T3–T8), planner, 2026-10-25

@@ -90,6 +90,17 @@ impl DashboardQuery {
             fresh: None,
         }
     }
+
+    /// The same read with every tile computed and its entry replaced
+    /// (`fresh=1`). For a caller that decides something from the numbers *now*
+    /// (the report runner's "skip when empty"): a remembered answer within the
+    /// install's rule is fine to show, not to base a send/skip on (RPT-1 skip
+    /// when empty, PR #245 CI).
+    #[must_use]
+    pub(crate) fn fresh_all(mut self) -> Self {
+        self.fresh = Some("1".to_owned());
+        self
+    }
 }
 
 /// Why [`get_body`] stopped: the store failed, or the request's parameter
