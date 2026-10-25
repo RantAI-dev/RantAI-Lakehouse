@@ -558,9 +558,11 @@ async fn deleting_a_connector_removes_its_schema_rows(pool: PgPool) -> sqlx::Res
         "connector_schema_change",
         "connector_inactive_column",
     ] {
-        let (count,): (i64,) = sqlx::query_as(&format!("SELECT count(*) FROM {table}"))
-            .fetch_one(&pool)
-            .await?;
+        // safe: `table` is one of this test's own literals in the loop above.
+        let (count,): (i64,) =
+            sqlx::query_as(sqlx::AssertSqlSafe(format!("SELECT count(*) FROM {table}")))
+                .fetch_one(&pool)
+                .await?;
         assert_eq!(count, 0, "{table}");
     }
     Ok(())
