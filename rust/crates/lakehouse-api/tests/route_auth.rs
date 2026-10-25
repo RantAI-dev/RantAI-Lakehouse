@@ -2883,11 +2883,17 @@ async fn the_report_routes_need_dashboard_read_both_ways() {
         .iter()
         .filter(|(_, p, _)| p.starts_with("/api/reports/"))
         .map(|(m, p, policy)| {
-            assert_eq!(
-                *policy,
-                Policy::RequiresPermission("dashboard:read"),
-                "{m} {p}"
-            );
+            // BI-19 B2 (D10, PR #250 CI): the picker is `RequiresAuth` at the
+            // router because the People panel asks it with `roles=1` for a
+            // caller who manages a dashboard by a rule alone; its handler still
+            // asks `dashboard:read` and the download right for the report
+            // picker, which the loop below proves (analyst 403, viewer past).
+            let expected = if *p == "/api/reports/recipients" {
+                Policy::RequiresAuth
+            } else {
+                Policy::RequiresPermission("dashboard:read")
+            };
+            assert_eq!(*policy, expected, "{m} {p}");
             (*m, *p)
         })
         .collect();

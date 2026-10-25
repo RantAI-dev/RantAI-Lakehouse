@@ -683,6 +683,10 @@ async fn managed_subject(
     if id.is_empty() {
         return Err(ApiError::BadRequest("id is required.".to_owned()));
     }
+    // BI-19 B2 (PR #250 CI): a caller who holds no rule and no starting point
+    // for managing anything is refused before `ClickHouse` is asked, so the
+    // answer does not depend on the analytics store being up (`route_auth`).
+    require_can_ever(state, principal, Level::Manage).await?;
     let (map, tree) = access_map(state, principal).await?;
     if !map.is_entitled() {
         return Err(refused());
