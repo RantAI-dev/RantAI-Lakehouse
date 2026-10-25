@@ -954,7 +954,7 @@ pub(crate) async fn annotate_table(
                 Err(SpecRunFailure::Clickhouse(err)) => {
                     let _logged = upstream_error::report_ch(&upstream_error::TILE, &err);
                 }
-                Err(SpecRunFailure::Refused(_)) => {}
+                Err(SpecRunFailure::Refused(_) | SpecRunFailure::Tile(_)) => {}
             }
         }
         Some(TableRead::Trend { .. }) | None => {}

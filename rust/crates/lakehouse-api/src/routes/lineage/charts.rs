@@ -288,7 +288,10 @@ pub(super) async fn add_dashboard_nodes(
     let viewer = match crate::routes::dashboard_access::usage_viewer_of(state, principal).await {
         Ok(viewer) => viewer,
         Err(err) => {
-            tracing::warn!(?err, "lineage: the caller's dashboard reach could not be resolved");
+            tracing::warn!(
+                ?err,
+                "lineage: the caller's dashboard reach could not be resolved"
+            );
             return;
         }
     };

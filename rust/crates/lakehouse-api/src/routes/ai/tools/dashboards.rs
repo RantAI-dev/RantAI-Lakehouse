@@ -1261,7 +1261,15 @@ mod tests {
             "title": "Project plan", "kind": "gantt", "mart": "mart_x", "dimension": "task",
             "breakdown": "team", "start": "begins", "end": "ends", "progress": "done",
         });
-        let made = create_chart(&ch, None, &arguments(plan.clone()), None, &time).await;
+        let made = create_chart(
+            &ch,
+            &as_viewer(None),
+            None,
+            &arguments(plan.clone()),
+            None,
+            &time,
+        )
+        .await;
         assert_eq!(made["created"], json!(true), "{made}");
         let all = sent(&server).await;
         let ran = statements(&all);
@@ -1277,7 +1285,8 @@ mod tests {
                 .as_object_mut()
                 .unwrap()
                 .extend(extra.as_object().unwrap().clone());
-            let reply = create_chart(&ch, None, &arguments(input), None, &time).await;
+            let reply =
+                create_chart(&ch, &as_viewer(None), None, &arguments(input), None, &time).await;
             assert!(
                 reply["error"].as_str().unwrap().contains(sentence),
                 "{reply}"

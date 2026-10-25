@@ -446,7 +446,7 @@ async fn deliver(
     }
     // BI-19 part B1: the owner's rules decide, not only their starting point:
     // a report is never sent from a dashboard its owner can no longer see.
-    let viewer = viewer_for(state, &owner)
+    let viewer = viewer_for(state, owner)
         .await
         .map_err(|_| stop(DASHBOARD_UNREADABLE))?;
     let board = store::get_board(&state.clickhouse, &sub.board, &viewer)
@@ -468,7 +468,7 @@ async fn deliver(
     let rows = subscriptions::recipients(pool, sub.id)
         .await
         .map_err(|_| stop(DATABASE_DOWN))?;
-    let audience = audience_for(state, &rows, &owner, (&sub.board, &settings)).await;
+    let audience = audience_for(state, &rows, owner, (&sub.board, &settings)).await;
     if audience.addresses.is_empty() {
         return Err(stop(NOBODY_LEFT));
     }
