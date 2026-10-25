@@ -83,10 +83,11 @@ pub async fn rules_for_item(
     item_kind: &str,
     item_id: &str,
 ) -> Result<Vec<AccessRule>, StoreError> {
-    Ok(sqlx::query_as(&format!(
+    // safe: only the constant `RULE_COLUMNS` is formatted in; values are bound (SEC-41).
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {RULE_COLUMNS} FROM dashboard_access_rule \
          WHERE item_kind = $1 AND item_id = $2 ORDER BY granted_at, user_id, role_id"
-    ))
+    )))
     .bind(item_kind)
     .bind(item_id)
     .fetch_all(pool)
@@ -105,11 +106,12 @@ pub async fn rules_for_grantee(
     user_id: Uuid,
     role_names: &[String],
 ) -> Result<Vec<AccessRule>, StoreError> {
-    Ok(sqlx::query_as(&format!(
+    // safe: only the constant `RULE_COLUMNS` is formatted in; values are bound (SEC-41).
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {RULE_COLUMNS} FROM dashboard_access_rule \
          WHERE user_id = $1 \
             OR role_id IN (SELECT id FROM role WHERE name = ANY($2))"
-    ))
+    )))
     .bind(user_id)
     .bind(role_names)
     .fetch_all(pool)
@@ -127,10 +129,11 @@ pub async fn rules_for_items(
     item_kind: &str,
     item_ids: &[String],
 ) -> Result<Vec<AccessRule>, StoreError> {
-    Ok(sqlx::query_as(&format!(
+    // safe: only the constant `RULE_COLUMNS` is formatted in; values are bound (SEC-41).
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {RULE_COLUMNS} FROM dashboard_access_rule \
          WHERE item_kind = $1 AND item_id = ANY($2) ORDER BY granted_at, user_id, role_id"
-    ))
+    )))
     .bind(item_kind)
     .bind(item_ids)
     .fetch_all(pool)
