@@ -387,26 +387,56 @@ async fn only_somebody_who_manages_a_dashboard_reads_or_changes_its_permissions(
     assert_eq!(body["yourLevel"], "manage");
     assert_eq!(body["rules"].as_array().unwrap().len(), 1, "{body}");
 
-    // Somebody who can see it and does not manage it is refused; somebody who
-    // cannot see it, and an id that does not exist, get the same 404.
-    // BI-19 B1 review R10: this asserted 200 although the comment and
-    // `managed_subject` say 403 (a reader holds view, not manage); corrected.
+    // BI-19 B2 (PR #250 CI): can-ever 403 before lookup. `managed_subject`
+    // first asks whether the caller can manage ANYTHING; one who cannot gets
+    // the same 403 for an existing, a hidden and an unknown id, so the answer
+    // tells them nothing about which ids exist (and no ClickHouse lookup is
+    // spent on somebody who can never act). Was: 404 for the hidden and the
+    // unknown id, written before that guard; corrected, not weakened.
     let cookie = session_cookie_for_user(&pool, reader).await;
     assert_eq!(
         get(&router, &cookie, get_access).await.0,
         StatusCode::FORBIDDEN
     );
     let cookie = session_cookie_for_user(&pool, guest).await;
-    assert_eq!(
-        get(&router, &cookie, get_access).await.0,
-        StatusCode::FORBIDDEN
-    );
+    let existing = get(&router, &cookie, get_access).await;
     let hidden = get(&router, &cookie, "/api/dashboard/access?kind=board&id=b2").await;
+    let unknown = get(&router, &cookie, "/api/dashboard/access?kind=board&id=nope").await;
+    assert_eq!(existing.0, StatusCode::FORBIDDEN);
+    assert_eq!(
+        existing, hidden,
+        "an existing and a hidden dashboard answer alike"
+    );
+    assert_eq!(
+        hidden, unknown,
+        "a hidden dashboard and an unknown id answer alike"
+    );
+
+    // Somebody who manages something (another dashboard) but cannot see this
+    // one gets a 404 identical to an unknown id: existence stays hidden from
+    // somebody who could act on it if they could see it.
+    let steward = create_principal_with_permissions(&pool, "query:read").await;
+    replace_item(
+        &pool,
+        "board",
+        "b3",
+        &[NewRule {
+            user_id: Some(steward),
+            role_id: None,
+            level: "manage".to_owned(),
+        }],
+        false,
+        None,
+    )
+    .await
+    .unwrap();
+    let cookie = session_cookie_for_user(&pool, steward).await;
+    let hidden = get(&router, &cookie, get_access).await;
     let unknown = get(&router, &cookie, "/api/dashboard/access?kind=board&id=nope").await;
     assert_eq!(hidden.0, StatusCode::NOT_FOUND);
     assert_eq!(
         hidden, unknown,
-        "an existing dashboard and an unknown id answer alike"
+        "a dashboard the steward cannot see and an unknown id answer alike"
     );
 
     // Neither permission nor rule.
