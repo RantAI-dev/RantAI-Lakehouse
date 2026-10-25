@@ -367,17 +367,26 @@ pub(super) async fn move_chart(
 
     let ch = &state.clickhouse;
     // BI-19 B1 review R1: the resolved viewer (rules and restrictions), not the baseline.
-    let viewer = match super::viewer_for_write(state, Some(principal)).await {
-        Ok(viewer) => viewer,
+    // BI-19 B2 review B2-1: `edit` on the chart's dashboard and on the target.
+    let scope = match super::scope_for_write(state, Some(principal)).await {
+        Ok(scope) => scope,
         Err(error) => return error,
     };
+    let viewer = scope.viewer.clone();
     // A chart in the trash or on a board the caller cannot see, and a target
     // in the trash or in somebody else's personal space, are "not found".
-    if let Err(gate) = require_editable_chart(ch, &id, &viewer).await {
-        return refused(gate);
+    let chart_board = match require_editable_chart(ch, &id, &viewer).await {
+        Ok(board) => board,
+        Err(gate) => return refused(gate),
+    };
+    if let Err(error) = super::require_edit_on(state, &scope, &chart_board).await {
+        return error;
     }
     if let Err(gate) = require_chart_board(ch, Some(&new_board), &viewer).await {
         return refused(gate);
+    }
+    if let Err(error) = super::require_edit_on(state, &scope, &new_board).await {
+        return error;
     }
     let stored = match store::list_stored_charts(ch, &viewer).await {
         Ok(s) => s,

@@ -546,11 +546,16 @@ pub(super) async fn list_charts(ch: &ChClient, viewer: &Viewer) -> Value {
 /// The two read tools that say what a chart can be built on beyond one mart:
 /// `list_sql_sources` and `suggest_join` (one dispatch arm, `run_tool` is at
 /// clippy's line limit).
-pub(super) async fn chart_sources(ch: &ChClient, name: &str, args: &Map<String, Value>) -> Value {
+pub(super) async fn chart_sources(
+    ch: &ChClient,
+    viewer: &Viewer,
+    name: &str,
+    args: &Map<String, Value>,
+) -> Value {
     if name == "suggest_join" {
         suggest_join(ch, args).await
     } else {
-        list_sql_sources(ch).await
+        list_sql_sources(ch, viewer).await
     }
 }
 
@@ -572,11 +577,15 @@ pub(super) async fn suggest_join(ch: &ChClient, args: &Map<String, Value>) -> Va
 /// `list_sql_sources`: every dashboard SQL source with its columns split
 /// into dimensions and measures, the same split `describe_mart` uses. A
 /// `ClickHouse` failure is a fixed message, never its text.
-pub(super) async fn list_sql_sources(ch: &ChClient) -> Value {
+///
+/// `BI-19` B2 review S4 (owner decision): a source filed in a folder is listed
+/// only to a caller who may see that folder, as in the console.
+pub(super) async fn list_sql_sources(ch: &ChClient, viewer: &Viewer) -> Value {
     match lakehouse_bi::sources::list_sources(ch).await {
         Ok(sources) => {
             let out: Vec<Value> = sources
                 .iter()
+                .filter(|s| crate::routes::dashboard_sources::source_visible(viewer, s))
                 .map(|s| {
                     let (measures, dimensions): (Vec<_>, Vec<_>) = s
                         .columns

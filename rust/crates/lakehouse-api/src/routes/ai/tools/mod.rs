@@ -161,20 +161,32 @@ pub(in crate::routes) async fn run_tool(
         "get_build_status" => pipelines::get_build_status(&state.dagster).await,
         "describe_mart" => data::describe_mart(state, principal, args).await,
         "create_chart" | "update_chart" => {
-            // BI-19 B1 review R1: the chart gates read as the resolved viewer.
-            let viewer = match viewer_for_write(state, principal).await {
-                Ok(viewer) => viewer,
+            // BI-19 B2 review B2-1: the level checks of the console's write
+            // routes (`specs_create`/`specs_update`) apply to the assistant too:
+            // `edit` on the dashboard the chart is on and on the one it moves to.
+            let scope = match scope_for_write(state, principal).await {
+                Ok(scope) => scope,
                 Err(error) => return error,
             };
+            let viewer = &scope.viewer;
+            if name == "create_chart" {
+                if let Err(error) = require_edit_on(state, &scope, &arg_str(args, "board")).await {
+                    return error;
+                }
+            } else if let Err(error) =
+                require_edit_on_chart(state, &scope, &arg_str(args, "id"), Some(args)).await
+            {
+                return error;
+            }
             // BI-9: a chart's SQL is built with the report time zone (a deployment setting).
             let Ok(time) = crate::routes::settings::time_context(state).await else {
                 // The cause was logged under a reference by `time_context`.
                 return json!({ "error": "The reporting settings could not be read." });
             };
             if name == "create_chart" {
-                dashboards::create_chart(ch, &viewer, principal, args, None, &time).await
+                dashboards::create_chart(ch, viewer, principal, args, None, &time).await
             } else {
-                dashboards::update_chart(ch, &viewer, principal, args, &time).await
+                dashboards::update_chart(ch, viewer, principal, args, &time).await
             }
         }
         "create_board" => dashboards::create_board(ch, principal, args).await,
@@ -187,9 +199,20 @@ pub(in crate::routes) async fn run_tool(
             Ok(viewer) => dashboards::list_charts(ch, &viewer).await,
             Err(error) => error,
         },
-        "list_sql_sources" | "suggest_join" => dashboards::chart_sources(ch, name, args).await,
-        "delete_chart" => match viewer_for_write(state, principal).await {
-            Ok(viewer) => dashboards::delete_chart(ch, &viewer, principal, args).await,
+        "list_sql_sources" | "suggest_join" => match viewer_for(state, principal).await {
+            Ok(viewer) => dashboards::chart_sources(ch, &viewer, name, args).await,
+            Err(error) => error,
+        },
+        "delete_chart" => match scope_for_write(state, principal).await {
+            Ok(scope) => {
+                // BI-19 B2 review B2-1: `edit` on the chart's dashboard first.
+                if let Err(error) =
+                    require_edit_on_chart(state, &scope, &arg_str(args, "id"), None).await
+                {
+                    return error;
+                }
+                dashboards::delete_chart(ch, &scope.viewer, principal, args).await
+            }
             Err(error) => error,
         },
         n if look::handles(n) => look::run(state, principal, name, args).await,
@@ -272,8 +295,10 @@ pub(super) async fn viewer_for(
     state: &AppState,
     principal: Option<&Principal>,
 ) -> Result<Viewer, Value> {
+    // `BI-19` B2 review note: nobody attached sees nothing (fail closed), not
+    // the anonymous viewer that reads as the unowned dashboards.
     let Some(principal) = principal else {
-        return Ok(Viewer::anonymous());
+        return Ok(Viewer::nothing());
     };
     crate::routes::dashboard_access::viewer_for(state, principal)
         .await
@@ -290,11 +315,79 @@ pub(super) async fn viewer_for_write(
     principal: Option<&Principal>,
 ) -> Result<Viewer, Value> {
     let Some(principal) = principal else {
-        return Ok(Viewer::anonymous());
+        return Ok(Viewer::nothing());
     };
     crate::routes::dashboard_access::viewer_for_write(state, principal)
         .await
         .map_err(|err| json!({ "error": err.to_string() }))
+}
+
+/// The write tools' starting point (`BI-19` B2 review B2-1): the caller's
+/// [`Scope`](crate::routes::dashboard_access::Scope), the one the console's
+/// write routes use, so the assistant is judged by the same levels. With nobody
+/// attached there is nobody to judge and nothing is written (fail closed).
+pub(super) async fn scope_for_write(
+    state: &AppState,
+    principal: Option<&Principal>,
+) -> Result<crate::routes::dashboard_access::Scope, Value> {
+    let Some(principal) = principal else {
+        return Err(json!({
+            "error": "the dashboard tools change a dashboard as the signed-in person, and there is none."
+        }));
+    };
+    crate::routes::dashboard_access::scope_for_write(state, principal)
+        .await
+        .map_err(|err| json!({ "error": err.to_string() }))
+}
+
+/// `edit` on the dashboard `board` (blank = the built-in one), the answer of a
+/// refusal as a tool error: the same 404 sentence for one the caller cannot see
+/// and the 403 sentence for one they see and may not edit (`BI-19` B2 review
+/// B2-1; a narrowing-only change, the tool did no such check before).
+pub(super) async fn require_edit_on(
+    state: &AppState,
+    scope: &crate::routes::dashboard_access::Scope,
+    board: &str,
+) -> Result<(), Value> {
+    crate::routes::dashboard_access::require_board_level(
+        state,
+        scope,
+        board,
+        lakehouse_bi::access::Level::Edit,
+    )
+    .await
+    .map(|_| ())
+    .map_err(|err| json!({ "error": err.to_string() }))
+}
+
+/// `edit` on the dashboard chart `id` is on and, when the call names another
+/// `board` (`update_chart`), on that one too. A chart the caller cannot edit is
+/// answered as the tool's own gate does (`require_editable_chart`).
+pub(super) async fn require_edit_on_chart(
+    state: &AppState,
+    scope: &crate::routes::dashboard_access::Scope,
+    id: &str,
+    target: Option<&Map<String, Value>>,
+) -> Result<(), Value> {
+    if id.is_empty() {
+        // The tool answers "id is required" itself.
+        return Ok(());
+    }
+    let board = crate::routes::dashboard_organise::require_editable_chart(
+        &state.clickhouse,
+        id,
+        &scope.viewer,
+    )
+    .await
+    .map_err(dashboards::refused)?;
+    require_edit_on(state, scope, &board).await?;
+    if let Some(target) = target {
+        let to = arg_str(target, "board");
+        if !to.trim().is_empty() {
+            require_edit_on(state, scope, &to).await?;
+        }
+    }
+    Ok(())
 }
 
 /// Checks a chart call before the gate offers it as a draft (plan 18). `None`
@@ -370,6 +463,129 @@ mod tests {
         }
         let unknown = run_tool(&state, None, "not_a_real_tool", &Map::new()).await;
         assert_eq!(unknown, json!({ "error": "unknown tool: not_a_real_tool" }));
+    }
+
+    /// A stand-in `ClickHouse` that holds dashboards `b1` and `b2` (unfiled,
+    /// unowned) and the chart `c1` on `b1`, enough for the write tools' level
+    /// checks, which run before anything is written.
+    struct TwoBoards;
+
+    impl wiremock::Respond for TwoBoards {
+        fn respond(&self, request: &wiremock::Request) -> wiremock::ResponseTemplate {
+            let sql = String::from_utf8_lossy(&request.body).into_owned();
+            let rows: Vec<Value> = if sql.contains("FROM console.bi_chart FINAL WHERE id = 'c1'") {
+                vec![json!({ "is_deleted": 0, "board": "b1" })]
+            } else if sql.contains("SELECT is_deleted, owner_id FROM console.bi_board FINAL") {
+                // `board_row_state`: the dashboard exists, live, unowned.
+                ["b1", "b2"]
+                    .iter()
+                    .filter(|id| sql.contains(&format!("id = '{id}'")))
+                    .map(|_| json!({ "is_deleted": 0, "owner_id": "" }))
+                    .collect()
+            } else if sql.contains("FROM console.bi_board FINAL") {
+                ["b1", "b2"]
+                    .iter()
+                    .filter(|id| sql.contains(&format!("id='{id}'")))
+                    .map(|id| json!({ "id": id, "name": id, "folder_id": "", "owner_id": "" }))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(json!({ "meta": [], "data": rows, "rows": rows.len() }))
+        }
+    }
+
+    fn state_over_two_boards(uri: &str) -> AppState {
+        let env = HashMap::from([("CH_URL".to_owned(), uri.to_owned())]);
+        AppState::new(Config::from_map(&env).unwrap())
+    }
+
+    fn caller_with(permissions: &str) -> Principal {
+        Principal {
+            id: lakehouse_auth::PrincipalId::User(uuid::Uuid::from_u128(9)),
+            tenant_ids: Vec::new(),
+            display_name: "Rina".to_owned(),
+            permissions: lakehouse_auth::PermissionSet::parse(permissions),
+            provider: "session".to_owned(),
+            must_change_password: false,
+            role_names: Vec::new(),
+        }
+    }
+
+    fn five_write_calls() -> Vec<(&'static str, Map<String, Value>)> {
+        let args = |v: Value| v.as_object().cloned().unwrap();
+        vec![
+            ("create_chart", args(json!({ "board": "b1", "title": "T" }))),
+            ("update_chart", args(json!({ "id": "c1", "board": "b2" }))),
+            ("delete_chart", args(json!({ "id": "c1" }))),
+            ("move_chart", args(json!({ "id": "c1", "board": "b2" }))),
+            ("format_chart", args(json!({ "chart": "c1" }))),
+        ]
+    }
+
+    /// `BI-19` B2 review B2-1: the assistant's five chart-writing tools are
+    /// judged by the same level as the console's routes. A caller whose
+    /// starting point is `view` (`dashboard:read` only) reaches the gate in a
+    /// unit test (the gate is not in play when `run_tool` is called) and is
+    /// refused by every tool with the 403 sentence, and nothing is written.
+    #[tokio::test]
+    async fn a_caller_at_view_level_is_refused_by_all_five_chart_write_tools() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(TwoBoards)
+            .mount(&server)
+            .await;
+        let state = state_over_two_boards(&server.uri());
+        let reader = caller_with("dashboard:read");
+        for (tool, args) in five_write_calls() {
+            let reply = run_tool(&state, Some(&reader), tool, &args).await;
+            let error = reply["error"].as_str().unwrap_or_default();
+            assert!(
+                error.contains("edit on this dashboard"),
+                "{tool} should be refused for a view caller, got {reply}"
+            );
+        }
+    }
+
+    /// The other half: at `manage` (a `dashboard:write` holder) the level check
+    /// lets the call through, so no tool answers with the level or the
+    /// not-found sentence of the check (a later step may still fail on the
+    /// stand-in, which holds no marts).
+    #[tokio::test]
+    async fn a_caller_at_manage_level_passes_the_level_check_of_the_five_tools() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(TwoBoards)
+            .mount(&server)
+            .await;
+        let state = state_over_two_boards(&server.uri());
+        let writer = caller_with("dashboard:read, dashboard:write");
+        for (tool, args) in five_write_calls() {
+            let reply = run_tool(&state, Some(&writer), tool, &args).await;
+            let error = reply["error"].as_str().unwrap_or_default();
+            assert!(
+                !error.contains("edit on this dashboard") && !error.contains("dashboard not found"),
+                "{tool} should pass the level check for a writer, got {reply}"
+            );
+        }
+    }
+
+    /// With nobody attached the write tools change nothing (and the read
+    /// tools' fallback sees nothing).
+    #[tokio::test]
+    async fn the_chart_write_tools_change_nothing_with_nobody_attached() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(TwoBoards)
+            .mount(&server)
+            .await;
+        let state = state_over_two_boards(&server.uri());
+        for (tool, args) in five_write_calls() {
+            let reply = run_tool(&state, None, tool, &args).await;
+            assert!(reply["error"].is_string(), "{tool}: {reply}");
+            assert!(reply.get("created").is_none() && reply.get("updated").is_none());
+        }
     }
 
     // PR review fix (SHOULD-FIX): `AI_ASK_BACK=false` only hid `ask_user` from
