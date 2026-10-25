@@ -354,6 +354,30 @@ Commands: as in the BI-4 entry (fmt clean, clippy `--all-targets --all-features 
 *Not verified:* the R1 integration test and the rest of `tests/report_runner.rs` (needs Postgres;
 written and compiled only); the full workspace run; `route_auth`/`sec11_guard` were not re-run.
 
+### PR #245 CI: the system-prompt pin in `ai_sql_help.rs` (developer)
+
+`ai_sql_help.rs::a_chat_with_no_allowlist_is_offered_today_s_tools_and_today_s_prompt` failed
+(`45c0fcda...` against the pinned `f59505f7...`). The pin belongs to main's AI team (added in #127,
+last moved in #188), and its comment says a change of the bytes is updated by hand when intended.
+The test's turn runs in Ask mode, so only the Ask suffix reaches it. The cause is BI-5 review S9:
+`SYSTEM_ASK_SUFFIX` now ends with the `limits_and_freshness!` sentences. Proof: hashing the captured
+system message with exactly that text removed gives the old pin `f59505f7...` again, so nothing else
+moved (no merge artifact, no changed wording). The Build-only additions (set_cache_rule, the
+export and report lines) do not reach this test, and the offered-tool list assertion still passes.
+`feat/bi-phase-6` passes with the old pin because it does not contain S9 (no
+`limits_and_freshness!`); its Distance/RegionOf line is in the Build suffix only.
+
+Pin updated to `45c0fcda7b755bbcb6eb7fa7bb48df1f724b6be61b5738546c55c41fabbe006b`. **The AI team must
+review these added Ask-mode sentences (Assistant parity):**
+
+> Charts and Query Studio run under time and row limits an administrator sets: for "what are my
+> query limits?" or "why did this chart time out?" call get_query_limits and say the limit and where
+> it comes from; you cannot change limits, an administrator does in Admin > Settings > Query limits.
+> To "stop the running query", call stop_query (it ends only the person's own running queries).
+> Dashboards remember the results of their charts; each tile result carries computedAt (when the
+> data was computed) and remembered (true when it came from memory), so for "how fresh is this
+> dashboard?" read them from the data and say the time.
+
 ## 8. Review (planner appends)
 
 Planner, 2026-10-24: the console's shapes are accepted as the contract for the Rust tasks (the `/api/settings/limits` GET/PUT shape, the failed tile's `limit`, `X-Run-Id`, `POST /api/query/cancel`). The row-cut marker on a tile result is named **`limitHit`**, because `limit` is already a raw table's page size. T1 to T5 build to these shapes.
