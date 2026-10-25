@@ -263,6 +263,12 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         "inspected for UNKNOWN_TABLE to pick a fixed message; never returned",
     ),
     // The assistant's tools.
+    // BI-19 B2 (PR #250 CI): the shared helpers in ai/tools/mod.rs.
+    (
+        "ai/tools/mod.rs",
+        ".map_err(|err| json!({ \"error\": err.to_string() }))",
+        "an ApiError from routes::dashboard_access (viewer_for, scope_for_write, require_board_level): fixed texts written in this repository, a store failure is already \"database error\" through From<StoreError>",
+    ),
     (
         "ai/tools/alerts.rs",
         "json!({ \"error\": err.to_string() })",
