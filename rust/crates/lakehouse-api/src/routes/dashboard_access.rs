@@ -407,6 +407,32 @@ pub(crate) async fn require_board_level(
     Ok(Some(board))
 }
 
+/// The caller's level on dashboard `id` for the payload's `access.level`, so the
+/// console shows only what the level allows (`BI-19` part B2, T9). The server
+/// enforces it either way; this only decides what the page offers. The reader
+/// already passed the read check, so anything that cannot be worked out reads as
+/// `view` (never a wider offer). `all`, `default` and blank are judged at the
+/// root.
+pub(crate) async fn payload_level(state: &AppState, principal: &Principal, id: &str) -> Level {
+    let Ok(scope) = scope_for_write(state, principal).await else {
+        return Level::View;
+    };
+    let id = id.trim();
+    let level = if id.is_empty() || id == store::DEFAULT_BOARD_ID || id == "all" {
+        scope.root_level()
+    } else {
+        match store::get_board(&state.clickhouse, id, &Viewer::system()).await {
+            Ok(Some(board)) => scope.map.level_for_board(
+                &board.id,
+                &board.folder_id.clone().unwrap_or_default(),
+                &board.owner_id.clone().unwrap_or_default(),
+            ),
+            _ => None,
+        }
+    };
+    level.unwrap_or(Level::View)
+}
+
 /// Whether the caller manages anything at all: the starting point is manage, or
 /// a rule names them with `manage`. The People panel's recipient picker asks it
 /// (an item-less question, as the picker is asked before an item is chosen);

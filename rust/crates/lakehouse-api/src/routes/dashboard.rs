@@ -246,7 +246,16 @@ pub(crate) async fn payload_for(
             crate::routes::settings::add_formatting(&mut body, &format);
             // BI-1 D7: the console hides the download items for a person
             // whose every role is switched off; the routes refuse anyway.
+            let level = crate::routes::dashboard_access::payload_level(
+                state,
+                principal,
+                q.board.as_deref().unwrap_or(store::DEFAULT_BOARD_ID),
+            )
+            .await;
             if let Some(map) = body.as_object_mut() {
+                // BI-19 B2 (T9): what the caller may do with this dashboard, so
+                // the console offers only that; the server checks it anyway.
+                map.insert("access".to_owned(), json!({ "level": level.as_str() }));
                 // BI-1 D1/feature decision 6: the console offers the PDF item
                 // only when the deployment has a renderer and a key for its token.
                 map.insert(

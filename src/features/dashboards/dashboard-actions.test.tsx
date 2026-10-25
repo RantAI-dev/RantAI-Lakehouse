@@ -143,9 +143,18 @@ describe("write controls (R18)", () => {
     renderMenu({ canWrite: false })
     await screen.findByText("Manual")
     for (const label of ["Rename", "Duplicate", "Delete dashboard"]) expect(screen.queryByText(label)).toBeNull()
-    for (const label of ["Refresh now", "Fullscreen", "Print…", "Export YAML", "Share…"]) {
+    for (const label of ["Refresh now", "Fullscreen", "Print…", "Export YAML"]) {
       expect(screen.getByText(label)).toBeTruthy()
     }
+    // BI-19 B2: sharing needs manage, so a viewer is not offered it either.
+    expect(screen.queryByText("Share…")).toBeNull()
+  })
+
+  it("an editor without manage is offered Rename and Duplicate but not Share or Delete (BI-19 B2)", async () => {
+    renderMenu({ canWrite: true, canManage: false })
+    expect(await screen.findByText("Rename")).toBeTruthy()
+    expect(screen.getByText("Duplicate")).toBeTruthy()
+    for (const label of ["Share…", "Delete dashboard"]) expect(screen.queryByText(label)).toBeNull()
   })
 
   it("the dashboard menu shows Rename, Duplicate and Delete to an editor", async () => {

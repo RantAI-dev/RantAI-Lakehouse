@@ -69,6 +69,7 @@ import { DrillMenu, NoteDialog, RecordsDialog, type DrillTarget } from "./drill"
 import { DrillTrail, useTileDrills } from "./tile-drills";
 import type { RecordsRequest } from "./records";
 import { forgetLastBoard, rememberLastBoard } from "./last-board";
+import { offerFor } from "./access-level";
 import { ShareDialog } from "./share-dialog";
 import { TileBody } from "./tile-body";
 import { exportNotice } from "./table-export";
@@ -106,6 +107,8 @@ type Payload = {
   reporting?: ReportingContext;
   /** False when every role of the viewer is switched off from downloading (BI-1); the download items are hidden. Absent from an older server: allowed. */
   canDownload?: boolean;
+  /** What the caller may do with this dashboard (`BI-19` B2); absent from an older server: the global permission decides. */
+  access?: { level: string };
   /** False when the deployment has no PDF renderer (`BI-1`, feature decision 6). Absent from an older server: not offered. */
   pdfSupported?: boolean;
   /** The dashboard's own theme and font (BI-17 part A); absent when it follows the console. */
@@ -665,7 +668,9 @@ export function DashboardPage({ boardId }: { boardId: string }) {
     () => placeUnboxed(charts.map((c) => ({ id: c.id, span: c.span, kind: c.kind })), layout, tabs),
     [charts, layout, tabs],
   );
-  const canWrite = hasPermission("dashboard:write");
+  // BI-19 B2: the dashboard's own level decides what is offered; the server
+  // checks every write against the same level.
+  const { canEdit: canWrite, canManage } = offerFor(data?.access?.level, hasPermission("dashboard:write"));
   const selectTab = React.useCallback((id: string) => {
     const qs = withTabParam(window.location.search, tabs, id);
     router.replace(qs ? `${pathname}?${qs}` : pathname, { scroll: false });
@@ -1095,14 +1100,15 @@ export function DashboardPage({ boardId }: { boardId: string }) {
             <DashboardActionsMenu
               isDefault={isDefault}
               canWrite={canWrite}
+              canManage={canManage}
               isPrivate={Boolean(ownerId)}
               onHistory={() => setHistoryOpen(true)}
-              onTheme={hasPermission("dashboard:write") ? () => { setThemeError(null); setThemeOpen(true); } : undefined}
+              onTheme={canWrite ? () => { setThemeError(null); setThemeOpen(true); } : undefined}
               loading={loading}
               fullscreen={fullscreen}
               autoSec={String(autoSec)}
               savedSec={String(savedSec)}
-              canSaveRefresh={refreshIsSaveable({ mayWrite: hasPermission("dashboard:write"), saved: savedSec, effective: autoSec })}
+              canSaveRefresh={refreshIsSaveable({ mayWrite: canWrite, saved: savedSec, effective: autoSec })}
               savingRefresh={savingRefresh}
               onRefresh={() => void load()}
               onToggleFullscreen={toggleFullscreen}
@@ -1148,7 +1154,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
             savedFilters={defaultFilters}
             onChange={applyFilters}
             dirty={rowDirty}
-            canSaveDefault={!isDefault && hasPermission("dashboard:write")}
+            canSaveDefault={!isDefault && canWrite}
             tabs={tabs}
             saving={savingDefault}
             onSaveDefault={() => void saveRowDefault()}
@@ -1328,12 +1334,12 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       {historyOpen ? (
         <VersionHistoryDialog
           boardId={board}
-          canWrite={hasPermission("dashboard:write")}
+          canWrite={canWrite}
           onOpenChange={setHistoryOpen}
           onReverted={() => { notifyDashboardsChanged(); void load(); }}
         />
       ) : null}
-      {!isDefault ? <ShareDialog board={board} dashName={dashName} open={shareOpen} onOpenChange={setShareOpen} /> : null}
+      {!isDefault ? <ShareDialog board={board} dashName={dashName} open={shareOpen && canManage} onOpenChange={setShareOpen} /> : null}
       {themeOpen ? (
         <ThemeFontDialog open={themeOpen} onOpenChange={setThemeOpen} theme={data?.theme} font={data?.font}
           allowedFonts={data?.reporting?.fonts ?? SHIPPED_FONT_IDS} saving={savingTheme} error={themeError} onSave={(c) => void saveThemeAndFont(c)} />

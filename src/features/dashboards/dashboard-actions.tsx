@@ -20,7 +20,7 @@ import { PDF_NOT_SET_UP } from "./chart-download";
 
 /** The dashboard's ⋯ menu: refresh, view, auto-refresh, and board actions. */
 export function DashboardActionsMenu({
-  isDefault, canWrite, isPrivate, onHistory, onTheme, loading, fullscreen, autoSec, savedSec, canSaveRefresh, savingRefresh,
+  isDefault, canWrite, canManage = canWrite, isPrivate, onHistory, onTheme, loading, fullscreen, autoSec, savedSec, canSaveRefresh, savingRefresh,
   onRefresh, onToggleFullscreen, onAutoSec, onSaveRefresh, onRename, onShare, onExportPdf, onDuplicate, onDelete,
   onDownloadPdf, pdfSupported = true, canDownload = true, onSubscriptions,
 }: {
@@ -31,6 +31,11 @@ export function DashboardActionsMenu({
    * (SHOULD-FIX) R18); Share keeps its own rule.
    */
   readonly canWrite: boolean;
+  /**
+   * The caller manages the dashboard (`BI-19` part B2): only then are Share and
+   * Delete offered. Absent: as `canWrite`, the answer before levels existed.
+   */
+  readonly canManage?: boolean;
   /** In somebody's personal space: it cannot be shared until it is moved to a folder. */
   readonly isPrivate?: boolean;
   /** Opens the version history; the item is left out when absent. */
@@ -145,7 +150,7 @@ export function DashboardActionsMenu({
                 </TooltipContent>
               </Tooltip>
             ) : null}
-            {!isDefault && !isPrivate ? (
+            {!isDefault && !isPrivate && canManage ? (
               <DropdownMenuItem onClick={onShare}>
                 <Share2 className="size-4" /> Share…
               </DropdownMenuItem>
@@ -197,7 +202,7 @@ export function DashboardActionsMenu({
               </DropdownMenuItem>
             ) : null}
           </DropdownMenuGroup>
-          {!isDefault && canWrite ? (
+          {!isDefault && canManage ? (
             <>
               <DropdownMenuSeparator />
               <DropdownMenuGroup>

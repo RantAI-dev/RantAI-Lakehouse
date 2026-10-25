@@ -80,6 +80,25 @@ describe("PeoplePanel (BI-19 part B1)", () => {
     expect((put.body as { rules: unknown[] }).rules).toContainEqual({ roleId: "r2", level: "view" })
   })
 
+  it("changes a person to edit and saves that level (BI-19 part B2)", async () => {
+    const calls = stub(ACCESS)
+    render(<PeoplePanel kind="board" id="b_1" />)
+    await screen.findByText("Dewi")
+    fireEvent.change(screen.getByLabelText("Level of Dewi"), { target: { value: "edit" } })
+    fireEvent.click(screen.getByText("Save people"))
+    await waitFor(() => expect(calls.some((c) => c.method === "PUT")).toBe(true))
+    const put = calls.find((c) => c.method === "PUT")!
+    expect((put.body as { rules: unknown[] }).rules).toEqual([{ userId: "u1", level: "edit" }])
+  })
+
+  it("offers no level above the caller's own (feature B6)", async () => {
+    stub({ ...ACCESS, yourLevel: "edit" })
+    render(<PeoplePanel kind="board" id="b_1" />)
+    await screen.findByText("Dewi")
+    const options = Array.from(screen.getByLabelText("Level of Dewi").querySelectorAll("option")).map((o) => o.getAttribute("value"))
+    expect(options).toEqual(["view", "edit"])
+  })
+
   it("says why when the caller does not manage the item", async () => {
     stub({ error: "invalid_request", message: "permission_denied: manage on this item" }, 403)
     render(<PeoplePanel kind="board" id="b_1" />)
