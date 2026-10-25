@@ -1585,10 +1585,14 @@ mod tests {
                 .await
                 .expect("connect to the test-support admin database");
             let db_name = format!("lakehouse_api_main_test_{}", Uuid::new_v4().simple());
-            sqlx::query(&format!(r#"CREATE DATABASE "{db_name}""#))
-                .execute(&admin_pool)
-                .await
-                .expect("create a fresh per-test database");
+            // safe: `db_name` is this helper's own prefix plus a lowercase-hex
+            // UUID; no caller text reaches the statement.
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                r#"CREATE DATABASE "{db_name}""#
+            )))
+            .execute(&admin_pool)
+            .await
+            .expect("create a fresh per-test database");
             admin_pool.close().await;
 
             let (base, _old_db) = base_url

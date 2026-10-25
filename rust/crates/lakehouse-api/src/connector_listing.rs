@@ -113,6 +113,17 @@ pub enum Dispatch {
 // ── Classifying a failure (principle 4) ───────────────────────────────────
 
 /// The class of a `sqlx` error, from its type and its code, never its text.
+///
+/// `SEC-41` decision 4 also names the `MySQL` "password over an unencrypted
+/// connection" refusal (no `mysql-rsa`, so `sqlx-mysql` 0.9 will not send
+/// it). It needs no arm here: `sqlx` reports it as
+/// [`sqlx::Error::Configuration`], which D10's eight-word vocabulary has no
+/// word for — the source was reached and the credential may well be right —
+/// so it stays [`ErrorClass::Failed`], the enum's own documented
+/// catch-all, rather than being guessed into `SignInRefused`. The sentence
+/// the operator needs is `connector_probe::MYSQL_PLAINTEXT_PASSWORD_REFUSED`,
+/// which the same error gets from `connector_probe::classify_sqlx_error`
+/// (the connection test, discovery and deprovision).
 pub(crate) fn class_of_sqlx(err: &sqlx::Error) -> ErrorClass {
     match err {
         sqlx::Error::Io(io) if io.kind() == std::io::ErrorKind::TimedOut => ErrorClass::Timeout,

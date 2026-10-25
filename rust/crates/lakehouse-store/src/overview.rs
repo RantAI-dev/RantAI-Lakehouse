@@ -166,7 +166,10 @@ pub enum DeliveryRecord<'a> {
 /// Returns [`StoreError::Database`] if the query fails.
 pub async fn list_alerts(pool: &PgPool) -> Result<Vec<AlertItem>, StoreError> {
     let sql = format!("SELECT {ALERT_COLUMNS} FROM alert_instance ORDER BY at DESC");
-    let rows: Vec<AlertRow> = sqlx::query_as(&sql).fetch_all(pool).await?;
+    // safe: only the constant `ALERT_COLUMNS` is formatted in; values are bound.
+    let rows: Vec<AlertRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+        .fetch_all(pool)
+        .await?;
     Ok(rows.into_iter().map(AlertItem::from).collect())
 }
 
@@ -180,7 +183,11 @@ pub async fn acknowledge_alert(pool: &PgPool, id: &str) -> Result<Option<AlertIt
     let sql = format!(
         "UPDATE alert_instance SET status = 'acknowledged' WHERE id = $1 RETURNING {ALERT_COLUMNS}"
     );
-    let row: Option<AlertRow> = sqlx::query_as(&sql).bind(id).fetch_optional(pool).await?;
+    // safe: only the constant `ALERT_COLUMNS` is formatted in; values are bound.
+    let row: Option<AlertRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
     Ok(row.map(AlertItem::from))
 }
 
@@ -199,7 +206,8 @@ pub async fn resolve_alert(
         "UPDATE alert_instance SET status = 'resolved', resolution_note = $2 \
          WHERE id = $1 RETURNING {ALERT_COLUMNS}"
     );
-    let row: Option<AlertRow> = sqlx::query_as(&sql)
+    // safe: only the constant `ALERT_COLUMNS` is formatted in; values are bound.
+    let row: Option<AlertRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(id)
         .bind(note)
         .fetch_optional(pool)
@@ -302,7 +310,8 @@ pub async fn insert_from_fired_rule_with_delivery(
          VALUES ($1,$2,$3,$4,$5,'open',$6,$7,$8,$6,$9,$10) \
          RETURNING {ALERT_COLUMNS}"
     );
-    let row: AlertRow = sqlx::query_as(&sql)
+    // safe: only the constant `ALERT_COLUMNS` is formatted in; values are bound.
+    let row: AlertRow = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(&id)
         .bind(fired.title)
         .bind(fired.severity)
@@ -335,7 +344,8 @@ pub async fn silence_alert(
         "UPDATE alert_instance SET status = 'acknowledged', silenced_until = $2 \
          WHERE id = $1 RETURNING {ALERT_COLUMNS}"
     );
-    let row: Option<AlertRow> = sqlx::query_as(&sql)
+    // safe: only the constant `ALERT_COLUMNS` is formatted in; values are bound.
+    let row: Option<AlertRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(id)
         .bind(until)
         .fetch_optional(pool)
