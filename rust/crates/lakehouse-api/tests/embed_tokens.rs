@@ -1139,6 +1139,8 @@ async fn the_frame_answer_carries_only_the_sites_of_this_boards_cards() {
         download_denied_roles: Vec::new(),
         report_allowed_domains: Vec::new(),
         public_links_enabled: true,
+        result_cache_mode: "default".to_owned(),
+        result_cache_minutes: None,
     };
     lakehouse_store::reporting_settings::upsert(&app.pool, &stored, "test")
         .await
@@ -1205,6 +1207,8 @@ async fn the_frame_answer_and_the_payload_agree_on_a_boards_content_sites() {
         download_denied_roles: Vec::new(),
         report_allowed_domains: Vec::new(),
         public_links_enabled: true,
+        result_cache_mode: "default".to_owned(),
+        result_cache_minutes: None,
     };
     lakehouse_store::reporting_settings::upsert(&app.pool, &stored, "test")
         .await
@@ -1260,6 +1264,8 @@ async fn the_frame_answer_without_a_card_has_no_content_site() {
         download_denied_roles: Vec::new(),
         report_allowed_domains: Vec::new(),
         public_links_enabled: true,
+        result_cache_mode: "default".to_owned(),
+        result_cache_minutes: None,
     };
     lakehouse_store::reporting_settings::upsert(&app.pool, &stored, "test")
         .await

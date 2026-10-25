@@ -217,7 +217,13 @@ async fn query_metric(
         grain,
         filters,
     };
-    match routes::value_query(state, principal, &source, catalog, &query).await {
+    // Boxed: the read now also opens the result-cache scope, which grew this
+    // future past the large-future lint's size for every caller of `run_tool`.
+    match Box::pin(routes::value_query(
+        state, principal, &source, catalog, &query,
+    ))
+    .await
+    {
         Ok(mut tile) => {
             tile["metric"] = json!(found.name);
             tile["label"] = json!(found.label);

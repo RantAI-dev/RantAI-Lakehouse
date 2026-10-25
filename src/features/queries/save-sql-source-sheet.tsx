@@ -6,6 +6,7 @@ import { toast } from "sonner"
 import { CreateSheet } from "@/components/patterns/create-sheet"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { useEffectiveLimits } from "@/hooks/use-effective-limits"
 import { useServiceAction } from "@/hooks/use-service"
 import { sqlSummary } from "@/lib/sql-text"
 import { dashboardService } from "@/services"
@@ -28,6 +29,8 @@ export function SaveSqlSourceSheet({
   readonly onOpenChange: (open: boolean) => void
   readonly sql: string
 }) {
+  // BI-5: the sentence about the limits follows the setting; without it, no number is printed.
+  const limits = useEffectiveLimits()
   const [title, setTitle] = React.useState("")
   const createAct = useServiceAction((signal, input: { title: string; sql: string }) =>
     dashboardService.createSqlSource(input, signal)
@@ -69,7 +72,11 @@ export function SaveSqlSourceSheet({
       <ul className="list-disc space-y-1 pl-5 text-xs text-muted-foreground">
         <li>One read-only SELECT or WITH query; joins across marts are fine.</li>
         <li>Only Gold tables, written as serving.&lt;table&gt;.</li>
-        <li>Charts on it return at most 2,000 rows and stop after 30 seconds.</li>
+        <li>
+          {limits
+            ? `Charts on it return at most ${limits.chartRows.toLocaleString("en-US")} rows and stop after ${limits.timeoutSeconds.toLocaleString("en-US")} seconds.`
+            : "Charts on it stop at the row and time limits set in Admin > Settings."}
+        </li>
         <li>Governance masking and row filters still apply to every viewer.</li>
       </ul>
     </CreateSheet>

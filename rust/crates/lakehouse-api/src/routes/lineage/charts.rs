@@ -45,7 +45,6 @@ use serde_json::{Value, json};
 
 use super::columns::{scope_for, sql_source_key};
 use super::{Assembled, Graph, table_id, upstream};
-use crate::routes::dashboard_organise::viewer_of;
 use crate::state::AppState;
 use crate::upstream_error;
 
@@ -284,7 +283,15 @@ pub(super) async fn add_dashboard_nodes(
     if !principal.has("dashboard:read") {
         return;
     }
-    let viewer = viewer_of(principal);
+    // BI-19 B1 (with BI-14 D2): the caller's resolved reach, not the baseline;
+    // a store that cannot answer shows no dashboard objects (fail closed).
+    let viewer = match crate::routes::dashboard_access::usage_viewer_of(state, principal).await {
+        Ok(viewer) => viewer,
+        Err(err) => {
+            tracing::warn!(?err, "lineage: the caller's dashboard reach could not be resolved");
+            return;
+        }
+    };
     let dash = match load(&state.clickhouse, &viewer).await {
         Ok(dash) => dash,
         Err(err) => {
@@ -575,7 +582,10 @@ pub(crate) async fn read(
         return Err(ApiError::NotFound(NOT_FOUND.to_owned()));
     }
     let ch = &state.clickhouse;
-    let dash = load(ch, &viewer_of(principal))
+    // BI-19 B1: the resolved viewer, not the baseline (a chart on a dashboard the
+    // rules leave out reads as an unknown id).
+    let viewer = crate::routes::dashboard_access::usage_viewer_of(state, principal).await?;
+    let dash = load(ch, &viewer)
         .await
         .map_err(|err| upstream_error::ch_error(&upstream_error::DATABASE, &err))?;
     let chart = dash

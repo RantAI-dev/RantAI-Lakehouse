@@ -58,6 +58,7 @@ export const TOOL_LABEL: Record<string, string> = {
   update_chart: "Edit chart",
   format_chart: "Format chart",
   set_dashboard_theme: "Set dashboard theme",
+  set_cache_rule: "Set how long results are remembered",
   list_charts: "List charts",
   delete_chart: "Delete chart",
   create_board: "Create board",

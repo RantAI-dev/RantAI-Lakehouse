@@ -545,6 +545,17 @@ fn set_dashboard_theme_schema() -> Value {
             "required": ["board"] } } })
 }
 
+fn set_cache_rule_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "set_cache_rule",
+        "description": "Set how long a dashboard's or a chart's results may be remembered instead of computed again (\"Make this chart always fresh\"). Give a board (list_boards) or a chart (list_charts), one of the two. rule: default follows the level above (a chart follows its dashboard, a dashboard follows the install's setting in Admin > Settings), fresh computes every time, minutes remembers for `minutes` (1 to 1440). The narrowest rule set wins. Not for the built-in dashboard; set it on one of its charts or duplicate it first. The install's own rule is set by an administrator in Admin > Settings, not here. A result is also recomputed whenever the data under it changes, whatever the rule.",
+        "parameters": { "type": "object", "properties": {
+            "board": { "type": "string", "description": "the dashboard id (list_boards)" },
+            "chart": { "type": "string", "description": "the chart id (list_charts)" },
+            "rule": { "type": "string", "enum": ["default", "fresh", "minutes"] },
+            "minutes": { "type": "number", "description": "with rule minutes: 1 to 1440" } },
+            "required": ["rule"] } } })
+}
+
 fn create_chart_schema() -> Value {
     with_type_properties(with_style_properties(with_shape_properties(
         with_table_properties(
@@ -643,6 +654,19 @@ fn list_sql_sources_schema() -> Value {
     json!({ "type": "function", "function": { "name": "list_sql_sources",
         "description": "List the dashboard SQL sources (saved SQL, usually combining several Gold marts) with their dimensions and measures. Use the id as sqlSource in create_chart. Users create SQL sources in Query Studio, not in chat.",
         "parameters": { "type": "object", "properties": {} } } })
+}
+
+fn get_query_limits_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "get_query_limits",
+        "description": "The time and row limits that apply to the person you are talking to: how long a chart or Query Studio query may run (timeoutSeconds), rows a chart reads (chartRows), points a map shows (mapPoints), rows Query Studio returns (studioRows), and where the time limit comes from (source: the install, or one of their roles). Use it to answer \"what are my query limits?\" and \"why did this chart time out?\". You cannot change limits: an administrator does, in Admin > Settings > Query limits.",
+        "parameters": { "type": "object", "properties": {} } } })
+}
+
+fn stop_query_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "stop_query",
+        "description": "Stop the person's own running queries on the engine (\"stop the running query\"). With runId (a UUID, the run of a dashboard load or a Query Studio run) it ends that run; without it, it ends every query of this person that is running now. It never touches anyone else's queries. Answers how many were stopped (0: nothing was running).",
+        "parameters": { "type": "object", "properties": {
+            "runId": { "type": "string", "description": "UUID of one run; omit to stop all of the person's running queries" } } } } })
 }
 
 fn delete_chart_schema() -> Value {
@@ -1758,6 +1782,12 @@ pub static TOOLS: &[ToolSpec] = &[
         permission: "dashboard:write",
     },
     ToolSpec {
+        name: "set_cache_rule",
+        schema: set_cache_rule_schema,
+        risk: Risk::WriteLow,
+        permission: "dashboard:write",
+    },
+    ToolSpec {
         name: "create_board",
         schema: create_board_schema,
         risk: Risk::WriteLow,
@@ -1795,6 +1825,25 @@ pub static TOOLS: &[ToolSpec] = &[
         schema: suggest_join_schema,
         risk: Risk::Read,
         permission: "dashboard:read",
+    },
+    // Read-only: reports the limits that apply to the person (`BI-5`, D7).
+    ToolSpec {
+        name: "get_query_limits",
+        schema: get_query_limits_schema,
+        risk: Risk::Read,
+        permission: "",
+    },
+    // `Risk::Read` although it kills queries (`BI-5`, D7): it can only end the
+    // caller's OWN running queries (the pattern's principal part is the
+    // authenticated person, never an argument), it changes no data and
+    // nothing needs to be approved or undone; the same call the Stop button
+    // makes. Killing someone else's query is `kill_query`, which needs
+    // `workload:cancel` and approval.
+    ToolSpec {
+        name: "stop_query",
+        schema: stop_query_schema,
+        risk: Risk::Read,
+        permission: "",
     },
     ToolSpec {
         name: "delete_chart",
@@ -2470,8 +2519,10 @@ mod tests {
         // `export_dashboard` and `export_chart` (`AI-10`, with `BI-1`)
         // + `create_report_subscription`, `list_report_subscriptions`,
         // `update_report_subscription` and `delete_report_subscription`
-        // (`AI-10`, with `RPT-1`) + `list_maps` (`BI-16` part C2, `AI-5`).
-        assert_eq!(tool_schemas().len(), 107);
+        // (`AI-10`, with `RPT-1`) + `list_maps` (`BI-16` part C2, `AI-5`)
+        // + `get_query_limits` and `stop_query` (`BI-5`)
+        // + `set_cache_rule` (`BI-4` part B).
+        assert_eq!(tool_schemas().len(), 110);
     }
 
     /// `RPT-1` (with `AI-10`): the report tools have the console's permission,
@@ -2960,6 +3011,9 @@ mod tests {
             offered_names,
             vec![
                 "get_quality".to_owned(),
+                // BI-5: both limits tools need only a sign-in.
+                "get_query_limits".to_owned(),
+                "stop_query".to_owned(),
                 "list_alert_rules".to_owned(),
                 "get_audit_history".to_owned(),
                 "list_classification_rules".to_owned(),

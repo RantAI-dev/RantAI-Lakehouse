@@ -9,11 +9,22 @@ describe("toolsFromCaps", () => {
     expect(toolsFromCaps(new Set(["data"]), "build")).toContain("ask_user")
   })
 
+  it("offers the query-limit tools with Query Data in both modes (BI-5)", () => {
+    for (const mode of ["ask", "build"] as const) {
+      for (const tool of ["get_query_limits", "stop_query"]) expect(toolsFromCaps(new Set(["data"]), mode)).toContain(tool)
+    }
+  })
+
   it("offers the read-only metric tools with Query Data in both modes (AI-7)", () => {
     for (const mode of ["ask", "build"] as const) {
       for (const tool of ["list_metrics", "describe_metric", "query_metric"]) expect(toolsFromCaps(new Set(["data"]), mode)).toContain(tool)
       expect(toolsFromCaps(new Set(["data"]), mode)).not.toContain("create_metric")
     }
+  })
+
+  it("offers set_cache_rule with the Dashboard Builder in build mode and not in ask mode (BI-4)", () => {
+    expect(toolsFromCaps(new Set(["dashboard"]), "build")).toContain("set_cache_rule")
+    expect(toolsFromCaps(new Set(["dashboard"]), "ask")).not.toContain("set_cache_rule")
   })
 
   it("does not offer ask_user when Query Data is off", () => {

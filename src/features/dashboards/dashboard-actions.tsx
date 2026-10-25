@@ -2,7 +2,7 @@
 
 import * as React from "react";
 import {
-  ChartColumn, Check, Copy, Download, Eye, FileDown, History, Mail, Printer, Maximize2, Minimize2, MoreHorizontal, Palette, Pencil, RefreshCw, Save, Share2, Trash2,
+  ChartColumn, Check, Copy, Download, Eye, FileDown, History, Mail, Printer, Maximize2, Minimize2, MoreHorizontal, Palette, Pencil, RefreshCw, Save, Share2, Timer, Trash2,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
@@ -20,7 +20,7 @@ import { PDF_NOT_SET_UP } from "./chart-download";
 
 /** The dashboard's ⋯ menu: refresh, view, auto-refresh, and board actions. */
 export function DashboardActionsMenu({
-  isDefault, canWrite, canManage = canWrite, isPrivate, onHistory, onTheme, loading, fullscreen, autoSec, savedSec, canSaveRefresh, savingRefresh,
+  isDefault, canWrite, canManage = canWrite, isPrivate, onHistory, onTheme, onFreshness, loading, fullscreen, autoSec, savedSec, canSaveRefresh, savingRefresh,
   onRefresh, onToggleFullscreen, onAutoSec, onSaveRefresh, onRename, onShare, onExportPdf, onDuplicate, onDelete,
   onDownloadPdf, pdfSupported = true, canDownload = true, onSubscriptions,
 }: {
@@ -42,6 +42,8 @@ export function DashboardActionsMenu({
   readonly onHistory?: () => void;
   /** Opens "Theme and font…" (`BI-17`); the item is left out when absent. */
   readonly onTheme?: () => void;
+  /** Opens "Freshness…" (`BI-4` part B): how long this dashboard's results are remembered; left out when absent. */
+  readonly onFreshness?: () => void;
   readonly loading: boolean;
   readonly fullscreen: boolean;
   /** The interval in force, in seconds ("0" = manual). */
@@ -163,6 +165,11 @@ export function DashboardActionsMenu({
             {!isDefault && onTheme ? (
               <DropdownMenuItem onClick={onTheme}>
                 <Palette className="size-4" /> Theme and font…
+              </DropdownMenuItem>
+            ) : null}
+            {!isDefault && onFreshness ? (
+              <DropdownMenuItem onClick={onFreshness}>
+                <Timer className="size-4" /> Freshness…
               </DropdownMenuItem>
             ) : null}
             {canDownload && onDownloadPdf ? (

@@ -64,6 +64,13 @@ pub struct DashboardQuery {
     /// not named here takes the board's saved value, else its default.
     #[serde(default)]
     params: Option<String>,
+    /// BI-4 part B (feature decision 6): `fresh=1` computes every tile and
+    /// replaces what was remembered; `fresh=<chart id>[,<chart id>]` does so
+    /// for those charts only ("Refresh this tile"). Not read from an embed or
+    /// a public link: a reader with no sign-in cannot force the engine to
+    /// recompute a board.
+    #[serde(default)]
+    fresh: Option<String>,
 }
 
 impl DashboardQuery {
@@ -81,7 +88,19 @@ impl DashboardQuery {
             filters: filters.map(str::to_owned),
             grain: grain.map(str::to_owned),
             params: params.map(str::to_owned),
+            fresh: None,
         }
+    }
+
+    /// The same read with every tile computed and its entry replaced
+    /// (`fresh=1`). For a caller that decides something from the numbers *now*
+    /// (the report runner's "skip when empty"): a remembered answer within the
+    /// install's rule is fine to show, not to base a send/skip on (RPT-1 skip
+    /// when empty, PR #245 CI).
+    #[must_use]
+    pub(crate) fn fresh_all(mut self) -> Self {
+        self.fresh = Some("1".to_owned());
+        self
     }
 }
 
@@ -235,14 +254,25 @@ pub(crate) async fn payload_for(
         .await
         .map_err(reject)?;
     let obligations = PolicyEngineObligations::from_state(state);
-    match get_body(
-        &state.clickhouse,
-        q,
-        param_filters,
-        &principal.role_names,
-        &placeholders,
-        &obligations,
-        (&time, requested, &viewer),
+    // BI-4 part B: open the scope remembered results are looked up in, with
+    // the install's rule; `get_body` narrows it to the board's and the charts'.
+    // (Named apart from the access `scope` above, which `payload_level` needs.)
+    let cache_scope = crate::result_cache::CacheScope::new(
+        std::sync::Arc::clone(&state.result_cache),
+        format.result_cache,
+        crate::result_cache::Fresh::parse(q.fresh.as_deref()),
+    );
+    match crate::result_cache::scoped(
+        cache_scope,
+        get_body(
+            &state.clickhouse,
+            q,
+            param_filters,
+            &principal.role_names,
+            &placeholders,
+            &obligations,
+            (&time, requested, &viewer, &state.tile_slots),
+        ),
     )
     .await
     {
@@ -289,9 +319,10 @@ pub(crate) async fn payload_for(
 #[allow(
     clippy::too_many_lines,
     reason = "one straight-line port of a single large TS handler (spec \
-              merge -> filter application -> parallel tile execution); \
-              splitting it up would scatter one pipeline across helpers \
-              with no independent reuse"
+              merge -> filter application -> tile execution, which BI-4 \
+              part A runs side by side through `tile_pool`); splitting it \
+              up would scatter one pipeline across helpers with no \
+              independent reuse"
 )]
 async fn get_body(
     ch: &ChClient,
@@ -300,7 +331,12 @@ async fn get_body(
     roles: &[String],
     placeholders: &crate::sql_rewrite::PlaceholderValues,
     obligations: &PolicyEngineObligations<'_>,
-    (time, requested_grain, viewer): (&TimeContext, GrainRequest, &Viewer),
+    (time, requested_grain, viewer, tile_slots): (
+        &TimeContext,
+        GrainRequest,
+        &Viewer,
+        &tokio::sync::Semaphore,
+    ),
 ) -> Result<Value, BodyError> {
     let board = q.board.clone().unwrap_or_else(|| "default".to_owned());
     let years: Vec<i64> = q
@@ -425,22 +461,23 @@ async fn get_body(
     // the board reads, not only the ones an active filter touches.
     let cols = mart_columns(ch).await?;
 
-    let mut results = Map::new();
-    if on_default {
-        for k in KPIS.iter() {
-            let sql =
-                lakehouse_bi::builder::apply_builtin_year_filter(&k.sql, &k.mart, &years, &cols);
-            let (id, val) = run_spec_sql(ch, &k.id, &sql, roles, placeholders, obligations).await;
-            results.insert(id, val);
-        }
-        for c in CHARTS.iter() {
-            let sql =
-                lakehouse_bi::builder::apply_builtin_year_filter(&c.sql, &c.mart, &years, &cols);
-            let (id, val) = run_spec_sql(ch, &c.id, &sql, roles, placeholders, obligations).await;
-            results.insert(id, val);
-        }
-    }
     let sources = sources_for(ch, stored_for_board.iter().copied()).await?;
+    // BI-4 part B: the scope the handler opened, narrowed to this board's own
+    // rule and told the marts the board reads, so their fingerprints are read
+    // in one query. With no scope open (a caller that did not ask) nothing is
+    // remembered.
+    let cache_scope = crate::result_cache::current().map(|scope| {
+        scope
+            .for_board(
+                board_obj.and_then(|b| b.cache),
+                cols.keys().map(|mart| format!("serving.{mart}")).collect(),
+            )
+            // BI-4 B review P-B1: where a calendar day ends for "Today" tiles.
+            .with_zone(time.zone())
+    });
+    let cache_rule = cache_scope
+        .as_ref()
+        .map_or(Value::Null, |scope| scope.rule().to_json());
     // BI-13: the questions of a combined chart are asked as the viewer, one
     // statement each; their sources are read here, once, and a read that fails
     // only fails the questions that need it.
@@ -461,65 +498,147 @@ async fn get_body(
         layer_sources: &layer_sources,
         read: &read,
     };
-    for c in &stored_for_board {
-        // BI-11: the chart as this read sees it, every parameter replaced by
-        // its value; a value that does not fit is this tile's plain sentence.
-        let c = match effective_chart(c, &cols, &sources, &read) {
-            Ok(effective) => effective,
-            Err(msg) => {
-                results.insert(c.spec.id.clone(), json!({ "error": msg }));
-                continue;
-            }
-        };
-        let c = &*c;
-        // BI-18 part C: a filter tied to other tabs is not given to this tile,
-        // and so is not reported as skipped on it either.
-        let tile_filters =
-            lakehouse_bi::layout::filters_for_chart(&filters, &tabs, &layout, &c.spec.id);
-        let tile_layer_ctx = crate::routes::layers::LayerContext {
-            filters: &tile_filters,
-            ..layer_ctx
-        };
-        let filtered = match stored_chart_sql(c, &years, &tile_filters, &cols, &sources, &read) {
-            Ok(filtered) => filtered,
-            Err(msg) => {
-                results.insert(c.spec.id.clone(), json!({ "error": msg }));
-                continue;
-            }
-        };
-        let (id, mut val) = run_spec_sql(
-            ch,
-            &c.spec.id,
-            &filtered.sql,
-            roles,
-            placeholders,
-            obligations,
-        )
-        .await;
-        let skipped = &filtered.skipped;
-        crate::routes::support::annotate_params(&mut val, c, &loaded.values);
-        crate::routes::support::annotate_grain(&mut val, &filtered, c);
-        crate::routes::support::annotate_table(
-            ch,
-            &mut val,
-            &filtered,
-            (roles, placeholders, obligations),
-        )
-        .await;
-        crate::routes::layers::annotate_layers(&tile_layer_ctx, &mut val, c, filtered.grain).await;
-        crate::routes::support::annotate_metric_labels(
-            &mut val,
-            c,
-            &field_catalog,
-            Some((&cols, &sources)),
-        );
-        // The tile still renders; this only lets it say which active filters
-        // its data cannot honour (no such column, or a type that does not fit).
-        if !skipped.is_empty()
-            && let Value::Object(tile) = &mut val
+    // BI-4 part A (plan D1/D2): every tile is one future, run up to 6 at once
+    // for this request and under the process's `tile_slots`. A tile's masks
+    // and row filters are applied inside its own pipeline, as before, and its
+    // failure is its own `error` value, so no tile can fail another. The
+    // outputs come back in this order (built-ins, then stored charts), which
+    // is the order the sequential loops inserted them in.
+    let (years_ref, cols_ref, sources_ref, read_ref) = (&years, &cols, &sources, &read);
+    let (filters_ref, tabs_ref, layout_ref) = (&filters, &tabs, &layout);
+    let (values_ref, catalog_ref, layer_ctx_ref) = (&loaded.values, &field_catalog, &layer_ctx);
+    let mut tiles: Vec<futures::future::BoxFuture<'_, (String, Value)>> = Vec::new();
+    // BI-5 (plan D4): the tile ids in `tiles` order, so a tile the board's
+    // deadline cut off can still be named.
+    let mut tile_ids: Vec<String> = Vec::new();
+    if on_default {
+        for (id, sql_text, mart) in KPIS
+            .iter()
+            .map(|k| (&k.id, &k.sql, &k.mart))
+            .chain(CHARTS.iter().map(|c| (&c.id, &c.sql, &c.mart)))
         {
-            tile.insert("filtersSkipped".to_owned(), json!(skipped));
+            tile_ids.push(id.clone());
+            tiles.push(Box::pin(async move {
+                let sql = lakehouse_bi::builder::apply_builtin_year_filter(
+                    sql_text, mart, years_ref, cols_ref,
+                );
+                run_spec_sql(ch, id, &sql, roles, placeholders, obligations).await
+            }));
         }
+    }
+    for c in &stored_for_board {
+        let c: &StoredChartSpec = c;
+        tile_ids.push(c.spec.id.clone());
+        let chart_rule = c.def.shape.cache;
+        tiles.push(Box::pin(crate::result_cache::in_chart(
+            (Some(c.spec.id.as_str()), chart_rule),
+            async move {
+                // BI-11: the chart as this read sees it, every parameter replaced
+                // by its value; a value that does not fit is this tile's plain
+                // sentence.
+                let c = match effective_chart(c, cols_ref, sources_ref, read_ref) {
+                    Ok(effective) => effective,
+                    Err(msg) => return (c.spec.id.clone(), json!({ "error": msg })),
+                };
+                let c = &*c;
+                // BI-18 part C: a filter tied to other tabs is not given to this
+                // tile, and so is not reported as skipped on it either.
+                let tile_filters = lakehouse_bi::layout::filters_for_chart(
+                    filters_ref,
+                    tabs_ref,
+                    layout_ref,
+                    &c.spec.id,
+                );
+                let tile_layer_ctx = crate::routes::layers::LayerContext {
+                    filters: &tile_filters,
+                    ..*layer_ctx_ref
+                };
+                let filtered = match stored_chart_sql(
+                    c,
+                    years_ref,
+                    &tile_filters,
+                    cols_ref,
+                    sources_ref,
+                    read_ref,
+                ) {
+                    Ok(filtered) => filtered,
+                    Err(msg) => return (c.spec.id.clone(), json!({ "error": msg })),
+                };
+                let filtered = crate::routes::support::with_map_limit(filtered, c.spec.kind).await;
+                // BI-5 review B1: the rows this kind may read.
+                let (id, mut val) = crate::routes::support::with_tile_rows(
+                    c.spec.kind,
+                    &filtered.sql,
+                    run_spec_sql(
+                        ch,
+                        &c.spec.id,
+                        &filtered.sql,
+                        roles,
+                        placeholders,
+                        obligations,
+                    ),
+                )
+                .await;
+                let skipped = &filtered.skipped;
+                crate::routes::support::annotate_params(&mut val, c, values_ref);
+                crate::routes::support::annotate_grain(&mut val, &filtered, c);
+                crate::routes::support::annotate_table(
+                    ch,
+                    &mut val,
+                    &filtered,
+                    (roles, placeholders, obligations),
+                )
+                .await;
+                crate::routes::layers::annotate_layers(
+                    &tile_layer_ctx,
+                    &mut val,
+                    c,
+                    filtered.grain,
+                )
+                .await;
+                crate::routes::support::annotate_metric_labels(
+                    &mut val,
+                    c,
+                    catalog_ref,
+                    Some((cols_ref, sources_ref)),
+                );
+                // The tile still renders; this only lets it say which active
+                // filters its data cannot honour (no such column, or a type that
+                // does not fit).
+                if !skipped.is_empty()
+                    && let Value::Object(tile) = &mut val
+                {
+                    tile.insert("filtersSkipped".to_owned(), json!(skipped));
+                }
+                (id, val)
+            },
+        )));
+    }
+    let mut results = Map::new();
+    // BI-5 (plan D4): a board that outlasts `ceil(tiles / 6)` rounds of the
+    // caller's time limit answers the tiles that finished and says "not
+    // reached in time" for the rest, rather than a bare 408.
+    let run = crate::query_limits::QueryRun::current_or_detached();
+    let limit = run
+        .limits()
+        .await
+        .map_or(crate::query_limits::BOARD_DEADLINE_CAP, |limits| {
+            limits.timeout
+        });
+    let deadline =
+        tokio::time::Instant::now() + crate::query_limits::board_deadline(tiles.len(), limit);
+    let unreached = |i: usize| {
+        (
+            tile_ids[i].clone(),
+            json!({ "error": crate::query_limits::NOT_REACHED_SENTENCE }),
+        )
+    };
+    let running = crate::tile_pool::run_tiles_until(tile_slots, tiles, deadline, &unreached);
+    let finished = match cache_scope {
+        Some(scope) => crate::result_cache::scoped(scope, running).await,
+        None => running.await,
+    };
+    for (id, val) in finished {
         results.insert(id, val);
     }
 
@@ -609,6 +728,12 @@ async fn get_body(
         // BI-18·B: the interval an editor saved; 0 when none, so the
         // console starts from "off" without a second request.
         "refreshSeconds": board_obj.and_then(|b| b.refresh_seconds).unwrap_or(0),
+        // BI-4 part B: the freshness rule in force for this board (its own,
+        // else the install's), which the console states under the Refresh
+        // button; `null` when the caller opened no cache scope.
+        "cacheRule": cache_rule,
+        // The board's own rule, for the Freshness dialog; `null` follows the install.
+        "boardCacheRule": board_obj.and_then(|b| b.cache).map(lakehouse_bi::cache_rule::CacheRule::to_json),
         // BI-11: the controls the board shows (the definition and this read's
         // value), the value each has without a request (the saved default the
         // console compares with), and every parameter's value for this read.
@@ -903,6 +1028,10 @@ async fn preview_sources_visible(
 /// real `Extension<Principal>`, whose
 /// `role_names`/id/tenant ids are threaded into [`run_spec_sql`] so a
 /// preview is masked/row-filtered exactly like the persisted tile would be.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one straight-line handler (parse, build the spec, run it as the viewer, annotate); the BI-5 review B1 row-cap wrapper took it from 100 to 103"
+)]
 pub async fn specs_preview(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -950,13 +1079,18 @@ pub async fn specs_preview(
             .collect(),
     };
     let obligations = PolicyEngineObligations::from_state(&state);
-    let (_, mut result) = run_spec_sql(
-        &state.clickhouse,
-        &spec.spec.id,
+    // BI-5 review B1: the preview reads as many rows as the tile will.
+    let (_, mut result) = crate::routes::support::with_tile_rows(
+        spec.spec.kind,
         &spec.spec.sql,
-        &principal.role_names,
-        &placeholders,
-        &obligations,
+        run_spec_sql(
+            &state.clickhouse,
+            &spec.spec.id,
+            &spec.spec.sql,
+            &principal.role_names,
+            &placeholders,
+            &obligations,
+        ),
     )
     .await;
     crate::routes::support::annotate_saved_grain(&mut result, &spec);
@@ -1463,7 +1597,18 @@ struct BoardEditBody {
     /// one of the fonts an administrator allows in Admin > Settings.
     #[serde(default)]
     font: Option<String>,
+    /// How long the board's tiles may be served from remembered results
+    /// (`BI-4` part B): `{"mode": "default"|"fresh"|"minutes", "minutes"?}`.
+    /// `default` clears the board's own rule. Raw JSON so a malformed rule
+    /// gets [`CACHE_RULE_REFUSED`]. Not part of a version (see
+    /// `store::update_board_cache`).
+    #[serde(default)]
+    cache: Option<Value>,
 }
+
+/// What a person is told when a board's or a chart's freshness rule is not
+/// one (`BI-4` part B, feature decision 2).
+pub(crate) const CACHE_RULE_REFUSED: &str = "The freshness rule must be {\"mode\": \"default\"} or {\"mode\": \"fresh\"}, or {\"mode\": \"minutes\", \"minutes\": a whole number from 1 to 1440}.";
 
 impl BoardEditBody {
     /// The level the body needs on the dashboard (`BI-19` part B2): `manage`
@@ -1519,6 +1664,8 @@ fn board_edit_allowed(body: &BoardEditBody) -> bool {
                 // and the built-in board is code, not a saved dashboard.
                 && body.theme.is_none()
                 && body.font.is_none()
+                // BI-4 part B: the built-in board follows the install's rule.
+                && body.cache.is_none()
         }
         Some(_) => true,
     }
@@ -1628,6 +1775,26 @@ async fn check_theme_and_font(state: &AppState, parsed: &BoardEditBody) -> Resul
     }
 }
 
+/// The board edit's freshness rule (`BI-4` part B), `None` when the body does
+/// not send one.
+///
+/// # Errors
+///
+/// 400 with [`CACHE_RULE_REFUSED`] (a fixed sentence; the rule is the caller's
+/// own text) when the value is not a rule or its minutes are out of range.
+fn checked_cache_rule(
+    parsed: &BoardEditBody,
+) -> Result<Option<lakehouse_bi::cache_rule::CacheRule>, ApiError> {
+    parsed
+        .cache
+        .as_ref()
+        .map(|raw| {
+            serde_json::from_value(raw.clone())
+                .map_err(|_| ApiError::BadRequest(CACHE_RULE_REFUSED.to_owned()))
+        })
+        .transpose()
+}
+
 /// The error of a board write: a board that is not there any more (deleted
 /// while the edit was on its way) is refused with its own sentence, and the
 /// store's failure keeps the mapping the write had before
@@ -1663,6 +1830,12 @@ async fn save_tabs_and_phone_layout(
     // BI-17 part A: the theme and font ride with the other presentation saves.
     if parsed.theme.is_some() || parsed.font.is_some() {
         store::update_board_theme(ch, id, parsed.theme.as_deref(), parsed.font.as_deref())
+            .await
+            .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
+    }
+    // BI-4 part B: the freshness rule, already parsed by `checked_cache_rule`.
+    if let Some(rule) = checked_cache_rule(parsed)? {
+        store::update_board_cache(ch, id, rule)
             .await
             .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
     }
@@ -1823,6 +1996,8 @@ pub async fn boards_update(
     }
     check_tab_rules(ch, &id, &parsed).await?;
     check_theme_and_font(&state, &parsed).await?;
+    // Before the first write, like the checks above: a bad rule changes nothing.
+    checked_cache_rule(&parsed)?;
     let refresh = checked_refresh(parsed.refresh_seconds)?;
     let checked_params =
         crate::routes::params::check_board_params_opt(ch, parsed.params.as_deref()).await?;
@@ -3675,20 +3850,37 @@ async fn export_tile_statement(
             grouped_export_statement(ch, (&viewer, &chart), q, &dashboard_filters, &time).await?;
         (statement, HashMap::new())
     };
+    // BI-5 review S4: a grouped file holds what the tile shows, so it runs under
+    // the same limits the tile ran under. An unreadable setting leaves the text.
+    let limits = crate::query_limits::QueryRun::current_or_detached()
+        .limits()
+        .await
+        .ok();
     Ok((
         chart,
-        export_statement_settings(rows_mode, statement),
+        export_statement_settings(rows_mode, statement, limits.as_ref()),
         labels,
     ))
 }
 
 /// The statement as the download sends it. A raw table's rows lift a SQL
-/// source's 2 000-row cap to the download's (D6); a grouped tile stays byte for
-/// byte the tile's own statement, because a grouped chart exports its own result
-/// (feature decision 8; `BI-1` review fix (SHOULD-FIX) R4).
-fn export_statement_settings(rows_mode: bool, statement: String) -> String {
+/// source's 2 000-row cap to the download's (D6); a grouped tile is the tile's own statement, run under
+/// the caller's limits like the tile (`BI-5` review S4), because a grouped chart
+/// exports its own result (feature decision 8; `BI-1` review fix (SHOULD-FIX) R4).
+fn export_statement_settings(
+    rows_mode: bool,
+    statement: String,
+    limits: Option<&crate::query_limits::TileLimits>,
+) -> String {
     if rows_mode {
         lakehouse_bi::builder::with_export_settings(&statement, crate::export::EXPORT_ROW_CAP + 1)
+    } else if let Some(limits) = limits {
+        // The tile's own statement is run with these numbers (`try_run_spec_sql`).
+        lakehouse_bi::builder::with_run_settings(
+            &statement,
+            limits.chart_rows.saturating_add(1),
+            u32::try_from(limits.timeout_seconds()).unwrap_or(u32::MAX),
+        )
     } else {
         statement
     }
@@ -4773,11 +4965,29 @@ mod tests {
             "SELECT region, sum(n) AS n FROM (SELECT 1\n) AS src GROUP BY region{}",
             lakehouse_bi::builder::SQL_SOURCE_SETTINGS
         );
-        assert_eq!(export_statement_settings(false, tile.clone()), tile);
-        let rows = export_statement_settings(true, tile.clone());
+        assert_eq!(export_statement_settings(false, tile.clone(), None), tile);
+        let rows = export_statement_settings(true, tile.clone(), None);
         assert_ne!(rows, tile);
         assert!(rows.contains("max_result_rows = 1000001"), "{rows}");
         assert!(!rows.contains("max_result_rows = 2000"), "{rows}");
+    }
+
+    /// `BI-5` review S4: a grouped file runs under the caller's limits, as the
+    /// tile does, so an administrator's change reaches the file too.
+    #[test]
+    fn a_grouped_download_takes_the_callers_limits_like_its_tile() {
+        let tile = format!(
+            "SELECT region, sum(n) AS n FROM (SELECT 1\n) AS src GROUP BY region{}",
+            lakehouse_bi::builder::SQL_SOURCE_SETTINGS
+        );
+        let mut limits = crate::query_limits::Snapshot::default().effective_for_roles(&[]);
+        limits.chart_rows = 500;
+        limits.timeout = std::time::Duration::from_secs(120);
+        let got = export_statement_settings(false, tile, Some(&limits));
+        assert!(
+            got.contains("max_result_rows = 501") && got.contains("max_execution_time = 120"),
+            "{got}"
+        );
     }
 
     #[test]
@@ -5895,6 +6105,7 @@ mod typed_filters {
             filters: Some(filters.to_owned()),
             grain: None,
             params: None,
+            fresh: None,
         };
         let parsed = parse_filters_param(q.filters.as_deref()).expect("valid filters");
         get_body(
@@ -5908,10 +6119,119 @@ mod typed_filters {
                 &lakehouse_bi::grain::TimeContext::default(),
                 GrainRequest::Saved,
                 &lakehouse_bi::access::Viewer::system(),
+                &tokio::sync::Semaphore::new(crate::tile_pool::TILES_PER_PROCESS),
             ),
         )
         .await
         .expect("the payload builds")
+    }
+
+    /// Answers a tile query after 300 ms and records when it arrived, so a
+    /// test can see how many tiles were in flight together.
+    struct SlowTile {
+        arrivals: std::sync::Arc<std::sync::Mutex<Vec<std::time::Instant>>>,
+    }
+
+    impl wiremock::Respond for SlowTile {
+        fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+            let text = String::from_utf8_lossy(&request.body);
+            if text.contains("mart_bad") {
+                return ResponseTemplate::new(500).set_body_string("boom");
+            }
+            self.arrivals
+                .lock()
+                .expect("arrivals lock")
+                .push(std::time::Instant::now());
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_millis(300))
+                .set_body_json(json!({
+                    "meta": [{ "name": "kab", "type": "String" }, { "name": "visitors", "type": "UInt32" }],
+                    "data": [{ "kab": "a", "visitors": 1 }],
+                    "rows": 1,
+                }))
+        }
+    }
+
+    /// BI-4 part A (plan D1/T1): twelve 300 ms tiles are answered in two
+    /// rounds of six, in chart order, and a tile whose query fails does not
+    /// fail the others.
+    #[tokio::test]
+    async fn twelve_slow_tiles_load_six_at_a_time_in_order_and_one_failure_stays_its_own() {
+        let server = MockServer::start().await;
+        let mut charts: Vec<Value> = (0..12)
+            .map(|i| chart_row(&format!("c{i:02}"), "b1", "mart_a", None))
+            .collect();
+        charts[8] = chart_row("c08", "b1", "mart_bad", None);
+        answer(
+            &server,
+            "FROM console.bi_chart FINAL",
+            &["id", "board", "created_by", "created_at", "spec_json"],
+            charts,
+        )
+        .await;
+        answer(&server, "FROM console.bi_board FINAL", &["id"], vec![]).await;
+        answer(&server, "FROM console.bi_source FINAL", &["id"], vec![]).await;
+        let mut cols = mart_column_rows("mart_a", &[("visitors", "UInt32"), ("kab", "String")]);
+        cols.extend(mart_column_rows(
+            "mart_bad",
+            &[("visitors", "UInt32"), ("kab", "String")],
+        ));
+        answer(
+            &server,
+            "SELECT table, name, type FROM system.columns",
+            &["table", "name", "type"],
+            cols,
+        )
+        .await;
+        let arrivals = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        Mock::given(method("POST"))
+            .and(body_string_contains("FROM serving.mart_"))
+            .respond_with(SlowTile {
+                arrivals: arrivals.clone(),
+            })
+            .mount(&server)
+            .await;
+        answer_rest(&server).await;
+
+        let started = std::time::Instant::now();
+        // A filter makes each tile send a statement of its own over its mart
+        // (without one a stored chart sends its saved `SELECT 1`).
+        let body = dashboard(
+            &server,
+            r#"[{"column":"visitors","op":"between","min":"0"}]"#,
+        )
+        .await;
+        let took = started.elapsed();
+
+        let results = body["results"].as_object().expect("results");
+        let ids: Vec<&String> = results.keys().collect();
+        let expected: Vec<String> = (0..12).map(|i| format!("c{i:02}")).collect();
+        assert_eq!(ids, expected.iter().collect::<Vec<_>>(), "chart order");
+        assert!(
+            results["c08"].get("error").is_some(),
+            "{:?}",
+            results["c08"]
+        );
+        for id in expected.iter().filter(|id| *id != "c08") {
+            assert!(
+                results[id].get("error").is_none(),
+                "{id}: {:?}",
+                results[id]
+            );
+            assert_eq!(results[id]["rows"][0]["visitors"], 1, "{id}");
+        }
+        // Eleven 300 ms tiles one after another take 3.3 s.
+        assert!(took < std::time::Duration::from_millis(1500), "{took:?}");
+        let times = arrivals.lock().expect("arrivals lock").clone();
+        assert_eq!(times.len(), 11, "every healthy tile asked once");
+        let first = *times.iter().min().expect("a tile query");
+        let in_first_wave = times
+            .iter()
+            .filter(|t| t.duration_since(first) < std::time::Duration::from_millis(200))
+            .count();
+        // Six start together; the 7th cannot start until one finishes (300 ms).
+        // The failing tile (c08) is in the second wave, so the first has six.
+        assert_eq!(in_first_wave, 6, "six tiles in the first wave");
     }
 
     #[test]
@@ -6704,8 +7024,8 @@ mod records_pages {
         let (rows, count) = page_and_count(&server).await;
         assert!(rows.contains("channel = 'web'"), "{rows}");
         // The source's cap rides on the count too.
-        assert!(count.contains("max_execution_time = 30"), "{count}");
-        assert!(rows.contains("max_execution_time = 30"), "{rows}");
+        assert!(count.contains("max_execution_time = 60"), "{count}");
+        assert!(rows.contains("max_execution_time = 60"), "{rows}");
     }
 
     #[tokio::test]
@@ -7050,6 +7370,7 @@ mod time_grain {
             filters: None,
             grain: requested.map(|g| g.as_str().to_owned()),
             params: None,
+            fresh: None,
         };
         get_body(
             &ch,
@@ -7062,6 +7383,7 @@ mod time_grain {
                 time,
                 requested.into(),
                 &lakehouse_bi::access::Viewer::system(),
+                &tokio::sync::Semaphore::new(crate::tile_pool::TILES_PER_PROCESS),
             ),
         )
         .await
@@ -7114,6 +7436,49 @@ mod time_grain {
         assert_eq!(body["appliedGrain"], json!("month"));
     }
 
+    /// `BI-4` part B T5 (plan D8, `BI-4-AC1`): the second open is served from
+    /// memory and says so, with the first open's `computedAt`; `fresh=1`
+    /// computes again; the payload names the rule in force.
+    #[tokio::test]
+    async fn a_second_open_is_remembered_and_fresh_computes_again() {
+        use crate::result_cache::{CacheScope, Fresh, ResultCache, scoped};
+        let server = MockServer::start().await;
+        mount_board(&server, "").await;
+        let cache = std::sync::Arc::new(ResultCache::new(8));
+        let time = TimeContext::default();
+        let open = |fresh: Fresh| {
+            scoped(
+                CacheScope::new(
+                    std::sync::Arc::clone(&cache),
+                    lakehouse_bi::cache_rule::CacheRule::Follow,
+                    fresh,
+                ),
+                dashboard(&server, None, &time),
+            )
+        };
+        let first = open(Fresh::No).await;
+        let second = open(Fresh::No).await;
+        let forced = open(Fresh::parse(Some("1"))).await;
+        let tiles: Vec<&String> = first["results"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .filter(|(_, v)| v.get("computedAt").is_some())
+            .map(|(id, _)| id)
+            .collect();
+        assert!(!tiles.is_empty(), "{first}");
+        for id in tiles {
+            assert_eq!(first["results"][id]["remembered"], json!(false), "{id}");
+            assert_eq!(second["results"][id]["remembered"], json!(true), "{id}");
+            assert_eq!(
+                second["results"][id]["computedAt"], first["results"][id]["computedAt"],
+                "{id}"
+            );
+            assert_eq!(forced["results"][id]["remembered"], json!(false), "{id}");
+        }
+        assert_eq!(first["cacheRule"], json!({ "mode": "default" }));
+    }
+
     #[tokio::test]
     async fn own_sets_the_saved_grain_aside_for_this_view() {
         let server = MockServer::start().await;
@@ -7126,6 +7491,7 @@ mod time_grain {
             filters: None,
             grain: Some("own".to_owned()),
             params: None,
+            fresh: None,
         };
         let body = get_body(
             &ch,
@@ -7138,6 +7504,7 @@ mod time_grain {
                 &TimeContext::default(),
                 super::GrainRequest::Own,
                 &lakehouse_bi::access::Viewer::system(),
+                &tokio::sync::Semaphore::new(crate::tile_pool::TILES_PER_PROCESS),
             ),
         )
         .await
@@ -7516,6 +7883,7 @@ mod table_tiles {
             filters: None,
             grain: None,
             params: None,
+            fresh: None,
         };
         get_body(
             &ch,
@@ -7528,6 +7896,7 @@ mod table_tiles {
                 &TimeContext::default(),
                 GrainRequest::Saved,
                 &lakehouse_bi::access::Viewer::system(),
+                &tokio::sync::Semaphore::new(crate::tile_pool::TILES_PER_PROCESS),
             ),
         )
         .await

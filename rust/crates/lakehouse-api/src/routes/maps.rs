@@ -526,7 +526,9 @@ pub async fn delete(
         .await
         .map_err(|err| upstream_error::ch_error(&upstream_error::DATABASE, &err))?;
     if !uses(&all).is_empty() {
-        let viewer = crate::routes::dashboard_organise::viewer_of(&principal);
+        // BI-19 B1: the resolved viewer, not the baseline; what the rules leave
+        // out reads as "a dashboard you cannot see".
+        let viewer = crate::routes::dashboard_access::usage_viewer_of(&state, &principal).await?;
         let mine = store::list_stored_charts(ch, &viewer)
             .await
             .map_err(|err| upstream_error::ch_error(&upstream_error::DATABASE, &err))?;

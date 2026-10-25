@@ -225,6 +225,106 @@ pub fn identifiers_used(sql: &str, dialect: &dyn Dialect) -> Option<HashSet<Stri
     Some(collector.found)
 }
 
+/// What a statement reads or calls that its table names do not show
+/// (`BI-4` B review P-B1, P-S1). See [`reads_beyond_tables`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BeyondTables {
+    /// A clock or random function: the answer changes with no change to any
+    /// table (`now`, `today`, `rand*`, `generateUUID*`, ...).
+    pub clock_or_random: bool,
+    /// Data read through a name no `FROM`/`JOIN` factor carries: a
+    /// `dictGet*`/`joinGet*` call, or `IN <table>`.
+    pub outside_from: bool,
+}
+
+/// The functions whose value is not a function of the tables: lower-cased
+/// exact names; the `rand` and `generateuuid` families are matched by prefix
+/// in [`is_clock_or_random_function`].
+const CLOCK_FUNCTIONS: &[&str] = &[
+    "now",
+    "now64",
+    "nowinblock",
+    "nowinblock64",
+    "today",
+    "yesterday",
+    "current_date",
+    "current_time",
+    "current_timestamp",
+    "localtime",
+    "localtimestamp",
+    "currentdate",
+    "uuid",
+    "uptime",
+];
+
+/// Whether `name` (any case, last segment) is a clock or random function.
+/// The prefixes keep a variant this list missed (`randCanonical`,
+/// `randomString`, `generateUUIDv4`, `generateSnowflakeID`) from slipping
+/// through; a false positive only shortens a result's life.
+fn is_clock_or_random_function(name: &str) -> bool {
+    let last = name.rsplit('.').next().unwrap_or(name).to_ascii_lowercase();
+    CLOCK_FUNCTIONS.contains(&last.as_str())
+        || last.starts_with("rand")
+        || last.starts_with("generateuuid")
+        || last.starts_with("generatesnowflake")
+}
+
+struct BeyondTablesFinder {
+    found: BeyondTables,
+}
+
+impl Visitor for BeyondTablesFinder {
+    type Break = Infallible;
+
+    fn pre_visit_expr(&mut self, expr: &sqlparser::ast::Expr) -> ControlFlow<Infallible> {
+        use sqlparser::ast::Expr;
+        match expr {
+            Expr::Function(f) => {
+                let name = f.name.to_string();
+                if is_clock_or_random_function(&name) {
+                    self.found.clock_or_random = true;
+                }
+                if is_dict_or_join_function(&name) {
+                    self.found.outside_from = true;
+                }
+            }
+            // `x IN tbl` names a table without a table factor; `x IN (a)` with
+            // a column is caught too, which only shortens a result's life.
+            Expr::InList { list, .. }
+                if matches!(
+                    list.as_slice(),
+                    [Expr::Identifier(_) | Expr::CompoundIdentifier(_)]
+                ) =>
+            {
+                self.found.outside_from = true;
+            }
+            _ => {}
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+/// Whether `sql` calls a clock or random function, or reads data through a
+/// name no table factor carries (`dictGet*`/`joinGet*`, `IN <table>`), so the
+/// table fingerprint cannot vouch for its result. A statement that does not
+/// parse answers both `true` (nothing can be said, so nothing is trusted).
+#[must_use]
+pub fn reads_beyond_tables(sql: &str, dialect: &dyn Dialect) -> BeyondTables {
+    let Ok(statements) = Parser::parse_sql(dialect, sql) else {
+        return BeyondTables {
+            clock_or_random: true,
+            outside_from: true,
+        };
+    };
+    let mut finder = BeyondTablesFinder {
+        found: BeyondTables::default(),
+    };
+    for stmt in &statements {
+        let _: ControlFlow<Infallible> = stmt.visit(&mut finder);
+    }
+    finder.found
+}
+
 struct QuotedIdentChecker<'a, S> {
     known: &'a HashSet<String, S>,
     has_unknown: bool,

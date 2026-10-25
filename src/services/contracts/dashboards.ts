@@ -1,4 +1,5 @@
 import type { FilterDef } from "../clients/bi-store"
+import type { TileLimit } from "./settings"
 
 /**
  * Kontrak untuk halaman DAFTAR dashboard (`/dashboards/browse`) dan untuk
@@ -494,7 +495,12 @@ export type DashboardFolder = {
  * wrote itself (a refused statement, a deleted source). Mirrors
  * `rust/crates/lakehouse-api/src/upstream_error.rs` (`UpstreamFailure::to_json`).
  */
-export type TileFailure = { error: string; errorId?: string }
+export type TileFailure = {
+  error: string
+  errorId?: string
+  /** `BI-5` plan D6: set when the time limit ended the tile; the console says the limit. Not on the server yet. */
+  limit?: TileLimit
+}
 
 /**
  * One step of a chart's path (`BI-14` plan D1). `kind` is `chart`,
