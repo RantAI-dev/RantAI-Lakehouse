@@ -217,7 +217,11 @@ pub(crate) async fn payload_for(
     // does one the caller's rules leave out, and the caller who holds no
     // `dashboard:read` and no rule is refused here (the router floor is "signed
     // in", plan D8).
-    let viewer = viewer_for(state, principal).await.map_err(reject)?;
+    // BI-19 B2 review note: one resolution serves the read and the level.
+    let scope = crate::routes::dashboard_access::payload_scope(state, principal)
+        .await
+        .map_err(reject)?;
+    let viewer = scope.viewer.clone();
     // BI-18: a malformed `filters` used to be ignored without a word, which
     // showed an unfiltered dashboard for a filter the caller believed was on.
     let param_filters = parse_filters_param(q.filters.as_deref()).map_err(reject)?;
@@ -248,7 +252,7 @@ pub(crate) async fn payload_for(
             // whose every role is switched off; the routes refuse anyway.
             let level = crate::routes::dashboard_access::payload_level(
                 state,
-                principal,
+                &scope,
                 q.board.as_deref().unwrap_or(store::DEFAULT_BOARD_ID),
             )
             .await;
@@ -1269,7 +1273,23 @@ pub async fn boards_create(
     crate::routes::dashboard_folders::ensure_folder_usable(&state.clickhouse, &folder_id, &viewer)
         .await?;
     if let Some(scope) = scope.as_ref() {
-        scope.require_on_folder(&folder_id, Level::Edit)?;
+        // BI-19 B2 review S1: a copy named for no folder lands next to its
+        // original (`store::duplicate_board`), so `edit` is asked where it will
+        // be filed, not at the root. An unknown or invisible original is left
+        // to the duplicate itself, which answers 404.
+        let mut filed_in = folder_id.clone();
+        if folder_id.is_empty()
+            && let Some(dup) = parsed.duplicate.as_deref().map(str::trim)
+            && !dup.is_empty()
+            && dup != store::DEFAULT_BOARD_ID
+            && let Some(original) = store::get_board(&state.clickhouse, dup, &viewer)
+                .await
+                .map_err(|err| crate::routes::dashboard_folders::classify_ch_error(&err))?
+            && original.owner_id.as_deref().is_none_or(str::is_empty)
+        {
+            filed_in = original.folder_id.unwrap_or_default();
+        }
+        scope.require_on_folder(&filed_in, Level::Edit)?;
     }
     // The owner of the folder a new dashboard is filed in: it travels in the
     // first insert, so a dashboard filed in a personal space is private from
@@ -1902,7 +1922,13 @@ pub async fn fields(
         return crate::error::ApiRejection(err).into_response();
     }
     if let Some(id) = q.source.as_deref() {
-        return match source_fields_body(&state.clickhouse, id).await {
+        // BI-19 B2 review S4: the columns of a source in a folder the caller
+        // cannot see are not theirs to read either.
+        let viewer = match viewer_for(&state, &principal).await {
+            Ok(viewer) => viewer,
+            Err(err) => return crate::error::ApiRejection(err).into_response(),
+        };
+        return match source_fields_body(&state.clickhouse, &viewer, id).await {
             Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
             Err(err) => crate::error::ApiRejection(err).into_response(),
         };
@@ -2080,10 +2106,11 @@ async fn tables_schema<'a>(
 /// `?source=` branch of [`fields`]: the SQL source's columns, split the same
 /// way a mart's are. New shape (no parity corpus); errors are classified,
 /// never `ClickHouse` text.
-async fn source_fields_body(ch: &ChClient, id: &str) -> Result<Value, ApiError> {
+async fn source_fields_body(ch: &ChClient, viewer: &Viewer, id: &str) -> Result<Value, ApiError> {
     let source = lakehouse_bi::sources::get_source(ch, id.trim())
         .await
         .map_err(|err| classify_dashboard_ch_error(&err))?
+        .filter(|s| crate::routes::dashboard_sources::source_visible(viewer, s))
         .ok_or_else(|| ApiError::NotFound(format!("SQL source '{}' not found.", id.trim())))?;
     let mut dimensions = Vec::new();
     let mut measures = Vec::new();

@@ -407,16 +407,38 @@ pub(crate) async fn require_board_level(
     Ok(Some(board))
 }
 
+/// The [`Scope`] the dashboard payload is built from: the viewer it reads as and
+/// the levels its `access.level` is worked out from, resolved once per request
+/// (`BI-19` B2 review note: the level used to cost a second resolution).
+///
+/// A caller who holds `dashboard:read` has the same starting point for a read as
+/// for a write, so one resolution serves both. Somebody who holds only rules
+/// reads as [`viewer_for`] says (no starting point), and the level comes from
+/// the write resolution.
+///
+/// # Errors
+///
+/// As [`viewer_for`].
+pub(crate) async fn payload_scope(
+    state: &AppState,
+    principal: &Principal,
+) -> Result<Scope, ApiError> {
+    if principal.has(ENTRY_PERMISSION) {
+        return scope_for_write(state, principal).await;
+    }
+    let viewer = viewer_for(state, principal).await?;
+    let mut scope = scope_for_write(state, principal).await?;
+    scope.viewer = viewer;
+    Ok(scope)
+}
+
 /// The caller's level on dashboard `id` for the payload's `access.level`, so the
 /// console shows only what the level allows (`BI-19` part B2, T9). The server
 /// enforces it either way; this only decides what the page offers. The reader
 /// already passed the read check, so anything that cannot be worked out reads as
 /// `view` (never a wider offer). `all`, `default` and blank are judged at the
 /// root.
-pub(crate) async fn payload_level(state: &AppState, principal: &Principal, id: &str) -> Level {
-    let Ok(scope) = scope_for_write(state, principal).await else {
-        return Level::View;
-    };
+pub(crate) async fn payload_level(state: &AppState, scope: &Scope, id: &str) -> Level {
     let id = id.trim();
     let level = if id.is_empty() || id == store::DEFAULT_BOARD_ID || id == "all" {
         scope.root_level()
@@ -1026,8 +1048,8 @@ fn keys_of(rules: &[rules::AccessRule]) -> Vec<GranteeKey> {
 }
 
 /// What moving a dashboard from one folder chain to another does to who sees
-/// it: the people and roles the destination's folders list and the old ones
-/// did not (they gain), the reverse (they lose), and whether the starting
+/// it: the people and roles the destination's counting folders list and the old
+/// ones did not (they gain), the reverse (they lose), and whether the starting
 /// point (everyone whose role gives them dashboards) is lost or regained
 /// because a mark is on one chain and not the other. The dashboard's own rules
 /// and mark travel with it, so they are not part of the difference. Pure.
@@ -1049,21 +1071,37 @@ fn move_difference(
     (gains, loses, to.1 && !from.1, from.1 && !to.1)
 }
 
-/// The folder ids on a chain and whether any of them is marked.
+/// The folders whose rules count for an item that sits under `chain` (nearest
+/// first), and whether the item is restricted by one of them: the rules count
+/// up to and including the nearest marked folder, the way
+/// [`lakehouse_bi::access::AccessMap`] resolves a level (`BI-19` B1 owner
+/// decision Q-R14; `BI-19` B2 review S2). Pure.
+fn counting_chain<'a>(chain: &'a [Folder], marked: &[String]) -> (&'a [Folder], bool) {
+    match chain.iter().position(|f| marked.contains(&f.id)) {
+        Some(at) => (&chain[..=at], true),
+        None => (chain, false),
+    }
+}
+
+/// The rules that count on a chain (see [`counting_chain`]) and whether it is
+/// restricted.
 async fn chain_rules(
     pool: &lakehouse_store::PgPool,
     chain: &[Folder],
 ) -> Result<(Vec<rules::AccessRule>, bool), ApiError> {
-    let ids: Vec<String> = chain.iter().map(|f| f.id.clone()).collect();
+    let marked: Vec<String> = rules::all_restrictions(pool)
+        .await
+        .map_err(|e| store_failed(&e))?
+        .into_iter()
+        .filter(|m| m.item_kind == "folder")
+        .map(|m| m.item_id)
+        .collect();
+    let (counted, restricted) = counting_chain(chain, &marked);
+    let ids: Vec<String> = counted.iter().map(|f| f.id.clone()).collect();
     let found = rules::rules_for_items(pool, "folder", &ids)
         .await
         .map_err(|e| store_failed(&e))?;
-    let marked = rules::all_restrictions(pool)
-        .await
-        .map_err(|e| store_failed(&e))?
-        .iter()
-        .any(|m| m.item_kind == "folder" && ids.contains(&m.item_id));
-    Ok((found, marked))
+    Ok((found, restricted))
 }
 
 /// Query of `GET /api/dashboard/access-preview`.
@@ -1113,6 +1151,20 @@ pub async fn access_preview(
         }
     }
     let pool = pool_of(&state)?;
+    // BI-19 B2 review S2 (Q-R14): a dashboard with its own mark has a fresh list
+    // that no folder, old or new, adds to or takes from, so nothing changes for
+    // anybody; the folders' rules only count for one that is not marked.
+    let own_mark = rules::restriction_for_item(pool, "board", &subject.id)
+        .await
+        .map_err(|e| store_failed(&e))?;
+    if own_mark.is_some() {
+        return Ok(ApiJson(json!({
+            "gains": [],
+            "loses": [],
+            "startingPointLoses": false,
+            "startingPointGains": false,
+        })));
+    }
     let from = chain_rules(pool, &subject.ancestors).await?;
     let to = chain_rules(pool, &to_chain).await?;
     let (gains, loses, start_loses, start_gains) =
@@ -1201,6 +1253,41 @@ mod tests {
             item_id: id.to_owned(),
             level,
         }
+    }
+
+    fn folder(id: &str, parent: &str) -> Folder {
+        Folder {
+            id: id.to_owned(),
+            name: id.to_owned(),
+            parent_id: parent.to_owned(),
+            created_by: String::new(),
+            updated_at: None,
+            owner_id: String::new(),
+        }
+    }
+
+    /// `BI-19` B2 review S2 (Q-R14): the rules a move compares count up to and
+    /// including the nearest marked folder, nearest first, and no further.
+    #[test]
+    fn a_chain_counts_up_to_and_including_its_nearest_marked_folder() {
+        let chain = [folder("f3", "f2"), folder("f2", "f1"), folder("f1", "")];
+        let ids = |counted: &[Folder]| counted.iter().map(|f| f.id.clone()).collect::<Vec<_>>();
+
+        let (counted, restricted) = counting_chain(&chain, &[]);
+        assert_eq!(ids(counted), ["f3", "f2", "f1"]);
+        assert!(!restricted);
+
+        let (counted, restricted) = counting_chain(&chain, &["f2".to_owned()]);
+        assert_eq!(
+            ids(counted),
+            ["f3", "f2"],
+            "f1 above the mark does not count"
+        );
+        assert!(restricted);
+
+        // Two marks: only the nearest ends the list.
+        let (counted, _) = counting_chain(&chain, &["f3".to_owned(), "f1".to_owned()]);
+        assert_eq!(ids(counted), ["f3"]);
     }
 
     #[test]
