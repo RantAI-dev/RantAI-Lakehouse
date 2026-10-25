@@ -24,3 +24,11 @@ export function historyQueryString(filter?: QueryHistoryFilter): string {
   if (filter.before) params.set("before", `${filter.before.at},${filter.before.id}`);
   return params.toString();
 }
+
+/**
+ * The page size the history endpoint answers with — the server's
+ * `HISTORY_PAGE_LIMIT` (`routes/query.rs`). The page's "Load more"
+ * infers the end of the trail from it: a page that comes back with
+ * fewer rows was the last one, so no older page can exist.
+ */
+export const HISTORY_PAGE_LIMIT = 50
