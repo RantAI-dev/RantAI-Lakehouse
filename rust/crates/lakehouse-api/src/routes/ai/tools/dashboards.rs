@@ -250,6 +250,11 @@ pub(super) async fn create_chart(
     if let Err(err) = require_chart_board(ch, input.board.as_deref(), viewer).await {
         return refused(err);
     }
+    // BI-19 B2 re-review S4-b: a source in a folder the caller cannot see is the
+    // unknown-source answer, as for the console's create.
+    if let Err(err) = store::ensure_sources_visible(ch, &input, viewer, &[]).await {
+        return upstream_error::bi(&upstream_error::DATABASE, &err).to_json();
+    }
     match store::spec_from_input(ch, &input, ChartSource::Ai, "ai", id, time).await {
         Ok(spec) => match store::insert_chart(ch, &spec).await {
             Ok(()) => {
@@ -364,6 +369,19 @@ pub(super) async fn update_chart(
         .is_empty()
     {
         input.board = Some(old_board.clone());
+    }
+    // BI-19 B2 re-review S4-b: as the console's update: a source the chart does
+    // not already read must be one the caller may see.
+    let already: Vec<String> = match store::list_stored_charts(ch, viewer).await {
+        Ok(all) => all
+            .into_iter()
+            .find(|c| c.spec.id == id)
+            .map(|c| store::sql_sources_named(&c.def))
+            .unwrap_or_default(),
+        Err(err) => return upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json(),
+    };
+    if let Err(err) = store::ensure_sources_visible(ch, &input, viewer, &already).await {
+        return upstream_error::bi(&upstream_error::DATABASE, &err).to_json();
     }
     match store::spec_from_input(ch, &input, ChartSource::Ai, "ai", Some(id), time).await {
         Ok(spec) => match store::insert_chart(ch, &spec).await {

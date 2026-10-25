@@ -39,16 +39,26 @@ pub(super) fn list_formula_functions() -> Value {
     })
 }
 
-pub(super) async fn list_calculated_fields(state: &AppState, args: &Map<String, Value>) -> Value {
+pub(super) async fn list_calculated_fields(
+    state: &AppState,
+    principal: Option<&Principal>,
+    args: &Map<String, Value>,
+) -> Value {
     let q = match serde_json::from_value(Value::Object(route_args(args))) {
         Ok(q) => q,
         Err(_unparsed) => return json!({ "error": "give mart or sqlSource" }),
     };
-    api_result_to_value(calc_fields::list(State(state.clone()), Query(q)).await).await
+    let who = principal.cloned().map(Extension);
+    api_result_to_value(calc_fields::list(State(state.clone()), who, Query(q)).await).await
 }
 
-pub(super) async fn validate_formula(state: &AppState, args: &Map<String, Value>) -> Value {
-    api_result_to_value(calc_fields::validate(State(state.clone()), body(args)).await).await
+pub(super) async fn validate_formula(
+    state: &AppState,
+    principal: Option<&Principal>,
+    args: &Map<String, Value>,
+) -> Value {
+    let who = principal.cloned().map(Extension);
+    api_result_to_value(calc_fields::validate(State(state.clone()), who, body(args)).await).await
 }
 
 /// The route answers `{ ok, field }`; the audit trail and the model read the
@@ -197,8 +207,8 @@ pub(super) async fn run(
     }
     match name {
         "list_formula_functions" => list_formula_functions(),
-        "list_calculated_fields" => list_calculated_fields(state, args).await,
-        "validate_formula" => validate_formula(state, args).await,
+        "list_calculated_fields" => list_calculated_fields(state, principal, args).await,
+        "validate_formula" => validate_formula(state, principal, args).await,
         "create_calculated_field" => create_calculated_field(state, principal, args).await,
         "update_calculated_field" => update_calculated_field(state, principal, args).await,
         "delete_calculated_field" => delete_calculated_field(state, principal, args).await,

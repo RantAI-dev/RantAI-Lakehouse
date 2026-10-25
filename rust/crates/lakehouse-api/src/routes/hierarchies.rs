@@ -25,7 +25,7 @@ use serde_json::{Value, json};
 
 use crate::error::ApiResult;
 use crate::json::ApiJson;
-use crate::routes::calc_fields::{author_name, classify_ch, resolve};
+use crate::routes::calc_fields::{author_name, classify_ch, resolve, resolve_visible};
 use crate::routes::dashboard_access::require_entitled;
 use crate::state::AppState;
 
@@ -132,7 +132,14 @@ pub async fn create(
 ) -> ApiResult<ApiJson<Value>> {
     let parsed = parse_body(&body)?;
     let ch = &state.clickhouse;
-    let source = resolve(ch, parsed.mart.as_deref(), parsed.source.as_deref()).await?;
+    // BI-19 B2 re-review S4-b: a hidden SQL source is the unknown-source 404.
+    let source = resolve_visible(
+        &state,
+        principal.as_ref(),
+        parsed.mart.as_deref(),
+        parsed.source.as_deref(),
+    )
+    .await?;
     let name = parsed.name.trim().to_owned();
     hierarchies::validate(&name, &parsed.levels, &source.cols).map_err(ApiError::BadRequest)?;
     let siblings = hierarchies::list_for(ch, source.kind, &source.id)
@@ -191,7 +198,9 @@ pub async fn update(
         .ok_or_else(|| ApiError::NotFound(format!("hierarchy '{id}' not found.")))?;
     let source = match current.source_kind {
         SourceKind::Mart => resolve(ch, Some(&current.source_id), None).await?,
-        SourceKind::SqlSource => resolve(ch, None, Some(&current.source_id)).await?,
+        SourceKind::SqlSource => {
+            resolve_visible(&state, principal.as_ref(), None, Some(&current.source_id)).await?
+        }
     };
     let name = parsed.name.trim().to_owned();
     hierarchies::validate(&name, &parsed.levels, &source.cols).map_err(ApiError::BadRequest)?;

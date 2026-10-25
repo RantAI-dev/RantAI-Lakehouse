@@ -324,7 +324,17 @@ pub async fn delete(
     if !folder.owner_id.is_empty() {
         return Err(personal_space_refusal().into());
     }
-    let subfolders = all.iter().filter(|f| f.parent_id == id).count();
+    // BI-19 B2 re-review (SHOULD-FIX, pre-existing since R5): subfolders are
+    // counted as `Viewer::system()`, as the dashboards below are. Through the
+    // caller's viewer a manager of F could delete it and orphan a restricted
+    // sub-folder they cannot see (not a leak, F2 keeps its mark, but the tree
+    // would break).
+    let subfolders = folders::list_folders(ch, &Viewer::system())
+        .await
+        .map_err(|err| classify_ch_error(&err))?
+        .iter()
+        .filter(|f| f.parent_id == id)
+        .count();
     // An ordinary folder never holds a private dashboard, so counting what the
     // caller may see is counting all of it.
     // R5: a folder may now hold a dashboard the caller cannot see (a restriction

@@ -817,6 +817,11 @@ pub async fn specs_create(
         Level::Edit,
     )
     .await?;
+    // BI-19 B2 re-review S4-b: a source in a folder the caller cannot see is
+    // the unknown-source answer, as for the sources routes.
+    store::ensure_sources_visible(&state.clickhouse, &input, &scope.viewer, &[])
+        .await
+        .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
     let time = crate::routes::settings::time_context(&state).await?;
     let spec = store::spec_from_input(
         &state.clickhouse,
@@ -893,6 +898,7 @@ pub async fn specs_preview(
     // chart (not part of its definition). Checked against the definitions;
     // a value that does not fit is a 400.
     let sent_params = raw.as_object_mut().and_then(|o| o.remove("params"));
+    let is_drill = raw.get("drillOf").is_some();
     let input = preview_input(&state, &principal, raw).await?;
     let time = crate::routes::settings::time_context(&state).await?;
     let loaded = if sent_params.is_some() || input.uses_params() {
@@ -905,6 +911,16 @@ pub async fn specs_preview(
         Some(l) if l.store_error.is_none() => time.with_params(l.values.clone()),
         _ => time,
     };
+    // BI-19 B2 re-review S4-b: the preview reads the named source's rows, so a
+    // hidden source is the unknown-source answer here too. A drill rebuilds a
+    // saved chart's own definition (the dashboard governs it, and `drill_input`
+    // read it through the viewer).
+    if !is_drill {
+        let viewer = crate::routes::dashboard_access::viewer_for(&state, &principal).await?;
+        store::ensure_sources_visible(&state.clickhouse, &input, &viewer, &[])
+            .await
+            .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
+    }
     let spec = store::spec_from_input(
         &state.clickhouse,
         &input,
@@ -1045,6 +1061,18 @@ pub async fn specs_update(
         Level::Edit,
     )
     .await?;
+    // BI-19 B2 re-review S4-b: a source the chart does not already read must be
+    // one the caller may see. What it reads now stays (the dashboard governs).
+    let already = store::list_stored_charts(ch, &scope.viewer)
+        .await
+        .map_err(|err| classify_dashboard_ch_error(&err))?
+        .into_iter()
+        .find(|c| c.spec.id == id)
+        .map(|c| store::sql_sources_named(&c.def))
+        .unwrap_or_default();
+    store::ensure_sources_visible(ch, &input, &scope.viewer, &already)
+        .await
+        .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
     let time = crate::routes::settings::time_context(&state).await?;
     let spec = store::spec_from_input(ch, &input, ChartSource::Ui, "ui", Some(id), &time)
         .await
@@ -2934,6 +2962,20 @@ async fn records_for_roles(
             ));
         }
     };
+    // BI-19 B2 re-review S4-b: a bare `sqlSource=` resolves a source by id, so
+    // it is the same 404 as an unknown source when the source sits in a folder
+    // the caller cannot see. With a chart the dashboard governs (the chart was
+    // found through the viewer above), so a tile on a visible dashboard keeps
+    // reading its source.
+    if q.chart.as_deref().is_none_or(|c| c.trim().is_empty())
+        && let Some(id) = q
+            .sql_source
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    {
+        crate::routes::dashboard_sources::visible_source(ch, viewer, id).await?;
+    }
     let relation = records_relation(ch, &q, &joins).await?;
     let relation = with_calculated_columns(ch, relation, (&q, &own), time).await?;
     let filters = with_chart_filters(&own, dashboard_filters, &relation.cols, time)?;

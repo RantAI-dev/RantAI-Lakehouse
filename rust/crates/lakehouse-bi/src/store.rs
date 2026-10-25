@@ -4149,6 +4149,57 @@ fn resolved_from_inline(input: &ChartInput, inline: InlineSql<'_>) -> Result<Res
     })
 }
 
+/// The SQL sources a chart definition reads: its own and its other questions'
+/// (trimmed, non-empty).
+#[must_use]
+pub fn sql_sources_named(input: &ChartInput) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(id) = input.sql_source.as_deref() {
+        out.push(id.trim().to_owned());
+    }
+    for layer in input.shape.layers_list() {
+        if let Some(id) = layer.sql_source.as_deref() {
+            out.push(id.trim().to_owned());
+        }
+    }
+    out.retain(|id| !id.is_empty());
+    out
+}
+
+/// Whether the SQL sources a chart definition names (its own and its other
+/// questions') are ones `viewer` may use, `BI-19` B2 re-review S4-b.
+///
+/// A source filed in a folder the viewer cannot see is the same "not found" as
+/// an unknown id, so a chart cannot be used to read a hidden source's rows or
+/// to learn it exists. `keep` is what the chart already uses (an edit of a tile
+/// that reads a source keeps reading it: the dashboard governs, not the folder
+/// of the source); only a source the definition newly names is checked. Called
+/// by the routes that take a definition from a person (create, update, preview,
+/// the assistant's chart tools), never by rendering or by a duplicate, which
+/// work from stored charts.
+///
+/// # Errors
+///
+/// [`BiError::Validation`] with the unknown-source sentence, or
+/// [`BiError::Clickhouse`] when the source cannot be read.
+pub async fn ensure_sources_visible(
+    ch: &ChClient,
+    input: &ChartInput,
+    viewer: &Viewer,
+    keep: &[String],
+) -> Result<(), BiError> {
+    let named = sql_sources_named(input);
+    for id in named.iter().filter(|id| !keep.contains(id)) {
+        if let Some(found) = crate::sources::get_source(ch, id).await?
+            && !found.folder_id.is_empty()
+            && !viewer.sees_folder(&found.folder_id, "")
+        {
+            return Err(BiError::Validation(format!("SQL source '{id}' not found.")));
+        }
+    }
+    Ok(())
+}
+
 /// Resolve `input.mart` / `input.sql_source` (exactly one) into a
 /// [`Resolved`] relation.
 async fn resolve_relation(ch: &ChClient, input: &ChartInput) -> Result<Resolved, BiError> {

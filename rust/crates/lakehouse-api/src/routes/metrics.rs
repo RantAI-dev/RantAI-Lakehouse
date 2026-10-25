@@ -42,7 +42,7 @@ use serde_json::{Value, json};
 use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::policy_engine::PolicyEngineObligations;
-use crate::routes::calc_fields::{Resolved, author_name, resolve};
+use crate::routes::calc_fields::{Resolved, author_name, resolve, resolve_visible};
 use crate::routes::dashboard_access::require_entitled;
 use crate::state::AppState;
 use crate::upstream_error;
@@ -142,6 +142,21 @@ async fn resolve_current(ch: &ChClient, kind: SourceKind, id: &str) -> Result<Re
     match kind {
         SourceKind::Mart => resolve(ch, Some(id), None).await,
         SourceKind::SqlSource => resolve(ch, None, Some(id)).await,
+    }
+}
+
+/// [`resolve_current`] for a handler that changes something on the source: a
+/// SQL source in a folder the caller cannot see is the unknown-source 404
+/// (`BI-19` B2 re-review S4-b).
+async fn resolve_current_visible(
+    state: &AppState,
+    principal: Option<&Extension<Principal>>,
+    kind: SourceKind,
+    id: &str,
+) -> Result<Resolved, ApiError> {
+    match kind {
+        SourceKind::Mart => resolve(&state.clickhouse, Some(id), None).await,
+        SourceKind::SqlSource => resolve_visible(state, principal, None, Some(id)).await,
     }
 }
 
@@ -491,7 +506,15 @@ pub async fn create(
 ) -> ApiResult<ApiJson<Value>> {
     let parsed: MetricBody = parse(&body)?;
     let ch = &state.clickhouse;
-    let source = resolve(ch, parsed.mart.as_deref(), parsed.source.as_deref()).await?;
+    // BI-19 B2 re-review S4-b: a source the caller names is resolved as the
+    // viewer they read as (the unknown-source 404 for a hidden one).
+    let source = resolve_visible(
+        &state,
+        principal.as_ref(),
+        parsed.mart.as_deref(),
+        parsed.source.as_deref(),
+    )
+    .await?;
     let name = parsed.name.trim().to_owned();
     metrics::validate_name(&name, &source.cols).map_err(ApiError::BadRequest)?;
     let existing = metrics::list_metrics(ch)
@@ -537,7 +560,13 @@ pub async fn update(
         .await
         .map_err(|failure| classify_ch(&failure))?
         .ok_or_else(|| ApiError::NotFound(format!("metric '{id}' not found.")))?;
-    let source = resolve_current(ch, current.source_kind, &current.source_id).await?;
+    let source = resolve_current_visible(
+        &state,
+        principal.as_ref(),
+        current.source_kind,
+        &current.source_id,
+    )
+    .await?;
     let def = definition(parsed, &source, current.name.clone(), current.id.clone());
     let (mut def, _ok) = checked(&state, def, &source).await?;
     def.created_by = author_name(principal.as_ref());
@@ -633,7 +662,15 @@ pub async fn validate(
     let parsed: MetricBody = parse(&body)?;
     let want_value = parsed.value;
     let ch = &state.clickhouse;
-    let source = resolve(ch, parsed.mart.as_deref(), parsed.source.as_deref()).await?;
+    // BI-19 B2 re-review S4-b: a source the caller names is resolved as the
+    // viewer they read as (the unknown-source 404 for a hidden one).
+    let source = resolve_visible(
+        &state,
+        principal.as_ref(),
+        parsed.mart.as_deref(),
+        parsed.source.as_deref(),
+    )
+    .await?;
     let own = parsed.name.trim().to_owned();
     let name = if lakehouse_core::ident::Ident::new(own.as_str()).is_ok() {
         own
@@ -827,7 +864,15 @@ pub async fn create_segment(
 ) -> ApiResult<ApiJson<Value>> {
     let parsed: SegmentBody = parse(&body)?;
     let ch = &state.clickhouse;
-    let source = resolve(ch, parsed.mart.as_deref(), parsed.source.as_deref()).await?;
+    // BI-19 B2 re-review S4-b: a source the caller names is resolved as the
+    // viewer they read as (the unknown-source 404 for a hidden one).
+    let source = resolve_visible(
+        &state,
+        principal.as_ref(),
+        parsed.mart.as_deref(),
+        parsed.source.as_deref(),
+    )
+    .await?;
     let name = parsed.name.trim().to_owned();
     metrics::validate_name(&name, &source.cols).map_err(ApiError::BadRequest)?;
     let existing = metrics::list_segments(ch)
@@ -878,7 +923,13 @@ pub async fn update_segment(
         .await
         .map_err(|failure| classify_ch(&failure))?
         .ok_or_else(|| ApiError::NotFound(format!("segment '{id}' not found.")))?;
-    let source = resolve_current(ch, current.source_kind, &current.source_id).await?;
+    let source = resolve_current_visible(
+        &state,
+        principal.as_ref(),
+        current.source_kind,
+        &current.source_id,
+    )
+    .await?;
     let mut def = segment_definition(parsed, &source, current.name.clone(), current.id.clone());
     check_segment(&state, &def, &source).await?;
     def.created_by = author_name(principal.as_ref());
