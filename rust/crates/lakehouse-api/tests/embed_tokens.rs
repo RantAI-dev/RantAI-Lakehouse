@@ -508,7 +508,7 @@ async fn embed_info_without_a_secret_is_unsupported_with_the_reason_and_no_sampl
     let app = app(&ch, None).await;
     let (status, body) = as_user(
         &app,
-        "dashboard:read",
+        "dashboard:read, dashboard:write",
         Request::builder().uri(format!("/api/dashboard/embed-info?board={BOARD}")),
         Body::empty(),
     )
@@ -532,7 +532,7 @@ async fn embed_info_with_a_secret_returns_a_sample_token_that_has_iat_exp_and_jt
     let app = app(&ch, Some(SECRET)).await;
     let (status, body) = as_user(
         &app,
-        "dashboard:read",
+        "dashboard:read, dashboard:write",
         Request::builder().uri(format!("/api/dashboard/embed-info?board={BOARD}")),
         Body::empty(),
     )
@@ -984,7 +984,7 @@ async fn embed_info_reports_the_allowed_sites_the_instant_and_the_limit() {
     let app = app(&ch, Some(SECRET)).await;
     let (status, body) = as_user(
         &app,
-        "dashboard:read",
+        "dashboard:read, dashboard:write",
         Request::builder().uri(format!("/api/dashboard/embed-info?board={BOARD}")),
         Body::empty(),
     )
@@ -1670,7 +1670,7 @@ async fn only_a_filter_that_picks_values_can_be_locked_or_editable() {
     // The dialog is told which filters can only be hidden.
     let (_, info) = as_user(
         &app,
-        "dashboard:read",
+        "dashboard:read, dashboard:write",
         Request::builder().uri(format!("/api/dashboard/embed-info?board={BOARD}")),
         Body::empty(),
     )

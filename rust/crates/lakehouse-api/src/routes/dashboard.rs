@@ -17,7 +17,7 @@ use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use lakehouse_auth::Principal;
-use lakehouse_bi::access::Viewer;
+use lakehouse_bi::access::{Level, Viewer};
 use lakehouse_bi::builder::{ReadContext, RelationColumns};
 use lakehouse_bi::filters::{ColumnKind, validate_filters, without_inert};
 use lakehouse_bi::grain::{Grain, TimeContext};
@@ -787,12 +787,23 @@ pub async fn specs_create(
     Extension(principal): Extension<Principal>,
     body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
+    // BI-19 B2 (plan D8): a caller who holds less than `edit` everywhere is
+    // refused first, whatever the request says.
+    crate::routes::dashboard_access::require_can_ever(&state, &principal, Level::Edit).await?;
     let input = parse_chart_input(&body)?;
     // BI-18 part C, part 2: a chart cannot be put on a dashboard that is in
     // the trash or in somebody else's personal space.
     // BI-19 B1 review R5: the resolved viewer, so a restricted dashboard is a 404.
-    let viewer = crate::routes::dashboard_access::viewer_for_write(&state, &principal).await?;
-    require_chart_board(&state.clickhouse, input.board.as_deref(), &viewer).await?;
+    // BI-19 B2 (plan D8): and `edit` on that dashboard, else 403.
+    let scope = crate::routes::dashboard_access::scope_for_write(&state, &principal).await?;
+    require_chart_board(&state.clickhouse, input.board.as_deref(), &scope.viewer).await?;
+    crate::routes::dashboard_access::require_board_level(
+        &state,
+        &scope,
+        input.board.as_deref().unwrap_or_default(),
+        Level::Edit,
+    )
+    .await?;
     let time = crate::routes::settings::time_context(&state).await?;
     let spec = store::spec_from_input(
         &state.clickhouse,
@@ -987,6 +998,9 @@ pub async fn specs_update(
     Extension(principal): Extension<Principal>,
     body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
+    // BI-19 B2 (plan D8): a caller who holds less than `edit` everywhere is
+    // refused first, whatever the request says.
+    crate::routes::dashboard_access::require_can_ever(&state, &principal, Level::Edit).await?;
     let raw: Value = serde_json::from_slice(&body)
         .map_err(|_err| ApiError::BadRequest("body JSON is invalid".to_owned()))?;
     let id = raw
@@ -1003,10 +1017,21 @@ pub async fn specs_update(
     // would bring it back without a restore) or on somebody else's personal
     // board, nor move a chart onto such a board.
     // BI-19 B1 review R5: the resolved viewer, so a restricted dashboard is a 404.
-    let viewer = crate::routes::dashboard_access::viewer_for_write(&state, &principal).await?;
+    // BI-19 B2 (plan D8): `edit` on the dashboard the chart is on, and on the one
+    // it moves to; visible-but-below is a 403.
+    let scope = crate::routes::dashboard_access::scope_for_write(&state, &principal).await?;
     let ch = &state.clickhouse;
-    let old_board = require_editable_chart(ch, &id, &viewer).await?;
-    require_chart_board(ch, input.board.as_deref(), &viewer).await?;
+    let old_board = require_editable_chart(ch, &id, &scope.viewer).await?;
+    crate::routes::dashboard_access::require_board_level(&state, &scope, &old_board, Level::Edit)
+        .await?;
+    require_chart_board(ch, input.board.as_deref(), &scope.viewer).await?;
+    crate::routes::dashboard_access::require_board_level(
+        &state,
+        &scope,
+        input.board.as_deref().unwrap_or_default(),
+        Level::Edit,
+    )
+    .await?;
     let time = crate::routes::settings::time_context(&state).await?;
     let spec = store::spec_from_input(ch, &input, ChartSource::Ui, "ui", Some(id), &time)
         .await
@@ -1062,6 +1087,9 @@ pub async fn specs_delete(
     Extension(principal): Extension<Principal>,
     Query(q): Query<IdQuery>,
 ) -> ApiResult<ApiJson<Value>> {
+    // BI-19 B2 (plan D8): a caller who holds less than `edit` everywhere is
+    // refused first, whatever the request says.
+    crate::routes::dashboard_access::require_can_ever(&state, &principal, Level::Edit).await?;
     let Some(id) = q.id.filter(|s| !s.is_empty()) else {
         return Err(ApiError::BadRequest("id is required".to_owned()).into());
     };
@@ -1070,10 +1098,13 @@ pub async fn specs_delete(
     let ch = &state.clickhouse;
     // BI-19 B1 review R5: the resolved viewer; a chart on a dashboard the caller
     // cannot see is answered like one that does not exist.
-    let viewer = crate::routes::dashboard_access::viewer_for_write(&state, &principal).await?;
-    let Some(board) = visible_live_chart_board(ch, &id, &viewer).await? else {
+    let scope = crate::routes::dashboard_access::scope_for_write(&state, &principal).await?;
+    let Some(board) = visible_live_chart_board(ch, &id, &scope.viewer).await? else {
         return Ok(ApiJson(json!({ "ok": true })));
     };
+    // BI-19 B2 (plan D8): seen, so `edit` is checked (403 below it).
+    crate::routes::dashboard_access::require_board_level(&state, &scope, &board, Level::Edit)
+        .await?;
     store::delete_chart(ch, &id, &principal.display_name)
         .await
         .map_err(|err| {
@@ -1197,14 +1228,25 @@ pub async fn boards_create(
     principal: Option<Extension<Principal>>,
     body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
+    if let Some(Extension(p)) = principal.as_ref() {
+        // BI-19 B2 (plan D8): filing a dashboard needs `edit` somewhere.
+        crate::routes::dashboard_access::require_can_ever(&state, p, Level::Edit).await?;
+    }
     // Fail closed: with nobody attached (the assistant's tool surface does not
     // come through here) the caller is anonymous and sees no personal space.
     // BI-19 B1 review R5: the resolved viewer, so duplicating (or filing into) a
     // dashboard or folder the caller cannot see is the same 404 as an unknown one.
-    let viewer = match principal.as_ref() {
-        Some(Extension(p)) => crate::routes::dashboard_access::viewer_for_write(&state, p).await?,
-        None => Viewer::anonymous(),
+    // BI-19 B2 (plan D8, D14): filing a dashboard needs `edit` on the folder it
+    // goes into, and a copy needs the original to be visible.
+    let scope = match principal.as_ref() {
+        Some(Extension(p)) => {
+            Some(crate::routes::dashboard_access::scope_for_write(&state, p).await?)
+        }
+        None => None,
     };
+    let viewer = scope
+        .as_ref()
+        .map_or_else(Viewer::anonymous, |s| s.viewer.clone());
     let parsed: BoardCreateBody = if body.is_empty() {
         BoardCreateBody::default()
     } else {
@@ -1217,6 +1259,9 @@ pub async fn boards_create(
     // takes only its owner's dashboards.
     crate::routes::dashboard_folders::ensure_folder_usable(&state.clickhouse, &folder_id, &viewer)
         .await?;
+    if let Some(scope) = scope.as_ref() {
+        scope.require_on_folder(&folder_id, Level::Edit)?;
+    }
     // The owner of the folder a new dashboard is filed in: it travels in the
     // first insert, so a dashboard filed in a personal space is private from
     // the moment it exists and never public in between
@@ -1354,6 +1399,20 @@ struct BoardEditBody {
 }
 
 impl BoardEditBody {
+    /// The level the body needs on the dashboard (`BI-19` part B2): `manage`
+    /// when it shares or moves it, else `edit`.
+    fn level_needed(&self) -> Level {
+        if self.embed.is_some()
+            || self.embed_revoke_all.is_some()
+            || self.embed_origins.is_some()
+            || self.folder_id.is_some()
+        {
+            Level::Manage
+        } else {
+            Level::Edit
+        }
+    }
+
     /// Whether the body changes what a version holds (`BI-18` part C, part 2):
     /// everything but sharing, the folder and the embed state.
     fn changes_content(&self) -> bool {
@@ -1644,6 +1703,9 @@ pub async fn boards_update(
     Extension(principal): Extension<Principal>,
     body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
+    // BI-19 B2 (plan D8): a caller who holds less than `edit` everywhere is
+    // refused first, whatever the request says.
+    crate::routes::dashboard_access::require_can_ever(&state, &principal, Level::Edit).await?;
     let parsed: BoardEditBody = if body.is_empty() {
         BoardEditBody::default()
     } else {
@@ -1668,9 +1730,24 @@ pub async fn boards_update(
     // blank live row over its trash entry, and an edit by id could reach
     // another user's draft.
     // BI-19 B1 review R5: the resolved viewer, so a restricted dashboard is a 404.
-    let viewer = crate::routes::dashboard_access::viewer_for_write(&state, &principal).await?;
+    let scope = crate::routes::dashboard_access::scope_for_write(&state, &principal).await?;
+    let viewer = scope.viewer.clone();
     if id != store::DEFAULT_BOARD_ID {
         require_board(ch, &id, &viewer).await?;
+    }
+    // BI-19 B2 (plan D8): `edit` for the content; sharing the dashboard (embed
+    // state, the sites that may frame it, withdrawing tokens) and moving it
+    // change who can reach it, so they need `manage` (feature B1, B7). The place
+    // it moves to needs `edit`, as any filing does.
+    crate::routes::dashboard_access::require_board_level(
+        &state,
+        &scope,
+        &id,
+        parsed.level_needed(),
+    )
+    .await?;
+    if let Some(folder_id) = &parsed.folder_id {
+        scope.require_on_folder(folder_id.trim(), Level::Edit)?;
     }
     // Before the first write, so a bad filter list does not leave a board
     // half-edited (BI-18).
@@ -1756,6 +1833,9 @@ pub async fn boards_delete(
     Extension(principal): Extension<Principal>,
     Query(q): Query<IdQuery>,
 ) -> ApiResult<ApiJson<Value>> {
+    // BI-19 B2 (plan D8): a caller who holds less than `manage` everywhere is
+    // refused first, whatever the request says.
+    crate::routes::dashboard_access::require_can_ever(&state, &principal, Level::Manage).await?;
     let id = q.id.unwrap_or_default();
     if id.is_empty() || id == store::DEFAULT_BOARD_ID {
         return Err(ApiError::BadRequest("invalid dashboard".to_owned()).into());
@@ -1764,8 +1844,11 @@ pub async fn boards_delete(
     // caller may see can be deleted. An unknown, already deleted or private
     // board is "not found" alike.
     // BI-19 B1 review R5: the resolved viewer, so a restricted dashboard is a 404.
-    let viewer = crate::routes::dashboard_access::viewer_for_write(&state, &principal).await?;
-    require_board(&state.clickhouse, &id, &viewer).await?;
+    let scope = crate::routes::dashboard_access::scope_for_write(&state, &principal).await?;
+    require_board(&state.clickhouse, &id, &scope.viewer).await?;
+    // BI-19 B2 (plan D8): deleting is `manage` (feature B1).
+    crate::routes::dashboard_access::require_board_level(&state, &scope, &id, Level::Manage)
+        .await?;
     store::delete_board(&state.clickhouse, &id, &principal.display_name)
         .await
         .map_err(|err| {
@@ -2139,8 +2222,14 @@ pub struct JoinSuggestionsQuery {
 /// does not have; the database's failure is classified, never forwarded.
 pub async fn join_suggestions(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Query(q): Query<JoinSuggestionsQuery>,
 ) -> Response {
+    // BI-19 B2 (plan D8): "signed in" at the router; a person with neither
+    // `dashboard:read` nor a rule is refused here, as the router refused them.
+    if let Err(err) = crate::routes::dashboard_access::require_entitled(&state, &principal).await {
+        return crate::error::ApiRejection(err).into_response();
+    }
     match join_suggestions_value(&state.clickhouse, q.left.as_deref(), q.right.as_deref()).await {
         Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
         Err(rejection) => crate::error::ApiRejection(rejection).into_response(),
@@ -4392,6 +4481,11 @@ pub async fn embed_info(
     Extension(principal): Extension<Principal>,
     Query(q): Query<EmbedInfoQuery>,
 ) -> Response {
+    if let Err(err) =
+        crate::routes::dashboard_access::require_can_ever(&state, &principal, Level::Manage).await
+    {
+        return crate::error::ApiRejection(err).into_response();
+    }
     let id = q.board.unwrap_or_default();
     if id.is_empty() || id == "default" {
         return (
@@ -4400,8 +4494,23 @@ pub async fn embed_info(
         )
             .into_response();
     }
-    let viewer = match viewer_for(&state, &principal).await {
-        Ok(viewer) => viewer,
+    // BI-19 B2 (plan D8): this is the Share dialog's embed state and mints a
+    // sample token, so it is for somebody who manages the dashboard (404 for one
+    // they cannot see, 403 for one they only view or edit).
+    let viewer = match crate::routes::dashboard_access::scope_for_write(&state, &principal).await {
+        Ok(scope) => {
+            if let Err(err) = crate::routes::dashboard_access::require_board_level(
+                &state,
+                &scope,
+                &id,
+                Level::Manage,
+            )
+            .await
+            {
+                return crate::error::ApiRejection(err).into_response();
+            }
+            scope.viewer
+        }
         Err(err) => return crate::error::ApiRejection(err).into_response(),
     };
     match embed_info_body(&state, &id, q.chart.as_deref(), &viewer).await {

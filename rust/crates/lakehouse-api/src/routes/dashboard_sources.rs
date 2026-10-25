@@ -198,7 +198,13 @@ fn clean_title(title: &str) -> Result<String, ApiError> {
 /// # Errors
 ///
 /// 422/503 on a `ClickHouse` failure (fixed text).
-pub async fn list(State(state): State<AppState>) -> ApiResult<ApiJson<Value>> {
+pub async fn list(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+) -> ApiResult<ApiJson<Value>> {
+    // BI-19 B2 (plan D8): the chart builder lists sources for somebody who can
+    // edit a dashboard through a rule alone; the router asks only "signed in".
+    crate::routes::dashboard_access::require_entitled(&state, &principal).await?;
     let list = sources::list_sources(&state.clickhouse)
         .await
         .map_err(|err| classify_ch_error(&err))?;

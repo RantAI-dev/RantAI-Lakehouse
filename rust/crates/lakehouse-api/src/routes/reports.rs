@@ -805,9 +805,10 @@ pub async fn deliveries(
 pub struct PickerQuery {
     #[serde(default)]
     q: Option<String>,
-    /// `1`: also list roles whose name matches, for the permissions picker
-    /// (`BI-19` part B). Roles are shown only to somebody with
-    /// `dashboard:write`: the report picker stays as narrow as it was.
+    /// `1`: the permissions picker (`BI-19` part B): also list roles whose
+    /// name matches. Roles are shown only to somebody who manages a dashboard
+    /// (`dashboard:write` or a `manage` rule); the report picker stays as
+    /// narrow as it was.
     #[serde(default)]
     roles: Option<String>,
 }
@@ -824,7 +825,20 @@ pub async fn recipients(
     Extension(principal): Extension<Principal>,
     Query(q): Query<PickerQuery>,
 ) -> ApiResult<ApiJson<Value>> {
-    crate::routes::settings::require_download(&state, &principal).await?;
+    // BI-19 B2 (plan D10): the People panel asks with `roles=1`. Somebody who
+    // manages a dashboard through a rule alone holds no `dashboard:read` and may
+    // not be allowed to download, yet must find people to add, so that mode
+    // asks for "manages something" (the item is checked on save) and nothing
+    // else. The report picker keeps what the router asked of it before:
+    // `dashboard:read`, then the download right.
+    let permissions_picker = q.roles.as_deref() == Some("1")
+        && crate::routes::dashboard_access::manages_something(&state, &principal).await?;
+    if !permissions_picker {
+        if !principal.has("dashboard:read") {
+            return Err(ApiError::PermissionDenied("dashboard:read".to_owned()).into());
+        }
+        crate::routes::settings::require_download(&state, &principal).await?;
+    }
     let found = subscriptions::search_active_users(
         pool_of(&state)?,
         q.q.as_deref().unwrap_or("").trim(),
@@ -832,7 +846,7 @@ pub async fn recipients(
     )
     .await
     .map_err(|e| store_failed(&e))?;
-    let roles = if q.roles.as_deref() == Some("1") && principal.has("dashboard:write") {
+    let roles = if permissions_picker {
         lakehouse_store::dashboard_access::search_roles(
             pool_of(&state)?,
             q.q.as_deref().unwrap_or("").trim(),

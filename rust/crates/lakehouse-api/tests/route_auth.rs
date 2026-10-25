@@ -2225,7 +2225,8 @@ fn the_sec12_embed_routes_are_registered_with_the_policies_the_plan_names() {
     );
     assert_eq!(
         policy_of("POST", "/api/dashboard/embed-revoke"),
-        Some(Policy::RequiresPermission("dashboard:write")),
+        // BI-19 B2: "signed in" at the router, `manage` on the dashboard in the handler.
+        Some(Policy::RequiresAuth),
         "withdrawing a token is a write"
     );
 }
@@ -2353,7 +2354,8 @@ async fn the_join_suggestions_need_dashboard_read_and_not_query_read() {
             .iter()
             .find(|(m, p, _)| *m == "GET" && *p == "/api/dashboard/join-suggestions")
             .map(|(_, _, policy)| *policy),
-        Some(Policy::RequiresPermission("dashboard:read"))
+        // BI-19 B2: "signed in" at the router, the entry check in the handler.
+        Some(Policy::RequiresAuth)
     );
     let uri = "/api/dashboard/join-suggestions?left=a&right=b";
     let viewer = common::create_principal_with_permissions(&pool, "dashboard:read").await;
@@ -2458,12 +2460,15 @@ async fn history_trash_personal_space_favourites_and_search_have_the_right_permi
                 .iter()
                 .find(|(m, p, _)| *m == method && *p == path)
                 .map(|(_, _, policy)| *policy),
-            // BI-19 part B1: the reads are "signed in" plus the handler's entry check.
-            Some(if needs == "dashboard:read" {
-                Policy::RequiresAuth
-            } else {
-                Policy::RequiresPermission(needs)
-            }),
+            // BI-19 B1/B2: the reads and the writes on a dashboard are "signed in" plus
+            // the handler's check; only the personal space keeps a permission.
+            Some(
+                if needs == "dashboard:read" || path != "/api/dashboard/personal" {
+                    Policy::RequiresAuth
+                } else {
+                    Policy::RequiresPermission(needs)
+                }
+            ),
             "{method} {path}"
         );
         let (allowed, other) = if needs == "dashboard:read" {
@@ -2577,6 +2582,152 @@ async fn the_moved_dashboard_reads_are_refused_without_a_rule_and_pass_with_one(
             resp.status() != StatusCode::UNAUTHORIZED && resp.status() != StatusCode::FORBIDDEN,
             "{method} {uri}: a rule must get past the guard, got {}",
             resp.status()
+        );
+    }
+}
+
+/// BI-19 part B2 (plan D8): the write routes of a dashboard are `RequiresAuth`
+/// at the router and judge the caller's level in the handler. Both ways for
+/// every moved row: no session is 401; no permission and no rule is 403;
+/// `dashboard:read` alone (view) is 403 on every write; a rule giving `edit`
+/// is past the guard on the edit rows and still 403 on the manage rows; a rule
+/// giving `manage` is past on all (what follows is the harness's unreachable
+/// `ClickHouse`, never 401 or 403).
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the table of moved rows is the test; splitting it would hide a row from one of the four checks"
+)]
+async fn the_moved_dashboard_writes_need_edit_or_manage_both_ways() {
+    let TestApp { router, pool } = spin_up().await;
+    // (method, uri, body, needs manage)
+    let moved: [(&str, &str, &str, bool); 14] = [
+        ("POST", "/api/dashboard/specs", r#"{"board":"b1"}"#, false),
+        (
+            "PUT",
+            "/api/dashboard/specs",
+            r#"{"id":"c1","board":"b1"}"#,
+            false,
+        ),
+        ("DELETE", "/api/dashboard/specs?id=c1", "", false),
+        ("POST", "/api/dashboard/boards", r#"{"name":"x"}"#, false),
+        (
+            "PUT",
+            "/api/dashboard/boards",
+            r#"{"id":"b1","name":"x"}"#,
+            false,
+        ),
+        ("DELETE", "/api/dashboard/boards?id=b1", "", true),
+        (
+            "POST",
+            "/api/dashboard/versions/revert",
+            r#"{"board":"b1","version":1}"#,
+            false,
+        ),
+        (
+            "POST",
+            "/api/dashboard/trash/restore",
+            r#"{"kind":"chart","id":"c1"}"#,
+            false,
+        ),
+        ("GET", "/api/dashboard/public-link?board=b1", "", true),
+        (
+            "PUT",
+            "/api/dashboard/public-link",
+            r#"{"board":"b1"}"#,
+            true,
+        ),
+        ("DELETE", "/api/dashboard/public-link?board=b1", "", true),
+        ("GET", "/api/dashboard/embed-info?board=b1", "", true),
+        (
+            "PUT",
+            "/api/dashboard/embed-settings",
+            r#"{"board":"b1","filterModes":{}}"#,
+            true,
+        ),
+        (
+            "POST",
+            "/api/dashboard/embed-revoke",
+            r#"{"board":"b1","token":"t"}"#,
+            true,
+        ),
+    ];
+    let nothing = common::create_principal_with_permissions(&pool, "query:read").await;
+    let viewer = common::create_principal_with_permissions(&pool, "dashboard:read").await;
+    let editor = common::create_principal_with_permissions(&pool, "query:read").await;
+    let manager = common::create_principal_with_permissions(&pool, "query:read").await;
+    for (who, level, board) in [(editor, "edit", "b1"), (manager, "manage", "b2")] {
+        lakehouse_store::dashboard_access::replace_item(
+            &pool,
+            "board",
+            board,
+            &[lakehouse_store::dashboard_access::NewRule {
+                user_id: Some(who),
+                role_id: None,
+                level: level.to_owned(),
+            }],
+            false,
+            None,
+        )
+        .await
+        .expect("give the principal a level on one dashboard");
+    }
+    for (method, uri, body, manage) in moved {
+        let path = uri.split('?').next().unwrap_or(uri);
+        assert_eq!(
+            POLICY_TABLE
+                .iter()
+                .find(|(m, p, _)| *m == method && *p == path)
+                .map(|(_, _, policy)| *policy),
+            Some(Policy::RequiresAuth),
+            "{method} {path}"
+        );
+        let send = |cookie: String| {
+            let router = router.clone();
+            async move {
+                request_with_cookie_and_body(
+                    &router,
+                    method,
+                    uri,
+                    &cookie,
+                    body.as_bytes().to_vec(),
+                )
+                .await
+                .status()
+            }
+        };
+        assert_eq!(
+            send(String::new()).await,
+            StatusCode::UNAUTHORIZED,
+            "{method} {uri}"
+        );
+        for who in [nothing, viewer] {
+            let cookie = common::session_cookie_for_user(&pool, who).await;
+            assert_eq!(
+                send(cookie).await,
+                StatusCode::FORBIDDEN,
+                "{method} {uri}: no write level"
+            );
+        }
+        let cookie = common::session_cookie_for_user(&pool, editor).await;
+        let status = send(cookie).await;
+        if manage {
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "{method} {uri}: edit is not manage"
+            );
+        } else {
+            assert!(
+                status != StatusCode::UNAUTHORIZED && status != StatusCode::FORBIDDEN,
+                "{method} {uri}: edit must get past the guard, got {status}"
+            );
+        }
+        let cookie = common::session_cookie_for_user(&pool, manager).await;
+        let status = send(cookie).await;
+        assert!(
+            status != StatusCode::UNAUTHORIZED && status != StatusCode::FORBIDDEN,
+            "{method} {uri}: manage must get past the guard, got {status}"
         );
     }
 }
@@ -2824,7 +2975,8 @@ async fn the_public_link_routes_are_gated_in_both_directions() {
         let pattern = uri.split('?').next().unwrap();
         assert_eq!(
             policy_of(method, pattern),
-            Some(Policy::RequiresPermission("dashboard:write")),
+            // BI-19 B2: "signed in" at the router, `manage` on the dashboard in the handler.
+            Some(Policy::RequiresAuth),
             "{method} {pattern}"
         );
         let reader = create_principal_with_permissions(&pool, "dashboard:read").await;
@@ -2885,7 +3037,8 @@ async fn the_embed_values_and_settings_routes_are_gated_in_both_directions() {
     let path = "/api/dashboard/embed-settings";
     assert_eq!(
         policy_of("PUT", path),
-        Some(Policy::RequiresPermission("dashboard:write"))
+        // BI-19 B2: `manage` on the dashboard, in the handler.
+        Some(Policy::RequiresAuth)
     );
     let body = br#"{"board":"b_x","filterModes":{}}"#.to_vec();
     let resp = request_with_cookie_and_body(&router, "PUT", path, "", body.clone()).await;

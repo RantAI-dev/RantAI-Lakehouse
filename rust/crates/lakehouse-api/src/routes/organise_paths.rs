@@ -549,10 +549,17 @@ async fn another_users_private_board_cannot_be_edited_or_deleted() {
 
 #[tokio::test]
 async fn deleting_a_board_copies_its_charts_and_then_the_board_to_the_trash() {
-    let server = engine(vec![(
-        &["SELECT is_deleted, owner_id FROM console.bi_board"],
-        vec![state_row(0, "")],
-    )])
+    let server = engine(vec![
+        // BI-19 B2: the delete reads the dashboard's row to judge `manage` on it.
+        (
+            &["FROM console.bi_board FINAL WHERE is_deleted = 0 AND id='b_old'"],
+            vec![board_row("b_old", "")],
+        ),
+        (
+            &["SELECT is_deleted, owner_id FROM console.bi_board"],
+            vec![state_row(0, "")],
+        ),
+    ])
     .await;
     boards_delete(
         State(state_for(&server)),
@@ -1692,7 +1699,8 @@ async fn embed_info_for_a_private_board_is_not_found() {
     .await;
     let response = super::embed_info(
         State(state_for(&server)),
-        Extension(person(ME, "dashboard:read")),
+        // BI-19 B2: the Share dialog's embed state is for somebody who manages.
+        Extension(person(ME, "dashboard:read, dashboard:write")),
         Query(serde_json::from_value(json!({ "board": "b_draft" })).unwrap()),
     )
     .await;

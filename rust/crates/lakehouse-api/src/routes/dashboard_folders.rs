@@ -24,7 +24,7 @@ use axum::Extension;
 use axum::body::Bytes;
 use axum::extract::{Query, State};
 use lakehouse_auth::Principal;
-use lakehouse_bi::access::Viewer;
+use lakehouse_bi::access::{Level, Viewer};
 use lakehouse_bi::folders::{self, Folder};
 use lakehouse_bi::sources;
 use lakehouse_bi::store::{self, BiError};
@@ -194,17 +194,25 @@ pub async fn create(
     Extension(principal): Extension<Principal>,
     body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
+    // BI-19 B2 (plan D8): a caller who holds less than `edit` everywhere is
+    // refused first, whatever the request says.
+    crate::routes::dashboard_access::require_can_ever(&state, &principal, Level::Edit).await?;
     let body: CreateBody = parse(&body)?;
     let ch = &state.clickhouse;
     // BI-19 B1 review R5: the resolved viewer, so a folder the caller cannot see
     // is a 404 whatever they try to do with it.
-    let viewer = crate::routes::dashboard_access::viewer_for_write(&state, &principal).await?;
-    let all = folders::list_folders(ch, &viewer)
+    let scope = crate::routes::dashboard_access::scope_for_write(&state, &principal).await?;
+    let all = folders::list_folders(ch, &scope.viewer)
         .await
         .map_err(|err| classify_ch_error(&err))?;
     let parent = body.parent_id.unwrap_or_default().trim().to_owned();
     if all.iter().any(|f| f.id == parent && !f.owner_id.is_empty()) {
         return Err(personal_space_refusal().into());
+    }
+    // BI-19 B2 (plan D8): a folder is made by somebody who can edit its parent.
+    // An unknown parent is left to `check_placement`'s own 400.
+    if parent.is_empty() || all.iter().any(|f| f.id == parent) {
+        scope.require_on_folder(&parent, Level::Edit)?;
     }
     let name = folders::check_placement(&all, None, &body.name, &parent)
         .map_err(|rule| ApiError::BadRequest(rule.message().to_owned()))?;
@@ -233,13 +241,16 @@ pub async fn update(
     Extension(principal): Extension<Principal>,
     body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
+    // BI-19 B2 (plan D8): a caller who holds less than `edit` everywhere is
+    // refused first, whatever the request says.
+    crate::routes::dashboard_access::require_can_ever(&state, &principal, Level::Edit).await?;
     let body: UpdateBody = parse(&body)?;
     let id = required_id(body.id.as_deref())?;
     let ch = &state.clickhouse;
     // BI-19 B1 review R5: the resolved viewer, so a folder the caller cannot see
     // is a 404 whatever they try to do with it.
-    let viewer = crate::routes::dashboard_access::viewer_for_write(&state, &principal).await?;
-    let all = folders::list_folders(ch, &viewer)
+    let scope = crate::routes::dashboard_access::scope_for_write(&state, &principal).await?;
+    let all = folders::list_folders(ch, &scope.viewer)
         .await
         .map_err(|err| classify_ch_error(&err))?;
     let current = all
@@ -254,6 +265,15 @@ pub async fn update(
     let parent = body
         .parent_id
         .map_or_else(|| current.parent_id.clone(), |p| p.trim().to_owned());
+    // BI-19 B2 (plan D8): renaming is `edit` on the folder; moving it changes
+    // who can reach everything in it, so it is `manage` on the folder and
+    // `edit` on the place it goes to (feature B7).
+    if parent == current.parent_id {
+        scope.require_on_folder(&id, Level::Edit)?;
+    } else {
+        scope.require_on_folder(&id, Level::Manage)?;
+        scope.require_on_folder(&parent, Level::Edit)?;
+    }
     let name = folders::check_placement(&all, Some(&id), &name, &parent)
         .map_err(|rule| ApiError::BadRequest(rule.message().to_owned()))?;
     if all.iter().any(|f| f.id == parent && !f.owner_id.is_empty()) {
@@ -285,17 +305,22 @@ pub async fn delete(
     Extension(principal): Extension<Principal>,
     Query(q): Query<IdQuery>,
 ) -> ApiResult<ApiJson<Value>> {
+    // BI-19 B2 (plan D8): a caller who holds less than `manage` everywhere is
+    // refused first, whatever the request says.
+    crate::routes::dashboard_access::require_can_ever(&state, &principal, Level::Manage).await?;
     let id = required_id(q.id.as_deref())?;
     let ch = &state.clickhouse;
     // BI-19 B1 review R5: the resolved viewer, so a folder the caller cannot see
     // is a 404 whatever they try to do with it.
-    let viewer = crate::routes::dashboard_access::viewer_for_write(&state, &principal).await?;
-    let all = folders::list_folders(ch, &viewer)
+    let scope = crate::routes::dashboard_access::scope_for_write(&state, &principal).await?;
+    let all = folders::list_folders(ch, &scope.viewer)
         .await
         .map_err(|err| classify_ch_error(&err))?;
     let Some(folder) = all.iter().find(|f| f.id == id) else {
         return Err(ApiError::NotFound("folder not found.".to_owned()).into());
     };
+    // BI-19 B2 (plan D8): deleting is `manage` (feature B1).
+    scope.require_on_folder(&id, Level::Manage)?;
     if !folder.owner_id.is_empty() {
         return Err(personal_space_refusal().into());
     }

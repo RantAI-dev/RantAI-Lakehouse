@@ -37,7 +37,7 @@ use axum::Extension;
 use axum::body::Bytes;
 use axum::extract::{Query, State};
 use lakehouse_auth::Principal;
-use lakehouse_bi::access::Viewer;
+use lakehouse_bi::access::{Level, Viewer};
 use lakehouse_bi::items::{self, Kind, List};
 use lakehouse_bi::specs::ChartSource;
 use lakehouse_bi::store::{self, BiError, ChartInput, StoredChartSpec};
@@ -637,6 +637,9 @@ pub async fn revert(
     Extension(principal): Extension<Principal>,
     body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
+    // BI-19 B2 (plan D8): a caller who holds less than `edit` everywhere is
+    // refused first, whatever the request says.
+    crate::routes::dashboard_access::require_can_ever(&state, &principal, Level::Edit).await?;
     let body: RevertBody = parse(&body)?;
     let id = body.board.trim();
     if id.is_empty() || body.version == 0 {
@@ -649,8 +652,10 @@ pub async fn revert(
     }
     let ch = &state.clickhouse;
     // BI-19 B1 review R5: the resolved viewer, so a restricted dashboard is a 404.
-    let viewer = crate::routes::dashboard_access::viewer_for_write(&state, &principal).await?;
-    require_board(ch, id, &viewer).await?;
+    let scope = crate::routes::dashboard_access::scope_for_write(&state, &principal).await?;
+    require_board(ch, id, &scope.viewer).await?;
+    // BI-19 B2 (plan D8): going back is an edit.
+    crate::routes::dashboard_access::require_board_level(&state, &scope, id, Level::Edit).await?;
     let Some(stored) = versions::load(ch, id, body.version)
         .await
         .map_err(|err| classify_ch_error(&err))?
@@ -748,6 +753,9 @@ pub async fn trash_restore(
     Extension(principal): Extension<Principal>,
     body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
+    // BI-19 B2 (plan D8): a caller who holds less than `edit` everywhere is
+    // refused first, whatever the request says.
+    crate::routes::dashboard_access::require_can_ever(&state, &principal, Level::Edit).await?;
     let body: RestoreBody = parse(&body)?;
     let id = body.id.trim();
     if id.is_empty() {
@@ -755,7 +763,32 @@ pub async fn trash_restore(
     }
     let ch = &state.clickhouse;
     // BI-19 B1 review R5: the resolved viewer, so a restricted dashboard is a 404.
-    let viewer = crate::routes::dashboard_access::viewer_for_write(&state, &principal).await?;
+    let scope = crate::routes::dashboard_access::scope_for_write(&state, &principal).await?;
+    let viewer = scope.viewer.clone();
+    // BI-19 B2 (plan D8): bringing a dashboard back undoes a delete, so it is
+    // `manage`; a chart comes back with `edit` on its dashboard. The trashed
+    // row is not a live dashboard, so the level is read from where it sits;
+    // what the caller cannot see keeps the 404 the restore itself gives.
+    let placements = store::board_placements(ch)
+        .await
+        .map_err(|err| classify_ch_error(&err))?;
+    match Kind::parse(body.kind.trim()) {
+        Some(Kind::Board) => scope.refuse_below(&placements, id, Level::Manage)?,
+        Some(Kind::Chart) => {
+            if let Some((_, board)) = store::chart_row_state(ch, id)
+                .await
+                .map_err(|err| classify_ch_error(&err))?
+            {
+                if board.is_empty() || board == store::DEFAULT_BOARD_ID {
+                    // On the built-in dashboard: judged at the root.
+                    scope.require_root(Level::Edit)?;
+                } else {
+                    scope.refuse_below(&placements, &board, Level::Edit)?;
+                }
+            }
+        }
+        None => {}
+    }
     let outcome = match Kind::parse(body.kind.trim()) {
         Some(Kind::Board) => trash::restore_board(ch, id, &viewer).await,
         Some(Kind::Chart) => trash::restore_chart(ch, id, &viewer).await,

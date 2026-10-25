@@ -432,6 +432,19 @@ impl AccessMap {
         self.all || self.baseline.is_some() || !self.grants.is_empty()
     }
 
+    /// The level at the top of the tree, where a dashboard or folder with no
+    /// parent is filed (and the built-in dashboard lives): only the starting
+    /// point can give one there, as no rule can name the root (`BI-19` part
+    /// B2: creating at the root needs `edit`, and `dashboard:read` alone is
+    /// `view`).
+    #[must_use]
+    pub fn level_at_root(&self) -> Option<Level> {
+        if self.all {
+            return Some(Level::Manage);
+        }
+        self.baseline
+    }
+
     /// The level on the dashboard `id`, which sits in folder `folder_id`
     /// (`""` = root) and belongs to `owner` (`""` = nobody). `None`: no
     /// access.
@@ -1004,5 +1017,17 @@ mod tests {
         assert!(Level::View < Level::Edit && Level::Edit < Level::Manage);
         assert_eq!(ItemKind::parse("board"), Some(ItemKind::Board));
         assert_eq!(ItemKind::parse("chart"), None);
+    }
+
+    #[test]
+    fn the_root_has_only_the_starting_point_and_an_administrator_manages_it() {
+        let rule = grant(ItemKind::Folder, "f1", Level::Manage);
+        // A rule on a folder never reaches the root.
+        let granted = AccessMap::new("u1", false, None, &[folder("f1", "")], &[rule], &[]);
+        assert_eq!(granted.level_at_root(), None);
+        let viewer = AccessMap::new("u1", false, Some(Level::View), &[], &[], &[]);
+        assert_eq!(viewer.level_at_root(), Some(Level::View));
+        let admin = AccessMap::new("u1", true, None, &[], &[], &[]);
+        assert_eq!(admin.level_at_root(), Some(Level::Manage));
     }
 }

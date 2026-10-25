@@ -53,6 +53,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use lakehouse_auth::throttle::{self, ThrottlePolicy};
 use lakehouse_auth::{Principal, PrincipalId, Secret};
+use lakehouse_bi::access::Level;
 use lakehouse_bi::store::{self, Board};
 use lakehouse_core::ApiError;
 use lakehouse_store::PgPool;
@@ -487,31 +488,28 @@ fn link_json(link: &PublicLink) -> Value {
 }
 
 /// The dashboard a management call is about: named, not the built-in one, and
-/// visible to the caller (an unknown, trashed or somebody else's personal board
-/// is the same "not found"). Shared with the embed settings route (`BI-26`
-/// review fix R6, rule 4).
+/// managed by the caller (an unknown, trashed or somebody else's personal board
+/// is the same "not found"; one they see without `manage` is a 403). Shared
+/// with the embed settings route (`BI-26` review fix R6, rule 4).
 pub(crate) async fn managed_board(
     state: &AppState,
     principal: &Principal,
     id: Option<&str>,
 ) -> Result<Board, ApiError> {
+    // Refused first when the caller manages nothing, whatever dashboard they name.
+    crate::routes::dashboard_access::require_can_ever(state, principal, Level::Manage).await?;
     let id = id.map(str::trim).unwrap_or_default();
     if id.is_empty() || id == store::DEFAULT_BOARD_ID {
         return Err(ApiError::BadRequest("invalid dashboard".to_owned()));
     }
-    // BI-19 B1 review R5: the resolved viewer, so a dashboard the caller's rules
-    // and the restrictions leave out is the same 404 as an unknown one (the
-    // GET returns, and the PUT makes, a live token).
-    let viewer = crate::routes::dashboard_access::viewer_for_write(state, principal).await?;
-    store::get_board(&state.clickhouse, id, &viewer)
-        .await
-        .map_err(|err| {
-            upstream_error::ch_error_as(
-                &upstream_error::DATABASE,
-                &err,
-                upstream_error::FailedAs::Internal,
-            )
-        })?
+    // BI-19 B1 review R5 and B2 (plan D5, D8): the link, the embed and their
+    // settings are managed by somebody with `manage` on the dashboard. One that
+    // the caller's rules and the restrictions leave out is the same 404 as an
+    // unknown one (the GET returns, and the PUT makes, a live token); one they
+    // see and do not manage is a 403.
+    let scope = crate::routes::dashboard_access::scope_for_write(state, principal).await?;
+    crate::routes::dashboard_access::require_board_level(state, &scope, id, Level::Manage)
+        .await?
         .ok_or_else(|| ApiError::NotFound(BOARD_NOT_FOUND.to_owned()))
 }
 
@@ -609,6 +607,8 @@ pub async fn put_link(
     Extension(principal): Extension<Principal>,
     body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
+    // Before the body is read: a caller who manages nothing is refused as such.
+    crate::routes::dashboard_access::require_can_ever(&state, &principal, Level::Manage).await?;
     let parsed: PutBody =
         serde_json::from_slice(&body).map_err(|_| ApiError::BadRequest(BODY_SHAPE.to_owned()))?;
     let board = managed_board(&state, &principal, Some(&parsed.board)).await?;

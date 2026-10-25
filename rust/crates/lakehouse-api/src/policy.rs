@@ -539,27 +539,37 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     //    holds neither `dashboard:read` nor a rule naming them or one of their
     //    roles with the same 403 as before, and otherwise shows only what the
     //    rules give. Each moved row is asserted both ways in
-    //    `tests/route_auth.rs` (no rule: 403; a rule: past the guard). The
-    //    rows still `dashboard:read` here are either writes or reads the
-    //    chart builder and the Share dialog use, which B2 moves with the
-    //    write floors. ─────────────────────────────────────────────────────
+    //    `tests/route_auth.rs` (no rule: 403; a rule: past the guard).
+    //
+    //    BI-19 part B2 (plan D8): the WRITE routes below are `RequiresAuth`
+    //    too. A person can edit or manage one dashboard through a rule without
+    //    holding `dashboard:write`, so the router cannot ask for it; each
+    //    handler calls `routes::dashboard_access::scope_for_write` and checks
+    //    the caller's resolved LEVEL on the dashboard or folder it touches:
+    //    `edit` for changing it, `manage` for sharing, the public link, embed,
+    //    moving and deleting it. 404 for what the caller cannot see, 403 for
+    //    what they see and may not do; a caller with neither a starting point
+    //    nor a rule gets the 403 they got. The catalog writes (calculated
+    //    fields, hierarchies, parameters, metrics, SQL sources) belong to no
+    //    dashboard and keep their own global permission. ──────────────────
     ("GET",    "/api/dashboard",              Policy::RequiresAuth),
-    ("GET",    "/api/dashboard/specs",        Policy::RequiresPermission("dashboard:read")),
+    ("GET",    "/api/dashboard/specs",        Policy::RequiresAuth),
     // BI-19 B1 review R2/R9: a drill goes through the resolved viewer; any other
     // preview needs `dashboard:read`, checked in the handler.
     ("POST",   "/api/dashboard/specs/preview", Policy::RequiresAuth),
-    ("POST",   "/api/dashboard/specs",        Policy::RequiresPermission("dashboard:write")),
-    ("PUT",    "/api/dashboard/specs",        Policy::RequiresPermission("dashboard:write")),
-    ("DELETE", "/api/dashboard/specs",        Policy::RequiresPermission("dashboard:write")),
+    ("POST",   "/api/dashboard/specs",        Policy::RequiresAuth),
+    ("PUT",    "/api/dashboard/specs",        Policy::RequiresAuth),
+    ("DELETE", "/api/dashboard/specs",        Policy::RequiresAuth),
     ("GET",    "/api/dashboard/boards",       Policy::RequiresAuth),
-    ("POST",   "/api/dashboard/boards",       Policy::RequiresPermission("dashboard:write")),
-    ("PUT",    "/api/dashboard/boards",       Policy::RequiresPermission("dashboard:write")),
-    ("DELETE", "/api/dashboard/boards",       Policy::RequiresPermission("dashboard:write")),
-    // Dashboard folders (plan §4): filing dashboards is editing them.
+    ("POST",   "/api/dashboard/boards",       Policy::RequiresAuth),
+    ("PUT",    "/api/dashboard/boards",       Policy::RequiresAuth),
+    ("DELETE", "/api/dashboard/boards",       Policy::RequiresAuth),
+    // Dashboard folders (plan §4): filing dashboards is editing them (`edit` on the
+    // folder; moving or deleting one is `manage`, in the handler).
     ("GET",    "/api/dashboard/folders",      Policy::RequiresAuth),
-    ("POST",   "/api/dashboard/folders",      Policy::RequiresPermission("dashboard:write")),
-    ("PUT",    "/api/dashboard/folders",      Policy::RequiresPermission("dashboard:write")),
-    ("DELETE", "/api/dashboard/folders",      Policy::RequiresPermission("dashboard:write")),
+    ("POST",   "/api/dashboard/folders",      Policy::RequiresAuth),
+    ("PUT",    "/api/dashboard/folders",      Policy::RequiresAuth),
+    ("DELETE", "/api/dashboard/folders",      Policy::RequiresAuth),
     // BI-18 part C, part 2: the personal space is created on first use (writing
     // is what makes a dashboard to put in it); history and the trash are read
     // with the dashboard, and going back or restoring edit it, so they need the
@@ -567,11 +577,11 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // caller's own preferences, never an edit of a dashboard: `dashboard:read`.
     ("POST",   "/api/dashboard/personal",        Policy::RequiresPermission("dashboard:write")),
     ("GET",    "/api/dashboard/versions",        Policy::RequiresAuth),
-    ("POST",   "/api/dashboard/versions/revert", Policy::RequiresPermission("dashboard:write")),
+    ("POST",   "/api/dashboard/versions/revert", Policy::RequiresAuth),
     // BI-19 B1 review R9: the handler resolves the viewer (403 for a caller with
     // neither `dashboard:read` nor a rule), so a rule-only person can open Trash.
     ("GET",    "/api/dashboard/trash",           Policy::RequiresAuth),
-    ("POST",   "/api/dashboard/trash/restore",   Policy::RequiresPermission("dashboard:write")),
+    ("POST",   "/api/dashboard/trash/restore",   Policy::RequiresAuth),
     ("GET",    "/api/dashboard/shortcuts",       Policy::RequiresAuth),
     ("PUT",    "/api/dashboard/favourites",      Policy::RequiresAuth),
     ("POST",   "/api/dashboard/recent",          Policy::RequiresAuth),
@@ -579,7 +589,7 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // Dashboard SQL sources: listing is a read; authoring and previewing
     // arbitrary SQL is its own permission, separate from dashboard:write
     // (plan §1, the Metabase "native query" split).
-    ("GET",    "/api/dashboard/sources",      Policy::RequiresPermission("dashboard:read")),
+    ("GET",    "/api/dashboard/sources",      Policy::RequiresAuth),
     ("POST",   "/api/dashboard/sources",      Policy::RequiresPermission("dashboard:sql")),
     ("PUT",    "/api/dashboard/sources",      Policy::RequiresPermission("dashboard:sql")),
     ("DELETE", "/api/dashboard/sources",      Policy::RequiresPermission("dashboard:sql")),
@@ -607,7 +617,7 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("DELETE", "/api/dashboard/segments",             Policy::RequiresPermission("metric:write")),
     ("GET",    "/api/dashboard/fields",       Policy::RequiresAuth),
     // BI-7: join suggestions read column metadata only, like `fields`.
-    ("GET",    "/api/dashboard/join-suggestions", Policy::RequiresPermission("dashboard:read")),
+    ("GET",    "/api/dashboard/join-suggestions", Policy::RequiresAuth),
     ("GET",    "/api/dashboard/hierarchies",      Policy::RequiresAuth),
     ("POST",   "/api/dashboard/hierarchies",      Policy::RequiresPermission("dashboard:write")),
     ("PUT",    "/api/dashboard/hierarchies",      Policy::RequiresPermission("dashboard:write")),
@@ -632,7 +642,9 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // BI-1 (D5): a dashboard as a PDF. `dashboard:read`, narrowed by the roles
     // switched off from downloading (D7), audited before the file is sent.
     ("GET",    "/api/dashboard/export/pdf",   Policy::RequiresAuth),
-    ("GET",    "/api/dashboard/embed-info",   Policy::RequiresPermission("dashboard:read")),
+    // BI-19 B2: the Share dialog's embed state and sample token: `manage` on the
+    // dashboard, in the handler.
+    ("GET",    "/api/dashboard/embed-info",   Policy::RequiresAuth),
     // RPT-1 (D7): scheduled reports. `dashboard:read` gets past the gate; the
     // handlers then require the download right to create, and the owner or an
     // administrator (`settings:write`) to read, change, pause, send or delete.
@@ -643,14 +655,17 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("DELETE", "/api/reports/subscriptions/{id}", Policy::RequiresPermission("dashboard:read")),
     ("POST",   "/api/reports/subscriptions/{id}/send", Policy::RequiresPermission("dashboard:read")),
     ("GET",    "/api/reports/subscriptions/{id}/deliveries", Policy::RequiresPermission("dashboard:read")),
-    ("GET",    "/api/reports/recipients",     Policy::RequiresPermission("dashboard:read")),
+    // BI-19 B2 (D10): also the People panel's picker (`roles=1`), for somebody who
+    // manages a dashboard through a rule alone; the handler asks `dashboard:read`
+    // and the download right for the report picker, as the router did.
+    ("GET",    "/api/reports/recipients",     Policy::RequiresAuth),
     // SEC-12: withdrawing a token changes who can read the dashboard, so it
-    // is a write, like the embed toggle on `PUT /api/dashboard/boards`.
-    ("POST",   "/api/dashboard/embed-revoke", Policy::RequiresPermission("dashboard:write")),
+    // is a `manage` write, like the embed toggle on `PUT /api/dashboard/boards`.
+    ("POST",   "/api/dashboard/embed-revoke", Policy::RequiresAuth),
     // BI-26 (D8): which filters an embed viewer sees, changes or never sees is
-    // what a viewer may do, so it is a write (manage on the dashboard once
-    // `BI-19` part B ships, feature decision 11).
-    ("PUT",    "/api/dashboard/embed-settings", Policy::RequiresPermission("dashboard:write")),
+    // what a viewer may do, so it is a write (`manage` on the dashboard, checked
+    // in the handler since `BI-19` part B2, feature decision 11).
+    ("PUT",    "/api/dashboard/embed-settings", Policy::RequiresAuth),
     // BI-19 part B1 (D10): the permissions of a dashboard or folder. "Signed in"
     // at the router and "manage on the item" in the handler
     // (`dashboard_access::managed_subject`), because a person can manage one
@@ -661,13 +676,13 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // The move dialog's "who gains and who loses access" (feature B7): manage
     // on the dashboard, in the handler, like the access routes.
     ("GET",    "/api/dashboard/access-preview", Policy::RequiresAuth),
-    // BI-19 part A (D5): making, changing and ending a dashboard's public link
-    // changes who can read it, so all three are writes (reading its state is
-    // too: the response carries the link's token). Part B of the plan moves
-    // these to "manage on the dashboard" with a handler check.
-    ("GET",    "/api/dashboard/public-link",  Policy::RequiresPermission("dashboard:write")),
-    ("PUT",    "/api/dashboard/public-link",  Policy::RequiresPermission("dashboard:write")),
-    ("DELETE", "/api/dashboard/public-link",  Policy::RequiresPermission("dashboard:write")),
+    // BI-19 part A (D5), B2: making, changing and ending a dashboard's public link
+    // changes who can read it, so all three need `manage` on the dashboard (reading
+    // its state too: the response carries the link's token), checked in the
+    // handler (`public_links::managed_board`).
+    ("GET",    "/api/dashboard/public-link",  Policy::RequiresAuth),
+    ("PUT",    "/api/dashboard/public-link",  Policy::RequiresAuth),
+    ("DELETE", "/api/dashboard/public-link",  Policy::RequiresAuth),
 
     // ── Reporting settings (`BI-9`, `routes::settings`). Reading is auth-only:
     //    the console needs the zone and the first day to label every date

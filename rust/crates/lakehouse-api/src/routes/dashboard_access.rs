@@ -43,7 +43,7 @@ use axum::Extension;
 use axum::body::Bytes;
 use axum::extract::{Query, State};
 use lakehouse_auth::{Principal, PrincipalId};
-use lakehouse_bi::access::{AccessMap, Grant, ItemKind, Level, TooManyIds, Viewer};
+use lakehouse_bi::access::{AccessMap, BoardPlacement, Grant, ItemKind, Level, TooManyIds, Viewer};
 use lakehouse_bi::folders::Folder;
 use lakehouse_bi::{folders, store};
 use lakehouse_core::ApiError;
@@ -173,6 +173,257 @@ pub(crate) async fn viewer_for_write(
     let baseline = baseline_of(principal)
         .or_else(|| principal.has("dashboard:write").then_some(Level::Manage));
     resolve(state, principal, baseline).await
+}
+
+/// Refuse early a caller who could not reach `needed` on *any* item: no
+/// starting point, no rule gives it. The answer does not depend on the item
+/// (so it is no oracle for ids), is a `403` the way the router's floor was,
+/// and costs nothing for the common holder of `dashboard:write` (the starting
+/// point settles it with no read). Write handlers call it before they parse
+/// the body or read a dashboard, so a viewer is refused the same with or
+/// without a valid request (`BI-19` part B2).
+///
+/// # Errors
+///
+/// 403 `dashboard:read` for a caller with neither a starting point nor a rule
+/// (as before the floor moved); 403 naming the level for one who holds less
+/// everywhere; the classified store error when the rules cannot be read.
+pub(crate) async fn require_can_ever(
+    state: &AppState,
+    principal: &Principal,
+    needed: Level,
+) -> Result<(), ApiError> {
+    if principal.has("identity:write") {
+        return Ok(());
+    }
+    let baseline = baseline_of(principal)
+        .or_else(|| principal.has("dashboard:write").then_some(Level::Manage));
+    if baseline.is_some_and(|b| b >= needed) {
+        return Ok(());
+    }
+    let (grants, _) = read_rules(state, principal).await?;
+    if grants.iter().any(|g| g.level >= needed) {
+        return Ok(());
+    }
+    if baseline.is_none() && grants.is_empty() {
+        return Err(refused());
+    }
+    Err(lacks(needed))
+}
+
+/// What a write handler knows about the caller, worked out once per request
+/// (`BI-19` part B2, plan D8): the [`Viewer`] that decides what exists for them
+/// and the [`AccessMap`] that decides what they may do with it.
+///
+/// A write is judged by the caller's resolved *level* on the dashboard (or
+/// folder) it touches: `edit` for changing it, `manage` for sharing, the
+/// public link, embedding, moving and deleting it (feature B1). The answer for
+/// something the caller cannot see is the same `404` a read gives (no id
+/// guessing); for something they see and may not do, `403`.
+pub(crate) struct Scope {
+    pub(crate) viewer: Viewer,
+    map: AccessMap,
+}
+
+/// Why the caller is refused a level, in the sentence the `403` carries.
+fn lacks(needed: Level) -> ApiError {
+    ApiError::PermissionDenied(
+        match needed {
+            Level::View => "view on this dashboard",
+            Level::Edit => "edit on this dashboard",
+            Level::Manage => "manage on this dashboard",
+        }
+        .to_owned(),
+    )
+}
+
+/// [`Scope`] for a write handler. The starting point is
+/// [`viewer_for_write`]'s (a `dashboard:write` holder with no
+/// `dashboard:read` keeps the reach those routes always gave them), so no
+/// existing writer is newly refused; rules only add to it, and a restriction
+/// takes it away, as for reads.
+///
+/// The folder tree is read only when something can change a level (a rule
+/// names the caller or a mark exists), so a deployment that uses no
+/// permissions pays the two small Postgres reads and nothing more.
+///
+/// # Errors
+///
+/// 403 for a caller with neither a starting point nor a rule; 503 when too
+/// many dashboards carry their own permissions; otherwise the classified
+/// store error.
+pub(crate) async fn scope_for_write(
+    state: &AppState,
+    principal: &Principal,
+) -> Result<Scope, ApiError> {
+    let baseline = baseline_of(principal)
+        .or_else(|| principal.has("dashboard:write").then_some(Level::Manage));
+    let (grants, marks) = read_rules(state, principal).await?;
+    if baseline.is_none() && grants.is_empty() {
+        return Err(refused());
+    }
+    let all = principal.has("identity:write");
+    let tree = if !all && (!grants.is_empty() || !marks.is_empty()) {
+        folders::list_folders(&state.clickhouse, &Viewer::system())
+            .await
+            .map_err(|e| classify_ch_error(&e))?
+    } else {
+        Vec::new()
+    };
+    let map = AccessMap::new(
+        principal.id.uuid().to_string(),
+        all,
+        baseline,
+        &tree,
+        &grants,
+        &marks,
+    );
+    let viewer = if all || (baseline.is_some() && marks.is_empty()) {
+        viewer_of(principal)
+    } else {
+        let placements = store::board_placements(&state.clickhouse)
+            .await
+            .map_err(|e| classify_ch_error(&e))?;
+        map.viewer(&placements).map_err(too_many)?
+    };
+    Ok(Scope { viewer, map })
+}
+
+impl Scope {
+    /// The level at the root of the tree, where the built-in dashboard lives
+    /// and a new dashboard or folder is filed when it names no parent.
+    fn root_level(&self) -> Option<Level> {
+        self.map.level_at_root()
+    }
+
+    /// Require `needed` at the root.
+    ///
+    /// # Errors
+    ///
+    /// 404 for somebody with no starting point, 403 below `needed`.
+    pub(crate) fn require_root(&self, needed: Level) -> Result<(), ApiError> {
+        match self.root_level() {
+            None => Err(ApiError::NotFound(BOARD_NOT_FOUND.to_owned())),
+            Some(level) if level < needed => Err(lacks(needed)),
+            Some(_) => Ok(()),
+        }
+    }
+
+    /// Require `needed` on the dashboard whose row is `board`.
+    ///
+    /// # Errors
+    ///
+    /// 404 when the caller has no level on it, 403 when it is below `needed`.
+    pub(crate) fn require_on_board(
+        &self,
+        board: &lakehouse_bi::store::Board,
+        needed: Level,
+    ) -> Result<(), ApiError> {
+        let folder_id = board.folder_id.clone().unwrap_or_default();
+        let owner = board.owner_id.clone().unwrap_or_default();
+        Self::check(
+            self.map.level_for_board(&board.id, &folder_id, &owner),
+            needed,
+            BOARD_NOT_FOUND,
+        )
+    }
+
+    /// Require `needed` on the folder `id` (`""` = the root).
+    ///
+    /// # Errors
+    ///
+    /// 404 when the caller has no level on it, 403 when it is below `needed`.
+    pub(crate) fn require_on_folder(&self, id: &str, needed: Level) -> Result<(), ApiError> {
+        if id.is_empty() {
+            return self.require_root(needed);
+        }
+        Self::check(self.map.level_for_folder(id), needed, FOLDER_NOT_FOUND)
+    }
+
+    fn check(level: Option<Level>, needed: Level, missing: &str) -> Result<(), ApiError> {
+        match level {
+            None => Err(ApiError::NotFound(missing.to_owned())),
+            Some(level) if level < needed => Err(lacks(needed)),
+            Some(_) => Ok(()),
+        }
+    }
+
+    /// For a dashboard that may be in the trash (so [`require_board_level`]'s
+    /// live lookup cannot find it): `403` when the caller can see where it
+    /// sits and holds less than `needed` there. An unknown dashboard or one
+    /// they have no level on passes, so the caller's own lookup gives the
+    /// `404` it always gave (nothing new is confirmed).
+    ///
+    /// # Errors
+    ///
+    /// 403 for a dashboard the caller sees and may not do this to.
+    pub(crate) fn refuse_below(
+        &self,
+        placements: &[BoardPlacement],
+        id: &str,
+        needed: Level,
+    ) -> Result<(), ApiError> {
+        let level = placements
+            .iter()
+            .find(|p| p.id == id)
+            .and_then(|p| self.map.level_for_board(&p.id, &p.folder_id, &p.owner_id));
+        match level {
+            Some(level) if level < needed => Err(lacks(needed)),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// Require `needed` on dashboard `id` for a write, and return its row. The
+/// built-in dashboard (`default`, or blank) is judged at the root and returns
+/// `None`.
+///
+/// # Errors
+///
+/// 404 `dashboard not found.` for an unknown, trashed or invisible dashboard
+/// (one answer, so an id guess learns nothing); 403 for one the caller sees
+/// and may not do this to; the classified store error otherwise.
+pub(crate) async fn require_board_level(
+    state: &AppState,
+    scope: &Scope,
+    id: &str,
+    needed: Level,
+) -> Result<Option<lakehouse_bi::store::Board>, ApiError> {
+    let id = id.trim();
+    if id.is_empty() || id == store::DEFAULT_BOARD_ID {
+        // The built-in dashboard belongs to the starting point, like a chart
+        // filed without a board (`require_chart_board`).
+        if !scope.viewer.sees_builtin() {
+            return Err(ApiError::NotFound(BOARD_NOT_FOUND.to_owned()));
+        }
+        scope.require_root(needed)?;
+        return Ok(None);
+    }
+    let board = store::get_board(&state.clickhouse, id, &Viewer::system())
+        .await
+        .map_err(|e| classify_ch_error(&e))?
+        .ok_or_else(|| ApiError::NotFound(BOARD_NOT_FOUND.to_owned()))?;
+    scope.require_on_board(&board, needed)?;
+    Ok(Some(board))
+}
+
+/// Whether the caller manages anything at all: the starting point is manage, or
+/// a rule names them with `manage`. The People panel's recipient picker asks it
+/// (an item-less question, as the picker is asked before an item is chosen);
+/// the item itself is checked on save.
+///
+/// # Errors
+///
+/// The classified store error.
+pub(crate) async fn manages_something(
+    state: &AppState,
+    principal: &Principal,
+) -> Result<bool, ApiError> {
+    if principal.has("identity:write") || principal.has("dashboard:write") {
+        return Ok(true);
+    }
+    let (grants, _) = read_rules(state, principal).await?;
+    Ok(grants.iter().any(|g| g.level == Level::Manage))
 }
 
 async fn resolve(
@@ -900,6 +1151,111 @@ mod tests {
             role_id: role,
             level: level.to_owned(),
         }
+    }
+
+    fn scope(baseline: Option<Level>, grants: &[Grant], marks: &[(ItemKind, String)]) -> Scope {
+        let tree = [Folder {
+            id: "f1".to_owned(),
+            name: "f1".to_owned(),
+            parent_id: String::new(),
+            created_by: String::new(),
+            updated_at: None,
+            owner_id: String::new(),
+        }];
+        let map = AccessMap::new("u1", false, baseline, &tree, grants, marks);
+        Scope {
+            viewer: Viewer::user("u1", false),
+            map,
+        }
+    }
+
+    fn rule(kind: ItemKind, id: &str, level: Level) -> Grant {
+        Grant {
+            kind,
+            item_id: id.to_owned(),
+            level,
+        }
+    }
+
+    #[test]
+    fn edit_on_one_folder_lets_a_person_edit_there_and_manage_nowhere_and_see_nothing_else() {
+        let edit = scope(None, &[rule(ItemKind::Folder, "f1", Level::Edit)], &[]);
+        assert!(edit.require_on_folder("f1", Level::Edit).is_ok());
+        // Visible but not enough: 403, not 404.
+        assert!(matches!(
+            edit.require_on_folder("f1", Level::Manage),
+            Err(ApiError::PermissionDenied(_))
+        ));
+        // Another folder and the root are not theirs: the same 404 as unknown.
+        assert!(matches!(
+            edit.require_on_folder("f2", Level::Edit),
+            Err(ApiError::NotFound(_))
+        ));
+        assert!(matches!(
+            edit.require_root(Level::Edit),
+            Err(ApiError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn a_viewer_by_the_starting_point_is_refused_every_write_and_a_writer_is_not() {
+        let viewer = scope(Some(Level::View), &[], &[]);
+        assert!(viewer.require_root(Level::View).is_ok());
+        assert!(matches!(
+            viewer.require_on_folder("f1", Level::Edit),
+            Err(ApiError::PermissionDenied(_))
+        ));
+        let writer = scope(Some(Level::Manage), &[], &[]);
+        assert!(writer.require_on_folder("f1", Level::Manage).is_ok());
+        assert!(writer.require_root(Level::Edit).is_ok());
+    }
+
+    #[test]
+    fn a_restriction_takes_the_starting_point_away_from_a_writer_below_it() {
+        let marks = [(ItemKind::Folder, "f1".to_owned())];
+        let writer = scope(Some(Level::Manage), &[], &marks);
+        assert!(matches!(
+            writer.require_on_folder("f1", Level::Edit),
+            Err(ApiError::NotFound(_))
+        ));
+        assert!(writer.require_root(Level::Edit).is_ok());
+    }
+
+    #[test]
+    fn a_trashed_dashboard_is_refused_with_403_only_when_the_caller_sees_it() {
+        let editor = scope(None, &[rule(ItemKind::Folder, "f1", Level::Edit)], &[]);
+        let placements = [
+            BoardPlacement {
+                id: "mine".to_owned(),
+                folder_id: "f1".to_owned(),
+                owner_id: String::new(),
+            },
+            BoardPlacement {
+                id: "other".to_owned(),
+                folder_id: "f2".to_owned(),
+                owner_id: String::new(),
+            },
+        ];
+        assert!(matches!(
+            editor.refuse_below(&placements, "mine", Level::Manage),
+            Err(ApiError::PermissionDenied(_))
+        ));
+        assert!(
+            editor
+                .refuse_below(&placements, "mine", Level::Edit)
+                .is_ok()
+        );
+        // Not theirs and unknown pass: the restore's own 404 answers both alike.
+        assert!(
+            editor
+                .refuse_below(&placements, "other", Level::Manage)
+                .is_ok()
+        );
+        assert!(
+            editor
+                .refuse_below(&placements, "nope", Level::Manage)
+                .is_ok()
+        );
     }
 
     #[test]
