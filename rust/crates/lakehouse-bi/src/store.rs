@@ -3455,9 +3455,14 @@ fn geo_fields(kind: ChartKind, input: &ChartInput) -> Result<GeoFields, BiError>
                 "map is only for geomap/pointmap/geoheat.".to_owned(),
             ));
         }
-        if !map_id_is_well_formed(map) {
+        // BI-16 C2b QA fix Q1: an uploaded map has a server-made id (`m_` and
+        // 12 hex digits, `crate::geo::is_map_id`) that the bundled-map shape
+        // refuses because of its underscore. Whether the uploaded map still
+        // exists is the console's call when it draws (it says "map not
+        // available"), like for a bundled id it has no file for.
+        if !map_id_is_well_formed(map) && !crate::geo::is_map_id(map) {
             return Err(BiError::Validation(format!(
-                "invalid map id: use 1-{MAP_ID_MAX_LEN} lowercase letters, digits or '-'."
+                "invalid map id: use a bundled map (1-{MAP_ID_MAX_LEN} lowercase letters, digits or '-') or an uploaded map's id."
             )));
         }
     }
@@ -5869,6 +5874,34 @@ mod tests {
         }
         assert!(map_id_is_well_formed(&"a".repeat(MAP_ID_MAX_LEN)));
         assert!(!map_id_is_well_formed(&"a".repeat(MAP_ID_MAX_LEN + 1)));
+    }
+
+    #[test]
+    fn a_geomap_on_an_uploaded_map_passes_and_a_malformed_uploaded_id_is_refused() {
+        // BI-16 C2b QA fix Q1: `m_` + 12 hex digits is the server-made id.
+        let mut geomap = geo_input(ChartKind::Geomap);
+        geomap.map = Some("m_0123456789ab".to_owned());
+        assert_eq!(
+            geo_fields(ChartKind::Geomap, &geomap)
+                .unwrap()
+                .map
+                .as_deref(),
+            Some("m_0123456789ab")
+        );
+        for bad in [
+            "m_XYZ",
+            "M_0123456789ab",
+            "m_0123456789AB",
+            "m_0123456789abc",
+            "m_0123456789a",
+        ] {
+            geomap.map = Some(bad.to_owned());
+            assert!(geo_fields(ChartKind::Geomap, &geomap).is_err(), "{bad}");
+        }
+        // The point kinds take an uploaded map too; the other kinds still refuse any map.
+        let mut bar = geo_input(ChartKind::Bar);
+        bar.map = Some("m_0123456789ab".to_owned());
+        assert!(geo_fields(ChartKind::Bar, &bar).is_err());
     }
 
     #[test]

@@ -486,3 +486,51 @@ async fn a_calculated_field_that_names_the_map_blocks_its_delete_by_id_or_by_nam
         assert_eq!(region_lookup_of(&app, &id).await, Some(true));
     }
 }
+
+// ── a region chart on an uploaded map (`BI-16` C2b QA fix Q1) ────────────
+
+/// The builder refused every uploaded map with "invalid map id" because the
+/// check only knew the bundled shape. The mock engine knows no mart, so the
+/// preview stops later with another sentence; what is shown is that the map id
+/// is not what stops it, while a malformed id still is.
+#[tokio::test]
+async fn a_region_chart_on_an_uploaded_map_is_not_refused_for_its_id() {
+    let (app, _engine) = with_engine().await;
+    let admin_cookie = admin(&app).await;
+    let id = upload(&app, &admin_cookie, "Zona Demo").await.json()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let editor = session_cookie_for_user(
+        &app.pool,
+        create_principal_with_permissions(&app.pool, "dashboard:read,dashboard:write").await,
+    )
+    .await;
+    let preview = |map: String| {
+        let (app, editor) = (&app, editor.clone());
+        async move {
+            let body = json!({
+                "title": "Regions", "kind": "geomap", "mart": "mart_visits",
+                "dimension": "region", "measures": ["visitors"], "map": map,
+            });
+            send(
+                app,
+                &editor,
+                "POST",
+                "/api/dashboard/specs/preview",
+                Some(("application/json".to_owned(), body.to_string().into_bytes())),
+                &[],
+            )
+            .await
+        }
+    };
+    let ok = preview(id.clone()).await;
+    assert!(
+        !String::from_utf8_lossy(&ok.body).contains("invalid map id"),
+        "{}",
+        String::from_utf8_lossy(&ok.body)
+    );
+    let bad = preview("m_XYZ".to_owned()).await;
+    assert_eq!(bad.status, StatusCode::BAD_REQUEST);
+    assert!(String::from_utf8_lossy(&bad.body).contains("invalid map id"));
+}
