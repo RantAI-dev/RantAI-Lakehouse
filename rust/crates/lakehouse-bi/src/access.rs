@@ -730,8 +730,9 @@ mod tests {
         assert_eq!(m.level_for_folder("f2"), Some(Level::Manage));
         assert_eq!(m.level_for_folder("f3"), None);
         assert_eq!(m.level_for_board("deep", "f4", ""), None);
-        // A restricted dashboard directly under f1 is closed too, and a rule
-        // on the dashboard itself, or on a restricted item between, opens it.
+        // A restricted dashboard directly under f1 is closed too: the rule on f1
+        // is above its own mark, so it does not count. Only a rule on the
+        // dashboard itself opens it (below).
         let m = map(None, &four_levels(), &grants, &[(ItemKind::Board, "b1")]);
         assert_eq!(m.level_for_board("b1", "f2", ""), None);
         assert_eq!(m.level_for_board("b2", "f2", ""), Some(Level::Manage));
@@ -750,6 +751,35 @@ mod tests {
         );
         assert_eq!(m.level_for_board("b", "f4", ""), None);
         assert_eq!(m.level_for_board("b", "f3", ""), Some(Level::Edit));
+    }
+
+    /// `BI-19` B1 owner decision Q-R14, confirmed by the owner 2026-10-25
+    /// (B2 review): a restricted dashboard inside a restricted folder is a fresh
+    /// list. The people listed on the folder do not see it unless they are also
+    /// listed on the dashboard, and the dashboard's own list does not need the
+    /// folder's.
+    #[test]
+    fn a_restricted_dashboard_in_a_restricted_folder_counts_only_its_own_rules() {
+        let marks = [(ItemKind::Folder, "f2"), (ItemKind::Board, "b1")];
+        // Listed on the folder only: the folder is theirs, the dashboard is not.
+        let on_folder = [grant(ItemKind::Folder, "f2", Level::Manage)];
+        let m = map(None, &four_levels(), &on_folder, &marks);
+        assert_eq!(m.level_for_folder("f2"), Some(Level::Manage));
+        assert_eq!(m.level_for_board("b1", "f2", ""), None);
+        // Another dashboard in the same folder, not restricted, is theirs.
+        assert_eq!(m.level_for_board("b2", "f2", ""), Some(Level::Manage));
+        // Listed on the dashboard only: the dashboard is theirs, the folder is not.
+        let on_board = [grant(ItemKind::Board, "b1", Level::View)];
+        let m = map(None, &four_levels(), &on_board, &marks);
+        assert_eq!(m.level_for_board("b1", "f2", ""), Some(Level::View));
+        assert_eq!(m.level_for_folder("f2"), None);
+        // Listed on both: the dashboard's own level, the folder's has no say.
+        let both = [
+            grant(ItemKind::Folder, "f2", Level::Manage),
+            grant(ItemKind::Board, "b1", Level::View),
+        ];
+        let m = map(None, &four_levels(), &both, &marks);
+        assert_eq!(m.level_for_board("b1", "f2", ""), Some(Level::View));
     }
 
     /// BI-19 B1 review R3: the viewer for somebody with neither a starting
