@@ -875,6 +875,25 @@ async fn preview_input(
         .map_err(|_err| ApiError::BadRequest("body JSON is invalid".to_owned()))
 }
 
+/// `BI-19` B2 re-review S4-b: the preview reads the named source's rows, so a
+/// hidden source is the unknown-source answer here too. A drill rebuilds a
+/// saved chart's own definition (the dashboard governs it, and `drill_input`
+/// read it through the viewer).
+async fn preview_sources_visible(
+    state: &AppState,
+    principal: &Principal,
+    input: &ChartInput,
+    is_drill: bool,
+) -> Result<(), ApiError> {
+    if is_drill {
+        return Ok(());
+    }
+    let viewer = crate::routes::dashboard_access::viewer_for(state, principal).await?;
+    store::ensure_sources_visible(&state.clickhouse, input, &viewer, &[])
+        .await
+        .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))
+}
+
 /// `POST /api/dashboard/specs/preview` — validate and execute a chart input
 /// without persisting it. The builder uses this to show the user the actual
 /// result before the chart is added to a dashboard.
@@ -911,16 +930,7 @@ pub async fn specs_preview(
         Some(l) if l.store_error.is_none() => time.with_params(l.values.clone()),
         _ => time,
     };
-    // BI-19 B2 re-review S4-b: the preview reads the named source's rows, so a
-    // hidden source is the unknown-source answer here too. A drill rebuilds a
-    // saved chart's own definition (the dashboard governs it, and `drill_input`
-    // read it through the viewer).
-    if !is_drill {
-        let viewer = crate::routes::dashboard_access::viewer_for(&state, &principal).await?;
-        store::ensure_sources_visible(&state.clickhouse, &input, &viewer, &[])
-            .await
-            .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
-    }
+    preview_sources_visible(&state, &principal, &input, is_drill).await?;
     let spec = store::spec_from_input(
         &state.clickhouse,
         &input,

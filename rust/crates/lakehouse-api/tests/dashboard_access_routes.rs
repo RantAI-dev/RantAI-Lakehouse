@@ -695,7 +695,7 @@ async fn an_unlisted_person_cannot_create_a_digest_of_a_restricted_dashboard() {
     let cookie = session_cookie_for_user(&pool, outsider).await;
     let digest = |board: &str| {
         json!({
-            "name": "Weekly", "kind": "digest", "board": board,
+            "name": "Weekly", "type": "digest", "board": board,
             "channel": "email", "target": "x@example.test",
             "mart": "mart_x", "measure": "visitors",
         })
@@ -736,7 +736,7 @@ async fn even_a_listed_person_cannot_save_a_digest_of_a_restricted_dashboard() {
         "POST",
         "/api/alerts",
         Some(json!({
-            "name": "Weekly", "kind": "digest", "board": "b_secret",
+            "name": "Weekly", "type": "digest", "board": "b_secret",
             "channel": "email", "target": "x@example.test",
             "mart": "mart_x", "measure": "visitors",
         })),
@@ -1430,6 +1430,13 @@ async fn the_chart_lists_leave_out_a_restricted_dashboards_charts() {
         assert_eq!(status, StatusCode::OK, "{tool}");
         let text = tool["result"].to_string();
         assert!(!text.contains("c_secret"), "{text}");
+        if who == rule_only {
+            // BI-19 B2 re-review (test bug, rule 2): the assistant's chart
+            // tools need `dashboard:read`, which a rule-only person lacks, so
+            // the tool refuses them; the leak check above still holds.
+            assert!(text.contains("dashboard:read"), "{text}");
+            continue;
+        }
         for id in &expect {
             assert!(text.contains(id), "{id} missing from {text}");
         }
