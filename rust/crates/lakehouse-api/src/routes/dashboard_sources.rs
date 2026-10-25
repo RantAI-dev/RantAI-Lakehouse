@@ -193,7 +193,39 @@ fn clean_title(title: &str) -> Result<String, ApiError> {
     Ok(title.to_owned())
 }
 
-/// `GET /api/dashboard/sources` — every live source.
+/// Whether `viewer` may see `source`: a source at the root is for everyone
+/// entitled to dashboards, one filed in a folder is for the people who may see
+/// that folder (`BI-19` B2 review S4, owner decision 2026-10-25; the SQL text is
+/// the thing a restricted folder keeps back).
+#[must_use]
+pub(crate) fn source_visible(viewer: &lakehouse_bi::access::Viewer, source: &SqlSource) -> bool {
+    source.folder_id.is_empty() || viewer.sees_folder(&source.folder_id, "")
+}
+
+/// The same `404` for a source that does not exist and one in a folder the
+/// caller cannot see, so an id guess learns nothing.
+fn source_not_found(id: &str) -> ApiError {
+    ApiError::NotFound(format!("SQL source '{id}' not found."))
+}
+
+/// The source `id` as `viewer` may see it.
+///
+/// # Errors
+///
+/// 404 for an unknown source or one in a folder the caller cannot see.
+pub(crate) async fn visible_source(
+    ch: &ChClient,
+    viewer: &lakehouse_bi::access::Viewer,
+    id: &str,
+) -> Result<SqlSource, ApiError> {
+    sources::get_source(ch, id)
+        .await
+        .map_err(|err| classify_ch_error(&err))?
+        .filter(|s| source_visible(viewer, s))
+        .ok_or_else(|| source_not_found(id))
+}
+
+/// `GET /api/dashboard/sources` — every live source the caller may see.
 ///
 /// # Errors
 ///
@@ -204,10 +236,15 @@ pub async fn list(
 ) -> ApiResult<ApiJson<Value>> {
     // BI-19 B2 (plan D8): the chart builder lists sources for somebody who can
     // edit a dashboard through a rule alone; the router asks only "signed in".
-    crate::routes::dashboard_access::require_entitled(&state, &principal).await?;
-    let list = sources::list_sources(&state.clickhouse)
+    // `viewer_for` refuses somebody with neither `dashboard:read` nor a rule.
+    // BI-19 B2 review S4: and a source in a restricted folder is not listed.
+    let viewer = crate::routes::dashboard_access::viewer_for(&state, &principal).await?;
+    let list: Vec<SqlSource> = sources::list_sources(&state.clickhouse)
         .await
-        .map_err(|err| classify_ch_error(&err))?;
+        .map_err(|err| classify_ch_error(&err))?
+        .into_iter()
+        .filter(|s| source_visible(&viewer, s))
+        .collect();
     Ok(ApiJson(json!({ "sources": list })))
 }
 
@@ -221,6 +258,12 @@ async fn save(
     let title = clean_title(&body.title)?;
     let folder_id = body.folder_id.unwrap_or_default().trim().to_owned();
     crate::routes::dashboard_folders::ensure_folder_exists(&state.clickhouse, &folder_id).await?;
+    // BI-19 B2 review S4: nor can a source be filed in a folder the caller
+    // cannot see (the same 400 as for an unknown folder, so no id is confirmed).
+    let viewer = crate::routes::dashboard_access::viewer_for_write(state, principal).await?;
+    if !folder_id.is_empty() && !viewer.sees_folder(&folder_id, "") {
+        return Err(ApiError::BadRequest("folder not found.".to_owned()));
+    }
     let (normalized, rewritten) = checked_and_rewritten(state, principal, &body.sql).await?;
     let columns = probe_columns(&state.clickhouse, &rewritten).await?;
     let source = SqlSource {
@@ -278,12 +321,10 @@ pub async fn update(
         .filter(|s| !s.is_empty())
         .ok_or_else(|| ApiError::BadRequest("id is required.".to_owned()))?
         .to_owned();
-    let existing = sources::get_source(&state.clickhouse, &id)
-        .await
-        .map_err(|err| classify_ch_error(&err))?;
-    if existing.is_none() {
-        return Err(ApiError::NotFound(format!("SQL source '{id}' not found.")).into());
-    }
+    // BI-19 B2 review S4: a source in a folder the caller cannot see is as
+    // unknown to them as one that does not exist, for a change as for a read.
+    let viewer = crate::routes::dashboard_access::viewer_for_write(&state, &principal).await?;
+    visible_source(&state.clickhouse, &viewer, &id).await?;
     let source = save(&state, &principal, body, id).await?;
     Ok(ApiJson(json!({ "ok": true, "source": source })))
 }
@@ -306,13 +347,9 @@ pub async fn delete(
             .ok_or_else(|| ApiError::BadRequest("id is required.".to_owned()))?
             .to_owned();
     let ch = &state.clickhouse;
-    if sources::get_source(ch, &id)
-        .await
-        .map_err(|err| classify_ch_error(&err))?
-        .is_none()
-    {
-        return Err(ApiError::NotFound(format!("SQL source '{id}' not found.")).into());
-    }
+    // BI-19 B2 review S4: as in `update`.
+    let viewer = crate::routes::dashboard_access::viewer_for_write(&state, &principal).await?;
+    visible_source(ch, &viewer, &id).await?;
     // BI-18 part C, part 2: a chart on somebody's personal board still blocks
     // the delete (it would break), but it is not named: the caller is told
     // only about the charts they may see.
