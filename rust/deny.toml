@@ -23,12 +23,19 @@ targets = []
 
 [advisories]
 # RUSTSEC-2023-0071 ("Marvin Attack" timing side-channel in `rsa` 0.9.10):
-# pulled in solely as a dev-dependency of lakehouse-auth
-# (crates/lakehouse-auth/tests/oidc.rs, to mint an RSA key for OIDC test
-# fixtures). It is never linked into a shipped binary, and upstream has
-# published no fix ("No safe upgrade is available!" per the advisory) —
-# `cargo update -p rsa --dry-run` confirms 0.9.10 is already latest.
-# Re-evaluate when RustCrypto/RSA ships a constant-time implementation.
+# a DEV-dependency only, of `lakehouse-auth` and `lakehouse-api` (to mint an
+# RSA key for OIDC and service-account test fixtures —
+# crates/lakehouse-auth/tests/oidc.rs, crates/lakehouse-api/src/routes/auth.rs
+# and crates/lakehouse-api/src/connector_probe/saas.rs, all inside
+# `#[cfg(test)]`). Since `SEC-41` (`sqlx` 0.9 with `mysql-rsa` off)
+# `cargo tree -i rsa -e normal -p lakehouse-api` prints "nothing to print":
+# no shipped binary links it. Before `SEC-41` that sentence was FALSE —
+# `sqlx-mysql` 0.8.6 depended on `rsa` as a normal dependency, so the old
+# justification here ("pulled in solely as a dev-dependency") described a
+# tree that did not exist. Upstream has published no fix ("No safe upgrade
+# is available!" per the advisory); `cargo update -p rsa --dry-run` confirms
+# 0.9.10 is the latest. Re-evaluate when RustCrypto/RSA ships a
+# constant-time implementation.
 #
 # RUSTSEC-2024-0436 (`paste` is no longer maintained): an *unmaintained*
 # advisory, not a vulnerability — there is no CVE and no exploit path, only a
@@ -55,23 +62,16 @@ targets = []
 # Latest `calamine` (0.36.1) requires `zip ^8.6` and does not yet accept
 # `zip` 9.0.0. Drop when `calamine` accepts `zip` >= 9.0.0; then `cargo update -p zip`.
 # RUSTSEC-2026-0381 (SEC-46, bundled roots trust distrusted emSign
-# intermediates) on `webpki-roots` 0.26.11: a version-number match only.
-# 0.26.11 is a semver-trick shim whose sole dependency is `webpki-roots` 1.x
-# and whose `TLS_SERVER_ROOTS` are re-exported from it; the lockfile pins 1.x at
-# 1.0.10, which carries the fix. No 0.26 release is patched (0.26.11 is the
-# last). Only `sqlx-core` 0.8.6 requires the 0.26 shim:
-#
-#   webpki-roots 0.26 <- sqlx-core <- sqlx
-#
-# Drop when SEC-41 moves `sqlx` to 0.9 and `webpki-roots` 0.26 leaves
-# Cargo.lock; then remove this entry.
+# intermediates) is gone from this list with `SEC-41`: it matched only
+# `webpki-roots` 0.26.11, the semver shim `sqlx-core` 0.8.6 required, and
+# `sqlx` 0.9 depends on `webpki-roots` 1.x directly (0.26 is no longer in
+# `Cargo.lock`: `cargo tree -i webpki-roots@0.26.11` finds no package).
 ignore = [
     "RUSTSEC-2023-0071",
     "RUSTSEC-2024-0436",
     "RUSTSEC-2026-0367",
     "RUSTSEC-2026-0368",
     "RUSTSEC-2026-0369",
-    "RUSTSEC-2026-0381",
 ]
 
 [licenses]

@@ -272,7 +272,8 @@ pub async fn insert(pool: &PgPool, new: &NewUpload<'_>) -> Result<Upload, StoreE
           tenant_id) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING {COLS}"
     );
-    Ok(sqlx::query_as(&sql)
+    // safe: only the constant `COLS` is formatted in; values are bound.
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(new.id)
         .bind(new.original_filename)
         .bind(new.storage_key)
@@ -295,7 +296,8 @@ pub async fn list(pool: &PgPool, tenant_id: Uuid, limit: i64) -> Result<Vec<Uplo
         "SELECT {COLS} FROM file_upload WHERE tenant_id = $1 \
          ORDER BY created_at DESC, id DESC LIMIT $2"
     );
-    Ok(sqlx::query_as(&sql)
+    // safe: only the constant `COLS` is formatted in; values are bound.
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(tenant_id)
         .bind(limit.clamp(1, 500))
         .fetch_all(pool)
@@ -310,7 +312,11 @@ pub async fn list(pool: &PgPool, tenant_id: Uuid, limit: i64) -> Result<Vec<Uplo
 /// Returns [`StoreError::Database`] on a database failure.
 pub async fn get(pool: &PgPool, id: &str) -> Result<Option<Upload>, StoreError> {
     let sql = format!("SELECT {COLS} FROM file_upload WHERE id = $1");
-    Ok(sqlx::query_as(&sql).bind(id).fetch_optional(pool).await?)
+    // safe: only the constant `COLS` is formatted in; values are bound.
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+        .bind(id)
+        .fetch_optional(pool)
+        .await?)
 }
 
 /// The upload whose load is run `run_id`, or `None` (`SRC-7` F6): the
@@ -326,7 +332,8 @@ pub async fn get_by_run_id(pool: &PgPool, run_id: &str) -> Result<Option<Upload>
     let sql = format!(
         "SELECT {COLS} FROM file_upload WHERE run_id = $1 ORDER BY updated_at DESC LIMIT 1"
     );
-    Ok(sqlx::query_as(&sql)
+    // safe: only the constant `COLS` is formatted in; values are bound.
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(run_id)
         .fetch_optional(pool)
         .await?)
@@ -378,7 +385,8 @@ pub async fn find_by_sha256(
          WHERE tenant_id = $1 AND sha256 = $2 AND sha256 <> '' AND id <> $3 \
          ORDER BY created_at DESC, id DESC LIMIT 1"
     );
-    Ok(sqlx::query_as(&sql)
+    // safe: only the constant `COLS` is formatted in; values are bound.
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(tenant_id)
         .bind(sha256)
         .bind(exclude_id)
@@ -418,7 +426,8 @@ pub async fn mark_ingesting(
          updated_at = now() \
          WHERE id = $1 AND status <> 'ingesting' RETURNING {COLS}"
     );
-    Ok(sqlx::query_as(&sql)
+    // safe: only the constant `COLS` is formatted in; values are bound.
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(id)
         .bind(Json(parse_options.clone()))
         .bind(bronze_table)
@@ -538,7 +547,8 @@ pub async fn mark_ingesting_within_limits(
          updated_at = now() \
          WHERE id = $1 AND status <> 'ingesting' RETURNING {COLS}"
     );
-    let marked: Option<Upload> = sqlx::query_as(&sql)
+    // safe: only the constant `COLS` is formatted in; values are bound.
+    let marked: Option<Upload> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(id)
         .bind(Json(parse_options.clone()))
         .bind(bronze_table)
@@ -577,7 +587,8 @@ pub async fn attach_run(
          WHERE id = $1 AND status = 'ingesting' AND run_id IS NULL \
          RETURNING {COLS}"
     );
-    Ok(sqlx::query_as(&sql)
+    // safe: only the constant `COLS` is formatted in; values are bound.
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(id)
         .bind(run_id)
         .fetch_optional(pool)
@@ -618,7 +629,8 @@ pub async fn mark_finished(
          WHERE id = $1 AND status = 'ingesting' AND run_id IS NOT DISTINCT FROM $2 \
          RETURNING {COLS}"
     );
-    Ok(sqlx::query_as(&sql)
+    // safe: only the constant `COLS` is formatted in; values are bound.
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(id)
         .bind(run_id)
         .bind(error)

@@ -202,7 +202,10 @@ pub async fn list_residency_rules(pool: &PgPool) -> Result<Vec<ResidencyRule>, S
 /// Returns [`StoreError::Database`] if the query fails.
 pub async fn list_policies(pool: &PgPool) -> Result<Vec<Policy>, StoreError> {
     let sql = format!("SELECT {POLICY_COLUMNS} FROM policy ORDER BY created_at DESC, name");
-    let rows: Vec<PolicyRow> = sqlx::query_as(&sql).fetch_all(pool).await?;
+    // safe: only the constant `POLICY_COLUMNS` is formatted in; values are bound.
+    let rows: Vec<PolicyRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+        .fetch_all(pool)
+        .await?;
     Ok(rows.into_iter().map(Policy::from).collect())
 }
 
@@ -248,7 +251,8 @@ pub async fn create_policy(pool: &PgPool, input: &CreatePolicyInput) -> Result<P
         "INSERT INTO policy (name, status, kind, subjects, resources, effect, conditions, owner) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING {POLICY_COLUMNS}"
     );
-    let row: PolicyRow = sqlx::query_as(&sql)
+    // safe: only the constant `POLICY_COLUMNS` is formatted in; values are bound.
+    let row: PolicyRow = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(&input.name)
         .bind(status)
         .bind(&input.kind)
@@ -286,7 +290,8 @@ pub async fn set_policy_status(
            status = $2 \
          WHERE id = $1 RETURNING {POLICY_COLUMNS}"
     );
-    let row: Option<PolicyRow> = sqlx::query_as(&sql)
+    // safe: only the constant `POLICY_COLUMNS` is formatted in; values are bound.
+    let row: Option<PolicyRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(id)
         .bind(status)
         .fetch_optional(pool)
@@ -306,7 +311,11 @@ pub async fn delete_policy(pool: &PgPool, id: &str) -> Result<Option<Policy>, St
         return Ok(None);
     };
     let sql = format!("DELETE FROM policy WHERE id = $1 RETURNING {POLICY_COLUMNS}");
-    let row: Option<PolicyRow> = sqlx::query_as(&sql).bind(id).fetch_optional(pool).await?;
+    // safe: only the constant `POLICY_COLUMNS` is formatted in; values are bound.
+    let row: Option<PolicyRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
     Ok(row.map(Policy::from))
 }
 

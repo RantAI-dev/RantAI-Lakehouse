@@ -1319,6 +1319,34 @@ pub(crate) fn parse_postgres_host(host: &str) -> Option<PgDialTarget<'_>> {
     })
 }
 
+/// What a `MySQL` dial says when the server asked for its password over a
+/// connection that is not encrypted and this build has no RSA backend to
+/// send it (`SEC-41` decision 4, spec D3: the `mysql-rsa` feature stays off,
+/// so the password is never RSA-encrypted to a server that did not offer
+/// TLS). One sentence, safe to show: it repeats no upstream text.
+pub(crate) const MYSQL_PLAINTEXT_PASSWORD_REFUSED: &str = "This MySQL server asks for its \
+     password over an unencrypted connection. Turn on TLS on the server, or use \
+     mysql_native_password for this user.";
+
+/// Whether `err` is `sqlx-mysql` 0.9's refusal to send a password without
+/// TLS, i.e. the `caching_sha2_password` full-auth or `sha256_password` path
+/// with the `rsa` feature off.
+///
+/// The type is the discriminator `sqlx` offers: `rsa_backend::encrypt`
+/// returns [`sqlx::Error::Configuration`] (`sqlx-mysql-0.9.0/src/
+/// connection/auth.rs`, the `#[cfg(not(feature = "rsa"))]` module), and
+/// `sqlx` has no dedicated error kind for it — so the guard also matches the
+/// one fixed sentence that module returns. Both halves are ours to check:
+/// the text is `sqlx`'s own constant, never a server's reply.
+pub(crate) fn is_mysql_plaintext_password_refusal(err: &sqlx::Error) -> bool {
+    match err {
+        sqlx::Error::Configuration(source) => {
+            source.to_string().contains("RSA auth backend disabled")
+        }
+        _ => false,
+    }
+}
+
 /// Classify a `sqlx` connection error into one of a small set of generic
 /// failure classes — see the module doc comment's "Error messages never
 /// echo upstream data" section for why this never formats `err` itself.
@@ -1335,6 +1363,11 @@ pub(crate) fn classify_sqlx_error(err: &sqlx::Error) -> &'static str {
             std::io::ErrorKind::PermissionDenied => "permission denied",
             _ => "connection failed",
         },
+        // `SEC-41` decision 4: the operator can act on this one (it names
+        // TLS), so it gets its own sentence instead of "connection failed".
+        sqlx::Error::Configuration(_) if is_mysql_plaintext_password_refusal(err) => {
+            MYSQL_PLAINTEXT_PASSWORD_REFUSED
+        }
         sqlx::Error::Tls(_) => "TLS error",
         sqlx::Error::Database(db_err) => match db_err.code().as_deref() {
             // PostgreSQL error codes: 28P01 invalid_password,
@@ -3112,5 +3145,38 @@ mod tests {
         assert!(!outcome.ok);
         assert!(!outcome.supported);
         assert!(outcome.latency_ms.is_none());
+    }
+
+    /// `SEC-41` decision 4: `sqlx-mysql` 0.9 without `mysql-rsa` refuses to
+    /// send a password to a server that asked for it over a plaintext
+    /// connection. That refusal must reach the operator as the one fixed
+    /// sentence (it names TLS), and no other `Configuration` error may be
+    /// mistaken for it.
+    #[test]
+    fn a_mysql_password_refusal_over_plaintext_has_its_own_sentence() {
+        // The exact `Error::Configuration` text `sqlx-mysql` 0.9's
+        // `#[cfg(not(feature = "rsa"))]` backend returns.
+        let refusal = sqlx::Error::Configuration(
+            "RSA auth backend disabled; enable feature `mysql-rsa` (or `rsa` if using \
+             sqlx-mysql directly) or use TLS."
+                .into(),
+        );
+        assert!(is_mysql_plaintext_password_refusal(&refusal));
+        assert_eq!(
+            classify_sqlx_error(&refusal),
+            MYSQL_PLAINTEXT_PASSWORD_REFUSED,
+            "the refusal must keep its own actionable sentence"
+        );
+        assert!(
+            MYSQL_PLAINTEXT_PASSWORD_REFUSED.contains("Turn on TLS"),
+            "the sentence must tell the operator what to do: {MYSQL_PLAINTEXT_PASSWORD_REFUSED}"
+        );
+
+        // A `Configuration` error from anywhere else stays generic: the
+        // match is on `sqlx`'s own fixed text, never on "any configuration
+        // problem".
+        let other = sqlx::Error::Configuration("some other option".into());
+        assert!(!is_mysql_plaintext_password_refusal(&other));
+        assert_eq!(classify_sqlx_error(&other), "connection failed");
     }
 }
