@@ -80,7 +80,9 @@ pub async fn insert(pool: &PgPool, map: &NewGeoMap<'_>) -> Result<GeoMap, StoreE
 pub async fn list(pool: &PgPool) -> Result<Vec<GeoMap>, StoreError> {
     let sql = format!("SELECT {COLS} FROM geo_map ORDER BY created_at, id");
     // safe: only the constant `COLS` is formatted in; values are bound (SEC-41).
-    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str())).fetch_all(pool).await?)
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+        .fetch_all(pool)
+        .await?)
 }
 
 /// One map without its file, or `None`.
@@ -91,7 +93,10 @@ pub async fn list(pool: &PgPool) -> Result<Vec<GeoMap>, StoreError> {
 pub async fn get(pool: &PgPool, id: &str) -> Result<Option<GeoMap>, StoreError> {
     let sql = format!("SELECT {COLS} FROM geo_map WHERE id = $1");
     // safe: only the constant `COLS` is formatted in; values are bound (SEC-41).
-    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str())).bind(id).fetch_optional(pool).await?)
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+        .bind(id)
+        .fetch_optional(pool)
+        .await?)
 }
 
 /// A map's simplified file and a tag that changes when the file does.
