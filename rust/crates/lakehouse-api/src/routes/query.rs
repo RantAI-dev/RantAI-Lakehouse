@@ -16,11 +16,15 @@ use lakehouse_clickhouse::{ChClient, ChError};
 use lakehouse_core::ApiError;
 use lakehouse_store::PgPool;
 use lakehouse_store::audit::NewAuditEvent;
-use lakehouse_store::queries::{self, QueryHistoryItem, RecordHistoryInput, SavedQuery};
+use lakehouse_store::queries::{
+    self, HistoryFilter, QueryHistoryItem, RecordHistoryInput, SavedQuery,
+};
 use lakehouse_store::uploads::TableClaim;
 use lakehouse_trino::{TrinoError, TrinoResult};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 
 use crate::error::ApiResult;
@@ -1661,20 +1665,121 @@ pub async fn list_saved(
     Ok(ApiJson(queries::list_saved(pool(&state)?, scope).await?))
 }
 
-/// `GET /api/query/history` — the caller's own recent query executions,
-/// recorded by [`run`].
+/// The `GET /api/query/history` query string (`QS-4`, decision 5). Every
+/// field stays a raw string on purpose: this struct parses whatever the
+/// caller sends, so the extractor itself can never reject, and
+/// [`parse_history_query`] is the one place a bad value becomes a 400
+/// with this route's own fixed message — never `serde_urlencoded`'s
+/// rendering of a serde error.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryQueryRaw {
+    status: Option<String>,
+    engine: Option<String>,
+    min_duration_ms: Option<String>,
+    table: Option<String>,
+    from: Option<String>,
+    to: Option<String>,
+    /// The page cursor: `<at>,<id>` — the `at` and `id` of the last row
+    /// the caller has already seen.
+    before: Option<String>,
+}
+
+/// The statuses `query_history`'s own check allows — the set [`run`]
+/// records, and nothing else.
+const HISTORY_STATUSES: [&str; 4] = ["completed", "failed", "cancelled", "blocked"];
+
+/// The engines [`run`] records.
+const HISTORY_ENGINES: [&str; 2] = ["clickhouse", "trino"];
+
+/// Parse the history query string into a [`HistoryFilter`], refusing a
+/// bad value with a fixed 400 before the store sees it.
+///
+/// Unknown keys are ignored, not refused: the contract is the seven
+/// documented names, and a caller sending more than that is forward
+/// compatible, not wrong. An empty value (`?status=`) is no value, so a
+/// client that builds links from empty inputs filters nothing instead of
+/// getting a 400 it cannot read.
+fn parse_history_query(raw: &HistoryQueryRaw) -> Result<HistoryFilter<'_>, ApiError> {
+    let mut filter = HistoryFilter::default();
+    if let Some(status) = raw.status.as_deref().filter(|s| !s.is_empty()) {
+        if !HISTORY_STATUSES.contains(&status) {
+            return Err(ApiError::BadRequest(
+                "status must be one of completed, failed, cancelled, blocked".to_owned(),
+            ));
+        }
+        filter.status = Some(status);
+    }
+    if let Some(engine) = raw.engine.as_deref().filter(|s| !s.is_empty()) {
+        if !HISTORY_ENGINES.contains(&engine) {
+            return Err(ApiError::BadRequest(
+                "engine must be one of clickhouse, trino".to_owned(),
+            ));
+        }
+        filter.engine = Some(engine);
+    }
+    if let Some(min) = raw.min_duration_ms.as_deref().filter(|s| !s.is_empty()) {
+        filter.min_duration_ms = Some(min.parse::<i64>().ok().filter(|ms| *ms >= 0).ok_or_else(
+            || {
+                ApiError::BadRequest(
+                    "minDurationMs must be a non-negative whole number of milliseconds".to_owned(),
+                )
+            },
+        )?);
+    }
+    if let Some(table) = raw.table.as_deref().filter(|s| !s.is_empty()) {
+        filter.table = Some(table);
+    }
+    filter.from = history_time("from", raw.from.as_deref())?;
+    filter.to = history_time("to", raw.to.as_deref())?;
+    if let Some(before) = raw.before.as_deref().filter(|s| !s.is_empty()) {
+        let bad_before = || {
+            ApiError::BadRequest(
+                "before must be <at>,<id>: the at and the id of the last row you have seen"
+                    .to_owned(),
+            )
+        };
+        let (at, id) = before.split_once(',').ok_or_else(bad_before)?;
+        if id.is_empty() {
+            return Err(bad_before());
+        }
+        filter.before_at = Some(OffsetDateTime::parse(at, &Rfc3339).map_err(|_| bad_before())?);
+        filter.before_id = Some(id);
+    }
+    Ok(filter)
+}
+
+/// Parse one of the window bounds: RFC 3339, the format the rows' own
+/// `at` carries, so a cursor cut from a listed row parses back.
+fn history_time(field: &str, raw: Option<&str>) -> Result<Option<OffsetDateTime>, ApiError> {
+    match raw {
+        // An empty value is no value, like every other filter field.
+        None | Some("") => Ok(None),
+        Some(raw) => OffsetDateTime::parse(raw, &Rfc3339)
+            .map(Some)
+            .map_err(|_| ApiError::BadRequest(format!("{field} must be an RFC 3339 time"))),
+    }
+}
+
+/// `GET /api/query/history` — the caller's own recorded query executions,
+/// filtered, inside the last 14 days, one page at a time (`QS-4`).
 ///
 /// # Errors
 ///
 /// 401 when nobody is signed in — history belongs to a person, so there is
-/// no sensible answer for "everyone's". 503 if no pool is configured; 500
-/// on a database failure.
+/// no sensible answer for "everyone's". 400 for a bad filter value, with a
+/// fixed message naming the field. 503 if no pool is configured; 500 on a
+/// database failure.
 pub async fn list_history(
     State(state): State<AppState>,
     principal: Option<Extension<Principal>>,
+    Query(raw): Query<HistoryQueryRaw>,
 ) -> ApiResult<ApiJson<Vec<QueryHistoryItem>>> {
     let owner = caller_id(principal.as_ref())?;
-    Ok(ApiJson(queries::list_history(pool(&state)?, owner).await?))
+    let filter = parse_history_query(&raw)?;
+    Ok(ApiJson(
+        queries::list_history(pool(&state)?, owner, &filter).await?,
+    ))
 }
 
 /// The signed-in caller's id, or a 401.
@@ -3831,5 +3936,159 @@ mod tenant_scope_tests {
                 owns_catalog: false,
             }
         );
+    }
+}
+
+/// `QS-4` step 4: the history query string's parser, on its own. The
+/// store's tests own the SQL semantics; these own the 400s.
+#[cfg(test)]
+mod history_query_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::{HistoryQueryRaw, parse_history_query};
+
+    fn raw(
+        status: Option<&str>,
+        engine: Option<&str>,
+        min_duration_ms: Option<&str>,
+        table: Option<&str>,
+        from: Option<&str>,
+        to: Option<&str>,
+        before: Option<&str>,
+    ) -> HistoryQueryRaw {
+        HistoryQueryRaw {
+            status: status.map(str::to_owned),
+            engine: engine.map(str::to_owned),
+            min_duration_ms: min_duration_ms.map(str::to_owned),
+            table: table.map(str::to_owned),
+            from: from.map(str::to_owned),
+            to: to.map(str::to_owned),
+            before: before.map(str::to_owned),
+        }
+    }
+
+    /// A well-formed query string lands in the filter with every field it
+    /// named, and one that named nothing filters nothing.
+    #[test]
+    fn a_good_query_parses_into_its_filter() {
+        let query = raw(
+            Some("failed"),
+            Some("trino"),
+            Some("1500"),
+            Some("orders"),
+            Some("2026-10-11T00:00:00Z"),
+            Some("2026-10-20T12:00:00.500Z"),
+            Some("2026-10-20T11:59:59.999Z,q-1729"),
+        );
+        let filter = parse_history_query(&query).unwrap();
+        assert_eq!(filter.status, Some("failed"));
+        assert_eq!(filter.engine, Some("trino"));
+        assert_eq!(filter.min_duration_ms, Some(1500));
+        assert_eq!(filter.table, Some("orders"));
+        assert_eq!(
+            filter.before_id,
+            Some("q-1729"),
+            "the cursor's id half is everything after the first comma"
+        );
+        assert!(filter.from.is_some() && filter.to.is_some() && filter.before_at.is_some());
+
+        let empty_query = raw(None, None, None, None, None, None, None);
+        let empty = parse_history_query(&empty_query).unwrap();
+        assert_eq!(empty, super::HistoryFilter::default());
+    }
+
+    /// An empty value is no value: a client that builds links from empty
+    /// inputs filters nothing instead of getting a 400.
+    #[test]
+    fn empty_values_filter_nothing() {
+        let query = raw(
+            Some(""),
+            Some(""),
+            Some(""),
+            Some(""),
+            Some(""),
+            Some(""),
+            Some(""),
+        );
+        let filter = parse_history_query(&query).unwrap();
+        assert_eq!(filter, super::HistoryFilter::default());
+    }
+
+    /// A value outside the known sets is a 400 whose message names the
+    /// field — fixed text, never a serde rendering.
+    #[test]
+    fn an_unknown_status_or_engine_is_a_400_naming_the_field() {
+        let bad_status = raw(Some("yesterday"), None, None, None, None, None, None);
+        let err = parse_history_query(&bad_status).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "status must be one of completed, failed, cancelled, blocked"
+        );
+        let bad_engine = raw(None, Some("presto"), None, None, None, None, None);
+        let err = parse_history_query(&bad_engine).unwrap_err();
+        assert_eq!(err.to_string(), "engine must be one of clickhouse, trino");
+    }
+
+    /// A value that does not parse is a 400 whose message names the field:
+    /// the duration's number, the window's times, and the cursor's two
+    /// halves.
+    #[test]
+    fn a_bad_duration_time_or_cursor_is_a_400_naming_the_field() {
+        let cases: [(HistoryQueryRaw, &str); 6] = [
+            (
+                raw(None, None, Some("soon"), None, None, None, None),
+                "minDurationMs",
+            ),
+            (
+                raw(None, None, Some("-1"), None, None, None, None),
+                "minDurationMs",
+            ),
+            (
+                raw(None, None, None, None, Some("not-a-time"), None, None),
+                "from",
+            ),
+            (
+                raw(
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("2026-13-45T00:00:00Z"),
+                    None,
+                ),
+                "to",
+            ),
+            (
+                raw(
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("2026-10-20T00:00:00Z"),
+                ),
+                "before",
+            ),
+            (
+                raw(
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("2026-10-20T00:00:00Z,"),
+                ),
+                "before",
+            ),
+        ];
+        for (query, field) in &cases {
+            let err = parse_history_query(query).unwrap_err();
+            let message = err.to_string();
+            assert!(message.starts_with(field), "{message} must name {field:?}");
+            assert_eq!(err.status(), 400, "a bad value is a 400: {message}");
+        }
     }
 }

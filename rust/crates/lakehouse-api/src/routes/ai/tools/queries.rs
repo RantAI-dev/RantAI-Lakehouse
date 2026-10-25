@@ -335,9 +335,10 @@ mod tests {
                 "expected a successful run, got {result}"
             );
 
-            let history = queries::list_history(&pool, Uuid::nil())
-                .await
-                .expect("query_history is readable");
+            let history =
+                queries::list_history(&pool, Uuid::nil(), &queries::HistoryFilter::default())
+                    .await
+                    .expect("query_history is readable");
             let recorded = history
                 .first()
                 .expect("run_saved_query must have recorded one history row");

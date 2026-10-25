@@ -21,8 +21,8 @@ use lakehouse_test_support as _;
 
 use lakehouse_store::audit::{NewAuditEvent, insert as insert_audit_event};
 use lakehouse_store::queries::{
-    RecordHistoryInput, SavedQueryScope, create_saved_query, get_history_item, history_mentioning,
-    history_recent, list_history, list_saved, record_history,
+    HistoryFilter, RecordHistoryInput, SavedQueryScope, create_saved_query, get_history_item,
+    history_mentioning, history_recent, list_history, list_saved, record_history,
 };
 use sqlx::PgPool;
 use time::OffsetDateTime;
@@ -51,7 +51,9 @@ async fn seed_populates_saved_queries(pool: PgPool) -> sqlx::Result<()> {
 async fn record_history_round_trips_through_list(pool: PgPool) -> sqlx::Result<()> {
     let owner = Uuid::new_v4();
     assert_eq!(
-        list_history(&pool, owner).await.unwrap(),
+        list_history(&pool, owner, &HistoryFilter::default())
+            .await
+            .unwrap(),
         [] as [lakehouse_store::queries::QueryHistoryItem; 0]
     );
 
@@ -76,7 +78,9 @@ async fn record_history_round_trips_through_list(pool: PgPool) -> sqlx::Result<(
     .await
     .unwrap();
 
-    let history = list_history(&pool, owner).await.unwrap();
+    let history = list_history(&pool, owner, &HistoryFilter::default())
+        .await
+        .unwrap();
     assert_eq!(history.len(), 1);
     assert_eq!(history[0].id, "q-1");
     assert_eq!(history[0].sql, "SELECT 1");
@@ -86,7 +90,9 @@ async fn record_history_round_trips_through_list(pool: PgPool) -> sqlx::Result<(
     // Another user's history is not this user's: the rows are private to
     // whoever ran them.
     assert_eq!(
-        list_history(&pool, Uuid::new_v4()).await.unwrap(),
+        list_history(&pool, Uuid::new_v4(), &HistoryFilter::default())
+            .await
+            .unwrap(),
         [] as [lakehouse_store::queries::QueryHistoryItem; 0]
     );
     Ok(())
@@ -117,7 +123,9 @@ async fn record_history_is_idempotent_per_id(pool: PgPool) -> sqlx::Result<()> {
     record_history(&pool, &input).await.unwrap();
     record_history(&pool, &input).await.unwrap();
 
-    let history = list_history(&pool, owner).await.unwrap();
+    let history = list_history(&pool, owner, &HistoryFilter::default())
+        .await
+        .unwrap();
     assert_eq!(history.len(), 1);
     Ok(())
 }
@@ -162,7 +170,9 @@ async fn history_item_has_no_audit_id_without_a_real_event(pool: PgPool) -> sqlx
     .await
     .unwrap();
 
-    let history = list_history(&pool, owner).await.unwrap();
+    let history = list_history(&pool, owner, &HistoryFilter::default())
+        .await
+        .unwrap();
     assert_eq!(history.len(), 1);
     assert_eq!(history[0].audit_event_id, None);
     Ok(())
@@ -199,7 +209,9 @@ async fn history_item_resolves_the_real_audit_event_id(pool: PgPool) -> sqlx::Re
         .await
         .unwrap();
 
-    let history = list_history(&pool, owner).await.unwrap();
+    let history = list_history(&pool, owner, &HistoryFilter::default())
+        .await
+        .unwrap();
     assert_eq!(history.len(), 1);
     assert_eq!(
         history[0].audit_event_id.as_deref(),
@@ -268,7 +280,9 @@ async fn history_item_uses_the_newest_of_several_events_without_duplicating_the_
     )
     .await;
 
-    let history = list_history(&pool, owner).await.unwrap();
+    let history = list_history(&pool, owner, &HistoryFilter::default())
+        .await
+        .unwrap();
     assert_eq!(history.len(), 1, "the lateral join must not duplicate rows");
     assert_eq!(
         history[0].audit_event_id.as_deref(),
@@ -309,7 +323,9 @@ async fn record_history_carries_the_real_engine_and_is_scoped_by_owner_id(
     .await
     .unwrap();
 
-    let history = list_history(&pool, owner).await.unwrap();
+    let history = list_history(&pool, owner, &HistoryFilter::default())
+        .await
+        .unwrap();
     assert_eq!(history.len(), 1);
     assert_eq!(history[0].user, "Real User");
     assert_eq!(history[0].engine, "trino");
@@ -590,5 +606,426 @@ async fn saved_queries_are_listed_per_tenant(pool: PgPool) -> sqlx::Result<()> {
     // A caller in no tenant reads no row at all.
     let none = list_saved(&pool, SavedQueryScope::None).await.unwrap();
     assert_eq!(none, [] as [lakehouse_store::queries::SavedQuery; 0]);
+    Ok(())
+}
+
+// ── The history page's filters (`QS-4`, step 4) ─────────────────────────
+
+/// A listed page's row ids, in the order the page returned them.
+fn row_ids(rows: &[lakehouse_store::queries::QueryHistoryItem]) -> Vec<&str> {
+    rows.iter().map(|r| r.id.as_str()).collect()
+}
+
+/// A listed page's row ids, sorted where a test does not care about order.
+fn sorted_ids(rows: &[lakehouse_store::queries::QueryHistoryItem]) -> Vec<&str> {
+    let mut v = row_ids(rows);
+    v.sort_unstable();
+    v
+}
+
+/// Inserts one history row with the knobs the filter tests turn, and
+/// backdates it `age_days` behind `now()` — `record_history` stamps `at`
+/// with the column default, so the age is applied afterwards.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a test fixture: each argument is one knob a filter test turns, and a params struct would bury the one field that differs at a call site"
+)]
+async fn insert_history_row(
+    pool: &PgPool,
+    id: &str,
+    owner: Uuid,
+    status: &str,
+    engine: &str,
+    duration_ms: i64,
+    tables: &[&str],
+    message: Option<&str>,
+    age_days: i32,
+) {
+    let tables: Vec<String> = tables.iter().map(|t| (*t).to_owned()).collect();
+    record_history(
+        pool,
+        &RecordHistoryInput {
+            id,
+            sql: "SELECT 1",
+            user: "Bootstrap Admin",
+            owner_id: Some(owner),
+            status,
+            duration_ms,
+            scanned_bytes: 1,
+            cost_units: 0.1,
+            workload_class: "hot-analytics",
+            engine,
+            cache_assisted: false,
+            tables_read: &tables,
+            message,
+        },
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE query_history SET at = now() - make_interval(days => $1) WHERE id = $2")
+        .bind(age_days)
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+/// Each filter on its own keeps exactly the rows it names — the one-axis
+/// questions the history page's bar asks — and another user's rows answer
+/// none of them.
+#[sqlx::test(migrations = "../../migrations")]
+async fn each_filter_alone_selects_its_own_rows(pool: PgPool) -> sqlx::Result<()> {
+    let owner = Uuid::new_v4();
+    insert_history_row(
+        &pool,
+        "q-a",
+        owner,
+        "completed",
+        "clickhouse",
+        100,
+        &["marts.retails"],
+        None,
+        0,
+    )
+    .await;
+    insert_history_row(
+        &pool,
+        "q-b",
+        owner,
+        "failed",
+        "clickhouse",
+        5_000,
+        &["bronze.orders"],
+        Some("Arrow table is missing"),
+        3,
+    )
+    .await;
+    insert_history_row(
+        &pool,
+        "q-c",
+        owner,
+        "blocked",
+        "trino",
+        2_500,
+        &["marts.retails", "bronze.orders"],
+        Some("another tenant claims orders"),
+        10,
+    )
+    .await;
+
+    let failed = list_history(
+        &pool,
+        owner,
+        &HistoryFilter {
+            status: Some("failed"),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(row_ids(&failed), ["q-b"]);
+
+    let trino = list_history(
+        &pool,
+        owner,
+        &HistoryFilter {
+            engine: Some("trino"),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(row_ids(&trino), ["q-c"]);
+
+    let slow = list_history(
+        &pool,
+        owner,
+        &HistoryFilter {
+            min_duration_ms: Some(1_000),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(row_ids(&slow), ["q-b", "q-c"]);
+
+    let orders = list_history(
+        &pool,
+        owner,
+        &HistoryFilter {
+            table: Some("orders"),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        row_ids(&orders),
+        ["q-b", "q-c"],
+        "any element of tables_read matches"
+    );
+
+    let window = list_history(
+        &pool,
+        owner,
+        &HistoryFilter {
+            from: Some(OffsetDateTime::now_utc() - time::Duration::days(5)),
+            to: Some(OffsetDateTime::now_utc() - time::Duration::days(2)),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        row_ids(&window),
+        ["q-b"],
+        "the window [now-5d, now-2d] holds exactly the 3-day-old row"
+    );
+
+    // Another user's rows never appear, filtered or not.
+    let stranger = list_history(
+        &pool,
+        Uuid::new_v4(),
+        &HistoryFilter {
+            status: Some("failed"),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(row_ids(&stranger), [] as [&str; 0]);
+    Ok(())
+}
+
+/// The 14-day window is the server's, not the caller's (decision 2): a
+/// row 15 days old is never listed, and an older `from` cannot bring it
+/// back.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_row_fifteen_days_old_is_never_listed_even_when_from_asks_for_it(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let owner = Uuid::new_v4();
+    insert_history_row(
+        &pool,
+        "q-old",
+        owner,
+        "completed",
+        "clickhouse",
+        10,
+        &["marts.retails"],
+        None,
+        15,
+    )
+    .await;
+    insert_history_row(
+        &pool,
+        "q-new",
+        owner,
+        "completed",
+        "clickhouse",
+        10,
+        &["marts.retails"],
+        None,
+        0,
+    )
+    .await;
+
+    let unfiltered = list_history(&pool, owner, &HistoryFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        unfiltered.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+        ["q-new"],
+        "the default view is the last 14 days"
+    );
+
+    let from_thirty_days_back = list_history(
+        &pool,
+        owner,
+        &HistoryFilter {
+            from: Some(OffsetDateTime::now_utc() - time::Duration::days(30)),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        from_thirty_days_back
+            .iter()
+            .map(|r| r.id.as_str())
+            .collect::<Vec<_>>(),
+        ["q-new"],
+        "from is clamped to now minus 14 days"
+    );
+    Ok(())
+}
+
+/// The cursor pages by the `at` *and* `id` of the last row seen: 55 rows
+/// that share one `at` come back as 50 then 5, with nothing repeated and
+/// nothing skipped — the millisecond tie is what the id half is for.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_cursor_pages_without_repeats_or_skips(pool: PgPool) -> sqlx::Result<()> {
+    let owner = Uuid::new_v4();
+    for i in 0..55 {
+        insert_history_row(
+            &pool,
+            &format!("q-{i:02}"),
+            owner,
+            "completed",
+            "clickhouse",
+            1,
+            &["marts.retails"],
+            None,
+            1,
+        )
+        .await;
+    }
+
+    let page_one = list_history(&pool, owner, &HistoryFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(page_one.len(), 50);
+    let last = page_one.last().unwrap();
+    let cursor_at =
+        OffsetDateTime::parse(&last.at, &time::format_description::well_known::Rfc3339).unwrap();
+
+    let page_two = list_history(
+        &pool,
+        owner,
+        &HistoryFilter {
+            before_at: Some(cursor_at),
+            before_id: Some(&last.id),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(page_two.len(), 5);
+
+    let mut seen: Vec<&str> = page_one.iter().map(|r| r.id.as_str()).collect();
+    seen.extend(page_two.iter().map(|r| r.id.as_str()));
+    let mut sorted = seen.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(seen.len(), 55, "no repeats");
+    assert_eq!(sorted.len(), 55, "no skips");
+    assert_eq!(sorted[0], "q-00");
+    assert_eq!(sorted[54], "q-54");
+    Ok(())
+}
+
+/// `%` and `_` in the table text are matched literally (decision 7), while
+/// the match itself stays a case-insensitive contains.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_percent_or_underscore_in_the_table_filter_is_literal(pool: PgPool) -> sqlx::Result<()> {
+    let owner = Uuid::new_v4();
+    insert_history_row(
+        &pool,
+        "q-plain",
+        owner,
+        "completed",
+        "clickhouse",
+        1,
+        &["bronze.orders"],
+        None,
+        0,
+    )
+    .await;
+    insert_history_row(
+        &pool,
+        "q-wild",
+        owner,
+        "completed",
+        "clickhouse",
+        1,
+        &["marts.ord%ers"],
+        None,
+        0,
+    )
+    .await;
+    insert_history_row(
+        &pool,
+        "q-under",
+        owner,
+        "completed",
+        "clickhouse",
+        1,
+        &["bronze.o_ders"],
+        None,
+        0,
+    )
+    .await;
+    insert_history_row(
+        &pool,
+        "q-caps",
+        owner,
+        "completed",
+        "clickhouse",
+        1,
+        &["BRONZE.ORDERS"],
+        None,
+        0,
+    )
+    .await;
+    insert_history_row(
+        &pool,
+        "q-suffix",
+        owner,
+        "completed",
+        "clickhouse",
+        1,
+        &["bronze.orders_old"],
+        None,
+        0,
+    )
+    .await;
+
+    let contains = list_history(
+        &pool,
+        owner,
+        &HistoryFilter {
+            table: Some("orders"),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        sorted_ids(&contains),
+        ["q-caps", "q-plain", "q-suffix"],
+        "case-insensitive, any element, contains"
+    );
+
+    let literal_percent = list_history(
+        &pool,
+        owner,
+        &HistoryFilter {
+            table: Some("ord%"),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        sorted_ids(&literal_percent),
+        ["q-wild"],
+        "% is a literal percent"
+    );
+
+    let literal_underscore = list_history(
+        &pool,
+        owner,
+        &HistoryFilter {
+            table: Some("o_ders"),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        sorted_ids(&literal_underscore),
+        ["q-under"],
+        "_ is a literal underscore"
+    );
     Ok(())
 }
