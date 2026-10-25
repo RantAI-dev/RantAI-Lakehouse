@@ -35,12 +35,20 @@ const BOARDS: [(&str, &str, &str); 4] = [
     ("b_private", "fp_x", "someone-else"),
 ];
 
-/// The folders the stand-in holds: `(id, name)`, both at the top level.
-const FOLDERS: [(&str, &str); 3] = [("f1", "Secret"), ("f2", "Open"), ("f3", "Empty")];
+/// The folders the stand-in holds: `(id, name, parent)`. `f4` is the child of
+/// `f5` (BI-19 B2 re-review: the folder-delete test).
+const FOLDERS: [(&str, &str, &str); 5] = [
+    ("f1", "Secret", ""),
+    ("f2", "Open", ""),
+    ("f3", "Empty", ""),
+    ("f4", "Child", "f5"),
+    ("f5", "Parent", ""),
+];
 
 /// A dashboard in the trash: `(id, folder)`. It shows only in the placements
-/// and the row-state lookups, as in the real store.
-const TRASHED: [(&str, &str); 1] = [("b_trashed", "f2")];
+/// and the row-state lookups, as in the real store. `b_orphan` names a folder
+/// that no longer exists.
+const TRASHED: [(&str, &str); 2] = [("b_trashed", "f2"), ("b_orphan", "f_gone")];
 
 /// The charts the stand-in holds: `(id, state, board)`; state 2 is the trash.
 const CHARTS: [(&str, u8, &str); 4] = [
@@ -101,10 +109,10 @@ impl Respond for Store {
             let hidden = listed(&sql, "AND id NOT IN (").unwrap_or_default();
             FOLDERS
                 .iter()
-                .filter(|(id, _)| only.as_ref().is_none_or(|o| o.iter().any(|i| i == id)))
-                .filter(|(id, _)| !hidden.iter().any(|h| h == id))
+                .filter(|(id, _, _)| only.as_ref().is_none_or(|o| o.iter().any(|i| i == id)))
+                .filter(|(id, _, _)| !hidden.iter().any(|h| h == id))
                 .filter(|_| !sql.contains("AND 1 = 0"))
-                .map(|(id, name)| json!({ "id": id, "name": name, "parent_id": "" }))
+                .map(|(id, name, parent)| json!({ "id": id, "name": name, "parent_id": parent }))
                 .collect()
         } else if sql.contains("SELECT id, folder_id, owner_id FROM console.bi_board") {
             BOARDS
@@ -429,18 +437,35 @@ async fn a_manager_replaces_the_rules_and_the_change_is_audited_and_the_refusals
     let manager = create_principal_with_permissions(&pool, "dashboard:read, dashboard:write").await;
     let ann = create_principal_with_permissions(&pool, "query:read").await;
     let cookie = session_cookie_for_user(&pool, manager).await;
+    // BI-19 B2 re-review (B2-3, test bug, rule 2): the manager lists themselves
+    // with manage. Restricting b2 without that locks the caller out (Q-R14, as
+    // designed), and the refusals below would then all read 404. The intent
+    // (a manager's change is applied, audited, and the refusals hold) is kept.
     let ok = put(
         &router,
         &cookie,
         &json!({
             "kind": "board", "id": "b2", "restricted": true,
-            "rules": [{ "userId": ann, "level": "view" }],
+            "rules": [
+                { "userId": ann, "level": "view" },
+                { "userId": manager, "level": "manage" },
+            ],
         }),
     )
     .await;
     assert_eq!(ok.0, StatusCode::OK, "{}", ok.1);
     assert_eq!(ok.1["restricted"], true);
-    assert_eq!(ok.1["rules"][0]["id"], json!(ann));
+    let named: Vec<&Value> = ok.1["rules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| &r["id"])
+        .collect();
+    assert!(
+        named.contains(&&json!(ann)) && named.contains(&&json!(manager)),
+        "{}",
+        ok.1
+    );
     let audited: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM audit_event WHERE action = 'dashboard.access_change' AND resource_id = 'b2'",
     )
@@ -487,7 +512,7 @@ async fn a_manager_replaces_the_rules_and_the_change_is_audited_and_the_refusals
     let rules = lakehouse_store::dashboard_access::rules_for_item(&pool, "board", "b2")
         .await
         .unwrap();
-    assert_eq!(rules.len(), 1);
+    assert_eq!(rules.len(), 2, "ann and the manager, as first saved");
 }
 
 // ── BI-19 B1 review R1 to R6 ───────────────────────────────────────────────
@@ -636,7 +661,7 @@ async fn a_drill_preview_is_a_404_for_an_unseen_chart_and_other_previews_need_re
         &cookie,
         "POST",
         preview,
-        Some(json!({ "drillOf": "c_on_secret", "level": 1 })),
+        Some(json!({ "drillOf": "c_on_secret", "to": "city" })),
     )
     .await;
     let unknown = send(
@@ -644,7 +669,7 @@ async fn a_drill_preview_is_a_404_for_an_unseen_chart_and_other_previews_need_re
         &cookie,
         "POST",
         preview,
-        Some(json!({ "drillOf": "c_nope", "level": 1 })),
+        Some(json!({ "drillOf": "c_nope", "to": "city" })),
     )
     .await;
     assert_eq!(hidden.0, StatusCode::NOT_FOUND, "{hidden:?}");
@@ -672,6 +697,7 @@ async fn an_unlisted_person_cannot_create_a_digest_of_a_restricted_dashboard() {
         json!({
             "name": "Weekly", "kind": "digest", "board": board,
             "channel": "email", "target": "x@example.test",
+            "mart": "mart_x", "measure": "visitors",
         })
     };
     let hidden = send(
@@ -712,10 +738,12 @@ async fn even_a_listed_person_cannot_save_a_digest_of_a_restricted_dashboard() {
         Some(json!({
             "name": "Weekly", "kind": "digest", "board": "b_secret",
             "channel": "email", "target": "x@example.test",
+            "mart": "mart_x", "measure": "visitors",
         })),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.to_string().contains("restricted"), "{body}");
 }
 
 /// Q-R14: managing a parent folder through a rule does not open a restricted
@@ -1277,9 +1305,14 @@ async fn the_assistants_chart_tools_need_edit_on_a_restricted_dashboard() {
 #[tokio::test]
 async fn a_sql_source_in_a_restricted_folder_follows_the_folder() {
     let (router, pool, _ch) = app().await;
-    let listed = create_principal_with_permissions(&pool, "dashboard:read, dashboard:write").await;
+    // `dashboard:sql` is the router floor of the source routes (B2 re-review:
+    // the principals lacked it and every call was a 403 before the filter ran).
+    let listed =
+        create_principal_with_permissions(&pool, "dashboard:read, dashboard:write, dashboard:sql")
+            .await;
     let unlisted =
-        create_principal_with_permissions(&pool, "dashboard:read, dashboard:write").await;
+        create_principal_with_permissions(&pool, "dashboard:read, dashboard:write, dashboard:sql")
+            .await;
     replace_item(
         &pool,
         "folder",
@@ -1384,7 +1417,7 @@ async fn the_chart_lists_leave_out_a_restricted_dashboards_charts() {
         let cookie = session_cookie_for_user(&pool, who).await;
         let (status, specs) = get(&router, &cookie, "/api/dashboard/specs").await;
         assert_eq!(status, StatusCode::OK, "{specs}");
-        let got = chart_ids(&specs, "specs");
+        let got = chart_ids(&specs, "charts");
         assert_eq!(got, expect, "specs: {specs}");
         let (status, tool) = send(
             &router,
@@ -1592,4 +1625,247 @@ async fn the_export_file_leaves_out_a_restricted_dashboard_for_the_unlisted() {
         assert_eq!(text.contains("b_secret"), sees, "{text}");
         assert_eq!(text.contains("c_secret"), sees, "{text}");
     }
+}
+
+// ── BI-19 B2 re-review: S4-b (every by-id source path), folder delete, restore ──
+
+/// A reply with the id of the source taken out, so the answer for a hidden
+/// source and for an unknown one can be compared whole (the sentence names the
+/// id that was asked for).
+fn without_id(reply: &(StatusCode, Value), id: &str) -> (StatusCode, String) {
+    (reply.0, reply.1.to_string().replace(id, "<id>"))
+}
+
+/// One request per place that takes a SQL source's id from the caller, for the
+/// source `id`: `(method, path, body)`.
+fn source_calls(id: &str) -> Vec<(&'static str, String, Option<Value>)> {
+    let chart = json!({
+        "title": "T", "kind": "bar", "mart": "", "sqlSource": id,
+        "dimension": "n", "measures": ["n"], "aggregate": "sum", "board": "b1",
+    });
+    let field = json!({ "source": id, "name": "twice", "formula": "[n] * 2" });
+    let metric = json!({ "source": id, "name": "total", "formula": "Sum([n])" });
+    let hierarchy = json!({ "source": id, "name": "h", "levels": ["n"] });
+    vec![
+        (
+            "GET",
+            format!("/api/dashboard/records?sqlSource={id}"),
+            None,
+        ),
+        (
+            "GET",
+            format!("/api/dashboard/calc-fields?source={id}"),
+            None,
+        ),
+        (
+            "POST",
+            "/api/dashboard/calc-fields/validate".to_owned(),
+            Some(field.clone()),
+        ),
+        ("POST", "/api/dashboard/calc-fields".to_owned(), Some(field)),
+        (
+            "POST",
+            "/api/dashboard/metrics/validate".to_owned(),
+            Some(metric.clone()),
+        ),
+        ("POST", "/api/dashboard/metrics".to_owned(), Some(metric)),
+        (
+            "POST",
+            "/api/dashboard/hierarchies".to_owned(),
+            Some(hierarchy),
+        ),
+        (
+            "POST",
+            "/api/dashboard/specs".to_owned(),
+            Some(chart.clone()),
+        ),
+        (
+            "POST",
+            "/api/dashboard/specs/preview".to_owned(),
+            Some(chart),
+        ),
+    ]
+}
+
+/// S4-b: each place that takes a SQL source's id from the caller answers a
+/// source in a folder they cannot see exactly as it answers an unknown id, and
+/// answers a person who may see the folder normally.
+#[tokio::test]
+async fn every_path_that_names_a_sql_source_hides_one_in_a_restricted_folder() {
+    let (router, pool, _ch) = app().await;
+    let power = "dashboard:read, dashboard:write, metric:write";
+    let listed = create_principal_with_permissions(&pool, power).await;
+    let unlisted = create_principal_with_permissions(&pool, power).await;
+    replace_item(
+        &pool,
+        "folder",
+        "f1",
+        &[rule_for(listed, "manage")],
+        true,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let cookie = session_cookie_for_user(&pool, unlisted).await;
+    let listed_cookie = session_cookie_for_user(&pool, listed).await;
+    for n in 0..source_calls("s_secret").len() {
+        let (method, path, body) = source_calls("s_secret").swap_remove(n);
+        let hidden = send(&router, &cookie, method, &path, body).await;
+        let (method, path, body) = source_calls("s_nope").swap_remove(n);
+        let unknown = send(&router, &cookie, method, &path, body).await;
+        assert!(hidden.0.is_client_error(), "path {n}: {hidden:?}");
+        assert_eq!(
+            without_id(&hidden, "s_secret"),
+            without_id(&unknown, "s_nope"),
+            "path {n} ({method} {path}): a hidden source and an unknown one answer alike"
+        );
+        // The listed person gets past the source check (what follows is the
+        // stand-in store's business).
+        let (method, path, body) = source_calls("s_secret").swap_remove(n);
+        let seen = send(&router, &listed_cookie, method, &path, body).await;
+        assert!(
+            !(seen.0 == StatusCode::NOT_FOUND && seen.1.to_string().contains("s_secret")),
+            "path {n}: a person who may see the folder is not told it is unknown: {seen:?}"
+        );
+    }
+    // A source at the root stays reachable for everyone entitled.
+    let (status, _) = get(&router, &cookie, "/api/dashboard/calc-fields?source=s_root").await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+/// S4-b, the assistant: `list_calculated_fields` and `validate_formula` answer
+/// a hidden source as an unknown one.
+#[tokio::test]
+async fn the_assistant_does_not_resolve_a_hidden_sql_source_either() {
+    let (router, pool, _ch) = app().await;
+    restricted_folder(&pool).await;
+    let outsider =
+        create_principal_with_permissions(&pool, "dashboard:read, dashboard:write").await;
+    let cookie = session_cookie_for_user(&pool, outsider).await;
+    for (tool, args) in [
+        ("list_calculated_fields", json!({ "sqlSource": "{}" })),
+        (
+            "validate_formula",
+            json!({ "sqlSource": "{}", "name": "x", "formula": "[n] * 2" }),
+        ),
+        (
+            "create_chart",
+            json!({ "title": "T", "kind": "bar", "sqlSource": "{}", "dimension": "n",
+                    "measures": ["n"], "aggregate": "sum", "board": "b1", "confirmed": true }),
+        ),
+    ] {
+        let ask = |id: &str| {
+            let args: Value = serde_json::from_str(&args.to_string().replace("{}", id)).unwrap();
+            let router = router.clone();
+            let cookie = cookie.clone();
+            async move {
+                send(
+                    &router,
+                    &cookie,
+                    "POST",
+                    "/api/ai/tool",
+                    Some(json!({ "tool": tool, "args": args, "mode": "build" })),
+                )
+                .await
+            }
+        };
+        let hidden = ask("s_secret").await;
+        let unknown = ask("s_nope").await;
+        assert_eq!(
+            without_id(&hidden, "s_secret"),
+            without_id(&unknown, "s_nope"),
+            "{tool}"
+        );
+        assert!(
+            !hidden.1.to_string().contains("SELECT 1"),
+            "{tool}: {hidden:?}"
+        );
+    }
+}
+
+/// Re-review (pre-existing since R5): a folder holding a restricted sub-folder
+/// the caller cannot see is not empty. The count of subfolders goes through
+/// `Viewer::system()`, so the manager of the parent is told 409 instead of
+/// deleting it and orphaning the child.
+#[tokio::test]
+async fn a_folder_holding_a_hidden_restricted_subfolder_is_not_deleted() {
+    let (router, pool, _ch) = app().await;
+    let manager = create_principal_with_permissions(&pool, "dashboard:read").await;
+    replace_item(
+        &pool,
+        "folder",
+        "f5",
+        &[rule_for(manager, "manage")],
+        true,
+        None,
+    )
+    .await
+    .unwrap();
+    // `f4` (its child) is restricted to nobody in particular.
+    replace_item(&pool, "folder", "f4", &[], true, None)
+        .await
+        .unwrap();
+    let cookie = session_cookie_for_user(&pool, manager).await;
+    let (status, body) = send(
+        &router,
+        &cookie,
+        "DELETE",
+        "/api/dashboard/folders?id=f5",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body.to_string().contains("1 subfolder"), "{body}");
+    assert!(
+        lakehouse_store::dashboard_access::restriction_for_item(&pool, "folder", "f5")
+            .await
+            .unwrap()
+            .is_some(),
+        "the refused delete took nothing away"
+    );
+}
+
+/// B2-2 (re-review): a dashboard whose folder is gone comes back at the root,
+/// so restoring it needs `edit` there, on top of `manage` on the dashboard.
+#[tokio::test]
+async fn restoring_a_dashboard_whose_folder_is_gone_needs_edit_at_the_root() {
+    let (router, pool, _ch) = app().await;
+    // Manage on the dashboard through a rule, with only a view-level starting
+    // point and no write permission: not allowed to file anything at the root.
+    let rule_manager = create_principal_with_permissions(&pool, "dashboard:read").await;
+    replace_item(
+        &pool,
+        "board",
+        "b_orphan",
+        &[rule_for(rule_manager, "manage")],
+        false,
+        None,
+    )
+    .await
+    .unwrap();
+    let cookie = session_cookie_for_user(&pool, rule_manager).await;
+    let (status, body) = send(
+        &router,
+        &cookie,
+        "POST",
+        "/api/dashboard/trash/restore",
+        Some(json!({ "kind": "board", "id": "b_orphan" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    // Edit at the root (the starting point of a writer) lets it through the
+    // level checks.
+    let writer = create_principal_with_permissions(&pool, "dashboard:read, dashboard:write").await;
+    let cookie = session_cookie_for_user(&pool, writer).await;
+    let (status, body) = send(
+        &router,
+        &cookie,
+        "POST",
+        "/api/dashboard/trash/restore",
+        Some(json!({ "kind": "board", "id": "b_orphan" })),
+    )
+    .await;
+    assert!(passed(status), "{status} {body}");
 }
