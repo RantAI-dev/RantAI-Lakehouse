@@ -1241,10 +1241,18 @@ async fn the_assistants_chart_tools_need_edit_on_a_restricted_dashboard() {
 async fn a_sql_source_in_a_restricted_folder_follows_the_folder() {
     let (router, pool, _ch) = app().await;
     let listed = create_principal_with_permissions(&pool, "dashboard:read, dashboard:write").await;
-    let unlisted = create_principal_with_permissions(&pool, "dashboard:read, dashboard:write").await;
-    replace_item(&pool, "folder", "f1", &[rule_for(listed, "view")], true, None)
-        .await
-        .unwrap();
+    let unlisted =
+        create_principal_with_permissions(&pool, "dashboard:read, dashboard:write").await;
+    replace_item(
+        &pool,
+        "folder",
+        "f1",
+        &[rule_for(listed, "view")],
+        true,
+        None,
+    )
+    .await
+    .unwrap();
     let ids = |body: &Value| -> Vec<String> {
         body["sources"]
             .as_array()
@@ -1258,8 +1266,22 @@ async fn a_sql_source_in_a_restricted_folder_follows_the_folder() {
     let (status, body) = get(&router, &cookie, "/api/dashboard/sources").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(ids(&body), ["s_root"], "{body}");
-    let unknown = send(&router, &cookie, "GET", "/api/dashboard/fields?source=s_nope", None).await;
-    let hidden = send(&router, &cookie, "GET", "/api/dashboard/fields?source=s_secret", None).await;
+    let unknown = send(
+        &router,
+        &cookie,
+        "GET",
+        "/api/dashboard/fields?source=s_nope",
+        None,
+    )
+    .await;
+    let hidden = send(
+        &router,
+        &cookie,
+        "GET",
+        "/api/dashboard/fields?source=s_secret",
+        None,
+    )
+    .await;
     assert_eq!(hidden.0, StatusCode::NOT_FOUND, "{hidden:?}");
     assert_eq!(hidden.0, unknown.0);
     let change = send(
@@ -1271,7 +1293,14 @@ async fn a_sql_source_in_a_restricted_folder_follows_the_folder() {
     )
     .await;
     assert_eq!(change.0, StatusCode::NOT_FOUND, "{change:?}");
-    let gone = send(&router, &cookie, "DELETE", "/api/dashboard/sources?id=s_secret", None).await;
+    let gone = send(
+        &router,
+        &cookie,
+        "DELETE",
+        "/api/dashboard/sources?id=s_secret",
+        None,
+    )
+    .await;
     assert_eq!(gone.0, StatusCode::NOT_FOUND, "{gone:?}");
 
     let cookie = session_cookie_for_user(&pool, listed).await;
