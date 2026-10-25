@@ -1014,6 +1014,59 @@ mod tests {
         assert!(!used.charts.contains(&HIDDEN_USE.to_owned()));
     }
 
+    /// `BI-19` B1 review R3 (test owed, B2 review S5): a chart on a dashboard the
+    /// caller's rules leave out (a restriction, not a personal space) blocks the
+    /// delete without being named, listed or counted among the dashboards.
+    #[tokio::test]
+    async fn a_chart_on_a_restricted_dashboard_blocks_a_delete_without_being_named() {
+        use lakehouse_bi::access::{AccessMap, BoardPlacement, ItemKind, Level};
+        let server = MockServer::start().await;
+        answer(
+            &server,
+            &["FROM console.bi_chart FINAL", "NOT IN ('b_secret')"],
+            vec![chart("c_public", "b_public")],
+        )
+        .await;
+        answer(
+            &server,
+            &["FROM console.bi_chart FINAL"],
+            vec![chart("c_public", "b_public"), chart("c_secret", "b_secret")],
+        )
+        .await;
+        answer(&server, &["FROM console.bi_board FINAL"], vec![]).await;
+        let ch =
+            lakehouse_clickhouse::ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let placements = [BoardPlacement {
+            id: "b_secret".to_owned(),
+            folder_id: String::new(),
+            owner_id: String::new(),
+        }];
+        let viewer = AccessMap::new(
+            "u_me",
+            false,
+            Some(Level::View),
+            &[],
+            &[],
+            &[(ItemKind::Board, "b_secret".to_owned())],
+        )
+        .viewer(&placements)
+        .unwrap();
+        let pick = |charts: &[lakehouse_bi::store::StoredChartSpec]| -> Vec<String> {
+            charts.iter().map(|c| c.spec.id.clone()).collect()
+        };
+
+        let used = usage_of(&ch, pick, Vec::new(), &viewer).await.unwrap();
+        assert!(!used.is_empty(), "the delete is still blocked");
+        assert_eq!(used.chart_rows.len(), 1, "only the visible chart is listed");
+        assert!(
+            used.charts.contains(&HIDDEN_USE.to_owned()),
+            "{:?}",
+            used.charts
+        );
+        assert!(!used.sentence().contains("c_secret"), "{}", used.sentence());
+        assert!(!used.sentence().contains("b_secret"), "{}", used.sentence());
+    }
+
     /// BI-2 (T3): a metric watched by an alert rule cannot be deleted, and the
     /// refusal names the rule.
     #[test]

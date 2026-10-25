@@ -36,7 +36,7 @@ const BOARDS: [(&str, &str, &str); 4] = [
 ];
 
 /// The folders the stand-in holds: `(id, name)`, both at the top level.
-const FOLDERS: [(&str, &str); 2] = [("f1", "Secret"), ("f2", "Open")];
+const FOLDERS: [(&str, &str); 3] = [("f1", "Secret"), ("f2", "Open"), ("f3", "Empty")];
 
 /// A dashboard in the trash: `(id, folder)`. It shows only in the placements
 /// and the row-state lookups, as in the real store.
@@ -61,6 +61,25 @@ fn listed(sql: &str, marker: &str) -> Option<Vec<String>> {
             .map(|s| s.trim().trim_matches('\'').to_owned())
             .collect(),
     )
+}
+
+/// Every id listed after each occurrence of `marker` in `sql`.
+fn all_lists(sql: &str, marker: &str) -> Vec<Vec<String>> {
+    sql.match_indices(marker)
+        .filter_map(|(at, _)| listed(&sql[at..], marker))
+        .collect()
+}
+
+/// A chart statement keeps a chart of `board` when the viewer's fragments allow
+/// its board (`AND board IN (...)`, `AND board NOT IN (...)`, `AND 1 = 0`).
+fn chart_allowed(sql: &str, board: &str) -> bool {
+    !sql.contains("AND 1 = 0")
+        && all_lists(sql, "AND board IN (")
+            .iter()
+            .all(|l| l.iter().any(|i| i == board))
+        && !all_lists(sql, "AND board NOT IN (")
+            .iter()
+            .any(|l| l.iter().any(|i| i == board))
 }
 
 /// The SQL sources the stand-in holds: `(id, folder)`.
@@ -122,6 +141,24 @@ impl Respond for Store {
                 .chain(TRASHED.iter().map(|(id, _)| (*id, 2, "")))
                 .filter(|(id, _, _)| *id == wanted)
                 .map(|(_, state, owner)| json!({ "is_deleted": state, "owner_id": owner }))
+                .collect()
+        } else if sql.contains("SELECT id, spec_json, board, created_by") {
+            // `list_stored_charts`: a chart per dashboard, filtered by the viewer's fragments.
+            CHARTS
+                .iter()
+                .filter(|(_, state, _)| *state == 0)
+                .filter(|(_, _, board)| chart_allowed(&sql, board))
+                .map(|(id, _, board)| {
+                    let spec = json!({
+                        "id": id, "title": format!("Chart {id}"), "kind": "bar", "mart": "mart_x",
+                        "sql": "SELECT 1", "x": "region", "y": "email"
+                    });
+                    json!({
+                        "id": id, "board": board, "created_by": "ui",
+                        "created_at": "2026-01-01 00:00:00",
+                        "spec_json": json!({ "spec": spec, "def": null, "hasYear": false }).to_string(),
+                    })
+                })
                 .collect()
         } else if sql.contains("FROM console.bi_source FINAL") {
             let wanted = state_lookup(&sql, "AND id = '");
@@ -1308,4 +1345,251 @@ async fn a_sql_source_in_a_restricted_folder_follows_the_folder() {
     assert_eq!(ids(&body), ["s_root", "s_secret"], "{body}");
     let (status, _) = get(&router, &cookie, "/api/dashboard/fields?source=s_secret").await;
     assert_eq!(status, StatusCode::OK);
+}
+
+// ── BI-19 B2 review S5/S6: the leak tests and the positive cases ───────────
+
+fn chart_ids(body: &Value, key: &str) -> Vec<String> {
+    body[key]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|c| c["id"].as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// R10 (specs) and S6 (`list_charts`): an unlisted person is not shown the chart
+/// of a restricted dashboard, by the console's list or by the assistant's; a
+/// rule-only person on `b1` sees `c1` and nothing else.
+#[tokio::test]
+async fn the_chart_lists_leave_out_a_restricted_dashboards_charts() {
+    let (router, pool, _ch) = app().await;
+    restricted_folder(&pool).await;
+    let outsider = create_principal_with_permissions(&pool, "dashboard:read").await;
+    let rule_only = create_principal_with_permissions(&pool, "query:read").await;
+    replace_item(
+        &pool,
+        "board",
+        "b1",
+        &[rule_for(rule_only, "view")],
+        false,
+        None,
+    )
+    .await
+    .unwrap();
+
+    for (who, expect) in [(outsider, vec!["c1", "c2"]), (rule_only, vec!["c1"])] {
+        let cookie = session_cookie_for_user(&pool, who).await;
+        let (status, specs) = get(&router, &cookie, "/api/dashboard/specs").await;
+        assert_eq!(status, StatusCode::OK, "{specs}");
+        let got = chart_ids(&specs, "specs");
+        assert_eq!(got, expect, "specs: {specs}");
+        let (status, tool) = send(
+            &router,
+            &cookie,
+            "POST",
+            "/api/ai/tool",
+            Some(json!({ "tool": "list_charts", "args": {}, "mode": "ask" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{tool}");
+        let text = tool["result"].to_string();
+        assert!(!text.contains("c_secret"), "{text}");
+        for id in &expect {
+            assert!(text.contains(id), "{id} missing from {text}");
+        }
+    }
+}
+
+/// S6: `records?chart=` for a rule-only person is a 404 for a chart on a
+/// dashboard they were not given, and passes the access check for the chart on
+/// the dashboard they were (whatever the stand-in store makes of the read).
+#[tokio::test]
+async fn records_of_a_chart_need_a_dashboard_the_person_was_given() {
+    let (router, pool, _ch) = app().await;
+    let rule_only = create_principal_with_permissions(&pool, "query:read").await;
+    replace_item(
+        &pool,
+        "board",
+        "b1",
+        &[rule_for(rule_only, "view")],
+        false,
+        None,
+    )
+    .await
+    .unwrap();
+    let cookie = session_cookie_for_user(&pool, rule_only).await;
+    let hidden = get(&router, &cookie, "/api/dashboard/records?chart=c2").await;
+    let unknown = get(&router, &cookie, "/api/dashboard/records?chart=c_nope").await;
+    assert_eq!(hidden.0, StatusCode::NOT_FOUND, "{hidden:?}");
+    assert_eq!(hidden, unknown);
+    let given = get(&router, &cookie, "/api/dashboard/records?chart=c1").await;
+    assert!(passed(given.0), "{given:?}");
+}
+
+/// R10 (versions, favourites): a restricted dashboard answers like one
+/// that does not exist, to somebody the rules leave out.
+#[tokio::test]
+async fn versions_and_favourites_of_a_restricted_dashboard_read_as_unknown() {
+    let (router, pool, _ch) = app().await;
+    restricted_folder(&pool).await;
+    let outsider = create_principal_with_permissions(&pool, "dashboard:read").await;
+    let cookie = session_cookie_for_user(&pool, outsider).await;
+    for (method, uri, body) in [
+        ("GET", "/api/dashboard/versions?board={}", None),
+        (
+            "PUT",
+            "/api/dashboard/favourites",
+            Some(json!({ "kind": "board", "id": "{}", "on": true })),
+        ),
+    ] {
+        let fill = |id: &str| {
+            (
+                uri.replace("{}", id),
+                body.as_ref().map(|b: &Value| {
+                    serde_json::from_str::<Value>(&b.to_string().replace("{}", id)).unwrap()
+                }),
+            )
+        };
+        let (hidden_uri, hidden_body) = fill("b_secret");
+        let (nope_uri, nope_body) = fill("nope");
+        let hidden = send(&router, &cookie, method, &hidden_uri, hidden_body).await;
+        let unknown = send(&router, &cookie, method, &nope_uri, nope_body).await;
+        assert!(hidden.0.is_client_error(), "{method} {uri}: {hidden:?}");
+        assert_eq!(hidden, unknown, "{method} {uri}");
+    }
+}
+
+/// R10 (trash, search): the statements an unlisted person's trash list and
+/// search send carry the viewer's exclusion of the restricted dashboard, and a
+/// listed person's do not.
+#[tokio::test]
+async fn trash_and_search_statements_exclude_a_restricted_dashboard_for_the_unlisted() {
+    let (router, pool, ch) = app().await;
+    let listed = create_principal_with_permissions(&pool, "dashboard:read").await;
+    let outsider = create_principal_with_permissions(&pool, "dashboard:read").await;
+    replace_item(
+        &pool,
+        "folder",
+        "f1",
+        &[rule_for(listed, "view")],
+        true,
+        None,
+    )
+    .await
+    .unwrap();
+    let excluded = |statements: &[String], needle: &str| {
+        statements
+            .iter()
+            .filter(|s| s.contains(needle))
+            .any(|s| s.contains("NOT IN ('b_secret')"))
+    };
+    for (who, hides) in [(outsider, true), (listed, false)] {
+        let cookie = session_cookie_for_user(&pool, who).await;
+        ch.reset().await;
+        Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(Store)
+            .mount(&ch)
+            .await;
+        for uri in ["/api/dashboard/trash", "/api/dashboard/search?q=a"] {
+            let (status, body) = get(&router, &cookie, uri).await;
+            assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        }
+        let statements: Vec<String> = ch
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+        for table in [
+            "FROM console.bi_board FINAL WHERE is_deleted = 2",
+            "FROM console.bi_board FINAL WHERE is_deleted = 0",
+        ] {
+            assert_eq!(
+                excluded(&statements, table),
+                hides,
+                "{table}: {statements:?}"
+            );
+        }
+    }
+}
+
+/// R8: deleting an (empty) folder takes its rules and its mark with it, so a
+/// later folder cannot inherit them through a reused id.
+#[tokio::test]
+async fn deleting_a_restricted_folder_takes_its_rules_and_mark_with_it() {
+    let (router, pool, _ch) = app().await;
+    let manager = create_principal_with_permissions(&pool, "dashboard:read").await;
+    replace_item(
+        &pool,
+        "folder",
+        "f3",
+        &[rule_for(manager, "manage")],
+        true,
+        None,
+    )
+    .await
+    .unwrap();
+    let cookie = session_cookie_for_user(&pool, manager).await;
+    let (status, body) = send(
+        &router,
+        &cookie,
+        "DELETE",
+        "/api/dashboard/folders?id=f3",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let marks = lakehouse_store::dashboard_access::all_restrictions(&pool)
+        .await
+        .unwrap();
+    assert!(marks.iter().all(|m| m.item_id != "f3"), "{marks:?}");
+    let rules = lakehouse_store::dashboard_access::rules_for_item(&pool, "folder", "f3")
+        .await
+        .unwrap();
+    assert!(rules.is_empty(), "{rules:?}");
+}
+
+/// R10 (export): the dashboard-as-code file is the caller's view of the
+/// dashboards, so the restricted dashboard and its chart are not in an
+/// unlisted person's file, and are in a listed person's.
+#[tokio::test]
+async fn the_export_file_leaves_out_a_restricted_dashboard_for_the_unlisted() {
+    let (router, pool, _ch) = app().await;
+    let listed = create_principal_with_permissions(&pool, "dashboard:read").await;
+    let outsider = create_principal_with_permissions(&pool, "dashboard:read").await;
+    replace_item(
+        &pool,
+        "folder",
+        "f1",
+        &[rule_for(listed, "view")],
+        true,
+        None,
+    )
+    .await
+    .unwrap();
+    for (who, sees) in [(outsider, false), (listed, true)] {
+        let cookie = session_cookie_for_user(&pool, who).await;
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/dashboard/export")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        assert!(text.contains("b1"), "{text}");
+        assert_eq!(text.contains("b_secret"), sees, "{text}");
+        assert_eq!(text.contains("c_secret"), sees, "{text}");
+    }
 }
