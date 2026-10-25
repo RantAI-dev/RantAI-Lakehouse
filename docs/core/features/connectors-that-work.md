@@ -68,6 +68,8 @@ All seven defaults signed by the product owner on 2026-10-08 ("run everything as
 
 - Oracle, MongoDB, Kafka and SFTP connectors cannot be tested from the
   console. A wrong credential shows on the first load, not on save.
+- A MongoDB source must run MongoDB 4.4 or later: the driver (`pymongo`
+  4.18, `SEC-52`) no longer supports 4.0 and 4.2.
 - An object-storage connector is tested only when it has an endpoint.
 - Google Sheets is not available.
 - Business-app connectors (`SRC-3`): the eight supported types are tested
