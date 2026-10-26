@@ -46,6 +46,14 @@ pub const MAX_BYTES: usize = 1_000_000;
 /// The most charts a file may hold (plan D14).
 pub const MAX_CHARTS: usize = 200;
 
+/// The most tables a file may list. The preview asks the database about each
+/// one, so the list is bounded (`BI-19` D review SF-D3); 200 charts cannot
+/// usefully read more.
+pub const MAX_TABLES: usize = 200;
+
+/// The most column names a file may list for one table (`BI-19` D review SF-D3).
+pub const MAX_COLUMNS: usize = 1000;
+
 /// The longest file-local chart id; ids are names inside the file only.
 const MAX_ID_CHARS: usize = 64;
 
@@ -142,6 +150,9 @@ pub enum FileError {
     /// Two charts share an id, an id is empty or too long, or the layout names
     /// a chart that is not in the file.
     BadChartIds,
+    /// A table listed twice, more than [`MAX_TABLES`] tables, or more than
+    /// [`MAX_COLUMNS`] columns for one (`BI-19` D review SF-D3).
+    BadTables,
 }
 
 impl FileError {
@@ -155,6 +166,7 @@ impl FileError {
             Self::WrongKind => "That is not a dashboard file from this product.",
             Self::UnknownVersion => "That dashboard file is from a version this one cannot read.",
             Self::BadChartIds => "That dashboard file names its charts inconsistently.",
+            Self::BadTables => "That dashboard file lists its tables inconsistently or too many.",
         }
     }
 }
@@ -199,6 +211,17 @@ pub fn parse(raw: Value, size: usize) -> Result<DashboardFile, FileError> {
         {
             return Err(FileError::BadChartIds);
         }
+    }
+    // BI-19 D review SF-D3: the preview runs one schema query per listed table,
+    // so the list is bounded and has no repeats.
+    let mut tables = BTreeSet::new();
+    if file.tables.len() > MAX_TABLES
+        || file
+            .tables
+            .iter()
+            .any(|t| t.columns.len() > MAX_COLUMNS || !tables.insert(t.name.as_str()))
+    {
+        return Err(FileError::BadTables);
     }
     let names_a_stranger = file
         .board
@@ -431,6 +454,25 @@ mod tests {
             parse(json!([1]), 10).unwrap_err(),
             FileError::NotADashboardFile
         );
+    }
+
+    /// BI-19 D review SF-D3: a table listed twice, too many tables, or too many
+    /// columns is refused before anything is asked of the database.
+    #[test]
+    fn a_file_with_a_repeated_or_too_long_table_list_is_refused() {
+        let mut twice = file_json();
+        twice["tables"] = json!([{"name": "mart_a"}, {"name": "mart_a"}]);
+        assert_eq!(parse(twice, 1000).unwrap_err(), FileError::BadTables);
+        let mut many = file_json();
+        many["tables"] = json!(
+            (0..=MAX_TABLES)
+                .map(|i| json!({"name": format!("t{i}")}))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(parse(many, 1000).unwrap_err(), FileError::BadTables);
+        let mut wide = file_json();
+        wide["tables"] = json!([{"name": "mart_a", "columns": (0..=MAX_COLUMNS).map(|i| format!("c{i}")).collect::<Vec<_>>()}]);
+        assert_eq!(parse(wide, 1000).unwrap_err(), FileError::BadTables);
     }
 
     /// The file cannot carry what only the importer may decide: an owner, a

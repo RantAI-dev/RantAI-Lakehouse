@@ -75,6 +75,25 @@ const PDF_FAILED: Context = Context::new(
     "The PDF could not be made.",
 );
 
+/// The image's own sentences (`BI-19` D review SF-D4): the same failures as the
+/// PDF's, worded for a chart image.
+const IMAGE_BUSY: &str = "Too many images are being made right now; try again in a minute.";
+const IMAGE_TIMEOUT: Context = Context::new(
+    "image render timeout",
+    "The image took too long to make.",
+    "The image took too long to make.",
+);
+const IMAGE_UNREACHABLE: Context = Context::new(
+    "image render unreachable",
+    "The image service is not reachable.",
+    "The image service is not reachable.",
+);
+const IMAGE_FAILED: Context = Context::new(
+    "image render failed",
+    "The image could not be made.",
+    "The image could not be made.",
+);
+
 /// The query of `GET /api/dashboard/export/pdf`: the board and the paper, and
 /// the filter, parameter and grain text exactly as `GET /api/dashboard` takes
 /// them (the console sends the same strings it loaded the page with).
@@ -100,6 +119,17 @@ pub(crate) fn pdf_failure(err: &PdfError) -> ApiError {
         PdfError::Timeout => &PDF_TIMEOUT,
         PdfError::Unreachable(_) => &PDF_UNREACHABLE,
         PdfError::Refused(_) | PdfError::NotAPdf | PdfError::NotAnImage => &PDF_FAILED,
+    };
+    upstream_error::report(ctx, upstream_error::Class::Failed, err)
+        .into_api_error(FailedAs::ServiceUnavailable)
+}
+
+/// [`pdf_failure`] for a chart image (`BI-19` D review SF-D4).
+fn image_failure(err: &PdfError) -> ApiError {
+    let ctx = match err {
+        PdfError::Timeout => &IMAGE_TIMEOUT,
+        PdfError::Unreachable(_) => &IMAGE_UNREACHABLE,
+        PdfError::Refused(_) | PdfError::NotAPdf | PdfError::NotAnImage => &IMAGE_FAILED,
     };
     upstream_error::report(ctx, upstream_error::Class::Failed, err)
         .into_api_error(FailedAs::ServiceUnavailable)
@@ -474,7 +504,8 @@ pub(crate) async fn export_chart_png(
     .await
     .map_err(|failure| match failure {
         PdfFailure::NotSetUp => ApiError::Unavailable(IMAGES_NOT_SET_UP.to_owned()),
-        other => other.into_api_error(),
+        PdfFailure::Busy => ApiError::Unavailable(IMAGE_BUSY.to_owned()),
+        PdfFailure::Conversion(err) => image_failure(&err),
     })?;
 
     record_download_audit(
@@ -540,5 +571,25 @@ mod tests {
             assert!(text.contains("Reference:"), "{text}");
             assert!(!text.contains("gotenberg:3000"), "{text}");
         }
+    }
+
+    /// `BI-19` D review SF-D4: an image failure never says "PDF".
+    #[test]
+    fn an_image_failure_says_image_and_never_pdf() {
+        for err in [
+            PdfError::Timeout,
+            PdfError::Unreachable("http://gotenberg:3000 refused".to_owned()),
+            PdfError::Refused(500),
+            PdfError::NotAPdf,
+            PdfError::NotAnImage,
+        ] {
+            let text = image_failure(&err).to_string();
+            assert!(text.contains("image"), "{text}");
+            assert!(
+                !text.contains("PDF") && !text.contains("gotenberg:3000"),
+                "{text}"
+            );
+        }
+        assert!(!IMAGE_BUSY.contains("PDF"));
     }
 }

@@ -1708,11 +1708,49 @@ async fn the_dashboard_file_of_a_restricted_dashboard_is_a_404_like_an_unknown_o
         "/api/dashboard/export?format=file&board=b_secret",
     )
     .await;
-    assert_ne!(
-        status,
-        StatusCode::NOT_FOUND,
-        "a listed person is not told 404"
-    );
+    // BI-19 D review SF-D5: the listed person gets the file itself, not just
+    // "not a 404" (which a 500 or a 403 would satisfy too).
+    assert_eq!(status, StatusCode::OK, "a listed person gets the file");
+    let (_, file) = get(
+        &router,
+        &cookie,
+        "/api/dashboard/export?format=file&board=b_secret",
+    )
+    .await;
+    assert_eq!(file["kind"], "rantai-dashboard");
+}
+
+/// `BI-19` D review SF-D6: an import into a folder the person can only view is
+/// a 403.
+#[tokio::test]
+async fn an_import_into_a_folder_the_person_can_only_view_is_forbidden() {
+    let (router, pool, _ch) = app().await;
+    let user = create_principal_with_permissions(&pool, "dashboard:read, dashboard:write").await;
+    replace_item(&pool, "folder", "f1", &[rule_for(user, "view")], true, None)
+        .await
+        .unwrap();
+    let cookie = session_cookie_for_user(&pool, user).await;
+    let file = json!({
+        "kind": "rantai-dashboard", "version": 1,
+        "board": { "name": "X", "description": "", "filters": [], "tabs": [], "layout": {}, "phoneLayout": [] },
+        "charts": [], "tables": []
+    });
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/dashboard/import")
+                .header("cookie", cookie)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "file": file, "folderId": "f1" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
 
 // ── BI-19 B2 re-review: S4-b (every by-id source path), folder delete, restore ──

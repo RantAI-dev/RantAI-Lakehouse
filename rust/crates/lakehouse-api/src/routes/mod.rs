@@ -1547,6 +1547,16 @@ mod tests {
             route_timeout("/api/reports/subscriptions/0b7e"),
             DEFAULT_REQUEST_TIMEOUT
         );
+        // BI-19 D review SF-D6: an import runs up to 200 charts; its preview is
+        // one schema read per table and keeps the default.
+        assert_eq!(
+            route_timeout("/api/dashboard/import"),
+            EXPORT_REQUEST_TIMEOUT
+        );
+        assert_eq!(
+            route_timeout("/api/dashboard/import/preview"),
+            DEFAULT_REQUEST_TIMEOUT
+        );
     }
 
     /// `SRC-13` decision D9: the discovery routes carry a listing call of up to

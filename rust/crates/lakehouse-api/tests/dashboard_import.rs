@@ -30,6 +30,10 @@ const MARTS: [(&str, [&str; 3]); 3] = [
 #[derive(Clone)]
 struct Store {
     log: Arc<Mutex<Vec<String>>>,
+    /// Every `INSERT` into `bi_chart` fails (a store that cannot write).
+    fail_chart_insert: Arc<std::sync::atomic::AtomicBool>,
+    /// The SQL source `s_one` lives in a folder the importer cannot see.
+    hidden_source: Arc<std::sync::atomic::AtomicBool>,
 }
 
 fn quoted_after(sql: &str, marker: &str) -> Option<String> {
@@ -103,6 +107,22 @@ impl Respond for Store {
                     .collect(),
             );
         }
+        if sql.starts_with(
+            "INSERT INTO console.bi_chart (id, title, spec_json, board, created_by) VALUES",
+        ) && self
+            .fail_chart_insert
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return ResponseTemplate::new(500).set_body_string("planted-engine-text");
+        }
+        if sql.contains("FROM console.bi_source")
+            && self.hidden_source.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return rows(vec![json!({
+                "id": "s_one", "title": "One", "sql": "SELECT 1 AS region", "columns_json": "[]",
+                "folder_id": "f_hidden", "created_by": "t", "updated_at": "2026-01-01 00:00:00"
+            })]);
+        }
         if sql.starts_with("INSERT") || sql.starts_with("ALTER") || sql.starts_with("CREATE") {
             return ResponseTemplate::new(200).set_body_string("");
         }
@@ -136,14 +156,22 @@ struct App {
     router: axum::Router,
     pool: sqlx::PgPool,
     log: Arc<Mutex<Vec<String>>>,
+    fail_chart_insert: Arc<std::sync::atomic::AtomicBool>,
+    hidden_source: Arc<std::sync::atomic::AtomicBool>,
     _ch: MockServer,
 }
 
 async fn app() -> App {
     let log = Arc::new(Mutex::new(Vec::new()));
+    let fail_chart_insert = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let hidden_source = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let ch = MockServer::start().await;
     Mock::given(wiremock::matchers::method("POST"))
-        .respond_with(Store { log: log.clone() })
+        .respond_with(Store {
+            log: log.clone(),
+            fail_chart_insert: fail_chart_insert.clone(),
+            hidden_source: hidden_source.clone(),
+        })
         .mount(&ch)
         .await;
     let env = HashMap::from([("CH_URL".to_owned(), ch.uri())]);
@@ -152,6 +180,8 @@ async fn app() -> App {
         router,
         pool,
         log,
+        fail_chart_insert,
+        hidden_source,
         _ch: ch,
     }
 }
@@ -450,4 +480,150 @@ async fn a_person_who_can_only_read_cannot_import_and_an_unknown_board_has_no_fi
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// Whether the log holds the statement `wipe_board` sends for the board.
+fn board_was_wiped(app: &App) -> bool {
+    app.log.lock().unwrap().iter().any(|s| {
+        s.starts_with("INSERT INTO console.bi_board (id, name, owner_id, is_deleted) SELECT")
+    })
+}
+
+/// `BI-19` D review SF-D1: a store that cannot write is an error that takes the
+/// half-made board back, not a chart "left out" in a 200.
+#[tokio::test]
+async fn a_store_that_cannot_write_a_chart_fails_the_import_and_wipes_the_board() {
+    let app = app().await;
+    let cookie = writer(&app, "dashboard:read, dashboard:write").await;
+    let file = exported(&app, &cookie).await;
+    app.fail_chart_insert
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let (status, body) = send(
+        &app,
+        &cookie,
+        "POST",
+        "/api/dashboard/import",
+        Some(json!({ "file": file, "mapping": { "mart_a": "mart_a", "mart_b": "mart_b" } })),
+    )
+    .await;
+    assert_ne!(status, StatusCode::OK, "{body}");
+    assert!(!body.to_string().contains("planted-engine-text"), "{body}");
+    assert!(board_was_wiped(&app), "the half-made board is taken back");
+}
+
+/// `BI-19` D review SF-D2 (the wipe path): a dashboard setting the editor would
+/// not save (a theme that does not exist) is a 400 and the board is wiped.
+#[tokio::test]
+async fn a_file_with_a_theme_that_cannot_be_saved_is_refused_and_the_board_wiped() {
+    let app = app().await;
+    let cookie = writer(&app, "dashboard:read, dashboard:write").await;
+    let mut file = exported(&app, &cookie).await;
+    file["board"]["theme"] = json!("no-such-theme");
+    let (status, body) = send(
+        &app,
+        &cookie,
+        "POST",
+        "/api/dashboard/import",
+        Some(json!({ "file": file, "mapping": { "mart_a": "mart_a", "mart_b": "mart_b" } })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(board_was_wiped(&app));
+}
+
+/// `BI-19` D review SF-D3: a table listed twice is refused before the database
+/// is asked about any table.
+#[tokio::test]
+async fn a_file_listing_a_table_twice_is_refused_before_any_schema_query() {
+    let app = app().await;
+    let cookie = writer(&app, "dashboard:read, dashboard:write").await;
+    let mut file = exported(&app, &cookie).await;
+    file["tables"] = json!([{ "name": "mart_a" }, { "name": "mart_a" }]);
+    let before = app.log.lock().unwrap().len();
+    let (status, body) = send(
+        &app,
+        &cookie,
+        "POST",
+        "/api/dashboard/import/preview",
+        Some(json!({ "file": file })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        app.log.lock().unwrap()[before..]
+            .iter()
+            .all(|s| !s.contains("FROM system.columns")),
+        "no schema query for a refused file"
+    );
+}
+
+/// `BI-19` D review SF-D6: a chart over a SQL source in a folder the importer
+/// cannot see is left out as unavailable; a chart naming a table that is not in
+/// the file's `tables` is left out as not matched.
+#[tokio::test]
+async fn a_hidden_sql_source_and_an_unlisted_table_leave_their_charts_out_with_the_reason() {
+    let app = app().await;
+    let cookie = writer(&app, "dashboard:read, dashboard:write, dashboard:sql").await;
+    let mut file = exported(&app, &cookie).await;
+    file["charts"][1]["def"] = json!({
+        "title": "From SQL", "kind": "bar", "sqlSource": "s_one", "dimension": "region", "measures": ["email"]
+    });
+    file["tables"] = json!([{ "name": "mart_a", "columns": ["region", "email", "amount"] }]);
+    app.hidden_source
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    // The importer is not listed on `f_hidden`.
+    let other = create_principal_with_permissions(&app.pool, "dashboard:read").await;
+    lakehouse_store::dashboard_access::replace_item(
+        &app.pool,
+        "folder",
+        "f_hidden",
+        &[lakehouse_store::dashboard_access::NewRule {
+            user_id: Some(other),
+            role_id: None,
+            level: "view".to_owned(),
+        }],
+        true,
+        None,
+    )
+    .await
+    .unwrap();
+    let (status, result) = send(
+        &app,
+        &cookie,
+        "POST",
+        "/api/dashboard/import",
+        Some(json!({ "file": file, "mapping": { "mart_a": "mart_a" } })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    let reasons: Vec<&str> = result["leftOut"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|c| c["reason"].as_str())
+        .collect();
+    assert!(
+        reasons.contains(&"The SQL source it reads is not available here."),
+        "{result}"
+    );
+    assert_eq!(reasons.len(), 1, "{result}");
+    // A table that is not in the file's `tables` cannot be mapped, so the
+    // charts that read it are left out as not matched.
+    file["tables"] = json!([]);
+    let (_, result) = send(
+        &app,
+        &cookie,
+        "POST",
+        "/api/dashboard/import",
+        Some(json!({ "file": file, "mapping": { "mart_a": "mart_a" } })),
+    )
+    .await;
+    assert!(
+        result["leftOut"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| { c["reason"] == "Its table was not matched to a table here." }),
+        "{result}"
+    );
 }

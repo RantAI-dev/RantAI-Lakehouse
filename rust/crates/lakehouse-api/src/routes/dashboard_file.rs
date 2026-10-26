@@ -321,36 +321,51 @@ pub async fn import(
     .await
     .map_err(|err| classify_bi_error(&err))?;
 
-    match build(
-        &state,
-        &principal,
-        &scope.viewer,
-        &board.id,
-        (&document, &mapping),
-    )
-    .await
-    {
-        Ok(result) => {
-            snapshot(ch, &board.id, &principal).await;
-            let mut shown = board;
-            shown.folder_id = Some(folder_id);
-            Ok(ApiJson(json!({
-                "ok": true,
-                "board": shown,
-                "imported": result.made,
-                "leftOut": result.left_out,
-            })))
-        }
-        Err(err) => {
-            // The half-made dashboard is taken back; a cleanup that fails as
-            // well goes to the log under a reference, and the caller gets the
-            // error that stopped the import.
-            if let Err(cleanup) = store::wipe_board(ch, &board.id).await {
-                let _logged = upstream_error::report_ch(&upstream_error::DATABASE, &cleanup);
+    // BI-19 D review SF-D2: the build and the take-back run in a task of their
+    // own, which the handler awaits. A client that goes away mid-import drops
+    // this handler's future, not the task, so the half-made board is always
+    // either finished or wiped.
+    let task = tokio::spawn({
+        let (state, principal, viewer) = (state.clone(), principal.clone(), scope.viewer.clone());
+        let board_id = board.id.clone();
+        async move {
+            let built = build(
+                &state,
+                &principal,
+                &viewer,
+                &board_id,
+                (&document, &mapping),
+            )
+            .await;
+            match built {
+                Ok(result) => {
+                    snapshot(&state.clickhouse, &board_id, &principal).await;
+                    Ok(result)
+                }
+                Err(err) => {
+                    // The half-made dashboard is taken back; a cleanup that
+                    // fails as well goes to the log under a reference, and the
+                    // caller gets the error that stopped the import.
+                    if let Err(cleanup) = store::wipe_board(&state.clickhouse, &board_id).await {
+                        let _logged =
+                            upstream_error::report_ch(&upstream_error::DATABASE, &cleanup);
+                    }
+                    Err(err)
+                }
             }
-            Err(err.into())
         }
-    }
+    });
+    let result = task
+        .await
+        .map_err(|err| upstream_error::internal_error(&upstream_error::SERVICE, &err))??;
+    let mut shown = board;
+    shown.folder_id = Some(folder_id);
+    Ok(ApiJson(json!({
+        "ok": true,
+        "board": shown,
+        "imported": result.made,
+        "leftOut": result.left_out,
+    })))
 }
 
 struct Built {
@@ -439,13 +454,16 @@ async fn make_chart(
         Err(BiError::Validation(_)) => return Ok(Outcome::LeftOut(MISSING_PART)),
         Err(err) => return Err(classify_bi_error(&err)),
     };
-    match store::insert_chart(ch, &spec).await {
-        Ok(()) => Ok(Outcome::Made(spec.spec.id)),
-        Err(err) => {
-            // The statement did not run against the data here; the engine's
-            // text goes to the log under a reference.
-            let _logged = upstream_error::report_ch(&upstream_error::DATABASE, &err);
-            Ok(Outcome::LeftOut(QUERY_FAILED))
-        }
+    // BI-19 D review SF-D1: only the chart's own statement failing is "its query
+    // did not run here"; a store that cannot write stops the import (which then
+    // takes the board back) instead of reading as a chart left out.
+    if let Err(err) = store::smoke_test_chart(ch, &spec).await {
+        // The engine's text goes to the log under a reference.
+        let _logged = upstream_error::report_ch(&upstream_error::DATABASE, &err);
+        return Ok(Outcome::LeftOut(QUERY_FAILED));
     }
+    store::insert_chart_unchecked(ch, &spec)
+        .await
+        .map_err(|err| classify_ch_error(&err))?;
+    Ok(Outcome::Made(spec.spec.id))
 }

@@ -251,7 +251,7 @@ async fn without_the_renderer_settings_images_are_not_set_up_and_failures_are_fi
     .await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     let error = error_of(&body);
-    assert!(error.starts_with("The PDF could not be made."), "{error}");
+    assert!(error.starts_with("The image could not be made."), "{error}");
     assert!(!error.contains("chromium") && !error.contains("/srv"));
     let audited: i64 =
         sqlx::query_scalar("SELECT count(*) FROM audit_event WHERE action = 'dashboard.chart_png'")
