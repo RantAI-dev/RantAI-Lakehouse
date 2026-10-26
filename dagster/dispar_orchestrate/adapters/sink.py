@@ -809,6 +809,10 @@ def _apply_cursor(source: Any, cursor: str, mode: str = "incremental") -> None:
 # `DATA-18` flush size of a type-changing replace: the batches the job hands over are
 # gathered up to this many bytes, then written as data files inside the one transaction.
 RETYPE_FLUSH_BYTES = 64 * 1024 * 1024
+# The columns the sink itself adds and `dlt`'s own bookkeeping. They are not the load's
+# columns, and the table may or may not carry them: `_fit_batch` fills the `dlt` ones in
+# and drops the stamp when the table has no such column (`PR #186 review SHOULD-FIX 1`).
+SYSTEM_COLUMNS = ("_ingested_at", "_dlt_id", "_dlt_load_id")
 # Iceberg's own type names (`long`, `decimal(38, 9)`, `timestamptz`) as pyiceberg's types.
 _ICEBERG_TYPE: TypeAdapter[IcebergType] = TypeAdapter(IcebergType)
 
@@ -830,11 +834,16 @@ def _retype_in(transaction: Any, table: Any, changed: list[str], column_types: M
     """Stage, in `transaction`, the new type of each column in `changed`: the column is
     deleted and added again under the same name (Iceberg refuses `update_column` to a type
     that does not widen), then moved back to where it was, so the table keeps the file's
-    column order. Nothing is committed here."""
+    column order. A column the load writes and the table does not have yet is added as it
+    is (`PR #186 review SHOULD-FIX 1`: it was dropped, and the load reported success).
+    Nothing is committed here."""
     order = [field.name for field in table.schema().fields]
+    added = [name for name in column_types if name not in order]
     with transaction.update_schema() as update:
         for name in changed:
             update.delete_column(name)
+            update.add_column(name, _ICEBERG_TYPE.validate_python(column_types[name]))
+        for name in added:
             update.add_column(name, _ICEBERG_TYPE.validate_python(column_types[name]))
     with transaction.update_schema() as update:
         for name in changed:  # in the table's order, so the column before is already in place
@@ -862,8 +871,19 @@ def _fit_batch(batch: pa.Table, target: pa.Schema, load_id: str) -> pa.Table:
 
     # Errors
 
-    Raises `ValueError` for a required column of a name this function cannot fill, and
-    whatever the cast raises for a value that does not fit."""
+    Raises `ValueError` for a required column of a name this function cannot fill, for a
+    column of the load the table does not have (`PR #186 review SHOULD-FIX 1`: it was dropped
+    silently, and the load reported success), and whatever the cast raises for a value that
+    does not fit."""
+    extra = [
+        name
+        for name in batch.schema.names
+        if name not in target.names and name not in SYSTEM_COLUMNS
+    ]
+    if extra:
+        # The names are in the log, never in the message: the message is a fixed sentence.
+        logger.warning("the load has a column the table does not have: %s", ", ".join(sorted(extra)))
+        raise ValueError("the load has a column the table does not have")
     rows = batch.num_rows
     arrays = []
     for field in target:
