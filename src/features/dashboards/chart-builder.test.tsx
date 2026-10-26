@@ -480,6 +480,23 @@ describe("ChartBuilder Format section (BI-17 part A)", () => {
   })
 })
 
+describe("ChartBuilder freshness (BI-4 part B)", () => {
+  it("shows the chart's own rule, opening the fold it sits in, and refuses minutes out of range in a sentence", async () => {
+    renderBuilder({ ...barDef, cache: { mode: "minutes", minutes: 30 } })
+    const minutes = (await screen.findByLabelText("Freshness: minutes")) as HTMLInputElement
+    expect(minutes.value).toBe("30")
+    fireEvent.change(minutes, { target: { value: "5000" } })
+    expect((await screen.findByRole("alert")).textContent).toBe("Remember for between 1 minute and 24 hours (1 to 1440 minutes).")
+  })
+
+  it("offers 'Follow the default' to a chart with no rule of its own and no minutes box", async () => {
+    renderBuilder(barDef)
+    fireEvent.click(await screen.findByRole("button", { name: /More options/ }))
+    expect(await screen.findByLabelText("Freshness")).toBeTruthy()
+    expect(screen.queryByLabelText("Freshness: minutes")).toBeNull()
+  })
+})
+
 describe("ChartBuilder scatter (BI-17 B QA fix F2)", () => {
   it("asks for an X metric and a Y metric, and a size for a bubble chart", async () => {
     renderBuilder(barDef)

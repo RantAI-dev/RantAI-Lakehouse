@@ -8,6 +8,7 @@ import { downloadCsv, toCsv } from "@/lib/csv";
 import type { ChartRenderSpec } from "@/lib/dashboard-specs";
 import { RowsTable } from "@/components/patterns/rows-table";
 import type { FilterSkip } from "@/services/clients/bi-store";
+import type { TileLimit } from "@/services/contracts/settings";
 import { visibleColumns } from "@/lib/chart-shape";
 import { TileBody } from "./tile-body";
 import type { TileFailure } from "@/services/contracts/dashboards";
@@ -33,6 +34,16 @@ export type Rows = {
   grainSkipped?: string;
   /** More buckets existed than the chart's limit; the latest are shown (BI-9). A pivot: more cells than it may return, so the first are shown (BI-16). */
   truncated?: boolean;
+  /**
+  /**
+   * `BI-5` plan D6: set when the row limit cut this tile's result; the tile says "Showing the first N rows, the limit set by
+   * your administrator". Named `limitHit`, not `limit`, because `limit` above is already a raw table's page size; the plan's
+   * `limit` object is on a failed tile (`TileFailure.limit`). Not on the server yet: T2 must return it under this name or this changes.
+   */
+  limitHit?: TileLimit;
+  /** When the engine computed these rows (RFC 3339, UTC) and whether this answer came from memory (`BI-4` part B). */
+  computedAt?: string;
+  remembered?: boolean;
   /**
    * `gantt` (BI-16 part C1, plan D2): how many rows the statement left out because their end is before their start. The plan leaves the
    * shape of this count to T1; the tile reads it when present and says nothing when it is absent.

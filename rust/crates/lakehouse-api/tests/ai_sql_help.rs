@@ -355,6 +355,13 @@ async fn with_the_switch_off_a_direct_tool_call_is_refused_and_runs_nothing() {
 // above is untouched, because none of the six is in `ALWAYS` (five are writes,
 // and the read-only `set_board_view_filters` is routed in by the dashboard
 // domain's own word list, which the test's turn does not match).
+//
+// Updated by hand for `BI-5` review S9 (PR #245 CI): the Ask suffix now ends
+// with the `limits_and_freshness!` sentences (`get_query_limits`, `stop_query`,
+// `computedAt`), so a person in Ask mode can be told their limits. The new hash
+// is the old bytes plus exactly those sentences (hashing the prompt with that
+// text removed gives the previous pin f59505f7...). The AI team reviews the
+// sentences (Assistant parity).
 const OFFERED_WITHOUT_ALLOWLIST: &[&str] = &[
     "ask_user",
     "describe_dataset",
@@ -374,7 +381,7 @@ const OFFERED_WITHOUT_ALLOWLIST: &[&str] = &[
     "run_sql",
 ];
 const SYSTEM_SHA256_WITHOUT_ALLOWLIST: &str =
-    "f59505f7a7fff527cbb8a25e44b7a86b37f62868746c86f14881cddfcf5cfb68";
+    "45c0fcda7b755bbcb6eb7fa7bb48df1f724b6be61b5738546c55c41fabbe006b";
 
 fn sha256_hex(text: &str) -> String {
     use std::fmt::Write as _;

@@ -247,6 +247,7 @@ fn plain(message: impl Into<String>) -> Failure {
 fn failure_of(failure: SpecRunFailure) -> Failure {
     let value = match failure {
         SpecRunFailure::Refused(message) => json!({ "error": message }),
+        SpecRunFailure::Tile(answer) => answer,
         // SEC-11: the database's text goes to the log under the reference.
         SpecRunFailure::Clickhouse(err) => {
             upstream_error::report_ch(&upstream_error::TILE, &err).to_json()

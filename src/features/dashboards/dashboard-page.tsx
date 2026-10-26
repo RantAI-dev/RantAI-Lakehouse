@@ -3,7 +3,7 @@
 import * as React from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { useTheme } from "next-themes";
-import { ArrowRightLeft, ChartColumn, Download, GitFork, Heading, Maximize2, Minus, MousePointerClick, Move, Moon, Pencil, Plus, Smartphone, SlidersHorizontal, Sparkles, Table2, Trash2, Rows3 } from "lucide-react";
+import { ArrowRightLeft, ChartColumn, Download, GitFork, Heading, Maximize2, Minus, MousePointerClick, Move, Moon, Pencil, Plus, RefreshCw, Smartphone, SlidersHorizontal, Sparkles, Square, Table2, Trash2, Rows3 } from "lucide-react";
 import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog";
 import { PageHeader } from "@/components/patterns/page-header";
 import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@rantai/design-system/ui/empty";
@@ -35,7 +35,9 @@ import type { ChartClick, FilterDef, FilterField } from "@/services/clients/bi-s
 import { useAuth } from "@/features/auth/auth-provider";
 import { useCopilot } from "@/features/copilot/use-copilot";
 import { useService } from "@/hooks/use-service";
-import { dashboardService } from "@/services";
+import { dashboardService, queryService } from "@/services";
+import { newRunId, RUN_ID_HEADER } from "@/lib/run-id";
+import { STOPPED_SENTENCE } from "@/lib/query-limits";
 import { apiFetch } from "@/services/http";
 import { useAutoRefresh } from "./auto-refresh";
 import { BoardSwitcher } from "./board-switcher";
@@ -44,6 +46,8 @@ import { fmtInt } from "./chart-option";
 import { DashboardActionsMenu, EditLayoutButton, NewChartButton, RenameDashboardDialog } from "./dashboard-actions";
 import { chartWriteItems } from "./tile-write-items";
 import { ThemeFontDialog } from "./theme-font-dialog";
+import { FreshnessDialog } from "./freshness-dialog";
+import type { CacheRule } from "@/lib/result-cache";
 import { dashboardLook, type DashboardTheme } from "@/lib/dashboard-look";
 import { NOTE_KINDS, withNote } from "@/lib/style-draft";
 import { SHIPPED_FONT_IDS } from "@/lib/formatting-settings";
@@ -101,6 +105,9 @@ type Payload = {
   tabs?: BoardTab[]; phoneLayout?: PhoneTile[];
   /** The board's saved auto-refresh in seconds; 0 when none (BI-18·B). */
   refreshSeconds?: number;
+  /** BI-4 part B: the freshness rule in force for this board, and the board's own (absent follows the install). */
+  cacheRule?: CacheRule | null;
+  boardCacheRule?: CacheRule | null;
   /** The grain the board saved ("" when none), and the one this response used (BI-9). */
   grain?: string; appliedGrain?: string | null;
   /** The zone and first weekday the buckets were cut with (BI-9). */
@@ -213,6 +220,10 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   const [removeBusy, setRemoveBusy] = React.useState(false);
   const [renameOpen, setRenameOpen] = React.useState(false);
   const [themeOpen, setThemeOpen] = React.useState(false);
+  // BI-4 part B: the dashboard's own freshness rule, saved through the board write path.
+  const [freshOpen, setFreshOpen] = React.useState(false);
+  const [savingFresh, setSavingFresh] = React.useState(false);
+  const [freshError, setFreshError] = React.useState<string | null>(null);
   // BI-17: a note being pinned on a clicked point (edit mode), and the sentence when the save was refused.
   const [noteFor, setNoteFor] = React.useState<{ tileId: string; point: string } | null>(null);
   const [savingNote, setSavingNote] = React.useState(false);
@@ -258,9 +269,17 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   // old board's response (slower: it runs the built-in tiles) used to land
   // last and paint its charts under the new dashboard's name.
   const loadSeq = React.useRef(0);
-  const load = React.useCallback(async (): Promise<Payload | undefined> => {
+  // BI-5 (plan D5): the run in flight, so Stop can end its queries on the engine and abort the request.
+  const runRef = React.useRef<{ runId: string; controller: AbortController } | null>(null);
+  const [stopped, setStopped] = React.useState(false);
+  // `fresh` asks the server to compute instead of using what it remembers (BI-4 part B, feature
+  // decision 6): "1" for every tile (Refresh), or a chart id for "Refresh this tile". The automatic
+  // refresh and every other reload follow the rule and pass nothing.
+  const load = React.useCallback(async (fresh?: string): Promise<Payload | undefined> => {
     const seq = ++loadSeq.current;
-    setLoading(true); setError(null);
+    const run = { runId: newRunId(), controller: new AbortController() };
+    runRef.current = run;
+    setLoading(true); setError(null); setStopped(false);
     try {
       const q = new URLSearchParams({ board });
       // A parameter that is not a filter list is ignored: the saved default shows.
@@ -270,7 +289,8 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       if (grainAsked) q.set("grain", grainAsked);
       const paramsAsked = paramsQuery(pValues);
       if (paramsAsked) q.set("params", paramsAsked);
-      const res = await apiFetch(`/api/dashboard?${q.toString()}`, { cache: "no-store" });
+      if (fresh) q.set("fresh", fresh);
+      const res = await apiFetch(`/api/dashboard?${q.toString()}`, { cache: "no-store", headers: { [RUN_ID_HEADER]: run.runId }, signal: run.controller.signal });
       const json = (await res.json()) as Payload;
       if (seq !== loadSeq.current) return undefined;
       if (!res.ok) throw new Error((json as { error?: string }).error ?? "Failed to load dashboard");
@@ -280,12 +300,29 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       setPhone(json.phoneLayout);
       return json;
     } catch (e) {
+      // Stop is an answer, not an error: the tiles that were already on screen stay, and the page says "Stopped".
+      if (run.controller.signal.aborted) {
+        if (seq === loadSeq.current) setStopped(true);
+        return undefined;
+      }
       if (seq === loadSeq.current) setError(e instanceof Error ? e.message : String(e));
       return undefined;
     } finally {
       if (seq === loadSeq.current) setLoading(false);
     }
   }, [board, fParam, gChoice, pValues]);
+
+  /**
+   * Stop on a dashboard that is still loading (BI-5 decision 4): ask the server to end this
+   * run's queries on the engine, then abort the request. The cancel call is best effort (the
+   * route lands with T4 of the BI-5 plan; until then it answers 404): the abort always happens.
+   */
+  const stopLoading = React.useCallback(() => {
+    const run = runRef.current;
+    if (!run) return;
+    void queryService.cancel(run.runId).catch(() => undefined);
+    run.controller.abort();
+  }, []);
 
   // Switching dashboard starts in view mode; the switcher navigates without
   // `f`, so the new board opens on its own default.
@@ -506,6 +543,27 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       setSavingTheme(false);
     }
   }, [board]);
+
+  const saveFreshness = React.useCallback(async (rule: CacheRule) => {
+    setSavingFresh(true);
+    setFreshError(null);
+    try {
+      const res = await apiFetch("/api/dashboard/boards", {
+        method: "PUT", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: board, cache: rule }),
+      });
+      if (!res.ok) {
+        const j = (await res.json().catch(() => null)) as { error?: string } | null;
+        throw new Error(j?.error ?? "Could not save the freshness rule");
+      }
+      setFreshOpen(false);
+      void load();
+    } catch (e) {
+      setFreshError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSavingFresh(false);
+    }
+  }, [board, load]);
 
   // BI-17: pin a note on a point. The chart is written whole through its own write route
   // (`dashboard:write`), with the note added to the stored definition.
@@ -972,6 +1030,8 @@ export function DashboardPage({ boardId }: { boardId: string }) {
     const menu: TileMenuItem[] = [
       { label: "Expand", icon: <Maximize2 />, onSelect: () => setTileDialog({ kind: "expand", id: spec.id }) },
       { label: "View data", icon: <Table2 />, onSelect: () => setTileDialog({ kind: "data", id: spec.id }) },
+      // BI-4 part B (feature decision 6): this tile is computed again and replaces what is remembered; the others stay.
+      ...(hasRows(cell) && cell.computedAt ? [{ label: "Refresh this tile", icon: <RefreshCw />, onSelect: () => void load(spec.id) }] : []),
       // The drill menu stays reachable on a chart that opens somewhere else.
       ...(spec.def?.click && drillable
         ? [{ label: menuTiles.has(spec.id) ? "Click opens its destination" : "Click opens the drill menu", icon: <MousePointerClick />, onSelect: () => toggleMenuTile(spec.id) }]
@@ -1097,19 +1157,25 @@ export function DashboardPage({ boardId }: { boardId: string }) {
                 }}
               />
             ) : null}
+            {loading ? (
+              <Button size="sm" variant="outline" onClick={stopLoading}>
+                <Square className="size-4" aria-hidden /> Stop
+              </Button>
+            ) : null}
             <DashboardActionsMenu
               isDefault={isDefault}
               canWrite={canWrite}
               isPrivate={Boolean(ownerId)}
               onHistory={() => setHistoryOpen(true)}
               onTheme={hasPermission("dashboard:write") ? () => { setThemeError(null); setThemeOpen(true); } : undefined}
+              onFreshness={hasPermission("dashboard:write") ? () => { setFreshError(null); setFreshOpen(true); } : undefined}
               loading={loading}
               fullscreen={fullscreen}
               autoSec={String(autoSec)}
               savedSec={String(savedSec)}
               canSaveRefresh={refreshIsSaveable({ mayWrite: hasPermission("dashboard:write"), saved: savedSec, effective: autoSec })}
               savingRefresh={savingRefresh}
-              onRefresh={() => void load()}
+              onRefresh={() => void load("1")}
               onToggleFullscreen={toggleFullscreen}
               onAutoSec={(v) => setSessionSec(Number(v))}
               onSaveRefresh={() => void saveRefreshDefault()}
@@ -1180,9 +1246,12 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       ) : null}
 
       {/* Canvas */}
+      {stopped ? (
+        <p role="status" className="text-sm text-muted-foreground">{STOPPED_SENTENCE}. Press Refresh to load the dashboard again.</p>
+      ) : null}
       {loading && charts.length === 0 ? (
         <DashboardTilesSkeleton />
-      ) : !loading && charts.length === 0 ? (
+      ) : !loading && charts.length === 0 && !stopped ? (
         <Empty className="border border-dashed">
           <EmptyHeader>
             <EmptyMedia variant="icon">
@@ -1342,6 +1411,10 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       {themeOpen ? (
         <ThemeFontDialog open={themeOpen} onOpenChange={setThemeOpen} theme={data?.theme} font={data?.font}
           allowedFonts={data?.reporting?.fonts ?? SHIPPED_FONT_IDS} saving={savingTheme} error={themeError} onSave={(c) => void saveThemeAndFont(c)} />
+      ) : null}
+      {freshOpen ? (
+        <FreshnessDialog open={freshOpen} onOpenChange={setFreshOpen} rule={data?.boardCacheRule} effective={data?.cacheRule}
+          saving={savingFresh} error={freshError} onSave={(r) => void saveFreshness(r)} />
       ) : null}
       {renameOpen ? (
         <RenameDashboardDialog open={renameOpen} onOpenChange={setRenameOpen} currentName={dashName} onSave={(n) => void renameDashboard(n)} />

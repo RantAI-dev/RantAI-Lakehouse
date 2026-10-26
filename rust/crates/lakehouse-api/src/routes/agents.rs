@@ -1021,6 +1021,54 @@ const REPORT_WRITE_TOOLS: [&str; 3] = [
     "delete_report_subscription",
 ];
 
+/// [`run_headless_loop_inner`] under a query run: a scheduled run has no request, so
+/// without this its `run_sql` would use the compiled-in limits, not the settings
+/// (`BI-5` review B2). Boxed to keep this future under the size lint.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "forwards every argument of the loop it wraps"
+)]
+async fn run_headless_loop(
+    state: &AppState,
+    run_id: &str,
+    employee_id: &str,
+    prompt: &str,
+    is_build: bool,
+    perms: &PermissionSet,
+    principal: Option<&Principal>,
+    principal_id: Option<String>,
+    principal_kind: &str,
+    actor_label: &str,
+    // WS7 item G2: `budget_limit`/`budget_consumed` are measured in
+    // TOKENS, not currency — `lakehouse-llm` has no price table (`grep
+    // -rn "price\|cost_per_token" rust/crates/lakehouse-llm/` returns
+    // nothing) and this loop does not invent one. `DigitalEmployee.
+    // budget_limit`'s existing column and "Budget ceiling" label are
+    // reinterpreted as a token ceiling going forward — a disclosed,
+    // breaking semantic change for any already-authored employee whose
+    // `budget_limit` was set assuming a currency unit.
+    budget_limit: f64,
+) -> HeadlessOutcome {
+    crate::query_limits::scope_if_missing(
+        state,
+        principal,
+        Box::pin(run_headless_loop_inner(
+            state,
+            run_id,
+            employee_id,
+            prompt,
+            is_build,
+            perms,
+            principal,
+            principal_id,
+            principal_kind,
+            actor_label,
+            budget_limit,
+        )),
+    )
+    .await
+}
+
 /// The headless tool-calling loop shared by every `POST
 /// /api/agents/employees/{id}/run` call — see [`run_employee`]'s doc
 /// comment for the full picture. Never panics: an LLM failure, a refused
@@ -1037,7 +1085,7 @@ const REPORT_WRITE_TOOLS: [&str; 3] = [
               scatter one sequential loop across helpers with no independent reuse, matching \
               routes::ai::chat's own identical justification"
 )]
-async fn run_headless_loop(
+async fn run_headless_loop_inner(
     state: &AppState,
     run_id: &str,
     employee_id: &str,

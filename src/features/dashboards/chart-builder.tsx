@@ -48,6 +48,8 @@ import type { ChartClick } from "@/services/clients/bi-store";
 import { kindHasClickValue } from "@/lib/chart-click";
 import { clickProblem } from "@/lib/click-destination";
 import { ClickSetting } from "./click-setting";
+import { FreshnessField } from "./freshness-field";
+import { draftOf, draftProblem, ruleOf, type CacheRule, type RuleDraft } from "@/lib/result-cache";
 import { KpiCompareSection, PivotSection, TableSection, type SourceColumns } from "./table-settings";
 import { draftFromDef, draftPayload, draftProblems, emptyTableDraft, type TableDraft } from "@/lib/table-draft";
 import type { TableDefFields } from "@/lib/table-types";
@@ -125,6 +127,8 @@ export type ChartDef = {
   referenceLines?: RefLineDef[];
   /** What a click does instead of the drill menu (BI-18·B); absent = the menu. */
   click?: ChartClick;
+  /** How long this chart's result may be remembered (BI-4 part B); absent follows the dashboard. */
+  cache?: CacheRule;
   /** How a date or timestamp dimension is grouped (BI-9); absent = as stored. */
   grain?: string;
 } & TableDefFields // raw tables, pivots and KPI comparisons (BI-16 part A)
@@ -435,6 +439,8 @@ export function ChartBuilder({
   const [paramDefs, setParamDefs] = React.useState<ParamDef[]>([]);
   const [limitParamName, setLimitParamName] = React.useState("");
   const [refLines, setRefLines] = React.useState<RefLineDraft[]>([]);
+  // BI-4 part B: how long this chart's result may be remembered.
+  const [cacheDraft, setCacheDraft] = React.useState<RuleDraft>(draftOf(null));
   // BI-17 part A: the chart's formats, colours, axes, labels, notes, tooltip and conditional colours (section 5).
   const [style, setStyle] = React.useState<StyleFields>({});
   const [formatOpen, setFormatOpen] = React.useState(false);
@@ -835,6 +841,7 @@ export function ChartBuilder({
       setLimitParamName(limitParam(initial.limit) ?? "");
       setLimit(typeof initial.limit === "number" ? initial.limit : 20);
       setRefLines(refLinesFromDef(initial.referenceLines));
+      setCacheDraft(draftOf(initial.cache));
       setTypeDraft(typeDraftFromDef(initial));
       setStyle(styleFromDef(initial));
       setFormatOpen(formatUsed(styleFromDef(initial), initial.referenceLines?.length ?? 0));
@@ -847,6 +854,7 @@ export function ChartBuilder({
         click: !!initial.click,
         columnSettings: initial.kind === "table" && initial.tableMode !== "rows" ? Object.keys(initial.columnSettings ?? {}).length : 0,
         compare: initial.kind === "kpi" && !!initial.compare,
+        freshness: !!initial.cache && initial.cache.mode !== "default",
       }));
       setTargetBoard(initial.board ?? board);
       setClick(initial.click);
@@ -1056,6 +1064,8 @@ export function ChartBuilder({
         // A bullet graph without a category is one row and has no limit.
         limit: isPoints || (isBullet && !dimension) ? undefined : limitParamName ? { param: limitParamName } : Math.min(limit, maxLimit),
         referenceLines: takesLines && refLinesPayload(refLines).length ? refLinesPayload(refLines) : undefined,
+        // BI-4 part B: left out when it follows the dashboard, which clears a rule the chart had.
+        cache: forPreview || cacheDraft.mode === "default" || draftProblem(cacheDraft) ? undefined : ruleOf(cacheDraft),
         layers: layersApply ? layersPayload(layers) : undefined,
         draw: layersApply && ownDraw ? ownDraw : undefined,
         axis: layersApply && ownAxis ? ownAxis : undefined,
@@ -1078,6 +1088,8 @@ export function ChartBuilder({
     const clickable = kindHasClickValue(kind);
     const problem = clickable ? clickProblem(click) : null;
     if (problem && !forPreview) throw new Error(problem);
+    const freshProblem = draftProblem(cacheDraft);
+    if (freshProblem && !forPreview && !isStaticTile) throw new Error(freshProblem);
     if (clickable && click && !problem) payload.click = click;
     if (isEdit) payload.id = editId;
     // BI-11: the preview is drawn with the values the dashboard shows; they are not part of the chart.
@@ -1630,6 +1642,10 @@ export function ChartBuilder({
             {isKpi ? <KpiCompareSection draft={tableDraft} onChange={setTableDraft} columns={sourceColumns} metric={pickedMetric ? { label: pickedMetric.label, timeColumn: pickedMetric.timeColumn, grain: pickedMetric.grain } : undefined} /> : null}
             {isGroupedTable ? <TableSection part="format" draft={tableDraft} onChange={setTableDraft} columns={sourceColumns} groupedColumns={shownColumns} /> : null}
             {rules.click ? <ClickSetting value={click} onChange={setClick} boards={boardOptions} /> : null}
+            {!isStaticTile ? (
+              <FreshnessField id="chart-freshness" draft={cacheDraft} onChange={setCacheDraft}
+                help="How long this chart's result is remembered. Follow the default uses the dashboard's setting." />
+            ) : null}
             {rules.parameters ? (
               <div>
                 <Button type="button" size="sm" variant="ghost" className="h-7 px-2 text-xs" onClick={() => setParamsOpen(true)}>

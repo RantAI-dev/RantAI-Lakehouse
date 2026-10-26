@@ -595,6 +595,7 @@ fn embed_token(board_id: &str) -> String {
     sign_embed(
         &EmbedClaims {
             resource: Some(EmbedResource {
+                // BI-26: a token names a dashboard or one chart, never both.
                 chart: None,
                 dashboard: Some(board_id.to_owned()),
             }),

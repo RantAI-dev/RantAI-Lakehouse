@@ -184,6 +184,7 @@ async fn payload(server: &MockServer, viewer: &Viewer, board: &str) -> Value {
         filters: None,
         grain: None,
         params: None,
+        fresh: None,
     };
     get_body(
         &ch,
@@ -196,6 +197,7 @@ async fn payload(server: &MockServer, viewer: &Viewer, board: &str) -> Value {
             &lakehouse_bi::grain::TimeContext::default(),
             GrainRequest::Saved,
             viewer,
+            &tokio::sync::Semaphore::new(crate::tile_pool::TILES_PER_PROCESS),
         ),
     )
     .await

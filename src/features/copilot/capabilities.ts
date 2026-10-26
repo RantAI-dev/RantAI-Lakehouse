@@ -26,6 +26,8 @@ export const CAPABILITIES: Capability[] = [
     tools: ["run_sql", "ask_user", "list_datasets", "describe_dataset", "get_lineage", "get_quality", "describe_mart",
       // BI-2 / AI-7: a question for a number is answered from a named metric when one matches, in Ask mode too.
       "list_metrics", "describe_metric", "query_metric",
+      // BI-5: the limits that apply to the person, and Stop for their own running queries. Read-only, so Ask mode offers them too.
+      "get_query_limits", "stop_query",
       // BI-1 / AI-10: "give me this dashboard as a PDF" is a question, not a change: a link, in Ask mode too.
       "export_dashboard", "export_chart",
       // RPT-1 / AI-10: listing one's scheduled reports is a question too.
@@ -40,6 +42,8 @@ export const CAPABILITIES: Capability[] = [
     tools: ["describe_mart", "suggest_join", "list_sql_sources", "list_charts", "list_boards", "suggest_dashboard", "create_chart", "update_chart", "delete_chart", "create_board",
       // BI-17 part A / AI-8: formatting a chart and a dashboard's theme (named here or they never reach the model).
       "format_chart", "set_dashboard_theme",
+      // BI-4 part B: how long a chart's or a dashboard's results are remembered.
+      "set_cache_rule",
       // BI-18 part C / AI-9: tabs (the composer sends this list as the allowlist, so a tool missing here never reaches the model).
       "create_tab", "rename_tab", "move_charts_to_tab", "move_tab", "delete_tab",
       // BI-8 review fix (BLOCKER) R1: the composer sends this list as the allowlist of tools for the turn, so a tool missing here never reaches the model.

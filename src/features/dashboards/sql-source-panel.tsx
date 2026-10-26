@@ -1,5 +1,6 @@
 "use client";
 
+import { useEffectiveLimits } from "@/hooks/use-effective-limits";
 import { Play, TriangleAlert, X } from "lucide-react";
 import { SqlEditor } from "@/components/sql-editor";
 import { Button } from "@/components/ui/button";
@@ -93,6 +94,8 @@ const PHASE_NOTE: Partial<Record<SqlRunPhase, string>> = {
  * a blank line.
  */
 export function SqlSourcePanel({ draft, onCancelEdit }: { draft: SqlSourceDraft; onCancelEdit: () => void }) {
+  // BI-5: the sentence about the limits follows the setting; without it, no number is printed.
+  const limits = useEffectiveLimits()
   const editing = draft.mode === "edit";
   const nameProblem = sourceNameProblem(draft.name);
   // Red only once the user has touched the field or tried to save; before
@@ -137,7 +140,9 @@ export function SqlSourcePanel({ draft, onCancelEdit }: { draft: SqlSourceDraft;
         <SqlEditor value={draft.sql} onChange={draft.setSql} minHeight="200px" wrap />
         <p className="text-xs text-muted-foreground" id="sql-source-hint">
           One read-only SELECT over <span className="font-mono">serving</span> tables, written as{" "}
-          <span className="font-mono">serving.&lt;table&gt;</span>. At most 2,000 rows and 30 seconds.
+          <span className="font-mono">serving.&lt;table&gt;</span>. {limits
+            ? `At most ${limits.chartRows.toLocaleString("en-US")} rows and ${limits.timeoutSeconds.toLocaleString("en-US")} seconds.`
+            : "Row and time limits are set in Admin > Settings."}
           Drill-down to records is not available for SQL sources.
         </p>
       </div>
