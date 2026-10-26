@@ -2,6 +2,8 @@ import type {
   CreateUploadResponse,
   UploadCheck,
   UploadCompare,
+  UploadFolder,
+  UploadListFilter,
   IngestUploadInput,
   IngestUploadResponse,
   Upload,
@@ -93,8 +95,57 @@ function uploadUrl(id: string, suffix = ""): string {
 }
 
 export const uploadService: UploadService = {
-  async list(signal) {
-    return readJson<Upload[]>(await apiFetch(base, { signal }))
+  async list(signal, filter?: UploadListFilter) {
+    // Only what is chosen is sent, so an unfiltered list is the URL it always was.
+    const query = new URLSearchParams()
+    if (filter?.folderId !== undefined && filter.folderId !== "") query.set("folderId", filter.folderId)
+    if (filter?.q !== undefined && filter.q.trim() !== "") query.set("q", filter.q.trim())
+    const text = query.toString()
+    return readJson<Upload[]>(await apiFetch(text === "" ? base : `${base}?${text}`, { signal }))
+  },
+  async listFolders(signal) {
+    return readJson<UploadFolder[]>(await apiFetch(`${base}/folders`, { signal }))
+  },
+  async createFolder(input, signal) {
+    return readJson<UploadFolder>(
+      await apiFetch(`${base}/folders`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: input.name,
+          ...(input.parentId !== undefined ? { parentId: input.parentId } : {}),
+        }),
+        signal,
+      })
+    )
+  },
+  async updateFolder(id, input, signal) {
+    return readJson<UploadFolder>(
+      await apiFetch(`${base}/folders/${encodeURIComponent(id)}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ...(input.name !== undefined ? { name: input.name } : {}),
+          ...(input.parentId !== undefined ? { parentId: input.parentId } : {}),
+        }),
+        signal,
+      })
+    )
+  },
+  async deleteFolder(id, signal) {
+    // 204 with no body.
+    const res = await apiFetch(`${base}/folders/${encodeURIComponent(id)}`, { method: "DELETE", signal })
+    if (!res.ok) throw await failure(res)
+  },
+  async moveUploads(input, signal) {
+    return readJson<{ moved: number }>(
+      await apiFetch(`${base}/move`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ uploadIds: input.uploadIds, folderId: input.folderId }),
+        signal,
+      })
+    )
   },
   async get(id, signal) {
     return readJson<Upload>(await apiFetch(uploadUrl(id), { signal }))

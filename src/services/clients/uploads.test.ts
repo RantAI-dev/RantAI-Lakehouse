@@ -410,3 +410,75 @@ describe("uploadService errors", () => {
     expect(err.message).toBe("This upload is being loaded, so it cannot be deleted yet.")
   })
 })
+
+describe("uploadService folders (DATA-35)", () => {
+  const FOLDER = {
+    id: "uf-1",
+    parentId: null,
+    name: "Sales",
+    fileCount: 2,
+    childCount: 0,
+    createdAt: "2026-10-26T10:00:00Z",
+    updatedAt: "2026-10-26T10:00:00Z",
+  }
+
+  it("sends only the filters that were chosen, so an unfiltered list is the URL it always was", async () => {
+    const calls = stubFetch(() => json([]))
+    await uploadService.list()
+    await uploadService.list(undefined, {})
+    await uploadService.list(undefined, { folderId: "uf-1" })
+    await uploadService.list(undefined, { folderId: "none", q: " stock & co " })
+    await uploadService.list(undefined, { q: "   " })
+    expect(calls.map((c) => c.url)).toEqual([
+      "/api/uploads",
+      "/api/uploads",
+      "/api/uploads?folderId=uf-1",
+      "/api/uploads?folderId=none&q=stock+%26+co",
+      "/api/uploads",
+    ])
+  })
+
+  it("lists, creates, renames, moves and deletes folders on the folder routes", async () => {
+    const calls = stubFetch(() => json(FOLDER))
+    await expect(uploadService.listFolders()).resolves.toEqual(FOLDER)
+    await uploadService.createFolder({ name: "Sales" })
+    await uploadService.createFolder({ name: "Q1", parentId: "uf-1" })
+    await uploadService.updateFolder("uf-1", { name: "Old" })
+    await uploadService.updateFolder("a/b", { parentId: null })
+    expect(calls.map((c) => `${c.init.method ?? "GET"} ${c.url}`)).toEqual([
+      "GET /api/uploads/folders",
+      "POST /api/uploads/folders",
+      "POST /api/uploads/folders",
+      "PATCH /api/uploads/folders/uf-1",
+      "PATCH /api/uploads/folders/a%2Fb",
+    ])
+    expect(JSON.parse(String(calls[1]!.init.body))).toEqual({ name: "Sales" })
+    expect(JSON.parse(String(calls[2]!.init.body))).toEqual({ name: "Q1", parentId: "uf-1" })
+    expect(JSON.parse(String(calls[3]!.init.body))).toEqual({ name: "Old" })
+    expect(JSON.parse(String(calls[4]!.init.body))).toEqual({ parentId: null })
+  })
+
+  it("deletes a folder with a 204 and moves files with the ids and the folder, null meaning none", async () => {
+    let answer: () => Response = () => new Response(null, { status: 204 })
+    const calls = stubFetch(() => answer())
+    await uploadService.deleteFolder("uf-1")
+    expect(calls[0]!.init.method).toBe("DELETE")
+    expect(calls[0]!.url).toBe("/api/uploads/folders/uf-1")
+
+    answer = () => json({ moved: 2 })
+    await expect(uploadService.moveUploads({ uploadIds: ["up-1", "up-2"], folderId: null })).resolves.toEqual({ moved: 2 })
+    expect(calls[1]!.url).toBe("/api/uploads/move")
+    expect(JSON.parse(String(calls[1]!.init.body))).toEqual({ uploadIds: ["up-1", "up-2"], folderId: null })
+  })
+
+  it("shows the API's sentence for a folder it refuses, with its status", async () => {
+    stubFetch(() => json({ error: "This folder still holds files or folders. Move them out and delete its folders first." }, 409))
+    const err = await rejection(uploadService.deleteFolder("uf-1"))
+    expect(err.status).toBe(409)
+    expect(err.message).toBe("This folder still holds files or folders. Move them out and delete its folders first.")
+    stubFetch(() => json({ error: "Folders can be nested at most 3 levels deep." }, 400))
+    expect((await rejection(uploadService.createFolder({ name: "D", parentId: "uf-3" }))).message).toBe(
+      "Folders can be nested at most 3 levels deep."
+    )
+  })
+})
