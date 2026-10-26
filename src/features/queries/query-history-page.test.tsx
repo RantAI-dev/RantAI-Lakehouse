@@ -1,9 +1,10 @@
 // The history page's own behaviour, against the real component: its
 // filters reach the client call, "Load more" walks the cursor, a row's
 // SQL builds the studio link, a refused row shows what the server told
-// it, and the empty state says what the window is. The service is
-// spied; nothing leaves the test. `next/navigation` is stubbed before
-// any import resolves (`mock.module` is hoisted), for the tabs' pathname.
+// it, a refused older page says why there is none, and the empty state
+// says what the window is. The service is spied; nothing leaves the
+// test. `next/navigation` is stubbed before any import resolves
+// (`mock.module` is hoisted), for the tabs' pathname.
 mock.module("next/navigation", () => ({
   usePathname: () => "/query-studio/history",
 }))
@@ -12,6 +13,7 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test"
 import { queryService } from "@/services"
 import type { QueryHistoryItem } from "@/services/contracts/queries"
+import { ServiceError } from "@/services/errors"
 import { QueryHistoryPage } from "./query-history-page"
 
 afterEach(() => {
@@ -153,5 +155,30 @@ describe("QueryHistoryPage", () => {
     render(<QueryHistoryPage />)
     await screen.findByText("SELECT 1")
     expect(screen.queryByRole("button", { name: "Load more" })).toBeNull()
+  })
+
+  it("a 403 from the history call shows the permission message", async () => {
+    spyOn(queryService, "listHistory").mockImplementation(
+      (async (filter?: { before?: { at: string; id: string } }) => {
+        if (filter?.before) {
+          throw new ServiceError(
+            "permission_denied",
+            "You do not have access to the query history.",
+            403,
+          )
+        }
+        return fullPage()
+      }) as unknown as typeof queryService.listHistory,
+    )
+    render(<QueryHistoryPage />)
+
+    await screen.findByText("SELECT 50")
+    fireEvent.click(await screen.findByRole("button", { name: "Load more" }))
+
+    const message = await screen.findByText("You do not have access to the query history.")
+    expect(message).toBeDefined()
+    // The rows the page has stay: the failure only says there is no
+    // older page yet.
+    expect(screen.getByText("SELECT 50")).toBeDefined()
   })
 })
