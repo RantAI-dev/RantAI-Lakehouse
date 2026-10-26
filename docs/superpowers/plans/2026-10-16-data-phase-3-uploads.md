@@ -1109,6 +1109,16 @@ finding, in this order, on top of `0be39e85`; nothing else in the branch was cha
 - Two loads at once at 2 GiB, and a Parquet row group larger than memory: still unmeasured
   (`DATA-33`, `DATA-34`).
 
+**The merge, and the runs on the pushed head.** The planner's merge of `main` (`9b067dbc`) was
+taken in after the commits above (merge commit `b4a82ad8`; one conflict, in
+`docs/core/BACKLOG.md`, resolved hunk by hunk: `DATA-13`, `DATA-14` and `DATA-15` keep main's
+status, `DATA-36` stays, and the "Ready to start" list is the one `regen_deps.py` writes for the
+merged file), so the branch could be pushed without a force. The merge changed no code, and the
+block above was run again on the pushed head `b4a82ad8` with the same counts: `cargo fmt --check`
+clean, clippy clean, 233 passed (1 ignored) in the API's lib suite filtered on `upload`, 59 passed
+in `lakehouse-store`'s `uploads` suite, 140 and 6 passed in the API's `upload_routes` and
+`connector_upload_table` suites, 332 passed (1 skipped) in the seven Python files above.
+
 ## 12. Review
 
 ### Slice 1, round 1 (planner/reviewer, Claude Opus), at `159f8dea`, 2026-10-19
