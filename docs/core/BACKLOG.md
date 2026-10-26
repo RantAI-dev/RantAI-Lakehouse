@@ -278,6 +278,7 @@ estimate (S, M, L), which the base has no field for.
 | `BI-34` | Task | Downloads (`BI-1`) have no memory setting and no concurrency limit, unlike the PDF's two slots, and an XLSX file's rows are written on the async worker: set `max_memory_usage` on export statements, limit concurrent downloads per process, and move the per-row XLSX writes to `spawn_blocking`. From the `BI-1` review (N3, R10 follow-up), 2026-10-17 | Dashboards | P2 | Todo |  | `BI-1` plan, review 2 |
 | `BI-35` | Task | Scheduled reports (`RPT-1`) follow-ups from its review, 2026-10-18: a requester who holds `agent:approve` can approve their own outside send; "Send now" has no rate limit; a report over the 310 s route budget is cut with nothing recorded; the subscriptions dialog calls the service directly instead of `useServiceAction`; console Delete of a subscription has no confirm step | Dashboards | P2 | Todo |  | `RPT-1` plan, review 1 |
 | `OPS-11` | Task | Next.js 16.4 (on `main`) blocks the dev server's own resources for any origin but `localhost`, so a console dev server opened by a LAN address never finishes loading. Read the allowed dev origins from an environment variable (`allowedDevOrigins`), empty by default, and document it in `.env.example`. Found at the phase 3 QA, 2026-10-17 | Operations | P3 | Done | #229 | phase 3 QA |
+| `OPS-12` | Task | The `Rust · test (stable)` CI job runs out of disk on the runner: PR #186 (DATA-17 uploads) and its stacked branch died with "No space left on device" in the `cargo test --workspace --locked` step (run 40268340415), and commit 820484ba (QS-4) hit the same wall and worked around it by merging two test binaries instead of fixing the cause. Every one of the 68 lakehouse-api integration test binaries links the whole crate with full debug info. Free the runner's disk (delete the toolchains the job never uses) and build this job's test binaries with line tables only | Operations | P1 | Done | [#260](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/260) | PR #186 CI run 40268340415 |
 | `OPS-4` | Task | Fail loudly when the application database is unreachable | Platform | P3 | Done | [#234](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/234) | `docs/OPERATIONS.md` |
 | `OPS-6` | Feature | Log and trace viewer | Operations | P3 | Idea |  | `docs/archive/FEATURE_COVERAGE.md` |
 | `BIZ-1` | Feature | Enterprise edition | Business | P3 | Idea |  | PRODUCT §1 |
@@ -383,6 +384,7 @@ set by the product owner and are left empty until they are.
 | `SEC-44` | 2026-10-17 | | |
 | `SEC-46` | 2026-10-21 | 2026-10-21 | |
 | `OPS-11` | 2026-10-23 | 2026-10-23 | |
+| `OPS-12` | 2026-10-26 | 2026-10-26 | |
 | `SEC-48` | 2026-10-23 | 2026-10-23 | |
 | `OPS-10` | 2026-10-23 | 2026-10-23 | |
 | `QS-1` | 2026-10-23 | 2026-10-23 | |
