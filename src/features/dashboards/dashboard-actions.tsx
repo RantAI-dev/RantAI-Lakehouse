@@ -22,7 +22,7 @@ import { PDF_NOT_SET_UP } from "./chart-download";
 export function DashboardActionsMenu({
   isDefault, canWrite, canManage = canWrite, isPrivate, onHistory, onTheme, loading, fullscreen, autoSec, savedSec, canSaveRefresh, savingRefresh,
   onRefresh, onToggleFullscreen, onAutoSec, onSaveRefresh, onRename, onShare, onExportPdf, onDuplicate, onDelete,
-  onDownloadPdf, pdfSupported = true, canDownload = true, onSubscriptions,
+  onDownloadPdf, pdfSupported = true, canDownload = true, onSubscriptions, onExportFile,
 }: {
   readonly isDefault: boolean;
   /**
@@ -67,6 +67,8 @@ export function DashboardActionsMenu({
   readonly canDownload?: boolean;
   /** Opens "Subscriptions…" (`RPT-1`); left out when absent or when downloads are switched off for the viewer. */
   readonly onSubscriptions?: () => void;
+  /** Downloads the dashboard as a file to import elsewhere (`BI-19` part D); left out when absent. */
+  readonly onExportFile?: () => void;
   readonly onDuplicate: () => void;
   readonly onDelete: () => void;
 }) {
@@ -196,6 +198,11 @@ export function DashboardActionsMenu({
             <DropdownMenuItem render={<a href="/api/dashboard/export" download />}>
               <Download className="size-4" /> Export YAML
             </DropdownMenuItem>
+            {!isDefault && onExportFile ? (
+              <DropdownMenuItem onClick={onExportFile}>
+                <Download className="size-4" /> Export dashboard file
+              </DropdownMenuItem>
+            ) : null}
             {canWrite ? (
               <DropdownMenuItem onClick={onDuplicate}>
                 <Copy className="size-4" /> Duplicate

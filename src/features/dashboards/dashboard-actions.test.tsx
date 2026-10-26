@@ -122,6 +122,19 @@ describe("DashboardActionsMenu downloads (BI-1)", () => {
   })
 })
 
+describe("DashboardActionsMenu Export dashboard file (BI-19 part D)", () => {
+  it("offers the file on a saved dashboard and not on the built-in one", async () => {
+    const onExportFile = mock(() => {})
+    renderMenu({ isDefault: false, onExportFile })
+    fireEvent.click(await screen.findByText("Export dashboard file"))
+    expect(onExportFile).toHaveBeenCalledTimes(1)
+    cleanup()
+    renderMenu({ isDefault: true, onExportFile })
+    await screen.findByText("Print…")
+    expect(screen.queryByText("Export dashboard file")).toBeNull()
+  })
+})
+
 describe("DashboardActionsMenu Subscriptions… (RPT-1)", () => {
   it("opens the subscriptions for a viewer who may download", async () => {
     const onSubscriptions = mock(() => {})

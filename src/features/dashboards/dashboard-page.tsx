@@ -3,7 +3,7 @@
 import * as React from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { useTheme } from "next-themes";
-import { ArrowRightLeft, Bell, ChartColumn, Download, GitFork, Heading, Maximize2, Minus, MousePointerClick, Move, Moon, Pencil, Plus, Smartphone, SlidersHorizontal, Sparkles, Table2, Trash2, Rows3 } from "lucide-react";
+import { ArrowRightLeft, Bell, ChartColumn, Download, GitFork, ImageDown, Heading, Maximize2, Minus, MousePointerClick, Move, Moon, Pencil, Plus, Smartphone, SlidersHorizontal, Sparkles, Table2, Trash2, Rows3 } from "lucide-react";
 import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog";
 import { PageHeader } from "@/components/patterns/page-header";
 import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@rantai/design-system/ui/empty";
@@ -75,7 +75,7 @@ import { offerFor } from "./access-level";
 import { ShareDialog } from "./share-dialog";
 import { TileBody } from "./tile-body";
 import { exportNotice } from "./table-export";
-import { downloadChartData, downloadDashboardPdf, downloadMenuKind, type DataChoice, type PdfChoice, type ReadState } from "./chart-download";
+import { downloadChartData, downloadChartPng, downloadDashboardFile, downloadDashboardPdf, downloadMenuKind, type DataChoice, type PdfChoice, type ReadState } from "./chart-download";
 import { DownloadDataDialog, DownloadPdfDialog } from "./download-dialogs";
 import { SubscriptionsDialog } from "./subscriptions-dialog";
 import { TileDataDialog, TileExpandDialog, downloadRowsCsv, hasRows, type Cell } from "./tile-dialogs";
@@ -937,6 +937,24 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   const [pdfOpen, setPdfOpen] = React.useState(false);
   const [subsOpen, setSubsOpen] = React.useState(false);
   const [dataFor, setDataFor] = React.useState<{ id: string; title: string } | null>(null);
+  async function downloadPng(id: string) {
+    try {
+      const fileName = await downloadChartPng(id, readState());
+      notifySuccess("Image downloaded", fileName);
+    } catch (err) {
+      notifyFailure("The image could not be made", err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  async function downloadFile() {
+    try {
+      const fileName = await downloadDashboardFile(board);
+      notifySuccess("Dashboard file downloaded", fileName);
+    } catch (err) {
+      notifyFailure("The dashboard file could not be made", err instanceof Error ? err.message : String(err));
+    }
+  }
+
   async function downloadData(id: string, choice: DataChoice) {
     const done = await downloadChartData(id, choice, readState(), tableSorts.current[id]);
     const note = exportNotice(done);
@@ -1002,7 +1020,13 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       // Excel or CSV, formatted or raw. A built-in tile has no stored definition to
       // read and keeps the rows on screen as CSV.
       ...(downloadKind === "data"
-        ? [{ label: "Download data…", icon: <Download />, onSelect: () => setDataFor({ id: spec.id, title: spec.title }) }]
+        ? [
+            { label: "Download data…", icon: <Download />, onSelect: () => setDataFor({ id: spec.id, title: spec.title }) },
+            // BI-19 part D (plan D13): the chart as a picture, drawn by the same renderer as the PDF, so only where there is one.
+            ...(data?.pdfSupported === true
+              ? [{ label: "Download PNG", icon: <ImageDown />, onSelect: () => void downloadPng(spec.id) }]
+              : []),
+          ]
         : downloadKind === "csv"
           ? [{ label: "Download CSV", icon: <Download />, onSelect: () => hasRows(cell) && downloadRowsCsv(spec.title, cell) }]
           : []),
@@ -1129,6 +1153,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
               onShare={() => setShareOpen(true)}
               onExportPdf={exportPdf}
               onDownloadPdf={() => setPdfOpen(true)}
+              onExportFile={() => void downloadFile()}
               onSubscriptions={() => setSubsOpen(true)}
               pdfSupported={data?.pdfSupported === true}
               canDownload={canDownload}
