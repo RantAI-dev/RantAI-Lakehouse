@@ -430,6 +430,120 @@ Cause: `geo_fields` (`lakehouse-bi/src/store.rs`) used `map_id_is_well_formed`, 
 
 Tests: `a_geomap_on_an_uploaded_map_passes_and_a_malformed_uploaded_id_is_refused` (store.rs; `m_0123456789ab` passes, `m_XYZ`, `M_...`, upper-case hex, wrong length refused, Bar still refuses a map); `a_region_chart_on_an_uploaded_map_is_not_refused_for_its_id` (tests/maps_routes.rs, needs Postgres: runs in CI, compiled here under clippy `--all-targets`, *not run locally*). Commands: `cargo clippy -p lakehouse-bi -p lakehouse-api --all-targets -- -D warnings` clean; `cargo test -p lakehouse-bi --lib` 575 passed, 0 failed, 4 ignored; `bun run typecheck` clean; `bun test src/features/dashboards/uploaded-maps.test.tsx` 4 pass. No console render test was added (the renderer had no built-in-only assumption; only a message changed).
 
+### Handoff (PR #246 review BLOCKER fixes, 2026-10-26)
+
+Developer (branch `feat/bi-phase-6`). The two review BLOCKERs of #246, one
+commit each. No scope change; no new dependency; no compose change.
+
+**Commits**
+
+- `562f11ce` fix(maps): a public link and an embed read a map boundary by
+  their own token (PR #246 review BLOCKER 1).
+- `e37bbaa8` fix(maps): the region dictionary reads as a password-less engine
+  user (PR #246 review BLOCKER 2).
+
+**BLOCKER 1 — the anonymous views read a map boundary by their own token**
+
+The console's `ensureMap` fetched an uploaded map through `apiFetch`, whose
+401 calls `redirectToLogin()`; a public link and an embed have no account to
+log into, so a map tile sent the viewer to the login page.
+
+- `GET /api/public/dashboard/{token}/maps/{id}/geojson` (new): the share
+  token opens the board as `GET /api/public/dashboard/{token}` does, and the
+  file is served only when a chart on that board draws on that map; a 404
+  otherwise (the same answer for a map the board does not use, for a map that
+  does not exist and for a map id that is not server-made, so the route is no
+  oracle for what a board holds).
+- `POST /api/embed/maps/{id}/geojson` (new): the body is `{ jwt }`, exactly
+  as `POST /api/embed/data` takes it, and it opens the same board. The token
+  check is now one helper (`routes::embed::embed_grant`) that both routes
+  use, so they cannot disagree about what a token opens.
+- Both routes are `Policy::Public` (the token is the credential, as for the
+  board's data) and are asserted both ways in `tests/route_auth.rs`; the
+  public-route count in `policy.rs` moves from nine to eleven.
+- In the console `ensureMap(id, load)` takes the loader from its caller: the
+  public link and the embed pass a token-based loader, the signed-in console
+  keeps `apiFetch`. A boundary that cannot be fetched shows a fixed sentence
+  on the tile ("This map's boundary file could not be loaded."), never a
+  redirect.
+- Tests: `tests/maps_routes.rs` (a map the board uses → 200 and the file; a
+  map it does not use → 404; a token that is not a board → the same 404 the
+  public dashboard route gives; a bad JWT → the same fixed 401
+  `POST /api/embed/data` gives), `tests/route_auth.rs` (the two new routes
+  are not refused by the auth gate), and
+  `src/features/dashboards/public-map-boundary.test.tsx` (the public link and
+  the embed read the boundary from their own route and never reach
+  `apiFetch`; a boundary that cannot be read shows the sentence).
+
+**BLOCKER 2 — the dictionary reads as a password-less engine user**
+
+The API's `ClickHouse` password was written into every map dictionary's DDL
+(in clear in the engine's own metadata files). Per the planner's decision the
+dictionary now reads through `lakehouse_geo`, which has NO password, may log
+in from the local host only and may only `SELECT console.geo_region`:
+
+- `lakehouse_bi::geo`: `GEO_ENGINE_USER`, `GEO_USER_DDL`
+  (`CREATE USER IF NOT EXISTS lakehouse_geo NOT IDENTIFIED HOST LOCAL`) and
+  `GEO_GRANT_DDL` (`GRANT SELECT ON console.geo_region TO lakehouse_geo`),
+  next to `REGION_TABLE_DDL`; `dictionary_ddl(id)` writes
+  `SOURCE(CLICKHOUSE(USER 'lakehouse_geo' QUERY ...))` with no `PASSWORD`
+  and no API credential (the user and password parameters and the now-unused
+  `string_literal` are gone).
+- `routes::maps::enable_region_lookup` runs the two statements idempotently,
+  right where `REGION_TABLE_DDL` is run (the first upload that needs the
+  lookup), before the inserts and the dictionary.
+- Measured on a throwaway `ClickHouse` 26.8.30.8 (`clickhouse/clickhouse-server:26.8`,
+  the tag `docker-compose.yml` runs): `NOT IDENTIFIED` and `HOST LOCAL` are
+  accepted; the dictionary loads and `dictGet` answers; from another
+  container on the same docker network the engine user is refused (516); the
+  engine's metadata holds no password (the stored DDL reads
+  `SOURCE(CLICKHOUSE(USER 'lakehouse_geo' QUERY ...)`); the user may not read
+  another table and may not write (497). The commands and their outputs are
+  in `docs/plans/BI-16C-RESULT.md`.
+- The ignored live test passes against that engine with the new DDL:
+  `LIVE_CH_URL=http://172.17.0.5:8123 LIVE_CH_USER=admin LIVE_CH_PASSWORD=adminpw
+  cargo test -p lakehouse-bi --lib live_region_of -- --ignored` → 1 passed,
+  0 failed.
+- The cost, measured and written on the feature page: the API's engine login
+  needs `CREATE USER` and `GRANT`. Without them the upload still answers 201
+  and the map still draws, but `RegionOf` has no lookup for it (the
+  lifecycle's fail-closed path).
+- Docs: `docs/plans/BI-16C-RESULT.md` (the measurement, and the S1 section
+  marked superseded) and the feature page's limit line
+  (`docs/core/features/gantt-world-maps-spatial.md`).
+
+**Commands and counts (final tree, 2026-10-26, in the foreground)**
+
+- `cd rust && cargo fmt --check` → clean, no output.
+- `/home/shiro/rantai/bin/cargo-locked clippy -j 2 --workspace --all-targets --all-features -- -D warnings` → Finished, 0 warnings.
+- `/home/shiro/rantai/bin/cargo-locked test -j 2 -p lakehouse-bi` → 575 passed, 0 failed, 4 ignored (lib) + 1 passed (`specs_match_typescript`).
+- `/home/shiro/rantai/bin/cargo-locked test -j 2 -p lakehouse-api --test route_auth` → 60 passed, 0 failed.
+- `/home/shiro/rantai/bin/cargo-locked test -j 2 -p lakehouse-api --test maps_routes` → 11 passed, 0 failed.
+- `/home/shiro/rantai/bin/cargo-locked test -j 2 -p lakehouse-api --test embed_tokens` → 24 passed, 0 failed.
+- `/home/shiro/rantai/bin/cargo-locked test -j 2 -p lakehouse-api --lib -- maps` → 22 passed, 0 failed, 2564 filtered out.
+- `flock /home/shiro/rantai/.heavy.lock bun run typecheck` → exit 0.
+- `flock /home/shiro/rantai/.heavy.lock bun run lint` → 0 errors, 9 warnings, none in a file of these commits.
+- `flock /home/shiro/rantai/.heavy.lock bun test src/features/dashboards/public-map-boundary.test.tsx src/features/dashboards/uploaded-maps.test.tsx src/features/dashboards/natural-earth-maps.test.tsx` → 17 pass, 0 fail (3 files).
+- `flock /home/shiro/rantai/.heavy.lock bun run test` → 2718 pass, 1 skip, 0 fail (280 files).
+
+**Not verified**
+
+- `cargo test --workspace` was not run here (the crates above were); CI runs
+  the whole workspace on the PR.
+- The webpack build was not run (CI runs it).
+- The map was never drawn in a real canvas: the component tests hand the
+  option to a mocked `EChart` (as the earlier parts of this plan did).
+- The PDF print view (`src/features/dashboards/render-view.tsx`, BI-1's
+  surface) still reads an uploaded map through `apiFetch`, so the same
+  redirect BLOCKER 1 describes is still open there. It is reported, not
+  fixed: that surface is not this PR's, and the fix would need a third
+  token-authenticated route.
+- The engine-user change on a deployment whose API engine login may not
+  create users was measured only as the engine's refusal (`497`), not on a
+  running stack; the 20,000-region dictionary's memory was not measured.
+- The throwaway engine container (`pr246-ch-geo`, `pr246-ch-client`) and the
+  throwaway docker network were removed at the end of the measurement.
+
 ## 8. Review (planner appends, one entry per part)
 
 Planner, 2026-10-24: the console's Gantt assumptions are the contract for T1 (result columns `task`, `group`, `start`, `end`, `progress`; optional `reversedRows`; dates as report-zone strings). Feature decision 2's "today line can be switched off" becomes a style field `todayLine: false` (planner default). The console adds the switch, and T1 validates the field.
