@@ -6285,7 +6285,16 @@ mod typed_filters {
             charts,
         )
         .await;
-        answer(&server, "FROM console.bi_board FINAL", &["id"], vec![]).await;
+        // BI-19 x BI-4 (PR #250 CI): the board must exist; a dashboard the
+        // store does not list is a 404 (BI-19 part B1), so an empty answer
+        // here made the whole payload NotFound, not the tiles.
+        answer(
+            &server,
+            "FROM console.bi_board FINAL",
+            &["id", "name"],
+            vec![json!({ "id": "b1", "name": "Board one" })],
+        )
+        .await;
         answer(&server, "FROM console.bi_source FINAL", &["id"], vec![]).await;
         let mut cols = mart_column_rows("mart_a", &[("visitors", "UInt32"), ("kab", "String")]);
         cols.extend(mart_column_rows(
