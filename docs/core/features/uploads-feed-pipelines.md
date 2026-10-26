@@ -6,14 +6,14 @@
 | Backlog | `DATA-19` |
 | Kind | Feature |
 | Spec | `docs/core/specs/data-19.md` (no *(proposed)* numbers) |
-| Status | In Acceptance (merged in #165, 2026-10-15); checklist not run |
+| Status | Released (accepted 2026-10-23; PR #165) |
 | Priority | P2 |
 | Owner | The module's owner, in the base. Not named here (the repo is public). |
 | Acceptor | Held in the base; not the Owner. |
-| Plan | `docs/superpowers/plans/2026-10-14-data-19-uploads-feed-pipelines.md` (PR #165). |
+| Plan | `docs/superpowers/plans/2026-10-14-data-19-uploads-feed-pipelines.md` (PR #165). Nothing open blocks it (`BLD-3` shipped). |
 | Started | 2026-10-14 |
-| Shipped | 2026-10-15 (merged; not accepted) |
-| Evidence | #165 |
+| Shipped | 2026-10-15 |
+| Evidence | |
 
 ## Problem
 
@@ -85,22 +85,22 @@ Limits worth saying out loud:
 
 | ID | Do this | Expect | Result |
 | --- | --- | --- | --- |
-| `DATA-19-AC1` | Upload a file; build a Silver table from it; build a Gold table from that; chart it | All from the console; the chart shows the file's data | Not run |
-| `DATA-19-AC2` | Re-upload the file with one row changed | The downstream pipeline runs; the chart shows the change | Not run |
-| `DATA-19-AC3` | Open lineage for the Gold table | The upload is shown as the origin | Not run |
-| `DATA-19-AC4` | Delete the upload (the file), then run the pipeline | The table and the pipeline keep working; lineage shows the origin as "deleted upload" | Not run |
-| `DATA-19-AC5` | Upload a file into a different table | The pipeline does not run again | Not run |
-| `DATA-19-AC6` | Switch "Run again after this table is re-uploaded" off; re-upload | The pipeline does not run | Not run |
-| `DATA-19-AC7` | As a user without the permission, pick the uploaded table as a source | Refused with an honest message | Not run |
+| `DATA-19-AC1` | Upload a file; build a Silver table from it; build a Gold table from that; chart it | All from the console; the chart shows the file's data | Pass 2026-10-23 (product owner) |
+| `DATA-19-AC2` | Re-upload the file with one row changed | The downstream pipeline runs; the chart shows the change | Pass 2026-10-23 (product owner) |
+| `DATA-19-AC3` | Open lineage for the Gold table | The upload is shown as the origin | Pass 2026-10-23 (product owner) |
+| `DATA-19-AC4` | Delete the upload (the file), then run the pipeline | The table and the pipeline keep working; lineage shows the origin as "deleted upload" | Pass 2026-10-23 (product owner) |
+| `DATA-19-AC5` | Upload a file into a different table | The pipeline does not run again | Pass 2026-10-23 (product owner) |
+| `DATA-19-AC6` | Switch "Run again after this table is re-uploaded" off; re-upload | The pipeline does not run | Pass 2026-10-23 (product owner) |
+| `DATA-19-AC7` | As a user without the permission, pick the uploaded table as a source | Refused with an honest message | Pass 2026-10-23 (product owner) |
 
-**Acceptor** (not the Owner): __________ **Date:** ______ **Build:** ______
+**Acceptor** (not the Owner): product owner (held in the base) **Date:** 2026-10-23 **Build:** main 0e5498d2
 
 Exceptions, each with an owner and a date:
 
 ## After acceptance
 
 - [ ] `PRODUCT.md` section 2 and 3 updated
-- [ ] `BACKLOG.md` status set to **Released**, with the PR in the PR column; follow-ups added
-- [ ] `BACKLOG.md` Dates has the Shipped date
+- [x] `BACKLOG.md` status set to **Released**, with the PR in the PR column; follow-ups added
+- [x] `BACKLOG.md` Dates has the Shipped date
 - [ ] The base row updated to match the repo (status, PR, dates, QA-case results); the Acceptor is recorded in the base
 - [ ] `CHANGELOG.md` entry a customer can read

@@ -5,7 +5,7 @@
 | Module | Data (Catalog) |
 | Backlog | `DATA-11` |
 | Spec | `docs/core/specs/data-11.md` (one *(proposed)* number, signed under Decisions 1) |
-| Status | Decisions signed 2026-10-09. In Acceptance: merged in #98 on 2026-10-09; rows 10, 11, 13 and 14 not run (`DATA-24`) |
+| Status | Released (accepted 2026-10-23, with two exceptions: rows 5 and 14). Decisions signed 2026-10-09; merged in #98 on 2026-10-09 |
 | Plan | `docs/superpowers/plans/2026-10-09-data-11-catalog-search.md` |
 
 ## Problem
@@ -96,28 +96,34 @@ A step not performed is never Pass. Steps needing a terminal are marked
 | 7 | In the ⌘K box, choose "See all results" | The Data Explorer opens with the words filled in | Pass 2026-10-09 |
 | 8 | In the Data Explorer, filter by owner, then by tag, then by layer | Each filter narrows the list; together they combine | Pass 2026-10-09 |
 | 9 | Edit a table's tags, then search the new tag straight away | The table is found | Pass 2026-10-09 |
-| 10 | Sign in as a user without `catalog:read`; press ⌘K and type a table name | No tables are listed; the Data Explorer says access is missing | Not run |
-| 11 | On a deployment with two tenants and `CATALOG_TENANT_ID` set, search as a member of the other tenant | No tables are listed, and the Data Explorer shows the reason | Not run |
+| 10 | Sign in as a user without `catalog:read`; press ⌘K and type a table name | No tables are listed; the Data Explorer says access is missing | Pass 2026-10-23 (product owner) |
+| 11 | On a deployment with two tenants and `CATALOG_TENANT_ID` set, search as a member of the other tenant | No tables are listed, and the Data Explorer shows the reason | Pass 2026-10-23 (product owner) |
 | 12 | Type words that match nothing | "No results", not an error and not every table | Pass 2026-10-09 |
-| 13 | (operator) Stop ClickHouse; search | A plain "catalog unavailable" message, with no server text in it | Not run |
-| 14 | (operator) Read `docs/plans/DATA-11-RESULT.md` | It gives the measured time for 10,000 tables, the command that produced it, and whether 500 ms was met | Not run |
+| 13 | (operator) Stop ClickHouse; search | A plain "catalog unavailable" message, with no server text in it | Pass 2026-10-23 (product owner) |
+| 14 | (operator) Read `docs/plans/DATA-11-RESULT.md` | It gives the measured time for 10,000 tables, the command that produced it, and whether 500 ms was met | Fail 2026-10-23 (pre-check); accepted as an exception by the product owner |
 
-**Accepted by:** __________ **Date:** ______ **Build:** ______
+**Accepted by:** product owner (held in the base) **Date:** 2026-10-23 **Build:** main 0e5498d2
 
 The product owner checked rows 1 to 9 and 12 on 2026-10-09, on a separate
 instance of branch `feat/data-11-catalog-search` at `a020540` (29 assets),
-and reported them passed. Not yet accepted: rows 10, 11, 13 and 14 were not
-run.
+and reported them passed. On 2026-10-23 the product owner ran the checklist
+for acceptance and accepted it, with two exceptions found in a pre-check the
+same day: rows 5 and 14, below. Rows 10, 11 and 13, not run before, are
+marked Pass on that date.
 
 Exceptions, each with an owner and a date:
 
-- Row 14, the speed measurement on 10,000 tables: not run; needs a
-  throwaway stack outside the build machine. Owner: planner.
-- Rows 10, 11 and 13: need a second user, a second tenant and a stopped
-  ClickHouse. Owner: product owner, on staging.
+- Row 5, a typo that matches only a table's name: the result gets no
+  "approximate match" label, while a column or tag typo does. Cause, by
+  reading: `matchedOn` is null when the name is the best field
+  (`rust/crates/lakehouse-api/src/routes/catalog_search.rs`). Owner: product
+  owner. Date: 2026-10-23. Follow-up: `DATA-32`.
+- Row 14, the speed measurement on 10,000 tables: `docs/plans/DATA-11-RESULT.md`
+  does not exist. Owner: product owner. Date: 2026-10-23. Follow-up:
+  `DATA-24`.
 
 ## After acceptance
 
-- [ ] `PRODUCT.md` section 2 and 3 updated
-- [ ] `BACKLOG.md` item moved to Done; follow-ups added
+- [x] `PRODUCT.md` section 2 and 3 updated
+- [x] `BACKLOG.md` item moved to Done; follow-ups added
 - [ ] `CHANGELOG.md` entry a customer can read
