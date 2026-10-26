@@ -8,6 +8,13 @@
 //! reads a 403 as "this user may not run anything at all" and refuses the
 //! whole batch.
 //!
+//! The same rule covers every statement that names a table: a `DESCRIBE`,
+//! a `DESC` and a `SHOW COLUMNS FROM` are gated like a `SELECT`. A
+//! statement that lists objects without naming one table (`SHOW TABLES`,
+//! `SHOW DATABASES`) names no table to check, so it is refused for a
+//! tenant that does not own the shared catalog: a 422 with the fixed
+//! sentence `This statement is not available to your organisation.`
+//!
 //! These tests drive the real router over two seeded tenants (`rina@meridian.example`
 //! in Meridian Group, `sari@meridian.example` in Meridian Retail), with the
 //! shared catalog owned by Meridian Group (`CATALOG_TENANT_ID`) and a
@@ -36,7 +43,10 @@ use uuid::Uuid;
 use wiremock::matchers::{body_string_contains, method};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use common::{TestApp, session_cookie_for_seeded_user, spin_up_with_env};
+use common::{
+    TestApp, create_principal_with_permissions, session_cookie_for_seeded_user,
+    session_cookie_for_user, spin_up_with_env,
+};
 
 /// The tenant that owns the shared catalog, and the upload table below.
 const OWNER_TENANT: &str = "11111111-1111-4111-8111-000000000001";
@@ -54,6 +64,9 @@ const OWNED_TABLE: &str = "group_orders";
 const OWNED_STATEMENT: &str = "SELECT * FROM bronze.group_orders";
 /// The refusal, byte for byte: the table as the rewrite canonicalises it.
 const REFUSAL: &str = "Table not found or not available to your organisation: bronze.group_orders";
+/// The refusal of a statement that lists objects without naming one table,
+/// byte for byte.
+const LISTING_REFUSAL: &str = "This statement is not available to your organisation.";
 
 /// The catalog's owner, in a deployment that holds the seeded tenants.
 async fn spin_up_with_clickhouse(ch_uri: &str) -> TestApp {
@@ -321,6 +334,14 @@ async fn history_rows(pool: &PgPool) -> i64 {
         .expect("read the run history")
 }
 
+/// The status of every run the history holds, oldest first.
+async fn history_statuses(pool: &PgPool) -> Vec<String> {
+    sqlx::query_scalar("SELECT status FROM query_history ORDER BY at, id")
+        .fetch_all(pool)
+        .await
+        .expect("read the run history")
+}
+
 /// A run the caller owns, so the download's own ownership check passes.
 async fn insert_history_row(pool: &PgPool, id: &str, sql: &str, owner: Uuid) {
     let input = RecordHistoryInput {
@@ -398,6 +419,255 @@ async fn another_tenants_upload_table_is_refused_recorded_and_never_asked() {
         1,
         "the refusal is a run the history now records (`QS-4`, decision 3)"
     );
+    assert_eq!(
+        engine_requests(&ch).await,
+        0,
+        "the refusal precedes the engine: nothing may be asked"
+    );
+}
+
+#[tokio::test]
+async fn a_describe_of_another_tenants_upload_table_is_refused_recorded_and_never_asked() {
+    let ch = MockServer::start().await;
+    mount_engine(&ch).await;
+    let TestApp { router, pool } = spin_up_with_clickhouse(&ch.uri()).await;
+    claim_the_owned_table(&pool).await;
+    let cookie = session_cookie_for_seeded_user(&pool, "sari@meridian.example").await;
+
+    let (status, body) = post_sql(
+        &router,
+        &cookie,
+        "/api/query/run",
+        "DESCRIBE bronze.group_orders",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"], REFUSAL, "{body}");
+    assert_eq!(
+        history_rows(&pool).await,
+        1,
+        "the refusal is a run the history now records (`QS-4`, decision 3)"
+    );
+    assert_eq!(
+        engine_requests(&ch).await,
+        0,
+        "the refusal precedes the engine: nothing may be asked"
+    );
+}
+
+#[tokio::test]
+async fn a_desc_and_a_show_columns_of_another_tenants_upload_table_are_refused() {
+    let ch = MockServer::start().await;
+    mount_engine(&ch).await;
+    let TestApp { router, pool } = spin_up_with_clickhouse(&ch.uri()).await;
+    claim_the_owned_table(&pool).await;
+    let cookie = session_cookie_for_seeded_user(&pool, "sari@meridian.example").await;
+
+    // The other two spellings of the same question: the table they name
+    // is the one the gate checks, whatever the statement's kind.
+    for statement in [
+        "DESC bronze.group_orders",
+        "SHOW COLUMNS FROM bronze.group_orders",
+    ] {
+        let (status, body) = post_sql(&router, &cookie, "/api/query/run", statement).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{statement}: {body}");
+        assert_eq!(body["error"], REFUSAL, "{statement}: {body}");
+    }
+    assert_eq!(
+        engine_requests(&ch).await,
+        0,
+        "the refusals precede the engine: nothing may be asked"
+    );
+}
+
+#[tokio::test]
+async fn show_tables_is_refused_for_a_tenant_that_does_not_own_the_catalog() {
+    let ch = MockServer::start().await;
+    mount_engine(&ch).await;
+    let TestApp { router, pool } = spin_up_with_clickhouse(&ch.uri()).await;
+    let cookie = session_cookie_for_seeded_user(&pool, "sari@meridian.example").await;
+
+    let (status, body) = post_sql(
+        &router,
+        &cookie,
+        "/api/query/run",
+        "SHOW TABLES FROM bronze",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["error"], LISTING_REFUSAL, "{body}");
+    assert_eq!(
+        engine_requests(&ch).await,
+        0,
+        "the refusal precedes the engine: nothing may be asked"
+    );
+    assert_eq!(
+        history_statuses(&pool).await,
+        vec!["blocked".to_owned()],
+        "the refusal is a run the history records as blocked (`QS-4`, decision 3)"
+    );
+}
+
+#[tokio::test]
+async fn show_databases_is_refused_for_a_tenant_that_does_not_own_the_catalog() {
+    let ch = MockServer::start().await;
+    mount_engine(&ch).await;
+    let TestApp { router, pool } = spin_up_with_clickhouse(&ch.uri()).await;
+    let cookie = session_cookie_for_seeded_user(&pool, "sari@meridian.example").await;
+
+    let (status, body) = post_sql(&router, &cookie, "/api/query/run", "SHOW DATABASES").await;
+
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["error"], LISTING_REFUSAL, "{body}");
+    assert_eq!(
+        engine_requests(&ch).await,
+        0,
+        "the refusal precedes the engine: nothing may be asked"
+    );
+}
+
+#[tokio::test]
+async fn the_catalog_tenant_still_lists_tables_and_databases() {
+    let ch = MockServer::start().await;
+    mount_engine(&ch).await;
+    let TestApp { router, pool } = spin_up_with_clickhouse(&ch.uri()).await;
+    let cookie = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+
+    // The tenant that owns the shared catalog may list it: the refusal is
+    // for a tenant that does not own it.
+    for statement in ["SHOW TABLES FROM bronze", "SHOW DATABASES"] {
+        let (status, body) = post_sql(&router, &cookie, "/api/query/run", statement).await;
+        assert_eq!(status, StatusCode::OK, "{statement}: {body}");
+    }
+    let sent = sent_statements(&ch).await;
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    assert!(sent[0].contains("SHOW TABLES"), "{}", sent[0]);
+    assert!(sent[1].contains("SHOW DATABASES"), "{}", sent[1]);
+}
+
+#[tokio::test]
+async fn the_unrestricted_principal_still_lists_tables() {
+    let ch = MockServer::start().await;
+    mount_engine(&ch).await;
+    let TestApp { router, pool } = spin_up_with_clickhouse(&ch.uri()).await;
+    // A principal holding every permission (`"*:*"`) reaches every table,
+    // so it may list them too.
+    let admin = create_principal_with_permissions(&pool, "*:*").await;
+    let cookie = session_cookie_for_user(&pool, admin).await;
+
+    let (status, body) = post_sql(
+        &router,
+        &cookie,
+        "/api/query/run",
+        "SHOW TABLES FROM bronze",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let sent = sent_statements(&ch).await;
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert!(sent[0].contains("SHOW TABLES"), "{}", sent[0]);
+}
+
+#[tokio::test]
+async fn a_deployment_with_one_tenant_still_describes_and_lists() {
+    let ch = MockServer::start().await;
+    mount_engine(&ch).await;
+    let TestApp { router, pool } = spin_up_with_clickhouse(&ch.uri()).await;
+    claim_the_owned_table(&pool).await;
+    let sari = user_id(&pool, "sari@meridian.example").await;
+    leave_one_tenant(&pool, sari).await;
+    let cookie = session_cookie_for_seeded_user(&pool, "sari@meridian.example").await;
+
+    // One tenant in the whole deployment: there is no other tenant's
+    // table to reach, so nothing changes — not the table, not the listing.
+    for statement in ["DESCRIBE bronze.group_orders", "SHOW TABLES FROM bronze"] {
+        let (status, body) = post_sql(&router, &cookie, "/api/query/run", statement).await;
+        assert_eq!(status, StatusCode::OK, "{statement}: {body}");
+    }
+    let sent = sent_statements(&ch).await;
+    assert_eq!(sent.len(), 2, "{sent:?}");
+}
+
+#[tokio::test]
+async fn a_select_that_names_no_table_still_runs() {
+    let ch = MockServer::start().await;
+    mount_engine(&ch).await;
+    let TestApp { router, pool } = spin_up_with_clickhouse(&ch.uri()).await;
+    let cookie = session_cookie_for_seeded_user(&pool, "sari@meridian.example").await;
+
+    let (status, body) = post_sql(&router, &cookie, "/api/query/run", "SELECT 1").await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let sent = sent_statements(&ch).await;
+    assert_eq!(sent.len(), 1, "{sent:?}");
+}
+
+#[tokio::test]
+async fn an_estimate_of_a_describe_of_another_tenants_upload_table_is_refused() {
+    let ch = MockServer::start().await;
+    mount_engine(&ch).await;
+    let TestApp { router, pool } = spin_up_with_clickhouse(&ch.uri()).await;
+    claim_the_owned_table(&pool).await;
+    let cookie = session_cookie_for_seeded_user(&pool, "sari@meridian.example").await;
+
+    let (status, body) = post_sql(
+        &router,
+        &cookie,
+        "/api/query/estimate",
+        "DESCRIBE bronze.group_orders",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"], REFUSAL, "{body}");
+    assert_eq!(
+        engine_requests(&ch).await,
+        0,
+        "the refusal precedes the explain: nothing may be asked"
+    );
+}
+
+#[tokio::test]
+async fn an_estimate_of_show_databases_is_refused_for_a_tenant_that_does_not_own_the_catalog() {
+    let ch = MockServer::start().await;
+    mount_engine(&ch).await;
+    let TestApp { router, pool } = spin_up_with_clickhouse(&ch.uri()).await;
+    let cookie = session_cookie_for_seeded_user(&pool, "sari@meridian.example").await;
+
+    let (status, body) = post_sql(&router, &cookie, "/api/query/estimate", "SHOW DATABASES").await;
+
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["error"], LISTING_REFUSAL, "{body}");
+    assert_eq!(
+        engine_requests(&ch).await,
+        0,
+        "the refusal precedes the explain: nothing may be asked"
+    );
+}
+
+#[tokio::test]
+async fn the_chat_cannot_run_another_tenants_upload_table() {
+    let ch = MockServer::start().await;
+    mount_engine(&ch).await;
+    let TestApp { router, pool } = spin_up_with_clickhouse(&ch.uri()).await;
+    claim_the_owned_table(&pool).await;
+    let cookie = session_cookie_for_seeded_user(&pool, "sari@meridian.example").await;
+
+    // The chat's own `run_sql` admits a `SELECT` only, so this is the
+    // shape it can carry: the refusal is the gate's, not the tool's.
+    let ran = call_tool(
+        &router,
+        &cookie,
+        "run_sql",
+        json!({ "sql": OWNED_STATEMENT }),
+    )
+    .await;
+
+    assert_eq!(ran["outcome"], json!("failed"), "{ran}");
+    assert_eq!(ran["result"]["error"], json!(REFUSAL), "{ran}");
     assert_eq!(
         engine_requests(&ch).await,
         0,

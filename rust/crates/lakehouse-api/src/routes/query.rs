@@ -81,7 +81,10 @@ fn parse_body(body: &Bytes) -> Result<SqlBody, ApiError> {
 /// `AGENTS.md` rule 4) when obligations cannot be resolved or `sql` fails
 /// classification/substitution, and 404 [`ApiError::NotFound`] with the
 /// fixed sentence of [`table_not_available`] when the statement reads a
-/// table the caller may not read (`SEC-20`).
+/// table the caller may not read (`SEC-20`), and 422
+/// [`ApiError::Unprocessable`] with the fixed sentence of
+/// [`LISTING_NOT_AVAILABLE`] when the statement lists objects without
+/// naming a table and the caller may not list them (`SEC-20`).
 pub(crate) async fn rewrite_sql_for_principal(
     state: &AppState,
     sql: &str,
@@ -148,13 +151,21 @@ async fn rewrite_sql_for_principal_inner(
     // statement that reads a table the caller may not read is refused
     // before the policy's own prefetch asks the engine about that table,
     // and before the statement reaches the engine at all.
-    refuse_unreachable_tables(
-        state,
-        principal,
-        headers,
-        &referenced_table_names(sql, is_trino_engine(engine)),
-    )
-    .await?;
+    //
+    // The gate's targets come from ONE parse, with the dialect of the
+    // engine the statement names (the same choice the policy rewrite
+    // below makes): the tables the statement names, or the fact that it
+    // lists objects without naming one. A statement that does not parse
+    // has no targets at all: the policy rewrite refuses it with a 422 of
+    // its own, so there is nothing here to gate.
+    let gate_dialect: &dyn sqlparser::dialect::Dialect = if is_trino_engine(engine) {
+        &sqlparser::dialect::GenericDialect {}
+    } else {
+        &sqlparser::dialect::ClickHouseDialect {}
+    };
+    if let Some(targets) = crate::sql_rewrite::gate_targets(sql, gate_dialect) {
+        refuse_unreachable_tables(state, principal, headers, &targets).await?;
+    }
 
     // WS7 item D1/D2: the actual referenced-tables/prefetch/enforce
     // sequence now lives in ONE place —
@@ -239,6 +250,19 @@ fn table_not_available(table: &str) -> ApiError {
         "Table not found or not available to your organisation: {table}"
     ))
 }
+
+/// `SEC-20`: the one sentence a statement that lists objects without
+/// naming one table is refused with.
+///
+/// A 422, never a 403: the statement is refused for what it DOES (it
+/// lists), not because the caller lacks a permission, and the sentence
+/// says nothing about what the deployment holds — the same sentence for
+/// every caller, so it cannot be an oracle.
+///
+/// A listing is refused rather than passed because no table is named, so
+/// the gate has nothing to compare the caller's tenant against: letting
+/// it through would show one tenant the shared catalog's table names.
+const LISTING_NOT_AVAILABLE: &str = "This statement is not available to your organisation.";
 
 /// `SEC-20`: the caller's reach over tables, resolved once per request.
 ///
@@ -498,41 +522,75 @@ async fn claim_on(state: &AppState, tenant_id: Uuid, table: &str) -> Result<Tabl
         })
 }
 
-/// `SEC-20`: refuse a statement that reads a table the caller may not
-/// read.
+/// `SEC-20`: refuse a statement the caller's tenant may not run.
 ///
-/// The tables are the ones the statement names, as
-/// [`crate::sql_rewrite::referenced_tables`] canonicalises them (a
-/// `CTE`'s own name is not a table), and the first table out of reach is
-/// the one the refusal names.
+/// The targets are what the statement means to the gate: the tables it
+/// names — canonicalised the way the policy rewrite canonicalises them
+/// ([`crate::sql_rewrite::canonicalize`]), so a `CTE`'s own name is not a
+/// table — or the fact that it lists objects without naming one table.
+///
+/// A named table is checked one by one, and the first table out of reach
+/// is the one the refusal names. A listing names no table, so there is
+/// nothing to check table by table: it passes for the catalog's own
+/// tenant (and for a deployment with one tenant) and is refused
+/// otherwise.
 ///
 /// # Errors
 ///
 /// 404 with the fixed sentence of [`table_not_available`] for a table the
-/// caller may not read; 404 for an `X-Tenant` header the caller does not
-/// belong to; 503 when a claim cannot be read.
+/// caller may not read; 422 with the fixed sentence of
+/// [`LISTING_NOT_AVAILABLE`] for a statement that lists objects and the
+/// caller may not list them; 404 for an `X-Tenant` header the caller does
+/// not belong to; 503 when a claim cannot be read.
 async fn refuse_unreachable_tables(
     state: &AppState,
     principal: &Principal,
     headers: &HeaderMap,
-    tables: &[String],
+    targets: &crate::sql_rewrite::GateTargets,
 ) -> Result<(), ApiError> {
-    if tables.is_empty() {
-        return Ok(());
-    }
-    let reach = resolve_reach(state, principal, headers).await?;
-    let tenant_id = match reach {
-        TenantReach::All => return Ok(()),
-        TenantReach::NoTenant => return Err(table_not_available(&tables[0])),
-        TenantReach::Tenant { tenant_id, .. } => tenant_id,
-    };
-    let mut claims = Vec::with_capacity(tables.len());
-    for table in tables {
-        claims.push(claim_on(state, tenant_id, table).await?);
-    }
-    match first_unreachable(reach, &claims) {
-        Some(at) => Err(table_not_available(&tables[at])),
-        None => Ok(()),
+    match targets {
+        crate::sql_rewrite::GateTargets::Tables(tables) => {
+            if tables.is_empty() {
+                return Ok(());
+            }
+            let reach = resolve_reach(state, principal, headers).await?;
+            let tenant_id = match reach {
+                TenantReach::All => return Ok(()),
+                TenantReach::NoTenant => return Err(table_not_available(&tables[0])),
+                TenantReach::Tenant { tenant_id, .. } => tenant_id,
+            };
+            let mut claims = Vec::with_capacity(tables.len());
+            for table in tables {
+                claims.push(claim_on(state, tenant_id, table).await?);
+            }
+            match first_unreachable(reach, &claims) {
+                Some(at) => Err(table_not_available(&tables[at])),
+                None => Ok(()),
+            }
+        }
+        crate::sql_rewrite::GateTargets::ListsObjects => {
+            // The reach is resolved FIRST: a header naming a tenant the
+            // caller does not belong to is a 404 everywhere else, and it
+            // must not be answered with the listing's own 422.
+            let reach = resolve_reach(state, principal, headers).await?;
+            match reach {
+                // Every permission, or a deployment with one tenant: there
+                // is no other tenant's listing to keep. The catalog's own
+                // tenant may list the shared catalog.
+                TenantReach::All
+                | TenantReach::Tenant {
+                    owns_catalog: true, ..
+                } => Ok(()),
+                // A member of another tenant, or a caller in no tenant.
+                TenantReach::Tenant {
+                    owns_catalog: false,
+                    ..
+                }
+                | TenantReach::NoTenant => {
+                    Err(ApiError::Unprocessable(LISTING_NOT_AVAILABLE.to_owned()))
+                }
+            }
+        }
     }
 }
 

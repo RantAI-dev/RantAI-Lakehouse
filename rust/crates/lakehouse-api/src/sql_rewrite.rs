@@ -152,11 +152,6 @@ fn referenced_tables_of(statements: &[Statement]) -> HashSet<String> {
 /// whatever the statement's kind — or the fact that it lists objects
 /// without naming one table, which no table-level check can cover.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(
-    dead_code,
-    reason = "the tenant gate in routes/query.rs reads gate_targets; only this \
-              module's own tests read the enum until that call lands"
-)]
 pub enum GateTargets {
     /// The tables the statement names, canonicalised (see [`canonicalize`])
     /// and sorted, so the same statement always hands the gate the same
@@ -207,11 +202,6 @@ pub enum GateTargets {
 /// - `EXPLAIN DESCRIBE x` does NOT parse at all (`parser/mod.rs:14480-14483`:
 ///   "Explain must be root of the plan"), so it is a `None`.
 #[must_use]
-#[allow(
-    dead_code,
-    reason = "the tenant gate in routes/query.rs is the caller; only this \
-              module's own tests call it until that call lands"
-)]
 pub fn gate_targets(sql: &str, dialect: &dyn Dialect) -> Option<GateTargets> {
     let statements = Parser::parse_sql(dialect, sql).ok()?;
     let mut tables: HashSet<String> = HashSet::new();
@@ -231,11 +221,6 @@ pub fn gate_targets(sql: &str, dialect: &dyn Dialect) -> Option<GateTargets> {
 }
 
 /// What ONE statement means to the tenant gate — see [`gate_targets`].
-#[allow(
-    dead_code,
-    reason = "reachable only from gate_targets, whose caller is the tenant \
-              gate in routes/query.rs"
-)]
 fn statement_gate_targets(stmt: &Statement) -> GateTargets {
     match stmt {
         // A query's tables are the ones `referenced_tables` finds in it.
@@ -268,11 +253,6 @@ fn statement_gate_targets(stmt: &Statement) -> GateTargets {
 /// schema, and `SHOW COLUMNS` alone names nothing: the statement then
 /// lists the columns of every table it can see, so there is no table to
 /// gate and the caller must treat it as a listing.
-#[allow(
-    dead_code,
-    reason = "reachable only from gate_targets, whose caller is the tenant \
-              gate in routes/query.rs"
-)]
 fn show_columns_table(show_options: &sqlparser::ast::ShowStatementOptions) -> Option<&ObjectName> {
     let show_in = show_options.show_in.as_ref()?;
     let name = show_in.parent_name.as_ref()?;
