@@ -100,8 +100,8 @@ estimate (S, M, L), which the base has no field for.
 
 | ID | Kind | Item | Module | Priority | Status | PR | Source |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `RPT-1` | Feature | Scheduled reports with PDF and spreadsheet attachments. **Blocked by `BI-1` (PDF and Excel attachments)** | Dashboards | P2 | Planned |  | PRODUCT §2 |
-| `BI-1` | Feature | Export a dashboard as a server-made PDF and as Excel | Dashboards | P2 | Planned |  | PRODUCT §2 |
+| `RPT-1` | Feature | Scheduled reports with PDF and spreadsheet attachments. **Blocked by `BI-1` (PDF and Excel attachments)** | Dashboards | P2 | In Acceptance | [#204](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/204) | PRODUCT §2 |
+| `BI-1` | Feature | Export a dashboard as a server-made PDF and as Excel | Dashboards | P2 | In Acceptance | [#204](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/204) | PRODUCT §2 |
 | `BI-4` | Feature | Result caching for charts and queries; run a dashboard's tiles in parallel | Dashboards | P2 | Planned |  | `reference/competitive-comparison.md` (BI matrix) |
 | `BI-5` | Feature | Configurable query timeouts and row limits; Stop cancels the query on the server | Dashboards | P2 | Planned |  | `reference/competitive-comparison.md` (BI matrix) |
 | `BI-6` | Feature | A chart builder as capable as Metabase's and Tableau's: several dimensions, filters, sorting, multi-step questions. No drag and drop; the assistant covers that | Dashboards | P2 | In Acceptance | [#160](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/160) | `reference/competitive-comparison.md` (BI matrix) |
@@ -300,19 +300,16 @@ parity), built after it.
 | Item | Status | Blocked by | Blocks |
 | --- | --- | --- | --- |
 | `BI-18` | Building | — | `AI-2`, `AI-9` (templates part), `BI-26` (locking a dashboard filter in an embed), `QS-5` (the dashboard date filter) |
-| `BI-1` | Planned | — | `AI-10`, `RPT-1` (PDF and Excel attachments) |
-| `RPT-1` | Planned | `BI-1` (PDF and Excel attachments) | `AI-10`, `BI-19` (digest schedules) |
 | `BI-14` | Planned | — | `AI-13` |
 | `BI-16` | Building | — | `AI-5` (per chart type as it lands) |
 | `BI-17` | Building | — | `AI-8` |
-| `BI-19` | Planned | `RPT-1` (digest schedules) | `AI-11` |
+| `BI-19` | Planned | — | `AI-11` |
 | `BI-26` | Planned | `BI-18` (locking a dashboard filter in an embed) | `AI-11` |
 | `BLD-1` | Building | — | `REL-6` |
 | `DATA-4` | Planned | — | `DATA-3` |
 | `DEC-8` | Decided | — | `AI-11` |
 | `QS-5` | Planned | `BI-18` (the dashboard date filter) | `AI-12` (variables part) |
 | `SEC-14` | Building | — | `SRC-4` (credentials) |
-| `AI-10` | Planned | `RPT-1`, `BI-1` | — |
 | `AI-11` | Planned | `BI-19`, `BI-26`, `DEC-8` | — |
 | `AI-12` | Building | `QS-5` (variables part) | — |
 | `AI-13` | Planned | `BI-14` | — |
@@ -326,7 +323,7 @@ parity), built after it.
 
 **Ready to start** (Todo, Planned or Idea, nothing open blocks it; Idea items still need a spec):
 
-`ADM-1`, `ADM-2`, `AI-21`, `AI-22`, `BI-1`, `BI-14`, `BI-20`, `BI-27`, `BI-28`, `BI-29`, `BI-3`, `BI-30`, `BI-31`, `BI-32`, `BI-33`, `BI-34`, `BI-35`, `BI-4`, `BI-5`, `BIZ-1`, `BIZ-2`, `BLD-10`, `BLD-6`, `DATA-18`, `DATA-20`, `DATA-21`, `DATA-22`, `DATA-23`, `DATA-24`, `DATA-25`, `DATA-26`, `DATA-27`, `DATA-32`, `DATA-4`, `DATA-5`, `DATA-6`, `DATA-8`, `DOC-2`, `GOV-1`, `GOV-3`, `GOV-5`, `INT-2`, `OPS-2`, `OPS-3`, `OPS-6`, `OPS-8`, `QA-1`, `QRY-1`, `QS-2`, `QS-3`, `REL-1`, `REL-2`, `REL-4`, `REL-7`, `SEC-22`, `SEC-34`, `SEC-4`, `SEC-40`, `SEC-50`, `SEC-7`, `SRC-15`, `SRC-18`, `SRC-2`, `SRC-22`, `SRC-23`, `SRC-24`, `SRC-25`, `SRC-26`, `SRC-27`, `SRC-28`, `SRC-30`, `SRC-31`, `SRC-33`, `SRC-34`, `SRC-5`, `VER-1`
+`ADM-1`, `ADM-2`, `AI-10`, `AI-21`, `AI-22`, `BI-14`, `BI-19`, `BI-20`, `BI-27`, `BI-28`, `BI-29`, `BI-3`, `BI-30`, `BI-31`, `BI-32`, `BI-33`, `BI-34`, `BI-35`, `BI-4`, `BI-5`, `BIZ-1`, `BIZ-2`, `BLD-10`, `BLD-6`, `DATA-18`, `DATA-20`, `DATA-21`, `DATA-22`, `DATA-23`, `DATA-24`, `DATA-25`, `DATA-26`, `DATA-27`, `DATA-32`, `DATA-4`, `DATA-5`, `DATA-6`, `DATA-8`, `DOC-2`, `GOV-1`, `GOV-3`, `GOV-5`, `INT-2`, `OPS-2`, `OPS-3`, `OPS-6`, `OPS-8`, `QA-1`, `QRY-1`, `QS-2`, `QS-3`, `REL-1`, `REL-2`, `REL-4`, `REL-7`, `SEC-22`, `SEC-34`, `SEC-4`, `SEC-40`, `SEC-50`, `SEC-7`, `SRC-15`, `SRC-18`, `SRC-2`, `SRC-22`, `SRC-23`, `SRC-24`, `SRC-25`, `SRC-26`, `SRC-27`, `SRC-28`, `SRC-30`, `SRC-31`, `SRC-33`, `SRC-34`, `SRC-5`, `VER-1`
 
 ## Dates
 
@@ -455,6 +452,8 @@ set by the product owner and are left empty until they are.
 | `SEC-47` | 2026-10-23 | 2026-10-24 | |
 | `SEC-49` | 2026-10-25 | 2026-10-26 | |
 | `SEC-52` | 2026-10-24 | 2026-10-24 | |
+| `BI-1` | 2026-10-17 | 2026-10-26 | |
+| `RPT-1` | 2026-10-17 | 2026-10-26 | |
 
 ## Decide
 
