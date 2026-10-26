@@ -250,7 +250,13 @@ pub async fn login(State(state): State<AppState>, body: Bytes) -> ApiResult<Resp
         Err(err) => {
             // SEC-49: the try was counted before hashing; a storage error is
             // not a wrong password, so give the count back (best-effort).
-            if let Err(refund_err) = throttle::refund_attempt(pool, &key).await {
+            // The refund also takes away a lock this very try set (PR #236
+            // review SHOULD-FIX 1): the try that reaches the limit locks
+            // the key, and a storage error after that must not leave a real
+            // user locked out over a database hiccup.
+            if let Err(refund_err) =
+                throttle::refund_attempt(pool, &key, &state.throttle_policy).await
+            {
                 tracing::warn!(%refund_err, "failed to refund a login attempt");
             }
             tracing::warn!(error = %err, "login failed with a non-credential error");

@@ -215,21 +215,49 @@ async fn bump(
 /// count and no lock is deleted, so a storage failure leaves no row. One
 /// statement; it never goes below zero.
 ///
+/// The refund also undoes the LOCK the same try may have set (PR #236
+/// review SHOULD-FIX 1): [`record_attempt`] locks the key as soon as the
+/// count reaches [`ThrottlePolicy::max_failures`], so a storage error
+/// after that point used to leave the row locked for the whole lockout
+/// even though only `max_failures - 1` wrong passwords were ever checked
+/// — before SEC-49 a storage error never locked. The lock is cleared in
+/// the same statement whenever the decremented count falls below
+/// `max_failures`; a count still at the limit keeps its lock.
+///
 /// # Errors
 ///
 /// Returns [`AuthError::Database`] on a storage failure.
-pub async fn refund_attempt(pool: &PgPool, key: &str) -> Result<(), AuthError> {
+pub async fn refund_attempt(
+    pool: &PgPool,
+    key: &str,
+    policy: &ThrottlePolicy,
+) -> Result<(), AuthError> {
+    let max: i32 = i32::try_from(policy.max_failures).unwrap_or(i32::MAX);
+    // One statement. Both branches read the pre-update row, so the
+    // "decremented count" is the same value in each: the DELETE branch
+    // refunds the last count (a row left with no count and no lock is
+    // removed), the UPDATE branch refunds a count above one. A lock is
+    // cleared whenever that decremented count falls below `max_failures`
+    // (PR #236 review SHOULD-FIX 1) — `GREATEST(.., 0)` states the
+    // "never below zero" rule in the statement itself.
     sqlx::query(
         "WITH gone AS ( \
            DELETE FROM login_throttle \
-           WHERE key_hash = $1 AND failures <= 1 AND locked_until IS NULL \
+           WHERE key_hash = $1 AND failures <= 1 \
+             AND (locked_until IS NULL OR GREATEST(failures - 1, 0) < $2) \
            RETURNING 1 \
          ) \
-         UPDATE login_throttle SET failures = failures - 1 \
+         UPDATE login_throttle SET \
+           failures = GREATEST(failures - 1, 0), \
+           locked_until = CASE \
+             WHEN GREATEST(failures - 1, 0) < $2 THEN NULL \
+             ELSE locked_until \
+           END \
          WHERE key_hash = $1 AND failures > 1 \
            AND NOT EXISTS (SELECT 1 FROM gone)",
     )
     .bind(key)
+    .bind(max)
     .execute(pool)
     .await?;
     Ok(())
