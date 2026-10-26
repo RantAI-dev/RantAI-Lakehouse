@@ -47,10 +47,14 @@ choices below are the planner's, where the spec leaves room.
 
 ## Acceptance checklist (product owner, on a running console)
 
-- [ ] Every Target row of the spec works as written
-- [ ] On a fresh compose install, a test against `127.0.0.1` is refused
-- [ ] A REST test against a public URL that redirects to `169.254.169.254` is refused
-- [ ] The refusal names no address
-- [ ] With the allow-list set to the source's network, the same test runs
-- [ ] Deleting a change-capture connector whose target is internal is refused, and `force=true` removes it
-- [ ] A user without the permission is refused
+- [x] Every Target row of the spec works as written (Pass 2026-10-23, product owner)
+- [x] On a fresh compose install, a test against `127.0.0.1` is refused (Pass 2026-10-23, product owner)
+- [x] A REST test against a public URL that redirects to `169.254.169.254` is refused (Pass 2026-10-23, product owner)
+- [x] The refusal names no address (Pass 2026-10-23, product owner)
+- [x] With the allow-list set to the source's network, the same test runs (Pass 2026-10-23, product owner)
+- [x] Deleting a change-capture connector whose target is internal is refused, and `force=true` removes it (Pass 2026-10-23, product owner)
+- [x] A user without the permission is refused (Pass 2026-10-23, product owner)
+
+**Acceptor** (not the Owner): product owner (held in the base) **Date:** 2026-10-23 **Build:** main 0e5498d2
+
+Exceptions, each with an owner and a date: none.

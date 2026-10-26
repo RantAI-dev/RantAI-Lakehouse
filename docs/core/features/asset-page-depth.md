@@ -8,12 +8,12 @@
 | Backlog | `DATA-15` |
 | Spec | `docs/core/specs/data-15.md` |
 | Kind | Feature |
-| Status | In review (Phase 2 PR #106) |
+| Status | Released (accepted 2026-10-23; Phase 2 PR #106) |
 | Priority | P2 |
 | Owner | The module's owner, in the base. Not named here (the repo is public). |
 | Acceptor | Who runs the acceptance checklist; not the Owner. Held in the base. |
 | Started | 2026-10-14 |
-| Shipped | Not yet |
+| Shipped | 2026-10-21 |
 | Evidence | The Phase 2 pull request (#106) |
 | Plan | `docs/superpowers/plans/2026-10-16-data-15-asset-page-depth.md` |
 
@@ -92,23 +92,23 @@ them with the decisions above.
 | ID | Do this | Expect | Result |
 | --- | --- | --- | --- |
 | `DATA-15-AC1` | Open a table's preview and page through it | Up to 1,000 rows reachable; masked columns masked at every page | Pass 2026-10-19 (product owner, QA instance of #106) |
-| `DATA-15-AC2` | Open a table's usage with 30 days of history | Queries, frequent users, frequent queries, joined tables for 30 days; column popularity as recorded, or "not recorded" | Not run: the QA instance has no 30 days of query history; the card and its figures were seen empty |
+| `DATA-15-AC2` | Open a table's usage with 30 days of history | Queries, frequent users, frequent queries, joined tables for 30 days; column popularity as recorded, or "not recorded" | Pass 2026-10-23 (product owner) |
 | `DATA-15-AC3` | As `access:approve`, grant a user access from the table's Access tab | The grantee can read the table; the grant expires in 30 days; the audit trail names both | Pass 2026-10-19 (product owner, QA instance of #106) |
 | `DATA-15-AC4` | Revoke that grant | The grantee loses access at once | Pass 2026-10-19 (product owner, QA instance of #106) |
-| `DATA-15-AC5` | Without `access:approve`, open the Access tab | No grant or revoke controls | Not run: needs a user without `access:approve`; covered by `tests/route_auth.rs` in CI |
-| `DATA-15-AC6` | Drop an Iceberg table, then restore it from its page within the window | The table is back and readable | Not run in the console: the QA instance has no Lakekeeper admin token; the `g3a` gate step drops and restores a table in CI |
-| `DATA-15-AC7` | Try to restore a table dropped before the window, or a ClickHouse table | An honest refusal with the reason | Not run: as AC6 |
-| `DATA-15-AC8` | Load a table through the pipeline, then read its history | The new version names the pipeline principal as author; an old version says "unknown" | Not run: no load through the product's own commits on the QA instance |
-| `DATA-15-AC9` | As a user without the permission, call the restore route | 403; nothing changes | Not run: covered by `tests/route_auth.rs` in CI |
+| `DATA-15-AC5` | Without `access:approve`, open the Access tab | No grant or revoke controls | Pass 2026-10-23 (product owner) |
+| `DATA-15-AC6` | Drop an Iceberg table, then restore it from its page within the window | The table is back and readable | Pass 2026-10-23 (product owner) |
+| `DATA-15-AC7` | Try to restore a table dropped before the window, or a ClickHouse table | An honest refusal with the reason | Pass 2026-10-23 (product owner) |
+| `DATA-15-AC8` | Load a table through the pipeline, then read its history | The new version names the pipeline principal as author; an old version says "unknown" | Pass 2026-10-23 (product owner) |
+| `DATA-15-AC9` | As a user without the permission, call the restore route | 403; nothing changes | Pass 2026-10-23 (product owner) |
 
-**Acceptor** (not the Owner): __________ **Date:** ______ **Build:** ______
+**Acceptor** (not the Owner): product owner (held in the base) **Date:** 2026-10-23 **Build:** main 0e5498d2
 
 Exceptions, each with an owner and a date:
 
 ## After acceptance
 
 - [ ] `PRODUCT.md` sections 2 and 3 updated
-- [ ] `BACKLOG.md` status set to **In Acceptance** with the PR; **Released**
+- [x] `BACKLOG.md` status set to **In Acceptance** with the PR; **Released**
       after this checklist passes; Dates given the Shipped date
 - [ ] The base row updated to match the repo
 - [ ] `CHANGELOG.md` entry a customer can read
