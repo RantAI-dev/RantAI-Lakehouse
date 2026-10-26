@@ -391,6 +391,11 @@ async fn an_upload_creates_the_region_lookup_in_order_and_a_delete_drops_it() {
     let sent = statements(&engine).await;
     let order = [
         position(&sent, "CREATE TABLE IF NOT EXISTS console.geo_region"),
+        // PR #246 review BLOCKER 2: the dictionary reads as a dedicated
+        // engine user with NO password, which the API creates and grants
+        // right where the table it reads is created.
+        position(&sent, "CREATE USER IF NOT EXISTS lakehouse_geo"),
+        position(&sent, "GRANT SELECT ON console.geo_region TO lakehouse_geo"),
         position(&sent, "INSERT INTO console.geo_region"),
         position(
             &sent,
@@ -402,13 +407,15 @@ async fn an_upload_creates_the_region_lookup_in_order_and_a_delete_drops_it() {
         ),
     ];
     assert!(order.windows(2).all(|w| w[0] < w[1]), "{order:?}");
-    // The full boundaries, both regions, and the dictionary reads as the engine user.
-    assert!(sent[order[1]].contains("North") && sent[order[1]].contains("South"));
+    // The full boundaries, both regions, and the dictionary reads as the
+    // password-less engine user — no credential in the DDL.
+    assert!(sent[order[3]].contains("North") && sent[order[3]].contains("South"));
     assert!(
-        sent[order[2]].contains("USER 'default' PASSWORD '' QUERY"),
+        sent[order[4]].contains("USER 'lakehouse_geo' QUERY"),
         "{}",
-        sent[order[2]]
+        sent[order[4]]
     );
+    assert!(!sent[order[4]].contains("PASSWORD"), "{}", sent[order[4]]);
     assert_eq!(region_lookup_of(&app, &id).await, Some(true));
 
     let gone = send(

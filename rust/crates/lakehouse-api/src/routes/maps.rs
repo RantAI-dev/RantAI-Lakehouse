@@ -325,9 +325,12 @@ pub async fn create(
 /// Creates the map's region lookup on the engine (`console.geo_region` rows,
 /// then the polygon dictionary, loaded at once) and records that it exists.
 ///
-/// Verified on a throwaway `ClickHouse` 26.8.9.10 with a password on the user
-/// (`docs/plans/BI-16C-RESULT.md`); the dictionary reads as the API's own
-/// engine user. Any failure is
+/// Measured on a throwaway `ClickHouse` 26.8.30.8
+/// (`docs/plans/BI-16C-RESULT.md`): the dictionary reads as the engine user
+/// `lakehouse_geo`, which has NO password, may log in from the local host only
+/// and may only SELECT the boundary table (`PR #246 review BLOCKER 2`), so no
+/// credential is written into the dictionary's DDL or into the engine's own
+/// metadata. Any failure is
 /// logged under a reference id, undone as far as it can be, and leaves the
 /// flag off: the map stays usable for drawing, and the formula compiler tells
 /// `RegionOf` that the map has no lookup.
@@ -340,15 +343,19 @@ async fn enable_region_lookup(
     let ch = &state.clickhouse;
     let steps = async {
         ch.exec(lakehouse_bi::geo::REGION_TABLE_DDL, None).await?;
+        // PR #246 review BLOCKER 2: the dictionary reads as a dedicated
+        // engine user with NO password, which may log in from the local host
+        // only and may only SELECT the boundary table. The API creates it
+        // (and grants it) here, right where the table it reads is created
+        // and at the same "first upload that needs it" moment; both
+        // statements are idempotent.
+        ch.exec(lakehouse_bi::geo::GEO_USER_DDL, None).await?;
+        ch.exec(lakehouse_bi::geo::GEO_GRANT_DDL, None).await?;
         for statement in inserts {
             ch.exec(statement, None).await?;
         }
         for sql in [
-            lakehouse_bi::geo::dictionary_ddl(
-                &map.id,
-                &state.config.ch_user,
-                &state.config.ch_password,
-            ),
+            lakehouse_bi::geo::dictionary_ddl(&map.id),
             lakehouse_bi::geo::reload_dictionary_sql(&map.id),
         ]
         .into_iter()

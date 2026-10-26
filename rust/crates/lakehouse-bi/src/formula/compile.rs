@@ -2530,7 +2530,7 @@ mod tests {
         let url = std::env::var("LIVE_CH_URL").expect("LIVE_CH_URL");
         let user = std::env::var("LIVE_CH_USER").unwrap_or_else(|_| "default".to_owned());
         let password = std::env::var("LIVE_CH_PASSWORD").unwrap_or_default();
-        let ch = ChClient::new(url, user.clone(), password.clone());
+        let ch = ChClient::new(url, user, password);
         let id = "m_cccccccccccc";
         let file = include_bytes!("../../../../../public/geo/id-provinces.geojson");
         let checked = crate::geo::validate(file, "name").unwrap();
@@ -2538,6 +2538,11 @@ mod tests {
             .await
             .unwrap();
         ch.exec(crate::geo::REGION_TABLE_DDL, None).await.unwrap();
+        // PR #246 review BLOCKER 2: the dictionary reads as the dedicated
+        // engine user with no password, which the API creates next to the
+        // table it reads.
+        ch.exec(crate::geo::GEO_USER_DDL, None).await.unwrap();
+        ch.exec(crate::geo::GEO_GRANT_DDL, None).await.unwrap();
         ch.exec(&crate::geo::delete_regions_sql(id).unwrap(), None)
             .await
             .unwrap();
@@ -2547,12 +2552,9 @@ mod tests {
         ch.exec(&crate::geo::drop_dictionary_sql(id).unwrap(), None)
             .await
             .unwrap();
-        ch.exec(
-            &crate::geo::dictionary_ddl(id, &user, &password).unwrap(),
-            None,
-        )
-        .await
-        .unwrap();
+        ch.exec(&crate::geo::dictionary_ddl(id).unwrap(), None)
+            .await
+            .unwrap();
         ch.exec(&crate::geo::reload_dictionary_sql(id).unwrap(), None)
             .await
             .unwrap();
