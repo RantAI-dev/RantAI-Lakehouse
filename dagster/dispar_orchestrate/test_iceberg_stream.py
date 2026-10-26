@@ -9,6 +9,7 @@ Driven on a local catalog, the harness of `test_sink_dedup_marker.py`.
 from __future__ import annotations
 
 from collections.abc import Iterator
+from datetime import datetime, timezone
 
 import dlt
 import pyarrow as pa
@@ -51,8 +52,10 @@ def test_a_replace_of_several_groups_is_one_commit_with_every_row(lab: Lab, monk
     cut: list[int] = []
     real = iceberg_stream.groups
 
-    def counting(dataset):
-        for group in real(dataset):
+    def counting(dataset, schema=None):
+        # `PR #186 review SHOULD-FIX 2`: `groups` takes the unified schema now (it computes
+        # it when it is not given one), so the wrapper takes it too.
+        for group in real(dataset, schema):
             cut.append(group.num_rows)
             yield group
 
@@ -100,6 +103,93 @@ def test_groups_are_cut_by_bytes_and_none_is_lost(tmp_path) -> None:
 
     assert len(cut) > 1, "2,000 bytes is far less than the file"
     assert sum(group.num_rows for group in cut) == 1000
+
+
+def test_groups_of_files_with_different_columns_are_joined_and_padded(tmp_path) -> None:
+    """`PR #186 review SHOULD-FIX 2`: `dlt` starts a new normalized file when a table's column
+    count changes, so the files of one load do not all have the same schema, and
+    `pa.Table.from_batches` refuses batches of different schemas."""
+    import pyarrow.parquet as pq
+
+    first = tmp_path / "one.parquet"
+    second = tmp_path / "two.parquet"
+    pq.write_table(pa.table({"id": pa.array(["1"], type=pa.string())}), first)
+    pq.write_table(
+        pa.table({"id": pa.array(["2"], type=pa.string()), "late": pa.array(["x"], type=pa.string())}),
+        second,
+    )
+
+    class Dataset:
+        files = [str(first), str(second)]
+
+    cut = list(iceberg_stream.groups(Dataset()))
+
+    assert sum(group.num_rows for group in cut) == 2
+    table = pa.concat_tables(cut)
+    assert table.schema.names == ["id", "late"], "the union of the files' columns"
+    assert table.column("late").to_pylist() == [None, "x"], "the column a file does not have is null in it"
+
+
+def test_a_write_whose_files_have_different_columns_adds_the_column_and_writes_it(lab: Lab, tmp_path) -> None:
+    """`PR #186 review SHOULD-FIX 2`, at the write: the files of one load do not all have the
+    same columns, the column the first file does not have is null in it, and the table
+    carries it (the table is evolved inside the transaction that writes the rows)."""
+    import pyarrow.parquet as pq
+
+    from dispar_orchestrate.adapters import sink as sink_module
+
+    load_via_sink(_resource(10), "streamed", lab.config, LoadPlan(mode="replace"))
+    pipeline = lab.pipeline("streamed")
+    table = sink_module.history.open_table(pipeline, "streamed", sync=False)
+    arrow = table.schema().as_arrow()
+
+    def _row(with_late: bool) -> pa.Table:
+        data = {}
+        for field in arrow:
+            if pa.types.is_timestamp(field.type):
+                data[field.name] = pa.array([datetime.now(timezone.utc)], type=field.type)
+            else:
+                data[field.name] = pa.array(["x"], type=field.type)
+        if with_late:
+            data["late"] = pa.array(["y"], type=pa.string())
+        return pa.table(data)
+
+    first = tmp_path / "one.parquet"
+    second = tmp_path / "two.parquet"
+    pq.write_table(_row(False), first)
+    pq.write_table(_row(True), second)
+
+    class Dataset:
+        files = [str(first), str(second)]
+        schema = arrow
+
+    iceberg_stream._write(table, iceberg_stream._Streamed(Dataset()), "append", lambda **_kwargs: None)
+
+    written = lab.rows("streamed")
+    assert len(written) == 12, "the ten rows of the load and the two of the write"
+    lates = [row.get("late") for row in written]
+    assert lates.count("y") == 1, "the new column is written"
+    assert lates.count(None) == 11, "the column the first file does not have is null in it"
+    assert "late" in [field.name for field in lab.table("streamed").schema().fields], "the table carries it"
+
+
+def test_a_load_whose_later_file_has_a_new_column_writes_it(lab: Lab) -> None:
+    """`PR #186 review SHOULD-FIX 2`, end to end: a resource whose second batch brings a field
+    the first one does not have. The load writes the column; the table carries it."""
+    def rows():
+        yield pa.table({"id": pa.array(["1"], type=pa.string())})
+        yield pa.table({"id": pa.array(["2"], type=pa.string()), "late": pa.array(["x"], type=pa.string())})
+
+    resource = dlt.resource(rows(), name="streamed")
+    resource.apply_hints(columns=[{"name": "id", "data_type": "text"}])
+    load_via_sink(resource, "streamed", lab.config, LoadPlan(mode="replace"))
+
+    written = {row["id"]: row for row in lab.rows("streamed")}
+    assert set(written) == {"1", "2"}, "both rows are written"
+    assert written["1"].get("late") is None, "the column the first file does not have is null in it"
+    assert written["2"].get("late") == "x", "the new column is written, not dropped"
+    fields = [field.name for field in lab.table("streamed").schema().fields]
+    assert "late" in fields, "the table carries the new column"
 
 
 def test_a_load_of_no_rows_still_commits_one_snapshot_as_dlt_did(lab: Lab) -> None:
