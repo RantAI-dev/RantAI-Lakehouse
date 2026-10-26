@@ -50,7 +50,7 @@ pub(super) fn handles(name: &str) -> bool {
 
 /// The fields `format_chart` may change: the style block of `ChartInput` and
 /// the reference lines. Everything else of the chart is out of its reach.
-pub(crate) const FORMAT_FIELDS: [&str; 10] = [
+pub(crate) const FORMAT_FIELDS: [&str; 11] = [
     "format",
     "valueFormats",
     "dateFormat",
@@ -60,6 +60,7 @@ pub(crate) const FORMAT_FIELDS: [&str; 10] = [
     "annotations",
     "tooltip",
     "conditional",
+    "clusters",
     "referenceLines",
 ];
 
@@ -581,6 +582,60 @@ mod tests {
         );
     }
 
+    /// `BI-17` part B (plan D6): `format_chart` carries a forecast line and the
+    /// clusters setting, checked with the console's own sentences.
+    #[test]
+    fn a_forecast_line_and_clusters_are_saved_and_checked() {
+        let after = merge_format(
+            &stored(),
+            &args(json!({ "chart": "c1", "referenceLines": [{ "kind": "forecast", "horizon": 6, "label": "Outlook" }] })),
+        )
+        .unwrap();
+        let line = &after.shape.reference_lines.unwrap()[0];
+        assert_eq!(
+            (line.kind, line.horizon),
+            (lakehouse_bi::params::LineKind::Forecast, Some(6))
+        );
+        let e = merge_format(
+            &stored(),
+            &args(
+                json!({ "chart": "c1", "referenceLines": [{ "kind": "forecast", "horizon": 99 }] }),
+            ),
+        )
+        .unwrap_err();
+        assert!(e.contains("horizon of 1 to 60"), "{e}");
+
+        let scatter: ChartInput = serde_json::from_value(json!({
+            "title": "Stores", "mart": "mart_x", "kind": "scatter",
+            "dimension": "store", "measures": ["sales", "visits"], "board": "b1",
+        }))
+        .unwrap();
+        let after = merge_format(
+            &scatter,
+            &args(json!({ "chart": "c1", "clusters": { "k": 4 } })),
+        )
+        .unwrap();
+        assert!(after.style.clusters.is_some());
+        let e = merge_format(
+            &stored(),
+            &args(json!({ "chart": "c1", "clusters": { "k": "auto" } })),
+        )
+        .unwrap_err();
+        assert!(
+            e.contains("clusters is only for a scatter or bubble chart"),
+            "{e}"
+        );
+        let e = merge_format(
+            &scatter,
+            &args(json!({ "chart": "c1", "clusters": { "k": 11 } })),
+        )
+        .unwrap_err();
+        assert!(e.contains("from 2 to 10"), "{e}");
+        let removed =
+            merge_format(&after, &args(json!({ "chart": "c1", "clusters": null }))).unwrap();
+        assert!(removed.style.clusters.is_none());
+    }
+
     #[test]
     fn the_request_of_ai_8_ac1_applies_all_three_changes() {
         // "Show values in rupiah, make the bars green, add a target line at 1,000."
@@ -681,6 +736,7 @@ mod tests {
                 "format": {}, "valueFormats": {"v": {}}, "dateFormat": {}, "colors": {}, "axes": {},
                 "labels": {"show": true}, "annotations": [{"x": "a", "text": "t"}], "tooltip": {"fields": ["v"]},
                 "conditional": [{"column": "v", "rule": {"type": "contains", "text": "x"}, "color": "#000000"}],
+                "clusters": {"k": "auto"},
             }))
             .unwrap(),
             ..stored()

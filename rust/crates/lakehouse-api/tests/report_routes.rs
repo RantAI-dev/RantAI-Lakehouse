@@ -26,6 +26,10 @@ use wiremock::{Mock, MockServer, Request as MockRequest, Respond, ResponseTempla
 
 const BOARD: &str = "b_rpt";
 
+/// The seeded tenants (`0002_seed_identity.sql`).
+const MERIDIAN_GROUP: Uuid = Uuid::from_u128(0x11111111_1111_4111_8111_000000000001);
+const MERIDIAN_RETAIL: Uuid = Uuid::from_u128(0x11111111_1111_4111_8111_000000000002);
+
 struct FakeCh;
 
 impl Respond for FakeCh {
@@ -653,6 +657,83 @@ async fn the_recipient_picker_lists_only_active_people_at_most_twenty_with_name_
     let cookie = session_cookie_for_user(&f.app.pool, nobody).await;
     let (status, _) = call(&f, "GET", "/api/reports/recipients?q=a", &cookie, None).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+/// `PR #204` review (SHOULD-FIX) 1: the picker is scoped to the caller's
+/// tenants, and a recipient who shares no tenant with the owner is refused
+/// when the subscription is saved.
+#[tokio::test]
+async fn a_recipient_outside_the_callers_tenants_is_not_listed_and_is_refused_at_save() {
+    let f = fixture(&[]).await;
+    let insider = user_id(&f.app.pool, "Insider", "active").await;
+    let outsider = user_id(&f.app.pool, "Outsider", "active").await;
+    for (person, tenant) in [
+        (f.owner, MERIDIAN_GROUP),
+        (insider, MERIDIAN_GROUP),
+        (outsider, MERIDIAN_RETAIL),
+    ] {
+        sqlx::query("INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2)")
+            .bind(person)
+            .bind(tenant)
+            .execute(&f.app.pool)
+            .await
+            .unwrap();
+    }
+
+    let (status, listed) = call(
+        &f,
+        "GET",
+        "/api/reports/recipients?q=insider",
+        &f.owner_cookie,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let names: Vec<&str> = listed["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["Insider"], "only the caller's own tenant");
+    let (_, others) = call(
+        &f,
+        "GET",
+        "/api/reports/recipients?q=outsider",
+        &f.owner_cookie,
+        None,
+    )
+    .await;
+    assert!(
+        others["items"].as_array().unwrap().is_empty(),
+        "a person in another tenant is not listed"
+    );
+
+    // Saving with that person as a recipient is refused.
+    let (status, err) = call(
+        &f,
+        "POST",
+        SUBS,
+        &f.owner_cookie,
+        Some(body(json!([{ "userId": outsider.to_string() }]))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
+    assert_eq!(
+        err["error"].as_str(),
+        Some("Every console recipient must be in one of your tenants.")
+    );
+
+    // A person who shares a tenant with the owner is accepted.
+    let (status, made) = call(
+        &f,
+        "POST",
+        SUBS,
+        &f.owner_cookie,
+        Some(body(json!([{ "userId": insider.to_string() }]))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{made}");
 }
 
 #[tokio::test]

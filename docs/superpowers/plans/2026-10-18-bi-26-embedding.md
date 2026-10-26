@@ -330,3 +330,15 @@ Passed:
 - The settings are kept after reopening.
 
 BI-26 QA passed.
+
+### Re-review after fix round 1 (Evan's planner, 2026-10-26, at `ac0782ab`)
+
+Every finding of Review 1 is closed in the code:
+- **R1 (BLOCKER), closed.** In `resolve_embed_filters` (`routes/embed.rs`), the token's value replaces the saved filter for a locked column and for an editable column the token sets. Hidden columns stay ANDed.
+- **R4, closed.** Embed pages allow `'self'` in `frame-ancestors` (`src/lib/csp.ts`). A dry merge with `main`'s SEC-47 CSP keeps this, and every other page keeps `'none'`.
+- **R6, closed.** `put_settings` reuses `public_links::managed_board`, and the frame-origins route reuses `verified_claims` and `admit`.
+- R2, R3 and R5 are closed per the fix-round handoff, with the tests named there.
+
+Owner QA passed (above). No BLOCKER is open.
+
+`T6`, the assistant's embed tools, is `AI-11`: a separate item Blocked by `BI-19`, `BI-26` and `DEC-8`, so it is not part of PR #235.

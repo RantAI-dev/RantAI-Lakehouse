@@ -92,6 +92,159 @@ describe("uploadService requests", () => {
     expect((init.headers as Headers).has("Content-Type")).toBe(false)
   })
 
+  it("opens a chunked upload with a JSON body of the name and the size", async () => {
+    const calls = stubFetch(() =>
+      json({ upload: { ...UPLOAD, status: "receiving" }, partSize: 8 * 1024 * 1024, partCount: 3 }, 201)
+    )
+    const session = await uploadService.createSession({ filename: "big.csv", sizeBytes: 20_000_000 })
+
+    expect(session.partCount).toBe(3)
+    expect(session.partSize).toBe(8 * 1024 * 1024)
+    const { url, init } = calls[0]!
+    expect(url).toBe("/api/uploads/sessions")
+    expect(init.method).toBe("POST")
+    expect((init.headers as Headers).get("Content-Type")).toBe("application/json")
+    expect(JSON.parse(init.body as string)).toEqual({ filename: "big.csv", sizeBytes: 20_000_000 })
+  })
+
+  it("sends a piece as a raw PUT of the bytes to its numbered path", async () => {
+    const calls = stubFetch(() => json({ partNumber: 2, sizeBytes: 4 }))
+    const piece = new Blob(["abcd"])
+    const receipt = await uploadService.putPart("up 1", 2, piece)
+
+    expect(receipt).toEqual({ partNumber: 2, sizeBytes: 4 })
+    const { url, init } = calls[0]!
+    expect(url).toBe("/api/uploads/up%201/parts/2")
+    expect(init.method).toBe("PUT")
+    expect((init.headers as Headers).get("Content-Type")).toBe("application/octet-stream")
+    expect(init.body).toBe(piece)
+  })
+
+  it("carries the 429's Retry-After on the error of a piece, and the API's sentence as its message", async () => {
+    stubFetch(
+      () =>
+        new Response(JSON.stringify({ error: "Too many uploads are in progress. Try again in a moment." }), {
+          status: 429,
+          headers: { "Content-Type": "application/json", "Retry-After": "5" },
+        })
+    )
+    const err = await rejection(uploadService.putPart("up-1", 1, new Blob(["a"])))
+    expect(err.status).toBe(429)
+    expect(err.retryAfterSecs).toBe(5)
+    expect(err.message).toBe("Too many uploads are in progress. Try again in a moment.")
+  })
+
+  it("leaves retryAfterSecs unset for a 429 that names none, and for every other status", async () => {
+    stubFetch(() => json({ error: "No." }, 429))
+    expect((await rejection(uploadService.putPart("up-1", 1, new Blob(["a"])))).retryAfterSecs).toBeUndefined()
+    stubFetch(
+      () => new Response(JSON.stringify({ error: "No." }), { status: 503, headers: { "Retry-After": "7" } })
+    )
+    expect((await rejection(uploadService.putPart("up-1", 1, new Blob(["a"])))).retryAfterSecs).toBeUndefined()
+  })
+
+  it("does not show a proxy's plain-text answer to a piece: it says the upload did not reach the service", async () => {
+    stubFetch(() => new Response("Request Entity Too Large", { status: 413 }))
+    const err = await rejection(uploadService.putPart("up-1", 1, new Blob(["a"])))
+    expect(err.status).toBe(413)
+    expect(err.message).toContain("did not reach the service")
+    // The chunked path names its own limit, 2 GB, not the 50 MB of `POST /api/uploads`.
+    expect(err.message).toContain("2 GB")
+    expect(err.message).not.toContain("Request Entity Too Large")
+  })
+
+  it("reads the pieces the API holds, and completes an upload with a POST that has no body", async () => {
+    const calls = stubFetch(() => json({ received: [1, 3], partSize: 8, partCount: 3 }))
+    expect(await uploadService.listParts("up-1")).toEqual({ received: [1, 3], partSize: 8, partCount: 3 })
+    expect(calls[0]!.url).toBe("/api/uploads/up-1/parts")
+    expect(calls[0]!.init.method).toBeUndefined()
+
+    const done = stubFetch(() => json({ ...UPLOAD, duplicateOf: { ...UPLOAD, id: "up-0" } }))
+    const completed = await uploadService.complete("up-1")
+    expect(completed.duplicateOf?.id).toBe("up-0")
+    expect(done[0]!.url).toBe("/api/uploads/up-1/complete")
+    expect(done[0]!.init.method).toBe("POST")
+    expect(done[0]!.init.body).toBeUndefined()
+  })
+
+  it("shows the API's sentence when completion is refused", async () => {
+    stubFetch(() => json({ error: "Some pieces have not arrived: 2." }, 409))
+    const err = await rejection(uploadService.complete("up-1"))
+    expect(err.status).toBe(409)
+    expect(err.message).toBe("Some pieces have not arrived: 2.")
+  })
+
+  it("checks a column list: the reading in force and the columns, as JSON, stored by nobody", async () => {
+    const calls = stubFetch(() => json({ sampledRows: 3, count: 1, byColumn: [{ column: "qty", count: 1 }], rows: [{ row: 2, column: "qty", value: "abc" }] }))
+    const columns = [{ source: "Qty", name: "qty", type: "integer" as const }]
+    const result = await uploadService.check("up-1", { options: { encoding: "utf-8", delimiter: "\t", headerRow: 2 }, columns })
+    expect(result.count).toBe(1)
+    const { url, init } = calls[0]!
+    expect(url).toBe("/api/uploads/up-1/check")
+    expect(init.method).toBe("POST")
+    expect(JSON.parse(init.body as string)).toEqual({ encoding: "utf-8", delimiter: "\t", headerRow: 2, columns })
+    await uploadService.check("up-1", { columns })
+    expect(JSON.parse(calls[1]!.init.body as string)).toEqual({ columns })
+  })
+
+  it("shows the API's sentence when a column list is refused by the check", async () => {
+    stubFetch(() => json({ error: "The column list has 1 columns but the file has 2." }, 400))
+    const err = await rejection(uploadService.check("up-1", { columns: [] }))
+    expect(err.status).toBe(400)
+    expect(err.message).toBe("The column list has 1 columns but the file has 2.")
+  })
+
+  it("compares the other files with the first: their ids, the reading and the column list when there is one", async () => {
+    const mismatch = { uploadId: "up-2", file: "b.csv", missing: [], extra: ["notes"], typeConflicts: [] }
+    const calls = stubFetch(() => json({ mismatches: [mismatch] }))
+    const columns = [{ source: "Qty", name: "qty", type: "integer" as const }]
+    const result = await uploadService.compare("up-1", {
+      alsoUploads: ["up-2", "up-3"],
+      options: { encoding: "utf-8", delimiter: ";", headerRow: 1, sheet: "Stock" },
+      columns,
+    })
+    expect(result.mismatches).toEqual([mismatch])
+    const { url, init } = calls[0]!
+    expect(url).toBe("/api/uploads/up-1/compare")
+    expect(init.method).toBe("POST")
+    expect(JSON.parse(init.body as string)).toEqual({
+      alsoUploads: ["up-2", "up-3"],
+      encoding: "utf-8",
+      delimiter: ";",
+      headerRow: 1,
+      sheet: "Stock",
+      columns,
+    })
+    await uploadService.compare("up-1", { alsoUploads: ["up-2"] })
+    expect(JSON.parse(calls[1]!.init.body as string)).toEqual({ alsoUploads: ["up-2"] })
+  })
+
+  it("shows the API's sentence when a comparison is refused, and a missing file as not found", async () => {
+    stubFetch(() => json({ error: "One of the other files was not found." }, 404))
+    const err = await rejection(uploadService.compare("up-1", { alsoUploads: ["up-9"] }))
+    expect(err.status).toBe(404)
+    expect(err.code).toBe("not_found")
+    expect(err.message).toBe("One of the other files was not found.")
+  })
+
+  it("sends the other files with a load", async () => {
+    const calls = stubFetch(() => json({ upload: UPLOAD, runId: "run-1" }))
+    await uploadService.ingest("up-1", {
+      encoding: "utf-8",
+      delimiter: ",",
+      headerRow: 0,
+      bronzeTable: "stock",
+      alsoUploads: ["up-2"],
+    })
+    expect(JSON.parse(calls[0]!.init.body as string)).toMatchObject({ bronzeTable: "stock", alsoUploads: ["up-2"] })
+  })
+
+  it("asks for a preview of the columns of a table the file will be added to", async () => {
+    const calls = stubFetch(() => json({}))
+    await uploadService.preview("up-1", { headerRow: 0, table: "stock_raw" })
+    expect(calls[0]!.url).toBe("/api/uploads/up-1/preview?headerRow=0&table=stock_raw")
+  })
+
   it("asks for a preview with no query when nothing is overridden", async () => {
     const calls = stubFetch(() => json({}))
     await uploadService.preview("up-1")

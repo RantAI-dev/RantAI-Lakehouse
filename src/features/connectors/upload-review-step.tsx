@@ -3,10 +3,20 @@
 import * as React from "react"
 import { MetadataList, type MetadataItem } from "@/components/patterns/metadata-list"
 import { formatBytes, formatDateTime, formatNumber } from "@/lib/format"
-import { delimiterLabel, encodingLabel, headerRowDisplay, rawTableFullName } from "@/lib/uploads"
-import type { Upload, UploadLoadMode } from "@/services/contracts/uploads"
+import {
+  columnTypeLabel,
+  delimiterLabel,
+  encodingLabel,
+  hasFixedDialect,
+  headerRowDisplay,
+  layoutLabel,
+  rawTableFullName,
+} from "@/lib/uploads"
+import type { Upload, UploadLoadMode, UploadOnBadValue, UploadPreviewColumn } from "@/services/contracts/uploads"
 import type { UploadPreviewView } from "./upload-check-step"
 import { Refusal } from "./upload-parts"
+
+const DATE_WORDS = { iso: "year first", dmy: "day first", mdy: "month first" } as const
 
 function Group({ title, items }: { readonly title: string; readonly items: MetadataItem[] }) {
   return (
@@ -36,7 +46,10 @@ export function UploadReviewStep({
   tableName,
   offersMode,
   mode,
+  columns,
+  onBadValue,
   error,
+  otherFiles,
 }: {
   readonly upload: Upload
   readonly view: UploadPreviewView
@@ -45,24 +58,38 @@ export function UploadReviewStep({
   readonly offersMode: boolean
   /** The mode that will be sent (`replace` unless the choice was offered and made). */
   readonly mode: UploadLoadMode
+  /** The columns as chosen: names and types. */
+  readonly columns: readonly UploadPreviewColumn[]
+  /** What happens to a value that does not fit. */
+  readonly onBadValue: UploadOnBadValue
   readonly error: React.ComponentProps<typeof Refusal>["error"] | null
+  /** The names of the files loaded with the first (`DATA-17` slice 5); empty for a load of one file. */
+  readonly otherFiles: readonly string[]
 }) {
   const { settled } = view
   const using = settled?.using
   const full = rawTableFullName(tableName)
+  const files = otherFiles.length + 1
+  const several = files > 1
   const rowsSentence =
     mode === "append"
-      ? "The rows already in the table stay, and this file's are added after them."
-      : "Any rows the table already holds are replaced by this file's."
+      ? `The rows already in the table stay, and ${several ? "these files'" : "this file's"} are added after them.`
+      : `Any rows the table already holds are replaced by ${several ? "these files'" : "this file's"}.`
 
   return (
     <div className="space-y-4">
       <div className="divide-y divide-border overflow-hidden rounded-lg border border-border bg-muted/30">
         <Group
-          title="File"
+          title={several ? "Files" : "File"}
           items={[
-            { label: "Name", value: <Wrapped>{upload.originalFilename}</Wrapped> },
-            { label: "Size", value: formatBytes(upload.sizeBytes) },
+            { label: several ? "First file" : "Name", value: <Wrapped>{upload.originalFilename}</Wrapped> },
+            ...(several
+              ? [
+                  { label: "Files", value: `${files} files into ${full}` },
+                  ...otherFiles.map((name, index) => ({ label: `File ${index + 2}`, value: <Wrapped>{name}</Wrapped> })),
+                ]
+              : []),
+            { label: several ? "Size of the first" : "Size", value: formatBytes(upload.sizeBytes) },
             { label: "Uploaded", value: formatDateTime(upload.createdAt) },
           ]}
         />
@@ -75,16 +102,27 @@ export function UploadReviewStep({
                   { label: "Columns", value: String(settled.columns.length) },
                   { label: "Rows in the file", value: formatNumber(settled.parquet.rows) },
                 ]
-              : [
-                  ...(settled?.workbook
-                    ? [{ label: "Sheet", value: <Wrapped>{settled.workbook.sheet}</Wrapped> }]
-                    : [
-                        { label: "Encoding", value: using ? encodingLabel(using.encoding) : "—" },
-                        { label: "Delimiter", value: using ? delimiterLabel(using.delimiter) : "—" },
-                      ]),
-                  { label: "Header row", value: using ? String(headerRowDisplay(using.headerRow)) : "—" },
-                  { label: "Columns", value: settled ? String(settled.columns.length) : "—" },
-                ]),
+              : settled?.layout && hasFixedDialect(settled.layout)
+                ? [
+                    { label: "Format", value: layoutLabel(settled.layout) },
+                    { label: "Columns", value: String(settled.columns.length) },
+                  ]
+                : [
+                    ...(settled?.layout
+                      ? [{ label: "Format", value: layoutLabel(settled.layout) }]
+                      : []),
+                    ...(settled?.archive
+                      ? [{ label: "Files in the zip", value: String(settled.archive.files.length) }]
+                      : []),
+                    ...(settled?.workbook
+                      ? [{ label: "Sheet", value: <Wrapped>{settled.workbook.sheet}</Wrapped> }]
+                      : [
+                          { label: "Encoding", value: using ? encodingLabel(using.encoding) : "—" },
+                          { label: "Delimiter", value: using ? delimiterLabel(using.delimiter) : "—" },
+                        ]),
+                    { label: "Header row", value: using ? String(headerRowDisplay(using.headerRow)) : "—" },
+                    { label: "Columns", value: settled ? String(settled.columns.length) : "—" },
+                  ]),
           ]}
         />
         <Group
@@ -94,14 +132,34 @@ export function UploadReviewStep({
             ...(offersMode
               ? [{ label: "Rows already in it", value: mode === "append" ? "Add to its rows" : "Replace its rows" }]
               : []),
-            { label: "Column types", value: "Text" },
+          ]}
+        />
+        <Group
+          title="Columns"
+          items={[
+            ...columns.map((column, index) => ({
+              label: column.name || `Column ${index + 1}`,
+              value: (
+                <Wrapped>
+                  {columnTypeLabel(column.type)}
+                  {column.dateFormat !== undefined ? `, read ${DATE_WORDS[column.dateFormat]}` : ""}
+                </Wrapped>
+              ),
+            })),
+            { label: "A value that does not fit", value: onBadValue === "stop" ? "Stops the load" : "Is loaded as empty" },
           ]}
         />
       </div>
       <p className="text-sm text-muted-foreground">
-        Load reads <span className="break-words font-medium text-foreground">{upload.originalFilename}</span> with these
-        settings and writes its rows to <span className="break-all font-mono text-foreground">{full}</span>, every column as
-        text. {rowsSentence} You can follow it on the next page.
+        Load reads{" "}
+        {several ? (
+          <span className="font-medium text-foreground">{files} files, the first of them {upload.originalFilename},</span>
+        ) : (
+          <span className="break-words font-medium text-foreground">{upload.originalFilename}</span>
+        )}{" "}
+        with these settings and writes {several ? "their" : "its"} rows to{" "}
+        <span className="break-all font-mono text-foreground">{full}</span>, each column with the type listed above.{" "}
+        {rowsSentence} You can follow it on the next page.
       </p>
       {error !== null ? <Refusal error={error} /> : null}
     </div>

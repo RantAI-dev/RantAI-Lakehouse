@@ -197,6 +197,13 @@ export type DashboardService = {
   setFavourite(kind: ItemKind, id: string, on: boolean, signal?: AbortSignal): Promise<void>
   /** Note that the caller opened an item (best effort). */
   touchRecent(kind: ItemKind, id: string, signal?: AbortSignal): Promise<void>
+  /**
+   * `GET /api/dashboard/charts/{id}/lineage` (`BI-14` plan D1): the path from a
+   * chart to its sources. Needs `lineage:read`; without it the server answers
+   * 403 and the call throws `permission_denied`. **Not on the server yet** (T2
+   * of the BI-14 plan).
+   */
+  chartLineage(id: string, signal?: AbortSignal): Promise<ChartLineage>
   /** Dashboards and charts whose name contains `text`, across what the caller may read. */
   searchItems(text: string, signal?: AbortSignal): Promise<ShortcutItem[]>
 }
@@ -488,3 +495,41 @@ export type DashboardFolder = {
  * `rust/crates/lakehouse-api/src/upstream_error.rs` (`UpstreamFailure::to_json`).
  */
 export type TileFailure = { error: string; errorId?: string }
+
+/**
+ * One step of a chart's path (`BI-14` plan D1). `kind` is `chart`,
+ * `sql_source`, `metric`, `gold`, `silver`, `bronze`, `connector`, `upload` or
+ * `pipeline`. `refreshedAt` is an ISO time; `refreshSource` names the record it
+ * comes from ("last Gold build", "Iceberg last update", "last connector run",
+ * "upload time"); `notRecorded` is true when no record exists, and then there is
+ * no `refreshedAt` (never a guess).
+ */
+export type LineageStep = {
+  id: string
+  kind: "chart" | "sql_source" | "metric" | "gold" | "silver" | "bronze" | "connector" | "upload" | "pipeline" | string
+  label: string
+  refreshedAt?: string
+  refreshSource?: string
+  notRecorded?: boolean
+}
+
+/** A recorded connection between two steps; `from` feeds `to`. Same shape as the lineage page's edges. */
+export type LineageStepEdge = { id: string; from: string; to: string; kind: string; evidence?: string }
+
+/** The columns one field of the chart comes from, step by step (`via` names the step: a build, a formula or a SQL source). */
+export type FieldColumns = { field: string; columns: { table: string; column: string; via: string }[] }
+
+/**
+ * `GET /api/dashboard/charts/{id}/lineage` (`BI-14` plan D1). `chart` is the
+ * chart's id and title (the plan names the field, not its shape: the console's
+ * choice, the contract for T2). `steps` come in path order, the chart first.
+ * `coverage` lists in words what the path leaves out.
+ */
+export type ChartLineage = {
+  chart: { id: string; title: string }
+  steps: LineageStep[]
+  edges: LineageStepEdge[]
+  fields: FieldColumns[]
+  coverage: string[]
+  supported: boolean
+}

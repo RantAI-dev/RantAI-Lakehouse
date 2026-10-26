@@ -16,7 +16,7 @@ use serde::Serialize;
 pub struct FnInfo {
     /// The name as it is written in the catalog.
     pub name: &'static str,
-    /// `maths`, `text`, `dates`, `conditions`, `conversion` or `aggregations`.
+    /// `maths`, `text`, `dates`, `conditions`, `conversion`, `spatial` or `aggregations`.
     pub category: &'static str,
     /// The call with its arguments, for the help line.
     pub signature: &'static str,
@@ -154,6 +154,8 @@ pub static CATALOG: &[FnInfo] = &[
     f("ToNumber", "conversion", "ToNumber(text)", "Read a text as a number; empty when it is not one.", "ToNumber([label])", (1, Some(1))),
     f("ToText", "conversion", "ToText(x)", "A number, date or true/false as text.", "ToText([amount])", (1, Some(1))),
     f("ToDate", "conversion", "ToDate(x)", "Read a text such as 2026-03-01 as a date, or take the date of a timestamp.", "ToDate('2026-03-01')", (1, Some(1))),
+    f("Distance", "spatial", "Distance(lat1, lon1, lat2, lon2, unit)", "The distance between two points on the earth (WGS 84), in metres, or in km when 'unit' is written as 'km'; 'm' is the default.", "Distance([amount], [qty], -6.9, 107.6, 'km')", (4, Some(5))),
+    f("RegionOf", "spatial", "RegionOf(map, lat, lon)", "The name of the region of an uploaded map that a point falls in, or empty when it falls in none. 'map' is the map's name or id written out. Not available to a role that has a data policy.", "RegionOf('Sales regions', [amount], [qty])", (3, Some(3))),
     agg("Sum", "Sum(x)", "The total of a number over the rows of each group.", "Sum([amount])", (1, Some(1))),
     agg("Count", "Count(x)", "The number of rows (or, with x, of rows where x is not empty).", "Count([label])", (0, Some(1))),
     agg("CountDistinct", "CountDistinct(x)", "The number of different values.", "CountDistinct([label])", (1, Some(1))),
@@ -199,7 +201,7 @@ mod tests {
         assert_eq!(names.len(), n, "a function is listed twice");
         assert_eq!(lookup("sUm").map(|f| f.name), Some("Sum"));
         assert!(lookup("Sleep").is_none());
-        assert_eq!(n, 62);
+        assert_eq!(n, 64);
     }
 
     #[test]

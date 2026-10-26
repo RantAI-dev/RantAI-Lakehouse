@@ -24,6 +24,7 @@ import { uploadService as uploadClientService } from "./clients/uploads"
 import { homeService as homeClientService } from "./clients/home"
 import { reportService as reportClientService } from "./clients/reports"
 import { settingsService as settingsClientService } from "./clients/settings"
+import { mapService as mapClientService } from "./clients/maps"
 import { chatTermService as chatTermClientService } from "./clients/chat-terms"
 import { semanticService as semanticClientService } from "./clients/semantic"
 import { tagKeysService as tagKeysClientService } from "./clients/tag-keys"
@@ -115,6 +116,8 @@ export const homeService = homeClientService
 // The deployment's report time zone and first day of the week over
 // `/api/settings/reporting` (BI-9).
 export const settingsService = settingsClientService
+// Uploaded map boundaries over `/api/maps` (BI-16 part C2b). No mock ever existed.
+export const mapService = mapClientService
 // Scheduled reports by email (RPT-1) over `/api/reports/...`. No mock ever existed.
 export const reportService = reportClientService
 /**

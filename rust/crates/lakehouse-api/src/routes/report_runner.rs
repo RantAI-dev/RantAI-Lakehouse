@@ -35,16 +35,19 @@
 //!
 //! # The runner
 //!
-//! [`tick`] claims at most five due subscriptions (`claim_due`: `FOR UPDATE SKIP
-//! LOCKED`, `next_run_at` moved forward from the claim time in the same
+//! [`tick`] claims the due subscriptions one at a time (`claim_due`: `FOR UPDATE
+//! SKIP LOCKED`, `next_run_at` moved forward from the claim time in the same
 //! transaction, so two replicas never take the same row and a missed run happens
-//! once) and runs them one after the other. Running them one at a time keeps the
-//! runner to a single PDF slot of the two a process has; "Send now" and the
-//! downloads keep the other. A failed scheduled run adds one to the failure
-//! count, tells the owner by email, and the fifth in a row pauses the
-//! subscription. No per-user notification list exists in the console (the bell
-//! lists open alerts and pending approvals for everyone), so the owner is told
-//! by email, and the subscription's list shows the status and the reason.
+//! once) and runs them one after the other, until nothing is due. One at a time
+//! because the claim and the send that follows it are two moments: a process
+//! that dies between them loses that one send, and a batch would lose as many
+//! sends as it held rows (`PR #204` review (SHOULD-FIX) 2). Running them one at
+//! a time keeps the runner to a single PDF slot of the two a process has;
+//! "Send now" and the downloads keep the other. A failed scheduled run adds one
+//! to the failure count, tells the owner by email, and the fifth in a row pauses
+//! the subscription. No per-user notification list exists in the console (the
+//! bell lists open alerts and pending approvals for everyone), so the owner is
+//! told by email, and the subscription's list shows the status and the reason.
 //! "Send now" never counts toward the five.
 
 use std::time::Duration;
@@ -79,8 +82,6 @@ pub const MAX_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
 pub const MAX_CHART_FILES: usize = 10;
 /// People one subscription may address (feature decision 3).
 pub const MAX_RECIPIENTS: usize = 50;
-/// Subscriptions one tick takes.
-const CLAIM_LIMIT: i64 = 5;
 /// How often the runner looks for due subscriptions.
 const TICK_EVERY: Duration = Duration::from_secs(60);
 /// Deliveries older than this are removed once a day (feature decision 7).
@@ -635,6 +636,9 @@ async fn audience_for(
 /// still view dashboards, their roles may download, and, when the owner belongs
 /// to tenants, they share one with the owner. Someone who fails any of these is
 /// left out and counted, as a disabled person is.
+///
+/// The tenant rule is the one copy in `routes::reports::shares_a_tenant`
+/// (`PR #204` review (SHOULD-FIX) 1; AGENTS.md rule 4).
 async fn users_who_may_receive(
     state: &AppState,
     rows: &[RecipientRow],
@@ -647,11 +651,8 @@ async fn users_who_may_receive(
         else {
             continue;
         };
-        let shares_a_tenant = owner.tenant_ids.is_empty()
-            || person
-                .tenant_ids
-                .iter()
-                .any(|t| owner.tenant_ids.contains(t));
+        let shares_a_tenant =
+            crate::routes::reports::shares_a_tenant(&owner.tenant_ids, &person.tenant_ids);
         // BI-19 B1 review R12: the recipient's own resolved reach decides, not
         // only `dashboard:read`: somebody the rules leave out of a restricted
         // dashboard is not sent its report. A failure to resolve leaves them out.
@@ -1256,32 +1257,41 @@ async fn tell_owner(
 // ── The runner ───────────────────────────────────────────────────────────
 
 /// Take the subscriptions that are due now and run each. Returns how many were
-/// taken. A failure to claim is logged and the next tick tries again; a
-/// failure to record one run is logged and the rest still run.
+/// taken.
+///
+/// One at a time (`PR #204` review (SHOULD-FIX) 2): the row in flight is the
+/// only one a failure between the claim and the send can affect. The tick
+/// claims the next row when it is done with this one, until nothing is due.
+///
+/// A failure to claim is logged and the next tick tries again; a failure to
+/// record one run is logged and the rest still run.
 pub async fn tick(state: &AppState, mailer: &dyn ReportMailer) -> usize {
     let Some(pool) = state.pg.as_deref() else {
         return 0;
     };
-    let now = OffsetDateTime::now_utc();
-    let claimed = match subscriptions::claim_due(pool, now, CLAIM_LIMIT, |sub| {
-        sub.schedule()
-            .ok()
-            .and_then(|s| s.next_run_after(&sub.time_zone, now).ok())
-    })
-    .await
-    {
-        Ok(rows) => rows,
-        Err(err) => {
-            tracing::warn!(%err, "report runner could not claim due subscriptions");
-            return 0;
+    let mut taken = 0;
+    loop {
+        let now = OffsetDateTime::now_utc();
+        let claimed = match subscriptions::claim_due(pool, now, |sub| {
+            sub.schedule()
+                .ok()
+                .and_then(|s| s.next_run_after(&sub.time_zone, now).ok())
+        })
+        .await
+        {
+            Ok(Some(row)) => row,
+            Ok(None) => break,
+            Err(err) => {
+                tracing::warn!(%err, "report runner could not claim due subscriptions");
+                break;
+            }
+        };
+        if let Err(err) = run_subscription(state, mailer, &claimed, false).await {
+            tracing::warn!(%err, subscription = %claimed.id, "report run could not be recorded");
         }
-    };
-    for sub in &claimed {
-        if let Err(err) = run_subscription(state, mailer, sub, false).await {
-            tracing::warn!(%err, subscription = %sub.id, "report run could not be recorded");
-        }
+        taken += 1;
     }
-    claimed.len()
+    taken
 }
 
 /// Remove deliveries older than [`DELIVERY_RETENTION_DAYS`]. How many went.

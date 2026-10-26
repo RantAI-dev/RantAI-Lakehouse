@@ -9,7 +9,8 @@
 //! It checks, for the person the report will be made as (the owner): that they
 //! can view and download, that the board is theirs to see, that the chosen
 //! charts are data charts of that board, that the PDF service exists when a PDF
-//! is asked for, that every console recipient is an active user, that every
+//! is asked for, that every console recipient is an active user who shares a
+//! tenant with the owner when the owner belongs to tenants, that every
 //! outside address is on a domain an administrator listed
 //! (`reporting_settings.report_allowed_domains`, empty at first, so nothing
 //! leaves the company until a domain is added), and that there are at most 50
@@ -67,6 +68,9 @@ const RESTRICTED_OUTSIDE: &str = "This dashboard is restricted to the people lis
 const NO_RECIPIENTS: &str = "Choose at least one recipient.";
 const TOO_MANY_RECIPIENTS: &str = "A report goes to at most 50 recipients.";
 const NOT_AN_ACTIVE_USER: &str = "Every console recipient must be an active user.";
+/// A console recipient outside the owner's tenants (`PR #204` review
+/// (SHOULD-FIX) 1; feature decision 8).
+const NOT_IN_YOUR_TENANTS: &str = "Every console recipient must be in one of your tenants.";
 const BAD_ADDRESS: &str = "Every outside recipient must be an email address.";
 const DOMAIN_NOT_ALLOWED: &str =
     "An outside address is on a domain an administrator has not allowed for reports.";
@@ -197,6 +201,20 @@ pub(crate) fn schedule_json(s: Schedule) -> Value {
 
 // ── The rules ────────────────────────────────────────────────────────────
 
+/// Whether a person may be sent a report made as the owner: an owner who
+/// belongs to no tenant constrains nobody, otherwise the two must share one
+/// tenant (feature decision 8; `RPT-1` review fix R8).
+///
+/// One copy, read by the recipient picker, the save-time refusal and the
+/// runner's audience (`PR #204` review (SHOULD-FIX) 1; AGENTS.md rule 4: a
+/// second copy of a rule is a finding).
+pub(crate) fn shares_a_tenant(owner_tenants: &[Uuid], person_tenants: &[Uuid]) -> bool {
+    owner_tenants.is_empty()
+        || person_tenants
+            .iter()
+            .any(|tenant| owner_tenants.contains(tenant))
+}
+
 /// Check `input` for a report made as `owner` and turn it into what the store
 /// writes. `owner` is the person the report is made as, whoever is saving it.
 ///
@@ -280,7 +298,7 @@ pub(crate) async fn validate_input(
         check_filters_text(Some(&filters.to_string()))?;
     }
 
-    let recipients = check_recipients(state, pool, &input.recipients).await?;
+    let recipients = check_recipients(state, pool, owner, &input.recipients).await?;
     let next_run_at = schedule
         .next_run_after(&time_zone, OffsetDateTime::now_utc())
         .map_err(|e| ApiError::BadRequest(e.message().to_owned()))?;
@@ -329,9 +347,12 @@ async fn check_charts(
 
 /// The recipients as the store writes them, after the rules of feature decision
 /// 3: at most 50, console users active, outside addresses on a listed domain.
+/// A console recipient must also share a tenant with `owner` when the owner
+/// belongs to tenants (feature decision 8; `PR #204` review (SHOULD-FIX) 1).
 async fn check_recipients(
     state: &AppState,
     pool: &lakehouse_store::PgPool,
+    owner: &Principal,
     wanted: &[RecipientInput],
 ) -> Result<Vec<Recipient>, ApiError> {
     if wanted.is_empty() {
@@ -350,6 +371,18 @@ async fn check_recipients(
                 let uuid = id
                     .parse::<Uuid>()
                     .map_err(|_| ApiError::BadRequest(NOT_AN_ACTIVE_USER.to_owned()))?;
+                // The tenant rule first: a person outside the owner's tenants
+                // is refused the same way whether they are active or not, so
+                // the refusal does not tell the caller what the state of a
+                // person outside their tenants is.
+                if !owner.tenant_ids.is_empty() {
+                    let tenants = lakehouse_store::identity::user_tenant_ids(pool, uuid)
+                        .await
+                        .map_err(|e| store_failed(&e))?;
+                    if !shares_a_tenant(&owner.tenant_ids, &tenants) {
+                        return Err(ApiError::BadRequest(NOT_IN_YOUR_TENANTS.to_owned()));
+                    }
+                }
                 let status = lakehouse_store::identity::user_status(pool, uuid)
                     .await
                     .map_err(|e| store_failed(&e))?;
@@ -817,6 +850,12 @@ pub struct PickerQuery {
 /// recipient picker, at most 20, to anyone who may subscribe. Narrower than
 /// `identity:read`'s full list on purpose: no roles, no tenants, no status.
 ///
+/// The list is scoped to the caller's tenants (feature decision 8; `PR #204`
+/// review (SHOULD-FIX) 1): a caller who belongs to tenants sees only the
+/// people who share one of them, so the picker never offers a recipient the
+/// save would refuse. A caller who belongs to no tenant sees everyone, which
+/// is what a deployment that does not use tenants does.
+///
 /// # Errors
 ///
 /// 403 when the caller may not download.
@@ -843,6 +882,7 @@ pub async fn recipients(
         pool_of(&state)?,
         q.q.as_deref().unwrap_or("").trim(),
         PICKER_LIMIT,
+        &principal.tenant_ids,
     )
     .await
     .map_err(|e| store_failed(&e))?;

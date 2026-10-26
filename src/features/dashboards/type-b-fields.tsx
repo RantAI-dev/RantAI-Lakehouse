@@ -4,7 +4,7 @@ import * as React from "react";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { AUTO_HISTOGRAM_BINS, MAX_ALT, MAX_BANDS, MAX_HISTOGRAM_COUNT, urlProblem, type TypeDraft } from "@/lib/type-b";
+import { AUTO_HISTOGRAM_BINS, MAX_ALT, MAX_BANDS, MAX_GANTT_BARS, MAX_HISTOGRAM_COUNT, urlProblem, type TypeDraft } from "@/lib/type-b";
 import { columnItems } from "./builder-sections";
 
 /**
@@ -104,6 +104,53 @@ export function HistogramFields({ draft, onChange }: { readonly draft: TypeDraft
         ) : null}
       </div>
       <p className="text-xs text-muted-foreground">Counts the rows in each range of the number column. At most {MAX_HISTOGRAM_COUNT} ranges.</p>
+    </div>
+  );
+}
+
+const NO_PROGRESS = "__none__";
+
+/**
+ * The start, end and optional progress columns of a Gantt chart (`BI-16` part
+ * C1, plan D1). Start and end are date or date-time columns; progress is a
+ * number column read as 0 to 100 percent. The task (Task column) and the group
+ * (Group) are the builder's own dimension and breakdown fields.
+ */
+export function GanttFields({
+  draft, onChange, dateColumns, numberColumns, fieldLabel, disabled, placeholder,
+}: {
+  readonly draft: TypeDraft;
+  readonly onChange: Change;
+  readonly dateColumns: readonly string[];
+  readonly numberColumns: readonly string[];
+  readonly fieldLabel: (name: string) => React.ReactNode;
+  readonly disabled: boolean;
+  readonly placeholder: string;
+}) {
+  const pick = (label: string, value: string, set: (v: string) => void, required: boolean) => (
+    <div className="grid content-start gap-1.5">
+      <Label>{label} {required ? <span aria-hidden className="text-destructive">*</span> : <span className="font-normal text-muted-foreground">(optional, 0 to 100)</span>}</Label>
+      <Select
+        value={value || (required ? "" : NO_PROGRESS)}
+        items={{ ...(required ? {} : { [NO_PROGRESS]: "— no progress —" }), ...columnItems(required ? dateColumns : numberColumns, fieldLabel, value) }}
+        onValueChange={(v) => set(!v || v === NO_PROGRESS ? "" : v)} disabled={disabled}
+      >
+        <SelectTrigger className="w-full" aria-label={label}><SelectValue placeholder={disabled ? placeholder : "pick a column"} /></SelectTrigger>
+        <SelectContent>
+          {required ? null : <SelectItem value={NO_PROGRESS}>— no progress —</SelectItem>}
+          {(required ? dateColumns : numberColumns).map((c) => <SelectItem key={c} value={c}>{fieldLabel(c)}</SelectItem>)}
+        </SelectContent>
+      </Select>
+    </div>
+  );
+  return (
+    <div className="grid gap-3">
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+        {pick("Start column", draft.ganttStart, (v) => onChange({ ganttStart: v }), true)}
+        {pick("End column", draft.ganttEnd, (v) => onChange({ ganttEnd: v }), true)}
+      </div>
+      {pick("Progress column", draft.ganttProgress, (v) => onChange({ ganttProgress: v }), false)}
+      <p className="text-xs text-muted-foreground">One bar per task and group, from its earliest start to its latest end. At most {MAX_GANTT_BARS.toLocaleString("en-US")} bars.</p>
     </div>
   );
 }

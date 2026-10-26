@@ -161,6 +161,49 @@ describe("SchemaBrowser", () => {
     expect(row.getAttribute("title") ?? "").toContain("SQL name")
   })
 
+  it("makes a Bronze table insertable once its detail names the table", async () => {
+    const getAsset = stubServices()
+    getAsset.mockResolvedValueOnce({
+      schema: [],
+      queryTarget: { engine: "clickhouse", table: "icecat_api.bronze.orders" },
+    } as never)
+    const { container } = render(<Harness />)
+    const view = editorView(container)
+    setBuffer(view, "SELECT * FROM ", "SELECT * FROM ".length)
+
+    fireEvent.click(await screen.findByRole("button", { name: "Columns of Demo Orders" }))
+
+    const insert = await screen.findByRole("button", {
+      name: "Insert icecat_api.bronze.orders",
+    })
+    fireEvent.click(insert)
+
+    expect(view.state.doc.toString()).toBe("SELECT * FROM icecat_api.bronze.orders")
+  })
+
+  it("does not offer a Trino-only Bronze name on a ClickHouse tab", async () => {
+    const getAsset = stubServices()
+    getAsset.mockResolvedValueOnce({
+      schema: [{ name: "oid", dataType: "String" }],
+      layer: "bronze",
+      type: "iceberg-table",
+      tableName: "orders",
+      namespace: "bronze",
+      name: "Demo Orders",
+    } as never)
+    render(<Harness />)
+
+    fireEvent.click(await screen.findByRole("button", { name: "Columns of Demo Orders" }))
+
+    // The detail landed: its column is listed.
+    expect(await screen.findByText("oid")).toBeTruthy()
+    // The tab is ClickHouse and this name is Trino's, so it is not offered
+    // here; the row still says its SQL name is not known.
+    expect(screen.queryByRole("button", { name: "Insert iceberg.bronze.orders" })).toBeNull()
+    const row = screen.getByRole("button", { name: "Demo Orders" })
+    expect(row.getAttribute("title") ?? "").toContain("SQL name")
+  })
+
   it("shows the catalog's reason when a table's columns were refused, and retries on request", async () => {
     const getAsset = stubServices()
     getAsset.mockResolvedValueOnce({

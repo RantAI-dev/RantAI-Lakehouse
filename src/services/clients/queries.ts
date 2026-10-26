@@ -10,6 +10,7 @@ import type {
   QueryEngine,
   SqlFixOutcome,
 } from "../contracts/queries";
+import { historyQueryString } from "@/lib/history-query-params";
 import { apiFetch } from "../http";
 import { ServiceError } from "../errors";
 import { chatAnswerFromBody } from "./chat-answer";
@@ -188,8 +189,9 @@ export const clickhouseQueryService: QueryService = {
   saveQuery(input: SaveQueryInput, signal) {
     return postJson<SavedQuery>("/api/query/saved", input, signal);
   },
-  listHistory(signal) {
-    return get<QueryHistoryItem[]>("/api/query/history", signal);
+  listHistory(filter, signal) {
+    const query = historyQueryString(filter);
+    return get<QueryHistoryItem[]>(`/api/query/history${query ? `?${query}` : ""}`, signal);
   },
   getSchedulingCapability(signal) {
     return get<QuerySchedulingCapability>("/api/query/scheduling", signal);

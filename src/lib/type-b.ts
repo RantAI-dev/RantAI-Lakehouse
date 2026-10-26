@@ -21,6 +21,8 @@ export const HISTOGRAM_ROW_CAP = 100
 export const MAX_BULLETS = 20
 /** The most ranges a histogram draws between its first and its last; more would be a stripe of zeros. */
 export const MAX_DRAWN_RANGES = 500
+/** The bars a Gantt chart draws (`BI-16` part C1, feature decision 1); the statement asks for one more to tell "more than this". */
+export const MAX_GANTT_BARS = 1000
 
 /** The sentence the server answers with, word for word (`CONTENT_SITE_REFUSED`). */
 export const CONTENT_SITE_REFUSED =
@@ -43,6 +45,16 @@ export type TypeDefFields = {
   url?: string
   /** `image`. */
   alt?: string
+  /**
+   * `gantt` (`BI-16` part C1, plan D1): the columns a task starts and ends in
+   * (dates or date-times, required) and an optional 0 to 100 progress column.
+   * Flat on the chart, beside `lat` and `lon`. The task is the `dimension`, the
+   * group the `breakdown`. The server (`lakehouse-bi` T1) does not know these
+   * fields yet, so a chart of this kind is refused until it lands.
+   */
+  start?: string
+  end?: string
+  progress?: string
 }
 
 export function takesGoal(kind: string): boolean {
@@ -51,6 +63,11 @@ export function takesGoal(kind: string): boolean {
 
 export function isTypeBKind(kind: string): kind is Extract<ChartKind, "progress" | "histogram" | "bullet" | "image" | "web"> {
   return kind === "progress" || kind === "histogram" || kind === "bullet" || kind === "image" || kind === "web"
+}
+
+/** The Gantt chart (`BI-16` part C1): one bar per task from a start column to an end column. */
+export function isGanttKind(kind: string): kind is Extract<ChartKind, "gantt"> {
+  return kind === "gantt"
 }
 
 // ── the address ──────────────────────────────────────────────────────────
@@ -111,10 +128,17 @@ export type TypeDraft = {
   histWidth: string
   url: string
   alt: string
+  /** `gantt`: the start, end and progress columns (progress may stay empty). */
+  ganttStart: string
+  ganttEnd: string
+  ganttProgress: string
 }
 
 export function emptyTypeDraft(): TypeDraft {
-  return { goalMode: "number", goalNumber: "", goalMeasure: "", bands: [], histMode: "auto", histCount: "10", histWidth: "", url: "", alt: "" }
+  return {
+    goalMode: "number", goalNumber: "", goalMeasure: "", bands: [], histMode: "auto", histCount: "10", histWidth: "", url: "", alt: "",
+    ganttStart: "", ganttEnd: "", ganttProgress: "",
+  }
 }
 
 const textOf = (v: unknown): string => (v === undefined || v === null ? "" : String(v))
@@ -138,6 +162,9 @@ export function typeDraftFromDef(def: TypeDefFields | undefined): TypeDraft {
   }
   d.url = def.url ?? ""
   d.alt = def.alt ?? ""
+  d.ganttStart = def.start ?? ""
+  d.ganttEnd = def.end ?? ""
+  d.ganttProgress = def.progress ?? ""
   return d
 }
 
@@ -181,6 +208,11 @@ export function typePayload(kind: string, d: TypeDraft): Record<string, unknown>
     out.alt = d.alt.trim()
   }
   if (kind === "web") out.url = d.url.trim()
+  if (kind === "gantt") {
+    if (d.ganttStart) out.start = d.ganttStart
+    if (d.ganttEnd) out.end = d.ganttEnd
+    if (d.ganttProgress) out.progress = d.ganttProgress
+  }
   return out
 }
 
@@ -212,6 +244,10 @@ export function typeProblems(kind: string, d: TypeDraft): string[] {
       const n = finiteNumber(d.histWidth)
       if (n === null || n <= 0) out.push("Range width")
     }
+  }
+  if (kind === "gantt") {
+    if (!d.ganttStart) out.push("Start column")
+    if (!d.ganttEnd) out.push("End column")
   }
   if (kind === "image" || kind === "web") {
     if (d.url.trim() === "") out.push("Address")

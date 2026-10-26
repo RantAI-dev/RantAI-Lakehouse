@@ -17,12 +17,12 @@ Numbers, dates and booleans load as numbers, dates and booleans.
 
 ## Target specs
 
-"Today" is `main` at `f3a3196`, read from the code, not tested. A target is either a competitor's documented number (named under Benchmark) or marked *(proposed)*: the planner's number, which the product owner confirms or changes on the feature page before the plan is written.
+"Today" is `main` at `17867e52` (re-read 2026-10-16 for the Phase 3 plan, `docs/superpowers/plans/2026-10-16-data-phase-3-uploads.md`), read from the code, not tested. A target is either a competitor's documented number (named under Benchmark) or marked *(proposed)*: the planner's number, which the product owner confirms or changes on the feature page before the plan is written.
 
 | Capability | Today | Target |
 | --- | --- | --- |
-| Type detection | Every column is text | Integer, decimal, boolean, date, timestamp and text detected from a sample of 10,000 rows *(proposed)* |
-| Edit before loading | Names cleaned automatically | Edit each column's name and type in the preview |
+| Type detection | Every column is text (ADR 0014 decision 4: no type inference). A Parquet file's own types are shown in the preview, then dropped | Integer, decimal, boolean, date, timestamp and text detected from a sample of 10,000 rows *(proposed)* |
+| Edit before loading | Nothing is editable. Column names are cleaned only by the load job, so the preview shows the raw header and the user never sees the final names before loading | Edit each column's name and type in the preview |
 | Bad values | n/a | Rows that do not fit the chosen type are counted and listed (first 100), and the user chooses: load as null or stop |
 | Date formats | n/a | Detects ISO, dd/mm/yyyy and mm/dd/yyyy, and asks when ambiguous |
 

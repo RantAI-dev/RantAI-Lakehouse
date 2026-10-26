@@ -6,6 +6,8 @@ import { DEFAULT_PALETTE, resolvePalette } from "@/lib/chart-palettes";
 import type { ResolvedReferenceLine, StyleFields, ValueFormat } from "@/lib/chart-style";
 import { formatAxisValue, formatValue } from "@/lib/value-format";
 import type { ChartSpec } from "@/lib/dashboard-specs";
+import { planClusters, type ClusterPlan } from "./cluster-plan";
+import { planForecast, withForecastSeries, type ForecastBuckets, type ForecastPlan } from "./forecast-line";
 import { boxplotNeedsLogAxis, toBoxplot, toCalendar, toSankey, toSunburst } from "@/lib/chart-transforms";
 
 /**
@@ -220,16 +222,25 @@ export function buildOption(
   if (spec.kind === "scatter" || spec.kind === "bubble") {
     const xc = yArr[0], yc = yArr[1] ?? yArr[0], sc = yArr[2];
     const maxS = spec.kind === "bubble" && sc ? Math.max(1, ...rows.map((r) => num(r[sc]))) : 1;
+    const items = rows.map((r) => ({ name: str(r[spec.x]), value: [num(r[xc]), num(r[yc]), sc ? num(r[sc]) : 0] }));
+    const symbolSize = spec.kind === "bubble" && sc ? (d: unknown) => { const a = d as number[]; return 8 + 38 * Math.sqrt((a[2] ?? 0) / maxS); } : 12;
+    // BI-17 part B (D5): one series per cluster, coloured by the palette and named in the legend with its size and centre.
+    const plan = clustersOf(spec, rows, opts.style);
+    const groups = plan && !("refused" in plan.result) ? plan.result : undefined;
+    const series = groups
+      ? groups.clusters.map((g, k) => ({
+          type: "scatter", name: clusterName(k, g, fmtInt),
+          symbolSize, itemStyle: { opacity: 0.75 }, data: items.filter((_, i) => groups.labels[i] === k),
+        }))
+      : [{ type: "scatter", symbolSize, itemStyle: { opacity: 0.75 }, data: items }];
     return { ...base,
       tooltip: { ...base.tooltip, trigger: "item", formatter: (p: unknown) => {
         const o = p as ItemP; const d = o.value;
         return `${escapeHtml(o.name)}<br/>${escapeHtml(labelOf(xc))}: <b>${fmtInt(d[0])}</b><br/>${escapeHtml(labelOf(yc))}: <b>${fmtInt(d[1])}</b>${sc ? `<br/>${escapeHtml(labelOf(sc))}: <b>${fmtInt(d[2])}</b>` : ""}`;
       } },
+      ...(groups ? { legend: { top: 0, type: "scroll", textStyle: { color: axis, fontSize: 11, ...LEGEND_TEXT }, tooltip: { show: true }, icon: "circle" }, grid: { ...base.grid, top: 34 } } : {}),
       xAxis: valAxis(labelOf(xc)), yAxis: valAxis(labelOf(yc)),
-      series: [{ type: "scatter",
-        symbolSize: spec.kind === "bubble" && sc ? (d: unknown) => { const a = d as number[]; return 8 + 38 * Math.sqrt((a[2] ?? 0) / maxS); } : 12,
-        itemStyle: { opacity: 0.75 },
-        data: rows.map((r) => ({ name: str(r[spec.x]), value: [num(r[xc]), num(r[yc]), sc ? num(r[sc]) : 0] })) }],
+      series,
     } as EChartsOption;
   }
 
@@ -520,6 +531,31 @@ export function buildOption(
 
 export { fmtInt };
 
+/** The points of a scatter or bubble chart as the clusters see them: x, y and, for a bubble, its size. */
+function clusterPoints(spec: Pick<Renderable, "kind" | "y">, rows: Row[]): number[][] {
+  const cols = Array.isArray(spec.y) ? spec.y : [spec.y];
+  const used = spec.kind === "bubble" && cols[2] ? [cols[0], cols[1] ?? cols[0], cols[2]] : [cols[0], cols[1] ?? cols[0]];
+  return rows.map((r) => used.map((c) => num(r[c])));
+}
+
+/** The clustering of a scatter or bubble chart that asks for it; undefined for any other chart. */
+export function clustersOf(spec: Pick<Renderable, "kind" | "y">, rows: Row[], style: StyleFields | undefined): ClusterPlan | undefined {
+  if ((spec.kind !== "scatter" && spec.kind !== "bubble") || !style?.clusters) return undefined;
+  return planClusters(clusterPoints(spec, rows), style.clusters);
+}
+
+/** The line under a chart with clusters: the points used, or why there are none (Q5 spirit: a sentence, not a guess). */
+export function clusterNote(spec: Pick<Renderable, "kind" | "y">, rows: Row[], style: StyleFields | undefined): string | undefined {
+  return clustersOf(spec, rows, style)?.note;
+}
+
+/** "Cluster 1 (n = 42; x̄ = 3, ȳ = 9)": the legend entry of a group. */
+function clusterName(index: number, group: { size: number; center: number[] }, write: (v: number) => string): string {
+  const marks = ["x̄", "ȳ", "z̄"];
+  const centre = group.center.map((v, i) => `${marks[i]} = ${write(v)}`).join(", ");
+  return `Cluster ${index + 1} (n = ${group.size.toLocaleString("en-US")}; ${centre})`;
+}
+
 /** A reference line as the server resolved it (`BI-11`, `BI-17`). */
 export type ReferenceLine = ResolvedReferenceLine;
 
@@ -534,6 +570,8 @@ export type LineContext = {
   format?: (measure: string | undefined, v: number) => string;
   /** Set when the result was cut off: computed labels then say "of the N shown" (decision 9). */
   cutOff?: boolean;
+  /** `BI-17` part B: the buckets of the rows, so a forecast can find the periods ahead. */
+  buckets?: ForecastBuckets;
 };
 
 const LINE_NAME: Record<string, string> = { average: "Average", median: "Median", min: "Min", max: "Max", trend: "Trend" };
@@ -589,6 +627,61 @@ export function trendEnds(values: readonly number[]): [number, number] | null {
  * their own and stay on the first axis.
  */
 export function withReferenceLines(
+  option: EChartsOption,
+  lines: readonly ReferenceLine[] | undefined,
+  horizontal: boolean,
+  dark: boolean,
+  ctx?: LineContext,
+  columns?: readonly (string | undefined)[],
+): EChartsOption {
+  return withForecastLine(withMarkLines(option, lines, horizontal, dark, ctx, columns), lines, horizontal, dark, ctx, columns);
+}
+
+/**
+ * `BI-17` part B (D4): the forecast reference line, if the chart has one and
+ * knows its buckets (`ctx.buckets`). Drawn after the other lines, on the
+ * axis of the measure it describes; a refusal draws nothing (the sentence is
+ * `forecastNote`).
+ */
+export function withForecastLine(
+  option: EChartsOption,
+  lines: readonly ReferenceLine[] | undefined,
+  horizontal: boolean,
+  dark: boolean,
+  ctx?: LineContext,
+  columns?: readonly (string | undefined)[],
+): EChartsOption {
+  const found = forecastOf(lines, ctx, horizontal);
+  if (!found || !ctx) return option;
+  const { line, plan } = found;
+  const series = Array.isArray(option.series) ? option.series : [];
+  const i = line.measure && columns ? columns.findIndex((c) => c === line.measure) : 0;
+  return withForecastSeries(option, plan, {
+    name: line.label || "Forecast",
+    color: line.color ?? (dark ? "#fbbf24" : "#d97706"),
+    seriesIndex: Math.min(Math.max(i, 0), Math.max(series.length - 1, 0)),
+    actual: ctx.values(line.measure),
+    write: (v) => ctx.format?.(line.measure, v) ?? formatNumber(v, decimalsFor([v])),
+  });
+}
+
+/** The forecast line of a chart and its plan; the first `forecast` line is the only one (D1). */
+function forecastOf(lines: readonly ReferenceLine[] | undefined, ctx: LineContext | undefined, horizontal: boolean): { line: ReferenceLine; plan: ForecastPlan } | null {
+  const line = lines?.find((l) => l.kind === "forecast");
+  if (!line || !ctx?.buckets || !Number.isInteger(line.horizon)) return null;
+  const plan = planForecast(line.horizon as number, ctx.values(line.measure), ctx.buckets, horizontal);
+  return { line, plan };
+}
+
+/**
+ * The sentence under a chart with a forecast: the model and band, or why
+ * there is no forecast (Q5: a refusal is a sentence, never a line).
+ */
+export function forecastNote(lines: readonly ReferenceLine[] | undefined, ctx: LineContext | undefined, horizontal: boolean): string | undefined {
+  return forecastOf(lines, ctx, horizontal)?.plan.note;
+}
+
+function withMarkLines(
   option: EChartsOption,
   lines: readonly ReferenceLine[] | undefined,
   horizontal: boolean,

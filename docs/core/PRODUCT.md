@@ -115,7 +115,7 @@ hands-on testing.
 | Business-app connectors (CRM, ads, support tools) | **Partial.** Eight of Databricks' ten generally available ones are supported and gate-tested against mock vendors (`ops/g6`, job `g6-saas`): Salesforce, ServiceNow, Google Analytics 4, HubSpot, Zendesk, Confluence, Dynamics 365, SharePoint; each with browser or key sign-in, object and column choice, incremental loads where the vendor has a change filter, and schema-change handling. *Not verified* on any real vendor account. Workday Reports and NetSuite are built and listed unsupported. Pull request #216, not merged or accepted | Yes: Databricks has 10 generally available plus about 45 in beta; Airbyte 602 | Real-account test of all ten (`SRC-27`), the second wave of about 45 (`SRC-26`) |
 | Live change capture | **Partial.** Proven for PostgreSQL (gate `ops/g4`); MySQL and SQL Server exist but are not gate-tested | Yes: PostgreSQL, MySQL, SQL Server, Oracle; MongoDB at Airbyte | MySQL, SQL Server, Oracle, MongoDB (`SRC-4`) |
 | Message queues | **Partial.** Kafka loads into tables; no processing over streams | Yes, with stream processing | Stream processing |
-| Upload a file from the console | **Partial.** One CSV or TSV file of up to 50 MB, every column stored as text; merged (PR #71), not accepted | Yes: Databricks 10 files up to 2 GB with types; Snowflake 250 files of 250 MB | Formats, size, types (`DATA-17`, `DATA-18`) |
+| Upload a file from the console | **Partial.** On `main`: one CSV, TSV, Excel or Parquet file of up to 50 MB, every column stored as text; merged (PR #71, #76), not accepted. In PR #186 (not merged): JSON, JSON Lines, Avro, gzip, zip, 10 files into one table, 2 GB per upload (one load at a time measured, `docs/plans/DATA-17-RESULT.md`), and column types | Yes: Databricks 10 files up to 2 GB with types; Snowflake 250 files of 250 MB | Acceptance and merge of #186 (`DATA-17`, `DATA-18`); loads of 2 GB at the same time unmeasured (`DATA-33`) |
 
 #### Storing data
 
@@ -154,7 +154,7 @@ hands-on testing.
 | Roles and permissions | **Have** | Yes | — |
 | Classify and mask sensitive columns | **Have.** Proven end to end (gate `ops/g8`) | Yes | — |
 | Row-level rules | **Partial.** The policy engine applies row filters and masks on read; masking is proven end to end (gate `ops/g8`), row filters are not gate-tested | Yes | Prove row filters |
-| Catalog and search | **Partial.** Search finds a table by its name, columns, tags, description or owner, forgives a typo and ranks (`DATA-11`, merged; speed on 10,000 tables not measured). Certification part 1 is built (`DATA-12`: a governed mark set with `governance:write`); governed tags, marks in the chart builder and Query Studio, and per-user table visibility are not built | Yes: columns, tags, certification | `DATA-12`, `DATA-20`, `DATA-24` |
+| Catalog and search | **Partial.** Search finds a table by its name, columns, tags, description or owner, forgives a typo and ranks (`DATA-11`, accepted 2026-10-23; speed on 10,000 tables not measured, and a typo that matches only a table's name carries no "approximate match" label, `DATA-24`, `DATA-32`). Certified and deprecated marks, governed tags, and the marks in the chart builder and Query Studio are built and accepted (`DATA-12`, 2026-10-23); per-user table visibility is not built | Yes: columns, tags, certification | `DATA-12`, `DATA-20`, `DATA-24` |
 | Lineage | **Partial** | Yes, including outside systems | Depth |
 | Data quality checks | **Partial.** Hand-written rules; freshness against a set target | Yes: ready check libraries, anomaly detection | `DATA-14` |
 | Audit trail | **Partial.** Pipeline runs and assistant actions; not every console change | Yes | Full coverage |
@@ -248,8 +248,13 @@ in `README.md` ("Status / Known limitations").
 - One engine; no querying other systems in place. Querying a table as it
   was earlier works from a version picker, but no test yet proves masking
   applies to past versions (`DATA-16`).
-- File upload takes one CSV or TSV file of up to 50 MB, and every column is
-  stored as text (merged, not accepted).
+- File upload on `main` takes one CSV, TSV, Excel or Parquet file of up to
+  50 MB, and every column is stored as text (merged, not accepted). Pull
+  request #186 (not merged) adds JSON, JSON Lines, Avro, gzip and zip, up to
+  10 files into one table, up to 2 GB per upload (measured for one load at a
+  time; two at once, a Parquet row group larger than memory, and Avro and zip
+  at large sizes are not measured, `DATA-33`, `DATA-34`), no row cap, and
+  guessed, editable column types.
 - Dashboards filter by year only; there are no calculated fields.
 - Query Studio shows at most 2,000 rows. A chart built on a saved query is
   limited to 2,000 rows and 30 seconds.
@@ -300,7 +305,7 @@ run without the product owner fixing things by hand.
 | 3 | No human security review | Commission one |
 | 4 | The main branch can be changed without review | Apply the settings drafted in `docs/CI.md` |
 | 5 | No support commitment to put in a contract | Decide one (`reference/support-model.md`) |
-| 6 | Open high-severity security findings: connector password theft (`SEC-14`), connection tests reaching internal addresses (`SEC-15`) | Fix the security items under Now in `BACKLOG.md`; their specs are in `specs/` |
+| 6 | Open high-severity security findings: connector password theft (`SEC-14`), connection tests reaching internal addresses (`SEC-15`, accepted 2026-10-23) | Fix the security items under Now in `BACKLOG.md`; their specs are in `specs/` |
 
 Not blockers, but will be found in a customer's evaluation: full audit
 coverage, single sign-on, tested backup restore, cleanup of old table

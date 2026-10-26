@@ -1,5 +1,6 @@
 import type { Board } from "../contracts/dashboards"
 import type {
+  ChartLineage,
   CreateBoardInput,
   DashboardFolder,
   DashboardService,
@@ -445,6 +446,13 @@ export const clickhouseDashboardService: DashboardService = {
       "/api/dashboard/recent",
       { method: "POST", headers: JSON_HEADERS, body: JSON.stringify({ kind, id }), signal },
       "Recent items could not be saved"
+    )
+  },
+  chartLineage(id, signal) {
+    return request<ChartLineage>(
+      `/api/dashboard/charts/${encodeURIComponent(id)}/lineage`,
+      { cache: "no-store", signal },
+      "Lineage is unavailable"
     )
   },
   async searchItems(text, signal): Promise<ShortcutItem[]> {

@@ -33,6 +33,11 @@ export type Rows = {
   grainSkipped?: string;
   /** More buckets existed than the chart's limit; the latest are shown (BI-9). A pivot: more cells than it may return, so the first are shown (BI-16). */
   truncated?: boolean;
+  /**
+   * `gantt` (BI-16 part C1, plan D2): how many rows the statement left out because their end is before their start. The plan leaves the
+   * shape of this count to T1; the tile reads it when present and says nothing when it is absent.
+   */
+  reversedRows?: number;
   /** A raw table's first page: the rows its pages walk through, the page size and the offset. Absent when the count could not be read (BI-16). */
   total?: number;
   limit?: number;

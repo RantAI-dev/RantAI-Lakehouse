@@ -34,13 +34,19 @@ export type ReportingSettings = {
    * Names of the roles that may not download (`BI-1`). A person whose every
    * role is on the list gets no download items; a Platform Admin always may.
    * Empty: everyone may.
+   *
+   * Only a caller with `settings:write` reads this list; for anyone else it
+   * is absent from the answer (`PR #204` review SHOULD-FIX 3).
    */
-  downloadDeniedRoles: string[]
+  downloadDeniedRoles?: string[]
   /**
    * Outside email domains a scheduled report may go to (`RPT-1`), lower case,
    * at most 50, no wildcards. Empty: no report leaves the company.
+   *
+   * Only a caller with `settings:write` reads this list; for anyone else it
+   * is absent from the answer (`PR #204` review SHOULD-FIX 3).
    */
-  reportAllowedDomains: string[]
+  reportAllowedDomains?: string[]
   /**
    * Whether public links work (`BI-19` part A). On at first; off stops every
    * link at once, and switching it on again brings back the links that have

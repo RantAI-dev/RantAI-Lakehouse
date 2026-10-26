@@ -317,29 +317,58 @@ jobs:
     # twice with every test passing up to the cancel. The budget is a guard
     # against a hung test, not a speed target; a hang still ends here.
     timeout-minutes: 40
+    # OPS-12: this job links one test binary per file in
+    # `rust/crates/lakehouse-api/tests/` (68 of them), each against the whole
+    # crate, and full debug info in every binary is what filled the runner's
+    # disk (PR #186 run 40268340415: "No space left on device" in this job's
+    # step; commit 820484ba (QS-4) hit the same wall and worked around it by
+    # merging two test binaries instead of fixing the cause). `line-tables-only`
+    # keeps the file:line a backtrace prints and drops the rest of the debug
+    # information, so the same binaries take a fraction of the space.
+    #
+    # Both profiles are named because the `test` profile inherits from `dev`:
+    # dependencies are built with `dev`, the test binaries themselves with
+    # `test`.
+    #
+    # The cache key needs no change: Swatinem/rust-cache hashes the value of
+    # every environment variable whose name starts with `CARGO` into its key
+    # (its README's `env-vars` default is "CARGO CC CFLAGS CXX CMAKE RUST"),
+    # these two variables move the key on their own. The entry built with full
+    # debug info is simply not restored, and the first run after this change
+    # rebuilds the dependencies once and, on `main`, saves the new entry.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
     steps:
       - name: Checkout
         uses: actions/checkout@v7
 
-      # Since `main` moved to Rust 1.99.1 (REL-9), this job on PR #204 died
-      # every time: one run's annotation says `System.IO.IOException: No space
-      # left on device` from the runner itself (no job logs), and two more hit
-      # the 40-minute limit with no logs (the runner died the same way). Before
-      # the 1.99.1 merge the same job passed in 19-29 min. `main` still passes
-      # (22-28 min) because it has far fewer integration-test binaries; this
-      # branch adds many, and each debug test binary of `lakehouse-api` is
-      # about 0.8 GB, on a runner with about 14 GB free. So the step is on
-      # this PR: its test binaries are what overflow the disk. It deletes only
-      # preinstalled toolchains this job never uses; Docker (testcontainers)
-      # and the Rust toolchain stay. `df` puts the freed space in the log.
+      # OPS-12: the disk that ran out is the runner's, and the runner ships
+      # toolchains this job never uses. Deleting them is free space for the
+      # test binaries; the Postgres image this job needs is pulled by
+      # testcontainers itself later, so nothing this job requires is removed.
+      # `df -h /` before and after prints what the step actually freed, so the
+      # run's log carries the measurement instead of a guess.
       - name: Free runner disk
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
           df -h /
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+
+      # PR #186 CI ran out of runner disk twice (`No space left on device`)
+      # once main's sqlx 0.9 build and this branch's extra integration-test
+      # binaries shared the runner. The runner image ships toolchains this job
+      # never uses; removing them frees the space without lowering what is
+      # tested. Docker is left alone: testcontainers needs it.
+      - name: Free runner disk
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h /
 
       # Save on `main` only; see the `clippy` job's `Cache cargo` step.
       - name: Cache cargo

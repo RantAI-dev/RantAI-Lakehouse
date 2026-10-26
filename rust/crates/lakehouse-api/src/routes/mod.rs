@@ -50,6 +50,7 @@ mod lakehouse;
 pub(crate) mod layers;
 mod lineage;
 mod load_alerts;
+mod maps;
 pub(crate) mod metrics;
 mod notifications;
 mod ops;
@@ -174,7 +175,7 @@ const PDF_REQUEST_TIMEOUT: Duration = Duration::from_secs(60 + 70 + 10);
 fn route_timeout(path: &str) -> Duration {
     match path {
         "/api/ai/chat" => *AI_CHAT_TIMEOUT,
-        "/api/uploads" => UPLOAD_REQUEST_TIMEOUT,
+        "/api/uploads" | "/api/maps" => UPLOAD_REQUEST_TIMEOUT,
         "/api/dashboard/chart-export" | "/api/dashboard/table-export" => EXPORT_REQUEST_TIMEOUT,
         "/api/dashboard/export/pdf" => PDF_REQUEST_TIMEOUT,
         // RPT-1: "Send now" makes the PDF and the chart files in the request,
@@ -182,9 +183,22 @@ fn route_timeout(path: &str) -> Duration {
         other if other.starts_with("/api/reports/subscriptions/") && other.ends_with("/send") => {
             EXPORT_REQUEST_TIMEOUT
         }
+        other if is_upload_part_path(other) => UPLOAD_REQUEST_TIMEOUT,
         other if is_discovery_path(other) => DISCOVERY_REQUEST_TIMEOUT,
         _ => DEFAULT_REQUEST_TIMEOUT,
     }
+}
+
+/// Whether `path` is `/api/uploads/{id}/parts/{n}`: one 8 MiB piece of a
+/// chunked upload (`DATA-17`). It gets [`UPLOAD_REQUEST_TIMEOUT`], not the
+/// default 60 s, which would cut an 8 MiB piece off on a link slower than about
+/// 1 Mbit/s; the other `/api/uploads/{id}*` routes keep the default.
+fn is_upload_part_path(path: &str) -> bool {
+    path.strip_prefix("/api/uploads/")
+        .map(|rest| rest.split('/').collect::<Vec<_>>())
+        .is_some_and(|segments| {
+            matches!(segments.as_slice(), [id, "parts", n] if !id.is_empty() && !n.is_empty())
+        })
 }
 
 /// `/api/connectors/{id}/discovery/{kind}`'s timeout (`SRC-13` decision D9): the
@@ -491,6 +505,11 @@ fn governance_static_router() -> Router<AppState> {
         .route(
             "/api/governance/lineage/columns",
             get(governance::column_lineage),
+        )
+        // BI-14 (D5): the charts that read a table. Static, ahead of `{kind}`.
+        .route(
+            "/api/governance/lineage/used-by",
+            get(lineage::used_by::used_by),
         )
         // DATA-14 (F2): quality incidents. Static segments, mounted ahead of
         // `/api/governance/quality/{id}` and the `{kind}` capture.
@@ -843,9 +862,36 @@ fn uploads_router(state: &AppState) -> Router<AppState> {
             get(uploads::get).delete(uploads::delete),
         )
         .route("/api/uploads/{id}/preview", get(uploads::preview))
+        // DATA-18: apply a column list to the sample, store nothing.
+        .route(
+            "/api/uploads/{id}/check",
+            axum::routing::post(uploads::columns::check),
+        )
         .route(
             "/api/uploads/{id}/ingest",
             axum::routing::post(uploads::ingest),
+        )
+        // DATA-17 slice 5: which other files can load into one table with this one.
+        .route(
+            "/api/uploads/{id}/compare",
+            axum::routing::post(uploads::group::compare),
+        )
+        // DATA-17: the pieces of a chunked upload. Only the piece route takes
+        // a large body, and its own limit (a piece plus 64 KiB); the other
+        // routes keep axum's 2 MB default.
+        .route(
+            "/api/uploads/{id}/parts/{n}",
+            axum::routing::put(uploads::sessions::put_part).layer(DefaultBodyLimit::max(
+                uploads::sessions::MAX_PART_BODY_BYTES,
+            )),
+        )
+        .route(
+            "/api/uploads/{id}/parts",
+            get(uploads::sessions::list_parts),
+        )
+        .route(
+            "/api/uploads/{id}/complete",
+            axum::routing::post(uploads::sessions::complete),
         )
         .route_layer(from_fn_with_state(
             state.clone(),
@@ -858,7 +904,32 @@ fn uploads_router(state: &AppState) -> Router<AppState> {
                 .layer(DefaultBodyLimit::max(uploads::MAX_REQUEST_BODY_BYTES))
                 .get(uploads::list),
         )
+        // DATA-17: opens a chunked upload. A static path next to `{id}`; it
+        // belongs to no existing upload, so it sits outside the tenant layer.
+        .route(
+            "/api/uploads/sessions",
+            axum::routing::post(uploads::sessions::create_session),
+        )
         .merge(per_upload)
+}
+
+/// The `/api/maps/*` sub-router (`BI-16` part C2b): `POST /api/maps` alone
+/// takes the larger body ([`maps::MAX_REQUEST_BODY_BYTES`]), as
+/// `POST /api/uploads` does; the layer on that one method router keeps the
+/// raised limit off every other route.
+fn maps_router() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/api/maps",
+            axum::routing::post(maps::create)
+                .layer(DefaultBodyLimit::max(maps::MAX_REQUEST_BODY_BYTES))
+                .get(maps::list),
+        )
+        .route(
+            "/api/maps/{id}",
+            axum::routing::patch(maps::rename).delete(maps::delete),
+        )
+        .route("/api/maps/{id}/geojson", get(maps::geojson))
 }
 
 /// The `/api/identity/*` sub-router (Phase 2 identity domain), split out
@@ -1185,6 +1256,11 @@ pub fn router(state: AppState) -> Router {
         .route("/api/dashboard/export", get(dashboard::export))
         .route("/api/dashboard/table-export", get(dashboard::table_export))
         .route("/api/dashboard/chart-export", get(dashboard::chart_export))
+        // BI-14 (D1): where a chart comes from. `lineage:read` (owner decision Q6).
+        .route(
+            "/api/dashboard/charts/{id}/lineage",
+            get(lineage::charts::chart_lineage),
+        )
         .route("/api/dashboard/export/pdf", get(pdf_export::export_pdf))
         .route("/api/dashboard/embed-info", get(dashboard::embed_info))
         .route("/api/embed/data", axum::routing::post(embed::data))
@@ -1250,6 +1326,17 @@ pub fn router(state: AppState) -> Router {
                 .put(public_links::put_link)
                 .delete(public_links::delete_link),
         )
+        // PR #246 review BLOCKER 1: a public link and an embed read a map's
+        // boundary through their own token, the way they read the board's
+        // data; the console's own route keeps the signed-in reader.
+        .route(
+            "/api/public/dashboard/{token}/maps/{id}/geojson",
+            get(embed::public_map_geojson),
+        )
+        .route(
+            "/api/embed/maps/{id}/geojson",
+            axum::routing::post(embed::embed_map_geojson),
+        )
         .route("/api/ai/chat", axum::routing::post(ai::chat))
         .route("/api/ai/tool", axum::routing::post(ai::tool_call))
         .route(
@@ -1291,6 +1378,7 @@ pub fn router(state: AppState) -> Router {
         // ADR 0014: files uploaded from the console and loaded into raw
         // tables. Tenant-scoped like connectors.
         .merge(uploads_router(&state))
+        .merge(maps_router())
         // Phase 2, Task 2.8: knowledge sources and vector jobs (metadata
         // only — no `search` route here, see `routes::knowledge`'s module
         // doc comment).
@@ -1482,12 +1570,27 @@ mod tests {
             "/api/uploads/up-1/ingest",
             "/api/uploads/",
             "/api/uploads/x/y",
+            "/api/uploads/up-1/parts",
+            "/api/uploads/up-1/complete",
+            "/api/uploads/sessions",
+            "/api/uploads/up-1/parts/",
+            "/api/uploads//parts/1",
+            "/api/uploads/up-1/parts/1/x",
         ] {
             assert_eq!(
                 route_timeout(per_upload),
                 DEFAULT_REQUEST_TIMEOUT,
                 "{per_upload}"
             );
+        }
+    }
+
+    /// `DATA-17`: one 8 MiB piece of a chunked upload gets the long bound, as
+    /// the single request it replaces did.
+    #[test]
+    fn a_piece_of_a_chunked_upload_takes_five_minutes() {
+        for piece in ["/api/uploads/up-1/parts/1", "/api/uploads/up-1/parts/256"] {
+            assert_eq!(route_timeout(piece), UPLOAD_REQUEST_TIMEOUT, "{piece}");
         }
     }
 }

@@ -10,12 +10,61 @@
  */
 
 /**
- * `uploaded` (stored, never loaded), `ingesting` (a load is running),
- * `ingested` (loaded) or `failed`. Widened with `| string` because the Rust
+ * `receiving` (a chunked upload whose pieces are still arriving: it cannot be
+ * previewed or loaded yet), `uploaded` (stored, never loaded), `ingesting` (a
+ * load is running), `ingested` (loaded) or `failed`. Widened with `| string` because the Rust
  * field is a plain `String` (`lakehouse_store::uploads::Upload::status`), so
  * the client stays honest about a value a later version might add.
  */
-export type UploadStatus = "uploaded" | "ingesting" | "ingested" | "failed" | string
+export type UploadStatus = "receiving" | "uploaded" | "ingesting" | "ingested" | "failed" | string
+
+/**
+ * A column's type (`DATA-18`, decision 2): the six a person chooses among, and
+ * `float`, which only a file that carries one (Parquet) starts with, shown as
+ * "Floating point (from the file)" (decision 10). Mirrors Rust `ColumnType`
+ * (`lakehouse-api/src/upload_types.rs`).
+ */
+export type UploadColumnType = "text" | "integer" | "decimal" | "boolean" | "date" | "timestamp" | "float"
+
+/** How a date is read: ISO `2026-10-16`, day first `16/10/2026`, or month first `10/16/2026`. */
+export type UploadDateFormat = "iso" | "dmy" | "mdy"
+
+/**
+ * One column of a load as a person confirmed it (`columns` of the ingest body and
+ * of the check). `source` is the file's own name for it, for display; the load
+ * matches columns by position. `dateFormat` is required for `date` and
+ * `timestamp` and refused for the others; `timezone` is required for `timestamp`
+ * (whether its values carry a zone and are stored as instants in UTC) and
+ * refused for the others.
+ */
+export type UploadColumnSpec = {
+  source: string
+  name: string
+  type: UploadColumnType
+  dateFormat?: UploadDateFormat
+  timezone?: boolean
+}
+
+/** A column of a preview: a spec, what the guess said, and the question a date may need. */
+export type UploadPreviewColumn = UploadColumnSpec & {
+  /** The type the guess (or the file's own type) gave; `type` differs when the table decides. */
+  guessedType: UploadColumnType
+  /** Every sampled value could be read day first or month first: Load stays off until `dateFormat` is chosen. */
+  askDateOrder: boolean
+}
+
+/** What the guess found wrong with the values of a column list: all counted, the first 100 listed (decision 6). */
+export type UploadBadValues = {
+  count: number
+  byColumn: { column: string; count: number }[]
+  rows: { row: number; column: string; value: string }[]
+}
+
+/** `POST /api/uploads/{id}/check`'s response: how many rows were read, and the values that do not fit. */
+export type UploadCheck = UploadBadValues & { sampledRows: number }
+
+/** What to do with a value that does not fit: `stop` the load (pre-selected) or load it as empty (`null`). */
+export type UploadOnBadValue = "null" | "stop"
 
 /**
  * What a load does with the rows a table already holds: `replace` swaps them
@@ -103,12 +152,24 @@ export type Upload = {
   /** Display name of whoever uploaded it. */
   uploadedBy: string
   status: UploadStatus
+  /**
+   * The size the client announced when it opened a chunked upload. Present only
+   * on a `receiving` upload or one that arrived in pieces (`sizeBytes` is `0`
+   * until the pieces are assembled).
+   */
+  declaredSize?: number
   /** ISO 8601, UTC. When the bytes were stored. */
   createdAt: string
   /** ISO 8601, UTC. When the row last changed state; for a load, the time it was claimed. */
   updatedAt: string
   /** What the last load was told to use. Absent until a load was requested. */
   parseOptions?: UploadParseOptions
+  /** The column list the last load was told; absent for a load with no list (every column text). */
+  columns?: UploadColumnSpec[]
+  /** What the last load did with a value that does not fit; set when `columns` is. */
+  onBadValue?: UploadOnBadValue
+  /** The values the last load found that did not fit its column's type; absent when none. */
+  badValues?: UploadBadValues
   /** The raw table the last load targeted. */
   bronzeTable?: string
   loadMode?: UploadLoadMode | string
@@ -134,6 +195,13 @@ export type Upload = {
    * `ingested`.
    */
   assetId?: string
+  /**
+   * `DATA-17` slice 5: the id of the upload this file was loaded WITH, when its last load
+   * took several files into one table. Set on every file of the load but the first (the
+   * one that has the run and the row count); absent for a file that loaded alone and for
+   * the first file itself. A file loaded with others has no `rows` of its own.
+   */
+  loadedWith?: string
 }
 
 /**
@@ -149,6 +217,54 @@ export type CreateUploadResponse = Upload & {
   /** Present when the file is a Parquet file: its columns with their declared types. */
   parquet?: UploadParquet
 }
+
+/**
+ * `POST /api/uploads/sessions`'s response (201): the new `receiving` upload and
+ * the shape of the pieces to send (`DATA-17`). Every piece but the last is
+ * exactly `partSize` bytes; pieces are numbered `1..=partCount`.
+ */
+export type UploadSession = {
+  upload: Upload
+  partSize: number
+  partCount: number
+}
+
+/** `GET /api/uploads/{id}/parts`: the numbers of the pieces the API holds, ascending, so a client that lost its connection sends only the rest. */
+export type UploadParts = {
+  received: number[]
+  partSize: number
+  partCount: number
+}
+
+/** `PUT /api/uploads/{id}/parts/{n}`'s response: the piece the API stored. */
+export type UploadPartReceipt = {
+  partNumber: number
+  sizeBytes: number
+}
+
+/**
+ * What a JSON, JSON Lines, Avro, gzip or zip file is read as (`DATA-17` slice 4).
+ * Mirrors Rust `LayoutView` (`routes/uploads.rs`). `format` is `delimited`, `json`,
+ * `jsonl` or `avro`; `compression` is `none`, `gzip` or `zip`.
+ */
+export type UploadLayout = {
+  format: "delimited" | "json" | "jsonl" | "avro" | string
+  compression: "none" | "gzip" | "zip" | string
+}
+
+/** One file of a zip archive. Mirrors Rust `ArchiveFileView`. */
+export type UploadArchiveFile = {
+  name: string
+  /** Its size once unpacked, as the archive declares it. */
+  sizeBytes: number
+  /** How many columns its header, keys or fields give. */
+  columns: number
+  /** Whether it has the first file's columns, whatever their order. A load needs every file to. */
+  matchesFirst: boolean
+}
+
+/** The files of a zip archive, in the archive's order. */
+export type UploadArchive = { files: UploadArchiveFile[] }
 
 /**
  * `GET /api/uploads/{id}/preview`: what the first bytes of the file contain.
@@ -187,7 +303,47 @@ export type UploadPreview = {
    * names (row 1), and none of the three settings is the person's to choose.
    */
   parquet?: UploadParquet
+  /**
+   * Present when the file is JSON, JSON Lines, Avro, gzip or zip: what it is read as. For
+   * JSON and Avro `detected` and `using` read UTF-8 and a comma and the keys or fields are
+   * the header, as for Parquet; a gzip or zip of delimited text keeps the three settings.
+   */
+  layout?: UploadLayout
+  /** Present when the file is a zip: its files, and whether each has the first file's columns. */
+  archive?: UploadArchive
+  /** Every column with its name, starting type and date reading (`DATA-18`). */
+  columnSpecs: UploadPreviewColumn[]
+  /** How many data rows the guess read (at most 10,000, or 16 MiB). */
+  sampledRows: number
+  /** The names and types are those of the table the file will be added to, not a guess. */
+  fromTable?: boolean
 }
+
+/** A column both files have, whose values in the other file do not fit the first file's type. */
+export type UploadTypeConflict = {
+  column: string
+  /** The first file's type for it. */
+  expected: UploadColumnType
+  /** The type the other file's own values give. */
+  found: UploadColumnType
+}
+
+/**
+ * A file that cannot load into one table with the first one (`DATA-17` slice 5, decision 4):
+ * the columns it lacks, the ones it adds, and the columns whose values do not fit the first
+ * file's type. The names are those the load gives the columns, and their order does not matter.
+ * Mirrors Rust `Mismatch` (`routes/uploads/group.rs`).
+ */
+export type UploadMismatch = {
+  uploadId: string
+  file: string
+  missing: string[]
+  extra: string[]
+  typeConflicts: UploadTypeConflict[]
+}
+
+/** `POST /api/uploads/{id}/compare`'s response: the files that cannot load with the first, in the order asked; empty when all can. */
+export type UploadCompare = { mismatches: UploadMismatch[] }
 
 /**
  * The `POST /api/uploads/{id}/ingest` body. All of it is what the user
@@ -198,6 +354,16 @@ export type IngestUploadInput = UploadParseOptions & {
   bronzeTable: string
   /** `replace` when absent. */
   mode?: UploadLoadMode
+  /** The columns as confirmed; with `onBadValue`. Left out, every column is loaded as text. */
+  columns?: UploadColumnSpec[]
+  /** Required with `columns`, refused without. */
+  onBadValue?: UploadOnBadValue
+  /**
+   * `DATA-17` slice 5: the other files of a load of several files into this table (at most 9,
+   * the upload in the path is the first). The API compares their columns with the first
+   * file's again and refuses the load with the list when they differ.
+   */
+  alsoUploads?: string[]
 }
 
 /** `POST /api/uploads/{id}/ingest`'s response: the upload, now `ingesting`, and the run carrying the load out. */
@@ -220,15 +386,63 @@ export interface UploadService {
    */
   create(file: File, signal?: AbortSignal): Promise<CreateUploadResponse>
   /**
+   * `POST /api/uploads/sessions` (`DATA-17`): opens a chunked upload for a file
+   * of `sizeBytes` bytes. Refused (400) for a size of 0 or above the limit,
+   * each with the API's sentence.
+   */
+  createSession(
+    input: { filename: string; sizeBytes: number },
+    signal?: AbortSignal
+  ): Promise<UploadSession>
+  /**
+   * `PUT /api/uploads/{id}/parts/{n}`: sends piece `number` (from 1) as raw
+   * bytes. A piece sent again replaces the earlier copy, so a retry is safe.
+   * A 429 carries `retryAfterSecs` on the `ServiceError`.
+   */
+  putPart(
+    id: string,
+    number: number,
+    bytes: Blob,
+    signal?: AbortSignal
+  ): Promise<UploadPartReceipt>
+  /** `GET /api/uploads/{id}/parts`: which pieces the API holds. 409 when the upload is no longer receiving. */
+  listParts(id: string, signal?: AbortSignal): Promise<UploadParts>
+  /**
+   * `POST /api/uploads/{id}/complete`: assembles the pieces and checks the
+   * file. The answer is `create`'s: the upload and, for a workbook or a
+   * Parquet file, its facts, with `duplicateOf` when the tenant holds the same
+   * file. 409 lists the pieces still missing.
+   */
+  complete(id: string, signal?: AbortSignal): Promise<CreateUploadResponse>
+  /**
    * `GET /api/uploads/{id}/preview`. Each option given overrides detection;
    * one left out is detected. `headerRow` is zero-based. `sheet` chooses the
    * sheet of a workbook (its first visible one when left out).
    */
   preview(
     id: string,
-    options?: Partial<UploadParseOptions>,
+    options?: Partial<UploadParseOptions> & { table?: string },
     signal?: AbortSignal
   ): Promise<UploadPreview>
+  /**
+   * `POST /api/uploads/{id}/check`: applies a column list to the sample and lists
+   * the values that do not fit. Stores nothing. The reading is the one in force.
+   */
+  check(
+    id: string,
+    input: { options?: Partial<UploadParseOptions>; columns: UploadColumnSpec[] },
+    signal?: AbortSignal
+  ): Promise<UploadCheck>
+  /**
+   * `POST /api/uploads/{id}/compare` (`DATA-17` slice 5): which of `alsoUploads` cannot load
+   * into one table with this upload. The reading and the column list are what the Check step has
+   * so far, so the types the others must fit are the person's. Stores nothing.
+   */
+  compare(
+    id: string,
+    input: { alsoUploads: string[]; options?: Partial<UploadParseOptions>; columns?: UploadColumnSpec[] },
+    signal?: AbortSignal
+  ): Promise<UploadCompare>
   /** `POST /api/uploads/{id}/ingest`: starts the load. 409 for a table the upload may not load into. */
   ingest(id: string, input: IngestUploadInput, signal?: AbortSignal): Promise<IngestUploadResponse>
   /** `DELETE /api/uploads/{id}` (204): removes the file and its entry. Never the table. 409 while loading. */
