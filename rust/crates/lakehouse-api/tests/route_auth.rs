@@ -231,7 +231,6 @@ async fn a_seeded_analyst_is_denied_the_four_hardened_permission_families() {
         ("POST", "/api/identity/roles"),
         ("POST", "/api/agents/employees/x/suspend"),
         ("POST", "/api/storage/restore"),
-        ("POST", "/api/alerts"),
     ] {
         let resp = request_with_cookie(&router, method, path, &cookie).await;
         assert_eq!(
@@ -240,6 +239,61 @@ async fn a_seeded_analyst_is_denied_the_four_hardened_permission_families() {
             "{method} {path}: a seeded Analyst must be denied"
         );
     }
+}
+
+/// `BI-19` part C (C3): `/api/alerts` is "signed in" at the router, because a
+/// person who can view a chart may alert on it for themselves; the handler asks
+/// for `alert:write` for everything else. Both directions, with real principals:
+/// the seeded Analyst (no `alert:write`) is refused a plain threshold rule and a
+/// chart alert to somebody else's address; the Data Engineer (has it) is not
+/// refused by the auth gate; with no session the router answers 401.
+#[tokio::test]
+async fn the_alert_routes_are_signed_in_at_the_router_and_the_handler_asks_for_the_right() {
+    let TestApp { router, pool } = spin_up().await;
+    for method in ["POST", "PUT", "DELETE"] {
+        assert_eq!(
+            POLICY_TABLE
+                .iter()
+                .find(|(m, p, _)| *m == method && *p == "/api/alerts")
+                .map(|(_, _, policy)| *policy),
+            Some(Policy::RequiresAuth)
+        );
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri("/api/alerts")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "{method} with no session"
+        );
+    }
+    let analyst = session_cookie_for_seeded_user(&pool, "sari@meridian.example").await;
+    let engineer = session_cookie_for_seeded_user(&pool, "bayu@meridian.example").await;
+    let plain = br#"{"name":"n","type":"alert","mart":"m","measure":"x","target":"https://hooks.example.com/x"}"#.to_vec();
+    let to_someone_else = br#"{"name":"n","type":"alert","chart":"c1","condition":"any_rows","channel":"email","target":"other@example.com"}"#.to_vec();
+    for body in [plain.clone(), to_someone_else] {
+        let resp =
+            request_with_cookie_and_body(&router, "POST", "/api/alerts", &analyst, body).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "an Analyst without alert:write"
+        );
+    }
+    let resp = request_with_cookie_and_body(&router, "POST", "/api/alerts", &engineer, plain).await;
+    assert!(
+        resp.status() != StatusCode::UNAUTHORIZED && resp.status() != StatusCode::FORBIDDEN,
+        "a holder of alert:write got {}",
+        resp.status()
+    );
 }
 
 /// A seeded Analyst (no `identity:write`) is denied

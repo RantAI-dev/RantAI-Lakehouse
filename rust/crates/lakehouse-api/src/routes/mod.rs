@@ -9,6 +9,7 @@ mod agents;
 pub(crate) mod ai;
 mod alerts;
 pub mod auth;
+mod chart_alerts;
 // `pub(crate)`, not private: `crate::pipeline_lag` (BLD-2) reads
 // `authored_pipelines::job_name` to name the job a lag run launches, and
 // re-deriving the `authored__<id>` mapping in a second place is exactly

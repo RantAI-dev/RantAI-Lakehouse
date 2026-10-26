@@ -400,9 +400,15 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     //    allowed through, not merely `RequiresAuth`'s "any authenticated
     //    principal" — this table entry is a floor, not the whole guard. ──
     ("GET",    "/api/alerts",      Policy::RequiresAuth),
-    ("POST",   "/api/alerts",      Policy::RequiresPermission("alert:write")),
-    ("PUT",    "/api/alerts",      Policy::RequiresPermission("alert:write")),
-    ("DELETE", "/api/alerts",      Policy::RequiresPermission("alert:write")),
+    // `BI-19` part C (C3): signed in is the floor. Anybody who can view a chart
+    // may save an alert on it for themselves (and remove their own), so the
+    // handler decides: `alert:write` for every other rule or target, the
+    // owner's own address for a chart alert without it
+    // (`routes::chart_alerts::authorise_save`, `may_delete`). Asserted both
+    // ways in `tests/route_auth.rs`.
+    ("POST",   "/api/alerts",      Policy::RequiresAuth),
+    ("PUT",    "/api/alerts",      Policy::RequiresAuth),
+    ("DELETE", "/api/alerts",      Policy::RequiresAuth),
     // `SRC-7` D9: whether run reports can arrive; auth only, it reads no rule.
     ("GET",    "/api/alerts/status", Policy::RequiresAuth),
     ("GET",    "/api/alerts/run",  Policy::RequiresAuth),
@@ -1561,22 +1567,18 @@ mod tests {
         );
     }
 
-    /// #4: alert rule CRUD (`alert:write`) is granted to Data Engineer
-    /// (0020) — an Analyst must be denied on all three mutating methods,
-    /// Data Engineer allowed.
+    /// #4 (changed by `BI-19` part C, C3): alert rule CRUD is "signed in" at the
+    /// router, because a person who can view a chart may alert on it for
+    /// themselves. `alert:write` is judged in the handler
+    /// (`tests/route_auth.rs`, `the_alert_routes_are_signed_in_at_the_router_and_the_handler_asks_for_the_right`).
     #[test]
-    fn alert_crud_denies_analyst_allows_data_engineer() {
-        use lakehouse_auth::PermissionSet;
-
+    fn alert_crud_is_signed_in_at_the_router_and_the_handler_asks_for_the_right() {
         for method in ["POST", "PUT", "DELETE"] {
-            assert_denied_then_allowed(
-                method,
-                "/api/alerts",
-                &PermissionSet::parse("query:read, catalog:read, lineage:read"),
-                "an Analyst",
-                &PermissionSet::parse("pipeline:*, catalog:write, connector:manage, alert:write"),
-                "a Data Engineer",
-            );
+            let row = POLICY_TABLE
+                .iter()
+                .find(|(m, p, _)| *m == method && *p == "/api/alerts")
+                .map(|(_, _, policy)| *policy);
+            assert_eq!(row, Some(Policy::RequiresAuth), "{method} /api/alerts");
         }
     }
 

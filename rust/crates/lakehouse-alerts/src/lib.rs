@@ -630,10 +630,33 @@ struct RuleExtras {
 }
 
 impl RuleExtras {
-    fn of(input: &AlertRuleInput) -> Self {
+    /// `input` has passed [`normalize_input`], so a chart rule's fields are
+    /// already valid; nothing but the owner is kept for any other rule.
+    fn of(input: &AlertRuleInput, kind: AlertKind) -> Self {
+        let owner_id = input.owner_id.clone().unwrap_or_default();
+        let chart = input.chart.as_deref().map_or("", str::trim);
+        if kind != AlertKind::Alert || chart.is_empty() {
+            return Self {
+                owner_id,
+                ..Self::default()
+            };
+        }
+        let condition = input.condition.as_deref().map_or("", str::trim);
+        let filters = lakehouse_bi::filters::without_inert(input.filters.as_deref().unwrap_or(&[]));
         Self {
-            owner_id: input.owner_id.clone().unwrap_or_default(),
-            ..Self::default()
+            chart: chart.to_owned(),
+            series: if condition == "any_rows" {
+                String::new()
+            } else {
+                input.series.as_deref().map_or("", str::trim).to_owned()
+            },
+            filters_json: if filters.is_empty() {
+                String::new()
+            } else {
+                serde_json::to_string(&filters).unwrap_or_default()
+            },
+            condition: condition.to_owned(),
+            owner_id,
         }
     }
 }
@@ -655,6 +678,12 @@ fn normalize_alert(
     input: &AlertRuleInput,
     common: NormalizedCommon,
 ) -> Result<NormalizedRule, AlertError> {
+    // BI-19 part C (D12): a rule that watches a chart reads neither a mart nor a
+    // metric of its own; the chart says what is read.
+    let chart = input.chart.as_deref().map_or("", str::trim);
+    if !chart.is_empty() {
+        return normalize_chart(input, common, chart);
+    }
     // BI-2: a rule that watches a metric reads no mart, measure or aggregate.
     let metric = input.metric.as_deref().map_or("", str::trim);
     if !metric.is_empty() {
@@ -718,6 +747,69 @@ fn normalize_alert(
         measure,
         agg,
         op,
+        threshold,
+        board: String::new(),
+        severity: common.severity,
+        metric: String::new(),
+        pipeline: String::new(),
+        connector: String::new(),
+        asset: String::new(),
+    })
+}
+
+/// The conditions of a chart alert (D12): over a line, under it, or "returns any
+/// rows".
+const CONDITIONS: [&str; 3] = ["above", "below", "any_rows"];
+
+/// Validate a chart alert (`BI-19` part C, D12). Pure; whether the chart exists
+/// and has a number is checked by [`save_rule`], which can read it.
+fn normalize_chart(
+    input: &AlertRuleInput,
+    common: NormalizedCommon,
+    chart: &str,
+) -> Result<NormalizedRule, AlertError> {
+    let bad = |m: &str| Err(AlertError::Validation(m.to_owned()));
+    if chart.len() > 128
+        || !chart
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+    {
+        return bad("invalid chart.");
+    }
+    let condition = input.condition.as_deref().map_or("", str::trim);
+    if !CONDITIONS.contains(&condition) {
+        return bad("condition must be above, below or any_rows.");
+    }
+    let threshold = if condition == "any_rows" {
+        0.0
+    } else {
+        let t = input.threshold.unwrap_or(0.0);
+        if !t.is_finite() {
+            return bad("invalid threshold.");
+        }
+        t
+    };
+    if let Some(series) = input.series.as_deref()
+        && (series.len() > 128 || series.chars().any(char::is_control))
+    {
+        return bad("invalid series.");
+    }
+    if let Some(filters) = input.filters.as_deref() {
+        lakehouse_bi::filters::validate_filters(filters).map_err(AlertError::Validation)?;
+    }
+    Ok(NormalizedRule {
+        name: common.name,
+        kind: common.kind,
+        channel: common.channel,
+        target: common.target,
+        mart: String::new(),
+        measure: String::new(),
+        agg: default_agg(),
+        op: if condition == "below" {
+            AlertOp::Lt
+        } else {
+            AlertOp::Gt
+        },
         threshold,
         board: String::new(),
         severity: common.severity,
@@ -1281,7 +1373,10 @@ pub async fn save_rule(
             ));
         }
     }
-    let extras = RuleExtras::of(input);
+    let extras = RuleExtras::of(input, normalized.kind);
+    if !extras.chart.is_empty() {
+        check_chart_has_a_number(ch, &extras).await?;
+    }
     let rid = id.map_or_else(new_rule_id, str::to_owned);
     let enabled: u8 = u8::from(input.enabled != Some(false));
     let threshold = normalized.threshold;
@@ -1341,6 +1436,120 @@ pub async fn delete_rule(ch: &ChClient, id: &str) -> Result<(), ChError> {
         SqlLiteral::from(id)
     );
     ch.exec(&sql, None).await
+}
+
+// ── Chart alerts (BI-19 part C, D12) ────────────────────────────────────
+
+/// What number a chart gives an alert (feature C1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NumberShape {
+    /// A KPI or a gauge: its one value.
+    Single,
+    /// A line, area, bar or combo chart over its dimension: the latest point of
+    /// the chosen series.
+    Series,
+    /// Any other chart: no single number, so only "returns any rows".
+    NoNumber,
+}
+
+/// The [`NumberShape`] of a chart kind.
+#[must_use]
+pub const fn number_shape(kind: lakehouse_bi::specs::ChartKind) -> NumberShape {
+    use lakehouse_bi::specs::ChartKind;
+    match kind {
+        ChartKind::Kpi | ChartKind::Gauge => NumberShape::Single,
+        ChartKind::Line | ChartKind::Area | ChartKind::Bar | ChartKind::Combo => {
+            NumberShape::Series
+        }
+        _ => NumberShape::NoNumber,
+    }
+}
+
+/// The number a chart's result gives (C1): a [`NumberShape::Single`] chart's
+/// first row, a [`NumberShape::Series`] chart's last row in the `series` column
+/// (the result is ordered by the dimension, which `save_rule` checks).
+///
+/// # Errors
+///
+/// A fixed sentence when the result has no row, no such column, or a value that
+/// is not a number; the check is then recorded as failed, never read as zero.
+pub fn chart_number(
+    shape: NumberShape,
+    series: Option<&str>,
+    columns: &[String],
+    rows: &[Value],
+) -> Result<f64, String> {
+    let (row, column) = match shape {
+        NumberShape::Single => (
+            rows.first(),
+            series
+                .filter(|s| !s.is_empty() && columns.iter().any(|c| c == s))
+                .or_else(|| columns.first().map(String::as_str)),
+        ),
+        NumberShape::Series => (
+            rows.last(),
+            series.filter(|s| columns.iter().any(|c| c == s)),
+        ),
+        NumberShape::NoNumber => return Err("the chart has no single number.".to_owned()),
+    };
+    let Some(column) = column else {
+        return Err("the series is not in the chart's result.".to_owned());
+    };
+    let Some(cell) = row.and_then(|r| r.get(column)) else {
+        return Err("the chart returned no value.".to_owned());
+    };
+    let value = coerce_number(Some(cell));
+    if value.is_finite() && !cell.is_null() {
+        Ok(value)
+    } else {
+        Err("the chart's value is not a number.".to_owned())
+    }
+}
+
+/// Save-time check that a chart alert watches a chart that exists and has what
+/// the condition needs (D12): "above" and "below" need a number (a KPI, a gauge,
+/// or a series of a chart ordered by its dimension); any other chart allows only
+/// "`any_rows`". Read as the server (`Viewer::system`): whether the caller may see
+/// the chart is the route's check, not this crate's.
+async fn check_chart_has_a_number(ch: &ChClient, extras: &RuleExtras) -> Result<(), AlertError> {
+    let charts =
+        lakehouse_bi::store::list_stored_charts(ch, &lakehouse_bi::access::Viewer::system())
+            .await?;
+    let Some(chart) = charts.iter().find(|c| c.spec.id == extras.chart) else {
+        return Err(AlertError::Validation("no chart has that id.".to_owned()));
+    };
+    if extras.condition == "any_rows" {
+        return Ok(());
+    }
+    let refuse = |m: &str| Err(AlertError::Validation(m.to_owned()));
+    match number_shape(chart.def.kind) {
+        NumberShape::Series if extras.series.is_empty() => {
+            refuse("choose the series whose latest point the alert reads.")
+        }
+        NumberShape::Series if chart.def.effective_order() != "none" => refuse(
+            "this chart is sorted by value, so it has no latest point; use 'returns any rows'.",
+        ),
+        NumberShape::Single | NumberShape::Series => Ok(()),
+        NumberShape::NoNumber => refuse(
+            "this chart has no single number; an alert on it can only be 'returns any rows'.",
+        ),
+    }
+}
+
+/// The reason a chart rule is skipped by [`run_rules`].
+const CHART_SKIPPED: &str = "chart alerts are evaluated by /api/alerts/run after run_rules returns, \
+     because they are read as the person who set them";
+
+/// A chart rule that cannot run: record `Stopped` with `reason` (no message is
+/// sent) and report it as skipped. For an owner who is disabled or can no longer
+/// see the chart (C4).
+pub async fn stop(state: Option<&dyn StateSource>, rule: &AlertRule, reason: &str) -> RunResult {
+    if let Some(state) = state {
+        state
+            .record(&rule.id, AlertState::Stopped, None, Some(reason))
+            .await;
+    }
+    skipped(rule, reason.to_owned())
 }
 
 // ── Alerts that fire once (BI-19 part C, D11) ───────────────────────────
@@ -2808,6 +3017,10 @@ async fn run_alert(
     gate: &dyn SqlGate,
     rule: &AlertRule,
 ) -> RunResult {
+    // BI-19 part C (D12): the API reads a chart rule as its owner.
+    if rule.chart.is_some() {
+        return skipped(rule, CHART_SKIPPED.to_owned());
+    }
     let mart = rule.mart.as_deref().unwrap_or("");
     let measure = rule.measure.as_deref().unwrap_or("");
     // BI-2: a rule that watches a metric reads the metric, not a column.
@@ -6203,5 +6416,290 @@ mod tests {
             assert!(q.contains("ADD COLUMN IF NOT EXISTS"), "{q}");
             assert!(!q.contains("DROP") && !q.contains("MODIFY"), "{q}");
         }
+    }
+
+    // ── BI-19 part C, T12: chart alerts (D12) ───────────────────────────
+
+    fn chart_input(condition: &str) -> AlertRuleInput {
+        AlertRuleInput {
+            name: Some("Visitors".to_owned()),
+            target: Some("ops@example.com".to_owned()),
+            channel: Some("email".to_owned()),
+            chart: Some("c_one".to_owned()),
+            condition: Some(condition.to_owned()),
+            threshold: Some(100.0),
+            ..AlertRuleInput::default()
+        }
+    }
+
+    #[test]
+    fn a_chart_rule_needs_a_known_condition_and_derives_its_operator() {
+        let above = normalize_input(&chart_input("above")).unwrap();
+        assert_eq!((above.op, above.threshold), (AlertOp::Gt, 100.0));
+        assert!(above.mart.is_empty() && above.metric.is_empty());
+        let below = normalize_input(&chart_input("below")).unwrap();
+        assert_eq!(below.op, AlertOp::Lt);
+        let any = normalize_input(&chart_input("any_rows")).unwrap();
+        assert_eq!(any.threshold, 0.0);
+        for bad in ["", "equal", "ABOVE"] {
+            let err = normalize_input(&chart_input(bad)).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "condition must be above, below or any_rows."
+            );
+        }
+    }
+
+    #[test]
+    fn a_chart_rule_refuses_a_chart_id_series_threshold_or_filter_that_is_malformed() {
+        let mut input = chart_input("above");
+        input.chart = Some("c' OR 1=1".to_owned());
+        assert_eq!(
+            normalize_input(&input).unwrap_err().to_string(),
+            "invalid chart."
+        );
+        let mut input = chart_input("above");
+        input.threshold = Some(f64::NAN);
+        assert_eq!(
+            normalize_input(&input).unwrap_err().to_string(),
+            "invalid threshold."
+        );
+        let mut input = chart_input("above");
+        input.series = Some("a\nb".to_owned());
+        assert_eq!(
+            normalize_input(&input).unwrap_err().to_string(),
+            "invalid series."
+        );
+        let mut input = chart_input("above");
+        input.filters = Some(vec![lakehouse_bi::filters::FilterDef {
+            column: String::new(),
+            ..serde_json::from_str(r#"{"column":"x","values":["a"]}"#).unwrap()
+        }]);
+        assert!(normalize_input(&input).is_err());
+    }
+
+    #[test]
+    fn extras_keep_a_chart_rules_fields_and_only_the_owner_of_any_other_rule() {
+        let mut input = chart_input("above");
+        input.series = Some("visitors".to_owned());
+        input.owner_id = Some("u1".to_owned());
+        input.filters = Some(vec![
+            serde_json::from_str(r#"{"column":"region","values":["Bali"]}"#).unwrap(),
+        ]);
+        let extras = RuleExtras::of(&input, AlertKind::Alert);
+        assert_eq!(
+            (
+                extras.chart.as_str(),
+                extras.series.as_str(),
+                extras.condition.as_str()
+            ),
+            ("c_one", "visitors", "above")
+        );
+        assert!(extras.filters_json.contains("Bali"));
+        let other = RuleExtras::of(&input, AlertKind::Digest);
+        assert!(other.chart.is_empty() && other.filters_json.is_empty());
+        assert_eq!(other.owner_id, "u1");
+        input.condition = Some("any_rows".to_owned());
+        assert_eq!(RuleExtras::of(&input, AlertKind::Alert).series, "");
+    }
+
+    #[test]
+    fn a_chart_number_is_the_first_value_of_a_kpi_and_the_latest_point_of_a_series() {
+        use serde_json::json;
+        let cols = vec!["month".to_owned(), "visitors".to_owned()];
+        let rows = vec![
+            json!({"month": "2026-01", "visitors": 10}),
+            json!({"month": "2026-02", "visitors": "25.5"}),
+        ];
+        assert_eq!(
+            chart_number(NumberShape::Series, Some("visitors"), &cols, &rows),
+            Ok(25.5)
+        );
+        assert_eq!(
+            chart_number(NumberShape::Series, None, &cols, &rows),
+            Err("the series is not in the chart's result.".to_owned())
+        );
+        let kpi = vec![json!({"total": 7})];
+        assert_eq!(
+            chart_number(NumberShape::Single, None, &["total".to_owned()], &kpi),
+            Ok(7.0)
+        );
+        assert_eq!(
+            chart_number(NumberShape::Single, None, &["total".to_owned()], &[]),
+            Err("the chart returned no value.".to_owned())
+        );
+        let text = vec![json!({"total": "n/a"}), json!({"total": null})];
+        for row in &text {
+            assert_eq!(
+                chart_number(
+                    NumberShape::Single,
+                    None,
+                    &["total".to_owned()],
+                    std::slice::from_ref(row)
+                ),
+                Err("the chart's value is not a number.".to_owned())
+            );
+        }
+        assert!(chart_number(NumberShape::NoNumber, None, &cols, &rows).is_err());
+    }
+
+    #[test]
+    fn only_kpi_gauge_and_ordered_series_kinds_give_a_number() {
+        use lakehouse_bi::specs::ChartKind;
+        assert_eq!(number_shape(ChartKind::Kpi), NumberShape::Single);
+        assert_eq!(number_shape(ChartKind::Gauge), NumberShape::Single);
+        assert_eq!(number_shape(ChartKind::Line), NumberShape::Series);
+        assert_eq!(number_shape(ChartKind::Pie), NumberShape::NoNumber);
+        assert_eq!(number_shape(ChartKind::Heatmap), NumberShape::NoNumber);
+    }
+
+    fn charts_json(kind: &str, order: &str) -> serde_json::Value {
+        let spec = serde_json::json!({
+            "id": "c_one", "title": "T", "kind": kind, "mart": "mart_x", "sql": "SELECT 1",
+            "x": "month", "y": "visitors"
+        });
+        let def = serde_json::json!({
+            "title": "T", "mart": "mart_x", "kind": kind, "dimension": "month",
+            "measures": ["visitors"], "order": order
+        });
+        serde_json::json!({
+            "meta": [], "rows": 1,
+            "data": [{
+                "id": "c_one", "board": "b1", "created_by": "ui",
+                "created_at": "2026-01-01 00:00:00",
+                "spec_json": serde_json::json!({"spec": spec, "def": def, "hasYear": false}).to_string()
+            }]
+        })
+    }
+
+    async fn save_chart_rule(
+        kind: &str,
+        order: &str,
+        condition: &str,
+        series: Option<&str>,
+    ) -> Result<AlertRule, AlertError> {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(wiremock::matchers::body_string_contains(
+            "FROM console.bi_chart",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(charts_json(kind, order)))
+        .mount(&server)
+        .await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": [], "data": [], "rows": 0
+            })))
+            .mount(&server)
+            .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let mut input = chart_input(condition);
+        input.series = series.map(str::to_owned);
+        save_rule(&ch, &test_webhook_sender(), &input, None).await
+    }
+
+    /// D12: a chart with no single number refuses "above" and keeps "`any_rows`".
+    #[tokio::test]
+    async fn a_chart_with_no_number_refuses_above_and_allows_any_rows() {
+        let err = save_chart_rule("pie", "none", "above", None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("can only be 'returns any rows'"),
+            "{err}"
+        );
+        // The stored row is empty in this fake, so the save fails after the check
+        // with the "could not be found" sentence; what matters is the check passed.
+        let ok = save_chart_rule("pie", "none", "any_rows", None).await;
+        assert!(
+            ok.as_ref()
+                .err()
+                .is_none_or(|e| e.to_string().contains("could not be found")),
+            "{ok:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_series_chart_needs_a_series_and_an_order_by_its_dimension() {
+        let err = save_chart_rule("line", "none", "above", None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("choose the series"), "{err}");
+        let err = save_chart_rule("line", "desc", "above", Some("visitors"))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("sorted by value"), "{err}");
+        let kpi = save_chart_rule("kpi", "none", "above", None).await;
+        assert!(
+            kpi.as_ref()
+                .err()
+                .is_none_or(|e| e.to_string().contains("could not be found")),
+            "{kpi:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_chart_that_does_not_exist_is_refused() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": [], "data": [], "rows": 0
+            })))
+            .mount(&server)
+            .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let err = save_rule(&ch, &test_webhook_sender(), &chart_input("above"), None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "no chart has that id.");
+    }
+
+    /// D12: `run_rules` leaves a chart rule to the API, with the reason.
+    #[tokio::test]
+    async fn run_one_skips_a_chart_rule_and_says_why() {
+        let state = FakeState::default();
+        let ch = ChClient::new(
+            "http://127.0.0.1:1".to_owned(),
+            "default".to_owned(),
+            String::new(),
+        );
+        let mut rule = legacy_rule("http://127.0.0.1:9");
+        rule.chart = Some("c_one".to_owned());
+        let r = run_one(
+            &ch,
+            &test_webhook_sender(),
+            &no_smtp_email_sender(),
+            None,
+            (None, Some(&state)),
+            &PassGate,
+            &rule,
+        )
+        .await;
+        assert_eq!(r.skipped.as_deref(), Some(CHART_SKIPPED));
+        assert!(!r.fired);
+    }
+
+    /// C4: an owner who lost access stops the rule; nothing is sent, the reason
+    /// is recorded, and the next healthy check judges it afresh.
+    #[tokio::test]
+    async fn a_stopped_rule_records_its_reason_and_is_judged_afresh_when_it_runs_again() {
+        let state = FakeState::default();
+        let rule = legacy_rule("http://127.0.0.1:9");
+        let r = stop(
+            Some(&state),
+            &rule,
+            "The person who set this alert is gone.",
+        )
+        .await;
+        assert_eq!(state.states.lock().unwrap()["al_1"], AlertState::Stopped);
+        assert_eq!(
+            r.skipped.as_deref(),
+            Some("The person who set this alert is gone.")
+        );
+        assert_eq!(
+            transition(AlertState::Stopped, true),
+            (AlertState::Firing, Sending::Crossed)
+        );
     }
 }

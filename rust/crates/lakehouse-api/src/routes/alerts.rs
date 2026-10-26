@@ -115,6 +115,10 @@ pub(crate) async fn visible_rules(
     principal: Option<&Principal>,
     rules: Vec<AlertRule>,
 ) -> Result<Vec<AlertRule>, ApiError> {
+    // BI-19 part C: anybody signed in may now save a chart alert for
+    // themselves, so the list shows each person their own (the alert permission
+    // sees all); the rule names a target address and the chart's filters.
+    let rules = crate::routes::chart_alerts::visible_to(rules, principal);
     if !rules
         .iter()
         .any(|rule| rule.kind.is_connector_scoped() || rule.kind.is_asset_scoped())
@@ -442,8 +446,12 @@ pub async fn create(
     principal: Option<Extension<Principal>>,
     body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
-    let input = parse_body(&body)?;
-    authorise_rule_create(&state, principal.as_ref().map(|Extension(p)| p), &input).await?;
+    let mut input = parse_body(&body)?;
+    let caller = principal.as_ref().map(|Extension(p)| p);
+    authorise_rule_create(&state, caller, &input).await?;
+    // BI-19 part C (C3): the router's floor is "signed in"; the permission, the
+    // chart and the owner are settled here.
+    crate::routes::chart_alerts::authorise_save(&state, caller, None, &mut input).await?;
     let rule =
         lakehouse_alerts::save_rule(&state.clickhouse, &state.webhook_sender(), &input, None)
             .await
@@ -466,17 +474,13 @@ pub async fn update(
     principal: Option<Extension<Principal>>,
     body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
-    let input = parse_body(&body)?;
+    let mut input = parse_body(&body)?;
     let Some(id) = input.id.clone() else {
         return Err(ApiError::BadRequest("id is required".to_owned()).into());
     };
-    authorise_rule_update(
-        &state,
-        principal.as_ref().map(|Extension(p)| p),
-        &id,
-        &input,
-    )
-    .await?;
+    let caller = principal.as_ref().map(|Extension(p)| p);
+    authorise_rule_update(&state, caller, &id, &input).await?;
+    crate::routes::chart_alerts::authorise_save(&state, caller, Some(&id), &mut input).await?;
     let rule = lakehouse_alerts::save_rule(
         &state.clickhouse,
         &state.webhook_sender(),
@@ -518,7 +522,22 @@ pub async fn delete(
     let Some(id) = query.id else {
         return Err(ApiError::BadRequest("id is required".to_owned()).into());
     };
-    authorise_existing_rule(&state, principal.as_ref().map(|Extension(p)| p), &id).await?;
+    let caller = principal.as_ref().map(|Extension(p)| p);
+    authorise_existing_rule(&state, caller, &id).await?;
+    // BI-19 part C (C3): the router's floor is "signed in"; without the alert
+    // permission a person removes only their own chart alert.
+    if !crate::routes::chart_alerts::may_delete(
+        caller,
+        lakehouse_alerts::get_rule(&state.clickhouse, &id)
+            .await
+            .map_err(|err| {
+                tracing::warn!(%err, "an alert rule could not be read before a delete");
+                ApiError::Unavailable("the alert rules could not be read".to_owned())
+            })?
+            .as_ref(),
+    ) {
+        return Err(ApiError::PermissionDenied("alert:write".to_owned()).into());
+    }
     lakehouse_alerts::delete_rule(&state.clickhouse, &id)
         .await
         .map_err(|err| {
@@ -848,6 +867,16 @@ fn fired_detail(rule: &AlertRule, value: Option<f64>) -> String {
             "{} is stale: observed age {value} min",
             rule.mart.as_deref().unwrap_or("")
         ),
+        // BI-19 part C (planner decision 3): `alert_instance` is one list for
+        // everyone, so a chart alert's detail never carries the value.
+        AlertKind::Alert if rule.chart.is_some() => format!(
+            "chart alert: the chart is {} its line",
+            match rule.condition.as_deref() {
+                Some("below") => "below",
+                Some("any_rows") => "returning rows against",
+                _ => "above",
+            }
+        ),
         // BI-2: a rule that watches a metric says so, not a column.
         AlertKind::Alert if rule.metric.is_some() => format!(
             "metric {} {} {} — observed {value}",
@@ -1053,7 +1082,7 @@ pub async fn run(
         ch: &state.clickhouse,
     };
 
-    let results = lakehouse_alerts::run_rules(
+    let mut results = lakehouse_alerts::run_rules(
         &state.clickhouse,
         &http,
         &email,
@@ -1071,6 +1100,20 @@ pub async fn run(
             upstream_error::FailedAs::Internal,
         )
     })?;
+
+    // BI-19 part C (D12): chart rules are read as their owners here; their
+    // `run_rules` entries (skipped, with the reason) are replaced by the result.
+    let state_ref = state_source.as_ref().map(|s| s as &dyn StateSource);
+    let chart_results = crate::routes::chart_alerts::evaluate(
+        &state,
+        (&http, &email),
+        silence_source.as_ref().map(|s| s as &dyn SilenceSource),
+        state_ref,
+        query.id.as_deref(),
+    )
+    .await;
+    results.retain(|r| !chart_results.iter().any(|c| c.id == r.id));
+    results.extend(chart_results);
 
     // Persist every fired, non-Digest result as an `alert_instance` row,
     // best-effort (WS5 item C1) — see `persist_fired_results`'s doc
