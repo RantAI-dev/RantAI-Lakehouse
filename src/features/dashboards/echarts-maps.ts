@@ -114,20 +114,39 @@ function aliasesOf(gj: FeatureCollection): [string, string][] {
 }
 
 /**
+ * How an uploaded map's boundary file is fetched.
+ *
+ * The console signs in and reads it through `apiFetch` (the map's own
+ * route). A public link and an embed are anonymous: they pass their own
+ * token-based loader, because `apiFetch`'s 401 sends the browser to the
+ * login page — which an anonymous viewer has no use for
+ * (`PR #246 review BLOCKER 1`).
+ */
+export type MapLoader = (id: string) => Promise<Response>;
+
+/** The console's loader: the signed-in reader's own route. */
+const consoleLoader: MapLoader = (id) => apiFetch(uploadedEntry(id).url);
+
+/**
  * Load + register the map `id` once (idempotent). Resolves false for an id
  * that is not in the catalogue, or when its GeoJSON is missing or malformed.
+ *
+ * `load` reads an uploaded map's file; a bundled file is a static asset and
+ * is never fetched through it.
  */
-export function ensureMap(id: string): Promise<boolean> {
+export function ensureMap(id: string, load: MapLoader = consoleLoader): Promise<boolean> {
   const entry = mapEntry(id);
   if (!entry) return Promise.resolve(false);
   if (featureNames.has(id)) return Promise.resolve(true);
   let p = loading.get(id);
   if (!p) {
     // A bundled file is a static asset: deliberately NOT `apiFetch` (no auth
-    // state to react to). An uploaded map is an `/api/*` call behind a sign-in,
-    // so it goes through `apiFetch` (a 401 sends the person to the login page);
-    // the server's `Cache-Control` and ETag decide how long it is kept.
-    p = (entry.uploaded ? apiFetch(entry.url) : fetch(entry.url, { cache: "force-cache" }))
+    // state to react to). An uploaded map is read through the loader the
+    // caller gives: the console's `apiFetch` (a 401 sends the person to the
+    // login page), or a public link's / embed's own token route (no session
+    // at all, so a refusal there is "not found", never a redirect). The
+    // server's `Cache-Control` and ETag decide how long it is kept.
+    p = (entry.uploaded ? load(id) : fetch(entry.url, { cache: "force-cache" }))
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error("geojson not found"))))
       .then((gj: FeatureCollection) => {
         const names = (gj.features ?? []).map((f) => String(f.properties?.name ?? "")).filter(Boolean);

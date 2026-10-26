@@ -417,10 +417,32 @@ pub async fn geojson(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
-    if !well_formed(&id) {
+    map_file(&state, &id, &headers).await
+}
+
+/// The file of a map, as every reader of it gets it: the simplified
+/// `GeoJSON`, an `ETag` that changes with the file, and a `Cache-Control`
+/// that keeps it out of shared caches. A matching `If-None-Match` answers
+/// 304.
+///
+/// `PR #246 review BLOCKER 1`: the public link and the embed read a map's
+/// boundary through their own token, so they come here too — the bytes are
+/// the same file the console draws, and the map's own route keeps the
+/// signed-in reader.
+///
+/// # Errors
+///
+/// 404 for an id that is not server-made or that names no map; 503 without a
+/// Postgres pool; 5xx through `upstream_error` on a database failure.
+pub(super) async fn map_file(
+    state: &AppState,
+    id: &str,
+    headers: &HeaderMap,
+) -> ApiResult<Response> {
+    if !well_formed(id) {
         return Err(ApiError::NotFound(NOT_FOUND.to_owned()).into());
     }
-    let file = geo_map::file(pool(&state)?, &id)
+    let file = geo_map::file(pool(state)?, id)
         .await
         .map_err(|err| store_failed(&err))?
         .ok_or_else(|| ApiError::NotFound(NOT_FOUND.to_owned()))?;

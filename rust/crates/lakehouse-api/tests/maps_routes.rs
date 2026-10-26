@@ -18,6 +18,7 @@ use tower::ServiceExt;
 
 use std::collections::HashMap;
 
+use lakehouse_embed::{EmbedClaims, EmbedResource, sign_embed, unix_now};
 use wiremock::matchers::{body_string_contains, method};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -328,6 +329,22 @@ async fn a_delete_that_cannot_check_the_charts_fails_closed_and_keeps_the_map() 
 /// An app whose engine is a mock that answers every statement with an empty
 /// result, except the ones a test mounts first.
 async fn with_engine() -> (TestApp, MockServer) {
+    with_engine_env(HashMap::new()).await
+}
+
+/// The same, with an embed secret configured: the signed-embed routes need
+/// one (`SEC-12`).
+async fn with_engine_and_embed() -> (TestApp, MockServer) {
+    with_engine_env(HashMap::from([(
+        "EMBED_SECRET".to_owned(),
+        EMBED_SECRET.to_owned(),
+    )]))
+    .await
+}
+
+/// The app over a mock engine that answers every statement with an empty
+/// result.
+async fn with_engine_env(env: HashMap<String, String>) -> (TestApp, MockServer) {
     let engine = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(
@@ -335,7 +352,8 @@ async fn with_engine() -> (TestApp, MockServer) {
         )
         .mount(&engine)
         .await;
-    let env = HashMap::from([("CH_URL".to_owned(), engine.uri())]);
+    let mut env = env;
+    env.insert("CH_URL".to_owned(), engine.uri());
     (spin_up_with_env(&env).await, engine)
 }
 
@@ -485,6 +503,216 @@ async fn a_calculated_field_that_names_the_map_blocks_its_delete_by_id_or_by_nam
         assert!(reply.json()["error"].as_str().unwrap().contains("RegionOf"));
         assert_eq!(region_lookup_of(&app, &id).await, Some(true));
     }
+}
+
+// ── a public link and an embed read a map's boundary (`PR #246 review BLOCKER 1`) ──
+
+/// The secret the embed's signed token is signed with (a test value, never a
+/// real one).
+const EMBED_SECRET: &str = "test-embed-secret-not-real";
+
+/// Mounts the board lookup (by its public token and by its id) and the chart
+/// on it, so a token opens a board that has a chart on the map `map_id`.
+async fn mount_board_and_chart(engine: &MockServer, board_id: &str, token: &str, map_id: &str) {
+    let board = json!({
+        "id": board_id, "name": "Shared", "description": "", "created_by": "ui",
+        "layout_json": "", "filters_json": "", "public_token": token,
+        "embed_enabled": "1", "folder_id": "", "created_at": "2026-10-10 00:00:00",
+    });
+    let board_meta: Vec<Value> = [
+        "id",
+        "name",
+        "description",
+        "created_by",
+        "layout_json",
+        "filters_json",
+        "public_token",
+        "embed_enabled",
+        "folder_id",
+        "created_at",
+    ]
+    .iter()
+    .map(|n| json!({ "name": n, "type": "String" }))
+    .collect();
+    for needle in [
+        format!("public_token='{token}'"),
+        format!("id='{board_id}'"),
+    ] {
+        Mock::given(method("POST"))
+            .and(body_string_contains(needle.clone()))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "meta": board_meta, "data": [board], "rows": 1 })),
+            )
+            .with_priority(1)
+            .mount(engine)
+            .await;
+    }
+    let spec = json!({
+        "id": "c1", "title": "Regions", "kind": "geomap", "mart": "mart_a",
+        "sql": "SELECT 1", "x": "region", "y": "n", "map": map_id,
+    });
+    let def = json!({
+        "title": "Regions", "mart": "mart_a", "kind": "geomap",
+        "dimension": "region", "measures": ["n"], "map": map_id,
+    });
+    let chart_meta: Vec<Value> = ["id", "board", "created_by", "created_at", "spec_json"]
+        .iter()
+        .map(|n| json!({ "name": n, "type": "String" }))
+        .collect();
+    Mock::given(method("POST"))
+        .and(body_string_contains("FROM console.bi_chart FINAL"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "meta": chart_meta,
+            "data": [json!({
+                "id": "c1", "board": board_id, "created_by": "ui",
+                "created_at": "2026-01-01 00:00:00",
+                "spec_json": json!({ "spec": spec, "def": def, "hasYear": false }).to_string(),
+            })],
+            "rows": 1,
+        })))
+        .with_priority(1)
+        .mount(engine)
+        .await;
+}
+
+/// A signed embed token for `board_id`, valid for an hour.
+fn embed_token(board_id: &str) -> String {
+    let now = unix_now();
+    sign_embed(
+        &EmbedClaims {
+            resource: Some(EmbedResource {
+                dashboard: Some(board_id.to_owned()),
+            }),
+            params: None,
+            exp: Some(now + 3600.0),
+            iat: Some(now),
+            jti: Some("jti-map".to_owned()),
+        },
+        EMBED_SECRET,
+    )
+}
+
+#[tokio::test]
+async fn a_public_link_reads_the_boundary_of_a_map_its_board_uses_and_refuses_the_rest() {
+    let (app, engine) = with_engine().await;
+    let cookie = admin(&app).await;
+    let id = upload(&app, &cookie, "Sales regions").await.json()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    mount_board_and_chart(&engine, "b_shared", "tok", &id).await;
+
+    let file = send(
+        &app,
+        "",
+        "GET",
+        &format!("/api/public/dashboard/tok/maps/{id}/geojson"),
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(file.status, StatusCode::OK);
+    assert_eq!(file.headers["content-type"], "application/geo+json");
+    assert_eq!(
+        file.json()["features"][0]["properties"],
+        json!({ "name": "North" })
+    );
+
+    // A map no chart on that board draws on: the same 404 as a map that does
+    // not exist, so the route is no oracle for what the board holds.
+    for other in ["m_000000000000", "not-an-id"] {
+        let refused = send(
+            &app,
+            "",
+            "GET",
+            &format!("/api/public/dashboard/tok/maps/{other}/geojson"),
+            None,
+            &[],
+        )
+        .await;
+        assert_eq!(refused.status, StatusCode::NOT_FOUND, "{other}");
+        assert_eq!(refused.json()["error"], json!("not_found"));
+    }
+
+    // A token that is not a board: the same 404 the public dashboard route
+    // gives for it.
+    let unknown = send(
+        &app,
+        "",
+        "GET",
+        &format!("/api/public/dashboard/nope/maps/{id}/geojson"),
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(unknown.status, StatusCode::NOT_FOUND);
+    assert_eq!(unknown.json()["error"], json!("not_found"));
+}
+
+#[tokio::test]
+async fn an_embed_reads_the_boundary_of_a_map_its_board_uses_and_refuses_a_bad_token() {
+    let (app, engine) = with_engine_and_embed().await;
+    let cookie = admin(&app).await;
+    let id = upload(&app, &cookie, "Sales regions").await.json()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    mount_board_and_chart(&engine, "b_embedded", "tok", &id).await;
+    let jwt = embed_token("b_embedded");
+
+    let file = send(
+        &app,
+        "",
+        "POST",
+        &format!("/api/embed/maps/{id}/geojson"),
+        Some((
+            "application/json".to_owned(),
+            json!({ "jwt": jwt }).to_string().into_bytes(),
+        )),
+        &[],
+    )
+    .await;
+    assert_eq!(file.status, StatusCode::OK);
+    assert_eq!(
+        file.json()["features"][0]["properties"],
+        json!({ "name": "North" })
+    );
+
+    // A map no chart on that board draws on.
+    let other = send(
+        &app,
+        "",
+        "POST",
+        "/api/embed/maps/m_000000000000/geojson",
+        Some((
+            "application/json".to_owned(),
+            json!({ "jwt": jwt }).to_string().into_bytes(),
+        )),
+        &[],
+    )
+    .await;
+    assert_eq!(other.status, StatusCode::NOT_FOUND);
+
+    // A token that does not verify: the same fixed 401 `POST /api/embed/data`
+    // gives, never a redirect to a login page.
+    let bad = send(
+        &app,
+        "",
+        "POST",
+        &format!("/api/embed/maps/{id}/geojson"),
+        Some((
+            "application/json".to_owned(),
+            json!({ "jwt": "not.a.token" }).to_string().into_bytes(),
+        )),
+        &[],
+    )
+    .await;
+    assert_eq!(bad.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        bad.json()["error"],
+        json!("embed token is invalid or expired")
+    );
 }
 
 // ── a region chart on an uploaded map (`BI-16` C2b QA fix Q1) ────────────

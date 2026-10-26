@@ -1250,6 +1250,17 @@ pub fn router(state: AppState) -> Router {
             "/api/public/dashboard/{token}",
             get(embed::public_dashboard),
         )
+        // PR #246 review BLOCKER 1: a public link and an embed read a map's
+        // boundary through their own token, the way they read the board's
+        // data; the console's own route keeps the signed-in reader.
+        .route(
+            "/api/public/dashboard/{token}/maps/{id}/geojson",
+            get(embed::public_map_geojson),
+        )
+        .route(
+            "/api/embed/maps/{id}/geojson",
+            axum::routing::post(embed::embed_map_geojson),
+        )
         .route("/api/ai/chat", axum::routing::post(ai::chat))
         .route("/api/ai/tool", axum::routing::post(ai::tool_call))
         .route(

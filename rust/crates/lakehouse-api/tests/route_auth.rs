@@ -2657,3 +2657,51 @@ async fn lag_check_route_authorization_asserted_both_ways() {
         resp.status()
     );
 }
+
+/// `PR #246 review BLOCKER 1`: the public link's and the embed's map
+/// boundary routes are `Policy::Public`, because the token is the credential
+/// there, exactly as it is for the board's data (`GET
+/// /api/public/dashboard/{token}` and `POST /api/embed/data`).
+///
+/// The two table-driven loops above walk both entries by construction (a
+/// `Policy::Public` entry is not refused by the gate, and the Platform Admin
+/// is never refused on it); this names them, so a change of their
+/// classification is caught here and not only in the table.
+///
+/// With no credentials at all the gate must let the request through to the
+/// handler, which answers 404 (no such board) or 400 (no jwt) — never a 401,
+/// which the console would turn into a redirect to the login page for a
+/// viewer who has no account.
+#[tokio::test]
+async fn the_public_map_boundary_routes_are_not_refused_by_the_auth_gate() {
+    let TestApp { router, .. } = spin_up().await;
+    for (method, path) in [
+        (
+            "GET",
+            "/api/public/dashboard/tok/maps/m_0123456789ab/geojson",
+        ),
+        ("POST", "/api/embed/maps/m_0123456789ab/geojson"),
+    ] {
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("router never fails a request outright");
+        assert_ne!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "{method} {path}: a public route must not answer 401 with no credentials"
+        );
+        assert_ne!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "{method} {path}: a public route must not answer 403 with no credentials"
+        );
+    }
+}

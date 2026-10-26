@@ -12,6 +12,7 @@ import { buildOption, clusterNote, fmtInt, forecastNote, withReferenceLines } fr
 import { buildCombinedOption, cutLayers, failedLayers } from "./combined-option";
 import { takesLayers, type LayerDef } from "@/lib/chart-layers";
 import { GeoChart } from "./geo-chart";
+import type { MapLoader } from "./echarts-maps";
 import { useReporting } from "./reporting-context";
 import { KpiCard } from "./kpi-card";
 import { PivotTable } from "./pivot-table";
@@ -42,7 +43,7 @@ function hasRows(c: Cell | undefined): c is Rows {
 
 /** Render a tile's body per its kind: text / kpi / table / chart. */
 export function TileBody({
-  spec, cell, dark, loading, onDataClick, hideLegend, paging, onTableSort,
+  spec, cell, dark, loading, onDataClick, hideLegend, paging, onTableSort, loadMap,
 }: {
   spec: ChartRenderSpec & { text?: string; caption?: string };
   cell: Cell | undefined;
@@ -64,6 +65,13 @@ export function TileBody({
   paging?: { filters: FilterDef[] };
   /** A raw table reports the sort the viewer chose (for the whole-result export). */
   onTableSort?: (sort: { column: string; dir: "asc" | "desc" }) => void;
+  /**
+   * How an uploaded map's boundary file is read. Absent (the signed-in
+   * console): the map's own route through `apiFetch`. A public link and an
+   * embed pass their own token-based loader, so an anonymous viewer is never
+   * sent to the login page (`PR #246 review BLOCKER 1`).
+   */
+  loadMap?: MapLoader;
 }) {
   const reporting = useReporting();
   // `def` is the stored definition (typed `unknown` on the shared spec): the
@@ -141,7 +149,7 @@ export function TileBody({
     if (!hasRows(cell) || cell.rows.length === 0) {
       return <p className="grid h-full place-items-center text-xs text-muted-foreground">No data.</p>;
     }
-    return <GeoChart spec={spec} rows={cell.rows} dark={dark} onDataClick={onDataClick} format={def?.format} locale={reporting.numberLocale} byValue={def?.colors?.byValue} />;
+    return <GeoChart spec={spec} rows={cell.rows} dark={dark} onDataClick={onDataClick} format={def?.format} locale={reporting.numberLocale} byValue={def?.colors?.byValue} loadMap={loadMap} />;
   }
 
   // BI-13: a chart with more questions on it draws all of them on one axis.
