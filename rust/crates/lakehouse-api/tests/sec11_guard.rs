@@ -120,6 +120,20 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         ".map_err(|err| err.to_string())?;",
         "rewrite_sql_for_principal's ApiError: the policy's own non-leaking message, written in this repository",
     ),
+    // D3 (plan 39): `run` records every answered run. Both lines write the
+    // history row for a refused or failed run; each `err` is an `ApiError`
+    // (`rewrite_sql_for_principal_with_headers` and
+    // `execute_query_against_engine` both return `Result<_, ApiError>`), so
+    // its `to_string()` is the same fixed text the adjacent
+    // `return Err(err.into())` hands the response. The row goes to the
+    // caller's own history, not into a response, and the marker test in
+    // `tests/query_history_recording.rs` pins that the engine's raw text
+    // never reaches it.
+    (
+        "query.rs",
+        "&err.to_string(),",
+        "the history row keeps the classified ApiError text the response itself carries (plan 39 D3)",
+    ),
     (
         "query.rs",
         "invalid JSON: {err}",
