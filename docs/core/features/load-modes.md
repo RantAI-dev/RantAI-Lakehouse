@@ -89,26 +89,37 @@ Rows 1 to 4 are the spec's checklist, in its order.
 
 | # | Do this | Expect | Result |
 | --- | --- | --- | --- |
-| 1 | Spec: every Target row above works as written | Rows 5 to 12 pass | |
-| 2 | Spec: set a table to "incremental and deduplicate"; update a row at the source; run | One current row for that key, with the new values. Set another table to "history" and do the same: a closed row with its valid-to time and a new current row | |
-| 3 | Spec: refresh one table of a connector that has two | The other table's rows and its last load time do not change | |
-| 4 | Spec: as a user without `connector:manage`, change a mode, refresh, clear; and make a load fail | Refused each time; the failure shows an honest message with no source error text | |
-| 5 | Open a table's mode choice on a SQL connector and on a file connector | Six modes on the first; four on the second, with the reason the other two are missing | |
-| 6 | On a SQL table, open the key | The source's own key is filled in and can be changed | |
-| 7 | Choose a deduplicating mode with no key | Cannot be saved; the message says why | |
-| 8 | Load a table in "replace and deduplicate" from a source that holds the same key twice | One row per key: the one with the highest cursor value | |
-| 9 | Refresh a table "removing old rows", then "keeping" | First: the table holds exactly the source's rows. Second: by its mode, merged or added | |
-| 10 | Clear a table | It is empty; the next incremental run loads everything again | |
-| 11 | Query a deduplicated table from Query Studio after two merges | One row per key and a correct count | |
+| 1 | Spec: every Target row above works as written | Rows 5 to 12 pass | Pass 2026-10-23 (product owner) |
+| 2 | Spec: set a table to "incremental and deduplicate"; update a row at the source; run | One current row for that key, with the new values. Set another table to "history" and do the same: a closed row with its valid-to time and a new current row | Pass 2026-10-23 (product owner) |
+| 3 | Spec: refresh one table of a connector that has two | The other table's rows and its last load time do not change | Pass 2026-10-23 (product owner) |
+| 4 | Spec: as a user without `connector:manage`, change a mode, refresh, clear; and make a load fail | Refused each time; the failure shows an honest message with no source error text | Pass 2026-10-23 (product owner) |
+| 5 | Open a table's mode choice on a SQL connector and on a file connector | Six modes on the first; four on the second, with the reason the other two are missing | Pass 2026-10-23 (product owner) |
+| 6 | On a SQL table, open the key | The source's own key is filled in and can be changed | Pass 2026-10-23 (product owner) |
+| 7 | Choose a deduplicating mode with no key | Cannot be saved; the message says why | Pass 2026-10-23 (product owner) |
+| 8 | Load a table in "replace and deduplicate" from a source that holds the same key twice | One row per key: the one with the highest cursor value | Pass 2026-10-23 (product owner) |
+| 9 | Refresh a table "removing old rows", then "keeping" | First: the table holds exactly the source's rows. Second: by its mode, merged or added | Pass 2026-10-23 (product owner) |
+| 10 | Clear a table | It is empty; the next incremental run loads everything again | Pass 2026-10-23 (product owner) |
+| 11 | Query a deduplicated table from Query Studio after two merges | One row per key and a correct count | Pass 2026-10-23 (product owner) |
+| 12 | In "history" mode, run twice with nothing changed at the source, then query the table | No new rows; one current row per key; closed rows keep their times | Pass 2026-10-23 (product owner) |
 
-| 12 | In "history" mode, run twice with nothing changed at the source, then query the table | No new rows; one current row per key; closed rows keep their times | |
-
-**Accepted by:** __________ **Date:** ______ **Build:** ______
+**Accepted by:** product owner (held in the base) **Date:** 2026-10-23 **Build:** main 0e5498d2
 
 Exceptions, each with an owner and a date:
+
+- Row 8 (and row 1, which includes it): accepted as Pass, with a gap the
+  product owner's run could not show. In "replace and deduplicate" the
+  console offers no field for the cursor column; it shows one only for the
+  two incremental modes
+  (`src/features/connectors/connector-ingest-panel.tsx`, read on `main` at
+  `309e1a58`). Without a cursor the load keeps the last row read for each
+  key, as the mode's hint says, not the one with the highest cursor value;
+  a cursor can be set only through the API. Found in the planner's
+  pre-check of 2026-10-16, on a source where the last row read and the
+  highest cursor differ. Owner: product owner. Date: 2026-10-23.
+  Follow-up: `SRC-34`.
 
 ## After acceptance
 
 - [ ] `PRODUCT.md` section 2 and 3 updated
-- [ ] `BACKLOG.md` item set to Released; follow-ups added
+- [x] `BACKLOG.md` item set to Released; follow-ups added
 - [ ] `CHANGELOG.md` entry a customer can read
