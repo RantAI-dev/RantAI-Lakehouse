@@ -3096,6 +3096,93 @@ async fn the_public_link_routes_are_gated_in_both_directions() {
     }
 }
 
+/// `BI-19` part E (D15): the six comment routes are in `POLICY_TABLE` as
+/// "signed in" (the level is the dashboard's, checked in the handler), and the
+/// gate agrees both ways: no session is 401, a person with neither
+/// `dashboard:read` nor a rule is 403, and `dashboard:read` gets past the gate
+/// (the handler then answers for the dashboard, never 401 or 403).
+#[tokio::test]
+async fn the_comment_routes_are_gated_in_both_directions() {
+    let TestApp { router, pool } = spin_up().await;
+    let id = "00000000-0000-0000-0000-000000000001";
+    let comment_routes = [
+        (
+            "GET",
+            "/api/dashboard/comments",
+            "/api/dashboard/comments?board=b_x",
+        ),
+        ("POST", "/api/dashboard/comments", "/api/dashboard/comments"),
+        (
+            "GET",
+            "/api/dashboard/comments/people",
+            "/api/dashboard/comments/people?board=b_x",
+        ),
+        (
+            "POST",
+            "/api/dashboard/comments/mentions/read",
+            "/api/dashboard/comments/mentions/read",
+        ),
+        (
+            "PUT",
+            "/api/dashboard/comments/{id}",
+            "/api/dashboard/comments/00000000-0000-0000-0000-000000000001",
+        ),
+        (
+            "DELETE",
+            "/api/dashboard/comments/{id}",
+            "/api/dashboard/comments/00000000-0000-0000-0000-000000000001",
+        ),
+    ];
+    let nothing = create_principal_with_permissions(&pool, "query:read").await;
+    let reader = create_principal_with_permissions(&pool, "dashboard:read").await;
+    for (method, pattern, uri) in comment_routes {
+        assert_eq!(
+            POLICY_TABLE
+                .iter()
+                .find(|(m, p, _)| *m == method && *p == pattern)
+                .map(|(_, _, policy)| *policy),
+            Some(Policy::RequiresAuth),
+            "{method} {pattern}"
+        );
+        let body = format!("{{\"board\":\"b_x\",\"body\":\"hi\",\"id\":\"{id}\"}}");
+        let send = |cookie: String| {
+            let router = router.clone();
+            let body = body.clone();
+            async move {
+                request_with_cookie_and_body(&router, method, uri, &cookie, body.into_bytes())
+                    .await
+                    .status()
+            }
+        };
+        assert_eq!(
+            send(String::new()).await,
+            StatusCode::UNAUTHORIZED,
+            "{method} {uri}"
+        );
+        let cookie = session_cookie_for_user(&pool, nothing).await;
+        let status = send(cookie).await;
+        // The mark-read route belongs to the caller alone, so it has no
+        // dashboard to refuse on; every other route is refused for them.
+        if pattern.ends_with("/mentions/read") {
+            assert!(
+                status != StatusCode::UNAUTHORIZED && status != StatusCode::FORBIDDEN,
+                "{method} {uri}: {status}"
+            );
+        } else {
+            assert!(
+                status == StatusCode::FORBIDDEN || status == StatusCode::NOT_FOUND,
+                "{method} {uri}: no access got {status}"
+            );
+        }
+        let cookie = session_cookie_for_user(&pool, reader).await;
+        let status = send(cookie).await;
+        assert!(
+            status != StatusCode::UNAUTHORIZED && status != StatusCode::FORBIDDEN,
+            "{method} {uri}: reader got {status}"
+        );
+    }
+}
+
 /// `BI-26` (D5, D8): the values route is public (the signed token is the
 /// credential: with no token it answers 400, never 401 or 403, and nothing is
 /// read), and the settings route is `dashboard:write`: no session is 401,

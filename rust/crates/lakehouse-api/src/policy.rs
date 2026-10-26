@@ -710,6 +710,16 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("GET",    "/api/dashboard/public-link",  Policy::RequiresAuth),
     ("PUT",    "/api/dashboard/public-link",  Policy::RequiresAuth),
     ("DELETE", "/api/dashboard/public-link",  Policy::RequiresAuth),
+    // BI-19 part E (D15): comments are as visible as their dashboard. The floor is
+    // "signed in" because a person who holds only a rule on one dashboard (no
+    // `dashboard:read`) may comment on it; `view` (and author or `manage` for a
+    // delete) is checked in the handler (`dashboard_comments::target_for`).
+    ("GET",    "/api/dashboard/comments",              Policy::RequiresAuth),
+    ("POST",   "/api/dashboard/comments",              Policy::RequiresAuth),
+    ("GET",    "/api/dashboard/comments/people",       Policy::RequiresAuth),
+    ("POST",   "/api/dashboard/comments/mentions/read", Policy::RequiresAuth),
+    ("PUT",    "/api/dashboard/comments/{id}",         Policy::RequiresAuth),
+    ("DELETE", "/api/dashboard/comments/{id}",         Policy::RequiresAuth),
 
     // ── Reporting settings (`BI-9`, `routes::settings`). Reading is auth-only:
     //    the console needs the zone and the first day to label every date

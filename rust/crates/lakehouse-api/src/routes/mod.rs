@@ -30,6 +30,7 @@ mod connector_runs;
 mod connectors;
 mod dashboard;
 pub(crate) mod dashboard_access;
+mod dashboard_comments;
 mod dashboard_file;
 mod dashboard_folders;
 pub(crate) mod dashboard_organise;
@@ -1334,6 +1335,24 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/dashboard/access-preview",
             get(dashboard_access::access_preview),
+        )
+        // BI-19 part E (D15): comments. The router asks "signed in"; `view` on the
+        // dashboard (and author or `manage` for delete) is checked in the handler.
+        .route(
+            "/api/dashboard/comments",
+            get(dashboard_comments::list).post(dashboard_comments::post),
+        )
+        .route(
+            "/api/dashboard/comments/people",
+            get(dashboard_comments::people),
+        )
+        .route(
+            "/api/dashboard/comments/mentions/read",
+            axum::routing::post(dashboard_comments::mark_read),
+        )
+        .route(
+            "/api/dashboard/comments/{id}",
+            axum::routing::put(dashboard_comments::edit).delete(dashboard_comments::remove),
         )
         .route(
             "/api/dashboard/public-link",

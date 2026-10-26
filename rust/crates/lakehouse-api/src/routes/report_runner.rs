@@ -1088,7 +1088,7 @@ struct MailParts<'a> {
 
 /// The link to the dashboard in the console, from `CONSOLE_PUBLIC_URL` (never
 /// from a request). `None` when the deployment did not say where the console is.
-fn dashboard_link(state: &AppState, board: &str) -> Option<String> {
+pub(crate) fn dashboard_link(state: &AppState, board: &str) -> Option<String> {
     let base = state.config.console_public_url.as_deref()?;
     let id: String = board
         .bytes()
@@ -1104,7 +1104,7 @@ fn dashboard_link(state: &AppState, board: &str) -> Option<String> {
 }
 
 /// Text for an HTML body: the five characters that matter.
-fn html_text(raw: &str) -> String {
+pub(crate) fn html_text(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     for c in raw.chars() {
         match c {

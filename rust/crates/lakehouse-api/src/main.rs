@@ -1114,6 +1114,17 @@ fn spawn_trash_sweep(state: &AppState) {
                             {
                                 tracing::warn!(%err, "permission rules of a purged dashboard were not removed");
                             }
+                            // BI-19 part E (D15) and the part A review note: a purged
+                            // dashboard's comments (and, with them, their mentions) and
+                            // its public-link row go too. `board_id` has no foreign key.
+                            if let Err(err) =
+                                lakehouse_store::dashboard_comments::delete_for_board(pg, id).await
+                            {
+                                tracing::warn!(%err, "comments of a purged dashboard were not removed");
+                            }
+                            if let Err(err) = lakehouse_store::public_links::delete(pg, id).await {
+                                tracing::warn!(%err, "public link of a purged dashboard was not removed");
+                            }
                         }
                     }
                     tracing::info!(

@@ -17,6 +17,14 @@
 //! fabricated-looking notification. Both `openAlerts` and
 //! `pendingApprovals` are full lists here, never bare counts.
 //!
+//! # Mentions are the exception (`BI-19` part E)
+//!
+//! `unreadMentions` lists the caller's unread mentions in dashboard comments.
+//! Those do have a per-person read cursor (`dashboard_comment_mention.read_at`),
+//! so "unread" is true for them. Each line is built from the live dashboard
+//! and left out when the caller can no longer see it; it never carries the
+//! comment's text.
+//!
 //! # `supported: false`, not a fabricated zero
 //!
 //! When `state.pg` is not configured, this route reports `supported:
@@ -24,7 +32,10 @@
 //! which would read as "genuinely nothing waiting" rather than "not
 //! measured" (AGENTS.md principle 2).
 
+use axum::Extension;
 use axum::extract::State;
+use lakehouse_auth::Principal;
+use lakehouse_core::ApiError;
 use serde_json::{Value, json};
 
 use crate::error::ApiResult;
@@ -36,7 +47,10 @@ use crate::state::AppState;
 /// # Errors
 ///
 /// 500 on a database failure while reading either source table.
-pub async fn list(State(state): State<AppState>) -> ApiResult<ApiJson<Value>> {
+pub async fn list(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+) -> ApiResult<ApiJson<Value>> {
     let Some(pool) = state.pg.as_deref() else {
         return Ok(ApiJson(json!({
             "supported": false,
@@ -69,10 +83,23 @@ pub async fn list(State(state): State<AppState>) -> ApiResult<ApiJson<Value>> {
         })
         .collect();
 
+    // BI-19 part E (D15): unread mentions in dashboard comments, per person.
+    // These have a real read cursor (`dashboard_comment_mention.read_at`), so
+    // unlike the two lists above they can be called unread. A reader who cannot
+    // reach the comment table's dashboards gets none; a failure to work them
+    // out is reported as such, never as an empty list.
+    let (mentions, mentions_note) =
+        match crate::routes::dashboard_comments::bell_lines(&state, &principal).await {
+            Ok(lines) => (lines, Value::Null),
+            Err(ApiError::PermissionDenied(_)) => (Vec::new(), Value::Null),
+            Err(_) => (Vec::new(), json!("Mentions could not be read right now.")),
+        };
     Ok(ApiJson(json!({
         "supported": true,
         "openAlerts": open_alerts,
         "pendingApprovals": pending_approvals,
+        "unreadMentions": mentions,
+        "unreadMentionsUnavailable": mentions_note,
     })))
 }
 
@@ -102,7 +129,16 @@ mod tests {
         let state = AppState::new(cfg);
         assert!(state.pg.is_none());
 
-        let ApiJson(body) = list(State(state)).await.unwrap();
+        let principal = Principal {
+            id: lakehouse_auth::PrincipalId::User(uuid::Uuid::new_v4()),
+            tenant_ids: Vec::new(),
+            display_name: "t".to_owned(),
+            permissions: lakehouse_auth::PermissionSet::default(),
+            provider: "session".to_owned(),
+            must_change_password: false,
+            role_names: Vec::new(),
+        };
+        let ApiJson(body) = list(State(state), Extension(principal)).await.unwrap();
 
         assert_eq!(
             body,
