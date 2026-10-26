@@ -2487,6 +2487,7 @@ async fn start_group_within(
             load_mode: LoadMode::Append,
             column_spec: None,
             on_bad_value: None,
+            folder_id: None,
         },
         limits,
     )

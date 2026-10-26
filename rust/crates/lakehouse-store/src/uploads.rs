@@ -121,7 +121,7 @@ use uuid::Uuid;
 
 use crate::{PgPool, StoreError};
 
-fn ser_ts<S: serde::Serializer>(at: &OffsetDateTime, s: S) -> Result<S::Ok, S::Error> {
+pub(crate) fn ser_ts<S: serde::Serializer>(at: &OffsetDateTime, s: S) -> Result<S::Ok, S::Error> {
     let at = at.to_offset(time::UtcOffset::UTC);
     s.serialize_str(&format!(
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
@@ -271,6 +271,11 @@ pub struct Upload {
     /// `None` for a file that loaded alone and for the primary itself.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub loaded_with: Option<String>,
+    /// The folder the file sits in on the Uploaded files tab (`DATA-35`,
+    /// `0112_upload_folders.sql`); `None` is "No folder". A grouping only: it
+    /// changes nothing about the file's table.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub folder_id: Option<String>,
     /// When the bytes were stored.
     #[serde(serialize_with = "ser_ts")]
     pub created_at: OffsetDateTime,
@@ -283,7 +288,7 @@ pub struct Upload {
 const COLS: &str = "id, original_filename, storage_key, content_type, size_bytes, sha256, \
                     uploaded_by, tenant_id, status, parse_options, bronze_table, load_mode, \
                     row_count, run_id, error, declared_size, multipart_id, parts_digest, column_spec, on_bad_value, \
-                    bad_values, loaded_with, created_at, updated_at";
+                    bad_values, loaded_with, folder_id, created_at, updated_at";
 
 /// Everything needed to record a file whose bytes are already stored.
 ///
@@ -598,13 +603,71 @@ pub async fn insert(pool: &PgPool, new: &NewUpload<'_>) -> Result<Upload, StoreE
 ///
 /// Returns [`StoreError::Database`] on a database failure.
 pub async fn list(pool: &PgPool, tenant_id: Uuid, limit: i64) -> Result<Vec<Upload>, StoreError> {
+    list_filtered(pool, tenant_id, limit, &ListFilter::default()).await
+}
+
+/// Which folder's uploads a listing shows (`DATA-35`, plan AD5).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FolderFilter<'a> {
+    /// Every upload of the tenant, whatever its folder.
+    #[default]
+    Any,
+    /// Only the uploads in no folder.
+    NoFolder,
+    /// Only the uploads directly in this folder.
+    In(&'a str),
+}
+
+/// What narrows a listing before the newest-first window is cut, so that a
+/// folder's files and a search are not hidden by newer files elsewhere.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ListFilter<'a> {
+    /// The folder to show.
+    pub folder: FolderFilter<'a>,
+    /// Text a file name or a table name must contain, case-insensitively.
+    /// The text is bound as a value; `%`, `_` and `\` in it match themselves.
+    pub text: Option<&'a str>,
+}
+
+/// `tenant_id`'s uploads that match `filter`, newest first. `limit` is clamped to
+/// `1..=500`. A folder of another tenant matches nothing: the tenant is bound
+/// in the same statement.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] on a database failure.
+pub async fn list_filtered(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    limit: i64,
+    filter: &ListFilter<'_>,
+) -> Result<Vec<Upload>, StoreError> {
+    let (by_folder, folder_id) = match filter.folder {
+        FolderFilter::Any => (false, None),
+        FolderFilter::NoFolder => (true, None),
+        FolderFilter::In(id) => (true, Some(id)),
+    };
+    // `ILIKE` with the user's text escaped: the pattern is `%text%` and only the
+    // wrapping `%` are wildcards.
+    let pattern = filter.text.map(|text| {
+        let escaped = text
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        format!("%{escaped}%")
+    });
     let sql = format!(
         "SELECT {COLS} FROM file_upload WHERE tenant_id = $1 \
+           AND (NOT $3 OR folder_id IS NOT DISTINCT FROM $4) \
+           AND ($5::text IS NULL OR original_filename ILIKE $5 OR bronze_table ILIKE $5) \
          ORDER BY created_at DESC, id DESC LIMIT $2"
     );
     Ok(sqlx::query_as(&sql)
         .bind(tenant_id)
         .bind(limit.clamp(1, 500))
+        .bind(by_folder)
+        .bind(folder_id)
+        .bind(pattern)
         .fetch_all(pool)
         .await?)
 }
@@ -827,6 +890,11 @@ pub struct LoadClaim<'a> {
     pub column_spec: Option<&'a Value>,
     /// What to do with a value that does not fit; set exactly when `column_spec` is.
     pub on_bad_value: Option<&'a str>,
+    /// The folder every file of the load is put in, and the table's claim
+    /// remembers (`DATA-35` decision 2); `None` leaves each file's folder as it
+    /// is. The caller has checked the folder is the tenant's
+    /// ([`crate::upload_folders::folder_in_tenant`]).
+    pub folder_id: Option<&'a str>,
 }
 
 /// [`mark_ingesting`] with the load limits of `SEC-17`: counts the
@@ -866,6 +934,7 @@ pub async fn mark_ingesting_within_limits(
         load_mode,
         column_spec,
         on_bad_value,
+        folder_id: None,
     };
     mark_group_within_limits(pool, id, &[], &claim, limits).await
 }
@@ -920,7 +989,7 @@ pub async fn mark_group_within_limits(
     let sql = format!(
         "UPDATE file_upload SET status = 'ingesting', parse_options = $2, \
          bronze_table = $3, load_mode = $4, column_spec = $5, on_bad_value = $6, \
-         loaded_with = NULL, \
+         loaded_with = NULL, folder_id = COALESCE($7, folder_id), \
          run_id = NULL, error = NULL, row_count = NULL, bad_values = NULL, updated_at = now() \
          WHERE id = $1 AND status <> 'ingesting' RETURNING {COLS}"
     );
@@ -931,6 +1000,7 @@ pub async fn mark_group_within_limits(
         .bind(claim.load_mode.as_str())
         .bind(claim.column_spec.map(|spec| Json(spec.clone())))
         .bind(claim.on_bad_value)
+        .bind(claim.folder_id)
         .fetch_optional(&mut *tx)
         .await?;
     let Some(marked) = marked else {
@@ -943,7 +1013,7 @@ pub async fn mark_group_within_limits(
         let taken = sqlx::query(
             "UPDATE file_upload SET status = 'ingesting', parse_options = $2, \
              bronze_table = $3, load_mode = $4, column_spec = $5, on_bad_value = $6, \
-             loaded_with = $7, \
+             loaded_with = $7, folder_id = COALESCE($8, folder_id), \
              run_id = NULL, error = NULL, row_count = NULL, bad_values = NULL, updated_at = now() \
              WHERE id = ANY($1) AND status NOT IN ('ingesting', 'receiving') \
                AND tenant_id = (SELECT tenant_id FROM file_upload WHERE id = $7)",
@@ -955,12 +1025,26 @@ pub async fn mark_group_within_limits(
         .bind(claim.column_spec.map(|spec| Json(spec.clone())))
         .bind(claim.on_bad_value)
         .bind(id)
+        .bind(claim.folder_id)
         .execute(&mut *tx)
         .await?;
         if usize::try_from(taken.rows_affected()).ok() != Some(also.len()) {
             tx.rollback().await?;
             return Ok(MarkOutcome::GroupNotMarked);
         }
+    }
+    if let Some(folder_id) = claim.folder_id {
+        // `DATA-35` decision 2: the table remembers the folder of its latest load, so
+        // a re-upload preselects it. The claim is the primary's tenant's own row.
+        sqlx::query(
+            "UPDATE upload_table_claim SET folder_id = $2 \
+             WHERE bronze_table = $1 AND tenant_id = $3",
+        )
+        .bind(claim.bronze_table)
+        .bind(folder_id)
+        .bind(marked.tenant_id)
+        .execute(&mut *tx)
+        .await?;
     }
     tx.commit().await?;
     Ok(MarkOutcome::Marked(Box::new(marked)))
