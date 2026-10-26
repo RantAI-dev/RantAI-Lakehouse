@@ -5,6 +5,7 @@ import * as React from "react"
 import { Prec } from "@codemirror/state"
 import { EditorView, keymap } from "@codemirror/view"
 
+import { assetQueryTarget } from "@/lib/asset-query"
 import { useDebouncedCallback } from "@/hooks/use-debounced-callback"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { catalogRefusal } from "@/lib/catalog-refusal"
@@ -235,7 +236,7 @@ export function useQueryStudio() {
     queryService.saveQuery(input, signal)
   )
   const savedState = useService((s) => queryService.listSaved(s), [])
-  const historyState = useService((s) => queryService.listHistory(s), [])
+  const historyState = useService((s) => queryService.listHistory(undefined, s), [])
 
   // The tables the catalog shows, from the real catalog so suggestions
   // cannot drift from what exists.
@@ -244,22 +245,41 @@ export function useQueryStudio() {
   // is a nicety, and Query Studio works without it.
   const assetsState = useService((s) => assetService.listAssets({}, s), [])
 
+  // The query target a table's detail named, keyed by the catalog id. The
+  // detail is already fetched for a table a person expands or a statement
+  // names; the same answer carries the SQL form.
+  const [targets, setTargets] = React.useState<
+    Record<string, ReturnType<typeof assetQueryTarget>>
+  >({})
+
   // The tables in the shape the completion needs: the SQL name to insert,
   // the name a person reads, and every name the table answers to.
   //
-  // A Bronze asset's registry slug is not a SQL name, and its Trino name
-  // sits on the asset's detail rather than on this list, so such a table
-  // gets no reference and is never suggested.
+  // A Bronze asset's registry slug is not a SQL name, so such a table has
+  // no reference until its detail is loaded; the target the detail names
+  // is offered on the engine it serves — a Trino-only name on a Trino tab
+  // only. An id that reads as a SQL name keeps being the reference, as it
+  // always was.
   const tables = React.useMemo<CompletionTable[]>(() => {
     if (assetsState.status !== "success") return []
-    return assetsState.data.map((asset) => ({
-      id: asset.id,
-      label: asset.name,
-      reference: SQL_TABLE_NAME.test(asset.id) ? asset.id : "",
-      layer: asset.layer,
-      names: [asset.id, `${asset.namespace}.${asset.name}`],
-    }))
-  }, [assetsState.status, assetsState.data])
+    return assetsState.data.map((asset) => {
+      const fallback = SQL_TABLE_NAME.test(asset.id) ? asset.id : ""
+      const target = targets[asset.id]
+      const reference =
+        fallback !== ""
+          ? fallback
+          : target && (target.engine !== "trino" || engine === "trino")
+            ? target.table
+            : ""
+      return {
+        id: asset.id,
+        label: asset.name,
+        reference,
+        layer: asset.layer,
+        names: [asset.id, `${asset.namespace}.${asset.name}`],
+      }
+    })
+  }, [assetsState.status, assetsState.data, targets, engine])
 
   // The columns of the tables the buffer names: fetched once each and kept
   // for the session. A table that cannot be read is kept as a failure too,
@@ -300,6 +320,12 @@ export function useQueryStudio() {
           if (refusal) {
             rememberColumns(id, { status: "failed", reason: refusal.reason })
             return
+          }
+          // A slug id names no table, so the answer is asked for the SQL
+          // form; an id that already reads as one keeps being the
+          // reference and the answer is not read for names.
+          if (!SQL_TABLE_NAME.test(id)) {
+            setTargets((previous) => ({ ...previous, [id]: assetQueryTarget(detail) }))
           }
           rememberColumns(id, {
             status: "ready",

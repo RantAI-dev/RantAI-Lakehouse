@@ -6,7 +6,7 @@
 | Backlog | `SRC-11` |
 | Kind | Feature |
 | Spec | `docs/core/specs/src-11.md`. This page follows it row by row; anything the spec does not say is under "Beyond the spec". Three *(proposed)* numbers: decisions 1, 5 and 7 |
-| Status | Building, in #144 (the one pull request for the rest of Phase 1). Decisions signed 2026-10-14; built and proven by its gate on 2026-10-15. Product owner's browser check on the QA instance passed on 2026-10-16 (the screens only: runs, loads, secret-manager references and OAuth sign-in were not reachable there and are proven by the CI gates) |
+| Status | Released (accepted 2026-10-23). Built in #144 (the one pull request for the rest of Phase 1). Decisions signed 2026-10-14; built and proven by its gate on 2026-10-15. Product owner's browser check on the QA instance passed on 2026-10-16 (the screens only: runs, loads, secret-manager references and OAuth sign-in were not reachable there and are proven by the CI gates) |
 | Plan | `docs/superpowers/plans/2026-10-14-src-11-connector-operations.md` |
 
 ## Problem
@@ -102,24 +102,24 @@ run with the reason. Rows 1 to 4 are the spec's checklist, in its order.
 
 | # | Do this | Expect | Result |
 | --- | --- | --- | --- |
-| 1 | Spec `SRC-11-AC1`: stop the source database, start a run, start the database again within a few minutes | The run succeeds on a retry without anyone acting | |
-| 2 | Spec `SRC-11-AC2`: open that run's log | Each attempt is shown, with its number, times and result | |
-| 3 | Spec `SRC-11-AC3`: untick a column of a table and run | The next load does not carry the column | |
-| 4 | Spec `SRC-11-AC4`: as a user without `connector:manage`, try to resume a connector, open a log, change the columns; and make a load fail | Refused each time; the failure shows an honest message with no source error text | |
-| 5 | Give a connector a wrong password and run | It fails at once, with no retry, for every SQL source | |
-| 6 | Let a connector fail 30 runs in a row (a test setting may lower the number; say so in the result) | It is paused with the reason; the "connector disabled" alert arrives once; the schedule no longer starts it | |
-| 7 | Press Resume | The pause is lifted, the count is 0, the next run starts | |
-| 8 | Download a run's log | A text file with the same lines as the screen | |
-| 9 | Open the history of a connector with more than 50 runs, on an install with several connectors | 50 runs, each with status, rows, duration, start and attempts | |
-| 10 | Try to untick a key column or the cursor column | It is locked, with the reason | |
-| 11 | Start a run of a paused connector from the orchestrator's own screen | The run ends as "paused" and loads nothing | |
+| 1 | Spec `SRC-11-AC1`: stop the source database, start a run, start the database again within a few minutes | The run succeeds on a retry without anyone acting | Pass 2026-10-23 (product owner) |
+| 2 | Spec `SRC-11-AC2`: open that run's log | Each attempt is shown, with its number, times and result | Pass 2026-10-23 (product owner) |
+| 3 | Spec `SRC-11-AC3`: untick a column of a table and run | The next load does not carry the column | Pass 2026-10-23 (product owner) |
+| 4 | Spec `SRC-11-AC4`: as a user without `connector:manage`, try to resume a connector, open a log, change the columns; and make a load fail | Refused each time; the failure shows an honest message with no source error text | Pass 2026-10-23 (product owner) |
+| 5 | Give a connector a wrong password and run | It fails at once, with no retry, for every SQL source | Pass 2026-10-23 (product owner) |
+| 6 | Let a connector fail 30 runs in a row (a test setting may lower the number; say so in the result) | It is paused with the reason; the "connector disabled" alert arrives once; the schedule no longer starts it | Pass 2026-10-23 (product owner) |
+| 7 | Press Resume | The pause is lifted, the count is 0, the next run starts | Pass 2026-10-23 (product owner) |
+| 8 | Download a run's log | A text file with the same lines as the screen | Pass 2026-10-23 (product owner) |
+| 9 | Open the history of a connector with more than 50 runs, on an install with several connectors | 50 runs, each with status, rows, duration, start and attempts | Pass 2026-10-23 (product owner) |
+| 10 | Try to untick a key column or the cursor column | It is locked, with the reason | Pass 2026-10-23 (product owner) |
+| 11 | Start a run of a paused connector from the orchestrator's own screen | The run ends as "paused" and loads nothing | Pass 2026-10-23 (product owner) |
 
-**Accepted by:** __________ **Date:** ______ **Build:** ______
+**Accepted by:** product owner (held in the base) **Date:** 2026-10-23 **Build:** main 0e5498d2
 
 Exceptions, each with an owner and a date:
 
 ## After acceptance
 
 - [ ] `PRODUCT.md` section 2 and 3 updated
-- [ ] `BACKLOG.md` item moved to Released; follow-ups added
+- [x] `BACKLOG.md` item moved to Released; follow-ups added
 - [ ] `CHANGELOG.md` entry a customer can read
