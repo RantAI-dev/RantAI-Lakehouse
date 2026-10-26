@@ -128,7 +128,11 @@ pub(super) async fn delete_alert_rule(
         return json!({ "error": err.to_string() });
     }
     match lakehouse_alerts::delete_rule(&state.clickhouse, &id).await {
-        Ok(()) => json!({ "ok": true }),
+        Ok(()) => {
+            // BI-19 C review SF-7: the same state clean-up as `DELETE /api/alerts`.
+            crate::routes::alerts::forget_state(state, &id).await;
+            json!({ "ok": true })
+        }
         Err(err) => upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json(),
     }
 }

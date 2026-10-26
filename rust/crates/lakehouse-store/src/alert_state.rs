@@ -111,6 +111,73 @@ pub async fn record_failed_check(
     Ok(())
 }
 
+/// Claim a transition before its message is sent (`BI-19` C review SF-1): write
+/// `next` only if the stored state is still `expected` (a rule with no row
+/// counts as having none, so the insert wins), and say whether this call won.
+/// One conditional upsert, so of two overlapping runners that read the same
+/// state exactly one gets `true` and sends.
+///
+/// # Errors
+///
+/// [`StoreError::Database`] if the statement fails.
+pub async fn claim(
+    pool: &PgPool,
+    rule_id: &str,
+    expected: &str,
+    next: &str,
+    last_value: Option<f64>,
+    now: OffsetDateTime,
+) -> Result<bool, StoreError> {
+    let won: Option<(String,)> = sqlx::query_as(
+        "INSERT INTO alert_rule_state (rule_id, state, since, last_value, last_checked_at, reason) \
+         VALUES ($1, $2, $4, $3, $4, NULL) \
+         ON CONFLICT (rule_id) DO UPDATE SET \
+           since = CASE WHEN alert_rule_state.state = EXCLUDED.state \
+                        THEN alert_rule_state.since ELSE EXCLUDED.since END, \
+           state = EXCLUDED.state, \
+           last_value = EXCLUDED.last_value, \
+           last_checked_at = EXCLUDED.last_checked_at, \
+           reason = NULL \
+         WHERE alert_rule_state.state = $5 \
+         RETURNING rule_id",
+    )
+    .bind(rule_id)
+    .bind(next)
+    .bind(last_value)
+    .bind(now)
+    .bind(expected)
+    .fetch_optional(pool)
+    .await?;
+    Ok(won.is_some())
+}
+
+/// Give a [`claim`] back when its message could not be delivered: `to` replaces
+/// `claimed`, and only if the rule is still in `claimed` (a later claim by
+/// another runner is left alone).
+///
+/// # Errors
+///
+/// [`StoreError::Database`] if the statement fails.
+pub async fn release(
+    pool: &PgPool,
+    rule_id: &str,
+    claimed: &str,
+    to: &str,
+    now: OffsetDateTime,
+) -> Result<(), StoreError> {
+    sqlx::query(
+        "UPDATE alert_rule_state SET state = $3, since = $4 \
+         WHERE rule_id = $1 AND state = $2",
+    )
+    .bind(rule_id)
+    .bind(claimed)
+    .bind(to)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Forget a deleted rule's state.
 ///
 /// # Errors

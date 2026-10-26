@@ -118,7 +118,7 @@ pub(crate) async fn visible_rules(
     // BI-19 part C: anybody signed in may now save a chart alert for
     // themselves, so the list shows each person their own (the alert permission
     // sees all); the rule names a target address and the chart's filters.
-    let rules = crate::routes::chart_alerts::visible_to(rules, principal);
+    let rules = crate::routes::chart_alerts::visible_to(state, rules, principal).await;
     if !rules
         .iter()
         .any(|rule| rule.kind.is_connector_scoped() || rule.kind.is_asset_scoped())
@@ -451,7 +451,7 @@ pub async fn create(
     authorise_rule_create(&state, caller, &input).await?;
     // BI-19 part C (C3): the router's floor is "signed in"; the permission, the
     // chart and the owner are settled here.
-    crate::routes::chart_alerts::authorise_save(&state, caller, None, &mut input).await?;
+    crate::routes::chart_alerts::authorise_save(&state, caller, None, None, &mut input).await?;
     let rule =
         lakehouse_alerts::save_rule(&state.clickhouse, &state.webhook_sender(), &input, None)
             .await
@@ -480,7 +480,15 @@ pub async fn update(
     };
     let caller = principal.as_ref().map(|Extension(p)| p);
     authorise_rule_update(&state, caller, &id, &input).await?;
-    crate::routes::chart_alerts::authorise_save(&state, caller, Some(&id), &mut input).await?;
+    let stored = crate::routes::chart_alerts::stored_rule(&state, &id).await?;
+    crate::routes::chart_alerts::authorise_save(
+        &state,
+        caller,
+        Some(&id),
+        stored.as_ref(),
+        &mut input,
+    )
+    .await?;
     let rule = lakehouse_alerts::save_rule(
         &state.clickhouse,
         &state.webhook_sender(),
@@ -492,6 +500,16 @@ pub async fn update(
         upstream_error::alert(&upstream_error::DATABASE, &err)
             .into_api_error(upstream_error::FailedAs::BadRequest)
     })?;
+    // BI-19 C review SF-3: a rule that now watches something else starts from
+    // `ok`, so it neither announces a "back to normal" for a line it never
+    // crossed nor misses a crossing of the new one. Renaming it or changing its
+    // target keeps the state.
+    if stored
+        .as_ref()
+        .is_some_and(|old| lakehouse_alerts::watches_differ(old, &rule))
+    {
+        forget_state(&state, &id).await;
+    }
     Ok(ApiJson(json!({ "ok": true, "rule": rule })))
 }
 
@@ -528,12 +546,8 @@ pub async fn delete(
     // permission a person removes only their own chart alert.
     if !crate::routes::chart_alerts::may_delete(
         caller,
-        lakehouse_alerts::get_rule(&state.clickhouse, &id)
-            .await
-            .map_err(|err| {
-                tracing::warn!(%err, "an alert rule could not be read before a delete");
-                ApiError::Unavailable("the alert rules could not be read".to_owned())
-            })?
+        crate::routes::chart_alerts::stored_rule(&state, &id)
+            .await?
             .as_ref(),
     ) {
         return Err(ApiError::PermissionDenied("alert:write".to_owned()).into());
@@ -547,12 +561,21 @@ pub async fn delete(
                 upstream_error::FailedAs::Internal,
             )
         })?;
-    if let Some(pg) = state.pg.as_deref()
-        && let Err(err) = lakehouse_store::alert_state::delete(pg, &id).await
-    {
-        tracing::warn!(%err, rule_id = %id, "a deleted alert's state could not be removed");
-    }
+    forget_state(&state, &id).await;
     Ok(ApiJson(json!({ "ok": true })))
+}
+
+/// Drop the stored state of rule `id` (`BI-19` part C, D11): after its delete,
+/// and when an edit changes what it watches. The one place that does it, for the
+/// route and for the assistant's `delete_alert_rule` (`BI-19` C review SF-7).
+/// Best effort: a state that cannot be removed is logged, not an error to the
+/// caller, because the rule itself is already changed.
+pub(crate) async fn forget_state(state: &AppState, id: &str) {
+    if let Some(pg) = state.pg.as_deref()
+        && let Err(err) = lakehouse_store::alert_state::delete(pg, id).await
+    {
+        tracing::warn!(%err, rule_id = %id, "an alert's state could not be removed");
+    }
 }
 
 /// Query parameters for `GET`/`POST /api/alerts/run`.
@@ -719,6 +742,42 @@ impl StateSource for ApiStateSource<'_> {
         .await
         {
             tracing::warn!(%err, rule_id, "an alert's state could not be saved");
+        }
+    }
+
+    async fn claim(
+        &self,
+        rule_id: &str,
+        previous: AlertState,
+        next: AlertState,
+        value: Option<f64>,
+    ) -> Result<bool, String> {
+        lakehouse_store::alert_state::claim(
+            self.pg,
+            rule_id,
+            previous.as_str(),
+            next.as_str(),
+            value,
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .map_err(|err| {
+            tracing::warn!(%err, rule_id, "an alert's transition could not be claimed");
+            "the alert's state could not be saved, so it was not sent.".to_owned()
+        })
+    }
+
+    async fn release(&self, rule_id: &str, claimed: AlertState, previous: AlertState) {
+        if let Err(err) = lakehouse_store::alert_state::release(
+            self.pg,
+            rule_id,
+            claimed.as_str(),
+            previous.as_str(),
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        {
+            tracing::warn!(%err, rule_id, "a claimed alert transition could not be given back");
         }
     }
 
@@ -960,6 +1019,23 @@ async fn persist_fired_results(
         let silenced = ApiSilenceSource { pg }.is_silenced(&rule.id).await;
         if silenced {
             continue;
+        }
+        // BI-19 C review SF-2: a delivery that keeps failing is tried again at
+        // every check; the crossing keeps the one open instance it has (a retry
+        // that arrives updates it) instead of adding one per check.
+        if rule.kind == AlertKind::Alert
+            && let Some(delivery) = result
+                .delivered
+                .as_ref()
+                .and_then(crate::routes::load_alerts::delivery_record)
+        {
+            match overview::retry_open_undelivered(pg, &rule.id, delivery).await {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(err) => {
+                    tracing::warn!(%err, rule_id = %rule.id, "an open alert instance could not be checked for a retry");
+                }
+            }
         }
         let detail = fired_detail(rule, result.value);
         let fired = FiredRule {

@@ -222,27 +222,66 @@ pub(crate) async fn evaluate(
     out
 }
 
-/// Keep, of `rules`, the chart rules `principal` may see: their own, or all for
-/// the alert permission. Every other rule passes (this is only about the new
-/// kind of rule, which any signed-in person can now save).
-pub(crate) fn visible_to(rules: Vec<AlertRule>, principal: Option<&Principal>) -> Vec<AlertRule> {
+/// The stored rule `id`, for the save and delete guards.
+///
+/// # Errors
+///
+/// 503 when the rules cannot be read.
+pub(crate) async fn stored_rule(state: &AppState, id: &str) -> Result<Option<AlertRule>, ApiError> {
+    lakehouse_alerts::get_rule(&state.clickhouse, id)
+        .await
+        .map_err(|err| {
+            tracing::warn!(%err, "an alert rule could not be read before a change");
+            ApiError::Unavailable("the alert rules could not be read".to_owned())
+        })
+}
+
+/// Keep, of `rules`, the chart rules `principal` may see (`BI-19` C review
+/// SF-5): their own, and, with the alert permission, those on charts they can
+/// see themselves. A chart rule names a chart id, filter values and an owner, so
+/// the alert permission does not widen the list to charts the person cannot
+/// open. Every other rule passes (this is only about the new kind of rule,
+/// which any signed-in person can now save). A store that cannot answer leaves
+/// only their own rules (principle 3).
+pub(crate) async fn visible_to(
+    state: &AppState,
+    rules: Vec<AlertRule>,
+    principal: Option<&Principal>,
+) -> Vec<AlertRule> {
+    if rules.iter().all(|r| r.chart.is_none()) {
+        return rules;
+    }
+    let me = principal.map(|p| p.id.uuid().to_string());
+    let seen: Option<Vec<String>> = match principal.filter(|p| p.has("alert:write")) {
+        Some(p) => match viewer_for(state, p).await {
+            Ok(viewer) => store::list_stored_charts(&state.clickhouse, &viewer)
+                .await
+                .ok()
+                .map(|charts| charts.into_iter().map(|c| c.spec.id).collect()),
+            Err(_) => None,
+        },
+        None => None,
+    };
     rules
         .into_iter()
         .filter(|rule| {
-            rule.chart.is_none()
-                || principal.is_some_and(|p| {
-                    p.has("alert:write")
-                        || rule.owner_id.as_deref() == Some(p.id.uuid().to_string().as_str())
-                })
+            let Some(chart) = rule.chart.as_deref() else {
+                return true;
+            };
+            let own = rule.owner_id.is_some() && rule.owner_id == me;
+            own || seen
+                .as_ref()
+                .is_some_and(|ids| ids.iter().any(|id| id == chart))
         })
         .collect()
 }
 
 /// Whether `principal` may delete `rule` (C3): the alert permission, or their
-/// own chart rule.
+/// own chart rule. With no principal it is `false` (`BI-19` C review SF-4,
+/// principle 3: the guard never opens for an unknown caller).
 pub(crate) fn may_delete(principal: Option<&Principal>, rule: Option<&AlertRule>) -> bool {
     let Some(principal) = principal else {
-        return true;
+        return false;
     };
     principal.has("alert:write")
         || rule.is_some_and(|r| {
@@ -253,26 +292,31 @@ pub(crate) fn may_delete(principal: Option<&Principal>, rule: Option<&AlertRule>
 
 /// The save guard of `POST` and `PUT /api/alerts` (`BI-19` part C, C3), run
 /// after the scope checks: the router's floor is "signed in", so the permission
-/// is judged here.
+/// is judged here. `stored` is the rule `id` names, read once by the caller
+/// ([`stored_rule`]), which also uses it to decide whether the rule's state is
+/// kept.
 ///
 /// - Without `alert:write`, only a chart alert whose target is the person's own
-///   address (planner decision 1), on a chart they can view; and not another
-///   person's chart rule.
+///   address (planner decision 1), on a chart they can view; and a change needs
+///   an existing **chart** rule that they own: any other id, an unknown one
+///   included, is 403 (`BI-19` C review C-R1).
 /// - A chart alert needs the chart visible to the caller (404 as for an unknown
 ///   one) and, on a restricted dashboard, an own-address target (Q-R12).
-/// - Sets `input.owner_id`: the caller for a new chart rule; the stored owner
-///   when a rule is changed (the rule keeps reading as the person who set it);
-///   nothing for any other rule (decision 2).
+/// - Sets `input.owner_id`: the caller for every chart rule that is saved, a new
+///   one or a changed one (`BI-19` C review C-R2: a rule is read as whoever
+///   ends up owning it, and its chart, filters and target were judged as the
+///   caller, so it is not kept as the previous owner); the stored owner for a
+///   changed rule that is not a chart rule; nothing for a new one (decision 2).
 ///
 /// # Errors
 ///
 /// 401 for a chart alert with no principal; 403 `alert:write`; 404 for a chart
-/// the caller cannot see; 400 for a restricted dashboard; 503 when the stored
-/// rule cannot be read.
+/// the caller cannot see; 400 for a restricted dashboard.
 pub(crate) async fn authorise_save(
     state: &AppState,
     principal: Option<&Principal>,
     id: Option<&str>,
+    stored: Option<&AlertRule>,
     input: &mut AlertRuleInput,
 ) -> Result<(), ApiError> {
     let chart = input
@@ -281,15 +325,6 @@ pub(crate) async fn authorise_save(
         .map(str::trim)
         .filter(|c| !c.is_empty())
         .map(str::to_owned);
-    let stored = match id {
-        Some(id) => lakehouse_alerts::get_rule(&state.clickhouse, id)
-            .await
-            .map_err(|err| {
-                tracing::warn!(%err, "an alert rule could not be read before a change");
-                ApiError::Unavailable("the alert rules could not be read".to_owned())
-            })?,
-        None => None,
-    };
     let Some(principal) = principal else {
         return if chart.is_some() {
             Err(ApiError::unauthorized())
@@ -300,10 +335,11 @@ pub(crate) async fn authorise_save(
     let me = principal.id.uuid().to_string();
     let has_write = principal.has("alert:write");
     let kind_is_alert = matches!(input.kind.as_deref(), None | Some("alert"));
-    // A chart rule that somebody else set is theirs to change.
-    if let Some(rule) = stored.as_ref().filter(|r| r.chart.is_some())
-        && !has_write
-        && rule.owner_id.as_deref() != Some(me.as_str())
+    // BI-19 C review C-R1: without the permission a change is to one's own
+    // chart rule or nothing, whatever kind the stored rule is.
+    if !has_write
+        && id.is_some()
+        && !stored.is_some_and(|r| r.chart.is_some() && r.owner_id.as_deref() == Some(me.as_str()))
     {
         return Err(ApiError::PermissionDenied("alert:write".to_owned()));
     }
@@ -311,7 +347,7 @@ pub(crate) async fn authorise_save(
         if !has_write {
             return Err(ApiError::PermissionDenied("alert:write".to_owned()));
         }
-        input.owner_id = stored.and_then(|r| r.owner_id);
+        input.owner_id = stored.and_then(|r| r.owner_id.clone());
         return Ok(());
     }
     let Some(chart) = chart else {
@@ -342,11 +378,18 @@ pub(crate) async fn authorise_save(
     if restricted && !own_target {
         return Err(ApiError::BadRequest(RESTRICTED_SAVE.to_owned()));
     }
-    input.owner_id = Some(
-        stored
-            .and_then(|r| r.owner_id)
-            .filter(|_| id.is_some())
-            .unwrap_or(me),
-    );
+    // BI-19 C review C-R2: the caller owns the rule from this save on.
+    input.owner_id = Some(me);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::may_delete;
+
+    /// `BI-19` C review SF-4: with no principal the guard is closed.
+    #[test]
+    fn a_delete_with_no_principal_is_refused() {
+        assert!(!may_delete(None, None));
+    }
 }

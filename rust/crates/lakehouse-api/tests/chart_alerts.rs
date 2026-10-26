@@ -38,6 +38,10 @@ struct FakeCh {
     target: Arc<Mutex<String>>,
     value: Arc<Mutex<f64>>,
     chart_exists: Arc<Mutex<bool>>,
+    /// The stored rule is a mart rule (no chart) instead of a chart rule.
+    plain: Arc<Mutex<bool>>,
+    /// The stored rule exists at all (false: an unknown id).
+    rule_exists: Arc<Mutex<bool>>,
     log: Arc<Mutex<Vec<String>>>,
 }
 
@@ -87,10 +91,17 @@ impl Respond for FakeCh {
                 .set_body_json(json!({ "meta": meta, "data": data, "rows": n }))
         };
         if sql.contains("FROM console.alert_rule") {
-            return rows(
-                json!([]),
-                vec![rule_row(&self.owner, &self.target.lock().unwrap())],
-            );
+            if !*self.rule_exists.lock().unwrap() {
+                return rows(json!([]), vec![]);
+            }
+            let mut row = rule_row(&self.owner, &self.target.lock().unwrap());
+            if *self.plain.lock().unwrap() {
+                row["chart"] = json!("");
+                row["condition"] = json!("");
+                row["mart"] = json!("mart_x");
+                row["measure"] = json!("visitors");
+            }
+            return rows(json!([]), vec![row]);
         }
         if sql.contains("FROM console.bi_chart") {
             let present = *self.chart_exists.lock().unwrap();
@@ -132,6 +143,8 @@ async fn fixture(target: &str) -> Fixture {
         target: Arc::new(Mutex::new(target.to_owned())),
         value: Arc::new(Mutex::new(150.0)),
         chart_exists: Arc::new(Mutex::new(true)),
+        plain: Arc::new(Mutex::new(false)),
+        rule_exists: Arc::new(Mutex::new(true)),
         log: Arc::new(Mutex::new(Vec::new())),
     };
     let ch = MockServer::start().await;
@@ -363,4 +376,154 @@ async fn a_restricted_dashboards_alert_goes_only_to_its_owners_own_address() {
     let r = run(&f).await;
     assert_eq!(r["skipped"], Value::Null, "{r}");
     assert_eq!(r["fired"], json!(true));
+}
+
+// ---- BI-19 C review: the save guard (C-R1, C-R2), reached through PUT/POST ----
+
+fn chart_rule_body(target: &str) -> Value {
+    json!({
+        "id": RULE, "name": "Visitors in Bali", "type": "alert", "chart": "c_kpi",
+        "condition": "above", "threshold": 100.0, "channel": "email", "target": target,
+    })
+}
+
+async fn send_alert(f: &Fixture, who: Uuid, method: &str, body: Value) -> (u16, Value) {
+    let cookie = session_cookie_for_user(&f.app.pool, who).await;
+    let resp = f
+        .app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri("/api/alerts")
+                .header("cookie", cookie)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+fn saved(f: &Fixture) -> Vec<String> {
+    f.fake
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|sql| sql.contains("INSERT INTO console.alert_rule"))
+        .cloned()
+        .collect()
+}
+
+/// C-R1: a person without `alert:write` cannot replace a rule that is not their
+/// own chart rule, here a mart rule they can name by id.
+#[tokio::test]
+async fn a_person_without_alert_write_cannot_take_over_a_mart_rule() {
+    let f = fixture("owner@test.invalid").await;
+    *f.fake.plain.lock().unwrap() = true;
+    let (status, _) = send_alert(&f, f.owner, "PUT", chart_rule_body("owner@test.invalid")).await;
+    assert_eq!(status, 403);
+    assert!(saved(&f).is_empty(), "the rule must be unchanged");
+}
+
+/// C-R1: and an id that does not exist is 403 too, not a way to create a rule
+/// with an id of their choosing.
+#[tokio::test]
+async fn a_person_without_alert_write_cannot_put_an_unknown_id() {
+    let f = fixture("owner@test.invalid").await;
+    *f.fake.rule_exists.lock().unwrap() = false;
+    let (status, _) = send_alert(&f, f.owner, "PUT", chart_rule_body("owner@test.invalid")).await;
+    assert_eq!(status, 403);
+    assert!(saved(&f).is_empty(), "no rule was written");
+}
+
+/// The positive case: the analyst saves their own chart rule, to their own
+/// address, and owns it.
+#[tokio::test]
+async fn an_analyst_saves_their_own_chart_alert_to_their_own_address() {
+    let f = fixture("owner@test.invalid").await;
+    let (status, body) =
+        send_alert(&f, f.owner, "PUT", chart_rule_body("owner@test.invalid")).await;
+    assert_eq!(status, 200, "{body}");
+    let inserts = saved(&f);
+    assert_eq!(inserts.len(), 1, "{inserts:?}");
+    assert!(inserts[0].contains(&f.owner.to_string()), "{}", inserts[0]);
+    // Another address is the alert permission's to send to.
+    let (status, _) = send_alert(&f, f.owner, "PUT", chart_rule_body("someone@example.com")).await;
+    assert_eq!(status, 403);
+}
+
+/// C-R2: a writer who saves another person's chart rule owns it afterwards, so
+/// the next read uses the writer's access and not the first owner's.
+#[tokio::test]
+async fn a_writer_who_edits_anothers_chart_rule_becomes_its_owner() {
+    let f = fixture("owner@test.invalid").await;
+    let writer =
+        common::create_principal_with_permissions(&f.app.pool, "dashboard:read, alert:write").await;
+    let (status, body) =
+        send_alert(&f, writer, "PUT", chart_rule_body("someone@example.com")).await;
+    assert_eq!(status, 200, "{body}");
+    let inserts = saved(&f);
+    assert_eq!(inserts.len(), 1, "{inserts:?}");
+    assert!(inserts[0].contains(&writer.to_string()), "{}", inserts[0]);
+    assert!(!inserts[0].contains(&f.owner.to_string()), "{}", inserts[0]);
+}
+
+/// SF-3: an edit of the name alone keeps the state (the unit test
+/// `editing_what_a_rule_watches_differs_and_editing_its_name_does_not` covers
+/// which edits drop it; the fake here serves one stored row for both reads).
+#[tokio::test]
+async fn renaming_a_rule_keeps_its_state() {
+    let f = fixture("owner@test.invalid").await;
+    silence(&f.app.pool).await;
+    run(&f).await;
+    assert_eq!(state_of(&f.app.pool).await.unwrap().0, "firing");
+    let mut renamed = chart_rule_body("owner@test.invalid");
+    renamed["name"] = json!("Other name");
+    renamed["threshold"] = json!(100.0);
+    // The fake serves the same stored row for the "after" read, so the saved
+    // rule differs from the stored one in the name only.
+    let (status, _) = send_alert(&f, f.owner, "PUT", renamed).await;
+    assert_eq!(status, 200);
+    assert_eq!(state_of(&f.app.pool).await.unwrap().0, "firing");
+}
+
+/// SF-4/SF-5 and C4: a dashboard that is restricted to somebody else stops the
+/// owner's alert with the reason (the 403/404 to `stopped` mapping).
+#[tokio::test]
+async fn an_owner_who_lost_the_dashboard_stops_the_alert() {
+    let f = fixture("owner@test.invalid").await;
+    let other = Uuid::new_v4();
+    sqlx::query("INSERT INTO app_user (id, name, email, status) VALUES ($1, 'Other', 'o2@test.invalid', 'active')")
+        .bind(other)
+        .execute(&f.app.pool)
+        .await
+        .unwrap();
+    replace_item(
+        &f.app.pool,
+        "board",
+        BOARD,
+        &[NewRule {
+            user_id: Some(other),
+            role_id: None,
+            level: "view".to_owned(),
+        }],
+        true,
+        None,
+    )
+    .await
+    .unwrap();
+    let r = run(&f).await;
+    assert!(r["skipped"].as_str().is_some(), "{r}");
+    let (state, reason) = state_of(&f.app.pool).await.unwrap();
+    assert_eq!(state, "stopped");
+    assert!(reason.unwrap().contains("can no longer see"));
 }

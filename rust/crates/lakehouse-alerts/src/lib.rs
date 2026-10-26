@@ -1656,10 +1656,61 @@ pub trait StateSource: Send + Sync {
     /// Record a check that could not run: the time and `reason` (a fixed
     /// sentence) move; the state and the last value do not.
     async fn record_failed(&self, rule_id: &str, reason: &str);
+
+    /// Claim a transition before its message is sent (`BI-19` C review SF-1):
+    /// move the rule from `previous` to `next` only if it is still in
+    /// `previous`, and say whether this caller won. Two runners that read the
+    /// same `previous` cannot both win, so only the winner sends.
+    ///
+    /// # Errors
+    ///
+    /// A fixed, non-leaking sentence when the state cannot be written; the rule
+    /// is then skipped without sending, since an unclaimed send is a repeat.
+    async fn claim(
+        &self,
+        rule_id: &str,
+        previous: AlertState,
+        next: AlertState,
+        value: Option<f64>,
+    ) -> Result<bool, String>;
+
+    /// Undo a [`StateSource::claim`] whose message could not be delivered: put
+    /// the rule back in `previous` (only if it is still in `claimed`), so the
+    /// next check sends again (the accepted resend-after-failure behaviour).
+    async fn release(&self, rule_id: &str, claimed: AlertState, previous: AlertState);
+}
+
+/// Whether `new` watches something other than `old` (`BI-19` C review SF-3): a
+/// kind, a source, a line, a chart, a series, a filter, a condition or a
+/// reading identity changed. Name, target, channel, severity and the enabled
+/// flag are not part of what is watched, so editing them keeps the state (no
+/// repeat of a crossing that was already sent).
+#[must_use]
+pub fn watches_differ(old: &AlertRule, new: &AlertRule) -> bool {
+    old.kind != new.kind
+        || old.mart != new.mart
+        || old.measure != new.measure
+        || old.agg != new.agg
+        || old.op != new.op
+        || old.threshold.to_bits() != new.threshold.to_bits()
+        || old.board != new.board
+        || old.metric != new.metric
+        || old.pipeline != new.pipeline
+        || old.connector != new.connector
+        || old.asset != new.asset
+        || old.chart != new.chart
+        || old.series != new.series
+        || old.filters != new.filters
+        || old.condition != new.condition
+        || old.owner_id != new.owner_id
 }
 
 /// The reason a rule is skipped when no [`StateSource`] was supplied.
 const STATE_UNAVAILABLE: &str = "the alert's state could not be read, so the rule was not checked (it would send on every check).";
+
+/// The reason reported when another runner claimed the same transition first
+/// (`BI-19` C review SF-1): it sends, this one does not.
+const CLAIMED_ELSEWHERE: &str = "another check of this alert is handling it.";
 
 /// The reason stored when a crossing or a recovery could not be delivered: the
 /// state does not advance, so the next check sends it again.
@@ -2950,9 +3001,11 @@ fn failure_reason(err: &AlertError) -> String {
 /// [`transition`] from the state before, send the message that decision calls for
 /// (or none), and record the new state.
 ///
-/// A read that failed records itself and changes nothing (C2). A message that
-/// could not be delivered leaves the state where it was, so the next check sends
-/// it again rather than the crossing being lost; a message that is silenced
+/// A read that failed records itself and changes nothing (C2). The transition
+/// is claimed with a compare-and-set before anything is sent (`BI-19` C review
+/// SF-1), so two overlapping runners send once. A message that could not be
+/// delivered gives the claim back and leaves the state where it was, so the
+/// next check sends it again rather than the crossing being lost; a message that is silenced
 /// counts as handled (a silence hides the noise, not the fact). A state that
 /// cannot be read skips the rule rather than guessing, since a guess is a repeat.
 pub async fn settle(
@@ -2987,16 +3040,37 @@ pub async fn settle(
         ),
         Sending::Nothing => (String::new(), None),
     };
-    let delivered = match text {
-        Some(text) => deliver_unless_silenced(http, email, silence, rule, &title, text).await,
-        None => None,
-    };
-    if delivered.as_ref().is_some_and(|d| !d.ok) {
-        state.record_failed(&rule.id, NOT_DELIVERED_RETRY).await;
-    } else {
+    let Some(text) = text else {
         state
             .record(&rule.id, next, Some(reading.value), None)
             .await;
+        return RunResult {
+            id: rule.id.clone(),
+            name: rule.name.clone(),
+            kind: rule.kind,
+            fired: false,
+            value: Some(reading.value),
+            delivered: None,
+            skipped: None,
+            recovered: false,
+        };
+    };
+    // BI-19 C review SF-1: claim the transition before sending. Of two runners
+    // that read the same previous state only one wins and sends; the loser
+    // reports the check as handled elsewhere.
+    match state
+        .claim(&rule.id, previous, next, Some(reading.value))
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return skipped(rule, CLAIMED_ELSEWHERE.to_owned()),
+        Err(reason) => return skipped(rule, reason),
+    }
+    let delivered = deliver_unless_silenced(http, email, silence, rule, &title, text).await;
+    if delivered.as_ref().is_some_and(|d| !d.ok) {
+        // Roll the claim back so the next check sends again.
+        state.release(&rule.id, next, previous).await;
+        state.record_failed(&rule.id, NOT_DELIVERED_RETRY).await;
     }
     RunResult {
         id: rule.id.clone(),
@@ -6122,6 +6196,9 @@ mod tests {
         states: std::sync::Mutex<std::collections::HashMap<String, AlertState>>,
         failed: std::sync::Mutex<Vec<String>>,
         unreadable: bool,
+        /// When set, `state_of` answers this whatever is stored: a runner that
+        /// read the state before another runner claimed the transition.
+        stale: Option<AlertState>,
     }
 
     #[async_trait::async_trait]
@@ -6129,6 +6206,9 @@ mod tests {
         async fn state_of(&self, rule_id: &str) -> Result<AlertState, String> {
             if self.unreadable {
                 return Err("the alert's state could not be read.".to_owned());
+            }
+            if let Some(stale) = self.stale {
+                return Ok(stale);
             }
             Ok(self
                 .states
@@ -6152,6 +6232,27 @@ mod tests {
         }
         async fn record_failed(&self, _rule_id: &str, reason: &str) {
             self.failed.lock().unwrap().push(reason.to_owned());
+        }
+        async fn claim(
+            &self,
+            rule_id: &str,
+            previous: AlertState,
+            next: AlertState,
+            _value: Option<f64>,
+        ) -> Result<bool, String> {
+            let mut states = self.states.lock().unwrap();
+            let current = states.get(rule_id).copied().unwrap_or(AlertState::Ok);
+            if current != previous {
+                return Ok(false);
+            }
+            states.insert(rule_id.to_owned(), next);
+            Ok(true)
+        }
+        async fn release(&self, rule_id: &str, claimed: AlertState, previous: AlertState) {
+            let mut states = self.states.lock().unwrap();
+            if states.get(rule_id).copied() == Some(claimed) {
+                states.insert(rule_id.to_owned(), previous);
+            }
         }
     }
 
@@ -6381,8 +6482,67 @@ mod tests {
         .await;
         assert!(r.fired);
         assert!(r.delivered.is_some_and(|d| !d.ok));
-        assert!(state.states.lock().unwrap().get("al_1").is_none());
+        // BI-19 C review SF-1: the claim was given back, so the rule reads as
+        // before (`ok`) and the next check sends again.
+        assert_eq!(
+            state.states.lock().unwrap().get("al_1").copied(),
+            Some(AlertState::Ok)
+        );
         assert_eq!(*state.failed.lock().unwrap(), [NOT_DELIVERED_RETRY]);
+    }
+
+    /// `BI-19` C review SF-1: two runners that read the same state before either
+    /// wrote it send once. The second one read `ok` after the first had already
+    /// claimed `firing`, so its claim loses and it sends nothing.
+    #[tokio::test]
+    async fn two_overlapping_checks_of_one_crossing_send_once() {
+        let hook = hook_receiving().await;
+        let http = test_webhook_sender();
+        let email = no_smtp_email_sender();
+        let rule = legacy_rule(&hook.uri());
+        let reading = || Reading::against_threshold(&rule, "x", 150.0);
+        let state = FakeState::default();
+        let first = settle((&http, &email), None, Some(&state), &rule, Ok(reading())).await;
+        assert!(first.fired, "{first:?}");
+        let late_reader = FakeState {
+            stale: Some(AlertState::Ok),
+            states: std::sync::Mutex::new(state.states.lock().unwrap().clone()),
+            ..FakeState::default()
+        };
+        let second = settle(
+            (&http, &email),
+            None,
+            Some(&late_reader),
+            &rule,
+            Ok(reading()),
+        )
+        .await;
+        assert!(!second.fired && second.delivered.is_none(), "{second:?}");
+        assert_eq!(second.skipped.as_deref(), Some(CLAIMED_ELSEWHERE));
+        assert_eq!(hook.received_requests().await.unwrap().len(), 1);
+    }
+
+    /// `BI-19` C review SF-3: only a change of what is watched drops the state.
+    #[test]
+    fn editing_what_a_rule_watches_differs_and_editing_its_name_does_not() {
+        let old = legacy_rule("http://hooks.test");
+        let mut renamed = old.clone();
+        renamed.name = "other".to_owned();
+        renamed.target = "http://hooks.test/other".to_owned();
+        renamed.enabled = !old.enabled;
+        assert!(!watches_differ(&old, &renamed));
+        for change in [
+            |r: &mut AlertRule| r.threshold = 5.0,
+            |r: &mut AlertRule| r.op = AlertOp::Lt,
+            |r: &mut AlertRule| r.measure = Some("other".to_owned()),
+            |r: &mut AlertRule| r.chart = Some("c_1".to_owned()),
+            |r: &mut AlertRule| r.condition = Some("any_rows".to_owned()),
+            |r: &mut AlertRule| r.owner_id = Some("u".to_owned()),
+        ] {
+            let mut changed = old.clone();
+            change(&mut changed);
+            assert!(watches_differ(&old, &changed));
+        }
     }
 
     /// `ensure` widens the table with additive statements only (D11): every new
