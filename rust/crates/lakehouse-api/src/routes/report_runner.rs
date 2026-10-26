@@ -596,6 +596,9 @@ fn audience_of(
 /// still view dashboards, their roles may download, and, when the owner belongs
 /// to tenants, they share one with the owner. Someone who fails any of these is
 /// left out and counted, as a disabled person is.
+///
+/// The tenant rule is the one copy in `routes::reports::shares_a_tenant`
+/// (`PR #204` review (SHOULD-FIX) 1; AGENTS.md rule 4).
 async fn users_who_may_receive(
     state: &AppState,
     rows: &[RecipientRow],
@@ -608,11 +611,8 @@ async fn users_who_may_receive(
         else {
             continue;
         };
-        let shares_a_tenant = owner.tenant_ids.is_empty()
-            || person
-                .tenant_ids
-                .iter()
-                .any(|t| owner.tenant_ids.contains(t));
+        let shares_a_tenant =
+            crate::routes::reports::shares_a_tenant(&owner.tenant_ids, &person.tenant_ids);
         if person.has("dashboard:read")
             && crate::routes::settings::may_download(&person, denied_roles)
             && shares_a_tenant

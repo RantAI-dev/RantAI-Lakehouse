@@ -14,12 +14,16 @@ use lakehouse_store::report_subscriptions::{
     DeliveryStatus, NewDelivery, NewSubscription, PAUSE_AFTER_FAILURES, Recipient,
     UNSCHEDULABLE_REASON, claim_due, create, delete, get, last_deliveries, list_deliveries,
     list_for_board, list_for_owner, note_outcome, prune_deliveries, recipients, record_delivery,
-    retry_at, set_paused, update,
+    retry_at, search_active_users, set_paused, update,
 };
 use serde_json::json;
 use sqlx::PgPool;
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
+
+/// The seeded tenants (`0002_seed_identity.sql`).
+const MERIDIAN_GROUP: Uuid = Uuid::from_u128(0x11111111_1111_4111_8111_000000000001);
+const MERIDIAN_RETAIL: Uuid = Uuid::from_u128(0x11111111_1111_4111_8111_000000000002);
 
 async fn user(pool: &PgPool, name: &str) -> Uuid {
     sqlx::query_scalar("INSERT INTO app_user (name, email) VALUES ($1, $2) RETURNING id")
@@ -353,6 +357,46 @@ async fn a_row_whose_schedule_cannot_be_worked_out_is_paused_with_a_reason(
     let stored = get(&pool, s.id).await.unwrap().unwrap();
     assert!(stored.paused);
     assert_eq!(stored.paused_reason.as_deref(), Some(UNSCHEDULABLE_REASON));
+    Ok(())
+}
+
+/// `PR #204` review (SHOULD-FIX) 1: the picker lists only the people who share
+/// a tenant with the caller, and an empty list of tenants lists everyone —
+/// which is what a deployment that does not use tenants does.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_picker_lists_only_the_people_who_share_a_tenant(pool: PgPool) -> sqlx::Result<()> {
+    let inside = user(&pool, "Picker Inside").await;
+    let outside = user(&pool, "Picker Outside").await;
+    let nowhere = user(&pool, "Picker Nowhere").await;
+    for (person, tenant) in [(inside, MERIDIAN_GROUP), (outside, MERIDIAN_RETAIL)] {
+        sqlx::query("INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2)")
+            .bind(person)
+            .bind(tenant)
+            .execute(&pool)
+            .await?;
+    }
+
+    let listed = search_active_users(&pool, "Picker", 20, &[MERIDIAN_GROUP])
+        .await
+        .unwrap();
+    let ids: Vec<Uuid> = listed.iter().map(|(id, _, _)| *id).collect();
+    assert_eq!(ids, vec![inside], "only the person in the caller's tenant");
+    assert!(
+        !ids.contains(&outside),
+        "a person in another tenant is not listed"
+    );
+    assert!(
+        !ids.contains(&nowhere),
+        "a person in no tenant is not listed"
+    );
+
+    // No tenant narrows the list: everyone is listed, as on a deployment that
+    // does not use tenants.
+    let all = search_active_users(&pool, "Picker", 20, &[]).await.unwrap();
+    let all_ids: Vec<Uuid> = all.iter().map(|(id, _, _)| *id).collect();
+    assert!(all_ids.contains(&inside));
+    assert!(all_ids.contains(&outside));
+    assert!(all_ids.contains(&nowhere));
     Ok(())
 }
 

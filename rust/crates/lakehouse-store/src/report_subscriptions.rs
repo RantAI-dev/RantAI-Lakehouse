@@ -692,6 +692,12 @@ pub async fn prune_deliveries(pool: &PgPool, cutoff: OffsetDateTime) -> Result<u
 /// by name. An empty `needle` lists the first `limit`. The needle is bound, and
 /// its `%`, `_` and `\` are escaped so it matches literally.
 ///
+/// `tenant_ids` narrows the list to the people who share one of those tenants
+/// with the caller (feature decision 8): an empty list means no tenant
+/// narrows the list, which is what a deployment that does not use tenants
+/// does — the caller's own tenant rule, in
+/// `lakehouse-api`'s `routes::reports::shares_a_tenant`, decides the same way.
+///
 /// # Errors
 ///
 /// [`StoreError::Database`] if the query fails.
@@ -699,6 +705,7 @@ pub async fn search_active_users(
     pool: &PgPool,
     needle: &str,
     limit: i64,
+    tenant_ids: &[Uuid],
 ) -> Result<Vec<(Uuid, String, String)>, StoreError> {
     let escaped = needle
         .replace('\\', "\\\\")
@@ -707,10 +714,14 @@ pub async fn search_active_users(
     Ok(sqlx::query_as(
         "SELECT id, name, email FROM app_user \
          WHERE status = 'active' AND (name ILIKE $1 OR email ILIKE $1) \
+         AND (cardinality($3::uuid[]) = 0 \
+              OR EXISTS (SELECT 1 FROM app_user_tenant ut \
+                         WHERE ut.user_id = app_user.id AND ut.tenant_id = ANY($3::uuid[]))) \
          ORDER BY name, email LIMIT $2",
     )
     .bind(format!("%{escaped}%"))
     .bind(limit)
+    .bind(tenant_ids.to_vec())
     .fetch_all(pool)
     .await?)
 }
