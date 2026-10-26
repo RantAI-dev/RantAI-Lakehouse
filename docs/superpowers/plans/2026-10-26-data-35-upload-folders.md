@@ -77,7 +77,7 @@ Developer: a non-Opus agent (Claude Sonnet 5.5). Branch `feat/data-35-upload-fol
 
 ### Not verified, and why
 
-- **Rust: `cargo clippy` and `cargo test`, not run** (`df -h /` showed 1.4 to 1.6 GB free, under the 8 GB the task allows). Everything in T1 to T3 is uncompiled: the store module, the routes, 11 store tests (`tests/upload_folders.rs`), 6 route tests (`tests/upload_folder_routes.rs`), 4 ingest route tests and a unit test (`routes/uploads.rs`, `tests/upload_routes.rs`). Expect compile or clippy findings on first CI.
+- **Rust: `cargo clippy` and `cargo test`, not run** (`df -h /` showed 1.4 to 1.6 GB free, under the 8 GB the task allows). Everything in T1 to T3 is uncompiled: the store module, the routes, 13 store tests (`tests/upload_folders.rs`), 6 route tests (`tests/upload_folder_routes.rs`), 4 ingest route tests and a unit test (`routes/uploads.rs`, `tests/upload_routes.rs`). Expect compile or clippy findings on first CI.
 - **Console: `bun test`, `bun run typecheck`, `bun run lint`, not run** (under 2 GB free; no `node_modules` symlink made). Two tests lean on base-ui `Select` option clicks (`moves a file into a folder chosen in the picker`, and the two option clicks in the Table step folder tests), which I could not try.
 - **Gate `ops/g9/upload_test.py` `step_folders`: not run** (needs a deployed stack).
 - **No browser check** of the tab or the Table step (feature page checklist `DATA-35-AC1` to `AC7` all Not run).
