@@ -1,6 +1,6 @@
 # ADR 0014 — Files uploaded from the console
 
-- **Status:** Accepted (product owner, 2026-10-02); implementation in progress. Amended 2026-10-07: Excel workbooks, and 2026-10-08: Parquet files (see "Amendment" below)
+- **Status:** Accepted (product owner, 2026-10-02); implementation in progress. Amended 2026-10-07: Excel workbooks, 2026-10-08: Parquet files, and 2026-10-23: chunked upload, a streaming load and column types (see "Amendment" below)
 - **Phase:** `DATA-9`, plan `docs/superpowers/plans/2026-10-02-upload-file.md`
 - **Date:** 2026-10-02
 
@@ -208,7 +208,46 @@ same path as a workbook.
   Iceberg client; the API crate now declares it with the same features, so no
   crate and no licence is added.
 
+## Amendment, 2026-10-23 — chunked upload, a streaming load, column types (`DATA-17`, `DATA-18`)
+
+Plan `docs/superpowers/plans/2026-10-16-data-phase-3-uploads.md` (PR #186,
+not merged when this was written). Decisions 2 and 4 and the two earlier
+amendments change as follows; decision 3 stays.
+
+- **Decision 2 (a cap, the file held in memory).** Replaced for the Upload
+  file page. The browser sends the file in 8 MiB pieces; the API writes each
+  as an S3 multipart part, and keeps the part list in Postgres. The cap is 2 GiB (2,147,483,648 bytes) per
+  load, counted over all its files and, for gzip and zip, over the unpacked
+  size. It is set from `docs/plans/DATA-17-RESULT.md`. `POST /api/uploads`
+  keeps its single-request path and its 50 MB cap. The 2,000,000-row cap of the
+  load job is removed: memory followed bytes, not rows.
+- **Decision 4 (only delimited text, every column text).** Replaced. JSON,
+  JSON Lines, Avro, gzip and zip are accepted besides delimited text, Excel
+  and Parquet. Types are guessed from the first 10,000 rows (or 16 MB), the
+  person confirms or changes them in the preview, and the job casts the
+  whole file; a load that sends no column list still stores text. Leading
+  zeros stay text (`007` is not 7), a decimal is exact with 9 digits after
+  the point, and an ambiguous date is asked about, never guessed. The reason
+  the decision gave (a material number is not an integer) is kept by those
+  rules, not by forbidding inference. Decision 3's invariant is extended: the
+  Rust preview and the Python load follow the same rules, pinned by one set of
+  fixtures in `ops/fixtures/uploads/types/`.
+- **Parquet amendment (2026-10-08).** The API no longer converts a Parquet
+  file to text: the preview reads the footer and the first row group by range
+  and the load job reads the file itself, with its types. An Excel workbook
+  is still converted in the API, at 50 MB.
+- **The load is one commit.** The job writes an upload to Iceberg in groups
+  of up to 32 MiB inside one transaction, so a failed load changes nothing and
+  a replace that changes a column's type is atomic.
+
 ## Verification
 
-None yet. This ADR is written with the plan, before the code. What is run,
-and what is not, is recorded in the plan's Handoff and Review sections.
+The numbers the 2 GiB cap rests on are in `docs/plans/DATA-17-RESULT.md`
+(`g9-upload-large` on a throwaway branch, one 16 GB GitHub-hosted runner, one
+load at a time): after the streaming fix (run 39916318666) the load job's
+memory grew by 0.9 to 2.3 GiB for CSV, JSON Lines, gzipped CSV and ten
+Parquet files from 256 MiB to 2 GiB, against up to 9.75 GiB before it (run
+39903340840), and the API's by 0 to 50 MiB; a 2 GiB load took 98 to 118 s.
+Not measured: two large loads at once, a Parquet row group larger than memory,
+Avro and zip at large sizes (`DATA-33`, `DATA-34`). What was run for each
+slice, and what was not, is in the plan's Handoff and Review sections.

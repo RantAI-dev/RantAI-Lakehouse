@@ -10,14 +10,22 @@
 //!
 //! # Where this sits
 //!
-//! The load job reads delimited text and nothing else (ADR 0014, decision 3:
-//! two readers, one dialect). A Parquet file is brought to that dialect here,
-//! once, in the API, exactly as a workbook is ([`crate::upload_workbook`]):
-//! [`convert`] writes UTF-8 text separated by commas (the first record is the
-//! file's own column names), and the routes store that beside the original and
-//! hand it to the unchanged job. Every column is loaded as text, as for CSV and
-//! Excel; the file's own types are shown in the preview ([`ColumnInfo`]) and
-//! are not carried into the table.
+//! Since `DATA-17` T2.2 (plan AD2) the API no longer converts a Parquet file
+//! for a load: the job reads the file natively (`dagster/dispar_orchestrate/
+//! parquet_ingest.py`), in batches, and writes the same text for every value
+//! that [`convert`] writes here. What stays here is what the API needs to
+//! SHOW: [`inspect`] (the footer: columns, types, row count) and [`convert`]
+//! with `max_rows`, which writes the first rows of the first row group as the
+//! preview's text. Both read through a `ChunkReader`, and for a stored file
+//! that is `upload_parquet_range::RangeReader`, which fetches only the ranges
+//! asked for, so the API never holds a Parquet file; what the footer declares
+//! (its length, where every column chunk lies, the size of every row group) is
+//! bounded before it is trusted ([`MAX_FOOTER_BYTES`], `check_layout`).
+//! `convert` is also the oracle of the text rules: `ops/fixtures/parquet/
+//! types.expected.json` is what it writes for `types.parquet` and what the
+//! job's reader must write too (a test on each side). Every column is loaded
+//! as text, as for CSV and Excel; the file's own types are shown in the preview
+//! ([`ColumnInfo`]) and are not carried into the table.
 //!
 //! # How the file is read
 //!
@@ -80,9 +88,17 @@
 //!   sentence names the first such column and its type, so the user knows
 //!   what to remove;
 //! - a file of more than [`MAX_CELLS`] cells (rows times columns), decided from
-//!   the footer before any row is decoded. A Parquet file is compressed and can
-//!   hold far more than the bytes of the upload suggest, and the API converts
-//!   it in memory. The number is a cap, not a measurement;
+//!   the footer before any row is decoded, **only when the whole file is
+//!   converted in memory** (`convert` with no row limit). A Parquet file is
+//!   compressed and can hold far more than the bytes of the upload suggest, and
+//!   that conversion holds it all. The footer read ([`inspect`]) and a preview
+//!   ([`convert`] with a row limit) do not hold the file, so they have no cell
+//!   cap: the load job streams a Parquet file by row group and the upload is
+//!   bounded by its byte cap (`DATA-17` T6.2 item 3,
+//!   `docs/plans/DATA-17-RESULT.md`). What still protects the API's own memory
+//!   there is [`MAX_FOOTER_BYTES`] (the footer is bounded before it is
+//!   read), [`MAX_PREVIEW_GROUP_BYTES`] (the first row group a preview fetches)
+//!   and [`MAX_OUTPUT_BYTES`]. The number is a cap, not a measurement;
 //! - a conversion whose text would pass [`MAX_OUTPUT_BYTES`]: the cell cap
 //!   does not bound the size of a cell, and a column of long repeated strings
 //!   compresses to almost nothing.
@@ -100,20 +116,34 @@ use arrow_array::types::{
 };
 use arrow_array::{Array, ArrayRef, ArrowPrimitiveType, PrimitiveArray, RecordBatch};
 use arrow_schema::{DataType, Schema, TimeUnit};
-use axum::body::Bytes;
 use parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
 };
 use parquet::basic::Type as PhysicalType;
-use parquet::file::metadata::RowGroupMetaData;
+use parquet::file::metadata::{ParquetMetaData, RowGroupMetaData};
+use parquet::file::reader::ChunkReader;
 use serde::Serialize;
 
 use crate::upload_workbook::{finish_text, float_text, write_record};
 
-/// The most cells a Parquet file may hold: 5,000,000 rows times columns, the
-/// same cap as a workbook's sheet. A cap that keeps the conversion's memory
-/// bounded, not a measured limit.
+/// The most cells a Parquet file may hold when it is converted whole in memory:
+/// 5,000,000 rows times columns, the same cap as a workbook's sheet. A cap that
+/// keeps that conversion's memory bounded, not a measured limit. It does not
+/// apply to [`inspect`] or to a preview ([`cell_cap_for`]): the job streams a
+/// Parquet file, and the upload is bounded by its bytes.
 pub const MAX_CELLS: u64 = crate::upload_workbook::MAX_SHEET_CELLS;
+
+/// The cell cap for a read: [`MAX_CELLS`] only when the whole file is converted
+/// in memory (`max_rows` is `None`), none for the footer read and for a preview,
+/// which hold a footer and a first row group and never the file. `DATA-17` T6.2
+/// item 3; the API's memory is bounded there by [`MAX_FOOTER_BYTES`],
+/// [`MAX_PREVIEW_GROUP_BYTES`] and [`MAX_OUTPUT_BYTES`], not by a cell count.
+const fn cell_cap_for(max_rows: Option<usize>) -> u64 {
+    match max_rows {
+        None => MAX_CELLS,
+        Some(_) => u64::MAX,
+    }
+}
 
 /// The most text a conversion may produce: 512 MiB. The cell cap alone does not
 /// bound it (see the module doc); a cap, not a measurement.
@@ -121,6 +151,19 @@ pub const MAX_OUTPUT_BYTES: usize = 512 * 1024 * 1024;
 
 /// Rows decoded at a time.
 const BATCH_ROWS: usize = 8192;
+
+/// The longest footer the reader will take: 16 MiB. A footer lists every row
+/// group and column chunk, so a wide file with many row groups has a large one;
+/// a number above this is a file that was damaged or made to cost memory
+/// (`DATA-17` T2.2, plan AD2: what the footer declares is bounded before it is
+/// read). A cap, not a measurement.
+pub const MAX_FOOTER_BYTES: u64 = 16 * 1024 * 1024;
+
+/// The most compressed bytes of the first row group a preview will fetch to show
+/// rows: 64 MiB. A preview decodes a row group's column chunks whole, so this
+/// bounds its memory; a file whose first group is larger is previewed with its
+/// columns and no rows (see [`convert`]).
+pub const MAX_PREVIEW_GROUP_BYTES: i64 = 64 * 1024 * 1024;
 
 /// The first and last four bytes of a Parquet file.
 const MAGIC: &[u8] = b"PAR1";
@@ -156,7 +199,7 @@ pub enum ParquetFileError {
         /// `binary`, `list`, `map`, `struct` or another fixed word.
         type_name: &'static str,
     },
-    /// The file is past [`MAX_CELLS`].
+    /// The file is past [`MAX_CELLS`] and was to be converted whole.
     #[error("That file is larger than the limit of 5,000,000 cells (rows times columns).")]
     TooLarge,
     /// The text of the file would be past [`MAX_OUTPUT_BYTES`].
@@ -210,6 +253,9 @@ fn guarded<T>(work: impl FnOnce() -> Result<T, ParquetFileError>) -> Result<T, P
 struct Opened {
     meta: ArrowReaderMetadata,
     info: ParquetInfo,
+    /// Compressed size of the first row group, from the footer; `0` for a file
+    /// with none.
+    first_group_bytes: i64,
 }
 
 /// The options both reads use: the Arrow schema some writers embed is ignored.
@@ -223,15 +269,73 @@ pub fn has_encrypted_magic(bytes: &[u8]) -> bool {
     bytes.starts_with(ENCRYPTED_MAGIC)
 }
 
-fn open(bytes: &Bytes, cap: u64) -> Result<Opened, ParquetFileError> {
-    if has_encrypted_magic(bytes) {
-        return Err(ParquetFileError::Encrypted);
-    }
-    if !bytes.starts_with(MAGIC) {
+/// Check what the footer declares against the file that holds it, before the
+/// footer is read: the length it announces fits in the file and under
+/// [`MAX_FOOTER_BYTES`]. A file shorter than a magic, a footer length and a
+/// magic is not Parquet.
+fn check_footer_length<R: ChunkReader>(reader: &R) -> Result<u64, ParquetFileError> {
+    let size = reader.len();
+    if size < 12 {
         return Err(ParquetFileError::Unreadable);
     }
-    let loaded = ArrowReaderMetadata::load(bytes, plain_options())
+    let tail = reader
+        .get_bytes(size - 8, 8)
         .map_err(|_err| ParquetFileError::Unreadable)?;
+    if tail.get(4..8) != Some(MAGIC) {
+        return Err(ParquetFileError::Unreadable);
+    }
+    let announced = tail
+        .get(0..4)
+        .and_then(|raw| <[u8; 4]>::try_from(raw).ok())
+        .map(u32::from_le_bytes)
+        .map_or(u64::MAX, u64::from);
+    if announced > MAX_FOOTER_BYTES || announced.saturating_add(12) > size {
+        return Err(ParquetFileError::Unreadable);
+    }
+    Ok(announced)
+}
+
+/// Check what the parsed footer declares about the row groups against the file:
+/// every column chunk lies inside the data region (`data_end`: the byte where the
+/// footer starts), and no row group is larger than the data.
+fn check_layout(metadata: &ParquetMetaData, data_end: u64) -> Result<(), ParquetFileError> {
+    let footer = u64::try_from(metadata.file_metadata().num_rows()).ok();
+    if footer.is_none() {
+        return Err(ParquetFileError::Unreadable);
+    }
+    for group in metadata.row_groups() {
+        let too_big = u64::try_from(group.compressed_size()).map_or(true, |bytes| bytes > data_end);
+        if too_big {
+            return Err(ParquetFileError::Unreadable);
+        }
+        for column in group.columns() {
+            let (start, length) = column.byte_range();
+            if start.checked_add(length).is_none_or(|end| end > data_end) {
+                return Err(ParquetFileError::Unreadable);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn open<R: ChunkReader + 'static>(reader: &R, cap: u64) -> Result<Opened, ParquetFileError> {
+    if reader.len() >= 4 {
+        let head = reader
+            .get_bytes(0, 4)
+            .map_err(|_err| ParquetFileError::Unreadable)?;
+        if has_encrypted_magic(&head) {
+            return Err(ParquetFileError::Encrypted);
+        }
+        if !head.starts_with(MAGIC) {
+            return Err(ParquetFileError::Unreadable);
+        }
+    } else {
+        return Err(ParquetFileError::Unreadable);
+    }
+    let footer = check_footer_length(reader)?;
+    let loaded = ArrowReaderMetadata::load(reader, plain_options())
+        .map_err(|_err| ParquetFileError::Unreadable)?;
+    check_layout(loaded.metadata(), reader.len().saturating_sub(8 + footer))?;
     if loaded
         .metadata()
         .row_groups()
@@ -292,7 +396,16 @@ fn open(bytes: &Bytes, cap: u64) -> Result<Opened, ParquetFileError> {
     } else {
         loaded
     };
-    Ok(Opened { meta, info })
+    let first_group_bytes = meta
+        .metadata()
+        .row_groups()
+        .first()
+        .map_or(0, RowGroupMetaData::compressed_size);
+    Ok(Opened {
+        meta,
+        info,
+        first_group_bytes,
+    })
 }
 
 /// The same metadata with each `INT96` column read as microseconds (see the
@@ -402,14 +515,17 @@ fn type_label(data_type: &DataType) -> String {
 ///
 /// [`ParquetFileError::Unreadable`] when the bytes do not open as a Parquet
 /// file, [`ParquetFileError::Encrypted`], [`ParquetFileError::NoColumns`],
-/// [`ParquetFileError::Unsupported`] for a binary or nested column,
-/// [`ParquetFileError::TooLarge`] past [`MAX_CELLS`].
-pub fn inspect(bytes: &Bytes) -> Result<ParquetInfo, ParquetFileError> {
-    inspect_capped(bytes, MAX_CELLS)
+/// [`ParquetFileError::Unsupported`] for a binary or nested column. There is no
+/// cell cap here: only the footer is read ([`cell_cap_for`]).
+pub fn inspect<R: ChunkReader + 'static>(reader: &R) -> Result<ParquetInfo, ParquetFileError> {
+    inspect_capped(reader, u64::MAX)
 }
 
-fn inspect_capped(bytes: &Bytes, cap: u64) -> Result<ParquetInfo, ParquetFileError> {
-    guarded(|| open(bytes, cap).map(|opened| opened.info))
+fn inspect_capped<R: ChunkReader + 'static>(
+    reader: &R,
+    cap: u64,
+) -> Result<ParquetInfo, ParquetFileError> {
+    guarded(|| open(reader, cap).map(|opened| opened.info))
 }
 
 /// The file in `bytes` as delimited text: a first record of column names, then
@@ -421,31 +537,55 @@ fn inspect_capped(bytes: &Bytes, cap: u64) -> Result<ParquetInfo, ParquetFileErr
 /// Those of [`inspect`]; [`ParquetFileError::Unreadable`] also when a page of
 /// the file cannot be decoded; [`ParquetFileError::TooMuchText`] past
 /// [`MAX_OUTPUT_BYTES`].
-pub fn convert(bytes: &Bytes, max_rows: Option<usize>) -> Result<Converted, ParquetFileError> {
-    convert_capped(bytes, max_rows, MAX_CELLS, MAX_OUTPUT_BYTES)
+pub fn convert<R: ChunkReader + Clone + 'static>(
+    reader: &R,
+    max_rows: Option<usize>,
+) -> Result<Converted, ParquetFileError> {
+    convert_capped(
+        reader,
+        max_rows,
+        cell_cap_for(max_rows),
+        MAX_OUTPUT_BYTES,
+        MAX_PREVIEW_GROUP_BYTES,
+    )
 }
 
-fn convert_capped(
-    bytes: &Bytes,
+fn convert_capped<R: ChunkReader + Clone + 'static>(
+    reader: &R,
     max_rows: Option<usize>,
     cell_cap: u64,
     byte_cap: usize,
+    group_cap: i64,
 ) -> Result<Converted, ParquetFileError> {
     guarded(|| {
-        let Opened { meta, info } = open(bytes, cell_cap)?;
+        let Opened {
+            meta,
+            info,
+            first_group_bytes,
+        } = open(reader, cell_cap)?;
         let mut out = Vec::new();
         let names: Vec<&str> = info.columns.iter().map(|c| c.name.as_str()).collect();
         write_record(&mut out, &names);
 
-        let mut builder = ParquetRecordBatchReaderBuilder::new_with_metadata(bytes.clone(), meta)
+        // A preview (`max_rows` given) reads the FIRST row group only, and only
+        // when it is small enough to fetch; a larger one is shown as its columns
+        // with no rows. The reader decodes a group's column chunks whole, so the
+        // bound is what keeps a preview's memory bounded.
+        let mut builder = ParquetRecordBatchReaderBuilder::new_with_metadata(reader.clone(), meta)
             .with_batch_size(BATCH_ROWS);
         if let Some(limit) = max_rows {
-            builder = builder.with_limit(limit);
+            if first_group_bytes > group_cap || info.rows == 0 {
+                return Ok(Converted {
+                    info,
+                    csv: finish_text(out),
+                });
+            }
+            builder = builder.with_limit(limit).with_row_groups(vec![0]);
         }
-        let reader = builder
+        let batches = builder
             .build()
             .map_err(|_err| ParquetFileError::Unreadable)?;
-        for batch in reader {
+        for batch in batches {
             let batch = batch.map_err(|_err| ParquetFileError::Unreadable)?;
             write_batch(&mut out, &batch)?;
             if out.len() > byte_cap {
@@ -691,7 +831,9 @@ mod tests {
         StringArray, TimestampMicrosecondArray,
     };
     use arrow_schema::{Field, Fields};
+    use axum::body::Bytes;
     use parquet::arrow::ArrowWriter;
+    use parquet::file::metadata::ParquetMetaDataReader;
 
     use super::*;
     use crate::upload_parse::{Encoding, decode, split_records};
@@ -1138,17 +1280,31 @@ mod tests {
             ParquetFileError::TooLarge
         );
         assert_eq!(
-            convert_capped(&bytes, None, 14, MAX_OUTPUT_BYTES).unwrap_err(),
+            convert_capped(&bytes, None, 14, MAX_OUTPUT_BYTES, i64::MAX).unwrap_err(),
             ParquetFileError::TooLarge
         );
         // A file with no rows is no cells, whatever its columns.
         assert!(inspect_capped(&fixture(EMPTY), 0).is_ok());
     }
 
+    /// `DATA-17` T6.2 item 3: the cell cap is for the whole-file conversion in
+    /// memory; the footer read and a preview have none, so a Parquet file that
+    /// the job streams is bounded by its bytes.
+    #[test]
+    fn the_cell_cap_applies_to_a_whole_conversion_and_not_to_a_footer_or_a_preview() {
+        assert_eq!(cell_cap_for(None), MAX_CELLS);
+        assert_eq!(cell_cap_for(Some(2000)), u64::MAX);
+        // A file of 15 cells is read by `inspect` and by a preview whatever the cap
+        // of a whole conversion would say.
+        let bytes = fixture(ORDERS);
+        assert!(inspect(&bytes).is_ok());
+        assert!(convert(&bytes, Some(2)).is_ok());
+    }
+
     #[test]
     fn a_conversion_past_the_text_cap_is_refused() {
         assert_eq!(
-            convert_capped(&fixture(ORDERS), None, MAX_CELLS, 40).unwrap_err(),
+            convert_capped(&fixture(ORDERS), None, MAX_CELLS, 40, i64::MAX).unwrap_err(),
             ParquetFileError::TooMuchText
         );
     }
@@ -1194,5 +1350,205 @@ mod tests {
             column_texts(&(Arc::new(local) as ArrayRef)).unwrap(),
             ["1970-01-01T00:00:01", ""]
         );
+    }
+
+    // ── DATA-17 T2.2: bounded, ranged reading ───────────────────────────
+
+    /// `types.parquet` as the job's reader must write it: the shared fixture of
+    /// `ops/fixtures/parquet/types.expected.json`, read by a test on each side.
+    #[test]
+    fn the_shared_fixture_is_what_the_converter_writes_for_types_parquet() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../ops/fixtures/parquet/types.expected.json"
+        );
+        let shared: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let expected: Vec<Vec<String>> = shared["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|record| {
+                record
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|cell| cell.as_str().unwrap().to_owned())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(records(&convert(&fixture(TYPES), None).unwrap()), expected);
+    }
+
+    /// A reader that records every range the crate asks for.
+    #[derive(Clone)]
+    struct Recording {
+        inner: Bytes,
+        asked: Arc<std::sync::Mutex<Vec<(u64, u64)>>>,
+    }
+
+    impl Recording {
+        fn of(inner: Bytes) -> Self {
+            Self {
+                inner,
+                asked: Arc::default(),
+            }
+        }
+        fn asked(&self) -> Vec<(u64, u64)> {
+            self.asked.lock().unwrap().clone()
+        }
+    }
+
+    impl parquet::file::reader::Length for Recording {
+        fn len(&self) -> u64 {
+            u64::try_from(self.inner.len()).unwrap()
+        }
+    }
+
+    impl ChunkReader for Recording {
+        type T = <Bytes as ChunkReader>::T;
+        fn get_read(&self, start: u64) -> parquet::errors::Result<Self::T> {
+            self.asked.lock().unwrap().push((start, u64::MAX));
+            self.inner.get_read(start)
+        }
+        fn get_bytes(&self, start: u64, length: usize) -> parquet::errors::Result<Bytes> {
+            self.asked
+                .lock()
+                .unwrap()
+                .push((start, u64::try_from(length).unwrap()));
+            self.inner.get_bytes(start, length)
+        }
+    }
+
+    /// A file of `groups` row groups of `per_group` rows each.
+    fn grouped(groups: usize, per_group: usize) -> Bytes {
+        let rows = groups * per_group;
+        let batch = batch_of(vec![
+            (
+                "id",
+                Arc::new(Int64Array::from_iter_values(
+                    0..i64::try_from(rows).unwrap(),
+                )) as ArrayRef,
+            ),
+            (
+                "text",
+                Arc::new(StringArray::from_iter_values((0..rows).map(|n| {
+                    format!("row number {n} with some padding to fill the page")
+                }))) as ArrayRef,
+            ),
+        ]);
+        let mut out = Vec::new();
+        let props = parquet::file::properties::WriterProperties::builder()
+            .set_max_row_group_row_count(Some(per_group))
+            .build();
+        let mut writer = ArrowWriter::try_new(&mut out, batch.schema(), Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        Bytes::from(out)
+    }
+
+    #[test]
+    fn the_footer_alone_is_read_to_inspect_a_file_and_the_first_row_group_to_preview_it() {
+        let file = grouped(4, 5_000);
+        let size = u64::try_from(file.len()).unwrap();
+
+        let recording = Recording::of(file.clone());
+        let info = inspect(&recording).unwrap();
+        assert_eq!(info.rows, 20_000);
+        let asked = recording.asked();
+        assert!(
+            asked
+                .iter()
+                .all(|(start, _)| *start == 0 || *start >= size / 2),
+            "inspect reads the magic and the end of the file: {asked:?}"
+        );
+
+        let recording = Recording::of(file.clone());
+        let previewed = convert(&recording, Some(20)).unwrap();
+        assert_eq!(records(&previewed).len(), 21);
+        let footer = u64::try_from(footer_len(&file)).unwrap();
+        let footer_start = size - 8 - footer;
+        let metadata = ParquetMetaDataReader::decode_metadata(
+            &file[usize::try_from(footer_start).unwrap()..usize::try_from(size - 8).unwrap()],
+        )
+        .unwrap();
+        let first_end = metadata
+            .row_group(0)
+            .columns()
+            .iter()
+            .map(|c| {
+                let (start, len) = c.byte_range();
+                start + len
+            })
+            .max()
+            .unwrap();
+        let asked = recording.asked();
+        assert!(
+            asked
+                .iter()
+                .all(|(start, _)| *start < first_end || *start >= footer_start),
+            "a preview reads the footer and the first row group, nothing between the \
+             first group's end ({first_end}) and the footer ({footer_start}): {asked:?}"
+        );
+        assert!(
+            first_end < size / 2,
+            "the first of four groups is a part of the file"
+        );
+    }
+
+    fn footer_len(file: &Bytes) -> usize {
+        let tail = &file[file.len() - 8..file.len() - 4];
+        usize::try_from(u32::from_le_bytes(tail.try_into().unwrap())).unwrap()
+    }
+
+    #[test]
+    fn a_footer_that_announces_more_than_the_file_holds_is_unreadable_and_nothing_panics() {
+        let mut broken = fixture(ORDERS).to_vec();
+        let at = broken.len() - 8;
+        broken[at..at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(
+            inspect(&Bytes::from(broken.clone())).unwrap_err(),
+            ParquetFileError::Unreadable
+        );
+        let whole = u32::try_from(broken.len()).unwrap();
+        broken[at..at + 4].copy_from_slice(&whole.to_le_bytes());
+        assert_eq!(
+            inspect(&Bytes::from(broken)).unwrap_err(),
+            ParquetFileError::Unreadable
+        );
+        // A file shorter than a magic, a length and a magic.
+        for len in 0..12 {
+            assert_eq!(
+                inspect(&Bytes::from(vec![b'P'; len])).unwrap_err(),
+                ParquetFileError::Unreadable,
+                "{len} bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn column_chunks_that_lie_outside_the_data_the_footer_describes_are_refused() {
+        // Drop 100 bytes from the front of the data: the footer is intact and
+        // every offset in it now points past where its data can be.
+        let mut shifted = fixture(ORDERS).to_vec();
+        shifted.drain(4..104);
+        assert_eq!(
+            inspect(&Bytes::from(shifted)).unwrap_err(),
+            ParquetFileError::Unreadable
+        );
+    }
+
+    #[test]
+    fn a_first_row_group_over_the_preview_bound_shows_the_columns_and_no_rows() {
+        let file = grouped(2, 1_000);
+        let shown = convert_capped(&file, Some(20), MAX_CELLS, MAX_OUTPUT_BYTES, 1).unwrap();
+        assert_eq!(records(&shown), rows(&[&["id", "text"]]));
+        assert_eq!(
+            shown.info.rows, 2_000,
+            "the footer's count is still reported"
+        );
+        // Without the bound the same preview has its rows.
+        let all = convert(&file, Some(20)).unwrap();
+        assert_eq!(records(&all).len(), 21);
     }
 }

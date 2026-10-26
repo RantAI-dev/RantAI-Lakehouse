@@ -2461,6 +2461,7 @@ version = "0.1.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
+ "apache-avro",
  "arrow-array",
  "arrow-schema",
  "async-trait",
@@ -2469,6 +2470,7 @@ dependencies = [
  "calamine",
  "chrono",
  "croner",
+ "flate2",
  "futures",
  "hmac",
  "iceberg",
