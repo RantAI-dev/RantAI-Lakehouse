@@ -505,6 +505,22 @@ test("a retry sends back the columns and the choice the failed load was told", (
   assert.equal("columns" in (retryInput({ ...upload, columns: undefined, onBadValue: undefined }) ?? {}), false)
 })
 
+test("a retry puts the file in the folder the load put it in, and names none when the upload sits in none", () => {
+  const upload = {
+    id: "up-1",
+    originalFilename: "a.csv",
+    sizeBytes: 1,
+    uploadedBy: "Ana",
+    status: "failed" as const,
+    createdAt: "",
+    updatedAt: "",
+    parseOptions: { encoding: "utf-8" as const, delimiter: ",", headerRow: 0 },
+    bronzeTable: "t",
+  }
+  assert.equal(retryInput({ ...upload, folderId: "uf-1" })?.folderId, "uf-1")
+  assert.equal("folderId" in (retryInput(upload) ?? {}), false)
+})
+
 test("the mark and the label follow the name: JSON, Avro and archives have their own kinds", () => {
   assert.equal(uploadFileKind("a.json"), "json")
   assert.equal(uploadFileKind("a.NDJSON"), "json")

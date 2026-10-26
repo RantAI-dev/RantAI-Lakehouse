@@ -26,7 +26,7 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test"
 import { formatBytes } from "@/lib/format"
 import { MAX_SESSION_BYTES, REGISTRATION_FAILED_REASON, TABLE_NAME_RULE } from "@/lib/uploads"
-import type { Upload, UploadColumnSpec, UploadPreview } from "@/services/contracts/uploads"
+import type { Upload, UploadColumnSpec, UploadFolder, UploadPreview } from "@/services/contracts/uploads"
 import { UploadFilePage } from "./upload-file-page"
 
 const originalFetch = global.fetch
@@ -109,6 +109,21 @@ type Routes = {
   /** `POST /api/uploads/{id}/compare` (several files into one table): gets the body the page sent; the default finds no mismatch. */
   compare?: (body: { alsoUploads: string[]; columns?: { name: string; type: string }[] }) => unknown | Response
   ingest?: Response
+  /** `GET /api/uploads/folders` (`DATA-35`); the default is no folders. */
+  folders?: UploadFolder[] | Response
+  /** `POST /api/uploads/folders`: gets the body the page sent. */
+  createFolder?: (body: { name: string; parentId?: string }) => UploadFolder | Response
+}
+
+function folder(over: Partial<UploadFolder> & Pick<UploadFolder, "id" | "name">): UploadFolder {
+  return {
+    parentId: null,
+    fileCount: 0,
+    childCount: 0,
+    createdAt: "2026-10-26T10:00:00Z",
+    updatedAt: "2026-10-26T10:00:00Z",
+    ...over,
+  }
 }
 
 const PIECE = 8 * 1024 * 1024
@@ -130,6 +145,12 @@ function stubFetch(routes: Routes = {}): Call[] {
     calls.push({ url: `${target.pathname}${target.search}`, method, body })
     const reply = (value: unknown) => (value instanceof Response ? value : json(value))
     if (target.pathname === "/api/uploads" && method === "GET") return reply(routes.list ?? [])
+    // Before the per-upload routes below: `folders` is not an upload id.
+    if (target.pathname === "/api/uploads/folders" && method === "GET") return reply(routes.folders ?? [])
+    if (target.pathname === "/api/uploads/folders" && method === "POST") {
+      const asked = body as { name: string; parentId?: string }
+      return reply(routes.createFolder ? routes.createFolder(asked) : folder({ id: "uf-new", name: asked.name, parentId: asked.parentId ?? null }))
+    }
     if (target.pathname === "/api/uploads/sessions" && method === "POST") {
       const input = body as { filename: string; sizeBytes: number }
       if (routes.session) return answer(routes.session, input)
@@ -993,6 +1014,107 @@ describe("UploadFilePage, Table step", () => {
   })
 })
 
+describe("UploadFilePage, Table step, folders (DATA-35)", () => {
+  const FOLDERS = [folder({ id: "uf-sales", name: "Sales", childCount: 1 }), folder({ id: "uf-q1", name: "Q1", parentId: "uf-sales" })]
+
+  async function openTable(routes: Routes) {
+    url.search = "?id=up-1"
+    const calls = stubFetch({ get: () => upload(), preview: () => preview(), ...routes })
+    render(<UploadFilePage />)
+    await screen.findByLabelText("Encoding")
+    await waitFor(() => expect(next().disabled).toBe(false))
+    fireEvent.click(next())
+    await screen.findByLabelText("Table name")
+    return calls
+  }
+
+  /** Goes on to Review and presses Load; returns the body of the ingest. */
+  async function load(calls: Call[]) {
+    fireEvent.click(next())
+    fireEvent.click(await screen.findByRole("button", { name: "Load" }))
+    await waitFor(() => expect(sent(calls, "POST", /\/ingest$/).length).toBe(1))
+    return sent(calls, "POST", /\/ingest$/)[0]!.body as Record<string, unknown>
+  }
+
+  it("offers an optional folder, No folder by default, and sends no folderId when it is left alone", async () => {
+    const calls = await openTable({ folders: FOLDERS, ingest: json({ upload: upload({ status: "ingesting" }), runId: "run-1" }) })
+    const picker = screen.getByRole("combobox", { name: "Folder (optional)" })
+    expect(picker.textContent).toContain("No folder")
+    const body = await load(calls)
+    expect("folderId" in body).toBe(false)
+  })
+
+  it("sends the folder that was chosen", async () => {
+    const calls = await openTable({ folders: FOLDERS, ingest: json({ upload: upload({ status: "ingesting" }), runId: "run-1" }) })
+    fireEvent.click(screen.getByRole("combobox", { name: "Folder (optional)" }))
+    fireEvent.click(await screen.findByRole("option", { name: "Sales / Q1" }))
+    const body = await load(calls)
+    expect(body.folderId).toBe("uf-q1")
+  })
+
+  it("makes a folder from the step, picks it, and sends it", async () => {
+    const calls = await openTable({
+      folders: FOLDERS,
+      createFolder: (asked) => folder({ id: "uf-jan", name: asked.name }),
+      ingest: json({ upload: upload({ status: "ingesting" }), runId: "run-1" }),
+    })
+    fireEvent.click(screen.getByRole("button", { name: "New folder" }))
+    await screen.findByText("A folder groups uploaded files on the Uploaded files tab.")
+    fireEvent.change(screen.getByLabelText("Folder name"), { target: { value: "January" } })
+    fireEvent.click(screen.getByRole("button", { name: "Create" }))
+
+    await waitFor(() => expect(screen.getByRole("combobox", { name: "Folder (optional)" }).textContent).toContain("January"))
+    expect(sent(calls, "POST", /\/api\/uploads\/folders$/)[0]!.body).toEqual({ name: "January" })
+    const body = await load(calls)
+    expect(body.folderId).toBe("uf-jan")
+  })
+
+  it("shows the API's sentence when a folder is refused, and keeps the dialog open", async () => {
+    await openTable({
+      folders: FOLDERS,
+      createFolder: () => json({ error: "A folder with that name already exists in the same place." }, 409),
+    })
+    fireEvent.click(screen.getByRole("button", { name: "New folder" }))
+    await screen.findByLabelText("Folder name")
+    fireEvent.change(screen.getByLabelText("Folder name"), { target: { value: "Sales" } })
+    fireEvent.click(screen.getByRole("button", { name: "Create" }))
+    expect((await screen.findByRole("alert")).textContent).toBe("A folder with that name already exists in the same place.")
+  })
+
+  it("preselects the folder of the newest upload loaded into an existing table, and sends it", async () => {
+    const calls = await openTable({
+      folders: FOLDERS,
+      list: [upload({ id: "up-0", status: "ingested", bronzeTable: "stock", assetId: "stock", folderId: "uf-q1" })],
+      ingest: json({ upload: upload({ status: "ingesting" }), runId: "run-1" }),
+    })
+    expect(screen.getByRole("combobox", { name: "Folder (optional)" }).textContent).toContain("Sales / Q1")
+    const body = await load(calls)
+    expect(body.folderId).toBe("uf-q1")
+  })
+
+  it("sends null when the person chooses No folder for a table that has one", async () => {
+    const calls = await openTable({
+      folders: FOLDERS,
+      list: [upload({ id: "up-0", status: "ingested", bronzeTable: "stock", assetId: "stock", folderId: "uf-q1" })],
+      ingest: json({ upload: upload({ status: "ingesting" }), runId: "run-1" }),
+    })
+    fireEvent.click(screen.getByRole("combobox", { name: "Folder (optional)" }))
+    fireEvent.click(await screen.findByRole("option", { name: "No folder" }))
+    const body = await load(calls)
+    expect(body.folderId).toBeNull()
+  })
+
+  it("offers no picker, and names no folder, when the folders cannot be read", async () => {
+    const calls = await openTable({
+      folders: json({ error: "You do not have permission to do this." }, 403),
+      ingest: json({ upload: upload({ status: "ingesting" }), runId: "run-1" }),
+    })
+    expect(screen.queryByRole("combobox", { name: "Folder (optional)" })).toBeNull()
+    const body = await load(calls)
+    expect("folderId" in body).toBe(false)
+  })
+})
+
 describe("UploadFilePage, after Load", () => {
   /** Opens the page on up-1 and goes to Review; `ingest` is what the API answers to Load. */
   async function review(routes: Routes) {
@@ -1159,6 +1281,21 @@ describe("UploadFilePage, after Load", () => {
     await waitFor(() => expect(calls.filter((c) => c.url.endsWith("/ingest")).length).toBe(before + 1))
     const retry = calls.filter((c) => c.url.endsWith("/ingest")).at(-1)
     expect(retry?.body).toEqual({ ...OPTIONS, bronzeTable: "stock", mode: "append" })
+  })
+
+  it("puts a retry in the folder the failed load used (DATA-35)", async () => {
+    const failed = { ...started, status: "failed", error: "The load into the table failed.", folderId: "uf-q1" }
+    const calls = await review({
+      get: (n) => (n === 1 ? upload() : failed),
+      ingest: json({ upload: started, runId: "run-1" }),
+    })
+    fireEvent.click(screen.getByRole("button", { name: "Load" }))
+    await screen.findByText("Failed", { selector: "span" })
+
+    fireEvent.click(screen.getByRole("button", { name: "Try again" }))
+    await waitFor(() => expect(calls.filter((c) => c.url.endsWith("/ingest")).length).toBe(2))
+    const retry = calls.filter((c) => c.url.endsWith("/ingest")).at(-1)
+    expect(retry?.body).toEqual({ ...OPTIONS, bronzeTable: "stock", mode: "replace", folderId: "uf-q1" })
   })
 
   it("after a failure only at the catalog, says the rows are there and retries with Replace", async () => {

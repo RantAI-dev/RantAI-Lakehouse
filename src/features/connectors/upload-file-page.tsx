@@ -8,10 +8,12 @@ import { PageHeader } from "@/components/patterns/page-header"
 import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { Button } from "@/components/ui/button"
 import { useService, useServiceAction } from "@/hooks/use-service"
+import { folderOfTable } from "@/lib/upload-folders"
 import { isUploadedTable, suggestTableName, tableNameProblem } from "@/lib/uploads"
 import { uploadService } from "@/services"
-import type { IngestUploadInput, Upload, UploadLoadMode } from "@/services/contracts/uploads"
+import type { IngestUploadInput, Upload, UploadFolder, UploadLoadMode } from "@/services/contracts/uploads"
 import { UploadCheckStep, useUploadPreview } from "./upload-check-step"
+import { UploadFolderField } from "./upload-folder-field"
 import { FileStep } from "./upload-file-step"
 import { DuplicateNotice, LoadFailure } from "./upload-parts"
 import { UploadReviewStep } from "./upload-review-step"
@@ -71,6 +73,11 @@ function UploadWizard({ initial, pollMs }: { readonly initial: Upload | null; re
     () => initial?.bronzeTable ?? (initial ? suggestTableName(initial.originalFilename) : "")
   )
   const [mode, setMode] = React.useState<UploadLoadMode>("replace")
+  // The folder the person picked (`DATA-35`): `null` is "no folder" on purpose, `undefined` is
+  // "not touched", when the table's own folder applies.
+  const [folderChoice, setFolderChoice] = React.useState<string | null | undefined>(undefined)
+  // Folders made on this step, shown before the list is read again.
+  const [madeFolders, setMadeFolders] = React.useState<readonly UploadFolder[]>([])
   // The files a started load took with the first, kept for "Try again" and the run view.
   const [together, setTogether] = React.useState<readonly { id: string; name: string }[] | null>(null)
 
@@ -80,6 +87,9 @@ function UploadWizard({ initial, pollMs }: { readonly initial: Upload | null; re
   // (only then is there a choice to make). If the list cannot be read, no
   // choice is offered and the load replaces, as it does for a new table.
   const uploads = useService((s) => uploadService.list(s), [])
+  // The tenant's folders for the picker. If they cannot be read, no picker is offered and the load
+  // names no folder.
+  const folderList = useService((s) => uploadService.listFolders(s), [])
   const queue = useUploadQueue()
   // The file the next steps carry on with: the first one that was not refused.
   const primary = queue.files.find((f) => f.state !== "refused") ?? null
@@ -101,6 +111,13 @@ function UploadWizard({ initial, pollMs }: { readonly initial: Upload | null; re
   const offersMode = uploads.status === "success" && isUploadedTable(tableName, uploads.data)
   const effectiveMode: UploadLoadMode = offersMode ? mode : "replace"
   const nameProblem = tableName === "" ? null : tableNameProblem(tableName)
+  // `DATA-35` decision 2: a table an earlier upload loaded offers the folder that upload sits in.
+  const tableFolder = offersMode && uploads.status === "success" ? folderOfTable(tableName, uploads.data) : undefined
+  const folderId = folderChoice !== undefined ? folderChoice : tableFolder
+  const folders =
+    folderList.status === "success"
+      ? [...folderList.data, ...madeFolders.filter((made) => !folderList.data.some((f) => f.id === made.id))]
+      : null
   // Adding to a table that exists: its names and types are the columns' (`DATA-18` decision 9).
   const { setTable } = view
   React.useEffect(() => {
@@ -116,6 +133,7 @@ function UploadWizard({ initial, pollMs }: { readonly initial: Upload | null; re
     setRun(null)
     setTableName("")
     setMode("replace")
+    setFolderChoice(undefined)
     setTogether(null)
     view.reset()
     ingest.reset()
@@ -155,6 +173,8 @@ function UploadWizard({ initial, pollMs }: { readonly initial: Upload | null; re
       ...(choices.columns.length > 0 ? { columns: choices.columns.map(columnSpecOf), onBadValue: choices.onBadValue } : {}),
       // `DATA-17` slice 5: the other files of the load. The API compares their columns again.
       ...(group.ids.length > 0 ? { alsoUploads: group.ids } : {}),
+      // `DATA-35`: the folder shown on the Table step is the one sent, `null` included.
+      ...(folderId !== undefined ? { folderId } : {}),
     })
     if (started !== null) {
       setTogether(group.files.filter((f) => f.uploadId !== null).map((f) => ({ id: f.uploadId ?? "", name: f.name })))
@@ -251,6 +271,16 @@ function UploadWizard({ initial, pollMs }: { readonly initial: Upload | null; re
           offersMode={offersMode}
           mode={mode}
           onMode={setMode}
+          folderField={
+            folders !== null ? (
+              <UploadFolderField
+                folders={folders}
+                value={folderId ?? null}
+                onChange={setFolderChoice}
+                onCreated={(made) => setMadeFolders((prev) => [...prev, made])}
+              />
+            ) : null
+          }
         />
       ) : null}
       {step === STEPS.length - 1 && upload !== null ? (
