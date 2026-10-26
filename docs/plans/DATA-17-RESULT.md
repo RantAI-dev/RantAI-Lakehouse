@@ -21,9 +21,10 @@ is not used below.
 
 ## The API (the transport)
 
-The API's growth stays between 0 and 50 MiB for every format and size up to
-2 GiB (base 45–209 MiB over the run). The chunked transport keeps the API's
-memory flat, as slice 1 designed.
+The API's growth stays between 0 and 50 MiB for every format it measured
+(CSV, JSON Lines, gzip and Parquet) and every size up to 2 GiB (base 45–209
+MiB over the run). The chunked transport keeps the API's memory flat, as
+slice 1 designed.
 
 ## The job (Dagster code location)
 
@@ -80,9 +81,14 @@ write in 32 MiB groups in one transaction; Parquet read without
 | 1,024 MiB | +1,893 MiB, 71.1 s | +1,402 MiB, 76.1 s | +1,285 MiB, 86.3 s (780 MiB) | +1,130 MiB, 64.6 s (1,007 MiB) |
 | 2,048 MiB | **+1,982 MiB**, 106.8 s | **+1,628 MiB**, 101.8 s | **+867 MiB**, 118.3 s (1,557 MiB) | **+2,273 MiB**, 97.5 s (2,013 MiB) |
 
-- **Memory no longer follows the file**: from 256 MiB to 2 GiB the growth
-  stays between about 0.9 and 2.3 GiB for every format (before: up to
-  9.5 GiB). CSV 2 GiB went from +9,750 to +1,982 MiB.
+- **Memory no longer follows the file**: for the four formats this run
+  measured -- CSV, JSON Lines, a gzipped CSV and ten Parquet files in one load
+  -- the growth from 256 MiB to 2 GiB stays between about 0.9 and 2.3 GiB
+  (before: up to 9.5 GiB). CSV 2 GiB went from +9,750 to +1,982 MiB.
+- **Not measured after the fix**: a JSON array, an Avro file, a zip, and a
+  single Parquet file (the before-fix run measured a single Parquet file, at
+  22 to 201 MiB, not at 2 GiB). The fix is in the write step, which every
+  format goes through, but that is a reading of the code, not a measurement.
 - **Parquet still rises a little** (1.1 to 2.3 GiB from 1 to 2 GiB): the
   reader decodes one row group whole, and these files carry larger row groups
   as they grow. A single row group larger than memory is not covered.

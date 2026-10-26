@@ -1372,7 +1372,8 @@ including a separate constant for the unpacked-size check so that `POST
 
 `docs/plans/DATA-17-RESULT.md` (CI run 39903340840): the API stays flat
 (growth under 50 MiB at every size), but the job grows with the upload's
-bytes at three to five times its size, every format (CSV 2 GiB: +9.75 GiB).
+bytes at three to five times its size, in every format the run measured (CSV,
+JSON Lines, gzip and Parquet; CSV 2 GiB: +9.75 GiB).
 
 - **`BLOCKER 6` (slice 2, AD2: "the job streams").** The job does not hold
   memory flat; the plan's design and the 2 GB target both depend on it.
