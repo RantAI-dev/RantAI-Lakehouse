@@ -90,7 +90,7 @@ const TOO_LONG: &str = "A comment can have at most 2000 characters.";
 const CONTROL_CHARS: &str = "A comment cannot contain control characters.";
 const MENTION_REFUSED: &str = "One of the people mentioned cannot see this dashboard.";
 const TOO_MANY_MENTIONS: &str = "A comment can mention at most 20 people.";
-const SERVICE_REFUSED: &str =
+pub const SERVICE_REFUSED: &str =
     "Comments are for people; a service identity cannot post, edit, delete or look people up.";
 const NOT_THE_AUTHOR: &str = "Only the author can change a comment.";
 const NOT_AUTHOR_OR_MANAGER: &str =

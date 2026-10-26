@@ -30,7 +30,9 @@ mod connector_runs;
 mod connectors;
 mod dashboard;
 pub(crate) mod dashboard_access;
-mod dashboard_comments;
+// `pub` only so the route test can build its expected 403 body from `SERVICE_REFUSED`
+// instead of a second copy of the sentence (BI-19 E, PR #250 CI).
+pub mod dashboard_comments;
 mod dashboard_file;
 mod dashboard_folders;
 pub(crate) mod dashboard_organise;

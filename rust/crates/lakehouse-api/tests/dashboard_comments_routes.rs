@@ -10,6 +10,7 @@ mod common;
 
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
+use lakehouse_api::routes::dashboard_comments::SERVICE_REFUSED;
 use lakehouse_store::dashboard_access::{NewRule, replace_item};
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -592,7 +593,9 @@ async fn a_service_token_is_refused_in_a_sentence_on_post_edit_delete_and_the_pi
         let body: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(
             body["error"],
-            "Comments are for people; a service identity cannot post, edit, delete or look people up.",
+            // `ApiError::PermissionDenied` renders as `permission_denied: {sentence}` (the
+            // product's 403 body convention), so the prefix is part of the expected text.
+            format!("permission_denied: {SERVICE_REFUSED}"),
             "{method} {uri}"
         );
     }
