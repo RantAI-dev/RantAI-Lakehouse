@@ -31,6 +31,12 @@
 //! 5. `DELETE /api/uploads/{id}` removes the object and the row. The table the
 //!    upload became stays, and so does the claim on its name.
 //!
+//! # Folders (`DATA-35`)
+//!
+//! The Uploaded files tab groups files in folders ([`folders`]): the folder routes,
+//! `POST /api/uploads/move`, and `folderId` on `GET /api/uploads` and on an ingest.
+//! A folder is a grouping only; a file's table does not change with it.
+//!
 //! # Chunked uploads (`DATA-17`, plan AD1)
 //!
 //! `POST /api/uploads` reads the whole file in one request, and the proxy in
@@ -123,7 +129,8 @@ use lakehouse_store::PgPool;
 use lakehouse_store::audit::{self as store_audit, NewAuditEvent};
 use lakehouse_store::connectors;
 use lakehouse_store::uploads::{
-    self, LoadClaim, LoadLimits, LoadMode, MarkOutcome, NewUpload, TableClaim, Upload,
+    self, FolderFilter, ListFilter, LoadClaim, LoadLimits, LoadMode, MarkOutcome, NewUpload,
+    TableClaim, Upload,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -148,6 +155,7 @@ use crate::upload_store::{PREFIX, UploadStore};
 use crate::upload_workbook::{self, WorkbookError, WorkbookInfo};
 
 pub(super) mod columns;
+pub(super) mod folders;
 pub(super) mod group;
 pub(super) mod sessions;
 
@@ -1231,31 +1239,60 @@ pub(super) async fn settle_loading_upload(state: &AppState, pool: &PgPool, row: 
 
 /// `GET /api/uploads` — the active tenant's uploads, newest first, at most
 /// [`LIST_LIMIT`]. A caller in no tenant gets an empty list, never another
-/// tenant's. A loading upload is settled first.
+/// tenant's. A loading upload is settled first. `folderId=<id>|none` and `q=<text>`
+/// narrow the list before the window is cut (`DATA-35`, [`ListQuery`]).
 ///
 /// # Errors
 ///
-/// 404 if `X-Tenant` names a tenant the caller does not belong to; 503 if no
-/// pool is configured; 500 on a database failure.
+/// 400 for a query string that cannot be read; 404 if `X-Tenant` names a tenant the
+/// caller does not belong to; 503 if no pool is configured; 500 on a database
+/// failure.
 pub async fn list(
     State(state): State<AppState>,
     principal: Option<Extension<Principal>>,
     headers: HeaderMap,
+    query: Result<Query<ListQuery>, axum::extract::rejection::QueryRejection>,
 ) -> ApiResult<ApiJson<Vec<UploadView>>> {
     let Some(Extension(principal)) = principal else {
         return Err(ApiError::unauthorized().into());
     };
+    let Query(query) = query.map_err(|err| {
+        tracing::warn!(%err, "an upload list query string could not be read");
+        ApiError::BadRequest(QUERY_UNREADABLE.to_owned())
+    })?;
     let Some(tenant_id) = crate::tenant_scope::resolve(&principal, &headers)? else {
         return Ok(ApiJson(Vec::new()));
     };
     let pool = pool(&state)?;
-    let rows = uploads::list(pool, tenant_id, LIST_LIMIT).await?;
+    // `DATA-35` AD-5: the filters narrow the rows BEFORE the newest-100 window is cut,
+    // so a folder's files and a search are not hidden by newer files elsewhere. With
+    // neither, this is the list it always was.
+    let text = query.q.as_deref().map(str::trim).filter(|q| !q.is_empty());
+    let filter = ListFilter {
+        folder: match query.folder_id.as_deref() {
+            None | Some("") => FolderFilter::Any,
+            Some("none") => FolderFilter::NoFolder,
+            Some(id) => FolderFilter::In(id),
+        },
+        text,
+    };
+    let rows = uploads::list_filtered(pool, tenant_id, LIST_LIMIT, &filter).await?;
     let mut settler = Settler::new(&state, pool);
     let mut views = Vec::with_capacity(rows.len());
     for row in rows {
         views.push(settler.settle(row).await.into());
     }
     Ok(ApiJson(views))
+}
+
+/// Query parameters of [`list`] (`DATA-35`, plan AD-5).
+#[derive(Debug, Deserialize)]
+pub struct ListQuery {
+    /// A folder id, or `none` for the files in no folder; absent: every file.
+    #[serde(rename = "folderId")]
+    folder_id: Option<String>,
+    /// Text a file name or a table name must contain, case-insensitively.
+    q: Option<String>,
 }
 
 /// `GET /api/uploads/{id}` — one upload, settled first if it is loading.
