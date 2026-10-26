@@ -336,6 +336,38 @@ async fn admit(
     Ok((board, subject))
 }
 
+/// The board a signed embed token opens — or the refusal the token gets.
+///
+/// The checks and the answers are the ones `POST /api/embed/data` has always
+/// given (`SEC-12`): a missing token is a 400, an unset secret a 503, a
+/// token that does not verify (a bad signature, a missing or too-long
+/// lifetime, an expired or withdrawn token, a token without a dashboard) the
+/// one fixed 401, and a board that is not there or has embedding off a 403.
+///
+/// `PR #246 review BLOCKER 1`: the embed's map route reads the same token
+/// the same way, so the two routes cannot disagree about what a token opens.
+/// It is the same [`verified_claims`] and [`admit`] the data route uses, so a
+/// chart token (`BI-26`) opens its own dashboard here too, exactly as it does
+/// there.
+///
+/// # Errors
+///
+/// The refusal to send, as a ready response.
+async fn embed_grant(state: &AppState, jwt: Option<&str>) -> Result<Subject, Box<Response>> {
+    let Some(jwt) = jwt.filter(|s| !s.is_empty()) else {
+        return Err(Box::new(
+            (
+                StatusCode::BAD_REQUEST,
+                ApiJson(json!({ "error": "jwt is required" })),
+            )
+                .into_response(),
+        ));
+    };
+    let claims = verified_claims(state, jwt)?;
+    let (_board, subject) = admit(state, &claims).await?;
+    Ok(subject)
+}
+
 /// `POST /api/embed/data` — signed-embed (Metabase-style) dashboard data.
 pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
     // `try { jwt = String((await req.json())?.jwt ?? "") } catch { /* ignore */ }`
@@ -894,7 +926,7 @@ fn value_to_string(v: &Value) -> String {
 /// answers `401 password_required` with no data and no dashboard name.
 pub async fn public_dashboard(
     State(state): State<AppState>,
-    headers: axum::http::HeaderMap,
+    headers: HeaderMap,
     Path(token): Path<String>,
 ) -> Response {
     let board = match crate::routes::public_links::resolve(&state, &token).await {
@@ -967,10 +999,14 @@ pub async fn public_dashboard(
 /// through its own token, the way it reads the board's data: a token that
 /// is not a board is a 404, exactly as `GET /api/public/dashboard/{token}`
 /// answers, and a map no chart on that board draws on is the same 404.
+///
+/// `BI-19` part A: the link is read from Postgres and a link with a
+/// password needs its ticket, exactly as the board's data does — the map is
+/// part of that board, so it is behind the same door.
 pub async fn public_map_geojson(
     State(state): State<AppState>,
-    Path((token, id)): Path<(String, String)>,
     headers: HeaderMap,
+    Path((token, id)): Path<(String, String)>,
 ) -> Response {
     // BI-19 part A: the link is resolved the way `public_dashboard` resolves
     // it — from Postgres, with the password ticket — so a map behind a
@@ -1004,29 +1040,18 @@ pub async fn public_map_geojson(
 /// 404, so the token reads the board it opens and nothing else.
 pub async fn embed_map_geojson(
     State(state): State<AppState>,
-    Path(id): Path<String>,
     headers: HeaderMap,
+    Path(id): Path<String>,
     body: Bytes,
 ) -> Response {
     let jwt = serde_json::from_slice::<EmbedDataBody>(&body)
         .ok()
         .and_then(|b| b.jwt);
-    let Some(jwt) = jwt.filter(|s| !s.is_empty()) else {
-        return (
-            StatusCode::BAD_REQUEST,
-            ApiJson(json!({ "error": "jwt is required" })),
-        )
-            .into_response();
-    };
     // The same admission `POST /api/embed/data` applies, so the two routes
     // cannot disagree about what a token opens (`BI-26`'s `verified_claims`
     // and `admit`, which read a chart token as well as a board token).
-    let claims = match verified_claims(&state, &jwt) {
-        Ok(claims) => claims,
-        Err(refusal) => return *refusal,
-    };
-    let (_board, subject) = match admit(&state, &claims).await {
-        Ok(admitted) => admitted,
+    let subject = match embed_grant(&state, jwt.as_deref()).await {
+        Ok(subject) => subject,
         Err(refusal) => return *refusal,
     };
     map_for_board(&state, &subject.board_id, &id, &headers).await
@@ -1071,8 +1096,9 @@ async fn board_map_ids(state: &AppState, board_id: &str) -> Result<Vec<String>, 
         .collect())
 }
 
-/// The fixed-500 answer a store failure gets, as the other embed routes send
-/// it (`PR #246 review BLOCKER 1`: the map routes read the store too).
+/// The fixed-500 answer a store failure gets on the map routes (`PR #246
+/// review BLOCKER 1`: they read the store too). The engine's own text never
+/// reaches the answer (SEC-11): it goes to the log under a reference id.
 fn database_failure(err: &ChError) -> Response {
     (
         StatusCode::INTERNAL_SERVER_ERROR,

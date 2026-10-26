@@ -16,7 +16,7 @@ import { selectedTab } from "@/lib/dashboard-tabs";
 import type { BoardTab, LayoutMap, PhoneTile } from "@/services";
 import { TabBar } from "./tab-bar";
 import type { TileFailure } from "@/services/contracts/dashboards";
-import { LinkGone, PasswordGate, openPublic } from "./public-link-access";
+import { LinkGone, PasswordGate, TICKET_HEADER, openPublic, readTicket } from "./public-link-access";
 
 type Cell = { columns: string[]; rows: Record<string, unknown>[] } | TileFailure;
 type Payload = {
@@ -54,8 +54,20 @@ export function PublicDashboard({ token }: { token: string }) {
   // PR #246 review BLOCKER 1: an uploaded map's boundary is read through the
   // link's own token, the way the board's data is — never through `apiFetch`,
   // whose 401 would send this anonymous viewer to the login page.
+  // BI-19 part A: the ticket of a link with a password rides with it, the
+  // same way it rides with the board's data, so a map on a link that needs a
+  // password is behind the same door.
   const loadMap = React.useCallback<MapLoader>(
-    (id) => fetch(`/api/public/dashboard/${encodeURIComponent(token)}/maps/${encodeURIComponent(id)}/geojson`, { cache: "no-store" }),
+    (id) => {
+      const ticket = readTicket(token);
+      return fetch(
+        `/api/public/dashboard/${encodeURIComponent(token)}/maps/${encodeURIComponent(id)}/geojson`,
+        {
+          cache: "no-store",
+          headers: ticket ? { [TICKET_HEADER]: ticket } : undefined,
+        }
+      );
+    },
     [token],
   );
 

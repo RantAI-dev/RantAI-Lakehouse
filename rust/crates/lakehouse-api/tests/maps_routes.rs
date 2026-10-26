@@ -19,6 +19,8 @@ use tower::ServiceExt;
 use std::collections::HashMap;
 
 use lakehouse_embed::{EmbedClaims, EmbedResource, sign_embed, unix_now};
+use lakehouse_store::public_links as links;
+use time::{Duration, OffsetDateTime};
 use wiremock::matchers::{body_string_contains, method};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -30,9 +32,9 @@ const FILE: &str = r#"{"type":"FeatureCollection","features":[
  {"type":"Feature","properties":{"NAME":"North"},"geometry":{"type":"Polygon","coordinates":[[[0,0],[1,0],[1,1],[0,1],[0,0]]]}},
  {"type":"Feature","properties":{"NAME":"South"},"geometry":{"type":"Polygon","coordinates":[[[0,-2],[1,-2],[1,-1],[0,-1],[0,-2]]]}}]}"#;
 
-/// The public link's token (`BI-19` part A): the column's own check wants at
-/// least eight characters.
-const TOKEN: &str = "tok_public_link";
+/// The token of the public link under test. `BI-19` part A keeps it in
+/// Postgres with a length of 8 to 200 characters (migration `0098`).
+const PUBLIC_TOKEN: &str = "p_map_public_link";
 
 struct Reply {
     status: StatusCode,
@@ -593,9 +595,9 @@ fn embed_token(board_id: &str) -> String {
     sign_embed(
         &EmbedClaims {
             resource: Some(EmbedResource {
-                dashboard: Some(board_id.to_owned()),
                 // BI-26: a token names a dashboard or one chart, never both.
                 chart: None,
+                dashboard: Some(board_id.to_owned()),
             }),
             params: None,
             exp: Some(now + 3600.0),
@@ -614,17 +616,19 @@ async fn a_public_link_reads_the_boundary_of_a_map_its_board_uses_and_refuses_th
         .as_str()
         .unwrap()
         .to_owned();
-    mount_board_and_chart(&engine, "b_shared", TOKEN, &id).await;
-    // BI-19 part A: a public link lives in Postgres, not on the board row, so
-    // the link the route reads is a row here. The board itself is still read
-    // from the engine, by the id the row names. The token is at least eight
-    // characters (the column's own check).
-    sqlx::query(
-        "INSERT INTO dashboard_public_link (board_id, token, expires_at) \
-         VALUES ('b_shared', $1, now() + interval '1 hour')",
+    mount_board_and_chart(&engine, "b_shared", PUBLIC_TOKEN, &id).await;
+    // `BI-19` part A: a public link lives in Postgres, not in the board row
+    // (migration `0098`), and the map route reads it there, exactly as
+    // `GET /api/public/dashboard/{token}` does. A board row's `public_token`
+    // is not a credential any more, so the link is made through the store.
+    links::replace(
+        &app.pool,
+        "b_shared",
+        PUBLIC_TOKEN,
+        OffsetDateTime::now_utc() + Duration::days(5),
+        None,
+        None,
     )
-    .bind(TOKEN)
-    .execute(&app.pool)
     .await
     .unwrap();
 
@@ -632,7 +636,7 @@ async fn a_public_link_reads_the_boundary_of_a_map_its_board_uses_and_refuses_th
         &app,
         "",
         "GET",
-        &format!("/api/public/dashboard/{TOKEN}/maps/{id}/geojson"),
+        &format!("/api/public/dashboard/{PUBLIC_TOKEN}/maps/{id}/geojson"),
         None,
         &[],
     )
@@ -651,7 +655,7 @@ async fn a_public_link_reads_the_boundary_of_a_map_its_board_uses_and_refuses_th
             &app,
             "",
             "GET",
-            &format!("/api/public/dashboard/{TOKEN}/maps/{other}/geojson"),
+            &format!("/api/public/dashboard/{PUBLIC_TOKEN}/maps/{other}/geojson"),
             None,
             &[],
         )

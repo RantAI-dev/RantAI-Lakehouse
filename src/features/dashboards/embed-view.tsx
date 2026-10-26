@@ -16,7 +16,7 @@ import type { BoardTab, LayoutMap, PhoneTile } from "@/services";
 import { TabBar } from "./tab-bar";
 import type { TileFailure } from "@/services/contracts/dashboards";
 import { EMBED_UNAVAILABLE, embedRefusalMessage } from "./embed-refusal";
-import { PasswordGate, openPublic } from "./public-link-access";
+import { PasswordGate, TICKET_HEADER, openPublic, readTicket } from "./public-link-access";
 import { DEFAULT_EMBED_LOOK, themeFor, type EmbedLook } from "@/lib/embed-look";
 import { EmbedFilterBar, type EmbedFilter, type ViewerFilter } from "./embed-filter-bar";
 import { fetchFrameOrigins, useEmbedHeight } from "./use-embed-height";
@@ -78,13 +78,21 @@ export function EmbedView({
   // embed's own token (the signed JWT, or the public link's token), the way
   // the board's data is — never through `apiFetch`, whose 401 would send
   // this anonymous viewer to the login page.
+  // BI-19 part A: a public link with a password sends its ticket with the
+  // map, the same way it sends it with the board's data.
   const loadMap = React.useCallback<MapLoader>(
     (id) => jwt
       ? fetch(`/api/embed/maps/${encodeURIComponent(id)}/geojson`, {
           method: "POST", headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ jwt }), cache: "no-store",
         })
-      : fetch(`/api/public/dashboard/${encodeURIComponent(token ?? "")}/maps/${encodeURIComponent(id)}/geojson`, { cache: "no-store" }),
+      : (() => {
+          const ticket = token ? readTicket(token) : null;
+          return fetch(`/api/public/dashboard/${encodeURIComponent(token ?? "")}/maps/${encodeURIComponent(id)}/geojson`, {
+            cache: "no-store",
+            headers: ticket ? { [TICKET_HEADER]: ticket } : undefined,
+          });
+        })(),
     [token, jwt],
   );
 

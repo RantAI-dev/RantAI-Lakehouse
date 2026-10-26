@@ -45,7 +45,9 @@ fn formatting_defaults(mut body: Value) -> Value {
         "system"
     ]);
     body["contentSites"] = json!([]);
+    // `BI-19` part A: the public-links switch is everybody's to read.
     body["publicLinksEnabled"] = json!(true);
+    // `BI-4` part B: the install's freshness rule for remembered results.
     body["resultCache"] = json!({"mode": "default"});
     body
 }

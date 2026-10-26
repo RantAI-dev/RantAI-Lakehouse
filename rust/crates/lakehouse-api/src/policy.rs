@@ -145,13 +145,15 @@ pub enum Policy {
 /// this table never needs to know about path-parameter values.
 #[rustfmt::skip]
 pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
-    // ── Public: the ONLY eleven routes in the whole service. (Was "six" —
+    // ── Public: the ONLY thirteen routes in the whole service. (Was "six" —
     // corrected when the seventh was added, since Task A5's
     // `/api/auth/oidc/callback` had already made the old count stale; the
     // eighth is `POST /api/embed/frame`, SEC-12; the ninth is
-    // `POST /api/render/data`, BI-1; the tenth and the eleventh are the
-    // public link's and the embed's map boundary route, `PR #246 review
-    // BLOCKER 1`.) ───────────────────────────────────────────────────────
+    // `POST /api/render/data`, BI-1; the tenth and the eleventh are
+    // `POST /api/embed/values` (BI-26) and
+    // `POST /api/public/dashboard/{token}/unlock` (BI-19 part A); the twelfth
+    // and the thirteenth are the public link's and the embed's map boundary
+    // route, `PR #246 review BLOCKER 1`.) ──────────────────────────────────
     ("GET",  "/health",                          Policy::Public),
     ("POST", "/api/embed/data",                   Policy::Public),
     // BI-1 (D3): the PDF's print view has no session; its data route is
@@ -1188,7 +1190,7 @@ mod tests {
     }
 
     #[test]
-    fn exactly_eleven_public_entries_exist() {
+    fn exactly_thirteen_public_entries_exist() {
         // Pre-existing drift found while landing the `/api/auth/providers`
         // route: this assertion was still pinned at 4 even though the two
         // earlier OIDC public routes (`/api/auth/oidc/start`,

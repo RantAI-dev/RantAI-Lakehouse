@@ -802,6 +802,11 @@ mod tests {
             body_json(&TimeContext::default(), &off, true, false)["publicLinksEnabled"],
             json!(false)
         );
+        // `true`: an administrator reads the same switch.
+        assert_eq!(
+            body_json(&TimeContext::default(), &off, true, true)["publicLinksEnabled"],
+            json!(false)
+        );
     }
 
     /// `BI-4` part B T3: the install's freshness rule is kept when the body
