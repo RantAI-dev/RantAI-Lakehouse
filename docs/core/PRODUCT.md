@@ -154,7 +154,7 @@ hands-on testing.
 | Roles and permissions | **Have** | Yes | — |
 | Classify and mask sensitive columns | **Have.** Proven end to end (gate `ops/g8`) | Yes | — |
 | Row-level rules | **Partial.** The policy engine applies row filters and masks on read; masking is proven end to end (gate `ops/g8`), row filters are not gate-tested | Yes | Prove row filters |
-| Catalog and search | **Partial.** Search finds a table by its name, columns, tags, description or owner, forgives a typo and ranks (`DATA-11`, merged; speed on 10,000 tables not measured). Certification part 1 is built (`DATA-12`: a governed mark set with `governance:write`); governed tags, marks in the chart builder and Query Studio, and per-user table visibility are not built | Yes: columns, tags, certification | `DATA-12`, `DATA-20`, `DATA-24` |
+| Catalog and search | **Partial.** Search finds a table by its name, columns, tags, description or owner, forgives a typo and ranks (`DATA-11`, accepted 2026-10-23; speed on 10,000 tables not measured, and a typo that matches only a table's name carries no "approximate match" label, `DATA-24`, `DATA-32`). Certified and deprecated marks, governed tags, and the marks in the chart builder and Query Studio are built and accepted (`DATA-12`, 2026-10-23); per-user table visibility is not built | Yes: columns, tags, certification | `DATA-12`, `DATA-20`, `DATA-24` |
 | Lineage | **Partial** | Yes, including outside systems | Depth |
 | Data quality checks | **Partial.** Hand-written rules; freshness against a set target | Yes: ready check libraries, anomaly detection | `DATA-14` |
 | Audit trail | **Partial.** Pipeline runs and assistant actions; not every console change | Yes | Full coverage |
@@ -305,7 +305,7 @@ run without the product owner fixing things by hand.
 | 3 | No human security review | Commission one |
 | 4 | The main branch can be changed without review | Apply the settings drafted in `docs/CI.md` |
 | 5 | No support commitment to put in a contract | Decide one (`reference/support-model.md`) |
-| 6 | Open high-severity security findings: connector password theft (`SEC-14`), connection tests reaching internal addresses (`SEC-15`) | Fix the security items under Now in `BACKLOG.md`; their specs are in `specs/` |
+| 6 | Open high-severity security findings: connector password theft (`SEC-14`), connection tests reaching internal addresses (`SEC-15`, accepted 2026-10-23) | Fix the security items under Now in `BACKLOG.md`; their specs are in `specs/` |
 
 Not blockers, but will be found in a customer's evaluation: full audit
 coverage, single sign-on, tested backup restore, cleanup of old table
