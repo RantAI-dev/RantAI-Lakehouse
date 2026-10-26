@@ -17,15 +17,15 @@ Upload Excel, JSON and Parquet files, up to 10 at once, up to 2 GB in total.
 
 ## Target specs
 
-"Today" is `main` at `f3a3196`, read from the code, not tested. A target is either a competitor's documented number (named under Benchmark) or marked *(proposed)*: the planner's number, which the product owner confirms or changes on the feature page before the plan is written.
+"Today" is `main` at `17867e52` (re-read 2026-10-16 for the Phase 3 plan, `docs/superpowers/plans/2026-10-16-data-phase-3-uploads.md`), read from the code, not tested; it was `f3a3196` before, when Excel and Parquet had not merged. A target is either a competitor's documented number (named under Benchmark) or marked *(proposed)*: the planner's number, which the product owner confirms or changes on the feature page before the plan is written.
 
 | Capability | Today | Target |
 | --- | --- | --- |
-| Formats | CSV and TSV | CSV, TSV, JSON and JSON Lines, Avro, Parquet, Excel (.xlsx: one chosen sheet) |
-| Files per upload | 1 | Up to 10 files, uploaded in parallel (Databricks) |
-| Size | 50 MB and 2,000,000 rows | Up to 2 GB per upload (Databricks), with the memory of the ingestion process measured in a RESULT document before the number ships |
-| Upload method | Single request | Resumable chunked upload with a progress bar per file; a dropped connection resumes |
-| Compressed files | Not supported | gzip and zip |
+| Formats | Delimited text (comma, tab, semicolon, pipe; UTF-8 or UTF-16), Excel `.xls`/`.xlsx` (one chosen sheet) and flat Parquet, since #76. No JSON, JSON Lines or Avro | CSV, TSV, JSON and JSON Lines, Avro, Parquet, Excel (.xlsx: one chosen sheet) |
+| Files per upload | 1 (a drop of several keeps the first) | Up to 10 files, uploaded in parallel (Databricks) |
+| Size | 50 MiB per file (the whole file held in memory by the console's proxy, the API and the load job); 2,000,000 rows, checked only by the load job; 1,000 columns (`SEC-17`); 5,000,000 cells per Excel sheet or Parquet file | Up to 2 GB per upload (Databricks), with the memory of the ingestion process measured in a RESULT document before the number ships |
+| Upload method | Single request, no progress, not resumable; above 51 MiB the console's proxy cuts the body instead of refusing it | Resumable chunked upload with a progress bar per file; a dropped connection resumes |
+| Compressed files | Not supported: gzip and zip are refused (an `.xlsx` is a zip and is read as a workbook) | gzip and zip |
 | Several files into one table | n/a | Files with the same columns load into one table; mismatches are listed before loading |
 
 ## Benchmark

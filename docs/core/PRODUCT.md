@@ -115,7 +115,7 @@ hands-on testing.
 | Business-app connectors (CRM, ads, support tools) | **Partial.** Eight of Databricks' ten generally available ones are supported and gate-tested against mock vendors (`ops/g6`, job `g6-saas`): Salesforce, ServiceNow, Google Analytics 4, HubSpot, Zendesk, Confluence, Dynamics 365, SharePoint; each with browser or key sign-in, object and column choice, incremental loads where the vendor has a change filter, and schema-change handling. *Not verified* on any real vendor account. Workday Reports and NetSuite are built and listed unsupported. Pull request #216, not merged or accepted | Yes: Databricks has 10 generally available plus about 45 in beta; Airbyte 602 | Real-account test of all ten (`SRC-27`), the second wave of about 45 (`SRC-26`) |
 | Live change capture | **Partial.** Proven for PostgreSQL (gate `ops/g4`); MySQL and SQL Server exist but are not gate-tested | Yes: PostgreSQL, MySQL, SQL Server, Oracle; MongoDB at Airbyte | MySQL, SQL Server, Oracle, MongoDB (`SRC-4`) |
 | Message queues | **Partial.** Kafka loads into tables; no processing over streams | Yes, with stream processing | Stream processing |
-| Upload a file from the console | **Partial.** One CSV or TSV file of up to 50 MB, every column stored as text; merged (PR #71), not accepted | Yes: Databricks 10 files up to 2 GB with types; Snowflake 250 files of 250 MB | Formats, size, types (`DATA-17`, `DATA-18`) |
+| Upload a file from the console | **Partial.** On `main`: one CSV, TSV, Excel or Parquet file of up to 50 MB, every column stored as text; merged (PR #71, #76), not accepted. In PR #186 (not merged): JSON, JSON Lines, Avro, gzip, zip, 10 files into one table, 2 GB per upload (one load at a time measured, `docs/plans/DATA-17-RESULT.md`), and column types | Yes: Databricks 10 files up to 2 GB with types; Snowflake 250 files of 250 MB | Acceptance and merge of #186 (`DATA-17`, `DATA-18`); loads of 2 GB at the same time unmeasured (`DATA-33`) |
 
 #### Storing data
 
@@ -248,8 +248,13 @@ in `README.md` ("Status / Known limitations").
 - One engine; no querying other systems in place. Querying a table as it
   was earlier works from a version picker, but no test yet proves masking
   applies to past versions (`DATA-16`).
-- File upload takes one CSV or TSV file of up to 50 MB, and every column is
-  stored as text (merged, not accepted).
+- File upload on `main` takes one CSV, TSV, Excel or Parquet file of up to
+  50 MB, and every column is stored as text (merged, not accepted). Pull
+  request #186 (not merged) adds JSON, JSON Lines, Avro, gzip and zip, up to
+  10 files into one table, up to 2 GB per upload (measured for one load at a
+  time; two at once, a Parquet row group larger than memory, and Avro and zip
+  at large sizes are not measured, `DATA-33`, `DATA-34`), no row cap, and
+  guessed, editable column types.
 - Dashboards filter by year only; there are no calculated fields.
 - Query Studio shows at most 2,000 rows. A chart built on a saved query is
   limited to 2,000 rows and 30 seconds.
