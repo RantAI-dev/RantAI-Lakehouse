@@ -40,7 +40,34 @@ export type QueryHistoryItem = {
    */
   engine: EngineCategory | QueryEngine | string
   cacheAssisted: boolean
+  /**
+   * The tables the statement named as written (`QS-4`): empty for a
+   * statement that did not parse, and for every row recorded before the
+   * column existed — the server backfills nothing.
+   */
+  tablesRead: string[]
+  /** The exact text the response gave the caller for a failed or refused run. */
+  message?: string
   auditEventId?: string
+}
+
+/**
+ * The history page's filters (`QS-4`, decision 5): every field is
+ * optional, and an absent or empty field filters nothing. `from` and `to`
+ * are RFC 3339 strings — the shape a row's `at` carries, so a cursor cut
+ * from a listed row parses back. `before` is the page cursor: the `at`
+ * and `id` of the last row seen; the server answers with the page before
+ * it. The server clamps `from` to the last 14 days whatever the caller
+ * sends (decision 2).
+ */
+export type QueryHistoryFilter = {
+  status?: QueryHistoryItem["status"]
+  engine?: string
+  minDurationMs?: number
+  table?: string
+  from?: string
+  to?: string
+  before?: { at: string; id: string }
 }
 
 /** Simple federated / multi-source execution plan stage for UI. */
@@ -189,7 +216,12 @@ export type SqlFixOutcome = SqlProposal | { answer: string }
 export interface QueryService {
   listSaved(signal?: AbortSignal): Promise<SavedQuery[]>
   saveQuery(input: SaveQueryInput, signal?: AbortSignal): Promise<SavedQuery>
-  listHistory(signal?: AbortSignal): Promise<QueryHistoryItem[]>
+  /**
+   * The caller's own recorded runs, newest first, one page of 50. The
+   * filter is optional: without it the endpoint answers the newest page
+   * of the last 14 days (`QS-4`, decision 5).
+   */
+  listHistory(filter?: QueryHistoryFilter, signal?: AbortSignal): Promise<QueryHistoryItem[]>
   estimate(sql: string, signal?: AbortSignal): Promise<QueryEstimate>
   run(sql: string, options: { engine: QueryEngine }, signal?: AbortSignal): Promise<QueryResult>
   /** Asks the chat's engine; masking, row filters and `query:read` apply to the SQL it runs. */

@@ -303,13 +303,22 @@ const UPLOAD_EVIDENCE: &str = "upload table claim (upload_table_claim)";
 fn add_claim_rows(g: &mut Graph, claims: &[lakehouse_store::uploads::ClaimedTable]) {
     for claim in claims {
         let upload = format!("upload:{}", claim.upload_id);
-        let label = claim
+        let name = claim
             .original_filename
             .as_deref()
             .map(str::trim)
-            .filter(|name| !name.is_empty())
-            .unwrap_or(DELETED_UPLOAD_LABEL);
-        g.node(&upload, label, UPLOAD);
+            .filter(|name| !name.is_empty());
+        // `DATA-17` slice 5: a table loaded from several files says so. The count is of
+        // the files that loaded with the claiming upload, of its own tenant
+        // (`list_claims`); a deleted upload has no name to attach it to.
+        let label = match name {
+            Some(name) if claim.also_loaded > 0 => {
+                format!("{name} and {} more", claim.also_loaded)
+            }
+            Some(name) => name.to_owned(),
+            None => DELETED_UPLOAD_LABEL.to_owned(),
+        };
+        g.node(&upload, &label, UPLOAD);
         let bronze = format!("bronze:{}", claim.bronze_table);
         g.node(&bronze, &format!("bronze.{}", claim.bronze_table), "bronze");
         g.edge(&upload, &bronze, UPLOAD, UPLOAD_EVIDENCE);
@@ -674,6 +683,7 @@ mod tests {
             bronze_table: table.to_owned(),
             upload_id: upload_id.to_owned(),
             original_filename: filename.map(str::to_owned),
+            also_loaded: 0,
         }
     }
 
@@ -722,6 +732,28 @@ mod tests {
             !keep.contains("upload:up-2"),
             "another table's upload is not lineage"
         );
+    }
+
+    /// `DATA-17` slice 5: a table loaded from several files names the first file and
+    /// how many others came with it; a load of one file keeps the plain name, and a
+    /// deleted upload keeps its own label whatever the count says (the name is never
+    /// guessed back).
+    #[test]
+    fn a_table_loaded_from_several_files_says_how_many_came_with_the_first() {
+        let mut g = Graph::default();
+        let mut several = claim("stock_raw", "up-1", Some("stock_a.csv"));
+        several.also_loaded = 2;
+        let mut gone = claim("other_raw", "up-2", None);
+        gone.also_loaded = 3;
+        add_claim_rows(
+            &mut g,
+            &[several, claim("solo_raw", "up-3", Some("solo.csv")), gone],
+        );
+
+        let label = |id: &str| g.nodes.get(id).map(|n| n.0.as_str());
+        assert_eq!(label("upload:up-1"), Some("stock_a.csv and 2 more"));
+        assert_eq!(label("upload:up-3"), Some("solo.csv"));
+        assert_eq!(label("upload:up-2"), Some(DELETED_UPLOAD_LABEL));
     }
 
     /// A claim outlives the upload that made it (deleting an upload

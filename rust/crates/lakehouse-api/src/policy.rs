@@ -858,6 +858,15 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("DELETE", "/api/uploads/{id}",          Policy::RequiresPermission("connector:manage")),
     ("GET",  "/api/uploads/{id}/preview",    Policy::RequiresPermission("connector:manage")),
     ("POST", "/api/uploads/{id}/ingest",     Policy::RequiresPermission("connector:manage")),
+    // DATA-18: the values of the sample that do not fit a column list.
+    ("POST", "/api/uploads/{id}/check",      Policy::RequiresPermission("connector:manage")),
+    ("POST", "/api/uploads/{id}/compare",    Policy::RequiresPermission("connector:manage")),
+    // DATA-17: chunked upload. The session route belongs to no upload yet;
+    // the three `{id}` routes also answer 404 outside the caller's tenants.
+    ("POST", "/api/uploads/sessions",        Policy::RequiresPermission("connector:manage")),
+    ("PUT",  "/api/uploads/{id}/parts/{n}",  Policy::RequiresPermission("connector:manage")),
+    ("GET",  "/api/uploads/{id}/parts",      Policy::RequiresPermission("connector:manage")),
+    ("POST", "/api/uploads/{id}/complete",   Policy::RequiresPermission("connector:manage")),
 
     // ── Knowledge: no seeded resource — auth only. ───────────────────────
     ("GET",  "/api/knowledge/sources",       Policy::RequiresAuth),

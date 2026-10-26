@@ -905,6 +905,14 @@ pub struct Config {
     /// The same, for the whole installation: `UPLOAD_MAX_CONCURRENT`,
     /// default 16 (`SEC-17`).
     pub upload_max_concurrent: u32,
+    /// Hours after which an upload session whose pieces never all arrived
+    /// is aborted and removed: `UPLOAD_SESSION_TTL_HOURS`, default 24
+    /// (`DATA-17`, decision 8 of the feature page, *proposed* and signed by
+    /// default). A value that is not a whole number of 1 or more fails config
+    /// resolution ([`ConfigError::InvalidUploadLimit`]). Read by the hourly
+    /// sweep (`upload_sweep`); the compose file does not pass it through yet,
+    /// so a container runs with the default.
+    pub upload_session_ttl_hours: u32,
     /// Failed connector runs in a row at which the connector is paused and
     /// `connector_disabled` is raised (`SRC-11` decision D3), from
     /// `CONNECTOR_AUTO_DISABLE_AFTER`. Zero, negative, or unparseable values
@@ -1145,6 +1153,7 @@ impl std::fmt::Debug for Config {
                 &self.upload_max_concurrent_per_user,
             )
             .field("upload_max_concurrent", &self.upload_max_concurrent)
+            .field("upload_session_ttl_hours", &self.upload_session_ttl_hours)
             .field(
                 "connector_auto_disable_after",
                 &self.connector_auto_disable_after,
@@ -1281,8 +1290,8 @@ impl Config {
     ///   `AI_RELEVANT_TABLES` is set and non-empty but is neither `true`
     ///   nor `false`.
     /// - [`ConfigError::InvalidUploadLimit`], if
-    ///   `UPLOAD_MAX_CONCURRENT_PER_USER` or `UPLOAD_MAX_CONCURRENT` is set
-    ///   and non-empty but is not a whole number of 1 or more.
+    ///   `UPLOAD_MAX_CONCURRENT_PER_USER`, `UPLOAD_MAX_CONCURRENT` or
+    ///   `UPLOAD_SESSION_TTL_HOURS` is set and non-empty but is not a whole number of 1 or more.
     ///
     /// An unparseable `SMTP_PORT` does NOT error — see [`Config::smtp_port`].
     #[allow(
@@ -1528,6 +1537,7 @@ impl Config {
             auth_retention_days: parse_positive_u32_or_default(env, "AUTH_RETENTION_DAYS", 30),
             upload_max_concurrent_per_user: parse_limit(env, "UPLOAD_MAX_CONCURRENT_PER_USER", 4)?,
             upload_max_concurrent: parse_limit(env, "UPLOAD_MAX_CONCURRENT", 16)?,
+            upload_session_ttl_hours: parse_limit(env, "UPLOAD_SESSION_TTL_HOURS", 24)?,
             connector_auto_disable_after: i32::try_from(parse_positive_u32_or_default(
                 env,
                 "CONNECTOR_AUTO_DISABLE_AFTER",
@@ -2721,5 +2731,25 @@ mod tests {
         assert_eq!(with("").as_deref(), None);
         assert_eq!(with("javascript:alert(1)").as_deref(), None);
         assert_eq!(with("lakehouse.example.com").as_deref(), None);
+    }
+
+    #[test]
+    fn the_upload_session_lifetime_defaults_to_24_hours_and_a_bad_value_is_refused() {
+        assert_eq!(
+            Config::from_map(&HashMap::new())
+                .unwrap()
+                .upload_session_ttl_hours,
+            24
+        );
+        let cfg = Config::from_map(&env_with("UPLOAD_SESSION_TTL_HOURS", "6")).unwrap();
+        assert_eq!(cfg.upload_session_ttl_hours, 6);
+        for bad in ["0", "-1", "abc"] {
+            let err = Config::from_map(&env_with("UPLOAD_SESSION_TTL_HOURS", bad))
+                .expect_err("a bad lifetime must stop start-up");
+            assert_eq!(
+                err,
+                ConfigError::InvalidUploadLimit("UPLOAD_SESSION_TTL_HOURS", bad.to_owned())
+            );
+        }
     }
 }

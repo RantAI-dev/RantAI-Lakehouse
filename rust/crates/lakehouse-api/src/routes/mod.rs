@@ -181,9 +181,22 @@ fn route_timeout(path: &str) -> Duration {
         other if other.starts_with("/api/reports/subscriptions/") && other.ends_with("/send") => {
             EXPORT_REQUEST_TIMEOUT
         }
+        other if is_upload_part_path(other) => UPLOAD_REQUEST_TIMEOUT,
         other if is_discovery_path(other) => DISCOVERY_REQUEST_TIMEOUT,
         _ => DEFAULT_REQUEST_TIMEOUT,
     }
+}
+
+/// Whether `path` is `/api/uploads/{id}/parts/{n}`: one 8 MiB piece of a
+/// chunked upload (`DATA-17`). It gets [`UPLOAD_REQUEST_TIMEOUT`], not the
+/// default 60 s, which would cut an 8 MiB piece off on a link slower than about
+/// 1 Mbit/s; the other `/api/uploads/{id}*` routes keep the default.
+fn is_upload_part_path(path: &str) -> bool {
+    path.strip_prefix("/api/uploads/")
+        .map(|rest| rest.split('/').collect::<Vec<_>>())
+        .is_some_and(|segments| {
+            matches!(segments.as_slice(), [id, "parts", n] if !id.is_empty() && !n.is_empty())
+        })
 }
 
 /// `/api/connectors/{id}/discovery/{kind}`'s timeout (`SRC-13` decision D9): the
@@ -842,9 +855,36 @@ fn uploads_router(state: &AppState) -> Router<AppState> {
             get(uploads::get).delete(uploads::delete),
         )
         .route("/api/uploads/{id}/preview", get(uploads::preview))
+        // DATA-18: apply a column list to the sample, store nothing.
+        .route(
+            "/api/uploads/{id}/check",
+            axum::routing::post(uploads::columns::check),
+        )
         .route(
             "/api/uploads/{id}/ingest",
             axum::routing::post(uploads::ingest),
+        )
+        // DATA-17 slice 5: which other files can load into one table with this one.
+        .route(
+            "/api/uploads/{id}/compare",
+            axum::routing::post(uploads::group::compare),
+        )
+        // DATA-17: the pieces of a chunked upload. Only the piece route takes
+        // a large body, and its own limit (a piece plus 64 KiB); the other
+        // routes keep axum's 2 MB default.
+        .route(
+            "/api/uploads/{id}/parts/{n}",
+            axum::routing::put(uploads::sessions::put_part).layer(DefaultBodyLimit::max(
+                uploads::sessions::MAX_PART_BODY_BYTES,
+            )),
+        )
+        .route(
+            "/api/uploads/{id}/parts",
+            get(uploads::sessions::list_parts),
+        )
+        .route(
+            "/api/uploads/{id}/complete",
+            axum::routing::post(uploads::sessions::complete),
         )
         .route_layer(from_fn_with_state(
             state.clone(),
@@ -856,6 +896,12 @@ fn uploads_router(state: &AppState) -> Router<AppState> {
             axum::routing::post(uploads::create)
                 .layer(DefaultBodyLimit::max(uploads::MAX_REQUEST_BODY_BYTES))
                 .get(uploads::list),
+        )
+        // DATA-17: opens a chunked upload. A static path next to `{id}`; it
+        // belongs to no existing upload, so it sits outside the tenant layer.
+        .route(
+            "/api/uploads/sessions",
+            axum::routing::post(uploads::sessions::create_session),
         )
         .merge(per_upload)
 }
@@ -1472,12 +1518,27 @@ mod tests {
             "/api/uploads/up-1/ingest",
             "/api/uploads/",
             "/api/uploads/x/y",
+            "/api/uploads/up-1/parts",
+            "/api/uploads/up-1/complete",
+            "/api/uploads/sessions",
+            "/api/uploads/up-1/parts/",
+            "/api/uploads//parts/1",
+            "/api/uploads/up-1/parts/1/x",
         ] {
             assert_eq!(
                 route_timeout(per_upload),
                 DEFAULT_REQUEST_TIMEOUT,
                 "{per_upload}"
             );
+        }
+    }
+
+    /// `DATA-17`: one 8 MiB piece of a chunked upload gets the long bound, as
+    /// the single request it replaces did.
+    #[test]
+    fn a_piece_of_a_chunked_upload_takes_five_minutes() {
+        for piece in ["/api/uploads/up-1/parts/1", "/api/uploads/up-1/parts/256"] {
+            assert_eq!(route_timeout(piece), UPLOAD_REQUEST_TIMEOUT, "{piece}");
         }
     }
 }

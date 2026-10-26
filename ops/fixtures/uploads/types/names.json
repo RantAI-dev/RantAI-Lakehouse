@@ -1,0 +1,99 @@
+{
+ "_about": "A header and the column names the load makes of it (file_ingest._column_names); the API mirrors the rule so the preview shows final names (DATA-18 T3.1/T3.2).",
+ "cases": [
+  {
+   "header": [
+    "Name",
+    "Name",
+    "",
+    "Qty ",
+    "",
+    "A.scrap",
+    "2024",
+    "Material description"
+   ],
+   "names": [
+    "name",
+    "name_2",
+    "col_2",
+    "qty",
+    "col_4",
+    "a_scrap",
+    "col_2024",
+    "material_description"
+   ]
+  },
+  {
+   "header": [
+    "a",
+    "a",
+    "a_2"
+   ],
+   "names": [
+    "a",
+    "a_2",
+    "a_2_2"
+   ]
+  },
+  {
+   "header": [
+    "größe",
+    "名前",
+    "値"
+   ],
+   "names": [
+    "gr_e",
+    "col_1",
+    "col_2"
+   ]
+  },
+  {
+   "header": [
+    "id",
+    "ID",
+    "Id"
+   ],
+   "names": [
+    "id",
+    "id_2",
+    "id_3"
+   ]
+  },
+  {
+   "header": [
+    "  ",
+    "",
+    " x "
+   ],
+   "names": [
+    "col_0",
+    "col_1",
+    "x"
+   ]
+  },
+  {
+   "header": [
+    "Order ID",
+    "order-id",
+    "order.id"
+   ],
+   "names": [
+    "order_id",
+    "order_id_2",
+    "order_id_3"
+   ]
+  },
+  {
+   "header": [
+    "_x",
+    "__y",
+    "z__"
+   ],
+   "names": [
+    "x",
+    "y",
+    "z"
+   ]
+  }
+ ]
+}

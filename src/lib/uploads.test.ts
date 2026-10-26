@@ -4,6 +4,10 @@ import { join } from "node:path"
 import { test } from "node:test"
 import type { Upload } from "@/services/contracts/uploads"
 import {
+  COLUMN_NAME_RULE,
+  COLUMN_TYPES,
+  MAX_FILES,
+  MAX_SESSION_BYTES,
   MAX_TABLE_NAME_CHARS,
   MAX_UPLOAD_BYTES,
   REGISTRATION_FAILED_REASON,
@@ -12,12 +16,22 @@ import {
   UPLOAD_ENCODINGS,
   delimiterLabel,
   encodingLabel,
+  columnListProblems,
+  columnNameProblem,
+  columnSpecOf,
+  columnTypeLabel,
+  archiveProblem,
   fileKindProblem,
+  hasFixedDialect,
+  layoutLabel,
   fileProblem,
   fileSizeProblem,
   headerRowDisplay,
   headerRowFromDisplay,
+  groupProblem,
   isUploadedTable,
+  mismatchLines,
+  planPick,
   rawTableFullName,
   retryInput,
   statusLabel,
@@ -26,11 +40,16 @@ import {
   tableNameProblem,
   uploadFileKind,
   uploadFileLabel,
+  withColumnType,
 } from "./uploads"
 
-test("MAX_UPLOAD_BYTES is the API's cap, 50 MiB", () => {
+test("MAX_UPLOAD_BYTES is the cap of POST /api/uploads and of a workbook, 50 MiB", () => {
   assert.equal(MAX_UPLOAD_BYTES, 50 * 1024 * 1024)
   assert.equal(MAX_UPLOAD_BYTES, 52_428_800)
+})
+
+test("MAX_SESSION_BYTES is the chunked path's cap, exactly 2 GiB (DATA-17-RESULT.md, plan T6.2)", () => {
+  assert.equal(MAX_SESSION_BYTES, 2_147_483_648)
 })
 
 test("tableNameProblem says the API's sentence, word for word", () => {
@@ -172,7 +191,8 @@ test("suggestTableName always suggests a name tableNameProblem accepts", () => {
   }
 })
 
-test("statusLabel names the four statuses and shows an unknown one as received", () => {
+test("statusLabel names the five statuses and shows an unknown one as received", () => {
+  assert.equal(statusLabel("receiving"), "Receiving")
   assert.equal(statusLabel("uploaded"), "Uploaded")
   assert.equal(statusLabel("ingesting"), "Loading")
   assert.equal(statusLabel("ingested"), "Loaded")
@@ -265,67 +285,22 @@ test("REGISTRATION_FAILED_REASON is one of the reasons the load job records", ()
   assert.equal(REGISTRATION_FAILED_REASON, "The table was loaded but could not be registered in the catalog.")
 })
 
-test("fileSizeProblem refuses only a file over 50 MB, names the limit and says what to do", () => {
+test("fileSizeProblem refuses a file over 2 GB, and a workbook over 50 MB, each naming its own limit", () => {
   assert.equal(fileSizeProblem("a.csv", 0), null)
-  assert.equal(fileSizeProblem("a.csv", MAX_UPLOAD_BYTES), null)
-  const problem = fileSizeProblem("big.csv", MAX_UPLOAD_BYTES + 1)
+  assert.equal(fileSizeProblem("a.csv", MAX_UPLOAD_BYTES + 1), null, "a text file may be past 50 MB")
+  assert.equal(fileSizeProblem("a.csv", MAX_SESSION_BYTES), null)
+  const problem = fileSizeProblem("big.csv", MAX_SESSION_BYTES + 1)
   assert.ok(problem !== null)
   assert.match(problem, /^big\.csv is /)
-  assert.match(problem, /50 MB limit/)
+  assert.match(problem, /2 GB limit/)
   assert.match(problem, /Split it/)
-})
 
-test("retryInput repeats what the load was told, and replaces after a registration failure", () => {
-  const options = { encoding: "utf-8" as const, delimiter: ";", headerRow: 2 }
-  const failed = upload({
-    status: "failed",
-    parseOptions: options,
-    bronzeTable: "stock",
-    loadMode: "append",
-    error: "The load into the table failed.",
-  })
-  assert.deepEqual(retryInput(failed), { ...options, bronzeTable: "stock", mode: "append" })
-  assert.deepEqual(retryInput({ ...failed, loadMode: "replace" }), { ...options, bronzeTable: "stock", mode: "replace" })
-  // Rows are already in the table: adding them again would double them.
-  assert.equal(retryInput({ ...failed, error: REGISTRATION_FAILED_REASON })?.mode, "replace")
-  // A load nobody recorded the settings of is not guessed at.
-  assert.equal(retryInput(upload({ status: "failed" })), null)
-  assert.equal(retryInput(upload({ status: "failed", parseOptions: options })), null)
-})
-
-test("fileKindProblem refuses a workbook the API does not read, or an archive, by its name, in the API's words", () => {
-  for (const name of ["a.xlsm", "a.xlsb", "a.ods", "a.zip", "a.gz", "a.7z", "report.final.xlsm"]) {
-    const problem = fileKindProblem(name)
-    assert.ok(problem?.startsWith(`${name} looks like a workbook or a zip archive that is not an .xls or .xlsx file.`), name)
-    assert.ok(problem?.includes("Only .xls and .xlsx workbooks, .parquet files and delimited text files (CSV, TSV) can be uploaded; save the sheet as .xlsx or CSV first."), name)
+  for (const name of ["a.xlsx", "A.XLS"]) {
+    assert.equal(fileSizeProblem(name, MAX_UPLOAD_BYTES), null, name)
+    const workbook = fileSizeProblem(name, MAX_UPLOAD_BYTES + 1)
+    assert.ok(workbook !== null, name)
+    assert.match(workbook, /50 MB limit for an Excel workbook/)
   }
-})
-
-test("fileKindProblem lets an .xls or .xlsx through: the API opens it, and refuses one that does not open", () => {
-  for (const name of ["a.xls", "a.xlsx", "DATA.XLS", "Data.XlsX", "report.final.xlsx", "a.csv.xlsx"]) {
-    assert.equal(fileKindProblem(name), null, name)
-  }
-})
-
-test("fileKindProblem lets a .parquet through: the API opens it, and refuses one that does not open", () => {
-  for (const name of ["a.parquet", "DATA.PARQUET", "report.final.parquet", "a.csv.parquet"]) {
-    assert.equal(fileKindProblem(name), null, name)
-  }
-})
-
-test("fileKindProblem refuses other binaries in the API's sentence, which now names Parquet too", () => {
-  for (const name of ["a.pdf", "a.docx", "a.avro", "a.orc", "a.sqlite"]) {
-    assert.equal(
-      fileKindProblem(name),
-      `${name} is not a delimited text file, an Excel workbook or a Parquet file. Only .xls and .xlsx workbooks, .parquet files and delimited text files (CSV, TSV) can be uploaded.`
-    )
-  }
-})
-
-test("fileKindProblem ignores the case of the extension", () => {
-  assert.ok(fileKindProblem("DATA.XLSM")?.includes("not an .xls or .xlsx file"))
-  assert.ok(fileKindProblem("Data.OdS")?.includes("not an .xls or .xlsx file"))
-  assert.equal(fileKindProblem("DATA.PARQUET"), null)
 })
 
 test("fileKindProblem lets through delimited text, unknown extensions and names with no extension", () => {
@@ -335,8 +310,8 @@ test("fileKindProblem lets through delimited text, unknown extensions and names 
 })
 
 test("fileProblem gives the kind first, then the size, and null for an acceptable file", () => {
-  assert.ok(fileProblem("a.xlsm", MAX_UPLOAD_BYTES + 1)?.includes("not an .xls or .xlsx file"))
-  assert.ok(fileProblem("a.csv", MAX_UPLOAD_BYTES + 1)?.includes("50 MB limit"))
+  assert.ok(fileProblem("a.xlsm", MAX_UPLOAD_BYTES + 1)?.includes("looks like a workbook or an archive"))
+  assert.ok(fileProblem("a.csv", MAX_SESSION_BYTES + 1)?.includes("2 GB limit"))
   assert.ok(fileProblem("a.xlsx", MAX_UPLOAD_BYTES + 1)?.includes("50 MB limit"))
   assert.equal(fileProblem("a.csv", 1024), null)
   assert.equal(fileProblem("a.xlsx", 1024), null)
@@ -393,4 +368,170 @@ test("tableNameFault names the specific break and is null exactly when tableName
     assert.notEqual(tableNameProblem(name), null, name)
     assert.notEqual(tableNameFault(name), null, name)
   }
+})
+
+/** A file of `size` bytes without allocating it. */
+function fileOfSize(name: string, size: number): File {
+  const file = new File(["x"], name)
+  Object.defineProperty(file, "size", { value: size })
+  return file
+}
+
+test("planPick keeps the first ten files of a pick and counts the rest as left out", () => {
+  assert.equal(MAX_FILES, 10)
+  const picked = Array.from({ length: 12 }, (_, i) => fileOfSize(`f${i}.csv`, 10))
+  const { candidates, dropped } = planPick([], picked)
+  assert.equal(candidates.length, 10)
+  assert.equal(dropped, 2)
+  assert.deepEqual(
+    candidates.map((c) => c.file.name),
+    picked.slice(0, 10).map((f) => f.name)
+  )
+  assert.ok(candidates.every((c) => c.problem === null))
+})
+
+test("planPick counts the files already listed against the ten", () => {
+  const existing = Array.from({ length: 9 }, () => ({ size: 1, state: "received" }))
+  const { candidates, dropped } = planPick(existing, [fileOfSize("a.csv", 1), fileOfSize("b.csv", 1)])
+  assert.equal(candidates.length, 1)
+  assert.equal(dropped, 1)
+  assert.equal(planPick(Array.from({ length: 10 }, () => ({ size: 1, state: "received" })), [fileOfSize("c.csv", 1)]).dropped, 1)
+})
+
+test("planPick gives a file its own problem: a kind the API does not read, or one over the limit", () => {
+  const { candidates } = planPick(
+    [],
+    [fileOfSize("stock.XLSM", 10), fileOfSize("big.csv", MAX_SESSION_BYTES + 1), fileOfSize("ok.csv", 10)]
+  )
+  assert.match(candidates[0].problem ?? "", /looks like a workbook or an archive/)
+  assert.match(candidates[1].problem ?? "", /over the 2 GB limit/)
+  assert.equal(candidates[2].problem, null)
+})
+
+test("planPick counts the 2 GB of one upload over all its files, and a refused file does not count", () => {
+  const half = MAX_SESSION_BYTES / 2
+  const { candidates } = planPick(
+    [{ size: half, state: "received" }, { size: MAX_SESSION_BYTES, state: "refused" }],
+    [fileOfSize("a.csv", half), fileOfSize("b.csv", 1), fileOfSize("c.csv", 1)]
+  )
+  assert.equal(candidates[0].problem, null, "exactly the limit in all")
+  assert.match(candidates[1].problem ?? "", /b\.csv would bring the files to .*over the 2 GB limit for one upload/)
+  assert.match(candidates[2].problem ?? "", /c\.csv would bring the files/)
+})
+
+// ── column types (DATA-18) ────────────────────────────────────────────────
+
+test("a typed column name follows the API's rule, word for word", () => {
+  for (const ok of ["a", "qty", "order_id", "a1_b2", "x".repeat(128)]) assert.equal(columnNameProblem(ok), null, ok)
+  for (const bad of ["", "Qty", "1a", "a__b", "a_", "_a", "a-b", "a b", "_dlt_x", "x".repeat(129)]) {
+    assert.equal(columnNameProblem(bad), COLUMN_NAME_RULE, JSON.stringify(bad))
+  }
+  assert.match(COLUMN_NAME_RULE, /joined by single underscores/)
+})
+
+test("the six types are offered in the API's order, and a float is named as it comes from the file", () => {
+  assert.deepEqual(COLUMN_TYPES.map((t) => t.value), ["text", "integer", "decimal", "boolean", "date", "timestamp"])
+  assert.equal(columnTypeLabel("float"), "Floating point (from the file)")
+  assert.equal(columnTypeLabel("integer"), "Integer")
+})
+
+const column = (over: Partial<Parameters<typeof columnSpecOf>[0]> = {}) => ({
+  source: "Qty",
+  name: "qty",
+  type: "text" as const,
+  guessedType: "text" as const,
+  askDateOrder: false,
+  ...over,
+})
+
+test("a list is stopped by a bad or repeated name and by a date reading nobody has answered", () => {
+  assert.deepEqual(columnListProblems([column(), column({ name: "other" })]), [])
+  assert.deepEqual(columnListProblems([column({ name: "Bad Name" })]), [COLUMN_NAME_RULE])
+  assert.deepEqual(columnListProblems([column(), column()]), [COLUMN_NAME_RULE])
+  const asked = columnListProblems([column({ name: "due", type: "date" })])
+  assert.equal(asked.length, 1)
+  assert.match(asked[0], /day first or month first/)
+  assert.deepEqual(columnListProblems([column({ name: "due", type: "date", dateFormat: "dmy" })]), [])
+})
+
+test("what goes to the API keeps the reading only where there is one, and a timestamp always says its zone", () => {
+  assert.deepEqual(columnSpecOf(column({ type: "integer", dateFormat: "iso", timezone: true })), {
+    source: "Qty",
+    name: "qty",
+    type: "integer",
+  })
+  assert.deepEqual(columnSpecOf(column({ type: "date", dateFormat: "mdy" })), {
+    source: "Qty",
+    name: "qty",
+    type: "date",
+    dateFormat: "mdy",
+  })
+  assert.deepEqual(columnSpecOf(column({ type: "timestamp", dateFormat: "iso" })), {
+    source: "Qty",
+    name: "qty",
+    type: "timestamp",
+    dateFormat: "iso",
+    timezone: false,
+  })
+})
+
+test("changing a column's type sheds the reading and zone it no longer has, and starts a date with none chosen", () => {
+  const stamp = column({ type: "timestamp", dateFormat: "dmy", timezone: true })
+  const asInteger = withColumnType(stamp, "integer")
+  assert.equal(asInteger.dateFormat, undefined)
+  assert.equal(asInteger.timezone, undefined)
+  const asDate = withColumnType(column(), "date")
+  assert.equal(asDate.dateFormat, undefined, "a person says how it is read")
+  assert.equal(withColumnType(stamp, "date").dateFormat, "dmy", "a reading already chosen is kept")
+})
+
+test("a retry sends back the columns and the choice the failed load was told", () => {
+  const upload = {
+    id: "up-1",
+    originalFilename: "a.csv",
+    sizeBytes: 1,
+    uploadedBy: "Ana",
+    status: "failed",
+    createdAt: "",
+    updatedAt: "",
+    parseOptions: { encoding: "utf-8" as const, delimiter: ",", headerRow: 0 },
+    bronzeTable: "t",
+    columns: [{ source: "Qty", name: "qty", type: "integer" as const }],
+    onBadValue: "stop" as const,
+  }
+  const input = retryInput(upload)
+  assert.deepEqual(input?.columns, upload.columns)
+  assert.equal(input?.onBadValue, "stop")
+  assert.equal("columns" in (retryInput({ ...upload, columns: undefined, onBadValue: undefined }) ?? {}), false)
+})
+
+test("the mark and the label follow the name: JSON, Avro and archives have their own kinds", () => {
+  assert.equal(uploadFileKind("a.json"), "json")
+  assert.equal(uploadFileKind("a.NDJSON"), "json")
+  assert.equal(uploadFileKind("a.avro"), "avro")
+  assert.equal(uploadFileKind("a.csv.gz"), "archive")
+  assert.equal(uploadFileKind("a.zip"), "archive")
+  assert.equal(uploadFileKind("a.csv"), "delimited")
+})
+
+test("layoutLabel says what a file is read as, and only JSON and Avro have no dialect to choose", () => {
+  assert.equal(layoutLabel({ format: "json", compression: "none" }), "JSON")
+  assert.equal(layoutLabel({ format: "jsonl", compression: "gzip" }), "JSON Lines in a gzip file")
+  assert.equal(layoutLabel({ format: "avro", compression: "zip" }), "Avro in a zip archive")
+  assert.equal(layoutLabel({ format: "delimited", compression: "gzip" }), "CSV or TSV in a gzip file")
+  assert.equal(hasFixedDialect(undefined), false)
+  assert.equal(hasFixedDialect({ format: "delimited", compression: "zip" }), false)
+  assert.equal(hasFixedDialect({ format: "json", compression: "none" }), true)
+  assert.equal(hasFixedDialect({ format: "avro", compression: "none" }), true)
+})
+
+test("archiveProblem is null for a zip whose files agree and names how many differ otherwise", () => {
+  const file = (name: string, matchesFirst: boolean) => ({ name, sizeBytes: 1, columns: 3, matchesFirst })
+  assert.equal(archiveProblem(undefined), null)
+  assert.equal(archiveProblem({ files: [file("a.csv", true), file("b.csv", true)] }), null)
+  assert.match(archiveProblem({ files: [file("a.csv", true), file("b.csv", false)] }) ?? "", /^One file of the zip does not have the same columns/)
+  assert.match(
+    archiveProblem({ files: [file("a.csv", true), file("b.csv", false), file("c.csv", false)] }) ?? "",
+    /^2 files of the zip do not have the same columns/
+  )
 })

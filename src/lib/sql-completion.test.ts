@@ -94,6 +94,29 @@ test("sqlCompletionOptions memberi kolom tabel yang diberi alias tanpa AS", () =
   assert.deepEqual(options.map((option) => option.label), ["amount", "status"])
 })
 
+test("sqlCompletionOptions memberi kolom tabel Bronze yang ditulis dengan namespace.name", () => {
+  const bronze: CompletionTable = {
+    id: "bronze_orders",
+    label: "Orders",
+    reference: "",
+    layer: "raw",
+    names: ["bronze_orders", "bronze.orders"],
+  }
+  const sql = "SELECT o. FROM bronze.orders o"
+  const { options } = sqlCompletionOptions({
+    sql,
+    cursor: after(sql, "o."),
+    tables: [bronze],
+    columns: {
+      bronze_orders: {
+        status: "ready",
+        columns: [{ name: "oid", dataType: "String" }],
+      },
+    },
+  })
+  assert.deepEqual(options.map((option) => option.label), ["oid"])
+})
+
 test("sqlCompletionOptions tidak mencampur kolom dua tabel yang nama kolomnya sama", () => {
   const sql = "SELECT a., b. FROM silver.orders a JOIN serving.customers b"
   const first = sqlCompletionOptions({
