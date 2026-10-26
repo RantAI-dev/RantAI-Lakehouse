@@ -44,7 +44,7 @@
 //! (`upload_formats.py`, `Budget`).
 
 use std::collections::HashMap;
-use std::io::{Read, Seek};
+use std::io::{Read, Seek, SeekFrom};
 
 use serde_json::{Map, Value};
 
@@ -52,6 +52,24 @@ use crate::upload_types::{ColumnType, DateFormat, Declared, declared_from_parque
 
 /// Decision 13: a zip holds up to ten files.
 pub const MAX_ZIP_FILES: usize = 10;
+
+/// The most entries a zip's central directory may declare (`PR #186 review BLOCKER 2`).
+///
+/// `zip::ZipArchive::new` reads the whole central directory into memory, one record per
+/// entry (folders included), before the caller can look at any of it: an archive of
+/// millions of folder entries would take the API's memory with it, in a blocking task
+/// that outlives the request's timeout. The count is read from the end-of-central-directory
+/// record instead, so such an archive is refused without being read. The cap is far above
+/// [`MAX_ZIP_FILES`], which is the number of files a load reads: an archive of ten files
+/// with a few folders beside them is well inside it.
+pub const MAX_ZIP_ENTRIES: u64 = 1_000;
+
+/// The most bytes a zip's central directory may take (`PR #186 review BLOCKER 2`).
+///
+/// The same read, bounded: a thousand entries with ordinary names take about 60 KiB of
+/// central directory, so 4 MiB leaves room for long names and refuses an archive whose
+/// directory is megabytes long.
+pub const MAX_ZIP_CENTRAL_BYTES: u64 = 4 * 1024 * 1024;
 
 /// How a stored object is wrapped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -197,6 +215,13 @@ pub enum Refusal {
     /// A zip with too many files.
     #[error("A zip archive may hold at most 10 files.")]
     ZipTooMany,
+    /// A zip whose central directory is bigger than the API will read.
+    ///
+    /// `PR #186 review BLOCKER 2`: the central directory is read into memory before the
+    /// archive can be looked at, so an archive with millions of entries is refused on the
+    /// counts it declares, before the directory is built.
+    #[error("This zip archive holds too many files to be read.")]
+    ZipTooManyEntries,
     /// A zip with an encrypted file.
     #[error("A zip archive with a password cannot be read.")]
     ZipEncrypted,
@@ -916,6 +941,124 @@ fn archive_name(name: &str) -> bool {
     .any(|suffix| lower.ends_with(suffix))
 }
 
+/// The end-of-central-directory record of a zip: how many entries its central directory
+/// holds and how many bytes that directory takes.
+struct ZipDirectory {
+    entries: u64,
+    bytes: u64,
+}
+
+/// `len` bytes of `reader` from `at`.
+fn read_at<R: Read + Seek>(reader: &mut R, at: u64, len: usize) -> Result<Vec<u8>, Refusal> {
+    reader
+        .seek(SeekFrom::Start(at))
+        .map_err(|_err| Refusal::NotZip)?;
+    let mut out = vec![0u8; len];
+    reader
+        .read_exact(&mut out)
+        .map_err(|_err| Refusal::NotZip)?;
+    Ok(out)
+}
+
+/// The little-endian number at `at`.
+fn u16_at(bytes: &[u8], at: usize) -> u64 {
+    u64::from(u16::from_le_bytes([bytes[at], bytes[at + 1]]))
+}
+
+/// The little-endian number at `at`.
+fn u32_at(bytes: &[u8], at: usize) -> u64 {
+    u64::from(u32::from_le_bytes([
+        bytes[at],
+        bytes[at + 1],
+        bytes[at + 2],
+        bytes[at + 3],
+    ]))
+}
+
+/// The little-endian number at `at`.
+fn u64_at(bytes: &[u8], at: usize) -> u64 {
+    let mut raw = [0u8; 8];
+    raw.copy_from_slice(&bytes[at..at + 8]);
+    u64::from_le_bytes(raw)
+}
+
+/// The counts a zip's central directory declares, read from the end of the file.
+///
+/// `PR #186 review BLOCKER 2`. `zip::ZipArchive::new` builds a record for every entry of
+/// the central directory — folders included — before the caller can look at any of it, so
+/// an archive of millions of folders would take the API's memory with it (in a blocking
+/// task, which outlives the request's timeout). This reads the end-of-central-directory
+/// record instead, and the zip64 one when the archive has it, so an archive that is too
+/// big is refused before its directory is built.
+///
+/// # Errors
+///
+/// [`Refusal::NotZip`] for bytes that hold no end-of-central-directory record.
+fn zip_directory<R: Read + Seek>(reader: &mut R) -> Result<ZipDirectory, Refusal> {
+    const EOCD: &[u8; 4] = b"PK\x05\x06";
+    const ZIP64_EOCD: &[u8; 4] = b"PK\x06\x06";
+    const ZIP64_LOCATOR: &[u8; 4] = b"PK\x06\x07";
+    const EOCD_LEN: usize = 22;
+    const MAX_COMMENT: usize = 65_535;
+
+    let len = reader
+        .seek(SeekFrom::End(0))
+        .map_err(|_err| Refusal::NotZip)?;
+    if len < u64::try_from(EOCD_LEN).unwrap_or(u64::MAX) {
+        return Err(Refusal::NotZip);
+    }
+    // The record is at the very end, after a comment of up to 64 KiB; the zip64 locator
+    // that may point at the zip64 record sits just before it.
+    let window = usize::try_from(len)
+        .unwrap_or(usize::MAX)
+        .min(EOCD_LEN + MAX_COMMENT + 20);
+    let start = len.saturating_sub(u64::try_from(window).unwrap_or(u64::MAX));
+    let tail = read_at(reader, start, window)?;
+    // The last record whose own comment ends at the end of the file is the real one: a
+    // comment may hold the signature itself.
+    let mut found = None;
+    let mut from = tail.len();
+    while from >= 4 {
+        from -= 1;
+        if tail[from..].starts_with(EOCD) && from + EOCD_LEN <= tail.len() {
+            let comment = usize::try_from(u16_at(&tail, from + 20)).unwrap_or_default();
+            if from + EOCD_LEN + comment == tail.len() {
+                found = Some(from);
+                break;
+            }
+        }
+    }
+    let at = found.ok_or(Refusal::NotZip)?;
+    let mut entries = u16_at(&tail, at + 10);
+    let mut bytes = u32_at(&tail, at + 12);
+    if entries == u64::from(u16::MAX) || bytes == u64::from(u32::MAX) {
+        // A zip64 archive: the real counts are in the zip64 record, which the locator
+        // before the end record points at. Without the locator the 32-bit counts stand,
+        // and they are the sentinel: the archive is refused below.
+        if at >= 20 && tail[at - 20..].starts_with(ZIP64_LOCATOR) {
+            let record_at = u64_at(&tail, at - 20 + 8);
+            let record = read_at(reader, record_at, 56)?;
+            if record.starts_with(ZIP64_EOCD) {
+                entries = u64_at(&record, 24);
+                bytes = u64_at(&record, 32);
+            }
+        }
+    }
+    Ok(ZipDirectory { entries, bytes })
+}
+
+/// Refuse a zip whose central directory is bigger than the API will read.
+///
+/// `PR #186 review BLOCKER 2`: the one check every zip read goes through, before
+/// `zip::ZipArchive::new` builds a record for each of its entries.
+fn check_zip_directory<R: Read + Seek>(reader: &mut R) -> Result<(), Refusal> {
+    let directory = zip_directory(reader)?;
+    if directory.entries > MAX_ZIP_ENTRIES || directory.bytes > MAX_ZIP_CENTRAL_BYTES {
+        return Err(Refusal::ZipTooManyEntries);
+    }
+    Ok(())
+}
+
 /// The indices of the files a load reads, in order.
 fn file_indices<R: Read + Seek>(archive: &mut zip::ZipArchive<R>) -> Result<Vec<usize>, Refusal> {
     let mut found = Vec::new();
@@ -936,8 +1079,10 @@ fn file_indices<R: Read + Seek>(archive: &mut zip::ZipArchive<R>) -> Result<Vec<
 /// # Errors
 ///
 /// [`Refusal`] for a file that is not a zip, holds no files, more than [`MAX_ZIP_FILES`], an
-/// encrypted file, an archive by name, or files that are not all of one supported format.
-pub fn zip_listing<R: Read + Seek>(reader: R) -> Result<ZipListing, Refusal> {
+/// encrypted file, an archive by name, files that are not all of one supported format, or a
+/// central directory bigger than [`MAX_ZIP_ENTRIES`] entries ([`Refusal::ZipTooManyEntries`]).
+pub fn zip_listing<R: Read + Seek>(mut reader: R) -> Result<ZipListing, Refusal> {
+    check_zip_directory(&mut reader)?;
     let mut archive = zip::ZipArchive::new(reader).map_err(|_err| Refusal::NotZip)?;
     let indices = file_indices(&mut archive)?;
     if indices.is_empty() {
@@ -978,13 +1123,15 @@ pub fn zip_listing<R: Read + Seek>(reader: R) -> Result<ZipListing, Refusal> {
 ///
 /// # Errors
 ///
-/// [`Refusal`] for a damaged archive or entry, and [`Refusal::ZipNested`] for an entry that
-/// starts like another archive.
+/// [`Refusal`] for a damaged archive or entry, [`Refusal::ZipNested`] for an entry that
+/// starts like another archive, and [`Refusal::ZipTooManyEntries`] for a central directory
+/// bigger than the API will read.
 pub fn zip_file_prefix<R: Read + Seek>(
-    reader: R,
+    mut reader: R,
     position: usize,
     limit: usize,
 ) -> Result<(Vec<u8>, bool), Refusal> {
+    check_zip_directory(&mut reader)?;
     let mut archive = zip::ZipArchive::new(reader).map_err(|_err| Refusal::NotZip)?;
     let indices = file_indices(&mut archive)?;
     let index = *indices.get(position).ok_or(Refusal::ZipEmpty)?;
@@ -1028,8 +1175,10 @@ pub fn check_zip<R: Read + Seek>(mut reader: R, cap: u64) -> Result<(), Refusal>
 /// # Errors
 ///
 /// [`Refusal::TooLargeUnpacked`] past the cap; [`Refusal::NotZip`] for a damaged archive;
-/// [`Refusal::ZipNested`] for an entry that starts like another archive.
-pub fn count_unpacked_zip<R: Read + Seek>(reader: R, cap: u64) -> Result<u64, Refusal> {
+/// [`Refusal::ZipNested`] for an entry that starts like another archive;
+/// [`Refusal::ZipTooManyEntries`] for a central directory bigger than the API will read.
+pub fn count_unpacked_zip<R: Read + Seek>(mut reader: R, cap: u64) -> Result<u64, Refusal> {
+    check_zip_directory(&mut reader)?;
     let mut archive = zip::ZipArchive::new(reader).map_err(|_err| Refusal::NotZip)?;
     let indices = file_indices(&mut archive)?;
     let mut declared = 0u64;
@@ -1486,6 +1635,51 @@ mod tests {
         );
         let forks = zipped(&[("__MACOSX/._a.csv", b"\0"), ("a.csv", b"a\n1\n")]);
         assert_eq!(zip_listing(Cursor::new(forks)).unwrap().files.len(), 1);
+    }
+
+    #[test]
+    fn pr_186_review_blocker_2_a_zip_with_more_entries_than_the_cap_is_refused_before_it_is_read() {
+        // `PR #186 review BLOCKER 2`: the central directory is built in memory before the
+        // archive can be looked at, so an archive of folders is refused on the counts it
+        // declares, without the directory being built.
+        assert!(MAX_ZIP_ENTRIES >= u64::try_from(MAX_ZIP_FILES).unwrap());
+        let folders: Vec<(String, Vec<u8>)> = (0..=MAX_ZIP_ENTRIES)
+            .map(|i| (format!("d{i}/"), Vec::new()))
+            .collect();
+        let archive = zipped(
+            &folders
+                .iter()
+                .map(|(name, data)| (name.as_str(), data.as_slice()))
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            zip_listing(Cursor::new(archive.clone())).unwrap_err(),
+            Refusal::ZipTooManyEntries
+        );
+        assert_eq!(
+            count_unpacked_zip(Cursor::new(archive.clone()), 1_000_000).unwrap_err(),
+            Refusal::ZipTooManyEntries
+        );
+        assert_eq!(
+            zip_file_prefix(Cursor::new(archive), 0, 10).unwrap_err(),
+            Refusal::ZipTooManyEntries
+        );
+        // One entry fewer is inside the cap: the archive is read and its folders are left
+        // out, as a zip of files is.
+        let fewer: Vec<(String, Vec<u8>)> = (0..MAX_ZIP_ENTRIES)
+            .map(|i| (format!("d{i}/"), Vec::new()))
+            .collect();
+        let inside = zipped(
+            &fewer
+                .iter()
+                .map(|(name, data)| (name.as_str(), data.as_slice()))
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            zip_listing(Cursor::new(inside)).unwrap_err(),
+            Refusal::ZipEmpty,
+            "the folders are not files"
+        );
     }
 
     #[test]
