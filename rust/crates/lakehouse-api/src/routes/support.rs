@@ -254,6 +254,37 @@ pub(crate) enum SpecRunFailure {
     Clickhouse(ChError),
 }
 
+/// What a caller with a data policy is told when a statement with a `RegionOf`
+/// lookup is refused (`BI-16` part C3, option B signed by the owner on
+/// 2026-10-24). The rewrite refuses every `dictGet*` call of such a caller
+/// (`sql_rewrite::DictOrJoinFunctionDenied`: a dictionary's source cannot be
+/// seen from the query text); the refusal stays, only the words change, so the
+/// caller learns which function and why, in English. The narrow exemption for
+/// the server-made `console.geo_dict_*` dictionaries is a backlog follow-up
+/// for the security team.
+pub(crate) const REGION_OF_REFUSED: &str = "RegionOf is not available to you: your role has a data policy, and the region lookup cannot be checked against it yet. Ask an administrator, or use a column that already holds the region.";
+
+/// [`crate::policy_engine::enforcement_error_message`], with the sentence
+/// above for a refused `dictGet*` call in a statement that does a `RegionOf`
+/// lookup (it names a `console.geo_dict_` dictionary); every other refusal
+/// keeps its fixed message.
+pub(crate) fn enforcement_message_for(
+    sql: &str,
+    err: &crate::policy_engine::EnforcementError,
+) -> &'static str {
+    let denied = matches!(
+        err,
+        crate::policy_engine::EnforcementError::Rewrite(
+            crate::sql_rewrite::RewriteError::DictOrJoinFunctionDenied { .. }
+        )
+    );
+    if denied && sql.contains("console.geo_dict_m_") {
+        REGION_OF_REFUSED
+    } else {
+        crate::policy_engine::enforcement_error_message(err)
+    }
+}
+
 /// The body of [`run_spec_sql`]: the rewrite for `roles`, then the query, as
 /// `{"columns", "rows"}`. An empty `sql` (text tiles) needs no query.
 ///
@@ -279,9 +310,7 @@ pub(crate) async fn try_run_spec_sql(
         obligations,
     )
     .await
-    .map_err(|err| {
-        SpecRunFailure::Refused(crate::policy_engine::enforcement_error_message(&err))
-    })?;
+    .map_err(|err| SpecRunFailure::Refused(enforcement_message_for(sql, &err)))?;
     let r = ch
         .query(&rewritten, None)
         .await
@@ -714,6 +743,26 @@ pub(crate) async fn annotate_table(
                 && lakehouse_bi::tables::pivot_trim(rows, *row_cap)
             {
                 tile.insert("truncated".to_owned(), json!(true));
+            }
+        }
+        // BI-16 part C1: the Gantt chart's reversed rows, counted through the
+        // same role rewrite; a failed count only leaves the note out.
+        Some(TableRead::Reversed { count_sql }) => {
+            match try_run_spec_sql(ch, count_sql, roles, placeholders, obligations).await {
+                Ok(counted) => {
+                    let n = counted["rows"][0]["n"].as_u64().or_else(|| {
+                        counted["rows"][0]["n"]
+                            .as_str()
+                            .and_then(|t| t.parse().ok())
+                    });
+                    if let Some(n) = n.filter(|n| *n > 0) {
+                        tile.insert("reversedRows".to_owned(), json!(n));
+                    }
+                }
+                Err(SpecRunFailure::Clickhouse(err)) => {
+                    let _logged = upstream_error::report_ch(&upstream_error::TILE, &err);
+                }
+                Err(SpecRunFailure::Refused(_)) => {}
             }
         }
         Some(TableRead::Trend { .. }) | None => {}
@@ -1199,5 +1248,40 @@ mod run_spec_sql_enforcement {
             "a refused chart SQL must never reach ClickHouse: {requests:?}"
         );
         Ok(())
+    }
+}
+
+/// `BI-16` part C3 (option B): a refused `RegionOf` lookup is told in English,
+/// naming the function; any other refusal keeps its fixed message.
+#[cfg(test)]
+mod region_of_refusal {
+    use super::*;
+    use crate::policy_engine::EnforcementError;
+    use crate::sql_rewrite::RewriteError;
+
+    fn denied() -> EnforcementError {
+        EnforcementError::Rewrite(RewriteError::DictOrJoinFunctionDenied {
+            name: "dictGetOrDefault".to_owned(),
+        })
+    }
+
+    #[test]
+    fn a_denied_region_lookup_names_region_of_and_other_dictionary_calls_keep_the_fixed_message() {
+        let lookup = "SELECT dictGetOrDefault('console.geo_dict_m_0123456789ab', 'name', (lon, lat), '') FROM t";
+        assert_eq!(
+            enforcement_message_for(lookup, &denied()),
+            REGION_OF_REFUSED
+        );
+        assert!(REGION_OF_REFUSED.starts_with("RegionOf is not available to you"));
+        let other = "SELECT dictGet('crm.people', 'email', id) FROM t";
+        assert_eq!(
+            enforcement_message_for(other, &denied()),
+            crate::policy_engine::enforcement_error_message(&denied())
+        );
+        let unparseable = EnforcementError::Rewrite(RewriteError::Unparseable);
+        assert_eq!(
+            enforcement_message_for(lookup, &unparseable),
+            crate::policy_engine::enforcement_error_message(&unparseable)
+        );
     }
 }

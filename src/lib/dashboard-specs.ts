@@ -29,7 +29,9 @@ export type ChartKind =
   // no data, no statement (BI-18 part C): a heading, a rule, and a heading that folds the tiles below it
   | "heading" | "divider" | "section"
   // BI-16 part B: a picture and a web page from a site an administrator allows (no statement)
-  | "image" | "web";
+  | "image" | "web"
+  // BI-16 part C1: one bar per task from a start to an end, grouped and coloured by a column, with a line at today
+  | "gantt";
 export type NumFmt = "int" | "float";
 /** Spec origin: builtin (seeded), AI-generated via chat, or manual via the UI. */
 export type ChartSource = "builtin" | "ai" | "ui";
@@ -78,6 +80,10 @@ export type ChartSpec = {
   /** Latitude / longitude columns of the rows, for `pointmap` and `geoheat`. */
   lat?: string;
   lon?: string;
+  /** `gantt` (BI-16 part C1, plan D1): the start, end and progress columns, beside `lat`/`lon`; the task is `x`, the group `series`. */
+  start?: string;
+  end?: string;
+  progress?: string;
   format?: NumFmt;
   /** 2 = full width in the grid. */
   span?: 1 | 2;

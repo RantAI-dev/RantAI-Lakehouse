@@ -68,6 +68,17 @@ export type CondRule = {
   target?: "cell" | "text"
 }
 
+/**
+ * `BI-17` part B (plan D2): colour the points of a scatter or bubble chart by
+ * cluster. `k` is the number of groups, 2 to 10, or "auto" (the console picks
+ * it). Mirrors `StyleFields.clusters` of `lakehouse_bi::style`, which the
+ * server validates once T1 lands; until then only the console checks it.
+ */
+export type ClusterSetting = { k: "auto" | number }
+
+export const MIN_CLUSTERS = 2
+export const MAX_CLUSTERS = 10
+
 export type StyleFields = {
   format?: ValueFormat
   valueFormats?: Record<string, ValueFormat>
@@ -78,6 +89,9 @@ export type StyleFields = {
   annotations?: Annotation[]
   tooltip?: { fields: string[] }
   conditional?: CondRule[]
+  clusters?: ClusterSetting
+  /** `gantt` (BI-16 part C1, plan section 7): `false` hides the line at today; absent means shown. T1 validates it. */
+  todayLine?: boolean
 }
 
 /** Limits the server enforces; the builder uses them to stop early. */
@@ -89,7 +103,7 @@ export const MAX_ANNOTATIONS = 20
 export const MAX_CONDITIONAL_RULES = 20
 
 /** What a reference line marks; mirrors `lakehouse_bi::params::LineKind`. */
-export type ReferenceLineKind = "value" | "average" | "median" | "min" | "max" | "trend" | "band"
+export type ReferenceLineKind = "value" | "average" | "median" | "min" | "max" | "trend" | "band" | "forecast"
 
 /**
  * A reference line as the server sends it with a tile's rows, parameters
@@ -106,4 +120,6 @@ export type ResolvedReferenceLine = {
   color?: string
   /** The value a computed line describes, by result name; absent is the first. */
   measure?: string
+  /** Periods ahead of a `forecast` line (`BI-17` part B, D1); the server validates it with T1. */
+  horizon?: number
 }

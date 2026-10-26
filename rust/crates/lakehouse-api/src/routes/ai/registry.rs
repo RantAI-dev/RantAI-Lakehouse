@@ -125,7 +125,8 @@ fn chart_kind_enum() -> Value {
         "histogram",
         "bullet",
         "image",
-        "web"
+        "web",
+        "gantt"
     ])
 }
 
@@ -147,7 +148,10 @@ fn with_type_properties(mut schema: Value) -> Value {
             "count": { "type": "integer", "minimum": 1, "maximum": 100, "description": "at most this many ranges" } },
             "description": "histogram only: give a width or a count, not both; leave out for about 20 ranges chosen automatically. The number column is `dimension`; a histogram takes no measures, breakdown, limit or order" },
         "url": { "type": "string", "description": "image and web only (required): an https address on a site an administrator allows in Admin > Settings; any other address is refused" },
-        "alt": { "type": "string", "maxLength": 200, "description": "image only (required): a short description of the picture for screen readers" }
+        "alt": { "type": "string", "maxLength": 200, "description": "image only (required): a short description of the picture for screen readers" },
+        "start": { "type": "string", "description": "gantt only (required): the date or date-time column a task starts at. A Gantt chart draws one bar per task: `dimension` is the task column, `breakdown` the optional group (colour), and `start`, `end` and the optional `progress` name columns; it takes no measures, aggregate, limit or order and shows the first 1,000 tasks by start" },
+        "end": { "type": "string", "description": "gantt only (required): the date or date-time column a task ends at; a row that ends before it starts is left out and counted" },
+        "progress": { "type": "string", "description": "gantt only (optional): a number column drawn as the share of the bar done" }
     });
     if let Some(props) = schema
         .pointer_mut("/function/parameters/properties")
@@ -438,8 +442,9 @@ fn describe_mart_schema() -> Value {
 /// parameter value, a line computed from the rows on screen, or a band.
 fn reference_lines_schema() -> Value {
     json!({ "type": "array", "maxItems": 5, "items": { "type": "object", "properties": {
-        "kind": { "type": "string", "enum": ["value", "average", "median", "min", "max", "trend", "band"],
-            "description": "value (default): a line at `value`; average, median, min, max: computed from the rows the chart shows; trend: a linear trend over them; band: a shaded band from `value` to `to`" },
+        "kind": { "type": "string", "enum": ["value", "average", "median", "min", "max", "trend", "band", "forecast"],
+            "description": "value (default): a line at `value`; average, median, min, max: computed from the rows the chart shows; trend: a linear trend over them; band: a shaded band from `value` to `to`; forecast: the series continued `horizon` periods ahead with a 95 % band (bar, line, area, stacked, combo with the date dimension grouped by minute to year, no breakdown, at most one per chart)" },
+        "horizon": { "type": "integer", "minimum": 1, "maximum": 60, "description": "forecast only, required: how many periods ahead" },
         "value": { "oneOf": [ { "type": "number" }, param_ref_schema() ], "description": "where on the value axis: a number, or {param: <a number parameter>}. Required for kind value and band; leave out for a computed line" },
         "to": { "oneOf": [ { "type": "number" }, param_ref_schema() ], "description": "band only: the other edge" },
         "label": { "type": "string", "description": "at most 60 characters" },
@@ -495,7 +500,10 @@ fn style_properties() -> Value {
             "rule": { "type": "object", "description": "{type:\"compare\",op:lt|le|gt|ge|eq|ne,value}, {type:\"between\",from,to}, {type:\"contains\",text} or {type:\"range\",colors:[2 or 3 #rrggbb]}" },
             "color": { "type": "string", "description": "#rrggbb; not for a range" },
             "target": { "type": "string", "enum": ["cell", "text"] } }, "required": ["column", "rule"] },
-            "description": "table, pivot and kpi only: colour a cell or the value by a rule, for example below 1,000 in red" }
+            "description": "table, pivot and kpi only: colour a cell or the value by a rule, for example below 1,000 in red" },
+        "clusters": { "type": ["object", "null"], "properties": {
+            "k": { "oneOf": [ { "type": "string", "enum": ["auto"] }, { "type": "integer", "minimum": 2, "maximum": 10 } ], "description": "\"auto\" (the console picks from 2 to 10) or a number of groups" } }, "required": ["k"],
+            "description": "scatter and bubble only: colour the points by cluster (k-means over the points on screen)" }
     })
 }
 
@@ -607,6 +615,12 @@ fn list_boards_schema() -> Value {
 fn suggest_dashboard_schema() -> Value {
     json!({ "type": "function", "function": { "name": "suggest_dashboard",
         "description": "Every Gold mart with its dimensions and measures at once, for proposing a set of dashboard charts.",
+        "parameters": { "type": "object", "properties": {} } } })
+}
+
+fn list_maps_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "list_maps",
+        "description": "List the maps a geomap, pointmap or geoheat chart can be drawn on: the ones that ship with the console (Jakarta, Indonesia, the world, and the states or provinces of any country) and the ones an administrator uploaded, with the id to put in `map` and a label. Call it before setting `map`.",
         "parameters": { "type": "object", "properties": {} } } })
 }
 
@@ -2375,6 +2389,15 @@ pub static TOOLS: &[ToolSpec] = &[
         risk: Risk::Read,
         permission: "query:read",
     },
+    // BI-16 part C2 (D10): the maps a chart can be drawn on, built-in and
+    // uploaded. Reading mirrors `GET /api/maps` (any signed-in caller), and the
+    // dashboard tools need `dashboard:read` anyway.
+    ToolSpec {
+        name: "list_maps",
+        schema: list_maps_schema,
+        risk: Risk::Read,
+        permission: "dashboard:read",
+    },
 ];
 
 /// The `OpenAI`-compatible `tools` schema array, matching
@@ -2447,8 +2470,8 @@ mod tests {
         // `export_dashboard` and `export_chart` (`AI-10`, with `BI-1`)
         // + `create_report_subscription`, `list_report_subscriptions`,
         // `update_report_subscription` and `delete_report_subscription`
-        // (`AI-10`, with `RPT-1`).
-        assert_eq!(tool_schemas().len(), 106);
+        // (`AI-10`, with `RPT-1`) + `list_maps` (`BI-16` part C2, `AI-5`).
+        assert_eq!(tool_schemas().len(), 107);
     }
 
     /// `RPT-1` (with `AI-10`): the report tools have the console's permission,
@@ -2557,7 +2580,7 @@ mod tests {
         // and format_chart cannot drift, and every field is a field of `lakehouse_bi::style`.
         let style = style_properties();
         let style = style.as_object().expect("an object");
-        assert_eq!(style.len(), 9);
+        assert_eq!(style.len(), 10);
         for tool in ["create_chart", "update_chart", "format_chart"] {
             let schema = (find(tool).expect("registered tool").schema)();
             let properties = &schema["function"]["parameters"]["properties"];
@@ -2746,10 +2769,19 @@ mod tests {
             let schema = (find(tool).expect("registered tool").schema)();
             let properties = &schema["function"]["parameters"]["properties"];
             let kinds = properties["kind"]["enum"].as_array().unwrap();
-            for kind in ["progress", "histogram", "bullet", "image", "web"] {
+            for kind in ["progress", "histogram", "bullet", "image", "web", "gantt"] {
                 assert!(kinds.iter().any(|k| k == kind), "{tool} lacks kind {kind}");
             }
-            for field in ["goal", "bands", "histogram", "url", "alt"] {
+            for field in [
+                "goal",
+                "bands",
+                "histogram",
+                "url",
+                "alt",
+                "start",
+                "end",
+                "progress",
+            ] {
                 assert!(properties.get(field).is_some(), "{tool} lacks {field}");
             }
             assert_eq!(
@@ -2769,7 +2801,16 @@ mod tests {
         // `format_chart` changes only the look: it takes none of them.
         let format = (find("format_chart").expect("registered tool").schema)();
         let props = &format["function"]["parameters"]["properties"];
-        for field in ["goal", "bands", "histogram", "url", "alt"] {
+        for field in [
+            "goal",
+            "bands",
+            "histogram",
+            "url",
+            "alt",
+            "start",
+            "end",
+            "progress",
+        ] {
             assert!(props.get(field).is_none(), "format_chart took {field}");
         }
     }

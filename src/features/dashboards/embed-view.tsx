@@ -8,6 +8,7 @@ import { dashboardLook } from "@/lib/dashboard-look";
 import { DashboardGrid, type GridItem } from "./dashboard-grid";
 import { ReportingProvider } from "./reporting-context";
 import { TileBody } from "./tile-body";
+import type { MapLoader } from "./echarts-maps";
 import { OwnFiltersMarker, ownFilters } from "./filters/own-filters-marker";
 import type { ChartRenderSpec } from "@/lib/dashboard-specs";
 import { selectedTab } from "@/lib/dashboard-tabs";
@@ -48,6 +49,19 @@ export function EmbedView({ token, jwt, chartId }: { token?: string; jwt?: strin
   // SEC-12: what a refused signed token reads. The public link keeps the
   // plain line.
   const [refusal, setRefusal] = React.useState(EMBED_UNAVAILABLE);
+  // PR #246 review BLOCKER 1: an uploaded map's boundary is read through the
+  // embed's own token (the signed JWT, or the public link's token), the way
+  // the board's data is — never through `apiFetch`, whose 401 would send
+  // this anonymous viewer to the login page.
+  const loadMap = React.useCallback<MapLoader>(
+    (id) => jwt
+      ? fetch(`/api/embed/maps/${encodeURIComponent(id)}/geojson`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ jwt }), cache: "no-store",
+        })
+      : fetch(`/api/public/dashboard/${encodeURIComponent(token ?? "")}/maps/${encodeURIComponent(id)}/geojson`, { cache: "no-store" }),
+    [token, jwt],
+  );
 
   // Data source: a public token (GET, read-only) OR a signed JWT embed (POST,
   // server-side locked filters). Public link: /embed/dashboard/<token>.
@@ -112,7 +126,7 @@ export function EmbedView({ token, jwt, chartId }: { token?: string; jwt?: strin
             )}
           </div>
           <div className="min-h-0 flex-1 p-2">
-            {spec ? <TileBody spec={spec} cell={data?.results[spec.id]} dark={dark} loading={state === "loading"} /> : null}
+            {spec ? <TileBody spec={spec} cell={data?.results[spec.id]} dark={dark} loading={state === "loading"} loadMap={loadMap} /> : null}
           </div>
         </div>
       </div>
@@ -128,7 +142,7 @@ export function EmbedView({ token, jwt, chartId }: { token?: string; jwt?: strin
     badge: <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">{spec.kind}</span>,
     // BI-6: the chart's own filters, listed (the viewer cannot change them).
     hint: ownFilters(spec) ? <OwnFiltersMarker filters={ownFilters(spec) ?? []} /> : null,
-    body: <TileBody spec={spec} cell={data?.results[spec.id]} dark={dark} loading={state === "loading"} />,
+    body: <TileBody spec={spec} cell={data?.results[spec.id]} dark={dark} loading={state === "loading"} loadMap={loadMap} />,
   }));
 
   return (

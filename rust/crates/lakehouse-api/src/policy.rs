@@ -145,10 +145,13 @@ pub enum Policy {
 /// this table never needs to know about path-parameter values.
 #[rustfmt::skip]
 pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
-    // ── Public: the ONLY eight routes in the whole service. (Was "six" —
+    // ── Public: the ONLY eleven routes in the whole service. (Was "six" —
     // corrected when the seventh was added, since Task A5's
     // `/api/auth/oidc/callback` had already made the old count stale; the
-    // eighth is `POST /api/embed/frame`, SEC-12.) ───────────────────────
+    // eighth is `POST /api/embed/frame`, SEC-12; the ninth is
+    // `POST /api/render/data`, BI-1; the tenth and the eleventh are the
+    // public link's and the embed's map boundary route, `PR #246 review
+    // BLOCKER 1`.) ───────────────────────────────────────────────────────
     ("GET",  "/health",                          Policy::Public),
     ("POST", "/api/embed/data",                   Policy::Public),
     // BI-1 (D3): the PDF's print view has no session; its data route is
@@ -161,6 +164,12 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // empty list for a token that is invalid.
     ("POST", "/api/embed/frame",                  Policy::Public),
     ("GET",  "/api/public/dashboard/{token}",     Policy::Public),
+    // PR #246 review BLOCKER 1: the boundary file of a map a chart on the
+    // board draws on. Public because the token is the credential, exactly as
+    // for the board's data above: a token that is not a board, and a map no
+    // chart on that board uses, are both a 404.
+    ("GET",  "/api/public/dashboard/{token}/maps/{id}/geojson", Policy::Public),
+    ("POST", "/api/embed/maps/{id}/geojson",      Policy::Public),
     ("POST", "/api/auth/login",                   Policy::Public),
     // Redirect-only, grants nothing — it only ever
     // 302s to a fixed, config-sourced IdP URL and sets a single-use flow
@@ -295,6 +304,11 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // same permission; charts and dashboards in the answer are listed only
     // to `dashboard:read` inside the handler.
     ("GET",  "/api/governance/lineage/columns", Policy::RequiresPermission("lineage:read")),
+    // BI-14 (D5, owner decision Q6): the charts that read a table, and (D1)
+    // where one chart comes from. Both read the lineage graph, so they need
+    // `lineage:read`, not `dashboard:read`: a dashboard viewer sees no lineage.
+    ("GET",  "/api/governance/lineage/used-by", Policy::RequiresPermission("lineage:read")),
+    ("GET",  "/api/dashboard/charts/{id}/lineage", Policy::RequiresPermission("lineage:read")),
     // WS3 item 17: surfaces per-connector ingest history, the same
     // audience as the base `/api/connectors` routes above.
     ("GET",  "/api/governance/ingest-runs", Policy::RequiresPermission("connector:manage")),
@@ -847,6 +861,15 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("GET",  "/api/uploads/{id}/parts",      Policy::RequiresPermission("connector:manage")),
     ("POST", "/api/uploads/{id}/complete",   Policy::RequiresPermission("connector:manage")),
 
+    // ── Uploaded maps (`BI-16` part C2b, plan D5): a map is visible to
+    //    everyone who can make charts, so reading is `RequiresAuth`; only
+    //    `settings:write` uploads, renames or deletes one. ──────────────────
+    ("GET",  "/api/maps",                    Policy::RequiresAuth),
+    ("POST", "/api/maps",                    Policy::RequiresPermission("settings:write")),
+    ("GET",  "/api/maps/{id}/geojson",       Policy::RequiresAuth),
+    ("PATCH", "/api/maps/{id}",              Policy::RequiresPermission("settings:write")),
+    ("DELETE", "/api/maps/{id}",             Policy::RequiresPermission("settings:write")),
+
     // ── Knowledge: no seeded resource — auth only. ───────────────────────
     ("GET",  "/api/knowledge/sources",       Policy::RequiresAuth),
     ("POST", "/api/knowledge/sources",       Policy::RequiresAuth),
@@ -1138,7 +1161,7 @@ mod tests {
     }
 
     #[test]
-    fn exactly_nine_public_entries_exist() {
+    fn exactly_eleven_public_entries_exist() {
         // Pre-existing drift found while landing the `/api/auth/providers`
         // route: this assertion was still pinned at 4 even though the two
         // earlier OIDC public routes (`/api/auth/oidc/start`,
@@ -1155,7 +1178,9 @@ mod tests {
         // SEC-12 added `POST /api/embed/frame`: 7 -> 8.
         // BI-1 (D3) added `POST /api/render/data`, the PDF print view's data
         // route, authenticated by its signed render token: 8 -> 9.
-        assert_eq!(public_count, 9);
+        // PR #246 review BLOCKER 1 added the public link's and the embed's
+        // map boundary route, each authenticated by its own token: 9 -> 11.
+        assert_eq!(public_count, 11);
     }
 
     /// SEC-23 (F1): adding a governance rule needs `governance:write`, the

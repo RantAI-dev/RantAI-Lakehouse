@@ -10,7 +10,7 @@
 
 use axum::body::Bytes;
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use lakehouse_bi::access::Viewer;
 use lakehouse_bi::store::{self, Board, FilterDef, StoredChartSpec};
@@ -68,34 +68,50 @@ fn token_refused() -> Response {
         .into_response()
 }
 
-/// `POST /api/embed/data` — signed-embed (Metabase-style) dashboard data.
-pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
-    // `try { jwt = String((await req.json())?.jwt ?? "") } catch { /* ignore */ }`
-    // — an unparseable body is swallowed, not a 400; it just yields an
-    // empty jwt, which the emptiness check below rejects the normal way.
-    let jwt = serde_json::from_slice::<EmbedDataBody>(&body)
-        .ok()
-        .and_then(|b| b.jwt)
-        .filter(|s| !s.is_empty());
-    let Some(jwt) = jwt else {
-        return (
-            StatusCode::BAD_REQUEST,
-            ApiJson(json!({ "error": "jwt is required" })),
-        )
-            .into_response();
-    };
+/// What a signed embed token opens: the board, its id, and the claims the
+/// token carried.
+struct EmbedGrant {
+    /// The board's id, as the token named it.
+    board_id: String,
+    /// The board, with its embed access read.
+    board: Board,
+    /// The token's claims (its locked `params`, its `iat` and `jti`).
+    claims: lakehouse_embed::EmbedClaims,
+}
 
+/// The board a signed embed token opens — or the refusal the token gets.
+///
+/// The checks and the answers are the ones `POST /api/embed/data` has always
+/// given (`SEC-12`): a missing token is a 400, an unset secret a 503, a
+/// token that does not verify (a bad signature, a missing or too-long
+/// lifetime, an expired or withdrawn token, a token without a dashboard) the
+/// one fixed 401, and a board that is not there or has embedding off a 403.
+///
+/// `PR #246 review BLOCKER 1`: the embed's map route reads the same token
+/// the same way, so the two routes cannot disagree about what a token opens.
+async fn embed_grant(state: &AppState, jwt: Option<&str>) -> Result<EmbedGrant, Box<Response>> {
+    let Some(jwt) = jwt.filter(|s| !s.is_empty()) else {
+        return Err(Box::new(
+            (
+                StatusCode::BAD_REQUEST,
+                ApiJson(json!({ "error": "jwt is required" })),
+            )
+                .into_response(),
+        ));
+    };
     // SEC-12: the secret is configuration only. Unset means signed embedding
     // is unavailable, said plainly; nothing is generated or stored.
     let Some(secret) = state.config.embed_secret.as_deref() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            ApiJson(json!({ "error": EMBEDDING_NOT_CONFIGURED })),
-        )
-            .into_response();
+        return Err(Box::new(
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                ApiJson(json!({ "error": EMBEDDING_NOT_CONFIGURED })),
+            )
+                .into_response(),
+        ));
     };
     let claims = match lakehouse_embed::verify_embed(
-        &jwt,
+        jwt,
         secret,
         state.config.embed_token_max_lifetime_seconds,
         lakehouse_embed::unix_now(),
@@ -105,34 +121,29 @@ pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
             // SEC-12: the reason is for the log only; the response is one
             // fixed message so a caller cannot tell which check failed.
             tracing::info!(%reason, "signed embed token refused");
-            return token_refused();
+            return Err(Box::new(token_refused()));
         }
     };
-
     let Some(board_id) = claims
         .resource
-        .and_then(|r| r.dashboard)
+        .as_ref()
+        .and_then(|r| r.dashboard.as_deref())
         .filter(|d| !d.is_empty())
     else {
-        return token_refused();
+        return Err(Box::new(token_refused()));
     };
-
-    let board = match store::get_board(&state.clickhouse, &board_id, &Viewer::anonymous()).await {
+    let board = match store::get_board(&state.clickhouse, board_id, &Viewer::anonymous()).await {
         Ok(b) => b,
-        Err(err) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ApiJson(upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json()),
-            )
-                .into_response();
-        }
+        Err(err) => return Err(Box::new(database_failure(&err))),
     };
     let Some(board) = board.filter(|b| b.embed_enabled.unwrap_or(false)) else {
-        return (
-            StatusCode::FORBIDDEN,
-            ApiJson(json!({ "error": "embedding_disabled" })),
-        )
-            .into_response();
+        return Err(Box::new(
+            (
+                StatusCode::FORBIDDEN,
+                ApiJson(json!({ "error": "embedding_disabled" })),
+            )
+                .into_response(),
+        ));
     };
     // SEC-12: withdrawal is read on every request — the board's embed events
     // are aggregated on each read, with no cache in this process — so
@@ -146,11 +157,32 @@ pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
         claims.iat.unwrap_or(f64::NEG_INFINITY),
         claims.jti.as_deref(),
     ) {
-        return token_refused();
+        return Err(Box::new(token_refused()));
     }
+    Ok(EmbedGrant {
+        board_id: board_id.to_owned(),
+        board,
+        claims,
+    })
+}
+
+/// `POST /api/embed/data` — signed-embed (Metabase-style) dashboard data.
+pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
+    // `try { jwt = String((await req.json())?.jwt ?? "") } catch { /* ignore */ }`
+    // — an unparseable body is swallowed, not a 400; it just yields an
+    // empty jwt, which the emptiness check inside the token check rejects the
+    // normal way.
+    let jwt = serde_json::from_slice::<EmbedDataBody>(&body)
+        .ok()
+        .and_then(|b| b.jwt);
+    let grant = match embed_grant(&state, jwt.as_deref()).await {
+        Ok(grant) => grant,
+        Err(refusal) => return *refusal,
+    };
+    let board = grant.board;
 
     let mut filters = board.filters.clone().unwrap_or_default();
-    filters.extend(params_to_filters(claims.params));
+    filters.extend(params_to_filters(grant.claims.params));
 
     let time = match crate::routes::settings::time_context(&state).await {
         Ok(t) => t,
@@ -167,7 +199,7 @@ pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
         &state.clickhouse,
         &PolicyEngineObligations::from_state(&state),
         &board,
-        &board_id,
+        &grant.board_id,
         &filters,
         &time,
         &format,
@@ -477,11 +509,7 @@ pub async fn public_dashboard(
         }
     };
     let Some(board) = board else {
-        return (
-            StatusCode::NOT_FOUND,
-            ApiJson(json!({ "error": "not_found" })),
-        )
-            .into_response();
+        return not_found();
     };
 
     let filters = board.filters.clone().unwrap_or_default();
@@ -522,6 +550,102 @@ pub async fn public_dashboard(
         )
             .into_response(),
     }
+}
+
+/// `GET /api/public/dashboard/{token}/maps/{id}/geojson` — the boundary
+/// file of a map one of this board's charts draws on.
+///
+/// `PR #246 review BLOCKER 1`: the public link reads a map's boundary
+/// through its own token, the way it reads the board's data: a token that
+/// is not a board is a 404, exactly as `GET /api/public/dashboard/{token}`
+/// answers, and a map no chart on that board draws on is the same 404.
+pub async fn public_map_geojson(
+    State(state): State<AppState>,
+    Path((token, id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    let board = match store::get_board_by_token(&state.clickhouse, &token).await {
+        Ok(b) => b,
+        Err(err) => return database_failure(&err),
+    };
+    let Some(board) = board else {
+        return not_found();
+    };
+    map_for_board(&state, &board.id, &id, &headers).await
+}
+
+/// `POST /api/embed/maps/{id}/geojson` — the boundary file of a map one of
+/// the embedded board's charts draws on. The body is `{ jwt }`, exactly as
+/// `POST /api/embed/data` takes it, and it opens the same board.
+///
+/// `PR #246 review BLOCKER 1`: the console's `ensureMap` fetched a map
+/// through `apiFetch`, whose 401 sends the browser to the login page — an
+/// anonymous viewer of an embed has no account to log into. The embed reads
+/// its boundary here instead, and a map no chart on that board draws on is a
+/// 404, so the token reads the board it opens and nothing else.
+pub async fn embed_map_geojson(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let jwt = serde_json::from_slice::<EmbedDataBody>(&body)
+        .ok()
+        .and_then(|b| b.jwt);
+    let grant = match embed_grant(&state, jwt.as_deref()).await {
+        Ok(grant) => grant,
+        Err(refusal) => return *refusal,
+    };
+    map_for_board(&state, &grant.board_id, &id, &headers).await
+}
+
+/// The map file `id` for a board that may open it.
+///
+/// The token is the credential, and the token's board is what it opens: the
+/// file is served only when a chart on that board draws on that map, and the
+/// answer is a 404 otherwise — the same answer for a map the board does not
+/// use, for a map that does not exist and for a map id that is not
+/// server-made, so the route is no oracle for what a board holds.
+async fn map_for_board(
+    state: &AppState,
+    board_id: &str,
+    id: &str,
+    headers: &HeaderMap,
+) -> Response {
+    let maps = match board_map_ids(state, board_id).await {
+        Ok(maps) => maps,
+        Err(err) => return database_failure(&err),
+    };
+    if !maps.iter().any(|m| m == id) {
+        return not_found();
+    }
+    match super::maps::map_file(state, id, headers).await {
+        Ok(response) => response,
+        Err(rejection) => rejection.into_response(),
+    }
+}
+
+/// The map ids the charts on `board_id` draw on.
+///
+/// The charts are read as nobody in particular, exactly as the embed and the
+/// public payload read them ([`board_cards`]): a chart in the trash or on a
+/// personal board is not on this board.
+async fn board_map_ids(state: &AppState, board_id: &str) -> Result<Vec<String>, ChError> {
+    let stored = store::list_stored_charts(&state.clickhouse, &Viewer::anonymous()).await?;
+    Ok(board_cards(&stored, board_id)
+        .into_iter()
+        .filter_map(|c| c.def.map.clone())
+        .collect())
+}
+
+/// The 404 every refused public answer gives: the same body and status the
+/// public dashboard route gives for a token that is not a board.
+fn not_found() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        ApiJson(json!({ "error": "not_found" })),
+    )
+        .into_response()
 }
 
 /// A chart as an embed or a public link shows it: the render spec of the

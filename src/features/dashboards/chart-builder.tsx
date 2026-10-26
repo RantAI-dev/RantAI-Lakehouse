@@ -8,7 +8,7 @@ import { useTheme } from "next-themes";
 import {
   CalendarDays, ChartBar, ChartCandlestick, ChartColumn, ChartLine, ChartPie, ChevronDown, ChevronRight, Code, Flame, Gauge, Workflow,
   Map, MapPin, PanelLeftClose, PanelLeftOpen, Pencil, Plus, ScatterChart, Search, SlidersHorizontal, Table2, Type, type LucideIcon,
-  ChartNoAxesColumn, Globe, Image as ImageIcon, Target,
+  ChartNoAxesColumn, ChartNoAxesGantt, Globe, Image as ImageIcon, Target,
 } from "lucide-react";
 import {
   Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription,
@@ -70,7 +70,9 @@ import {
   GRAIN_LABELS, columnKindOfType, grainChoices, isGrain, isTruncation, limitAfterGrainPick, limitHasEffect, type ColumnKind, type Grain,
 } from "@/lib/time-grain";
 import { cn } from "@/lib/utils";
-import { DEFAULT_CHOROPLETH_MAP, DEFAULT_POINT_MAP, MAP_CATALOGUE, mapCredit } from "./echarts-maps";
+import { MapPicker } from "./map-picker";
+import { DEFAULT_CHOROPLETH_MAP, DEFAULT_POINT_MAP, mapCredit } from "./echarts-maps";
+import { useMapCatalogue } from "./use-map-catalogue";
 import { SqlRowsTable, SqlSourcePanel } from "./sql-source-panel";
 import { selectedMart, type Mart } from "./mart-marks";
 import { JoinsSection, type JoinTableInfo } from "./joins-section";
@@ -92,7 +94,7 @@ import { ValueGroupDialog } from "./value-group-dialog";
 import { HierarchyDialog } from "./hierarchy-dialog";
 import { TileBody } from "./tile-body";
 import { useReporting } from "./reporting-context";
-import { BandFields, CardFields, GoalFields, HistogramFields } from "./type-b-fields";
+import { BandFields, CardFields, GanttFields, GoalFields, HistogramFields } from "./type-b-fields";
 import {
   emptyTypeDraft, goalMeasureColumn, takesGoal, typeDraftFromDef, typePayload, typeProblems, urlProblem,
   type TypeDefFields, type TypeDraft,
@@ -172,6 +174,9 @@ export const KIND_GROUPS: { group: string; items: { value: ChartKind; label: str
     { value: "boxplot", label: "Box plot (distribution)" },
     { value: "histogram", label: "Histogram (spread of a number)" },
   ] },
+  { group: "Schedule", items: [
+    { value: "gantt", label: "Gantt (tasks over time)" },
+  ] },
   { group: "Flow", items: [
     { value: "sankey", label: "Sankey (flow between 2 dimensions)" },
   ] },
@@ -228,7 +233,6 @@ function withCalculated(base: Fields, columns: string[], calculated: CalcField[]
   return { dimensions, measures, kinds, columns, calculated };
 }
 /** Map id → label for the base-ui select (see KIND_LABELS). */
-const MAP_LABELS: Record<string, string> = Object.fromEntries(MAP_CATALOGUE.map((m) => [m.id, m.label]));
 const NO_LABEL_ITEMS: Record<string, string> = { [NO_BREAKDOWN]: "— no label —" };
 const SPAN_LABELS: Record<string, string> = { "1": "Half width", "2": "Full width" };
 /** Whether the viewport is at least `px` wide; false on the server. */
@@ -268,6 +272,7 @@ const KIND_DESCRIPTIONS: Record<ChartKind, string> = {
   calendar: "Spot daily patterns on a calendar",
   progress: "Show a value against its goal, with the percentage reached",
   histogram: "Count how many rows fall in each range of a number",
+  gantt: "Lay tasks on a time axis, one bar from start to end, with a line at today",
   bullet: "Compare a value with a target and ranges such as poor, fair and good",
   image: "Show a picture from an allowed site", web: "Show a web page from an allowed site",
   // BI-18 part C: added from the dashboard's "Add" menu, never picked here; present only to satisfy the record.
@@ -285,6 +290,7 @@ const KIND_KEYWORDS: Partial<Record<ChartKind, string>> = {
   pivot: "pivot cross tab crosstab matrix totals subtotals",
   table: "table rows raw columns grid",
   histogram: "distribution spread frequency bins ranges buckets",
+  gantt: "timeline schedule project plan tasks milestones jadwal",
   progress: "goal target percent percentage bar completion",
   bullet: "target bands goal poor fair good performance",
   image: "picture logo photo png jpg gambar",
@@ -304,6 +310,7 @@ function kindIcon(kind: ChartKind): LucideIcon {
   if (kind === "calendar") return CalendarDays;
   if (kind === "kpi" || kind === "gauge" || kind === "progress") return Gauge;
   if (kind === "histogram") return ChartNoAxesColumn;
+  if (kind === "gantt") return ChartNoAxesGantt;
   if (kind === "bullet") return Target;
   if (kind === "image") return ImageIcon;
   if (kind === "web") return Globe;
@@ -473,6 +480,11 @@ export function ChartBuilder({
   const isProgress = kind === "progress";
   const isHistogram = kind === "histogram";
   const isBullet = kind === "bullet";
+  // BI-16 part C1 (plan D1): the task is the dimension, the group the breakdown, the start, end and progress columns are the type draft's.
+  const isGantt = kind === "gantt";
+  // BI-16 C2b: the bundled maps and the uploaded ones, by name.
+  const mapCatalogue = useMapCatalogue();
+  const mapLabels = React.useMemo<Record<string, string>>(() => Object.fromEntries(mapCatalogue.map((m) => [m.id, m.label])), [mapCatalogue]);
   const isSingle = isKpi || isGauge || isProgress;         // no dimension (single number)
   const isHeatmap = kind === "heatmap";
   // Kinds drawn from the breakdown shape (x, series, value): a 2nd
@@ -488,7 +500,7 @@ export function ChartBuilder({
   // A pivot and a raw table name their columns in their own fields, not as a dimension and measures.
   const ownColumns = isPivot || (kind === "table" && tableDraft.mode === "rows");
   // A histogram counts the rows of its column: it takes no measure either.
-  const noMeasures = ownColumns || isHistogram;
+  const noMeasures = ownColumns || isHistogram || isGantt;
   const rowsMode = kind === "table" && tableDraft.mode === "rows";
   // BI-6: a grouped table lists its groupings; the first is also its `dimension`.
   const isGroupedTable = kind === "table" && !rowsMode;
@@ -506,7 +518,10 @@ export function ChartBuilder({
   );
   const metricRow = measureRows.find((r) => isMetricColumn(r.column));
   const pickedMetric = metricRow ? (fields?.metrics ?? []).find((m) => m.name === metricNameOf(metricRow.column)) : undefined;
-  // Fix the number of measure rows to what the kind takes.
+  // Fix the number of measure rows to what the kind takes. BI-17 B QA fix F2: it also runs when the
+  // rows themselves change length, because picking the data source (and resetting the form) puts
+  // back one blank row, which left a scatter with an X metric and no Y metric.
+  const measureRowCount = measureRows.length;
   React.useEffect(() => {
     setMeasureRows((rows) => {
       if (rows.length === Math.min(Math.max(rows.length, limits.min), limits.max || 1) && rows.length >= limits.min) return rows;
@@ -514,7 +529,7 @@ export function ChartBuilder({
       while (next.length < limits.min) next.push({ column: "", aggregate: "" });
       return next;
     });
-  }, [limits.min, limits.max]);
+  }, [limits.min, limits.max, measureRowCount]);
   const sourceColumns = React.useMemo<SourceColumns>(() => ({
     all: [...(fields?.dimensions ?? []), ...(fields?.measures ?? [])],
     dates: Object.entries(fields?.kinds ?? {}).filter(([, k]) => k === "date" || k === "datetime").map(([name]) => name),
@@ -585,7 +600,7 @@ export function ChartBuilder({
     setLat((l) => l || guessed.lat || "");
     setLon((l) => l || guessed.lon || "");
   }, [isPoints, fields, coordinateColumns]);
-  const canBreakdown = kind === "bar" || kind === "hbar" || kind === "line" || kind === "area" || needsBreakdown;
+  const canBreakdown = kind === "bar" || kind === "hbar" || kind === "line" || kind === "area" || needsBreakdown || isGantt;
   // BI-10: a number column can be the dimension or the breakdown when it is put in bins; a table does
   // that per grouping, a pivot on its first number row or column field.
   const onSqlSource = choice?.kind === "sql" || source === NEW_SQL_CHOICE;
@@ -623,8 +638,8 @@ export function ChartBuilder({
   const pivotNumberField = isPivot ? [...tableDraft.pivotRows, ...tableDraft.pivotColumns].find((c) => isNumber(c)) : undefined;
   const mLabels = isSingle ? ["Measure"] : MEASURE_LABELS[kind] ?? ["Measure (Y)"];
   const measureTitle = (i: number) => (limits.max > 1 && limits.max === limits.min ? mLabels[i] ?? `Measure ${i + 1}` : i === 0 ? mLabels[0] : `Measure ${i + 1}`);
-  const dimensionLabel = isChoropleth ? "Region column" : isPoints ? "Label" : isHistogram ? "Number column" : isBullet ? "Category" : "Dimension (X)";
-  const breakdownLabel = kind === "sankey" ? "Flows to" : kind === "sunburst" ? "Outer ring" : isHeatmap ? "2nd dimension (Y)" : "Breakdown / series";
+  const dimensionLabel = isChoropleth ? "Region column" : isPoints ? "Label" : isHistogram ? "Number column" : isGantt ? "Task column" : isBullet ? "Category" : "Dimension (X)";
+  const breakdownLabel = isGantt ? "Group" : kind === "sankey" ? "Flows to" : kind === "sunburst" ? "Outer ring" : isHeatmap ? "2nd dimension (Y)" : "Breakdown / series";
   // Phase 2 QA R20: the title is built from the labels the pickers show (a metric's label, a
   // joined column's own name), never the stored reference (`metric:name`, `table__column`).
   const titleText = (name: string) => (name ? columnRef(name, {
@@ -945,7 +960,7 @@ export function ChartBuilder({
     groupings: shape.groupings.map((g) => g.column), rowColumns: tableDraft.columns,
     pivot: { rows: tableDraft.pivotRows, columns: tableDraft.pivotColumns, values: tableDraft.pivotValues.filter((v) => v.column).map((v) => v.column) },
     measures: measureRows.filter((r) => r.column).map((r) => measureLabel(limits.own ? r : { ...r, aggregate: "" }, wholeMeasure, aggregate)),
-    mapLabel: isMap ? MAP_LABELS[effectiveMap] ?? "" : "", lat, lon,
+    mapLabel: isMap ? mapLabels[effectiveMap] ?? "" : "", lat, lon,
     sort: rules.sort === "choice" ? sortLabels[shape.sortChoice] ?? "" : rules.sort === "by-date" ? "by date" : rules.sort === "by-category" ? "by category" : "",
     limit: rules.limit ? (limitParamName ? "param" : Math.min(limit, maxLimit)) : null,
     filters: rules.filters ? shape.filters.length : 0, other: shape.other && rules.other.shown,
@@ -992,6 +1007,14 @@ export function ChartBuilder({
       const wrong = urlProblem(typeDraft.url, sites);
       if (wrong && !forPreview) throw new Error(wrong);
       payload = { title: payloadTitle, kind, span, board: targetBoard, ...typePayload(kind, typeDraft) };
+    } else if (isGantt) {
+      // BI-16 part C1 (plan D1): no measure, aggregate, order or limit; the statement is the server's `gantt_sql`.
+      payload = {
+        title: payloadTitle, ...sourcePayload(withSource), kind, dimension, span, board: targetBoard,
+        breakdown: breakdown || undefined,
+        ...typePayload(kind, typeDraft),
+        ...shapeOut(),
+      };
     } else if (isHistogram) {
       payload = {
         title: payloadTitle, ...sourcePayload(withSource), kind, dimension, span, board: targetBoard,
@@ -1377,10 +1400,8 @@ export function ChartBuilder({
           {isMap ? (
             <div className="grid gap-1.5">
               <Label>Map</Label>
-              <Select value={effectiveMap} items={MAP_LABELS} onValueChange={(v) => setMapId(v ?? "")}>
-                <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
-                <SelectContent>{MAP_CATALOGUE.map((m) => <SelectItem key={m.id} value={m.id}>{m.label}</SelectItem>)}</SelectContent>
-              </Select>
+              {/* BI-16 C2a follow-up (planner, picker search): about 250 maps need a search. */}
+              <MapPicker maps={mapCatalogue} value={effectiveMap} onChange={setMapId} />
               {mapCredit(effectiveMap) ? <p className="text-xs text-muted-foreground">{mapCredit(effectiveMap)}</p> : null}
               {isChoropleth ? (
                 <p className="text-xs text-muted-foreground">The region column is matched to the map by name; rows that match no region are counted under the map.</p>
@@ -1522,6 +1543,13 @@ export function ChartBuilder({
           ) : null}
           {isBullet ? <BandFields draft={typeDraft} onChange={changeType} /> : null}
           {isHistogram ? <HistogramFields draft={typeDraft} onChange={changeType} /> : null}
+          {isGantt ? (
+            <GanttFields
+              draft={typeDraft} onChange={changeType} fieldLabel={fieldLabel} disabled={!fields} placeholder={noFieldsHint}
+              dateColumns={coordinateColumns.filter((c) => fields?.kinds?.[c] === "date" || fields?.kinds?.[c] === "datetime")}
+              numberColumns={numberColumns}
+            />
+          ) : null}
           {isPivot ? (
             <>
               <PivotSection draft={tableDraft} onChange={setTableDraft} columns={sourceColumns} />
@@ -1615,7 +1643,7 @@ export function ChartBuilder({
           {/* BI-17 part A: formats, colours, axes, labels, reference lines, notes, tooltip; conditional colours for tables and KPIs. */}
           <FoldSection number={5} title="Format" open={formatOpen} onOpenChange={setFormatOpen} panelRef={(n) => { panelRefs.current[5] = n; }}>
             <FormatSection rules={fmtRules} style={style} onChange={setStyle} valueNames={formatValueNames} seriesNames={formatValueNames} paletteValue={effectivePalette(style, palette, isEdit)}>
-              {rules.referenceLines ? <ReferenceLinesEditor value={refLines} onChange={setRefLines} numberParams={numberParamDefs} valueNames={resultNames} /> : null}
+              {rules.referenceLines ? <ReferenceLinesEditor value={refLines} onChange={setRefLines} numberParams={numberParamDefs} valueNames={resultNames} takesForecast={kind !== "hbar"} /> : null}
             </FormatSection>
           </FoldSection>
         </>
