@@ -9,15 +9,22 @@
 //!
 //! # Claiming without sending twice (feature decision 8)
 //!
-//! [`claim_due`] reads the due rows with `FOR UPDATE SKIP LOCKED`, moves each
-//! one's `next_run_at` forward and commits, in one transaction. Two API
-//! processes running it at once get disjoint rows: the second skips what the
-//! first has locked, and after the commit the rows are no longer due. The next
-//! time is computed from the claim time by the caller's closure (see
+//! [`claim_due`] reads the due row with `FOR UPDATE SKIP LOCKED`, moves its
+//! `next_run_at` forward and commits, in one transaction. Two API processes
+//! running it at once get disjoint rows: the second skips what the first has
+//! locked, and after the commit the rows are no longer due. The next time is
+//! computed from the claim time by the caller's closure (see
 //! [`crate::report_schedule`]), so a send that was missed while the API was down
-//! is claimed once, not once per missed time. A process that dies between the
-//! claim and the send loses that one send; it is never sent twice. The runner
-//! records nothing for a send it did not make.
+//! is claimed once, not once per missed time.
+//!
+//! One row at a time (`PR #204` review (SHOULD-FIX) 2): the claim and the
+//! send that follows it are two moments, and a process that dies between them
+//! loses that one send. A batch of five would move five rows forward and lose
+//! up to five sends. The caller takes the next row when it is done with this
+//! one, until nothing is due.
+//!
+//! A process that dies between the claim and the send loses that one send; it
+//! is never sent twice. The runner records nothing for a send it did not make.
 //!
 //! # What is never stored
 //!
@@ -409,13 +416,14 @@ pub async fn retry_at(pool: &PgPool, id: Uuid, at: OffsetDateTime) -> Result<boo
     Ok(done.rows_affected() > 0)
 }
 
-/// Take the subscriptions that are due at `now`, at most `limit`, oldest first,
-/// and move each one's next due time forward in the same transaction (see the
-/// module doc). `next_after` works the new time out from the claim; `None`
-/// means the schedule cannot be worked out, and that row is paused with
-/// [`UNSCHEDULABLE_REASON`] and not returned.
+/// Take the subscription that is due at `now`, the oldest first, and move its
+/// next due time forward in the same transaction (see the module doc).
+/// `next_after` works the new time out from the claim; `None` means the
+/// schedule cannot be worked out, and that row is paused with
+/// [`UNSCHEDULABLE_REASON`] and the next due row is taken instead.
 ///
-/// The returned rows still hold the time they were due.
+/// The returned row still holds the time it was due. `None` means nothing was
+/// due.
 ///
 /// # Errors
 ///
@@ -423,45 +431,46 @@ pub async fn retry_at(pool: &PgPool, id: Uuid, at: OffsetDateTime) -> Result<boo
 pub async fn claim_due<F>(
     pool: &PgPool,
     now: OffsetDateTime,
-    limit: i64,
     next_after: F,
-) -> Result<Vec<Subscription>, StoreError>
+) -> Result<Option<Subscription>, StoreError>
 where
     F: Fn(&Subscription) -> Option<OffsetDateTime>,
 {
     let mut tx = pool.begin().await?;
     let sql = format!(
         "SELECT {SUBSCRIPTION_COLUMNS} FROM report_subscription \
-         WHERE NOT paused AND next_run_at <= $1 ORDER BY next_run_at, id LIMIT $2 \
+         WHERE NOT paused AND next_run_at <= $1 ORDER BY next_run_at, id LIMIT 1 \
          FOR UPDATE SKIP LOCKED"
     );
-    // safe: only constant column lists are formatted in; values are bound (SEC-41).
-    let due: Vec<Subscription> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
-        .bind(now)
-        .bind(limit)
-        .fetch_all(&mut *tx)
-        .await?;
-    let mut claimed = Vec::with_capacity(due.len());
-    for row in due {
+    loop {
+        // safe: only constant column lists are formatted in; values are bound (SEC-41).
+        let due: Option<Subscription> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+            .bind(now)
+            .fetch_optional(&mut *tx)
+            .await?;
+        let Some(row) = due else {
+            tx.commit().await?;
+            return Ok(None);
+        };
         if let Some(next) = next_after(&row) {
             sqlx::query("UPDATE report_subscription SET next_run_at = $2 WHERE id = $1")
                 .bind(row.id)
                 .bind(next)
                 .execute(&mut *tx)
                 .await?;
-            claimed.push(row);
-        } else {
-            sqlx::query(
-                "UPDATE report_subscription SET paused = TRUE, paused_reason = $2 WHERE id = $1",
-            )
-            .bind(row.id)
-            .bind(UNSCHEDULABLE_REASON)
-            .execute(&mut *tx)
-            .await?;
+            tx.commit().await?;
+            return Ok(Some(row));
         }
+        // The schedule cannot be worked out: the row pauses itself and the next
+        // due row is taken, so one unschedulable row does not hold up the rest.
+        sqlx::query(
+            "UPDATE report_subscription SET paused = TRUE, paused_reason = $2 WHERE id = $1",
+        )
+        .bind(row.id)
+        .bind(UNSCHEDULABLE_REASON)
+        .execute(&mut *tx)
+        .await?;
     }
-    tx.commit().await?;
-    Ok(claimed)
 }
 
 /// How a send ended, as the table stores it.

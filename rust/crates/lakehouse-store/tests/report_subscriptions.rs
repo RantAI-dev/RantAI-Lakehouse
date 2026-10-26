@@ -226,10 +226,13 @@ async fn claiming_takes_only_due_unpaused_rows_and_moves_them_forward(
         .unwrap();
 
     let next = now + Duration::days(7);
-    let claimed = claim_due(&pool, now, 5, |_| Some(next)).await.unwrap();
-    assert_eq!(claimed.iter().map(|s| s.id).collect::<Vec<_>>(), [due.id]);
+    let claimed = claim_due(&pool, now, |_| Some(next))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed.id, due.id);
     assert!(
-        claimed[0].next_run_at < now,
+        claimed.next_run_at < now,
         "the row returned still holds the time it was due"
     );
     let stored = get(&pool, due.id).await.unwrap().unwrap();
@@ -238,15 +241,13 @@ async fn claiming_takes_only_due_unpaused_rows_and_moves_them_forward(
         "the stored time moved forward"
     );
     // A second claim finds nothing: a missed run happens once.
-    assert_eq!(
-        claim_due(&pool, now, 5, |_| Some(next)).await.unwrap(),
-        [] as [lakehouse_store::report_subscriptions::Subscription; 0]
-    );
+    assert_eq!(claim_due(&pool, now, |_| Some(next)).await.unwrap(), None);
     Ok(())
 }
 
+/// `PR #204` review (SHOULD-FIX) 2: one row at a time, the oldest first.
 #[sqlx::test(migrations = "../../migrations")]
-async fn claiming_respects_the_limit_oldest_first(pool: PgPool) -> sqlx::Result<()> {
+async fn claiming_takes_one_row_at_a_time_oldest_first(pool: PgPool) -> sqlx::Result<()> {
     let owner = user(&pool, "owner").await;
     let now = OffsetDateTime::now_utc();
     let mut ids = Vec::new();
@@ -263,14 +264,26 @@ async fn claiming_respects_the_limit_oldest_first(pool: PgPool) -> sqlx::Result<
         .unwrap();
         ids.push((minutes, s.id));
     }
-    let claimed = claim_due(&pool, now, 2, |_| Some(now + Duration::days(1)))
-        .await
-        .unwrap();
-    let oldest_two: Vec<Uuid> = [30, 20]
+    let mut claimed = Vec::new();
+    for _ in 0..3 {
+        let row = claim_due(&pool, now, |_| Some(now + Duration::days(1)))
+            .await
+            .unwrap()
+            .unwrap();
+        claimed.push(row.id);
+    }
+    let oldest_first: Vec<Uuid> = [30, 20, 10]
         .iter()
         .map(|m| ids.iter().find(|(x, _)| x == m).unwrap().1)
         .collect();
-    assert_eq!(claimed.iter().map(|s| s.id).collect::<Vec<_>>(), oldest_two);
+    assert_eq!(claimed, oldest_first);
+    // Nothing is due any more.
+    assert_eq!(
+        claim_due(&pool, now, |_| Some(now + Duration::days(1)))
+            .await
+            .unwrap(),
+        None
+    );
     Ok(())
 }
 
@@ -300,17 +313,24 @@ async fn a_row_locked_by_another_claim_is_skipped(pool: PgPool) -> sqlx::Result<
     assert_eq!(locked.len(), 4);
     // The second claims on its own connection and gets nothing, without waiting.
     let started = std::time::Instant::now();
-    let second = claim_due(&pool, now, 5, |_| Some(now + Duration::days(1)))
+    let second = claim_due(&pool, now, |_| Some(now + Duration::days(1)))
         .await
         .unwrap();
-    assert!(second.is_empty(), "locked rows are skipped");
+    assert_eq!(second, None, "locked rows are skipped");
     assert!(started.elapsed() < std::time::Duration::from_secs(5));
     holder.rollback().await?;
-    // Once released, they are claimable.
-    let third = claim_due(&pool, now, 5, |_| Some(now + Duration::days(1)))
-        .await
-        .unwrap();
-    assert_eq!(third.len(), 4);
+    // Once released, they are claimable, one at a time.
+    let mut claimed = Vec::new();
+    for _ in 0..4 {
+        claimed.push(
+            claim_due(&pool, now, |_| Some(now + Duration::days(1)))
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+        );
+    }
+    assert_eq!(claimed.len(), 4);
     Ok(())
 }
 
@@ -328,16 +348,16 @@ async fn two_claims_at_once_get_disjoint_rows(pool: PgPool) -> sqlx::Result<()> 
     }
     let later = now + Duration::days(1);
     let (a, b) = tokio::join!(
-        claim_due(&pool, now, 5, |_| Some(later)),
-        claim_due(&pool, now, 5, |_| Some(later)),
+        claim_due(&pool, now, |_| Some(later)),
+        claim_due(&pool, now, |_| Some(later)),
     );
     let (a, b) = (a.unwrap(), b.unwrap());
-    let mut all: Vec<Uuid> = a.iter().chain(b.iter()).map(|s| s.id).collect();
+    let mut all: Vec<Uuid> = [a, b].into_iter().flatten().map(|row| row.id).collect();
     let total = all.len();
     all.sort();
     all.dedup();
     assert_eq!(all.len(), total, "no row was claimed twice");
-    assert!(total <= 10);
+    assert_eq!(total, 2, "each claim took one row");
     Ok(())
 }
 
@@ -350,10 +370,7 @@ async fn a_row_whose_schedule_cannot_be_worked_out_is_paused_with_a_reason(
     let s = create(&pool, &new_sub(owner, "a", now - Duration::minutes(1)))
         .await
         .unwrap();
-    assert_eq!(
-        claim_due(&pool, now, 5, |_| None).await.unwrap(),
-        [] as [lakehouse_store::report_subscriptions::Subscription; 0]
-    );
+    assert_eq!(claim_due(&pool, now, |_| None).await.unwrap(), None);
     let stored = get(&pool, s.id).await.unwrap().unwrap();
     assert!(stored.paused);
     assert_eq!(stored.paused_reason.as_deref(), Some(UNSCHEDULABLE_REASON));
