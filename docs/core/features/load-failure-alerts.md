@@ -5,7 +5,7 @@
 | Module | Data (Sources) |
 | Backlog | `SRC-7` |
 | Spec | `docs/core/specs/src-7.md`. This page follows it row by row; anything the spec does not say is under "Beyond the spec" |
-| Status | Decisions signed 2026-10-09. In Acceptance: merged in #101 on 2026-10-12, CI green; checklist not run. Row 5 (a failed delivery shown honestly) cannot pass until `SRC-17` |
+| Status | Released (accepted 2026-10-23). Decisions signed 2026-10-09; merged in #101 on 2026-10-12, CI green. Row 5 (a failed delivery shown honestly) waited for `SRC-17`, done in #124 |
 | Plan | `docs/superpowers/plans/2026-10-08-src-7-load-failure-alerts.md` |
 
 ## Problem
@@ -91,27 +91,27 @@ Target row works as written" checkable and cover the decisions above.
 
 | # | Do this | Expect | Result |
 | --- | --- | --- | --- |
-| 1 | Spec: every Target row above works as written | Rows 6 to 10 pass | |
-| 2 | Spec: break a connector's password; run it, with a failed-run rule to an email address and one to a webhook | The run fails and an email and a webhook arrive within 5 minutes | |
-| 3 | Spec: open Sources without pressing Test | The connector list shows the failure | |
-| 4 | Spec: with no success rule, run a healthy connector | No success alert. Create a success rule for that connector; run again: one arrives | |
-| 5 | Spec: as a user without `alert:write`, create a rule; and cause a delivery to fail (a webhook that answers 500) | The user is refused; the failed delivery is shown with an honest message and no server text | |
-| 6 | Run the broken connector twice more, with a "3 in a row" rule | The rule fires once, after the third run | |
-| 7 | Upload a file that fails to load, with an upload rule in place; do not open the upload | An alert arrives within 5 minutes | |
-| 8 | Read the connector's row after rows 2 and 6, then fix the password and run | Last failure time and a count of 3; then last success time and a count of 0 | |
-| 9 | Create a "connector disabled" rule and a "schema change" rule | Both saved. They fire in the `SRC-11` and `SRC-8` checklists, not here | |
-| 10 | Read an alert from row 2 | It names the connector and the run and links to the console; no database error text | |
-| 11 | As a user who is not an administrator: create a rule for all connectors, then for another tenant's connector | Both refused with a plain message | |
-| 12 | (operator) Unset `PIPELINE_RUN_TOKEN`, restart, open the Alerts page | The page says run alerts are not being reported | |
+| 1 | Spec: every Target row above works as written | Rows 6 to 10 pass | Pass 2026-10-23 (product owner) |
+| 2 | Spec: break a connector's password; run it, with a failed-run rule to an email address and one to a webhook | The run fails and an email and a webhook arrive within 5 minutes | Pass 2026-10-23 (product owner) |
+| 3 | Spec: open Sources without pressing Test | The connector list shows the failure | Pass 2026-10-23 (product owner) |
+| 4 | Spec: with no success rule, run a healthy connector | No success alert. Create a success rule for that connector; run again: one arrives | Pass 2026-10-23 (product owner) |
+| 5 | Spec: as a user without `alert:write`, create a rule; and cause a delivery to fail (a webhook that answers 500) | The user is refused; the failed delivery is shown with an honest message and no server text | Pass 2026-10-23 (product owner) |
+| 6 | Run the broken connector twice more, with a "3 in a row" rule | The rule fires once, after the third run | Pass 2026-10-23 (product owner) |
+| 7 | Upload a file that fails to load, with an upload rule in place; do not open the upload | An alert arrives within 5 minutes | Pass 2026-10-23 (product owner) |
+| 8 | Read the connector's row after rows 2 and 6, then fix the password and run | Last failure time and a count of 3; then last success time and a count of 0 | Pass 2026-10-23 (product owner) |
+| 9 | Create a "connector disabled" rule and a "schema change" rule | Both saved. They fire in the `SRC-11` and `SRC-8` checklists, not here | Pass 2026-10-23 (product owner) |
+| 10 | Read an alert from row 2 | It names the connector and the run and links to the console; no database error text | Pass 2026-10-23 (product owner) |
+| 11 | As a user who is not an administrator: create a rule for all connectors, then for another tenant's connector | Both refused with a plain message | Pass 2026-10-23 (product owner) |
+| 12 | (operator) Unset `PIPELINE_RUN_TOKEN`, restart, open the Alerts page | The page says run alerts are not being reported | Pass 2026-10-23 (product owner) |
 
 Pre-merge check, 2026-10-12, product owner, on a separate instance built from PR #101 at `f9d488f`: the Alerts page, the six rule kinds and the Sources list were reported as conforming ("QA sudah sesuai"). No rule of a new kind was left saved on that instance. No run could be started there (it uses the shared orchestrator) and SMTP is not configured, so rows 2 to 8 and 12's restart were not exercised; the g6 gate proved a failed run reaching the connector's row in 21 to 26 seconds on PR #101. This is not the acceptance run.
 
-**Accepted by:** __________ **Date:** ______ **Build:** ______
+**Accepted by:** product owner (held in the base) **Date:** 2026-10-23 **Build:** main 0e5498d2
 
 Exceptions, each with an owner and a date:
 
 ## After acceptance
 
 - [ ] `PRODUCT.md` section 2 and 3 updated
-- [ ] `BACKLOG.md` item moved to Done; follow-ups added
+- [x] `BACKLOG.md` item moved to Done; follow-ups added
 - [ ] `CHANGELOG.md` entry a customer can read

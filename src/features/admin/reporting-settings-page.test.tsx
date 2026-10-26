@@ -59,6 +59,20 @@ const DEFAULTS = {
   reportAllowedDomains: [],
 }
 
+/**
+ * What the server sends a caller without `settings:write` (`PR #204` review
+ * SHOULD-FIX 3): the two lists only an administrator may read are absent.
+ */
+const READER_DEFAULTS = {
+  timeZone: "Asia/Jakarta",
+  weekStart: "monday",
+  saved: false,
+  numberLocale: "en-US",
+  companyPalette: [],
+  fonts: ["inter", "ibm-plex-sans", "source-serif", "jetbrains-mono", "system"],
+  contentSites: [],
+}
+
 describe("ReportingSettingsForm", () => {
   it("shows the zone in use and the first day, and offers Save only to a writer", async () => {
     mockSettings(DEFAULTS)
@@ -173,7 +187,7 @@ describe("ReportingSettingsForm", () => {
     expect(screen.queryByRole("button", { name: "Remove https://img.example" })).toBeNull()
   })
 
-  it("lists the roles that may not download, saves the chosen ones, and shows them read-only without settings:write", async () => {
+  it("lists the roles that may not download and saves the chosen ones", async () => {
     const calls = mockSettings({ ...DEFAULTS, downloadDeniedRoles: ["Viewer"] })
     render(<ReportingSettingsForm canWrite zoneList={zoneList} />)
     expect(await screen.findByRole("heading", { name: "Downloads" })).toBeDefined()
@@ -186,12 +200,14 @@ describe("ReportingSettingsForm", () => {
     await waitFor(() => expect(calls.some((c) => c.method === "PUT")).toBe(true))
     const sent = JSON.parse(calls.find((c) => c.method === "PUT")?.body ?? "{}")
     expect(sent.downloadDeniedRoles).toEqual(["Analyst", "Viewer"])
+  })
 
-    cleanup()
-    mockSettings({ ...DEFAULTS, downloadDeniedRoles: ["Viewer"] })
+  it("shows no downloads section to a caller who may not read the list (PR #204 review SHOULD-FIX 3)", async () => {
+    mockSettings(READER_DEFAULTS)
     render(<ReportingSettingsForm canWrite={false} zoneList={zoneList} />)
-    const readOnly = (await screen.findByRole("checkbox", { name: "Viewer" })) as HTMLElement
-    expect(readOnly.getAttribute("aria-disabled") === "true" || readOnly.hasAttribute("disabled")).toBe(true)
+    await screen.findByLabelText("Report time zone")
+    expect(screen.queryByRole("heading", { name: "Downloads" })).toBeNull()
+    expect(screen.queryByRole("checkbox", { name: "Viewer" })).toBeNull()
   })
 
   it("adds and removes an outside report domain, refuses a wildcard or an address, and saves the list", async () => {
@@ -214,12 +230,12 @@ describe("ReportingSettingsForm", () => {
     expect(sent.reportAllowedDomains).toEqual(["another.example", "partner.example"])
   })
 
-  it("lists the report domains read-only without settings:write", async () => {
-    mockSettings({ ...DEFAULTS, reportAllowedDomains: ["partner.example"] })
+  it("shows no report-domains section to a caller who may not read the list (PR #204 review SHOULD-FIX 3)", async () => {
+    mockSettings(READER_DEFAULTS)
     render(<ReportingSettingsForm canWrite={false} zoneList={zoneList} />)
-    await screen.findByText("partner.example")
+    await screen.findByLabelText("Report time zone")
+    expect(screen.queryByRole("heading", { name: "Reports: outside email domains" })).toBeNull()
     expect(screen.queryByLabelText("Report domain")).toBeNull()
-    expect(screen.queryByRole("button", { name: "Remove partner.example" })).toBeNull()
   })
 
   it("says Unsaved changes next to Save for a palette colour, a content site and a report domain, and clears it after Save (RPT-1 QA fix Q2)", async () => {

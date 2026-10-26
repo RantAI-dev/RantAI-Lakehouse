@@ -199,3 +199,128 @@ async fn a_failure_after_the_lock_expires_starts_the_count_fresh(pool: PgPool) {
         "the second failure after expiry must lock again"
     );
 }
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn twenty_concurrent_record_attempt_calls_get_counts_one_to_twenty(pool: PgPool) {
+    // SEC-49: each concurrent call must see its own count (no duplicates),
+    // so a caller that verifies a password only while the count is within
+    // the limit lets exactly `max_failures` of them through.
+    let key = throttle::key_for("attempts@test.com");
+    let pool = Arc::new(pool);
+    let p = policy();
+    let mut handles = Vec::new();
+    for _ in 0..20 {
+        let pool = pool.clone();
+        let key = key.clone();
+        let p = p.clone();
+        handles.push(tokio::spawn(async move {
+            throttle::record_attempt(&pool, &key, &p).await
+        }));
+    }
+    let mut results = Vec::new();
+    for handle in handles {
+        results.push(handle.await.unwrap().unwrap());
+    }
+    let mut counts: Vec<u32> = results.iter().map(|(count, _)| *count).collect();
+    counts.sort_unstable();
+    assert_eq!(counts, (1..=20).collect::<Vec<u32>>());
+    for (count, locked) in &results {
+        // The lock is reported exactly from the call that reaches the limit.
+        assert_eq!(locked.is_some(), *count >= 5, "count {count}");
+    }
+    assert!(throttle::locked_until(&pool, &key).await.unwrap().is_some());
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn record_attempt_reports_no_lock_below_the_limit_and_a_lock_at_it(pool: PgPool) {
+    let key = throttle::key_for("walk@test.com");
+    for expected in 1..=4_u32 {
+        let (count, locked) = throttle::record_attempt(&pool, &key, &policy())
+            .await
+            .unwrap();
+        assert_eq!(count, expected);
+        assert!(locked.is_none());
+    }
+    let (count, locked) = throttle::record_attempt(&pool, &key, &policy())
+        .await
+        .unwrap();
+    assert_eq!(count, 5);
+    assert!(locked.is_some());
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn refund_attempt_gives_back_one_count_and_removes_an_empty_row(pool: PgPool) {
+    // SEC-49: a storage error during sign-in must not count toward the lock.
+    let key = throttle::key_for("refund@test.com");
+    throttle::record_attempt(&pool, &key, &policy())
+        .await
+        .unwrap();
+    throttle::record_attempt(&pool, &key, &policy())
+        .await
+        .unwrap();
+    throttle::refund_attempt(&pool, &key, &policy())
+        .await
+        .unwrap();
+    let (count, _) = throttle::record_attempt(&pool, &key, &policy())
+        .await
+        .unwrap();
+    assert_eq!(count, 2, "one refund leaves one count, the next try is #2");
+    throttle::refund_attempt(&pool, &key, &policy())
+        .await
+        .unwrap();
+    throttle::refund_attempt(&pool, &key, &policy())
+        .await
+        .unwrap();
+    let rows: Option<(i32,)> =
+        sqlx::query_as("SELECT failures FROM login_throttle WHERE key_hash = $1")
+            .bind(&key)
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+    assert!(rows.is_none(), "an emptied row is deleted");
+    throttle::refund_attempt(&pool, &key, &policy())
+        .await
+        .unwrap();
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn refund_attempt_clears_the_lock_the_same_try_set(pool: PgPool) {
+    // PR #236 review SHOULD-FIX 1: the try that reaches the limit sets
+    // the lock, so a storage error in the password check afterwards must
+    // give the count back AND take the lock away. Otherwise the row keeps
+    // the lock for the whole lockout after only four wrong passwords.
+    let key = throttle::key_for("refund-lock@test.com");
+    for expected in 1..=4_u32 {
+        let (count, locked) = throttle::record_attempt(&pool, &key, &policy())
+            .await
+            .unwrap();
+        assert_eq!(count, expected);
+        assert!(locked.is_none());
+    }
+    let (count, locked) = throttle::record_attempt(&pool, &key, &policy())
+        .await
+        .unwrap();
+    assert_eq!(count, 5);
+    assert!(
+        locked.is_some(),
+        "the try that reaches the limit sets the lock"
+    );
+
+    throttle::refund_attempt(&pool, &key, &policy())
+        .await
+        .unwrap();
+
+    assert!(
+        throttle::locked_until(&pool, &key).await.unwrap().is_none(),
+        "the refunded try must not leave the key locked"
+    );
+
+    // The count is back at four, so the next try reaches the limit again
+    // and locks again: the refund gave one count back, it did not throw
+    // the count away.
+    let (count, locked) = throttle::record_attempt(&pool, &key, &policy())
+        .await
+        .unwrap();
+    assert_eq!(count, 5);
+    assert!(locked.is_some(), "the next try locks again");
+}

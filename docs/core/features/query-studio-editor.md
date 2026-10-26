@@ -85,7 +85,9 @@ and the last result) keeps working, and follows the active query tab.
   undone (the editor runs read-only statements, so nothing was written).
 - Autocomplete and the schema browser know only the tables the catalog shows
   you. A table you can query but the catalog does not list gets no column
-  suggestions.
+  suggestions. A Bronze table's SQL name is known once its detail is loaded:
+  expand it in the schema browser, or write its `namespace.name` in the
+  statement. A name only Trino serves is offered on a Trino tab only.
 - Run all takes at most 20 statements, and a browser keeps at most 20 tabs.
 
 ## Acceptance checklist
@@ -95,7 +97,7 @@ a pass.
 
 | ID | Do this | Expect | Result |
 | --- | --- | --- | --- |
-| `QS-1-AC1` | In the SQL tab, type `SELECT o. FROM <a catalog table> o` and put the cursor after `o.` | The list shows that table's columns | Not run |
+| `QS-1-AC1` | In the SQL tab, type `SELECT o. FROM <a Silver or Gold table, or a Bronze one whose detail is loaded> o` and put the cursor after `o.` | The list shows that table's columns | Not run |
 | `QS-1-AC2` | Write three statements separated by `;` and press Run all | Three result tabs, one per statement, in order | Not run |
 | `QS-1-AC3` | Open three query tabs with different SQL, close the browser, open Query Studio again | The three tabs are back with their names and SQL | Not run |
 | `QS-1-AC4` | Sign in as a user without `query:read`, open Query Studio and press Run all | Every statement is refused with a permission message, and nothing runs on the engine (`POST /api/query/run` needs `query:read`, `policy.rs:412`) | Not run |

@@ -80,6 +80,12 @@ export function ReportingSettingsForm({
   )
 
   const loaded = state.status === "success" ? state.data : null
+  // `PR #204` review SHOULD-FIX 3: the server sends the two lists only an
+  // administrator may read to a caller with `settings:write`. Without them
+  // there is nothing to show, and "with none chosen, everyone may download"
+  // would be a lie about a list this page may not read.
+  const canReadDeniedRoles = loaded?.downloadDeniedRoles !== undefined
+  const canReadDomains = loaded?.reportAllowedDomains !== undefined
   React.useEffect(() => {
     if (loaded) {
       setZone(loaded.timeZone)
@@ -372,73 +378,77 @@ export function ReportingSettingsForm({
               </div>
             ) : null}
           </section>
-          <section className="flex flex-col gap-1.5" aria-labelledby="settings-report-domains">
-            <h2 id="settings-report-domains" className="text-sm font-medium">
-              Reports: outside email domains
-            </h2>
-            {unsaved.domains ? <UnsavedNote /> : null}
-            <p className="text-xs text-muted-foreground">
-              A scheduled report may be sent to an address outside the company only if its
-              domain is listed here, written example.com, no wildcards. At most{" "}
-              {MAX_REPORT_DOMAINS}. With none listed, no report leaves the company.
-            </p>
-            <ul className="flex flex-col gap-1" aria-label="Report domains">
-              {domains.map((d) => (
-                <li key={d} className="flex items-center gap-2 text-sm">
-                  <span className="font-mono">{d}</span>
-                  {canWrite ? (
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      aria-label={`Remove ${d}`}
-                      onClick={() => setDomains(domains.filter((x) => x !== d))}
-                    >
-                      Remove
-                    </Button>
-                  ) : null}
-                </li>
+          {canReadDomains ? (
+            <section className="flex flex-col gap-1.5" aria-labelledby="settings-report-domains">
+              <h2 id="settings-report-domains" className="text-sm font-medium">
+                Reports: outside email domains
+              </h2>
+              {unsaved.domains ? <UnsavedNote /> : null}
+              <p className="text-xs text-muted-foreground">
+                A scheduled report may be sent to an address outside the company only if its
+                domain is listed here, written example.com, no wildcards. At most{" "}
+                {MAX_REPORT_DOMAINS}. With none listed, no report leaves the company.
+              </p>
+              <ul className="flex flex-col gap-1" aria-label="Report domains">
+                {domains.map((d) => (
+                  <li key={d} className="flex items-center gap-2 text-sm">
+                    <span className="font-mono">{d}</span>
+                    {canWrite ? (
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        aria-label={`Remove ${d}`}
+                        onClick={() => setDomains(domains.filter((x) => x !== d))}
+                      >
+                        Remove
+                      </Button>
+                    ) : null}
+                  </li>
+                ))}
+              </ul>
+              {canWrite ? (
+                <div className="flex gap-2">
+                  <Input
+                    aria-label="Report domain"
+                    value={domain}
+                    onChange={(e) => setDomain(e.target.value)}
+                    placeholder="partner.example.com"
+                    autoComplete="off"
+                  />
+                  <Button
+                    variant="outline"
+                    onClick={addDomain}
+                    disabled={!domainValid || domains.length >= MAX_REPORT_DOMAINS}
+                  >
+                    Add domain
+                  </Button>
+                </div>
+              ) : null}
+            </section>
+          ) : null}
+          {canReadDeniedRoles ? (
+            <section className="flex flex-col gap-1.5" aria-labelledby="settings-downloads">
+              <h2 id="settings-downloads" className="text-sm font-medium">
+                Downloads
+              </h2>
+              <p className="text-xs text-muted-foreground">
+                Roles that may not download dashboards as PDF or data as Excel or CSV. A
+                person who holds any other role still can, and Platform Admin always can.
+                With none chosen, everyone who can see a dashboard can download it.
+              </p>
+              {roleNames.map((name) => (
+                <div key={name} className="flex items-center gap-2">
+                  <Checkbox
+                    id={`download-denied-${name}`}
+                    checked={denied.includes(name)}
+                    onCheckedChange={(on) => toggleDenied(name, on === true)}
+                    disabled={!canWrite}
+                  />
+                  <Label htmlFor={`download-denied-${name}`}>{name}</Label>
+                </div>
               ))}
-            </ul>
-            {canWrite ? (
-              <div className="flex gap-2">
-                <Input
-                  aria-label="Report domain"
-                  value={domain}
-                  onChange={(e) => setDomain(e.target.value)}
-                  placeholder="partner.example.com"
-                  autoComplete="off"
-                />
-                <Button
-                  variant="outline"
-                  onClick={addDomain}
-                  disabled={!domainValid || domains.length >= MAX_REPORT_DOMAINS}
-                >
-                  Add domain
-                </Button>
-              </div>
-            ) : null}
-          </section>
-          <section className="flex flex-col gap-1.5" aria-labelledby="settings-downloads">
-            <h2 id="settings-downloads" className="text-sm font-medium">
-              Downloads
-            </h2>
-            <p className="text-xs text-muted-foreground">
-              Roles that may not download dashboards as PDF or data as Excel or CSV. A
-              person who holds any other role still can, and Platform Admin always can.
-              With none chosen, everyone who can see a dashboard can download it.
-            </p>
-            {roleNames.map((name) => (
-              <div key={name} className="flex items-center gap-2">
-                <Checkbox
-                  id={`download-denied-${name}`}
-                  checked={denied.includes(name)}
-                  onCheckedChange={(on) => toggleDenied(name, on === true)}
-                  disabled={!canWrite}
-                />
-                <Label htmlFor={`download-denied-${name}`}>{name}</Label>
-              </div>
-            ))}
-          </section>
+            </section>
+          ) : null}
           {canWrite ? (
             <div className="flex items-center gap-3">
               <Button
