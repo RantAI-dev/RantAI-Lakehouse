@@ -465,3 +465,119 @@ Verdict: B1 and B2 are fixed; R1 and R2 are SHOULD-FIX; the new integration test
 - **S8, click-to-gone part:** still open, and taken at the owner's QA (`BI-5-AC2`) after merge.
 
 No BLOCKER is open. After merge, `BI-5` is In Acceptance, not Released, until `BI-5-AC2` passes.
+
+### Handoff (merge main after #235), developer, branch `feat/bi-phase-5`
+
+**Merge commit `50c13352`** — "Merge remote-tracking branch 'origin/main' into
+`feat/bi-phase-5`", parents `48d6aefb` (the branch) and `7fe61227` (PR #235,
+`BI-19` part A and `BI-26`, merged to `main`). Pushed to
+`origin/feat/bi-phase-5` as a fast-forward (`48d6aefb..50c13352`).
+
+**Why the merge was small.** The branch had already merged
+`origin/feat/bi-phase-4b` (the #235 branch) at `5916b839`, so most of #235 was
+already in the tree; the merge that had to be finished was the one against
+`main`'s own copy of it. The audit was done hunk by hunk against both parents
+(`git diff HEAD -- <f>`, `git diff MERGE_HEAD -- <f>`, `git show HEAD:<f>`,
+`git show MERGE_HEAD:<f>`), not by taking a side of the whole file (rule 9).
+
+**Per-file resolution of the seven conflicts:**
+
+- **`rust/crates/lakehouse-api/src/routes/embed.rs`** — main's `embed_grant`
+  (BI-26's one admission: `verified_claims` then `admit`) is restored and
+  `embed_map_geojson` calls it, so the map route and the data route cannot
+  disagree about what a token opens. The public map route resolves the link
+  the way `public_dashboard` does (BI-19 part A: Postgres, with the password
+  ticket). The branch's BI-4 work is untouched: `render_board_payload` takes
+  the tile slots and runs the tiles through `tile_pool`, `data` and
+  `public_dashboard` wrap it in `result_cache::scoped`, and BI-5's board
+  deadline and row cut stay in the same loop. `database_failure` stays as the
+  branch's helper for the map route's store failure (same 500, same
+  `upstream_error::report_ch` payload; the engine's text never reaches the
+  answer, SEC-11).
+- **`rust/crates/lakehouse-api/src/routes/settings.rs`** — both switches are
+  on the reporting settings: `publicLinksEnabled` (BI-19 part A) and
+  `resultCache` (BI-4 part B), and the test asserts both callers (a reader
+  without `settings:write` and an administrator read the same switch).
+- **`rust/crates/lakehouse-api/tests/maps_routes.rs`** — main's version: the
+  public-link row is written through `lakehouse_store::public_links::replace`
+  (the store helper, rule 4) instead of a raw `INSERT`, and `EmbedResource`
+  names `chart` (BI-26). Same behaviour (a live link row in Postgres, token
+  of at least eight characters).
+- **`rust/crates/lakehouse-api/tests/reporting_settings_route.rs`** —
+  `publicLinksEnabled` and `resultCache` are everybody's, so they belong to
+  the helper every caller reads; BI-4 part B's save/keep/refuse test stays.
+- **`rust/crates/lakehouse-api/tests/route_auth.rs`** — unchanged, and
+  complete: the branch already carried #235's two gate tests (it merged
+  `origin/feat/bi-phase-4b` at `5916b839`), and BI-5's two gates sit beside
+  them. Every route of both sides is in `POLICY_TABLE` (checked: `/api/embed/values`,
+  `/api/dashboard/embed-settings`, `/api/public/dashboard/{token}/unlock`,
+  `/api/dashboard/public-link` GET/PUT/DELETE, `/api/settings/limits`
+  GET/PUT, `/api/query/cancel`) and the table-driven loops assert each one
+  both ways; the "every registered route is in `POLICY_TABLE`" test passes.
+- **`rust/crates/lakehouse-auth/src/throttle.rs`** — main's `record_attempt`
+  (BI-19 part A review fix (BLOCKER) R1) is kept: one atomic UPSERT that does
+  not push a public link's lock further out when a guess continues, which is
+  what BI-19 R1 decided. The SEC-49 decision (PR #236) is kept by it too: the
+  attempt is counted before the password is hashed, the caller verifies only
+  while the count is within `max_failures`, `clear` on success and
+  `refund_attempt` on a storage error. The branch's copy was the same
+  function as it stood before SEC-49 landed (an artefact of the earlier
+  merge), not a decision of this plan; the doc comment at the site names the
+  provenance and which copy is kept.
+- **`src/services/contracts/settings.ts`** — unchanged, and complete: the
+  branch already carried #235's `publicLinksEnabled` beside BI-4/BI-5's
+  `resultCache`, `QueryLimits` and `TileLimit`.
+
+Three files git merged cleanly but that carry #235's side, kept whole:
+`policy.rs` (the public block holds #235/BI-26's two public routes and the
+count is 13, `exactly_thirteen_public_entries_exist`; BI-5's
+`settings/limits` and `query/cancel` rows stay),
+`src/features/dashboards/embed-view.tsx` and
+`src/features/dashboards/public-dashboard.tsx` (the map request carries the
+public link's ticket, `X-Public-Link-Ticket`, which the merged
+`public_map_geojson` asks for of a link with a password).
+
+The two #235 plan documents take main's version, which carries the re-review
+of part A and the scope of PR #235; the branch's own handoff sections in them
+are already in main's copy (they came from `origin/feat/bi-phase-4b`).
+
+**Checks run** (from `rust/`, shared `CARGO_TARGET_DIR=/home/shiro/rantai/cargo-target`
+through `/home/shiro/rantai/bin/cargo-locked`, foreground, one command at a
+time; `free -g` and `df -h /` checked first — 10 GB RAM free, 208 GB disk
+free):
+
+- `cargo fmt --check`: clean (exit 0).
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`:
+  clean (exit 0), 1 m 26 s.
+- `cargo test --workspace`: exit 0 — **8195 passed, 0 failed, 49 ignored over
+  155 test binaries** (39 m 38 s). The binaries this merge touches:
+  `route_auth` 64, `embed_tokens` 41, `reporting_settings_route` 13,
+  `maps_routes` 11, `public_links` 10 (API) and 12 (store), `sec11_guard` 4,
+  `upstream_errors` 6, and `lakehouse-auth`'s `throttle` 14.
+- `bun run typecheck`: exit 0.
+- `bun run lint`: exit 0 — 0 errors, 11 warnings, all pre-existing and in
+  files this merge does not touch.
+- `bun run test`: exit 0 — 2890 pass, 1 skip, 0 fail (2891 tests, 297 files).
+- `python3 ops/lint/check_intra_package_imports.py` and
+  `python3 ops/lint/check_bare_iceberg_count.py`: clean.
+- `docker compose --profile '*' config --quiet`: clean (with throwaway
+  `POSTGRES_PASSWORD`, `RUSTFS_ACCESS_KEY`, `RUSTFS_SECRET_KEY`,
+  `LAKEKEEPER_ENCRYPTION_KEY`, `CONNECTOR_SECRETS_KEY` exported).
+
+**Not verified:**
+
+- `cargo audit` and `cargo deny`: red on `main` for the zstd advisories;
+  PR #261 fixes them. No dependency was touched by this merge, so nothing here
+  was run against them.
+- The dagster suite (`python -m pytest dispar_orchestrate -q`): not run. This
+  merge touches no file under `dagster/`; the branch's own BI-4/BI-5 work
+  never did either, and CI runs it on the PR.
+- A real `docker compose up` (compose files were not changed by this merge).
+- The webpack build, and any browser check of the public link's password page
+  or of the ticket-carrying map request. The ticket header is covered where it
+  is sent for the board's data (`public-link-access.test.tsx`); the map
+  request's header is asserted for its URL and for not going through
+  `apiFetch` (`public-map-boundary.test.tsx`), not for the header itself.
+- The owner's QA items still open from the reviews above: `BI-5-AC2` (the
+  click-to-gone time on a board of more than six slow tiles) and the
+  `S8` click-to-gone part.
