@@ -149,7 +149,7 @@ export type DashboardService = {
    * caller cannot see answers like one that does not exist. Refusals arrive as
    * the server's sentence.
    */
-  listComments(board: string, signal?: AbortSignal): Promise<DashboardComment[]>
+  listComments(board: string, signal?: AbortSignal): Promise<CommentList>
   postComment(input: CommentInput, signal?: AbortSignal): Promise<DashboardComment>
   /** Author only. `mentions` omitted keeps the people already mentioned. */
   editComment(id: string, body: string, mentions?: string[], signal?: AbortSignal): Promise<DashboardComment>
@@ -568,6 +568,12 @@ export type DashboardComment = {
   /** The author, or somebody who manages the dashboard. */
   canDelete: boolean
 }
+
+/**
+ * The newest comments of a dashboard, oldest first. `truncated` is true when
+ * older ones exist that are not returned (`BI-19` E review E-6c).
+ */
+export type CommentList = { comments: DashboardComment[]; truncated: boolean }
 
 export type CommentInput = {
   board: string

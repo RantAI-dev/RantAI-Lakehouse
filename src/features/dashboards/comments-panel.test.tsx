@@ -26,7 +26,11 @@ const COMMENT = {
   canDelete: true,
 }
 
-function stub(comments: unknown[], onWrite: (c: Call) => Response = () => json({ ok: true })): Call[] {
+function stub(
+  comments: unknown[],
+  onWrite: (c: Call) => Response = () => json({ ok: true }),
+  truncated = false,
+): Call[] {
   const calls: Call[] = []
   global.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
     const call = {
@@ -36,7 +40,7 @@ function stub(comments: unknown[], onWrite: (c: Call) => Response = () => json({
     }
     calls.push(call)
     if (call.url.includes("/comments/people")) return json({ items: [{ id: "u2", name: "Bob" }] })
-    if (call.method === "GET") return json({ comments })
+    if (call.method === "GET") return json({ comments, truncated })
     return onWrite(call)
   }) as unknown as typeof fetch
   return calls
@@ -110,6 +114,29 @@ describe("CommentsPanel", () => {
     expect(post.disabled).toBe(true)
     fireEvent.change(box, { target: { value: "x".repeat(2000) } })
     expect(post.disabled).toBe(false)
+  })
+
+  it("asks the server once, after typing pauses (BI-19 E review E-3)", async () => {
+    const calls = stub([])
+    render(<CommentsPanel board="b_1" />)
+    const box = await screen.findByLabelText("Write a comment")
+    for (const value of ["@b", "@bo", "@bob"]) fireEvent.change(box, { target: { value } })
+    expect(calls.filter((c) => c.url.includes("/people"))).toHaveLength(0)
+    await waitFor(() => expect(calls.filter((c) => c.url.includes("/people"))).toHaveLength(1))
+    expect(calls.find((c) => c.url.includes("/people"))!.url).toContain("q=bob")
+  })
+
+  it("says when older comments are not shown (BI-19 E review E-6c)", async () => {
+    stub([COMMENT], undefined, true)
+    render(<CommentsPanel board="b_1" />)
+    expect(await screen.findByText("Older comments are not shown.")).toBeTruthy()
+  })
+
+  it("does not say it when the list is complete", async () => {
+    stub([COMMENT])
+    render(<CommentsPanel board="b_1" />)
+    await screen.findByText(COMMENT.body)
+    expect(screen.queryByText("Older comments are not shown.")).toBeNull()
   })
 
   it("deletes through the service", async () => {

@@ -15,6 +15,9 @@ import { dashboardService, type CommentPerson, type DashboardComment } from "@/s
 /** `BI-19` part E, decision D15: a comment is 1 to 2000 characters. */
 export const MAX_COMMENT_CHARS = 2000;
 
+/** Wait this long after the last keystroke before asking the server for people. */
+export const PICKER_DEBOUNCE_MS = 250;
+
 /** The sentence a failed call carries, as the page shows it. */
 function sentence(e: unknown): string {
   return readableErrorMessage(e instanceof Error ? e.message : "The comment was not saved.");
@@ -65,14 +68,19 @@ export function CommentsPanel({ board }: { readonly board: string }) {
   const [editing, setEditing] = React.useState<{ id: string; text: string } | null>(null);
 
   const word = pendingMention(text);
+  // BI-19 E review E-3: each lookup costs a read of every candidate's access on
+  // the server, so wait for a pause in typing and cancel the lookup a newer
+  // keystroke makes useless.
   React.useEffect(() => {
     if (word === null) { setPeople([]); return; }
-    let cancelled = false;
-    dashboardService
-      .commentPeople(board, word)
-      .then((found) => { if (!cancelled) setPeople(found); })
-      .catch(() => { if (!cancelled) setPeople([]); });
-    return () => { cancelled = true; };
+    const controller = new AbortController();
+    const timer = setTimeout(() => {
+      dashboardService
+        .commentPeople(board, word, controller.signal)
+        .then((found) => { if (!controller.signal.aborted) setPeople(found); })
+        .catch(() => { if (!controller.signal.aborted) setPeople([]); });
+    }, PICKER_DEBOUNCE_MS);
+    return () => { clearTimeout(timer); controller.abort(); };
   }, [board, word]);
 
   async function act(work: () => Promise<unknown>, done?: () => void) {
@@ -103,7 +111,8 @@ export function CommentsPanel({ board }: { readonly board: string }) {
     void act(() => dashboardService.editComment(editing.id, body), () => setEditing(null));
   }
 
-  const comments: DashboardComment[] = list.status === "success" ? list.data : [];
+  const comments: DashboardComment[] = list.status === "success" ? list.data.comments : [];
+  const truncated = list.status === "success" && list.data.truncated;
 
   return (
     <div className="space-y-3">
@@ -113,6 +122,10 @@ export function CommentsPanel({ board }: { readonly board: string }) {
       ) : null}
       {list.status === "success" && comments.length === 0 ? (
         <p className="text-xs text-muted-foreground">No comments yet.</p>
+      ) : null}
+      {truncated ? (
+        // BI-19 E review E-6c: the list is the newest 200; say so rather than look complete.
+        <p className="text-xs text-muted-foreground">Older comments are not shown.</p>
       ) : null}
       <ul className="max-h-72 space-y-3 overflow-y-auto" aria-label="Comments">
         {comments.map((c) => (

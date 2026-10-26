@@ -317,12 +317,12 @@ export const clickhouseDashboardService: DashboardService = {
   },
   // BI-19 part E. The server's sentences are ours, so they are shown as they come.
   async listComments(board, signal) {
-    const json = await request<{ comments?: DashboardComment[] }>(
+    const json = await request<{ comments?: DashboardComment[]; truncated?: boolean }>(
       `/api/dashboard/comments?board=${encodeURIComponent(board)}`,
       { cache: "no-store", signal },
       "The comments could not be loaded"
     )
-    return json.comments ?? []
+    return { comments: json.comments ?? [], truncated: json.truncated === true }
   },
   async postComment(input, signal) {
     const res = await apiFetch("/api/dashboard/comments", {

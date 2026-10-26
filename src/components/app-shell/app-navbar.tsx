@@ -52,13 +52,19 @@ export function AppNavbar() {
     notifications.data.supported &&
     (notifications.data.openAlerts.length > 0 ||
       notifications.data.pendingApprovals.length > 0 ||
-      (notifications.data.unreadMentions ?? []).length > 0)
+      notifications.data.unreadMentions.length > 0)
   // BI-19 part E: unread @mentions in dashboard comments, each a real line the
   // reader can open. Empty when none, or when the deployment cannot say.
   const mentions =
     notifications.status === "success" && notifications.data.supported
-      ? (notifications.data.unreadMentions ?? [])
+      ? notifications.data.unreadMentions
       : []
+  // BI-19 E review E-6b: when the mentions could not be read, say so; an empty
+  // bell would read as "no mentions".
+  const mentionsNote =
+    notifications.status === "success" && notifications.data.supported
+      ? notifications.data.unreadMentionsUnavailable
+      : null
 
   return (
     <header
@@ -141,7 +147,7 @@ export function AppNavbar() {
               <Sparkles className="size-4" />
             </Button>
           )}
-          {mentions.length > 0 ? (
+          {mentions.length > 0 || mentionsNote ? (
             <DropdownMenu>
               <DropdownMenuTrigger
                 render={
@@ -154,7 +160,9 @@ export function AppNavbar() {
                 }
               >
                 <Bell className="size-4" />
-                <span className="absolute right-2 top-2 size-1.5 rounded-full bg-primary ring-2 ring-background" />
+                {hasNotifications ? (
+                  <span className="absolute right-2 top-2 size-1.5 rounded-full bg-primary ring-2 ring-background" />
+                ) : null}
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end">
                 {mentions.map((m) => (
@@ -162,13 +170,20 @@ export function AppNavbar() {
                     {m.title}
                   </DropdownMenuItem>
                 ))}
-                <DropdownMenuItem
-                  onClick={() => {
-                    void notificationsService.markMentionsRead().then(() => notifications.reload()).catch(() => undefined)
-                  }}
-                >
-                  Mark mentions as read
-                </DropdownMenuItem>
+                {mentionsNote ? (
+                  <p role="status" className="px-2 py-1.5 text-xs text-muted-foreground">
+                    {mentionsNote}
+                  </p>
+                ) : null}
+                {mentions.length > 0 ? (
+                  <DropdownMenuItem
+                    onClick={() => {
+                      void notificationsService.markMentionsRead().then(() => notifications.reload()).catch(() => undefined)
+                    }}
+                  >
+                    Mark mentions as read
+                  </DropdownMenuItem>
+                ) : null}
                 <DropdownMenuItem render={<Link href="/alerts" />}>Alerts and approvals</DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>

@@ -46,9 +46,11 @@ export type Notifications =
       supported: true
       openAlerts: OpenAlertNotification[]
       pendingApprovals: PendingApprovalNotification[]
-      unreadMentions?: MentionNotification[]
+      // BI-19 E review E-6a: required, as the server always sends both. An
+      // optional field let a client read "absent" as "none".
+      unreadMentions: MentionNotification[]
       /** A sentence when the mentions could not be read (never an empty list passed off as none). */
-      unreadMentionsUnavailable?: string | null
+      unreadMentionsUnavailable: string | null
     }
   | { supported: false; reason: string }
 
