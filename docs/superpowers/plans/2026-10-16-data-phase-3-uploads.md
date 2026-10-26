@@ -1022,6 +1022,93 @@ written without a compiler: expect CI to find any slip (the places to look: the 
 The `workflow_dispatch` file was parsed as YAML only; it was not dispatched. Two loads at once at 2 GiB
 remain unmeasured (RESULT).
 
+### Handoff (PR #186 review fixes, 2026-10-26)
+
+Developer (a non-Opus agent), branch `feat/data-phase-3-uploads`, the review findings of
+`PR #186`: BLOCKER 1, BLOCKER 2, the clippy lint and SHOULD-FIX 1 to 4. One commit per
+finding, in this order, on top of `0be39e85`; nothing else in the branch was changed.
+
+| Finding | Commit | What |
+| --- | --- | --- |
+| BLOCKER 1 | `d275f159` | An Avro file must be uncompressed (the null codec): both readers refuse a compressed container |
+| BLOCKER 2 | `78ce9d83` | A zip's central directory is read from its end record, before `ZipArchive::new` builds it |
+| clippy | `0be39e85` | `assert!(x.is_empty())` became `assert_eq!(x, Vec::<T>::new())` (already on the branch) |
+| SHOULD-FIX 1 | `e83281cb` | A type-changing replace writes the column the table lacks |
+| SHOULD-FIX 2 | `c64b2cd8` | The streamed write joins files of different columns |
+| SHOULD-FIX 3 | `80e5ef55` | The measurement names the four formats it covered |
+| SHOULD-FIX 4 | `0946166f` | `DATA-36` in the backlog |
+
+**Commands run (in the foreground, on this branch's sources, on the final commit).**
+
+- `cd rust && cargo fmt --check`: clean (rc 0).
+- `/home/shiro/rantai/bin/cargo-locked clippy -j 2 --workspace --all-targets --all-features -- -D warnings`: clean
+  (`Finished dev profile in 2m 17s`, no warning and no error). The whole workspace was checked again: the
+  shared target had been built by another worktree, and the script touches this worktree's sources first.
+- `/home/shiro/rantai/bin/cargo-locked test -j 2 -p lakehouse-api --lib -- upload`: **233 passed**, 0 failed,
+  1 ignored (2,356 filtered out). Among them the two new ones: a deflate Avro is refused, and a zip of
+  1,001 folder entries is refused.
+- `/home/shiro/rantai/bin/cargo-locked test -j 2 -p lakehouse-store --test uploads`: **59 passed**, 0 failed.
+- `/home/shiro/rantai/bin/cargo-locked test -j 2 -p lakehouse-api --test upload_routes --test connector_upload_table`:
+  **140 passed** and **6 passed**, 0 failed.
+- Python (dagster venv: dlt 1.30.0, pyiceberg 0.12.0, pyarrow 25.0.1, fastavro 1.13.1, ijson 3.6.0):
+  `cd dagster && flock /home/shiro/rantai/.heavy.lock python -m pytest dispar_orchestrate -q -p no:cacheprovider`
+  (the whole suite, the final code): **2389 passed, 1 skipped, 33 subtests passed** in 20m32s. The touched
+  files alone (`test_upload_formats`, `test_iceberg_stream`, `test_typed_load`, `test_sink`,
+  `test_file_ingest`, `test_several_files`, `test_parquet_ingest`): **332 passed, 1 skipped** in 54 s.
+- `python3 ops/lint/check_intra_package_imports.py`: OK. `python3 ops/lint/check_bare_iceberg_count.py`: OK.
+
+**The fixes are proven, not assumed.** Each new test was run against the old code and fails there:
+
+- the deflate Avro: the Rust test reads a container whose header names the codec and whose one block
+  inflates to a megabyte, and is refused without being inflated; the Python test writes one with
+  `fastavro` and is refused too. With the old code both read the file.
+- the zip cap: a zip of 1,001 folder entries is refused at all three read sites; with the old code the
+  archive was read and its 1,001 central-directory records built.
+- SHOULD-FIX 1: with the old `sink.py` the table's schema after the write was
+  `['a', 'b', 'c', '_ingested_at']` and the new column `d` was never written.
+- SHOULD-FIX 2: with the old `iceberg_stream.py` the two new tests fail with
+  `ArrowInvalid: Schema at index 1 was different`.
+
+**What the reviewer should look at (choices of mine, with the reason).**
+
+1. The Avro refusal corrects the feature page's spec-target row and the CHANGELOG's format line in
+   place: the format itself has never shipped, so there is no "Fixed" entry to add.
+2. The zip caps are two named constants with their reason: `MAX_ZIP_ENTRIES` (1,000) and
+   `MAX_ZIP_CENTRAL_BYTES` (4 MiB). The entry cap is far above `MAX_ZIP_FILES` (ten files), and a test
+   asserts that; the size cap is 4 MiB, which a thousand ordinary entries fit in.
+3. SHOULD-FIX 2 needed one thing the review did not name: the table is evolved to the unified schema
+   inside the transaction that writes the rows. `dlt` evolves the table with the schema of its dataset
+   (the first file's), so a later file's new column is not in the table and the write is refused with
+   "PyArrow table contains more columns". Only the columns the table lacks are added; the ones it has
+   are left as they are.
+4. SHOULD-FIX 1's `_fit_batch` raises a `ValueError`, the module's existing pattern for a batch that
+   does not fit, with a fixed sentence; the column names go to the log, never to the message. The
+   sink's own `_ingested_at` and `dlt`'s `_dlt_id`/`_dlt_load_id` are not the load's columns and are not
+   refused.
+5. `DATA-36` is free on `origin/main` (which ends at `DATA-32`) and on this branch (which ends at
+   `DATA-34`). The regenerated "Dependencies" section also drops `DATA-18` and `QS-4` from "Ready to
+   start" (both are `Building` now) and adds `DATA-29` to `DATA-34` and `DATA-36`: that is the
+   script's output on a list that was stale since `main`'s merge.
+6. The clippy finding was already fixed on the branch in `0be39e85` ("satisfy clippy assert_is_empty
+   after main's toolchain update"). This round ran clippy on the final code and it is clean, so no
+   commit was needed for it.
+
+**Not verified, with the reason.**
+
+- `cargo test --workspace`: not run. The whole workspace's test binaries do not fit this VM's disk
+  (32 GB free at the end, and the shared target holds the other sessions' test executables). The
+  three suites that carry this branch's code are the ones quoted above; CI's `Rust · test (stable)`
+  runs the whole workspace on the pull request.
+- The TypeScript block (`bun run typecheck`, `bun run lint`, `bun run test`): not run; no TypeScript
+  file changed in this round.
+- The gate (`Rust · G9 file upload`) and a 2 GiB load: not run; there is no stack on this machine (the
+  same reason as the earlier handoffs). The Avro refusal and the zip cap were exercised by the API's
+  own tests, not through the gate.
+- A real Lakekeeper REST catalog: the Iceberg writes here are against a local filesystem catalog, as
+  in the earlier handoffs.
+- Two loads at once at 2 GiB, and a Parquet row group larger than memory: still unmeasured
+  (`DATA-33`, `DATA-34`).
+
 ## 12. Review
 
 ### Slice 1, round 1 (planner/reviewer, Claude Opus), at `159f8dea`, 2026-10-19
