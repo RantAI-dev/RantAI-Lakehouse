@@ -288,7 +288,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(got.0, ORDERS[10..]);
-        assert!(got.1.is_empty());
+        assert_eq!(got.1, Vec::<u8>::new());
     }
 
     #[tokio::test]

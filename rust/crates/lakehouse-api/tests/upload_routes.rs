@@ -4964,7 +4964,7 @@ async fn a_file_sent_in_pieces_out_of_order_is_assembled_and_answered_like_a_who
         stack.bucket.get(&keys[0]).unwrap() == bytes,
         "the object is the file, byte for byte"
     );
-    assert!(stack.bucket.open_multiparts().is_empty());
+    assert_eq!(stack.bucket.open_multiparts(), Vec::<String>::new());
     let (digest, multipart, sha, pieces): (Option<Vec<u8>>, Option<String>, String, i64) =
         sqlx::query_as(
             "SELECT parts_digest, multipart_id, sha256, \
@@ -5048,7 +5048,7 @@ async fn completing_with_a_piece_missing_is_409_listing_it_and_the_upload_stays_
     assert_eq!(refused.status, StatusCode::CONFLICT, "{}", refused.text);
     assert_eq!(refused.json["error"], "Some pieces have not arrived: 2.");
     assert_eq!(stack.status_of(&id).await.0, "receiving");
-    assert!(stack.bucket.keys().is_empty());
+    assert_eq!(stack.bucket.keys(), Vec::<String>::new());
     assert_eq!(stack.bucket.open_multiparts().len(), 1);
 
     let sent = stack
@@ -5162,7 +5162,7 @@ async fn a_session_over_the_cap_or_with_no_bytes_or_a_bad_body_is_refused_and_op
         .await
         .unwrap();
     assert_eq!(rows, 0);
-    assert!(stack.bucket.open_multiparts().is_empty());
+    assert_eq!(stack.bucket.open_multiparts(), Vec::<String>::new());
 
     let at_cap = stack.open_session(&bayu, "a.csv", SESSION_CAP).await;
     assert_eq!(at_cap.status, StatusCode::CREATED, "{}", at_cap.text);
@@ -5268,8 +5268,8 @@ async fn deleting_a_session_aborts_its_multipart_upload() {
         )
         .await;
     assert_eq!(reply.status, StatusCode::NO_CONTENT, "{}", reply.text);
-    assert!(stack.bucket.open_multiparts().is_empty());
-    assert!(stack.bucket.keys().is_empty());
+    assert_eq!(stack.bucket.open_multiparts(), Vec::<String>::new());
+    assert_eq!(stack.bucket.keys(), Vec::<String>::new());
     assert_eq!(stack.row_count(&id).await, 0);
     let late = stack.put_part(&bayu, &id, "1", b"a,b\n1,2\n3\n").await;
     assert_eq!(late.status, StatusCode::NOT_FOUND);
@@ -6386,10 +6386,9 @@ async fn a_zip_preview_lists_its_files_and_a_load_with_a_file_of_other_columns_i
             .unwrap()
             .contains("do not all have the same columns")
     );
-    assert!(
-        requests_containing(&stack.dagster, "launchRun")
-            .await
-            .is_empty()
+    assert_eq!(
+        requests_containing(&stack.dagster, "launchRun").await,
+        Vec::<Value>::new()
     );
 }
 
@@ -6506,7 +6505,7 @@ async fn an_archive_inside_an_archive_a_mixed_zip_and_a_misnamed_file_are_refuse
             .await
             .contains("does not end in .avro")
     );
-    assert!(stack.bucket.keys().is_empty());
+    assert_eq!(stack.bucket.keys(), Vec::<String>::new());
 }
 
 #[tokio::test]
@@ -6797,10 +6796,9 @@ async fn a_file_with_an_extra_column_refuses_the_whole_load_with_the_list() {
         !message.contains("b.csv") && !message.contains("c.csv"),
         "{message}"
     );
-    assert!(
-        requests_containing(&stack.dagster, "launchRun")
-            .await
-            .is_empty()
+    assert_eq!(
+        requests_containing(&stack.dagster, "launchRun").await,
+        Vec::<Value>::new()
     );
     assert!(stack.claims().await.is_empty(), "no table was claimed");
     for id in &ids {
@@ -7043,7 +7041,10 @@ async fn a_bad_list_of_other_files_is_400_and_asks_nobody() {
         );
     }
     assert!(stack.dagster.received_requests().await.unwrap().is_empty());
-    assert!(stack.claims().await.is_empty());
+    assert_eq!(
+        stack.claims().await,
+        Vec::<(String, Option<Uuid>, String)>::new()
+    );
 }
 
 /// A file that is unknown, of another tenant, or of a tenant the caller is not in is one
@@ -7090,12 +7091,14 @@ async fn a_file_of_another_tenant_or_an_unknown_one_is_the_same_404_and_a_load_n
         answers.windows(2).all(|pair| pair[0] == pair[1]),
         "{answers:?}"
     );
-    assert!(
-        requests_containing(&stack.dagster, "launchRun")
-            .await
-            .is_empty()
+    assert_eq!(
+        requests_containing(&stack.dagster, "launchRun").await,
+        Vec::<Value>::new()
     );
-    assert!(stack.claims().await.is_empty());
+    assert_eq!(
+        stack.claims().await,
+        Vec::<(String, Option<Uuid>, String)>::new()
+    );
     assert_eq!(stack.group_state(&mine).await.0, "uploaded");
     assert_eq!(stack.group_state(&theirs).await.0, "uploaded");
 }

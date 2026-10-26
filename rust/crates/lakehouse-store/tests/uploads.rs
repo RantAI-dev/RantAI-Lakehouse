@@ -2113,7 +2113,10 @@ async fn pieces_are_listed_by_number_and_a_piece_sent_again_replaces_the_earlier
 ) -> sqlx::Result<()> {
     let tenant_a = tenant(&pool, "uploads-parts").await;
     open_session(&pool, "up-p1", tenant_a).await;
-    assert!(list_parts(&pool, "up-p1").await.unwrap().is_empty());
+    assert_eq!(
+        list_parts(&pool, "up-p1").await.unwrap(),
+        Vec::<UploadPart>::new()
+    );
 
     for p in [
         part(3, 100, "c"),
@@ -2198,7 +2201,10 @@ async fn finishing_a_session_makes_an_uploaded_file_and_forgets_its_pieces(
         "no hash of the whole bytes exists, and none is made up"
     );
     assert_eq!(done.parts_digest.as_deref(), Some(&digest[..]));
-    assert!(list_parts(&pool, "up-f1").await.unwrap().is_empty());
+    assert_eq!(
+        list_parts(&pool, "up-f1").await.unwrap(),
+        Vec::<UploadPart>::new()
+    );
     // A late piece is refused: the file is assembled.
     assert!(
         !record_part(&pool, "up-f1", &part(1, 10, "a"))
