@@ -33,6 +33,10 @@ pub(crate) mod dashboard_organise;
 mod dashboard_sources;
 pub(crate) mod drill;
 mod embed;
+mod pdf_export;
+mod render;
+pub mod report_runner;
+mod reports;
 // DATA-10 review SHOULD-FIX 1: route modules stay private; tests call gold_export_history
 mod gold;
 mod governance;
@@ -134,6 +138,18 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// bound; the per-upload routes (`/api/uploads/{id}*`) keep the default.
 const UPLOAD_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// The chart and table downloads' timeout (`BI-1` review fix (BLOCKER) R2). The
+/// stream from `ClickHouse` has 300 seconds (`export::EXPORT_TIMEOUT`) and its
+/// query 280 (`max_execution_time`), then the file is written and sent; the 60
+/// second default cut a long export with a bare `request timeout`. Ten seconds
+/// above the stream, so the sentence the export itself gives wins.
+const EXPORT_REQUEST_TIMEOUT: Duration = Duration::from_secs(310);
+
+/// The PDF route's timeout (`BI-1` review fix (BLOCKER) R2): the wait for a
+/// free slot ([`crate::pdf::PDF_SLOT_WAIT`]), the client's 70 seconds with
+/// Gotenberg, and ten seconds for the token, the audit and the answer.
+const PDF_REQUEST_TIMEOUT: Duration = Duration::from_secs(60 + 70 + 10);
+
 /// Per-route request timeout, mirroring each TypeScript handler's `export
 /// const maxDuration` (grep of every `src/app/api/**/route.ts`):
 ///
@@ -157,6 +173,13 @@ fn route_timeout(path: &str) -> Duration {
     match path {
         "/api/ai/chat" => *AI_CHAT_TIMEOUT,
         "/api/uploads" => UPLOAD_REQUEST_TIMEOUT,
+        "/api/dashboard/chart-export" | "/api/dashboard/table-export" => EXPORT_REQUEST_TIMEOUT,
+        "/api/dashboard/export/pdf" => PDF_REQUEST_TIMEOUT,
+        // RPT-1: "Send now" makes the PDF and the chart files in the request,
+        // so it gets the longest export deadline.
+        other if other.starts_with("/api/reports/subscriptions/") && other.ends_with("/send") => {
+            EXPORT_REQUEST_TIMEOUT
+        }
         other if is_upload_part_path(other) => UPLOAD_REQUEST_TIMEOUT,
         other if is_discovery_path(other) => DISCOVERY_REQUEST_TIMEOUT,
         _ => DEFAULT_REQUEST_TIMEOUT,
@@ -1205,8 +1228,32 @@ pub fn router(state: AppState) -> Router {
         .route("/api/dashboard/values", get(dashboard::values))
         .route("/api/dashboard/export", get(dashboard::export))
         .route("/api/dashboard/table-export", get(dashboard::table_export))
+        .route("/api/dashboard/chart-export", get(dashboard::chart_export))
+        .route("/api/dashboard/export/pdf", get(pdf_export::export_pdf))
         .route("/api/dashboard/embed-info", get(dashboard::embed_info))
         .route("/api/embed/data", axum::routing::post(embed::data))
+        .route("/api/render/data", axum::routing::post(render::data))
+        // RPT-1 (D7): scheduled reports. Authorisation beyond `dashboard:read`
+        // (owner or administrator, download right) is in the handlers.
+        .route(
+            "/api/reports/subscriptions",
+            get(reports::list).post(reports::create),
+        )
+        .route(
+            "/api/reports/subscriptions/{id}",
+            get(reports::get)
+                .put(reports::update)
+                .delete(reports::delete),
+        )
+        .route(
+            "/api/reports/subscriptions/{id}/send",
+            axum::routing::post(reports::send_now),
+        )
+        .route(
+            "/api/reports/subscriptions/{id}/deliveries",
+            get(reports::deliveries),
+        )
+        .route("/api/reports/recipients", get(reports::recipients))
         .route(
             "/api/embed/frame",
             axum::routing::post(embed::frame_origins),
@@ -1354,6 +1401,32 @@ mod tests {
     /// (120s, an 8-round LLM tool loop) — a blanket 60s bound 408'd a
     /// legitimate in-flight request. Pins the per-route table to the TS
     /// `export const maxDuration` grep.
+    /// `BI-1` review fix (BLOCKER) R2: the downloads keep the budgets they were
+    /// built for. The console proxy (`next.config.ts` `proxyTimeout`) must be at
+    /// least the largest of these.
+    #[test]
+    fn the_download_routes_have_their_own_timeouts() {
+        assert_eq!(
+            route_timeout("/api/dashboard/chart-export"),
+            Duration::from_secs(310)
+        );
+        assert_eq!(
+            route_timeout("/api/dashboard/table-export"),
+            Duration::from_secs(310)
+        );
+        assert_eq!(
+            route_timeout("/api/dashboard/export/pdf"),
+            Duration::from_secs(140)
+        );
+        assert!(Duration::from_secs(310) > crate::export::EXPORT_TIMEOUT);
+        assert!(PDF_REQUEST_TIMEOUT > crate::pdf::PDF_SLOT_WAIT + crate::pdf::PDF_DEADLINE);
+        // Everything else keeps the default.
+        assert_eq!(
+            route_timeout("/api/dashboard/export"),
+            DEFAULT_REQUEST_TIMEOUT
+        );
+    }
+
     #[test]
     fn chat_timeout_defaults_to_120s_and_clamps_an_operator_override() {
         assert_eq!(chat_timeout_from(None), Duration::from_secs(120));
@@ -1378,6 +1451,15 @@ mod tests {
             "no TS maxDuration export — falls back to the default"
         );
         assert_eq!(DEFAULT_REQUEST_TIMEOUT, Duration::from_secs(60));
+        // RPT-1: "Send now" makes the files in the request.
+        assert_eq!(
+            route_timeout("/api/reports/subscriptions/0b7e/send"),
+            EXPORT_REQUEST_TIMEOUT
+        );
+        assert_eq!(
+            route_timeout("/api/reports/subscriptions/0b7e"),
+            DEFAULT_REQUEST_TIMEOUT
+        );
     }
 
     /// `SRC-13` decision D9: the discovery routes carry a listing call of up to

@@ -20,13 +20,14 @@ import {
   COMPANY_PALETTE_MAX,
   COMPANY_PALETTE_MIN,
   MAX_CONTENT_SITES,
+  MAX_REPORT_DOMAINS,
   NUMBER_LOCALES,
   SHIPPED_FONTS,
   isHexColor,
 } from "@/lib/formatting-settings"
 import { listTimeZones } from "@/lib/time-zones"
 import { withNotify } from "@/lib/notify"
-import { settingsService, type ReportingSettingsInput } from "@/services"
+import { identityService, settingsService, type ReportingSettingsInput } from "@/services"
 
 const WEEK_STARTS = { monday: "Monday", sunday: "Sunday" } as const
 
@@ -64,6 +65,12 @@ export function ReportingSettingsForm({
   const [hex, setHex] = React.useState("")
   const [sites, setSites] = React.useState<string[]>([])
   const [site, setSite] = React.useState("")
+  const [denied, setDenied] = React.useState<string[]>([])
+  const [domains, setDomains] = React.useState<string[]>([])
+  const [domain, setDomain] = React.useState("")
+  // The role names come from the identity service; a person who can save
+  // settings but not read roles still sees (and can clear) the saved list.
+  const roles = useService((signal) => identityService.listRoles(signal), [])
   const save = useServiceAction(
     withNotify(
       { success: "Settings saved", error: "Settings were not saved" },
@@ -73,6 +80,12 @@ export function ReportingSettingsForm({
   )
 
   const loaded = state.status === "success" ? state.data : null
+  // `PR #204` review SHOULD-FIX 3: the server sends the two lists only an
+  // administrator may read to a caller with `settings:write`. Without them
+  // there is nothing to show, and "with none chosen, everyone may download"
+  // would be a lie about a list this page may not read.
+  const canReadDeniedRoles = loaded?.downloadDeniedRoles !== undefined
+  const canReadDomains = loaded?.reportAllowedDomains !== undefined
   React.useEffect(() => {
     if (loaded) {
       setZone(loaded.timeZone)
@@ -81,6 +94,8 @@ export function ReportingSettingsForm({
       setPalette(loaded.companyPalette)
       setFonts(loaded.fonts)
       setSites(loaded.contentSites ?? [])
+      setDenied(loaded.downloadDeniedRoles ?? [])
+      setDomains(loaded.reportAllowedDomains ?? [])
     }
   }, [loaded])
 
@@ -93,7 +108,27 @@ export function ReportingSettingsForm({
       locale !== loaded.numberLocale ||
       palette.join() !== loaded.companyPalette.join() ||
       fonts.join() !== loaded.fonts.join() ||
-      sites.join() !== (loaded.contentSites ?? []).join())
+      sites.join() !== (loaded.contentSites ?? []).join() ||
+      denied.join() !== (loaded.downloadDeniedRoles ?? []).join() ||
+      domains.join() !== (loaded.reportAllowedDomains ?? []).join())
+
+  // RPT-1 QA fix Q2: the three lists (palette, content sites, report domains)
+  // change only local state until Save; each says so the same way.
+  const unsaved = {
+    palette: loaded !== null && palette.join() !== loaded.companyPalette.join(),
+    sites: loaded !== null && sites.join() !== (loaded.contentSites ?? []).join(),
+    domains: loaded !== null && domains.join() !== (loaded.reportAllowedDomains ?? []).join(),
+  }
+
+  // Sorted like the server stores it, so the comparison with the saved list is stable.
+  const roleNames = React.useMemo(() => {
+    const listed = roles.status === "success" && Array.isArray(roles.data) ? roles.data.map((r) => r.name) : []
+    return [...new Set([...listed, ...denied])].sort()
+  }, [roles, denied])
+
+  function toggleDenied(name: string, off: boolean) {
+    setDenied(roleNames.filter((r) => (r === name ? off : denied.includes(r))))
+  }
 
   function addColour() {
     const colour = hex.trim().toLowerCase()
@@ -114,6 +149,17 @@ export function ReportingSettingsForm({
     setSite("")
   }
 
+  // `RPT-1`: a domain name, no wildcard, address or path. The server has the
+  // last word; this keeps the obvious mistakes from reaching it.
+  const domainText = domain.trim().toLowerCase()
+  const domainValid = /^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]*[a-z0-9])?$/.test(domainText)
+
+  function addDomain() {
+    if (!domainValid || domains.includes(domainText) || domains.length >= MAX_REPORT_DOMAINS) return
+    setDomains([...domains, domainText].sort())
+    setDomain("")
+  }
+
   function toggleFont(id: string, on: boolean) {
     // Kept in the shipped order, so the comparison with the saved list is stable.
     setFonts(Object.keys(SHIPPED_FONTS).filter((f) => (f === id ? on : fonts.includes(f))))
@@ -127,6 +173,8 @@ export function ReportingSettingsForm({
       companyPalette: palette,
       fonts,
       contentSites: sites,
+      downloadDeniedRoles: denied,
+      reportAllowedDomains: domains,
     })
     if (result) state.reload()
   }
@@ -214,6 +262,7 @@ export function ReportingSettingsForm({
             <h2 id="settings-palette" className="text-sm font-medium">
               Company palette
             </h2>
+            {unsaved.palette ? <UnsavedNote /> : null}
             <p className="text-xs text-muted-foreground">
               {COMPANY_PALETTE_MIN} to {COMPANY_PALETTE_MAX} colours. With a palette set, new
               charts use it.
@@ -287,6 +336,7 @@ export function ReportingSettingsForm({
             <h2 id="settings-content-sites" className="text-sm font-medium">
               Allowed content sites
             </h2>
+            {unsaved.sites ? <UnsavedNote /> : null}
             <p className="text-xs text-muted-foreground">
               Image and web-page cards may only show addresses on these sites, written
               https://host or https://host:port, no wildcards. At most {MAX_CONTENT_SITES}.
@@ -328,14 +378,88 @@ export function ReportingSettingsForm({
               </div>
             ) : null}
           </section>
+          {canReadDomains ? (
+            <section className="flex flex-col gap-1.5" aria-labelledby="settings-report-domains">
+              <h2 id="settings-report-domains" className="text-sm font-medium">
+                Reports: outside email domains
+              </h2>
+              {unsaved.domains ? <UnsavedNote /> : null}
+              <p className="text-xs text-muted-foreground">
+                A scheduled report may be sent to an address outside the company only if its
+                domain is listed here, written example.com, no wildcards. At most{" "}
+                {MAX_REPORT_DOMAINS}. With none listed, no report leaves the company.
+              </p>
+              <ul className="flex flex-col gap-1" aria-label="Report domains">
+                {domains.map((d) => (
+                  <li key={d} className="flex items-center gap-2 text-sm">
+                    <span className="font-mono">{d}</span>
+                    {canWrite ? (
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        aria-label={`Remove ${d}`}
+                        onClick={() => setDomains(domains.filter((x) => x !== d))}
+                      >
+                        Remove
+                      </Button>
+                    ) : null}
+                  </li>
+                ))}
+              </ul>
+              {canWrite ? (
+                <div className="flex gap-2">
+                  <Input
+                    aria-label="Report domain"
+                    value={domain}
+                    onChange={(e) => setDomain(e.target.value)}
+                    placeholder="partner.example.com"
+                    autoComplete="off"
+                  />
+                  <Button
+                    variant="outline"
+                    onClick={addDomain}
+                    disabled={!domainValid || domains.length >= MAX_REPORT_DOMAINS}
+                  >
+                    Add domain
+                  </Button>
+                </div>
+              ) : null}
+            </section>
+          ) : null}
+          {canReadDeniedRoles ? (
+            <section className="flex flex-col gap-1.5" aria-labelledby="settings-downloads">
+              <h2 id="settings-downloads" className="text-sm font-medium">
+                Downloads
+              </h2>
+              <p className="text-xs text-muted-foreground">
+                Roles that may not download dashboards as PDF or data as Excel or CSV. A
+                person who holds any other role still can, and Platform Admin always can.
+                With none chosen, everyone who can see a dashboard can download it.
+              </p>
+              {roleNames.map((name) => (
+                <div key={name} className="flex items-center gap-2">
+                  <Checkbox
+                    id={`download-denied-${name}`}
+                    checked={denied.includes(name)}
+                    onCheckedChange={(on) => toggleDenied(name, on === true)}
+                    disabled={!canWrite}
+                  />
+                  <Label htmlFor={`download-denied-${name}`}>{name}</Label>
+                </div>
+              ))}
+            </section>
+          ) : null}
           {canWrite ? (
-            <Button
-              className="w-fit"
-              onClick={handleSave}
-              disabled={!changed || paletteInvalid || save.status === "pending"}
-            >
-              Save
-            </Button>
+            <div className="flex items-center gap-3">
+              <Button
+                className="w-fit"
+                onClick={handleSave}
+                disabled={!changed || paletteInvalid || save.status === "pending"}
+              >
+                Save
+              </Button>
+              {changed ? <UnsavedNote /> : null}
+            </div>
           ) : (
             <p className="text-sm text-muted-foreground">
               Only an administrator can change these.
@@ -344,5 +468,14 @@ export function ReportingSettingsForm({
         </div>
       ) : null}
     </div>
+  )
+}
+
+/** RPT-1 QA fix Q2: the one wording for "this is not stored until Save". */
+function UnsavedNote() {
+  return (
+    <p role="status" className="text-xs text-amber-700 dark:text-amber-400">
+      Unsaved changes
+    </p>
   )
 }

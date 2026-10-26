@@ -126,6 +126,14 @@ jobs:
             sed -i "/^${name}=/d" .env
             printf '\n%s=%s\n' "$name" "$value" >> .env
           done
+          # BI-1: the address the Gotenberg container uses to reach the console,
+          # which is deployed below as `lakehouse-frontend` on this network.
+          # Not a secret; a plain line so the PDF item is on in staging.
+          sed -i '/^CONSOLE_INTERNAL_URL=/d;/^RENDER_TOKEN_SECRET=/d' .env
+          # BI-1 review fix (BLOCKER) R1: the PDF render token's own key. Optional
+          # here: without the repo secret PDF export is simply not set up on staging.
+          printf '\nRENDER_TOKEN_SECRET=%s\n' "$STAGING_RENDER_TOKEN_SECRET" >> .env
+          printf '\nCONSOLE_INTERNAL_URL=%s\n' 'http://lakehouse-frontend:3000' >> .env
           if [ -n "$missing" ]; then
             echo "::error::staging secrets not set:$missing (Settings > Secrets and variables > Actions)"
             exit 1
@@ -149,6 +157,7 @@ jobs:
           # required, like the tokens above (compose refuses to start without it).
           STAGING_CONNECTOR_SECRETS_KEY: ${{ secrets.STAGING_CONNECTOR_SECRETS_KEY }}
           STAGING_EMBED_SECRET: ${{ secrets.STAGING_EMBED_SECRET }}
+          STAGING_RENDER_TOKEN_SECRET: ${{ secrets.STAGING_RENDER_TOKEN_SECRET }}
 
       - name: Build & start backend stack (core + seaweedfs + dagster + trino)
         working-directory: ${{ github.workspace }}

@@ -151,6 +151,10 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // eighth is `POST /api/embed/frame`, SEC-12.) ───────────────────────
     ("GET",  "/health",                          Policy::Public),
     ("POST", "/api/embed/data",                   Policy::Public),
+    // BI-1 (D3): the PDF's print view has no session; its data route is
+    // authenticated by the signed render token in the body, and reads as the
+    // person the token names (never as the embed viewer role).
+    ("POST", "/api/render/data",                  Policy::Public),
     // SEC-12: the console's `proxy.ts` asks which sites may frame an embed
     // page, with the token the page was opened with. Public because the
     // token is the credential; it answers only an origin list, and the same
@@ -592,7 +596,25 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // BI-16 part A (T8): the whole result of a raw table as CSV. Same
     // permission as seeing the tile; every export is audited.
     ("GET",    "/api/dashboard/table-export", Policy::RequiresPermission("dashboard:read")),
+    // BI-1 (D6): any chart's data as Excel or CSV. Same permission as seeing
+    // the tile, narrowed by the roles an administrator switched off from
+    // downloading (checked in the handler, D7); every download is audited.
+    ("GET",    "/api/dashboard/chart-export", Policy::RequiresPermission("dashboard:read")),
+    // BI-1 (D5): a dashboard as a PDF. `dashboard:read`, narrowed by the roles
+    // switched off from downloading (D7), audited before the file is sent.
+    ("GET",    "/api/dashboard/export/pdf",   Policy::RequiresPermission("dashboard:read")),
     ("GET",    "/api/dashboard/embed-info",   Policy::RequiresPermission("dashboard:read")),
+    // RPT-1 (D7): scheduled reports. `dashboard:read` gets past the gate; the
+    // handlers then require the download right to create, and the owner or an
+    // administrator (`settings:write`) to read, change, pause, send or delete.
+    ("GET",    "/api/reports/subscriptions",  Policy::RequiresPermission("dashboard:read")),
+    ("POST",   "/api/reports/subscriptions",  Policy::RequiresPermission("dashboard:read")),
+    ("GET",    "/api/reports/subscriptions/{id}", Policy::RequiresPermission("dashboard:read")),
+    ("PUT",    "/api/reports/subscriptions/{id}", Policy::RequiresPermission("dashboard:read")),
+    ("DELETE", "/api/reports/subscriptions/{id}", Policy::RequiresPermission("dashboard:read")),
+    ("POST",   "/api/reports/subscriptions/{id}/send", Policy::RequiresPermission("dashboard:read")),
+    ("GET",    "/api/reports/subscriptions/{id}/deliveries", Policy::RequiresPermission("dashboard:read")),
+    ("GET",    "/api/reports/recipients",     Policy::RequiresPermission("dashboard:read")),
     // SEC-12: withdrawing a token changes who can read the dashboard, so it
     // is a write, like the embed toggle on `PUT /api/dashboard/boards`.
     ("POST",   "/api/dashboard/embed-revoke", Policy::RequiresPermission("dashboard:write")),
@@ -1116,7 +1138,7 @@ mod tests {
     }
 
     #[test]
-    fn exactly_eight_public_entries_exist() {
+    fn exactly_nine_public_entries_exist() {
         // Pre-existing drift found while landing the `/api/auth/providers`
         // route: this assertion was still pinned at 4 even though the two
         // earlier OIDC public routes (`/api/auth/oidc/start`,
@@ -1131,7 +1153,9 @@ mod tests {
             .filter(|(_, _, policy)| *policy == Policy::Public)
             .count();
         // SEC-12 added `POST /api/embed/frame`: 7 -> 8.
-        assert_eq!(public_count, 8);
+        // BI-1 (D3) added `POST /api/render/data`, the PDF print view's data
+        // route, authenticated by its signed render token: 8 -> 9.
+        assert_eq!(public_count, 9);
     }
 
     /// SEC-23 (F1): adding a governance rule needs `governance:write`, the

@@ -1048,6 +1048,9 @@ async fn the_frame_answer_carries_only_the_sites_of_this_boards_cards() {
             "https://elsewhere.example".to_owned(),
             "https://unused.example".to_owned(),
         ],
+        // This branch's BI-1 / BI-5 settings; these tests do not exercise them.
+        download_denied_roles: Vec::new(),
+        report_allowed_domains: Vec::new(),
     };
     lakehouse_store::reporting_settings::upsert(&app.pool, &stored, "test")
         .await
@@ -1099,6 +1102,9 @@ async fn the_frame_answer_and_the_payload_agree_on_a_boards_content_sites() {
             "https://default.example".to_owned(),
             "https://elsewhere.example".to_owned(),
         ],
+        // This branch's BI-1 / BI-5 settings; these tests do not exercise them.
+        download_denied_roles: Vec::new(),
+        report_allowed_domains: Vec::new(),
     };
     lakehouse_store::reporting_settings::upsert(&app.pool, &stored, "test")
         .await
@@ -1150,6 +1156,9 @@ async fn the_frame_answer_without_a_card_has_no_content_site() {
         company_palette: Vec::new(),
         fonts: Vec::new(),
         content_sites: vec!["https://img.example".to_owned()],
+        // This branch's BI-1 / BI-5 settings; these tests do not exercise them.
+        download_denied_roles: Vec::new(),
+        report_allowed_domains: Vec::new(),
     };
     lakehouse_store::reporting_settings::upsert(&app.pool, &stored, "test")
         .await

@@ -74,6 +74,26 @@ pub struct Ready;
 pub const SQL_SOURCE_SETTINGS: &str =
     " SETTINGS max_result_rows = 2000, result_overflow_mode = 'break', max_execution_time = 30";
 
+/// `statement` with the SQL-source cap of a tile ([`SQL_SOURCE_SETTINGS`]:
+/// 2 000 rows, 30 seconds) swapped for a download's: `max_rows` rows and 280
+/// seconds, below the 300-second timeout of the download's stream (`BI-1`,
+/// plan decision D6). A separate path on purpose: a tile keeps its cap, only a
+/// whole-result download lifts it. A statement over a mart, which carries no
+/// such cap, comes back unchanged; settings added after the cap
+/// (`prefer_column_name_to_alias`, ...) are kept.
+#[must_use]
+pub fn with_export_settings(statement: &str, max_rows: u32) -> String {
+    let Some(at) = statement.rfind(SQL_SOURCE_SETTINGS) else {
+        return statement.to_owned();
+    };
+    format!(
+        "{} SETTINGS max_result_rows = {max_rows}, result_overflow_mode = 'break', \
+         max_execution_time = 280{}",
+        &statement[..at],
+        &statement[at + SQL_SOURCE_SETTINGS.len()..]
+    )
+}
+
 /// Where a chart's rows come from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Relation {
@@ -4944,5 +4964,20 @@ mod tests {
             "SELECT * FROM serving.t WHERE ((toFloat64(v) >= 500 AND toFloat64(v) < 1000) OR (toFloat64(v) = 1000 AND toFloat64(v) = (SELECT max(toFloat64(v)) FROM serving.t WHERE g IN ('a')))) AND g IN ('a') ORDER BY ALL LIMIT 50 OFFSET 0"
         );
         assert_eq!(got.count.matches("SELECT max").count(), 1);
+    }
+
+    #[test]
+    fn export_settings_replace_the_tile_cap_and_keep_what_follows_it() {
+        let sql =
+            format!("SELECT 1 FROM (SELECT 1\n) AS src{SQL_SOURCE_SETTINGS}, join_use_nulls = 1");
+        let got = with_export_settings(&sql, 1_000_001);
+        assert_eq!(
+            got,
+            "SELECT 1 FROM (SELECT 1\n) AS src SETTINGS max_result_rows = 1000001, \
+             result_overflow_mode = 'break', max_execution_time = 280, join_use_nulls = 1"
+        );
+        assert!(!got.contains("= 2000"));
+        // A mart statement has no cap to lift.
+        assert_eq!(with_export_settings("SELECT 1", 5), "SELECT 1");
     }
 }

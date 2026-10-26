@@ -385,6 +385,27 @@ pub async fn user_in_tenant(
     Ok(present.is_some_and(|(present,)| present))
 }
 
+/// The tenants a user belongs to (`app_user_tenant`), in no particular order.
+/// An empty list means the user belongs to no tenant.
+///
+/// Read from the same rows `lakehouse_auth::repository::load_principal_for_user`
+/// puts in `Principal::tenant_ids`, so this list and the tenant list on a
+/// request can never disagree about membership. Used by `RPT-1`'s recipient
+/// rules (review fix (SHOULD-FIX) 1): the picker and the save-time refusal
+/// ask whether a person shares a tenant with the report's owner.
+///
+/// # Errors
+///
+/// [`StoreError::Database`] on any database failure.
+pub async fn user_tenant_ids(pool: &PgPool, user_id: Uuid) -> Result<Vec<Uuid>, StoreError> {
+    let rows: Vec<(Uuid,)> =
+        sqlx::query_as("SELECT tenant_id FROM app_user_tenant WHERE user_id = $1")
+            .bind(user_id)
+            .fetch_all(pool)
+            .await?;
+    Ok(rows.into_iter().map(|(id,)| id).collect())
+}
+
 /// The display name of `id`, or `None` when there is no such row.
 ///
 /// Read from `app_user.name` — the same column
