@@ -21,11 +21,23 @@ from `system.processes`. The 5-second target for the whole click is **neither me
 failed**; the part after the engine (the route, the proxy, the browser) is unmeasured and has
 to be taken at the owner's QA (`BI-5-AC2`).
 
-The grant question (section 5) is also not verified: the container's `default` user holds
-every grant. Whether the API's own `ClickHouse` user may `KILL QUERY` its own queries with a
-`LIKE` on `query_id` needs the stack's user and was not tested (compose and init SQL are owned
-elsewhere; if a grant is missing, Stop answers `{ stopped: n }` and the kill fails with a
-logged error).
+The grant question (section 5) was measured by the planner on 2026-10-26, on
+`clickhouse/clickhouse-server:26.8` (version 26.8.30.8), with a user `apiuser` that held only
+`SELECT` on `system.numbers` and `system.one`. It ran a query with
+`query_id = 'sess1:run1:tile1'`:
+
+| the user's grants | `KILL QUERY WHERE query_id LIKE 'sess1:run1:%' ASYNC` by the same user |
+| --- | --- |
+| no `SELECT` on `system.processes` | refused: `Code: 497 ... it's necessary to have the grant SELECT ON system.processes (ACCESS_DENIED)` |
+| plus `GRANT SELECT ON system.processes` | accepted; the query ended and `system.processes` had 0 rows for it |
+| the same, against a query of another user (`admin`) | refused: `User apiuser attempts to kill query created by admin (ACCESS_DENIED)` |
+
+So the API's engine user needs `SELECT ON system.processes`, and **no** `KILL QUERY` grant, to
+stop its own queries. The engine itself keeps it from stopping anyone else's. The compose stack's
+API user is the container's admin user (`CLICKHOUSE_USER`) and holds every grant, so Stop works
+there as shipped. A deployment that gives the API a restricted engine user must add
+`GRANT SELECT ON system.processes`. Without it, the count and the kill fail, and the route answers
+through `upstream_error` (a fixed sentence; the engine's text stays in the log).
 
 Scripts (kept outside the repo): `measure.py`, `e2b.py`, `e4.py`.
 

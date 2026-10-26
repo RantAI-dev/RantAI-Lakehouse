@@ -485,3 +485,11 @@ Read at `4590a3f2`. The key is complete and no result leaks between people:
   - the 3-second target is honestly not measured.
 
 Verdict: not ready until P-B1 is fixed; then P-S1–P-S6, and the integration files must run.
+
+### Re-review of the part B fixes (Evan's planner, 2026-10-26, at `4b96fc4e`)
+
+- **P-B1 (BLOCKER), closed.** `result_cache.rs` serves an entry with `day_bound` only when `same_day_in_zone(zone, computed_at, now)` is true. That needs a known report zone, read through `jiff`; with no zone, the entry is never served. `add_unwatchable_reads` sets `day_bound` from `sql_rewrite::reads_beyond_tables(...).clock_or_random`, which is also `true` for a statement it cannot parse (fails closed). The mock-clock test covers 23:55 to 00:05 in Jakarta.
+- **P-S1 to P-S6:** closed per the fix handoff (commits `4573bfe5`, `49c069a9`, `7ed9096b`).
+- The integration files ran green in PR #245's CI (39 of 39).
+
+No BLOCKER is open. After merge, `BI-4` is In Acceptance until the owner's QA.

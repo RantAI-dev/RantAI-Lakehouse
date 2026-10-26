@@ -456,3 +456,12 @@ Verdict: not ready to merge until B1 and B2 are fixed; then S1–S4 and S6–S9.
 - **S8 open:** the `KILL` grant and the click-to-gone time, at QA.
 
 Verdict: B1 and B2 are fixed; R1 and R2 are SHOULD-FIX; the new integration tests must run green before merge.
+
+### Re-review of R1 and R2, and S8 (Evan's planner, 2026-10-26, at `4b96fc4e`)
+
+- **R1, closed.** `report_runner.rs` runs the delivery inside `query_limits::scope_if_missing(state, Some(owner), …)`, so a scheduled report sends its owner's query id and the configured limits.
+- **R2, closed.** The assistant's `stop_query` (`ai/tools/limits.rs`) and `POST /api/query/cancel` share one `query_cancel::stop_own_queries`. It marks the run stopped and always sends the kill.
+- **S8, grant part: closed by measurement** (`docs/plans/BI-5-RESULT.md`, 2026-10-26). An engine user needs `SELECT ON system.processes` and no `KILL QUERY` grant to stop its own queries, and the engine refuses to let it stop another user's. The compose API user holds every grant.
+- **S8, click-to-gone part:** still open, and taken at the owner's QA (`BI-5-AC2`) after merge.
+
+No BLOCKER is open. After merge, `BI-5` is In Acceptance, not Released, until `BI-5-AC2` passes.
