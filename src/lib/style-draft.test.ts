@@ -153,3 +153,44 @@ describe("the palette the builder shows", () => {
     expect(effectivePalette({}, [], false)).toBe("default")
   })
 })
+
+// BI-17 part B (plan D2): clusters are a style field of scatter and bubble charts only.
+describe("clusters", () => {
+  test("only a scatter or bubble chart takes them", () => {
+    expect(formatRules({ kind: "scatter", breakdown: false, measures: 2 }).clusters).toBe(true)
+    expect(formatRules({ kind: "bubble", breakdown: false, measures: 3 }).clusters).toBe(true)
+    expect(formatRules({ kind: "line", breakdown: false, measures: 1 }).clusters).toBe(false)
+    expect(formatRules({ kind: "geomap", breakdown: false, measures: 1 }).clusters).toBe(false)
+  })
+
+  test("auto and 2 to 10 groups are sent, anything else and any other kind are not", () => {
+    const scatter = formatRules({ kind: "scatter", breakdown: false, measures: 2 })
+    expect(stylePayload({ clusters: { k: "auto" } }, scatter)).toEqual({ clusters: { k: "auto" } })
+    expect(stylePayload({ clusters: { k: 10 } }, scatter)).toEqual({ clusters: { k: 10 } })
+    for (const k of [1, 11, 2.5, Number.NaN]) expect(stylePayload({ clusters: { k } }, scatter)).toEqual({})
+    expect(stylePayload({ clusters: { k: 3 } }, formatRules({ kind: "line", breakdown: false, measures: 1 }))).toEqual({})
+  })
+
+  test("a saved chart reads back and is sent back unchanged, and a chart saved before has none", () => {
+    const scatter = formatRules({ kind: "scatter", breakdown: false, measures: 2 })
+    const saved: StyleFields = { clusters: { k: 4 } }
+    expect(stylePayload(styleFromDef(saved), scatter)).toEqual(saved)
+    expect(stylePayload(styleFromDef({}), scatter)).toEqual({})
+  })
+})
+
+// BI-17 part B (plan D2): the Clusters setting.
+test("clusters are offered on a scatter and a bubble chart only", () => {
+  expect(formatRules({ kind: "scatter", breakdown: false, measures: 2 }).clusters).toBe(true)
+  expect(formatRules({ kind: "bubble", breakdown: false, measures: 3 }).clusters).toBe(true)
+  expect(formatRules({ kind: "line", breakdown: false, measures: 1 }).clusters).toBe(false)
+})
+
+test("a valid clusters setting round-trips, and an invalid or unsupported one is not sent", () => {
+  const scatter = formatRules({ kind: "scatter", breakdown: false, measures: 2 })
+  for (const k of ["auto", 2, 10] as const) {
+    expect(stylePayload(styleFromDef({ clusters: { k } }), scatter)).toEqual({ clusters: { k } })
+  }
+  for (const k of [1, 11, 2.5, Number.NaN]) expect(stylePayload({ clusters: { k } }, scatter)).toEqual({})
+  expect(stylePayload({ clusters: { k: "auto" } }, formatRules({ kind: "bar", breakdown: false, measures: 1 }))).toEqual({})
+})

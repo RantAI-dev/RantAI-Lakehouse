@@ -46,6 +46,11 @@ use crate::state::AppState;
 mod builds;
 // Column-level lineage (`DATA-13`): producers, and the route that reads it.
 pub(crate) mod columns;
+// `BI-14`: charts, SQL sources and metrics in the graph, and the route that
+// walks one chart's path upstream.
+pub(crate) mod charts;
+// `BI-14`: which charts read a table.
+pub(crate) mod used_by;
 
 /// Most nodes one response carries, so a focus on a hub table cannot
 /// return the whole warehouse.
@@ -56,6 +61,10 @@ struct Graph {
     nodes: BTreeMap<String, (String, &'static str)>,
     edges: Vec<(String, String, &'static str, String)>,
     coverage: Vec<String>,
+    /// When a node was last refreshed and what says so (`BI-14` D3): a
+    /// `silver`/`serving` table's last build in `system.query_log` (UTC,
+    /// `YYYY-MM-DD HH:MM`). A node with no entry has no recorded time.
+    refreshed: BTreeMap<String, (String, &'static str)>,
 }
 
 impl Graph {
@@ -461,8 +470,19 @@ fn matches_focus(g: &Graph, focus: &str) -> Vec<String> {
 /// back, outgoing edges walked forward, never sideways (a sibling that
 /// shares a parent is not in the focus's lineage).
 fn reachable(g: &Graph, start: &[String]) -> BTreeSet<String> {
+    walk(g, start, &[true, false])
+}
+
+/// Only what is upstream of `start` (`BI-14`: where a chart comes from), the
+/// same walk as [`reachable`] with the forward pass left out.
+fn upstream(g: &Graph, start: &[String]) -> BTreeSet<String> {
+    walk(g, start, &[false])
+}
+
+/// [`reachable`]'s walk over the given directions (`true` forward).
+fn walk(g: &Graph, start: &[String], directions: &[bool]) -> BTreeSet<String> {
     let mut keep: BTreeSet<String> = start.iter().cloned().collect();
-    for forward in [true, false] {
+    for &forward in directions {
         let mut frontier: Vec<String> = start.to_vec();
         while let Some(node) = frontier.pop() {
             if keep.len() >= MAX_NODES {
@@ -485,22 +505,26 @@ fn reachable(g: &Graph, start: &[String]) -> BTreeSet<String> {
     keep
 }
 
-/// The recorded lineage around `focus` for `principal` (see the module
-/// doc). An empty or unknown focus returns an empty graph with a note, so
-/// the response never depends on which data a deployment holds.
+/// The table graph as recorded for `principal`, before any focus is applied
+/// (`BI-14` D2: the chart route walks the same graph the lineage page draws,
+/// it does not build a second one), with the tenant and shared-catalog rules
+/// the walk and the column mappings need.
+struct Assembled {
+    g: Graph,
+    tenant: Option<uuid::Uuid>,
+    shared: bool,
+}
+
+/// Every record the graph draws, for `principal`.
 ///
 /// # Errors
 ///
-/// [`ApiError::NotFound`] when `X-Tenant` names a tenant the caller does
-/// not belong to, and [`ApiError::Unavailable`] when the shared-catalog
-/// rule cannot be evaluated: both from the same helpers the catalog and
-/// connector routes use.
-pub(crate) async fn build(
+/// As [`build`].
+async fn assemble(
     state: &AppState,
     principal: &Principal,
     headers: &HeaderMap,
-    focus: &str,
-) -> Result<Value, ApiError> {
+) -> Result<Assembled, ApiError> {
     let tenant = crate::tenant_scope::resolve(principal, headers)?;
     let mut g = Graph::default();
     let shared =
@@ -523,6 +547,33 @@ pub(crate) async fn build(
          that last wrote it, so a table filled some other way has no incoming edge"
             .to_owned(),
     );
+    Ok(Assembled { g, tenant, shared })
+}
+
+/// The recorded lineage around `focus` for `principal` (see the module
+/// doc). An empty or unknown focus returns an empty graph with a note, so
+/// the response never depends on which data a deployment holds.
+///
+/// # Errors
+///
+/// [`ApiError::NotFound`] when `X-Tenant` names a tenant the caller does
+/// not belong to, and [`ApiError::Unavailable`] when the shared-catalog
+/// rule cannot be evaluated: both from the same helpers the catalog and
+/// connector routes use.
+pub(crate) async fn build(
+    state: &AppState,
+    principal: &Principal,
+    headers: &HeaderMap,
+    focus: &str,
+) -> Result<Value, ApiError> {
+    let Assembled {
+        mut g,
+        tenant,
+        shared,
+    } = assemble(state, principal, headers).await?;
+    // BI-14 (D2, D5): the charts, SQL sources and metrics the caller may see,
+    // downstream of the tables they read.
+    charts::add_dashboard_nodes(state, principal, tenant, shared, &mut g).await;
 
     let base = json!({ "focus": focus, "columnMappings": [], "supported": true });
     let empty = |note: String| {
