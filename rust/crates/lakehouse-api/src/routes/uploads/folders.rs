@@ -29,7 +29,7 @@ use axum::http::{HeaderMap, StatusCode};
 use lakehouse_auth::Principal;
 use lakehouse_core::ApiError;
 use lakehouse_store::audit::NewAuditEvent;
-use lakehouse_store::upload_folders::{self, FolderError, FolderPatch, UploadFolder};
+use lakehouse_store::upload_folders::{self, FolderError, FolderPatch, ParentChange, UploadFolder};
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
@@ -96,16 +96,49 @@ fn json_object(body: &[u8]) -> Result<Map<String, Value>, ApiError> {
     }
 }
 
-/// `text` or `null` for a field that names a folder; `None` when it is absent.
+/// A request field that names a folder, with its three JSON states told apart:
+/// absent, `null` and text. An enum, not an `Option<Option<String>>` (clippy
+/// `option_option`, PR #259 CI), so the states carry names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum FolderRef {
+    /// The field is not in the body.
+    Absent,
+    /// The field is `null`: the top level, no folder.
+    Null,
+    /// The field is the id of a folder.
+    Id(String),
+}
+
+impl FolderRef {
+    /// The folder id, or `None` for both "absent" and `null`.
+    pub(super) fn into_id(self) -> Option<String> {
+        match self {
+            Self::Id(id) => Some(id),
+            Self::Absent | Self::Null => None,
+        }
+    }
+
+    /// The same three states as a patch's parent change.
+    fn as_change(&self) -> ParentChange<'_> {
+        match self {
+            Self::Absent => ParentChange::Keep,
+            Self::Null => ParentChange::Root,
+            Self::Id(id) => ParentChange::Under(id),
+        }
+    }
+}
+
+/// `text` or `null` for a field that names a folder; [`FolderRef::Absent`] when
+/// it is absent.
 fn optional_folder_ref(
     fields: &Map<String, Value>,
     name: &str,
     sentence: &str,
-) -> Result<Option<Option<String>>, ApiError> {
+) -> Result<FolderRef, ApiError> {
     match fields.get(name) {
-        None => Ok(None),
-        Some(Value::Null) => Ok(Some(None)),
-        Some(Value::String(id)) => Ok(Some(Some(id.clone()))),
+        None => Ok(FolderRef::Absent),
+        Some(Value::Null) => Ok(FolderRef::Null),
+        Some(Value::String(id)) => Ok(FolderRef::Id(id.clone())),
         Some(_) => Err(ApiError::BadRequest(sentence.to_owned())),
     }
 }
@@ -178,7 +211,7 @@ pub async fn create(
         Some(Value::String(name)) => name.as_str(),
         _ => return Err(ApiError::BadRequest(NAME_TEXT.to_owned()).into()),
     };
-    let parent = optional_folder_ref(&fields, "parentId", PARENT_TEXT)?.flatten();
+    let parent = optional_folder_ref(&fields, "parentId", PARENT_TEXT)?.into_id();
     let id = format!("uf-{}", Uuid::new_v4());
     let made = upload_folders::create(
         pool(&state)?,
@@ -225,7 +258,7 @@ pub async fn update(
         Some(_) => return Err(ApiError::BadRequest(NAME_TEXT.to_owned()).into()),
     };
     let parent = optional_folder_ref(&fields, "parentId", PARENT_TEXT)?;
-    if name.is_none() && parent.is_none() {
+    if name.is_none() && parent == FolderRef::Absent {
         return Err(ApiError::BadRequest(NOTHING_TO_CHANGE.to_owned()).into());
     }
     let pool = pool(&state)?;
@@ -235,7 +268,7 @@ pub async fn update(
         &id,
         FolderPatch {
             name,
-            parent: parent.as_ref().map(Option::as_deref),
+            parent: parent.as_change(),
         },
     )
     .await
@@ -255,7 +288,7 @@ pub async fn update(
         )
         .await;
     }
-    if parent.is_some() {
+    if parent != FolderRef::Absent {
         let args = json!({ "parentId": changed.parent_id });
         record_audit(
             pool,
@@ -323,8 +356,9 @@ pub async fn move_uploads(
     let fields = json_object(&body)?;
     let upload_ids = upload_ids_of(&fields)?;
     // `folderId` is required: `null` means "out of any folder" and must be said.
-    let Some(folder) = optional_folder_ref(&fields, "folderId", FOLDER_ID_RULE)? else {
-        return Err(ApiError::BadRequest(FOLDER_ID_RULE.to_owned()).into());
+    let folder = match optional_folder_ref(&fields, "folderId", FOLDER_ID_RULE)? {
+        FolderRef::Absent => return Err(ApiError::BadRequest(FOLDER_ID_RULE.to_owned()).into()),
+        given => given.into_id(),
     };
     let pool = pool(&state)?;
     // The folder is checked on its own so that "no such folder" and "no such
@@ -406,11 +440,11 @@ mod tests {
     fn a_folder_reference_may_be_absent_null_or_text_and_nothing_else() {
         let obj = |value: Value| json_object(value.to_string().as_bytes()).unwrap();
         let read = |value: Value| optional_folder_ref(&obj(value), "p", PARENT_TEXT);
-        assert_eq!(read(json!({})).unwrap(), None);
-        assert_eq!(read(json!({ "p": null })).unwrap(), Some(None));
+        assert_eq!(read(json!({})).unwrap(), FolderRef::Absent);
+        assert_eq!(read(json!({ "p": null })).unwrap(), FolderRef::Null);
         assert_eq!(
             read(json!({ "p": "uf-1" })).unwrap(),
-            Some(Some("uf-1".to_owned()))
+            FolderRef::Id("uf-1".to_owned())
         );
         assert!(read(json!({ "p": 3 })).is_err());
     }

@@ -622,5 +622,5 @@ async fn the_upload_list_can_be_narrowed_by_folder_and_text() {
             None,
         )
         .await;
-    assert!(ids(&foreign).is_empty());
+    assert_eq!(ids(&foreign), Vec::<String>::new());
 }

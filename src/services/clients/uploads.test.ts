@@ -439,8 +439,14 @@ describe("uploadService folders (DATA-35)", () => {
   })
 
   it("lists, creates, renames, moves and deletes folders on the folder routes", async () => {
-    const calls = stubFetch(() => json(FOLDER))
-    await expect(uploadService.listFolders()).resolves.toEqual(FOLDER)
+    // The list route answers an array of folders; every other folder route answers one.
+    let listing = true
+    const calls = stubFetch(() => {
+      const answer = listing ? [FOLDER] : FOLDER
+      listing = false
+      return json(answer)
+    })
+    await expect(uploadService.listFolders()).resolves.toEqual([FOLDER])
     await uploadService.createFolder({ name: "Sales" })
     await uploadService.createFolder({ name: "Q1", parentId: "uf-1" })
     await uploadService.updateFolder("uf-1", { name: "Old" })

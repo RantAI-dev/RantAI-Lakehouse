@@ -17,8 +17,8 @@ use std::borrow::Cow;
 
 use lakehouse_store::identity::{CreateTenantInput, create_tenant};
 use lakehouse_store::upload_folders::{
-    FolderError, FolderPatch, MAX_DEPTH, claim_folder, create, delete, folder_in_tenant, list,
-    move_uploads, update,
+    FolderError, FolderPatch, MAX_DEPTH, ParentChange, claim_folder, create, delete,
+    folder_in_tenant, list, move_uploads, update,
 };
 use lakehouse_store::uploads::{
     FolderFilter, ListFilter, LoadClaim, LoadLimits, LoadMode, MarkOutcome, NewUpload, Upload,
@@ -110,7 +110,7 @@ async fn a_move_counts_the_subtree_of_the_moved_folder(pool: PgPool) -> sqlx::Re
         t,
         "uf-x",
         FolderPatch {
-            parent: Some(Some("uf-b")),
+            parent: ParentChange::Under("uf-b"),
             ..FolderPatch::default()
         },
     )
@@ -123,7 +123,7 @@ async fn a_move_counts_the_subtree_of_the_moved_folder(pool: PgPool) -> sqlx::Re
         t,
         "uf-y",
         FolderPatch {
-            parent: Some(Some("uf-b")),
+            parent: ParentChange::Under("uf-b"),
             ..FolderPatch::default()
         },
     )
@@ -146,7 +146,7 @@ async fn a_folder_cannot_be_moved_into_itself_or_its_descendant(pool: PgPool) ->
             t,
             "uf-a",
             FolderPatch {
-                parent: Some(Some(target)),
+                parent: ParentChange::Under(target),
                 ..FolderPatch::default()
             },
         )
@@ -188,7 +188,7 @@ async fn sibling_names_are_unique_without_regard_to_case(pool: PgPool) -> sqlx::
         t,
         "uf-3",
         FolderPatch {
-            parent: Some(Some("uf-1")),
+            parent: ParentChange::Under("uf-1"),
             ..FolderPatch::default()
         },
     )

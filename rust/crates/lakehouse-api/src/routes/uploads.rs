@@ -1918,10 +1918,11 @@ struct IngestRequest {
     /// named; empty for a load of one file.
     also_uploads: Vec<String>,
     /// The folder every file of the load is put in and the table remembers
-    /// (`DATA-35` decision 2, AD-4). `None`: the request said nothing, so the
-    /// table's remembered folder applies ([`effective_folder`]); `Some(None)`:
-    /// `folderId: null`, "no folder" chosen on purpose.
-    folder_id: Option<Option<String>>,
+    /// (`DATA-35` decision 2, AD-4). [`folders::FolderRef::Absent`]: the request
+    /// said nothing, so the table's remembered folder applies
+    /// ([`effective_folder`]); [`folders::FolderRef::Null`]: `folderId: null`,
+    /// "no folder" chosen on purpose.
+    folder_id: folders::FolderRef,
 }
 
 /// Why a raw table name is refused, or `None` (review finding C1).
@@ -2042,9 +2043,9 @@ fn parse_ingest_request(
     };
     group::check_also_list(&also_uploads)?;
     let folder_id = match fields.get("folderId") {
-        None => None,
-        Some(Value::Null) => Some(None),
-        Some(Value::String(id)) if !id.is_empty() => Some(Some(id.clone())),
+        None => folders::FolderRef::Absent,
+        Some(Value::Null) => folders::FolderRef::Null,
+        Some(Value::String(id)) if !id.is_empty() => folders::FolderRef::Id(id.clone()),
         Some(_) => return Err(bad(FOLDER_ID_RULE)),
     };
     Ok(IngestRequest {
@@ -2488,15 +2489,17 @@ async fn effective_folder(
     request: &IngestRequest,
 ) -> ApiResult<Option<String>> {
     match &request.folder_id {
-        Some(Some(folder)) => {
+        folders::FolderRef::Id(folder) => {
             if upload_folders::folder_in_tenant(pool, tenant_id, folder).await? {
                 Ok(Some(folder.clone()))
             } else {
                 Err(ApiError::NotFound(folders::FOLDER_NOT_FOUND.to_owned()).into())
             }
         }
-        Some(None) => Ok(None),
-        None => Ok(upload_folders::claim_folder(pool, tenant_id, &request.table).await?),
+        folders::FolderRef::Null => Ok(None),
+        folders::FolderRef::Absent => {
+            Ok(upload_folders::claim_folder(pool, tenant_id, &request.table).await?)
+        }
     }
 }
 
@@ -3282,17 +3285,21 @@ mod tests {
     fn the_folder_is_optional_text_or_null_and_nothing_else() {
         let read = |value: Value| parse_ingest_request(&body(&value), None, None);
         let mut with = valid();
-        assert_eq!(read(with.clone()).unwrap().folder_id, None, "said nothing");
+        assert_eq!(
+            read(with.clone()).unwrap().folder_id,
+            folders::FolderRef::Absent,
+            "said nothing"
+        );
         with["folderId"] = json!(null);
         assert_eq!(
             read(with.clone()).unwrap().folder_id,
-            Some(None),
+            folders::FolderRef::Null,
             "said none"
         );
         with["folderId"] = json!("uf-1");
         assert_eq!(
             read(with.clone()).unwrap().folder_id,
-            Some(Some("uf-1".to_owned()))
+            folders::FolderRef::Id("uf-1".to_owned())
         );
         for bad in [json!(3), json!(""), json!(["uf-1"]), json!(true)] {
             with["folderId"] = bad;
@@ -3314,7 +3321,7 @@ mod tests {
                 sheet: None,
                 columns: None,
                 also_uploads: Vec::new(),
-                folder_id: None,
+                folder_id: folders::FolderRef::Absent,
             }
         );
         let mut full = valid();

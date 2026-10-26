@@ -104,13 +104,30 @@ impl From<sqlx::Error> for FolderError {
     }
 }
 
-/// What to change on a folder: each field is left alone when `None`.
+/// What a folder patch does to the parent. Three cases, so this is an enum and
+/// not an `Option<Option<&str>>` (clippy `option_option`, PR #259 CI): "leave
+/// it" and "move to the top level" must not be mistaken for each other, and the
+/// names say which is which. The JSON route keeps its contract: `parentId`
+/// absent is `Keep`, `null` is `Root`, text is `Under`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ParentChange<'a> {
+    /// Leave the parent as it is.
+    #[default]
+    Keep,
+    /// Move the folder to the top level.
+    Root,
+    /// Move the folder under this folder.
+    Under(&'a str),
+}
+
+/// What to change on a folder: the name is left alone when `None`, the parent
+/// when [`ParentChange::Keep`].
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FolderPatch<'a> {
     /// The new name.
     pub name: Option<&'a str>,
-    /// The new parent: `Some(None)` moves the folder to the top level.
-    pub parent: Option<Option<&'a str>>,
+    /// What to do with the parent.
+    pub parent: ParentChange<'a>,
 }
 
 const SELECT_WITH_COUNTS: &str = "SELECT f.id, f.parent_id, f.name, \
@@ -313,8 +330,12 @@ pub async fn update(
     let Some((current_name, current_parent)) = current else {
         return Err(FolderError::NotFound);
     };
-    let parent = patch.parent.unwrap_or(current_parent.as_deref());
-    if let Some(new_parent) = patch.parent.flatten() {
+    let parent = match patch.parent {
+        ParentChange::Keep => current_parent.as_deref(),
+        ParentChange::Root => None,
+        ParentChange::Under(new_parent) => Some(new_parent),
+    };
+    if let ParentChange::Under(new_parent) = patch.parent {
         let Some(parent_depth) = depth_of(&mut tx, tenant_id, new_parent).await? else {
             return Err(FolderError::NotFound);
         };
