@@ -214,3 +214,54 @@ async fn load_principal_for_user_ignores_an_expired_grant(pool: PgPool) -> sqlx:
     assert!(!principal.has("catalog:write"));
     Ok(())
 }
+
+// ── The first tenant is the lowest `tenant_id`, whatever the insert order
+//    ───────────────────────────────────────────────────────────────────────
+
+/// A principal's FIRST tenant is who acts when a request carries no
+/// `X-Tenant` header — the chat, the saved-query tools and the catalog
+/// sample and profile fall back to it — so it must be the same tenant on
+/// every request, whatever order the memberships happen to sit in.
+///
+/// The two memberships below are written with the HIGHER tenant id first, so
+/// an unordered read (a sequential scan, which is what the planner picks for
+/// this table) hands them back in the order they were written. The lower id
+/// must still come first.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_first_tenant_is_the_lowest_id_whatever_the_insert_order(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let user_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO app_user (id, name, email) VALUES ($1, $2, $3)")
+        .bind(user_id)
+        .bind("Tenant Order Probe")
+        .bind(format!("tenant-order-{user_id}@meridian.example"))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let lower = Uuid::parse_str("11111111-1111-4111-8111-000000000001").unwrap();
+    let higher = Uuid::parse_str("11111111-1111-4111-8111-000000000002").unwrap();
+
+    // The higher id first: the order the rows are written in must not
+    // survive into the principal.
+    sqlx::query("INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2)")
+        .bind(user_id)
+        .bind(higher)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2)")
+        .bind(user_id)
+        .bind(lower)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let principal = load_principal_for_user(&pool, user_id, "local".to_owned(), false)
+        .await
+        .unwrap();
+
+    assert_eq!(principal.tenant_ids, vec![lower, higher]);
+    Ok(())
+}
