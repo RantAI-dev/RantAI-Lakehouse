@@ -81,6 +81,35 @@ fn board_row() -> Value {
     })
 }
 
+/// Whether the viewer clause the product put on a `bi_chart` / `bi_board`
+/// read leaves `BOARD` out. `ClickHouse` applies that clause; this stand-in has
+/// to apply it too, or a test that removes the owner's access would read the
+/// board as if nothing had changed (BI-19 C, PR #250 CI: the test was wrong,
+/// the product filters in SQL).
+fn clause_hides_board(sql: &str) -> bool {
+    if sql.contains("AND 1 = 0") {
+        return true;
+    }
+    let quoted = format!("'{BOARD}'");
+    let mut rest = sql;
+    let mut consumed = 0;
+    while let Some(at) = rest.find(" IN (") {
+        let before = &sql[..consumed + at];
+        let after = &rest[at + 5..];
+        let Some(end) = after.find(')') else { break };
+        let list = &after[..end];
+        if !list.starts_with("SELECT") {
+            let negated = before.ends_with(" NOT");
+            if list.contains(&quoted) == negated {
+                return true;
+            }
+        }
+        consumed += at + 5 + end;
+        rest = &sql[consumed..];
+    }
+    false
+}
+
 impl Respond for FakeCh {
     fn respond(&self, request: &MockRequest) -> ResponseTemplate {
         let sql = String::from_utf8_lossy(&request.body).into_owned();
@@ -104,11 +133,12 @@ impl Respond for FakeCh {
             return rows(json!([]), vec![row]);
         }
         if sql.contains("FROM console.bi_chart") {
-            let present = *self.chart_exists.lock().unwrap();
+            let present = *self.chart_exists.lock().unwrap() && !clause_hides_board(&sql);
             return rows(json!([]), if present { vec![chart_row()] } else { vec![] });
         }
         if sql.contains("FROM console.bi_board") {
-            return rows(json!([]), vec![board_row()]);
+            let hidden = clause_hides_board(&sql);
+            return rows(json!([]), if hidden { vec![] } else { vec![board_row()] });
         }
         if sql.contains("system.columns") {
             return rows(

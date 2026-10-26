@@ -102,6 +102,18 @@ impl DashboardQuery {
         self.fresh = Some("1".to_owned());
         self
     }
+
+    /// The same read with only chart `id` computed fresh (`fresh=<id>`), the
+    /// other tiles of the board staying as remembered. For a caller that
+    /// decides from one tile's number *now* (a chart alert's crossing and
+    /// recovery, `BI-19` C, PR #250 CI): a remembered number would delay a
+    /// recovery by the cache's age, and computing the whole board every
+    /// check would cost far more than the one tile the rule watches.
+    #[must_use]
+    pub(crate) fn fresh_chart(mut self, id: &str) -> Self {
+        self.fresh = Some(id.to_owned());
+        self
+    }
 }
 
 /// Why [`get_body`] stopped: the store failed, or the request's parameter

@@ -143,7 +143,10 @@ async fn read(state: &AppState, rule: &AlertRule) -> Result<Reading, Unreadable>
         filters.as_deref(),
         None,
         None,
-    );
+    )
+    // BI-19 C (PR #250 CI): a number that decides a send is never a remembered
+    // one (the recovery would arrive a cache age late).
+    .fresh_chart(chart_id);
     let payload = match crate::routes::dashboard::payload_for(state, &principal, &query).await {
         Ok(payload) => payload,
         Err(response) => {
