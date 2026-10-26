@@ -373,6 +373,7 @@ async fn an_embed_token_an_expired_token_and_a_foreign_secret_are_refused_with_o
     let embed = sign_embed(
         &EmbedClaims {
             resource: Some(EmbedResource {
+                chart: None,
                 dashboard: Some(PUBLIC_BOARD.to_owned()),
             }),
             params: None,

@@ -57,6 +57,7 @@ const DEFAULTS = {
   contentSites: [],
   downloadDeniedRoles: [],
   reportAllowedDomains: [],
+  publicLinksEnabled: true,
 }
 
 /**
@@ -119,7 +120,21 @@ describe("ReportingSettingsForm", () => {
       contentSites: [],
       downloadDeniedRoles: [],
       reportAllowedDomains: [],
+      publicLinksEnabled: true,
     })
+  })
+
+  it("switches public links off for everyone on Save and warns first", async () => {
+    const calls = mockSettings(DEFAULTS)
+    render(<ReportingSettingsForm canWrite zoneList={zoneList} />)
+    const box = (await screen.findByLabelText("Allow public links")) as HTMLElement
+    await waitFor(() => expect(box.getAttribute("aria-checked")).toBe("true"))
+    fireEvent.click(box)
+    await screen.findByText("Saving this stops every public link now.")
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+    await waitFor(() => expect(calls.some((c) => c.method === "PUT")).toBe(true))
+    const put = calls.find((c) => c.method === "PUT")
+    expect(JSON.parse(put?.body ?? "{}").publicLinksEnabled).toBe(false)
   })
 
   it("adds a palette colour, refuses a single colour, and saves the palette and the fonts", async () => {

@@ -436,6 +436,22 @@ pub(crate) fn stored_chart_sql(
     .ok_or("this chart's definition is invalid")
 }
 
+/// The `resolved` object of a tile whose parameters changed its statement
+/// (`BI-11`): the columns, and the row limit, that the parameters gave the slots
+/// in this read. The console reads series names, labels and clicks from it
+/// (`withResolvedSlots`), because the stored definition still holds the slot as
+/// `{param}` text. One writer for the dashboard payload and for a public link or
+/// embed (`BI-19` part A QA fix P3: the public payload used to leave it out, and
+/// the page then tried to read the unresolved slot as a column name).
+pub(crate) fn resolved_json(effective: &store::StoredChartSpec) -> serde_json::Value {
+    serde_json::json!({
+        "dimension": effective.def.dimension,
+        "breakdown": effective.def.breakdown,
+        "measures": effective.def.measures,
+        "limit": effective.def.limit_value(),
+    })
+}
+
 /// `BI-11`: the chart as this read sees it, with every parameter in its
 /// definition replaced by the read's value ([`lakehouse_bi::params::resolve_chart`]).
 /// A chart that names no parameter slot comes back as it is.

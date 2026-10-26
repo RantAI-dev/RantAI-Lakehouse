@@ -56,6 +56,7 @@ pub mod knowledge;
 pub mod maintenance_policy;
 pub mod overview;
 pub mod pipelines;
+pub mod public_links;
 pub mod quality;
 pub mod queries;
 pub mod report_schedule;

@@ -160,14 +160,30 @@ async fn an_engine_failure_that_is_not_a_query_error_stays_fixed() {
 async fn a_public_link_tile_with_the_same_engine_error_stays_fixed() {
     let ch = failing_clickhouse().await;
     let app = app_with(&[("CH_URL", ch.uri())]).await;
-    let (_status, body) = send(
+    // PR #235 CI: an unknown token is a 404 before `ClickHouse` is asked
+    // (BI-19), so the old "some-token" made these assertions vacuous. A live
+    // link sends the request on to the board read, which fails over the
+    // stand-in with the planted engine error.
+    let token = "p_author_exception_live_link";
+    lakehouse_store::public_links::replace(
+        &app.pool,
+        "b_author_exception",
+        token,
+        time::OffsetDateTime::now_utc() + time::Duration::days(1),
+        None,
+        None,
+    )
+    .await
+    .expect("store a live public link");
+    let (status, body) = send(
         &app.router,
         Request::builder()
-            .uri("/api/public/dashboard/some-token")
+            .uri(format!("/api/public/dashboard/{token}"))
             .body(Body::empty())
             .expect("build request"),
     )
     .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
     assert!(!body.contains("Unknown identifier"), "{body}");
     assert!(!body.contains("UNKNOWN_IDENTIFIER"), "{body}");
     assert!(!body.contains("ch-internal"), "{body}");
@@ -243,6 +259,7 @@ async fn a_failing_tile_inside_a_signed_embed_is_the_fixed_message_with_a_refere
     let token = lakehouse_embed::sign_embed(
         &lakehouse_embed::EmbedClaims {
             resource: Some(lakehouse_embed::EmbedResource {
+                chart: None,
                 dashboard: Some("b_embed".to_owned()),
             }),
             params: None,
@@ -376,6 +393,7 @@ async fn combined_embed(layer: Value) -> Value {
     let token = lakehouse_embed::sign_embed(
         &lakehouse_embed::EmbedClaims {
             resource: Some(lakehouse_embed::EmbedResource {
+                chart: None,
                 dashboard: Some("b_embed".to_owned()),
             }),
             params: None,

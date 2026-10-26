@@ -77,7 +77,9 @@ export const dashboardService = clickhouseDashboardService
  * a feature imports them from `@/services` and not from a client
  * (`PR #199 review M SHOULD-FIX BI-16 7`).
  */
-export type { Board, BoardTab, LayoutMap, PhoneTile, TileBox } from "./contracts/dashboards"
+export type {
+  Board, BoardChart, BoardTab, EmbedInfo, FilterMode, LayoutMap, PhoneTile, PublicLink, PublicLinkState, TileBox,
+} from "./contracts/dashboards"
 /** Calculated fields of a mart or SQL source (BI-8). */
 export const calcFieldService = calcFieldClientService
 /** Reusable metrics and segments (BI-2). */
