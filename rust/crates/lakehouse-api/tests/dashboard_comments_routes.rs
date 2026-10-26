@@ -529,3 +529,71 @@ async fn an_edit_that_adds_a_mention_checks_the_new_person_only() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
+
+/// `BI-19` E review E-5: a service identity has no `app_user` row, so it is told
+/// so in a sentence (403) on every route that would write its id, not a 500 from
+/// the author foreign key.
+#[tokio::test]
+async fn a_service_token_is_refused_in_a_sentence_on_post_edit_delete_and_the_picker() {
+    const TOKEN: &str = "svc-comments-fixture-token";
+    let (router, pool, _ch) = app().await;
+    let identity = lakehouse_store::identity::create_service_identity(
+        &pool,
+        &lakehouse_store::identity::CreateServiceIdentityInput {
+            name: "test-comments".to_owned(),
+            scopes: vec!["dashboard:read".to_owned(), "dashboard:write".to_owned()],
+            environment: "test".to_owned(),
+        },
+    )
+    .await
+    .unwrap();
+    lakehouse_auth::service_token::ensure_service_credential(
+        &pool,
+        identity.id.parse().unwrap(),
+        &lakehouse_auth::Secret::new(TOKEN.to_owned()),
+    )
+    .await
+    .unwrap();
+    let id = Uuid::new_v4();
+    let calls = [
+        (
+            "POST",
+            "/api/dashboard/comments".to_owned(),
+            Some(json!({ "board": "b1", "body": "hi" })),
+        ),
+        (
+            "PUT",
+            format!("/api/dashboard/comments/{id}"),
+            Some(json!({ "body": "hi" })),
+        ),
+        ("DELETE", format!("/api/dashboard/comments/{id}"), None),
+        (
+            "GET",
+            "/api/dashboard/comments/people?board=b1&q=a".to_owned(),
+            None,
+        ),
+    ];
+    for (method, uri, body) in calls {
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(&uri)
+                    .header("authorization", format!("Bearer {TOKEN}"))
+                    .header("content-type", "application/json")
+                    .body(body.map_or_else(Body::empty, |b| Body::from(b.to_string())))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{method} {uri}");
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            body["error"],
+            "Comments are for people; a service identity cannot post, edit, delete or look people up.",
+            "{method} {uri}"
+        );
+    }
+}

@@ -57,10 +57,12 @@
 //! SEC-11: every sentence is ours; store and `ClickHouse` text goes to the log
 //! under a reference.
 
+use std::sync::Arc;
+
 use axum::Extension;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
-use lakehouse_auth::Principal;
+use lakehouse_auth::{Principal, PrincipalId};
 use lakehouse_bi::access::Level;
 use lakehouse_bi::store::{self, Board};
 use lakehouse_core::ApiError;
@@ -88,6 +90,8 @@ const TOO_LONG: &str = "A comment can have at most 2000 characters.";
 const CONTROL_CHARS: &str = "A comment cannot contain control characters.";
 const MENTION_REFUSED: &str = "One of the people mentioned cannot see this dashboard.";
 const TOO_MANY_MENTIONS: &str = "A comment can mention at most 20 people.";
+const SERVICE_REFUSED: &str =
+    "Comments are for people; a service identity cannot post, edit, delete or look people up.";
 const NOT_THE_AUTHOR: &str = "Only the author can change a comment.";
 const NOT_AUTHOR_OR_MANAGER: &str =
     "Only the author or someone who manages the dashboard can delete a comment.";
@@ -114,16 +118,17 @@ struct Target {
     key: String,
     /// `None` for the built-in dashboard.
     board: Option<Board>,
-    scope: Scope,
+    /// Shared so a caller that resolves many dashboards (the bell) resolves the
+    /// caller's scope once (`BI-19` E review E-3).
+    scope: Arc<Scope>,
 }
 
 impl Target {
     /// Whether the caller manages the dashboard (may delete others' comments).
     fn manageable(&self) -> bool {
-        match &self.board {
-            Some(board) => self.scope.require_on_board(board, Level::Manage).is_ok(),
-            None => self.scope.require_root(Level::Manage).is_ok(),
-        }
+        self.scope
+            .require_known(self.board.as_ref(), Level::Manage)
+            .is_ok()
     }
 
     fn name(&self) -> String {
@@ -133,21 +138,36 @@ impl Target {
     }
 }
 
-/// Resolve `board` for `principal` at `view`: the one place that decides a
-/// comment route may touch a dashboard.
-async fn target_for(
-    state: &AppState,
-    principal: &Principal,
-    board: &str,
-) -> Result<Target, ApiError> {
-    pool_of(state)?;
-    let scope = scope_for_write(state, principal).await?;
+/// `BI-19` E review E-5: a service identity has no `app_user` row, so its
+/// comment would fail the author foreign key as a 500. Refuse it up front with
+/// a sentence instead.
+fn refuse_service(principal: &Principal) -> Result<(), ApiError> {
+    match principal.id {
+        PrincipalId::User(_) => Ok(()),
+        PrincipalId::Service(_) => Err(ApiError::PermissionDenied(SERVICE_REFUSED.to_owned())),
+    }
+}
+
+/// Resolve `board` at `view` for a caller whose `scope` is already worked out:
+/// the one place that decides a comment route may touch a dashboard.
+async fn target_with(state: &AppState, scope: Arc<Scope>, board: &str) -> Result<Target, ApiError> {
     let id = board.trim();
     let board = require_board_level(state, &scope, id, Level::View).await?;
     let key = board
         .as_ref()
         .map_or_else(|| store::DEFAULT_BOARD_ID.to_owned(), |b| b.id.clone());
     Ok(Target { key, board, scope })
+}
+
+/// [`target_with`] after resolving `principal`'s scope.
+async fn target_for(
+    state: &AppState,
+    principal: &Principal,
+    board: &str,
+) -> Result<Target, ApiError> {
+    pool_of(state)?;
+    let scope = Arc::new(scope_for_write(state, principal).await?);
+    target_with(state, scope, board).await
 }
 
 /// [`target_for`] with a comment's own not-found sentence, for the routes that
@@ -221,11 +241,16 @@ async fn can_see(
     if !crate::routes::reports::shares_a_tenant(&author.tenant_ids, &person.tenant_ids) {
         return Ok(false);
     }
-    match target_for(state, &person, &target.key).await {
-        Ok(_) => Ok(true),
-        Err(ApiError::NotFound(_) | ApiError::PermissionDenied(_)) => Ok(false),
-        Err(other) => Err(other),
-    }
+    // `BI-19` E review E-3: the person's scope once, judged against the board
+    // the caller already fetched (no second `ClickHouse` read per candidate).
+    let scope = match scope_for_write(state, &person).await {
+        Ok(scope) => scope,
+        Err(ApiError::NotFound(_) | ApiError::PermissionDenied(_)) => return Ok(false),
+        Err(other) => return Err(other),
+    };
+    Ok(scope
+        .require_known(target.board.as_ref(), Level::View)
+        .is_ok())
 }
 
 /// Every mentioned person must see the dashboard (D15).
@@ -307,7 +332,7 @@ pub struct BoardQuery {
 }
 
 /// `GET /api/dashboard/comments?board=` — the dashboard's comments (the newest
-/// 200, oldest first).
+/// 200, oldest first; `truncated` says older ones are left out).
 ///
 /// # Errors
 ///
@@ -325,7 +350,7 @@ pub async fn list(
     }
     let target = target_for(&state, &principal, board).await?;
     let pool = pool_of(&state)?;
-    let rows = comments::list(pool, &target.key)
+    let (rows, truncated) = comments::list(pool, &target.key)
         .await
         .map_err(|e| store_failure(&e))?;
     let ids: Vec<Uuid> = rows.iter().map(|c| c.id).collect();
@@ -343,7 +368,9 @@ pub async fn list(
             comment_json(c, &who, caller, manages)
         })
         .collect();
-    Ok(ApiJson(json!({ "comments": items })))
+    Ok(ApiJson(
+        json!({ "comments": items, "truncated": truncated }),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -373,6 +400,7 @@ pub async fn post(
     Extension(principal): Extension<Principal>,
     body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
+    refuse_service(&principal)?;
     let parsed: PostBody =
         serde_json::from_slice(&body).map_err(|_| ApiError::BadRequest(BODY_SHAPE.to_owned()))?;
     // Access before the body is judged: a caller who cannot see the dashboard
@@ -383,16 +411,16 @@ pub async fn post(
     let mentions = parsed_mentions(&parsed.mentions, author)?;
     require_all_see(&state, &principal, &target, &mentions).await?;
     let pool = pool_of(&state)?;
-    let id = comments::insert(pool, &target.key, author, &text, &mentions)
+    let (id, to_email) = comments::insert(pool, &target.key, author, &text, &mentions)
         .await
         .map_err(|e| store_failure(&e))?;
-    notify(&state, &principal, &target, &mentions);
+    notify(&state, &principal, &target, &to_email);
     Ok(ApiJson(one_json(&state, &principal, &target, id).await?))
 }
 
 /// `PUT /api/dashboard/comments/{id}` — the author changes the text and,
 /// when `mentions` is present, the people mentioned. Only people newly
-/// mentioned are notified.
+/// mentioned (and with no other unread mention here) are emailed.
 ///
 /// # Errors
 ///
@@ -404,6 +432,7 @@ pub async fn edit(
     Path(id): Path<Uuid>,
     body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
+    refuse_service(&principal)?;
     let parsed: EditBody =
         serde_json::from_slice(&body).map_err(|_| ApiError::BadRequest(EDIT_SHAPE.to_owned()))?;
     let pool = pool_of(&state)?;
@@ -435,11 +464,11 @@ pub async fn edit(
         .filter(|user| !already.contains(user))
         .collect();
     require_all_see(&state, &principal, &target, &fresh).await?;
-    let added = comments::update(pool, id, &text, &mentions)
+    let to_email = comments::update(pool, id, &text, &mentions)
         .await
         .map_err(|e| store_failure(&e))?
         .ok_or_else(|| ApiError::NotFound(COMMENT_NOT_FOUND.to_owned()))?;
-    notify(&state, &principal, &target, &added);
+    notify(&state, &principal, &target, &to_email);
     Ok(ApiJson(one_json(&state, &principal, &target, id).await?))
 }
 
@@ -455,6 +484,7 @@ pub async fn remove(
     Extension(principal): Extension<Principal>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<ApiJson<Value>> {
+    refuse_service(&principal)?;
     let pool = pool_of(&state)?;
     let comment = comments::get(pool, id)
         .await
@@ -478,7 +508,9 @@ pub struct PeopleQuery {
 }
 
 /// `GET /api/dashboard/comments/people?board=&q=` — the @ picker: active people
-/// whose own access reaches the dashboard, at most 10. Somebody who cannot see
+/// whose **name** contains `q` and whose own access reaches the dashboard, at
+/// most 10 (`BI-19` E review E-2: an address, or a piece of one, matches nobody,
+/// so the picker is no way to look up who has which address). Somebody who cannot see
 /// the dashboard is not offered, so the picker never offers a mention the post
 /// would refuse, and it is no way to list who can see a dashboard they are
 /// not on (the caller must see it themselves first).
@@ -491,13 +523,14 @@ pub async fn people(
     Extension(principal): Extension<Principal>,
     Query(q): Query<PeopleQuery>,
 ) -> ApiResult<ApiJson<Value>> {
+    refuse_service(&principal)?;
     let board = q.board.as_deref().map(str::trim).unwrap_or_default();
     if board.is_empty() {
         return Err(ApiError::BadRequest("board is required".to_owned()).into());
     }
     let target = target_for(&state, &principal, board).await?;
     let pool = pool_of(&state)?;
-    let found = lakehouse_store::report_subscriptions::search_active_users(
+    let found = lakehouse_store::report_subscriptions::search_active_user_names(
         pool,
         q.q.as_deref().unwrap_or("").trim(),
         PICKER_CANDIDATES,
@@ -507,12 +540,12 @@ pub async fn people(
     .map_err(|e| store_failure(&e))?;
     let me = principal.id.uuid();
     let mut shown: Vec<Value> = Vec::new();
-    for (id, name, _email) in found {
+    for (id, name) in found {
         if shown.len() >= PICKER_SHOWN {
             break;
         }
         if id != me && can_see(&state, &principal, &target, id).await? {
-            // No address: a mention needs a name, and the picker is not a directory.
+            // Name only, matched on the name only (E-2).
             shown.push(json!({ "id": id, "name": name }));
         }
     }
@@ -551,12 +584,18 @@ pub(crate) async fn bell_lines(
     let unread = comments::unread_mentions(pool, principal.id.uuid())
         .await
         .map_err(|e| store_failure(&e))?;
+    if unread.is_empty() {
+        return Ok(Vec::new());
+    }
+    // `BI-19` E review E-3: the reader's scope once for the whole bell, not once
+    // per dashboard.
+    let scope = Arc::new(scope_for_write(state, principal).await?);
     let mut by_board: std::collections::HashMap<String, Option<Target>> =
         std::collections::HashMap::new();
     let mut lines = Vec::new();
     for mention in unread {
         if !by_board.contains_key(&mention.board_id) {
-            let target = match target_for(state, principal, &mention.board_id).await {
+            let target = match target_with(state, Arc::clone(&scope), &mention.board_id).await {
                 Ok(target) => Some(target),
                 Err(ApiError::NotFound(_) | ApiError::PermissionDenied(_)) => None,
                 Err(other) => return Err(other),
@@ -581,8 +620,29 @@ pub(crate) async fn bell_lines(
     Ok(lines)
 }
 
-/// Email each newly mentioned person (when `SMTP_HOST` is set): who, which
-/// dashboard, the link. Not the comment's text, not a chart or a value (E3).
+/// The email a mention sends: who, which dashboard, the link. The signature is
+/// the guarantee (`BI-19` E review E-4): it is given no comment text, chart or
+/// value (feature E3), and every name is escaped as text.
+fn mention_email(author: &str, board: &str, link: Option<&str>) -> String {
+    use crate::routes::report_runner::html_text;
+    match link {
+        Some(link) => format!(
+            "<p>{} mentioned you in a comment on the dashboard {}.</p><p><a href=\"{2}\">{2}</a></p>",
+            html_text(author),
+            html_text(board),
+            html_text(link)
+        ),
+        None => format!(
+            "<p>{} mentioned you in a comment on the dashboard {}.</p>",
+            html_text(author),
+            html_text(board)
+        ),
+    }
+}
+
+/// Email the people the store chose (when `SMTP_HOST` is set): newly mentioned
+/// and with no other unread mention on this dashboard (`BI-19` E review E-1).
+/// Not the comment's text, not a chart or a value (E3).
 /// Runs in the background and is best effort: a failed send never fails or
 /// delays the comment, and is logged without the address.
 fn notify(state: &AppState, author: &Principal, target: &Target, people: &[Uuid]) {
@@ -595,25 +655,10 @@ fn notify(state: &AppState, author: &Principal, target: &Target, people: &[Uuid]
     let sender =
         lakehouse_notify::EmailSender::new(crate::routes::alerts::smtp_config(&state.config));
     let link = crate::routes::report_runner::dashboard_link(state, &target.key);
-    let board_name = target.name();
-    let author_name = author.display_name.clone();
+    let html = mention_email(&author.display_name, &target.name(), link.as_deref());
     let people = people.to_vec();
     tokio::spawn(async move {
-        use crate::routes::report_runner::html_text;
         let subject = "You were mentioned in a comment";
-        let html = match &link {
-            Some(link) => format!(
-                "<p>{} mentioned you in a comment on the dashboard {}.</p><p><a href=\"{2}\">{2}</a></p>",
-                html_text(&author_name),
-                html_text(&board_name),
-                html_text(link)
-            ),
-            None => format!(
-                "<p>{} mentioned you in a comment on the dashboard {}.</p>",
-                html_text(&author_name),
-                html_text(&board_name)
-            ),
-        };
         for user in people {
             let Ok(person) = lakehouse_store::identity::get_user(&pool, &user.to_string()).await
             else {
@@ -632,6 +677,57 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    /// `BI-19` E review E-4: names are escaped, and the email is exactly the
+    /// fixed sentences around the names and the link (no place for a comment's
+    /// text, which `mention_email` is never given).
+    #[test]
+    fn the_mention_email_escapes_names_and_carries_no_comment_text() {
+        let html = mention_email(
+            "<script>alert(1)</script>",
+            "Q3 \"board\" & <b>co</b>",
+            Some("https://console.example/d?x=1&y=2"),
+        );
+        assert!(!html.contains("<script>"), "{html}");
+        assert!(!html.contains("<b>"), "{html}");
+        assert!(
+            html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"),
+            "{html}"
+        );
+        assert!(
+            html.contains("Q3 &quot;board&quot; &amp; &lt;b&gt;co&lt;/b&gt;"),
+            "{html}"
+        );
+        assert!(html.contains("x=1&amp;y=2"), "{html}");
+        assert_eq!(
+            mention_email("Ann", "Sales", None),
+            "<p>Ann mentioned you in a comment on the dashboard Sales.</p>"
+        );
+        assert_eq!(
+            mention_email("Ann", "Sales", Some("https://c.example/d")),
+            "<p>Ann mentioned you in a comment on the dashboard Sales.</p>\
+             <p><a href=\"https://c.example/d\">https://c.example/d</a></p>"
+        );
+    }
+
+    /// `BI-19` E review E-5.
+    #[test]
+    fn a_service_identity_is_refused_with_a_sentence() {
+        let mut principal = Principal {
+            id: PrincipalId::User(Uuid::new_v4()),
+            tenant_ids: Vec::new(),
+            display_name: "t".to_owned(),
+            permissions: lakehouse_auth::PermissionSet::default(),
+            provider: "session".to_owned(),
+            must_change_password: false,
+            role_names: Vec::new(),
+        };
+        assert!(refuse_service(&principal).is_ok());
+        principal.id = PrincipalId::Service(Uuid::new_v4());
+        assert!(
+            matches!(refuse_service(&principal), Err(ApiError::PermissionDenied(m)) if m == SERVICE_REFUSED)
+        );
+    }
 
     #[test]
     fn text_is_trimmed_and_bounded() {

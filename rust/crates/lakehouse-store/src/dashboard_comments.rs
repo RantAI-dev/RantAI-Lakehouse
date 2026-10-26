@@ -65,12 +65,14 @@ pub struct Mention {
 const COMMENT_COLUMNS: &str = "c.id, c.board_id, c.author_id, u.name AS author_name, c.body, \
      c.created_at, c.edited_at";
 
-/// The newest [`PANEL_LIMIT`] live comments of a dashboard, oldest first.
+/// The newest [`PANEL_LIMIT`] live comments of a dashboard, oldest first, and
+/// whether older ones exist that are not returned (`BI-19` E review E-6c: the
+/// panel says so rather than looking complete).
 ///
 /// # Errors
 ///
 /// [`StoreError::Database`] if the query fails.
-pub async fn list(pool: &PgPool, board_id: &str) -> Result<Vec<Comment>, StoreError> {
+pub async fn list(pool: &PgPool, board_id: &str) -> Result<(Vec<Comment>, bool), StoreError> {
     // safe: only the constant `COMMENT_COLUMNS` is formatted in; values are bound (SEC-41).
     let mut rows: Vec<Comment> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {COMMENT_COLUMNS} FROM dashboard_comment c \
@@ -79,11 +81,15 @@ pub async fn list(pool: &PgPool, board_id: &str) -> Result<Vec<Comment>, StoreEr
          ORDER BY c.created_at DESC, c.id DESC LIMIT $2"
     )))
     .bind(board_id)
-    .bind(PANEL_LIMIT)
+    // One more than the panel shows, to know whether anything is left out.
+    .bind(PANEL_LIMIT + 1)
     .fetch_all(pool)
     .await?;
+    let shown = usize::try_from(PANEL_LIMIT).unwrap_or(usize::MAX);
+    let truncated = rows.len() > shown;
+    rows.truncate(shown);
     rows.reverse();
-    Ok(rows)
+    Ok((rows, truncated))
 }
 
 /// One live comment; a deleted or unknown id is `None`.
@@ -122,7 +128,50 @@ pub async fn mentions_of(
     .await?)
 }
 
-/// Post a comment with its mentions, in one transaction.
+/// Of `users`, those with no unread mention on `board_id` other than the one
+/// in comment `except`: the only people a new mention may email.
+///
+/// `BI-19` E review E-1: anyone with `view` can post or edit in a loop, so
+/// without this rule a loop emails up to 20 colleagues per request. One email
+/// per person per dashboard until they read it (the bell's mark-read clears the
+/// condition). It runs in the transaction that writes the mention, under a lock
+/// on the dashboard, so two comments posted at once cannot both email the same
+/// person.
+async fn first_unread(
+    tx: &mut sqlx::PgConnection,
+    board_id: &str,
+    except: Uuid,
+    users: &[Uuid],
+) -> Result<Vec<Uuid>, StoreError> {
+    let rows: Vec<(Uuid,)> = sqlx::query_as(
+        "SELECT u FROM unnest($3::uuid[]) AS u \
+         WHERE NOT EXISTS ( \
+             SELECT 1 FROM dashboard_comment_mention m \
+             JOIN dashboard_comment c ON c.id = m.comment_id \
+             WHERE m.user_id = u AND m.read_at IS NULL AND c.deleted_at IS NULL \
+               AND c.board_id = $1 AND c.id <> $2)",
+    )
+    .bind(board_id)
+    .bind(except)
+    .bind(users)
+    .fetch_all(tx)
+    .await?;
+    Ok(rows.into_iter().map(|(u,)| u).collect())
+}
+
+/// Take the dashboard's mention lock for the rest of the transaction.
+async fn lock_board(tx: &mut sqlx::PgConnection, board_id: &str) -> Result<(), StoreError> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+        .bind(format!("dashboard_comment_mention:{board_id}"))
+        .execute(tx)
+        .await?;
+    Ok(())
+}
+
+/// Post a comment with its mentions, in one transaction. Returns the comment's
+/// id and the mentioned people who are to be emailed: those with no other
+/// unread mention on this dashboard (`BI-19` E review E-1). Every mentioned
+/// person gets the bell line either way.
 ///
 /// # Errors
 ///
@@ -133,8 +182,9 @@ pub async fn insert(
     author: Uuid,
     body: &str,
     mentions: &[Uuid],
-) -> Result<Uuid, StoreError> {
+) -> Result<(Uuid, Vec<Uuid>), StoreError> {
     let mut tx = pool.begin().await?;
+    lock_board(&mut tx, board_id).await?;
     let (id,): (Uuid,) = sqlx::query_as(
         "INSERT INTO dashboard_comment (board_id, author_id, body) VALUES ($1, $2, $3) \
          RETURNING id",
@@ -152,12 +202,14 @@ pub async fn insert(
     .bind(mentions)
     .execute(&mut *tx)
     .await?;
+    let email = first_unread(&mut tx, board_id, id, mentions).await?;
     tx.commit().await?;
-    Ok(id)
+    Ok((id, email))
 }
 
 /// Replace a live comment's text and mentions, in one transaction. Returns the
-/// people newly mentioned (so only they are notified), or `None` when the
+/// people newly mentioned who are to be emailed (no other unread mention on
+/// this dashboard, as for [`insert`]; `BI-19` E review E-1), or `None` when the
 /// comment is deleted or unknown. A person who stays mentioned keeps their
 /// `read_at`.
 ///
@@ -171,6 +223,16 @@ pub async fn update(
     mentions: &[Uuid],
 ) -> Result<Option<Vec<Uuid>>, StoreError> {
     let mut tx = pool.begin().await?;
+    let Some((board_id,)): Option<(String,)> = sqlx::query_as(
+        "SELECT board_id FROM dashboard_comment WHERE id = $1 AND deleted_at IS NULL",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?
+    else {
+        return Ok(None);
+    };
+    lock_board(&mut tx, &board_id).await?;
     let changed = sqlx::query(
         "UPDATE dashboard_comment SET body = $2, edited_at = now() \
          WHERE id = $1 AND deleted_at IS NULL",
@@ -199,8 +261,10 @@ pub async fn update(
     .bind(mentions)
     .fetch_all(&mut *tx)
     .await?;
+    let added: Vec<Uuid> = added.into_iter().map(|(u,)| u).collect();
+    let email = first_unread(&mut tx, &board_id, id, &added).await?;
     tx.commit().await?;
-    Ok(Some(added.into_iter().map(|(u,)| u).collect()))
+    Ok(Some(email))
 }
 
 /// Delete a live comment (the row stays, with who deleted it and when).

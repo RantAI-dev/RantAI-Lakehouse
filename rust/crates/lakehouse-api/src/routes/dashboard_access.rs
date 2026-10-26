@@ -309,6 +309,29 @@ impl Scope {
         }
     }
 
+    /// Require `needed` on a dashboard already fetched: its row, or `None` for
+    /// the built-in dashboard (judged at the root, and a 404 for somebody who
+    /// does not see it). Lets a caller that checks many people against one
+    /// dashboard read the row once (`BI-19` E review E-3).
+    ///
+    /// # Errors
+    ///
+    /// As [`require_on_board`](Self::require_on_board) and
+    /// [`require_root`](Self::require_root).
+    pub(crate) fn require_known(
+        &self,
+        board: Option<&lakehouse_bi::store::Board>,
+        needed: Level,
+    ) -> Result<(), ApiError> {
+        if let Some(board) = board {
+            return self.require_on_board(board, needed);
+        }
+        if !self.viewer.sees_builtin() {
+            return Err(ApiError::NotFound(BOARD_NOT_FOUND.to_owned()));
+        }
+        self.require_root(needed)
+    }
+
     /// Require `needed` on the dashboard whose row is `board`.
     ///
     /// # Errors
@@ -393,10 +416,7 @@ pub(crate) async fn require_board_level(
     if id.is_empty() || id == store::DEFAULT_BOARD_ID {
         // The built-in dashboard belongs to the starting point, like a chart
         // filed without a board (`require_chart_board`).
-        if !scope.viewer.sees_builtin() {
-            return Err(ApiError::NotFound(BOARD_NOT_FOUND.to_owned()));
-        }
-        scope.require_root(needed)?;
+        scope.require_known(None, needed)?;
         return Ok(None);
     }
     let board = store::get_board(&state.clickhouse, id, &Viewer::system())
