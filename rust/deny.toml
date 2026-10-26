@@ -66,12 +66,86 @@ targets = []
 # `webpki-roots` 0.26.11, the semver shim `sqlx-core` 0.8.6 required, and
 # `sqlx` 0.9 depends on `webpki-roots` 1.x directly (0.26 is no longer in
 # `Cargo.lock`: `cargo tree -i webpki-roots@0.26.11` finds no package).
+#
+# RUSTSEC-2026-0391 (`zstd` 0.13.3: data from an abandoned stream leaks
+# into the next stream on a reused context), RUSTSEC-2026-0398 and
+# RUSTSEC-2026-0403 (`zstd-safe` 7.2.4: `Seekable::decompress` sets a
+# `Vec` length past its capacity; a failed legacy frame extends a `Vec`
+# over uninitialized memory), and RUSTSEC-2026-0410 (`zstd-sys` 2.0.16:
+# the wasm32 allocator shim corrupts memory on allocation failure). Four
+# advisories in one stack, each with a fixed release upstream (`zstd`
+# >= 0.14.3, `zstd-safe` >= 8.2.0, `zstd-sys` >= 2.1.2) that this tree
+# cannot take yet. The chain is:
+#
+#   zstd <- apache-avro, parquet <- iceberg <- lakehouse-iceberg
+#                                <- lakehouse-api
+#
+# (`lakehouse-api` also depends on `apache-avro` and `parquet` directly,
+# for the upload readers; `iceberg` enables `apache-avro`'s `zstandard`
+# feature and depends on `zstd` itself.)
+#
+# There is no fix available today. `iceberg` 0.10.1 is the latest release
+# and requires `zstd ^0.13.3`, `parquet ^58` and `apache-avro ^0.21`;
+# `apache-avro` 0.22.0, the latest, still requires `zstd ^0.13.3`; only
+# `parquet` 60 moved to `zstd` 0.14, and `iceberg` cannot take it. So no
+# `cargo update` changes any of the three versions, and there is no
+# patched release to wait for either.
+#
+# Reachability, checked against the code rather than assumed:
+#
+# - The API DOES decompress zstd on data it did not write. The Parquet
+#   upload preview decodes the first row group of an uploaded file
+#   (`lakehouse-api/src/upload_parquet.rs`, `convert_capped` ->
+#   `ParquetRecordBatchReaderBuilder`), and a file whose pages are
+#   ZSTD-compressed goes through `parquet`'s `ZSTDCodec` ->
+#   `zstd::bulk::Decompressor`. The footer read (`inspect` ->
+#   `ArrowReaderMetadata::load`) decodes thrift metadata only and
+#   decompresses nothing. The uploaded Avro path is safe by
+#   construction: `upload_formats::read_avro` reads the container's
+#   `avro.codec` from the header and refuses every codec but `null`
+#   BEFORE `apache_avro::Reader::new` (`PR #186 review BLOCKER 1`), so an
+#   uploaded `zstandard` Avro is refused before a block is read.
+# - None of the four advisories' affected functions is on that path.
+#   0391 is `zstd::stream::raw::{Decoder,Encoder}::with_context`, the
+#   only constructors that take a BORROWED context; every context in
+#   this tree is created fresh and owned (`zstd::bulk::*`,
+#   `zstd::stream::decode_all`, `zstd::{Encoder,Decoder}::new`), so no
+#   context is ever reused across streams. 0398 is
+#   `zstd_safe::seekable::Seekable::decompress`; that module is
+#   `#[cfg(feature = "seekable")]`, the feature is not a default, and
+#   `zstd` 0.13.3 has no `seekable` feature and no `seekable` module at
+#   all, so the function is not even compiled into our binaries. 0403 is
+#   `zstd_safe::DCtx::decompress_stream`, whose length extension only
+#   happens for a `Vec<u8>` destination; the advisory states the read
+#   decoder, `decode_all` and the bulk API are not affected, and this
+#   tree uses only those (never `zstd::stream::write::Decoder`). 0410 is
+#   the wasm32 allocator shim ("Affected Architectures: wasm32"); we
+#   build x86_64 Linux.
+# - The Iceberg side reads the same stack: `lakehouse-iceberg`'s
+#   `read_all` scans Parquet data files (the Gold mart's are written by
+#   this workspace and are UNCOMPRESSED, parquet's default codec; the
+#   Bronze ones are written by Debezium, whose codec is its own default
+#   and not ours), and `iceberg` reads the Avro manifests with
+#   `apache-avro`, which would honour a `zstandard` codec if a manifest
+#   declared one. Those files are written by the Iceberg clients and the
+#   catalog, not by an upload.
+# - So no advisory is reachable today, but the code a fix would land in
+#   is a user-controlled one: an uploaded Parquet file's pages are
+#   decompressed by Rust. A mitigation (refusing zstd-compressed
+#   uploads in the API) is the product owner's call, tracked as `SEC-53`.
+#
+# Drop when `iceberg` releases a version on parquet >= 60 and
+# apache-avro on zstd >= 0.14.3, then `cargo update`.
 ignore = [
     "RUSTSEC-2023-0071",
     "RUSTSEC-2024-0436",
     "RUSTSEC-2026-0367",
     "RUSTSEC-2026-0368",
     "RUSTSEC-2026-0369",
+    "RUSTSEC-2026-0391",
+    "RUSTSEC-2026-0398",
+    "RUSTSEC-2026-0403",
+    "RUSTSEC-2026-0410",
 ]
 
 [licenses]
