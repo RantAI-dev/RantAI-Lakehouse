@@ -43,6 +43,19 @@ afterEach(() => {
   cleanup()
 })
 
+/**
+ * Picks an option of a base-ui Select the way a pointer does. The item only commits a click that
+ * began with a pointerdown on it (a bare `fireEvent.click` is dropped as a stray mouse click), so a
+ * test that skips the pointerdown never changes the selection (PR #259 CI (folder picker tests)).
+ */
+function pickOption(option: HTMLElement) {
+  fireEvent.pointerDown(option, { button: 0, pointerType: "mouse" })
+  fireEvent.mouseDown(option, { button: 0 })
+  fireEvent.pointerUp(option, { button: 0, pointerType: "mouse" })
+  fireEvent.mouseUp(option, { button: 0 })
+  fireEvent.click(option)
+}
+
 function json(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } })
 }
@@ -1047,7 +1060,7 @@ describe("UploadFilePage, Table step, folders (DATA-35)", () => {
   it("sends the folder that was chosen", async () => {
     const calls = await openTable({ folders: FOLDERS, ingest: json({ upload: upload({ status: "ingesting" }), runId: "run-1" }) })
     fireEvent.click(screen.getByRole("combobox", { name: "Folder (optional)" }))
-    fireEvent.click(await screen.findByRole("option", { name: "Sales / Q1" }))
+    pickOption(await screen.findByRole("option", { name: "Sales / Q1" }))
     const body = await load(calls)
     expect(body.folderId).toBe("uf-q1")
   })
@@ -1099,7 +1112,7 @@ describe("UploadFilePage, Table step, folders (DATA-35)", () => {
       ingest: json({ upload: upload({ status: "ingesting" }), runId: "run-1" }),
     })
     fireEvent.click(screen.getByRole("combobox", { name: "Folder (optional)" }))
-    fireEvent.click(await screen.findByRole("option", { name: "No folder" }))
+    pickOption(await screen.findByRole("option", { name: "No folder" }))
     const body = await load(calls)
     expect(body.folderId).toBeNull()
   })
