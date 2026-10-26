@@ -128,6 +128,7 @@ use lakehouse_dagster::map_run_status;
 use lakehouse_store::PgPool;
 use lakehouse_store::audit::{self as store_audit, NewAuditEvent};
 use lakehouse_store::connectors;
+use lakehouse_store::upload_folders;
 use lakehouse_store::uploads::{
     self, FolderFilter, ListFilter, LoadClaim, LoadLimits, LoadMode, MarkOutcome, NewUpload,
     TableClaim, Upload,
@@ -280,6 +281,7 @@ const TABLE_NAME_RULE: &str = "Table names start with a lower-case letter and us
 const MODE_RULE: &str = "mode must be replace or append.";
 const ALSO_UPLOADS_RULE: &str =
     "alsoUploads must be a list of at most 9 upload ids, each used once, none of them this upload.";
+const FOLDER_ID_RULE: &str = "folderId must be text or null.";
 const OTHER_BUSY: &str = "One of the other files is already being loaded.";
 const ENCODING_RULE: &str = "encoding must be utf-8 or utf-16.";
 const DELIMITER_RULE: &str = "delimiter must be a comma, a semicolon, a tab or a pipe.";
@@ -1915,6 +1917,11 @@ struct IngestRequest {
     /// The other files of a load of several files (`DATA-17` slice 5), at most 9, as
     /// named; empty for a load of one file.
     also_uploads: Vec<String>,
+    /// The folder every file of the load is put in and the table remembers
+    /// (`DATA-35` decision 2, AD-4). `None`: the request said nothing, so the
+    /// table's remembered folder applies ([`effective_folder`]); `Some(None)`:
+    /// `folderId: null`, "no folder" chosen on purpose.
+    folder_id: Option<Option<String>>,
 }
 
 /// Why a raw table name is refused, or `None` (review finding C1).
@@ -1970,8 +1977,8 @@ fn text_field<'a>(fields: &'a Map<String, Value>, name: &str) -> Result<&'a str,
 
 /// Validate the body of `POST /api/uploads/{id}/ingest`: `bronzeTable`,
 /// `mode` (optional, `replace` by default), `encoding`, `delimiter`,
-/// `headerRow` and, optional, `sheet`, `columns` with `onBadValue`, and `alsoUploads`
-/// (`DATA-17` slice 5). All are checked; the load uses exactly what was confirmed
+/// `headerRow` and, optional, `sheet`, `columns` with `onBadValue`, `alsoUploads`
+/// (`DATA-17` slice 5) and `folderId` (`DATA-35`). All are checked; the load uses exactly what was confirmed
 /// and nothing is guessed (ADR 0014, decision 3).
 ///
 /// For a `conversion` (a workbook or a Parquet file) the dialect is not the
@@ -2034,6 +2041,12 @@ fn parse_ingest_request(
         Some(_) => return Err(bad(ALSO_UPLOADS_RULE)),
     };
     group::check_also_list(&also_uploads)?;
+    let folder_id = match fields.get("folderId") {
+        None => None,
+        Some(Value::Null) => Some(None),
+        Some(Value::String(id)) if !id.is_empty() => Some(Some(id.clone())),
+        Some(_) => return Err(bad(FOLDER_ID_RULE)),
+    };
     Ok(IngestRequest {
         table: table.to_owned(),
         mode,
@@ -2043,6 +2056,7 @@ fn parse_ingest_request(
         sheet,
         columns,
         also_uploads,
+        folder_id,
     })
 }
 
@@ -2406,6 +2420,7 @@ async fn claim_load(
     pool: &PgPool,
     row: &Upload,
     request: &IngestRequest,
+    folder_id: Option<&str>,
     converted: Option<&Converted>,
     limits: LoadLimits,
 ) -> ApiResult<Upload> {
@@ -2434,6 +2449,7 @@ async fn claim_load(
             load_mode: request.mode,
             column_spec: column_spec.as_ref(),
             on_bad_value,
+            folder_id,
         },
         limits,
     )
@@ -2454,6 +2470,34 @@ async fn claim_load(
             .into());
         }
     })
+}
+
+/// The folder a load puts its files in (`DATA-35` decision 2, plan AD-4): the one
+/// the request named, which must be the upload's tenant's (decision 5, `SEC-16`:
+/// another tenant's reads as a folder that does not exist, and nothing has been
+/// claimed yet); nothing when it said `null`; and, when it said nothing, the folder
+/// the table's claim remembers from its latest load, so a re-upload joins the
+/// table's folder (`None` for a new table or one whose folder was deleted).
+///
+/// # Errors
+///
+/// 404 for a folder that is not the tenant's; 500 on a database failure.
+async fn effective_folder(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    request: &IngestRequest,
+) -> ApiResult<Option<String>> {
+    match &request.folder_id {
+        Some(Some(folder)) => {
+            if upload_folders::folder_in_tenant(pool, tenant_id, folder).await? {
+                Ok(Some(folder.clone()))
+            } else {
+                Err(ApiError::NotFound(folders::FOLDER_NOT_FOUND.to_owned()).into())
+            }
+        }
+        Some(None) => Ok(None),
+        None => Ok(upload_folders::claim_folder(pool, tenant_id, &request.table).await?),
+    }
 }
 
 /// The reading the request confirmed, as the preview takes it.
@@ -2590,7 +2634,8 @@ async fn load_keys_of(
 /// file with no rows, and for a header with more than 1,000 columns under the
 /// confirmed reading (`SEC-17`, checked before any claim); 404
 /// for an unknown upload or another tenant's, or an unknown or other tenant's file of
-/// `alsoUploads`; 400 also for more than nine of them, a file of another kind, the files
+/// `alsoUploads`, or a `folderId` that is not a folder of the upload's tenant
+/// (`DATA-35`; a `folderId` that is not text is 400); 400 also for more than nine of them, a file of another kind, the files
 /// together over the cap and files whose columns differ; 409 when this upload (or one of
 /// `alsoUploads`) is still being received (`DATA-17`), is already loading, another is
 /// loading into that table, a connector loads it, or the
@@ -2625,6 +2670,7 @@ pub async fn ingest(
     let Some(tenant_id) = row.tenant_id else {
         return Err(not_found().into());
     };
+    let folder = effective_folder(pool, tenant_id, &request).await?;
     let others = group::members(
         &state,
         pool,
@@ -2668,7 +2714,15 @@ pub async fn ingest(
         return Err(ApiError::Conflict(TABLE_NOT_FREE.to_owned()).into());
     }
 
-    let claimed = claim_load(pool, &row, &request, converted.as_ref(), limits).await?;
+    let claimed = claim_load(
+        pool,
+        &row,
+        &request,
+        folder.as_deref(),
+        converted.as_ref(),
+        limits,
+    )
+    .await?;
 
     let run_id = launch(&state, pool, &claimed, &request, &load_keys, kind).await?;
     let attached = finish_launch_and_audit(
@@ -2724,6 +2778,9 @@ async fn finish_launch_and_audit(
         // `DATA-17` slice 5: the other files of the load, so the audit trail of the
         // primary says which uploads went into the table with it.
         map.insert("alsoUploads".to_owned(), json!(request.also_uploads));
+    }
+    if let (Value::Object(map), Some(folder)) = (&mut args, &attached.folder_id) {
+        map.insert("folderId".to_owned(), json!(folder));
     }
     if let Value::Object(map) = &mut args {
         match (converted, conversion) {
@@ -3222,6 +3279,28 @@ mod tests {
     }
 
     #[test]
+    fn the_folder_is_optional_text_or_null_and_nothing_else() {
+        let read = |value: Value| parse_ingest_request(&body(&value), None, None);
+        let mut with = valid();
+        assert_eq!(read(with.clone()).unwrap().folder_id, None, "said nothing");
+        with["folderId"] = json!(null);
+        assert_eq!(
+            read(with.clone()).unwrap().folder_id,
+            Some(None),
+            "said none"
+        );
+        with["folderId"] = json!("uf-1");
+        assert_eq!(
+            read(with.clone()).unwrap().folder_id,
+            Some(Some("uf-1".to_owned()))
+        );
+        for bad in [json!(3), json!(""), json!(["uf-1"]), json!(true)] {
+            with["folderId"] = bad;
+            assert_eq!(read(with.clone()).unwrap_err().to_string(), FOLDER_ID_RULE);
+        }
+    }
+
+    #[test]
     fn a_complete_body_is_accepted_and_mode_defaults_to_replace() {
         let request = parse_ingest_request(&body(&valid()), None, None).unwrap();
         assert_eq!(
@@ -3235,6 +3314,7 @@ mod tests {
                 sheet: None,
                 columns: None,
                 also_uploads: Vec::new(),
+                folder_id: None,
             }
         );
         let mut full = valid();

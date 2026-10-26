@@ -41,7 +41,7 @@ use crate::state::AppState;
 // ── Messages. Every one is fixed text; none carries upstream text. ───────
 
 const NO_TENANT: &str = "Your account belongs to no tenant, so folders cannot be used.";
-const FOLDER_NOT_FOUND: &str = "Folder not found.";
+pub(super) const FOLDER_NOT_FOUND: &str = "Folder not found.";
 const NAME_RULE: &str = "A folder name has 1 to 100 characters.";
 const NAME_TAKEN: &str = "A folder with that name already exists in the same place.";
 const TOO_DEEP: &str = "Folders can be nested at most 3 levels deep.";
