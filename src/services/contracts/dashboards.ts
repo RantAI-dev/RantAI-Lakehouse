@@ -132,7 +132,17 @@ export type DashboardService = {
    * a sample token, what has been withdrawn and which sites may frame it.
    * Needs `dashboard:read`.
    */
-  getEmbedInfo(board: string, signal?: AbortSignal): Promise<EmbedInfo>
+  getEmbedInfo(board: string, signal?: AbortSignal, chart?: string): Promise<EmbedInfo>
+  /** `BI-26`: save each filter's embed mode. Needs `dashboard:write`. */
+  setEmbedFilterModes(board: string, modes: Record<string, FilterMode>, signal?: AbortSignal): Promise<void>
+  /** `BI-26`: the charts of a dashboard, for the chart picker of the embed section. */
+  listBoardCharts(board: string, signal?: AbortSignal): Promise<BoardChart[]>
+  /** `BI-19` part A. Needs `dashboard:write`. */
+  getPublicLink(board: string, signal?: AbortSignal): Promise<PublicLinkState>
+  /** Make a link or change its expiry or password; refusals carry the server's sentence. */
+  savePublicLink(input: PublicLinkInput, signal?: AbortSignal): Promise<PublicLink>
+  /** End the link at once. */
+  endPublicLink(board: string, signal?: AbortSignal): Promise<void>
   /**
    * Replace the sites allowed to frame the board's embed pages. The server
    * validates and normalises them; a refusal arrives as `invalid_request`
@@ -272,6 +282,51 @@ export type EmbedInfo = {
   revokedBefore: number | null
   /** Sites allowed to frame the embed pages. */
   allowedOrigins: string[]
+  /** `BI-26`: each filter column's embed mode; a column not listed is hidden. */
+  filterModes?: Record<string, FilterMode>
+  /** `BI-26`: the dashboard's saved filter columns, the ones that can be given a mode. */
+  filterColumns?: string[]
+  /** `BI-26` review fix R3: filter columns that do not pick values; they can only be hidden. */
+  hiddenOnlyColumns?: string[]
+}
+
+/** What a viewer of a signed embed may do with one dashboard filter (`BI-26`). */
+export type FilterMode = "locked" | "editable" | "hidden"
+
+/** A chart of a dashboard, for the embed chart picker. */
+export type BoardChart = { id: string; title: string }
+
+/**
+ * A dashboard's public link (`BI-19` part A), from `GET`/`PUT
+ * /api/dashboard/public-link`. The password is never sent back: only
+ * `hasPassword`.
+ */
+export type PublicLink = {
+  token: string
+  /** RFC 3339. */
+  expiresAt: string
+  /** True once `expiresAt` has passed; the link no longer works. */
+  expired: boolean
+  hasPassword: boolean
+  createdAt: string
+}
+
+export type PublicLinkState = {
+  /** False while an administrator has switched public links off (Admin > Settings). */
+  enabled: boolean
+  link: PublicLink | null
+}
+
+/**
+ * What a save sends. `password` absent keeps it, `null` removes it, a string
+ * (8 to 128 characters) sets it; `newLink` makes a new token even when a live
+ * link exists.
+ */
+export type PublicLinkInput = {
+  board: string
+  expiresAt: string
+  password?: string | null
+  newLink?: boolean
 }
 
 export type CreateBoardInput = {

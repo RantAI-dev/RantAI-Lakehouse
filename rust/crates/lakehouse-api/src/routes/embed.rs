@@ -43,11 +43,15 @@ use crate::upstream_error;
 /// plan Hard Requirement 2).
 pub(crate) const EMBED_VIEWER_ROLE: &str = "Dashboard Viewer";
 
-/// `{ jwt }` — the `POST /api/embed/data` body shape.
+/// `{ jwt, filters? }` — the `POST /api/embed/data` body shape. `filters` is
+/// the dashboard page's filter shape (`BI-26`, plan D4): the values a viewer
+/// chose for the filters a manager made editable.
 #[derive(Debug, Default, Deserialize)]
 struct EmbedDataBody {
     #[serde(default)]
     jwt: Option<String>,
+    #[serde(default)]
+    filters: Option<Vec<FilterDef>>,
 }
 
 /// The one message every refused signed token gets (`SEC-12`): a bad
@@ -68,39 +72,165 @@ fn token_refused() -> Response {
         .into_response()
 }
 
-/// What a signed embed token opens: the board, its id, and the claims the
-/// token carried.
-struct EmbedGrant {
-    /// The board's id, as the token named it.
-    board_id: String,
-    /// The board, with its embed access read.
-    board: Board,
-    /// The token's claims (its locked `params`, its `iat` and `jti`).
-    claims: lakehouse_embed::EmbedClaims,
+/// Take the column of a hidden filter out of every tile's `filtersSkipped`
+/// (`BI-26` review NOTE): a tile that says which active filters it could not
+/// honour would otherwise name a filter the viewer is not meant to know of.
+/// Locked and editable filters, which the viewer knows, stay. Signed embeds only.
+fn strip_hidden_skips(body: &mut Value, access: &lakehouse_bi::embed_access::EmbedAccess) {
+    use lakehouse_bi::embed_access::FilterMode;
+    let Some(results) = body.get_mut("results").and_then(Value::as_object_mut) else {
+        return;
+    };
+    for tile in results.values_mut() {
+        let Some(list) = tile.get_mut("filtersSkipped").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        list.retain(|skipped| {
+            skipped
+                .get("column")
+                .and_then(Value::as_str)
+                .is_none_or(|column| access.mode_of(column) != FilterMode::Hidden)
+        });
+        if list.is_empty()
+            && let Some(map) = tile.as_object_mut()
+        {
+            map.remove("filtersSkipped");
+        }
+    }
 }
 
-/// The board a signed embed token opens — or the refusal the token gets.
+/// The filters of one signed-embed read (`BI-26` plan D3).
+struct ResolvedFilters {
+    /// What the tiles are filtered by.
+    filters: Vec<FilterDef>,
+    /// The columns whose filter the viewer may change here: editable, and not
+    /// set by the token.
+    editable: Vec<String>,
+}
+
+/// Work out the filters of a signed-embed read from the board's saved filters,
+/// each one's embed mode, the token's `params` and the viewer's values.
 ///
-/// The checks and the answers are the ones `POST /api/embed/data` has always
-/// given (`SEC-12`): a missing token is a 400, an unset secret a 503, a
-/// token that does not verify (a bad signature, a missing or too-long
-/// lifetime, an expired or withdrawn token, a token without a dashboard) the
-/// one fixed 401, and a board that is not there or has embedding off a 403.
+/// - `locked`: the token must name the column, else the read is refused
+///   (`Err(column)`; feature decision 6). A forgotten value never shows all rows.
+///   The token's value replaces the saved filter on that column (R1).
+/// - `editable`: the viewer's value replaces the saved one; with none the saved
+///   value applies.
+/// - `hidden` (and a column nobody chose a mode for): the saved value applies.
 ///
-/// `PR #246 review BLOCKER 1`: the embed's map route reads the same token
-/// the same way, so the two routes cannot disagree about what a token opens.
-async fn embed_grant(state: &AppState, jwt: Option<&str>) -> Result<EmbedGrant, Box<Response>> {
-    let Some(jwt) = jwt.filter(|s| !s.is_empty()) else {
-        return Err(Box::new(
-            (
-                StatusCode::BAD_REQUEST,
-                ApiJson(json!({ "error": "jwt is required" })),
-            )
-                .into_response(),
-        ));
+/// A viewer value for a column that is not editable, or that the token set, is
+/// dropped. The token's `params` are applied last, as before, and only narrow
+/// (feature decision 7): a legacy token that locks a column that is no filter
+/// keeps working.
+fn resolve_embed_filters(
+    saved: &[FilterDef],
+    access: &lakehouse_bi::embed_access::EmbedAccess,
+    params: Option<&std::collections::HashMap<String, Value>>,
+    viewer: &[FilterDef],
+) -> Result<ResolvedFilters, String> {
+    use lakehouse_bi::embed_access::FilterMode;
+    let token_sets = |column: &str| params.is_some_and(|p| p.contains_key(column));
+    let mode_of = |f: &FilterDef| {
+        if f.column.is_empty() {
+            FilterMode::Hidden
+        } else {
+            access.mode_of(&f.column)
+        }
     };
-    // SEC-12: the secret is configuration only. Unset means signed embedding
-    // is unavailable, said plainly; nothing is generated or stored.
+    for f in saved {
+        if mode_of(f) == FilterMode::Locked && !token_sets(&f.column) {
+            return Err(f.column.clone());
+        }
+    }
+    let mut editable: Vec<String> = Vec::new();
+    for f in saved {
+        if mode_of(f) == FilterMode::Editable
+            && !token_sets(&f.column)
+            && !editable.contains(&f.column)
+        {
+            editable.push(f.column.clone());
+        }
+    }
+    // BI-26 review fix (BLOCKER) R1: for a locked column, and an editable one
+    // the token sets, the token's value REPLACES the saved filter. Left in
+    // place, the saved value was ANDed with the token's: a board saved with
+    // `Bali` and a token for `Java` showed nothing, and a locked filter could
+    // never show a value outside the saved one. A hidden column keeps being
+    // ANDed with the saved filter, so tokens signed before filter modes (which
+    // lock a column that is hidden or no filter at all) read exactly as before.
+    let mut filters: Vec<FilterDef> = saved
+        .iter()
+        .filter(|f| {
+            let replaced = !f.column.is_empty()
+                && token_sets(&f.column)
+                && matches!(mode_of(f), FilterMode::Locked | FilterMode::Editable);
+            !replaced
+        })
+        .cloned()
+        .collect();
+    for v in viewer {
+        if v.column.is_empty() || !editable.contains(&v.column) {
+            tracing::info!(column = %v.column, "a viewer filter value for a column that is not editable was dropped");
+            continue;
+        }
+        filters.retain(|f| f.column != v.column);
+        filters.push(v.clone());
+    }
+    filters.extend(params_to_filters(params.cloned()));
+    Ok(ResolvedFilters { filters, editable })
+}
+
+/// What a verified token names, resolved to its dashboard (`BI-26` plan D1).
+pub(crate) struct Subject {
+    /// The dashboard every board check (embedding on, withdrawal, allowed
+    /// sites) is made on. For a chart token, the chart's own dashboard.
+    pub board_id: String,
+    /// The one chart a chart token may read; `None` for a dashboard token.
+    pub only_chart: Option<String>,
+}
+
+/// Resolve what a token names. `None` is a refusal and the caller answers it
+/// with the one token message: the token names nothing, or both a dashboard and
+/// a chart, or a chart that is unknown, in the trash or on a personal board
+/// (the chart is looked up as nobody in particular, like the payload). One
+/// helper for `data`, `frame_origins` and `revoke_token` (AGENTS rule 4).
+///
+/// # Errors
+///
+/// [`lakehouse_clickhouse::ChError`] when the chart list cannot be read.
+pub(crate) async fn subject_of(
+    ch: &ChClient,
+    resource: Option<&lakehouse_embed::EmbedResource>,
+) -> Result<Option<Subject>, lakehouse_clickhouse::ChError> {
+    match resource.and_then(lakehouse_embed::EmbedResource::target) {
+        Some(lakehouse_embed::EmbedTarget::Dashboard(id)) => Ok(Some(Subject {
+            board_id: id.to_owned(),
+            only_chart: None,
+        })),
+        Some(lakehouse_embed::EmbedTarget::Chart(id)) => {
+            let stored = store::list_stored_charts(ch, &Viewer::anonymous()).await?;
+            Ok(stored.iter().find(|c| c.spec.id == id).map(|c| Subject {
+                // A chart with no board is on the built-in dashboard.
+                board_id: if c.board.is_empty() {
+                    store::DEFAULT_BOARD_ID.to_owned()
+                } else {
+                    c.board.clone()
+                },
+                only_chart: Some(id.to_owned()),
+            }))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Verify a signed token (`SEC-12`): the secret is configuration only, and an
+/// unset one means signed embedding is unavailable, said plainly (nothing is
+/// generated or stored); every other failure is the one fixed message, the
+/// reason going to the log only. Shared by `data` and `values`.
+fn verified_claims(
+    state: &AppState,
+    jwt: &str,
+) -> Result<lakehouse_embed::EmbedClaims, Box<Response>> {
     let Some(secret) = state.config.embed_secret.as_deref() else {
         return Err(Box::new(
             (
@@ -110,31 +240,52 @@ async fn embed_grant(state: &AppState, jwt: Option<&str>) -> Result<EmbedGrant, 
                 .into_response(),
         ));
     };
-    let claims = match lakehouse_embed::verify_embed(
+    lakehouse_embed::verify_embed(
         jwt,
         secret,
         state.config.embed_token_max_lifetime_seconds,
         lakehouse_embed::unix_now(),
-    ) {
-        Ok(claims) => claims,
-        Err(reason) => {
-            // SEC-12: the reason is for the log only; the response is one
-            // fixed message so a caller cannot tell which check failed.
-            tracing::info!(%reason, "signed embed token refused");
-            return Err(Box::new(token_refused()));
+    )
+    .map_err(|reason| {
+        tracing::info!(%reason, "signed embed token refused");
+        Box::new(token_refused())
+    })
+}
+
+/// What every signed read checks about its token's dashboard, once: what the
+/// token names ([`subject_of`]), that embedding is on for it, and that the
+/// token has not been withdrawn. Returns the dashboard and the subject, or the
+/// response to send.
+async fn admit(
+    state: &AppState,
+    claims: &lakehouse_embed::EmbedClaims,
+) -> Result<(Board, Subject), Box<Response>> {
+    let subject = match subject_of(&state.clickhouse, claims.resource.as_ref()).await {
+        Ok(Some(subject)) => subject,
+        Ok(None) => return Err(Box::new(token_refused())),
+        Err(err) => {
+            return Err(Box::new(
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ApiJson(upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json()),
+                )
+                    .into_response(),
+            ));
         }
     };
-    let Some(board_id) = claims
-        .resource
-        .as_ref()
-        .and_then(|r| r.dashboard.as_deref())
-        .filter(|d| !d.is_empty())
-    else {
-        return Err(Box::new(token_refused()));
-    };
-    let board = match store::get_board(&state.clickhouse, board_id, &Viewer::anonymous()).await {
+    let board = match store::get_board(&state.clickhouse, &subject.board_id, &Viewer::anonymous())
+        .await
+    {
         Ok(b) => b,
-        Err(err) => return Err(Box::new(database_failure(&err))),
+        Err(err) => {
+            return Err(Box::new(
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ApiJson(upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json()),
+                )
+                    .into_response(),
+            ));
+        }
     };
     let Some(board) = board.filter(|b| b.embed_enabled.unwrap_or(false)) else {
         return Err(Box::new(
@@ -159,30 +310,123 @@ async fn embed_grant(state: &AppState, jwt: Option<&str>) -> Result<EmbedGrant, 
     ) {
         return Err(Box::new(token_refused()));
     }
-    Ok(EmbedGrant {
-        board_id: board_id.to_owned(),
-        board,
-        claims,
-    })
+    // BI-26 review fix (SHOULD-FIX) R2: a chart token's own withdrawal follows the
+    // chart. It is written on the dashboard the chart was on, so it is looked up
+    // on every dashboard's events (a "withdraw all" is the dashboard's, and
+    // applies to the dashboard the chart is on now).
+    if subject.only_chart.is_some()
+        && let Some(jti) = claims.jti.as_deref()
+    {
+        match store::jti_withdrawn_anywhere(&state.clickhouse, jti).await {
+            Ok(false) => {}
+            Ok(true) => return Err(Box::new(token_refused())),
+            Err(err) => {
+                return Err(Box::new(
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        ApiJson(
+                            upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json(),
+                        ),
+                    )
+                        .into_response(),
+                ));
+            }
+        }
+    }
+    Ok((board, subject))
+}
+
+/// The board a signed embed token opens — or the refusal the token gets.
+///
+/// The checks and the answers are the ones `POST /api/embed/data` has always
+/// given (`SEC-12`): a missing token is a 400, an unset secret a 503, a
+/// token that does not verify (a bad signature, a missing or too-long
+/// lifetime, an expired or withdrawn token, a token without a dashboard) the
+/// one fixed 401, and a board that is not there or has embedding off a 403.
+///
+/// `PR #246 review BLOCKER 1`: the embed's map route reads the same token
+/// the same way, so the two routes cannot disagree about what a token opens.
+/// It is the same [`verified_claims`] and [`admit`] the data route uses, so a
+/// chart token (`BI-26`) opens its own dashboard here too, exactly as it does
+/// there.
+///
+/// # Errors
+///
+/// The refusal to send, as a ready response.
+async fn embed_grant(state: &AppState, jwt: Option<&str>) -> Result<Subject, Box<Response>> {
+    let Some(jwt) = jwt.filter(|s| !s.is_empty()) else {
+        return Err(Box::new(
+            (
+                StatusCode::BAD_REQUEST,
+                ApiJson(json!({ "error": "jwt is required" })),
+            )
+                .into_response(),
+        ));
+    };
+    let claims = verified_claims(state, jwt)?;
+    let (_board, subject) = admit(state, &claims).await?;
+    Ok(subject)
 }
 
 /// `POST /api/embed/data` — signed-embed (Metabase-style) dashboard data.
 pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
     // `try { jwt = String((await req.json())?.jwt ?? "") } catch { /* ignore */ }`
     // — an unparseable body is swallowed, not a 400; it just yields an
-    // empty jwt, which the emptiness check inside the token check rejects the
-    // normal way.
-    let jwt = serde_json::from_slice::<EmbedDataBody>(&body)
-        .ok()
-        .and_then(|b| b.jwt);
-    let grant = match embed_grant(&state, jwt.as_deref()).await {
-        Ok(grant) => grant,
+    // empty jwt, which the emptiness check below rejects the normal way.
+    let parsed = serde_json::from_slice::<EmbedDataBody>(&body).ok();
+    let viewer_filters = parsed.as_ref().and_then(|b| b.filters.clone());
+    let jwt = parsed.and_then(|b| b.jwt).filter(|s| !s.is_empty());
+    let Some(jwt) = jwt else {
+        return (
+            StatusCode::BAD_REQUEST,
+            ApiJson(json!({ "error": "jwt is required" })),
+        )
+            .into_response();
+    };
+
+    let claims = match verified_claims(&state, &jwt) {
+        Ok(claims) => claims,
         Err(refusal) => return *refusal,
     };
-    let board = grant.board;
+    let (board, subject) = match admit(&state, &claims).await {
+        Ok(admitted) => admitted,
+        Err(refusal) => return *refusal,
+    };
+    let board_id = subject.board_id.clone();
 
-    let mut filters = board.filters.clone().unwrap_or_default();
-    filters.extend(params_to_filters(grant.claims.params));
+    // BI-26 (D3): the saved filters, each by its embed mode, then the viewer's
+    // values for the editable ones, then the token's values last.
+    if let Some(viewer) = &viewer_filters
+        && let Err(msg) = lakehouse_bi::filters::validate_filters(viewer)
+    {
+        return (StatusCode::BAD_REQUEST, ApiJson(json!({ "error": msg }))).into_response();
+    }
+    // A chart token gets that chart and nothing else, so it has no dropdown of
+    // the dashboard's values: its editable filters read as hidden.
+    let viewer_values = if subject.only_chart.is_some() {
+        &[][..]
+    } else {
+        viewer_filters.as_deref().unwrap_or_default()
+    };
+    let resolved = match resolve_embed_filters(
+        board.filters.as_deref().unwrap_or_default(),
+        &board.embed_access,
+        claims.params.as_ref(),
+        viewer_values,
+    ) {
+        Ok(resolved) => resolved,
+        Err(column) => {
+            // The log says which column; the response never does.
+            tracing::info!(%column, board = %board_id, "signed embed token refused: a locked filter has no value");
+            return token_refused();
+        }
+    };
+    let filters = resolved.filters;
+    let editable = if subject.only_chart.is_some() {
+        Vec::new()
+    } else {
+        resolved.editable
+    };
 
     let time = match crate::routes::settings::time_context(&state).await {
         Ok(t) => t,
@@ -199,9 +443,13 @@ pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
         &state.clickhouse,
         &PolicyEngineObligations::from_state(&state),
         &board,
-        &grant.board_id,
+        &board_id,
         &filters,
         &time,
+        Narrowing {
+            only_chart: subject.only_chart.as_deref(),
+            editable: &editable,
+        },
         &format,
     )
     .await;
@@ -212,6 +460,7 @@ pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
                 &format,
                 &content_sites,
             );
+            strip_hidden_skips(&mut body, &board.embed_access);
             (StatusCode::OK, ApiJson(body)).into_response()
         }
         Err(err) => (
@@ -220,6 +469,187 @@ pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
         )
             .into_response(),
     }
+}
+
+/// `{ jwt, column }` — the `POST /api/embed/values` body shape.
+#[derive(Debug, Default, Deserialize)]
+struct EmbedValuesBody {
+    #[serde(default)]
+    jwt: Option<String>,
+    #[serde(default)]
+    column: Option<String>,
+}
+
+/// `POST /api/embed/values` — the values an editable filter's dropdown lists
+/// (`BI-26` plan D5). Public: the token is the credential.
+///
+/// Every token check of `data` runs first (`verified_claims`, `admit`), then the
+/// column must be editable for this token (a locked or hidden column, a column
+/// the token set, and any column of a chart token are refused). The values come
+/// from the same query as the dashboard picker, read as the fixed viewer role,
+/// with the token's locked values and the board's saved values applied, so a
+/// dropdown never lists a region the token locked away. At most 1,000 values.
+///
+/// # Errors
+///
+/// `400` without a token or a column; the one token message for a bad token;
+/// `403 filter_not_editable` for a column the viewer may not change;
+/// `503` without `EMBED_SECRET`.
+pub async fn values(State(state): State<AppState>, body: Bytes) -> Response {
+    let parsed = serde_json::from_slice::<EmbedValuesBody>(&body).unwrap_or_default();
+    let (Some(jwt), Some(column)) = (
+        parsed.jwt.filter(|s| !s.is_empty()),
+        parsed.column.filter(|s| !s.is_empty()),
+    ) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            ApiJson(json!({ "error": "jwt and column are required" })),
+        )
+            .into_response();
+    };
+    let claims = match verified_claims(&state, &jwt) {
+        Ok(claims) => claims,
+        Err(refusal) => return *refusal,
+    };
+    let (board, subject) = match admit(&state, &claims).await {
+        Ok(admitted) => admitted,
+        Err(refusal) => return *refusal,
+    };
+    // A chart token gets no dropdown of the dashboard's values, whatever else
+    // its token lacks (checked first, so the answer does not depend on it).
+    if subject.only_chart.is_some() {
+        return (
+            StatusCode::FORBIDDEN,
+            ApiJson(json!({ "error": "filter_not_editable" })),
+        )
+            .into_response();
+    }
+    let Ok(resolved) = resolve_embed_filters(
+        board.filters.as_deref().unwrap_or_default(),
+        &board.embed_access,
+        claims.params.as_ref(),
+        &[],
+    ) else {
+        return token_refused();
+    };
+    if !resolved.editable.contains(&column) {
+        return (
+            StatusCode::FORBIDDEN,
+            ApiJson(json!({ "error": "filter_not_editable" })),
+        )
+            .into_response();
+    }
+    let filters_json = serde_json::to_string(&resolved.filters).unwrap_or_else(|_| "[]".to_owned());
+    let time = match crate::routes::settings::time_context(&state).await {
+        Ok(t) => t,
+        Err(err) => return crate::error::ApiRejection(err).into_response(),
+    };
+    let roles = [EMBED_VIEWER_ROLE.to_owned()];
+    let obligations = PolicyEngineObligations::from_state(&state);
+    match crate::routes::dashboard::values_with_limit(
+        &state.clickhouse,
+        crate::routes::dashboard::ValuesQuery::for_board(&column, &subject.board_id, filters_json),
+        (&roles, &Viewer::anonymous()),
+        (
+            &crate::sql_rewrite::PlaceholderValues::none(),
+            &obligations,
+            &time,
+        ),
+        crate::routes::dashboard::EMBED_VALUES_LIMIT,
+    )
+    .await
+    {
+        Ok(found) => (StatusCode::OK, ApiJson(found)).into_response(),
+        Err(err) => crate::error::ApiRejection(err).into_response(),
+    }
+}
+
+/// What a manager is told when a filter that does not pick values is made
+/// locked or editable (`BI-26` review fix R3).
+const ONLY_VALUE_FILTERS: &str = "Only a filter that picks values can be locked or editable in an embed. Leave the others hidden.";
+
+/// `{ board, filterModes }` — the `PUT /api/dashboard/embed-settings` body.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SettingsBody {
+    board: String,
+    filter_modes: std::collections::BTreeMap<String, lakehouse_bi::embed_access::FilterMode>,
+}
+
+/// `PUT /api/dashboard/embed-settings` — set each filter's embed mode
+/// (`BI-26` plan D8). Needs `dashboard:write` until `BI-19` part B (feature
+/// decision 11: manage on the dashboard). The columns must be the dashboard's
+/// saved filters; the change is audited (`dashboard.embed_settings`) before it
+/// is made.
+///
+/// # Errors
+///
+/// `400` for a body of another shape, the built-in dashboard, a column that is
+/// no filter of the dashboard, or modes the store refuses; `404` for a
+/// dashboard the caller cannot see; `503` when the change cannot be audited.
+pub async fn put_settings(
+    State(state): State<AppState>,
+    axum::Extension(principal): axum::Extension<lakehouse_auth::Principal>,
+    body: Bytes,
+) -> ApiResult<ApiJson<Value>> {
+    let parsed: SettingsBody = serde_json::from_slice(&body).map_err(|_| {
+        ApiError::BadRequest(
+            "body must be {\"board\": string, \"filterModes\": {column: \"locked\"|\"editable\"|\"hidden\"}}"
+                .to_owned(),
+        )
+    })?;
+    // BI-26 review fix (SHOULD-FIX) R6: the one guard for "a dashboard a manager
+    // names and may see" (`public_links::managed_board`), not a second copy.
+    let board =
+        crate::routes::public_links::managed_board(&state, &principal, Some(&parsed.board)).await?;
+    let known: std::collections::BTreeSet<&str> = board
+        .filters
+        .iter()
+        .flatten()
+        .map(|f| f.column.as_str())
+        .collect();
+    if parsed
+        .filter_modes
+        .keys()
+        .any(|c| !known.contains(c.as_str()))
+    {
+        return Err(ApiError::BadRequest(
+            "A mode can only be set for a filter the dashboard has.".to_owned(),
+        )
+        .into());
+    }
+    // BI-26 review fix (SHOULD-FIX) R3: locked and editable work for a filter that
+    // picks values (`in`). A range, a relative date or a text match has no value a
+    // token can set or a dropdown can offer, so it can only be hidden.
+    let not_values: std::collections::BTreeSet<&str> = board
+        .filters
+        .iter()
+        .flatten()
+        .filter(|f| !f.op.is_in())
+        .map(|f| f.column.as_str())
+        .collect();
+    if parsed.filter_modes.iter().any(|(column, mode)| {
+        *mode != lakehouse_bi::embed_access::FilterMode::Hidden
+            && not_values.contains(column.as_str())
+    }) {
+        return Err(ApiError::BadRequest(ONLY_VALUE_FILTERS.to_owned()).into());
+    }
+    // The audit helper is the download audit's single writer; the action name
+    // and the arguments make the record this change's own (BI-26 review NOTE).
+    crate::routes::dashboard::record_download_audit(
+        &state,
+        &principal,
+        ("dashboard.embed_settings", "dashboard", &board.id),
+        json!({ "filterModes": parsed.filter_modes }),
+    )
+    .await
+    .map_err(|_| ApiError::Unavailable("the audit store is unavailable".to_owned()))?;
+    store::set_board_embed_filter_modes(&state.clickhouse, &board.id, &parsed.filter_modes)
+        .await
+        .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
+    Ok(ApiJson(
+        json!({ "ok": true, "filterModes": parsed.filter_modes }),
+    ))
 }
 
 /// Body of `POST /api/embed/frame`: the token the embed page was opened
@@ -255,13 +685,18 @@ struct FrameBody {
 /// SHOULD-FIX 1`): the whole deployment list would tell whoever reads a shared
 /// link which sites the deployment allows (`PR #199 review M SHOULD-FIX BI-16
 /// 1`, decision M6).
-/// A store failure is a `500` with the fixed database message, and the caller
-/// treats anything but `200` as "no site".
+///
+/// A store failure is a `500` with the fixed database message (a `503` for a
+/// public link when there is no Postgres, `BI-19` part A), and the caller
+/// treats anything but `200` as "no site". `BI-26` review fix R6: a signed
+/// token is checked by the same `verified_claims` and `admit` the data route
+/// uses, a public link by `public_links::resolve` (a link that is gone frames
+/// nowhere; one with a password still answers, the page asks for it).
 pub async fn frame_origins(State(state): State<AppState>, body: Bytes) -> Response {
     let parsed = serde_json::from_slice::<FrameBody>(&body).unwrap_or_default();
     let board = match board_for_frame(&state, parsed).await {
         Ok(board) => board,
-        Err(err) => return database_failure(&err),
+        Err(err) => return crate::error::ApiRejection(err).into_response(),
     };
     let Some(board) = board else {
         return frame_answer(&[], &[]);
@@ -271,15 +706,6 @@ pub async fn frame_origins(State(state): State<AppState>, body: Bytes) -> Respon
         Err(err) => return crate::error::ApiRejection(err).into_response(),
     };
     frame_answer(&board.embed_access.origins, &content_sites)
-}
-
-/// The fixed-500 answer a store failure gets, as the other embed routes send it.
-fn database_failure(err: &ChError) -> Response {
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        ApiJson(upstream_error::report_ch(&upstream_error::DATABASE, err).to_json()),
-    )
-        .into_response()
 }
 
 /// The one `200` answer this route sends, with both lists in a fixed shape.
@@ -293,35 +719,25 @@ fn frame_answer(origins: &[String], content_sites: &[String]) -> Response {
 
 /// The board a frame request names, or `None` for anything that is not a good
 /// token — every refused case gets the same empty answer.
-async fn board_for_frame(state: &AppState, body: FrameBody) -> Result<Option<Board>, ChError> {
+async fn board_for_frame(state: &AppState, body: FrameBody) -> Result<Option<Board>, ApiError> {
     if let Some(jwt) = body.jwt.filter(|s| !s.is_empty()) {
-        // Same verification `data` applies, so a token that would be refused
-        // there is not given a framing list here.
-        let Some(secret) = state.config.embed_secret.as_deref() else {
+        // BI-26 review fix (SHOULD-FIX) R6: the same checks `data` makes
+        // (`verified_claims`, `admit`), not a second copy; a token that would be
+        // refused there is given no framing list, whatever the reason.
+        let Ok(claims) = verified_claims(state, &jwt) else {
             return Ok(None);
         };
-        let Ok(claims) = lakehouse_embed::verify_embed(
-            &jwt,
-            secret,
-            state.config.embed_token_max_lifetime_seconds,
-            lakehouse_embed::unix_now(),
-        ) else {
-            return Ok(None);
-        };
-        let Some(board_id) = claims.resource.and_then(|r| r.dashboard) else {
-            return Ok(None);
-        };
-        let board = store::get_board(&state.clickhouse, &board_id, &Viewer::anonymous()).await?;
-        return Ok(board.filter(|b| {
-            b.embed_enabled.unwrap_or(false)
-                && !b.embed_access.is_withdrawn(
-                    claims.iat.unwrap_or(f64::NEG_INFINITY),
-                    claims.jti.as_deref(),
-                )
-        }));
+        return Ok(admit(state, &claims).await.ok().map(|(board, _)| board));
     }
     if let Some(token) = body.token.filter(|s| !s.is_empty()) {
-        return store::get_board_by_token(&state.clickhouse, &token).await;
+        // BI-19 part A (D3): a link that does not work frames nowhere, like a
+        // token that is invalid.
+        return Ok(
+            match crate::routes::public_links::resolve(state, &token).await? {
+                crate::routes::public_links::Resolved::Open(open) => Some(open.board),
+                crate::routes::public_links::Resolved::Gone => None,
+            },
+        );
     }
     Ok(None)
 }
@@ -416,11 +832,12 @@ pub async fn revoke_token(State(state): State<AppState>, body: Bytes) -> ApiResu
         tracing::info!(%reason, "embed token to withdraw refused");
         ApiError::BadRequest(TOKEN_REFUSED.to_owned())
     })?;
-    let for_board = claims
-        .resource
-        .as_ref()
-        .and_then(|r| r.dashboard.as_deref());
-    if for_board != Some(board) {
+    // BI-26 (D1): a chart token is withdrawn through its chart's dashboard.
+    let for_board = subject_of(&state.clickhouse, claims.resource.as_ref())
+        .await
+        .map_err(|err| crate::routes::dashboard_folders::classify_ch_error(&err))?
+        .map(|s| s.board_id);
+    if for_board.as_deref() != Some(board) {
         return Err(
             ApiError::BadRequest("that token is for a different dashboard.".to_owned()).into(),
         );
@@ -494,22 +911,30 @@ fn value_to_string(v: &Value) -> String {
 }
 
 /// `GET /api/public/dashboard/{token}` — read-only public share view.
+///
+/// `BI-19` part A (plan D3): the link is read from Postgres. An unknown,
+/// expired, switched-off (by the link's owner or by an administrator), trashed
+/// or personal-space link is the same `404 not_found`; a link with a password
+/// needs `X-Public-Link-Ticket` from the unlock route, and without a live one
+/// answers `401 password_required` with no data and no dashboard name.
 pub async fn public_dashboard(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(token): Path<String>,
 ) -> Response {
-    let board = match store::get_board_by_token(&state.clickhouse, &token).await {
-        Ok(b) => b,
-        Err(err) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ApiJson(upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json()),
-            )
-                .into_response();
+    let board = match crate::routes::public_links::resolve(&state, &token).await {
+        Ok(crate::routes::public_links::Resolved::Open(open)) => {
+            if let Some(refusal) =
+                crate::routes::public_links::check_ticket(&state, &open.link, &headers).await
+            {
+                return refusal;
+            }
+            open.board
         }
-    };
-    let Some(board) = board else {
-        return not_found();
+        Ok(crate::routes::public_links::Resolved::Gone) => {
+            return crate::routes::public_links::not_found();
+        }
+        Err(err) => return crate::error::ApiRejection(err).into_response(),
     };
 
     let filters = board.filters.clone().unwrap_or_default();
@@ -532,6 +957,7 @@ pub async fn public_dashboard(
         &board_id,
         &filters,
         &time,
+        Narrowing::default(),
         &format,
     )
     .await;
@@ -559,19 +985,31 @@ pub async fn public_dashboard(
 /// through its own token, the way it reads the board's data: a token that
 /// is not a board is a 404, exactly as `GET /api/public/dashboard/{token}`
 /// answers, and a map no chart on that board draws on is the same 404.
+///
+/// `BI-19` part A: the link is read from Postgres and a link with a
+/// password needs its ticket, exactly as the board's data does — the map is
+/// part of that board, so it is behind the same door.
 pub async fn public_map_geojson(
     State(state): State<AppState>,
-    Path((token, id)): Path<(String, String)>,
     headers: HeaderMap,
+    Path((token, id)): Path<(String, String)>,
 ) -> Response {
-    let board = match store::get_board_by_token(&state.clickhouse, &token).await {
-        Ok(b) => b,
-        Err(err) => return database_failure(&err),
+    let board = match crate::routes::public_links::resolve(&state, &token).await {
+        Ok(crate::routes::public_links::Resolved::Open(open)) => {
+            if let Some(refusal) =
+                crate::routes::public_links::check_ticket(&state, &open.link, &headers).await
+            {
+                return refusal;
+            }
+            open.board
+        }
+        Ok(crate::routes::public_links::Resolved::Gone) => {
+            return crate::routes::public_links::not_found();
+        }
+        Err(err) => return crate::error::ApiRejection(err).into_response(),
     };
-    let Some(board) = board else {
-        return not_found();
-    };
-    map_for_board(&state, &board.id, &id, &headers).await
+    let board_id = board.id.clone();
+    map_for_board(&state, &board_id, &id, &headers).await
 }
 
 /// `POST /api/embed/maps/{id}/geojson` — the boundary file of a map one of
@@ -585,18 +1023,18 @@ pub async fn public_map_geojson(
 /// 404, so the token reads the board it opens and nothing else.
 pub async fn embed_map_geojson(
     State(state): State<AppState>,
-    Path(id): Path<String>,
     headers: HeaderMap,
+    Path(id): Path<String>,
     body: Bytes,
 ) -> Response {
     let jwt = serde_json::from_slice::<EmbedDataBody>(&body)
         .ok()
         .and_then(|b| b.jwt);
-    let grant = match embed_grant(&state, jwt.as_deref()).await {
-        Ok(grant) => grant,
+    let subject = match embed_grant(&state, jwt.as_deref()).await {
+        Ok(subject) => subject,
         Err(refusal) => return *refusal,
     };
-    map_for_board(&state, &grant.board_id, &id, &headers).await
+    map_for_board(&state, &subject.board_id, &id, &headers).await
 }
 
 /// The map file `id` for a board that may open it.
@@ -614,10 +1052,16 @@ async fn map_for_board(
 ) -> Response {
     let maps = match board_map_ids(state, board_id).await {
         Ok(maps) => maps,
-        Err(err) => return database_failure(&err),
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ApiJson(upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json()),
+            )
+                .into_response();
+        }
     };
     if !maps.iter().any(|m| m == id) {
-        return not_found();
+        return crate::routes::public_links::not_found();
     }
     match super::maps::map_file(state, id, headers).await {
         Ok(response) => response,
@@ -636,16 +1080,6 @@ async fn board_map_ids(state: &AppState, board_id: &str) -> Result<Vec<String>, 
         .into_iter()
         .filter_map(|c| c.def.map.clone())
         .collect())
-}
-
-/// The 404 every refused public answer gives: the same body and status the
-/// public dashboard route gives for a token that is not a board.
-fn not_found() -> Response {
-    (
-        StatusCode::NOT_FOUND,
-        ApiJson(json!({ "error": "not_found" })),
-    )
-        .into_response()
 }
 
 /// A chart as an embed or a public link shows it: the render spec of the
@@ -706,11 +1140,13 @@ async fn board_columns(
     charts: &[&StoredChartSpec],
     filters: &[FilterDef],
     fields: &lakehouse_bi::fields::FieldCatalog,
+    need_kinds: bool,
 ) -> Result<
     std::collections::HashMap<String, lakehouse_bi::builder::RelationColumns>,
     lakehouse_clickhouse::ChError,
 > {
-    let need_cols = filters.iter().any(FilterDef::is_active)
+    let need_cols = need_kinds
+        || filters.iter().any(FilterDef::is_active)
         || charts.iter().any(|c| {
             c.def.needs_columns()
                 || fields.chart_uses(&c.def)
@@ -748,6 +1184,52 @@ fn tile_filters<'a>(
     )
 }
 
+/// The charts a read covers: those of `board_id`, or only `only_chart` for a
+/// chart token (`BI-26` plan D1: a chart token reads that chart and no other).
+fn charts_of<'a>(
+    stored: &'a [StoredChartSpec],
+    board_id: &str,
+    only_chart: Option<&str>,
+) -> Vec<&'a StoredChartSpec> {
+    // One selection of the board's cards (`board_cards`), narrowed to a chart
+    // token's chart: the frame answer's content sites use the same helper.
+    board_cards(stored, board_id)
+        .into_iter()
+        .filter(|c| only_chart.is_none_or(|only| c.spec.id == only))
+        .collect()
+}
+
+/// A chart as the payload carries it, with `resolved` when its slots take a
+/// parameter. `BI-19` part A QA fix P3: the columns the parameters gave this
+/// read are sent as the dashboard payload sends them; without them the page
+/// read `{param}` measures as column names.
+fn rendered_chart(original: &StoredChartSpec, effective: &StoredChartSpec) -> Value {
+    let mut rendered = embed_rendered(original, effective);
+    if lakehouse_bi::params::changes_statement(&original.def) {
+        rendered["resolved"] = crate::routes::support::resolved_json(effective);
+    }
+    rendered
+}
+
+/// The `embedFilters` of a payload: for each editable column its kind (from the
+/// relation's columns, `null` when unknown) and the filter now applied to it.
+fn describe_editable(editable: &[String], fields: &[Value], filters: &[FilterDef]) -> Value {
+    let described: Vec<Value> = editable
+        .iter()
+        .map(|column| {
+            json!({
+                "column": column,
+                "kind": fields
+                    .iter()
+                    .find(|f| f["column"] == json!(column))
+                    .map_or(Value::Null, |f| f["kind"].clone()),
+                "filter": filters.iter().find(|f| &f.column == column),
+            })
+        })
+        .collect();
+    json!(described)
+}
+
 /// The `{ board, layout, charts, results }` payload of an embed or a public
 /// link, with the board's tabs and phone layout when it has them (`BI-18` part
 /// C; left off otherwise so an older board's payload is unchanged).
@@ -756,7 +1238,11 @@ fn board_body(
     charts: &[Value],
     results: &serde_json::Map<String, Value>,
     time: &lakehouse_bi::grain::TimeContext,
+    only_chart: Option<&str>,
 ) -> Value {
+    if let Some(chart) = only_chart {
+        return chart_body(board, charts, results, time, chart);
+    }
     let mut body = json!({
         "board": { "id": board.id, "name": board.name },
         "layout": layout_json(board),
@@ -787,6 +1273,46 @@ fn board_body(
     body
 }
 
+/// The payload of a chart token (`BI-26` plan D1): that chart's spec and result
+/// and nothing that names another: no dashboard name, no other chart id in a
+/// layout, no tabs, no phone layout. `onlyChart` tells the page to draw the one
+/// chart filling the frame. The dashboard's theme and font still apply.
+fn chart_body(
+    board: &Board,
+    charts: &[Value],
+    results: &serde_json::Map<String, Value>,
+    time: &lakehouse_bi::grain::TimeContext,
+    chart: &str,
+) -> Value {
+    let mut body = json!({
+        "board": { "id": board.id },
+        "layout": {},
+        "charts": charts,
+        "results": results,
+        "onlyChart": chart,
+        "reporting": { "timeZone": time.zone(), "weekStart": time.week_start().as_str() },
+    });
+    if let Some(board_obj) = body["board"].as_object_mut() {
+        if let Some(theme) = &board.theme {
+            board_obj.insert("theme".to_owned(), json!(theme));
+        }
+        if let Some(font) = &board.font {
+            board_obj.insert("font".to_owned(), json!(font));
+        }
+    }
+    body
+}
+
+/// What a read is narrowed to beyond the board (`BI-26`): a chart token's one
+/// chart, and the columns whose filter the viewer may change. A struct so
+/// [`render_board_payload`] stays within the argument limit once it also takes
+/// the format settings (`SEC-47`).
+#[derive(Debug, Default, Clone, Copy)]
+struct Narrowing<'a> {
+    only_chart: Option<&'a str>,
+    editable: &'a [String],
+}
+
 /// Shared `{ board, layout, charts, results }` assembly for both
 /// [`data`] and [`public_dashboard`]: every stored chart belonging to
 /// `board_id`, filtered by `filters` (never by caller-supplied years —
@@ -803,6 +1329,7 @@ async fn render_board_payload(
     board_id: &str,
     filters: &[FilterDef],
     time: &lakehouse_bi::grain::TimeContext,
+    narrowing: Narrowing<'_>,
     format: &crate::routes::settings::FormatSettings,
 ) -> Result<(Value, Vec<String>), lakehouse_clickhouse::ChError> {
     let roles = [EMBED_VIEWER_ROLE.to_owned()];
@@ -811,9 +1338,16 @@ async fn render_board_payload(
     // trash or on a personal board is not in it (BI-18 part C, part 2).
     let stored = store::list_stored_charts(ch, &Viewer::anonymous()).await?;
     let field_catalog = catalog_or_empty(ch).await;
-    let stored_for_board = board_cards(&stored, board_id);
+    let stored_for_board = charts_of(&stored, board_id, narrowing.only_chart);
 
-    let cols = board_columns(ch, &stored_for_board, filters, &field_catalog).await?;
+    let cols = board_columns(
+        ch,
+        &stored_for_board,
+        filters,
+        &field_catalog,
+        !narrowing.editable.is_empty(),
+    )
+    .await?;
 
     let mut results = serde_json::Map::new();
     let mut charts_out = Vec::with_capacity(stored_for_board.len());
@@ -899,13 +1433,18 @@ async fn render_board_payload(
             }
         }
 
-        charts_out.push(embed_rendered(original, c));
+        charts_out.push(rendered_chart(original, c));
     }
 
-    Ok((
-        board_body(board, &charts_out, &results, time),
-        crate::routes::settings::content_sites_of_cards(&stored_for_board, format),
-    ))
+    let mut body = board_body(board, &charts_out, &results, time, narrowing.only_chart);
+    // BI-26 (D4): the editable filters only (column, kind, current value).
+    // Locked and hidden filters are not described.
+    if !narrowing.editable.is_empty() {
+        let fields = crate::routes::dashboard::filter_fields(&stored_for_board, &cols, &sources);
+        body["embedFilters"] = describe_editable(narrowing.editable, &fields, filters);
+    }
+    let sites = crate::routes::settings::content_sites_of_cards(&stored_for_board, format);
+    Ok((body, sites))
 }
 
 #[cfg(test)]
@@ -913,6 +1452,37 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    /// `BI-26` review NOTE: a tile does not name a hidden filter in `filtersSkipped`.
+    #[test]
+    fn a_hidden_filters_column_is_taken_out_of_the_skipped_list_and_the_others_stay() {
+        use lakehouse_bi::embed_access::{EmbedAccess, FilterMode};
+        let mut access = EmbedAccess::default();
+        access
+            .filter_modes
+            .insert("region".to_owned(), FilterMode::Locked);
+        access
+            .filter_modes
+            .insert("year".to_owned(), FilterMode::Editable);
+        let mut body = json!({ "results": {
+            "c1": { "rows": [], "filtersSkipped": [
+                { "column": "region", "reason": "no_column" },
+                { "column": "year", "reason": "no_column" },
+                { "column": "secret_column", "reason": "no_column" } ] },
+            "c2": { "rows": [], "filtersSkipped": [{ "column": "secret_column", "reason": "no_column" }] },
+            "c3": { "rows": [] }
+        }});
+        strip_hidden_skips(&mut body, &access);
+        let kept: Vec<&str> = body["results"]["c1"]["filtersSkipped"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["column"].as_str().unwrap())
+            .collect();
+        assert_eq!(kept, ["region", "year"]);
+        assert!(body["results"]["c2"].get("filtersSkipped").is_none());
+        assert!(body["results"]["c3"].get("filtersSkipped").is_none());
+    }
 
     #[test]
     fn params_to_filters_none_yields_empty() {
@@ -1048,6 +1618,7 @@ mod typed_filters {
             "b1",
             &filters,
             &lakehouse_bi::grain::TimeContext::default(),
+            Narrowing::default(),
             &crate::routes::settings::FormatSettings::default(),
         )
         .await
@@ -1195,6 +1766,7 @@ mod typed_filters {
             "b1",
             &filters,
             &lakehouse_bi::grain::TimeContext::default(),
+            Narrowing::default(),
             &crate::routes::settings::FormatSettings::default(),
         )
         .await
@@ -1303,6 +1875,7 @@ mod typed_filters {
             "b1",
             &locked,
             &lakehouse_bi::grain::TimeContext::default(),
+            Narrowing::default(),
             &crate::routes::settings::FormatSettings::default(),
         )
         .await
@@ -1403,6 +1976,7 @@ mod typed_filters {
             "b1",
             &[],
             &time,
+            Narrowing::default(),
             &crate::routes::settings::FormatSettings::default(),
         )
         .await

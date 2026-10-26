@@ -64,6 +64,7 @@ And ask the assistant to switch embedding on (it asks a person to approve first)
 - The host page must add the ten-line snippet for the height to follow the content. Without it the frame keeps the height the host gave it.
 - Hiding our name hides it in the frame only; the page source still shows where the frame comes from.
 - A token that does not set every locked filter is refused. Sign every locked filter's value.
+- Withdrawing one chart token follows the chart if it is moved to another dashboard. "Withdraw all" belongs to a dashboard: it applies to the dashboard the chart is on now, so tokens withdrawn that way on the old dashboard work again after the chart moves (`BI-26` review fix R2).
 - Breaking on upgrade: a single-chart embed made by adding `?chart=` to a dashboard token still works, but the token can still show the whole dashboard. For a chart only, sign a chart token.
 
 ## Asking the assistant

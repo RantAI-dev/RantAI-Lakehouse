@@ -34,6 +34,7 @@ mod dashboard_sources;
 pub(crate) mod drill;
 mod embed;
 mod pdf_export;
+pub mod public_links;
 mod render;
 pub mod report_runner;
 mod reports;
@@ -1288,6 +1289,13 @@ pub fn router(state: AppState) -> Router {
             "/api/embed/frame",
             axum::routing::post(embed::frame_origins),
         )
+        // BI-26 (D5): the dropdown values of an editable filter, token-gated.
+        .route("/api/embed/values", axum::routing::post(embed::values))
+        // BI-26 (D8): each filter's embed mode.
+        .route(
+            "/api/dashboard/embed-settings",
+            axum::routing::put(embed::put_settings),
+        )
         .route(
             "/api/dashboard/embed-revoke",
             axum::routing::post(embed::revoke_token),
@@ -1295,6 +1303,18 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/public/dashboard/{token}",
             get(embed::public_dashboard),
+        )
+        // BI-19 part A (D4): the password of a public link.
+        .route(
+            "/api/public/dashboard/{token}/unlock",
+            axum::routing::post(public_links::unlock),
+        )
+        // BI-19 part A (D5): make, change and end a dashboard's public link.
+        .route(
+            "/api/dashboard/public-link",
+            get(public_links::get_link)
+                .put(public_links::put_link)
+                .delete(public_links::delete_link),
         )
         // PR #246 review BLOCKER 1: a public link and an embed read a map's
         // boundary through their own token, the way they read the board's

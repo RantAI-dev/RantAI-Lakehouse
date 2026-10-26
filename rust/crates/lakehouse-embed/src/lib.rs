@@ -43,13 +43,45 @@ use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// The dashboard resource an embed token grants access to, mirroring the
-/// TypeScript's `{ dashboard?: string }`.
+/// The resource an embed token grants access to, mirroring the TypeScript's
+/// `{ dashboard?: string }` and, since `BI-26` (plan D1), `chart`: a token
+/// names a dashboard or one chart, never both and never neither
+/// ([`EmbedResource::target`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EmbedResource {
     /// The dashboard slug/id being embedded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dashboard: Option<String>,
+    /// The id of the one chart being embedded (`BI-26`). The server finds the
+    /// chart's dashboard itself; the token cannot name another chart's data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chart: Option<String>,
+}
+
+/// What a token names, once it has been checked to name exactly one thing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbedTarget<'a> {
+    /// A whole dashboard.
+    Dashboard(&'a str),
+    /// One chart (`BI-26`).
+    Chart(&'a str),
+}
+
+impl EmbedResource {
+    /// What the token names, or `None` when it names nothing, both a dashboard
+    /// and a chart, or an empty id. `None` is a refusal, never a default
+    /// (`BI-26` plan D1, fail closed): a token that names both could be read as
+    /// either, and a chart token must not be turned into a dashboard.
+    #[must_use]
+    pub fn target(&self) -> Option<EmbedTarget<'_>> {
+        let dashboard = self.dashboard.as_deref().filter(|d| !d.is_empty());
+        let chart = self.chart.as_deref().filter(|c| !c.is_empty());
+        match (dashboard, chart) {
+            (Some(d), None) => Some(EmbedTarget::Dashboard(d)),
+            (None, Some(c)) => Some(EmbedTarget::Chart(c)),
+            _ => None,
+        }
+    }
 }
 
 /// Claims carried by a signed embed token: the TypeScript's
@@ -408,6 +440,7 @@ mod tests {
     fn claims(iat: f64, exp: f64) -> EmbedClaims {
         EmbedClaims {
             resource: Some(EmbedResource {
+                chart: None,
                 dashboard: Some("b_test".to_owned()),
             }),
             params: Some(HashMap::from([("tenant".to_owned(), json!("dispar-dki"))])),
@@ -567,6 +600,7 @@ mod tests {
         let parts: Vec<&str> = token.split('.').collect();
         let tampered_claims = EmbedClaims {
             resource: Some(EmbedResource {
+                chart: None,
                 dashboard: Some("b_evil".to_owned()),
             }),
             ..claims
@@ -699,6 +733,78 @@ mod tests {
         assert_eq!(
             verify_render(&tampered, RENDER_SECRET, NOW),
             Err(TokenError::BadSignature)
+        );
+    }
+
+    /// `BI-26` plan D1: a token names a dashboard or one chart, never both and
+    /// never neither, and an empty id names nothing.
+    #[test]
+    fn a_token_names_exactly_one_of_a_dashboard_and_a_chart() {
+        let res = |dashboard: Option<&str>, chart: Option<&str>| EmbedResource {
+            dashboard: dashboard.map(str::to_owned),
+            chart: chart.map(str::to_owned),
+        };
+        assert_eq!(
+            res(Some("b_1"), None).target(),
+            Some(EmbedTarget::Dashboard("b_1"))
+        );
+        assert_eq!(
+            res(None, Some("u_1")).target(),
+            Some(EmbedTarget::Chart("u_1"))
+        );
+        assert_eq!(res(Some("b_1"), Some("u_1")).target(), None, "both");
+        assert_eq!(res(None, None).target(), None, "neither");
+        assert_eq!(res(Some(""), None).target(), None);
+        assert_eq!(res(None, Some("")).target(), None);
+        assert_eq!(
+            res(Some(""), Some("u_1")).target(),
+            Some(EmbedTarget::Chart("u_1")),
+            "an empty id is not a claim"
+        );
+    }
+
+    #[test]
+    fn a_chart_token_signs_and_verifies_with_its_chart_id() {
+        let claims = EmbedClaims {
+            resource: Some(EmbedResource {
+                dashboard: None,
+                chart: Some("u_abc".to_owned()),
+            }),
+            exp: Some(NOW + 600.0),
+            iat: Some(NOW),
+            ..EmbedClaims::default()
+        };
+        let verified = verify_embed(&sign_embed(&claims, SECRET), SECRET, 86_400, NOW).unwrap();
+        assert_eq!(
+            verified.resource.unwrap().target(),
+            Some(EmbedTarget::Chart("u_abc"))
+        );
+    }
+
+    /// `BI-26` feature decision 10: a token cannot name a role or a person. The
+    /// claims type has no such field, so a signed `role` or `sub` is dropped on
+    /// the way in; the read always uses the fixed viewer role
+    /// (`EMBED_VIEWER_ROLE` in `lakehouse-api`).
+    #[test]
+    fn a_role_or_person_claim_in_a_signed_token_is_ignored() {
+        let payload = serde_json::json!({
+            "resource": { "dashboard": "b_1" }, "exp": NOW + 600.0, "iat": NOW,
+            "role": "Platform Admin", "sub": "00000000-0000-0000-0000-000000000001"
+        });
+        let data = format!(
+            "{}.{}",
+            b64url_json(&serde_json::json!({ "alg": "HS256", "typ": "JWT" })).unwrap(),
+            b64url_json(&payload).unwrap()
+        );
+        let mut mac = <HmacSha256 as KeyInit>::new_from_slice(SECRET.as_bytes()).unwrap();
+        mac.update(data.as_bytes());
+        let token = format!("{data}.{}", b64url(&mac.finalize().into_bytes()));
+        let claims = verify_embed(&token, SECRET, 86_400, NOW).unwrap();
+        let echoed = serde_json::to_value(&claims).unwrap();
+        assert!(echoed.get("role").is_none() && echoed.get("sub").is_none());
+        assert_eq!(
+            claims.resource.unwrap().target(),
+            Some(EmbedTarget::Dashboard("b_1"))
         );
     }
 }

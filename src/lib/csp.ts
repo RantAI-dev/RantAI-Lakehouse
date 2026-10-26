@@ -168,8 +168,12 @@ export type PolicyOptions = {
    * validated here before it enters the header.
    */
   contentSites?: readonly unknown[]
-  /** Sites allowed to frame this page (`SEC-12`); empty means none. */
-  frameAncestors?: readonly unknown[]
+  /**
+   * Sites allowed to frame this page besides the console itself (`SEC-12`,
+   * BI-26 R4: an embed page's list is `'self'` plus these). Left out or `null`
+   * (every non-embed page, an embed whose list could not be read) means none.
+   */
+  frameAncestors?: readonly unknown[] | null
   /** `next dev` only; see the module doc. */
   development?: boolean
 }

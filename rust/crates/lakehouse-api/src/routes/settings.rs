@@ -90,7 +90,7 @@ pub(crate) const DOWNLOADS_OFF: &str = "Downloads are switched off for your role
 
 /// What the person is told when the body is not the two fields.
 const BODY_SHAPE: &str = "body must be {\"timeZone\": string, \"weekStart\": \"monday\"|\"sunday\", \
-\"numberLocale\"?: \"en-US\"|\"id-ID\", \"companyPalette\"?: [\"#rrggbb\", ...], \"fonts\"?: [string, ...], \"contentSites\"?: [\"https://host\", ...], \"downloadDeniedRoles\"?: [string, ...], \"reportAllowedDomains\"?: [string, ...]}";
+\"numberLocale\"?: \"en-US\"|\"id-ID\", \"companyPalette\"?: [\"#rrggbb\", ...], \"fonts\"?: [string, ...], \"contentSites\"?: [\"https://host\", ...], \"downloadDeniedRoles\"?: [string, ...], \"reportAllowedDomains\"?: [string, ...], \"publicLinksEnabled\"?: boolean}";
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -103,6 +103,7 @@ struct SettingsBody {
     content_sites: Option<Vec<String>>,
     download_denied_roles: Option<Vec<String>>,
     report_allowed_domains: Option<Vec<String>>,
+    public_links_enabled: Option<bool>,
 }
 
 /// The formatting half of the settings, as the console reads it.
@@ -121,6 +122,10 @@ pub(crate) struct FormatSettings {
     /// The outside email domains a scheduled report may go to (`RPT-1`, D8).
     /// Like `download_denied_roles`, not part of [`Self::to_json`].
     pub report_allowed_domains: Vec<String>,
+    /// Whether public links work (`BI-19` part A, feature A7). Not part of
+    /// [`Self::to_json`]: an anonymous reader has no use for it, and an
+    /// administrator reads it through `body_json`.
+    pub public_links_enabled: bool,
 }
 
 impl Default for FormatSettings {
@@ -134,6 +139,7 @@ impl Default for FormatSettings {
             content_sites: Vec::new(),
             download_denied_roles: Vec::new(),
             report_allowed_domains: Vec::new(),
+            public_links_enabled: true,
         }
     }
 }
@@ -147,6 +153,7 @@ impl FormatSettings {
             content_sites: row.content_sites.clone(),
             download_denied_roles: row.download_denied_roles.clone(),
             report_allowed_domains: row.report_allowed_domains.clone(),
+            public_links_enabled: row.public_links_enabled,
         }
     }
 
@@ -327,6 +334,9 @@ fn checked_formatting(
         content_sites,
         download_denied_roles,
         report_allowed_domains,
+        public_links_enabled: parsed
+            .public_links_enabled
+            .unwrap_or(current.public_links_enabled),
     })
 }
 
@@ -493,6 +503,9 @@ fn body_json(
         "timeZone": ctx.zone(),
         "weekStart": ctx.week_start().as_str(),
         "saved": saved,
+        // `BI-19` part A: the switch is everybody's to read; only the two
+        // lists below are an administrator's (`PR #204` review (SHOULD-FIX) 3).
+        "publicLinksEnabled": format.public_links_enabled,
     });
     if administrator {
         body["downloadDeniedRoles"] = json!(format.download_denied_roles);
@@ -596,6 +609,7 @@ pub async fn put_reporting(
             content_sites: format.content_sites,
             download_denied_roles: format.download_denied_roles,
             report_allowed_domains: format.report_allowed_domains,
+            public_links_enabled: format.public_links_enabled,
         },
         &principal.id.uuid().to_string(),
     )
@@ -669,7 +683,7 @@ mod tests {
                 "timeZone": "Europe/Berlin", "weekStart": "sunday", "saved": true,
                 "numberLocale": "en-US", "companyPalette": [],
                 "fonts": ["inter", "ibm-plex-sans", "source-serif", "jetbrains-mono", "system"],
-                "contentSites": [], "downloadDeniedRoles": [], "reportAllowedDomains": [],
+                "contentSites": [], "downloadDeniedRoles": [], "reportAllowedDomains": [], "publicLinksEnabled": true,
             })
         );
         assert_eq!(
@@ -716,10 +730,36 @@ mod tests {
             content_sites: vec!["https://img.example".to_owned()],
             download_denied_roles: vec!["Viewer".to_owned()],
             report_allowed_domains: vec!["example.com".to_owned()],
+            public_links_enabled: false,
         };
         assert_eq!(
             checked_formatting(&body(""), &current, None).unwrap(),
             current
+        );
+    }
+
+    /// `BI-19` part A (feature A7): the switch is kept when the body does not
+    /// send it, changed when it does, and is for the settings screen only.
+    #[test]
+    fn the_public_links_switch_is_kept_changed_and_kept_out_of_the_dashboard_payload() {
+        let on = FormatSettings::default();
+        assert!(on.public_links_enabled, "on at first, as before");
+        let off = checked_formatting(&body(r#","publicLinksEnabled":false"#), &on, None).unwrap();
+        assert!(!off.public_links_enabled);
+        assert!(
+            !checked_formatting(&body(""), &off, None)
+                .unwrap()
+                .public_links_enabled
+        );
+        assert!(
+            checked_formatting(&body(r#","publicLinksEnabled":true"#), &off, None)
+                .unwrap()
+                .public_links_enabled
+        );
+        assert!(off.to_json().get("publicLinksEnabled").is_none());
+        assert_eq!(
+            body_json(&TimeContext::default(), &off, true, true)["publicLinksEnabled"],
+            json!(false)
         );
     }
 
