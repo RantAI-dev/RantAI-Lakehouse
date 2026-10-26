@@ -115,7 +115,13 @@ pub(super) async fn run_sql(
     let body = axum::body::Bytes::from(json!({ "sql": sql }).to_string());
     let extension = Some(axum::Extension(principal.clone()));
     let result = api_result_to_value(
-        crate::routes::query::run(axum::extract::State(state.clone()), extension, body).await,
+        crate::routes::query::run(
+            axum::extract::State(state.clone()),
+            extension,
+            axum::http::HeaderMap::new(),
+            body,
+        )
+        .await,
     )
     .await;
     compact_query_result(result)
@@ -847,10 +853,16 @@ mod run_sql_delegation {
         )
     }
 
+    /// The shared catalog belongs to one tenant, and the query path is
+    /// scoped to the tenant: this fixture principal is the catalog's own
+    /// member, so the shared tables stay reachable. The chat sends no
+    /// `X-Tenant` header, so the tenant is the caller's first one.
+    const CATALOG_TENANT_ID: &str = "11111111-1111-4111-8111-000000000001";
+
     fn analyst_principal() -> Principal {
         Principal {
             id: PrincipalId::User(Uuid::nil()),
-            tenant_ids: Vec::new(),
+            tenant_ids: vec![uuid::uuid!("11111111-1111-4111-8111-000000000001")],
             display_name: "alice".to_owned(),
             permissions: PermissionSet::parse("query:read"),
             provider: "session".to_owned(),
@@ -950,6 +962,7 @@ mod run_sql_delegation {
         let mut env = HashMap::new();
         env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
         env.insert("CH_URL".to_owned(), server.uri());
+        env.insert("CATALOG_TENANT_ID".to_owned(), CATALOG_TENANT_ID.to_owned());
         let state = AppState::new(Config::from_map(&env).expect("valid config from a map"));
 
         let principal = analyst_principal();

@@ -213,13 +213,19 @@ pub fn decode(bytes: &[u8], encoding: Encoding) -> String {
                 [0xFE, 0xFF, rest @ ..] => (rest, true),
                 other => (other, false),
             };
+            // `as_chunks::<2>().0` is `chunks_exact(2)` with the chunk typed
+            // as `[u8; 2]`: it stops at the last whole unit and leaves a
+            // trailing odd byte in `.1`, which is dropped, as before
+            // (clippy's `chunks_exact_to_as_chunks` under 1.99 — REL-9).
             let units: Vec<u16> = bytes
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|pair| {
                     if big_endian {
-                        u16::from_be_bytes([pair[0], pair[1]])
+                        u16::from_be_bytes(*pair)
                     } else {
-                        u16::from_le_bytes([pair[0], pair[1]])
+                        u16::from_le_bytes(*pair)
                     }
                 })
                 .collect();

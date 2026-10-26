@@ -153,7 +153,10 @@ REFUSAL_CUES = (
 )
 
 # Words that appear in almost any Indonesian answer and almost never in an
-# English one; three or more distinct hits reads as Indonesian.
+# English one, and the words a short confirmation is built of ("sudah siap",
+# "tinjau pratinjaunya di bawah lalu konfirmasi"): a short answer carries too
+# few of the common words to reach three, so the words such an answer uses
+# count as markers too. Three or more distinct hits reads as Indonesian.
 INDONESIAN_MARKERS = (
     "yang",
     "dan",
@@ -180,6 +183,14 @@ INDONESIAN_MARKERS = (
     "ke",
     "usaha",
     "berdasarkan",
+    "sudah",
+    "siap",
+    "silakan",
+    "lalu",
+    "bawah",
+    "tinjau",
+    "periksa",
+    "konfirmasi",
 )
 
 RAW_ERROR_PATTERNS = (r"DB::Exception", r"Code: \d+", r"\bstack trace\b", r"SQLSTATE")
@@ -703,7 +714,9 @@ def run_setup(
     cfg: Config, session: requests.Session, setup: list[dict[str, Any]]
 ) -> tuple[dict[str, str], list[dict[str, str]]]:
     """Make the case's own objects through the API. Returns the ids saved under
-    each name and the objects created, for cleanup."""
+    each name and the objects created, for cleanup. A call without an `id_at`
+    only changes what an earlier call made: it saves no name and adds nothing
+    for the cleanup to delete."""
     names: dict[str, str] = {}
     created: list[dict[str, str]] = []
     for call in setup:
@@ -715,6 +728,11 @@ def run_setup(
         )
         if resp.status_code >= 400:
             raise SetupError(f"setup {call.get('name', call['path'])}: HTTP {resp.status_code}")
+        if not call.get("id_at"):
+            # A call that only changes what an earlier call made (the tabs of
+            # a board) replies without an id: it saves no name, and the
+            # cleanup must not delete the object the earlier call created.
+            continue
         body = resp.json()
         found = dig(body, call["id_at"])
         if not found:

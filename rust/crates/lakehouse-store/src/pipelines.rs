@@ -699,7 +699,8 @@ pub async fn list_pipelines(
          WHERE ($2 OR ($1::uuid IS NOT NULL AND tenant_id = $1)) \
          ORDER BY created_at DESC"
     );
-    let rows: Vec<PipelineRow> = sqlx::query_as(&sql)
+    // safe: only the constant `PIPELINE_COLUMNS` is formatted in; values are bound.
+    let rows: Vec<PipelineRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(filter.tenant_id)
         .bind(filter.all_tenants)
         .fetch_all(pool)
@@ -778,7 +779,11 @@ pub async fn assign_run_as(pool: &PgPool, id: &str, run_as: Uuid) -> Result<(), 
 /// Returns [`StoreError::Database`] if the query fails.
 pub async fn get_pipeline(pool: &PgPool, id: &str) -> Result<Option<Pipeline>, StoreError> {
     let sql = format!("SELECT {PIPELINE_COLUMNS} FROM pipeline_definition WHERE id = $1");
-    let row: Option<PipelineRow> = sqlx::query_as(&sql).bind(id).fetch_optional(pool).await?;
+    // safe: only the constant `PIPELINE_COLUMNS` is formatted in; values are bound.
+    let row: Option<PipelineRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
     Ok(row.map(Pipeline::from))
 }
 
@@ -1016,7 +1021,8 @@ schedule, description, incremental_column, fbic_enabled, transforms, \
          RETURNING {FULL_PIPELINE_COLUMNS}"
     );
     let mut tx = pool.begin().await?;
-    let row: FullPipelineRow = sqlx::query_as(&sql)
+    // safe: only the constant `FULL_PIPELINE_COLUMNS` is formatted in; values are bound.
+    let row: FullPipelineRow = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(&id)
         .bind(&input.name)
         .bind(&input.kind)
@@ -1112,6 +1118,51 @@ pub struct UpdatePipelineInput {
     /// `dependsOn` in the body defaults to `None` via
     /// `#[serde(default)]`.
     pub depends_on: Option<Vec<String>>,
+    /// The pipeline's ingress connector (`BLD-9` / decision 7).
+    ///
+    /// Three states, because they mean three different writes. An
+    /// `Option<Option<String>>` says the same thing, but it is exactly the
+    /// shape `clippy::option_option` refuses (`PR #247 CI`): a reader has to
+    /// remember which `None` is "leave it alone" and which is "clear it".
+    /// The route has already checked a `Set` connector is in the pipeline's
+    /// tenant and that the source is one of its Bronze tables
+    /// (`validate_connector_source`), so this function never stores a
+    /// connector the run would refuse.
+    pub connector_id: ConnectorChange,
+}
+
+/// What a `PUT /api/pipelines/{id}` asked to do with a pipeline's connector
+/// (`BLD-9` / decision 7).
+///
+/// It is also the wire shape of `connectorId` on that route: `#[serde(default)]`
+/// on the field makes an absent key [`Self::Keep`], JSON `null` deserializes
+/// to [`Self::Clear`], and a string to [`Self::Set`] (trimmed; an empty
+/// string means "no connector"). One enum for the meaning and the wire,
+/// instead of an `Option<Option<String>>` the compiler's own lints refuse
+/// (`PR #247 CI`, `clippy::option_option`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ConnectorChange {
+    /// The body did not mention `connectorId`: keep the stored connector.
+    #[default]
+    Keep,
+    /// The body sent `null` (or an empty string): store none.
+    Clear,
+    /// The body named a connector: set or replace it.
+    Set(String),
+}
+
+impl<'de> serde::Deserialize<'de> for ConnectorChange {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let submitted = Option::<String>::deserialize(deserializer)?;
+        Ok(match submitted {
+            None => Self::Clear,
+            Some(id) if id.trim().is_empty() => Self::Clear,
+            Some(id) => Self::Set(id.trim().to_owned()),
+        })
+    }
 }
 
 /// Replace an authored pipeline's definition. Its status is left as it
@@ -1191,11 +1242,25 @@ async fn update_pipeline_with_event(
         "UPDATE pipeline_definition SET kind = $2, source = $3, target = $4, schedule = $5, \
          description = $6, incremental_column = $7, fbic_enabled = $8, transforms = $9, \
 owner = COALESCE($10, owner), max_retries = COALESCE($11, max_retries), \
-         depends_on = COALESCE($12, depends_on) \
+         depends_on = COALESCE($12, depends_on), \
+         connector_id = CASE WHEN $13 THEN $14 ELSE connector_id END \
          WHERE id = $1 RETURNING {FULL_PIPELINE_COLUMNS}"
     );
+    // BLD-9 / decision 7: `connector_id` cannot use the `COALESCE` shape
+    // the columns above use, because "clear it" (`NULL`) and "leave it
+    // alone" are different requests and both would bind `NULL`. The
+    // boolean says whether this write touches the column at all; the
+    // text is the value (typed `NULL` when clearing, so the column's
+    // foreign key holds). `ConnectorChange` carries the three states, so
+    // this match is the only place they turn into SQL.
+    let (connector_set, connector_value) = match &input.connector_id {
+        ConnectorChange::Keep => (false, None),
+        ConnectorChange::Clear => (true, None),
+        ConnectorChange::Set(connector_id) => (true, Some(connector_id.clone())),
+    };
     let mut tx = pool.begin().await?;
-    let row: Option<FullPipelineRow> = sqlx::query_as(&sql)
+    // safe: only the constant `FULL_PIPELINE_COLUMNS` is formatted in; values are bound.
+    let row: Option<FullPipelineRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(id)
         .bind(&input.kind)
         .bind(&source)
@@ -1212,6 +1277,8 @@ owner = COALESCE($10, owner), max_retries = COALESCE($11, max_retries), \
         // keeps the stored chain. `Some(vec![])` binds as the empty
         // array and clears the chain explicitly.
         .bind(&input.depends_on)
+        .bind(connector_set)
+        .bind(&connector_value)
         .fetch_optional(&mut *tx)
         .await?;
     let Some(row) = row else {
@@ -1275,9 +1342,10 @@ pub async fn delete_pipeline(
     // waits on it and then reads the same final state we are about to
     // delete, so the deleted-version row's snapshot is the stable
     // last-known state, not whatever it was at the moment of the SELECT.
-    let row: Option<FullPipelineRow> = sqlx::query_as(&format!(
+    // safe: only the constant `FULL_PIPELINE_COLUMNS` is formatted in; values are bound.
+    let row: Option<FullPipelineRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {FULL_PIPELINE_COLUMNS} FROM pipeline_definition WHERE id = $1 FOR UPDATE"
-    ))
+    )))
     .bind(id)
     .fetch_optional(&mut *tx)
     .await?;
@@ -1613,7 +1681,8 @@ pub async fn set_status(
     let sql = format!(
         "UPDATE pipeline_definition SET status = $2 WHERE id = $1 RETURNING {PIPELINE_COLUMNS}"
     );
-    let row: Option<PipelineRow> = sqlx::query_as(&sql)
+    // safe: only the constant `PIPELINE_COLUMNS` is formatted in; values are bound.
+    let row: Option<PipelineRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(id)
         .bind(status)
         .fetch_optional(pool)
@@ -1832,7 +1901,8 @@ pub async fn get_lag_state(
     pipeline_id: &str,
 ) -> Result<Option<PipelineLagState>, StoreError> {
     let sql = format!("SELECT {LAG_STATE_COLUMNS} FROM pipeline_lag_state WHERE pipeline_id = $1");
-    let row: Option<LagStateRow> = sqlx::query_as(&sql)
+    // safe: only the constant `LAG_STATE_COLUMNS` is formatted in; values are bound.
+    let row: Option<LagStateRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(pipeline_id)
         .fetch_optional(pool)
         .await?;
@@ -1912,7 +1982,8 @@ pub async fn list_lag_states(
     }
     let sql =
         format!("SELECT {LAG_STATE_COLUMNS} FROM pipeline_lag_state WHERE pipeline_id = ANY($1)");
-    let rows: Vec<LagStateRow> = sqlx::query_as(&sql)
+    // safe: only the constant `LAG_STATE_COLUMNS` is formatted in; values are bound.
+    let rows: Vec<LagStateRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(pipeline_ids)
         .fetch_all(pool)
         .await?;
@@ -1974,7 +2045,8 @@ pub async fn upsert_lag_state_conn(
             behind_streak = EXCLUDED.behind_streak \
          RETURNING {LAG_STATE_COLUMNS}"
     );
-    let row: LagStateRow = sqlx::query_as(&sql)
+    // safe: only the constant `LAG_STATE_COLUMNS` is formatted in; values are bound.
+    let row: LagStateRow = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(&update.pipeline_id)
         .bind(update.tenant_id)
         .bind(&update.consumed_tokens)
@@ -2004,9 +2076,6 @@ pub async fn upsert_lag_state_conn(
 /// A lag state whose row has never been checked (`last_check_at IS NULL`)
 /// maps to `None`, the same shape [`PipelineLagState`] picks from.
 ///
-/// # Errors
-///
-/// Returns [`StoreError::Database`] if a query fails.
 /// BLD-2 review R5 SHOULD-FIX 3, measured on the tests this function is
 /// pinned by (both in `tests/pipelines.rs`): the sort below owns the
 /// missing-row INSERT order — a `BEFORE INSERT` probe fails without it,
@@ -2015,6 +2084,10 @@ pub async fn upsert_lag_state_conn(
 /// Both halves are asserted rather than assumed; a caller that ever locks
 /// the rows one statement at a time inherits the sorted order from HERE,
 /// which is what the contention test is there to say.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if a query fails.
 pub async fn lock_lag_states_ordered(
     conn: &mut sqlx::PgConnection,
     ids: &[String],
@@ -2044,7 +2117,8 @@ pub async fn lock_lag_states_ordered(
         "SELECT {LAG_STATE_COLUMNS} FROM pipeline_lag_state WHERE pipeline_id = ANY($1) \
          ORDER BY pipeline_id FOR UPDATE"
     );
-    let rows: Vec<LagStateRow> = sqlx::query_as(&sql)
+    // safe: only the constant `LAG_STATE_COLUMNS` is formatted in; values are bound.
+    let rows: Vec<LagStateRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(&ordered)
         .fetch_all(&mut *conn)
         .await?;
@@ -2101,7 +2175,8 @@ pub async fn set_target_lag(
          SET target_lag_seconds = $2, target_lag_downstream = $3 \
          WHERE id = $1 RETURNING {PIPELINE_COLUMNS}"
     );
-    let row: Option<PipelineRow> = sqlx::query_as(&sql)
+    // safe: only the constant `PIPELINE_COLUMNS` is formatted in; values are bound.
+    let row: Option<PipelineRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(id)
         .bind(seconds)
         .bind(downstream)
@@ -2159,6 +2234,56 @@ pub async fn count_lag_pipelines_reading(
     Ok(count)
 }
 
+/// The batched form of [`count_lag_pipelines_reading`]: which of
+/// `candidates` — `(id, target, tenant_id)` — no lag pipeline reads.
+///
+/// `downstream_without_readers` used to call [`count_lag_pipelines_reading`]
+/// once per downstream candidate, which is one pool checkout per row. One
+/// statement answers all of them, with the SAME predicate (a pipeline with a
+/// target lag whose source is the candidate's target, or whose `depends_on`
+/// names a pipeline whose target is), so the batched answer cannot drift
+/// from the per-row one the check still uses. `unnest` of three parallel
+/// arrays rather than `= ANY($1)` because each candidate pairs its own
+/// target and tenant, which one array cannot express.
+///
+/// A tenantless candidate (`tenant_id` NULL) matches no reader, exactly as
+/// `count_lag_pipelines_reading` answers `0` for one without querying.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the query fails.
+pub async fn lag_pipelines_without_readers(
+    pool: &PgPool,
+    candidates: &[(&str, &str, Option<Uuid>)],
+) -> Result<Vec<String>, StoreError> {
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ids: Vec<&str> = candidates.iter().map(|c| c.0).collect();
+    let targets: Vec<&str> = candidates.iter().map(|c| c.1).collect();
+    let tenants: Vec<Option<Uuid>> = candidates.iter().map(|c| c.2).collect();
+    let rows: Vec<String> = sqlx::query_scalar(
+        "SELECT c.id FROM unnest($1::text[], $2::text[], $3::uuid[]) \
+         AS c(id, target, tenant_id) \
+         WHERE NOT EXISTS ( \
+           SELECT 1 FROM pipeline_definition p \
+           WHERE p.tenant_id = c.tenant_id \
+             AND p.id != c.id \
+             AND (p.target_lag_seconds IS NOT NULL OR p.target_lag_downstream) \
+             AND (p.source = c.target OR EXISTS ( \
+                    SELECT 1 FROM unnest(p.depends_on) AS up(id) \
+                    JOIN pipeline_definition u ON u.id = up.id \
+                    WHERE u.tenant_id = c.tenant_id AND u.target = c.target))) \
+         ORDER BY c.id",
+    )
+    .bind(&ids)
+    .bind(&targets)
+    .bind(&tenants)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
 /// Upstream pipelines whose target lag is `downstream`, and whose target is
 /// read by `pipeline` (directly as its source, or through `depends_on`).
 /// BLD-2 review R1 decision R3 / SHOULD-FIX 9: tenant-scoped.
@@ -2187,7 +2312,8 @@ pub async fn upstream_downstream_pipelines_conn(
     let sql = format!(
         "SELECT {PIPELINE_COLUMNS} FROM pipeline_definition          WHERE target_lag_downstream = true            AND tenant_id = $4            AND id != $1            AND (target = ANY($2) OR id = ANY($3))          ORDER BY id"
     );
-    let rows: Vec<PipelineRow> = sqlx::query_as(&sql)
+    // safe: only the constant `PIPELINE_COLUMNS` is formatted in; values are bound.
+    let rows: Vec<PipelineRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(&pipeline.id)
         .bind(&input_tables)
         .bind(&pipeline.depends_on)

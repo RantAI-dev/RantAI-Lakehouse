@@ -3460,6 +3460,11 @@ pub async fn access_request(
 /// single fan-out handler whose in-handler `kind` branch a future edit
 /// could silently skip.
 ///
+/// `SEC-45`: holding `access:approve` is not enough to APPROVE a request —
+/// the approver must hold the permission the request asks for, the same
+/// rule a direct grant obeys (`routes::catalog_grants::create`, `PR #106
+/// review R1 BLOCKER 4`). Rejecting needs no permission of its own.
+///
 /// `GRANT_DAYS`: how long an approved access request's [`AccessGrant`]
 /// lasts. Fixed rather than caller-supplied (no field in the request or
 /// decide body names it) — a requester/approver cannot negotiate their
@@ -3484,6 +3489,12 @@ type DecideAccessRequestBody = crate::routes::agents::DecideApprovalBody;
 /// - `403` [`ApiError::PermissionDenied`] if the deciding principal is the SAME
 ///   person who requested this access — self-approval is refused, proven
 ///   by a real test (WS7 plan's own acceptance criterion for this task).
+/// - `403` [`ApiError::PermissionDenied`] if the decision is an approval and
+///   the deciding principal does NOT hold the permission the request asks
+///   for (`SEC-45`) — an approver may only approve a permission they hold
+///   themselves, the same rule a direct grant obeys
+///   ([`crate::routes::catalog_grants::create`]). A rejection needs no
+///   permission of its own: it gives nothing away.
 /// - `409` [`ApiError::Conflict`] if the request has already been decided.
 /// - `503`/`500` as [`lakehouse_store::StoreError`] classifies.
 pub async fn decide_access_request(
@@ -3521,6 +3532,27 @@ pub async fn decide_access_request(
             "tidak boleh menyetujui permintaan akses milik sendiri".to_owned(),
         )
         .into());
+    }
+    // SEC-45: an approver may only approve a permission they hold
+    // themselves — the same rule `routes::catalog_grants::create` applies
+    // to a direct grant (`PR #106 review R1 BLOCKER 4`), so holding
+    // `access:approve` alone never widens anybody's permissions. Checked
+    // BEFORE the store call, so a refused approval writes no status, no
+    // grant and no audit row: nothing changes. REJECTING stays allowed —
+    // it gives nothing away.
+    if decision == lakehouse_store::agents::Decision::Approved {
+        // The permission asked for is the approval's own `action`, stored
+        // as `access:<permission>` (`create_access_request`'s shape). A row
+        // whose `action` is not shaped that way is refused as well: fail
+        // closed — an approver whose permission cannot be read cannot be
+        // shown to hold it.
+        let requested = existing.action.strip_prefix("access:").unwrap_or_default();
+        if !principal.has(requested) {
+            return Err(ApiError::PermissionDenied(
+                "you cannot approve a permission you do not hold".to_owned(),
+            )
+            .into());
+        }
     }
 
     let grant = match lakehouse_store::agents::decide_access_request(
@@ -3609,7 +3641,7 @@ mod tests {
     fn split_db_table_empty_table_for_bare_db() {
         let (db, table) = split_db_table("silver");
         assert_eq!(db, "silver");
-        assert!(table.is_empty());
+        assert_eq!(table, "");
     }
 
     #[test]
@@ -4037,9 +4069,9 @@ mod tests {
             description: Some(description.to_owned()),
             governed_tags: None,
         };
-        assert!(
-            changed_annotation_fields(Some(&before), &body("Data Platform", " Orders ", &["pii"]))
-                .is_empty()
+        assert_eq!(
+            changed_annotation_fields(Some(&before), &body("Data Platform", " Orders ", &["pii"])),
+            [] as [&str; 0]
         );
         assert_eq!(
             changed_annotation_fields(Some(&before), &body("Finance", "Orders", &[])),
@@ -4187,7 +4219,10 @@ mod tests {
             silver_downstream("orders", true),
             vec![json!({ "id": "silver.orders", "name": "silver.orders" })]
         );
-        assert!(silver_downstream("orders", false).is_empty());
+        assert_eq!(
+            silver_downstream("orders", false),
+            [] as [serde_json::Value; 0]
+        );
 
         // A Silver model is listed as its own asset once Bronze itself is
         // readable; on a deployment where it is not, the dataset's page IS
@@ -4301,7 +4336,10 @@ mod tests {
     fn iceberg_candidates_excludes_a_seed_like_name_absent_from_the_listing() {
         let pairs = vec![("commerce-orders".to_owned(), "commerce_orders".to_owned())];
         let bronze_tables: HashSet<String> = HashSet::new();
-        assert!(iceberg_candidates(&pairs, &bronze_tables).is_empty());
+        assert_eq!(
+            iceberg_candidates(&pairs, &bronze_tables),
+            [] as [(std::string::String, std::string::String); 0]
+        );
     }
 
     #[test]
@@ -4320,7 +4358,10 @@ mod tests {
             ("a".to_owned(), "a".to_owned()),
             ("b".to_owned(), "b".to_owned()),
         ];
-        assert!(iceberg_candidates(&pairs, &HashSet::new()).is_empty());
+        assert_eq!(
+            iceberg_candidates(&pairs, &HashSet::new()),
+            [] as [(std::string::String, std::string::String); 0]
+        );
     }
 
     fn bronze_row_with_id(slug: &str) -> Value {

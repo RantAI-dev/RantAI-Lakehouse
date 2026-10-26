@@ -585,7 +585,7 @@ mod tests {
             ("AWS_REGION", "eu-west-1"),
         ]))
         .unwrap();
-        assert!(none.allowed_prefixes.is_empty());
+        assert_eq!(none.allowed_prefixes, [] as [std::string::String; 0]);
         for bad in ["vault:secret/a/", "aws-sm:a/../b/"] {
             let err = SecretManagerSettings::from_map(&env(&[
                 ("SECRET_MANAGER", "aws"),

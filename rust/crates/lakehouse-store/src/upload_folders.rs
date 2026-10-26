@@ -196,7 +196,11 @@ async fn subtree_of(
 /// Returns [`StoreError::Database`] on a database failure.
 pub async fn list(pool: &PgPool, tenant_id: Uuid) -> Result<Vec<UploadFolder>, StoreError> {
     let sql = format!("{SELECT_WITH_COUNTS} WHERE f.tenant_id = $1 ORDER BY lower(f.name), f.id");
-    Ok(sqlx::query_as(&sql).bind(tenant_id).fetch_all(pool).await?)
+    // safe: only the constant `SELECT_WITH_COUNTS` is formatted in; values are bound (SEC-41).
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+        .bind(tenant_id)
+        .fetch_all(pool)
+        .await?)
 }
 
 async fn one(
@@ -205,7 +209,8 @@ async fn one(
     id: &str,
 ) -> Result<UploadFolder, FolderError> {
     let sql = format!("{SELECT_WITH_COUNTS} WHERE f.tenant_id = $1 AND f.id = $2");
-    sqlx::query_as(&sql)
+    // safe: only the constant `SELECT_WITH_COUNTS` is formatted in; values are bound (SEC-41).
+    sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(tenant_id)
         .bind(id)
         .fetch_optional(conn)

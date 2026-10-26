@@ -1458,9 +1458,10 @@ async fn adding_a_governance_rule_without_governance_write_is_refused_and_stores
         ),
     ];
     for (kind, table, body) in cases {
-        // `table` is a constant from the array above, never user input.
+        // safe: only the constant `table` from the array above is formatted
+        // in; never user input.
         let count_sql = format!("SELECT count(*) FROM {table}");
-        let before: i64 = sqlx::query_scalar(&count_sql)
+        let before: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(count_sql.as_str()))
             .fetch_one(&pool)
             .await
             .expect("count rules before");
@@ -1485,7 +1486,8 @@ async fn adding_a_governance_rule_without_governance_write_is_refused_and_stores
             StatusCode::FORBIDDEN,
             "adding a {kind} rule without governance:write must be refused"
         );
-        let after: i64 = sqlx::query_scalar(&count_sql)
+        // safe: `table` is a constant from the array above, never user input.
+        let after: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(count_sql.as_str()))
             .fetch_one(&pool)
             .await
             .expect("count rules after");
