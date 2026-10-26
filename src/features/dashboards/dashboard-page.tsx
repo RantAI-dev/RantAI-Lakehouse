@@ -3,7 +3,7 @@
 import * as React from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { useTheme } from "next-themes";
-import { ArrowRightLeft, ChartColumn, Download, GitFork, Heading, Maximize2, Minus, MousePointerClick, Move, Moon, Pencil, Plus, Smartphone, SlidersHorizontal, Sparkles, Table2, Trash2, Rows3 } from "lucide-react";
+import { ArrowRightLeft, Bell, ChartColumn, Download, GitFork, Heading, Maximize2, Minus, MousePointerClick, Move, Moon, Pencil, Plus, Smartphone, SlidersHorizontal, Sparkles, Table2, Trash2, Rows3 } from "lucide-react";
 import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog";
 import { PageHeader } from "@/components/patterns/page-header";
 import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@rantai/design-system/ui/empty";
@@ -64,6 +64,7 @@ import { DashboardGrid, type GridItem, type TileMenuItem } from "./dashboard-gri
 import { LineDialog } from "./line-dialog";
 import { TabBar } from "./tab-bar";
 import { isSectionKind } from "./tile-card";
+import { ChartAlertDialog, type AlertChart } from "./chart-alert-dialog";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { DashboardTilesSkeleton } from "./dashboard-skeleton";
 import { DrillMenu, NoteDialog, RecordsDialog, type DrillTarget } from "./drill";
@@ -256,6 +257,8 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   // BI-14: the chart whose "Where does this come from" panel is open.
   const [lineageChart, setLineageChart] = React.useState<{ id: string; title: string } | null>(null);
   const [tileDialog, setTileDialog] = React.useState<{ kind: "data" | "expand"; id: string } | null>(null);
+  // BI-19 part C: a chart's ⋯ > "Alert me…".
+  const [alertChart, setAlertChart] = React.useState<AlertChart | null>(null);
   // Only the newest load may write state. Creating a dashboard fires a
   // reload of the board being left and then navigates to the new one; the
   // old board's response (slower: it runs the built-in tiles) used to land
@@ -987,6 +990,9 @@ export function DashboardPage({ boardId }: { boardId: string }) {
         : []),
       // BI-14 (decision 1, Q6): everyone who sees a stored chart gets the item; the panel says what a person without `lineage:read` may do.
       ...(own ? [{ label: "Where does this come from", icon: <GitFork />, onSelect: () => setLineageChart({ id: spec.id, title: spec.title }) }] : []),
+      // BI-19 part C (C3): everyone who can view a stored chart may alert on it
+      // for themselves; the server decides who may send it elsewhere.
+      ...(own && !edit ? [{ label: "Alert me…", icon: <Bell />, onSelect: () => setAlertChart({ id: spec.id, title: spec.title, kind: spec.kind, measures: hasRows(cell) ? cell.columns.filter((c) => c !== spec.def?.dimension) : [] }) }] : []),
       // BI-9: a chart grouped by a part of the date (a weekday) has no rows to
       // list or range to filter; the menu says why instead of leaving the click dead.
       ...(hasRows(cell) && isGrain(cell.grain) && !isTruncation(cell.grain)
@@ -1331,6 +1337,16 @@ export function DashboardPage({ boardId }: { boardId: string }) {
 
       {tileDialog?.kind === "data" && dialogSpec ? (
         <TileDataDialog title={dialogSpec.title} cell={data?.results[dialogSpec.id]} onClose={() => setTileDialog(null)} canDownload={canDownload} />
+      ) : null}
+      {alertChart ? (
+        <ChartAlertDialog
+          open
+          onOpenChange={(open) => { if (!open) setAlertChart(null); }}
+          chart={alertChart}
+          filters={normalizeFilters(filters)}
+          userEmail={user?.email ?? null}
+          canWriteAlerts={hasPermission("alert:write")}
+        />
       ) : null}
       {tileDialog?.kind === "expand" && dialogSpec ? (
         <TileExpandDialog spec={dialogSpec} cell={data?.results[dialogSpec.id]} dark={dark} onClose={() => setTileDialog(null)} />
