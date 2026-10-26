@@ -526,6 +526,11 @@ in from the local host only and may only `SELECT console.geo_region`:
 - `flock /home/shiro/rantai/.heavy.lock bun test src/features/dashboards/public-map-boundary.test.tsx src/features/dashboards/uploaded-maps.test.tsx src/features/dashboards/natural-earth-maps.test.tsx` → 17 pass, 0 fail (3 files).
 - `flock /home/shiro/rantai/.heavy.lock bun run test` → 2718 pass, 1 skip, 0 fail (280 files).
 
+The repository has no `vitest`: the console's test runner is `bun test`
+(`bunfig.toml` preloads happy-dom for the DOM). The new console test was
+therefore written for `bun:test`, like every other test file under `src/`,
+and run with the repo's runner.
+
 **Not verified**
 
 - `cargo test --workspace` was not run here (the crates above were); CI runs
