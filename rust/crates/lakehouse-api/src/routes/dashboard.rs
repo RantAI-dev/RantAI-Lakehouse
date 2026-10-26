@@ -3179,30 +3179,30 @@ pub struct TableExportQuery {
 pub struct ChartExportQuery {
     /// The tile to download.
     #[serde(default)]
-    chart: Option<String>,
-    /// `xlsx` or `csv` (default `csv`).
+    pub(crate) chart: Option<String>,
+    /// `xlsx` or `csv` (default `csv`), or `png` (`BI-19` part D: the chart as an image).
     #[serde(default)]
-    format: Option<String>,
+    pub(crate) format: Option<String>,
     /// `formatted` (default) or `raw`.
     #[serde(default)]
-    values: Option<String>,
+    pub(crate) values: Option<String>,
     /// The dashboard's active filters (JSON list), as `GET /api/dashboard`.
     #[serde(default)]
-    filters: Option<String>,
+    pub(crate) filters: Option<String>,
     /// The sort the viewer chose on a raw table, in place of the saved one.
     #[serde(default, rename = "sortColumn")]
-    sort_column: Option<String>,
+    pub(crate) sort_column: Option<String>,
     #[serde(default, rename = "sortDir")]
-    sort_dir: Option<String>,
+    pub(crate) sort_dir: Option<String>,
     /// The parameter values the tile was drawn with (JSON object).
     #[serde(default)]
-    params: Option<String>,
+    pub(crate) params: Option<String>,
     /// The year list a built-in dashboard filters by (`1,2`), as `GET /api/dashboard`.
     #[serde(default)]
-    year: Option<String>,
+    pub(crate) year: Option<String>,
     /// The grain switch, as `GET /api/dashboard`.
     #[serde(default)]
-    grain: Option<String>,
+    pub(crate) grain: Option<String>,
 }
 
 impl ChartExportQuery {
@@ -3594,7 +3594,8 @@ fn export_failure(err: &crate::export::ExportError) -> ApiError {
 /// # Errors
 ///
 /// 400 for a missing `chart`, an unknown `format`/`values`, a tile with no
-/// data, bad filters or sort; 403 when every role of the person is switched
+/// data, bad filters or sort; with `format=png` see
+/// [`crate::routes::pdf_export::export_chart_png`]; 403 when every role of the person is switched
 /// off from downloading; 404 for an unknown tile; 422 when the role rewrite
 /// refuses or the engine rejects the statement; 503 when the engine or the
 /// audit store is unavailable.
@@ -3603,6 +3604,11 @@ pub async fn chart_export(
     Extension(principal): Extension<Principal>,
     Query(q): Query<ChartExportQuery>,
 ) -> ApiResult<Response> {
+    // BI-19 part D (plan D13): an image is made by the renderer, not by a row
+    // stream, so it has its own path (and its own audit action).
+    if q.format.as_deref() == Some("png") {
+        return crate::routes::pdf_export::export_chart_png(&state, &principal, &q).await;
+    }
     export_chart(&state, &principal, &q, "dashboard.chart_export", false).await
 }
 

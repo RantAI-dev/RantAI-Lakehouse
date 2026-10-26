@@ -294,6 +294,12 @@ pub struct RenderClaims {
     pub aud: String,
     /// The dashboard to print.
     pub board: String,
+    /// `BI-19` part D (plan D13): set for a chart's image. The token is then
+    /// good for this one chart of `board` and for nothing else on it: the data
+    /// route (`routes::render`) answers with that chart only, and refuses the
+    /// token when the person can no longer see it. Absent for a dashboard PDF.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chart: Option<String>,
     /// The person who asked (`app_user.id`): the data is read as them.
     pub principal: String,
     /// The dashboard's filters, as the JSON list `GET /api/dashboard` takes in
@@ -628,6 +634,7 @@ mod tests {
         RenderClaims {
             aud: RENDER_AUDIENCE.to_owned(),
             board: "b_test".to_owned(),
+            chart: None,
             principal: "7d1e1c52-2f6b-4f3a-9c58-0c5d1d3f9a11".to_owned(),
             filters: Some(r#"[{"column":"region","values":["north"]}]"#.to_owned()),
             params: Some(r#"{"p":1}"#.to_owned()),

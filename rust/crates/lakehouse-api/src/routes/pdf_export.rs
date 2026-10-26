@@ -39,6 +39,14 @@ use crate::upstream_error::{self, Context, FailedAs};
 /// decision 6). The browser's print stays available in the console.
 pub(crate) const PDF_NOT_SET_UP: &str = "PDF export is not set up on this deployment";
 
+/// What the person is told when the deployment has no renderer and asks for a
+/// chart image (`BI-19` plan D13): the same three settings as the PDF.
+pub(crate) const IMAGES_NOT_SET_UP: &str = "Images are not set up on this deployment.";
+
+/// What a service token is told when it asks for an image.
+const IMAGE_FOR_PEOPLE: &str =
+    "An image is made for a signed-in person; a service token cannot ask for one.";
+
 /// What a service token is told (R3).
 pub(crate) const PDF_FOR_PEOPLE: &str =
     "A PDF is made for a signed-in person; a service token cannot ask for one.";
@@ -91,7 +99,7 @@ pub(crate) fn pdf_failure(err: &PdfError) -> ApiError {
     let ctx = match err {
         PdfError::Timeout => &PDF_TIMEOUT,
         PdfError::Unreachable(_) => &PDF_UNREACHABLE,
-        PdfError::Refused(_) | PdfError::NotAPdf => &PDF_FAILED,
+        PdfError::Refused(_) | PdfError::NotAPdf | PdfError::NotAnImage => &PDF_FAILED,
     };
     upstream_error::report(ctx, upstream_error::Class::Failed, err)
         .into_api_error(FailedAs::ServiceUnavailable)
@@ -155,13 +163,95 @@ impl PdfFailure {
 ///
 /// [`PdfFailure`] as described there.
 pub(crate) async fn make_pdf(state: &AppState, job: &PdfJob<'_>) -> Result<Vec<u8>, PdfFailure> {
-    // The slots are taken for the whole conversion. A further request waits for
-    // one, but not longer than a minute (BI-1 review fix (BLOCKER) R2): then it
-    // is told, in a sentence, instead of meeting the route's deadline.
-    let _slot = crate::pdf::acquire_slot(&state.pdf_slots, crate::pdf::PDF_SLOT_WAIT)
-        .await
-        .ok_or(PdfFailure::Busy)?;
+    let _slot = take_slot(state).await?;
+    let (page_url, gotenberg) = render_page(
+        state,
+        &RenderPage {
+            kind: "dashboard",
+            chart: None,
+            board: job.board,
+            person: job.person,
+            values: job.values,
+            paper: (job.paper.as_str(), job.orientation.as_str()),
+        },
+    )?;
+    convert_url(
+        gotenberg,
+        &page_url,
+        (job.paper, job.orientation),
+        crate::pdf::PDF_DEADLINE,
+    )
+    .await
+    .map_err(PdfFailure::Conversion)
+}
 
+/// What a chart image is made of (`BI-19` part D, plan D13): one chart of a
+/// dashboard, the person it is made as, and the values the print view reads
+/// the dashboard with.
+pub(crate) struct PngJob<'a> {
+    pub board: &'a str,
+    pub chart: &'a str,
+    pub person: uuid::Uuid,
+    pub values: DashboardValues<'a>,
+}
+
+/// Make one chart's PNG: the same slot, the same token secret and the same
+/// configured address as [`make_pdf`], with a token that names the chart, and
+/// Gotenberg's screenshot route in place of the print route.
+///
+/// # Errors
+///
+/// [`PdfFailure`] as for [`make_pdf`]; `NotSetUp` reads "Images are not set up
+/// on this deployment" at the route (it is the same three settings).
+pub(crate) async fn make_png(state: &AppState, job: &PngJob<'_>) -> Result<Vec<u8>, PdfFailure> {
+    let _slot = take_slot(state).await?;
+    let (page_url, gotenberg) = render_page(
+        state,
+        &RenderPage {
+            kind: "chart",
+            chart: Some(job.chart),
+            board: job.board,
+            person: job.person,
+            values: job.values,
+            // The claims carry a paper and an orientation for a PDF; an image
+            // has neither, and says so rather than naming a paper it is not on.
+            paper: ("image", "none"),
+        },
+    )?;
+    crate::pdf::screenshot_url(gotenberg, &page_url, crate::pdf::PDF_DEADLINE)
+        .await
+        .map_err(PdfFailure::Conversion)
+}
+
+/// The slots are taken for the whole conversion. A further request waits for
+/// one, but not longer than a minute (BI-1 review fix (BLOCKER) R2): then it
+/// is told, in a sentence, instead of meeting the route's deadline. The PDF and
+/// the image share the slots, so Chromium never runs more than `PDF_AT_ONCE`
+/// conversions together.
+async fn take_slot(state: &AppState) -> Result<tokio::sync::OwnedSemaphorePermit, PdfFailure> {
+    crate::pdf::acquire_slot(&state.pdf_slots, crate::pdf::PDF_SLOT_WAIT)
+        .await
+        .ok_or(PdfFailure::Busy)
+}
+
+/// The print view one token opens.
+struct RenderPage<'a> {
+    /// `dashboard` or `chart`: the path under `/render/`.
+    kind: &'static str,
+    chart: Option<&'a str>,
+    board: &'a str,
+    person: uuid::Uuid,
+    values: DashboardValues<'a>,
+    paper: (&'a str, &'a str),
+}
+
+/// Mint the render token and build the address Gotenberg opens, from
+/// configuration and the token only (`BI-1` review fix R1: `RENDER_TOKEN_SECRET`
+/// only). Returns the page address and the Gotenberg address.
+fn render_page<'s>(
+    state: &'s AppState,
+    page: &RenderPage<'_>,
+) -> Result<(String, &'s str), PdfFailure> {
     let (Some(secret), Some(gotenberg), Some(console)) = (
         state.config.render_token_secret.as_ref(),
         state.config.gotenberg_url.as_deref(),
@@ -173,13 +263,14 @@ pub(crate) async fn make_pdf(state: &AppState, job: &PdfJob<'_>) -> Result<Vec<u
     let token = lakehouse_embed::sign_render(
         &lakehouse_embed::RenderClaims {
             aud: lakehouse_embed::RENDER_AUDIENCE.to_owned(),
-            board: job.board.to_owned(),
-            principal: job.person.to_string(),
-            filters: job.values.filters.map(str::to_owned),
-            params: job.values.params.map(str::to_owned),
-            grain: job.values.grain.map(str::to_owned),
-            paper: job.paper.as_str().to_owned(),
-            orientation: job.orientation.as_str().to_owned(),
+            board: page.board.to_owned(),
+            chart: page.chart.map(str::to_owned),
+            principal: page.person.to_string(),
+            filters: page.values.filters.map(str::to_owned),
+            params: page.values.params.map(str::to_owned),
+            grain: page.values.grain.map(str::to_owned),
+            paper: page.paper.0.to_owned(),
+            orientation: page.paper.1.to_owned(),
             iat: now,
             exp: lakehouse_embed::render_expiry(now),
             jti: uuid::Uuid::new_v4().to_string(),
@@ -187,15 +278,14 @@ pub(crate) async fn make_pdf(state: &AppState, job: &PdfJob<'_>) -> Result<Vec<u
         secret.expose_secret(),
     );
     // The address comes from configuration and the token only.
-    let page_url = format!("{}/render/dashboard/{token}", console.trim_end_matches('/'));
-    convert_url(
+    Ok((
+        format!(
+            "{}/render/{}/{token}",
+            console.trim_end_matches('/'),
+            page.kind
+        ),
         gotenberg,
-        &page_url,
-        (job.paper, job.orientation),
-        crate::pdf::PDF_DEADLINE,
-    )
-    .await
-    .map_err(PdfFailure::Conversion)
+    ))
 }
 
 /// `GET /api/dashboard/export/pdf?board=&paper=&orientation=` — the PDF.
@@ -312,6 +402,111 @@ pub async fn export_pdf(
         .into_response())
 }
 
+/// `GET /api/dashboard/chart-export?chart=&format=png` — one chart as a PNG
+/// (`BI-19` part D, plan D13), called by `chart_export` for that format.
+///
+/// The chart is found through the caller's own reads
+/// (`list_stored_charts` with their resolved viewer), so a chart on a
+/// dashboard their rules leave out, in the trash, or in somebody else's
+/// personal space is the same 404 as one that does not exist. The renderer
+/// then reads the dashboard as the same person with a token that names only
+/// this chart (`routes::render`). Same `require_download`, same slots and fixed
+/// sentences as the PDF; the audit entry is `dashboard.chart_png`.
+///
+/// # Errors
+///
+/// 400 for a missing chart, filters that do not parse, a tile that shows no
+/// data, or a service token; 403 when every role of the person is switched off
+/// from downloading; 404 for a chart the person cannot see; 503 with a fixed
+/// sentence when images are not set up, Gotenberg is down or too slow, or the
+/// audit store is down.
+pub(crate) async fn export_chart_png(
+    state: &AppState,
+    principal: &Principal,
+    q: &crate::routes::dashboard::ChartExportQuery,
+) -> ApiResult<Response> {
+    // The entry check (and the resolved viewer) first, as the PDF route does.
+    let viewer = viewer_for(state, principal).await?;
+    if matches!(principal.id, lakehouse_auth::PrincipalId::Service(_)) {
+        return Err(ApiError::BadRequest(IMAGE_FOR_PEOPLE.to_owned()).into());
+    }
+    crate::routes::settings::require_download(state, principal).await?;
+    if !pdf_supported(&state.config) {
+        return Err(ApiError::Unavailable(IMAGES_NOT_SET_UP.to_owned()).into());
+    }
+    let chart_id = q
+        .chart
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .ok_or_else(|| ApiError::BadRequest("chart is required".to_owned()))?;
+    crate::routes::dashboard::check_filters_text(q.filters.as_deref())?;
+    let chart = store::list_stored_charts(&state.clickhouse, &viewer)
+        .await
+        .map_err(|err| classify_dashboard_ch_error(&err))?
+        .into_iter()
+        .find(|c| c.spec.id == chart_id)
+        .ok_or_else(|| ApiError::NotFound("this tile does not exist".to_owned()))?;
+    if chart.spec.kind.is_static() {
+        return Err(ApiError::BadRequest(
+            "this tile shows no data, so there is nothing to download".to_owned(),
+        )
+        .into());
+    }
+    let board = if chart.board.is_empty() {
+        store::DEFAULT_BOARD_ID
+    } else {
+        chart.board.as_str()
+    };
+    let png = make_png(
+        state,
+        &PngJob {
+            board,
+            chart: chart_id,
+            person: principal.id.uuid(),
+            values: DashboardValues {
+                filters: q.filters.as_deref(),
+                params: q.params.as_deref(),
+                grain: q.grain.as_deref(),
+            },
+        },
+    )
+    .await
+    .map_err(|failure| match failure {
+        PdfFailure::NotSetUp => ApiError::Unavailable(IMAGES_NOT_SET_UP.to_owned()),
+        other => other.into_api_error(),
+    })?;
+
+    record_download_audit(
+        state,
+        principal,
+        ("dashboard.chart_png", "dashboard_tile", chart_id),
+        json!({
+            "board": board,
+            "tile": chart_id,
+            "width": crate::pdf::PNG_WIDTH,
+            "scale": crate::pdf::PNG_SCALE,
+            "bytes": png.len(),
+        }),
+    )
+    .await?;
+
+    let date = crate::routes::settings::report_date(state).await;
+    let file_name = format!("{}-{date}.png", file_slug(&chart.spec.title, "chart"));
+    Ok((
+        [
+            (header::CONTENT_TYPE, "image/png".to_owned()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{file_name}\""),
+            ),
+            (header::CACHE_CONTROL, "no-store".to_owned()),
+        ],
+        png,
+    )
+        .into_response())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,6 +532,7 @@ mod tests {
             ),
             (PdfError::Refused(500), "The PDF could not be made."),
             (PdfError::NotAPdf, "The PDF could not be made."),
+            (PdfError::NotAnImage, "The PDF could not be made."),
         ];
         for (err, sentence) in cases {
             let text = pdf_failure(&err).to_string();

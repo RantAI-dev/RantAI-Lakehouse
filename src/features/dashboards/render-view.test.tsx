@@ -162,3 +162,23 @@ describe("the PDF print view", () => {
     }
   })
 })
+
+describe("the chart image view (BI-19 part D, plan D13)", () => {
+  it("draws the one chart under its title and the applied filters in the box Gotenberg screenshots", async () => {
+    serve(payload({
+      layout: { c_chart: { x: 0, y: 0, w: 12, h: 4 } },
+      tabs: undefined,
+      charts: [{ id: "c_chart", title: "Visits by region", kind: "bar", mart: "m", x: "k", y: "v", source: "ui" }],
+    }))
+    const { container } = render(<RenderView token="a.b.c" chart />)
+    expect(await screen.findByRole("heading", { name: "Visits by region" })).toBeTruthy()
+    expect(container.querySelector("[data-render-chart]")).not.toBeNull()
+    expect(screen.getByTestId("render-filters").textContent).toContain("region: north, south")
+    expect(screen.getByTestId("tile-c_chart")).toBeTruthy()
+    // No dashboard chrome: no tab headings, no "Downloaded by" block.
+    expect(screen.queryByText("Downloaded by")).toBeNull()
+    await waitFor(() => expect(captured).not.toBeNull())
+    act(() => captured?.chartFinished())
+    await waitFor(() => expect(flag()).toBe(true))
+  })
+})
