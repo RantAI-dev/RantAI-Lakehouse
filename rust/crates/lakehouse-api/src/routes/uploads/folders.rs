@@ -400,6 +400,7 @@ fn upload_ids_of(fields: &Map<String, Value>) -> Result<Vec<String>, ApiError> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
 
     /// Every refusal the store can make is a sentence written in this file, and a
