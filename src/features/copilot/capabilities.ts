@@ -62,7 +62,9 @@ export const CAPABILITIES: Capability[] = [
       "export_dashboard", "export_chart",
       // RPT-1 / AI-10: scheduled reports by email. Creating one for the person alone waits for the Confirm button;
       // naming anyone else, and every delete, waits in Approvals (the composer sends this list as the allowlist, see BI-8 R1).
-      "list_report_subscriptions", "create_report_subscription", "update_report_subscription", "delete_report_subscription"],
+      "list_report_subscriptions", "create_report_subscription", "update_report_subscription", "delete_report_subscription",
+      // BI-16 part C2 / AI-5: the maps a map chart can use, built-in and uploaded (read-only).
+      "list_maps"],
   },
   {
     key: "pipeline",

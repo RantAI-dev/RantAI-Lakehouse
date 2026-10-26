@@ -3,7 +3,7 @@
 import * as React from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { useTheme } from "next-themes";
-import { ArrowRightLeft, ChartColumn, Download, Heading, Maximize2, Minus, MousePointerClick, Move, Moon, Pencil, Plus, RefreshCw, Smartphone, SlidersHorizontal, Sparkles, Square, Table2, Trash2, Rows3 } from "lucide-react";
+import { ArrowRightLeft, ChartColumn, Download, GitFork, Heading, Maximize2, Minus, MousePointerClick, Move, Moon, Pencil, Plus, RefreshCw, Smartphone, SlidersHorizontal, Sparkles, Square, Table2, Trash2, Rows3 } from "lucide-react";
 import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog";
 import { PageHeader } from "@/components/patterns/page-header";
 import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@rantai/design-system/ui/empty";
@@ -61,6 +61,7 @@ import { GrainMarkers } from "./grain-marker";
 import { OwnFiltersMarker } from "./filters/own-filters-marker";
 import { GrainSwitch } from "./grain-switch";
 import { ReportingProvider } from "./reporting-context";
+import { ChartLineagePanel } from "./chart-lineage-panel";
 import { FilterBar } from "./filters/filter-bar";
 import { SkippedFiltersMarker } from "./filters/skipped-marker";
 import { DashboardGrid, type GridItem, type TileMenuItem } from "./dashboard-grid";
@@ -260,6 +261,8 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   const [records, setRecords] = React.useState<RecordsRequest | null>(null);
   // Tiles whose saved click destination the viewer set aside for the drill menu (this session only).
   const [menuTiles, setMenuTiles] = React.useState<ReadonlySet<string>>(new Set());
+  // BI-14: the chart whose "Where does this come from" panel is open.
+  const [lineageChart, setLineageChart] = React.useState<{ id: string; title: string } | null>(null);
   const [tileDialog, setTileDialog] = React.useState<{ kind: "data" | "expand"; id: string } | null>(null);
   // Only the newest load may write state. Creating a dashboard fires a
   // reload of the board being left and then navigates to the new one; the
@@ -1037,6 +1040,8 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       ...((offersTileRecords(spec.kind) || spec.def?.steps?.length) && (spec.mart || spec.sqlSource)
         ? [{ label: "View records", icon: <Table2 />, onSelect: () => openRecords({ title: spec.title, mart: spec.mart, sqlSource: spec.sqlSource, chart: ownFilterChart(spec) }, spec.source === "builtin", NO_FILTERS, spec.id) }]
         : []),
+      // BI-14 (decision 1, Q6): everyone who sees a stored chart gets the item; the panel says what a person without `lineage:read` may do.
+      ...(own ? [{ label: "Where does this come from", icon: <GitFork />, onSelect: () => setLineageChart({ id: spec.id, title: spec.title }) }] : []),
       // BI-9: a chart grouped by a part of the date (a weekday) has no rows to
       // list or range to filter; the menu says why instead of leaving the click dead.
       ...(hasRows(cell) && isGrain(cell.grain) && !isTruncation(cell.grain)
@@ -1443,6 +1448,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
           onDownload={(choice) => downloadData(dataFor.id, choice)}
         />
       ) : null}
+      <ChartLineagePanel chart={lineageChart} onOpenChange={(next) => { if (!next) setLineageChart(null); }} />
     </div>
     </ReportingProvider>
   );

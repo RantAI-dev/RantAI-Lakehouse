@@ -87,3 +87,25 @@ test("computed lines and bands round trip, and a computed line carries no value"
   assert.equal(isComputedLine("median"), true)
   assert.equal(isComputedLine("band"), false)
 })
+
+// BI-17 part B (plan D1): the forecast line and its horizon.
+test("a forecast line round-trips with its horizon and measure", () => {
+  const lines = [{ kind: "forecast", horizon: 6, label: "Outlook", measure: "visitors" }]
+  assert.deepEqual(refLinesPayload(refLinesFromDef(lines)), lines)
+  assert.equal(isComputedLine("forecast"), true)
+})
+
+test("a forecast with no whole horizon from 1 to 60 is not sent, and only the first forecast is kept", () => {
+  const draft = (horizon: string) => ({ value: "", param: "", label: "", kind: "forecast" as const, horizon })
+  assert.deepEqual(refLinesPayload([draft("")]), [])
+  assert.deepEqual(refLinesPayload([draft("0")]), [])
+  assert.deepEqual(refLinesPayload([draft("61")]), [])
+  assert.deepEqual(refLinesPayload([draft("2.5")]), [])
+  assert.deepEqual(refLinesPayload([draft("60")]), [{ kind: "forecast", horizon: 60 }])
+  assert.deepEqual(refLinesPayload([draft("3"), draft("9")]), [{ kind: "forecast", horizon: 3 }])
+})
+
+test("a chart saved before forecasts is sent back byte for byte", () => {
+  const lines = [{ value: 5, label: "Goal" }, { kind: "average" }, { kind: "band", value: 1, to: 2 }]
+  assert.deepEqual(refLinesPayload(refLinesFromDef(lines)), lines)
+})

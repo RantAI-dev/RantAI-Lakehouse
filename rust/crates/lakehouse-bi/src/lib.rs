@@ -16,6 +16,7 @@ pub mod filters;
 pub mod folders;
 pub mod formatting;
 pub mod formula;
+pub mod geo;
 pub mod grain;
 pub mod groups;
 pub mod hierarchies;

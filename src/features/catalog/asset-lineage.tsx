@@ -8,6 +8,7 @@ import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
 import { useAuth } from "@/features/auth/auth-provider"
 import { KIND_LABEL, focusIds, type LineageNode } from "@/features/governance/lineage-graph"
+import { UsedBy } from "@/features/governance/used-by"
 import { useService, type ServiceState } from "@/hooks/use-service"
 import { assetQueryStudioHref } from "@/lib/asset-query"
 import { isIcebergCandidate } from "@/lib/lakehouse-view"
@@ -316,6 +317,9 @@ export function AssetLineage({ asset: a, state }: { asset: AssetDetail; state: A
           <MappingList mappings={mappings} />
         </SectionCard>
       ) : null}
+
+      {/* BI-14 (plan D5): the charts that read this table, beside the recorded dependents. */}
+      <UsedBy table={lineageKey(a)} />
 
       <div className="grid gap-2 lg:grid-cols-2">
         <SectionCard

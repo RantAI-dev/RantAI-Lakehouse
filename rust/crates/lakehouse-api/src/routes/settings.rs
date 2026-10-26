@@ -465,6 +465,32 @@ pub(crate) async fn report_date(state: &AppState) -> String {
 /// default, which would shift every date silently); a stored row that no
 /// longer validates (edited by hand around the CHECKs) is a fixed `500`.
 pub(crate) async fn time_context(state: &AppState) -> Result<TimeContext, ApiError> {
+    let ctx = base_time_context(state).await?;
+    // BI-16 part C3: the uploaded maps `RegionOf` may name ride in the context
+    // every formula compile receives. A map list that cannot be read leaves
+    // none (logged): `RegionOf` then says it finds no such map.
+    let Some(pool) = state.pg.as_deref() else {
+        return Ok(ctx);
+    };
+    let maps = match lakehouse_store::geo_map::list(pool).await {
+        Ok(rows) => rows
+            .into_iter()
+            .map(|m| lakehouse_bi::geo::SpatialMap {
+                id: m.id,
+                name: m.name,
+                region_lookup: m.region_lookup,
+            })
+            .collect(),
+        Err(err) => {
+            tracing::warn!(%err, "the uploaded maps could not be listed for the formula compiler");
+            Vec::new()
+        }
+    };
+    Ok(ctx.with_maps(maps))
+}
+
+/// [`time_context`] without the uploaded maps.
+async fn base_time_context(state: &AppState) -> Result<TimeContext, ApiError> {
     let Some(pool) = state.pg.as_deref() else {
         return Ok(TimeContext::default());
     };

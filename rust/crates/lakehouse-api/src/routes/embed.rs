@@ -10,11 +10,11 @@
 
 use axum::body::Bytes;
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use lakehouse_bi::access::Viewer;
 use lakehouse_bi::store::{self, Board, FilterDef, StoredChartSpec};
-use lakehouse_clickhouse::ChClient;
+use lakehouse_clickhouse::{ChClient, ChError};
 use lakehouse_core::ApiError;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -958,6 +958,127 @@ pub async fn public_dashboard(
         )
             .into_response(),
     }
+}
+
+/// `GET /api/public/dashboard/{token}/maps/{id}/geojson` — the boundary
+/// file of a map one of this board's charts draws on.
+///
+/// `PR #246 review BLOCKER 1`: the public link reads a map's boundary
+/// through its own token, the way it reads the board's data: a token that
+/// is not a board is a 404, exactly as `GET /api/public/dashboard/{token}`
+/// answers, and a map no chart on that board draws on is the same 404.
+pub async fn public_map_geojson(
+    State(state): State<AppState>,
+    Path((token, id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    // BI-19 part A: the link is resolved the way `public_dashboard` resolves
+    // it — from Postgres, with the password ticket — so a map behind a
+    // password needs the same ticket the board's data does, and a link that
+    // does not work is the same 404 as the board's.
+    let board = match crate::routes::public_links::resolve(&state, &token).await {
+        Ok(crate::routes::public_links::Resolved::Open(open)) => {
+            if let Some(refusal) =
+                crate::routes::public_links::check_ticket(&state, &open.link, &headers).await
+            {
+                return refusal;
+            }
+            open.board
+        }
+        Ok(crate::routes::public_links::Resolved::Gone) => {
+            return crate::routes::public_links::not_found();
+        }
+        Err(err) => return crate::error::ApiRejection(err).into_response(),
+    };
+    map_for_board(&state, &board.id, &id, &headers).await
+}
+
+/// `POST /api/embed/maps/{id}/geojson` — the boundary file of a map one of
+/// the embedded board's charts draws on. The body is `{ jwt }`, exactly as
+/// `POST /api/embed/data` takes it, and it opens the same board.
+///
+/// `PR #246 review BLOCKER 1`: the console's `ensureMap` fetched a map
+/// through `apiFetch`, whose 401 sends the browser to the login page — an
+/// anonymous viewer of an embed has no account to log into. The embed reads
+/// its boundary here instead, and a map no chart on that board draws on is a
+/// 404, so the token reads the board it opens and nothing else.
+pub async fn embed_map_geojson(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let jwt = serde_json::from_slice::<EmbedDataBody>(&body)
+        .ok()
+        .and_then(|b| b.jwt);
+    let Some(jwt) = jwt.filter(|s| !s.is_empty()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            ApiJson(json!({ "error": "jwt is required" })),
+        )
+            .into_response();
+    };
+    // The same admission `POST /api/embed/data` applies, so the two routes
+    // cannot disagree about what a token opens (`BI-26`'s `verified_claims`
+    // and `admit`, which read a chart token as well as a board token).
+    let claims = match verified_claims(&state, &jwt) {
+        Ok(claims) => claims,
+        Err(refusal) => return *refusal,
+    };
+    let (_board, subject) = match admit(&state, &claims).await {
+        Ok(admitted) => admitted,
+        Err(refusal) => return *refusal,
+    };
+    map_for_board(&state, &subject.board_id, &id, &headers).await
+}
+
+/// The map file `id` for a board that may open it.
+///
+/// The token is the credential, and the token's board is what it opens: the
+/// file is served only when a chart on that board draws on that map, and the
+/// answer is a 404 otherwise — the same answer for a map the board does not
+/// use, for a map that does not exist and for a map id that is not
+/// server-made, so the route is no oracle for what a board holds.
+async fn map_for_board(
+    state: &AppState,
+    board_id: &str,
+    id: &str,
+    headers: &HeaderMap,
+) -> Response {
+    let maps = match board_map_ids(state, board_id).await {
+        Ok(maps) => maps,
+        Err(err) => return database_failure(&err),
+    };
+    if !maps.iter().any(|m| m == id) {
+        return crate::routes::public_links::not_found();
+    }
+    match super::maps::map_file(state, id, headers).await {
+        Ok(response) => response,
+        Err(rejection) => rejection.into_response(),
+    }
+}
+
+/// The map ids the charts on `board_id` draw on.
+///
+/// The charts are read as nobody in particular, exactly as the embed and the
+/// public payload read them ([`board_cards`]): a chart in the trash or on a
+/// personal board is not on this board.
+async fn board_map_ids(state: &AppState, board_id: &str) -> Result<Vec<String>, ChError> {
+    let stored = store::list_stored_charts(&state.clickhouse, &Viewer::anonymous()).await?;
+    Ok(board_cards(&stored, board_id)
+        .into_iter()
+        .filter_map(|c| c.def.map.clone())
+        .collect())
+}
+
+/// The fixed-500 answer a store failure gets, as the other embed routes send
+/// it (`PR #246 review BLOCKER 1`: the map routes read the store too).
+fn database_failure(err: &ChError) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        ApiJson(upstream_error::report_ch(&upstream_error::DATABASE, err).to_json()),
+    )
+        .into_response()
 }
 
 /// A chart as an embed or a public link shows it: the render spec of the

@@ -18,6 +18,11 @@ export const KIND_LABEL: Record<string, string> = {
   gold: "Gold",
   iceberg: "Iceberg",
   pipeline: "Pipeline",
+  // BI-14 (plan D5): the lineage page also draws the charts, SQL sources and metrics that read a table.
+  chart: "Chart",
+  sql_source: "SQL source",
+  metric: "Metric",
+  upload: "Upload",
 }
 
 /** An id's kind prefix and the rest: `table:silver.orders` is `["table", "silver.orders"]`. */

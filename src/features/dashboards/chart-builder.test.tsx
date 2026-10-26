@@ -496,3 +496,35 @@ describe("ChartBuilder freshness (BI-4 part B)", () => {
     expect(screen.queryByLabelText("Freshness: minutes")).toBeNull()
   })
 })
+
+describe("ChartBuilder scatter (BI-17 B QA fix F2)", () => {
+  it("asks for an X metric and a Y metric, and a size for a bubble chart", async () => {
+    renderBuilder(barDef)
+    const trigger = await screen.findByRole("button", { name: /Change chart type, now Bar/ })
+    fireEvent.click(trigger)
+    fireEvent.click(await screen.findByRole("button", { name: "Scatter (X vs Y)" }))
+    await waitFor(() => expect(screen.getByText("X metric")).toBeTruthy())
+    expect(screen.getByText("Y metric")).toBeTruthy()
+    expect(screen.queryByText("Size metric")).toBeNull()
+  })
+
+  it("does the same when the chart is new and the data source is picked after the kind", async () => {
+    renderBuilder()
+    const scatter = await screen.findByRole("button", { name: "Scatter (X vs Y)" })
+    fireEvent.click(scatter)
+    await waitFor(() => expect(screen.getByText("X metric")).toBeTruthy())
+    expect(screen.getByText("Y metric")).toBeTruthy()
+  })
+
+  it("keeps the Y metric when the data source is picked after the kind (it used to reset to one row)", async () => {
+    renderBuilder()
+    fireEvent.click(await screen.findByRole("button", { name: "Bubble (X, Y, size)" }))
+    fireEvent.click(await screen.findByRole("combobox", { name: /pick a mart/i }).catch(() => screen.getByText(/pick a mart/)))
+    fireEvent.click(await screen.findByRole("option", { name: /mart_visits/ }))
+    await screen.findByText("Data source")
+    fireEvent.click(screen.getByRole("button", { name: /What to show/ }))
+    await waitFor(() => expect(screen.getByText("X metric")).toBeTruthy())
+    expect(screen.getByText("Y metric")).toBeTruthy()
+    expect(screen.getByText("Size metric")).toBeTruthy()
+  })
+})

@@ -30,6 +30,10 @@ const BODY_SHAPE: &str = "body must be {\"timeZone\": string, \"weekStart\": \"m
 ///
 /// The two lists only an administrator reads (`PR #204` review (SHOULD-FIX) 3)
 /// are not part of it: a reader without `settings:write` does not get them.
+///
+/// `publicLinksEnabled` (`BI-19` part A) and `resultCache` (`BI-4` part B)
+/// are everybody's: the public-link pages read the first and every dashboard
+/// read reads the second, so they are in the answer for every caller.
 fn formatting_defaults(mut body: Value) -> Value {
     body["numberLocale"] = json!("en-US");
     body["companyPalette"] = json!([]);
@@ -41,6 +45,8 @@ fn formatting_defaults(mut body: Value) -> Value {
         "system"
     ]);
     body["contentSites"] = json!([]);
+    body["publicLinksEnabled"] = json!(true);
+    body["resultCache"] = json!({"mode": "default"});
     body
 }
 
@@ -49,8 +55,6 @@ fn formatting_defaults(mut body: Value) -> Value {
 fn administrator_lists(mut body: Value) -> Value {
     body["downloadDeniedRoles"] = json!([]);
     body["reportAllowedDomains"] = json!([]);
-    body["publicLinksEnabled"] = json!(true);
-    body["resultCache"] = json!({"mode": "default"});
     body
 }
 

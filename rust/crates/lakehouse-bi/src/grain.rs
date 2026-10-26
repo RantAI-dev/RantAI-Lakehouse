@@ -170,6 +170,7 @@ pub struct TimeContext {
     params: crate::params::ParamValues,
     content_sites: Vec<String>,
     company_palette: Vec<String>,
+    maps: Vec<crate::geo::SpatialMap>,
 }
 
 impl Default for TimeContext {
@@ -182,6 +183,7 @@ impl Default for TimeContext {
             params: crate::params::ParamValues::default(),
             content_sites: Vec::new(),
             company_palette: Vec::new(),
+            maps: Vec::new(),
         }
     }
 }
@@ -199,6 +201,7 @@ impl TimeContext {
             params: crate::params::ParamValues::default(),
             content_sites: Vec::new(),
             company_palette: Vec::new(),
+            maps: Vec::new(),
         })
     }
 
@@ -229,6 +232,21 @@ impl TimeContext {
     #[must_use]
     pub fn company_palette(&self) -> &[String] {
         &self.company_palette
+    }
+
+    /// This context with the uploaded maps a `RegionOf` call may name
+    /// (`BI-16` part C3). They ride here for the reason the content sites do:
+    /// every path that compiles a formula already receives this context.
+    #[must_use]
+    pub fn with_maps(mut self, maps: Vec<crate::geo::SpatialMap>) -> Self {
+        self.maps = maps;
+        self
+    }
+
+    /// The uploaded maps (none unless a caller set them).
+    #[must_use]
+    pub fn maps(&self) -> &[crate::geo::SpatialMap] {
+        &self.maps
     }
 
     /// This context with the parameter values of a read.

@@ -9,6 +9,7 @@ import { dashboardLook } from "@/lib/dashboard-look";
 import { DashboardGrid, type GridItem } from "./dashboard-grid";
 import { ReportingProvider } from "./reporting-context";
 import { TileBody } from "./tile-body";
+import type { MapLoader } from "./echarts-maps";
 import { OwnFiltersMarker, ownFilters } from "./filters/own-filters-marker";
 import type { ChartRenderSpec } from "@/lib/dashboard-specs";
 import { selectedTab } from "@/lib/dashboard-tabs";
@@ -50,6 +51,13 @@ export function PublicDashboard({ token }: { token: string }) {
   const [state, setState] = React.useState<"loading" | "ok" | "notfound" | "password" | "error">("loading");
   // Bumped when the password page succeeds, so the dashboard is asked for again.
   const [attempt, setAttempt] = React.useState(0);
+  // PR #246 review BLOCKER 1: an uploaded map's boundary is read through the
+  // link's own token, the way the board's data is — never through `apiFetch`,
+  // whose 401 would send this anonymous viewer to the login page.
+  const loadMap = React.useCallback<MapLoader>(
+    (id) => fetch(`/api/public/dashboard/${encodeURIComponent(token)}/maps/${encodeURIComponent(id)}/geojson`, { cache: "no-store" }),
+    [token],
+  );
 
   React.useEffect(() => {
     let alive = true;
@@ -93,7 +101,7 @@ export function PublicDashboard({ token }: { token: string }) {
     badge: <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">{spec.kind}</span>,
     // BI-6: the chart's own filters, listed (the viewer cannot change them).
     hint: ownFilters(spec) ? <OwnFiltersMarker filters={ownFilters(spec) ?? []} /> : null,
-    body: <TileBody spec={spec} cell={data?.results[spec.id]} dark={dark} loading={state === "loading"} />,
+    body: <TileBody spec={spec} cell={data?.results[spec.id]} dark={dark} loading={state === "loading"} loadMap={loadMap} />,
   }));
 
   return (

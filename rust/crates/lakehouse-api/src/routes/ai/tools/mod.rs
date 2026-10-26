@@ -35,6 +35,7 @@ mod calc_fields;
 mod connectors;
 mod dashboards;
 mod export;
+mod maps;
 // `pub(in crate::routes)` (not merely `mod`) so `routes::lineage` — a
 // SIBLING module of `routes::ai`, not a descendant — can reuse
 // `data::CATALOG_UNION`, the SAME bronze-catalog query `list_datasets`

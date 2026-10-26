@@ -111,6 +111,7 @@ const KINDS: &[ChartKind] = &[
     ChartKind::Gauge,
     ChartKind::Progress,
     ChartKind::Histogram,
+    ChartKind::Gantt,
     ChartKind::Bullet,
     ChartKind::Table,
     ChartKind::Pivot,
@@ -3555,9 +3556,14 @@ fn geo_fields(kind: ChartKind, input: &ChartInput) -> Result<GeoFields, BiError>
                 "map is only for geomap/pointmap/geoheat.".to_owned(),
             ));
         }
-        if !map_id_is_well_formed(map) {
+        // BI-16 C2b QA fix Q1: an uploaded map has a server-made id (`m_` and
+        // 12 hex digits, `crate::geo::is_map_id`) that the bundled-map shape
+        // refuses because of its underscore. Whether the uploaded map still
+        // exists is the console's call when it draws (it says "map not
+        // available"), like for a bundled id it has no file for.
+        if !map_id_is_well_formed(map) && !crate::geo::is_map_id(map) {
             return Err(BiError::Validation(format!(
-                "invalid map id: use 1-{MAP_ID_MAX_LEN} lowercase letters, digits or '-'."
+                "invalid map id: use a bundled map (1-{MAP_ID_MAX_LEN} lowercase letters, digits or '-') or an uploaded map's id."
             )));
         }
     }
@@ -4719,7 +4725,7 @@ fn check_measures(
 ) -> Result<(), BiError> {
     // BI-16 part B: a histogram counts the rows of its dimension; it has no
     // measure (`types_b::check_fields` refused any).
-    if kind == ChartKind::Histogram {
+    if kind == ChartKind::Histogram || kind == ChartKind::Gantt {
         return Ok(());
     }
     if kind == ChartKind::Pivot || input.tables.is_rows_mode(kind) {
@@ -4794,6 +4800,7 @@ fn check_shaping(
             dimension: &input.dimension,
             breakdown: input.breakdown.as_deref().unwrap_or(""),
             grained: grain.is_some(),
+            truncated_grain: grain.is_some_and(Grain::is_truncation),
         },
     )
     .map_err(BiError::Validation)?;
@@ -5023,7 +5030,9 @@ fn spec_from_resolved(
         grain,
         time,
     };
-    let spec = if kind == ChartKind::Histogram {
+    let spec = if kind == ChartKind::Gantt {
+        spec_from_gantt_input(input, ctx)
+    } else if kind == ChartKind::Histogram {
         spec_from_histogram_input(input, ctx)
     } else if kind == ChartKind::Pivot {
         spec_from_pivot_input(input, ctx)
@@ -5202,6 +5211,143 @@ fn spec_from_histogram_input(
         lat: None,
         lon: None,
         format: Some(NumFmt::Int),
+        span: Some(ctx.span),
+        text: None,
+        caption: None,
+        target: None,
+        click: None,
+    };
+    Ok(StoredChartSpec {
+        spec,
+        source,
+        board,
+        def,
+        has_year,
+        created_by: Some(created_by),
+        created_at: None,
+    })
+}
+
+/// The start, end and progress columns of a Gantt chart, checked against the
+/// relation: they exist, the first two are dates or date-times, progress is a
+/// number, and the task and group columns exist.
+fn check_gantt_columns(
+    input: &ChartInput,
+    ctx: &ChartCtx<'_>,
+) -> Result<(String, String, String), BiError> {
+    let named = |value: &Option<String>| {
+        value
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let (start, end, progress) = (
+        named(&input.types.start),
+        named(&input.types.end),
+        named(&input.types.progress),
+    );
+    let known = |column: &str, what: &str| {
+        if IDENT_ALLOWED(column) && ctx.cols.contains(column) {
+            Ok(())
+        } else {
+            Err(BiError::Validation(format!(
+                "invalid or missing {what} column '{column}'."
+            )))
+        }
+    };
+    known(&input.dimension, "task")?;
+    known(&start, "start")?;
+    known(&end, "end")?;
+    for (column, what) in [(&start, "start"), (&end, "end")] {
+        if !matches!(
+            ctx.kinds.get(column),
+            Some(ColumnKind::Date | ColumnKind::DateTime)
+        ) {
+            return Err(BiError::Validation(format!(
+                "'{column}' is not a date or date-time column; the {what} of a Gantt chart must be one."
+            )));
+        }
+    }
+    if !progress.is_empty() {
+        known(&progress, "progress")?;
+        if ctx.kinds.get(&progress) != Some(&ColumnKind::Number) {
+            return Err(BiError::Validation(format!(
+                "'{progress}' is not a number column; the progress of a Gantt chart must be one."
+            )));
+        }
+    }
+    if let Some(group) = input.breakdown.as_deref() {
+        known(group, "group")?;
+    }
+    Ok((start, end, progress))
+}
+
+/// A Gantt chart (`BI-16` part C1, plan D1 and D2): one row per task with its
+/// first start and last end, grouped by the optional breakdown. The task,
+/// group, start, end and progress columns are checked against the relation
+/// here; the statement itself is [`crate::builder::gantt_stored_sql`].
+fn spec_from_gantt_input(
+    input: &ChartInput,
+    ctx: ChartCtx<'_>,
+) -> Result<StoredChartSpec, BiError> {
+    let (start, end, progress) = check_gantt_columns(input, &ctx)?;
+    let def = ChartInput {
+        title: ctx.title.clone(),
+        subtitle: ctx.subtitle.clone(),
+        mart: ctx.mart.clone(),
+        sql_source: ctx.sql_source.clone(),
+        kind: ctx.kind,
+        dimension: input.dimension.clone(),
+        measures: MeasureList::default(),
+        breakdown: input.breakdown.clone(),
+        map: None,
+        lat: None,
+        lon: None,
+        aggregate: None,
+        limit: None,
+        order: None,
+        span: Some(ctx.span),
+        board: Some(ctx.board.clone()),
+        text: None,
+        caption: None,
+        target: None,
+        click: input.click.clone(),
+        grain: None,
+        tables: TableFields::default(),
+        shape: stored_shape(input),
+        style: input.style.clone(),
+        types: Box::new(crate::types_b::TypeFields {
+            start: Some(start),
+            end: Some(end),
+            progress: Some(progress).filter(|p| !p.is_empty()),
+            ..crate::types_b::TypeFields::default()
+        }),
+    };
+    let sql = crate::builder::gantt_stored_sql(&def, &ctx.from, &ctx.kinds, ctx.time)
+        .ok_or_else(|| BiError::Validation("this Gantt chart cannot be built.".to_owned()))?;
+    crate::style::check_style_names(input, &ctx.cols).map_err(BiError::Validation)?;
+    let (source, board, has_year, created_by) = (
+        ctx.source,
+        ctx.board.clone(),
+        ctx.has_year,
+        ctx.created_by.to_owned(),
+    );
+    let spec = ChartSpec {
+        id: ctx.new_id,
+        title: ctx.title,
+        subtitle: ctx.subtitle,
+        kind: ctx.kind,
+        mart: ctx.mart,
+        sql_source: ctx.sql_source,
+        sql,
+        x: input.dimension.clone(),
+        y: ChartY::Single(crate::builder::GANTT_START.to_owned()),
+        series: input.breakdown.clone(),
+        map: None,
+        lat: None,
+        lon: None,
+        format: None,
         span: Some(ctx.span),
         text: None,
         caption: None,
@@ -5830,6 +5976,34 @@ mod tests {
         }
         assert!(map_id_is_well_formed(&"a".repeat(MAP_ID_MAX_LEN)));
         assert!(!map_id_is_well_formed(&"a".repeat(MAP_ID_MAX_LEN + 1)));
+    }
+
+    #[test]
+    fn a_geomap_on_an_uploaded_map_passes_and_a_malformed_uploaded_id_is_refused() {
+        // BI-16 C2b QA fix Q1: `m_` + 12 hex digits is the server-made id.
+        let mut geomap = geo_input(ChartKind::Geomap);
+        geomap.map = Some("m_0123456789ab".to_owned());
+        assert_eq!(
+            geo_fields(ChartKind::Geomap, &geomap)
+                .unwrap()
+                .map
+                .as_deref(),
+            Some("m_0123456789ab")
+        );
+        for bad in [
+            "m_XYZ",
+            "M_0123456789ab",
+            "m_0123456789AB",
+            "m_0123456789abc",
+            "m_0123456789a",
+        ] {
+            geomap.map = Some(bad.to_owned());
+            assert!(geo_fields(ChartKind::Geomap, &geomap).is_err(), "{bad}");
+        }
+        // The point kinds take an uploaded map too; the other kinds still refuse any map.
+        let mut bar = geo_input(ChartKind::Bar);
+        bar.map = Some("m_0123456789ab".to_owned());
+        assert!(geo_fields(ChartKind::Bar, &bar).is_err());
     }
 
     #[test]

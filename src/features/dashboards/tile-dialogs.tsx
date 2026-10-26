@@ -35,6 +35,7 @@ export type Rows = {
   /** More buckets existed than the chart's limit; the latest are shown (BI-9). A pivot: more cells than it may return, so the first are shown (BI-16). */
   truncated?: boolean;
   /**
+  /**
    * `BI-5` plan D6: set when the row limit cut this tile's result; the tile says "Showing the first N rows, the limit set by
    * your administrator". Named `limitHit`, not `limit`, because `limit` above is already a raw table's page size; the plan's
    * `limit` object is on a failed tile (`TileFailure.limit`). Not on the server yet: T2 must return it under this name or this changes.
@@ -43,6 +44,11 @@ export type Rows = {
   /** When the engine computed these rows (RFC 3339, UTC) and whether this answer came from memory (`BI-4` part B). */
   computedAt?: string;
   remembered?: boolean;
+  /**
+   * `gantt` (BI-16 part C1, plan D2): how many rows the statement left out because their end is before their start. The plan leaves the
+   * shape of this count to T1; the tile reads it when present and says nothing when it is absent.
+   */
+  reversedRows?: number;
   /** A raw table's first page: the rows its pages walk through, the page size and the offset. Absent when the count could not be read (BI-16). */
   total?: number;
   limit?: number;

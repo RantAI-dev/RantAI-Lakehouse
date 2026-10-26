@@ -45,6 +45,7 @@ pub mod connector_run;
 pub mod connector_type;
 pub mod connectors;
 pub mod error;
+pub mod geo_map;
 pub mod gold_publication;
 pub mod governance;
 pub mod governed_tag;
