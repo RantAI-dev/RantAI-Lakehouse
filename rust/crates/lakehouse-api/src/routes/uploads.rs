@@ -3405,11 +3405,11 @@ mod tests {
         );
         let mut null_list = valid();
         null_list["alsoUploads"] = Value::Null;
-        assert!(
+        assert_eq!(
             parse_ingest_request(&body(&null_list), None, None)
                 .unwrap()
-                .also_uploads
-                .is_empty()
+                .also_uploads,
+            Vec::<String>::new()
         );
     }
 

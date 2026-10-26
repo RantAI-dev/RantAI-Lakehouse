@@ -1368,7 +1368,7 @@ mod tests {
         for _ in 0..5_000 {
             head.push_str("\n \n\t\n");
         }
-        assert!(sample_of(&head, true, 10_000).is_empty());
+        assert_eq!(sample_of(&head, true, 10_000), Vec::<Vec<String>>::new());
     }
 
     // ── the shared fixtures ─────────────────────────────────────────────
@@ -1633,7 +1633,10 @@ id,n
             header_row: 99,
             ..using
         };
-        assert!(sample_records(head, false, past, 10).is_empty());
+        assert_eq!(
+            sample_records(head, false, past, 10),
+            Vec::<Vec<String>>::new()
+        );
     }
 
     #[test]

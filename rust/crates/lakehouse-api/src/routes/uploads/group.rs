@@ -570,13 +570,15 @@ mod tests {
             spec("id", ColumnType::Integer),
             spec("qty", ColumnType::Text),
         ];
-        assert!(
-            compare_samples(&first, &loose, &other, &other_specs)
-                .2
-                .is_empty()
+        assert_eq!(
+            compare_samples(&first, &loose, &other, &other_specs).2,
+            Vec::<TypeConflict>::new()
         );
         // No list at all (every column text): nothing to conflict.
-        assert!(compare_samples(&first, &[], &other, &[]).2.is_empty());
+        assert_eq!(
+            compare_samples(&first, &[], &other, &[]).2,
+            Vec::<TypeConflict>::new()
+        );
     }
 
     #[test]
@@ -587,7 +589,10 @@ mod tests {
         let same = sample(&["qty"], &[&["n/a"], &["6"]]);
         let integer = [spec("qty", ColumnType::Integer)];
         let text = [spec("qty", ColumnType::Text)];
-        assert!(compare_samples(&first, &integer, &same, &text).2.is_empty());
+        assert_eq!(
+            compare_samples(&first, &integer, &same, &text).2,
+            Vec::<TypeConflict>::new()
+        );
         // The first file fits, the other does not: that is the conflict.
         let clean = sample(&["qty"], &[&["4"], &["5"]]);
         assert_eq!(compare_samples(&clean, &integer, &same, &text).2.len(), 1);
@@ -598,10 +603,9 @@ mod tests {
         let first = sample(&["n"], &[&["1.5"]]);
         let decimal = [spec("n", ColumnType::Decimal)];
         let whole = sample(&["n"], &[&["2"]]);
-        assert!(
-            compare_samples(&first, &decimal, &whole, &[spec("n", ColumnType::Integer)])
-                .2
-                .is_empty()
+        assert_eq!(
+            compare_samples(&first, &decimal, &whole, &[spec("n", ColumnType::Integer)]).2,
+            Vec::<TypeConflict>::new()
         );
         let integer = [spec("n", ColumnType::Integer)];
         let fractional = sample(&["n"], &[&["2.5"]]);
@@ -610,10 +614,9 @@ mod tests {
         // column it was given, so there is no verdict on that column (the rule that keeps
         // two identical files from ever conflicting); the conflict needs a first file
         // whose own sample fits.
-        assert!(
-            compare_samples(&first, &integer, &fractional, &other)
-                .2
-                .is_empty()
+        assert_eq!(
+            compare_samples(&first, &integer, &fractional, &other).2,
+            Vec::<TypeConflict>::new()
         );
         let fits = sample(&["n"], &[&["1"]]);
         let conflicts = compare_samples(&fits, &integer, &fractional, &other).2;
