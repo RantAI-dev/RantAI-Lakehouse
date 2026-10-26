@@ -1069,6 +1069,13 @@ async fn a_percent_or_underscore_in_the_table_filter_is_literal(pool: PgPool) ->
 /// millisecond. The page after it must compare on the same value: a
 /// comparison against the stored microsecond `at` skips every row inside
 /// the last page's millisecond, and those rows are never seen again.
+///
+/// The two rows are placed so their ids disagree with their microseconds:
+/// `q-a` is the newer of the two by a microsecond and the older by id. The
+/// order therefore has to cut to the millisecond and fall back to the id,
+/// the way the comparison does. An order on the raw microsecond puts `q-a`
+/// at the end of the page and leaves `q-b` behind the cursor, so `q-b` is
+/// never seen again.
 #[sqlx::test(migrations = "../../migrations")]
 async fn two_rows_in_one_millisecond_come_back_exactly_once_across_the_page_boundary(
     pool: PgPool,
@@ -1092,18 +1099,22 @@ async fn two_rows_in_one_millisecond_come_back_exactly_once_across_the_page_boun
         )
         .await;
     }
+    // The newer of the two by microsecond is the older one by id: only an
+    // order that cuts to the millisecond and falls back to the id puts `q-b`
+    // at the end of the page. An order on the raw microsecond puts `q-a`
+    // there and leaves `q-b` behind the cursor.
     insert_history_row_at(
         &pool,
         "q-a",
         owner,
-        base + time::Duration::microseconds(100),
+        base + time::Duration::microseconds(150),
     )
     .await;
     insert_history_row_at(
         &pool,
         "q-b",
         owner,
-        base + time::Duration::microseconds(150),
+        base + time::Duration::microseconds(100),
     )
     .await;
 
@@ -1112,7 +1123,6 @@ async fn two_rows_in_one_millisecond_come_back_exactly_once_across_the_page_boun
         .unwrap();
     assert_eq!(page_one.len(), 50);
     let last = page_one.last().unwrap();
-    assert_eq!(last.id, "q-b", "the newer of the two rows ends the page");
     let cursor_at =
         OffsetDateTime::parse(&last.at, &time::format_description::well_known::Rfc3339).unwrap();
     assert!(
@@ -1138,12 +1148,10 @@ async fn two_rows_in_one_millisecond_come_back_exactly_once_across_the_page_boun
     )
     .await
     .unwrap();
-    assert_eq!(
-        row_ids(&page_two),
-        ["q-a"],
-        "the row inside the last page's millisecond comes back"
-    );
 
+    // The fixture holds 51 rows: 49 fill rows and the two of one
+    // millisecond. Across the boundary each of them comes back exactly
+    // once — none repeated, none skipped.
     let mut seen: Vec<&str> = page_one.iter().map(|r| r.id.as_str()).collect();
     seen.extend(page_two.iter().map(|r| r.id.as_str()));
     let mut sorted = seen.clone();
@@ -1151,6 +1159,19 @@ async fn two_rows_in_one_millisecond_come_back_exactly_once_across_the_page_boun
     sorted.dedup();
     assert_eq!(seen.len(), sorted.len(), "no repeats");
     assert_eq!(seen.len(), 51, "no skips");
+
+    // Which row ended the page, and which one came back with the next page:
+    // the id tie-break inside the millisecond, the same order the
+    // comparison walks.
+    assert_eq!(
+        last.id, "q-b",
+        "the greater id of the millisecond ends the page"
+    );
+    assert_eq!(
+        row_ids(&page_two),
+        ["q-a"],
+        "the row inside the last page's millisecond comes back"
+    );
     Ok(())
 }
 
