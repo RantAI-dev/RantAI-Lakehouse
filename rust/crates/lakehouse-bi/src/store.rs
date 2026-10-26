@@ -541,6 +541,11 @@ pub struct Board {
     /// [`crate::formatting::SHIPPED_FONTS`]); `None` is the console's own.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub font: Option<String>,
+    /// How long the dashboard's tiles may be served from remembered results
+    /// (`BI-4` part B, feature decision 2). `None` follows the install's rule;
+    /// a board saved before the column reads as `None`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub cache: Option<crate::cache_rule::CacheRule>,
     /// `ClickHouse`-formatted creation timestamp.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub created_at: Option<String>,
@@ -771,6 +776,15 @@ async fn ensure_board_state_columns(ch: &ChClient) -> Result<(), ChError> {
         )
         .await?;
     }
+    // BI-4 part B (plan D7): the dashboard's freshness rule, `''` meaning
+    // "follow the install". Same idiom as `refresh_seconds`: a constant
+    // default, so a board saved before reads as following the install, and no
+    // Postgres migration because boards live in ClickHouse.
+    ch.exec(
+        "ALTER TABLE console.bi_board ADD COLUMN IF NOT EXISTS cache_json String DEFAULT ''",
+        None,
+    )
+    .await?;
     Ok(())
 }
 
@@ -1195,7 +1209,7 @@ pub const DEFAULT_BOARD_ID: &str = "default";
 /// `console.bi_board_embed_event` and is read by aggregation
 /// ([`get_board_embed_access`]), so the board row is never asked for it
 /// (`PR #105 review SHOULD-FIX 1`, kept by `PR #199 review N`).
-const BOARD_COLS: &str = "id, name, description, created_by, layout_json, filters_json, public_token, embed_enabled, folder_id, refresh_seconds, grain, params_json, tabs_json, phone_layout_json, theme, font, owner_id, toString(created_at) AS created_at";
+const BOARD_COLS: &str = "id, name, description, created_by, layout_json, filters_json, public_token, embed_enabled, folder_id, refresh_seconds, grain, params_json, tabs_json, phone_layout_json, theme, font, cache_json, owner_id, toString(created_at) AS created_at";
 
 /// The `bi_board` columns a row keeps through the trash: everything but
 /// `created_at` (the version, set by the insert) and the trash columns.
@@ -1204,7 +1218,7 @@ const BOARD_COLS: &str = "id, name, description, created_by, layout_json, filter
 /// The legacy embed columns are not among them: the embed access state is in
 /// the event table, which the trash never touches, so a board that comes
 /// back from the trash keeps the withdrawals it had (`PR #199 review N`).
-pub(crate) const BOARD_KEEP_COLS: &str = "id, name, description, created_by, layout_json, filters_json, public_token, embed_enabled, folder_id, refresh_seconds, grain, params_json, tabs_json, phone_layout_json, theme, font, owner_id";
+pub(crate) const BOARD_KEEP_COLS: &str = "id, name, description, created_by, layout_json, filters_json, public_token, embed_enabled, folder_id, refresh_seconds, grain, params_json, tabs_json, phone_layout_json, theme, font, cache_json, owner_id";
 
 /// A board in the personal space cannot be shared. Move it to a folder first.
 pub const PERSONAL_NOT_SHAREABLE: &str =
@@ -1277,6 +1291,15 @@ fn row_to_board(row: &serde_json::Map<String, Value>) -> Board {
         .filter(|t| !t.is_empty()),
         theme: Some(row_str(row, "theme").to_owned()).filter(|t| !t.is_empty()),
         font: Some(row_str(row, "font").to_owned()).filter(|f| !f.is_empty()),
+        // Fail closed: a stored text that is not a rule (edited by hand
+        // around the validation) reads as "always fresh", never as the
+        // default, which would remember results the editor may have meant to
+        // keep fresh.
+        cache: Some(
+            crate::cache_rule::CacheRule::from_stored(row_str(row, "cache_json"))
+                .unwrap_or(crate::cache_rule::CacheRule::Fresh),
+        )
+        .filter(|rule| *rule != crate::cache_rule::CacheRule::Follow),
         created_at: Some(stamp.clone()),
         updated_at: Some(stamp),
         public_token: Some(public_token.to_owned()),
@@ -1495,6 +1518,7 @@ pub async fn create_board_in(
         phone_layout: None,
         theme: None,
         font: None,
+        cache: None,
         created_at: None,
         updated_at: None,
         public_token: None,
@@ -1521,7 +1545,7 @@ async fn upsert_board(
     refresh_seconds: u32,
     (grain, params): (&str, &[crate::params::BoardParam]),
     (tabs, phone_layout): (&[crate::layout::Tab], &[crate::layout::PhoneTile]),
-    (theme, font): (&str, &str),
+    (theme, font, cache): (&str, &str, &str),
 ) -> Result<(), ChError> {
     let layout_json = serde_json::to_string(layout).unwrap_or_else(|_| "{}".to_owned());
     let filters_json = serde_json::to_string(filters).unwrap_or_else(|_| "[]".to_owned());
@@ -1529,8 +1553,8 @@ async fn upsert_board(
         // SEC-12 (PR #105 review SHOULD-FIX 1): the embed access state is NOT
         // a column of this INSERT. The row therefore never carries it, and a
         // save can never write back a withdrawn token (`PR #199 review N`).
-        "INSERT INTO console.bi_board (id, name, description, created_by, layout_json, filters_json, public_token, embed_enabled, folder_id, refresh_seconds, grain, params_json, tabs_json, phone_layout_json, theme, font, owner_id) VALUES \
-         ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+        "INSERT INTO console.bi_board (id, name, description, created_by, layout_json, filters_json, public_token, embed_enabled, folder_id, refresh_seconds, grain, params_json, tabs_json, phone_layout_json, theme, font, cache_json, owner_id) VALUES \
+         ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
         SqlLiteral::from(id),
         SqlLiteral::from(name),
         SqlLiteral::from(description),
@@ -1553,6 +1577,8 @@ async fn upsert_board(
         // And the theme and font (BI-17 part A), for the same reason.
         SqlLiteral::from(theme),
         SqlLiteral::from(font),
+        // And the freshness rule (BI-4 part B), for the same reason.
+        SqlLiteral::from(cache),
         // The personal space: carried on every save like the rest, or an
         // unrelated edit would make a private draft public.
         SqlLiteral::from(owner_id),
@@ -1660,6 +1686,10 @@ async fn save_board_patch(
         .unwrap_or_default();
     let theme = patch.theme.or(board.theme.as_deref()).unwrap_or("");
     let font = patch.font.or(board.font.as_deref()).unwrap_or("");
+    let cache = patch
+        .cache
+        .or(board.cache.map(crate::cache_rule::CacheRule::to_stored))
+        .unwrap_or_default();
     upsert_board(
         ch,
         &board.id,
@@ -1674,7 +1704,7 @@ async fn save_board_patch(
         refresh_seconds,
         (grain, params),
         (tabs, phone_layout),
-        (theme, font),
+        (theme, font, &cache),
     )
     .await
 }
@@ -1698,6 +1728,8 @@ struct BoardPatch<'a> {
     phone_layout: Option<&'a [crate::layout::PhoneTile]>,
     theme: Option<&'a str>,
     font: Option<&'a str>,
+    /// The stored text of the rule (`""` follows the install).
+    cache: Option<String>,
 }
 
 /// Rename a board. No-op if the board does not exist (matches the TS `if
@@ -1814,6 +1846,7 @@ fn shell_board(id: &str) -> Board {
         phone_layout: None,
         theme: None,
         font: None,
+        cache: None,
         created_at: None,
         updated_at: None,
         public_token: None,
@@ -2149,6 +2182,34 @@ pub async fn update_board_theme(
         BoardPatch {
             theme,
             font,
+            ..Default::default()
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+/// Save the dashboard's freshness rule (`BI-4` part B, feature decision 2).
+/// [`CacheRule::Follow`](crate::cache_rule::CacheRule::Follow) clears it. A
+/// version restore does not carry the rule (the version history covers what a
+/// dashboard shows, not how long it is remembered), so it keeps the live one.
+///
+/// # Errors
+///
+/// Returns [`BiError::Validation`] when the board is not live, or
+/// [`BiError::Clickhouse`] on a `ClickHouse` failure.
+pub async fn update_board_cache(
+    ch: &ChClient,
+    id: &str,
+    rule: crate::cache_rule::CacheRule,
+) -> Result<(), BiError> {
+    ensure_bi_table(ch).await?;
+    let board = board_for_update(ch, id).await?;
+    save_board_patch(
+        ch,
+        &board,
+        BoardPatch {
+            cache: Some(rule.to_stored()),
             ..Default::default()
         },
     )
@@ -2867,6 +2928,7 @@ pub async fn duplicate_board(
             phone_layout: Some(&new_phone),
             theme: src.theme.as_deref(),
             font: src.font.as_deref(),
+            cache: src.cache.map(crate::cache_rule::CacheRule::to_stored),
             folder_id: Some(&folder_id),
             owner_id: Some(&owner_id),
             ..Default::default()
@@ -2896,6 +2958,7 @@ pub async fn duplicate_board(
         phone_layout: Some(new_phone).filter(|p| !p.is_empty()),
         theme: src.theme,
         font: src.font,
+        cache: src.cache,
         folder_id: Some(folder_id),
         ..new_board
     })
@@ -5903,9 +5966,10 @@ mod tests {
         // `console.bi_board_version` and `console.bi_user_item` tables, the
         // `bi_board_version.label` column and the BI-17 part A `theme` and
         // `font` columns. 37 = those 36 plus the one `system.columns` query.
+        // 38 = those 37 plus the BI-4 part B `bi_board.cache_json` column.
         assert_eq!(
-            first_call_requests, 37,
-            "first call should issue the 36 DDL statements and the one legacy-column check"
+            first_call_requests, 38,
+            "first call should issue the 37 DDL statements and the one legacy-column check"
         );
 
         ensure_bi_table(&ch).await.unwrap();
@@ -6486,7 +6550,7 @@ mod tests {
             30,
             ("day", &[]),
             (&[], &[]),
-            ("", ""),
+            ("", "", ""),
         )
         .await
         .unwrap();
@@ -6513,6 +6577,8 @@ mod tests {
             !body.contains("embed_origins_json"),
             "must not contain embed_origins_json: {body}"
         );
+        // BI-4 part B: the freshness rule is carried on every full-row save.
+        assert!(body.contains("cache_json"), "{body}");
     }
 
     /// A `ClickHouse` stand-in for the legacy embed copy: answers the
@@ -6876,6 +6942,7 @@ mod tests {
             phone_layout: None,
             theme: None,
             font: None,
+            cache: None,
             created_at: Some("2026-01-01 00:00:00".to_owned()),
             updated_at: Some("2026-01-02 00:00:00".to_owned()),
             public_token: Some("p_abc".to_owned()),
@@ -7518,7 +7585,7 @@ mod tests {
             spec.spec.sql,
             "SELECT place, visitors FROM (\nSELECT day, seen_at, place, visitors FROM serving.mart_x\n) AS src \
              ORDER BY visitors DESC, place, visitors LIMIT 50 OFFSET 0 \
-             SETTINGS max_result_rows = 2000, result_overflow_mode = 'break', max_execution_time = 30"
+             SETTINGS max_result_rows = 2000, result_overflow_mode = 'break', max_execution_time = 60"
         );
         assert_eq!(spec.def.tables.table_mode.as_deref(), Some("rows"));
         assert!(spec.def.measures.is_empty() && spec.def.dimension.is_empty());
@@ -8610,6 +8677,39 @@ mod tests {
             (json["theme"].as_str(), json["font"].as_str()),
             (Some("dark"), Some("inter"))
         );
+    }
+
+    /// `BI-4` part B (D7): the rule reads back, a row from before the column
+    /// has none, a text that is not a rule reads as "always fresh" (fail
+    /// closed), and the column is in both the read and the trash-keep lists.
+    #[test]
+    fn a_boards_cache_rule_reads_back_and_the_column_is_kept_through_the_trash() {
+        use crate::cache_rule::CacheRule;
+        let row = |extra: Value| {
+            let mut v = serde_json::json!({ "id": "b_1", "name": "N", "layout_json": "{}" });
+            v.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            v.as_object().unwrap().clone()
+        };
+        assert_eq!(row_to_board(&row(serde_json::json!({}))).cache, None);
+        assert_eq!(
+            row_to_board(&row(serde_json::json!({ "cache_json": "" }))).cache,
+            None
+        );
+        let set = row_to_board(&row(serde_json::json!({
+            "cache_json": CacheRule::Minutes(15).to_stored()
+        })));
+        assert_eq!(set.cache, Some(CacheRule::Minutes(15)));
+        assert_eq!(
+            serde_json::to_value(&set).unwrap()["cache"],
+            serde_json::json!({ "mode": "minutes", "minutes": 15 })
+        );
+        let broken = row_to_board(&row(
+            serde_json::json!({ "cache_json": "{\"mode\":\"x\"}" }),
+        ));
+        assert_eq!(broken.cache, Some(CacheRule::Fresh));
+        assert!(BOARD_COLS.contains("cache_json") && BOARD_KEEP_COLS.contains("cache_json"));
     }
 
     fn stored(id: &str, board: &str) -> StoredChartSpec {

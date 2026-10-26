@@ -269,6 +269,16 @@ pub async fn refund_attempt(
 /// # Errors
 ///
 /// Returns [`AuthError::Database`] on a storage failure.
+///
+/// Merge of `origin/main` (PR #235: `BI-19` part A and `BI-26`) into
+/// `feat/bi-phase-5` (PR #245): both sides carry a `record_attempt` — `SEC-49`
+/// (PR #236) on this branch, `BI-19` part A review fix (BLOCKER) R1 on `main` —
+/// and the merge kept two definitions of the same name, which do not compile.
+/// This copy is the one kept: the one on `origin/main` (PR #235), which the
+/// planner re-reviewed and merged. It keeps the `BI-19` decision that a
+/// public link's lock is not pushed further out by a continuing guess (see
+/// [`bump`]), and the sign-in path (`SEC-49`) is not affected by that
+/// difference, because it refuses a locked key before it counts.
 pub async fn record_attempt(
     pool: &PgPool,
     key: &str,

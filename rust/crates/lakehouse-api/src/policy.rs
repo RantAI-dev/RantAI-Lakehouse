@@ -731,6 +731,12 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     //    `settings_write_needs_no_seed_change_and_no_seeded_role_has_it`. ────
     ("GET",    "/api/settings/reporting",     Policy::RequiresAuth),
     ("PUT",    "/api/settings/reporting",     Policy::RequiresPermission("settings:write")),
+    // ── Query limits (`BI-5`, `routes::query_limits`): anyone signed in reads
+    //    the limits that apply to them; changing them is `settings:write`. ──
+    ("GET",    "/api/settings/limits",        Policy::RequiresAuth),
+    // Stop: any login, because the route only ever ends the caller's own run.
+    ("POST",   "/api/query/cancel",           Policy::RequiresAuth),
+    ("PUT",    "/api/settings/limits",        Policy::RequiresPermission("settings:write")),
 
     // ── Agent / AI: no seeded resource for free-form ask/chat — auth only.
     ("POST", "/api/ai/chat",             Policy::RequiresAuth),

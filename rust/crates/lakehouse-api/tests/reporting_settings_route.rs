@@ -24,12 +24,16 @@ use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const BODY_SHAPE: &str = "body must be {\"timeZone\": string, \"weekStart\": \"monday\"|\"sunday\", \
-\"numberLocale\"?: \"en-US\"|\"id-ID\", \"companyPalette\"?: [\"#rrggbb\", ...], \"fonts\"?: [string, ...], \"contentSites\"?: [\"https://host\", ...], \"downloadDeniedRoles\"?: [string, ...], \"reportAllowedDomains\"?: [string, ...], \"publicLinksEnabled\"?: boolean}";
+\"numberLocale\"?: \"en-US\"|\"id-ID\", \"companyPalette\"?: [\"#rrggbb\", ...], \"fonts\"?: [string, ...], \"contentSites\"?: [\"https://host\", ...], \"downloadDeniedRoles\"?: [string, ...], \"reportAllowedDomains\"?: [string, ...], \"publicLinksEnabled\"?: boolean, \"resultCache\"?: {\"mode\": \"default\"|\"fresh\"|\"minutes\", \"minutes\"?: number}}";
 
 /// What a deployment that never saved formatting reads back.
 ///
 /// The two lists only an administrator reads (`PR #204` review (SHOULD-FIX) 3)
 /// are not part of it: a reader without `settings:write` does not get them.
+///
+/// `publicLinksEnabled` (`BI-19` part A) and `resultCache` (`BI-4` part B)
+/// are everybody's: the public-link pages read the first and every dashboard
+/// read reads the second, so they are in the answer for every caller.
 fn formatting_defaults(mut body: Value) -> Value {
     body["numberLocale"] = json!("en-US");
     body["companyPalette"] = json!([]);
@@ -43,6 +47,8 @@ fn formatting_defaults(mut body: Value) -> Value {
     body["contentSites"] = json!([]);
     // `BI-19` part A: the public-links switch is everybody's to read.
     body["publicLinksEnabled"] = json!(true);
+    // `BI-4` part B: the install's freshness rule for remembered results.
+    body["resultCache"] = json!({"mode": "default"});
     body
 }
 
@@ -544,4 +550,73 @@ async fn an_image_or_web_card_is_saved_only_for_a_site_the_administrator_listed(
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// `BI-4` part B T3 (feature decision 2, `BI-4-AC4`): the install's freshness
+/// rule is saved by someone with `settings:write`, read back, kept by a later
+/// save that does not send it, and refused with a sentence when out of range.
+#[tokio::test]
+async fn the_result_cache_rule_is_saved_kept_and_refused_when_out_of_range() {
+    let (TestApp { router, pool }, _server) = app_with_engine(1).await;
+    let writer = create_principal_with_permissions(&pool, "settings:write").await;
+    let cookie = session_cookie_for_user(&pool, writer).await;
+    let (status, body) = call(
+        &router,
+        "PUT",
+        &cookie,
+        r#"{"timeZone":"UTC","weekStart":"monday","resultCache":{"mode":"minutes","minutes":30}}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["resultCache"],
+        json!({"mode": "minutes", "minutes": 30})
+    );
+    let (status, body) = call(
+        &router,
+        "PUT",
+        &cookie,
+        r#"{"timeZone":"UTC","weekStart":"sunday"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["resultCache"],
+        json!({"mode": "minutes", "minutes": 30})
+    );
+    for bad in [
+        r#","resultCache":{"mode":"minutes","minutes":0}"#,
+        r#","resultCache":{"mode":"minutes","minutes":1441}"#,
+        r#","resultCache":{"mode":"sometimes"}"#,
+    ] {
+        let (status, body) = call(
+            &router,
+            "PUT",
+            &cookie,
+            &format!(r#"{{"timeZone":"UTC","weekStart":"monday"{bad}}}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|m| m.starts_with("resultCache must be")),
+            "{body}"
+        );
+    }
+    let (_, got) = call(&router, "GET", &cookie, "").await;
+    assert_eq!(
+        got["resultCache"],
+        json!({"mode": "minutes", "minutes": 30})
+    );
+    let nobody = create_principal_with_permissions(&pool, "dashboard:write").await;
+    let cookie = session_cookie_for_user(&pool, nobody).await;
+    let (status, _) = call(
+        &router,
+        "PUT",
+        &cookie,
+        r#"{"timeZone":"UTC","weekStart":"monday","resultCache":{"mode":"fresh"}}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
 }

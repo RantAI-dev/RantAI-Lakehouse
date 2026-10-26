@@ -439,18 +439,25 @@ pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
         Ok(f) => f,
         Err(err) => return crate::error::ApiRejection(err).into_response(),
     };
-    let payload = render_board_payload(
-        &state.clickhouse,
-        &PolicyEngineObligations::from_state(&state),
-        &board,
-        &board_id,
-        &filters,
-        &time,
-        Narrowing {
-            only_chart: subject.only_chart.as_deref(),
-            editable: &editable,
-        },
-        &format,
+    let payload = crate::result_cache::scoped(
+        crate::result_cache::CacheScope::new(
+            std::sync::Arc::clone(&state.result_cache),
+            format.result_cache,
+            crate::result_cache::Fresh::No,
+        ),
+        render_board_payload(
+            &state.clickhouse,
+            &PolicyEngineObligations::from_state(&state),
+            &board,
+            &board_id,
+            &filters,
+            (&time, &state.tile_slots),
+            Narrowing {
+                only_chart: subject.only_chart.as_deref(),
+                editable: &editable,
+            },
+            &format,
+        ),
     )
     .await;
     match payload {
@@ -971,15 +978,22 @@ pub async fn public_dashboard(
         Ok(f) => f,
         Err(err) => return crate::error::ApiRejection(err).into_response(),
     };
-    let payload = render_board_payload(
-        &state.clickhouse,
-        &PolicyEngineObligations::from_state(&state),
-        &board,
-        &board_id,
-        &filters,
-        &time,
-        Narrowing::default(),
-        &format,
+    let payload = crate::result_cache::scoped(
+        crate::result_cache::CacheScope::new(
+            std::sync::Arc::clone(&state.result_cache),
+            format.result_cache,
+            crate::result_cache::Fresh::No,
+        ),
+        render_board_payload(
+            &state.clickhouse,
+            &PolicyEngineObligations::from_state(&state),
+            &board,
+            &board_id,
+            &filters,
+            (&time, &state.tile_slots),
+            Narrowing::default(),
+            &format,
+        ),
     )
     .await;
     match payload {
@@ -1015,6 +1029,10 @@ pub async fn public_map_geojson(
     headers: HeaderMap,
     Path((token, id)): Path<(String, String)>,
 ) -> Response {
+    // BI-19 part A: the link is resolved the way `public_dashboard` resolves
+    // it — from Postgres, with the password ticket — so a map behind a
+    // password needs the same ticket the board's data does, and a link that
+    // does not work is the same 404 as the board's.
     let board = match crate::routes::public_links::resolve(&state, &token).await {
         Ok(crate::routes::public_links::Resolved::Open(open)) => {
             if let Some(refusal) =
@@ -1029,8 +1047,7 @@ pub async fn public_map_geojson(
         }
         Err(err) => return crate::error::ApiRejection(err).into_response(),
     };
-    let board_id = board.id.clone();
-    map_for_board(&state, &board_id, &id, &headers).await
+    map_for_board(&state, &board.id, &id, &headers).await
 }
 
 /// `POST /api/embed/maps/{id}/geojson` — the boundary file of a map one of
@@ -1051,6 +1068,9 @@ pub async fn embed_map_geojson(
     let jwt = serde_json::from_slice::<EmbedDataBody>(&body)
         .ok()
         .and_then(|b| b.jwt);
+    // The same admission `POST /api/embed/data` applies, so the two routes
+    // cannot disagree about what a token opens (`BI-26`'s `verified_claims`
+    // and `admit`, which read a chart token as well as a board token).
     let subject = match embed_grant(&state, jwt.as_deref()).await {
         Ok(subject) => subject,
         Err(refusal) => return *refusal,
@@ -1073,13 +1093,7 @@ async fn map_for_board(
 ) -> Response {
     let maps = match board_map_ids(state, board_id).await {
         Ok(maps) => maps,
-        Err(err) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ApiJson(upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json()),
-            )
-                .into_response();
-        }
+        Err(err) => return database_failure(&err),
     };
     if !maps.iter().any(|m| m == id) {
         return crate::routes::public_links::not_found();
@@ -1101,6 +1115,17 @@ async fn board_map_ids(state: &AppState, board_id: &str) -> Result<Vec<String>, 
         .into_iter()
         .filter_map(|c| c.def.map.clone())
         .collect())
+}
+
+/// The fixed-500 answer a store failure gets on the map routes (`PR #246
+/// review BLOCKER 1`: they read the store too). The engine's own text never
+/// reaches the answer (SEC-11): it goes to the log under a reference id.
+fn database_failure(err: &ChError) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        ApiJson(upstream_error::report_ch(&upstream_error::DATABASE, err).to_json()),
+    )
+        .into_response()
 }
 
 /// A chart as an embed or a public link shows it: the render spec of the
@@ -1343,13 +1368,20 @@ struct Narrowing<'a> {
 /// ([`crate::routes::settings::content_sites_of_cards`], over the same
 /// selection), so the payload and the frame answer for that board narrow the
 /// deployment's list the same way (`PR #233 review SHOULD-FIX 1`).
+#[allow(
+    clippy::too_many_lines,
+    reason = "one pipeline (read the board's charts and sources, run every tile \
+              through `tile_pool`, assemble the payload); the per-tile future \
+              borrows eleven locals, so a helper would need as many \
+              parameters as the body has lines it saves"
+)]
 async fn render_board_payload(
     ch: &ChClient,
     obligations: &PolicyEngineObligations<'_>,
     board: &Board,
     board_id: &str,
     filters: &[FilterDef],
-    time: &lakehouse_bi::grain::TimeContext,
+    (time, tile_slots): (&lakehouse_bi::grain::TimeContext, &tokio::sync::Semaphore),
     narrowing: Narrowing<'_>,
     format: &crate::routes::settings::FormatSettings,
 ) -> Result<(Value, Vec<String>), lakehouse_clickhouse::ChError> {
@@ -1407,54 +1439,140 @@ async fn render_board_payload(
         layer_sources: &layer_sources,
         read: &read,
     };
-    for original in &stored_for_board {
-        let tile_filters = tile_filters(board, filters, &original.spec.id);
-        let effective = crate::routes::support::effective_chart(original, &cols, &sources, &read);
-        let c = match &effective {
-            Ok(e) => &**e,
-            Err(msg) => {
-                results.insert(original.spec.id.clone(), json!({ "error": msg }));
-                charts_out.push(embed_rendered(original, original));
-                continue;
-            }
-        };
-        match stored_chart_sql(c, &[], &tile_filters, &cols, &sources, &read) {
-            Ok(filtered) => {
-                let (id, mut val) = run_spec_sql(
-                    ch,
-                    &c.spec.id,
-                    &filtered.sql,
-                    &roles,
-                    &placeholders,
-                    obligations,
-                )
-                .await;
-                crate::routes::support::annotate_params(&mut val, c, &values);
-                crate::routes::support::annotate_grain(&mut val, &filtered, c);
-                // BI-16 part A: the first page of a raw table, with its
-                // total; an embed and a public link offer no paging.
-                crate::routes::support::annotate_table(
-                    ch,
-                    &mut val,
-                    &filtered,
-                    (&roles, &placeholders, obligations),
-                )
-                .await;
-                let tile_ctx = crate::routes::layers::LayerContext {
-                    filters: &tile_filters,
-                    ..layer_ctx
-                };
-                crate::routes::layers::annotate_layers(&tile_ctx, &mut val, c, filtered.grain)
-                    .await;
-                annotate_metric_labels(&mut val, c, &field_catalog, Some((&cols, &sources)));
-                results.insert(id, val);
-            }
-            Err(msg) => {
-                results.insert(c.spec.id.clone(), json!({ "error": msg }));
-            }
+    // BI-4 part A (plan D1/D2): the tiles run up to 6 at once for this
+    // request and under the process's `tile_slots`, through the one shared
+    // mechanism (`tile_pool`). Each tile keeps the masks of the embed viewer
+    // role and its own `error` value; the outputs come back in chart order,
+    // the order the sequential loop produced.
+    let (cols_ref, sources_ref, read_ref, values_ref) = (&cols, &sources, &read, &values);
+    let (roles_ref, placeholders_ref, catalog_ref) = (&roles, &placeholders, &field_catalog);
+    let layer_ctx_ref = &layer_ctx;
+    let tiles: Vec<futures::future::BoxFuture<'_, (String, Value, Value)>> = stored_for_board
+        .iter()
+        .map(|original| {
+            let original: &StoredChartSpec = original;
+            // BI-4 part B: the chart's own freshness rule narrows the board's.
+            Box::pin(crate::result_cache::in_chart(
+                (Some(original.spec.id.as_str()), original.def.shape.cache),
+                async move {
+                    let tile_filters = tile_filters(board, filters, &original.spec.id);
+                    let effective = crate::routes::support::effective_chart(
+                        original,
+                        cols_ref,
+                        sources_ref,
+                        read_ref,
+                    );
+                    let c = match &effective {
+                        Ok(e) => &**e,
+                        Err(msg) => {
+                            return (
+                                original.spec.id.clone(),
+                                json!({ "error": msg }),
+                                embed_rendered(original, original),
+                            );
+                        }
+                    };
+                    let val = match stored_chart_sql(
+                        c,
+                        &[],
+                        &tile_filters,
+                        cols_ref,
+                        sources_ref,
+                        read_ref,
+                    ) {
+                        Ok(filtered) => {
+                            let filtered =
+                                crate::routes::support::with_map_limit(filtered, c.spec.kind).await;
+                            // BI-5 review B1: the rows this kind may read.
+                            let (id, mut val) = crate::routes::support::with_tile_rows(
+                                c.spec.kind,
+                                &filtered.sql,
+                                run_spec_sql(
+                                    ch,
+                                    &c.spec.id,
+                                    &filtered.sql,
+                                    roles_ref,
+                                    placeholders_ref,
+                                    obligations,
+                                ),
+                            )
+                            .await;
+                            crate::routes::support::annotate_params(&mut val, c, values_ref);
+                            crate::routes::support::annotate_grain(&mut val, &filtered, c);
+                            // BI-16 part A: the first page of a raw table, with
+                            // its total; an embed and a public link offer no
+                            // paging.
+                            crate::routes::support::annotate_table(
+                                ch,
+                                &mut val,
+                                &filtered,
+                                (roles_ref, placeholders_ref, obligations),
+                            )
+                            .await;
+                            let tile_ctx = crate::routes::layers::LayerContext {
+                                filters: &tile_filters,
+                                ..*layer_ctx_ref
+                            };
+                            crate::routes::layers::annotate_layers(
+                                &tile_ctx,
+                                &mut val,
+                                c,
+                                filtered.grain,
+                            )
+                            .await;
+                            annotate_metric_labels(
+                                &mut val,
+                                c,
+                                catalog_ref,
+                                Some((cols_ref, sources_ref)),
+                            );
+                            (id, val)
+                        }
+                        Err(msg) => (c.spec.id.clone(), json!({ "error": msg })),
+                    };
+                    (val.0, val.1, rendered_chart(original, c))
+                },
+            )) as futures::future::BoxFuture<'_, (String, Value, Value)>
+        })
+        .collect();
+    // BI-5 (plan D4): the same board deadline as the dashboard payload.
+    let run = crate::query_limits::QueryRun::current_or_detached();
+    let limit = run
+        .limits()
+        .await
+        .map_or(crate::query_limits::BOARD_DEADLINE_CAP, |limits| {
+            limits.timeout
+        });
+    let deadline =
+        tokio::time::Instant::now() + crate::query_limits::board_deadline(tiles.len(), limit);
+    let unreached = |i: usize| {
+        let original: &StoredChartSpec = stored_for_board[i];
+        (
+            original.spec.id.clone(),
+            json!({ "error": crate::query_limits::NOT_REACHED_SENTENCE }),
+            embed_rendered(original, original),
+        )
+    };
+    // BI-4 part B: the scope the handler opened, narrowed to the board's own
+    // rule; the embed viewer's masks are in each statement, so equal viewers
+    // share a result and different ones never do.
+    let running = crate::tile_pool::run_tiles_until(tile_slots, tiles, deadline, &unreached);
+    let finished = match crate::result_cache::current() {
+        Some(scope) => {
+            let candidates = cols.keys().map(|mart| format!("serving.{mart}")).collect();
+            crate::result_cache::scoped(
+                scope
+                    .for_board(board.cache, candidates)
+                    .with_zone(time.zone()),
+                running,
+            )
+            .await
         }
-
-        charts_out.push(rendered_chart(original, c));
+        None => running.await,
+    };
+    for (id, val, rendered) in finished {
+        results.insert(id, val);
+        charts_out.push(rendered);
     }
 
     let mut body = board_body(board, &charts_out, &results, time, narrowing.only_chart);
@@ -1565,6 +1683,12 @@ mod typed_filters {
     }
 
     #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one fixture board and its assertions in a single scenario; \
+                  it was 100 lines on BI-26's branch and the BI-4 tile-slot \
+                  tuple in its call took it to 103"
+    )]
     async fn a_board_saved_with_a_typed_filter_renders_publicly_with_it_applied() {
         let server = MockServer::start().await;
         let spec = json!({
@@ -1623,6 +1747,7 @@ mod typed_filters {
             phone_layout: None,
             theme: None,
             font: None,
+            cache: None,
             created_at: None,
             updated_at: None,
             public_token: None,
@@ -1638,7 +1763,10 @@ mod typed_filters {
             &board,
             "b1",
             &filters,
-            &lakehouse_bi::grain::TimeContext::default(),
+            (
+                &lakehouse_bi::grain::TimeContext::default(),
+                &tokio::sync::Semaphore::new(crate::tile_pool::TILES_PER_PROCESS),
+            ),
             Narrowing::default(),
             &crate::routes::settings::FormatSettings::default(),
         )
@@ -1772,6 +1900,7 @@ mod typed_filters {
             }]),
             theme: Some("dark".to_owned()),
             font: Some("inter".to_owned()),
+            cache: None,
             created_at: None,
             updated_at: None,
             public_token: None,
@@ -1786,7 +1915,10 @@ mod typed_filters {
             &board,
             "b1",
             &filters,
-            &lakehouse_bi::grain::TimeContext::default(),
+            (
+                &lakehouse_bi::grain::TimeContext::default(),
+                &tokio::sync::Semaphore::new(crate::tile_pool::TILES_PER_PROCESS),
+            ),
             Narrowing::default(),
             &crate::routes::settings::FormatSettings::default(),
         )
@@ -1878,6 +2010,7 @@ mod typed_filters {
             phone_layout: None,
             theme: None,
             font: None,
+            cache: None,
             created_at: None,
             updated_at: None,
             public_token: None,
@@ -1895,7 +2028,10 @@ mod typed_filters {
             &board,
             "b1",
             &locked,
-            &lakehouse_bi::grain::TimeContext::default(),
+            (
+                &lakehouse_bi::grain::TimeContext::default(),
+                &tokio::sync::Semaphore::new(crate::tile_pool::TILES_PER_PROCESS),
+            ),
             Narrowing::default(),
             &crate::routes::settings::FormatSettings::default(),
         )
@@ -1977,6 +2113,7 @@ mod typed_filters {
             phone_layout: None,
             theme: None,
             font: None,
+            cache: None,
             created_at: None,
             updated_at: None,
             public_token: None,
@@ -1996,7 +2133,10 @@ mod typed_filters {
             &board,
             "b1",
             &[],
-            &time,
+            (
+                &time,
+                &tokio::sync::Semaphore::new(crate::tile_pool::TILES_PER_PROCESS),
+            ),
             Narrowing::default(),
             &crate::routes::settings::FormatSettings::default(),
         )

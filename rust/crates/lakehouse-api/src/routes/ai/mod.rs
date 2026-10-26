@@ -1161,7 +1161,13 @@ fn stream_chat(state: AppState, principal: Option<Principal>, run: PreparedChat)
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
     let (mut writer, reader) = tokio::io::duplex(16 * 1024);
 
-    tokio::spawn(async move {
+    // BI-5 review B2: the chat's tools (`run_sql`, `stop_query`) run in this
+    // spawned task, which does not inherit the request's task-local run. Without
+    // the run below they would use the compiled-in limits, a nil principal and
+    // a query id nobody's Stop can match. The run is taken here, in the
+    // request's task, and handed to the spawned one.
+    let query_run = crate::query_limits::QueryRun::current_or_detached();
+    tokio::spawn(crate::query_limits::scope(query_run, async move {
         let last = match run_chat(&state, principal.as_ref(), run, Some(&tx)).await {
             Ok(body) => json!({ "type": "done", "body": body }),
             Err(err) => json!({
@@ -1171,7 +1177,7 @@ fn stream_chat(state: AppState, principal: Option<Principal>, run: PreparedChat)
             }),
         };
         let _ = tx.send(last);
-    });
+    }));
     // Dropping `rx` when a write fails (client gone) makes the loop's next
     // `report` return false.
     tokio::spawn(async move {

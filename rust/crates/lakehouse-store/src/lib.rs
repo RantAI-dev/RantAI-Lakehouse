@@ -62,6 +62,7 @@ pub mod pipelines;
 pub mod public_links;
 pub mod quality;
 pub mod queries;
+pub mod query_limits;
 pub mod report_schedule;
 pub mod report_subscriptions;
 pub mod reporting_settings;

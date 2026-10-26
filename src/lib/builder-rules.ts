@@ -109,10 +109,12 @@ export type MoreOptionsUse = {
   columnSettings: number
   /** A KPI compared with an earlier period or a goal. */
   compare: boolean
+  /** A freshness rule of the chart's own (`BI-4` part B). */
+  freshness?: boolean
 }
 
 export function moreOptionsUsed(u: MoreOptionsUse): boolean {
-  return u.steps > 0 || u.layers > 0 || u.click || u.columnSettings > 0 || u.compare
+  return u.steps > 0 || u.layers > 0 || u.click || u.columnSettings > 0 || u.compare || u.freshness === true
 }
 
 /**

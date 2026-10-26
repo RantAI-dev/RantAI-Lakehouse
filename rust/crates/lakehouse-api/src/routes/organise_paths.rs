@@ -195,6 +195,7 @@ async fn payload_result(
         filters: None,
         grain: None,
         params: None,
+        fresh: None,
     };
     get_body(
         &ch,
@@ -207,6 +208,7 @@ async fn payload_result(
             &lakehouse_bi::grain::TimeContext::default(),
             GrainRequest::Saved,
             viewer,
+            &tokio::sync::Semaphore::new(crate::tile_pool::TILES_PER_PROCESS),
         ),
     )
     .await

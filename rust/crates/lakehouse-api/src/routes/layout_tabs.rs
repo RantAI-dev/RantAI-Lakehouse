@@ -114,6 +114,7 @@ async fn dashboard(server: &MockServer, filters: &str) -> Value {
         filters: Some(filters.to_owned()),
         grain: None,
         params: None,
+        fresh: None,
     };
     let parsed = parse_filters_param(q.filters.as_deref()).expect("valid filters");
     get_body(
@@ -127,6 +128,7 @@ async fn dashboard(server: &MockServer, filters: &str) -> Value {
             &lakehouse_bi::grain::TimeContext::default(),
             GrainRequest::Saved,
             &Viewer::system(),
+            &tokio::sync::Semaphore::new(crate::tile_pool::TILES_PER_PROCESS),
         ),
     )
     .await
@@ -646,6 +648,7 @@ mod verify {
             filters: None,
             grain: None,
             params: None,
+            fresh: None,
         };
         let obligations = PolicyEngineObligations::new(None, ch);
         get_body(
@@ -659,6 +662,7 @@ mod verify {
                 &lakehouse_bi::grain::TimeContext::default(),
                 GrainRequest::Saved,
                 &Viewer::system(),
+                &tokio::sync::Semaphore::new(crate::tile_pool::TILES_PER_PROCESS),
             ),
         )
         .await

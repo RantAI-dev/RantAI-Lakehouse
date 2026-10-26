@@ -145,6 +145,11 @@ pub fn resource_for(
         // (merge of main into phase 3: the table was main's, written before
         // they existed).
         "format_chart" => (Some("chart"), str_field("chart")),
+        // `set_cache_rule` (`BI-4` part B) names a chart or a board, one of the two.
+        "set_cache_rule" => match str_field("chart") {
+            Some(chart) => (Some("chart"), Some(chart)),
+            None => (Some("board"), str_field("board")),
+        },
         "create_calculated_field" | "update_calculated_field" | "delete_calculated_field" => {
             (Some("calculated_field"), str_field("id"))
         }

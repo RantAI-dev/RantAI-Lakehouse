@@ -66,6 +66,8 @@ mod quality_incidents;
 mod quality_load;
 mod quality_schedules;
 mod query;
+mod query_cancel;
+mod query_limits;
 mod schema_changes;
 pub(crate) mod schema_versions;
 mod settings;
@@ -78,7 +80,7 @@ use std::time::Duration;
 use axum::Router;
 use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::StatusCode;
-use axum::middleware::{Next, from_fn, from_fn_with_state};
+use axum::middleware::{Next, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use serde::Serialize;
@@ -163,7 +165,8 @@ const PDF_REQUEST_TIMEOUT: Duration = Duration::from_secs(60 + 70 + 10);
 /// |---------------------------------|------------------|
 /// | `/api/ai/chat`                  | 120              |
 /// | `/api/alerts/run`               | 60               |
-/// | `/api/query/run`                | 60               |
+/// | `/api/query/run`                | 60 (BI-5: the longest configured limit + 15, see [`deadline_for`]) |
+/// | board routes (`/api/dashboard`, `/api/embed/*`, `/api/public/dashboard/*`, `/api/render/data`) | 60 (BI-5: an outer cap of 35 minutes, see [`deadline_for`]) |
 /// | everything else (no export)     | [`DEFAULT_REQUEST_TIMEOUT`] (60) |
 ///
 /// `/api/uploads` has no TypeScript handler to mirror and takes
@@ -193,6 +196,48 @@ fn route_timeout(path: &str) -> Duration {
         other if is_upload_part_path(other) => UPLOAD_REQUEST_TIMEOUT,
         other if is_discovery_path(other) => DISCOVERY_REQUEST_TIMEOUT,
         _ => DEFAULT_REQUEST_TIMEOUT,
+    }
+}
+
+/// The routes whose queries run under the administrator's time limit
+/// (`BI-5`): their deadline follows the limit instead of the fixed 60 s.
+fn limit_bearing(path: &str) -> bool {
+    path == "/api/query/run" || is_board_path(path)
+}
+
+/// The routes that answer a whole board: tiles run six at a time, so one can
+/// need several rounds of the time limit.
+///
+/// `BI-5` review S1: only the routes that run a whole board's tiles. The embed
+/// frame and values routes and a public link's `unlock` run no tile, so they
+/// keep the ordinary deadline.
+fn is_board_path(path: &str) -> bool {
+    path == "/api/dashboard"
+        || path == "/api/render/data"
+        || path == "/api/embed/data"
+        || path
+            .strip_prefix("/api/public/dashboard/")
+            .is_some_and(|token| !token.is_empty() && !token.contains('/'))
+}
+
+/// The deadline of `path` given the install's longest configured time limit
+/// (`None`: not read, or not readable, which keeps [`route_timeout`]).
+///
+/// `BI-5` plan D4 says a limit-bearing route gets that limit plus 15 s, and
+/// that a board's deadline is `ceil(tiles / 6) x limit + 15 s` computed in the
+/// handler (which answers the finished tiles and marks the rest "not reached
+/// in time"). The two cannot both be the middleware's: a deadline of one limit
+/// would cut a two-round board before its handler could answer. So the
+/// middleware gives `/api/query/run` the limit plus 15 s, and a board route
+/// the 35-minute cap as an outer bound, leaving the handler's own deadline
+/// (`query_limits::board_deadline`) the one that decides.
+fn deadline_for(path: &str, longest: Option<Duration>) -> Duration {
+    match longest {
+        Some(_) if is_board_path(path) => crate::query_limits::BOARD_DEADLINE_CAP,
+        Some(longest) if limit_bearing(path) => {
+            longest.saturating_add(crate::query_limits::DEADLINE_MARGIN)
+        }
+        _ => route_timeout(path),
     }
 }
 
@@ -1405,6 +1450,17 @@ pub fn router(state: AppState) -> Router {
             "/api/settings/reporting",
             get(settings::get_reporting).put(settings::put_reporting),
         )
+        // Time and row limits of charts and Query Studio (`BI-5`); see
+        // `routes::query_limits`.
+        // Stop (`BI-5`): ends the caller's own queries of one run.
+        .route(
+            "/api/query/cancel",
+            axum::routing::post(query_cancel::cancel),
+        )
+        .route(
+            "/api/settings/limits",
+            get(query_limits::get_limits).put(query_limits::put_limits),
+        )
         // Phase 2 identity domain.
         .merge(identity_router())
         // Phase 2, Task 2.7: connector definitions.
@@ -1430,8 +1486,14 @@ pub fn router(state: AppState) -> Router {
         // OUTER layer) so a slow session/permission check while a caller
         // has the connection open still counts against the request's
         // deadline instead of running unbounded outside it.
+        // `BI-5`: the run every query of this request belongs to. Inside
+        // `auth_gate` so the principal it names is already there.
+        .layer(from_fn_with_state(
+            state.clone(),
+            crate::query_limits::scope_middleware,
+        ))
         .layer(from_fn_with_state(state.clone(), auth_gate))
-        .layer(from_fn(timeout_middleware))
+        .layer(from_fn_with_state(state.clone(), timeout_middleware))
         .with_state(state)
 }
 
@@ -1484,8 +1546,19 @@ struct TimeoutBody {
 /// path that violated the `{"error": "<message>"}` /
 /// `application/json;charset=utf-8` contract every other response honors —
 /// this renders the same JSON error envelope via [`ApiJson`].
-async fn timeout_middleware(req: Request, next: Next) -> Response {
-    let timeout = route_timeout(req.uri().path());
+async fn timeout_middleware(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    let path = req.uri().path();
+    // Only a route that runs queries under the limits reads them (BI-5 plan
+    // D4); every other route keeps its fixed deadline without a settings read.
+    let longest = if limit_bearing(path) {
+        crate::query_limits::snapshot(&state)
+            .await
+            .ok()
+            .map(|snap| snap.longest_timeout())
+    } else {
+        None
+    };
+    let timeout = deadline_for(path, longest);
     match tokio::time::timeout(timeout, next.run(req)).await {
         Ok(response) => response,
         Err(_elapsed) => (
@@ -1531,6 +1604,48 @@ mod tests {
             route_timeout("/api/dashboard/export"),
             DEFAULT_REQUEST_TIMEOUT
         );
+    }
+
+    /// `BI-5` plan D4: the query route follows the longest configured limit
+    /// plus 15 s, a board route gets the outer cap, everything else keeps its
+    /// fixed deadline, and an unreadable setting keeps the fixed one too.
+    #[test]
+    fn limit_bearing_routes_follow_the_longest_configured_limit() {
+        let longest = Some(Duration::from_secs(300));
+        assert_eq!(
+            deadline_for("/api/query/run", longest),
+            Duration::from_secs(315)
+        );
+        for board in [
+            "/api/dashboard",
+            "/api/render/data",
+            "/api/embed/data",
+            "/api/public/dashboard/abc",
+        ] {
+            assert_eq!(
+                deadline_for(board, longest),
+                crate::query_limits::BOARD_DEADLINE_CAP,
+                "{board}"
+            );
+            assert_eq!(deadline_for(board, None), route_timeout(board), "{board}");
+        }
+        // BI-5 review S1: routes under the board prefixes that run no tile.
+        for other in [
+            "/api/dashboard/export",
+            "/api/catalog",
+            "/api/ai/chat",
+            "/api/embed/frame",
+            "/api/embed/values",
+            "/api/public/dashboard/abc/unlock",
+            "/api/public/dashboard/",
+        ] {
+            assert_eq!(
+                deadline_for(other, longest),
+                route_timeout(other),
+                "{other}"
+            );
+            assert!(!limit_bearing(other));
+        }
     }
 
     #[test]

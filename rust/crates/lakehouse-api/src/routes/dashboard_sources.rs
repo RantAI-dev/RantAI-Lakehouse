@@ -477,6 +477,7 @@ async fn preview_for_roles(
             match try_run_spec_sql(ch, &chart.spec.sql, roles, placeholders, obligations).await {
                 Ok(rows) => rows,
                 Err(SpecRunFailure::Refused(message)) => json!({ "error": message }),
+                Err(SpecRunFailure::Tile(answer)) => answer,
                 Err(SpecRunFailure::Clickhouse(err)) => return Err(classify_ch_error(&err)),
             };
         crate::routes::support::annotate_saved_grain(&mut rows, &chart);

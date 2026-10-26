@@ -25,6 +25,8 @@ fn settings(zone: &str, week: &str) -> ReportingSettings {
         download_denied_roles: Vec::new(),
         report_allowed_domains: Vec::new(),
         public_links_enabled: true,
+        result_cache_mode: "default".to_owned(),
+        result_cache_minutes: None,
     }
 }
 
@@ -214,5 +216,53 @@ async fn the_table_refuses_an_empty_report_domain_and_more_than_fifty(
         assert!(upsert(&pool, &s, "u").await.is_err());
     }
     assert_eq!(get(&pool).await.expect("get"), None, "nothing was stored");
+    Ok(())
+}
+
+/// `BI-4` part B T3 (D7): the rule round-trips, a row saved before it reads
+/// as `default`, and the table refuses minutes out of range or sent with a
+/// mode that takes none.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_result_cache_rule_round_trips_and_the_table_refuses_a_bad_one(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let stored = upsert(&pool, &settings("UTC", "monday"), "u")
+        .await
+        .expect("upsert");
+    assert_eq!(stored.result_cache_mode, "default");
+    assert_eq!(stored.result_cache_minutes, None);
+
+    for (mode, minutes) in [
+        ("fresh", None),
+        ("minutes", Some(1)),
+        ("minutes", Some(1440)),
+    ] {
+        let mut s = settings("UTC", "monday");
+        s.result_cache_mode = mode.to_owned();
+        s.result_cache_minutes = minutes;
+        let back = upsert(&pool, &s, "u").await.expect("upsert");
+        assert_eq!(back, s);
+        assert_eq!(get(&pool).await.expect("get"), Some(s));
+    }
+
+    for (mode, minutes) in [
+        ("minutes", Some(0)),
+        ("minutes", Some(1441)),
+        ("minutes", None),
+        ("fresh", Some(5)),
+        ("default", Some(5)),
+        ("sometimes", None),
+    ] {
+        let mut s = settings("UTC", "monday");
+        s.result_cache_mode = mode.to_owned();
+        s.result_cache_minutes = minutes;
+        assert!(upsert(&pool, &s, "u").await.is_err(), "{mode} {minutes:?}");
+    }
+    let kept = get(&pool).await.expect("get").expect("row");
+    assert_eq!(
+        kept.result_cache_minutes,
+        Some(1440),
+        "a refusal changes nothing"
+    );
     Ok(())
 }

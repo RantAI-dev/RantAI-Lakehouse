@@ -7,6 +7,7 @@
 pub mod access;
 pub mod bin;
 pub mod builder;
+pub mod cache_rule;
 pub mod click;
 pub mod dashboard_file;
 pub mod embed_access;

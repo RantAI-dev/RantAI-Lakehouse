@@ -321,6 +321,19 @@ fn look_summary(name: &str, args: &Map<String, Value>) -> String {
             get("chart")
         );
     }
+    if name == "set_cache_rule" {
+        let rule = match (get("rule"), args.get("minutes").and_then(Value::as_i64)) {
+            ("minutes", Some(n)) => format!("diingat {n} menit"),
+            ("fresh", _) => "selalu segar".to_owned(),
+            _ => "ikut aturan di atasnya".to_owned(),
+        };
+        let (kind, id) = if get("chart").is_empty() {
+            ("dashboard", get("board"))
+        } else {
+            ("chart", get("chart"))
+        };
+        return format!("Mengatur seberapa lama hasil {kind} {id} diingat ({rule}).");
+    }
     format!(
         "Mengatur tema dan font dashboard {} (tema: {}, font: {}).",
         get("board"),
@@ -400,7 +413,7 @@ fn summary_for(spec: &ToolSpec, args: &Map<String, Value>) -> String {
             s("title"),
             s("kind")
         ),
-        "format_chart" | "set_dashboard_theme" => look_summary(spec.name, args),
+        "format_chart" | "set_dashboard_theme" | "set_cache_rule" => look_summary(spec.name, args),
         "create_board" => format!("Membuat board baru bernama \"{}\".", s("name")),
         "create_tab" => format!(
             "Menambah tab \"{}\" pada dashboard {}.",
@@ -715,7 +728,7 @@ mod tests {
     ];
 
     /// BI-17 part A / AI-8: the two formatting tools are `WriteLow` like `update_chart`.
-    const FORMAT_TOOLS: [&str; 2] = ["format_chart", "set_dashboard_theme"];
+    const FORMAT_TOOLS: [&str; 3] = ["format_chart", "set_dashboard_theme", "set_cache_rule"];
 
     /// A `PermissionSet` granting everything (`*:*`) — Platform Admin.
     fn admin_perms() -> PermissionSet {
