@@ -89,7 +89,18 @@ export function HistoryQuickList({
   const shown = expanded ? all.slice(0, PAGE_SIZE * 4) : all.slice(0, PAGE_SIZE)
 
   return (
-    <SectionCard title="History" description="Your recent runs.">
+    <SectionCard
+      title="History"
+      description="Your recent runs."
+      action={
+        <Link
+          href="/query-studio/history"
+          className="text-xs text-primary hover:underline"
+        >
+          View all
+        </Link>
+      }
+    >
       {state.status === "loading" ? <LoadingSkeleton rows={3} /> : null}
       {state.status === "error" ? (
         <ErrorState error={state.error} onRetry={state.reload} />

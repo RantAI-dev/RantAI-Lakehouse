@@ -447,5 +447,5 @@ fn a_chart_saved_before_bins_builds_no_range_statement() {
         )],
     );
     assert!(!got.sql.contains("rng"), "{}", got.sql);
-    assert!(got.bins.is_empty());
+    assert_eq!(got.bins, [] as [lakehouse_bi::builder::BinRead; 0]);
 }

@@ -150,6 +150,7 @@ hands-on testing.
 
 | Capability | Ours | Competitors | Gap |
 | --- | --- | --- | --- |
+| Query tenancy | **Partial.** A query and a saved query are scoped to the caller's tenant — another tenant's uploaded table is refused with the same 404 as a missing table, and the shared catalog belongs to the tenant named in `CATALOG_TENANT_ID` (`SEC-20`). Dashboards, scheduled exports, alerts and authored pipelines are not scoped this way yet | Yes | `SEC-50` |
 | Roles and permissions | **Have** | Yes | — |
 | Classify and mask sensitive columns | **Have.** Proven end to end (gate `ops/g8`) | Yes | — |
 | Row-level rules | **Partial.** The policy engine applies row filters and masks on read; masking is proven end to end (gate `ops/g8`), row filters are not gate-tested | Yes | Prove row filters |
@@ -266,8 +267,8 @@ in `README.md` ("Status / Known limitations").
   a connector's stored password can be sent to a new host (`SEC-14`);
   connection tests and alert webhooks can reach internal addresses
   (`SEC-15`, `SEC-10`); raw database errors reach the screen on dashboard
-  tiles and embeds (`SEC-11`); queries are not scoped to the tenant
-  (`SEC-20`). The full list is `SEC-10` to `SEC-21` in `BACKLOG.md`.
+  tiles and embeds (`SEC-11`). The full list is `SEC-10` to `SEC-21` in
+  `BACKLOG.md`.
 - The audit trail does not cover every console change.
 - The backend was ported and reviewed by AI agents, with no full human
   security review. A previously internal key is in the public git history

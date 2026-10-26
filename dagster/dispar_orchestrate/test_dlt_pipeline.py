@@ -34,6 +34,7 @@ from datetime import timezone
 
 import dlt
 import pytest
+from dagster import Failure
 
 from dispar_orchestrate import ssrf_guard
 from dispar_orchestrate.dlt_pipeline import BronzeIngestConfig, run_bronze_ingest
@@ -126,7 +127,13 @@ def test_run_bronze_ingest_refuses_a_blocked_host_before_building_credentials(mo
         run_bronze_ingest(_base_config(source_db_host="169.254.169.254"))
 
 
-def test_from_dial_builds_a_config_from_a_registry_supplied_postgres_dial() -> None:
+def test_from_dial_builds_a_config_from_a_registry_supplied_postgres_dial(
+    monkeypatch,
+) -> None:
+    # `SEC-37`: `from_dial` starts from `from_env`, which requires the two
+    # connector-scoped S3 credentials (no `rustfsadmin` fallback any more).
+    monkeypatch.setenv("CONNECTOR_S3_ACCESS_KEY", "test-access-key")
+    monkeypatch.setenv("CONNECTOR_S3_SECRET_KEY", "test-secret-key")
     # Mirrors rust/migrations/0034_seed_connector_ingest_spec.sql's
     # seeded conn-pg-lakehouse row shape exactly (dial.driver == "postgres",
     # not "postgresql" -- SqlDriver's #[serde(rename_all = "snake_case")]).
@@ -167,6 +174,34 @@ def test_from_dial_requires_at_least_one_source_object() -> None:
     dial = {"driver": "postgres", "host": "postgres", "port": 5432, "database": "d", "user": "u"}
     with pytest.raises(ValueError, match="at least one source object"):
         BronzeIngestConfig.from_dial(dial, secrets={"password": "x"}, source_objects=[])
+
+
+def test_from_env_names_an_unset_s3_access_key_and_does_not_default_one(
+    monkeypatch,
+) -> None:
+    """`SEC-37`: the `rustfsadmin` fallback is gone. An unset
+    `CONNECTOR_S3_ACCESS_KEY` fails the run with a `Failure` naming the
+    variable, instead of dialling the object store with a credential
+    written in the repository."""
+    monkeypatch.delenv("CONNECTOR_S3_ACCESS_KEY", raising=False)
+    monkeypatch.setenv("CONNECTOR_S3_SECRET_KEY", "a-real-secret")
+
+    with pytest.raises(Failure) as raised:
+        BronzeIngestConfig.from_env()
+
+    assert "CONNECTOR_S3_ACCESS_KEY" in str(raised.value)
+
+
+def test_from_env_names_an_unset_s3_secret_key_and_does_not_default_one(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("CONNECTOR_S3_ACCESS_KEY", "a-real-key")
+    monkeypatch.delenv("CONNECTOR_S3_SECRET_KEY", raising=False)
+
+    with pytest.raises(Failure) as raised:
+        BronzeIngestConfig.from_env()
+
+    assert "CONNECTOR_S3_SECRET_KEY" in str(raised.value)
 
 
 class _FakeLoadInfo:

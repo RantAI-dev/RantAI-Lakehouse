@@ -116,7 +116,7 @@ Exceptions, each with an owner and a date:
   a cursor can be set only through the API. Found in the planner's
   pre-check of 2026-10-16, on a source where the last row read and the
   highest cursor differ. Owner: product owner. Date: 2026-10-23.
-  Follow-up: `SRC-32`.
+  Follow-up: `SRC-34`.
 
 ## After acceptance
 

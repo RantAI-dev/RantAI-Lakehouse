@@ -108,6 +108,20 @@ def _env(name: str, default: str) -> str:
     return value if value else default
 
 
+def _required_env(name: str) -> str:
+    """Read `name`, failing the run when it is unset or empty.
+
+    `SEC-37`: `from_env` used to fall back to the literal `rustfsadmin` for
+    the two S3 credentials. Compose always sets them, so a missing value is
+    a misconfiguration: `Failure` (config, not transient — no retry helps)
+    naming the variable beats dialling the object store with a guessed key.
+    """
+    value = _env(name, "")
+    if not value:
+        raise Failure(f"{name} must be set (SEC-37: no default credentials in code)")
+    return value
+
+
 INVALID_KEEP_COPIES_REASON = "invalid GOLD_KEEP_COPIES"
 INVALID_ORPHAN_MIN_AGE_REASON = "invalid GOLD_ORPHAN_MIN_AGE_SECONDS"
 
@@ -191,14 +205,30 @@ class GoldExportConfig:
     # exists — the schedule then runs and fails loudly (`401`/`503`)
     # instead of silently, which is the honest state to ship.
     run_token: str
+    # CREDENTIAL HYGIENE (review finding): these used to read
+    # `RUSTFS_ACCESS_KEY`/`RUSTFS_SECRET_KEY` directly — RustFS's own ROOT
+    # credentials, the same ones the bucket-bootstrap/admin-shaped jobs in
+    # docker-compose.yml use. This module only ever reads/writes objects
+    # under the warehouse bucket, so it does not need root. It reads the
+    # connector-scoped names instead (`CONNECTOR_S3_ACCESS_KEY`/
+    # `CONNECTOR_S3_SECRET_KEY` — see docker-compose.yml's
+    # `dagster-code-location` env block, where compose points them at the
+    # RustFS root key because this stack's RustFS version has no
+    # non-proprietary-API way to mint a narrower S3 identity).
+    #
+    # `SEC-37`: REQUIRED — no default, no fallback. They used to default to
+    # the literal `rustfsadmin` here and in `from_env`; a credential written
+    # in the code is one an operator never chose (`AGENTS.md` rule 5).
+    # `from_env` raises `Failure` naming the variable when either is unset,
+    # and there is no constructor that supplies one for you.
+    rustfs_access_key: str
+    rustfs_secret_key: str
     gold_keep_copies: str = "7"
     gold_orphan_min_age_seconds: str = "3600"
     gold_export_token_file: str = "/tokens/gold-export.jwt"
     lakekeeper_catalog_uri: str = "http://lakekeeper:8181/catalog"
     lakekeeper_warehouse: str = "default"
     rustfs_endpoint: str = "http://rustfs:9000"
-    rustfs_access_key: str = "rustfsadmin"
-    rustfs_secret_key: str = "rustfsadmin"
     ch_oauth_client_id: str = ""
     ch_oauth_server_uri: str = ""
 
@@ -219,8 +249,8 @@ class GoldExportConfig:
             ),
             lakekeeper_warehouse=_env("LAKEKEEPER_WAREHOUSE", "default"),
             rustfs_endpoint=_env("CH_RUSTFS_S3_ENDPOINT", "http://rustfs:9000"),
-            rustfs_access_key=_env("CONNECTOR_S3_ACCESS_KEY", "rustfsadmin"),
-            rustfs_secret_key=_env("CONNECTOR_S3_SECRET_KEY", "rustfsadmin"),
+            rustfs_access_key=_required_env("CONNECTOR_S3_ACCESS_KEY"),
+            rustfs_secret_key=_required_env("CONNECTOR_S3_SECRET_KEY"),
             ch_oauth_client_id=_env("CH_OAUTH_CLIENT_ID", ""),
             ch_oauth_server_uri=_env("CH_OAUTH_SERVER_URI", ""),
         )

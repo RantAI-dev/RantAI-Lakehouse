@@ -43,6 +43,12 @@ const PICKER_STATEMENT: &str = "SELECT n FROM serving.t\nSETTINGS iceberg_snapsh
 async fn spin_up_with_clickhouse(ch_uri: &str) -> TestApp {
     let mut overrides = HashMap::new();
     overrides.insert("CH_URL".to_owned(), ch_uri.to_owned());
+    // The shared catalog belongs to one tenant, and the query path is
+    // scoped to the tenant: this principal must be the catalog's own.
+    overrides.insert(
+        "CATALOG_TENANT_ID".to_owned(),
+        "11111111-1111-4111-8111-000000000001".to_owned(),
+    );
     spin_up_with_env(&overrides).await
 }
 
@@ -139,6 +145,8 @@ async fn insert_history_row(pool: &PgPool, id: &str, sql: &str) {
         workload_class: "hot-analytics",
         engine: "clickhouse",
         cache_assisted: false,
+        tables_read: &[],
+        message: None,
     };
     record_history(pool, &input)
         .await

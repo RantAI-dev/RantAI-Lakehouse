@@ -29,7 +29,11 @@ fn pool(state: &AppState) -> Result<&PgPool, Value> {
     })
 }
 
-pub(super) async fn save_query(state: &AppState, args: &Map<String, Value>) -> Value {
+pub(super) async fn save_query(
+    state: &AppState,
+    principal: Option<&Principal>,
+    args: &Map<String, Value>,
+) -> Value {
     let title = arg_str(args, "title");
     let sql = arg_str(args, "sql");
     if title.is_empty() || sql.is_empty() {
@@ -58,18 +62,48 @@ pub(super) async fn save_query(state: &AppState, args: &Map<String, Value>) -> V
     };
     // The copilot saves under the name it was given; it has no principal
     // id of its own to record as the author.
-    match queries::create_saved_query(pool, &title, &sql, &owner, &tags, None).await {
+    //
+    // `SEC-20`: the tenant is the caller's own — the chat sends no
+    // `X-Tenant` header, so it is the caller's first one, the same
+    // answer every caller without headers gets. A call that belongs to
+    // no tenant writes a row that belongs to no tenant.
+    let tenant_id = principal
+        .and_then(|principal| {
+            crate::tenant_scope::resolve(principal, &axum::http::HeaderMap::new()).ok()
+        })
+        .flatten();
+    match queries::create_saved_query(pool, &title, &sql, &owner, &tags, None, tenant_id).await {
         Ok(saved) => json!({ "ok": true, "query": saved }),
         Err(err) => upstream_error::store(&upstream_error::STORE, &err).to_json(),
     }
 }
 
-pub(super) async fn list_saved_queries(state: &AppState) -> Value {
+pub(super) async fn list_saved_queries(state: &AppState, principal: Option<&Principal>) -> Value {
     let pool = match pool(state) {
         Ok(p) => p,
         Err(err) => return err,
     };
-    match queries::list_saved(pool).await {
+    // `SEC-20`: the caller's tenant's saved queries, and the rows that
+    // belong to no tenant when that tenant owns the shared catalog. A
+    // scope that cannot be resolved is no rows at all — the list fails
+    // closed.
+    let scope = match principal {
+        Some(principal) => match crate::routes::query::saved_query_scope(
+            state,
+            principal,
+            &axum::http::HeaderMap::new(),
+        )
+        .await
+        {
+            Ok(scope) => scope,
+            Err(err) => {
+                tracing::warn!(?err, "chat: the saved query scope could not be resolved");
+                queries::SavedQueryScope::None
+            }
+        },
+        None => queries::SavedQueryScope::None,
+    };
+    match queries::list_saved(pool, scope).await {
         Ok(saved) => json!({ "queries": saved }),
         Err(err) => upstream_error::store(&upstream_error::STORE, &err).to_json(),
     }
@@ -88,13 +122,6 @@ pub(super) async fn run_saved_query(
         Ok(p) => p,
         Err(err) => return err,
     };
-    let saved = match queries::list_saved(pool).await {
-        Ok(all) => all.into_iter().find(|q| q.id == id),
-        Err(err) => return upstream_error::store(&upstream_error::STORE, &err).to_json(),
-    };
-    let Some(saved) = saved else {
-        return json!({ "error": "saved query tidak ditemukan" });
-    };
     // `None` here is not just the interactive copilot's own missing
     // session — `run_headless_loop` (`routes::agents`) forwards the SAME
     // principal `run_employee`'s auth guard resolved, and that is `None`
@@ -104,11 +131,38 @@ pub(super) async fn run_saved_query(
     // feature; naming the real reason here keeps the refusal fail-closed
     // (the query still never runs) while being honest about why, per
     // AGENTS.md principle 2.
+    //
+    // The check comes before the lookup: the lookup is scoped to the
+    // caller's tenant (`SEC-20`), and a caller with no principal has no
+    // tenant to scope by.
     let Some(principal) = principal else {
         return json!({
             "error": "running a saved query needs an authenticated user; this run was \
                        triggered by a schedule, which has no user to run it as",
         });
+    };
+    // `SEC-20`: the lookup is the caller's tenant's list, so a saved
+    // query of another tenant is not found at all — the chat's own
+    // "not found" answer, not a refusal that would confirm it exists.
+    let scope = match crate::routes::query::saved_query_scope(
+        state,
+        principal,
+        &axum::http::HeaderMap::new(),
+    )
+    .await
+    {
+        Ok(scope) => scope,
+        Err(err) => {
+            tracing::warn!(?err, "chat: the saved query scope could not be resolved");
+            queries::SavedQueryScope::None
+        }
+    };
+    let saved = match queries::list_saved(pool, scope).await {
+        Ok(all) => all.into_iter().find(|q| q.id == id),
+        Err(err) => return upstream_error::store(&upstream_error::STORE, &err).to_json(),
+    };
+    let Some(saved) = saved else {
+        return json!({ "error": "saved query tidak ditemukan" });
     };
     let body = Bytes::from(json!({ "sql": saved.sql }).to_string());
     // This internal call never goes through axum's auth middleware, so it
@@ -121,8 +175,19 @@ pub(super) async fn run_saved_query(
     // copilot-run saved query is recorded under the real user in
     // `query_history`, exactly like a console-run query.
     let extension = Some(Extension(principal.clone()));
-    api_result_to_value(crate::routes::query::run(State(state.clone()), extension, body).await)
-        .await
+    // The chat sends no `X-Tenant` header, so the tenant is the caller's
+    // first one — the same answer `tenant_scope::resolve` gives every
+    // caller without headers.
+    api_result_to_value(
+        crate::routes::query::run(
+            State(state.clone()),
+            extension,
+            axum::http::HeaderMap::new(),
+            body,
+        )
+        .await,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -150,7 +215,7 @@ mod tests {
     async fn save_query_requires_title_and_sql() {
         let state = state_without_pool();
         assert_eq!(
-            save_query(&state, &Map::new()).await,
+            save_query(&state, None, &Map::new()).await,
             json!({ "error": "title and sql are required" })
         );
     }
@@ -169,7 +234,7 @@ mod tests {
         let state = state_without_pool();
         let mut args = Map::new();
         args.insert("id".to_owned(), json!("q1"));
-        let result = list_saved_queries(&state).await;
+        let result = list_saved_queries(&state, None).await;
         assert!(result.get("error").is_some());
         let result = run_saved_query(&state, None, &args).await;
         assert!(result.get("error").is_some());
@@ -214,10 +279,15 @@ mod tests {
             )
         }
 
+        /// The shared catalog belongs to one tenant, and the query path
+        /// is scoped to the tenant: this fixture principal is the
+        /// catalog's own member, so the shared tables stay reachable.
+        const CATALOG_TENANT_ID: &str = "11111111-1111-4111-8111-000000000001";
+
         fn alice() -> Principal {
             Principal {
                 id: PrincipalId::User(Uuid::nil()),
-                tenant_ids: Vec::new(),
+                tenant_ids: vec![uuid::uuid!("11111111-1111-4111-8111-000000000001")],
                 display_name: "alice".to_owned(),
                 permissions: PermissionSet::parse("query:read"),
                 provider: "session".to_owned(),
@@ -243,12 +313,13 @@ mod tests {
             let mut env = HashMap::new();
             env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
             env.insert("CH_URL".to_owned(), server.uri());
+            env.insert("CATALOG_TENANT_ID".to_owned(), CATALOG_TENANT_ID.to_owned());
             let state = AppState::new(Config::from_map(&env).expect("valid config from a map"));
 
             // The migration seed (`0006_seed_queries.sql`) lands two saved
             // queries; either would do, so take the first rather than
             // hardcoding its id here.
-            let saved = queries::list_saved(&pool)
+            let saved = queries::list_saved(&pool, queries::SavedQueryScope::All)
                 .await
                 .expect("the migration seed provides saved queries");
             let first = saved
@@ -264,9 +335,10 @@ mod tests {
                 "expected a successful run, got {result}"
             );
 
-            let history = queries::list_history(&pool, Uuid::nil())
-                .await
-                .expect("query_history is readable");
+            let history =
+                queries::list_history(&pool, Uuid::nil(), &queries::HistoryFilter::default())
+                    .await
+                    .expect("query_history is readable");
             let recorded = history
                 .first()
                 .expect("run_saved_query must have recorded one history row");
@@ -292,9 +364,10 @@ mod tests {
             // hits exactly this path.
             let mut env = HashMap::new();
             env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
+            env.insert("CATALOG_TENANT_ID".to_owned(), CATALOG_TENANT_ID.to_owned());
             let state = AppState::new(Config::from_map(&env).expect("valid config from a map"));
 
-            let saved = queries::list_saved(&pool)
+            let saved = queries::list_saved(&pool, queries::SavedQueryScope::All)
                 .await
                 .expect("the migration seed provides saved queries");
             let first = saved
