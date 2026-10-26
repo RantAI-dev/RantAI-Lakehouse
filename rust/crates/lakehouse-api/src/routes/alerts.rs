@@ -12,7 +12,8 @@ use axum::extract::{Extension, Query, State};
 use axum::http::HeaderMap;
 use iceberg::{NamespaceIdent, TableIdent};
 use lakehouse_alerts::{
-    AlertKind, AlertRule, AlertRuleInput, FreshnessSource, LateSource, SilenceSource, SqlGate,
+    AlertKind, AlertRule, AlertRuleInput, AlertState, FreshnessSource, LateSource, SilenceSource,
+    SqlGate, StateSource,
 };
 use lakehouse_auth::{Principal, PrincipalId};
 use lakehouse_core::ApiError;
@@ -527,6 +528,11 @@ pub async fn delete(
                 upstream_error::FailedAs::Internal,
             )
         })?;
+    if let Some(pg) = state.pg.as_deref()
+        && let Err(err) = lakehouse_store::alert_state::delete(pg, &id).await
+    {
+        tracing::warn!(%err, rule_id = %id, "a deleted alert's state could not be removed");
+    }
     Ok(ApiJson(json!({ "ok": true })))
 }
 
@@ -653,6 +659,61 @@ impl SilenceSource for ApiSilenceSource<'_> {
             // a silent no-op that also fails to fire — degrade to "not
             // silenced," never fail the whole run.
             .unwrap_or(false)
+    }
+}
+
+/// [`StateSource`] backed by Postgres `alert_rule_state` (`BI-19` part C, D11,
+/// migration `0113`). A read that fails is the fixed sentence (principle 4), and
+/// the rule is then skipped rather than judged; a write that fails is logged
+/// here, because the caller has already sent or not sent.
+pub(crate) struct ApiStateSource<'a> {
+    pub(crate) pg: &'a PgPool,
+}
+
+#[async_trait::async_trait]
+impl StateSource for ApiStateSource<'_> {
+    async fn state_of(&self, rule_id: &str) -> Result<AlertState, String> {
+        match lakehouse_store::alert_state::get(self.pg, rule_id).await {
+            Ok(row) => Ok(row.map_or(AlertState::Ok, |r| AlertState::parse(&r.state))),
+            Err(err) => {
+                tracing::warn!(%err, rule_id, "an alert's state could not be read");
+                Err("the alert's state could not be read.".to_owned())
+            }
+        }
+    }
+
+    async fn record(
+        &self,
+        rule_id: &str,
+        state: AlertState,
+        value: Option<f64>,
+        reason: Option<&str>,
+    ) {
+        if let Err(err) = lakehouse_store::alert_state::record_check(
+            self.pg,
+            rule_id,
+            state.as_str(),
+            value,
+            reason,
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        {
+            tracing::warn!(%err, rule_id, "an alert's state could not be saved");
+        }
+    }
+
+    async fn record_failed(&self, rule_id: &str, reason: &str) {
+        if let Err(err) = lakehouse_store::alert_state::record_failed_check(
+            self.pg,
+            rule_id,
+            reason,
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        {
+            tracing::warn!(%err, rule_id, "an alert's failed check could not be saved");
+        }
     }
 }
 
@@ -898,6 +959,23 @@ async fn persist_fired_results(
     }
 }
 
+/// A rule that is back under its line closes the instances it opened
+/// (`BI-19` part C, D12), so the alert list shows one state for one condition.
+/// Best effort, like the insert: the message has already been sent.
+async fn resolve_recovered(pg: &PgPool, results: &[lakehouse_alerts::RunResult]) {
+    for result in results.iter().filter(|r| r.recovered) {
+        if let Err(err) = lakehouse_store::alert_state::resolve_open_instances(
+            pg,
+            &result.id,
+            "The value is back within the line.",
+        )
+        .await
+        {
+            tracing::warn!(%err, rule_id = %result.id, "recovered alert instances could not be resolved");
+        }
+    }
+}
+
 /// `GET`/`POST /api/alerts/run` — evaluate rules and deliver alerts/
 /// digests that fire.
 ///
@@ -969,6 +1047,7 @@ pub async fn run(
         _ => None,
     };
     let silence_source = state.pg.as_deref().map(|pg| ApiSilenceSource { pg });
+    let state_source = state.pg.as_deref().map(|pg| ApiStateSource { pg });
     let gate = ApiSqlGate {
         pg: state.pg.as_deref(),
         ch: &state.clickhouse,
@@ -981,6 +1060,7 @@ pub async fn run(
         query.id.as_deref(),
         freshness_source.as_ref().map(|s| s as &dyn FreshnessSource),
         silence_source.as_ref().map(|s| s as &dyn SilenceSource),
+        state_source.as_ref().map(|s| s as &dyn StateSource),
         &gate,
     )
     .await
@@ -997,6 +1077,7 @@ pub async fn run(
     // comment.
     if let Some(pg) = state.pg.as_deref() {
         persist_fired_results(pg, &state.clickhouse, &results).await;
+        resolve_recovered(pg, &results).await;
     }
 
     // Plan 1f: `pipeline_late` rules fire from this op, not from the
@@ -2600,6 +2681,11 @@ mod rule_scope_authorisation {
             metric: None,
             connector: None,
             asset: (kind == AlertKind::QualityIncident).then(|| "*".to_owned()),
+            chart: None,
+            series: None,
+            filters: Vec::new(),
+            condition: None,
+            owner_id: None,
         };
         let rules = vec![
             rule("quality", AlertKind::QualityIncident),

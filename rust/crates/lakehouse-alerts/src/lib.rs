@@ -382,6 +382,31 @@ pub struct AlertRule {
     /// string then, like `pipeline` and `connector`.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub asset: Option<String>,
+    /// `BI-19` part C (D12): the id of the chart a chart alert watches. `None`
+    /// for a rule that watches a mart column or a metric; the column stores the
+    /// empty string then, like `pipeline`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub chart: Option<String>,
+    /// The series (a measure's column in the chart's result) a line, bar or
+    /// combo chart alert reads the latest point of. `None` for a KPI or gauge
+    /// chart, which has one number, and for a "returns any rows" rule.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub series: Option<String>,
+    /// The dashboard filters the chart is read with (the same shape as the
+    /// dashboard's `filters`), empty for none. Stored as JSON text in
+    /// `filters_json`.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub filters: Vec<lakehouse_bi::filters::FilterDef>,
+    /// `above`, `below` or `any_rows` for a chart rule; `None` for a legacy
+    /// rule, which keeps `op` (D11).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub condition: Option<String>,
+    /// The person the rule reads its data as (C4): their roles, masking and row
+    /// filters apply, and their access to the chart decides whether it still
+    /// runs. `None` for a rule saved before part C, which reads as the fixed
+    /// viewer role it always did.
+    #[serde(rename = "ownerId", skip_serializing_if = "Option::is_none", default)]
+    pub owner_id: Option<String>,
 }
 
 fn default_agg() -> String {
@@ -457,6 +482,19 @@ pub struct AlertRuleInput {
     /// Table (`zone.table` in `bronze`, `silver` or `serving`) or `"*"` for
     /// a `quality_incident` rule (`DATA-14`); not read for any other kind.
     pub asset: Option<String>,
+    /// `BI-19` part C: the chart a chart alert watches (D12).
+    pub chart: Option<String>,
+    /// The series of a line, bar or combo chart the alert reads (D12).
+    pub series: Option<String>,
+    /// The dashboard filters the chart is read with (D12).
+    pub filters: Option<Vec<lakehouse_bi::filters::FilterDef>>,
+    /// `above`, `below` or `any_rows` (D11, D12).
+    pub condition: Option<String>,
+    /// Who the rule reads its data as. Never taken from a request body: the
+    /// route sets it from the signed-in person (`serde(skip)`), so a caller
+    /// cannot save a rule that reads as somebody with wider access.
+    #[serde(skip)]
+    pub owner_id: Option<String>,
 }
 
 /// The validated, normalized shape [`save_rule`] persists — split out of
@@ -575,6 +613,28 @@ fn normalize_input(input: &AlertRuleInput) -> Result<NormalizedRule, AlertError>
         normalize_asset_scoped(input, common)
     } else {
         normalize_digest(input, common)
+    }
+}
+
+/// The `BI-19` part C columns of a rule (D11, D12), kept apart from
+/// [`NormalizedRule`] because they do not depend on the rule's kind: any
+/// threshold rule may carry an owner, and only a chart rule the rest. Empty
+/// strings mean absent, like every other optional column of this table.
+#[derive(Debug, Default)]
+struct RuleExtras {
+    chart: String,
+    series: String,
+    filters_json: String,
+    condition: String,
+    owner_id: String,
+}
+
+impl RuleExtras {
+    fn of(input: &AlertRuleInput) -> Self {
+        Self {
+            owner_id: input.owner_id.clone().unwrap_or_default(),
+            ..Self::default()
+        }
     }
 }
 
@@ -1047,10 +1107,23 @@ pub async fn ensure(ch: &ChClient) -> Result<(), ChError> {
         None,
     )
     .await?;
+    // `BI-19` part C (D11, D12): the chart an alert watches and how, and the
+    // person it reads as. All additive and `IF NOT EXISTS`, like `asset` above;
+    // a rule saved before them reads back with every one absent, which is a
+    // legacy rule (it keeps `op`, and reads as the fixed viewer role).
+    for column in ["chart", "series", "filters_json", "condition", "owner_id"] {
+        ch.exec(
+            &format!(
+                "ALTER TABLE console.alert_rule ADD COLUMN IF NOT EXISTS {column} String DEFAULT ''"
+            ),
+            None,
+        )
+        .await?;
+    }
     Ok(())
 }
 
-const COLS: &str = "id,name,type,mart,measure,agg,op,threshold,board,channel,target,enabled,toString(created_at) AS created_at,severity,pipeline,metric,connector,asset";
+const COLS: &str = "id,name,type,mart,measure,agg,op,threshold,board,channel,target,enabled,toString(created_at) AS created_at,severity,pipeline,metric,connector,asset,chart,series,filters_json,condition,owner_id";
 
 fn row_str<'a>(row: &'a Map<String, Value>, key: &str) -> &'a str {
     row.get(key).and_then(Value::as_str).unwrap_or("")
@@ -1125,6 +1198,14 @@ fn row_to_rule(row: &Map<String, Value>) -> AlertRule {
         metric: non_empty(row_str(row, "metric")),
         connector: non_empty(row_str(row, "connector")),
         asset: non_empty(row_str(row, "asset")),
+        chart: non_empty(row_str(row, "chart")),
+        series: non_empty(row_str(row, "series")),
+        // A stored text that does not parse reads as no filters: the rule then
+        // watches the chart unfiltered, which `save_rule` never writes (it
+        // serialises a list it has parsed), so only a hand edit gets here.
+        filters: serde_json::from_str(row_str(row, "filters_json")).unwrap_or_default(),
+        condition: non_empty(row_str(row, "condition")),
+        owner_id: non_empty(row_str(row, "owner_id")),
     }
 }
 
@@ -1200,6 +1281,7 @@ pub async fn save_rule(
             ));
         }
     }
+    let extras = RuleExtras::of(input);
     let rid = id.map_or_else(new_rule_id, str::to_owned);
     let enabled: u8 = u8::from(input.enabled != Some(false));
     let threshold = normalized.threshold;
@@ -1210,7 +1292,7 @@ pub async fn save_rule(
     // already turns `""` back into `None` on read, so the round-trip is
     // lossless).
     let sql = format!(
-        "INSERT INTO console.alert_rule (id,name,type,mart,measure,agg,op,threshold,board,channel,target,enabled,severity,pipeline,metric,connector,asset) VALUES ({},{},{},{},{},{},{},{threshold},{},{},{},{enabled},{},{},{},{},{})",
+        "INSERT INTO console.alert_rule (id,name,type,mart,measure,agg,op,threshold,board,channel,target,enabled,severity,pipeline,metric,connector,asset,chart,series,filters_json,condition,owner_id) VALUES ({},{},{},{},{},{},{},{threshold},{},{},{},{enabled},{},{},{},{},{},{},{},{},{},{})",
         SqlLiteral::from(rid.as_str()),
         SqlLiteral::from(normalized.name.as_str()),
         SqlLiteral::from(normalized.kind.as_str()),
@@ -1226,6 +1308,11 @@ pub async fn save_rule(
         SqlLiteral::from(normalized.metric.as_str()),
         SqlLiteral::from(normalized.connector.as_str()),
         SqlLiteral::from(normalized.asset.as_str()),
+        SqlLiteral::from(extras.chart.as_str()),
+        SqlLiteral::from(extras.series.as_str()),
+        SqlLiteral::from(extras.filters_json.as_str()),
+        SqlLiteral::from(extras.condition.as_str()),
+        SqlLiteral::from(extras.owner_id.as_str()),
     );
     ch.exec(&sql, None).await?;
     match get_rule(ch, &rid).await? {
@@ -1255,6 +1342,120 @@ pub async fn delete_rule(ch: &ChClient, id: &str) -> Result<(), ChError> {
     );
     ch.exec(&sql, None).await
 }
+
+// ── Alerts that fire once (BI-19 part C, D11) ───────────────────────────
+
+/// Where a threshold rule stands between two checks (D11, feature C2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlertState {
+    /// Not over the line, or never checked: a rule without a stored state
+    /// reads as this, so the first check over the line sends once.
+    Ok,
+    /// Over the line, and the crossing was sent.
+    Firing,
+    /// The rule's owner can no longer see what it watches (or is disabled), so
+    /// the rule does not run; the stored reason says why. A rule that is
+    /// checked again is judged afresh, as `Ok` is.
+    Stopped,
+}
+
+impl AlertState {
+    /// The string stored in `alert_rule_state.state`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Firing => "firing",
+            Self::Stopped => "stopped",
+        }
+    }
+
+    /// Parse a stored state; anything but the three known words reads as
+    /// [`AlertState::Ok`] (the state a rule without a row has), never as a
+    /// reason to stay silent.
+    #[must_use]
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "firing" => Self::Firing,
+            "stopped" => Self::Stopped,
+            _ => Self::Ok,
+        }
+    }
+}
+
+/// What a check must tell the person, given the state before it and whether the
+/// value is over the line now. Called `Send` in the plan; renamed because the
+/// name would shadow the `Send` marker trait in this module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sending {
+    /// The value crossed the line: one message.
+    Crossed,
+    /// The value is back: one message.
+    Recovered,
+    /// Nothing to say (still over, or still under).
+    Nothing,
+}
+
+/// The one rule of "fires once" (D11): the state after a check and what that
+/// check sends. Pure, so the whole table is a unit test.
+///
+/// A check that errors does not call this: it records itself and changes
+/// nothing (feature C2).
+///
+/// | before            | over the line | after    | sends       |
+/// | ----------------- | ------------- | -------- | ----------- |
+/// | `Ok` / `Stopped`  | yes           | `Firing` | `Crossed`   |
+/// | `Ok` / `Stopped`  | no            | `Ok`     | `Nothing`   |
+/// | `Firing`          | yes           | `Firing` | `Nothing`   |
+/// | `Firing`          | no            | `Ok`     | `Recovered` |
+#[must_use]
+pub const fn transition(previous: AlertState, crossed: bool) -> (AlertState, Sending) {
+    match (previous, crossed) {
+        (AlertState::Ok | AlertState::Stopped, true) => (AlertState::Firing, Sending::Crossed),
+        (AlertState::Ok | AlertState::Stopped, false) => (AlertState::Ok, Sending::Nothing),
+        (AlertState::Firing, true) => (AlertState::Firing, Sending::Nothing),
+        (AlertState::Firing, false) => (AlertState::Ok, Sending::Recovered),
+    }
+}
+
+/// Where the state of each rule is kept, injected by the caller like
+/// [`SilenceSource`] so this crate stays free of Postgres. Required for a
+/// threshold rule: without it a rule cannot tell a first crossing from a
+/// repeat, and sending on every check is exactly what D11 ends, so a threshold
+/// rule is skipped with a reason when there is none.
+#[async_trait::async_trait]
+pub trait StateSource: Send + Sync {
+    /// The state of `rule_id`; [`AlertState::Ok`] when it has none.
+    ///
+    /// # Errors
+    ///
+    /// A fixed, non-leaking sentence when the state cannot be read; the rule is
+    /// then skipped, not judged.
+    async fn state_of(&self, rule_id: &str) -> Result<AlertState, String>;
+
+    /// Record a check that ran: the state after it, the number read, and the
+    /// reason when `state` is [`AlertState::Stopped`]. An implementation that
+    /// cannot write logs it itself (the caller has already sent or not sent).
+    async fn record(
+        &self,
+        rule_id: &str,
+        state: AlertState,
+        value: Option<f64>,
+        reason: Option<&str>,
+    );
+
+    /// Record a check that could not run: the time and `reason` (a fixed
+    /// sentence) move; the state and the last value do not.
+    async fn record_failed(&self, rule_id: &str, reason: &str);
+}
+
+/// The reason a rule is skipped when no [`StateSource`] was supplied.
+const STATE_UNAVAILABLE: &str = "the alert's state could not be read, so the rule was not checked (it would send on every check).";
+
+/// The reason stored when a crossing or a recovery could not be delivered: the
+/// state does not advance, so the next check sends it again.
+const NOT_DELIVERED_RETRY: &str =
+    "the message could not be delivered; it is sent again at the next check.";
 
 // ── Evaluation ──────────────────────────────────────────────────────────
 
@@ -1550,7 +1751,8 @@ pub struct RunResult {
     /// Whether it was an alert or a digest.
     #[serde(rename = "type")]
     pub kind: AlertKind,
-    /// Whether it fired (crossed threshold, or — for a digest — was sent).
+    /// Whether it fired: a threshold rule crossed its line at this check (once;
+    /// `BI-19` D11), or — for a digest — was sent.
     pub fired: bool,
     /// The observed aggregate value, for alerts.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1561,6 +1763,11 @@ pub struct RunResult {
     /// Why this rule was skipped, if evaluating it failed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skipped: Option<String>,
+    /// `BI-19` part C (D11): the value is back under the line and the recovery
+    /// message was sent (or was silenced). `fired` is then `false`: it means a
+    /// crossing was sent this check, not that the value is over the line.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub recovered: bool,
 }
 
 /// Source of dataset-freshness data for `AlertKind::Freshness` rules,
@@ -2332,6 +2539,7 @@ pub async fn run_rules(
     only: Option<&str>,
     freshness: Option<&dyn FreshnessSource>,
     silence: Option<&dyn SilenceSource>,
+    state: Option<&dyn StateSource>,
     gate: &dyn SqlGate,
 ) -> Result<Vec<RunResult>, ChError> {
     let rules: Vec<AlertRule> = list_rules(ch)
@@ -2342,7 +2550,7 @@ pub async fn run_rules(
 
     let mut out = Vec::with_capacity(rules.len());
     for rule in &rules {
-        out.push(run_one(ch, http, email, freshness, silence, gate, rule).await);
+        out.push(run_one(ch, http, email, freshness, (silence, state), gate, rule).await);
     }
     Ok(out)
 }
@@ -2352,12 +2560,12 @@ async fn run_one(
     http: &WebhookSender,
     email: &EmailSender,
     freshness: Option<&dyn FreshnessSource>,
-    silence: Option<&dyn SilenceSource>,
+    (silence, state): (Option<&dyn SilenceSource>, Option<&dyn StateSource>),
     gate: &dyn SqlGate,
     rule: &AlertRule,
 ) -> RunResult {
     match rule.kind {
-        AlertKind::Alert => run_alert(ch, http, email, silence, gate, rule).await,
+        AlertKind::Alert => run_alert(ch, (http, email), (silence, state), gate, rule).await,
         AlertKind::Digest => run_digest(ch, http, email, silence, gate, rule).await,
         AlertKind::Freshness => {
             run_freshness(freshness, http, email, silence, rule, now_millis()).await
@@ -2467,63 +2675,158 @@ async fn deliver_unless_silenced(
     )
 }
 
+/// What one check of a threshold rule read: the number, whether it is over the
+/// line, and the two sentences a message can carry. Built by whoever reads the
+/// number (the evaluator here for a mart column or a metric, the API for a chart,
+/// whose statement is built by API code) so that all of them settle through
+/// [`settle`] and fire once.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Reading {
+    /// The number read (for "returns any rows", the row count).
+    pub value: f64,
+    /// Whether it is over the line.
+    pub crossed: bool,
+    /// The message for a crossing.
+    pub breached: String,
+    /// The message for the recovery.
+    pub back: String,
+}
+
+impl Reading {
+    /// A number compared with the rule's `op` and `threshold`.
+    #[must_use]
+    pub fn against_threshold(rule: &AlertRule, watched: &str, value: f64) -> Self {
+        let line = format!("{} {}", rule.op.as_str(), fmt_id_id(rule.threshold));
+        Self {
+            value,
+            crossed: compare(value, rule.op, rule.threshold),
+            breached: format!(
+                "{watched} = {} {line} (threshold breached)",
+                fmt_id_id(value)
+            ),
+            back: format!(
+                "{watched} = {} (back within the line: no longer {line})",
+                fmt_id_id(value)
+            ),
+        }
+    }
+
+    /// "Returns any rows" (D12): over the line when `rows` is above zero.
+    #[must_use]
+    pub fn any_rows(watched: &str, rows: usize) -> Self {
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "a row count of a chart result is far below f64's exact-integer range"
+        )]
+        let value = rows as f64;
+        Self {
+            value,
+            crossed: rows > 0,
+            breached: format!("{watched} returned {rows} row(s)"),
+            back: format!("{watched} returns no rows any more"),
+        }
+    }
+}
+
+/// The reason a failed read is recorded with: a fixed sentence, never engine text
+/// (principle 4).
+fn failure_reason(err: &AlertError) -> String {
+    match err {
+        AlertError::Validation(reason) => reason.clone(),
+        AlertError::Clickhouse(_) => "the value could not be read.".to_owned(),
+    }
+}
+
+/// Settle one check of a threshold rule (`BI-19` part C, D11): decide with
+/// [`transition`] from the state before, send the message that decision calls for
+/// (or none), and record the new state.
+///
+/// A read that failed records itself and changes nothing (C2). A message that
+/// could not be delivered leaves the state where it was, so the next check sends
+/// it again rather than the crossing being lost; a message that is silenced
+/// counts as handled (a silence hides the noise, not the fact). A state that
+/// cannot be read skips the rule rather than guessing, since a guess is a repeat.
+pub async fn settle(
+    (http, email): (&WebhookSender, &EmailSender),
+    silence: Option<&dyn SilenceSource>,
+    state: Option<&dyn StateSource>,
+    rule: &AlertRule,
+    reading: Result<Reading, String>,
+) -> RunResult {
+    let reading = match reading {
+        Ok(reading) => reading,
+        Err(reason) => {
+            if let Some(state) = state {
+                state.record_failed(&rule.id, &reason).await;
+            }
+            return skipped(rule, reason);
+        }
+    };
+    let Some(state) = state else {
+        return skipped(rule, STATE_UNAVAILABLE.to_owned());
+    };
+    let previous = match state.state_of(&rule.id).await {
+        Ok(previous) => previous,
+        Err(reason) => return skipped(rule, reason),
+    };
+    let (next, sending) = transition(previous, reading.crossed);
+    let (title, text) = match sending {
+        Sending::Crossed => (format!("⚠️ Alert: {}", rule.name), Some(&reading.breached)),
+        Sending::Recovered => (
+            format!("✅ Back to normal: {}", rule.name),
+            Some(&reading.back),
+        ),
+        Sending::Nothing => (String::new(), None),
+    };
+    let delivered = match text {
+        Some(text) => deliver_unless_silenced(http, email, silence, rule, &title, text).await,
+        None => None,
+    };
+    if delivered.as_ref().is_some_and(|d| !d.ok) {
+        state.record_failed(&rule.id, NOT_DELIVERED_RETRY).await;
+    } else {
+        state
+            .record(&rule.id, next, Some(reading.value), None)
+            .await;
+    }
+    RunResult {
+        id: rule.id.clone(),
+        name: rule.name.clone(),
+        kind: rule.kind,
+        fired: sending == Sending::Crossed,
+        value: Some(reading.value),
+        delivered,
+        skipped: None,
+        recovered: sending == Sending::Recovered,
+    }
+}
+
 async fn run_alert(
     ch: &ChClient,
-    http: &WebhookSender,
-    email: &EmailSender,
-    silence: Option<&dyn SilenceSource>,
+    (http, email): (&WebhookSender, &EmailSender),
+    (silence, state): (Option<&dyn SilenceSource>, Option<&dyn StateSource>),
     gate: &dyn SqlGate,
     rule: &AlertRule,
 ) -> RunResult {
     let mart = rule.mart.as_deref().unwrap_or("");
     let measure = rule.measure.as_deref().unwrap_or("");
     // BI-2: a rule that watches a metric reads the metric, not a column.
-    let value = match rule.metric.as_deref() {
-        Some(metric) => match metric_value(ch, gate, metric).await {
-            Ok(v) => v,
-            Err(AlertError::Validation(reason)) => return skipped(rule, reason),
-            Err(AlertError::Clickhouse(_)) => {
-                return skipped(rule, "the metric could not be read.".to_owned());
-            }
-        },
-        None => match current_value(ch, gate, mart, measure, &rule.agg).await {
-            Ok(v) => v,
-            Err(err) => return skipped(rule, err.to_string()),
-        },
+    let read = match rule.metric.as_deref() {
+        Some(metric) => metric_value(ch, gate, metric).await,
+        None => current_value(ch, gate, mart, measure, &rule.agg).await,
     };
-    let fired = compare(value, rule.op, rule.threshold);
-    if !fired {
-        return RunResult {
-            id: rule.id.clone(),
-            name: rule.name.clone(),
-            kind: rule.kind,
-            fired: false,
-            value: Some(value),
-            delivered: None,
-            skipped: None,
-        };
-    }
     let watched = rule.metric.as_deref().map_or_else(
         || format!("{}({measure}) on {mart}", rule.agg),
         |m| format!("metric {m}"),
     );
-    let text = format!(
-        "{watched} = {} {} {} (threshold breached)",
-        fmt_id_id(value),
-        rule.op.as_str(),
-        fmt_id_id(rule.threshold),
-    );
-    let title = format!("⚠️ Alert: {}", rule.name);
-    let delivered = deliver_unless_silenced(http, email, silence, rule, &title, &text).await;
-    RunResult {
-        id: rule.id.clone(),
-        name: rule.name.clone(),
-        kind: rule.kind,
-        fired: true,
-        value: Some(value),
-        delivered,
-        skipped: None,
-    }
+    // BI-2 kept its own sentence for a metric that could not be read.
+    let reading = read
+        .map(|value| Reading::against_threshold(rule, &watched, value))
+        .map_err(|err| match (&err, rule.metric.is_some()) {
+            (AlertError::Clickhouse(_), true) => "the metric could not be read.".to_owned(),
+            _ => failure_reason(&err),
+        });
+    settle((http, email), silence, state, rule, reading).await
 }
 
 async fn run_digest(
@@ -2557,6 +2860,7 @@ async fn run_digest(
                 value: None,
                 delivered,
                 skipped: None,
+                recovered: false,
             }
         }
         Err(err) => skipped(rule, err.to_string()),
@@ -2621,6 +2925,7 @@ async fn run_freshness(
             value: Some(age_minutes),
             delivered: None,
             skipped: None,
+            recovered: false,
         };
     }
     let text = format!(
@@ -2636,6 +2941,7 @@ async fn run_freshness(
         value: Some(age_minutes),
         delivered,
         skipped: None,
+        recovered: false,
     }
 }
 
@@ -2648,6 +2954,7 @@ fn skipped(rule: &AlertRule, reason: String) -> RunResult {
         value: None,
         delivered: None,
         skipped: Some(reason),
+        recovered: false,
     }
 }
 
@@ -3966,6 +4273,11 @@ mod tests {
             metric: None,
             connector: None,
             asset: None,
+            chart: None,
+            series: None,
+            filters: Vec::new(),
+            condition: None,
+            owner_id: None,
         }
     }
 
@@ -4282,6 +4594,11 @@ mod tests {
             metric: Some(metric.to_owned()),
             connector: None,
             asset: None,
+            chart: None,
+            series: None,
+            filters: Vec::new(),
+            condition: None,
+            owner_id: None,
         }
     }
 
@@ -4310,7 +4627,7 @@ mod tests {
         let http = WebhookSender::new(std::sync::Arc::new(RefuseAll));
         let email = no_smtp_email_sender();
         let rule = metric_rule("gone", AlertOp::Gt, 0.0);
-        let result = run_one(&ch, &http, &email, None, None, &RewriteGate, &rule).await;
+        let result = run_one(&ch, &http, &email, None, (None, None), &RewriteGate, &rule).await;
         assert!(!result.fired);
         assert_eq!(result.value, None);
         assert_eq!(
@@ -4323,7 +4640,16 @@ mod tests {
             "default".to_owned(),
             String::new(),
         );
-        let result = run_one(&down, &http, &email, None, None, &RewriteGate, &rule).await;
+        let result = run_one(
+            &down,
+            &http,
+            &email,
+            None,
+            (None, None),
+            &RewriteGate,
+            &rule,
+        )
+        .await;
         assert!(!result.fired);
         assert_eq!(
             result.skipped.as_deref(),
@@ -4378,7 +4704,16 @@ mod tests {
             (AlertOp::Gt, 278_955.0, false),
         ] {
             let rule = metric_rule("total_visitors_demo", op, threshold);
-            let r = run_one(&ch, &http, &email, None, Some(&silence), &PassGate, &rule).await;
+            let r = run_one(
+                &ch,
+                &http,
+                &email,
+                None,
+                (Some(&silence), None),
+                &PassGate,
+                &rule,
+            )
+            .await;
             eprintln!(
                 "RULE total_visitors_demo {} {threshold} -> fired {} value {:?} skipped {:?}",
                 op.as_str(),
@@ -4391,7 +4726,16 @@ mod tests {
             assert_eq!(r.fired, expect_fired);
         }
         let gone = metric_rule("no_such_metric_here", AlertOp::Gt, 0.0);
-        let r = run_one(&ch, &http, &email, None, Some(&silence), &PassGate, &gone).await;
+        let r = run_one(
+            &ch,
+            &http,
+            &email,
+            None,
+            (Some(&silence), None),
+            &PassGate,
+            &gone,
+        )
+        .await;
         eprintln!(
             "RULE no_such_metric_here -> fired {} skipped {:?}",
             r.fired, r.skipped
@@ -4951,7 +5295,16 @@ mod tests {
         let mut rule = freshness_rule("t");
         rule.kind = AlertKind::Digest;
         rule.board = Some("b_restricted".to_owned());
-        let result = run_one(&ch, &http, &email, None, None, &RestrictedGate, &rule).await;
+        let result = run_one(
+            &ch,
+            &http,
+            &email,
+            None,
+            (None, None),
+            &RestrictedGate,
+            &rule,
+        )
+        .await;
         assert!(!result.fired);
         assert!(
             result
@@ -5516,5 +5869,339 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(matched, 0, "silenced rule must not be delivered");
+    }
+
+    // ── BI-19 part C, T11: alerts that fire once (D11) ──────────────────
+
+    /// The whole transition table of D11 / feature C2.
+    #[test]
+    fn the_transition_table_sends_once_on_crossing_and_once_on_recovery() {
+        use AlertState::{Firing, Ok, Stopped};
+        use Sending::{Crossed, Nothing, Recovered};
+        for (before, crossed, after, sends) in [
+            (Ok, true, Firing, Crossed),
+            (Ok, false, Ok, Nothing),
+            (Firing, true, Firing, Nothing),
+            (Firing, false, Ok, Recovered),
+            (Stopped, true, Firing, Crossed),
+            (Stopped, false, Ok, Nothing),
+        ] {
+            assert_eq!(
+                transition(before, crossed),
+                (after, sends),
+                "{before:?} with crossed={crossed}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stored_state_word_that_is_not_known_reads_as_ok_and_never_as_silence() {
+        for s in [AlertState::Ok, AlertState::Firing, AlertState::Stopped] {
+            assert_eq!(AlertState::parse(s.as_str()), s);
+        }
+        assert_eq!(AlertState::parse(""), AlertState::Ok);
+        assert_eq!(AlertState::parse("garbage"), AlertState::Ok);
+    }
+
+    /// A state source in memory that counts its writes.
+    #[derive(Default)]
+    struct FakeState {
+        states: std::sync::Mutex<std::collections::HashMap<String, AlertState>>,
+        failed: std::sync::Mutex<Vec<String>>,
+        unreadable: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl StateSource for FakeState {
+        async fn state_of(&self, rule_id: &str) -> Result<AlertState, String> {
+            if self.unreadable {
+                return Err("the alert's state could not be read.".to_owned());
+            }
+            Ok(self
+                .states
+                .lock()
+                .unwrap()
+                .get(rule_id)
+                .copied()
+                .unwrap_or(AlertState::Ok))
+        }
+        async fn record(
+            &self,
+            rule_id: &str,
+            state: AlertState,
+            _value: Option<f64>,
+            _reason: Option<&str>,
+        ) {
+            self.states
+                .lock()
+                .unwrap()
+                .insert(rule_id.to_owned(), state);
+        }
+        async fn record_failed(&self, _rule_id: &str, reason: &str) {
+            self.failed.lock().unwrap().push(reason.to_owned());
+        }
+    }
+
+    /// A mart rule `sum(amount) > 100` whose webhook target is `hook`.
+    fn legacy_rule(hook: &str) -> AlertRule {
+        let mut rule = freshness_rule("t");
+        rule.kind = AlertKind::Alert;
+        rule.mart = Some("mart_x".to_owned());
+        rule.measure = Some("amount".to_owned());
+        rule.op = AlertOp::Gt;
+        rule.threshold = 100.0;
+        rule.channel = AlertChannel::Webhook;
+        rule.target = format!("{hook}/hook");
+        rule
+    }
+
+    async fn engine_answering(value: f64) -> wiremock::MockServer {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": [{"name": "v", "type": "Float64"}],
+                "data": [{"v": value}],
+                "rows": 1,
+            })))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    async fn hook_receiving() -> wiremock::MockServer {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let hook = MockServer::start().await;
+        Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&hook)
+            .await;
+        hook
+    }
+
+    /// `BI-19` part C, T11: a rule that was over the line on three checks in a
+    /// row sends once, not three times (the spec's "re-fires every check").
+    #[tokio::test]
+    async fn a_legacy_rule_over_the_line_on_three_checks_sends_once() {
+        let engine = engine_answering(150.0).await;
+        let hook = hook_receiving().await;
+        let ch = ChClient::new(engine.uri(), "default".to_owned(), String::new());
+        let http = test_webhook_sender();
+        let email = no_smtp_email_sender();
+        let state = FakeState::default();
+        let rule = legacy_rule(&hook.uri());
+        let mut fired = 0;
+        for _ in 0..3 {
+            let r = run_one(
+                &ch,
+                &http,
+                &email,
+                None,
+                (None, Some(&state)),
+                &PassGate,
+                &rule,
+            )
+            .await;
+            assert_eq!(r.skipped, None);
+            assert_eq!(r.value, Some(150.0));
+            fired += usize::from(r.fired);
+        }
+        assert_eq!(fired, 1);
+        assert_eq!(hook.received_requests().await.unwrap().len(), 1);
+        assert_eq!(state.states.lock().unwrap()["al_1"], AlertState::Firing);
+    }
+
+    /// And once more when it is back: firing, firing, back, back is two messages.
+    #[tokio::test]
+    async fn the_value_coming_back_sends_one_recovery_and_then_nothing() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let hook = hook_receiving().await;
+        let http = test_webhook_sender();
+        let email = no_smtp_email_sender();
+        let state = FakeState::default();
+        let rule = legacy_rule(&hook.uri());
+        let mut recoveries = 0;
+        for value in [150.0, 160.0, 40.0, 30.0] {
+            let engine = MockServer::start().await;
+            Mock::given(wiremock::matchers::any())
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "meta": [{"name": "v", "type": "Float64"}],
+                    "data": [{"v": value}],
+                    "rows": 1,
+                })))
+                .mount(&engine)
+                .await;
+            let ch = ChClient::new(engine.uri(), "default".to_owned(), String::new());
+            let r = run_one(
+                &ch,
+                &http,
+                &email,
+                None,
+                (None, Some(&state)),
+                &PassGate,
+                &rule,
+            )
+            .await;
+            recoveries += usize::from(r.recovered);
+            assert!(!(r.fired && r.recovered));
+        }
+        assert_eq!(recoveries, 1);
+        let bodies: Vec<String> = hook
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+        assert_eq!(bodies.len(), 2, "{bodies:?}");
+        assert!(bodies[0].contains("Alert:"), "{}", bodies[0]);
+        assert!(bodies[1].contains("Back to normal"), "{}", bodies[1]);
+        assert_eq!(state.states.lock().unwrap()["al_1"], AlertState::Ok);
+    }
+
+    /// A check that errors changes nothing: the rule stays `firing`, so the check
+    /// after it does not send the crossing a second time.
+    #[tokio::test]
+    async fn a_check_that_errors_records_itself_and_changes_nothing() {
+        let hook = hook_receiving().await;
+        let http = test_webhook_sender();
+        let email = no_smtp_email_sender();
+        let state = FakeState::default();
+        state
+            .states
+            .lock()
+            .unwrap()
+            .insert("al_1".to_owned(), AlertState::Firing);
+        let down = ChClient::new(
+            "http://127.0.0.1:1".to_owned(),
+            "default".to_owned(),
+            String::new(),
+        );
+        let rule = legacy_rule(&hook.uri());
+        let r = run_one(
+            &down,
+            &http,
+            &email,
+            None,
+            (None, Some(&state)),
+            &PassGate,
+            &rule,
+        )
+        .await;
+        assert_eq!(r.skipped.as_deref(), Some("the value could not be read."));
+        assert!(!r.fired && !r.recovered);
+        assert_eq!(state.states.lock().unwrap()["al_1"], AlertState::Firing);
+        assert_eq!(
+            *state.failed.lock().unwrap(),
+            ["the value could not be read."]
+        );
+        assert!(hook.received_requests().await.unwrap().is_empty());
+        // Still over the line afterwards: nothing is sent, it was already told.
+        let engine = engine_answering(150.0).await;
+        let ch = ChClient::new(engine.uri(), "default".to_owned(), String::new());
+        let r = run_one(
+            &ch,
+            &http,
+            &email,
+            None,
+            (None, Some(&state)),
+            &PassGate,
+            &rule,
+        )
+        .await;
+        assert!(!r.fired);
+        assert!(hook.received_requests().await.unwrap().is_empty());
+    }
+
+    /// Fail closed: with no way to read the state the rule is not checked, since
+    /// it would send on every check.
+    #[tokio::test]
+    async fn a_threshold_rule_with_no_readable_state_is_skipped_not_sent() {
+        let engine = engine_answering(150.0).await;
+        let hook = hook_receiving().await;
+        let ch = ChClient::new(engine.uri(), "default".to_owned(), String::new());
+        let http = test_webhook_sender();
+        let email = no_smtp_email_sender();
+        let rule = legacy_rule(&hook.uri());
+        let none = run_one(&ch, &http, &email, None, (None, None), &PassGate, &rule).await;
+        assert_eq!(none.skipped.as_deref(), Some(STATE_UNAVAILABLE));
+        let broken = FakeState {
+            unreadable: true,
+            ..FakeState::default()
+        };
+        let r = run_one(
+            &ch,
+            &http,
+            &email,
+            None,
+            (None, Some(&broken)),
+            &PassGate,
+            &rule,
+        )
+        .await;
+        assert_eq!(
+            r.skipped.as_deref(),
+            Some("the alert's state could not be read.")
+        );
+        assert!(hook.received_requests().await.unwrap().is_empty());
+    }
+
+    /// A crossing the webhook refused is not lost: the state stays `ok`, so the
+    /// next check sends it again.
+    #[tokio::test]
+    async fn a_crossing_that_could_not_be_delivered_is_sent_again_at_the_next_check() {
+        let engine = engine_answering(150.0).await;
+        let ch = ChClient::new(engine.uri(), "default".to_owned(), String::new());
+        let http = WebhookSender::new(std::sync::Arc::new(RefuseAll));
+        let email = no_smtp_email_sender();
+        let state = FakeState::default();
+        let rule = legacy_rule("http://hooks.test");
+        let r = run_one(
+            &ch,
+            &http,
+            &email,
+            None,
+            (None, Some(&state)),
+            &PassGate,
+            &rule,
+        )
+        .await;
+        assert!(r.fired);
+        assert!(r.delivered.is_some_and(|d| !d.ok));
+        assert!(state.states.lock().unwrap().get("al_1").is_none());
+        assert_eq!(*state.failed.lock().unwrap(), [NOT_DELIVERED_RETRY]);
+    }
+
+    /// `ensure` widens the table with additive statements only (D11): every new
+    /// column is `ADD COLUMN IF NOT EXISTS`, and nothing is dropped or modified.
+    #[tokio::test]
+    async fn ensure_sends_only_additive_alters_for_the_part_c_columns() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        ensure(&ch).await.unwrap();
+        let sent: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+        for column in ["chart", "series", "filters_json", "condition", "owner_id"] {
+            assert!(
+                sent.iter().any(|q| q.contains(&format!(
+                    "ALTER TABLE console.alert_rule ADD COLUMN IF NOT EXISTS {column} String DEFAULT ''"
+                ))),
+                "no additive statement for {column}"
+            );
+        }
+        for q in sent.iter().filter(|q| q.contains("ALTER")) {
+            assert!(q.contains("ADD COLUMN IF NOT EXISTS"), "{q}");
+            assert!(!q.contains("DROP") && !q.contains("MODIFY"), "{q}");
+        }
     }
 }
