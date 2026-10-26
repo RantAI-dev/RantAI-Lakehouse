@@ -80,6 +80,7 @@ Each default was the planner's recommendation.
   - Avro and zip files at large sizes;
   - any machine other than that runner.
 - A zip may not hold a Parquet file (decision 13; `DATA-28`).
+- An Avro file must be **uncompressed** (the null codec). A compressed container is refused, on both sides, with "This Avro file is compressed. Save it with no compression.": the Avro readers inflate a whole block with no limit on the output (apache-avro 0.21 in the API, fastavro 1.13.1 in the job), so a few MB of a compressed file of zeros would ask for gigabytes of memory. Uncompressed Avro files are the norm for an upload (`PR #186 review BLOCKER 1`).
 - An upload continues after a dropped connection only while its page stays open.
 - Several files load into one table only when their columns match.
 - Nested JSON and Avro values are kept as JSON text, not spread into columns.
@@ -92,7 +93,7 @@ Against `docs/core/specs/data-17.md`, as built in #186. "Met" means built and co
 
 | Spec row | Target | Result |
 | --- | --- | --- |
-| Formats | CSV, TSV, JSON, JSON Lines, Avro, Parquet, Excel (one sheet) | Met. JSON is a top-level array of objects (decision 11); Avro is an object container file whose top level is a record, with no codec or the deflate codec |
+| Formats | CSV, TSV, JSON, JSON Lines, Avro, Parquet, Excel (one sheet) | Met. JSON is a top-level array of objects (decision 11); Avro is an object container file whose top level is a record and which is uncompressed (the null codec: a compressed container is refused, see the limits above) |
 | Files per upload | Up to 10, in parallel | Met. Up to 10; up to 4 pieces in flight per user (decision 6) |
 | Size | Up to 2 GB, memory measured in a RESULT document | Met for one load at a time, see the limits above and `docs/plans/DATA-17-RESULT.md`. Time was not a target; it grew by 30 to 60 percent with the streaming fix |
 | Upload method | Resumable chunks, a progress bar per file | Met, with the reach of decision 7: resuming works while the page stays open |

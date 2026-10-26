@@ -19,8 +19,11 @@
 //!   shortest form (the load keeps the digits the source wrote, `1.50`; this is the only
 //!   difference), a missing key or `null` as empty, and a nested object or array as compact
 //!   JSON text with its keys in the source's order (decision 11: no child tables).
-//! - **Avro** is an object container file whose top-level type is a record, compressed with
-//!   no codec or `deflate` (the job's reader needs nothing else installed). A field that is
+//! - **Avro** is an object container file whose top-level type is a record, and it must be
+//!   **uncompressed** (the null codec): `PR #186 review BLOCKER 1`. A compressed container
+//!   is refused, because both readers inflate a whole block with no limit on the output
+//!   (apache-avro 0.21 and fastavro 1.13.1 both hand the inflated block over whole), so a
+//!   few MB of zeros becomes gigabytes in the API and in the job. A field that is
 //!   a union with null may be empty; a record, array or map is JSON text (a map's keys are
 //!   sorted here and in the file's order in the load); `bytes` and `fixed` columns, which
 //!   have no text form, are refused, as a binary Parquet column is. The schema's own types
@@ -232,10 +235,13 @@ pub enum Refusal {
     /// An Avro column with no text form.
     #[error("An Avro column holds binary data, which cannot be loaded.")]
     AvroBinary,
-    /// An Avro codec the job does not read.
-    #[error(
-        "This Avro file uses a compression this upload does not read. Save it with no compression or with deflate."
-    )]
+    /// An Avro codec the upload does not read.
+    ///
+    /// `PR #186 review BLOCKER 1`: only the null codec is read, on both sides. A
+    /// compressed container is refused, because the readers inflate a whole block with no
+    /// limit on the output (apache-avro 0.21 and fastavro 1.13.1), so a small file of
+    /// zeros becomes gigabytes of memory.
+    #[error("This Avro file is compressed. Save it with no compression.")]
     AvroCodec,
 }
 
@@ -738,9 +744,10 @@ mod avro {
 ///
 /// # Errors
 ///
-/// [`Refusal`] for bytes that are not an Avro container, a codec the job does not read, a
-/// top-level type that is not a record, a binary column, no records, and more than
-/// [`crate::upload_parse::MAX_COLUMNS`] fields.
+/// [`Refusal`] for bytes that are not an Avro container, a codec the upload does not read
+/// (`PR #186 review BLOCKER 1`: only the null codec is read, because a compressed block is
+/// inflated whole and without a limit), a top-level type that is not a record, a binary
+/// column, no records, and more than [`crate::upload_parse::MAX_COLUMNS`] fields.
 pub fn read_avro(
     bytes: &[u8],
     head_is_truncated: bool,
@@ -751,10 +758,12 @@ pub fn read_avro(
     if !bytes.starts_with(b"Obj\x01") {
         return Err(Refusal::AvroInvalid);
     }
-    if !matches!(
-        avro_codec(bytes)?.as_deref(),
-        None | Some("null" | "deflate")
-    ) {
+    // `PR #186 review BLOCKER 1`: the null codec only. apache-avro 0.21 inflates a deflate
+    // block with `miniz_oxide::inflate::decompress_to_vec`, which has no limit on the
+    // output, so a 16 MiB head of a deflate file can ask for gigabytes of memory in the
+    // API. The job's reader (fastavro) inflates the same way, so the file is refused on
+    // both sides rather than read on one and refused on the other.
+    if !matches!(avro_codec(bytes)?.as_deref(), None | Some("null")) {
         return Err(Refusal::AvroCodec);
     }
     let reader = Reader::new(bytes).map_err(|_err| Refusal::AvroInvalid)?;
@@ -1239,33 +1248,73 @@ mod tests {
         out
     }
 
+    /// A zig-zag varint, as an Avro block header writes a count or a size.
+    fn zigzag_varint(value: u64) -> Vec<u8> {
+        let mut raw = value << 1;
+        let mut out = Vec::new();
+        loop {
+            let byte = u8::try_from(raw & 0x7f).unwrap();
+            raw >>= 7;
+            if raw == 0 {
+                out.push(byte);
+                return out;
+            }
+            out.push(byte | 0x80);
+        }
+    }
+
+    /// A deflate Avro container: the header names the codec, and its one block inflates to
+    /// a megabyte of zeros out of a few hundred bytes (`PR #186 review BLOCKER 1`).
+    fn deflate_avro() -> Vec<u8> {
+        let mut out = avro_header("deflate");
+        let mut encoder =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&vec![0u8; 1024 * 1024]).unwrap();
+        let compressed = encoder.finish().unwrap();
+        out.push(2); // one object
+        out.extend_from_slice(&zigzag_varint(u64::try_from(compressed.len()).unwrap()));
+        out.extend_from_slice(&compressed);
+        out.extend_from_slice(&[7u8; 16]); // the sync marker again
+        out
+    }
+
     #[test]
-    fn avro_that_is_not_readable_is_refused_and_only_the_codecs_the_job_reads_are_accepted() {
+    fn avro_that_is_not_readable_is_refused_and_only_the_null_codec_is_accepted() {
         assert_eq!(
             read_avro(b"hello", false, 10).unwrap_err(),
             Refusal::AvroInvalid
         );
         assert_eq!(read_avro(b"", false, 10).unwrap_err(), Refusal::AvroInvalid);
-        for codec in ["snappy", "zstandard", "bzip2", "xz"] {
+        // `PR #186 review BLOCKER 1`: deflate is refused with the rest, because the readers
+        // inflate a whole block with no limit on the output.
+        for codec in ["snappy", "zstandard", "bzip2", "xz", "deflate"] {
             assert_eq!(
                 read_avro(&avro_header(codec), false, 10).unwrap_err(),
                 Refusal::AvroCodec,
                 "{codec}"
             );
         }
-        // A codec the job reads gets to the next check: this header's schema is not a record.
-        for codec in ["null", "deflate"] {
-            assert_eq!(
-                read_avro(&avro_header(codec), false, 10).unwrap_err(),
-                Refusal::AvroNotRecord,
-                "{codec}"
-            );
-        }
+        // The codec the upload reads gets to the next check: this header's schema is not a
+        // record.
+        assert_eq!(
+            read_avro(&avro_header("null"), false, 10).unwrap_err(),
+            Refusal::AvroNotRecord
+        );
         assert_eq!(
             avro_codec(&fixture("orders.avro")).unwrap().as_deref(),
             Some("null"),
             "fastavro writes the null codec by name"
         );
+    }
+
+    #[test]
+    fn pr_186_review_blocker_1_a_deflate_avro_is_refused_and_never_inflated() {
+        let file = deflate_avro();
+        assert!(
+            file.len() < 8 * 1024,
+            "the file is a few KiB; its block would inflate to a megabyte"
+        );
+        assert_eq!(read_avro(&file, false, 10).unwrap_err(), Refusal::AvroCodec);
     }
 
     #[test]
