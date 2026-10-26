@@ -145,6 +145,19 @@ export type DashboardService = {
   /** End the link at once. */
   endPublicLink(board: string, signal?: AbortSignal): Promise<void>
   /**
+   * `BI-19` part E: comments on a dashboard. Needs view on it; a dashboard the
+   * caller cannot see answers like one that does not exist. Refusals arrive as
+   * the server's sentence.
+   */
+  listComments(board: string, signal?: AbortSignal): Promise<DashboardComment[]>
+  postComment(input: CommentInput, signal?: AbortSignal): Promise<DashboardComment>
+  /** Author only. `mentions` omitted keeps the people already mentioned. */
+  editComment(id: string, body: string, mentions?: string[], signal?: AbortSignal): Promise<DashboardComment>
+  /** Author, or somebody who manages the dashboard. */
+  deleteComment(id: string, signal?: AbortSignal): Promise<void>
+  /** The @ picker: people who can see the dashboard (no addresses). */
+  commentPeople(board: string, query: string, signal?: AbortSignal): Promise<CommentPerson[]>
+  /**
    * `BI-19` part B: who has what on a dashboard or folder. Needs manage on the
    * item; anything else arrives as the server's sentence (403 for one the
    * caller can see and does not manage, 404 for one they cannot see).
@@ -539,3 +552,28 @@ export type ChartLineage = {
   coverage: string[]
   supported: boolean
 }
+
+/** A comment as the server returns it (`BI-19` part E). `body` is plain text. */
+export type DashboardComment = {
+  id: string
+  board: string
+  /** `null` once the author's account is gone. */
+  author: { id: string; name: string } | null
+  body: string
+  createdAt: string
+  editedAt: string | null
+  mentions: { id: string; name: string }[]
+  /** Only the author edits. */
+  canEdit: boolean
+  /** The author, or somebody who manages the dashboard. */
+  canDelete: boolean
+}
+
+export type CommentInput = {
+  board: string
+  body: string
+  /** User ids; each must be able to see the dashboard or the server refuses. */
+  mentions: string[]
+}
+
+export type CommentPerson = { id: string; name: string }

@@ -3,7 +3,7 @@
 import * as React from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { useTheme } from "next-themes";
-import { ArrowRightLeft, Bell, ChartColumn, Download, GitFork, ImageDown, Heading, Maximize2, Minus, MousePointerClick, Move, Moon, Pencil, Plus, RefreshCw, Smartphone, SlidersHorizontal, Sparkles, Square, Table2, Trash2, Rows3 } from "lucide-react";
+import { ArrowRightLeft, Bell, MessageSquare, ChartColumn, Download, GitFork, ImageDown, Heading, Maximize2, Minus, MousePointerClick, Move, Moon, Pencil, Plus, RefreshCw, Smartphone, SlidersHorizontal, Sparkles, Square, Table2, Trash2, Rows3 } from "lucide-react";
 import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog";
 import { PageHeader } from "@/components/patterns/page-header";
 import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@rantai/design-system/ui/empty";
@@ -77,6 +77,7 @@ import type { RecordsRequest } from "./records";
 import { forgetLastBoard, rememberLastBoard } from "./last-board";
 import { offerFor } from "./access-level";
 import { ShareDialog } from "./share-dialog";
+import { CommentsDialog } from "./comments-panel";
 import { TileBody } from "./tile-body";
 import { exportNotice } from "./table-export";
 import { downloadChartData, downloadChartPng, downloadDashboardFile, downloadDashboardPdf, downloadMenuKind, type DataChoice, type PdfChoice, type ReadState } from "./chart-download";
@@ -239,6 +240,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   const foldersState = useService((signal) => dashboardService.listFolders(signal), []);
   const folders = React.useMemo(() => labelledFolders(foldersState.data ?? [], user?.id), [foldersState.data, user?.id]);
   const [shareOpen, setShareOpen] = React.useState(false);
+  const [commentsOpen, setCommentsOpen] = React.useState(false);
   const [historyOpen, setHistoryOpen] = React.useState(false);
   // BI-18 part C, part 2: favourites, and "recent" noted once per dashboard opened.
   const shortcuts = useService((signal) => dashboardService.shortcuts(signal), []);
@@ -1226,6 +1228,12 @@ export function DashboardPage({ boardId }: { boardId: string }) {
               onDuplicate={() => void duplicateDashboard()}
               onDelete={() => void deleteDashboard()}
             />
+            {/* BI-19 part E: anyone who can see the dashboard can read and write comments; the server checks. */}
+            {!isDefault ? (
+              <Button size="sm" variant="outline" onClick={() => setCommentsOpen(true)}>
+                <MessageSquare className="size-4" /> Comments
+              </Button>
+            ) : null}
             {hasPermission("dashboard:write") ? (
               <Button size="sm" variant="outline" onClick={() => setParamsOpen(true)}>
                 <SlidersHorizontal className="size-4" /> Parameters
@@ -1454,6 +1462,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
           onReverted={() => { notifyDashboardsChanged(); void load(); }}
         />
       ) : null}
+      {!isDefault ? <CommentsDialog board={board} dashName={dashName} open={commentsOpen} onOpenChange={setCommentsOpen} /> : null}
       {!isDefault ? <ShareDialog board={board} dashName={dashName} open={shareOpen && canManage} onOpenChange={setShareOpen} /> : null}
       {themeOpen ? (
         <ThemeFontDialog open={themeOpen} onOpenChange={setThemeOpen} theme={data?.theme} font={data?.font}

@@ -17,7 +17,7 @@ import type {
   VersionHistory,
 } from "../contracts/dashboards"
 import type {
-  EmbedInfo, GranteeMatches, ItemAccess, MoveEffect, PublicLink, PublicLinkState,
+  CommentPerson, DashboardComment, EmbedInfo, GranteeMatches, ItemAccess, MoveEffect, PublicLink, PublicLinkState,
 } from "../contracts/dashboards"
 import { apiFetch } from "../http"
 import { ServiceError, type ServiceErrorCode } from "../errors"
@@ -314,6 +314,48 @@ export const clickhouseDashboardService: DashboardService = {
       signal,
     })
     await checkedWrite<{ ok: boolean }>(res)
+  },
+  // BI-19 part E. The server's sentences are ours, so they are shown as they come.
+  async listComments(board, signal) {
+    const json = await request<{ comments?: DashboardComment[] }>(
+      `/api/dashboard/comments?board=${encodeURIComponent(board)}`,
+      { cache: "no-store", signal },
+      "The comments could not be loaded"
+    )
+    return json.comments ?? []
+  },
+  async postComment(input, signal) {
+    const res = await apiFetch("/api/dashboard/comments", {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify(input),
+      signal,
+    })
+    return await checkedWrite<DashboardComment>(res)
+  },
+  async editComment(id, body, mentions, signal) {
+    const res = await apiFetch(`/api/dashboard/comments/${encodeURIComponent(id)}`, {
+      method: "PUT",
+      headers: JSON_HEADERS,
+      body: JSON.stringify(mentions === undefined ? { body } : { body, mentions }),
+      signal,
+    })
+    return await checkedWrite<DashboardComment>(res)
+  },
+  async deleteComment(id, signal) {
+    const res = await apiFetch(`/api/dashboard/comments/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+      signal,
+    })
+    await checkedWrite<{ ok: boolean }>(res)
+  },
+  async commentPeople(board, query, signal) {
+    const json = await request<{ items?: CommentPerson[] }>(
+      `/api/dashboard/comments/people?board=${encodeURIComponent(board)}&q=${encodeURIComponent(query)}`,
+      { cache: "no-store", signal },
+      "The people could not be loaded"
+    )
+    return json.items ?? []
   },
   // BI-19 part B. The server's sentences are ours, so they are shown as they come.
   async getAccess(kind, id, signal) {

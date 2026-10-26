@@ -50,7 +50,15 @@ export function AppNavbar() {
   const hasNotifications =
     notifications.status === "success" &&
     notifications.data.supported &&
-    (notifications.data.openAlerts.length > 0 || notifications.data.pendingApprovals.length > 0)
+    (notifications.data.openAlerts.length > 0 ||
+      notifications.data.pendingApprovals.length > 0 ||
+      (notifications.data.unreadMentions ?? []).length > 0)
+  // BI-19 part E: unread @mentions in dashboard comments, each a real line the
+  // reader can open. Empty when none, or when the deployment cannot say.
+  const mentions =
+    notifications.status === "success" && notifications.data.supported
+      ? (notifications.data.unreadMentions ?? [])
+      : []
 
   return (
     <header
@@ -133,20 +141,53 @@ export function AppNavbar() {
               <Sparkles className="size-4" />
             </Button>
           )}
-          <Button
-            variant="ghost"
-            size="icon"
-            className="relative size-9 rounded-lg text-muted-foreground hover:bg-muted hover:text-foreground"
-            aria-label="Notifications"
-            render={
-              <Link href="/alerts">
+          {mentions.length > 0 ? (
+            <DropdownMenu>
+              <DropdownMenuTrigger
+                render={
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="relative size-9 rounded-lg text-muted-foreground hover:bg-muted hover:text-foreground"
+                    aria-label="Notifications"
+                  />
+                }
+              >
                 <Bell className="size-4" />
-                {hasNotifications ? (
-                  <span className="absolute right-2 top-2 size-1.5 rounded-full bg-primary ring-2 ring-background" />
-                ) : null}
-              </Link>
-            }
-          />
+                <span className="absolute right-2 top-2 size-1.5 rounded-full bg-primary ring-2 ring-background" />
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end">
+                {mentions.map((m) => (
+                  <DropdownMenuItem key={m.id} render={<Link href={`/dashboards/${encodeURIComponent(m.board)}`} />}>
+                    {m.title}
+                  </DropdownMenuItem>
+                ))}
+                <DropdownMenuItem
+                  onClick={() => {
+                    void notificationsService.markMentionsRead().then(() => notifications.reload()).catch(() => undefined)
+                  }}
+                >
+                  Mark mentions as read
+                </DropdownMenuItem>
+                <DropdownMenuItem render={<Link href="/alerts" />}>Alerts and approvals</DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          ) : (
+            <Button
+              variant="ghost"
+              size="icon"
+              className="relative size-9 rounded-lg text-muted-foreground hover:bg-muted hover:text-foreground"
+              aria-label="Notifications"
+              render={
+                <Link href="/alerts">
+                  <Bell className="size-4" />
+                  {hasNotifications ? (
+                    <span className="absolute right-2 top-2 size-1.5 rounded-full bg-primary ring-2 ring-background" />
+                  ) : null}
+                </Link>
+              }
+            />
+          )}
           <UserMenu userName={user?.name} userEmail={user?.email} onLogout={logout} />
         </div>
       </div>

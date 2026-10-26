@@ -28,14 +28,32 @@ export type PendingApprovalNotification = {
   requestedAt: string
 }
 
+/**
+ * `BI-19` part E: an unread @mention in a dashboard comment. Unlike the two
+ * lists above these do have a read cursor, so "unread" is true. The title is
+ * built from the live dashboard and never carries the comment's text.
+ */
+export type MentionNotification = {
+  /** The comment's id. */
+  id: string
+  board: string
+  title: string
+  at: string
+}
+
 export type Notifications =
   | {
       supported: true
       openAlerts: OpenAlertNotification[]
       pendingApprovals: PendingApprovalNotification[]
+      unreadMentions?: MentionNotification[]
+      /** A sentence when the mentions could not be read (never an empty list passed off as none). */
+      unreadMentionsUnavailable?: string | null
     }
   | { supported: false; reason: string }
 
 export interface NotificationsService {
   list(signal?: AbortSignal): Promise<Notifications>
+  /** Mark every unread mention of the caller as read. */
+  markMentionsRead(signal?: AbortSignal): Promise<void>
 }
