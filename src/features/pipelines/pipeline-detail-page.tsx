@@ -202,6 +202,15 @@ export function PipelineDetailPage() {
   const [now, setNow] = React.useState(() => Date.now())
   const fastUntil = React.useRef(0)
   const reloadRuns = runsState.reload
+  // BLD-8: this effect re-arms the poll timer, so its dependencies decide
+  // whether a live run's list ever refreshes again. `runsStatus` (not
+  // `runsState`) is deliberate: `useService` returns a fresh object on
+  // every render, and while a run is live the `now` interval below renders
+  // the page once a second -- with the whole object here, each tick cleared
+  // and re-armed the timeout, it never fired, and a run that had ended
+  // stayed "Running" until a manual reload. `runsStatus` changes only when
+  // a reload actually starts or finishes, so the timer survives a tick.
+  const runsStatus = runsState.status
   React.useEffect(() => {
     const fast = anyLive || Date.now() < fastUntil.current
     const t = setTimeout(
@@ -212,7 +221,7 @@ export function PipelineDetailPage() {
       fast ? LIVE_POLL_MS : IDLE_POLL_MS
     )
     return () => clearTimeout(t)
-  }, [anyLive, reloadRuns, runsState])
+  }, [anyLive, reloadRuns, runsStatus])
   // A live run's clock ticks every second; the rest of the page does not need it.
   React.useEffect(() => {
     if (!anyLive) return

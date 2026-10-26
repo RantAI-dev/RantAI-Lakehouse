@@ -37,6 +37,39 @@ The assistant's `create_pipeline` can name an uploaded table as its source
 once the builder can; no new tool. AI work for the Data module is the AI
 team's (`AI-16`).
 
+## A connector's tables feed pipelines
+
+This page is the closest one for `BLD-7`, `BLD-8` and `BLD-9` (a connector's
+tables feeding a pipeline, the same way an upload does).
+
+A connector on a pipeline says **where the pipeline's data came from** — it is
+never a second way to read the source (`DEC-15`). So:
+
+- *Create pipeline* on a connector's page opens the form with the source zone
+  fixed to `bronze` and *Source table* listing that connector's ingest targets
+  (the tables its ingest job actually wrote). Creating or editing a pipeline
+  with a connector and any other table is refused, with one sentence that names
+  the tables to pick; a connector that has not loaded anything yet says to run
+  its ingest first.
+- The pipeline runs after that table's load: `ingest_job` is in `dependsOn`, on
+  by default (the form shows a switch and the user may turn it off). The sensor
+  counts only the ingest runs that loaded this pipeline's own Bronze table, so
+  another connector's load does not start it. (`BLD-4`.)
+- Editing a pipeline can change or clear its connector; *No connector* is a
+  real choice and clears the stored one. (`BLD-9`.)
+- A failed run shows the reason our own code raised (`config rejected: …`,
+  `refused: …`). Any other engine or driver text is not shown as the reason:
+  the page says "The run failed; see the run log" and the log is one click
+  away. (`BLD-8`.)
+
+Limits worth saying out loud:
+
+- There is no direct read from a source into Silver. A pipeline with a
+  connector reads one of that connector's Bronze tables, and nothing else.
+- A pipeline stored before this rule (a connector on a non-Bronze source) fails
+  its run with a fixed message that says to edit it; it is never run against
+  the source directly.
+
 ## Decisions
 
 | # | Decision | Default | Signed |

@@ -636,7 +636,7 @@ mod tests {
             matches_focus(&g, "gold.mart_visits"),
             vec!["iceberg:gold.mart_visits".to_owned()]
         );
-        assert!(matches_focus(&g, "nothing").is_empty());
+        assert_eq!(matches_focus(&g, "nothing"), [] as [std::string::String; 0]);
     }
 
     #[test]

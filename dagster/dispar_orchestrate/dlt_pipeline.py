@@ -61,6 +61,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+from dagster import Failure
 from dlt.sources.sql_database import sql_database
 
 from dispar_orchestrate import schema_observer, ssrf_guard
@@ -70,6 +71,23 @@ from dispar_orchestrate.adapters.sink import LoadPlan, SinkConfig, load_via_sink
 def _env(name: str, default: str) -> str:
     value = os.environ.get(name, "").strip()
     return value if value else default
+
+
+def _required_env(name: str) -> str:
+    """Read `name`, failing the run when it is unset or empty.
+
+    `SEC-37`: this module used to fall back to the literal `rustfsadmin` for
+    the two S3 credentials. A credential written into the code is one an
+    operator never chose (`AGENTS.md` rule 5), and compose always sets these
+    two on `dagster-code-location` now, so a missing value is a
+    misconfiguration: name the variable and fail the run (`Failure` for a
+    config problem, so the retry policy does not burn attempts on it),
+    rather than dial someone's object store with a guessed key.
+    """
+    value = _env(name, "")
+    if not value:
+        raise Failure(f"{name} must be set (SEC-37: no default credentials in code)")
+    return value
 
 
 @dataclass(frozen=True)
@@ -109,12 +127,16 @@ class BronzeIngestConfig:
     # warehouse bucket's `bronze/` prefix, so it does not need root. Read
     # the connector-scoped names instead (`CONNECTOR_S3_ACCESS_KEY`/
     # `CONNECTOR_S3_SECRET_KEY` — see docker-compose.yml's
-    # `dagster-code-location` env block for why these still default to
-    # the RustFS root key today: this stack's RustFS version has no
+    # `dagster-code-location` env block, where compose points them at the
+    # RustFS root key because this stack's RustFS version has no
     # non-proprietary-admin-API way to mint a narrower S3 identity, and
     # this project's locked decision is "plain S3 API only, never a
     # store's proprietary admin call" — see the `rustfs` service's own
-    # comment in docker-compose.yml). A deployment that CAN provision a
+    # comment in docker-compose.yml). `SEC-37`: the fallback that used to
+    # live HERE (`_env(..., "rustfsadmin")`) is gone — the two vars are
+    # required (`_required_env`), so a run outside compose cannot silently
+    # dial the object store with a credential written in the repository.
+    # A deployment that CAN provision a
     # least-privilege RustFS/S3 identity only needs to point these two
     # vars at it; no code change here.
     rustfs_access_key: str
@@ -152,8 +174,8 @@ class BronzeIngestConfig:
             ),
             lakekeeper_warehouse=_env("LAKEKEEPER_WAREHOUSE", "default"),
             rustfs_endpoint=_env("CH_RUSTFS_S3_ENDPOINT", "http://rustfs:9000"),
-            rustfs_access_key=_env("CONNECTOR_S3_ACCESS_KEY", "rustfsadmin"),
-            rustfs_secret_key=_env("CONNECTOR_S3_SECRET_KEY", "rustfsadmin"),
+            rustfs_access_key=_required_env("CONNECTOR_S3_ACCESS_KEY"),
+            rustfs_secret_key=_required_env("CONNECTOR_S3_SECRET_KEY"),
             warehouse_bucket=_env("LAKEHOUSE_WAREHOUSE_BUCKET", "lakehouse-warehouse"),
             lakekeeper_token=lakekeeper_token,
         )

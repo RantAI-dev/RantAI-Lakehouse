@@ -2,10 +2,11 @@
 
 No network: every test calls pure functions or a fake session. The seams are
 the functions the harness runs in order: `run_case` (one case, its turns, its
-setup and its cleanup), `pass_rule` and `verdict` (how runs become a case and
-a set), `confirm_body` (the request the console sends), `cleanup_plan` (what
-the `finally` deletes), `expect_state_problems` (the state check), and `main`
-(the exit codes).
+setup and its cleanup), `run_setup` (the objects a case makes), `pass_rule`
+and `verdict` (how runs become a case and a set), `confirm_body` (the request
+the console sends), `cleanup_plan` (what the `finally` deletes),
+`expect_state_problems` (the state check), `looks_indonesian` (which language
+an answer is in), and `main` (the exit codes).
 
 The 28 existing cases must score as they did before the dashboard features:
 `test_existing_cases_rescore_to_the_numbers_recorded_before` replays a saved
@@ -503,6 +504,40 @@ class SetupTests(unittest.TestCase):
         cfg = make_cfg()
         session = FakeSession({("POST", "/api/dashboard/specs"): FakeResponse(400, {"error": "bad"})})
         setup = [{"name": "c", "method": "POST", "path": "/api/dashboard/specs", "body": {}, "id_at": "chart.id"}]
+        with self.assertRaises(m.SetupError):
+            m.run_setup(cfg, session, setup)
+
+    def test_a_setup_call_without_an_id_at_saves_no_name_and_nothing_to_delete(self) -> None:
+        # A call that only changes what an earlier call made (the tabs of a
+        # board) replies without an id: it saves no name, and the cleanup must
+        # not delete the object the earlier call created a second time.
+        cfg = make_cfg()
+        session = FakeSession({
+            ("POST", "/api/dashboard/boards"): {"board": {"id": "b-1"}},
+            ("POST", "/api/dashboard/specs"): {"chart": {"id": "c-1"}},
+            ("PUT", "/api/dashboard/boards"): {"ok": True},
+        })
+        setup = [
+            {"name": "board", "method": "POST", "path": "/api/dashboard/boards", "body": {"name": "T"}, "id_at": "board.id"},
+            {"method": "PUT", "path": "/api/dashboard/boards", "body": {"id": "{board}", "tabs": [{"id": "t1", "title": "Overview"}]}},
+            {"name": "chart", "method": "POST", "path": "/api/dashboard/specs", "body": {"board": "{board}"}, "id_at": "chart.id"},
+        ]
+        names, created = m.run_setup(cfg, session, setup)
+        # The calls around it still save their names.
+        self.assertEqual(names, {"board": "b-1", "chart": "c-1"})
+        # The call with no `id_at` adds nothing for the cleanup to delete.
+        self.assertEqual(created, [{"kind": "board", "id": "b-1"}, {"kind": "chart", "id": "c-1"}])
+        # Its body carries the id the first call saved.
+        method, url, body = session.calls[1]
+        self.assertEqual((method, url), ("PUT", "http://api.test/api/dashboard/boards"))
+        self.assertEqual(body, {"id": "b-1", "tabs": [{"id": "t1", "title": "Overview"}]})
+
+    def test_a_setup_call_without_an_id_at_still_fails_the_run_when_the_call_fails(self) -> None:
+        # The call itself was refused: the run is a setup error, as it is for
+        # a call that names an id.
+        cfg = make_cfg()
+        session = FakeSession({("PUT", "/api/dashboard/boards"): FakeResponse(400, {"error": "bad"})})
+        setup = [{"method": "PUT", "path": "/api/dashboard/boards", "body": {"id": "b-1"}}]
         with self.assertRaises(m.SetupError):
             m.run_setup(cfg, session, setup)
 
@@ -1215,6 +1250,34 @@ class DashboardRowsTests(unittest.TestCase):
     def test_the_quarterly_case_stays_in_indonesian(self) -> None:
         self.assertEqual(self.cases()["chart_quarterly_id"].get("lang"), "id")
 
+    def test_the_move_to_tab_case_gives_the_board_a_first_tab_of_its_own(self) -> None:
+        # A tile that names no tab leaves the chart on the board's first tab,
+        # so with "Maps" as the only tab the chart already sits where the
+        # case asks for it. The board gets a tab of its own before it.
+        setup = self.cases()["dash_move_charts_to_tab"]["setup"]
+        self.assertEqual(len(setup), 3)
+        third = setup[2]
+        self.assertEqual(third["method"], "PUT")
+        self.assertEqual(third["path"], "/api/dashboard/boards")
+        self.assertEqual(third["body"], {"id": "{board}", "tabs": [{"id": "t_overview", "title": "Overview"}]})
+        # The board PUT replies without an id, so the call names none.
+        self.assertNotIn("id_at", third)
+
+    def test_the_formula_case_asks_without_the_ambiguous_question_mark(self) -> None:
+        # The `?` was read as the question mark of the question, so the
+        # validator was asked about a formula that ends where a value was
+        # expected rather than about the mistake it names.
+        case = self.cases()["calc_validate_error"]
+        self.assertEqual(case["turns"], ["Check this formula on mart_event: Sum([jumlah_event]) / ("])
+        self.assertNotIn("?", case["turns"][0])
+        fact = [f for f in case["facts"] if f.get("label") == "mistake"]
+        self.assertEqual(len(fact), 1)
+        self.assertEqual(fact[0]["values"], ["ends where a value was expected"])
+        self.assertEqual(
+            fact[0]["aliases"],
+            {"ends where a value was expected": ["incomplete", "unterminated", "nothing to divide by", "missing", "tidak lengkap"]},
+        )
+
     def test_metric_first_cases_make_a_metric_and_assert_the_chart_uses_it(self) -> None:
         # A metric measure is saved as {"metric": <name>}, so a plain
         # `def.measures` match cannot see it; `def.measures[].metric` can.
@@ -1356,14 +1419,14 @@ class DashboardRowsTests(unittest.TestCase):
         self.assertTrue(case.get("confirm"))
         self.assertIn("SELECT", case["formula_forbid"])
 
-    def test_calc_validate_error_names_the_offending_token(self) -> None:
-        # row 18: "the answer names the mistake". The formula's broken token is
-        # the `?` (lex.rs: "unexpected character '?'"), and a text fact must
-        # have the answer say it.
+    def test_calc_validate_error_names_the_mistake_the_validator_gives(self) -> None:
+        # row 18: "the answer names the mistake". The formula ends where a
+        # value was expected (formula/parse.rs: "the formula ends where a
+        # value was expected."), and a text fact must have the answer say it.
         case = self.cases()["calc_validate_error"]
         facts = [f for f in case.get("facts", []) if f.get("kind") == "text"]
         self.assertTrue(facts, "a text fact must name the mistake")
-        self.assertIn("'?'", facts[0]["values"])
+        self.assertIn("ends where a value was expected", facts[0]["values"])
 
     def test_calc_then_chart_asserts_the_chart_uses_the_field(self) -> None:
         # row 19: a chart uses the calculated field by name (def.measures lists it).
@@ -1568,6 +1631,68 @@ class ToolArgsMatchTest(unittest.TestCase):
             m.tool_args_match({"filters": [{"region": "São Paulo"}]}, {"filters": "São Paulo"})
         )
         self.assertFalse(m.tool_args_match({"regions": ["Berlin"]}, {"regions": "São Paulo"}))
+
+
+# ── the language check: which answer reads Indonesian ────────────────────
+
+
+# The short confirmations the assistant gives after a draft. Each is too short
+# to carry three of the common words, so the words such an answer is built of
+# are markers too.
+SHORT_INDONESIAN_ANSWERS = (
+    "Draft grafiknya sudah siap — tinjau pratinjaunya di bawah lalu konfirmasi.",
+    "Draft grafik garis sudah siap — tinjau pratinjaunya di bawah lalu konfirmasi.",
+    "Draft grafiknya sudah siap — silakan tinjau pratinjaunya di bawah lalu konfirmasi.",
+    "Draft grafiknya sudah siap — periksa pratinjaunya dan konfirmasi.",
+    "Draft grafik batang **Pengunjung Mancanegara per Negara** sudah siap — tinjau pratinjaunya di bawah lalu konfirmasi.",
+    "Draft grafiknya sudah siap — cek pratinjau di bawah lalu konfirmasi ya.",
+)
+
+# Every English answer the tests in this file use, and where it comes from.
+ENGLISH_ANSWERS_THE_TESTS_USE = (
+    # `ScoreCaseTests.body` and `ScoreCaseTests.refused`
+    "Done.",
+    "I can't create charts here.",
+    "Charts can't read a Silver table directly.",
+    "I cannot do that in ask mode.",
+    "I can not draw that.",
+    "I am not able to change the board.",
+    "I can’t create charts here.",
+    "That isn’t available.",
+    "Here is the chart you asked for.",
+    # `TraceChecksTests`
+    "I have queued this in Approvals for you.",
+    "It is waiting in Approvals.",
+    "No such chart.",
+    # the answers the `run_case` tests script
+    "Drafted.",
+    "Renamed.",
+    "ok",
+    # the saved run the rescore test replays
+    "There is no data for that. Malaysia 1234 bar chart mart_event 1,234 tahun",
+    # the draft answer the assistant gives in English
+    "The chart draft is ready — review the preview below and confirm.",
+)
+
+
+class LanguageTests(unittest.TestCase):
+    def test_the_short_indonesian_answers_read_indonesian(self) -> None:
+        for answer in SHORT_INDONESIAN_ANSWERS:
+            self.assertTrue(m.looks_indonesian(answer), answer)
+
+    def test_the_english_answers_the_tests_use_read_english(self) -> None:
+        for answer in ENGLISH_ANSWERS_THE_TESTS_USE:
+            self.assertFalse(m.looks_indonesian(answer), answer)
+
+    def test_the_marker_set_carries_the_words_a_short_confirmation_uses(self) -> None:
+        # The set is pinned here so that dropping one of these words fails the
+        # suite instead of silently changing what reads as Indonesian.
+        for word in ("sudah", "siap", "silakan", "lalu", "bawah", "tinjau", "periksa", "konfirmasi"):
+            self.assertIn(word, m.INDONESIAN_MARKERS, word)
+
+    def test_three_markers_read_indonesian_and_two_do_not(self) -> None:
+        self.assertTrue(m.looks_indonesian("Draft sudah siap lalu."))
+        self.assertFalse(m.looks_indonesian("Draft sudah siap."))
 
 
 if __name__ == "__main__":

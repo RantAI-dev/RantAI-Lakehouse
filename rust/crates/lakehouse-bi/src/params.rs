@@ -1403,8 +1403,8 @@ pub fn reference_lines(def: &ChartInput, params: &ParamValues) -> Vec<ResolvedLi
         .iter()
         .flatten()
         .filter_map(|line| {
-            let value = line.value.as_ref().map(&resolve);
-            let to = line.to.as_ref().map(&resolve);
+            let value = line.value.as_ref().map(resolve);
+            let to = line.to.as_ref().map(resolve);
             // A parameter that is missing or not a number drops the line.
             if value == Some(None) || to == Some(None) {
                 return None;
@@ -2070,7 +2070,9 @@ mod tests {
         let mut b = chart(&json!({}));
         b.spec.id = "u_2".to_owned();
         assert_eq!(charts_using(&[a.clone(), b], "n"), ["u_1"]);
-        assert!(charts_using(&[a], "other").is_empty());
+        let only = [a];
+        let other = charts_using(&only, "other");
+        assert!(other.is_empty(), "{other:?}");
         let _ = ColumnKind::Text;
     }
 }

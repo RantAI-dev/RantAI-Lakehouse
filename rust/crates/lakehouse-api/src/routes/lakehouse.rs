@@ -34,7 +34,7 @@ use crate::bounded;
 use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::lakehouse_catalog;
-use crate::routes::governance::latest_maintenance_run;
+use crate::routes::governance::{latest_maintenance_run, maintenance_history_table_name};
 use crate::routes::support::{num_or_zero, str_col};
 use crate::state::AppState;
 
@@ -340,7 +340,9 @@ fn maintenance_body(
 /// wrote for `table_name`'s NEWEST recorded run (`run_at = (SELECT
 /// max(run_at) ...)`), narrowed to that one table via a bound, escaped
 /// literal — never `format!` on an identifier here, `table_name` is a
-/// value, not a column/table name. `bronze_meta.maintenance_verb_run` is a
+/// value, not a column/table name. `table_name` is the qualified name
+/// [`maintenance_history_table_name`] builds, the same one the job
+/// records (`OPS-9`). `bronze_meta.maintenance_verb_run` is a
 /// brand-new table (WS2 §4): most tables, and every deployment before this
 /// feature existed, will never have a row in it — see
 /// [`maintenance_verb_runs_or_empty`] for how that absence is handled.
@@ -653,11 +655,11 @@ pub async fn table_detail(
 
 /// `true` only for `bronze`: the P4 maintenance job (and its
 /// `bronze_meta.maintenance_run` history table) only ever compacts
-/// `bronze` tables, and that table has no namespace column — a
-/// `table_name`-only filter would attribute `bronze/orders`' run to
-/// `silver/orders` if both existed. [`maintenance`] uses this to decide
-/// whether to query `ClickHouse` at all for a given namespace, rather than
-/// returning a row that merely happens to share the table's name.
+/// `bronze` tables. Other namespaces' rows in that same table come from
+/// other jobs (`gold_export.py` records `gold.<mart>`, `agent_runs.py`
+/// records `agent_employee.<id>`) and are not a table's maintenance
+/// history, so [`maintenance`] uses this to decide whether to query
+/// `ClickHouse` at all rather than returning a row from a different job.
 fn last_run_applies(ns: &str) -> bool {
     ns == "bronze"
 }
@@ -684,28 +686,29 @@ pub async fn maintenance(
 
     let policy = maintenance_policy::get_policy(pool(&state)?, &ns, &table).await?;
 
-    // `bronze_meta.maintenance_run` has no namespace column and the job
-    // only maintains `bronze` — see `last_run_applies`. For any other
-    // namespace, `lastRun` is honestly `null` without querying
-    // `ClickHouse` at all, rather than risking another namespace's
-    // same-named table's run.
-    let last_run = if last_run_applies(&ns) {
-        latest_maintenance_run(&state.clickhouse, Some(&table))
+    // `bronze_meta.maintenance_run` has no namespace column, and the job
+    // records the catalog's own two-part name — `OPS-9`: see
+    // [`maintenance_history_table_name`], the one place that name is
+    // built. Only `bronze` has maintenance history at all
+    // ([`last_run_applies`]); any other namespace is honestly `null`/`[]`
+    // without querying `ClickHouse`.
+    let history_name = last_run_applies(&ns).then(|| maintenance_history_table_name(&ns, &table));
+
+    let last_run = match history_name.as_deref() {
+        Some(name) => latest_maintenance_run(&state.clickhouse, Some(name))
             .await
             .map_err(|err| classify_ch_error(&err))?
             .into_iter()
-            .next()
-    } else {
-        None
+            .next(),
+        None => None,
     };
 
     // `lastVerbRuns` — see `maintenance_verb_runs_or_empty`'s doc comment:
     // it shares `last_run`'s fixed 503 for every failure except the table
     // itself not existing yet, which is the honest `[]`.
-    let last_verb_runs = if last_run_applies(&ns) {
-        maintenance_verb_runs_or_empty(&state.clickhouse, &table).await?
-    } else {
-        Vec::new()
+    let last_verb_runs = match history_name.as_deref() {
+        Some(name) => maintenance_verb_runs_or_empty(&state.clickhouse, name).await?,
+        None => Vec::new(),
     };
 
     Ok(ApiJson(maintenance_body(
@@ -1381,6 +1384,35 @@ mod tests {
         assert!(sql.contains("WHERE table_name = 'orders''; DROP TABLE x; --'"));
         assert!(sql.contains("FROM lake.`bronze_meta.maintenance_verb_run`"));
         assert!(sql.contains("ORDER BY verb"));
+    }
+
+    /// `OPS-9`: the per-table verbs read must filter on the QUALIFIED name
+    /// the maintenance job records (`bronze.<table>`, see
+    /// [`maintenance_history_table_name`]), not the bare `{table}` segment
+    /// the URL carries — the bare name matched no row, so a Bronze table
+    /// never showed its last run.
+    #[test]
+    fn maintenance_verb_run_query_for_a_bronze_table_filters_the_name_the_job_records() {
+        let name = maintenance_history_table_name("bronze", "orders");
+        let sql = maintenance_verb_run_query(&name);
+
+        assert_eq!(name, "bronze.orders");
+        assert!(sql.contains("WHERE table_name = 'bronze.orders'"));
+        assert!(
+            !sql.contains("WHERE table_name = 'orders'"),
+            "the bare name is what the job never records: {sql}"
+        );
+    }
+
+    /// A namespace other than Bronze keeps its own qualified name — the
+    /// helper is not "prefix bronze", it is "the catalog's two-part name",
+    /// which is what `gold_export.py`/`agent_runs.py` record too.
+    #[test]
+    fn maintenance_history_table_name_qualifies_every_namespace_with_its_own_name() {
+        assert_eq!(
+            maintenance_history_table_name("gold", "orders"),
+            "gold.orders"
+        );
     }
 
     #[test]

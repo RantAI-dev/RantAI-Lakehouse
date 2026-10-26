@@ -678,8 +678,8 @@ class OpForPipelineTest(unittest.TestCase):
         """BLD-3 / D4: Bronze is written by ingestion, so a pipeline with a
         `bronze` target is a config rejection, not a run failure to retry --
         retrying gets the same refusal. `Failure(allow_retries=False)`
-        wraps `AuthoredJobError` (the shape the connector-source guard
-        above uses), the guard fires BEFORE any SQL is built, and the
+        wraps `AuthoredJobError` (the shape every config guard in the op
+        body uses), the guard fires BEFORE any SQL is built, and the
         wording is the one constant the API and the assistant's schema
         refusal also use."""
         from dagster import Failure
@@ -700,23 +700,80 @@ class OpForPipelineTest(unittest.TestCase):
         mocked_exec.assert_not_called()
         mocked_query.assert_not_called()
 
-    def test_connector_sourced_pipeline_raises_a_non_retryable_failure_wrapping_authored_job_error(
+    def test_a_connector_pipeline_reads_its_own_bronze_table_like_any_bronze_pipeline(
         self,
     ) -> None:
-        """PART D: an authored pipeline that names a `connectorId` is
-        not implemented by this build (see `CONNECTOR_SOURCE_UNSUPPORTED_REASON`)
-        -- a missing-feature gap, never a transient failure. Wrapped in
-        `Failure(allow_retries=False)` so the run fails loudly on the
-        first attempt."""
+        """BLD-7 / decision 3 + `DEC-15`: a pipeline with a connector is not
+        refused any more. It reads `sourceZone.sourceTable` -- here the
+        Bronze table its connector loaded -- through the catalog database,
+        exactly as a Bronze pipeline without a connector does, and the
+        author's enforcement call sees that same SELECT (`BLD-1` / D4)."""
+        pipeline = _ready_pipeline(
+            connectorId="conn-1", sourceZone="bronze", sourceTable="orders",
+        )
+        run_fn = authored_factory._op_for_pipeline(pipeline)
+        selects: list[str] = []
+
+        def record_select(
+            _cfg: authored_factory.AuthoredPipelineConfig, _pipeline_id: str, sql: str,
+        ) -> str:
+            selects.append(sql)
+            return sql
+
+        counts = iter([[{"n": "0"}], [{"n": "3"}]])
+        exec_calls: list[str] = []
+        with mock.patch.object(authored_factory, "_enforced_sql", side_effect=record_select), \
+             mock.patch.object(authored_factory, "_ch_exec", side_effect=lambda t, s: exec_calls.append(s)), \
+             mock.patch.object(authored_factory, "_ch_query_json", side_effect=lambda t, s: next(counts)), \
+             mock.patch.object(authored_factory.ClickHouseTarget, "from_env", return_value=ClickHouseTarget("http://ch", "default", "")):
+            result = run_fn(build_op_context())
+
+        self.assertEqual(
+            selects,
+            ["SELECT id, name FROM icecat_api.`bronze.orders`"],
+            "a connector pipeline reads its Bronze table through the catalog database",
+        )
+        self.assertEqual(result["rows"], 3)
+        self.assertTrue(
+            any("INSERT INTO serving.`__staging_orders_clean" in s for s in exec_calls),
+            "the run writes its target, as any accepted pipeline does",
+        )
+
+    def test_a_connector_pipeline_whose_source_is_not_bronze_is_refused_before_any_sql(
+        self,
+    ) -> None:
+        """BLD-7 / decision 3: the blanket connector refusal is gone, but a
+        row stored before the API's rule -- connector set, source zone not
+        `bronze` -- still cannot run. Reading that zone would be the direct
+        source read `DEC-15` rules out, so it is a config rejection whose
+        fixed message says to edit the pipeline, and it fires before any
+        SQL is built or sent."""
         from dagster import Failure
 
-        pipeline = _ready_pipeline(connectorId="conn-1")
+        pipeline = _ready_pipeline(connectorId="conn-1")  # default zone: silver
         run_fn = authored_factory._op_for_pipeline(pipeline)
-        with self.assertRaises(Failure) as ctx:
-            run_fn(build_op_context())
+        with mock.patch.object(authored_factory, "_ch_exec") as mocked_exec, \
+             mock.patch.object(authored_factory, "_ch_query_json") as mocked_query:
+            with self.assertRaises(Failure) as ctx:
+                run_fn(build_op_context())
         self.assertFalse(ctx.exception.allow_retries)
-        self.assertIn("connector-sourced", str(ctx.exception))
         self.assertIsInstance(ctx.exception.__cause__, authored_factory.AuthoredJobError)
+        self.assertIn(authored_factory.CONNECTOR_SOURCE_NOT_BRONZE_REASON, str(ctx.exception))
+        self.assertIn("Edit the pipeline", str(ctx.exception))
+        mocked_exec.assert_not_called()
+        mocked_query.assert_not_called()
+
+    def test_a_connector_pipeline_reads_bronze_without_the_retired_unsupported_reason(
+        self,
+    ) -> None:
+        """BLD-7 / decision 3: the old blanket refusal ("connector-sourced
+        authored pipelines are not executed by this build") no longer
+        exists, so no run can fail with it. The constant itself is gone
+        rather than left unused next to its replacement."""
+        self.assertFalse(
+            hasattr(authored_factory, "CONNECTOR_SOURCE_UNSUPPORTED_REASON"),
+            "the blanket connector refusal must be deleted, not kept dead",
+        )
 
     def test_an_unsafe_identifier_raises_a_non_retryable_failure_and_reaches_no_sql(
         self,

@@ -32,7 +32,7 @@ import { pipelineService } from "@/services"
 import type { PipelineRun, PipelineRunTrigger, RetryStrategy } from "@/services/contracts/pipelines"
 import { isLiveRun, runDurationMs } from "./pipeline-run-stats"
 import { RunLogConsole, useRunLogs } from "./run-log-console"
-import { failureLines, type LogLevelFilter } from "./run-logs"
+import { classifiedFailureReason, failureLines, type LogLevelFilter } from "./run-logs"
 import { StepTimeline } from "./step-timeline"
 
 function TriggerChip({
@@ -91,18 +91,34 @@ function TriggerChip({
   }
 }
 
+/**
+ * The reason a failed run gives, as the page may show it (BLD-8 /
+ * decision 6).
+ *
+ * `reason` is the classified sentence from [`classifiedFailureReason`]:
+ * only this product's own fixed descriptions reach it. When the log holds
+ * none, the page says the run failed and points at the log instead of
+ * repeating a driver's or a traceback's text.
+ */
 function FailureCallout({
   lines,
+  reason,
   loading,
   onShowErrors,
 }: {
   lines: ReturnType<typeof failureLines>
+  reason: string | null
   loading: boolean
   onShowErrors: () => void
 }) {
   const step = lines.find((l) => l.stepKey)?.stepKey
   return (
-    <div className="relative overflow-hidden rounded-xl border border-destructive/30 bg-destructive/[0.06] p-4">
+    // `role="note"` so the one place that explains a failure is findable by
+    // assistive tech (and by the page test) without hunting the log panel.
+    <div
+      role="note"
+      className="relative overflow-hidden rounded-xl border border-destructive/30 bg-destructive/[0.06] p-4"
+    >
       <div aria-hidden className="absolute inset-y-0 left-0 w-1 bg-destructive" />
       <div className="flex flex-wrap items-start justify-between gap-2">
         <div className="flex items-center gap-2 text-sm font-semibold text-destructive">
@@ -121,20 +137,14 @@ function FailureCallout({
           </Button>
         ) : null}
       </div>
-      {loading && lines.length === 0 ? (
+      {loading && reason === null ? (
         <p className="mt-2 text-xs text-muted-foreground">Reading the log for the error…</p>
-      ) : lines.length === 0 ? (
-        <p className="mt-2 text-xs text-muted-foreground">
-          The run failed, but its log holds no error line. The orchestrator recorded no reason.
-        </p>
+      ) : reason !== null ? (
+        <p className="mt-2 whitespace-pre-wrap break-words text-sm leading-6 text-foreground">{reason}</p>
       ) : (
-        <ul className="mt-2 flex flex-col gap-1.5">
-          {lines.map((l, i) => (
-            <li key={`${l.ts}-${i}`} className="whitespace-pre-wrap break-words font-mono text-xs leading-5 text-foreground">
-              {l.message}
-            </li>
-          ))}
-        </ul>
+        <p className="mt-2 text-sm leading-6 text-foreground">
+          The run failed; see the run log.
+        </p>
       )}
     </div>
   )
@@ -180,6 +190,10 @@ export function RunInspector({
   }, [run.id])
 
   const errors = React.useMemo(() => failureLines(logs.lines), [logs.lines])
+  // BLD-8 / decision 6: the reason shown is the classified one (this
+  // product's own fixed descriptions), never the engine's or a driver's
+  // text; `errors` stays for the step name and the log action.
+  const failureReason = React.useMemo(() => classifiedFailureReason(logs.lines), [logs.lines])
   const logRef = React.useRef<HTMLDivElement>(null)
 
   const retry = useServiceAction(
@@ -317,6 +331,7 @@ export function RunInspector({
       {run.status === "failed" ? (
         <FailureCallout
           lines={errors}
+          reason={failureReason}
           loading={logs.loading}
           onShowErrors={() => {
             setStepKey(null)

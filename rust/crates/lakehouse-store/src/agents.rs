@@ -129,7 +129,10 @@ const WORKFLOW_COLUMNS: &str =
 /// Returns [`StoreError::Database`] if the query fails.
 pub async fn list_workflows(pool: &PgPool) -> Result<Vec<AgentWorkflow>, StoreError> {
     let sql = format!("SELECT {WORKFLOW_COLUMNS} FROM agent_workflow ORDER BY created_at DESC");
-    Ok(sqlx::query_as(&sql).fetch_all(pool).await?)
+    // safe: only the constant `WORKFLOW_COLUMNS` is formatted in; values are bound.
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+        .fetch_all(pool)
+        .await?)
 }
 
 /// Everything [`create_workflow`] needs. Mirrors `CreateWorkflowInput`.
@@ -164,7 +167,8 @@ pub async fn create_workflow(
          VALUES ($1, $2, 'draft', $3, $4, $5, $6) \
          RETURNING {WORKFLOW_COLUMNS}"
     );
-    Ok(sqlx::query_as(&sql)
+    // safe: only the constant `WORKFLOW_COLUMNS` is formatted in; values are bound.
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(&id)
         .bind(&input.name)
         .bind(owner)
@@ -327,7 +331,10 @@ const FULL_EMPLOYEE_COLUMNS: &str = "id, name, purpose, owner, autonomy, status,
 /// Returns [`StoreError::Database`] if the query fails.
 pub async fn list_employees(pool: &PgPool) -> Result<Vec<DigitalEmployee>, StoreError> {
     let sql = format!("SELECT {EMPLOYEE_COLUMNS} FROM agent_employee ORDER BY created_at DESC");
-    let rows: Vec<EmployeeListRow> = sqlx::query_as(&sql).fetch_all(pool).await?;
+    // safe: only the constant `EMPLOYEE_COLUMNS` is formatted in; values are bound.
+    let rows: Vec<EmployeeListRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+        .fetch_all(pool)
+        .await?;
     Ok(rows
         .into_iter()
         .map(EmployeeListRow::without_metrics)
@@ -343,7 +350,11 @@ pub async fn list_employees(pool: &PgPool) -> Result<Vec<DigitalEmployee>, Store
 /// Returns [`StoreError::Database`] if the query fails.
 pub async fn get_employee(pool: &PgPool, id: &str) -> Result<Option<DigitalEmployee>, StoreError> {
     let sql = format!("SELECT {EMPLOYEE_COLUMNS} FROM agent_employee WHERE id = $1");
-    let row: Option<EmployeeListRow> = sqlx::query_as(&sql).bind(id).fetch_optional(pool).await?;
+    // safe: only the constant `EMPLOYEE_COLUMNS` is formatted in; values are bound.
+    let row: Option<EmployeeListRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
     Ok(row.map(EmployeeListRow::without_metrics))
 }
 
@@ -361,7 +372,11 @@ pub async fn get_employee_with_metrics(
     id: &str,
 ) -> Result<Option<DigitalEmployee>, StoreError> {
     let sql = format!("SELECT {FULL_EMPLOYEE_COLUMNS} FROM agent_employee WHERE id = $1");
-    Ok(sqlx::query_as(&sql).bind(id).fetch_optional(pool).await?)
+    // safe: only the constant `FULL_EMPLOYEE_COLUMNS` is formatted in; values are bound.
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+        .bind(id)
+        .fetch_optional(pool)
+        .await?)
 }
 
 /// List every digital employee that has a `schedule_cron` set, newest
@@ -379,7 +394,10 @@ pub async fn list_scheduled_employees(pool: &PgPool) -> Result<Vec<DigitalEmploy
         "SELECT {EMPLOYEE_COLUMNS} FROM agent_employee WHERE schedule_cron IS NOT NULL \
          ORDER BY created_at DESC"
     );
-    let rows: Vec<EmployeeListRow> = sqlx::query_as(&sql).fetch_all(pool).await?;
+    // safe: only the constant `EMPLOYEE_COLUMNS` is formatted in; values are bound.
+    let rows: Vec<EmployeeListRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+        .fetch_all(pool)
+        .await?;
     Ok(rows
         .into_iter()
         .map(EmployeeListRow::without_metrics)
@@ -493,7 +511,8 @@ pub async fn create_employee(
          VALUES ($1, $2, $3, $4, $5, 'draft', $6, $7, $8, $9, $10, $11, $12) \
          RETURNING {EMPLOYEE_COLUMNS}"
     );
-    let row: EmployeeListRow = sqlx::query_as(&sql)
+    // safe: only the constant `EMPLOYEE_COLUMNS` is formatted in; values are bound.
+    let row: EmployeeListRow = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(&id)
         .bind(&input.name)
         .bind(&input.purpose)
@@ -528,7 +547,8 @@ async fn set_employee_status(
 ) -> Result<DigitalEmployee, StoreError> {
     let sql =
         format!("UPDATE agent_employee SET status = $2 WHERE id = $1 RETURNING {EMPLOYEE_COLUMNS}");
-    let row: Option<EmployeeListRow> = sqlx::query_as(&sql)
+    // safe: only the constant `EMPLOYEE_COLUMNS` is formatted in; values are bound.
+    let row: Option<EmployeeListRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(id)
         .bind(status)
         .fetch_optional(pool)
@@ -759,7 +779,8 @@ pub async fn list_runs(
         "SELECT {RUN_COLUMNS} FROM agent_run WHERE ($1::text IS NULL OR employee_id = $1) \
          ORDER BY started_at DESC"
     );
-    let rows: Vec<RunRow> = sqlx::query_as(&sql)
+    // safe: only the constant `RUN_COLUMNS` is formatted in; values are bound.
+    let rows: Vec<RunRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(employee_id)
         .fetch_all(pool)
         .await?;
@@ -777,7 +798,11 @@ pub async fn list_runs(
 /// Returns [`StoreError::Database`] if a query fails.
 pub async fn get_run(pool: &PgPool, id: &str) -> Result<Option<AgentRun>, StoreError> {
     let sql = format!("SELECT {RUN_COLUMNS} FROM agent_run WHERE id = $1");
-    let row: Option<RunRow> = sqlx::query_as(&sql).bind(id).fetch_optional(pool).await?;
+    // safe: only the constant `RUN_COLUMNS` is formatted in; values are bound.
+    let row: Option<RunRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
     match row {
         Some(row) => Ok(Some(hydrate_run(pool, row).await?)),
         None => Ok(None),
@@ -970,7 +995,9 @@ pub async fn list_approvals(
         "SELECT {APPROVAL_COLUMNS_QUALIFIED} {APPROVAL_AUDIT_JOIN} WHERE ($1::text IS NULL OR \
          a.employee_id = $1) ORDER BY a.requested_at DESC"
     );
-    let rows: Vec<ApprovalRow> = sqlx::query_as(&sql)
+    // safe: only the constants `APPROVAL_COLUMNS_QUALIFIED`, `APPROVAL_AUDIT_JOIN` are formatted
+    // in; values are bound.
+    let rows: Vec<ApprovalRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(employee_id)
         .fetch_all(pool)
         .await?;
@@ -1055,7 +1082,9 @@ pub async fn decide_approval(
     .await?;
     let select_sql =
         format!("SELECT {APPROVAL_COLUMNS_QUALIFIED} {APPROVAL_AUDIT_JOIN} WHERE a.id = $1");
-    let row: ApprovalRow = sqlx::query_as(&select_sql)
+    // safe: only the constants `APPROVAL_COLUMNS_QUALIFIED`, `APPROVAL_AUDIT_JOIN` are formatted
+    // in; values are bound.
+    let row: ApprovalRow = sqlx::query_as(sqlx::AssertSqlSafe(select_sql.as_str()))
         .bind(id)
         .fetch_one(&mut *tx)
         .await?;
@@ -1517,7 +1546,9 @@ pub async fn create_access_request(
     .await?;
     let select_sql =
         format!("SELECT {APPROVAL_COLUMNS_QUALIFIED} {APPROVAL_AUDIT_JOIN} WHERE a.id = $1");
-    let row: ApprovalRow = sqlx::query_as(&select_sql)
+    // safe: only the constants `APPROVAL_COLUMNS_QUALIFIED`, `APPROVAL_AUDIT_JOIN` are formatted
+    // in; values are bound.
+    let row: ApprovalRow = sqlx::query_as(sqlx::AssertSqlSafe(select_sql.as_str()))
         .bind(&approval_id)
         .fetch_one(pool)
         .await?;
@@ -1535,7 +1566,9 @@ pub async fn create_access_request(
 pub async fn get_approval(pool: &PgPool, id: &str) -> Result<Option<ApprovalItem>, StoreError> {
     let select_sql =
         format!("SELECT {APPROVAL_COLUMNS_QUALIFIED} {APPROVAL_AUDIT_JOIN} WHERE a.id = $1");
-    let row: Option<ApprovalRow> = sqlx::query_as(&select_sql)
+    // safe: only the constants `APPROVAL_COLUMNS_QUALIFIED`, `APPROVAL_AUDIT_JOIN` are formatted
+    // in; values are bound.
+    let row: Option<ApprovalRow> = sqlx::query_as(sqlx::AssertSqlSafe(select_sql.as_str()))
         .bind(id)
         .fetch_optional(pool)
         .await?;
@@ -1898,7 +1931,11 @@ pub async fn list_pending_approvals(pool: &PgPool) -> Result<Vec<ApprovalItem>, 
         "SELECT {APPROVAL_COLUMNS_QUALIFIED} {APPROVAL_AUDIT_JOIN} WHERE a.status = 'pending' \
          ORDER BY a.requested_at DESC"
     );
-    let rows: Vec<ApprovalRow> = sqlx::query_as(&sql).fetch_all(pool).await?;
+    // safe: only the constants `APPROVAL_COLUMNS_QUALIFIED`, `APPROVAL_AUDIT_JOIN` are formatted
+    // in; values are bound.
+    let rows: Vec<ApprovalRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+        .fetch_all(pool)
+        .await?;
     Ok(rows.into_iter().map(ApprovalItem::from).collect())
 }
 
@@ -2004,8 +2041,8 @@ mod access_request_tests {
     /// all. Quoted failure text (`cargo test -p lakehouse-store
     /// agents::create_access_request 2>&1 | tail -30` against the pre-E1/E2
     /// state): `error[E0433]: failed to resolve: use of undeclared type
-    /// \`NewAccessRequest\`` / `error[E0425]: cannot find function
-    /// \`create_access_request\` in this scope`.
+    /// NewAccessRequest` / `error[E0425]: cannot find function
+    /// create_access_request in this scope`.
     #[sqlx::test(migrations = "../../migrations")]
     async fn create_access_request_inserts_a_pending_approval_with_kind_access(
         pool: PgPool,
@@ -2034,8 +2071,8 @@ mod access_request_tests {
     /// `decide_access_request`/`AccessGrant` did not exist at all. Quoted
     /// failure text (`cargo test -p lakehouse-store
     /// agents::decide_access_request 2>&1 | tail -30` against the pre-E3
-    /// state): `error[E0425]: cannot find function \`decide_access_request\`
-    /// in this scope`.
+    /// state): ``error[E0425]: cannot find function `decide_access_request`
+    /// in this scope``.
     #[sqlx::test(migrations = "../../migrations")]
     async fn decide_access_request_approved_creates_a_time_bounded_grant(
         pool: PgPool,
@@ -2097,12 +2134,10 @@ mod access_request_tests {
             here[0].granted_by.as_deref(),
             Some("admin@tenant-a.invalid")
         );
-        assert!(
-            super::list_asset_grants(&pool, "silver.other")
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        let grants = super::list_asset_grants(&pool, "silver.other")
+            .await
+            .unwrap();
+        assert!(grants.is_empty(), "{grants:?}");
         Ok(())
     }
 
@@ -2161,12 +2196,10 @@ mod access_request_tests {
             .expect("the grant is in force");
         assert_eq!(revoked.permission, "query:read");
         assert_eq!(revoked.user, "user2@tenant-a.invalid");
-        assert!(
-            super::list_asset_grants(&pool, "silver.orders")
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        let grants = super::list_asset_grants(&pool, "silver.orders")
+            .await
+            .unwrap();
+        assert!(grants.is_empty(), "{grants:?}");
         assert!(
             super::revoke_asset_grant(&pool, "silver.orders", &made.id, admin)
                 .await

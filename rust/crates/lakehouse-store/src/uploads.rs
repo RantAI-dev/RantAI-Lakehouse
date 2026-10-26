@@ -353,7 +353,8 @@ pub async fn insert_receiving(pool: &PgPool, new: &NewReceiving<'_>) -> Result<U
           declared_size, multipart_id) \
          VALUES ($1, $2, $3, $4, $5, $6, 'receiving', $7, $8) RETURNING {COLS}"
     );
-    Ok(sqlx::query_as(&sql)
+    // safe: only the constant `COLS` is formatted in; values are bound (SEC-41).
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(new.id)
         .bind(new.original_filename)
         .bind(new.storage_key)
@@ -478,7 +479,8 @@ pub async fn finish_receiving(
          parts_digest = $3, multipart_id = NULL, updated_at = now() \
          WHERE id = $1 AND status = 'receiving' RETURNING {COLS}"
     );
-    let row: Option<Upload> = sqlx::query_as(&sql)
+    // safe: only the constant `COLS` is formatted in; values are bound (SEC-41).
+    let row: Option<Upload> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(id)
         .bind(size_bytes)
         .bind(parts_digest)
@@ -512,7 +514,8 @@ pub async fn stale_receiving(
          WHERE status = 'receiving' AND created_at < now() - make_interval(hours => $1) \
          ORDER BY created_at, id LIMIT $2"
     );
-    Ok(sqlx::query_as(&sql)
+    // safe: only the constant `COLS` is formatted in; values are bound (SEC-41).
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(older_than_hours)
         .bind(limit.clamp(1, 500))
         .fetch_all(pool)
@@ -557,7 +560,8 @@ pub async fn find_by_parts_digest(
          WHERE tenant_id = $1 AND parts_digest = $2 AND id <> $3 \
          ORDER BY created_at DESC, id DESC LIMIT 1"
     );
-    Ok(sqlx::query_as(&sql)
+    // safe: only the constant `COLS` is formatted in; values are bound (SEC-41).
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(tenant_id)
         .bind(parts_digest)
         .bind(exclude_id)
@@ -579,7 +583,8 @@ pub async fn insert(pool: &PgPool, new: &NewUpload<'_>) -> Result<Upload, StoreE
           tenant_id) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING {COLS}"
     );
-    Ok(sqlx::query_as(&sql)
+    // safe: only the constant `COLS` is formatted in; values are bound.
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(new.id)
         .bind(new.original_filename)
         .bind(new.storage_key)
@@ -602,7 +607,8 @@ pub async fn list(pool: &PgPool, tenant_id: Uuid, limit: i64) -> Result<Vec<Uplo
         "SELECT {COLS} FROM file_upload WHERE tenant_id = $1 \
          ORDER BY created_at DESC, id DESC LIMIT $2"
     );
-    Ok(sqlx::query_as(&sql)
+    // safe: only the constant `COLS` is formatted in; values are bound.
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(tenant_id)
         .bind(limit.clamp(1, 500))
         .fetch_all(pool)
@@ -617,7 +623,11 @@ pub async fn list(pool: &PgPool, tenant_id: Uuid, limit: i64) -> Result<Vec<Uplo
 /// Returns [`StoreError::Database`] on a database failure.
 pub async fn get(pool: &PgPool, id: &str) -> Result<Option<Upload>, StoreError> {
     let sql = format!("SELECT {COLS} FROM file_upload WHERE id = $1");
-    Ok(sqlx::query_as(&sql).bind(id).fetch_optional(pool).await?)
+    // safe: only the constant `COLS` is formatted in; values are bound.
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+        .bind(id)
+        .fetch_optional(pool)
+        .await?)
 }
 
 /// The upload whose load is run `run_id`, or `None` (`SRC-7` F6): the
@@ -633,7 +643,8 @@ pub async fn get_by_run_id(pool: &PgPool, run_id: &str) -> Result<Option<Upload>
     let sql = format!(
         "SELECT {COLS} FROM file_upload WHERE run_id = $1 ORDER BY updated_at DESC LIMIT 1"
     );
-    Ok(sqlx::query_as(&sql)
+    // safe: only the constant `COLS` is formatted in; values are bound.
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(run_id)
         .fetch_optional(pool)
         .await?)
@@ -685,7 +696,8 @@ pub async fn find_by_sha256(
          WHERE tenant_id = $1 AND sha256 = $2 AND sha256 <> '' AND id <> $3 \
          ORDER BY created_at DESC, id DESC LIMIT 1"
     );
-    Ok(sqlx::query_as(&sql)
+    // safe: only the constant `COLS` is formatted in; values are bound.
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(tenant_id)
         .bind(sha256)
         .bind(exclude_id)
@@ -726,7 +738,8 @@ pub async fn mark_ingesting(
          updated_at = now() \
          WHERE id = $1 AND status <> 'ingesting' RETURNING {COLS}"
     );
-    Ok(sqlx::query_as(&sql)
+    // safe: only the constant `COLS` is formatted in; values are bound.
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(id)
         .bind(Json(parse_options.clone()))
         .bind(bronze_table)
@@ -924,7 +937,8 @@ pub async fn mark_group_within_limits(
          run_id = NULL, error = NULL, row_count = NULL, bad_values = NULL, updated_at = now() \
          WHERE id = $1 AND status <> 'ingesting' RETURNING {COLS}"
     );
-    let marked: Option<Upload> = sqlx::query_as(&sql)
+    // safe: only the constant `COLS` is formatted in; values are bound.
+    let marked: Option<Upload> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(id)
         .bind(Json(claim.parse_options.clone()))
         .bind(claim.bronze_table)
@@ -1015,7 +1029,8 @@ pub async fn attach_run(
          WHERE id = $1 AND status = 'ingesting' AND run_id IS NULL \
          RETURNING {COLS}"
     );
-    Ok(sqlx::query_as(&sql)
+    // safe: only the constant `COLS` is formatted in; values are bound.
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(id)
         .bind(run_id)
         .fetch_optional(pool)
@@ -1061,7 +1076,8 @@ pub async fn mark_finished(
          RETURNING {COLS}"
     );
     let mut tx = pool.begin().await?;
-    let settled: Option<Upload> = sqlx::query_as(&sql)
+    // safe: only the constant `COLS` is formatted in; values are bound (SEC-41).
+    let settled: Option<Upload> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(id)
         .bind(run_id)
         .bind(error)

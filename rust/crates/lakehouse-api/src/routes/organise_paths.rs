@@ -222,14 +222,14 @@ async fn the_dashboard_payload_leaves_out_another_users_private_chart() {
 
     // The statements asked for live rows, and for the viewer's scope.
     let chart_reads = sent(&server, "FROM console.bi_chart FINAL").await;
-    assert!(!chart_reads.is_empty());
+    assert_ne!(chart_reads, [] as [std::string::String; 0]);
     for read in &chart_reads {
         assert!(read.contains("is_deleted = 0"), "{read}");
         assert!(read.contains(&me), "{read}");
         assert!(read.contains(TRASHED_BOARDS), "{read}");
     }
     let board_reads = sent(&server, "FROM console.bi_board FINAL WHERE is_deleted = 0").await;
-    assert!(!board_reads.is_empty());
+    assert_ne!(board_reads, [] as [std::string::String; 0]);
     for read in board_reads {
         assert!(read.contains(&owner_clause(ME)), "{read}");
     }
@@ -367,7 +367,10 @@ async fn a_records_request_for_a_hidden_tile_is_not_found() {
         "{refusal:?}"
     );
     // Nothing of the hidden tile's data was read: only store reads were sent.
-    assert!(sent(&server, "FROM serving.mart_a").await.is_empty());
+    assert_eq!(
+        sent(&server, "FROM serving.mart_a").await,
+        [] as [std::string::String; 0]
+    );
 }
 
 #[tokio::test]
@@ -391,7 +394,10 @@ async fn the_csv_export_of_a_hidden_tile_is_not_found() {
     };
     let response = axum::response::IntoResponse::into_response(rejection);
     assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
-    assert!(sent(&server, "FROM serving.").await.is_empty());
+    assert_eq!(
+        sent(&server, "FROM serving.").await,
+        [] as [std::string::String; 0]
+    );
 }
 
 #[tokio::test]
@@ -572,7 +578,7 @@ async fn a_chart_in_the_trash_cannot_be_edited_back_to_life_by_an_edit() {
     )
     .await;
     assert!(outcome.is_err());
-    assert!(writes(&server).await.is_empty());
+    assert_eq!(writes(&server).await, [] as [std::string::String; 0]);
 }
 
 #[tokio::test]
@@ -593,7 +599,7 @@ async fn a_chart_cannot_be_put_on_a_deleted_or_private_board() {
         )
         .await;
         assert!(outcome.is_err(), "{is_deleted} {owner}");
-        assert!(writes(&server).await.is_empty());
+        assert_eq!(writes(&server).await, [] as [std::string::String; 0]);
     }
 }
 
@@ -900,7 +906,7 @@ async fn the_trash_list_and_a_restore_are_scoped_to_the_caller() {
             "{refusal}"
         );
     }
-    assert!(writes(&server).await.is_empty());
+    assert_eq!(writes(&server).await, [] as [std::string::String; 0]);
 }
 
 fn items_kind_board() -> &'static str {
@@ -917,16 +923,13 @@ async fn favourites_recent_items_and_search_ask_for_what_the_caller_may_see() {
     let ch = client(&server);
     let who = Viewer::user(id_of(ME), false);
     // A blank search asks nothing; a typed one asks for visible rows only.
-    assert!(
-        lakehouse_bi::search::search(&ch, &who, "  ")
-            .await
-            .unwrap()
-            .is_empty()
+    assert_eq!(
+        lakehouse_bi::search::search(&ch, &who, "  ").await.unwrap(),
+        [] as [lakehouse_bi::items::Entry; 0]
     );
-    assert!(
-        sent(&server, "positionCaseInsensitiveUTF8")
-            .await
-            .is_empty()
+    assert_eq!(
+        sent(&server, "positionCaseInsensitiveUTF8").await,
+        [] as [std::string::String; 0]
     );
     lakehouse_bi::search::search(&ch, &who, "50%_off")
         .await
@@ -1061,6 +1064,14 @@ async fn history_server(rules: Vec<(Vec<&'static str>, Vec<Value>)>) -> MockServ
     engine(rules).await
 }
 
+// Test helper: `Result<_, Response>` mirrors the handlers it drives, and its
+// `Err` is unwrapped by the test body, never printed. Clippy 1.98 started
+// reporting `result_large_err` on `async fn`s (rust-clippy#17130); boxing
+// here would only change how the test spells `unwrap_err()` (REL-9, D2).
+#[allow(
+    clippy::result_large_err,
+    reason = "test helper mirroring the handler's Result<_, Response>; its Err is unwrapped by the test, so boxing it buys nothing"
+)]
 async fn revert_to(server: &MockServer, version: u32) -> Result<Value, axum::response::Response> {
     super::super::dashboard_organise::revert(
         State(state_for(server)),
@@ -1182,6 +1193,12 @@ async fn going_back_restores_the_theme_and_the_font() {
     assert!(board.contains("'dark', 'jetbrains-mono'"), "{board}");
 }
 
+// As `revert_to` above: a test helper whose `Err` is the handler response
+// the test unwraps (REL-9, D2).
+#[allow(
+    clippy::result_large_err,
+    reason = "test helper mirroring the handler's Result<_, Response>; its Err is unwrapped by the test, so boxing it buys nothing"
+)]
 async fn edit_board(server: &MockServer, body: Value) -> Result<Value, axum::response::Response> {
     boards_update(
         State(state_for(server)),
@@ -1274,7 +1291,7 @@ async fn a_version_that_was_pruned_or_never_existed_is_not_found() {
     .await;
     let response = revert_to(&server, 7).await.unwrap_err();
     assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
-    assert!(writes(&server).await.is_empty());
+    assert_eq!(writes(&server).await, [] as [std::string::String; 0]);
 }
 
 #[tokio::test]
@@ -1291,7 +1308,10 @@ async fn the_built_in_dashboard_keeps_no_history_and_cannot_be_reverted() {
             .unwrap(),
         None
     );
-    assert!(sent(&server, "bi_board_version").await.is_empty());
+    assert_eq!(
+        sent(&server, "bi_board_version").await,
+        [] as [std::string::String; 0]
+    );
     let body = json!({ "board": "default", "version": 1 });
     let outcome = super::super::dashboard_organise::revert(
         State(state_for(&server)),
@@ -1337,7 +1357,7 @@ async fn a_version_is_written_only_for_a_change_and_only_fifteen_are_kept() {
             .unwrap(),
         None
     );
-    assert!(writes(&unchanged).await.is_empty());
+    assert_eq!(writes(&unchanged).await, [] as [std::string::String; 0]);
 
     let changed = history_server(live(vec![
         (
@@ -1511,7 +1531,7 @@ async fn moving_a_shared_board_into_a_personal_space_is_refused() {
         refused.to_string().contains("Turn off sharing"),
         "{refused}"
     );
-    assert!(writes(&server).await.is_empty());
+    assert_eq!(writes(&server).await, [] as [std::string::String; 0]);
     let private = {
         let mut b = board_row("b2", &id_of(ME));
         b["public_token"] = json!("");
@@ -1531,7 +1551,7 @@ async fn moving_a_shared_board_into_a_personal_space_is_refused() {
         .await
         .unwrap_err();
     assert!(refused.to_string().contains("personal space"), "{refused}");
-    assert!(writes(&server).await.is_empty());
+    assert_eq!(writes(&server).await, [] as [std::string::String; 0]);
 }
 
 // ── What names a use ───────────────────────────────────────────────────
@@ -1563,7 +1583,10 @@ async fn a_use_by_a_chart_the_caller_cannot_see_blocks_a_delete_without_naming_i
     let seen = super::super::dashboard_organise::Seen::read(&ch, &Viewer::user(id_of(OTHER), true))
         .await
         .unwrap();
-    assert!(seen.hidden_charts().is_empty());
+    assert_eq!(
+        seen.hidden_charts(),
+        [] as [lakehouse_bi::store::StoredChartSpec; 0]
+    );
 }
 
 /// A parameter that a dashboard in somebody's personal space shows still stops
@@ -1833,7 +1856,7 @@ async fn a_chart_added_to_a_tabbed_board_gets_its_tab_at_creation() {
     lakehouse_bi::store::place_new_chart(&ch, "b1", "c1")
         .await
         .unwrap();
-    assert!(writes(&none).await.is_empty());
+    assert_eq!(writes(&none).await, [] as [std::string::String; 0]);
     assert_eq!(writes(&server).await.len(), 1);
 }
 
@@ -2069,7 +2092,7 @@ async fn a_save_that_races_a_delete_writes_no_row() {
         serde_json::from_value(json!({ "c1": { "x": 0, "y": 0, "w": 6, "h": 4 } })).unwrap();
     let refused = lakehouse_bi::store::update_board_layout(&ch, "b1", &layout).await;
     assert!(refused.is_err(), "{refused:?}");
-    assert!(writes(&server).await.is_empty());
+    assert_eq!(writes(&server).await, [] as [std::string::String; 0]);
     // The built-in dashboard has no row until something is saved: its shell is
     // still written.
     let written = lakehouse_bi::store::update_board_layout(
@@ -2418,7 +2441,7 @@ async fn restoring_a_chart_whose_dashboard_is_in_the_trash_is_a_conflict() {
         body["error"],
         "Its dashboard is in the trash too: restore the dashboard first."
     );
-    assert!(writes(&server).await.is_empty());
+    assert_eq!(writes(&server).await, [] as [std::string::String; 0]);
 }
 
 /// R11: the payload's board list says which dashboard is private, so the page
@@ -2682,8 +2705,14 @@ mod engine {
         assert!(boards_you.is_empty(), "{boards_you:?}");
         assert!(hit_ids(search::search(&ch, &me, "secret").await.unwrap()).contains(&draft.id));
         // `%` and `_` are ordinary characters.
-        assert!(search::search(&ch, &me, "%").await.unwrap().is_empty());
-        assert!(search::search(&ch, &me, "a_c").await.unwrap().is_empty());
+        assert_eq!(
+            search::search(&ch, &me, "%").await.unwrap(),
+            [] as [lakehouse_bi::items::Entry; 0]
+        );
+        assert_eq!(
+            search::search(&ch, &me, "a_c").await.unwrap(),
+            [] as [lakehouse_bi::items::Entry; 0]
+        );
         // A draft cannot be shared, and a shared dashboard cannot be hidden by moving it.
         let refused = store::set_board_public(&ch, &draft.id, true)
             .await

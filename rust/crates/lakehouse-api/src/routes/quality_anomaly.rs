@@ -665,7 +665,10 @@ mod tests {
             load_at(&pool, "silver.orders", 4 - i, i64::from(i) * 1_000).await;
         }
         assert_eq!(note_load(&state, "silver.orders", 4_001).await, None);
-        assert!(open_incidents(&pool).await.is_empty());
+        assert_eq!(
+            open_incidents(&pool).await,
+            [] as [(std::string::String, std::string::String); 0]
+        );
         // The load is in the history all the same.
         assert_eq!(
             quality::recent_loads(&pool, "silver.orders", 50)
@@ -689,7 +692,10 @@ mod tests {
             None,
             "a normal load"
         );
-        assert!(open_incidents(&pool).await.is_empty());
+        assert_eq!(
+            open_incidents(&pool).await,
+            [] as [(std::string::String, std::string::String); 0]
+        );
 
         // The next load adds 100 rows: 10% of the usual 1000.
         let opened = note_load(&state, "silver.orders", 11_100).await;
@@ -803,7 +809,10 @@ mod tests {
         // A load ends the silence.
         load_at(&pool, "silver.orders", 0, 1_000).await;
         tick(&state).await;
-        assert!(open_incidents(&pool).await.is_empty());
+        assert_eq!(
+            open_incidents(&pool).await,
+            [] as [(std::string::String, std::string::String); 0]
+        );
     }
 
     /// Loads older than ninety days are forgotten on the tick.

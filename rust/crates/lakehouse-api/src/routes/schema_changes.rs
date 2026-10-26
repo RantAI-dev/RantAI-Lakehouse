@@ -826,7 +826,10 @@ mod tests {
         );
         assert_eq!(observed.columns.len(), 2);
         assert_eq!(observed.primary_key, vec!["id".to_owned()]);
-        assert!(lakehouse_store::schema_diff::diff(Some(&previous), &observed).is_empty());
+        assert_eq!(
+            lakehouse_store::schema_diff::diff(Some(&previous), &observed),
+            [] as [lakehouse_store::schema_diff::Change; 0]
+        );
         let before = shape_for_phase(
             Phase::BeforeLoad,
             Some(&previous),

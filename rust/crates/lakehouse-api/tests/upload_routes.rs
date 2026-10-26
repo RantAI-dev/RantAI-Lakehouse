@@ -851,9 +851,11 @@ impl Stack {
                 .unwrap()
                 .unwrap();
         }
-        sqlx::query(&format!(
+        // safe: `age` is one of this test file's own interval literals
+        // ("10 seconds", "1 hour", ...), never caller text.
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "UPDATE file_upload SET updated_at = now() - interval '{age}' WHERE id = $1"
-        ))
+        )))
         .bind(id)
         .execute(&self.app.pool)
         .await
@@ -1080,8 +1082,16 @@ async fn a_body_past_the_limit_is_refused_with_the_fixed_text_and_stores_nothing
         reply.json["error"],
         "The file is larger than the 50 MB limit."
     );
-    assert!(stack.bucket.keys().is_empty());
-    assert!(stack.audit_actions().await.is_empty());
+    assert_eq!(stack.bucket.keys(), [] as [std::string::String; 0]);
+    assert_eq!(
+        stack.audit_actions().await,
+        [] as [(
+            std::string::String,
+            std::option::Option<std::string::String>,
+            std::option::Option<std::string::String>,
+            serde_json::Value
+        ); 0]
+    );
     let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM file_upload")
         .fetch_one(&stack.app.pool)
         .await
@@ -1111,7 +1121,7 @@ async fn a_file_one_byte_over_the_cap_is_refused_by_size() {
         reply.json["error"],
         "The file is larger than the 50 MB limit."
     );
-    assert!(stack.bucket.keys().is_empty());
+    assert_eq!(stack.bucket.keys(), [] as [std::string::String; 0]);
 }
 
 /// The first bytes decide, never the name or the type the browser claimed.
@@ -1229,7 +1239,7 @@ async fn an_empty_file_a_missing_part_and_a_request_that_is_no_form_are_each_400
             "The request must be a multipart form with one part named file."
         );
     }
-    assert!(stack.bucket.keys().is_empty());
+    assert_eq!(stack.bucket.keys(), [] as [std::string::String; 0]);
 }
 
 /// A part that is not the file does not stand in for it, and a form read
@@ -1251,7 +1261,7 @@ async fn a_form_cut_off_mid_part_is_unreadable_in_one_fixed_sentence() {
         .await;
     assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.text);
     assert_eq!(reply.json["error"], "The upload could not be read.");
-    assert!(stack.bucket.keys().is_empty());
+    assert_eq!(stack.bucket.keys(), [] as [std::string::String; 0]);
 }
 
 /// A caller in no tenant has nowhere to put a file, and sees an empty list,
@@ -1300,7 +1310,7 @@ async fn an_x_tenant_the_caller_does_not_belong_to_is_404_and_stores_nothing() {
         )
         .await;
     assert_eq!(reply.status, StatusCode::NOT_FOUND);
-    assert!(stack.bucket.keys().is_empty());
+    assert_eq!(stack.bucket.keys(), [] as [std::string::String; 0]);
 }
 
 /// A deployment that has no storage credentials answers 503 with the fixed
@@ -3811,7 +3821,7 @@ async fn a_delete_removes_the_object_and_the_row() {
         .await;
 
     assert_eq!(delete.status, StatusCode::NO_CONTENT, "{}", delete.text);
-    assert!(delete.text.is_empty());
+    assert_eq!(delete.text, "");
     assert!(stack.bucket.keys().is_empty(), "the object is gone");
     let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM file_upload WHERE id = $1")
         .bind(&id)
@@ -3898,7 +3908,7 @@ async fn a_delete_of_a_loading_upload_whose_run_ended_is_settled_first() {
         .await;
 
     assert_eq!(delete.status, StatusCode::NO_CONTENT, "{}", delete.text);
-    assert!(stack.bucket.keys().is_empty());
+    assert_eq!(stack.bucket.keys(), [] as [std::string::String; 0]);
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -4052,7 +4062,15 @@ async fn a_workbook_that_cannot_be_read_or_is_not_named_like_one_is_refused_with
         stack.bucket.keys().is_empty(),
         "nothing was stored for a refused file"
     );
-    assert!(stack.audit_actions().await.is_empty());
+    assert_eq!(
+        stack.audit_actions().await,
+        [] as [(
+            std::string::String,
+            std::option::Option<std::string::String>,
+            std::option::Option<std::string::String>,
+            serde_json::Value
+        ); 0]
+    );
 }
 
 #[tokio::test]
@@ -4315,7 +4333,14 @@ async fn a_workbook_ingest_that_cannot_convert_claims_nothing_and_launches_nothi
     }
     assert!(stack.dagster.received_requests().await.unwrap().is_empty());
     assert_eq!(stack.status_of(&id).await.0, "uploaded");
-    assert!(stack.claims().await.is_empty());
+    assert_eq!(
+        stack.claims().await,
+        [] as [(
+            std::string::String,
+            std::option::Option<uuid::Uuid>,
+            std::string::String
+        ); 0]
+    );
     assert_eq!(
         stack.bucket.keys(),
         [format!("uploads/{GROUP}/{id}.xlsx")],
@@ -4496,7 +4521,15 @@ async fn a_parquet_file_that_cannot_be_read_or_is_not_named_like_one_is_refused_
         stack.bucket.keys().is_empty(),
         "nothing was stored for a refused file"
     );
-    assert!(stack.audit_actions().await.is_empty());
+    assert_eq!(
+        stack.audit_actions().await,
+        [] as [(
+            std::string::String,
+            std::option::Option<std::string::String>,
+            std::option::Option<std::string::String>,
+            serde_json::Value
+        ); 0]
+    );
 }
 
 #[tokio::test]
@@ -4694,7 +4727,14 @@ async fn a_parquet_ingest_that_cannot_convert_claims_nothing_and_launches_nothin
     assert_eq!(reply.json["error"], EMPTY_PARQUET);
     assert!(stack.dagster.received_requests().await.unwrap().is_empty());
     assert_eq!(stack.status_of(&id).await.0, "uploaded");
-    assert!(stack.claims().await.is_empty());
+    assert_eq!(
+        stack.claims().await,
+        [] as [(
+            std::string::String,
+            std::option::Option<uuid::Uuid>,
+            std::string::String
+        ); 0]
+    );
     assert_eq!(
         stack.bucket.keys(),
         [format!("uploads/{GROUP}/{id}.parquet")],

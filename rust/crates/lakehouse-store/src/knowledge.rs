@@ -122,7 +122,10 @@ const JOB_COLUMNS: &str = "id, name, status, source, source_id, output_asset_id,
 /// Returns [`StoreError::Database`] if the query fails.
 pub async fn list_sources(pool: &PgPool) -> Result<Vec<KnowledgeSource>, StoreError> {
     let sql = format!("SELECT {SOURCE_COLUMNS} FROM knowledge_source ORDER BY created_at DESC");
-    Ok(sqlx::query_as(&sql).fetch_all(pool).await?)
+    // safe: only the constant `SOURCE_COLUMNS` is formatted in; values are bound.
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+        .fetch_all(pool)
+        .await?)
 }
 
 /// List every vector job, newest first.
@@ -132,7 +135,10 @@ pub async fn list_sources(pool: &PgPool) -> Result<Vec<KnowledgeSource>, StoreEr
 /// Returns [`StoreError::Database`] if the query fails.
 pub async fn list_vector_jobs(pool: &PgPool) -> Result<Vec<VectorJob>, StoreError> {
     let sql = format!("SELECT {JOB_COLUMNS} FROM vector_job ORDER BY created_at DESC");
-    Ok(sqlx::query_as(&sql).fetch_all(pool).await?)
+    // safe: only the constant `JOB_COLUMNS` is formatted in; values are bound.
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+        .fetch_all(pool)
+        .await?)
 }
 
 /// Everything [`create_source`] needs. Mirrors `CreateKnowledgeSourceInput`.
@@ -171,7 +177,8 @@ pub async fn create_source(
          VALUES ($1, $2, $3, 'draft', $4, 'v1', $5, 'indexing', $6) \
          RETURNING {SOURCE_COLUMNS}"
     );
-    Ok(sqlx::query_as(&sql)
+    // safe: only the constant `SOURCE_COLUMNS` is formatted in; values are bound.
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(&id)
         .bind(&input.name)
         .bind(&input.kind)
@@ -223,7 +230,8 @@ pub async fn create_vector_job(
          VALUES ($1, $2, 'draft', $3, $4, $5, $6, $7) \
          RETURNING {JOB_COLUMNS}"
     );
-    Ok(sqlx::query_as(&sql)
+    // safe: only the constant `JOB_COLUMNS` is formatted in; values are bound.
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(&id)
         .bind(&input.name)
         .bind(&input.source)

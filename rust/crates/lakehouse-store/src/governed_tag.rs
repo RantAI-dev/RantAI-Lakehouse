@@ -132,10 +132,11 @@ pub async fn create_key(
 ) -> Result<TagKeyRow, StoreError> {
     validate_key(key)?;
     validate_allowed_values(allowed_values)?;
-    let row = sqlx::query_as(&format!(
+    // safe: only the constant `KEY_COLUMNS` is formatted in; values are bound.
+    let row = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "INSERT INTO governed_tag_key (key, allowed_values, created_by) \
          VALUES ($1, $2, $3) RETURNING {KEY_COLUMNS}"
-    ))
+    )))
     .bind(key)
     .bind(allowed_values)
     .bind(created_by)
@@ -150,9 +151,10 @@ pub async fn create_key(
 ///
 /// [`StoreError::Database`] if the query fails.
 pub async fn list_keys(pool: &PgPool) -> Result<Vec<TagKeyRow>, StoreError> {
-    let rows = sqlx::query_as(&format!(
+    // safe: only the constant `KEY_COLUMNS` is formatted in; values are bound.
+    let rows = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {KEY_COLUMNS} FROM governed_tag_key ORDER BY key"
-    ))
+    )))
     .fetch_all(pool)
     .await?;
     Ok(rows)
@@ -198,10 +200,11 @@ pub async fn update_key_values(
             parts.join(", ")
         )));
     }
-    let row = sqlx::query_as(&format!(
+    // safe: only the constant `KEY_COLUMNS` is formatted in; values are bound.
+    let row = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "UPDATE governed_tag_key SET allowed_values = $2, updated_at = now() \
          WHERE key = $1 RETURNING {KEY_COLUMNS}"
-    ))
+    )))
     .bind(key)
     .bind(allowed_values)
     .fetch_one(&mut *tx)
@@ -365,10 +368,11 @@ const TAG_COLUMNS: &str = "asset_id, tag_key, value, set_by, set_at";
 ///
 /// [`StoreError::Database`] if the query fails.
 pub async fn list_for_asset(pool: &PgPool, asset_id: &str) -> Result<Vec<AssetTagRow>, StoreError> {
-    let rows = sqlx::query_as(&format!(
+    // safe: only the constant `TAG_COLUMNS` is formatted in; values are bound.
+    let rows = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {TAG_COLUMNS} FROM asset_governed_tag \
          WHERE asset_id = $1 ORDER BY tag_key"
-    ))
+    )))
     .bind(asset_id)
     .fetch_all(pool)
     .await?;
@@ -386,10 +390,11 @@ pub async fn list_for_assets(
     pool: &PgPool,
     asset_ids: &[String],
 ) -> Result<Vec<AssetTagRow>, StoreError> {
-    let rows = sqlx::query_as(&format!(
+    // safe: only the constant `TAG_COLUMNS` is formatted in; values are bound.
+    let rows = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {TAG_COLUMNS} FROM asset_governed_tag \
          WHERE asset_id = ANY($1) ORDER BY asset_id, tag_key"
-    ))
+    )))
     .bind(asset_ids)
     .fetch_all(pool)
     .await?;

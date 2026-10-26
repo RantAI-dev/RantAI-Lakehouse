@@ -227,11 +227,11 @@
   {
     "id": "calc_validate_error",
     "mode": "build",
-    "turns": ["Is this formula right: Sum([jumlah_event]) / ( ? Check it on mart_event."],
+    "turns": ["Check this formula on mart_event: Sum([jumlah_event]) / ("],
     "expect_tool": {"name": "validate_formula", "args_contains": {"mart": "mart_event"}},
     "expect_no_tool": ["create_calculated_field"],
     "facts": [
-      {"label": "mistake", "kind": "text", "values": ["'?'"]}
+      {"label": "mistake", "kind": "text", "values": ["ends where a value was expected"], "aliases": {"ends where a value was expected": ["incomplete", "unterminated", "nothing to divide by", "missing", "tidak lengkap"]}}
     ]
   },
   {
@@ -507,7 +507,8 @@
     "confirm": true,
     "setup": [
       {"name": "board", "method": "POST", "path": "/api/dashboard/boards", "body": {"name": "Eval Move To Tab Board"}, "id_at": "board.id"},
-      {"name": "chart", "method": "POST", "path": "/api/dashboard/specs", "body": {"title": "Eval Tab Chart", "kind": "kpi", "mart": "mart_event", "measures": ["jumlah_event"], "board": "{board}"}, "id_at": "chart.id"}
+      {"name": "chart", "method": "POST", "path": "/api/dashboard/specs", "body": {"title": "Eval Tab Chart", "kind": "kpi", "mart": "mart_event", "measures": ["jumlah_event"], "board": "{board}"}, "id_at": "chart.id"},
+      {"method": "PUT", "path": "/api/dashboard/boards", "body": {"id": "{board}", "tabs": [{"id": "t_overview", "title": "Overview"}]}}
     ],
     "turns": [
       "Add a tab called Maps to dashboard {board}.",

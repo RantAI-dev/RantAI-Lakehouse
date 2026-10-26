@@ -247,7 +247,9 @@ pub async fn walk(
          FROM walk w JOIN column_lineage l ON l.id = w.id \
          GROUP BY l.id ORDER BY MIN(w.hop), l.id LIMIT {MAX_WALK_ROWS}"
     );
-    let rows = sqlx::query_as(&sql)
+    // safe: the table/column names come from `match direction` over constants, plus
+    // `MAX_HOPS`/`MAX_WALK_ROWS`; values are bound.
+    let rows = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(table)
         .bind(column)
         .bind(scope.shared)
@@ -270,7 +272,8 @@ pub async fn touching_table(
     table: &str,
     scope: Scope,
 ) -> Result<Vec<MappingRow>, StoreError> {
-    let rows = sqlx::query_as(&format!(
+    // safe: only the constant `MAX_WALK_ROWS` is formatted in; values are bound.
+    let rows = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT id, producer_kind, producer_ref, from_table, from_column, to_table, to_column, \
                 transform, partial, reason, recorded_at, 1 AS hop \
          FROM column_lineage \
@@ -278,7 +281,7 @@ pub async fn touching_table(
            AND ((tenant_id IS NULL AND $2) OR (tenant_id IS NOT NULL AND ($3 OR tenant_id = $4))) \
            AND (producer_kind <> 'sql_source' OR $5) \
          ORDER BY to_table, to_column, id LIMIT {MAX_WALK_ROWS}"
-    ))
+    )))
     .bind(table)
     .bind(scope.shared)
     .bind(scope.all_tenants)
@@ -319,9 +322,10 @@ pub async fn oldest_recorded_at(
 ///
 /// [`StoreError::Database`] if the delete fails.
 pub async fn purge_expired(pool: &PgPool) -> Result<u64, StoreError> {
-    let done = sqlx::query(&format!(
+    // safe: only the constant `RETENTION_DAYS` is formatted in; values are bound.
+    let done = sqlx::query(sqlx::AssertSqlSafe(format!(
         "DELETE FROM column_lineage WHERE recorded_at < now() - interval '{RETENTION_DAYS} days'"
-    ))
+    )))
     .execute(pool)
     .await?;
     Ok(done.rows_affected())

@@ -32,6 +32,7 @@ yield nothing.
 
 from __future__ import annotations
 
+import os
 import unittest
 from unittest import mock
 from unittest.mock import MagicMock
@@ -41,6 +42,7 @@ import requests
 from dagster import (
     AssetMaterialization,
     DefaultScheduleStatus,
+    Failure,
     RunRequest,
     build_op_context,
 )
@@ -66,6 +68,10 @@ def _cfg(run_token: str = "a-real-token") -> GoldExportConfig:
         api_url="http://lakehouse-api.invalid:8080",
         marts=[],
         run_token=run_token,
+        # `SEC-37`: the two S3 credentials are required dataclass fields now
+        # (no `rustfsadmin` default); these tests never reach S3.
+        rustfs_access_key="test-access-key",
+        rustfs_secret_key="test-secret-key",
     )
 
 
@@ -75,6 +81,33 @@ class _FakeContext:
 
     def __init__(self) -> None:
         self.log = MagicMock()
+
+
+class GoldExportConfigFromEnvTests(unittest.TestCase):
+    """`SEC-37`: `from_env` used to fall back to the literal `rustfsadmin`
+    for the two S3 credentials. It must name the unset variable and fail
+    (`Failure`, config — no retry helps), never build a config from a
+    credential written in the repository."""
+
+    def test_from_env_names_an_unset_s3_access_key_and_does_not_default_one(
+        self,
+    ) -> None:
+        with mock.patch.dict(
+            os.environ, {"CONNECTOR_S3_SECRET_KEY": "a-real-secret"}, clear=True
+        ):
+            with self.assertRaises(Failure) as raised:
+                GoldExportConfig.from_env()
+        self.assertIn("CONNECTOR_S3_ACCESS_KEY", str(raised.exception))
+
+    def test_from_env_names_an_unset_s3_secret_key_and_does_not_default_one(
+        self,
+    ) -> None:
+        with mock.patch.dict(
+            os.environ, {"CONNECTOR_S3_ACCESS_KEY": "a-real-key"}, clear=True
+        ):
+            with self.assertRaises(Failure) as raised:
+                GoldExportConfig.from_env()
+        self.assertIn("CONNECTOR_S3_SECRET_KEY", str(raised.exception))
 
 
 class GoldExportHeaderTests(unittest.TestCase):
@@ -583,7 +616,15 @@ class GoldKeepCopiesParsingTests(unittest.TestCase):
         self.assertEqual(str(ctx.exception), "invalid GOLD_KEEP_COPIES")
 
     def test_config_from_env_defaults(self) -> None:
-        with mock.patch.dict("os.environ", {}, clear=True):
+        with mock.patch.dict(
+            "os.environ",
+            {
+                # `SEC-37`: required, no `rustfsadmin` fallback.
+                "CONNECTOR_S3_ACCESS_KEY": "test-access-key",
+                "CONNECTOR_S3_SECRET_KEY": "test-secret-key",
+            },
+            clear=True,
+        ):
             cfg = GoldExportConfig.from_env()
             self.assertEqual(cfg.gold_keep_copies, "7")
             self.assertEqual(cfg.gold_export_token_file, "/tokens/gold-export.jwt")
@@ -595,6 +636,9 @@ class GoldKeepCopiesParsingTests(unittest.TestCase):
             {
                 "GOLD_KEEP_COPIES": "14",
                 "LAKEKEEPER_GOLD_EXPORT_TOKEN_FILE": "/custom/path/gold.jwt",
+                # `SEC-37`: required, no `rustfsadmin` fallback.
+                "CONNECTOR_S3_ACCESS_KEY": "test-access-key",
+                "CONNECTOR_S3_SECRET_KEY": "test-secret-key",
             },
             clear=True,
         ):
@@ -646,7 +690,15 @@ class GoldOrphanMinAgeParsingTests(unittest.TestCase):
         self.assertEqual(str(ctx.exception), "invalid GOLD_ORPHAN_MIN_AGE_SECONDS")
 
     def test_config_from_env_defaults(self) -> None:
-        with mock.patch.dict("os.environ", {}, clear=True):
+        with mock.patch.dict(
+            "os.environ",
+            {
+                # `SEC-37`: required, no `rustfsadmin` fallback.
+                "CONNECTOR_S3_ACCESS_KEY": "test-access-key",
+                "CONNECTOR_S3_SECRET_KEY": "test-secret-key",
+            },
+            clear=True,
+        ):
             cfg = GoldExportConfig.from_env()
             self.assertEqual(cfg.gold_orphan_min_age_seconds, "3600")
             self.assertEqual(parse_gold_orphan_min_age_seconds(cfg.gold_orphan_min_age_seconds), 3600)
@@ -656,6 +708,9 @@ class GoldOrphanMinAgeParsingTests(unittest.TestCase):
             "os.environ",
             {
                 "GOLD_ORPHAN_MIN_AGE_SECONDS": "0",
+                # `SEC-37`: required, no `rustfsadmin` fallback.
+                "CONNECTOR_S3_ACCESS_KEY": "test-access-key",
+                "CONNECTOR_S3_SECRET_KEY": "test-secret-key",
             },
             clear=True,
         ):
