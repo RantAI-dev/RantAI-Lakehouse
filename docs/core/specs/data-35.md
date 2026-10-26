@@ -48,9 +48,9 @@ changes on the feature page before the plan is written.
 | Folders inside folders | n/a | Allowed, at most 3 levels *(proposed)* |
 | Rename | n/a | A folder can be renamed; names are unique among the folders that share a parent |
 | Delete | n/a | Only an empty folder; the delete control is disabled, with the reason, while it holds files |
-| Who | Uploading needs `connector:manage` | Creating, renaming, moving and deleting need the same permission *(proposed)*; everyone who can see the tab sees the folders |
+| Who | Every upload route and the whole Sources page need `connector:manage` (`policy.rs:805-826`, `:663`) | The folder routes need the same permission *(proposed)*: whoever can open the tab manages its folders; anyone else is refused, as for the tab today |
 | Scope | Uploads belong to a tenant | Folders belong to a tenant, the same set for everyone in it *(proposed)*; never visible to another tenant (`SEC-16`) |
-| Search | The tab's search matches file names | Search still covers every folder, and each result shows its folder |
+| Search | None: the tab is a plain table of the newest 100 uploads (`uploads-panel.tsx`, `LIST_LIMIT` in `routes/uploads.rs`) | A search box on the tab that covers every folder, each result showing its folder |
 
 ## Benchmark
 
@@ -67,7 +67,7 @@ Run on a running console by the product owner. A step not performed is never a p
 - `DATA-35-AC2` Move that file and another one to a third folder, then to "No folder": both follow; their tables, a chart reading one of them and its lineage are unchanged
 - `DATA-35-AC3` Re-upload into the first file's table: the new file joins the table's folder
 - `DATA-35-AC4` A folder holding a file: its delete control is disabled and says why; after the file is moved out, the folder can be deleted
-- `DATA-35-AC5` A user without `connector:manage` sees the folders but cannot create, rename, move or delete; a user of another tenant sees none of them
+- `DATA-35-AC5` A user without `connector:manage` is refused on the folder routes, as on the tab today; a user of another tenant sees none of the folders
 - `DATA-35-AC6` Search the tab for a file in a folder: it is found, with its folder shown
 
 ## Not included
