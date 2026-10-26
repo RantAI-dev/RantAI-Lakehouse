@@ -670,6 +670,37 @@ async fn insert_history_row(
         .unwrap();
 }
 
+/// Inserts one history row at an exact `at`, so a test can put two rows
+/// inside one millisecond — the case the page cursor has to survive.
+async fn insert_history_row_at(pool: &PgPool, id: &str, owner: Uuid, at: OffsetDateTime) {
+    record_history(
+        pool,
+        &RecordHistoryInput {
+            id,
+            sql: "SELECT 1",
+            user: "Bootstrap Admin",
+            owner_id: Some(owner),
+            status: "completed",
+            duration_ms: 1,
+            scanned_bytes: 1,
+            cost_units: 0.1,
+            workload_class: "hot-analytics",
+            engine: "clickhouse",
+            cache_assisted: false,
+            tables_read: &[],
+            message: None,
+        },
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE query_history SET at = $2 WHERE id = $1")
+        .bind(id)
+        .bind(at)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
 /// Each filter on its own keeps exactly the rows it names — the one-axis
 /// questions the history page's bar asks — and another user's rows answer
 /// none of them.
@@ -1026,6 +1057,152 @@ async fn a_percent_or_underscore_in_the_table_filter_is_literal(pool: PgPool) ->
         sorted_ids(&literal_underscore),
         ["q-under"],
         "_ is a literal underscore"
+    );
+    Ok(())
+}
+
+/// Two rows of one owner inside one millisecond come back exactly once
+/// across the page boundary.
+///
+/// The value a row's `at` leaves the store with is cut to milliseconds, so
+/// the cursor the console carries for the last row of a page is that
+/// millisecond. The page after it must compare on the same value: a
+/// comparison against the stored microsecond `at` skips every row inside
+/// the last page's millisecond, and those rows are never seen again.
+#[sqlx::test(migrations = "../../migrations")]
+async fn two_rows_in_one_millisecond_come_back_exactly_once_across_the_page_boundary(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let owner = Uuid::new_v4();
+    // A whole second an hour ago: inside the window the store clamps to,
+    // and with no sub-second part to round away.
+    let base = OffsetDateTime::now_utc()
+        .replace_nanosecond(0)
+        .expect("a whole second")
+        - time::Duration::hours(1);
+    // A page holds 50 rows, so 49 newer rows put the two rows of one
+    // millisecond at the end of the first page and at the start of the
+    // next — the boundary the console's cursor is built from.
+    for i in 0..49 {
+        insert_history_row_at(
+            &pool,
+            &format!("q-fill-{i:02}"),
+            owner,
+            base + time::Duration::seconds(1),
+        )
+        .await;
+    }
+    insert_history_row_at(
+        &pool,
+        "q-a",
+        owner,
+        base + time::Duration::microseconds(100),
+    )
+    .await;
+    insert_history_row_at(
+        &pool,
+        "q-b",
+        owner,
+        base + time::Duration::microseconds(150),
+    )
+    .await;
+
+    let page_one = list_history(&pool, owner, &HistoryFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(page_one.len(), 50);
+    let last = page_one.last().unwrap();
+    assert_eq!(last.id, "q-b", "the newer of the two rows ends the page");
+    let cursor_at =
+        OffsetDateTime::parse(&last.at, &time::format_description::well_known::Rfc3339).unwrap();
+    assert!(
+        last.at.ends_with('Z'),
+        "the cursor carries an ISO timestamp: {}",
+        last.at
+    );
+    assert_eq!(
+        cursor_at.millisecond(),
+        0,
+        "the cursor carries whole milliseconds: {}",
+        last.at
+    );
+
+    let page_two = list_history(
+        &pool,
+        owner,
+        &HistoryFilter {
+            before_at: Some(cursor_at),
+            before_id: Some(&last.id),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        row_ids(&page_two),
+        ["q-a"],
+        "the row inside the last page's millisecond comes back"
+    );
+
+    let mut seen: Vec<&str> = page_one.iter().map(|r| r.id.as_str()).collect();
+    seen.extend(page_two.iter().map(|r| r.id.as_str()));
+    let mut sorted = seen.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(seen.len(), sorted.len(), "no repeats");
+    assert_eq!(seen.len(), 51, "no skips");
+    Ok(())
+}
+
+/// A `\` in the table text is matched literally: it is the escape
+/// character of the match, so it has to survive the chain that makes `%`
+/// and `_` literal — and it never turns into a wildcard.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_backslash_in_the_table_filter_matches_literally(pool: PgPool) -> sqlx::Result<()> {
+    let owner = Uuid::new_v4();
+    insert_history_row(
+        &pool,
+        "q-backslash",
+        owner,
+        "completed",
+        "clickhouse",
+        1,
+        &["bronze\\orders"],
+        None,
+        0,
+    )
+    .await;
+
+    let literal = list_history(
+        &pool,
+        owner,
+        &HistoryFilter {
+            table: Some("bronze\\orders"),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        sorted_ids(&literal),
+        ["q-backslash"],
+        "a backslash is a literal backslash"
+    );
+
+    let wildcard = list_history(
+        &pool,
+        owner,
+        &HistoryFilter {
+            table: Some("bronze%orders"),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        wildcard.is_empty(),
+        "a percent is still a literal percent: {:?}",
+        row_ids(&wildcard)
     );
     Ok(())
 }
