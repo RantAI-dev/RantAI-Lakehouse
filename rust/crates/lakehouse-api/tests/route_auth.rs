@@ -2668,8 +2668,16 @@ async fn the_moved_dashboard_reads_are_refused_without_a_rule_and_pass_with_one(
 async fn the_moved_dashboard_writes_need_edit_or_manage_both_ways() {
     let TestApp { router, pool } = spin_up().await;
     // (method, uri, body, needs manage)
-    let moved: [(&str, &str, &str, bool); 14] = [
+    let moved: [(&str, &str, &str, bool); 16] = [
         ("POST", "/api/dashboard/specs", r#"{"board":"b1"}"#, false),
+        // BI-19 part D (plan D14): importing a dashboard file is creating one.
+        (
+            "POST",
+            "/api/dashboard/import/preview",
+            r#"{"file":{}}"#,
+            false,
+        ),
+        ("POST", "/api/dashboard/import", r#"{"file":{}}"#, false),
         (
             "PUT",
             "/api/dashboard/specs",

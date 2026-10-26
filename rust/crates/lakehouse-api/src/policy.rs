@@ -654,6 +654,11 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("GET",    "/api/dashboard/records",      Policy::RequiresAuth),
     ("GET",    "/api/dashboard/values",       Policy::RequiresAuth),
     ("GET",    "/api/dashboard/export",       Policy::RequiresAuth),
+    // BI-19 part D (plan D14): the floor is "signed in"; each handler asks for
+    // `edit` somewhere and `edit` on the folder the dashboard is filed in, as
+    // `POST /api/dashboard/boards` does (route_auth asserts both ways).
+    ("POST",   "/api/dashboard/import/preview", Policy::RequiresAuth),
+    ("POST",   "/api/dashboard/import",       Policy::RequiresAuth),
     // BI-16 part A (T8): the whole result of a raw table as CSV. Same
     // permission as seeing the tile; every export is audited.
     ("GET",    "/api/dashboard/table-export", Policy::RequiresAuth),

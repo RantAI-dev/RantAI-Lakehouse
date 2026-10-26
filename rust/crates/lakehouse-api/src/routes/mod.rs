@@ -30,6 +30,7 @@ mod connector_runs;
 mod connectors;
 mod dashboard;
 pub(crate) mod dashboard_access;
+mod dashboard_file;
 mod dashboard_folders;
 pub(crate) mod dashboard_organise;
 mod dashboard_sources;
@@ -177,7 +178,11 @@ fn route_timeout(path: &str) -> Duration {
     match path {
         "/api/ai/chat" => *AI_CHAT_TIMEOUT,
         "/api/uploads" | "/api/maps" => UPLOAD_REQUEST_TIMEOUT,
-        "/api/dashboard/chart-export" | "/api/dashboard/table-export" => EXPORT_REQUEST_TIMEOUT,
+        // BI-19 part D: an import checks and runs each of up to 200 charts, so it
+        // gets the export deadline too.
+        "/api/dashboard/chart-export" | "/api/dashboard/table-export" | "/api/dashboard/import" => {
+            EXPORT_REQUEST_TIMEOUT
+        }
         "/api/dashboard/export/pdf" => PDF_REQUEST_TIMEOUT,
         // RPT-1: "Send now" makes the PDF and the chart files in the request,
         // so it gets the longest export deadline.
@@ -1255,6 +1260,15 @@ pub fn router(state: AppState) -> Router {
         .route("/api/dashboard/records", get(dashboard::records))
         .route("/api/dashboard/values", get(dashboard::values))
         .route("/api/dashboard/export", get(dashboard::export))
+        // BI-19 part D (plan D14): a dashboard file in, with a mapping preview.
+        .route(
+            "/api/dashboard/import/preview",
+            axum::routing::post(dashboard_file::import_preview),
+        )
+        .route(
+            "/api/dashboard/import",
+            axum::routing::post(dashboard_file::import),
+        )
         .route("/api/dashboard/table-export", get(dashboard::table_export))
         .route("/api/dashboard/chart-export", get(dashboard::chart_export))
         // BI-14 (D1): where a chart comes from. `lineage:read` (owner decision Q6).

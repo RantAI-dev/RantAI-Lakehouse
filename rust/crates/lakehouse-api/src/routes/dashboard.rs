@@ -1890,6 +1890,88 @@ pub async fn boards_update(
     Ok(ApiJson(with_embed_access(json!({ "ok": true }))))
 }
 
+/// The settings of an imported dashboard file (`BI-19` part D, plan D14), as
+/// [`apply_imported_content`] takes them.
+pub(crate) struct ImportedContent {
+    pub filters: Vec<FilterDef>,
+    pub tabs: Vec<lakehouse_bi::layout::Tab>,
+    pub layout: LayoutMap,
+    pub phone_layout: Vec<lakehouse_bi::layout::PhoneTile>,
+    pub params: Vec<lakehouse_bi::params::BoardParam>,
+    pub grain: Option<String>,
+    pub refresh_seconds: Option<u32>,
+    pub theme: Option<String>,
+    pub font: Option<String>,
+}
+
+/// Save an imported file's settings on a board the importer just made, through
+/// the same checks and writes as `PUT /api/dashboard/boards` (tab rules, filter
+/// ties, theme and font allowed by the administrator, refresh interval, saved
+/// parameters, grain), so a file cannot save what the editor could not.
+///
+/// # Errors
+///
+/// 400 with the editor's own sentence for the first check that fails, before
+/// that check's write; the caller takes the half-made board back.
+pub(crate) async fn apply_imported_content(
+    state: &AppState,
+    board: &str,
+    content: ImportedContent,
+) -> Result<(), ApiError> {
+    let ch = &state.clickhouse;
+    let parsed = BoardEditBody {
+        id: Some(board.to_owned()),
+        layout: Some(content.layout),
+        filters: Some(content.filters),
+        refresh_seconds: content.refresh_seconds.map(i64::from),
+        grain: content.grain,
+        params: Some(content.params),
+        tabs: Some(content.tabs),
+        phone_layout: Some(content.phone_layout),
+        theme: content.theme,
+        font: content.font,
+        ..BoardEditBody::default()
+    };
+    if let Some(filters) = &parsed.filters {
+        validate_filters(filters).map_err(ApiError::BadRequest)?;
+    }
+    check_tab_rules(ch, board, &parsed).await?;
+    check_theme_and_font(state, &parsed).await?;
+    let refresh = checked_refresh(parsed.refresh_seconds)?;
+    let checked_params =
+        crate::routes::params::check_board_params_opt(ch, parsed.params.as_deref()).await?;
+    if let Some(grain) = &parsed.grain
+        && !grain.trim().is_empty()
+    {
+        parse_grain_param(Some(grain))?;
+    }
+    if let Some(layout) = &parsed.layout {
+        store::update_board_layout(ch, board, layout)
+            .await
+            .map_err(|err| board_write_error(&err))?;
+    }
+    if let Some(seconds) = refresh {
+        store::update_board_refresh(ch, board, seconds)
+            .await
+            .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
+    }
+    save_grain_and_params(
+        ch,
+        board,
+        parsed.grain.as_deref(),
+        checked_params.as_deref(),
+    )
+    .await?;
+    save_tabs_and_phone_layout(ch, board, &parsed).await?;
+    if let Some(filters) = &parsed.filters {
+        let filters = without_inert(filters);
+        store::update_board_filters(ch, board, &filters)
+            .await
+            .map_err(|err| board_write_error(&err))?;
+    }
+    Ok(())
+}
+
 /// `DELETE /api/dashboard/boards?id=` — delete a board and its charts.
 ///
 /// # Errors
@@ -4172,6 +4254,18 @@ pub(crate) async fn values_with_limit(
 
 // ── /api/dashboard/export ───────────────────────────────────────────────
 
+/// Query of `GET /api/dashboard/export`.
+#[derive(Debug, Default, Deserialize)]
+pub struct ExportQuery {
+    /// `yaml` (default: every dashboard) or `file` (one dashboard as a JSON
+    /// file, `BI-19` part D).
+    #[serde(default)]
+    format: Option<String>,
+    /// The dashboard, with `format=file`.
+    #[serde(default)]
+    board: Option<String>,
+}
+
 /// `GET /api/dashboard/export` — every board + stored chart, as a minimal
 /// hand-rolled `YAML` document. The only non-`JSON` response in this crate:
 /// returned directly as `text/yaml`, bypassing [`ApiJson`].
@@ -4182,7 +4276,23 @@ pub(crate) async fn values_with_limit(
 pub async fn export(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
+    Query(q): Query<ExportQuery>,
 ) -> ApiResult<Response> {
+    // BI-19 part D (plan D14): `format=file` is one dashboard as a JSON file.
+    match q.format.as_deref() {
+        None | Some("" | "yaml") => {}
+        Some("file") => {
+            return crate::routes::dashboard_file::export_file(
+                &state,
+                &principal,
+                q.board.as_deref(),
+            )
+            .await;
+        }
+        Some(_) => {
+            return Err(ApiError::BadRequest("format must be yaml or file.".to_owned()).into());
+        }
+    }
     // The file is the caller's view of the dashboards: no deleted board or
     // chart, and no other user's personal space (BI-18 part C, part 2).
     let viewer = viewer_for(&state, &principal).await?;

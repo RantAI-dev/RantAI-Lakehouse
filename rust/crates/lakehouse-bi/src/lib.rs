@@ -8,6 +8,7 @@ pub mod access;
 pub mod bin;
 pub mod builder;
 pub mod click;
+pub mod dashboard_file;
 pub mod embed_access;
 pub mod export_format;
 pub mod fields;

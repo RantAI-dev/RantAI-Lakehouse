@@ -1664,6 +1664,57 @@ async fn the_export_file_leaves_out_a_restricted_dashboard_for_the_unlisted() {
     }
 }
 
+/// `BI-19` part D (plan D14): the dashboard file reads through the requester's
+/// resolved viewer, so a restricted dashboard is the same 404 as an unknown one
+/// for somebody who is not listed.
+#[tokio::test]
+async fn the_dashboard_file_of_a_restricted_dashboard_is_a_404_like_an_unknown_one() {
+    let (router, pool, _ch) = app().await;
+    let listed = create_principal_with_permissions(&pool, "dashboard:read").await;
+    let outsider = create_principal_with_permissions(&pool, "dashboard:read").await;
+    replace_item(
+        &pool,
+        "folder",
+        "f1",
+        &[rule_for(listed, "view")],
+        true,
+        None,
+    )
+    .await
+    .unwrap();
+    let cookie = session_cookie_for_user(&pool, outsider).await;
+    let (hidden, hidden_body) = get(
+        &router,
+        &cookie,
+        "/api/dashboard/export?format=file&board=b_secret",
+    )
+    .await;
+    let (unknown, unknown_body) = get(
+        &router,
+        &cookie,
+        "/api/dashboard/export?format=file&board=nope",
+    )
+    .await;
+    assert_eq!(hidden, StatusCode::NOT_FOUND);
+    assert_eq!(
+        (hidden, &hidden_body),
+        (unknown, &unknown_body),
+        "a restricted dashboard and one that does not exist answer alike"
+    );
+    let cookie = session_cookie_for_user(&pool, listed).await;
+    let (status, _) = get(
+        &router,
+        &cookie,
+        "/api/dashboard/export?format=file&board=b_secret",
+    )
+    .await;
+    assert_ne!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a listed person is not told 404"
+    );
+}
+
 // ── BI-19 B2 re-review: S4-b (every by-id source path), folder delete, restore ──
 
 /// A reply with the id of the source taken out, so the answer for a hidden

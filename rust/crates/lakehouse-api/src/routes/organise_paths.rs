@@ -470,6 +470,7 @@ async fn the_yaml_export_holds_only_what_the_caller_may_see() {
     let response = export(
         State(state_for(&server)),
         Extension(person(ME, "dashboard:read")),
+        Query(crate::routes::dashboard::ExportQuery::default()),
     )
     .await
     .done("the export builds");

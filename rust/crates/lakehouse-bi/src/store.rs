@@ -2601,10 +2601,13 @@ pub async fn delete_board(ch: &ChClient, id: &str, deleted_by: &str) -> Result<(
 /// charts stays private. The charts go first, like a delete does, so a
 /// failure cannot leave live charts on a board that is gone.
 ///
+/// `pub` since BI-19 part D: a dashboard import that fails after the board was
+/// created takes it back the same way a failed copy does.
+///
 /// # Errors
 ///
 /// Returns [`ChError`] on a `ClickHouse` failure.
-async fn wipe_board(ch: &ChClient, id: &str) -> Result<(), ChError> {
+pub async fn wipe_board(ch: &ChClient, id: &str) -> Result<(), ChError> {
     let charts = format!(
         "INSERT INTO console.bi_chart (id, title, spec_json, board, created_by, is_deleted) \
          SELECT id, '', '{{}}', board, 'system', 1 FROM console.bi_chart FINAL \
