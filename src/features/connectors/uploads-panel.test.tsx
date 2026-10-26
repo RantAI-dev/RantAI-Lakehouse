@@ -309,7 +309,9 @@ describe("UploadsPanel folders", () => {
     await screen.findByText("loose.csv")
 
     fireEvent.click(folderNav().getByRole("button", { name: /^Q1/ }))
-    await waitFor(() => expect(screen.queryByText("loose.csv")).toBeNull())
+    // Compared as a boolean: while the element is still there, bun formats the whole DOM node into the
+    // failure message on every poll, which took ~8 s and timed this test out (PR #259 CI).
+    await waitFor(() => expect(screen.queryByText("loose.csv") !== null).toBe(false))
     expect(screen.getByText("jan.csv")).toBeDefined()
     expect(calls.map((c) => c.url)).toContain("/api/uploads?folderId=uf-q1")
     expect(screen.queryByRole("columnheader", { name: "Folder" })).toBeNull()
@@ -327,7 +329,7 @@ describe("UploadsPanel folders", () => {
 
     fireEvent.change(screen.getByRole("textbox", { name: "Search uploaded files" }), { target: { value: " jan " } })
     await waitFor(() => expect(calls.map((c) => c.url)).toContain("/api/uploads?q=jan"))
-    await waitFor(() => expect(screen.queryByText("loose.csv")).toBeNull())
+    await waitFor(() => expect(screen.queryByText("loose.csv") !== null).toBe(false))
     expect(screen.getByText("Searching every folder.")).toBeDefined()
     expect(within(rowOf("jan.csv")).getByText("Sales / Q1")).toBeDefined()
   })
@@ -358,7 +360,7 @@ describe("UploadsPanel folders", () => {
 
     await waitFor(() => expect(calls.some((c) => c.url === "/api/uploads/move")).toBe(true))
     expect(calls.find((c) => c.url === "/api/uploads/move")?.body).toEqual({ uploadIds: ["up-1", "up-2"], folderId: null })
-    await waitFor(() => expect(screen.queryByText("2 selected")).toBeNull())
+    await waitFor(() => expect(screen.queryByText("2 selected") !== null).toBe(false))
   })
 
   it("moves a file into a folder chosen in the picker", async () => {
@@ -451,7 +453,7 @@ describe("UploadsPanel folders", () => {
 
     refuse = false
     fireEvent.click(screen.getByRole("button", { name: "Create" }))
-    await waitFor(() => expect(screen.queryByText("New folder in Ops")).toBeNull())
+    await waitFor(() => expect(screen.queryByText("New folder in Ops") !== null).toBe(false))
     const posts = calls.filter((c) => c.method === "POST" && c.url === "/api/uploads/folders")
     expect(posts.map((c) => c.body)).toEqual([
       { name: "Archive", parentId: "uf-ops" },
