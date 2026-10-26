@@ -352,6 +352,20 @@ pub struct QueryHistoryItem {
     /// Whether the result was served (partly) from cache. Serializes as
     /// `cacheAssisted`.
     pub cache_assisted: bool,
+    /// The tables the statement names as written, as
+    /// `sql_rewrite::referenced_tables` parsed them when the run was
+    /// recorded (`QS-4`, decision 4). Empty for a statement that does not
+    /// parse, and for every row recorded before
+    /// `0111_query_history_detail.sql`, which backfills nothing.
+    /// Serializes as `tablesRead`.
+    pub tables_read: Vec<String>,
+    /// The exact text the response gave the caller for a failed or refused
+    /// run — fixed and classified before it was stored, never the engine's
+    /// raw text (principle 4). `None` for a completed run and for every
+    /// row recorded before `0111_query_history_detail.sql`. Omitted from
+    /// JSON when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
     /// The newest real `audit_event` row recorded against this history row
     /// (`resource_kind = 'query_history'`, `resource_id = id`), resolved on
     /// read via a lateral join in [`list_history`] — never stored. `None`
@@ -383,6 +397,8 @@ struct QueryHistoryRow {
     workload_class: String,
     engine: String,
     cache_assisted: bool,
+    tables_read: Vec<String>,
+    message: Option<String>,
     audit_event_id: Option<String>,
     owner_id: Option<Uuid>,
 }
@@ -401,24 +417,94 @@ impl From<QueryHistoryRow> for QueryHistoryItem {
             workload_class: row.workload_class,
             engine: row.engine,
             cache_assisted: row.cache_assisted,
+            tables_read: row.tables_read,
+            message: row.message,
             audit_event_id: row.audit_event_id,
             owner_id: row.owner_id,
         }
     }
 }
 
-/// The most history rows [`list_history`] returns. The console's history
-/// panel is a recent-activity view, not an archive browser; an unbounded
-/// `SELECT *` would grow without limit as `routes::query::run` keeps
-/// inserting.
-const HISTORY_LIST_LIMIT: i64 = 200;
+/// The filters the history page sends (`QS-4`, decision 5). The route
+/// parses and validates the query string into this; [`list_history`] binds
+/// every value, so its SQL is one constant statement. `None` means "no
+/// filter on this axis", and the all-`None` default is the side panel's
+/// and the page's first view: the newest page of the last 14 days.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct HistoryFilter<'a> {
+    /// `completed | failed | cancelled | blocked` — the statuses the
+    /// table's own check allows. The route rejects anything else with a
+    /// 400 before this is built.
+    pub status: Option<&'a str>,
+    /// `clickhouse | trino` — the engines `run` records. The route
+    /// rejects anything else with a 400 before this is built.
+    pub engine: Option<&'a str>,
+    /// Only runs that took at least this many milliseconds.
+    pub min_duration_ms: Option<i64>,
+    /// A table the run read: matched against every element of
+    /// `tables_read`, case-insensitively, as a contains-match in which
+    /// `%` and `_` are literal (decision 7).
+    pub table: Option<&'a str>,
+    /// The window's start. [`list_history`] clamps it to now minus 14
+    /// days (decision 2): the page shows the last fortnight, whatever the
+    /// caller asks for.
+    pub from: Option<OffsetDateTime>,
+    /// The window's end, inclusive.
+    pub to: Option<OffsetDateTime>,
+    /// The page cursor's `at` half: the `at` of the last row the caller
+    /// has already seen. With [`HistoryFilter::before_id`] it pages
+    /// without repeats or skips.
+    pub before_at: Option<OffsetDateTime>,
+    /// The page cursor's `id` half, breaking ties between rows that share
+    /// an `at` (rows land in one millisecond more often than a cursor
+    /// built on `at` alone could survive).
+    pub before_id: Option<&'a str>,
+}
 
-/// List one user's recorded query executions, most recent first.
+/// The page size of [`list_history`]: the most rows any one answer
+/// carries. "Load more" asks for the next page with the cursor (decision
+/// 5), so no answer grows as `routes::query::run` keeps inserting, and
+/// reaching an older row is what the filters are for — the side panel's
+/// old first bite of 200 is not kept.
+const HISTORY_PAGE_LIMIT: i64 = 50;
+
+/// List one user's recorded query executions, filtered, most recent
+/// first, one page at a time.
 ///
 /// History holds the SQL people typed, which is as private as the chat
 /// sessions in `console.chat_session`: before `owner_id` existed this
 /// listed the whole table, so everyone read everyone else's queries. Rows
 /// recorded before then have no owner and are returned to nobody.
+///
+/// # One constant statement
+///
+/// Every filter is a `$n IS NULL OR ...` arm, so the SQL never changes
+/// shape and every value is bound — `format!` has nothing to do here
+/// (decision 5; the repo rule that only constant identifiers may be
+/// interpolated). An absent filter costs Postgres one null test per row
+/// and buys a statement whose shape Postgres can learn once.
+///
+/// # The 14-day window (decision 2)
+///
+/// `GREATEST(COALESCE($6, now() - interval '14 days'), now() - interval
+/// '14 days')` floors the window at now minus 14 days: Postgres's
+/// `GREATEST` ignores null arguments, so a null `from` falls to the floor
+/// and a `from` older than the floor is clamped to it. Nothing is
+/// deleted — an older row is still in the table, it is just not listed.
+///
+/// # The cursor (decision 5)
+///
+/// `(q.at, q.id) < ($8::timestamptz, $9::text)` under
+/// `ORDER BY q.at DESC, q.id DESC` pages by the `at` *and* `id` of the
+/// last row seen: a cursor on `at` alone would repeat or skip every row
+/// that shares its millisecond.
+///
+/// # The `table` match (decision 7)
+///
+/// `%` and `_` in the caller's text are matched literally: the three
+/// `replace`s escape the escape character first, then the two wildcards,
+/// and `ILIKE` does the case-insensitive contains-match against every
+/// element of `tables_read`.
 ///
 /// # `auditEventId` resolution (WS1 task 1.14, judge finding J12)
 ///
@@ -441,11 +527,12 @@ const HISTORY_LIST_LIMIT: i64 = 200;
 pub async fn list_history(
     pool: &PgPool,
     owner_id: Uuid,
+    filter: &HistoryFilter<'_>,
 ) -> Result<Vec<QueryHistoryItem>, StoreError> {
     let rows: Vec<QueryHistoryRow> = sqlx::query_as(
         "SELECT q.id, q.sql, q.user_name, q.at, q.status, q.duration_ms, q.scanned_bytes, \
          q.cost_units, q.workload_class, q.engine, q.cache_assisted, ae.id AS audit_event_id, \
-         q.owner_id \
+         q.owner_id, q.tables_read, q.message \
          FROM query_history q \
          LEFT JOIN LATERAL ( \
              SELECT ae.id FROM audit_event ae \
@@ -453,10 +540,29 @@ pub async fn list_history(
               ORDER BY ae.at DESC LIMIT 1 \
          ) ae ON true \
          WHERE q.owner_id = $1 \
-         ORDER BY q.at DESC LIMIT $2",
+           AND ($2::text IS NULL OR q.status = $2) \
+           AND ($3::text IS NULL OR q.engine = $3) \
+           AND ($4::bigint IS NULL OR q.duration_ms >= $4) \
+           AND ($5::text IS NULL OR EXISTS ( \
+               SELECT 1 FROM unnest(q.tables_read) AS t(t) \
+                WHERE t.t ILIKE '%' || replace(replace(replace($5, '\\', '\\\\'), '%', '\\%'), '_', '\\_') || '%')) \
+           AND q.at >= GREATEST(COALESCE($6::timestamptz, now() - interval '14 days'), \
+                                now() - interval '14 days') \
+           AND ($7::timestamptz IS NULL OR q.at <= $7) \
+           AND ($8::timestamptz IS NULL OR (q.at, q.id) < ($8::timestamptz, $9::text)) \
+         ORDER BY q.at DESC, q.id DESC \
+         LIMIT $10",
     )
     .bind(owner_id)
-    .bind(HISTORY_LIST_LIMIT)
+    .bind(filter.status)
+    .bind(filter.engine)
+    .bind(filter.min_duration_ms)
+    .bind(filter.table)
+    .bind(filter.from)
+    .bind(filter.to)
+    .bind(filter.before_at)
+    .bind(filter.before_id)
+    .bind(HISTORY_PAGE_LIMIT)
     .fetch_all(pool)
     .await?;
     Ok(rows.into_iter().map(QueryHistoryItem::from).collect())
@@ -480,7 +586,7 @@ pub async fn get_history_item(
     let row: Option<QueryHistoryRow> = sqlx::query_as(
         "SELECT q.id, q.sql, q.user_name, q.at, q.status, q.duration_ms, q.scanned_bytes, \
          q.cost_units, q.workload_class, q.engine, q.cache_assisted, ae.id AS audit_event_id, \
-         q.owner_id \
+         q.owner_id, q.tables_read, q.message \
          FROM query_history q \
          LEFT JOIN LATERAL ( \
              SELECT ae.id FROM audit_event ae \
@@ -523,19 +629,31 @@ pub struct RecordHistoryInput<'a> {
     pub engine: &'a str,
     /// Whether the result was served (partly) from cache.
     pub cache_assisted: bool,
+    /// The tables the statement names as written, as the caller parsed
+    /// them. Empty for a statement that does not parse, and for every row
+    /// recorded before the column existed (migration
+    /// `0111_query_history_detail.sql` backfills nothing).
+    pub tables_read: &'a [String],
+    /// The exact text the response carried for a failed or refused run —
+    /// fixed and classified before it is stored, the same text the
+    /// caller's screen showed. `None` where there is nothing to say: a
+    /// completed run, and every row recorded before the column existed.
+    pub message: Option<&'a str>,
 }
 
 /// Record one query execution.
 ///
 /// # Non-fatal by design
 ///
-/// This is called from `routes::query::run` *after* a query has already
-/// succeeded against `ClickHouse` and a response has been built for the
-/// caller. A logging write failing (no pool configured, Postgres down,
-/// whatever) must never turn an otherwise-successful query into an error
-/// response — so `routes::query::run` calls this, gets a `Result`, and on
-/// `Err` logs a warning and still returns the successful `QueryResult`
-/// unchanged. The `Result` is returned rather than swallowed *here* so
+/// This is called from `routes::query::run` once the run has an answer —
+/// a completed run after its result is built, and (since the history
+/// page, `QS-4`) a refused or failed run before its error response goes
+/// out, carrying the same message that response does. A logging write
+/// failing (no pool configured, Postgres down, whatever) must never turn
+/// an otherwise-settled run into a different response — so
+/// `routes::query::run` calls this, gets a `Result`, and on `Err` logs a
+/// warning and still returns the response it had built, success or not.
+/// The `Result` is returned rather than swallowed *here* so
 /// that decision stays visible at the call site instead of this function
 /// silently deciding it for every caller (a test, for instance, very much
 /// wants to see the error).
@@ -550,8 +668,8 @@ pub async fn record_history(
     sqlx::query(
         "INSERT INTO query_history \
          (id, sql, user_name, status, duration_ms, scanned_bytes, cost_units, \
-          workload_class, engine, cache_assisted, owner_id) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+          workload_class, engine, cache_assisted, owner_id, tables_read, message) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
          ON CONFLICT (id) DO NOTHING",
     )
     .bind(input.id)
@@ -565,6 +683,8 @@ pub async fn record_history(
     .bind(input.engine)
     .bind(input.cache_assisted)
     .bind(input.owner_id)
+    .bind(input.tables_read)
+    .bind(input.message)
     .execute(pool)
     .await?;
     Ok(())
@@ -605,6 +725,8 @@ mod tests {
             workload_class: "hot-analytics".to_owned(),
             engine: "hot-store".to_owned(),
             cache_assisted: true,
+            tables_read: vec!["marts.retails".to_owned()],
+            message: None,
             audit_event_id: Some("aud-1".to_owned()),
             owner_id: None,
         };
@@ -646,6 +768,8 @@ mod tests {
             workload_class: "hot-analytics".to_owned(),
             engine: "hot-store".to_owned(),
             cache_assisted: false,
+            tables_read: Vec::new(),
+            message: None,
             audit_event_id: None,
             owner_id: None,
         };
