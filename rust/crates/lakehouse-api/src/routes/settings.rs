@@ -19,6 +19,13 @@
 //! that follows the rules at the top of `policy.rs`: no seed grant, only a
 //! `*:*` holder (Platform Admin) has it until an operator grants it to a role.
 //!
+//! Two lists are in the answer only for a caller with `settings:write` (`PR
+//! #204` review (SHOULD-FIX) 3): the roles that may not download
+//! (`downloadDeniedRoles`) and the outside domains a report may go to
+//! (`reportAllowedDomains`). They name the deployment's roles and its
+//! partners, which every signed-in person has no business reading. Everything
+//! else — the content sites among it — is everybody's.
+//!
 //! # The formatting fields
 //!
 //! `numberLocale` (`en-US` or `id-ID`), `companyPalette` (empty, or 2 to 12
@@ -482,16 +489,33 @@ pub(crate) async fn time_context(state: &AppState) -> Result<TimeContext, ApiErr
         .ok_or_else(|| ApiError::Internal("The reporting settings are invalid.".to_owned()))
 }
 
-fn body_json(ctx: &TimeContext, format: &FormatSettings, saved: bool) -> Value {
+/// The settings answer. `administrator` says whether the caller may read the
+/// two lists only an administrator reads (the roles that may not download and
+/// the outside domains a report may go to); they are left out of the answer
+/// for anyone else (`PR #204` review (SHOULD-FIX) 3).
+fn body_json(
+    ctx: &TimeContext,
+    format: &FormatSettings,
+    saved: bool,
+    administrator: bool,
+) -> Value {
     let mut body = json!({
         "timeZone": ctx.zone(),
         "weekStart": ctx.week_start().as_str(),
         "saved": saved,
-        "downloadDeniedRoles": format.download_denied_roles,
-        "reportAllowedDomains": format.report_allowed_domains,
+        // BI-19 part A and BI-4 part B: the public-links switch and the
+        // result-cache rule are read by everyone who signs in (the first by
+        // the public-link pages, the second by every dashboard read), so
+        // they are in the answer for every caller.
         "publicLinksEnabled": format.public_links_enabled,
         "resultCache": format.result_cache.to_json(),
     });
+    // PR #204 review (SHOULD-FIX) 3: the two lists only an administrator
+    // reads are in the answer only for a caller with `settings:write`.
+    if administrator {
+        body["downloadDeniedRoles"] = json!(format.download_denied_roles);
+        body["reportAllowedDomains"] = json!(format.report_allowed_domains);
+    }
     if let (Some(map), Value::Object(fields)) = (body.as_object_mut(), format.to_json()) {
         map.extend(fields);
     }
@@ -501,10 +525,21 @@ fn body_json(ctx: &TimeContext, format: &FormatSettings, saved: bool) -> Value {
 /// `GET /api/settings/reporting` — the zone and first day in use, and whether
 /// they were ever saved (`saved: false` means these are the defaults).
 ///
+/// The two lists only an administrator reads — the roles that may not download
+/// and the outside domains a report may go to — are in the answer only for a
+/// caller with `settings:write` (`PR #204` review (SHOULD-FIX) 3): they name
+/// the deployment's roles and its partners, which every signed-in person has
+/// no business reading. Everything else, the content sites among it, is
+/// everybody's (`SEC-47`'s Content-Security-Policy reads this answer from the
+/// console server for every signed-in page).
+///
 /// # Errors
 ///
 /// 5xx from [`time_context`] when the settings cannot be read.
-pub async fn get_reporting(State(state): State<AppState>) -> ApiResult<ApiJson<Value>> {
+pub async fn get_reporting(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+) -> ApiResult<ApiJson<Value>> {
     let ctx = time_context(&state).await?;
     let format = format_settings(&state).await?;
     let saved = match state.pg.as_deref() {
@@ -514,7 +549,12 @@ pub async fn get_reporting(State(state): State<AppState>) -> ApiResult<ApiJson<V
             .is_some(),
         None => false,
     };
-    Ok(ApiJson(body_json(&ctx, &format, saved)))
+    Ok(ApiJson(body_json(
+        &ctx,
+        &format,
+        saved,
+        principal.has("settings:write"),
+    )))
 }
 
 /// `PUT /api/settings/reporting` — save `{timeZone, weekStart}` and, when
@@ -593,6 +633,8 @@ pub async fn put_reporting(
         &echoed,
         &FormatSettings::from_row(&stored),
         true,
+        // The caller may save, so they may read the two lists back.
+        true,
     )))
 }
 
@@ -646,7 +688,7 @@ mod tests {
     fn the_response_names_the_zone_the_first_day_and_whether_it_was_saved() {
         let ctx = TimeContext::new("Europe/Berlin", WeekStart::Sunday).unwrap();
         assert_eq!(
-            body_json(&ctx, &FormatSettings::default(), true),
+            body_json(&ctx, &FormatSettings::default(), true, true),
             json!({
                 "timeZone": "Europe/Berlin", "weekStart": "sunday", "saved": true,
                 "numberLocale": "en-US", "companyPalette": [],
@@ -656,9 +698,31 @@ mod tests {
             })
         );
         assert_eq!(
-            body_json(&TimeContext::default(), &FormatSettings::default(), false)["saved"],
+            body_json(
+                &TimeContext::default(),
+                &FormatSettings::default(),
+                false,
+                true
+            )["saved"],
             json!(false)
         );
+    }
+
+    /// `PR #204` review (SHOULD-FIX) 3: the two lists only an administrator
+    /// reads are left out of the answer for anyone else.
+    #[test]
+    fn the_two_administrator_lists_are_left_out_for_anyone_else() {
+        let denied = FormatSettings {
+            download_denied_roles: vec!["Viewer".to_owned()],
+            report_allowed_domains: vec!["partner.example".to_owned()],
+            ..FormatSettings::default()
+        };
+        let body = body_json(&TimeContext::default(), &denied, true, false);
+        assert!(body.get("downloadDeniedRoles").is_none(), "{body}");
+        assert!(body.get("reportAllowedDomains").is_none(), "{body}");
+        // Everything else is everybody's.
+        assert_eq!(body["contentSites"], json!([]));
+        assert_eq!(body["numberLocale"], json!("en-US"));
     }
 
     fn body(extra: &str) -> SettingsBody {
@@ -705,8 +769,11 @@ mod tests {
                 .public_links_enabled
         );
         assert!(off.to_json().get("publicLinksEnabled").is_none());
+        // `false`: the switch is everybody's (only the two lists of `PR #204`
+        // review SHOULD-FIX 3 are an administrator's), so it must be in the
+        // answer for a caller without `settings:write` too.
         assert_eq!(
-            body_json(&TimeContext::default(), &off, true)["publicLinksEnabled"],
+            body_json(&TimeContext::default(), &off, true, false)["publicLinksEnabled"],
             json!(false)
         );
     }
@@ -733,8 +800,11 @@ mod tests {
             CacheRule::Minutes(30),
             "a body without the rule keeps it"
         );
+        // `false`: the freshness rule is everybody's (only the two lists of
+        // `PR #204` review SHOULD-FIX 3 are an administrator's), so it must
+        // be in the answer for a caller without `settings:write` too.
         assert_eq!(
-            body_json(&TimeContext::default(), &set, true)["resultCache"],
+            body_json(&TimeContext::default(), &set, true, false)["resultCache"],
             json!({"mode": "minutes", "minutes": 30})
         );
         for bad in [
@@ -875,7 +945,7 @@ mod tests {
         };
         assert!(denied.to_json().get("downloadDeniedRoles").is_none());
         assert_eq!(
-            body_json(&TimeContext::default(), &denied, true)["downloadDeniedRoles"],
+            body_json(&TimeContext::default(), &denied, true, true)["downloadDeniedRoles"],
             json!(["Viewer"])
         );
     }
@@ -1044,7 +1114,7 @@ mod tests {
         };
         assert!(f.to_json().get("reportAllowedDomains").is_none());
         assert_eq!(
-            body_json(&TimeContext::default(), &f, true)["reportAllowedDomains"],
+            body_json(&TimeContext::default(), &f, true, true)["reportAllowedDomains"],
             json!(["x.example"])
         );
     }

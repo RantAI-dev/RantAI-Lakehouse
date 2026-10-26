@@ -462,6 +462,23 @@ async fn a_scheduled_delivery_asks_the_engine_as_the_owner_under_the_saved_limit
     }
 }
 
+/// `PR #204` review (SHOULD-FIX) 2: one row at a time, and the tick keeps
+/// going until nothing is due, so two due subscriptions are both sent.
+#[tokio::test]
+async fn two_due_subscriptions_are_both_sent_in_one_tick() {
+    let f = fixture(ok_pdf(), true).await;
+    let first = subscription(&f, |_| {}).await;
+    let second = subscription(&f, |_| {}).await;
+
+    assert_eq!(tick(&f.state, &f.mailer).await, 2, "both were taken");
+    assert_eq!(f.mailer.reports().len(), 2, "both were sent");
+    assert_eq!(deliveries(&f, &first).await.len(), 1);
+    assert_eq!(deliveries(&f, &second).await.len(), 1);
+    // Nothing is due any more.
+    assert_eq!(tick(&f.state, &f.mailer).await, 0);
+    assert_eq!(f.mailer.reports().len(), 2, "no third email");
+}
+
 /// The subject carries today's date in the subscription's zone; the test reads
 /// it back from the subject instead of computing a second clock.
 fn today(subject: &str) -> String {

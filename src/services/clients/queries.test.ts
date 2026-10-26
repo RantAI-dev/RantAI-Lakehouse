@@ -321,3 +321,32 @@ describe("Stop (BI-5 plan D5)", () => {
     expect((await rejection(clickhouseQueryService.cancel("7f0c0f0e-3c7e-4a3e-9d4f-0a1b2c3d4e5f"))).code).toBe("not_found")
   })
 })
+
+describe("clickhouseQueryService.listHistory", () => {
+  it("asks /api/query/history with no query string when no filter is given", async () => {
+    const calls = stubFetch(() => json([]))
+    const rows = await clickhouseQueryService.listHistory()
+    expect(rows).toEqual([])
+    expect(calls[0]!.url).toBe("/api/query/history")
+  })
+
+  it("appends the filter's query string, encoded, after a single ?", async () => {
+    const calls = stubFetch(() => json([]))
+    await clickhouseQueryService.listHistory({
+      status: "failed",
+      table: "ord%",
+      minDurationMs: 0,
+      before: { at: "2026-10-20T11:59:59.999Z", id: "q-1729" },
+    })
+    expect(calls[0]!.url).toBe(
+      "/api/query/history?status=failed&minDurationMs=0&table=ord%25" +
+        "&before=2026-10-20T11%3A59%3A59.999Z%2Cq-1729",
+    )
+  })
+
+  it("adds no query string for a filter of empty strings", async () => {
+    const calls = stubFetch(() => json([]))
+    await clickhouseQueryService.listHistory({ table: "" })
+    expect(calls[0]!.url).toBe("/api/query/history")
+  })
+})

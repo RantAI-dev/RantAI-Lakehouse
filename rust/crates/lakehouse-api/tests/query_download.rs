@@ -57,6 +57,8 @@ async fn insert_history_row(pool: &PgPool, id: &str, sql: &str, owner: Option<Uu
         workload_class: "hot-analytics",
         engine,
         cache_assisted: false,
+        tables_read: &[],
+        message: None,
     };
     record_history(pool, &input)
         .await

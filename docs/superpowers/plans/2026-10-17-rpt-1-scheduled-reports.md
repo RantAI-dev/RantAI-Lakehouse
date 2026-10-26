@@ -260,6 +260,40 @@ Commit: the fix commit "fix(reports): Skip when empty leaves single-value charts
 - Checks: `cargo fmt --check` ok (after one rustfmt wrap in my test); `cargo clippy --workspace --all-targets -- -D warnings` exit 0; `cargo test -p lakehouse-api --lib -- report` 107 passed; `--test report_runner -- --test-threads=1` 19 passed; `--test report_routes -- --test-threads=1` 12 passed; `bun run typecheck` clean; `bun run lint` 0 errors (9 existing warnings); `bun test src/features/dashboards src/lib/dashboard-tabs.test.ts` 437 pass, 0 fail.
 - Not verified: the owner's `b_6574e2b9` case in the browser.
 
+### Handoff (PR #204 review fixes, 2026-10-26)
+
+The review of PR #204 (BI-1 and RPT-1 together) left three SHOULD-FIX findings. One commit each, in the order of the findings; every fix site cites "PR #204 review (SHOULD-FIX) N".
+
+| Finding | Commit | What changed |
+| --- | --- | --- |
+| SHOULD-FIX 1 — the recipient picker and the save follow the caller's tenants | `a0f8b87e` | `lakehouse-store`: `search_active_users` takes the caller's tenants and lists only the people who share one of them (an empty list lists everyone: a deployment that does not use tenants). `identity::user_tenant_ids` reads a user's tenants from the same `app_user_tenant` rows the request's own tenant list is read from. `lakehouse-api`: one copy of the tenant rule, `routes::reports::shares_a_tenant`, read by the picker, the save-time refusal and the runner's audience (AGENTS.md rule 4). The save refuses a recipient who shares no tenant with the owner: "Every console recipient must be in one of your tenants." The tenant rule is checked before the active check, so the refusal does not tell the caller whether a person outside their tenants is active. |
+| SHOULD-FIX 2 — the runner takes one due subscription at a time | `7d4c353c` | `lakehouse-store`: `claim_due` takes one row (the oldest due one), `FOR UPDATE SKIP LOCKED` still, and returns it (`None` when nothing is due); a row whose schedule cannot be worked out pauses itself and the next due row is taken. `lakehouse-api`: `tick` claims the next row when it is done with this one, until nothing is due — the row in flight is the only one a failure between the claim and the send can affect. The CHANGELOG's runner sentence ("at most 5 due subscriptions") says one at a time now. |
+| SHOULD-FIX 3 — the two administrator lists are read only by an administrator | `2a2441b5` | `lakehouse-api`: `GET /api/settings/reporting` carries `downloadDeniedRoles` and `reportAllowedDomains` only for a caller with `settings:write`; the content sites stay for everybody (`SEC-47`'s Content-Security-Policy reads this answer from the console server for every signed-in page). The console's contract says the two lists are optional and the settings page shows the two sections only when the answer carries them ("with none chosen, everyone may download" would be a lie about a list the page may not read). The CHANGELOG's BI-9 entry says which lists a reader without `settings:write` does not get. |
+
+**Before them, two merges of `origin/main`** (merge commits, no rebase): `2c83a164` (`9b79eb10`: QS-4, SEC-41, SRC-34, DATA-32) and `a32c541b` (`a93d0fc7`: SEC-49). Conflicts in the first, both kept both sides: `CHANGELOG.md`'s `### Added` holds main's QS-4 entry and the branch's RPT-1 and BI-1 entries, each its own item; `docs/core/BACKLOG.md`'s "Ready to start" line is the union of both sides, recomputed with `review/regen_deps.py` (which also writes `?` into the `DEC-8` dependency row; that row was restored by hand to `Decided | — | AI-11`, the decision the owner signed on 2026-10-17). The second merge was clean. Neither merge touched `docker-compose.yml`, `dagster/` or `ops/`.
+
+**Tests added** (each finding): the store's picker lists only the people who share a tenant (`the_picker_lists_only_the_people_who_share_a_tenant`); the route's picker does not list a person in another tenant and the save refuses them, while a person in the caller's own tenant is accepted (`a_recipient_outside_the_callers_tenants_is_not_listed_and_is_refused_at_save`); the store claims one row at a time, oldest first, and two claims at once still get disjoint rows; the runner sends two due subscriptions in one tick (`two_due_subscriptions_are_both_sent_in_one_tick`); the route gives the two administrator lists to a caller with `settings:write` and not to one without it, and the console shows neither section to a caller that may not read them.
+
+**Commands run** (every cargo command through `bin/cargo-locked … -j 2`, one at a time, in the foreground):
+
+- `cargo fmt --check`: clean.
+- `cargo-locked clippy -j 2 --workspace --all-targets --all-features -- -D warnings`: clean.
+- `cargo-locked test -j 2 -p lakehouse-api --lib`: 2563 passed, 0 failed, 17 ignored.
+- `cargo-locked test -j 2 -p lakehouse-api --test <file>`, every one of the 74 integration files: 700 passed, 0 failed, 4 ignored. The files this slice touched: `report_routes` 13, `report_runner` 20, `reporting_settings_route` 12, `route_auth` 59.
+- `cargo-locked test -j 2 -p <crate>` for the other twelve crates (`lakehouse-core`, `lakehouse-clickhouse`, `lakehouse-bi`, `lakehouse-auth`, `lakehouse-notify`, `lakehouse-iceberg`, `lakehouse-alerts`, `lakehouse-embed`, `lakehouse-trino`, `lakehouse-dagster`, `lakehouse-llm`, `lakehouse-store`): 1828 passed, 0 failed (65 test binaries). `lakehouse-store --test report_subscriptions` 14 of those.
+- `flock /home/shiro/rantai/.heavy.lock bun run typecheck`: clean.
+- `flock /home/shiro/rantai/.heavy.lock bun run lint`: 0 errors, 9 warnings (none in a file this slice touched).
+- `flock /home/shiro/rantai/.heavy.lock bun run test`: 2591 pass, 1 skip, 0 fail (266 files). The file this slice touched, `src/features/admin/reporting-settings-page.test.tsx`, 12 pass.
+- `python3 ops/lint/check_intra_package_imports.py` and `python3 ops/lint/check_bare_iceberg_count.py`: both OK.
+
+**Not verified, and why**
+
+- **`cargo test --workspace` in one command.** The shared `CARGO_TARGET_DIR` had 549 MB free and the linker died with a bus error (`ld terminated with signal 7`), so the whole workspace was run as one crate at a time and, for `lakehouse-api`, one test target at a time — the same tests, the same counts, each test binary deleted after its run (what `cargo-target-prune.sh` does).
+- **`docker compose --profile '*' config --quiet`**: not run. The worktree has no `.env`, and the compose file needs `POSTGRES_PASSWORD` and the other must-set values; no compose file changed in this slice or in either merge.
+- **The Dagster pytest** (`python -m pytest dispar_orchestrate -q`): not run; this slice changed nothing under `dagster/` and neither merge brought Dagster code.
+- **The browser.** The console changes (the two hidden sections) are proved by component tests only; the owner's QA of them is still open, as the assistant's AI-10 cases are.
+- **A crash between the claim and the send** still loses that one send; not tested by killing a process (the same gap the earlier handoff named).
+
 ## 8. Review (planner appends)
 
 ### Review 1 (planner, 2026-10-18, at `d9f96362`)

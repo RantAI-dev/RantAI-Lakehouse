@@ -1,0 +1,685 @@
+{
+ "_about": "One value, a type and a date reading: does it fit (ok), and what is stored (cast, a canonical text: integer digits; decimal with nine fractional digits; boolean true/false; date YYYY-MM-DD; timestamp YYYY-MM-DDTHH:MM:SS.ffffff, with Z when the column holds instants, converted to UTC; float as Python repr; null for an empty cell). Rust asserts ok; the job's caster asserts both (DATA-18 T3.1).",
+ "cases": [
+  {
+   "type": "integer",
+   "dateFormat": null,
+   "timezone": null,
+   "value": "42",
+   "ok": true,
+   "cast": "42"
+  },
+  {
+   "type": "integer",
+   "dateFormat": null,
+   "timezone": null,
+   "value": " 42 ",
+   "ok": true,
+   "cast": "42"
+  },
+  {
+   "type": "integer",
+   "dateFormat": null,
+   "timezone": null,
+   "value": "+7",
+   "ok": true,
+   "cast": "7"
+  },
+  {
+   "type": "integer",
+   "dateFormat": null,
+   "timezone": null,
+   "value": "-0",
+   "ok": true,
+   "cast": "0"
+  },
+  {
+   "type": "integer",
+   "dateFormat": null,
+   "timezone": null,
+   "value": "007",
+   "ok": true,
+   "cast": "7"
+  },
+  {
+   "type": "integer",
+   "dateFormat": null,
+   "timezone": null,
+   "value": "9223372036854775807",
+   "ok": true,
+   "cast": "9223372036854775807"
+  },
+  {
+   "type": "integer",
+   "dateFormat": null,
+   "timezone": null,
+   "value": "9223372036854775808",
+   "ok": false,
+   "cast": null
+  },
+  {
+   "type": "integer",
+   "dateFormat": null,
+   "timezone": null,
+   "value": "-9223372036854775808",
+   "ok": true,
+   "cast": "-9223372036854775808"
+  },
+  {
+   "type": "integer",
+   "dateFormat": null,
+   "timezone": null,
+   "value": "1.5",
+   "ok": false,
+   "cast": null
+  },
+  {
+   "type": "integer",
+   "dateFormat": null,
+   "timezone": null,
+   "value": "1e3",
+   "ok": false,
+   "cast": null
+  },
+  {
+   "type": "integer",
+   "dateFormat": null,
+   "timezone": null,
+   "value": "1,234",
+   "ok": false,
+   "cast": null
+  },
+  {
+   "type": "integer",
+   "dateFormat": null,
+   "timezone": null,
+   "value": "abc",
+   "ok": false,
+   "cast": null
+  },
+  {
+   "type": "integer",
+   "dateFormat": null,
+   "timezone": null,
+   "value": "",
+   "ok": true,
+   "cast": null
+  },
+  {
+   "type": "integer",
+   "dateFormat": null,
+   "timezone": null,
+   "value": "   ",
+   "ok": true,
+   "cast": null
+  },
+  {
+   "type": "decimal",
+   "dateFormat": null,
+   "timezone": null,
+   "value": "1.5",
+   "ok": true,
+   "cast": "1.500000000"
+  },
+  {
+   "type": "decimal",
+   "dateFormat": null,
+   "timezone": null,
+   "value": "-0.25",
+   "ok": true,
+   "cast": "-0.250000000"
+  },
+  {
+   "type": "decimal",
+   "dateFormat": null,
+   "timezone": null,
+   "value": ".5",
+   "ok": true,
+   "cast": "0.500000000"
+  },
+  {
+   "type": "decimal",
+   "dateFormat": null,
+   "timezone": null,
+   "value": "12",
+   "ok": true,
+   "cast": "12.000000000"
+  },
+  {
+   "type": "decimal",
+   "dateFormat": null,
+   "timezone": null,
+   "value": "0.123456789",
+   "ok": true,
+   "cast": "0.123456789"
+  },
+  {
+   "type": "decimal",
+   "dateFormat": null,
+   "timezone": null,
+   "value": "0.1234567891",
+   "ok": false,
+   "cast": null
+  },
+  {
+   "type": "decimal",
+   "dateFormat": null,
+   "timezone": null,
+   "value": "1,234.5",
+   "ok": false,
+   "cast": null
+  },
+  {
+   "type": "decimal",
+   "dateFormat": null,
+   "timezone": null,
+   "value": "1e3",
+   "ok": false,
+   "cast": null
+  },
+  {
+   "type": "decimal",
+   "dateFormat": null,
+   "timezone": null,
+   "value": "12345678901234567890123456789.5",
+   "ok": true,
+   "cast": "12345678901234567890123456789.500000000"
+  },
+  {
+   "type": "decimal",
+   "dateFormat": null,
+   "timezone": null,
+   "value": "123456789012345678901234567890",
+   "ok": false,
+   "cast": null
+  },
+  {
+   "type": "decimal",
+   "dateFormat": null,
+   "timezone": null,
+   "value": "5.",
+   "ok": false,
+   "cast": null
+  },
+  {
+   "type": "decimal",
+   "dateFormat": null,
+   "timezone": null,
+   "value": "",
+   "ok": true,
+   "cast": null
+  },
+  {
+   "type": "boolean",
+   "dateFormat": null,
+   "timezone": null,
+   "value": "true",
+   "ok": true,
+   "cast": "true"
+  },
+  {
+   "type": "boolean",
+   "dateFormat": null,
+   "timezone": null,
+   "value": "FALSE",
+   "ok": true,
+   "cast": "false"
+  },
+  {
+   "type": "boolean",
+   "dateFormat": null,
+   "timezone": null,
+   "value": "Yes",
+   "ok": true,
+   "cast": "true"
+  },
+  {
+   "type": "boolean",
+   "dateFormat": null,
+   "timezone": null,
+   "value": "n",
+   "ok": true,
+   "cast": "false"
+  },
+  {
+   "type": "boolean",
+   "dateFormat": null,
+   "timezone": null,
+   "value": "T",
+   "ok": true,
+   "cast": "true"
+  },
+  {
+   "type": "boolean",
+   "dateFormat": null,
+   "timezone": null,
+   "value": "1",
+   "ok": true,
+   "cast": "true"
+  },
+  {
+   "type": "boolean",
+   "dateFormat": null,
+   "timezone": null,
+   "value": "0",
+   "ok": true,
+   "cast": "false"
+  },
+  {
+   "type": "boolean",
+   "dateFormat": null,
+   "timezone": null,
+   "value": "maybe",
+   "ok": false,
+   "cast": null
+  },
+  {
+   "type": "boolean",
+   "dateFormat": null,
+   "timezone": null,
+   "value": "2",
+   "ok": false,
+   "cast": null
+  },
+  {
+   "type": "boolean",
+   "dateFormat": null,
+   "timezone": null,
+   "value": "",
+   "ok": true,
+   "cast": null
+  },
+  {
+   "type": "date",
+   "dateFormat": "iso",
+   "timezone": null,
+   "value": "2026-10-16",
+   "ok": true,
+   "cast": "2026-10-16"
+  },
+  {
+   "type": "date",
+   "dateFormat": "iso",
+   "timezone": null,
+   "value": "2026-02-30",
+   "ok": false,
+   "cast": null
+  },
+  {
+   "type": "date",
+   "dateFormat": "iso",
+   "timezone": null,
+   "value": "2026-13-01",
+   "ok": false,
+   "cast": null
+  },
+  {
+   "type": "date",
+   "dateFormat": "iso",
+   "timezone": null,
+   "value": "2026-10-16T00:00:00",
+   "ok": false,
+   "cast": null
+  },
+  {
+   "type": "date",
+   "dateFormat": "iso",
+   "timezone": null,
+   "value": "16/10/2026",
+   "ok": false,
+   "cast": null
+  },
+  {
+   "type": "date",
+   "dateFormat": "iso",
+   "timezone": null,
+   "value": "",
+   "ok": true,
+   "cast": null
+  },
+  {
+   "type": "date",
+   "dateFormat": "dmy",
+   "timezone": null,
+   "value": "16/10/2026",
+   "ok": true,
+   "cast": "2026-10-16"
+  },
+  {
+   "type": "date",
+   "dateFormat": "dmy",
+   "timezone": null,
+   "value": "1.2.2026",
+   "ok": true,
+   "cast": "2026-02-01"
+  },
+  {
+   "type": "date",
+   "dateFormat": "dmy",
+   "timezone": null,
+   "value": "16-10-2026",
+   "ok": true,
+   "cast": "2026-10-16"
+  },
+  {
+   "type": "date",
+   "dateFormat": "dmy",
+   "timezone": null,
+   "value": "31/04/2026",
+   "ok": false,
+   "cast": null
+  },
+  {
+   "type": "date",
+   "dateFormat": "dmy",
+   "timezone": null,
+   "value": "16/10/26",
+   "ok": false,
+   "cast": null
+  },
+  {
+   "type": "date",
+   "dateFormat": "dmy",
+   "timezone": null,
+   "value": "16/10-2026",
+   "ok": false,
+   "cast": null
+  },
+  {
+   "type": "date",
+   "dateFormat": "dmy",
+   "timezone": null,
+   "value": "29/02/2024",
+   "ok": true,
+   "cast": "2024-02-29"
+  },
+  {
+   "type": "date",
+   "dateFormat": "dmy",
+   "timezone": null,
+   "value": "29/02/2025",
+   "ok": false,
+   "cast": null
+  },
+  {
+   "type": "date",
+   "dateFormat": "mdy",
+   "timezone": null,
+   "value": "10/16/2026",
+   "ok": true,
+   "cast": "2026-10-16"
+  },
+  {
+   "type": "date",
+   "dateFormat": "mdy",
+   "timezone": null,
+   "value": "13/01/2026",
+   "ok": false,
+   "cast": null
+  },
+  {
+   "type": "timestamp",
+   "dateFormat": "iso",
+   "timezone": false,
+   "value": "2026-10-16T13:30:05",
+   "ok": true,
+   "cast": "2026-10-16T13:30:05.000000"
+  },
+  {
+   "type": "timestamp",
+   "dateFormat": "iso",
+   "timezone": false,
+   "value": "2026-10-16 13:30",
+   "ok": true,
+   "cast": "2026-10-16T13:30:00.000000"
+  },
+  {
+   "type": "timestamp",
+   "dateFormat": "iso",
+   "timezone": false,
+   "value": "2026-10-16T13:30:05.123456",
+   "ok": true,
+   "cast": "2026-10-16T13:30:05.123456"
+  },
+  {
+   "type": "timestamp",
+   "dateFormat": "iso",
+   "timezone": false,
+   "value": "2026-10-16T13:30:05.5",
+   "ok": true,
+   "cast": "2026-10-16T13:30:05.500000"
+  },
+  {
+   "type": "timestamp",
+   "dateFormat": "iso",
+   "timezone": false,
+   "value": "2026-10-16T13:30:05.1234567",
+   "ok": false,
+   "cast": null
+  },
+  {
+   "type": "timestamp",
+   "dateFormat": "iso",
+   "timezone": false,
+   "value": "2026-10-16T25:00:00",
+   "ok": false,
+   "cast": null
+  },
+  {
+   "type": "timestamp",
+   "dateFormat": "iso",
+   "timezone": false,
+   "value": "2026-10-16T13:60:00",
+   "ok": false,
+   "cast": null
+  },
+  {
+   "type": "timestamp",
+   "dateFormat": "iso",
+   "timezone": false,
+   "value": "2026-10-16",
+   "ok": false,
+   "cast": null
+  },
+  {
+   "type": "timestamp",
+   "dateFormat": "iso",
+   "timezone": false,
+   "value": "2026-10-16T13:30:05Z",
+   "ok": false,
+   "cast": null
+  },
+  {
+   "type": "timestamp",
+   "dateFormat": "iso",
+   "timezone": false,
+   "value": "",
+   "ok": true,
+   "cast": null
+  },
+  {
+   "type": "timestamp",
+   "dateFormat": "iso",
+   "timezone": true,
+   "value": "2026-10-16T13:30:05+07:00",
+   "ok": true,
+   "cast": "2026-10-16T06:30:05.000000Z"
+  },
+  {
+   "type": "timestamp",
+   "dateFormat": "iso",
+   "timezone": true,
+   "value": "2026-10-16T13:30:05Z",
+   "ok": true,
+   "cast": "2026-10-16T13:30:05.000000Z"
+  },
+  {
+   "type": "timestamp",
+   "dateFormat": "iso",
+   "timezone": true,
+   "value": "2026-10-16 13:30:05-03:30",
+   "ok": true,
+   "cast": "2026-10-16T17:00:05.000000Z"
+  },
+  {
+   "type": "timestamp",
+   "dateFormat": "iso",
+   "timezone": true,
+   "value": "2026-10-16T13:30:05+0700",
+   "ok": true,
+   "cast": "2026-10-16T06:30:05.000000Z"
+  },
+  {
+   "type": "timestamp",
+   "dateFormat": "iso",
+   "timezone": true,
+   "value": "2026-10-16T13:30:05",
+   "ok": false,
+   "cast": null
+  },
+  {
+   "type": "timestamp",
+   "dateFormat": "dmy",
+   "timezone": false,
+   "value": "16/10/2026 13:30",
+   "ok": true,
+   "cast": "2026-10-16T13:30:00.000000"
+  },
+  {
+   "type": "timestamp",
+   "dateFormat": "mdy",
+   "timezone": false,
+   "value": "10/16/2026 13:30:05.25",
+   "ok": true,
+   "cast": "2026-10-16T13:30:05.250000"
+  },
+  {
+   "type": "timestamp",
+   "dateFormat": "dmy",
+   "timezone": false,
+   "value": "31/04/2026 10:00",
+   "ok": false,
+   "cast": null
+  },
+  {
+   "type": "float",
+   "dateFormat": null,
+   "timezone": null,
+   "value": "1.5",
+   "ok": true,
+   "cast": "1.5"
+  },
+  {
+   "type": "float",
+   "dateFormat": null,
+   "timezone": null,
+   "value": "-2",
+   "ok": true,
+   "cast": "-2.0"
+  },
+  {
+   "type": "float",
+   "dateFormat": null,
+   "timezone": null,
+   "value": "1e3",
+   "ok": true,
+   "cast": "1000.0"
+  },
+  {
+   "type": "float",
+   "dateFormat": null,
+   "timezone": null,
+   "value": "1e-7",
+   "ok": true,
+   "cast": "1e-07"
+  },
+  {
+   "type": "float",
+   "dateFormat": null,
+   "timezone": null,
+   "value": "0.30000000000000004",
+   "ok": true,
+   "cast": "0.30000000000000004"
+  },
+  {
+   "type": "float",
+   "dateFormat": null,
+   "timezone": null,
+   "value": "inf",
+   "ok": true,
+   "cast": "inf"
+  },
+  {
+   "type": "float",
+   "dateFormat": null,
+   "timezone": null,
+   "value": "-inf",
+   "ok": true,
+   "cast": "-inf"
+  },
+  {
+   "type": "float",
+   "dateFormat": null,
+   "timezone": null,
+   "value": "NaN",
+   "ok": true,
+   "cast": "nan"
+  },
+  {
+   "type": "float",
+   "dateFormat": null,
+   "timezone": null,
+   "value": "abc",
+   "ok": false,
+   "cast": null
+  },
+  {
+   "type": "float",
+   "dateFormat": null,
+   "timezone": null,
+   "value": "1,5",
+   "ok": false,
+   "cast": null
+  },
+  {
+   "type": "float",
+   "dateFormat": null,
+   "timezone": null,
+   "value": "",
+   "ok": true,
+   "cast": null
+  },
+  {
+   "type": "text",
+   "dateFormat": null,
+   "timezone": null,
+   "value": "abc",
+   "ok": true,
+   "cast": "abc"
+  },
+  {
+   "type": "text",
+   "dateFormat": null,
+   "timezone": null,
+   "value": "",
+   "ok": true,
+   "cast": ""
+  },
+  {
+   "type": "text",
+   "dateFormat": null,
+   "timezone": null,
+   "value": "  x ",
+   "ok": true,
+   "cast": "  x "
+  },
+  {
+   "type": "text",
+   "dateFormat": null,
+   "timezone": null,
+   "value": "007",
+   "ok": true,
+   "cast": "007"
+  }
+ ]
+}
