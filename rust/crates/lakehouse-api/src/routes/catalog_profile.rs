@@ -17,9 +17,11 @@
 //! a row's content), so it must never reveal more than a `SELECT` the
 //! caller could run themselves. The aggregate query is therefore passed
 //! through the exact rewrite `POST /api/query/run` uses
-//! (`query::rewrite_sql_for_principal`): masked columns are profiled in
-//! their masked form and row filters shrink the profiled rows. The route
-//! requires `query:read` for the same reason.
+//! (`query::rewrite_sql_for_principal_with_headers`, with this request's
+//! headers, so the profile is read as the organisation the console
+//! picked): masked columns are profiled in their masked form and row
+//! filters shrink the profiled rows. The route requires `query:read` for
+//! the same reason.
 //!
 //! # Bounded cost
 //!
@@ -40,7 +42,7 @@ use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::routes::catalog::{catalog_tenant_refusal, split_db_table};
 use crate::routes::catalog_source::{self, ReadSource, SourceKind};
-use crate::routes::query::rewrite_sql_for_principal;
+use crate::routes::query::rewrite_sql_for_principal_with_headers;
 use crate::routes::support::str_col;
 use crate::state::AppState;
 use crate::upstream_error;
@@ -343,11 +345,12 @@ pub async fn profile(
         return Ok(unsupported("None of this asset's columns can be profiled."));
     }
 
-    let sql = rewrite_sql_for_principal(
+    let sql = rewrite_sql_for_principal_with_headers(
         &state,
         &profile_sql(&source.from, &planned),
         "clickhouse",
         &principal,
+        &headers,
     )
     .await?;
     let result = state

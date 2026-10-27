@@ -267,6 +267,18 @@ mod recording {
     /// Text only the fake engine's failure body carries. It must appear in
     /// neither the response nor the history row.
     const ENGINE_MARKER: &str = "TANGERINE-PANEL-NINE";
+    /// The read-only guard's fixed sentence.
+    const READ_ONLY_REFUSAL: &str =
+        "Only read queries (SELECT/SHOW/DESCRIBE/EXPLAIN) are allowed in Query Studio.";
+    /// The past-version refusal's fixed sentence (`DATA-16` F3).
+    const PAST_VERSION_REFUSAL: &str =
+        "Querying a past version of a table is available on the ClickHouse engine only.";
+    /// The settings rule's fixed sentence (`SEC-21`).
+    const SETTINGS_REFUSAL: &str =
+        "Query Studio accepts only iceberg_snapshot_id in SETTINGS; the server sets the others.";
+    /// The Trino keyword check's fixed sentence.
+    const TRINO_KEYWORD_REFUSAL: &str = "This statement is not permitted against Trino (write, session, or procedure keyword \
+         detected).";
 
     /// The caller acts in a deployment whose shared catalog the owner tenant
     /// holds (`CATALOG_TENANT_ID`), with `ClickHouse` at the mock.
@@ -411,6 +423,23 @@ mod recording {
             .expect("the run's row is recorded")
     }
 
+    /// The engine the caller's run recorded — the request's own `engine`
+    /// field, written into the row.
+    async fn the_recorded_engine(pool: &PgPool, email: &str) -> String {
+        let (user_id,): (Uuid,) = sqlx::query_as("SELECT id FROM app_user WHERE email = $1")
+            .bind(email)
+            .fetch_one(pool)
+            .await
+            .unwrap_or_else(|e| {
+                panic!("seeded user {email} must exist (0002_seed_identity.sql): {e}")
+            });
+        sqlx::query_scalar("SELECT engine FROM query_history WHERE owner_id = $1")
+            .bind(user_id)
+            .fetch_one(pool)
+            .await
+            .expect("the run's row is recorded")
+    }
+
     #[tokio::test]
     async fn a_failed_engine_run_records_failed_with_the_responses_message_and_not_the_engines_text()
      {
@@ -494,6 +523,198 @@ mod recording {
             the_recorded_run(&pool, "sari@meridian.example").await;
         assert_eq!(recorded_status, "blocked");
         assert_eq!(message.as_deref(), Some(TABLE_REFUSAL));
+        assert_eq!(
+            tables_read,
+            vec!["bronze.group_orders".to_owned()],
+            "{tables_read:?}"
+        );
+    }
+
+    /// The read-only guard refuses a writing statement before anything is
+    /// asked of the engine, and the refusal is recorded: the history says
+    /// `blocked` and carries the sentence the caller was told.
+    #[tokio::test]
+    async fn a_statement_the_read_only_guard_refuses_records_blocked() {
+        let ch = MockServer::start().await;
+        let TestApp { router, pool } = spin_up_with_clickhouse(&ch.uri()).await;
+        let cookie = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+
+        let (status, body) = post_sql(
+            &router,
+            &cookie,
+            "INSERT INTO bronze.group_orders VALUES (1)",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["error"], READ_ONLY_REFUSAL, "{body}");
+        assert_eq!(
+            engine_requests(&ch).await,
+            0,
+            "the guard refuses before the engine is asked"
+        );
+        let (recorded_status, message, tables_read) =
+            the_recorded_run(&pool, "rina@meridian.example").await;
+        assert_eq!(recorded_status, "blocked");
+        assert_eq!(message.as_deref(), Some(READ_ONLY_REFUSAL));
+        assert!(
+            tables_read.is_empty(),
+            "a refused write is not a query, so it names no table: {tables_read:?}"
+        );
+    }
+
+    /// A past-version clause cannot run on Trino: the rewrite cannot parse
+    /// it, and the refusal is recorded as `blocked` — with the sentence
+    /// the caller was told, and without the engine ever being asked.
+    #[tokio::test]
+    async fn a_past_version_clause_on_trino_records_blocked() {
+        let ch = MockServer::start().await;
+        let TestApp { router, pool } = spin_up_with_clickhouse(&ch.uri()).await;
+        let cookie = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+
+        let (status, body) = post_json(
+            &router,
+            &cookie,
+            json!({
+                "sql": "SELECT * FROM bronze.group_orders VERSION AS OF 1",
+                "engine": "trino",
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["error"], PAST_VERSION_REFUSAL, "{body}");
+        assert_eq!(
+            engine_requests(&ch).await,
+            0,
+            "the statement never reaches an engine"
+        );
+        let (recorded_status, message, tables_read) =
+            the_recorded_run(&pool, "rina@meridian.example").await;
+        assert_eq!(recorded_status, "blocked");
+        assert_eq!(message.as_deref(), Some(PAST_VERSION_REFUSAL));
+        assert!(
+            tables_read.is_empty(),
+            "a statement that does not parse names no table: {tables_read:?}"
+        );
+        assert_eq!(
+            the_recorded_engine(&pool, "rina@meridian.example").await,
+            "trino",
+            "the row carries the engine the request named"
+        );
+    }
+
+    /// A Trino statement the keyword check refuses is refused before the
+    /// engine is asked, and the refusal is recorded as `blocked` — with
+    /// the sentence the caller was told.
+    ///
+    /// `EXPLAIN ANALYZE` is the first hazard the check names: on Trino it
+    /// *executes* the statement it explains, so a read-only statement
+    /// behind it is not read-only at all. It still passes the read-only
+    /// guard (it starts with an allowed keyword and names none of the
+    /// twelve denied ones), so the keyword check is what refuses it.
+    #[tokio::test]
+    async fn a_trino_statement_with_a_refused_keyword_records_blocked() {
+        let ch = MockServer::start().await;
+        let TestApp { router, pool } = spin_up_with_clickhouse(&ch.uri()).await;
+        let cookie = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+
+        let (status, body) = post_json(
+            &router,
+            &cookie,
+            json!({ "sql": "EXPLAIN ANALYZE SELECT 1", "engine": "trino" }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["error"], TRINO_KEYWORD_REFUSAL, "{body}");
+        assert_eq!(
+            engine_requests(&ch).await,
+            0,
+            "the keyword check refuses before the engine is asked"
+        );
+        let (recorded_status, message, tables_read) =
+            the_recorded_run(&pool, "rina@meridian.example").await;
+        assert_eq!(recorded_status, "blocked");
+        assert_eq!(message.as_deref(), Some(TRINO_KEYWORD_REFUSAL));
+        assert!(
+            tables_read.is_empty(),
+            "the statement names no table: {tables_read:?}"
+        );
+        assert_eq!(
+            the_recorded_engine(&pool, "rina@meridian.example").await,
+            "trino",
+            "the row carries the engine the request named"
+        );
+    }
+
+    /// A statement naming a setting the console does not allow is refused
+    /// before it runs, and the refusal is recorded as `blocked`.
+    #[tokio::test]
+    async fn a_statement_with_a_refused_setting_records_blocked() {
+        let ch = MockServer::start().await;
+        mount_prefetch_ok(&ch).await;
+        let TestApp { router, pool } = spin_up_with_clickhouse(&ch.uri()).await;
+        let cookie = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+
+        let (status, body) = post_sql(
+            &router,
+            &cookie,
+            "SELECT n FROM serving.t SETTINGS max_result_rows = 0",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["error"], SETTINGS_REFUSAL, "{body}");
+        assert!(
+            statements_reaching_the_engine(&ch).await.is_empty(),
+            "the statement the caller wrote never reaches the engine"
+        );
+        let (recorded_status, message, tables_read) =
+            the_recorded_run(&pool, "rina@meridian.example").await;
+        assert_eq!(recorded_status, "blocked");
+        assert_eq!(message.as_deref(), Some(SETTINGS_REFUSAL));
+        assert_eq!(tables_read, vec!["serving.t".to_owned()], "{tables_read:?}");
+    }
+
+    /// A 5xx from the rewrite is recorded as `failed`, not as `blocked`: the
+    /// service failed while deciding, the caller was told so, and the row
+    /// says the same thing — never the database's own text.
+    #[tokio::test]
+    async fn a_5xx_from_the_rewrite_records_failed() {
+        let ch = MockServer::start().await;
+        let TestApp { router, pool } = spin_up_with_clickhouse(&ch.uri()).await;
+        claim_table_for(&pool, OWNER_TENANT).await;
+        // The tenant gate reads the claim table to answer "is this table
+        // the caller's?". Hiding that table makes the read fail, which is
+        // the one 5xx the rewrite can produce here.
+        sqlx::query("ALTER TABLE upload_table_claim RENAME TO upload_table_claim_hidden")
+            .execute(&pool)
+            .await
+            .expect("hide the claim table from the gate");
+        let cookie = session_cookie_for_seeded_user(&pool, "sari@meridian.example").await;
+
+        let (status, body) = post_sql(&router, &cookie, OWNED_STATEMENT).await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{status}: {body}");
+        assert_eq!(
+            engine_requests(&ch).await,
+            0,
+            "the gate refuses before the engine is asked"
+        );
+        let response_message = body["error"].as_str().expect("the fixed error text");
+        let (recorded_status, message, tables_read) =
+            the_recorded_run(&pool, "sari@meridian.example").await;
+        assert_eq!(recorded_status, "failed");
+        assert_eq!(
+            message.as_deref(),
+            Some(response_message),
+            "the row says what the caller was told"
+        );
+        assert!(
+            !response_message.contains("upload_table_claim"),
+            "the database's own text never reaches the caller: {response_message}"
+        );
         assert_eq!(
             tables_read,
             vec!["bronze.group_orders".to_owned()],
