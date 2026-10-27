@@ -13,8 +13,12 @@
  * (`matchRegionRows` returns it in `unmatchedNames`).
  */
 
-/** What a bundled map's features are: Jakarta cities, provinces or kabupaten/kota. */
-export type RegionLevel = "city" | "province" | "regency"
+/**
+ * What a bundled map's features are: Jakarta cities, Indonesian provinces or
+ * kabupaten/kota, countries of the world map, or the states/provinces of a
+ * country map (BI-16 C2a, decision D4).
+ */
+export type RegionLevel = "city" | "province" | "regency" | "country" | "subdivision" | "uploaded"
 
 export type RegionValue = { name: string; value: number }
 
@@ -34,6 +38,11 @@ export type RegionMatch = {
 function plain(raw: unknown): string {
   return String(raw ?? "")
     .toLowerCase()
+    // "Côte d'Ivoire" and "Cote d'Ivoire", "São Paulo" and "Sao Paulo" are
+    // one name to a person typing data (C2a: the world and country maps
+    // carry diacritics; the Indonesian files have none, so nothing changes there).
+    .normalize("NFD")
+    .replace(/\p{M}/gu, "")
     .replace(/\./g, " ")
     .replace(/\s+/g, " ")
     .trim()
@@ -86,10 +95,30 @@ export function normalizeJakartaArea(raw: string): string {
   return s.replace(/\b\w/g, (c) => c.toUpperCase())
 }
 
+/**
+ * Country spellings that are neither the Natural Earth name, its long name
+ * nor an ISO code (those are indexed from the map itself), keyed by `plain()`
+ * form, valued by the `plain()` form of the feature name (BI-16 C2a).
+ */
+const COUNTRY_ALIASES: Record<string, string> = {
+  uk: "united kingdom",
+  "great britain": "united kingdom",
+  burma: "myanmar",
+  "ivory coast": "cote d'ivoire",
+  swaziland: "eswatini",
+  macedonia: "north macedonia",
+  "east timor": "timor-leste",
+  "viet nam": "vietnam",
+  turkiye: "turkey",
+}
+
 /** The `plain()` name a row's region should have to match a feature of `level`. */
 function candidate(raw: string, level: RegionLevel): string {
   if (level === "city") return plain(normalizeJakartaArea(raw))
   const s = plain(raw)
+  if (level === "country") return COUNTRY_ALIASES[s] ?? s
+  // An uploaded map (BI-16 C2b) has the names its owner chose: matched as they are, ignoring case, accents and spacing.
+  if (level === "subdivision" || level === "uploaded") return s
   if (level === "province") {
     const bare = s.replace(PROVINCE_PREFIX, "")
     return PROVINCE_ALIASES[bare] ?? bare
@@ -101,12 +130,23 @@ function candidate(raw: string, level: RegionLevel): string {
 /** Lookup from the comparison form of each feature name to the name as written. */
 export type RegionIndex = Map<string, string>
 
-export function buildRegionIndex(featureNames: Iterable<string>): RegionIndex {
+/**
+ * Other spellings a feature is known by, as `[alias, feature name]` pairs: the
+ * ISO codes and long name of a country, the ISO 3166-2 code of a state. They
+ * come from the map's own properties (BI-16 C2a) and never override a name.
+ */
+export type RegionAliases = Iterable<readonly [alias: string, name: string]>
+
+export function buildRegionIndex(featureNames: Iterable<string>, aliases: RegionAliases = []): RegionIndex {
   const index: RegionIndex = new Map()
   for (const name of featureNames) {
     const key = plain(name)
     // The first feature wins; a map whose names collide after normalizing
     // would be a data problem in the bundled file, not something to merge.
+    if (key && !index.has(key)) index.set(key, name)
+  }
+  for (const [alias, name] of aliases) {
+    const key = plain(alias)
     if (key && !index.has(key)) index.set(key, name)
   }
   return index
@@ -126,9 +166,10 @@ export function matchRegion(raw: string, level: RegionLevel, index: RegionIndex)
 export function matchRegionRows(
   rows: { name: string; value: number }[],
   level: RegionLevel,
-  featureNames: Iterable<string>
+  featureNames: Iterable<string>,
+  aliases: RegionAliases = []
 ): RegionMatch {
-  const index = buildRegionIndex(featureNames)
+  const index = buildRegionIndex(featureNames, aliases)
   const sums = new Map<string, number>()
   const unmatched = new Set<string>()
   let unmatchedRows = 0
@@ -158,9 +199,10 @@ export function matchRegionRows(
 export function rawNamesByFeature(
   rawNames: Iterable<string>,
   level: RegionLevel,
-  featureNames: Iterable<string>
+  featureNames: Iterable<string>,
+  aliases: RegionAliases = []
 ): Map<string, string[]> {
-  const index = buildRegionIndex(featureNames)
+  const index = buildRegionIndex(featureNames, aliases)
   const out = new Map<string, string[]>()
   for (const raw of rawNames) {
     const feature = matchRegion(raw, level, index)

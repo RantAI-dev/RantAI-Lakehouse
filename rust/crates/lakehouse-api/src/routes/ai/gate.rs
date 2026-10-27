@@ -138,6 +138,40 @@ fn reason_for_write_high(spec: &ToolSpec, args: &Map<String, Value>) -> String {
             s("id")
         ),
         "delete_metric" => format!("Menghapus metrik {} secara permanen.", s("id")),
+        "create_report_subscription" | "update_report_subscription" => {
+            let others = args
+                .get("recipients")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            let outside: Vec<&str> = args
+                .get("recipients")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|r| r.get("email").and_then(Value::as_str))
+                .collect();
+            let verb = if spec.name == "create_report_subscription" {
+                "Mengirim laporan terjadwal dashboard"
+            } else {
+                "Mengubah laporan terjadwal"
+            };
+            format!(
+                "{verb} {} ke {others} penerima selain peminta (alamat luar: {}). Penerima melihat data sesuai hak akses peminta, bukan hak Anda.",
+                if s("board").is_empty() {
+                    s("id")
+                } else {
+                    s("board")
+                },
+                if outside.is_empty() {
+                    "tidak ada".to_owned()
+                } else {
+                    outside.join(", ")
+                }
+            )
+        }
+        "delete_report_subscription" => {
+            format!("Menghapus laporan terjadwal {} secara permanen.", s("id"))
+        }
         "delete_tab" => format!(
             "Menghapus tab {} dari dashboard {}; chart di dalamnya pindah ke tab pertama.",
             s("tab"),
@@ -287,6 +321,19 @@ fn look_summary(name: &str, args: &Map<String, Value>) -> String {
             get("chart")
         );
     }
+    if name == "set_cache_rule" {
+        let rule = match (get("rule"), args.get("minutes").and_then(Value::as_i64)) {
+            ("minutes", Some(n)) => format!("diingat {n} menit"),
+            ("fresh", _) => "selalu segar".to_owned(),
+            _ => "ikut aturan di atasnya".to_owned(),
+        };
+        let (kind, id) = if get("chart").is_empty() {
+            ("dashboard", get("board"))
+        } else {
+            ("chart", get("chart"))
+        };
+        return format!("Mengatur seberapa lama hasil {kind} {id} diingat ({rule}).");
+    }
     format!(
         "Mengatur tema dan font dashboard {} (tema: {}, font: {}).",
         get("board"),
@@ -317,6 +364,28 @@ fn board_layout_summary(name: &str, args: &Map<String, Value>) -> String {
     format!("Menyimpan {n} filter sebagai default board {board} untuk semua pengguna.")
 }
 
+/// The confirmation sentence of the report tools (`RPT-1`): what is scheduled
+/// and, in words, that it goes to the person alone (anything else is an approval).
+fn report_summary(name: &str, args: &Map<String, Value>) -> String {
+    let s = |key: &str| args.get(key).and_then(Value::as_str).unwrap_or("");
+    let when = args
+        .get("schedule")
+        .and_then(|v| v.get("kind"))
+        .and_then(Value::as_str)
+        .unwrap_or("jadwal yang sama");
+    if name == "create_report_subscription" {
+        format!(
+            "Menjadwalkan laporan dashboard {} ({when}) lewat email ke Anda sendiri.",
+            s("board")
+        )
+    } else {
+        format!(
+            "Mengubah laporan terjadwal {} (tanpa penerima baru; penerima yang ada tetap atau berkurang).",
+            s("id")
+        )
+    }
+}
+
 fn summary_for(spec: &ToolSpec, args: &Map<String, Value>) -> String {
     let s = |key: &str| args.get(key).and_then(Value::as_str).unwrap_or("");
     match spec.name {
@@ -344,7 +413,7 @@ fn summary_for(spec: &ToolSpec, args: &Map<String, Value>) -> String {
             s("title"),
             s("kind")
         ),
-        "format_chart" | "set_dashboard_theme" => look_summary(spec.name, args),
+        "format_chart" | "set_dashboard_theme" | "set_cache_rule" => look_summary(spec.name, args),
         "create_board" => format!("Membuat board baru bernama \"{}\".", s("name")),
         "create_tab" => format!(
             "Menambah tab \"{}\" pada dashboard {}.",
@@ -370,6 +439,9 @@ fn summary_for(spec: &ToolSpec, args: &Map<String, Value>) -> String {
         ),
         "arrange_board" | "save_board_filters" => board_layout_summary(spec.name, args),
         "move_chart" => format!("Memindahkan chart {} ke board {}.", s("id"), s("board")),
+        "create_report_subscription" | "update_report_subscription" => {
+            report_summary(spec.name, args)
+        }
         "create_calculated_field" => format!(
             "Membuat kolom hitung \"{}\" = {} (pada {}).",
             s("name"),
@@ -416,6 +488,10 @@ fn summary_for(spec: &ToolSpec, args: &Map<String, Value>) -> String {
 pub fn strip_confirmed(args: &Map<String, Value>) -> Map<String, Value> {
     let mut out = args.clone();
     out.remove("confirmed");
+    // `ownerId` is written only by the server, into the stored arguments of an
+    // approval (`tools::reports::approval_args`, `RPT-1`); a model must not be
+    // able to name the person a report is made as.
+    out.remove("ownerId");
     out
 }
 
@@ -493,12 +569,31 @@ pub fn outcome_of(refusal: &Value) -> &'static str {
 ///   [`create_write_high_approval`] (T0.5). This is deliberately NOT the
 ///   same as executing, and NOT the `WriteLow` confirmation path — a
 ///   `WriteHigh` call must never slip through by carrying `confirmed: true`.
+#[cfg(test)]
 #[must_use]
 pub fn decide(
     is_build: bool,
     perms: Option<&PermissionSet>,
     spec: &ToolSpec,
     args: &Map<String, Value>,
+) -> Option<Value> {
+    decide_with(is_build, perms, spec, args, None)
+}
+
+/// [`decide`] with a fact the server worked out about the call, which the
+/// model cannot see or set. `RPT-1` review fix (BLOCKER) R2: for
+/// `update_report_subscription`, `audience_needs_approval` says whether the
+/// recipients the call leaves in place include anyone but the requester and the
+/// call does more than narrow them (`tools::report_audience`, loaded before the
+/// gate at every dispatch site). `None`: not worked out, the arguments alone
+/// decide.
+#[must_use]
+pub fn decide_with(
+    is_build: bool,
+    perms: Option<&PermissionSet>,
+    spec: &ToolSpec,
+    args: &Map<String, Value>,
+    audience_needs_approval: Option<bool>,
 ) -> Option<Value> {
     // F2.9 (PR #59 review): the Ask-mode / permission gates check the
     // STATIC risk (a Read tool must never refuse in Ask mode regardless
@@ -508,7 +603,7 @@ pub fn decide(
     // of the `WriteLow` confirmation path. Ask mode is intentionally
     // unaffected: a non-Read call is refused in Ask mode whether the
     // tool is `WriteLow` or `WriteHigh` in this call.
-    let effective = effective_risk(spec, args);
+    let effective = effective_risk_with(spec, args, audience_needs_approval);
     if !is_build && effective != Risk::Read {
         return Some(ask_mode_refusal(spec.name));
     }
@@ -554,10 +649,46 @@ pub fn decide(
 /// `pub` because the `decide` / `decide_by_name` arms in this module
 /// consult it directly, and the tests in `mod tests` pin both
 /// directions (with / without `runConfig`).
+#[cfg(test)]
 #[must_use]
 pub fn effective_risk(spec: &ToolSpec, args: &Map<String, Value>) -> Risk {
+    effective_risk_with(spec, args, None)
+}
+
+/// [`effective_risk`] with the server-side audience fact of [`decide_with`].
+#[must_use]
+pub fn effective_risk_with(
+    spec: &ToolSpec,
+    args: &Map<String, Value>,
+    audience_needs_approval: Option<bool>,
+) -> Risk {
     if spec.name == "trigger_pipeline" && matches!(args.get("runConfig"), Some(Value::Object(_))) {
         return Risk::WriteHigh;
+    }
+    // RPT-1 / AI-10 (feature decision 10; product owner, 2026-10-17): a report
+    // that goes only to the person asking is a confirmation; naming any other
+    // recipient emails someone else, so that call waits for a human's approval.
+    // Per call, not per tool, like `trigger_pipeline` above. A list that only
+    // holds the empty array names nobody.
+    let names_others = args
+        .get("recipients")
+        .and_then(Value::as_array)
+        .is_some_and(|others| !others.is_empty());
+    match (spec.name, audience_needs_approval) {
+        // RPT-1 review fix (BLOCKER) R2: an update is judged by who ends up
+        // receiving it, which the server looked up (the stored list when the
+        // call names none), not by the recipients it names: a new chart sent to
+        // a stored outside list is an approval; pausing or removing a recipient
+        // is a Confirm.
+        ("update_report_subscription", Some(needs)) => {
+            if needs {
+                return Risk::WriteHigh;
+            }
+        }
+        ("create_report_subscription" | "update_report_subscription", _) if names_others => {
+            return Risk::WriteHigh;
+        }
+        _ => {}
     }
     spec.risk
 }
@@ -571,9 +702,10 @@ pub fn decide_by_name(
     perms: Option<&PermissionSet>,
     tool_name: &str,
     args: &Map<String, Value>,
+    audience_needs_approval: Option<bool>,
 ) -> Option<Value> {
     let spec = super::registry::find(tool_name)?;
-    decide(is_build, perms, spec, args)
+    decide_with(is_build, perms, spec, args, audience_needs_approval)
 }
 
 #[cfg(test)]
@@ -596,7 +728,7 @@ mod tests {
     ];
 
     /// BI-17 part A / AI-8: the two formatting tools are `WriteLow` like `update_chart`.
-    const FORMAT_TOOLS: [&str; 2] = ["format_chart", "set_dashboard_theme"];
+    const FORMAT_TOOLS: [&str; 3] = ["format_chart", "set_dashboard_theme", "set_cache_rule"];
 
     /// A `PermissionSet` granting everything (`*:*`) — Platform Admin.
     fn admin_perms() -> PermissionSet {
@@ -614,6 +746,38 @@ mod tests {
 
     /// BI-17 part A / AI-8: the formatting tools wait for the chat's confirmation, do not execute
     /// without it, are refused to a user without `dashboard:write`, and (being `WriteLow`) need no approval.
+    /// RPT-1 review fix (BLOCKER) R2: the audience fact, not the named
+    /// recipients, decides an update; creating still goes by what it names.
+    #[test]
+    fn a_report_update_is_judged_by_the_servers_audience_fact_when_there_is_one() {
+        let update = spec("update_report_subscription");
+        let create = spec("create_report_subscription");
+        let none = no_args();
+        assert_eq!(
+            effective_risk_with(update, &none, Some(true)),
+            Risk::WriteHigh
+        );
+        assert_eq!(
+            effective_risk_with(update, &none, Some(false)),
+            Risk::WriteLow
+        );
+        // Without the fact the arguments decide, as before.
+        assert_eq!(effective_risk_with(update, &none, None), Risk::WriteLow);
+        let mut named = Map::new();
+        named.insert("recipients".to_owned(), json!([{ "email": "a@b.example" }]));
+        assert_eq!(effective_risk_with(update, &named, None), Risk::WriteHigh);
+        // The fact says narrowing: naming a subset is a Confirm.
+        assert_eq!(
+            effective_risk_with(update, &named, Some(false)),
+            Risk::WriteLow
+        );
+        assert_eq!(
+            effective_risk_with(create, &named, Some(false)),
+            Risk::WriteHigh
+        );
+        assert_eq!(effective_risk_with(create, &none, None), Risk::WriteLow);
+    }
+
     #[test]
     fn the_formatting_tools_need_confirmation_and_dashboard_write() {
         let admin = admin_perms();
@@ -956,11 +1120,11 @@ mod tests {
     #[test]
     fn unregistered_tool_is_never_refused() {
         assert_eq!(
-            decide_by_name(false, None, "not_a_real_tool", &no_args()),
+            decide_by_name(false, None, "not_a_real_tool", &no_args(), None),
             None
         );
         assert_eq!(
-            decide_by_name(true, None, "not_a_real_tool", &no_args()),
+            decide_by_name(true, None, "not_a_real_tool", &no_args(), None),
             None
         );
     }
@@ -1065,7 +1229,7 @@ mod tests {
         ];
         for tool in ["run_sql", "run_saved_query"] {
             for perms in &without {
-                let refused = decide_by_name(true, Some(perms), tool, &no_args())
+                let refused = decide_by_name(true, Some(perms), tool, &no_args(), None)
                     .unwrap_or_else(|| panic!("{tool} must be refused without query:read"));
                 assert_eq!(refused["reason"], json!("permission"), "{tool}");
                 assert_eq!(refused["required"], json!("query:read"), "{tool}");
@@ -1075,7 +1239,8 @@ mod tests {
                     true,
                     Some(&PermissionSet::parse("query:read")),
                     tool,
-                    &no_args()
+                    &no_args(),
+                    None
                 ),
                 None,
                 "{tool} must be allowed with query:read"

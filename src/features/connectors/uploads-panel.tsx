@@ -63,7 +63,7 @@ export function UploadsPanel({ pollMs = POLL_MS }: { readonly pollMs?: number })
     return (
       <EmptyState
         title="No uploaded files"
-        description="Upload a CSV or TSV file to bring it in as a raw table."
+        description="Upload CSV, TSV, Excel or Parquet files to bring them in as raw tables."
         action={
           <Button size="sm" render={<Link href="/connectors/upload" />}>
             <UploadIcon data-icon="inline-start" />
@@ -103,12 +103,21 @@ export function UploadsPanel({ pollMs = POLL_MS }: { readonly pollMs?: number })
                 <TableCell className="max-w-64 truncate font-medium" title={upload.originalFilename}>
                   {upload.originalFilename}
                 </TableCell>
-                <TableCell>{formatBytes(upload.sizeBytes)}</TableCell>
+                <TableCell>
+                  {/* A file still being received has stored no bytes yet: show the size it announced. */}
+                  {formatBytes(upload.status === "receiving" ? (upload.declaredSize ?? 0) : upload.sizeBytes)}
+                </TableCell>
                 <TableCell>
                   <div className="space-y-1">
                     <UploadStatusPill status={upload.status} />
                     {upload.status === "failed" && upload.error ? (
                       <p className="max-w-64 whitespace-normal text-xs text-destructive">{upload.error}</p>
+                    ) : null}
+                    {upload.loadedWith !== undefined ? (
+                      // `DATA-17` slice 5: a file of a load of several files; the first has the run and the count.
+                      <p className="max-w-64 whitespace-normal text-xs text-muted-foreground">
+                        Loaded with {uploads.find((u) => u.id === upload.loadedWith)?.originalFilename ?? "the first file"}
+                      </p>
                     ) : null}
                   </div>
                 </TableCell>
@@ -126,7 +135,9 @@ export function UploadsPanel({ pollMs = POLL_MS }: { readonly pollMs?: number })
                 </TableCell>
                 <TableCell>
                   {upload.rows === undefined ? (
-                    <span className="text-muted-foreground">Not measured</span>
+                    <span className="text-muted-foreground">
+                      {upload.loadedWith !== undefined ? "Counted with the first file" : "Not measured"}
+                    </span>
                   ) : (
                     formatNumber(upload.rows)
                   )}

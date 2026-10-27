@@ -10,19 +10,44 @@
  */
 
 import { formatBytes } from "@/lib/format"
+import type { Candidate } from "@/lib/upload-queue"
 import type {
   IngestUploadInput,
   Upload,
+  UploadColumnSpec,
+  UploadColumnType,
+  UploadDateFormat,
+  UploadArchive,
   UploadEncoding,
+  UploadLayout,
+  UploadMismatch,
+  UploadPreviewColumn,
   UploadStatus,
 } from "@/services/contracts/uploads"
 
 /**
- * The largest file the API accepts (its `MAX_UPLOAD_BYTES`): 50 MiB, which
- * its sentence calls "50 MB". A bigger file is refused in the browser, before
- * a byte of it is sent.
+ * The largest file `POST /api/uploads` accepts (its `MAX_UPLOAD_BYTES`), and
+ * the largest Excel workbook the chunked path accepts (decision 9 of
+ * `docs/core/features/upload-big-files-and-more-formats.md`): 50 MiB, which
+ * the API's sentences call "50 MB". A bigger workbook is refused in the
+ * browser, before a byte of it is sent.
  */
 export const MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+
+/**
+ * The largest file the chunked upload path takes (the API's
+ * `MAX_SESSION_BYTES`, `routes/uploads/sessions.rs`): 2 GiB, exactly
+ * 2,147,483,648 bytes, "2 GB" in words (decision 1: GB means GiB). The page
+ * sends every file by pieces, so this is the limit it enforces for all but
+ * workbooks. Measured in `docs/plans/DATA-17-RESULT.md`; plan T6.2.
+ */
+export const MAX_SESSION_BYTES = 2 * 1024 * 1024 * 1024
+
+/** A workbook is read whole by the API, so it keeps [`MAX_UPLOAD_BYTES`] on the chunked path as well. */
+const WORKBOOK_NAME = /\.xlsx?$/i
+
+/** The most files one upload takes (decision 5 of `docs/core/features/upload-big-files-and-more-formats.md`). */
+export const MAX_FILES = 10
 
 /** The longest raw table name the API accepts (its `MAX_TABLE_NAME_CHARS`). */
 export const MAX_TABLE_NAME_CHARS = 128
@@ -106,6 +131,8 @@ export function suggestTableName(fileName: string): string {
 /** What a status is called on screen. A status this version does not know is shown as received. */
 export function statusLabel(status: UploadStatus): string {
   switch (status) {
+    case "receiving":
+      return "Receiving"
     case "uploaded":
       return "Uploaded"
     case "ingesting":
@@ -214,30 +241,34 @@ export const REGISTRATION_FAILED_REASON = "The table was loaded but could not be
  * what to do next.
  */
 export function fileSizeProblem(name: string, sizeBytes: number): string | null {
-  if (sizeBytes <= MAX_UPLOAD_BYTES) return null
-  return `${name} is ${formatBytes(sizeBytes)}, over the 50 MB limit. Split it into smaller files or leave out columns you do not need, then choose a file again.`
+  if (WORKBOOK_NAME.test(name)) {
+    if (sizeBytes <= MAX_UPLOAD_BYTES) return null
+    return `${name} is ${formatBytes(sizeBytes)}, over the 50 MB limit for an Excel workbook. Save the sheet as CSV, or leave out columns you do not need, then choose a file again.`
+  }
+  if (sizeBytes <= MAX_SESSION_BYTES) return null
+  return `${name} is ${formatBytes(sizeBytes)}, over the 2 GB limit. Split it into smaller files or leave out columns you do not need, then choose a file again.`
 }
 
 /**
- * The sentence for a file a person must not send, and the extensions it is
- * for. The words follow the API's `WORKBOOK`, `PARQUET` and `OTHER_BINARY`
- * (`routes/uploads.rs`); the API still decides by content, so a file that
- * passes here can be refused there (a `.parquet` with a binary column, say),
- * and only a name that is clearly neither
- * delimited text, nor an `.xls` / `.xlsx` workbook, nor a `.parquet` file is refused here. The
- * workbook kinds the API does not open (`.xlsm`, `.xlsb`, `.ods`) and
- * archives are refused with the workbook sentence.
+ * The extensions of files a person must not send. The words follow the API's
+ * `WORKBOOK` and `OTHER_BINARY` (`routes/uploads.rs`); the API still decides by
+ * content, so a file that passes here can be refused there (a `.parquet` with a
+ * binary column, say), and only a name that is clearly not a kind it reads is
+ * refused here. The workbook kinds the API does not open (`.xlsm`, `.xlsb`,
+ * `.ods`) and the archives it does not open (anything but `.gz` and `.zip`)
+ * are refused with the workbook-or-archive sentence.
  */
 const WORKBOOK_EXTENSIONS = ["xlsm", "xlsb", "ods"]
-const ARCHIVE_EXTENSIONS = ["zip", "gz", "tgz", "bz2", "xz", "7z", "rar", "tar"]
-const OTHER_BINARY_EXTENSIONS = ["pdf", "doc", "docx", "ppt", "pptx", "avro", "orc", "db", "sqlite"]
+const ARCHIVE_EXTENSIONS = ["tgz", "bz2", "xz", "7z", "rar", "tar"]
+const OTHER_BINARY_EXTENSIONS = ["pdf", "doc", "docx", "ppt", "pptx", "orc", "db", "sqlite"]
 
 /**
  * Why a file cannot be sent judging by its NAME alone, or `null`. A workbook
- * the API does not read, an archive or another binary is
- * refused at once, before any byte is sent, in words consistent with the
- * API's. `.xls`, `.xlsx` and `.parquet` pass: the API opens them, and refuses
- * one that does not open, in its own sentence. A name with no
+ * the API does not read, an archive it does not read (`.tar`, `.7z` ...) or
+ * another binary is refused at once, before any byte is sent, in words
+ * consistent with the API's. `.xls`, `.xlsx`, `.parquet`, `.json`, `.jsonl`,
+ * `.ndjson`, `.avro`, `.gz` and `.zip` pass: the API opens them, and refuses one
+ * that does not open, in its own sentence. A name with no
  * extension or an unknown one (`.txt`, `.dat`, an extension-less export) is
  * never refused here: it may be delimited text, and the API judges content.
  * Case does not matter.
@@ -247,10 +278,10 @@ export function fileKindProblem(name: string): string | null {
   if (dot < 0) return null
   const extension = name.slice(dot + 1).toLowerCase()
   if (WORKBOOK_EXTENSIONS.includes(extension) || ARCHIVE_EXTENSIONS.includes(extension)) {
-    return `${name} looks like a workbook or a zip archive that is not an .xls or .xlsx file. Only .xls and .xlsx workbooks, .parquet files and delimited text files (CSV, TSV) can be uploaded; save the sheet as .xlsx or CSV first.`
+    return `${name} looks like a workbook or an archive this upload does not read. Excel workbooks must be .xls or .xlsx, and archives .gz or .zip; or save the sheet as .xlsx or CSV first.`
   }
   if (OTHER_BINARY_EXTENSIONS.includes(extension)) {
-    return `${name} is not a delimited text file, an Excel workbook or a Parquet file. Only .xls and .xlsx workbooks, .parquet files and delimited text files (CSV, TSV) can be uploaded.`
+    return `${name} is not a file this upload reads. Upload CSV, TSV, JSON, JSON Lines, Avro, Parquet or Excel (.xls, .xlsx) files, a .gz of a text or JSON file, or a .zip of such files.`
   }
   return null
 }
@@ -258,6 +289,41 @@ export function fileKindProblem(name: string): string | null {
 /** Why a chosen file cannot be sent (its kind by name, then its size), or `null`. */
 export function fileProblem(name: string, sizeBytes: number): string | null {
   return fileKindProblem(name) ?? fileSizeProblem(name, sizeBytes)
+}
+
+/**
+ * What a pick of files becomes: `candidates` for the upload queue, in order,
+ * and how many files of the pick were left out because the list is full.
+ *
+ * - The list holds at most [`MAX_FILES`]; the first files of a pick are kept
+ *   (decision 5) and `dropped` counts the rest.
+ * - A file with a problem of its own ([`fileProblem`]) is listed with it.
+ * - The 2 GB limit counts all the files of one upload together (decision 2):
+ *   a file that would take the sum over it is listed with a sentence saying
+ *   so and is not sent, so a person never waits for files the load would
+ *   refuse. `existing` is what the list holds already (a refused file does not
+ *   count: it is not sent).
+ */
+export function planPick(
+  existing: readonly { readonly size: number; readonly state: string }[],
+  picked: readonly File[]
+): { candidates: Candidate[]; dropped: number } {
+  const room = Math.max(0, MAX_FILES - existing.length)
+  const taken = picked.slice(0, room)
+  let total = existing.filter((f) => f.state !== "refused").reduce((sum, f) => sum + f.size, 0)
+  const candidates = taken.map((file): Candidate => {
+    const own = fileProblem(file.name, file.size)
+    if (own !== null) return { file, problem: own }
+    if (total + file.size > MAX_SESSION_BYTES) {
+      return {
+        file,
+        problem: `${file.name} would bring the files to ${formatBytes(total + file.size)}, over the 2 GB limit for one upload (all its files together). Remove a file, then choose this one again.`,
+      }
+    }
+    total += file.size
+    return { file, problem: null }
+  })
+  return { candidates, dropped: picked.length - taken.length }
 }
 
 /**
@@ -269,8 +335,11 @@ export function fileProblem(name: string, sizeBytes: number): string | null {
  * the catalog (`REGISTRATION_FAILED_REASON`): its rows ARE in the table, so a
  * retry with `append` would write them twice. That retry replaces, whatever
  * the first load chose.
+ *
+ * `alsoUploads` are the other files of a load of several files (`DATA-17` slice 5), which the
+ * upload row of the first file does not list: the screen knows them (the files it loaded with).
  */
-export function retryInput(upload: Upload): IngestUploadInput | null {
+export function retryInput(upload: Upload, alsoUploads: readonly string[] = []): IngestUploadInput | null {
   const { parseOptions, bronzeTable } = upload
   if (parseOptions === undefined || bronzeTable === undefined) return null
   const mode =
@@ -279,7 +348,15 @@ export function retryInput(upload: Upload): IngestUploadInput | null {
       : upload.loadMode === "append"
         ? "append"
         : "replace"
-  return { ...parseOptions, bronzeTable, mode }
+  // `DATA-18`: what the load was told about the columns goes back with it, or a retry
+  // would load everything as text.
+  const withColumns =
+    upload.columns !== undefined && upload.onBadValue !== undefined
+      ? { columns: upload.columns, onBadValue: upload.onBadValue }
+      : {}
+  // `DATA-17` slice 5: a load of several files is retried with the same files.
+  const withOthers = alsoUploads.length > 0 ? { alsoUploads: [...alsoUploads] } : {}
+  return { ...parseOptions, bronzeTable, mode, ...withColumns, ...withOthers }
 }
 
 /**
@@ -293,8 +370,8 @@ export function rawTableFullName(table: string): string {
   return `bronze.${table}`
 }
 
-/** What a chosen file looks like to the eye: an Excel workbook, a Parquet file, CSV or TSV text, or anything else. */
-export type UploadFileKind = "workbook" | "parquet" | "delimited" | "other"
+/** What a chosen file looks like to the eye: an Excel workbook, a Parquet file, a JSON, JSON Lines or Avro file, an archive (gzip, zip), CSV or TSV text, or anything else. */
+export type UploadFileKind = "workbook" | "parquet" | "json" | "avro" | "archive" | "delimited" | "other"
 
 /** The extension of a file name, lower-cased, or `""` when there is none (`.csv` alone and `a.` have none). */
 function extensionOf(name: string): string {
@@ -311,6 +388,9 @@ export function uploadFileKind(name: string): UploadFileKind {
   const extension = extensionOf(name)
   if (extension === "xls" || extension === "xlsx") return "workbook"
   if (extension === "parquet") return "parquet"
+  if (extension === "json" || extension === "jsonl" || extension === "ndjson") return "json"
+  if (extension === "avro") return "avro"
+  if (extension === "gz" || extension === "zip") return "archive"
   if (extension === "csv" || extension === "tsv") return "delimited"
   return "other"
 }
@@ -323,4 +403,159 @@ export function uploadFileLabel(name: string): string | null {
   const extension = extensionOf(name)
   if (extension === "" || extension.length > MAX_LABEL_CHARS || !/^[a-z0-9]+$/.test(extension)) return null
   return extension.toUpperCase()
+}
+
+// ── JSON, Avro, gzip and zip (`DATA-17` slice 4) ──────────────────────────
+
+/** Whether the file has no encoding, delimiter or header row to choose: its keys or fields are the columns. */
+export function hasFixedDialect(layout: UploadLayout | undefined): boolean {
+  return layout !== undefined && layout.format !== "delimited"
+}
+
+/** What a file is read as, in words (`JSON`, `CSV or TSV in a gzip file`), for the Review step. */
+export function layoutLabel(layout: UploadLayout): string {
+  const what =
+    layout.format === "json"
+      ? "JSON"
+      : layout.format === "jsonl"
+        ? "JSON Lines"
+        : layout.format === "avro"
+          ? "Avro"
+          : "CSV or TSV"
+  if (layout.compression === "gzip") return `${what} in a gzip file`
+  if (layout.compression === "zip") return `${what} in a zip archive`
+  return what
+}
+
+/**
+ * Why a zip cannot be loaded as it is, or `null`: a file whose columns differ from the first
+ * file's. The API refuses the same load (`ZIP_COLUMNS_DIFFER`); this tells the person on the
+ * Check step, where Next stays off.
+ */
+export function archiveProblem(archive: UploadArchive | undefined): string | null {
+  if (archive === undefined) return null
+  const different = archive.files.filter((file) => !file.matchesFirst)
+  if (different.length === 0) return null
+  return `${different.length === 1 ? "One file" : `${different.length} files`} of the zip ${
+    different.length === 1 ? "does not have" : "do not have"
+  } the same columns as the first. A zip loads whole, so make the files agree and upload it again.`
+}
+
+// ── Several files into one table (`DATA-17` slice 5) ──────────────────────
+
+/**
+ * What differs in a file that cannot load with the first one, as short lines for the list:
+ * the columns it lacks, the ones it adds, and each column whose values do not fit the first
+ * file's type. The names are those the load gives the columns.
+ */
+export function mismatchLines(mismatch: UploadMismatch): string[] {
+  const lines: string[] = []
+  if (mismatch.missing.length > 0) lines.push(`Missing: ${mismatch.missing.join(", ")}`)
+  if (mismatch.extra.length > 0) lines.push(`Not in the first file: ${mismatch.extra.join(", ")}`)
+  for (const conflict of mismatch.typeConflicts) {
+    lines.push(
+      `${conflict.column}: the first file reads it as ${columnTypeLabel(conflict.expected).toLowerCase()}, here it looks like ${columnTypeLabel(conflict.found).toLowerCase()}`
+    )
+  }
+  return lines
+}
+
+/**
+ * Why Load stays off for a load of several files, or `null` (decision 4): a file still being
+ * sent is not in the load yet, and a file whose columns differ must be removed.
+ */
+export function groupProblem(input: {
+  readonly pending: number
+  readonly mismatched: number
+}): string | null {
+  if (input.mismatched > 0) {
+    return `${input.mismatched === 1 ? "One file does" : `${input.mismatched} files do`} not have the columns of the first. Remove ${
+      input.mismatched === 1 ? "it" : "them"
+    } to load the rest.`
+  }
+  if (input.pending > 0) {
+    return `${input.pending === 1 ? "One file is" : `${input.pending} files are`} still being sent. Load waits until ${
+      input.pending === 1 ? "it arrives" : "they arrive"
+    }.`
+  }
+  return null
+}
+
+// ── Column types (`DATA-18`) ──────────────────────────────────────────────
+
+/** The six types a person chooses among (decision 2), in the order the select lists them. */
+export const COLUMN_TYPES: readonly { value: UploadColumnType; label: string }[] = [
+  { value: "text", label: "Text" },
+  { value: "integer", label: "Integer" },
+  { value: "decimal", label: "Decimal" },
+  { value: "boolean", label: "Boolean" },
+  { value: "date", label: "Date" },
+  { value: "timestamp", label: "Timestamp" },
+]
+
+/** A type on screen. `float` only comes from a file that carries one (decision 10). */
+export function columnTypeLabel(type: UploadColumnType): string {
+  if (type === "float") return "Floating point (from the file)"
+  return COLUMN_TYPES.find((t) => t.value === type)?.label ?? type
+}
+
+/** How a date is read, as the select lists it. */
+export const DATE_FORMATS: readonly { value: UploadDateFormat; label: string }[] = [
+  { value: "iso", label: "Year first (2026-10-16)" },
+  { value: "dmy", label: "Day first (16/10/2026)" },
+  { value: "mdy", label: "Month first (10/16/2026)" },
+]
+
+/** The API's sentence for a column name that breaks the rule (`NAME_RULE` in `upload_types.rs`). */
+export const COLUMN_NAME_RULE =
+  "Column names start with a lower-case letter and use lower-case letters and digits joined by single underscores, with at most 128 characters, and each name is used once."
+
+const COLUMN_NAME = /^[a-z][a-z0-9]*(_[a-z0-9]+)*$/
+
+/** Why a typed column name is refused, or `null`: the API's rule, which this repeats so the person is told while typing. */
+export function columnNameProblem(name: string): string | null {
+  return COLUMN_NAME.test(name) && name.length <= 128 && !name.startsWith("_dlt") ? null : COLUMN_NAME_RULE
+}
+
+/**
+ * What stops a column list from being loaded, as sentences: a name that breaks the
+ * rule or is used twice, and a date or timestamp whose reading is still a question
+ * ("day first or month first?", decision 4). Empty when the list may go on.
+ */
+export function columnListProblems(columns: readonly UploadPreviewColumn[]): string[] {
+  const problems: string[] = []
+  const seen = new Set<string>()
+  for (const column of columns) {
+    if (columnNameProblem(column.name) !== null) problems.push(COLUMN_NAME_RULE)
+    else if (seen.has(column.name)) problems.push(COLUMN_NAME_RULE)
+    seen.add(column.name)
+    if ((column.type === "date" || column.type === "timestamp") && column.dateFormat === undefined) {
+      problems.push(`Say how the dates of ${column.name || column.source} are read: day first or month first.`)
+    }
+  }
+  return [...new Set(problems)]
+}
+
+/** What goes to the API for a column: the spec, without what the screen keeps for itself. */
+export function columnSpecOf(column: UploadPreviewColumn): UploadColumnSpec {
+  const dated = column.type === "date" || column.type === "timestamp"
+  return {
+    source: column.source,
+    name: column.name,
+    type: column.type,
+    ...(dated && column.dateFormat !== undefined ? { dateFormat: column.dateFormat } : {}),
+    ...(column.type === "timestamp" ? { timezone: column.timezone ?? false } : {}),
+  }
+}
+
+/** The column as it is after a change of type: a type that has no date reading or zone sheds them, one that has takes the guess's or a default. */
+export function withColumnType(column: UploadPreviewColumn, type: UploadColumnType): UploadPreviewColumn {
+  const dated = type === "date" || type === "timestamp"
+  const { dateFormat, timezone, ...rest } = column
+  return {
+    ...rest,
+    type,
+    ...(dated ? { dateFormat: dateFormat ?? undefined } : {}),
+    ...(type === "timestamp" ? { timezone: timezone ?? false } : {}),
+  }
 }

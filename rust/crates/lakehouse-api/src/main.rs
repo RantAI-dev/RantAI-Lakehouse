@@ -21,6 +21,7 @@ mod connector_secret_store;
 mod csv_export;
 mod csv_safe;
 mod error;
+mod export;
 mod gold_export;
 mod gold_export_history;
 mod gold_lock;
@@ -30,10 +31,13 @@ mod json;
 mod lakehouse_catalog;
 mod lakekeeper_token;
 mod next_run;
+mod pdf;
 mod pipeline_lag;
 mod pipeline_source;
 mod policy;
 mod policy_engine;
+mod query_limits;
+mod result_cache;
 mod routes;
 mod rustfs_client;
 mod secret_crypto;
@@ -44,11 +48,16 @@ mod sql_rewrite;
 mod state;
 mod tenant;
 mod tenant_scope;
+mod tile_pool;
 mod transform_grammar;
+mod upload_formats;
 mod upload_limits;
 mod upload_parquet;
+mod upload_parquet_range;
 mod upload_parse;
 mod upload_store;
+mod upload_sweep;
+mod upload_types;
 mod upload_workbook;
 mod upstream_error;
 mod webhook_guard;
@@ -171,6 +180,14 @@ async fn run() -> anyhow::Result<()> {
     // SRC-11 D5/D6: the daily removal of run log lines and attempts older
     // than 30 days.
     spawn_run_log_cleanup(&state);
+    // RPT-1 D3: the scheduled-report runner (a tick every minute, a daily
+    // 90-day cleanup of deliveries).
+    routes::report_runner::spawn(&state);
+    // BI-19 part A (D2): the public links dashboards carried before links
+    // moved to Postgres, copied once, each expiring in 30 days.
+    routes::public_links::spawn_legacy_copy(&state);
+    // DATA-17 decision 8: abort and remove chunked uploads nobody finished.
+    spawn_upload_session_sweep(&state);
 
     let app = routes::router(state);
 
@@ -1022,6 +1039,46 @@ fn spawn_auth_cleanup(state: &AppState) {
         loop {
             interval.tick().await;
             run().await;
+        }
+    });
+}
+
+/// Spawn the hourly sweep of abandoned chunked-upload sessions (`DATA-17`
+/// decision 8): sessions older than `UPLOAD_SESSION_TTL_HOURS` are aborted in
+/// storage and removed (`upload_sweep`). The first tick is immediate, so a
+/// restart after a long outage clears what expired meanwhile; missed ticks
+/// are skipped. An error, or storage that is not configured, is logged and
+/// never takes the process down. Without a Postgres pool, logs once and
+/// spawns nothing.
+fn spawn_upload_session_sweep(state: &AppState) {
+    let Some(pool) = state.pg.clone() else {
+        tracing::warn!("no Postgres pool configured; upload-session sweep will not run");
+        return;
+    };
+    let config = state.config.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(3600));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let store = match upload_store::UploadStore::connect(&config).await {
+                Ok(store) => store,
+                Err(err) => {
+                    tracing::warn!(%err, "upload-session sweep skipped: storage is not usable");
+                    continue;
+                }
+            };
+            match upload_sweep::sweep_stale_sessions(&pool, &store, config.upload_session_ttl_hours)
+                .await
+            {
+                Ok(done) if done.removed > 0 || done.failed > 0 => tracing::info!(
+                    removed = done.removed,
+                    failed = done.failed,
+                    "upload-session sweep complete"
+                ),
+                Ok(_) => {}
+                Err(err) => tracing::warn!(%err, "upload-session sweep failed"),
+            }
         }
     });
 }

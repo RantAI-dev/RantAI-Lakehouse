@@ -106,7 +106,10 @@ export function UploadTableStep({
         </fieldset>
       ) : null}
 
-      <UploadNotice>Every column is stored as text. Numbers and dates have to be converted afterwards.</UploadNotice>
+      <UploadNotice>
+        The columns keep the names and types chosen on the previous step. Adding to a table that already exists keeps that
+        table&apos;s names and types.
+      </UploadNotice>
     </div>
   )
 }

@@ -45,12 +45,15 @@ use crate::upstream_error;
 
 /// Whether `name` is one of the formatting tools (one guard arm in `run_tool`).
 pub(super) fn handles(name: &str) -> bool {
-    matches!(name, "format_chart" | "set_dashboard_theme")
+    matches!(
+        name,
+        "format_chart" | "set_dashboard_theme" | "set_cache_rule"
+    )
 }
 
 /// The fields `format_chart` may change: the style block of `ChartInput` and
 /// the reference lines. Everything else of the chart is out of its reach.
-pub(crate) const FORMAT_FIELDS: [&str; 10] = [
+pub(crate) const FORMAT_FIELDS: [&str; 11] = [
     "format",
     "valueFormats",
     "dateFormat",
@@ -60,6 +63,7 @@ pub(crate) const FORMAT_FIELDS: [&str; 10] = [
     "annotations",
     "tooltip",
     "conditional",
+    "clusters",
     "referenceLines",
 ];
 
@@ -73,6 +77,7 @@ pub(super) async fn run(
     match name {
         "format_chart" => Box::pin(format_chart(state, principal, args)).await,
         "set_dashboard_theme" => set_dashboard_theme(state, principal, args).await,
+        "set_cache_rule" => Box::pin(set_cache_rule(state, principal, args)).await,
         other => json!({ "error": format!("unknown tool: {other}") }),
     }
 }
@@ -309,6 +314,73 @@ fn draws_key(def: &ChartInput, drawn: &[String], key: &str, colour: &str) -> boo
     })
 }
 
+/// The chart `id` as the caller may edit it: not in the trash, not purged, not
+/// on somebody else's personal board (all three answer like a chart that never
+/// existed). The one copy for every tool that rewrites a stored chart.
+///
+/// # Errors
+///
+/// The tool's answer: a sentence, or the classified database error.
+async fn load_chart_for_edit(
+    ch: &lakehouse_clickhouse::ChClient,
+    id: &str,
+    viewer: &Viewer,
+) -> Result<store::StoredChartSpec, Value> {
+    match require_editable_chart(ch, id, viewer).await {
+        Ok(_) => {}
+        Err(crate::routes::dashboard_organise::Gate::Missing(sentence)) => {
+            return Err(json!({ "error": sentence }));
+        }
+        Err(crate::routes::dashboard_organise::Gate::Store(cause)) => {
+            return Err(upstream_error::report_ch(&upstream_error::DATABASE, &cause).to_json());
+        }
+    }
+    let stored = match store::list_stored_charts(ch, viewer).await {
+        Ok(all) => all.into_iter().find(|c| c.spec.id == id),
+        Err(err) => {
+            return Err(upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json());
+        }
+    };
+    stored.ok_or_else(|| json!({ "error": "chart not found." }))
+}
+
+/// Save `merged` over the stored chart `stored` through the same builder and
+/// checks as `update_chart`, and record the dashboard's version. The one copy
+/// for every tool that rewrites a stored chart.
+///
+/// # Errors
+///
+/// The tool's answer: the console's own sentence or the classified database
+/// error.
+async fn save_edited_chart(
+    state: &AppState,
+    principal: Option<&Principal>,
+    stored: &store::StoredChartSpec,
+    merged: &ChartInput,
+) -> Result<store::StoredChartSpec, Value> {
+    let ch = &state.clickhouse;
+    // BI-9: a chart's SQL is built with the report time zone (a deployment setting).
+    let Ok(time) = crate::routes::settings::time_context(state).await else {
+        return Err(json!({ "error": "The reporting settings could not be read." }));
+    };
+    let created_by = stored.created_by.clone().unwrap_or_else(|| "ai".to_owned());
+    let spec = store::spec_from_input(
+        ch,
+        merged,
+        stored.source,
+        &created_by,
+        Some(stored.spec.id.clone()),
+        &time,
+    )
+    .await
+    .map_err(|err| upstream_error::bi(&upstream_error::DATABASE, &err).to_json())?;
+    store::insert_chart(ch, &spec)
+        .await
+        .map_err(|err| upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json())?;
+    snapshot_as(ch, &spec.board, principal).await;
+    Ok(spec)
+}
+
 async fn format_chart(
     state: &AppState,
     principal: Option<&Principal>,
@@ -318,26 +390,10 @@ async fn format_chart(
     if id.is_empty() {
         return json!({ "error": "chart is required (an id from list_charts)." });
     }
-    let ch = &state.clickhouse;
     let viewer: Viewer = principal.map_or_else(Viewer::anonymous, viewer_of);
-    // A chart in the trash, one purged for good, or one on somebody else's
-    // personal board cannot be edited, and all three answer like a chart
-    // that never existed.
-    match require_editable_chart(ch, &id, &viewer).await {
-        Ok(_) => {}
-        Err(crate::routes::dashboard_organise::Gate::Missing(sentence)) => {
-            return json!({ "error": sentence });
-        }
-        Err(crate::routes::dashboard_organise::Gate::Store(cause)) => {
-            return upstream_error::report_ch(&upstream_error::DATABASE, &cause).to_json();
-        }
-    }
-    let stored = match store::list_stored_charts(ch, &viewer).await {
-        Ok(all) => all.into_iter().find(|c| c.spec.id == id),
-        Err(err) => return upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json(),
-    };
-    let Some(stored) = stored else {
-        return json!({ "error": "chart not found." });
+    let stored = match load_chart_for_edit(&state.clickhouse, &id, &viewer).await {
+        Ok(stored) => stored,
+        Err(answer) => return answer,
     };
     let merged = match merge_format(&stored.def, args) {
         Ok(m) => m,
@@ -351,26 +407,72 @@ async fn format_chart(
     if let Err(sentence) = check_series_keys(&stored.def, &stored.spec.y, args) {
         return json!({ "error": sentence });
     }
-    // BI-9: a chart's SQL is built with the report time zone (a deployment setting).
-    let Ok(time) = crate::routes::settings::time_context(state).await else {
-        return json!({ "error": "The reporting settings could not be read." });
-    };
-    let created_by = stored.created_by.clone().unwrap_or_else(|| "ai".to_owned());
-    match store::spec_from_input(ch, &merged, stored.source, &created_by, Some(id), &time).await {
-        Ok(spec) => match store::insert_chart(ch, &spec).await {
-            Ok(()) => {
-                snapshot_as(ch, &spec.board, principal).await;
-                json!({
-                    "formatted": true,
-                    "id": spec.spec.id,
-                    "title": spec.spec.title,
-                    "kind": spec.spec.kind,
-                })
-            }
-            Err(err) => upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json(),
-        },
-        Err(err) => upstream_error::bi(&upstream_error::DATABASE, &err).to_json(),
+    match save_edited_chart(state, principal, &stored, &merged).await {
+        Ok(spec) => json!({
+            "formatted": true,
+            "id": spec.spec.id,
+            "title": spec.spec.title,
+            "kind": spec.spec.kind,
+        }),
+        Err(answer) => answer,
     }
+}
+
+/// `set_cache_rule` (`BI-4` part B, `AI` parity): how long a dashboard's or a
+/// chart's results may be remembered. A dashboard is saved through the console
+/// route's own handler (which checks the permission and the board and records
+/// the version); a chart is saved like `format_chart` saves one, with only its
+/// `cache` field changed. `default` removes the rule so the level above
+/// decides.
+async fn set_cache_rule(
+    state: &AppState,
+    principal: Option<&Principal>,
+    args: &Map<String, Value>,
+) -> Value {
+    use lakehouse_bi::cache_rule::{CacheRule, RULE_REFUSED};
+    let Some(principal) = principal else {
+        return json!({ "error": "set_cache_rule changes a dashboard as the signed-in person, and there is none." });
+    };
+    let (board, chart) = (arg_str(args, "board"), arg_str(args, "chart"));
+    if board.is_empty() == chart.is_empty() {
+        return json!({ "error": "give a board (an id from list_boards) or a chart (an id from list_charts), one of the two." });
+    }
+    let rule = match args.get("rule").and_then(Value::as_str) {
+        Some(mode) => CacheRule::parse(mode, args.get("minutes").and_then(Value::as_i64)),
+        None => Err(RULE_REFUSED.to_owned()),
+    };
+    let rule = match rule {
+        Ok(rule) => rule,
+        Err(sentence) => return json!({ "error": sentence }),
+    };
+    if !chart.is_empty() {
+        let viewer = viewer_of(principal);
+        let stored = match load_chart_for_edit(&state.clickhouse, &chart, &viewer).await {
+            Ok(stored) => stored,
+            Err(answer) => return answer,
+        };
+        let mut merged = stored.def.clone();
+        merged.shape.cache = Some(rule).filter(|r| *r != CacheRule::Follow);
+        return match save_edited_chart(state, Some(principal), &stored, &merged).await {
+            Ok(spec) => json!({ "updated": true, "chart": spec.spec.id, "rule": rule.to_json() }),
+            Err(answer) => answer,
+        };
+    }
+    if board == store::DEFAULT_BOARD_ID {
+        return json!({
+            "error": "the built-in dashboard follows the install's rule; duplicate it first, or set the rule on one of its charts."
+        });
+    }
+    let body = json!({ "id": board, "cache": rule.to_json() });
+    let bytes = Bytes::from(serde_json::to_vec(&body).unwrap_or_default());
+    let result = api_result_to_value(
+        dashboard::boards_update(State(state.clone()), Extension(principal.clone()), bytes).await,
+    )
+    .await;
+    if result.get("error").is_some() {
+        return result;
+    }
+    json!({ "updated": true, "board": board, "rule": rule.to_json() })
 }
 
 async fn set_dashboard_theme(
@@ -557,6 +659,60 @@ mod tests {
         );
     }
 
+    /// `BI-17` part B (plan D6): `format_chart` carries a forecast line and the
+    /// clusters setting, checked with the console's own sentences.
+    #[test]
+    fn a_forecast_line_and_clusters_are_saved_and_checked() {
+        let after = merge_format(
+            &stored(),
+            &args(json!({ "chart": "c1", "referenceLines": [{ "kind": "forecast", "horizon": 6, "label": "Outlook" }] })),
+        )
+        .unwrap();
+        let line = &after.shape.reference_lines.unwrap()[0];
+        assert_eq!(
+            (line.kind, line.horizon),
+            (lakehouse_bi::params::LineKind::Forecast, Some(6))
+        );
+        let e = merge_format(
+            &stored(),
+            &args(
+                json!({ "chart": "c1", "referenceLines": [{ "kind": "forecast", "horizon": 99 }] }),
+            ),
+        )
+        .unwrap_err();
+        assert!(e.contains("horizon of 1 to 60"), "{e}");
+
+        let scatter: ChartInput = serde_json::from_value(json!({
+            "title": "Stores", "mart": "mart_x", "kind": "scatter",
+            "dimension": "store", "measures": ["sales", "visits"], "board": "b1",
+        }))
+        .unwrap();
+        let after = merge_format(
+            &scatter,
+            &args(json!({ "chart": "c1", "clusters": { "k": 4 } })),
+        )
+        .unwrap();
+        assert!(after.style.clusters.is_some());
+        let e = merge_format(
+            &stored(),
+            &args(json!({ "chart": "c1", "clusters": { "k": "auto" } })),
+        )
+        .unwrap_err();
+        assert!(
+            e.contains("clusters is only for a scatter or bubble chart"),
+            "{e}"
+        );
+        let e = merge_format(
+            &scatter,
+            &args(json!({ "chart": "c1", "clusters": { "k": 11 } })),
+        )
+        .unwrap_err();
+        assert!(e.contains("from 2 to 10"), "{e}");
+        let removed =
+            merge_format(&after, &args(json!({ "chart": "c1", "clusters": null }))).unwrap();
+        assert!(removed.style.clusters.is_none());
+    }
+
     #[test]
     fn the_request_of_ai_8_ac1_applies_all_three_changes() {
         // "Show values in rupiah, make the bars green, add a target line at 1,000."
@@ -657,6 +813,7 @@ mod tests {
                 "format": {}, "valueFormats": {"v": {}}, "dateFormat": {}, "colors": {}, "axes": {},
                 "labels": {"show": true}, "annotations": [{"x": "a", "text": "t"}], "tooltip": {"fields": ["v"]},
                 "conditional": [{"column": "v", "rule": {"type": "contains", "text": "x"}, "color": "#000000"}],
+                "clusters": {"k": "auto"},
             }))
             .unwrap(),
             ..stored()

@@ -1,4 +1,4 @@
-import type {
+import type { UsedBy,
   GovernanceService,
   Policy,
   QualityRule,
@@ -102,6 +102,9 @@ export const clickhouseGovernanceService: GovernanceService = {
   },
   async getLineage(focusId, signal) {
     return get<LineageGraph>(`/api/governance/lineage?focus=${encodeURIComponent(focusId)}`, signal);
+  },
+  async getUsedBy(table, signal) {
+    return get<UsedBy>(`/api/governance/lineage/used-by?table=${encodeURIComponent(table)}`, signal);
   },
   async getColumnLineage(table, column, direction, signal) {
     const query = new URLSearchParams({ table, column, direction });

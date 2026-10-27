@@ -10,6 +10,7 @@ import { useDebouncedCallback } from "@/hooks/use-debounced-callback"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { catalogRefusal } from "@/lib/catalog-refusal"
 import { notifyInfo } from "@/lib/notify"
+import { newRunId } from "@/lib/run-id"
 import {
   MAX_QUERY_TABS,
   readTabs,
@@ -127,6 +128,13 @@ type Batch = {
   index: number
   reloaded: boolean
   active: boolean
+  /**
+   * BI-5 (plan D5): the id the statement in flight was sent under, which Stop
+   * names in the cancel call. One id per statement, so a cancel ends only the
+   * statement that is running and never one that already finished.
+   */
+  runId: string | null
+  engine: QueryEngine
 }
 
 /**
@@ -679,7 +687,14 @@ export function useQueryStudio() {
 
       const controller = new AbortController()
       runControllerRef.current = controller
-      const batch: Batch = { tabId, index: 0, reloaded: false, active: true }
+      const batch: Batch = {
+        tabId,
+        index: 0,
+        reloaded: false,
+        active: true,
+        runId: null,
+        engine: runEngine,
+      }
       batchRef.current = batch
       setRunning(true)
 
@@ -709,9 +724,11 @@ export function useQueryStudio() {
             ),
           }))
           try {
+            const runId = newRunId()
+            batch.runId = runId
             const result = await queryService.run(
               list[index].text,
-              { engine: runEngine },
+              { engine: runEngine, runId },
               controller.signal
             )
             setRuns((previous) => ({
@@ -818,6 +835,13 @@ export function useQueryStudio() {
    */
   const stopRun = React.useCallback(() => {
     const batch = batchRef.current
+    // BI-5: ask the server to end the statement's query first. Best effort (a
+    // Trino run has no id to send: the built-in engine is the only one that can
+    // stop a query, see the feature page), and Stop aborts the request either
+    // way, so the page never waits on a query the person gave up on.
+    if (batch?.active && batch.runId && batch.engine === "clickhouse") {
+      void queryService.cancel(batch.runId).catch(() => undefined)
+    }
     runControllerRef.current?.abort()
     // The controller goes now, not when the request settles: a request
     // that never comes back would otherwise hold the console shut.

@@ -38,6 +38,7 @@ hmac = { workspace = true }
 # dev-dependencies it was only in so far.
 jsonwebtoken = { workspace = true }
 sha2 = { workspace = true }
+moka = { workspace = true }
 base64 = { workspace = true }
 # Builds the IdP authorize-endpoint redirect URL with `Url::query_pairs_mut`
 # rather than hand-formatting a query string — see the workspace `Cargo.toml`
@@ -105,6 +106,9 @@ sqlparser = { workspace = true, features = ["visitor"] }
 # dependency of something else in the tree, but this is the first direct
 # use of it in this crate (WS4 item G2).
 chrono = "0.4"
+# BI-4 B review P-B1: the calendar day in the report time zone (the same
+# workspace `jiff` and bundled database `lakehouse-store` already uses).
+jiff = { workspace = true }
 # Reads `.xls` and `.xlsx` for the file upload (`upload_workbook`, ADR 0014,
 # amendment of 2026-10-07). MIT; it adds `atoi_simd`, `codepage`,
 # `debug_unsafe`, `fast-float2`, `typed-path`, `zip` and `zopfli` to the
@@ -133,6 +137,16 @@ arrow-schema = "58"
 # licence); declared here because the upload's reader is the API's own, not
 # routed through the Iceberg crate.
 parquet = "58"
+# `DATA-17` slice 4 (plan AD8): the preview reads the Avro, gzip and zip files an upload may
+# be (`upload_formats`). All three are already in `Cargo.lock` through other crates, at
+# the versions below and with the features the build already unifies, so the lockfile
+# gains no crate. `apache-avro` is the crate `iceberg` uses for its manifests;
+# its default features are off here because codecs are not ours to choose (the preview
+# accepts the `null` and `deflate` codecs the job's `fastavro` reads without extras);
+# `zip` has `deflate` as `calamine` already enables it; `flate2` reads the gzip prefix.
+apache-avro = { version = "0.21", default-features = false }
+flate2 = "1.1"
+zip = { version = "8.6", default-features = false, features = ["deflate"] }
 # 0.13, not 0.12: SEC-8 — tiberius 0.12 pulls rustls 0.21 ->
 # rustls-webpki 0.101.7 (RUSTSEC-2026-0098/0099/0104, no fixed 0.101.x);
 # the 0.13 line is on rustls 0.23 -> webpki 0.103.15, all three fixed.
@@ -156,8 +170,17 @@ reqwest013 = { package = "reqwest", version = "0.13", default-features = false, 
 # `futures` 0.3 is already in `Cargo.lock` (`lakehouse-iceberg` depends on it),
 # so this adds no package; only this crate's dependency list in the lockfile.
 futures = "0.3"
+# `BI-1` D6: the .xlsx writer. Pinned exactly (a download format must not change
+# under a routine update); `constant_memory` mode keeps a million-row export off
+# the heap. MIT OR Apache-2.0; `cargo deny check` and `cargo audit` pass with it
+# (plan 2026-10-17-bi-1-export.md, section 5).
+rust_xlsxwriter = { version = "=0.99.1", features = ["constant_memory"] }
 
 [dev-dependencies]
+# `BI-1` T2: the export tests open the .xlsx they wrote to read its cells and
+# styles. Same version and features as `calamine` and `rust_xlsxwriter` already
+# ask for, so the lockfile gains no package.
+zip = { version = "8.6", default-features = false, features = ["deflate"] }
 tower = { workspace = true, features = ["util"] }
 wiremock = { workspace = true }
 uuid = { workspace = true }

@@ -625,5 +625,57 @@
     "expect_state": [
       {"path": "/api/dashboard/specs", "list": "charts", "where": {"kind": "bullet", "def.goal": 1000}, "count": 1}
     ]
+  },
+  {
+    "id": "limits_why_timed_out",
+    "mode": "ask",
+    "turns": ["Why did this chart time out?"],
+    "expect_tool": {"name": "get_query_limits"}
+  },
+  {
+    "id": "dash_make_chart_always_fresh",
+    "mode": "build",
+    "confirm": true,
+    "setup": [
+      {"name": "chart", "method": "POST", "path": "/api/dashboard/specs", "body": {"title": "Eval Fresh Chart", "kind": "bar", "mart": "mart_event", "dimension": "tahun", "measures": ["jumlah_event"]}, "id_at": "chart.id"}
+    ],
+    "turns": ["Make chart {chart} always fresh."],
+    "expect_tool": {"name": "set_cache_rule", "args_contains": {"chart": "{chart}", "rule": "fresh"}},
+    "expect_state": [
+      {"path": "/api/dashboard/specs", "list": "charts", "where": {"id": "{chart}", "def.cache.mode": "fresh"}, "count": 1}
+    ]
+  }
+  ,{
+    "id": "calc_distance_to_bandung",
+    "mode": "build",
+    "confirm": true,
+    "turns": [
+      "Add a field called km_from_bandung on mart_demo_map_points with the distance in kilometres from each place to Bandung (latitude -6.9175, longitude 107.6191)."
+    ],
+    "expect_tool": {
+      "name": "create_calculated_field",
+      "args_contains": {
+        "mart": "mart_demo_map_points",
+        "name": "km_from_bandung"
+      }
+    },
+    "expect_state": [
+      {
+        "path": "/api/dashboard/calc-fields?mart=mart_demo_map_points",
+        "list": "fields",
+        "where": {
+          "name": "km_from_bandung"
+        },
+        "count": 1
+      }
+    ],
+    "forbid": [
+      "SELECT",
+      "geoDistance"
+    ],
+    "formula_forbid": [
+      "SELECT",
+      "geoDistance"
+    ]
   }
 ]

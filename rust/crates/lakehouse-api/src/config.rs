@@ -334,6 +334,30 @@ pub struct Config {
     /// plain-text `console.app_kv` row); `None` means signed embedding is
     /// unavailable and says so, while the API still starts.
     pub embed_secret: Option<String>,
+    /// Base URL of the Gotenberg container that makes PDFs (`GOTENBERG_URL`,
+    /// `BI-1` D1/D5). `None` when unset or empty. Operator configuration,
+    /// never taken from a request.
+    pub gotenberg_url: Option<String>,
+    /// The key render tokens are signed with (`RENDER_TOKEN_SECRET`, `BI-1`
+    /// review fix (BLOCKER) R1). Server-only and independent of every other
+    /// secret: `EMBED_SECRET` is held by the embedding customer, and a render
+    /// token reads as whichever person it names. `None` when unset or empty:
+    /// PDF export is then not set up (fail closed).
+    pub render_token_secret: Option<lakehouse_core::secret::SecretValue>,
+    /// The console's address as the Gotenberg container reaches it
+    /// (`CONSOLE_INTERNAL_URL`, e.g. `http://lakehouse-frontend:3000`): the
+    /// print view lives at `<this>/render/dashboard/<token>`. `None` when
+    /// unset or empty. PDF export needs this, `GOTENBERG_URL` and
+    /// `RENDER_TOKEN_SECRET` (the render token's key); any one missing means "PDF
+    /// export is not set up on this deployment" (feature decision 6).
+    pub console_internal_url: Option<String>,
+    /// The console's address as people open it (`CONSOLE_PUBLIC_URL`, e.g.
+    /// `https://lakehouse.example.com`): the link in a scheduled report's email
+    /// (`RPT-1`) is `<this>/dashboards/<id>`. Operator configuration, never
+    /// taken from a request (a header the caller controls would put a link of
+    /// their choosing in an email to others). `None` when unset, empty or not an
+    /// `http(s)` address: the email then has no link and says nothing about one.
+    pub console_public_url: Option<String>,
     /// The longest lifetime (`exp - iat`) a signed embed token may have, in
     /// seconds (`SEC-12`). `EMBED_TOKEN_MAX_LIFETIME_SECONDS`; default
     /// 86400. A value that is not a positive integer fails start-up
@@ -881,6 +905,14 @@ pub struct Config {
     /// The same, for the whole installation: `UPLOAD_MAX_CONCURRENT`,
     /// default 16 (`SEC-17`).
     pub upload_max_concurrent: u32,
+    /// Hours after which an upload session whose pieces never all arrived
+    /// is aborted and removed: `UPLOAD_SESSION_TTL_HOURS`, default 24
+    /// (`DATA-17`, decision 8 of the feature page, *proposed* and signed by
+    /// default). A value that is not a whole number of 1 or more fails config
+    /// resolution ([`ConfigError::InvalidUploadLimit`]). Read by the hourly
+    /// sweep (`upload_sweep`); the compose file does not pass it through yet,
+    /// so a container runs with the default.
+    pub upload_session_ttl_hours: u32,
     /// Failed connector runs in a row at which the connector is paused and
     /// `connector_disabled` is raised (`SRC-11` decision D3), from
     /// `CONNECTOR_AUTO_DISABLE_AFTER`. Zero, negative, or unparseable values
@@ -920,6 +952,13 @@ impl std::fmt::Debug for Config {
                 "embed_secret",
                 &self.embed_secret.as_ref().map(|_| REDACTED),
             )
+            .field(
+                "render_token_secret",
+                &self.render_token_secret.as_ref().map(|_| REDACTED),
+            )
+            .field("gotenberg_url", &self.gotenberg_url)
+            .field("console_internal_url", &self.console_internal_url)
+            .field("console_public_url", &self.console_public_url)
             .field(
                 "embed_token_max_lifetime_seconds",
                 &self.embed_token_max_lifetime_seconds,
@@ -1114,6 +1153,7 @@ impl std::fmt::Debug for Config {
                 &self.upload_max_concurrent_per_user,
             )
             .field("upload_max_concurrent", &self.upload_max_concurrent)
+            .field("upload_session_ttl_hours", &self.upload_session_ttl_hours)
             .field(
                 "connector_auto_disable_after",
                 &self.connector_auto_disable_after,
@@ -1250,8 +1290,8 @@ impl Config {
     ///   `AI_RELEVANT_TABLES` is set and non-empty but is neither `true`
     ///   nor `false`.
     /// - [`ConfigError::InvalidUploadLimit`], if
-    ///   `UPLOAD_MAX_CONCURRENT_PER_USER` or `UPLOAD_MAX_CONCURRENT` is set
-    ///   and non-empty but is not a whole number of 1 or more.
+    ///   `UPLOAD_MAX_CONCURRENT_PER_USER`, `UPLOAD_MAX_CONCURRENT` or
+    ///   `UPLOAD_SESSION_TTL_HOURS` is set and non-empty but is not a whole number of 1 or more.
     ///
     /// An unparseable `SMTP_PORT` does NOT error — see [`Config::smtp_port`].
     #[allow(
@@ -1306,6 +1346,13 @@ impl Config {
             llm_model: or_default(env, "LLM_MODEL", "MiniMax-M3"),
             llm_key,
             embed_secret: truthy(env, "EMBED_SECRET"),
+            render_token_secret: truthy(env, "RENDER_TOKEN_SECRET")
+                .map(lakehouse_core::secret::SecretValue::new),
+            gotenberg_url: truthy(env, "GOTENBERG_URL"),
+            console_internal_url: truthy(env, "CONSOLE_INTERNAL_URL"),
+            console_public_url: truthy(env, "CONSOLE_PUBLIC_URL")
+                .map(|url| url.trim_end_matches('/').to_owned())
+                .filter(|url| url.starts_with("https://") || url.starts_with("http://")),
             embed_token_max_lifetime_seconds: parse_embed_token_max_lifetime(env)?,
             alerts_run_token: truthy(env, "ALERTS_RUN_TOKEN"),
             smtp_host: truthy(env, "SMTP_HOST"),
@@ -1490,6 +1537,7 @@ impl Config {
             auth_retention_days: parse_positive_u32_or_default(env, "AUTH_RETENTION_DAYS", 30),
             upload_max_concurrent_per_user: parse_limit(env, "UPLOAD_MAX_CONCURRENT_PER_USER", 4)?,
             upload_max_concurrent: parse_limit(env, "UPLOAD_MAX_CONCURRENT", 16)?,
+            upload_session_ttl_hours: parse_limit(env, "UPLOAD_SESSION_TTL_HOURS", 24)?,
             connector_auto_disable_after: i32::try_from(parse_positive_u32_or_default(
                 env,
                 "CONNECTOR_AUTO_DISABLE_AFTER",
@@ -1574,6 +1622,7 @@ mod tests {
             ("CH_PASSWORD", "s3cret-ch-pass"),
             ("LLM_KEY", "s3cret-llm-key"),
             ("EMBED_SECRET", "s3cret-embed"),
+            ("RENDER_TOKEN_SECRET", "s3cret-render"),
             ("ALERTS_RUN_TOKEN", "s3cret-alerts-token"),
             ("SMTP_PASS", "s3cret-smtp-pass"),
             ("AGENT_RUN_TOKEN", "s3cret-agent-run-token"),
@@ -1592,6 +1641,7 @@ mod tests {
             "s3cret-ch-pass",
             "s3cret-llm-key",
             "s3cret-embed",
+            "s3cret-render",
             "s3cret-alerts-token",
             "s3cret-smtp-pass",
             "s3cret-agent-run-token",
@@ -1620,6 +1670,10 @@ mod tests {
         assert_eq!(cfg.llm_model, "MiniMax-M3");
         assert_eq!(cfg.llm_key, "");
         assert_eq!(cfg.embed_secret, None);
+        assert_eq!(cfg.gotenberg_url, None);
+        assert!(cfg.render_token_secret.is_none());
+        assert_eq!(cfg.console_internal_url, None);
+        assert_eq!(cfg.console_public_url, None);
         assert_eq!(cfg.embed_token_max_lifetime_seconds, 86_400);
         assert_eq!(cfg.alerts_run_token, None);
         assert_eq!(cfg.smtp_host, None);
@@ -2634,5 +2688,68 @@ mod tests {
             err,
             ConfigError::InvalidUploadLimit("UPLOAD_MAX_CONCURRENT", _)
         ));
+    }
+
+    /// `BI-1` D1: the PDF renderer's two addresses are plain configuration;
+    /// empty is unset, so a compose default of `""` means "not set up".
+    #[test]
+    fn the_pdf_renderer_addresses_are_read_and_empty_means_unset() {
+        let mut env = HashMap::new();
+        env.insert(
+            "GOTENBERG_URL".to_owned(),
+            "http://gotenberg:3000".to_owned(),
+        );
+        env.insert(
+            "CONSOLE_INTERNAL_URL".to_owned(),
+            "http://lakehouse-frontend:3000".to_owned(),
+        );
+        let cfg = Config::from_map(&env).unwrap();
+        assert_eq!(cfg.gotenberg_url.as_deref(), Some("http://gotenberg:3000"));
+        assert_eq!(
+            cfg.console_internal_url.as_deref(),
+            Some("http://lakehouse-frontend:3000")
+        );
+        env.insert("CONSOLE_INTERNAL_URL".to_owned(), String::new());
+        let blank = Config::from_map(&env).unwrap();
+        assert_eq!(blank.console_internal_url, None);
+    }
+
+    /// `RPT-1`: the console's public address is plain configuration; empty, a
+    /// non-`http(s)` value and a trailing slash are handled so a link built
+    /// from it is never `javascript:` or `//`.
+    #[test]
+    fn the_console_public_address_is_read_trimmed_and_must_be_http() {
+        let with = |value: &str| {
+            let mut env = HashMap::new();
+            env.insert("CONSOLE_PUBLIC_URL".to_owned(), value.to_owned());
+            Config::from_map(&env).unwrap().console_public_url
+        };
+        assert_eq!(
+            with("https://lakehouse.example.com/").as_deref(),
+            Some("https://lakehouse.example.com")
+        );
+        assert_eq!(with("").as_deref(), None);
+        assert_eq!(with("javascript:alert(1)").as_deref(), None);
+        assert_eq!(with("lakehouse.example.com").as_deref(), None);
+    }
+
+    #[test]
+    fn the_upload_session_lifetime_defaults_to_24_hours_and_a_bad_value_is_refused() {
+        assert_eq!(
+            Config::from_map(&HashMap::new())
+                .unwrap()
+                .upload_session_ttl_hours,
+            24
+        );
+        let cfg = Config::from_map(&env_with("UPLOAD_SESSION_TTL_HOURS", "6")).unwrap();
+        assert_eq!(cfg.upload_session_ttl_hours, 6);
+        for bad in ["0", "-1", "abc"] {
+            let err = Config::from_map(&env_with("UPLOAD_SESSION_TTL_HOURS", bad))
+                .expect_err("a bad lifetime must stop start-up");
+            assert_eq!(
+                err,
+                ConfigError::InvalidUploadLimit("UPLOAD_SESSION_TTL_HOURS", bad.to_owned())
+            );
+        }
     }
 }

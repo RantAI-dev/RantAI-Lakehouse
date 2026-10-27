@@ -979,7 +979,11 @@ fn headless_tools(perms: &PermissionSet, is_build: bool) -> Vec<Value> {
             let name = t["function"]["name"].as_str().unwrap_or("");
             let is_write =
                 ai_registry::find(name).is_some_and(|spec| spec.risk != ai_registry::Risk::Read);
-            name != ai_registry::ASK_USER && (is_build || !is_write)
+            // RPT-1 review fix (BLOCKER) R1: the report write tools are not
+            // offered either (`headless_refusal` holds the line if one is named).
+            name != ai_registry::ASK_USER
+                && !REPORT_WRITE_TOOLS.contains(&name)
+                && (is_build || !is_write)
         })
         .collect()
 }
@@ -989,8 +993,80 @@ fn headless_tools(perms: &PermissionSet, is_build: bool) -> Vec<Value> {
 /// run has nobody to answer. PR review fix (SHOULD-FIX): the decision sat
 /// inline in the loop, where no test could reach it without a model.
 fn headless_refusal(name: &str) -> Option<String> {
-    (name == ai_registry::ASK_USER)
-        .then(|| format!("refused: a headless run has nobody to answer ({name})"))
+    if name == ai_registry::ASK_USER {
+        return Some(format!(
+            "refused: a headless run has nobody to answer ({name})"
+        ));
+    }
+    // RPT-1 review fix (BLOCKER) R1: a scheduled report is made as a person and
+    // emailing someone else waits for a human's approval (DEC-8). A headless
+    // run has no person to own the report, no Confirm button, and does not go
+    // through `gate::effective_risk`, so the tools that write one are refused
+    // here (fail closed). Reading the list stays.
+    REPORT_WRITE_TOOLS
+        .contains(&name)
+        .then(|| format!("refused: a headless run cannot schedule or change reports ({name})"))
+}
+
+/// Drop the argument only the server may write (`ownerId`, `RPT-1` review fix
+/// (BLOCKER) R1).
+fn strip_server_fields(args: &mut Map<String, Value>) {
+    args.remove("ownerId");
+}
+
+/// The scheduled-report tools that write (`RPT-1`); refused in a headless run.
+const REPORT_WRITE_TOOLS: [&str; 3] = [
+    "create_report_subscription",
+    "update_report_subscription",
+    "delete_report_subscription",
+];
+
+/// [`run_headless_loop_inner`] under a query run: a scheduled run has no request, so
+/// without this its `run_sql` would use the compiled-in limits, not the settings
+/// (`BI-5` review B2). Boxed to keep this future under the size lint.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "forwards every argument of the loop it wraps"
+)]
+async fn run_headless_loop(
+    state: &AppState,
+    run_id: &str,
+    employee_id: &str,
+    prompt: &str,
+    is_build: bool,
+    perms: &PermissionSet,
+    principal: Option<&Principal>,
+    principal_id: Option<String>,
+    principal_kind: &str,
+    actor_label: &str,
+    // WS7 item G2: `budget_limit`/`budget_consumed` are measured in
+    // TOKENS, not currency — `lakehouse-llm` has no price table (`grep
+    // -rn "price\|cost_per_token" rust/crates/lakehouse-llm/` returns
+    // nothing) and this loop does not invent one. `DigitalEmployee.
+    // budget_limit`'s existing column and "Budget ceiling" label are
+    // reinterpreted as a token ceiling going forward — a disclosed,
+    // breaking semantic change for any already-authored employee whose
+    // `budget_limit` was set assuming a currency unit.
+    budget_limit: f64,
+) -> HeadlessOutcome {
+    crate::query_limits::scope_if_missing(
+        state,
+        principal,
+        Box::pin(run_headless_loop_inner(
+            state,
+            run_id,
+            employee_id,
+            prompt,
+            is_build,
+            perms,
+            principal,
+            principal_id,
+            principal_kind,
+            actor_label,
+            budget_limit,
+        )),
+    )
+    .await
 }
 
 /// The headless tool-calling loop shared by every `POST
@@ -1009,7 +1085,7 @@ fn headless_refusal(name: &str) -> Option<String> {
               scatter one sequential loop across helpers with no independent reuse, matching \
               routes::ai::chat's own identical justification"
 )]
-async fn run_headless_loop(
+async fn run_headless_loop_inner(
     state: &AppState,
     run_id: &str,
     employee_id: &str,
@@ -1215,8 +1291,12 @@ async fn run_headless_loop(
         }
 
         for call in &calls {
-            let args: Map<String, Value> =
+            let mut args: Map<String, Value> =
                 serde_json::from_str(&call.function.arguments).unwrap_or_default();
+            // RPT-1 review fix (BLOCKER) R1: `ownerId` is written only by the
+            // server, into an approval's stored arguments; a model must not
+            // name it here either (`gate::strip_confirmed` does this in chat).
+            strip_server_fields(&mut args);
             let spec = ai_registry::find(&call.function.name);
             let is_write = spec.is_some_and(|s| s.risk != ai_registry::Risk::Read);
 
@@ -1968,6 +2048,37 @@ mod tests {
             Some("refused: a headless run has nobody to answer (ask_user)")
         );
         assert_eq!(headless_refusal("run_sql"), None);
+    }
+
+    // RPT-1 review fix (BLOCKER) R1: a model-supplied owner never reaches a tool.
+    #[test]
+    fn a_model_supplied_owner_is_dropped_before_a_headless_call() {
+        let mut args: Map<String, Value> =
+            serde_json::from_value(json!({ "id": "x", "ownerId": "someone-else" })).unwrap();
+        strip_server_fields(&mut args);
+        assert!(!args.contains_key("ownerId"));
+        assert!(args.contains_key("id"));
+    }
+
+    // RPT-1 review fix (BLOCKER) R1.
+    #[test]
+    fn a_headless_run_refuses_the_report_write_tools_and_does_not_offer_them() {
+        for name in REPORT_WRITE_TOOLS {
+            assert!(
+                headless_refusal(name)
+                    .is_some_and(|d| d.contains("cannot schedule or change reports")),
+                "{name}"
+            );
+            for is_build in [false, true] {
+                let tools = headless_tools(&admin_perms(), is_build);
+                assert!(!names_of(&tools).contains(&name), "{name} {is_build}");
+            }
+        }
+        // Reading one's reports is still allowed.
+        assert_eq!(headless_refusal("list_report_subscriptions"), None);
+        assert!(
+            names_of(&headless_tools(&admin_perms(), false)).contains(&"list_report_subscriptions")
+        );
     }
 
     fn platform_admin_principal() -> Principal {

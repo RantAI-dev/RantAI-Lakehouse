@@ -381,7 +381,7 @@ export function ConnectorCreatePage() {
                 (DATA-9, `docs/core/features/upload-file.md`). */}
             <p className="text-sm text-muted-foreground">
               <Link href="/connectors/upload" className="text-primary underline-offset-4 hover:underline">
-                Have a file instead? Upload a CSV or TSV
+                Have a file instead? Upload CSV, TSV, Excel or Parquet files
               </Link>
             </p>
             {types.status === "loading" ? (

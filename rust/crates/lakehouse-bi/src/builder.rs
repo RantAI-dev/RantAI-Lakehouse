@@ -64,15 +64,135 @@ pub struct NeedsProjection;
 pub struct Ready;
 
 /// `SETTINGS` appended to every statement built over a [`Relation::Sql`]:
-/// the same 2 000-row cap as Query Studio (`routes/query.rs`
-/// `MAX_RESULT_ROWS`), enforced by `ClickHouse` rather than by truncating
-/// afterwards, and a 30 s execution limit. Why 30 s: Superset's SQL Lab
-/// default (`SQLLAB_TIMEOUT`), and below the API's 60 s route/HTTP timeout,
-/// so `ClickHouse` cancels the query itself instead of it running on after
-/// the client gave up (measured: `max_execution_time = 1` on a 1e11-row
-/// scan fails with `TIMEOUT_EXCEEDED` after 1.00 s on `ClickHouse` 26.8).
+/// the same 2 000-row cap as Query Studio (`routes/query.rs`), enforced by
+/// `ClickHouse` rather than by truncating afterwards, and a 60 s execution
+/// limit. These are the **defaults** of the administrator's query limits
+/// (`BI-5`, migration `0101`; `lakehouse_store::query_limits::QueryLimits::
+/// default` pins the same numbers): the API swaps this text for the numbers
+/// of the request's limits with [`with_run_settings`] before the statement
+/// runs, because the text is also stored with a saved chart and a change of
+/// the setting must reach charts that were saved before it. The text stays
+/// in the statement, not only in URL settings, because a statement-level
+/// `SETTINGS` overrides URL settings (`SEC-21`). The time limit is below the
+/// API's route deadline, so `ClickHouse` cancels the query itself instead of
+/// it running on after the client gave up (measured: `max_execution_time = 1`
+/// on a 1e11-row scan fails with `TIMEOUT_EXCEEDED` after 1.00 s on
+/// `ClickHouse` 26.8).
 pub const SQL_SOURCE_SETTINGS: &str =
-    " SETTINGS max_result_rows = 2000, result_overflow_mode = 'break', max_execution_time = 30";
+    " SETTINGS max_result_rows = 2000, result_overflow_mode = 'break', max_execution_time = 60";
+
+/// `statement` with the SQL-source cap of a tile ([`SQL_SOURCE_SETTINGS`])
+/// swapped for `max_rows` rows and `seconds` seconds: the one body behind a
+/// tile's configured limits (`BI-5` plan D3) and a download's
+/// ([`with_export_settings`]). A statement over a mart, which carries no such
+/// cap, comes back unchanged; settings added after the cap
+/// (`prefer_column_name_to_alias`, ...) are kept.
+#[must_use]
+pub fn with_run_settings(statement: &str, max_rows: u32, seconds: u32) -> String {
+    let Some((start, end)) = find_source_settings(statement) else {
+        return statement.to_owned();
+    };
+    format!(
+        "{} SETTINGS max_result_rows = {max_rows}, result_overflow_mode = 'break', \
+         max_execution_time = {seconds}{}",
+        &statement[..start],
+        &statement[end..]
+    )
+}
+
+/// Where the SQL-source cap sits in `statement` (`BI-5` review S3): the last
+/// ` SETTINGS max_result_rows = <n>, result_overflow_mode = 'break',
+/// max_execution_time = <n>` with **any** two numbers, not only today's
+/// defaults. A chart saved before `BI-5` stores the text with
+/// `max_execution_time = 30`, and a chart saved under another default would
+/// store that one; matching only the current text left those on their old
+/// limits (and kept `BI-1`'s export lift off them). Returns the byte range of
+/// the clause, from the space before `SETTINGS` to the end of the last number.
+fn find_source_settings(statement: &str) -> Option<(usize, usize)> {
+    const HEAD: &str = " SETTINGS max_result_rows = ";
+    const MIDDLE: &str = ", result_overflow_mode = 'break', max_execution_time = ";
+    let mut search_end = statement.len();
+    while let Some(start) = statement[..search_end].rfind(HEAD) {
+        let digits = |from: usize| {
+            statement[from..]
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(statement.len() - from)
+        };
+        let rows_at = start + HEAD.len();
+        let rows_len = digits(rows_at);
+        let middle_at = rows_at + rows_len;
+        if rows_len > 0 && statement[middle_at..].starts_with(MIDDLE) {
+            let seconds_at = middle_at + MIDDLE.len();
+            let seconds_len = digits(seconds_at);
+            if seconds_len > 0 {
+                return Some((start, seconds_at + seconds_len));
+            }
+        }
+        search_end = start;
+    }
+    None
+}
+
+/// `statement` with the SQL-source cap of a tile swapped for a download's:
+/// `max_rows` rows and 280 seconds, below the 300-second timeout of the
+/// download's stream (`BI-1`, plan decision D6). A separate path on purpose:
+/// a tile keeps its cap, only a whole-result download lifts it.
+#[must_use]
+pub fn with_export_settings(statement: &str, max_rows: u32) -> String {
+    with_run_settings(statement, max_rows, 280)
+}
+
+/// A point-map statement (`build_points_sql`, `grid_points_sql`) with the
+/// number of points it keeps swapped for `points`, the administrator's map
+/// limit (`BI-5`): `LIMIT n` is the statement's last clause before any
+/// `SETTINGS`. Over a SQL source the limit is also held to `source_rows`, the
+/// source's row cap, for the reason [`point_limit`] gives (a `LIMIT` above the
+/// cap would be cut by the engine at an unpredictable block). A statement that
+/// does not end that way comes back unchanged: the API calls this only for
+/// point maps, and the tests below pin the shape against what the builders
+/// write.
+#[must_use]
+pub fn with_point_limit(statement: &str, points: u32, source_rows: u32) -> String {
+    let Some((at, _, rest)) = trailing_limit_parts(statement) else {
+        return statement.to_owned();
+    };
+    let limit = if find_source_settings(rest).is_some() {
+        points.min(source_rows)
+    } else {
+        points
+    };
+    format!("{}{LIMIT_KEYWORD}{limit}{rest}", &statement[..at])
+}
+
+const LIMIT_KEYWORD: &str = " LIMIT ";
+
+/// Where the builder's own last `LIMIT n` sits in `statement`: the byte where
+/// ` LIMIT ` starts, the digits' length and the text after the digits, which is
+/// empty or begins ` SETTINGS`. `None` when the statement ends otherwise (a
+/// text the builder did not write).
+fn trailing_limit_parts(statement: &str) -> Option<(usize, usize, &str)> {
+    let at = statement.rfind(LIMIT_KEYWORD)?;
+    let after = &statement[at + LIMIT_KEYWORD.len()..];
+    let digits_end = after
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(after.len());
+    let (digits, rest) = after.split_at(digits_end);
+    if digits.is_empty() || !(rest.is_empty() || rest.starts_with(" SETTINGS")) {
+        return None;
+    }
+    Some((at, digits.len(), rest))
+}
+
+/// The number of the builder's own last `LIMIT n` (`BI-5` review B1): what a
+/// pivot's statement says it may return, so the per-run row cap can stand at
+/// the pivot's own cap and not at the chart cap. `None` for a text that does not
+/// end in one.
+#[must_use]
+pub fn trailing_limit(statement: &str) -> Option<u32> {
+    let (at, len, _) = trailing_limit_parts(statement)?;
+    let start = at + LIMIT_KEYWORD.len();
+    statement[start..start + len].parse().ok()
+}
 
 /// Where a chart's rows come from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1033,6 +1153,134 @@ fn histogram_sql(def: &ChartInput, from: &Relation, where_clauses: Vec<String>) 
     )
 }
 
+/// Most tasks a Gantt chart keeps; the statement asks for one more so the tile
+/// can say "more than 1,000" (`BI-16` part C1, plan D2).
+pub const GANTT_LIMIT: u32 = 1001;
+
+/// The first result column of a Gantt chart's statement, also the `y` of its
+/// spec: the result has `task`, `group`, `start`, `end` and optionally
+/// `progress` (the names the console reads).
+pub const GANTT_START: &str = "start";
+
+/// The columns a Gantt chart reads, as `Ident`s, from its definition.
+struct GanttColumns {
+    task: Ident,
+    group: Option<Ident>,
+    start: Ident,
+    end: Ident,
+    progress: Option<Ident>,
+}
+
+fn gantt_columns(def: &ChartInput) -> Option<GanttColumns> {
+    let named = |v: &Option<String>| v.clone().filter(|c| !c.trim().is_empty());
+    Some(GanttColumns {
+        task: Ident::new(def.dimension.clone()).ok()?,
+        group: match def.breakdown.as_deref().filter(|g| !g.is_empty()) {
+            Some(g) => Some(Ident::new(g.to_owned()).ok()?),
+            None => None,
+        },
+        start: Ident::new(named(&def.types.start)?).ok()?,
+        end: Ident::new(named(&def.types.end)?).ok()?,
+        progress: match named(&def.types.progress) {
+            Some(p) => Some(Ident::new(p).ok()?),
+            None => None,
+        },
+    })
+}
+
+/// A date or timestamp column as the tile reads it: a timestamp in the report
+/// zone (a `Date` is never shifted).
+fn gantt_instant<H: std::hash::BuildHasher>(
+    column: &Ident,
+    kinds: &HashMap<String, ColumnKind, H>,
+    time: &TimeContext,
+) -> String {
+    if kinds.get(column.as_str()) == Some(&ColumnKind::DateTime) {
+        time.in_zone_expr(&column.to_string())
+    } else {
+        column.to_string()
+    }
+}
+
+/// A Gantt chart's statement (`BI-16` part C1, plan D2): one row per task and
+/// group with its first start and last end (and mean progress), the first
+/// [`GANTT_LIMIT`] by start. Rows that end before they start are left out and
+/// counted by [`gantt_reversed_sql`] for the note. The inner select renames
+/// the columns to `__`-prefixed names so a source column called `start` or
+/// `end` can neither shadow nor be shadowed by the result's names, and the
+/// dashboard's predicates sit under it on the raw rows, as in every other
+/// builder here. `None` when the definition no longer checks out.
+fn gantt_sql<H: std::hash::BuildHasher>(
+    def: &ChartInput,
+    from: &Relation,
+    where_clauses: &[String],
+    (kinds, time): (&HashMap<String, ColumnKind, H>, &TimeContext),
+) -> Option<String> {
+    let c = gantt_columns(def)?;
+    let group = c
+        .group
+        .as_ref()
+        .map_or_else(|| "''".to_owned(), ToString::to_string);
+    let progress_inner = c
+        .progress
+        .as_ref()
+        .map(|p| format!(", toFloat64({p}) AS __p"))
+        .unwrap_or_default();
+    let progress_outer = if c.progress.is_some() {
+        ", avg(__p) AS `progress`"
+    } else {
+        ""
+    };
+    let where_sql = if where_clauses.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", where_clauses.join(" AND "))
+    };
+    Some(format!(
+        "SELECT __t AS `task`, __g AS `group`, min(__s) AS `start`, max(__e) AS `end`{progress_outer} \
+         FROM (SELECT {task} AS __t, {group} AS __g, {start} AS __s, {end} AS __e{progress_inner} \
+         FROM {from}{where_sql}) WHERE __e >= __s GROUP BY __t, __g ORDER BY min(__s), __t LIMIT {GANTT_LIMIT}{}",
+        from.settings(),
+        task = c.task,
+        start = gantt_instant(&c.start, kinds, time),
+        end = gantt_instant(&c.end, kinds, time),
+        from = from.render(),
+    ))
+}
+
+/// How many rows of a Gantt chart end before they start: they cannot be drawn,
+/// and the tile says how many were left out (`reversedRows`).
+fn gantt_reversed_sql<H: std::hash::BuildHasher>(
+    def: &ChartInput,
+    from: &Relation,
+    where_clauses: &[String],
+    (kinds, time): (&HashMap<String, ColumnKind, H>, &TimeContext),
+) -> Option<String> {
+    let c = gantt_columns(def)?;
+    let mut clauses = where_clauses.to_vec();
+    clauses.push(format!(
+        "{} < {}",
+        gantt_instant(&c.end, kinds, time),
+        gantt_instant(&c.start, kinds, time)
+    ));
+    Some(format!(
+        "SELECT count() AS n FROM {} WHERE {}{}",
+        from.render(),
+        clauses.join(" AND "),
+        from.settings()
+    ))
+}
+
+/// The statement a Gantt chart is saved with (no dashboard filter).
+pub(crate) fn gantt_stored_sql(
+    def: &ChartInput,
+    from: &Relation,
+    kinds: &HashMap<String, ColumnKind>,
+    time: &TimeContext,
+) -> Option<String> {
+    gantt_sql(def, from, &[], (kinds, time))
+}
+
 /// The statement a histogram is saved with (no dashboard filter).
 pub(crate) fn histogram_stored_sql(def: &ChartInput, from: &Relation) -> Option<String> {
     histogram_sql(def, from, Vec::new())
@@ -1209,6 +1457,12 @@ pub enum TableRead {
         /// Rows to keep ([`tables::pivot_row_cap`]).
         row_cap: u32,
     },
+    /// A Gantt chart: the statement that counts the rows that end before they
+    /// start, left out of the bars (`BI-16` part C1).
+    Reversed {
+        /// `SELECT count() AS n ...` over the same relation and predicates.
+        count_sql: String,
+    },
     /// A KPI that compares with its previous period: the period the buckets
     /// are cut by, so the tile can label them.
     Trend {
@@ -1381,6 +1635,9 @@ where
         // BI-16 part B: a histogram reads the bins' widths, so it is always
         // rebuilt (the tile carries them), like a binned chart.
         || kind == crate::specs::ChartKind::Histogram
+        // BI-16 part C1: a Gantt chart carries the count of its reversed rows,
+        // built here and not stored.
+        || kind == crate::specs::ChartKind::Gantt
         || def.tables.is_rows_mode(kind)
         || def.tables.compares_to_previous(kind)
         || def.uses_shaping()
@@ -2080,6 +2337,15 @@ fn rebuild<H: std::hash::BuildHasher>(
             table: Some(TableRead::Trend { period: *period }),
         });
     }
+    if kind == crate::specs::ChartKind::Gantt {
+        let inputs = (ctx.cols, ctx.read.time);
+        let sql = gantt_sql(def, from, &where_clauses, inputs)?;
+        let count_sql = gantt_reversed_sql(def, from, &where_clauses, inputs)?;
+        return Some(Rebuilt {
+            sql,
+            table: Some(TableRead::Reversed { count_sql }),
+        });
+    }
     rebuild_chart(
         spec,
         from,
@@ -2149,6 +2415,10 @@ fn result_aliases(
         crate::specs::ChartKind::Histogram => {
             vec![def.dimension.clone(), HISTOGRAM_COUNT.to_owned()]
         }
+        // The rewritten select names its columns `__t` ...; a predicate on a
+        // source column of the same name as a result column stays on the raw
+        // rows (the predicates sit in the inner select).
+        crate::specs::ChartKind::Gantt => Vec::new(),
         crate::specs::ChartKind::Boxplot => def
             .measures
             .first()
@@ -4944,5 +5214,102 @@ mod tests {
             "SELECT * FROM serving.t WHERE ((toFloat64(v) >= 500 AND toFloat64(v) < 1000) OR (toFloat64(v) = 1000 AND toFloat64(v) = (SELECT max(toFloat64(v)) FROM serving.t WHERE g IN ('a')))) AND g IN ('a') ORDER BY ALL LIMIT 50 OFFSET 0"
         );
         assert_eq!(got.count.matches("SELECT max").count(), 1);
+    }
+
+    #[test]
+    fn export_settings_replace_the_tile_cap_and_keep_what_follows_it() {
+        let sql =
+            format!("SELECT 1 FROM (SELECT 1\n) AS src{SQL_SOURCE_SETTINGS}, join_use_nulls = 1");
+        let got = with_export_settings(&sql, 1_000_001);
+        assert_eq!(
+            got,
+            "SELECT 1 FROM (SELECT 1\n) AS src SETTINGS max_result_rows = 1000001, \
+             result_overflow_mode = 'break', max_execution_time = 280, join_use_nulls = 1"
+        );
+        assert!(!got.contains("= 2000"));
+        // A mart statement has no cap to lift.
+        assert_eq!(with_export_settings("SELECT 1", 5), "SELECT 1");
+    }
+
+    #[test]
+    fn the_run_settings_swap_the_source_cap_and_leave_a_mart_statement_alone() {
+        let sql =
+            format!("SELECT 1 FROM (SELECT 1\n) AS src{SQL_SOURCE_SETTINGS}, join_use_nulls = 1");
+        assert_eq!(
+            with_run_settings(&sql, 501, 90),
+            "SELECT 1 FROM (SELECT 1\n) AS src SETTINGS max_result_rows = 501, \
+             result_overflow_mode = 'break', max_execution_time = 90, join_use_nulls = 1"
+        );
+        assert_eq!(with_run_settings("SELECT 1", 5, 5), "SELECT 1");
+        // The default text swapped for the default numbers is the same text.
+        let own = format!("SELECT 1{SQL_SOURCE_SETTINGS}");
+        assert_eq!(with_run_settings(&own, 2000, 60), own);
+    }
+
+    /// `BI-5` review S3: a chart saved before `BI-5` stores the cap with
+    /// `max_execution_time = 30` (and any other default would store its own);
+    /// both swaps still reach it, and `BI-1`'s export lift with them.
+    #[test]
+    fn the_run_settings_find_a_source_cap_written_with_other_numbers() {
+        let old = "SELECT 1 FROM (SELECT 1\n) AS src SETTINGS max_result_rows = 2000, \
+                   result_overflow_mode = 'break', max_execution_time = 30";
+        assert_eq!(
+            with_run_settings(old, 501, 90),
+            "SELECT 1 FROM (SELECT 1\n) AS src SETTINGS max_result_rows = 501, \
+             result_overflow_mode = 'break', max_execution_time = 90"
+        );
+        let lifted = with_export_settings(old, 1_000_000);
+        assert!(
+            lifted.contains("max_result_rows = 1000000")
+                && lifted.contains("max_execution_time = 280"),
+            "{lifted}"
+        );
+        // A point statement over such a source is still held to the source cap.
+        let points = format!(
+            "SELECT x FROM (SELECT 1) AS src LIMIT 5000{}",
+            &old[old.find(" SETTINGS").unwrap_or(0)..]
+        );
+        assert!(with_point_limit(&points, 5000, 2000).contains(" LIMIT 2000 SETTINGS"));
+        // Not a cap of ours: a different clause is left alone.
+        let other = "SELECT 1 SETTINGS max_result_rows = 5, max_execution_time = 3";
+        assert_eq!(with_run_settings(other, 9, 9), other);
+        // The last clause is the one swapped, never a similar text inside the source.
+        let inner = format!("SELECT '{old}' AS t{SQL_SOURCE_SETTINGS}");
+        assert!(with_run_settings(&inner, 7, 7).ends_with(
+            "max_result_rows = 7, result_overflow_mode = 'break', max_execution_time = 7"
+        ));
+    }
+
+    #[test]
+    fn a_point_statement_takes_the_map_limit_and_never_exceeds_a_source_cap() {
+        let mart = Relation::Mart(Ident::new("mart_x").unwrap());
+        let (lat, lon, m) = (
+            Ident::new("lat").unwrap(),
+            Ident::new("lon").unwrap(),
+            Ident::new("visitors").unwrap(),
+        );
+        let sql = build_points_sql(&mart, (&lat, &lon), None, &m, Aggregate::Count, &[]);
+        assert!(sql.ends_with(" LIMIT 5000"), "{sql}");
+        assert!(with_point_limit(&sql, 800, 2000).ends_with(" LIMIT 800"));
+        assert!(with_point_limit(&sql, 50_000, 2000).ends_with(" LIMIT 50000"));
+
+        let source = Relation::Sql("SELECT 1 AS lat, 2 AS lon, 3 AS visitors".to_owned());
+        let sql = build_points_sql(&source, (&lat, &lon), None, &m, Aggregate::Count, &[]);
+        assert!(sql.contains(" LIMIT 2000 SETTINGS"), "{sql}");
+        let swapped = with_point_limit(&sql, 50_000, 3000);
+        assert!(swapped.contains(" LIMIT 3000 SETTINGS"), "{swapped}");
+        assert!(swapped.ends_with(SQL_SOURCE_SETTINGS), "{swapped}");
+        assert!(with_point_limit(&sql, 100, 3000).contains(" LIMIT 100 SETTINGS"));
+    }
+
+    #[test]
+    fn a_statement_that_does_not_end_in_a_limit_is_left_unchanged_by_the_point_swap() {
+        for sql in [
+            "SELECT 1",
+            "SELECT a FROM t LIMIT 5 OFFSET 3",
+            "SELECT a FROM t LIMIT x",
+        ] {
+            assert_eq!(with_point_limit(sql, 10, 10), sql);
+        }
     }
 }

@@ -9,12 +9,14 @@ import { dashboardLook } from "@/lib/dashboard-look";
 import { DashboardGrid, type GridItem } from "./dashboard-grid";
 import { ReportingProvider } from "./reporting-context";
 import { TileBody } from "./tile-body";
+import type { MapLoader } from "./echarts-maps";
 import { OwnFiltersMarker, ownFilters } from "./filters/own-filters-marker";
 import type { ChartRenderSpec } from "@/lib/dashboard-specs";
 import { selectedTab } from "@/lib/dashboard-tabs";
 import type { BoardTab, LayoutMap, PhoneTile } from "@/services";
 import { TabBar } from "./tab-bar";
 import type { TileFailure } from "@/services/contracts/dashboards";
+import { LinkGone, PasswordGate, TICKET_HEADER, openPublic, readTicket } from "./public-link-access";
 
 type Cell = { columns: string[]; rows: Record<string, unknown>[] } | TileFailure;
 type Payload = {
@@ -46,36 +48,53 @@ export function PublicDashboard({ token }: { token: string }) {
   const dark = look.dark;
   const fixedTheme = look.className !== "";
   const [tabId, setTabId] = React.useState<string | null>(null);
-  const [state, setState] = React.useState<"loading" | "ok" | "notfound" | "error">("loading");
+  const [state, setState] = React.useState<"loading" | "ok" | "notfound" | "password" | "error">("loading");
+  // Bumped when the password page succeeds, so the dashboard is asked for again.
+  const [attempt, setAttempt] = React.useState(0);
+  // PR #246 review BLOCKER 1: an uploaded map's boundary is read through the
+  // link's own token, the way the board's data is — never through `apiFetch`,
+  // whose 401 would send this anonymous viewer to the login page.
+  // BI-19 part A: the ticket of a link with a password rides with it, the
+  // same way it rides with the board's data, so a map on a link that needs a
+  // password is behind the same door.
+  const loadMap = React.useCallback<MapLoader>(
+    (id) => {
+      const ticket = readTicket(token);
+      return fetch(
+        `/api/public/dashboard/${encodeURIComponent(token)}/maps/${encodeURIComponent(id)}/geojson`,
+        {
+          cache: "no-store",
+          headers: ticket ? { [TICKET_HEADER]: ticket } : undefined,
+        }
+      );
+    },
+    [token],
+  );
 
   React.useEffect(() => {
     let alive = true;
     (async () => {
       try {
-        // Deliberately NOT `apiFetch`: this is the unauthenticated public
-        // share view. A 401/403/404 here means "no such share", rendered
-        // below as not-found — `apiFetch`'s 401 -> /login redirect would be
-        // wrong for a viewer who has no account to log into.
-        const res = await fetch(`/api/public/dashboard/${encodeURIComponent(token)}`, { cache: "no-store" });
+        // `openPublic` is deliberately NOT `apiFetch`: this is the
+        // unauthenticated public share view, and `apiFetch`'s 401 -> /login
+        // redirect would be wrong for a viewer who has no account.
+        const result = await openPublic<Payload>(token);
         if (!alive) return;
-        if (res.status === 404) { setState("notfound"); return; }
-        if (!res.ok) { setState("error"); return; }
-        setData(await res.json());
+        if (result.kind === "gone") { setState("notfound"); return; }
+        if (result.kind === "password") { setState("password"); return; }
+        if (result.kind === "error") { setState("error"); return; }
+        setData(result.data);
         setState("ok");
       } catch {
         if (alive) setState("error");
       }
     })();
     return () => { alive = false; };
-  }, [token]);
+  }, [token, attempt]);
 
-  if (state === "notfound") {
-    return (
-      <Centered>
-        <p className="text-lg font-semibold">Dashboard not available</p>
-        <p className="mt-1 text-sm text-muted-foreground">This link has been revoked or never existed.</p>
-      </Centered>
-    );
+  if (state === "notfound") return <LinkGone />;
+  if (state === "password") {
+    return <PasswordGate token={token} onOpen={() => { setState("loading"); setAttempt((n) => n + 1); }} />;
   }
   if (state === "error") {
     return (
@@ -94,7 +113,7 @@ export function PublicDashboard({ token }: { token: string }) {
     badge: <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">{spec.kind}</span>,
     // BI-6: the chart's own filters, listed (the viewer cannot change them).
     hint: ownFilters(spec) ? <OwnFiltersMarker filters={ownFilters(spec) ?? []} /> : null,
-    body: <TileBody spec={spec} cell={data?.results[spec.id]} dark={dark} loading={state === "loading"} />,
+    body: <TileBody spec={spec} cell={data?.results[spec.id]} dark={dark} loading={state === "loading"} loadMap={loadMap} />,
   }));
 
   return (

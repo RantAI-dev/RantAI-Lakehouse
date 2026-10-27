@@ -6,7 +6,7 @@ import { ZOOM_MAX, ZOOM_MIN } from "@/lib/geo-view";
 import type { ValueFormat } from "@/lib/chart-style";
 import { formatValue } from "@/lib/value-format";
 import { fmtInt as plainInt } from "./chart-option";
-import { DEFAULT_CHOROPLETH_MAP, DEFAULT_POINT_MAP, mapEntry, mapFeatureNames } from "./echarts-maps";
+import { DEFAULT_CHOROPLETH_MAP, DEFAULT_POINT_MAP, mapEntry, mapFeatureAliases, mapFeatureNames } from "./echarts-maps";
 
 /** What the three map kinds need of a chart spec. */
 export type GeoSpec = Pick<ChartSpec, "kind" | "x" | "y" | "map" | "lat" | "lon" | "sqlSource">;
@@ -33,7 +33,7 @@ export function regionNamesFor(spec: GeoSpec, rows: Row[]): Map<string, string[]
   if (spec.kind !== "geomap") return undefined;
   const mapId = resolveMapId(spec);
   const level = mapEntry(mapId)?.level ?? "province";
-  return rawNamesByFeature(rows.map((r) => String(r[spec.x] ?? "")), level, mapFeatureNames(mapId));
+  return rawNamesByFeature(rows.map((r) => String(r[spec.x] ?? "")), level, mapFeatureNames(mapId), mapFeatureAliases(mapId));
 }
 
 /** A cell as a number; a missing or non-numeric cell is NaN, never 0. */
@@ -100,7 +100,7 @@ export function buildGeoOption(spec: GeoSpec, rows: Row[], dark: boolean, look: 
 
   if (spec.kind === "geomap") {
     const named = rows.map((r) => ({ name: String(r[spec.x] ?? ""), value: cellNumber(r[yCol]) }));
-    const match = matchRegionRows(named, level, mapFeatureNames(mapId));
+    const match = matchRegionRows(named, level, mapFeatureNames(mapId), mapFeatureAliases(mapId));
     const maxV = Math.max(1, ...match.data.map((d) => d.value));
     const notices = match.unmatchedRows > 0 ? [unmatchedNotice(match.unmatchedRows, match.unmatchedNames)] : [];
     const option: EChartsOption = {

@@ -757,6 +757,10 @@ async fn execute_query_against_engine(
     sql: &str,
     user_id: &str,
     started: Instant,
+    (run, limits): (
+        &crate::query_limits::QueryRun,
+        &crate::query_limits::TileLimits,
+    ),
 ) -> Result<(Vec<String>, Vec<Value>, u64, u64), ApiError> {
     if engine == "trino" {
         let trino_user = format!("console-{user_id}");
@@ -778,11 +782,26 @@ async fn execute_query_against_engine(
         // SEC-21: the engine stops producing rows past the cap, so a huge
         // result never reaches this process. One row more than the route
         // keeps is asked for, so `truncated` stays honest.
+        //
+        // BI-5: the cap is the administrator's Query Studio row limit, the
+        // engine also stops the query at the time limit, and the query is
+        // named so Stop can end it (`QueryRun::options`). A query the limit
+        // or a Stop ended gets a fixed sentence (plan D6), not the engine's
+        // text.
+        let options = run.options(limits, limits.studio_rows);
         let result = state
             .clickhouse
-            .query_limited(sql, MAX_RESULT_ROWS + 1, None)
+            .query_with_options(sql, &options, None)
             .await
-            .map_err(|e| upstream_error::ch_error_for_author(&upstream_error::DATABASE, &e))?;
+            .map_err(|e| {
+                if e.is_time_limit() {
+                    ApiError::Unprocessable(crate::query_limits::time_sentence("query", limits))
+                } else if e.is_killed_on_engine() {
+                    ApiError::Unprocessable(crate::query_limits::STOPPED_SENTENCE.to_owned())
+                } else {
+                    upstream_error::ch_error_for_author(&upstream_error::DATABASE, &e)
+                }
+            })?;
 
         let columns: Vec<String> = result.meta.iter().map(|m| m.name.clone()).collect();
         let rows: Vec<Value> = result
@@ -869,19 +888,19 @@ pub(crate) async fn check_statement_would_run(
         .map_err(|err| upstream_error::ch_message_for_author(&upstream_error::DATABASE, &err))
 }
 
-/// The most rows one run hands back to the browser.
-///
-/// The console renders every row it receives, so an unbounded `SELECT *`
-/// used to be enough to freeze the tab. The response says when the cap
-/// applied (`truncated`), so nobody reads a partial answer as the whole one.
-///
-/// `ClickHouse` is asked to stop at the cap (`ChClient::query_limited`), so
-/// a huge result does not fill this process's memory before `truncate`
-/// runs (SEC-21). `result_overflow_mode = 'break'` stops at a block
-/// boundary, so up to one block (`max_block_size`, about 65,000 rows by
-/// default) beyond the cap can still arrive; the route keeps
-/// `MAX_RESULT_ROWS` of them. `Trino`'s client bounds its own result.
-const MAX_RESULT_ROWS: usize = 2_000;
+// The most rows one run hands back to the browser is the administrator's
+// Query Studio row limit (`TileLimits::studio_rows`, default 2,000; `BI-5`).
+//
+// The console renders every row it receives, so an unbounded `SELECT *`
+// used to be enough to freeze the tab. The response says when the cap
+// applied (`truncated`), so nobody reads a partial answer as the whole one.
+//
+// `ClickHouse` is asked to stop at the cap (`ChClient::query_with_options`),
+// so a huge result does not fill this process's memory before `truncate`
+// runs (SEC-21). `result_overflow_mode = 'break'` stops at a block
+// boundary, so up to one block (`max_block_size`, about 65,000 rows by
+// default) beyond the cap can still arrive; the route keeps `studio_rows` of
+// them. `Trino`'s client bounds its own result.
 
 /// `POST /api/query/run` — execute a read-only `SQL` statement against
 /// `ClickHouse` (`engine` absent or `"clickhouse"`) or `Trino`
@@ -894,11 +913,11 @@ const MAX_RESULT_ROWS: usize = 2_000;
 /// with the exact message the response carries and the tables the
 /// statement names (`QS-4`). A run whose body does not parse, whose `sql`
 /// is empty, or that has no principal is not recorded — nobody, or
-/// nothing, to record; a run the caller stops is not recorded either,
-/// because the server is not told (Stop closes the browser's request;
-/// `QS-2` is what stops a query on the server). The audit trail's own
-/// refusal path stays what WS7 built it for: enforcement decisions, not
-/// this route's history write.
+/// nothing, to record. A run the caller stops is recorded as `failed`
+/// too (`BI-5`): Stop ends the statement on the server, so the server is
+/// told, and the row carries the stop's own fixed sentence. The audit
+/// trail's own refusal path stays what WS7 built it for: enforcement
+/// decisions, not this route's history write.
 ///
 /// # Errors
 ///
@@ -982,6 +1001,11 @@ pub async fn run(
         return Err(ApiError::unauthorized().into());
     };
     let user_id = p.id.uuid().to_string();
+    // BI-5: this caller's limits and the run (`X-Run-Id`) the statement
+    // belongs to, so Stop can find it.
+    let run = crate::query_limits::QueryRun::current_or_detached();
+    let limits = run.limits().await?;
+    let row_limit = limits.studio_rows as usize;
 
     if engine == "trino" && !is_trino_safe(&statement) {
         let refusal = ApiError::Unprocessable(
@@ -1045,33 +1069,46 @@ pub async fn run(
     let started = Instant::now();
     let started_epoch_ms = epoch_ms();
 
-    let (columns, mut rows, duration_ms, scanned_bytes) =
-        match execute_query_against_engine(&state, &engine, &rewritten, &user_id, started).await {
-            Ok(result) => result,
-            Err(err) => {
-                record_uncompleted_run(
-                    &state,
-                    &p,
-                    &statement,
-                    &engine,
-                    "failed",
-                    &err.to_string(),
-                    &tables_read,
-                    started.elapsed().as_millis(),
-                )
-                .await;
-                return Err(err.into());
-            }
-        };
+    // QS-4: every run that reaches the engine is recorded, whether it
+    // answered or not. BI-5's limits travel with the call, so a run the time
+    // limit or a Stop ended ends here with the limit's own fixed sentence —
+    // and that sentence, not the engine's text, is what the history row
+    // carries, exactly as the response does.
+    let (columns, mut rows, duration_ms, scanned_bytes) = match execute_query_against_engine(
+        &state,
+        &engine,
+        &rewritten,
+        &user_id,
+        started,
+        (&run, &limits),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(err) => {
+            record_uncompleted_run(
+                &state,
+                &p,
+                &statement,
+                &engine,
+                "failed",
+                &err.to_string(),
+                &tables_read,
+                started.elapsed().as_millis(),
+            )
+            .await;
+            return Err(err.into());
+        }
+    };
 
     // The console renders every row it receives, so an unbounded `SELECT *`
-    // used to be enough to freeze the tab — see `MAX_RESULT_ROWS`'s own doc
-    // comment. The engines stop at the cap (`ClickHouse` inside the engine,
-    // `Trino` in its client); this keeps exactly `MAX_RESULT_ROWS` of what
+    // used to be enough to freeze the tab — see the note above this function.
+    // The engines stop at the cap (`ClickHouse` inside the engine,
+    // `Trino` in its client); this keeps exactly `row_limit` of what
     // arrived, and the response says when it did.
     let total_rows = rows.len();
-    let truncated = total_rows > MAX_RESULT_ROWS;
-    rows.truncate(MAX_RESULT_ROWS);
+    let truncated = total_rows > row_limit;
+    rows.truncate(row_limit);
 
     let cost_units = std::cmp::max(1, bytes_to_cost_units(scanned_bytes));
     let id = format!("q-{started_epoch_ms}");
@@ -1133,8 +1170,7 @@ pub async fn run(
         &id,
         &json!(columns),
         &json!(rows),
-        total_rows,
-        truncated,
+        (total_rows, truncated, row_limit),
         duration_ms,
         scanned_bytes,
         cost_units,
@@ -1330,8 +1366,7 @@ fn run_result_json(
     id: &str,
     columns: &Value,
     rows: &Value,
-    total_rows: usize,
-    truncated: bool,
+    (total_rows, truncated, row_limit): (usize, bool, usize),
     duration_ms: u64,
     scanned_bytes: u64,
     cost_units: u64,
@@ -1344,7 +1379,7 @@ fn run_result_json(
         "rows": rows,
         "rowCount": total_rows,
         "truncated": truncated,
-        "rowLimit": MAX_RESULT_ROWS,
+        "rowLimit": row_limit,
         "metrics": {
             "durationMs": duration_ms,
             "scannedBytes": scanned_bytes,
@@ -2647,8 +2682,7 @@ mod tests {
             "q-1",
             &json!([]),
             &json!([]),
-            0,
-            false,
+            (0, false, 2_000),
             12,
             34,
             1,
