@@ -115,6 +115,19 @@ impl Respond for Store {
         {
             return ResponseTemplate::new(500).set_body_string("planted-engine-text");
         }
+        // BI-19 (PR #250 CI), test not product: the importer's viewer hides a
+        // folder only if the folder list names it (`AccessMap::viewer` walks
+        // the stored folders), so the stand-in must serve `f_hidden` as a row
+        // like the real store does; without it the viewer saw the source's
+        // folder as unknown-and-open and the chart failed later, on its columns.
+        if sql.contains("FROM console.bi_folder")
+            && self.hidden_source.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return rows(vec![json!({
+                "id": "f_hidden", "name": "Hidden", "parent_id": "", "created_by": "t",
+                "owner_id": "", "updated_at": "2026-01-01 00:00:00"
+            })]);
+        }
         if sql.contains("FROM console.bi_source")
             && self.hidden_source.load(std::sync::atomic::Ordering::SeqCst)
         {

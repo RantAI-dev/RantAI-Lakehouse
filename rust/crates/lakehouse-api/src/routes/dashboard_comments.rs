@@ -90,6 +90,9 @@ const TOO_LONG: &str = "A comment can have at most 2000 characters.";
 const CONTROL_CHARS: &str = "A comment cannot contain control characters.";
 const MENTION_REFUSED: &str = "One of the people mentioned cannot see this dashboard.";
 const TOO_MANY_MENTIONS: &str = "A comment can mention at most 20 people.";
+/// The one sentence a service identity (a run token or API key) gets on every
+/// comment route. `pub` so the route tests assert the exact text; comments are
+/// a human conversation, and a service identity has no name to show on one.
 pub const SERVICE_REFUSED: &str =
     "Comments are for people; a service identity cannot post, edit, delete or look people up.";
 const NOT_THE_AUTHOR: &str = "Only the author can change a comment.";
@@ -326,6 +329,9 @@ async fn one_json(
     ))
 }
 
+/// Query string of `GET /api/dashboard/comments`. `pub` only because the
+/// handler that takes it is routed from `routes/mod.rs`; the board id is
+/// optional here so a missing one is our `400`, not the extractor's text.
 #[derive(Deserialize)]
 pub struct BoardQuery {
     board: Option<String>,
@@ -501,6 +507,9 @@ pub async fn remove(
     Ok(ApiJson(json!({ "ok": true })))
 }
 
+/// Query string of `GET /api/dashboard/comments/people`: the dashboard and the
+/// typed prefix. `pub` for the same reason as [`BoardQuery`]; both are optional
+/// so a missing one is our `400`, not the extractor's text.
 #[derive(Deserialize)]
 pub struct PeopleQuery {
     board: Option<String>,
