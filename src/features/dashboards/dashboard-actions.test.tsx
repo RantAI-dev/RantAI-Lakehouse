@@ -133,6 +133,14 @@ describe("DashboardActionsMenu Export dashboard file (BI-19 part D)", () => {
     await screen.findByText("Print…")
     expect(screen.queryByText("Export dashboard file")).toBeNull()
   })
+
+  // BI-19 Q-D1 (owner decision 2026-10-27).
+  it("hides both exports when downloads are switched off for the viewer", async () => {
+    renderMenu({ isDefault: false, onExportFile: () => {}, canDownload: false })
+    await screen.findByText("Print…")
+    expect(screen.queryByText("Export dashboard file")).toBeNull()
+    expect(screen.queryByText("Export YAML")).toBeNull()
+  })
 })
 
 describe("DashboardActionsMenu Subscriptions… (RPT-1)", () => {

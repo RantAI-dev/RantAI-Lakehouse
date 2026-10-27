@@ -67,7 +67,8 @@ const QUERY_FAILED: &str = "Its query did not run here.";
 /// # Errors
 ///
 /// 400 for a missing `board` or the built-in dashboard (duplicate it first: it
-/// has no stored charts); 404 for a dashboard the person cannot see; otherwise
+/// has no stored charts); 404 for a dashboard the person cannot see; 403 when
+/// downloads are off for the person's roles (`BI-19` Q-D1); otherwise
 /// the classified store error.
 pub(crate) async fn export_file(
     state: &AppState,
@@ -90,6 +91,11 @@ pub(crate) async fn export_file(
         .await
         .map_err(|err| classify_ch_error(&err))?
         .ok_or_else(|| ApiError::NotFound(BOARD_NOT_FOUND.to_owned()))?;
+    // BI-19 Q-D1 (owner decision 2026-10-27): the file holds table and column
+    // names, filter and parameter values and KPI targets, so it follows the
+    // per-role download switch (BI-1). After the visibility check above, so a
+    // hidden dashboard stays the same 404 for a role with downloads off.
+    crate::routes::settings::require_download(state, principal).await?;
     let charts: Vec<_> = store::list_stored_charts(ch, &viewer)
         .await
         .map_err(|err| classify_ch_error(&err))?

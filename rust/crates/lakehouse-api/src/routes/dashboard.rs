@@ -4484,7 +4484,11 @@ pub async fn export(
 ) -> ApiResult<Response> {
     // BI-19 part D (plan D14): `format=file` is one dashboard as a JSON file.
     match q.format.as_deref() {
-        None | Some("" | "yaml") => {}
+        // BI-19 Q-D1 (owner decision 2026-10-27): the YAML export is a
+        // download like the file, so it follows the per-role switch (BI-1).
+        None | Some("" | "yaml") => {
+            crate::routes::settings::require_download(&state, &principal).await?;
+        }
         Some("file") => {
             return crate::routes::dashboard_file::export_file(
                 &state,

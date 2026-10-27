@@ -202,10 +202,13 @@ export function DashboardActionsMenu({
             <DropdownMenuItem onClick={onExportPdf}>
               <Printer className="size-4" /> Print…
             </DropdownMenuItem>
-            <DropdownMenuItem render={<a href="/api/dashboard/export" download />}>
-              <Download className="size-4" /> Export YAML
-            </DropdownMenuItem>
-            {!isDefault && onExportFile ? (
+            {/* BI-19 Q-D1 (owner decision 2026-10-27): both exports follow the per-role download switch. */}
+            {canDownload ? (
+              <DropdownMenuItem render={<a href="/api/dashboard/export" download />}>
+                <Download className="size-4" /> Export YAML
+              </DropdownMenuItem>
+            ) : null}
+            {canDownload && !isDefault && onExportFile ? (
               <DropdownMenuItem onClick={onExportFile}>
                 <Download className="size-4" /> Export dashboard file
               </DropdownMenuItem>

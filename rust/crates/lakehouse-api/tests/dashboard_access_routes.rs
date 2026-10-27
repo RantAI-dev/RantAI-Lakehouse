@@ -1720,6 +1720,55 @@ async fn the_dashboard_file_of_a_restricted_dashboard_is_a_404_like_an_unknown_o
     assert_eq!(file["kind"], "rantai-dashboard");
 }
 
+/// `BI-19` Q-D1 (owner decision 2026-10-27): both exports follow the per-role
+/// download switch. A listed person whose role has downloads off is refused
+/// with the existing sentence; an outsider still gets the 404 (the visibility
+/// check runs first), so the switch does not reveal a hidden dashboard.
+#[tokio::test]
+async fn the_dashboard_file_and_the_yaml_follow_the_download_switch() {
+    let (router, pool, _ch) = app().await;
+    let listed = create_principal_with_permissions(&pool, "dashboard:read").await;
+    let outsider = create_principal_with_permissions(&pool, "dashboard:read").await;
+    replace_item(
+        &pool,
+        "folder",
+        "f1",
+        &[rule_for(listed, "view")],
+        true,
+        None,
+    )
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO reporting_settings (singleton, time_zone, week_start, download_denied_roles) \
+         SELECT TRUE, 'UTC', 'monday', array_agg(r.name) FROM role r WHERE r.name LIKE 'Single Perm %'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let cookie = session_cookie_for_user(&pool, listed).await;
+    for uri in [
+        "/api/dashboard/export?format=file&board=b_secret",
+        "/api/dashboard/export",
+    ] {
+        let (status, body) = get(&router, &cookie, uri).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{uri}");
+        assert!(
+            body.to_string()
+                .contains("Downloads are switched off for your role."),
+            "{uri}: {body}"
+        );
+    }
+    let cookie = session_cookie_for_user(&pool, outsider).await;
+    let (status, _) = get(
+        &router,
+        &cookie,
+        "/api/dashboard/export?format=file&board=b_secret",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "hidden stays 404, not 403");
+}
+
 /// `BI-19` D review SF-D6: an import into a folder the person can only view is
 /// a 403.
 #[tokio::test]
