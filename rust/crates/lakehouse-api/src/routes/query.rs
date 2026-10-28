@@ -889,7 +889,8 @@ pub(crate) async fn check_statement_would_run(
 }
 
 // The most rows one run hands back to the browser is the administrator's
-// Query Studio row limit (`TileLimits::studio_rows`, default 2,000; `BI-5`).
+// Query Studio row limit (`TileLimits::studio_rows`, default 64,000;
+// `BI-5`, `QS-2`).
 //
 // The console renders every row it receives, so an unbounded `SELECT *`
 // used to be enough to freeze the tab. The response says when the cap

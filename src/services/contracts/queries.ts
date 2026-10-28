@@ -136,7 +136,7 @@ export type QueryResult = {
   engine: QueryEngine | string
   /** How many rows the query produced, which `rows` may only be part of (`total_rows`). */
   rowCount: number
-  /** True when `rows` was cut to `rowLimit` (2,000, `MAX_RESULT_ROWS`) before being sent. */
+  /** True when `rows` was cut to `rowLimit` (64,000 by default) before being sent. */
   truncated: boolean
   rowLimit: number
   metrics: {

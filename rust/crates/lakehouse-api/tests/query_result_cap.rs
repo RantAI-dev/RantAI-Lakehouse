@@ -30,8 +30,9 @@ use common::{
     TestApp, create_principal_with_permissions, session_cookie_for_user, spin_up_with_env,
 };
 
-/// What the browser is handed: `routes::query::MAX_RESULT_ROWS`.
-const ROWS_KEPT: usize = 2_000;
+/// What the browser is handed: the install's Query Studio row limit
+/// (`QueryLimits::studio_rows`), which migration `0115` set to 64,000.
+const ROWS_KEPT: usize = 64_000;
 
 /// The table the huge result is read from. A table function such as
 /// `numbers(..)` would be refused for a policy-governed caller, which would
@@ -43,9 +44,10 @@ const HUGE_SELECT: &str = "SELECT n FROM serving.query_result_cap";
 
 /// The most rows the engine may send. `break` stops at a block boundary, so
 /// the engine can send up to one block (`max_block_size`, about 65,000 rows
-/// by default) beyond the cap; 100,000 is that bound with room, and still 100 times below the
-/// 10,000,000 rows the statement produces.
-const ENGINE_ROW_BOUND: usize = 100_000;
+/// by default) beyond the cap; 130,000 is that bound with room (64,001 plus
+/// one block of 65,536 is 129,537), and still far below the 10,000,000 rows
+/// the statement produces.
+const ENGINE_ROW_BOUND: usize = 130_000;
 
 /// ONE `ClickHouse` per test binary; see `tests/gold_publication.rs` for why
 /// per-test containers race. The container is never stopped by the test.
@@ -168,7 +170,7 @@ async fn the_engine_stops_producing_rows_at_the_cap() {
 }
 
 #[tokio::test]
-async fn a_run_over_a_huge_table_keeps_2000_rows_and_the_engine_sent_few() {
+async fn a_run_over_a_huge_table_keeps_64000_rows_and_the_engine_sent_few() {
     let (app, _ch) = spin_up_with_clickhouse().await;
 
     let (status, body) = run_as_reader(&app, HUGE_SELECT).await;
@@ -190,13 +192,13 @@ async fn a_result_of_exactly_the_cap_is_not_reported_as_truncated() {
     let (app, _ch) = spin_up_with_clickhouse().await;
 
     let (status, body) =
-        run_as_reader(&app, "SELECT n FROM serving.query_result_cap LIMIT 2000").await;
+        run_as_reader(&app, "SELECT n FROM serving.query_result_cap LIMIT 64000").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["rows"].as_array().expect("rows").len(), ROWS_KEPT);
     assert_eq!(body["truncated"], json!(false), "{body}");
 
     let (status, body) =
-        run_as_reader(&app, "SELECT n FROM serving.query_result_cap LIMIT 2001").await;
+        run_as_reader(&app, "SELECT n FROM serving.query_result_cap LIMIT 64001").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["rows"].as_array().expect("rows").len(), ROWS_KEPT);
     assert_eq!(body["truncated"], json!(true), "{body}");

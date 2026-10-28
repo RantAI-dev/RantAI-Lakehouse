@@ -587,7 +587,7 @@ mod tests {
 
     /// Replaces the pin that tied `SQL_SOURCE_MAX_ROWS` to the settings text
     /// (rule 2: replaced, not deleted): the builder's default text, the
-    /// store's defaults and migration `0101`'s column defaults must be the
+    /// store's defaults and the migrations' column defaults must be the
     /// same numbers.
     #[test]
     fn the_builder_default_text_the_store_default_and_the_migration_agree() {
@@ -606,13 +606,23 @@ mod tests {
             ("timeout_seconds INT NOT NULL DEFAULT", d.timeout_seconds),
             ("chart_rows      INT NOT NULL DEFAULT", d.chart_rows),
             ("map_points      INT NOT NULL DEFAULT", d.map_points),
-            ("studio_rows     INT NOT NULL DEFAULT", d.studio_rows),
         ] {
             assert!(
                 migration.contains(&format!("{column} {value}")),
                 "{column} {value}"
             );
         }
+        // The Query Studio rows moved in migration `0115`, so their column
+        // default is set there and not in `0101`.
+        let migration_0115 = include_str!("../../../migrations/0115_query_studio_rows_default.sql");
+        assert!(
+            migration_0115.contains(&format!(
+                "ALTER COLUMN studio_rows SET DEFAULT {}",
+                d.studio_rows
+            )),
+            "studio_rows {}",
+            d.studio_rows
+        );
     }
 
     #[test]
@@ -657,7 +667,7 @@ mod tests {
                 d.map_points,
                 d.studio_rows
             ),
-            (60, 2000, 5000, 2000)
+            (60, 2000, 5000, 64000)
         );
     }
 }

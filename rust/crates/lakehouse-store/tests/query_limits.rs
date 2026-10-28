@@ -8,7 +8,17 @@ use lakehouse_test_support as _;
 use lakehouse_store::StoreError;
 use lakehouse_store::query_limits::{QueryLimits, get, role_limits, save};
 use sqlx::PgPool;
+use sqlx::migrate::Migrator;
 use uuid::Uuid;
+
+/// The migration set this repository applies, compiled in (`sqlx::migrate!`
+/// embeds the files at compile time, so a migration edit needs a rebuild
+/// before a test result means anything).
+static MIGRATOR: Migrator = sqlx::migrate!("../../migrations");
+
+/// The version of the migration that moves the Query Studio row default
+/// from 2,000 to 64,000 (`QS-2`).
+const STUDIO_ROWS_MIGRATION: i64 = 115;
 
 async fn role_id(pool: &PgPool, name: &str) -> Uuid {
     sqlx::query_scalar("SELECT id FROM role WHERE name = $1")
@@ -16,6 +26,13 @@ async fn role_id(pool: &PgPool, name: &str) -> Uuid {
         .fetch_one(pool)
         .await
         .expect("seeded role")
+}
+
+/// The Query Studio row limit the install row carries.
+async fn studio_rows(pool: &PgPool) -> sqlx::Result<i32> {
+    sqlx::query_scalar("SELECT studio_rows FROM query_limits WHERE singleton")
+        .fetch_one(pool)
+        .await
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -30,10 +47,59 @@ async fn the_migration_seeds_the_feature_defaults_and_the_struct_default_matches
             timeout_seconds: 60,
             chart_rows: 2000,
             map_points: 5000,
-            studio_rows: 2000
+            studio_rows: 64000
         }
     );
     assert_eq!(role_limits(&pool).await.expect("roles"), Vec::new());
+    Ok(())
+}
+
+/// `QS-2` decision 1: the Query Studio row default moves from 2,000 to
+/// 64,000, so the row migration `0101` seeded with the old default reads
+/// 64,000 once the migration that moves it has run.
+#[sqlx::test(migrations = false)]
+async fn the_old_query_studio_default_of_two_thousand_moves_to_sixty_four_thousand(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    // The database as an install had it before the migration: every
+    // migration up to the one before it.
+    MIGRATOR.run_to(STUDIO_ROWS_MIGRATION - 1, &pool).await?;
+    assert_eq!(studio_rows(&pool).await?, 2000, "the old default");
+
+    MIGRATOR.run_to(STUDIO_ROWS_MIGRATION, &pool).await?;
+
+    assert_eq!(studio_rows(&pool).await?, 64000);
+    Ok(())
+}
+
+/// `QS-2` decision 1: the migration moves the old default and nothing else.
+/// A limit an administrator chose stays as it is, and a row written without
+/// a value gets the new default.
+#[sqlx::test(migrations = false)]
+async fn an_administrators_own_query_studio_limit_is_left_alone_by_the_default_migration(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    MIGRATOR.run_to(STUDIO_ROWS_MIGRATION - 1, &pool).await?;
+    sqlx::query("UPDATE query_limits SET studio_rows = 5000 WHERE singleton")
+        .execute(&pool)
+        .await?;
+
+    MIGRATOR.run_to(STUDIO_ROWS_MIGRATION, &pool).await?;
+
+    assert_eq!(
+        studio_rows(&pool).await?,
+        5000,
+        "a limit an administrator chose is not the old default and stays"
+    );
+    // A row written without a value gets the column's default, which is
+    // the number the migration sets.
+    sqlx::query("DELETE FROM query_limits WHERE singleton")
+        .execute(&pool)
+        .await?;
+    sqlx::query("INSERT INTO query_limits (singleton) VALUES (TRUE)")
+        .execute(&pool)
+        .await?;
+    assert_eq!(studio_rows(&pool).await?, 64000);
     Ok(())
 }
 
