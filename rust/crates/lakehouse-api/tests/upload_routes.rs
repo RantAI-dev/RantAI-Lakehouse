@@ -7713,3 +7713,258 @@ async fn a_folder_of_another_tenant_or_of_no_kind_refuses_the_load_before_anythi
     assert_eq!(stack.folder_of(&id).await, None);
 }
 
+// ════════════════════════════════════════════════════════════════════════
+// The child that reads an uploaded file (`SEC-22`)
+// ════════════════════════════════════════════════════════════════════════
+
+/// The sentence of a file that needed more memory or more time than a read
+/// is allowed (`SEC-22` D4): one sentence for the cases that cannot be told
+/// apart — a signal, an allocation failure, a timeout.
+const NEEDS_MORE_MEMORY: &str = "This file needs more memory or time to read than an upload is allowed. Save it as CSV and upload that instead.";
+
+/// The sentence of a request that arrives while every conversion slot is
+/// taken (`SEC-22` D4).
+const TOO_MANY_CONVERSIONS: &str =
+    "Too many files are being read right now. Try again in a few seconds.";
+
+/// A stand-in for the child that reads an uploaded file: it takes its time
+/// and answers nothing, so a test can hold a conversion slot for as long as
+/// it needs one.
+///
+/// `exec sleep` and no shell left behind: the child the API starts is the
+/// sleep itself, so killing it kills the sleep.
+fn slow_child() -> std::path::PathBuf {
+    let dir = tempfile::tempdir().expect("a temporary directory for the stand-in child");
+    let path = dir.path().join("slow-child");
+    std::fs::write(&path, "#!/bin/sh\nexec sleep 30\n").expect("the stand-in child is written");
+    let mut permissions = std::fs::metadata(&path)
+        .expect("the stand-in child exists")
+        .permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path, permissions).expect("the stand-in child is executable");
+    }
+    #[cfg(not(unix))]
+    std::fs::set_permissions(&path, permissions).expect("the stand-in child is executable");
+    // The directory is removed when it goes out of scope; the child has
+    // already been read by then, and the API starts it by path.
+    std::mem::forget(dir);
+    path
+}
+
+#[tokio::test]
+async fn a_hostile_workbook_ends_the_child_and_leaves_the_api_alone() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    // The workbook asks for 48 GB before a single cell is read (`SEC-22` T1).
+    // The child is the one that ends; the API is not.
+    let hostile = fixture("hostile/huge_shared_strings.xlsx");
+    let reply = stack
+        .send(
+            &bayu,
+            "POST",
+            "/api/uploads",
+            file_form("hostile.xlsx", "application/octet-stream", &hostile),
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.text);
+    assert_eq!(reply.json["error"], NEEDS_MORE_MEMORY, "{}", reply.text);
+    assert!(
+        stack.bucket.keys().is_empty(),
+        "nothing of the refused file was stored: {:?}",
+        stack.bucket.keys()
+    );
+
+    // The API is still there: the next request answers normally.
+    let upload = stack.upload(&bayu, "a.csv", b"a,b\n1,2\n").await;
+    assert_eq!(upload["status"], "uploaded");
+}
+
+#[tokio::test]
+async fn a_hostile_parquet_file_is_refused_with_the_readers_own_reason() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    // The footer declares a row group of one tebibyte in 123 bytes; the
+    // reader checks the footer against the file and refuses it (`SEC-22` T1).
+    let hostile = fixture("hostile/huge_footer.parquet");
+    let reply = stack
+        .send(
+            &bayu,
+            "POST",
+            "/api/uploads",
+            file_form("hostile.parquet", "application/octet-stream", &hostile),
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.text);
+    assert_eq!(reply.json["error"], UNREADABLE_PARQUET, "{}", reply.text);
+    assert_eq!(stack.bucket.keys(), [] as [String; 0]);
+}
+
+#[tokio::test]
+async fn a_second_preview_of_a_workbook_reads_the_stored_text_and_runs_no_child() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    let upload = stack
+        .upload(&bayu, "stock.xlsx", &workbook("stock.xlsx"))
+        .await;
+    let uri = format!("/api/uploads/{}/preview", id_of(&upload));
+    // The upload itself read the workbook once, to learn its sheets.
+    assert_eq!(
+        stack.state.conversion_runner.runs(),
+        1,
+        "the upload ran one child"
+    );
+
+    let first = stack.get(&bayu, &uri).await;
+    assert_eq!(first.status, StatusCode::OK, "{}", first.text);
+    assert_eq!(
+        stack.state.conversion_runner.runs(),
+        2,
+        "the preview converted the sheet once"
+    );
+
+    // A header row the user changed: the stored text is read, no child runs.
+    let second = stack.get(&bayu, &format!("{uri}?headerRow=1")).await;
+    assert_eq!(second.status, StatusCode::OK, "{}", second.text);
+    assert_eq!(
+        stack.state.conversion_runner.runs(),
+        2,
+        "the second preview ran no child"
+    );
+    assert_eq!(second.json["using"]["headerRow"], 1);
+}
+
+#[tokio::test]
+async fn a_parquet_preview_reads_the_file_through_the_child() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    let upload = stack
+        .upload(&bayu, "orders.parquet", &parquet_file("orders.parquet"))
+        .await;
+    let uri = format!("/api/uploads/{}/preview", id_of(&upload));
+    let reply = stack.get(&bayu, &uri).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text);
+    assert_eq!(
+        reply.json["columns"],
+        json!(["sku", "name", "qty", "price", "received"])
+    );
+    assert_eq!(reply.json["parquet"]["columns"], orders_columns());
+    assert_eq!(
+        stack.state.conversion_runner.runs(),
+        2,
+        "the upload read the footer and the preview read the rows"
+    );
+}
+
+#[tokio::test]
+async fn a_conversion_that_is_already_running_makes_the_next_one_a_429() {
+    let stack = Stack::with(Options {
+        upload_max_conversions: Some("1"),
+        conversion_child: Some(slow_child()),
+        ..Options::default()
+    })
+    .await;
+    let bayu = stack.bayu().await;
+    // The first request holds the only slot: its child takes its time.
+    let first = stack.spawn_upload(&bayu, "stock.xlsx", &workbook("stock.xlsx"));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let second = stack
+        .send(
+            &bayu,
+            "POST",
+            "/api/uploads",
+            file_form("other.xlsx", "text/csv", &workbook("stock.xlsx")),
+        )
+        .await;
+    assert_eq!(
+        second.status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "{}",
+        second.text
+    );
+    assert_eq!(
+        second.json["error"], TOO_MANY_CONVERSIONS,
+        "{}",
+        second.text
+    );
+    assert_eq!(second.retry_after.as_deref(), Some("5"));
+
+    // The held request is dropped: its child is killed with it.
+    first.abort();
+}
+
+#[tokio::test]
+async fn a_conversion_past_its_cap_is_refused_and_nothing_is_kept() {
+    let stack = Stack::with(Options {
+        conversion_output_cap: Some(64),
+        ..Options::default()
+    })
+    .await;
+    let bayu = stack.bayu().await;
+    let upload = stack
+        .upload(&bayu, "stock.xlsx", &workbook("stock.xlsx"))
+        .await;
+    let id = id_of(&upload);
+    let reply = stack
+        .get(&bayu, &format!("/api/uploads/{id}/preview"))
+        .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.text);
+    assert_eq!(
+        reply.json["error"],
+        "That file holds more text than can be converted (the limit is 512 MB of text).",
+        "{}",
+        reply.text
+    );
+    // The text the child managed to write is not kept (`SEC-22` D6).
+    assert!(
+        !stack
+            .bucket
+            .keys()
+            .iter()
+            .any(|key| key.contains(".converted.")),
+        "{:?}",
+        stack.bucket.keys()
+    );
+}
+
+#[tokio::test]
+async fn deleting_a_workbook_removes_its_converted_objects() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    let upload = stack
+        .upload(&bayu, "stock.xlsx", &workbook("stock.xlsx"))
+        .await;
+    let id = id_of(&upload);
+    let preview = stack
+        .get(&bayu, &format!("/api/uploads/{id}/preview"))
+        .await;
+    assert_eq!(preview.status, StatusCode::OK, "{}", preview.text);
+    let original = format!("uploads/{GROUP}/{id}.xlsx");
+    let keys = stack.bucket.keys();
+    assert!(
+        keys.contains(&format!("{original}.sheets.json")),
+        "{keys:?}"
+    );
+    assert!(
+        keys.contains(&format!("{original}.converted.0.csv")),
+        "{keys:?}"
+    );
+    assert!(
+        keys.contains(&format!("{original}.converted.0.json")),
+        "{keys:?}"
+    );
+
+    let gone = stack
+        .send(
+            &bayu,
+            "DELETE",
+            &format!("/api/uploads/{id}"),
+            Payload::None,
+        )
+        .await;
+    assert_eq!(gone.status, StatusCode::NO_CONTENT, "{}", gone.text);
+    assert!(stack.bucket.keys().is_empty(), "{:?}", stack.bucket.keys());
+}
