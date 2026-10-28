@@ -38,6 +38,7 @@ pub mod crypto_provider;
 pub mod csv_export;
 pub mod csv_safe;
 pub mod error;
+pub mod export;
 pub mod gold_export;
 pub mod gold_export_history;
 pub mod gold_lock;
@@ -47,20 +48,25 @@ pub mod json;
 pub mod lakehouse_catalog;
 pub mod lakekeeper_token;
 pub mod next_run;
+pub mod pdf;
 pub mod pg_probe;
+pub mod pipeline_lag;
 pub mod pipeline_source;
 pub mod policy;
 pub mod policy_engine;
+pub mod query_limits;
+pub mod result_cache;
 pub mod routes;
 pub mod rustfs_client;
 pub mod secret_crypto;
 pub mod secret_manager;
 pub mod sql_guard;
+pub mod sql_lineage;
 pub mod sql_rewrite;
 pub mod state;
 pub mod tenant;
 pub mod tenant_scope;
-pub mod transform_grammar;
+pub mod tile_pool;
 
 // Test-only: the TLS-terminating proxy in front of the shared test
 // Postgres (`SEC-14` part B). Declared in both this crate's module roots
@@ -68,10 +74,15 @@ pub mod transform_grammar;
 #[cfg(test)]
 mod tls_proxy;
 
+pub mod transform_grammar;
+pub mod upload_formats;
 pub mod upload_limits;
 pub mod upload_parquet;
+pub mod upload_parquet_range;
 pub mod upload_parse;
 pub mod upload_store;
+pub mod upload_sweep;
+pub mod upload_types;
 pub mod upload_workbook;
 pub mod upstream_error;
 pub mod webhook_guard;

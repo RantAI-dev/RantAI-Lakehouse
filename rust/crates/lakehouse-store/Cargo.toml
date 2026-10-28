@@ -12,12 +12,18 @@ serde_json = { workspace = true }
 sqlx = { workspace = true }
 uuid = { workspace = true }
 time = { workspace = true }
+jiff = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
 uuid = { workspace = true }
+# `SEC-41` decision 6: `tests/migrations_upgrade.rs` recomputes the SHA-384
+# checksum `sqlx` 0.8 wrote into `_sqlx_migrations`, so the fixture is a real
+# 0.8-migrated database rather than an approximation. Already in the
+# workspace (`sha2` 0.11), so this adds no package.
+sha2 = { workspace = true }
 lakehouse-test-support = { path = "../lakehouse-test-support" }
 
 [lints]

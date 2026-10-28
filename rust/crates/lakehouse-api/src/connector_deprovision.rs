@@ -348,7 +348,10 @@ async fn drop_publication(
     let drop_sql = format!("DROP PUBLICATION IF EXISTS \"{publication_name}\"");
     with_timeout(
         publication_name,
-        sqlx::query(&drop_sql).execute(&mut *conn),
+        // safe: `publication_name` passed `ConnectorSlug::new` above, whose
+        // alphabet (`^[a-z0-9][a-z0-9_]{0,62}$`) cannot close the quoted
+        // identifier.
+        sqlx::query(sqlx::AssertSqlSafe(drop_sql.as_str())).execute(&mut *conn),
         |source| DeprovisionError::DropPublication {
             publication: publication_name.to_owned(),
             source,

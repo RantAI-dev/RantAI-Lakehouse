@@ -2,7 +2,7 @@ import assert from "node:assert/strict"
 import test from "node:test"
 
 import {
-  columnSwitchParams, limitParam, normalizeDef, paramsDiffer, paramsQuery, readParamsParam, refLinesFromDef, refLinesPayload,
+  columnSwitchParams, limitParam, normalizeDef, paramsDiffer, paramsQuery, readParamsParam, refLinesFromDef, refLinesPayload, isComputedLine,
   savedParamsBody, slotParam, slotText, withParamsParam, withValue, type ParamControl, type ParamDef,
 } from "./params"
 
@@ -71,4 +71,41 @@ test("reference lines round trip, and a row with neither a number nor a paramete
   assert.deepEqual(refLinesPayload([{ value: "", param: "", label: "x" }, { value: "abc", param: "", label: "" }]), [])
   const six = Array.from({ length: 6 }, (_, i) => ({ value: String(i), param: "", label: "" }))
   assert.equal(refLinesPayload(six).length, 5)
+})
+
+test("computed lines and bands round trip, and a computed line carries no value", () => {
+  const lines = [
+    { kind: "average", color: "#112233" },
+    { kind: "trend", measure: "visitors", label: "Trend" },
+    { kind: "band", value: 1, to: { param: "hi" }, label: "Normal" },
+    { value: 5 },
+  ]
+  assert.deepEqual(refLinesPayload(refLinesFromDef(lines)), lines)
+  // A band with one edge missing, and an old line without a kind, behave.
+  assert.deepEqual(refLinesPayload([{ value: "1", param: "", label: "", kind: "band", to: "" }]), [])
+  assert.deepEqual(refLinesPayload([{ value: "2", param: "", label: "" }]), [{ value: 2 }])
+  assert.equal(isComputedLine("median"), true)
+  assert.equal(isComputedLine("band"), false)
+})
+
+// BI-17 part B (plan D1): the forecast line and its horizon.
+test("a forecast line round-trips with its horizon and measure", () => {
+  const lines = [{ kind: "forecast", horizon: 6, label: "Outlook", measure: "visitors" }]
+  assert.deepEqual(refLinesPayload(refLinesFromDef(lines)), lines)
+  assert.equal(isComputedLine("forecast"), true)
+})
+
+test("a forecast with no whole horizon from 1 to 60 is not sent, and only the first forecast is kept", () => {
+  const draft = (horizon: string) => ({ value: "", param: "", label: "", kind: "forecast" as const, horizon })
+  assert.deepEqual(refLinesPayload([draft("")]), [])
+  assert.deepEqual(refLinesPayload([draft("0")]), [])
+  assert.deepEqual(refLinesPayload([draft("61")]), [])
+  assert.deepEqual(refLinesPayload([draft("2.5")]), [])
+  assert.deepEqual(refLinesPayload([draft("60")]), [{ kind: "forecast", horizon: 60 }])
+  assert.deepEqual(refLinesPayload([draft("3"), draft("9")]), [{ kind: "forecast", horizon: 3 }])
+})
+
+test("a chart saved before forecasts is sent back byte for byte", () => {
+  const lines = [{ value: 5, label: "Goal" }, { kind: "average" }, { kind: "band", value: 1, to: 2 }]
+  assert.deepEqual(refLinesPayload(refLinesFromDef(lines)), lines)
 })

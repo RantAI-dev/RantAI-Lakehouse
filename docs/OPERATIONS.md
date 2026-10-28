@@ -15,13 +15,13 @@ they have since been converged onto this single file, and
 `Dockerfile.api` is gone.
 
 The old committed `rust/Dockerfile` broke a clean-clone build two ways:
-`Cargo.lock` requires a toolchain new enough for `time@0.3.55` (rustc
->= 1.88 — see the `rust-toolchain.toml` `channel = "1.96.1"` pin, which
-is what the workspace actually builds with), and `sqlx::migrate!
+`Cargo.lock` requires a toolchain matching the `rust-version` floor (see
+the `rust-toolchain.toml` `channel` pin, which is what the workspace
+actually builds with), and `sqlx::migrate!
 ("../../migrations")` in `lakehouse-store/src/lib.rs` embeds the
 migrations directory at *compile* time, so it must exist in the build
 context or `cargo build` fails outright. The current `rust/Dockerfile`
-pins `rust:1.96.1-slim` to match `rust-toolchain.toml`, copies
+pins `rust:1.99.1-slim` to match `rust-toolchain.toml`, copies
 `migrations/` into the build context before the build step, installs
 `sqlx-cli`, and uses `entrypoint.api.sh` to apply migrations at boot.
 
@@ -61,7 +61,8 @@ report healthy (`depends_on: condition: service_healthy`) before starting,
 so first-boot migrations and the bootstrap-admin seed (both of which need
 Postgres) get a real chance to run instead of racing container startup.
 This is a start-order convenience, not a hard runtime dependency — see
-"Postgres-down is quiet," below.
+"Postgres: unreachable is loud, a mismatched schema refuses to start,"
+below.
 
 `rustfs`, `lakekeeper`, and their bootstrap jobs are **still not called
 from any `lakehouse-api` route as of P6** — see the module map in
@@ -869,7 +870,7 @@ What the operator needs to know:
 - **Framing.** Each dashboard lists the sites allowed to show its embed pages
   (Share dialog; at most 20; `https://host[:port]`, or `http://localhost[:port]`
   for development; no wildcards). The console's `proxy.ts` asks the API
-  (`POST /api/embed/frame`, which needs no sign-in and answers only the list)
+  (`POST /api/embed/frame`, which needs no sign-in and answers only the lists)
   and sends `Content-Security-Policy: frame-ancestors <sites>`, or
   `frame-ancestors 'none'` when the list is empty, the token is not good, or
   the API cannot be reached within 3 seconds. The console reads the API address
@@ -877,8 +878,54 @@ What the operator needs to know:
   `http://localhost:8080`; a deployment must pass `-e RUST_API_URL=...`, as the
   staging deploy does). If it points where nothing listens, every embed page is
   sent as `frame-ancestors 'none'` and no embed renders. The rule is enforced by the
-  viewer's browser; it does not replace the token. No other console page sends
-  a framing header.
+  viewer's browser; it does not replace the token. Every other console page
+  sends `frame-ancestors 'none'` (`SEC-47`, the next section).
+
+### The console's Content-Security-Policy (`SEC-47`)
+
+Every console page is served with a `Content-Security-Policy`, so the browser
+— not only the page's own code — refuses an inline script, a script from
+another origin, an `object`, a moved `base`, and an image or frame from
+anywhere but the sites an administrator allows. A redirect from an allowed
+site to another one is refused by the browser as well. The policy is enforced,
+not report-only.
+
+- **What it says.** `default-src 'self'`; scripts run only with the request's
+  own nonce and `'strict-dynamic'`; `object-src 'none'`; `base-uri 'self'`;
+  `form-action 'self'`; `connect-src 'self'`; `font-src 'self' data:`. A
+  console page sends `frame-ancestors 'none'`; an embed page sends its
+  dashboard's list (the `SEC-12` bullet above). `style-src 'unsafe-inline'` is
+  a stated exception: React, Radix and ECharts write inline `style` attributes
+  and style elements, which a nonce cannot cover. It allows styles, never
+  script. `next dev` also adds `'unsafe-eval'` and the HMR websocket; a
+  production build has neither.
+- **The sites images and web pages may come from** are the content sites in
+  Admin > Settings (`BI-16` part B). A console page asks `GET
+  /api/settings/reporting` with the visitor's own cookie and reuses the answer
+  for 60 seconds, per console process; an embed page asks `POST
+  /api/embed/frame`, which answers the sites of *that dashboard's* image and
+  web cards only, never the whole deployment list. Both fail closed: an API
+  that cannot be reached within 3 seconds, a `401`, a `500` or an answer of the
+  wrong shape leaves `img-src 'self' data: blob:` and `frame-src 'none'`, and
+  the page still loads (its own scripts, styles and fonts are local). A site
+  added in Admin > Settings takes effect within a minute. Both calls read
+  `RUST_API_URL` **at run time**, as the framing call does; pointed at nothing,
+  console pages have no external image or frame but still work.
+- **Every page renders per request.** A nonce is per request, so no console
+  page is prerendered or cached by a CDN: `src/app/layout.tsx` sets
+  `dynamic = "force-dynamic"`. Cache static assets if you need to; do not cache
+  the HTML.
+- **A reverse proxy in front of the console must not drop the header.** The
+  console sets it itself; a proxy that strips or rewrites unknown
+  `Content-Security-Policy` headers leaves the console with no script at all.
+  A deployment that sets its own policy in front of the console's must keep
+  that header's nonce (or replace the whole policy knowingly).
+- **Known limits.** There is no `report-uri`: a refused request is visible only
+  in the browser's console. A public link (`/public/dashboard/<token>`) is
+  opened without a session, so it is served without the content sites: its
+  image and web cards are refused by the browser (an image card then says it
+  could not be loaded, a web card stays blank). Only the console and the embed
+  pages load them.
 
 ### Connector credentials from a secret manager (`SRC-12`, ADR 0002 addendum 6)
 
@@ -939,43 +986,37 @@ turn each one on.
 
 ## Healthcheck: what `GET /health` actually checks
 
-`GET /health` is a **plain liveness check** — it returns `200 ok`
-unconditionally, with no dependency on Postgres, ClickHouse, Dagster, or
-the LLM (`rust/crates/lakehouse-api/src/routes/mod.rs`, `async fn
-health()`). It answers "is the process up and serving," not "are its
-dependencies reachable." That's sufficient for compose's own
-`depends_on`/orchestration needs (which target `postgres` and
-`clickhouse`'s own healthchecks directly, not this endpoint), and it's
-what the existing `#[tokio::test] health_returns_200_ok` locks in.
+`GET /health` answers `200` with a JSON body — `{"status": "ok",
+"database": "ok" | "unavailable"}` — and it is still a **liveness plus
+application-database check**, not a full readiness probe
+(`rust/crates/lakehouse-api/src/routes/mod.rs`, `async fn health`). It
+does not dial ClickHouse, Dagster, Lakekeeper or the LLM: the status code
+stays `200` whenever the process can answer at all, because a deployment
+with no usable Postgres still serves every Phase 1 route (catalog,
+overview, query, storage), and the ops gates (`ops/g*/`) and
+`ops/ai_eval` poll this endpoint for a `200` to decide the API is up.
 
-**We did not add a `GET /health/ready` in this pass.** It would be
-genuinely useful (a real k8s/compose readiness probe should reflect
-dependency health, not just liveness), but every route file that would
-need touching to add one — `main.rs`, `routes/mod.rs` is fine, but wiring
-in a new handler that calls out to ClickHouse/Postgres crosses into
-territory this phase was told not to touch casually — plus the DoS
-consideration (a readiness probe must do a *bounded*, cheap check —
-e.g. `SELECT 1` / `ChClient::query("SELECT 1")` with a short timeout, not
-a full dependency traversal, and definitely not hitting Dagster or the LLM
-on every probe) needs its own review, not a drive-by addition. Proposed
-shape, for whoever picks this up:
+`database` is what `OPS-4` added:
 
-```
-GET /health/ready
-  -> 200 {"postgres": "ok"|"unavailable", "clickhouse": "ok"|"unavailable"}
-     if Postgres is configured (state.pg.is_some()), a bounded SELECT 1
-     against it (short timeout, e.g. 1s) — degrade to "unavailable" on
-     error rather than 500
-     same for ClickHouse: a cheap `SELECT 1` / `/ping`, bounded timeout
-     never hit Dagster or the LLM here — they're already excluded from
-     "core" health by design (see Config's doc comments) and calling out
-     to them on every probe is exactly the unbounded-upstream-call
-     DoS shape to avoid
-  -> always 200 (a probe endpoint shouldn't itself flap the process's
-     perceived liveness); readiness is communicated in the body, not the
-     status code, unless the orchestrator specifically wants a non-200 to
-     pull the pod from a load balancer — pick one and document it
-```
+- `ok` — the start-up step connected and applied every migration, so the
+  schema is at this build's version.
+- `unavailable` — no pool at all (`DATABASE_URL` did not parse), the
+  database could not be reached, or it refused the migrations. Phase 2
+  routes (identity, auth, governance writes, pipelines, connectors,
+  alerts, ...) are degraded; Phase 1 answers.
+
+The value is the last answer the start-up step or its 60 s retry loop
+gave, **not a live probe**. A database lost after boot keeps answering
+`ok` until the process restarts: a per-request probe would have to be a
+bounded `SELECT 1` on its own short timeout, and `/health` is polled by
+the gates, so a probe that waits out a dead database's 30 s acquire
+timeout would stall them. An operator diagnosing "the database died" has
+to read the log (below), not only this endpoint.
+
+**There is no `GET /health/ready`.** This section used to propose adding
+one; `OPS-4` instead extended the one health route with the
+application-database state, which is the dependency that actually
+changes what the console can do.
 
 ## Bootstrap admin: there is no default credential
 
@@ -994,26 +1035,50 @@ force a password change before continuing (see
 `routes::auth::change_password`, which enforces this server-side, not
 just as a UI hint).
 
-## Postgres-down is quiet — this is the biggest operational trap here
+## Postgres: unreachable is loud, a mismatched schema refuses to start
 
-**The service does not refuse to boot when Postgres is unreachable.**
-`lakehouse_store::connect_lazy` never does network I/O at startup; a
-misconfigured or dead `DATABASE_URL` is discovered lazily, at first use.
-Dependent (Phase 2: identity, auth, governance-writes, pipelines,
-connectors, alerts, ...) routes degrade to `503` one request at a time
-instead of the process failing to start or a healthcheck failing loudly.
+`lakehouse_store::connect_lazy` never does network I/O at startup, so a
+dead `DATABASE_URL` is still only discovered when something first uses
+the pool. `OPS-4` keeps that degrade — the Phase 1 routes (catalog,
+overview, query, storage) do not touch Postgres, and an unreachable
+database must not take the whole console down — but makes it loud, and
+draws one hard line:
 
-**In practice this means:** a broken `DATABASE_URL` looks, from the
-outside, like "the process is up and `/health` is green" while every
-login attempt and every Phase 2 route silently 503s. Watch the `503` rate
-and the structured logs (`tracing::error!` on migration/bootstrap
-failures), not just process uptime or the liveness check, when diagnosing
-"nothing works" reports. The same applies to ClickHouse-backed routes,
-which 503 the same way if ClickHouse is down — the difference is only
-that in the local compose stack, ClickHouse *is* wired into
-`depends_on: condition: service_healthy`, so this specific failure mode is
-less likely to bite you locally than in a deployment that skips that
-check.
+- **The database is reachable but the migrations fail** (a `_sqlx_migrations`
+  row this build does not have or has changed, a failed statement):
+  `lakehouse-api` **refuses to start** and exits non-zero, logging the
+  migration error and the line `the application database is not at this
+  build's schema version`. Compose restarts it and it says the same thing
+  every time. This is deliberate: before `OPS-4` the API started anyway,
+  sqlx stopped at the first mismatch, and every newer route answered
+  `500` while the process looked healthy (PRs #106 and #199). The fix for
+  a real mismatch is to run the matching migrations, not to restart until
+  it works.
+- **The database cannot be reached at all** (connection refused, a
+  timeout, a closed pool): the API serves the Phase 1 routes and logs an
+  `error!` at start and again every 60 s until a connection succeeds, at
+  which point the migrations apply and the retries stop. `GET /health`
+  reports `"database": "unavailable"` meanwhile (see "Healthcheck"
+  above). If the database becomes reachable later with a schema that
+  still does not match this build, the retry loop logs the same
+  schema-mismatch line once and stops — a mismatch does not heal by
+  waiting, and a background task cannot un-start a process that is
+  already serving.
+- **No pool at all** (`DATABASE_URL` is not a parsable Postgres URL):
+  every Phase 2 route answers `503`, `/health` says the database is
+  unavailable, and the log carries the reason.
+
+**In practice this means:** watch `/health`'s `database` field and the
+structured logs (`tracing::error!` on migration/retry/bootstrap
+failures), not just process uptime. With a pool but an unreachable
+database, a Phase 2 query fails as `500` with the fixed text
+`database error` (the driver's own text stays in the log, never in the
+response); with no pool at all it is `503`. The same applies to
+ClickHouse-backed routes, which 503 the same way if ClickHouse is down —
+the difference is only that in the local compose stack, ClickHouse *is*
+wired into `depends_on: condition: service_healthy`, so this specific
+failure mode is less likely to bite you locally than in a deployment that
+skips that check.
 
 ## Features unavailable in the local stack
 
@@ -1023,7 +1088,7 @@ check.
 | AI chat (Copilot and Query Studio's Natural language box) | LLM API key | `503` from `/api/ai/*` | Set `LLM_URL`/`LLM_MODEL`/`LLM_KEY` (or `MINIMAX_API_KEY`) to a real OpenAI-compatible provider |
 | Alert digests / threshold emails | SMTP | Alerts still evaluate; email delivery silently no-ops | Set `SMTP_HOST` (and friends) to a real SMTP relay |
 | Signed dashboard embeds | `EMBED_SECRET` | `POST /api/embed/data` answers `503` "embedding is not configured"; the Share dialog says so | Set `EMBED_SECRET` (see "Signed dashboard embeds (`SEC-12`)") |
-| SSO / OIDC login | An OIDC provider | Local password auth only | Set `OIDC_ISSUER` + `OIDC_CLIENT_ID` (and, for the browser flow, the four URLs and `OIDC_JWKS_URL`); see "Single sign-on (OIDC)" below and `rust/crates/lakehouse-auth/README.md` |
+| SSO / OIDC login | An OIDC provider | Local password auth only | Set `OIDC_ISSUER` + `OIDC_CLIENT_ID` (and, for the browser flow, the four URLs); `OIDC_JWKS_URL` is optional — see "Single sign-on (OIDC)" below and `rust/crates/lakehouse-auth/README.md` |
 
 ## Login throttling and session cleanup
 
@@ -1165,20 +1230,26 @@ client also sets `OIDC_CLIENT_SECRET`.
 | `OIDC_TOKEN_URL` | for the browser flow | unset | The provider's token endpoint. |
 | `OIDC_REDIRECT_URI` | for the browser flow | unset | This deployment's callback: `<api-origin>/api/auth/oidc/callback`. Register the same value on the provider. |
 | `OIDC_CLIENT_SECRET` | for a confidential client | unset | Sent only in the code exchange; never logged, redacted in `Config`'s `Debug`. |
-| `OIDC_JWKS_URL` | for providers not serving `{issuer}/.well-known/jwks.json` | `{OIDC_ISSUER}/.well-known/jwks.json` | See the limitation below: Entra ID and Google both need this set. |
+| `OIDC_JWKS_URL` | no | discovery | The key set's address. Unset means it is read from the provider's discovery document (`{OIDC_ISSUER}/.well-known/openid-configuration`, its `jwks_uri`), on the first token check. Set it only when that document is unavailable or names a key set this deployment cannot reach; an explicit value wins and no discovery request is made. |
 | `OIDC_PROVIDER_NAME` | no | `default` | Label behind `oidc:<name>` in `auth_identity.provider`. |
 | `OIDC_GROUPS_CLAIM` | no | `groups` | Which token claim carries the caller's groups. |
 | `OIDC_ROLE_MAP` | no | empty | `group=Role Name,...`; a group not named here is ignored. |
 | `OIDC_JIT_PROVISIONING` | no | `false` | Exactly the string `true` (not `TRUE`/`1`/`yes`) creates an `app_user` on first sign-in. |
 | `OIDC_CLOCK_SKEW_SECONDS` | no | `60` | Leeway on `exp`/`nbf`; an unparseable value falls back to `60` instead of failing boot. |
 
-**A limitation worth stating plainly: the API does not read `jwks_uri` from
-the provider's discovery document.** It builds the JWKS URL as
-`{OIDC_ISSUER}/.well-known/jwks.json` unless `OIDC_JWKS_URL` overrides it
-(`state.rs`). Neither vendor below serves keys at that path, so both require
-`OIDC_JWKS_URL`; the setting's whole purpose is this case. A future
-change could fetch the discovery document and read `jwks_uri` from it —
-reported, not built (SEC-3).
+**Where the signing keys come from.** With `OIDC_JWKS_URL` unset, the API
+reads the provider's discovery document
+(`{OIDC_ISSUER}/.well-known/openid-configuration`) and uses its `jwks_uri`
+(`SEC-38`). The document is read on the first token check — not at start-up,
+so an unreachable provider does not stop the API — and cached with the key
+set for five minutes, or re-read the moment a token names a key id the cache
+does not know. It is trusted only when its own `issuer` equals
+`OIDC_ISSUER` exactly and `jwks_uri` is an absolute `https` URL (`http` only
+under an `http` issuer, which is how the local test providers are reached);
+otherwise every token is refused with the same generic 401 and a `warn` line
+names the failed check. Set `OIDC_JWKS_URL` to skip discovery entirely, for
+a provider that publishes no discovery document or one this deployment
+cannot reach.
 
 ### Keycloak
 
@@ -1237,25 +1308,35 @@ token. Entra's issuer and endpoints are per tenant:
 | `OIDC_CLIENT_SECRET` | the client secret value |
 | `OIDC_AUTHORIZE_URL` | `https://login.microsoftonline.com/<tenant-id>/oauth2/v2.0/authorize` |
 | `OIDC_TOKEN_URL` | `https://login.microsoftonline.com/<tenant-id>/oauth2/v2.0/token` |
-| `OIDC_JWKS_URL` | `https://login.microsoftonline.com/<tenant-id>/discovery/v2.0/keys` |
+| `OIDC_JWKS_URL` | optional — discovery names `https://login.microsoftonline.com/<tenant-id>/discovery/v2.0/keys`; set it only to skip discovery |
 | `OIDC_REDIRECT_URI` | `<api-origin>/api/auth/oidc/callback` |
 | `OIDC_GROUPS_CLAIM` | `groups` |
 
 **Limits.** Entra's `groups` claim carries group **object ids** (GUIDs), not
 names, so `OIDC_ROLE_MAP` keys are those GUIDs. When a user is in more groups
 than the claim can hold, Entra replaces the claim with an overage marker
-(`_claim_names`/`_claim_sources`, or `hasgroups`) and the group list must be
-fetched from Microsoft Graph instead — the console does not follow that, so a
-role mapping for such a user silently does not apply. (Microsoft docs:
+(`_claim_names`/`_claim_sources`, or `hasgroups` in the implicit flow) and
+the group list must be fetched from Microsoft Graph instead — the console
+does not follow that. `SEC-39` makes the case visible rather than silent:
+the code flow this deployment uses carries `_claim_names`, so the sign-in
+still succeeds, a `warn` line records the user and provider (never the
+token or the claim source), and the console shows: "Your account is in more
+groups than the sign-in token can list, so no group-based role was applied.
+Ask an administrator to assign your role directly or to limit the groups
+sent in the token." Following the Graph link to apply the mapped role
+remains the full fix and is not built. (Microsoft docs:
 <https://learn.microsoft.com/en-us/entra/identity-platform/access-token-claims-reference>,
-the `groups` and overage claims.) Backlog `SEC-39` makes this case visible.
+the `groups` and overage claims.)
 
 ### Google
 
 Create an OAuth client (Google Cloud console → APIs & Services →
 Credentials → OAuth client ID, type **Web application**) and add the
-authorized redirect URI equal to `OIDC_REDIRECT_URI`. Google publishes its
-keys at a fixed URL, so `OIDC_JWKS_URL` must be set:
+authorized redirect URI equal to `OIDC_REDIRECT_URI`. Google publishes a
+discovery document at
+`https://accounts.google.com/.well-known/openid-configuration`, so
+`OIDC_JWKS_URL` can stay unset; the value it names is shown below for an
+operator who prefers to set it explicitly:
 
 | Setting | Value |
 | --- | --- |
@@ -1264,7 +1345,7 @@ keys at a fixed URL, so `OIDC_JWKS_URL` must be set:
 | `OIDC_CLIENT_SECRET` | the client secret |
 | `OIDC_AUTHORIZE_URL` | `https://accounts.google.com/o/oauth2/v2/auth` |
 | `OIDC_TOKEN_URL` | `https://oauth2.googleapis.com/token` |
-| `OIDC_JWKS_URL` | `https://www.googleapis.com/oauth2/v3/certs` |
+| `OIDC_JWKS_URL` | optional — `https://www.googleapis.com/oauth2/v3/certs` |
 | `OIDC_REDIRECT_URI` | `<api-origin>/api/auth/oidc/callback` |
 | `OIDC_GROUPS_CLAIM` | not usable — see below |
 

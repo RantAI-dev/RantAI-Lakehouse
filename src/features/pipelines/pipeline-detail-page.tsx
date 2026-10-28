@@ -43,6 +43,7 @@ import { RunHistoryStrip, runFill, statusLabel } from "./run-history-strip"
 import { authorChoices, readsAs } from "./pipeline-reads-as"
 import { RunInspector } from "./run-inspector"
 import { ScheduleHistory } from "./schedule-history"
+import { PipelineFreshnessPanel } from "./pipeline-freshness-panel"
 
 /** Poll cadence: fast while a run is live or one was just launched, slow otherwise. */
 const LIVE_POLL_MS = 4000
@@ -201,6 +202,15 @@ export function PipelineDetailPage() {
   const [now, setNow] = React.useState(() => Date.now())
   const fastUntil = React.useRef(0)
   const reloadRuns = runsState.reload
+  // BLD-8: this effect re-arms the poll timer, so its dependencies decide
+  // whether a live run's list ever refreshes again. `runsStatus` (not
+  // `runsState`) is deliberate: `useService` returns a fresh object on
+  // every render, and while a run is live the `now` interval below renders
+  // the page once a second -- with the whole object here, each tick cleared
+  // and re-armed the timeout, it never fired, and a run that had ended
+  // stayed "Running" until a manual reload. `runsStatus` changes only when
+  // a reload actually starts or finishes, so the timer survives a tick.
+  const runsStatus = runsState.status
   React.useEffect(() => {
     const fast = anyLive || Date.now() < fastUntil.current
     const t = setTimeout(
@@ -211,7 +221,7 @@ export function PipelineDetailPage() {
       fast ? LIVE_POLL_MS : IDLE_POLL_MS
     )
     return () => clearTimeout(t)
-  }, [anyLive, reloadRuns, runsState])
+  }, [anyLive, reloadRuns, runsStatus])
   // A live run's clock ticks every second; the rest of the page does not need it.
   React.useEffect(() => {
     if (!anyLive) return
@@ -468,6 +478,8 @@ export function PipelineDetailPage() {
           now={now}
         />
       ) : null}
+
+      <PipelineFreshnessPanel pipeline={p} onUpdated={state.reload} />
 
       <Tabs value={tab} onValueChange={(v) => setParam("tab", String(v))}>
         <TabsList variant="line" className="gap-4 border-b border-border pb-1">

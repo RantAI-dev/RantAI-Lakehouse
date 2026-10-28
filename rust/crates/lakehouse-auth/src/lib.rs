@@ -55,7 +55,7 @@ mod token;
 pub use authenticator::Authenticator;
 pub use credential::Credential;
 pub use error::AuthError;
-pub use oidc::{OidcAuthenticator, OidcConfig};
+pub use oidc::{OidcAuthenticator, OidcConfig, OidcLogin, SignInNotice};
 pub use password::LocalPasswordAuthenticator;
 pub use permissions::PermissionSet;
 pub use principal::{Principal, PrincipalId};
@@ -63,13 +63,15 @@ pub use repository::PgPool;
 pub use secret::Secret;
 pub use service_token::ServiceTokenAuthenticator;
 pub use session::SessionAuthenticator;
-// `token` itself stays private (`hash_token` is an internal storage detail
-// of `session`/`service_token`, not something a caller outside this crate
-// should ever need) — but `generate_opaque_token` is this crate's ONE
-// CSPRNG primitive, and `lakehouse-api`'s OIDC login route needs it for
-// the OIDC `state`/`nonce`/PKCE `code_verifier` triple, specifically so
-// that route never reaches for an ad-hoc `rand` call of its own (grep for
-// the existing helper before writing one — AGENTS.md rule 4). Re-exporting
-// just this one function, rather than making `token` `pub mod`, keeps
-// `hash_token` out of the public surface.
-pub use token::generate_opaque_token;
+// `token` itself stays private, and two of its functions are re-exported.
+// `generate_opaque_token` is this crate's ONE CSPRNG primitive, and
+// `lakehouse-api`'s OIDC login route needs it for the OIDC
+// `state`/`nonce`/PKCE `code_verifier` triple, specifically so that route
+// never reaches for an ad-hoc `rand` call of its own (grep for the existing
+// helper before writing one — AGENTS.md rule 4).
+//
+// `hash_token` was an internal storage detail of `session`/`service_token`
+// until `BI-19` part A: a public link's password ticket is the same kind of
+// value as a session token (256 random bits, kept only as its SHA-256), and
+// plan decision D4 says to use this helper rather than write another.
+pub use token::{generate_opaque_token, hash_token};

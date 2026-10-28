@@ -153,6 +153,17 @@ fn problem_json(problem: &FormulaError) -> Value {
     })
 }
 
+/// Who is asking, for the personal space: the signed-in caller, or nobody in
+/// particular when no principal is attached.
+pub(crate) fn viewer_or_anonymous(
+    principal: Option<&Extension<Principal>>,
+) -> lakehouse_bi::access::Viewer {
+    // Fail closed: with nobody attached the caller sees no personal space.
+    principal.map_or_else(lakehouse_bi::access::Viewer::anonymous, |Extension(p)| {
+        crate::routes::dashboard_organise::viewer_of(p)
+    })
+}
+
 pub(crate) fn author_name(principal: Option<&Extension<Principal>>) -> String {
     principal.map_or_else(String::new, |Extension(p)| p.display_name.clone())
 }
@@ -340,16 +351,27 @@ async fn dependents(
     field: &FieldDef,
     source: &Resolved,
     siblings: &[FieldDef],
-    time: &lakehouse_bi::grain::TimeContext,
+    (time, viewer): (
+        &lakehouse_bi::grain::TimeContext,
+        &lakehouse_bi::access::Viewer,
+    ),
 ) -> Result<Vec<String>, ApiError> {
-    let charts = store::list_stored_charts(ch)
+    // BI-18 part C, part 2: a chart on somebody's personal board still counts
+    // (the change would break it), but is not named.
+    let seen = crate::routes::dashboard_organise::Seen::read(ch, viewer)
         .await
         .map_err(|failure| classify_ch(&failure))?;
-    let boards = store::list_boards(ch)
-        .await
-        .map_err(|failure| classify_ch(&failure))?;
-    let using = fields::charts_using(&charts, field.source_kind, &field.source_id, &field.name);
-    let mut out = fields::name_charts(&charts, &boards, &using);
+    let using = fields::charts_using(
+        &seen.charts,
+        field.source_kind,
+        &field.source_id,
+        &field.name,
+    );
+    let mut out = fields::name_charts(&seen.charts, &seen.boards, &using);
+    let hidden = seen.hidden_charts();
+    if !fields::charts_using(&hidden, field.source_kind, &field.source_id, &field.name).is_empty() {
+        out.push(crate::routes::dashboard_organise::HIDDEN_USE.to_owned());
+    }
     out.extend(
         fields::fields_using(siblings, &source.cols, time, &field.name)
             .into_iter()
@@ -374,6 +396,7 @@ pub async fn update(
 ) -> ApiResult<ApiJson<Value>> {
     let parsed = parse_body(&body)?;
     let ch = &state.clickhouse;
+    let viewer = viewer_or_anonymous(principal.as_ref());
     let id = parsed
         .id
         .as_deref()
@@ -427,7 +450,7 @@ pub async fn update(
     )
     .map_err(|problem| unprocessable(&problem))?;
     if level.as_str() != current.level {
-        let users = dependents(ch, &current, &source, &siblings, &time).await?;
+        let users = dependents(ch, &current, &source, &siblings, (&time, &viewer)).await?;
         if !users.is_empty() {
             let into = match level {
                 Level::Aggregate => "an aggregate",
@@ -463,9 +486,11 @@ pub async fn update(
 /// or another field uses it.
 pub async fn delete(
     State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
     Query(q): Query<IdQuery>,
 ) -> ApiResult<ApiJson<Value>> {
     let ch = &state.clickhouse;
+    let viewer = viewer_or_anonymous(principal.as_ref());
     let id =
         q.id.as_deref()
             .map(str::trim)
@@ -491,7 +516,7 @@ pub async fn delete(
     let siblings = fields::list_fields_for(ch, source.kind, &source.id)
         .await
         .map_err(|failure| classify_ch(&failure))?;
-    let users = dependents(ch, &current, &source, &siblings, &time).await?;
+    let users = dependents(ch, &current, &source, &siblings, (&time, &viewer)).await?;
     if !users.is_empty() {
         return Err(ApiError::Conflict(format!(
             "the field is still used by {}.",
@@ -548,6 +573,18 @@ mod tests {
         }
         fn has_any_obligation(&self, _roles: &[String]) -> bool {
             true
+        }
+    }
+
+    /// A role with no authored obligation anywhere.
+    struct NoObligations;
+
+    impl ObligationsSource for NoObligations {
+        fn obligations_for(&self, _table: &str, _roles: &[String]) -> Option<TableObligations> {
+            None
+        }
+        fn has_any_obligation(&self, _roles: &[String]) -> bool {
+            false
         }
     }
 
@@ -830,7 +867,16 @@ mod tests {
         .into_iter()
         .map(|(n, k)| (n.to_owned(), k))
         .collect();
-        let time = TimeContext::default();
+        // `RegionOf` resolves its map literal against the uploaded maps, so the
+        // context carries one named exactly as the catalog example says (PR #246
+        // CI). Its compiled form reads the map's dictionary through a string
+        // literal in `dictGetOrDefault`, not through a `FROM`, so the
+        // "only its own table" assertions below stay unchanged and still cover it.
+        let time = TimeContext::default().with_maps(vec![lakehouse_bi::geo::SpatialMap {
+            id: "m_0123456789ab".to_owned(),
+            name: "Sales regions".to_owned(),
+            region_lookup: true,
+        }]);
         let policy = OneTable {
             table: "serving.t",
             mask: vec!["label"],
@@ -840,6 +886,37 @@ mod tests {
         for f in lakehouse_bi::formula::catalog::CATALOG {
             let c = compile(f.example, &Scope::new(&columns, &time), None).unwrap();
             let sql = format!("SELECT {} AS v FROM serving.t", c.sql);
+            // PR #246 CI: `RegionOf` compiles to `dictGetOrDefault`, which the
+            // role rewrite refuses for any principal with an authored
+            // obligation; the catalog says "Not available to a role that has a
+            // data policy", so refusal is the specified behaviour, not a gap.
+            // The example is still checked on both sides: refused under the
+            // policy, and, for a role with no obligation, passed through
+            // reading only its own table (the dictionary is named in a string
+            // literal, never a `FROM`).
+            if c.sql.contains("dictGet") {
+                assert!(
+                    matches!(
+                        rewrite(&sql, &policy),
+                        Err(RewriteError::DictOrJoinFunctionDenied { .. })
+                    ),
+                    "{}: {sql}",
+                    f.name
+                );
+                let free = enforce(
+                    &sql,
+                    &ClickHouseDialect {},
+                    &["analyst".to_owned()],
+                    &PlaceholderValues::none(),
+                    &NoObligations,
+                    &NoViews,
+                )
+                .unwrap_or_else(|failure| panic!("{}: {failure}\n{sql}", f.name));
+                let tables =
+                    crate::sql_rewrite::referenced_tables(&free, &ClickHouseDialect {}).unwrap();
+                assert_eq!(tables, vec!["serving.t".to_owned()], "{}", f.name);
+                continue;
+            }
             let out = rewrite(&sql, &policy).unwrap_or_else(|failure| {
                 panic!("{}: {failure}\n{sql}", f.name);
             });

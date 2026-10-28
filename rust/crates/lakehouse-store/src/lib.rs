@@ -29,7 +29,7 @@
 //! that was never `Some`.
 
 // `sqlx::test` embeds the migration set at compile time; touching this file
-// (adding `0033_connector_ingest_spec.sql`, WS3 item 1; `0064_connector_schema_changes.sql`, SRC-8) forces the macro to
+// (adding `0033_connector_ingest_spec.sql`, WS3 item 1; `0064_connector_schema_changes.sql`, SRC-8; `0083_governed_tags.sql`, DATA-12; `0079_column_lineage.sql`, DATA-13; `0081_quality_incidents.sql`, DATA-14) forces the macro to
 // re-expand and pick up the new migration for every `#[sqlx::test]` in this
 // crate's `tests/` binaries.
 pub mod agents;
@@ -37,6 +37,7 @@ pub mod annotation;
 pub mod audit;
 pub mod cdc;
 pub mod chat_term;
+pub mod column_lineage;
 pub mod connector_discovery;
 pub mod connector_oauth;
 pub mod connector_probe_result;
@@ -44,8 +45,10 @@ pub mod connector_run;
 pub mod connector_type;
 pub mod connectors;
 pub mod error;
+pub mod geo_map;
 pub mod gold_publication;
 pub mod governance;
+pub mod governed_tag;
 pub mod home_layout;
 pub mod identity;
 pub mod ingest_spec;
@@ -53,8 +56,14 @@ pub mod knowledge;
 pub mod maintenance_policy;
 pub mod overview;
 pub mod pipelines;
+pub mod public_links;
+pub mod quality;
 pub mod queries;
+pub mod query_limits;
+pub mod report_schedule;
+pub mod report_subscriptions;
 pub mod reporting_settings;
+pub mod saas_vendors;
 pub mod schema_change;
 pub mod schema_diff;
 pub mod semantic;

@@ -3,7 +3,7 @@
 import * as React from "react"
 import Link from "next/link"
 import { useRouter } from "next/navigation"
-import { ChevronDown, Folder, FolderCog, LayoutGrid, PlusIcon, Rows3, Sigma } from "lucide-react"
+import { ChevronDown, Folder, FolderCog, LayoutGrid, Lock, PlusIcon, Rows3, Sigma, Trash2 } from "lucide-react"
 
 import { DataTable } from "@/components/data-table/data-table"
 import { DataTableAdvancedToolbar } from "@/components/data-table/data-table-advanced-toolbar"
@@ -26,7 +26,6 @@ import { Label } from "@/components/ui/label"
 import {
   Select,
   SelectContent,
-  SelectItem,
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
@@ -37,6 +36,14 @@ import { useTableUrlState } from "@/hooks/use-table-url-state"
 import { useAuth } from "@/features/auth/auth-provider"
 import { filterDataClientSide } from "@/lib/data-table"
 import {
+  folderChoices,
+  folderOptionText,
+  isPersonalFolder,
+  itemHref,
+  labelledFolders,
+  manageableFolders,
+} from "@/lib/dashboard-organise"
+import {
   buildFolderTree,
   flattenFolders,
   folderPath,
@@ -44,10 +51,10 @@ import {
   type FolderLike,
 } from "@/lib/folder-tree"
 import { formatRelativeTime } from "@/lib/format"
-import { withNotify } from "@/lib/notify"
+import { notifyError, withNotify } from "@/lib/notify"
 import { cn } from "@/lib/utils"
 import { dashboardService } from "@/services"
-import type { Board } from "@/services/clients/bi-store"
+import type { Board } from "@/services"
 import { notifyDashboardsChanged } from "./dashboard-events"
 import {
   BoardActionsMenu,
@@ -55,8 +62,12 @@ import {
   ShareBadges,
   type BoardRowActions,
 } from "./dashboard-list-columns"
+import { FavouriteButton } from "./favourite-button"
+import { PRIVATE_HINT } from "./private-badge"
+import { FolderOptions } from "./folder-options"
 import { ManageFoldersDialog, MoveBoardDialog } from "./folder-dialogs"
 import { forgetLastBoard } from "./last-board"
+import { TrashDialog } from "./trash-dialog"
 
 /** Select value for "no folder" (base-ui needs a non-empty value). */
 const NO_FOLDER = "__none__"
@@ -143,18 +154,16 @@ function BoardFormDialog({
               <Select value={folderId} onValueChange={(v) => setFolderId(v ?? NO_FOLDER)}>
                 <SelectTrigger className="w-full">
                   <SelectValue>
-                    {folderId === NO_FOLDER ? "No folder" : folderPath(folders ?? [], folderId)}
+                    {folderOptionText(folders ?? [], folderId === NO_FOLDER ? "" : folderId, "No folder")}
                   </SelectValue>
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value={NO_FOLDER}>No folder</SelectItem>
-                  {folderOptions.map(({ folder }) => (
-                    <SelectItem key={folder.id} value={folder.id}>
-                      {folderPath(folders ?? [], folder.id)}
-                    </SelectItem>
-                  ))}
+                  <FolderOptions folders={folders ?? []} noneValue={NO_FOLDER} noneLabel="No folder" />
                 </SelectContent>
               </Select>
+              {isPersonalFolder(folders ?? [], folderId) ? (
+                <p className="text-xs text-muted-foreground">{PRIVATE_HINT}</p>
+              ) : null}
             </div>
           ) : null}
         </div>
@@ -176,6 +185,31 @@ function BoardFormDialog({
         </DialogFooter>
       </DialogContent>
     </Dialog>
+  )
+}
+
+/** One line of links: the caller's favourites or recent items (BI-18 part C, part 2). */
+function ShortcutStrip({
+  label,
+  items,
+}: {
+  readonly label: string
+  readonly items: { kind: "board" | "chart"; id: string; name: string; board?: string }[]
+}) {
+  if (items.length === 0) return null
+  return (
+    <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-sm">
+      <span className="text-xs font-medium uppercase tracking-wide text-muted-foreground">{label}</span>
+      {items.map((item) => (
+        <Link
+          key={`${item.kind}:${item.id}`}
+          href={itemHref(item)}
+          className="max-w-48 truncate rounded-md border bg-card px-2 py-0.5 hover:border-primary/40"
+        >
+          {item.name}
+        </Link>
+      ))}
+    </div>
   )
 }
 
@@ -210,6 +244,11 @@ function BoardCard({
         </Link>
         <div className="relative z-10 -mt-1.5 -mr-2 flex shrink-0 items-center gap-1">
           <ShareBadges board={board} />
+          <FavouriteButton
+            on={actions.isFavourite?.(board) ?? false}
+            name={board.name}
+            onToggle={() => actions.onToggleFavourite?.(board)}
+          />
           <BoardActionsMenu board={board} actions={actions} />
         </div>
       </div>
@@ -266,9 +305,43 @@ export function DashboardListPage() {
   // Folders are listed to everyone who can see dashboards; filing needs
   // `dashboard:write`, which the API enforces (policy.rs).
   const foldersState = useService((s) => dashboardService.listFolders(s), [])
-  const folders = React.useMemo(() => foldersState.data ?? [], [foldersState.data])
+  const auth = useAuth()
+  const me = auth.user?.id
+  // The caller's own personal space is called "Personal space"; the folder
+  // manager never offers one, and a dashboard is filed only in an ordinary
+  // folder or the caller's own space (BI-18 part C, part 2).
+  const folders = React.useMemo(
+    () => labelledFolders(foldersState.data ?? [], me),
+    [foldersState.data, me],
+  )
+  const fileable = React.useMemo(() => folderChoices(folders, me), [folders, me])
   const reloadFolders = foldersState.reload
-  const canFile = useAuth().hasPermission("dashboard:write")
+  const canFile = auth.hasPermission("dashboard:write")
+  // The personal space is created on first use: a writer with none yet opens it
+  // once, then the folder list is read again.
+  const spaceAsked = React.useRef(false)
+  React.useEffect(() => {
+    if (!canFile || !me || foldersState.status !== "success" || spaceAsked.current) return
+    spaceAsked.current = true
+    if (foldersState.data.some((f) => f.ownerId === me)) return
+    void dashboardService
+      .ensurePersonalSpace()
+      .then(() => reloadFolders())
+      .catch(() => undefined)
+  }, [canFile, me, foldersState.status, foldersState.data, reloadFolders])
+  // Favourites and recent items (best effort: the list works without them).
+  const shortcuts = useService((s) => dashboardService.shortcuts(s), [])
+  const favourites = React.useMemo(
+    () => (shortcuts.status === "success" ? shortcuts.data.favourites : []),
+    [shortcuts],
+  )
+  const recent = shortcuts.status === "success" ? shortcuts.data.recent : []
+  const favouriteIds = React.useMemo(
+    () => new Set(favourites.filter((f) => f.kind === "board").map((f) => f.id)),
+    [favourites],
+  )
+  const reloadShortcuts = shortcuts.reload
+  const [trashOpen, setTrashOpen] = React.useState(false)
   const [view, setView] = React.useState<ViewMode>("gallery")
   const [collapsed, setCollapsed] = React.useState<Set<string>>(new Set())
   const [foldersOpen, setFoldersOpen] = React.useState(false)
@@ -334,26 +407,39 @@ export function DashboardListPage() {
   )
   const deleteAction = useServiceAction(
     withNotify(
-      { success: "Dashboard deleted", error: "Could not delete dashboard" },
+      { success: "Moved to the trash", error: "Could not delete dashboard" },
       (signal, id: string) => dashboardService.deleteBoard(id, signal),
     ),
   )
 
   const actions = React.useMemo<BoardRowActions>(
     () => ({
-      onRename: setRenaming,
-      onDelete: setDeleting,
+      onRename: canFile ? setRenaming : undefined,
+      onDelete: canFile ? setDeleting : undefined,
       onMove: canFile ? setMoving : undefined,
-      onDuplicate: (b) => {
+      isFavourite: (b) => favouriteIds.has(b.id),
+      onToggleFavourite: (b) => {
         void (async () => {
-          const created = await duplicateAction.run(b.id)
-          notifyDashboardsChanged()
-          reload()
-          if (created?.id) router.push(`/dashboards/${created.id}`)
+          try {
+            await dashboardService.setFavourite("board", b.id, !favouriteIds.has(b.id))
+          } catch (err) {
+            notifyError("Could not save the favourite", err)
+          }
+          reloadShortcuts()
         })()
       },
+      onDuplicate: canFile
+        ? (b) => {
+            void (async () => {
+              const created = await duplicateAction.run(b.id)
+              notifyDashboardsChanged()
+              reload()
+              if (created?.id) router.push(`/dashboards/${created.id}`)
+            })()
+          }
+        : undefined,
     }),
-    [canFile, duplicateAction, reload, router],
+    [canFile, duplicateAction, favouriteIds, reload, reloadShortcuts, router],
   )
   const folderPathOf = React.useCallback(
     (b: Board) => (b.folderId ? folderPath(folders, b.folderId) : ""),
@@ -416,12 +502,13 @@ export function DashboardListPage() {
       return next
     })
 
-  const newButton = (
+  // BI-18 part C review fix (SHOULD-FIX) R27: without `dashboard:write` there is no button.
+  const newButton = canFile ? (
     <Button size="sm" onClick={() => setCreateOpen(true)}>
       <PlusIcon data-icon="inline-start" />
       New dashboard
     </Button>
-  )
+  ) : null
 
   // Tidak ada primitive ToggleGroup di repo ini, jadi dua tombol ikon dengan
   // `aria-pressed` — sama jelasnya bagi screen reader tanpa menambah primitive
@@ -483,6 +570,8 @@ export function DashboardListPage() {
 
       {state.status === "success" && boards.length > 0 ? (
         <div className="space-y-4">
+          <ShortcutStrip label="Favourites" items={favourites} />
+          <ShortcutStrip label="Recent" items={recent.filter((r) => !favouriteIds.has(r.id))} />
           <DataTableAdvancedToolbar
             table={table}
             onRefresh={reload}
@@ -497,6 +586,13 @@ export function DashboardListPage() {
                   <Button variant="outline" size="sm" onClick={() => setFoldersOpen(true)}>
                     <FolderCog data-icon="inline-start" />
                     Folders
+                  </Button>
+                ) : null}
+                {/* BI-18 part C review fix (SHOULD-FIX) R18: the trash is for those who can restore. */}
+                {canFile ? (
+                  <Button variant="outline" size="sm" onClick={() => setTrashOpen(true)}>
+                    <Trash2 data-icon="inline-start" />
+                    Trash
                   </Button>
                 ) : null}
                 {newButton}
@@ -535,7 +631,11 @@ export function DashboardListPage() {
                           aria-hidden
                         />
                         {section.folderId ? (
-                          <Folder className="size-4 text-muted-foreground" aria-hidden />
+                          folders.find((f) => f.id === section.folderId)?.ownerId ? (
+                            <Lock className="size-4 text-muted-foreground" aria-hidden />
+                          ) : (
+                            <Folder className="size-4 text-muted-foreground" aria-hidden />
+                          )
                         ) : null}
                         {section.path || "No folder"}
                         <span className="text-xs font-normal text-muted-foreground tabular-nums">
@@ -576,7 +676,7 @@ export function DashboardListPage() {
         submitLabel="Create"
         initialName=""
         initialDescription=""
-        folders={canFile ? folders : undefined}
+        folders={canFile ? fileable : undefined}
         busy={createAction.status === "pending"}
         onSubmit={({ name, description, folderId }) => {
           void (async () => {
@@ -614,7 +714,7 @@ export function DashboardListPage() {
         <ManageFoldersDialog
           open={foldersOpen}
           onOpenChange={setFoldersOpen}
-          folders={folders}
+          folders={manageableFolders(folders)}
           onChanged={() => {
             notifyDashboardsChanged()
             reloadFolders()
@@ -626,7 +726,7 @@ export function DashboardListPage() {
         <MoveBoardDialog
           open
           onOpenChange={(open) => !open && setMoving(null)}
-          folders={folders}
+          folders={fileable}
           boardId={moving.id}
           currentFolderId={moving.folderId ?? ""}
           onMoved={() => {
@@ -636,11 +736,23 @@ export function DashboardListPage() {
         />
       ) : null}
 
+      {trashOpen ? (
+        <TrashDialog
+          canWrite={canFile}
+          onOpenChange={setTrashOpen}
+          onRestored={() => {
+            notifyDashboardsChanged()
+            reload()
+            reloadShortcuts()
+          }}
+        />
+      ) : null}
+
       <ConfirmActionDialog
         open={deleting !== null}
         onOpenChange={(open) => !open && setDeleting(null)}
         title={`Delete ${deleting?.name ?? "dashboard"}?`}
-        description="This deletes the dashboard and every tile on it."
+        description="The dashboard and its tiles go to the trash. You can restore them for 30 days."
         impact={
           deleting?.publicToken
             ? "This dashboard has a public link. Anyone using that link will lose access."

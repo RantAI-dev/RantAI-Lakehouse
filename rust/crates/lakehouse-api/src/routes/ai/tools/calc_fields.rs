@@ -86,12 +86,17 @@ pub(super) async fn update_calculated_field(
     )
 }
 
-pub(super) async fn delete_calculated_field(state: &AppState, args: &Map<String, Value>) -> Value {
+pub(super) async fn delete_calculated_field(
+    state: &AppState,
+    principal: Option<&Principal>,
+    args: &Map<String, Value>,
+) -> Value {
     let q = match serde_json::from_value(Value::Object(route_args(args))) {
         Ok(q) => q,
         Err(_unparsed) => return json!({ "error": "id is required" }),
     };
-    api_result_to_value(calc_fields::delete(State(state.clone()), Query(q)).await).await
+    let who = principal.cloned().map(Extension);
+    api_result_to_value(calc_fields::delete(State(state.clone()), who, Query(q)).await).await
 }
 
 /// `create_value_group` (`BI-10`): the calculated-field route with a `group`
@@ -155,6 +160,10 @@ fn with_param_id(mut result: Value) -> Value {
 pub(super) fn handles(name: &str) -> bool {
     // BI-2: the metric tools ride the same single guard arm in `run_tool`.
     super::metrics::handles(name)
+        // BI-18 part C: the tab tools ride the same guard arm.
+        || super::tabs::handles(name)
+        // BI-16 part C2: the map list rides it too.
+        || super::maps::handles(name)
         || matches!(
             name,
             "list_formula_functions"
@@ -185,13 +194,19 @@ pub(super) async fn run(
     if super::metrics::handles(name) {
         return super::metrics::run(state, principal, name, args).await;
     }
+    if super::tabs::handles(name) {
+        return super::tabs::run(state, principal, name, args).await;
+    }
+    if super::maps::handles(name) {
+        return super::maps::list_maps(state).await;
+    }
     match name {
         "list_formula_functions" => list_formula_functions(),
         "list_calculated_fields" => list_calculated_fields(state, args).await,
         "validate_formula" => validate_formula(state, args).await,
         "create_calculated_field" => create_calculated_field(state, principal, args).await,
         "update_calculated_field" => update_calculated_field(state, principal, args).await,
-        "delete_calculated_field" => delete_calculated_field(state, args).await,
+        "delete_calculated_field" => delete_calculated_field(state, principal, args).await,
         "create_value_group" => create_value_group(state, principal, args).await,
         "list_hierarchies" => list_hierarchies(state, args).await,
         "create_hierarchy" => create_hierarchy(state, principal, args).await,
@@ -213,8 +228,34 @@ pub(super) async fn run(
                 Ok(q) => q,
                 Err(_unparsed) => return json!({ "error": "id is required" }),
             };
-            api_result_to_value(params::delete(State(state.clone()), Query(q)).await).await
+            let who = principal.cloned().map(Extension);
+            api_result_to_value(params::delete(State(state.clone()), who, Query(q)).await).await
         }
         other => json!({ "error": format!("unknown tool: {other}") }),
+    }
+}
+
+#[cfg(test)]
+mod spatial_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    /// `BI-16` part C3 (T10): the function list the assistant reads has both
+    /// spatial functions, with their help.
+    #[test]
+    fn list_formula_functions_lists_distance_and_region_of() {
+        let listed = super::list_formula_functions();
+        let functions = listed["functions"].as_array().expect("the function list");
+        for name in ["Distance", "RegionOf"] {
+            let entry = functions
+                .iter()
+                .find(|f| f["name"] == name)
+                .unwrap_or_else(|| panic!("{name} is not listed"));
+            assert_eq!(entry["category"], "spatial");
+            assert!(
+                entry["signature"]
+                    .as_str()
+                    .is_some_and(|s| s.starts_with(name))
+            );
+        }
     }
 }

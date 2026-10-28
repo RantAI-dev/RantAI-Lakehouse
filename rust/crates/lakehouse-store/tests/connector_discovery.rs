@@ -267,6 +267,43 @@ async fn a_result_past_a_bound_or_with_a_bad_string_is_refused(pool: PgPool) -> 
             }],
             truncated: false,
         },
+        // SRC-3: a load description is short text without control characters.
+        Listing {
+            objects: vec![ListedObject {
+                load: Some("re-read in full: a\nb".to_owned()),
+                ..ListedObject::named("tickets", ObjectKind::Object)
+            }],
+            truncated: false,
+        },
+        Listing {
+            objects: vec![ListedObject {
+                load: Some("x".repeat(201)),
+                ..ListedObject::named("tickets", ObjectKind::Object)
+            }],
+            truncated: false,
+        },
+        // SRC-3 slice 5 review BLOCKER 14: a label is bounded like a name.
+        Listing {
+            objects: vec![ListedObject {
+                label: Some("Team\nSite / Tasks".to_owned()),
+                ..ListedObject::named("site/list", ObjectKind::Object)
+            }],
+            truncated: false,
+        },
+        Listing {
+            objects: vec![ListedObject {
+                label: Some("x".repeat(257)),
+                ..ListedObject::named("site/list", ObjectKind::Object)
+            }],
+            truncated: false,
+        },
+        Listing {
+            objects: vec![ListedObject {
+                label: Some("  ".to_owned()),
+                ..ListedObject::named("site/list", ObjectKind::Object)
+            }],
+            truncated: false,
+        },
     ];
     for bad in bad_sets {
         let err = finish(&pool, PG, Kind::List, "req-1", &Outcome::Listing(bad), t0)
@@ -322,7 +359,10 @@ async fn a_result_past_a_bound_or_with_a_bad_string_is_refused(pool: PgPool) -> 
     );
     let stored = get(&pool, PG, Kind::Preview).await.unwrap().unwrap();
     assert_eq!(stored.state, State::Done);
-    assert!(stored.preview.unwrap().columns.is_empty());
+    assert_eq!(
+        stored.preview.unwrap().columns,
+        [] as [lakehouse_store::connector_discovery::ListedColumn; 0]
+    );
     Ok(())
 }
 
@@ -427,6 +467,25 @@ fn answers_serialize_to_the_documented_shapes() {
     assert_eq!(json["objects"][0]["kind"], "file");
     assert_eq!(json["objects"][0]["modifiedAt"], "2026-10-15T09:00:00Z");
     assert!(json["reason"].as_str().unwrap().contains("10,000"));
+
+    // BLOCKER 14: a label and a site are carried; an object without a label says nothing of one.
+    let labelled = Answer::listing(
+        "",
+        Listing {
+            objects: vec![
+                ListedObject {
+                    label: Some("Team / Tasks".to_owned()),
+                    ..ListedObject::named("site,1,2/list", ObjectKind::Object)
+                },
+                ListedObject::named("site,1,2", ObjectKind::Site),
+            ],
+            truncated: false,
+        },
+    );
+    let json = serde_json::to_value(&labelled).unwrap();
+    assert_eq!(json["objects"][0]["label"], "Team / Tasks");
+    assert_eq!(json["objects"][1]["kind"], "site");
+    assert!(json["objects"][1].get("label").is_none());
 
     let running = serde_json::to_value(Answer::running(Kind::List)).unwrap();
     assert_eq!(

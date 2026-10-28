@@ -46,7 +46,7 @@ struct ErrorBody {
 impl IntoResponse for ApiRejection {
     fn into_response(self) -> Response {
         // `ApiError::status()` returns a `u16` known to be a valid HTTP
-        // status code (400/401/403/404/409/422/429/500/503);
+        // status code (400/401/403/404/409/422/429/500/502/503);
         // `StatusCode::from_u16` cannot fail for these constants, but
         // `unwrap`/`expect` are denied outside tests, so fall back to 500
         // on the theoretical error path rather than panicking.

@@ -16,7 +16,8 @@
 //! [`crate::builder`] — see [`ColumnKind`].
 
 use lakehouse_core::ident::Ident;
-use serde::{Deserialize, Serialize};
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// Most boards' filters the API accepts in one list.
 pub const MAX_FILTERS: usize = 20;
@@ -108,17 +109,27 @@ pub struct FilterDef {
     /// The column to filter on. Empty for a reference to a segment.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub column: String,
-    /// Values for `in` / `not_in`. Always serialized, as before BI-18.
-    #[serde(default)]
+    /// Values for `in` / `not_in`. Always serialized, as before BI-18. A
+    /// number is read as the text of the number.
+    #[serde(default, deserialize_with = "deserialize_values")]
     pub values: Vec<String>,
     /// How the column is compared. Absent means `in`.
     #[serde(default, skip_serializing_if = "FilterOp::is_in")]
     pub op: FilterOp,
-    /// Lower bound of `between`: a number, or an ISO date `YYYY-MM-DD`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Lower bound of `between`: a number, or an ISO date `YYYY-MM-DD`. A
+    /// number in the JSON is read as the text of the number.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_min"
+    )]
     pub min: Option<String>,
     /// Upper bound of `between`, same format as `min`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_max"
+    )]
     pub max: Option<String>,
     /// Unit of `relative`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -152,6 +163,13 @@ pub struct FilterDef {
     /// has no column and so never becomes a predicate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub segment: Option<String>,
+    /// `BI-18` part C: the ids of the dashboard tabs this filter applies to.
+    /// Absent (or empty) means every tab, which is what a filter saved before
+    /// tabs existed means. Meaningful only on a board's filters; the server
+    /// never reads it when building SQL, only when choosing which filters a
+    /// tile gets ([`FilterDef::applies_on`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tabs: Option<Vec<String>>,
 }
 
 #[allow(
@@ -160,6 +178,53 @@ pub struct FilterDef {
 )]
 fn is_false(b: &bool) -> bool {
     !*b
+}
+
+/// Read a filter's list of values: a string as it is, a number as the text
+/// `serde_json` prints for it.
+///
+/// A model that filters on a year sends `values: [2024]`, and a decode error
+/// on that leaves it guessing what the filter wants. The number becomes the
+/// text of the number, which is the filter the model meant.
+fn deserialize_values<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<String>, D::Error> {
+    let values = Vec::<serde_json::Value>::deserialize(deserializer)?;
+    values
+        .into_iter()
+        .map(|value| match value {
+            serde_json::Value::String(text) => Ok(text),
+            serde_json::Value::Number(number) => Ok(number.to_string()),
+            _ => Err(D::Error::custom(
+                "the filter's values must be a number or a string",
+            )),
+        })
+        .collect()
+}
+
+/// Read a filter's lower bound: a string as it is, a number as the text
+/// `serde_json` prints for it, and no bound at all for `null`.
+fn deserialize_min<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
+    deserialize_bound(deserializer, "min")
+}
+
+/// Read a filter's upper bound, the same way as its lower bound.
+fn deserialize_max<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
+    deserialize_bound(deserializer, "max")
+}
+
+/// Read one bound of a filter. The field's own name is in the refusal, so the
+/// caller knows which of the two bounds to fix.
+fn deserialize_bound<'de, D: Deserializer<'de>>(
+    deserializer: D,
+    field: &str,
+) -> Result<Option<String>, D::Error> {
+    match serde_json::Value::deserialize(deserializer)? {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::String(text) => Ok(Some(text)),
+        serde_json::Value::Number(number) => Ok(Some(number.to_string())),
+        _ => Err(D::Error::custom(format!(
+            "the filter's {field} must be a number or a string"
+        ))),
+    }
 }
 
 impl FilterDef {
@@ -181,6 +246,7 @@ impl FilterDef {
             max_exclusive: false,
             required: false,
             segment: None,
+            tabs: None,
         }
     }
 
@@ -213,6 +279,19 @@ impl FilterDef {
         }
     }
 
+    /// Whether a tile on `tab` is given this filter (`BI-18` part C). A filter
+    /// with no ties applies on every tab, and so does one on a board with no
+    /// tabs (`tab` is `None`): a tile on a tab the filter is not tied to
+    /// simply does not get it, which is not a skip and is never reported as
+    /// one.
+    #[must_use]
+    pub fn applies_on(&self, tab: Option<&str>) -> bool {
+        match (&self.tabs, tab) {
+            (Some(ties), Some(tab)) if !ties.is_empty() => ties.iter().any(|t| t == tab),
+            _ => true,
+        }
+    }
+
     /// Check the filter is well-formed: the fields its op needs are present
     /// and parse. It does not know the column's type; that is checked per
     /// relation when the predicate is built.
@@ -222,6 +301,17 @@ impl FilterDef {
     /// A message for the caller, naming what is wrong. It never echoes the
     /// offending value.
     pub fn validate(&self) -> Result<(), String> {
+        if let Some(ties) = &self.tabs {
+            if ties.len() > crate::layout::MAX_TABS {
+                return Err(format!(
+                    "a filter is tied to at most {} tabs",
+                    crate::layout::MAX_TABS
+                ));
+            }
+            for tab in ties {
+                crate::layout::check_tab_id(tab)?;
+            }
+        }
         if let Some(name) = &self.segment {
             // A reference carries nothing but the name.
             if Ident::new(name.clone()).is_err() || !self.column.is_empty() {
@@ -475,6 +565,53 @@ mod tests {
         assert!(serde_json::from_str::<FilterDef>(bad).is_err());
     }
 
+    /// A model that filters on a year sends the year as a number. The filter
+    /// reads as if the year had been sent as text, so the model is not stuck
+    /// on a decode error.
+    #[test]
+    fn a_number_in_the_values_is_read_as_its_text() {
+        let from_number = parse(r#"{"column":"tahun","values":[2024]}"#);
+        let from_text = parse(r#"{"column":"tahun","values":["2024"]}"#);
+        assert_eq!(from_number, from_text);
+        assert_eq!(from_number.values, vec!["2024".to_owned()]);
+    }
+
+    #[test]
+    fn a_number_in_a_bound_is_read_as_its_text() {
+        let f = parse(r#"{"column":"n","op":"between","min":10,"max":2.5}"#);
+        assert_eq!(f.min.as_deref(), Some("10"));
+        assert_eq!(f.max.as_deref(), Some("2.5"));
+    }
+
+    #[test]
+    fn a_value_that_is_neither_a_number_nor_a_string_is_refused_naming_the_field() {
+        let err =
+            serde_json::from_str::<FilterDef>(r#"{"column":"c","values":[true]}"#).unwrap_err();
+        assert!(err.to_string().contains("values"), "{err}");
+        let err = serde_json::from_str::<FilterDef>(r#"{"column":"c","op":"between","min":true}"#)
+            .unwrap_err();
+        assert!(err.to_string().contains("min"), "{err}");
+        let err = serde_json::from_str::<FilterDef>(r#"{"column":"c","op":"between","max":true}"#)
+            .unwrap_err();
+        assert!(err.to_string().contains("max"), "{err}");
+    }
+
+    /// The bytes on the wire do not depend on how the value was written, so a
+    /// board saved from a number reads back like one saved from text.
+    #[test]
+    fn a_filter_parsed_from_a_number_serializes_like_the_one_parsed_from_a_string() {
+        let from_number = parse(r#"{"column":"tahun","values":[2024]}"#);
+        let from_text = parse(r#"{"column":"tahun","values":["2024"]}"#);
+        assert_eq!(
+            serde_json::to_string(&from_number).unwrap(),
+            serde_json::to_string(&from_text).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_string(&from_number).unwrap(),
+            r#"{"column":"tahun","values":["2024"]}"#
+        );
+    }
+
     #[test]
     fn typed_fields_use_camel_case_names_and_are_omitted_when_absent() {
         let f = parse(r#"{"column":"d","op":"relative","anchor":"last","n":30,"unit":"day"}"#);
@@ -585,7 +722,7 @@ mod tests {
             range.clone(),
         ];
         assert_eq!(without_inert(&list), vec![keep, range]);
-        assert!(without_inert(&[]).is_empty());
+        assert!(without_inert(&[]).is_empty(), "{:?}", without_inert(&[]));
     }
 
     #[test]
@@ -633,5 +770,43 @@ mod tests {
         ] {
             assert_eq!(ColumnKind::from_clickhouse_type(ty), want, "{ty}");
         }
+    }
+
+    #[test]
+    fn a_filter_tied_to_tabs_round_trips_and_a_legacy_one_keeps_its_bytes() {
+        let legacy = r#"{"column":"kawasan","values":["Asia"]}"#;
+        assert!(parse(legacy).tabs.is_none());
+        assert_eq!(serde_json::to_string(&parse(legacy)).unwrap(), legacy);
+        let tied = r#"{"column":"kawasan","values":["Asia"],"tabs":["t_a","t_b"]}"#;
+        let f = parse(tied);
+        assert_eq!(
+            f.tabs.as_deref(),
+            Some(&["t_a".to_owned(), "t_b".to_owned()][..])
+        );
+        assert_eq!(serde_json::to_string(&f).unwrap(), tied);
+        assert!(f.validate().is_ok());
+        assert!(f.applies_on(Some("t_b")) && !f.applies_on(Some("t_c")));
+    }
+
+    #[test]
+    fn a_tie_must_be_a_short_list_of_well_formed_tab_ids() {
+        let with = |tabs: &str| {
+            parse(&format!(
+                r#"{{"column":"kawasan","values":["a"],"tabs":{tabs}}}"#
+            ))
+            .validate()
+        };
+        assert!(with(r#"["ok_1"]"#).is_ok());
+        assert!(with("[]").is_ok(), "an empty list is no tie");
+        assert!(with(r#"["a b"]"#).is_err());
+        assert!(with(r#"[""]"#).is_err());
+        let many = format!(
+            "[{}]",
+            (0..21)
+                .map(|i| format!("\"t{i}\""))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        assert!(with(&many).is_err());
     }
 }

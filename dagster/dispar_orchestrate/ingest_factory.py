@@ -187,6 +187,7 @@ from dispar_orchestrate.adapters import files as files_adapter
 from dispar_orchestrate.adapters import mongodb as mongodb_adapter
 from dispar_orchestrate.adapters import oracle as oracle_adapter
 from dispar_orchestrate.adapters import rest as rest_adapter
+from dispar_orchestrate.adapters import saas as saas_adapter
 from dispar_orchestrate.adapters import sftp as sftp_adapter
 from dispar_orchestrate.adapters import sheets as sheets_adapter
 from dispar_orchestrate.adapters import sink as sink_adapter
@@ -197,6 +198,7 @@ from dispar_orchestrate.bronze_catalog import record_ingest_offset, record_inges
 from dispar_orchestrate.column_gate import UnsupportedColumnType, reject_unsupported_column_types
 from dispar_orchestrate.ingest_errors import UnknownAdapter, UnsupportedKafkaAuth
 from dispar_orchestrate.op_metadata import source_metadata
+from dispar_orchestrate.saas import vendors as saas_vendors
 from dispar_orchestrate.secret_map import secret_field_names
 from dispar_orchestrate.secret_resolver import SecretRefRejected
 
@@ -294,6 +296,7 @@ _ADAPTERS = {
     "sheets": sheets_adapter,
     "mongodb": mongodb_adapter,
     "sftp": sftp_adapter,
+    "saas": saas_adapter,
 }
 
 
@@ -335,6 +338,11 @@ def _resolve_object_secrets(connector: dict, adapter_name: str, dial: dict) -> d
     # with `None`, even for a connector whose dial happens to carry an
     # "auth" object for some other reason.
     auth_type = dial.get("auth", {}).get("type") if adapter_name in ("rest", "kafka", "sftp") else None
+    if adapter_name == "saas":
+        # SRC-3 AD2: the key the vendor table resolves: the browser sign-in's tag,
+        # or `integration:<vendor>`. An unknown vendor is a rejected setting
+        # (`secret_field_names` raises `ValueError`, classified setting_rejected).
+        auth_type = saas_vendors.auth_type_of(dial)
     fields = secret_field_names(adapter_name, auth_type)
     if not fields:
         # ("kafka", "none"): a PLAINTEXT broker needs no secret at all --
@@ -396,7 +404,10 @@ def _load_plan(adapter_name: str, obj: dict, refresh: str | None = None) -> Load
     rejection.
     """
     plan = LoadPlan.from_source_object(obj, refresh=refresh)
-    if plan.mode in sink_adapter.INCREMENTAL_MODES and adapter_name != "sql":
+    # SRC-3 AD6: a `saas` object may load incrementally when its vendor module
+    # declares a cursor for it; `adapters/saas.py` refuses the object whose
+    # module declares none, or another one, before anything is read.
+    if plan.mode in sink_adapter.INCREMENTAL_MODES and adapter_name not in ("sql", "saas"):
         raise UnsupportedLoadMode(
             f"load mode {plan.mode!r} is only available for SQL connectors, not adapter {adapter_name!r}"
         )
@@ -636,6 +647,13 @@ ACTIONS = (ACTION_REFRESH_KEEP, ACTION_REFRESH_REMOVE, ACTION_CLEAR)
 _REFRESH_OF_ACTION = {ACTION_REFRESH_KEEP: "keep", ACTION_REFRESH_REMOVE: "remove"}
 
 
+def _run_author(connector_id: str, run_id: str | None) -> str:
+    """Who our own `pyiceberg` commits are recorded as (`DATA-15` F5): the connector and
+    the first eight characters of the Dagster run, e.g. `connector conn-x, run 1a2b3c4d`.
+    The run part is left out when there is no run id, never invented."""
+    return f"connector {connector_id}, run {run_id[:8]}" if run_id else f"connector {connector_id}"
+
+
 def _single_table_request(connector_id: str, object_name: Any, action: Any) -> tuple[str, str] | None:
     """The `(object, action)` a run was started with, or `None` for an ordinary run
     of every table. Both or neither: an `object` without an `action` (or the reverse)
@@ -716,7 +734,9 @@ def _run_one_object(
         try:
             sink_adapter.clear_table(
                 obj["target"],
-                sink_adapter.SinkConfig.from_bronze_ingest_config(dlt_pipeline.BronzeIngestConfig.from_env()),
+                sink_adapter.SinkConfig.from_bronze_ingest_config(
+                    dlt_pipeline.BronzeIngestConfig.from_env(), author=_run_author(connector_id, run_id)
+                ),
             )
         except Exception as exc:  # noqa: BLE001 -- every failure still gets a row (never silently invisible)
             _record(rows=None, status="failed", error=_classify_exception(exc))
@@ -781,13 +801,16 @@ def _run_one_object(
             outcome = sink_adapter.load_via_sink(
                 result.source,
                 obj["target"],
-                sink_adapter.SinkConfig.from_bronze_ingest_config(dlt_pipeline.BronzeIngestConfig.from_env()),
+                sink_adapter.SinkConfig.from_bronze_ingest_config(
+                    dlt_pipeline.BronzeIngestConfig.from_env(), author=_run_author(connector_id, run_id)
+                ),
                 plan,
             )
             _record(rows=outcome.rows, status="succeeded")
             _register_in_catalog(connector_id, obj)
             return outcome.rows
 
+        observed_before = False
         adapter = _ADAPTERS.get(adapter_name)
         if adapter is None:
             raise UnknownAdapter(f"ingest_factory: no adapter dispatch for adapter={adapter_name!r}")
@@ -835,6 +858,17 @@ def _run_one_object(
                 _record(rows=None, status="waiting", error=_WAITING_MESSAGE)
                 return None
             source, resolved = result.source, result.resolved
+        elif adapter_name == "saas":
+            # SRC-3: the vendor module reads through a `SaasSession`, which
+            # resolves and pins every host itself (link rule, AD3), so `resolved`
+            # stays None and nothing is wrapped here. A vendor that describes
+            # its fields is observed BEFORE the load through `gate` (AD7).
+            saas_result = adapter.build_source(dial, secrets, [obj], connector_id=connector_id, gate=gate)
+            if saas_result is None:
+                _record(rows=None, status="waiting", error=_WAITING_MESSAGE)
+                return None
+            source, resolved = saas_result.source, None
+            observed_before = saas_result.observed_before_load
         elif adapter_name == "rest":
             # SRC-12 part C: the connector's id lets a REST load report a refresh
             # token the provider rotated (`adapters/rest.py`, OAUTH).
@@ -845,7 +879,9 @@ def _run_one_object(
             source, resolved = result.source, result.resolved
 
         def _load():
-            sink_config = sink_adapter.SinkConfig.from_bronze_ingest_config(dlt_pipeline.BronzeIngestConfig.from_env())
+            sink_config = sink_adapter.SinkConfig.from_bronze_ingest_config(
+                dlt_pipeline.BronzeIngestConfig.from_env(), author=_run_author(connector_id, run_id)
+            )
             return sink_adapter.load_via_sink(source, obj["target"], sink_config, plan)
 
         host = _host_of(dial)
@@ -856,9 +892,11 @@ def _run_one_object(
             outcome = _load()
         _record(rows=outcome.rows, status="succeeded")
         _register_in_catalog(connector_id, obj)
-        if adapter_name != "sql":
-            # files / rest / mongodb / sftp: observed AFTER the load (SRC-8,
-            # D4). sql was observed before it; sheets returned above.
+        if adapter_name != "sql" and not observed_before:
+            # files / rest / mongodb / sftp (and a saas vendor that does not
+            # describe its fields): observed AFTER the load (SRC-8, D4). sql
+            # and a describing saas vendor were observed before it; sheets
+            # returned above.
             _observe_after_load(connector_id, obj["name"], outcome.columns, run_id)
         return outcome.rows
     except (
@@ -869,6 +907,10 @@ def _run_one_object(
         # no key value, too many keys). Fixed message: counts and names only.
         dedup_adapter.DedupRefused,
         schema_observer.ObservationRefused,
+        # SRC-3: a vendor with no module in this build, or a dial/sign-in the
+        # vendor does not accept. Fixed messages.
+        saas_vendors.UnsupportedVendor,
+        saas_adapter.SaasSetupRefused,
     ) as exc:
         _record(rows=None, status="rejected", error=str(exc))
         raise

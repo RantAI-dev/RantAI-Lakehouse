@@ -78,6 +78,15 @@ jobs:
           sed -i '/^TENANT_WAREHOUSE_S3_ACCESS_KEY=/d;/^TENANT_WAREHOUSE_S3_SECRET_KEY=/d' .env
           printf '\nTENANT_WAREHOUSE_S3_ACCESS_KEY=%s\nTENANT_WAREHOUSE_S3_SECRET_KEY=%s\n' \
             "$STAGING_RUSTFS_ACCESS_KEY" "$STAGING_RUSTFS_SECRET_KEY" >> .env
+          # File upload storage (DATA-9, DATA-17): compose defaults
+          # RUSTFS_ACCESS_KEY_SECRET_REF / RUSTFS_SECRET_KEY_SECRET_REF to
+          # env:UPLOAD_S3_ACCESS_KEY / env:UPLOAD_S3_SECRET_KEY, and since SEC-18
+          # (#83) .env.example ships both empty, so on staging every upload
+          # answered "Upload storage is not configured." Same RustFS keys as the
+          # tenant warehouse above; a separate upload key may replace them later.
+          sed -i '/^UPLOAD_S3_ACCESS_KEY=/d;/^UPLOAD_S3_SECRET_KEY=/d' .env
+          printf '\nUPLOAD_S3_ACCESS_KEY=%s\nUPLOAD_S3_SECRET_KEY=%s\n' \
+            "$STAGING_RUSTFS_ACCESS_KEY" "$STAGING_RUSTFS_SECRET_KEY" >> .env
           # Paid provider credential, kept OUT of the repo (this repo is
           # public): inject it as the ONLY LLM_KEY= line in the file.
           # .env.example ships an empty `LLM_KEY=` too; compose resolves
@@ -117,6 +126,14 @@ jobs:
             sed -i "/^${name}=/d" .env
             printf '\n%s=%s\n' "$name" "$value" >> .env
           done
+          # BI-1: the address the Gotenberg container uses to reach the console,
+          # which is deployed below as `lakehouse-frontend` on this network.
+          # Not a secret; a plain line so the PDF item is on in staging.
+          sed -i '/^CONSOLE_INTERNAL_URL=/d;/^RENDER_TOKEN_SECRET=/d' .env
+          # BI-1 review fix (BLOCKER) R1: the PDF render token's own key. Optional
+          # here: without the repo secret PDF export is simply not set up on staging.
+          printf '\nRENDER_TOKEN_SECRET=%s\n' "$STAGING_RENDER_TOKEN_SECRET" >> .env
+          printf '\nCONSOLE_INTERNAL_URL=%s\n' 'http://lakehouse-frontend:3000' >> .env
           if [ -n "$missing" ]; then
             echo "::error::staging secrets not set:$missing (Settings > Secrets and variables > Actions)"
             exit 1
@@ -140,6 +157,7 @@ jobs:
           # required, like the tokens above (compose refuses to start without it).
           STAGING_CONNECTOR_SECRETS_KEY: ${{ secrets.STAGING_CONNECTOR_SECRETS_KEY }}
           STAGING_EMBED_SECRET: ${{ secrets.STAGING_EMBED_SECRET }}
+          STAGING_RENDER_TOKEN_SECRET: ${{ secrets.STAGING_RENDER_TOKEN_SECRET }}
 
       - name: Build & start backend stack (core + seaweedfs + dagster + trino)
         working-directory: ${{ github.workspace }}

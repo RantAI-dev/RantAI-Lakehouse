@@ -5,7 +5,7 @@
 | Module | Data (Sources) |
 | Backlog | `SRC-8` |
 | Spec | `docs/core/specs/src-8.md`. This page follows it row by row; anything the spec does not say is under "Beyond the spec". The spec has no *(proposed)* numbers |
-| Status | Decisions signed 2026-10-09 and 2026-10-10. In Acceptance: merged in #101 on 2026-10-12, CI green; checklist not run. A connector loaded after the fact cannot leave a pause until `SRC-16` |
+| Status | Released (accepted 2026-10-23). Decisions signed 2026-10-09 and 2026-10-10; merged in #101 on 2026-10-12, CI green. A connector loaded after the fact could not leave a pause until `SRC-16`, done in #120 |
 | Plan | `docs/superpowers/plans/2026-10-09-src-8-source-schema-changes.md` |
 
 ## Problem
@@ -81,6 +81,15 @@ Rows 5 to 9 are beyond the spec.
   change; tables with a change that waits keep waiting (`SRC-16`).
 - A column added at the source is filled from the run that first sees it;
   older rows are empty in it (spec: backfill is later).
+- Business-app connectors (`SRC-3`): Salesforce, HubSpot, ServiceNow and
+  Dynamics 365 describe their fields, so a change is found before the load and
+  "ask first" and "pause" hold the load back, as for a SQL source. Zendesk,
+  Confluence, SharePoint, Workday Reports and NetSuite do not describe
+  their fields (NetSuite's SuiteQL lists no table columns; `SRC-28`), so a
+  change is found after the load, as for files and REST, and under "Pause"
+  the connector stops after the run that loaded it. Google Analytics 4 loads
+  the dimensions and metrics you choose in the report; a custom dimension added
+  at the property is checked against the property's metadata before it is used. Gate-tested against mock vendors only.
 
 ## Acceptance checklist
 
@@ -90,27 +99,27 @@ Target row works as written" checkable and cover the decisions above.
 
 | # | Do this | Expect | Result |
 | --- | --- | --- | --- |
-| 1 | Spec: every Target row above works as written | Rows 6 to 10 pass | |
-| 2 | Spec: add a column at the source; run | It appears in the table after the run and a notice lists it | |
-| 3 | Spec: drop a column at the source; run | The table pauses, the column stays, the notice asks for a decision | |
-| 4 | Spec: set "pause"; change anything at the source; run | The load stops until approved | |
-| 5 | Spec: as a user without `connector:manage`, approve a change or set a policy; and make the orchestrator unable to reach the API during a run | The user is refused; the run fails with an honest message and nothing is loaded unchecked | |
-| 6 | Rename a column at the source; run | One removed and one added are listed; the table pauses | |
-| 7 | Narrow a column's type, then change a table's primary key; run each | The table pauses each time, under the default policy and under "apply all" | |
-| 8 | Approve the removal from row 3 | The table loads again; the column is still there with its old values, marked inactive on the connector page and in the Schema tab | |
-| 9 | Set "ask first"; add a column at the source; run | The table loads without the new column; the notice lists it; after approval the next run has it | |
-| 10 | With a "schema changed" alert rule (`SRC-7`), repeat row 2 | The alert arrives, naming the connector and table | |
-| 11 | Set "apply all" on a PostgreSQL connector; create a table in a schema it loads from; run | The table is added to the connector and loaded; the notice lists it | |
-| 12 | While one table waits (row 3), look at the connector's other tables and its health | They loaded; no failure alert; the failure count did not rise | |
+| 1 | Spec: every Target row above works as written | Rows 6 to 10 pass | Pass 2026-10-23 (product owner) |
+| 2 | Spec: add a column at the source; run | It appears in the table after the run and a notice lists it | Pass 2026-10-23 (product owner) |
+| 3 | Spec: drop a column at the source; run | The table pauses, the column stays, the notice asks for a decision | Pass 2026-10-23 (product owner) |
+| 4 | Spec: set "pause"; change anything at the source; run | The load stops until approved | Pass 2026-10-23 (product owner) |
+| 5 | Spec: as a user without `connector:manage`, approve a change or set a policy; and make the orchestrator unable to reach the API during a run | The user is refused; the run fails with an honest message and nothing is loaded unchecked | Pass 2026-10-23 (product owner) |
+| 6 | Rename a column at the source; run | One removed and one added are listed; the table pauses | Pass 2026-10-23 (product owner) |
+| 7 | Narrow a column's type, then change a table's primary key; run each | The table pauses each time, under the default policy and under "apply all" | Pass 2026-10-23 (product owner) |
+| 8 | Approve the removal from row 3 | The table loads again; the column is still there with its old values, marked inactive on the connector page and in the Schema tab | Pass 2026-10-23 (product owner) |
+| 9 | Set "ask first"; add a column at the source; run | The table loads without the new column; the notice lists it; after approval the next run has it | Pass 2026-10-23 (product owner) |
+| 10 | With a "schema changed" alert rule (`SRC-7`), repeat row 2 | The alert arrives, naming the connector and table | Pass 2026-10-23 (product owner) |
+| 11 | Set "apply all" on a PostgreSQL connector; create a table in a schema it loads from; run | The table is added to the connector and loaded; the notice lists it | Pass 2026-10-23 (product owner) |
+| 12 | While one table waits (row 3), look at the connector's other tables and its health | They loaded; no failure alert; the failure count did not rise | Pass 2026-10-23 (product owner) |
 
 Pre-merge check, 2026-10-12, product owner, on a separate instance built from PR #101 at `f9d488f`: the Schema changes tab and the policy choice were reported as conforming ("QA sudah sesuai"). No policy change was left saved on that instance. No run could be started there, so rows 2 to 12 were not exercised in a browser; the g6 gate proved rows 2, 3, 8 and 12 against MySQL on PR #101. This is not the acceptance run.
 
-**Accepted by:** __________ **Date:** ______ **Build:** ______
+**Accepted by:** product owner (held in the base) **Date:** 2026-10-23 **Build:** main 0e5498d2
 
 Exceptions, each with an owner and a date:
 
 ## After acceptance
 
 - [ ] `PRODUCT.md` section 2 and 3 updated
-- [ ] `BACKLOG.md` item moved to Done; follow-ups added
+- [x] `BACKLOG.md` item moved to Done; follow-ups added
 - [ ] `CHANGELOG.md` entry a customer can read

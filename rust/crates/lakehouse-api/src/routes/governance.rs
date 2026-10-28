@@ -10,7 +10,7 @@
 use axum::Extension;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use lakehouse_auth::Principal;
 use lakehouse_clickhouse::{ChClient, ChError};
@@ -476,11 +476,34 @@ async fn maintenance(ch: &ChClient) -> Result<Value, GovError> {
     Ok(json!({ "maintenance": runs }))
 }
 
+/// The `table_name` value `bronze_meta.maintenance_run` (and
+/// `bronze_meta.maintenance_verb_run`) record for a table a caller
+/// addresses as `{ns}/{table}`.
+///
+/// Every writer records the catalog's own two-part name, never the bare
+/// one: the Bronze maintenance job (`dagster/dispar_orchestrate/
+/// maintenance.py::_run_maintenance_for_table`, fed `bronze.<table>` by
+/// `discover_bronze_tables`), `gold_export.py` (`gold.<mart>`) and
+/// `agent_runs.py` (`agent_employee.<id>`). A namespace whose writer were
+/// to record a bare name would need this function changed — that is the
+/// one place the rule lives, so both readers below agree with the writer
+/// (AGENTS.md rule 4). `OPS-9`: before this helper, both readers filtered
+/// on the bare name from the URL, so a Bronze table never showed the run
+/// the job had recorded for it.
+pub(crate) fn maintenance_history_table_name(ns: &str, table: &str) -> String {
+    format!("{ns}.{table}")
+}
+
 /// Builds the `SELECT` behind [`latest_maintenance_run`]. `table_name`
 /// narrows to one table (`WHERE table_name = {SqlLiteral} ... LIMIT 1`);
 /// `None` keeps the all-tables query byte-identical to what
 /// `GET /api/governance/maintenance` has always run (`ORDER BY run_at DESC
 /// LIMIT 500`, no `WHERE`).
+///
+/// A caller narrowing to ONE table passes the name
+/// [`maintenance_history_table_name`] built from the `{ns}`/`{table}` it
+/// was asked about — the qualified name the writer recorded (see that
+/// function's doc comment for why a bare name matches no row).
 fn maintenance_run_query(table_name: Option<&str>) -> String {
     const COLUMNS: &str = "table_name, run_at, \
         toString(dry_run_deleted_data_files) dry_data, \
@@ -620,6 +643,27 @@ pub async fn lineage(
     Query(q): Query<LineageQuery>,
 ) -> crate::error::ApiResult<ApiJson<Value>> {
     let body = crate::routes::lineage::build(&state, &principal, &headers, &q.focus).await?;
+    Ok(ApiJson(body))
+}
+
+/// `GET /api/governance/lineage/columns?table=&column=&direction=up|down`
+/// (`DATA-13`): the columns a column comes from, or the columns (and saved
+/// charts, with their dashboards) built from it, following recorded mappings
+/// up to ten hops. Same permission and tenant rules as [`lineage`]; charts
+/// and dashboards are listed only to a caller with `dashboard:read`.
+///
+/// # Errors
+///
+/// 400 for a missing or malformed parameter; 404 when `X-Tenant` names a
+/// tenant the caller does not belong to; 503 without a Postgres pool or when
+/// the shared-catalog rule cannot be evaluated; 500 on a database failure.
+pub(crate) async fn column_lineage(
+    State(state): State<AppState>,
+    axum::Extension(principal): axum::Extension<lakehouse_auth::Principal>,
+    headers: axum::http::HeaderMap,
+    Query(q): Query<crate::routes::lineage::columns::ColumnQuery>,
+) -> crate::error::ApiResult<ApiJson<Value>> {
+    let body = crate::routes::lineage::columns::read(&state, &principal, &headers, &q).await?;
     Ok(ApiJson(body))
 }
 
@@ -1521,6 +1565,225 @@ pub async fn delete_classification_rule(
     Ok(ApiJson(json!({ "ok": true, "id": rule.id })))
 }
 
+// ── /api/governance/tag-keys (DATA-12 part 2) ──────────────────────────
+
+/// Longest display name stored as `created_by` (`0083`'s CHECK).
+const TAG_KEY_ACTOR_MAX_LEN: usize = 128;
+
+fn tag_key_json(row: &lakehouse_store::governed_tag::TagKeyRow) -> Value {
+    let iso = |at: time::OffsetDateTime| {
+        at.format(&time::format_description::well_known::Rfc3339)
+            .ok()
+    };
+    json!({
+        "key": row.key,
+        "allowedValues": row.allowed_values,
+        "createdBy": row.created_by,
+        "createdAt": iso(row.created_at),
+        "updatedAt": iso(row.updated_at),
+    })
+}
+
+/// Records a tag-key change in the audit trail, on the key itself (a key is
+/// not a catalog table, so it has no Change history to join). Best-effort
+/// like every audit write here: it never fails the change it records.
+async fn audit_tag_key(state: &AppState, actor: &Principal, key: &str, action: &str, args: Value) {
+    let Some(pg) = state.pg.as_deref() else {
+        return;
+    };
+    let _ = lakehouse_store::audit::insert(
+        pg,
+        lakehouse_store::audit::NewAuditEvent {
+            principal_id: Some(actor.id.uuid().to_string()),
+            principal_kind: Some("user".to_owned()),
+            actor_label: Some(actor.display_name.clone()),
+            action: action.to_owned(),
+            resource_kind: Some("tag_key".to_owned()),
+            resource_id: Some(key.to_owned()),
+            args: Some(args),
+            outcome: "executed".to_owned(),
+            ..Default::default()
+        },
+    )
+    .await;
+}
+
+/// `GET /api/governance/tag-keys` — every defined governed tag key with the
+/// values it allows. Needs only `catalog:read` (`POLICY_TABLE`): an editor
+/// with `catalog:write` must read the list to render the value pickers, and
+/// a definition is not sensitive.
+///
+/// # Errors
+///
+/// 503 if no pool is configured; 500 (classified, never database text) on a
+/// database failure.
+pub async fn list_tag_keys(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
+) -> ApiResult<ApiJson<Vec<Value>>> {
+    // PR #106 review R2 SHOULD-FIX 2: gate list_tag_keys with catalog_tenant_refusal
+    if let Some(reason) =
+        crate::routes::catalog::catalog_tenant_refusal(&state, &principal, &headers).await?
+    {
+        return Err(ApiError::PermissionDenied(reason.to_owned()).into());
+    }
+    let rows = lakehouse_store::governed_tag::list_keys(pool(&state)?).await?;
+    Ok(ApiJson(rows.iter().map(tag_key_json).collect()))
+}
+
+/// The `POST /api/governance/tag-keys` body.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CreateTagKeyBody {
+    key: String,
+    allowed_values: Vec<String>,
+}
+
+/// `POST /api/governance/tag-keys` — define a key and the values it may
+/// take. Needs `governance:write`: only an admin creates keys (spec,
+/// "Governed tags"). Audited as `governance.tag_key_create`.
+///
+/// # Errors
+///
+/// 400 naming the field for a malformed body, a key or value that is not
+/// 1-64 characters matching `^[a-z0-9][a-z0-9_-]*$`, an empty or repeating
+/// list, or more than 50 values; 409 when the key already exists; 503/500
+/// as above.
+pub async fn create_tag_key(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<ApiJson<Value>> {
+    // PR #106 review R1 BLOCKER 1
+    if let Some(reason) =
+        crate::routes::catalog::catalog_tenant_refusal(&state, &principal, &headers).await?
+    {
+        return Err(ApiError::PermissionDenied(reason.to_owned()).into());
+    }
+    let body: CreateTagKeyBody = parse_body(&body)?;
+    let created_by: String = principal
+        .display_name
+        .chars()
+        .take(TAG_KEY_ACTOR_MAX_LEN)
+        .collect();
+    let row = lakehouse_store::governed_tag::create_key(
+        pool(&state)?,
+        &body.key,
+        &body.allowed_values,
+        &created_by,
+    )
+    .await
+    .map_err(|err| match err {
+        lakehouse_store::StoreError::Conflict => {
+            ApiError::Conflict(format!("the tag key \"{}\" already exists", body.key))
+        }
+        other => ApiError::from(other),
+    })?;
+    audit_tag_key(
+        &state,
+        &principal,
+        &row.key,
+        "governance.tag_key_create",
+        json!({ "allowedValues": row.allowed_values }),
+    )
+    .await;
+    Ok(ApiJson(tag_key_json(&row)))
+}
+
+/// The `PUT /api/governance/tag-keys/{key}` body. Only the values change: a
+/// key is never renamed, so a `key` field is refused rather than ignored.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UpdateTagKeyBody {
+    allowed_values: Vec<String>,
+}
+
+/// `PUT /api/governance/tag-keys/{key}` — replace the values a key allows.
+/// Needs `governance:write`. A value some table still has cannot be removed:
+/// the refusal names each such value with its table count and nothing
+/// changes. Audited as `governance.tag_key_update`.
+///
+/// # Errors
+///
+/// 400 for a malformed body (including a `key` field), the value rules of
+/// [`create_tag_key`], or a removed value still in use; 404 when the key is
+/// not defined; 503/500 as above.
+pub async fn update_tag_key(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(key): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<ApiJson<Value>> {
+    // PR #106 review R1 BLOCKER 1
+    if let Some(reason) =
+        crate::routes::catalog::catalog_tenant_refusal(&state, &principal, &headers).await?
+    {
+        return Err(ApiError::PermissionDenied(reason.to_owned()).into());
+    }
+    let body: UpdateTagKeyBody = parse_body(&body)?;
+    let row =
+        lakehouse_store::governed_tag::update_key_values(pool(&state)?, &key, &body.allowed_values)
+            .await
+            .map_err(|err| match err {
+                lakehouse_store::StoreError::NotFound => tag_key_not_found(&key),
+                other => ApiError::from(other),
+            })?;
+    audit_tag_key(
+        &state,
+        &principal,
+        &row.key,
+        "governance.tag_key_update",
+        json!({ "allowedValues": row.allowed_values }),
+    )
+    .await;
+    Ok(ApiJson(tag_key_json(&row)))
+}
+
+/// `DELETE /api/governance/tag-keys/{key}` — remove a key nobody uses.
+/// Needs `governance:write`. Refused while any table has a value for it, with
+/// the number of tables in the sentence: a tag is never lost silently.
+/// Audited as `governance.tag_key_delete`.
+///
+/// # Errors
+///
+/// 400 when a table still has a value for the key; 404 when the key is not
+/// defined; 503/500 as above.
+pub async fn delete_tag_key(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(key): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<ApiJson<Value>> {
+    // PR #106 review R1 BLOCKER 1
+    if let Some(reason) =
+        crate::routes::catalog::catalog_tenant_refusal(&state, &principal, &headers).await?
+    {
+        return Err(ApiError::PermissionDenied(reason.to_owned()).into());
+    }
+    lakehouse_store::governed_tag::delete_key(pool(&state)?, &key)
+        .await
+        .map_err(|err| match err {
+            lakehouse_store::StoreError::NotFound => tag_key_not_found(&key),
+            other => ApiError::from(other),
+        })?;
+    audit_tag_key(
+        &state,
+        &principal,
+        &key,
+        "governance.tag_key_delete",
+        json!({}),
+    )
+    .await;
+    Ok(ApiJson(json!({ "ok": true, "key": key })))
+}
+
+fn tag_key_not_found(key: &str) -> ApiError {
+    ApiError::NotFound(format!("the tag key \"{key}\" is not defined"))
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -1573,7 +1836,10 @@ mod tests {
     fn preview_body_reports_unmeasured_when_conditions_do_not_parse() {
         let v = preview_result_json(None, None);
         assert!(v["affectedRows"].is_null());
-        assert!(v["maskedColumns"].as_array().unwrap().is_empty());
+        assert_eq!(
+            v["maskedColumns"].as_array().unwrap().as_slice(),
+            &[] as &[serde_json::Value]
+        );
         assert_eq!(v["supported"], json!(false));
     }
 
@@ -1656,6 +1922,50 @@ mod tests {
         assert!(sql.contains("WHERE table_name = 'o''rders'"));
     }
 
+    /// `OPS-9`: the per-table read narrows on the qualified name the
+    /// maintenance job records ([`maintenance_history_table_name`]), which
+    /// is what makes a Bronze table's last run visible at all.
+    #[test]
+    fn maintenance_run_query_for_one_bronze_table_filters_the_qualified_name() {
+        let sql = maintenance_run_query(Some(&maintenance_history_table_name("bronze", "orders")));
+
+        assert!(sql.contains("WHERE table_name = 'bronze.orders'"));
+        assert!(sql.contains("ORDER BY run_at DESC LIMIT 1"));
+    }
+
+    /// `OPS-9`, on the wire: the narrowed query `ClickHouse` receives is
+    /// the qualified name, proven by a mock that only answers that SQL.
+    #[tokio::test]
+    async fn latest_maintenance_run_for_one_table_sends_the_qualified_recorded_name() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::body_string_contains(
+                "table_name = 'bronze.orders'",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{
+                    "table_name": "bronze.orders",
+                    "run_at": "2026-01-01T00:00:00Z",
+                    "dry_data": "0", "dry_manifests": "0",
+                    "applied_data": "1", "applied_manifests": "0",
+                    "skipped_verbs": "",
+                }],
+            })))
+            .mount(&server)
+            .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+
+        let rows = latest_maintenance_run(
+            &ch,
+            Some(&maintenance_history_table_name("bronze", "orders")),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["tableName"], json!("bronze.orders"));
+    }
+
     /// Real precedent, cited in this task's plan: `lakehouse-clickhouse/
     /// src/lib.rs:401+`'s `wiremock`-backed `ChClient` tests — this
     /// module has no live-`ClickHouse` integration test of its own, so
@@ -1730,7 +2040,7 @@ mod tests {
 
         let rows = ingest_runs_or_empty(&ch, "conn-x").await.unwrap();
 
-        assert!(rows.is_empty());
+        assert_eq!(rows, [] as [crate::routes::governance::IngestRunRow; 0]);
     }
 
     #[tokio::test]
@@ -1944,5 +2254,367 @@ mod tests {
             .map(|r| r.get("id").and_then(Value::as_str).unwrap())
             .collect();
         assert_eq!(ids, vec!["b", "c", "a"]);
+    }
+
+    // ── DATA-12 part 2: governed tag keys ────────────────────────────────
+    mod tag_key_handlers {
+        #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+        use std::collections::HashMap;
+
+        use lakehouse_auth::{PermissionSet, PrincipalId};
+        // Force-links `lakehouse-test-support` so its `#[ctor]` Postgres
+        // testcontainer bootstrap runs for this test binary.
+        use lakehouse_test_support as _;
+        use uuid::Uuid;
+
+        use super::super::*;
+        use crate::config::Config;
+        use crate::error::ApiRejection;
+
+        fn state_for(pool: &lakehouse_store::PgPool) -> AppState {
+            let options = pool.connect_options();
+            let mut env = HashMap::new();
+            env.insert(
+                "DATABASE_URL".to_owned(),
+                format!(
+                    "postgres://{}:postgres@{}:{}/{}",
+                    options.get_username(),
+                    options.get_host(),
+                    options.get_port(),
+                    options.get_database().expect("a named database"),
+                ),
+            );
+            AppState::new(Config::from_map(&env).expect("a valid test Config"))
+        }
+
+        // PR #106 review R2 BLOCKER 8: happy-path tests use an unrestricted (*:*) caller
+        // so the fail-closed catalog_tenant_refusal gate allows tag key writes.
+        fn admin() -> Principal {
+            Principal {
+                id: PrincipalId::User(Uuid::new_v4()),
+                tenant_ids: Vec::new(),
+                display_name: "Rina Admin".to_owned(),
+                permissions: PermissionSet::parse("governance:write,*:*"),
+                provider: "session".to_owned(),
+                must_change_password: false,
+                role_names: Vec::new(),
+            }
+        }
+
+        async fn answer<T: serde::Serialize>(
+            result: Result<ApiJson<T>, ApiRejection>,
+        ) -> (StatusCode, Value) {
+            let response = match result {
+                Ok(ok) => ok.into_response(),
+                Err(rejection) => rejection.into_response(),
+            };
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (status, serde_json::from_slice(&bytes).unwrap_or_default())
+        }
+
+        async fn create(state: &AppState, body: &str) -> (StatusCode, Value) {
+            answer(
+                create_tag_key(
+                    State(state.clone()),
+                    Extension(admin()),
+                    HeaderMap::new(),
+                    Bytes::copy_from_slice(body.as_bytes()),
+                )
+                .await,
+            )
+            .await
+        }
+
+        async fn update(state: &AppState, key: &str, body: &str) -> (StatusCode, Value) {
+            answer(
+                update_tag_key(
+                    State(state.clone()),
+                    Extension(admin()),
+                    Path(key.to_owned()),
+                    HeaderMap::new(),
+                    Bytes::copy_from_slice(body.as_bytes()),
+                )
+                .await,
+            )
+            .await
+        }
+
+        async fn remove(state: &AppState, key: &str) -> (StatusCode, Value) {
+            answer(
+                delete_tag_key(
+                    State(state.clone()),
+                    Extension(admin()),
+                    Path(key.to_owned()),
+                    HeaderMap::new(),
+                )
+                .await,
+            )
+            .await
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_tag_key_is_defined_listed_widened_and_deleted_and_each_step_is_audited(
+            pool: lakehouse_store::PgPool,
+        ) {
+            let state = state_for(&pool);
+            let (status, made) = create(
+                &state,
+                r#"{"key":"data_domain","allowedValues":["finance","ops"]}"#,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(made["key"], json!("data_domain"));
+            assert_eq!(made["allowedValues"], json!(["finance", "ops"]));
+            assert_eq!(made["createdBy"], json!("Rina Admin"));
+
+            let (_, listed) = answer(
+                list_tag_keys(State(state.clone()), Extension(admin()), HeaderMap::new()).await,
+            )
+            .await;
+            assert_eq!(listed.as_array().unwrap().len(), 1);
+            assert_eq!(listed[0]["allowedValues"], json!(["finance", "ops"]));
+
+            let (status, widened) = update(
+                &state,
+                "data_domain",
+                r#"{"allowedValues":["finance","ops","hr"]}"#,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(widened["allowedValues"], json!(["finance", "ops", "hr"]));
+
+            let (status, gone) = remove(&state, "data_domain").await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(gone, json!({ "ok": true, "key": "data_domain" }));
+
+            let actions: Vec<String> = sqlx::query_scalar(
+                "SELECT action FROM audit_event WHERE resource_kind = 'tag_key' \
+                 AND resource_id = 'data_domain' ORDER BY at",
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                actions,
+                vec![
+                    "governance.tag_key_create",
+                    "governance.tag_key_update",
+                    "governance.tag_key_delete"
+                ]
+            );
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn tag_key_refusals_name_the_field_and_store_nothing(pool: lakehouse_store::PgPool) {
+            let state = state_for(&pool);
+            let cases = [
+                (r#"{"key":"Bad Key","allowedValues":["a"]}"#, "key"),
+                (r#"{"key":"k","allowedValues":[]}"#, "allowedValues"),
+                (
+                    r#"{"key":"k","allowedValues":["Finance"]}"#,
+                    "allowedValues",
+                ),
+                (r#"{"key":"k","allowedValues":["a","a"]}"#, "allowedValues"),
+                (r#"{"key":"k"}"#, "allowedValues"),
+                ("not json", "invalid JSON"),
+            ];
+            for (body, names) in cases {
+                let (status, answer) = create(&state, body).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+                let message = answer["error"].as_str().unwrap();
+                assert!(message.contains(names), "{body}: {message}");
+            }
+            let many: Vec<String> = (0..51).map(|i| format!("\"v{i}\"")).collect();
+            let (status, answer) = create(
+                &state,
+                &format!(r#"{{"key":"k","allowedValues":[{}]}}"#, many.join(",")),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(answer["error"].as_str().unwrap().contains("at most 50"));
+
+            let stored: i64 = sqlx::query_scalar("SELECT count(*) FROM governed_tag_key")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(stored, 0);
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_duplicate_tag_key_is_409_a_missing_one_is_404_and_a_rename_is_refused(
+            pool: lakehouse_store::PgPool,
+        ) {
+            let state = state_for(&pool);
+            let body = r#"{"key":"tier","allowedValues":["gold"]}"#;
+            assert_eq!(create(&state, body).await.0, StatusCode::OK);
+            let (status, again) = create(&state, body).await;
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert!(again["error"].as_str().unwrap().contains("\"tier\""));
+
+            assert_eq!(
+                update(&state, "nope", r#"{"allowedValues":["a"]}"#).await.0,
+                StatusCode::NOT_FOUND
+            );
+            assert_eq!(remove(&state, "nope").await.0, StatusCode::NOT_FOUND);
+
+            let (status, rename) = update(
+                &state,
+                "tier",
+                r#"{"key":"level","allowedValues":["gold"]}"#,
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(rename["error"].as_str().unwrap().contains("key"));
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_tag_key_in_use_cannot_lose_a_value_or_be_deleted_and_the_answer_counts_tables(
+            pool: lakehouse_store::PgPool,
+        ) {
+            let state = state_for(&pool);
+            create(
+                &state,
+                r#"{"key":"data_domain","allowedValues":["finance","ops"]}"#,
+            )
+            .await;
+            for asset in ["silver.a", "silver.b"] {
+                lakehouse_store::governed_tag::set_asset_tags(
+                    &pool,
+                    asset,
+                    &[("data_domain".to_owned(), "ops".to_owned())],
+                    "Rina",
+                )
+                .await
+                .unwrap();
+            }
+
+            let (status, refused) =
+                update(&state, "data_domain", r#"{"allowedValues":["finance"]}"#).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(refused["error"].as_str().unwrap().contains("\"ops\" (2)"));
+
+            let (status, refused) = remove(&state, "data_domain").await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(refused["error"].as_str().unwrap().contains("2 tables"));
+
+            let kept: Vec<String> = sqlx::query_scalar(
+                "SELECT unnest(allowed_values) FROM governed_tag_key ORDER BY 1",
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            assert_eq!(kept, vec!["finance", "ops"], "a refusal changes nothing");
+        }
+
+        // PR #106 review R1 BLOCKER 1
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_caller_outside_the_catalog_tenant_is_refused_every_tag_key_write(
+            pool: lakehouse_store::PgPool,
+        ) {
+            let t1 = Uuid::new_v4();
+            let t2 = Uuid::new_v4();
+            sqlx::query("INSERT INTO tenant (id, name, slug, plan, residency) VALUES ($1, 'T1', 't1', 'Standard', 'US'), ($2, 'T2', 't2', 'Standard', 'US')")
+                .bind(t1)
+                .bind(t2)
+                .execute(&pool)
+                .await
+                .unwrap();
+
+            let options = pool.connect_options();
+            let mut env = HashMap::new();
+            env.insert(
+                "DATABASE_URL".to_owned(),
+                format!(
+                    "postgres://{}:postgres@{}:{}/{}",
+                    options.get_username(),
+                    options.get_host(),
+                    options.get_port(),
+                    options.get_database().expect("a named database"),
+                ),
+            );
+            env.insert("CATALOG_TENANT_ID".to_owned(), t1.to_string());
+            let state = AppState::new(Config::from_map(&env).expect("a valid test Config"));
+
+            let outside_caller = Principal {
+                id: PrincipalId::User(Uuid::new_v4()),
+                tenant_ids: vec![t2],
+                display_name: "Outsider".to_owned(),
+                permissions: PermissionSet::parse("governance:write"),
+                provider: "session".to_owned(),
+                must_change_password: false,
+                role_names: Vec::new(),
+            };
+
+            // PR #106 review R2 SHOULD-FIX 2: list_tag_keys is refused for outside caller
+            let (status, resp) = answer(
+                list_tag_keys(
+                    State(state.clone()),
+                    Extension(outside_caller.clone()),
+                    HeaderMap::new(),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert!(resp["error"].as_str().unwrap().contains(
+                "this deployment's shared catalog is owned by the tenant named in CATALOG_TENANT_ID"
+            ));
+
+            let (status, resp) = answer(
+                create_tag_key(
+                    State(state.clone()),
+                    Extension(outside_caller.clone()),
+                    HeaderMap::new(),
+                    Bytes::from_static(br#"{"key":"outside_key","allowedValues":["v1"]}"#),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert!(resp["error"].as_str().unwrap().contains(
+                "this deployment's shared catalog is owned by the tenant named in CATALOG_TENANT_ID"
+            ));
+
+            let (status, resp) = answer(
+                update_tag_key(
+                    State(state.clone()),
+                    Extension(outside_caller.clone()),
+                    Path("outside_key".to_owned()),
+                    HeaderMap::new(),
+                    Bytes::from_static(br#"{"allowedValues":["v1","v2"]}"#),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert!(resp["error"].as_str().unwrap().contains(
+                "this deployment's shared catalog is owned by the tenant named in CATALOG_TENANT_ID"
+            ));
+
+            let (status, resp) = answer(
+                delete_tag_key(
+                    State(state.clone()),
+                    Extension(outside_caller),
+                    Path("outside_key".to_owned()),
+                    HeaderMap::new(),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert!(resp["error"].as_str().unwrap().contains(
+                "this deployment's shared catalog is owned by the tenant named in CATALOG_TENANT_ID"
+            ));
+
+            let stored: i64 = sqlx::query_scalar("SELECT count(*) FROM governed_tag_key")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(stored, 0);
+        }
     }
 }

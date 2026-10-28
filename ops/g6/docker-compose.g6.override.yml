@@ -484,6 +484,69 @@ services:
     entrypoint: ["/bin/sh", "-c"]
     command: ["pip install -q requests psycopg2-binary && python src13_discovery_scale_test.py"]
 
+  # SRC-3 (T1.12, AD9): the runner of `ops/g6/g6_saas_test.py`, the gate of the business-app
+  # connectors. A job of its own (`g6-saas`, profile `g6-saas`), so no existing connector gate
+  # grows past its 20 minutes. Since the slice 2 review (BLOCKER 4) the gate goes through the
+  # product: connectors created through the API, the API's connection test, discovery and loads
+  # through Dagster into Bronze Iceberg, read back through ClickHouse. So it needs what the
+  # `g6-test-runner` needs (Dagster, ClickHouse, the credential volume) plus the mock vendor
+  # server. The shared Dagster image because it already holds `requests` and the vendor modules the
+  # in-process steps import; same `image:` key and `GIT_SHA` arg as `g6-ops-test-runner`.
+  # The two gate-only switches and `SAAS_GATE_ORIGINS` that make the product reach the mock are
+  # in `docker-compose.g6-saas.override.yml`, which only this job layers on.
+  g6-saas-test-runner:
+    profiles: ["g6-saas"]
+    image: ${LAKEHOUSE_DAGSTER_IMAGE:-rantai-lakehouse-dagster:local}
+    build:
+      context: ./dagster
+      dockerfile: Dockerfile
+      args:
+        GIT_SHA: ${GIT_SHA:-unknown}
+    working_dir: /work
+    volumes:
+      - ./ops/g6:/work:ro
+      - ./ops/gates:/opt/gates:ro
+      # Where the gate writes each connector's credential value, under the name the API derived
+      # (ADR 0002 Addendum 3); the API and Dagster mount the same volume read-only.
+      - type: volume
+        source: g6_secrets
+        target: /gate-secrets
+    depends_on:
+      lakehouse-api:
+        condition: service_started
+      dagster-code-location:
+        condition: service_started
+      saas-stub-g6:
+        condition: service_started
+    environment:
+      LAKEHOUSE_API_URL: http://lakehouse-api:8080
+      DAGSTER_URL: http://dagster-webserver:3000/graphql
+      SAAS_STUB_URL: http://saas-stub-g6:8080
+      CH_URL: http://clickhouse:8123
+      CH_USER: ${CH_USER:-default}
+      CH_PASSWORD: ${CH_PASSWORD:-}
+      CH_LAKEKEEPER_CATALOG_URI: http://lakekeeper:8181/catalog
+      LAKEKEEPER_WAREHOUSE: ${LAKEKEEPER_WAREHOUSE:-default}
+      CH_RUSTFS_S3_ENDPOINT: http://rustfs:9000
+      CH_OAUTH_CLIENT_ID: clickhouse-reader
+      CH_OAUTH_SERVER_URI: http://oidc-mock:8090/token
+      AUTH_BOOTSTRAP_EMAIL: ${AUTH_BOOTSTRAP_EMAIL:-}
+      AUTH_BOOTSTRAP_PASSWORD: ${AUTH_BOOTSTRAP_PASSWORD:-}
+      # SRC-3 V-HubSpot.4: the vendor steps run the vendor modules in this container against
+      # the mock vendor on its per-vendor ports (`SAAS_GATE_ORIGINS` is built by the script from
+      # `saas_stub.VENDOR_PORTS`). GATE-ONLY, like the two switches in this file's first
+      # comment: the mock speaks plain `http` at an internal address, which the product
+      # refuses unless these are on. The main compose file sets neither.
+      CONNECTOR_OAUTH_ALLOW_HTTP: "true"
+      INGEST_ALLOW_INTERNAL_HOSTS: "true"
+      # SRC-3 AD9 amended (slice 6): the vendors this job owns, comma separated. `g6-saas-a` and
+      # `g6-saas-b` set it; empty (a local run) means every vendor.
+      SAAS_GATE_VENDORS: ${SAAS_GATE_VENDORS:-}
+      PYTHONPATH: /opt/gates
+      PYTHONDONTWRITEBYTECODE: "1"
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["pip install -q requests && python g6_saas_test.py"]
+
 # PR #105 CI fix (SEC-10): a fixed subnet for the project's default network,
 # so `WEBHOOK_ALLOWED_CIDRS` on `lakehouse-api` can name exactly the network
 # the `g6-alerts` receiver lives on instead of a broad private range. The

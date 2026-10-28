@@ -41,6 +41,9 @@
 //! * JIT provisioning is opt-in, default off — [`OidcConfig::jit_provisioning`].
 //! * Claim-to-role mapping — [`OidcAuthenticator::mapped_permissions`]; see
 //!   its doc comment for the union-with-local-roles precedence rule and why.
+//! * A group overage is said, not silent — [`OidcClaims::has_claim_overage`]
+//!   detects the marker a provider sends instead of the groups claim, and
+//!   [`OidcLogin::notice`] carries the caveat the console shows (`SEC-39`).
 
 use std::collections::HashMap;
 use std::sync::RwLock;
@@ -51,6 +54,7 @@ use jsonwebtoken::jwk::{AlgorithmParameters, Jwk, JwkSet};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use serde::Deserialize;
 use serde_json::Value;
+use url::Url;
 use uuid::Uuid;
 
 use crate::authenticator::Authenticator;
@@ -96,8 +100,24 @@ const ALLOWED_ALGORITHMS: &[Algorithm] = &[
 
 /// How long a fetched JWKS is trusted before [`JwksClient`] will fetch it
 /// again, absent a cache miss forcing an earlier refetch (see
-/// [`JwksClient::key_for`]'s doc comment for the rotation path).
+/// [`JwksClient::key_for`]'s doc comment for the rotation path). The same
+/// TTL applies to a discovery document [`JwksClient`] had to read to learn
+/// the key set's address (`SEC-38`).
 const DEFAULT_JWKS_TTL: StdDuration = StdDuration::from_secs(300);
+
+/// The `OpenID Connect` Discovery 1.0 document path, appended to the
+/// configured issuer when no explicit key-set address is configured
+/// (`SEC-38`, discovery section 4). Entra ID and Google both publish their
+/// keys at a `jwks_uri` named there; neither serves a key set at the
+/// `{issuer}/.well-known/jwks.json` path this module used to assume.
+const DISCOVERY_PATH: &str = "/.well-known/openid-configuration";
+
+/// The claim `OpenID Connect` providers use to say that another claim's
+/// values did not fit in the token and live in a separate source instead —
+/// Entra ID's "overage". `_claim_names` names the claim (and a source
+/// key), `_claim_sources` holds the source's location. `SEC-39` reads only
+/// the presence of the marker, never the source it names.
+const CLAIM_NAMES: &str = "_claim_names";
 
 /// The default `leeway` (in seconds) applied to `exp`/`nbf` validation when
 /// [`OidcConfig::clock_skew_seconds`] is not overridden. Matches
@@ -126,8 +146,15 @@ pub struct OidcConfig {
     /// [`crate::Principal::provider`] and the `auth_identity.provider`
     /// value this authenticator reads and writes.
     pub provider_name: String,
-    /// The URL [`JwksClient`] fetches the provider's signing keys from.
-    pub jwks_url: String,
+    /// The URL [`JwksClient`] fetches the provider's signing keys from,
+    /// when the operator set one explicitly (`OIDC_JWKS_URL`).
+    ///
+    /// `None` means: read the address from the provider's `OpenID Connect`
+    /// discovery document (`{issuer}/.well-known/openid-configuration`,
+    /// its `jwks_uri` member) on the first key lookup — `SEC-38`. An
+    /// explicit address always wins, and then no discovery request is ever
+    /// made.
+    pub jwks_url: Option<String>,
     /// Whether an unrecognized `sub` (no existing `auth_identity` row) is
     /// allowed to provision a new `app_user` on the spot. Defaults to
     /// `false` at the config layer — see [`crate::authenticator`] module
@@ -148,8 +175,8 @@ pub struct OidcConfig {
 
 impl OidcConfig {
     /// Build a config with [`DEFAULT_CLOCK_SKEW_SECONDS`] clock skew, no
-    /// role mapping, and JIT provisioning off — the safe defaults a caller
-    /// only needs to override explicitly.
+    /// role mapping, JIT provisioning off, and `jwks_url` set explicitly —
+    /// the safe defaults a caller only needs to override explicitly.
     #[must_use]
     pub fn new(
         issuer: impl Into<String>,
@@ -161,7 +188,27 @@ impl OidcConfig {
             issuer: issuer.into(),
             client_id: client_id.into(),
             provider_name: provider_name.into(),
-            jwks_url: jwks_url.into(),
+            jwks_url: Some(jwks_url.into()),
+            jit_provisioning: false,
+            role_map: HashMap::new(),
+            groups_claim: "groups".to_owned(),
+            clock_skew_seconds: DEFAULT_CLOCK_SKEW_SECONDS,
+        }
+    }
+
+    /// Same as [`Self::new`], but with no explicit key-set address: the
+    /// address is read from `issuer`'s discovery document (`SEC-38`).
+    #[must_use]
+    pub fn with_discovery(
+        issuer: impl Into<String>,
+        client_id: impl Into<String>,
+        provider_name: impl Into<String>,
+    ) -> Self {
+        Self {
+            issuer: issuer.into(),
+            client_id: client_id.into(),
+            provider_name: provider_name.into(),
+            jwks_url: None,
             jit_provisioning: false,
             role_map: HashMap::new(),
             groups_claim: "groups".to_owned(),
@@ -184,6 +231,43 @@ struct CachedJwks {
     fetched_at: Instant,
 }
 
+/// One cached discovery read: the `jwks_uri` a provider's discovery
+/// document named, with the time it was read (`SEC-38`). Cached for the
+/// same [`JwksClient::ttl`] as the key set itself, per the plan's decision
+/// 2 — a discovery document is no more trustworthy for longer than the
+/// keys it points at.
+struct CachedDiscovery {
+    url: String,
+    fetched_at: Instant,
+}
+
+/// The subset of an `OpenID Connect` Discovery 1.0 document this module
+/// reads (`SEC-38`, section 4). Unknown members are ignored, as the
+/// specification allows a provider to add its own.
+#[derive(Debug, Deserialize)]
+struct DiscoveryDocument {
+    /// The issuer identifier the provider claims. Trusted only when it
+    /// equals the configured issuer exactly (discovery section 4.3).
+    issuer: String,
+    /// The key set's absolute URL.
+    jwks_uri: String,
+}
+
+/// Where a [`JwksClient`] learns the key set's address from.
+enum JwksSource {
+    /// An operator-set address (`OIDC_JWKS_URL`): used exactly as given,
+    /// with no discovery request at all (`SEC-38`, decision 1).
+    Fixed(String),
+    /// The provider's discovery document, read lazily on the first key
+    /// lookup and again on the refresh moments [`JwksClient::key_for`]
+    /// documents (`SEC-38`, decision 2).
+    Discovery {
+        /// The configured issuer, used both to build the discovery
+        /// document's address and to check the document's own `issuer`.
+        issuer: String,
+    },
+}
+
 /// Fetches and caches a provider's JSON Web Key Set.
 ///
 /// # Why caching is load-bearing, not an optimization
@@ -196,11 +280,19 @@ struct CachedJwks {
 /// "one fetch per request" into "one fetch per [`DEFAULT_JWKS_TTL`]
 /// window, plus one extra fetch the instant a `kid` this service hasn't
 /// seen shows up" — see [`Self::key_for`].
+///
+/// # Where the key set lives
+///
+/// With an explicit address ([`Self::new`], [`Self::with_ttl`]) it is
+/// fetched from there. Without one ([`Self::discovering`]) the address
+/// comes from the provider's discovery document, so `OIDC_JWKS_URL` is
+/// optional (`SEC-38`).
 pub struct JwksClient {
-    url: String,
+    source: JwksSource,
     http: reqwest::Client,
     ttl: StdDuration,
     cache: RwLock<Option<CachedJwks>>,
+    discovery: RwLock<Option<CachedDiscovery>>,
 }
 
 impl JwksClient {
@@ -215,20 +307,46 @@ impl JwksClient {
     /// waiting [`DEFAULT_JWKS_TTL`] in real time.
     #[must_use]
     pub fn with_ttl(url: impl Into<String>, ttl: StdDuration) -> Self {
+        Self::with_source(JwksSource::Fixed(url.into()), ttl)
+    }
+
+    /// Build a client that reads the key set's address from `issuer`'s
+    /// discovery document (`{issuer}/.well-known/openid-configuration`),
+    /// caching the address and the keys for `ttl` (`SEC-38`).
+    #[must_use]
+    pub fn discovering(issuer: impl Into<String>, ttl: StdDuration) -> Self {
+        Self::with_source(
+            JwksSource::Discovery {
+                issuer: issuer.into(),
+            },
+            ttl,
+        )
+    }
+
+    /// The one place a [`JwksClient`]'s fields are assembled, so every
+    /// constructor caches the same way.
+    fn with_source(source: JwksSource, ttl: StdDuration) -> Self {
         Self {
-            url: url.into(),
+            source,
             http: reqwest::Client::new(),
             ttl,
             cache: RwLock::new(None),
+            discovery: RwLock::new(None),
         }
     }
 
-    /// Fetch the JWKS document fresh over HTTP. Never consults or updates
-    /// the cache itself — callers decide when a fetch is warranted.
-    async fn fetch(&self) -> Result<JwkSet, AuthError> {
+    /// `GET url` and parse the body as `T`. Every transport, status and
+    /// parse failure folds into [`AuthError::InvalidCredentials`]: a
+    /// provider that cannot serve its own (public) configuration makes no
+    /// token verifiable here, and the caller must not learn which upstream
+    /// step failed (principle 4).
+    async fn get_json<T>(&self, url: &str) -> Result<T, AuthError>
+    where
+        T: serde::de::DeserializeOwned,
+    {
         let response = self
             .http
-            .get(&self.url)
+            .get(url)
             .send()
             .await
             .map_err(|_| AuthError::InvalidCredentials)?;
@@ -236,9 +354,92 @@ impl JwksClient {
             return Err(AuthError::InvalidCredentials);
         }
         response
-            .json::<JwkSet>()
+            .json::<T>()
             .await
             .map_err(|_| AuthError::InvalidCredentials)
+    }
+
+    /// The `jwks_uri` from the cached discovery document, but only if it is
+    /// still within [`Self::ttl`] — the mirror of [`Self::cached_key`].
+    fn cached_discovery_url(&self) -> Option<String> {
+        let guard = self.discovery.read().ok()?;
+        let cached = guard.as_ref()?;
+        if cached.fetched_at.elapsed() >= self.ttl {
+            return None;
+        }
+        Some(cached.url.clone())
+    }
+
+    /// Read `issuer`'s discovery document and return its `jwks_uri`.
+    ///
+    /// The document is trusted only when its own `issuer` equals `issuer`
+    /// exactly (Discovery 1.0 section 4.3) and `jwks_uri` is an absolute
+    /// `https` URL (`http` only when the issuer itself is `http`, i.e. a
+    /// local test provider such as `ops/oidc-mock`). Each refusal logs
+    /// which check failed, by name only — the provider's text never
+    /// becomes a response, and its document is never echoed into a log
+    /// line.
+    ///
+    /// The issuer and the document are administrator configuration, never
+    /// request input, so the connector address allowlist does not apply
+    /// here — the same reasoning `crate::openfga`'s module doc gives for
+    /// its own dialer.
+    async fn discover(&self, issuer: &str) -> Result<String, AuthError> {
+        let document_url = format!("{}{DISCOVERY_PATH}", issuer.trim_end_matches('/'));
+        let document: DiscoveryDocument = self.get_json(&document_url).await.inspect_err(|_| {
+            tracing::warn!(
+                issuer = %issuer,
+                reason = "discovery document could not be read",
+                "OIDC discovery failed; no token can be verified"
+            );
+        })?;
+        if document.issuer != issuer {
+            tracing::warn!(
+                issuer = %issuer,
+                reason = "discovery issuer does not equal the configured issuer",
+                "OIDC discovery refused"
+            );
+            return Err(AuthError::InvalidCredentials);
+        }
+        if !jwks_uri_is_allowed(&document.jwks_uri, issuer) {
+            tracing::warn!(
+                issuer = %issuer,
+                reason = "discovery jwks_uri is not an absolute https URL",
+                "OIDC discovery refused"
+            );
+            return Err(AuthError::InvalidCredentials);
+        }
+        if let Ok(mut guard) = self.discovery.write() {
+            *guard = Some(CachedDiscovery {
+                url: document.jwks_uri.clone(),
+                fetched_at: Instant::now(),
+            });
+        }
+        Ok(document.jwks_uri)
+    }
+
+    /// The address this client reads the key set from. `refresh_discovery`
+    /// forces a fresh discovery read even while the cached address is
+    /// still within [`Self::ttl`] — the unknown-`kid` path in
+    /// [`Self::key_for`].
+    async fn jwks_url(&self, refresh_discovery: bool) -> Result<String, AuthError> {
+        match &self.source {
+            JwksSource::Fixed(url) => Ok(url.clone()),
+            JwksSource::Discovery { issuer } => {
+                if !refresh_discovery && let Some(url) = self.cached_discovery_url() {
+                    return Ok(url);
+                }
+                self.discover(issuer).await
+            }
+        }
+    }
+
+    /// Fetch the JWKS document fresh over HTTP. Never consults or updates
+    /// the key-set cache itself — callers decide when a fetch is
+    /// warranted. `refresh_discovery` is forwarded to [`Self::jwks_url`].
+    async fn fetch(&self, refresh_discovery: bool) -> Result<JwkSet, AuthError> {
+        let url = self.jwks_url(refresh_discovery).await?;
+        self.get_json::<JwkSet>(&url).await
     }
 
     /// Look for `kid` in the cached JWKS, but only if the cache is still
@@ -253,6 +454,18 @@ impl JwksClient {
             return None;
         }
         decoding_key_from_jwk(cached.set.find(kid)?).ok()
+    }
+
+    /// Whether the key-set cache holds a set that is still within
+    /// [`Self::ttl`] — i.e. whether [`Self::cached_key`] returning `None`
+    /// means "this `kid` is unknown" rather than "the cache is cold or
+    /// expired".
+    fn cache_is_fresh(&self) -> bool {
+        self.cache
+            .read()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|c| c.fetched_at.elapsed() < self.ttl))
+            .unwrap_or(false)
     }
 
     /// Resolve `kid` to a [`DecodingKey`], fetching the JWKS if (and only
@@ -271,6 +484,11 @@ impl JwksClient {
     /// supplied `kid`) is rejected — see the caller,
     /// [`OidcAuthenticator::validate_token`].
     ///
+    /// With discovery (`SEC-38`), a `kid` a *fresh* cached set doesn't know
+    /// also re-reads the discovery document: the provider may have moved
+    /// its keys, not just rotated them. A cold or expired cache re-reads it
+    /// anyway, because the cached address carries the same TTL.
+    ///
     /// # Errors
     ///
     /// Returns [`AuthError::InvalidCredentials`] if the JWKS can't be
@@ -280,7 +498,7 @@ impl JwksClient {
         if let Some(key) = self.cached_key(kid) {
             return Ok(key);
         }
-        let set = self.fetch().await?;
+        let set = self.fetch(self.cache_is_fresh()).await?;
         let key = set
             .find(kid)
             .and_then(|jwk| decoding_key_from_jwk(jwk).ok());
@@ -291,6 +509,27 @@ impl JwksClient {
             });
         }
         key.ok_or(AuthError::InvalidCredentials)
+    }
+}
+
+/// Whether a discovery document's `jwks_uri` may be used (`SEC-38`,
+/// decision 3): it must be an absolute URL with a host, served over
+/// `https` — or over `http` only when the configured issuer is itself
+/// `http`, which is how this repository's local test providers
+/// (`ops/oidc-mock`, Keycloak on the compose network) are reached. A
+/// document that arrived over `https` therefore never downgrades its key
+/// set to plaintext.
+fn jwks_uri_is_allowed(jwks_uri: &str, issuer: &str) -> bool {
+    let Ok(parsed) = Url::parse(jwks_uri) else {
+        return false;
+    };
+    if parsed.host_str().is_none() {
+        return false;
+    }
+    match parsed.scheme() {
+        "https" => true,
+        "http" => Url::parse(issuer).is_ok_and(|issuer| issuer.scheme() == "http"),
+        _ => false,
     }
 }
 
@@ -362,6 +601,61 @@ impl OidcClaims {
             _ => Vec::new(),
         }
     }
+
+    /// Whether `claim_name` was replaced by an overage marker: the token
+    /// carries `_claim_names` with a member named `claim_name`, and the
+    /// values live in the source it names instead of in the claim itself
+    /// (`SEC-39`; Entra ID's "group overage"). The marker's source URL in
+    /// `_claim_sources` is deliberately never read or logged — following it
+    /// is the Microsoft Graph call that is out of scope.
+    ///
+    /// A marker for a different claim (say `roles` while this deployment
+    /// maps `groups`) is not an overage here: [`Self::groups`] would have
+    /// found the claim itself.
+    fn has_claim_overage(&self, claim_name: &str) -> bool {
+        self.extra
+            .get(CLAIM_NAMES)
+            .and_then(Value::as_object)
+            .is_some_and(|names| names.contains_key(claim_name))
+    }
+}
+
+/// A caveat about a browser sign-in that nevertheless succeeded (`SEC-39`).
+///
+/// The API sends [`Self::code`] to the console and the console owns the
+/// sentence (`src/features/auth/sso-notice.tsx`), so the wording lives in
+/// exactly one place and a code cannot drift into prose on one side only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignInNotice {
+    /// The provider replaced the groups claim with an overage marker, so
+    /// no group-based role could be mapped for this sign-in. Signing in
+    /// still succeeds: refusing would lock out a user who also holds roles
+    /// granted in the console (`SEC-39`, decision 2).
+    GroupOverage,
+}
+
+impl SignInNotice {
+    /// The fixed code the console maps to its own sentence.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::GroupOverage => "group_overage",
+        }
+    }
+}
+
+/// What [`OidcAuthenticator::authenticate_with_nonce`] resolved for a
+/// browser sign-in: the principal, the role names its groups mapped to, and
+/// any caveat the console should show (`SEC-39`).
+#[derive(Debug)]
+pub struct OidcLogin {
+    /// The authenticated user.
+    pub principal: Principal,
+    /// The role names mapped from the token's groups — persisted onto the
+    /// session row by `routes::auth::oidc_callback`.
+    pub mapped_role_names: Vec<String>,
+    /// The caveat to show to the user, if this sign-in had one.
+    pub notice: Option<SignInNotice>,
 }
 
 /// [`Authenticator`] for [`Credential::Bearer`] — the concrete `OIDC`
@@ -376,10 +670,15 @@ pub struct OidcAuthenticator {
 
 impl OidcAuthenticator {
     /// Build an authenticator for `config`, backed by `pool`, fetching JWKS
-    /// from `config.jwks_url` with the default cache TTL.
+    /// from `config.jwks_url` with the default cache TTL — or, when no
+    /// explicit address is configured, from the address the provider's
+    /// discovery document names (`SEC-38`).
     #[must_use]
     pub fn new(config: OidcConfig, pool: PgPool) -> Self {
-        let jwks = JwksClient::new(config.jwks_url.clone());
+        let jwks = match &config.jwks_url {
+            Some(url) => JwksClient::new(url.clone()),
+            None => JwksClient::discovering(config.issuer.clone(), DEFAULT_JWKS_TTL),
+        };
         Self::with_jwks_client(config, jwks, pool)
     }
 
@@ -510,15 +809,25 @@ impl OidcAuthenticator {
     ///
     /// # Return value
     ///
-    /// Also returns the mapped role NAMES [`Self::mapped_role_names`]
-    /// computed for this login (empty when [`OidcConfig::role_map`] is
-    /// unset or none of `claims`' groups matched it) — the caller
-    /// (`routes::auth::oidc_callback`) persists these on the new session
-    /// row so [`crate::session::validate_session`] can keep resolving them
-    /// on every later request, per `mapped_permissions`' own doc comment
-    /// ("for the lifetime of that login"). The returned [`Principal`]'s
-    /// permissions already include them for this one response, same as
-    /// before — the session-row copy is for every request after this one.
+    /// An [`OidcLogin`]: the [`Principal`] (whose permissions already
+    /// include this login's mapped roles for this one response), the mapped
+    /// role NAMES [`Self::mapped_role_names`] computed for this login
+    /// (empty when [`OidcConfig::role_map`] is unset or none of `claims`'
+    /// groups matched it) — the caller (`routes::auth::oidc_callback`)
+    /// persists those names on the new session row so
+    /// [`crate::session::validate_session`] can keep resolving them on
+    /// every later request, per `mapped_permissions`' own doc comment
+    /// ("for the lifetime of that login") — and any [`SignInNotice`].
+    ///
+    /// # Group overage (`SEC-39`)
+    ///
+    /// When the provider replaced the configured groups claim with an
+    /// overage marker ([`OidcClaims::has_claim_overage`]), no group-based
+    /// role can be mapped: the login still succeeds (decision 2 — refusing
+    /// would lock out a user who also holds roles granted in the console),
+    /// a `warn` line records the user id and provider (never the token and
+    /// never the marker's claim-source URL), and the returned notice tells
+    /// the console to say so.
     ///
     /// # Errors
     ///
@@ -531,7 +840,7 @@ impl OidcAuthenticator {
         &self,
         token: &Secret,
         expected_nonce: &str,
-    ) -> Result<(Principal, Vec<String>), AuthError> {
+    ) -> Result<OidcLogin, AuthError> {
         let claims = self.validate_token(token.expose()).await?;
         let actual_nonce = claims
             .extra
@@ -541,9 +850,23 @@ impl OidcAuthenticator {
         if actual_nonce != expected_nonce {
             return Err(AuthError::InvalidCredentials);
         }
+        let group_overage = claims.has_claim_overage(&self.config.groups_claim);
         let principal = self.resolve_principal(&claims).await?;
         let mapped_role_names = self.mapped_role_names(&claims);
-        Ok((principal, mapped_role_names))
+        if group_overage {
+            // `SEC-39`, decision 3: the user's id and the provider, nothing
+            // from the token and nothing from `_claim_sources`.
+            tracing::warn!(
+                user_id = %principal.id.uuid(),
+                provider = %self.provider_label,
+                "OIDC sign-in carried a group overage marker; no group-based role was applied"
+            );
+        }
+        Ok(OidcLogin {
+            principal,
+            mapped_role_names,
+            notice: group_overage.then_some(SignInNotice::GroupOverage),
+        })
     }
 
     /// Create (or link to an existing, same-email) `app_user` for `claims`,
@@ -693,6 +1016,64 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_discovery_jwks_uri_must_be_absolute_and_not_downgrade_https() {
+        // `SEC-38`, decision 3. A wiremock server can only serve over
+        // plaintext `http`, so the `http`-under-`https` refusal is checked
+        // here, on the pure rule, rather than through a discovered
+        // document.
+        assert!(jwks_uri_is_allowed(
+            "https://keys.example/jwks",
+            "https://issuer.example"
+        ));
+        assert!(jwks_uri_is_allowed(
+            "http://keycloak:8080/realms/lakehouse/protocol/openid-connect/certs",
+            "http://keycloak:8080/realms/lakehouse"
+        ));
+        assert!(!jwks_uri_is_allowed(
+            "http://keys.example/jwks",
+            "https://issuer.example"
+        ));
+        assert!(!jwks_uri_is_allowed("/jwks", "https://issuer.example"));
+        assert!(!jwks_uri_is_allowed(
+            "file:///etc/passwd",
+            "https://issuer.example"
+        ));
+    }
+
+    /// `SEC-39`, decision 1: `_claim_names` naming the configured groups
+    /// claim is the overage marker. A token that carries `groups` is not an
+    /// overage, and a marker for some other claim (say `roles`, while this
+    /// deployment maps `groups`) is not this deployment's concern.
+    #[test]
+    fn a_group_overage_marker_is_detected_and_a_present_groups_claim_is_not() {
+        let overage: OidcClaims = serde_json::from_value(serde_json::json!({
+            "sub": "user-1",
+            "_claim_names": {"groups": "src1"},
+            "_claim_sources": {"src1": {"endpoint": "https://graph.example/v1.0/me"}},
+        }))
+        .expect("a token carrying an overage marker");
+        assert!(overage.has_claim_overage("groups"));
+        assert!(
+            overage.groups("groups").is_empty(),
+            "an overage marker stands in for the group list, so none is read"
+        );
+
+        let present: OidcClaims = serde_json::from_value(serde_json::json!({
+            "sub": "user-1",
+            "groups": ["lakehouse-admins"],
+        }))
+        .expect("a token carrying a groups claim");
+        assert!(!present.has_claim_overage("groups"));
+
+        let other_claim: OidcClaims = serde_json::from_value(serde_json::json!({
+            "sub": "user-1",
+            "_claim_names": {"roles": "src1"},
+        }))
+        .expect("a token carrying a marker for another claim");
+        assert!(!other_claim.has_claim_overage("groups"));
+    }
+
+    #[test]
     fn provider_label_combines_the_oidc_prefix_and_name() {
         let config = OidcConfig::new(
             "https://issuer.example",
@@ -738,7 +1119,7 @@ mod tests {
             name: None,
             extra: HashMap::new(),
         };
-        assert!(claims.groups("groups").is_empty());
+        assert_eq!(claims.groups("groups"), [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -752,6 +1133,6 @@ mod tests {
                 Value::String("not-an-array".to_owned()),
             )]),
         };
-        assert!(claims.groups("groups").is_empty());
+        assert_eq!(claims.groups("groups"), [] as [std::string::String; 0]);
     }
 }

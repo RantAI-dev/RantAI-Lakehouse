@@ -120,8 +120,47 @@ fn chart_kind_enum() -> Value {
         "gauge",
         "table",
         "pivot",
-        "text"
+        "text",
+        "progress",
+        "histogram",
+        "bullet",
+        "image",
+        "web",
+        "gantt"
     ])
+}
+
+/// The properties `BI-16` part B adds to both chart tools (progress, histogram,
+/// bullet, image and web cards), inserted into the schema built by
+/// [`create_chart_schema`] and [`update_chart_schema`] so the two cannot drift.
+/// The limits are the ones `lakehouse_bi::types_b` enforces, and an address the
+/// administrator does not allow is refused with the console's own sentence.
+fn with_type_properties(mut schema: Value) -> Value {
+    let extra = json!({
+        "goal": { "oneOf": [
+            { "type": "number" },
+            { "type": "object", "properties": { "measure": { "type": "string" } }, "required": ["measure"] } ],
+            "description": "progress (required) and bullet (optional target): a number, or {\"measure\": <column>} for a second value of the same source, which must also be the second entry of `measures`. A progress bar takes one value in `measures` and no dimension" },
+        "bands": { "type": "array", "minItems": 1, "maxItems": 3, "items": { "type": "number" },
+            "description": "bullet only: 1 to 3 rising upper limits of the bands behind the bar (for example poor, fair, good)" },
+        "histogram": { "type": "object", "properties": {
+            "width": { "type": "number", "description": "the width of each range" },
+            "count": { "type": "integer", "minimum": 1, "maximum": 100, "description": "at most this many ranges" } },
+            "description": "histogram only: give a width or a count, not both; leave out for about 20 ranges chosen automatically. The number column is `dimension`; a histogram takes no measures, breakdown, limit or order" },
+        "url": { "type": "string", "description": "image and web only (required): an https address on a site an administrator allows in Admin > Settings; any other address is refused" },
+        "alt": { "type": "string", "maxLength": 200, "description": "image only (required): a short description of the picture for screen readers" },
+        "start": { "type": "string", "description": "gantt only (required): the date or date-time column a task starts at. A Gantt chart draws one bar per task: `dimension` is the task column, `breakdown` the optional group (colour), and `start`, `end` and the optional `progress` name columns; it takes no measures, aggregate, limit or order and shows the first 1,000 tasks by start" },
+        "end": { "type": "string", "description": "gantt only (required): the date or date-time column a task ends at; a row that ends before it starts is left out and counted" },
+        "progress": { "type": "string", "description": "gantt only (optional): a number column drawn as the share of the bar done" }
+    });
+    if let Some(props) = schema
+        .pointer_mut("/function/parameters/properties")
+        .and_then(Value::as_object_mut)
+        && let Value::Object(extra) = extra
+    {
+        props.extend(extra);
+    }
+    schema
 }
 
 /// The properties `BI-16` part A adds to both chart tools (raw tables, pivots,
@@ -242,11 +281,7 @@ fn with_shape_properties(mut schema: Value) -> Value {
             "description": "the column to group by; or {param: <a list parameter whose values are columns of the data>} to let the viewer switch it" },
         "breakdown": { "oneOf": [ { "type": "string" }, param_ref_schema() ],
             "description": "a second column to split by; or {param: <a list parameter>} to let the viewer switch it" },
-        "referenceLines": { "type": "array", "maxItems": 5, "items": { "type": "object", "properties": {
-            "value": { "oneOf": [ { "type": "number" }, param_ref_schema() ], "description": "where on the value axis: a number, or {param: <a number parameter>}" },
-            "label": { "type": "string", "description": "at most 60 characters" } },
-            "required": ["value"] },
-            "description": "up to 5 horizontal lines on the value axis (bar, hbar, line, area, stacked, combo), for example a target. Use a parameter for a line the viewer can move" },
+        "referenceLines": reference_lines_schema(),
         "filters": filters_schema("the chart's own filters (at most 20), always applied, whatever the dashboard's filters are; the same filters a dashboard takes, on columns of the chart's data. Use them for \"only one category\" or \"only 2026\""),
         "layers": { "type": "array", "minItems": 1, "maxItems": 4, "items": { "type": "object", "properties": {
             "mart": { "type": "string", "description": "the Gold mart this question reads (give this or sqlSource)" },
@@ -403,9 +438,128 @@ fn describe_mart_schema() -> Value {
             "mart": { "type": "string", "description": "mart name, e.g. mart_sales" } } } } })
 }
 
+/// The `referenceLines` of the chart tools (`BI-11`, `BI-17`): a fixed or
+/// parameter value, a line computed from the rows on screen, or a band.
+fn reference_lines_schema() -> Value {
+    json!({ "type": "array", "maxItems": 5, "items": { "type": "object", "properties": {
+        "kind": { "type": "string", "enum": ["value", "average", "median", "min", "max", "trend", "band", "forecast"],
+            "description": "value (default): a line at `value`; average, median, min, max: computed from the rows the chart shows; trend: a linear trend over them; band: a shaded band from `value` to `to`; forecast: the series continued `horizon` periods ahead with a 95 % band (bar, line, area, stacked, combo with the date dimension grouped by minute to year, no breakdown, at most one per chart)" },
+        "horizon": { "type": "integer", "minimum": 1, "maximum": 60, "description": "forecast only, required: how many periods ahead" },
+        "value": { "oneOf": [ { "type": "number" }, param_ref_schema() ], "description": "where on the value axis: a number, or {param: <a number parameter>}. Required for kind value and band; leave out for a computed line" },
+        "to": { "oneOf": [ { "type": "number" }, param_ref_schema() ], "description": "band only: the other edge" },
+        "label": { "type": "string", "description": "at most 60 characters" },
+        "color": { "type": "string", "description": "#rrggbb" },
+        "measure": { "type": "string", "description": "a computed line: which value of the chart it describes (a result name); default the first" } } },
+        "description": "up to 5 marks on the value axis (bar, hbar, line, area, stacked, combo), for example a target at 1,000, the average, a trend or a band. Use a parameter for a line the viewer can move. A computed line describes the rows on screen" })
+}
+
+/// The `BI-17` part A formatting fields of `create_chart`, `update_chart` and
+/// `format_chart` (the style block of `lakehouse_bi::style`), written once so
+/// the three cannot drift. The limits are the ones `style::check_style` enforces.
+fn style_properties() -> Value {
+    let value_format = json!({ "type": "object", "properties": {
+        "style": { "type": "string", "enum": ["auto", "number", "percent", "currency", "scientific", "compact"], "description": "percent multiplies by 100 (0.125 is 12.5%); compact is 1.2 K, 3.4 M, 5 B, 2 T; auto is how it looked before" },
+        "decimals": { "type": "integer", "minimum": 0, "maximum": 10 },
+        "thousands": { "type": "boolean", "description": "group thousands (default true)" },
+        "currency": { "type": "string", "description": "an ISO 4217 code such as IDR or USD, upper case; with the currency or compact style. Rupiah is IDR" },
+        "currencyDisplay": { "type": "string", "enum": ["symbol", "code"] },
+        "prefix": { "type": "string", "description": "at most 16 characters" },
+        "suffix": { "type": "string", "description": "at most 16 characters" } } });
+    let axis = json!({ "type": "object", "properties": {
+        "title": { "type": "string", "description": "at most 60 characters" },
+        "show": { "type": "boolean" },
+        "min": { "type": "number" }, "max": { "type": "number" },
+        "log": { "type": "boolean", "description": "logarithmic scale; every value must be above zero" },
+        "rotate": { "type": "integer", "enum": [0, 45, 90], "description": "label rotation, category axis" } } });
+    json!({
+        "format": { "oneOf": [value_format, { "type": "null" }], "description": "how every number of the chart is written (the number format). null removes it. Changing it with format_chart keeps everything else of the chart" },
+        "valueFormats": { "type": ["object", "null"], "additionalProperties": value_format, "description": "a number format per value, keyed by the value's result name; replaces `format` for that value" },
+        "dateFormat": { "type": ["object", "null"], "properties": {
+            "style": { "type": "string", "enum": ["auto", "short", "medium", "long", "iso", "monthYear"] },
+            "hour12": { "type": "boolean" }, "abbreviate": { "type": "boolean", "description": "short month and day names" } },
+            "description": "how dates and timestamps are written" },
+        "colors": { "type": ["object", "null"], "properties": {
+            "palette": { "type": "string", "enum": ["default", "bright", "muted", "sequential-blue", "diverging-red-blue", "company"] },
+            "series": { "type": "object", "additionalProperties": { "type": "string" }, "description": "series name (or the value's result name) to #rrggbb; \"make the bars green\" is the chart's value name with a green" },
+            "byValue": { "type": "array", "minItems": 2, "maxItems": 3, "items": { "type": "string" }, "description": "colour by value: 2 or 3 #rrggbb stops (one value, no breakdown; bar, hbar, pie, treemap, geomap)" } },
+            "description": "colours; a field given here replaces the whole colors setting" },
+        "axes": { "type": ["object", "null"], "properties": {
+            "x": axis, "y": axis, "y2": axis,
+            "rightValues": { "type": "array", "items": { "type": "string" }, "description": "result names drawn against a second Y axis (bar, line, area, combo with at least two values)" } },
+            "description": "axis titles, limits, log scale, label rotation, hiding; bar, hbar, line, area, stacked, combo, scatter, bubble, waterfall, boxplot" },
+        "labels": { "type": ["object", "null"], "properties": { "show": { "type": "boolean" } }, "description": "write each value on its bar or point, in its format" },
+        "annotations": { "type": ["array", "null"], "maxItems": 20, "items": { "type": "object", "properties": {
+            "x": { "type": "string", "description": "the category or date the note is pinned to, as the chart shows it" },
+            "series": { "type": "string" },
+            "text": { "type": "string", "description": "plain text, at most 140 characters" } }, "required": ["x", "text"] },
+            "description": "short notes pinned to points (bar, hbar, line, area, stacked, combo, waterfall)" },
+        "tooltip": { "type": ["object", "null"], "properties": { "fields": { "type": "array", "items": { "type": "string" } } },
+            "description": "show only these of the chart's values in the tooltip (result names)" },
+        "conditional": { "type": ["array", "null"], "maxItems": 20, "items": { "type": "object", "properties": {
+            "column": { "type": "string" },
+            "rule": { "type": "object", "description": "{type:\"compare\",op:lt|le|gt|ge|eq|ne,value}, {type:\"between\",from,to}, {type:\"contains\",text} or {type:\"range\",colors:[2 or 3 #rrggbb]}" },
+            "color": { "type": "string", "description": "#rrggbb; not for a range" },
+            "target": { "type": "string", "enum": ["cell", "text"] } }, "required": ["column", "rule"] },
+            "description": "table, pivot and kpi only: colour a cell or the value by a rule, for example below 1,000 in red" },
+        "clusters": { "type": ["object", "null"], "properties": {
+            "k": { "oneOf": [ { "type": "string", "enum": ["auto"] }, { "type": "integer", "minimum": 2, "maximum": 10 } ], "description": "\"auto\" (the console picks from 2 to 10) or a number of groups" } }, "required": ["k"],
+            "description": "scatter and bubble only: colour the points by cluster (k-means over the points on screen)" }
+    })
+}
+
+/// Insert [`style_properties`] into a chart tool's schema, the way
+/// [`with_shape_properties`] inserts the `BI-6` fields.
+fn with_style_properties(mut schema: Value) -> Value {
+    if let Some(props) = schema
+        .pointer_mut("/function/parameters/properties")
+        .and_then(Value::as_object_mut)
+        && let Value::Object(extra) = style_properties()
+    {
+        props.extend(extra);
+    }
+    schema
+}
+
+fn format_chart_schema() -> Value {
+    let mut properties = serde_json::Map::new();
+    properties.insert(
+        "chart".to_owned(),
+        json!({ "type": "string", "description": "the id of the chart (list_charts)" }),
+    );
+    if let Value::Object(style) = style_properties() {
+        properties.extend(style);
+    }
+    properties.insert("referenceLines".to_owned(), reference_lines_schema());
+    json!({ "type": "function", "function": { "name": "format_chart",
+        "description": "Change only how a saved chart looks: number and date formats (rupiah, percent, compact, decimals), colours (a palette, a colour per series, colour by value), axes, data labels, reference lines (a target at 1,000, an average, a trend, a band), notes, tooltip fields and, for a table or KPI, conditional colours. Send ONLY the fields that change: a field you give replaces that field, null removes it, and everything you leave out stays as it is (the data, the title, the filters and the other formatting). list_charts gives the ids. To change what the chart shows, use update_chart.",
+        "parameters": { "type": "object", "properties": properties, "required": ["chart"] } } })
+}
+
+fn set_dashboard_theme_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "set_dashboard_theme",
+        "description": "Set a dashboard's theme and font for its tiles, wherever it is shown (the console, public links, embeds). theme: auto follows the console, light or dark fixes it. font: one of the fonts an administrator allows (inter, ibm-plex-sans, source-serif, jetbrains-mono, system), or an empty string for the console's own. Not for the built-in dashboard.",
+        "parameters": { "type": "object", "properties": {
+            "board": { "type": "string", "description": "the dashboard id (list_boards)" },
+            "theme": { "type": "string", "enum": ["auto", "light", "dark"] },
+            "font": { "type": "string", "enum": ["", "inter", "ibm-plex-sans", "source-serif", "jetbrains-mono", "system"] } },
+            "required": ["board"] } } })
+}
+
+fn set_cache_rule_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "set_cache_rule",
+        "description": "Set how long a dashboard's or a chart's results may be remembered instead of computed again (\"Make this chart always fresh\"). Give a board (list_boards) or a chart (list_charts), one of the two. rule: default follows the level above (a chart follows its dashboard, a dashboard follows the install's setting in Admin > Settings), fresh computes every time, minutes remembers for `minutes` (1 to 1440). The narrowest rule set wins. Not for the built-in dashboard; set it on one of its charts or duplicate it first. The install's own rule is set by an administrator in Admin > Settings, not here. A result is also recomputed whenever the data under it changes, whatever the rule.",
+        "parameters": { "type": "object", "properties": {
+            "board": { "type": "string", "description": "the dashboard id (list_boards)" },
+            "chart": { "type": "string", "description": "the chart id (list_charts)" },
+            "rule": { "type": "string", "enum": ["default", "fresh", "minutes"] },
+            "minutes": { "type": "number", "description": "with rule minutes: 1 to 1440" } },
+            "required": ["rule"] } } })
+}
+
 fn create_chart_schema() -> Value {
-    with_shape_properties(with_table_properties(
-        json!({ "type": "function", "function": { "name": "create_chart",
+    with_type_properties(with_style_properties(with_shape_properties(
+        with_table_properties(
+            json!({ "type": "function", "function": { "name": "create_chart",
         "description": "Create a chart card on a dashboard (/dashboards) from a Gold mart OR a saved SQL source (sqlSource, for data that combines several marts). The server writes the SQL from the columns you pick; you do not write SQL. Call describe_mart (or list_sql_sources) first to use columns that exist.",
         "parameters": { "type": "object", "properties": {
             "title": { "type": "string" }, "subtitle": { "type": "string" },
@@ -424,12 +578,14 @@ fn create_chart_schema() -> Value {
             "grain": { "type": "string", "enum": grain_enum(), "description": GRAIN_DESCRIPTION },
             "board": { "type": "string" } },
             "required": ["title", "kind"] } } }),
-    ))
+        ),
+    )))
 }
 
 fn update_chart_schema() -> Value {
-    with_shape_properties(with_table_properties(
-        json!({ "type": "function", "function": { "name": "update_chart",
+    with_type_properties(with_style_properties(with_shape_properties(
+        with_table_properties(
+            json!({ "type": "function", "function": { "name": "update_chart",
         "description": "Change a saved chart (by id), keeping its id. Send every field, as for create_chart, with the new values. list_charts gives the ids.",
         "parameters": { "type": "object", "properties": {
             "id": { "type": "string" }, "title": { "type": "string" }, "subtitle": { "type": "string" },
@@ -448,7 +604,8 @@ fn update_chart_schema() -> Value {
             "grain": { "type": "string", "enum": grain_enum(), "description": GRAIN_DESCRIPTION },
             "board": { "type": "string" } },
             "required": ["id", "title", "kind"] } } }),
-    ))
+        ),
+    )))
 }
 
 fn create_board_schema() -> Value {
@@ -469,6 +626,12 @@ fn list_boards_schema() -> Value {
 fn suggest_dashboard_schema() -> Value {
     json!({ "type": "function", "function": { "name": "suggest_dashboard",
         "description": "Every Gold mart with its dimensions and measures at once, for proposing a set of dashboard charts.",
+        "parameters": { "type": "object", "properties": {} } } })
+}
+
+fn list_maps_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "list_maps",
+        "description": "List the maps a geomap, pointmap or geoheat chart can be drawn on: the ones that ship with the console (Jakarta, Indonesia, the world, and the states or provinces of any country) and the ones an administrator uploaded, with the id to put in `map` and a label. Call it before setting `map`.",
         "parameters": { "type": "object", "properties": {} } } })
 }
 
@@ -493,11 +656,75 @@ fn list_sql_sources_schema() -> Value {
         "parameters": { "type": "object", "properties": {} } } })
 }
 
+fn get_query_limits_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "get_query_limits",
+        "description": "The time and row limits that apply to the person you are talking to: how long a chart or Query Studio query may run (timeoutSeconds), rows a chart reads (chartRows), points a map shows (mapPoints), rows Query Studio returns (studioRows), and where the time limit comes from (source: the install, or one of their roles). Use it to answer \"what are my query limits?\" and \"why did this chart time out?\". You cannot change limits: an administrator does, in Admin > Settings > Query limits.",
+        "parameters": { "type": "object", "properties": {} } } })
+}
+
+fn stop_query_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "stop_query",
+        "description": "Stop the person's own running queries on the engine (\"stop the running query\"). With runId (a UUID, the run of a dashboard load or a Query Studio run) it ends that run; without it, it ends every query of this person that is running now. It never touches anyone else's queries. Answers how many were stopped (0: nothing was running).",
+        "parameters": { "type": "object", "properties": {
+            "runId": { "type": "string", "description": "UUID of one run; omit to stop all of the person's running queries" } } } } })
+}
+
 fn delete_chart_schema() -> Value {
     json!({ "type": "function", "function": { "name": "delete_chart",
         "description": "Delete one saved chart card (by id). Built-in charts cannot be deleted. Needs human approval before it runs.",
         "parameters": { "type": "object", "properties": { "id": { "type": "string" } },
             "required": ["id"] } } })
+}
+
+// ── BI-18 part C tabs (with AI-9) ─────────────────────────────────────────
+
+fn create_tab_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "create_tab",
+        "description": "Add a tab to a dashboard (board). On a dashboard with no tabs the first tab holds every chart already on it, so to separate some charts create a second tab as well and then move_charts_to_tab. The built-in dashboard has no tabs.",
+        "parameters": { "type": "object", "properties": {
+            "board": { "type": "string", "description": "dashboard id from list_boards" },
+            "title": { "type": "string", "description": "1 to 60 characters" } },
+            "required": ["board", "title"] } } })
+}
+
+fn rename_tab_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "rename_tab",
+        "description": "Rename a tab of a dashboard. The tab keeps its id, so charts and filters stay on it.",
+        "parameters": { "type": "object", "properties": {
+            "board": { "type": "string" },
+            "tab": { "type": "string", "description": "the tab's id or its title, from list_boards" },
+            "title": { "type": "string", "description": "the new title, 1 to 60 characters" } },
+            "required": ["board", "tab", "title"] } } })
+}
+
+fn move_charts_to_tab_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "move_charts_to_tab",
+        "description": "Put charts of a dashboard on one of its tabs, below what is already there. Charts are picked by id (list_charts); every one must be on this dashboard.",
+        "parameters": { "type": "object", "properties": {
+            "board": { "type": "string" },
+            "tab": { "type": "string", "description": "the tab's id or its title" },
+            "chartIds": { "type": "array", "items": { "type": "string" }, "description": "ids of the charts to move" } },
+            "required": ["board", "tab", "chartIds"] } } })
+}
+
+fn move_tab_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "move_tab",
+        "description": "Change the order of a dashboard's tabs. Give `tabs` (every tab, in the new order) or `tab` with `position` (1 is first). Tab ids, titles and the charts on each stay as they are.",
+        "parameters": { "type": "object", "properties": {
+            "board": { "type": "string" },
+            "tabs": { "type": "array", "items": { "type": "string" }, "description": "every tab's id or title, in the new order" },
+            "tab": { "type": "string", "description": "the tab's id or its title, to move to `position`" },
+            "position": { "type": "integer", "minimum": 1, "description": "where the tab goes, 1 for first" } },
+            "required": ["board"] } } })
+}
+
+fn delete_tab_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "delete_tab",
+        "description": "Delete a tab of a dashboard. Its charts move to the first remaining tab (none are deleted); a filter tied to it is tied to that tab instead. Needs human approval before it runs.",
+        "parameters": { "type": "object", "properties": {
+            "board": { "type": "string" },
+            "tab": { "type": "string", "description": "the tab's id or its title" } },
+            "required": ["board", "tab"] } } })
 }
 
 // ── BI-8 calculated fields (with AI-4) ───────────────────────────────────
@@ -1186,7 +1413,7 @@ fn draft_quality_rule_schema() -> Value {
 
 fn get_ingest_spec_schema() -> Value {
     json!({ "type": "function", "function": { "name": "get_ingest_spec",
-        "description": "Read a connector's ingest spec: its adapter (sql, cdc, files, rest, sheets, mongodb, kafka, sftp), ingest mode, dial (how to reach the source), the source objects it ingests and the Bronze table each lands in, and its schedule. Null fields mean ingest was never set up.",
+        "description": "Read a connector's ingest spec: its adapter (sql, cdc, files, rest, sheets, mongodb, kafka, sftp, saas), ingest mode, dial (how to reach the source), the source objects it ingests and the Bronze table each lands in, and its schedule. Null fields mean ingest was never set up.",
         "parameters": { "type": "object", "properties": {
             "id": { "type": "string", "description": "connector id, from list_connectors" } },
             "required": ["id"] } } })
@@ -1197,7 +1424,7 @@ fn set_ingest_spec_schema() -> Value {
         "description": "Set what a connector ingests into Bronze. Call get_ingest_spec and discover_source first. adapter and dial must match the connector's type; each source object names a source table (or endpoint, file) and the Bronze table it lands in. When you send a connector's source objects again (for example to add a table), keep each object's loadMode, primaryKey and excludedColumns exactly as get_ingest_spec returned them: an object sent without a loadMode goes back to replace, and one sent without excludedColumns loads every column again. Example for a Postgres table: adapter \"sql\", ingestMode \"batch\", dial {\"driver\":\"postgres\",\"host\":\"db\",\"port\":5432,\"database\":\"shop\",\"user\":\"reader\"}, sourceObjects [{\"name\":\"public.orders\",\"target\":\"orders\"}], scheduleCron \"0 * * * *\". The server validates the dial and refuses internal addresses. This tool never carries a credential, so it cannot change where a connector points (adapter, host, port, database, endpoint, bucket, base URL or brokers): such a change is refused with a conflict and is made in the console, where the credentials are entered again.",
         "parameters": { "type": "object", "properties": {
             "id": { "type": "string", "description": "connector id" },
-            "adapter": { "type": "string", "enum": ["sql", "cdc", "files", "rest", "sheets", "mongodb", "kafka", "sftp"] },
+            "adapter": { "type": "string", "enum": ["sql", "cdc", "files", "rest", "sheets", "mongodb", "kafka", "sftp", "saas"] },
             "ingestMode": { "type": "string", "enum": ["batch", "cdc", "stream"] },
             "dial": { "type": "object", "description": "how to reach the source; fields depend on the adapter" },
             "sourceObjects": { "type": "array", "items": { "type": "object", "properties": {
@@ -1276,6 +1503,36 @@ fn get_pipeline_schema() -> Value {
             "required": ["id"] } } })
 }
 
+fn set_pipeline_target_lag_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "set_pipeline_target_lag",
+        "description": "Set or clear an authored pipeline's target lag. Target lag makes the pipeline refresh automatically whenever its inputs change, aiming to keep data within the given lag. Use targetLag: { kind: \"lag\", minutes: N } for a time target (minimum 1 minute, up to 10080 minutes / 7 days), { kind: \"downstream\" } to refresh whenever downstream readers need it, or null to clear.",
+        "parameters": { "type": "object", "properties": {
+            "pipeline": { "type": "string", "description": "pipeline id (pl-…) or pipeline name" },
+            "targetLag": {
+                "description": "target lag configuration: { kind: \"lag\", minutes } | { kind: \"downstream\" } | null to clear",
+                "oneOf": [
+                    { "type": "null" },
+                    {
+                        "type": "object",
+                        "properties": {
+                            "kind": { "type": "string", "enum": ["lag"] },
+                            "minutes": { "type": "integer", "minimum": 1, "maximum": 10080 }
+                        },
+                        "required": ["kind", "minutes"]
+                    },
+                    {
+                        "type": "object",
+                        "properties": {
+                            "kind": { "type": "string", "enum": ["downstream"] }
+                        },
+                        "required": ["kind"]
+                    }
+                ]
+            }
+        },
+        "required": ["pipeline"] } } })
+}
+
 fn mark_pipeline_ready_schema() -> Value {
     json!({ "type": "function", "function": { "name": "mark_pipeline_ready",
         "description": "Move an authored pipeline (pl-…) from draft to ready, so the orchestrator builds a job for it and trigger_pipeline can run it.",
@@ -1320,6 +1577,108 @@ fn set_table_maintenance_schema() -> Value {
             "compactSmallFiles": { "type": "boolean" },
             "schedule": { "type": "string", "description": "cron schedule, optional" } },
             "required": ["namespace", "table", "compactSmallFiles"] } } })
+}
+
+fn export_dashboard_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "export_dashboard",
+        "description": "Give a link that downloads a dashboard as a PDF, every tab with the filters applied. Nothing is made until the person opens the link, and it is made with their permissions. Use the board id from list_boards.",
+        "parameters": { "type": "object", "properties": {
+            "board": { "type": "string", "description": "the dashboard's id, from list_boards" },
+            "filters": { "type": "array", "items": { "type": "object" }, "description": "the filters in force on the page, copied from the page context's raw JSON, so the file matches the screen; leave out when there are none" },
+            "params": { "type": "object", "description": "the parameter values in force, name to value, if the page context lists any" },
+            "grain": { "type": "string", "enum": ["minute", "hour", "day", "week", "month", "quarter", "year"], "description": "the dashboard's time grain switch if the page context shows one" },
+            "format": { "type": "string", "enum": ["pdf"], "description": "pdf, the default" },
+            "paper": { "type": "string", "enum": ["a4", "letter"], "description": "default a4" },
+            "orientation": { "type": "string", "enum": ["portrait", "landscape"], "description": "default portrait" } },
+            "required": ["board"] } } })
+}
+
+fn export_chart_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "export_chart",
+        "description": "Give a link that downloads one chart's data as Excel or CSV (up to 1,000,000 rows). Nothing is made until the person opens the link, and it is made with their permissions. Use the chart id from list_charts.",
+        "parameters": { "type": "object", "properties": {
+            "chart": { "type": "string", "description": "the chart's id, from list_charts" },
+            "filters": { "type": "array", "items": { "type": "object" }, "description": "the filters in force on the page, copied from the page context's raw JSON, so the file matches the screen; leave out when there are none" },
+            "params": { "type": "object", "description": "the parameter values in force, name to value, if the page context lists any" },
+            "grain": { "type": "string", "enum": ["minute", "hour", "day", "week", "month", "quarter", "year"], "description": "the dashboard's time grain switch if the page context shows one" },
+            "format": { "type": "string", "enum": ["xlsx", "csv"] },
+            "values": { "type": "string", "enum": ["formatted", "raw"], "description": "formatted as on the chart (default) or the raw values" } },
+            "required": ["chart", "format"] } } })
+}
+
+/// The schedule, flat, as the console's form sends it (`RPT-1` feature decision 4).
+fn report_schedule_property() -> Value {
+    json!({ "type": "object", "description": "when it is sent, in the time zone given (default: the report time zone). kind hourly: minute; daily: hour, minute; weekly: weekday 1 (Monday) to 7 (Sunday), hour, minute; monthly: monthDay 1 to 28 or \"last\", hour, minute",
+        "properties": {
+            "kind": { "type": "string", "enum": ["hourly", "daily", "weekly", "monthly"] },
+            "minute": { "type": "integer", "minimum": 0, "maximum": 59 },
+            "hour": { "type": "integer", "minimum": 0, "maximum": 23 },
+            "weekday": { "type": "integer", "minimum": 1, "maximum": 7 },
+            "monthDay": { "description": "1 to 28, or the word last" } },
+        "required": ["kind"] })
+}
+
+fn create_report_subscription_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "create_report_subscription",
+        "description": "Send a dashboard by email on a schedule, as a PDF and/or chosen charts' data as Excel or CSV. By default it is sent to the person asking alone, who confirms with the Confirm button. Naming any other recipient (`recipients`) needs a human's approval first, and an outside address works only on a domain an administrator allowed in Admin > Settings. The report is made with the asking person's own permissions, masking and row filters, and every recipient sees the same data.",
+        "parameters": { "type": "object", "properties": {
+            "board": { "type": "string", "description": "the dashboard's id, from list_boards" },
+            "schedule": report_schedule_property(),
+            "timeZone": { "type": "string", "description": "an IANA zone such as Asia/Jakarta; leave out for the report time zone" },
+            "pdf": { "type": "boolean", "description": "attach the dashboard as a PDF; true for a request such as \"send me this dashboard as a PDF\"" },
+            "paper": { "type": "string", "enum": ["a4", "letter"], "description": "default a4" },
+            "orientation": { "type": "string", "enum": ["portrait", "landscape"], "description": "default portrait" },
+            "charts": { "type": "array", "maxItems": 10, "items": { "type": "object", "properties": {
+                "chart": { "type": "string", "description": "a data chart's id on this dashboard, from list_charts" },
+                "format": { "type": "string", "enum": ["xlsx", "csv"] },
+                "values": { "type": "string", "enum": ["formatted", "raw"] } }, "required": ["chart", "format"] },
+                "description": "charts whose data is attached as files" },
+            "filters": { "type": "array", "items": { "type": "object" }, "description": "the filters this report uses, copied from the page context's raw JSON; leave out for none" },
+            "params": { "type": "object", "description": "parameter values, name to value" },
+            "grain": { "type": "string", "enum": ["minute", "hour", "day", "week", "month", "quarter", "year"] },
+            "skipWhenEmpty": { "type": "boolean", "description": "send nothing when every chart has no rows" },
+            "sendToMe": { "type": "boolean", "description": "send to the person asking; default true" },
+            "recipients": { "type": "array", "maxItems": 49, "items": { "type": "object", "properties": {
+                "userId": { "type": "string", "description": "a console user's id" },
+                "email": { "type": "string", "description": "an outside address" } } },
+                "description": "OTHER recipients; naming any makes the call wait for human approval" } },
+            "required": ["board", "schedule"] } } })
+}
+
+fn list_report_subscriptions_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "list_report_subscriptions",
+        "description": "List the scheduled reports the person set up: their schedule, what they attach, who gets them and whether they are paused.",
+        "parameters": { "type": "object", "properties": {
+            "board": { "type": "string", "description": "only this dashboard's, optional" } } } } })
+}
+
+fn update_report_subscription_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "update_report_subscription",
+        "description": "Change a scheduled report the person set up: the schedule, time zone, attachments, filters or recipients, or pause or resume it. Give only what changes; everything left out stays. Naming recipients in `recipients` needs a human's approval.",
+        "parameters": { "type": "object", "properties": {
+            "id": { "type": "string", "description": "the subscription's id, from list_report_subscriptions" },
+            "schedule": report_schedule_property(),
+            "timeZone": { "type": "string" },
+            "pdf": { "type": "boolean" },
+            "paper": { "type": "string", "enum": ["a4", "letter"] },
+            "orientation": { "type": "string", "enum": ["portrait", "landscape"] },
+            "charts": { "type": "array", "maxItems": 10, "items": { "type": "object" }, "description": "the full list of chart files; replaces the current one" },
+            "filters": { "type": "array", "items": { "type": "object" } },
+            "params": { "type": "object" },
+            "grain": { "type": "string" },
+            "skipWhenEmpty": { "type": "boolean" },
+            "sendToMe": { "type": "boolean" },
+            "recipients": { "type": "array", "items": { "type": "object" }, "description": "replaces the recipients; naming others needs approval" },
+            "paused": { "type": "boolean", "description": "true pauses, false resumes" } },
+            "required": ["id"] } } })
+}
+
+fn delete_report_subscription_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "delete_report_subscription",
+        "description": "Delete a scheduled report. Needs human approval, like every deletion.",
+        "parameters": { "type": "object", "properties": {
+            "id": { "type": "string", "description": "the subscription's id, from list_report_subscriptions" } },
+            "required": ["id"] } } })
 }
 
 fn get_capacity_schema() -> Value {
@@ -1411,6 +1770,24 @@ pub static TOOLS: &[ToolSpec] = &[
         permission: "dashboard:write",
     },
     ToolSpec {
+        name: "format_chart",
+        schema: format_chart_schema,
+        risk: Risk::WriteLow,
+        permission: "dashboard:write",
+    },
+    ToolSpec {
+        name: "set_dashboard_theme",
+        schema: set_dashboard_theme_schema,
+        risk: Risk::WriteLow,
+        permission: "dashboard:write",
+    },
+    ToolSpec {
+        name: "set_cache_rule",
+        schema: set_cache_rule_schema,
+        risk: Risk::WriteLow,
+        permission: "dashboard:write",
+    },
+    ToolSpec {
         name: "create_board",
         schema: create_board_schema,
         risk: Risk::WriteLow,
@@ -1449,9 +1826,60 @@ pub static TOOLS: &[ToolSpec] = &[
         risk: Risk::Read,
         permission: "dashboard:read",
     },
+    // Read-only: reports the limits that apply to the person (`BI-5`, D7).
+    ToolSpec {
+        name: "get_query_limits",
+        schema: get_query_limits_schema,
+        risk: Risk::Read,
+        permission: "",
+    },
+    // `Risk::Read` although it kills queries (`BI-5`, D7): it can only end the
+    // caller's OWN running queries (the pattern's principal part is the
+    // authenticated person, never an argument), it changes no data and
+    // nothing needs to be approved or undone; the same call the Stop button
+    // makes. Killing someone else's query is `kill_query`, which needs
+    // `workload:cancel` and approval.
+    ToolSpec {
+        name: "stop_query",
+        schema: stop_query_schema,
+        risk: Risk::Read,
+        permission: "",
+    },
     ToolSpec {
         name: "delete_chart",
         schema: delete_chart_schema,
+        risk: Risk::WriteHigh,
+        permission: "dashboard:write",
+    },
+    // BI-18 part C / AI-9: tabs. They save through `PUT /api/dashboard/boards`
+    // (`dashboard:write`); deleting a tab asks for approval like `delete_chart`.
+    ToolSpec {
+        name: "create_tab",
+        schema: create_tab_schema,
+        risk: Risk::WriteLow,
+        permission: "dashboard:write",
+    },
+    ToolSpec {
+        name: "rename_tab",
+        schema: rename_tab_schema,
+        risk: Risk::WriteLow,
+        permission: "dashboard:write",
+    },
+    ToolSpec {
+        name: "move_charts_to_tab",
+        schema: move_charts_to_tab_schema,
+        risk: Risk::WriteLow,
+        permission: "dashboard:write",
+    },
+    ToolSpec {
+        name: "move_tab",
+        schema: move_tab_schema,
+        risk: Risk::WriteLow,
+        permission: "dashboard:write",
+    },
+    ToolSpec {
+        name: "delete_tab",
+        schema: delete_tab_schema,
         risk: Risk::WriteHigh,
         permission: "dashboard:write",
     },
@@ -1913,6 +2341,12 @@ pub static TOOLS: &[ToolSpec] = &[
         permission: "pipeline:write",
     },
     ToolSpec {
+        name: "set_pipeline_target_lag",
+        schema: set_pipeline_target_lag_schema,
+        risk: Risk::WriteLow,
+        permission: "pipeline:write",
+    },
+    ToolSpec {
         name: "list_iceberg_tables",
         schema: list_iceberg_tables_schema,
         risk: Risk::Read,
@@ -1942,6 +2376,50 @@ pub static TOOLS: &[ToolSpec] = &[
         risk: Risk::Read,
         permission: "catalog:read",
     },
+    // `BI-1` / `AI-10`: a download link, nothing made until the person opens it
+    // with their own session, so `Read` and the permission of seeing a
+    // dashboard; whether their roles may download is checked in the tool.
+    ToolSpec {
+        name: "export_dashboard",
+        schema: export_dashboard_schema,
+        risk: Risk::Read,
+        permission: "dashboard:read",
+    },
+    ToolSpec {
+        name: "export_chart",
+        schema: export_chart_schema,
+        risk: Risk::Read,
+        permission: "dashboard:read",
+    },
+    // `RPT-1` / `AI-10`: scheduled reports. Creating or changing one for the
+    // person alone is `WriteLow` (the Confirm button); naming any other
+    // recipient makes that call `WriteHigh` (`gate::effective_risk`), and a
+    // delete is `WriteHigh` like every deletion. The permission is the
+    // console's: seeing the dashboard; the download right is checked in the tool.
+    ToolSpec {
+        name: "create_report_subscription",
+        schema: create_report_subscription_schema,
+        risk: Risk::WriteLow,
+        permission: "dashboard:read",
+    },
+    ToolSpec {
+        name: "list_report_subscriptions",
+        schema: list_report_subscriptions_schema,
+        risk: Risk::Read,
+        permission: "dashboard:read",
+    },
+    ToolSpec {
+        name: "update_report_subscription",
+        schema: update_report_subscription_schema,
+        risk: Risk::WriteLow,
+        permission: "dashboard:read",
+    },
+    ToolSpec {
+        name: "delete_report_subscription",
+        schema: delete_report_subscription_schema,
+        risk: Risk::WriteHigh,
+        permission: "dashboard:read",
+    },
     // Asks the person a question and stores nothing, so it needs no
     // permission beyond being signed in. The console's click is what saves
     // the answer.
@@ -1959,6 +2437,15 @@ pub static TOOLS: &[ToolSpec] = &[
         schema: propose_sql_schema,
         risk: Risk::Read,
         permission: "query:read",
+    },
+    // BI-16 part C2 (D10): the maps a chart can be drawn on, built-in and
+    // uploaded. Reading mirrors `GET /api/maps` (any signed-in caller), and the
+    // dashboard tools need `dashboard:read` anyway.
+    ToolSpec {
+        name: "list_maps",
+        schema: list_maps_schema,
+        risk: Risk::Read,
+        permission: "dashboard:read",
     },
 ];
 
@@ -2010,7 +2497,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tool_schemas_has_ninety_two_entries() {
+    fn tool_schemas_has_one_hundred_entries() {
         // 15 pre-T1 tools + 19 Tier 1 operations tools (5 alerts + 4
         // connectors + 7 pipelines + 3 saved queries) + 13 Tier 2 tools
         // (5 governance reads + 1 maintenance + 2 workloads + 2 gold
@@ -2023,10 +2510,35 @@ mod tests {
         // `create_parameter`, `update_parameter` and `delete_parameter` (`BI-11`)
         // + `list_metrics`, `describe_metric`, `query_metric`, `create_metric`,
         // `update_metric` and `delete_metric` (`BI-2`, `AI-7`) + `propose_sql`
-        // (`AI-12`, plan 15; merged from main) + the 6 dashboard-board tools
-        // (plan 20: `rename_board`, `delete_board`, `arrange_board`,
-        // `move_chart`, `set_board_view_filters`, `save_board_filters`).
-        assert_eq!(tool_schemas().len(), 92);
+        // (`AI-12`, plan 15; merged from main) + `create_tab`, `rename_tab`,
+        // `move_charts_to_tab`, `move_tab` and `delete_tab` (`BI-18` part C, `AI-9`)
+        // + `format_chart` and `set_dashboard_theme` (`BI-17` part A, `AI-8`)
+        // + the 6 dashboard-board tools from main (plan 20: `rename_board`,
+        // `delete_board`, `arrange_board`, `move_chart`, `set_board_view_filters`,
+        // `save_board_filters`) + `set_pipeline_target_lag` (`BLD-2`, from main) +
+        // `export_dashboard` and `export_chart` (`AI-10`, with `BI-1`)
+        // + `create_report_subscription`, `list_report_subscriptions`,
+        // `update_report_subscription` and `delete_report_subscription`
+        // (`AI-10`, with `RPT-1`) + `set_cache_rule` (`BI-4` part B)
+        // + `list_maps` (`BI-16` part C2, `AI-5`).
+        assert_eq!(tool_schemas().len(), 110);
+    }
+
+    /// `RPT-1` (with `AI-10`): the report tools have the console's permission,
+    /// reading is free, creating and changing one is a confirmation, and a delete
+    /// is an approval.
+    #[test]
+    fn the_report_tools_have_the_risk_and_permission_decision_10_gives_them() {
+        for (name, risk) in [
+            ("create_report_subscription", Risk::WriteLow),
+            ("list_report_subscriptions", Risk::Read),
+            ("update_report_subscription", Risk::WriteLow),
+            ("delete_report_subscription", Risk::WriteHigh),
+        ] {
+            let spec = find(name).expect("registered tool");
+            assert_eq!(spec.risk, risk, "{name}");
+            assert_eq!(spec.permission, "dashboard:read", "{name}");
+        }
     }
 
     /// `BI-2` (with `AI-7`): reading a metric needs `dashboard:read`; defining,
@@ -2063,6 +2575,27 @@ mod tests {
         }
     }
 
+    /// `BI-18` part C (with `AI-9`): the tab tools need `dashboard:write`, the
+    /// permission of the route they save through, and deleting a tab asks for
+    /// approval.
+    #[test]
+    fn the_tab_tools_have_the_risk_and_permission_of_the_route_they_call() {
+        for (name, risk) in [
+            ("create_tab", Risk::WriteLow),
+            ("rename_tab", Risk::WriteLow),
+            ("move_charts_to_tab", Risk::WriteLow),
+            ("move_tab", Risk::WriteLow),
+            ("delete_tab", Risk::WriteHigh),
+        ] {
+            let spec = find(name).expect("registered tool");
+            assert_eq!(
+                (spec.risk, spec.permission),
+                (risk, "dashboard:write"),
+                "{name}"
+            );
+        }
+    }
+
     #[test]
     fn the_bi_10_tools_have_the_risk_and_permission_of_the_routes_they_call() {
         for (name, risk, permission) in [
@@ -2091,6 +2624,59 @@ mod tests {
 
     /// `BI-11` (with `AI-6`): the chart tools take a parameter for the limit
     /// and the column slots, and reference lines.
+    #[test]
+    fn the_formatting_fields_are_the_same_on_the_three_chart_tools() {
+        // BI-17 part A / AI-8: written once (`style_properties`), so create_chart, update_chart
+        // and format_chart cannot drift, and every field is a field of `lakehouse_bi::style`.
+        let style = style_properties();
+        let style = style.as_object().expect("an object");
+        assert_eq!(style.len(), 10);
+        for tool in ["create_chart", "update_chart", "format_chart"] {
+            let schema = (find(tool).expect("registered tool").schema)();
+            let properties = &schema["function"]["parameters"]["properties"];
+            for (field, definition) in style {
+                assert_eq!(&properties[field], definition, "{tool} {field}");
+            }
+            assert_eq!(
+                properties["referenceLines"],
+                reference_lines_schema(),
+                "{tool}"
+            );
+        }
+    }
+
+    #[test]
+    fn format_chart_names_the_chart_and_nothing_else_is_required() {
+        let schema = (find("format_chart").expect("registered tool").schema)();
+        assert_eq!(
+            schema["function"]["parameters"]["required"],
+            json!(["chart"])
+        );
+        let spec = find("format_chart").expect("registered tool");
+        assert_eq!(
+            (spec.risk, spec.permission),
+            (Risk::WriteLow, "dashboard:write")
+        );
+        let spec = find("set_dashboard_theme").expect("registered tool");
+        assert_eq!(
+            (spec.risk, spec.permission),
+            (Risk::WriteLow, "dashboard:write")
+        );
+        // Its fields are exactly the ones the tool may change.
+        let schema = (find("format_chart").expect("registered tool").schema)();
+        let mut names: Vec<&str> = schema["function"]["parameters"]["properties"]
+            .as_object()
+            .expect("an object")
+            .keys()
+            .map(String::as_str)
+            .filter(|k| *k != "chart")
+            .collect();
+        names.sort_unstable();
+        let mut allowed = crate::routes::ai::tools::FORMAT_FIELDS.to_vec();
+        allowed.sort_unstable();
+        assert_eq!(names, allowed);
+    }
+
     #[test]
     fn the_chart_tools_take_parameters_and_reference_lines() {
         for tool in ["create_chart", "update_chart"] {
@@ -2222,6 +2808,60 @@ mod tests {
                 json!(["by", "dir"]),
                 "{tool}"
             );
+        }
+    }
+
+    /// `BI-16` part B (`AI-5`): both chart tools take the five new kinds and their
+    /// fields, and the tool count does not change (no new tool).
+    #[test]
+    fn the_chart_tools_take_the_progress_histogram_bullet_image_and_web_fields() {
+        for tool in ["create_chart", "update_chart"] {
+            let schema = (find(tool).expect("registered tool").schema)();
+            let properties = &schema["function"]["parameters"]["properties"];
+            let kinds = properties["kind"]["enum"].as_array().unwrap();
+            for kind in ["progress", "histogram", "bullet", "image", "web", "gantt"] {
+                assert!(kinds.iter().any(|k| k == kind), "{tool} lacks kind {kind}");
+            }
+            for field in [
+                "goal",
+                "bands",
+                "histogram",
+                "url",
+                "alt",
+                "start",
+                "end",
+                "progress",
+            ] {
+                assert!(properties.get(field).is_some(), "{tool} lacks {field}");
+            }
+            assert_eq!(
+                properties["histogram"]["properties"]["count"]["maximum"],
+                json!(100)
+            );
+            assert_eq!(properties["bands"]["maxItems"], json!(3));
+            assert_eq!(properties["alt"]["maxLength"], json!(200));
+            // The tool says where an address may come from, as the console does.
+            assert!(
+                properties["url"]["description"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Admin > Settings")
+            );
+        }
+        // `format_chart` changes only the look: it takes none of them.
+        let format = (find("format_chart").expect("registered tool").schema)();
+        let props = &format["function"]["parameters"]["properties"];
+        for field in [
+            "goal",
+            "bands",
+            "histogram",
+            "url",
+            "alt",
+            "start",
+            "end",
+            "progress",
+        ] {
+            assert!(props.get(field).is_none(), "format_chart took {field}");
         }
     }
 
@@ -2370,6 +3010,9 @@ mod tests {
             offered_names,
             vec![
                 "get_quality".to_owned(),
+                // BI-5: both limits tools need only a sign-in.
+                "get_query_limits".to_owned(),
+                "stop_query".to_owned(),
                 "list_alert_rules".to_owned(),
                 "get_audit_history".to_owned(),
                 "list_classification_rules".to_owned(),

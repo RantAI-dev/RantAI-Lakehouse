@@ -17,9 +17,11 @@
 //! a row's content), so it must never reveal more than a `SELECT` the
 //! caller could run themselves. The aggregate query is therefore passed
 //! through the exact rewrite `POST /api/query/run` uses
-//! (`query::rewrite_sql_for_principal`): masked columns are profiled in
-//! their masked form and row filters shrink the profiled rows. The route
-//! requires `query:read` for the same reason.
+//! (`query::rewrite_sql_for_principal_with_headers`, with this request's
+//! headers, so the profile is read as the organisation the console
+//! picked): masked columns are profiled in their masked form and row
+//! filters shrink the profiled rows. The route requires `query:read` for
+//! the same reason.
 //!
 //! # Bounded cost
 //!
@@ -40,7 +42,7 @@ use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::routes::catalog::{catalog_tenant_refusal, split_db_table};
 use crate::routes::catalog_source::{self, ReadSource, SourceKind};
-use crate::routes::query::rewrite_sql_for_principal;
+use crate::routes::query::rewrite_sql_for_principal_with_headers;
 use crate::routes::support::str_col;
 use crate::state::AppState;
 use crate::upstream_error;
@@ -262,19 +264,17 @@ fn unsupported(reason: &str) -> Response {
         .into_response()
 }
 
-/// The table behind `id` (see `catalog_source`), or `Ok(None)` when the
-/// asset is real but nothing readable backs it.
-pub(crate) async fn resolve_source(
-    state: &AppState,
-    id: &str,
-) -> Result<Option<ReadSource>, ApiError> {
-    if id.starts_with("silver.") || id.starts_with("serving.") {
-        let (db, table) = split_db_table(id);
-        return catalog_source::clickhouse_source(&state.clickhouse, &db, &table)
-            .await
-            .map_err(|e| upstream_error::ch_error(&upstream_error::DATABASE, &e));
-    }
-    let slug = SqlLiteral::from(id);
+/// The registry's `table_name` for the Bronze dataset `slug` (empty when the
+/// dataset has no table yet): the Iceberg table the asset page reads.
+/// Shared by [`resolve_source`] and the restore of a dropped table
+/// (`DATA-15` F4), so the registry is asked one way.
+///
+/// # Errors
+///
+/// [`ApiError::NotFound`] when no dataset has that slug; a classified
+/// `ClickHouse` error when the registry cannot be read.
+pub(crate) async fn bronze_table_name(state: &AppState, slug: &str) -> Result<String, ApiError> {
+    let slug = SqlLiteral::from(slug);
     let sql = format!(
         "SELECT table_name FROM lake.`bronze_meta.dataset_sync` WHERE slug = {slug}
          UNION ALL SELECT table_name FROM lake.`bronze_meta_sec.dataset_sync` WHERE slug = {slug}
@@ -288,7 +288,23 @@ pub(crate) async fn resolve_source(
     let Some(row) = rows.first() else {
         return Err(ApiError::NotFound("Asset not found".to_owned()));
     };
-    catalog_source::bronze_source(state, str_col(row, "table_name"))
+    Ok(str_col(row, "table_name").to_owned())
+}
+
+/// The table behind `id` (see `catalog_source`), or `Ok(None)` when the
+/// asset is real but nothing readable backs it.
+pub(crate) async fn resolve_source(
+    state: &AppState,
+    id: &str,
+) -> Result<Option<ReadSource>, ApiError> {
+    if id.starts_with("silver.") || id.starts_with("serving.") {
+        let (db, table) = split_db_table(id);
+        return catalog_source::clickhouse_source(&state.clickhouse, &db, &table)
+            .await
+            .map_err(|e| upstream_error::ch_error(&upstream_error::DATABASE, &e));
+    }
+    let table_name = bronze_table_name(state, id).await?;
+    catalog_source::bronze_source(state, &table_name)
         .await
         .map_err(|e| upstream_error::ch_error(&upstream_error::DATABASE, &e))
 }
@@ -329,11 +345,12 @@ pub async fn profile(
         return Ok(unsupported("None of this asset's columns can be profiled."));
     }
 
-    let sql = rewrite_sql_for_principal(
+    let sql = rewrite_sql_for_principal_with_headers(
         &state,
         &profile_sql(&source.from, &planned),
         "clickhouse",
         &principal,
+        &headers,
     )
     .await?;
     let result = state
@@ -448,7 +465,7 @@ mod tests {
             exact_top_values(Some(&arr)),
             vec![json!({ "value": "3", "count": 2 })]
         );
-        assert!(exact_top_values(None).is_empty());
+        assert_eq!(exact_top_values(None), [] as [serde_json::Value; 0]);
     }
 
     #[test]

@@ -5,6 +5,7 @@ import {
   cronProblem,
   defaultDiscoverSchema,
   defaultTarget,
+  labelTarget,
   isAutoDisablePause,
   loadModeProblem,
   lockedColumns,
@@ -124,12 +125,21 @@ describe("ingest panel helpers", () => {
     // ... and a key (the two lines below named no key before the key field existed).
     expect(loadModeProblem({ loadMode: "incremental_dedup", incrementalKey: "updated_at", primaryKey: ["id"] })).toBeNull()
     expect(loadModeProblem({ loadMode: "replace_dedup", primaryKey: ["id"] })).toBeNull()
+    // PR #216 final review BLOCKER 18: `incremental` appends a changed business-app record as a second row.
+    expect(loadModeProblem({ loadMode: "incremental", incrementalKey: "updated_at", adapter: "saas" })).toMatch(/one per key/)
+    expect(loadModeProblem({ loadMode: "incremental", incrementalKey: "updated_at", adapter: "sql" })).toBeNull()
   })
 
   it("names a Bronze table after the connector and the source table", () => {
     expect(defaultTarget("northwind", "public.orders")).toBe("northwind_orders")
     expect(defaultTarget("Northwind DB!", "public.Order Details")).toBe("northwind_db_order_details")
     expect(defaultTarget("2024 sales", "t")).toBe("t_2024_sales_t")
+  })
+  it("names the table of a labelled object from the whole label (slice 5 review BLOCKER 14)", () => {
+    expect(labelTarget("intranet", "Team Site / Tasks")).toBe("intranet_team_site_tasks")
+    expect(labelTarget("Intranet", "v1.2 Plan / Q3 2026")).toBe("intranet_v1_2_plan_q3_2026")
+    expect(labelTarget("2024", "HR / Staff")).toBe("t_2024_hr_staff")
+    expect(labelTarget("", "!!!")).toBe("table")
   })
   // The edge cases below are pinned by `default_bronze_target`'s Rust test as
   // well (`lakehouse-store/src/ingest_spec.rs`): both rules must agree.
@@ -509,7 +519,7 @@ describe("ConnectorIngestPanel load modes and keys", () => {
       "Keep history",
     ])
     // Nothing is missing, so there is no line about a missing mode.
-    expect(screen.queryByText(/offered for SQL sources only/)).toBeNull()
+    expect(screen.queryByText(/offered for SQL sources and business apps only/)).toBeNull()
   })
 
   it("offers four modes to any other batch source and says why the incremental ones are missing", async () => {
@@ -522,7 +532,20 @@ describe("ConnectorIngestPanel load modes and keys", () => {
     render(<ConnectorIngestPanel connectorId="conn-api" connectorName="api" />)
     const mode = await modeOf("orders")
     expect([...mode.options].map((o) => o.value)).toEqual(["replace", "append", "replace_dedup", "history"])
-    expect(screen.getByText(/Adding only new rows, with or without one row per key, is offered for SQL sources only/)).toBeDefined()
+    expect(screen.getByText(/Adding only new rows, with or without one row per key, is offered for SQL sources and business apps only/)).toBeDefined()
+  })
+
+  it("offers five modes to a business app, without the append-only incremental one (final review BLOCKER 18)", async () => {
+    stubFetch({
+      ...SPEC,
+      adapter: "saas",
+      dial: { vendor: "zendesk", account: "acme", auth: { type: "integration" } } as unknown as typeof SPEC.dial,
+      sourceObjects: [{ name: "tickets", target: "saas_tickets" }],
+    })
+    render(<ConnectorIngestPanel connectorId="conn-saas" connectorName="acme" />)
+    const mode = await modeOf("tickets")
+    expect([...mode.options].map((o) => o.value)).toEqual(["replace", "append", "replace_dedup", "incremental_dedup", "history"])
+    expect(screen.queryByText(/offered for SQL sources and business apps only/)).toBeNull()
   })
 
   it("says in each hint what happens to the rows already in the table", async () => {
@@ -1066,6 +1089,22 @@ describe("ConnectorIngestPanel run log", () => {
     expect(screen.getByText("Run ended")).toBeDefined()
     expect(screen.getByText("Next attempt in 1 min")).toBeDefined()
     expect(calls.some((c) => c.url.endsWith("/runs/run-log-000001/log"))).toBe(true)
+  })
+
+  it("words the two business-app classes (SRC-3, migration 0097) and says a rate limit used its retries", async () => {
+    const log = {
+      ...LOG,
+      attempts: [
+        { table: "tickets", attempt: 1, startedAt: "2026-10-12T08:00:01.000Z", endedAt: "2026-10-12T08:00:02.000Z", rowsLoaded: 0, result: "failed", errorClass: "rate_limited", waitSeconds: null },
+        { table: "owners", attempt: 1, startedAt: "2026-10-12T08:01:05.000Z", endedAt: "2026-10-12T08:01:06.000Z", rowsLoaded: 0, result: "failed", errorClass: "permission_missing", waitSeconds: null },
+      ],
+    }
+    stubFetch(SPEC, { runs: [LOG.run], logs: { "run-log-000001": log } })
+    panel()
+    fireEvent.click(await screen.findByRole("button", { name: "Show log" }))
+    // A rate limit is retried, so with no wait left it says the retries are used up; a missing permission is not.
+    expect(await screen.findByText("The source limited the rate of requests. Retries are used up.")).toBeDefined()
+    expect(screen.getByText("The account lacks a permission at the source")).toBeDefined()
   })
 
   it("downloads the same log as text from the same route with ?format=text", async () => {

@@ -142,7 +142,8 @@ export function ConnectorsPage() {
         title="Connectors"
         // SRC-6 F7: the old text promised SaaS and federation, which no
         // connector type here delivers; list only what the picker offers.
-        description="Databases, change capture, object storage, files, REST APIs and message topics. Data enters the platform here before processing."
+        // SRC-3 slice 7 review SHOULD-FIX 16: eight business apps are supported now.
+        description="Databases, change capture, object storage, files, REST APIs, message topics and business apps. Data enters the platform here before processing."
         actions={
           <>
             <Button variant="outline" size="sm" render={<Link href="/connectors/upload" />}>

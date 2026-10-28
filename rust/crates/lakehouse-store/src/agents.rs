@@ -129,7 +129,10 @@ const WORKFLOW_COLUMNS: &str =
 /// Returns [`StoreError::Database`] if the query fails.
 pub async fn list_workflows(pool: &PgPool) -> Result<Vec<AgentWorkflow>, StoreError> {
     let sql = format!("SELECT {WORKFLOW_COLUMNS} FROM agent_workflow ORDER BY created_at DESC");
-    Ok(sqlx::query_as(&sql).fetch_all(pool).await?)
+    // safe: only the constant `WORKFLOW_COLUMNS` is formatted in; values are bound.
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+        .fetch_all(pool)
+        .await?)
 }
 
 /// Everything [`create_workflow`] needs. Mirrors `CreateWorkflowInput`.
@@ -164,7 +167,8 @@ pub async fn create_workflow(
          VALUES ($1, $2, 'draft', $3, $4, $5, $6) \
          RETURNING {WORKFLOW_COLUMNS}"
     );
-    Ok(sqlx::query_as(&sql)
+    // safe: only the constant `WORKFLOW_COLUMNS` is formatted in; values are bound.
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(&id)
         .bind(&input.name)
         .bind(owner)
@@ -327,7 +331,10 @@ const FULL_EMPLOYEE_COLUMNS: &str = "id, name, purpose, owner, autonomy, status,
 /// Returns [`StoreError::Database`] if the query fails.
 pub async fn list_employees(pool: &PgPool) -> Result<Vec<DigitalEmployee>, StoreError> {
     let sql = format!("SELECT {EMPLOYEE_COLUMNS} FROM agent_employee ORDER BY created_at DESC");
-    let rows: Vec<EmployeeListRow> = sqlx::query_as(&sql).fetch_all(pool).await?;
+    // safe: only the constant `EMPLOYEE_COLUMNS` is formatted in; values are bound.
+    let rows: Vec<EmployeeListRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+        .fetch_all(pool)
+        .await?;
     Ok(rows
         .into_iter()
         .map(EmployeeListRow::without_metrics)
@@ -343,7 +350,11 @@ pub async fn list_employees(pool: &PgPool) -> Result<Vec<DigitalEmployee>, Store
 /// Returns [`StoreError::Database`] if the query fails.
 pub async fn get_employee(pool: &PgPool, id: &str) -> Result<Option<DigitalEmployee>, StoreError> {
     let sql = format!("SELECT {EMPLOYEE_COLUMNS} FROM agent_employee WHERE id = $1");
-    let row: Option<EmployeeListRow> = sqlx::query_as(&sql).bind(id).fetch_optional(pool).await?;
+    // safe: only the constant `EMPLOYEE_COLUMNS` is formatted in; values are bound.
+    let row: Option<EmployeeListRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
     Ok(row.map(EmployeeListRow::without_metrics))
 }
 
@@ -361,7 +372,11 @@ pub async fn get_employee_with_metrics(
     id: &str,
 ) -> Result<Option<DigitalEmployee>, StoreError> {
     let sql = format!("SELECT {FULL_EMPLOYEE_COLUMNS} FROM agent_employee WHERE id = $1");
-    Ok(sqlx::query_as(&sql).bind(id).fetch_optional(pool).await?)
+    // safe: only the constant `FULL_EMPLOYEE_COLUMNS` is formatted in; values are bound.
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+        .bind(id)
+        .fetch_optional(pool)
+        .await?)
 }
 
 /// List every digital employee that has a `schedule_cron` set, newest
@@ -379,7 +394,10 @@ pub async fn list_scheduled_employees(pool: &PgPool) -> Result<Vec<DigitalEmploy
         "SELECT {EMPLOYEE_COLUMNS} FROM agent_employee WHERE schedule_cron IS NOT NULL \
          ORDER BY created_at DESC"
     );
-    let rows: Vec<EmployeeListRow> = sqlx::query_as(&sql).fetch_all(pool).await?;
+    // safe: only the constant `EMPLOYEE_COLUMNS` is formatted in; values are bound.
+    let rows: Vec<EmployeeListRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+        .fetch_all(pool)
+        .await?;
     Ok(rows
         .into_iter()
         .map(EmployeeListRow::without_metrics)
@@ -493,7 +511,8 @@ pub async fn create_employee(
          VALUES ($1, $2, $3, $4, $5, 'draft', $6, $7, $8, $9, $10, $11, $12) \
          RETURNING {EMPLOYEE_COLUMNS}"
     );
-    let row: EmployeeListRow = sqlx::query_as(&sql)
+    // safe: only the constant `EMPLOYEE_COLUMNS` is formatted in; values are bound.
+    let row: EmployeeListRow = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(&id)
         .bind(&input.name)
         .bind(&input.purpose)
@@ -528,7 +547,8 @@ async fn set_employee_status(
 ) -> Result<DigitalEmployee, StoreError> {
     let sql =
         format!("UPDATE agent_employee SET status = $2 WHERE id = $1 RETURNING {EMPLOYEE_COLUMNS}");
-    let row: Option<EmployeeListRow> = sqlx::query_as(&sql)
+    // safe: only the constant `EMPLOYEE_COLUMNS` is formatted in; values are bound.
+    let row: Option<EmployeeListRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(id)
         .bind(status)
         .fetch_optional(pool)
@@ -759,7 +779,8 @@ pub async fn list_runs(
         "SELECT {RUN_COLUMNS} FROM agent_run WHERE ($1::text IS NULL OR employee_id = $1) \
          ORDER BY started_at DESC"
     );
-    let rows: Vec<RunRow> = sqlx::query_as(&sql)
+    // safe: only the constant `RUN_COLUMNS` is formatted in; values are bound.
+    let rows: Vec<RunRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(employee_id)
         .fetch_all(pool)
         .await?;
@@ -777,7 +798,11 @@ pub async fn list_runs(
 /// Returns [`StoreError::Database`] if a query fails.
 pub async fn get_run(pool: &PgPool, id: &str) -> Result<Option<AgentRun>, StoreError> {
     let sql = format!("SELECT {RUN_COLUMNS} FROM agent_run WHERE id = $1");
-    let row: Option<RunRow> = sqlx::query_as(&sql).bind(id).fetch_optional(pool).await?;
+    // safe: only the constant `RUN_COLUMNS` is formatted in; values are bound.
+    let row: Option<RunRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
     match row {
         Some(row) => Ok(Some(hydrate_run(pool, row).await?)),
         None => Ok(None),
@@ -970,7 +995,9 @@ pub async fn list_approvals(
         "SELECT {APPROVAL_COLUMNS_QUALIFIED} {APPROVAL_AUDIT_JOIN} WHERE ($1::text IS NULL OR \
          a.employee_id = $1) ORDER BY a.requested_at DESC"
     );
-    let rows: Vec<ApprovalRow> = sqlx::query_as(&sql)
+    // safe: only the constants `APPROVAL_COLUMNS_QUALIFIED`, `APPROVAL_AUDIT_JOIN` are formatted
+    // in; values are bound.
+    let rows: Vec<ApprovalRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(employee_id)
         .fetch_all(pool)
         .await?;
@@ -1055,7 +1082,9 @@ pub async fn decide_approval(
     .await?;
     let select_sql =
         format!("SELECT {APPROVAL_COLUMNS_QUALIFIED} {APPROVAL_AUDIT_JOIN} WHERE a.id = $1");
-    let row: ApprovalRow = sqlx::query_as(&select_sql)
+    // safe: only the constants `APPROVAL_COLUMNS_QUALIFIED`, `APPROVAL_AUDIT_JOIN` are formatted
+    // in; values are bound.
+    let row: ApprovalRow = sqlx::query_as(sqlx::AssertSqlSafe(select_sql.as_str()))
         .bind(id)
         .fetch_one(&mut *tx)
         .await?;
@@ -1517,7 +1546,9 @@ pub async fn create_access_request(
     .await?;
     let select_sql =
         format!("SELECT {APPROVAL_COLUMNS_QUALIFIED} {APPROVAL_AUDIT_JOIN} WHERE a.id = $1");
-    let row: ApprovalRow = sqlx::query_as(&select_sql)
+    // safe: only the constants `APPROVAL_COLUMNS_QUALIFIED`, `APPROVAL_AUDIT_JOIN` are formatted
+    // in; values are bound.
+    let row: ApprovalRow = sqlx::query_as(sqlx::AssertSqlSafe(select_sql.as_str()))
         .bind(&approval_id)
         .fetch_one(pool)
         .await?;
@@ -1535,7 +1566,9 @@ pub async fn create_access_request(
 pub async fn get_approval(pool: &PgPool, id: &str) -> Result<Option<ApprovalItem>, StoreError> {
     let select_sql =
         format!("SELECT {APPROVAL_COLUMNS_QUALIFIED} {APPROVAL_AUDIT_JOIN} WHERE a.id = $1");
-    let row: Option<ApprovalRow> = sqlx::query_as(&select_sql)
+    // safe: only the constants `APPROVAL_COLUMNS_QUALIFIED`, `APPROVAL_AUDIT_JOIN` are formatted
+    // in; values are bound.
+    let row: Option<ApprovalRow> = sqlx::query_as(sqlx::AssertSqlSafe(select_sql.as_str()))
         .bind(id)
         .fetch_optional(pool)
         .await?;
@@ -1665,6 +1698,210 @@ pub async fn decide_access_request(
     Ok(grant)
 }
 
+/// The user a grant is made to, found by e-mail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantTarget {
+    /// `app_user.id`.
+    pub id: Uuid,
+    /// `app_user.name`.
+    pub name: String,
+}
+
+/// The user whose e-mail is `email`, compared ignoring case; an exact match
+/// wins when two rows differ only in case (`app_user_email_unique` is
+/// case-sensitive). `DATA-15` F3.
+///
+/// # Errors
+///
+/// [`StoreError::Database`] on any query failure.
+pub async fn find_user_by_email(
+    pool: &PgPool,
+    email: &str,
+) -> Result<Option<GrantTarget>, StoreError> {
+    let row: Option<(Uuid, String)> = sqlx::query_as(
+        "SELECT id, name FROM app_user WHERE lower(email) = lower($1) \
+         ORDER BY (email = $1) DESC, created_at LIMIT 1",
+    )
+    .bind(email)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(id, name)| GrantTarget { id, name }))
+}
+
+/// A grant made from an asset's page, as the page lists it (`DATA-15` F3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssetGrant {
+    /// `access_grant.id`.
+    pub id: String,
+    /// The grantee's name.
+    pub user: String,
+    /// The grantee's e-mail, so two people with one name can be told apart.
+    pub user_email: String,
+    /// The permission token granted.
+    pub permission: String,
+    /// When it was granted, ISO 8601.
+    pub granted_at: String,
+    /// When it stops applying, ISO 8601.
+    pub expires_at: String,
+    /// `"request"` (an approved access request) or `"direct"`.
+    pub via: String,
+    /// Who granted it: the granter of a direct grant, or the person who
+    /// approved the request (from the approval's audit event). `None` when
+    /// that person was deleted or the approval predates the audit trail.
+    pub granted_by: Option<String>,
+}
+
+#[derive(FromRow)]
+struct AssetGrantRow {
+    id: String,
+    user_name: String,
+    user_email: String,
+    permission: String,
+    granted_at: OffsetDateTime,
+    expires_at: OffsetDateTime,
+    via: String,
+    granted_by: Option<String>,
+}
+
+impl From<AssetGrantRow> for AssetGrant {
+    fn from(row: AssetGrantRow) -> Self {
+        Self {
+            id: row.id,
+            user: row.user_name,
+            user_email: row.user_email,
+            permission: row.permission,
+            granted_at: iso_millis(row.granted_at),
+            expires_at: iso_millis(row.expires_at),
+            via: row.via,
+            granted_by: row.granted_by,
+        }
+    }
+}
+
+/// Every grant that is still in force (not revoked, not expired) and was
+/// made from the asset `catalog_id`: direct grants by their `catalog_id`,
+/// grants of approved requests by their approval's `resource`. Newest
+/// first. `DATA-15` F3.
+///
+/// # Errors
+///
+/// [`StoreError::Database`] on any query failure.
+pub async fn list_asset_grants(
+    pool: &PgPool,
+    catalog_id: &str,
+) -> Result<Vec<AssetGrant>, StoreError> {
+    let rows: Vec<AssetGrantRow> = sqlx::query_as(
+        "SELECT g.id, u.name AS user_name, u.email AS user_email, g.permission, \
+                g.granted_at, g.expires_at, \
+                CASE WHEN g.approval_id IS NULL THEN 'direct' ELSE 'request' END AS via, \
+                COALESCE(gb.name, decided.actor_label) AS granted_by \
+         FROM access_grant g \
+         JOIN app_user u ON u.id = g.user_id \
+         LEFT JOIN app_user gb ON gb.id = g.granted_by_user_id \
+         LEFT JOIN approval_item a ON a.id = g.approval_id \
+         LEFT JOIN LATERAL ( \
+             SELECT e.actor_label FROM audit_event e \
+              WHERE e.resource_kind = 'approval' AND e.resource_id = g.approval_id \
+                AND e.outcome = 'approved' \
+              ORDER BY e.at DESC LIMIT 1 \
+         ) decided ON true \
+         WHERE g.revoked_at IS NULL AND g.expires_at > now() \
+           AND (g.catalog_id = $1 OR a.resource = $1) \
+         ORDER BY g.granted_at DESC, g.id",
+    )
+    .bind(catalog_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(AssetGrant::from).collect())
+}
+
+/// A direct grant just made.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectGrant {
+    /// `access_grant.id`.
+    pub id: String,
+    /// When it stops applying, ISO 8601.
+    pub expires_at: String,
+}
+
+/// Inserts a direct grant (no approval) of `permission` to `user_id`,
+/// made from the asset `catalog_id` by `granted_by`, lasting `days` days.
+/// The caller has already checked the permission is one that may be
+/// granted and that the user does not hold it. `DATA-15` F3.
+///
+/// # Errors
+///
+/// [`StoreError::Database`] on any failure, including a `user_id` or
+/// `granted_by` that names no `app_user` row.
+pub async fn create_direct_grant(
+    pool: &PgPool,
+    user_id: Uuid,
+    permission: &str,
+    catalog_id: &str,
+    granted_by: Uuid,
+    days: i64,
+) -> Result<DirectGrant, StoreError> {
+    let (id, expires_at): (String, OffsetDateTime) = sqlx::query_as(
+        "INSERT INTO access_grant \
+             (id, user_id, permission, catalog_id, granted_by_user_id, expires_at) \
+         VALUES ($1, $2, $3, $4, $5, now() + ($6 || ' days')::interval) \
+         RETURNING id, expires_at",
+    )
+    .bind(format!("grant-{}", Uuid::new_v4()))
+    .bind(user_id)
+    .bind(permission)
+    .bind(catalog_id)
+    .bind(granted_by)
+    .bind(days.to_string())
+    .fetch_one(pool)
+    .await?;
+    Ok(DirectGrant {
+        id,
+        expires_at: iso_millis(expires_at),
+    })
+}
+
+/// What a revoke ended, for the audit event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevokedGrant {
+    /// The grantee's name.
+    pub user: String,
+    /// The permission that was revoked.
+    pub permission: String,
+}
+
+/// Revokes the grant `grant_id` if it is in force and was made from the
+/// asset `catalog_id` (a direct grant of it, or the grant of an approved
+/// request for it): sets `revoked_at` and `revoked_by_user_id`. A grant
+/// already revoked or expired, or made from another asset, is `Ok(None)`.
+/// The grantee loses the permission at their next request
+/// (`load_principal_for_user`). `DATA-15` F3.
+///
+/// # Errors
+///
+/// [`StoreError::Database`] on any query failure.
+pub async fn revoke_asset_grant(
+    pool: &PgPool,
+    catalog_id: &str,
+    grant_id: &str,
+    revoked_by: Uuid,
+) -> Result<Option<RevokedGrant>, StoreError> {
+    let row: Option<(String, String)> = sqlx::query_as(
+        "UPDATE access_grant g SET revoked_at = now(), revoked_by_user_id = $3 \
+          WHERE g.id = $2 AND g.revoked_at IS NULL AND g.expires_at > now() \
+            AND (g.catalog_id = $1 OR EXISTS ( \
+                 SELECT 1 FROM approval_item a WHERE a.id = g.approval_id AND a.resource = $1)) \
+      RETURNING (SELECT u.name FROM app_user u WHERE u.id = g.user_id), g.permission",
+    )
+    .bind(catalog_id)
+    .bind(grant_id)
+    .bind(revoked_by)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(user, permission)| RevokedGrant { user, permission }))
+}
+
 /// `overview.pendingApprovals` (WS5 item B2): the count of approval items
 /// still waiting on a human decision.
 ///
@@ -1694,7 +1931,11 @@ pub async fn list_pending_approvals(pool: &PgPool) -> Result<Vec<ApprovalItem>, 
         "SELECT {APPROVAL_COLUMNS_QUALIFIED} {APPROVAL_AUDIT_JOIN} WHERE a.status = 'pending' \
          ORDER BY a.requested_at DESC"
     );
-    let rows: Vec<ApprovalRow> = sqlx::query_as(&sql).fetch_all(pool).await?;
+    // safe: only the constants `APPROVAL_COLUMNS_QUALIFIED`, `APPROVAL_AUDIT_JOIN` are formatted
+    // in; values are bound.
+    let rows: Vec<ApprovalRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+        .fetch_all(pool)
+        .await?;
     Ok(rows.into_iter().map(ApprovalItem::from).collect())
 }
 
@@ -1800,8 +2041,8 @@ mod access_request_tests {
     /// all. Quoted failure text (`cargo test -p lakehouse-store
     /// agents::create_access_request 2>&1 | tail -30` against the pre-E1/E2
     /// state): `error[E0433]: failed to resolve: use of undeclared type
-    /// \`NewAccessRequest\`` / `error[E0425]: cannot find function
-    /// \`create_access_request\` in this scope`.
+    /// NewAccessRequest` / `error[E0425]: cannot find function
+    /// create_access_request in this scope`.
     #[sqlx::test(migrations = "../../migrations")]
     async fn create_access_request_inserts_a_pending_approval_with_kind_access(
         pool: PgPool,
@@ -1830,8 +2071,8 @@ mod access_request_tests {
     /// `decide_access_request`/`AccessGrant` did not exist at all. Quoted
     /// failure text (`cargo test -p lakehouse-store
     /// agents::decide_access_request 2>&1 | tail -30` against the pre-E3
-    /// state): `error[E0425]: cannot find function \`decide_access_request\`
-    /// in this scope`.
+    /// state): ``error[E0425]: cannot find function `decide_access_request`
+    /// in this scope``.
     #[sqlx::test(migrations = "../../migrations")]
     async fn decide_access_request_approved_creates_a_time_bounded_grant(
         pool: PgPool,
@@ -1868,6 +2109,163 @@ mod access_request_tests {
         )
         .expect("expires_at must be a real ISO 8601 timestamp");
         assert!(expires_at > time::OffsetDateTime::now_utc());
+        Ok(())
+    }
+
+    /// `DATA-15` F3: a direct grant has no approval, is listed for the asset
+    /// it was made from (with its granter), and is not listed for another.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_direct_grant_is_listed_for_its_asset_only(pool: PgPool) -> sqlx::Result<()> {
+        let admin = seed_test_user(&pool, "admin@tenant-a.invalid").await;
+        let user = seed_test_user(&pool, "user@tenant-a.invalid").await;
+        let made =
+            super::create_direct_grant(&pool, user, "query:read", "silver.orders", admin, 30)
+                .await
+                .expect("a direct grant must insert");
+        let here = super::list_asset_grants(&pool, "silver.orders")
+            .await
+            .unwrap();
+        assert_eq!(here.len(), 1);
+        assert_eq!(here[0].id, made.id);
+        assert_eq!(here[0].via, "direct");
+        assert_eq!(here[0].permission, "query:read");
+        assert_eq!(here[0].user_email, "user@tenant-a.invalid");
+        assert_eq!(
+            here[0].granted_by.as_deref(),
+            Some("admin@tenant-a.invalid")
+        );
+        let grants = super::list_asset_grants(&pool, "silver.other")
+            .await
+            .unwrap();
+        assert!(grants.is_empty(), "{grants:?}");
+        Ok(())
+    }
+
+    /// `DATA-15` F3: an approved request's grant is listed for the asset the
+    /// request named, as `via: "request"`.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn an_approved_requests_grant_is_listed_for_the_requested_asset(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let requester = seed_test_user(&pool, "req3@tenant-a.invalid").await;
+        let req = create_access_request(
+            &pool,
+            &NewAccessRequest {
+                requested_by_user_id: requester,
+                catalog_id: "silver.orders",
+                permission: "lineage:read",
+                reason: "x",
+            },
+        )
+        .await
+        .unwrap();
+        super::decide_access_request(&pool, &req.id, super::Decision::Approved, None, 30)
+            .await
+            .unwrap();
+        let listed = super::list_asset_grants(&pool, "silver.orders")
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].via, "request");
+        assert_eq!(listed[0].permission, "lineage:read");
+        Ok(())
+    }
+
+    /// `DATA-15` F3: a revoke ends the grant (it stops being listed and stops
+    /// applying), only from the asset it was made from, and only once.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_revoked_grant_stops_being_listed_and_cannot_be_revoked_twice(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let admin = seed_test_user(&pool, "admin2@tenant-a.invalid").await;
+        let user = seed_test_user(&pool, "user2@tenant-a.invalid").await;
+        let made =
+            super::create_direct_grant(&pool, user, "query:read", "silver.orders", admin, 30)
+                .await
+                .unwrap();
+        // Another asset's page cannot revoke it.
+        assert!(
+            super::revoke_asset_grant(&pool, "silver.other", &made.id, admin)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let revoked = super::revoke_asset_grant(&pool, "silver.orders", &made.id, admin)
+            .await
+            .unwrap()
+            .expect("the grant is in force");
+        assert_eq!(revoked.permission, "query:read");
+        assert_eq!(revoked.user, "user2@tenant-a.invalid");
+        let grants = super::list_asset_grants(&pool, "silver.orders")
+            .await
+            .unwrap();
+        assert!(grants.is_empty(), "{grants:?}");
+        assert!(
+            super::revoke_asset_grant(&pool, "silver.orders", &made.id, admin)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let (revoked_by,): (Option<Uuid>,) =
+            sqlx::query_as("SELECT revoked_by_user_id FROM access_grant WHERE id = $1")
+                .bind(&made.id)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(revoked_by, Some(admin));
+        Ok(())
+    }
+
+    /// `DATA-15` F3: the `CHECK` — a grant with neither an approval nor an
+    /// asset is refused — and deleting the granter keeps a direct grant.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_grant_needs_an_origin_and_survives_its_granters_deletion(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let admin = seed_test_user(&pool, "admin3@tenant-a.invalid").await;
+        let user = seed_test_user(&pool, "user3@tenant-a.invalid").await;
+        let orphan = sqlx::query(
+            "INSERT INTO access_grant (id, user_id, permission, expires_at) \
+             VALUES ('grant-orphan', $1, 'query:read', now() + interval '1 day')",
+        )
+        .bind(user)
+        .execute(&pool)
+        .await;
+        assert!(
+            orphan.is_err(),
+            "a grant with no approval and no asset must be refused"
+        );
+
+        super::create_direct_grant(&pool, user, "query:read", "silver.orders", admin, 30)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM app_user WHERE id = $1")
+            .bind(admin)
+            .execute(&pool)
+            .await?;
+        let listed = super::list_asset_grants(&pool, "silver.orders")
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].granted_by, None);
+        Ok(())
+    }
+
+    /// `DATA-15` F3: the e-mail lookup ignores case and finds nobody for an
+    /// unknown address.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_user_is_found_by_email_ignoring_case(pool: PgPool) -> sqlx::Result<()> {
+        let id = seed_test_user(&pool, "Mixed.Case@tenant-a.invalid").await;
+        let found = super::find_user_by_email(&pool, "mixed.case@TENANT-A.invalid")
+            .await
+            .unwrap()
+            .expect("found");
+        assert_eq!(found.id, id);
+        assert!(
+            super::find_user_by_email(&pool, "nobody@tenant-a.invalid")
+                .await
+                .unwrap()
+                .is_none()
+        );
         Ok(())
     }
 }

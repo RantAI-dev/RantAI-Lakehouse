@@ -151,12 +151,14 @@ import json
 import logging
 import os
 import warnings
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Protocol
 
 import dlt
+import pyarrow as pa
+from dlt.common.utils import uniq_id_base64
 from dlt.destinations import filesystem
 from dlt.destinations.adapters import iceberg_adapter, iceberg_partition
 from dlt.extract.incremental import IncrementalResourceWrapper
@@ -164,9 +166,11 @@ from dlt.extract.resource import DltResource
 from dlt.extract.source import DltSource
 from dlt.pipeline.exceptions import PipelineStepFailed
 from dlt.pipeline.helpers import pipeline_drop
+from pydantic import TypeAdapter
 from pyiceberg.expressions import AlwaysTrue
+from pyiceberg.types import IcebergType
 
-from dispar_orchestrate.adapters import dedup, history
+from dispar_orchestrate.adapters import dedup, history, iceberg_stream
 
 logger = logging.getLogger(__name__)
 
@@ -178,6 +182,9 @@ REFRESHES = ("keep", "remove")
 # beyond a cursor (the cursor is pushed into the query, so only `sql_database`).
 DEDUP_MODES = ("replace_dedup", "incremental_dedup")
 INCREMENTAL_MODES = ("incremental", "incremental_dedup")
+# The resource-state keys a vendor's change-feed link is kept under (`SRC-3` final review
+# BLOCKER 17; Graph's link and Dataverse's link with the `$select` it belongs to).
+DELTA_STATE_KEYS = ("delta_link", "delta")
 # SRC-10 sixth pass: `history` also needs a key, but is written by `adapters/history.py`
 # and takes no cursor (decision 10).
 KEY_MODES = (*DEDUP_MODES, "history")
@@ -291,7 +298,7 @@ class LoadPlan:
         )
 
 
-def _stamp_ingested_at(record: dict[str, Any]) -> dict[str, Any]:
+def _stamp_ingested_at(record: Any) -> Any:
     """Bronze's system ingestion-time column (ADR 0004's
     `bronze::INGESTED_AT_COLUMN` equivalent for the dlt write path) --
     stamped here, the ONE place any Bronze row this sink writes gets it,
@@ -299,7 +306,19 @@ def _stamp_ingested_at(record: dict[str, Any]) -> dict[str, Any]:
     (e.g. a Kafka payload that happens to carry a same-named field) is
     OVERWRITTEN, not preserved, so partitioning never depends on a
     source-provided timestamp existing, being non-null, or meaning what
-    this column means."""
+    this column means.
+
+    `record` is a row (a dict) or, since the upload job streams in batches
+    (`DATA-17` T2.1), an Arrow table or record batch: every row of the batch gets
+    the one moment the batch was stamped, in a `timestamp[us, UTC]` column that
+    replaces a column of the same name the batch brought."""
+    if isinstance(record, (pa.Table, pa.RecordBatch)):
+        stamp = pa.array([datetime.now(timezone.utc)] * record.num_rows, type=pa.timestamp("us", tz="UTC"))
+        if isinstance(record, pa.RecordBatch):
+            record = pa.Table.from_batches([record])
+        if "_ingested_at" in record.schema.names:
+            record = record.drop_columns(["_ingested_at"])
+        return record.append_column("_ingested_at", stamp)
     record["_ingested_at"] = datetime.now(timezone.utc)
     return record
 
@@ -389,9 +408,14 @@ class SinkConfig:
     rustfs_secret_key: str
     warehouse_bucket: str
     lakekeeper_token: str
+    # Who the commits of OUR OWN `pyiceberg` writes (the history mode, emptying a table)
+    # are recorded as: the run's label, e.g. `connector conn-x, run 1a2b`
+    # (`history.snapshot_properties`). Empty when the caller has no run context; `dlt`'s
+    # own commits do not carry it (`DATA-15` F5: that is the loader's owners' change).
+    author: str = ""
 
     @classmethod
-    def from_bronze_ingest_config(cls, config: BronzeIngestConfigLike) -> "SinkConfig":
+    def from_bronze_ingest_config(cls, config: BronzeIngestConfigLike, author: str = "") -> "SinkConfig":
         return cls(
             lakekeeper_catalog_uri=config.lakekeeper_catalog_uri,
             lakekeeper_warehouse=config.lakekeeper_warehouse,
@@ -400,6 +424,7 @@ class SinkConfig:
             rustfs_secret_key=config.rustfs_secret_key,
             warehouse_bucket=config.warehouse_bucket,
             lakekeeper_token=config.lakekeeper_token,
+            author=author,
         )
 
 
@@ -566,6 +591,47 @@ def _has_cursor(pipeline: Any, cursor: str, *, sync: bool = True) -> bool:
     )
 
 
+def _continues_from_delta(source: Any) -> bool:
+    """Whether `source` reads its objects from a vendor's change-feed link
+    instead of a cursor (`adapters/saas.py` sets `delta_state` on the
+    resource; final review BLOCKER 17)."""
+    if isinstance(source, DltSource):
+        resources = list(source.selected_resources.values())
+    elif isinstance(source, DltResource):
+        resources = [source]
+    else:
+        return False
+    return any(getattr(resource, "delta_state", False) for resource in resources)
+
+
+def _delta_resources(pipeline: Any) -> dict[str, list[str]]:
+    """The resources whose state holds a vendor's change-feed link
+    (`{schema name: [resource name]}`): Graph's `@odata.deltaLink` and
+    Dataverse's change-tracking link (`SRC-3` final review BLOCKER 17)."""
+    remembered: dict[str, list[str]] = {}
+    for schema_name, source_state in (pipeline.state.get("sources") or {}).items():
+        for resource_name, resource_state in (source_state.get("resources") or {}).items():
+            if any(key in resource_state for key in DELTA_STATE_KEYS):
+                remembered.setdefault(schema_name, []).append(resource_name)
+    return remembered
+
+
+def _has_delta_link(pipeline: Any) -> bool:
+    """Whether an earlier run committed a change-feed link to continue from.
+    A delta object has no dlt cursor to ask (`_has_cursor`), so "first run"
+    (and therefore a replace rather than a merge) is decided by its link."""
+    return any(_delta_resources(pipeline).values())
+
+
+def _forget_delta_links(pipeline: Any) -> None:
+    """Drop every change-feed link. A run that must read the object in full
+    (its first one, or the first after a mode that left the table without the
+    deduplication marker) forgets the link first, or the read would return only
+    what changed since it and the replace would lose the rest of the table."""
+    for schema_name, resources in sorted(_delta_resources(pipeline).items()):
+        pipeline_drop(pipeline, resources=sorted(resources), schema_name=schema_name, state_only=True)()
+
+
 def _forget_cursors(pipeline: Any) -> None:
     """Drop every incremental cursor after an `append` run. That run added
     the whole source again, so a cursor kept from an earlier incremental
@@ -583,7 +649,8 @@ def _forget_cursors(pipeline: Any) -> None:
 def _forget_table_state(pipeline: Any) -> None:
     """Drop everything the pipeline remembers about how far the table got: every
     incremental cursor AND every deduplication marker (`SRC-10` decision 5, a
-    refresh or a clear). Without a cursor an incremental mode reads everything;
+    refresh or a clear), and a vendor's change-feed link (final review BLOCKER 17).
+    Without a cursor an incremental mode reads everything;
     without the marker `incremental_dedup` treats its next run as the first and
     replaces. Reads the state stored with the data first (a recreated container
     has no local copy). `pipeline_drop(state_only=True)` removes a resource's
@@ -595,7 +662,9 @@ def _forget_table_state(pipeline: Any) -> None:
     remembered: dict[str, list[str]] = {}
     for schema_name, source_state in (pipeline.state.get("sources") or {}).items():
         for resource_name, resource_state in (source_state.get("resources") or {}).items():
-            if resource_state.get("incremental") or dedup.MARKER_KEY in resource_state:
+            if resource_state.get("incremental") or dedup.MARKER_KEY in resource_state or any(
+                key in resource_state for key in DELTA_STATE_KEYS
+            ):
                 remembered.setdefault(schema_name, []).append(resource_name)
     for schema_name, resources in sorted(remembered.items()):
         pipeline_drop(pipeline, resources=sorted(resources), schema_name=schema_name, state_only=True)()
@@ -623,7 +692,7 @@ def _bronze_pipeline(bronze_table_name: str, config: SinkConfig) -> Any:
     )
 
 
-def empty_table(pipeline: Any, bronze_table_name: str) -> bool:
+def empty_table(pipeline: Any, bronze_table_name: str, author: str = "") -> bool:
     """Delete every row of a Bronze table in ONE `pyiceberg` transaction, keeping the
     table: its columns, its day partition on `_ingested_at`, `format-version` 2 and its
     snapshot history. The ONE way a Bronze table is emptied (`clear_table`, a refresh
@@ -649,6 +718,8 @@ def empty_table(pipeline: Any, bronze_table_name: str) -> bool:
     history pass: it tolerates a write of ours), so its view stays consistent; the
     cursor and marker are forgotten by the caller.
 
+    `author` is recorded on the commit as `rantai.author` (`history.snapshot_properties`).
+
     # Errors
 
     Whatever the catalog raises; `RuntimeError` (fixed text) if a row remains after
@@ -659,7 +730,7 @@ def empty_table(pipeline: Any, bronze_table_name: str) -> bool:
     with warnings.catch_warnings():
         # pyiceberg warns when a delete matches nothing: an already empty table.
         warnings.filterwarnings("ignore", message="Delete operation did not match any records")
-        iceberg_table.delete(delete_filter=AlwaysTrue())
+        iceberg_table.delete(delete_filter=AlwaysTrue(), snapshot_properties=history.snapshot_properties(author))
     if iceberg_table.scan(limit=1).to_arrow().num_rows:
         raise RuntimeError(f"table {bronze_table_name!r}: rows remained after the delete")
     return True
@@ -679,7 +750,7 @@ def clear_table(bronze_table_name: str, config: SinkConfig) -> SinkResult:
     pipeline = _bronze_pipeline(bronze_table_name, config)
     _abort_pending(pipeline, strict=True)
     _forget_table_state(pipeline)
-    emptied = empty_table(pipeline, bronze_table_name)
+    emptied = empty_table(pipeline, bronze_table_name, config.author)
     return SinkResult(
         rows=0,
         has_failed_jobs=False,
@@ -714,12 +785,174 @@ def _apply_cursor(source: Any, cursor: str, mode: str = "incremental") -> None:
     else:
         raise UnsupportedLoadMode(f"load mode {mode!r} needs a dlt source or resource, not plain rows")
     for resource in resources:
+        if getattr(resource, "delta_state", False):
+            # PR #216 final review BLOCKER 17: an object read from a vendor's change-feed link is
+            # not filtered by a cursor at all (its rows can predate the last one seen); the merge on
+            # its key is what makes the rerun exact. `adapters/saas.py` builds it without dlt's
+            # incremental step, so there is nothing to re-apply here.
+            continue
         if not isinstance(resource.incremental, IncrementalResourceWrapper):
             raise UnsupportedLoadMode(
                 f"load mode {mode!r} is not available for {resource.name!r}: its source cannot filter by a "
                 "cursor before the rows are stamped, so reruns would add the last row again"
             )
-        resource.apply_hints(incremental=dlt.sources.incremental(cursor))
+        # SRC-3 V-GA4.2: a `saas` object whose vendor changes recent records after first
+        # reporting them (Google Analytics: 24 to 48 hours) names the lag its cursor
+        # must step back by (`ObjectDecl.lag_seconds`, set on the resource by
+        # `adapters/saas.py`). Without it the hint below would replace the resource's own
+        # cursor and drop the lag, and dlt would then filter out the re-read rows. A
+        # `sql_database` resource has no such attribute: unchanged for it.
+        lag = getattr(resource, "cursor_lag_seconds", None)
+        resource.apply_hints(incremental=dlt.sources.incremental(cursor, lag=lag))
+
+
+# `DATA-18` flush size of a type-changing replace: the batches the job hands over are
+# gathered up to this many bytes, then written as data files inside the one transaction.
+RETYPE_FLUSH_BYTES = 64 * 1024 * 1024
+# The columns the sink itself adds and `dlt`'s own bookkeeping. They are not the load's
+# columns, and the table may or may not carry them: `_fit_batch` fills the `dlt` ones in
+# and drops the stamp when the table has no such column (`PR #186 review SHOULD-FIX 1`).
+SYSTEM_COLUMNS = ("_ingested_at", "_dlt_id", "_dlt_load_id")
+# Iceberg's own type names (`long`, `decimal(38, 9)`, `timestamptz`) as pyiceberg's types.
+_ICEBERG_TYPE: TypeAdapter[IcebergType] = TypeAdapter(IcebergType)
+
+
+def _changed_columns(table: Any, column_types: Mapping[str, str]) -> list[str]:
+    """The columns the table has with another Iceberg type than the load is about to
+    write, in the table's column order. `column_types` maps a column name to the Iceberg
+    type name the load writes; a column the table has and the load does not write is not a
+    difference, and neither is a column the table does not have yet."""
+    held = {field.name: str(field.field_type) for field in table.schema().fields}
+    return [
+        field.name
+        for field in table.schema().fields
+        if field.name in column_types and held[field.name] != column_types[field.name]
+    ]
+
+
+def _retype_in(transaction: Any, table: Any, changed: list[str], column_types: Mapping[str, str]) -> None:
+    """Stage, in `transaction`, the new type of each column in `changed`: the column is
+    deleted and added again under the same name (Iceberg refuses `update_column` to a type
+    that does not widen), then moved back to where it was, so the table keeps the file's
+    column order. A column the load writes and the table does not have yet is added as it
+    is (`PR #186 review SHOULD-FIX 1`: it was dropped, and the load reported success).
+    Nothing is committed here."""
+    order = [field.name for field in table.schema().fields]
+    added = [name for name in column_types if name not in order]
+    with transaction.update_schema() as update:
+        for name in changed:
+            update.delete_column(name)
+            update.add_column(name, _ICEBERG_TYPE.validate_python(column_types[name]))
+        for name in added:
+            update.add_column(name, _ICEBERG_TYPE.validate_python(column_types[name]))
+    with transaction.update_schema() as update:
+        for name in changed:  # in the table's order, so the column before is already in place
+            position = order.index(name)
+            if position == 0:
+                update.move_first(name)
+            else:
+                update.move_after(name, order[position - 1])
+
+
+def _items_of(source: Any) -> Iterable[Any]:
+    """What a `dlt` source or resource yields when it is run without a pipeline (its
+    maps, among them the `_ingested_at` stamp, are applied), or the items of a plain iterable."""
+    if isinstance(source, DltSource):
+        for resource in source.selected_resources.values():
+            yield from resource
+    else:
+        yield from source
+
+
+def _fit_batch(batch: pa.Table, target: pa.Schema, load_id: str) -> pa.Table:
+    """`batch` laid out as the table's (new) schema: its columns cast to the table's types, the
+    columns it does not carry as `dlt` would leave them (`_dlt_load_id`, `_dlt_id` filled in,
+    any other column null).
+
+    # Errors
+
+    Raises `ValueError` for a required column of a name this function cannot fill, for a
+    column of the load the table does not have (`PR #186 review SHOULD-FIX 1`: it was dropped
+    silently, and the load reported success), and whatever the cast raises for a value that
+    does not fit."""
+    extra = [
+        name
+        for name in batch.schema.names
+        if name not in target.names and name not in SYSTEM_COLUMNS
+    ]
+    if extra:
+        # The names are in the log, never in the message: the message is a fixed sentence.
+        logger.warning("the load has a column the table does not have: %s", ", ".join(sorted(extra)))
+        raise ValueError("the load has a column the table does not have")
+    rows = batch.num_rows
+    arrays = []
+    for field in target:
+        if field.name in batch.schema.names:
+            arrays.append(batch[field.name].cast(field.type))
+        elif field.name == "_dlt_load_id":
+            arrays.append(pa.array([load_id] * rows, type=field.type))
+        elif field.name == "_dlt_id":
+            arrays.append(pa.array([uniq_id_base64(10) for _ in range(rows)], type=field.type))
+        elif field.nullable:
+            arrays.append(pa.nulls(rows, type=field.type))
+        else:
+            raise ValueError("a required column of the table is not in the load")
+    return pa.Table.from_arrays(arrays, schema=target)
+
+
+def _replace_changing_types(
+    table: Any, source: Any, changed: list[str], column_types: Mapping[str, str]
+) -> int:
+    """`DATA-18` decision 9, "replacing a table may change its types": write a `replace` that
+    changes column types as ONE `pyiceberg` transaction, the new schema and the new rows
+    together (Phase 3 slice 3 review BLOCKER 1). A failure anywhere inside, including the
+    stream's own (`on_bad_value` told to stop), commits nothing: the schema, the rows and the
+    current snapshot stay as they were, and the old snapshots stay in the table's history
+    after a success. The table is NEVER dropped or purged.
+
+    Measured with dlt 1.30.0 and pyiceberg 0.12.0 (section 8 item 5 of the Phase 3 plan): a
+    `dlt` replace that changes a column's type is refused by pyiceberg, so this case does not
+    go through `dlt`; every other load does. The batches are read from `source` (already
+    stamped with `_ingested_at`) and written inside the transaction in groups of up to
+    `RETYPE_FLUSH_BYTES`, so the file is never held whole. A failure after some groups were
+    written leaves their data files in the bucket, unreferenced by the table (the orphan
+    clean-up of `maintenance.py` owns those).
+
+    The table's `dlt` schema (in the bucket) keeps the old types of the changed columns
+    until the next `dlt` load of the table, which always declares its column types, and
+    those declarations win (section 8 item 5: no variant column).
+
+    Returns the number of rows written. # Errors: whatever the catalog, the cast or
+    `source` raises; nothing is committed then."""
+    load_id = f"{datetime.now(timezone.utc).timestamp():.6f}"
+    rows = 0
+    pending: list[pa.Table] = []
+    pending_bytes = 0
+    first = True
+    with table.transaction() as transaction:
+        _retype_in(transaction, table, changed, column_types)
+        target = transaction.table_metadata.schema().as_arrow()
+
+        def flush() -> None:
+            nonlocal first, pending, pending_bytes
+            if not pending and not first:
+                return
+            chunk = pa.concat_tables(pending) if pending else target.empty_table()
+            # The first group replaces what the table holds; later groups add to it.
+            (transaction.overwrite if first else transaction.append)(chunk)
+            first, pending, pending_bytes = False, [], 0
+
+        for item in _items_of(source):
+            fitted = _fit_batch(
+                pa.Table.from_batches([item]) if isinstance(item, pa.RecordBatch) else item, target, load_id
+            )
+            rows += fitted.num_rows
+            pending.append(fitted)
+            pending_bytes += fitted.nbytes
+            if pending_bytes >= RETYPE_FLUSH_BYTES:
+                flush()
+        flush()
+    return rows
 
 
 def _abort_pending(pipeline: Any, *, strict: bool = False) -> None:
@@ -807,7 +1040,7 @@ def _load_history(source: Any, bronze_table_name: str, config: SinkConfig, plan:
         _forget_table_state(pipeline)
     try:
         outcome = history.load_history(
-            pipeline, source, bronze_table_name, plan.key, _apply_iceberg_hints
+            pipeline, source, bronze_table_name, plan.key, _apply_iceberg_hints, author=config.author
         )
     except Exception:
         _abort_pending(pipeline)
@@ -821,7 +1054,11 @@ def _load_history(source: Any, bronze_table_name: str, config: SinkConfig, plan:
 
 
 def load_via_sink(
-    source, bronze_table_name: str, config: SinkConfig, plan: LoadPlan = LoadPlan()
+    source,
+    bronze_table_name: str,
+    config: SinkConfig,
+    plan: LoadPlan = LoadPlan(),
+    column_types: Mapping[str, str] | None = None,
 ) -> SinkResult:
     """Write `source` (an already-configured `dlt` source, e.g. `sql_database(...)`
     with hints/maps already applied by the calling adapter) to Bronze
@@ -839,8 +1076,15 @@ def load_via_sink(
     with no key value, more distinct keys than `INGEST_DEDUP_MAX_ROWS`, cursor
     values that cannot be ordered. On any failure the pipeline's pending
     packages are aborted first (see "What a failed load leaves behind").
+
+    `column_types` (name to Iceberg type name, `DATA-18`): when given, a `replace` that
+    changes a column's type is written as one `pyiceberg` transaction instead of through
+    `dlt` (`_replace_changing_types`); it never drops the table.
     """
     _install_catalog_env(config)
+    # PR #186 review BLOCKER 6: dlt's Iceberg job reads the whole load into memory; see
+    # `iceberg_stream`. Before any pipeline exists, so every job of this load takes the path.
+    iceberg_stream.install()
     if plan.refresh == "remove":
         # SRC-10 decision 5: refresh, removing old rows. Emptied here, at the point
         # of loading, after the adapter's schema check let the table through (the
@@ -923,11 +1167,18 @@ def load_via_sink(
     # What the pipeline state says about earlier runs, read from the bucket first
     # (a recreated container has no local copy). Only the modes that continue from
     # a cursor consult it; the others cost no extra read.
+    # PR #216 final review BLOCKER 17: a delta object continues from its vendor link, kept in the
+    # resource state, not from a dlt cursor (`_has_cursor` would always say "first run" for it and
+    # the run would replace the table with only the changed rows).
+    delta = plan.mode in INCREMENTAL_MODES and _continues_from_delta(source)
     key_marked = False
     if plan.mode in INCREMENTAL_MODES:
         # (Synced above, by the history check or the refresh.)
         markers = dedup.markers(pipeline.state)
         key_marked = bool(markers) and all(marker == list(plan.key) for marker in markers)
+    continues = (
+        _has_delta_link(pipeline) if delta else _has_cursor(pipeline, plan.cursor or "", sync=False)
+    ) if plan.mode in INCREMENTAL_MODES else False
     run_options: dict[str, Any] = {}
     if plan.mode == "incremental":
         write_disposition: Any = "append"
@@ -939,16 +1190,19 @@ def load_via_sink(
         run_options["primary_key"] = list(plan.key)
     else:
         write_disposition = plan.mode
-    if plan.mode == "incremental_dedup" and not key_marked and _has_cursor(pipeline, plan.cursor or "", sync=False):
+    if plan.mode == "incremental_dedup" and not key_marked and continues:
         # SRC-10 R2: a cursor exists (the table was loaded with `incremental`, or
         # with another key) but no run has left the table deduplicated on THIS key.
-        # The run must read everything and replace, so the cursor goes first. Done
-        # before the run and failing safe: with no cursor, a failed run is "first"
-        # again next time.
-        _forget_cursors(pipeline)
+        # The run must read everything and replace, so the cursor (or, for a delta
+        # object, the link) goes first. Done before the run and failing safe: with
+        # nothing to continue from, a failed run is "first" again next time.
+        if delta:
+            _forget_delta_links(pipeline)
+        else:
+            _forget_cursors(pipeline)
+        continues = False
     if plan.mode in INCREMENTAL_MODES and (
-        not _has_cursor(pipeline, plan.cursor or "", sync=False)
-        or (plan.mode == "incremental_dedup" and not key_marked)
+        not continues or (plan.mode == "incremental_dedup" and not key_marked)
     ):
         # Nothing to continue from: load everything, and replace rather
         # than stack it onto what an earlier mode left there. For
@@ -960,13 +1214,29 @@ def load_via_sink(
         # re-reads and re-merges the last row.
         write_disposition = "replace"
     try:
-        load_info = pipeline.run(
-            source,
-            table_name=bronze_table_name,
-            table_format="iceberg",
-            write_disposition=write_disposition,
-            **run_options,
-        )
+        changed: list[str] = []
+        retype_table = None
+        if column_types is not None and write_disposition == "replace":
+            # `DATA-18`: a replace may change the column types; see `_replace_changing_types`.
+            retype_table = history.open_table(pipeline, bronze_table_name, sync=False)
+            changed = _changed_columns(retype_table, column_types) if retype_table is not None else []
+        if changed and retype_table is not None and column_types is not None:
+            # Phase 3 slice 3 review BLOCKER 1: one transaction, never a drop.
+            written = _replace_changing_types(retype_table, source, changed, column_types)
+            return SinkResult(
+                rows=written,
+                has_failed_jobs=False,
+                load_info_str=f"replaced in one commit, {len(changed)} column type(s) changed",
+                columns=(),  # dlt's schema is not updated by this path: nothing to report, nothing guessed
+            )
+        else:
+            load_info = pipeline.run(
+                source,
+                table_name=bronze_table_name,
+                table_format="iceberg",
+                write_disposition=write_disposition,
+                **run_options,
+            )
         dedup.assert_flushed(dedup_steps, table=bronze_table_name)
     except Exception as exc:
         # SRC-10 measurement 4: a failed load leaves its package pending and the

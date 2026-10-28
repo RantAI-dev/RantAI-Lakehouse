@@ -84,8 +84,14 @@ pub enum Kind {
     /// and refuse it otherwise; `upload_parquet` converts it (ADR 0014,
     /// amendment of 2026-10-08).
     Parquet,
-    /// Another binary format (a PDF, a gzip stream), or bytes that are not
-    /// text (NUL bytes in something that is not UTF-16). Refused.
+    /// A gzip stream (`.gz`, `DATA-17` slice 4). The routes accept it when it is
+    /// also named `.gz` and holds text or JSON; `upload_formats` reads it.
+    Gzip,
+    /// An Avro object container file (`Obj` and a 1). The routes accept it when it is
+    /// also named `.avro`; `upload_formats` reads it.
+    Avro,
+    /// Another binary format (a PDF), or bytes that are not text (NUL bytes in
+    /// something that is not UTF-16). Refused.
     OtherBinary,
 }
 
@@ -111,7 +117,15 @@ pub fn sniff(head: &[u8]) -> Kind {
     if head.starts_with(b"PAR1") && head.get(4).is_some_and(|b| is_control(*b)) {
         return Kind::Parquet;
     }
-    if head.starts_with(b"%PDF-") || head.starts_with(&[0x1F, 0x8B]) {
+    if head.starts_with(&[0x1F, 0x8B]) {
+        return Kind::Gzip;
+    }
+    // `Obj` and the byte 1: four bytes that are not a header of any text export a
+    // person would save, and an Avro container always starts so.
+    if head.starts_with(b"Obj\x01") {
+        return Kind::Avro;
+    }
+    if head.starts_with(b"%PDF-") {
         return Kind::OtherBinary;
     }
     if detect_encoding(head) == Encoding::Utf8 && head.contains(&0) {
@@ -199,13 +213,19 @@ pub fn decode(bytes: &[u8], encoding: Encoding) -> String {
                 [0xFE, 0xFF, rest @ ..] => (rest, true),
                 other => (other, false),
             };
+            // `as_chunks::<2>().0` is `chunks_exact(2)` with the chunk typed
+            // as `[u8; 2]`: it stops at the last whole unit and leaves a
+            // trailing odd byte in `.1`, which is dropped, as before
+            // (clippy's `chunks_exact_to_as_chunks` under 1.99 — REL-9).
             let units: Vec<u16> = bytes
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|pair| {
                     if big_endian {
-                        u16::from_be_bytes([pair[0], pair[1]])
+                        u16::from_be_bytes(*pair)
                     } else {
-                        u16::from_le_bytes([pair[0], pair[1]])
+                        u16::from_le_bytes(*pair)
                     }
                 })
                 .collect();
@@ -546,6 +566,38 @@ pub fn preview(
     }
 }
 
+/// The data records a type guess reads (`DATA-18`, decision 1): the records
+/// below the header that are not blank, at most `max_rows` of them, read as
+/// `using` says (`preview`'s `using`).
+///
+/// Only the records it returns are ever held, so a 16 MiB head of narrow rows
+/// costs `max_rows` records and not a million, whatever blanks or lines it
+/// holds; the rest of the head is parsed and dropped as it passes. A cut head
+/// drops its last record, as [`preview`] does — but only when the reading
+/// reached the end of the head: a sample that stopped at `max_rows` never read
+/// the cut record, and the one extra record parsed to tell the two apart is
+/// complete whenever anything follows.
+#[must_use]
+pub fn sample_records(
+    head: &[u8],
+    head_is_truncated: bool,
+    using: Reading,
+    max_rows: usize,
+) -> Vec<Vec<String>> {
+    let text = decode(head, using.encoding);
+    let mut records = Records::new(&text, using.delimiter);
+    let mut rows: Vec<Vec<String>> = records
+        .by_ref()
+        .skip(using.header_row.saturating_add(1))
+        .filter(|record| !is_blank(record))
+        .take(max_rows)
+        .collect();
+    if head_is_truncated && records.next().is_none() {
+        rows.pop();
+    }
+    rows
+}
+
 /// Most columns a file may have (`SEC-17`). The load job holds the same
 /// number (`MAX_COLUMNS` in `file_ingest.py`) and is the authority; the API
 /// checks early so a file that cannot load is refused before a run exists.
@@ -588,6 +640,9 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
+
+    // `writeln!` onto a `String` in the tests below.
+    use std::fmt::Write as _;
 
     // ── helpers ─────────────────────────────────────────────────────────
 
@@ -639,12 +694,17 @@ mod tests {
     }
 
     #[test]
-    fn a_pdf_or_a_gzip_stream_is_another_binary_format() {
+    fn a_pdf_is_another_binary_format_and_a_gzip_stream_and_an_avro_container_are_their_own_kinds()
+    {
         assert_eq!(sniff(b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n"), Kind::OtherBinary);
         assert_eq!(
             sniff(&[0x1F, 0x8B, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00]),
-            Kind::OtherBinary
+            Kind::Gzip
         );
+        assert_eq!(sniff(b"Obj\x01\x04\x16avro.schema"), Kind::Avro);
+        // Text that merely starts with the same letters is still text.
+        assert_eq!(sniff(b"Obj,x\n1,2\n"), Kind::DelimitedText);
+        assert_eq!(sniff(b"Obj\x02"), Kind::DelimitedText);
     }
 
     #[test]
@@ -1253,6 +1313,64 @@ mod tests {
         assert_eq!(body["truncated"], json!(false));
     }
 
+    // ── sample_records (DATA-18) ─────────────────────────────────────────
+
+    fn sample_of(text: &str, cut: bool, max_rows: usize) -> Vec<Vec<String>> {
+        let shown = preview(text.as_bytes(), cut, Overrides::default(), 0);
+        sample_records(text.as_bytes(), cut, shown.using, max_rows)
+    }
+
+    #[test]
+    fn a_sample_reads_the_rows_below_the_header_and_skips_the_blanks() {
+        let text = "Report\n\nid,n\n1,a\n\n \n2,b\n";
+        let rows = sample_of(text, false, 10);
+        assert_eq!(rows, records(&[&["1", "a"], &["2", "b"]]));
+        assert_eq!(
+            sample_of(text, false, 1),
+            records(&[&["1", "a"]]),
+            "the sample stops at its bound, like the preview"
+        );
+    }
+
+    /// The guess reads far more rows than the preview shows, so the sample is
+    /// its own read and not `preview`'s rows with a bigger constant.
+    #[test]
+    fn a_sample_reads_many_more_rows_than_the_preview_shows() {
+        let mut text = String::from("n\n");
+        for i in 0..30 {
+            let _ = writeln!(text, "{i}");
+        }
+        assert_eq!(sample_of(&text, false, 25).len(), 25);
+        assert_eq!(sample_of(&text, false, 100).len(), 30);
+    }
+
+    #[test]
+    fn a_sample_of_a_cut_head_drops_its_last_record_but_not_one_it_stopped_before() {
+        // The reading reached the end of a cut head: the half record goes.
+        let cut = "n\n1\n2\n3";
+        assert_eq!(
+            sample_of(cut, true, 10),
+            records(&[&["1"], &["2"]]),
+            "the cut record is dropped"
+        );
+        // The reading stopped at its bound inside the head: the last record it
+        // took is complete, and the cut one was never reached.
+        let head = "n\n1\n2\n3\n4\n";
+        assert_eq!(sample_of(head, true, 3), records(&[&["1"], &["2"], &["3"]]));
+    }
+
+    /// A head of nothing but blank lines below the header yields no rows and
+    /// holds nothing while doing so: the bound is the rows kept, not the rows
+    /// parsed.
+    #[test]
+    fn a_sample_of_nothing_but_blank_lines_is_empty() {
+        let mut head = String::from("n\n");
+        for _ in 0..5_000 {
+            head.push_str("\n \n\t\n");
+        }
+        assert_eq!(sample_of(&head, true, 10_000), Vec::<Vec<String>>::new());
+    }
+
     // ── the shared fixtures ─────────────────────────────────────────────
     //
     // `ops/fixtures/uploads/` is read by these tests and, in T7, by the
@@ -1427,7 +1545,15 @@ mod tests {
         let mut found: Vec<String> = std::fs::read_dir(FIXTURE_DIR)
             .unwrap()
             .map(|entry| entry.unwrap().file_name().into_string().unwrap())
-            .filter(|name| name != "README.md" && name != ".gitattributes")
+            // `types/` is `DATA-18` T3.1's own set, read by `upload_types`
+            // against its own list, and `formats/` is `DATA-17` slice 4's, read by
+            // `upload_formats`; neither is one of the dialect fixtures.
+            .filter(|name| {
+                name != "README.md"
+                    && name != ".gitattributes"
+                    && name != "types"
+                    && name != "formats"
+            })
             .collect();
         found.sort_unstable();
         assert_eq!(
@@ -1478,5 +1604,62 @@ mod tests {
             ..Overrides::default()
         };
         assert_eq!(header_width(text.as_bytes(), false, past), 0);
+    }
+
+    // ── DATA-18: the sample a type guess reads ───────────────────────────
+
+    #[test]
+    fn the_sample_is_the_non_blank_records_below_the_header_and_stops_at_the_bound() {
+        let head = b"title
+id,n
+1,a
+
+  ,
+2,b
+3,c
+";
+        let using = Reading {
+            encoding: Encoding::Utf8,
+            delimiter: ',',
+            header_row: 1,
+        };
+        assert_eq!(
+            sample_records(head, false, using, 10),
+            records(&[&["1", "a"], &["2", "b"], &["3", "c"]])
+        );
+        assert_eq!(sample_records(head, false, using, 2).len(), 2);
+        // A header past the end leaves nothing.
+        let past = Reading {
+            header_row: 99,
+            ..using
+        };
+        assert_eq!(
+            sample_records(head, false, past, 10),
+            Vec::<Vec<String>>::new()
+        );
+    }
+
+    #[test]
+    fn a_cut_head_loses_its_last_record_only_when_the_sample_reached_it() {
+        let cut = b"id
+1
+2
+3
+4 half a rec";
+        let using = Reading {
+            encoding: Encoding::Utf8,
+            delimiter: ',',
+            header_row: 0,
+        };
+        assert_eq!(
+            sample_records(cut, true, using, 100),
+            records(&[&["1"], &["2"], &["3"]])
+        );
+        // Stopped at the bound: the cut was not reached, nothing is dropped.
+        assert_eq!(
+            sample_records(cut, true, using, 2),
+            records(&[&["1"], &["2"]])
+        );
+        assert_eq!(sample_records(cut, false, using, 100).len(), 4);
     }
 }

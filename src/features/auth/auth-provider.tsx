@@ -21,8 +21,12 @@ import { readActiveTenantId, writeActiveTenantId } from "@/services/http";
  * `/landing` is the marketing page (WEB-1, `docs/superpowers/plans/
  * 2026-10-11-landing-page.md`). It is static, calls no API and must render
  * for a visitor who has no session, without the console chrome.
+ *
+ * `/render` is the PDF print view (`BI-1`): the Gotenberg container that makes
+ * the PDF has no session, so the page reads its data with a render token in
+ * the address (`POST /api/render/data`) and renders without the console chrome.
  */
-const PUBLIC_PREFIXES = ["/login", "/public", "/embed", "/landing"];
+const PUBLIC_PREFIXES = ["/login", "/public", "/embed", "/landing", "/render"];
 
 export function isPublicPath(pathname: string): boolean {
   return PUBLIC_PREFIXES.some((p) => pathname === p || pathname.startsWith(`${p}/`));

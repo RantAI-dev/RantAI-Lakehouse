@@ -146,9 +146,11 @@ impl EndReason {
 }
 
 /// The kind of a failed attempt: the fixed words of `SRC-11` decision D2,
-/// the only description of a failure the log ever holds. The first four are
-/// retried, the rest are not (`other` is an unclassified failure and is not
-/// retried: an unknown failure is not guessed to be transient).
+/// the only description of a failure the log ever holds. The first four, and
+/// `rate_limited`, are retried, the rest are not (`other` is an unclassified
+/// failure and is not retried: an unknown failure is not guessed to be
+/// transient). `permission_missing` and `rate_limited` came with `SRC-3`
+/// (`0097`, slice 1 review BLOCKER 1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorClass {
@@ -172,6 +174,12 @@ pub enum ErrorClass {
     SchemaDecisionPending,
     /// An unclassified failure.
     Other,
+    /// The source accepted the sign-in but the account lacks a permission the
+    /// connector needs (`SRC-3`). Not retried: the answer stays the same.
+    PermissionMissing,
+    /// The source limited the rate of requests and still did after the
+    /// bounded waits (`SRC-3` decision 13). Retried like `source_busy`.
+    RateLimited,
 }
 
 impl ErrorClass {
@@ -189,6 +197,8 @@ impl ErrorClass {
             Self::SettingRejected => "setting_rejected",
             Self::SchemaDecisionPending => "schema_decision_pending",
             Self::Other => "other",
+            Self::PermissionMissing => "permission_missing",
+            Self::RateLimited => "rate_limited",
         }
     }
 
@@ -197,7 +207,11 @@ impl ErrorClass {
     pub const fn is_transient(self) -> bool {
         matches!(
             self,
-            Self::Unreachable | Self::Timeout | Self::SourceBusy | Self::ApiUnreachable
+            Self::Unreachable
+                | Self::Timeout
+                | Self::SourceBusy
+                | Self::ApiUnreachable
+                | Self::RateLimited
         )
     }
 
@@ -213,6 +227,8 @@ impl ErrorClass {
             Self::SettingRejected => "a setting was rejected",
             Self::SchemaDecisionPending => "the table waits for a schema decision",
             Self::Other => "the failure is not classified",
+            Self::PermissionMissing => "the account lacks a permission at the source",
+            Self::RateLimited => "the source limited the rate of requests",
         }
     }
 }
@@ -724,7 +740,8 @@ pub async fn list_runs(
         "SELECT {RUN_COLUMNS} FROM connector_run WHERE connector_id = $1 \
          ORDER BY started_at DESC, run_id DESC LIMIT $2"
     );
-    let rows: Vec<RunRow> = sqlx::query_as(&sql)
+    // safe: only the constant `RUN_COLUMNS` is formatted in; values are bound.
+    let rows: Vec<RunRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(connector_id)
         .bind(limit)
         .fetch_all(pool)
@@ -838,7 +855,8 @@ pub async fn get_run_log(
 ) -> Result<Option<RunLog>, StoreError> {
     let sql =
         format!("SELECT {RUN_COLUMNS} FROM connector_run WHERE run_id = $1 AND connector_id = $2");
-    let run: Option<RunRow> = sqlx::query_as(&sql)
+    // safe: only the constant `RUN_COLUMNS` is formatted in; values are bound.
+    let run: Option<RunRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(run_id)
         .bind(connector_id)
         .fetch_optional(pool)

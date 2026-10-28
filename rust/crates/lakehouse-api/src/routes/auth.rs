@@ -110,6 +110,25 @@ struct LoginResponse {
     must_change_password: bool,
 }
 
+/// The one answer for a locked key, shared by the lock check and the
+/// over-the-limit refusal (SEC-49) so the two cannot differ on the wire.
+/// `None` (no lock time known) waits one second.
+fn locked_response(locked_until: Option<time::OffsetDateTime>) -> ApiError {
+    // `.max(1)` keeps the value in range, so the `try_from` fallback is
+    // unreachable; it exists so no `as` cast can silently wrap a negative
+    // difference.
+    let secs = locked_until.map_or(1, |locked| {
+        let now = time::OffsetDateTime::now_utc();
+        u64::try_from((locked - now).whole_seconds() + 1)
+            .unwrap_or(1)
+            .max(1)
+    });
+    ApiError::TooManyRequests {
+        message: "Too many failed sign-in attempts. Try again later.".to_owned(),
+        retry_after_secs: secs,
+    }
+}
+
 /// `POST /api/auth/login` — verify `{ email, password }`, and on success,
 /// create a server-side session and set its cookie.
 ///
@@ -122,9 +141,11 @@ struct LoginResponse {
 /// of whether an account with that email exists, and a locked key never
 /// reaches password verification.
 ///
-/// On a failed login, `record_failure` is called. If that call sets a
-/// lock, one `auth.login_locked` audit row is written (best-effort: a
-/// failed audit write is logged, not propagated). On a successful login,
+/// Each try is counted by `record_attempt` before the password is checked
+/// (SEC-49), so concurrent tries cannot exceed the limit; a try over the
+/// limit is refused without a hash. If a try reaches
+/// the limit and fails, one `auth.login_locked` audit row is written
+/// (best-effort: a failed audit write is logged, not propagated). On a successful login,
 /// `clear` resets the count.
 ///
 /// # Errors
@@ -146,18 +167,20 @@ pub async fn login(State(state): State<AppState>, body: Bytes) -> ApiResult<Resp
     let key = throttle::key_for(&email);
 
     if let Some(locked_until) = throttle::locked_until(pool, &key).await? {
-        let now = time::OffsetDateTime::now_utc();
-        // `.max(1)` keeps the value in range, so the `try_from` fallback
-        // below is unreachable; it exists so no `as` cast can silently
-        // wrap a negative difference.
-        let secs = u64::try_from((locked_until - now).whole_seconds() + 1)
-            .unwrap_or(1)
-            .max(1);
-        return Err(ApiError::TooManyRequests {
-            message: "Too many failed sign-in attempts. Try again later.".to_owned(),
-            retry_after_secs: secs,
-        }
-        .into());
+        return Err(locked_response(Some(locked_until)).into());
+    }
+
+    // SEC-49: count this try BEFORE the password is hashed. Counting only
+    // after a failed check let many simultaneous guesses pass the lock check
+    // above before the first failure was written. The UPSERT serialises in
+    // Postgres, so only the first `max_failures` concurrent tries get a
+    // count within the limit and reach Argon2; the rest answer exactly as
+    // a locked key does, without a hash. A missing user still hashes
+    // (`DUMMY_HASH`) while within the limit, so timing is unchanged.
+    let (attempt, attempt_lock) =
+        throttle::record_attempt(pool, &key, &state.throttle_policy).await?;
+    if attempt > state.throttle_policy.max_failures {
+        return Err(locked_response(attempt_lock).into());
     }
 
     let credential = Credential::Password {
@@ -207,8 +230,9 @@ pub async fn login(State(state): State<AppState>, body: Bytes) -> ApiResult<Resp
         // user toward a lockout over a database hiccup (review blocker 1,
         // 2026-10-03).
         Err(AuthError::InvalidCredentials) => {
-            let lock_set = throttle::record_failure(pool, &key, &state.throttle_policy).await?;
-            if lock_set.is_some() {
+            // SEC-49: the try was already counted before hashing; the try
+            // that reached the limit is the one that set the lock.
+            if attempt_lock.is_some() && attempt == state.throttle_policy.max_failures {
                 let event = NewAuditEvent {
                     action: "auth.login_locked".to_owned(),
                     outcome: "refused".to_owned(),
@@ -224,6 +248,17 @@ pub async fn login(State(state): State<AppState>, body: Bytes) -> ApiResult<Resp
             Err(ApiError::invalid_or_expired().into())
         }
         Err(err) => {
+            // SEC-49: the try was counted before hashing; a storage error is
+            // not a wrong password, so give the count back (best-effort).
+            // The refund also takes away a lock this very try set (PR #236
+            // review SHOULD-FIX 1): the try that reaches the limit locks
+            // the key, and a storage error after that must not leave a real
+            // user locked out over a database hiccup.
+            if let Err(refund_err) =
+                throttle::refund_attempt(pool, &key, &state.throttle_policy).await
+            {
+                tracing::warn!(%refund_err, "failed to refund a login attempt");
+            }
             tracing::warn!(error = %err, "login failed with a non-credential error");
             Err(ApiError::from(err).into())
         }
@@ -811,6 +846,26 @@ pub struct OidcCallbackQuery {
     state: Option<String>,
 }
 
+/// The query parameter a successful callback appends to the landing path
+/// when the sign-in had a caveat (`SEC-39`). The console maps its value to
+/// the sentence it shows (`src/features/auth/sso-notice.tsx`); this service
+/// never puts prose — or anything from the token — into the URL.
+const OIDC_NOTICE_PARAM: &str = "ssoNotice";
+
+/// `next` with `ssoNotice=<code>` appended, keeping any query `next`
+/// already carried. `next` has already passed `is_safe_relative_path`
+/// (inside [`oidc_start`], before it was written to the flow cookie), so
+/// this only adds a fixed parameter name and an allowlisted code.
+///
+/// `is_safe_relative_path` allows a `#fragment`, so the parameter goes
+/// before it: after the `#` it would be part of the fragment, which the
+/// console's `useSearchParams` never reads (PR review, `SEC-39`).
+fn path_with_notice(next: &str, code: &str) -> String {
+    let (path, fragment) = next.find('#').map_or((next, ""), |at| next.split_at(at));
+    let separator = if path.contains('?') { '&' } else { '?' };
+    format!("{path}{separator}{OIDC_NOTICE_PARAM}={code}{fragment}")
+}
+
 /// The one field this handler reads from the token endpoint's response.
 /// Deliberately not `#[serde(deny_unknown_fields)]`: an `IdP` is free to
 /// also return `access_token`/`refresh_token`/`expires_in`/etc, none of
@@ -838,6 +893,12 @@ struct TokenResponse {
 /// then fails at the missing-cookie check below, which is what makes the
 /// whole exchange single-use regardless of how the first attempt turned
 /// out.
+///
+/// On success the redirect to `next` carries `ssoNotice=<code>` when the
+/// sign-in had a caveat — today only Entra ID's group overage (`SEC-39`),
+/// which also gets a `warn` line from
+/// [`lakehouse_auth::OidcAuthenticator::authenticate_with_nonce`]. The
+/// console maps the code to its own sentence; this handler adds no prose.
 ///
 /// # Errors
 ///
@@ -948,14 +1009,14 @@ pub async fn oidc_callback(
         return Ok(unauthorized());
     };
 
-    let Ok((principal, mapped_role_names)) = auth
+    let Ok(login) = auth
         .authenticate_with_nonce(&Secret::new(id_token), &flow.nonce)
         .await
     else {
         tracing::warn!("oidc callback: id token verification failed");
         return Ok(unauthorized());
     };
-    let PrincipalId::User(user_id) = principal.id else {
+    let PrincipalId::User(user_id) = login.principal.id else {
         // `authenticate_with_nonce` only ever resolves a
         // `PrincipalId::User` (`resolve_principal` loads through
         // `app_user`) — this branch exists so the match stays exhaustive,
@@ -985,7 +1046,7 @@ pub async fn oidc_callback(
         session::DEFAULT_SESSION_TTL,
         None,
         None,
-        &mapped_role_names,
+        &login.mapped_role_names,
     )
     .await?;
 
@@ -997,7 +1058,7 @@ pub async fn oidc_callback(
     // carries `principal_id`. Best-effort: a failed audit write is
     // logged and swallowed, never propagated, so the response on the
     // wire is always the underlying login's, not the audit's.
-    let audit_event = oidc_login_audit_event(&principal, user_id);
+    let audit_event = oidc_login_audit_event(&login.principal, user_id);
     if let Err(err) = store_audit::insert(pool, audit_event).await {
         tracing::warn!(
             %err,
@@ -1008,17 +1069,23 @@ pub async fn oidc_callback(
     }
 
     let mut response = (StatusCode::FOUND, ()).into_response();
+    // `flow.next` was already validated by `is_safe_relative_path` inside
+    // `oidc_start` before it was ever written to the cookie (see
+    // `OidcFlow`'s doc comment) — never re-derived from this request, so
+    // there is nothing left to re-validate here. The fallback exists only
+    // for the type-level possibility that a valid relative path is somehow
+    // not a valid header value, not because a value that already passed
+    // `is_safe_relative_path` is expected to fail this.
+    //
+    // `SEC-39`: a sign-in with a caveat says so on the page the user lands
+    // on. The notice is a fixed code, never the token's claims.
+    let location = match login.notice {
+        Some(notice) => path_with_notice(&flow.next, notice.code()),
+        None => flow.next,
+    };
     response.headers_mut().insert(
         header::LOCATION,
-        // `flow.next` was already validated by `is_safe_relative_path`
-        // inside `oidc_start` before it was ever written to the cookie
-        // (see `OidcFlow`'s doc comment) — never re-derived from this
-        // request, so there is nothing left to re-validate here. The
-        // fallback exists only for the type-level possibility that a
-        // valid relative path is somehow not a valid header value, not
-        // because a value that already passed `is_safe_relative_path` is
-        // expected to fail this.
-        HeaderValue::from_str(&flow.next).unwrap_or_else(|_| HeaderValue::from_static("/")),
+        HeaderValue::from_str(&location).unwrap_or_else(|_| HeaderValue::from_static("/")),
     );
     response.headers_mut().append(
         header::SET_COOKIE,
@@ -1156,7 +1223,6 @@ mod tests {
 
     use axum::body::Body;
     use axum::http::{Request, StatusCode, header};
-    use base64::Engine as _;
     use tower::ServiceExt;
 
     use super::*;
@@ -1312,6 +1378,28 @@ mod tests {
     }
 
     #[test]
+    fn path_with_notice_keeps_the_query_and_puts_the_notice_before_a_fragment() {
+        // PR review (`SEC-39`): `next` may carry a query and a fragment;
+        // the notice joins the query and never lands inside the fragment.
+        assert_eq!(
+            path_with_notice("/", "group_overage"),
+            "/?ssoNotice=group_overage"
+        );
+        assert_eq!(
+            path_with_notice("/dashboards?tab=1", "group_overage"),
+            "/dashboards?tab=1&ssoNotice=group_overage"
+        );
+        assert_eq!(
+            path_with_notice("/dashboards#chart-2", "group_overage"),
+            "/dashboards?ssoNotice=group_overage#chart-2"
+        );
+        assert_eq!(
+            path_with_notice("/d?tab=1#x?y", "group_overage"),
+            "/d?tab=1&ssoNotice=group_overage#x?y"
+        );
+    }
+
+    #[test]
     fn is_safe_relative_path_rejects_every_p3_named_shape() {
         // Unit-level pin, independent of the full HTTP round trip above —
         // this is the function the four named off-origin/ambiguous shapes
@@ -1452,6 +1540,11 @@ mod tests {
         aud: &'a str,
         exp: i64,
         nonce: &'a str,
+        /// Entra ID's overage marker (`SEC-39`): names each claim whose
+        /// values did not fit in the token, so the claim itself is absent.
+        /// `None` for every ordinary test token.
+        #[serde(rename = "_claim_names", skip_serializing_if = "Option::is_none")]
+        claim_names: Option<serde_json::Value>,
     }
 
     fn sign_id_token(claims: &IdTokenClaims<'_>, key: &TestKey) -> String {
@@ -1467,6 +1560,25 @@ mod tests {
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/.well-known/jwks.json"))
             .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&set))
+            .mount(server)
+            .await;
+    }
+
+    /// Mount the discovery document `SEC-38` reads when `OIDC_JWKS_URL` is
+    /// unset. These round-trip tests set `OIDC_ISSUER` to the mock server
+    /// itself and no `OIDC_JWKS_URL`, so this (not the key set's path)
+    /// is what names `/.well-known/jwks.json` as the key set's address.
+    async fn mount_discovery(server: &wiremock::MockServer, issuer: &str) {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/.well-known/openid-configuration",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "issuer": issuer,
+                    "jwks_uri": format!("{issuer}/.well-known/jwks.json"),
+                })),
+            )
             .mount(server)
             .await;
     }
@@ -1508,6 +1620,7 @@ mod tests {
         let server = wiremock::MockServer::start().await;
         let key = TestKey::generate("kid-1");
         mount_jwks(&server, &key).await;
+        mount_discovery(&server, &server.uri()).await;
 
         let issuer = server.uri();
         let client_id = "lakehouse-console";
@@ -1527,6 +1640,7 @@ mod tests {
                 // always well under `i32::MAX` seconds past the epoch.
                 exp: time::OffsetDateTime::now_utc().unix_timestamp() + 3600,
                 nonce: &flow.nonce,
+                claim_names: None,
             },
             &key,
         );
@@ -1601,6 +1715,109 @@ mod tests {
         Ok(())
     }
 
+    // ── `SEC-39`: a group overage is said, not silent ──────────────────────
+
+    /// The overage marker rides on the landing path as a fixed code, and a
+    /// path that already carries a query keeps it.
+    #[test]
+    fn the_sign_in_notice_is_appended_without_dropping_an_existing_query() {
+        assert_eq!(
+            path_with_notice("/", "group_overage"),
+            "/?ssoNotice=group_overage"
+        );
+        assert_eq!(
+            path_with_notice("/dashboards/main?tab=history", "group_overage"),
+            "/dashboards/main?tab=history&ssoNotice=group_overage"
+        );
+    }
+
+    /// A successful round trip whose id token carries `_claim_names`
+    /// instead of `groups` (Entra ID's overage marker) still signs in, and
+    /// the redirect tells the console so (`SEC-39`, decisions 2 and 4).
+    /// Same wiremock harness as
+    /// `oidc_callback_with_a_matching_state_and_nonce_creates_a_session_and_redirects`;
+    /// the only differences are the marker and the asserted `LOCATION`.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn oidc_callback_with_a_group_overage_redirects_with_the_notice(
+        pool: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        use lakehouse_test_support as _;
+
+        let server = wiremock::MockServer::start().await;
+        let key = TestKey::generate("kid-1");
+        mount_jwks(&server, &key).await;
+        mount_discovery(&server, &server.uri()).await;
+
+        let issuer = server.uri();
+        let client_id = "lakehouse-console";
+        let flow = OidcFlow {
+            state: "state-from-start".to_owned(),
+            nonce: "nonce-from-start".to_owned(),
+            code_verifier: "verifier-1".to_owned(),
+            next: "/dashboards".to_owned(),
+        };
+
+        let id_token = sign_id_token(
+            &IdTokenClaims {
+                sub: "user-overage-round-trip",
+                iss: &issuer,
+                aud: client_id,
+                exp: time::OffsetDateTime::now_utc().unix_timestamp() + 3600,
+                nonce: &flow.nonce,
+                claim_names: Some(serde_json::json!({ "groups": "src1" })),
+            },
+            &key,
+        );
+        mount_token_endpoint(&server, &id_token).await;
+
+        let mut env = HashMap::new();
+        env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
+        env.insert("OIDC_ISSUER".to_owned(), issuer.clone());
+        env.insert("OIDC_CLIENT_ID".to_owned(), client_id.to_owned());
+        env.insert(
+            "OIDC_AUTHORIZE_URL".to_owned(),
+            format!("{issuer}/authorize"),
+        );
+        env.insert("OIDC_TOKEN_URL".to_owned(), format!("{issuer}/token"));
+        env.insert(
+            "OIDC_REDIRECT_URI".to_owned(),
+            "https://lake.invalid/api/auth/oidc/callback".to_owned(),
+        );
+        env.insert("OIDC_JIT_PROVISIONING".to_owned(), "true".to_owned());
+        // A mapping that COULD have applied had the token carried the
+        // group: the point is that an overage maps nothing and says so,
+        // not that this deployment has no mapping at all.
+        env.insert(
+            "OIDC_ROLE_MAP".to_owned(),
+            "lakehouse-admins=Platform Admin".to_owned(),
+        );
+        let config = Config::from_map(&env).expect("a valid test Config");
+        let state = AppState::new(config);
+        let app = crate::routes::router(state);
+
+        let cookie = oidc_flow_cookie_header(true, Some(&flow));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/auth/oidc/callback?code=auth-code-1&state={}",
+                        flow.state
+                    ))
+                    .header(header::COOKIE, cookie.to_str().unwrap())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FOUND);
+        assert_eq!(
+            response.headers().get(header::LOCATION).unwrap(),
+            "/dashboards?ssoNotice=group_overage"
+        );
+        Ok(())
+    }
+
     // ── `oidc_callback` writes a real `audit_event` row on
     // success. Reuses the wiremock round-trip harness above verbatim —
     // the only addition is the post-response SELECT against
@@ -1625,6 +1842,7 @@ mod tests {
         let server = wiremock::MockServer::start().await;
         let key = TestKey::generate("kid-1");
         mount_jwks(&server, &key).await;
+        mount_discovery(&server, &server.uri()).await;
 
         let issuer = server.uri();
         let client_id = "lakehouse-console";
@@ -1642,6 +1860,7 @@ mod tests {
                 aud: client_id,
                 exp: time::OffsetDateTime::now_utc().unix_timestamp() + 3600,
                 nonce: &flow.nonce,
+                claim_names: None,
             },
             &key,
         );

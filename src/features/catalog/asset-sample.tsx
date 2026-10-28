@@ -10,25 +10,32 @@ import { useService } from "@/hooks/use-service"
 import { assetQueryStudioHref } from "@/lib/asset-query"
 import { typeFamily } from "@/lib/column-type"
 import { nextSort, sortedOrder, type SortState } from "@/lib/sample-grid"
+import { formatNumber } from "@/lib/format"
 import { cn } from "@/lib/utils"
 import { assetService } from "@/services"
 import type { AssetDetail } from "@/services/contracts/assets"
 import { StandInNotice } from "./asset-stand-in"
 import type { IcebergTableState } from "./asset-storage"
-import { CountToggle } from "./count-toggle"
 import { SampleGrid, type Picked } from "./sample-grid"
 import { SampleInspector } from "./sample-inspector"
 
-/** Twenty-five fills the page; the last is the API's cap. The first is what opens. */
-const SIZES = [25, 50, 100] as const
+/**
+ * `DATA-15` F1: the tab asks for the API's cap, 1,000 rows, once, and shows
+ * them `PAGE_ROWS` at a time. One read means a sort can order every row
+ * loaded, which a read per page could not.
+ */
+const SAMPLE_ROWS = 1000
+const PAGE_ROWS = 100
 
 /**
  * The Sample tab: the asset's first rows as the reader would get them from
  * a query — masked and row-filtered — as a data preview: a grid that reads
  * like data, which can be sorted, and an inspector beside it for a picked
  * cell or column. Plan:
- * `docs/superpowers/plans/2026-10-05-sample-tab-data-preview.md`. Anything past
- * a hundred rows is Query Studio's job.
+ * `docs/superpowers/plans/2026-10-05-sample-tab-data-preview.md`; the
+ * 1,000 rows and the pager are `DATA-15` F1
+ * (`docs/superpowers/plans/2026-10-16-data-15-asset-page-depth.md`).
+ * Anything past a thousand rows is Query Studio's job.
  *
  * The detail body carries five rows. They show until the first answer for
  * the chosen size comes back, so the tab is never blank while it loads; where
@@ -40,7 +47,7 @@ const SIZES = [25, 50, 100] as const
  * takes it, so a column the inspector opens states the same facts here.
  */
 export function AssetSample({ asset: a, iceberg }: { asset: AssetDetail; iceberg: IcebergTableState }) {
-  const [size, setSize] = React.useState<number>(SIZES[0])
+  const [page, setPage] = React.useState(0)
   const [sort, setSort] = React.useState<SortState>(null)
   const [picked, setPicked] = React.useState<Picked | null>(null)
   // The inspector reads the table's profile when it first mounts, so it mounts at the first pick and
@@ -54,9 +61,9 @@ export function AssetSample({ asset: a, iceberg }: { asset: AssetDetail; iceberg
   const more = useService(
     (s) =>
       canLoad && assetService.getAssetSample
-        ? assetService.getAssetSample(a.id, size, s)
+        ? assetService.getAssetSample(a.id, SAMPLE_ROWS, s)
         : Promise.resolve(null),
-    [a.id, size, canLoad]
+    [a.id, canLoad]
   )
   const loaded = more.status === "success" ? more.data : null
   // While a larger sample loads, the rows already on screen stay there.
@@ -75,6 +82,13 @@ export function AssetSample({ asset: a, iceberg }: { asset: AssetDetail; iceberg
     [rows, sort, family]
   )
 
+  // The page on screen: positions `start` to `end` of the sorted order. A sample that shrank under a
+  // later page (the rows are re-read) lands on the last page that still exists.
+  const pages = Math.max(1, Math.ceil(order.length / PAGE_ROWS))
+  const current = Math.min(page, pages - 1)
+  const start = current * PAGE_ROWS
+  const shown = order.slice(start, start + PAGE_ROWS)
+
   // A cell picked in rows that are no longer there (a smaller sample) is not picked.
   const pick = picked && (picked.kind === "column" || picked.at < rows.length) ? picked : null
 
@@ -87,6 +101,11 @@ export function AssetSample({ asset: a, iceberg }: { asset: AssetDetail; iceberg
     // The control that had focus is gone with the panel; focus goes back to the grid's tab stop.
     if (restoreFocus) wrapRef.current?.querySelector<HTMLElement>('td[role="gridcell"][tabindex="0"]')?.focus()
   }
+  const turn = (next: number) => {
+    setPage(next)
+    // A cell is a place on the page that is going away; a column is not.
+    setPicked((p) => (p?.kind === "cell" ? null : p))
+  }
   const onKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
     if (e.key !== "Escape" || pick === null) return
     e.preventDefault()
@@ -97,22 +116,7 @@ export function AssetSample({ asset: a, iceberg }: { asset: AssetDetail; iceberg
   // In the card's body, not its header action: that slot cannot shrink, so at phone width the controls
   // left the title and description a few characters wide (the Schema tab's card met the same slot).
   const controls = (
-    <div className="mb-2 flex flex-wrap items-center justify-between gap-x-3 gap-y-2">
-      {canLoad ? (
-        <CountToggle
-          label="Rows"
-          ariaLabel="Rows to show"
-          options={SIZES}
-          value={size}
-          onChange={(n) => {
-            setSize(n)
-            // A cell is a place in the rows, and the rows are about to change; a column is not.
-            setPicked((p) => (p?.kind === "cell" ? null : p))
-          }}
-        />
-      ) : (
-        <span />
-      )}
+    <div className="mb-2 flex flex-wrap items-center justify-end gap-x-3 gap-y-2">
       <Button size="sm" variant="outline" render={<Link href={assetQueryStudioHref(a)} />}>
         Open in Query Studio
       </Button>
@@ -130,11 +134,11 @@ export function AssetSample({ asset: a, iceberg }: { asset: AssetDetail; iceberg
         description={
           a.sampleRestricted || rows.length === 0
             ? "Masking and row filters applied."
-            : `${loading ? `Loading ${size} rows… showing the` : "The"} first ${rows.length} row${
+            : `${loading ? `Loading ${formatNumber(SAMPLE_ROWS)} rows… showing the` : "The"} first ${formatNumber(rows.length)} row${
                 rows.length === 1 ? "" : "s"
               }, as you would read them: masking and row filters applied.${
                 sort
-                  ? ` Sorted by ${sort.column} (${sort.direction === "asc" ? "ascending" : "descending"}), among the rows shown.`
+                  ? ` Sorted by ${sort.column} (${sort.direction === "asc" ? "ascending" : "descending"}), among the ${formatNumber(rows.length)} row${rows.length === 1 ? "" : "s"} loaded, all pages.`
                   : ""
               }`
         }
@@ -169,13 +173,32 @@ export function AssetSample({ asset: a, iceberg }: { asset: AssetDetail; iceberg
               <SampleGrid
                 columns={columns}
                 rows={rows}
-                order={order}
+                order={shown}
+                rowOffset={start}
                 schema={schema}
                 sort={sort}
-                onSort={(column) => setSort((s) => nextSort(s, column))}
+                onSort={(column) => {
+                  setSort((s) => nextSort(s, column))
+                  setPage(0)
+                }}
                 picked={pick}
                 onPick={pickIt}
               />
+              {order.length > PAGE_ROWS ? (
+                <div className="mt-2 flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">
+                  <span role="status" className="tabular-nums">
+                    {`Rows ${formatNumber(start + 1)}–${formatNumber(start + shown.length)} of ${formatNumber(order.length)}`}
+                  </span>
+                  <div className="flex items-center gap-1">
+                    <Button size="sm" variant="outline" disabled={current === 0} onClick={() => turn(current - 1)}>
+                      Previous
+                    </Button>
+                    <Button size="sm" variant="outline" disabled={current >= pages - 1} onClick={() => turn(current + 1)}>
+                      Next
+                    </Button>
+                  </div>
+                </div>
+              ) : null}
             </div>
             {inspecting ? (
               <SampleInspector

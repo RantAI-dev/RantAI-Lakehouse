@@ -1,38 +1,87 @@
 //! Who may use a dashboard's signed embed, and who may frame it (`SEC-12`).
 //!
-//! Three things are kept with the board (`console.bi_board`, three columns
-//! beside `embed_enabled`):
+//! Three things make up a board's access state:
 //!
 //! - **`revoked_before`**: "withdraw all". A Unix-seconds instant; a token
 //!   whose `iat` is at or before it is refused.
-//! - **`withdrawn`**: "withdraw one". A small list of `(jti, exp)`. A token
-//!   carrying a listed `jti` is refused for this board only. An entry is
-//!   dropped once the token could no longer be accepted anyway, which is
-//!   `exp` plus the clock tolerance, not `exp` alone: the verifier accepts a
-//!   token up to 60 seconds past its `exp`, so dropping the record at `exp`
-//!   would let the token back in for that minute.
+//! - **`withdrawn`**: "withdraw one". A list of `(jti, exp)`. A token
+//!   carrying a listed `jti` is refused for this board only. The list is
+//!   not where a token expires: the verifier accepts a token up to its `exp`
+//!   plus the clock tolerance, so an entry that expires would still have to
+//!   be refused while the verifier honours it (PR #201 review F SHOULD-FIX
+//!   1). The cap that bounds the list counts only the entries that could
+//!   still be accepted.
 //! - **`origins`**: the sites allowed to frame the embed pages.
 //!
-//! # Why on the board
+//! # Where the state lives
 //!
-//! The board is read with `FINAL` on every `POST /api/embed/data`, so a
-//! withdrawal written by the Share dialog is seen by the next request. There
-//! is no cache in between (see the plan, section 7). Putting the state in
-//! the board row also means deleting a board deletes its withdrawals.
+//! In `console.bi_board_embed_event`, an append-only table the state is
+//! written to and read back by aggregation (PR #105 review SHOULD-FIX 1).
+//! It was on the board row once, and a dashboard save (a full-row `INSERT`
+//! into a `ReplacingMergeTree`) could write the old state back: a token
+//! withdrawn in between worked again. The events are aggregated on every
+//! request, so there is no cache in between (see the plan, section 7) and a
+//! withdrawal takes effect on the next request.
 //!
 //! # Limits
 //!
 //! `revoked_before` is the API server's clock at the moment of withdrawal,
 //! compared with the `iat` the customer's server wrote. A token minted by a
-//! clock that runs ahead of ours by up to the 60-second tolerance carries an
+//! clock that runs ahead of ours by up to the clock tolerance carries an
 //! `iat` later than the withdrawal and survives "withdraw all" until it
 //! expires; the maximum lifetime bounds that. Withdraw one by `jti` is
 //! exact.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
+
+/// What a viewer of a signed embed may do with one dashboard filter
+/// (`BI-26`, feature decision 5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FilterMode {
+    /// The token must set it and the viewer cannot change it.
+    Locked,
+    /// The viewer sees it and changes it.
+    Editable,
+    /// Not shown; the dashboard's saved value applies. The default for a
+    /// filter nobody has chosen a mode for.
+    Hidden,
+}
+
+/// At most this many filter modes are stored per dashboard.
+pub const MAX_FILTER_MODES: usize = 100;
+
+/// Validate the filter modes a manager saves: at most [`MAX_FILTER_MODES`]
+/// entries, each keyed by a non-empty column name of at most 200 characters.
+/// Whether each column is a filter of the dashboard is the route's check (it
+/// has the dashboard).
+///
+/// # Errors
+///
+/// A fixed sentence.
+pub fn validate_filter_modes(modes: &BTreeMap<String, FilterMode>) -> Result<(), String> {
+    if modes.len() > MAX_FILTER_MODES {
+        return Err(format!(
+            "at most {MAX_FILTER_MODES} filter modes can be saved per dashboard."
+        ));
+    }
+    if modes
+        .keys()
+        .any(|c| c.is_empty() || c.chars().count() > 200)
+    {
+        return Err("a filter mode needs a column name of 1 to 200 characters.".to_owned());
+    }
+    Ok(())
+}
 
 /// At most this many allowed origins per dashboard.
 pub const MAX_ORIGINS: usize = 20;
+
+/// The most sites an administrator may list as allowed content sites for
+/// image and web cards (`BI-16` part B, decision 4).
+pub const MAX_CONTENT_SITES: usize = 50;
 
 /// At most this many individually withdrawn tokens kept per dashboard. The
 /// list only needs to hold tokens that are still within their lifetime; past
@@ -59,6 +108,9 @@ pub struct EmbedAccess {
     pub withdrawn: Vec<WithdrawnToken>,
     /// Sites allowed to frame the embed pages, normalised.
     pub origins: Vec<String>,
+    /// Each dashboard filter's embed mode, by column (`BI-26`, plan D2). A
+    /// column missing here is [`FilterMode::Hidden`]; see [`Self::mode_of`].
+    pub filter_modes: BTreeMap<String, FilterMode>,
 }
 
 impl EmbedAccess {
@@ -67,8 +119,10 @@ impl EmbedAccess {
     /// Fails closed (principle 3): a withdrawn-tokens column that does not
     /// parse is something this code never writes, and ignoring it would
     /// silently re-admit withdrawn tokens, so every token is refused instead
-    /// (`revoked_before` is set to its maximum) until the board is saved
-    /// again. An origins column that does not parse allows no site.
+    /// (`revoked_before` is set to its maximum) — permanently, not until the
+    /// board is saved again (PR #201 review F doc note: the legacy columns
+    /// are never written again, so nothing saves that board again). An
+    /// origins column that does not parse allows no site.
     #[must_use]
     pub fn from_stored(revoked_before: u64, withdrawn_json: &str, origins_json: &str) -> Self {
         let withdrawn_json = withdrawn_json.trim();
@@ -89,7 +143,19 @@ impl EmbedAccess {
             revoked_before,
             withdrawn,
             origins,
+            filter_modes: BTreeMap::new(),
         }
+    }
+
+    /// The embed mode of the filter on `column`: what a manager chose, else
+    /// [`FilterMode::Hidden`] (a new filter shows nothing until someone
+    /// chooses; feature decision 5).
+    #[must_use]
+    pub fn mode_of(&self, column: &str) -> FilterMode {
+        self.filter_modes
+            .get(column)
+            .copied()
+            .unwrap_or(FilterMode::Hidden)
     }
 
     /// Whether a token with this `iat` and `jti` has been withdrawn.
@@ -182,6 +248,55 @@ pub fn validate_origins(raw: &[String]) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
+/// Validate the administrator's list of sites images and web pages may come
+/// from (`BI-16` part B, decision 4).
+///
+/// The same entry grammar and normal form as [`validate_origins`] (it calls
+/// the same [`normalize_origin`], rule 4: no second parser), with two
+/// differences: at most [`MAX_CONTENT_SITES`] entries, and `https` only, with
+/// no `http://localhost` exception, because a card loads the site into every
+/// viewer's browser.
+///
+/// # Errors
+///
+/// A message naming the first entry that is not acceptable, or the limit.
+pub fn validate_content_sites(raw: &[String]) -> Result<Vec<String>, String> {
+    let mut out: Vec<String> = Vec::with_capacity(raw.len());
+    for entry in raw {
+        let origin = normalize_origin(entry)?;
+        if !origin.starts_with("https://") {
+            let shown: String = entry.chars().take(80).collect();
+            return Err(format!(
+                "\"{shown}\" is not an allowed site: write it as https://host or https://host:port"
+            ));
+        }
+        if !out.contains(&origin) {
+            out.push(origin);
+        }
+    }
+    if out.len() > MAX_CONTENT_SITES {
+        return Err(format!(
+            "at most {MAX_CONTENT_SITES} content sites can be allowed."
+        ));
+    }
+    Ok(out)
+}
+
+/// The origin (`https://host[:port]`, normal form) of an address, or `None`
+/// when it is not an `https` address with a valid host. Used to compare a
+/// card's address with the allowed content sites; it goes through
+/// [`normalize_origin`] so both sides are written the same way.
+#[must_use]
+pub fn https_origin_of(url: &str) -> Option<String> {
+    let rest = url.trim().strip_prefix("https://")?;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    // User-info is how `https://allowed.example@evil.example/` hides the host.
+    if authority.contains('@') {
+        return None;
+    }
+    normalize_origin(&format!("https://{authority}")).ok()
+}
+
 fn normalize_origin(raw: &str) -> Result<String, String> {
     let shown: String = raw.chars().take(80).collect();
     let bad = |why: &str| Err(format!("\"{shown}\" is not an allowed site: {why}"));
@@ -245,6 +360,58 @@ mod tests {
 
     fn strings(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn a_filter_without_a_chosen_mode_is_hidden_and_the_modes_are_bounded() {
+        let mut access = EmbedAccess::default();
+        assert_eq!(access.mode_of("region"), FilterMode::Hidden);
+        access
+            .filter_modes
+            .insert("region".to_owned(), FilterMode::Editable);
+        assert_eq!(access.mode_of("region"), FilterMode::Editable);
+        assert_eq!(access.mode_of("year"), FilterMode::Hidden);
+        let mut modes = BTreeMap::new();
+        assert!(validate_filter_modes(&modes).is_ok());
+        modes.insert(String::new(), FilterMode::Locked);
+        assert!(validate_filter_modes(&modes).is_err());
+        let many: BTreeMap<String, FilterMode> = (0..=MAX_FILTER_MODES)
+            .map(|i| (format!("c{i}"), FilterMode::Hidden))
+            .collect();
+        assert!(validate_filter_modes(&many).is_err());
+        assert_eq!(
+            serde_json::to_string(&FilterMode::Locked).unwrap(),
+            "\"locked\""
+        );
+    }
+
+    #[test]
+    fn content_sites_are_https_only_and_capped_at_fifty() {
+        assert_eq!(
+            validate_content_sites(&strings(&["https://Img.Example", "https://img.example"])),
+            Ok(strings(&["https://img.example"]))
+        );
+        assert!(validate_content_sites(&strings(&["http://localhost"])).is_err());
+        assert!(validate_content_sites(&strings(&["http://a.example"])).is_err());
+        assert!(validate_content_sites(&strings(&["https://*.example"])).is_err());
+        assert!(validate_content_sites(&strings(&["https://a.example/path"])).is_err());
+        let fifty: Vec<String> = (0..50).map(|i| format!("https://s{i}.example")).collect();
+        assert_eq!(validate_content_sites(&fifty).unwrap().len(), 50);
+        let fifty_one: Vec<String> = (0..51).map(|i| format!("https://s{i}.example")).collect();
+        assert!(validate_content_sites(&fifty_one).is_err());
+    }
+
+    #[test]
+    fn the_origin_of_an_address_ignores_the_path_and_refuses_user_info() {
+        assert_eq!(
+            https_origin_of("https://Img.Example:8443/a/b.png?x=1#f").as_deref(),
+            Some("https://img.example:8443")
+        );
+        assert_eq!(https_origin_of("http://img.example/a.png"), None);
+        assert_eq!(https_origin_of("https://ok.example@evil.example/"), None);
+        assert_eq!(https_origin_of("https://[::1]/"), None);
+        assert_eq!(https_origin_of("//img.example/a.png"), None);
+        assert_eq!(https_origin_of("https:///a.png"), None);
     }
 
     #[test]
@@ -453,7 +620,7 @@ mod tests {
             access.is_withdrawn(4_000_000_000.0, None),
             "every token is refused"
         );
-        assert!(access.origins.is_empty());
+        assert!(access.origins.is_empty(), "{:?}", access.origins);
     }
 
     #[test]

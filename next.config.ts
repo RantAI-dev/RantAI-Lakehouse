@@ -1,6 +1,17 @@
 import type { NextConfig } from "next";
+import { devOrigins } from "./src/lib/dev-origins";
+
+// `OPS-11`: Next.js 16.4 serves the dev server's own resources (HMR, chunks)
+// only to `localhost` unless the host is listed here, so a dev console opened
+// by a LAN address never finishes loading. `CONSOLE_ALLOWED_DEV_ORIGINS`
+// (comma-separated hostnames, `*.` wildcards allowed, see `.env.example`) adds
+// hosts; `127.0.0.1` is always allowed (`BI-1 QA fix`, see `src/lib/dev-origins.ts`).
+// It affects `next dev` only: a production build ignores it.
+const allowedDevOrigins = devOrigins(process.env.CONSOLE_ALLOWED_DEV_ORIGINS);
 
 const nextConfig: NextConfig = {
+  allowedDevOrigins,
+
   // Jejak build mandiri (server + node_modules minimal) supaya image Docker
   // konsol tetap ramping — dipakai stack demo `rantai-lake-demo`.
   output: "standalone",
@@ -23,8 +34,11 @@ const nextConfig: NextConfig = {
     // 10,000 tables) and the API's route timeout for the two discovery paths is 130
     // (`DISCOVERY_REQUEST_TIMEOUT` in `rust/crates/lakehouse-api/src/routes/mod.rs`), so with the
     // default the console would report a failure for a listing the API was still
-    // answering. Keep this equal to that route timeout.
-    proxyTimeout: 130_000,
+    // answering. Keep this equal to the LARGEST route timeout in that function: the
+    // chart and table downloads (`EXPORT_REQUEST_TIMEOUT`, 310 s; BI-1 review fix
+    // (BLOCKER) R2) are longer than the discovery paths, and the proxy would cut a
+    // long Excel download at the old 130 s while the API was still sending it.
+    proxyTimeout: 310_000,
   },
 
   // Proxy /api/* to the Rust backend service. Browser URLs stay the same;

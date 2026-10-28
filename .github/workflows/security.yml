@@ -37,13 +37,34 @@ jobs:
         uses: taiki-e/install-action@cargo-audit
 
       # RUSTSEC-2023-0071 ("Marvin Attack" timing side-channel in `rsa`
-      # 0.9.10) is a dev-only test dependency of lakehouse-auth
-      # (crates/lakehouse-auth/tests/oidc.rs) with no upstream fix
-      # available. See rust/deny.toml for the full justification — the
-      # same exception is mirrored here since cargo-audit and cargo-deny
-      # read separate ignore lists.
+      # 0.9.10) is a DEV-only test dependency, of lakehouse-auth and
+      # lakehouse-api (both mint RSA keys for OIDC/service-account test
+      # fixtures), with no upstream fix available. Since SEC-41 (sqlx 0.9,
+      # mysql-rsa off) `cargo tree -i rsa -e normal -p lakehouse-api`
+      # prints "nothing to print" — before it, sqlx-mysql 0.8.6 linked
+      # `rsa` into the API binary. See rust/deny.toml for the full
+      # justification — the same exception is mirrored here since
+      # cargo-audit and cargo-deny read separate ignore lists.
+      #
+      # RUSTSEC-2026-0367, RUSTSEC-2026-0368, and RUSTSEC-2026-0369 (`zip`
+      # 8.6.0 extraction vulnerabilities) are unreachable: calamine 0.36.1
+      # never calls extract, and the workspace has no direct zip dependency.
+      # See rust/deny.toml for the full justification.
+      #
+      # RUSTSEC-2026-0381 is not ignored any more: it matched only
+      # webpki-roots 0.26.11, the shim sqlx-core 0.8.6 required, and SEC-41
+      # moved sqlx to 0.9 (webpki-roots 1.x, which carries the fix).
+      #
+      # RUSTSEC-2026-0391 (zstd 0.13.3), RUSTSEC-2026-0398 and
+      # RUSTSEC-2026-0403 (zstd-safe 7.2.4) and RUSTSEC-2026-0410
+      # (zstd-sys 2.0.16) are the zstd stack under `iceberg` 0.10.1.
+      # No fix is available: `iceberg` 0.10.1 pins `zstd ^0.13.3`,
+      # `parquet ^58` and `apache-avro ^0.21`, and `apache-avro` 0.22.0
+      # still needs `zstd ^0.13.3`. None of the four affected functions is
+      # reachable from this tree (see rust/deny.toml for the reachability
+      # result and the drop condition).
       - name: cargo audit
-        run: cargo audit --ignore RUSTSEC-2023-0071
+        run: cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0367 --ignore RUSTSEC-2026-0368 --ignore RUSTSEC-2026-0369 --ignore RUSTSEC-2026-0391 --ignore RUSTSEC-2026-0398 --ignore RUSTSEC-2026-0403 --ignore RUSTSEC-2026-0410
         working-directory: rust
 
   cargo-deny:

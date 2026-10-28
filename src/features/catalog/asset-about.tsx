@@ -19,11 +19,12 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Textarea } from "@/components/ui/textarea"
 import { useAuth } from "@/features/auth/auth-provider"
-import { useServiceAction } from "@/hooks/use-service"
+import { useService, useServiceAction } from "@/hooks/use-service"
 import { notifySuccess } from "@/lib/notify"
 import { cn } from "@/lib/utils"
-import { assetService } from "@/services"
+import { assetService, tagKeysService } from "@/services"
 import type { AssetAnnotation, AssetDetail } from "@/services/contracts/assets"
+import { chosenGovernedTags, governedPairLabels } from "./governed-tags"
 
 /** The API's bounds on an annotation (`routes::catalog::validate_annotation_body`). */
 const MAX_TAGS = 20
@@ -64,6 +65,14 @@ function EditDialog({
   const [owner, setOwner] = React.useState(a.annotation?.owner ?? "")
   const [steward, setSteward] = React.useState(a.annotation?.steward ?? "")
   const [tags, setTags] = React.useState((a.annotation?.tags ?? []).join(", "))
+  // DATA-12 part 2: one select per defined key. The keys load with the dialog;
+  // until they have, if they cannot be read, and while none is defined, no
+  // `governedTags` is sent, so a save never wipes values the editor could not
+  // show.
+  const tagKeys = useService((s) => tagKeysService.list(s), [])
+  const [governed, setGoverned] = React.useState<Record<string, string>>(
+    a.annotation?.governedTags ?? {}
+  )
   const save = useServiceAction((signal, input: AssetAnnotation) => {
     if (!assetService.updateAnnotation) {
       return Promise.reject(new Error("This deployment cannot edit asset details."))
@@ -79,6 +88,9 @@ function EditDialog({
       owner: orNull(owner),
       steward: orNull(steward),
       tags: parsed.tags,
+      ...(tagKeys.status === "success" && tagKeys.data.length > 0
+        ? { governedTags: chosenGovernedTags(governed) }
+        : {}),
     })
     // `run` resolves to `null` only on failure, which `save.error` shows.
     if (ok === null) return
@@ -143,6 +155,42 @@ function EditDialog({
               {"error" in parsed ? parsed.error : "Separate with commas. Tags make the asset findable in search."}
             </p>
           </div>
+          {tagKeys.status === "success" && tagKeys.data.length > 0 ? (
+            <div className="grid gap-1.5">
+              <Label>Governed tags</Label>
+              <div className="grid gap-2 sm:grid-cols-2">
+                {tagKeys.data.map((tagKey) => (
+                  <div key={tagKey.key} className="grid gap-1">
+                    <Label htmlFor={`asset-governed-${tagKey.key}`} className="font-mono text-xs">
+                      {tagKey.key}
+                    </Label>
+                    <select
+                      id={`asset-governed-${tagKey.key}`}
+                      className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
+                      value={governed[tagKey.key] ?? ""}
+                      onChange={(e) => setGoverned({ ...governed, [tagKey.key]: e.target.value })}
+                    >
+                      <option value="">None</option>
+                      {tagKey.allowedValues.map((value) => (
+                        <option key={value} value={value}>
+                          {value}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                ))}
+              </div>
+              <p className="text-xs text-muted-foreground">
+                Values an admin agreed on. Only these can be chosen; the free tags above are not
+                affected.
+              </p>
+            </div>
+          ) : null}
+          {tagKeys.status === "error" ? (
+            <p className="text-xs text-muted-foreground">
+              The governed tag keys could not be loaded, so they are left as they are.
+            </p>
+          ) : null}
           {save.error ? <p className="text-sm text-destructive">{save.error.message}</p> : null}
         </div>
         <DialogFooter>
@@ -161,8 +209,8 @@ function EditDialog({
 }
 
 /**
- * What the asset is and who answers for it. Description, owner, steward
- * and tags can be edited here by anyone with `catalog:write`; the rest is
+ * What the asset is and who answers for it. Description, owner, steward,
+ * tags and governed tags can be edited here by anyone with `catalog:write`; the rest is
  * the registry's.
  */
 export function AssetAbout({
@@ -183,6 +231,7 @@ export function AssetAbout({
   const { hasPermission } = useAuth()
   const [editing, setEditing] = React.useState(false)
   const tags = a.tags ?? []
+  const governedPairs = governedPairLabels(a.governedTags)
 
   return (
     <SectionCard
@@ -218,12 +267,19 @@ export function AssetAbout({
             : []),
           { label: "Columns", value: String(a.schema.length || a.columnCount) },
           ...(schemaLabel ? [{ label: "Schema", value: schemaLabel }] : []),
-          ...(tags.length > 0
+          // Governed pairs (`key: value`, tone "info") sit beside the free tags
+          // (neutral) in one row: both are how the asset is found.
+          ...(tags.length > 0 || governedPairs.length > 0
             ? [
                 {
                   label: "Tags",
                   value: (
                     <span className="flex flex-wrap gap-1">
+                      {governedPairs.map((pair) => (
+                        <Pill key={`governed:${pair}`} tone="info" title="Governed tag">
+                          {pair}
+                        </Pill>
+                      ))}
                       {tags.map((tag) => (
                         <Pill key={tag} tone="neutral">
                           {tag}

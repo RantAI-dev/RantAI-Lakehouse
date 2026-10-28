@@ -56,14 +56,15 @@ function renderBuilder(initial?: ChartDef) {
 }
 
 describe("ChartBuilder sections (phase 2 QA R3)", () => {
-  it("shows four ordered sections and folds the last one", async () => {
+  it("shows five ordered sections and folds the last two", async () => {
     renderBuilder(barDef)
     const headings = await screen.findAllByRole("heading", { level: 3 })
-    // A folded section also shows its summary after the title (phase 2 QA R10).
-    const titles = ["Data", "What to show", "Sort and filter", "More options"]
-    expect(headings.map((h) => h.textContent ?? "")).toHaveLength(4)
+    // A folded section also shows its summary after the title (phase 2 QA R10). BI-17 added "Format" as the fifth.
+    const titles = ["Data", "What to show", "Sort and filter", "More options", "Format"]
+    expect(headings.map((h) => h.textContent ?? "")).toHaveLength(5)
     headings.forEach((h, i) => expect(h.textContent).toContain(titles[i]))
     expect(screen.getByRole("button", { name: /More options/ }).getAttribute("aria-expanded")).toBe("false")
+    expect(screen.getByRole("button", { name: /Format/ }).getAttribute("aria-expanded")).toBe("false")
     // Nothing of the folded options is drawn, and no row of chips or default-aggregate select stands in the form.
     expect(screen.queryByText("Reference lines")).toBeNull()
     expect(screen.queryByText("Parameters")).toBeNull()
@@ -72,10 +73,19 @@ describe("ChartBuilder sections (phase 2 QA R3)", () => {
   })
 
   it("opens the fold on its own when the edited chart uses something inside it", async () => {
-    renderBuilder({ ...barDef, referenceLines: [{ value: 100 }] as never })
+    renderBuilder({ ...barDef, click: { kind: "url", url: "https://example.com/x" } })
     const toggle = await screen.findByRole("button", { name: /More options/ })
     await waitFor(() => expect(toggle.getAttribute("aria-expanded")).toBe("true"))
     expect(screen.getByText("Parameters")).toBeTruthy()
+  })
+
+  // BI-17: the reference lines editor moved from More options to the Format section.
+  it("opens Format, not More options, for a chart with a reference line, and lists the line there", async () => {
+    renderBuilder({ ...barDef, referenceLines: [{ value: 100 }] as never })
+    const format = await screen.findByRole("button", { name: /Format/ })
+    await waitFor(() => expect(format.getAttribute("aria-expanded")).toBe("true"))
+    expect(screen.getByRole("button", { name: /More options/ }).getAttribute("aria-expanded")).toBe("false")
+    expect(screen.getByLabelText("Line 1 value")).toBeTruthy()
   })
 
   it("opens the fold for steps, and a user can open it by hand", async () => {
@@ -112,8 +122,9 @@ describe("ChartBuilder aggregation (phase 2 QA R4)", () => {
 
 describe("ChartBuilder kind rules (phase 2 QA R5)", () => {
   it("hides steps and questions while 'Other' is on and says why beside the switch", async () => {
-    renderBuilder({ ...barDef, other: true, limit: 5, steps: undefined, referenceLines: [{ value: 1 }] as never })
+    renderBuilder({ ...barDef, other: true, limit: 5, steps: undefined })
     const toggle = await screen.findByRole("button", { name: /More options/ })
+    fireEvent.click(toggle)
     await waitFor(() => expect(toggle.getAttribute("aria-expanded")).toBe("true"))
     expect(screen.getByText("While this is on, steps and more questions are not available.")).toBeTruthy()
     expect(screen.queryByText("Steps")).toBeNull()
@@ -122,7 +133,7 @@ describe("ChartBuilder kind rules (phase 2 QA R5)", () => {
   })
 
   it("offers 'Other', steps and questions to a bar, and none of them to a KPI", async () => {
-    const { unmount } = renderBuilder({ ...barDef, referenceLines: [{ value: 1 }] as never })
+    const { unmount } = renderBuilder({ ...barDef, click: { kind: "url", url: "https://example.com/x" } })
     await screen.findByLabelText("Group the rest as Other")
     expect(screen.getByText("Steps")).toBeTruthy()
     expect(screen.getByText("More questions")).toBeTruthy()
@@ -400,5 +411,120 @@ describe("ChartBuilder resizable split (phase 2 QA R18)", () => {
     } finally {
       window.matchMedia = original
     }
+  })
+})
+
+// BI-17 part A, T7: the Format section.
+const FULL_STYLE = {
+  format: { style: "compact", currency: "IDR", decimals: 2 },
+  valueFormats: { visitors: { style: "percent", decimals: 1 } },
+  dateFormat: { style: "monthYear", abbreviate: true },
+  colors: { palette: "muted", series: { visitors: "#112233" }, byValue: ["#dbeafe", "#1d4ed8"] },
+  axes: { x: { title: "Province", rotate: 45 }, y: { title: "Visitors", min: 0, max: 5000, log: true, show: false } },
+  labels: { show: true },
+  annotations: [{ x: "Bali", text: "Peak season" }],
+  tooltip: { fields: ["visitors"] },
+}
+
+describe("ChartBuilder Format section (BI-17 part A)", () => {
+  it("reopens a chart saved with every field and sends the same style back", async () => {
+    renderBuilder({ ...barDef, ...FULL_STYLE } as ChartDef)
+    const toggle = await screen.findByRole("button", { name: /Format/ })
+    await waitFor(() => expect(toggle.getAttribute("aria-expanded")).toBe("true"))
+    // The controls hold what was saved.
+    expect((screen.getByLabelText("Number format decimals") as HTMLInputElement).value).toBe("2")
+    expect((screen.getByLabelText("Number format currency code") as HTMLInputElement).value).toBe("IDR")
+    expect((screen.getByLabelText("X axis title") as HTMLInputElement).value).toBe("Province")
+    expect((screen.getByLabelText("Y axis maximum") as HTMLInputElement).value).toBe("5000")
+    expect((screen.getByLabelText("Note 1 text") as HTMLInputElement).value).toBe("Peak season")
+    expect(screen.getByLabelText("Palette").textContent).toContain("Muted")
+    // The preview request carries the style exactly as saved.
+    await waitFor(() => expect(bodies.some((b) => b.axes)).toBe(true))
+    const sent = bodies[bodies.length - 1]!
+    for (const [field, value] of Object.entries(FULL_STYLE)) expect(sent[field], field).toEqual(value)
+  })
+
+  it("a bar chart offers colours, axes, labels, notes and reference lines, and no conditional colours", async () => {
+    renderBuilder(barDef)
+    fireEvent.click(await screen.findByRole("button", { name: /Format/ }))
+    for (const title of ["Values", "Dates", "Colours", "Axes", "Labels", "Notes", "Tooltip"]) expect(screen.getByText(title), title).toBeTruthy()
+    expect(screen.getByText("Reference lines")).toBeTruthy()
+    expect(screen.queryByText("Conditional colours")).toBeNull()
+  })
+
+  it("a table offers conditional colours and number formats, and no axes or palette", async () => {
+    renderBuilder({ title: "T", kind: "table", mart: "mart_visits", dimension: "provinsi", measures: ["visitors"], aggregate: "sum" })
+    fireEvent.click(await screen.findByRole("button", { name: /Format/ }))
+    expect(screen.getByText("Conditional colours", { selector: "legend" })).toBeTruthy()
+    expect(screen.getByText("Values")).toBeTruthy()
+    for (const title of ["Axes", "Colours", "Labels", "Notes", "Tooltip"]) expect(screen.queryByText(title), title).toBeNull()
+  })
+
+  it("does not send a conditional rule that has no column yet", async () => {
+    renderBuilder({ title: "T", kind: "table", mart: "mart_visits", dimension: "provinsi", measures: ["visitors"], aggregate: "sum" })
+    fireEvent.click(await screen.findByRole("button", { name: /Format/ }))
+    fireEvent.click(screen.getByRole("button", { name: /Add a rule/ }))
+    fireEvent.change(screen.getByLabelText("Rule 1 value"), { target: { value: "1000" } })
+    await waitFor(() => expect(bodies.length).toBeGreaterThan(0))
+    expect(bodies[bodies.length - 1]!.conditional).toBeUndefined()
+  })
+
+  it("a line added to a bar chart is a goal line at the number given", async () => {
+    renderBuilder(barDef)
+    fireEvent.click(await screen.findByRole("button", { name: /Format/ }))
+    fireEvent.click(screen.getByRole("button", { name: /Add a line/ }))
+    fireEvent.change(screen.getByLabelText("Line 1 value"), { target: { value: "1000" } })
+    fireEvent.change(screen.getByLabelText("Line 1 label"), { target: { value: "Goal" } })
+    await waitFor(() => expect(bodies.some((b) => b.referenceLines)).toBe(true))
+    expect(bodies[bodies.length - 1]!.referenceLines).toEqual([{ value: 1000, label: "Goal" }])
+  })
+})
+
+describe("ChartBuilder freshness (BI-4 part B)", () => {
+  it("shows the chart's own rule, opening the fold it sits in, and refuses minutes out of range in a sentence", async () => {
+    renderBuilder({ ...barDef, cache: { mode: "minutes", minutes: 30 } })
+    const minutes = (await screen.findByLabelText("Freshness: minutes")) as HTMLInputElement
+    expect(minutes.value).toBe("30")
+    fireEvent.change(minutes, { target: { value: "5000" } })
+    expect((await screen.findByRole("alert")).textContent).toBe("Remember for between 1 minute and 24 hours (1 to 1440 minutes).")
+  })
+
+  it("offers 'Follow the default' to a chart with no rule of its own and no minutes box", async () => {
+    renderBuilder(barDef)
+    fireEvent.click(await screen.findByRole("button", { name: /More options/ }))
+    expect(await screen.findByLabelText("Freshness")).toBeTruthy()
+    expect(screen.queryByLabelText("Freshness: minutes")).toBeNull()
+  })
+})
+
+describe("ChartBuilder scatter (BI-17 B QA fix F2)", () => {
+  it("asks for an X metric and a Y metric, and a size for a bubble chart", async () => {
+    renderBuilder(barDef)
+    const trigger = await screen.findByRole("button", { name: /Change chart type, now Bar/ })
+    fireEvent.click(trigger)
+    fireEvent.click(await screen.findByRole("button", { name: "Scatter (X vs Y)" }))
+    await waitFor(() => expect(screen.getByText("X metric")).toBeTruthy())
+    expect(screen.getByText("Y metric")).toBeTruthy()
+    expect(screen.queryByText("Size metric")).toBeNull()
+  })
+
+  it("does the same when the chart is new and the data source is picked after the kind", async () => {
+    renderBuilder()
+    const scatter = await screen.findByRole("button", { name: "Scatter (X vs Y)" })
+    fireEvent.click(scatter)
+    await waitFor(() => expect(screen.getByText("X metric")).toBeTruthy())
+    expect(screen.getByText("Y metric")).toBeTruthy()
+  })
+
+  it("keeps the Y metric when the data source is picked after the kind (it used to reset to one row)", async () => {
+    renderBuilder()
+    fireEvent.click(await screen.findByRole("button", { name: "Bubble (X, Y, size)" }))
+    fireEvent.click(await screen.findByRole("combobox", { name: /pick a mart/i }).catch(() => screen.getByText(/pick a mart/)))
+    fireEvent.click(await screen.findByRole("option", { name: /mart_visits/ }))
+    await screen.findByText("Data source")
+    fireEvent.click(screen.getByRole("button", { name: /What to show/ }))
+    await waitFor(() => expect(screen.getByText("X metric")).toBeTruthy())
+    expect(screen.getByText("Y metric")).toBeTruthy()
+    expect(screen.getByText("Size metric")).toBeTruthy()
   })
 })

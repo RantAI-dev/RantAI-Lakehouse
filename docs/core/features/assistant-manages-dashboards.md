@@ -6,7 +6,7 @@
 | Backlog | `AI-1`, `AI-2`, `AI-20` |
 | Spec | `docs/core/specs/ai-1.md`, `docs/core/specs/ai-2.md`; `AI-20` has no spec (it is a follow-up from PR #104 review SHOULD-FIX 11) |
 | Status | Decisions signed 2026-10-15 (two decisions); the rest are planner defaults, owner to confirm at QA |
-| Plan | `plans/20-the-assistant-renames-arranges-and-filters-dashboards.md` |
+| Plan | Plan files are not kept in the repository. |
 
 ## Problem
 
@@ -23,7 +23,7 @@ grain answers from the chart's own grain or not at all.
 1. Ask the assistant to rename a board: "rename this dashboard to 'Q3
    review'".
 2. Ask the assistant to delete a board; the assistant asks for it through
-   Confirm, names the board, and says its charts go too.
+   an Approval, names the board, and says its charts go too.
 3. Ask the assistant to arrange the tiles by plain instruction: "make the
    revenue chart half width and put the funnel next to it", "put the
    conversion rate on top". Only the tiles the person names move.
@@ -56,7 +56,7 @@ grain answers from the chart's own grain or not at all.
 
 Six tools cover the things a person can already do to a dashboard from the
 console: rename it, delete it, arrange its tiles, move a chart, change the
-filters this viewer sees, and save a board's default filters. Five of the six
+filters this viewer sees, and save a board's default filters. Four of the six
 call the same route handler the console calls, so validation, permissions,
 audit and the console's own refusals all carry through unchanged.
 
@@ -80,6 +80,34 @@ audit and the console's own refusals all carry through unchanged.
   default; refused on the built-in Main board; only used when the
   person asks to save or to make it the default for everyone.
 
+The chart tools say what they did. `delete_chart` refuses a chart that does
+not exist or that the person cannot see ("this tile does not exist"),
+instead of reporting a delete that never happened. `update_chart` keeps the
+formatting and the board the call leaves out, so changing a chart's title
+does not move it to another board or cost it its colours; a change of the
+chart's kind resets the formatting, because the old formatting does not fit
+the new kind. `update_chart` keeps the data source the call leaves out
+too, so a rename does not have to repeat the mart. `list_charts` names
+each chart's board and its tab, so the assistant can read what an update
+keeps.
+
+`list_charts` also names the formatting a chart holds (the `style` it
+was saved with, and the reference lines when it has any) and the names
+its series can take (`seriesNames`): the names the chart draws, which are
+the names a series colour and a value format are stored under. The
+assistant names a series instead of guessing one. `format_chart` refuses
+a series the chart does not draw, and names the series the chart does
+draw, so the assistant corrects the call instead of trying again. A chart
+whose series are not known when it is saved (one that breaks its data
+down into one series per value, or one that reads a parameter) is not
+checked, and for such a chart `seriesNames` names the measure and not a
+series. A pie, a rose, a funnel or a treemap colours its marks by the
+name of the item and not by a series.
+
+A dashboard filter that names a saved segment is refused: a board filter
+names a column, and a saved segment belongs to a chart's or a metric's own
+filters.
+
 The dashboard page applies a `set_board_view_filters` result when the
 chat reply's trace holds the step for the board on screen: it writes the
 filters into the page address with the same helpers a chip change uses.
@@ -102,7 +130,7 @@ than the chart's own.
 | 5 | `set_board_view_filters` validates filters and writes nothing; returns `{applyViewFilters: true, board, filters}` (the full list that should be active; an empty list clears). Read risk, so it is offered in Ask mode too | Planner default | Owner to confirm at QA |
 | 6 | The dashboard page applies a view-filter result. When a chat reply's trace holds a `set_board_view_filters` step with `ok: true` and its `board` is the board on screen, the page writes the filters into the address with the existing helpers (`encodeFilters` / `filtersToParam`). On any other page or another board the step card shows a link to that board with the filters in the address, built with the same helpers. The hook sits beside the existing way the dock tells the page about a tool result (`use-copilot.ts:301`, `:405`); no new channel | Planner default | Owner to confirm at QA |
 | 7 | `save_board_filters` saves the default and is used only when the person asks to save or to make it the default for everyone. On the built-in Main board it fails as the console does. **The plan named a `grain?` argument alongside `board` and `filters`; the schema and implementation carry `board` + `filters` only — saving the time grain is not part of the tool** | Planner default | Owner to confirm at QA |
-| 8 | The page context carries what the tools need: for `AI-2`, the active filters also as compact JSON (`FilterDef[]`), within their own 4,000-character budget, leaving room inside the page context's 5,000-character cap; when over, the JSON is left out and the chip summary stays. For `AI-20`, the on-screen time grain and the board's saved grain (`summarizeGrain`, new, beside `summarizeFilters`), and the page effect's dependency list gains them | Planner default | Owner to confirm at QA |
+| 8 | The page context carries what the tools need: for `AI-2`, the active filters also as compact JSON (`FilterDef[]`), within their own 4,000-character budget, leaving room inside the page context's 6,000-character cap; when over, the JSON is left out and the chip summary stays. For `AI-20`, the on-screen time grain and the board's saved grain (`summarizeGrain`, new, beside `summarizeFilters`), and the page effect's dependency list gains them | Planner default | Owner to confirm at QA |
 | 9 | `AI-2` is two tools, not one: `set_board_view_filters` changes only the person's view (the active filters in the address, nothing saved) by default, and `save_board_filters` saves the board's default only on an explicit request, through Confirm. A single tool that saved by default would change the dashboard for everyone without a second prompt | — | Owner, 2026-10-15 |
 | 10 | "Undo in one step" is not built. Boards have no version history yet, so the assistant cannot undo a rename, a deletion, an arrange, a move or a saved-filters change. It is written as an unmet target, and the backlog gains a row that waits for `BI-18` (version history part) | — | Owner, 2026-10-15 |
 | 11 | "Linked filters" named in `docs/core/specs/ai-2.md` are not in the `BI-18` code at `7a092caf`. The feature page says so and leaves the row unmet; no code for it | Planner default | Owner to confirm at QA |
@@ -126,7 +154,7 @@ than the chart's own.
   board and says its charts go too.
 - The active filters in the page context are written as compact JSON
     within a 4,000-character budget of their own, which leaves room inside
-    the page context's 5,000-character cap. When they do not, the JSON
+    the page context's 6,000-character cap. When they do not, the JSON
   is left out and the chip summary stays.
 
 ## Acceptance checklist

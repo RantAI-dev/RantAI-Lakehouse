@@ -1,6 +1,7 @@
 import type {
+  QueryLimits,
+  QueryLimitsInput,
   ReportingSettings,
-  ReportingSettingsInput,
   SettingsService,
 } from "../contracts/settings"
 import { ServiceError } from "../errors"
@@ -11,12 +12,13 @@ import { apiFetch } from "../http"
  * error body's text is the route's own fixed message ("Unknown time zone."),
  * so it is safe to show.
  */
-async function call(
+async function call<T = ReportingSettings>(
   method: "GET" | "PUT",
-  body: ReportingSettingsInput | undefined,
-  signal?: AbortSignal
-): Promise<ReportingSettings> {
-  const res = await apiFetch("/api/settings/reporting", {
+  body: unknown,
+  signal?: AbortSignal,
+  path = "/api/settings/reporting"
+): Promise<T> {
+  const res = await apiFetch(path, {
     method,
     headers: body === undefined ? undefined : { "Content-Type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
@@ -32,10 +34,19 @@ async function call(
           : "invalid_request"
     throw new ServiceError(kind, json?.error ?? `Failed (${res.status})`, res.status)
   }
-  return json as ReportingSettings
+  return json as T
 }
 
+/**
+ * `/api/settings/limits` (`BI-5`). The route does not exist until T1 of the
+ * BI-5 plan is built: until then a read answers 404 and the page says it
+ * could not load, which is true.
+ */
+const LIMITS_PATH = "/api/settings/limits"
+
 export const settingsService: SettingsService = {
+  getLimits: (signal) => call<QueryLimits>("GET", undefined, signal, LIMITS_PATH),
+  saveLimits: (input: QueryLimitsInput, signal) => call<QueryLimits>("PUT", input, signal, LIMITS_PATH),
   getReporting: (signal) => call("GET", undefined, signal),
   saveReporting: (input, signal) => call("PUT", input, signal),
 }

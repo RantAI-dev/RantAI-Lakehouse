@@ -44,6 +44,13 @@ use crate::state::AppState;
 
 // One more record: what each table was last built from (see the module).
 mod builds;
+// Column-level lineage (`DATA-13`): producers, and the route that reads it.
+pub(crate) mod columns;
+// `BI-14`: charts, SQL sources and metrics in the graph, and the route that
+// walks one chart's path upstream.
+pub(crate) mod charts;
+// `BI-14`: which charts read a table.
+pub(crate) mod used_by;
 
 /// Most nodes one response carries, so a focus on a hub table cannot
 /// return the whole warehouse.
@@ -54,6 +61,10 @@ struct Graph {
     nodes: BTreeMap<String, (String, &'static str)>,
     edges: Vec<(String, String, &'static str, String)>,
     coverage: Vec<String>,
+    /// When a node was last refreshed and what says so (`BI-14` D3): a
+    /// `silver`/`serving` table's last build in `system.query_log` (UTC,
+    /// `YYYY-MM-DD HH:MM`). A node with no entry has no recorded time.
+    refreshed: BTreeMap<String, (String, &'static str)>,
 }
 
 impl Graph {
@@ -301,13 +312,22 @@ const UPLOAD_EVIDENCE: &str = "upload table claim (upload_table_claim)";
 fn add_claim_rows(g: &mut Graph, claims: &[lakehouse_store::uploads::ClaimedTable]) {
     for claim in claims {
         let upload = format!("upload:{}", claim.upload_id);
-        let label = claim
+        let name = claim
             .original_filename
             .as_deref()
             .map(str::trim)
-            .filter(|name| !name.is_empty())
-            .unwrap_or(DELETED_UPLOAD_LABEL);
-        g.node(&upload, label, UPLOAD);
+            .filter(|name| !name.is_empty());
+        // `DATA-17` slice 5: a table loaded from several files says so. The count is of
+        // the files that loaded with the claiming upload, of its own tenant
+        // (`list_claims`); a deleted upload has no name to attach it to.
+        let label = match name {
+            Some(name) if claim.also_loaded > 0 => {
+                format!("{name} and {} more", claim.also_loaded)
+            }
+            Some(name) => name.to_owned(),
+            None => DELETED_UPLOAD_LABEL.to_owned(),
+        };
+        g.node(&upload, &label, UPLOAD);
         let bronze = format!("bronze:{}", claim.bronze_table);
         g.node(&bronze, &format!("bronze.{}", claim.bronze_table), "bronze");
         g.edge(&upload, &bronze, UPLOAD, UPLOAD_EVIDENCE);
@@ -450,8 +470,19 @@ fn matches_focus(g: &Graph, focus: &str) -> Vec<String> {
 /// back, outgoing edges walked forward, never sideways (a sibling that
 /// shares a parent is not in the focus's lineage).
 fn reachable(g: &Graph, start: &[String]) -> BTreeSet<String> {
+    walk(g, start, &[true, false])
+}
+
+/// Only what is upstream of `start` (`BI-14`: where a chart comes from), the
+/// same walk as [`reachable`] with the forward pass left out.
+fn upstream(g: &Graph, start: &[String]) -> BTreeSet<String> {
+    walk(g, start, &[false])
+}
+
+/// [`reachable`]'s walk over the given directions (`true` forward).
+fn walk(g: &Graph, start: &[String], directions: &[bool]) -> BTreeSet<String> {
     let mut keep: BTreeSet<String> = start.iter().cloned().collect();
-    for forward in [true, false] {
+    for &forward in directions {
         let mut frontier: Vec<String> = start.to_vec();
         while let Some(node) = frontier.pop() {
             if keep.len() >= MAX_NODES {
@@ -474,6 +505,51 @@ fn reachable(g: &Graph, start: &[String]) -> BTreeSet<String> {
     keep
 }
 
+/// The table graph as recorded for `principal`, before any focus is applied
+/// (`BI-14` D2: the chart route walks the same graph the lineage page draws,
+/// it does not build a second one), with the tenant and shared-catalog rules
+/// the walk and the column mappings need.
+struct Assembled {
+    g: Graph,
+    tenant: Option<uuid::Uuid>,
+    shared: bool,
+}
+
+/// Every record the graph draws, for `principal`.
+///
+/// # Errors
+///
+/// As [`build`].
+async fn assemble(
+    state: &AppState,
+    principal: &Principal,
+    headers: &HeaderMap,
+) -> Result<Assembled, ApiError> {
+    let tenant = crate::tenant_scope::resolve(principal, headers)?;
+    let mut g = Graph::default();
+    let shared =
+        match crate::routes::catalog::catalog_tenant_refusal(state, principal, headers).await? {
+            None => {
+                add_shared(state, &mut g).await;
+                true
+            }
+            Some(reason) => {
+                g.coverage.push(format!(
+                    "shared catalog, ClickHouse tables and Gold exports are not shown: {reason}"
+                ));
+                false
+            }
+        };
+    add_tenant_owned(state, principal, tenant, &mut g).await;
+    builds::drop_repeats(&mut g);
+    g.coverage.push(
+        "only recorded edges are drawn; what a table is built from is read from the statement \
+         that last wrote it, so a table filled some other way has no incoming edge"
+            .to_owned(),
+    );
+    Ok(Assembled { g, tenant, shared })
+}
+
 /// The recorded lineage around `focus` for `principal` (see the module
 /// doc). An empty or unknown focus returns an empty graph with a note, so
 /// the response never depends on which data a deployment holds.
@@ -490,21 +566,14 @@ pub(crate) async fn build(
     headers: &HeaderMap,
     focus: &str,
 ) -> Result<Value, ApiError> {
-    let tenant = crate::tenant_scope::resolve(principal, headers)?;
-    let mut g = Graph::default();
-    match crate::routes::catalog::catalog_tenant_refusal(state, principal, headers).await? {
-        None => add_shared(state, &mut g).await,
-        Some(reason) => g.coverage.push(format!(
-            "shared catalog, ClickHouse tables and Gold exports are not shown: {reason}"
-        )),
-    }
-    add_tenant_owned(state, principal, tenant, &mut g).await;
-    builds::drop_repeats(&mut g);
-    g.coverage.push(
-        "only recorded edges are drawn; what a table is built from is read from the statement \
-         that last wrote it, so a table filled some other way has no incoming edge"
-            .to_owned(),
-    );
+    let Assembled {
+        mut g,
+        tenant,
+        shared,
+    } = assemble(state, principal, headers).await?;
+    // BI-14 (D2, D5): the charts, SQL sources and metrics the caller may see,
+    // downstream of the tables they read.
+    charts::add_dashboard_nodes(state, principal, tenant, shared, &mut g).await;
 
     let base = json!({ "focus": focus, "columnMappings": [], "supported": true });
     let empty = |note: String| {
@@ -543,6 +612,11 @@ pub(crate) async fn build(
         })
         .collect();
     let mut body = base;
+    // DATA-13 (F1): the recorded column mappings that touch the focus, in the
+    // row shape `GET /api/governance/lineage/columns` answers, under the same
+    // tenant rules as the graph above.
+    body["columnMappings"] =
+        columns::mappings_touching(state, principal, tenant, shared, &start).await;
     body["nodes"] = json!(nodes);
     body["edges"] = json!(edges);
     body["coverage"] = json!(g.coverage);
@@ -613,7 +687,7 @@ mod tests {
             matches_focus(&g, "gold.mart_visits"),
             vec!["iceberg:gold.mart_visits".to_owned()]
         );
-        assert!(matches_focus(&g, "nothing").is_empty());
+        assert_eq!(matches_focus(&g, "nothing"), [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -660,6 +734,7 @@ mod tests {
             bronze_table: table.to_owned(),
             upload_id: upload_id.to_owned(),
             original_filename: filename.map(str::to_owned),
+            also_loaded: 0,
         }
     }
 
@@ -708,6 +783,28 @@ mod tests {
             !keep.contains("upload:up-2"),
             "another table's upload is not lineage"
         );
+    }
+
+    /// `DATA-17` slice 5: a table loaded from several files names the first file and
+    /// how many others came with it; a load of one file keeps the plain name, and a
+    /// deleted upload keeps its own label whatever the count says (the name is never
+    /// guessed back).
+    #[test]
+    fn a_table_loaded_from_several_files_says_how_many_came_with_the_first() {
+        let mut g = Graph::default();
+        let mut several = claim("stock_raw", "up-1", Some("stock_a.csv"));
+        several.also_loaded = 2;
+        let mut gone = claim("other_raw", "up-2", None);
+        gone.also_loaded = 3;
+        add_claim_rows(
+            &mut g,
+            &[several, claim("solo_raw", "up-3", Some("solo.csv")), gone],
+        );
+
+        let label = |id: &str| g.nodes.get(id).map(|n| n.0.as_str());
+        assert_eq!(label("upload:up-1"), Some("stock_a.csv and 2 more"));
+        assert_eq!(label("upload:up-3"), Some("solo.csv"));
+        assert_eq!(label("upload:up-2"), Some(DELETED_UPLOAD_LABEL));
     }
 
     /// A claim outlives the upload that made it (deleting an upload

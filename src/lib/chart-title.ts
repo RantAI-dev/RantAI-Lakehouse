@@ -14,8 +14,14 @@ export type TitleParts = {
 
 export function suggestChartTitle({ kind, dimension, measures = [], breakdown }: TitleParts): string {
   const [m1, m2] = measures.filter(Boolean);
-  if (kind === "text" || !m1) return "";
+  // BI-16 part B: a histogram has no measure; it counts the rows of its column.
+  if (kind === "histogram") return dimension ? `Spread of ${dimension}` : "";
+  // BI-16 part C1: a Gantt chart has no measure; it lays the tasks of its column on a time axis.
+  if (kind === "gantt") return dimension ? `Schedule of ${dimension}` : "";
+  if (kind === "text" || kind === "image" || kind === "web" || !m1) return "";
   if (kind === "kpi" || kind === "gauge") return m1;
+  if (kind === "progress") return `${m1} against its goal`;
+  if (kind === "bullet" && !dimension) return `${m1} against its target`;
   const metric = (kind === "scatter" || kind === "bubble") && m2 ? `${m1} vs ${m2}` : kind === "combo" && m2 ? `${m1} and ${m2}` : m1;
   // A point map has no category: its dimension is only a tooltip label.
   if (kind === "geoheat") return `${metric} density`;

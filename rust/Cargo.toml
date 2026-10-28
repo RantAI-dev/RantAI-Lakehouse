@@ -4,12 +4,15 @@ members = ["crates/*"]
 
 [workspace.package]
 edition = "2024"
-# Real floor, not the edition-2024 minimum (1.85). Verified by building
-# --locked against progressively newer toolchains: 1.85 fails because
-# testcontainers/testcontainers-modules require 1.88, time/time-core/
-# time-macros require 1.88.0, etcetera requires 1.87.0, and ferroid
-# requires 1.85.1. 1.88.0 builds clean. See docs/CI.md.
-rust-version = "1.88"
+# Floor, not the edition-2024 minimum (1.85). Since REL-9 (product-owner
+# decision D1, 2026-10-17) the floor is the latest stable, same release as
+# the `rust-toolchain.toml` pin: `sqlx` 0.9 — which `SEC-41` lands —
+# requires rustc 1.94, so a held-over lower promise could not be kept, and
+# the owner chose to move pin and floor together rather than chase
+# dependency floors. The CI `msrv` job checks it one patch below the pin
+# with `cargo +1.99.0 check --workspace --all-targets --locked`. See
+# docs/CI.md.
+rust-version = "1.99"
 license = "AGPL-3.0-or-later"
 
 [workspace.dependencies]
@@ -31,6 +34,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 indexmap = { version = "2", features = ["serde"] }
 hmac = "0.13"
 sha2 = "0.11"
+# In-process store of remembered dashboard results (`BI-4` part B). Already in
+# `Cargo.lock` (0.12.16, via `iceberg`) with the `future` feature, so it adds no crate.
+moka = { version = "0.12.16", default-features = false, features = ["future"] }
 base64 = "0.23"
 rand = "0.10"
 # `SRC-12` decision 4: AES-256-GCM for managed connector credentials at rest
@@ -51,11 +57,27 @@ url = "2"
 # first DIRECT use, so it needs its own workspace entry.
 ipnet = "2"
 time = { version = "0.3", features = ["formatting", "parsing", "serde"] }
+# `RPT-1` (`lakehouse-store::report_schedule`): zone-aware schedule maths needs a
+# time zone database in Rust, and the workspace had none (the zone list lives
+# in the engine). `jiff` was already in `Cargo.lock` through `serde_with`, with
+# its bundled database `jiff-tzdb`, so this adds no package; `tzdb-bundle-always`
+# makes the schedule independent of the container image having `tzdata`.
+jiff = { version = "0.2", default-features = false, features = ["std", "tzdb-bundle-always"] }
 lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "rustls-tls", "builder", "tokio1-rustls-tls"] }
 wiremock = "0.6"
 tempfile = "3"
 tokio-util = "0.7"
-sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "mysql", "uuid", "time", "json", "macros", "migrate"] }
+# `SEC-41` decision 1: `sqlx` 0.9 dropped the combined `runtime-tokio-rustls`
+# feature; `runtime-tokio` + `tls-rustls` is the same pair of things it meant
+# (`tls-rustls` = `tls-rustls-ring` = `tls-rustls-ring-webpki`: rustls' ring
+# provider with webpki roots), so a connector dial uses the same crypto
+# provider and the same root store as under 0.8. `default-features = false`
+# because 0.9's default set adds `any`, which this workspace never uses
+# (`sqlx::Any`/`AnyPool` appear nowhere); `mysql-rsa` stays off (`SEC-41`
+# decision 3 / spec D3), so a MySQL server with no TLS that asks for a
+# SHA-2 password plugin is refused rather than sent an RSA-encrypted
+# password, and `rsa` leaves the API binary.
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "mysql", "uuid", "time", "json", "macros", "migrate"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 async-trait = "0.1"
 argon2 = "0.6"
@@ -64,10 +86,15 @@ subtle = "2"
 # with NEITHER backend enabled by default; `CryptoProvider::get_default()`
 # panics at runtime ("Could not automatically determine the process-level
 # CryptoProvider...") unless exactly one of `rust_crypto`/`aws_lc_rs` is
-# selected. Chose `rust_crypto` (pure-Rust, no new C dependency) to match
-# every other crypto crate already in this workspace (sha2, hmac, argon2,
-# rand are all RustCrypto-ecosystem).
-jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto", "use_pem"] }
+# selected. Chose `rust_crypto` then (pure-Rust); switched to `aws_lc_rs`
+# for SEC-51, because `rust_crypto` pulls `p256`/`p384` -> `ecdsa` ->
+# `elliptic-curve`, which pins `crypto-bigint` ^0.5, and that version is
+# `RUSTSEC-2026-0387` (timing variability in modular reduction) with no
+# patched 0.5 release. `aws_lc_rs` adds no C dependency here: `aws-lc-rs`
+# is already compiled into this workspace through `object_store`/`rustls`.
+# Exactly one backend must stay selected -- selecting both would link two
+# providers and fail to build.
+jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs", "use_pem"] }
 # `lakehouse-api::next_run` (WS4 item G2) is the first workstream to land
 # this dependency -- WS5 also needs cron-next-occurrence computation and
 # reuses this same entry rather than adding a second one (programme rule:
@@ -113,7 +140,10 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["loggin
 rustls = { version = "0.23", default-features = false, features = ["logging", "std", "tls12", "ring"] }
 
 [workspace.lints.rust]
-future-incompatible = "warn"
+# `future_incompatible` with an underscore: Cargo 1.99 warns that the
+# hyphenated `future-incompatible` spelling is deprecated and will not work
+# in a future edition (REL-9). Same lint, same level.
+future_incompatible = "warn"
 nonstandard_style = { level = "deny", priority = -1 }
 missing_docs = "warn"
 

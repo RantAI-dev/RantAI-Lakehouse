@@ -120,6 +120,20 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         ".map_err(|err| err.to_string())?;",
         "rewrite_sql_for_principal's ApiError: the policy's own non-leaking message, written in this repository",
     ),
+    // D3 (plan 39): `run` records every answered run. Both lines write the
+    // history row for a refused or failed run; each `err` is an `ApiError`
+    // (`rewrite_sql_for_principal_with_headers` and
+    // `execute_query_against_engine` both return `Result<_, ApiError>`), so
+    // its `to_string()` is the same fixed text the adjacent
+    // `return Err(err.into())` hands the response. The row goes to the
+    // caller's own history, not into a response, and the marker test in
+    // `tests/query_history_recording.rs` pins that the engine's raw text
+    // never reaches it.
+    (
+        "query.rs",
+        "&err.to_string(),",
+        "the history row keeps the classified ApiError text the response itself carries (plan 39 D3)",
+    ),
     (
         "query.rs",
         "invalid JSON: {err}",
@@ -129,6 +143,14 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         "quality.rs",
         "Invalid request body: {err}",
         "serde error over the caller's own request body",
+    ),
+    // DATA-14: `detail` is built by our own code from numbers and our own rule/asset names
+    // (`open_for_failed_run`: rule name, `Verdict::value`, threshold; `open_anomaly`: the
+    // `detail()` sentences of `quality_anomaly`); no ClickHouse or other upstream text.
+    (
+        "quality_incidents.rs",
+        "let text = format!(\"{asset}: {detail}. View: /governance/data-quality\");",
+        "asset key and incident detail are written in this repository from counts, percentages and rule names, never upstream error text",
     ),
     (
         "storage.rs",
@@ -272,8 +294,18 @@ const ALLOWED: &[(&str, &str, &str)] = &[
     ),
     (
         "ai/tools/dashboards.rs",
-        ".map_err(|e| e.to_string())",
-        "serde error over the model's own tool arguments",
+        "cause.to_string()",
+        "serde error over the model's own tool arguments, the same class as the look.rs entry below: it names the field the model must fix, never a payload from Postgres, Iceberg or ClickHouse",
+    ),
+    (
+        "ai/tools/dashboards.rs",
+        "{field}\\\": {cause}",
+        "the same serde error over the model's own tool arguments, in front of the field's name",
+    ),
+    (
+        "ai/tools/pipelines.rs",
+        "invalid targetLag: {err}",
+        "serde error over the model's own tool arguments, the same class as dashboards.rs above: it tells the model which of its `targetLag` fields is wrong, never a payload from Postgres, Iceberg or ClickHouse",
     ),
     (
         "ai/tools/data.rs",
@@ -298,6 +330,21 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         "ai/tools/boards.rs",
         "format!(\"filters: {err}\")",
         "serde error over the caller's own tool arguments",
+    ),
+    // The tool's own decode of the model's formatting arguments: serde
+    // reporting a shape it cannot parse out of the formatting block the
+    // model sent. Same class as the `ai/tools/dashboards.rs` entry above --
+    // our own schema describing the caller's input, never an upstream
+    // payload.
+    (
+        "ai/tools/look.rs",
+        "cause.to_string()",
+        "serde error over the model's own formatting arguments, the same class as dashboards.rs above: it names the field the model must fix, never a payload from Postgres, Iceberg or ClickHouse",
+    ),
+    (
+        "ai/tools/look.rs",
+        "a formatting field has the wrong shape: ",
+        "the same serde error over the model's own formatting arguments, in front of the field's name",
     ),
 ];
 

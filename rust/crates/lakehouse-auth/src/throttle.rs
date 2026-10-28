@@ -107,6 +107,34 @@ pub async fn record_failure(
     key: &str,
     policy: &ThrottlePolicy,
 ) -> Result<Option<OffsetDateTime>, AuthError> {
+    let Some((failures, locked)) = bump(pool, key, policy).await? else {
+        return Ok(None);
+    };
+    let max: i32 = i32::try_from(policy.max_failures).unwrap_or(i32::MAX);
+    if failures >= max {
+        Ok(locked)
+    } else {
+        Ok(None)
+    }
+}
+
+/// The one UPSERT behind [`record_failure`] (SEC-49). Returns the row's
+/// `(failures, locked_until)` after the write.
+///
+/// [`record_attempt`] does not share this statement, and the reason is the
+/// lock: a failure is counted AFTER the password was checked, and every
+/// failure past the limit pushes the lock's end further out. An attempt is
+/// counted BEFORE the check, and a public link counts every guess, refused
+/// or not (`BI-19` part A): there the lock a later attempt finds must be
+/// kept as it is, or a visitor could hold a link locked for as long as they
+/// keep guessing. The sign-in path never reaches that case — it refuses a
+/// locked key before it counts — so the two statements differ only where
+/// the public link can tell.
+async fn bump(
+    pool: &PgPool,
+    key: &str,
+    policy: &ThrottlePolicy,
+) -> Result<Option<(i32, Option<OffsetDateTime>)>, AuthError> {
     let now = OffsetDateTime::now_utc();
     let window_interval = format!("{} seconds", policy.window.whole_seconds());
     let lockout_interval = format!("{} seconds", policy.lockout.whole_seconds());
@@ -154,15 +182,144 @@ pub async fn record_failure(
     .bind(&lockout_interval)
     .fetch_optional(pool)
     .await?;
-    let Some((failures, locked)) = row else {
-        return Ok(None);
-    };
+    Ok(row)
+}
+
+/// Give back one count taken by [`record_attempt`] when the try ended in a
+/// storage error rather than a verdict on the password (SEC-49). Counting
+/// before the check would otherwise let database hiccups walk a real user
+/// toward a lockout (review blocker 1, 2026-10-03). A row left with no
+/// count and no lock is deleted, so a storage failure leaves no row. One
+/// statement; it never goes below zero.
+///
+/// The refund also undoes the LOCK the same try may have set (PR #236
+/// review SHOULD-FIX 1): [`record_attempt`] locks the key as soon as the
+/// count reaches [`ThrottlePolicy::max_failures`], so a storage error
+/// after that point used to leave the row locked for the whole lockout
+/// even though only `max_failures - 1` wrong passwords were ever checked
+/// — before SEC-49 a storage error never locked. The lock is cleared in
+/// the same statement whenever the decremented count falls below
+/// `max_failures`; a count still at the limit keeps its lock.
+///
+/// # Errors
+///
+/// Returns [`AuthError::Database`] on a storage failure.
+pub async fn refund_attempt(
+    pool: &PgPool,
+    key: &str,
+    policy: &ThrottlePolicy,
+) -> Result<(), AuthError> {
     let max: i32 = i32::try_from(policy.max_failures).unwrap_or(i32::MAX);
-    if failures >= max {
-        Ok(locked)
-    } else {
-        Ok(None)
-    }
+    // One statement. Both branches read the pre-update row, so the
+    // "decremented count" is the same value in each: the DELETE branch
+    // refunds the last count (a row left with no count and no lock is
+    // removed), the UPDATE branch refunds a count above one. A lock is
+    // cleared whenever that decremented count falls below `max_failures`
+    // (PR #236 review SHOULD-FIX 1) — `GREATEST(.., 0)` states the
+    // "never below zero" rule in the statement itself.
+    sqlx::query(
+        "WITH gone AS ( \
+           DELETE FROM login_throttle \
+           WHERE key_hash = $1 AND failures <= 1 \
+             AND (locked_until IS NULL OR GREATEST(failures - 1, 0) < $2) \
+           RETURNING 1 \
+         ) \
+         UPDATE login_throttle SET \
+           failures = GREATEST(failures - 1, 0), \
+           locked_until = CASE \
+             WHEN GREATEST(failures - 1, 0) < $2 THEN NULL \
+             ELSE locked_until \
+           END \
+         WHERE key_hash = $1 AND failures > 1 \
+           AND NOT EXISTS (SELECT 1 FROM gone)",
+    )
+    .bind(key)
+    .bind(max)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Count an attempt BEFORE it is checked, and say which attempt it is and until
+/// when the key is locked, if it is (one atomic UPSERT ... RETURNING)
+/// (`BI-19` part A review fix (BLOCKER) R1).
+///
+/// [`locked_until`] then [`record_failure`] counts only after the (slow)
+/// verification, so any number of simultaneous guesses all pass the lock check
+/// before the first failure is written, and each runs a full hash. This is the
+/// other order: one atomic statement adds the attempt and returns the count, and
+/// the caller verifies only while the count is at most
+/// [`ThrottlePolicy::max_failures`]. Whatever number of requests arrive at once,
+/// at most `max_failures` of them reach the verifier within a window. The same
+/// statement counts the sign-in attempt (`SEC-49`), so concurrent sign-ins
+/// cannot exceed the lock either: the UPSERT serialises in Postgres and each
+/// call gets its own count, 20 simultaneous calls seeing 1 to 20.
+///
+/// The count restarts at 1 when the window has passed with no lock, or when a
+/// lock has expired. The attempt that reaches `max_failures` sets the lock for
+/// [`ThrottlePolicy::lockout`]; every later attempt, refused or not, keeps it
+/// and is counted. The caller calls [`clear`] on success, so a person who types
+/// the right password never counts toward a lock, and a storage error in the
+/// check calls [`refund_attempt`] to give the count back (`SEC-49`).
+///
+/// Returns `(count, locked_until)`: the count after this call, and
+/// `Some(locked_until)` once the count has reached [`ThrottlePolicy::max_failures`]
+/// (the call that reaches the limit sets the lock), otherwise `None`.
+///
+/// # Errors
+///
+/// Returns [`AuthError::Database`] on a storage failure.
+///
+/// Merge of `origin/main` (PR #235: `BI-19` part A and `BI-26`) into
+/// `feat/bi-phase-5` (PR #245): both sides carry a `record_attempt` — `SEC-49`
+/// (PR #236) on this branch, `BI-19` part A review fix (BLOCKER) R1 on `main` —
+/// and the merge kept two definitions of the same name, which do not compile.
+/// This copy is the one kept: the one on `origin/main` (PR #235), which the
+/// planner re-reviewed and merged. It keeps the `BI-19` decision that a
+/// public link's lock is not pushed further out by a continuing guess (see
+/// [`bump`]), and the sign-in path (`SEC-49`) is not affected by that
+/// difference, because it refuses a locked key before it counts.
+pub async fn record_attempt(
+    pool: &PgPool,
+    key: &str,
+    policy: &ThrottlePolicy,
+) -> Result<(u32, Option<OffsetDateTime>), AuthError> {
+    let now = OffsetDateTime::now_utc();
+    let window_interval = format!("{} seconds", policy.window.whole_seconds());
+    let lockout_interval = format!("{} seconds", policy.lockout.whole_seconds());
+    let max = i32::try_from(policy.max_failures).unwrap_or(i32::MAX);
+    // `reset`: the window passed with no lock, or the lock has expired. It is
+    // written out in each assignment because ON CONFLICT DO UPDATE assignments
+    // only see the pre-update row.
+    let (count, locked): (i32, Option<OffsetDateTime>) = sqlx::query_as(
+        "INSERT INTO login_throttle (key_hash, failures, window_started_at, locked_until) \
+         VALUES ($1, 1, $2, CASE WHEN 1 >= $4 THEN $2 + $5::interval END) \
+         ON CONFLICT (key_hash) DO UPDATE SET \
+           failures = CASE \
+             WHEN COALESCE(login_throttle.locked_until < $2, \
+                           login_throttle.window_started_at < $2 - $3::interval) \
+               THEN 1 ELSE login_throttle.failures + 1 END, \
+           window_started_at = CASE \
+             WHEN COALESCE(login_throttle.locked_until < $2, \
+                           login_throttle.window_started_at < $2 - $3::interval) \
+               THEN $2 ELSE login_throttle.window_started_at END, \
+           locked_until = CASE \
+             WHEN COALESCE(login_throttle.locked_until < $2, \
+                           login_throttle.window_started_at < $2 - $3::interval) \
+               THEN CASE WHEN 1 >= $4 THEN $2 + $5::interval END \
+             WHEN login_throttle.failures + 1 >= $4 \
+               THEN COALESCE(login_throttle.locked_until, $2 + $5::interval) \
+             ELSE login_throttle.locked_until END \
+         RETURNING login_throttle.failures, login_throttle.locked_until",
+    )
+    .bind(key)
+    .bind(now)
+    .bind(&window_interval)
+    .bind(max)
+    .bind(&lockout_interval)
+    .fetch_one(pool)
+    .await?;
+    Ok((u32::try_from(count).unwrap_or(u32::MAX), locked))
 }
 
 /// Clear the throttle row for `key` — called on a successful login so the

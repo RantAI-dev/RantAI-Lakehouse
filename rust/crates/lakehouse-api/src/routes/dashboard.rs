@@ -14,9 +14,10 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use axum::Extension;
 use axum::body::Bytes;
 use axum::extract::{Query, State};
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use lakehouse_auth::Principal;
+use lakehouse_bi::access::Viewer;
 use lakehouse_bi::builder::{ReadContext, RelationColumns};
 use lakehouse_bi::filters::{ColumnKind, validate_filters, without_inert};
 use lakehouse_bi::grain::{Grain, TimeContext};
@@ -30,6 +31,10 @@ use serde_json::{Map, Value, json};
 use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::policy_engine::PolicyEngineObligations;
+use crate::routes::dashboard_organise::{
+    drop_tile, place_new_chart, require_board, require_chart_board, require_editable_chart,
+    snapshot, viewer_of, visible_live_chart_board,
+};
 use crate::routes::support::{
     effective_chart, is_numeric_type, mart_columns, render_stored_spec, run_spec_sql, sources_for,
     stored_chart_sql, strip_non_ident,
@@ -41,7 +46,7 @@ use crate::upstream_error;
 // ── GET /api/dashboard ──────────────────────────────────────────────────
 
 /// Query parameters accepted by `GET /api/dashboard`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct DashboardQuery {
     #[serde(default)]
     board: Option<String>,
@@ -58,6 +63,44 @@ pub struct DashboardQuery {
     /// not named here takes the board's saved value, else its default.
     #[serde(default)]
     params: Option<String>,
+    /// BI-4 part B (feature decision 6): `fresh=1` computes every tile and
+    /// replaces what was remembered; `fresh=<chart id>[,<chart id>]` does so
+    /// for those charts only ("Refresh this tile"). Not read from an embed or
+    /// a public link: a reader with no sign-in cannot force the engine to
+    /// recompute a board.
+    #[serde(default)]
+    fresh: Option<String>,
+}
+
+impl DashboardQuery {
+    /// The query the PDF's print view reads a board with (`BI-1` D3): the
+    /// board and the filter, parameter and grain text the person had on screen.
+    pub(crate) fn for_render(
+        board: &str,
+        filters: Option<&str>,
+        params: Option<&str>,
+        grain: Option<&str>,
+    ) -> Self {
+        Self {
+            board: Some(board.to_owned()),
+            year: None,
+            filters: filters.map(str::to_owned),
+            grain: grain.map(str::to_owned),
+            params: params.map(str::to_owned),
+            fresh: None,
+        }
+    }
+
+    /// The same read with every tile computed and its entry replaced
+    /// (`fresh=1`). For a caller that decides something from the numbers *now*
+    /// (the report runner's "skip when empty"): a remembered answer within the
+    /// install's rule is fine to show, not to base a send/skip on (RPT-1 skip
+    /// when empty, PR #245 CI).
+    #[must_use]
+    pub(crate) fn fresh_all(mut self) -> Self {
+        self.fresh = Some("1".to_owned());
+        self
+    }
 }
 
 /// Why [`get_body`] stopped: the store failed, or the request's parameter
@@ -139,6 +182,41 @@ pub async fn get(
     Extension(principal): Extension<Principal>,
     Query(q): Query<DashboardQuery>,
 ) -> Response {
+    match payload_for(&state, &principal, &q).await {
+        Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
+        Err(response) => response,
+    }
+}
+
+/// Whether the deployment can make a PDF: a Gotenberg to ask, an address the
+/// renderer reaches the console at, and the secret the render token is signed
+/// with (`RENDER_TOKEN_SECRET`, its own server-only secret, BI-1 review fix
+/// (BLOCKER) R1). Any one missing is "not set up" (`BI-1`, feature decision 6).
+pub(crate) fn pdf_supported(config: &crate::config::Config) -> bool {
+    config.gotenberg_url.is_some()
+        && config.console_internal_url.is_some()
+        && config.render_token_secret.is_some()
+}
+
+/// The payload `GET /api/dashboard` answers for `principal`: the board's
+/// tiles read as that person (masks, row filters), the formatting settings and
+/// whether the person may download. The one copy, called by the route and by
+/// the PDF's print view (`routes::render`, `BI-1` D3) so the file shows what
+/// the screen shows.
+///
+/// # Errors
+///
+/// The response to send instead: 400 for filters, grain or parameters that do
+/// not fit, a fixed sentence for a store failure.
+#[allow(
+    clippy::result_large_err,
+    reason = "the Err is a ready Response the caller returns verbatim; boxing it would change every call site for no gain on the success path (REL-9 decision D2, PR #204 CI)"
+)]
+pub(crate) async fn payload_for(
+    state: &AppState,
+    principal: &Principal,
+    q: &DashboardQuery,
+) -> Result<Value, Response> {
     let placeholders = crate::sql_rewrite::PlaceholderValues {
         principal_id: Some(principal.id.uuid().to_string()),
         principal_tenant_ids: principal
@@ -147,48 +225,81 @@ pub async fn get(
             .map(ToString::to_string)
             .collect(),
     };
+    let reject = |err: ApiError| crate::error::ApiRejection(err).into_response();
     // BI-18: a malformed `filters` used to be ignored without a word, which
     // showed an unfiltered dashboard for a filter the caller believed was on.
-    let param_filters = match parse_filters_param(q.filters.as_deref()) {
-        Ok(f) => f,
-        Err(err) => return crate::error::ApiRejection(err).into_response(),
-    };
-    let requested = match parse_grain_request(q.grain.as_deref()) {
-        Ok(g) => g,
-        Err(err) => return crate::error::ApiRejection(err).into_response(),
-    };
-    let time = match crate::routes::settings::time_context(&state).await {
-        Ok(t) => t,
-        Err(err) => return crate::error::ApiRejection(err).into_response(),
-    };
-    let obligations = PolicyEngineObligations::from_state(&state);
-    match get_body(
-        &state.clickhouse,
-        &q,
-        param_filters,
-        &principal.role_names,
-        &placeholders,
-        &obligations,
-        (&time, requested),
+    let param_filters = parse_filters_param(q.filters.as_deref()).map_err(reject)?;
+    let requested = parse_grain_request(q.grain.as_deref()).map_err(reject)?;
+    let time = crate::routes::settings::time_context(state)
+        .await
+        .map_err(reject)?;
+    // BI-17 part A: the number locale, company palette and fonts go out in the
+    // payload's `reporting` object next to the zone.
+    let format = crate::routes::settings::format_settings(state)
+        .await
+        .map_err(reject)?;
+    let obligations = PolicyEngineObligations::from_state(state);
+    // BI-18 part C, part 2: a board in the trash or in somebody else's
+    // personal space reads as a board that does not exist.
+    let viewer = viewer_of(principal);
+    // BI-4 part B: open the scope remembered results are looked up in, with
+    // the install's rule; `get_body` narrows it to the board's and the charts'.
+    let scope = crate::result_cache::CacheScope::new(
+        std::sync::Arc::clone(&state.result_cache),
+        format.result_cache,
+        crate::result_cache::Fresh::parse(q.fresh.as_deref()),
+    );
+    match crate::result_cache::scoped(
+        scope,
+        get_body(
+            &state.clickhouse,
+            q,
+            param_filters,
+            &principal.role_names,
+            &placeholders,
+            &obligations,
+            (&time, requested, &viewer, &state.tile_slots),
+        ),
     )
     .await
     {
-        Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
-        Err(BodyError::Params(err)) => crate::error::ApiRejection(err).into_response(),
-        Err(BodyError::Store(err)) => (
+        Ok(mut body) => {
+            crate::routes::settings::add_formatting(&mut body, &format);
+            // BI-1 D7: the console hides the download items for a person
+            // whose every role is switched off; the routes refuse anyway.
+            if let Some(map) = body.as_object_mut() {
+                // BI-1 D1/feature decision 6: the console offers the PDF item
+                // only when the deployment has a renderer and a key for its token.
+                map.insert(
+                    "pdfSupported".to_owned(),
+                    Value::Bool(pdf_supported(&state.config)),
+                );
+                map.insert(
+                    "canDownload".to_owned(),
+                    Value::Bool(crate::routes::settings::may_download(
+                        principal,
+                        &format.download_denied_roles,
+                    )),
+                );
+            }
+            Ok(body)
+        }
+        Err(BodyError::Params(err)) => Err(reject(err)),
+        Err(BodyError::Store(err)) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             ApiJson(upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json()),
         )
-            .into_response(),
+            .into_response()),
     }
 }
 
 #[allow(
     clippy::too_many_lines,
     reason = "one straight-line port of a single large TS handler (spec \
-              merge -> filter application -> parallel tile execution); \
-              splitting it up would scatter one pipeline across helpers \
-              with no independent reuse"
+              merge -> filter application -> tile execution, which BI-4 \
+              part A runs side by side through `tile_pool`); splitting it \
+              up would scatter one pipeline across helpers with no \
+              independent reuse"
 )]
 async fn get_body(
     ch: &ChClient,
@@ -197,7 +308,12 @@ async fn get_body(
     roles: &[String],
     placeholders: &crate::sql_rewrite::PlaceholderValues,
     obligations: &PolicyEngineObligations<'_>,
-    (time, requested_grain): (&TimeContext, GrainRequest),
+    (time, requested_grain, viewer, tile_slots): (
+        &TimeContext,
+        GrainRequest,
+        &Viewer,
+        &tokio::sync::Semaphore,
+    ),
 ) -> Result<Value, BodyError> {
     let board = q.board.clone().unwrap_or_else(|| "default".to_owned());
     let years: Vec<i64> = q
@@ -208,19 +324,21 @@ async fn get_body(
         .filter_map(|s| s.trim().parse::<i64>().ok())
         .collect();
     let mut store_error: Option<String> = None;
-    let (stored, boards) =
-        match tokio::try_join!(store::list_stored_charts(ch), store::list_boards(ch)) {
-            Ok(v) => v,
-            Err(err) => {
-                store_error =
-                    Some(upstream_error::report_ch(&upstream_error::DATABASE, &err).to_string());
-                (Vec::new(), Vec::new())
-            }
-        };
+    let (stored, boards) = match tokio::try_join!(
+        store::list_stored_charts(ch, viewer),
+        store::list_boards(ch, viewer)
+    ) {
+        Ok(v) => v,
+        Err(err) => {
+            store_error =
+                Some(upstream_error::report_ch(&upstream_error::DATABASE, &err).to_string());
+            (Vec::new(), Vec::new())
+        }
+    };
 
     // The built-in board's layout row is kept out of `list_boards`.
     let default_row = if board == store::DEFAULT_BOARD_ID {
-        store::get_board(ch, store::DEFAULT_BOARD_ID)
+        store::get_board(ch, store::DEFAULT_BOARD_ID, viewer)
             .await
             .unwrap_or_else(|err| {
                 store_error.get_or_insert_with(|| {
@@ -236,6 +354,9 @@ async fn get_body(
         .find(|b| b.id == board)
         .or(default_row.as_ref());
     let layout = board_obj.and_then(|b| b.layout.clone()).unwrap_or_default();
+    // BI-18 part C: the tabs decide which filters each tile is given.
+    let tabs: Vec<lakehouse_bi::layout::Tab> =
+        board_obj.and_then(|b| b.tabs.clone()).unwrap_or_default();
     let filters = param_filters
         .or_else(|| board_obj.and_then(|b| b.filters.clone()))
         .unwrap_or_default();
@@ -301,22 +422,23 @@ async fn get_body(
     // the board reads, not only the ones an active filter touches.
     let cols = mart_columns(ch).await?;
 
-    let mut results = Map::new();
-    if on_default {
-        for k in KPIS.iter() {
-            let sql =
-                lakehouse_bi::builder::apply_builtin_year_filter(&k.sql, &k.mart, &years, &cols);
-            let (id, val) = run_spec_sql(ch, &k.id, &sql, roles, placeholders, obligations).await;
-            results.insert(id, val);
-        }
-        for c in CHARTS.iter() {
-            let sql =
-                lakehouse_bi::builder::apply_builtin_year_filter(&c.sql, &c.mart, &years, &cols);
-            let (id, val) = run_spec_sql(ch, &c.id, &sql, roles, placeholders, obligations).await;
-            results.insert(id, val);
-        }
-    }
     let sources = sources_for(ch, stored_for_board.iter().copied()).await?;
+    // BI-4 part B: the scope the handler opened, narrowed to this board's own
+    // rule and told the marts the board reads, so their fingerprints are read
+    // in one query. With no scope open (a caller that did not ask) nothing is
+    // remembered.
+    let cache_scope = crate::result_cache::current().map(|scope| {
+        scope
+            .for_board(
+                board_obj.and_then(|b| b.cache),
+                cols.keys().map(|mart| format!("serving.{mart}")).collect(),
+            )
+            // BI-4 B review P-B1: where a calendar day ends for "Today" tiles.
+            .with_zone(time.zone())
+    });
+    let cache_rule = cache_scope
+        .as_ref()
+        .map_or(Value::Null, |scope| scope.rule().to_json());
     // BI-13: the questions of a combined chart are asked as the viewer, one
     // statement each; their sources are read here, once, and a read that fails
     // only fails the questions that need it.
@@ -337,57 +459,147 @@ async fn get_body(
         layer_sources: &layer_sources,
         read: &read,
     };
-    for c in &stored_for_board {
-        // BI-11: the chart as this read sees it, every parameter replaced by
-        // its value; a value that does not fit is this tile's plain sentence.
-        let c = match effective_chart(c, &cols, &sources, &read) {
-            Ok(effective) => effective,
-            Err(msg) => {
-                results.insert(c.spec.id.clone(), json!({ "error": msg }));
-                continue;
-            }
-        };
-        let c = &*c;
-        let filtered = match stored_chart_sql(c, &years, &filters, &cols, &sources, &read) {
-            Ok(filtered) => filtered,
-            Err(msg) => {
-                results.insert(c.spec.id.clone(), json!({ "error": msg }));
-                continue;
-            }
-        };
-        let (id, mut val) = run_spec_sql(
-            ch,
-            &c.spec.id,
-            &filtered.sql,
-            roles,
-            placeholders,
-            obligations,
-        )
-        .await;
-        let skipped = &filtered.skipped;
-        crate::routes::support::annotate_params(&mut val, c, &loaded.values);
-        crate::routes::support::annotate_grain(&mut val, &filtered, c);
-        crate::routes::support::annotate_table(
-            ch,
-            &mut val,
-            &filtered,
-            (roles, placeholders, obligations),
-        )
-        .await;
-        crate::routes::layers::annotate_layers(&layer_ctx, &mut val, c, filtered.grain).await;
-        crate::routes::support::annotate_metric_labels(
-            &mut val,
-            c,
-            &field_catalog,
-            Some((&cols, &sources)),
-        );
-        // The tile still renders; this only lets it say which active filters
-        // its data cannot honour (no such column, or a type that does not fit).
-        if !skipped.is_empty()
-            && let Value::Object(tile) = &mut val
+    // BI-4 part A (plan D1/D2): every tile is one future, run up to 6 at once
+    // for this request and under the process's `tile_slots`. A tile's masks
+    // and row filters are applied inside its own pipeline, as before, and its
+    // failure is its own `error` value, so no tile can fail another. The
+    // outputs come back in this order (built-ins, then stored charts), which
+    // is the order the sequential loops inserted them in.
+    let (years_ref, cols_ref, sources_ref, read_ref) = (&years, &cols, &sources, &read);
+    let (filters_ref, tabs_ref, layout_ref) = (&filters, &tabs, &layout);
+    let (values_ref, catalog_ref, layer_ctx_ref) = (&loaded.values, &field_catalog, &layer_ctx);
+    let mut tiles: Vec<futures::future::BoxFuture<'_, (String, Value)>> = Vec::new();
+    // BI-5 (plan D4): the tile ids in `tiles` order, so a tile the board's
+    // deadline cut off can still be named.
+    let mut tile_ids: Vec<String> = Vec::new();
+    if on_default {
+        for (id, sql_text, mart) in KPIS
+            .iter()
+            .map(|k| (&k.id, &k.sql, &k.mart))
+            .chain(CHARTS.iter().map(|c| (&c.id, &c.sql, &c.mart)))
         {
-            tile.insert("filtersSkipped".to_owned(), json!(skipped));
+            tile_ids.push(id.clone());
+            tiles.push(Box::pin(async move {
+                let sql = lakehouse_bi::builder::apply_builtin_year_filter(
+                    sql_text, mart, years_ref, cols_ref,
+                );
+                run_spec_sql(ch, id, &sql, roles, placeholders, obligations).await
+            }));
         }
+    }
+    for c in &stored_for_board {
+        let c: &StoredChartSpec = c;
+        tile_ids.push(c.spec.id.clone());
+        let chart_rule = c.def.shape.cache;
+        tiles.push(Box::pin(crate::result_cache::in_chart(
+            (Some(c.spec.id.as_str()), chart_rule),
+            async move {
+                // BI-11: the chart as this read sees it, every parameter replaced
+                // by its value; a value that does not fit is this tile's plain
+                // sentence.
+                let c = match effective_chart(c, cols_ref, sources_ref, read_ref) {
+                    Ok(effective) => effective,
+                    Err(msg) => return (c.spec.id.clone(), json!({ "error": msg })),
+                };
+                let c = &*c;
+                // BI-18 part C: a filter tied to other tabs is not given to this
+                // tile, and so is not reported as skipped on it either.
+                let tile_filters = lakehouse_bi::layout::filters_for_chart(
+                    filters_ref,
+                    tabs_ref,
+                    layout_ref,
+                    &c.spec.id,
+                );
+                let tile_layer_ctx = crate::routes::layers::LayerContext {
+                    filters: &tile_filters,
+                    ..*layer_ctx_ref
+                };
+                let filtered = match stored_chart_sql(
+                    c,
+                    years_ref,
+                    &tile_filters,
+                    cols_ref,
+                    sources_ref,
+                    read_ref,
+                ) {
+                    Ok(filtered) => filtered,
+                    Err(msg) => return (c.spec.id.clone(), json!({ "error": msg })),
+                };
+                let filtered = crate::routes::support::with_map_limit(filtered, c.spec.kind).await;
+                // BI-5 review B1: the rows this kind may read.
+                let (id, mut val) = crate::routes::support::with_tile_rows(
+                    c.spec.kind,
+                    &filtered.sql,
+                    run_spec_sql(
+                        ch,
+                        &c.spec.id,
+                        &filtered.sql,
+                        roles,
+                        placeholders,
+                        obligations,
+                    ),
+                )
+                .await;
+                let skipped = &filtered.skipped;
+                crate::routes::support::annotate_params(&mut val, c, values_ref);
+                crate::routes::support::annotate_grain(&mut val, &filtered, c);
+                crate::routes::support::annotate_table(
+                    ch,
+                    &mut val,
+                    &filtered,
+                    (roles, placeholders, obligations),
+                )
+                .await;
+                crate::routes::layers::annotate_layers(
+                    &tile_layer_ctx,
+                    &mut val,
+                    c,
+                    filtered.grain,
+                )
+                .await;
+                crate::routes::support::annotate_metric_labels(
+                    &mut val,
+                    c,
+                    catalog_ref,
+                    Some((cols_ref, sources_ref)),
+                );
+                // The tile still renders; this only lets it say which active
+                // filters its data cannot honour (no such column, or a type that
+                // does not fit).
+                if !skipped.is_empty()
+                    && let Value::Object(tile) = &mut val
+                {
+                    tile.insert("filtersSkipped".to_owned(), json!(skipped));
+                }
+                (id, val)
+            },
+        )));
+    }
+    let mut results = Map::new();
+    // BI-5 (plan D4): a board that outlasts `ceil(tiles / 6)` rounds of the
+    // caller's time limit answers the tiles that finished and says "not
+    // reached in time" for the rest, rather than a bare 408.
+    let run = crate::query_limits::QueryRun::current_or_detached();
+    let limit = run
+        .limits()
+        .await
+        .map_or(crate::query_limits::BOARD_DEADLINE_CAP, |limits| {
+            limits.timeout
+        });
+    let deadline =
+        tokio::time::Instant::now() + crate::query_limits::board_deadline(tiles.len(), limit);
+    let unreached = |i: usize| {
+        (
+            tile_ids[i].clone(),
+            json!({ "error": crate::query_limits::NOT_REACHED_SENTENCE }),
+        )
+    };
+    let running = crate::tile_pool::run_tiles_until(tile_slots, tiles, deadline, &unreached);
+    let finished = match cache_scope {
+        Some(scope) => crate::result_cache::scoped(scope, running).await,
+        None => running.await,
+    };
+    for (id, val) in finished {
         results.insert(id, val);
     }
 
@@ -410,7 +622,13 @@ async fn get_body(
 
     let mut boards_out = vec![json!({ "id": "default", "name": "Main" })];
     for b in &boards {
-        boards_out.push(json!({ "id": b.id, "name": b.name, "folderId": b.folder_id }));
+        let mut entry = json!({ "id": b.id, "name": b.name, "folderId": b.folder_id });
+        // BI-18 part C review fix (SHOULD-FIX) R11: the page needs to know a
+        // dashboard is in a personal space; the key is absent for every other.
+        if let (Some(owner), Some(map)) = (&b.owner_id, entry.as_object_mut()) {
+            map.insert("ownerId".to_owned(), json!(owner));
+        }
+        boards_out.push(entry);
     }
 
     let kpis_out: Vec<Value> = if on_default {
@@ -444,17 +662,12 @@ async fn get_body(
         if let Ok(e) = &effective
             && lakehouse_bi::params::changes_statement(&c.def)
         {
-            rendered["resolved"] = json!({
-                "dimension": e.def.dimension,
-                "breakdown": e.def.breakdown,
-                "measures": e.def.measures,
-                "limit": e.def.limit_value(),
-            });
+            rendered["resolved"] = crate::routes::support::resolved_json(e);
         }
         charts_out.push(rendered);
     }
 
-    Ok(json!({
+    let mut body = json!({
         "board": board,
         "years": years,
         "layout": layout_to_json(&layout),
@@ -476,6 +689,12 @@ async fn get_body(
         // BI-18·B: the interval an editor saved; 0 when none, so the
         // console starts from "off" without a second request.
         "refreshSeconds": board_obj.and_then(|b| b.refresh_seconds).unwrap_or(0),
+        // BI-4 part B: the freshness rule in force for this board (its own,
+        // else the install's), which the console states under the Refresh
+        // button; `null` when the caller opened no cache scope.
+        "cacheRule": cache_rule,
+        // The board's own rule, for the Freshness dialog; `null` follows the install.
+        "boardCacheRule": board_obj.and_then(|b| b.cache).map(lakehouse_bi::cache_rule::CacheRule::to_json),
         // BI-11: the controls the board shows (the definition and this read's
         // value), the value each has without a request (the saved default the
         // console compares with), and every parameter's value for this read.
@@ -487,7 +706,29 @@ async fn get_body(
         "charts": charts_out,
         "results": results,
         "storeError": store_error,
-    }))
+    });
+    // BI-18 part C: left off when there are none, so the payload of a board
+    // saved before tabs and phone layouts is the one it always was.
+    if let Some(map) = body.as_object_mut() {
+        if !tabs.is_empty() {
+            map.insert("tabs".to_owned(), json!(tabs));
+        }
+        if let Some(phone) = board_obj
+            .and_then(|b| b.phone_layout.as_ref())
+            .filter(|p| !p.is_empty())
+        {
+            map.insert("phoneLayout".to_owned(), json!(phone));
+        }
+        // BI-17 part A (D6): left off when the board follows the console, so
+        // a board saved before themes has the payload it always had.
+        if let Some(theme) = board_obj.and_then(|b| b.theme.as_ref()) {
+            map.insert("theme".to_owned(), json!(theme));
+        }
+        if let Some(font) = board_obj.and_then(|b| b.font.as_ref()) {
+            map.insert("font".to_owned(), json!(font));
+        }
+    }
+    Ok(body)
 }
 
 /// Parse the `filters` query parameter. Absent or blank means "use the
@@ -497,6 +738,17 @@ async fn get_body(
 ///
 /// 400 with a message of ours when the text is not a JSON filter list or a
 /// filter fails [`validate_filters`].
+/// Whether `raw` is a `filters` text `GET /api/dashboard` would accept, so a
+/// route that only forwards the text (the PDF's token) refuses a bad one at
+/// once, with the page's own sentence.
+///
+/// # Errors
+///
+/// 400 with the sentence `GET /api/dashboard` gives.
+pub(crate) fn check_filters_text(raw: Option<&str>) -> Result<(), ApiError> {
+    parse_filters_param(raw).map(|_| ())
+}
+
 fn parse_filters_param(raw: Option<&str>) -> Result<Option<Vec<FilterDef>>, ApiError> {
     let Some(raw) = raw.map(str::trim).filter(|r| !r.is_empty()) else {
         return Ok(None);
@@ -514,14 +766,14 @@ fn parse_filters_param(raw: Option<&str>) -> Result<Option<Vec<FilterDef>>, ApiE
 ///
 /// When two relations disagree on a column's kind the first chart's wins;
 /// the tiles it does not fit report `wrong_type` rather than being coerced.
-fn filter_fields(
+pub(crate) fn filter_fields(
     charts: &[&StoredChartSpec],
     mart_cols: &HashMap<String, RelationColumns>,
     sources: &HashMap<String, lakehouse_bi::sources::SqlSource>,
 ) -> Vec<Value> {
     let mut by_column: BTreeMap<String, (ColumnKind, usize)> = BTreeMap::new();
     for c in charts {
-        if c.spec.kind == ChartKind::Text {
+        if c.spec.kind.is_static() {
             continue;
         }
         let source_cols;
@@ -576,19 +828,21 @@ fn filter_fields(
         .collect()
 }
 
-fn layout_to_json(layout: &LayoutMap) -> Value {
-    let mut m = Map::new();
-    for (k, b) in layout {
-        m.insert(k.clone(), json!({ "x": b.x, "y": b.y, "w": b.w, "h": b.h }));
-    }
-    Value::Object(m)
+/// The layout as the payload carries it: `{ chartId: { x, y, w, h, tab? } }`,
+/// `tab` only on a tile that names one (`BI-18` part C). Shared with the embed
+/// and public payloads so the three agree.
+pub(crate) fn layout_to_json(layout: &LayoutMap) -> Value {
+    serde_json::to_value(layout).unwrap_or_else(|_| json!({}))
 }
 
 // ── /api/dashboard/specs ────────────────────────────────────────────────
 
 /// `GET /api/dashboard/specs` — every stored chart, in render shape.
-pub async fn specs_list(State(state): State<AppState>) -> Response {
-    match store::list_stored_charts(&state.clickhouse).await {
+pub async fn specs_list(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+) -> Response {
+    match store::list_stored_charts(&state.clickhouse, &viewer_of(&principal)).await {
         Ok(stored) => {
             let charts: Vec<Value> = stored.iter().map(render_stored_chart).collect();
             (StatusCode::OK, ApiJson(json!({ "charts": charts }))).into_response()
@@ -622,8 +876,16 @@ fn parse_chart_input(body: &Bytes) -> Result<ChartInput, ApiError> {
 ///
 /// 400 on an unparseable body or a `lakehouse_bi` validation/`ClickHouse`
 /// failure, matching the `TypeScript`'s single `catch` around both.
-pub async fn specs_create(State(state): State<AppState>, body: Bytes) -> ApiResult<ApiJson<Value>> {
+pub async fn specs_create(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    body: Bytes,
+) -> ApiResult<ApiJson<Value>> {
     let input = parse_chart_input(&body)?;
+    // BI-18 part C, part 2: a chart cannot be put on a dashboard that is in
+    // the trash or in somebody else's personal space.
+    let viewer = viewer_of(&principal);
+    require_chart_board(&state.clickhouse, input.board.as_deref(), &viewer).await?;
     let time = crate::routes::settings::time_context(&state).await?;
     let spec = store::spec_from_input(
         &state.clickhouse,
@@ -644,6 +906,8 @@ pub async fn specs_create(State(state): State<AppState>, body: Bytes) -> ApiResu
                 upstream_error::FailedAs::BadRequest,
             )
         })?;
+    place_new_chart(&state.clickhouse, &spec.board, &spec.spec.id).await;
+    snapshot(&state.clickhouse, &spec.board, &principal).await;
     Ok(ApiJson(
         json!({ "ok": true, "chart": render_stored_spec(&spec.spec, ChartSource::Ui) }),
     ))
@@ -657,6 +921,10 @@ pub async fn specs_create(State(state): State<AppState>, body: Bytes) -> ApiResu
 /// ("dashboard:read")` guarantees a real `Extension<Principal>`, whose
 /// `role_names`/id/tenant ids are threaded into [`run_spec_sql`] so a
 /// preview is masked/row-filtered exactly like the persisted tile would be.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one straight-line handler (parse, build the spec, run it as the viewer, annotate); the BI-5 review B1 row-cap wrapper took it from 100 to 103"
+)]
 pub async fn specs_preview(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -672,7 +940,7 @@ pub async fn specs_preview(
     // a value that does not fit is a 400.
     let sent_params = raw.as_object_mut().and_then(|o| o.remove("params"));
     let input = if raw.get("drillOf").is_some() {
-        crate::routes::drill::drill_input(&state.clickhouse, raw).await?
+        crate::routes::drill::drill_input(&state.clickhouse, raw, &viewer_of(&principal)).await?
     } else {
         serde_json::from_value(raw)
             .map_err(|_err| ApiError::BadRequest("body JSON is invalid".to_owned()))?
@@ -707,13 +975,18 @@ pub async fn specs_preview(
             .collect(),
     };
     let obligations = PolicyEngineObligations::from_state(&state);
-    let (_, mut result) = run_spec_sql(
-        &state.clickhouse,
-        &spec.spec.id,
+    // BI-5 review B1: the preview reads as many rows as the tile will.
+    let (_, mut result) = crate::routes::support::with_tile_rows(
+        spec.spec.kind,
         &spec.spec.sql,
-        &principal.role_names,
-        &placeholders,
-        &obligations,
+        run_spec_sql(
+            &state.clickhouse,
+            &spec.spec.id,
+            &spec.spec.sql,
+            &principal.role_names,
+            &placeholders,
+            &obligations,
+        ),
     )
     .await;
     crate::routes::support::annotate_saved_grain(&mut result, &spec);
@@ -789,7 +1062,11 @@ pub async fn specs_preview(
 ///
 /// 400 on an unparseable body, a missing `id`, or a validation/`ClickHouse`
 /// failure.
-pub async fn specs_update(State(state): State<AppState>, body: Bytes) -> ApiResult<ApiJson<Value>> {
+pub async fn specs_update(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    body: Bytes,
+) -> ApiResult<ApiJson<Value>> {
     let raw: Value = serde_json::from_slice(&body)
         .map_err(|_err| ApiError::BadRequest("body JSON is invalid".to_owned()))?;
     let id = raw
@@ -802,26 +1079,29 @@ pub async fn specs_update(State(state): State<AppState>, body: Bytes) -> ApiResu
     };
     let input: ChartInput = serde_json::from_value(raw)
         .map_err(|_err| ApiError::BadRequest("body JSON is invalid".to_owned()))?;
+    // BI-18 part C, part 2: an edit may not reach a chart in the trash (it
+    // would bring it back without a restore) or on somebody else's personal
+    // board, nor move a chart onto such a board.
+    let viewer = viewer_of(&principal);
+    let ch = &state.clickhouse;
+    let old_board = require_editable_chart(ch, &id, &viewer).await?;
+    require_chart_board(ch, input.board.as_deref(), &viewer).await?;
     let time = crate::routes::settings::time_context(&state).await?;
-    let spec = store::spec_from_input(
-        &state.clickhouse,
-        &input,
-        ChartSource::Ui,
-        "ui",
-        Some(id),
-        &time,
-    )
-    .await
-    .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
-    store::insert_chart(&state.clickhouse, &spec)
+    let spec = store::spec_from_input(ch, &input, ChartSource::Ui, "ui", Some(id), &time)
         .await
-        .map_err(|err| {
-            upstream_error::ch_error_as(
-                &upstream_error::DATABASE,
-                &err,
-                upstream_error::FailedAs::BadRequest,
-            )
-        })?;
+        .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
+    store::insert_chart(ch, &spec).await.map_err(|err| {
+        upstream_error::ch_error_as(
+            &upstream_error::DATABASE,
+            &err,
+            upstream_error::FailedAs::BadRequest,
+        )
+    })?;
+    // The board it left changed too, when the edit moved it.
+    if old_board != spec.board {
+        snapshot(ch, &old_board, &principal).await;
+    }
+    snapshot(ch, &spec.board, &principal).await;
     Ok(ApiJson(
         json!({ "ok": true, "chart": render_stored_spec(&spec.spec, ChartSource::Ui) }),
     ))
@@ -858,12 +1138,19 @@ impl IdQuery {
 /// [`ApiError::Internal`] on a `ClickHouse` failure.
 pub async fn specs_delete(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Query(q): Query<IdQuery>,
 ) -> ApiResult<ApiJson<Value>> {
     let Some(id) = q.id.filter(|s| !s.is_empty()) else {
         return Err(ApiError::BadRequest("id is required".to_owned()).into());
     };
-    store::delete_chart(&state.clickhouse, &id)
+    // A chart the caller may not see is answered like one that does not exist:
+    // `ok`, and nothing is deleted (BI-18 part C, part 2).
+    let ch = &state.clickhouse;
+    let Some(board) = visible_live_chart_board(ch, &id, &viewer_of(&principal)).await? else {
+        return Ok(ApiJson(json!({ "ok": true })));
+    };
+    store::delete_chart(ch, &id, &principal.display_name)
         .await
         .map_err(|err| {
             upstream_error::ch_error_as(
@@ -872,6 +1159,8 @@ pub async fn specs_delete(
                 upstream_error::FailedAs::Internal,
             )
         })?;
+    drop_tile(ch, &board, &id).await;
+    snapshot(ch, &board, &principal).await;
     Ok(ApiJson(json!({ "ok": true })))
 }
 
@@ -884,19 +1173,25 @@ pub async fn specs_delete(
 /// and would go stale the moment a chart is added, moved between boards, or
 /// deleted. The built-in board's count comes from the compiled-in specs,
 /// which is where its tiles actually come from.
-pub async fn boards_list(State(state): State<AppState>) -> Response {
+pub async fn boards_list(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+) -> Response {
     let ch = &state.clickhouse;
-    let (boards, stored) =
-        match tokio::try_join!(store::list_boards(ch), store::list_stored_charts(ch)) {
-            Ok(pair) => pair,
-            Err(err) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    ApiJson(upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json()),
-                )
-                    .into_response();
-            }
-        };
+    let viewer = viewer_of(&principal);
+    let (boards, stored) = match tokio::try_join!(
+        store::list_boards(ch, &viewer),
+        store::list_stored_charts(ch, &viewer)
+    ) {
+        Ok(pair) => pair,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ApiJson(upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json()),
+            )
+                .into_response();
+        }
+    };
     let mut counts: HashMap<&str, usize> = HashMap::new();
     for c in &stored {
         *counts.entry(c.board.as_str()).or_default() += 1;
@@ -912,6 +1207,11 @@ pub async fn boards_list(State(state): State<AppState>) -> Response {
         "chartCount": builtin_tiles + counts.get(store::DEFAULT_BOARD_ID).copied().unwrap_or(0),
         "builtin": true,
     })];
+    // BI-19 part A (plan D1): the list's "public" mark and the delete warning
+    // read the live links from Postgres, never the dashboard row. `Board` does
+    // not serialise its old `public_token`, so a board without a live link has
+    // no `publicToken` at all.
+    let links = crate::routes::public_links::live_tokens(&state).await;
     out.extend(boards.iter().map(|b| {
         let mut value = serde_json::to_value(b).unwrap_or_else(|_| json!({}));
         if let Some(obj) = value.as_object_mut() {
@@ -920,6 +1220,9 @@ pub async fn boards_list(State(state): State<AppState>) -> Response {
                 json!(counts.get(b.id.as_str()).copied().unwrap_or(0)),
             );
             obj.insert("builtin".to_owned(), json!(false));
+            if let Some(token) = links.get(b.id.as_str()) {
+                obj.insert("publicToken".to_owned(), json!(token));
+            }
         }
         value
     }));
@@ -961,6 +1264,11 @@ pub async fn boards_create(
     principal: Option<Extension<Principal>>,
     body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
+    // Fail closed: with nobody attached (the assistant's tool surface does not
+    // come through here) the caller is anonymous and sees no personal space.
+    let viewer = principal
+        .as_ref()
+        .map_or_else(Viewer::anonymous, |Extension(p)| viewer_of(p));
     let parsed: BoardCreateBody = if body.is_empty() {
         BoardCreateBody::default()
     } else {
@@ -969,25 +1277,80 @@ pub async fn boards_create(
     };
     let author = author_name(principal.as_ref());
     let folder_id = parsed.folder_id.unwrap_or_default().trim().to_owned();
-    // Checked first, so an unknown folder creates nothing.
-    crate::routes::dashboard_folders::ensure_folder_exists(&state.clickhouse, &folder_id).await?;
-    let mut board = if let Some(dup) = parsed.duplicate {
-        store::duplicate_board(&state.clickhouse, &dup, &author).await
+    // Checked first, so an unknown folder creates nothing. A personal space
+    // takes only its owner's dashboards.
+    crate::routes::dashboard_folders::ensure_folder_usable(&state.clickhouse, &folder_id, &viewer)
+        .await?;
+    // The owner of the folder a new dashboard is filed in: it travels in the
+    // first insert, so a dashboard filed in a personal space is private from
+    // the moment it exists and never public in between
+    // (`PR #199 review M BLOCKER 5`). An ordinary folder has no owner.
+    let folder_owner = if folder_id.is_empty() {
+        String::new()
     } else {
-        store::create_board(
+        lakehouse_bi::folders::folder_owner(&state.clickhouse, &folder_id)
+            .await
+            .map_err(|err| crate::routes::dashboard_folders::classify_ch_error(&err))?
+    };
+    let duplicated = parsed.duplicate.is_some();
+    let mut board = if let Some(dup) = parsed.duplicate {
+        store::duplicate_board(&state.clickhouse, &dup, &author, &viewer)
+            .await
+            .map_err(|err| match err {
+                store::DuplicateError::Copy(cause) => {
+                    crate::routes::dashboard_folders::classify_bi_error(&cause)
+                }
+                store::DuplicateError::CopyAndCleanup { cause, cleanup } => {
+                    // The half-built copy that could not be taken back is the
+                    // operator's problem: it is reported under a reference id
+                    // (the raw text goes to the log, never to a response) and
+                    // the caller's own error is kept
+                    // (`PR #199 review O SHOULD-FIX 3`).
+                    let _logged = upstream_error::report_ch(&upstream_error::DATABASE, &cleanup);
+                    crate::routes::dashboard_folders::classify_bi_error(&cause)
+                }
+            })?
+    } else {
+        store::create_board_in(
             &state.clickhouse,
             &parsed.name.unwrap_or_default(),
             &parsed.description.unwrap_or_default(),
             &author,
+            &folder_id,
+            &folder_owner,
         )
         .await
-    }
-    .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
-    if !folder_id.is_empty() {
-        store::move_board(&state.clickhouse, &board.id, &folder_id)
+        .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?
+    };
+    if duplicated {
+        // A copy lands next to the original and is private from its first
+        // insert, so moving it into another folder is a change of place, not
+        // the first time it is given an owner.
+        if !folder_id.is_empty() {
+            store::move_board(&state.clickhouse, &board.id, &folder_id, false)
+                .await
+                .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
+            board.folder_id = Some(folder_id);
+        } else if board.owner_id.as_deref().is_some_and(|o| o != viewer.id()) {
+            // An administrator duplicating somebody else's draft: the copy is the
+            // administrator's own draft, not a second one in the other user's
+            // space.
+            let mine = lakehouse_bi::folders::ensure_personal_folder(
+                &state.clickhouse,
+                viewer.id(),
+                &author,
+            )
             .await
-            .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
-        board.folder_id = Some(folder_id);
+            .map_err(|err| crate::routes::dashboard_folders::classify_ch_error(&err))?;
+            store::move_board(&state.clickhouse, &board.id, &mine.id, false)
+                .await
+                .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
+            board.folder_id = Some(mine.id);
+            board.owner_id = Some(viewer.id().to_owned());
+        }
+    }
+    if let Some(Extension(p)) = principal.as_ref() {
+        snapshot(&state.clickhouse, &board.id, p).await;
     }
     Ok(ApiJson(json!({ "ok": true, "board": board })))
 }
@@ -1005,6 +1368,9 @@ struct BoardEditBody {
     layout: Option<LayoutMap>,
     #[serde(default)]
     filters: Option<Vec<FilterDef>>,
+    /// Refused (`BI-19` part A, plan D5): public links are made, changed and
+    /// ended through `/api/dashboard/public-link`. The field stays so a console
+    /// opened before the upgrade gets this sentence and not a silent `ok`.
     #[serde(default)]
     public: Option<bool>,
     #[serde(default)]
@@ -1033,6 +1399,51 @@ struct BoardEditBody {
     /// empty list shows none.
     #[serde(default)]
     params: Option<Vec<lakehouse_bi::params::BoardParam>>,
+    /// The tabs of the board (`BI-18` part C); an empty list removes them. The
+    /// tiles in `layout` and the ties in `filters` that the same save (or the
+    /// stored board) holds must name only tabs in this list.
+    #[serde(default)]
+    tabs: Option<Vec<lakehouse_bi::layout::Tab>>,
+    /// The order and heights of the tiles below 640 px (`BI-18` part C); an
+    /// empty list goes back to the computed stacking.
+    #[serde(default, rename = "phoneLayout")]
+    phone_layout: Option<Vec<lakehouse_bi::layout::PhoneTile>>,
+    /// The dashboard's theme (`BI-17` part A): `auto`, `light` or `dark`.
+    #[serde(default)]
+    theme: Option<String>,
+    /// The dashboard's font (`BI-17` part A): `""` for the console's own, or
+    /// one of the fonts an administrator allows in Admin > Settings.
+    #[serde(default)]
+    font: Option<String>,
+    /// How long the board's tiles may be served from remembered results
+    /// (`BI-4` part B): `{"mode": "default"|"fresh"|"minutes", "minutes"?}`.
+    /// `default` clears the board's own rule. Raw JSON so a malformed rule
+    /// gets [`CACHE_RULE_REFUSED`]. Not part of a version (see
+    /// `store::update_board_cache`).
+    #[serde(default)]
+    cache: Option<Value>,
+}
+
+/// What a person is told when a board's or a chart's freshness rule is not
+/// one (`BI-4` part B, feature decision 2).
+pub(crate) const CACHE_RULE_REFUSED: &str = "The freshness rule must be {\"mode\": \"default\"} or {\"mode\": \"fresh\"}, or {\"mode\": \"minutes\", \"minutes\": a whole number from 1 to 1440}.";
+
+impl BoardEditBody {
+    /// Whether the body changes what a version holds (`BI-18` part C, part 2):
+    /// everything but sharing, the folder and the embed state.
+    fn changes_content(&self) -> bool {
+        self.name.is_some()
+            || self.description.is_some()
+            || self.layout.is_some()
+            || self.filters.is_some()
+            || self.refresh_seconds.is_some()
+            || self.grain.is_some()
+            || self.params.is_some()
+            || self.tabs.is_some()
+            || self.phone_layout.is_some()
+            || self.theme.is_some()
+            || self.font.is_some()
+    }
 }
 
 /// Whether a `PUT /api/dashboard/boards` body may be applied: it names a
@@ -1049,6 +1460,16 @@ fn board_edit_allowed(body: &BoardEditBody) -> bool {
                 && body.embed_revoke_all.is_none()
                 && body.embed_origins.is_none()
                 && body.folder_id.is_none()
+                // BI-18 part C: the built-in board is one page; duplicate it
+                // for a copy that can have tabs. Its phone layout is a
+                // layout, so it is accepted.
+                && body.tabs.is_none()
+                // BI-17 part A: a theme and a font are the dashboard's own,
+                // and the built-in board is code, not a saved dashboard.
+                && body.theme.is_none()
+                && body.font.is_none()
+                // BI-4 part B: the built-in board follows the install's rule.
+                && body.cache.is_none()
         }
         Some(_) => true,
     }
@@ -1068,6 +1489,161 @@ fn checked_refresh(raw: Option<i64>) -> Result<Option<u32>, ApiError> {
     let seconds = u32::try_from(raw).unwrap_or(u32::MAX);
     lakehouse_bi::click::validate_refresh_seconds(seconds).map_err(ApiError::BadRequest)?;
     Ok(Some(seconds))
+}
+
+/// The tab rules of a board edit (`BI-18` part C), checked before the first
+/// write so a save that would leave a tile on a missing tab, or a filter tied
+/// to one, changes nothing. The tabs, tiles and filters it judges are the
+/// body's where it sends them and the stored board's where it does not, so a
+/// body that only deletes a tab is checked against the tiles and filters
+/// already saved.
+///
+/// # Errors
+///
+/// 400 with our sentence for tabs that are not valid, a tile on a tab that does
+/// not exist, or a filter tied to one; a classified error when the board
+/// cannot be read.
+async fn check_tab_rules(ch: &ChClient, id: &str, parsed: &BoardEditBody) -> Result<(), ApiError> {
+    if let Some(tabs) = &parsed.tabs {
+        lakehouse_bi::layout::validate_tabs(tabs).map_err(ApiError::BadRequest)?;
+    }
+    if let Some(phone) = &parsed.phone_layout {
+        lakehouse_bi::layout::validate_phone_layout(phone).map_err(ApiError::BadRequest)?;
+    }
+    let ties = |filters: &[FilterDef]| {
+        filters
+            .iter()
+            .any(|f| f.tabs.as_ref().is_some_and(|t| !t.is_empty()))
+    };
+    let layout_names_tab = parsed
+        .layout
+        .as_ref()
+        .is_some_and(|l| l.values().any(|t| t.tab.is_some()));
+    let filters_tie = parsed.filters.as_deref().is_some_and(ties);
+    // A save that touches no tab, tile tab or tie needs no other row.
+    if parsed.tabs.is_none() && !layout_names_tab && !filters_tie {
+        return Ok(());
+    }
+    // The caller was checked against this board before the first read
+    // (`boards_update`); the tabs and ties are judged against what is stored.
+    let stored = store::get_board(ch, id, &Viewer::system())
+        .await
+        .map_err(|err| classify_dashboard_ch_error(&err))?;
+    let tabs = match (&parsed.tabs, &stored) {
+        (Some(tabs), _) => tabs.clone(),
+        (None, Some(board)) => board.tabs.clone().unwrap_or_default(),
+        (None, None) => Vec::new(),
+    };
+    let stored_layout = stored.as_ref().and_then(|b| b.layout.as_ref());
+    let layout = parsed.layout.as_ref().or(stored_layout);
+    if let Some(layout) = layout {
+        lakehouse_bi::layout::check_layout_tabs(layout, &tabs).map_err(ApiError::BadRequest)?;
+    }
+    let stored_filters = stored.as_ref().and_then(|b| b.filters.as_deref());
+    let filters = parsed
+        .filters
+        .as_deref()
+        .or(stored_filters)
+        .unwrap_or_default();
+    lakehouse_bi::layout::check_filter_ties(filters, &tabs).map_err(ApiError::BadRequest)?;
+    Ok(())
+}
+
+/// The theme and the font of a board edit (`BI-17` part A, D6), checked before
+/// the first write: the theme is one of the three, and the font is one the
+/// administrator allows (Admin > Settings), so a font removed from the list
+/// cannot be chosen again. An empty font (the console's own) is always
+/// allowed.
+///
+/// # Errors
+///
+/// 400 with our sentence; a classified error when the settings cannot be read.
+async fn check_theme_and_font(state: &AppState, parsed: &BoardEditBody) -> Result<(), ApiError> {
+    if let Some(theme) = &parsed.theme
+        && !store::BOARD_THEMES.contains(&theme.as_str())
+    {
+        return Err(ApiError::BadRequest(
+            "theme must be auto, light or dark.".to_owned(),
+        ));
+    }
+    let Some(font) = parsed.font.as_deref().filter(|f| !f.is_empty()) else {
+        return Ok(());
+    };
+    let allowed = crate::routes::settings::format_settings(state).await?.fonts;
+    if allowed.iter().any(|f| f == font) {
+        Ok(())
+    } else {
+        Err(ApiError::BadRequest(
+            "That font is not one an administrator allows for dashboards.".to_owned(),
+        ))
+    }
+}
+
+/// The board edit's freshness rule (`BI-4` part B), `None` when the body does
+/// not send one.
+///
+/// # Errors
+///
+/// 400 with [`CACHE_RULE_REFUSED`] (a fixed sentence; the rule is the caller's
+/// own text) when the value is not a rule or its minutes are out of range.
+fn checked_cache_rule(
+    parsed: &BoardEditBody,
+) -> Result<Option<lakehouse_bi::cache_rule::CacheRule>, ApiError> {
+    parsed
+        .cache
+        .as_ref()
+        .map(|raw| {
+            serde_json::from_value(raw.clone())
+                .map_err(|_| ApiError::BadRequest(CACHE_RULE_REFUSED.to_owned()))
+        })
+        .transpose()
+}
+
+/// The error of a board write: a board that is not there any more (deleted
+/// while the edit was on its way) is refused with its own sentence, and the
+/// store's failure keeps the mapping the write had before
+/// (`PR #199 review M SHOULD-FIX BI-18 3`).
+fn board_write_error(err: &store::BiError) -> ApiError {
+    match err {
+        store::BiError::Validation(msg) => ApiError::BadRequest(msg.clone()),
+        store::BiError::Clickhouse(err) => upstream_error::ch_error_as(
+            &upstream_error::DATABASE,
+            err,
+            upstream_error::FailedAs::BadRequest,
+        ),
+    }
+}
+
+/// The tabs and the phone layout of a board edit (`BI-18` part C), both
+/// already checked by [`check_tab_rules`].
+async fn save_tabs_and_phone_layout(
+    ch: &ChClient,
+    id: &str,
+    parsed: &BoardEditBody,
+) -> Result<(), ApiError> {
+    if let Some(tabs) = &parsed.tabs {
+        store::update_board_tabs(ch, id, tabs)
+            .await
+            .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
+    }
+    if let Some(phone) = &parsed.phone_layout {
+        store::update_board_phone_layout(ch, id, phone)
+            .await
+            .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
+    }
+    // BI-17 part A: the theme and font ride with the other presentation saves.
+    if parsed.theme.is_some() || parsed.font.is_some() {
+        store::update_board_theme(ch, id, parsed.theme.as_deref(), parsed.font.as_deref())
+            .await
+            .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
+    }
+    // BI-4 part B: the freshness rule, already parsed by `checked_cache_rule`.
+    if let Some(rule) = checked_cache_rule(parsed)? {
+        store::update_board_cache(ch, id, rule)
+            .await
+            .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
+    }
+    Ok(())
 }
 
 /// The `SEC-12` part of [`boards_update`]: withdraw every embed token of the
@@ -1132,7 +1708,25 @@ async fn save_grain_and_params(
     Ok(())
 }
 
-/// `PUT /api/dashboard/boards` — rename/relayout/re-filter/publish/embed a
+/// File board `id` in `folder_id` (`""` = the root), if `viewer` may use that
+/// folder: another user's personal space is refused (`BI-18` part C, part 2).
+async fn file_in_folder(
+    state: &AppState,
+    id: &str,
+    folder_id: &str,
+    viewer: &Viewer,
+) -> Result<(), ApiError> {
+    let ch = &state.clickhouse;
+    crate::routes::dashboard_folders::ensure_folder_usable(ch, folder_id, viewer).await?;
+    // BI-19 part A (plan D5): the link is in Postgres now, so the rule "a shared
+    // dashboard cannot go into the personal space" asks there.
+    let has_link = crate::routes::public_links::has_link(state, id).await?;
+    store::move_board(ch, id, folder_id, has_link)
+        .await
+        .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))
+}
+
+/// `PUT /api/dashboard/boards` — rename/relayout/re-filter/embed a
 /// board.
 ///
 /// The built-in `"default"` board accepts a layout only: it has no name,
@@ -1142,8 +1736,15 @@ async fn save_grain_and_params(
 ///
 /// 400 when `id` is missing, when `"default"` is sent anything but a
 /// layout, or on a validation/`ClickHouse` failure.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one ordered pipeline (check everything, then write, then snapshot); the \
+              BI-17 theme check pushed it one line over and splitting it would scatter \
+              the order that keeps a bad save from leaving a board half-edited"
+)]
 pub async fn boards_update(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
     let parsed: BoardEditBody = if body.is_empty() {
@@ -1155,13 +1756,33 @@ pub async fn boards_update(
     if !board_edit_allowed(&parsed) {
         return Err(ApiError::BadRequest("invalid dashboard".to_owned()).into());
     }
+    if parsed.public.is_some() {
+        // BI-19 part A (plan D5): a save no longer touches a public link, so a
+        // body that still asks for one must not look as if it worked.
+        return Err(ApiError::BadRequest(
+            "Public links are made from Share, with an expiry. Reload the page.".to_owned(),
+        )
+        .into());
+    }
     let id = parsed.id.clone().unwrap_or_default();
     let ch = &state.clickhouse;
+    // BI-18 part C, part 2: only a live board the caller may see can be
+    // edited. Without this a layout save for a deleted board would write a
+    // blank live row over its trash entry, and an edit by id could reach
+    // another user's draft.
+    let viewer = viewer_of(&principal);
+    if id != store::DEFAULT_BOARD_ID {
+        require_board(ch, &id, &viewer).await?;
+    }
     // Before the first write, so a bad filter list does not leave a board
     // half-edited (BI-18).
     if let Some(filters) = &parsed.filters {
         validate_filters(filters).map_err(ApiError::BadRequest)?;
     }
+    check_tab_rules(ch, &id, &parsed).await?;
+    check_theme_and_font(&state, &parsed).await?;
+    // Before the first write, like the checks above: a bad rule changes nothing.
+    checked_cache_rule(&parsed)?;
     let refresh = checked_refresh(parsed.refresh_seconds)?;
     let checked_params =
         crate::routes::params::check_board_params_opt(ch, parsed.params.as_deref()).await?;
@@ -1183,13 +1804,7 @@ pub async fn boards_update(
     if let Some(layout) = &parsed.layout {
         store::update_board_layout(ch, &id, layout)
             .await
-            .map_err(|err| {
-                upstream_error::ch_error_as(
-                    &upstream_error::DATABASE,
-                    &err,
-                    upstream_error::FailedAs::BadRequest,
-                )
-            })?;
+            .map_err(|err| board_write_error(&err))?;
     }
     if let Some(seconds) = refresh {
         store::update_board_refresh(ch, &id, seconds)
@@ -1197,6 +1812,7 @@ pub async fn boards_update(
             .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
     }
     save_grain_and_params(ch, &id, parsed.grain.as_deref(), checked_params.as_deref()).await?;
+    save_tabs_and_phone_layout(ch, &id, &parsed).await?;
     if let Some(filters) = &parsed.filters {
         // BI-18 review round 1: a save cleans the row of filters that filter
         // nothing. Not rejected (an older console still sends them) and not
@@ -1204,23 +1820,18 @@ pub async fn boards_update(
         let filters = without_inert(filters);
         store::update_board_filters(ch, &id, &filters)
             .await
-            .map_err(|err| {
-                upstream_error::ch_error_as(
-                    &upstream_error::DATABASE,
-                    &err,
-                    upstream_error::FailedAs::BadRequest,
-                )
-            })?;
+            .map_err(|err| board_write_error(&err))?;
     }
     if let Some(folder_id) = &parsed.folder_id {
-        let folder_id = folder_id.trim();
-        crate::routes::dashboard_folders::ensure_folder_exists(ch, folder_id).await?;
-        store::move_board(ch, &id, folder_id)
-            .await
-            .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
+        file_in_folder(&state, &id, folder_id.trim(), &viewer).await?;
+    }
+    // BI-18 part C, part 2: one version per request that changed the content.
+    let changes_content = parsed.changes_content();
+    if changes_content {
+        snapshot(ch, &id, &principal).await;
     }
     // SEC-12. Merged into whichever response below is returned, so a body
-    // that also sets `public` or `embed` still reports them.
+    // that also sets `embed` still reports them.
     let embed_access = apply_embed_access(ch, &id, &parsed).await?;
     let with_embed_access = |mut body: Value| {
         if let Some(map) = body.as_object_mut() {
@@ -1228,14 +1839,6 @@ pub async fn boards_update(
         }
         body
     };
-    if let Some(public) = parsed.public {
-        let token = store::set_board_public(ch, &id, public)
-            .await
-            .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
-        return Ok(ApiJson(with_embed_access(
-            json!({ "ok": true, "publicToken": token }),
-        )));
-    }
     if let Some(embed) = parsed.embed {
         let enabled = store::set_board_embed(ch, &id, embed)
             .await
@@ -1254,13 +1857,18 @@ pub async fn boards_update(
 /// 400 when `id` is missing/`"default"`; 500 on a `ClickHouse` failure.
 pub async fn boards_delete(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Query(q): Query<IdQuery>,
 ) -> ApiResult<ApiJson<Value>> {
     let id = q.id.unwrap_or_default();
     if id.is_empty() || id == store::DEFAULT_BOARD_ID {
         return Err(ApiError::BadRequest("invalid dashboard".to_owned()).into());
     }
-    store::delete_board(&state.clickhouse, &id)
+    // BI-18 part C, part 2: deleting moves to the trash, and only a board the
+    // caller may see can be deleted. An unknown, already deleted or private
+    // board is "not found" alike.
+    require_board(&state.clickhouse, &id, &viewer_of(&principal)).await?;
+    store::delete_board(&state.clickhouse, &id, &principal.display_name)
         .await
         .map_err(|err| {
             upstream_error::ch_error_as(
@@ -1292,7 +1900,12 @@ pub struct FieldsQuery {
 
 /// `GET /api/dashboard/fields` — mart list, or one mart's columns split
 /// into dimensions/measures.
-pub async fn fields(State(state): State<AppState>, Query(q): Query<FieldsQuery>) -> Response {
+pub async fn fields(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
+    Query(q): Query<FieldsQuery>,
+) -> Response {
     if let Some(id) = q.source.as_deref() {
         return match source_fields_body(&state.clickhouse, id).await {
             Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
@@ -1309,13 +1922,42 @@ pub async fn fields(State(state): State<AppState>, Query(q): Query<FieldsQuery>)
         };
     }
     match fields_body(&state.clickhouse, q.mart.as_deref()).await {
-        Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
+        Ok(mut body) => {
+            if q.mart.is_none() {
+                // PR #106 review R1 BLOCKER 2, SHOULD-FIX DATA-12 2:
+                // Only decorate marts if catalog_tenant_refusal allows it:
+                if let Ok(None) =
+                    crate::routes::catalog::catalog_tenant_refusal(&state, &principal, &headers)
+                        .await
+                {
+                    mark_marts(&state, &mut body).await;
+                }
+            }
+            (StatusCode::OK, ApiJson(body)).into_response()
+        }
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             ApiJson(upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json()),
         )
             .into_response(),
     }
+}
+
+/// `DATA-12` part 3: puts each mart's certified or deprecated mark on the
+/// mart list the chart builder's picker reads, from the same annotation
+/// fields the catalog shows (`catalog::insert_certification_fields`), so the
+/// picker can mark a mart and warn when a deprecated one is chosen. A mart's
+/// catalog id is `serving.<name>`; an unmarked mart gains no key. One batch
+/// read for the whole list.
+async fn mark_marts(state: &AppState, body: &mut Value) {
+    let Some(marts) = body.get_mut("marts").and_then(Value::as_array_mut) else {
+        return;
+    };
+    // `DATA-12` task 10 moved the merge itself to
+    // `catalog::apply_serving_certification`: the assistant's
+    // `describe_mart` marks its marts the same way, so the guard, the id
+    // convention and the field shape have one owner instead of two.
+    crate::routes::catalog::apply_serving_certification(state, marts, "name").await;
 }
 
 /// `?joins=` branch of [`fields`] (`BI-7`): the columns of the flat relation a
@@ -1784,7 +2426,7 @@ pub async fn records(
     records_for_roles(
         &state.clickhouse,
         q,
-        &principal.role_names,
+        (&principal.role_names, &viewer_of(&principal)),
         &placeholders,
         &obligations,
         &time,
@@ -1807,7 +2449,7 @@ const DASHBOARD_QUERY: upstream_error::Context = upstream_error::Context::new(
 /// text (AGENTS.md principle 4): a server-side error is a fixed 422,
 /// anything else a fixed 503, both with a reference id; the real detail is
 /// only logged.
-fn classify_dashboard_ch_error(err: &lakehouse_clickhouse::ChError) -> ApiError {
+pub(crate) fn classify_dashboard_ch_error(err: &lakehouse_clickhouse::ChError) -> ApiError {
     upstream_error::ch_error(&DASHBOARD_QUERY, err)
 }
 
@@ -1945,17 +2587,62 @@ async fn with_calculated_columns(
     })
 }
 
+/// `filters` narrowed to the ones the tile of `chart` is given (`BI-18` part
+/// C): a records list, an export or a drill of a tile on one tab must not take
+/// a filter tied to another, as the tile itself does not.
+///
+/// Nothing is read when no filter is tied to a tab. A board that cannot be
+/// read leaves every filter on: the result can only be narrower than the tile,
+/// never wider, and the failure is logged under a reference.
+pub(crate) async fn filters_for_chart_tab(
+    ch: &ChClient,
+    chart: &StoredChartSpec,
+    filters: Vec<FilterDef>,
+) -> Vec<FilterDef> {
+    if !filters
+        .iter()
+        .any(|f| f.tabs.as_ref().is_some_and(|t| !t.is_empty()))
+    {
+        return filters;
+    }
+    // `chart` was found through a viewer-scoped read by the caller, so its board
+    // is one that viewer may see; the board is read here only for its tabs.
+    let board = match store::get_board(ch, &chart.board, &Viewer::system()).await {
+        Ok(Some(board)) => board,
+        Ok(None) => return filters,
+        Err(err) => {
+            let _ = upstream_error::report_ch(&upstream_error::DATABASE, &err);
+            return filters;
+        }
+    };
+    lakehouse_bi::layout::filters_for_chart(
+        &filters,
+        board.tabs.as_deref().unwrap_or_default(),
+        &board.layout.unwrap_or_default(),
+        &chart.spec.id,
+    )
+    .into_owned()
+}
+
 /// The own filters of the tile `q.chart` names (`BI-6`), or none when it names
 /// no tile. The tile must read the relation the query names: its filters mean
 /// nothing over another one.
 async fn chart_own_filters(
     ch: &ChClient,
     q: &RecordsQuery,
-) -> Result<(Vec<FilterDef>, Vec<lakehouse_bi::joins::JoinSpec>), ApiError> {
+    dashboard_filters: Vec<FilterDef>,
+    viewer: &Viewer,
+) -> Result<TileFilters, ApiError> {
     let Some(id) = q.chart.as_deref().map(str::trim).filter(|c| !c.is_empty()) else {
-        return Ok((Vec::new(), Vec::new()));
+        return Ok(TileFilters {
+            own: Vec::new(),
+            joins: Vec::new(),
+            dashboard: dashboard_filters,
+        });
     };
-    let stored = store::list_stored_charts(ch)
+    // A tile in the trash, or on another user's personal board, is "this tile
+    // does not exist" (BI-18 part C, part 2).
+    let stored = store::list_stored_charts(ch, viewer)
         .await
         .map_err(|err| classify_dashboard_ch_error(&err))?;
     let chart = stored
@@ -2000,7 +2687,21 @@ async fn chart_own_filters(
     // BI-2: a segment in the tile's filters is its filters here too, so the
     // records behind a mark are the rows the mark was drawn from.
     let own = expand_tile_segments(ch, own, sql_source, mart).await?;
-    Ok((own, joins))
+    // BI-18 part C: only the dashboard filters the tile itself is given.
+    let dashboard = filters_for_chart_tab(ch, chart, dashboard_filters).await;
+    Ok(TileFilters {
+        own,
+        joins,
+        dashboard,
+    })
+}
+
+/// What [`chart_own_filters`] found for a tile: its own filters and joins, and
+/// the dashboard filters it is given.
+struct TileFilters {
+    own: Vec<FilterDef>,
+    joins: Vec<lakehouse_bi::joins::JoinSpec>,
+    dashboard: Vec<FilterDef>,
 }
 
 /// `filters` with each `{ "segment": … }` replaced by the segment's filters,
@@ -2161,7 +2862,7 @@ fn records_value<'a>(
 async fn records_for_roles(
     ch: &ChClient,
     q: RecordsQuery,
-    roles: &[String],
+    (roles, viewer): (&[String], &Viewer),
     placeholders: &crate::sql_rewrite::PlaceholderValues,
     obligations: &PolicyEngineObligations<'_>,
     time: &TimeContext,
@@ -2175,7 +2876,11 @@ async fn records_for_roles(
     .clamp(1, RECORDS_PAGE_MAX);
     let offset = records_number(q.offset.as_deref(), "offset", 0)?;
     let dashboard_filters = parse_filters_param(q.filters.as_deref())?.unwrap_or_default();
-    let (own, joins) = chart_own_filters(ch, &q).await?;
+    let TileFilters {
+        own,
+        joins,
+        dashboard: dashboard_filters,
+    } = chart_own_filters(ch, &q, dashboard_filters, viewer).await?;
 
     // A drill is a column and a value together; neither is the whole tile.
     let drill = match (
@@ -2274,8 +2979,10 @@ async fn run_records(
         )
         .await
         .map_err(|err| {
+            // BI-16 C3 review S6: the English `RegionOf` sentence, not the
+            // fixed one, when the refused statement does a region lookup.
             ApiError::Unprocessable(
-                crate::policy_engine::enforcement_error_message(&err).to_owned(),
+                crate::routes::support::enforcement_message_for(&statement, &err).to_owned(),
             )
         })
     };
@@ -2348,19 +3055,11 @@ fn rows_statements(
     ))
 }
 
-// ── /api/dashboard/table-export (BI-16 part A, T8) ───────────────────────
+// ── /api/dashboard/chart-export and /table-export (BI-16 part A, T8; BI-1 T2) ──
 
-/// The most rows a whole-result export writes (owner's decision, BI-16A
-/// addendum). One more is read so a result of exactly this size is not
-/// reported as cut.
-const EXPORT_ROW_CAP: u32 = 100_000;
-
-/// Over a SQL source `ClickHouse` itself returns at most 2 000 rows
-/// ([`lakehouse_bi::builder::SQL_SOURCE_SETTINGS`]); the cap is one below so
-/// the probe row still fits and a cut is seen, not hidden by the engine.
-const EXPORT_SQL_SOURCE_ROW_CAP: u32 = 1_999;
-
-/// Query parameters for `GET /api/dashboard/table-export`.
+/// Query parameters for `GET /api/dashboard/table-export`, the older route
+/// (CSV, raw values, a raw table only). It runs the same code as
+/// `chart-export` with those three things fixed.
 #[derive(Debug, Default, Deserialize)]
 pub struct TableExportQuery {
     /// The raw-table tile to export (its stored definition decides the
@@ -2382,9 +3081,83 @@ pub struct TableExportQuery {
     params: Option<String>,
 }
 
-/// A file name from a tile's title: letters, digits, `-` and `_` only, so it
-/// can sit in a `Content-Disposition` header unquoted-safe.
-fn export_file_name(title: &str) -> String {
+/// Query parameters for `GET /api/dashboard/chart-export` (`BI-1`, D6): the
+/// tile, the file kind, and everything the dashboard page itself sends to read
+/// the tile, so the file holds the rows the viewer saw (no second encoding).
+#[derive(Debug, Default, Deserialize)]
+pub struct ChartExportQuery {
+    /// The tile to download.
+    #[serde(default)]
+    chart: Option<String>,
+    /// `xlsx` or `csv` (default `csv`).
+    #[serde(default)]
+    format: Option<String>,
+    /// `formatted` (default) or `raw`.
+    #[serde(default)]
+    values: Option<String>,
+    /// The dashboard's active filters (JSON list), as `GET /api/dashboard`.
+    #[serde(default)]
+    filters: Option<String>,
+    /// The sort the viewer chose on a raw table, in place of the saved one.
+    #[serde(default, rename = "sortColumn")]
+    sort_column: Option<String>,
+    #[serde(default, rename = "sortDir")]
+    sort_dir: Option<String>,
+    /// The parameter values the tile was drawn with (JSON object).
+    #[serde(default)]
+    params: Option<String>,
+    /// The year list a built-in dashboard filters by (`1,2`), as `GET /api/dashboard`.
+    #[serde(default)]
+    year: Option<String>,
+    /// The grain switch, as `GET /api/dashboard`.
+    #[serde(default)]
+    grain: Option<String>,
+}
+
+impl ChartExportQuery {
+    /// The query a scheduled report reads one chart's file with (`RPT-1`, plan
+    /// D4): the same fields the console's menu sends, with the subscription's
+    /// own filter, parameter and grain text, so the file holds the rows the
+    /// subscription's dashboard shows.
+    pub(crate) fn for_report(
+        chart: &str,
+        (format, values): (&str, &str),
+        dashboard: &crate::routes::pdf_export::DashboardValues<'_>,
+    ) -> Self {
+        Self {
+            chart: Some(chart.to_owned()),
+            format: Some(format.to_owned()),
+            values: Some(values.to_owned()),
+            filters: dashboard.filters.map(str::to_owned),
+            sort_column: None,
+            sort_dir: None,
+            params: dashboard.params.map(str::to_owned),
+            year: None,
+            grain: dashboard.grain.map(str::to_owned),
+        }
+    }
+}
+
+impl From<TableExportQuery> for ChartExportQuery {
+    fn from(q: TableExportQuery) -> Self {
+        Self {
+            chart: q.chart,
+            format: Some("csv".to_owned()),
+            values: Some("raw".to_owned()),
+            filters: q.filters,
+            sort_column: q.sort_column,
+            sort_dir: q.sort_dir,
+            params: q.params,
+            year: None,
+            grain: None,
+        }
+    }
+}
+
+/// A name safe in a file name from a title: letters, digits, `-` and `_` only,
+/// so it can sit in a `Content-Disposition` header unquoted-safe. `fallback`
+/// when nothing is left.
+pub(crate) fn file_slug(title: &str, fallback: &str) -> String {
     let slug: String = title
         .trim()
         .chars()
@@ -2401,23 +3174,41 @@ fn export_file_name(title: &str) -> String {
         .filter(|p| !p.is_empty())
         .collect::<Vec<_>>()
         .join("-");
-    format!(
-        "{}.csv",
-        if slug.is_empty() {
-            "table"
-        } else {
-            slug.as_str()
-        }
-    )
+    if slug.is_empty() {
+        fallback.to_owned()
+    } else {
+        slug
+    }
 }
 
-/// The audit entry of one export, written before the file is returned: an
-/// export that cannot be recorded is not handed over.
-async fn record_export_audit(
+/// A file name from a tile's title (see [`file_slug`]). A file that was cut at
+/// the row cap says so in its name (feature decision 8).
+pub(crate) fn export_file_name(title: &str, extension: &str, cut_at: Option<u32>) -> String {
+    let slug = file_slug(title, "table");
+    match cut_at {
+        Some(rows) => format!("{slug}-first-{rows}-rows.{extension}"),
+        None => format!("{slug}.{extension}"),
+    }
+}
+
+/// What one download did, for the audit record.
+struct ExportOutcome {
+    action: &'static str,
+    rows: usize,
+    cut: bool,
+    cap: u32,
+    format: crate::export::FileFormat,
+    values: crate::export::Values,
+}
+
+/// The audit entry of one download (a chart's file or a dashboard's PDF),
+/// written before the file is returned: a download that cannot be recorded is
+/// not handed over (`BI-1` D8). One writer for every kind of download.
+pub(crate) async fn record_download_audit(
     state: &AppState,
     principal: &Principal,
-    chart: &StoredChartSpec,
-    (rows, cut, cap): (usize, bool, u32),
+    (action, resource_kind, resource_id): (&str, &str, &str),
+    args: Value,
 ) -> Result<(), ApiError> {
     let pool = state
         .pg
@@ -2427,16 +3218,10 @@ async fn record_export_audit(
         principal_id: Some(principal.id.uuid().to_string()),
         principal_kind: Some(principal.kind_for_audit().to_owned()),
         actor_label: Some(principal.display_name.clone()),
-        action: "dashboard.table_export".to_owned(),
-        resource_kind: Some("dashboard_tile".to_owned()),
-        resource_id: Some(chart.spec.id.clone()),
-        args: Some(json!({
-            "board": chart.board,
-            "tile": chart.spec.id,
-            "rows": rows,
-            "cut": cut,
-            "cap": cap,
-        })),
+        action: action.to_owned(),
+        resource_kind: Some(resource_kind.to_owned()),
+        resource_id: Some(resource_id.to_owned()),
+        args: Some(args),
         outcome: "executed".to_owned(),
         ..lakehouse_store::audit::NewAuditEvent::default()
     };
@@ -2444,9 +3229,33 @@ async fn record_export_audit(
         .await
         .map(|_| ())
         .map_err(|err| {
-            tracing::warn!(%err, "failed to record a table export; the export is refused");
+            tracing::warn!(%err, "failed to record a download; the download is refused");
             ApiError::Unavailable("the audit store is unavailable".to_owned())
         })
+}
+
+/// The audit entry of one chart download.
+async fn record_export_audit(
+    state: &AppState,
+    principal: &Principal,
+    chart: &StoredChartSpec,
+    outcome: &ExportOutcome,
+) -> Result<(), ApiError> {
+    record_download_audit(
+        state,
+        principal,
+        (outcome.action, "dashboard_tile", &chart.spec.id),
+        json!({
+            "board": chart.board,
+            "tile": chart.spec.id,
+            "rows": outcome.rows,
+            "cut": outcome.cut,
+            "cap": outcome.cap,
+            "format": outcome.format.extension(),
+            "values": if outcome.values == crate::export::Values::Raw { "raw" } else { "formatted" },
+        }),
+    )
+    .await
 }
 
 /// The tile's visible columns in order (a hidden one is left out) and the
@@ -2474,16 +3283,16 @@ fn export_columns(chart: &StoredChartSpec) -> (Vec<String>, Vec<String>) {
     (shown, labels)
 }
 
-/// The statement of an export and the row cap it was built for: the tile's
-/// visible columns, its saved sort or the viewer's, the dashboard's filters,
-/// and one row more than the cap so a cut is seen.
+/// The statement of a raw-table export: the tile's visible columns, its saved
+/// sort or the viewer's, the dashboard's filters, and one row more than the
+/// cap so a cut is seen.
 fn export_statement(
     chart: &StoredChartSpec,
     relation: &RecordsRelation,
-    q: &TableExportQuery,
+    q: &ChartExportQuery,
     (shown, filters): (&[String], &[FilterDef]),
     time: &TimeContext,
-) -> Result<(String, u32), ApiError> {
+) -> Result<String, ApiError> {
     let chosen_sort = q.sort_column.clone().filter(|c| !c.is_empty());
     let fields = lakehouse_bi::tables::TableFields {
         columns: Some(shown.to_vec()),
@@ -2499,79 +3308,25 @@ fn export_statement(
     };
     let known: HashSet<String> = relation.cols.keys().cloned().collect();
     let plan = lakehouse_bi::tables::plan_rows(&fields, &known).map_err(ApiError::BadRequest)?;
-    let cap = if chart.def.sql_source.is_some() {
-        EXPORT_SQL_SOURCE_ROW_CAP
-    } else {
-        EXPORT_ROW_CAP
-    };
-    let statement = lakehouse_bi::builder::rows_page_sql(
+    Ok(lakehouse_bi::builder::rows_page_sql(
         &relation.from,
         &relation.cols,
         filters,
         &plan,
-        (cap + 1, 0),
+        (crate::export::EXPORT_ROW_CAP + 1, 0),
         time,
     )
-    .rows;
-    Ok((statement, cap))
+    .rows)
 }
 
-/// `GET /api/dashboard/table-export?chart=` — every row of a raw table's
-/// result as a CSV file (`BI-16` part A, T8).
-///
-/// The statement is the tile's own ([`lakehouse_bi::builder::rows_page_sql`]):
-/// the tile's visible columns in order, the dashboard's filters, the saved
-/// sort or the one the viewer chose, read through the same guard and role
-/// rewrite as a tile (`rewrite_sql_for_roles`), so masks and row filters apply
-/// to the file. Values are the engine's raw values; headers are the columns'
-/// labels. At most [`EXPORT_ROW_CAP`] rows are written; the response says
-/// whether it was cut (`X-Export-Cut`) and how many rows it holds
-/// (`X-Export-Rows`), so the console can tell the person.
-///
-/// Needs `dashboard:read` (whoever can see the tile may export it; owner's
-/// decision, 2026-10-11) and is not offered to embeds or public links. Every
-/// export is written to the audit trail before the file is returned, and an
-/// audit store that cannot be written refuses the export.
-///
-/// Response headers follow Query Studio's download (`Content-Type`,
-/// `Content-Disposition: attachment`); the body is built in memory like that
-/// one, bounded by the row cap. The raw-bytes response bypasses `ApiJson`
-/// because the body is a file, not a JSON value.
-///
-/// # Errors
-///
-/// 400 for a missing or non-raw-table `chart`, bad filters or sort; 404 for an
-/// unknown tile; 422 when the role rewrite refuses or the engine rejects the
-/// statement; 503 when the engine or the audit store is unavailable.
-pub async fn table_export(
-    State(state): State<AppState>,
-    Extension(principal): Extension<Principal>,
-    Query(q): Query<TableExportQuery>,
-) -> ApiResult<Response> {
-    let ch = &state.clickhouse;
-    let chart_id = q
-        .chart
-        .as_deref()
-        .map(str::trim)
-        .filter(|c| !c.is_empty())
-        .ok_or_else(|| ApiError::BadRequest("chart is required".to_owned()))?;
-    let stored = store::list_stored_charts(ch)
-        .await
-        .map_err(|err| classify_dashboard_ch_error(&err))?;
-    let chart = stored
-        .iter()
-        .find(|c| c.spec.id == chart_id)
-        .ok_or_else(|| ApiError::NotFound("this tile does not exist".to_owned()))?;
-    if !chart.def.tables.is_rows_mode(chart.spec.kind) {
-        return Err(ApiError::BadRequest(
-            "only a table in rows mode can be exported this way".to_owned(),
-        )
-        .into());
-    }
-    let dashboard_filters = parse_filters_param(q.filters.as_deref())?.unwrap_or_default();
-    let time = crate::routes::settings::time_context(&state).await?;
-    let loaded = crate::routes::params::load(ch, &[], q.params.as_deref()).await?;
-    let time = time.with_params(loaded.values);
+/// The statement of a raw table's rows, with the labels of its columns.
+async fn rows_export_statement(
+    ch: &ChClient,
+    chart: &StoredChartSpec,
+    q: &ChartExportQuery,
+    dashboard_filters: Vec<FilterDef>,
+    time: &TimeContext,
+) -> Result<(String, HashMap<String, String>), ApiError> {
     let relation_query = RecordsQuery {
         mart: Some(chart.def.mart.clone()),
         sql_source: chart.def.sql_source.clone(),
@@ -2588,11 +3343,322 @@ pub async fn table_export(
     )
     .await?;
     let own = own.as_slice();
-    let relation = with_calculated_columns(ch, relation, (&relation_query, own), &time).await?;
-    let filters = with_chart_filters(own, dashboard_filters, &relation.cols, &time)?;
-
+    let relation = with_calculated_columns(ch, relation, (&relation_query, own), time).await?;
+    let filters = with_chart_filters(own, dashboard_filters, &relation.cols, time)?;
     let (shown, labels) = export_columns(chart);
-    let (statement, cap) = export_statement(chart, &relation, &q, (&shown, &filters), &time)?;
+    let statement = export_statement(chart, &relation, q, (&shown, &filters), time)?;
+    Ok((statement, shown.into_iter().zip(labels).collect()))
+}
+
+/// The statement a grouped tile (a chart, a pivot, a summary table, a KPI)
+/// reads, built the way `GET /api/dashboard` builds it for that tile, so the
+/// file holds what the tile shows. The tile's own row limit stays: a grouped
+/// chart exports its own result (feature decision 8).
+async fn grouped_export_statement(
+    ch: &ChClient,
+    (viewer, chart): (&Viewer, &StoredChartSpec),
+    q: &ChartExportQuery,
+    filters: &[FilterDef],
+    time: &TimeContext,
+) -> Result<String, ApiError> {
+    let years: Vec<i64> = q
+        .year
+        .as_deref()
+        .unwrap_or("")
+        .split(',')
+        .filter_map(|s| s.trim().parse::<i64>().ok())
+        .collect();
+    let board_id = if chart.board.is_empty() {
+        store::DEFAULT_BOARD_ID
+    } else {
+        chart.board.as_str()
+    };
+    let board = store::get_board(ch, board_id, viewer)
+        .await
+        .map_err(|err| classify_dashboard_ch_error(&err))?;
+    let saved_grain = board
+        .as_ref()
+        .and_then(|b| b.grain.as_deref())
+        .and_then(Grain::parse)
+        .filter(|g| g.is_truncation());
+    let grain = match parse_grain_request(q.grain.as_deref())? {
+        GrainRequest::Switch(g) => Some(g),
+        GrainRequest::Own => None,
+        GrainRequest::Saved => saved_grain,
+    };
+    let fields = lakehouse_bi::fields::list_catalog_fields(ch)
+        .await
+        .map_err(|err| classify_dashboard_ch_error(&err))?;
+    let fields = lakehouse_bi::fields::FieldCatalog::from_fields(fields);
+    let cols = mart_columns(ch)
+        .await
+        .map_err(|err| classify_dashboard_ch_error(&err))?;
+    let sources = sources_for(ch, std::iter::once(chart))
+        .await
+        .map_err(|err| classify_dashboard_ch_error(&err))?;
+    let read = ReadContext {
+        time,
+        grain,
+        fields: &fields,
+    };
+    let effective = effective_chart(chart, &cols, &sources, &read).map_err(ApiError::BadRequest)?;
+    stored_chart_sql(&effective, &years, filters, &cols, &sources, &read)
+        .map(|filtered| filtered.sql)
+        .map_err(|message| ApiError::Unprocessable(message.to_owned()))
+}
+
+/// The header of each column and the value format of each, by column name.
+///
+/// A column's format is the chart's per-value one; a numeric column without
+/// one takes the chart's default format unless it is the tile's dimension or
+/// breakdown (a year or an id is not an amount). A metric's saved hint is not
+/// read here: the file has the chart's formats only.
+fn export_labels_and_formats(
+    chart: &StoredChartSpec,
+    labels: HashMap<String, String>,
+    names: &[String],
+    types: &[String],
+) -> (
+    HashMap<String, String>,
+    HashMap<String, lakehouse_bi::style::ValueFormat>,
+) {
+    let style = &chart.def.style;
+    let mut formats = HashMap::new();
+    for (i, name) in names.iter().enumerate() {
+        if let Some(f) = style.value_formats.get(name) {
+            formats.insert(name.clone(), f.clone());
+            continue;
+        }
+        let numeric = types.get(i).is_some_and(|t| is_numeric_type(t));
+        let is_axis = *name == chart.def.dimension || chart.def.breakdown.as_deref() == Some(name);
+        if let (true, false, Some(f)) = (numeric, is_axis, &style.format) {
+            formats.insert(name.clone(), f.clone());
+        }
+    }
+    (labels, formats)
+}
+
+/// The download response: the file streamed from disk, with the counts the
+/// console tells the person (`X-Export-Rows`, `X-Export-Cut`, `X-Export-Cap`).
+/// The body is a file, not a JSON value, so it bypasses `ApiJson`.
+fn export_response(
+    written: crate::export::Written,
+    file_name: &str,
+    format: crate::export::FileFormat,
+    cap: u32,
+) -> Response {
+    let body = axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(written.file));
+    (
+        [
+            (header::CONTENT_TYPE, format.content_type().to_owned()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{file_name}\""),
+            ),
+            (header::CONTENT_LENGTH, written.len.to_string()),
+            (header::CACHE_CONTROL, "no-store".to_owned()),
+            (
+                header::HeaderName::from_static("x-export-rows"),
+                written.rows.to_string(),
+            ),
+            (
+                header::HeaderName::from_static("x-export-cut"),
+                written.cut.to_string(),
+            ),
+            (
+                header::HeaderName::from_static("x-export-cap"),
+                cap.to_string(),
+            ),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+/// A failure of the file itself, reported under a reference with a fixed
+/// sentence (SEC-11).
+fn export_failure(err: &crate::export::ExportError) -> ApiError {
+    match err {
+        crate::export::ExportError::Source(ch) => classify_dashboard_ch_error(ch),
+        other => upstream_error::internal_error(&upstream_error::SERVICE, other),
+    }
+}
+
+/// `GET /api/dashboard/chart-export?chart=&format=&values=` — the whole result
+/// of a tile as an Excel or CSV file (`BI-1`, D6).
+///
+/// The statement is the tile's own: a raw table's rows
+/// ([`lakehouse_bi::builder::rows_page_sql`], up to
+/// [`crate::export::EXPORT_ROW_CAP`] rows, also over a SQL source), or what
+/// `GET /api/dashboard` runs for a grouped tile. Either is read through the
+/// same role rewrite as a tile (`rewrite_sql_for_roles`), so masks and row
+/// filters apply to the file. Rows are streamed from the engine into a file
+/// on disk (`crate::export`), then the file is streamed to the client.
+///
+/// Needs `dashboard:read` and a role that is not switched off from
+/// downloading (D7); is not offered to embeds or public links. Every download
+/// is written to the audit trail before the file is returned, and an audit
+/// store that cannot be written refuses the download (D8).
+///
+/// # Errors
+///
+/// 400 for a missing `chart`, an unknown `format`/`values`, a tile with no
+/// data, bad filters or sort; 403 when every role of the person is switched
+/// off from downloading; 404 for an unknown tile; 422 when the role rewrite
+/// refuses or the engine rejects the statement; 503 when the engine or the
+/// audit store is unavailable.
+pub async fn chart_export(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Query(q): Query<ChartExportQuery>,
+) -> ApiResult<Response> {
+    export_chart(&state, &principal, &q, "dashboard.chart_export", false).await
+}
+
+/// `GET /api/dashboard/table-export?chart=` — [`chart_export`] fixed to a raw
+/// table, as CSV, with raw values (`BI-16` part A, T8).
+///
+/// # Errors
+///
+/// As [`chart_export`]; 400 also for a tile that is not a raw table.
+pub async fn table_export(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Query(q): Query<TableExportQuery>,
+) -> ApiResult<Response> {
+    export_chart(
+        &state,
+        &principal,
+        &q.into(),
+        "dashboard.table_export",
+        true,
+    )
+    .await
+}
+
+/// The tile a download is for and the statement that reads it, before the
+/// role rewrite: found through the viewer's own reads (a tile in the trash or
+/// in somebody else's personal space does not exist), refused when it holds
+/// no data, or is not a raw table for the older route.
+async fn export_tile_statement(
+    state: &AppState,
+    principal: &Principal,
+    q: &ChartExportQuery,
+    rows_only: bool,
+) -> Result<(StoredChartSpec, String, HashMap<String, String>), ApiError> {
+    let ch = &state.clickhouse;
+    let chart_id = q
+        .chart
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .ok_or_else(|| ApiError::BadRequest("chart is required".to_owned()))?;
+    let viewer = viewer_of(principal);
+    let chart = store::list_stored_charts(ch, &viewer)
+        .await
+        .map_err(|err| classify_dashboard_ch_error(&err))?
+        .into_iter()
+        .find(|c| c.spec.id == chart_id)
+        .ok_or_else(|| ApiError::NotFound("this tile does not exist".to_owned()))?;
+    if chart.spec.kind.is_static() {
+        return Err(ApiError::BadRequest(
+            "this tile shows no data, so there is nothing to download".to_owned(),
+        ));
+    }
+    let rows_mode = chart.def.tables.is_rows_mode(chart.spec.kind);
+    if rows_only && !rows_mode {
+        return Err(ApiError::BadRequest(
+            "only a table in rows mode can be exported this way".to_owned(),
+        ));
+    }
+    let dashboard_filters = parse_filters_param(q.filters.as_deref())?.unwrap_or_default();
+    // BI-18 part C: a filter tied to another tab is not in this tile's file.
+    let dashboard_filters = filters_for_chart_tab(ch, &chart, dashboard_filters).await;
+    let time = crate::routes::settings::time_context(state).await?;
+    let loaded = crate::routes::params::load(ch, &[], q.params.as_deref()).await?;
+    let time = time.with_params(loaded.values);
+    let (statement, labels) = if rows_mode {
+        rows_export_statement(ch, &chart, q, dashboard_filters, &time).await?
+    } else {
+        let statement =
+            grouped_export_statement(ch, (&viewer, &chart), q, &dashboard_filters, &time).await?;
+        (statement, HashMap::new())
+    };
+    // BI-5 review S4: a grouped file holds what the tile shows, so it runs under
+    // the same limits the tile ran under. An unreadable setting leaves the text.
+    let limits = crate::query_limits::QueryRun::current_or_detached()
+        .limits()
+        .await
+        .ok();
+    Ok((
+        chart,
+        export_statement_settings(rows_mode, statement, limits.as_ref()),
+        labels,
+    ))
+}
+
+/// The statement as the download sends it. A raw table's rows lift a SQL
+/// source's 2 000-row cap to the download's (D6); a grouped tile is the tile's own statement, run under
+/// the caller's limits like the tile (`BI-5` review S4), because a grouped chart
+/// exports its own result (feature decision 8; `BI-1` review fix (SHOULD-FIX) R4).
+fn export_statement_settings(
+    rows_mode: bool,
+    statement: String,
+    limits: Option<&crate::query_limits::TileLimits>,
+) -> String {
+    if rows_mode {
+        lakehouse_bi::builder::with_export_settings(&statement, crate::export::EXPORT_ROW_CAP + 1)
+    } else if let Some(limits) = limits {
+        // The tile's own statement is run with these numbers (`try_run_spec_sql`).
+        lakehouse_bi::builder::with_run_settings(
+            &statement,
+            limits.chart_rows.saturating_add(1),
+            u32::try_from(limits.timeout_seconds()).unwrap_or(u32::MAX),
+        )
+    } else {
+        statement
+    }
+}
+
+/// One chart's file, written and not yet sent or recorded.
+pub(crate) struct ChartFile {
+    pub chart: StoredChartSpec,
+    pub written: crate::export::Written,
+    pub format: crate::export::FileFormat,
+    pub values: crate::export::Values,
+}
+
+/// Read the chart's rows as `principal` and write them to a file: the one
+/// path the download routes and the scheduled report (`RPT-1`) share, so the
+/// masks and row filters (`rewrite_sql_for_roles`), the caps and the formats
+/// cannot differ between a download and an email.
+///
+/// The caller has checked that the person may download (the routes call
+/// `require_download`, the runner checks the owner's rights) and records the
+/// audit entry before the file is handed over.
+///
+/// # Errors
+///
+/// As [`chart_export`].
+pub(crate) async fn build_chart_file(
+    state: &AppState,
+    principal: &Principal,
+    q: &ChartExportQuery,
+    rows_only: bool,
+) -> Result<ChartFile, ApiError> {
+    use crate::export::{FileFormat, Values};
+
+    let format = q
+        .format
+        .as_deref()
+        .map_or(Some(FileFormat::Csv), FileFormat::parse)
+        .ok_or_else(|| ApiError::BadRequest("format must be xlsx or csv.".to_owned()))?;
+    let values = q
+        .values
+        .as_deref()
+        .map_or(Some(Values::Formatted), Values::parse)
+        .ok_or_else(|| ApiError::BadRequest("values must be formatted or raw.".to_owned()))?;
+    let (chart, statement, labels) = export_tile_statement(state, principal, q, rows_only).await?;
 
     let placeholders = crate::sql_rewrite::PlaceholderValues {
         principal_id: Some(principal.id.uuid().to_string()),
@@ -2602,7 +3668,7 @@ pub async fn table_export(
             .map(ToString::to_string)
             .collect(),
     };
-    let obligations = PolicyEngineObligations::from_state(&state);
+    let obligations = PolicyEngineObligations::from_state(state);
     let rewritten = crate::policy_engine::rewrite_sql_for_roles(
         &statement,
         &sqlparser::dialect::ClickHouseDialect {},
@@ -2612,46 +3678,78 @@ pub async fn table_export(
     )
     .await
     .map_err(|err| {
-        ApiError::Unprocessable(crate::policy_engine::enforcement_error_message(&err).to_owned())
+        ApiError::Unprocessable(
+            crate::routes::support::enforcement_message_for(&statement, &err).to_owned(),
+        )
     })?;
-    let result = ch
-        .query(&rewritten, None)
+    let mut stream = state
+        .clickhouse
+        .query_stream(&rewritten, crate::export::EXPORT_TIMEOUT)
         .await
         .map_err(|err| classify_dashboard_ch_error(&err))?;
-
-    let cut = result.data.len() > cap as usize;
-    let rows: Vec<Map<String, Value>> = result.data.iter().take(cap as usize).cloned().collect();
-    let body = crate::csv_export::write_csv(&labels, &shown, &rows);
-
-    record_export_audit(&state, &principal, chart, (rows.len(), cut, cap)).await?;
-
-    Ok((
-        [
-            (header::CONTENT_TYPE, "text/csv; charset=utf-8".to_owned()),
-            (
-                header::CONTENT_DISPOSITION,
-                format!(
-                    "attachment; filename=\"{}\"",
-                    export_file_name(&chart.spec.title)
-                ),
-            ),
-            (header::CACHE_CONTROL, "no-store".to_owned()),
-            (
-                header::HeaderName::from_static("x-export-rows"),
-                rows.len().to_string(),
-            ),
-            (
-                header::HeaderName::from_static("x-export-cut"),
-                cut.to_string(),
-            ),
-            (
-                header::HeaderName::from_static("x-export-cap"),
-                cap.to_string(),
-            ),
-        ],
-        body,
+    let (labels, formats) =
+        export_labels_and_formats(&chart, labels, stream.names(), stream.types());
+    let locale = crate::routes::settings::format_settings(state)
+        .await?
+        .number_locale;
+    let written = crate::export::write_export(
+        &mut stream,
+        &crate::export::ExportOptions {
+            format,
+            values,
+            cap: crate::export::EXPORT_ROW_CAP as usize,
+            locale: &locale,
+            labels: &labels,
+            formats: &formats,
+        },
     )
-        .into_response())
+    .await
+    .map_err(|err| export_failure(&err))?;
+    Ok(ChartFile {
+        chart,
+        written,
+        format,
+        values,
+    })
+}
+
+async fn export_chart(
+    state: &AppState,
+    principal: &Principal,
+    q: &ChartExportQuery,
+    action: &'static str,
+    rows_only: bool,
+) -> ApiResult<Response> {
+    crate::routes::settings::require_download(state, principal).await?;
+    let ChartFile {
+        chart,
+        written,
+        format,
+        values,
+    } = build_chart_file(state, principal, q, rows_only).await?;
+    let cap = crate::export::EXPORT_ROW_CAP;
+
+    record_export_audit(
+        state,
+        principal,
+        &chart,
+        &ExportOutcome {
+            action,
+            rows: written.rows,
+            cut: written.cut,
+            cap,
+            format,
+            values,
+        },
+    )
+    .await?;
+
+    let file_name = export_file_name(
+        &chart.spec.title,
+        format.extension(),
+        written.cut.then_some(cap),
+    );
+    Ok(export_response(written, &file_name, format, cap))
 }
 
 // ── /api/dashboard/values ───────────────────────────────────────────────
@@ -2675,9 +3773,24 @@ pub struct ValuesQuery {
     filters: Option<String>,
 }
 
+impl ValuesQuery {
+    /// The query of a signed embed's dropdown (`BI-26` plan D5): `column` over
+    /// the relations `board`'s charts read, narrowed by `filters` (JSON list).
+    pub(crate) fn for_board(column: &str, board: &str, filters: String) -> Self {
+        Self {
+            column: Some(column.to_owned()),
+            q: None,
+            board: Some(board.to_owned()),
+            filters: Some(filters),
+        }
+    }
+}
+
 /// Values a list returns at most; one more is fetched to know whether the
 /// list was cut.
 const VALUES_LIMIT: usize = 200;
+/// The most values a signed embed's dropdown lists (`BI-26` plan D5).
+pub(crate) const EMBED_VALUES_LIMIT: usize = 1_000;
 /// Longest search text, in characters.
 const VALUES_SEARCH_MAX_CHARS: usize = 200;
 
@@ -2710,7 +3823,7 @@ pub async fn values(
     values_for_roles(
         &state.clickhouse,
         q,
-        &principal.role_names,
+        (&principal.role_names, &viewer_of(&principal)),
         &placeholders,
         &obligations,
         &time,
@@ -2752,12 +3865,12 @@ fn values_select(
 }
 
 /// The statement over every relation's `SELECT`, fetching one value more
-/// than [`VALUES_LIMIT`] so the caller can tell the list was cut.
-fn values_statement(selects: &[String], settings: &str) -> String {
+/// than `limit` so the caller can tell the list was cut.
+fn values_statement(selects: &[String], settings: &str, limit: usize) -> String {
     let union = selects.join(" UNION DISTINCT ");
     format!(
         "SELECT v FROM ({union}) WHERE v != '' ORDER BY v LIMIT {}{settings}",
-        VALUES_LIMIT + 1
+        limit + 1
     )
 }
 
@@ -2773,18 +3886,17 @@ fn values_statement(selects: &[String], settings: &str) -> String {
 async fn board_value_selects(
     ch: &ChClient,
     board: &str,
-    column: &str,
-    search: Option<&str>,
+    (column, search): (&str, Option<&str>),
     other_filters: &[FilterDef],
-    time: &TimeContext,
+    (time, viewer): (&TimeContext, &Viewer),
 ) -> Result<(Vec<String>, bool), ApiError> {
-    let charts = store::list_stored_charts(ch)
+    let charts = store::list_stored_charts(ch, viewer)
         .await
         .map_err(|err| classify_dashboard_ch_error(&err))?;
     let on_board: Vec<&StoredChartSpec> = charts
         .iter()
         .filter(|c| board == "all" || c.board == board)
-        .filter(|c| c.spec.kind != ChartKind::Text)
+        .filter(|c| !c.spec.kind.is_static())
         .collect();
     let mart_cols = mart_columns(ch)
         .await
@@ -2849,10 +3961,33 @@ async fn board_value_selects(
 async fn values_for_roles(
     ch: &ChClient,
     q: ValuesQuery,
-    roles: &[String],
+    (roles, viewer): (&[String], &Viewer),
     placeholders: &crate::sql_rewrite::PlaceholderValues,
     obligations: &PolicyEngineObligations<'_>,
     time: &TimeContext,
+) -> Result<Value, ApiError> {
+    values_with_limit(
+        ch,
+        q,
+        (roles, viewer),
+        (placeholders, obligations, time),
+        VALUES_LIMIT,
+    )
+    .await
+}
+
+/// [`values_for_roles`] with the list's limit chosen by the caller: the
+/// dashboard's picker lists 200, a signed embed's dropdown 1,000 (`BI-26`).
+pub(crate) async fn values_with_limit(
+    ch: &ChClient,
+    q: ValuesQuery,
+    (roles, viewer): (&[String], &Viewer),
+    (placeholders, obligations, time): (
+        &crate::sql_rewrite::PlaceholderValues,
+        &PolicyEngineObligations<'_>,
+        &TimeContext,
+    ),
+    limit: usize,
 ) -> Result<Value, ApiError> {
     let column = strip_non_ident(q.column.as_deref().unwrap_or(""));
     if column.is_empty() {
@@ -2870,7 +4005,7 @@ async fn values_for_roles(
     let (selects, settings) = if let Some(board) = q.board.as_deref().filter(|b| !b.is_empty()) {
         let others: Vec<FilterDef> = linked.into_iter().filter(|f| f.column != column).collect();
         let (selects, has_source) =
-            board_value_selects(ch, board, &column, search, &others, time).await?;
+            board_value_selects(ch, board, (&column, search), &others, (time, viewer)).await?;
         let settings = if has_source {
             lakehouse_bi::builder::SQL_SOURCE_SETTINGS
         } else {
@@ -2904,7 +4039,7 @@ async fn values_for_roles(
     if selects.is_empty() {
         return Ok(empty());
     }
-    let sql = values_statement(&selects, settings);
+    let sql = values_statement(&selects, settings, limit);
     let rewritten = crate::policy_engine::rewrite_sql_for_roles(
         &sql,
         &sqlparser::dialect::ClickHouseDialect {},
@@ -2914,7 +4049,10 @@ async fn values_for_roles(
     )
     .await
     .map_err(|err| {
-        ApiError::Unprocessable(crate::policy_engine::enforcement_error_message(&err).to_owned())
+        // BI-16 C3 review S6 (as in `run_records`).
+        ApiError::Unprocessable(
+            crate::routes::support::enforcement_message_for(&sql, &err).to_owned(),
+        )
     })?;
     let rows = ch
         .rows(&rewritten, None)
@@ -2924,8 +4062,8 @@ async fn values_for_roles(
         .iter()
         .filter_map(|r| r.get("v").and_then(Value::as_str).map(ToOwned::to_owned))
         .collect();
-    let truncated = values.len() > VALUES_LIMIT;
-    values.truncate(VALUES_LIMIT);
+    let truncated = values.len() > limit;
+    values.truncate(limit);
     Ok(json!({ "column": column, "values": values, "truncated": truncated }))
 }
 
@@ -2938,11 +4076,17 @@ async fn values_for_roles(
 /// # Errors
 ///
 /// 500 (`ApiError::Internal`) if either `ClickHouse` listing fails.
-pub async fn export(State(state): State<AppState>) -> ApiResult<Response> {
+pub async fn export(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+) -> ApiResult<Response> {
+    // The file is the caller's view of the dashboards: no deleted board or
+    // chart, and no other user's personal space (BI-18 part C, part 2).
+    let viewer = viewer_of(&principal);
     let (charts, boards, default_row) = tokio::try_join!(
-        store::list_stored_charts(&state.clickhouse),
-        store::list_boards(&state.clickhouse),
-        store::get_board(&state.clickhouse, store::DEFAULT_BOARD_ID)
+        store::list_stored_charts(&state.clickhouse, &viewer),
+        store::list_boards(&state.clickhouse, &viewer),
+        store::get_board(&state.clickhouse, store::DEFAULT_BOARD_ID, &viewer)
     )
     .map_err(|err| {
         upstream_error::ch_error_as(
@@ -2969,6 +4113,17 @@ pub async fn export(State(state): State<AppState>) -> ApiResult<Response> {
             b.layout.as_ref(),
             b.params.as_deref(),
         ));
+        // BI-18 part C: a board's tabs, after its other keys.
+        if let Some(tabs) = b.tabs.as_deref().filter(|t| !t.is_empty()) {
+            let rendered = tabs
+                .iter()
+                .map(|t| serde_json::to_string(t).unwrap_or_default())
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push_str("    tabs: [");
+            out.push_str(&rendered);
+            out.push_str("]\n");
+        }
     }
     out.push('\n');
     out.push_str("charts:\n");
@@ -3040,8 +4195,14 @@ fn yaml_board(
     {
         lines.push("    layout:".to_owned());
         for (cid, bx) in layout {
+            // BI-18 part C: the tab only when the tile names one, so the
+            // line of a board saved before tabs is unchanged.
+            let tab = bx
+                .tab
+                .as_deref()
+                .map_or_else(String::new, |t| format!(", tab: {}", yaml_value(&json!(t))));
             lines.push(format!(
-                "      {cid}: {{ x: {}, y: {}, w: {}, h: {} }}",
+                "      {cid}: {{ x: {}, y: {}, w: {}, h: {}{tab} }}",
                 bx.x, bx.y, bx.w, bx.h
             ));
         }
@@ -3181,6 +4342,7 @@ fn chart_def_fields(def: &ChartInput) -> Vec<(&'static str, Value)> {
                 out.push(("grain", json!(grain)));
             }
             push_table_fields(def, &mut out);
+            push_type_fields(def, &mut out);
             push_shape_fields(def, &mut out);
             if let Some(span) = def.span {
                 out.push(("span", json!(span)));
@@ -3231,6 +4393,30 @@ fn push_shape_fields(def: &ChartInput, out: &mut Vec<(&'static str, Value)>) {
     }
 }
 
+/// The `BI-16` part B fields of a definition (goal, bands, histogram ranges,
+/// the address and description of an image or web card), present only on the
+/// charts that carry them.
+fn push_type_fields(def: &ChartInput, out: &mut Vec<(&'static str, Value)>) {
+    const NAMES: [&str; 8] = [
+        "goal",
+        "bands",
+        "histogram",
+        "url",
+        "alt",
+        "start",
+        "end",
+        "progress",
+    ];
+    let Ok(Value::Object(fields)) = serde_json::to_value(&def.types) else {
+        return;
+    };
+    for name in NAMES {
+        if let Some(value) = fields.get(name) {
+            out.push((name, value.clone()));
+        }
+    }
+}
+
 /// The `BI-16` part A fields of a definition (raw table, pivot, comparison),
 /// present only on the charts that carry them, so the exported shape of every
 /// earlier chart does not change.
@@ -3264,6 +4450,9 @@ fn push_table_fields(def: &ChartInput, out: &mut Vec<(&'static str, Value)>) {
 pub struct EmbedInfoQuery {
     #[serde(default)]
     board: Option<String>,
+    /// `BI-26`: sign the sample for this chart instead of the dashboard.
+    #[serde(default)]
+    chart: Option<String>,
 }
 
 /// `GET /api/dashboard/embed-info` — this board's embed status and a
@@ -3293,6 +4482,7 @@ pub struct EmbedInfoQuery {
 /// exist; 500 on any other `ClickHouse` failure.
 pub async fn embed_info(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Query(q): Query<EmbedInfoQuery>,
 ) -> Response {
     let id = q.board.unwrap_or_default();
@@ -3303,7 +4493,7 @@ pub async fn embed_info(
         )
             .into_response();
     }
-    match embed_info_body(&state, &id).await {
+    match embed_info_body(&state, &id, q.chart.as_deref(), &viewer_of(&principal)).await {
         Ok(Some(body)) => (StatusCode::OK, ApiJson(body)).into_response(),
         Ok(None) => (
             StatusCode::NOT_FOUND,
@@ -3321,8 +4511,10 @@ pub async fn embed_info(
 async fn embed_info_body(
     state: &AppState,
     id: &str,
+    chart: Option<&str>,
+    viewer: &Viewer,
 ) -> Result<Option<Value>, lakehouse_clickhouse::ChError> {
-    let Some(board) = store::get_board(&state.clickhouse, id).await? else {
+    let Some(board) = store::get_board(&state.clickhouse, id, viewer).await? else {
         return Ok(None);
     };
     let enabled = board.embed_enabled.unwrap_or(false);
@@ -3338,6 +4530,25 @@ async fn embed_info_body(
         "maxLifetimeSeconds": max_lifetime,
         "revokedBefore": revoked_before,
         "allowedOrigins": board.embed_access.origins,
+        // BI-26 (D8): each filter column's embed mode and the columns that
+        // can be given one (the board's saved filters), for the Share dialog.
+        "filterModes": board.embed_access.filter_modes,
+        // BI-26 review fix R3: filters that do not pick values (a range, a
+        // relative date, a text match) can only be hidden in an embed.
+        "hiddenOnlyColumns": board
+            .filters
+            .iter()
+            .flatten()
+            .filter(|f| !f.column.is_empty() && !f.op.is_in())
+            .map(|f| f.column.clone())
+            .collect::<std::collections::BTreeSet<_>>(),
+        "filterColumns": board
+            .filters
+            .iter()
+            .flatten()
+            .filter(|f| !f.column.is_empty())
+            .map(|f| f.column.clone())
+            .collect::<std::collections::BTreeSet<_>>(),
     });
     let with_access = |mut body: Value| {
         if let (Some(map), Some(extra)) = (body.as_object_mut(), access.as_object()) {
@@ -3362,11 +4573,26 @@ async fn embed_info_body(
         reason = "a lifetime limit in seconds; far below 2^53"
     )]
     let lifetime = 3600.0_f64.min(max_lifetime as f64);
+    // BI-26 (D8): a sample for one chart names it (and not the dashboard); the
+    // locked filters' saved values ride as `params`, so the sample is not
+    // refused for a locked value it forgot (feature decision 6).
+    let named_chart = match chart {
+        Some(c)
+            if store::list_stored_charts(&state.clickhouse, viewer)
+                .await?
+                .iter()
+                .any(|s| s.spec.id == c && s.board == id) =>
+        {
+            Some(c.to_owned())
+        }
+        _ => None,
+    };
     let claims = lakehouse_embed::EmbedClaims {
         resource: Some(lakehouse_embed::EmbedResource {
-            dashboard: Some(id.to_owned()),
+            dashboard: named_chart.is_none().then(|| id.to_owned()),
+            chart: named_chart,
         }),
-        params: Some(HashMap::new()),
+        params: Some(locked_sample_params(&board)),
         exp: Some(iat + lifetime),
         // SEC-12: a token must carry `iat` and `exp`; the sample also gets a
         // `jti` so the Share dialog can show a token that can be withdrawn.
@@ -3385,6 +4611,23 @@ async fn embed_info_body(
     }))))
 }
 
+/// The `params` of a sample token: for each filter whose embed mode is locked,
+/// its saved value (an `in` filter's values) under its column.
+fn locked_sample_params(board: &lakehouse_bi::store::Board) -> HashMap<String, Value> {
+    use lakehouse_bi::embed_access::FilterMode;
+    board
+        .filters
+        .iter()
+        .flatten()
+        .filter(|f| {
+            !f.column.is_empty()
+                && board.embed_access.mode_of(&f.column) == FilterMode::Locked
+                && !f.values.is_empty()
+        })
+        .map(|f| (f.column.clone(), json!(f.values)))
+        .collect()
+}
+
 fn now_unix_seconds() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3397,6 +4640,39 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    /// `BI-1` review fix (SHOULD-FIX) R4: only a raw table's rows lift a SQL
+    /// source's tile cap; a grouped statement is sent exactly as the tile reads it.
+    #[test]
+    fn only_a_raw_table_lifts_the_sql_source_cap_in_its_download() {
+        let tile = format!(
+            "SELECT region, sum(n) AS n FROM (SELECT 1\n) AS src GROUP BY region{}",
+            lakehouse_bi::builder::SQL_SOURCE_SETTINGS
+        );
+        assert_eq!(export_statement_settings(false, tile.clone(), None), tile);
+        let rows = export_statement_settings(true, tile.clone(), None);
+        assert_ne!(rows, tile);
+        assert!(rows.contains("max_result_rows = 1000001"), "{rows}");
+        assert!(!rows.contains("max_result_rows = 2000"), "{rows}");
+    }
+
+    /// `BI-5` review S4: a grouped file runs under the caller's limits, as the
+    /// tile does, so an administrator's change reaches the file too.
+    #[test]
+    fn a_grouped_download_takes_the_callers_limits_like_its_tile() {
+        let tile = format!(
+            "SELECT region, sum(n) AS n FROM (SELECT 1\n) AS src GROUP BY region{}",
+            lakehouse_bi::builder::SQL_SOURCE_SETTINGS
+        );
+        let mut limits = crate::query_limits::Snapshot::default().effective_for_roles(&[]);
+        limits.chart_rows = 500;
+        limits.timeout = std::time::Duration::from_secs(120);
+        let got = export_statement_settings(false, tile, Some(&limits));
+        assert!(
+            got.contains("max_result_rows = 501") && got.contains("max_execution_time = 120"),
+            "{got}"
+        );
+    }
 
     #[test]
     fn strip_non_ident_removes_everything_but_word_chars() {
@@ -3696,11 +4972,98 @@ mod tests {
                 y: 0,
                 w: 3,
                 h: 5,
+                tab: None,
+            },
+        );
+        layout.insert(
+            "c2".to_owned(),
+            store::TileBox {
+                x: 3,
+                y: 0,
+                w: 3,
+                h: 5,
+                tab: Some("t_maps".to_owned()),
             },
         );
         let out = yaml_board("b1", "Board 1", Some(&layout), None);
         assert!(out.contains("    layout:\n"));
         assert!(out.contains("      c1: { x: 0, y: 0, w: 3, h: 5 }"));
+        // BI-18 part C: the tab only on a tile that names one.
+        assert!(out.contains("      c2: { x: 3, y: 0, w: 3, h: 5, tab: t_maps }"));
+    }
+
+    // ── DATA-12 part 3: marks on the mart list ───────────────────────────
+    mod marks {
+        use std::collections::HashMap;
+
+        // Force-links `lakehouse-test-support` so its `#[ctor]` Postgres
+        // testcontainer bootstrap runs for this test binary.
+        use lakehouse_test_support as _;
+
+        use super::super::*;
+        use crate::config::Config;
+
+        fn state_for(pool: &lakehouse_store::PgPool) -> AppState {
+            let options = pool.connect_options();
+            let mut env = HashMap::new();
+            env.insert(
+                "DATABASE_URL".to_owned(),
+                format!(
+                    "postgres://{}:postgres@{}:{}/{}",
+                    options.get_username(),
+                    options.get_host(),
+                    options.get_port(),
+                    options.get_database().expect("a named database"),
+                ),
+            );
+            AppState::new(Config::from_map(&env).expect("a valid test Config"))
+        }
+
+        async fn deprecate(pool: &lakehouse_store::PgPool, id: &str, replacement: Option<&str>) {
+            lakehouse_store::annotation::set_certification(
+                pool,
+                &lakehouse_store::annotation::CertificationInput {
+                    asset_id: id.to_owned(),
+                    status: "deprecated".to_owned(),
+                    note: Some("Use the v2 mart".to_owned()),
+                    replacement_asset_id: replacement.map(str::to_owned),
+                    certified_by: "Rina".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_deprecated_mart_reaches_the_picker_payload_with_its_note_and_replacement(
+            pool: lakehouse_store::PgPool,
+        ) {
+            deprecate(&pool, "serving.orders", Some("serving.orders_v2")).await;
+            let mut body = json!({ "marts": [
+                { "name": "orders", "rows": 10 },
+                { "name": "orders_v2", "rows": 12 },
+                { "name": "stock", "rows": 3 },
+            ]});
+
+            mark_marts(&state_for(&pool), &mut body).await;
+
+            let orders = &body["marts"][0];
+            assert_eq!(orders["certification"], json!("deprecated"));
+            assert_eq!(orders["certificationNote"], json!("Use the v2 mart"));
+            assert_eq!(orders["replacementAssetId"], json!("serving.orders_v2"));
+            assert_eq!(orders["replacementName"], json!("orders_v2"));
+            assert_eq!(orders["rows"], json!(10), "the existing fields are kept");
+            assert!(body["marts"][1].get("certification").is_none());
+            assert!(body["marts"][2].get("certification").is_none());
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_list_with_no_marks_is_left_exactly_as_it_was(pool: lakehouse_store::PgPool) {
+            let original = json!({ "marts": [{ "name": "orders", "rows": 10 }] });
+            let mut body = original.clone();
+            mark_marts(&state_for(&pool), &mut body).await;
+            assert_eq!(body, original);
+        }
     }
 }
 
@@ -3810,7 +5173,10 @@ mod records_enforcement {
         let body = records_for_roles(
             &ch,
             drill("mart_x", "region", "north"),
-            &["Analyst".to_owned()],
+            (
+                &["Analyst".to_owned()],
+                &lakehouse_bi::access::Viewer::system(),
+            ),
             &PlaceholderValues::none(),
             &obligations,
             &lakehouse_bi::grain::TimeContext::default(),
@@ -3903,7 +5269,10 @@ mod records_enforcement {
         let body = records_for_roles(
             &ch,
             q,
-            &["Analyst".to_owned()],
+            (
+                &["Analyst".to_owned()],
+                &lakehouse_bi::access::Viewer::system(),
+            ),
             &PlaceholderValues::none(),
             &obligations,
             &lakehouse_bi::grain::TimeContext::default(),
@@ -3948,7 +5317,7 @@ mod records_enforcement {
         let err = records_for_roles(
             &ch,
             drill("mart_x", "region", "north"),
-            &[],
+            (&[], &lakehouse_bi::access::Viewer::system()),
             &PlaceholderValues::none(),
             &obligations,
             &lakehouse_bi::grain::TimeContext::default(),
@@ -4052,7 +5421,10 @@ mod values_enforcement {
                 column: Some("email".to_owned()),
                 ..ValuesQuery::default()
             },
-            &["Analyst".to_owned()],
+            (
+                &["Analyst".to_owned()],
+                &lakehouse_bi::access::Viewer::system(),
+            ),
             &PlaceholderValues::none(),
             &obligations,
             &lakehouse_bi::grain::TimeContext::default(),
@@ -4069,7 +5441,7 @@ mod values_enforcement {
             .map(|r| String::from_utf8_lossy(&r.body).into_owned())
             .filter(|b| b.contains("DISTINCT"))
             .collect();
-        assert!(!distinct_queries.is_empty());
+        assert_ne!(distinct_queries, [] as [std::string::String; 0]);
         assert!(
             distinct_queries
                 .iter()
@@ -4147,7 +5519,10 @@ mod values_enforcement {
                 q: Some("secret".to_owned()),
                 ..ValuesQuery::default()
             },
-            &["Analyst".to_owned()],
+            (
+                &["Analyst".to_owned()],
+                &lakehouse_bi::access::Viewer::system(),
+            ),
             &PlaceholderValues::none(),
             &obligations,
             &lakehouse_bi::grain::TimeContext::default(),
@@ -4164,7 +5539,7 @@ mod values_enforcement {
             .map(|r| String::from_utf8_lossy(&r.body).into_owned())
             .filter(|b| b.contains("DISTINCT"))
             .collect();
-        assert!(!reads.is_empty());
+        assert_ne!(reads, [] as [std::string::String; 0]);
         for sql in &reads {
             // The search runs over the masked source, so typing a clear value
             // cannot confirm that it exists behind the mask.
@@ -4273,7 +5648,12 @@ mod typed_filters {
     use crate::policy_engine::PolicyEngineObligations;
     use crate::sql_rewrite::PlaceholderValues;
 
-    async fn answer(server: &MockServer, statement_has: &str, meta: &[&str], data: Vec<Value>) {
+    pub(super) async fn answer(
+        server: &MockServer,
+        statement_has: &str,
+        meta: &[&str],
+        data: Vec<Value>,
+    ) {
         let meta: Vec<Value> = meta
             .iter()
             .map(|n| json!({ "name": n, "type": "String" }))
@@ -4290,7 +5670,7 @@ mod typed_filters {
     }
 
     /// Anything not matched above (DDL, tile queries): success, no rows.
-    async fn answer_rest(server: &MockServer) {
+    pub(super) async fn answer_rest(server: &MockServer) {
         Mock::given(method("POST"))
             .respond_with(
                 ResponseTemplate::new(200)
@@ -4300,7 +5680,7 @@ mod typed_filters {
             .await;
     }
 
-    async fn statements(server: &MockServer) -> Vec<String> {
+    pub(super) async fn statements(server: &MockServer) -> Vec<String> {
         server
             .received_requests()
             .await
@@ -4310,7 +5690,7 @@ mod typed_filters {
             .collect()
     }
 
-    fn chart_row(id: &str, board: &str, mart: &str, source: Option<&str>) -> Value {
+    pub(super) fn chart_row(id: &str, board: &str, mart: &str, source: Option<&str>) -> Value {
         let mut spec = json!({
             "id": id, "title": id, "kind": "bar", "mart": mart,
             "sql": "SELECT 1", "x": "kab", "y": "visitors"
@@ -4329,13 +5709,13 @@ mod typed_filters {
         })
     }
 
-    fn mart_column_rows(table: &str, cols: &[(&str, &str)]) -> Vec<Value> {
+    pub(super) fn mart_column_rows(table: &str, cols: &[(&str, &str)]) -> Vec<Value> {
         cols.iter()
             .map(|(name, ty)| json!({ "table": table, "name": name, "type": ty }))
             .collect()
     }
 
-    fn client(server: &MockServer) -> ChClient {
+    pub(super) fn client(server: &MockServer) -> ChClient {
         ChClient::new(server.uri(), "default".to_owned(), String::new())
     }
 
@@ -4401,6 +5781,7 @@ mod typed_filters {
             filters: Some(filters.to_owned()),
             grain: None,
             params: None,
+            fresh: None,
         };
         let parsed = parse_filters_param(q.filters.as_deref()).expect("valid filters");
         get_body(
@@ -4413,10 +5794,120 @@ mod typed_filters {
             (
                 &lakehouse_bi::grain::TimeContext::default(),
                 GrainRequest::Saved,
+                &lakehouse_bi::access::Viewer::system(),
+                &tokio::sync::Semaphore::new(crate::tile_pool::TILES_PER_PROCESS),
             ),
         )
         .await
         .expect("the payload builds")
+    }
+
+    /// Answers a tile query after 300 ms and records when it arrived, so a
+    /// test can see how many tiles were in flight together.
+    struct SlowTile {
+        arrivals: std::sync::Arc<std::sync::Mutex<Vec<std::time::Instant>>>,
+    }
+
+    impl wiremock::Respond for SlowTile {
+        fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+            let text = String::from_utf8_lossy(&request.body);
+            if text.contains("mart_bad") {
+                return ResponseTemplate::new(500).set_body_string("boom");
+            }
+            self.arrivals
+                .lock()
+                .expect("arrivals lock")
+                .push(std::time::Instant::now());
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_millis(300))
+                .set_body_json(json!({
+                    "meta": [{ "name": "kab", "type": "String" }, { "name": "visitors", "type": "UInt32" }],
+                    "data": [{ "kab": "a", "visitors": 1 }],
+                    "rows": 1,
+                }))
+        }
+    }
+
+    /// BI-4 part A (plan D1/T1): twelve 300 ms tiles are answered in two
+    /// rounds of six, in chart order, and a tile whose query fails does not
+    /// fail the others.
+    #[tokio::test]
+    async fn twelve_slow_tiles_load_six_at_a_time_in_order_and_one_failure_stays_its_own() {
+        let server = MockServer::start().await;
+        let mut charts: Vec<Value> = (0..12)
+            .map(|i| chart_row(&format!("c{i:02}"), "b1", "mart_a", None))
+            .collect();
+        charts[8] = chart_row("c08", "b1", "mart_bad", None);
+        answer(
+            &server,
+            "FROM console.bi_chart FINAL",
+            &["id", "board", "created_by", "created_at", "spec_json"],
+            charts,
+        )
+        .await;
+        answer(&server, "FROM console.bi_board FINAL", &["id"], vec![]).await;
+        answer(&server, "FROM console.bi_source FINAL", &["id"], vec![]).await;
+        let mut cols = mart_column_rows("mart_a", &[("visitors", "UInt32"), ("kab", "String")]);
+        cols.extend(mart_column_rows(
+            "mart_bad",
+            &[("visitors", "UInt32"), ("kab", "String")],
+        ));
+        answer(
+            &server,
+            "SELECT table, name, type FROM system.columns",
+            &["table", "name", "type"],
+            cols,
+        )
+        .await;
+        let arrivals = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        Mock::given(method("POST"))
+            .and(body_string_contains("FROM serving.mart_"))
+            .respond_with(SlowTile {
+                arrivals: arrivals.clone(),
+            })
+            .mount(&server)
+            .await;
+        answer_rest(&server).await;
+
+        let started = std::time::Instant::now();
+        // A filter makes each tile send a statement of its own over its mart
+        // (without one a stored chart sends its saved `SELECT 1`).
+        let body = dashboard(
+            &server,
+            r#"[{"column":"visitors","op":"between","min":"0"}]"#,
+        )
+        .await;
+        let took = started.elapsed();
+
+        let results = body["results"].as_object().expect("results");
+        let ids: Vec<&String> = results.keys().collect();
+        let expected: Vec<String> = (0..12).map(|i| format!("c{i:02}")).collect();
+        assert_eq!(ids, expected.iter().collect::<Vec<_>>(), "chart order");
+        assert!(
+            results["c08"].get("error").is_some(),
+            "{:?}",
+            results["c08"]
+        );
+        for id in expected.iter().filter(|id| *id != "c08") {
+            assert!(
+                results[id].get("error").is_none(),
+                "{id}: {:?}",
+                results[id]
+            );
+            assert_eq!(results[id]["rows"][0]["visitors"], 1, "{id}");
+        }
+        // Eleven 300 ms tiles one after another take 3.3 s.
+        assert!(took < std::time::Duration::from_millis(1500), "{took:?}");
+        let times = arrivals.lock().expect("arrivals lock").clone();
+        assert_eq!(times.len(), 11, "every healthy tile asked once");
+        let first = *times.iter().min().expect("a tile query");
+        let in_first_wave = times
+            .iter()
+            .filter(|t| t.duration_since(first) < std::time::Duration::from_millis(200))
+            .count();
+        // Six start together; the 7th cannot start until one finishes (300 ms).
+        // The failing tile (c08) is in the second wave, so the first has six.
+        assert_eq!(in_first_wave, 6, "six tiles in the first wave");
     }
 
     #[test]
@@ -4547,7 +6038,7 @@ mod typed_filters {
             .iter()
             .filter(|s| s.contains("GROUP BY kab") && s.contains("WHERE kab IN"))
             .collect();
-        assert!(!tiles.is_empty());
+        assert_ne!(tiles, [] as [&std::string::String; 0]);
         for sql in tiles {
             assert!(sql.contains(&format!("kab IN ({list})")), "{sql}");
             assert!(
@@ -4647,7 +6138,7 @@ mod typed_filters {
         values_for_roles(
             &ch,
             q,
-            &[],
+            (&[], &lakehouse_bi::access::Viewer::system()),
             &PlaceholderValues::none(),
             &obligations,
             &lakehouse_bi::grain::TimeContext::default(),
@@ -4697,7 +6188,7 @@ mod typed_filters {
         // The rewrite writes a literal in its own escaping (`\\` and `\'`).
         let literal = "'50%_\\\\\\'x\\\\'";
         let reads = value_reads(&server).await;
-        assert!(!reads.is_empty());
+        assert_ne!(reads, [] as [std::string::String; 0]);
         for sql in &reads {
             assert!(sql.contains("positionCaseInsensitiveUTF8"), "{sql}");
             assert!(sql.contains(literal), "{sql} lacks {literal}");
@@ -4771,7 +6262,7 @@ mod typed_filters {
         .unwrap();
         assert_eq!(body["values"], json!(["Ubud"]));
         let reads = value_reads(&server).await;
-        assert!(!reads.is_empty());
+        assert_ne!(reads, [] as [std::string::String; 0]);
         // `mart_a` has `provinsi`, so it is narrowed; `mart_b` lacks it and
         // is read whole.
         assert!(
@@ -4864,7 +6355,7 @@ mod typed_filters {
         .await
         .unwrap();
         assert_eq!(body["values"], json!([]));
-        assert!(value_reads(&server).await.is_empty());
+        assert_eq!(value_reads(&server).await, [] as [std::string::String; 0]);
     }
 }
 
@@ -4967,7 +6458,7 @@ mod records_pages {
         records_for_roles(
             &ch,
             q,
-            &[],
+            (&[], &lakehouse_bi::access::Viewer::system()),
             &PlaceholderValues::none(),
             &obligations,
             &lakehouse_bi::grain::TimeContext::default(),
@@ -5209,8 +6700,8 @@ mod records_pages {
         let (rows, count) = page_and_count(&server).await;
         assert!(rows.contains("channel = 'web'"), "{rows}");
         // The source's cap rides on the count too.
-        assert!(count.contains("max_execution_time = 30"), "{count}");
-        assert!(rows.contains("max_execution_time = 30"), "{rows}");
+        assert!(count.contains("max_execution_time = 60"), "{count}");
+        assert!(rows.contains("max_execution_time = 60"), "{rows}");
     }
 
     #[tokio::test]
@@ -5555,6 +7046,7 @@ mod time_grain {
             filters: None,
             grain: requested.map(|g| g.as_str().to_owned()),
             params: None,
+            fresh: None,
         };
         get_body(
             &ch,
@@ -5563,7 +7055,12 @@ mod time_grain {
             &[],
             &PlaceholderValues::none(),
             &obligations,
-            (time, requested.into()),
+            (
+                time,
+                requested.into(),
+                &lakehouse_bi::access::Viewer::system(),
+                &tokio::sync::Semaphore::new(crate::tile_pool::TILES_PER_PROCESS),
+            ),
         )
         .await
         .expect("the payload builds")
@@ -5615,6 +7112,49 @@ mod time_grain {
         assert_eq!(body["appliedGrain"], json!("month"));
     }
 
+    /// `BI-4` part B T5 (plan D8, `BI-4-AC1`): the second open is served from
+    /// memory and says so, with the first open's `computedAt`; `fresh=1`
+    /// computes again; the payload names the rule in force.
+    #[tokio::test]
+    async fn a_second_open_is_remembered_and_fresh_computes_again() {
+        use crate::result_cache::{CacheScope, Fresh, ResultCache, scoped};
+        let server = MockServer::start().await;
+        mount_board(&server, "").await;
+        let cache = std::sync::Arc::new(ResultCache::new(8));
+        let time = TimeContext::default();
+        let open = |fresh: Fresh| {
+            scoped(
+                CacheScope::new(
+                    std::sync::Arc::clone(&cache),
+                    lakehouse_bi::cache_rule::CacheRule::Follow,
+                    fresh,
+                ),
+                dashboard(&server, None, &time),
+            )
+        };
+        let first = open(Fresh::No).await;
+        let second = open(Fresh::No).await;
+        let forced = open(Fresh::parse(Some("1"))).await;
+        let tiles: Vec<&String> = first["results"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .filter(|(_, v)| v.get("computedAt").is_some())
+            .map(|(id, _)| id)
+            .collect();
+        assert!(!tiles.is_empty(), "{first}");
+        for id in tiles {
+            assert_eq!(first["results"][id]["remembered"], json!(false), "{id}");
+            assert_eq!(second["results"][id]["remembered"], json!(true), "{id}");
+            assert_eq!(
+                second["results"][id]["computedAt"], first["results"][id]["computedAt"],
+                "{id}"
+            );
+            assert_eq!(forced["results"][id]["remembered"], json!(false), "{id}");
+        }
+        assert_eq!(first["cacheRule"], json!({ "mode": "default" }));
+    }
+
     #[tokio::test]
     async fn own_sets_the_saved_grain_aside_for_this_view() {
         let server = MockServer::start().await;
@@ -5627,6 +7167,7 @@ mod time_grain {
             filters: None,
             grain: Some("own".to_owned()),
             params: None,
+            fresh: None,
         };
         let body = get_body(
             &ch,
@@ -5635,7 +7176,12 @@ mod time_grain {
             &[],
             &PlaceholderValues::none(),
             &obligations,
-            (&TimeContext::default(), super::GrainRequest::Own),
+            (
+                &TimeContext::default(),
+                super::GrainRequest::Own,
+                &lakehouse_bi::access::Viewer::system(),
+                &tokio::sync::Semaphore::new(crate::tile_pool::TILES_PER_PROCESS),
+            ),
         )
         .await
         .unwrap();
@@ -5738,7 +7284,15 @@ mod time_grain {
     ) -> Result<Value, ApiError> {
         let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
         let obligations = PolicyEngineObligations::new(None, &ch);
-        records_for_roles(&ch, q, &[], &PlaceholderValues::none(), &obligations, time).await
+        records_for_roles(
+            &ch,
+            q,
+            (&[], &lakehouse_bi::access::Viewer::system()),
+            &PlaceholderValues::none(),
+            &obligations,
+            time,
+        )
+        .await
     }
 
     fn bucket_query(column: &str, value: &str, grain: &str) -> RecordsQuery {
@@ -6005,6 +7559,7 @@ mod table_tiles {
             filters: None,
             grain: None,
             params: None,
+            fresh: None,
         };
         get_body(
             &ch,
@@ -6013,7 +7568,12 @@ mod table_tiles {
             &[],
             &PlaceholderValues::none(),
             &obligations,
-            (&TimeContext::default(), GrainRequest::Saved),
+            (
+                &TimeContext::default(),
+                GrainRequest::Saved,
+                &lakehouse_bi::access::Viewer::system(),
+                &tokio::sync::Semaphore::new(crate::tile_pool::TILES_PER_PROCESS),
+            ),
         )
         .await
         .expect("the payload builds")
@@ -6102,8 +7662,25 @@ mod join_rewrite;
 #[path = "bin_rewrite.rs"]
 mod bin_rewrite;
 
+// BI-16 part B: the role rewrite on the progress, histogram and bullet
+// statements; reuses the governed table and helpers of `bin_rewrite` above.
+#[cfg(test)]
+#[path = "type_b_rewrite.rs"]
+mod type_b_rewrite;
+
 // BI-11: the role rewrite on the three ways a parameter's value reaches a
 // statement; see `chart_shapes_rewrite` above.
 #[cfg(test)]
 #[path = "param_rewrite.rs"]
 mod param_rewrite;
+
+// BI-18 part C: tabs, tab ties and section tiles on the dashboard routes; see
+// `chart_shapes_rewrite` above. It uses the helpers of `typed_filters`.
+#[cfg(test)]
+#[path = "layout_tabs.rs"]
+mod layout_tabs;
+
+// BI-18 part C, part 2: what every read and write path does about the trash and
+// the personal space; the ignored tests check the clauses on the real engine.
+#[path = "organise_paths.rs"]
+mod organise_paths;

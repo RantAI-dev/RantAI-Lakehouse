@@ -1,7 +1,7 @@
 import { strict as assert } from "node:assert"
 import { test } from "node:test"
 import { ServiceError } from "@/services/errors"
-import { buildErrorDescription } from "./notify-message"
+import { buildErrorDescription, readableErrorMessage } from "./notify-message"
 
 /**
  * Mengikuti konvensi repo (`node:test` + `node:assert`, seperti
@@ -70,4 +70,52 @@ test("buildErrorDescription tetap memberi teks saat pesan error kosong", () => {
 
   // Pesan kosong tidak boleh menghasilkan toast tanpa keterangan sama sekali.
   assert.equal(description, "It may already have been deleted. Reload the list.")
+})
+
+// BI-18 part C review fix (SHOULD-FIX) R20: the API's `code: detail` text never reaches the reader.
+test("a permission_denied message shows the hint sentence alone, with no code prefix", () => {
+  const err = new ServiceError("permission_denied", "permission_denied: dashboard:write")
+  assert.equal(
+    buildErrorDescription(err),
+    "This account does not have permission. Ask a workspace admin."
+  )
+  assert.equal(
+    readableErrorMessage("permission_denied: dashboard:write"),
+    "This account does not have permission. Ask a workspace admin."
+  )
+})
+
+test("every known code prefix is dropped, and a message without one is left as it is", () => {
+  for (const code of ["not_found", "invalid_request", "unavailable", "too_many_requests"]) {
+    const text = readableErrorMessage(`${code}: something internal`)
+    assert.ok(!text.includes(`${code}:`) && !text.includes("internal"), text)
+  }
+  assert.equal(readableErrorMessage("Chart not found."), "Chart not found.")
+  assert.equal(readableErrorMessage("permissions: nothing"), "permissions: nothing")
+  assert.ok(!buildErrorDescription(new ServiceError("invalid_request", "invalid_request: x"))?.includes("invalid_request:"))
+})
+
+// BI-18 part C review fix R20 (follow-up: keep the server's sentence).
+test("a sentence after the code is shown as the server wrote it", () => {
+  assert.equal(
+    readableErrorMessage("permission_denied: Downloads are switched off for your role."),
+    "Downloads are switched off for your role."
+  )
+  assert.equal(
+    readableErrorMessage("unavailable: The PDF service is not reachable. Reference: abc."),
+    "The PDF service is not reachable. Reference: abc."
+  )
+})
+
+test("a bare permission id or a fragment after the code still reads as the generic hint", () => {
+  assert.equal(
+    readableErrorMessage("permission_denied: dashboard:write"),
+    "This account does not have permission. Ask a workspace admin."
+  )
+  assert.equal(
+    readableErrorMessage("permission_denied"),
+    "This account does not have permission. Ask a workspace admin."
+  )
+  // A space but no closing full stop is not taken for a sentence.
+  assert.ok(!readableErrorMessage("not_found: row 12 in table x").includes("row 12"))
 })

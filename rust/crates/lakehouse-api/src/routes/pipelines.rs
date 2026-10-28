@@ -5,6 +5,18 @@
 //! Ports `src/app/api/pipelines/route.ts`,
 //! `src/app/api/pipelines/[id]/runs/route.ts`, and
 //! `src/app/api/pipelines/[id]/trigger/route.ts`.
+//!
+//! # Target lag: read here, decided elsewhere
+//!
+//! This module serialises a pipeline's target lag (`targetLag`, plan D2)
+//! and attaches the `lag` measurement the console shows (plan D8), but it
+//! decides nothing about it: every "is it fresh enough, run or wait"
+//! question is answered once, in [`crate::pipeline_lag`], from the
+//! orchestrator's lag-check route. The list therefore reads the state
+//! table once for every lag pipeline it is returning instead of asking
+//! per pipeline, and the list payload and the detail payload cannot drift
+//! apart over what "behind" means, because neither of them is what
+//! decides it.
 
 use axum::Extension;
 use axum::body::Bytes;
@@ -187,7 +199,55 @@ async fn list_body(
             all_tenants,
         };
         let authored = pipelines::list_pipelines(pg, &filter).await?;
-        pipelines.extend(authored.iter().filter_map(|p| serde_json::to_value(p).ok()));
+        // BLD-2 plan D8: `targetLag` rides on the serialized row; `lag` is
+        // added here because it is a MEASUREMENT the check writes, and one
+        // read of many pipelines' state is one query (`AC5` makes it
+        // visible on the list too, not only on the page). Both store reads
+        // propagate: a swallowed failure would report every lag pipeline as
+        // "no check has run", which is a different and wrong claim.
+        let lag_ids: Vec<&str> = authored
+            .iter()
+            .filter(|p| p.target_lag.is_some())
+            .map(|p| p.id.as_str())
+            .collect();
+        let lag_states = pipelines::list_lag_states(pg, &lag_ids).await?;
+        let no_readers = crate::pipeline_lag::downstream_without_readers(pg, &authored).await?;
+        // BLD-2 review R5 SHOULD-FIX 1: the whole list's chain walks share
+        // ONE connection and the stop answers come from the `lag_states`
+        // map above — a per-row walk plus a per-upstream state read used
+        // to multiply the round trips by rows.
+        let upstream_stops =
+            crate::pipeline_lag::upstream_stops_for_list(pg, &authored, &lag_states).await?;
+        let now = time::OffsetDateTime::now_utc();
+        for p in &authored {
+            if let Ok(mut val) = serde_json::to_value(p) {
+                if let Value::Object(obj) = &mut val {
+                    // BLD-2 review R4 BLOCKER 1 (a) / decision R16 + R5
+                    // decision R18: the answer comes from the SAME chain the
+                    // check walks, and the walk stops where the check's own
+                    // upstream evaluation stops — first open request, deepest
+                    // first — not from `dependsOn` alone. A pipeline with no
+                    // target lag is never shown a `lag` object, and its chain
+                    // was not walked either, so it has no entry in
+                    // `upstream_stops` at all.
+                    let upstream_stop = upstream_stops
+                        .get(&p.id)
+                        .and_then(std::option::Option::as_ref);
+                    obj.insert(
+                        "lag".to_owned(),
+                        crate::pipeline_lag::lag_json(
+                            p.target_lag,
+                            lag_states.get(&p.id),
+                            now,
+                            no_readers.contains(&p.id),
+                            i32::from(p.max_retries),
+                            upstream_stop,
+                        ),
+                    );
+                }
+                pipelines.push(val);
+            }
+        }
     }
     match dagster_jobs_refused {
         None => Ok(json!({ "pipelines": pipelines })),
@@ -250,6 +310,8 @@ fn dagster_pipeline_row(
         "slaOk": sla_ok.map_or(Value::Null, Value::Bool),
         "late": late_value.map_or(Value::Null, Value::Bool),
         "freshnessLagSeconds": Value::Null,
+        "targetLag": Value::Null,
+        "lag": Value::Null,
     })
 }
 
@@ -958,6 +1020,15 @@ async fn authored_detail(
         );
         obj.insert("upstream".to_owned(), json!(upstream));
         obj.insert("downstream".to_owned(), json!(downstream));
+        // BLD-2 plan D8: the Freshness panel's `lag` object.
+        let lag = match detail_lag(pool, &pipeline).await {
+            Ok(lag) => lag,
+            Err(err) => {
+                tracing::warn!(%err, pipeline_id = %id, "authored_detail: target lag lookup failed");
+                return ApiRejection(err.into()).into_response();
+            }
+        };
+        obj.insert("lag".to_owned(), lag);
         // BLD-1 / D2: the author this pipeline reads as, by NAME. The
         // console shows "Reads as: <name>", and it cannot get that from
         // `GET /api/identity/users` -- that route is `identity:read`, which
@@ -983,6 +1054,46 @@ async fn authored_detail(
         );
     }
     (StatusCode::OK, ApiJson(body)).into_response()
+}
+
+/// BLD-2 plan D8: the `lag` object for one pipeline's detail payload —
+/// what its target is, how far behind it is, and why. Two store reads
+/// when the pipeline has a target lag (and none when it has none, which is
+/// the common case).
+///
+/// Both reads fail loudly: a swallowed error would answer "no check has
+/// run" for a pipeline that is in fact being checked every 30 seconds,
+/// which is a different and wrong claim (`BLD-2-AC5`).
+async fn detail_lag(pool: &PgPool, pipeline: &pipelines::Pipeline) -> Result<Value, StoreError> {
+    if pipeline.target_lag.is_none() {
+        return Ok(crate::pipeline_lag::lag_json(
+            None,
+            None,
+            time::OffsetDateTime::now_utc(),
+            false,
+            0,
+            None,
+        ));
+    }
+    let state = pipelines::get_lag_state(pool, &pipeline.id).await?;
+    let no_readers =
+        crate::pipeline_lag::downstream_without_readers(pool, std::slice::from_ref(pipeline))
+            .await?;
+    // BLD-2 review R4 BLOCKER 1 (a) / decision R16 + SHOULD-FIX 3:
+    // the answer comes from the SAME chain the check walks (not
+    // `dependsOn` alone) and the read propagates with `?` — the old code
+    // refused decision R16's answer: it walked `dependsOn` and swallowed
+    // every store error with `if let Ok(...)`, so a failing read silently
+    // answered "nothing is blocking this pipeline".
+    let upstream_stop = crate::pipeline_lag::upstream_stop_of(pool, pipeline).await?;
+    Ok(crate::pipeline_lag::lag_json(
+        pipeline.target_lag,
+        state.as_ref(),
+        time::OffsetDateTime::now_utc(),
+        no_readers.contains(&pipeline.id),
+        i32::from(pipeline.max_retries),
+        upstream_stop.as_ref(),
+    ))
 }
 
 /// Build the `upstream` array for `authored_detail`: one entry per id
@@ -2700,10 +2811,12 @@ pub async fn run_finished_event(
     // may deliver `connector_success`. An upload's success needs no alert.
     if load_alerts::is_connector_job(&req.job_name) {
         return Ok(ApiJson(
-            load_alerts::connector_run_event(&state, pool, &req, load_alerts::Outcome::Success)
-                .await?,
+            super::quality_load::connector_success(&state, pool, &req).await?,
         ));
     }
+    // DATA-14 (F4): an upload's success needs no alert, but its table was just
+    // loaded (followed up in the background); the answer stays "unknown jobName".
+    super::quality_load::spawn_upload(&state, &req);
     let Some(pipeline_id) = job_name_to_pipeline_id(pool, &req.job_name).await? else {
         return Ok(ApiJson(json!({
             "matched": 0,
@@ -2730,6 +2843,14 @@ pub async fn run_finished_event(
         ))
         .into());
     }
+    // DATA-13 (F2): the run is confirmed SUCCESS, so the SQL it ran becomes
+    // the pipeline's column lineage. A failed run was refused above and
+    // writes nothing.
+    super::lineage::columns::record_pipeline_run(&state, pool, &pipeline_id).await;
+    // DATA-14 (F4): the same confirmed success starts the on-load checks of
+    // the pipeline's target table, in the background; nothing here can fail
+    // this event.
+    super::quality_load::spawn_pipeline(&state, &req.run_id, &pipeline_id);
     // Plan 1f: compute the two per-run outcomes from the run's own data
     // and the pipeline's `pipeline_sla` row, then hand them to the
     // evaluator. `slow` is `None` when no duration SLA is configured
@@ -2811,6 +2932,14 @@ pub async fn run_finished_event(
 /// not loaded (marked ready while it was down, say) gets one reload; if
 /// the job is still missing, 409 says so rather than a launch error that
 /// reads like a bad job name.
+// `result_large_err` now reports `async fn`s too (clippy 1.98,
+// rust-clippy#17130). The `Err` here is a ready `Response` the route returns
+// verbatim, so boxing it would change this helper's contract and every call
+// site for an allocation only on the error path (REL-9, decision D2).
+#[allow(
+    clippy::result_large_err,
+    reason = "the Err is a ready Response the route returns verbatim; boxing it would change every call site for no gain on the success path"
+)]
 async fn authored_launch_target(state: &AppState, id: &str) -> Result<String, Response> {
     let pool = pool(state).map_err(|err| ApiRejection(err).into_response())?;
     let pipeline = pipelines::get_pipeline(pool, id)
@@ -2931,6 +3060,9 @@ pub struct CreatePipelineBody {
     /// connector picker). Must be a connector in the creator's tenant.
     #[serde(default)]
     connector_id: Option<String>,
+    /// BLD-2: target lag (plan D2, D8).
+    #[serde(default)]
+    pub target_lag: Option<lakehouse_store::pipelines::TargetLag>,
 }
 
 /// BLD-1 / D1: the `app_user` id a principal may author a pipeline as, or
@@ -3037,12 +3169,25 @@ pub async fn create(
         &others,
         &dagster_jobs,
     )?;
+    crate::routes::authored_pipelines::validate_target_lag(body.target_lag)?;
     let connector_id = body
         .connector_id
         .map(|id| id.trim().to_owned())
         .filter(|id| !id.is_empty());
     if let Some(connector_id) = connector_id.as_deref() {
         require_connector_in_tenant(pool(&state)?, connector_id, tenant_id).await?;
+        // BLD-7 / decision 2 + DEC-15: a pipeline that names a connector
+        // reads one of that connector's Bronze tables, never the source
+        // directly. Runs AFTER the tenant check, so an out-of-tenant
+        // connector keeps answering "not a connector in your tenant"
+        // whatever the source says.
+        crate::routes::authored_pipelines::validate_connector_source(
+            pool(&state)?,
+            connector_id,
+            &body.source_zone,
+            &body.source_table,
+        )
+        .await?;
     }
     let input = CreatePipelineInput {
         name: body.name,
@@ -3062,6 +3207,7 @@ pub async fn create(
         depends_on: body.depends_on,
         connector_id,
         id: Some(id),
+        target_lag: body.target_lag,
         // BLD-1 / D1: the creator is the author, so a pipeline reads as
         // the person who made it. Only a HUMAN principal gets an author:
         // `PrincipalId::Service` has no `app_user` row for the foreign
@@ -3092,7 +3238,11 @@ pub async fn create(
 /// unknown id, another tenant's connector and an unassigned one get the
 /// same answer, so this is no oracle for which connector ids exist. A
 /// creator in no tenant owns no connector, so it cannot name one.
-async fn require_connector_in_tenant(
+///
+/// `BLD-9` / decision 7 calls this from `PUT` too, with the PIPELINE's
+/// tenant (the row `in_scope` already vouched for), so an edit cannot
+/// attach a connector from another tenant.
+pub(crate) async fn require_connector_in_tenant(
     pool: &PgPool,
     connector_id: &str,
     tenant_id: Option<Uuid>,
@@ -3262,6 +3412,9 @@ pub async fn generate(
         // so no id was minted in advance — the store's default `slug_id`
         // path applies. PR #57 review F1.7.
         id: None,
+        // BLD-2 T4: same as `create` — a pipeline an LLM drafts starts
+        // with no target lag until a user or the assistant sets one.
+        target_lag: None,
         // BLD-1 / D1: the LLM proposes the SHAPE, never the identity. The
         // author is the human who asked, exactly as in `create`.
         run_as: author_id(&principal),
@@ -3707,6 +3860,12 @@ fn schedule_mutation_body(job: &DgJob, paused: bool) -> Value {
 /// `pipeline_run_pipeline_name` surfaces as 503 with the FIXED body
 /// `{"error": "orchestrator error"}` and the detail only to `tracing`
 /// (PR #80 review BLOCKER 1, AGENTS.md principle 4).
+// Same reason as `authored_launch_target` above: the `Err` is the ready
+// rejection the caller returns, not a value it inspects (REL-9, D2).
+#[allow(
+    clippy::result_large_err,
+    reason = "the Err is a ready Response the route returns verbatim; boxing it would change every call site for no gain on the success path"
+)]
 async fn enforce_run_id_pipeline_scope(
     state: &AppState,
     principal: &Principal,
@@ -5315,7 +5474,10 @@ mod tests {
                 "dispar_orchestrate/maintenance.py::run_bronze_maintenance"
             );
             assert_eq!(ops[0]["commit"], "unknown");
-            assert!(v["config"].as_array().expect("config array").is_empty());
+            assert_eq!(
+                v["config"].as_array().expect("config array").as_slice(),
+                &[] as &[serde_json::Value]
+            );
             assert!(v["definition"].is_null());
         }
 
@@ -5400,6 +5562,11 @@ mod tests {
         /// dropped: the pipeline was saved (the toast said so) but `list`,
         /// which shows only the caller's tenant, never returned it, and the
         /// connector could be deleted from under it.
+        ///
+        /// BLD-7 / decision 2: the source is now one of the connector's own
+        /// ingest targets (`conn-pg-lakehouse` loads `ingest_demo.orders`
+        /// into `orders`, migration 0034), so the create is also the proof
+        /// that naming that target is accepted.
         #[sqlx::test(migrations = "../../migrations")]
         async fn create_stores_the_authors_tenant_and_the_connector(pool: sqlx::PgPool) {
             use lakehouse_test_support as _;
@@ -5409,7 +5576,10 @@ mod tests {
                 State(state.clone()),
                 Extension(fixture_member_principal()),
                 HeaderMap::new(),
-                create_body(&json!({ "connectorId": "conn-pg-lakehouse" })),
+                create_body(&json!({
+                    "connectorId": "conn-pg-lakehouse",
+                    "sourceTable": "orders",
+                })),
             )
             .await
             .expect("create should succeed");
@@ -5434,6 +5604,134 @@ mod tests {
             assert!(
                 dependents.iter().any(|d| d.id == created.id),
                 "must depend on its connector"
+            );
+        }
+
+        /// BLD-7 / decision 2: `bronze.<one of the connector's ingest
+        /// targets>` is accepted, and the stored row keeps both the source
+        /// and the connector.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn create_accepts_a_connector_with_one_of_its_bronze_tables(pool: sqlx::PgPool) {
+            use lakehouse_test_support as _;
+
+            let state = pg_state_for(&pool);
+            let (status, ApiJson(created)) = create(
+                State(state),
+                Extension(fixture_member_principal()),
+                HeaderMap::new(),
+                create_body(&json!({
+                    "connectorId": "conn-pg-lakehouse",
+                    "sourceTable": "orders",
+                })),
+            )
+            .await
+            .expect("a Bronze table the connector loads should be accepted");
+
+            assert_eq!(status, StatusCode::CREATED);
+            assert_eq!(created.source, "bronze.orders");
+            assert_eq!(created.connector_id.as_deref(), Some("conn-pg-lakehouse"));
+        }
+
+        /// BLD-7 / decision 2: a non-Bronze source is refused with the one
+        /// fixed sentence that names the tables the connector does load,
+        /// and nothing is stored.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn create_refuses_a_non_bronze_source_for_a_connector(pool: sqlx::PgPool) {
+            use lakehouse_test_support as _;
+
+            let state = pg_state_for(&pool);
+            let err = create(
+                State(state),
+                Extension(fixture_member_principal()),
+                HeaderMap::new(),
+                create_body(&json!({
+                    "connectorId": "conn-pg-lakehouse",
+                    "sourceZone": "silver",
+                    "sourceTable": "orders",
+                })),
+            )
+            .await
+            .expect_err("a silver source with a connector must be refused");
+
+            assert_eq!(err.0.status(), 400);
+            let message = err.0.to_string();
+            assert!(
+                message.contains("reads one of that connector's Bronze tables"),
+                "the refusal says what to pick, got: {message}"
+            );
+            assert!(
+                message.contains("orders"),
+                "the refusal lists the connector's own table, got: {message}"
+            );
+            let listed = pipelines::list_pipelines(
+                &pool,
+                &pipelines::PipelineFilter {
+                    tenant_id: Some(SEED_TENANT.parse().unwrap()),
+                    all_tenants: false,
+                },
+            )
+            .await
+            .unwrap();
+            assert!(
+                listed
+                    .iter()
+                    .all(|p| !p.name.starts_with("tenant-route-test-")),
+                "a refused create stores nothing"
+            );
+        }
+
+        /// BLD-7 / decision 2: a Bronze table the connector does not load
+        /// is refused the same way.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn create_refuses_a_bronze_table_the_connector_does_not_load(pool: sqlx::PgPool) {
+            use lakehouse_test_support as _;
+
+            let state = pg_state_for(&pool);
+            let err = create(
+                State(state),
+                Extension(fixture_member_principal()),
+                HeaderMap::new(),
+                create_body(&json!({
+                    "connectorId": "conn-pg-lakehouse",
+                    "sourceTable": "some_other_table",
+                })),
+            )
+            .await
+            .expect_err("a table outside the connector's targets must be refused");
+
+            assert_eq!(err.0.status(), 400);
+            assert!(
+                err.0
+                    .to_string()
+                    .contains("reads one of that connector's Bronze tables"),
+                "the refusal is the same fixed sentence"
+            );
+        }
+
+        /// BLD-7 / decision 2: a connector that has not loaded anything yet
+        /// (`conn-s3-warehouse` ships with an empty `source_objects`,
+        /// migration 0034) says so, instead of pretending it has a table.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn create_refuses_a_connector_with_no_ingest_targets(pool: sqlx::PgPool) {
+            use lakehouse_test_support as _;
+
+            let state = pg_state_for(&pool);
+            let err = create(
+                State(state),
+                Extension(fixture_member_principal()),
+                HeaderMap::new(),
+                create_body(&json!({
+                    "connectorId": "conn-s3-warehouse",
+                    "sourceTable": "anything",
+                })),
+            )
+            .await
+            .expect_err("a connector with no tables cannot be a source yet");
+
+            assert_eq!(err.0.status(), 400);
+            assert_eq!(
+                err.0.to_string(),
+                crate::routes::authored_pipelines::CONNECTOR_HAS_NO_TABLES
             );
         }
 
@@ -5916,8 +6214,10 @@ mod tests {
                     depends_on: Vec::new(),
                     connector_id: None,
                     id: None,
-                    run_as: None,
+                    // BLD-2: this fixture is not about a target lag.
+                    target_lag: None,
                     // BLD-1 / D1: no author — these fixtures never reach the orchestrator.
+                    run_as: None,
                 },
                 None,
             )
@@ -6266,7 +6566,10 @@ mod tests {
             // "failed", never the raw Dagster string.
             assert_eq!(steps[0]["status"], "failed");
             assert!(steps[0]["startMs"].is_number());
-            assert!(steps[0]["materializations"].as_array().unwrap().is_empty());
+            assert_eq!(
+                steps[0]["materializations"].as_array().unwrap().as_slice(),
+                &[] as &[serde_json::Value]
+            );
         }
 
         #[tokio::test]
@@ -8490,8 +8793,10 @@ mod tests {
                     depends_on: Vec::new(),
                     connector_id: None,
                     id: Some(id.clone()),
-                    run_as: None,
+                    // BLD-2: this fixture is not about a target lag.
+                    target_lag: None,
                     // BLD-1 / D1: no author — these fixtures never reach the orchestrator.
+                    run_as: None,
                 },
                 None,
             )
@@ -8989,9 +9294,12 @@ mod tests {
         /// the caller sent a non-object (or no body at all).
         #[test]
         fn top_level_keys_for_non_objects_is_empty() {
-            assert!(top_level_keys(&Value::Null).is_empty());
-            assert!(top_level_keys(&json!([])).is_empty());
-            assert!(top_level_keys(&json!("string")).is_empty());
+            assert_eq!(top_level_keys(&Value::Null), [] as [std::string::String; 0]);
+            assert_eq!(top_level_keys(&json!([])), [] as [std::string::String; 0]);
+            assert_eq!(
+                top_level_keys(&json!("string")),
+                [] as [std::string::String; 0]
+            );
         }
     }
 
@@ -9323,11 +9631,15 @@ mod tests {
                 "the retry for the same (run, kind) is deduped away"
             );
 
-            let rows: Vec<(String, String, String)> =
-                sqlx::query_as("SELECT run_id, pipeline_id, kind FROM pipeline_run_event")
-                    .fetch_all(&pool)
-                    .await
-                    .expect("read the dedupe table");
+            // DATA-14 (F4): the load's quality follow-up is deduped in this table
+            // too, in the background; this test is about the alert kinds.
+            let rows: Vec<(String, String, String)> = sqlx::query_as(
+                "SELECT run_id, pipeline_id, kind FROM pipeline_run_event \
+                 WHERE kind <> 'quality_load'",
+            )
+            .fetch_all(&pool)
+            .await
+            .expect("read the dedupe table");
             assert_eq!(
                 rows,
                 vec![(
@@ -9426,8 +9738,10 @@ mod tests {
                 depends_on: Vec::new(),
                 connector_id: None,
                 id: None,
-                run_as: None,
+                // BLD-2: this fixture is not about a target lag.
+                target_lag: None,
                 // BLD-1 / D1: no author — these fixtures never reach the orchestrator.
+                run_as: None,
             }
         }
 
@@ -10495,8 +10809,10 @@ mod tests {
                 depends_on,
                 connector_id: None,
                 id: None,
-                run_as: None,
+                // BLD-2: this fixture is not about a target lag.
+                target_lag: None,
                 // BLD-1 / D1: no author — these fixtures never reach the orchestrator.
+                run_as: None,
             }
         }
 

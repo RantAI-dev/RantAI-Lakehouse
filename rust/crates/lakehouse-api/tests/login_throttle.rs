@@ -273,7 +273,7 @@ async fn a_storage_failure_during_login_is_not_rendered_or_counted_as_a_wrong_pa
 
 #[tokio::test]
 async fn an_expired_lock_lets_the_correct_password_through_again() {
-    let TestApp { router, pool } = spin_up_with_env(&env_with(MAX_FAILURES, "1")).await;
+    let TestApp { router, pool } = spin_up_with_env(&env_with(MAX_FAILURES, "300")).await;
     seed_password_identity(&pool).await;
 
     let resp = login(&router, THROTTLED_EMAIL, WRONG_PASSWORD).await;
@@ -283,9 +283,20 @@ async fn an_expired_lock_lets_the_correct_password_through_again() {
     let resp = login(&router, THROTTLED_EMAIL, REAL_PASSWORD).await;
     assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
 
-    // LOGIN_LOCKOUT_SECS=1: wait out the lock plus a margin for the
-    // one-second granularity of the locked_until comparison.
-    tokio::time::sleep(std::time::Duration::from_millis(1300)).await;
+    // SEC-49 (PR #236 CI): the lock used to last one second and the test
+    // slept it out, but the second wrong try hashes with Argon2 AFTER the
+    // lock is set, so on a slow runner the lock expired before the 429
+    // check above. The lock is now long (so the refusal cannot race the
+    // clock) and expiry is made by moving `locked_until` into the past:
+    // the product still decides by comparing it to the clock, and nothing
+    // in the lock behaviour is loosened.
+    sqlx::query(
+        "UPDATE login_throttle SET locked_until = now() - interval '1 second' \
+         WHERE locked_until IS NOT NULL",
+    )
+    .execute(&pool)
+    .await
+    .expect("expire the lock");
 
     let resp = login(&router, THROTTLED_EMAIL, REAL_PASSWORD).await;
     assert_eq!(
@@ -293,4 +304,42 @@ async fn an_expired_lock_lets_the_correct_password_through_again() {
         StatusCode::OK,
         "a correct password after the lock expires must sign in"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn twenty_concurrent_wrong_logins_let_at_most_the_limit_reach_the_password_check() {
+    // SEC-49: a 401 is only produced after the password verifier ran, a 429
+    // never reaches it. So the number of 401s is the number of tries that
+    // were hashed; it must not exceed the limit however many arrive at once.
+    const LIMIT: usize = 5;
+    let TestApp { router, pool } = spin_up_with_env(&env_with("5", "300")).await;
+    seed_password_identity(&pool).await;
+
+    let mut handles = Vec::new();
+    for _ in 0..20 {
+        let router = router.clone();
+        handles.push(tokio::spawn(async move {
+            login(&router, THROTTLED_EMAIL, WRONG_PASSWORD)
+                .await
+                .status()
+        }));
+    }
+    let mut verified = 0;
+    let mut refused = 0;
+    for handle in handles {
+        match handle.await.expect("login task") {
+            StatusCode::UNAUTHORIZED => verified += 1,
+            StatusCode::TOO_MANY_REQUESTS => refused += 1,
+            other => panic!("unexpected status {other}"),
+        }
+    }
+    assert_eq!(
+        verified, LIMIT,
+        "only the first {LIMIT} tries may be hashed"
+    );
+    assert_eq!(refused, 20 - LIMIT);
+
+    // The correct password is refused for the lock's lifetime.
+    let resp = login(&router, THROTTLED_EMAIL, REAL_PASSWORD).await;
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
 }

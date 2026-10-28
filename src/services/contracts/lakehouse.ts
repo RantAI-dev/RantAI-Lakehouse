@@ -81,6 +81,12 @@ export type LakehouseSnapshot = {
   // Iceberg snapshot operation — known values widened with `| string` since
   // the catalog is free to report an operation this contract doesn't list.
   operation: "append" | "replace" | "overwrite" | "delete" | string
+  /**
+   * Who made the commit, where the product recorded it (the snapshot summary
+   * key `rantai.author`, `DATA-15`); `null` where it did not — a load written
+   * through `dlt` records none — and the page then says "unknown".
+   */
+  author: string | null
   summary: LakehouseSnapshotSummary
 }
 

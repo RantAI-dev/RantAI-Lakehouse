@@ -5,7 +5,7 @@
 | Module | Data (Sources) |
 | Backlog | `SRC-6` |
 | Spec | `docs/core/specs/src-6.md` (no *(proposed)* numbers; the decisions below are about behaviour) |
-| Status | Decisions signed 2026-10-08. In Acceptance: merged in #101 on 2026-10-12, CI green; checklist not run |
+| Status | Released (accepted 2026-10-23). Decisions signed 2026-10-08; merged in #101 on 2026-10-12, CI green |
 | Plan | `docs/superpowers/plans/2026-10-08-src-6-broken-connectors.md` |
 
 ## Problem
@@ -39,7 +39,10 @@ Found by reading the code on 2026-10-08; evidence is in the plan, section 2.
 - Testing public AWS S3 with no endpoint set (Decision 3).
 - Making Google Sheets work.
 - Table discovery for these types: `SRC-13`. Gate tests for them: `SRC-9`.
-- New connector types: `SRC-3`.
+- New connector types: `SRC-3`, built later in #216; the eight business-app
+  types it makes supported are tested from the console (a real call to the
+  vendor, or "not testable" with the reason), see
+  `business-app-connectors.md`.
 
 ## Asking the assistant
 
@@ -65,8 +68,13 @@ All seven defaults signed by the product owner on 2026-10-08 ("run everything as
 
 - Oracle, MongoDB, Kafka and SFTP connectors cannot be tested from the
   console. A wrong credential shows on the first load, not on save.
+- A MongoDB source must run MongoDB 4.4 or later: the driver (`pymongo`
+  4.18, `SEC-52`) no longer supports 4.0 and 4.2.
 - An object-storage connector is tested only when it has an endpoint.
 - Google Sheets is not available.
+- Business-app connectors (`SRC-3`): the eight supported types are tested
+  from the console against the vendor; Workday Reports and NetSuite appear as
+  not available, with the reason that they wait for a test on a real account.
 
 ## Acceptance checklist
 
@@ -74,25 +82,25 @@ Run on a real deployment. Mark each Pass, Fail, or Not run with the reason.
 
 | # | Do this | Expect | Result |
 | --- | --- | --- | --- |
-| 1 | Create an object-storage connector in the wizard: endpoint, bucket, access key, secret key | Created; the test shows connected | |
-| 2 | Edit it; enter a wrong secret key; save | Refused with a plain message; the test still passes with the old keys | |
-| 3 | Edit it; enter the right keys again; save | Saved and tested | |
-| 4 | Create an object-storage connector with no endpoint | Created; the test says it cannot be tested without an endpoint | |
-| 5 | Edit an Oracle connector; change the password; save | Saved; the page says it was not tested | |
-| 6 | Press Test on an Oracle, a MongoDB, a Kafka and an SFTP connector | Each says it cannot be tested from the console; health does not turn red | |
-| 7 | Open the connector picker | Google Sheets is dimmed, shows its reason, cannot be picked | |
-| 8 | Open Sources | The header does not mention SaaS or federation | |
-| 9 | As a user without `connector:manage`, try steps 1 and 5 | Refused | |
-| 10 | Point an object-storage connector at an endpoint that is down; test | A plain failure message with no address or server text in it | |
+| 1 | Create an object-storage connector in the wizard: endpoint, bucket, access key, secret key | Created; the test shows connected | Pass 2026-10-23 (product owner) |
+| 2 | Edit it; enter a wrong secret key; save | Refused with a plain message; the test still passes with the old keys | Pass 2026-10-23 (product owner) |
+| 3 | Edit it; enter the right keys again; save | Saved and tested | Pass 2026-10-23 (product owner) |
+| 4 | Create an object-storage connector with no endpoint | Created; the test says it cannot be tested without an endpoint | Pass 2026-10-23 (product owner) |
+| 5 | Edit an Oracle connector; change the password; save | Saved; the page says it was not tested | Pass 2026-10-23 (product owner) |
+| 6 | Press Test on an Oracle, a MongoDB, a Kafka and an SFTP connector | Each says it cannot be tested from the console; health does not turn red | Pass 2026-10-23 (product owner) |
+| 7 | Open the connector picker | Google Sheets is dimmed, shows its reason, cannot be picked | Pass 2026-10-23 (product owner) |
+| 8 | Open Sources | The header names business apps (since `SRC-3`) and does not mention federation | Pass 2026-10-23 (product owner), on main `0e5498d2`, where the header named neither SaaS nor federation; the business-app wording came with `SRC-3` after this run and is checked in its acceptance |
+| 9 | As a user without `connector:manage`, try steps 1 and 5 | Refused | Pass 2026-10-23 (product owner) |
+| 10 | Point an object-storage connector at an endpoint that is down; test | A plain failure message with no address or server text in it | Pass 2026-10-23 (product owner) |
 
 Pre-merge check, 2026-10-12, product owner, on a separate instance built from PR #101 at `f9d488f` (own database; the shared orchestrator, so no run could be started): the screens were reported as conforming ("QA sudah sesuai"). The instance afterwards held one object-storage connector made in the wizard with an endpoint, tested and healthy (rows 1, 7, 8). It held no Oracle connector, so rows 5 and 6 left no trace there. Rows 3, 9 and 10 were not in the check. This is not the acceptance run: the table above is filled on a real deployment.
 
-**Accepted by:** __________ **Date:** ______ **Build:** ______
+**Accepted by:** product owner (held in the base) **Date:** 2026-10-23 **Build:** main 0e5498d2
 
 Exceptions, each with an owner and a date:
 
 ## After acceptance
 
 - [ ] `PRODUCT.md` section 2 and 3 updated
-- [ ] `BACKLOG.md` item moved to Done; follow-ups added
+- [x] `BACKLOG.md` item moved to Done; follow-ups added
 - [ ] `CHANGELOG.md` entry a customer can read

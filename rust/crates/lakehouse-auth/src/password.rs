@@ -76,7 +76,12 @@ pub fn hash_password(password: &Secret) -> Result<Secret, AuthError> {
 /// [`verify`] (the caller that matters for non-enumeration) always calls
 /// this exactly once per attempt regardless of whether the identity was
 /// found, per the module doc comment.
-fn verify_password(password: &Secret, hash: &str) -> bool {
+///
+/// `pub` since `BI-19` part A: a public link's password is checked with the
+/// same `Argon2id` verifier and the same hash format as a login (plan D4, AGENTS
+/// rule 4: one helper, not a second one in `lakehouse-api`).
+#[must_use]
+pub fn verify_hash(password: &Secret, hash: &str) -> bool {
     let Ok(parsed) = PasswordHash::new(hash) else {
         return false;
     };
@@ -190,11 +195,11 @@ pub async fn verify(
         // No such identity: verify against the dummy hash anyway, so this
         // branch costs the same as a real verification, then fail exactly
         // as a wrong password would.
-        let _ = verify_password(password, DUMMY_HASH);
+        let _ = verify_hash(password, DUMMY_HASH);
         return Err(AuthError::InvalidCredentials);
     };
 
-    if !verify_password(password, &stored_hash) {
+    if !verify_hash(password, &stored_hash) {
         return Err(AuthError::InvalidCredentials);
     }
 
@@ -249,22 +254,19 @@ mod tests {
     fn a_freshly_hashed_password_verifies_against_its_own_hash() {
         let password = Secret::new("correct horse battery staple");
         let hash = hash_password(&password).unwrap();
-        assert!(verify_password(&password, hash.expose()));
+        assert!(verify_hash(&password, hash.expose()));
     }
 
     #[test]
     fn the_wrong_password_does_not_verify() {
         let password = Secret::new("correct horse battery staple");
         let hash = hash_password(&password).unwrap();
-        assert!(!verify_password(
-            &Secret::new("wrong password"),
-            hash.expose()
-        ));
+        assert!(!verify_hash(&Secret::new("wrong password"), hash.expose()));
     }
 
     #[test]
     fn a_malformed_stored_hash_fails_closed_rather_than_panicking() {
-        assert!(!verify_password(
+        assert!(!verify_hash(
             &Secret::new("anything"),
             "not-a-valid-phc-hash"
         ));
@@ -278,15 +280,15 @@ mod tests {
         let first = hash_password(&password).unwrap();
         let second = hash_password(&password).unwrap();
         assert_ne!(first.expose(), second.expose());
-        assert!(verify_password(&password, first.expose()));
-        assert!(verify_password(&password, second.expose()));
+        assert!(verify_hash(&password, first.expose()));
+        assert!(verify_hash(&password, second.expose()));
     }
 
     #[test]
     fn the_dummy_hash_constant_is_a_well_formed_argon2_phc_string() {
         // If this ever fails to parse, the non-enumeration guarantee in
         // `verify` silently degrades to "unknown user fails fast" — pin the
-        // constant down explicitly rather than relying on `verify_password`
+        // constant down explicitly rather than relying on `verify_hash`
         // returning `false` for both a bad hash and a bad password to hide
         // the difference.
         assert!(PasswordHash::new(DUMMY_HASH).is_ok());
@@ -304,16 +306,13 @@ mod tests {
 
     #[test]
     fn a_hash_from_before_the_argon2_0_6_bump_still_verifies() {
-        assert!(verify_password(
+        assert!(verify_hash(
             &Secret::new(PRE_BUMP_PASSWORD),
             PRE_BUMP_ARGON2_HASH
         ));
         // And the non-enumeration guarantee still holds: a wrong password
         // against that same pre-existing hash still fails.
-        assert!(!verify_password(
-            &Secret::new("wrong"),
-            PRE_BUMP_ARGON2_HASH
-        ));
+        assert!(!verify_hash(&Secret::new("wrong"), PRE_BUMP_ARGON2_HASH));
     }
 
     #[test]

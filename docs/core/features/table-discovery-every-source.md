@@ -6,7 +6,7 @@
 | Backlog | `SRC-13` |
 | Kind | Feature |
 | Spec | `docs/core/specs/src-13.md`. This page follows it row by row; anything the spec does not say is under "Beyond the spec". One *(proposed)* number, decision 9 |
-| Status | Building, in #144 (the one pull request for the rest of Phase 1). Decisions signed 2026-10-14; built and proven by its gates on 2026-10-15. Product owner's browser check on the QA instance passed on 2026-10-16 (the screens only: runs, loads, secret-manager references and OAuth sign-in were not reachable there and are proven by the CI gates) |
+| Status | Released (accepted 2026-10-23). Built in #144 (the one pull request for the rest of Phase 1). Decisions signed 2026-10-14; built and proven by its gates on 2026-10-15. Product owner's browser check on the QA instance passed on 2026-10-16 (the screens only: runs, loads, secret-manager references and OAuth sign-in were not reachable there and are proven by the CI gates) |
 | Plan | `docs/superpowers/plans/2026-10-15-src-13-table-discovery.md` |
 
 ## Problem
@@ -92,6 +92,14 @@ beyond the spec. The planner's recommendation is the Default.
 - For MongoDB, Kafka, SFTP and Oracle the listing runs as a short job and
   takes some seconds longer than for the other sources.
 - A file listing stops at 10,000 files; a narrower glob finds the rest.
+- Business-app connectors (`SRC-3`) list the vendor's objects through the
+  same short job (the vendor's own list where it has one, a suggested list
+  where it does not, such as ServiceNow, NetSuite and Dynamics 365 tables you
+  can also name). Columns are shown before choosing for Salesforce, HubSpot,
+  ServiceNow, Dynamics 365 and Google Analytics 4 (the vendor describes its
+  fields); for Zendesk, Confluence, SharePoint, Workday Reports and NetSuite
+  the preview answers "not supported" and the columns appear after the first
+  load. Gate-tested against mock vendors only.
 
 ## Acceptance checklist
 
@@ -100,21 +108,22 @@ run with the reason. Rows 1 and 2 are the spec's checklist, in its order.
 
 | # | Do this | Expect | Result |
 | --- | --- | --- | --- |
-| 1 | Spec `SRC-13-AC1`: for each connector type in the picker, press "Find tables" | The picker lists what exists at the source | |
-| 2 | Spec `SRC-13-AC2`: as a user without `connector:manage`, list tables; and list from a source that is down | Refused; the failure shows an honest message with no source error text | |
-| 3 | Open a listed table of each type | Its columns and types, marked "inferred from a sample" where they are | |
-| 4 | List a bucket with a glob that matches some files | Only those files, with size and date | |
-| 5 | Pick one endpoint of a REST connector with two, and run | Only that endpoint is loaded | |
-| 6 | Pick a Kafka topic | The connector reads that topic at its next run | |
-| 7 | List a PostgreSQL schema of 10,000 tables and search for one | The list arrives within 2 minutes; the search finds it | |
-| 8 | Add an Oracle table by name | Saved, and loaded at the next run | |
+| 1 | Spec `SRC-13-AC1`: for each connector type in the picker, press "Find tables" | The picker lists what exists at the source | Pass 2026-10-23 (product owner) |
+| 2 | Spec `SRC-13-AC2`: as a user without `connector:manage`, list tables; and list from a source that is down | Refused; the failure shows an honest message with no source error text | Pass 2026-10-23 (product owner) |
+| 3 | Open a listed table of each type | Its columns and types, marked "inferred from a sample" where they are | Pass 2026-10-23 (product owner) |
+| 4 | List a bucket with a glob that matches some files | Only those files, with size and date | Pass 2026-10-23 (product owner) |
+| 5 | Pick one endpoint of a REST connector with two, and run | Only that endpoint is loaded | Pass 2026-10-23 (product owner) |
+| 6 | Pick a Kafka topic | The connector reads that topic at its next run | Pass 2026-10-23 (product owner) |
+| 7 | List a PostgreSQL schema of 10,000 tables and search for one | The list arrives within 2 minutes; the search finds it | Pass 2026-10-23 (product owner) |
+| 8 | Add an Oracle table by name | Saved, and loaded at the next run | Pass 2026-10-23 (product owner) |
+| 9 | `SRC-3`: press "Find tables" on a supported business-app connector (for example HubSpot) | The vendor's objects are listed; a preview shows columns where the vendor describes them, and says "not supported" where it does not || Not run here: added by `SRC-3` after this run; checked in `SRC-3`'s acceptance |
 
-**Accepted by:** __________ **Date:** ______ **Build:** ______
+**Accepted by:** product owner (held in the base) **Date:** 2026-10-23 **Build:** main 0e5498d2
 
 Exceptions, each with an owner and a date:
 
 ## After acceptance
 
 - [ ] `PRODUCT.md` section 2 and 3 updated
-- [ ] `BACKLOG.md` item moved to Released; follow-ups added
+- [x] `BACKLOG.md` item moved to Released; follow-ups added
 - [ ] `CHANGELOG.md` entry a customer can read

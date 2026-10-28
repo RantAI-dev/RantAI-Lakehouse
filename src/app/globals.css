@@ -7,6 +7,15 @@
 @import "../../design-system/globals.css";
 
 /*
+ * BI-17 part A (D6): a dashboard fixed to the light theme inside a dark
+ * console. `design-system/tokens/colors.css` gives `.theme-light` the light
+ * tokens (one definition, not a copy); this stops the `dark:` variants of
+ * Tailwind from matching just because an ancestor, the console's <html>, is
+ * dark.
+ */
+@custom-variant dark (&:is(.dark *):not(:is(.theme-light *)));
+
+/*
  * Tailwind v4 wraps every `hover:` (and so `group-hover:`) in
  * `@media (hover: hover)`, so browsers that report no hover capability,
  * such as touchscreen laptops and some Linux or remote-desktop setups, get
@@ -153,6 +162,8 @@
     min-height: 0 !important;
   }
   .dash-canvas > .dash-canvas-grid { display: none !important; } /* garis grid */
+  /* BI-1: each tab of the PDF print view after the first starts a new page. */
+  .render-tab-break { break-before: page; }
   .dash-tile {
     position: static !important;
     left: auto !important; top: auto !important;

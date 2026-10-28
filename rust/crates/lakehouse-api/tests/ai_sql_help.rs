@@ -18,7 +18,10 @@ use tower::ServiceExt;
 use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use common::{TestApp, session_cookie_for_seeded_user, spin_up_with_env};
+use common::{
+    TestApp, create_principal_with_permissions, session_cookie_for_seeded_user,
+    session_cookie_for_user, spin_up_with_env,
+};
 
 /// One model round: the given text and tool calls, as an OpenAI-compatible
 /// `/chat/completions` response.
@@ -352,6 +355,13 @@ async fn with_the_switch_off_a_direct_tool_call_is_refused_and_runs_nothing() {
 // above is untouched, because none of the six is in `ALWAYS` (five are writes,
 // and the read-only `set_board_view_filters` is routed in by the dashboard
 // domain's own word list, which the test's turn does not match).
+//
+// Updated by hand for `BI-5` review S9 (PR #245 CI): the Ask suffix now ends
+// with the `limits_and_freshness!` sentences (`get_query_limits`, `stop_query`,
+// `computedAt`), so a person in Ask mode can be told their limits. The new hash
+// is the old bytes plus exactly those sentences (hashing the prompt with that
+// text removed gives the previous pin f59505f7...). The AI team reviews the
+// sentences (Assistant parity).
 const OFFERED_WITHOUT_ALLOWLIST: &[&str] = &[
     "ask_user",
     "describe_dataset",
@@ -371,7 +381,7 @@ const OFFERED_WITHOUT_ALLOWLIST: &[&str] = &[
     "run_sql",
 ];
 const SYSTEM_SHA256_WITHOUT_ALLOWLIST: &str =
-    "f59505f7a7fff527cbb8a25e44b7a86b37f62868746c86f14881cddfcf5cfb68";
+    "45c0fcda7b755bbcb6eb7fa7bb48df1f724b6be61b5738546c55c41fabbe006b";
 
 fn sha256_hex(text: &str) -> String {
     use std::fmt::Write as _;
@@ -656,4 +666,59 @@ async fn the_explain_sentence_inside_a_comment_does_not_end_the_offer() {
     assert_eq!(status, StatusCode::OK);
     let (names, _) = first_model_request(&llm).await;
     assert!(names.contains(&"propose_sql".to_owned()), "{names:?}");
+}
+
+/// Sends one chat turn as a fresh user who holds exactly `permissions`, and
+/// returns the system prompt the model received and the statements that
+/// reached `ClickHouse`.
+async fn system_prompt_for_user_holding(permissions: &str) -> (String, Vec<String>) {
+    let llm = mock_model(vec![model_round(Some("Hi."), &[])]).await;
+    let ch = mock_clickhouse(ResponseTemplate::new(200)).await;
+    let mut env = std::collections::HashMap::new();
+    env.insert("LLM_URL".to_owned(), llm.uri());
+    env.insert("CH_URL".to_owned(), ch.uri());
+    let TestApp { router, pool } = spin_up_with_env(&env).await;
+    let user = create_principal_with_permissions(&pool, permissions).await;
+    let cookie = session_cookie_for_user(&pool, user).await;
+    let body = json!({ "messages": [{ "role": "user", "content": "berapa tamu bulan ini?" }] });
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/ai/chat")
+                .header("content-type", "application/json")
+                .header("cookie", &cookie)
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let (_, system) = first_model_request(&llm).await;
+    (system, statements(&ch).await)
+}
+
+/// The refusal text a caller without `catalog:read` gets in place of the
+/// DATA MAP (SEC-24).
+const MAP_NEEDS_CATALOG_READ: &str = "(withheld: reading the data map needs catalog:read)";
+
+#[tokio::test]
+async fn a_user_without_catalog_read_gets_no_data_map_and_the_warehouse_is_not_asked() {
+    let (system, sent) = system_prompt_for_user_holding("dashboard:read").await;
+
+    assert!(system.contains(MAP_NEEDS_CATALOG_READ), "{system}");
+    assert!(
+        sent.iter().all(|s| !s.contains("system.")),
+        "the DATA MAP was built for a caller who may not read it: {sent:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_user_with_catalog_read_is_not_refused_the_data_map_for_a_missing_permission() {
+    // The seeded test database has several tenants, so the shared-catalog
+    // rule may still withhold the map with its own reason. The check here is
+    // that the permission is not what refuses this caller.
+    let (system, _) = system_prompt_for_user_holding("catalog:read").await;
+
+    assert!(!system.contains(MAP_NEEDS_CATALOG_READ), "{system}");
 }

@@ -42,6 +42,14 @@
 //! has width 1. Edges are multiples of the width, so `visitors` in bins of 500
 //! reads `0, 500, 1000, ...`.
 //!
+//! A histogram (`BI-16` part B) is cut differently, `BI-18` part C review fix
+//! (SHOULD-FIX) R21: a number of ranges is honoured ([`exact_width`]: the width
+//! is `(max - min) / n` rounded up to two significant digits), and automatic
+//! picks the nice width (1, 2, 2.5 or 5 times a power of ten) whose number of
+//! ranges is closest to 20 ([`nearest_nice_width`]). Edges are still multiples
+//! of the width, so alignment can cost one range over `n` when the minimum is
+//! not a multiple of it.
+//!
 //! # Grid
 //!
 //! A grid cell is `size` degrees square. [`grid_points_sql`] groups the
@@ -178,6 +186,14 @@ pub enum BinMode {
     Count(u32),
     /// Bins of exactly this width.
     Width(f64),
+    /// A histogram's number of ranges, honoured: this many equal ranges over
+    /// the shown minimum to maximum, the width rounded up to two significant
+    /// digits ([`exact_width`]). `BI-18` part C review fix (SHOULD-FIX) R21.
+    Ranges(u32),
+    /// A histogram left to choose: the nice width (1, 2, 2.5 or 5 times a
+    /// power of ten) whose number of ranges is closest to this many
+    /// ([`nearest_nice_width`]). `BI-18` part C review fix (SHOULD-FIX) R21.
+    Nearest(u32),
 }
 
 impl BinSpec {
@@ -228,6 +244,11 @@ pub enum WidthRule {
     Fixed(String),
     /// The smallest round width giving at most this many bins.
     Nice(u32),
+    /// This many ranges over the minimum to maximum, the width rounded up to
+    /// two significant digits.
+    Exact(u32),
+    /// The nice width whose ranges are closest in number to this.
+    Nearest(u32),
 }
 
 impl BinMode {
@@ -237,6 +258,8 @@ impl BinMode {
         match self {
             Self::Auto => WidthRule::Nice(AUTO_BINS),
             Self::Count(n) => WidthRule::Nice(n),
+            Self::Ranges(n) => WidthRule::Exact(n),
+            Self::Nearest(n) => WidthRule::Nearest(n),
             Self::Width(w) => WidthRule::Fixed(literal(w)),
         }
     }
@@ -254,6 +277,57 @@ pub struct Range {
 
 /// Multiples of the power of ten tried, smallest first.
 const NICE: [u32; 7] = [1, 2, 5, 10, 20, 50, 100];
+
+/// The width of a histogram's `count` equal ranges over `min` to `max`, rounded
+/// up to two significant digits; the reference the statement of
+/// [`WidthRule::Exact`] mirrors. A range of zero has width 1.
+#[must_use]
+pub fn exact_width(min: f64, max: f64, count: u32) -> f64 {
+    if max <= min || count == 0 {
+        return 1.0;
+    }
+    let raw = (max - min) / f64::from(count);
+    let scale = 10f64.powf(raw.log10().floor() - 1.0);
+    let steps = ((raw / scale) * 1e6).round() / 1e6;
+    steps.ceil() * scale
+}
+
+/// The ranges `width` cuts `min..=max` into when the edges are multiples of it
+/// (the last one closed at the maximum).
+#[must_use]
+pub fn aligned_ranges(min: f64, max: f64, width: f64) -> u32 {
+    if max <= min {
+        return 1;
+    }
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "a small non-negative whole number: widths are at least a bin of the range"
+    )]
+    let n = ((max / width).ceil() - (min / width).floor()) as u32;
+    n
+}
+
+/// Of 1, 2, 2.5, 5 and 10 times the power of ten just below
+/// `(max - min) / aim`, the width whose [`aligned_ranges`] are closest to
+/// `aim`, fewer ranges on a tie; the reference the statement of
+/// [`WidthRule::Nearest`] mirrors.
+#[must_use]
+pub fn nearest_nice_width(min: f64, max: f64, aim: u32) -> f64 {
+    if max <= min || aim == 0 {
+        return 1.0;
+    }
+    let p = 10f64.powf(((max - min) / f64::from(aim)).log10().floor());
+    let aim = i64::from(aim);
+    [1.0, 2.0, 2.5, 5.0, 10.0]
+        .iter()
+        .map(|k| k * p)
+        .min_by_key(|w| {
+            let n = i64::from(aligned_ranges(min, max, *w));
+            (n - aim).abs() * 2 + i64::from(n > aim)
+        })
+        .unwrap_or(p)
+}
 
 impl Range {
     /// A range over `column` for `mode`.
@@ -284,6 +358,25 @@ impl Range {
         let l1 = format!("SELECT min(toFloat64({c})) AS mn, max(toFloat64({c})) AS mx FROM {base}");
         match &self.rule {
             WidthRule::Fixed(w) => format!("SELECT mn, mx, {w} AS w FROM ({l1})"),
+            WidthRule::Exact(n) => {
+                // BI-18 part C review fix (SHOULD-FIX) R21: (max - min) / n, rounded
+                // UP to two significant digits (`exact_width` in Rust). `round(.., 6)`
+                // keeps 24.000000000000004 from rounding up to 25.
+                let scale = "pow(10, floor(log10(raw)) - 1)";
+                format!(
+                    "SELECT mn, mx, if(mx > mn, ceil(round(raw / {scale}, 6)) * {scale}, 1) AS w FROM (SELECT mn, mx, (mx - mn) / {n} AS raw FROM ({l1}))"
+                )
+            }
+            WidthRule::Nearest(n) => {
+                // BI-18 part C review fix (SHOULD-FIX) R21: of 1, 2, 2.5, 5 and 10 times
+                // the power of ten just below (max - min) / n, the width whose
+                // aligned ranges are closest to n (`nearest_nice_width` in Rust);
+                // on a tie the one with fewer ranges.
+                let count = "ceil(mx / c) - floor(mn / c)";
+                format!(
+                    "SELECT mn, mx, if(mx > mn, arraySort(c -> abs({count} - {n}) * 2 + if({count} > {n}, 1, 0), [p, 2 * p, 2.5 * p, 5 * p, 10 * p])[1], 1) AS w FROM (SELECT mn, mx, if(mx > mn, pow(10, floor(log10((mx - mn) / {n}))), 1) AS p FROM ({l1}))"
+                )
+            }
             WidthRule::Nice(n) => {
                 let l2 = format!(
                     "SELECT mn, mx, if(mx > mn, pow(10, floor(log10((mx - mn) / {n}))), 1) AS p FROM ({l1})"
@@ -675,5 +768,68 @@ mod tests {
         assert!(sql.contains("multiIf(c0 >= 50, 10, c1 >= 50, 1, c2 >= 50, 0.1, 0.01) AS __gs"));
         assert_eq!(sql.matches("FROM serving.t").count(), 2, "{sql}");
         assert!(sql.contains("count() AS v"));
+    }
+
+    // BI-18 part C review fix (SHOULD-FIX) R21: the planner's QA column,
+    // `mart_demo_map_points.visitors`, 0 to about 2,400. The statements are the
+    // text of the same rule; `exact_width` and `nearest_nice_width` are the
+    // reference they mirror, and the statements were also run on the engine
+    // (see the plan's handoff).
+    fn same(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-9
+    }
+
+    #[test]
+    fn a_histogram_set_to_ten_ranges_over_the_qa_column_has_ten() {
+        for (min, max) in [(0.0, 2400.0), (0.0, 2397.0), (3.0, 2403.0)] {
+            let w = exact_width(min, max, 10);
+            assert!(same(w, 240.0), "{min}..{max}");
+            assert!(
+                (10..=11).contains(&aligned_ranges(min, max, w)),
+                "{min}..{max}"
+            );
+        }
+        assert_eq!(
+            aligned_ranges(0.0, 2400.0, exact_width(0.0, 2400.0, 10)),
+            10
+        );
+        // Two significant digits, rounded up: 2460 / 10 = 246 gives 250.
+        assert!(same(exact_width(0.0, 2460.0, 10), 250.0));
+        assert!(same(exact_width(0.0, 0.3, 3), 0.1));
+        assert!(same(exact_width(5.0, 5.0, 10), 1.0));
+    }
+
+    #[test]
+    fn automatic_ranges_take_the_nice_width_nearest_twenty_over_the_qa_column() {
+        // 1 gives 2400 ranges' worth too many at p = 100: 100 -> 24, 200 -> 12,
+        // 250 -> 10, 500 -> 5, 1000 -> 3; 24 is the nearest to 20.
+        let w = nearest_nice_width(0.0, 2400.0, 20);
+        assert!(same(w, 100.0));
+        assert_eq!(aligned_ranges(0.0, 2400.0, w), 24);
+        // Neither the old 200 (12 ranges) nor a width that is not nice.
+        assert!(!same(w, 200.0));
+        // A tie goes to the fewer ranges: 0..40 aims at 20; 2 gives exactly 20.
+        assert!(same(nearest_nice_width(0.0, 40.0, 20), 2.0));
+        assert!(same(nearest_nice_width(7.0, 7.0, 20), 1.0));
+    }
+
+    #[test]
+    fn the_histogram_statements_carry_the_rule_and_bi_10_bins_are_unchanged() {
+        let exact = Range::new(&col("visitors"), BinMode::Ranges(10)).read_sql("serving.t");
+        assert!(exact.contains("(mx - mn) / 10 AS raw"), "{exact}");
+        assert!(
+            exact.contains("ceil(round(raw / pow(10, floor(log10(raw)) - 1), 6))"),
+            "{exact}"
+        );
+        let near = Range::new(&col("visitors"), BinMode::Nearest(20)).read_sql("serving.t");
+        assert!(
+            near.contains("[p, 2 * p, 2.5 * p, 5 * p, 10 * p]"),
+            "{near}"
+        );
+        assert!(near.contains("log10((mx - mn) / 20)"), "{near}");
+        // BI-10's counted and automatic bins still use the "at most" rule.
+        let count = Range::new(&col("v"), BinMode::Count(10)).read_sql("serving.t");
+        assert!(count.contains("ceil(mx / (1 * p)) - floor(mn / (1 * p)) <= 10, 1 * p"));
+        assert_eq!(BinMode::Auto.rule(), WidthRule::Nice(AUTO_BINS));
     }
 }

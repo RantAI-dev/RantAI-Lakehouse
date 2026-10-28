@@ -9,11 +9,22 @@
 //! here before every save. A folder is deleted only when empty (no
 //! subfolders, dashboards or SQL sources): 409 otherwise, fail closed
 //! rather than cascading. `ClickHouse` error text never reaches a response.
+//!
+//! # The personal space (`BI-18` part C, part 2)
+//!
+//! A folder with an owner is one user's personal space
+//! (`lakehouse_bi::folders`). The folder list a caller gets holds the ordinary
+//! folders and their own space (every space for `identity:write`); a space
+//! holds dashboards only, cannot be renamed, moved or deleted, and takes only
+//! its owner's dashboards: [`ensure_folder_usable`] is the one check boards go
+//! through, and [`ensure_folder_exists`] (SQL sources, which are not private)
+//! refuses a personal space outright.
 
 use axum::Extension;
 use axum::body::Bytes;
 use axum::extract::{Query, State};
 use lakehouse_auth::Principal;
+use lakehouse_bi::access::Viewer;
 use lakehouse_bi::folders::{self, Folder};
 use lakehouse_bi::sources;
 use lakehouse_bi::store::{self, BiError};
@@ -24,6 +35,7 @@ use serde_json::{Value, json};
 
 use crate::error::ApiResult;
 use crate::json::ApiJson;
+use crate::routes::dashboard_organise::viewer_of;
 use crate::state::AppState;
 use crate::upstream_error;
 
@@ -93,24 +105,64 @@ fn required_id(id: Option<&str>) -> Result<String, ApiError> {
         .ok_or_else(|| ApiError::BadRequest("id is required.".to_owned()))
 }
 
-/// Refuse a `folder_id` that names no live folder. `""` (root) always
-/// passes. Used by boards and SQL sources before they are filed.
+/// Refuse a `folder_id` that names no live ordinary folder. `""` (root) always
+/// passes. Used by SQL sources before they are filed: a source is shared by
+/// every dashboard, so it cannot be kept in somebody's personal space.
 ///
 /// # Errors
 ///
-/// 400 for an unknown folder, 503 when the store is unreachable.
+/// 400 for an unknown folder or a personal space, 503 when the store is
+/// unreachable.
 pub(crate) async fn ensure_folder_exists(ch: &ChClient, folder_id: &str) -> Result<(), ApiError> {
     if folder_id.is_empty() {
         return Ok(());
     }
-    let all = folders::list_folders(ch)
+    let all = folders::list_folders(ch, &Viewer::system())
         .await
         .map_err(|err| classify_ch_error(&err))?;
-    if all.iter().any(|f| f.id == folder_id) {
-        Ok(())
-    } else {
-        Err(ApiError::BadRequest("folder not found.".to_owned()))
+    match all.iter().find(|f| f.id == folder_id) {
+        None => Err(ApiError::BadRequest("folder not found.".to_owned())),
+        Some(f) if !f.owner_id.is_empty() => Err(ApiError::BadRequest(
+            "SQL sources cannot be kept in the personal space.".to_owned(),
+        )),
+        Some(_) => Ok(()),
     }
+}
+
+/// Refuse a `folder_id` a dashboard of `viewer` may not be filed in: unknown,
+/// or somebody else's personal space (an administrator sees every space but
+/// files only into their own). `""` (root) always passes.
+///
+/// # Errors
+///
+/// 400 with a fixed sentence, 503 when the store is unreachable.
+pub(crate) async fn ensure_folder_usable(
+    ch: &ChClient,
+    folder_id: &str,
+    viewer: &Viewer,
+) -> Result<(), ApiError> {
+    if folder_id.is_empty() {
+        return Ok(());
+    }
+    let all = folders::list_folders(ch, viewer)
+        .await
+        .map_err(|err| classify_ch_error(&err))?;
+    match all.iter().find(|f| f.id == folder_id) {
+        None => Err(ApiError::BadRequest("folder not found.".to_owned())),
+        Some(f) if !f.owner_id.is_empty() && f.owner_id != viewer.id() => {
+            Err(ApiError::BadRequest(
+                "Only the owner can file a dashboard in a personal space.".to_owned(),
+            ))
+        }
+        Some(_) => Ok(()),
+    }
+}
+
+/// The 400 for a change a personal space does not allow.
+fn personal_space_refusal() -> ApiError {
+    ApiError::BadRequest(
+        "The personal space cannot be renamed, moved, deleted or hold folders.".to_owned(),
+    )
 }
 
 /// `GET /api/dashboard/folders` — every live folder (a flat list; the
@@ -119,8 +171,11 @@ pub(crate) async fn ensure_folder_exists(ch: &ChClient, folder_id: &str) -> Resu
 /// # Errors
 ///
 /// 503 when the store is unreachable.
-pub async fn list(State(state): State<AppState>) -> ApiResult<ApiJson<Value>> {
-    let all = folders::list_folders(&state.clickhouse)
+pub async fn list(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+) -> ApiResult<ApiJson<Value>> {
+    let all = folders::list_folders(&state.clickhouse, &viewer_of(&principal))
         .await
         .map_err(|err| classify_ch_error(&err))?;
     Ok(ApiJson(json!({ "folders": all })))
@@ -139,10 +194,13 @@ pub async fn create(
 ) -> ApiResult<ApiJson<Value>> {
     let body: CreateBody = parse(&body)?;
     let ch = &state.clickhouse;
-    let all = folders::list_folders(ch)
+    let all = folders::list_folders(ch, &viewer_of(&principal))
         .await
         .map_err(|err| classify_ch_error(&err))?;
     let parent = body.parent_id.unwrap_or_default().trim().to_owned();
+    if all.iter().any(|f| f.id == parent && !f.owner_id.is_empty()) {
+        return Err(personal_space_refusal().into());
+    }
     let name = folders::check_placement(&all, None, &body.name, &parent)
         .map_err(|rule| ApiError::BadRequest(rule.message().to_owned()))?;
     let folder = Folder {
@@ -151,6 +209,7 @@ pub async fn create(
         parent_id: parent,
         created_by: principal.id.uuid().to_string(),
         updated_at: None,
+        owner_id: String::new(),
     };
     folders::save_folder(ch, &folder)
         .await
@@ -172,7 +231,7 @@ pub async fn update(
     let body: UpdateBody = parse(&body)?;
     let id = required_id(body.id.as_deref())?;
     let ch = &state.clickhouse;
-    let all = folders::list_folders(ch)
+    let all = folders::list_folders(ch, &viewer_of(&principal))
         .await
         .map_err(|err| classify_ch_error(&err))?;
     let current = all
@@ -180,18 +239,25 @@ pub async fn update(
         .find(|f| f.id == id)
         .cloned()
         .ok_or_else(|| ApiError::NotFound("folder not found.".to_owned()))?;
+    if !current.owner_id.is_empty() {
+        return Err(personal_space_refusal().into());
+    }
     let name = body.name.unwrap_or_else(|| current.name.clone());
     let parent = body
         .parent_id
         .map_or_else(|| current.parent_id.clone(), |p| p.trim().to_owned());
     let name = folders::check_placement(&all, Some(&id), &name, &parent)
         .map_err(|rule| ApiError::BadRequest(rule.message().to_owned()))?;
+    if all.iter().any(|f| f.id == parent && !f.owner_id.is_empty()) {
+        return Err(personal_space_refusal().into());
+    }
     let folder = Folder {
         id,
         name,
         parent_id: parent,
         created_by: principal.id.uuid().to_string(),
         updated_at: None,
+        owner_id: String::new(),
     };
     folders::save_folder(ch, &folder)
         .await
@@ -208,18 +274,24 @@ pub async fn update(
 /// unreachable.
 pub async fn delete(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Query(q): Query<IdQuery>,
 ) -> ApiResult<ApiJson<Value>> {
     let id = required_id(q.id.as_deref())?;
     let ch = &state.clickhouse;
-    let all = folders::list_folders(ch)
+    let all = folders::list_folders(ch, &viewer_of(&principal))
         .await
         .map_err(|err| classify_ch_error(&err))?;
-    if !all.iter().any(|f| f.id == id) {
+    let Some(folder) = all.iter().find(|f| f.id == id) else {
         return Err(ApiError::NotFound("folder not found.".to_owned()).into());
+    };
+    if !folder.owner_id.is_empty() {
+        return Err(personal_space_refusal().into());
     }
     let subfolders = all.iter().filter(|f| f.parent_id == id).count();
-    let boards = store::list_boards(ch)
+    // An ordinary folder never holds a private dashboard, so counting what the
+    // caller may see is counting all of it.
+    let boards = store::list_boards(ch, &viewer_of(&principal))
         .await
         .map_err(|err| classify_ch_error(&err))?
         .iter()
@@ -242,4 +314,26 @@ pub async fn delete(
         .await
         .map_err(|err| classify_ch_error(&err))?;
     Ok(ApiJson(json!({ "ok": true })))
+}
+
+/// `POST /api/dashboard/personal` — the caller's personal space, created on
+/// first use. Idempotent: the folder id is derived from the caller, so asking
+/// twice (or twice at once) is one folder. Needs `dashboard:write`, like
+/// creating any dashboard to put in it.
+///
+/// # Errors
+///
+/// 503 when the store is unreachable.
+pub async fn personal(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+) -> ApiResult<ApiJson<Value>> {
+    let folder = folders::ensure_personal_folder(
+        &state.clickhouse,
+        &principal.id.uuid().to_string(),
+        &principal.display_name,
+    )
+    .await
+    .map_err(|err| classify_ch_error(&err))?;
+    Ok(ApiJson(json!({ "folder": folder })))
 }

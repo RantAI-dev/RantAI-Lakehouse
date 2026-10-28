@@ -181,6 +181,11 @@ export function measureLimits(kind: string, rowsMode = false): { min: number; ma
       return { min: 2, max: 2, own: true }
     case "bubble":
       return { min: 3, max: 3, own: true }
+    // BI-16 part B: a histogram counts the rows of its dimension and takes no measure.
+    case "histogram":
+    // BI-16 part C1 (plan D1): a Gantt chart has a start and an end instead of a measure.
+    case "gantt":
+      return { min: 0, max: 0, own: false }
     default:
       return { min: 1, max: 1, own: false }
   }
@@ -195,7 +200,7 @@ export function takesOther(kind: string, rowsMode = false): boolean {
 /** Kinds whose statement is a plain `GROUP BY`, the only ones a sort applies to. */
 export function takesSort(kind: string, rowsMode = false): boolean {
   if (rowsMode) return false
-  return !["text", "kpi", "gauge", "boxplot", "pointmap", "geoheat", "pivot"].includes(kind)
+  return !["text", "kpi", "gauge", "boxplot", "pointmap", "geoheat", "pivot", "progress", "histogram", "bullet", "image", "web", "gantt"].includes(kind)
 }
 
 // ── the sort choice ──────────────────────────────────────────────────────
@@ -504,6 +509,18 @@ export function withResolvedSlots<D extends { dimension?: string; breakdown?: st
  * `chartAggregate` is the chart's own aggregate, which a measure written as a
  * plain name takes: one that is not `sum` reads "avg of stay" too (phase 2 QA R7).
  */
+/**
+ * A measure with its own aggregate whose column is a real column name. A stored
+ * definition may hold the column as `{param: "..."}` (BI-11) until a response's
+ * `resolved` replaces it (`withResolvedSlots`); such a slot has no name to
+ * label, and reading it as one is what crashed a public link (BI-19 part A QA
+ * fix P3). The server now sends `resolved` on a public link too; this keeps a
+ * payload without it from taking the page down.
+ */
+function ownAggregate(m: MeasureEntry | undefined): m is { column: string; aggregate: string } {
+  return m !== undefined && typeof m !== "string" && !("metric" in m) && typeof m.column === "string"
+}
+
 export function tileMeasureLabels(
   measures: readonly MeasureEntry[] | undefined,
   y: string | readonly string[],
@@ -517,9 +534,9 @@ export function tileMeasureLabels(
   if (steps?.length) {
     const base: ResultColumns = {
       groups: [],
-      measures: (measures ?? []).map((m) => (typeof m === "string" ? m : "metric" in m ? m.metric : `${m.aggregate}_${m.column}`)),
-      labels: Object.fromEntries((measures ?? []).flatMap((m) => (typeof m === "string" || "metric" in m ? [] : [[`${m.aggregate}_${m.column}`, `${m.aggregate} of ${displayColumn(m.column)}`]]))),
-      bases: Object.fromEntries((measures ?? []).flatMap((m) => (typeof m === "string" || "metric" in m ? [] : [[`${m.aggregate}_${m.column}`, m.column]]))),
+      measures: (measures ?? []).map((m) => (typeof m === "string" ? m : "metric" in m ? m.metric : `${m.aggregate}_${typeof m.column === "string" ? m.column : "?"}`)),
+      labels: Object.fromEntries((measures ?? []).flatMap((m) => (ownAggregate(m) ? [[`${m.aggregate}_${m.column}`, `${m.aggregate} of ${displayColumn(m.column)}`]] : []))),
+      bases: Object.fromEntries((measures ?? []).flatMap((m) => (ownAggregate(m) ? [[`${m.aggregate}_${m.column}`, m.column]] : []))),
     }
     const after = columnsAfterSteps({ ...base, groups: steps.flatMap((s) => (s.summarise?.by ?? []).map((name) => ({ name, kind: "text" }))) }, steps)
     for (const name of names) if (after.labels[name]) out[name] = after.labels[name]
@@ -533,7 +550,7 @@ export function tileMeasureLabels(
     const metricLabel = metricLabels?.[name]
     if (metricLabel && (!entry || typeof entry === "string" || "metric" in entry)) {
       out[name] = metricLabel
-    } else if (entry && typeof entry !== "string" && !("metric" in entry) && name !== entry.column) {
+    } else if (ownAggregate(entry) && name !== entry.column) {
       out[name] = `${AGGREGATE_WORDS[entry.aggregate] ?? entry.aggregate} of ${displayColumn(entry.column)}`
     } else if (entry && typeof entry === "string" && chartAggregate && chartAggregate !== "sum" && name === entry) {
       // Phase 2 QA R7: a plain name takes the chart's aggregate, which the label says.

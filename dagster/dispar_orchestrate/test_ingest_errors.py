@@ -112,17 +112,17 @@ _CASES = [
 def test_a_failure_is_named_with_its_class_and_retried_only_when_the_class_is_transient(exc, expected) -> None:
     verdict = e.classify(exc)
     assert verdict.error_class == expected
-    assert verdict.retried is (expected in {e.UNREACHABLE, e.TIMEOUT, e.SOURCE_BUSY, e.API_UNREACHABLE})
+    assert verdict.retried is (expected in {e.UNREACHABLE, e.TIMEOUT, e.SOURCE_BUSY, e.API_UNREACHABLE, e.RATE_LIMITED})
 
 
 def test_every_class_a_failure_can_get_is_in_the_closed_list_the_api_accepts() -> None:
     assert e.ERROR_CLASSES == {
         "unreachable", "timeout", "source_busy", "api_unreachable", "sign_in_refused", "address_refused",
-        "unsupported", "setting_rejected", "schema_decision_pending", "other",
+        "unsupported", "setting_rejected", "schema_decision_pending", "other", "permission_missing", "rate_limited",
     }
     assert {c for _, c in _CASES} <= e.ERROR_CLASSES
     assert set(e.CLASS_PHRASES) == e.ERROR_CLASSES
-    assert e.RETRIED_CLASSES == {"unreachable", "timeout", "source_busy", "api_unreachable"}
+    assert e.RETRIED_CLASSES == {"unreachable", "timeout", "source_busy", "api_unreachable", "rate_limited"}
 
 
 def test_a_table_waiting_for_a_schema_decision_is_a_class_that_is_not_retried() -> None:

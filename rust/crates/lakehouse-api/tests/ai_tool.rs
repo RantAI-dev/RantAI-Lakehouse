@@ -671,40 +671,13 @@ async fn save_board_filters_on_main_fails_with_the_console_message() {
     );
 }
 
-/// `save_board_filters` refuses more than the 20 filters the route allows
-/// (`routes/dashboard.rs:1163`, `validate_filters` inside `boards_update`).
-/// The refusal runs before
-/// the route's first `ClickHouse` call, so the dead upstream never gets
-/// asked — this is the plan's "21 filters are refused" line, asserted
-/// through the tool rather than against the library.
-#[tokio::test]
-async fn save_board_filters_refuses_more_than_twenty_filters() {
-    let TestApp { router, pool } = spin_up().await;
-    let cookie = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
-
-    let too_many: Vec<_> = (0..21)
-        .map(|i| json!({ "column": format!("c{i}"), "values": ["A"] }))
-        .collect();
-    let resp = post_tool(
-        &router,
-        Some(&cookie),
-        json!({
-            "tool": "save_board_filters",
-            "args": { "board": "b-some", "filters": too_many, "confirmed": true },
-            "mode": "build"
-        }),
-    )
-    .await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = json_body(resp).await;
-    assert_ne!(body["outcome"], json!("needs_confirmation"));
-    assert_ne!(body["outcome"], json!("refused"));
-    let err = body["result"]["error"].as_str().expect("error message");
-    assert!(
-        err.contains("at most 20"),
-        "the route's own limit must surface through the tool, got: {err}"
-    );
-}
+// `save_board_filters_refuses_more_than_twenty_filters` moved to
+// `routes/ai/tools/boards.rs` (merge of main into phase 3). BI-18 part C made
+// `boards_update` look the board up as the caller (`require_board`) before
+// `validate_filters`, so against this harness's dead `ClickHouse` the call
+// ends in the classified upstream error and never reaches the 20-filter
+// limit. The unit test there gives the route a live board and asserts the
+// same limit and that nothing is written.
 
 /// `save_board_filters` refuses an invalid filter op. The tool parses the
 /// args into `Vec<FilterDef>` itself (`tools/boards.rs:424`), so this one
@@ -913,4 +886,85 @@ async fn ask_mode_refuses_the_five_writers_and_allows_set_board_view_filters() {
     .await;
     let body = json_body(resp).await;
     assert_ne!(body["outcome"], json!("refused"));
+}
+
+// ── BI-4 part B: set_cache_rule ─────────────────────────────────────────
+
+/// `set_cache_rule` (WriteLow): without `confirmed: true` the gate returns
+/// `needs_confirmation` with a summary that names the board and nothing is
+/// saved (`AI-x-AC1`: it asks first).
+#[tokio::test]
+async fn set_cache_rule_without_confirmed_asks_first_and_names_the_board() {
+    let TestApp { router, pool } = spin_up().await;
+    let cookie = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+    let resp = post_tool(
+        &router,
+        Some(&cookie),
+        json!({
+            "tool": "set_cache_rule",
+            "args": { "board": "b-fresh", "rule": "fresh" },
+            "mode": "build"
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["outcome"], json!("needs_confirmation"));
+    assert!(
+        body["result"]["summary"]
+            .as_str()
+            .is_some_and(|s| s.contains("b-fresh")),
+        "{}",
+        body["result"]["summary"]
+    );
+}
+
+/// A rule the console would refuse is refused with the same sentence before
+/// anything is read or saved, and the audit row names the board.
+#[tokio::test]
+async fn set_cache_rule_refuses_minutes_out_of_range_with_the_console_sentence() {
+    let TestApp { router, pool } = spin_up().await;
+    let cookie = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+    let resp = post_tool(
+        &router,
+        Some(&cookie),
+        json!({
+            "tool": "set_cache_rule",
+            "args": { "board": "b-fresh", "rule": "minutes", "minutes": 5000, "confirmed": true },
+            "mode": "build"
+        }),
+    )
+    .await;
+    let body = json_body(resp).await;
+    assert_eq!(
+        body["result"]["error"],
+        json!("Remember for between 1 minute and 24 hours (1 to 1440 minutes).")
+    );
+    let events = list(&pool, AuditFilter::default()).await.expect("audit");
+    let ours: Vec<_> = events
+        .iter()
+        .filter(|e| e.action == "set_cache_rule")
+        .collect();
+    assert_eq!(ours.len(), 1);
+    assert_eq!(ours[0].resource_kind.as_deref(), Some("board"));
+}
+
+/// Someone without `dashboard:write` is refused before the tool runs.
+#[tokio::test]
+async fn set_cache_rule_is_refused_without_dashboard_write() {
+    let TestApp { router, pool } = spin_up().await;
+    let user = common::create_principal_with_permissions(&pool, "dashboard:read").await;
+    let cookie = common::session_cookie_for_user(&pool, user).await;
+    let resp = post_tool(
+        &router,
+        Some(&cookie),
+        json!({
+            "tool": "set_cache_rule",
+            "args": { "board": "b-fresh", "rule": "fresh", "confirmed": true },
+            "mode": "build"
+        }),
+    )
+    .await;
+    let body = json_body(resp).await;
+    assert_eq!(body["outcome"], json!("refused"));
 }

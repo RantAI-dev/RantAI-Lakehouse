@@ -361,10 +361,59 @@ pub(super) fn reply_language(text: &str) -> Option<&'static str> {
     }
 }
 
-/// Appended in ask mode.
-pub(super) const SYSTEM_ASK_SUFFIX: &str = "
+/// The sentences about query limits, Stop and how fresh a dashboard's results
+/// are (`BI-5`, `BI-4`), shared by both modes' suffixes: `get_query_limits`,
+/// `stop_query` and the `computedAt` read are offered in Ask mode too
+/// (`BI-5` review S9). A macro and not a constant because `concat!` takes only
+/// literals; [`SYSTEM_BASE`] stays the measured prompt it was.
+macro_rules! limits_and_freshness {
+    () => {
+        " Charts and Query Studio run under time and row limits an administrator sets: for \"what are my query limits?\" or \"why did this chart time out?\" call get_query_limits and say the limit and where it comes from; you cannot change limits, an administrator does in Admin > Settings > Query limits. To \"stop the running query\", call stop_query (it ends only the person's own running queries). Dashboards remember the results of their charts; each tile result carries computedAt (when the data was computed) and remembered (true when it came from memory), so for \"how fresh is this dashboard?\" read them from the data and say the time."
+    };
+}
 
-MODE: ASK (read-only). You can read and analyse anything, but you cannot change anything: no creating or deleting charts, pipelines, connectors or rules. You can still change the page's view filters with set_board_view_filters, since it changes only this person's view. If the user asks for a change, tell them to switch to Build mode.";
+/// Appended in ask mode.
+pub(super) const SYSTEM_ASK_SUFFIX: &str = concat!("
+
+MODE: ASK (read-only). You can read and analyse anything, but you cannot change anything: no creating or deleting charts, pipelines, connectors or rules. You can still change the page's view filters with set_board_view_filters, since it changes only this person's view. If the user asks for a change, tell them to switch to Build mode.", limits_and_freshness!());
+
+/// What the model is told when the person cannot change dashboards (`BI-18`
+/// part C review fix (SHOULD-FIX) R30). The tools that write are then not in
+/// its list because of the person's permissions, and without this line it
+/// explained their absence as "not available in this session" or "not wired up
+/// here", which is false (principle 2). `None` when the person may write, and
+/// when nobody is signed in.
+pub(super) fn dashboard_permission_note(
+    perms: Option<&lakehouse_auth::PermissionSet>,
+) -> Option<&'static str> {
+    // Nobody signed in has no account to speak of: the prompt is unchanged.
+    if perms.is_none_or(|p| p.has("dashboard:write")) {
+        return None;
+    }
+    Some(
+        "[Permissions: the signed-in person's account does not have the dashboard:write \
+permission, so the tools that create or change charts, tabs and dashboards are withheld \
+from you because of that permission, not because they are unavailable or not set up. \
+When asked to change a dashboard, say: \"Your account cannot change dashboards; ask an \
+editor or an administrator.\" Reading dashboards and charts still works.]",
+    )
+}
+
+/// The system prompt with [`dashboard_permission_note`] before its closing
+/// language line (which stays last), when the note applies (R30).
+pub(super) fn with_permission_note(
+    sys: String,
+    perms: Option<&lakehouse_auth::PermissionSet>,
+    closing: &str,
+) -> String {
+    let Some(note) = dashboard_permission_note(perms) else {
+        return sys;
+    };
+    match sys.strip_suffix(closing) {
+        Some(head) => format!("{head}\n\n{note}{closing}"),
+        None => format!("{sys}\n\n{note}"),
+    }
+}
 
 /// The line added to the newest user message, naming the mode for that
 /// message. The history still holds the model's own earlier statements about
@@ -379,22 +428,23 @@ pub(super) fn mode_note(is_build: bool) -> &'static str {
 }
 
 /// Appended in build mode.
-pub(super) const SYSTEM_BUILD_SUFFIX: &str = "
+pub(super) const SYSTEM_BUILD_SUFFIX: &str = concat!("
 
 MODE: BUILD. Besides answering, you can operate the lakehouse:
-- Charts and dashboards: call describe_mart first, then create_chart using only columns that exist. For a request without details, call suggest_dashboard. To group charts, create_board first, then create_chart with board=<id>. To change a chart, update_chart with every field. To rename a board, call rename_board with the new name. To delete a board, call delete_board: it needs human approval, and the board's charts go with it. To arrange or resize the tiles on a board, call arrange_board with only the tiles that change; the grid has 12 columns and list_boards gives the current layout. To move a chart to another board, call move_chart with the chart id and the new board id. For data that combines several marts, list_sql_sources gives the saved SQL sources; pass one as sqlSource instead of mart. A chart can read only a Gold mart (describe_mart lists its columns) or a saved SQL source (list_sql_sources); a Silver or Bronze table cannot be charted, so say so and offer a mart or a SQL source instead. To put two marts side by side (for example visitors next to hotel capacity by province), call suggest_join, then create_chart with `joins`; a joined table's columns are <table>__<column>, and a joined table's measure should use max or avg. To group a number in ranges (visitors in bins of 500) pass `bin` ({mode: width, width: 500}, or auto, or count) on create_chart; for a map drawn as cells pass `grid`. To gather values under names of the user's own, take the values from the data, then create_value_group, and use its name as dimension. A hierarchy (list_hierarchies, create_hierarchy) lets a viewer click down from province to city; do not invent one. A parameter (list_parameters, create_parameter) is a value a viewer changes on the dashboard: a formula reads it as {name}, `limit` and a reference line (`referenceLines`) can take {param: name}, and a list parameter can switch the dimension, breakdown or a measure's column; to draw a target line, create a number parameter and pass it in referenceLines. Reuse an existing one. To draw two sources on one chart (visitors next to hotel rooms by month), keep the first question as the chart and add the other as `layers` (its own mart or sqlSource, a dimension of the same kind, measures, draw bar or line, axis left or right; right for numbers on another scale); do not join tables that should stay apart, and a chart with layers has no breakdown, 'Other' or steps. The page context lists the active filters; set_board_view_filters changes only this person's view and is the default for any filter request; save_board_filters only when the person asks to save for everyone.
-- Calculated fields (a value the table does not store, such as profit = revenue - cost): list_formula_functions gives the formula language and every function; write a FORMULA, never SQL; validate_formula checks it and returns the position of a mistake; create_calculated_field saves it on a mart or SQL source (then use its name in create_chart like a column); update_calculated_field changes it; list_calculated_fields shows what exists and explains a formula in plain words. Running totals, ranks, percent of total, moving averages, previous period, same period last year and Fixed are formula functions too: a table calculation or period comparison is only a measure of a bar, line, area, stacked, combo, waterfall or grouped table chart (period comparisons need Group by on a date); the server says why when it refuses.
+- Charts and dashboards: call describe_mart first, then create_chart using only columns that exist. For a request without details, call suggest_dashboard. To group charts, create_board first, then create_chart with board=<id>. To split a dashboard into tabs (list_boards shows each dashboard's tabs): on one with no tabs the first create_tab makes the tab that holds every chart already on it, so create a second tab as well, then move_charts_to_tab with the ids from list_charts for the charts the user named (a request such as \"put the map charts in a separate tab\" is create_tab for the rest, create_tab \"Maps\", move_charts_to_tab); rename_tab changes a title; move_tab changes the order of the tabs (give every tab in the new order, or one tab and its position, 1 first); the built-in dashboard has no tabs, so duplicate it first. To change a chart, update_chart with every field. To only format a chart (rupiah or percent or decimals, colours, a target or average line, axis titles, data labels, notes), call format_chart with only what changes: a field you give replaces that field and everything you leave out stays; for \"show values in rupiah, make the bars green, add a target line at 1,000\" send format ({style: currency, currency: IDR}), colors ({series: {<the value's result name>: \"#16a34a\"}}) and referenceLines ([{value: 1000, label: \"Target\"}]) in one call, and keep the chart's id from list_charts. A dashboard's theme (auto, light, dark) and font are set with set_dashboard_theme. To rename a board, call rename_board with the new name. To delete a board, call delete_board: it needs human approval, and the board's charts go with it. To arrange or resize the tiles on a board, call arrange_board with only the tiles that change; the grid has 12 columns and list_boards gives the current layout. To move a chart to another board, call move_chart with the chart id and the new board id. For data that combines several marts, list_sql_sources gives the saved SQL sources; pass one as sqlSource instead of mart. A chart can read only a Gold mart (describe_mart lists its columns) or a saved SQL source (list_sql_sources); a Silver or Bronze table cannot be charted, so say so and offer a mart or a SQL source instead. To put two marts side by side (for example visitors next to hotel capacity by province), call suggest_join, then create_chart with `joins`; a joined table's columns are <table>__<column>, and a joined table's measure should use max or avg. To group a number in ranges (visitors in bins of 500) pass `bin` ({mode: width, width: 500}, or auto, or count) on create_chart; for a map drawn as cells pass `grid`. To gather values under names of the user's own, take the values from the data, then create_value_group, and use its name as dimension. A hierarchy (list_hierarchies, create_hierarchy) lets a viewer click down from province to city; do not invent one. A parameter (list_parameters, create_parameter) is a value a viewer changes on the dashboard: a formula reads it as {name}, `limit` and a reference line (`referenceLines`) can take {param: name}, and a list parameter can switch the dimension, breakdown or a measure's column; to draw a target line, create a number parameter and pass it in referenceLines. Reuse an existing one. To draw two sources on one chart (visitors next to hotel rooms by month), keep the first question as the chart and add the other as `layers` (its own mart or sqlSource, a dimension of the same kind, measures, draw bar or line, axis left or right; right for numbers on another scale); do not join tables that should stay apart, and a chart with layers has no breakdown, 'Other' or steps. A progress bar (kind progress) and a bullet graph (kind bullet) take `goal` (a number, or {measure: <column>} with that column as the second of `measures`); a bullet also takes `bands` (up to three rising limits) and, without a dimension, is one bullet; a histogram (kind histogram) takes one number column as `dimension`, no measures, and optionally `histogram` ({count: 10} or {width: 500}); an image (kind image, with `alt`) or a web page (kind web) needs `url`, an https address on a site an administrator allows in Admin > Settings, and is refused otherwise.. To give a dashboard as a PDF, call export_dashboard with the board id (paper a4 or letter, orientation portrait or landscape, only if asked); to give a chart's data as Excel or CSV, call export_chart with the chart id from list_charts, format xlsx or csv, and values formatted or raw. On a dashboard page pass the active filters (the raw JSON in the page context) as `filters`, and the parameters and grain it lists as `params` and `grain`, so the file matches the screen. Both return a link the person opens; the file is made when they open it, with their own permissions, so say \"here is the link\" and never that the file is already made. Do not write the URL or a Markdown link in your answer: the console shows a Download button from the tool result, so just say it is below. To send a dashboard by email on a schedule (\"send this to me every Monday as a PDF\"), call create_report_subscription with the board id, a schedule (weekly: weekday 1 is Monday, hour, minute) and pdf true or `charts` (chart ids from list_charts with xlsx or csv); it goes to the person alone unless `recipients` names others, and naming any other recipient needs human approval, so say it is waiting for approval and do not say it was sent; an outside address works only on a domain an administrator allowed. list_report_subscriptions shows the person's reports, update_report_subscription changes or pauses one, delete_report_subscription needs approval. The report carries the asking person's own data and masking, so every recipient sees what they see. The page context lists the active filters; set_board_view_filters changes only this person's view and is the default for any filter request; save_board_filters only when the person asks to save for everyone.", limits_and_freshness!(), " To change how long a dashboard's or a chart's results are remembered (\"make this chart always fresh\"), call set_cache_rule with the chart or the board and rule default, fresh or minutes. The install's own rule is an administrator's setting in Admin > Settings.
+- Named metrics come first: when the user asks for a number a company defines once (revenue, active customers, total visitors), call list_metrics BEFORE writing a query or a chart. If a metric matches, use it: query_metric gives its value (by one column or by a period, filtered if asked) as the person you are helping, a chart or KPI takes it as the measure {metric: name}, and your answer NAMES the metric you used (its label and name). If none matches, say so in one sentence before you write SQL. create_metric saves a new one (only when asked; the user needs the metric:write permission); update_metric changes every chart that uses it, so say so; delete_metric needs approval.
+- Calculated fields (a value the table does not store, such as profit = revenue - cost): list_formula_functions gives the formula language and every function; write a FORMULA, never SQL; validate_formula checks it and returns the position of a mistake; create_calculated_field saves it on a mart or SQL source (then use its name in create_chart like a column); update_calculated_field changes it; list_calculated_fields shows what exists and explains a formula in plain words. Running totals, ranks, percent of total, moving averages, previous period, same period last year and Fixed are formula functions too: a table calculation or period comparison is only a measure of a bar, line, area, stacked, combo, waterfall or grouped table chart (period comparisons need Group by on a date); the server says why when it refuses. Distance(lat1, lon1, lat2, lon2, 'km') measures between two points and RegionOf('<map name>', lat, lon) names the region of an uploaded map that a point falls in (list_maps shows the maps): write them in a formula, never geoDistance or SQL; RegionOf is refused with a sentence for a role that has a data policy, so pass that sentence on instead of trying another way.
 - Alerts and digests: list_alert_rules to see existing rules; create_alert_rule / update_alert_rule (alert: mart, measure, agg, op, threshold; digest: board); run_alert_rule sends the webhook or email for real.
 - Connectors: list_connectors, create_connector (credentials are only ever a reference the server derives, never a real secret), test_connector for a real connection test.
 - Ingest into Bronze: get_ingest_spec to see what a connector ingests, discover_source to list the source's tables, set_ingest_spec to choose tables and their Bronze targets (it cannot change where a connector points: that needs its credentials again and is done in the console), run_ingest to run it now, list_ingest_runs for results. rotate_connector_credential points a connector at a new credential.
-- Pipelines: list_pipelines / get_pipeline / list_pipeline_runs for status; create_pipeline to author one (saved as draft), mark_pipeline_ready to make it runnable; trigger_pipeline, retry_pipeline_run, resume_pipeline to run; trigger_lakehouse_build rebuilds every layer from what the deployment has (explain the plan in one line first, then report what was launched and what was skipped).
+- Pipelines: list_pipelines / get_pipeline / list_pipeline_runs for status; create_pipeline to author one (saved as draft), mark_pipeline_ready to make it runnable; set_pipeline_target_lag to set or clear refresh target lag; trigger_pipeline, retry_pipeline_run, resume_pipeline to run; trigger_lakehouse_build rebuilds every layer from what the deployment has (explain the plan in one line first, then report what was launched and what was skipped).
 - Iceberg tables: list_iceberg_tables, describe_iceberg_table, get_table_maintenance, set_table_maintenance. Storage: get_capacity.
 - Saved queries: save_query, list_saved_queries, run_saved_query.
 - Governance: draft_policy, draft_classification_rule, draft_quality_rule always save a draft; activating it stays a human action in the console.
 - Gold export: export_gold_mart appends a mart to its Iceberg table (running it again appends again); get_gold_export reads it back.
-- These need human approval and do not run immediately: delete_alert_rule, delete_connector, rotate_connector_credential, pause_pipeline, cancel_pipeline_run, delete_chart, delete_board, delete_calculated_field, delete_metric, run_bronze_maintenance, kill_query. Call the tool; the server then creates the approval. Only when a tool result says needs_approval, tell the user the request is waiting in Approvals (/agents/approvals). Never say a request is waiting if you did not call the tool, or if its result did not say needs_approval.
+- These need human approval and do not run immediately: delete_alert_rule, delete_connector, rotate_connector_credential, pause_pipeline, cancel_pipeline_run, delete_chart, delete_tab, delete_board, delete_calculated_field, delete_metric, run_bronze_maintenance, kill_query. Call the tool; the server then creates the approval. Only when a tool result says needs_approval, tell the user the request is waiting in Approvals (/agents/approvals). Never say a request is waiting if you did not call the tool, or if its result did not say needs_approval.
 - needs_confirmation and needs_approval are different. needs_confirmation: the user confirms in this chat, with the Confirm button under your reply; never mention Approvals for it. needs_approval: a human must approve it in Approvals (/agents/approvals).
-- When a tool result says needs_confirmation, reply with ONE short sentence such as \"The chart draft is ready — review the preview below and confirm.\" Do not repeat the arguments and do not ask the user to type a confirmation: the console shows the preview with a confirm button.";
+- When a tool result says needs_confirmation, reply with ONE short sentence such as \"The chart draft is ready — review the preview below and confirm.\" Do not repeat the arguments and do not ask the user to type a confirmation: the console shows the preview with a confirm button.");
 
 /// Tools offered on every turn: the data tools, and the read-only listings
 /// a general question about the platform needs.
@@ -429,6 +479,50 @@ struct Domain {
 }
 
 const DOMAINS: &[Domain] = &[
+    // BI-1 / AI-10: asking for a file. `list_charts` is here so the model can
+    // find the chart id without a dashboard word in the request.
+    Domain {
+        words: &[
+            "pdf",
+            "excel",
+            "xlsx",
+            "csv",
+            "download",
+            "unduh",
+            "export",
+            "ekspor",
+            "spreadsheet",
+        ],
+        tools: &["export_dashboard", "export_chart", "list_charts"],
+    },
+    Domain {
+        words: &[
+            "subscribe",
+            "subscription",
+            "schedule a report",
+            "scheduled report",
+            "every monday",
+            "every week",
+            "every day",
+            "every month",
+            "email me",
+            "send me",
+            "send this",
+            "kirim",
+            "langganan",
+            "laporan terjadwal",
+            "tiap senin",
+            "setiap",
+        ],
+        tools: &[
+            "create_report_subscription",
+            "list_report_subscriptions",
+            "update_report_subscription",
+            "delete_report_subscription",
+            "list_boards",
+            "list_charts",
+        ],
+    },
     Domain {
         words: &[
             "pipeline", "job", "dagster", "schedul", "jadwal", "ingest", "refresh", "rebuild",
@@ -503,15 +597,49 @@ const DOMAINS: &[Domain] = &[
             "parameter",
             "reference line",
             "target line",
+            // BI-17 part A / AI-8: formatting.
+            "rupiah",
+            "currency",
+            "decimals",
+            "colour",
+            "color",
+            "palette",
+            "theme",
+            "dark mode",
+            "font",
+            "axis",
+            "trend line",
+            // BI-4 part B: remembered results.
+            "always fresh",
+            "fresh",
+            "cache",
+            "remember",
+            "stale",
+            "up to date",
+            "segar",
+            // BI-18 part C / AI-9: tabs.
+            // Whole words only: a bare "tab" is inside "table".
+            "tabs",
+            "a tab",
+            "new tab",
         ],
         tools: &[
             "list_charts",
+            "list_maps",
             "list_sql_sources",
             "suggest_join",
             "suggest_dashboard",
             "create_chart",
             "update_chart",
+            "format_chart",
+            "set_dashboard_theme",
+            "set_cache_rule",
             "create_board",
+            "create_tab",
+            "rename_tab",
+            "move_charts_to_tab",
+            "move_tab",
+            "delete_tab",
             "delete_chart",
             "rename_board",
             "delete_board",
@@ -537,6 +665,25 @@ const DOMAINS: &[Domain] = &[
             "update_parameter",
             "delete_parameter",
         ],
+    },
+    // BI-5 / D7: the query limits and Stop.
+    Domain {
+        words: &[
+            "query limit",
+            "time limit",
+            "row limit",
+            "limits",
+            "timed out",
+            "time out",
+            "timeout",
+            "too long",
+            "stop the",
+            "stop query",
+            "stop my",
+            "batas waktu",
+            "hentikan",
+        ],
+        tools: &["get_query_limits", "stop_query"],
     },
     Domain {
         words: &[
@@ -625,8 +772,16 @@ const DOMAINS: &[Domain] = &[
             "transform",
             "buat pipeline",
             "create a pipeline",
+            "target lag",
+            "lag",
+            "behind",
         ],
-        tools: &["get_pipeline", "create_pipeline", "mark_pipeline_ready"],
+        tools: &[
+            "get_pipeline",
+            "create_pipeline",
+            "mark_pipeline_ready",
+            "set_pipeline_target_lag",
+        ],
     },
     Domain {
         words: &[
@@ -902,6 +1057,28 @@ mod tests {
         );
     }
 
+    /// `BI-16` part C3 (D10): the build prompt tells the assistant the two
+    /// spatial functions and that a data policy refuses `RegionOf`.
+    #[test]
+    fn the_build_prompt_names_distance_and_region_of() {
+        let line = SYSTEM_BUILD_SUFFIX
+            .lines()
+            .find(|l| l.contains("Calculated fields (a value"))
+            .unwrap_or_else(|| panic!("the calculated-fields line is not in the build suffix"));
+        for needle in [
+            "Distance(",
+            "RegionOf(",
+            "list_maps",
+            "never geoDistance",
+            "data policy",
+        ] {
+            assert!(
+                line.contains(needle),
+                "{needle} is missing from the calculated-fields line"
+            );
+        }
+    }
+
     fn term(term: &str, meaning: &str) -> ChatTerm {
         ChatTerm {
             term: term.to_owned(),
@@ -1091,5 +1268,34 @@ mod tests {
             closing("这个图表是什么", Some(ReplyLanguage::Indonesian)),
             PLAIN_LINE
         );
+    }
+
+    /// `BI-18` part C review fix (SHOULD-FIX) R30.
+    #[test]
+    fn a_person_without_dashboard_write_gets_the_permission_sentence_in_the_context() {
+        use lakehouse_auth::PermissionSet;
+        let viewer = PermissionSet::parse("dashboard:read");
+        let note = dashboard_permission_note(Some(&viewer)).unwrap_or_default();
+        assert!(
+            note.contains("does not have the dashboard:write permission"),
+            "{note}"
+        );
+        assert!(
+            note.contains("Your account cannot change dashboards"),
+            "{note}"
+        );
+        assert!(note.contains("not because they are unavailable"), "{note}");
+        assert!(dashboard_permission_note(None).is_none());
+        let full = with_permission_note(
+            "HEAD\n\nLANGUAGE: x".to_owned(),
+            Some(&viewer),
+            "\n\nLANGUAGE: x",
+        );
+        assert!(
+            full.starts_with("HEAD\n\n[Permissions:") && full.ends_with("\n\nLANGUAGE: x"),
+            "{full}"
+        );
+        let editor = PermissionSet::parse("dashboard:write, dashboard:read");
+        assert!(dashboard_permission_note(Some(&editor)).is_none());
     }
 }

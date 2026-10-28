@@ -19,7 +19,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use lakehouse_auth::Secret;
-use lakehouse_auth::openfga::{LakekeeperAdminClient, OpenfgaError, TenantWarehouseStorage};
+use lakehouse_auth::openfga::{
+    DeletedTableLookup, LakekeeperAdminClient, OpenfgaError, TenantWarehouseStorage,
+};
 use serde_json::json;
 use wiremock::matchers::{body_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -51,8 +53,14 @@ async fn ensure_warehouse_reuses_an_existing_warehouse_by_name_instead_of_recrea
         .expect(1)
         .mount(&server)
         .await;
-    // No POST mock registered at all — if the client tried to create,
-    // wiremock's unmatched-request panic on drop catches it.
+    // The only POST is the soft-delete profile (`DATA-15` F4); a POST to
+    // `/management/v1/warehouse` would be a create and would 404 here.
+    Mock::given(method("POST"))
+        .and(path("/management/v1/warehouse/wh-existing/delete-profile"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(1)
+        .mount(&server)
+        .await;
     let client = LakekeeperAdminClient::new(server.uri(), Secret::new("admin-token"));
     let id = client
         .ensure_warehouse("tenant-acme", "lakehouse-warehouse/acme/", &test_storage())
@@ -98,6 +106,16 @@ async fn ensure_warehouse_creates_when_no_warehouse_with_that_name_exists() {
             }
         })))
         .respond_with(ResponseTemplate::new(201).set_body_json(json!({"warehouse-id": "wh-new"})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // `DATA-15` F4: the new warehouse is made soft-delete (7 days).
+    Mock::given(method("POST"))
+        .and(path("/management/v1/warehouse/wh-new/delete-profile"))
+        .and(body_json(json!({
+            "delete-profile": {"type": "soft", "expiration-seconds": 604_800}
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
         .expect(1)
         .mount(&server)
         .await;
@@ -220,4 +238,157 @@ async fn grant_machine_principals_fails_on_an_unexpected_status() {
         .await;
     let client = LakekeeperAdminClient::new(server.uri(), Secret::new("admin-token"));
     assert!(client.grant_machine_principals("wh-1").await.is_err());
+}
+
+/// `DATA-15` F4: a warehouse that cannot be put on soft delete is an error,
+/// not a silent hard-delete warehouse.
+#[tokio::test]
+async fn a_refused_soft_delete_profile_fails_the_provisioning_call() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/management/v1/warehouse"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "warehouses": [{"id": "wh-existing", "name": "tenant-acme"}]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/management/v1/warehouse/wh-existing/delete-profile"))
+        .respond_with(ResponseTemplate::new(400))
+        .mount(&server)
+        .await;
+    let client = LakekeeperAdminClient::new(server.uri(), Secret::new("admin-token"));
+    let err = client
+        .ensure_warehouse("tenant-acme", "lakehouse-warehouse/acme/", &test_storage())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, OpenfgaError::Rejected), "{err:?}");
+}
+
+fn deleted(id: &str, name: &str, ns: &[&str], typ: &str, at: &str) -> serde_json::Value {
+    json!({
+        "id": id, "name": name, "namespace": ns, "typ": typ,
+        "warehouse-id": "wh-1",
+        "created-at": "2026-10-01T00:00:00Z",
+        "deleted-at": at,
+        "expiration-date": "2026-10-23T00:00:00Z"
+    })
+}
+
+/// `DATA-15` F4: the deleted-tabulars list is read page by page, only a
+/// *table* of that namespace and name matches, and the newest drop wins.
+#[tokio::test]
+async fn find_deleted_table_pages_matches_exactly_and_picks_the_newest_drop() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/management/v1/warehouse/wh-1/deleted-tabulars"))
+        .and(wiremock::matchers::query_param("pageToken", "p2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "tabulars": [deleted("t-new", "orders", &["bronze"], "table", "2026-10-16T09:00:00Z")]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/management/v1/warehouse/wh-1/deleted-tabulars"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "tabulars": [
+                deleted("t-old", "orders", &["bronze"], "table", "2026-10-10T09:00:00Z"),
+                deleted("t-view", "orders", &["bronze"], "view", "2026-10-15T09:00:00Z"),
+                deleted("t-other-ns", "orders", &["silver"], "table", "2026-10-15T09:00:00Z"),
+                deleted("t-other", "orders_archive", &["bronze"], "table", "2026-10-15T09:00:00Z")
+            ],
+            "next-page-token": "p2"
+        })))
+        .mount(&server)
+        .await;
+    let client = LakekeeperAdminClient::new(server.uri(), Secret::new("admin-token"));
+    let found = match client
+        .find_deleted_table("wh-1", "bronze", "orders")
+        .await
+        .unwrap()
+    {
+        DeletedTableLookup::Found(t) => t,
+        other => panic!("expected Found, got {other:?}"),
+    };
+    assert_eq!(found.id, "t-new");
+    assert_eq!(found.expires_at, "2026-10-23T00:00:00Z");
+    assert_eq!(
+        client
+            .find_deleted_table("wh-1", "bronze", "nothing")
+            .await
+            .unwrap(),
+        DeletedTableLookup::None
+    );
+}
+
+// PR #106 review R1 SHOULD-FIX DATA-15 2
+#[tokio::test]
+async fn find_deleted_table_stops_after_20_pages_and_returns_could_not_tell() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/management/v1/warehouse/wh-1/deleted-tabulars"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "tabulars": [],
+            "next-page-token": "more"
+        })))
+        .mount(&server)
+        .await;
+    let client = LakekeeperAdminClient::new(server.uri(), Secret::new("admin-token"));
+    let lookup = client
+        .find_deleted_table("wh-1", "bronze", "orders")
+        .await
+        .unwrap();
+    assert_eq!(lookup, DeletedTableLookup::CouldNotTell);
+}
+
+/// `DATA-15` F4: undrop sends the table's id as a `table` target.
+#[tokio::test]
+async fn undrop_table_sends_the_table_id_as_a_table_target() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/management/v1/warehouse/wh-1/deleted-tabulars/undrop",
+        ))
+        .and(body_json(
+            json!({"targets": [{"id": "t-1", "type": "table"}]}),
+        ))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = LakekeeperAdminClient::new(server.uri(), Secret::new("admin-token"));
+    client.undrop_table("wh-1", "t-1").await.unwrap();
+}
+
+/// `DATA-15` F4: a refused undrop is `Rejected`, and the warehouse lookup
+/// answers by name.
+#[tokio::test]
+async fn a_refused_undrop_is_rejected_and_a_warehouse_is_found_by_name() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/management/v1/warehouse/wh-1/deleted-tabulars/undrop",
+        ))
+        .respond_with(ResponseTemplate::new(409))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/management/v1/warehouse"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "warehouses": [{"id": "wh-1", "name": "default"}]
+        })))
+        .mount(&server)
+        .await;
+    let client = LakekeeperAdminClient::new(server.uri(), Secret::new("admin-token"));
+    let err = client.undrop_table("wh-1", "t-1").await.unwrap_err();
+    assert!(matches!(err, OpenfgaError::Rejected), "{err:?}");
+    assert_eq!(
+        client
+            .find_warehouse_id("default")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("wh-1")
+    );
+    assert!(client.find_warehouse_id("other").await.unwrap().is_none());
 }
