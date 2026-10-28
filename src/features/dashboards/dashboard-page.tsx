@@ -70,6 +70,7 @@ import { LineDialog } from "./line-dialog";
 import { TabBar } from "./tab-bar";
 import { isSectionKind } from "./tile-card";
 import { ChartAlertDialog, type AlertChart } from "./chart-alert-dialog";
+import { chartHasLatestPoint } from "./chart-alert";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { DashboardTilesSkeleton } from "./dashboard-skeleton";
 import { DrillMenu, NoteDialog, RecordsDialog, type DrillTarget } from "./drill";
@@ -1090,7 +1091,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       ...(own ? [{ label: "Where does this come from", icon: <GitFork />, onSelect: () => setLineageChart({ id: spec.id, title: spec.title }) }] : []),
       // BI-19 part C (C3): everyone who can view a stored chart may alert on it
       // for themselves; the server decides who may send it elsewhere.
-      ...(own && !edit ? [{ label: "Alert me…", icon: <Bell />, onSelect: () => setAlertChart({ id: spec.id, title: spec.title, kind: spec.kind, measures: hasRows(cell) ? cell.columns.filter((c) => c !== spec.def?.dimension) : [] }) }] : []),
+      ...(own && !edit ? [{ label: "Alert me…", icon: <Bell />, onSelect: () => setAlertChart({ id: spec.id, title: spec.title, kind: spec.kind, measures: hasRows(cell) ? cell.columns.filter((c) => c !== spec.def?.dimension) : [], latestPoint: chartHasLatestPoint(spec.def) }) }] : []),
       // BI-9: a chart grouped by a part of the date (a weekday) has no rows to
       // list or range to filter; the menu says why instead of leaving the click dead.
       ...(hasRows(cell) && isGrain(cell.grain) && !isTruncation(cell.grain)

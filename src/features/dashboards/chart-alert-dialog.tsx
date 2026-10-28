@@ -29,7 +29,17 @@ export type AlertChart = {
   readonly kind: string;
   /** The value columns of the chart, the choices for "series". */
   readonly measures: readonly string[];
+  /**
+   * Whether the chart has a latest point to compare (not sorted by value).
+   * False offers only "returns any rows" (BI-19 owner QA 2026-10-28, QA-6);
+   * the server's save-time check stays the authority. Absent means true.
+   */
+  readonly latestPoint?: boolean;
 };
+
+/** The sentence for a chart sorted by value. */
+export const NO_LATEST_POINT_SENTENCE =
+  "This chart is sorted by value, so it has no latest point to compare; it can only alert when it returns rows.";
 
 /**
  * A chart's ⋯ > "Alert me…": a condition on the chart's number, the line, the
@@ -49,7 +59,9 @@ export function ChartAlertDialog({
   readonly canWriteAlerts: boolean;
 }) {
   const shape = alertNumberShape(chart.kind);
-  const conditions: AlertCondition[] = shape === "none" ? ["any_rows"] : ["above", "below", "any_rows"];
+  const sortedByValue = shape === "series" && chart.latestPoint === false;
+  const conditions: AlertCondition[] = shape === "none" || sortedByValue ? ["any_rows"] : ["above", "below", "any_rows"];
+
   const [condition, setCondition] = React.useState<AlertCondition>(conditions[0]);
   const [threshold, setThreshold] = React.useState("");
   const [series, setSeries] = React.useState(chart.measures[0] ?? "");
@@ -111,6 +123,7 @@ export function ChartAlertDialog({
             {shape === "none" ? (
               <p className="text-xs text-muted-foreground">This chart has no single number, so an alert on it can only ask whether it returns any rows.</p>
             ) : null}
+            {sortedByValue ? <p className="text-xs text-muted-foreground">{NO_LATEST_POINT_SENTENCE}</p> : null}
           </div>
           {needsLine ? (
             <div className="grid gap-1.5">

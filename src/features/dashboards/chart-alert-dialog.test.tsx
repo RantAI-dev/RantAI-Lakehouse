@@ -1,7 +1,7 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it } from "bun:test"
-import { alertNumberShape } from "./chart-alert"
-import { ChartAlertDialog, OWN_ADDRESS_SENTENCE } from "./chart-alert-dialog"
+import { alertNumberShape, chartHasLatestPoint } from "./chart-alert"
+import { ChartAlertDialog, NO_LATEST_POINT_SENTENCE, OWN_ADDRESS_SENTENCE } from "./chart-alert-dialog"
 
 const originalFetch = global.fetch
 type Call = { url: string; method: string; body: Record<string, unknown> | undefined }
@@ -38,7 +38,32 @@ describe("alertNumberShape", () => {
   })
 })
 
+describe("chartHasLatestPoint", () => {
+  it("mirrors the server: a value sort has none, a sort by the dimension or no order has one", () => {
+    // BI-19 owner QA 2026-10-28, QA-6
+    expect(chartHasLatestPoint({ dimension: "provinsi", sort: { by: "sum_visitors" } })).toBe(false)
+    expect(chartHasLatestPoint({ dimension: "visit_date", sort: null })).toBe(true)
+    expect(chartHasLatestPoint({ dimension: "visit_date", sort: { by: "visit_date" } })).toBe(true)
+    expect(chartHasLatestPoint({ dimension: "d", order: "desc" })).toBe(false)
+    expect(chartHasLatestPoint({ dimension: "d", order: "none" })).toBe(true)
+    expect(chartHasLatestPoint(undefined)).toBe(true)
+  })
+})
+
 describe("ChartAlertDialog", () => {
+  it("offers only 'returns any rows' for a chart sorted by value, with the reason, and hides the series", async () => {
+    const calls = mockApi()
+    open({ id: "c4", title: "By province", kind: "bar", measures: ["sum_visitors"], latestPoint: false } as typeof line)
+    const when = screen.getByLabelText("When") as HTMLSelectElement
+    expect(Array.from(when.options).map((o) => o.value)).toEqual(["any_rows"])
+    expect(screen.getByText(NO_LATEST_POINT_SENTENCE)).toBeTruthy()
+    expect(screen.queryByLabelText(/Series/)).toBeNull()
+    fireEvent.click(screen.getByRole("button", { name: "Save alert" }))
+    await waitFor(() => expect(calls.length).toBe(1))
+    expect(calls[0].body).toMatchObject({ chart: "c4", condition: "any_rows" })
+    expect(calls[0].body?.series).toBeUndefined()
+  })
+
   it("saves a KPI alert with the chart, the condition, the line, the filters on screen and the person's own address", async () => {
     const calls = mockApi()
     open(kpi, { filters: [{ column: "region", values: ["Bali"] }] })
