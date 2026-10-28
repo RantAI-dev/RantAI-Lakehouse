@@ -69,7 +69,10 @@ pub(crate) mod schema_versions;
 mod settings;
 mod storage;
 pub(crate) mod support;
-mod uploads;
+// `pub(crate)`, because `crate::upload_convert` (the child process's
+// protocol) needs this module's own sentences: a file that is too large is
+// refused with the same words wherever it is noticed (`SEC-22` D4).
+pub(crate) mod uploads;
 
 use std::time::Duration;
 

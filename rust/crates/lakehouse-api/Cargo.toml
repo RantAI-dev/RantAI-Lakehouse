@@ -170,6 +170,13 @@ reqwest013 = { package = "reqwest", version = "0.13", default-features = false, 
 # `futures` 0.3 is already in `Cargo.lock` (`lakehouse-iceberg` depends on it),
 # so this adds no package; only this crate's dependency list in the lockfile.
 futures = "0.3"
+# `SEC-22`: the child process that reads an uploaded workbook or a Parquet
+# file (`upload_convert`) sets its own `RLIMIT_AS` and `RLIMIT_CPU` with
+# `nix`, so the memory a crafted file can ask for is the child's and never
+# the API's. The crate was already in `Cargo.lock` (0.31.3) through other
+# crates, so the lockfile gains no package; only the `resource` feature and
+# this dependency list change. MIT.
+nix = { workspace = true }
 # `BI-1` D6: the .xlsx writer. Pinned exactly (a download format must not change
 # under a routine update); `constant_memory` mode keeps a million-row export off
 # the heap. MIT OR Apache-2.0; `cargo deny check` and `cargo audit` pass with it

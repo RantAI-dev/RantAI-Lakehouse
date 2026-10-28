@@ -50,6 +50,7 @@ mod tenant;
 mod tenant_scope;
 mod tile_pool;
 mod transform_grammar;
+mod upload_convert;
 mod upload_formats;
 mod upload_limits;
 mod upload_parquet;
@@ -71,7 +72,18 @@ use state::AppState;
 /// Builds the runtime by hand instead of `#[tokio::main]` only to set the
 /// thread stack size: phase 2 catch-up with main (sqlparser 0.63), see
 /// [`config::WORKER_STACK_BYTES`] for the measurement behind the value.
+///
+/// `SEC-22` D1: the child that reads an uploaded workbook or a Parquet file
+/// is this same binary, started again with `inspect-upload`. Its branch comes
+/// FIRST — before the runtime is built and before the configuration is read —
+/// so the child needs no environment, starts no threads and opens no
+/// connection, and so that a file which asks for more memory than the
+/// machine has ends the CHILD and never the API.
 fn main() -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(code) = upload_convert::run_child_if_asked(&args) {
+        std::process::exit(code);
+    }
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_stack_size(config::WORKER_STACK_BYTES)

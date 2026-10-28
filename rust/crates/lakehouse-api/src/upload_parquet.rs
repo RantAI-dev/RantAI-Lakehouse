@@ -122,7 +122,7 @@ use parquet::arrow::arrow_reader::{
 use parquet::basic::Type as PhysicalType;
 use parquet::file::metadata::{ParquetMetaData, RowGroupMetaData};
 use parquet::file::reader::ChunkReader;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::upload_workbook::{finish_text, float_text, write_record};
 
@@ -208,7 +208,7 @@ pub enum ParquetFileError {
 }
 
 /// One column of a file, as the console shows it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ColumnInfo {
     /// The column's name: the header of the converted text.
@@ -221,7 +221,7 @@ pub struct ColumnInfo {
 }
 
 /// What the footer says about a file.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ParquetInfo {
     /// The columns in file order.
@@ -443,13 +443,30 @@ fn retyped_legacy(
 
 /// A column name fit to quote in a sentence: no control characters, at most
 /// [`MAX_QUOTED_NAME_CHARS`] characters.
-fn quoted_name(name: &str) -> String {
+pub(crate) fn quoted_name(name: &str) -> String {
     let clean: String = name.chars().filter(|c| !c.is_control()).collect();
     if clean.chars().count() > MAX_QUOTED_NAME_CHARS {
         let head: String = clean.chars().take(MAX_QUOTED_NAME_CHARS).collect();
         format!("{head}...")
     } else {
         clean
+    }
+}
+
+/// The word a refusal uses for a type that has no text form, when the word
+/// comes from outside this module — the child process's answer (`SEC-22`).
+///
+/// Only the six words [`unsupported_word`] names are words; anything else is
+/// `unsupported`, so a word that is not one of ours cannot end up in a
+/// sentence.
+pub(crate) fn type_word(word: &str) -> &'static str {
+    match word {
+        "binary" => "binary",
+        "list" => "list",
+        "map" => "map",
+        "struct" => "struct",
+        "interval" => "interval",
+        _ => "unsupported",
     }
 }
 
@@ -565,7 +582,7 @@ fn convert_capped<R: ChunkReader + Clone + 'static>(
         } = open(reader, cell_cap)?;
         let mut out = Vec::new();
         let names: Vec<&str> = info.columns.iter().map(|c| c.name.as_str()).collect();
-        write_record(&mut out, &names);
+        write_record(&mut out, &names).map_err(|_err| ParquetFileError::Unreadable)?;
 
         // A preview (`max_rows` given) reads the FIRST row group only, and only
         // when it is small enough to fetch; a larger one is shown as its columns
@@ -613,7 +630,7 @@ fn write_batch(out: &mut Vec<u8>, batch: &RecordBatch) -> Result<(), ParquetFile
                 .iter()
                 .map(|column| column.get(row).map_or("", String::as_str)),
         );
-        write_record(out, &fields);
+        write_record(out, &fields).map_err(|_err| ParquetFileError::Unreadable)?;
     }
     Ok(())
 }

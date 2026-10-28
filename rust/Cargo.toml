@@ -56,6 +56,15 @@ url = "2"
 # transitively (via `reqwest`, `2.12.1` in `Cargo.lock`) — this is the
 # first DIRECT use, so it needs its own workspace entry.
 ipnet = "2"
+# `SEC-22`: the child process that reads an uploaded workbook or a Parquet
+# file (`lakehouse-api::upload_convert`) sets its OWN resource limits
+# (`RLIMIT_AS`, `RLIMIT_CPU`) before it reads anything, so a crafted file
+# that asks for more memory than the machine has ends the child and never
+# the API. `nix` does that without `unsafe` (`Command::pre_exec` is the
+# other way). Already in `Cargo.lock` (0.31.3) through other crates, so the
+# lockfile gains no package; only the `resource` feature and the
+# `lakehouse-api` dependency list change. MIT.
+nix = { version = "0.31", default-features = false, features = ["resource"] }
 time = { version = "0.3", features = ["formatting", "parsing", "serde"] }
 # `RPT-1` (`lakehouse-store::report_schedule`): zone-aware schedule maths needs a
 # time zone database in Rust, and the workspace had none (the zone list lives

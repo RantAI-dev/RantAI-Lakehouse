@@ -30,10 +30,7 @@ use std::process::Command;
 
 /// The fixtures of `ops/fixtures/uploads/hostile/`, by name.
 const FIXTURES: [(&str, Expected); 2] = [
-    (
-        "huge_shared_strings.xlsx",
-        Expected::Abort,
-    ),
+    ("huge_shared_strings.xlsx", Expected::Abort),
     ("huge_footer.parquet", Expected::Refusal),
 ];
 
@@ -83,7 +80,10 @@ fn reads_the_hostile_fixture_named_by_the_environment() {
         return;
     };
     let bytes = axum::body::Bytes::from(fixture(&name));
-    let outcome: Result<String, String> = if name.ends_with(".xlsx") {
+    let is_workbook = std::path::Path::new(&name)
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("xlsx"));
+    let outcome: Result<String, String> = if is_workbook {
         lakehouse_api::upload_workbook::list_sheets(&bytes)
             .map(|info| format!("{info:?}"))
             .map_err(|err| err.to_string())

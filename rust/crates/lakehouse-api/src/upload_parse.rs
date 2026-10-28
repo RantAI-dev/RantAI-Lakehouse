@@ -1548,11 +1548,15 @@ mod tests {
             // `types/` is `DATA-18` T3.1's own set, read by `upload_types`
             // against its own list, and `formats/` is `DATA-17` slice 4's, read by
             // `upload_formats`; neither is one of the dialect fixtures.
+            // `hostile/` is `SEC-22` T1's set: files made to cost a reader
+            // more than it should, read by the `SEC-22` reproduction and by
+            // no dialect at all.
             .filter(|name| {
                 name != "README.md"
                     && name != ".gitattributes"
                     && name != "types"
                     && name != "formats"
+                    && name != "hostile"
             })
             .collect();
         found.sort_unstable();
