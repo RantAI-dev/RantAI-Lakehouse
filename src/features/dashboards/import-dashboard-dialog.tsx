@@ -2,6 +2,7 @@
 
 import * as React from "react";
 import Link from "next/link";
+import { ArrowRight, Upload } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   Dialog, DialogClose, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle,
@@ -43,14 +44,17 @@ export function ImportDashboardDialog({
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
   const [result, setResult] = React.useState<ImportResult | null>(null);
+  const [fileName, setFileName] = React.useState<string | null>(null);
+  const fileInput = React.useRef<HTMLInputElement>(null);
 
   React.useEffect(() => {
     if (!open) return;
-    setFile(null); setPreview(null); setMapping({}); setFolderId(NO_FOLDER); setBusy(false); setError(null); setResult(null);
+    setFile(null); setPreview(null); setMapping({}); setFolderId(NO_FOLDER); setBusy(false); setError(null); setResult(null); setFileName(null);
   }, [open]);
 
   async function choose(chosen: File | undefined) {
     if (!chosen) return;
+    setFileName(chosen.name);
     setBusy(true); setError(null); setPreview(null);
     try {
       const parsed = await readDashboardFile(chosen);
@@ -108,14 +112,24 @@ export function ImportDashboardDialog({
           <div className="flex flex-col gap-3">
             <div className="flex flex-col gap-1.5">
               <Label htmlFor="import-file">Dashboard file</Label>
+              {/* BI-19 owner QA 2026-10-28, QA-10: the browser's bare file input (and its
+                  native "No file chosen" tooltip) is hidden; the button below opens it. */}
               <input
+                ref={fileInput}
                 id="import-file"
                 type="file"
                 accept=".json,application/json"
                 disabled={busy}
                 onChange={(e) => void choose(e.target.files?.[0])}
-                className="text-sm"
+                className="sr-only"
+                tabIndex={-1}
               />
+              <div className="flex items-center gap-2">
+                <Button type="button" variant="outline" size="sm" disabled={busy} onClick={() => fileInput.current?.click()}>
+                  <Upload className="size-4" aria-hidden /> Choose a file…
+                </Button>
+                <span className="min-w-0 truncate text-sm text-muted-foreground">{fileName ?? "No file chosen"}</span>
+              </div>
             </div>
             {preview ? (
               <>
@@ -128,46 +142,40 @@ export function ImportDashboardDialog({
                   </p>
                 ) : null}
                 {preview.tables.length > 0 ? (
-                  <table className="w-full text-sm" aria-label="Table mapping">
-                    <thead>
-                      <tr className="text-left text-xs text-muted-foreground">
-                        <th className="pb-1 font-normal">Table in the file</th>
-                        <th className="pb-1 font-normal">Table here</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {preview.tables.map((t) => (
-                        <tr key={t.name}>
-                          <td className="py-1 pr-2 align-top">
-                            {t.name}
-                            {t.suggested && t.missingColumns.length > 0 ? (
-                              <span className="block text-xs text-muted-foreground">
-                                Missing here: {t.missingColumns.join(", ")}
-                              </span>
-                            ) : null}
-                          </td>
-                          <td className="py-1">
-                            <Select
-                              value={mapping[t.name] ?? NO_TABLE}
-                              onValueChange={(v) => setMapping((m) => {
-                                const next = { ...m };
-                                if (!v || v === NO_TABLE) delete next[t.name]; else next[t.name] = v;
-                                return next;
-                              })}
-                            >
-                              <SelectTrigger className="w-full" aria-label={`Table here for ${t.name}`}>
-                                <SelectValue>{mapping[t.name] ?? "None (leave its charts out)"}</SelectValue>
-                              </SelectTrigger>
-                              <SelectContent>
-                                <SelectItem value={NO_TABLE}>None (leave its charts out)</SelectItem>
-                                {preview.readableTables.map((r) => <SelectItem key={r} value={r}>{r}</SelectItem>)}
-                              </SelectContent>
-                            </Select>
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
+                  <div className="grid grid-cols-[1fr_auto_1fr] items-center gap-x-2 gap-y-2 text-sm" role="group" aria-label="Table mapping">
+                    <span className="text-xs text-muted-foreground">Table in the file</span>
+                    <span aria-hidden />
+                    <span className="text-xs text-muted-foreground">Table here</span>
+                    {preview.tables.map((t) => (
+                      <React.Fragment key={t.name}>
+                        <div className="min-w-0 break-words">
+                          {t.name}
+                          {t.suggested && t.missingColumns.length > 0 ? (
+                            <span className="block text-xs text-muted-foreground">
+                              Missing here: {t.missingColumns.join(", ")}
+                            </span>
+                          ) : null}
+                        </div>
+                        <ArrowRight className="size-4 text-muted-foreground" aria-hidden />
+                        <Select
+                          value={mapping[t.name] ?? NO_TABLE}
+                          onValueChange={(v) => setMapping((m) => {
+                            const next = { ...m };
+                            if (!v || v === NO_TABLE) delete next[t.name]; else next[t.name] = v;
+                            return next;
+                          })}
+                        >
+                          <SelectTrigger className="w-full" aria-label={`Table here for ${t.name}`}>
+                            <SelectValue>{mapping[t.name] ?? "None (leave its charts out)"}</SelectValue>
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value={NO_TABLE}>None (leave its charts out)</SelectItem>
+                            {preview.readableTables.map((r) => <SelectItem key={r} value={r}>{r}</SelectItem>)}
+                          </SelectContent>
+                        </Select>
+                      </React.Fragment>
+                    ))}
+                  </div>
                 ) : null}
                 {folders.length > 0 ? (
                   <div className="flex flex-col gap-1.5">
