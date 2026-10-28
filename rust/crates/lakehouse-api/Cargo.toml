@@ -115,7 +115,7 @@ jiff = { workspace = true }
 # lockfile, each MIT or Apache-2.0, all in `deny.toml`'s allow list. No
 # features: dates are rendered from its date components, so its `chrono`
 # feature is not needed.
-calamine = "0.36"
+calamine = "0.37"
 uuid = { workspace = true }
 sqlx = { workspace = true }
 # `connector_probe`'s real S3-compatible connectivity test — same crate,
