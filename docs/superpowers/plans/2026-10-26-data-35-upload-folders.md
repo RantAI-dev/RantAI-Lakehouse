@@ -101,3 +101,47 @@ Developer: a non-Opus agent (Claude Sonnet 5.5). Branch `feat/data-35-upload-fol
 ## 8. Review
 
 (Planner: findings tagged `BLOCKER` or `SHOULD-FIX`.)
+
+### Round 1, 2026-10-28, at `54588c4e` (read, not run; verification runs on the fix round's final commit)
+
+**BLOCKER 1. "No folder" is shown but not sent, or sent and ignored (decision 2; deviations 5 and 7).**
+The Table step leaves `folderId` out when the picker is untouched and the table's newest listed upload is in no folder (`src/features/connectors/upload-file-page.tsx:115-116`, `:177`); the route then falls back to the claim's remembered folder (`routes/uploads.rs:2499-2501`, `FolderRef::Absent`). An explicit `null` becomes `None` (`FolderRef::Null`), and the store writes `folder_id = COALESCE($7, folder_id)` / `COALESCE($8, folder_id)` (`lakehouse-store/src/uploads.rs:1005`, `:1030`), which keeps the file's folder. `retryInput` (`src/lib/uploads.ts:362`) also leaves the folder out when it is unset. Failures:
+- Load table `t` into folder A (the claim remembers A); move the file to No folder (a move never touches the claim); re-upload into `t`: the step shows No folder, nothing is sent, the file lands in A.
+- Load `f` with No folder while the claim remembers A, and the load fails; Try again omits `folderId`; `f` lands in A.
+- Re-open a file that sits in folder B and choose No folder: `null` is sent, `COALESCE` keeps B, and the choice is dropped without a word.
+
+The comment at `upload-file-page.tsx:176` ("the folder shown on the Table step is the one sent, `null` included") is false (rule 1). Fix:
+- The console always sends what the picker shows (`folderId: folderId ?? null`) whenever the picker is rendered, and `retryInput` sends `upload.folderId ?? null`.
+- The store's folder input becomes three-state (keep / set none / set some), so an explicit `null` sets `folder_id = NULL` on the primary and every file of the group.
+- An explicit `null` also sets the claim's folder to none: the claim records the latest load's choice (AD-4).
+- "Absent means the claim's folder" stays, for API callers only.
+- Tests: update `upload-file-page.test.tsx:1052` and `:1127`, which pin the omission today, and `uploads.test.ts:521`. Add route tests for "re-load a file that is in a folder with `null`" (the file and the claim end with no folder) and "absent `folderId` uses the claim's folder".
+- Rewrite the feature page line `upload-folders.md:65` to match.
+
+**SHOULD-FIX 2. The migration header gives a false reason for `NO ACTION` (deviation 1; rule 1).** `rust/migrations/0112_upload_folders.sql:33-38` says `RESTRICT` "would fail on whichever row the cascade reached first". Checked on Postgres 16, in a rolled-back transaction: a tenant `ON DELETE CASCADE` over a three-level chain with `parent_id ON DELETE RESTRICT` succeeds. Both are checked at the end of the statement; `NO ACTION` can additionally be deferred. Keep `NO ACTION` (accepted) and correct the sentence. The migration is not applied on `main`, so editing it is allowed. The real consequence stands: a tenant with a file still in a folder cannot be deleted, `23503` through `file_upload.folder_id RESTRICT`. Add that cause to the `# Errors` of `identity::delete_tenant` (`lakehouse-store/src/identity.rs:876`), which names only `app_user_tenant`.
+
+**SHOULD-FIX 3. Merge `main`.** The branch is 297 commits behind and conflicts in `CHANGELOG.md` and `docs/core/BACKLOG.md`. `policy.rs`, `routes/mod.rs`, `tests/route_auth.rs` and `lakehouse-store/src/lib.rs` auto-merge, but nothing has compiled them together, and the green CI at `54588c4e` is for the old base. Migration `0112` is still free (`main` stops at `0111`; `feat/bi-19-access` uses `0113`–`0114`). Resolve hunk by hunk (rule 9), and in `BACKLOG.md` keep `main`'s rows and change only `DATA-35`'s.
+
+**SHOULD-FIX 4. The CHANGELOG entry ends with a stale sentence.** The `DATA-35` entry (`CHANGELOG.md:34`) says the tests "were written but not run … the pull request's CI runs them". Delete the sentence: CI has run them, and the fix round re-runs everything.
+
+**SHOULD-FIX 5 (small, same round).**
+- `FOLDER_ID_RULE` is defined twice, at `routes/uploads.rs:284` and `routes/uploads/folders.rs:55` (rule 4): keep one.
+- The rename audit records the untrimmed name (`folders.rs:278`): record `changed.name`.
+
+**Checked and fine.**
+- The store rules are enforced in the database and are race-safe: one transaction under `pg_advisory_xact_lock(hashtext('upload_folder:'||tenant))` for create, update, delete and move. Depth is `parent_depth + subtree height > 3`. Sibling names are unique through the `lower(name)` index (`23505` → `NameTaken`). An upload racing a delete is refused by the `RESTRICT` key (`23503` → `NotEmpty`).
+- The tenant is bound in every query. Ingest checks `folder_in_tenant` before it claims. A move is all-or-nothing.
+- Routes: static paths come before `{id}`; all five are `connector:manage` and asserted both ways in `route_auth.rs`; responses use fixed sentences and `ApiJson`; there is no `unwrap` outside tests; SQL values are bound.
+- Console: imports go through `@/services`, fetches through `apiFetch`, and there are no new mocks.
+- The gate's `step_folders` follows the Python rules.
+- The commits after the handoff (`57595d76`, `5c1b8f1d`, `371084d2`, `54588c4e`) weaken nothing.
+
+**Deviations.** Accepted: 2, 3, 4, 8, 9, 10. Accepted with conditions:
+- 1: accepted, but its stated reason is false (SHOULD-FIX 2).
+- 5: accepted for API callers only, once BLOCKER 1 is fixed.
+- 6: accepted for this slice. A table whose uploads have dropped out of the newest-100 window then preselects No folder; returning the claim's folder from an API route is the follow-up.
+
+Rejected:
+- 7: rejected (BLOCKER 1).
+
+Open: BLOCKER 1, SHOULD-FIX 2 to 5.
