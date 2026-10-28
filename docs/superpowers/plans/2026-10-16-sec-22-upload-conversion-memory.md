@@ -1,8 +1,9 @@
 # `SEC-22`: reading a workbook or a Parquet file can never end the API process
 
 Planner and reviewer: Claude Opus. Developer: a non-Opus agent (`AGENTS.md`).
-Base: `origin/main` at `17867e52`. Branch: `fix/sec-22-upload-conversion-memory`,
-worktree `/home/hv/lakehouse-sec22-uploads`. One PR slice, to `main`, before the
+Base: `origin/main` at `f40b20eb` (re-anchored 2026-10-28, section 0; first
+written at `17867e52`). Branch: `fix/sec-22-upload-conversion-memory`, worktree
+`/home/shiro/rantai/wt-sec22`. One PR slice, to `main`, before the
 Phase 3 PR (#186): the product owner chose this on 2026-10-16. Phase 3 slices 2
 and 4 build on it (`docs/superpowers/plans/2026-10-16-data-phase-3-uploads.md`).
 
@@ -13,6 +14,133 @@ conversions running at once; workbook text has no byte cap; each preview convert
 the whole file again; and the limits doc in `upload_workbook.rs` says the opposite
 of the code. Source: PR #76 review, BLOCKER 1 (merged without the fix), and
 `docs/superpowers/plans/2026-10-12-delivery-review.md`.
+
+
+## 0. Amendment, 2026-10-28: re-anchored at `f40b20eb`
+
+The plan was written before Phase 3 (`DATA-17`, `DATA-18`, PR #186) merged.
+Where this section and sections 1 to 4 disagree, **this section wins**. Line
+numbers below are at `f40b20eb`; `R` is still `routes/uploads.rs`.
+
+### What Phase 3 changed
+
+- **A Parquet file is no longer converted for a load.** The job reads it
+  natively (`dagster/dispar_orchestrate/parquet_ingest.py`), and
+  `convert_upload` answers 500 for `Conversion::Parquet` (`R:2404`). The API
+  still parses Parquet in three places:
+  - `create`, on the request bytes (`R:881-887`, `upload_parquet::inspect`);
+  - `parquet_preview` (`R:1860-1868`, `upload_parquet::convert` with
+    `PARQUET_PREVIEW_ROWS`);
+  - `check_parquet_footer` at ingest (`R:2364-2375`, `inspect`).
+  The last two read through `RangeReader` (`upload_parquet_range.rs:48`). The
+  footer is bounded (`MAX_FOOTER_BYTES`, `upload_parquet.rs:160`) and so is
+  the first row group's compressed size (`MAX_PREVIEW_GROUP_BYTES`, `:166`).
+  The sizes a page declares for itself once decompressed are still the file's
+  word, and the decode still runs in the API. So Parquet stays in scope, for
+  `inspect` and the preview only.
+- **Workbooks are unchanged:**
+  - `create` lists the sheets at `R:873-879`;
+  - `workbook_preview` reads the whole object and runs `read_sheet` on every
+    call (`R:1817-1830`);
+  - `convert_upload` reads the whole object, writes `to_csv(None)` whole,
+    and stores it with one `put` under `converted_key` (`R:2377-2414`,
+    `R:582`, `<storage_key>.converted.csv`).
+- **`main.rs`:**
+  - `main()` (`:74-81`) only builds the runtime.
+  - `run()` reads `Config::from_env` (`:91`) and then dispatches
+    `rotate-secrets-key` (`:94-100`).
+  - The `inspect-upload` branch goes at the top of `main()`, before the
+    runtime is built (D1 is unchanged).
+  - PR #192 (`SEC-14` part B) adds a rustls provider install at the start of
+    `main()`. Whichever PR merges second keeps the child's branch first: the
+    child opens no connection and needs no provider.
+- **The store already writes in parts** (`upload_store.rs`):
+  `create_multipart` `:387`, `put_part` `:403`, `complete_multipart` `:436`,
+  `abort_multipart` `:464`, plus `get_range` `:313` and `head_bytes` `:296`.
+  D5's streamed write uses these. Do not add a second multipart path (rule 4).
+- **`blocking` (`R:623`) stays.** The gzip and zip checks in `create`
+  (`R:863-872`) still use it. They stream with a cap and are not `SEC-22`.
+
+### Decisions that change
+
+- **D1a. No file parser runs in the API process.** Every workbook and Parquet
+  parse listed above goes through the child.
+- **D1b. Feeding the child.** The child never reads the store or the network
+  (D1).
+  - At `create`, the request bytes are already in memory, and the API writes
+    them to the child's stdin.
+  - Everywhere else, the API streams the stored original into stdin in
+    chunks (`get_range`, 8 MiB). So the API never holds the file, which keeps
+    Phase 3's invariant for Parquet. The child holds it under its own memory
+    limit; the 50 MiB upload cap (`MAX_UPLOAD_BYTES`, `R:171`) bounds it.
+  - A Parquet child reads from memory (`Bytes` is a `ChunkReader`), so
+    `RangeReader` is no longer used by these three calls. Remove it if
+    nothing else uses it.
+  - Cost, deliberate: a Parquet preview now moves the whole file (at most
+    50 MiB) from the store, not just the footer and the first row group. Say
+    so in the commit.
+- **D2 (replaces D2).** The child's operations. Each writes one JSON line to
+  stdout first, then, for the two that convert, the CSV text until EOF:
+  - `list-sheets` → `WorkbookInfo`.
+  - `convert-sheet [name]` → `{sheet, info, empty}`, then the sheet's CSV
+    (`to_csv(None)`).
+  - `inspect-parquet` → `ParquetInfo`.
+  - `preview-parquet <max_rows>` → the converted preview's `info`, then its
+    CSV.
+
+  There is no whole-file Parquet conversion; the job reads the file. The
+  existing pure functions keep their unit tests.
+- **D5 (replaces D5).** Convert a workbook sheet once and store it.
+  - `create` stores the `list-sheets` JSON beside the original as
+    `<storage_key>.sheets.json`.
+  - A preview or an ingest finds the sheet's position `n` from that list. A
+    missing sheet means `default_sheet` (`upload_workbook.rs:137`), the same
+    rule `read_sheet` uses (`:332`).
+    - The list is read from storage, which is small, with no child.
+    - An upload made before this change has no `.sheets.json`. It runs
+      `list-sheets` once and stores the result.
+  - The sheet's text is stored once as `<storage_key>.converted.<n>.csv` and
+    its JSON line as `<storage_key>.converted.<n>.json`. Both are written by
+    streaming the child's stdout through the multipart helpers, and the
+    upload is aborted on any error (D6).
+  - A preview with both objects present runs no child. It reads the first
+    `PREVIEW_BYTES` with `head_bytes`, as a text file does. The
+    `WORKBOOK_PREVIEW_RECORDS` cut is replaced by that byte cut. This is a
+    deliberate behaviour change, stated in the commit (the old D5's reason
+    stands).
+  - Ingest passes the stored `.converted.<n>.csv` key in `Converted`, so the
+    job reads the same text the preview showed. It converts only when the
+    object is missing.
+  - **Parquet previews are not stored.** Their header row is fixed (`R:1873`),
+    so a second preview is rare, and the child reads one row group. Each
+    preview runs `preview-parquet`.
+- **D8 (extends D8).** Delete removes:
+  - `.sheets.json`;
+  - every `.converted.<n>.csv` and `.converted.<n>.json`;
+  - the legacy `.converted.csv`.
+
+  The existing delete tests that name `.converted.csv` (`R:3153`, `R:3554`)
+  stay and gain the new names.
+- **D7 (narrows D7).** T5 measures:
+  - `convert-sheet` on a 5,000,000-cell `.xlsx`;
+  - `preview-parquet` on a 50 MiB Parquet file whose first row group is
+    close to `MAX_PREVIEW_GROUP_BYTES`;
+  - the child's baseline on empty input.
+
+  There is no 5,000,000-cell Parquet conversion to measure any more.
+
+### Tasks: what changes
+
+- T1 unchanged.
+- T2 builds the four operations of D2 (above).
+- T3 also stores `.sheets.json` at `create`, and replaces the three Parquet
+  call sites.
+- T4 adds two route tests:
+  - a Parquet preview through the real child;
+  - a workbook preview made after a header-row change, which runs no child.
+    Count the child runs through the runner, test-only.
+- T5 follows D7 above.
+- T6 unchanged. The `g9-upload` job is at `.github/workflows/ci.yml:1557` now.
 
 ## 1. What is true at `17867e52`
 
