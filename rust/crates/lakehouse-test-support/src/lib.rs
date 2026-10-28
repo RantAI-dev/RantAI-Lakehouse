@@ -44,25 +44,33 @@
 //! # Leftover databases
 //!
 //! Every test process that links this crate leaves databases behind on the
-//! shared server. `lakehouse-api`'s integration tests create one
-//! `lakehouse_api_test_*` database per test and never drop it
-//! (`rust/crates/lakehouse-api/tests/common/mod.rs`), and sqlx 0.9 drops
-//! its own per-test database only after a test that succeeded
-//! (`sqlx-core-0.9.0/src/testing/mod.rs:233-240` →
-//! `sqlx-postgres-0.9.0/src/testing/mod.rs:189-198`) — a failed or
-//! panicked test leaves its database behind. The server's volume reached
-//! 177.7 GB in three days and filled the dev VM on 2026-10-26 (`OPS-13`).
+//! shared server, under three prefixes:
+//!
+//! * `lakehouse_api_test_*` — one per `lakehouse-api` integration test
+//!   (`rust/crates/lakehouse-api/tests/common/mod.rs:219`), which the
+//!   test never drops;
+//! * `lakehouse_api_main_test_*` — one per `lakehouse-api` binary crate's
+//!   own unit test (`rust/crates/lakehouse-api/src/main.rs:1644`), which
+//!   the test never drops either;
+//! * `_sqlx_test_*` — sqlx 0.9's own per-test database, which sqlx drops
+//!   only after a test that succeeded
+//!   (`sqlx-core-0.9.0/src/testing/mod.rs:233-240` →
+//!   `sqlx-postgres-0.9.0/src/testing/mod.rs:189-198`) — a failed or
+//!   panicked test leaves its database behind.
+//!
+//! The server's volume reached 177.7 GB in three days and filled the dev
+//! VM on 2026-10-26 (`OPS-13`).
 //!
 //! So this crate sweeps them: every 30 seconds it drops the databases
-//! whose name carries one of the two test prefixes, that nobody is
+//! whose name carries one of the three test prefixes, that nobody is
 //! connected to, and that were already idle on the previous pass. A
 //! database that was created a moment ago and is not connected to yet is
 //! left alone on the first pass, and a database with an open connection is
 //! left alone altogether.
 //!
 //! Nothing else on the server is ever dropped: not `postgres`, not
-//! `template0`/`template1`, not a database whose name carries neither
-//! prefix. The sweep never fails a test — a failure is reported on
+//! `template0`/`template1`, not a database whose name carries none of the
+//! three prefixes. The sweep never fails a test — a failure is reported on
 //! stderr, once per process, and the next pass tries again.
 //!
 //! The sweep is not a cleanup that can only help: it can drop a database
@@ -323,13 +331,26 @@ fn start_postgres_container() {
 
 /// The database names the sweep may drop.
 ///
-/// `lakehouse_api_test_` is the prefix `lakehouse-api`'s integration tests
-/// give their per-test databases, which they never drop. `_sqlx_test_` is
-/// sqlx 0.9's own prefix (`sqlx-core-0.9.0/src/testing/mod.rs:54`): the
-/// hash behind it is base64url of a SHA-512 digest, so UPPERCASE letters
-/// and digits occur, and the charset guard is `[A-Za-z0-9_]`, not
-/// `[a-z0-9_]`.
-const SWEEPABLE_PREFIXES: [&str; 2] = ["lakehouse_api_test_", "_sqlx_test_"];
+/// Three prefixes, each from a source of its own:
+///
+/// * `lakehouse_api_test_` — the per-test database of `lakehouse-api`'s
+///   integration tests (`rust/crates/lakehouse-api/tests/common/mod.rs:219`),
+///   which the test never drops.
+/// * `lakehouse_api_main_test_` — the per-test database of `lakehouse-api`'s
+///   binary crate's own unit tests
+///   (`rust/crates/lakehouse-api/src/main.rs:1644`), which the test never
+///   drops either. `OPS-13`: the sweep missed this third prefix, so 15
+///   such databases (11 MB each) sat on the shared server after one
+///   workspace test round, measured on 2026-10-28.
+/// * `_sqlx_test_` — sqlx 0.9's own prefix
+///   (`sqlx-core-0.9.0/src/testing/mod.rs:54`): the hash behind it is
+///   base64url of a SHA-512 digest, so UPPERCASE letters and digits
+///   occur, and the charset guard is `[A-Za-z0-9_]`, not `[a-z0-9_]`.
+const SWEEPABLE_PREFIXES: [&str; 3] = [
+    "lakehouse_api_test_",
+    "lakehouse_api_main_test_",
+    "_sqlx_test_",
+];
 
 /// Whether the sweep may drop the database with this name.
 ///
@@ -364,7 +385,7 @@ impl Sweeper {
         }
     }
 
-    /// Runs one pass: every database that carries one of the two test
+    /// Runs one pass: every database that carries one of the three test
     /// prefixes, that nobody is connected to, and that was already idle on
     /// the previous pass is dropped.
     ///
@@ -421,7 +442,7 @@ impl Sweeper {
         for name in &candidates {
             // `DROP DATABASE` takes an identifier, which cannot be bound as
             // a parameter. The name was checked by `is_sweepable` against
-            // the two test prefixes and the `[A-Za-z0-9_]` charset, so it
+            // the three test prefixes and the `[A-Za-z0-9_]` charset, so it
             // cannot hold a quote, and `{:?}` writes it as a double-quoted
             // identifier with backslashes escaped — the same quoting
             // sqlx's own test harness uses (`sqlx-postgres-0.9.0/src/
@@ -698,8 +719,9 @@ mod tests {
         // `[a-z0-9_]`.
         assert!(is_sweepable("_sqlx_test_aB3_xYz"));
         assert!(is_sweepable("lakehouse_api_test_0123456789abcdef"));
+        assert!(is_sweepable("lakehouse_api_main_test_0123456789abcdef"));
         // No prefix, no drop: not `postgres`, not `template1`, not a name
-        // outside the two prefixes.
+        // outside the three prefixes.
         assert!(!is_sweepable("postgres"));
         assert!(!is_sweepable("template1"));
         assert!(!is_sweepable("untouched_db_1"));
@@ -752,6 +774,43 @@ mod tests {
         // best effort: it fails on a database that is gone.
         drop_database(&lakehouse_name).await;
         drop_database(&sqlx_name).await;
+    }
+
+    #[tokio::test]
+    async fn a_database_with_the_bin_crate_prefix_is_gone_after_two_passes() {
+        let _turn = take_turn().await;
+        // OPS-13: the `lakehouse-api` binary's own unit tests create their
+        // per-test database with a third prefix
+        // (`rust/crates/lakehouse-api/src/main.rs:1644`) and never drop it,
+        // so the sweep has to cover that prefix too.
+        let name = format!("lakehouse_api_main_test_{}", unique_suffix());
+        // The sweep below drops the database; the guard is the net for a
+        // panic before that.
+        let _cleanup = Cleanup::new(&[name.as_str()]);
+        create_database(&name).await;
+
+        let mut sweeper = Sweeper::new();
+        sweeper
+            .pass(&database_url())
+            .await
+            .expect("run the first sweep pass");
+        let candidates = sweeper
+            .pass(&database_url())
+            .await
+            .expect("run the second sweep pass");
+
+        assert!(
+            candidates.contains(&name),
+            "a `lakehouse_api_main_test_` database with no connection is picked after two passes"
+        );
+        assert!(
+            !database_exists(&name).await,
+            "a `lakehouse_api_main_test_` database with no connection is gone after two passes"
+        );
+
+        // The sweep has dropped the database already, so the drop is best
+        // effort: it fails on a database that is gone.
+        drop_database(&name).await;
     }
 
     #[tokio::test]
@@ -812,11 +871,11 @@ mod tests {
 
         assert!(
             !candidates.contains(&name),
-            "only the two test prefixes may be picked for dropping"
+            "only the three test prefixes may be picked for dropping"
         );
         assert!(
             database_exists(&name).await,
-            "only the two test prefixes may be dropped"
+            "only the three test prefixes may be dropped"
         );
 
         drop_database(&name).await;
