@@ -295,3 +295,24 @@ The full block, on the final commit (`4b7dc55e`):
    (the folder list could not be read). The plan's deviation 5 says the console
    always sends what the Table step shows; with no picker there is nothing to
    show, and the table's remembered folder applies, as it did before.
+
+### Round 2, 2026-10-28, at `ad35f041`
+
+- **BLOCKER 1: fixed** (`76fa1a5e`). Read at the code:
+  - `ClaimFolder` has three states (keep / none / some). The file and group updates use `CASE WHEN <named> THEN <folder> ELSE folder_id END`, and the claim is updated only when a folder was named. So an explicit `null` clears the folder on the file, on every file of the group, and on the claim.
+  - An absent `folderId` maps to the claim's folder, or to keep when the claim remembers none.
+  - The console sends `folderId ?? null` whenever the picker is rendered, and `retryInput` always sends the folder.
+- The handoff's three new deviations are all accepted:
+  - 1: the three states live in the store.
+  - 2: an absent value with no remembered folder keeps the file where it is.
+  - 3: no folder is sent when the folder list could not be read.
+- **SHOULD-FIX 2, 4 and 5: fixed** (`59f3d47e`, `59185a9f`, `4b7dc55e`). **SHOULD-FIX 3: fixed** (`d04a84cf`). BACKLOG and CHANGELOG were checked against `main`: only `DATA-35`'s own lines differ.
+- **Reviewer verification at `ad35f041`**, run in the foreground with `line-tables-only` as CI does:
+  - `cargo fmt --check` clean.
+  - `cargo clippy --workspace --all-targets --all-features -D warnings` clean.
+  - `cargo test --workspace`: 157 binaries, 8271 passed, 0 failed, 49 ignored.
+  - `bun run typecheck` clean; `bun run lint` 0 errors (the 11 warnings already on `main`); `bun run test` 2925 pass, 1 skip, 0 fail.
+- Then `main` was merged in (#256, #257, and #267, the `Cargo.lock` fix for `main`'s stale lock). The merge has no conflicts and changes only `Cargo.lock` and `lakehouse-api/Cargo.toml`, and `cargo metadata --locked` passes. CI runs the full set on that merge.
+- *Not verified*: the g9 gate `step_folders` and the browser checks `DATA-35-AC1`…`AC7` need a running stack. They are for the product owner's acceptance.
+
+No open BLOCKER.
