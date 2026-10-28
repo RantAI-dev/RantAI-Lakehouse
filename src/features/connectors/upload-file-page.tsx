@@ -113,6 +113,8 @@ function UploadWizard({ initial, pollMs }: { readonly initial: Upload | null; re
   const nameProblem = tableName === "" ? null : tableNameProblem(tableName)
   // `DATA-35` decision 2: a table an earlier upload loaded offers the folder that upload sits in.
   const tableFolder = offersMode && uploads.status === "success" ? folderOfTable(tableName, uploads.data) : undefined
+  // The folder the picker shows: the one the person chose, or the table's own folder
+  // while the picker is untouched. `undefined` is "no folder of the table's either".
   const folderId = folderChoice !== undefined ? folderChoice : tableFolder
   const folders =
     folderList.status === "success"
@@ -173,8 +175,11 @@ function UploadWizard({ initial, pollMs }: { readonly initial: Upload | null; re
       ...(choices.columns.length > 0 ? { columns: choices.columns.map(columnSpecOf), onBadValue: choices.onBadValue } : {}),
       // `DATA-17` slice 5: the other files of the load. The API compares their columns again.
       ...(group.ids.length > 0 ? { alsoUploads: group.ids } : {}),
-      // `DATA-35`: the folder shown on the Table step is the one sent, `null` included.
-      ...(folderId !== undefined ? { folderId } : {}),
+      // `DATA-35`: the folder the Table step shows is the one the load sends, `null`
+      // included — the API reads `null` as "no folder" and an absent field as "the
+      // table's remembered folder" (`PR #259 review BLOCKER 1`). A picker that could
+      // not be read sends no folder at all, so the table's remembered folder applies.
+      ...(folders !== null ? { folderId: folderId ?? null } : {}),
     })
     if (started !== null) {
       setTogether(group.files.filter((f) => f.uploadId !== null).map((f) => ({ id: f.uploadId ?? "", name: f.name })))

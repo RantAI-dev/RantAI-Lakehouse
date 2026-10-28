@@ -518,7 +518,7 @@ test("a retry puts the file in the folder the load put it in, and names none whe
     bronzeTable: "t",
   }
   assert.equal(retryInput({ ...upload, folderId: "uf-1" })?.folderId, "uf-1")
-  assert.equal("folderId" in (retryInput(upload) ?? {}), false)
+  assert.equal(retryInput(upload)?.folderId, null)
 })
 
 test("the mark and the label follow the name: JSON, Avro and archives have their own kinds", () => {

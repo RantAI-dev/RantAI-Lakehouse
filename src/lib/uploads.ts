@@ -336,7 +336,10 @@ export function planPick(
  * retry with `append` would write them twice. That retry replaces, whatever
  * the first load chose.
  *
- * The folder the file sits in (`DATA-35`) is resent as it is.
+ * The folder the file sits in (`DATA-35`) goes back with it, `null` included: the
+ * API reads `null` as "no folder" and an absent field as "the table's remembered
+ * folder", so a retry must say which of the two it means (`PR #259 review
+ * BLOCKER 1`).
  *
  * `alsoUploads` are the other files of a load of several files (`DATA-17` slice 5), which the
  * upload row of the first file does not list: the screen knows them (the files it loaded with).
@@ -359,7 +362,7 @@ export function retryInput(upload: Upload, alsoUploads: readonly string[] = []):
   // `DATA-17` slice 5: a load of several files is retried with the same files.
   const withOthers = alsoUploads.length > 0 ? { alsoUploads: [...alsoUploads] } : {}
   // `DATA-35`: the folder the load put the file in goes back with it.
-  const withFolder = upload.folderId !== undefined ? { folderId: upload.folderId } : {}
+  const withFolder = { folderId: upload.folderId ?? null }
   return { ...parseOptions, bronzeTable, mode, ...withColumns, ...withOthers, ...withFolder }
 }
 

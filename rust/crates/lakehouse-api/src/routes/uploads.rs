@@ -130,8 +130,8 @@ use lakehouse_store::audit::{self as store_audit, NewAuditEvent};
 use lakehouse_store::connectors;
 use lakehouse_store::upload_folders;
 use lakehouse_store::uploads::{
-    self, FolderFilter, ListFilter, LoadClaim, LoadLimits, LoadMode, MarkOutcome, NewUpload,
-    TableClaim, Upload,
+    self, ClaimFolder, FolderFilter, ListFilter, LoadClaim, LoadLimits, LoadMode, MarkOutcome,
+    NewUpload, TableClaim, Upload,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -2421,7 +2421,7 @@ async fn claim_load(
     pool: &PgPool,
     row: &Upload,
     request: &IngestRequest,
-    folder_id: Option<&str>,
+    folder: ClaimFolder,
     converted: Option<&Converted>,
     limits: LoadLimits,
 ) -> ApiResult<Upload> {
@@ -2450,7 +2450,7 @@ async fn claim_load(
             load_mode: request.mode,
             column_spec: column_spec.as_ref(),
             on_bad_value,
-            folder_id,
+            folder,
         },
         limits,
     )
@@ -2476,9 +2476,9 @@ async fn claim_load(
 /// The folder a load puts its files in (`DATA-35` decision 2, plan AD-4): the one
 /// the request named, which must be the upload's tenant's (decision 5, `SEC-16`:
 /// another tenant's reads as a folder that does not exist, and nothing has been
-/// claimed yet); nothing when it said `null`; and, when it said nothing, the folder
-/// the table's claim remembers from its latest load, so a re-upload joins the
-/// table's folder (`None` for a new table or one whose folder was deleted).
+/// claimed yet); "no folder" when it said `null`; and, when it said nothing, the
+/// folder the table's claim remembers from its latest load, so a re-upload joins
+/// the table's folder (a table that remembers none leaves the file where it is).
 ///
 /// # Errors
 ///
@@ -2487,19 +2487,27 @@ async fn effective_folder(
     pool: &PgPool,
     tenant_id: Uuid,
     request: &IngestRequest,
-) -> ApiResult<Option<String>> {
+) -> ApiResult<ClaimFolder> {
     match &request.folder_id {
         folders::FolderRef::Id(folder) => {
             if upload_folders::folder_in_tenant(pool, tenant_id, folder).await? {
-                Ok(Some(folder.clone()))
+                Ok(ClaimFolder::Some(folder.clone()))
             } else {
                 Err(ApiError::NotFound(folders::FOLDER_NOT_FOUND.to_owned()).into())
             }
         }
-        folders::FolderRef::Null => Ok(None),
-        folders::FolderRef::Absent => {
-            Ok(upload_folders::claim_folder(pool, tenant_id, &request.table).await?)
-        }
+        // `PR #259 review BLOCKER 1`: "no folder" is a choice, and it is a choice
+        // the table remembers: the file leaves the folder it is in and the claim
+        // forgets its folder (the claim records the latest load's choice, AD-4).
+        folders::FolderRef::Null => Ok(ClaimFolder::None),
+        // No folder named: the table's remembered folder applies, and a table that
+        // remembers none leaves the file where it is.
+        folders::FolderRef::Absent => Ok(
+            match upload_folders::claim_folder(pool, tenant_id, &request.table).await? {
+                Some(folder) => ClaimFolder::Some(folder),
+                None => ClaimFolder::Keep,
+            },
+        ),
     }
 }
 
@@ -2717,15 +2725,7 @@ pub async fn ingest(
         return Err(ApiError::Conflict(TABLE_NOT_FREE.to_owned()).into());
     }
 
-    let claimed = claim_load(
-        pool,
-        &row,
-        &request,
-        folder.as_deref(),
-        converted.as_ref(),
-        limits,
-    )
-    .await?;
+    let claimed = claim_load(pool, &row, &request, folder, converted.as_ref(), limits).await?;
 
     let run_id = launch(&state, pool, &claimed, &request, &load_keys, kind).await?;
     let attached = finish_launch_and_audit(

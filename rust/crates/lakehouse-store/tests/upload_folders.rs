@@ -21,8 +21,8 @@ use lakehouse_store::upload_folders::{
     folder_in_tenant, list, move_uploads, update,
 };
 use lakehouse_store::uploads::{
-    FolderFilter, ListFilter, LoadClaim, LoadLimits, LoadMode, MarkOutcome, NewUpload, Upload,
-    claim_table, get, insert, list_filtered, mark_group_within_limits,
+    ClaimFolder, FolderFilter, ListFilter, LoadClaim, LoadLimits, LoadMode, MarkOutcome, NewUpload,
+    Upload, claim_table, get, insert, list_filtered, mark_finished, mark_group_within_limits,
 };
 use serde_json::json;
 use sqlx::PgPool;
@@ -459,19 +459,19 @@ async fn a_load_puts_every_file_in_the_folder_and_the_claim_remembers_it(
         per_user: 10,
         total: 10,
     };
-    let claim = |folder_id: Option<&'static str>| LoadClaim {
+    let claim = |folder: ClaimFolder| LoadClaim {
         parse_options: &options,
         bronze_table: "stock_raw",
         load_mode: LoadMode::Append,
         column_spec: None,
         on_bad_value: None,
-        folder_id,
+        folder,
     };
     let outcome = mark_group_within_limits(
         &pool,
         "up-1",
         &["up-2".to_owned()],
-        &claim(Some("uf-a")),
+        &claim(ClaimFolder::Some("uf-a".to_owned())),
         limits,
     )
     .await
@@ -497,11 +497,136 @@ async fn a_load_puts_every_file_in_the_folder_and_the_claim_remembers_it(
     assert_eq!(claim_folder(&pool, other, "stock_raw").await.unwrap(), None);
 
     // A later load that names no folder changes neither the files nor the claim.
-    let again = mark_group_within_limits(&pool, "up-3", &[], &claim(None), limits)
+    let again = mark_group_within_limits(&pool, "up-3", &[], &claim(ClaimFolder::Keep), limits)
         .await
         .unwrap();
     assert!(matches!(again, MarkOutcome::Marked(_)));
     assert_eq!(get(&pool, "up-3").await.unwrap().unwrap().folder_id, None);
+    assert_eq!(
+        claim_folder(&pool, t, "stock_raw")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("uf-a")
+    );
+    Ok(())
+}
+
+/// `PR #259 review BLOCKER 1`: "no folder" is a choice, not the absence of one.
+/// The files of the load leave the folder they are in and the table's claim
+/// forgets its folder, while a load that names no folder at all changes neither.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_load_that_names_no_folder_takes_the_files_out_and_forgets_it(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let t = tenant(&pool, "folders-no-folder").await;
+    folder(&pool, t, "uf-a", None, "A").await;
+    for id in ["up-1", "up-2", "up-3"] {
+        add(&pool, id, t, "f.csv").await;
+    }
+    assert!(claim_table(&pool, t, "stock_raw", "up-1").await.unwrap());
+
+    let options = json!({ "encoding": "utf-8", "delimiter": ",", "headerRow": 0 });
+    let limits = LoadLimits {
+        per_user: 10,
+        total: 10,
+    };
+    let claim = |folder: ClaimFolder| LoadClaim {
+        parse_options: &options,
+        bronze_table: "stock_raw",
+        load_mode: LoadMode::Append,
+        column_spec: None,
+        on_bad_value: None,
+        folder,
+    };
+
+    // The load into the folder: every file of the group goes in, and the claim
+    // remembers it.
+    let outcome = mark_group_within_limits(
+        &pool,
+        "up-1",
+        &["up-2".to_owned()],
+        &claim(ClaimFolder::Some("uf-a".to_owned())),
+        limits,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(outcome, MarkOutcome::Marked(_)));
+    for id in ["up-1", "up-2"] {
+        assert_eq!(
+            get(&pool, id).await.unwrap().unwrap().folder_id.as_deref(),
+            Some("uf-a"),
+            "{id}"
+        );
+    }
+    assert_eq!(
+        claim_folder(&pool, t, "stock_raw")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("uf-a")
+    );
+
+    // The load ends, so the files can be loaded again. Settling the primary
+    // settles the file that loaded with it.
+    mark_finished(&pool, "up-1", None, None, Some(1))
+        .await
+        .unwrap()
+        .unwrap();
+
+    // The same load with "no folder": every file of the group leaves the folder,
+    // and the claim forgets it.
+    let outcome = mark_group_within_limits(
+        &pool,
+        "up-1",
+        &["up-2".to_owned()],
+        &claim(ClaimFolder::None),
+        limits,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(outcome, MarkOutcome::Marked(_)));
+    for id in ["up-1", "up-2"] {
+        assert_eq!(
+            get(&pool, id).await.unwrap().unwrap().folder_id,
+            None,
+            "{id}"
+        );
+    }
+    assert_eq!(claim_folder(&pool, t, "stock_raw").await.unwrap(), None);
+
+    // The load ends again, and the files are put back in the folder by hand, so
+    // that the last load has something to keep.
+    mark_finished(&pool, "up-1", None, None, Some(1))
+        .await
+        .unwrap()
+        .unwrap();
+    sqlx::query("UPDATE file_upload SET folder_id = 'uf-a' WHERE id = $1")
+        .bind("up-1")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE upload_table_claim SET folder_id = 'uf-a' WHERE bronze_table = $1")
+        .bind("stock_raw")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // A load that names no folder at all leaves the files where they are and the
+    // claim as it was.
+    let outcome = mark_group_within_limits(&pool, "up-1", &[], &claim(ClaimFolder::Keep), limits)
+        .await
+        .unwrap();
+    assert!(matches!(outcome, MarkOutcome::Marked(_)));
+    assert_eq!(
+        get(&pool, "up-1")
+            .await
+            .unwrap()
+            .unwrap()
+            .folder_id
+            .as_deref(),
+        Some("uf-a")
+    );
     assert_eq!(
         claim_folder(&pool, t, "stock_raw")
             .await

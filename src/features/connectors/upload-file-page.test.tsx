@@ -1049,12 +1049,12 @@ describe("UploadFilePage, Table step, folders (DATA-35)", () => {
     return sent(calls, "POST", /\/ingest$/)[0]!.body as Record<string, unknown>
   }
 
-  it("offers an optional folder, No folder by default, and sends no folderId when it is left alone", async () => {
+  it("offers an optional folder, No folder by default, and sends no folder when it is left alone", async () => {
     const calls = await openTable({ folders: FOLDERS, ingest: json({ upload: upload({ status: "ingesting" }), runId: "run-1" }) })
     const picker = screen.getByRole("combobox", { name: "Folder (optional)" })
     expect(picker.textContent).toContain("No folder")
     const body = await load(calls)
-    expect("folderId" in body).toBe(false)
+    expect(body.folderId).toBeNull()
   })
 
   it("sends the folder that was chosen", async () => {
@@ -1117,7 +1117,7 @@ describe("UploadFilePage, Table step, folders (DATA-35)", () => {
     expect(body.folderId).toBeNull()
   })
 
-  it("offers no picker, and names no folder, when the folders cannot be read", async () => {
+  it("offers no picker, and sends no folder, when the folders cannot be read", async () => {
     const calls = await openTable({
       folders: json({ error: "You do not have permission to do this." }, 403),
       ingest: json({ upload: upload({ status: "ingesting" }), runId: "run-1" }),
@@ -1293,7 +1293,7 @@ describe("UploadFilePage, after Load", () => {
     fireEvent.click(screen.getByRole("button", { name: "Try again" }))
     await waitFor(() => expect(calls.filter((c) => c.url.endsWith("/ingest")).length).toBe(before + 1))
     const retry = calls.filter((c) => c.url.endsWith("/ingest")).at(-1)
-    expect(retry?.body).toEqual({ ...OPTIONS, bronzeTable: "stock", mode: "append" })
+    expect(retry?.body).toEqual({ ...OPTIONS, bronzeTable: "stock", mode: "append", folderId: null })
   })
 
   it("puts a retry in the folder the failed load used (DATA-35)", async () => {
@@ -1331,6 +1331,7 @@ describe("UploadFilePage, after Load", () => {
       ...OPTIONS,
       bronzeTable: "stock",
       mode: "replace",
+      folderId: null,
     })
   })
 

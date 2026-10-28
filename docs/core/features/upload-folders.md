@@ -62,7 +62,7 @@ to the AI team in `AI-16`.
   where a table lives or what it is called.
 - A folder holding files or other folders cannot be deleted; move its files out and delete its folders first.
 - A folder's list and a search show the newest 100 files that match, the same window the tab always had; the window is applied after the folder or the text narrows the list, so a folder's files are not hidden by newer files elsewhere.
-- A table remembers the folder of its latest load that named one. A re-upload that names no folder joins it; choosing "No folder" on the Table step puts that file in none and leaves the remembered folder as it was. The Table step offers the folder of the newest listed upload of the table, so it can differ from the remembered one after files were moved.
+- A table remembers the folder of its latest load, and the Table step sends the folder it shows: choosing "No folder" puts that file in none, and the table forgets its folder. A load that names no folder at all (an API call without a `folderId`) joins the table's remembered folder instead. The Table step offers the folder of the newest listed upload of the table, so it can differ from the remembered one after files were moved.
 - A tenant that still has files in folders cannot be deleted from the database (the folder rows are kept by the files that point at them); move the files out first.
 
 ## Acceptance checklist

@@ -34,9 +34,9 @@ use std::borrow::Cow;
 use lakehouse_store::StoreError;
 use lakehouse_store::identity::{CreateTenantInput, create_tenant};
 use lakehouse_store::uploads::{
-    ClaimedTable, LoadClaim, LoadLimits, LoadMode, MarkOutcome, NewReceiving, NewUpload,
-    TableClaim, Upload, UploadPart, attach_run, claim_table, delete, find_by_sha256, get,
-    get_by_run_id, insert, list, list_claims, loads_under_limits, mark_finished,
+    ClaimFolder, ClaimedTable, LoadClaim, LoadLimits, LoadMode, MarkOutcome, NewReceiving,
+    NewUpload, TableClaim, Upload, UploadPart, attach_run, claim_table, delete, find_by_sha256,
+    get, get_by_run_id, insert, list, list_claims, loads_under_limits, mark_finished,
     mark_group_within_limits, mark_ingesting, mark_ingesting_within_limits, table_being_loaded,
     table_claim, table_claimed, upload_in_tenants,
 };
@@ -2493,7 +2493,7 @@ async fn start_group_within(
             load_mode: LoadMode::Append,
             column_spec: None,
             on_bad_value: None,
-            folder_id: None,
+            folder: ClaimFolder::Keep,
         },
         limits,
     )
