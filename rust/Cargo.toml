@@ -119,6 +119,39 @@ croner = { version = "4" }
 # 0.63 verified latest via docs.rs/sqlparser/latest as of 2026-10-14;
 # `resolver = "3"` locks the exact patch in `Cargo.lock` on first build.
 sqlparser = "0.63"
+# SEC-14 part B (E2, D5/D8, SHOULD-FIX 9): the Postgres connection test speaks
+# the wire protocol itself (`lakehouse-api::pg_probe`) so it can refuse every
+# authentication method but SCRAM-SHA-256, which `sqlx` offers no way to
+# do. Pinned to 0.6.12 because this code relies on the SCRAM iteration cap
+# there to prevent iteration exhaustion attacks. MIT OR Apache-2.0.
+postgres-protocol = "0.6.12"
+# `postgres-protocol`'s `SaslMechanisms` is a
+# `fallible_iterator::FallibleIterator`, and reading its mechanisms needs the
+# trait in scope. Declared directly because `postgres-protocol` already pulls
+# the crate in, so it adds no package of its own. MIT OR Apache-2.0.
+fallible-iterator = "0.2"
+# `postgres-protocol` frames messages in `bytes::BytesMut`; already in
+# `Cargo.lock` (a `tokio`/`sqlx` dependency) -- this is the first direct use.
+bytes = "1"
+# SEC-14 part B (D5): the TLS a connector dial makes. Used by the
+# connection test's own client and by the test-only TLS-terminating proxy in
+# front of the shared test Postgres (`lakehouse-api::tls_proxy`).
+# PR #192 review BLOCKER 10: both `ring` and `aws-lc-rs` are enabled across
+# the workspace's dependencies -- `aws-lc-rs` arrives through `object_store`'s
+# `aws` feature (hence `reqwest`'s `__rustls-aws-lc-rs` and `hyper-rustls`'s
+# `aws-lc-rs`) and through `tokio-rustls`'s default features, which
+# `tiberius` turns on -- so rustls cannot pick a process default on its own
+# and panics with "Could not automatically determine the process-level
+# CryptoProvider" the first time something asks for one. `sqlx`'s `VerifyCa`
+# path and `hyper-rustls` (through `reqwest` and `object_store`) both ask.
+# `main` installs `ring` explicitly at start-up, before any task can dial;
+# `ring` is the provider this entry, `sqlx` and `pg_probe` name explicitly.
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12", "ring"] }
+# `ClientConfig`/`ServerConfig`, the `require`-posture certificate verifier,
+# and `rustls::pki_types` (the `CertificateDer` PEM reader `pg_probe` uses for
+# `CONNECTOR_TLS_CA_FILE`) all come from the rustls `tokio-rustls` above
+# re-exports, so no direct `rustls-pki-types` dependency is needed.
+rustls = { version = "0.23", default-features = false, features = ["logging", "std", "tls12", "ring"] }
 
 [workspace.lints.rust]
 # `future_incompatible` with an underscore: Cargo 1.99 warns that the
