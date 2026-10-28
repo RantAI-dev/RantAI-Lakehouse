@@ -1201,10 +1201,12 @@ pub fn pg_options_for_address(
 /// * With a CA: [`tiberius::Config::trust_cert_ca`] verifies the chain
 ///   against it. Tiberius adds the configured CA to native system roots, so
 ///   SQL Server accepts either the configured CA or any public root, unlike
-///   `PostgreSQL` which trusts only the configured CA (SEC-14B review round 1,
-///   SHOULD-FIX 7). tiberius checks the certificate's names against `config.host`,
-///   which is the CONFIGURED name (see the `SEC-15` socket note at each call site),
-///   so this is verify-full for SQL Server, not verify-ca.
+///   the PostgreSQL connection test (`pg_probe`), which trusts only the
+///   configured CA bundle (SEC-14B review round 1, SHOULD-FIX 7). The `sqlx`
+///   PostgreSQL dials are in between: `sqlx` adds the public webpki roots to
+///   the bundle it is given. tiberius checks the certificate's names against
+///   `config.host`, which is the CONFIGURED name (see the `SEC-15` socket note
+///   at each call site), so this is verify-full for SQL Server, not verify-ca.
 ///
 /// The two arms are mutually exclusive on purpose: `trust_cert_ca` panics
 /// when it is called after `trust_cert`, so one `match` keeps them apart.
@@ -1219,7 +1221,10 @@ pub(crate) fn apply_mssql_tls(config: &mut tiberius::Config, ca: Option<&Path>) 
 /// `SEC-15`: `MySQL`/`MariaDB` connect options that dial the [`Approved`]
 /// address. `SEC-14` part B leaves `MySQL` alone (D9): it keeps `Preferred`,
 /// the one posture here that still falls back to plaintext, and says so
-/// rather than reading as an oversight.
+/// rather than reading as an oversight. The password is not sent over that
+/// plaintext fallback: `SEC-41` decision 4 keeps `sqlx`'s `mysql-rsa` feature
+/// off, so a server that asks for the password without TLS is refused with
+/// `MYSQL_PLAINTEXT_PASSWORD_REFUSED` rather than handed it.
 pub(crate) fn mysql_connect_options(
     approved: &Approved,
     user: &str,
