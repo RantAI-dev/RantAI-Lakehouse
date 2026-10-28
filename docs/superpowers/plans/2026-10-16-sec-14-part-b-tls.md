@@ -719,3 +719,286 @@ discover, load and reload pass; PostgreSQL discover fails as expected
 user must read it; gate-only). BLOCKER 10's fix (`476d709e`) is reviewed
 with the full re-run after `SEC-41` merges, when this branch merges
 `main` again. Open: BLOCKER 12, Blocked by `SEC-41`.
+
+### Handoff (round 4, merge of main after SEC-41)
+
+Developer: a non-Opus coding agent. Worktree `/home/shiro/rantai/wt-pr192`
+(branch `fix/sec-14-part-b-tls`). Base of this round: `origin/main` at
+`97d62b3b`, which carries `SEC-41` (`sqlx` 0.9, PR #253). `main` moved
+while this round ran (`calamine` 0.37 and the npm group, PR #255/#256/
+#257/#267) and was merged again as `857e06e2`; the branch is now on top
+of `origin/main` at `2dc97b14`.
+
+#### 1. Commits on branch `fix/sec-14-part-b-tls` (round 4)
+
+- `2b47cedb`: Merge remote-tracking branch 'origin/main' into
+  fix/sec-14-part-b-tls (main at `97d62b3b`, with `SEC-41`'s `sqlx` 0.9).
+- `6074cff1`: test(connectors): VerifyCa at an IP through the production
+  helper (SEC-14 part B) — BLOCKER 12.
+- `1ad40c1a`: docs(connectors): correct the TLS posture text after the
+  sqlx 0.9 merge (SEC-14 part B) — BLOCKER 12's documentation half.
+- `857e06e2`: Merge remote-tracking branch 'origin/main' into
+  fix/sec-14-part-b-tls (main at `2dc97b14`).
+
+#### 2. Conflict resolution, file by file (AGENTS.md rule 9)
+
+- `rust/crates/lakehouse-api/src/lib.rs` and `src/main.rs`: both sides
+  added modules to two alphabetical lists, so the merged lists are the
+  union (`pdf`, `pg_probe`, `pipeline_lag`, `upload_formats`), with the
+  test-only `tls_proxy` block kept in both roots. `crypto_provider`
+  (BLOCKER 10's fix) is still a `mod` in the binary root, and `main`
+  still installs the `ring` provider as the FIRST thing it does, before
+  the runtime is built (`src/main.rs`: `fn main()` opens with
+  `crypto_provider::install_default_provider()`, then builds the tokio
+  runtime).
+- `rust/Cargo.lock`: a generated file, so it is not hand-merged. It
+  takes `main`'s lock and cargo re-resolves it. The result is `main`'s
+  lock plus exactly two packages: `postgres-protocol` 0.6.12 (the pin
+  from `4ecafbf9`) and `fallible-iterator` 0.2.0. Verified by comparing
+  the package/version sets of `origin/main`'s lock and the branch's:
+  no other package differs, none is missing, none is downgraded.
+  `cargo tree -i postgres-protocol` prints `postgres-protocol v0.6.12`
+  -> `lakehouse-api v0.1.0`.
+- `rust/crates/lakehouse-api/Cargo.toml`: the auto-merge left two
+  `rcgen` dev-dependency entries (this branch's and `main`'s `SEC-41`
+  one). They are the same requirement, so they are merged into one
+  entry whose comment gives both reasons. `calamine` is `0.37`, the
+  value `main` carries after PR #257 (the branch's own copy was still
+  `0.36`); with `0.36` the lock lost `zip` 9.1.2 and `quick-xml`
+  0.42, which `main` had.
+- `rust/crates/lakehouse-api/src/connector_listing.rs`: `main` added a
+  SaaS listing test that calls `dispatch` with the pre-`SEC-14` argument
+  list; the `ca` argument this branch added is passed as `None`.
+- Auto-merged but checked by hand: `docker-compose.yml`,
+  `ops/g6/docker-compose.g6.override.yml`, `config.rs`,
+  `connector_probe.rs`, `connector_deprovision.rs`,
+  `connector_discover.rs`, `connector_listing.rs`, `routes/connectors.rs`,
+  `.env.example`, `docs/OPERATIONS.md`, `CHANGELOG.md`, `README.md`.
+
+#### 3. What `sqlx` 0.9 broke in this branch's own code
+
+Nothing but one call site: `sqlx` 0.9 requires a run-time statement to
+be wrapped in `AssertSqlSafe`. This branch's own run-time query string
+is `connector_deprovision::drop_publication`'s `DROP PUBLICATION`, and it
+is now wrapped with the reason beside it (the publication name passed
+`ConnectorSlug::new`, whose alphabet cannot close the quoted
+identifier) — the same shape `SEC-41` uses at every other call site.
+No blanket wrapper. `main`'s 100 call sites came with the merge.
+
+#### 4. BLOCKER 12: closed
+
+The production `VerifyCa` dials are unchanged and now run on `sqlx`
+0.9: `connector_probe::pg_options_for_address` is still the one place
+that sets the mode (`Some(ca) => PgSslMode::VerifyCa` + `ssl_root_cert`,
+`None` => `PgSslMode::Require`), and its callers are the production
+dials — `connector_discover.rs` (discovery), `connector_deprovision.rs`
+(CDC slot/publication clean-up), `connector_listing.rs` (table listing).
+No `Require` fallback, no patched `sqlx`.
+
+- **Test** (`rust/crates/lakehouse-api/tests/crypto_provider.rs`):
+  `sqlx_verify_ca_dial_at_the_approved_address_succeeds_with_the_installed_provider`
+  dials the PRODUCTION helper
+  `lakehouse_api::connector_probe::pg_options_for_address` at `127.0.0.1`,
+  through the shared `tls_proxy` terminator (`src/tls_proxy.rs`, included
+  by `tests/common/mod.rs` — one terminator, not a second copy), with the
+  proxy's own certificate as the CA. The certificate names `localhost`, so
+  the chain verifies and only the name check cannot pass: exactly what
+  `VerifyCa` is for. The test binary calls the same
+  `lakehouse_api::crypto_provider::install_default_provider` that `main`
+  calls.
+  Result: `tests/crypto_provider.rs: ok 3 passed; 0 failed; 0 ignored`.
+  The companion `sqlx_require_dial_at_the_approved_address_succeeds_with_the_installed_provider`
+  covers the no-CA posture.
+- **Mutation evidence**: with the install removed from the test binary,
+  the `VerifyCa` dial panics with rustls' own message:
+  ```
+  thread 'sqlx_verify_ca_dial_at_the_approved_address_succeeds_with_the_installed_provider' panicked at /home/shiro/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustls-0.23.46/src/crypto/mod.rs:249:14:
+  Could not automatically determine the process-level CryptoProvider from Rustls crate features.
+  Call CryptoProvider::install_default() before this point to select a provider manually, or make sure exactly one of the 'aws-lc-rs' and 'ring' features is enabled.
+  test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+  ```
+  With the install restored: `test result: ok. 3 passed; 0 failed; 0 ignored`.
+- **Gate evidence**: G6's "PostgreSQL discover" now passes, which
+  round 3b recorded as the failing line:
+  ```
+  [g6] PostgreSQL discover: pass (ingest_demo.orders with 4 columns)
+  ```
+  (round 3b: `[g6] PostgreSQL discover: fail (expected the schemas to hold 'ingest_demo', got state='failed' [])`).
+
+#### 5. Round 3's BLOCKER 10 checklist: every rustls consumer in the API binary
+
+`cargo tree -e features -i rustls -p lakehouse-api` shows BOTH
+`rustls feature "ring"` and `rustls feature "aws_lc_rs"` in the API
+binary, so rustls cannot pick a process default by itself. Which
+consumer needs one, and which does not (versions from `rust/Cargo.lock`):
+
+| Consumer | Needs the process default? | Evidence |
+| --- | --- | --- |
+| `sqlx-core` 0.9.0 | **Yes**, on the `VerifyCa` path | `sqlx-core-0.9.0/src/net/tls/tls_rustls.rs:155` builds `WebPkiServerVerifier::builder(...)`, and `rustls-0.23.46/src/webpki/server_verifier.rs:153` resolves that builder's provider from the process default. The `Require` path names its own provider (`tls_rustls.rs:110`). |
+| `hyper-rustls` 0.27.9 (through `reqwest` 0.12/0.13, and through `object_store` 0.14) | **Yes** | `hyper-rustls-0.27.9/src/connector/builder.rs:93` (`ClientConfig::builder()`), which reads the process default. |
+| `tiberius` 0.13.0 | No | `tiberius-0.13.0/src/client/tls_stream/rustls_tls_stream.rs:173` takes the process-installed provider when there is one and falls back to `aws-lc-rs` when there is not (`:271`). The install changes which provider a SQL Server dial uses (`aws-lc-rs` -> `ring`), but it never panics. |
+| `lettre` 0.11.23 | No | `lettre-0.11.23/src/rustls_crypto.rs:5`: the process default, else `aws-lc-rs`. |
+| `object_store` 0.14.2 | Yes, through `reqwest` | `object_store`'s `aws` feature turns on `reqwest`'s `__rustls-aws-lc-rs`. |
+| `lakehouse-api::pg_probe` | No | `pg_probe.rs:202` names `rustls::crypto::ring::default_provider()` explicitly. |
+| `lakehouse-api::tls_proxy` (test-only) | No | `tls_proxy.rs:141` names the provider explicitly. |
+
+So the one install in `main` covers every consumer that asks for one.
+The file says this at `rust/crates/lakehouse-api/src/crypto_provider.rs`
+(with the same file:line evidence) and `rust/Cargo.toml`'s `rustls`
+entry no longer claims that `tiberius` pins `ring` (it does not).
+
+#### 6. Verification (foreground, final commit `857e06e2`)
+
+Machine: 11.9 GB RAM, 502 GB disk. Every cargo command ran through
+`/home/shiro/rantai/bin/cargo-locked` (shared `CARGO_TARGET_DIR`,
+heavy-job lock). No `cargo clean`; the shared target was pruned only by
+the machine's own `cargo-target-prune.sh`.
+
+1. **`cargo fmt --check`** — exit 0, no diff.
+2. **`cargo clippy --workspace --all-targets --all-features -- -D warnings`** —
+   exit 0, 0 warnings, 0 errors (`Finished dev profile ... in 4m 20s`).
+3. **`cargo test --workspace --no-fail-fast -j 1`** — 156 binaries,
+   **8353 passed; 0 failed; 49 ignored**. The per-binary lines are in
+   the table below. `-j 1` because this VM has 11.9 GB of RAM: with
+   cargo's default parallelism the `lakehouse-api` lib/bin test
+   compiles were SIGKILLed by the OOM killer twice (see "Not verified"
+   below), and once the disk filled up mid-link. Neither is a code
+   failure: the same tree passes when one rustc runs at a time.
+   | binary | result |
+   | --- | --- |
+   | `src/lib.rs` (lakehouse-api) | ok 2741 passed; 0 failed; 18 ignored |
+   | `src/main.rs` (lakehouse-api) | ok 2790 passed; 0 failed; 18 ignored |
+   | `tests/crypto_provider.rs` | ok 3 passed; 0 failed; 0 ignored |
+   | `tests/sec41_verify_ca.rs` | ok 1 passed; 0 failed; 0 ignored |
+   | `tests/connector_repoint.rs` | ok 15 passed; 0 failed; 0 ignored |
+   | `tests/connector_delete_deprovision.rs` | ok 9 passed; 0 failed; 0 ignored |
+   | `tests/connector_secret_rotate.rs` | ok 8 passed; 0 failed; 0 ignored |
+   | `tests/route_auth.rs` | ok 65 passed; 0 failed; 0 ignored |
+   | `tests/upload_routes.rs` | ok 141 passed; 0 failed; 0 ignored |
+   | every other binary | ok, 0 failed (156 binaries in all) |
+4. **`cargo deny check`** — exit 0:
+   `advisories ok, bans ok, licenses ok, sources ok`.
+5. **`bun run typecheck`** — exit 0 (`bun --bun tsc --noEmit`).
+6. **`bun run lint`** — exit 0, `11 problems (0 errors, 11 warnings)`;
+   every warning is in a file `main` owns (`src/components/ui/sidebar.tsx`,
+   `src/features/alerts/alerts-page.tsx`, `src/features/auth/login-page.tsx`,
+   `src/features/catalog/open-format-card.test.tsx`,
+   `src/features/copilot/use-copilot.ts`, `src/hooks/use-data-table.ts`,
+   `src/lib/dashboard-specs.ts`, `src/lib/uploads.test.ts`,
+   `src/services/http.ts`), none in a file this PR touches.
+7. **`bun run test`** — `2892 pass, 1 skip, 0 fail`, 7913 `expect()`
+   calls, 2893 tests across 298 files.
+8. **`docker compose --profile '*' config --quiet`** — exit 0, with the
+   must-set variables given dummy values:
+   ```
+   POSTGRES_PASSWORD=dummy RUSTFS_ACCESS_KEY=dummy RUSTFS_SECRET_KEY=dummy \
+   LAKEKEEPER_ENCRYPTION_KEY=dummy CONNECTOR_SECRETS_KEY=dummy \
+   docker compose -f docker-compose.yml --profile '*' config --quiet
+   ```
+9. **`git status`** — clean (nothing staged, nothing untracked but the
+   gitignored `.env`, `node_modules/` and `tsconfig.tsbuildinfo`).
+10. **The dependency state** — `cargo tree -i postgres-protocol` ->
+    `postgres-protocol v0.6.12` -> `lakehouse-api v0.1.0`.
+
+#### 7. Gates (rule 8), locally, the same commands as `.github/workflows/ci.yml`
+
+Each gate ran on its own clean, uniquely named compose project, under
+`flock /home/shiro/rantai/.heavy.lock`, with `docker compose -p <name>
+down -v` after it. The images were built from this branch's tree
+(`rantai-lakehouse-api:local`, `rantai-lakehouse-dagster:local`, plus
+the gate's own `oidc-mock`).
+
+1. **G6 ingest matrix, `g6-sql` half** (project `pr192r4g6`):
+   ```
+   [g6] PostgreSQL connect: pass (16 ms)
+   [g6] PostgreSQL discover: pass (ingest_demo.orders with 4 columns)
+   [g6] MySQL connect: pass (61 ms)
+   [g6] MySQL discover: pass (g6_ingest.orders with 2 columns)
+   [g6] MariaDB connect: pass (50 ms)
+   [g6] MariaDB discover: pass (g6_ingest.orders with 2 columns)
+   [g6] SQL Server connect: pass (57 ms)
+   [g6] SQL Server discover: pass (dbo.orders with 2 columns)
+   [g6] MySQL load: pass (2 rows in bronze.g6_mysql_orders)
+   [g6] MariaDB load: pass (2 rows in bronze.g6_mariadb_orders)
+   [g6] SQL Server load: pass (2 rows in bronze.g6_mssql_orders)
+   [g6] PostgreSQL load: pass (2000 rows in bronze.orders)
+   [g6] MySQL reload: pass (2 rows in bronze.g6_mysql_orders: replace left the same rows)
+   [g6] MariaDB reload: pass (2 rows in bronze.g6_mariadb_orders: replace left the same rows)
+   [g6] SQL Server reload: pass (2 rows in bronze.g6_mssql_orders: replace left the same rows)
+   [g6] PostgreSQL reload: pass (2000 rows in bronze.orders: replace left the same rows)
+   [g6] PASS
+   ```
+   Gate summary table: `| PostgreSQL | g6 | pass | pass | pass | pass |`
+   (MySQL, MariaDB and SQL Server likewise). **"PostgreSQL discover"
+   passing is BLOCKER 12's proof.**
+2. **G4 Debezium CDC** (project `pr192r4g4`):
+   ```
+   [g4] PostgreSQL CDC connect: pass (18 ms)
+   [g4] PostgreSQL CDC discover: pass (p5_cdc.orders with 4 columns)
+   [g4] PostgreSQL CDC load: pass (5 rows in the Bronze table after the initial snapshot)
+   [g4] PostgreSQL CDC reload: pass (an insert, an update and a delete each visible within 20s)
+   [g4] PASS
+   ```
+   Gate summary table: `| PostgreSQL CDC | g4 | pass | pass | pass | pass |`.
+   The gate's own tail also reports the WAL-breach alert, the slot
+   deprovision ("slot 'p5cdc_slot' no longer exists after deprovisioning
+   -- WAL is no longer pinned") and the OIDC round trip.
+3. **SRC-13 discovery of 10,000 tables** (project `pr192r4src13`):
+   ```
+   [src13] created 10000 tables in schema scale_10k in 42.0 s
+   [src13] schemas listed in 0.12 s (3 schemas)
+   [src13] 10000 tables listed in 0.18 s (limit 120 s)
+   [src13] search for 'T04242' answered in 0.15 s with ['scale_10k.t04242']
+   [src13] columns of scale_10k.t04242 read in 0.13 s: ['id', 'name'], key ['id']
+   [src13] PASS (43 s)
+   ```
+
+After the gates: every `pr192*` container, volume and image was removed
+(`docker compose -p <name> down -v` per gate, then the leftover
+`pr192*` images), and the exited testcontainers were removed with
+`docker ps -a --filter label=org.testcontainers.managed-by=testcontainers
+--filter status=exited -q | xargs -r docker rm -v` (none left).
+
+#### 8. Not verified / known limits
+
+- **The full-workspace `cargo test` needed `-j 1` on this VM.** With
+  cargo's default parallelism the `lakehouse-api` lib and bin test
+  compiles were killed by the OOM killer (`signal: 9, SIGKILL`) twice,
+  and one run died with `No space left on device` while linking. The
+  same command with `-j 1` on the same tree passes with 0 failures. The
+  first full run on this branch (before `main` moved) passed with the
+  default parallelism, so this is the machine's memory and disk
+  pressure, not the code.
+- **Disk during the gates: 38 GB free**, below the 40 GB line the
+  task set. Everything reclaimable that belonged to this round was
+  reclaimed (the gates' own volumes and images, the Docker build cache,
+  488 unused Docker volumes, and the machine's own
+  `cargo-target-prune.sh`); what is left on the disk belongs to other
+  projects and other agents' running stacks and was left alone. The
+  gates need a few GB each and all three passed.
+- **`gitleaks` is not installed on this machine**, so the secret scan
+  was *not verified* here; CI runs it on the pull request. The
+  repository's own `.gitleaks.toml` and `.gitleaksignore` were not
+  touched.
+- **`tests/sec41_verify_ca.rs` keeps its own TLS terminator** (main's
+  file, written before `src/tls_proxy.rs` reached `main`). It mints a
+  CA plus a second authority for the "another CA must be refused" half,
+  which `tls_proxy.rs` does not provide, so it was left as it is rather
+  than rewritten here; only its stale comments were corrected. The new
+  test in `tests/crypto_provider.rs` reuses `tls_proxy.rs` and adds no
+  second terminator.
+- The plan's decisions (E1-E6) and the owner's `SEC-41` decision
+  ("upgrade sqlx to 0.9 first, `VerifyCa` unchanged, no `Require`
+  fallback, no patched sqlx") were followed as written.
+
+#### 9. Scope & plan status
+
+- BLOCKER 10: the `ring` install at the start of `main` survives the
+  merge and is still the first thing `main` does; the checklist in
+  section 5 above is now answered with file:line evidence.
+- BLOCKER 11: unchanged by this round and still green (SQL Server
+  connect, discover, load and reload all pass in G6).
+- BLOCKER 12: **closed**. `VerifyCa` to the approved IP address works on
+  `sqlx` 0.9, through the production helper, with a regression test
+  and a mutation; G6's "PostgreSQL discover" passes.
+- No open BLOCKER from this round.
