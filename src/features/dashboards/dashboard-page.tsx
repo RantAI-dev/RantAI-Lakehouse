@@ -242,6 +242,23 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   const folders = React.useMemo(() => labelledFolders(foldersState.data ?? [], user?.id), [foldersState.data, user?.id]);
   const [shareOpen, setShareOpen] = React.useState(false);
   const [commentsOpen, setCommentsOpen] = React.useState(false);
+  // BI-19 owner QA 2026-10-28, QA-3: a mention in the bell links to `?comments=1`. The dialog
+  // opens once the board is loaded (also when the reader is already on this board and only the
+  // parameter is new), and closing it removes the parameter, keeping the others.
+  const commentsAsked = searchParams.get("comments") === "1";
+  const boardLoaded = data !== null;
+  React.useEffect(() => {
+    if (commentsAsked && boardLoaded && !isDefault) setCommentsOpen(true);
+  }, [commentsAsked, boardLoaded, isDefault]);
+  const changeCommentsOpen = React.useCallback((open: boolean) => {
+    setCommentsOpen(open);
+    if (open) return;
+    const q = new URLSearchParams(searchParams.toString());
+    if (!q.has("comments")) return;
+    q.delete("comments");
+    const qs = q.toString();
+    router.replace(qs ? `${pathname}?${qs}` : pathname, { scroll: false });
+  }, [router, pathname, searchParams]);
   const [historyOpen, setHistoryOpen] = React.useState(false);
   // BI-18 part C, part 2: favourites, and "recent" noted once per dashboard opened.
   const shortcuts = useService((signal) => dashboardService.shortcuts(signal), []);
@@ -1475,7 +1492,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
           onReverted={() => { notifyDashboardsChanged(); void load(); }}
         />
       ) : null}
-      {!isDefault ? <CommentsDialog board={board} dashName={dashName} open={commentsOpen} onOpenChange={setCommentsOpen} /> : null}
+      {!isDefault ? <CommentsDialog board={board} dashName={dashName} open={commentsOpen} onOpenChange={changeCommentsOpen} /> : null}
       {!isDefault ? <ShareDialog board={board} dashName={dashName} open={shareOpen && canManage} onOpenChange={setShareOpen} /> : null}
       {themeOpen ? (
         <ThemeFontDialog open={themeOpen} onOpenChange={setThemeOpen} theme={data?.theme} font={data?.font}
