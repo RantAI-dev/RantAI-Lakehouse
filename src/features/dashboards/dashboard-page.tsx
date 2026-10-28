@@ -1,6 +1,7 @@
 "use client";
 
 import * as React from "react";
+import Link from "next/link";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { useTheme } from "next-themes";
 import { ArrowRightLeft, Bell, MessageSquare, ChartColumn, Download, GitFork, ImageDown, Heading, Maximize2, Minus, MousePointerClick, Move, Moon, Pencil, Plus, RefreshCw, Smartphone, SlidersHorizontal, Sparkles, Square, Table2, Trash2, Rows3 } from "lucide-react";
@@ -1158,6 +1159,18 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   const drillOffer = drillChart ? tileDrills.offer(drillChart) : null;
   const filterFields = data?.filterFields ?? NO_FIELDS;
   const showFilterBar = filterFields.length > 0 || filters.length > 0;
+
+  // BI-19 owner QA 2026-10-28, QA-1: a board that never loaded (for the caller, "dashboard not
+  // found") shows the error and nothing that acts on the board: no star, menu, comments or
+  // share, and no empty-chart state. A later reload that fails keeps `data`, so it is not this.
+  if (error !== null && data === null) {
+    return (
+      <div className="flex flex-col items-start gap-3">
+        <div role="alert" className="rounded-lg border border-destructive/40 bg-destructive/5 px-4 py-3 text-sm text-destructive">{readableErrorMessage(error)}</div>
+        <Link href="/dashboards/browse" className="text-sm text-primary underline-offset-4 hover:underline">All dashboards</Link>
+      </div>
+    );
+  }
 
   // `dark` on the container themes the dashboard alone (the tokens and the
   // `dark:` variants key off an ancestor with the class); the rest of the
