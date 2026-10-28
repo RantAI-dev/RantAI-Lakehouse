@@ -72,6 +72,7 @@ pub mod schema_diff;
 pub mod semantic;
 pub mod sessions;
 pub mod storage;
+pub mod upload_folders;
 pub mod uploads;
 
 pub use error::StoreError;

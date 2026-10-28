@@ -964,6 +964,22 @@ fn uploads_router(state: &AppState) -> Router<AppState> {
             "/api/uploads/sessions",
             axum::routing::post(uploads::sessions::create_session),
         )
+        // DATA-35: folders for uploaded files. Static paths next to `{id}` (the
+        // router prefers a static segment, and an upload id is `up-<uuid>`), outside
+        // the per-upload layer because they name no upload: each folder is checked
+        // against the caller's tenant by the store (`uploads::folders`).
+        .route(
+            "/api/uploads/folders",
+            get(uploads::folders::list).post(uploads::folders::create),
+        )
+        .route(
+            "/api/uploads/folders/{id}",
+            axum::routing::patch(uploads::folders::update).delete(uploads::folders::delete),
+        )
+        .route(
+            "/api/uploads/move",
+            axum::routing::post(uploads::folders::move_uploads),
+        )
         .merge(per_upload)
 }
 

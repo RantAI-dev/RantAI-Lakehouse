@@ -7265,3 +7265,364 @@ async fn a_pointer_to_the_primary_goes_when_the_primary_loads_again_alone() {
     let state = stack.group_state(&ids[1]).await;
     assert_eq!((state.0.as_str(), state.1), ("ingested", None));
 }
+
+// ════════════════════════════════════════════════════════════════════════
+// Folders for uploaded files (DATA-35, plan T3)
+// ════════════════════════════════════════════════════════════════════════
+
+impl Stack {
+    /// Make a folder of `who`'s tenant through the route; the answer must be 201.
+    async fn make_folder(&self, who: &Caller, name: &str) -> String {
+        let reply = self
+            .send(
+                who,
+                "POST",
+                "/api/uploads/folders",
+                Payload::Json(json!({ "name": name })),
+            )
+            .await;
+        assert_eq!(reply.status, StatusCode::CREATED, "{}", reply.text);
+        reply.json["id"].as_str().unwrap().to_owned()
+    }
+
+    async fn folder_of(&self, id: &str) -> Option<String> {
+        sqlx::query_scalar("SELECT folder_id FROM file_upload WHERE id = $1")
+            .bind(id)
+            .fetch_one(&self.app.pool)
+            .await
+            .unwrap()
+    }
+
+    async fn claim_folder_of(&self, table: &str) -> Option<String> {
+        sqlx::query_scalar("SELECT folder_id FROM upload_table_claim WHERE bronze_table = $1")
+            .bind(table)
+            .fetch_one(&self.app.pool)
+            .await
+            .unwrap()
+    }
+}
+
+/// `folderId` on an ingest of three files (AD-4, decision 2): every file of the
+/// load is put in the folder, the table's claim remembers it, the audit event
+/// names it, and the job's run config is exactly what it was (a folder is not the
+/// job's business).
+#[tokio::test]
+async fn a_grouped_load_puts_every_file_in_the_chosen_folder_and_the_claim_remembers_it() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    mount_free_table(&stack.ch).await;
+    mount_launch(&stack.dagster, "run-f").await;
+    let folder = stack.make_folder(&bayu, "Stock").await;
+    let ids = stack
+        .upload_all(
+            &bayu,
+            &[("a.csv", STOCK_A), ("b.csv", STOCK_B), ("c.csv", STOCK_C)],
+        )
+        .await;
+
+    let mut body = ingest_body("stock_raw");
+    body["alsoUploads"] = json!([ids[1], ids[2]]);
+    body["folderId"] = json!(folder);
+    let reply = stack.ingest(&bayu, &ids[0], body).await;
+
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text);
+    assert_eq!(reply.json["upload"]["folderId"], folder.as_str());
+    for id in &ids {
+        assert_eq!(
+            stack.folder_of(id).await.as_deref(),
+            Some(folder.as_str()),
+            "{id}"
+        );
+    }
+    assert_eq!(
+        stack.claim_folder_of("stock_raw").await.as_deref(),
+        Some(folder.as_str())
+    );
+    let launches = requests_containing(&stack.dagster, "launchRun").await;
+    let config = &launches[0]["variables"]["cfg"]["ops"]["ingest_uploaded_file"]["config"];
+    assert!(
+        !config.to_string().contains(&folder),
+        "the job is told nothing of folders"
+    );
+    let audit = stack.audit_actions().await;
+    let ingest = audit.iter().find(|a| a.0 == "upload.ingest").unwrap();
+    assert_eq!(ingest.3["folderId"], folder.as_str());
+}
+
+/// A load that names no folder leaves the upload where it is and the audit event
+/// without a `folderId`: the ingest of one file is what it was.
+#[tokio::test]
+async fn a_load_that_names_no_folder_for_a_new_table_leaves_the_file_in_no_folder() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    mount_free_table(&stack.ch).await;
+    mount_launch(&stack.dagster, "run-n").await;
+    let upload = stack.upload(&bayu, "a.csv", STOCK_A).await;
+
+    let reply = stack
+        .ingest(&bayu, &id_of(&upload), ingest_body("stock_raw"))
+        .await;
+
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text);
+    assert!(reply.json["upload"].get("folderId").is_none());
+    assert_eq!(stack.folder_of(&id_of(&upload)).await, None);
+    assert_eq!(stack.claim_folder_of("stock_raw").await, None);
+    let audit = stack.audit_actions().await;
+    let ingest = audit.iter().find(|a| a.0 == "upload.ingest").unwrap();
+    assert!(ingest.3.get("folderId").is_none());
+}
+
+/// Decision 2: a re-upload into an existing table joins that table's folder when
+/// the request says nothing; `folderId: null` is "no folder" on purpose, and a
+/// folder named wins and is remembered.
+#[tokio::test]
+async fn a_re_upload_joins_the_tables_folder_unless_the_request_says_otherwise() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    mount_registered(&stack.ch).await;
+    mount_launch(&stack.dagster, "run-2").await;
+    let first = stack.make_folder(&bayu, "First").await;
+    let other = stack.make_folder(&bayu, "Other").await;
+    stack.seed_ingested(GROUP, "up-first", "stock_raw").await;
+    sqlx::query("UPDATE upload_table_claim SET folder_id = $1 WHERE bronze_table = 'stock_raw'")
+        .bind(&first)
+        .execute(&stack.app.pool)
+        .await
+        .unwrap();
+    let append = |extra: Value| {
+        let mut body = json!({ "bronzeTable": "stock_raw", "mode": "append", "encoding": "utf-8", "delimiter": ",", "headerRow": 0 });
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        body
+    };
+
+    let silent = stack.upload(&bayu, "again.csv", STOCK_A).await;
+    let reply = stack
+        .ingest(&bayu, &id_of(&silent), append(json!({})))
+        .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text);
+    assert_eq!(
+        stack.folder_of(&id_of(&silent)).await.as_deref(),
+        Some(first.as_str())
+    );
+    assert_eq!(
+        stack.claim_folder_of("stock_raw").await.as_deref(),
+        Some(first.as_str()),
+        "the claim keeps the folder it remembers"
+    );
+
+    // Settle the load so the table can be loaded into again.
+    uploads::mark_finished(
+        &stack.app.pool,
+        &id_of(&silent),
+        Some("run-2"),
+        None,
+        Some(1),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let none = stack.upload(&bayu, "none.csv", STOCK_B).await;
+    let reply = stack
+        .ingest(&bayu, &id_of(&none), append(json!({ "folderId": null })))
+        .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text);
+    assert_eq!(
+        stack.folder_of(&id_of(&none)).await,
+        None,
+        "no folder on purpose"
+    );
+    assert_eq!(
+        stack.claim_folder_of("stock_raw").await,
+        None,
+        "`PR #259 review BLOCKER 1`: the claim records the latest load's choice"
+    );
+
+    uploads::mark_finished(&stack.app.pool, &id_of(&none), Some("run-2"), None, Some(1))
+        .await
+        .unwrap()
+        .unwrap();
+    let named = stack.upload(&bayu, "named.csv", STOCK_C).await;
+    let reply = stack
+        .ingest(&bayu, &id_of(&named), append(json!({ "folderId": other })))
+        .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text);
+    assert_eq!(
+        stack.folder_of(&id_of(&named)).await.as_deref(),
+        Some(other.as_str())
+    );
+    assert_eq!(
+        stack.claim_folder_of("stock_raw").await.as_deref(),
+        Some(other.as_str())
+    );
+}
+
+/// `PR #259 review BLOCKER 1`: a file that sits in a folder and is loaded again
+/// with "no folder" leaves the folder, and the table forgets it too: the claim
+/// records the latest load's choice (AD-4).
+#[tokio::test]
+async fn a_re_load_with_no_folder_takes_the_file_out_and_the_table_forgets_it() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    mount_free_table(&stack.ch).await;
+    mount_launch(&stack.dagster, "run-f1").await;
+    let folder = stack.make_folder(&bayu, "Stock").await;
+    let upload = stack.upload(&bayu, "a.csv", STOCK_A).await;
+    let id = id_of(&upload);
+
+    let mut body = ingest_body("stock_raw");
+    body["folderId"] = json!(folder);
+    let reply = stack.ingest(&bayu, &id, body).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text);
+    assert_eq!(stack.folder_of(&id).await.as_deref(), Some(folder.as_str()));
+    assert_eq!(
+        stack.claim_folder_of("stock_raw").await.as_deref(),
+        Some(folder.as_str())
+    );
+
+    // The load ends, so the file can be loaded again.
+    uploads::mark_finished(&stack.app.pool, &id, Some("run-f1"), None, Some(1))
+        .await
+        .unwrap()
+        .unwrap();
+
+    let mut body = ingest_body("stock_raw");
+    body["folderId"] = json!(null);
+    let reply = stack.ingest(&bayu, &id, body).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text);
+    assert_eq!(stack.folder_of(&id).await, None, "the file left the folder");
+    assert_eq!(
+        stack.claim_folder_of("stock_raw").await,
+        None,
+        "the table forgot the folder"
+    );
+}
+
+/// `PR #259 review BLOCKER 1`: a load that names no folder at all joins the
+/// table's remembered folder. This is the API caller's way of saying "the
+/// table's folder", and it is what the console does not do: the console always
+/// says which folder it shows.
+#[tokio::test]
+async fn a_load_that_names_no_folder_joins_the_tables_folder() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    mount_registered(&stack.ch).await;
+    mount_launch(&stack.dagster, "run-f2").await;
+    let first = stack.make_folder(&bayu, "First").await;
+    stack.seed_ingested(GROUP, "up-first", "stock_raw").await;
+    sqlx::query("UPDATE upload_table_claim SET folder_id = $1 WHERE bronze_table = 'stock_raw'")
+        .bind(&first)
+        .execute(&stack.app.pool)
+        .await
+        .unwrap();
+    let upload = stack.upload(&bayu, "again.csv", STOCK_A).await;
+    let id = id_of(&upload);
+
+    let body = json!({ "bronzeTable": "stock_raw", "mode": "append", "encoding": "utf-8", "delimiter": ",", "headerRow": 0 });
+    let reply = stack.ingest(&bayu, &id, body).await;
+
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text);
+    assert_eq!(
+        stack.folder_of(&id).await.as_deref(),
+        Some(first.as_str()),
+        "the file joined the table's folder"
+    );
+    assert_eq!(
+        stack.claim_folder_of("stock_raw").await.as_deref(),
+        Some(first.as_str()),
+        "the claim keeps the folder it remembers"
+    );
+}
+
+/// `PR #259 review BLOCKER 1`: a load of several files with "no folder" takes
+/// every file of the group out of the folder it is in, and the table forgets it.
+#[tokio::test]
+async fn a_grouped_load_with_no_folder_takes_every_file_out() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    mount_free_table(&stack.ch).await;
+    mount_launch(&stack.dagster, "run-f3").await;
+    let folder = stack.make_folder(&bayu, "Stock").await;
+    let ids = stack
+        .upload_all(&bayu, &[("a.csv", STOCK_A), ("b.csv", STOCK_B)])
+        .await;
+
+    // The files are put in the folder by a move, so they sit in it before the load.
+    let reply = stack
+        .send(
+            &bayu,
+            "POST",
+            "/api/uploads/move",
+            Payload::Json(json!({ "uploadIds": ids, "folderId": folder })),
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text);
+    for id in &ids {
+        assert_eq!(
+            stack.folder_of(id).await.as_deref(),
+            Some(folder.as_str()),
+            "{id}"
+        );
+    }
+
+    let mut body = ingest_body("stock_raw");
+    body["alsoUploads"] = json!([ids[1]]);
+    body["folderId"] = json!(null);
+    let reply = stack.ingest(&bayu, &ids[0], body).await;
+
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text);
+    for id in &ids {
+        assert_eq!(stack.folder_of(id).await, None, "{id} left the folder");
+    }
+    assert_eq!(
+        stack.claim_folder_of("stock_raw").await,
+        None,
+        "the table forgot the folder"
+    );
+}
+
+/// `SEC-16`: another tenant's folder is "Folder not found." and the load is
+/// refused before anything is claimed, marked or launched; a `folderId` that is
+/// not text is a 400 with its own sentence.
+#[tokio::test]
+async fn a_folder_of_another_tenant_or_of_no_kind_refuses_the_load_before_anything_is_claimed() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    let andi = stack.andi().await;
+    mount_free_table(&stack.ch).await;
+    mount_launch(&stack.dagster, "run-x").await;
+    let theirs = stack.make_folder(&andi, "Theirs").await;
+    let upload = stack.upload(&bayu, "a.csv", STOCK_A).await;
+    let id = id_of(&upload);
+
+    for (folder, status, sentence) in [
+        (json!(theirs), StatusCode::NOT_FOUND, "Folder not found."),
+        (
+            json!("uf-does-not-exist"),
+            StatusCode::NOT_FOUND,
+            "Folder not found.",
+        ),
+        (
+            json!(3),
+            StatusCode::BAD_REQUEST,
+            "folderId must be text or null.",
+        ),
+        (
+            json!(""),
+            StatusCode::BAD_REQUEST,
+            "folderId must be text or null.",
+        ),
+    ] {
+        let mut body = ingest_body("stock_raw");
+        body["folderId"] = folder;
+        let reply = stack.ingest(&bayu, &id, body).await;
+        assert_eq!(reply.status, status, "{}", reply.text);
+        assert_eq!(reply.json["error"], sentence);
+    }
+
+    assert_eq!(stack.status_of(&id).await.0, "uploaded", "never marked");
+    assert!(stack.claims().await.is_empty(), "no table was claimed");
+    assert!(stack.dagster.received_requests().await.unwrap().is_empty());
+    assert_eq!(stack.folder_of(&id).await, None);
+}

@@ -1310,6 +1310,12 @@ async fn a_data_engineer_is_not_refused_and_an_analyst_is_on_every_upload_route(
         ("POST", "/api/uploads/x/check"),
         // DATA-17 slice 5: which other files can load into one table with this one.
         ("POST", "/api/uploads/x/compare"),
+        // DATA-35: folders for uploaded files; unknown ids answer 404, not 401/403.
+        ("GET", "/api/uploads/folders"),
+        ("POST", "/api/uploads/folders"),
+        ("PATCH", "/api/uploads/folders/x"),
+        ("DELETE", "/api/uploads/folders/x"),
+        ("POST", "/api/uploads/move"),
     ] {
         let engineer = session_cookie_for_seeded_user(&pool, "bayu@meridian.example").await;
         let resp = request_with_cookie(&router, method, path, &engineer).await;

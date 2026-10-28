@@ -202,6 +202,42 @@ export type Upload = {
    * the first file itself. A file loaded with others has no `rows` of its own.
    */
   loadedWith?: string
+  /**
+   * `DATA-35`: the folder the file sits in on the Uploaded files tab; absent is "No folder". A
+   * grouping only: it changes nothing about the file's table.
+   */
+  folderId?: string
+}
+
+/**
+ * One folder of the Uploaded files tab (`GET /api/uploads/folders`). Mirrors Rust
+ * `UploadFolder` (`lakehouse-store/src/upload_folders.rs`). The counts are of what is
+ * DIRECTLY in the folder, counted by the server; a folder is deleted only when both are 0
+ * (`DATA-35` decision 8).
+ */
+export type UploadFolder = {
+  id: string
+  /** The folder this one sits in; `null` at the top level. */
+  parentId: string | null
+  name: string
+  fileCount: number
+  childCount: number
+  createdBy?: string
+  /** ISO 8601, UTC. */
+  createdAt: string
+  /** ISO 8601, UTC. When it was last renamed or moved. */
+  updatedAt: string
+}
+
+/**
+ * What narrows `GET /api/uploads` before the newest-100 window is cut (`DATA-35`).
+ * Left out, the list is every upload of the tenant.
+ */
+export type UploadListFilter = {
+  /** A folder id, or `"none"` for the files in no folder. */
+  folderId?: string
+  /** Text a file name or a table name contains, case-insensitively. */
+  q?: string
 }
 
 /**
@@ -364,6 +400,12 @@ export type IngestUploadInput = UploadParseOptions & {
    * file's again and refuses the load with the list when they differ.
    */
   alsoUploads?: string[]
+  /**
+   * `DATA-35`: the folder every file of the load is put in, which the table remembers.
+   * Left out, the table's remembered folder applies (a re-upload joins it); `null` is
+   * "no folder" on purpose. A folder of another tenant is refused (404).
+   */
+  folderId?: string | null
 }
 
 /** `POST /api/uploads/{id}/ingest`'s response: the upload, now `ingesting`, and the run carrying the load out. */
@@ -373,8 +415,39 @@ export type IngestUploadResponse = {
 }
 
 export interface UploadService {
-  /** `GET /api/uploads`: the active tenant's uploads, newest first, at most 100. A bare array. */
-  list(signal?: AbortSignal): Promise<Upload[]>
+  /**
+   * `GET /api/uploads`: the active tenant's uploads, newest first, at most 100. A bare array.
+   * `filter` narrows it before the window is cut (`DATA-35`): a folder's files, the files in no
+   * folder, or a search over file and table names.
+   */
+  list(signal?: AbortSignal, filter?: UploadListFilter): Promise<Upload[]>
+  /** `GET /api/uploads/folders` (`DATA-35`): the tenant's folders, by name, each with its direct counts. */
+  listFolders(signal?: AbortSignal): Promise<UploadFolder[]>
+  /**
+   * `POST /api/uploads/folders` (201): makes a folder under `parentId` (the top level when
+   * absent). Refused with the API's sentence: name 1 to 100 characters (400), a fourth level
+   * (400), a sibling of that name, compared without case (409), a parent of another tenant (404).
+   */
+  createFolder(input: { name: string; parentId?: string }, signal?: AbortSignal): Promise<UploadFolder>
+  /**
+   * `PATCH /api/uploads/folders/{id}`: renames a folder, moves it (`parentId: null` is the top
+   * level), or both. A move into itself or into its own folders, or past the third level, is 400.
+   */
+  updateFolder(
+    id: string,
+    input: { name?: string; parentId?: string | null },
+    signal?: AbortSignal
+  ): Promise<UploadFolder>
+  /** `DELETE /api/uploads/folders/{id}` (204). 409 while the folder holds a file or a folder. */
+  deleteFolder(id: string, signal?: AbortSignal): Promise<void>
+  /**
+   * `POST /api/uploads/move`: puts the files in a folder (`null`: out of any). All of them are the
+   * caller's tenant's or none moves (404). Answers how many were moved.
+   */
+  moveUploads(
+    input: { uploadIds: string[]; folderId: string | null },
+    signal?: AbortSignal
+  ): Promise<{ moved: number }>
   /** `GET /api/uploads/{id}`: one upload; a loading one is settled by the API first. 404 outside the tenant. */
   get(id: string, signal?: AbortSignal): Promise<Upload>
   /**
