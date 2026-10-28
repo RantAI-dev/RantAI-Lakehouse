@@ -86,6 +86,16 @@ ICEBERG_DB = os.environ.get("ICEBERG_QUERY_DB", "icecat_api")
 ANALYST_EMAIL = "g8-time-travel-analyst@lakehouse.invalid"
 ANALYST_PASSWORD = "g8-time-travel-password-not-real-456"  # noqa: S105 -- gate fixture, not a real secret
 
+# SEC-20 scopes the query path to the tenant: with more than one seeded
+# tenant (migration 0002 seeds four), a caller in no tenant -- and any
+# caller outside the shared catalog's tenant -- is refused every shared
+# table with the same 404 a missing table gets. This gate proves time
+# travel keeps a policy for an analyst, so the analyst it seeds joins the
+# migration-seeded tenant (stable id, meant to be referenced) that the CI
+# stack names in `CATALOG_TENANT_ID`; a tenant-less analyst would prove
+# the refusal, which `tests/query_tenant_scope.rs` already asserts.
+CATALOG_TENANT_ID = "11111111-1111-4111-8111-000000000001"
+
 POLICY_NAME = "g8-time-travel-mask"
 MASKED_COLUMN = "customer"
 FILTER_LIMIT = 1000  # the policy's row filter is `id <= FILTER_LIMIT`
@@ -171,9 +181,10 @@ def step_wait_for_services() -> None:
 
 
 def step_seed_analyst_login() -> None:
-    """One `app_user` + `auth_identity` + `app_user_role` row, inserted
-    directly (`POST /api/identity/users` creates no password credential),
-    the same pattern `g8_governance_test.py` uses. Idempotent upserts."""
+    """One `app_user` + `auth_identity` + `app_user_role` +
+    `app_user_tenant` row, inserted directly (`POST /api/identity/users`
+    creates no password credential), the same pattern
+    `g8_governance_test.py` uses. Idempotent upserts."""
     user_id = psql(
         "INSERT INTO app_user (id, name, email, status) "
         f"VALUES (gen_random_uuid(), 'G8 Time Travel Analyst', '{ANALYST_EMAIL}', 'active') "
@@ -189,6 +200,11 @@ def step_seed_analyst_login() -> None:
     psql(
         "INSERT INTO app_user_role (user_id, role_id) "
         f"SELECT '{user_id}', r.id FROM role r WHERE r.name = 'Analyst' "
+        "ON CONFLICT DO NOTHING;"
+    )
+    psql(
+        "INSERT INTO app_user_tenant (user_id, tenant_id) "
+        f"VALUES ('{user_id}', '{CATALOG_TENANT_ID}') "
         "ON CONFLICT DO NOTHING;"
     )
     print("[g8-tt] seeded Analyst login (idempotent upsert)")

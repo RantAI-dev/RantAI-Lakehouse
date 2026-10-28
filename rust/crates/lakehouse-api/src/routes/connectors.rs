@@ -427,14 +427,23 @@ const HOST_CHANGE_NEEDS_CREDENTIALS: &str = "This connector connects using its h
      its credentials.";
 
 /// `SEC-14` (decision D4): the refusal for `PATCH` changing `host` on a
-/// connector that dials from that column — a row with no adapter (the
-/// original `kind` dispatch reads `<user>@<host>:<port>/<database>` from it)
-/// and a `files` row (the S3 probe reads `<endpoint>|<bucket>`). For every
-/// other adapter the column is a label: the dial comes from `dial`, which
-/// has its own guarded route. A `host` equal to the stored one (ignoring
-/// case and padding) changes nothing and is accepted.
+/// connector that dials from that column — only a row with no adapter (the
+/// original `kind` dispatch reads `<user>@<host>:<port>/<database>` from
+/// it). A `host` equal to the stored one (ignoring case and padding)
+/// changes nothing and is accepted.
+///
+/// `SEC-25` (b): a `files` row used to be refused here too, on the reading
+/// that its probe dials `<endpoint>|<bucket>` from `host`. Since `SRC-6` it
+/// does not: a `files` connector's target is `dial.protocol`,
+/// `dial.endpoint` (null for public S3) and `dial.bucket`
+/// (`ingest_spec::TargetIdentity`), and its `host` column is a label. A
+/// `host` change therefore sends no stored credential anywhere, and the
+/// refusal protected nothing while blocking a harmless rename; the guarded
+/// route for where a `files` connector points is `PUT
+/// /api/connectors/{id}/ingest-spec` (a re-point there needs the slots it
+/// reads).
 fn host_change_refusal(stored: &ConnectorDialInfo, new_host: &str) -> Option<ApiError> {
-    let dials_from_host = matches!(stored.adapter.as_deref(), None | Some("files"));
+    let dials_from_host = stored.adapter.is_none();
     (dials_from_host && !stored.host.trim().eq_ignore_ascii_case(new_host.trim()))
         .then(|| ApiError::Conflict(HOST_CHANGE_NEEDS_CREDENTIALS.to_owned()))
 }
@@ -1631,12 +1640,14 @@ fn slots_cover(required: usize, primary: bool, secondary: bool) -> bool {
 
 /// Whether a connector can have a second credential: an S3-shaped `files`
 /// connector (access key + secret key) or a `rest` one (basic auth's
-/// username + password, an `OAuth2` client id + secret). Every other adapter
+/// username + password, an `OAuth2` client id + secret) or a `saas` one (a
+/// browser sign-in's client secret + refresh token, `SRC-3`; a vendor's
+/// integration credential may fill one slot or two). Every other adapter
 /// reads exactly one (`secret_field_names`). A pre-WS3 row with no adapter
 /// keeps whatever slots it already has.
 fn has_secondary_slot(dial_info: &ConnectorDialInfo) -> bool {
     match dial_info.adapter.as_deref() {
-        Some("files" | "rest") => true,
+        Some("files" | "rest" | "saas") => true,
         Some(_) => false,
         None => dial_info.secret_ref_secondary.is_some(),
     }
@@ -2471,7 +2482,8 @@ fn resolve_debezium_source_target(
                 | Dial::Sheets(_)
                 | Dial::Mongo(_)
                 | Dial::Kafka(_)
-                | Dial::Sftp(_) => {
+                | Dial::Sftp(_)
+                | Dial::Saas(_) => {
                     return Err(ApiError::BadRequest(format!(
                         "connector {id} is registered with adapter {adapter:?} but its parsed \
                          dial is not a sql/cdc shape"
@@ -3325,7 +3337,8 @@ pub struct IngestCredentialBody {
 /// when `dial.endpoint` is set — a `files` dial with no endpoint override
 /// has no caller-supplied host to check) and `rest` (`dial.baseUrl`,
 /// parsed the same way [`connector_probe::probe_s3`] parses an S3
-/// endpoint) against [`connector_probe::resolve_checked`], gated the SAME
+/// endpoint) and `saas` (the vendor table's API and token addresses, built
+/// from `dial.account`) against [`connector_probe::resolve_checked`], gated the SAME
 /// way [`connector_probe::probe`] already is by
 /// `&state.config.connector_internal_hosts()`. Never checks
 /// `sheets`: its dial names a spreadsheet id, not a caller-chosen host —
@@ -3341,7 +3354,15 @@ pub struct IngestCredentialBody {
 async fn check_dial_ssrf(
     dial: &Dial,
     internal_hosts: &crate::internal_hosts::InternalHosts,
+    oauth: crate::connector_oauth::OAuthSettings,
 ) -> Result<(), ApiError> {
+    // `SRC-3` AD2: a `saas` dial dials the API host and the token host the
+    // vendor table builds from `account`; both are checked, since they can
+    // differ (a vendor's sign-in service is not its API).
+    let saas_urls: Vec<String> = match dial {
+        Dial::Saas(saas) => saas_dialled_urls(saas, oauth),
+        _ => Vec::new(),
+    };
     let host_port: Option<(&str, u16)> = match dial {
         Dial::Sql(sql) => Some((sql.host.as_str(), sql.port)),
         Dial::Cdc(cdc) => Some((cdc.host.as_str(), cdc.port)),
@@ -3362,8 +3383,16 @@ async fn check_dial_ssrf(
         // already has (its dial names a spreadsheet id, not a
         // caller-chosen host). The authoritative check for these
         // adapters stays in Dagster, not here.
-        Dial::Sheets(_) | Dial::Mongo(_) | Dial::Kafka(_) | Dial::Sftp(_) => None,
+        Dial::Sheets(_) | Dial::Mongo(_) | Dial::Kafka(_) | Dial::Sftp(_) | Dial::Saas(_) => None,
     };
+    for url in &saas_urls {
+        if let Some((host, port)) = connector_probe::parse_endpoint_host_port(url) {
+            connector_probe::resolve_checked(host, port, internal_hosts)
+                .await
+                .map(|_approved| ())
+                .map_err(ApiError::BadRequest)?;
+        }
+    }
     let Some((host, port)) = host_port else {
         return Ok(());
     };
@@ -3373,6 +3402,35 @@ async fn check_dial_ssrf(
         .await
         .map(|_approved| ())
         .map_err(ApiError::BadRequest)
+}
+
+/// The addresses a `saas` dial makes the product dial: the vendor's API base
+/// and token endpoint, built from the vendor table and the account
+/// (`SRC-3` AD2). Empty for a dial whose vendor or account no longer
+/// validates ([`Dial::parse`] has refused both before this runs).
+fn saas_dialled_urls(
+    saas: &lakehouse_store::ingest_spec::SaasDial,
+    oauth: crate::connector_oauth::OAuthSettings,
+) -> Vec<String> {
+    use lakehouse_store::saas_vendors::{SaasVendor, vendor};
+    let Some(vendor) = vendor(&saas.vendor) else {
+        return Vec::new();
+    };
+    let Ok(parts) = vendor.validate_account(&saas.account) else {
+        return Vec::new();
+    };
+    // Slice 2 review SHOULD-FIX 5: the gate-only mock origin (a no-op unless the
+    // gate-only switch is on), so the save-time check looks at what will be dialled.
+    [vendor.api_base, vendor.oauth.token_url]
+        .iter()
+        .map(|template| {
+            crate::connector_oauth::gate_rebase(
+                oauth,
+                vendor.id,
+                &SaasVendor::render(template, &parts),
+            )
+        })
+        .collect()
 }
 
 /// `SRC-12 review C1 BLOCKER 1`: refuse an `OAuth2` address the product will
@@ -3514,8 +3572,12 @@ async fn refuse_uploaded_targets(state: &AppState, source_objects: &Value) -> Re
 /// whatever `dial` names. So a save that changes the connector's target
 /// identity ([`lakehouse_store::ingest_spec::is_repoint`]: adapter, host,
 /// port, database, endpoint, bucket, base URL, brokers…) must carry every
-/// credential slot the new `dial` reads, in `credential`. Without them it
-/// is refused with a fixed 409 ([`REPOINT_NEEDS_CREDENTIALS`]) BEFORE the
+/// credential slot the new `dial` reads, in `credential`. A dial that reads
+/// none (`SEC-25`: Kafka with auth `none`, whose `secret_field_names` entry
+/// is empty) has no secret that could travel, so such a re-point needs no
+/// credential at all and is written with no swaps. A re-point that leaves
+/// out a slot it reads is refused with a fixed 409
+/// ([`REPOINT_NEEDS_CREDENTIALS`]) BEFORE the
 /// save-time address check and before any connection: nothing is resolved,
 /// dialled or written. With them the new settings are probed with those
 /// credentials alone (a [`crate::connector_secret_store::CandidateSecretResolver`],
@@ -3527,7 +3589,8 @@ async fn refuse_uploaded_targets(state: &AppState, source_objects: &Value) -> Re
 ///
 /// The assistant's `set_ingest_spec` tool calls this handler with no
 /// principal and never forwards a `credential`, so it reaches the 409 for a
-/// re-point and cannot carry a secret.
+/// re-point and cannot carry a secret (a re-point onto a dial that reads no
+/// credential, `SEC-25`, saves nothing secret either).
 ///
 /// # Errors
 ///
@@ -3601,15 +3664,23 @@ pub async fn ingest_spec_put(
     let repoint =
         lakehouse_store::ingest_spec::is_repoint(stored.adapter.as_deref(), &stored.dial, &dial);
     let required = credential_slots_read(&body.adapter, &dial);
-    if repoint
-        && !body.credential.as_ref().is_some_and(|credential| {
+    // `SEC-25` (a): a dial that reads NO credential slot (Kafka with auth
+    // `none`, `secret_field_names` returns an empty list) needs none to be
+    // re-pointed — there is no secret that could travel to the new host, so
+    // `slots_cover(0, ..)` is true. The refusal used to be keyed on "a
+    // credential object was sent", which made such a connector impossible to
+    // move: 409 without one, and 400 ("there is none to send") with one.
+    let covered = body
+        .credential
+        .as_ref()
+        .map_or(required == 0, |credential| {
             slots_cover(
                 required,
                 credential.primary.is_some(),
                 credential.secondary.is_some(),
             )
-        })
-    {
+        });
+    if repoint && !covered {
         return Err(ApiError::Conflict(REPOINT_NEEDS_CREDENTIALS.to_owned()).into());
     }
 
@@ -3622,8 +3693,24 @@ pub async fn ingest_spec_put(
         schedule_cron: body.schedule_cron,
     };
     let Some(credential) = credential else {
-        check_dial_ssrf(&dial, &state.config.connector_internal_hosts()).await?;
-        return match connectors::set_ingest_spec(pool(&state)?, &id, &input).await {
+        check_dial_ssrf(
+            &dial,
+            &state.config.connector_internal_hosts(),
+            state.config.oauth_settings(),
+        )
+        .await?;
+        // `SEC-25` (a): the one no-credential re-point the product allows is
+        // onto a dial that reads no slot, and it still has to go through
+        // `repoint_ingest_spec`, because `set_ingest_spec` refuses every
+        // change of target (that refusal is the defence in depth behind the
+        // route's own check). No swaps: there is no slot to move, and the
+        // store reads an empty `swaps` against zero fields as covering them.
+        let saved = if repoint && required == 0 {
+            connectors::repoint_ingest_spec(pool(&state)?, &id, &input, &[]).await
+        } else {
+            connectors::set_ingest_spec(pool(&state)?, &id, &input).await
+        };
+        return match saved {
             Ok(spec) => Ok(ApiJson(IngestSpecResponse::new(
                 spec,
                 time::OffsetDateTime::now_utc(),
@@ -3694,7 +3781,12 @@ async fn save_with_credentials(
     )?;
     let candidate = candidate_dial_info(&after, &changes, None)?;
 
-    check_dial_ssrf(dial, &state.config.connector_internal_hosts()).await?;
+    check_dial_ssrf(
+        dial,
+        &state.config.connector_internal_hosts(),
+        state.config.oauth_settings(),
+    )
+    .await?;
     // Only after the address is approved: a refused target makes no call to
     // the secret manager.
     resolve_references(state, &mut changes, "the change was NOT saved").await?;
@@ -3821,7 +3913,7 @@ fn cdc_ingest_run_unsupported_reason(connector_id: &str) -> String {
 /// the ingest run"` (F2.7: Dagster's own text was logged at the
 /// dagster crate boundary), except that a job the orchestrator has not
 /// loaded yet (`outcome.job_not_loaded`) is a 503 with a stable code
-/// (`PR #105 CI fix`); `Err(err)` becomes a 503 `orchestrator_unreachable`,
+/// (`PR #105 CI fix`); `Err(err)` becomes a retryable 503 or a 502,
 /// see below.
 ///
 /// # Errors
@@ -3832,7 +3924,8 @@ fn cdc_ingest_run_unsupported_reason(connector_id: &str) -> String {
 /// paused (`SRC-8`, [`CONNECTOR_PAUSED`]), if a run for this connector is still
 /// queued or running (see [`connector_runs`]), or if the table named waits
 /// for a schema decision; 422 if `Dagster` reports a launch-time failure; 503
-/// on a `Dagster` transport failure; 503/500 as above for the database pool.
+/// or 502 on a `Dagster` call, as below; 503/500 as above for the database
+/// pool.
 ///
 /// Two `503` answers carry a stable `code` beside the fixed `error`
 /// sentence and a `Retry-After`, so a client retries on the code and never
@@ -3844,11 +3937,16 @@ fn cdc_ingest_run_unsupported_reason(connector_id: &str) -> String {
 ///   location is still loading. It was a `422` before; `503` is the
 ///   route's status for "backing service not ready", the console treats
 ///   any non-2xx the same, and nothing else depends on the `422`.
-/// - `orchestrator_unreachable`: `Dagster` could not be reached or answered
-///   with a protocol failure, on the run list or the launch.
+/// - `orchestrator_unreachable`: `Dagster` could not be reached, or answered
+///   `5xx`, on the run list or the launch — the two failures that mean the
+///   same request will work shortly (`PR #105 review SHOULD-FIX 5` narrowed
+///   this code to them; a GraphQL error, an unreadable body or a `4xx` is a
+///   `502` with no code, because repeating the request unchanged gets the
+///   same answer).
 ///
 /// Every other launch failure stays the generic `422` with a reference id
-/// and no code.
+/// and no code, and a `Dagster` answer this service cannot use is the `502`
+/// above.
 ///
 /// # A run of one table (`SRC-10` decision 5)
 ///
@@ -4197,7 +4295,10 @@ mod tests {
     fn connector_runs_ignores_a_run_without_a_connector_id() {
         let mut run = dg_run("run-1", "SUCCESS", "conn-a");
         run.run_config = json!({});
-        assert!(connector_runs(&[run], "conn-a").is_empty());
+        assert_eq!(
+            connector_runs(&[run], "conn-a"),
+            [] as [crate::routes::connectors::ConnectorIngestRun; 0]
+        );
     }
 
     use axum::body::to_bytes;
@@ -5621,27 +5722,27 @@ mod tests {
         info
     }
 
-    /// `SEC-14` (D4): a connector that dials from its `host` column cannot
-    /// have it changed through `PATCH`; one that dials from `dial` can (the
-    /// column is a label), and so can a `PATCH` that repeats the stored
-    /// value.
+    /// `SEC-14` (D4), narrowed by `SEC-25` (b): only a connector that dials
+    /// from its `host` column (no adapter — the legacy `kind` dispatch)
+    /// cannot have it changed through `PATCH`. A connector WITH an adapter
+    /// dials from `dial`, so the column is a label — including `files`,
+    /// whose target since `SRC-6` is `dial.protocol`/`dial.endpoint`/
+    /// `dial.bucket`, never `host` (the old rule refused it and protected
+    /// nothing). Repeating the stored value is accepted either way.
     #[test]
     fn host_change_refusal_covers_the_rows_that_dial_from_host() {
         let legacy = host_row(None, "lakehouse@db:5432/lakehouse");
-        let files = host_row(Some("files"), "http://rustfs:9000|bucket");
         let sql = host_row(Some("sql"), "label");
 
-        for stored in [&legacy, &files] {
-            let err = host_change_refusal(stored, "lakehouse@other:5432/lakehouse")
-                .expect("a changed host must be refused");
-            let ApiError::Conflict(message) = err else {
-                panic!("expected 409");
-            };
-            assert_eq!(message, HOST_CHANGE_NEEDS_CREDENTIALS);
-        }
+        let err = host_change_refusal(&legacy, "lakehouse@other:5432/lakehouse")
+            .expect("a changed host must be refused");
+        let ApiError::Conflict(message) = err else {
+            panic!("expected 409");
+        };
+        assert_eq!(message, HOST_CHANGE_NEEDS_CREDENTIALS);
         assert!(host_change_refusal(&legacy, " LAKEHOUSE@db:5432/lakehouse ").is_none());
         assert!(host_change_refusal(&sql, "another label").is_none());
-        for adapter in ["cdc", "rest", "sheets", "mongodb", "kafka", "sftp"] {
+        for adapter in ["files", "cdc", "rest", "sheets", "mongodb", "kafka", "sftp"] {
             assert!(host_change_refusal(&host_row(Some(adapter), "x"), "y").is_none());
         }
     }

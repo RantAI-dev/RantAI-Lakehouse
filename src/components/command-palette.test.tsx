@@ -70,6 +70,22 @@ describe("CommandPalette catalog search", () => {
     expect(requested[0]).toContain("/api/catalog?q=revenue_amount")
   })
 
+  it("shows an asset's certified or deprecated mark beside its name, and none without one", async () => {
+    stubCatalog({
+      assets: [
+        asset(1, { certification: "certified" }),
+        asset(2, { certification: "deprecated" }),
+        asset(3),
+      ],
+    })
+    await search("table")
+    await screen.findByText("Table 3")
+    const row = (name: string) => screen.getByText(name).closest('[cmdk-item=""]') as HTMLElement
+    expect(row("Table 1").textContent).toContain("Certified")
+    expect(row("Table 2").textContent).toContain("Deprecated")
+    expect(row("Table 3").textContent).not.toMatch(/Certified|Deprecated/)
+  })
+
   it("says an approximate match is approximate", async () => {
     stubCatalog({
       assets: [asset(1, { matchedOn: { field: "description", value: "", approximate: true } })],
@@ -130,5 +146,122 @@ describe("CommandPalette catalog search", () => {
       expect(at(name)).toBeGreaterThan(-1)
       expect(at(name)).toBeLessThan(seeAll)
     }
+  })
+})
+
+describe("CommandPalette dashboards and charts", () => {
+  /** Answers each URL with its own body. */
+  function stubByUrl(answers: Record<string, unknown>) {
+    global.fetch = mock(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      requested.push(url)
+      const key = Object.keys(answers).find((k) => url.includes(k))
+      return new Response(JSON.stringify(key ? answers[key] : {}), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      })
+    }) as unknown as typeof fetch
+  }
+
+  it("finds a dashboard and a chart by name and opens the chart's dashboard", async () => {
+    stubByUrl({
+      "/api/dashboard/search": {
+        hits: [
+          { kind: "board", id: "b_1", name: "Hotels overview" },
+          { kind: "chart", id: "u_1", name: "Hotels by province", board: "b_2", boardName: "Map demo" },
+        ],
+      },
+      "/api/catalog": { assets: [] },
+    })
+    await search("hotels")
+    expect(await screen.findByText("Hotels overview")).toBeTruthy()
+    expect(screen.getByText("on Map demo")).toBeTruthy()
+    fireEvent.click(screen.getByText("Hotels by province"))
+    expect(pushed).toEqual(["/dashboards/b_2"])
+  })
+
+  it("shows the caller's favourites and recent dashboards before anything is typed", async () => {
+    stubByUrl({
+      "/api/dashboard/shortcuts": {
+        favourites: [{ kind: "board", id: "b_1", name: "My favourite" }],
+        recent: [{ kind: "board", id: "b_2", name: "Opened lately" }],
+      },
+    })
+    render(<CommandPalette />)
+    fireEvent.keyDown(document, { key: "k", ctrlKey: true })
+    expect(await screen.findByText("My favourite")).toBeTruthy()
+    expect(screen.getByText("Opened lately")).toBeTruthy()
+  })
+
+  it("says so when the dashboard search is unavailable, and stays quiet for a caller without access", async () => {
+    global.fetch = mock(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes("/api/dashboard/search")) return new Response(JSON.stringify({ error: "boom" }), { status: 503 })
+      return new Response(JSON.stringify({ assets: [] }), { status: 200 })
+    }) as unknown as typeof fetch
+    await search("orders")
+    expect(await screen.findByText("Dashboard search is unavailable")).toBeTruthy()
+    cleanup()
+    requested.length = 0
+    global.fetch = mock(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      requested.push(url)
+      if (url.includes("/api/dashboard/search")) return new Response(JSON.stringify({ error: "forbidden" }), { status: 403 })
+      return new Response(JSON.stringify({ assets: [] }), { status: 200 })
+    }) as unknown as typeof fetch
+    await search("orders")
+    await waitFor(() => expect(requested.some((u) => u.includes("/api/dashboard/search"))).toBe(true))
+    // Let the refusal settle: a caller without access sees no group and no line.
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    expect(screen.queryByText("Dashboard search is unavailable")).toBeNull()
+  })
+})
+
+describe("CommandPalette empty state and recents (BI-18 part C review fix R12)", () => {
+  function stubWith(handler: (url: string) => Promise<Response> | Response) {
+    global.fetch = mock(async (input: RequestInfo | URL) => handler(String(input))) as unknown as typeof fetch
+  }
+  const ok = (body: unknown) => new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } })
+
+  it("does not say No results above server hits", async () => {
+    stubWith((url) =>
+      url.includes("/api/dashboard/search")
+        ? ok({ hits: [{ kind: "chart", id: "u_1", name: "Choropleth of hotels", board: "b_1", boardName: "Map demo" }] })
+        : ok({ assets: [] }),
+    )
+    await search("choropleth")
+    expect(await screen.findByText("Choropleth of hotels")).toBeTruthy()
+    expect(screen.queryByText("No results.")).toBeNull()
+    expect(screen.queryByText("Searching…")).toBeNull()
+  })
+
+  it("says Searching… while the server answers, then No results. when nothing matched anywhere", async () => {
+    let release: (r: Response) => void = () => {}
+    let asked = false
+    stubWith((url) =>
+      url.includes("/api/dashboard/search") ? new Promise<Response>((resolve) => { asked = true; release = resolve }) : ok({ assets: [] }),
+    )
+    await search("zzzzqq")
+    expect(await screen.findByText("Searching…")).toBeTruthy()
+    expect(screen.queryByText("No results.")).toBeNull()
+    await waitFor(() => expect(asked).toBe(true))
+    release(ok({ hits: [] }))
+    expect(await screen.findByText("No results.")).toBeTruthy()
+    expect(screen.queryByText("Searching…")).toBeNull()
+  })
+
+  it("leaves a favourite out of Recent dashboards", async () => {
+    stubWith((url) =>
+      url.includes("/api/dashboard/shortcuts")
+        ? ok({
+            favourites: [{ kind: "board", id: "b_1", name: "Map demo" }],
+            recent: [{ kind: "board", id: "b_1", name: "Map demo" }, { kind: "board", id: "b_2", name: "Other board" }],
+          })
+        : ok({}),
+    )
+    render(<CommandPalette />)
+    fireEvent.keyDown(document, { key: "k", ctrlKey: true })
+    expect(await screen.findByText("Other board")).toBeTruthy()
+    expect(screen.getAllByText("Map demo")).toHaveLength(1)
   })
 })

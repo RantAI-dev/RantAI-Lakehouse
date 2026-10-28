@@ -70,8 +70,10 @@ crash, and a delete that fails is a problem of that case.
 Exit code 0 when the set passes, 1 when it fails, 2 when the run could not
 start (no stack, no login, a port already in use).
 
-This run belongs to a person, not to CI: it needs a model key, it builds an
-image, and it answers are read by whoever runs it. Put the numbers in the
+This run belongs to a person, not to CI: it needs a model key, and whoever
+runs it reads the answers. The runner (`run_dashboard_eval.sh`) builds the api
+image from the working tree under its own tag, or uses the image given with
+`--image`, and removes what it built when it ends. Put the numbers in the
 review of the PR that changed the tool or prompt. Results are never kept in
 the repository.
 """
@@ -142,10 +144,19 @@ REFUSAL_CUES = (
     "tidak mencakup",
     "hanya mencakup",
     "hanya tersedia",
+    "can't",
+    "cannot",
+    "can not",
+    "not able to",
+    "tidak bisa",
+    "tidak dapat",
 )
 
 # Words that appear in almost any Indonesian answer and almost never in an
-# English one; three or more distinct hits reads as Indonesian.
+# English one, and the words a short confirmation is built of ("sudah siap",
+# "tinjau pratinjaunya di bawah lalu konfirmasi"): a short answer carries too
+# few of the common words to reach three, so the words such an answer uses
+# count as markers too. Three or more distinct hits reads as Indonesian.
 INDONESIAN_MARKERS = (
     "yang",
     "dan",
@@ -172,6 +183,14 @@ INDONESIAN_MARKERS = (
     "ke",
     "usaha",
     "berdasarkan",
+    "sudah",
+    "siap",
+    "silakan",
+    "lalu",
+    "bawah",
+    "tinjau",
+    "periksa",
+    "konfirmasi",
 )
 
 RAW_ERROR_PATTERNS = (r"DB::Exception", r"Code: \d+", r"\bstack trace\b", r"SQLSTATE")
@@ -241,10 +260,18 @@ def api_get(cfg: Config, session: requests.Session, path: str) -> Any:
 
 
 def dig(value: Any, path: str) -> list[Any]:
-    """`a.b[].c` style lookup; `[]` fans out over a list."""
+    """`a.b[].c` style lookup; `[]` fans out over a list and `[N]` takes the
+    Nth element of one (`tabs[0].title` is the first tab's title, which is
+    how a case checks the order the tabs are in)."""
     current = [value]
     for part in path.split("."):
         fan = part.endswith("[]")
+        index: int | None = None
+        if not fan:
+            match = re.search(r"\[(\d+)\]$", part)
+            if match:
+                index = int(match.group(1))
+                part = part[: match.start()]
         key = part[:-2] if fan else part
         nxt: list[Any] = []
         for item in current:
@@ -254,10 +281,83 @@ def dig(value: Any, path: str) -> list[Any]:
                 continue
             if fan and isinstance(item, list):
                 nxt.extend(item)
-            elif not fan:
+            elif index is not None:
+                if isinstance(item, list) and index < len(item):
+                    nxt.append(item[index])
+            else:
                 nxt.append(item)
         current = nxt
     return current
+
+
+def _tool_arg(args: Any, key: str) -> Any:
+    """The value at a dotted `key` of a tool call's args, or `None` when any
+    part of the path is absent (so a missing key never matches an empty want)."""
+    current = args
+    for part in key.split("."):
+        if not isinstance(current, dict) or part not in current:
+            return None
+        current = current[part]
+    return current
+
+
+def tool_args_match(args: Any, want: dict[str, Any]) -> bool:
+    """Whether a tool call's args carry every `want` key (dotted keys read
+    into nested args, so the match does not depend on key order).
+
+    BLD-2 review R4 BLOCKER 2 / decision R15, restoring the string
+    semantics commit `5ec778414e86` broke: a wanted NUMBER matches only a
+    number EQUAL to it (`minutes: 10` never matches `100` -- the
+    SHOULD-FIX 9/10 intent stays), but a wanted STRING matches
+    case-insensitively as a substring of a string value AND of the JSON
+    text of a list or object value (`"filters": "tahun"` matches a filters
+    array of objects, `silver.orders_clean` matches `"pipeline":
+    "orders_clean"`), because a schema never guarantees a value's exact
+    string shape. A wanted string never matches a number and vice versa.
+
+    BLD-2 review R5 SHOULD-FIX 5: a wanted BOOL matches only a bool of the
+    same value. In Python `1 == True` and `1.0 == True`, so comparing
+    without a type check scored a call that sent `1` for a case that asked
+    for `true` -- the same number-is-not-a-bool rule the other two arms
+    already enforce. The JSON text is dumped with `ensure_ascii=False`, so a
+    wanted non-ASCII string is looked for as itself and not as the
+    `\\uXXXX` escape `json.dumps` writes by default."""
+    for key, wanted in want.items():
+        got = _tool_arg(args, key)
+        if got is None:
+            return False
+        if isinstance(wanted, bool):
+            if not isinstance(got, bool) or got != wanted:
+                return False
+        elif wanted is None:
+            if got != wanted:
+                return False
+        elif isinstance(wanted, (int, float)):
+            # The number comparison is member-wise over a list but is an
+            # equality per member: 10 must never match 100.
+            if isinstance(got, list):
+                if not any(
+                    isinstance(member, (int, float))
+                    and not isinstance(member, bool)
+                    and member == wanted
+                    for member in got
+                ):
+                    return False
+            elif not (
+                isinstance(got, (int, float)) and not isinstance(got, bool) and got == wanted
+            ):
+                return False
+        else:
+            wanted_text = str(wanted).lower()
+            if isinstance(got, str):
+                matched = wanted_text in got.lower()
+            elif isinstance(got, (list, dict)):
+                matched = wanted_text in json.dumps(got, ensure_ascii=False).lower()
+            else:
+                matched = False
+            if not matched:
+                return False
+    return True
 
 
 def where_matches(item: Any, where: dict[str, Any]) -> bool:
@@ -281,6 +381,37 @@ def _is_or_holds(got: Any, want: Any) -> bool:
     if isinstance(got, list):
         return want in got
     return got == want
+
+
+def tile_on_tab_matches(item: Any, spec: dict[str, Any]) -> bool:
+    """Whether the board puts the chart `spec["chart"]` on the tab titled
+    `spec["tab_title"]`.
+
+    A tile names its tab by that tab's id. A tile that names no tab, or names
+    one the board does not have, leaves the chart on the first tab. A board
+    with no tabs is on no tab, and a chart with no tile in the layout is on no
+    tab either."""
+    if not isinstance(item, dict):
+        return False
+    tabs = item.get("tabs")
+    if not isinstance(tabs, list) or not tabs:
+        return False
+    layout = item.get("layout")
+    tile = layout.get(spec.get("chart")) if isinstance(layout, dict) else None
+    if not isinstance(tile, dict):
+        return False
+    named = tile.get("tab")
+    tab: Any = None
+    if named is not None:
+        for candidate in tabs:
+            if isinstance(candidate, dict) and candidate.get("id") == named:
+                tab = candidate
+                break
+    if tab is None:
+        tab = tabs[0]
+    if not isinstance(tab, dict):
+        return False
+    return tab.get("title") == spec.get("tab_title")
 
 
 def resolve_fact(cfg: Config, session: requests.Session, fact: dict[str, Any]) -> list[Any]:
@@ -394,10 +525,11 @@ DELETE_ROUTES = {
     "field": "/api/dashboard/calc-fields",
     "source": "/api/dashboard/sources",
     "board": "/api/dashboard/boards",
+    "metric": "/api/dashboard/metrics",
 }
 # Newest first: a chart may use a field, a field a source, and a board holds
 # charts, so the dependants go before what they depend on.
-CLEANUP_ORDER = ("chart", "field", "source", "board")
+CLEANUP_ORDER = ("chart", "metric", "field", "source", "board")
 
 
 def kind_of_path(path: str) -> str | None:
@@ -436,10 +568,19 @@ def fill_value(value: Any, names: dict[str, str]) -> Any:
 
 
 def fill_check(check: dict[str, Any], names: dict[str, str]) -> dict[str, Any]:
-    """An `expect_state` with its `{name}` values replaced by the run's ids."""
+    """An `expect_state` with its `{name}` keys and values replaced by the run's ids."""
     filled = dict(check)
-    filled["where"] = fill_value(check.get("where", {}), names)
+    # The keys are filled too: a board's layout is keyed by chart id, so a
+    # `where` key such as `layout.{chart}.w` names a chart this run created.
+    filled["where"] = {
+        fill_names(key, names): fill_value(value, names)
+        for key, value in check.get("where", {}).items()
+    }
     filled["path"] = fill_names(check["path"], names)
+    if "tile_on_tab" in check:
+        # The chart of a `tile_on_tab` is a name the run saved, like the ids
+        # of a `where`.
+        filled["tile_on_tab"] = fill_value(check["tile_on_tab"], names)
     return filled
 
 
@@ -487,13 +628,22 @@ def formula_problems(
             formulas.append(_created_formula(step.get("result")))
     for confirm in confirms:
         if confirm.get("tool") == "create_calculated_field":
-            formulas.append(_created_formula(confirm.get("result")))
+            formulas.append(_created_formula(confirmed_result(confirm)))
     problems: list[str] = []
     for formula in formulas:
         for word in forbidden:
             if re.search(word, formula, re.IGNORECASE):
                 problems.append(f"formula contains {word}")
     return problems
+
+
+def confirmed_result(confirm: dict[str, Any]) -> dict[str, Any]:
+    """The tool's own result inside a confirm. `send_confirm` keeps the whole
+    `POST /api/ai/tool` reply `{tool, outcome, result}` under `result`, so the
+    created object's `id` and `created` are one level further in."""
+    reply = confirm.get("result")
+    inner = reply.get("result") if isinstance(reply, dict) else None
+    return inner if isinstance(inner, dict) else {}
 
 
 def _created_formula(result: Any) -> str:
@@ -539,11 +689,34 @@ def send_confirm(
     return body
 
 
+def confirm_problems(confirms: list[dict[str, Any]]) -> list[str]:
+    """A confirm that did not come back `executed` with HTTP 200 is a problem of
+    the case: HTTP 400 and up, an `error` in the reply, or any other `outcome`.
+    Without this a rejected confirm only shows as an object missing from the
+    state check, or not at all."""
+    problems: list[str] = []
+    for confirm in confirms:
+        reply = confirm.get("result")
+        if not isinstance(reply, dict):
+            reply = {}
+        status = reply.get("_status")
+        outcome = reply.get("outcome")
+        if status == 200 and outcome == "executed" and "error" not in reply:
+            continue
+        text = f"confirm {confirm.get('tool')}: HTTP {status}, outcome {outcome}"
+        if reply.get("error"):
+            text += f", error {reply['error']}"
+        problems.append(text)
+    return problems
+
+
 def run_setup(
     cfg: Config, session: requests.Session, setup: list[dict[str, Any]]
 ) -> tuple[dict[str, str], list[dict[str, str]]]:
     """Make the case's own objects through the API. Returns the ids saved under
-    each name and the objects created, for cleanup."""
+    each name and the objects created, for cleanup. A call without an `id_at`
+    only changes what an earlier call made: it saves no name and adds nothing
+    for the cleanup to delete."""
     names: dict[str, str] = {}
     created: list[dict[str, str]] = []
     for call in setup:
@@ -555,6 +728,11 @@ def run_setup(
         )
         if resp.status_code >= 400:
             raise SetupError(f"setup {call.get('name', call['path'])}: HTTP {resp.status_code}")
+        if not call.get("id_at"):
+            # A call that only changes what an earlier call made (the tabs of
+            # a board) replies without an id: it saves no name, and the
+            # cleanup must not delete the object the earlier call created.
+            continue
         body = resp.json()
         found = dig(body, call["id_at"])
         if not found:
@@ -590,12 +768,12 @@ def collect_created(
                 found.append({"kind": "field", "id": str(result["id"])})
     for confirm in confirms:
         tool = confirm.get("tool")
-        result = confirm.get("result") or {}
-        if isinstance(result, dict) and result.get("id") and result.get("created"):
+        result = confirmed_result(confirm)
+        if result.get("id") and result.get("created"):
             kind = {"create_chart": "chart", "create_board": "board"}.get(tool or "")
             if kind:
                 found.append({"kind": kind, "id": str(result["id"])})
-        if tool == "create_calculated_field" and isinstance(result, dict) and result.get("id") and result.get("ok") is True:
+        if tool == "create_calculated_field" and result.get("id") and result.get("ok") is True:
             found.append({"kind": "field", "id": str(result["id"])})
     return found
 
@@ -636,11 +814,13 @@ def expect_state_problems(
     resp.raise_for_status()
     items = resp.json().get(check["list"], [])
     where = check.get("where", {})
+    tile_on_tab = check.get("tile_on_tab")
     matches = [
         i
         for i in items
         if where_matches(i, where)
         and (check.get("scope") == "all" or str(i.get("id")) in own_ids)
+        and (tile_on_tab is None or tile_on_tab_matches(i, tile_on_tab))
     ]
     if "min" in check:
         if len(matches) < check["min"]:
@@ -770,8 +950,9 @@ def run_case(cfg: Config, session: requests.Session, case: dict[str, Any]) -> di
                         response = send_confirm(cfg, session, step, mode, body.get("sessionId"))
                         confirms.append({"tool": pending_of(step)["tool"], "result": response})
             messages.append({"role": "assistant", "content": plain_text(body.get("answer", ""))})
-        scored = score_case(cfg, session, case, bodies)
+        scored = score_case(cfg, session, case, bodies, names)
         scored["confirms"] = confirms
+        scored["problems"].extend(confirm_problems(confirms))
         trace = [s for b in bodies for s in b.get("toolTrace", [])]
         created = collect_created(setup_created, [trace], confirms)
         own_ids = {c["id"] for c in created}
@@ -861,8 +1042,15 @@ def bodies_from_saved(result: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def score_case(
-    cfg: Config, session: requests.Session, case: dict[str, Any], bodies: list[dict[str, Any]]
+    cfg: Config,
+    session: requests.Session,
+    case: dict[str, Any],
+    bodies: list[dict[str, Any]],
+    names: dict[str, str] | None = None,
 ) -> dict[str, Any]:
+    """Score one case from its response bodies. `names` are the ids the case's
+    setup saved, used to fill `{name}` in `expect_tool.args_contains` the way
+    the turns are filled; `--rescore` has no setup and passes none."""
     final = bodies[-1]
     raw_answer = final.get("answer", "") or ""
     answer = plain_text(raw_answer)
@@ -892,13 +1080,15 @@ def score_case(
     if expect_tool:
         required += 1
         trace = [t for b in bodies for t in b.get("toolTrace", []) if t.get("tool") == expect_tool["name"]]
-        want = expect_tool.get("args_contains", {})
-        if any(all(str(v).lower() in str(t.get("args", {}).get(k, "")).lower() for k, v in want.items()) for t in trace):
+        want = fill_value(expect_tool.get("args_contains", {}), names or {})
+        if any(tool_args_match(t.get("args", {}), want) for t in trace):
             hit += 1
         else:
             missing.append(f"tool={expect_tool['name']}{want}")
 
-    refused = any(cue in lowered for cue in REFUSAL_CUES)
+    # The cues are written with a straight apostrophe; a model often answers
+    # with a curly one.
+    refused = any(cue in lowered.replace("\u2019", "'") for cue in REFUSAL_CUES)
     # No expected facts (e.g. no pipeline is failing right now): completeness
     # is about declining only when the case expects that.
     if required:

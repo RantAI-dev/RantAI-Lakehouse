@@ -54,7 +54,7 @@ This feature is the assistant working inside Query Studio. The user asks with on
 
 - A proposal is checked for the caller's permissions and for the names the engine resolves, and it is never run. A statement that plans can still return rows other than the ones the person meant.
 - The console refuses to send a statement of more than 20,000 characters to be fixed; it says the query is too long for the assistant to fix.
-- The assistant sees the tables the chat's data map lists, and learns of other tables only from the error text.
+- The assistant sees the tables the chat's data map lists, and learns of other tables only from the error text. The data map goes only to a user with `catalog:read`, and its sample values and ranges go only to a user who also has `query:read` (`SEC-24`).
 - The diff is against the editor as it was when the proposal came back. Typing in the editor closes the proposal, and so does running the query.
 - In an Explain turn the assistant is offered no tool, so it can neither propose a fix nor run a query.
 - A chat the console opened with a tool list refuses any tool outside that list.

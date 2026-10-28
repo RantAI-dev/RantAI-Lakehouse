@@ -8,7 +8,8 @@ import type { ChartClickHandler } from "@/lib/chart-click";
 import type { ChartRenderSpec } from "@/lib/dashboard-specs";
 import { readView, stepZoom, ZOOM_MAX, ZOOM_MIN } from "@/lib/geo-view";
 import { EChart } from "./echart";
-import { ensureMap, mapEntry } from "./echarts-maps";
+import { ensureMap, mapEntry, type MapLoader } from "./echarts-maps";
+import type { ValueFormat } from "@/lib/chart-style";
 import { buildGeoOption, regionNamesFor, resolveMapId } from "./geo-option";
 
 type Row = Record<string, unknown>;
@@ -22,21 +23,34 @@ const CONTROL_BUTTON_CLASS = "border-border bg-background/85 shadow-xs backdrop-
  * The three map kinds (`geomap`, `pointmap`, `geoheat`). Loads the bundled
  * map first (local GeoJSON) and says plainly when it cannot be drawn: an id
  * the console has no map for, or a GeoJSON file that is missing.
+ *
+ * `loadMap` reads an uploaded map's boundary file. The console leaves it
+ * out (the map's own route, through `apiFetch`); a public link and an embed
+ * pass their own token-based loader, so an anonymous viewer is never sent to
+ * the login page (`PR #246 review BLOCKER 1`).
  */
-export function GeoChart({ spec, rows, dark, onDataClick }: {
+export function GeoChart({ spec, rows, dark, onDataClick, format, locale, byValue, loadMap }: {
   spec: ChartRenderSpec; rows: Row[]; dark: boolean; onDataClick?: ChartClickHandler;
+  /** BI-17: the chart's number format, the deployment's locale and the colour range of a map. */
+  format?: ValueFormat; locale?: string; byValue?: string[];
+  /** How an uploaded map's file is read (absent: the console's own route). */
+  loadMap?: MapLoader;
 }) {
   const mapId = resolveMapId(spec);
   const entry = mapEntry(mapId);
   // The outcome is keyed by the map it is for, so switching maps shows the
   // loading state until the new one answers (no state reset inside the effect).
   const [loaded, setLoaded] = React.useState<{ id: string; ok: boolean } | null>(null);
+  // Depend on whether the map is known, not on `entry`: an uploaded map's
+  // entry is rebuilt on every `mapEntry` call, so depending on the object
+  // re-ran this effect each render and looped forever (found in BI-19 QA).
+  const known = entry !== undefined;
   React.useEffect(() => {
-    if (!entry) return;
+    if (!known) return;
     let alive = true;
-    void ensureMap(mapId).then((ok) => { if (alive) setLoaded({ id: mapId, ok }); });
+    void ensureMap(mapId, loadMap).then((ok) => { if (alive) setLoaded({ id: mapId, ok }); });
     return () => { alive = false; };
-  }, [mapId, entry]);
+  }, [mapId, known, loadMap]);
 
   if (!entry) {
     return (
@@ -51,19 +65,31 @@ export function GeoChart({ spec, rows, dark, onDataClick }: {
     return (
       <div className="grid h-full place-content-center px-4 text-center text-xs text-muted-foreground">
         <p className="font-medium text-foreground">Map data not loaded</p>
-        <p className="mt-1">Add <code className="rounded bg-muted px-1 font-mono">public{entry.url}</code> to enable this map.</p>
+        {entry.uploaded ? (
+          // BI-16 C2b QA fix Q1: an uploaded map has no file under public/; it is gone (deleted) or unreadable.
+          loadMap ? (
+            // An anonymous viewer (a public link or an embed) cannot pick another map:
+            // the tile says what happened and stops. Never a redirect.
+            <p className="mt-1">This map&apos;s boundary file could not be loaded.</p>
+          ) : (
+            <p className="mt-1">This uploaded map no longer exists or cannot be read. Pick another map in the chart settings.</p>
+          )
+        ) : (
+          <p className="mt-1">Add <code className="rounded bg-muted px-1 font-mono">public{entry.url}</code> to enable this map.</p>
+        )}
       </div>
     );
   }
   // A different map or kind starts from its own fit: the old pan and zoom
   // are coordinates of another map.
-  return <ReadyMap key={`${spec.kind}:${mapId}`} spec={spec} rows={rows} dark={dark} onDataClick={onDataClick} />;
+  return <ReadyMap key={`${spec.kind}:${mapId}`} spec={spec} rows={rows} dark={dark} onDataClick={onDataClick} format={format} locale={locale} byValue={byValue} />;
 }
 
-function ReadyMap({ spec, rows, dark, onDataClick }: {
+function ReadyMap({ spec, rows, dark, onDataClick, format, locale, byValue }: {
   spec: ChartRenderSpec; rows: Row[]; dark: boolean; onDataClick?: ChartClickHandler;
+  format?: ValueFormat; locale?: string; byValue?: string[];
 }) {
-  const { option, notices } = React.useMemo(() => buildGeoOption(spec, rows, dark), [spec, rows, dark]);
+  const { option, notices } = React.useMemo(() => buildGeoOption(spec, rows, dark, { format, locale, byValue }), [spec, rows, dark, format, locale, byValue]);
   // A region is drilled by the spelling the column stores, which only the
   // rows know (geo-option.ts `regionNamesFor`); computed once per data load.
   const regionNames = React.useMemo(() => regionNamesFor(spec, rows), [spec, rows]);

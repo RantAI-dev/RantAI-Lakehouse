@@ -112,7 +112,15 @@ const MAX_ITER: u32 = 8;
 
 /// What a late `ask_user` gets back (plan 14). The model reads it on its
 /// next round, so it asks the model to answer with the reading it used.
-const LATE_ASK_REFUSAL: &str = "ask_user must come before any query in a turn. Answer now with the reading you used, and say which reading it is.";
+/// The wording forbids the three defects staging QA saw in the model's
+/// reply: an apology or a mention of the refusal, a closing question in
+/// plain text, and a reply in another language.
+const LATE_ASK_REFUSAL: &str = "ask_user is refused: a turn may ask only before \
+it runs a query, and this turn has run one. Do not apologise and do not \
+mention this refusal. Answer now from the results above with the reading \
+you used, and say in one sentence which reading it is. Do not end with a \
+question: if another reading is possible, name it as a statement. Reply in \
+the language of the user's question.";
 
 /// What a call gets back when the console's allowlist did not offer the tool
 /// (plan 17). The model reads it on its next round, so it is told to answer
@@ -316,9 +324,38 @@ async fn users_terms(
         })
 }
 
+/// What the DATA MAP may show a caller (`SEC-24`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MapAccess {
+    /// No map: the caller may not read the catalog.
+    None,
+    /// Tables and columns only: no column ranges and no sample values.
+    WithoutSamples,
+    /// The whole map.
+    Full,
+}
+
+/// What the DATA MAP may show `principal`, from its permissions alone. The
+/// map lists the catalog's tables, so it needs `catalog:read`, the
+/// permission of `/api/catalog`. Its column ranges come from
+/// `/api/catalog/{id}/profile` and its sample values from
+/// `/api/catalog/{id}/sample`. Both routes need `query:read`, so the ranges
+/// and samples need it too.
+/// `Principal::has` honours wildcards, so a `*:*` holder gets the full map.
+fn data_map_access(principal: Option<&Principal>) -> MapAccess {
+    match principal {
+        Some(p) if p.has("catalog:read") && p.has("query:read") => MapAccess::Full,
+        Some(p) if p.has("catalog:read") => MapAccess::WithoutSamples,
+        _ => MapAccess::None,
+    }
+}
+
 /// The system prompt: the rules for the mode, the rules for asking (when
 /// `AI_ASK_BACK` is on and `asking`, that is, `ask_user` is in the chat's
-/// tool list), the DATA MAP (when the caller may read the shared catalog),
+/// tool list), the DATA MAP (when the caller may read the shared catalog:
+/// the map follows `catalog:read`, the permission of `/api/catalog`, and its
+/// column ranges and sample values follow `query:read`, the permission of
+/// `/api/catalog/{id}/profile` and `/api/catalog/{id}/sample`, `SEC-24`),
 /// the caller's own words (when `AI_ASK_BACK` is on), the page the user is
 /// on, and the reply-language line last.
 ///
@@ -347,7 +384,13 @@ async fn system_prompt(
     // carries sample values, so it follows the catalog route's own rule
     // (`catalog::catalog_tenant_refusal`): a caller that route refuses gets
     // no map, and one it cannot evaluate gets none either (fail closed).
+    //
+    // The permission is checked first (`SEC-24`): `/api/ai/chat` needs only a
+    // signed-in user, so without this a Dashboard Viewer would read the
+    // tables and samples that the catalog routes refuse it.
+    let access = data_map_access(principal);
     let refusal = match principal {
+        Some(_) if access == MapAccess::None => Some("reading the data map needs catalog:read"),
         Some(p) => crate::routes::catalog::catalog_tenant_refusal(state, p, headers)
             .await
             .unwrap_or(Some("the shared-catalog rule could not be evaluated")),
@@ -363,9 +406,18 @@ async fn system_prompt(
             } else {
                 std::collections::HashSet::new()
             };
+            // A caller without `query:read` gets `None` here, which drops
+            // every range and sample (`data_map` lists tables and columns
+            // only) and skips the shared cache, so such a caller costs one
+            // rebuild of the map per turn.
+            let withheld = if access == MapAccess::Full {
+                withheld.as_ref()
+            } else {
+                None
+            };
             data_map::data_map(
                 &state.clickhouse,
-                withheld.as_ref(),
+                withheld,
                 &notes,
                 &query_words,
                 state.config.ai_relevant_tables,
@@ -421,17 +473,24 @@ fn without_tool_in_explain(tools: Vec<Value>, newest_user: Option<&str>) -> Vec<
         .collect()
 }
 
-/// Validates the body and assembles the system prompt, history and the tool
-/// list for this principal and mode. A bad body is a ready 400 response.
-async fn prepare_chat(
+/// R30: the note for a person who cannot change dashboards goes before the
+/// closing language line, which stays last.
+fn with_permission_note(
     state: &AppState,
-    principal: Option<&Principal>,
-    headers: &axum::http::HeaderMap,
-    parsed: ChatBody,
-) -> Result<PreparedChat, Response> {
-    let perms = principal.map(|p| &p.permissions);
-    let history: Vec<LlmMessage> = parsed
-        .messages
+    sys: String,
+    perms: Option<&lakehouse_auth::PermissionSet>,
+    recent_user: &[&str],
+) -> String {
+    let closing = prompt::closing(
+        recent_user.last().copied().unwrap_or_default(),
+        state.config.ai_default_reply_language,
+    );
+    prompt::with_permission_note(sys, perms, &closing)
+}
+
+/// The user and assistant turns of a request as model messages.
+fn history_of(messages: &[IncomingMessage]) -> Vec<LlmMessage> {
+    messages
         .iter()
         .filter(|m| m.role == "user" || m.role == "assistant")
         .map(|m| LlmMessage {
@@ -445,7 +504,29 @@ async fn prepare_chat(
             tool_call_id: None,
             name: None,
         })
-        .collect();
+        .collect()
+}
+
+/// Validates the body and assembles the system prompt, history and the tool
+/// list for this principal and mode. A bad body is a ready 400 response.
+///
+/// Clippy 1.98 taught `result_large_err` to look at `async fn`s
+/// (rust-clippy#17130), which surfaced this signature: the `Err` is a ready
+/// `Response` the handler returns verbatim. Boxing it would change that
+/// contract and every call site for an allocation only on the error path,
+/// so the signature stays (REL-9, decision D2).
+#[allow(
+    clippy::result_large_err,
+    reason = "the Err is a ready Response the handler returns verbatim; boxing it would change this contract and every call site, for no gain on the success path"
+)]
+async fn prepare_chat(
+    state: &AppState,
+    principal: Option<&Principal>,
+    headers: &axum::http::HeaderMap,
+    parsed: ChatBody,
+) -> Result<PreparedChat, Response> {
+    let perms = principal.map(|p| &p.permissions);
+    let history = history_of(&parsed.messages);
     if history.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -453,7 +534,6 @@ async fn prepare_chat(
         )
             .into_response());
     }
-
     let is_build = parsed.mode.as_deref() == Some("build");
     let recent_user: Vec<&str> = parsed
         .messages
@@ -494,7 +574,6 @@ async fn prepare_chat(
             relevant.contains(name)
         })
         .collect();
-
     // The rules for asking are written only for a chat that can ask: one
     // whose tool list holds `ask_user`. The SQL help rules follow the same
     // rule for `propose_sql`.
@@ -518,7 +597,7 @@ async fn prepare_chat(
         sql_help,
     )
     .await;
-
+    let sys = with_permission_note(state, sys, perms, &recent_user);
     let mut messages = vec![LlmMessage {
         role: LlmMessageRole::System,
         content: Some(sys),
@@ -804,8 +883,14 @@ async fn run_chat(
                     Some("stopped"),
                 ));
             }
-            let args: Map<String, Value> =
-                serde_json::from_str(&call.function.arguments).unwrap_or_default();
+            // `confirmed` is the console Confirm button's signal, sent only
+            // through `POST /api/ai/tool`; a model may not send it (backlog
+            // AI-18, ADR 0012 Decision 3). It is stripped here, before the
+            // gate, so the gate, the audit record and `run_tool` never see it.
+            let args = gate::strip_confirmed(
+                &serde_json::from_str::<Map<String, Value>>(&call.function.arguments)
+                    .unwrap_or_default(),
+            );
             // plan 14: an ask after any tool that ran in this turn is refused
             // before the gate. The prompt asks the model to ask first; this
             // is the check that holds when it does not.
@@ -828,7 +913,13 @@ async fn run_chat(
             // have the call silently dropped) so it can tell the user
             // instead of assuming a write (or a read it wasn't allowed)
             // it never got.
-            let gate_result = gate::decide_by_name(is_build, perms, &call.function.name, &args);
+            // RPT-1 review fix (BLOCKER) R2: who an update leaves receiving the
+            // report is looked up here, before the gate, and given to it as a
+            // server-side fact.
+            let audience =
+                tools::report_audience(state, principal, &call.function.name, &args).await;
+            let gate_result =
+                gate::decide_by_name(is_build, perms, &call.function.name, &args, audience);
             // plan 17: with an allowlist, the tools the console named are the
             // only ones a call may reach. The check is against the offered
             // list, not the request's strings, so a tool the switch removed,
@@ -847,18 +938,9 @@ async fn run_chat(
                     };
                     let (_, resource_id) =
                         audit::resource_for(&call.function.name, &args, &json!({}));
-                    let redacted = audit::redact(&Value::Object(args.clone()));
-                    let actor =
-                        principal.map_or_else(|| "unknown".to_owned(), |p| p.display_name.clone());
-                    let approval_result = gate::create_write_high_approval(
-                        state.pg.as_deref(),
-                        &actor,
-                        spec,
-                        &args,
-                        &redacted,
-                        resource_id.as_deref(),
-                    )
-                    .await;
+                    let approval_result =
+                        request_approval(state, principal, spec, &args, resource_id.as_deref())
+                            .await;
                     let (run_id, approval_id) = if approval_result
                         .get("needs_approval")
                         .and_then(Value::as_bool)
@@ -892,9 +974,7 @@ async fn run_chat(
                 let error = not_offered_refusal(&call.function.name);
                 (json!({ "error": error }), "failed", None, None)
             } else {
-                let clean_args = gate::strip_confirmed(&args);
-                let result =
-                    tools::run_tool(state, principal, &call.function.name, &clean_args).await;
+                let result = tools::run_tool(state, principal, &call.function.name, &args).await;
                 let ok = !matches!(&result, Value::Object(m) if m.contains_key("error"));
                 (result, if ok { "executed" } else { "failed" }, None, None)
             };
@@ -1081,7 +1161,13 @@ fn stream_chat(state: AppState, principal: Option<Principal>, run: PreparedChat)
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
     let (mut writer, reader) = tokio::io::duplex(16 * 1024);
 
-    tokio::spawn(async move {
+    // BI-5 review B2: the chat's tools (`run_sql`, `stop_query`) run in this
+    // spawned task, which does not inherit the request's task-local run. Without
+    // the run below they would use the compiled-in limits, a nil principal and
+    // a query id nobody's Stop can match. The run is taken here, in the
+    // request's task, and handed to the spawned one.
+    let query_run = crate::query_limits::QueryRun::current_or_detached();
+    tokio::spawn(crate::query_limits::scope(query_run, async move {
         let last = match run_chat(&state, principal.as_ref(), run, Some(&tx)).await {
             Ok(body) => json!({ "type": "done", "body": body }),
             Err(err) => json!({
@@ -1091,7 +1177,7 @@ fn stream_chat(state: AppState, principal: Option<Principal>, run: PreparedChat)
             }),
         };
         let _ = tx.send(last);
-    });
+    }));
     // Dropping `rx` when a write fails (client gone) makes the loop's next
     // `report` return false.
     tokio::spawn(async move {
@@ -1173,21 +1259,24 @@ pub async fn tool_call(
     };
     let is_build = parsed.mode.as_deref() == Some("build");
 
-    let gate_result = gate::decide(is_build, perms, spec, &parsed.args);
+    // RPT-1 review fix (BLOCKER) R2: as in the chat loop, the audience of a
+    // report update is looked up before the gate.
+    let audience = tools::report_audience(
+        &state,
+        principal.as_ref().map(|Extension(p)| p),
+        &parsed.tool,
+        &parsed.args,
+    )
+    .await;
+    let gate_result = gate::decide_with(is_build, perms, spec, &parsed.args, audience);
     let (result, outcome, run_id, approval_id) = if let Some(refusal) = gate_result {
         if gate::is_write_high_pending(&refusal) {
             let (_, resource_id) = audit::resource_for(&parsed.tool, &parsed.args, &json!({}));
-            let redacted = audit::redact(&Value::Object(parsed.args.clone()));
-            let actor = principal.as_ref().map_or_else(
-                || "unknown".to_owned(),
-                |Extension(p)| p.display_name.clone(),
-            );
-            let approval_result = gate::create_write_high_approval(
-                state.pg.as_deref(),
-                &actor,
+            let approval_result = request_approval(
+                &state,
+                principal.as_ref().map(|Extension(p)| p),
                 spec,
                 &parsed.args,
-                &redacted,
                 resource_id.as_deref(),
             )
             .await;
@@ -1252,6 +1341,39 @@ pub async fn tool_call(
         ApiJson(json!({ "tool": parsed.tool, "outcome": outcome, "result": result })),
     )
         .into_response()
+}
+
+/// Create the approval for a `WriteHigh` call that [`gate::decide`] flagged, and
+/// return what the model and the console see. The one copy for the chat loop and
+/// `POST /api/ai/tool`.
+///
+/// `RPT-1`: the report tools check the requester's rights now, before any
+/// approval exists, and carry the requester into the stored arguments
+/// (`ownerId`, see `tools::approval_args`); every other tool's arguments are
+/// stored as they are. A refusal is returned instead of an approval.
+async fn request_approval(
+    state: &AppState,
+    principal: Option<&Principal>,
+    spec: &registry::ToolSpec,
+    args: &Map<String, Value>,
+    resource_id: Option<&str>,
+) -> Value {
+    let actor = principal.map_or_else(|| "unknown".to_owned(), |p| p.display_name.clone());
+    match tools::approval_args(state, principal, spec.name, args).await {
+        Ok(stored) => {
+            let redacted = audit::redact(&Value::Object(stored.clone()));
+            gate::create_write_high_approval(
+                state.pg.as_deref(),
+                &actor,
+                spec,
+                &stored,
+                &redacted,
+                resource_id,
+            )
+            .await
+        }
+        Err(refusal) => refusal,
+    }
 }
 
 /// Builds the `/api/ai/chat` response body, matching the TypeScript's
@@ -2308,6 +2430,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_late_ask_refusal_forbids_an_apology_a_closing_question_and_another_language() {
+        // The constant is the only instruction the model reads on its next
+        // round, so it must forbid the three defects staging QA saw.
+        let text = LATE_ASK_REFUSAL.to_lowercase();
+        assert!(
+            text.contains("apologi"),
+            "the refusal must forbid an apology, got: {text}"
+        );
+        assert!(
+            text.contains("do not end with a question"),
+            "the refusal must forbid a closing question in plain text, got: {text}"
+        );
+        assert!(
+            text.contains("language of the user's question"),
+            "the refusal must tell the model to reply in the user's language, got: {text}"
+        );
+    }
+
     #[tokio::test]
     async fn with_both_switches_on_the_count_rules_come_after_the_ask_back_rules() {
         let state = state_with_ask_back_and_layer("true", "true");
@@ -2369,6 +2510,69 @@ mod tests {
             must_change_password: false,
             role_names: Vec::new(),
         }
+    }
+
+    /// A signed-in user holding exactly `permissions`.
+    fn holding(permissions: &str) -> Principal {
+        Principal {
+            permissions: lakehouse_auth::PermissionSet::parse(permissions),
+            ..analyst(7)
+        }
+    }
+
+    #[test]
+    fn the_data_map_is_withheld_from_no_user_and_from_one_without_catalog_read() {
+        assert_eq!(data_map_access(None), MapAccess::None);
+        assert_eq!(
+            data_map_access(Some(&holding("dashboard:read"))),
+            MapAccess::None
+        );
+        // `query:read` alone does not open the map: the catalog route needs
+        // `catalog:read` for the tables themselves.
+        assert_eq!(
+            data_map_access(Some(&holding("query:read"))),
+            MapAccess::None
+        );
+        assert_eq!(data_map_access(Some(&holding(""))), MapAccess::None);
+    }
+
+    #[test]
+    fn catalog_read_alone_gets_the_map_without_samples() {
+        assert_eq!(
+            data_map_access(Some(&holding("catalog:read"))),
+            MapAccess::WithoutSamples
+        );
+    }
+
+    #[test]
+    fn catalog_read_with_query_read_and_a_wildcard_holder_get_the_full_map() {
+        assert_eq!(
+            data_map_access(Some(&holding("catalog:read, query:read"))),
+            MapAccess::Full
+        );
+        assert_eq!(data_map_access(Some(&holding("*:*"))), MapAccess::Full);
+    }
+
+    #[tokio::test]
+    async fn the_prompt_of_a_user_without_catalog_read_names_the_permission_and_lists_no_table() {
+        let state = state_with_ask_back_and_layer("false", "false");
+        let headers = axum::http::HeaderMap::new();
+        let who = holding("dashboard:read");
+        let text = system_prompt(
+            &state,
+            Some(&who),
+            &headers,
+            false,
+            "",
+            &[FIXED_QUESTION],
+            false,
+            false,
+        )
+        .await;
+        assert!(
+            text.contains("DATA MAP\n(withheld: reading the data map needs catalog:read)"),
+            "{text}"
+        );
     }
 
     fn chat_body(tools: Option<&[&str]>) -> ChatBody {
@@ -2493,6 +2697,50 @@ mod tests {
             "the language line is unchanged in build mode: {system}"
         );
         assert!(lang.contains("Indonesian"), "{lang}");
+    }
+
+    /// BI-18 part C review fix (SHOULD-FIX) R30: the chat of a person who cannot
+    /// change dashboards says why the tools are withheld, ahead of the language
+    /// line; a person who can gets no such sentence.
+    #[tokio::test]
+    async fn a_chat_without_dashboard_write_says_the_tools_are_withheld_for_permissions() {
+        let state = state_with_ask_back("false");
+        let headers = axum::http::HeaderMap::new();
+        let system = |who: Principal| {
+            let state = state.clone();
+            let headers = headers.clone();
+            async move {
+                let chat = prepare_chat(
+                    &state,
+                    Some(&who),
+                    &headers,
+                    history_of(&[("user", "Move the map charts to a new tab.")]),
+                )
+                .await
+                .map_err(|_| "a valid body")
+                .expect("a prepared chat");
+                chat.messages[0].content.clone().unwrap_or_default()
+            }
+        };
+        let viewer = system(analyst(1)).await;
+        assert!(
+            viewer.contains(
+                "Your account cannot change dashboards; ask an editor or an administrator."
+            ),
+            "{viewer}"
+        );
+        assert!(
+            viewer.find("Your account cannot change dashboards")
+                < viewer.find(&prompt::closing("Move the map charts to a new tab.", None)),
+            "the sentence comes before the language line"
+        );
+        let mut editor = analyst(2);
+        editor.permissions = lakehouse_auth::PermissionSet::parse("dashboard:write, query:read");
+        assert!(
+            !system(editor)
+                .await
+                .contains("Your account cannot change dashboards")
+        );
     }
 
     #[tokio::test]

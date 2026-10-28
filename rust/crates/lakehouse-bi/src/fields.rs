@@ -466,6 +466,34 @@ impl FieldCatalog {
         def: &ChartInput,
         raw: Option<&RelationColumns>,
     ) -> BTreeMap<String, String> {
+        // A label that is the name itself is left out: the tile shows the name.
+        self.metric_values(def, raw, crate::metrics::entry_label, |value, name| {
+            value != name
+        })
+    }
+
+    /// `BI-17` (D4): the format hint of each metric the chart shows, by metric
+    /// name, for the metrics that have one. The console uses it as the default
+    /// format of that value, below the chart's own and a per-value one.
+    #[must_use]
+    pub fn metric_formats(
+        &self,
+        def: &ChartInput,
+        raw: Option<&RelationColumns>,
+    ) -> BTreeMap<String, String> {
+        self.metric_values(def, raw, crate::metrics::entry_format, |_, _| true)
+    }
+
+    /// One value per metric the chart (and its layers) shows, read from the
+    /// metric's catalog entry; shared by labels and formats so the two decide
+    /// "is this measure a metric" the same way.
+    fn metric_values(
+        &self,
+        def: &ChartInput,
+        raw: Option<&RelationColumns>,
+        get: fn(&FieldDef) -> Option<String>,
+        keep: fn(&str, &str) -> bool,
+    ) -> BTreeMap<String, String> {
         let mut out = BTreeMap::new();
         let mut take = |fields: &[FieldDef],
                         measures: &crate::shape::MeasureList,
@@ -473,14 +501,14 @@ impl FieldCatalog {
             for (i, name) in measures.iter().enumerate() {
                 let is = measures.is_metric(i)
                     || raw.is_some_and(|r| plain_name_is_metric(fields, r, name));
-                let label = fields
+                let value = fields
                     .iter()
                     .find(|f| f.is_metric() && f.name == *name)
-                    .and_then(crate::metrics::entry_label);
-                if let (true, Some(label)) = (is, label)
-                    && label != *name
+                    .and_then(get);
+                if let (true, Some(value)) = (is, value)
+                    && keep(&value, name)
                 {
-                    out.insert(name.clone(), label);
+                    out.insert(name.clone(), value);
                 }
             }
         };
@@ -587,12 +615,22 @@ fn takes_aggregate_measure(def: &ChartInput) -> bool {
         // BI-2: a comparing KPI takes a metric, whose number is the whole
         // aggregate the trend statement computes per period.
         ChartKind::Kpi => !def.tables.compares_to_previous(kind) || def.measures.has_metrics(),
-        ChartKind::Gauge => true,
+        // BI-16 part B: a progress bar and a bullet graph read their value (and
+        // goal) through the KPI builder or the grouped one, both of which take an
+        // aggregate field's expression.
+        ChartKind::Gauge | ChartKind::Progress | ChartKind::Bullet => true,
         ChartKind::Boxplot
+        | ChartKind::Histogram
+        | ChartKind::Gantt
         | ChartKind::Pointmap
         | ChartKind::Geoheat
         | ChartKind::Pivot
-        | ChartKind::Text => false,
+        | ChartKind::Text
+        | ChartKind::Heading
+        | ChartKind::Divider
+        | ChartKind::Section
+        | ChartKind::Image
+        | ChartKind::Web => false,
         _ => !def.tables.is_rows_mode(kind),
     }
 }
@@ -1427,7 +1465,7 @@ mod tests {
             "{}",
             got.sql
         );
-        assert!(got.sql.ends_with("SETTINGS max_result_rows = 2000, result_overflow_mode = 'break', max_execution_time = 30"));
+        assert!(got.sql.ends_with("SETTINGS max_result_rows = 2000, result_overflow_mode = 'break', max_execution_time = 60"));
         s.def.measures = vec!["bad".to_owned()].into();
         assert!(
             sql_for_sql_source_report(
@@ -1484,8 +1522,10 @@ mod tests {
             charts_using(&charts, SourceKind::Mart, "mart_x", "profit"),
             vec!["test"]
         );
-        assert!(charts_using(&charts, SourceKind::Mart, "mart_other", "profit").is_empty());
-        assert!(charts_using(&charts, SourceKind::SqlSource, "s_1", "profit").is_empty());
+        let other_mart = charts_using(&charts, SourceKind::Mart, "mart_other", "profit");
+        assert!(other_mart.is_empty(), "{other_mart:?}");
+        let sql_source = charts_using(&charts, SourceKind::SqlSource, "s_1", "profit");
+        assert!(sql_source.is_empty(), "{sql_source:?}");
         let cat = catalog();
         let t = TimeContext::default();
         let users = fields_using(cat.of(SourceKind::Mart, "mart_x"), &cols(), &t, "profit");

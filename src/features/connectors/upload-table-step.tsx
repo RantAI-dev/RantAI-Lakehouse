@@ -28,6 +28,7 @@ export function UploadTableStep({
   offersMode,
   mode,
   onMode,
+  folderField = null,
 }: {
   readonly tableName: string
   readonly onTableName: (name: string) => void
@@ -35,6 +36,8 @@ export function UploadTableStep({
   readonly offersMode: boolean
   readonly mode: UploadLoadMode
   readonly onMode: (mode: UploadLoadMode) => void
+  /** The folder picker (`DATA-35`), or nothing when the folders could not be read: the load then names no folder. */
+  readonly folderField?: React.ReactNode
 }) {
   const problem = tableName === "" ? null : tableNameFault(tableName)
   // The fieldset below has `min-w-0`: a fieldset defaults to its content's min width, which a long name would push past the card.
@@ -72,6 +75,8 @@ export function UploadTableStep({
         </div>
       </div>
 
+      {folderField}
+
       {offersMode ? (
         <fieldset className="min-w-0 space-y-2">
           <legend className="text-sm font-medium">
@@ -106,7 +111,10 @@ export function UploadTableStep({
         </fieldset>
       ) : null}
 
-      <UploadNotice>Every column is stored as text. Numbers and dates have to be converted afterwards.</UploadNotice>
+      <UploadNotice>
+        The columns keep the names and types chosen on the previous step. Adding to a table that already exists keeps that
+        table&apos;s names and types.
+      </UploadNotice>
     </div>
   )
 }

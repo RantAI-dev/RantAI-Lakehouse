@@ -81,7 +81,7 @@ describe("ConnectorCreatePage", () => {
   it("offers a link to upload a file, above the type cards, on the first step", async () => {
     stubFetch()
     renderPage()
-    const link = await screen.findByRole("link", { name: "Have a file instead? Upload a CSV or TSV" })
+    const link = await screen.findByRole("link", { name: "Have a file instead? Upload CSV, TSV, Excel or Parquet files" })
     expect(link.getAttribute("href")).toBe("/connectors/upload")
     const card = await screen.findByRole("radio", { name: /PostgreSQL/ })
     expect(link.compareDocumentPosition(card)).toBe(Node.DOCUMENT_POSITION_FOLLOWING)

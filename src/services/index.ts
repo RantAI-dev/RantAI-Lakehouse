@@ -2,7 +2,6 @@
  * Service registry — pages import from here, never from mock modules directly.
  * Swap `mock*` for HTTP/Flight adapters when backends are ready.
  */
-import { mockAssetService } from "./mock/assets"
 import { clickhouseQueryService } from "./clients/queries"
 import { clickhouseAssetService } from "./clients/assets"
 import { dagsterPipelineService } from "./clients/pipelines"
@@ -23,9 +22,12 @@ import { goldService as goldClientService } from "./clients/gold"
 import { notificationsService as notificationsClientService } from "./clients/notifications"
 import { uploadService as uploadClientService } from "./clients/uploads"
 import { homeService as homeClientService } from "./clients/home"
+import { reportService as reportClientService } from "./clients/reports"
 import { settingsService as settingsClientService } from "./clients/settings"
+import { mapService as mapClientService } from "./clients/maps"
 import { chatTermService as chatTermClientService } from "./clients/chat-terms"
 import { semanticService as semanticClientService } from "./clients/semantic"
+import { tagKeysService as tagKeysClientService } from "./clients/tag-keys"
 import * as authClient from "./clients/auth"
 
 // Overview is now fully real — summary/activity from ClickHouse+Dagster,
@@ -33,7 +35,6 @@ import * as authClient from "./clients/auth"
 // has been deleted.
 export const overviewService = clickhouseOverviewService
 export const assetService = clickhouseAssetService
-void mockAssetService
 // Pipelines is now fully real — list/get/runs/trigger from Dagster,
 // create/generate from Postgres + LLM, cancel/retry/pause/resume are
 // real Dagster mutations. mock/pipelines.ts has been deleted.
@@ -70,6 +71,15 @@ export const connectorService = postgresConnectorService
 // itself still calls `/api/dashboard/*` directly for charts/layout/filters.
 // No mock ever existed for this service.
 export const dashboardService = clickhouseDashboardService
+/**
+ * The dashboard types the console's features use. They live in the contract
+ * (`services/contracts/dashboards`), not in a client, and are exported here so
+ * a feature imports them from `@/services` and not from a client
+ * (`PR #199 review M SHOULD-FIX BI-16 7`).
+ */
+export type {
+  Board, BoardChart, BoardTab, EmbedInfo, FilterMode, LayoutMap, PhoneTile, PublicLink, PublicLinkState, TileBox,
+} from "./contracts/dashboards"
 /** Calculated fields of a mart or SQL source (BI-8). */
 export const calcFieldService = calcFieldClientService
 /** Reusable metrics and segments (BI-2). */
@@ -105,6 +115,17 @@ export const homeService = homeClientService
 // The deployment's report time zone and first day of the week over
 // `/api/settings/reporting` (BI-9).
 export const settingsService = settingsClientService
+// Uploaded map boundaries over `/api/maps` (BI-16 part C2b). No mock ever existed.
+export const mapService = mapClientService
+// Scheduled reports by email (RPT-1) over `/api/reports/...`. No mock ever existed.
+export const reportService = reportClientService
+/**
+ * The reporting settings a caller sends (the report time zone, the first day
+ * of the week, the number locale, the company palette, the fonts and the
+ * content sites). The contract owns the shape, and it is exported here so a
+ * feature imports it from `@/services` (`PR #199 review M SHOULD-FIX BI-17 7`).
+ */
+export type { ReportingSettingsInput } from "./contracts/settings"
 // The words a user defined for the chat (`PUT /api/ai/terms`), stored when
 // they pick an answer to a question the chat asked. No mock ever existed.
 export const chatTermService = chatTermClientService
@@ -112,6 +133,9 @@ export const chatTermService = chatTermClientService
 // the drafted meaning and role, and the person's confirmed corrections. No
 // mock ever existed.
 export const semanticService = semanticClientService
+// The governed tag keys and their allowed values (`/api/governance/tag-keys`,
+// `DATA-12` part 2). Free tags are not part of this.
+export const tagKeysService = tagKeysClientService
 // SSO admin page reads the live OIDC configuration
 // off the API process. Sessions page lists and revokes
 // live browser sessions via `GET /api/auth/sessions` and

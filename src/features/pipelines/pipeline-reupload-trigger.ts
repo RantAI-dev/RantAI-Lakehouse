@@ -13,13 +13,15 @@
  *   file only ever lands in a Bronze table, so a `silver`/`gold` source
  *   has no table to be re-uploaded — and the server refuses that
  *   upstream outright (`routes::authored_pipelines::
- *   validate_file_ingest_upstream`), so sending it would be a 400.
+ *   validate_per_table_upstream`), so sending it would be a 400.
  * - A new pipeline defaults ON: the feature's whole point is that a
  *   re-upload runs the pipeline, and a user building a pipeline over an
  *   uploaded table almost always wants it.
  * - Toggling changes ONLY this upstream. An `authored__`-free chain of
- *   other upstreams (another pipeline, `ingest_job`) is carried through
- *   untouched, and never duplicated.
+ *   other upstreams (another pipeline, `ingest_job` on bronze) is carried through
+ *   untouched, and never duplicated. On a non-Bronze source, per-table upstreams
+ *   (`file_ingest_job` and `ingest_job`) are dropped on save (BLD-4 review R1)
+ *   because the server refuses them and the form offers no control for them.
  *
  * The one upstream the switch owns is named by the DAGSTER side's own
  * constant (`file_ingest.JOB_NAME`); this literal and the API's
@@ -31,6 +33,9 @@
 
 /** The Dagster job one uploaded file's load runs. */
 export const FILE_INGEST_JOB = "file_ingest_job"
+
+/** The Dagster job one connector's load runs (BLD-4 review R1). */
+export const INGEST_JOB = "ingest_job"
 
 /** The only zone an uploaded file can be re-uploaded into. */
 export const BRONZE_ZONE = "bronze"
@@ -66,7 +71,7 @@ export function reuploadTriggerOn(
  *
  * For a source that is not Bronze the upload job is always removed: the
  * switch is not shown there, and a stored chain that names it is one the
- * server refuses (`validate_file_ingest_upstream`) — sending it back
+ * server refuses (`validate_per_table_upstream`) — sending it back
  * unchanged would make the whole save fail for a rule the user cannot
  * see a control for.
  */
@@ -76,6 +81,10 @@ export function withReuploadTrigger(
   on: boolean
 ): string[] {
   const kept = (dependsOn ?? []).filter((entry) => entry !== FILE_INGEST_JOB)
-  if (!on || !showsReuploadSwitch(sourceZone)) return kept
+  if (!showsReuploadSwitch(sourceZone)) {
+    // BLD-4 review R1 / Decision R1: drop ingest_job on non-Bronze sources
+    return kept.filter((entry) => entry !== INGEST_JOB)
+  }
+  if (!on) return kept
   return [FILE_INGEST_JOB, ...kept]
 }

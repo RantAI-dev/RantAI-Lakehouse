@@ -7,9 +7,15 @@
 //!   buttons.
 //! - [`propose`] — `propose_sql`, a corrected statement checked for the
 //!   caller and shown to the person, never run.
+//! - [`look`] — `format_chart`, `set_dashboard_theme` (`BI-17` part A) and
+//!   `set_cache_rule` (`BI-4` part B).
 //! - [`dashboards`] — `create_chart`, `update_chart`, `delete_chart`,
 //!   `create_board`, `list_boards`, `list_charts`, `list_sql_sources`,
 //!   `suggest_dashboard`.
+//! - [`export`] — `export_dashboard` and `export_chart` (`AI-10`, with `BI-1`): a
+//!   download link, made when the person opens it.
+//! - [`reports`] — the scheduled-report tools (`AI-10`, with `RPT-1`).
+//! - [`tabs`] — the dashboard tab tools (`BI-18` part C, with `AI-9`).
 //! - [`calc_fields`] — the calculated-field tools (`BI-8`, with `AI-4`).
 //! - [`pipelines`] — `trigger_lakehouse_build`, `get_build_status`, plus
 //!   the Tier 1 pipeline-operations tools (T1.3).
@@ -24,9 +30,12 @@
 
 mod alerts;
 mod ask;
+mod boards;
 mod calc_fields;
 mod connectors;
 mod dashboards;
+mod export;
+mod maps;
 // `pub(in crate::routes)` (not merely `mod`) so `routes::lineage` — a
 // SIBLING module of `routes::ai`, not a descendant — can reuse
 // `data::CATALOG_UNION`, the SAME bronze-catalog query `list_datasets`
@@ -36,11 +45,18 @@ mod gold;
 mod governance;
 mod ingest;
 mod lakehouse;
+mod limits;
+mod look;
+#[cfg(test)]
+pub(super) use look::FORMAT_FIELDS;
 mod metrics;
 mod ops;
 mod pipelines;
 mod propose;
 mod queries;
+mod reports;
+pub(in crate::routes) use reports::{approval_args, report_audience};
+mod tabs;
 
 use axum::response::{IntoResponse, Response};
 use lakehouse_auth::Principal;
@@ -99,6 +115,19 @@ pub(super) async fn api_result_to_value<T: IntoResponse>(result: ApiResult<T>) -
 /// [`registry::find`] recognises but this `match` has no arm for hits the
 /// `unreachable!` below instead of silently falling through to "tool tak
 /// dikenal", which would be a bug worth crashing a test over, not masking.
+///
+/// The match is the registry-to-domain lookup and nothing more: 66 arms
+/// naming a tool, plus one guard arm (`n if calc_fields::handles(n)`),
+/// plus a catch-all, over 16 per-domain modules. All but
+/// `create_chart | update_chart` are a plain delegation (rustfmt wraps some
+/// onto three lines, as for `set_pipeline_target_lag`); that one reads the
+/// report time zone first, because a chart's SQL is built in it (`BI-9`).
+#[allow(
+    clippy::too_many_lines,
+    reason = "one lookup table over 16 domain modules, 66 of its 67 arms a \
+              delegation; the split by domain already happened, so \
+              splitting the table itself would only scatter that lookup"
+)]
 pub(in crate::routes) async fn run_tool(
     state: &AppState,
     principal: Option<&Principal>,
@@ -132,7 +161,7 @@ pub(in crate::routes) async fn run_tool(
         "get_quality" => data::get_quality(ch).await,
         "trigger_lakehouse_build" => pipelines::trigger_build(state, principal).await,
         "get_build_status" => pipelines::get_build_status(&state.dagster).await,
-        "describe_mart" => data::describe_mart(ch, args).await,
+        "describe_mart" => data::describe_mart(state, principal, args).await,
         "create_chart" | "update_chart" => {
             // BI-9: a chart's SQL is built with the report time zone (a deployment setting).
             let Ok(time) = crate::routes::settings::time_context(state).await else {
@@ -140,17 +169,27 @@ pub(in crate::routes) async fn run_tool(
                 return json!({ "error": "The reporting settings could not be read." });
             };
             if name == "create_chart" {
-                dashboards::create_chart(ch, args, None, &time).await
+                dashboards::create_chart(ch, principal, args, None, &time).await
             } else {
-                dashboards::update_chart(ch, args, &time).await
+                dashboards::update_chart(ch, principal, args, &time).await
             }
         }
-        "create_board" => dashboards::create_board(ch, args).await,
-        "list_boards" => dashboards::list_boards(ch).await,
+        "create_board" => dashboards::create_board(ch, principal, args).await,
+        "list_boards" => dashboards::list_boards(ch, principal).await,
         "suggest_dashboard" => dashboards::suggest_dashboard(ch).await,
-        "list_charts" => dashboards::list_charts(ch).await,
+        "list_charts" => dashboards::list_charts(ch, principal).await,
         "list_sql_sources" | "suggest_join" => dashboards::chart_sources(ch, name, args).await,
-        "delete_chart" => dashboards::delete_chart(ch, args).await,
+        "delete_chart" => dashboards::delete_chart(ch, principal, args).await,
+        n if limits::handles(n) => limits::run(state, principal, name, args).await,
+        n if look::handles(n) => look::run(state, principal, name, args).await,
+        n if export::handles(n) => export::run(state, principal, name, args).await,
+        n if reports::handles(n) => reports::run(state, principal, name, args).await,
+        "rename_board"
+        | "delete_board"
+        | "arrange_board"
+        | "move_chart"
+        | "set_board_view_filters"
+        | "save_board_filters" => boards::run(state, principal, name, args).await,
         n if calc_fields::handles(n) => calc_fields::run(state, principal, name, args).await,
         "list_alert_rules" => alerts::list_alert_rules(state, principal).await,
         "create_alert_rule" => alerts::create_alert_rule(state, principal, args).await,
@@ -168,8 +207,8 @@ pub(in crate::routes) async fn run_tool(
         "pause_pipeline" => pipelines::pause_pipeline(state, principal, args).await,
         "resume_pipeline" => pipelines::resume_pipeline(state, principal, args).await,
         "cancel_pipeline_run" => pipelines::cancel_pipeline_run(state, principal, args).await,
-        "save_query" => queries::save_query(state, args).await,
-        "list_saved_queries" => queries::list_saved_queries(state).await,
+        "save_query" => queries::save_query(state, principal, args).await,
+        "list_saved_queries" => queries::list_saved_queries(state, principal).await,
         "run_saved_query" => queries::run_saved_query(state, principal, args).await,
         "get_audit_history" => governance::get_audit_history(state).await,
         "list_classification_rules" => governance::list_classification_rules(state).await,
@@ -195,6 +234,9 @@ pub(in crate::routes) async fn run_tool(
         "create_pipeline" => pipelines::create_pipeline(state, principal, args).await,
         "get_pipeline" => pipelines::get_pipeline(state, args).await,
         "mark_pipeline_ready" => pipelines::mark_pipeline_ready(state, args).await,
+        "set_pipeline_target_lag" => {
+            pipelines::set_pipeline_target_lag(state, principal, args).await
+        }
         "list_iceberg_tables" => lakehouse::list_iceberg_tables(state, args).await,
         "describe_iceberg_table" => lakehouse::describe_iceberg_table(state, args).await,
         "get_table_maintenance" => lakehouse::get_table_maintenance(state, args).await,

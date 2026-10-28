@@ -6,5 +6,8 @@
   "The file has more than 2,000,000 rows.",
   "The load into the table failed.",
   "The table was loaded but could not be registered in the catalog.",
-  "The file has more than 1,000 columns."
+  "The file has more than 1,000 columns.",
+  "Some values do not fit their column's type.",
+  "The file is larger than the upload limit once unpacked.",
+  "The file's columns are not the ones the preview showed."
 ]

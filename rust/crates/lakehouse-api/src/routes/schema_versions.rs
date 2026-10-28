@@ -654,7 +654,7 @@ mod tests {
     #[test]
     fn equal_lists_have_no_changes_and_different_lists_always_have_one() {
         let a = cols(&[("id", "UInt64"), ("email", "String")]);
-        assert!(changes(&a, &a).is_empty());
+        assert_eq!(changes(&a, &a), [] as [std::string::String; 0]);
         let pairs = [
             (cols(&[]), cols(&[("id", "UInt64")])),
             (cols(&[("id", "UInt64")]), cols(&[])),
@@ -789,7 +789,10 @@ mod tests {
 
     #[test]
     fn no_stored_versions_is_no_entries() {
-        assert!(entries(&[]).is_empty());
+        assert_eq!(
+            entries(&[]),
+            [] as [crate::routes::schema_versions::Entry; 0]
+        );
     }
 
     #[test]
@@ -1127,7 +1130,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(recorded, 0);
-        assert!(inserts(&bodies(&server).await).is_empty());
+        assert_eq!(
+            inserts(&bodies(&server).await),
+            [] as [&std::string::String; 0]
+        );
     }
 
     #[tokio::test]
@@ -1216,7 +1222,10 @@ mod tests {
             result,
             Err(EngineError::Failed(ChError::Server(_)))
         ));
-        assert!(inserts(&bodies(&server).await).is_empty());
+        assert_eq!(
+            inserts(&bodies(&server).await),
+            [] as [&std::string::String; 0]
+        );
     }
 
     #[tokio::test]
@@ -1292,7 +1301,7 @@ mod tests {
 
         assert!(matches!(result, Err(EngineError::NotAResult)), "{result:?}");
         let seen = bodies(&server).await;
-        assert!(inserts(&seen).is_empty());
+        assert_eq!(inserts(&seen), [] as [&std::string::String; 0]);
         assert_eq!(
             seen.len(),
             1,
@@ -1392,10 +1401,9 @@ mod tests {
             ))
             .mount(&server)
             .await;
-        assert!(
-            for_table(&client(&server), "silver.orders")
-                .await
-                .is_empty()
+        assert_eq!(
+            for_table(&client(&server), "silver.orders").await,
+            [] as [crate::routes::schema_versions::Entry; 0]
         );
 
         let server = MockServer::start().await;
@@ -1405,10 +1413,9 @@ mod tests {
             ))
             .mount(&server)
             .await;
-        assert!(
-            for_table(&client(&server), "silver.orders")
-                .await
-                .is_empty()
+        assert_eq!(
+            for_table(&client(&server), "silver.orders").await,
+            [] as [crate::routes::schema_versions::Entry; 0]
         );
     }
 
@@ -1419,10 +1426,9 @@ mod tests {
             .respond_with(ResponseTemplate::new(500).set_body_string("Code: 999. DB::Exception"))
             .mount(&server)
             .await;
-        assert!(
-            for_table(&client(&server), "silver.orders")
-                .await
-                .is_empty()
+        assert_eq!(
+            for_table(&client(&server), "silver.orders").await,
+            [] as [crate::routes::schema_versions::Entry; 0]
         );
 
         // An engine nobody answers for.
@@ -1431,7 +1437,10 @@ mod tests {
             "default".to_owned(),
             String::new(),
         );
-        assert!(for_table(&ch, "silver.orders").await.is_empty());
+        assert_eq!(
+            for_table(&ch, "silver.orders").await,
+            [] as [crate::routes::schema_versions::Entry; 0]
+        );
     }
 
     #[tokio::test]
@@ -1445,10 +1454,9 @@ mod tests {
             ]),
         )
         .await;
-        assert!(
-            for_table(&client(&server), "silver.orders")
-                .await
-                .is_empty()
+        assert_eq!(
+            for_table(&client(&server), "silver.orders").await,
+            [] as [crate::routes::schema_versions::Entry; 0]
         );
     }
 
@@ -1459,10 +1467,9 @@ mod tests {
             .respond_with(ResponseTemplate::new(200))
             .mount(&server)
             .await;
-        assert!(
-            for_table(&client(&server), "silver.orders")
-                .await
-                .is_empty()
+        assert_eq!(
+            for_table(&client(&server), "silver.orders").await,
+            [] as [crate::routes::schema_versions::Entry; 0]
         );
     }
 
@@ -1551,7 +1558,10 @@ mod tests {
         assert!(spawn_pass_on(&FLAG, &state));
         until_clear(&FLAG).await;
 
-        assert!(inserts(&bodies(&server).await).is_empty());
+        assert_eq!(
+            inserts(&bodies(&server).await),
+            [] as [&std::string::String; 0]
+        );
         assert!(
             spawn_pass_on(&FLAG, &state),
             "a failed pass does not wedge the next"

@@ -27,6 +27,9 @@
 //! only for a pre-WS3 row with no adapter — see [`probe`]'s doc comment for
 //! the `adapter`-first-then-legacy-`kind` dispatch rule.
 //!
+//! A `saas` adapter (`SRC-3`, the business-app vendors) is tested by the
+//! child module `saas`: one `GET` of the vendor's "who am I" request.
+//!
 //! A `sheets` adapter is registered (`connector_type`, `0035`) but ships
 //! **`supported: false` unconditionally** — see [`probe_sheets`]'s doc
 //! comment for why (no verified Google service-account token exchange
@@ -143,6 +146,8 @@ use tokio_util::compat::TokioAsyncWriteCompatExt;
 
 use crate::connector_oauth::{self, OAuthSettings, TokenFailure};
 use crate::internal_hosts::InternalHosts;
+
+mod saas;
 
 /// Bound on a single dial attempt (connect + one cheap operation). Chosen
 /// to be a "few seconds" per the task brief — long enough that a healthy
@@ -297,6 +302,9 @@ pub async fn probe_with(
         }
         Some("rest") => probe_rest_info(info, resolver, internal_hosts, oauth).await,
         Some("sheets") => probe_sheets(),
+        // `SRC-3` T1.4: the vendor's own "who am I" request, at an address the
+        // vendor table builds from the connector's account.
+        Some("saas") => saas::probe_saas_info(info, resolver, internal_hosts, oauth).await,
         // SRC-6 F4: these connect only from the orchestrator. Explicit arms,
         // so the answer does not depend on falling through to the `kind`
         // dispatch, whose label for an adapter row is free-form.
@@ -403,7 +411,8 @@ async fn probe_dial(
         | Dial::Sheets(_)
         | Dial::Mongo(_)
         | Dial::Kafka(_)
-        | Dial::Sftp(_) => {
+        | Dial::Sftp(_)
+        | Dial::Saas(_) => {
             return Outcome::misconfigured(format!(
                 "connector is misconfigured: its dial does not match its own adapter {adapter:?}"
             ));
@@ -1171,9 +1180,18 @@ pub(crate) async fn connect_pinned(approved: &Approved) -> std::io::Result<tokio
 /// The refusal text for a host that resolves to an address
 /// [`is_blocked_ip`] covers. Names the caller's own `host` string, never the
 /// address it resolved to (`SEC-15`, feature page decision 6).
+///
+/// `SEC-25` (c): the literal used to be one long line with the line breaks
+/// (and their indentation) spelled as runs of spaces, so every user and log
+/// reader saw "which this          installation". The `\` continuations
+/// below keep the same sentence with single spaces.
 fn refused_internal_message(host: &str) -> String {
     format!(
-        "refusing to dial {host:?}: it resolves to a private/internal address, which this          installation does not allow connection tests to reach (an operator can list its          network in CONNECTOR_PROBE_ALLOWED_CIDRS, or set          CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS=true to allow every internal address for a          trusted internal deployment)"
+        "refusing to dial {host:?}: it resolves to a private/internal address, which this \
+         installation does not allow connection tests to reach (an operator can list its \
+         network in CONNECTOR_PROBE_ALLOWED_CIDRS, or set \
+         CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS=true to allow every internal address for a \
+         trusted internal deployment)"
     )
 }
 
@@ -1301,6 +1319,34 @@ pub(crate) fn parse_postgres_host(host: &str) -> Option<PgDialTarget<'_>> {
     })
 }
 
+/// What a `MySQL` dial says when the server asked for its password over a
+/// connection that is not encrypted and this build has no RSA backend to
+/// send it (`SEC-41` decision 4, spec D3: the `mysql-rsa` feature stays off,
+/// so the password is never RSA-encrypted to a server that did not offer
+/// TLS). One sentence, safe to show: it repeats no upstream text.
+pub(crate) const MYSQL_PLAINTEXT_PASSWORD_REFUSED: &str = "This MySQL server asks for its \
+     password over an unencrypted connection. Turn on TLS on the server, or use \
+     mysql_native_password for this user.";
+
+/// Whether `err` is `sqlx-mysql` 0.9's refusal to send a password without
+/// TLS, i.e. the `caching_sha2_password` full-auth or `sha256_password` path
+/// with the `rsa` feature off.
+///
+/// The type is the discriminator `sqlx` offers: `rsa_backend::encrypt`
+/// returns [`sqlx::Error::Configuration`] (`sqlx-mysql-0.9.0/src/
+/// connection/auth.rs`, the `#[cfg(not(feature = "rsa"))]` module), and
+/// `sqlx` has no dedicated error kind for it — so the guard also matches the
+/// one fixed sentence that module returns. Both halves are ours to check:
+/// the text is `sqlx`'s own constant, never a server's reply.
+pub(crate) fn is_mysql_plaintext_password_refusal(err: &sqlx::Error) -> bool {
+    match err {
+        sqlx::Error::Configuration(source) => {
+            source.to_string().contains("RSA auth backend disabled")
+        }
+        _ => false,
+    }
+}
+
 /// Classify a `sqlx` connection error into one of a small set of generic
 /// failure classes — see the module doc comment's "Error messages never
 /// echo upstream data" section for why this never formats `err` itself.
@@ -1317,6 +1363,11 @@ pub(crate) fn classify_sqlx_error(err: &sqlx::Error) -> &'static str {
             std::io::ErrorKind::PermissionDenied => "permission denied",
             _ => "connection failed",
         },
+        // `SEC-41` decision 4: the operator can act on this one (it names
+        // TLS), so it gets its own sentence instead of "connection failed".
+        sqlx::Error::Configuration(_) if is_mysql_plaintext_password_refusal(err) => {
+            MYSQL_PLAINTEXT_PASSWORD_REFUSED
+        }
         sqlx::Error::Tls(_) => "TLS error",
         sqlx::Error::Database(db_err) => match db_err.code().as_deref() {
             // PostgreSQL error codes: 28P01 invalid_password,
@@ -1423,10 +1474,12 @@ fn parse_s3_host(host: &str) -> Option<(&str, &str)> {
 pub(crate) fn parse_endpoint_host_port(endpoint: &str) -> Option<(&str, u16)> {
     let (authority, default_port) = if let Some(rest) = endpoint.strip_prefix("https://") {
         (rest, 443)
-    } else if let Some(rest) = endpoint.strip_prefix("http://") {
-        (rest, 80)
     } else {
-        return None;
+        // REL-9: `?` on the remaining prefix says the same thing as the
+        // explicit `else { return None; }` it replaced (clippy's
+        // `question_mark` under 1.99); an endpoint with neither scheme is
+        // not a URL this function understands.
+        (endpoint.strip_prefix("http://")?, 80)
     };
     let authority = authority.split(['/', '?', '#']).next()?;
     if authority.is_empty() {
@@ -2102,6 +2155,22 @@ mod tests {
         assert!(!outcome.ok);
         assert!(outcome.latency_ms.is_none());
         assert!(outcome.message.contains("dial is invalid"));
+    }
+
+    /// `SEC-25` (c): the refusal a person and a log reader see must have
+    /// single spaces. The literal used to spell its line breaks as runs of
+    /// spaces ("which this          installation"), so this asserts the
+    /// WHOLE sentence, not a `contains`.
+    #[test]
+    fn the_private_address_refusal_reads_with_single_spaces() {
+        assert_eq!(
+            refused_internal_message("db.internal"),
+            "refusing to dial \"db.internal\": it resolves to a private/internal address, \
+             which this installation does not allow connection tests to reach (an operator \
+             can list its network in CONNECTOR_PROBE_ALLOWED_CIDRS, or set \
+             CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS=true to allow every internal address for \
+             a trusted internal deployment)"
+        );
     }
 
     #[test]
@@ -3076,5 +3145,38 @@ mod tests {
         assert!(!outcome.ok);
         assert!(!outcome.supported);
         assert!(outcome.latency_ms.is_none());
+    }
+
+    /// `SEC-41` decision 4: `sqlx-mysql` 0.9 without `mysql-rsa` refuses to
+    /// send a password to a server that asked for it over a plaintext
+    /// connection. That refusal must reach the operator as the one fixed
+    /// sentence (it names TLS), and no other `Configuration` error may be
+    /// mistaken for it.
+    #[test]
+    fn a_mysql_password_refusal_over_plaintext_has_its_own_sentence() {
+        // The exact `Error::Configuration` text `sqlx-mysql` 0.9's
+        // `#[cfg(not(feature = "rsa"))]` backend returns.
+        let refusal = sqlx::Error::Configuration(
+            "RSA auth backend disabled; enable feature `mysql-rsa` (or `rsa` if using \
+             sqlx-mysql directly) or use TLS."
+                .into(),
+        );
+        assert!(is_mysql_plaintext_password_refusal(&refusal));
+        assert_eq!(
+            classify_sqlx_error(&refusal),
+            MYSQL_PLAINTEXT_PASSWORD_REFUSED,
+            "the refusal must keep its own actionable sentence"
+        );
+        assert!(
+            MYSQL_PLAINTEXT_PASSWORD_REFUSED.contains("Turn on TLS"),
+            "the sentence must tell the operator what to do: {MYSQL_PLAINTEXT_PASSWORD_REFUSED}"
+        );
+
+        // A `Configuration` error from anywhere else stays generic: the
+        // match is on `sqlx`'s own fixed text, never on "any configuration
+        // problem".
+        let other = sqlx::Error::Configuration("some other option".into());
+        assert!(!is_mysql_plaintext_password_refusal(&other));
+        assert_eq!(classify_sqlx_error(&other), "connection failed");
     }
 }

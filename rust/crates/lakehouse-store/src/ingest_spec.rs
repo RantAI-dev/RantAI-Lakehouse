@@ -3,10 +3,10 @@
 //!
 //! `connector.dial` (`0033_connector_ingest_spec.sql`) is free-form
 //! `JSONB` at the column level, but never free-form at the application
-//! level: [`Dial::parse`] parses it into exactly one of eight
+//! level: [`Dial::parse`] parses it into exactly one of nine
 //! `#[serde(deny_unknown_fields, rename_all = "camelCase")]` structs,
 //! dispatched on the connector's own `adapter` column value. Every one of
-//! the eight structs rejects an unknown field, which is the property that
+//! the nine structs rejects an unknown field, which is the property that
 //! stops a credential (a `password`, an `apiSecret`) being smuggled into
 //! `dial` — a column the allowlisted `secretRef` resolver
 //! (`lakehouse_core::secret`, ADR 0002) never inspects.
@@ -463,6 +463,58 @@ impl SftpAuth {
     }
 }
 
+/// How a `saas` connector signs in (`SRC-3` decision 3), internally tagged
+/// on `type`.
+///
+/// Neither shape carries an address: the sign-in, token and revocation
+/// addresses come from the vendor table ([`crate::saas_vendors`], AD8), so a
+/// dial cannot send the client secret or the refresh token anywhere the
+/// table does not name.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase", tag = "type")]
+pub enum SaasAuth {
+    /// Sign-in in the browser: `OAuth2` authorisation code with PKCE
+    /// (`SRC-12`). The client secret and the refresh token are the
+    /// connector's two secrets.
+    #[serde(rename = "oauth2_authorization_code")]
+    Oauth2AuthorizationCode {
+        /// The app's client id (public by the protocol's definition).
+        #[serde(rename = "clientId")]
+        client_id: String,
+    },
+    /// The vendor's integration credential: its secret fields are named by
+    /// the vendor's table row. A vendor without one refuses this shape.
+    #[serde(rename = "integration")]
+    Integration,
+}
+
+/// The connection shape for a `saas` adapter's `dial` (`SRC-3`, plan AD1).
+///
+/// One adapter for the ten business-app vendors; `vendor` picks the row of
+/// [`crate::saas_vendors::SAAS_VENDORS`] and `account` is the one part of
+/// the vendor's address a person supplies (AD2).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct SaasDial {
+    /// The vendor's id in the table.
+    pub vendor: String,
+    /// The vendor's per-customer part of the address, in the shape the
+    /// vendor's [`crate::saas_vendors::AccountRule`] allows.
+    pub account: String,
+    /// The objects the person defined by name where the vendor has no
+    /// listing of them (reports, for example). Each name is data the
+    /// vendor module interprets, never an address.
+    #[serde(default)]
+    pub objects: Vec<String>,
+    /// How the connector signs in.
+    pub auth: SaasAuth,
+    /// `NetSuite` only (`SRC-3` slice 6): the id of the certificate uploaded in `NetSuite`'s "OAuth 2.0
+    /// Client Credentials (M2M) Setup", which goes into the signed assertion's `kid` header. It is a
+    /// name, not a secret and not a destination, so it is not part of the target identity.
+    #[serde(default)]
+    pub certificate_id: Option<String>,
+}
+
 /// A parsed `dial`, one variant per adapter.
 ///
 /// Never `#[serde(untagged)]` — see this module's doc comment. Constructed
@@ -487,6 +539,8 @@ pub enum Dial {
     Rest(RestDial),
     /// A `sheets` adapter's dial.
     Sheets(SheetsDial),
+    /// A `saas` adapter's dial (`SRC-3`).
+    Saas(SaasDial),
 }
 
 impl Dial {
@@ -503,7 +557,7 @@ impl Dial {
     /// # Errors
     ///
     /// Returns [`IngestSpecError::UnknownAdapter`] if `adapter` is not one
-    /// of `sql`/`cdc`/`mongodb`/`kafka`/`sftp`/`files`/`rest`/`sheets`,
+    /// of `sql`/`cdc`/`mongodb`/`kafka`/`sftp`/`files`/`rest`/`sheets`/`saas`,
     /// or [`IngestSpecError::InvalidDial`] if `raw` does not match the
     /// named adapter's shape (an unknown field, a missing required field,
     /// a hostname [`validate_hostname`] rejects, an Oracle TLS
@@ -550,6 +604,11 @@ impl Dial {
                 Ok(Dial::Rest(dial))
             }
             "sheets" => Ok(Dial::Sheets(parse_dial(adapter, raw)?)),
+            "saas" => {
+                let dial: SaasDial = parse_dial(adapter, raw)?;
+                validate_saas_dial_post_parse(adapter, &dial)?;
+                Ok(Dial::Saas(dial))
+            }
             other => Err(IngestSpecError::UnknownAdapter {
                 adapter: other.to_owned(),
             }),
@@ -605,17 +664,36 @@ impl Dial {
         }
     }
 
+    /// The `saas` adapter's `auth_type` key: the browser sign-in's tag, or
+    /// the vendor's `integration:<id>` key. `None` for any other adapter
+    /// and for an unknown vendor or an integration credential the vendor
+    /// does not have ([`Dial::parse`] refuses both, so a parsed dial always
+    /// has a key).
+    #[must_use]
+    pub fn saas_auth_type(&self) -> Option<&'static str> {
+        let Dial::Saas(saas) = self else {
+            return None;
+        };
+        let vendor = crate::saas_vendors::vendor(&saas.vendor)?;
+        vendor.auth_type_key(matches!(
+            saas.auth,
+            SaasAuth::Oauth2AuthorizationCode { .. }
+        ))
+    }
+
     /// The `auth_type` key [`secret_field_names`] needs for THIS dial's
     /// adapter, whichever of [`Self::rest_auth_type`],
-    /// [`Self::kafka_auth_type`] or [`Self::sftp_auth_type`] applies (at
-    /// most one ever returns `Some`, since each matches a disjoint set of
-    /// `Dial` variants) — the single call [`crate::connectors::set_ingest_spec`]
-    /// makes instead of trying each accessor itself.
+    /// [`Self::kafka_auth_type`], [`Self::sftp_auth_type`] or
+    /// [`Self::saas_auth_type`] applies (at most one ever returns `Some`,
+    /// since each matches a disjoint set of `Dial` variants) — the single
+    /// call [`crate::connectors::set_ingest_spec`] makes instead of trying
+    /// each accessor itself.
     #[must_use]
     pub fn secret_map_auth_type(&self) -> Option<&'static str> {
         self.rest_auth_type()
             .or_else(|| self.kafka_auth_type())
             .or_else(|| self.sftp_auth_type())
+            .or_else(|| self.saas_auth_type())
     }
 
     /// Where this dial sends the connector's credential, as a comparable
@@ -633,6 +711,7 @@ impl Dial {
     /// | `kafka` | `bootstrapServers` (as a set) |
     /// | `sftp` | `host`, `port`, `hostKeyFingerprint` |
     /// | `sheets` | nothing (fixed Google hosts) |
+    /// | `saas` | `vendor`, `account` (the vendor table builds every address from them, `SRC-3` AD2) |
     ///
     /// The adapter name is part of the identity, so `sql` to `cdc` on the
     /// same host is a re-point. A change of `user`, `sourceObjects`, the
@@ -752,6 +831,7 @@ impl Dial {
                 ],
             ),
             Dial::Sheets(_) => TargetIdentity::new("sheets", Vec::new()),
+            Dial::Saas(saas) => saas_target_identity(saas),
         }
     }
 }
@@ -778,6 +858,35 @@ impl TargetIdentity {
     pub fn adapter(&self) -> &'static str {
         self.adapter
     }
+}
+
+/// The target identity of a `saas` dial. `SRC-3` AD2: every address of a
+/// `saas` connector is built from the vendor row and `account`, so these two
+/// decide where the credential goes; the sign-in kind decides which secret
+/// occupies which slot. Changing any of the three needs every credential again
+/// (`SEC-14` part A; final review SHOULD-FIX 25: with the kind left out,
+/// switching sign-in kept the stored refs in their slots and sent a secret in
+/// another role). The vendor and the host part of the account compare
+/// case-insensitively, as host names do elsewhere in this module; the tenant
+/// after a `/` (Workday) is a name and compares as written.
+fn saas_target_identity(saas: &SaasDial) -> TargetIdentity {
+    let account = saas.account.trim();
+    let account = match account.split_once('/') {
+        Some((host, tenant)) => format!("{}/{tenant}", host.to_ascii_lowercase()),
+        None => account.to_ascii_lowercase(),
+    };
+    let auth_kind = match &saas.auth {
+        SaasAuth::Oauth2AuthorizationCode { .. } => "oauth2_authorization_code",
+        SaasAuth::Integration => "integration",
+    };
+    TargetIdentity::new(
+        "saas",
+        vec![
+            ("vendor", saas.vendor.trim().to_ascii_lowercase()),
+            ("account", account),
+            ("authType", auth_kind.to_owned()),
+        ],
+    )
 }
 
 /// Whether saving `new` over the stored `(stored_adapter, stored_dial)`
@@ -1041,6 +1150,88 @@ fn validate_rest_dial_post_parse(adapter: &str, dial: &RestDial) -> Result<(), I
     Ok(())
 }
 
+/// The most objects a `saas` dial may name.
+const MAX_SAAS_OBJECTS: usize = 200;
+/// The longest object name a `saas` dial may carry.
+const MAX_SAAS_OBJECT_NAME_LEN: usize = 256;
+
+/// Post-deserialize validation for a [`SaasDial`] (`SRC-3` AD1, AD2): the
+/// vendor is in the table, the account has the shape the vendor's host
+/// pattern allows, the sign-in is one the vendor offers, and the object
+/// names are plain text.
+///
+/// # Errors
+///
+/// Returns [`IngestSpecError::InvalidDial`] for an unknown vendor, an account
+/// outside the vendor's pattern, an integration credential the vendor does
+/// not offer (Salesforce: decision 4) or `NetSuite`'s without its
+/// `certificateId` (final review SHOULD-FIX 25), an empty or oversized
+/// client id, or an object name that is blank, long, repeated or has a
+/// control character.
+fn validate_saas_dial_post_parse(adapter: &str, dial: &SaasDial) -> Result<(), IngestSpecError> {
+    let refuse = |message: &str| IngestSpecError::InvalidDial {
+        adapter: adapter.to_owned(),
+        source: serde::de::Error::custom(message.to_owned()),
+    };
+    let Some(vendor) = crate::saas_vendors::vendor(&dial.vendor) else {
+        return Err(refuse("vendor is not one this build offers"));
+    };
+    vendor
+        .validate_account(&dial.account)
+        .map_err(|err| refuse(&format!("account: {err}")))?;
+    match &dial.auth {
+        SaasAuth::Oauth2AuthorizationCode { client_id } => {
+            if client_id.trim().is_empty()
+                || client_id.len() > MAX_OAUTH_FIELD_LEN
+                || client_id.chars().any(char::is_control)
+            {
+                return Err(refuse("auth.clientId must be a non-empty name"));
+            }
+        }
+        SaasAuth::Integration => {
+            if vendor.integration.is_none() {
+                return Err(refuse(
+                    "this vendor does not offer an integration credential; sign in instead",
+                ));
+            }
+        }
+    }
+    if let Some(certificate_id) = &dial.certificate_id {
+        // Slice 6: only `NetSuite`'s client-credentials way has a certificate; the id goes into a
+        // JWT header, so it is a short plain name.
+        let plain = !certificate_id.is_empty()
+            && certificate_id.len() <= 128
+            && certificate_id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+        if dial.vendor != "netsuite" || dial.auth != SaasAuth::Integration || !plain {
+            return Err(refuse(
+                "certificateId is only for NetSuite's integration credential and must be a plain name",
+            ));
+        }
+    } else if dial.vendor == "netsuite" && dial.auth == SaasAuth::Integration {
+        // PR #216 final review SHOULD-FIX 25: without it the signed assertion cannot name the
+        // certificate uploaded in NetSuite, and the connector failed only at its connection test.
+        return Err(refuse(
+            "NetSuite's integration credential needs certificateId: the id of the certificate uploaded in NetSuite",
+        ));
+    }
+    let mut seen = std::collections::HashSet::new();
+    if dial.objects.len() > MAX_SAAS_OBJECTS
+        || dial.objects.iter().any(|name| {
+            name.trim().is_empty()
+                || name.len() > MAX_SAAS_OBJECT_NAME_LEN
+                || name.chars().any(char::is_control)
+                || !seen.insert(name.as_str())
+        })
+    {
+        return Err(refuse(
+            "objects must be a short list of distinct, non-blank names without control characters",
+        ));
+    }
+    Ok(())
+}
+
 /// Post-deserialize application-level validation for an [`SqlDial`]:
 /// the rules serde cannot express declaratively.
 ///
@@ -1104,7 +1295,7 @@ fn validate_sql_dial_post_parse(adapter: &str, dial: &SqlDial) -> Result<(), Ing
 #[derive(Debug, thiserror::Error)]
 pub enum IngestSpecError {
     /// The connector's `adapter` column names a value not in the closed
-    /// `sql | cdc | mongodb | kafka | sftp | files | rest | sheets` set.
+    /// `sql | cdc | mongodb | kafka | sftp | files | rest | sheets | saas` set.
     #[error("unknown adapter {adapter:?}")]
     UnknownAdapter {
         /// The offending adapter value.
@@ -1234,7 +1425,8 @@ pub enum InvalidLoadMode {
     /// `incremental` or `incremental_dedup` for an adapter the ingest job
     /// does not run it for.
     #[error(
-        "source object {name:?} asks for an incremental loadMode, which only SQL connectors support"
+        "source object {name:?} asks for an incremental loadMode, which only SQL and business-app \
+         connectors support"
     )]
     NotForAdapter {
         /// The source object's name.
@@ -1246,6 +1438,18 @@ pub enum InvalidLoadMode {
          column that marks new rows"
     )]
     NoCursor {
+        /// The source object's name.
+        name: String,
+    },
+    /// Plain `incremental` on a `saas` object (final review BLOCKER 18): the
+    /// mode appends, so a vendor record read again after a change becomes a
+    /// second row under the same vendor id. Only a mode that merges on a key
+    /// keeps the table one row per record (`SRC-3` decision 6).
+    #[error(
+        "source object {name:?} asks for loadMode incremental on a business-app connector, which \
+         adds a changed record as a second row; use incremental_dedup, which keeps one row per key"
+    )]
+    SaasNeedsMerge {
         /// The source object's name.
         name: String,
     },
@@ -1318,9 +1522,10 @@ fn key_is_usable(columns: &[serde_json::Value]) -> bool {
 /// # Errors
 ///
 /// Returns [`InvalidLoadMode`] for the first object with an unknown
-/// `loadMode`, with an incremental mode on a non-`sql` adapter or without a
-/// cursor column that is a plain name of sensible length, with a
-/// deduplicating mode and no `primaryKey`, or with a `primaryKey` that is
+/// `loadMode`, with an incremental mode on an adapter other than `sql` and `saas` or without a
+/// cursor column that is a plain name of sensible length, with plain `incremental` on a `saas`
+/// object (it appends; a business-app record must merge on its key, final review BLOCKER 18),
+/// with a deduplicating mode and no `primaryKey`, or with a `primaryKey` that is
 /// not a usable key.
 pub fn validate_load_modes(
     adapter: &str,
@@ -1387,7 +1592,19 @@ pub fn validate_load_modes(
         if !mode.is_incremental() {
             continue;
         }
-        if adapter != "sql" {
+        // PR #216 final review BLOCKER 18: `incremental` appends, so every changed vendor record
+        // becomes a second row under the same id (and with a lag dlt's boundary de-duplication is
+        // off, so unchanged rows repeat too). A business-app object may only grow incrementally by
+        // merging on its key, which is `incremental_dedup`.
+        if adapter == "saas" && mode == LoadMode::Incremental {
+            return Err(InvalidLoadMode::SaasNeedsMerge { name });
+        }
+        // `SRC-3` AD6: a `saas` object may load incrementally too. Whether the
+        // vendor's API can filter that object by the cursor is declared per
+        // object in the orchestrator's vendor module (`saas/objects.py`); an
+        // object without a cursor there is saved without `incrementalKey`
+        // and so still stops at `NoCursor` below.
+        if !matches!(adapter, "sql" | "saas") {
             return Err(InvalidLoadMode::NotForAdapter { name });
         }
         let cursor = object
@@ -1455,8 +1672,10 @@ pub enum InvalidExcludedColumns {
 
 /// Whether the dial's source can list its columns before loading, so that
 /// column choice is offered for it (`SRC-11` decision D9): the `sql` adapter
-/// with the `PostgreSQL`, `MySQL`/`MariaDB` or SQL Server driver. Oracle
-/// follows with `SRC-13`; change-capture and every other adapter are out.
+/// with the `PostgreSQL`, `MySQL`/`MariaDB` or SQL Server driver, and the
+/// `saas` adapter (`SRC-3` AD6: each vendor module lists an object's fields
+/// before the load). Oracle follows with `SRC-13`; change-capture and every
+/// other adapter are out.
 #[must_use]
 pub const fn supports_column_choice(dial: &Dial) -> bool {
     matches!(
@@ -1464,7 +1683,7 @@ pub const fn supports_column_choice(dial: &Dial) -> bool {
         Dial::Sql(SqlDial {
             driver: SqlDriver::Postgres | SqlDriver::Mysql | SqlDriver::Mssql,
             ..
-        })
+        }) | Dial::Saas(_)
     )
 }
 
@@ -1778,8 +1997,9 @@ pub fn validate_hostname(field: &'static str, host: &str) -> Result<(), InvalidH
 /// matching Python-side change (the same discipline `column_gate.py` and
 /// `cdc.rs::NESTED_TYPE_MARKERS` already carry, X9).
 ///
-/// `auth_type` is consulted for `adapter == "rest"` (the `dial.auth.type`
-/// tag), `adapter == "kafka"` (`"none"` needs zero secret refs — a
+/// `auth_type` is consulted for `adapter == "saas"` (the key
+/// [`Dial::saas_auth_type`] builds from the vendor table), `adapter == "rest"`
+/// (the `dial.auth.type` tag), `adapter == "kafka"` (`"none"` needs zero secret refs — a
 /// `PLAINTEXT` broker has no credential at all — while `"sasl_plain"`
 /// needs two) and `adapter == "sftp"` (`"password"` vs. `"public_key"`
 /// select a different single field name, never a field COUNT, so both
@@ -1817,6 +2037,10 @@ pub fn secret_field_names(
         ("kafka", Some("none")) => Some(&[]),
         ("sftp", Some("public_key")) => Some(&["privateKey"]),
         ("sheets", _) => Some(&["serviceAccountJson"]),
+        // `SRC-3` AD2/AD8: a `saas` connector's slots come from the vendor
+        // table, keyed by `Dial::saas_auth_type` (the browser sign-in's two
+        // secrets, or the vendor's integration credential's fields).
+        ("saas", Some(auth_type)) => crate::saas_vendors::secret_fields_for(auth_type),
         _ => None,
     }
 }
@@ -2818,8 +3042,8 @@ mod target_identity_tests {
     use serde_json::{Value, json};
 
     use super::{
-        Dial, InvalidExcludedColumns, SourceObject, inactive_exclusions, is_repoint,
-        supports_column_choice, validate_excluded_columns,
+        Dial, InvalidExcludedColumns, InvalidLoadMode, SourceObject, inactive_exclusions,
+        is_repoint, supports_column_choice, validate_excluded_columns, validate_load_modes,
     };
 
     fn parse(adapter: &str, dial: &Value) -> Dial {
@@ -3298,6 +3522,69 @@ mod target_identity_tests {
         assert!(!supports_column_choice(&cdc));
     }
 
+    /// `SRC-3` T1.3, AD6: a `saas` object takes the deduplicating incremental
+    /// mode and column choice when it has a cursor; without one it is still
+    /// refused, with the same message as a SQL object. `rest` is still refused.
+    /// Final review BLOCKER 18: plain `incremental` is refused for `saas`
+    /// because it appends a changed record as a second row.
+    #[test]
+    fn saas_objects_take_incremental_loads_and_column_choice_only_with_a_cursor() {
+        let incremental = serde_json::json!([{
+            "name": "tickets", "target": "t", "loadMode": "incremental_dedup",
+            "incrementalKey": "updated_at", "primaryKey": ["id"]
+        }]);
+        assert_eq!(validate_load_modes("saas", &incremental), Ok(()));
+        let append_incremental = serde_json::json!([{
+            "name": "tickets", "target": "t", "loadMode": "incremental",
+            "incrementalKey": "updated_at", "primaryKey": ["id"]
+        }]);
+        assert_eq!(
+            validate_load_modes("saas", &append_incremental),
+            Err(InvalidLoadMode::SaasNeedsMerge {
+                name: "tickets".to_owned()
+            })
+        );
+        assert_eq!(
+            validate_load_modes("sql", &append_incremental),
+            Ok(()),
+            "a SQL source keeps plain incremental: the pushed-down query reads one row per row"
+        );
+        let no_cursor = serde_json::json!([{
+            "name": "tickets", "target": "t", "loadMode": "incremental_dedup", "primaryKey": ["id"]
+        }]);
+        assert_eq!(
+            validate_load_modes("saas", &no_cursor),
+            Err(InvalidLoadMode::NoCursor {
+                name: "tickets".to_owned()
+            })
+        );
+        assert!(matches!(
+            validate_load_modes("rest", &incremental),
+            Err(InvalidLoadMode::NotForAdapter { .. })
+        ));
+        let saas = Dial::parse(
+            "saas",
+            &serde_json::json!({
+                "vendor": "zendesk", "account": "acme",
+                "auth": {"type": "integration"}
+            }),
+        )
+        .expect("valid saas dial");
+        assert!(supports_column_choice(&saas));
+        let left_out = serde_json::json!([{
+            "name": "tickets", "target": "t", "excludedColumns": ["subject"]
+        }]);
+        assert_eq!(validate_excluded_columns(&saas, &left_out), Ok(()));
+        let cursor_left_out = serde_json::json!([{
+            "name": "tickets", "target": "t", "loadMode": "incremental",
+            "incrementalKey": "updated_at", "excludedColumns": ["updated_at"]
+        }]);
+        assert!(matches!(
+            validate_excluded_columns(&saas, &cursor_left_out),
+            Err(InvalidExcludedColumns::NamesCursorColumn { .. })
+        ));
+    }
+
     /// An object that leaves nothing out is fine for every source: the field
     /// absent, null and an empty list all mean "nothing".
     #[test]
@@ -3311,7 +3598,8 @@ mod target_identity_tests {
             validate_excluded_columns(&sql_dial_of("oracle"), &objects),
             Ok(())
         );
-        assert!(inactive_exclusions(&objects).is_empty());
+        let inactive = inactive_exclusions(&objects);
+        assert!(inactive.is_empty(), "{inactive:?}");
     }
 
     /// `SRC-11` D11: a key column of a deduplicating or history table and the
@@ -3602,5 +3890,180 @@ mod oauth_dial_tests {
             cc("https://login.example.com/token"),
             cc("https://evil.example.net/token")
         );
+    }
+}
+
+#[cfg(test)]
+mod saas_dial_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    fn dial(vendor: &str, account: &str, auth: &serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"vendor": vendor, "account": account, "auth": auth})
+    }
+
+    fn oauth() -> serde_json::Value {
+        serde_json::json!({"type": "oauth2_authorization_code", "clientId": "app-id"})
+    }
+
+    fn integration() -> serde_json::Value {
+        serde_json::json!({"type": "integration"})
+    }
+
+    #[test]
+    fn a_saas_dial_parses_and_names_its_secret_slots_through_the_vendor_table() {
+        let parsed = Dial::parse("saas", &dial("zendesk", "acme", &oauth())).unwrap();
+        assert!(matches!(parsed, Dial::Saas(_)));
+        assert_eq!(
+            parsed.secret_map_auth_type(),
+            Some("oauth2_authorization_code")
+        );
+        assert_eq!(
+            secret_field_names("saas", parsed.secret_map_auth_type()),
+            Some(["clientSecret", "refreshToken"].as_slice())
+        );
+        let token = Dial::parse("saas", &dial("zendesk", "acme", &integration())).unwrap();
+        assert_eq!(token.secret_map_auth_type(), Some("integration:zendesk"));
+        assert_eq!(
+            secret_field_names("saas", token.secret_map_auth_type()),
+            Some(["email", "apiToken"].as_slice())
+        );
+        assert_eq!(secret_field_names("saas", Some("bearer")), None);
+        assert_eq!(secret_field_names("saas", None), None);
+    }
+
+    #[test]
+    fn a_saas_dial_refuses_an_unknown_vendor_and_a_credential_smuggled_into_it() {
+        assert!(Dial::parse("saas", &dial("nobody", "acme", &oauth())).is_err());
+        let mut with_secret = dial("zendesk", "acme", &oauth());
+        with_secret["password"] = serde_json::json!("hunter2");
+        assert!(Dial::parse("saas", &with_secret).is_err());
+        let mut with_url = dial("zendesk", "acme", &oauth());
+        with_url["auth"]["tokenUrl"] = serde_json::json!("https://evil.example.invalid/token");
+        assert!(Dial::parse("saas", &with_url).is_err());
+    }
+
+    #[test]
+    fn a_saas_dial_refuses_an_account_outside_the_vendors_host_pattern() {
+        for account in [
+            "evil.example.invalid",
+            "acme@evil",
+            "acme:8443",
+            "https://acme",
+            "http://acme",
+            "acme/path",
+        ] {
+            assert!(
+                Dial::parse("saas", &dial("zendesk", account, &oauth())).is_err(),
+                "{account}"
+            );
+        }
+    }
+
+    #[test]
+    fn salesforce_offers_no_integration_credential_and_a_blank_client_id_is_refused() {
+        // `SRC-3` decision 4: the password sign-in is not offered.
+        assert!(Dial::parse("saas", &dial("salesforce", "acme", &integration())).is_err());
+        let blank = serde_json::json!({"type": "oauth2_authorization_code", "clientId": " "});
+        assert!(Dial::parse("saas", &dial("salesforce", "acme", &blank)).is_err());
+    }
+
+    #[test]
+    fn saas_object_names_must_be_distinct_plain_text() {
+        let mut value = dial("ga4", "123456", &oauth());
+        value["objects"] = serde_json::json!(["report one", "report two"]);
+        assert!(Dial::parse("saas", &value).is_ok());
+        value["objects"] = serde_json::json!(["same", "same"]);
+        assert!(Dial::parse("saas", &value).is_err());
+        value["objects"] = serde_json::json!([" "]);
+        assert!(Dial::parse("saas", &value).is_err());
+        value["objects"] = serde_json::json!(["bad\nname"]);
+        assert!(Dial::parse("saas", &value).is_err());
+    }
+
+    /// `SRC-3` slice 6: `NetSuite`'s client-credentials way names the certificate uploaded in `NetSuite`
+    /// (the assertion's `kid`); no other vendor or sign-in has one, and it must be a plain name.
+    #[test]
+    fn a_certificate_id_is_for_netsuites_integration_credential_only_and_is_a_plain_name() {
+        let with = |vendor: &str, account: &str, auth: &serde_json::Value, id: &str| {
+            let mut value = dial(vendor, account, auth);
+            value["certificateId"] = serde_json::json!(id);
+            Dial::parse("saas", &value)
+        };
+        assert!(with("netsuite", "1234567_SB1", &integration(), "cert-1.A_b").is_ok());
+        for bad in ["", "a b", "a/b", "a\nb", &"x".repeat(129)] {
+            assert!(
+                with("netsuite", "1234567", &integration(), bad).is_err(),
+                "{bad:?}"
+            );
+        }
+        assert!(with("netsuite", "1234567", &oauth(), "cert-1").is_err());
+        assert!(with("zendesk", "acme", &integration(), "cert-1").is_err());
+        // Final review SHOULD-FIX 25: the integration credential cannot be signed without the
+        // certificate id, so the save refuses it now rather than the connection test later.
+        assert!(Dial::parse("saas", &dial("netsuite", "1234567", &integration())).is_err());
+        assert!(Dial::parse("saas", &dial("netsuite", "1234567", &oauth())).is_ok());
+        // Not part of the target identity: it is a name, not a destination.
+        let a = with("netsuite", "1234567", &integration(), "cert-1").unwrap();
+        let b = with("netsuite", "1234567", &integration(), "cert-2").unwrap();
+        assert_eq!(a.target_identity(), b.target_identity());
+    }
+
+    #[test]
+    fn a_workday_dial_names_host_and_tenant_and_takes_the_integration_users_two_secrets() {
+        let parsed = Dial::parse(
+            "saas",
+            &dial(
+                "workday",
+                "wd2-impl-services1.workday.com/acme_tenant",
+                &integration(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            secret_field_names("saas", parsed.secret_map_auth_type()),
+            Some(["username", "password"].as_slice())
+        );
+        assert!(Dial::parse("saas", &dial("workday", "wd2.workday.com", &integration())).is_err());
+    }
+
+    #[test]
+    fn the_saas_target_identity_changes_with_the_vendor_the_account_or_the_sign_in_kind() {
+        let base = Dial::parse("saas", &dial("zendesk", "acme", &oauth())).unwrap();
+        let same_account_other_case =
+            Dial::parse("saas", &dial("zendesk", "ACME", &oauth())).unwrap();
+        assert_eq!(
+            base.target_identity(),
+            same_account_other_case.target_identity()
+        );
+        // Final review SHOULD-FIX 25: a different sign-in kind is a different role for the same
+        // stored slots, so the credentials must be asked again (this used to assert equality).
+        let other_auth = Dial::parse("saas", &dial("zendesk", "acme", &integration())).unwrap();
+        assert_ne!(base.target_identity(), other_auth.target_identity());
+        let mut renamed = dial("zendesk", "acme", &oauth());
+        renamed["objects"] = serde_json::json!(["tickets"]);
+        renamed["auth"]["clientId"] = serde_json::json!("another-app");
+        let renamed = Dial::parse("saas", &renamed).unwrap();
+        assert_eq!(base.target_identity(), renamed.target_identity());
+        let other_account = Dial::parse("saas", &dial("zendesk", "other", &oauth())).unwrap();
+        assert_ne!(base.target_identity(), other_account.target_identity());
+        let other_vendor = Dial::parse("saas", &dial("confluence", "acme", &oauth())).unwrap();
+        assert_ne!(base.target_identity(), other_vendor.target_identity());
+        assert!(is_repoint(
+            Some("saas"),
+            &dial("zendesk", "acme", &oauth()),
+            &other_account
+        ));
+        assert!(!is_repoint(
+            Some("saas"),
+            &dial("zendesk", "acme", &oauth()),
+            &renamed
+        ));
+        assert!(is_repoint(
+            Some("saas"),
+            &dial("zendesk", "acme", &oauth()),
+            &other_auth
+        ));
     }
 }

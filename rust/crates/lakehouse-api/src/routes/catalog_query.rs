@@ -32,7 +32,8 @@ use crate::error::ApiRejection;
 /// Fields a client may filter on. Every entry is a key the asset objects
 /// `catalog::list_body` emits can carry; `tags` only exists on an asset
 /// someone annotated, and reads as an empty list on the others
-/// ([`ARRAY_FIELDS`]).
+/// ([`ARRAY_FIELDS`]). `certification` (`DATA-12`) likewise exists only on
+/// an asset with a mark and reads as empty on the others.
 pub const FILTERABLE_FIELDS: &[&str] = &[
     "id",
     "name",
@@ -53,6 +54,7 @@ pub const FILTERABLE_FIELDS: &[&str] = &[
     "lastUpdated",
     "health",
     "residency",
+    "certification",
     "tags",
 ];
 
@@ -84,6 +86,7 @@ pub const SORTABLE_FIELDS: &[&str] = &[
     "lastUpdated",
     "health",
     "residency",
+    "certification",
 ];
 
 /// Fields a client may group by. Restricted to the low-cardinality
@@ -100,6 +103,7 @@ pub const GROUPABLE_FIELDS: &[&str] = &[
     "engine",
     "health",
     "residency",
+    "certification",
 ];
 
 /// How multiple filters combine.
@@ -331,11 +335,28 @@ fn matches_filter(asset: &Value, filter: &Filter) -> bool {
 /// nothing: a list has no order. An asset without the field is an empty
 /// list, so a negative filter keeps it, as it does for a missing scalar.
 fn matches_array_filter(asset: &Value, filter: &Filter) -> bool {
-    let entries: Vec<&str> = asset
+    let mut entries: Vec<String> = asset
         .get(filter.id.as_str())
         .and_then(Value::as_array)
-        .map(|items| items.iter().filter_map(Value::as_str).collect())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
         .unwrap_or_default();
+    // `DATA-12` part 2: the Tags filter reads the governed pairs too, as
+    // `key: value` entries, so `iLike finance` finds a table tagged
+    // `data_domain: finance` and `isEmpty` is true only for a table with
+    // neither kind. The same text the search indexes.
+    if filter.id == "tags" {
+        entries.extend(
+            super::catalog_search::governed_pairs(asset)
+                .into_iter()
+                .map(|(key, value)| format!("{key}: {value}")),
+        );
+    }
     let first = filter.values.first().map_or("", String::as_str);
     let any = |positive: &str| {
         entries.iter().any(|entry| match positive {
@@ -661,11 +682,38 @@ mod tests {
     }
 
     #[test]
+    fn the_tags_filter_reads_governed_pairs_as_key_colon_value() {
+        let assets = vec![
+            json!({ "id": "a", "governedTags": { "data_domain": "finance" } }),
+            json!({ "id": "b", "tags": ["pii"] }),
+            json!({ "id": "c" }),
+        ];
+        let hits = |operator: &str, values: &[&str]| -> Vec<String> {
+            apply_filters(
+                &assets,
+                &[filter("tags", operator, values)],
+                JoinOperator::And,
+            )
+            .iter()
+            .filter_map(|a| a["id"].as_str().map(str::to_owned))
+            .collect()
+        };
+        assert_eq!(hits("iLike", &["finance"]), vec!["a"]);
+        assert_eq!(hits("iLike", &["data_domain"]), vec!["a"]);
+        assert_eq!(hits("eq", &["data_domain: Finance"]), vec!["a"]);
+        assert_eq!(hits("isNotEmpty", &[]), vec!["a", "b"]);
+        assert_eq!(hits("notILike", &["finance"]), vec!["b", "c"]);
+    }
+
+    #[test]
     fn tags_ordering_operators_match_nothing() {
         for operator in ["lt", "lte", "gt", "gte"] {
             assert!(tag_hits(operator, &["m"]).is_empty(), "{operator}");
         }
-        assert!(tag_hits("isBetween", &["a", "z"]).is_empty());
+        assert_eq!(
+            tag_hits("isBetween", &["a", "z"]),
+            [] as [std::string::String; 0]
+        );
     }
 
     #[test]
@@ -677,6 +725,47 @@ mod tests {
         ] {
             assert!(matches!(err.0, ApiError::BadRequest(_)));
         }
+    }
+
+    /// `DATA-12` F5: `certification` filters (`eq`, `inArray`), sorts and
+    /// groups; a row without a mark falls under the empty group.
+    #[test]
+    fn certification_filters_sorts_and_groups() {
+        let rows = vec![
+            json!({ "id": "a", "certification": "deprecated" }),
+            json!({ "id": "b" }),
+            json!({ "id": "c", "certification": "certified" }),
+            json!({ "id": "d", "certification": "certified" }),
+        ];
+        let certified = apply_filters(
+            &rows,
+            &[filter("certification", "eq", &["certified"])],
+            JoinOperator::And,
+        );
+        assert_eq!(ids(&certified), vec!["c", "d"]);
+        let marked = apply_filters(
+            &rows,
+            &[filter(
+                "certification",
+                "inArray",
+                &["certified", "deprecated"],
+            )],
+            JoinOperator::And,
+        );
+        assert_eq!(ids(&marked), vec!["a", "c", "d"]);
+
+        assert!(parse_sort(Some(r#"[{"id":"certification","desc":false}]"#)).is_ok());
+        let mut sorted = rows.clone();
+        apply_sort(
+            &mut sorted,
+            &parse_sort(Some(r#"[{"id":"certification","desc":false}]"#)).unwrap(),
+        );
+        assert_eq!(ids(&sorted), vec!["b", "c", "d", "a"]);
+
+        assert!(parse_group_by(Some("certification")).is_ok());
+        let (_, groups) = apply_grouping(&rows, "certification");
+        let counts: Vec<(&str, usize)> = groups.iter().map(|g| (g.id.as_str(), g.count)).collect();
+        assert_eq!(counts, vec![("deprecated", 1), ("—", 1), ("certified", 2)]);
     }
 
     #[test]
@@ -741,7 +830,7 @@ mod tests {
             &[filter("layer", "bogusOperator", &["Silver"])],
             JoinOperator::And,
         );
-        assert!(hits.is_empty());
+        assert_eq!(hits, [] as [serde_json::Value; 0]);
     }
 
     // --- join operator ----------------------------------------------
@@ -919,7 +1008,7 @@ mod tests {
     fn paginate_past_the_end_is_empty_not_an_error() {
         // How infinite scroll terminates: the client stops once a page
         // comes back shorter than `pageSize`.
-        assert!(paginate(&fixture(), 99, 50).is_empty());
+        assert_eq!(paginate(&fixture(), 99, 50), [] as [serde_json::Value; 0]);
     }
 
     #[test]

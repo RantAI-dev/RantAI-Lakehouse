@@ -1,3 +1,4 @@
+import { readableErrorMessage } from "@/lib/notify-message";
 import { normalizeFilters } from "@/lib/dashboard-filter-state";
 import type { FilterDef } from "@/services/clients/bi-store";
 import { apiFetch } from "@/services/http";
@@ -23,6 +24,29 @@ export function fileNameOf(disposition: string | null): string {
   return /filename="([^"]+)"/.exec(disposition ?? "")?.[1] ?? "table.csv";
 }
 
+/** Save `blob` under `fileName` through a temporary link (the one place a download is handed to the browser). */
+export function saveBlob(blob: Blob, fileName: string): void {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = fileName;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+/**
+ * The sentence for a refused download, or `fallback`. A body that starts with an
+ * API error code (`permission_denied: ...`) reads as that code's hint, not as
+ * the code (`readableErrorMessage`, BI-18 part C review fix (SHOULD-FIX) R20,
+ * applied to BI-1's routes by the phase 3 merge).
+ */
+export async function refusalOf(res: Response, fallback: string): Promise<string> {
+  const json = (await res.json().catch(() => null)) as { error?: unknown } | null;
+  return typeof json?.error === "string" ? readableErrorMessage(json.error) : fallback;
+}
+
 /**
  * Download every row of a raw table's result (`BI-16` part A, T8). The server
  * applies the role rewrite, the filters and the sort, and writes at most
@@ -36,20 +60,10 @@ export async function downloadTableExport(
   params?: string | null,
 ): Promise<TableExportResult> {
   const res = await apiFetch(`/api/dashboard/table-export?${tableExportQuery(chart, filters, sort, params).toString()}`, { cache: "no-store" });
-  if (!res.ok) {
-    const json = (await res.json().catch(() => null)) as { error?: unknown } | null;
-    throw new Error(typeof json?.error === "string" ? json.error : "The export failed.");
-  }
+  if (!res.ok) throw new Error(await refusalOf(res, "The export failed."));
   const blob = await res.blob();
   const fileName = fileNameOf(res.headers.get("content-disposition"));
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = fileName;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  URL.revokeObjectURL(url);
+  saveBlob(blob, fileName);
   return {
     rows: Number(res.headers.get("x-export-rows") ?? 0),
     cut: res.headers.get("x-export-cut") === "true",

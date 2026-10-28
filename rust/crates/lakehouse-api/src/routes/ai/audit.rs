@@ -119,8 +119,37 @@ pub fn resource_for(
             .map(str::to_owned)
     };
     match tool_name {
-        "create_chart" | "update_chart" | "delete_chart" => (Some("chart"), str_field("id")),
-        "create_board" => (Some("board"), str_field("id")),
+        "create_chart" | "update_chart" | "delete_chart" | "move_chart" => {
+            (Some("chart"), str_field("id"))
+        }
+        // AI-1 / AI-2 / AI-20 (plan 20): the rest target a board,
+        // recorded under the board the tool actually changed. The arg
+        // key is split per tool rather than "prefer `id`, fall back to
+        // `board`" because the tool reads exactly one of them: a model
+        // that sent both keys would otherwise have the tool change
+        // `board` while this row recorded `id`, putting a false board
+        // in the trail for a real write. `str_field` looks at the
+        // result first, so an id the handler returned still wins.
+        "create_board" | "rename_board" | "delete_board" => (Some("board"), str_field("id")),
+        // The tab tools change a board: the audit names the board, not the tab.
+        "create_tab"
+        | "rename_tab"
+        | "move_charts_to_tab"
+        | "move_tab"
+        | "delete_tab"
+        | "arrange_board"
+        | "save_board_filters"
+        | "set_board_view_filters"
+        | "set_dashboard_theme" => (Some("board"), str_field("board")),
+        // The look tools (`BI-17` part A) read `chart` and `board`, not `id`
+        // (merge of main into phase 3: the table was main's, written before
+        // they existed).
+        "format_chart" => (Some("chart"), str_field("chart")),
+        // `set_cache_rule` (`BI-4` part B) names a chart or a board, one of the two.
+        "set_cache_rule" => match str_field("chart") {
+            Some(chart) => (Some("chart"), Some(chart)),
+            None => (Some("board"), str_field("board")),
+        },
         "create_calculated_field" | "update_calculated_field" | "delete_calculated_field" => {
             (Some("calculated_field"), str_field("id"))
         }
@@ -136,6 +165,14 @@ pub fn resource_for(
             args.get("id").and_then(Value::as_str).map(str::to_owned),
         ),
         "create_pipeline" | "mark_pipeline_ready" => (Some("pipeline"), str_field("id")),
+        "set_pipeline_target_lag" => (
+            Some("pipeline"),
+            result
+                .get("id")
+                .and_then(Value::as_str)
+                .or_else(|| args.get("pipeline").and_then(Value::as_str))
+                .map(str::to_owned),
+        ),
         "set_table_maintenance" => (
             Some("iceberg_table"),
             match (
@@ -350,6 +387,91 @@ mod tests {
         );
     }
 
+    /// AI-1 / AI-2 / AI-20 (plan 20): board tools record under the board
+    /// they actually changed, under the arg key each tool really reads:
+    /// `id` for rename / delete, `board` for arrange / save-filters /
+    /// set-view-filters. `move_chart` records the chart it moves,
+    /// exactly like `update_chart`.
+    #[test]
+    fn resource_for_records_the_board_the_tool_actually_changed() {
+        let mut id_args = Map::new();
+        id_args.insert("id".to_owned(), json!("b-1"));
+        assert_eq!(
+            resource_for("create_board", &id_args, &json!({})),
+            (Some("board"), Some("b-1".to_owned()))
+        );
+        assert_eq!(
+            resource_for("rename_board", &id_args, &json!({})),
+            (Some("board"), Some("b-1".to_owned()))
+        );
+        assert_eq!(
+            resource_for("delete_board", &id_args, &json!({})),
+            (Some("board"), Some("b-1".to_owned()))
+        );
+
+        let mut board_args = Map::new();
+        board_args.insert("board".to_owned(), json!("b-2"));
+        for tool in [
+            "arrange_board",
+            "save_board_filters",
+            "set_board_view_filters",
+        ] {
+            assert_eq!(
+                resource_for(tool, &board_args, &json!({})),
+                (Some("board"), Some("b-2".to_owned())),
+                "{tool} records the board it changed"
+            );
+        }
+
+        let mut move_args = Map::new();
+        move_args.insert("id".to_owned(), json!("c-1"));
+        move_args.insert("board".to_owned(), json!("b-2"));
+        assert_eq!(
+            resource_for("move_chart", &move_args, &json!({})),
+            (Some("chart"), Some("c-1".to_owned()))
+        );
+    }
+
+    /// The board-keyed tools read `board` and nothing else, so a model that
+    /// sent both keys must still leave the board it really changed in the
+    /// trail. Recording `id` here would file a real write under a board
+    /// nobody wrote to.
+    #[test]
+    fn resource_for_board_keyed_tools_ignore_a_stray_id_arg() {
+        let mut both = Map::new();
+        both.insert("id".to_owned(), json!("b-not-touched"));
+        both.insert("board".to_owned(), json!("b-2"));
+        for tool in [
+            "arrange_board",
+            "save_board_filters",
+            "set_board_view_filters",
+        ] {
+            assert_eq!(
+                resource_for(tool, &both, &json!({})),
+                (Some("board"), Some("b-2".to_owned())),
+                "{tool} must not file the write under the stray id"
+            );
+        }
+    }
+
+    /// The look tools name the chart or board under the arg they read
+    /// (`chart`, `board`), not `id`, so a stray `id` is not recorded.
+    #[test]
+    fn resource_for_names_the_chart_or_board_a_look_tool_changed() {
+        let mut args = Map::new();
+        args.insert("chart".to_owned(), json!("c-9"));
+        args.insert("board".to_owned(), json!("b-9"));
+        args.insert("id".to_owned(), json!("stray"));
+        assert_eq!(
+            resource_for("format_chart", &args, &json!({})),
+            (Some("chart"), Some("c-9".to_owned()))
+        );
+        assert_eq!(
+            resource_for("set_dashboard_theme", &args, &json!({})),
+            (Some("board"), Some("b-9".to_owned()))
+        );
+    }
+
     #[test]
     fn resource_for_unrelated_tool_is_none() {
         assert_eq!(
@@ -377,5 +499,20 @@ mod tests {
         )
         .await;
         // Reaching this line without panicking is the assertion.
+    }
+
+    #[test]
+    fn resource_for_set_pipeline_target_lag_maps_pipeline_and_id_or_arg() {
+        let mut args = Map::new();
+        args.insert("pipeline".to_owned(), json!("from-args"));
+        let result = json!({ "id": "from-result" });
+        assert_eq!(
+            resource_for("set_pipeline_target_lag", &args, &result),
+            (Some("pipeline"), Some("from-result".to_owned()))
+        );
+        assert_eq!(
+            resource_for("set_pipeline_target_lag", &args, &json!({})),
+            (Some("pipeline"), Some("from-args".to_owned()))
+        );
     }
 }

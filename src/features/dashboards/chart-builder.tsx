@@ -1,10 +1,14 @@
 "use client";
 
+import { governedPairLabels } from "@/features/catalog/governed-tags"
+import { Pill } from "@/components/patterns/status-badge"
+
 import * as React from "react";
 import { useTheme } from "next-themes";
 import {
   CalendarDays, ChartBar, ChartCandlestick, ChartColumn, ChartLine, ChartPie, ChevronDown, ChevronRight, Code, Flame, Gauge, Workflow,
   Map, MapPin, PanelLeftClose, PanelLeftOpen, Pencil, Plus, ScatterChart, Search, SlidersHorizontal, Table2, Type, type LucideIcon,
+  ChartNoAxesColumn, ChartNoAxesGantt, Globe, Image as ImageIcon, Target,
 } from "lucide-react";
 import {
   Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription,
@@ -27,6 +31,8 @@ import {
   type ChartSourceChoice,
 } from "@/lib/chart-source";
 import { useAuth } from "@/features/auth/auth-provider";
+import { DeprecationNotice } from "@/features/catalog/asset-certification";
+import { CertificationBadge } from "@/components/patterns/status-badge";
 import {
   NEW_SQL_CHOICE, fieldsFromColumns, keepIfOffered,
 } from "@/lib/sql-source-draft";
@@ -42,6 +48,8 @@ import type { ChartClick } from "@/services/clients/bi-store";
 import { kindHasClickValue } from "@/lib/chart-click";
 import { clickProblem } from "@/lib/click-destination";
 import { ClickSetting } from "./click-setting";
+import { FreshnessField } from "./freshness-field";
+import { draftOf, draftProblem, ruleOf, type CacheRule, type RuleDraft } from "@/lib/result-cache";
 import { KpiCompareSection, PivotSection, TableSection, type SourceColumns } from "./table-settings";
 import { draftFromDef, draftPayload, draftProblems, emptyTableDraft, type TableDraft } from "@/lib/table-draft";
 import type { TableDefFields } from "@/lib/table-types";
@@ -64,8 +72,11 @@ import {
   GRAIN_LABELS, columnKindOfType, grainChoices, isGrain, isTruncation, limitAfterGrainPick, limitHasEffect, type ColumnKind, type Grain,
 } from "@/lib/time-grain";
 import { cn } from "@/lib/utils";
-import { DEFAULT_CHOROPLETH_MAP, DEFAULT_POINT_MAP, MAP_CATALOGUE, mapCredit } from "./echarts-maps";
+import { MapPicker } from "./map-picker";
+import { DEFAULT_CHOROPLETH_MAP, DEFAULT_POINT_MAP, mapCredit } from "./echarts-maps";
+import { useMapCatalogue } from "./use-map-catalogue";
 import { SqlRowsTable, SqlSourcePanel } from "./sql-source-panel";
+import { selectedMart, type Mart } from "./mart-marks";
 import { JoinsSection, type JoinTableInfo } from "./joins-section";
 import { LayersSection } from "./layers-section";
 import { layerDraftsFromDef, layerProblems, layersPayload, takesLayers, type LayerDraft } from "@/lib/chart-layers";
@@ -75,12 +86,21 @@ import { missingSection, sectionSummaries, type SectionNumber } from "@/lib/sect
 import { readKindListPref, writeKindListPref } from "@/lib/kind-list-pref";
 import { CustomFieldsMenu } from "./custom-fields-menu";
 import { builderRules, carryOverOnKindSwitch, moreOptionsUsed } from "@/lib/builder-rules";
+import type { StyleFields } from "@/lib/chart-style";
+import { effectivePalette, formatRules, formatUsed, styleFromDef, stylePayload, withCompanyPalette } from "@/lib/style-draft";
+import { FormatSection } from "./format-section";
 import { FormulaEditorDialog } from "./formula-editor";
 import { isValueGroup, type CalcField } from "@/services/contracts/calc-fields";
 import type { Hierarchy } from "@/services/contracts/hierarchies";
 import { ValueGroupDialog } from "./value-group-dialog";
 import { HierarchyDialog } from "./hierarchy-dialog";
 import { TileBody } from "./tile-body";
+import { useReporting } from "./reporting-context";
+import { BandFields, CardFields, GanttFields, GoalFields, HistogramFields } from "./type-b-fields";
+import {
+  emptyTypeDraft, goalMeasureColumn, takesGoal, typeDraftFromDef, typePayload, typeProblems, urlProblem,
+  type TypeDefFields, type TypeDraft,
+} from "@/lib/type-b";
 import { useSqlSourceDraft } from "./use-sql-source-draft";
 import type { TileFailure } from "@/services/contracts/dashboards";
 
@@ -107,9 +127,13 @@ export type ChartDef = {
   referenceLines?: RefLineDef[];
   /** What a click does instead of the drill menu (BI-18·B); absent = the menu. */
   click?: ChartClick;
+  /** How long this chart's result may be remembered (BI-4 part B); absent follows the dashboard. */
+  cache?: CacheRule;
   /** How a date or timestamp dimension is grouped (BI-9); absent = as stored. */
   grain?: string;
 } & TableDefFields // raw tables, pivots and KPI comparisons (BI-16 part A)
+  & TypeDefFields // goal, bands, histogram ranges, the address of an image or web card (BI-16 part B)
+  & StyleFields // number and date formats, colours, axes, labels, notes, tooltip, conditional colours (BI-17 part A)
   & ShapeDefFields; // measures with their own aggregate, the chart's own filters, sort, "Other", groupings (BI-6)
 type BoardOpt = { id: string; name: string };
 /** The rows of the chart's last result beside the chart (BI-6 part 2). */
@@ -152,6 +176,10 @@ export const KIND_GROUPS: { group: string; items: { value: ChartKind; label: str
     { value: "heatmap", label: "Heatmap (2 dimensions)" },
     { value: "radar", label: "Radar" },
     { value: "boxplot", label: "Box plot (distribution)" },
+    { value: "histogram", label: "Histogram (spread of a number)" },
+  ] },
+  { group: "Schedule", items: [
+    { value: "gantt", label: "Gantt (tasks over time)" },
   ] },
   { group: "Flow", items: [
     { value: "sankey", label: "Sankey (flow between 2 dimensions)" },
@@ -164,11 +192,15 @@ export const KIND_GROUPS: { group: string; items: { value: ChartKind; label: str
   { group: "Single value", items: [
     { value: "kpi", label: "KPI — big number" },
     { value: "gauge", label: "Gauge" },
+    { value: "progress", label: "Progress bar (value vs goal)" },
+    { value: "bullet", label: "Bullet graph (value, target, bands)" },
   ] },
   { group: "Other", items: [
     { value: "table", label: "Data table" },
     { value: "pivot", label: "Pivot table" },
     { value: "text", label: "Text / note" },
+    { value: "image", label: "Image" },
+    { value: "web", label: "Web page" },
   ] },
 ];
 /**
@@ -205,7 +237,6 @@ function withCalculated(base: Fields, columns: string[], calculated: CalcField[]
   return { dimensions, measures, kinds, columns, calculated };
 }
 /** Map id → label for the base-ui select (see KIND_LABELS). */
-const MAP_LABELS: Record<string, string> = Object.fromEntries(MAP_CATALOGUE.map((m) => [m.id, m.label]));
 const NO_LABEL_ITEMS: Record<string, string> = { [NO_BREAKDOWN]: "— no label —" };
 const SPAN_LABELS: Record<string, string> = { "1": "Half width", "2": "Full width" };
 /** Whether the viewport is at least `px` wide; false on the server. */
@@ -243,6 +274,13 @@ const KIND_DESCRIPTIONS: Record<ChartKind, string> = {
   sunburst: "Break each category into its parts, as rings",
   boxplot: "Compare the spread of a measure across categories",
   calendar: "Spot daily patterns on a calendar",
+  progress: "Show a value against its goal, with the percentage reached",
+  histogram: "Count how many rows fall in each range of a number",
+  gantt: "Lay tasks on a time axis, one bar from start to end, with a line at today",
+  bullet: "Compare a value with a target and ranges such as poor, fair and good",
+  image: "Show a picture from an allowed site", web: "Show a web page from an allowed site",
+  // BI-18 part C: added from the dashboard's "Add" menu, never picked here; present only to satisfy the record.
+  heading: "A heading between tiles", divider: "A rule between tiles", section: "A heading that folds the tiles below it",
 };
 /**
  * Extra words the type search matches, beyond label and description: the
@@ -255,6 +293,12 @@ const KIND_KEYWORDS: Partial<Record<ChartKind, string>> = {
   geoheat: "map peta heatmap density kepadatan spatial geo",
   pivot: "pivot cross tab crosstab matrix totals subtotals",
   table: "table rows raw columns grid",
+  histogram: "distribution spread frequency bins ranges buckets",
+  gantt: "timeline schedule project plan tasks milestones jadwal",
+  progress: "goal target percent percentage bar completion",
+  bullet: "target bands goal poor fair good performance",
+  image: "picture logo photo png jpg gambar",
+  web: "iframe page embed website url status halaman",
 };
 function kindIcon(kind: ChartKind): LucideIcon {
   if (["bar", "hbar", "stacked", "combo"].includes(kind)) return kind === "bar" ? ChartColumn : ChartBar;
@@ -268,7 +312,12 @@ function kindIcon(kind: ChartKind): LucideIcon {
   if (kind === "sunburst") return ChartPie;
   if (kind === "boxplot") return ChartCandlestick;
   if (kind === "calendar") return CalendarDays;
-  if (kind === "kpi" || kind === "gauge") return Gauge;
+  if (kind === "kpi" || kind === "gauge" || kind === "progress") return Gauge;
+  if (kind === "histogram") return ChartNoAxesColumn;
+  if (kind === "gantt") return ChartNoAxesGantt;
+  if (kind === "bullet") return Target;
+  if (kind === "image") return ImageIcon;
+  if (kind === "web") return Globe;
   return kind === "table" || kind === "pivot" ? Table2 : Type;
 }
 /** Measure labels that vary by kind (X/Y/size, bar/line, etc.). */
@@ -278,8 +327,20 @@ const MEASURE_LABELS: Partial<Record<ChartKind, string[]>> = {
   combo: ["Bar metric", "Line metric"],
   stacked: ["Measure", "2nd measure"],
   pointmap: ["Measure (size and colour)"],
+  progress: ["Value"],
+  bullet: ["Value"],
   geoheat: ["Measure (weight)"],
 };
+
+/**
+ * The measure rows of a saved chart. A progress bar or a bullet graph measured against a second
+ * value was saved with that value as its second measure; the form keeps it in the goal
+ * (`typeDraft`), so the rows keep only the value (BI-16 part B).
+ */
+function measureRowsOf(def: ChartDef): MeasureRow[] {
+  const rows = rowsFromEntries(def.measures);
+  return def.kind && takesGoal(def.kind) && def.goal && typeof def.goal === "object" ? rows.slice(0, 1) : rows;
+}
 
 /**
  * Chart builder — the MANUAL path (Tableau-style). Used in two modes:
@@ -308,7 +369,7 @@ export function ChartBuilder({
   const open = controlled ? openProp! : openState;
   const setOpen = (o: boolean) => { onOpenChange?.(o); if (!controlled) setOpenState(o); };
 
-  const [marts, setMarts] = React.useState<{ name: string; rows: number }[]>([]);
+  const [marts, setMarts] = React.useState<Mart[]>([]);
   const [sqlSources, setSqlSources] = React.useState<SqlSource[]>([]);
   const [fields, setFields] = React.useState<Fields | null>(null);
   // BI-8: the formula box. `editing` is the field being changed, absent for a new one.
@@ -344,6 +405,7 @@ export function ChartBuilder({
   // Encoded data-source choice (`mart:<name>` / `sql:<id>`, lib/chart-source).
   const [source, setSource] = React.useState("");
   const choice = decodeSourceChoice(source);
+  const chosenMart = selectedMart(marts, choice);
   const [kind, setKind] = React.useState<ChartKind>("hbar");
   const [kindQuery, setKindQuery] = React.useState("");
   const kindGroups = React.useMemo(() => filterKindGroups(KIND_GROUPS, KIND_DESCRIPTIONS, kindQuery, KIND_KEYWORDS), [kindQuery]);
@@ -377,6 +439,11 @@ export function ChartBuilder({
   const [paramDefs, setParamDefs] = React.useState<ParamDef[]>([]);
   const [limitParamName, setLimitParamName] = React.useState("");
   const [refLines, setRefLines] = React.useState<RefLineDraft[]>([]);
+  // BI-4 part B: how long this chart's result may be remembered.
+  const [cacheDraft, setCacheDraft] = React.useState<RuleDraft>(draftOf(null));
+  // BI-17 part A: the chart's formats, colours, axes, labels, notes, tooltip and conditional colours (section 5).
+  const [style, setStyle] = React.useState<StyleFields>({});
+  const [formatOpen, setFormatOpen] = React.useState(false);
   // BI-13: the chart's other questions, and how its own series is drawn when it has them ("" = the kind's default).
   const [layers, setLayers] = React.useState<LayerDraft[]>([]);
   const [ownDraw, setOwnDraw] = React.useState("");
@@ -386,7 +453,7 @@ export function ChartBuilder({
   const [moreOpen, setMoreOpen] = React.useState(false);
   // Phase 2 QA R10: sections 1 to 3 are an accordion (one open, or none); a new chart starts on 1, an edited one folded.
   const [active, setActive] = React.useState<1 | 2 | 3 | null>(1);
-  const panelRefs = React.useRef<Partial<Record<SectionNumber, HTMLElement | null>>>({});
+  const panelRefs = React.useRef<Partial<Record<SectionNumber | 5, HTMLElement | null>>>({});
   const [focusAsk, setFocusAsk] = React.useState<{ section: SectionNumber; n: number } | null>(null);
   // Phase 2 QA R9: the type list at the left is open or folded; a remembered choice wins, else open for a new chart until a type is chosen.
   const [listOpen, setListOpen] = React.useState(true);
@@ -402,10 +469,29 @@ export function ChartBuilder({
   const [limitTouched, setLimitTouched] = React.useState(false);
   // Raw table, pivot and KPI comparison settings (BI-16 part A).
   const [tableDraft, setTableDraft] = React.useState<TableDraft>(emptyTableDraft);
+  // BI-16 part B: the deployment's content sites, a progress bar's goal, a bullet's bands, a histogram's ranges, a card's address.
+  const { contentSites, companyPalette } = useReporting();
+  const sites = contentSites ?? [];
+  const palette = companyPalette ?? [];
+  const [typeDraft, setTypeDraft] = React.useState<TypeDraft>(emptyTypeDraft);
+  const changeType = (patch: Partial<TypeDraft>) => setTypeDraft((d) => ({ ...d, ...patch }));
   const isText = kind === "text";
+  const isImage = kind === "image";
+  const isWeb = kind === "web";
+  const isCard = isImage || isWeb;
+  /** A tile with no data: a note, an image, a web page. */
+  const isStaticTile = isText || isCard;
   const isKpi = kind === "kpi";
   const isGauge = kind === "gauge";
-  const isSingle = isKpi || isGauge;         // no dimension (single number)
+  const isProgress = kind === "progress";
+  const isHistogram = kind === "histogram";
+  const isBullet = kind === "bullet";
+  // BI-16 part C1 (plan D1): the task is the dimension, the group the breakdown, the start, end and progress columns are the type draft's.
+  const isGantt = kind === "gantt";
+  // BI-16 C2b: the bundled maps and the uploaded ones, by name.
+  const mapCatalogue = useMapCatalogue();
+  const mapLabels = React.useMemo<Record<string, string>>(() => Object.fromEntries(mapCatalogue.map((m) => [m.id, m.label])), [mapCatalogue]);
+  const isSingle = isKpi || isGauge || isProgress;         // no dimension (single number)
   const isHeatmap = kind === "heatmap";
   // Kinds drawn from the breakdown shape (x, series, value): a 2nd
   // dimension is required (lakehouse_bi::store::breakdown_required).
@@ -419,6 +505,8 @@ export function ChartBuilder({
   const isPivot = kind === "pivot";
   // A pivot and a raw table name their columns in their own fields, not as a dimension and measures.
   const ownColumns = isPivot || (kind === "table" && tableDraft.mode === "rows");
+  // A histogram counts the rows of its column: it takes no measure either.
+  const noMeasures = ownColumns || isHistogram || isGantt;
   const rowsMode = kind === "table" && tableDraft.mode === "rows";
   // BI-6: a grouped table lists its groupings; the first is also its `dimension`.
   const isGroupedTable = kind === "table" && !rowsMode;
@@ -436,7 +524,10 @@ export function ChartBuilder({
   );
   const metricRow = measureRows.find((r) => isMetricColumn(r.column));
   const pickedMetric = metricRow ? (fields?.metrics ?? []).find((m) => m.name === metricNameOf(metricRow.column)) : undefined;
-  // Fix the number of measure rows to what the kind takes.
+  // Fix the number of measure rows to what the kind takes. BI-17 B QA fix F2: it also runs when the
+  // rows themselves change length, because picking the data source (and resetting the form) puts
+  // back one blank row, which left a scatter with an X metric and no Y metric.
+  const measureRowCount = measureRows.length;
   React.useEffect(() => {
     setMeasureRows((rows) => {
       if (rows.length === Math.min(Math.max(rows.length, limits.min), limits.max || 1) && rows.length >= limits.min) return rows;
@@ -444,7 +535,7 @@ export function ChartBuilder({
       while (next.length < limits.min) next.push({ column: "", aggregate: "" });
       return next;
     });
-  }, [limits.min, limits.max]);
+  }, [limits.min, limits.max, measureRowCount]);
   const sourceColumns = React.useMemo<SourceColumns>(() => ({
     all: [...(fields?.dimensions ?? []), ...(fields?.measures ?? [])],
     dates: Object.entries(fields?.kinds ?? {}).filter(([, k]) => k === "date" || k === "datetime").map(([name]) => name),
@@ -515,7 +606,7 @@ export function ChartBuilder({
     setLat((l) => l || guessed.lat || "");
     setLon((l) => l || guessed.lon || "");
   }, [isPoints, fields, coordinateColumns]);
-  const canBreakdown = kind === "bar" || kind === "hbar" || kind === "line" || kind === "area" || needsBreakdown;
+  const canBreakdown = kind === "bar" || kind === "hbar" || kind === "line" || kind === "area" || needsBreakdown || isGantt;
   // BI-10: a number column can be the dimension or the breakdown when it is put in bins; a table does
   // that per grouping, a pivot on its first number row or column field.
   const onSqlSource = choice?.kind === "sql" || source === NEW_SQL_CHOICE;
@@ -532,7 +623,7 @@ export function ChartBuilder({
     () => (fields?.measures ?? []).filter((m) => !wholeMeasure.has(m) && fields?.kinds?.[m] === "number"),
     [fields, wholeMeasure],
   );
-  const dimensionChoices = binKind ? [...(fields?.dimensions ?? []), ...numberColumns] : fields?.dimensions ?? [];
+  const dimensionChoices = isHistogram ? numberColumns : binKind ? [...(fields?.dimensions ?? []), ...numberColumns] : fields?.dimensions ?? [];
   const breakdownChoices = (binKind ? [...(fields?.dimensions ?? []), ...numberColumns] : fields?.dimensions ?? []).filter((d) => d !== dimension);
   const startingBin = onSqlSource ? ({ mode: "width", count: "10", width: "" } as const) : AUTO_BIN;
   const isNumber = (column: string) => fields?.kinds?.[column] === "number";
@@ -553,8 +644,8 @@ export function ChartBuilder({
   const pivotNumberField = isPivot ? [...tableDraft.pivotRows, ...tableDraft.pivotColumns].find((c) => isNumber(c)) : undefined;
   const mLabels = isSingle ? ["Measure"] : MEASURE_LABELS[kind] ?? ["Measure (Y)"];
   const measureTitle = (i: number) => (limits.max > 1 && limits.max === limits.min ? mLabels[i] ?? `Measure ${i + 1}` : i === 0 ? mLabels[0] : `Measure ${i + 1}`);
-  const dimensionLabel = isChoropleth ? "Region column" : isPoints ? "Label" : "Dimension (X)";
-  const breakdownLabel = kind === "sankey" ? "Flows to" : kind === "sunburst" ? "Outer ring" : isHeatmap ? "2nd dimension (Y)" : "Breakdown / series";
+  const dimensionLabel = isChoropleth ? "Region column" : isPoints ? "Label" : isHistogram ? "Number column" : isGantt ? "Task column" : isBullet ? "Category" : "Dimension (X)";
+  const breakdownLabel = isGantt ? "Group" : kind === "sankey" ? "Flows to" : kind === "sunburst" ? "Outer ring" : isHeatmap ? "2nd dimension (Y)" : "Breakdown / series";
   // Phase 2 QA R20: the title is built from the labels the pickers show (a metric's label, a
   // joined column's own name), never the stored reference (`metric:name`, `table__column`).
   const titleText = (name: string) => (name ? columnRef(name, {
@@ -583,8 +674,8 @@ export function ChartBuilder({
   }
   const draft = useSqlSourceDraft({ chartTitle: title.trim() || suggestedTitle, editChartId: editId, onColumns: applyRunColumns });
   // A text note has no data source, so a SQL draft left behind is ignored.
-  const sqlActive = !isText && draft.mode !== "none";
-  const heldPreview = !isText && draft.holdsChartPreview;
+  const sqlActive = !isStaticTile && draft.mode !== "none";
+  const heldPreview = !isStaticTile && draft.holdsChartPreview;
   // The SQL a chart preview may be drawn over: only text that was run
   // successfully and not edited since, so the chart never reads columns the
   // SQL may no longer return.
@@ -646,14 +737,15 @@ export function ChartBuilder({
   const noFieldsHint = isNewSql ? "run the SQL first" : "pick a source first";
   // Required fields still empty: listed in the preview before the user
   // hits Create, and the same list is the save-time error.
-  const missing: string[] = isText
-    ? [...(title.trim() ? [] : ["Title"]), ...(text.trim() ? [] : ["Content"])]
+  const missing: string[] = isStaticTile
+    ? [...(title.trim() ? [] : ["Title"]), ...(isText ? (text.trim() ? [] : ["Content"]) : typeProblems(kind, typeDraft))]
     : [
         ...(choice || isNewSql ? [] : ["Data source"]),
-        ...(!isSingle && !isPoints && !ownColumns && !isGroupedTable && !dimension ? [dimensionLabel] : []),
+        ...(!isSingle && !isPoints && !isBullet && !ownColumns && !isGroupedTable && !dimension ? [dimensionLabel] : []),
         ...(isPoints && !lat ? ["Latitude"] : []),
         ...(isPoints && !lon ? ["Longitude"] : []),
-        ...(ownColumns ? [] : measureRows.slice(0, limits.min).flatMap((r, i) => (r.column ? [] : [measureTitle(i)]))),
+        ...(noMeasures ? [] : measureRows.slice(0, limits.min).flatMap((r, i) => (r.column ? [] : [measureTitle(i)]))),
+        ...typeProblems(kind, typeDraft),
         ...(needsBreakdown && !breakdown ? [breakdownLabel] : []),
         ...draftProblems(kind, tableDraft, !!pickedMetric?.timeColumn),
         ...(layersApply ? layerProblems(layers) : []),
@@ -745,19 +837,24 @@ export function ChartBuilder({
       // At once, not after the columns load: a saved sort names a measure or a grouping, and the
       // check that drops a sort the chart no longer has must see them.
       setDimension(initial.dimension ?? savedShape.groupings[0]?.column ?? "");
-      setMeasureRows(rowsFromEntries(initial.measures));
+      setMeasureRows(measureRowsOf(initial));
       setLimitParamName(limitParam(initial.limit) ?? "");
       setLimit(typeof initial.limit === "number" ? initial.limit : 20);
       setRefLines(refLinesFromDef(initial.referenceLines));
+      setCacheDraft(draftOf(initial.cache));
+      setTypeDraft(typeDraftFromDef(initial));
+      setStyle(styleFromDef(initial));
+      setFormatOpen(formatUsed(styleFromDef(initial), initial.referenceLines?.length ?? 0));
       setLayers(layerDraftsFromDef(initial.layers));
       setOwnDraw(initial.draw ?? "");
       setOwnAxis(initial.axis ?? "");
       setLimitTouched(true);
       setMoreOpen(moreOptionsUsed({
-        steps: savedShape.steps.length, layers: initial.layers?.length ?? 0, referenceLines: initial.referenceLines?.length ?? 0,
+        steps: savedShape.steps.length, layers: initial.layers?.length ?? 0,
         click: !!initial.click,
         columnSettings: initial.kind === "table" && initial.tableMode !== "rows" ? Object.keys(initial.columnSettings ?? {}).length : 0,
         compare: initial.kind === "kpi" && !!initial.compare,
+        freshness: !!initial.cache && initial.cache.mode !== "default",
       }));
       setTargetBoard(initial.board ?? board);
       setClick(initial.click);
@@ -769,7 +866,7 @@ export function ChartBuilder({
         joinsSeen.current = JSON.stringify(joinsPayload(savedShape.joins).joins ?? []);
         void loadFields(m, savedShape.joins).then(() => {
           setDimension(initial.dimension ?? savedShape.groupings[0]?.column ?? "");
-          setMeasureRows(rowsFromEntries(initial.measures));
+          setMeasureRows(measureRowsOf(initial));
         });
       }
     } else {
@@ -783,7 +880,7 @@ export function ChartBuilder({
     setTitle(""); setSource(""); setKind("hbar"); setKindQuery(""); setDimension("");
     setMeasureRows([{ column: "", aggregate: "" }]); setBreakdown(""); setMapId(""); setLat(""); setLon("");
     setAggregate("sum"); setSpan(1);
-    setCaption(""); setTarget(""); setText(""); setShape(emptyShapeDraft()); setLimit(20); setLimitTouched(false); setLimitParamName(""); setRefLines([]); setLayers([]); setOwnDraw(""); setOwnAxis("");
+    setCaption(""); setTarget(""); setText(""); setShape(emptyShapeDraft()); setLimit(20); setLimitTouched(false); setLimitParamName(""); setRefLines([]); setStyle({}); setTypeDraft(emptyTypeDraft()); setFormatOpen(false); setLayers([]); setOwnDraw(""); setOwnAxis("");
     setTargetBoard(board); setClick(undefined); setMoreOpen(false); setActive(1); setGrain(""); setTableDraft(emptyTableDraft()); setFields(null); setError(null); setPreview(null); setPreviewError(null);
     draft.cancel();
     joinsSeen.current = "[]";
@@ -793,6 +890,8 @@ export function ChartBuilder({
   function onSourceChange(value: string) {
     draft.cancel();
     setSource(value); setDimension(""); setMeasureRows([{ column: "", aggregate: "" }]); setBreakdown("");
+    // A goal that is a second value names a column of the old source.
+    setTypeDraft((d) => ({ ...d, goalMeasure: "" }));
     setLat(""); setLon("");
     // The filters and groupings name the old source's columns.
     setShape((d) => ({ ...emptyShapeDraft(), sortChoice: d.sortChoice, other: d.other }));
@@ -817,9 +916,14 @@ export function ChartBuilder({
   // which its column settings are kept for.
   const resultNames = measureRows.filter((r) => r.column).map((r) => resultName(limits.own ? r : { ...r, aggregate: "" }, wholeMeasure));
   const shownColumns = [...new Set([...groupingNames, ...resultNames])];
+  // BI-17 part A: which groups of section 5 this chart takes, and the names its formats, second axis,
+  // tooltip and conditional colours can refer to (a table's columns, a pivot's value columns, else the values).
+  const fmtRules = formatRules({ kind, breakdown: canBreakdown && !!breakdown, measures: resultNames.length });
+  const formatValueNames = kind === "table" || kind === "pivot" ? (kind === "pivot" ? tableDraft.pivotValues.map((v) => v.column).filter(Boolean) : shownColumns) : resultNames;
+
   const shapeContext = { kind, rowsMode, grained: !!(grain && grainOptions.includes(grain)), breakdown: !!(canBreakdown && breakdown) };
   // BI-2: saved metrics of the source are offered where an aggregate field is (not maps, box plots, pivots or raw rows).
-  const takesMetrics = !ownColumns && !isPoints && kind !== "boxplot" && kind !== "text";
+  const takesMetrics = !noMeasures && !isPoints && kind !== "boxplot" && kind !== "text";
   const measureColumns = [
     ...(fields?.measures ?? []).filter((m) => !isPoints || (m !== lat && m !== lon)),
     ...(takesMetrics ? (fields?.metrics ?? []).map((m) => metricColumn(m.name)) : []),
@@ -864,7 +968,7 @@ export function ChartBuilder({
     groupings: shape.groupings.map((g) => g.column), rowColumns: tableDraft.columns,
     pivot: { rows: tableDraft.pivotRows, columns: tableDraft.pivotColumns, values: tableDraft.pivotValues.filter((v) => v.column).map((v) => v.column) },
     measures: measureRows.filter((r) => r.column).map((r) => measureLabel(limits.own ? r : { ...r, aggregate: "" }, wholeMeasure, aggregate)),
-    mapLabel: isMap ? MAP_LABELS[effectiveMap] ?? "" : "", lat, lon,
+    mapLabel: isMap ? mapLabels[effectiveMap] ?? "" : "", lat, lon,
     sort: rules.sort === "choice" ? sortLabels[shape.sortChoice] ?? "" : rules.sort === "by-date" ? "by date" : rules.sort === "by-category" ? "by category" : "",
     limit: rules.limit ? (limitParamName ? "param" : Math.min(limit, maxLimit)) : null,
     filters: rules.filters ? shape.filters.length : 0, other: shape.other && rules.other.shown,
@@ -906,12 +1010,33 @@ export function ChartBuilder({
     let payload: Record<string, unknown>;
     if (isText) {
       payload = { title: payloadTitle, kind, text, span, board: targetBoard };
-    } else if (isSingle) {
+    } else if (isCard) {
+      // BI-16 part B: an image or a web page has no data; the server checks the address against the allowed sites.
+      const wrong = urlProblem(typeDraft.url, sites);
+      if (wrong && !forPreview) throw new Error(wrong);
+      payload = { title: payloadTitle, kind, span, board: targetBoard, ...typePayload(kind, typeDraft) };
+    } else if (isGantt) {
+      // BI-16 part C1 (plan D1): no measure, aggregate, order or limit; the statement is the server's `gantt_sql`.
       payload = {
-        title: payloadTitle, kind, ...sourcePayload(withSource), measures: [measure], aggregate, span, board: targetBoard,
-        caption: isKpi && caption ? caption : undefined,
+        title: payloadTitle, ...sourcePayload(withSource), kind, dimension, span, board: targetBoard,
+        breakdown: breakdown || undefined,
+        ...typePayload(kind, typeDraft),
+        ...shapeOut(),
+      };
+    } else if (isHistogram) {
+      payload = {
+        title: payloadTitle, ...sourcePayload(withSource), kind, dimension, span, board: targetBoard,
+        ...typePayload(kind, typeDraft),
+        ...shapeOut(),
+      };
+    } else if (isSingle) {
+      const goalColumn = goalMeasureColumn(kind, typeDraft);
+      payload = {
+        title: payloadTitle, kind, ...sourcePayload(withSource), measures: [measure, ...(goalColumn ? [goalColumn] : [])], aggregate, span, board: targetBoard,
+        caption: (isKpi || isProgress) && caption ? caption : undefined,
         target: isGauge && Number(target) > 0 ? Number(target) : undefined,
         ...draftPayload(kind, tableDraft),
+        ...typePayload(kind, typeDraft),
         ...shapeOut(),
       };
     } else if (ownColumns) {
@@ -923,7 +1048,8 @@ export function ChartBuilder({
         ...shapeOut(),
       };
     } else {
-      const measures = entriesFromRows(measureRows, limits.own);
+      const goalColumn = goalMeasureColumn(kind, typeDraft);
+      const measures = [...entriesFromRows(measureRows, limits.own), ...(goalColumn ? [goalColumn] : [])];
       const legacyOrder = parseSortChoice(shape.sortChoice).order;
       payload = {
         title: payloadTitle, ...sourcePayload(withSource), kind,
@@ -935,22 +1061,35 @@ export function ChartBuilder({
         lat: isPoints ? lat : undefined, lon: isPoints ? lon : undefined,
         // A point map has a fixed cap of its own (lakehouse_bi::builder::POINT_LIMIT) and is not sorted.
         order: isCalendar ? "none" : isPoints ? undefined : legacyOrder,
-        limit: isPoints ? undefined : limitParamName ? { param: limitParamName } : Math.min(limit, maxLimit),
+        // A bullet graph without a category is one row and has no limit.
+        limit: isPoints || (isBullet && !dimension) ? undefined : limitParamName ? { param: limitParamName } : Math.min(limit, maxLimit),
         referenceLines: takesLines && refLinesPayload(refLines).length ? refLinesPayload(refLines) : undefined,
+        // BI-4 part B: left out when it follows the dashboard, which clears a rule the chart had.
+        cache: forPreview || cacheDraft.mode === "default" || draftProblem(cacheDraft) ? undefined : ruleOf(cacheDraft),
         layers: layersApply ? layersPayload(layers) : undefined,
         draw: layersApply && ownDraw ? ownDraw : undefined,
         axis: layersApply && ownAxis ? ownAxis : undefined,
         // Only a grain the column and kind allow is sent (BI-9); the server checks again.
         grain: grain && grainOptions.includes(grain) ? grain : undefined,
         ...draftPayload(kind, tableDraft, shownColumns),
+        ...typePayload(kind, typeDraft),
         ...shapeOut(),
       };
+    }
+    // BI-17 part A: only the groups this kind takes, with empty ones left out.
+    // A new chart in a deployment with a company palette draws with it
+    // (decision 6, `PR #199 review M SHOULD-FIX BI-17 4`).
+    if (!isStaticTile) {
+      const styled = stylePayload(style, fmtRules);
+      Object.assign(payload, fmtRules.colors ? withCompanyPalette(styled, palette, isEdit) : styled);
     }
     // A chart without marks to click (text, KPI, gauge, table, density map)
     // has no click setting; one left over from another kind is dropped.
     const clickable = kindHasClickValue(kind);
     const problem = clickable ? clickProblem(click) : null;
     if (problem && !forPreview) throw new Error(problem);
+    const freshProblem = draftProblem(cacheDraft);
+    if (freshProblem && !forPreview && !isStaticTile) throw new Error(freshProblem);
     if (clickable && click && !problem) payload.click = click;
     if (isEdit) payload.id = editId;
     // BI-11: the preview is drawn with the values the dashboard shows; they are not part of the chart.
@@ -963,12 +1102,16 @@ export function ChartBuilder({
     aggregate, span, caption, target, text, order: shape.sortChoice, limit, targetBoard, grain,
     // BI-16 part A: every table, pivot and comparison setting reaches the SQL or the render spec.
     tables: JSON.stringify(draftPayload(kind, tableDraft, shownColumns)),
+    // BI-16 part B: the goal, bands, ranges and address reach the statement or the drawing.
+    types: JSON.stringify(typeDraft),
     // BI-6: each measure's own aggregate, the chart's own filters, the sort, "Other" and the groupings.
     shape: JSON.stringify({ measures: measureRows, shape }),
     // BI-8: a changed formula changes the rows a chart over the field returns.
     calc: JSON.stringify((fields?.calculated ?? []).map((f) => [f.name, f.formula])),
     // BI-11: the values the preview is drawn with, the limit's parameter and the reference lines.
     params: JSON.stringify({ values: paramValues ?? null, limit: limitParamName, lines: refLines }),
+    // BI-17: formats and colours change how the preview is drawn, and the rules of a kind change what is sent.
+    style: JSON.stringify(stylePayload(style, fmtRules)),
     // BI-13: each question, and how the chart's own series is drawn, reaches the statements and the drawing.
     layers: JSON.stringify(layersApply ? { layers, ownDraw, ownAxis } : null),
   });
@@ -980,6 +1123,16 @@ export function ChartBuilder({
         result: { columns: [], rows: [] },
       } : null);
       setPreviewError(null);
+      return;
+    }
+    // BI-16 part B: an image or a web page is drawn from what is typed, with nothing to ask the server.
+    if (isCard) {
+      const wrong = urlProblem(typeDraft.url, sites);
+      setPreview(!wrong && typeDraft.url.trim() ? {
+        spec: { id: "preview", title: title || "Chart preview", kind, mart: "", x: "", y: "", source: "ui", def: typePayload(kind, typeDraft) },
+        result: { columns: [], rows: [] },
+      } : null);
+      setPreviewError(wrong);
       return;
     }
     // `/specs/preview` reads the SAVED source by id, so while the SQL is new
@@ -1116,7 +1269,7 @@ export function ChartBuilder({
       {/* Phase 2 QA R11: title wide, dashboard and width narrow, on one row. */}
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-[minmax(0,1fr)_9rem_8rem]">
         <div className="grid gap-1.5">
-          <Label htmlFor="ch-title">Title {isText ? <Req /> : null}</Label>
+          <Label htmlFor="ch-title">Title {isStaticTile ? <Req /> : null}</Label>
           <Input
             id="ch-title" value={title} onChange={(e) => setTitle(e.target.value)}
             placeholder={suggestedTitle || "e.g. Visitors by Region"}
@@ -1150,6 +1303,8 @@ export function ChartBuilder({
           <Label>Content (markdown) <Req /></Label>
           <Textarea rows={8} value={text} onChange={(e) => setText(e.target.value)} placeholder="Title **bold**, - bullets, or | table | GFM |." />
         </div>
+      ) : isCard ? (
+        <CardFields kind={kind === "web" ? "web" : "image"} draft={typeDraft} onChange={changeType} sites={sites} />
       ) : (
         <>
           {/* Phase 2 QA R3: four ordered sections; the last is folded. */}
@@ -1161,11 +1316,29 @@ export function ChartBuilder({
               <SelectContent>
                 <SelectGroup>
                   <SelectLabel>Gold marts</SelectLabel>
-                  {marts.map((m) => (
-                    <SelectItem key={m.name} value={encodeSourceChoice({ kind: "mart", name: m.name })}>
-                      {m.name} · {m.rows.toLocaleString("id-ID")}
-                    </SelectItem>
-                  ))}
+                  {marts.map((m) => {
+                    const governed = governedPairLabels(m.governedTags)
+                    const tags = m.tags ?? []
+                    return (
+                      <SelectItem key={m.name} value={encodeSourceChoice({ kind: "mart", name: m.name })}>
+                        <span className="flex items-center gap-1.5 flex-wrap">
+                          <span>{m.name} · {m.rows.toLocaleString("id-ID")}</span>
+                          {/* DATA-12 part 3 & PR #106 review R1 BLOCKER 2: mark and tags */}
+                          <CertificationBadge certification={m.certification} />
+                          {governed.map((pair) => (
+                            <Pill key={`governed:${pair}`} tone="info" className="text-[10px]">
+                              {pair}
+                            </Pill>
+                          ))}
+                          {tags.map((tag) => (
+                            <Pill key={tag} tone="neutral" className="text-[10px]">
+                              {tag}
+                            </Pill>
+                          ))}
+                        </span>
+                      </SelectItem>
+                    )
+                  })}
                 </SelectGroup>
                 {sqlSources.length ? (
                   <SelectGroup>
@@ -1187,6 +1360,9 @@ export function ChartBuilder({
                 ) : null}
               </SelectContent>
             </Select>
+            {/* DATA-12 part 3: a deprecated mart still works; it warns, with the
+                note and a link to its replacement, and never blocks. */}
+            {chosenMart ? <DeprecationNotice asset={chosenMart} /> : null}
             {choice?.kind === "mart" ? (
               <JoinsSection
                 baseMart={baseMart}
@@ -1236,10 +1412,8 @@ export function ChartBuilder({
           {isMap ? (
             <div className="grid gap-1.5">
               <Label>Map</Label>
-              <Select value={effectiveMap} items={MAP_LABELS} onValueChange={(v) => setMapId(v ?? "")}>
-                <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
-                <SelectContent>{MAP_CATALOGUE.map((m) => <SelectItem key={m.id} value={m.id}>{m.label}</SelectItem>)}</SelectContent>
-              </Select>
+              {/* BI-16 C2a follow-up (planner, picker search): about 250 maps need a search. */}
+              <MapPicker maps={mapCatalogue} value={effectiveMap} onChange={setMapId} />
               {mapCredit(effectiveMap) ? <p className="text-xs text-muted-foreground">{mapCredit(effectiveMap)}</p> : null}
               {isChoropleth ? (
                 <p className="text-xs text-muted-foreground">The region column is matched to the map by name; rows that match no region are counted under the map.</p>
@@ -1262,12 +1436,12 @@ export function ChartBuilder({
                 />
               ) : (
               <div className="grid content-start gap-1.5" data-slot="dimension-field">
-                <Label>{dimensionLabel} {isPoints ? <span className="font-normal text-muted-foreground">(optional, shown in the tooltip)</span> : <Req />}</Label>
-                {isPoints ? (
+                <Label>{dimensionLabel} {isPoints ? <span className="font-normal text-muted-foreground">(optional, shown in the tooltip)</span> : isBullet ? <span className="font-normal text-muted-foreground">(optional, one bullet per category)</span> : <Req />}</Label>
+                {isPoints || isBullet ? (
                   <Select value={dimension || NO_BREAKDOWN} items={{ ...NO_LABEL_ITEMS, ...columnItems(fields?.dimensions ?? [], fieldLabel, dimension) }} onValueChange={(v) => setDimension(v === NO_BREAKDOWN ? "" : v ?? "")} disabled={!fields}>
-                    <SelectTrigger className="w-full" title={dimension ? displayColumnFull(dimension) : undefined}><SelectValue placeholder={fields ? "no label" : noFieldsHint} /></SelectTrigger>
+                    <SelectTrigger className="w-full" title={dimension ? displayColumnFull(dimension) : undefined}><SelectValue placeholder={fields ? (isBullet ? "one bullet" : "no label") : noFieldsHint} /></SelectTrigger>
                     <SelectContent>
-                      <SelectItem value={NO_BREAKDOWN}>— no label —</SelectItem>
+                      <SelectItem value={NO_BREAKDOWN}>{isBullet ? "— no category —" : "— no label —"}</SelectItem>
                       {fields?.dimensions.map((d) => <SelectItem key={d} value={d}>{fieldLabel(d)}</SelectItem>)}
                     </SelectContent>
                   </Select>
@@ -1349,7 +1523,7 @@ export function ChartBuilder({
             <p className="text-xs text-muted-foreground">Pick a date column as the dimension; one cell per day, up to the last year of data.</p>
           ) : null}
 
-          {ownColumns ? null : (
+          {noMeasures ? null : (
             <MeasureRows
               rows={measureRows} onChange={setMeasureRows} labels={measureTitle}
               min={limits.min} max={limits.max} own={limits.own} columns={measureColumns} defaultAggregate={aggregate}
@@ -1357,7 +1531,7 @@ export function ChartBuilder({
               disabled={!fields} placeholder={fields ? "pick a column" : noFieldsHint} wholeMeasure={wholeMeasure} fieldLabel={fieldLabel}
             />
           )}
-          {ownColumns ? null : isKpi ? (
+          {noMeasures ? null : isKpi || isProgress ? (
             <div className="grid gap-1.5">
               <Label>Caption <span className="font-normal text-muted-foreground">(optional)</span></Label>
               <Input value={caption} onChange={(e) => setCaption(e.target.value)} placeholder="e.g. foreign visits (cumulative)" />
@@ -1372,6 +1546,21 @@ export function ChartBuilder({
               Up to {pointLimit(choice?.kind === "sql" ? choice.id : undefined).toLocaleString("en-US")} points, largest values first.
               One point per distinct latitude and longitude{dimension ? " and label" : ""}.
             </p>
+          ) : null}
+          {isProgress || isBullet ? (
+            <GoalFields
+              kind={isProgress ? "progress" : "bullet"} draft={typeDraft} onChange={changeType}
+              columns={measureColumns.filter((c) => c !== measure)} fieldLabel={fieldLabel} disabled={!fields} placeholder={noFieldsHint}
+            />
+          ) : null}
+          {isBullet ? <BandFields draft={typeDraft} onChange={changeType} /> : null}
+          {isHistogram ? <HistogramFields draft={typeDraft} onChange={changeType} /> : null}
+          {isGantt ? (
+            <GanttFields
+              draft={typeDraft} onChange={changeType} fieldLabel={fieldLabel} disabled={!fields} placeholder={noFieldsHint}
+              dateColumns={coordinateColumns.filter((c) => fields?.kinds?.[c] === "date" || fields?.kinds?.[c] === "datetime")}
+              numberColumns={numberColumns}
+            />
           ) : null}
           {isPivot ? (
             <>
@@ -1450,10 +1639,13 @@ export function ChartBuilder({
               />
             ) : null}
 
-            {rules.referenceLines ? <ReferenceLinesEditor value={refLines} onChange={setRefLines} numberParams={numberParamDefs} /> : null}
             {isKpi ? <KpiCompareSection draft={tableDraft} onChange={setTableDraft} columns={sourceColumns} metric={pickedMetric ? { label: pickedMetric.label, timeColumn: pickedMetric.timeColumn, grain: pickedMetric.grain } : undefined} /> : null}
             {isGroupedTable ? <TableSection part="format" draft={tableDraft} onChange={setTableDraft} columns={sourceColumns} groupedColumns={shownColumns} /> : null}
             {rules.click ? <ClickSetting value={click} onChange={setClick} boards={boardOptions} /> : null}
+            {!isStaticTile ? (
+              <FreshnessField id="chart-freshness" draft={cacheDraft} onChange={setCacheDraft}
+                help="How long this chart's result is remembered. Follow the default uses the dashboard's setting." />
+            ) : null}
             {rules.parameters ? (
               <div>
                 <Button type="button" size="sm" variant="ghost" className="h-7 px-2 text-xs" onClick={() => setParamsOpen(true)}>
@@ -1462,6 +1654,13 @@ export function ChartBuilder({
               </div>
             ) : null}
             {paramsOpen ? <ParamDialog open onOpenChange={setParamsOpen} canWrite onChanged={() => { if (source) void loadFields(source); }} /> : null}
+          </FoldSection>
+
+          {/* BI-17 part A: formats, colours, axes, labels, reference lines, notes, tooltip; conditional colours for tables and KPIs. */}
+          <FoldSection number={5} title="Format" open={formatOpen} onOpenChange={setFormatOpen} panelRef={(n) => { panelRefs.current[5] = n; }}>
+            <FormatSection rules={fmtRules} style={style} onChange={setStyle} valueNames={formatValueNames} seriesNames={formatValueNames} paletteValue={effectivePalette(style, palette, isEdit)}>
+              {rules.referenceLines ? <ReferenceLinesEditor value={refLines} onChange={setRefLines} numberParams={numberParamDefs} valueNames={resultNames} takesForecast={kind !== "hbar"} /> : null}
+            </FormatSection>
           </FoldSection>
         </>
       )}

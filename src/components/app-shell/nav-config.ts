@@ -20,6 +20,7 @@ import {
   Library,
   ListChecks,
   LogIn,
+  Map,
   MonitorSmartphone,
   Plug,
   SearchCode,
@@ -158,6 +159,7 @@ export const NAV_GROUPS: NavGroup[] = [
     icon: ShieldCheck,
     items: [
       { title: "Policies", href: "/governance/policies", icon: ShieldCheck },
+      { title: "Tag keys", href: "/governance/tag-keys", icon: Tags },
       {
         title: "Classification & Masking",
         href: "/governance/classification",
@@ -230,6 +232,7 @@ export const NAV_GROUPS: NavGroup[] = [
       { title: "SSO", href: "/admin/sso", icon: LogIn },
       { title: "Sessions", href: "/admin/sessions", icon: MonitorSmartphone },
       { title: "Settings", href: "/admin/settings", icon: SlidersHorizontal },
+      { title: "Maps", href: "/admin/maps", icon: Map },
     ],
   },
 ]

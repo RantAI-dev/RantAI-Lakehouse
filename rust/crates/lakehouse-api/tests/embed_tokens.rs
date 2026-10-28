@@ -40,7 +40,71 @@ const BOARD: &str = "b_embed";
 #[derive(Clone)]
 struct FakeCh {
     boards: Arc<Mutex<Vec<Value>>>,
+    /// Rows of `console.bi_chart` the chart read answers with (`BI-26` charts;
+    /// `SEC-47`: the frame route needs a board's cards to narrow its content
+    /// sites). Empty unless a test adds some.
+    charts: Arc<Mutex<Vec<Value>>>,
+    events: Arc<Mutex<Vec<Value>>>,
     log: Arc<Mutex<Vec<String>>>,
+}
+
+fn seed_events_from_board(b: &Value) -> Vec<Value> {
+    let mut events = Vec::new();
+    let id = b["id"].as_str().unwrap_or_default();
+
+    let revoked_before = match &b["embed_revoked_before"] {
+        Value::String(s) => s.parse::<u64>().unwrap_or(0),
+        Value::Number(n) => n.as_u64().unwrap_or(0),
+        _ => 0,
+    };
+    if revoked_before > 0 {
+        events.push(json!({
+            "board_id": id,
+            "kind": "revoke_all",
+            "revoked_before": revoked_before.to_string(),
+            "jti": "",
+            "exp": "0",
+            "origins_json": "[]",
+        }));
+    }
+
+    let origins_str = match &b["embed_origins_json"] {
+        Value::String(s) => s.as_str(),
+        _ => "[]",
+    };
+    if origins_str != "[]" && !origins_str.is_empty() {
+        events.push(json!({
+            "board_id": id,
+            "kind": "origins",
+            "revoked_before": "0",
+            "jti": "",
+            "exp": "0",
+            "origins_json": origins_str,
+        }));
+    }
+
+    let jti_str = match &b["embed_revoked_jti_json"] {
+        Value::String(s) => s.as_str(),
+        _ => "[]",
+    };
+    if let Ok(parsed) = serde_json::from_str::<Value>(jti_str)
+        && let Some(arr) = parsed.as_array()
+    {
+        for item in arr {
+            let jti = item["jti"].as_str().unwrap_or_default();
+            let exp = item["exp"].as_u64().unwrap_or(0);
+            events.push(json!({
+                "board_id": id,
+                "kind": "withdraw",
+                "revoked_before": "0",
+                "jti": jti,
+                "exp": exp.to_string(),
+                "origins_json": "[]",
+            }));
+        }
+    }
+
+    events
 }
 
 fn board_row(id: &str, overrides: &Value) -> Value {
@@ -64,8 +128,18 @@ impl FakeCh {
     }
 
     fn with_boards(boards: Vec<Value>) -> Self {
+        Self::with_charts(boards, Vec::new())
+    }
+
+    fn with_charts(boards: Vec<Value>, charts: Vec<Value>) -> Self {
+        let mut events = Vec::new();
+        for b in &boards {
+            events.extend(seed_events_from_board(b));
+        }
         Self {
             boards: Arc::new(Mutex::new(boards)),
+            charts: Arc::new(Mutex::new(charts)),
+            events: Arc::new(Mutex::new(events)),
             log: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -73,6 +147,34 @@ impl FakeCh {
     /// Change a field of a board between two requests, as a write by another
     /// session would.
     fn set(&self, id: &str, field: &str, value: &Value) {
+        if field == "embed_revoked_before" {
+            let val = match value {
+                Value::String(s) => s.clone(),
+                Value::Number(n) => n.to_string(),
+                _ => "0".to_string(),
+            };
+            self.events.lock().unwrap().push(json!({
+                "board_id": id,
+                "kind": "revoke_all",
+                "revoked_before": val,
+                "jti": "",
+                "exp": "0",
+                "origins_json": "[]",
+            }));
+        } else if field == "embed_origins_json" {
+            let val = match value {
+                Value::String(s) => s.clone(),
+                _ => "[]".to_string(),
+            };
+            self.events.lock().unwrap().push(json!({
+                "board_id": id,
+                "kind": "origins",
+                "revoked_before": "0",
+                "jti": "",
+                "exp": "0",
+                "origins_json": val,
+            }));
+        }
         for b in self.boards.lock().unwrap().iter_mut() {
             if b["id"] == id {
                 b[field] = value.clone();
@@ -80,14 +182,111 @@ impl FakeCh {
         }
     }
 
+    /// A `filter_modes` event for `board` (`BI-26`): the newest one is pushed last.
+    fn add_modes(&self, board: &str, modes: &Value) {
+        self.events.lock().unwrap().push(json!({
+            "board_id": board, "kind": "filter_modes", "revoked_before": "0",
+            "jti": "", "exp": "0", "origins_json": modes.to_string(),
+        }));
+    }
+
+    /// The statements that read the test mart's data.
+    fn tile_statements(&self) -> Vec<String> {
+        self.statements()
+            .into_iter()
+            .filter(|s| {
+                s.contains("mart_x") && s.contains("visitors") && !s.contains("system.columns")
+            })
+            .collect()
+    }
+
+    /// A stored chart row (`BI-26`): `id` titled `title` on `board`.
+    fn add_chart(&self, id: &str, board: &str, title: &str) {
+        let spec = json!({
+            "id": id, "title": title, "kind": "bar", "mart": "mart_x",
+            "sql": "SELECT stored", "x": "region", "y": "visitors"
+        });
+        let def = json!({
+            "title": title, "mart": "mart_x", "kind": "bar",
+            "dimension": "region", "measures": ["visitors"]
+        });
+        self.charts.lock().unwrap().push(json!({
+            "id": id, "board": board, "created_by": "ui",
+            "created_at": "2026-01-01 00:00:00",
+            "spec_json": json!({ "spec": spec, "def": def, "hasYear": false }).to_string(),
+        }));
+    }
+
     fn statements(&self) -> Vec<String> {
         self.log.lock().unwrap().clone()
+    }
+
+    /// SEC-12 (PR #105 review SHOULD-FIX 1): record the embed event an
+    /// `INSERT INTO console.bi_board_embed_event` carries, so a later read
+    /// of the aggregate sees it. Split out of [`Respond::respond`] for the
+    /// line limit.
+    fn record_embed_event(&self, sql: &str) {
+        let Some(pos) = sql.find("VALUES (") else {
+            return;
+        };
+        let rest = &sql[pos + "VALUES (".len()..];
+        let rest = rest.trim_end().trim_end_matches(')');
+        let parts: Vec<&str> = rest.splitn(4, ", ").collect();
+        if sql.contains("'origins'") && parts.len() >= 3 {
+            let board_id = parts[0].trim_matches('\'');
+            let origins_json = parts[2].trim_matches('\'').replace("\\\"", "\"");
+            self.events.lock().unwrap().push(json!({
+                "board_id": board_id,
+                "kind": "origins",
+                "revoked_before": "0",
+                "jti": "",
+                "exp": "0",
+                "origins_json": origins_json,
+            }));
+        } else if sql.contains("'revoke_all'") && parts.len() >= 3 {
+            let board_id = parts[0].trim_matches('\'');
+            let revoked_before = parts[2].trim();
+            self.events.lock().unwrap().push(json!({
+                "board_id": board_id,
+                "kind": "revoke_all",
+                "revoked_before": revoked_before,
+                "jti": "",
+                "exp": "0",
+                "origins_json": "[]",
+            }));
+        } else if sql.contains("'withdraw'") && parts.len() >= 4 {
+            let board_id = parts[0].trim_matches('\'');
+            let jti = parts[2].trim_matches('\'');
+            let exp = parts[3].trim();
+            self.events.lock().unwrap().push(json!({
+                "board_id": board_id,
+                "kind": "withdraw",
+                "revoked_before": "0",
+                "jti": jti,
+                "exp": exp,
+                "origins_json": "[]",
+            }));
+        }
     }
 
     fn inserts_into_board(&self) -> Vec<String> {
         self.statements()
             .into_iter()
-            .filter(|s| s.starts_with("INSERT INTO console.bi_board"))
+            // The board table only: a content edit also writes a row of
+            // `bi_board_version` (BI-18 part C, part 2), whose name starts the same.
+            .filter(|s| {
+                s.starts_with("INSERT INTO console.bi_board (")
+                    || s.starts_with("INSERT INTO console.bi_board ")
+            })
+            .collect()
+    }
+
+    /// SEC-12 (PR #105 review SHOULD-FIX 1): the embed access state is
+    /// written to the append-only event table and never to the board row.
+    fn inserts_into_embed_events(&self) -> Vec<String> {
+        self.statements()
+            .into_iter()
+            .filter(|s| s.starts_with("INSERT INTO console.bi_board_embed_event"))
             .collect()
     }
 
@@ -109,7 +308,64 @@ impl Respond for FakeCh {
             let n = data.len();
             ResponseTemplate::new(200).set_body_json(json!({ "meta": [], "data": data, "rows": n }))
         };
-        if sql.contains("FROM console.bi_board") {
+        // The state lookup every board edit makes first (BI-18 part C, part 2):
+        // live, and nobody's personal board.
+        if sql.starts_with("SELECT is_deleted, owner_id FROM console.bi_board") {
+            let found: Vec<Value> = self
+                .boards
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|b| {
+                    let id = b["id"].as_str().unwrap_or_default();
+                    sql.contains(&format!("WHERE id = '{id}'"))
+                })
+                .map(|b| json!({ "is_deleted": 0, "owner_id": b["owner_id"].as_str().unwrap_or("") }))
+                .collect();
+            return rows(found);
+        }
+        // BI-26 review fix R2: one token id, across every dashboard's events.
+        if sql.contains("kind='withdraw' AND jti=") {
+            let n = self
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| {
+                    e["kind"] == "withdraw"
+                        && sql.contains(&format!("jti='{}'", e["jti"].as_str().unwrap_or("-")))
+                })
+                .count();
+            return rows(vec![json!({ "n": n.to_string() })]);
+        }
+        // SEC-12 (PR #105 review SHOULD-FIX 1): the embed access state is read
+        // by aggregating the append-only event table, never from the row.
+        if sql.contains("FROM console.bi_board_embed_event") {
+            let found: Vec<Value> = self
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| {
+                    let id = e["board_id"].as_str().unwrap_or_default();
+                    sql.contains(&format!("board_id='{id}'"))
+                })
+                .cloned()
+                .collect();
+            return rows(found);
+        }
+        // And it is written there too: the event table is the only writer of
+        // the embed access state.
+        if sql.starts_with("INSERT INTO console.bi_board_embed_event") {
+            self.record_embed_event(&sql);
+            return ResponseTemplate::new(200).set_body_string(
+                "Ok.
+",
+            );
+        }
+        // A chart read names the boards table too (its sub-selects), so it is
+        // not the board read.
+        if sql.contains("FROM console.bi_board") && !sql.contains("FROM console.bi_chart") {
             let found: Vec<Value> = self
                 .boards
                 .lock()
@@ -126,9 +382,25 @@ impl Respond for FakeCh {
             return rows(found);
         }
         if sql.contains("FROM console.bi_chart") {
-            return rows(vec![]);
+            return rows(self.charts.lock().unwrap().clone());
         }
-        ResponseTemplate::new(200).set_body_string("Ok.\n")
+        // BI-26: the columns of the one mart the test charts read, so a filter
+        // on `region` reaches the tile's statement.
+        if sql.contains("FROM system.columns") {
+            return rows(vec![
+                json!({ "table": "mart_x", "name": "region", "type": "String" }),
+                json!({ "table": "mart_x", "name": "visitors", "type": "Int64" }),
+                json!({ "table": "mart_x", "name": "year", "type": "String" }),
+            ]);
+        }
+        // BI-26 T3: the dropdown query answers two values.
+        if sql.starts_with("SELECT v FROM (") {
+            return rows(vec![json!({ "v": "Bali" }), json!({ "v": "Java" })]);
+        }
+        ResponseTemplate::new(200).set_body_string(
+            "Ok.
+",
+        )
     }
 }
 
@@ -155,6 +427,7 @@ fn token(board: &str, iat: f64, exp: f64, jti: Option<&str>) -> String {
     sign_embed(
         &EmbedClaims {
             resource: Some(EmbedResource {
+                chart: None,
                 dashboard: Some(board.to_owned()),
             }),
             params: None,
@@ -302,6 +575,7 @@ async fn every_kind_of_refused_token_gets_the_same_status_and_body() {
     let no_exp = sign_embed(
         &EmbedClaims {
             resource: Some(EmbedResource {
+                chart: None,
                 dashboard: Some(BOARD.to_owned()),
             }),
             iat: Some(now),
@@ -312,6 +586,7 @@ async fn every_kind_of_refused_token_gets_the_same_status_and_body() {
     let no_iat = sign_embed(
         &EmbedClaims {
             resource: Some(EmbedResource {
+                chart: None,
                 dashboard: Some(BOARD.to_owned()),
             }),
             exp: Some(now + 60.0),
@@ -439,6 +714,17 @@ async fn the_public_link_ignores_every_new_check() {
     }));
     let ch = fake.serve().await;
     let app = app(&ch, None).await;
+    // BI-19 part A: the link is a row in Postgres, not the board's column.
+    lakehouse_store::public_links::replace(
+        &app.pool,
+        BOARD,
+        &format!("p_{BOARD}"),
+        time::OffsetDateTime::now_utc() + time::Duration::days(30),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
     let (status, body) = send(
         &app.router,
         Request::builder()
@@ -478,13 +764,13 @@ async fn withdrawing_one_token_stores_its_jti_and_keeps_the_rest_of_the_board_st
 
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["withdrawn"], "to-withdraw");
-    let inserts = fake.inserts_into_board();
+    let inserts = fake.inserts_into_embed_events();
     assert_eq!(inserts.len(), 1, "{inserts:?}");
     let insert = &inserts[0];
     assert!(insert.contains("to-withdraw"), "{insert}");
-    // The full-row INSERT carries the existing state forward.
-    assert!(insert.contains(", 1234, "), "{insert}");
-    assert!(insert.contains("https://app.customer.example"), "{insert}");
+    // SEC-12 (PR #105 review SHOULD-FIX 1): withdrawing does not touch the
+    // board row.
+    assert_eq!(fake.inserts_into_board(), [] as [std::string::String; 0]);
 }
 
 #[tokio::test]
@@ -521,7 +807,7 @@ async fn a_token_without_a_jti_cannot_be_withdrawn_singly_and_the_answer_says_so
     let message = body["error"].as_str().unwrap();
     assert!(message.contains("no id (jti)"), "{message}");
     assert!(message.contains("withdraw all"), "{message}");
-    assert!(fake.inserts_into_board().is_empty());
+    assert_eq!(fake.inserts_into_board(), [] as [std::string::String; 0]);
 }
 
 #[tokio::test]
@@ -557,7 +843,7 @@ async fn withdrawing_refuses_a_bad_token_a_token_for_another_board_and_a_bare_jt
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert!(fake.inserts_into_board().is_empty());
+    assert_eq!(fake.inserts_into_board(), [] as [std::string::String; 0]);
 }
 
 #[tokio::test]
@@ -579,14 +865,17 @@ async fn withdraw_all_writes_the_instant_and_an_unrelated_edit_does_not_reset_it
     assert_eq!(status, StatusCode::OK, "{body}");
     let stored = body["embedRevokedBefore"].as_u64().expect("the instant");
     assert!((before..=now_secs()).contains(&stored), "{stored}");
+    let event_inserts = fake.inserts_into_embed_events();
+    assert_eq!(event_inserts.len(), 1);
     assert!(
-        fake.inserts_into_board()[0].contains(&format!(", {stored}, ")),
-        "{:?}",
-        fake.inserts_into_board()
+        event_inserts[0].contains(&format!(", {stored}")),
+        "{event_inserts:?}"
     );
+    // SEC-12 (PR #105 review SHOULD-FIX 1): revoke_all inserts into the
+    // event table and does not touch bi_board.
+    assert_eq!(fake.inserts_into_board(), [] as [std::string::String; 0]);
 
-    // A rename afterwards (the board now reads back with that instant)
-    // writes it again rather than resetting it to 0.
+    // A rename afterwards writes the board row, but contains none of the embed columns.
     fake.set(BOARD, "embed_revoked_before", &json!(stored.to_string()));
     let (status, _) = as_user(
         &app,
@@ -600,7 +889,9 @@ async fn withdraw_all_writes_the_instant_and_an_unrelated_edit_does_not_reset_it
     .await;
     assert_eq!(status, StatusCode::OK);
     let last = fake.inserts_into_board().pop().unwrap();
-    assert!(last.contains(&format!(", {stored}, ")), "{last}");
+    assert!(!last.contains("embed_revoked_before"), "{last}");
+    assert!(!last.contains("embed_revoked_jti_json"), "{last}");
+    assert!(!last.contains("embed_origins_json"), "{last}");
 }
 
 #[tokio::test]
@@ -619,7 +910,7 @@ async fn withdraw_all_can_only_be_true() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert!(fake.inserts_into_board().is_empty());
+    assert_eq!(fake.inserts_into_board(), [] as [std::string::String; 0]);
 }
 
 // ── T4: allowed sites and the frame answer ─────────────────────────────
@@ -654,7 +945,8 @@ async fn allowed_sites_are_validated_normalised_and_stored() {
         body["embedOrigins"],
         json!(["https://app.customer.example", "http://localhost:3000"])
     );
-    assert!(fake.inserts_into_board()[0].contains("https://app.customer.example"));
+    assert!(fake.inserts_into_embed_events()[0].contains("https://app.customer.example"));
+    assert_eq!(fake.inserts_into_board(), [] as [std::string::String; 0]);
 
     for bad in [
         json!(["https://*.customer.example"]),
@@ -666,11 +958,15 @@ async fn allowed_sites_are_validated_normalised_and_stored() {
                 .collect::<Vec<_>>()
         ),
     ] {
-        let writes = fake.inserts_into_board().len();
+        let writes = fake.inserts_into_embed_events().len();
         let (status, body) = put_origins(&app, "dashboard:write", bad).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         assert!(body["error"].is_string());
-        assert_eq!(fake.inserts_into_board().len(), writes, "nothing written");
+        assert_eq!(
+            fake.inserts_into_embed_events().len(),
+            writes,
+            "nothing written"
+        );
     }
 }
 
@@ -681,7 +977,7 @@ async fn editing_allowed_sites_needs_dashboard_write() {
     let app = app(&ch, Some(SECRET)).await;
     let (status, _) = put_origins(&app, "dashboard:read", json!(["https://a.example"])).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
-    assert!(fake.inserts_into_board().is_empty());
+    assert_eq!(fake.inserts_into_board(), [] as [std::string::String; 0]);
 }
 
 #[tokio::test]
@@ -738,8 +1034,18 @@ async fn the_frame_answer_is_the_boards_sites_for_a_good_token_and_empty_for_eve
     ]);
     let ch = fake.serve().await;
     let app = app(&ch, Some(SECRET)).await;
-    let listed = json!({ "origins": ["https://app.customer.example"] });
-    let none = json!({ "origins": [] });
+    lakehouse_store::public_links::replace(
+        &app.pool,
+        BOARD,
+        &format!("p_{BOARD}"),
+        time::OffsetDateTime::now_utc() + time::Duration::days(30),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let listed = json!({ "origins": ["https://app.customer.example"], "contentSites": [] });
+    let none = json!({ "origins": [], "contentSites": [] });
 
     // Signed token, public link token.
     assert_eq!(
@@ -779,6 +1085,789 @@ async fn the_frame_answer_without_a_secret_is_empty_not_an_error() {
     let app = app(&ch, None).await;
     assert_eq!(
         frame(&app, json!({ "jwt": token_issued(5.0, None) })).await,
-        (StatusCode::OK, json!({ "origins": [] }))
+        (StatusCode::OK, json!({ "origins": [], "contentSites": [] }))
     );
+}
+
+/// A `console.bi_chart` row: one image card on `board` whose address is `url`.
+fn card_row(id: &str, board: &str, url: &str) -> Value {
+    let spec = json!({
+        "id": id, "title": id, "kind": "image", "mart": "mart_a",
+        "sql": "SELECT 1", "x": "kab", "y": "visitors"
+    });
+    let def = json!({
+        "title": id, "mart": "mart_a", "kind": "image", "dimension": "kab",
+        "measures": ["visitors"], "url": url
+    });
+    json!({
+        "id": id, "board": board, "created_by": "ui", "created_at": "2026-01-01 00:00:00",
+        "spec_json": json!({ "spec": spec, "def": def, "hasYear": false }).to_string(),
+    })
+}
+
+/// `SEC-47`: the frame answer carries the deployment's content sites only as
+/// far as this board's own image and web cards use them — a card on another
+/// board, or a site no card uses, would widen this page's `img-src` for no
+/// reason and tell an embed visitor what the deployment allows.
+#[tokio::test]
+async fn the_frame_answer_carries_only_the_sites_of_this_boards_cards() {
+    let fake = FakeCh::with_charts(
+        vec![board_row(
+            BOARD,
+            &json!({ "embed_origins_json": r#"["https://app.customer.example"]"# }),
+        )],
+        vec![
+            card_row("c1", BOARD, "https://Img.Example/logo.png"),
+            card_row("c2", BOARD, "https://not-listed.example/a.png"),
+            card_row("c3", "b_other", "https://elsewhere.example/a.png"),
+        ],
+    );
+    let ch = fake.serve().await;
+    let app = app(&ch, Some(SECRET)).await;
+    let stored = lakehouse_store::reporting_settings::ReportingSettings {
+        time_zone: "UTC".to_owned(),
+        week_start: "monday".to_owned(),
+        number_locale: "en-US".to_owned(),
+        company_palette: Vec::new(),
+        fonts: Vec::new(),
+        content_sites: vec![
+            "https://img.example".to_owned(),
+            "https://elsewhere.example".to_owned(),
+            "https://unused.example".to_owned(),
+        ],
+        // This branch's BI-1 / BI-5 settings; these tests do not exercise them.
+        download_denied_roles: Vec::new(),
+        report_allowed_domains: Vec::new(),
+        public_links_enabled: true,
+        result_cache_mode: "default".to_owned(),
+        result_cache_minutes: None,
+    };
+    lakehouse_store::reporting_settings::upsert(&app.pool, &stored, "test")
+        .await
+        .expect("the settings are saved");
+    // BI-19 part A: a public link token resolves through its stored link.
+    lakehouse_store::public_links::replace(
+        &app.pool,
+        BOARD,
+        &format!("p_{BOARD}"),
+        time::OffsetDateTime::now_utc() + time::Duration::days(30),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let expected = json!({
+        "origins": ["https://app.customer.example"],
+        "contentSites": ["https://img.example"],
+    });
+    assert_eq!(
+        frame(&app, json!({ "jwt": token_issued(5.0, Some("ok")) })).await,
+        (StatusCode::OK, expected.clone())
+    );
+    // The public link token answers the same list; it is the same board.
+    assert_eq!(
+        frame(&app, json!({ "token": format!("p_{BOARD}") })).await,
+        (StatusCode::OK, expected)
+    );
+}
+
+/// `PR #233 review SHOULD-FIX 1`: the frame answer and the embed payload
+/// narrow the deployment's content sites with one rule, over the same cards.
+/// The chart with no board is on the default board for both, so the policy a
+/// page is served can never disagree with the cards that page carries.
+#[tokio::test]
+async fn the_frame_answer_and_the_payload_agree_on_a_boards_content_sites() {
+    let fake = FakeCh::with_charts(
+        vec![
+            board_row(BOARD, &json!({})),
+            board_row("default", &json!({})),
+        ],
+        vec![
+            card_row("c1", BOARD, "https://Img.Example/logo.png"),
+            // The chart with no board is on the default board (`BI-18` part C).
+            card_row("c2", "", "https://Default.Example/a.png"),
+            card_row("c3", "b_other", "https://elsewhere.example/a.png"),
+        ],
+    );
+    let ch = fake.serve().await;
+    let app = app(&ch, Some(SECRET)).await;
+    let stored = lakehouse_store::reporting_settings::ReportingSettings {
+        time_zone: "UTC".to_owned(),
+        week_start: "monday".to_owned(),
+        number_locale: "en-US".to_owned(),
+        company_palette: Vec::new(),
+        fonts: Vec::new(),
+        content_sites: vec![
+            "https://img.example".to_owned(),
+            "https://default.example".to_owned(),
+            "https://elsewhere.example".to_owned(),
+        ],
+        // This branch's BI-1 / BI-5 settings; these tests do not exercise them.
+        download_denied_roles: Vec::new(),
+        report_allowed_domains: Vec::new(),
+        public_links_enabled: true,
+        result_cache_mode: "default".to_owned(),
+        result_cache_minutes: None,
+    };
+    lakehouse_store::reporting_settings::upsert(&app.pool, &stored, "test")
+        .await
+        .expect("the settings are saved");
+
+    // The same board through both routes: the answer and the payload agree,
+    // and neither carries the site of a card on another board.
+    let jwt = token_issued(5.0, None);
+    let (status, payload) = embed_data(&app, &jwt).await;
+    assert_eq!(status, StatusCode::OK, "{payload}");
+    assert_eq!(
+        payload["reporting"]["contentSites"],
+        json!(["https://img.example"])
+    );
+    let (status, framing) = frame(&app, json!({ "jwt": jwt })).await;
+    assert_eq!(status, StatusCode::OK, "{framing}");
+    assert_eq!(
+        framing["contentSites"], payload["reporting"]["contentSites"],
+        "{framing}"
+    );
+
+    // The default board carries the chart with no board, and only that one.
+    let iat = unix_now().floor();
+    let default = token("default", iat, iat + 3600.0, None);
+    let (status, payload) = embed_data(&app, &default).await;
+    assert_eq!(status, StatusCode::OK, "{payload}");
+    assert_eq!(
+        payload["reporting"]["contentSites"],
+        json!(["https://default.example"])
+    );
+    let (status, framing) = frame(&app, json!({ "jwt": default })).await;
+    assert_eq!(status, StatusCode::OK, "{framing}");
+    assert_eq!(
+        framing["contentSites"], payload["reporting"]["contentSites"],
+        "{framing}"
+    );
+}
+
+/// `SEC-47`: a board with no card, or a deployment that never saved a site,
+/// adds nothing — the page keeps `img-src 'self' data: blob:`.
+#[tokio::test]
+async fn the_frame_answer_without_a_card_has_no_content_site() {
+    let ch = FakeCh::new(&json!({})).serve().await;
+    let app = app(&ch, Some(SECRET)).await;
+    let stored = lakehouse_store::reporting_settings::ReportingSettings {
+        time_zone: "UTC".to_owned(),
+        week_start: "monday".to_owned(),
+        number_locale: "en-US".to_owned(),
+        company_palette: Vec::new(),
+        fonts: Vec::new(),
+        content_sites: vec!["https://img.example".to_owned()],
+        // This branch's BI-1 / BI-5 settings; these tests do not exercise them.
+        download_denied_roles: Vec::new(),
+        report_allowed_domains: Vec::new(),
+        public_links_enabled: true,
+        result_cache_mode: "default".to_owned(),
+        result_cache_minutes: None,
+    };
+    lakehouse_store::reporting_settings::upsert(&app.pool, &stored, "test")
+        .await
+        .expect("the settings are saved");
+
+    assert_eq!(
+        frame(&app, json!({ "jwt": token_issued(5.0, None) })).await,
+        (StatusCode::OK, json!({ "origins": [], "contentSites": [] }))
+    );
+}
+
+// ── BI-26 T1: chart tokens ─────────────────────────────────────────────
+
+fn chart_token(chart: &str, jti: Option<&str>) -> String {
+    let iat = (unix_now() - 5.0).floor();
+    sign_embed(
+        &EmbedClaims {
+            resource: Some(EmbedResource {
+                chart: Some(chart.to_owned()),
+                dashboard: None,
+            }),
+            params: None,
+            exp: Some(iat + 3600.0),
+            iat: Some(iat),
+            jti: jti.map(str::to_owned),
+        },
+        SECRET,
+    )
+}
+
+fn two_charts(fake: &FakeCh) {
+    fake.add_chart("u_one", BOARD, "Visitors by region");
+    fake.add_chart("u_two", BOARD, "Secret revenue");
+}
+
+#[tokio::test]
+async fn a_chart_token_reads_that_chart_and_nothing_that_names_another() {
+    let fake = FakeCh::new(&json!({ "name": "Whole board name" }));
+    two_charts(&fake);
+    let ch = fake.serve().await;
+    let app = app(&ch, Some(SECRET)).await;
+
+    let (status, body) = embed_data(&app, &chart_token("u_one", None)).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let charts = body["charts"].as_array().unwrap();
+    assert_eq!(charts.len(), 1, "{body}");
+    assert_eq!(charts[0]["id"], "u_one");
+    assert_eq!(body["onlyChart"], "u_one");
+    assert_eq!(body["layout"], json!({}));
+    assert!(body.get("tabs").is_none() && body.get("phoneLayout").is_none());
+    let text = body.to_string();
+    for other in ["u_two", "Secret revenue", "Whole board name"] {
+        assert!(
+            !text.contains(other),
+            "{other} is in the chart payload: {text}"
+        );
+    }
+    // A dashboard token for the same board still reads both.
+    let (_, whole) = embed_data(&app, &token_issued(5.0, None)).await;
+    assert_eq!(whole["charts"].as_array().unwrap().len(), 2, "{whole}");
+}
+
+#[tokio::test]
+async fn a_token_naming_both_neither_or_an_unknown_chart_is_refused_alike() {
+    let fake = FakeCh::new(&json!({}));
+    two_charts(&fake);
+    let ch = fake.serve().await;
+    let app = app(&ch, Some(SECRET)).await;
+    let iat = (unix_now() - 5.0).floor();
+    let signed = |dashboard: Option<&str>, chart: Option<&str>| {
+        sign_embed(
+            &EmbedClaims {
+                resource: Some(EmbedResource {
+                    chart: chart.map(str::to_owned),
+                    dashboard: dashboard.map(str::to_owned),
+                }),
+                params: None,
+                exp: Some(iat + 3600.0),
+                iat: Some(iat),
+                jti: None,
+            },
+            SECRET,
+        )
+    };
+    let refused = [
+        signed(Some(BOARD), Some("u_one")),
+        signed(None, None),
+        signed(None, Some("u_not_a_chart")),
+    ];
+    for jwt in refused {
+        let (status, body) = embed_data(&app, &jwt).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+        assert_eq!(body["error"], "embed token is invalid or expired");
+    }
+}
+
+#[tokio::test]
+async fn a_chart_token_obeys_the_boards_embed_switch_and_withdrawal() {
+    let off = FakeCh::with_boards(vec![board_row(BOARD, &json!({ "embed_enabled": "0" }))]);
+    two_charts(&off);
+    let ch = off.serve().await;
+    let app_off = app(&ch, Some(SECRET)).await;
+    let (status, _) = embed_data(&app_off, &chart_token("u_one", None)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let withdrawn = FakeCh::new(&json!({ "embed_revoked_before": u64::MAX.to_string() }));
+    two_charts(&withdrawn);
+    let ch2 = withdrawn.serve().await;
+    let app_w = app(&ch2, Some(SECRET)).await;
+    let (status, _) = embed_data(&app_w, &chart_token("u_one", None)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn a_chart_token_is_framed_and_withdrawn_through_its_charts_board() {
+    let fake = FakeCh::new(&json!({ "embed_origins_json": r#"["https://app.customer.example"]"# }));
+    two_charts(&fake);
+    let ch = fake.serve().await;
+    let app = app(&ch, Some(SECRET)).await;
+    let jwt = chart_token("u_one", Some("one-id"));
+    assert_eq!(
+        frame(&app, json!({ "jwt": jwt })).await,
+        (
+            StatusCode::OK,
+            json!({ "origins": ["https://app.customer.example"], "contentSites": [] })
+        )
+    );
+    let (status, body) = revoke_one(&app, "dashboard:write", BOARD, &jwt).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["withdrawn"], "one-id");
+    // The same token cannot be withdrawn through another board.
+    let (status, _) = revoke_one(&app, "dashboard:write", "b_other", &jwt).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+// ── BI-26 T2: filter modes ─────────────────────────────────────────────
+
+const SAVED_BALI: &str = r#"[{"column":"region","op":"in","values":["Bali"]}]"#;
+
+/// A board with a saved `region = Bali` filter, one chart, and `modes` chosen.
+fn modal_board(modes: &Value) -> FakeCh {
+    let fake = FakeCh::new(&json!({ "filters_json": SAVED_BALI }));
+    fake.add_chart("u_one", BOARD, "Visitors by region");
+    if !modes.is_null() {
+        fake.add_modes(BOARD, modes);
+    }
+    fake
+}
+
+async fn embed_with(app: &TestApp, jwt: &str, filters: Option<Value>) -> (StatusCode, Value) {
+    let mut body = json!({ "jwt": jwt });
+    if let Some(f) = filters {
+        body["filters"] = f;
+    }
+    send(
+        &app.router,
+        Request::builder()
+            .method("POST")
+            .uri("/api/embed/data")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap(),
+    )
+    .await
+}
+
+fn token_with(params: Option<Value>) -> String {
+    let iat = (unix_now() - 5.0).floor();
+    sign_embed(
+        &EmbedClaims {
+            resource: Some(EmbedResource {
+                chart: None,
+                dashboard: Some(BOARD.to_owned()),
+            }),
+            params: params.map(|p| serde_json::from_value(p).unwrap()),
+            exp: Some(iat + 3600.0),
+            iat: Some(iat),
+            jti: None,
+        },
+        SECRET,
+    )
+}
+
+fn sql_has(fake: &FakeCh, needle: &str) -> bool {
+    fake.tile_statements().iter().any(|s| s.contains(needle))
+}
+
+#[tokio::test]
+async fn a_locked_filter_needs_its_value_in_the_token_and_the_refusal_is_the_fixed_one() {
+    let fake = modal_board(&json!({ "region": "locked" }));
+    let ch = fake.serve().await;
+    let app = app(&ch, Some(SECRET)).await;
+
+    let (status, body) = embed_with(&app, &token_with(None), None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(body["error"], "embed token is invalid or expired");
+    assert!(
+        !body.to_string().contains("region"),
+        "the column is not named: {body}"
+    );
+    assert!(fake.tile_statements().is_empty(), "nothing was read");
+
+    let (status, body) =
+        embed_with(&app, &token_with(Some(json!({ "region": "Bali" }))), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(sql_has(&fake, "Bali"));
+    assert!(
+        body.get("embedFilters").is_none(),
+        "a locked filter is not described"
+    );
+}
+
+#[tokio::test]
+async fn an_editable_filter_takes_the_viewers_value_and_is_described() {
+    let fake = modal_board(&json!({ "region": "editable" }));
+    let ch = fake.serve().await;
+    let first = app(&ch, Some(SECRET)).await;
+
+    let (status, body) = embed_with(
+        &first,
+        &token_with(None),
+        Some(json!([{ "column": "region", "op": "in", "values": ["Java"] }])),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        sql_has(&fake, "Java") && !sql_has(&fake, "Bali"),
+        "{:?}",
+        fake.tile_statements()
+    );
+    let described = body["embedFilters"].as_array().unwrap();
+    assert_eq!(described.len(), 1);
+    assert_eq!(described[0]["column"], "region");
+    assert_eq!(described[0]["filter"]["values"], json!(["Java"]));
+
+    // Without a viewer value the saved one applies.
+    let fake2 = modal_board(&json!({ "region": "editable" }));
+    let ch2 = fake2.serve().await;
+    let app2 = app(&ch2, Some(SECRET)).await;
+    let (status, _) = embed_with(&app2, &token_with(None), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(sql_has(&fake2, "Bali"));
+}
+
+#[tokio::test]
+async fn a_viewer_value_for_a_hidden_or_locked_column_is_dropped_and_a_token_value_wins() {
+    let java = json!([{ "column": "region", "op": "in", "values": ["Java"] }]);
+    for (modes, params) in [
+        (json!({ "region": "hidden" }), None),
+        (Value::Null, None), // no mode chosen: hidden
+        (
+            json!({ "region": "locked" }),
+            Some(json!({ "region": "Bali" })),
+        ),
+        // editable, but the token set it: decision 7, the token wins.
+        (
+            json!({ "region": "editable" }),
+            Some(json!({ "region": "Bali" })),
+        ),
+    ] {
+        let fake = modal_board(&modes);
+        let ch = fake.serve().await;
+        let app = app(&ch, Some(SECRET)).await;
+        let (status, body) = embed_with(&app, &token_with(params), Some(java.clone())).await;
+        assert_eq!(status, StatusCode::OK, "{modes}: {body}");
+        assert!(sql_has(&fake, "Bali"), "{modes}");
+        assert!(
+            !sql_has(&fake, "Java"),
+            "{modes}: the viewer's value was applied"
+        );
+        assert!(body.get("embedFilters").is_none(), "{modes}: {body}");
+    }
+}
+
+#[tokio::test]
+async fn an_old_token_that_locks_a_column_that_is_no_filter_still_narrows() {
+    // BI-26-AC7: no saved filter, no mode; the token's params apply as before.
+    let fake = FakeCh::new(&json!({}));
+    fake.add_chart("u_one", BOARD, "Visitors by region");
+    let ch = fake.serve().await;
+    let app = app(&ch, Some(SECRET)).await;
+    let (status, body) =
+        embed_with(&app, &token_with(Some(json!({ "region": "Bali" }))), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(sql_has(&fake, "Bali"));
+}
+
+#[tokio::test]
+async fn an_invalid_viewer_filter_is_a_400() {
+    let fake = modal_board(&json!({ "region": "editable" }));
+    let ch = fake.serve().await;
+    let app = app(&ch, Some(SECRET)).await;
+    let (status, body) = embed_with(
+        &app,
+        &token_with(None),
+        Some(json!([{ "column": "bad column!", "op": "in", "values": ["x"] }])),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(fake.tile_statements(), [] as [String; 0]);
+}
+
+// ── BI-26 T3: values route, settings route, sample token ───────────────
+
+const REGION_AND_YEAR: &str = r#"[{"column":"region","op":"in","values":["Bali"]},{"column":"year","op":"in","values":["2024"]}]"#;
+
+/// `region` editable, `year` locked, both saved; `hidden` is not chosen.
+fn dropdown_board() -> FakeCh {
+    let fake = FakeCh::new(&json!({ "filters_json": REGION_AND_YEAR }));
+    fake.add_chart("u_one", BOARD, "Visitors by region");
+    fake.add_modes(BOARD, &json!({ "region": "editable", "year": "locked" }));
+    fake
+}
+
+async fn embed_values(app: &TestApp, jwt: &str, column: &str) -> (StatusCode, Value) {
+    send(
+        &app.router,
+        Request::builder()
+            .method("POST")
+            .uri("/api/embed/values")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({ "jwt": jwt, "column": column }).to_string(),
+            ))
+            .unwrap(),
+    )
+    .await
+}
+
+fn value_statements(fake: &FakeCh) -> Vec<String> {
+    fake.statements()
+        .into_iter()
+        .filter(|s| s.starts_with("SELECT v FROM ("))
+        .collect()
+}
+
+#[tokio::test]
+async fn the_values_of_an_editable_filter_are_listed_with_the_locked_filter_applied() {
+    let fake = dropdown_board();
+    let ch = fake.serve().await;
+    let app = app(&ch, Some(SECRET)).await;
+    let jwt = token_with(Some(json!({ "year": "2024" })));
+
+    let (status, body) = embed_values(&app, &jwt, "region").await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["values"], json!(["Bali", "Java"]));
+    let sent = value_statements(&fake);
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    // The token's locked year narrows the list; the column's own saved value
+    // does not (the viewer is choosing it); the list is capped at 1,000.
+    assert!(sent[0].contains("2024"), "{}", sent[0]);
+    assert!(!sent[0].contains("Bali"), "{}", sent[0]);
+    assert!(sent[0].contains("LIMIT 1001"), "{}", sent[0]);
+}
+
+#[tokio::test]
+async fn the_values_route_refuses_what_the_token_does_not_let_the_viewer_change() {
+    let fake = dropdown_board();
+    let ch = fake.serve().await;
+    let app = app(&ch, Some(SECRET)).await;
+    let jwt = token_with(Some(json!({ "year": "2024" })));
+    // A locked column, and one that is no filter at all.
+    for column in ["year", "visitors"] {
+        let (status, body) = embed_values(&app, &jwt, column).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{column}: {body}");
+    }
+    // A locked value missing from the token is the one token refusal.
+    let (status, body) = embed_values(&app, &token_with(None), "region").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(body["error"], "embed token is invalid or expired");
+    // The token set the column itself: decision 7, no dropdown for it.
+    let (status, _) = embed_values(
+        &app,
+        &token_with(Some(json!({ "year": "2024", "region": "Bali" }))),
+        "region",
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    // A chart token gets no dropdown of the dashboard's values.
+    let (status, _) = embed_values(&app, &chart_token("u_one", None), "region").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    // A bad token and a missing column.
+    let (status, _) = embed_values(&app, "not.a.token", "region").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _) = embed_values(&app, &jwt, "").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(value_statements(&fake).is_empty(), "no value was read");
+}
+
+#[tokio::test]
+async fn embed_settings_need_dashboard_write_name_real_filters_and_are_audited() {
+    let fake = dropdown_board();
+    let ch = fake.serve().await;
+    let app = app(&ch, Some(SECRET)).await;
+    let put = |perms: &'static str, body: Value| {
+        let app = &app;
+        async move {
+            as_user(
+                app,
+                perms,
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/dashboard/embed-settings")
+                    .header("content-type", "application/json"),
+                Body::from(body.to_string()),
+            )
+            .await
+        }
+    };
+    let modes =
+        json!({ "board": BOARD, "filterModes": { "region": "editable", "year": "locked" } });
+    let (status, _) = put("dashboard:read", modes.clone()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(
+        fake.statements()
+            .iter()
+            .all(|s| !s.contains("'filter_modes'"))
+    );
+
+    let (status, body) = put("dashboard:write", modes).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let writes: Vec<String> = fake
+        .statements()
+        .into_iter()
+        .filter(|s| {
+            s.starts_with("INSERT INTO console.bi_board_embed_event")
+                && s.contains("'filter_modes'")
+        })
+        .collect();
+    assert_eq!(writes.len(), 1, "{writes:?}");
+    let (audited,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM audit_event WHERE action = 'dashboard.embed_settings'",
+    )
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
+    assert_eq!(audited, 1);
+
+    // A column the dashboard has no filter on, an unknown mode, the built-in board.
+    for bad in [
+        json!({ "board": BOARD, "filterModes": { "nope": "locked" } }),
+        json!({ "board": BOARD, "filterModes": { "region": "wide-open" } }),
+        json!({ "board": "default", "filterModes": {} }),
+    ] {
+        let (status, _) = put("dashboard:write", bad.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
+    }
+}
+
+#[tokio::test]
+async fn the_sample_token_carries_the_chart_when_asked_and_the_locked_values_it_needs() {
+    let fake = dropdown_board();
+    let ch = fake.serve().await;
+    let app = app(&ch, Some(SECRET)).await;
+    let sample = |chart: &str| {
+        let app = &app;
+        let uri = format!("/api/dashboard/embed-info?board={BOARD}{chart}");
+        async move {
+            as_user(
+                app,
+                "dashboard:read",
+                Request::builder().uri(uri),
+                Body::empty(),
+            )
+            .await
+        }
+    };
+    // The dashboard sample is not refused for the locked year it would forget.
+    let (status, info) = sample("").await;
+    assert_eq!(status, StatusCode::OK, "{info}");
+    assert_eq!(
+        info["filterModes"],
+        json!({ "region": "editable", "year": "locked" })
+    );
+    assert_eq!(info["filterColumns"], json!(["region", "year"]));
+    let (status, whole) = embed_data(&app, info["sampleToken"].as_str().unwrap()).await;
+    assert_eq!(status, StatusCode::OK, "{whole}");
+    // A chart sample names the chart and reads that chart alone.
+    let (_, info) = sample("&chart=u_one").await;
+    let (status, one) = embed_data(&app, info["sampleToken"].as_str().unwrap()).await;
+    assert_eq!(status, StatusCode::OK, "{one}");
+    assert_eq!(one["onlyChart"], "u_one");
+}
+
+#[tokio::test]
+async fn a_locked_or_token_set_editable_value_replaces_the_saved_one_and_a_hidden_one_is_anded() {
+    // BI-26 review fix (BLOCKER) R1. Saved `region = Bali`, the token says Java.
+    for (modes, token_region, replaced) in [
+        (json!({ "region": "locked" }), "Java", true),
+        (json!({ "region": "editable" }), "Java", true),
+        (json!({ "region": "hidden" }), "Java", false),
+    ] {
+        let fake = modal_board(&modes);
+        let ch = fake.serve().await;
+        let app = app(&ch, Some(SECRET)).await;
+        let params = json!({ "region": token_region });
+        let (status, body) = embed_with(&app, &token_with(Some(params)), None).await;
+        assert_eq!(status, StatusCode::OK, "{modes}: {body}");
+        assert!(
+            sql_has(&fake, "Java"),
+            "{modes}: the token's value is applied"
+        );
+        assert_eq!(
+            sql_has(&fake, "Bali"),
+            !replaced,
+            "{modes}: the saved Bali predicate is {} the statement",
+            if replaced { "gone from" } else { "still in" }
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_dropdown_of_another_filter_sees_the_tokens_value_not_the_saved_one() {
+    // BI-26 review fix (BLOCKER) R1, in the values route: `year` is locked and
+    // saved as 2024; the token says 2025.
+    let fake = dropdown_board();
+    let ch = fake.serve().await;
+    let app = app(&ch, Some(SECRET)).await;
+    let jwt = token_with(Some(json!({ "year": "2025" })));
+    let (status, body) = embed_values(&app, &jwt, "region").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let sent = value_statements(&fake);
+    assert!(
+        sent[0].contains("2025") && !sent[0].contains("2024"),
+        "{}",
+        sent[0]
+    );
+}
+
+#[tokio::test]
+async fn a_withdrawn_chart_token_stays_withdrawn_after_its_chart_moves_to_another_dashboard() {
+    // BI-26 review fix (SHOULD-FIX) R2.
+    let fake = FakeCh::with_boards(vec![
+        board_row("b_a", &json!({})),
+        board_row("b_b", &json!({})),
+    ]);
+    fake.add_chart("u_one", "b_a", "Visitors");
+    let ch = fake.serve().await;
+    let app = app(&ch, Some(SECRET)).await;
+    let jwt = chart_token("u_one", Some("move-me"));
+    assert_eq!(embed_data(&app, &jwt).await.0, StatusCode::OK);
+    let (status, body) = revoke_one(&app, "dashboard:write", "b_a", &jwt).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(embed_data(&app, &jwt).await.0, StatusCode::UNAUTHORIZED);
+    // The chart moves to dashboard B; the withdrawal was written on A.
+    fake.charts.lock().unwrap()[0]["board"] = json!("b_b");
+    assert_eq!(embed_data(&app, &jwt).await.0, StatusCode::UNAUTHORIZED);
+    // Another token of the same chart is not affected.
+    assert_eq!(
+        embed_data(&app, &chart_token("u_one", Some("another")))
+            .await
+            .0,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn only_a_filter_that_picks_values_can_be_locked_or_editable() {
+    // BI-26 review fix (SHOULD-FIX) R3: `year` is a range, `region` an `in`.
+    let fake = FakeCh::new(&json!({
+        "filters_json": r#"[{"column":"region","op":"in","values":["Bali"]},{"column":"year","op":"between","min":"2020","max":"2024"}]"#
+    }));
+    fake.add_chart("u_one", BOARD, "Visitors by region");
+    let ch = fake.serve().await;
+    let app = app(&ch, Some(SECRET)).await;
+    let put = |modes: Value| {
+        let app = &app;
+        async move {
+            as_user(
+                app,
+                "dashboard:write",
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/dashboard/embed-settings")
+                    .header("content-type", "application/json"),
+                Body::from(json!({ "board": BOARD, "filterModes": modes }).to_string()),
+            )
+            .await
+        }
+    };
+    for mode in ["locked", "editable"] {
+        let (status, body) = put(json!({ "year": mode })).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{mode}: {body}");
+        assert!(body["error"].as_str().unwrap().contains("picks values"));
+    }
+    assert!(
+        fake.statements()
+            .iter()
+            .all(|s| !s.contains("'filter_modes'")),
+        "nothing was stored"
+    );
+    let (status, _) = put(json!({ "year": "hidden", "region": "editable" })).await;
+    assert_eq!(status, StatusCode::OK);
+    // The dialog is told which filters can only be hidden.
+    let (_, info) = as_user(
+        &app,
+        "dashboard:read",
+        Request::builder().uri(format!("/api/dashboard/embed-info?board={BOARD}")),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(info["hiddenOnlyColumns"], json!(["year"]));
 }

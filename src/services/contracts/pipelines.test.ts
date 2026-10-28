@@ -106,4 +106,36 @@ describe("WS4 pipelines contracts", () => {
     }
     expect(fixture.cursor).toBe("opaque-cursor-1")
   })
+
+  it("Pipeline carries optional targetLag and lag (BLD-2 D8)", () => {
+    const fixture: PipelineDetail = {
+      id: "pl-lag",
+      name: "lag pipeline",
+      kind: "batch",
+      status: "ready",
+      owner: "system",
+      source: "bronze.orders",
+      target: "silver.orders_clean",
+      schedule: "manual",
+      lastRunAt: null,
+      slaOk: null,
+      freshnessLagSeconds: null,
+      engine: "authored",
+      description: null,
+      graph: null,
+      config: [],
+      definition: null,
+      runs: [],
+      targetLag: { kind: "lag", minutes: 10 },
+      lag: {
+        status: "met",
+        lagSeconds: 45,
+        lastCheckAt: "2026-10-15T12:00:00Z",
+        reason: null,
+      },
+    }
+    expect(fixture.targetLag).toEqual({ kind: "lag", minutes: 10 })
+    expect(fixture.lag?.status).toBe("met")
+    expect(fixture.lag?.lagSeconds).toBe(45)
+  })
 })

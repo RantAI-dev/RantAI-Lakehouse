@@ -23,6 +23,8 @@
 //! { "kind": "list", "state": "done", "scope": "public",
 //!   "objects": [ { "name": "public.orders", "kind": "table",
 //!                  "size": 1024, "modifiedAt": "2026-10-15T09:00:00Z" } ],
+//!   (a business-app object also has "load": "incremental", or
+//!    "re-read in full: <reason>"; `SRC-3` decision 6)
 //!   "truncated": false }
 //! { "kind": "preview", "state": "done", "object": "public.orders",
 //!   "columns": [ { "name": "id", "typeName": "integer", "inferred": false } ],
@@ -85,6 +87,9 @@ pub const MAX_NAME_CHARS: usize = 256;
 
 /// The longest type name accepted, in characters.
 pub const MAX_TYPE_CHARS: usize = 128;
+
+/// The longest load description of a listed object, in characters.
+pub const MAX_LOAD_CHARS: usize = 200;
 
 /// How long a `running` request is believed. The orchestrator's job takes
 /// seconds; past this the row is shown as a timeout.
@@ -255,6 +260,17 @@ pub enum ObjectKind {
     Topic,
     /// A `MongoDB` collection.
     Collection,
+    /// An object of a business-app (`saas`) vendor: a Salesforce object, a
+    /// Zendesk resource, a Dataverse table (`SRC-3`).
+    Object,
+    /// A dimension a Google Analytics report can be built from (`SRC-3` slice 3
+    /// review BLOCKER 9): listed by the property's own metadata, with `schema: "fields"`.
+    Dimension,
+    /// A metric a Google Analytics report can be built from (same listing).
+    Metric,
+    /// A `SharePoint` site the person can pick (`SRC-3` slice 5 review BLOCKER 14): listed with
+    /// `schema: "fields"`, its `name` the Graph site id and its `label` the site's title.
+    Site,
 }
 
 /// One listed object. `name` is what a source object's `name` is in the ingest
@@ -273,6 +289,17 @@ pub struct ListedObject {
     /// When it last changed, RFC 3339, for a file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub modified_at: Option<String>,
+    /// How a business-app object loads (`SRC-3` decision 6): `incremental`, or
+    /// `re-read in full: <reason>`. Fixed text from the vendor module's own
+    /// declaration (`saas/objects.py`), never the vendor's words; only a `saas`
+    /// listing carries it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load: Option<String>,
+    /// A name for a person where `name` is an id (`SRC-3` slice 5 review BLOCKER 14: a `SharePoint`
+    /// list is `<site id>/<list id>`, shown as `Site / List`). The vendor module's own text, bounded
+    /// like a name; the ingest spec still keys the object by `name`, so a rename changes nothing stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 impl ListedObject {
@@ -284,6 +311,8 @@ impl ListedObject {
             kind,
             size: None,
             modified_at: None,
+            load: None,
+            label: None,
         }
     }
 }
@@ -363,7 +392,7 @@ impl Listing {
     /// # Errors
     ///
     /// [`StoreError::Validation`] for more than [`MAX_OBJECTS`] objects, a blank,
-    /// oversize or control-character name, a negative size, a `modifiedAt` that is
+    /// oversize or control-character name or label, a negative size, a `modifiedAt` that is
     /// not RFC 3339, or a result past [`MAX_RESULT_BYTES`].
     pub fn validate(&self) -> Result<(), StoreError> {
         if self.objects.len() > MAX_OBJECTS {
@@ -377,6 +406,12 @@ impl Listing {
                 return Err(StoreError::Validation(
                     "an object size must not be negative".to_owned(),
                 ));
+            }
+            if let Some(load) = object.load.as_deref() {
+                check_name("a load description", load, MAX_LOAD_CHARS)?;
+            }
+            if let Some(label) = object.label.as_deref() {
+                check_name("an object label", label, MAX_NAME_CHARS)?;
             }
             if object
                 .modified_at

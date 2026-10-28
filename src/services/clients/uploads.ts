@@ -1,11 +1,18 @@
 import type {
   CreateUploadResponse,
+  UploadCheck,
+  UploadCompare,
+  UploadFolder,
+  UploadListFilter,
   IngestUploadInput,
   IngestUploadResponse,
   Upload,
   UploadParseOptions,
+  UploadPartReceipt,
+  UploadParts,
   UploadPreview,
   UploadService,
+  UploadSession,
 } from "../contracts/uploads"
 import { apiFetch } from "../http"
 import { ServiceError, type ServiceErrorCode } from "../errors"
@@ -43,6 +50,23 @@ function notReached(status: number): string {
   return `The upload did not reach the service (answered ${status}). Files up to 50 MB are accepted; check that this one is under the limit and try again.`
 }
 
+/**
+ * The same for the chunked path (sessions, pieces, complete): its limit is 2 GB
+ * (an Excel workbook keeps 50 MB), not the 50 MB of `POST /api/uploads`. Plan
+ * T6.2 item 5: each path's text names its own cap.
+ */
+function notReachedByPieces(status: number): string {
+  return `The upload did not reach the service (answered ${status}). Files up to 2 GB are accepted (Excel workbooks up to 50 MB); check that this one is under the limit and try again.`
+}
+
+/** `Retry-After` as whole seconds (the API sends `5`), or `undefined` when absent or not a number. */
+function retryAfterSecs(res: Response): number | undefined {
+  const raw = res.headers.get("Retry-After")
+  if (raw === null) return undefined
+  const secs = Number(raw)
+  return Number.isFinite(secs) && secs >= 0 ? secs : undefined
+}
+
 async function failure(res: Response, fallback?: (status: number) => string): Promise<ServiceError> {
   const body: unknown = await res.json().catch(() => null)
   const sentence =
@@ -51,7 +75,12 @@ async function failure(res: Response, fallback?: (status: number) => string): Pr
     typeof sentence === "string" && sentence.trim() !== ""
       ? sentence
       : (fallback ?? ((status: number) => `Failed (${status})`))(res.status)
-  return new ServiceError(errorCode(res.status), message, res.status)
+  return new ServiceError(
+    errorCode(res.status),
+    message,
+    res.status,
+    res.status === 429 ? retryAfterSecs(res) : undefined
+  )
 }
 
 async function readJson<T>(res: Response): Promise<T> {
@@ -66,8 +95,57 @@ function uploadUrl(id: string, suffix = ""): string {
 }
 
 export const uploadService: UploadService = {
-  async list(signal) {
-    return readJson<Upload[]>(await apiFetch(base, { signal }))
+  async list(signal, filter?: UploadListFilter) {
+    // Only what is chosen is sent, so an unfiltered list is the URL it always was.
+    const query = new URLSearchParams()
+    if (filter?.folderId !== undefined && filter.folderId !== "") query.set("folderId", filter.folderId)
+    if (filter?.q !== undefined && filter.q.trim() !== "") query.set("q", filter.q.trim())
+    const text = query.toString()
+    return readJson<Upload[]>(await apiFetch(text === "" ? base : `${base}?${text}`, { signal }))
+  },
+  async listFolders(signal) {
+    return readJson<UploadFolder[]>(await apiFetch(`${base}/folders`, { signal }))
+  },
+  async createFolder(input, signal) {
+    return readJson<UploadFolder>(
+      await apiFetch(`${base}/folders`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: input.name,
+          ...(input.parentId !== undefined ? { parentId: input.parentId } : {}),
+        }),
+        signal,
+      })
+    )
+  },
+  async updateFolder(id, input, signal) {
+    return readJson<UploadFolder>(
+      await apiFetch(`${base}/folders/${encodeURIComponent(id)}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ...(input.name !== undefined ? { name: input.name } : {}),
+          ...(input.parentId !== undefined ? { parentId: input.parentId } : {}),
+        }),
+        signal,
+      })
+    )
+  },
+  async deleteFolder(id, signal) {
+    // 204 with no body.
+    const res = await apiFetch(`${base}/folders/${encodeURIComponent(id)}`, { method: "DELETE", signal })
+    if (!res.ok) throw await failure(res)
+  },
+  async moveUploads(input, signal) {
+    return readJson<{ moved: number }>(
+      await apiFetch(`${base}/move`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ uploadIds: input.uploadIds, folderId: input.folderId }),
+        signal,
+      })
+    )
   },
   async get(id, signal) {
     return readJson<Upload>(await apiFetch(uploadUrl(id), { signal }))
@@ -81,18 +159,84 @@ export const uploadService: UploadService = {
     if (!res.ok) throw await failure(res, notReached)
     return (await res.json()) as CreateUploadResponse
   },
+  async createSession(input, signal) {
+    const res = await apiFetch(`${base}/sessions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ filename: input.filename, sizeBytes: input.sizeBytes }),
+      signal,
+    })
+    if (!res.ok) throw await failure(res, notReachedByPieces)
+    return (await res.json()) as UploadSession
+  },
+  async putPart(id, number, bytes, signal) {
+    // A raw body, not a form: the API counts the bytes, and a piece sent again
+    // under the same number replaces the earlier copy.
+    const res = await apiFetch(uploadUrl(id, `/parts/${number}`), {
+      method: "PUT",
+      headers: { "Content-Type": "application/octet-stream" },
+      body: bytes,
+      signal,
+    })
+    if (!res.ok) throw await failure(res, notReachedByPieces)
+    return (await res.json()) as UploadPartReceipt
+  },
+  async listParts(id, signal) {
+    return readJson<UploadParts>(await apiFetch(uploadUrl(id, "/parts"), { signal }))
+  },
+  async complete(id, signal) {
+    const res = await apiFetch(uploadUrl(id, "/complete"), { method: "POST", signal })
+    if (!res.ok) throw await failure(res, notReachedByPieces)
+    return (await res.json()) as CreateUploadResponse
+  },
   async preview(id, options, signal) {
     // A parameter that is sent must be valid (the API refuses an empty one
     // rather than detect), so only what the caller chose is sent.
     const query = new URLSearchParams()
-    const chosen: Partial<UploadParseOptions> = options ?? {}
+    const chosen: Partial<UploadParseOptions> & { table?: string } = options ?? {}
     if (chosen.encoding !== undefined) query.set("encoding", chosen.encoding)
     if (chosen.delimiter !== undefined) query.set("delimiter", chosen.delimiter)
     if (chosen.headerRow !== undefined) query.set("headerRow", String(chosen.headerRow))
     if (chosen.sheet !== undefined) query.set("sheet", chosen.sheet)
+    if (chosen.table !== undefined) query.set("table", chosen.table)
     const text = query.toString()
     return readJson<UploadPreview>(
       await apiFetch(uploadUrl(id, `/preview${text === "" ? "" : `?${text}`}`), { signal })
+    )
+  },
+  async check(id, input, signal) {
+    const options = input.options ?? {}
+    return readJson<UploadCheck>(
+      await apiFetch(uploadUrl(id, "/check"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ...(options.encoding !== undefined ? { encoding: options.encoding } : {}),
+          ...(options.delimiter !== undefined ? { delimiter: options.delimiter } : {}),
+          ...(options.headerRow !== undefined ? { headerRow: options.headerRow } : {}),
+          ...(options.sheet !== undefined ? { sheet: options.sheet } : {}),
+          columns: input.columns,
+        }),
+        signal,
+      })
+    )
+  },
+  async compare(id, input, signal) {
+    const options = input.options ?? {}
+    return readJson<UploadCompare>(
+      await apiFetch(uploadUrl(id, "/compare"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          alsoUploads: input.alsoUploads,
+          ...(options.encoding !== undefined ? { encoding: options.encoding } : {}),
+          ...(options.delimiter !== undefined ? { delimiter: options.delimiter } : {}),
+          ...(options.headerRow !== undefined ? { headerRow: options.headerRow } : {}),
+          ...(options.sheet !== undefined ? { sheet: options.sheet } : {}),
+          ...(input.columns !== undefined ? { columns: input.columns } : {}),
+        }),
+        signal,
+      })
     )
   },
   async ingest(id, input: IngestUploadInput, signal) {

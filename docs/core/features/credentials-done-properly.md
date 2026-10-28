@@ -6,7 +6,7 @@
 | Backlog | `SRC-12` |
 | Kind | Feature |
 | Spec | `docs/core/specs/src-12.md`. This page follows it row by row; anything the spec does not say is under "Beyond the spec". One *(proposed)* number, decision 4 |
-| Status | Building, in #144 (the one pull request for the rest of Phase 1). Decisions signed 2026-10-14; all three parts built and proven by their gates on 2026-10-15. Product owner's browser check on the QA instance passed on 2026-10-16 (the screens only: runs, loads, secret-manager references and OAuth sign-in were not reachable there and are proven by the CI gates) |
+| Status | Released (accepted 2026-10-23). Built in #144 (the one pull request for the rest of Phase 1). Decisions signed 2026-10-14; all three parts built and proven by their gates on 2026-10-15. Product owner's browser check on the QA instance passed on 2026-10-16 (the screens only: runs, loads, secret-manager references and OAuth sign-in were not reachable there and are proven by the CI gates) |
 | Plan | `docs/superpowers/plans/2026-10-15-src-12-credentials.md` (three parts) |
 
 ## Problem
@@ -102,8 +102,11 @@ beyond the spec. The planner's recommendation is the Default.
   accepted.
 - Vault: KV version 2, no namespaces. Azure: the public cloud. Google: a
   service-account key file or the platform identity.
-- OAuth: REST connectors only; client authentication by `client_secret_post`
-  only; a signed-in connector cannot be moved to another provider (create a
+- OAuth: REST connectors and, since `SRC-3`, the business-app connectors
+  (each vendor's sign-in, token and revoke addresses are fixed in the product, not typed);
+  client authentication by `client_secret_post`, `client_secret_basic` (a Basic header: Workday Reports,
+  NetSuite) or a JSON body (`post_json`: Zendesk, Confluence) as the vendor
+  requires, per vendor; a signed-in connector cannot be moved to another provider (create a
   new one); two runs of one connector at once can race on a provider that
   rotates refresh tokens.
 
@@ -114,21 +117,21 @@ run with the reason. Rows 1 to 4 are the spec's checklist, in its order.
 
 | # | Do this | Expect | Result |
 | --- | --- | --- | --- |
-| 1 | Spec `SRC-12-AC1`: with Vault set, reference a connector's password in Vault; test and run it; look in the credentials volume | The test and the run succeed; the volume holds no copy | |
-| 2 | Spec `SRC-12-AC2`: with no secret manager, type a credential; read its stored file without the key | The file cannot be read as the credential | |
-| 3 | Spec `SRC-12-AC3`: connect a REST source with "Sign in"; run it again after its access token has expired | One sign-in; both runs succeed | |
-| 4 | Spec `SRC-12-AC4`: as a user without `connector:manage`, reference, sign in, replace; and use a reference that does not exist | Refused; the failure shows an honest message with no manager or provider text | |
-| 5 | (operator) Start without the key | Compose refuses to start and names the variable | |
-| 6 | Replace a typed credential, then run | The run uses the new one; no copy of the old one is left | |
-| 7 | (operator) Change the key with the command; start again | Every connector still tests and runs | |
-| 8 | Remove an OAuth credential | The source's token is revoked, or the page says the source cannot revoke it | |
+| 1 | Spec `SRC-12-AC1`: with Vault set, reference a connector's password in Vault; test and run it; look in the credentials volume | The test and the run succeed; the volume holds no copy | Pass 2026-10-23 (product owner) |
+| 2 | Spec `SRC-12-AC2`: with no secret manager, type a credential; read its stored file without the key | The file cannot be read as the credential | Pass 2026-10-23 (product owner) |
+| 3 | Spec `SRC-12-AC3`: connect a REST source with "Sign in"; run it again after its access token has expired | One sign-in; both runs succeed | Pass 2026-10-23 (product owner) |
+| 4 | Spec `SRC-12-AC4`: as a user without `connector:manage`, reference, sign in, replace; and use a reference that does not exist | Refused; the failure shows an honest message with no manager or provider text | Pass 2026-10-23 (product owner) |
+| 5 | (operator) Start without the key | Compose refuses to start and names the variable | Pass 2026-10-23 (product owner) |
+| 6 | Replace a typed credential, then run | The run uses the new one; no copy of the old one is left | Pass 2026-10-23 (product owner) |
+| 7 | (operator) Change the key with the command; start again | Every connector still tests and runs | Pass 2026-10-23 (product owner) |
+| 8 | Remove an OAuth credential | The source's token is revoked, or the page says the source cannot revoke it | Pass 2026-10-23 (product owner) |
 
-**Accepted by:** __________ **Date:** ______ **Build:** ______
+**Accepted by:** product owner (held in the base) **Date:** 2026-10-23 **Build:** main 0e5498d2
 
 Exceptions, each with an owner and a date:
 
 ## After acceptance
 
 - [ ] `PRODUCT.md` section 2 and 3 updated
-- [ ] `BACKLOG.md` item moved to Released; follow-ups added
+- [x] `BACKLOG.md` item moved to Released; follow-ups added
 - [ ] `CHANGELOG.md` entry a customer can read

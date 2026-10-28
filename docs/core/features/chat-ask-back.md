@@ -47,7 +47,7 @@ Yes. The assistant asks by itself when a word is unclear. The user answers by cl
 ## Limits to tell a customer
 
 - The chat asks once. If its previous message was a question, it takes the most likely reading and says which.
-- A turn in which the chat asks holds the question and its options only; the chat does not ask after it has already run a query in that turn.
+- A turn in which the chat asks holds the question and its options only; the chat does not ask after it has already run a query in that turn. After a refused late ask the chat answers with the reading it used, without an apology and without a question in text.
 - Options are two to four, each at most 80 characters.
 - A saved word is stored per user. Another user is asked again.
 - A user keeps at most 100 saved words. The 101st is refused until one is deleted. The 30 newest go into the prompt.
@@ -58,7 +58,7 @@ Yes. The assistant asks by itself when a word is unclear. The user answers by cl
 - The data map is built to a budget of 14,000 characters. When the tables that match a question already use it, the matching tables after that point and all the one-line tables get no description. They are listed by name in the closing "more tables not described here" line.
 - With `AI_RELEVANT_TABLES` on, column statistics are queried for every table when the map is built. The built map is cached for 120 seconds, and not cached at all when a masking policy exists. With the switch off, only the tables that fit the budget are queried, as before.
 - A saved word brings the words of its meaning into the match only when the question uses it. The question is the last two user messages together. The word counts as used when every one of its words (ignoring words of fewer than 3 characters and common function words) appears in those messages, in any order, or when the word stands as a phrase in one message with no letter, digit or `_` next to it. A word made only of ignored words cannot match by its words, so it matches only when it stands as a phrase.
-- A table with a policy row filter has no sample values or ranges in the data map, so a question cannot match on them. When the policies cannot be read, no table has them.
+- A table with a policy row filter has no sample values or ranges in the data map, so a question cannot match on them. When the policies cannot be read, no table has them. The data map goes only to a user with `catalog:read`, and its sample values and ranges go only to a user who also has `query:read` (`SEC-24`).
 - `AI_ASK_BACK=false` removes the `ask_user` tool, the rules about unclear words and the saved words from the prompt. The `/api/ai/terms` routes still answer.
 - `AI_RELEVANT_TABLES=false` makes the data map write every table in full, up to the 14,000-character budget.
 - Either switch set to a value other than `true` or `false` stops the API at start. Unset or empty means on.

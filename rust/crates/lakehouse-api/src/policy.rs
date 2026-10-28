@@ -145,18 +145,43 @@ pub enum Policy {
 /// this table never needs to know about path-parameter values.
 #[rustfmt::skip]
 pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
-    // ── Public: the ONLY eight routes in the whole service. (Was "six" —
+    // ── Public: the ONLY thirteen routes in the whole service. (Was "six" —
     // corrected when the seventh was added, since Task A5's
     // `/api/auth/oidc/callback` had already made the old count stale; the
-    // eighth is `POST /api/embed/frame`, SEC-12.) ───────────────────────
+    // eighth is `POST /api/embed/frame`, SEC-12; the ninth is
+    // `POST /api/render/data`, BI-1; the tenth and the eleventh are
+    // `POST /api/embed/values` (BI-26) and
+    // `POST /api/public/dashboard/{token}/unlock` (BI-19 part A); the twelfth
+    // and the thirteenth are the public link's and the embed's map boundary
+    // route, `PR #246 review BLOCKER 1`.) ──────────────────────────────────
     ("GET",  "/health",                          Policy::Public),
     ("POST", "/api/embed/data",                   Policy::Public),
+    // BI-1 (D3): the PDF's print view has no session; its data route is
+    // authenticated by the signed render token in the body, and reads as the
+    // person the token names (never as the embed viewer role).
+    ("POST", "/api/render/data",                  Policy::Public),
     // SEC-12: the console's `proxy.ts` asks which sites may frame an embed
     // page, with the token the page was opened with. Public because the
     // token is the credential; it answers only an origin list, and the same
     // empty list for a token that is invalid.
     ("POST", "/api/embed/frame",                  Policy::Public),
+    // BI-26 (D5): the values of an editable filter's dropdown. Public because the
+    // signed token is the credential; it answers only for a column that is
+    // editable for that token, as the fixed viewer role, with the token's
+    // locked values applied.
+    ("POST", "/api/embed/values",                 Policy::Public),
     ("GET",  "/api/public/dashboard/{token}",     Policy::Public),
+    // BI-19 part A (D4): trade a public link's password for a ticket. Public
+    // because the visitor has no account; the token and the password are the
+    // credentials, five wrong tries lock the link for 15 minutes, and a locked
+    // link, a wrong password and a made-up token all fail alike.
+    ("POST", "/api/public/dashboard/{token}/unlock", Policy::Public),
+    // PR #246 review BLOCKER 1: the boundary file of a map a chart on the
+    // board draws on. Public because the token is the credential, exactly as
+    // for the board's data above: a token that is not a board, and a map no
+    // chart on that board uses, are both a 404.
+    ("GET",  "/api/public/dashboard/{token}/maps/{id}/geojson", Policy::Public),
+    ("POST", "/api/embed/maps/{id}/geojson",      Policy::Public),
     ("POST", "/api/auth/login",                   Policy::Public),
     // Redirect-only, grants nothing — it only ever
     // 302s to a fixed, config-sourced IdP URL and sets a single-use flow
@@ -216,6 +241,10 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     //    permission string, no grant migration (WS2 plan review W8). ─────
     ("GET", "/api/catalog/{id}/annotation", Policy::RequiresPermission("catalog:read")),
     ("PUT", "/api/catalog/{id}/annotation", Policy::RequiresPermission("catalog:write")),
+    // DATA-12 D1: the certified / deprecated mark is its own write, behind
+    // `governance:write`, so a `catalog:write` holder who edits the details
+    // cannot vouch for a table.
+    ("PUT", "/api/catalog/{id}/certification", Policy::RequiresPermission("governance:write")),
 
     // ── Semantic layer (AI-16): plain-words descriptions of tables and
     //    columns, read by the Copilot's DATA MAP. The same two permissions
@@ -230,6 +259,18 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     //    governance authority from `agent:approve` that decides it. ───────
     ("POST", "/api/catalog/{id}/access-request",         Policy::RequiresPermission("catalog:read")),
     ("POST", "/api/catalog/access-requests/{id}/decide", Policy::RequiresPermission("access:approve")),
+    // DATA-15 F3: grant and revoke from the asset's page. The same
+    // authority as deciding a request, and no weaker: listing shows who
+    // holds what, so it is not `catalog:read`.
+    ("GET", "/api/catalog/{id}/grants",                  Policy::RequiresPermission("access:approve")),
+    ("POST", "/api/catalog/{id}/grants",                 Policy::RequiresPermission("access:approve")),
+    ("DELETE", "/api/catalog/{id}/grants/{grant_id}",    Policy::RequiresPermission("access:approve")),
+
+    // DATA-15 F4: whether a dropped table can come back (anyone who can see
+    // the asset), and bringing it back (a governance decision, like the
+    // certification mark and unlike an edit of the details).
+    ("GET", "/api/catalog/{id}/restore",                 Policy::RequiresPermission("catalog:read")),
+    ("POST", "/api/catalog/{id}/restore",                Policy::RequiresPermission("governance:write")),
 
     // ── Lakehouse (WS2 §4): the read-only Iceberg warehouse/namespace/
     //    table surface, gated by the same seeded `catalog:read` permission
@@ -271,6 +312,15 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     //    classification, audit, residency) has the same fan-out problem as
     //    ops — auth only for that one. ────────────────────────────────────
     ("GET",  "/api/governance/lineage",   Policy::RequiresPermission("lineage:read")),
+    // DATA-13: column-level lineage reads the same records' lineage, so the
+    // same permission; charts and dashboards in the answer are listed only
+    // to `dashboard:read` inside the handler.
+    ("GET",  "/api/governance/lineage/columns", Policy::RequiresPermission("lineage:read")),
+    // BI-14 (D5, owner decision Q6): the charts that read a table, and (D1)
+    // where one chart comes from. Both read the lineage graph, so they need
+    // `lineage:read`, not `dashboard:read`: a dashboard viewer sees no lineage.
+    ("GET",  "/api/governance/lineage/used-by", Policy::RequiresPermission("lineage:read")),
+    ("GET",  "/api/dashboard/charts/{id}/lineage", Policy::RequiresPermission("lineage:read")),
     // WS3 item 17: surfaces per-connector ingest history, the same
     // audience as the base `/api/connectors` routes above.
     ("GET",  "/api/governance/ingest-runs", Policy::RequiresPermission("connector:manage")),
@@ -293,6 +343,30 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // setting one.
     ("DELETE", "/api/governance/sla/{table}", Policy::RequiresPermission("governance:write")),
     ("DELETE", "/api/governance/classification/{id}", Policy::RequiresPermission("governance:write")),
+    // DATA-12 part 2: governed tag keys. Reading the list is `catalog:read`
+    // because an editor with `catalog:write` needs it to render the value
+    // pickers and a definition is not sensitive; defining, changing and
+    // removing a key is a governance act, like a mark (decision 1).
+    ("GET",  "/api/governance/tag-keys",        Policy::RequiresPermission("catalog:read")),
+    ("POST", "/api/governance/tag-keys",        Policy::RequiresPermission("governance:write")),
+    ("PUT",  "/api/governance/tag-keys/{key}",  Policy::RequiresPermission("governance:write")),
+    ("DELETE", "/api/governance/tag-keys/{key}", Policy::RequiresPermission("governance:write")),
+    // DATA-14 (F2): quality incidents. Listing them is open to any login
+    // like the rule list; resolving one is a governance decision, like
+    // editing or deleting a rule.
+    ("GET",  "/api/governance/quality/incidents", Policy::RequiresAuth),
+    ("POST", "/api/governance/quality/incidents/{id}/resolve", Policy::RequiresPermission("governance:write")),
+    // DATA-14 (F3): per-table schedules. Reading is open to any login like
+    // the rule list; setting one changes when real checks (and their
+    // incidents and alerts) run, so it is a governance decision.
+    ("GET",  "/api/governance/quality/schedules", Policy::RequiresAuth),
+    ("PUT",  "/api/governance/quality/schedules/{asset}", Policy::RequiresPermission("governance:write")),
+    // DATA-14 (F5): a table's learned-or-learning state; open to any login
+    // like the quality list it is shown beside.
+    ("GET",  "/api/governance/quality/learning/{asset}", Policy::RequiresAuth),
+    // DATA-14 (F7): a rule's run history; the rule list it belongs to is open to
+    // any login, and the history shows what that list shows (a verdict).
+    ("GET",  "/api/governance/quality/{id}/runs", Policy::RequiresAuth),
     // Running a rule reads the table it names, so it takes what reading
     // that table takes — the same grant as the column profile.
     ("POST", "/api/governance/quality/{id}/run", Policy::RequiresPermission("query:read")),
@@ -379,12 +453,21 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("POST", "/api/pipelines/generate",               Policy::RequiresPermission("pipeline:write")),
     ("GET",  "/api/pipelines/{id}",                    Policy::RequiresPermission("pipeline:read")),
     ("PUT",  "/api/pipelines/{id}",                    Policy::RequiresPermission("pipeline:write")),
+    ("PUT",  "/api/pipelines/{id}/target-lag",         Policy::RequiresPermission("pipeline:write")),
     ("DELETE", "/api/pipelines/{id}",                  Policy::RequiresPermission("pipeline:write")),
     ("GET",  "/api/pipelines/{id}/schedule-ticks",     Policy::RequiresPermission("pipeline:read")),
     // Every tenant's authored definitions, for the orchestrator's job
     // factory. `pipeline:read` is the floor; the handler also refuses
     // anyone but a service identity (routes::authored_pipelines).
     ("GET",  "/api/pipelines/runnable",                Policy::RequiresPermission("pipeline:read")),
+    // BLD-2: the target-lag sensor's one decision-maker (plan D5). Same
+    // floor as `runnable`, and the same handler-side refusal: only the
+    // orchestrator's service identity (or a Platform Admin) may ask
+    // whether a pipeline is behind its target. `pipeline:read` rather
+    // than `pipeline:write` because a check READS state and asks for a
+    // run the orchestrator launches itself — it does not mutate the
+    // pipeline, which is what the `pipeline:write` routes are for.
+    ("POST", "/api/pipelines/runnable/{id}/lag-check", Policy::RequiresPermission("pipeline:read")),
     // BLD-1 / D3: the orchestrator posts a pipeline's `SELECT` here and
     // gets back the rewrite that pipeline's AUTHOR is allowed to run.
     // Same floor as `runnable` above (`pipeline:read`), and the same
@@ -476,6 +559,20 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("POST",   "/api/dashboard/folders",      Policy::RequiresPermission("dashboard:write")),
     ("PUT",    "/api/dashboard/folders",      Policy::RequiresPermission("dashboard:write")),
     ("DELETE", "/api/dashboard/folders",      Policy::RequiresPermission("dashboard:write")),
+    // BI-18 part C, part 2: the personal space is created on first use (writing
+    // is what makes a dashboard to put in it); history and the trash are read
+    // with the dashboard, and going back or restoring edit it, so they need the
+    // permission that edits and deletes. Favourites and recent items are the
+    // caller's own preferences, never an edit of a dashboard: `dashboard:read`.
+    ("POST",   "/api/dashboard/personal",        Policy::RequiresPermission("dashboard:write")),
+    ("GET",    "/api/dashboard/versions",        Policy::RequiresPermission("dashboard:read")),
+    ("POST",   "/api/dashboard/versions/revert", Policy::RequiresPermission("dashboard:write")),
+    ("GET",    "/api/dashboard/trash",           Policy::RequiresPermission("dashboard:read")),
+    ("POST",   "/api/dashboard/trash/restore",   Policy::RequiresPermission("dashboard:write")),
+    ("GET",    "/api/dashboard/shortcuts",       Policy::RequiresPermission("dashboard:read")),
+    ("PUT",    "/api/dashboard/favourites",      Policy::RequiresPermission("dashboard:read")),
+    ("POST",   "/api/dashboard/recent",          Policy::RequiresPermission("dashboard:read")),
+    ("GET",    "/api/dashboard/search",          Policy::RequiresPermission("dashboard:read")),
     // Dashboard SQL sources: listing is a read; authoring and previewing
     // arbitrary SQL is its own permission, separate from dashboard:write
     // (plan §1, the Metabase "native query" split).
@@ -525,10 +622,39 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // BI-16 part A (T8): the whole result of a raw table as CSV. Same
     // permission as seeing the tile; every export is audited.
     ("GET",    "/api/dashboard/table-export", Policy::RequiresPermission("dashboard:read")),
+    // BI-1 (D6): any chart's data as Excel or CSV. Same permission as seeing
+    // the tile, narrowed by the roles an administrator switched off from
+    // downloading (checked in the handler, D7); every download is audited.
+    ("GET",    "/api/dashboard/chart-export", Policy::RequiresPermission("dashboard:read")),
+    // BI-1 (D5): a dashboard as a PDF. `dashboard:read`, narrowed by the roles
+    // switched off from downloading (D7), audited before the file is sent.
+    ("GET",    "/api/dashboard/export/pdf",   Policy::RequiresPermission("dashboard:read")),
     ("GET",    "/api/dashboard/embed-info",   Policy::RequiresPermission("dashboard:read")),
+    // RPT-1 (D7): scheduled reports. `dashboard:read` gets past the gate; the
+    // handlers then require the download right to create, and the owner or an
+    // administrator (`settings:write`) to read, change, pause, send or delete.
+    ("GET",    "/api/reports/subscriptions",  Policy::RequiresPermission("dashboard:read")),
+    ("POST",   "/api/reports/subscriptions",  Policy::RequiresPermission("dashboard:read")),
+    ("GET",    "/api/reports/subscriptions/{id}", Policy::RequiresPermission("dashboard:read")),
+    ("PUT",    "/api/reports/subscriptions/{id}", Policy::RequiresPermission("dashboard:read")),
+    ("DELETE", "/api/reports/subscriptions/{id}", Policy::RequiresPermission("dashboard:read")),
+    ("POST",   "/api/reports/subscriptions/{id}/send", Policy::RequiresPermission("dashboard:read")),
+    ("GET",    "/api/reports/subscriptions/{id}/deliveries", Policy::RequiresPermission("dashboard:read")),
+    ("GET",    "/api/reports/recipients",     Policy::RequiresPermission("dashboard:read")),
     // SEC-12: withdrawing a token changes who can read the dashboard, so it
     // is a write, like the embed toggle on `PUT /api/dashboard/boards`.
     ("POST",   "/api/dashboard/embed-revoke", Policy::RequiresPermission("dashboard:write")),
+    // BI-26 (D8): which filters an embed viewer sees, changes or never sees is
+    // what a viewer may do, so it is a write (manage on the dashboard once
+    // `BI-19` part B ships, feature decision 11).
+    ("PUT",    "/api/dashboard/embed-settings", Policy::RequiresPermission("dashboard:write")),
+    // BI-19 part A (D5): making, changing and ending a dashboard's public link
+    // changes who can read it, so all three are writes (reading its state is
+    // too: the response carries the link's token). Part B of the plan moves
+    // these to "manage on the dashboard" with a handler check.
+    ("GET",    "/api/dashboard/public-link",  Policy::RequiresPermission("dashboard:write")),
+    ("PUT",    "/api/dashboard/public-link",  Policy::RequiresPermission("dashboard:write")),
+    ("DELETE", "/api/dashboard/public-link",  Policy::RequiresPermission("dashboard:write")),
 
     // ── Reporting settings (`BI-9`, `routes::settings`). Reading is auth-only:
     //    the console needs the zone and the first day to label every date
@@ -540,6 +666,12 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     //    `settings_write_needs_no_seed_change_and_no_seeded_role_has_it`. ────
     ("GET",    "/api/settings/reporting",     Policy::RequiresAuth),
     ("PUT",    "/api/settings/reporting",     Policy::RequiresPermission("settings:write")),
+    // ── Query limits (`BI-5`, `routes::query_limits`): anyone signed in reads
+    //    the limits that apply to them; changing them is `settings:write`. ──
+    ("GET",    "/api/settings/limits",        Policy::RequiresAuth),
+    // Stop: any login, because the route only ever ends the caller's own run.
+    ("POST",   "/api/query/cancel",           Policy::RequiresAuth),
+    ("PUT",    "/api/settings/limits",        Policy::RequiresPermission("settings:write")),
 
     // ── Agent / AI: no seeded resource for free-form ask/chat — auth only.
     ("POST", "/api/ai/chat",             Policy::RequiresAuth),
@@ -748,6 +880,31 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("DELETE", "/api/uploads/{id}",          Policy::RequiresPermission("connector:manage")),
     ("GET",  "/api/uploads/{id}/preview",    Policy::RequiresPermission("connector:manage")),
     ("POST", "/api/uploads/{id}/ingest",     Policy::RequiresPermission("connector:manage")),
+    // DATA-18: the values of the sample that do not fit a column list.
+    ("POST", "/api/uploads/{id}/check",      Policy::RequiresPermission("connector:manage")),
+    ("POST", "/api/uploads/{id}/compare",    Policy::RequiresPermission("connector:manage")),
+    // DATA-17: chunked upload. The session route belongs to no upload yet;
+    // the three `{id}` routes also answer 404 outside the caller's tenants.
+    ("POST", "/api/uploads/sessions",        Policy::RequiresPermission("connector:manage")),
+    ("PUT",  "/api/uploads/{id}/parts/{n}",  Policy::RequiresPermission("connector:manage")),
+    ("GET",  "/api/uploads/{id}/parts",      Policy::RequiresPermission("connector:manage")),
+    ("POST", "/api/uploads/{id}/complete",   Policy::RequiresPermission("connector:manage")),
+    // DATA-35 decision 4: folders for uploaded files, the same permission as the
+    // uploads they group. Tenant scope is the store's (`upload_folders`, SEC-16).
+    ("GET",  "/api/uploads/folders",         Policy::RequiresPermission("connector:manage")),
+    ("POST", "/api/uploads/folders",         Policy::RequiresPermission("connector:manage")),
+    ("PATCH", "/api/uploads/folders/{id}",   Policy::RequiresPermission("connector:manage")),
+    ("DELETE", "/api/uploads/folders/{id}",  Policy::RequiresPermission("connector:manage")),
+    ("POST", "/api/uploads/move",            Policy::RequiresPermission("connector:manage")),
+
+    // ── Uploaded maps (`BI-16` part C2b, plan D5): a map is visible to
+    //    everyone who can make charts, so reading is `RequiresAuth`; only
+    //    `settings:write` uploads, renames or deletes one. ──────────────────
+    ("GET",  "/api/maps",                    Policy::RequiresAuth),
+    ("POST", "/api/maps",                    Policy::RequiresPermission("settings:write")),
+    ("GET",  "/api/maps/{id}/geojson",       Policy::RequiresAuth),
+    ("PATCH", "/api/maps/{id}",              Policy::RequiresPermission("settings:write")),
+    ("DELETE", "/api/maps/{id}",             Policy::RequiresPermission("settings:write")),
 
     // ── Knowledge: no seeded resource — auth only. ───────────────────────
     ("GET",  "/api/knowledge/sources",       Policy::RequiresAuth),
@@ -897,6 +1054,125 @@ pub async fn auth_gate(
 mod tests {
     use super::*;
 
+    /// `DATA-12` D1: the certified / deprecated mark is gated by
+    /// `governance:write`, not by the `catalog:write` of the details.
+    #[test]
+    fn the_certification_write_needs_governance_write() {
+        assert_eq!(
+            policy_for("PUT", "/api/catalog/{id}/certification"),
+            Some(Policy::RequiresPermission("governance:write"))
+        );
+    }
+
+    /// `DATA-13`: column-level lineage needs `lineage:read`, like the table
+    /// graph, and the route is classified (an unclassified route is a 500).
+    #[test]
+    fn column_lineage_needs_lineage_read() {
+        assert_eq!(
+            policy_for("GET", "/api/governance/lineage/columns"),
+            Some(Policy::RequiresPermission("lineage:read"))
+        );
+    }
+
+    /// `DATA-15` F4: the restore status is `catalog:read`; undropping a table
+    /// is `governance:write`.
+    #[test]
+    fn restore_status_needs_catalog_read_and_the_undrop_needs_governance_write() {
+        assert_eq!(
+            policy_for("GET", "/api/catalog/{id}/restore"),
+            Some(Policy::RequiresPermission("catalog:read"))
+        );
+        assert_eq!(
+            policy_for("POST", "/api/catalog/{id}/restore"),
+            Some(Policy::RequiresPermission("governance:write"))
+        );
+    }
+
+    /// `DATA-15` F3: listing, making and ending a grant from an asset's page
+    /// all need `access:approve`, the authority that decides a request.
+    #[test]
+    fn the_grant_routes_need_access_approve() {
+        for (method, path) in [
+            ("GET", "/api/catalog/{id}/grants"),
+            ("POST", "/api/catalog/{id}/grants"),
+            ("DELETE", "/api/catalog/{id}/grants/{grant_id}"),
+        ] {
+            assert_eq!(
+                policy_for(method, path),
+                Some(Policy::RequiresPermission("access:approve")),
+                "{method} {path}"
+            );
+        }
+    }
+
+    /// `DATA-12` part 2: reading the tag-key list is `catalog:read` (editors
+    /// need it to render pickers); defining, changing and removing a key is
+    /// `governance:write`, and nothing under `tag-keys` is left unclassified.
+    #[test]
+    fn tag_key_reads_need_catalog_read_and_writes_need_governance_write() {
+        assert_eq!(
+            policy_for("GET", "/api/governance/tag-keys"),
+            Some(Policy::RequiresPermission("catalog:read"))
+        );
+        for (method, path) in [
+            ("POST", "/api/governance/tag-keys"),
+            ("PUT", "/api/governance/tag-keys/{key}"),
+            ("DELETE", "/api/governance/tag-keys/{key}"),
+        ] {
+            assert_eq!(
+                policy_for(method, path),
+                Some(Policy::RequiresPermission("governance:write")),
+                "{method} {path}"
+            );
+        }
+    }
+
+    /// `DATA-14` (F2): listing quality incidents needs only a login, like the
+    /// quality list; resolving one needs `governance:write`.
+    #[test]
+    fn quality_incidents_are_listed_by_any_login_and_resolved_with_governance_write() {
+        assert_eq!(
+            policy_for("GET", "/api/governance/quality/incidents"),
+            Some(Policy::RequiresAuth)
+        );
+        assert_eq!(
+            policy_for("POST", "/api/governance/quality/incidents/{id}/resolve"),
+            Some(Policy::RequiresPermission("governance:write"))
+        );
+    }
+
+    /// `DATA-14` (F3): reading schedules needs only a login; setting one needs
+    /// `governance:write`.
+    #[test]
+    fn quality_schedules_are_read_by_any_login_and_set_with_governance_write() {
+        assert_eq!(
+            policy_for("GET", "/api/governance/quality/schedules"),
+            Some(Policy::RequiresAuth)
+        );
+        assert_eq!(
+            policy_for("PUT", "/api/governance/quality/schedules/{asset}"),
+            Some(Policy::RequiresPermission("governance:write"))
+        );
+    }
+
+    /// `DATA-14` (F7): a rule's run history is readable by any login.
+    #[test]
+    fn a_rules_run_history_is_readable_by_any_login() {
+        assert_eq!(
+            policy_for("GET", "/api/governance/quality/{id}/runs"),
+            Some(Policy::RequiresAuth)
+        );
+    }
+
+    /// `DATA-14` (F5): the learning state is readable by any login.
+    #[test]
+    fn the_learning_state_is_readable_by_any_login() {
+        assert_eq!(
+            policy_for("GET", "/api/governance/quality/learning/{asset}"),
+            Some(Policy::RequiresAuth)
+        );
+    }
+
     #[test]
     fn health_is_public() {
         assert_eq!(policy_for("GET", "/health"), Some(Policy::Public));
@@ -921,7 +1197,7 @@ mod tests {
     }
 
     #[test]
-    fn exactly_eight_public_entries_exist() {
+    fn exactly_thirteen_public_entries_exist() {
         // Pre-existing drift found while landing the `/api/auth/providers`
         // route: this assertion was still pinned at 4 even though the two
         // earlier OIDC public routes (`/api/auth/oidc/start`,
@@ -936,7 +1212,15 @@ mod tests {
             .filter(|(_, _, policy)| *policy == Policy::Public)
             .count();
         // SEC-12 added `POST /api/embed/frame`: 7 -> 8.
-        assert_eq!(public_count, 8);
+        // BI-1 (D3) added `POST /api/render/data`, the PDF print view's data
+        // route, authenticated by its signed render token: 8 -> 9.
+        // BI-19 part A (D4) added `POST /api/public/dashboard/{token}/unlock`,
+        // where a public link's password is traded for a ticket: 9 -> 10.
+        // BI-26 (D5) added `POST /api/embed/values`, the dropdown of an
+        // editable embed filter, authenticated by the signed token: 10 -> 11.
+        // PR #246 review BLOCKER 1 added the public link's and the embed's
+        // map boundary route, each authenticated by its own token: 11 -> 13.
+        assert_eq!(public_count, 13);
     }
 
     /// SEC-23 (F1): adding a governance rule needs `governance:write`, the

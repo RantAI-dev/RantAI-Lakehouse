@@ -6,12 +6,15 @@ import { useRouter } from "next/navigation";
 import { usePathname } from "next/navigation";
 import { useTheme } from "next-themes";
 import {
-  Search, Sparkles, BarChart3, LayoutGrid, Plus, Download, Moon, Sun, Clock, Database,
+  Search, Sparkles, BarChart3, LayoutGrid, Plus, Download, Moon, Sun, Clock, Database, Star,
 } from "lucide-react";
 import { NAV_GROUPS, pageTitleFor } from "@/components/app-shell/nav-config";
-import { assetService } from "@/services";
+import { CertificationBadge } from "@/components/patterns/status-badge";
+import { assetService, dashboardService } from "@/services";
 import { isServiceError } from "@/services/errors";
 import type { Asset } from "@/services/contracts/assets";
+import type { ShortcutItem } from "@/services/contracts/dashboards";
+import { itemHref } from "@/lib/dashboard-organise";
 import { capPaletteAssetResults, matchedOnLabel } from "@/lib/palette-search";
 
 /** Debounce, in ms, before a typed search term reaches `assetService`
@@ -67,6 +70,17 @@ export function CommandPalette() {
   // The line to show for it: a refusal, a `supported: false` reason, or the
   // outage text (DATA-11 review SHOULD-FIX 4). Null when the search worked.
   const [searchFailed, setSearchFailed] = React.useState<string | null>(null);
+  // BI-18 part C, part 2: dashboards and charts by name for a typed term; the
+  // caller's favourites and recent dashboards when nothing is typed.
+  const [dashHits, setDashHits] = React.useState<ShortcutItem[]>([]);
+  const [dashFavourites, setDashFavourites] = React.useState<ShortcutItem[]>([]);
+  const [dashRecent, setDashRecent] = React.useState<ShortcutItem[]>([]);
+  const [dashFailed, setDashFailed] = React.useState(false);
+  // BI-18 part C review fix (SHOULD-FIX) R12: the two server searches are
+  // answering. "No results." is only said once both have answered and every
+  // group, local and server, is empty; until then it says "Searching…".
+  const [assetsPending, setAssetsPending] = React.useState(false);
+  const [dashPending, setDashPending] = React.useState(false);
   const router = useRouter();
   const pathname = usePathname();
   const { resolvedTheme, setTheme } = useTheme();
@@ -85,8 +99,10 @@ export function CommandPalette() {
     if (!term) {
       setAssetResults([]);
       setSearchFailed(null);
+      setAssetsPending(false);
       return;
     }
+    setAssetsPending(true);
     let cancelled = false;
     const controller = new AbortController();
     const timer = setTimeout(() => {
@@ -96,11 +112,13 @@ export function CommandPalette() {
           if (cancelled) return;
           setSearchFailed(null);
           setAssetResults(capPaletteAssetResults(assets));
+          setAssetsPending(false);
         })
         .catch((err: unknown) => {
           if (cancelled) return;
           setAssetResults([]);
           setSearchFailed(failureLine(err));
+          setAssetsPending(false);
         });
     }, CATALOG_SEARCH_DEBOUNCE_MS);
     return () => {
@@ -109,6 +127,47 @@ export function CommandPalette() {
       controller.abort();
     };
   }, [search]);
+
+  // Dashboards and charts, by name (BI-18 part C, part 2). The server decides
+  // who may see what, so a private draft or a deleted item is never in the
+  // answer; a caller without `dashboard:read` gets a refusal and sees no group.
+  // Debounced like the catalog search, and abortable for the same reason.
+  React.useEffect(() => {
+    if (!open) return;
+    const term = search.trim();
+    let cancelled = false;
+    const controller = new AbortController();
+    setDashPending(Boolean(term));
+    const timer = setTimeout(() => {
+      const work = term
+        ? dashboardService.searchItems(term, controller.signal).then((hits) => ({ hits, favourites: [] as ShortcutItem[], recent: [] as ShortcutItem[] }))
+        : dashboardService.shortcuts(controller.signal).then((s) => ({ hits: [] as ShortcutItem[], ...s }));
+      work
+        .then((found) => {
+          if (cancelled) return;
+          setDashFailed(false);
+          setDashHits(found.hits.slice(0, 8));
+          setDashFavourites(found.favourites.slice(0, 5));
+          // A favourite is not listed again under Recent (as on the dashboard list).
+          const starred = new Set(found.favourites.map((f) => `${f.kind}:${f.id}`));
+          setDashRecent(found.recent.filter((r) => !starred.has(`${r.kind}:${r.id}`)).slice(0, 5));
+          setDashPending(false);
+        })
+        .catch((err: unknown) => {
+          if (cancelled) return;
+          setDashHits([]);
+          setDashFavourites([]);
+          setDashRecent([]);
+          setDashFailed(!(isServiceError(err) && err.code === "permission_denied"));
+          setDashPending(false);
+        });
+    }, CATALOG_SEARCH_DEBOUNCE_MS);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+      controller.abort();
+    };
+  }, [open, search]);
 
   // Open via ⌘K / Ctrl+K, and via an event from the navbar search box.
   React.useEffect(() => {
@@ -158,7 +217,7 @@ export function CommandPalette() {
         <Search className="size-4 shrink-0 text-muted-foreground" />
         <Command.Input
           autoFocus
-          placeholder="Search pages, actions, or catalog assets…"
+          placeholder="Search pages, actions, dashboards or catalog assets…"
           className="h-11 w-full bg-transparent text-sm outline-none placeholder:text-muted-foreground"
           value={search}
           onValueChange={setSearch}
@@ -169,7 +228,10 @@ export function CommandPalette() {
       <Command.List className="max-h-[54vh] overflow-y-auto p-1.5">
         {/* Not while the server has results: they are force-mounted, so
             cmdk's own count would say "No results." under them. */}
-        {assetResults.length === 0 ? (
+        {search.trim() && (assetsPending || dashPending) ? (
+          <div className="px-3 py-2 text-sm text-muted-foreground">Searching…</div>
+        ) : null}
+        {assetResults.length === 0 && dashHits.length === 0 && !assetsPending && !dashPending ? (
           <Command.Empty className="px-3 py-6 text-center text-sm text-muted-foreground">
             No results.
           </Command.Empty>
@@ -178,6 +240,43 @@ export function CommandPalette() {
           <div role="alert" className="px-3 py-2 text-sm text-muted-foreground">
             {searchFailed}
           </div>
+        ) : null}
+        {dashFailed && search.trim() ? (
+          <div role="alert" className="px-3 py-2 text-sm text-muted-foreground">
+            Dashboard search is unavailable
+          </div>
+        ) : null}
+
+        {/* Dashboards and charts by name. forceMount: the server already
+            decided these match, so cmdk's own filter must not hide them. */}
+        {dashHits.length ? (
+          <Command.Group forceMount heading="Dashboards and charts" className="[&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1 [&_[cmdk-group-heading]]:text-[11px] [&_[cmdk-group-heading]]:font-medium [&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-wide [&_[cmdk-group-heading]]:text-muted-foreground">
+            {dashHits.map((h) => (
+              <PaletteItem
+                key={`${h.kind}:${h.id}`}
+                forceMount
+                icon={h.kind === "board" ? LayoutGrid : BarChart3}
+                label={h.name}
+                detail={h.kind === "chart" && h.boardName ? `on ${h.boardName}` : null}
+                value={`dashitem ${h.kind} ${h.id} ${h.name}`}
+                onSelect={() => go(itemHref(h))}
+              />
+            ))}
+          </Command.Group>
+        ) : null}
+        {!search.trim() && dashFavourites.length ? (
+          <Command.Group heading="Favourites" className="[&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1 [&_[cmdk-group-heading]]:text-[11px] [&_[cmdk-group-heading]]:font-medium [&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-wide [&_[cmdk-group-heading]]:text-muted-foreground">
+            {dashFavourites.map((h) => (
+              <PaletteItem key={`${h.kind}:${h.id}`} icon={Star} label={h.name} detail={h.kind === "chart" && h.boardName ? `on ${h.boardName}` : null} value={`favourite ${h.kind} ${h.id} ${h.name}`} onSelect={() => go(itemHref(h))} />
+            ))}
+          </Command.Group>
+        ) : null}
+        {!search.trim() && dashRecent.length ? (
+          <Command.Group heading="Recent dashboards" className="[&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1 [&_[cmdk-group-heading]]:text-[11px] [&_[cmdk-group-heading]]:font-medium [&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-wide [&_[cmdk-group-heading]]:text-muted-foreground">
+            {dashRecent.map((h) => (
+              <PaletteItem key={`${h.kind}:${h.id}`} icon={Clock} label={h.name} detail={h.kind === "chart" && h.boardName ? `on ${h.boardName}` : null} value={`recent dashboard ${h.kind} ${h.id} ${h.name}`} onSelect={() => go(itemHref(h))} />
+            ))}
+          </Command.Group>
         ) : null}
 
         {/* Quick actions */}
@@ -222,6 +321,7 @@ export function CommandPalette() {
                 forceMount
                 icon={Database}
                 label={a.name}
+                badge={<CertificationBadge certification={a.certification} />}
                 detail={matchedOnLabel(a.matchedOn)}
                 value={`asset ${a.id} ${a.name}`}
                 onSelect={() => go(`/data/assets/${a.id}`)}
@@ -255,10 +355,12 @@ export function CommandPalette() {
 }
 
 function PaletteItem({
-  icon: Icon, label, detail, value, forceMount, onSelect,
+  icon: Icon, label, badge, detail, value, forceMount, onSelect,
 }: {
   icon: React.ComponentType<{ className?: string }>;
   label: string;
+  /** Shown after the label (a certified / deprecated mark). */
+  badge?: React.ReactNode;
   /** A second, smaller line under the label. */
   detail?: string | null;
   value: string;
@@ -274,7 +376,10 @@ function PaletteItem({
     >
       <Icon className="size-4 shrink-0 text-muted-foreground" />
       <span className="min-w-0 flex-1">
-        <span className="block truncate">{label}</span>
+        <span className="flex items-center gap-1.5">
+          <span className="truncate">{label}</span>
+          {badge}
+        </span>
         {detail ? <span className="block truncate text-xs text-muted-foreground">{detail}</span> : null}
       </span>
     </Command.Item>

@@ -8,31 +8,42 @@ import { ErrorWithReference } from "@/components/error-reference";
 import type { TileFailure } from "@/services/contracts/dashboards";
 import { MiniMarkdown } from "@/features/copilot/mini-markdown";
 import { EChart } from "./echart";
-import { buildOption, fmtInt, withReferenceLines } from "./chart-option";
+import { buildOption, clusterNote, fmtInt, forecastNote, withReferenceLines } from "./chart-option";
 import { buildCombinedOption, cutLayers, failedLayers } from "./combined-option";
 import { takesLayers, type LayerDef } from "@/lib/chart-layers";
 import { GeoChart } from "./geo-chart";
+import type { MapLoader } from "./echarts-maps";
 import { useReporting } from "./reporting-context";
 import { KpiCard } from "./kpi-card";
 import { PivotTable } from "./pivot-table";
 import { RawTable } from "./raw-table";
-import { cellClass, CellValue, columnStyle } from "./table-cell";
+import { cellClass, CellValue, columnStyle, conditionalCss } from "./table-cell";
+import { domainsOf } from "@/lib/conditional-format";
+import { decimalsFor } from "@/lib/chart-axis";
+import type { StyleFields } from "@/lib/chart-style";
+import { formatAxisValue, formatValue, withMetricFormats } from "@/lib/value-format";
+import { styleOption, seriesColumns } from "./style-option";
 import type { ColumnSetting, TableDefFields } from "@/lib/table-types";
 import type { FilterDef } from "@/services/clients/bi-store";
 import { bucketLabel, calendarFirstDay, isGrain } from "@/lib/time-grain";
 import { binsOfTile, relabelBins } from "@/lib/chart-bins";
 import { labelOtherRows, tileMeasureLabels, visibleColumns, withResolvedSlots, type ShapeDefFields } from "@/lib/chart-shape";
 import type { Rows } from "./tile-dialogs";
+import { HISTOGRAM_ROW_CAP, MAX_BULLETS, type TypeDefFields } from "@/lib/type-b";
+import { ProgressCard } from "./progress-card";
+import { ImageCard, WebCard } from "./content-cards";
+import { bulletOption, histogramOption } from "./type-b-option";
+import { ganttOption } from "./gantt-option";
+import { resolvePalette } from "@/lib/chart-palettes";
+import { limitSentence } from "@/lib/query-limits";
+import { dataFromLabel } from "@/lib/result-cache";
 
 type Cell = Rows | TileFailure;
 function hasRows(c: Cell | undefined): c is Rows {
   return !!c && "rows" in c;
 }
 
-/** Render a tile's body per its kind: text / kpi / table / chart. */
-export function TileBody({
-  spec, cell, dark, loading, onDataClick, hideLegend, paging, onTableSort,
-}: {
+type TileBodyProps = {
   spec: ChartRenderSpec & { text?: string; caption?: string };
   cell: Cell | undefined;
   dark: boolean;
@@ -53,11 +64,43 @@ export function TileBody({
   paging?: { filters: FilterDef[] };
   /** A raw table reports the sort the viewer chose (for the whole-result export). */
   onTableSort?: (sort: { column: string; dir: "asc" | "desc" }) => void;
-}) {
+  /**
+   * How an uploaded map's boundary file is read. Absent (the signed-in
+   * console): the map's own route through `apiFetch`. A public link and an
+   * embed pass their own token-based loader, so an anonymous viewer is never
+   * sent to the login page (`PR #246 review BLOCKER 1`).
+   */
+  loadMap?: MapLoader;
+};
+
+/**
+ * Render a tile's body per its kind: text / kpi / table / chart. A tile cut at
+ * the row limit says so under itself, with the limit that cut it (`BI-5`
+ * feature decision 5): the same sentence for every kind, so no kind has to
+ * remember to.
+ */
+export function TileBody(props: TileBodyProps) {
+  const reporting = useReporting();
+  const cut = hasRows(props.cell) && props.cell.limitHit?.kind === "rows" ? limitSentence(props.cell.limitHit) : null;
+  // BI-4 part B (feature decision 5): "Data from 10:42", and "remembered" when it came from memory.
+  const from = hasRows(props.cell) ? dataFromLabel(props.cell.computedAt, reporting.timeZone, props.cell.remembered) : null;
+  if (!cut && !from) return <TileBodyOf {...props} />;
+  return (
+    <div className="flex h-full min-h-0 flex-col">
+      <div className="min-h-0 flex-1"><TileBodyOf {...props} /></div>
+      {cut ? <p className="px-1 pt-1 text-[11px] text-muted-foreground">{cut}</p> : null}
+      {from ? <p className="px-1 pt-1 text-[11px] text-muted-foreground" data-slot="data-from">{from}</p> : null}
+    </div>
+  );
+}
+
+function TileBodyOf({
+  spec, cell, dark, loading, onDataClick, hideLegend, paging, onTableSort, loadMap,
+}: TileBodyProps) {
   const reporting = useReporting();
   // `def` is the stored definition (typed `unknown` on the shared spec): the
   // fields of raw tables, pivots and KPI comparisons are read from it (BI-16 part A).
-  const def = withResolvedSlots(spec.def as (TableDefFields & ShapeDefFields) | undefined, spec.resolved);
+  const def = withResolvedSlots(spec.def as (TableDefFields & ShapeDefFields & StyleFields & TypeDefFields) | undefined, spec.resolved);
   // BI-6: "avg of stay" for a measure with its own aggregate, or one that takes the chart's (phase 2 QA R7).
   const measureLabels = tileMeasureLabels(def?.measures, spec.y, def?.steps, hasRows(cell) ? cell.metricLabels : undefined, def?.aggregate);
   // BI-10: a binned grouping arrives as the bin's lower edge; the tile says "500 – 1,000".
@@ -65,7 +108,14 @@ export function TileBody({
   if (spec.kind === "text") {
     return <div className="h-full overflow-auto px-1 py-0.5 text-sm leading-relaxed"><MiniMarkdown text={spec.text ?? ""} /></div>;
   }
+  // BI-16 part B: an image and a web page are static like a note: no rows, no failure of a statement.
+  if (spec.kind === "image") return <ImageCard def={def} title={spec.title} />;
+  if (spec.kind === "web") return <WebCard def={def} title={spec.title} />;
   if (cell && "error" in cell) {
+    // BI-5 (feature decision 5): a tile the time limit ended says the limit, not the engine's error.
+    if (cell.limit?.kind === "time") {
+      return <p role="status" className="grid h-full place-items-center px-2 text-center text-xs text-muted-foreground">{limitSentence(cell.limit)}</p>;
+    }
     return (
       <p className="grid h-full place-items-center px-2 text-center text-xs text-destructive">
         <ErrorWithReference message={cell.error} errorId={cell.errorId} />
@@ -79,12 +129,30 @@ export function TileBody({
   }
   if (spec.kind === "kpi") {
     const v = hasRows(cell) ? Number(cell.rows[0]?.v ?? 0) : null;
+    const kpiFormat = def?.format ?? (hasRows(cell) ? withMetricFormats(undefined, cell.metricFormats)?.valueFormats?.[Object.keys(cell.metricFormats ?? {})[0] ?? ""] : undefined);
+    // BI-17: the KPI's number format, and the colour a rule gives its value ("green above the goal").
+    const paint = v === null ? undefined : conditionalCss(def?.conditional, null, v);
     return (
       <div className="grid h-full place-content-center px-2 text-center">
-        <p className="text-4xl font-semibold tabular-nums text-foreground">{v === null ? "—" : fmtInt(v)}</p>
+        <p className="text-4xl font-semibold tabular-nums text-foreground" style={paint && { color: paint.color, backgroundColor: paint.backgroundColor }}>{v === null ? "—" : kpiFormat ? formatValue(v, kpiFormat, reporting.numberLocale, decimalsFor([v])) : fmtInt(v)}</p>
         {spec.caption ? <p className="mt-1 text-xs text-muted-foreground">{spec.caption}</p> : null}
       </div>
     );
+  }
+
+  if (spec.kind === "progress" || spec.kind === "histogram" || spec.kind === "bullet") {
+    if (!hasRows(cell) || (cell.rows.length === 0 && spec.kind !== "progress")) {
+      return <p className="grid h-full place-items-center text-xs text-muted-foreground">No data.</p>;
+    }
+    return <TypeBBody spec={spec} cell={cell} def={def} bins={bins} measureLabels={measureLabels} dark={dark} />;
+  }
+
+  // BI-16 part C1 (plan D3): the Gantt chart draws its own rows (task, group, start, end, progress), not the category shape of the charts below.
+  if (spec.kind === "gantt") {
+    if (!hasRows(cell) || (cell.rows.length === 0 && !cell.reversedRows)) {
+      return <p className="grid h-full place-items-center text-xs text-muted-foreground">No data.</p>;
+    }
+    return <GanttBody cell={cell} def={def} dark={dark} onDataClick={onDataClick} />;
   }
 
   if (spec.kind === "table") {
@@ -94,7 +162,7 @@ export function TileBody({
     if (def?.tableMode === "rows") {
       return <RawTable spec={{ mart: spec.mart, sqlSource: spec.sqlSource, title: spec.title, def, chart: spec.source !== "builtin" && (def?.filters?.length || def?.joins?.length) ? spec.id : undefined }} cell={cell} paging={paging} onSortChange={onTableSort} />;
     }
-    return <TableView columns={cell.columns} rows={relabelBins(cell.rows, bins)} settings={def?.columnSettings} labels={measureLabels} />;
+    return <TableView columns={cell.columns} rows={relabelBins(cell.rows, bins)} settings={def?.columnSettings} labels={measureLabels} style={withMetricFormats(def, cell.metricFormats)} />;
   }
 
   if (spec.kind === "pivot") {
@@ -109,7 +177,7 @@ export function TileBody({
     if (!hasRows(cell) || cell.rows.length === 0) {
       return <p className="grid h-full place-items-center text-xs text-muted-foreground">No data.</p>;
     }
-    return <GeoChart spec={spec} rows={cell.rows} dark={dark} onDataClick={onDataClick} />;
+    return <GeoChart spec={spec} rows={cell.rows} dark={dark} onDataClick={onDataClick} format={def?.format} locale={reporting.numberLocale} byValue={def?.colors?.byValue} loadMap={loadMap} />;
   }
 
   // BI-13: a chart with more questions on it draws all of them on one axis.
@@ -130,17 +198,166 @@ export function TileBody({
     // BI-6: the computed "Other" group is drawn last and is never a value to
     // click; a real value that is also called "Other" stays apart from it.
     const { rows, otherLabels } = labelOtherRows(bucketed, spec.x);
-    // BI-11: the reference lines, at the values this read gave them.
-    const option = withReferenceLines(
-      buildOption({ ...spec, measureLabels }, rows, dark, { firstDay: calendarFirstDay(reporting.weekStart) }),
-      cell.referenceLines, spec.kind === "hbar", dark,
-    );
-    return (
+    // BI-17: formats, palette, axes, labels and notes; BI-11/BI-17: the reference lines, at the values this read gave them.
+    const locale = reporting.numberLocale ?? "en-US";
+    const style = withMetricFormats(def as StyleFields | undefined, cell.metricFormats);
+    const yCols = Array.isArray(spec.y) ? spec.y : [spec.y];
+    const decimals = decimalsFor(rows.flatMap((r) => yCols.map((c) => Number(r[c] ?? 0))));
+    const built = buildOption({ ...spec, measureLabels }, rows, dark, { firstDay: calendarFirstDay(reporting.weekStart), style, locale, companyPalette: reporting.companyPalette });
+    // The result column each series draws, in series order: a computed
+    // reference line is drawn on the axis of the measure it describes
+    // (`PR #199 review M BLOCKER 4`, decision M2).
+    const cols = seriesColumns({ kind: spec.kind, y: spec.y, breakdown: !!spec.series }, (built.series as unknown[] | undefined)?.length ?? 0);
+    const styled = styleOption(built, { kind: spec.kind, y: spec.y, breakdown: !!spec.series, style, locale, decimals, columns: cols, referenceLines: cell.referenceLines, measureLabels });
+    if (styled.message) {
+      return <p role="status" className="grid h-full place-items-center px-3 text-center text-xs text-muted-foreground">{styled.message}.</p>;
+    }
+    const fmtOf = (column?: string) => style?.valueFormats?.[column ?? yCols[0] ?? ""] ?? style?.format;
+    const lineCtx = {
+      values: (measure?: string) => rows.map((r) => Number(r[measure ?? yCols[0] ?? ""] ?? 0)),
+      format: (measure: string | undefined, v: number) => formatValue(v, fmtOf(measure), locale, decimals),
+      cutOff: !!cell.truncated,
+      // BI-17 part B: a forecast finds the periods ahead from the raw buckets and the report zone.
+      buckets: { grain, raw: rawRows.map((r) => r[spec.x]), timeZone: reporting.timeZone, breakdown: !!spec.series },
+    };
+    const option = withReferenceLines(styled.option, cell.referenceLines, spec.kind === "hbar", dark, lineCtx, cols);
+    // BI-17 part B: what the chart says under itself about a forecast or about clusters.
+    const forecastSentence = forecastNote(cell.referenceLines, lineCtx, spec.kind === "hbar") ?? clusterNote(spec, rows, style);
+    const chart = (
       <EChart option={hideLegend ? { ...option, legend: { show: false } } : option} height="100%"
         onDataClick={onDataClick ? (hit, pos) => onDataClick(hit, pos, { rows: rawRows, labelledRows: rows, grain: grain ?? undefined, otherLabels, bin: bins[spec.x] }) : undefined} />
     );
+    if (!styled.hiddenNotes && !forecastSentence) return chart;
+    return (
+      <div className="flex h-full min-h-0 flex-col">
+        <div className="min-h-0 flex-1">{chart}</div>
+        {styled.hiddenNotes ? (
+          <p className="px-1 pt-1 text-[11px] text-muted-foreground">
+            {styled.hiddenNotes} {styled.hiddenNotes === 1 ? "note" : "notes"} not shown: {styled.hiddenNotes === 1 ? "its point is" : "their points are"} not in the result
+          </p>
+        ) : null}
+        {forecastSentence ? <p className="px-1 pt-1 text-[11px] text-muted-foreground">{forecastSentence}</p> : null}
+      </div>
+    );
   }
   return <p className="grid h-full place-items-center text-xs text-muted-foreground">No data.</p>;
+}
+
+/**
+ * The progress bar, the histogram and the bullet graph (`BI-16` part B). They
+ * take the dashboard's filters like any chart and the number formats of
+ * `BI-17`: the value's own format, else the chart's, else the metric's.
+ */
+function TypeBBody({
+  spec, cell, def, bins, measureLabels, dark,
+}: {
+  spec: ChartRenderSpec & { caption?: string };
+  cell: Rows;
+  def: (TableDefFields & ShapeDefFields & StyleFields & TypeDefFields) | undefined;
+  bins: ReturnType<typeof binsOfTile>;
+  measureLabels: Record<string, string>;
+  dark: boolean;
+}) {
+  const reporting = useReporting();
+  const locale = reporting.numberLocale ?? "en-US";
+  const style = withMetricFormats(def, cell.metricFormats);
+  const yCols = Array.isArray(spec.y) ? spec.y : [spec.y];
+  const fmtOf = (column?: string) => style?.valueFormats?.[column ?? ""] ?? style?.format;
+  if (spec.kind === "progress") {
+    const metricFormat = fmtOf(yCols[0]) ?? (cell.metricFormats ? withMetricFormats(undefined, cell.metricFormats)?.valueFormats?.[Object.keys(cell.metricFormats)[0] ?? ""] : undefined);
+    return <ProgressCard def={def ?? {}} cell={cell} format={metricFormat} caption={spec.caption} />;
+  }
+  const color = resolvePalette(def?.colors, reporting.companyPalette)[0];
+  if (spec.kind === "histogram") {
+    const countColumn = yCols[0] ?? "";
+    const counts = cell.rows.map((r) => Number(r[countColumn] ?? 0));
+    const decimals = decimalsFor(counts);
+    const drawn = histogramOption({
+      rows: cell.rows, column: spec.x, countColumn, width: bins[spec.x]?.width, dark, color,
+      format: (v) => formatValue(v, fmtOf(countColumn), locale, decimals),
+      formatEdge: (v) => formatValue(v, undefined, locale, decimalsFor([v])),
+      showLabels: def?.labels?.show,
+    });
+    if ("message" in drawn) {
+      return <p role="status" className="grid h-full place-items-center px-3 text-center text-xs text-muted-foreground">{drawn.message}.</p>;
+    }
+    // A result as long as the server's cap may have been cut (a narrow width over a wide column); say so, as a cut-off chart does.
+    return (
+      <div className="flex h-full min-h-0 flex-col">
+        <div className="min-h-0 flex-1"><EChart option={drawn.option} height="100%" /></div>
+        {cell.rows.length >= HISTOGRAM_ROW_CAP ? (
+          <p className="px-1 pt-1 text-[11px] text-muted-foreground">Only the first {HISTOGRAM_ROW_CAP} ranges are shown; choose a wider width.</p>
+        ) : null}
+        {drawn.withoutValue > 0 ? (
+          <p className="px-1 pt-1 text-[11px] text-muted-foreground">
+            {drawn.withoutValue} {drawn.withoutValue === 1 ? "row has" : "rows have"} no value
+          </p>
+        ) : null}
+      </div>
+    );
+  }
+  const valueColumn = yCols[0] ?? "v";
+  const goalColumn = def?.goal && typeof def.goal === "object" ? (yCols[1] ?? "g") : undefined;
+  const all = cell.rows.flatMap((r) => [Number(r[valueColumn] ?? 0), ...(goalColumn ? [Number(r[goalColumn] ?? 0)] : [])]);
+  const decimals = decimalsFor(all);
+  const drawn = bulletOption({
+    rows: cell.rows, category: spec.x || undefined, valueColumn, goalColumn,
+    goal: typeof def?.goal === "number" ? def.goal : undefined, bands: def?.bands ?? [],
+    singleLabel: measureLabels[valueColumn] ?? firstMeasureLabel(def?.measures) ?? spec.title,
+    dark, color,
+    format: (v) => formatValue(v, fmtOf(valueColumn), locale, decimals),
+    axisFormat: (v) => formatAxisValue(v, fmtOf(valueColumn), locale, decimals),
+  });
+  if ("message" in drawn) {
+    return <p role="status" className="grid h-full place-items-center px-3 text-center text-xs text-muted-foreground">{drawn.message}.</p>;
+  }
+  return (
+    <div className="flex h-full min-h-0 flex-col">
+      <div className="min-h-0 flex-1"><EChart option={drawn.option} height="100%" /></div>
+      {drawn.more > 0 ? (
+        <p className="px-1 pt-1 text-[11px] text-muted-foreground">{drawn.more} more not shown (the first {MAX_BULLETS} are drawn)</p>
+      ) : null}
+    </div>
+  );
+}
+
+/**
+ * The Gantt chart (`BI-16` part C1, plan D3): bars from start to end, coloured
+ * by group, a line at today in the report time zone, and the notes the plan
+ * names under the chart (more than 1,000 tasks, rows that end before they
+ * start). A click on a bar names its task, so the drill lists that task's rows.
+ */
+function GanttBody({
+  cell, def, dark, onDataClick,
+}: {
+  cell: Rows;
+  def: (StyleFields & TypeDefFields) | undefined;
+  dark: boolean;
+  onDataClick?: ChartClickHandler;
+}) {
+  const reporting = useReporting();
+  const drawn = ganttOption({
+    rows: cell.rows, dark, timeZone: reporting.timeZone, reversedRows: cell.reversedRows, todayLine: def?.todayLine,
+    colors: resolvePalette(def?.colors, reporting.companyPalette),
+  });
+  if ("message" in drawn) {
+    return <p role="status" className="grid h-full place-items-center px-3 text-center text-xs text-muted-foreground">{drawn.message}.</p>;
+  }
+  return (
+    <div className="flex h-full min-h-0 flex-col">
+      <div className="min-h-0 flex-1">
+        <EChart option={drawn.option} height="100%" onDataClick={onDataClick ? (hit, pos) => onDataClick(hit, pos, { rows: cell.rows }) : undefined} />
+      </div>
+      {drawn.notes.map((note) => <p key={note} className="px-1 pt-1 text-[11px] text-muted-foreground">{note}.</p>)}
+    </div>
+  );
+}
+
+/** The first measure's name as a label, for the one bullet of a graph without a category. */
+function firstMeasureLabel(measures: ShapeDefFields["measures"]): string | undefined {
+  const first = measures?.[0];
+  if (first === undefined) return undefined;
+  return displayColumn(typeof first === "string" ? first : "metric" in first ? first.metric : first.column);
 }
 
 /**
@@ -163,11 +380,27 @@ function CombinedBody({
   onDataClick?: ChartClickHandler;
 }) {
   const grain = isGrain(cell.grain) ? cell.grain : null;
+  const reporting = useReporting();
+  const style = def as StyleFields | undefined;
+  const locale = reporting.numberLocale ?? "en-US";
   const combined = buildCombinedOption({
     kind: spec.kind, x: spec.x, y: spec.y, measureLabels, metricLabels: cell.metricLabels, rows: cell.rows, layers,
     layerMeasures: def?.layers?.map((l) => l.measures), baseDraw: def?.draw, baseAxis: def?.axis, grain,
+    style, locale, companyPalette: reporting.companyPalette,
   }, dark);
-  const option = withReferenceLines(combined.option, cell.referenceLines, false, dark);
+  const decimals = decimalsFor(Array.isArray(combined.option.series) ? combined.option.series.flatMap((s) => ((s as { data?: unknown[] }).data ?? []).filter((v): v is number => typeof v === "number")) : []);
+  const styled = styleOption(combined.option, {
+    kind: spec.kind, y: spec.y, style, locale, decimals,
+    columns: Array.isArray(combined.option.series) ? combined.option.series.map((s) => (s as { name?: string }).name) : undefined,
+    // A line or a band at or below zero vanishes on a logarithmic axis, so
+    // the lines are read here too and the tile says so
+    // (`PR #199 review O SHOULD-FIX 8`).
+    referenceLines: cell.referenceLines,
+  });
+  if (styled.message) {
+    return <p role="status" className="grid h-full place-items-center px-3 text-center text-xs text-muted-foreground">{styled.message}.</p>;
+  }
+  const option = withReferenceLines(styled.option, cell.referenceLines, false, dark);
   const failed = failedLayers(layers);
   const cut = cutLayers(layers);
   const click = onDataClick
@@ -186,6 +419,11 @@ function CombinedBody({
       <div className="min-h-0 flex-1">
         <EChart option={hideLegend ? { ...option, legend: { show: false } } : option} height="100%" onDataClick={click} />
       </div>
+      {styled.hiddenNotes ? (
+        <p className="px-1 pt-1 text-[11px] text-muted-foreground">
+          {styled.hiddenNotes} {styled.hiddenNotes === 1 ? "note" : "notes"} not shown: {styled.hiddenNotes === 1 ? "its point is" : "their points are"} not in the result
+        </p>
+      ) : null}
       {cut.length ? (
         <p className="px-1 pt-1 text-[11px] text-muted-foreground" aria-label="Questions that were cut off">
           {cut.map((label) => `${label}: not every value is shown`).join(" · ")}
@@ -202,7 +440,8 @@ function CombinedBody({
   );
 }
 
-function TableView({ columns, rows, settings = {}, labels = {} }: { columns: string[]; rows: Record<string, unknown>[]; settings?: Record<string, ColumnSetting>; labels?: Record<string, string> }) {
+function TableView({ columns, rows, settings = {}, labels = {}, style }: { columns: string[]; rows: Record<string, unknown>[]; settings?: Record<string, ColumnSetting>; labels?: Record<string, string>; style?: StyleFields }) {
+  const domains = React.useMemo(() => domainsOf(style?.conditional, rows), [style?.conditional, rows]);
   // The flag that marks the computed "Other" group is not a column to read.
   const shown = visibleColumns(columns).filter((c) => !settings[c]?.hidden);
   return (
@@ -216,7 +455,7 @@ function TableView({ columns, rows, settings = {}, labels = {} }: { columns: str
         <tbody>
           {rows.map((r, i) => (
             <tr key={i} className="border-b border-border/40 last:border-0">
-              {shown.map((c) => <td key={c} style={columnStyle(settings[c])} className={cellClass(settings[c])}><CellValue value={r[c]} setting={settings[c]} /></td>)}
+              {shown.map((c) => <td key={c} style={{ ...columnStyle(settings[c]), ...conditionalCss(style?.conditional, c, r[c], domains) }} className={cellClass(settings[c])}><CellValue value={r[c]} setting={settings[c]} format={style?.valueFormats?.[c] ?? style?.format} /></td>)}
             </tr>
           ))}
         </tbody>

@@ -18,6 +18,7 @@ use axum::body::Bytes;
 use axum::extract::{Json, Path, State};
 use axum::http::HeaderMap;
 use lakehouse_auth::Principal;
+use uuid::Uuid;
 
 use axum::response::IntoResponse;
 
@@ -523,6 +524,103 @@ pub(super) async fn mark_pipeline_ready(state: &AppState, args: &Map<String, Val
     .await
 }
 
+/// BLD-2 (T5): set or clear an authored pipeline's target lag from an assistant tool call.
+/// Resolves `pipeline` as either an authored id (`pl-…`) or by pipeline name / target table,
+/// then forwards to [`crate::routes::authored_pipelines::apply_set_target_lag`].
+pub(super) async fn set_pipeline_target_lag(
+    state: &AppState,
+    principal: Option<&Principal>,
+    args: &Map<String, Value>,
+) -> Value {
+    let Some(principal) = principal else {
+        return json!({ "error": "setting pipeline target lag needs a signed-in user" });
+    };
+    let pipeline_arg = arg_str(args, "pipeline");
+    if pipeline_arg.is_empty() {
+        return json!({ "error": "pipeline is required" });
+    }
+    // BLD-2 review R1 SHOULD-FIX 12: require targetLag explicitly
+    let Some(target_lag_val) = args.get("targetLag") else {
+        return json!({ "error": "targetLag is required (use null to clear)" });
+    };
+    let target_lag: Option<lakehouse_store::pipelines::TargetLag> = if target_lag_val.is_null() {
+        None
+    } else {
+        match serde_json::from_value(target_lag_val.clone()) {
+            Ok(tl) => Some(tl),
+            Err(err) => return json!({ "error": format!("invalid targetLag: {err}") }),
+        }
+    };
+    let pool = match crate::routes::pipelines::pool(state) {
+        Ok(pool) => pool,
+        // Through `api_result_to_value`'s choke point, the same way the
+        // `apply_set_target_lag` error below it is returned: the rejection's
+        // own classified body, never this error value's text copied by hand.
+        Err(err) => return api_result_to_value::<()>(Err(crate::error::ApiRejection(err))).await,
+    };
+    // BLD-2 review R1 BLOCKER 1: the name/target lookup is scoped to the
+    // caller's own scope, and a database failure is propagated instead of
+    // being folded into "resolve it as an id". No request headers reach a
+    // tool call, so the scope resolves the way `create_pipeline` above
+    // resolves a new pipeline's tenant: the principal's first tenant, and
+    // `Unrestricted` only for a Platform Admin who sent no `X-Tenant`.
+    // `apply_set_target_lag` re-checks `in_scope` on the id this produces,
+    // so a name that resolves to another tenant's row is answered with the
+    // same not-found as an unknown pipeline.
+    let pipeline_id = if pipeline_arg.starts_with("pl-") {
+        pipeline_arg.clone()
+    } else {
+        let scope = match crate::routes::authored_pipelines::resolve_caller_scope(
+            principal,
+            &HeaderMap::new(),
+        ) {
+            Ok(scope) => scope,
+            Err(err) => return api_result_to_value::<()>(Err(err)).await,
+        };
+        let candidates: Vec<(String, Option<Uuid>)> =
+            match sqlx::query_as::<_, (String, Option<Uuid>)>(
+                "SELECT id, tenant_id FROM pipeline_definition WHERE name = $1 OR target = $1",
+            )
+            .bind(&pipeline_arg)
+            .fetch_all(pool)
+            .await
+            {
+                Ok(rows) => rows,
+                Err(err) => {
+                    return api_result_to_value::<()>(Err(
+                        lakehouse_store::StoreError::from(err).into()
+                    ))
+                    .await;
+                }
+            };
+        match candidates.into_iter().find(|(_, row_tenant)| {
+            crate::routes::authored_pipelines::matches_scope(scope, *row_tenant)
+        }) {
+            Some((id, _)) => id,
+            // An unknown name stays the name: `apply_set_target_lag`'s
+            // `authored_only` answers `Pipeline <name> not found`, the
+            // same body as a name that exists in another tenant.
+            None => pipeline_arg.clone(),
+        }
+    };
+    // BLD-2 review R2 BLOCKER 1: pass tool own headers (&HeaderMap::new())
+    let res = crate::routes::authored_pipelines::apply_set_target_lag(
+        state,
+        principal,
+        &HeaderMap::new(),
+        &pipeline_id,
+        target_lag,
+    )
+    .await;
+    match res {
+        Ok(updated) => {
+            let reloaded = crate::routes::authored_pipelines::reload_orchestrator(state).await;
+            crate::routes::authored_pipelines::with_orchestrator(&updated, reloaded)
+        }
+        Err(err) => api_result_to_value::<()>(Err(err)).await,
+    }
+}
+
 #[cfg(test)]
 mod t1_3_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -531,7 +629,10 @@ mod t1_3_tests {
 
     use lakehouse_auth::{PermissionSet, PrincipalId};
     use lakehouse_dagster::LaunchFailure;
+    use sqlx::PgPool;
     use uuid::Uuid;
+    use wiremock::matchers::{body_string_contains, method};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
     use crate::config::Config;
@@ -967,6 +1068,199 @@ mod t1_3_tests {
             body["id"],
             json!("r-tool-config"),
             "args[\"runConfig\"] must reach the trigger route's launch body unchanged: got {body}",
+        );
+    }
+
+    #[tokio::test]
+    async fn set_pipeline_target_lag_refuses_calls_without_principal() {
+        let state = state();
+        let res = set_pipeline_target_lag(&state, None, &Map::new()).await;
+        assert_eq!(
+            res,
+            json!({ "error": "setting pipeline target lag needs a signed-in user" })
+        );
+    }
+
+    #[tokio::test]
+    async fn set_pipeline_target_lag_requires_pipeline_argument() {
+        let state = state();
+        let principal = fixture_user_principal();
+        let res = set_pipeline_target_lag(&state, Some(&principal), &Map::new()).await;
+        assert_eq!(res, json!({ "error": "pipeline is required" }));
+    }
+
+    #[tokio::test]
+    async fn set_pipeline_target_lag_refuses_invalid_target_lag_format() {
+        let state = state();
+        let principal = fixture_user_principal();
+        let mut args = Map::new();
+        args.insert("pipeline".to_owned(), json!("pl-test"));
+        args.insert("targetLag".to_owned(), json!("invalid_string"));
+        let res = set_pipeline_target_lag(&state, Some(&principal), &args).await;
+        assert!(
+            res["error"]
+                .as_str()
+                .unwrap()
+                .starts_with("invalid targetLag"),
+            "got {res}"
+        );
+    }
+
+    /// BLD-2 review R1 SHOULD-FIX 12: tool refuses omitted targetLag
+    #[tokio::test]
+    async fn set_pipeline_target_lag_refuses_omitted_target_lag() {
+        let state = state();
+        let principal = fixture_user_principal();
+        let mut args = Map::new();
+        args.insert("pipeline".to_owned(), json!("pl-test"));
+        let res = set_pipeline_target_lag(&state, Some(&principal), &args).await;
+        assert_eq!(
+            res,
+            json!({ "error": "targetLag is required (use null to clear)" })
+        );
+    }
+
+    /// A real `tenant` row: `pipeline_definition.tenant_id` references
+    /// `tenant (id)`, so a test that seeds a pipeline in a tenant has to
+    /// create the tenant first.
+    async fn seed_tenant(pool: &PgPool) -> Uuid {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO tenant (id, name, slug, plan, residency) \
+             VALUES ($1, 'Fixture tenant', $2, 'Standard', 'US')",
+        )
+        .bind(id)
+        .bind(format!("fixture-{id}"))
+        .execute(pool)
+        .await
+        .expect("seed a tenant row");
+        id
+    }
+
+    /// A [`AppState`] whose Postgres pool is `pool`, built the way
+    /// `Config::DATABASE_URL` builds it in production (so the test does
+    /// not reach past the config choke point), plus a Dagster mock that
+    /// answers a workspace reload.
+    async fn state_with_pg(pool: &sqlx::PgPool) -> AppState {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("reloadWorkspace"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({ "data": { "reloadWorkspace": { "__typename": "Workspace" } } }),
+            ))
+            .mount(&server)
+            .await;
+        let options = pool.connect_options();
+        let url = format!(
+            "postgres://{}:postgres@{}:{}/{}",
+            options.get_username(),
+            options.get_host(),
+            options.get_port(),
+            options
+                .get_database()
+                .expect("#[sqlx::test] always targets a named database")
+        );
+        let mut env = HashMap::new();
+        env.insert("DATABASE_URL".to_owned(), url);
+        env.insert(
+            "DAGSTER_URL".to_owned(),
+            format!("{}/graphql", server.uri()),
+        );
+        AppState::new(Config::from_map(&env).expect("valid test Config"))
+    }
+
+    /// BLD-2 review R1 BLOCKER 1: the assistant tool refuses cross-tenant pipelines
+    /// by id and by name, returning 404 and leaving state untouched.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn set_pipeline_target_lag_refuses_cross_tenant_by_id_and_by_name(pool: PgPool) {
+        // No request headers reach a tool call, so the state is built from
+        // the test pool alone; the Dagster mock is here because a
+        // successful write would reload the orchestrator, and this test
+        // asserts nothing was written.
+        let state = state_with_pg(&pool).await;
+        // `pipeline_definition.tenant_id` references `tenant (id)`, so both
+        // sides of the attempt are real rows rather than bare UUIDs.
+        let tenant_a = seed_tenant(&pool).await;
+        let tenant_b = seed_tenant(&pool).await;
+
+        // Seed tenant B's pipeline
+        let created = lakehouse_store::pipelines::create_pipeline(
+            &pool,
+            &lakehouse_store::pipelines::CreatePipelineInput {
+                name: "b-pipeline".to_owned(),
+                kind: "batch".to_owned(),
+                source_zone: "bronze".to_owned(),
+                source_table: "raw".to_owned(),
+                incremental_column: None,
+                transforms: Vec::new(),
+                fbic_enabled: false,
+                target_zone: "silver".to_owned(),
+                target_table: "b_target".to_owned(),
+                schedule: "manual".to_owned(),
+                owner: None,
+                description: None,
+                max_retries: None,
+                tenant_id: Some(tenant_b),
+                depends_on: Vec::new(),
+                connector_id: None,
+                id: None,
+                target_lag: None,
+                run_as: None,
+            },
+            None,
+        )
+        .await
+        .expect("create pipeline for tenant B");
+
+        // Tenant A principal: `pipeline:write` in tenant A only. The scope
+        // check a tool call gets is `resolve_caller_scope` with no
+        // `X-Tenant`, which resolves to the principal's first tenant.
+        let principal_a = Principal {
+            id: PrincipalId::User(Uuid::new_v4()),
+            tenant_ids: vec![tenant_a],
+            display_name: "User A".to_owned(),
+            permissions: PermissionSet::parse("pipeline:read,pipeline:write"),
+            provider: "session".to_owned(),
+            must_change_password: false,
+            role_names: Vec::new(),
+        };
+
+        // 1. Try to set by tenant B's id
+        let mut args_by_id = Map::new();
+        args_by_id.insert("pipeline".to_owned(), json!(created.id));
+        args_by_id.insert(
+            "targetLag".to_owned(),
+            json!({ "kind": "lag", "minutes": 10 }),
+        );
+        let res_id = set_pipeline_target_lag(&state, Some(&principal_a), &args_by_id).await;
+        assert_eq!(
+            res_id["error"],
+            json!(format!("Pipeline {} not found", created.id)),
+            "cross-tenant id must return not found"
+        );
+
+        // 2. Try to set by tenant B's name
+        let mut args_by_name = Map::new();
+        args_by_name.insert("pipeline".to_owned(), json!("b-pipeline"));
+        args_by_name.insert(
+            "targetLag".to_owned(),
+            json!({ "kind": "lag", "minutes": 10 }),
+        );
+        let res_name = set_pipeline_target_lag(&state, Some(&principal_a), &args_by_name).await;
+        assert_eq!(
+            res_name["error"],
+            json!("Pipeline b-pipeline not found"),
+            "cross-tenant name must return not found"
+        );
+
+        // Verify tenant B's pipeline lag was not changed
+        let stored = lakehouse_store::pipelines::get_pipeline(&pool, &created.id)
+            .await
+            .expect("read")
+            .expect("exists");
+        assert_eq!(
+            stored.target_lag, None,
+            "pipeline target lag must remain untouched"
         );
     }
 }

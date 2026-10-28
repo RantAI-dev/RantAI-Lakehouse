@@ -168,25 +168,117 @@ export function numberParams(defs: readonly ParamDef[]): ParamDef[] {
 }
 
 /** A reference line as the builder holds it. `param` set means the line follows that parameter. */
-export type RefLineDraft = { value: string; param: string; label: string }
+/** What a reference line marks (`BI-17` part A); mirrors `lakehouse_bi::params::LineKind`. */
+export const LINE_KINDS = ["value", "average", "median", "min", "max", "trend", "band", "forecast"] as const
+export type LineKind = (typeof LINE_KINDS)[number]
 
-export type RefLineDef = { value: number | { param: string }; label?: string }
-
-export function refLinesFromDef(lines: readonly RefLineDef[] | undefined): RefLineDraft[] {
-  return (lines ?? []).map((l) =>
-    typeof l.value === "number"
-      ? { value: String(l.value), param: "", label: l.label ?? "" }
-      : { value: "", param: l.value.param, label: l.label ?? "" },
-  )
+/** Whether the console computes the line from the rows on screen. */
+export function isComputedLine(kind: LineKind | string | undefined): boolean {
+  return kind === "average" || kind === "median" || kind === "min" || kind === "max" || kind === "trend" || kind === "forecast"
 }
 
-/** The lines to send; a row with neither a number nor a parameter is dropped. */
+/**
+ * `BI-17` part B (plan D1): a forecast looks 1 to 60 periods ahead, and a chart
+ * has at most one. Mirrors `lakehouse_bi::params` `ReferenceLine.horizon`; the
+ * server check lands with T1, so until then these limits are the console's only.
+ */
+export const MIN_FORECAST_HORIZON = 1
+export const MAX_FORECAST_HORIZON = 60
+export const DEFAULT_FORECAST_HORIZON = 6
+
+/**
+ * A line as the builder edits it. `kind` and the fields after it are
+ * `BI-17`; a draft without them is a plain value line.
+ */
+export type RefLineDraft = {
+  value: string
+  param: string
+  label: string
+  kind?: LineKind
+  /** A band's upper edge: a number, or a parameter. */
+  to?: string
+  toParam?: string
+  color?: string
+  measure?: string
+  /** A forecast's periods ahead (`BI-17` part B), as typed. */
+  horizon?: string
+}
+
+/** A line as the server stores it; `value` is absent on a computed line. */
+export type RefLineDef = {
+  value?: number | { param: string }
+  kind?: LineKind | string
+  to?: number | { param: string }
+  label?: string
+  color?: string
+  measure?: string
+  /** Periods ahead of a `forecast` line (`BI-17` part B, D1). */
+  horizon?: number
+}
+
+function edge(v: number | { param: string } | undefined): { text: string; param: string } {
+  if (v === undefined) return { text: "", param: "" }
+  return typeof v === "number" ? { text: String(v), param: "" } : { text: "", param: v.param }
+}
+
+export function refLinesFromDef(lines: readonly RefLineDef[] | undefined): RefLineDraft[] {
+  return (lines ?? []).map((l) => {
+    const from = edge(l.value)
+    const to = edge(l.to)
+    return {
+      value: from.text,
+      param: from.param,
+      label: l.label ?? "",
+      ...(l.kind && l.kind !== "value" ? { kind: l.kind as LineKind } : {}),
+      ...(l.to !== undefined ? { to: to.text, toParam: to.param } : {}),
+      ...(l.color ? { color: l.color } : {}),
+      ...(l.measure ? { measure: l.measure } : {}),
+      ...(l.horizon !== undefined ? { horizon: String(l.horizon) } : {}),
+    }
+  })
+}
+
+function edgePayload(text: string | undefined, param: string | undefined): number | { param: string } | undefined {
+  if (param) return { param }
+  if (text !== undefined && text.trim() !== "" && Number.isFinite(Number(text))) return Number(text)
+  return undefined
+}
+
+/**
+ * The lines to send; a value or band row with no number or parameter is
+ * dropped, and a computed line carries no value.
+ */
 export function refLinesPayload(rows: readonly RefLineDraft[]): RefLineDef[] {
   const out: RefLineDef[] = []
+  let forecasts = 0
   for (const r of rows.slice(0, MAX_REFERENCE_LINES)) {
     const label = r.label.trim()
-    if (r.param) out.push({ value: { param: r.param }, ...(label ? { label } : {}) })
-    else if (r.value.trim() !== "" && Number.isFinite(Number(r.value))) out.push({ value: Number(r.value), ...(label ? { label } : {}) })
+    const kind = r.kind ?? "value"
+    const rest = {
+      ...(label ? { label } : {}),
+      ...(r.color ? { color: r.color } : {}),
+      ...(isComputedLine(kind) && r.measure ? { measure: r.measure } : {}),
+    }
+    if (kind === "forecast") {
+      // At most one per chart, and only with a whole number of periods in range (D1).
+      const horizon = Number(r.horizon)
+      if (forecasts > 0 || !Number.isInteger(horizon) || horizon < MIN_FORECAST_HORIZON || horizon > MAX_FORECAST_HORIZON) continue
+      forecasts += 1
+      out.push({ kind, horizon, ...rest })
+      continue
+    }
+    if (isComputedLine(kind)) {
+      out.push({ kind, ...rest })
+      continue
+    }
+    const value = edgePayload(r.value, r.param)
+    if (value === undefined) continue
+    if (kind === "band") {
+      const to = edgePayload(r.to, r.toParam)
+      if (to !== undefined) out.push({ kind, value, to, ...rest })
+      continue
+    }
+    out.push({ value, ...rest })
   }
   return out
 }

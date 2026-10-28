@@ -1,5 +1,7 @@
 import type { ChartKind, ChartSpec, ChartSource } from "@/lib/dashboard-specs";
 import type { TableDefFields } from "@/lib/table-types";
+import type { StyleFields } from "@/lib/chart-style";
+import type { TypeDefFields } from "@/lib/type-b";
 
 /**
  * Shared BI/dashboard types.
@@ -40,11 +42,10 @@ export type ChartInput = {
   text?: string; // markdown content (kind="text")
   caption?: string; // unit/caption (kind="kpi")
   target?: number; // target/max (kind="gauge")
-} & TableDefFields; // raw tables, pivots and KPI comparisons (BI-16 part A)
+} & TableDefFields // raw tables, pivots and KPI comparisons (BI-16 part A)
+  & StyleFields // number formats, colours, axes, notes, conditional colours (BI-17 part A)
+  & TypeDefFields; // goal, bands, histogram ranges, address of an image or web card (BI-16 part B)
 
-/** Tile position on the grid canvas (12 columns). Key = chartId. */
-export type TileBox = { x: number; y: number; w: number; h: number };
-export type LayoutMap = Record<string, TileBox>;
 /** How a dashboard filter compares its column; absent means `in`. Mirrors `FilterOp` in `lakehouse-bi`. */
 export type FilterOp = "in" | "not_in" | "between" | "relative" | "contains" | "starts_with" | "ends_with" | "not_contains";
 export type RelativeUnit = "day" | "week" | "month" | "quarter" | "year";
@@ -77,6 +78,8 @@ export type FilterDef = {
   required?: boolean;
   /** BI-2: a reference to a saved segment of the chart's table, `{ column: "", values: [], segment }`; it stands for the segment's filters. */
   segment?: string;
+  /** BI-18 part C: the ids of the tabs this filter applies to. Absent or empty: every tab. */
+  tabs?: string[];
 };
 /** A column a filter can target, with how many tiles of the board have it. */
 export type FilterField = { column: string; kind: FilterKind | string; tiles: number };
@@ -94,38 +97,3 @@ export type ChartClick =
   | { kind: "query"; id: string }
   | { kind: "url"; url: string };
 
-export type Board = {
-  id: string;
-  name: string;
-  /** Satu kalimat tujuan board, tampil di halaman daftar dashboard. */
-  description?: string;
-  /** Nama tampilan pembuat board. Kosong untuk board lama / tanpa login. */
-  createdBy?: string;
-  /** Folder this board is filed in; empty or null = no folder. */
-  folderId?: string | null;
-  layout?: LayoutMap;
-  filters?: FilterDef[];
-  /**
-   * The auto-refresh an editor saved, in seconds (one of 60, 300, 600, 900,
-   * 1800, 3600). Absent when none was saved; BI-18·B.
-   */
-  refreshSeconds?: number;
-  createdAt?: string;
-  /**
-   * Kapan board terakhir ditulis.
-   *
-   * Nilainya sama dengan `createdAt`, dan itu disengaja: tabelnya
-   * `ReplacingMergeTree(created_at)`, jadi `created_at` adalah kolom versi
-   * yang ditulis ulang `now()` setiap kali board di-rename / layout
-   * disimpan / filter diubah. Jadi sejak awal isinya memang "terakhir
-   * diubah", cuma namanya saja "created". Di UI, labeli **"Updated"** —
-   * jangan pernah "Created", karena itu klaim yang tidak benar.
-   */
-  updatedAt?: string;
-  /** Jumlah tile di board ini; dihitung server, bukan kolom tersimpan. */
-  chartCount?: number;
-  /** `true` hanya untuk board bawaan (`default`) yang tidak bisa dihapus. */
-  builtin?: boolean;
-  publicToken?: string;
-  embedEnabled?: boolean;
-};

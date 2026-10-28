@@ -1,5 +1,6 @@
 "use client";
 
+import { isStaticKind } from "@/lib/dashboard-tabs";
 import * as React from "react";
 import Link from "next/link";
 import { useTheme } from "next-themes";
@@ -7,7 +8,7 @@ import { useTheme } from "next-themes";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useService } from "@/hooks/use-service";
 import type { ChartRenderSpec } from "@/lib/dashboard-specs";
-import type { LayoutMap } from "@/services/clients/bi-store";
+import type { LayoutMap } from "@/services";
 import { apiFetch } from "@/services/http";
 import { TileBody } from "./tile-body";
 import type { TileFailure } from "@/services/contracts/dashboards";
@@ -64,7 +65,7 @@ export function DashboardPreview({
       return box ? box.y * 100 + box.x : Number.MAX_SAFE_INTEGER;
     };
     const candidates = [...(state.data?.charts ?? [])]
-      .filter((c) => c.kind !== "text")
+      .filter((c) => !isStaticKind(c.kind))
       .sort((a, b) => order(a.id) - order(b.id));
     const visual = candidates.filter((c) => c.kind !== "table");
     return (visual.length > 0 ? visual : candidates).slice(0, limit);

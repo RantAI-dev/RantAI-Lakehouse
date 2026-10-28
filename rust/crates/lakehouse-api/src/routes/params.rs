@@ -240,6 +240,7 @@ fn users_of(
 /// 400 without an id, 404 for an unknown one, 409 naming what still uses it.
 pub async fn delete(
     State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
     Query(q): Query<IdQuery>,
 ) -> ApiResult<ApiJson<Value>> {
     let ch = &state.clickhouse;
@@ -257,16 +258,29 @@ pub async fn delete(
         .ok_or_else(|| ApiError::NotFound("parameter not found.".to_owned()))?;
     // A store that cannot be read refuses the delete: nothing can be shown to
     // be unused.
-    let (all_fields, charts, boards, default_row) = tokio::try_join!(
+    let viewer = crate::routes::calc_fields::viewer_or_anonymous(principal.as_ref());
+    let system = lakehouse_bi::access::Viewer::system();
+    let (all_fields, seen, default_row) = tokio::try_join!(
         fields::list_fields(ch),
-        store::list_stored_charts(ch),
-        store::list_boards(ch),
-        store::get_board(ch, store::DEFAULT_BOARD_ID),
+        crate::routes::dashboard_organise::Seen::read(ch, &viewer),
+        store::get_board(ch, store::DEFAULT_BOARD_ID, &system),
     )
     .map_err(|failure| classify_ch(&failure))?;
-    let mut shown = boards;
+    // BI-18 part C, part 2: what the caller may not see still blocks the
+    // delete but is not named.
+    let mut shown = seen.boards.clone();
     shown.extend(default_row);
-    let used = users_of(&current.name, &all_fields, &charts, &shown);
+    let mut used = users_of(&current.name, &all_fields, &seen.charts, &shown);
+    if !users_of(
+        &current.name,
+        &[],
+        &seen.hidden_charts(),
+        &seen.hidden_boards(),
+    )
+    .is_empty()
+    {
+        used.push(crate::routes::dashboard_organise::HIDDEN_USE.to_owned());
+    }
     if !used.is_empty() {
         return Err(ApiError::Conflict(format!(
             "the parameter '{}' is used by {}. Remove it there first.",

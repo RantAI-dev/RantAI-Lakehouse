@@ -9,17 +9,22 @@ use std::time::Instant;
 use axum::Extension;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use lakehouse_auth::Principal;
 use lakehouse_clickhouse::{ChClient, ChError};
 use lakehouse_core::ApiError;
 use lakehouse_store::PgPool;
 use lakehouse_store::audit::NewAuditEvent;
-use lakehouse_store::queries::{self, QueryHistoryItem, RecordHistoryInput, SavedQuery};
+use lakehouse_store::queries::{
+    self, HistoryFilter, QueryHistoryItem, RecordHistoryInput, SavedQuery,
+};
+use lakehouse_store::uploads::TableClaim;
 use lakehouse_trino::{TrinoError, TrinoResult};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 
 use crate::error::ApiResult;
@@ -74,15 +79,42 @@ fn parse_body(body: &Bytes) -> Result<SqlBody, ApiError> {
 /// (`policy_engine::engine_error_message`/`refusal_message` — the
 /// underlying Postgres/`sqlparser` error text never reaches the response,
 /// `AGENTS.md` rule 4) when obligations cannot be resolved or `sql` fails
-/// classification/substitution.
+/// classification/substitution, and 404 [`ApiError::NotFound`] with the
+/// fixed sentence of [`table_not_available`] when the statement reads a
+/// table the caller may not read (`SEC-20`), and 422
+/// [`ApiError::Unprocessable`] with the fixed sentence of
+/// [`LISTING_NOT_AVAILABLE`] when the statement lists objects without
+/// naming a table and the caller may not list them (`SEC-20`).
 pub(crate) async fn rewrite_sql_for_principal(
     state: &AppState,
     sql: &str,
     engine: &str,
     principal: &Principal,
 ) -> Result<String, ApiError> {
+    rewrite_sql_for_principal_with_headers(state, sql, engine, principal, &HeaderMap::new()).await
+}
+
+/// The shared rewrite, with the request's headers.
+///
+/// `SEC-20`: the tenant the caller acts as comes from the request's
+/// `X-Tenant` header when the caller has the request's headers, and from
+/// the caller's first tenant when it does not — the chat, the catalog's
+/// own sample and profile and the dependents list have no headers to
+/// pass. The header only ever narrows the caller's own tenants
+/// ([`crate::tenant_scope`]), so it can never widen anything.
+///
+/// # Errors
+///
+/// The same as [`rewrite_sql_for_principal`].
+pub(crate) async fn rewrite_sql_for_principal_with_headers(
+    state: &AppState,
+    sql: &str,
+    engine: &str,
+    principal: &Principal,
+    headers: &HeaderMap,
+) -> Result<String, ApiError> {
     let started_rewrite = Instant::now();
-    let result = rewrite_sql_for_principal_inner(state, sql, engine, principal).await;
+    let result = rewrite_sql_for_principal_inner(state, sql, engine, principal, headers).await;
     state
         .policy_decision_latencies
         .record(started_rewrite.elapsed());
@@ -103,6 +135,7 @@ async fn rewrite_sql_for_principal_inner(
     sql: &str,
     engine: &str,
     principal: &Principal,
+    headers: &HeaderMap,
 ) -> Result<String, ApiError> {
     let placeholders = crate::sql_rewrite::PlaceholderValues {
         principal_id: Some(principal.id.uuid().to_string()),
@@ -113,6 +146,26 @@ async fn rewrite_sql_for_principal_inner(
             .collect(),
     };
     let obligations_source = crate::policy_engine::PolicyEngineObligations::from_state(state);
+
+    // SEC-20: the tenant gate runs BEFORE the policy rewrite, so a
+    // statement that reads a table the caller may not read is refused
+    // before the policy's own prefetch asks the engine about that table,
+    // and before the statement reaches the engine at all.
+    //
+    // The gate's targets come from ONE parse, with the dialect of the
+    // engine the statement names (the same choice the policy rewrite
+    // below makes): the tables the statement names, or the fact that it
+    // lists objects without naming one. A statement that does not parse
+    // has no targets at all: the policy rewrite refuses it with a 422 of
+    // its own, so there is nothing here to gate.
+    let gate_dialect: &dyn sqlparser::dialect::Dialect = if is_trino_engine(engine) {
+        &sqlparser::dialect::GenericDialect {}
+    } else {
+        &sqlparser::dialect::ClickHouseDialect {}
+    };
+    if let Some(targets) = crate::sql_rewrite::gate_targets(sql, gate_dialect) {
+        refuse_unreachable_tables(state, principal, headers, &targets).await?;
+    }
 
     // WS7 item D1/D2: the actual referenced-tables/prefetch/enforce
     // sequence now lives in ONE place —
@@ -163,6 +216,413 @@ async fn rewrite_sql_for_principal_inner(
     })
 }
 
+/// `SEC-20`: how far the caller's reach extends over the tables a
+/// statement reads.
+///
+/// One decision per request, resolved by [`resolve_reach`] before any
+/// table is looked at, so "may this caller read that table" is asked
+/// once and answered the same way for every table and every route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TenantReach {
+    /// Nothing is out of reach: a principal holding every permission
+    /// (`"*:*"`), or a deployment with one tenant (or none) — there is no
+    /// other tenant's table to reach, so the gate changes nothing.
+    All,
+    /// The caller's own tenant, and whether that tenant owns the shared
+    /// catalog (the tenant named in `CATALOG_TENANT_ID`).
+    Tenant { tenant_id: Uuid, owns_catalog: bool },
+    /// The caller belongs to no tenant in a deployment that has more than
+    /// one: it owns no table and may read no shared one.
+    NoTenant,
+}
+
+/// `SEC-20`: the one sentence a table the caller may not read is refused
+/// with.
+///
+/// A 404, never a 403: a 403 would confirm the table exists to a caller
+/// who must not learn that, and Query Studio reads a 403 as "this user
+/// may not run anything at all" and refuses the whole batch. The
+/// sentence is the same whether the table exists and belongs to somebody
+/// else or does not exist at all, so the refusal is not an oracle
+/// either.
+fn table_not_available(table: &str) -> ApiError {
+    ApiError::NotFound(format!(
+        "Table not found or not available to your organisation: {table}"
+    ))
+}
+
+/// `SEC-20`: the one sentence a statement that lists objects without
+/// naming one table is refused with.
+///
+/// A 422, never a 403: the statement is refused for what it DOES (it
+/// lists), not because the caller lacks a permission, and the sentence
+/// says nothing about what the deployment holds — the same sentence for
+/// every caller, so it cannot be an oracle.
+///
+/// A listing is refused rather than passed because no table is named, so
+/// the gate has nothing to compare the caller's tenant against: letting
+/// it through would show one tenant the shared catalog's table names.
+const LISTING_NOT_AVAILABLE: &str = "This statement is not available to your organisation.";
+
+/// `SEC-20`: the caller's reach over tables, resolved once per request.
+///
+/// The answers it composes are the ones the rest of the service already
+/// uses, not copies of them (`AGENTS.md` rule 4):
+/// [`crate::routes::catalog::is_unrestricted`] (the `"*:*"` grant), the
+/// shared catalog's own gate
+/// [`crate::routes::catalog::catalog_tenant_refusal`],
+/// [`crate::tenant_scope::resolve`] (the `X-Tenant` header, or the
+/// caller's first tenant), and [`deployment_tenant_count`] (whether the
+/// deployment holds a second tenant at all).
+///
+/// # Errors
+///
+/// [`ApiError::NotFound`] when `X-Tenant` names a tenant the caller does
+/// not belong to — the same fail-closed 404 the tenant scope answers
+/// everywhere else, never a 403 that would confirm the tenant exists.
+async fn resolve_reach(
+    state: &AppState,
+    principal: &Principal,
+    headers: &HeaderMap,
+) -> Result<TenantReach, ApiError> {
+    if crate::routes::catalog::is_unrestricted(principal) {
+        return Ok(TenantReach::All);
+    }
+    let refused = crate::routes::catalog::catalog_tenant_refusal(state, principal, headers)
+        .await?
+        .is_some();
+    let tenant = crate::tenant_scope::resolve(principal, headers)?;
+    // The count is read only when the gate admitted the caller: a
+    // refusal decides the reach on its own, and the query path is hot.
+    //
+    // It is read AFTER the gate's own read, so the later answer is the
+    // one that decides: a deployment that gained a tenant between the
+    // two reads is scoped, not unscoped.
+    let tenant_count = if refused {
+        None
+    } else {
+        deployment_tenant_count(state).await?
+    };
+    Ok(reach_from(
+        refused,
+        tenant,
+        tenant_count,
+        state.config.catalog_tenant_id,
+    ))
+}
+
+/// `SEC-20`: the reach, as a pure function of the answers the request has.
+///
+/// The answers are the shared catalog's own gate (refused or not), the
+/// caller's tenant ([`crate::tenant_scope::resolve`]), how many tenants
+/// the deployment holds, and which tenant owns the shared catalog
+/// (`CATALOG_TENANT_ID`).
+///
+/// An answer that cannot be confirmed narrows the reach. A gate that
+/// admitted the caller is not proof that the caller owns the shared
+/// catalog: the gate admits a caller for two reasons (the caller owns the
+/// catalog, or the deployment holds a single tenant), and the count it
+/// read may be older than this request's. So the ownership is checked
+/// against the setting that names the catalog's tenant, and the count is
+/// read again. A deployment that grew a tenant in between is scoped,
+/// never unscoped — the narrowing is the safe direction, because the
+/// shared tables and the other tenants' uploads are the things to keep.
+fn reach_from(
+    refused: bool,
+    tenant: Option<Uuid>,
+    tenant_count: Option<i64>,
+    catalog_tenant_id: Option<Uuid>,
+) -> TenantReach {
+    let one_tenant = tenant_count.is_some_and(|count| count <= 1);
+    match (refused, tenant) {
+        // The shared catalog is open to this caller.
+        (false, Some(tenant_id)) => {
+            if one_tenant {
+                // A deployment with a single tenant holds no other
+                // tenant's table to reach: the gate changes nothing.
+                TenantReach::All
+            } else if catalog_tenant_id == Some(tenant_id) {
+                // The caller is the tenant that owns the shared catalog.
+                TenantReach::Tenant {
+                    tenant_id,
+                    owns_catalog: true,
+                }
+            } else {
+                // The gate admitted the caller, but the caller is not the
+                // tenant that owns the shared catalog: the gate must have
+                // read a smaller count than this request did. Fail
+                // closed — the shared tables are not the caller's.
+                TenantReach::Tenant {
+                    tenant_id,
+                    owns_catalog: false,
+                }
+            }
+        }
+        // The gate admitted a caller that belongs to no tenant, so it
+        // read a deployment with a single tenant.
+        (false, None) => {
+            if one_tenant {
+                TenantReach::All
+            } else {
+                // The deployment grew a tenant since the gate read its
+                // count: a caller that belongs to no tenant owns no table
+                // and reads no shared one.
+                TenantReach::NoTenant
+            }
+        }
+        // The shared catalog is closed to this caller: only the uploads
+        // its own tenant claimed are its own.
+        (true, Some(tenant_id)) => TenantReach::Tenant {
+            tenant_id,
+            owns_catalog: false,
+        },
+        // A caller with no tenant in a deployment that has more than
+        // one: it owns no upload and may read no shared table.
+        (true, None) => TenantReach::NoTenant,
+    }
+}
+
+/// `SEC-20`: the saved queries the caller may read.
+///
+/// The same reach the same request resolves for the tables a statement
+/// may read (see [`resolve_reach`]), asked once and answered once: the
+/// caller's tenant, whether that tenant owns the shared catalog, and
+/// whether the deployment holds a single tenant at all. A saved query
+/// belongs to the tenant that wrote it, so the reach over tables and the
+/// reach over saved queries end in the same place — and there is only
+/// one rule that says which tenant a request acts as
+/// ([`crate::tenant_scope::resolve`]).
+///
+/// # Errors
+///
+/// The same as [`resolve_reach`]: 404 for an `X-Tenant` header the
+/// caller does not belong to, 503 when the count cannot be read.
+pub(crate) async fn saved_query_scope(
+    state: &AppState,
+    principal: &Principal,
+    headers: &HeaderMap,
+) -> Result<queries::SavedQueryScope, ApiError> {
+    Ok(match resolve_reach(state, principal, headers).await? {
+        // Every permission, or a deployment with one tenant: every row.
+        TenantReach::All => queries::SavedQueryScope::All,
+        // One tenant's rows; the rows that belong to no tenant are the
+        // shared catalog's own, and the catalog's tenant reads them.
+        TenantReach::Tenant {
+            tenant_id,
+            owns_catalog,
+        } => queries::SavedQueryScope::Tenant {
+            tenant_id,
+            include_tenantless: owns_catalog,
+        },
+        // A caller in no tenant owns no saved query and reads none.
+        TenantReach::NoTenant => queries::SavedQueryScope::None,
+    })
+}
+
+/// `SEC-20`: how many tenants the deployment holds.
+///
+/// `None` when there is no database to count: the shared catalog's own
+/// gate refuses every caller it cannot verify in that state, and this gate
+/// fails closed with it.
+///
+/// The count is read beside the gate's own answer, never instead of it.
+/// The gate answers "may this caller read the shared catalog"; this
+/// answers "does this deployment hold a second tenant at all". The two
+/// are different questions, and the first does not tell the second: the
+/// gate admits a caller for the catalog's own tenant AND for a
+/// deployment with a single tenant, and those two have to end differently
+/// — a deployment with one tenant changes nothing.
+///
+/// # Errors
+///
+/// 503 when the count cannot be read: the store's own fixed message and a
+/// reference id, through [`upstream_error`] (the raw error text never
+/// reaches the response, `AGENTS.md` principle 4).
+async fn deployment_tenant_count(state: &AppState) -> Result<Option<i64>, ApiError> {
+    let Some(pool) = state.pg.as_deref() else {
+        return Ok(None);
+    };
+    let (count,): (i64,) = sqlx::query_as("SELECT count(*) FROM tenant")
+        .fetch_one(pool)
+        .await
+        .map_err(|err| {
+            upstream_error::report_sqlx(&upstream_error::STORE, &err)
+                .into_api_error(upstream_error::FailedAs::ServiceUnavailable)
+        })?;
+    Ok(Some(count))
+}
+
+/// `SEC-20`: the rule, as a pure function of the reach and the claim on
+/// the table.
+///
+/// - [`TenantReach::All`]: everything is reachable.
+/// - [`TableClaim::Ours`]: the caller's own tenant holds the table (an
+///   upload it made) — reachable, whoever owns the shared catalog.
+/// - [`TableClaim::Theirs`]: another tenant holds it — never reachable.
+/// - [`TableClaim::Unclaimed`]: nobody holds it — a table no upload
+///   claimed, or a shared table — and it is reachable only by the
+///   catalog's own tenant.
+fn table_is_reachable(reach: TenantReach, claim: TableClaim) -> bool {
+    match reach {
+        TenantReach::All => true,
+        TenantReach::NoTenant => false,
+        TenantReach::Tenant { owns_catalog, .. } => match claim {
+            TableClaim::Ours => true,
+            TableClaim::Theirs => false,
+            TableClaim::Unclaimed => owns_catalog,
+        },
+    }
+}
+
+/// `SEC-20`: the raw upload table a canonical table name names, when it
+/// names one.
+///
+/// An upload lands in the Bronze namespace under its raw name
+/// (`upload_table_claim.bronze_table`, the key
+/// [`lakehouse_store::uploads::table_claim`] reads), so `bronze.orders`
+/// is the upload table `orders` and no other namespace holds an upload.
+/// A bare one-part name is not it: `orders` alone names whatever the
+/// caller's default database holds.
+fn raw_table_name(table: &str) -> Option<&str> {
+    table
+        .strip_prefix(lakehouse_iceberg::bronze::BRONZE_NAMESPACE)?
+        .strip_prefix('.')
+}
+
+/// `SEC-20`: who holds `table`, as the caller's own tenant sees it.
+///
+/// A table no upload claimed has no holder, so it is nobody's and the
+/// shared rule decides it. The read is the store's own
+/// [`lakehouse_store::uploads::table_claim`] — the same answer the
+/// ingest path's `TABLE_NOT_FREE` conflict is built on, never a second
+/// reading of `upload_table_claim`.
+///
+/// A deployment with no Postgres pool has no claims to read, and the
+/// shared catalog's own gate refuses every principal without the
+/// unrestricted grant in that state anyway, so the answer is "nobody
+/// holds it" and the shared rule decides.
+///
+/// # Errors
+///
+/// 503 when the claim cannot be read: the store's own fixed message and
+/// a reference id, through [`upstream_error`] (the raw error text never
+/// reaches the response, `AGENTS.md` principle 4).
+async fn claim_on(state: &AppState, tenant_id: Uuid, table: &str) -> Result<TableClaim, ApiError> {
+    let Some(raw) = raw_table_name(table) else {
+        return Ok(TableClaim::Unclaimed);
+    };
+    let Some(pool) = state.pg.as_deref() else {
+        return Ok(TableClaim::Unclaimed);
+    };
+    lakehouse_store::uploads::table_claim(pool, tenant_id, raw)
+        .await
+        .map_err(|err| {
+            upstream_error::store(&upstream_error::STORE, &err)
+                .into_api_error(upstream_error::FailedAs::ServiceUnavailable)
+        })
+}
+
+/// `SEC-20`: refuse a statement the caller's tenant may not run.
+///
+/// The targets are what the statement means to the gate: the tables it
+/// names — canonicalised the way the policy rewrite canonicalises them
+/// ([`crate::sql_rewrite::canonicalize`]), so a `CTE`'s own name is not a
+/// table — or the fact that it lists objects without naming one table.
+///
+/// A named table is checked one by one, and the first table out of reach
+/// is the one the refusal names. A listing names no table, so there is
+/// nothing to check table by table: it passes for the catalog's own
+/// tenant (and for a deployment with one tenant) and is refused
+/// otherwise.
+///
+/// # Errors
+///
+/// 404 with the fixed sentence of [`table_not_available`] for a table the
+/// caller may not read; 422 with the fixed sentence of
+/// [`LISTING_NOT_AVAILABLE`] for a statement that lists objects and the
+/// caller may not list them; 404 for an `X-Tenant` header the caller does
+/// not belong to; 503 when a claim cannot be read.
+async fn refuse_unreachable_tables(
+    state: &AppState,
+    principal: &Principal,
+    headers: &HeaderMap,
+    targets: &crate::sql_rewrite::GateTargets,
+) -> Result<(), ApiError> {
+    match targets {
+        crate::sql_rewrite::GateTargets::Tables(tables) => {
+            if tables.is_empty() {
+                return Ok(());
+            }
+            let reach = resolve_reach(state, principal, headers).await?;
+            let tenant_id = match reach {
+                TenantReach::All => return Ok(()),
+                TenantReach::NoTenant => return Err(table_not_available(&tables[0])),
+                TenantReach::Tenant { tenant_id, .. } => tenant_id,
+            };
+            let mut claims = Vec::with_capacity(tables.len());
+            for table in tables {
+                claims.push(claim_on(state, tenant_id, table).await?);
+            }
+            match first_unreachable(reach, &claims) {
+                Some(at) => Err(table_not_available(&tables[at])),
+                None => Ok(()),
+            }
+        }
+        crate::sql_rewrite::GateTargets::ListsObjects => {
+            // The reach is resolved FIRST: a header naming a tenant the
+            // caller does not belong to is a 404 everywhere else, and it
+            // must not be answered with the listing's own 422.
+            let reach = resolve_reach(state, principal, headers).await?;
+            match reach {
+                // Every permission, or a deployment with one tenant: there
+                // is no other tenant's listing to keep. The catalog's own
+                // tenant may list the shared catalog.
+                TenantReach::All
+                | TenantReach::Tenant {
+                    owns_catalog: true, ..
+                } => Ok(()),
+                // A member of another tenant, or a caller in no tenant.
+                TenantReach::Tenant {
+                    owns_catalog: false,
+                    ..
+                }
+                | TenantReach::NoTenant => {
+                    Err(ApiError::Unprocessable(LISTING_NOT_AVAILABLE.to_owned()))
+                }
+            }
+        }
+    }
+}
+
+/// `SEC-20`: the first table the caller may not read, in the order the
+/// tables were listed.
+///
+/// The rule itself is [`table_is_reachable`]; this only says which table
+/// the refusal names, so the decision stays a pure function of the reach
+/// and the claims.
+fn first_unreachable(reach: TenantReach, claims: &[TableClaim]) -> Option<usize> {
+    claims
+        .iter()
+        .position(|claim| !table_is_reachable(reach, *claim))
+}
+
+/// The tables `sql` names, canonicalised the way the policy rewrite
+/// canonicalises them and sorted, so the refusal always names the same
+/// table for the same statement.
+///
+/// A statement that does not parse has no table list: the policy rewrite
+/// refuses it with a 422 of its own, so there is nothing here to gate.
+fn referenced_table_names(sql: &str, trino: bool) -> Vec<String> {
+    let dialect: &dyn sqlparser::dialect::Dialect = if trino {
+        &sqlparser::dialect::GenericDialect {}
+    } else {
+        &sqlparser::dialect::ClickHouseDialect {}
+    };
+    let mut tables = crate::sql_rewrite::referenced_tables(sql, dialect).unwrap_or_default();
+    tables.sort();
+    tables
+}
+
 /// Fixed text for `DATA-16` F3: past versions are queried on `ClickHouse`
 /// only (the `Trino` side is `DATA-21`).
 const PAST_VERSION_TRINO_MESSAGE: &str =
@@ -195,6 +655,97 @@ fn uses_past_version_clause(sql: &str) -> bool {
         .any(|w| (w[0] == "VERSION" || w[0] == "TIMESTAMP") && w[1] == "AS" && w[2] == "OF")
 }
 
+/// The one answer to a statement the settings rule refuses. It names no word
+/// of the statement and no upstream text (`AGENTS.md` principle 4).
+const SETTINGS_REFUSAL_MESSAGE: &str =
+    "Query Studio accepts only iceberg_snapshot_id in SETTINGS; the server sets the others.";
+
+/// The one setting a statement may name: the version picker's
+/// (`src/lib/snapshot-picker.ts`, `DATA-16`).
+const ALLOWED_SETTING: &str = "iceberg_snapshot_id";
+
+/// Finds a `SETTINGS` clause other than [`ALLOWED_SETTING`] anywhere in a
+/// parsed statement. The `Visitor` below reaches every `Query` (a
+/// subquery, a CTE, a derived table, an expression subquery, the query
+/// inside `EXPLAIN`), every table function's own argument list and every
+/// `INSERT`, which are the three places `sqlparser` keeps settings. The
+/// derived `Visit` covers every node kind, so a kind added by a later
+/// `sqlparser` is reached too.
+struct SettingsFinder;
+
+impl SettingsFinder {
+    fn refuses(settings: Option<&[sqlparser::ast::Setting]>) -> std::ops::ControlFlow<()> {
+        match settings {
+            Some(list) if list.iter().any(|s| s.key.value != ALLOWED_SETTING) => {
+                std::ops::ControlFlow::Break(())
+            }
+            _ => std::ops::ControlFlow::Continue(()),
+        }
+    }
+}
+
+impl sqlparser::ast::Visitor for SettingsFinder {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, query: &sqlparser::ast::Query) -> std::ops::ControlFlow<()> {
+        Self::refuses(query.settings.as_deref())
+    }
+
+    fn pre_visit_table_factor(
+        &mut self,
+        table_factor: &sqlparser::ast::TableFactor,
+    ) -> std::ops::ControlFlow<()> {
+        match table_factor {
+            sqlparser::ast::TableFactor::Table {
+                args: Some(args), ..
+            } => Self::refuses(args.settings.as_deref()),
+            _ => std::ops::ControlFlow::Continue(()),
+        }
+    }
+
+    fn pre_visit_statement(
+        &mut self,
+        statement: &sqlparser::ast::Statement,
+    ) -> std::ops::ControlFlow<()> {
+        match statement {
+            sqlparser::ast::Statement::Insert(insert) => Self::refuses(insert.settings.as_deref()),
+            _ => std::ops::ControlFlow::Continue(()),
+        }
+    }
+}
+
+/// SEC-21: a statement may name one setting, `iceberg_snapshot_id`. Any
+/// other `SETTINGS` entry would override the request-level settings the run
+/// sends (`ChClient::query_limited`): `SETTINGS max_result_rows = 0`
+/// measured 500,000 of 500,000 rows past the cap on `ClickHouse` 26.8, and
+/// `readonly = 1` is not an option because it also refuses the picker's
+/// setting.
+///
+/// `sql` is the statement that goes to the engine (the rewritten one), so
+/// what is checked is what `ClickHouse` reads. It is parsed with
+/// `ClickHouseDialect`; a statement that does not parse, or that is not
+/// exactly one statement, is refused with the same message, because a text
+/// this check cannot read is a text it cannot vouch for. Names are compared
+/// case-sensitively, so `ICEBERG_SNAPSHOT_ID` is refused.
+///
+/// # Errors
+/// 422 [`ApiError::Unprocessable`] with [`SETTINGS_REFUSAL_MESSAGE`] when
+/// the statement names another setting, does not parse, or is more than one
+/// statement. The parser's own message is dropped.
+fn refuse_unlisted_settings(sql: &str) -> Result<(), ApiError> {
+    let refusal = || ApiError::Unprocessable(SETTINGS_REFUSAL_MESSAGE.to_owned());
+    let statements =
+        sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::ClickHouseDialect {}, sql)
+            .map_err(|_| refusal())?;
+    if statements.len() != 1 {
+        return Err(refusal());
+    }
+    match sqlparser::ast::Visit::visit(&statements, &mut SettingsFinder) {
+        std::ops::ControlFlow::Break(()) => Err(refusal()),
+        std::ops::ControlFlow::Continue(()) => Ok(()),
+    }
+}
+
 /// Runs the already-rewritten `sql` against whichever engine `engine`
 /// names, returning `(columns, rows, duration_ms, scanned_bytes)`. Split
 /// out of [`run`] purely to keep that function under
@@ -206,6 +757,10 @@ async fn execute_query_against_engine(
     sql: &str,
     user_id: &str,
     started: Instant,
+    (run, limits): (
+        &crate::query_limits::QueryRun,
+        &crate::query_limits::TileLimits,
+    ),
 ) -> Result<(Vec<String>, Vec<Value>, u64, u64), ApiError> {
     if engine == "trino" {
         let trino_user = format!("console-{user_id}");
@@ -223,11 +778,30 @@ async fn execute_query_against_engine(
         // text is logged under the reference. An unreachable engine or a
         // non-query failure stays the fixed message. See
         // `upstream_error::ch_error_for_author`.
+        //
+        // SEC-21: the engine stops producing rows past the cap, so a huge
+        // result never reaches this process. One row more than the route
+        // keeps is asked for, so `truncated` stays honest.
+        //
+        // BI-5: the cap is the administrator's Query Studio row limit, the
+        // engine also stops the query at the time limit, and the query is
+        // named so Stop can end it (`QueryRun::options`). A query the limit
+        // or a Stop ended gets a fixed sentence (plan D6), not the engine's
+        // text.
+        let options = run.options(limits, limits.studio_rows);
         let result = state
             .clickhouse
-            .query(sql, None)
+            .query_with_options(sql, &options, None)
             .await
-            .map_err(|e| upstream_error::ch_error_for_author(&upstream_error::DATABASE, &e))?;
+            .map_err(|e| {
+                if e.is_time_limit() {
+                    ApiError::Unprocessable(crate::query_limits::time_sentence("query", limits))
+                } else if e.is_killed_on_engine() {
+                    ApiError::Unprocessable(crate::query_limits::STOPPED_SENTENCE.to_owned())
+                } else {
+                    upstream_error::ch_error_for_author(&upstream_error::DATABASE, &e)
+                }
+            })?;
 
         let columns: Vec<String> = result.meta.iter().map(|m| m.name.clone()).collect();
         let rows: Vec<Value> = result
@@ -274,6 +848,8 @@ async fn execute_query_against_engine(
 ///   read statements can be proposed.
 /// - A statement the policy refuses: the policy's own non-leaking message,
 ///   from [`rewrite_sql_for_principal`].
+/// - A statement that names a setting other than `iceberg_snapshot_id`: the
+///   settings rule's fixed sentence (`SEC-21`).
 /// - A statement `ClickHouse` cannot plan: its own SQL error text, which is
 ///   the author's to see, the same text `run_sql` already treats as such.
 /// - `engine` `"trino"`: a fixed "not supported yet" sentence. Plan 16
@@ -295,6 +871,10 @@ pub(crate) async fn check_statement_would_run(
     if is_trino_engine(engine) {
         return Err("Checking a Trino statement is not supported yet.".to_owned());
     }
+    // SEC-21: the check sends the statement to the engine, so the proposal
+    // must meet the settings rule a run applies, or the user would be shown a
+    // fix that `run` then refuses.
+    refuse_unlisted_settings(&rewritten).map_err(|err| err.to_string())?;
     let query = format!("EXPLAIN PLAN {}", strip_trailing_semicolon(&rewritten));
     state
         .clickhouse
@@ -308,24 +888,36 @@ pub(crate) async fn check_statement_would_run(
         .map_err(|err| upstream_error::ch_message_for_author(&upstream_error::DATABASE, &err))
 }
 
-/// The most rows one run hands back to the browser.
-///
-/// The console renders every row it receives, so an unbounded `SELECT *`
-/// used to be enough to freeze the tab. `ClickHouse`/`Trino` still compute
-/// the whole result — this caps what crosses the wire, and the response
-/// says when it did (`truncated`), so nobody reads a partial answer as the
-/// whole one.
-const MAX_RESULT_ROWS: usize = 2_000;
+// The most rows one run hands back to the browser is the administrator's
+// Query Studio row limit (`TileLimits::studio_rows`, default 2,000; `BI-5`).
+//
+// The console renders every row it receives, so an unbounded `SELECT *`
+// used to be enough to freeze the tab. The response says when the cap
+// applied (`truncated`), so nobody reads a partial answer as the whole one.
+//
+// `ClickHouse` is asked to stop at the cap (`ChClient::query_with_options`),
+// so a huge result does not fill this process's memory before `truncate`
+// runs (SEC-21). `result_overflow_mode = 'break'` stops at a block
+// boundary, so up to one block (`max_block_size`, about 65,000 rows by
+// default) beyond the cap can still arrive; the route keeps `studio_rows` of
+// them. `Trino`'s client bounds its own result.
 
 /// `POST /api/query/run` — execute a read-only `SQL` statement against
 /// `ClickHouse` (`engine` absent or `"clickhouse"`) or `Trino`
 /// (`engine: "trino"`, WS2 §4) and return it in `QueryResult` shape.
 ///
-/// Every successful run is written to the audit trail and to the caller's
-/// query history (best-effort — see `queries::record_history`'s doc
-/// comment). A refused or failed run is answered with an error and is NOT
-/// separately recorded here; the audit trail's own refusal path is what
-/// WS7 built for enforcement decisions, not this route's history write.
+/// Every run that reaches an answer is recorded, best-effort (see
+/// `queries::record_history`'s doc comment): a completed run in the audit
+/// trail and in the caller's query history, as before; a refused run as
+/// history status `blocked` and a failed engine call as `failed`, each
+/// with the exact message the response carries and the tables the
+/// statement names (`QS-4`). A run whose body does not parse, whose `sql`
+/// is empty, or that has no principal is not recorded — nobody, or
+/// nothing, to record. A run the caller stops is recorded as `failed`
+/// too (`BI-5`): Stop ends the statement on the server, so the server is
+/// told, and the row carries the stop's own fixed sentence. The audit
+/// trail's own refusal path stays what WS7 built it for: enforcement
+/// decisions, not this route's history write.
 ///
 /// # Errors
 ///
@@ -344,30 +936,61 @@ const MAX_RESULT_ROWS: usize = 2_000;
 ///   the request is refused before anything runs. The route is
 ///   policy-gated (`Policy::RequiresPermission("query:read")`), so this is
 ///   defense in depth, the same shape `routes::gold::export` uses.
+/// - 404 [`ApiError::NotFound`] when the statement reads a table the
+///   caller's tenant may not read: the fixed sentence of
+///   [`table_not_available`], the same whether the table belongs to
+///   another tenant or does not exist at all (`SEC-20`). Never a 403:
+///   Query Studio's Run all reads a 403 as "this user may not run
+///   anything" and would refuse the other statements too.
 /// - 422 [`ApiError::Unprocessable`] when `sql` fails [`is_read_only`] (any
 ///   engine) or [`is_trino_safe`] (`engine: "trino"` only), or when the
 ///   engine itself rejects the query, or `sql_rewrite::enforce` refuses it
 ///   (WS7 item C2 — a table function, a sensitive `system.*` read, a
 ///   `dictGet`/`joinGet`-family call, a view over a governed table, or an
 ///   authored-but-unenforceable policy condition, WS7 plan Hard
-///   Requirement 1).
+///   Requirement 1), or, on `ClickHouse`, when the statement names a setting
+///   other than `iceberg_snapshot_id` (`SEC-21`).
 /// - 503 [`ApiError::Unavailable`] when `Trino` is unreachable or times out.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one linear guard order (read-only, principal, Trino keywords, \
+              policy rewrite, settings, engine), each guard now ending in the \
+              same best-effort history record that `record_blocked` and \
+              `record_uncompleted_run` carry; splitting the guards into \
+              helpers would scatter an order whose sequence is the route's \
+              correctness, for a threshold, not a real seam"
+)]
 pub async fn run(
     State(state): State<AppState>,
     principal: Option<Extension<Principal>>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
     let parsed = parse_body(&body)?;
-    let sql = match parsed.sql {
+    let statement = match parsed.sql {
         Some(s) if !s.is_empty() => s,
         _ => return Err(ApiError::BadRequest("sql is required".to_owned()).into()),
     };
-    if !is_read_only(&sql) {
-        return Err(ApiError::Unprocessable(
+    // The engine is only a request field, so reading it before the guards
+    // changes nothing about which refusal a request meets. It is needed
+    // here for `tables_read`: the statement's tables are parsed with the
+    // dialect of the engine it names (the same parser the policy step
+    // uses), and the history row records them whether the run completes,
+    // fails or is refused (`QS-4`, decisions 3 and 4).
+    let engine = parsed.engine.as_deref().unwrap_or("clickhouse").to_owned();
+    let tables_read = referenced_table_names(&statement, is_trino_engine(&engine));
+
+    if !is_read_only(&statement) {
+        let refusal = ApiError::Unprocessable(
             "Only read queries (SELECT/SHOW/DESCRIBE/EXPLAIN) are allowed in Query Studio."
                 .to_owned(),
-        )
-        .into());
+        );
+        // No principal, no row: nobody to record the refusal against
+        // (`QS-4`, decision 3).
+        if let Some(Extension(p)) = &principal {
+            record_blocked(&state, p, &statement, &engine, &tables_read, &refusal).await;
+        }
+        return Err(refusal.into());
     }
 
     // See this function's doc comment: there is no honest value left to
@@ -378,15 +1001,20 @@ pub async fn run(
         return Err(ApiError::unauthorized().into());
     };
     let user_id = p.id.uuid().to_string();
+    // BI-5: this caller's limits and the run (`X-Run-Id`) the statement
+    // belongs to, so Stop can find it.
+    let run = crate::query_limits::QueryRun::current_or_detached();
+    let limits = run.limits().await?;
+    let row_limit = limits.studio_rows as usize;
 
-    let engine = parsed.engine.as_deref().unwrap_or("clickhouse").to_owned();
-    if engine == "trino" && !is_trino_safe(&sql) {
-        return Err(ApiError::Unprocessable(
+    if engine == "trino" && !is_trino_safe(&statement) {
+        let refusal = ApiError::Unprocessable(
             "This statement is not permitted against Trino (write, session, or procedure \
              keyword detected)."
                 .to_owned(),
-        )
-        .into());
+        );
+        record_blocked(&state, &p, &statement, &engine, &tables_read, &refusal).await;
+        return Err(refusal.into());
     }
 
     // WS7 item C2: every ad hoc SQL surface is rewritten through the same
@@ -395,21 +1023,92 @@ pub async fn run(
     // before `started`/`Instant::now()` below so the elapsed time recorded
     // for `policyDecisionP95Ms` covers exactly the rewrite step, nothing
     // else.
-    let sql = rewrite_sql_for_principal(&state, &sql, &engine, &p).await?;
+    //
+    // `statement` stays what the user wrote: query history records it (and
+    // `download` re-rewrites it for the caller's roles at that time), while
+    // `rewritten` is what the engine runs and the audit event records
+    // (`SEC-21`, `SEC-33`).
+    let rewritten =
+        match rewrite_sql_for_principal_with_headers(&state, &statement, &engine, &p, &headers)
+            .await
+        {
+            Ok(rewritten) => rewritten,
+            Err(err) => {
+                // A 4xx from the rewrite is the gate refusing (the policy, the
+                // tenant's tables, the caller's own tenant header); a 5xx is
+                // the service failing while asking. The history row says
+                // which.
+                let status: &'static str = if err.status() < 500 {
+                    "blocked"
+                } else {
+                    "failed"
+                };
+                record_uncompleted_run(
+                    &state,
+                    &p,
+                    &statement,
+                    &engine,
+                    status,
+                    &err.to_string(),
+                    &tables_read,
+                    0,
+                )
+                .await;
+                return Err(err.into());
+            }
+        };
+    // SEC-21: a statement's own `SETTINGS` would override the cap the run
+    // sends with the request. Trino has no such settings in its client.
+    if !is_trino_engine(&engine)
+        && let Err(refusal) = refuse_unlisted_settings(&rewritten)
+    {
+        record_blocked(&state, &p, &statement, &engine, &tables_read, &refusal).await;
+        return Err(refusal.into());
+    }
 
     let started = Instant::now();
     let started_epoch_ms = epoch_ms();
 
-    let (columns, mut rows, duration_ms, scanned_bytes) =
-        execute_query_against_engine(&state, &engine, &sql, &user_id, started).await?;
+    // QS-4: every run that reaches the engine is recorded, whether it
+    // answered or not. BI-5's limits travel with the call, so a run the time
+    // limit or a Stop ended ends here with the limit's own fixed sentence —
+    // and that sentence, not the engine's text, is what the history row
+    // carries, exactly as the response does.
+    let (columns, mut rows, duration_ms, scanned_bytes) = match execute_query_against_engine(
+        &state,
+        &engine,
+        &rewritten,
+        &user_id,
+        started,
+        (&run, &limits),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(err) => {
+            record_uncompleted_run(
+                &state,
+                &p,
+                &statement,
+                &engine,
+                "failed",
+                &err.to_string(),
+                &tables_read,
+                started.elapsed().as_millis(),
+            )
+            .await;
+            return Err(err.into());
+        }
+    };
 
     // The console renders every row it receives, so an unbounded `SELECT *`
-    // used to be enough to freeze the tab — see `MAX_RESULT_ROWS`'s own doc
-    // comment. `ClickHouse`/`Trino` still compute the whole result; only
-    // what crosses the wire is capped, and the response says when it did.
+    // used to be enough to freeze the tab — see the note above this function.
+    // The engines stop at the cap (`ClickHouse` inside the engine,
+    // `Trino` in its client); this keeps exactly `row_limit` of what
+    // arrived, and the response says when it did.
     let total_rows = rows.len();
-    let truncated = total_rows > MAX_RESULT_ROWS;
-    rows.truncate(MAX_RESULT_ROWS);
+    let truncated = total_rows > row_limit;
+    rows.truncate(row_limit);
 
     let cost_units = std::cmp::max(1, bytes_to_cost_units(scanned_bytes));
     let id = format!("q-{started_epoch_ms}");
@@ -425,7 +1124,7 @@ pub async fn run(
     // with this run's own `id` is the pairing WS1 T16's `LEFT JOIN`
     // resolves on read (WS5 Phase D preamble).
     if let Some(pool) = state.pg.as_deref() {
-        let event = query_run_audit_event(&p, &id, &sql);
+        let event = query_run_audit_event(&p, &id, &rewritten);
         if let Err(err) = lakehouse_store::audit::insert(pool, event).await {
             tracing::warn!(%err, "failed to record query.run audit event (query itself succeeded)");
         }
@@ -449,7 +1148,7 @@ pub async fn run(
         )]
         let input = RecordHistoryInput {
             id: &id,
-            sql: &sql,
+            sql: &statement,
             user: &user_id,
             owner_id: Some(p.id.uuid()),
             status: "completed",
@@ -459,6 +1158,8 @@ pub async fn run(
             workload_class: "hot-analytics",
             engine: &engine,
             cache_assisted: false,
+            tables_read: &tables_read,
+            message: None,
         };
         if let Err(err) = queries::record_history(pool, &input).await {
             tracing::warn!(%err, "failed to record query history (query itself succeeded)");
@@ -469,13 +1170,95 @@ pub async fn run(
         &id,
         &json!(columns),
         &json!(rows),
-        total_rows,
-        truncated,
+        (total_rows, truncated, row_limit),
         duration_ms,
         scanned_bytes,
         cost_units,
         &engine,
     )))
+}
+
+/// `QS-4` (the history page, decision 3): the one place records a run
+/// that did not complete.
+///
+/// The read-only guard, the Trino keyword check, the policy rewrite, the
+/// tenant gate and the settings guard record `blocked`; the engine's own
+/// error records `failed`. `message` is the exact text the response
+/// carries — an `ApiError`'s response body is `{"error": err.to_string()}`
+/// (`error.rs`), so the row and the caller's screen can never disagree,
+/// and the engine's own text reaches the row only the way it reached the
+/// response: already fixed and classified. Best-effort, the same posture
+/// as the completed write: a failed write is logged and never turns into
+/// an error response.
+///
+/// A refusal carries no measured numbers — nothing executed — so its
+/// duration is 0 and nothing was scanned or spent. An engine failure
+/// carries the time the failed attempt took, measured by the caller,
+/// where `started` is already in scope; nothing was scanned and nothing
+/// was spent that anyone reported.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "an attempt's elapsed milliseconds are wall-clock milliseconds; \
+              a duration that outlives i64's range outlives the service"
+)]
+async fn record_uncompleted_run(
+    state: &AppState,
+    principal: &Principal,
+    statement: &str,
+    engine: &str,
+    status: &'static str,
+    message: &str,
+    tables_read: &[String],
+    duration_ms: u128,
+) {
+    let Some(pool) = state.pg.as_deref() else {
+        return;
+    };
+    let user_id = principal.id.uuid().to_string();
+    let id = format!("q-{}", epoch_ms());
+    let input = RecordHistoryInput {
+        id: &id,
+        sql: statement,
+        user: &user_id,
+        owner_id: Some(principal.id.uuid()),
+        status,
+        duration_ms: duration_ms as i64,
+        scanned_bytes: 0,
+        cost_units: 0.0,
+        workload_class: "hot-analytics",
+        engine,
+        cache_assisted: false,
+        tables_read,
+        message: Some(message),
+    };
+    if let Err(err) = queries::record_history(pool, &input).await {
+        tracing::warn!(%err, "failed to record the refused or failed run");
+    }
+}
+
+/// The guard's shape of [`record_uncompleted_run`]: a refusal before the
+/// engine is asked is `blocked`, took no time, and its message is the
+/// refusal the response carries. One wrapper, so the guards' call sites
+/// stay one line and the five of them cannot drift apart.
+async fn record_blocked(
+    state: &AppState,
+    principal: &Principal,
+    statement: &str,
+    engine: &str,
+    tables_read: &[String],
+    refusal: &ApiError,
+) {
+    record_uncompleted_run(
+        state,
+        principal,
+        statement,
+        engine,
+        "blocked",
+        &refusal.to_string(),
+        tables_read,
+        0,
+    )
+    .await;
 }
 
 /// Built once per query run, unit-tested without a `ClickHouse`/Postgres
@@ -583,8 +1366,7 @@ fn run_result_json(
     id: &str,
     columns: &Value,
     rows: &Value,
-    total_rows: usize,
-    truncated: bool,
+    (total_rows, truncated, row_limit): (usize, bool, usize),
     duration_ms: u64,
     scanned_bytes: u64,
     cost_units: u64,
@@ -597,7 +1379,7 @@ fn run_result_json(
         "rows": rows,
         "rowCount": total_rows,
         "truncated": truncated,
-        "rowLimit": MAX_RESULT_ROWS,
+        "rowLimit": row_limit,
         "metrics": {
             "durationMs": duration_ms,
             "scannedBytes": scanned_bytes,
@@ -689,14 +1471,18 @@ fn bytes_to_cost_bucket(estimated_bytes: i64, divisor: f64) -> f64 {
 /// # Errors
 ///
 /// Returns 400 [`ApiError::BadRequest`] on an unparseable body or a
-/// missing/blank `sql`. An `EXPLAIN ESTIMATE` failure (e.g. non-`SELECT`
-/// input) still answers 200 — the console shows the estimate panel either
-/// way — but `estimatedBytes`/costs are `null` and the `ClickHouse` message
-/// is carried in `error`, rather than a zeroed estimate that looked
-/// identical to "this query reads nothing".
+/// missing/blank `sql`, and 422 [`ApiError::Unprocessable`] when `sql` fails
+/// [`is_read_only`], the rewrite refuses it, or it names a setting other than
+/// `iceberg_snapshot_id` (`SEC-21`), as [`run`] does. An `EXPLAIN
+/// ESTIMATE` failure (e.g. an unknown column) still answers 200 — the
+/// console shows the estimate panel either way — but `estimatedBytes`/costs
+/// are `null` and the `ClickHouse` message is carried in `error`, rather
+/// than a zeroed estimate that looked identical to "this query reads
+/// nothing".
 pub async fn estimate(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
     let parsed = parse_body(&body)?;
@@ -704,6 +1490,17 @@ pub async fn estimate(
         Some(s) if !s.trim().is_empty() => s,
         _ => return Err(ApiError::BadRequest("sql is required".to_owned()).into()),
     };
+    // SEC-19: the estimate refuses what the run refuses, with the run's
+    // status and message, and does so before the rewrite below, whose policy
+    // prefetch already queries the engine. `EXPLAIN ESTIMATE` is the only
+    // statement this route may send, so a non-read never reaches it.
+    if !is_read_only(&sql) {
+        return Err(ApiError::Unprocessable(
+            "Only read queries (SELECT/SHOW/DESCRIBE/EXPLAIN) are allowed in Query Studio."
+                .to_owned(),
+        )
+        .into());
+    }
 
     // A failed EXPLAIN is reported, not swallowed. It used to come back as
     // a zeroed estimate, so "this query cannot even be planned" and "this
@@ -717,7 +1514,12 @@ pub async fn estimate(
     // status and fixed message and is never sent to the engine. The planner
     // reports the tables the statement reads, which the rewrite does not
     // change, so the sources shown are what the run would show.
-    let rewritten = rewrite_sql_for_principal(&state, &sql, "clickhouse", &principal).await?;
+    let rewritten =
+        rewrite_sql_for_principal_with_headers(&state, &sql, "clickhouse", &principal, &headers)
+            .await?;
+    // SEC-21: the same settings rule as the run, on the statement the engine
+    // is sent.
+    refuse_unlisted_settings(&rewritten)?;
     let estimated = estimate_body(&state.clickhouse, &rewritten).await;
     let (estimated_bytes, sources, estimate_error) = match estimated {
         Ok((bytes, sources)) => (Some(bytes), sources, None),
@@ -735,14 +1537,33 @@ pub async fn estimate(
         sources
     };
 
-    Ok(ApiJson(estimate_result_json(
+    let mut result = estimate_result_json(
         estimated_bytes,
         cost_min,
         cost_max,
         &json!(sources_out),
         freshness_lag_seconds,
         estimate_error.as_deref(),
-    )))
+    );
+    // DATA-12 part 3: the marks of the tables this ClickHouse query reads,
+    // beside `sources` (which stays a list of names). One batch read; only a
+    // marked source gets an entry, and `sourceMarks` is absent when none is.
+    // This route estimates ClickHouse queries only; a Trino query is not
+    // estimated here and has no sources to mark.
+    // PR #106 review R1 BLOCKER 2, SHOULD-FIX DATA-12 2:
+    // Only decorate with sourceMarks if catalog_tenant_refusal allows it:
+    if let Ok(None) =
+        crate::routes::catalog::catalog_tenant_refusal(&state, &principal, &headers).await
+    {
+        let names = std::collections::HashMap::new();
+        let marks = crate::routes::catalog::certification_marks(&state, &sources_out, &names).await;
+        if !marks.is_empty()
+            && let Some(o) = result.as_object_mut()
+        {
+            o.insert("sourceMarks".to_owned(), json!(marks));
+        }
+    }
+    Ok(ApiJson(result))
 }
 
 /// Build the `/api/query/estimate` response body from already-computed
@@ -913,29 +1734,145 @@ fn pool(state: &AppState) -> Result<&PgPool, ApiError> {
     })
 }
 
-/// `GET /api/query/saved` — every saved query.
+/// `GET /api/query/saved` — the caller's tenant's saved queries.
+///
+/// `SEC-20`: a saved query is a statement somebody wrote against their
+/// own data, so it belongs to the tenant that wrote it. The list holds
+/// the caller's tenant's rows, and the rows that belong to no tenant
+/// when that tenant owns the shared catalog (see [`saved_query_scope`]).
 ///
 /// # Errors
 ///
-/// 503 if no pool is configured; 500 on a database failure.
-pub async fn list_saved(State(state): State<AppState>) -> ApiResult<ApiJson<Vec<SavedQuery>>> {
-    Ok(ApiJson(queries::list_saved(pool(&state)?).await?))
+/// 401 when nobody is signed in — a saved query belongs to a tenant, so
+/// there is no sensible answer for "everybody's"; 404 for an `X-Tenant`
+/// header the caller does not belong to; 503 if no pool is configured;
+/// 500 on a database failure.
+pub async fn list_saved(
+    State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
+    headers: HeaderMap,
+) -> ApiResult<ApiJson<Vec<SavedQuery>>> {
+    let Extension(principal) =
+        principal.ok_or_else(|| ApiError::Unauthorized("sign in required".to_owned()))?;
+    let scope = saved_query_scope(&state, &principal, &headers).await?;
+    Ok(ApiJson(queries::list_saved(pool(&state)?, scope).await?))
 }
 
-/// `GET /api/query/history` — the caller's own recent query executions,
-/// recorded by [`run`].
+/// The `GET /api/query/history` query string (`QS-4`, decision 5). Every
+/// field stays a raw string on purpose: this struct parses whatever the
+/// caller sends, so the extractor itself can never reject, and
+/// [`parse_history_query`] is the one place a bad value becomes a 400
+/// with this route's own fixed message — never `serde_urlencoded`'s
+/// rendering of a serde error.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryQueryRaw {
+    status: Option<String>,
+    engine: Option<String>,
+    min_duration_ms: Option<String>,
+    table: Option<String>,
+    from: Option<String>,
+    to: Option<String>,
+    /// The page cursor: `<at>,<id>` — the `at` and `id` of the last row
+    /// the caller has already seen.
+    before: Option<String>,
+}
+
+/// The statuses `query_history`'s own check allows — the set [`run`]
+/// records, and nothing else.
+const HISTORY_STATUSES: [&str; 4] = ["completed", "failed", "cancelled", "blocked"];
+
+/// The engines [`run`] records.
+const HISTORY_ENGINES: [&str; 2] = ["clickhouse", "trino"];
+
+/// Parse the history query string into a [`HistoryFilter`], refusing a
+/// bad value with a fixed 400 before the store sees it.
+///
+/// Unknown keys are ignored, not refused: the contract is the seven
+/// documented names, and a caller sending more than that is forward
+/// compatible, not wrong. An empty value (`?status=`) is no value, so a
+/// client that builds links from empty inputs filters nothing instead of
+/// getting a 400 it cannot read.
+fn parse_history_query(raw: &HistoryQueryRaw) -> Result<HistoryFilter<'_>, ApiError> {
+    let mut filter = HistoryFilter::default();
+    if let Some(status) = raw.status.as_deref().filter(|s| !s.is_empty()) {
+        if !HISTORY_STATUSES.contains(&status) {
+            return Err(ApiError::BadRequest(
+                "status must be one of completed, failed, cancelled, blocked".to_owned(),
+            ));
+        }
+        filter.status = Some(status);
+    }
+    if let Some(engine) = raw.engine.as_deref().filter(|s| !s.is_empty()) {
+        if !HISTORY_ENGINES.contains(&engine) {
+            return Err(ApiError::BadRequest(
+                "engine must be one of clickhouse, trino".to_owned(),
+            ));
+        }
+        filter.engine = Some(engine);
+    }
+    if let Some(min) = raw.min_duration_ms.as_deref().filter(|s| !s.is_empty()) {
+        filter.min_duration_ms = Some(min.parse::<i64>().ok().filter(|ms| *ms >= 0).ok_or_else(
+            || {
+                ApiError::BadRequest(
+                    "minDurationMs must be a non-negative whole number of milliseconds".to_owned(),
+                )
+            },
+        )?);
+    }
+    if let Some(table) = raw.table.as_deref().filter(|s| !s.is_empty()) {
+        filter.table = Some(table);
+    }
+    filter.from = history_time("from", raw.from.as_deref())?;
+    filter.to = history_time("to", raw.to.as_deref())?;
+    if let Some(before) = raw.before.as_deref().filter(|s| !s.is_empty()) {
+        let bad_before = || {
+            ApiError::BadRequest(
+                "before must be <at>,<id>: the at and the id of the last row you have seen"
+                    .to_owned(),
+            )
+        };
+        let (at, id) = before.split_once(',').ok_or_else(bad_before)?;
+        if id.is_empty() {
+            return Err(bad_before());
+        }
+        filter.before_at = Some(OffsetDateTime::parse(at, &Rfc3339).map_err(|_| bad_before())?);
+        filter.before_id = Some(id);
+    }
+    Ok(filter)
+}
+
+/// Parse one of the window bounds: RFC 3339, the format the rows' own
+/// `at` carries, so a cursor cut from a listed row parses back.
+fn history_time(field: &str, raw: Option<&str>) -> Result<Option<OffsetDateTime>, ApiError> {
+    match raw {
+        // An empty value is no value, like every other filter field.
+        None | Some("") => Ok(None),
+        Some(raw) => OffsetDateTime::parse(raw, &Rfc3339)
+            .map(Some)
+            .map_err(|_| ApiError::BadRequest(format!("{field} must be an RFC 3339 time"))),
+    }
+}
+
+/// `GET /api/query/history` — the caller's own recorded query executions,
+/// filtered, inside the last 14 days, one page at a time (`QS-4`).
 ///
 /// # Errors
 ///
 /// 401 when nobody is signed in — history belongs to a person, so there is
-/// no sensible answer for "everyone's". 503 if no pool is configured; 500
-/// on a database failure.
+/// no sensible answer for "everyone's". 400 for a bad filter value, with a
+/// fixed message naming the field. 503 if no pool is configured; 500 on a
+/// database failure.
 pub async fn list_history(
     State(state): State<AppState>,
     principal: Option<Extension<Principal>>,
+    Query(raw): Query<HistoryQueryRaw>,
 ) -> ApiResult<ApiJson<Vec<QueryHistoryItem>>> {
     let owner = caller_id(principal.as_ref())?;
-    Ok(ApiJson(queries::list_history(pool(&state)?, owner).await?))
+    let filter = parse_history_query(&raw)?;
+    Ok(ApiJson(
+        queries::list_history(pool(&state)?, owner, &filter).await?,
+    ))
 }
 
 /// The signed-in caller's id, or a 401.
@@ -957,18 +1894,23 @@ pub struct CreateSavedQueryBody {
 
 /// `POST /api/query/saved` — save the SQL in the editor under a name.
 ///
-/// Saved queries are shared: the whole team sees them, which is what makes
-/// them worth saving. The author is recorded all the same.
+/// `SEC-20`: a saved query belongs to the tenant that wrote it. The
+/// tenant is the one the request acts as — the `X-Tenant` header when the
+/// caller sends one, the caller's first tenant otherwise — and the row is
+/// that tenant's alone; the rows that belong to no tenant are the shared
+/// catalog's own. The author is recorded all the same.
 ///
 /// # Errors
 ///
 /// 400 on a malformed body or a blank title/SQL; 401 when nobody is signed
-/// in; 422 when the SQL is not read-only — a saved query is run through the
-/// same guard as anything else, so refusing it here is better than storing
+/// in; 404 for an `X-Tenant` header the caller does not belong to; 422
+/// when the SQL is not read-only — a saved query is run through the same
+/// guard as anything else, so refusing it here is better than storing
 /// something that can never run; 503/500 as above.
 pub async fn create_saved(
     State(state): State<AppState>,
     principal: Option<Extension<Principal>>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<(StatusCode, ApiJson<SavedQuery>)> {
     let body: CreateSavedQueryBody = serde_json::from_slice(&body)
@@ -985,6 +1927,18 @@ pub async fn create_saved(
         .into());
     }
     let owner_id = caller_id(principal.as_ref())?;
+    // The tenant the row belongs to is the tenant the request acts as,
+    // answered by the one resolver every caller without a header gets
+    // (`tenant_scope::resolve`). A caller in no tenant writes a row that
+    // belongs to no tenant: nobody can say whose query it is, so it is
+    // not anybody's to read but the shared catalog's owner's.
+    let tenant_id = crate::tenant_scope::resolve(
+        principal
+            .as_ref()
+            .map(|Extension(p)| p)
+            .ok_or_else(|| ApiError::Unauthorized("sign in required".to_owned()))?,
+        &headers,
+    )?;
     let owner = principal.map_or_else(|| "anonymous".to_owned(), |Extension(p)| p.display_name);
     let saved = queries::create_saved_query(
         pool(&state)?,
@@ -993,6 +1947,7 @@ pub async fn create_saved(
         &owner,
         &body.tags,
         Some(owner_id),
+        tenant_id,
     )
     .await?;
     Ok((StatusCode::CREATED, ApiJson(saved)))
@@ -1105,6 +2060,13 @@ fn map_download_ch_error(err: &ChError) -> ApiError {
 /// original run changes what comes back. The statement is rewritten for the
 /// caller's current roles first, exactly as the run route does.
 ///
+/// The stored statement is the one the user wrote ([`run`] records it, not
+/// the rewritten form), so today's policy is applied to it once. A row
+/// recorded before that change holds the rewritten form: an old mask or row
+/// filter sits inside it and today's policy applies on top, which only adds
+/// restriction (it fails closed). Those rows are left as they are (`SEC-21`,
+/// `SEC-33`).
+///
 /// Only rows whose `engine` is `"clickhouse"` or the legacy `"hot-store"`
 /// placeholder are eligible (WS2 plan review W9) — a `"trino"` row cannot
 /// be re-run through this route at all.
@@ -1126,7 +2088,9 @@ fn map_download_ch_error(err: &ChError) -> ApiError {
 ///   one does but its recorded owner is not the calling principal
 ///   (including every legacy `"anonymous"` row — see this doc comment).
 /// - 422 [`ApiError::Unprocessable`] when the policy rewrite refuses the
-///   statement (the run route's fixed message), when the row's `engine` is not
+///   statement (the run route's fixed message), when the statement names a
+///   setting other than `iceberg_snapshot_id` (`SEC-21`; the cap this route
+///   appends afterwards is not subject to that rule), when the row's `engine` is not
 ///   downloadable, when its stored `SQL` fails [`is_read_only`] (defense
 ///   in depth: `routes::query::run` already gated this at insert time),
 ///   or when `ClickHouse` rejects the re-run.
@@ -1137,6 +2101,7 @@ pub async fn download(
     Path(id): Path<String>,
     Query(query): Query<DownloadQuery>,
     principal: Option<Extension<Principal>>,
+    headers: HeaderMap,
 ) -> ApiResult<Response> {
     let (format_clause, content_type, extension) = match query.format.as_str() {
         "csv" => ("CSV", "text/csv", "csv"),
@@ -1187,7 +2152,12 @@ pub async fn download(
     let Some(Extension(caller)) = principal.as_ref() else {
         return Err(ApiError::NotFound("query run not found".to_owned()).into());
     };
-    let rewritten = rewrite_sql_for_principal(&state, &item.sql, &item.engine, caller).await?;
+    let rewritten =
+        rewrite_sql_for_principal_with_headers(&state, &item.sql, &item.engine, caller, &headers)
+            .await?;
+    // SEC-21: the stored statement may carry a setting recorded before the
+    // rule. The cap added below is appended after this check and stays.
+    refuse_unlisted_settings(&rewritten)?;
     let capped_sql = build_capped_statement(&rewritten, format_clause);
     let bytes = state
         .clickhouse
@@ -1253,6 +2223,236 @@ pub async fn scheduling(State(_state): State<AppState>) -> ApiResult<ApiJson<Val
     Ok(ApiJson(scheduling_capability_body()))
 }
 
+/// The SEC-21 settings rule, tested on its own. A separate module from
+/// `tests` so the two do not share a hunk.
+#[cfg(test)]
+mod settings_rule_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::collections::HashMap;
+
+    use lakehouse_auth::{PermissionSet, PrincipalId};
+    use wiremock::{MockServer, ResponseTemplate};
+
+    use super::*;
+    use crate::config::Config;
+
+    /// Statements the parser reads as one statement and that name a setting
+    /// other than `iceberg_snapshot_id`, in every place a setting can sit.
+    /// (`SELECT 1 SETTINGS ..` is not here: the parser reads `SETTINGS` as
+    /// the alias of `1`, so it is in [`UNREADABLE`].)
+    const REFUSED_FOR_A_SETTING: &[&str] = &[
+        "SELECT n FROM serving.t SETTINGS max_result_rows = 0",
+        "SELECT n FROM serving.t SETTINGS max_execution_time = 0",
+        "SELECT n FROM serving.t SETTINGS iceberg_snapshot_id = 1, max_result_rows = 0",
+        "SELECT n FROM serving.t SETTINGS max_result_rows = 0, iceberg_snapshot_id = 1",
+        "SELECT n FROM serving.t SETTINGS max_result_rows = 0 FORMAT JSON",
+        "SELECT n FROM serving.t SETTINGS /* a comment */ max_result_rows = 0",
+        "SELECT n FROM serving.t SETTINGS \"max_result_rows\" = 0",
+        // Case-sensitive: the picker writes the lower-case name.
+        "SELECT n FROM serving.t SETTINGS ICEBERG_SNAPSHOT_ID = 1",
+        "SELECT n FROM serving.t SETTINGS Iceberg_Snapshot_Id = 1",
+        // Every place a query can sit.
+        "SELECT * FROM (SELECT n FROM serving.t SETTINGS max_result_rows = 0)",
+        "WITH c AS (SELECT n FROM serving.t SETTINGS max_result_rows = 0) SELECT * FROM c",
+        "SELECT (SELECT n FROM serving.t SETTINGS max_result_rows = 0) AS x",
+        "SELECT n FROM serving.t WHERE n IN (SELECT n FROM serving.u SETTINGS max_result_rows = 0)",
+        "SELECT n FROM serving.t WHERE EXISTS (SELECT n FROM serving.u SETTINGS max_result_rows = 0)",
+        "SELECT n FROM serving.t UNION ALL SELECT n FROM serving.u SETTINGS max_result_rows = 0",
+        "(SELECT n FROM serving.t SETTINGS max_result_rows = 0) UNION ALL SELECT n FROM serving.u",
+        "SELECT a.n FROM serving.t a JOIN (SELECT n FROM serving.u SETTINGS max_result_rows = 0) b ON a.n = b.n",
+        "EXPLAIN SELECT n FROM serving.t SETTINGS max_result_rows = 0",
+        "EXPLAIN SELECT * FROM (SELECT n FROM serving.t SETTINGS max_result_rows = 0)",
+        "EXPLAIN ESTIMATE SELECT n FROM serving.t SETTINGS max_result_rows = 0",
+        // After each clause the setting can follow.
+        "SELECT n FROM serving.t FINAL SETTINGS max_result_rows = 0",
+        "SELECT n FROM serving.t ARRAY JOIN arr SETTINGS max_result_rows = 0",
+        "SELECT n FROM serving.t GROUP BY n WITH ROLLUP SETTINGS max_result_rows = 0",
+        "SELECT n FROM serving.t LIMIT 10 OFFSET 2 SETTINGS max_result_rows = 0",
+        "SELECT n FROM serving.t\n-- a comment\nSETTINGS max_result_rows = 0",
+        // A setting that is not on a query.
+        "SELECT * FROM executable('x.py', TabSeparated, 'a UInt8', SETTINGS pool_size = 16)",
+        "INSERT INTO t SETTINGS async_insert = 1 FORMAT JSONEachRow",
+    ];
+
+    /// Statements the rule refuses because it cannot read them as exactly one
+    /// statement. The engine would not see a different statement for these,
+    /// and the rewrite refuses most of them first.
+    const UNREADABLE: &[&str] = &[
+        "SELECT 1 SETTINGS max_result_rows = 0",
+        "SELECT n FROM serving.t; SELECT n FROM serving.u",
+        "SELECT n FROM serving.t SETTINGS iceberg_snapshot_id = 1; SELECT 2",
+        "SET max_result_rows = 0; SELECT n FROM serving.t",
+        "SELECT n FROM serving.t FORMAT JSON SETTINGS max_result_rows = 0",
+        "SELEC n FROM serving.t",
+        "SELECT n FROM serving.t SETTINGS",
+        // Statement kinds that can carry no setting in the parser's tree, so
+        // the parser must not accept them with one.
+        "SHOW TABLES SETTINGS max_result_rows = 0",
+        "DESCRIBE serving.t SETTINGS max_result_rows = 0",
+        "EXPLAIN AST SELECT n FROM serving.t SETTINGS max_result_rows = 0",
+        "SELECT n FROM serving.t INTO OUTFILE 'x' SETTINGS max_result_rows = 0",
+        "",
+    ];
+
+    /// The picker's output shapes (`src/lib/snapshot-picker.ts`) and
+    /// statements with no setting at all.
+    const ALLOWED: &[&str] = &[
+        "SELECT 1",
+        "SELECT 1;",
+        "SELECT n FROM serving.t WHERE n > 1 LIMIT 10",
+        "-- a comment\nSELECT 1",
+        "SELECT 'SETTINGS max_result_rows = 0' AS note",
+        "SELECT 1 AS settings",
+        "EXPLAIN SELECT 1",
+        "SHOW TABLES",
+        "DESCRIBE serving.t",
+        "SELECT n FROM serving.t\nSETTINGS iceberg_snapshot_id = 1",
+        "SELECT n FROM serving.t\nSETTINGS iceberg_snapshot_id = 4733245589251823498",
+        "SELECT n FROM serving.t LIMIT 5\nSETTINGS iceberg_snapshot_id = 1;",
+        "SELECT * FROM (SELECT n FROM serving.t) SETTINGS iceberg_snapshot_id = 1",
+        "SELECT n FROM serving.t SETTINGS iceberg_snapshot_id = 1 FORMAT JSON",
+        "SELECT n FROM serving.t SETTINGS iceberg_snapshot_id = 1, iceberg_snapshot_id = 2",
+        "EXPLAIN SELECT n FROM serving.t SETTINGS iceberg_snapshot_id = 1",
+    ];
+
+    fn refusal(sql: &str) -> ApiError {
+        refuse_unlisted_settings(sql).expect_err(&format!("expected a refusal: {sql:?}"))
+    }
+
+    #[test]
+    fn a_statement_with_any_other_setting_is_refused_with_one_fixed_message() {
+        for sql in REFUSED_FOR_A_SETTING.iter().chain(UNREADABLE) {
+            match refusal(sql) {
+                ApiError::Unprocessable(message) => {
+                    assert_eq!(message, SETTINGS_REFUSAL_MESSAGE, "{sql:?}");
+                }
+                other => panic!("expected 422 for {sql:?}, got {other:?}"),
+            }
+        }
+    }
+
+    /// Without this, a refusal above could come from the parser failing and
+    /// not from the rule, and removing the rule would leave the test green.
+    #[test]
+    fn every_statement_refused_for_a_setting_parses_as_one_statement() {
+        for sql in REFUSED_FOR_A_SETTING {
+            let parsed = sqlparser::parser::Parser::parse_sql(
+                &sqlparser::dialect::ClickHouseDialect {},
+                sql,
+            );
+            assert_eq!(parsed.map(|statements| statements.len()), Ok(1), "{sql:?}");
+        }
+    }
+
+    #[test]
+    fn the_version_pickers_setting_and_a_statement_without_settings_pass() {
+        for sql in ALLOWED {
+            assert!(
+                refuse_unlisted_settings(sql).is_ok(),
+                "expected allowed: {sql:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_refusal_says_nothing_about_the_statement() {
+        let message = SETTINGS_REFUSAL_MESSAGE;
+        for sql in [
+            "SELECT secret_column FROM salary SETTINGS salary_total = 0",
+            "SELEC salary",
+        ] {
+            let ApiError::Unprocessable(shown) = refusal(sql) else {
+                panic!("expected 422 for {sql:?}");
+            };
+            assert_eq!(shown, message);
+            assert!(!shown.contains("salary") && !shown.contains("secret_column"));
+        }
+    }
+
+    fn database_url_for(pool: &PgPool) -> String {
+        let options = pool.connect_options();
+        format!(
+            "postgres://{}:postgres@{}:{}/{}",
+            options.get_username(),
+            options.get_host(),
+            options.get_port(),
+            options
+                .get_database()
+                .expect("#[sqlx::test] always targets a named database"),
+        )
+    }
+
+    /// The shared catalog belongs to one tenant, and the query path is
+    /// scoped to the tenant: this fixture principal is the catalog's own
+    /// member, so the shared tables stay reachable.
+    const CATALOG_TENANT_ID: &str = "11111111-1111-4111-8111-000000000001";
+
+    fn analyst() -> Principal {
+        Principal {
+            id: PrincipalId::User(Uuid::nil()),
+            tenant_ids: vec![uuid::uuid!("11111111-1111-4111-8111-000000000001")],
+            display_name: "alice".to_owned(),
+            permissions: PermissionSet::parse("query:read"),
+            provider: "session".to_owned(),
+            must_change_password: false,
+            role_names: vec!["Analyst".to_owned()],
+        }
+    }
+
+    /// The Fix-with-AI check sends the statement to the engine inside an
+    /// `EXPLAIN PLAN`, so it applies the rule too.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_proposal_check_refuses_another_setting_before_the_engine_is_asked(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let server = MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "meta": [], "data": [], "rows": 0,
+            })))
+            .mount(&server)
+            .await;
+        let mut env = HashMap::new();
+        env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
+        env.insert("CH_URL".to_owned(), server.uri());
+        env.insert("CATALOG_TENANT_ID".to_owned(), CATALOG_TENANT_ID.to_owned());
+        let state = AppState::new(Config::from_map(&env).expect("valid config from a map"));
+
+        let refused = check_statement_would_run(
+            &state,
+            &analyst(),
+            "SELECT n FROM serving.t SETTINGS max_result_rows = 0",
+            "clickhouse",
+        )
+        .await;
+        assert_eq!(refused, Err(SETTINGS_REFUSAL_MESSAGE.to_owned()));
+
+        let leaked: Vec<String> = server
+            .received_requests()
+            .await
+            .expect("mock server records requests")
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .filter(|b| !b.contains("system."))
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "nothing may reach the engine: {leaked:?}"
+        );
+
+        let allowed = check_statement_would_run(
+            &state,
+            &analyst(),
+            "SELECT n FROM serving.t SETTINGS iceberg_snapshot_id = 1",
+            "clickhouse",
+        )
+        .await;
+        assert_eq!(allowed, Ok(()));
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -1267,7 +2467,7 @@ mod tests {
     fn fixture_user_principal() -> Principal {
         Principal {
             id: PrincipalId::User(Uuid::from_u128(1)),
-            tenant_ids: Vec::new(),
+            tenant_ids: vec![uuid::uuid!("11111111-1111-4111-8111-000000000001")],
             display_name: "Rina Wijaya".to_owned(),
             permissions: PermissionSet::parse("query:read"),
             provider: "session".to_owned(),
@@ -1482,8 +2682,7 @@ mod tests {
             "q-1",
             &json!([]),
             &json!([]),
-            0,
-            false,
+            (0, false, 2_000),
             12,
             34,
             1,
@@ -1532,6 +2731,279 @@ mod tests {
         }
         // The EXPLAIN ESTIMATE numbers are real.
         assert_eq!(v["estimatedBytes"], json!(100));
+    }
+
+    // ── DATA-12 part 3: marks on the sources of an estimate ─────────────
+
+    mod source_marks {
+        use std::collections::HashMap;
+
+        // Force-links `lakehouse-test-support` so its `#[ctor]` Postgres
+        // testcontainer bootstrap runs for this test binary.
+        use lakehouse_test_support as _;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        use super::*;
+        use crate::config::Config;
+
+        fn state_for(pool: &lakehouse_store::PgPool, ch_url: &str) -> AppState {
+            let options = pool.connect_options();
+            let mut env = HashMap::new();
+            env.insert(
+                "DATABASE_URL".to_owned(),
+                format!(
+                    "postgres://{}:postgres@{}:{}/{}",
+                    options.get_username(),
+                    options.get_host(),
+                    options.get_port(),
+                    options.get_database().expect("a named database"),
+                ),
+            );
+            env.insert("CH_URL".to_owned(), ch_url.to_owned());
+            env.insert(
+                "CATALOG_TENANT_ID".to_owned(),
+                "11111111-1111-4111-8111-000000000001".to_owned(),
+            );
+            AppState::new(Config::from_map(&env).expect("a valid test Config"))
+        }
+
+        /// A `ClickHouse` whose `EXPLAIN ESTIMATE` reads one table.
+        async fn clickhouse_reading(database: &str, table: &str) -> MockServer {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "meta": [],
+                    "data": [{ "database": database, "table": table, "rows": "10" }],
+                    "rows": 1,
+                })))
+                .mount(&server)
+                .await;
+            server
+        }
+
+        async fn estimate_of(state: AppState) -> Value {
+            estimate_of_caller(state, fixture_user_principal(), HeaderMap::new()).await
+        }
+
+        async fn estimate_of_caller(
+            state: AppState,
+            principal: Principal,
+            headers: HeaderMap,
+        ) -> Value {
+            estimate_of_caller_sql(state, principal, headers, "SELECT * FROM t").await
+        }
+
+        async fn estimate_of_caller_sql(
+            state: AppState,
+            principal: Principal,
+            headers: HeaderMap,
+            sql: &str,
+        ) -> Value {
+            let result = estimate(
+                State(state),
+                Extension(principal),
+                headers,
+                Bytes::from(serde_json::to_vec(&json!({ "sql": sql })).unwrap()),
+            )
+            .await;
+            let Ok(ApiJson(body)) = result else {
+                panic!("an estimate never errors back to the caller");
+            };
+            body
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_query_reading_a_deprecated_table_marks_that_source(
+            pool: lakehouse_store::PgPool,
+        ) {
+            lakehouse_store::annotation::set_certification(
+                &pool,
+                &lakehouse_store::annotation::CertificationInput {
+                    asset_id: "silver.orders".to_owned(),
+                    status: "deprecated".to_owned(),
+                    note: Some("Use silver.orders_v2".to_owned()),
+                    replacement_asset_id: Some("silver.orders_v2".to_owned()),
+                    certified_by: "Rina".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+            let ch = clickhouse_reading("silver", "orders").await;
+
+            let body = estimate_of(state_for(&pool, &ch.uri())).await;
+
+            assert_eq!(
+                body["sources"],
+                json!(["silver.orders"]),
+                "sources stay names"
+            );
+            let mark = &body["sourceMarks"]["silver.orders"];
+            assert_eq!(mark["certification"], json!("deprecated"));
+            assert_eq!(mark["certificationNote"], json!("Use silver.orders_v2"));
+            assert_eq!(mark["replacementAssetId"], json!("silver.orders_v2"));
+        }
+
+        // PR #106 review R1 BLOCKER 2
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_query_reading_a_table_with_tags_carries_them_in_source_marks(
+            pool: lakehouse_store::PgPool,
+        ) {
+            lakehouse_store::annotation::upsert_annotation(
+                &pool,
+                &lakehouse_store::annotation::AnnotationInput {
+                    asset_id: "silver.orders".to_owned(),
+                    owner: None,
+                    steward: None,
+                    description: None,
+                    tags: vec!["pii".to_owned()],
+                },
+            )
+            .await
+            .unwrap();
+            lakehouse_store::governed_tag::create_key(
+                &pool,
+                "data_domain",
+                &["finance".to_owned()],
+                "admin",
+            )
+            .await
+            .unwrap();
+            lakehouse_store::governed_tag::set_asset_tags(
+                &pool,
+                "silver.orders",
+                &[("data_domain".to_owned(), "finance".to_owned())],
+                "admin",
+            )
+            .await
+            .unwrap();
+
+            let ch = clickhouse_reading("silver", "orders").await;
+            let body = estimate_of(state_for(&pool, &ch.uri())).await;
+            let mark = &body["sourceMarks"]["silver.orders"];
+            assert_eq!(mark["tags"], json!(["pii"]));
+            assert_eq!(mark["governedTags"], json!({ "data_domain": "finance" }));
+        }
+
+        // PR #106 review R1 BLOCKER 2, SHOULD-FIX DATA-12 2
+        //
+        // `SEC-20` moved the shared table out of this caller's reach: a
+        // caller outside the catalog's tenant is refused a shared table
+        // before the estimate asks the engine anything (the refusal has
+        // its own test below). The DATA-12 rule — a caller outside the
+        // catalog's tenant gets no source marks — is still what happens
+        // for the tables that caller MAY read: its own tenant's upload.
+        // The mark is seeded on that upload, so the assertion below is
+        // "the mark exists and is still withheld", not "there was
+        // nothing to withhold".
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn caller_outside_catalog_tenant_receives_no_source_marks(
+            pool: lakehouse_store::PgPool,
+        ) {
+            lakehouse_store::annotation::set_certification(
+                &pool,
+                &lakehouse_store::annotation::CertificationInput {
+                    asset_id: "bronze.retail_orders".to_owned(),
+                    status: "certified".to_owned(),
+                    note: None,
+                    replacement_asset_id: None,
+                    certified_by: "Rina".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+            // The retail tenant holds this upload, so the caller below may
+            // read it: a tenant reads its own upload, whoever owns the
+            // shared catalog.
+            lakehouse_store::uploads::claim_table(
+                &pool,
+                uuid::uuid!("11111111-1111-4111-8111-000000000002"),
+                "retail_orders",
+                "upload-retail-orders",
+            )
+            .await
+            .unwrap();
+
+            let ch = clickhouse_reading("bronze", "retail_orders").await;
+            let state = state_for(&pool, &ch.uri());
+
+            // A caller who belongs to retail (not meridian-group catalog tenant):
+            let outside_caller = Principal {
+                id: PrincipalId::User(Uuid::new_v4()),
+                tenant_ids: vec![uuid::uuid!("11111111-1111-4111-8111-000000000002")],
+                display_name: "Outsider".to_owned(),
+                permissions: PermissionSet::parse("query:read"),
+                provider: "session".to_owned(),
+                must_change_password: false,
+                role_names: Vec::new(),
+            };
+
+            let body = estimate_of_caller_sql(
+                state,
+                outside_caller,
+                HeaderMap::new(),
+                "SELECT * FROM bronze.retail_orders",
+            )
+            .await;
+            assert_eq!(body["sources"], json!(["bronze.retail_orders"]));
+            assert!(
+                body.get("sourceMarks").is_none(),
+                "marks must be omitted for caller outside catalog tenant"
+            );
+        }
+
+        // SEC-20: a caller outside the catalog's tenant is refused a shared
+        // table with the fixed 404 sentence, and the engine is never asked.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn caller_outside_catalog_tenant_is_refused_a_shared_table(
+            pool: lakehouse_store::PgPool,
+        ) {
+            let ch = clickhouse_reading("silver", "orders").await;
+            let state = state_for(&pool, &ch.uri());
+
+            let outside_caller = Principal {
+                id: PrincipalId::User(Uuid::new_v4()),
+                tenant_ids: vec![uuid::uuid!("11111111-1111-4111-8111-000000000002")],
+                display_name: "Outsider".to_owned(),
+                permissions: PermissionSet::parse("query:read"),
+                provider: "session".to_owned(),
+                must_change_password: false,
+                role_names: Vec::new(),
+            };
+
+            let result = estimate(
+                State(state),
+                Extension(outside_caller),
+                HeaderMap::new(),
+                Bytes::from_static(br#"{"sql":"SELECT * FROM silver.orders"}"#),
+            )
+            .await;
+            let Err(err) = result else {
+                panic!("expected the shared table to be refused");
+            };
+            assert_eq!(err.0.status(), 404);
+            assert_eq!(
+                err.0.to_string(),
+                "Table not found or not available to your organisation: silver.orders"
+            );
+            assert!(
+                ch.received_requests()
+                    .await
+                    .expect("the mock records requests")
+                    .is_empty(),
+                "nothing may reach the engine"
+            );
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_query_reading_only_unmarked_tables_has_no_source_marks(
+            pool: lakehouse_store::PgPool,
+        ) {
+            let ch = clickhouse_reading("silver", "plain").await;
+            let body = estimate_of(state_for(&pool, &ch.uri())).await;
+            assert_eq!(body["sources"], json!(["silver.plain"]));
+            assert!(body.get("sourceMarks").is_none());
+        }
     }
 
     // ── `engine: "trino"` (WS2 §4) ──────────────────────────────────────
@@ -1587,6 +3059,7 @@ mod tests {
             let result = run(
                 State(state),
                 Some(principal_with_display_name("alice")),
+                HeaderMap::new(),
                 trino_body(sql),
             )
             .await;
@@ -1679,6 +3152,7 @@ mod tests {
             let ApiJson(value) = run(
                 State(state),
                 Some(principal_with_display_name("alice")),
+                HeaderMap::new(),
                 trino_body("SELECT 1"),
             )
             .await
@@ -1710,6 +3184,7 @@ mod tests {
             let result = run(
                 State(state),
                 Some(principal_with_display_name("trino-maintenance")),
+                HeaderMap::new(),
                 trino_body("SELECT 1"),
             )
             .await;
@@ -1724,7 +3199,7 @@ mod tests {
         async fn missing_principal_is_refused_before_reaching_trino() {
             let server = MockServer::start().await;
             let state = test_state_with_trino(&server.uri());
-            let result = run(State(state), None, trino_body("SELECT 1")).await;
+            let result = run(State(state), None, HeaderMap::new(), trino_body("SELECT 1")).await;
             let err = result.expect_err("no principal must be refused");
             assert_eq!(err.0.status(), 401);
             assert_eq!(
@@ -1787,7 +3262,7 @@ mod tests {
             let server = MockServer::start().await;
             let state = test_state_with_trino(&server.uri());
             let body = Bytes::from(r#"{"sql": "SELECT 1"}"#);
-            let err = run(State(state), None, body)
+            let err = run(State(state), None, HeaderMap::new(), body)
                 .await
                 .expect_err("no principal must be refused");
             assert_eq!(err.0.status(), 401);
@@ -1964,10 +3439,27 @@ mod tests {
             )
         }
 
+        /// The state these tests run against: the seeded deployment's
+        /// database, the mock engine, and the shared catalog's own
+        /// tenant — the query path is scoped to the tenant, and the
+        /// catalog's gate admits only that tenant's members.
+        fn state_for(pool: &PgPool, ch_url: &str) -> AppState {
+            let mut env = HashMap::new();
+            env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
+            env.insert("CH_URL".to_owned(), ch_url.to_owned());
+            env.insert("CATALOG_TENANT_ID".to_owned(), CATALOG_TENANT_ID.to_owned());
+            AppState::new(Config::from_map(&env).expect("valid config from a map"))
+        }
+
+        /// The shared catalog belongs to one tenant, and the query path
+        /// is scoped to the tenant: this fixture principal is the
+        /// catalog's own member, so the shared tables stay reachable.
+        const CATALOG_TENANT_ID: &str = "11111111-1111-4111-8111-000000000001";
+
         fn analyst_principal() -> Extension<Principal> {
             Extension(Principal {
                 id: PrincipalId::User(Uuid::nil()),
-                tenant_ids: Vec::new(),
+                tenant_ids: vec![uuid::uuid!("11111111-1111-4111-8111-000000000001")],
                 display_name: "alice".to_owned(),
                 permissions: PermissionSet::parse("query:read"),
                 provider: "session".to_owned(),
@@ -2057,13 +3549,16 @@ mod tests {
             let server = MockServer::start().await;
             mount_governed_table_responses(&server).await;
 
-            let mut env = HashMap::new();
-            env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
-            env.insert("CH_URL".to_owned(), server.uri());
-            let state = AppState::new(Config::from_map(&env).expect("valid config from a map"));
+            let state = state_for(&pool, &server.uri());
 
             let body = Bytes::from(json!({ "sql": "SELECT * FROM serving.mart_x" }).to_string());
-            let result = run(State(state), Some(analyst_principal()), body).await;
+            let result = run(
+                State(state),
+                Some(analyst_principal()),
+                HeaderMap::new(),
+                body,
+            )
+            .await;
             assert!(
                 result.is_ok(),
                 "expected a successful, masked run: {result:?}"
@@ -2100,10 +3595,7 @@ mod tests {
             pool: PgPool,
         ) -> sqlx::Result<()> {
             let server = MockServer::start().await;
-            let mut env = HashMap::new();
-            env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
-            env.insert("CH_URL".to_owned(), server.uri());
-            let state = AppState::new(Config::from_map(&env).expect("valid config from a map"));
+            let state = state_for(&pool, &server.uri());
 
             let result = check_statement_would_run(
                 &state,
@@ -2132,10 +3624,7 @@ mod tests {
             pool: PgPool,
         ) -> sqlx::Result<()> {
             let server = MockServer::start().await;
-            let mut env = HashMap::new();
-            env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
-            env.insert("CH_URL".to_owned(), server.uri());
-            let state = AppState::new(Config::from_map(&env).expect("valid config from a map"));
+            let state = state_for(&pool, &server.uri());
 
             let result = check_statement_would_run(
                 &state,
@@ -2189,10 +3678,7 @@ mod tests {
 
             let server = MockServer::start().await;
             mount_governed_table_responses(&server).await;
-            let mut env = HashMap::new();
-            env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
-            env.insert("CH_URL".to_owned(), server.uri());
-            let state = AppState::new(Config::from_map(&env).expect("valid config from a map"));
+            let state = state_for(&pool, &server.uri());
 
             let result = check_statement_would_run(
                 &state,
@@ -2262,10 +3748,7 @@ mod tests {
 
             let server = MockServer::start().await;
             mount_governed_table_responses(&server).await;
-            let mut env = HashMap::new();
-            env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
-            env.insert("CH_URL".to_owned(), server.uri());
-            let state = AppState::new(Config::from_map(&env).expect("valid config from a map"));
+            let state = state_for(&pool, &server.uri());
 
             check_statement_would_run(
                 &state,
@@ -2297,10 +3780,7 @@ mod tests {
             pool: PgPool,
         ) -> sqlx::Result<()> {
             let server = MockServer::start().await;
-            let mut env = HashMap::new();
-            env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
-            env.insert("CH_URL".to_owned(), server.uri());
-            let state = AppState::new(Config::from_map(&env).expect("valid config from a map"));
+            let state = state_for(&pool, &server.uri());
 
             let result =
                 check_statement_would_run(&state, &analyst_principal().0, "SELECT 1", "trino")
@@ -2327,13 +3807,16 @@ mod tests {
             // No mocks mounted at all — any request reaching `ClickHouse`
             // fails with a connection/404 error, which would itself prove
             // the refusal came too late.
-            let mut env = HashMap::new();
-            env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
-            env.insert("CH_URL".to_owned(), server.uri());
-            let state = AppState::new(Config::from_map(&env).expect("valid config from a map"));
+            let state = state_for(&pool, &server.uri());
 
             let body = Bytes::from(json!({ "sql": "SELECT * FROM url('h','CSV')" }).to_string());
-            let result = run(State(state), Some(analyst_principal()), body).await;
+            let result = run(
+                State(state),
+                Some(analyst_principal()),
+                HeaderMap::new(),
+                body,
+            )
+            .await;
             let err = result.expect_err("a table function must be refused");
             assert_eq!(err.into_response().status(), 422);
 
@@ -2346,6 +3829,358 @@ mod tests {
                 "a table function must never reach ClickHouse at all: {requests:?}"
             );
             Ok(())
+        }
+    }
+}
+
+/// `SEC-20`: the tenant gate's rule, on its own. A separate module from
+/// `tests` so the two do not share a hunk.
+#[cfg(test)]
+mod tenant_scope_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use lakehouse_store::uploads::TableClaim;
+    use uuid::Uuid;
+
+    use super::{
+        TenantReach, first_unreachable, raw_table_name, reach_from, referenced_table_names,
+        table_is_reachable, table_not_available,
+    };
+
+    const TENANT_A: Uuid = Uuid::from_u128(1);
+    const TENANT_B: Uuid = Uuid::from_u128(2);
+
+    /// The catalog's own tenant: it may read the shared tables.
+    fn catalog_tenant() -> TenantReach {
+        TenantReach::Tenant {
+            tenant_id: TENANT_A,
+            owns_catalog: true,
+        }
+    }
+
+    /// Another tenant: it may read its own uploads, and nothing else.
+    fn other_tenant() -> TenantReach {
+        TenantReach::Tenant {
+            tenant_id: TENANT_B,
+            owns_catalog: false,
+        }
+    }
+
+    #[test]
+    fn an_upload_claimed_by_another_tenant_is_refused() {
+        assert!(!table_is_reachable(other_tenant(), TableClaim::Theirs));
+        assert!(!table_is_reachable(catalog_tenant(), TableClaim::Theirs));
+    }
+
+    #[test]
+    fn an_upload_claimed_by_the_callers_own_tenant_is_allowed() {
+        assert!(table_is_reachable(other_tenant(), TableClaim::Ours));
+        assert!(table_is_reachable(catalog_tenant(), TableClaim::Ours));
+    }
+
+    #[test]
+    fn a_shared_table_follows_the_catalogs_own_gate() {
+        assert!(!table_is_reachable(other_tenant(), TableClaim::Unclaimed));
+        assert!(table_is_reachable(catalog_tenant(), TableClaim::Unclaimed));
+    }
+
+    #[test]
+    fn a_principal_holding_every_permission_passes() {
+        assert!(table_is_reachable(TenantReach::All, TableClaim::Theirs));
+        assert!(table_is_reachable(TenantReach::All, TableClaim::Unclaimed));
+    }
+
+    #[test]
+    fn a_deployment_with_one_tenant_changes_nothing() {
+        assert!(table_is_reachable(TenantReach::All, TableClaim::Ours));
+        assert!(table_is_reachable(TenantReach::All, TableClaim::Theirs));
+        assert!(table_is_reachable(TenantReach::All, TableClaim::Unclaimed));
+    }
+
+    #[test]
+    fn a_principal_with_no_tenant_reaches_nothing() {
+        assert!(!table_is_reachable(TenantReach::NoTenant, TableClaim::Ours));
+        assert!(!table_is_reachable(
+            TenantReach::NoTenant,
+            TableClaim::Unclaimed
+        ));
+    }
+
+    #[test]
+    fn a_raw_upload_name_is_the_bronze_namespace_and_the_raw_name() {
+        assert_eq!(raw_table_name("bronze.orders"), Some("orders"));
+        assert_eq!(raw_table_name("bronze"), None);
+        assert_eq!(raw_table_name("silver.orders"), None);
+        assert_eq!(raw_table_name("serving.mart_x"), None);
+        assert_eq!(raw_table_name("orders"), None);
+    }
+
+    #[test]
+    fn every_sql_form_of_a_bronze_table_names_the_same_upload() {
+        for sql in [
+            "SELECT * FROM bronze.orders",
+            "SELECT * FROM iceberg.bronze.orders",
+            "SELECT * FROM icecat_x.`bronze.orders`",
+        ] {
+            assert_eq!(
+                referenced_table_names(sql, false),
+                vec!["bronze.orders".to_owned()],
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_statement_reading_two_tables_refuses_on_the_second() {
+        let tables = referenced_table_names(
+            "SELECT * FROM bronze.invoices JOIN silver.orders ON true",
+            false,
+        );
+        assert_eq!(
+            tables,
+            vec!["bronze.invoices".to_owned(), "silver.orders".to_owned()]
+        );
+        // The caller's own upload first, then a shared table it may not
+        // read: the refusal names the second.
+        let claims = [TableClaim::Ours, TableClaim::Unclaimed];
+        assert_eq!(first_unreachable(other_tenant(), &claims), Some(1));
+        assert_eq!(first_unreachable(catalog_tenant(), &claims), None);
+    }
+
+    #[test]
+    fn a_cte_named_like_a_foreign_table_is_not_a_table() {
+        let tables = referenced_table_names(
+            "WITH foreign_orders AS (SELECT 1) SELECT * FROM foreign_orders",
+            false,
+        );
+        assert!(tables.is_empty(), "{tables:?}");
+    }
+
+    #[test]
+    fn the_refusal_is_a_404_with_the_fixed_sentence() {
+        let err = table_not_available("bronze.orders");
+        assert_eq!(err.status(), 404);
+        assert_eq!(
+            err.to_string(),
+            "Table not found or not available to your organisation: bronze.orders"
+        );
+    }
+
+    #[test]
+    fn a_deployment_with_one_tenant_reaches_everything() {
+        assert_eq!(
+            reach_from(false, Some(TENANT_A), Some(1), None),
+            TenantReach::All
+        );
+        assert_eq!(reach_from(false, None, Some(1), None), TenantReach::All);
+    }
+
+    #[test]
+    fn the_catalogs_own_tenant_owns_the_shared_tables() {
+        assert_eq!(
+            reach_from(false, Some(TENANT_A), Some(2), Some(TENANT_A)),
+            TenantReach::Tenant {
+                tenant_id: TENANT_A,
+                owns_catalog: true,
+            }
+        );
+    }
+
+    #[test]
+    fn a_gate_that_admits_a_caller_that_does_not_own_the_catalog_is_narrowed() {
+        // The gate read a smaller count than this request did: the
+        // shared tables are the catalog tenant's, not the caller's.
+        assert_eq!(
+            reach_from(false, Some(TENANT_B), Some(2), Some(TENANT_A)),
+            TenantReach::Tenant {
+                tenant_id: TENANT_B,
+                owns_catalog: false,
+            }
+        );
+        // And a caller that belongs to no tenant reaches nothing at all.
+        assert_eq!(
+            reach_from(false, None, Some(2), Some(TENANT_A)),
+            TenantReach::NoTenant
+        );
+    }
+
+    #[test]
+    fn a_closed_gate_keeps_the_caller_to_its_own_tenant() {
+        assert_eq!(
+            reach_from(true, Some(TENANT_B), Some(2), Some(TENANT_A)),
+            TenantReach::Tenant {
+                tenant_id: TENANT_B,
+                owns_catalog: false,
+            }
+        );
+        assert_eq!(
+            reach_from(true, None, Some(2), Some(TENANT_A)),
+            TenantReach::NoTenant
+        );
+    }
+
+    #[test]
+    fn an_unknown_tenant_count_is_never_the_one_tenant_case() {
+        assert_eq!(
+            reach_from(false, Some(TENANT_A), None, None),
+            TenantReach::Tenant {
+                tenant_id: TENANT_A,
+                owns_catalog: false,
+            }
+        );
+    }
+}
+
+/// `QS-4` step 4: the history query string's parser, on its own. The
+/// store's tests own the SQL semantics; these own the 400s.
+#[cfg(test)]
+mod history_query_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::{HistoryQueryRaw, parse_history_query};
+
+    fn raw(
+        status: Option<&str>,
+        engine: Option<&str>,
+        min_duration_ms: Option<&str>,
+        table: Option<&str>,
+        from: Option<&str>,
+        to: Option<&str>,
+        before: Option<&str>,
+    ) -> HistoryQueryRaw {
+        HistoryQueryRaw {
+            status: status.map(str::to_owned),
+            engine: engine.map(str::to_owned),
+            min_duration_ms: min_duration_ms.map(str::to_owned),
+            table: table.map(str::to_owned),
+            from: from.map(str::to_owned),
+            to: to.map(str::to_owned),
+            before: before.map(str::to_owned),
+        }
+    }
+
+    /// A well-formed query string lands in the filter with every field it
+    /// named, and one that named nothing filters nothing.
+    #[test]
+    fn a_good_query_parses_into_its_filter() {
+        let query = raw(
+            Some("failed"),
+            Some("trino"),
+            Some("1500"),
+            Some("orders"),
+            Some("2026-10-11T00:00:00Z"),
+            Some("2026-10-20T12:00:00.500Z"),
+            Some("2026-10-20T11:59:59.999Z,q-1729"),
+        );
+        let filter = parse_history_query(&query).unwrap();
+        assert_eq!(filter.status, Some("failed"));
+        assert_eq!(filter.engine, Some("trino"));
+        assert_eq!(filter.min_duration_ms, Some(1500));
+        assert_eq!(filter.table, Some("orders"));
+        assert_eq!(
+            filter.before_id,
+            Some("q-1729"),
+            "the cursor's id half is everything after the first comma"
+        );
+        assert!(filter.from.is_some() && filter.to.is_some() && filter.before_at.is_some());
+
+        let empty_query = raw(None, None, None, None, None, None, None);
+        let empty = parse_history_query(&empty_query).unwrap();
+        assert_eq!(empty, super::HistoryFilter::default());
+    }
+
+    /// An empty value is no value: a client that builds links from empty
+    /// inputs filters nothing instead of getting a 400.
+    #[test]
+    fn empty_values_filter_nothing() {
+        let query = raw(
+            Some(""),
+            Some(""),
+            Some(""),
+            Some(""),
+            Some(""),
+            Some(""),
+            Some(""),
+        );
+        let filter = parse_history_query(&query).unwrap();
+        assert_eq!(filter, super::HistoryFilter::default());
+    }
+
+    /// A value outside the known sets is a 400 whose message names the
+    /// field — fixed text, never a serde rendering.
+    #[test]
+    fn an_unknown_status_or_engine_is_a_400_naming_the_field() {
+        let bad_status = raw(Some("yesterday"), None, None, None, None, None, None);
+        let err = parse_history_query(&bad_status).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "status must be one of completed, failed, cancelled, blocked"
+        );
+        let bad_engine = raw(None, Some("presto"), None, None, None, None, None);
+        let err = parse_history_query(&bad_engine).unwrap_err();
+        assert_eq!(err.to_string(), "engine must be one of clickhouse, trino");
+    }
+
+    /// A value that does not parse is a 400 whose message names the field:
+    /// the duration's number, the window's times, and the cursor's two
+    /// halves.
+    #[test]
+    fn a_bad_duration_time_or_cursor_is_a_400_naming_the_field() {
+        let cases: [(HistoryQueryRaw, &str); 6] = [
+            (
+                raw(None, None, Some("soon"), None, None, None, None),
+                "minDurationMs",
+            ),
+            (
+                raw(None, None, Some("-1"), None, None, None, None),
+                "minDurationMs",
+            ),
+            (
+                raw(None, None, None, None, Some("not-a-time"), None, None),
+                "from",
+            ),
+            (
+                raw(
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("2026-13-45T00:00:00Z"),
+                    None,
+                ),
+                "to",
+            ),
+            (
+                raw(
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("2026-10-20T00:00:00Z"),
+                ),
+                "before",
+            ),
+            (
+                raw(
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("2026-10-20T00:00:00Z,"),
+                ),
+                "before",
+            ),
+        ];
+        for (query, field) in &cases {
+            let err = parse_history_query(query).unwrap_err();
+            let message = err.to_string();
+            assert!(message.starts_with(field), "{message} must name {field:?}");
+            assert_eq!(err.status(), 400, "a bad value is a 400: {message}");
         }
     }
 }

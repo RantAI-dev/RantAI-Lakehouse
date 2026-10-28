@@ -113,6 +113,17 @@ pub enum Dispatch {
 // ── Classifying a failure (principle 4) ───────────────────────────────────
 
 /// The class of a `sqlx` error, from its type and its code, never its text.
+///
+/// `SEC-41` decision 4 also names the `MySQL` "password over an unencrypted
+/// connection" refusal (no `mysql-rsa`, so `sqlx-mysql` 0.9 will not send
+/// it). It needs no arm here: `sqlx` reports it as
+/// [`sqlx::Error::Configuration`], which D10's eight-word vocabulary has no
+/// word for — the source was reached and the credential may well be right —
+/// so it stays [`ErrorClass::Failed`], the enum's own documented
+/// catch-all, rather than being guessed into `SignInRefused`. The sentence
+/// the operator needs is `connector_probe::MYSQL_PLAINTEXT_PASSWORD_REFUSED`,
+/// which the same error gets from `connector_probe::classify_sqlx_error`
+/// (the connection test, discovery and deprovision).
 pub(crate) fn class_of_sqlx(err: &sqlx::Error) -> ErrorClass {
     match err {
         sqlx::Error::Io(io) if io.kind() == std::io::ErrorKind::TimedOut => ErrorClass::Timeout,
@@ -970,6 +981,8 @@ async fn list_s3(
                 meta.last_modified
                     .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
             ),
+            load: None,
+            label: None,
         });
     }
     Ok(Listing { objects, truncated })
@@ -1125,12 +1138,15 @@ pub async fn dispatch(
         }
         Dial::Sheets(_) => Answer::failed(kind, ErrorClass::NotSupported),
         // Oracle, MongoDB, Kafka, SFTP, and the column preview of REST.
+        // `SRC-3` T1.6: a `saas` connector's objects and columns are listed
+        // by the vendor's own module in the orchestrator, never by the API.
         Dial::Sql(_)
         | Dial::Cdc(_)
         | Dial::Rest(_)
         | Dial::Mongo(_)
         | Dial::Kafka(_)
-        | Dial::Sftp(_) => return Dispatch::Orchestrator,
+        | Dial::Sftp(_)
+        | Dial::Saas(_) => return Dispatch::Orchestrator,
     };
     Dispatch::Done(answer)
 }
@@ -1379,6 +1395,21 @@ mod tests {
             serde_json::json!({"hosts": ["m.example:27017"], "database": "d",
                 "username": "u", "directConnection": true}),
         );
+        // `SRC-3` T1.6: a business-app connector is listed by its vendor's
+        // module in the orchestrator, for both lists and column previews.
+        let saas = info(
+            "saas",
+            serde_json::json!({
+                "vendor": "zendesk", "account": "acme",
+                "auth": {"type": "integration"}
+            }),
+        );
+        for kind in [Kind::List, Kind::Preview] {
+            assert!(matches!(
+                dispatch(kind, &saas, &request, &resolver, &InternalHosts::NONE).await,
+                Dispatch::Orchestrator
+            ));
+        }
         for connector in [&oracle, &mongo] {
             let out = dispatch(
                 Kind::List,

@@ -9,12 +9,18 @@ mod agents;
 pub(crate) mod ai;
 mod alerts;
 pub mod auth;
-mod authored_pipelines;
+// `pub(crate)`, not private: `crate::pipeline_lag` (BLD-2) reads
+// `authored_pipelines::job_name` to name the job a lag run launches, and
+// re-deriving the `authored__<id>` mapping in a second place is exactly
+// the drift the one definition exists to prevent.
+pub(crate) mod authored_pipelines;
 mod calc_fields;
 mod catalog;
 mod catalog_governance;
+mod catalog_grants;
 mod catalog_profile;
 mod catalog_query;
+mod catalog_restore;
 mod catalog_search;
 mod catalog_source;
 mod connector_discovery;
@@ -23,9 +29,15 @@ mod connector_runs;
 mod connectors;
 mod dashboard;
 mod dashboard_folders;
+pub(crate) mod dashboard_organise;
 mod dashboard_sources;
 pub(crate) mod drill;
 mod embed;
+mod pdf_export;
+pub mod public_links;
+mod render;
+pub mod report_runner;
+mod reports;
 // DATA-10 review SHOULD-FIX 1: route modules stay private; tests call gold_export_history
 mod gold;
 mod governance;
@@ -37,6 +49,7 @@ mod lakehouse;
 pub(crate) mod layers;
 mod lineage;
 mod load_alerts;
+mod maps;
 pub(crate) mod metrics;
 mod notifications;
 mod ops;
@@ -44,7 +57,13 @@ mod overview;
 pub(crate) mod params;
 mod pipelines;
 mod quality;
+mod quality_anomaly;
+mod quality_incidents;
+mod quality_load;
+mod quality_schedules;
 mod query;
+mod query_cancel;
+mod query_limits;
 mod schema_changes;
 pub(crate) mod schema_versions;
 mod settings;
@@ -55,11 +74,11 @@ mod uploads;
 use std::time::Duration;
 
 use axum::Router;
-use axum::extract::{DefaultBodyLimit, Request};
+use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::StatusCode;
-use axum::middleware::{Next, from_fn, from_fn_with_state};
+use axum::middleware::{Next, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post, put};
 use serde::Serialize;
 
 use crate::json::ApiJson;
@@ -123,6 +142,18 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// bound; the per-upload routes (`/api/uploads/{id}*`) keep the default.
 const UPLOAD_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// The chart and table downloads' timeout (`BI-1` review fix (BLOCKER) R2). The
+/// stream from `ClickHouse` has 300 seconds (`export::EXPORT_TIMEOUT`) and its
+/// query 280 (`max_execution_time`), then the file is written and sent; the 60
+/// second default cut a long export with a bare `request timeout`. Ten seconds
+/// above the stream, so the sentence the export itself gives wins.
+const EXPORT_REQUEST_TIMEOUT: Duration = Duration::from_secs(310);
+
+/// The PDF route's timeout (`BI-1` review fix (BLOCKER) R2): the wait for a
+/// free slot ([`crate::pdf::PDF_SLOT_WAIT`]), the client's 70 seconds with
+/// Gotenberg, and ten seconds for the token, the audit and the answer.
+const PDF_REQUEST_TIMEOUT: Duration = Duration::from_secs(60 + 70 + 10);
+
 /// Per-route request timeout, mirroring each TypeScript handler's `export
 /// const maxDuration` (grep of every `src/app/api/**/route.ts`):
 ///
@@ -130,7 +161,8 @@ const UPLOAD_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 /// |---------------------------------|------------------|
 /// | `/api/ai/chat`                  | 120              |
 /// | `/api/alerts/run`               | 60               |
-/// | `/api/query/run`                | 60               |
+/// | `/api/query/run`                | 60 (BI-5: the longest configured limit + 15, see [`deadline_for`]) |
+/// | board routes (`/api/dashboard`, `/api/embed/*`, `/api/public/dashboard/*`, `/api/render/data`) | 60 (BI-5: an outer cap of 35 minutes, see [`deadline_for`]) |
 /// | everything else (no export)     | [`DEFAULT_REQUEST_TIMEOUT`] (60) |
 ///
 /// `/api/uploads` has no TypeScript handler to mirror and takes
@@ -145,10 +177,72 @@ const UPLOAD_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 fn route_timeout(path: &str) -> Duration {
     match path {
         "/api/ai/chat" => *AI_CHAT_TIMEOUT,
-        "/api/uploads" => UPLOAD_REQUEST_TIMEOUT,
+        "/api/uploads" | "/api/maps" => UPLOAD_REQUEST_TIMEOUT,
+        "/api/dashboard/chart-export" | "/api/dashboard/table-export" => EXPORT_REQUEST_TIMEOUT,
+        "/api/dashboard/export/pdf" => PDF_REQUEST_TIMEOUT,
+        // RPT-1: "Send now" makes the PDF and the chart files in the request,
+        // so it gets the longest export deadline.
+        other if other.starts_with("/api/reports/subscriptions/") && other.ends_with("/send") => {
+            EXPORT_REQUEST_TIMEOUT
+        }
+        other if is_upload_part_path(other) => UPLOAD_REQUEST_TIMEOUT,
         other if is_discovery_path(other) => DISCOVERY_REQUEST_TIMEOUT,
         _ => DEFAULT_REQUEST_TIMEOUT,
     }
+}
+
+/// The routes whose queries run under the administrator's time limit
+/// (`BI-5`): their deadline follows the limit instead of the fixed 60 s.
+fn limit_bearing(path: &str) -> bool {
+    path == "/api/query/run" || is_board_path(path)
+}
+
+/// The routes that answer a whole board: tiles run six at a time, so one can
+/// need several rounds of the time limit.
+///
+/// `BI-5` review S1: only the routes that run a whole board's tiles. The embed
+/// frame and values routes and a public link's `unlock` run no tile, so they
+/// keep the ordinary deadline.
+fn is_board_path(path: &str) -> bool {
+    path == "/api/dashboard"
+        || path == "/api/render/data"
+        || path == "/api/embed/data"
+        || path
+            .strip_prefix("/api/public/dashboard/")
+            .is_some_and(|token| !token.is_empty() && !token.contains('/'))
+}
+
+/// The deadline of `path` given the install's longest configured time limit
+/// (`None`: not read, or not readable, which keeps [`route_timeout`]).
+///
+/// `BI-5` plan D4 says a limit-bearing route gets that limit plus 15 s, and
+/// that a board's deadline is `ceil(tiles / 6) x limit + 15 s` computed in the
+/// handler (which answers the finished tiles and marks the rest "not reached
+/// in time"). The two cannot both be the middleware's: a deadline of one limit
+/// would cut a two-round board before its handler could answer. So the
+/// middleware gives `/api/query/run` the limit plus 15 s, and a board route
+/// the 35-minute cap as an outer bound, leaving the handler's own deadline
+/// (`query_limits::board_deadline`) the one that decides.
+fn deadline_for(path: &str, longest: Option<Duration>) -> Duration {
+    match longest {
+        Some(_) if is_board_path(path) => crate::query_limits::BOARD_DEADLINE_CAP,
+        Some(longest) if limit_bearing(path) => {
+            longest.saturating_add(crate::query_limits::DEADLINE_MARGIN)
+        }
+        _ => route_timeout(path),
+    }
+}
+
+/// Whether `path` is `/api/uploads/{id}/parts/{n}`: one 8 MiB piece of a
+/// chunked upload (`DATA-17`). It gets [`UPLOAD_REQUEST_TIMEOUT`], not the
+/// default 60 s, which would cut an 8 MiB piece off on a link slower than about
+/// 1 Mbit/s; the other `/api/uploads/{id}*` routes keep the default.
+fn is_upload_part_path(path: &str) -> bool {
+    path.strip_prefix("/api/uploads/")
+        .map(|rest| rest.split('/').collect::<Vec<_>>())
+        .is_some_and(|segments| {
+            matches!(segments.as_slice(), [id, "parts", n] if !id.is_empty() && !n.is_empty())
+        })
 }
 
 /// `/api/connectors/{id}/discovery/{kind}`'s timeout (`SRC-13` decision D9): the
@@ -251,11 +345,14 @@ fn pipelines_router() -> Router<AppState> {
                 .put(authored_pipelines::update)
                 .delete(authored_pipelines::delete),
         )
+        .route("/api/pipelines/{id}/source", get(pipelines::source))
         .route(
             "/api/pipelines/{id}/schedule-ticks",
             get(authored_pipelines::schedule_ticks),
         )
-        .route("/api/pipelines/{id}/source", get(pipelines::source))
+        // BLD-2: the two target-lag routes live in `target_lag_routes`,
+        // merged in above.
+        .merge(target_lag_routes())
         .route("/api/pipelines/{id}/runs", get(pipelines::runs))
         // Plan R4 2b: definition version history. Static under
         // `{id}/versions`, so it is registered BEFORE
@@ -376,6 +473,31 @@ fn pipelines_router() -> Router<AppState> {
         )
 }
 
+/// BLD-2 (plan D6/D8): the target lag's own two routes, merged into the
+/// pipeline sub-router. They sit together because they are one feature's
+/// two doors — the orchestrator asks [`authored_pipelines::lag_check`] and
+/// a user sets the target through
+/// [`authored_pipelines::set_target_lag`] — and splitting them from
+/// [`pipelines_router`] is also what keeps that function under
+/// `clippy::too_many_lines`.
+///
+/// `lag-check` is under `/runnable/` because only the orchestrator may ask
+/// (the same gate as `runnable` itself), not because it lists anything.
+/// `target-lag` is its own route rather than a field on
+/// `PUT /api/pipelines/{id}`: clearing the lag (`AC8`) is a value that
+/// route's "absent means unchanged" body cannot express.
+fn target_lag_routes() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/api/pipelines/runnable/{id}/lag-check",
+            post(authored_pipelines::lag_check),
+        )
+        .route(
+            "/api/pipelines/{id}/target-lag",
+            put(authored_pipelines::set_target_lag),
+        )
+}
+
 /// The `/api/storage/*` sub-router (Task 2.6), split out for the same
 /// `clippy::too_many_lines` reason as [`pipelines_router`].
 fn storage_router() -> Router<AppState> {
@@ -422,6 +544,45 @@ fn lakehouse_router() -> Router<AppState> {
 fn governance_static_router() -> Router<AppState> {
     Router::new()
         .route("/api/governance/lineage", get(governance::lineage))
+        // DATA-13: column-level lineage. A static path ahead of the
+        // `{kind}` capture like `lineage` above (and four segments deep).
+        .route(
+            "/api/governance/lineage/columns",
+            get(governance::column_lineage),
+        )
+        // BI-14 (D5): the charts that read a table. Static, ahead of `{kind}`.
+        .route(
+            "/api/governance/lineage/used-by",
+            get(lineage::used_by::used_by),
+        )
+        // DATA-14 (F2): quality incidents. Static segments, mounted ahead of
+        // `/api/governance/quality/{id}` and the `{kind}` capture.
+        .route(
+            "/api/governance/quality/incidents",
+            get(quality_incidents::list_incidents),
+        )
+        .route(
+            "/api/governance/quality/incidents/{id}/resolve",
+            axum::routing::post(quality_incidents::resolve_incident),
+        )
+        // DATA-14 (F3): when a table's rules run. Static `schedules` segment,
+        // so `/api/governance/quality/{id}/run` cannot capture it.
+        .route(
+            "/api/governance/quality/schedules",
+            get(quality_schedules::list_schedules),
+        )
+        .route(
+            "/api/governance/quality/schedules/{asset}",
+            put(quality_schedules::put_schedule),
+        )
+        // DATA-14 (F5): whether a table's anomalies are being raised yet.
+        .route(
+            "/api/governance/quality/learning/{asset}",
+            get(quality_anomaly::learning_status),
+        )
+        // DATA-14 (F7): a rule's run history. `runs` is not `run`, so it
+        // cannot be captured by the POST route below.
+        .route("/api/governance/quality/{id}/runs", get(quality::rule_runs))
         // Evaluates one authored quality rule on request. Three segments
         // deep, so it cannot collide with the `{kind}` capture.
         .route(
@@ -470,6 +631,16 @@ fn governance_static_router() -> Router<AppState> {
             "/api/governance/classification/{id}",
             axum::routing::delete(governance::delete_classification_rule),
         )
+        // DATA-12 part 2: governed tag keys. Static segments, so they match
+        // ahead of the `{kind}` capture, as `policies` and `sla` do.
+        .route(
+            "/api/governance/tag-keys",
+            get(governance::list_tag_keys).post(governance::create_tag_key),
+        )
+        .route(
+            "/api/governance/tag-keys/{key}",
+            axum::routing::put(governance::update_tag_key).delete(governance::delete_tag_key),
+        )
 }
 
 /// The `/api/catalog/{id}/access-request` +
@@ -488,6 +659,20 @@ fn catalog_access_router() -> Router<AppState> {
         .route(
             "/api/catalog/access-requests/{id}/decide",
             axum::routing::post(catalog::decide_access_request),
+        )
+        // `DATA-15` F3: grant and revoke from the asset's page.
+        .route(
+            "/api/catalog/{id}/grants",
+            get(catalog_grants::list).post(catalog_grants::create),
+        )
+        .route(
+            "/api/catalog/{id}/grants/{grant_id}",
+            axum::routing::delete(catalog_grants::revoke),
+        )
+        // `DATA-15` F4: undrop a dropped Iceberg table within its window.
+        .route(
+            "/api/catalog/{id}/restore",
+            get(catalog_restore::status).post(catalog_restore::restore),
         )
 }
 
@@ -721,9 +906,36 @@ fn uploads_router(state: &AppState) -> Router<AppState> {
             get(uploads::get).delete(uploads::delete),
         )
         .route("/api/uploads/{id}/preview", get(uploads::preview))
+        // DATA-18: apply a column list to the sample, store nothing.
+        .route(
+            "/api/uploads/{id}/check",
+            axum::routing::post(uploads::columns::check),
+        )
         .route(
             "/api/uploads/{id}/ingest",
             axum::routing::post(uploads::ingest),
+        )
+        // DATA-17 slice 5: which other files can load into one table with this one.
+        .route(
+            "/api/uploads/{id}/compare",
+            axum::routing::post(uploads::group::compare),
+        )
+        // DATA-17: the pieces of a chunked upload. Only the piece route takes
+        // a large body, and its own limit (a piece plus 64 KiB); the other
+        // routes keep axum's 2 MB default.
+        .route(
+            "/api/uploads/{id}/parts/{n}",
+            axum::routing::put(uploads::sessions::put_part).layer(DefaultBodyLimit::max(
+                uploads::sessions::MAX_PART_BODY_BYTES,
+            )),
+        )
+        .route(
+            "/api/uploads/{id}/parts",
+            get(uploads::sessions::list_parts),
+        )
+        .route(
+            "/api/uploads/{id}/complete",
+            axum::routing::post(uploads::sessions::complete),
         )
         .route_layer(from_fn_with_state(
             state.clone(),
@@ -736,7 +948,48 @@ fn uploads_router(state: &AppState) -> Router<AppState> {
                 .layer(DefaultBodyLimit::max(uploads::MAX_REQUEST_BODY_BYTES))
                 .get(uploads::list),
         )
+        // DATA-17: opens a chunked upload. A static path next to `{id}`; it
+        // belongs to no existing upload, so it sits outside the tenant layer.
+        .route(
+            "/api/uploads/sessions",
+            axum::routing::post(uploads::sessions::create_session),
+        )
+        // DATA-35: folders for uploaded files. Static paths next to `{id}` (the
+        // router prefers a static segment, and an upload id is `up-<uuid>`), outside
+        // the per-upload layer because they name no upload: each folder is checked
+        // against the caller's tenant by the store (`uploads::folders`).
+        .route(
+            "/api/uploads/folders",
+            get(uploads::folders::list).post(uploads::folders::create),
+        )
+        .route(
+            "/api/uploads/folders/{id}",
+            axum::routing::patch(uploads::folders::update).delete(uploads::folders::delete),
+        )
+        .route(
+            "/api/uploads/move",
+            axum::routing::post(uploads::folders::move_uploads),
+        )
         .merge(per_upload)
+}
+
+/// The `/api/maps/*` sub-router (`BI-16` part C2b): `POST /api/maps` alone
+/// takes the larger body ([`maps::MAX_REQUEST_BODY_BYTES`]), as
+/// `POST /api/uploads` does; the layer on that one method router keeps the
+/// raised limit off every other route.
+fn maps_router() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/api/maps",
+            axum::routing::post(maps::create)
+                .layer(DefaultBodyLimit::max(maps::MAX_REQUEST_BODY_BYTES))
+                .get(maps::list),
+        )
+        .route(
+            "/api/maps/{id}",
+            axum::routing::patch(maps::rename).delete(maps::delete),
+        )
+        .route("/api/maps/{id}/geojson", get(maps::geojson))
 }
 
 /// The `/api/identity/*` sub-router (Phase 2 identity domain), split out
@@ -870,6 +1123,10 @@ pub fn router(state: AppState) -> Router {
             "/api/catalog/{id}/annotation",
             get(catalog::get_annotation).put(catalog::put_annotation),
         )
+        .route(
+            "/api/catalog/{id}/certification",
+            put(catalog::put_certification),
+        )
         // The semantic layer: a table's and a column's plain-words
         // description. `{asset}` is `serving.<table>` or `silver.<table>`;
         // the dot stays inside one path segment.
@@ -958,6 +1215,39 @@ pub fn router(state: AppState) -> Router {
                 .delete(dashboard_folders::delete),
         )
         .route(
+            "/api/dashboard/personal",
+            axum::routing::post(dashboard_folders::personal),
+        )
+        .route(
+            "/api/dashboard/versions",
+            get(dashboard_organise::versions_list),
+        )
+        .route(
+            "/api/dashboard/versions/revert",
+            axum::routing::post(dashboard_organise::revert),
+        )
+        .route("/api/dashboard/trash", get(dashboard_organise::trash_list))
+        .route(
+            "/api/dashboard/trash/restore",
+            axum::routing::post(dashboard_organise::trash_restore),
+        )
+        .route(
+            "/api/dashboard/shortcuts",
+            get(dashboard_organise::shortcuts),
+        )
+        .route(
+            "/api/dashboard/favourites",
+            axum::routing::put(dashboard_organise::favourite_set),
+        )
+        .route(
+            "/api/dashboard/recent",
+            axum::routing::post(dashboard_organise::recent_touch),
+        )
+        .route(
+            "/api/dashboard/search",
+            get(dashboard_organise::search_names),
+        )
+        .route(
             "/api/dashboard/sources",
             get(dashboard_sources::list)
                 .post(dashboard_sources::create)
@@ -1025,11 +1315,47 @@ pub fn router(state: AppState) -> Router {
         .route("/api/dashboard/values", get(dashboard::values))
         .route("/api/dashboard/export", get(dashboard::export))
         .route("/api/dashboard/table-export", get(dashboard::table_export))
+        .route("/api/dashboard/chart-export", get(dashboard::chart_export))
+        // BI-14 (D1): where a chart comes from. `lineage:read` (owner decision Q6).
+        .route(
+            "/api/dashboard/charts/{id}/lineage",
+            get(lineage::charts::chart_lineage),
+        )
+        .route("/api/dashboard/export/pdf", get(pdf_export::export_pdf))
         .route("/api/dashboard/embed-info", get(dashboard::embed_info))
         .route("/api/embed/data", axum::routing::post(embed::data))
+        .route("/api/render/data", axum::routing::post(render::data))
+        // RPT-1 (D7): scheduled reports. Authorisation beyond `dashboard:read`
+        // (owner or administrator, download right) is in the handlers.
+        .route(
+            "/api/reports/subscriptions",
+            get(reports::list).post(reports::create),
+        )
+        .route(
+            "/api/reports/subscriptions/{id}",
+            get(reports::get)
+                .put(reports::update)
+                .delete(reports::delete),
+        )
+        .route(
+            "/api/reports/subscriptions/{id}/send",
+            axum::routing::post(reports::send_now),
+        )
+        .route(
+            "/api/reports/subscriptions/{id}/deliveries",
+            get(reports::deliveries),
+        )
+        .route("/api/reports/recipients", get(reports::recipients))
         .route(
             "/api/embed/frame",
             axum::routing::post(embed::frame_origins),
+        )
+        // BI-26 (D5): the dropdown values of an editable filter, token-gated.
+        .route("/api/embed/values", axum::routing::post(embed::values))
+        // BI-26 (D8): each filter's embed mode.
+        .route(
+            "/api/dashboard/embed-settings",
+            axum::routing::put(embed::put_settings),
         )
         .route(
             "/api/dashboard/embed-revoke",
@@ -1038,6 +1364,29 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/public/dashboard/{token}",
             get(embed::public_dashboard),
+        )
+        // BI-19 part A (D4): the password of a public link.
+        .route(
+            "/api/public/dashboard/{token}/unlock",
+            axum::routing::post(public_links::unlock),
+        )
+        // BI-19 part A (D5): make, change and end a dashboard's public link.
+        .route(
+            "/api/dashboard/public-link",
+            get(public_links::get_link)
+                .put(public_links::put_link)
+                .delete(public_links::delete_link),
+        )
+        // PR #246 review BLOCKER 1: a public link and an embed read a map's
+        // boundary through their own token, the way they read the board's
+        // data; the console's own route keeps the signed-in reader.
+        .route(
+            "/api/public/dashboard/{token}/maps/{id}/geojson",
+            get(embed::public_map_geojson),
+        )
+        .route(
+            "/api/embed/maps/{id}/geojson",
+            axum::routing::post(embed::embed_map_geojson),
         )
         .route("/api/ai/chat", axum::routing::post(ai::chat))
         .route("/api/ai/tool", axum::routing::post(ai::tool_call))
@@ -1073,6 +1422,17 @@ pub fn router(state: AppState) -> Router {
             "/api/settings/reporting",
             get(settings::get_reporting).put(settings::put_reporting),
         )
+        // Time and row limits of charts and Query Studio (`BI-5`); see
+        // `routes::query_limits`.
+        // Stop (`BI-5`): ends the caller's own queries of one run.
+        .route(
+            "/api/query/cancel",
+            axum::routing::post(query_cancel::cancel),
+        )
+        .route(
+            "/api/settings/limits",
+            get(query_limits::get_limits).put(query_limits::put_limits),
+        )
         // Phase 2 identity domain.
         .merge(identity_router())
         // Phase 2, Task 2.7: connector definitions.
@@ -1080,6 +1440,7 @@ pub fn router(state: AppState) -> Router {
         // ADR 0014: files uploaded from the console and loaded into raw
         // tables. Tenant-scoped like connectors.
         .merge(uploads_router(&state))
+        .merge(maps_router())
         // Phase 2, Task 2.8: knowledge sources and vector jobs (metadata
         // only — no `search` route here, see `routes::knowledge`'s module
         // doc comment).
@@ -1097,14 +1458,47 @@ pub fn router(state: AppState) -> Router {
         // OUTER layer) so a slow session/permission check while a caller
         // has the connection open still counts against the request's
         // deadline instead of running unbounded outside it.
+        // `BI-5`: the run every query of this request belongs to. Inside
+        // `auth_gate` so the principal it names is already there.
+        .layer(from_fn_with_state(
+            state.clone(),
+            crate::query_limits::scope_middleware,
+        ))
         .layer(from_fn_with_state(state.clone(), auth_gate))
-        .layer(from_fn(timeout_middleware))
+        .layer(from_fn_with_state(state.clone(), timeout_middleware))
         .with_state(state)
 }
 
-/// `GET /health` — a plain liveness check, no dependencies.
-async fn health() -> &'static str {
-    "ok"
+/// `GET /health` — liveness, plus whether the application database is
+/// usable (`OPS-4` decision 2).
+///
+/// Answers `200` whenever this process can answer at all. With no usable
+/// Postgres it still serves every Phase 1 route (catalog, overview, query,
+/// storage), and the ops gates (`ops/g*/`) poll this endpoint for a `200`
+/// to decide the API is up — a non-`200` would report the whole API as
+/// down while most of it answers. The body carries the database's state
+/// instead, so "up but degraded" is visible rather than a green check over
+/// a schema the code cannot use.
+async fn health(State(state): State<AppState>) -> ApiJson<HealthBody> {
+    ApiJson(HealthBody {
+        status: "ok",
+        database: if state.database_ready() {
+            "ok"
+        } else {
+            "unavailable"
+        },
+    })
+}
+
+/// [`health`]'s body. `status` is `ok` for any process that answers this
+/// route; `database` is `ok` only once the start-up step confirmed the
+/// schema is at this build's version (`crate::state::AppState::
+/// database_ready`), and `unavailable` otherwise — no pool at all, an
+/// unreachable one, or one that refused the migrations.
+#[derive(Debug, Serialize)]
+struct HealthBody {
+    status: &'static str,
+    database: &'static str,
 }
 
 /// The JSON body shape a request-timeout response takes — same
@@ -1124,8 +1518,19 @@ struct TimeoutBody {
 /// path that violated the `{"error": "<message>"}` /
 /// `application/json;charset=utf-8` contract every other response honors —
 /// this renders the same JSON error envelope via [`ApiJson`].
-async fn timeout_middleware(req: Request, next: Next) -> Response {
-    let timeout = route_timeout(req.uri().path());
+async fn timeout_middleware(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    let path = req.uri().path();
+    // Only a route that runs queries under the limits reads them (BI-5 plan
+    // D4); every other route keeps its fixed deadline without a settings read.
+    let longest = if limit_bearing(path) {
+        crate::query_limits::snapshot(&state)
+            .await
+            .ok()
+            .map(|snap| snap.longest_timeout())
+    } else {
+        None
+    };
+    let timeout = deadline_for(path, longest);
     match tokio::time::timeout(timeout, next.run(req)).await {
         Ok(response) => response,
         Err(_elapsed) => (
@@ -1147,6 +1552,74 @@ mod tests {
     /// (120s, an 8-round LLM tool loop) — a blanket 60s bound 408'd a
     /// legitimate in-flight request. Pins the per-route table to the TS
     /// `export const maxDuration` grep.
+    /// `BI-1` review fix (BLOCKER) R2: the downloads keep the budgets they were
+    /// built for. The console proxy (`next.config.ts` `proxyTimeout`) must be at
+    /// least the largest of these.
+    #[test]
+    fn the_download_routes_have_their_own_timeouts() {
+        assert_eq!(
+            route_timeout("/api/dashboard/chart-export"),
+            Duration::from_secs(310)
+        );
+        assert_eq!(
+            route_timeout("/api/dashboard/table-export"),
+            Duration::from_secs(310)
+        );
+        assert_eq!(
+            route_timeout("/api/dashboard/export/pdf"),
+            Duration::from_secs(140)
+        );
+        assert!(Duration::from_secs(310) > crate::export::EXPORT_TIMEOUT);
+        assert!(PDF_REQUEST_TIMEOUT > crate::pdf::PDF_SLOT_WAIT + crate::pdf::PDF_DEADLINE);
+        // Everything else keeps the default.
+        assert_eq!(
+            route_timeout("/api/dashboard/export"),
+            DEFAULT_REQUEST_TIMEOUT
+        );
+    }
+
+    /// `BI-5` plan D4: the query route follows the longest configured limit
+    /// plus 15 s, a board route gets the outer cap, everything else keeps its
+    /// fixed deadline, and an unreadable setting keeps the fixed one too.
+    #[test]
+    fn limit_bearing_routes_follow_the_longest_configured_limit() {
+        let longest = Some(Duration::from_secs(300));
+        assert_eq!(
+            deadline_for("/api/query/run", longest),
+            Duration::from_secs(315)
+        );
+        for board in [
+            "/api/dashboard",
+            "/api/render/data",
+            "/api/embed/data",
+            "/api/public/dashboard/abc",
+        ] {
+            assert_eq!(
+                deadline_for(board, longest),
+                crate::query_limits::BOARD_DEADLINE_CAP,
+                "{board}"
+            );
+            assert_eq!(deadline_for(board, None), route_timeout(board), "{board}");
+        }
+        // BI-5 review S1: routes under the board prefixes that run no tile.
+        for other in [
+            "/api/dashboard/export",
+            "/api/catalog",
+            "/api/ai/chat",
+            "/api/embed/frame",
+            "/api/embed/values",
+            "/api/public/dashboard/abc/unlock",
+            "/api/public/dashboard/",
+        ] {
+            assert_eq!(
+                deadline_for(other, longest),
+                route_timeout(other),
+                "{other}"
+            );
+            assert!(!limit_bearing(other));
+        }
+    }
+
     #[test]
     fn chat_timeout_defaults_to_120s_and_clamps_an_operator_override() {
         assert_eq!(chat_timeout_from(None), Duration::from_secs(120));
@@ -1154,7 +1627,7 @@ mod tests {
         assert_eq!(chat_timeout_from(Some("abc")), Duration::from_secs(120));
         assert_eq!(chat_timeout_from(Some("600")), Duration::from_secs(600));
         assert_eq!(chat_timeout_from(Some("5")), Duration::from_secs(30));
-        assert_eq!(chat_timeout_from(Some("99999")), Duration::from_secs(1800));
+        assert_eq!(chat_timeout_from(Some("99999")), Duration::from_mins(30));
     }
 
     #[test]
@@ -1171,6 +1644,15 @@ mod tests {
             "no TS maxDuration export — falls back to the default"
         );
         assert_eq!(DEFAULT_REQUEST_TIMEOUT, Duration::from_secs(60));
+        // RPT-1: "Send now" makes the files in the request.
+        assert_eq!(
+            route_timeout("/api/reports/subscriptions/0b7e/send"),
+            EXPORT_REQUEST_TIMEOUT
+        );
+        assert_eq!(
+            route_timeout("/api/reports/subscriptions/0b7e"),
+            DEFAULT_REQUEST_TIMEOUT
+        );
     }
 
     /// `SRC-13` decision D9: the discovery routes carry a listing call of up to
@@ -1209,12 +1691,27 @@ mod tests {
             "/api/uploads/up-1/ingest",
             "/api/uploads/",
             "/api/uploads/x/y",
+            "/api/uploads/up-1/parts",
+            "/api/uploads/up-1/complete",
+            "/api/uploads/sessions",
+            "/api/uploads/up-1/parts/",
+            "/api/uploads//parts/1",
+            "/api/uploads/up-1/parts/1/x",
         ] {
             assert_eq!(
                 route_timeout(per_upload),
                 DEFAULT_REQUEST_TIMEOUT,
                 "{per_upload}"
             );
+        }
+    }
+
+    /// `DATA-17`: one 8 MiB piece of a chunked upload gets the long bound, as
+    /// the single request it replaces did.
+    #[test]
+    fn a_piece_of_a_chunked_upload_takes_five_minutes() {
+        for piece in ["/api/uploads/up-1/parts/1", "/api/uploads/up-1/parts/256"] {
+            assert_eq!(route_timeout(piece), UPLOAD_REQUEST_TIMEOUT, "{piece}");
         }
     }
 }
@@ -1263,8 +1760,23 @@ mod route_policy_tests {
     use crate::policy::{POLICY_TABLE, Policy};
     use crate::state::AppState;
 
+    /// A router whose state can AUTHENTICATE, with nothing to connect to.
+    ///
+    /// `SEC-37`: an unset `DATABASE_URL` now means "no Postgres pool", and
+    /// without one [`crate::auth::AuthenticatedPrincipal`] refuses every
+    /// protected route with 503 before it looks at the request — the honest
+    /// answer for a deployment that cannot check a credential, but it hides
+    /// the 401 this test exists to observe (a `RequiresAuth` entry with no
+    /// credential presented). So the state is built the way the old default
+    /// DSN built it: a LAZY pool (`connect_lazy` does no I/O) at a
+    /// throwaway address this test never dials, since the no-credential
+    /// path never reaches it.
     fn test_router() -> axum::Router {
-        let cfg = Config::from_map(&std::collections::HashMap::new()).unwrap();
+        let env = std::collections::HashMap::from([(
+            "DATABASE_URL".to_owned(),
+            "postgres://test:test@127.0.0.1:5432/test".to_owned(),
+        )]);
+        let cfg = Config::from_map(&env).unwrap();
         super::router(AppState::new(cfg))
     }
 

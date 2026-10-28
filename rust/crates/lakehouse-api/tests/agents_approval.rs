@@ -15,7 +15,10 @@ use lakehouse_store::audit::{AuditFilter, list};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
-use common::{TestApp, session_cookie_for_seeded_user, spin_up};
+use common::{
+    TestApp, create_principal_with_permissions, session_cookie_for_seeded_user,
+    session_cookie_for_user, spin_up,
+};
 
 async fn post(
     app: &axum::Router,
@@ -467,6 +470,16 @@ async fn access_decide_route_refuses_a_principal_approving_their_own_access_requ
 /// The before/after proof (WS7 plan Phase E acceptance): a DIFFERENT
 /// access:approve holder may decide, and approving actually widens what
 /// the requester can do.
+///
+/// `SEC-45` changed WHO may approve: holding `access:approve` is not
+/// enough, the approver must hold the permission the request asks for.
+/// The seeded Governance Admin (`dewi@meridian.example`) holds
+/// `access:approve` but NOT `catalog:write`, so she can no longer approve
+/// this request — she is refused with 403 by the rule under test (see
+/// `access_decide_route_refuses_an_approval_by_a_principal_without_the_requested_permission`).
+/// This test therefore approves as a principal minted with BOTH
+/// `access:approve` and `catalog:write`, which is what the widened rule
+/// asks for.
 #[tokio::test]
 async fn access_decide_route_allows_a_different_access_approve_holder_and_the_grant_widens_access()
 {
@@ -496,9 +509,11 @@ async fn access_decide_route_allows_a_different_access_approve_holder_and_the_gr
     .expect("load principal before grant");
     assert!(!before.has("catalog:write"));
 
-    // dewi@meridian.example: Governance Admin, holds access:approve, is
-    // NOT the requester.
-    let cookie = session_cookie_for_seeded_user(&pool, "dewi@meridian.example").await;
+    // An approver who holds `access:approve` AND the requested
+    // `catalog:write`, and is NOT the requester.
+    let approver_id =
+        create_principal_with_permissions(&pool, "access:approve, catalog:write").await;
+    let cookie = session_cookie_for_user(&pool, approver_id).await;
     let resp = post(
         &router,
         &format!("/api/catalog/access-requests/{approval_id}/decide"),
@@ -523,4 +538,363 @@ async fn access_decide_route_allows_a_different_access_approve_holder_and_the_gr
     .await
     .expect("load principal after grant");
     assert!(after.has("catalog:write"));
+}
+
+// ── SEC-45: an approver may only approve a permission they hold ──────────
+//
+// `access:approve` says "you may decide access requests"; it does not say
+// "you may hand out any permission". The rule a direct grant already obeys
+// (`routes::catalog_grants::create`, `PR #106 review R1 BLOCKER 4`) applies
+// here too: to APPROVE a request the decider must hold the permission the
+// request asks for. REJECTING needs no permission of its own — it gives
+// nothing away.
+
+/// The requested permission, read from the approval's own `action`
+/// (`access:<permission>`, the shape `create_access_request` writes).
+async fn requested_permission(approval_id: &str, pool: &sqlx::PgPool) -> String {
+    let (action,): (String,) = sqlx::query_as("SELECT action FROM approval_item WHERE id = $1")
+        .bind(approval_id)
+        .fetch_one(pool)
+        .await
+        .expect("the access request row exists");
+    action
+        .strip_prefix("access:")
+        .expect("an access request's action is \"access:<permission>\"-shaped")
+        .to_owned()
+}
+
+/// How many `access_grant` rows this approval produced — the thing a
+/// refused approval must NOT have written.
+async fn grants_for(approval_id: &str, pool: &sqlx::PgPool) -> i64 {
+    let (count,): (i64,) =
+        sqlx::query_as("SELECT count(*) FROM access_grant WHERE approval_id = $1")
+            .bind(approval_id)
+            .fetch_one(pool)
+            .await
+            .expect("count the access grants of an approval");
+    count
+}
+
+/// SEC-45: an approver who holds `access:approve` but NOT the permission
+/// the request asks for is refused with 403, and NOTHING changes: the
+/// request stays pending and no grant row is written.
+#[tokio::test]
+async fn access_decide_route_refuses_an_approval_by_a_principal_without_the_requested_permission() {
+    let TestApp { router, pool } = spin_up().await;
+    let approval_id = create_pending_access_request(
+        &router,
+        &pool,
+        "sari@meridian.example",
+        "cat-1",
+        "catalog:write",
+    )
+    .await;
+    assert_eq!(
+        requested_permission(&approval_id, &pool).await,
+        "catalog:write"
+    );
+
+    // A custom role holding `access:approve` alone: it may decide, but not
+    // hand out a permission it does not itself hold.
+    let approver_id = create_principal_with_permissions(&pool, "access:approve").await;
+    let cookie = session_cookie_for_user(&pool, approver_id).await;
+    let resp = post(
+        &router,
+        &format!("/api/catalog/access-requests/{approval_id}/decide"),
+        Some(&cookie),
+        json!({ "decision": "approved" }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body = json_body(resp).await;
+    assert_eq!(
+        body["error"],
+        json!("permission_denied: you cannot approve a permission you do not hold")
+    );
+
+    // Nothing changed: the request is still pending, and no grant exists.
+    let approval = lakehouse_store::agents::get_approval(&pool, &approval_id)
+        .await
+        .expect("read the access request")
+        .expect("the access request exists");
+    assert_eq!(approval.status, "pending");
+    assert_eq!(grants_for(&approval_id, &pool).await, 0);
+}
+
+/// SEC-45: the same approver, holding the requested permission as well, is
+/// allowed to approve — and the grant really widens the requester's
+/// permissions.
+#[tokio::test]
+async fn access_decide_route_allows_an_approval_by_a_principal_holding_the_requested_permission() {
+    let TestApp { router, pool } = spin_up().await;
+    let approval_id = create_pending_access_request(
+        &router,
+        &pool,
+        "sari@meridian.example",
+        "cat-1",
+        "catalog:write",
+    )
+    .await;
+
+    let (requester_id,): (uuid::Uuid,) = sqlx::query_as("SELECT id FROM app_user WHERE email = $1")
+        .bind("sari@meridian.example")
+        .fetch_one(&pool)
+        .await
+        .expect("seeded user sari@meridian.example must exist");
+
+    let approver_id =
+        create_principal_with_permissions(&pool, "access:approve, catalog:write").await;
+    let cookie = session_cookie_for_user(&pool, approver_id).await;
+    let resp = post(
+        &router,
+        &format!("/api/catalog/access-requests/{approval_id}/decide"),
+        Some(&cookie),
+        json!({ "decision": "approved" }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let approval = lakehouse_store::agents::get_approval(&pool, &approval_id)
+        .await
+        .expect("read the access request")
+        .expect("the access request exists");
+    assert_eq!(approval.status, "approved");
+    assert_eq!(grants_for(&approval_id, &pool).await, 1);
+
+    let after = lakehouse_auth::repository::load_principal_for_user(
+        &pool,
+        requester_id,
+        "local".to_owned(),
+        false,
+    )
+    .await
+    .expect("load principal after grant");
+    assert!(after.has("catalog:write"));
+}
+
+/// SEC-45: rejecting needs no permission of its own — a principal without
+/// the requested permission may still refuse the request (it gives nothing
+/// away).
+#[tokio::test]
+async fn access_decide_route_allows_a_rejection_by_a_principal_without_the_requested_permission() {
+    let TestApp { router, pool } = spin_up().await;
+    let approval_id = create_pending_access_request(
+        &router,
+        &pool,
+        "sari@meridian.example",
+        "cat-1",
+        "catalog:write",
+    )
+    .await;
+
+    let approver_id = create_principal_with_permissions(&pool, "access:approve").await;
+    let cookie = session_cookie_for_user(&pool, approver_id).await;
+    let resp = post(
+        &router,
+        &format!("/api/catalog/access-requests/{approval_id}/decide"),
+        Some(&cookie),
+        json!({ "decision": "rejected", "comment": "not needed" }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let approval = lakehouse_store::agents::get_approval(&pool, &approval_id)
+        .await
+        .expect("read the access request")
+        .expect("the access request exists");
+    assert_eq!(approval.status, "rejected");
+    assert_eq!(grants_for(&approval_id, &pool).await, 0);
+}
+
+// ── AI-1 / AI-20 (plan 20): `delete_board` is a WriteHigh tool ──────────
+//
+// `delete_board` deletes a board AND its charts. It is `WriteHigh`, so
+// it always goes through the human-approval flow: `POST /api/ai/tool`
+// creates a pending approval, `POST /api/agents/approvals/{id}/decide`
+// is the only path that ever runs the tool. This block pins both
+// branches. The harness's `ClickHouse` is a dead upstream, so a
+// successful approval lands the run at `failed` (the route's `DELETE
+// /api/dashboard/boards?id=…` reached `store::delete_board`, which
+// failed in ClickHouse) — exactly the same pattern the `delete_chart`
+// approval test uses. The "board and charts are gone afterwards" half
+// is left to a future harness with a real `ClickHouse`.
+
+/// `delete_board` (WriteHigh): calling `POST /api/ai/tool` with or
+/// without `confirmed: true` creates a pending approval, never
+/// executes the route directly. The approval carries the board id as
+/// the resource and the `reason` names the board and says the charts
+/// are deleted with it.
+#[tokio::test]
+async fn delete_board_creates_a_pending_approval_and_does_not_execute() {
+    let TestApp { router, pool } = spin_up().await;
+    let cookie = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+
+    let resp = post(
+        &router,
+        "/api/ai/tool",
+        Some(&cookie),
+        json!({
+            "tool": "delete_board",
+            "args": { "id": "b-del" },
+            "mode": "build"
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["outcome"], json!("needs_approval"));
+    assert_eq!(body["result"]["needs_approval"], json!(true));
+    let approval_id = body["result"]["approval_id"]
+        .as_str()
+        .expect("approval_id present")
+        .to_owned();
+    let run_id = body["result"]["run_id"]
+        .as_str()
+        .expect("run_id present")
+        .to_owned();
+
+    // The reason the human sees names the board and says its charts
+    // are deleted with it (plan 20 `gate.rs::reason_for_write_high`
+    // arm for `delete_board`).
+    let summary = body["result"]["summary"].as_str().expect("summary present");
+    assert!(
+        summary.contains("b-del"),
+        "summary must name the board, got: {summary}"
+    );
+    assert!(
+        summary.contains("chart"),
+        "the approval must warn that the board's charts go too, not just name the board, got: {summary}"
+    );
+
+    let approvals = lakehouse_store::agents::list_approvals(&pool, None)
+        .await
+        .expect("list approvals");
+    assert_eq!(approvals.len(), 1);
+    assert_eq!(approvals[0].id, approval_id);
+    assert_eq!(approvals[0].status, "pending");
+    assert_eq!(approvals[0].action, "delete_board");
+    assert_eq!(approvals[0].resource.as_deref(), Some("b-del"));
+
+    let run = lakehouse_store::agents::get_run(&pool, &run_id)
+        .await
+        .expect("get run")
+        .expect("run exists");
+    assert_eq!(run.status, "waiting_approval");
+
+    // The gate audit row carries the board as the resource, the
+    // `needs_approval` outcome, and is linked to the run/approval.
+    let events = list(&pool, AuditFilter::default())
+        .await
+        .expect("list audit events");
+    let ours: Vec<_> = events
+        .iter()
+        .filter(|e| e.action == "delete_board")
+        .collect();
+    assert_eq!(ours.len(), 1);
+    assert_eq!(ours[0].outcome, "needs_approval");
+    assert_eq!(ours[0].resource_kind.as_deref(), Some("board"));
+    assert_eq!(ours[0].resource_id.as_deref(), Some("b-del"));
+    assert_eq!(ours[0].run_id.as_deref(), Some(run_id.as_str()));
+    assert_eq!(ours[0].approval_id.as_deref(), Some(approval_id.as_str()));
+}
+
+/// Approving a pending `delete_board` approval by a principal who
+/// holds the tool's own permission routes the run through the real
+/// dispatch. The dead `ClickHouse` upstream forces the run to `failed`,
+/// the same shape `delete_chart` produces — the point is that the
+/// approval-decision path executed, not that the board was deleted.
+#[tokio::test]
+async fn approve_delete_board_executes_the_dispatch_and_audits_it() {
+    let TestApp { router, pool } = spin_up().await;
+    let approval_id = create_pending_delete_board_approval(&router, &pool).await;
+
+    let cookie = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+    let resp = post(
+        &router,
+        &format!("/api/agents/approvals/{approval_id}/decide"),
+        Some(&cookie),
+        json!({ "decision": "approved" }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["executed"], json!(true));
+    assert_eq!(body["approval"]["status"], json!("approved"));
+    assert!(body.get("result").is_some());
+
+    let run_id = body["approval"]["runId"]
+        .as_str()
+        .expect("runId present")
+        .to_owned();
+    let run = lakehouse_store::agents::get_run(&pool, &run_id)
+        .await
+        .expect("get run")
+        .expect("run exists");
+    assert!(
+        run.status == "failed" || run.status == "succeeded",
+        "the run must have reached the dispatch and ended terminally, got: {}",
+        run.status
+    );
+    assert_eq!(
+        run.steps.len(),
+        2,
+        "the pending step plus the execution step"
+    );
+}
+
+/// Rejecting a pending `delete_board` approval executes nothing.
+#[tokio::test]
+async fn reject_delete_board_executes_nothing() {
+    let TestApp { router, pool } = spin_up().await;
+    let approval_id = create_pending_delete_board_approval(&router, &pool).await;
+
+    let cookie = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+    let resp = post(
+        &router,
+        &format!("/api/agents/approvals/{approval_id}/decide"),
+        Some(&cookie),
+        json!({ "decision": "rejected" }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["executed"], json!(false));
+    assert_eq!(body["approval"]["status"], json!("rejected"));
+
+    let run_id = body["approval"]["runId"]
+        .as_str()
+        .expect("runId present")
+        .to_owned();
+    let run = lakehouse_store::agents::get_run(&pool, &run_id)
+        .await
+        .expect("get run")
+        .expect("run exists");
+    assert_eq!(run.status, "rejected");
+}
+
+/// Same shape as `create_pending_delete_chart_approval`: create a
+/// pending `delete_board` approval as the Platform Admin and return
+/// the `approval_id` so the approve/reject tests can decide it.
+async fn create_pending_delete_board_approval(
+    router: &axum::Router,
+    pool: &sqlx::PgPool,
+) -> String {
+    let cookie = session_cookie_for_seeded_user(pool, "fajar@meridian.example").await;
+    let resp = post(
+        router,
+        "/api/ai/tool",
+        Some(&cookie),
+        json!({
+            "tool": "delete_board",
+            "args": { "id": "b-del" },
+            "mode": "build"
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    body["result"]["approval_id"]
+        .as_str()
+        .expect("approval_id present")
+        .to_owned()
 }

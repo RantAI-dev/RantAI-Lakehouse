@@ -229,6 +229,10 @@ async fn save(
     sources::save_source(&state.clickhouse, &source)
         .await
         .map_err(|err| classify_ch_error(&err))?;
+    // DATA-13 (F4): the output columns are known from the probe above, so the
+    // source's column lineage is recorded now; a failure there is logged and
+    // never fails the save.
+    super::lineage::columns::record_sql_source(state, &source).await;
     Ok(source)
 }
 
@@ -286,6 +290,7 @@ pub async fn update(
 /// any chart still reads it, 422/503 on a `ClickHouse` failure.
 pub async fn delete(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Query(q): Query<IdQuery>,
 ) -> ApiResult<ApiJson<Value>> {
     let id =
@@ -302,21 +307,36 @@ pub async fn delete(
     {
         return Err(ApiError::NotFound(format!("SQL source '{id}' not found.")).into());
     }
-    let charts = store::list_stored_charts(ch)
+    // BI-18 part C, part 2: a chart on somebody's personal board still blocks
+    // the delete (it would break), but it is not named: the caller is told
+    // only about the charts they may see.
+    let all = store::list_stored_charts(ch, &lakehouse_bi::access::Viewer::system())
         .await
         .map_err(|err| classify_ch_error(&err))?;
-    let users = sources::charts_using_source(&charts, &id);
-    if !users.is_empty() {
-        return Err(ApiError::Conflict(format!(
-            "SQL source is still used by {} chart(s): {}",
-            users.len(),
-            users.join(", ")
-        ))
-        .into());
+    if !sources::charts_using_source(&all, &id).is_empty() {
+        let mine = store::list_stored_charts(
+            ch,
+            &crate::routes::dashboard_organise::viewer_of(&principal),
+        )
+        .await
+        .map_err(|err| classify_ch_error(&err))?;
+        let users = sources::charts_using_source(&mine, &id);
+        let message = if users.is_empty() {
+            "SQL source is still used by a dashboard you cannot see.".to_owned()
+        } else {
+            format!(
+                "SQL source is still used by {} chart(s): {}",
+                users.len(),
+                users.join(", ")
+            )
+        };
+        return Err(ApiError::Conflict(message).into());
     }
     sources::delete_source(ch, &id)
         .await
         .map_err(|err| classify_ch_error(&err))?;
+    // DATA-13 (F4): the source's column mappings go with it.
+    super::lineage::columns::forget_sql_source(&state, &id).await;
     // BI-8: the source's calculated fields go with it (no chart uses the
     // source any more, so none can use them).
     let orphans =
@@ -415,6 +435,7 @@ async fn preview_for_roles(
             match try_run_spec_sql(ch, &chart.spec.sql, roles, placeholders, obligations).await {
                 Ok(rows) => rows,
                 Err(SpecRunFailure::Refused(message)) => json!({ "error": message }),
+                Err(SpecRunFailure::Tile(answer)) => answer,
                 Err(SpecRunFailure::Clickhouse(err)) => return Err(classify_ch_error(&err)),
             };
         crate::routes::support::annotate_saved_grain(&mut rows, &chart);

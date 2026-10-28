@@ -5,7 +5,11 @@ import { readKpi, signedAmount, signedPercent, sparklinePoints, type KpiReading 
 import { bucketLabel, isGrain } from "@/lib/time-grain";
 import type { TableDefFields } from "@/lib/table-types";
 import { cn } from "@/lib/utils";
-import { decimalsFor, formatNumber } from "@/lib/chart-axis";
+import { decimalsFor } from "@/lib/chart-axis";
+import type { StyleFields } from "@/lib/chart-style";
+import { formatValue } from "@/lib/value-format";
+import { conditionalCss } from "./table-cell";
+import { useReporting } from "./reporting-context";
 import type { Rows } from "./tile-dialogs";
 
 const TONE: Record<KpiReading["tone"], string> = {
@@ -20,16 +24,18 @@ const TONE: Record<KpiReading["tone"], string> = {
  * better or worse, and a trend line over the periods the server returned.
  * Colour is never the only cue: the arrow and the sign say the same.
  */
-export function KpiCard({ def, cell, caption }: { readonly def: TableDefFields; readonly cell: Rows; readonly caption?: string }) {
+export function KpiCard({ def, cell, caption }: { readonly def: TableDefFields & StyleFields; readonly cell: Rows; readonly caption?: string }) {
   const r = readKpi(cell.rows, def.compare, def.goodDirection, typeof cell.grain === "string" ? cell.grain : undefined);
   // R4: one convention for the value and its change, the charts' (`decimalsFor`).
+  const { numberLocale } = useReporting();
+  const paint = r.value === null ? undefined : conditionalCss(def.conditional, null, r.value);
   const dec = decimalsFor([r.value ?? 0, r.reference ?? 0, r.delta ?? 0, ...r.series]);
   const grain = isGrain(cell.grain) ? cell.grain : null;
   const label = (bucket: unknown) => (grain && bucket !== undefined ? bucketLabel(grain, bucket) : "");
   const Arrow = r.delta === null || r.delta === 0 ? Minus : r.delta > 0 ? ArrowUp : ArrowDown;
   return (
     <div className="grid h-full place-content-center px-2 text-center">
-      <p className="text-4xl font-semibold tabular-nums text-foreground">{r.value === null ? "—" : formatNumber(r.value, dec)}</p>
+      <p className="text-4xl font-semibold tabular-nums text-foreground" style={paint}>{r.value === null ? "—" : formatValue(r.value, def.format, numberLocale, dec)}</p>
       {(r.mode === "previous" || r.mode === "last_year") && r.value !== null ? (
         <p className="mt-0.5 text-xs text-muted-foreground">{label(r.valueBucket)}</p>
       ) : null}

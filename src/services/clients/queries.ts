@@ -10,9 +10,11 @@ import type {
   QueryEngine,
   SqlFixOutcome,
 } from "../contracts/queries";
+import { historyQueryString } from "@/lib/history-query-params";
 import { apiFetch } from "../http";
 import { ServiceError } from "../errors";
 import { chatAnswerFromBody } from "./chat-answer";
+import { RUN_ID_HEADER } from "@/lib/run-id";
 
 /**
  * QueryService is real — `run`/`estimate` execute SQL against ClickHouse
@@ -48,11 +50,12 @@ async function get<T>(url: string, signal?: AbortSignal): Promise<T> {
 async function postJson<T>(
   url: string,
   body: Record<string, unknown>,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  extraHeaders?: Record<string, string>
 ): Promise<T> {
   const res = await apiFetch(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...extraHeaders },
     body: JSON.stringify(body),
     signal,
   });
@@ -162,7 +165,15 @@ async function proposeFix(
 export const clickhouseQueryService: QueryService = {
   // ── real (ClickHouse / Trino) ────────────────────────────────────────────
   run(sql, options, signal) {
-    return postJson<QueryResult>("/api/query/run", { sql, engine: options.engine }, signal);
+    return postJson<QueryResult>(
+      "/api/query/run",
+      { sql, engine: options.engine },
+      signal,
+      options.runId ? { [RUN_ID_HEADER]: options.runId } : undefined
+    );
+  },
+  cancel(runId, signal) {
+    return postJson<{ stopped: number }>("/api/query/cancel", { runId }, signal);
   },
   estimate(sql, signal) {
     return postJson<QueryEstimate>("/api/query/estimate", { sql }, signal);
@@ -188,8 +199,9 @@ export const clickhouseQueryService: QueryService = {
   saveQuery(input: SaveQueryInput, signal) {
     return postJson<SavedQuery>("/api/query/saved", input, signal);
   },
-  listHistory(signal) {
-    return get<QueryHistoryItem[]>("/api/query/history", signal);
+  listHistory(filter, signal) {
+    const query = historyQueryString(filter);
+    return get<QueryHistoryItem[]>(`/api/query/history${query ? `?${query}` : ""}`, signal);
   },
   getSchedulingCapability(signal) {
     return get<QuerySchedulingCapability>("/api/query/scheduling", signal);

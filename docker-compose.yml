@@ -185,6 +185,12 @@ services:
       # 30..1800). Raise it only for a slow self-hosted model, e.g. a
       # small model on CPU; see routes/mod.rs `AI_CHAT_TIMEOUT`.
       AI_CHAT_TIMEOUT_SECS: ${AI_CHAT_TIMEOUT_SECS:-}
+      # BI-4 B review P-S4: the dashboard memory (megabytes, default 256, 0
+      # remembers nothing, clamped to 4096) and how many tiles the process
+      # computes at once (default 24, clamped 4..128). Empty is unset; a
+      # value that is not a number is logged at start and the default is used.
+      RESULT_CACHE_MAX_MB: ${RESULT_CACHE_MAX_MB:-}
+      TILE_CONCURRENCY_MAX: ${TILE_CONCURRENCY_MAX:-}
       # Reply language for a chat message too short to detect: `id`
       # (Indonesian) or `en` (English). Empty means unset; any other value
       # stops the API at start (see config.rs).
@@ -217,6 +223,11 @@ services:
       # config.rs).
       UPLOAD_MAX_CONCURRENT_PER_USER: ${UPLOAD_MAX_CONCURRENT_PER_USER:-}
       UPLOAD_MAX_CONCURRENT: ${UPLOAD_MAX_CONCURRENT:-}
+      # DATA-17 (Phase 3 slice 1 review SHOULD-FIX 4): hours after which an
+      # upload whose pieces never all arrived is aborted and removed by the
+      # API's hourly sweep. Empty or unset keeps 24; a value that is not a
+      # whole number of 1 or more stops the API at start (see config.rs).
+      UPLOAD_SESSION_TTL_HOURS: ${UPLOAD_SESSION_TTL_HOURS:-}
       SMTP_HOST: ${SMTP_HOST:-}
       SMTP_PORT: ${SMTP_PORT:-587}
       SMTP_SECURE: ${SMTP_SECURE:-false}
@@ -295,6 +306,24 @@ services:
       # per-request 503 rather than lakehouse-api refusing to boot.
       TRINO_URL: ${TRINO_URL:-http://trino:8080}
       EMBED_SECRET: ${EMBED_SECRET:-}
+      # BI-1 (D1, D5): dashboard PDFs. GOTENBERG_URL is the `gotenberg` service
+      # below; CONSOLE_INTERNAL_URL is the console as that container reaches
+      # it (the console is not a compose service: it is run next to the stack,
+      # `lakehouse-frontend:3000` on staging) and is empty by default, which
+      # makes the PDF item say "PDF export is not set up on this deployment".
+      # PDF export also needs RENDER_TOKEN_SECRET, the key of the 2-minute render
+      # token (BI-1 review fix (BLOCKER) R1): its own server-only secret, never
+      # EMBED_SECRET (the embedding customer holds that one, and a render token
+      # reads as whoever it names). No default (AGENTS.md rule 5): unset, PDF
+      # export is not set up and the API still starts. GOTENBERG_URL and
+      # CONSOLE_INTERNAL_URL are internal addresses, not credentials.
+      GOTENBERG_URL: ${GOTENBERG_URL:-http://gotenberg:3000}
+      CONSOLE_INTERNAL_URL: ${CONSOLE_INTERNAL_URL:-}
+      RENDER_TOKEN_SECRET: ${RENDER_TOKEN_SECRET:-}
+      # RPT-1: the console as people open it, for the link in a scheduled
+      # report's email (`<this>/dashboards/<id>`). An address, not a credential;
+      # empty means the email carries no link.
+      CONSOLE_PUBLIC_URL: ${CONSOLE_PUBLIC_URL:-}
       # SEC-12: longest exp - iat of a signed embed token, in seconds. Empty
       # means 86400. A value that is not a positive whole number stops the
       # API at start, on purpose (a typo must not silently keep 24 hours).
@@ -855,6 +884,44 @@ services:
         exit 1
     restart: "no"
 
+  # BI-1 (D1): Gotenberg (headless Chromium) makes the dashboard PDFs. The
+  # API gives it one address, the console's print view with a 2-minute render
+  # token in it (`routes::pdf_export`), and Gotenberg returns the PDF.
+  #
+  # Pinned to an exact tag (8.37.0, published 2026-09-11, the newest 8.x tag
+  # at least two weeks old when this was added). Flags checked against that
+  # image's `gotenberg --help` and the Chromium module documentation,
+  # https://gotenberg.dev/docs/configuration#chromium:
+  #   --api-timeout=70s        above the API's own 60 s deadline for a PDF.
+  #   --chromium-allow-list    regular expressions; Chromium may open ONLY a
+  #                            URL that matches (feature decision 3: the
+  #                            renderer opens the console and nothing else, so
+  #                            a card that points elsewhere cannot make this
+  #                            container fetch it). The expression is
+  #                            CONSOLE_INTERNAL_URL followed by `/` or the end;
+  #                            its dots stand for any character, which only
+  #                            widens a host name by one character in the same
+  #                            position. An unset CONSOLE_INTERNAL_URL leaves a
+  #                            pattern that matches no real address, and the API
+  #                            refuses PDFs then anyway.
+  #   --chromium-disable-javascript=false  the print view is a script.
+  #   --log-level=warn
+  # No `ports:` mapping, like `openfga`: Gotenberg has no authentication, so it
+  # is reachable by its service name from the compose network only and nothing
+  # is published on the host. 1 GiB: Chromium plus two conversions at once
+  # (`PDF_AT_ONCE`) fits; a bigger dashboard fails with a fixed sentence
+  # instead of taking the host down.
+  gotenberg:
+    image: gotenberg/gotenberg:8.37.0
+    command:
+      - gotenberg
+      - --api-timeout=70s
+      - --chromium-allow-list=^${CONSOLE_INTERNAL_URL:-console-url-not-set}(/|$$)
+      - --chromium-disable-javascript=false
+      - --log-level=warn
+    mem_limit: 1g
+    restart: unless-stopped
+
   # R1 — mock OIDC discovery + JWKS issuer. Lakekeeper's ONLY generic
   # (non-Trino, non-Kubernetes) authentication mechanism is OIDC bearer
   # tokens validated against `openid_provider_uri`'s discovery document —
@@ -1053,6 +1120,18 @@ services:
               }
             }'
         fi
+        # DATA-15 F4: a dropped table is kept 7 days (604800 s) and can be
+        # undropped from its asset page; Lakekeeper 0.13.3's default is a
+        # hard delete, which cannot come back. Applied on every run, not
+        # only on create, so an existing warehouse gets it too and a rerun
+        # changes nothing (the same profile is written again). A table
+        # dropped before this ran was hard-deleted and is not recoverable.
+        wh_id=$$(curl -fsS -H "$$auth" "$$base/management/v1/warehouse" | \
+          jq -r --arg name "$$LAKEKEEPER_WAREHOUSE" \
+          '.warehouses[]? | select(.name == $$name) | .id')
+        curl -fsS -X POST -H "$$auth" "$$base/management/v1/warehouse/$$wh_id/delete-profile" \
+          -H 'Content-Type: application/json' \
+          -d '{"delete-profile": {"type": "soft", "expiration-seconds": 604800}}' >/dev/null
     restart: "no"
 
   # R1 — one-shot: self-register every non-admin principal
@@ -1338,7 +1417,10 @@ services:
 
   g1-test-runner:
     profiles: ["test"]
-    image: rust:1.96.1-slim
+    # Same pin as `rust/rust-toolchain.toml` (`channel = "1.99.1"`),
+    # `rust/Dockerfile`, and CI's `stable`-job resolution through that
+    # file, so acceptance and CI compile with one compiler.
+    image: rust:1.99.1-slim
     working_dir: /workspace
     volumes:
       - ./rust:/workspace
@@ -1701,6 +1783,18 @@ services:
               }
             }'
         fi
+        # DATA-15 F4: a dropped table is kept 7 days (604800 s) and can be
+        # undropped from its asset page; Lakekeeper 0.13.3's default is a
+        # hard delete, which cannot come back. Applied on every run, not
+        # only on create, so an existing warehouse gets it too and a rerun
+        # changes nothing (the same profile is written again). A table
+        # dropped before this ran was hard-deleted and is not recoverable.
+        wh_id=$$(curl -fsS -H "$$auth" "$$base/management/v1/warehouse" | \
+          jq -r --arg name "$$LAKEKEEPER_WAREHOUSE" \
+          '.warehouses[]? | select(.name == $$name) | .id')
+        curl -fsS -X POST -H "$$auth" "$$base/management/v1/warehouse/$$wh_id/delete-profile" \
+          -H 'Content-Type: application/json' \
+          -d '{"delete-profile": {"type": "soft", "expiration-seconds": 604800}}' >/dev/null
     restart: "no"
 
   # R1 (ADR 0011) — grants for the SEAWEEDFS warehouse. Grants are
@@ -2143,6 +2237,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      clickhouse:
+        condition: service_healthy
     environment:
       # Not a credential -- a retention window -- so a dev default is fine
       # (AGENTS.md: `${X:-}` for dev defaults, `${X:?}` for must-set).
@@ -2155,6 +2251,12 @@ services:
       LAKEKEEPER_PG_DB: ${LAKEKEEPER_PG_DB:-lakekeeper}
       OPENFGA_PG_DB: ${OPENFGA_PG_DB:-openfga}
       DAGSTER_PG_DB: ${DAGSTER_PG_DB:-dagster}
+      # OPS-7 E6: warehouse source endpoint/bucket and ClickHouse connection (non-secret).
+      BACKUP_WAREHOUSE_ENDPOINT: ${BACKUP_WAREHOUSE_ENDPOINT:-${CH_RUSTFS_S3_ENDPOINT:-http://rustfs:9000}}
+      BACKUP_WAREHOUSE_BUCKET: ${BACKUP_WAREHOUSE_BUCKET:-${LAKEHOUSE_WAREHOUSE_BUCKET:-lakehouse-warehouse}}
+      CH_URL: ${CH_URL:-http://clickhouse:8123}
+      CH_USER: ${CH_USER:-default}
+      CH_PASSWORD: ${CH_PASSWORD:-}
     command: ["python", "-m", "dispar_orchestrate.backup_job"]
     restart: "no"
 
@@ -2262,6 +2364,14 @@ services:
       PGUSER: ${POSTGRES_USER:-lakehouse}
       PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}
       PGDATABASE: ${POSTGRES_DB:-lakehouse}
+    # BLD-4 (`ops/g7/g7_pipeline_test.py`): the second SMALLEST table a
+    # connector-shaped gate needs to load one table and NOT another (a
+    # `ingest_job` run of one table) and so prove that a chain after
+    # `ingest_job` fires only for the table it reads. It is a fixture, not a
+    # product schema: the seeded `conn-pg-lakehouse` row is NOT edited to
+    # load it (0034's seed is applied, never edited) and the only code path
+    # that loads it is that gate's own ingest-spec PUT, against this stack's
+    # own instance.
     entrypoint: ["/bin/sh", "-c"]
     command:
       - >
@@ -2277,6 +2387,16 @@ services:
         SELECT 'customer_' || (g % 500), (g % 1000)::numeric + 0.5
         FROM generate_series(1, 2000) AS g
         WHERE NOT EXISTS (SELECT 1 FROM ingest_demo.orders);
+        CREATE TABLE IF NOT EXISTS ingest_demo.customers (
+          id bigserial PRIMARY KEY,
+          name text NOT NULL,
+          email text NOT NULL,
+          created_at timestamptz NOT NULL DEFAULT now()
+        );
+        INSERT INTO ingest_demo.customers (name, email)
+        SELECT 'customer_' || g, 'customer_' || g || '@example.invalid'
+        FROM generate_series(1, 20) AS g
+        WHERE NOT EXISTS (SELECT 1 FROM ingest_demo.customers);
         "
     restart: "no"
 
@@ -2357,7 +2477,15 @@ services:
   #   docker compose -p <project> --profile dagster run --rm g7-test-runner
   g7-test-runner:
     profiles: ["dagster"]
-    image: python:3.12-slim
+    # BLD-2 review R1 BLOCKER 8: the gate's dependencies are pinned in
+    # `ops/g7/Dockerfile` and baked into the image, the same way
+    # `ops/oidc-mock/Dockerfile` pins its own. Build it once with
+    # `docker compose -p <project> --profile dagster build g7-test-runner`
+    # (the `g3a-dagster` CI job does) instead of installing a driver at
+    # run time, so what the gate depends on is fixed by this file.
+    build:
+      context: ./ops/g7
+    image: ${G7_TEST_RUNNER_IMAGE:-rantai-g7-test-runner:local}
     working_dir: /work
     volumes:
       - ./ops/g7:/work:ro
@@ -2388,6 +2516,20 @@ services:
       CH_RUSTFS_S3_ENDPOINT: http://rustfs:9000
       LAKEKEEPER_WAREHOUSE: ${LAKEKEEPER_WAREHOUSE:-default}
       BRONZE_TABLE_NAME: ${BRONZE_TABLE_NAME:-g3a_orders}
+      # BLD-4: the two Bronze tables the dependency-chain half proves
+      # itself against, each loaded by a run of ONE table on the stack's
+      # own `conn-pg-lakehouse` connector. `orders` (the G3a fixture's
+      # source table) is the chain's OWN table; `customers` is the
+      # smallest second table `g3a-source-init` creates for this. Both
+      # Bronze names are fresh on purpose: a chain that already had a
+      # qualifying anchor would pass the "fires after its own table"
+      # assertion without this job loading anything.
+      G7_INGEST_CONNECTOR_ID: ${G7_INGEST_CONNECTOR_ID:-conn-pg-lakehouse}
+      G7_INGEST_OBJECT_A: ${G7_INGEST_OBJECT_A:-ingest_demo.orders}
+      G7_INGEST_BRONZE_TABLE_A: ${G7_INGEST_BRONZE_TABLE_A:-g7_dep_orders}
+      G7_INGEST_OBJECT_B: ${G7_INGEST_OBJECT_B:-ingest_demo.customers}
+      G7_INGEST_BRONZE_TABLE_B: ${G7_INGEST_BRONZE_TABLE_B:-g7_dep_customers}
+      G7_CHAIN_SILVER_TABLE: ${G7_CHAIN_SILVER_TABLE:-g7_dep_ingest_chain_out}
       # What the source step asserts (BLD-3 review BLOCKER 1): `required`
       # (the default, and what a real deployment wants) makes the gate
       # demand the op's real source text, which needs images carrying a
@@ -2402,21 +2544,28 @@ services:
       # setting needs this pair.
       CH_OAUTH_CLIENT_ID: clickhouse-reader
       CH_OAUTH_SERVER_URI: http://oidc-mock:8090/token
+      # BLD-2 review R1 BLOCKER 8 / R2 SHOULD-FIX 8: pass Postgres credentials to g7-test-runner (hard-coded host/port in compose network, drop duplicate POSTGRES_* pairs)
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: ${POSTGRES_USER:-lakehouse}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}
+      PGDATABASE: ${POSTGRES_DB:-lakehouse}
       PYTHONDONTWRITEBYTECODE: "1"
-    entrypoint: ["/bin/sh", "-c"]
-    command:
-      - "pip install -q requests && python g7_pipeline_test.py"
+    # BLD-2 review R1 BLOCKER 8: no `pip install` at run time — both
+    # dependencies come from the image (see `ops/g7/Dockerfile`).
+    command: ["python", "g7_pipeline_test.py"]
     restart: "no"
 
   # BLD-1 acceptance — `ops/g7/bld1_pipeline_author_test.py`: an authored
   # pipeline reads as its author, proven on the ROWS it writes. Its own
   # service rather than a second command on `g7-test-runner`, because that
   # one's `command` is fixed to the G7 script and `docker compose run`
-  # REPLACES a command -- running this through it would drop the
-  # `pip install requests` its `entrypoint` relies on, and the script would
-  # exit on `import requests` having proved nothing. Same image, same
-  # read-only `./ops/g7` mount, same bootstrap-admin credential from the
-  # operator's `.env`.
+  # REPLACES a command, and the two services no longer share an image.
+  # BLD-2 review R3 SHOULD-FIX 9: `g7-test-runner` now builds
+  # `ops/g7/Dockerfile` (its dependencies are baked in); this service stays
+  # on `python:3.12-slim` and installs `requests` in its own `command`.
+  # Same read-only `./ops/g7` mount, same bootstrap-admin credential from
+  # the operator's `.env`.
   #
   # `BLD1_NO_AUTHOR_PIPELINE_ID` is the third case's fixture (a pipeline
   # whose `run_as` was cleared, which is what a service identity's create
@@ -3435,6 +3584,17 @@ services:
       context: ./ops/g6
       dockerfile: Dockerfile.rest_stub
     profiles: ["g6", "g6-other"]
+    restart: "no"
+
+  # SRC-3 (T1.12, AD9): the mock vendor server of the SaaS gate, one container
+  # for every vendor (each on its own path prefix). Gate-only: its own profile,
+  # started by the two `g6-saas-*` jobs and nothing else. It holds no data and no
+  # credential; it is reachable only on the compose network.
+  saas-stub-g6:
+    build:
+      context: ./ops/g6
+      dockerfile: Dockerfile.saas_stub
+    profiles: ["g6-saas"]
     restart: "no"
 
   # Tier 2 (G6) — the mongodb-adapter fixture

@@ -351,3 +351,620 @@ async fn unauthenticated_request_is_refused_by_the_policy_layer() {
     .await;
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
+
+// ── AI-1 / AI-2 / AI-20 (plan 20): dashboard-board tools ────────────────
+//
+// Every test in this section is an HTTP-level exercise of `POST
+// /api/ai/tool` for one of the six new tools. The harness points
+// `ClickHouse` at a dead upstream (port 1 — a TCP RST, no DNS, no
+// wait: see `tests/common/mod.rs`), so a tool whose success path runs
+// a route that touches ClickHouse (`rename_board`, `delete_board`,
+// `arrange_board`, `move_chart`, `save_board_filters`) lands at
+// `outcome: "failed"` with the upstream error in the result. What each
+// test here CAN still prove without a live ClickHouse:
+//
+// - the gate's decision: refusal, `needs_confirmation`, or `failed`;
+// - the route's own CPU-side refusals (the `board_edit_allowed`
+//   "invalid dashboard" 400 on the built-in Main board, the tool's
+//   own "id/board/name/filters required" pre-checks);
+// - the audit row's `action` and `outcome`;
+// - the `Read` view-filter payload, which is built locally and never
+//   reaches ClickHouse.
+//
+// Plan 20's end-to-end state-change assertions are NOT in this file:
+// they need real `bi_board` / `bi_chart` rows in ClickHouse, which
+// the harness cannot produce, and are recorded as gaps here so a
+// reader is not left guessing:
+//
+//   * `move_chart` (plan 132): "the chart's board changes, its tile
+//     leaves the old board's layout, its other fields are unchanged"
+//     — needs a real `bi_chart` row (to read+re-write the chart) and a
+//     real `bi_board` row (to remove the tile from the old board's
+//     layout). The tool's first store call is `list_stored_charts`,
+//     which the dead upstream turns into a 502-class failure before
+//     any "chart not found" CPU check is reachable.
+//   * `arrange_board` (plan 130-131): "the listed tile moves, the
+//     others keep their boxes" and "a chart from another board is
+//     refused" — both need a real `bi_board` row (to read the current
+//     layout, merge the new tiles, and save the merged layout) and a
+//     real `bi_chart` row (to check the off-board chart id is on the
+//     named board). The CPU-only bounds / off-grid /
+//     `w`-or-`h`-below-1 checks are covered by `parse_arrange_tiles`'s
+//     unit tests in `tools/boards.rs`.
+//   * `arrange_board`, "nothing is saved on refusal" (plan 131's last
+//     clause): covered for the bounds case, which is decided before the
+//     tool reads the layout — see
+//     `arrange_board_refuses_an_off_grid_box_and_saves_nothing`. It
+//     stays fixture-bound for the off-board case, where the refusal can
+//     only be reached after reading real `bi_board` and `bi_chart` rows,
+//     so its no-save consequence cannot be shown here either.
+//   * `save_board_filters` (plan 133): of its four lines, three are covered
+//     here — "21 filters are refused" and "an invalid op is refused" both run
+//     before any `ClickHouse` call (see
+//     `save_board_filters_refuses_more_than_twenty_filters` and
+//     `save_board_filters_refuses_an_invalid_op`), and "Main refuses" runs
+//     inside `board_edit_allowed` (see
+//     `save_board_filters_on_main_fails_with_the_console_message`). Only
+//     "valid filters are saved" is a gap: it needs a real `bi_board` row
+//     whose `filters_json` the call would write through
+//     `store::update_board_filters`.
+//   * `set_board_view_filters` / `AI-2-AC2` (plan 134): "the board's
+//     saved filters are unchanged after the call" needs to read
+//     `bi_board.filters_json` before and after to establish a
+//     baseline. The tool itself is local: `pub(super) fn
+//     set_board_view_filters(args) -> Value` (no async, no `&state`,
+//     no ClickHouse ref) and only its returned payload is observable
+//     through the HTTP layer.
+//
+// No `#[ignore]` placeholders are left for this work, because each
+// gap is a real fixture (a `bi_board` row, a `bi_chart` row, a
+// layout) this harness cannot produce, not a skipped assertion.
+
+/// `rename_board` (WriteLow): without `confirmed: true` the gate returns
+/// `needs_confirmation` and nothing reaches the route.
+#[tokio::test]
+async fn rename_board_without_confirmed_is_a_draft_and_nothing_changed() {
+    let TestApp { router, pool } = spin_up().await;
+    let cookie = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+
+    let resp = post_tool(
+        &router,
+        Some(&cookie),
+        json!({
+            "tool": "rename_board",
+            "args": { "id": "b-rename", "name": "Renamed" },
+            "mode": "build"
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["outcome"], json!("needs_confirmation"));
+    assert_eq!(body["result"]["needs_confirmation"], json!(true));
+    assert!(
+        body["result"]["summary"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty()),
+        "needs_confirmation must carry a non-empty summary"
+    );
+    assert!(
+        body["result"]["summary"]
+            .as_str()
+            .is_some_and(|s| s.contains("b-rename") && s.contains("Renamed")),
+        "summary must name the board and the new name, got: {}",
+        body["result"]["summary"]
+    );
+}
+
+/// `rename_board` with `confirmed: true` passes the gate and reaches the
+/// route; the test harness's `ClickHouse` is a dead upstream, so the
+/// run ends `failed` — but the gate's decision is what the test pins.
+#[tokio::test]
+async fn rename_board_confirmed_passes_the_gate_and_is_audited_as_failed() {
+    let TestApp { router, pool } = spin_up().await;
+    let cookie = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+
+    let resp = post_tool(
+        &router,
+        Some(&cookie),
+        json!({
+            "tool": "rename_board",
+            "args": { "id": "b-rename", "name": "Renamed", "confirmed": true },
+            "mode": "build"
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_ne!(body["outcome"], json!("refused"));
+    assert_ne!(body["outcome"], json!("needs_confirmation"));
+    let events = list(&pool, AuditFilter::default())
+        .await
+        .expect("list audit events");
+    let ours: Vec<_> = events
+        .iter()
+        .filter(|e| e.action == "rename_board")
+        .collect();
+    assert_eq!(ours.len(), 1, "exactly one audit row");
+    assert_ne!(ours[0].outcome, "refused");
+    assert_ne!(ours[0].outcome, "needs_confirmation");
+    // AI-1: the resource is the board.
+    assert_eq!(ours[0].resource_kind.as_deref(), Some("board"));
+    assert_eq!(ours[0].resource_id.as_deref(), Some("b-rename"));
+}
+
+/// `rename_board` on the built-in Main board is refused by the route's
+/// own `board_edit_allowed`. The test harness's `ClickHouse` is dead, so
+/// the "invalid dashboard" message comes back from the route (no row
+/// was ever written there for this board id, but the route's check runs
+/// before any clickhouse call, so the 400 surfaces cleanly).
+#[tokio::test]
+async fn rename_board_on_default_fails_with_the_console_message() {
+    let TestApp { router, pool } = spin_up().await;
+    let cookie = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+
+    let resp = post_tool(
+        &router,
+        Some(&cookie),
+        json!({
+            "tool": "rename_board",
+            "args": { "id": "default", "name": "Anything", "confirmed": true },
+            "mode": "build"
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_ne!(body["outcome"], json!("needs_confirmation"));
+    assert_ne!(body["outcome"], json!("refused"));
+    assert_eq!(
+        body["result"]["error"],
+        json!("invalid dashboard"),
+        "route's own message must surface through the tool"
+    );
+}
+
+/// `arrange_board` refuses a box that does not fit the 12-column grid, and
+/// **nothing is saved when it refuses** (plan 131's last clause). The bounds
+/// check runs inside `parse_arrange_tiles`, which the tool calls before it
+/// reads the board's layout (`tools/boards.rs:154`, ahead of `read_layout`
+/// at `:159` and the save at `:197`), so a refusal here is answered without
+/// touching the store. That is what the second assertion pins: the error is
+/// the tool's own, not the dead upstream's "database is unavailable", which
+/// is what a tool that parsed the box and then tried to save would return.
+#[tokio::test]
+async fn arrange_board_refuses_an_off_grid_box_and_saves_nothing() {
+    let TestApp { router, pool } = spin_up().await;
+    let cookie = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+
+    let resp = post_tool(
+        &router,
+        Some(&cookie),
+        json!({
+            "tool": "arrange_board",
+            "args": {
+                "board": "b-arrange",
+                // x + w = 8 + 5 = 13, past the twelfth column.
+                "tiles": { "c-1": { "x": 8, "y": 0, "w": 5, "h": 3 } },
+                "confirmed": true
+            },
+            "mode": "build"
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_ne!(body["outcome"], json!("needs_confirmation"));
+    assert_ne!(body["outcome"], json!("refused"));
+    let err = body["result"]["error"].as_str().expect("error message");
+    assert!(
+        err.contains("12-column grid"),
+        "the grid refusal must name the grid, got: {err}"
+    );
+    assert!(
+        !err.contains("database is unavailable"),
+        "the refusal must come from the bounds check, before any save was \
+         attempted; reaching the store at all means the parse error was \
+         ignored, got: {err}"
+    );
+}
+
+/// `arrange_board` (WriteLow): the unconfirmed call needs confirmation.
+#[tokio::test]
+async fn arrange_board_without_confirmed_needs_confirmation() {
+    let TestApp { router, pool } = spin_up().await;
+    let cookie = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+
+    let resp = post_tool(
+        &router,
+        Some(&cookie),
+        json!({
+            "tool": "arrange_board",
+            "args": {
+                "board": "b-arrange",
+                "tiles": { "c-1": { "x": 0, "y": 0, "w": 6, "h": 3 } }
+            },
+            "mode": "build"
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["outcome"], json!("needs_confirmation"));
+    assert!(
+        body["result"]["summary"]
+            .as_str()
+            .is_some_and(|s| s.contains("1 tile") && s.contains("b-arrange")),
+        "summary must name the board and the count, got: {}",
+        body["result"]["summary"]
+    );
+}
+
+/// `save_board_filters` (WriteLow): the unconfirmed call needs
+/// confirmation, and the summary names the board and the filter count.
+#[tokio::test]
+async fn save_board_filters_without_confirmed_needs_confirmation() {
+    let TestApp { router, pool } = spin_up().await;
+    let cookie = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+
+    let filters = json!([
+        { "column": "kabupaten", "values": ["A", "B"] },
+        { "column": "tahun", "values": ["2026"] }
+    ]);
+    let resp = post_tool(
+        &router,
+        Some(&cookie),
+        json!({
+            "tool": "save_board_filters",
+            "args": { "board": "b-filters", "filters": filters },
+            "mode": "build"
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["outcome"], json!("needs_confirmation"));
+    assert!(
+        body["result"]["summary"]
+            .as_str()
+            .is_some_and(|s| s.contains("2 filter") && s.contains("b-filters")),
+        "summary must name the board and the count, got: {}",
+        body["result"]["summary"]
+    );
+}
+
+/// `save_board_filters` on the built-in Main board is refused by the
+/// route's own `board_edit_allowed`. The test harness's `ClickHouse` is
+/// dead, but the route's check runs before any `ClickHouse` call (same
+/// shape as `rename_board_on_default_fails_with_the_console_message`),
+/// so the 400 surfaces cleanly. The "valid filters are saved" half of
+/// the plan's Save-filters line is not in this file: it would write to
+/// `bi_board.filters_json` and the harness cannot observe that — see
+/// this section's header.
+#[tokio::test]
+async fn save_board_filters_on_main_fails_with_the_console_message() {
+    let TestApp { router, pool } = spin_up().await;
+    let cookie = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+
+    let resp = post_tool(
+        &router,
+        Some(&cookie),
+        json!({
+            "tool": "save_board_filters",
+            "args": {
+                "board": "default",
+                "filters": [{ "column": "kabupaten", "values": ["A"] }],
+                "confirmed": true
+            },
+            "mode": "build"
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_ne!(body["outcome"], json!("needs_confirmation"));
+    assert_ne!(body["outcome"], json!("refused"));
+    assert_eq!(
+        body["result"]["error"],
+        json!("invalid dashboard"),
+        "route's own message must surface through the tool"
+    );
+}
+
+// `save_board_filters_refuses_more_than_twenty_filters` moved to
+// `routes/ai/tools/boards.rs` (merge of main into phase 3). BI-18 part C made
+// `boards_update` look the board up as the caller (`require_board`) before
+// `validate_filters`, so against this harness's dead `ClickHouse` the call
+// ends in the classified upstream error and never reaches the 20-filter
+// limit. The unit test there gives the route a live board and asserts the
+// same limit and that nothing is written.
+
+/// `save_board_filters` refuses an invalid filter op. The tool parses the
+/// args into `Vec<FilterDef>` itself (`tools/boards.rs:424`), so this one
+/// never reaches the route at all — it is the plan's "an invalid op is
+/// refused" line for Save filters, which the view-filter tool's own invalid
+/// op test does not cover.
+#[tokio::test]
+async fn save_board_filters_refuses_an_invalid_op() {
+    let TestApp { router, pool } = spin_up().await;
+    let cookie = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+
+    let resp = post_tool(
+        &router,
+        Some(&cookie),
+        json!({
+            "tool": "save_board_filters",
+            "args": {
+                "board": "b-some",
+                "filters": [{ "column": "kabupaten", "values": ["A"], "op": "fuzzy_match" }],
+                "confirmed": true
+            },
+            "mode": "build"
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_ne!(body["outcome"], json!("needs_confirmation"));
+    assert_ne!(body["outcome"], json!("refused"));
+    let err = body["result"]["error"].as_str().expect("error message");
+    // The parse error is always prefixed `filters: `, so that proves
+    // nothing; naming the op the model actually sent is the part that matters.
+    assert!(
+        err.contains("fuzzy_match"),
+        "the refusal must name the unknown op, got: {err}"
+    );
+}
+
+/// `set_board_view_filters` (Read): passes the gate in any mode; the
+/// tool is local, so the result is the validated view-filter payload
+/// the page will apply — `applyViewFilters: true`, the board id, and
+/// the cleaned filter list. What the test proves is the returned
+/// shape; the "nothing was saved" half of that claim is a property of
+/// the tool's implementation, not something observable through this
+/// harness (the saved `bi_board.filters_json` row is in `ClickHouse`,
+/// and the harness's `ClickHouse` is a dead upstream — see this
+/// section's header).
+#[tokio::test]
+async fn set_board_view_filters_returns_the_view_payload() {
+    let TestApp { router, pool } = spin_up().await;
+    let cookie = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+
+    let filters = json!([
+        { "column": "kabupaten", "values": ["A"] }
+    ]);
+    let resp = post_tool(
+        &router,
+        Some(&cookie),
+        json!({
+            "tool": "set_board_view_filters",
+            "args": { "board": "b-view", "filters": filters },
+            "mode": "ask"
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_ne!(body["outcome"], json!("refused"));
+    assert_ne!(body["outcome"], json!("needs_confirmation"));
+    let result = &body["result"];
+    assert_eq!(result["applyViewFilters"], json!(true));
+    assert_eq!(result["board"], json!("b-view"));
+    assert_eq!(result["filters"][0]["column"], json!("kabupaten"));
+}
+
+/// `set_board_view_filters` is available to a Dashboard Viewer (only
+/// `dashboard:read`); the five writing tools are refused with the
+/// permission message.
+#[tokio::test]
+async fn set_board_view_filters_works_with_dashboard_read_only() {
+    let TestApp { router, pool } = spin_up().await;
+    let user_id = common::create_principal_with_permissions(&pool, "dashboard:read").await;
+    let cookie = common::session_cookie_for_user(&pool, user_id).await;
+
+    // The view filter call passes the gate; the route is not called, so
+    // there is no ClickHouse dependency. Outcome is `executed` (no
+    // `error` key in the result), the body has the page payload.
+    let resp = post_tool(
+        &router,
+        Some(&cookie),
+        json!({
+            "tool": "set_board_view_filters",
+            "args": { "board": "b-view", "filters": [] },
+            "mode": "build"
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_ne!(body["outcome"], json!("refused"));
+    assert_eq!(body["result"]["applyViewFilters"], json!(true));
+
+    // Every writing tool (and the high-risk `delete_board`) is refused
+    // with `reason: "permission"` and the required permission named.
+    for (tool, required) in [
+        ("rename_board", "dashboard:write"),
+        ("delete_board", "dashboard:write"),
+        ("arrange_board", "dashboard:write"),
+        ("move_chart", "dashboard:write"),
+        ("save_board_filters", "dashboard:write"),
+    ] {
+        let resp = post_tool(
+            &router,
+            Some(&cookie),
+            json!({
+                "tool": tool,
+                "args": { "id": "x", "name": "y" },
+                "mode": "build"
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK, "tool {tool}");
+        let body = json_body(resp).await;
+        assert_eq!(body["outcome"], json!("refused"), "tool {tool}");
+        assert_eq!(body["result"]["reason"], json!("permission"), "tool {tool}");
+        assert_eq!(body["result"]["required"], json!(required), "tool {tool}");
+    }
+}
+
+/// A principal with no permissions at all is refused on every new tool,
+/// including the `Read` view filter (which needs `dashboard:read`).
+#[tokio::test]
+async fn new_tools_are_refused_for_a_zero_permission_principal() {
+    let TestApp { router, pool } = spin_up().await;
+    let user_id = common::create_zero_permission_principal(&pool).await;
+    let cookie = common::session_cookie_for_user(&pool, user_id).await;
+
+    for tool in [
+        "rename_board",
+        "delete_board",
+        "arrange_board",
+        "move_chart",
+        "save_board_filters",
+        "set_board_view_filters",
+    ] {
+        let resp = post_tool(
+            &router,
+            Some(&cookie),
+            json!({ "tool": tool, "args": {}, "mode": "build" }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK, "tool {tool}");
+        let body = json_body(resp).await;
+        assert_eq!(body["outcome"], json!("refused"), "tool {tool}");
+        assert_eq!(body["result"]["reason"], json!("permission"), "tool {tool}");
+    }
+}
+
+/// Ask mode refuses the five writing tools and allows
+/// `set_board_view_filters` (the only one whose `Risk::Read` keeps it
+/// out of the Ask-mode gate).
+#[tokio::test]
+async fn ask_mode_refuses_the_five_writers_and_allows_set_board_view_filters() {
+    let TestApp { router, pool } = spin_up().await;
+    let cookie = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+
+    for tool in [
+        "rename_board",
+        "delete_board",
+        "arrange_board",
+        "move_chart",
+        "save_board_filters",
+    ] {
+        let resp = post_tool(
+            &router,
+            Some(&cookie),
+            json!({
+                "tool": tool,
+                "args": { "id": "x", "name": "y" },
+                "mode": "ask"
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK, "tool {tool}");
+        let body = json_body(resp).await;
+        assert_eq!(body["outcome"], json!("refused"), "tool {tool}");
+        assert!(
+            body["result"]["error"]
+                .as_str()
+                .is_some_and(|s| s.contains("Ask mode")),
+            "tool {tool}: ask-mode refusal must mention Ask mode, got {}",
+            body["result"]["error"]
+        );
+    }
+
+    // The view filter call still passes in Ask mode.
+    let resp = post_tool(
+        &router,
+        Some(&cookie),
+        json!({
+            "tool": "set_board_view_filters",
+            "args": { "board": "b-view", "filters": [] },
+            "mode": "ask"
+        }),
+    )
+    .await;
+    let body = json_body(resp).await;
+    assert_ne!(body["outcome"], json!("refused"));
+}
+
+// ── BI-4 part B: set_cache_rule ─────────────────────────────────────────
+
+/// `set_cache_rule` (WriteLow): without `confirmed: true` the gate returns
+/// `needs_confirmation` with a summary that names the board and nothing is
+/// saved (`AI-x-AC1`: it asks first).
+#[tokio::test]
+async fn set_cache_rule_without_confirmed_asks_first_and_names_the_board() {
+    let TestApp { router, pool } = spin_up().await;
+    let cookie = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+    let resp = post_tool(
+        &router,
+        Some(&cookie),
+        json!({
+            "tool": "set_cache_rule",
+            "args": { "board": "b-fresh", "rule": "fresh" },
+            "mode": "build"
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["outcome"], json!("needs_confirmation"));
+    assert!(
+        body["result"]["summary"]
+            .as_str()
+            .is_some_and(|s| s.contains("b-fresh")),
+        "{}",
+        body["result"]["summary"]
+    );
+}
+
+/// A rule the console would refuse is refused with the same sentence before
+/// anything is read or saved, and the audit row names the board.
+#[tokio::test]
+async fn set_cache_rule_refuses_minutes_out_of_range_with_the_console_sentence() {
+    let TestApp { router, pool } = spin_up().await;
+    let cookie = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+    let resp = post_tool(
+        &router,
+        Some(&cookie),
+        json!({
+            "tool": "set_cache_rule",
+            "args": { "board": "b-fresh", "rule": "minutes", "minutes": 5000, "confirmed": true },
+            "mode": "build"
+        }),
+    )
+    .await;
+    let body = json_body(resp).await;
+    assert_eq!(
+        body["result"]["error"],
+        json!("Remember for between 1 minute and 24 hours (1 to 1440 minutes).")
+    );
+    let events = list(&pool, AuditFilter::default()).await.expect("audit");
+    let ours: Vec<_> = events
+        .iter()
+        .filter(|e| e.action == "set_cache_rule")
+        .collect();
+    assert_eq!(ours.len(), 1);
+    assert_eq!(ours[0].resource_kind.as_deref(), Some("board"));
+}
+
+/// Someone without `dashboard:write` is refused before the tool runs.
+#[tokio::test]
+async fn set_cache_rule_is_refused_without_dashboard_write() {
+    let TestApp { router, pool } = spin_up().await;
+    let user = common::create_principal_with_permissions(&pool, "dashboard:read").await;
+    let cookie = common::session_cookie_for_user(&pool, user).await;
+    let resp = post_tool(
+        &router,
+        Some(&cookie),
+        json!({
+            "tool": "set_cache_rule",
+            "args": { "board": "b-fresh", "rule": "fresh", "confirmed": true },
+            "mode": "build"
+        }),
+    )
+    .await;
+    let body = json_body(resp).await;
+    assert_eq!(body["outcome"], json!("refused"));
+}

@@ -135,7 +135,7 @@ no admin account is created and you'll need to seed one directly in
 Postgres.
 
 See [docs/OPERATIONS.md](docs/OPERATIONS.md) for what's in/out of the
-compose stack, what `/health` actually checks, the Postgres backup/restore
+compose stack, what `/health` actually checks, the Lakehouse backup and restore
 procedure, and the biggest operational trap in this codebase (Postgres
 being down fails quietly, not loudly).
 
@@ -198,16 +198,19 @@ cargo deny check licenses
 
 ### Rust toolchain / MSRV
 
-The workspace declares `rust-version = "1.88"` in `rust/Cargo.toml` — that's
-the real floor this code has been verified to compile on (`Cargo.lock`
-pulls in `time@0.3.55`, which needs rustc >= 1.88, plus
-`testcontainers`/`etcetera`/`ferroid` transitively pushing past the raw
-edition-2024 minimum of `1.85`; see `rust/Cargo.toml`'s comment and
-`docs/CI.md` for how that was verified). `rust/rust-toolchain.toml` pins
-the toolchain actually used for local dev/CI (currently `1.96.1`, newer
-than the MSRV floor) so contributors and CI build with the same compiler;
-`rustup` will fetch it automatically the first time you run `cargo` inside
-`rust/`.
+`rust/Cargo.toml`'s `rust-version` is `1.99` and equals the
+`rust/rust-toolchain.toml` pin (`channel = "1.99.1"`): since REL-9
+(product-owner decision D1, 2026-10-17) the minimum the workspace promises
+is the latest stable — `sqlx` 0.9, which `SEC-41` needs, requires rustc
+1.94, so a held-over lower promise could not be kept — rather than a
+dependency's floor. `rustup` fetches the pinned toolchain automatically on
+the first `cargo` run inside `rust/`, so contributors and CI build with
+one compiler. The CI `msrv` job proves the floor one patch below the pin
+by running `cargo +1.99.0 check --workspace --all-targets --locked` in
+`rust/`; the `+` is load-bearing because the `rust-toolchain.toml` pin
+would otherwise override the toolchain that job installs (rustup
+precedence) and rebuild the job on the pin instead of the floor. See
+`docs/CI.md`.
 
 ## Configuration
 
@@ -259,7 +262,7 @@ guessed.
 | `OIDC_CLIENT_ID` | This app's client id as registered with the OIDC provider | unset | No — see above |
 | `OIDC_CLIENT_SECRET` | Client secret sent as `client_secret` in the authorization-code exchange at `OIDC_TOKEN_URL` (`routes/auth.rs`); leave unset for a public client | unset | No |
 | `OIDC_PROVIDER_NAME` | Short label combined with `oidc:` to form `Principal::provider` / `auth_identity.provider` | `default` | No |
-| `OIDC_JWKS_URL` | Explicit JWKS endpoint override | derived: `{OIDC_ISSUER}/.well-known/jwks.json` | No |
+| `OIDC_JWKS_URL` | Explicit JWKS endpoint override. Unset means the `jwks_uri` from `{OIDC_ISSUER}/.well-known/openid-configuration` (`SEC-38`) | discovery | No |
 | `OIDC_JIT_PROVISIONING` | `"true"` to auto-create an `app_user` for a validating token with no linked identity yet | `false` | No |
 | `OIDC_ROLE_MAP` | `"group1=Role One,group2=Role Two"` — maps an IdP group/role claim to a local role name | empty | No |
 | `OIDC_GROUPS_CLAIM` | Which token claim carries the caller's groups/roles | `groups` | No |
@@ -268,7 +271,7 @@ guessed.
 | `OIDC_TOKEN_URL` | Token endpoint of the OIDC provider, used to exchange an authorization code for tokens. Read ONLY from this var, never from a request | unset (browser SSO login stays off) | No |
 | `OIDC_REDIRECT_URI` | This deployment's fixed callback URL, registered with the OIDC provider ahead of time. Read ONLY from this var, never from a request, so a caller can never redirect a login or override the callback URL | unset (browser SSO login stays off) | No |
 | `ORACLE_CDC_LOGMINER_ENABLED` | Names the extension point for Oracle CDC via Debezium LogMiner. This build ships no Oracle LogMiner template, so Oracle CDC connectors are refused either way; the flag changes only the explanation (`docs/adr/0008-initial-snapshot-backfill.md`) | `false` | No |
-| `DATABASE_URL` | Postgres connection string for Phase 2 OLTP storage | `postgres://lakehouse:lakehouse@localhost:5432/lakehouse` | No (but a wrong/unreachable value means every Phase 2 route returns 503 — see below) |
+| `DATABASE_URL` | Postgres connection string for Phase 2 OLTP storage | unset (no Postgres pool; every Phase 2 route returns 503 — see below) | No (but a wrong/unreachable value means every Phase 2 route returns 503 — see below) |
 
 These are also read by `lakehouse-api` (`config.rs`, and `routes/mod.rs` for
 the chat timeout); they were missing from the table above until 2026-10-15
@@ -435,7 +438,9 @@ issue about any of the following — they're known, not bugs:
   embeddings API. The API's knowledge source and vector-job records remain
   (Postgres, `lakehouse-store::knowledge`) with no search route and no page.
 - **Connector "Test connection" dials PostgreSQL, MySQL/MariaDB, SQL Server,
-  S3-compatible object storage and REST APIs.** `POST /api/connectors/{id}/test`
+  S3-compatible object storage, REST APIs and the business-app vendors
+  (Salesforce, ServiceNow, Google Analytics 4, HubSpot, Zendesk, Confluence,
+  Dynamics 365, SharePoint; a fixed vendor host, never one typed by the user).** `POST /api/connectors/{id}/test`
   (`lakehouse-api`'s `connector_probe` module) opens a real, bounded
   connection to those and measures real latency, resolving the connector's
   `secretRef` through the allowlisted resolver (ADR 0002). Oracle, MongoDB,

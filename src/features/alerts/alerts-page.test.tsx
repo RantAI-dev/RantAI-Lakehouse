@@ -52,6 +52,15 @@ describe("alertRuleFormFields", () => {
       ...NO_LOAD_FIELDS,
     })
   })
+
+  it("shows no mart/measure, board, or freshness target for pipeline_behind_target", () => {
+    expect(alertRuleFormFields("pipeline_behind_target")).toEqual({
+      martMeasure: false,
+      board: false,
+      freshnessTarget: false,
+      ...NO_LOAD_FIELDS,
+    })
+  })
 })
 
 describe("a rule that watches a metric (BI-2)", () => {
@@ -167,6 +176,23 @@ describe("alertRuleSaveInput", () => {
     expect(body.type).toBe("upload_failure")
   })
 
+  it("sends a pipeline_behind_target rule with pipeline wildcard when none is given", () => {
+    expect(
+      alertRuleSaveInput({
+        ...FORM,
+        type: "pipeline_behind_target",
+        connector: undefined,
+      })
+    ).toEqual({
+      name: "Load failed",
+      type: "pipeline_behind_target",
+      channel: "webhook",
+      target: "https://hooks.example.com/x",
+      enabled: true,
+      pipeline: "*",
+    })
+  })
+
   it("sends the form unchanged for the older kinds", () => {
     const alert = { ...FORM, type: "alert", connector: undefined }
     expect(alertRuleSaveInput(alert)).toBe(alert)
@@ -183,6 +209,7 @@ describe("the rules table's labels and scope", () => {
     expect(ruleKindLabel("connector_schema_change")).toBe("Connector schema changed")
     expect(ruleKindLabel("connector_success")).toBe("Connector run succeeded")
     expect(ruleKindLabel("upload_failure")).toBe("Upload failed")
+    expect(ruleKindLabel("pipeline_behind_target")).toBe("Pipeline behind target lag")
   })
 
   it("shows the connector's name when known, its id otherwise, All connectors for *, Uploads for uploads", () => {
@@ -190,7 +217,58 @@ describe("the rules table's labels and scope", () => {
     expect(ruleScope({ type: "connector_failure", connector: "conn-z" }, connectors)).toBe("conn-z")
     expect(ruleScope({ type: "connector_failure", connector: "*" }, connectors)).toBe("All connectors")
     expect(ruleScope({ type: "upload_failure", connector: "*" }, connectors)).toBe("Uploads")
+    expect(ruleScope({ type: "pipeline_behind_target", pipeline: "pl-x" }, connectors)).toBe("pl-x")
+    expect(ruleScope({ type: "pipeline_behind_target", pipeline: "*" }, connectors)).toBe("All pipelines")
+    expect(ruleScope({ type: "pipeline_behind_target" }, connectors)).toBe("All pipelines")
     expect(ruleScope({ type: "alert" }, connectors)).toBeNull()
+  })
+})
+
+describe("the quality incident kind (DATA-14)", () => {
+  const base: AlertRule = {
+    id: "",
+    name: "  Quality  ",
+    type: "quality_incident",
+    agg: "sum",
+    op: ">",
+    threshold: 0,
+    channel: "webhook",
+    target: " https://hooks.example.com/x ",
+    enabled: true,
+  }
+
+  it("has no mart, measure, board, connector or table-name field of the other kinds", () => {
+    for (const admin of [false, true]) {
+      expect(alertRuleFormFields("quality_incident", admin)).toEqual({
+        martMeasure: false,
+        board: false,
+        freshnessTarget: false,
+        ...NO_LOAD_FIELDS,
+      })
+    }
+  })
+
+  it("saves only the fields that apply: name, kind, delivery, severity and the table", () => {
+    expect(alertRuleSaveInput({ ...base, asset: " Silver.Orders ", severity: "high" })).toEqual({
+      name: "Quality",
+      type: "quality_incident",
+      channel: "webhook",
+      target: "https://hooks.example.com/x",
+      enabled: true,
+      severity: "high",
+      asset: "Silver.Orders",
+    })
+    // No mart, aggregate, threshold or connector rides along, and no severity
+    // when there is none.
+    const sent = alertRuleSaveInput({ ...base, asset: "*", mart: "x", connector: "conn-a" })
+    expect(Object.keys(sent).sort()).toEqual(["asset", "channel", "enabled", "name", "target", "type"])
+  })
+
+  it("is named in words and scoped to its table, or to every table", () => {
+    expect(ruleKindLabel("quality_incident")).toBe("Quality incident opened")
+    expect(ruleScope({ type: "quality_incident", asset: "silver.orders" }, [])).toBe("silver.orders")
+    expect(ruleScope({ type: "quality_incident", asset: "*" }, [])).toBe("All tables")
+    expect(ruleScope({ type: "quality_incident" }, [])).toBeNull()
   })
 })
 

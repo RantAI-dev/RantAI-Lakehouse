@@ -90,6 +90,7 @@ function stubFetch(connectors: unknown[] = []): string[] {
     urls.push(target)
     if (target === "/api/connectors") return json(connectors)
     if (target === "/api/uploads") return json([])
+    if (target === "/api/uploads/folders") return json([])
     throw new Error(`unexpected fetch: ${target}`)
   }) as unknown as typeof fetch
   return urls
@@ -109,7 +110,7 @@ describe("ConnectorsPage tabs", () => {
     renderPage()
     expect(
       await screen.findByText(
-        "Databases, change capture, object storage, files, REST APIs and message topics. Data enters the platform here before processing."
+        "Databases, change capture, object storage, files, REST APIs, message topics and business apps. Data enters the platform here before processing."
       )
     ).toBeDefined()
     expect(screen.queryByText(/SaaS/)).toBeNull()
