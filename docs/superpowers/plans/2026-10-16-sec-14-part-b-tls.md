@@ -725,9 +725,13 @@ with the full re-run after `SEC-41` merges, when this branch merges
 Developer: a non-Opus coding agent. Worktree `/home/shiro/rantai/wt-pr192`
 (branch `fix/sec-14-part-b-tls`). Base of this round: `origin/main` at
 `97d62b3b`, which carries `SEC-41` (`sqlx` 0.9, PR #253). `main` moved
-while this round ran (`calamine` 0.37 and the npm group, PR #255/#256/
-#257/#267) and was merged again as `857e06e2`; the branch is now on top
-of `origin/main` at `2dc97b14`.
+twice while this round ran, and both moves were merged in:
+`2dc97b14` (PR #255/#256/#257/#267: the `calamine` 0.37 bump, the npm
+group, and the lock refresh) and `f40b20eb` (PR #259, `DATA-35` upload
+folders, plus PR #265). The branch is now on top of `origin/main` at
+`f40b20eb`; the third merge was conflict-free (`git merge-tree
+--write-tree` reported no conflict) and main's new commits touch no
+file this PR changes, except `CHANGELOG.md`, which merges cleanly.
 
 #### 1. Commits on branch `fix/sec-14-part-b-tls` (round 4)
 
@@ -737,8 +741,9 @@ of `origin/main` at `2dc97b14`.
   helper (SEC-14 part B) — BLOCKER 12.
 - `1ad40c1a`: docs(connectors): correct the TLS posture text after the
   sqlx 0.9 merge (SEC-14 part B) — BLOCKER 12's documentation half.
-- `857e06e2`: Merge remote-tracking branch 'origin/main' into
-  fix/sec-14-part-b-tls (main at `2dc97b14`).
+- `38aa9e80`: docs(plan): SEC-14 part B round 4 handoff.
+- `b4fc6d9d`: Merge remote-tracking branch 'origin/main' into
+  fix/sec-14-part-b-tls (main at `f40b20eb`).
 
 #### 2. Conflict resolution, file by file (AGENTS.md rule 9)
 
@@ -847,27 +852,27 @@ The file says this at `rust/crates/lakehouse-api/src/crypto_provider.rs`
 (with the same file:line evidence) and `rust/Cargo.toml`'s `rustls`
 entry no longer claims that `tiberius` pins `ring` (it does not).
 
-#### 6. Verification (foreground, final commit `857e06e2`)
+#### 6. Verification (foreground, final code commit `b4fc6d9d`)
 
 Machine: 11.9 GB RAM, 502 GB disk. Every cargo command ran through
 `/home/shiro/rantai/bin/cargo-locked` (shared `CARGO_TARGET_DIR`,
 heavy-job lock). No `cargo clean`; the shared target was pruned only by
-the machine's own `cargo-target-prune.sh`.
+the machine's own `cargo-target-prune.sh`. The last commit, the handoff
+itself, changes only this plan file.
 
 1. **`cargo fmt --check`** — exit 0, no diff.
-2. **`cargo clippy --workspace --all-targets --all-features -- -D warnings`** —
-   exit 0, 0 warnings, 0 errors (`Finished dev profile ... in 4m 20s`).
-3. **`cargo test --workspace --no-fail-fast -j 1`** — 156 binaries,
-   **8353 passed; 0 failed; 49 ignored**. The per-binary lines are in
-   the table below. `-j 1` because this VM has 11.9 GB of RAM: with
-   cargo's default parallelism the `lakehouse-api` lib/bin test
-   compiles were SIGKILLed by the OOM killer twice (see "Not verified"
-   below), and once the disk filled up mid-link. Neither is a code
-   failure: the same tree passes when one rustc runs at a time.
+2. **`cargo clippy --workspace --all-targets --all-features -j 1 -- -D warnings`** —
+   exit 0, 0 warnings, 0 errors (`Finished dev profile ... in 4m 02s`).
+   `-j 1` because this VM has 11.9 GB of RAM: with cargo's default
+   parallelism the `lakehouse-api` lib test compile was SIGKILLed by the
+   OOM killer (`signal: 9, SIGKILL`); the same tree passes with one
+   rustc at a time.
+3. **`cargo test --workspace --no-fail-fast -j 1`** — 158 binaries,
+   **8389 passed; 0 failed; 49 ignored**. The binaries that matter here:
    | binary | result |
    | --- | --- |
-   | `src/lib.rs` (lakehouse-api) | ok 2741 passed; 0 failed; 18 ignored |
-   | `src/main.rs` (lakehouse-api) | ok 2790 passed; 0 failed; 18 ignored |
+   | `src/lib.rs` (lakehouse-api) | ok 2774 passed; 0 failed; 18 ignored |
+   | `src/main.rs` (lakehouse-api) | ok 2823 passed; 0 failed; 18 ignored |
    | `tests/crypto_provider.rs` | ok 3 passed; 0 failed; 0 ignored |
    | `tests/sec41_verify_ca.rs` | ok 1 passed; 0 failed; 0 ignored |
    | `tests/connector_repoint.rs` | ok 15 passed; 0 failed; 0 ignored |
@@ -875,7 +880,7 @@ the machine's own `cargo-target-prune.sh`.
    | `tests/connector_secret_rotate.rs` | ok 8 passed; 0 failed; 0 ignored |
    | `tests/route_auth.rs` | ok 65 passed; 0 failed; 0 ignored |
    | `tests/upload_routes.rs` | ok 141 passed; 0 failed; 0 ignored |
-   | every other binary | ok, 0 failed (156 binaries in all) |
+   | every other binary | ok, 0 failed (158 binaries in all) |
 4. **`cargo deny check`** — exit 0:
    `advisories ok, bans ok, licenses ok, sources ok`.
 5. **`bun run typecheck`** — exit 0 (`bun --bun tsc --noEmit`).
@@ -886,8 +891,8 @@ the machine's own `cargo-target-prune.sh`.
    `src/features/copilot/use-copilot.ts`, `src/hooks/use-data-table.ts`,
    `src/lib/dashboard-specs.ts`, `src/lib/uploads.test.ts`,
    `src/services/http.ts`), none in a file this PR touches.
-7. **`bun run test`** — `2892 pass, 1 skip, 0 fail`, 7913 `expect()`
-   calls, 2893 tests across 298 files.
+7. **`bun run test`** — `2925 pass, 1 skip, 0 fail`, 8035 `expect()`
+   calls, 2926 tests across 299 files.
 8. **`docker compose --profile '*' config --quiet`** — exit 0, with the
    must-set variables given dummy values:
    ```
@@ -898,7 +903,9 @@ the machine's own `cargo-target-prune.sh`.
 9. **`git status`** — clean (nothing staged, nothing untracked but the
    gitignored `.env`, `node_modules/` and `tsconfig.tsbuildinfo`).
 10. **The dependency state** — `cargo tree -i postgres-protocol` ->
-    `postgres-protocol v0.6.12` -> `lakehouse-api v0.1.0`.
+    `postgres-protocol v0.6.12` -> `lakehouse-api v0.1.0`; and the
+    package/version sets of `origin/main`'s lock and the branch's differ
+    by exactly `postgres-protocol` 0.6.12 and `fallible-iterator` 0.2.0.
 
 #### 7. Gates (rule 8), locally, the same commands as `.github/workflows/ci.yml`
 
@@ -906,17 +913,19 @@ Each gate ran on its own clean, uniquely named compose project, under
 `flock /home/shiro/rantai/.heavy.lock`, with `docker compose -p <name>
 down -v` after it. The images were built from this branch's tree
 (`rantai-lakehouse-api:local`, `rantai-lakehouse-dagster:local`, plus
-the gate's own `oidc-mock`).
+the gate's own `oidc-mock`). The API image was rebuilt after each merge
+that touched the API's code, and the gates below ran against the image
+of the final tree.
 
-1. **G6 ingest matrix, `g6-sql` half** (project `pr192r4g6`):
+1. **G6 ingest matrix, `g6-sql` half** (project `pr192r5g6`):
    ```
-   [g6] PostgreSQL connect: pass (16 ms)
+   [g6] PostgreSQL connect: pass (17 ms)
    [g6] PostgreSQL discover: pass (ingest_demo.orders with 4 columns)
-   [g6] MySQL connect: pass (61 ms)
+   [g6] MySQL connect: pass (58 ms)
    [g6] MySQL discover: pass (g6_ingest.orders with 2 columns)
-   [g6] MariaDB connect: pass (50 ms)
+   [g6] MariaDB connect: pass (49 ms)
    [g6] MariaDB discover: pass (g6_ingest.orders with 2 columns)
-   [g6] SQL Server connect: pass (57 ms)
+   [g6] SQL Server connect: pass (21 ms)
    [g6] SQL Server discover: pass (dbo.orders with 2 columns)
    [g6] MySQL load: pass (2 rows in bronze.g6_mysql_orders)
    [g6] MariaDB load: pass (2 rows in bronze.g6_mariadb_orders)
@@ -931,9 +940,9 @@ the gate's own `oidc-mock`).
    Gate summary table: `| PostgreSQL | g6 | pass | pass | pass | pass |`
    (MySQL, MariaDB and SQL Server likewise). **"PostgreSQL discover"
    passing is BLOCKER 12's proof.**
-2. **G4 Debezium CDC** (project `pr192r4g4`):
+2. **G4 Debezium CDC** (project `pr192r5g4`):
    ```
-   [g4] PostgreSQL CDC connect: pass (18 ms)
+   [g4] PostgreSQL CDC connect: pass (14 ms)
    [g4] PostgreSQL CDC discover: pass (p5_cdc.orders with 4 columns)
    [g4] PostgreSQL CDC load: pass (5 rows in the Bronze table after the initial snapshot)
    [g4] PostgreSQL CDC reload: pass (an insert, an update and a delete each visible within 20s)
@@ -943,15 +952,20 @@ the gate's own `oidc-mock`).
    The gate's own tail also reports the WAL-breach alert, the slot
    deprovision ("slot 'p5cdc_slot' no longer exists after deprovisioning
    -- WAL is no longer pinned") and the OIDC round trip.
-3. **SRC-13 discovery of 10,000 tables** (project `pr192r4src13`):
+3. **SRC-13 discovery of 10,000 tables** (project `pr192r5src13`):
    ```
-   [src13] created 10000 tables in schema scale_10k in 42.0 s
-   [src13] schemas listed in 0.12 s (3 schemas)
-   [src13] 10000 tables listed in 0.18 s (limit 120 s)
-   [src13] search for 'T04242' answered in 0.15 s with ['scale_10k.t04242']
+   [src13] created 10000 tables in schema scale_10k in 39.1 s
+   [src13] schemas listed in 0.14 s (3 schemas)
+   [src13] 10000 tables listed in 0.21 s (limit 120 s)
+   [src13] search for 'T04242' answered in 0.14 s with ['scale_10k.t04242']
    [src13] columns of scale_10k.t04242 read in 0.13 s: ['id', 'name'], key ['id']
-   [src13] PASS (43 s)
+   [src13] PASS (40 s)
    ```
+   This one ran with `API_HOST_PORT=28080`: host port 8080 was taken by
+   another stack on this shared VM (`rantai-kb-dev-kb-lite-en-1`) when the
+   API container started. The gate itself runs inside the compose
+   network (`--no-deps src13-scale-test-runner`), so only the API's
+   published host port changed.
 
 After the gates: every `pr192*` container, volume and image was removed
 (`docker compose -p <name> down -v` per gate, then the leftover
@@ -961,21 +975,14 @@ After the gates: every `pr192*` container, volume and image was removed
 
 #### 8. Not verified / known limits
 
-- **The full-workspace `cargo test` needed `-j 1` on this VM.** With
-  cargo's default parallelism the `lakehouse-api` lib and bin test
-  compiles were killed by the OOM killer (`signal: 9, SIGKILL`) twice,
-  and one run died with `No space left on device` while linking. The
-  same command with `-j 1` on the same tree passes with 0 failures. The
-  first full run on this branch (before `main` moved) passed with the
-  default parallelism, so this is the machine's memory and disk
-  pressure, not the code.
-- **Disk during the gates: 38 GB free**, below the 40 GB line the
-  task set. Everything reclaimable that belonged to this round was
-  reclaimed (the gates' own volumes and images, the Docker build cache,
-  488 unused Docker volumes, and the machine's own
-  `cargo-target-prune.sh`); what is left on the disk belongs to other
-  projects and other agents' running stacks and was left alone. The
-  gates need a few GB each and all three passed.
+- **The full-workspace `cargo test` and `cargo clippy` needed `-j 1` on
+  this VM.** With cargo's default parallelism the `lakehouse-api` lib
+  and bin test compiles were killed by the OOM killer (`signal: 9,
+  SIGKILL`), and one run died with `No space left on device` while
+  linking. The same commands with `-j 1` on the same tree pass with 0
+  failures. An earlier full run on this branch (before `main` moved)
+  passed with the default parallelism, so this is the machine's memory
+  and disk pressure, not the code.
 - **`gitleaks` is not installed on this machine**, so the secret scan
   was *not verified* here; CI runs it on the pull request. The
   repository's own `.gitleaks.toml` and `.gitleaksignore` were not
@@ -993,8 +1000,8 @@ After the gates: every `pr192*` container, volume and image was removed
 
 #### 9. Scope & plan status
 
-- BLOCKER 10: the `ring` install at the start of `main` survives the
-  merge and is still the first thing `main` does; the checklist in
+- BLOCKER 10: the `ring` install at the start of `main` survives both
+  merges and is still the first thing `main` does; the checklist in
   section 5 above is now answered with file:line evidence.
 - BLOCKER 11: unchanged by this round and still green (SQL Server
   connect, discover, load and reload all pass in G6).
