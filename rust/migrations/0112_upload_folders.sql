@@ -32,13 +32,15 @@
 -- is `ON DELETE RESTRICT` so that a delete racing with a move into the folder
 -- fails in the database even if the store's own check was passed a moment
 -- earlier. `parent_id` uses the default `NO ACTION` and not RESTRICT: both refuse
--- to delete a parent that still has children, but NO ACTION is checked at the
--- end of the statement, so deleting a whole tenant (`ON DELETE CASCADE` on
--- `tenant_id`) can remove a parent and its children in one statement; RESTRICT
--- would fail on whichever row the cascade reached first. A tenant that still has
--- foldered files cannot be deleted either way, which is the safe side: the
--- files' own rows are kept by `ON DELETE SET NULL` on their `tenant_id`, and
--- their folder must not disappear under them.
+-- to delete a parent that still has children, and both are checked at the end of
+-- the statement, so a tenant delete (`ON DELETE CASCADE` on `tenant_id`) that
+-- removes a parent and its children in one statement succeeds under either
+-- (checked on Postgres 16, in a transaction rolled back; `PR #259 review
+-- SHOULD-FIX 2`). NO ACTION is kept: it is the default, and it can be deferred,
+-- while RESTRICT buys nothing here. A tenant that still has foldered files
+-- cannot be deleted either way, which is the safe side: the files' own rows are
+-- kept by `ON DELETE SET NULL` on their `tenant_id`, and their folder must not
+-- disappear under them.
 --
 -- # The table's folder for re-uploads (decision 2)
 --
