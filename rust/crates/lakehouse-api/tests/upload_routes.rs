@@ -58,7 +58,7 @@ use wiremock::{Mock, MockServer, Request as MockRequest, Respond, ResponseTempla
 
 use common::{
     TestApp, create_principal_with_permissions, session_cookie_for_seeded_user,
-    session_cookie_for_user, spin_up_with_env,
+    session_cookie_for_user, spin_up_with_state,
 };
 
 const GROUP: &str = "11111111-1111-4111-8111-000000000001";
@@ -587,6 +587,15 @@ struct Options {
     iceberg_query_db: Option<&'static str>,
     dagster_url: Option<&'static str>,
     ch_url: Option<&'static str>,
+    /// `SEC-22` D3: how many conversions run at once per API process.
+    upload_max_conversions: Option<&'static str>,
+    /// `SEC-22`: the child the runner starts, when it is not the binary
+    /// Cargo built: a stand-in that answers slowly, so a test can hold a
+    /// conversion slot.
+    conversion_child: Option<std::path::PathBuf>,
+    /// `SEC-22` D6: the output cap the child is given. The real one is
+    /// 512 MiB, which no test writes.
+    conversion_output_cap: Option<u64>,
 }
 
 impl Default for Options {
@@ -595,12 +604,18 @@ impl Default for Options {
             iceberg_query_db: Some("icecat_api"),
             dagster_url: None,
             ch_url: None,
+            upload_max_conversions: None,
+            conversion_child: None,
+            conversion_output_cap: None,
         }
     }
 }
 
 struct Stack {
     app: TestApp,
+    /// The state the router was built from (`SEC-22`: the tests count the
+    /// child's runs through it).
+    state: lakehouse_api::state::AppState,
     bucket: Bucket,
     s3: MockServer,
     dagster: MockServer,
@@ -627,6 +642,11 @@ fn file_form(filename: &str, content_type: &str, bytes: &[u8]) -> Payload {
 }
 
 fn form(parts: &[(&str, Option<&str>, &str, &[u8])]) -> Payload {
+    Payload::Raw("multipart/form-data; boundary=BOUNDARY", form_body(parts))
+}
+
+/// The body of a multipart form, for the request a test sends on its own.
+fn form_body(parts: &[(&str, Option<&str>, &str, &[u8])]) -> Vec<u8> {
     let mut body = Vec::new();
     for (name, filename, content_type, bytes) in parts {
         body.extend_from_slice(b"--BOUNDARY\r\n");
@@ -640,7 +660,7 @@ fn form(parts: &[(&str, Option<&str>, &str, &[u8])]) -> Payload {
         body.extend_from_slice(b"\r\n");
     }
     body.extend_from_slice(b"--BOUNDARY--\r\n");
-    Payload::Raw("multipart/form-data; boundary=BOUNDARY", body)
+    body
 }
 
 /// A signed-in caller: the session cookie and the tenant sent as `X-Tenant`.
@@ -685,9 +705,25 @@ impl Stack {
         if let Some(url) = options.ch_url {
             env.insert("CH_URL".to_owned(), url.to_owned());
         }
-        let app = spin_up_with_env(&env).await;
+        if let Some(limit) = options.upload_max_conversions {
+            env.insert("UPLOAD_MAX_CONVERSIONS".to_owned(), limit.to_owned());
+        }
+        let child = options.conversion_child.clone();
+        let output_cap = options.conversion_output_cap;
+        let (app, state) = spin_up_with_state(&env, |state| {
+            // `SEC-22`: the runner may start another child, and the child may
+            // have a smaller cap than the real one.
+            if let Some(child) = child {
+                state.conversion_runner = state.conversion_runner.with_binary(child);
+            }
+            if let Some(cap) = output_cap {
+                state.conversion_runner = state.conversion_runner.with_max_output_bytes(cap);
+            }
+        })
+        .await;
         Self {
             app,
+            state,
             bucket,
             s3,
             dagster,
@@ -754,6 +790,35 @@ impl Stack {
 
     async fn get(&self, who: &Caller, uri: &str) -> Reply {
         self.send(who, "GET", uri, Payload::None).await
+    }
+
+    /// Upload a file without waiting for the answer: the caller holds the
+    /// request while another one arrives (`SEC-22`: a conversion that is
+    /// already running holds the only slot).
+    fn spawn_upload(
+        &self,
+        who: &Caller,
+        filename: &str,
+        bytes: &[u8],
+    ) -> tokio::task::JoinHandle<StatusCode> {
+        let body = form_body(&[("file", Some(filename), "text/csv", bytes)]);
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/api/uploads")
+            .header("cookie", &who.cookie)
+            .header("content-type", "multipart/form-data; boundary=BOUNDARY");
+        if let Some(tenant) = who.tenant {
+            request = request.header("x-tenant", tenant);
+        }
+        let request = request.body(Body::from(body)).unwrap();
+        let router = self.app.router.clone();
+        tokio::spawn(async move {
+            let response = router
+                .oneshot(request)
+                .await
+                .expect("the router never fails a request outright");
+            response.status()
+        })
     }
 
     /// Upload `bytes` through the route; the answer must be 201.
@@ -4229,8 +4294,19 @@ async fn a_workbook_ingest_stores_the_converted_sheet_beside_the_original_and_la
         json!({ "encoding": "utf-8", "delimiter": ",", "headerRow": 0, "sheet": "Quirks" })
     );
     let original = format!("uploads/{GROUP}/{id}.xlsx");
-    let converted = format!("{original}.converted.csv");
-    assert_eq!(stack.bucket.keys(), [original.clone(), converted.clone()]);
+    // `SEC-22` D5: the converted text is stored under the sheet's position
+    // in the workbook's list (the Quirks sheet is the second), and the list
+    // of the sheets and the answer of the conversion are stored beside it.
+    let converted = format!("{original}.converted.1.csv");
+    assert_eq!(
+        stack.bucket.keys(),
+        [
+            original.clone(),
+            converted.clone(),
+            format!("{original}.converted.1.json"),
+            format!("{original}.sheets.json"),
+        ]
+    );
     assert_eq!(
         stack.bucket.get(&original).unwrap(),
         bytes,
@@ -4292,7 +4368,7 @@ async fn a_workbook_ingest_without_a_sheet_loads_the_default_sheet_of_an_xls_too
     assert_eq!(reply.json["upload"]["parseOptions"]["sheet"], "Stock");
     let converted = stack
         .bucket
-        .get(&format!("uploads/{GROUP}/{id}.xls.converted.csv"))
+        .get(&format!("uploads/{GROUP}/{id}.xls.converted.0.csv"))
         .unwrap();
     assert_eq!(
         String::from_utf8(converted).unwrap(),
@@ -4343,7 +4419,15 @@ async fn a_workbook_ingest_that_cannot_convert_claims_nothing_and_launches_nothi
     );
     assert_eq!(
         stack.bucket.keys(),
-        [format!("uploads/{GROUP}/{id}.xlsx")],
+        [
+            // The original, the list of the sheets (`SEC-22` D5), and the
+            // empty sheet's own conversion: the sheet was read, and what it
+            // holds is nothing.
+            format!("uploads/{GROUP}/{id}.xlsx"),
+            format!("uploads/{GROUP}/{id}.xlsx.converted.4.csv"),
+            format!("uploads/{GROUP}/{id}.xlsx.converted.4.json"),
+            format!("uploads/{GROUP}/{id}.xlsx.sheets.json"),
+        ],
         "no converted object for a sheet that could not be converted"
     );
 }
@@ -4400,7 +4484,9 @@ async fn deleting_a_workbook_upload_removes_the_original_and_the_converted_sheet
         "{}",
         reply.text
     );
-    assert_eq!(stack.bucket.keys().len(), 2);
+    // The original, the list of the sheets, the converted text and the
+    // answer of the conversion (`SEC-22` D5).
+    assert_eq!(stack.bucket.keys().len(), 4);
 
     let gone = stack
         .send(
@@ -7626,3 +7712,4 @@ async fn a_folder_of_another_tenant_or_of_no_kind_refuses_the_load_before_anythi
     assert!(stack.dagster.received_requests().await.unwrap().is_empty());
     assert_eq!(stack.folder_of(&id).await, None);
 }
+

@@ -228,6 +228,18 @@ services:
       # API's hourly sweep. Empty or unset keeps 24; a value that is not a
       # whole number of 1 or more stops the API at start (see config.rs).
       UPLOAD_SESSION_TTL_HOURS: ${UPLOAD_SESSION_TTL_HOURS:-}
+      # SEC-22: how many uploaded workbooks and Parquet files are read at
+      # once per API process. Each read is a child process with its own
+      # memory limit; over the limit the answer is 429 with
+      # `Retry-After: 5` and nothing waits. Empty or unset keeps 2; a value
+      # that is not a whole number of 1 or more stops the API at start (see
+      # config.rs).
+      UPLOAD_MAX_CONVERSIONS: ${UPLOAD_MAX_CONVERSIONS:-}
+      # SEC-22: the memory limit the child that reads an uploaded workbook
+      # or Parquet file sets for itself, in mebibytes. Empty or unset keeps
+      # the default; a value that is not a whole number of 1 or more stops
+      # the API at start (see config.rs).
+      UPLOAD_CONVERT_MEMORY_MB: ${UPLOAD_CONVERT_MEMORY_MB:-}
       SMTP_HOST: ${SMTP_HOST:-}
       SMTP_PORT: ${SMTP_PORT:-587}
       SMTP_SECURE: ${SMTP_SECURE:-false}

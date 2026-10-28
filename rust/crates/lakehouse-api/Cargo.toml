@@ -74,11 +74,14 @@ axum = { workspace = true }
 # (`tokio::sync::Mutex`/`OwnedMutexGuard`) and its tests
 # (`tokio::sync::Barrier`) need it directly, and this crate should compile
 # correctly on its own, not only as part of the whole-workspace build.
+# `process`: the child that reads an uploaded workbook or a Parquet file
+# (`upload_convert`, `SEC-22`) is a process of this binary, started with
+# `tokio::process::Command`.
 # `time`: `crate::bounded::run_with_budget` (WS2 §4) needs
 # `tokio::time::{timeout_at, Instant, sleep}` to bound per-table/per-namespace
 # Lakekeeper calls. `io-util`: `tokio::io::duplex` backs `routes::ai::stream_chat`'s
 # NDJSON progress pipe for `POST /api/ai/chat` (`stream: true`).
-tokio = { workspace = true, features = ["sync", "time", "io-util"] }
+tokio = { workspace = true, features = ["sync", "time", "io-util", "process"] }
 tower = { workspace = true }
 tower-http = { workspace = true }
 reqwest = { workspace = true }

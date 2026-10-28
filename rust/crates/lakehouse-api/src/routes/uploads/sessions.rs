@@ -33,9 +33,10 @@
 //! the memory of this route as it bounds `POST /api/uploads`. Opening a
 //! session reads no file, and completing a text file reads 64 KiB. Completing a
 //! Parquet file reads its footer, by range (`upload_parquet_range`), never the
-//! file. Completing a workbook reads the whole object, as `POST /api/uploads`
-//! does (it must be opened whole), so that path takes a place too and is refused
-//! above [`super::MAX_UPLOAD_BYTES`]: a workbook stays at 50 MB (feature page,
+//! file. Completing a workbook reads the whole object — but in the CHILD
+//! (`SEC-22` D1a), which reads it in pieces from the store, so the API holds
+//! none of it; that path takes a place too and is refused above
+//! [`super::MAX_UPLOAD_BYTES`]: a workbook stays at 50 MB (feature page,
 //! decision 9).
 //!
 //! # Posture
@@ -63,13 +64,14 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::{
-    Accepted, CreateResponse, EMPTY_FILE, MAX_UNPACKED_BYTES, MAX_UPLOAD_BYTES, NO_TENANT,
-    UploadView, blocking, classify_head, display_name, not_found, pool, record_audit, sha256_hex,
-    storage_key, upload_audit_event,
+    Accepted, CONVERSION_FAILED, CreateResponse, EMPTY_FILE, MAX_UNPACKED_BYTES, MAX_UPLOAD_BYTES,
+    NO_TENANT, UploadView, blocking, classify_head, conversion_error, display_name, not_found,
+    pool, record_audit, sha256_hex, sheets_key, sheets_of_answer, storage_key, upload_audit_event,
 };
 use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::state::AppState;
+use crate::upload_convert::{FileKind, Operation, Source};
 use crate::upload_formats;
 use crate::upload_limits::too_many_uploads;
 use crate::upload_parquet;
@@ -80,8 +82,10 @@ use crate::upload_workbook;
 /// The size of every piece but the last: 8 MiB. S3 refuses to assemble an
 /// upload whose pieces before the last are under 5 MiB (checked against
 /// `RustFS`, plan section 8 item 1), and 8 MiB keeps a 2 GiB file at 256 pieces
-/// against S3's limit of 10,000.
-pub(crate) const PART_SIZE: u64 = 8 * 1024 * 1024;
+/// against S3's limit of 10,000. One definition, in the store: the converted
+/// text of a workbook is written in pieces of the same size
+/// (`crate::upload_store::PART_SIZE`).
+pub(crate) const PART_SIZE: u64 = crate::upload_store::PART_SIZE;
 
 /// What the body limit of the piece route allows: a piece plus 64 KiB, so the
 /// limit is not what decides whether a piece is the right size (the size check
@@ -594,8 +598,9 @@ struct WholeFacts {
 }
 
 /// Open a workbook or a Parquet file, the way `POST /api/uploads` does before
-/// it stores one. A workbook must be read whole: the read takes a `SEC-17`
-/// place (it holds up to [`MAX_UPLOAD_BYTES`] in memory), and a workbook above
+/// it stores one. A workbook is opened by the CHILD (`SEC-22` D1a), which
+/// reads it in pieces from the store; the read takes a `SEC-17` place (the
+/// child reads up to [`MAX_UPLOAD_BYTES`] at a time), and a workbook above
 /// that size is refused with the existing sentence; this is where a workbook's
 /// 50 MB limit stays when sessions accept more (feature page, decision 9). A
 /// Parquet file's footer is read by range and checked (`DATA-17` T2.2), and the
@@ -636,6 +641,16 @@ async fn open_whole(
         // held, so it has no size cap here beyond the session's (2 GiB), and no cell cap
         // either: the job streams the file by row group (`DATA-17-RESULT.md`, plan T6.2
         // item 3). The footer is bounded by `MAX_FOOTER_BYTES` before it is read.
+        //
+        // `SEC-22` D1a sends every workbook and Parquet read to the child,
+        // and this footer read is the ONE that stays here: a session's
+        // Parquet file may be 2 GiB, and the child reads its input whole
+        // (`upload_convert::MAX_INPUT_BYTES` is 64 MiB), so the child cannot
+        // read this file at all. The footer read is bounded — it reads
+        // `MAX_FOOTER_BYTES` at most and decodes no page — and what it
+        // trusts it checks against the file (`upload_parquet::check_layout`),
+        // so it cannot be made to ask for more memory than it has. The
+        // planner has the mismatch in the handoff.
         let reader = RangeReader::open(store, &row.storage_key).await?;
         let opened = blocking(move || upload_parquet::inspect(&reader)).await?;
         return Ok(WholeFacts {
@@ -650,17 +665,35 @@ async fn open_whole(
         // Not a refusal of the file: it stays, and the caller completes again.
         return Err(too_many_uploads());
     };
-    let bytes = store.get_all(&row.storage_key).await?;
-    match accepted {
-        Accepted::Workbook => {
-            let opened = blocking(move || upload_workbook::list_sheets(&bytes)).await?;
-            Ok(WholeFacts {
-                workbook: Some(opened),
-                parquet: None,
-            })
-        }
-        _ => Ok(nothing()),
+    if accepted == Accepted::Workbook {
+        // `SEC-22` D1a: the workbook is opened by the CHILD, never by this
+        // process. A workbook declares how much memory its reader will want,
+        // and an allocation failure ends the process that made it — so the
+        // API must not be the one making it. The child reads the stored
+        // object in pieces, so the API holds none of it.
+        let source = Source::Stored {
+            store: store.clone(),
+            key: row.storage_key.clone(),
+        };
+        let answer = state
+            .conversion_runner
+            .answer(Operation::ListSheets, source)
+            .await
+            .map_err(|err| conversion_error(FileKind::Workbook, err))?;
+        let info = sheets_of_answer(&answer)?;
+        // The list of the sheets goes beside the original (`SEC-22` D5), so
+        // that a preview reads it from the store and needs no child.
+        let line = serde_json::to_vec(&answer)
+            .map_err(|_err| ApiError::Internal(CONVERSION_FAILED.to_owned()))?;
+        store
+            .put(&sheets_key(&row.storage_key), Bytes::from(line))
+            .await?;
+        return Ok(WholeFacts {
+            workbook: Some(info),
+            parquet: None,
+        });
     }
+    Ok(nothing())
 }
 
 /// Abort the multipart upload of a `receiving` row and remove the object that

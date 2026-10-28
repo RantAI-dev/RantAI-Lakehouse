@@ -49,28 +49,55 @@
 //! The text a conversion produces is capped at [`MAX_OUTPUT_BYTES`]: the
 //! child stops writing and exits with [`exit::TOO_MUCH_TEXT`], and the caller
 //! throws the partial object away rather than keeping it.
-
-// The API side of this protocol — the runner that starts the child, and the
-// sentences it answers a refusal with — lands in `SEC-22` T3. Until then the
-// binary compiles the parts of this module that only the API side uses, and
-// its `dead_code` lint would say so on every build. The allow goes with T3.
-#![allow(
-    dead_code,
-    reason = "the API side of the protocol (the runner and the sentences) lands in SEC-22 T3"
-)]
+//!
+//! # The API side
+//!
+//! [`ConversionRunner`] is the other half of the protocol: it starts the
+//! child, feeds it the file, reads the answer, and (for the operations that
+//! convert) writes the text into the store. It holds the slots: at most
+//! [`ConversionRunner::max_conversions`] conversions run at once per API
+//! process, and a request that arrives when every slot is taken is refused
+//! at once (429) rather than waiting.
+//!
+//! The child is started with an EMPTY environment and the two variables it
+//! needs ([`MEMORY_ENV`] and [`OUTPUT_ENV`]): a process that parses an
+//! untrusted file must not inherit the API's secrets.
 
 use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use axum::body::Bytes;
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::upload_parquet::{self, ParquetFileError, ParquetInfo};
+use crate::upload_store::{UploadStore, UploadStoreError};
 use crate::upload_workbook::{self, WorkbookError, WorkbookInfo};
 
-/// The environment variable the child's memory limit comes from. The API
-/// sets it on the child it starts; the child reads it for itself, so the
-/// limit holds whatever the caller does (`SEC-22` D1).
+/// The environment variable the child's memory limit comes from.
+///
+/// This is an INTERNAL variable, set by the API on the child it starts (see
+/// [`ConversionRunner::start`]); it is not one an operator sets. The
+/// operator-facing one is `UPLOAD_CONVERT_MEMORY_MB`
+/// (`crate::config::Config::upload_convert_memory_mb`), which the API reads
+/// and passes on as this one. The child reads this variable and nothing else:
+/// it never resolves the whole configuration, so it needs no database, no
+/// secret and no endpoint to read a file.
 pub const MEMORY_ENV: &str = "LAKEHOUSE_CONVERT_MEMORY_MIB";
+
+/// The environment variable the child's output cap comes from.
+///
+/// An INTERNAL variable, like [`MEMORY_ENV`]: the API sets it on the child it
+/// starts. The cap is [`MAX_OUTPUT_BYTES`] unless this says otherwise, and
+/// the API's own cap is the same number — the variable exists so that a test
+/// can ask the child for a smaller cap than 512 MiB without a 512 MiB
+/// fixture.
+pub const OUTPUT_ENV: &str = "LAKEHOUSE_CONVERT_MAX_OUTPUT_BYTES";
 
 /// The child's memory limit when nothing says otherwise: 1 GiB, the number
 /// `SEC-22` D7 starts from. `SEC-22` T5 measures the real peak and sets the
@@ -90,6 +117,18 @@ pub const MAX_OUTPUT_BYTES: u64 = crate::upload_parquet::MAX_OUTPUT_BYTES as u64
 /// upload cap is 50 MiB (`routes::uploads::MAX_UPLOAD_BYTES`), so this is
 /// the backstop for a caller that is not the API.
 pub const MAX_INPUT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The most bytes the child is fed at a time: 8 MiB, the piece size the
+/// chunked upload uses (`SEC-22` D1b). The API never holds the whole file.
+pub const FEED_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
+
+/// The most of the child's standard error that is kept: 2 KiB. The rest is
+/// read and dropped, so the child never blocks on a full pipe.
+pub const MAX_STDERR_BYTES: usize = 2 * 1024;
+
+/// The wall-clock limit of one conversion: 90 s (`SEC-22` D3). The console's
+/// proxy gives up at 130 s, so the conversion answers first.
+pub const CONVERSION_WALL: Duration = Duration::from_secs(90);
 
 /// The sentence for a file that needed more memory or more time than a read
 /// is allowed (`SEC-22` D4). The cases cannot be told apart reliably — a
@@ -128,21 +167,6 @@ pub mod exit {
     pub const INPUT_TOO_LARGE: i32 = 10;
     /// The child ran out of memory or out of time.
     pub const RESOURCE_LIMIT: i32 = 11;
-
-    /// Every code, for the tests that pin the table.
-    pub const ALL: [i32; 11] = [
-        OK,
-        UNREADABLE,
-        ENCRYPTED,
-        NO_SHEETS,
-        NO_COLUMNS,
-        UNKNOWN_SHEET,
-        TOO_LARGE,
-        TOO_MUCH_TEXT,
-        UNSUPPORTED_COLUMN,
-        INPUT_TOO_LARGE,
-        RESOURCE_LIMIT,
-    ];
 }
 
 /// What the child was asked to do.
@@ -370,25 +394,51 @@ impl Default for ChildLimits {
 
 impl ChildLimits {
     /// The limits the child runs under, with the memory limit from the
-    /// environment ([`MEMORY_ENV`]) when it says something usable.
+    /// environment ([`MEMORY_ENV`]) and the output cap from the environment
+    /// ([`OUTPUT_ENV`]) when they say something usable.
+    ///
+    /// The child reads these two variables and nothing else: it never
+    /// resolves the API's configuration, so it needs no environment of its
+    /// own to read a file (`SEC-22` D1).
     #[must_use]
     pub fn from_env() -> Self {
-        let raw = std::env::var(MEMORY_ENV).ok();
-        Self::with_memory(raw.as_deref())
+        let memory = std::env::var(MEMORY_ENV).ok();
+        let output = std::env::var(OUTPUT_ENV).ok();
+        Self::with_limits(memory.as_deref(), output.as_deref())
     }
 
     /// The limits the child runs under, with the memory limit `raw` names,
     /// in mebibytes. Anything that is not a whole number of 1 or more keeps
     /// the default: a limit that cannot be read is no limit at all.
+    #[allow(
+        dead_code,
+        reason = "the unit tests of this module read a limit from a string; the binary does not"
+    )]
     #[must_use]
     pub fn with_memory(raw: Option<&str>) -> Self {
+        Self::with_limits(raw, None)
+    }
+
+    /// The limits the child runs under, with the memory limit `memory` names
+    /// in mebibytes and the output cap `output` names in bytes. Anything that
+    /// is not a whole number of 1 or more keeps the default: a limit that
+    /// cannot be read is no limit at all.
+    #[must_use]
+    pub fn with_limits(memory: Option<&str>, output: Option<&str>) -> Self {
         let mut limits = Self::default();
-        if let Some(mib) = raw
+        if let Some(mib) = memory
             .map(str::trim)
             .and_then(|raw| raw.parse::<u64>().ok())
             .filter(|mib| *mib > 0)
         {
             limits.memory_bytes = mib.saturating_mul(1024 * 1024);
+        }
+        if let Some(bytes) = output
+            .map(str::trim)
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .filter(|bytes| *bytes > 0)
+        {
+            limits.max_output_bytes = bytes;
         }
         limits
     }
@@ -665,6 +715,575 @@ fn set_limits(limits: &ChildLimits) -> Result<(), String> {
         .map_err(|err| format!("RLIMIT_DATA: {err}"))?;
     setrlimit(Resource::RLIMIT_CPU, cpu, cpu).map_err(|err| format!("RLIMIT_CPU: {err}"))?;
     Ok(())
+}
+
+// ── the API side ──────────────────────────────────────────────────────────
+
+/// Where the file the child reads comes from.
+pub enum Source {
+    /// The bytes, already in memory: an upload that was just received.
+    Bytes(Bytes),
+    /// A stored object, read in pieces of [`FEED_CHUNK_BYTES`]. The API
+    /// never holds the whole file (`SEC-22` D1b).
+    Stored {
+        /// The store the object is in.
+        store: UploadStore,
+        /// The key the object is under.
+        key: String,
+    },
+}
+
+/// Why a conversion did not answer.
+///
+/// Each is one answer, never a mixture: a busy installation says so, a
+/// child that could not be started says so, and a file the child refused
+/// says the file's own reason.
+#[derive(Debug)]
+pub enum ConversionError {
+    /// Every slot is taken: 429, with `Retry-After: 5`.
+    Busy,
+    /// The child could not be started: 500.
+    NotStarted,
+    /// The child was killed, ran out of time, or answered something the
+    /// protocol does not allow: 400, with the one sentence for all of them.
+    ResourceLimit,
+    /// The file was refused: 400, with the refusal's own sentence.
+    Refused(Refusal),
+    /// The store failed while the text was written: 503.
+    Store(UploadStoreError),
+}
+
+/// The API's side of the child's protocol: it starts the child, feeds it the
+/// file, reads the answer, and writes the text of a conversion into the
+/// store.
+///
+/// Cheap to clone (the slots are shared), so it can live in [`crate::state::AppState`]
+/// like every other handle.
+#[derive(Clone)]
+pub struct ConversionRunner {
+    /// The binary the child is: this API's own binary.
+    binary: PathBuf,
+    /// Whether the binary is checked to be this API's own binary before it is
+    /// started. The API's own binary always is; a binary a caller sets with
+    /// [`Self::with_binary`] is run as it is, and that caller vouches for it.
+    check_binary: bool,
+    /// The conversion slots, shared by every clone.
+    slots: Arc<Semaphore>,
+    /// The memory limit the child sets for itself, in mebibytes.
+    memory_mib: u64,
+    /// The most text the child may produce, in bytes.
+    max_output_bytes: u64,
+    /// The wall-clock limit of one conversion.
+    wall: Duration,
+    /// How many children this process has started.
+    runs: Arc<AtomicU64>,
+}
+
+impl std::fmt::Debug for ConversionRunner {
+    /// Prints the type name and the limits, never the binary's path (which
+    /// says where the API is installed).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConversionRunner")
+            .field("memory_mib", &self.memory_mib)
+            .field("max_output_bytes", &self.max_output_bytes)
+            .field("wall", &self.wall)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ConversionRunner {
+    /// A runner that starts `binary` as the child, with `max_conversions`
+    /// conversions at once and the child's memory limit at `memory_mib`
+    /// mebibytes.
+    ///
+    /// The binary is checked before it is started: it must be this API's own
+    /// binary, whose name is `lakehouse-api`. A test binary would run the
+    /// test suite again, so it is refused (500) rather than started.
+    #[must_use]
+    pub fn new(binary: PathBuf, max_conversions: usize, memory_mib: u64) -> Self {
+        Self {
+            binary,
+            check_binary: true,
+            slots: Arc::new(Semaphore::new(max_conversions.max(1))),
+            memory_mib,
+            max_output_bytes: MAX_OUTPUT_BYTES,
+            wall: CONVERSION_WALL,
+            runs: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// The same runner, with another binary as the child. For the tests: the
+    /// route tests point the runner at the child Cargo built for them, and at
+    /// a stand-in script that answers slowly.
+    ///
+    /// The binary is run as it is: the caller vouches for it, and the check
+    /// that the child is this API's own binary does not apply.
+    #[allow(
+        dead_code,
+        reason = "the route tests point the runner at the child they built; the binary does not"
+    )]
+    #[must_use]
+    pub fn with_binary(&self, binary: PathBuf) -> Self {
+        Self {
+            binary,
+            check_binary: false,
+            slots: Arc::clone(&self.slots),
+            memory_mib: self.memory_mib,
+            max_output_bytes: self.max_output_bytes,
+            wall: self.wall,
+            runs: Arc::clone(&self.runs),
+        }
+    }
+
+    /// The same runner, with another output cap for the child. For the tests:
+    /// the cap is 512 MiB, and a test that proves the cap is reached does not
+    /// write 512 MiB.
+    #[allow(
+        dead_code,
+        reason = "the route tests set a smaller cap for the child; the binary does not"
+    )]
+    #[must_use]
+    pub fn with_max_output_bytes(&self, max_output_bytes: u64) -> Self {
+        Self {
+            binary: self.binary.clone(),
+            check_binary: self.check_binary,
+            slots: Arc::clone(&self.slots),
+            memory_mib: self.memory_mib,
+            max_output_bytes,
+            wall: self.wall,
+            runs: Arc::clone(&self.runs),
+        }
+    }
+
+    /// The same runner, with another wall-clock limit. For the tests.
+    #[allow(
+        dead_code,
+        reason = "the route tests shorten the wall clock; the binary does not"
+    )]
+    #[must_use]
+    pub fn with_wall(&self, wall: Duration) -> Self {
+        Self {
+            binary: self.binary.clone(),
+            check_binary: self.check_binary,
+            slots: Arc::clone(&self.slots),
+            memory_mib: self.memory_mib,
+            max_output_bytes: self.max_output_bytes,
+            wall,
+            runs: Arc::clone(&self.runs),
+        }
+    }
+
+    /// How many children this process has started. The route tests read it
+    /// to prove that a second preview runs no child.
+    #[allow(
+        dead_code,
+        reason = "the route tests count the child's runs; the binary does not"
+    )]
+    #[must_use]
+    pub fn runs(&self) -> u64 {
+        self.runs.load(Ordering::Relaxed)
+    }
+
+    /// Take a place, or `None` when every slot is taken.
+    fn try_slot(&self) -> Option<OwnedSemaphorePermit> {
+        Arc::clone(&self.slots).try_acquire_owned().ok()
+    }
+
+    /// Run the operation on the file and answer with what the child said.
+    ///
+    /// # Errors
+    ///
+    /// [`ConversionError`]: the installation is busy, the child could not be
+    /// started, the child was killed or ran out of time, or the file was
+    /// refused.
+    pub async fn answer(
+        &self,
+        operation: Operation,
+        source: Source,
+    ) -> Result<Answer, ConversionError> {
+        let Some(_slot) = self.try_slot() else {
+            return Err(ConversionError::Busy);
+        };
+        match tokio::time::timeout(self.wall, Box::pin(self.answer_inner(operation, source))).await
+        {
+            Ok(result) => result,
+            // Past the wall clock: the child is killed with it (the child is
+            // dropped, and `kill_on_drop` is set).
+            Err(_elapsed) => Err(ConversionError::ResourceLimit),
+        }
+    }
+
+    async fn answer_inner(
+        &self,
+        operation: Operation,
+        source: Source,
+    ) -> Result<Answer, ConversionError> {
+        let started = self.start(&operation, source).await?;
+        let Started {
+            answer,
+            child,
+            mut stdout,
+            stderr,
+        } = started;
+        if let Answer::Refusal { refusal } = &answer {
+            return Err(ConversionError::Refused(refusal.clone()));
+        }
+        // The rest of the output is text this operation does not produce; it
+        // is read and dropped, so the child is never blocked on a full pipe.
+        let mut piece = [0_u8; 8192];
+        while let Ok(read) = stdout.read(&mut piece).await {
+            if read == 0 {
+                break;
+            }
+        }
+        self.wait(child, stderr).await?;
+        Ok(answer)
+    }
+
+    /// Run the operation on the file and answer with what the child said and
+    /// the text it produced. The text is read into memory, so this is for
+    /// the small ones: a Parquet preview.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::answer`].
+    pub async fn answer_with_text(
+        &self,
+        operation: Operation,
+        source: Source,
+    ) -> Result<(Answer, Bytes), ConversionError> {
+        let Some(_slot) = self.try_slot() else {
+            return Err(ConversionError::Busy);
+        };
+        match tokio::time::timeout(self.wall, Box::pin(self.text_inner(operation, source))).await {
+            Ok(result) => result,
+            Err(_elapsed) => Err(ConversionError::ResourceLimit),
+        }
+    }
+
+    async fn text_inner(
+        &self,
+        operation: Operation,
+        source: Source,
+    ) -> Result<(Answer, Bytes), ConversionError> {
+        let started = self.start(&operation, source).await?;
+        let Started {
+            answer,
+            child,
+            mut stdout,
+            stderr,
+        } = started;
+        if let Answer::Refusal { refusal } = &answer {
+            return Err(ConversionError::Refused(refusal.clone()));
+        }
+        let mut text = Vec::new();
+        let mut piece = [0_u8; 16 * 1024];
+        loop {
+            let read = stdout
+                .read(&mut piece)
+                .await
+                .map_err(|_err| ConversionError::Refused(Refusal::ResourceLimit))?;
+            if read == 0 {
+                break;
+            }
+            text.extend_from_slice(&piece[..read]);
+            if u64::try_from(text.len()).unwrap_or(u64::MAX) > MAX_OUTPUT_BYTES {
+                return Err(ConversionError::Refused(Refusal::TooMuchText));
+            }
+        }
+        self.wait(child, stderr).await?;
+        Ok((answer, Bytes::from(text)))
+    }
+
+    /// Run the operation on the file and store the text it produced at
+    /// `text_key`, and the answer at `answer_key`.
+    ///
+    /// The text is written as one multipart upload, and the upload is
+    /// aborted when anything goes wrong: a partial object is never kept
+    /// (`SEC-22` D6).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::answer`], and [`ConversionError::Store`] when the store
+    /// refuses the write.
+    pub async fn convert_and_store(
+        &self,
+        operation: Operation,
+        source: Source,
+        store: &UploadStore,
+        text_key: &str,
+        answer_key: &str,
+    ) -> Result<Answer, ConversionError> {
+        let Some(_slot) = self.try_slot() else {
+            return Err(ConversionError::Busy);
+        };
+        match tokio::time::timeout(
+            self.wall,
+            Box::pin(self.store_inner(operation, source, store, text_key, answer_key)),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_elapsed) => Err(ConversionError::ResourceLimit),
+        }
+    }
+
+    async fn store_inner(
+        &self,
+        operation: Operation,
+        source: Source,
+        store: &UploadStore,
+        text_key: &str,
+        answer_key: &str,
+    ) -> Result<Answer, ConversionError> {
+        let started = self.start(&operation, source).await?;
+        let Started {
+            answer,
+            child,
+            mut stdout,
+            stderr,
+        } = started;
+        if let Answer::Refusal { refusal } = &answer {
+            return Err(ConversionError::Refused(refusal.clone()));
+        }
+        // The answer is stored first: it says what the text is, so a reader
+        // that finds the text can tell what it is without running a child.
+        let line = serde_json::to_vec(&answer)
+            .map_err(|_err| ConversionError::Refused(Refusal::Unreadable))?;
+        store
+            .put(answer_key, Bytes::from(line))
+            .await
+            .map_err(ConversionError::Store)?;
+        let written = write_text_to_store(store, text_key, &mut stdout).await;
+        if written.is_err() {
+            // The stream stopped early: read what is left of the child's
+            // output, so the child is never left writing into a pipe nobody
+            // reads.
+            let mut sink = [0_u8; 8192];
+            while let Ok(read) = stdout.read(&mut sink).await {
+                if read == 0 {
+                    break;
+                }
+            }
+        }
+        // The child's own ending decides the answer: it may have stopped
+        // (refused, killed, out of time) even though the store took what
+        // came of it.
+        match (self.wait(child, stderr).await, written) {
+            (Err(err), _) => {
+                // The child did not finish: what it wrote is not the whole
+                // text, so the objects are taken back out (`SEC-22` D6: a
+                // partial object is never kept).
+                remove_stored(store, text_key, answer_key).await;
+                Err(err)
+            }
+            (Ok(()), Err(err)) => {
+                remove_stored(store, text_key, answer_key).await;
+                Err(ConversionError::Store(err))
+            }
+            (Ok(()), Ok(_written)) => Ok(answer),
+        }
+    }
+
+    /// Start the child, feed it the file, and read its answer.
+    async fn start(
+        &self,
+        operation: &Operation,
+        source: Source,
+    ) -> Result<Started, ConversionError> {
+        if self.check_binary && !is_our_binary(&self.binary) {
+            tracing::warn!(
+                binary = %self.binary.display(),
+                "the child binary is not this API's own binary; no file is read"
+            );
+            return Err(ConversionError::NotStarted);
+        }
+        self.runs.fetch_add(1, Ordering::Relaxed);
+        let mut command = Command::new(&self.binary);
+        command
+            .arg("inspect-upload")
+            .args(operation.arguments())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            // The child parses a file somebody chose, so it must not inherit
+            // the API's environment: no secret, no endpoint, no password.
+            // It gets the two variables it needs and nothing else.
+            .env_clear()
+            .env(MEMORY_ENV, self.memory_mib.to_string())
+            .env(OUTPUT_ENV, self.max_output_bytes.to_string());
+        let mut child = command.spawn().map_err(|err| {
+            tracing::warn!(%err, "the child that reads an uploaded file could not be started");
+            ConversionError::NotStarted
+        })?;
+        let Some(stdin) = child.stdin.take() else {
+            return Err(ConversionError::NotStarted);
+        };
+        let Some(stdout) = child.stdout.take() else {
+            return Err(ConversionError::NotStarted);
+        };
+        let Some(mut stderr) = child.stderr.take() else {
+            return Err(ConversionError::NotStarted);
+        };
+        // The file is fed in another task: the child reads all of it before
+        // it answers, and the answer would never come if the feeding
+        // waited for it.
+        tokio::spawn(async move {
+            let _fed = feed(stdin, source).await;
+        });
+        // The standard error is drained in another task, so the child never
+        // blocks on a full pipe; only the first [`MAX_STDERR_BYTES`] are kept.
+        let stderr = tokio::spawn(async move {
+            let mut kept: Vec<u8> = Vec::new();
+            let mut piece = [0_u8; 4096];
+            while let Ok(read) = stderr.read(&mut piece).await {
+                if read == 0 {
+                    break;
+                }
+                if kept.len() < MAX_STDERR_BYTES {
+                    let room = MAX_STDERR_BYTES - kept.len();
+                    kept.extend_from_slice(&piece[..read.min(room)]);
+                }
+            }
+            kept
+        });
+        let mut stdout = BufReader::new(stdout);
+        let mut line = Vec::new();
+        let read = stdout
+            .read_until(b'\n', &mut line)
+            .await
+            .map_err(|_err| ConversionError::Refused(Refusal::ResourceLimit))?;
+        if read == 0 {
+            // The child said nothing: it died before its answer.
+            return Err(ConversionError::ResourceLimit);
+        }
+        let answer: Answer = serde_json::from_slice(&line)
+            .map_err(|_err| ConversionError::Refused(Refusal::Unreadable))?;
+        Ok(Started {
+            answer,
+            child,
+            stdout,
+            stderr,
+        })
+    }
+
+    /// Wait for the child to end, and read what it said on its standard
+    /// error.
+    async fn wait(
+        &self,
+        mut child: Child,
+        stderr: tokio::task::JoinHandle<Vec<u8>>,
+    ) -> Result<(), ConversionError> {
+        let status = child
+            .wait()
+            .await
+            .map_err(|_err| ConversionError::ResourceLimit)?;
+        if let Ok(kept) = stderr.await {
+            let text = String::from_utf8_lossy(&kept);
+            let text = text.trim();
+            if !text.is_empty() {
+                tracing::warn!(stderr = %text, "the child that reads an uploaded file said something");
+            }
+        }
+        match status.code() {
+            Some(exit::OK) => Ok(()),
+            Some(code) => Err(ConversionError::Refused(
+                Refusal::for_exit_code(code).unwrap_or(Refusal::Unreadable),
+            )),
+            // Killed by a signal: out of memory, out of time, or killed.
+            None => Err(ConversionError::ResourceLimit),
+        }
+    }
+}
+
+/// A started child: its answer, its output, and the process itself.
+struct Started {
+    /// What the child said.
+    answer: Answer,
+    /// The child itself.
+    child: Child,
+    /// The rest of its output: the text, for the operations that convert.
+    stdout: BufReader<ChildStdout>,
+    /// Its standard error, read in another task.
+    stderr: tokio::task::JoinHandle<Vec<u8>>,
+}
+
+/// Write the text the child produced into the store, as one multipart
+/// upload, and complete it. The upload is aborted when anything goes wrong.
+async fn write_text_to_store(
+    store: &UploadStore,
+    key: &str,
+    stdout: &mut BufReader<ChildStdout>,
+) -> Result<u64, UploadStoreError> {
+    // Boxed: the multipart write holds a good deal of state, and the future
+    // of the caller would otherwise be that big.
+    Box::pin(store.put_stream(key, stdout)).await
+}
+
+/// Take back out the objects a conversion that did not finish left behind.
+///
+/// Best effort: the caller is already answering with the failure, and a
+/// store that cannot delete either answers that one.
+async fn remove_stored(store: &UploadStore, text_key: &str, answer_key: &str) {
+    for key in [text_key, answer_key] {
+        if let Err(err) = store.delete(key).await {
+            tracing::warn!(%err, key, "the objects of a conversion that failed could not be removed");
+        }
+    }
+}
+
+/// Feed the child its file.
+async fn feed(mut stdin: ChildStdin, source: Source) -> Result<(), ConversionError> {
+    let result = match source {
+        Source::Bytes(bytes) => stdin.write_all(&bytes).await,
+        Source::Stored { store, key } => {
+            let size = store
+                .object_size(&key)
+                .await
+                .map_err(ConversionError::Store)?;
+            let Some(size) = size else {
+                return Err(ConversionError::Store(UploadStoreError::Unavailable(
+                    "not found",
+                )));
+            };
+            let mut offset: u64 = 0;
+            let mut result = Ok(());
+            while offset < size {
+                let len = FEED_CHUNK_BYTES.min(size - offset);
+                let chunk = store
+                    .read_range(&key, offset, len)
+                    .await
+                    .map_err(ConversionError::Store)?;
+                if chunk.is_empty() {
+                    break;
+                }
+                if let Err(err) = stdin.write_all(&chunk).await {
+                    result = Err(err);
+                    break;
+                }
+                offset = offset.saturating_add(chunk.len() as u64);
+            }
+            result
+        }
+    };
+    // The child's input ends here, so it can read the whole file.
+    let _closed = stdin.shutdown().await;
+    result.map_err(|_err| ConversionError::Refused(Refusal::ResourceLimit))
+}
+
+/// Whether `binary` is this API's own binary, which is what the child must
+/// be.
+///
+/// The child is this binary started again as `inspect-upload`, so its name is
+/// `lakehouse-api`. The name is what is checked, not the path: a TEST binary
+/// would run the test suite again, and a path is not a proof of anything
+/// else. In a deployment the path is [`std::env::current_exe`], which is this
+/// binary; in a test it is the child Cargo built (`CARGO_BIN_EXE_lakehouse-api`).
+fn is_our_binary(binary: &Path) -> bool {
+    binary
+        .file_stem()
+        .is_some_and(|stem| stem == "lakehouse-api")
 }
 
 #[cfg(test)]

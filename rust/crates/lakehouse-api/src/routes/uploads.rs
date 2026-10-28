@@ -147,13 +147,14 @@ use super::lakehouse::is_unknown_table_or_database_error;
 use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::state::AppState;
+use crate::upload_convert::{self, Answer, ConversionError, FileKind, Operation, Source};
 use crate::upload_formats::{self, ByName, Compression, Format, Layout, Refusal};
-use crate::upload_limits::too_many_uploads;
+use crate::upload_limits::{RETRY_AFTER_SECS, too_many_uploads};
 use crate::upload_parquet::{self, ParquetInfo};
 use crate::upload_parquet_range::RangeReader;
 use crate::upload_parse::{self, Encoding, Kind, Overrides, Preview};
 use crate::upload_store::{PREFIX, UploadStore};
-use crate::upload_workbook::{self, WorkbookError, WorkbookInfo};
+use crate::upload_workbook::WorkbookInfo;
 
 pub(super) mod columns;
 pub(super) mod folders;
@@ -195,12 +196,6 @@ const PREVIEW_BYTES: usize = 256 * 1024;
 
 /// Rows the preview returns.
 const PREVIEW_ROWS: usize = 20;
-
-/// How many records of a converted sheet the preview reads. A workbook is read
-/// whole to be converted, but the preview runs on text, and a header-row
-/// change re-runs it: a prefix keeps that cheap. A header row chosen past this
-/// shows no columns, as for a text file whose head is shorter than the row.
-const WORKBOOK_PREVIEW_RECORDS: usize = columns::SAMPLE_ROWS + 50;
 
 /// How many rows of a Parquet file the preview decodes (the converted text has
 /// one record more, the column names). Only these are decoded: the footer
@@ -583,6 +578,156 @@ fn converted_key(storage_key: &str) -> String {
     format!("{storage_key}.converted.csv")
 }
 
+/// The key the sheets of a workbook are stored under, beside the original
+/// (`SEC-22` D5). The list is small and is read from storage, so a preview
+/// needs no child to know which sheets the workbook has.
+fn sheets_key(storage_key: &str) -> String {
+    format!("{storage_key}.sheets.json")
+}
+
+/// The key a converted sheet's text is stored under: the sheet's position in
+/// the workbook's list (`SEC-22` D5).
+fn converted_text_key(storage_key: &str, position: usize) -> String {
+    format!("{storage_key}.converted.{position}.csv")
+}
+
+/// The key the answer of a converted sheet is stored under: what the sheet
+/// is and whether it was empty (`SEC-22` D5).
+fn converted_answer_key(storage_key: &str, position: usize) -> String {
+    format!("{storage_key}.converted.{position}.json")
+}
+
+/// The answer a conversion failure gets.
+///
+/// Each failure is one answer (`SEC-22` D4): the installation is busy (429),
+/// the child could not be started (500), the child was killed or ran out of
+/// time (400, one sentence for all of them), the file was refused (400, the
+/// refusal's own sentence), or the store failed (503).
+fn conversion_error(kind: FileKind, err: ConversionError) -> ApiError {
+    match err {
+        ConversionError::Busy => ApiError::TooManyRequests {
+            message: upload_convert::TOO_MANY_CONVERSIONS.to_owned(),
+            retry_after_secs: RETRY_AFTER_SECS,
+        },
+        ConversionError::NotStarted => ApiError::Internal(CONVERSION_FAILED.to_owned()),
+        ConversionError::ResourceLimit => {
+            ApiError::BadRequest(upload_convert::NEEDS_MORE_MEMORY.to_owned())
+        }
+        ConversionError::Refused(refusal) => ApiError::BadRequest(kind.sentence(&refusal)),
+        ConversionError::Store(err) => ApiError::from(err),
+    }
+}
+
+/// The workbook's sheets, from the stored list, or from a fresh run of the
+/// child.
+///
+/// An upload made before `SEC-22` has no stored list: it runs the child once
+/// and stores the list, and every later read finds it.
+///
+/// # Errors
+///
+/// 400 with the child's own sentence for a file that cannot be read; 503
+/// when the object store is unavailable.
+async fn sheets_of(
+    state: &AppState,
+    store: &UploadStore,
+    row: &Upload,
+) -> Result<WorkbookInfo, ApiError> {
+    let key = sheets_key(&row.storage_key);
+    match store.get_all(&key).await {
+        Ok(bytes) => {
+            if let Some(info) = stored_sheets(&bytes) {
+                return Ok(info);
+            }
+            tracing::warn!(
+                key = %key,
+                "the stored list of sheets could not be read; the file is read again"
+            );
+        }
+        // The object is not there: an upload made before `SEC-22`.
+        Err(crate::upload_store::UploadStoreError::Unavailable("not found")) => {}
+        Err(err) => return Err(err.into()),
+    }
+    let source = Source::Stored {
+        store: store.clone(),
+        key: row.storage_key.clone(),
+    };
+    let answer = state
+        .conversion_runner
+        .answer(Operation::ListSheets, source)
+        .await
+        .map_err(|err| conversion_error(FileKind::Workbook, err))?;
+    let info = sheets_of_answer(&answer)?;
+    let line = serde_json::to_vec(&answer)
+        .map_err(|_err| ApiError::Internal(CONVERSION_FAILED.to_owned()))?;
+    store.put(&key, Bytes::from(line)).await?;
+    Ok(info)
+}
+
+/// The sheets an answer holds, or `None` when the answer is not one.
+fn stored_sheets(bytes: &[u8]) -> Option<WorkbookInfo> {
+    let answer: Answer = serde_json::from_slice(bytes).ok()?;
+    sheets_of_answer(&answer).ok()
+}
+
+/// The sheets an answer holds.
+///
+/// # Errors
+///
+/// 500 when the answer is not one of the answers this module knows.
+fn sheets_of_answer(answer: &Answer) -> Result<WorkbookInfo, ApiError> {
+    match answer {
+        Answer::Sheets { info } | Answer::Sheet { info, .. } => Ok(info.clone()),
+        Answer::Parquet { .. } | Answer::Refusal { .. } => {
+            Err(ApiError::Internal(CONVERSION_FAILED.to_owned()))
+        }
+    }
+}
+
+/// What a Parquet file's footer says, as an answer holds it.
+///
+/// # Errors
+///
+/// 500 when the answer is not one of the answers this module knows.
+fn parquet_of_answer(answer: &Answer) -> Result<ParquetInfo, ApiError> {
+    match answer {
+        Answer::Parquet { info } => Ok(info.clone()),
+        Answer::Sheets { .. } | Answer::Sheet { .. } | Answer::Refusal { .. } => {
+            Err(ApiError::Internal(CONVERSION_FAILED.to_owned()))
+        }
+    }
+}
+
+/// The sheet the request names, and its position in the workbook's list.
+///
+/// No name means the workbook's default sheet, the same rule
+/// [`crate::upload_workbook::read_sheet`] uses; a name the workbook does not
+/// have is refused with the workbook's own sentence.
+///
+/// # Errors
+///
+/// 400 with [`UNKNOWN_SHEET`] for a name the workbook does not have.
+fn sheet_position(info: &WorkbookInfo, sheet: Option<&str>) -> Result<(String, usize), ApiError> {
+    let wanted = match sheet {
+        None => info.default_sheet.clone(),
+        Some(name) => name.to_owned(),
+    };
+    match info.sheets.iter().position(|listed| listed.name == wanted) {
+        Some(position) => Ok((wanted, position)),
+        None => Err(ApiError::BadRequest(
+            crate::upload_workbook::WorkbookError::UnknownSheet.to_string(),
+        )),
+    }
+}
+
+/// The file the child reads: the stored original, read in pieces.
+fn stored_source(store: &UploadStore, row: &Upload) -> Source {
+    Source::Stored {
+        store: store.clone(),
+        key: row.storage_key.clone(),
+    }
+}
+
 /// The conversion an upload needs, judged from its stored name AND its first
 /// bytes: a text export called `.xls` (ADR 0014's motivating file) is text, and
 /// so is a text file called `.parquet`. A file whose footer is encrypted starts
@@ -803,6 +948,104 @@ fn classify_gzip(head: &[u8]) -> Result<Accepted, ApiError> {
     }
 }
 
+/// Store the uploaded file and, for a workbook, the list of its sheets.
+///
+/// Bytes first: a row that exists means its object exists. The list of the
+/// sheets goes beside the original (`SEC-22` D5): a preview reads it from
+/// storage and needs no child to know which sheets the workbook has.
+///
+/// # Errors
+///
+/// 503 when the object store refuses the write. The original is taken back
+/// out when the list of the sheets cannot be stored: a workbook without its
+/// list would be read again by every preview.
+async fn store_upload(
+    store: &UploadStore,
+    key: &str,
+    bytes: Bytes,
+    sheets_answer: Option<&Answer>,
+) -> Result<(), ApiError> {
+    store.put(key, bytes).await?;
+    let Some(answer) = sheets_answer else {
+        return Ok(());
+    };
+    let list_key = sheets_key(key);
+    let line = serde_json::to_vec(answer)
+        .map_err(|_err| ApiError::Internal(CONVERSION_FAILED.to_owned()))?;
+    if let Err(err) = store.put(&list_key, Bytes::from(line)).await {
+        tracing::warn!(%err, key = %list_key, "the list of sheets could not be stored; the original is taken back out");
+        if let Err(cleanup) = store.delete(key).await {
+            tracing::warn!(%cleanup, key = %key, "an upload object could not be removed after its list of sheets failed");
+        }
+        return Err(err.into());
+    }
+    Ok(())
+}
+
+/// What the child said about an uploaded file.
+struct ChildReading {
+    /// The sheets of a workbook.
+    workbook: Option<WorkbookInfo>,
+    /// The columns and the row count of a Parquet file.
+    parquet: Option<ParquetInfo>,
+    /// The answer the list of sheets is stored as (`SEC-22` D5).
+    sheets: Option<Answer>,
+}
+
+/// Read an uploaded workbook or Parquet file with the child.
+///
+/// `SEC-22` D1a: the read happens in a child process, never in this one — a
+/// file that asks for more memory than the machine has must not end the API
+/// for every tenant.
+///
+/// # Errors
+///
+/// 400 with the child's own sentence for a file that cannot be read; 429 when
+/// every conversion slot is taken; 500 when the child could not be started.
+async fn read_with_child(
+    state: &AppState,
+    accepted: Accepted,
+    bytes: &Bytes,
+) -> Result<ChildReading, ApiError> {
+    match accepted {
+        Accepted::Workbook => {
+            let source = Source::Bytes(bytes.clone());
+            let answer = state
+                .conversion_runner
+                .answer(Operation::ListSheets, source)
+                .await
+                .map_err(|err| conversion_error(FileKind::Workbook, err))?;
+            let workbook = sheets_of_answer(&answer)?;
+            Ok(ChildReading {
+                workbook: Some(workbook),
+                parquet: None,
+                sheets: Some(answer),
+            })
+        }
+        Accepted::Parquet => {
+            let source = Source::Bytes(bytes.clone());
+            let answer = state
+                .conversion_runner
+                .answer(Operation::InspectParquet, source)
+                .await
+                .map_err(|err| conversion_error(FileKind::Parquet, err))?;
+            let parquet = parquet_of_answer(&answer)?;
+            Ok(ChildReading {
+                workbook: None,
+                parquet: Some(parquet),
+                sheets: None,
+            })
+        }
+        // Every other kind of file is not read by the child: a text file is
+        // read as text, and a gzip or a zip is checked here.
+        _ => Ok(ChildReading {
+            workbook: None,
+            parquet: None,
+            sheets: None,
+        }),
+    }
+}
+
 /// `POST /api/uploads` — one multipart part named `file`. 201 with the
 /// upload (see [`UploadView`]) and, when this tenant already holds the same
 /// bytes, `duplicateOf`.
@@ -852,37 +1095,30 @@ pub async fn create(
     })?;
     let part = read_file_part(form).await?;
     let accepted = check_file(&part.bytes, &part.filename)?;
-    // A workbook or a Parquet file is opened before anything is stored: only
-    // what opens is kept. (A Parquet file is opened by its footer; a page that
-    // cannot be decoded is found when the file is converted.)
+    // A workbook or a Parquet file is read before anything is stored: only
+    // what opens is kept. (`SEC-22` D1a: the read happens in a child
+    // process, never in this one — a file that asks for more memory than the
+    // machine has must not end the API for every tenant.)
     let cap = MAX_UNPACKED_BYTES;
-    let (workbook, parquet) = match accepted {
-        Accepted::Text | Accepted::Json | Accepted::JsonLines | Accepted::Avro => (None, None),
+    let (workbook, parquet, sheets_answer) = match accepted {
+        Accepted::Text | Accepted::Json | Accepted::JsonLines | Accepted::Avro => {
+            (None, None, None)
+        }
         // `DATA-17` slice 4 (decision 2): what a gzip or zip file unpacks to counts toward
         // the cap, and a bomb is refused here, before anything is stored.
         Accepted::Gzip => {
             let bytes = part.bytes.clone();
             blocking(move || upload_formats::check_gzip(std::io::Cursor::new(bytes), cap)).await?;
-            (None, None)
+            (None, None, None)
         }
         Accepted::Zip => {
             let bytes = part.bytes.clone();
             blocking(move || upload_formats::check_zip(std::io::Cursor::new(bytes), cap)).await?;
-            (None, None)
+            (None, None, None)
         }
-        Accepted::Workbook => {
-            let bytes = part.bytes.clone();
-            (
-                Some(blocking(move || upload_workbook::list_sheets(&bytes)).await?),
-                None,
-            )
-        }
-        Accepted::Parquet => {
-            let bytes = part.bytes.clone();
-            (
-                None,
-                Some(blocking(move || upload_parquet::inspect(&bytes)).await?),
-            )
+        other => {
+            let reading = read_with_child(&state, other, &part.bytes).await?;
+            (reading.workbook, reading.parquet, reading.sheets)
         }
     };
 
@@ -894,7 +1130,7 @@ pub async fn create(
     // Bytes first, row second: a row that exists means its object exists. The
     // reverse order leaves rows pointing at nothing whenever the store write
     // fails.
-    store.put(&key, part.bytes).await?;
+    store_upload(&store, &key, part.bytes, sheets_answer.as_ref()).await?;
     let row = match uploads::insert(
         pool,
         &NewUpload {
@@ -1436,14 +1672,14 @@ fn overrides_of(query: &PreviewQuery) -> Result<Overrides, ApiError> {
 /// the cost does not grow with the file. Every detected value can be
 /// overridden; whatever the user settles on is what [`ingest`] is handed.
 ///
-/// A workbook is read whole, converted on a blocking thread, and its first
-/// [`WORKBOOK_PREVIEW_RECORDS`] records go through the same preview as a CSV,
-/// under the fixed dialect the load will use. `encoding` and `delimiter` are
-/// validated and then ignored for a workbook (they have no meaning there; the
-/// answer says `utf-8` and `,`), `headerRow` applies, and `sheet` picks the
-/// sheet. The answer adds `workbook`: the sheet read and the sheets there are.
+/// A workbook's sheet is converted ONCE and stored (`SEC-22` D5); the
+/// preview reads the stored text, the first [`PREVIEW_BYTES`] of it, exactly
+/// as it reads a text upload. `encoding` and `delimiter` are validated and
+/// then ignored for a workbook (they have no meaning there; the answer says
+/// `utf-8` and `,`), `headerRow` applies, and `sheet` picks the sheet. The
+/// answer adds `workbook`: the sheet read and the sheets there are.
 ///
-/// A Parquet file is converted the same way (only the first
+/// A Parquet file is read the same way (only the first
 /// [`PARQUET_PREVIEW_ROWS`] rows are decoded). `encoding`, `delimiter`,
 /// `headerRow` and `sheet` are validated and then ignored: the header is the
 /// file's own column names, always the first record. The answer adds
@@ -1513,10 +1749,17 @@ async fn preview_with_sample(
     let head = store.head_bytes(&row.storage_key, PREVIEW_BYTES).await?;
     match conversion_of_head(&row.storage_key, &head) {
         Some(Conversion::Workbook) => {
-            return workbook_preview(&store, row, query.sheet.clone(), overrides.header_row).await;
+            return workbook_preview(
+                state,
+                &store,
+                row,
+                query.sheet.clone(),
+                overrides.header_row,
+            )
+            .await;
         }
         Some(Conversion::Parquet) => {
-            return parquet_preview(&store, row).await;
+            return parquet_preview(state, &store, row).await;
         }
         None => {}
     }
@@ -1814,27 +2057,48 @@ async fn layout_sample(
 
 /// The preview of a workbook: its sheet as text, read the way the load reads
 /// it (UTF-8, comma).
+///
+/// The sheet is converted ONCE and stored (`SEC-22` D5); the preview reads
+/// the stored text, exactly as it reads a text upload, so a second preview —
+/// a header row the user changed, say — runs no child at all.
 async fn workbook_preview(
+    state: &AppState,
     store: &UploadStore,
     row: &Upload,
     sheet: Option<String>,
     header_row: Option<usize>,
 ) -> Result<(PreviewResponse, Sample), ApiError> {
-    let bytes = store.get_all(&row.storage_key).await?;
-    let (info, name, csv, cut) = blocking(move || {
-        let read = upload_workbook::read_sheet(&bytes, sheet.as_deref())?;
-        let cut = read.data.rows() > WORKBOOK_PREVIEW_RECORDS;
-        let csv = read.data.to_csv(Some(WORKBOOK_PREVIEW_RECORDS));
-        Ok::<_, WorkbookError>((read.info, read.data.name().to_owned(), csv, cut))
-    })
-    .await?;
+    let info = sheets_of(state, store, row).await?;
+    let (name, position) = sheet_position(&info, sheet.as_deref())?;
+    let text_key = converted_text_key(&row.storage_key, position);
+    let answer_key = converted_answer_key(&row.storage_key, position);
+    let mut size = store.object_size(&text_key).await?;
+    if size.is_none() {
+        let source = stored_source(store, row);
+        state
+            .conversion_runner
+            .convert_and_store(
+                Operation::ConvertSheet(Some(name.clone())),
+                source,
+                store,
+                &text_key,
+                &answer_key,
+            )
+            .await
+            .map_err(|err| conversion_error(FileKind::Workbook, err))?;
+        size = store.object_size(&text_key).await?;
+    }
     let overrides = Overrides {
         encoding: Some(Encoding::Utf8),
         delimiter: Some(','),
         header_row,
     };
-    let preview = upload_parse::preview(&csv, cut, overrides, PREVIEW_ROWS);
-    let rows = upload_parse::sample_records(&csv, cut, preview.using, columns::SAMPLE_ROWS);
+    // The text is read as a text upload's text is: the first
+    // [`PREVIEW_BYTES`] of it.
+    let head = store.head_bytes(&text_key, PREVIEW_BYTES).await?;
+    let cut = size.unwrap_or(0) > u64::try_from(PREVIEW_BYTES).unwrap_or(u64::MAX);
+    let preview = upload_parse::preview(&head, cut, overrides, PREVIEW_ROWS);
+    let rows = upload_parse::sample_records(&head, cut, preview.using, columns::SAMPLE_ROWS);
     let sample = Sample {
         header: preview.columns.clone(),
         rows,
@@ -1857,27 +2121,33 @@ async fn workbook_preview(
 
 /// The preview of a Parquet file: its first rows as text, read the way the load
 /// reads them (UTF-8, comma, the first record is the header).
+///
+/// `SEC-22` D1b: the file is moved from the store to the child whole (at
+/// most 50 MiB), where it is read under the child's own memory limit. The
+/// preview is not stored: its header row is fixed, so a second preview is
+/// rare.
 async fn parquet_preview(
+    state: &AppState,
     store: &UploadStore,
     row: &Upload,
 ) -> Result<(PreviewResponse, Sample), ApiError> {
-    // `DATA-17` T2.2: the footer and the first row group, read by range; the file
-    // is never held (`RangeReader`), and what the footer declares is bounded.
-    let reader = RangeReader::open(store, &row.storage_key).await?;
-    let converted =
-        blocking(move || upload_parquet::convert(&reader, Some(PARQUET_PREVIEW_ROWS))).await?;
-    let cut = converted.info.rows > u64::try_from(PARQUET_PREVIEW_ROWS).unwrap_or(u64::MAX);
+    let source = stored_source(store, row);
+    let (answer, csv) = state
+        .conversion_runner
+        .answer_with_text(Operation::PreviewParquet(PARQUET_PREVIEW_ROWS), source)
+        .await
+        .map_err(|err| conversion_error(FileKind::Parquet, err))?;
+    let info = parquet_of_answer(&answer)?;
+    let cut = info.rows > u64::try_from(PARQUET_PREVIEW_ROWS).unwrap_or(u64::MAX);
     let overrides = Overrides {
         encoding: Some(Encoding::Utf8),
         delimiter: Some(','),
         header_row: Some(0),
     };
-    let preview = upload_parse::preview(&converted.csv, cut, overrides, PREVIEW_ROWS);
-    let rows =
-        upload_parse::sample_records(&converted.csv, cut, preview.using, columns::SAMPLE_ROWS);
+    let preview = upload_parse::preview(&csv, cut, overrides, PREVIEW_ROWS);
+    let rows = upload_parse::sample_records(&csv, cut, preview.using, columns::SAMPLE_ROWS);
     // A Parquet file's own types are the starting types (decision 10).
-    let declared = converted
-        .info
+    let declared = info
         .columns
         .iter()
         .map(|column| crate::upload_types::declared_from_parquet(&column.type_name))
@@ -1891,7 +2161,7 @@ async fn parquet_preview(
         PreviewResponse {
             preview,
             workbook: None,
-            parquet: Some(converted.info),
+            parquet: Some(info),
             layout: None,
             archive: None,
             column_specs: Vec::new(),
@@ -2348,12 +2618,12 @@ struct Converted {
     sheet: Option<String>,
 }
 
-/// Convert a workbook upload's chosen sheet, or a Parquet upload's table, and
-/// store the text as a CSV beside the original. The object is written again by
-/// the next load of the same upload, and removed with the upload ([`delete`]).
-/// The checks the Parquet conversion used to make at ingest, now made on the
-/// footer alone (`DATA-17` T2.2): the file opens, has rows, and has no more
-/// columns than a table may. Nothing is decoded and the file is not held.
+/// Check what a Parquet file's footer says, by reading it in a child process
+/// (`SEC-22` D1a).
+///
+/// The checks the conversion used to make at ingest, now made on the footer
+/// alone (`DATA-17` T2.2): the file opens, has rows, and has no more columns
+/// than a table may.
 ///
 /// # Errors
 ///
@@ -2363,8 +2633,13 @@ struct Converted {
 /// one with more than 1,000 columns; 503 when the object store is unavailable.
 async fn check_parquet_footer(state: &AppState, row: &Upload) -> Result<(), ApiError> {
     let store = UploadStore::connect(&state.config).await?;
-    let reader = RangeReader::open(&store, &row.storage_key).await?;
-    let info = blocking(move || upload_parquet::inspect(&reader)).await?;
+    let source = stored_source(&store, row);
+    let answer = state
+        .conversion_runner
+        .answer(Operation::InspectParquet, source)
+        .await
+        .map_err(|err| conversion_error(FileKind::Parquet, err))?;
+    let info = parquet_of_answer(&answer)?;
     if info.rows == 0 {
         return Err(ApiError::BadRequest(EMPTY_PARQUET.to_owned()));
     }
@@ -2374,6 +2649,18 @@ async fn check_parquet_footer(state: &AppState, row: &Upload) -> Result<(), ApiE
     Ok(())
 }
 
+/// Convert a workbook upload's chosen sheet and store the text beside the
+/// original, or use the text that is already there.
+///
+/// The sheet is converted ONCE (`SEC-22` D5): the text is stored under the
+/// sheet's position in the workbook's list, and the answer beside it. A load
+/// that finds the text reads it; only a load that does not find it converts.
+///
+/// # Errors
+///
+/// 400 with the child's own sentence for a file that cannot be read, a sheet
+/// the workbook does not have, or a sheet with no cells; 503 when the object
+/// store is unavailable.
 async fn convert_upload(
     state: &AppState,
     row: &Upload,
@@ -2381,30 +2668,55 @@ async fn convert_upload(
     sheet: Option<&str>,
 ) -> Result<Converted, ApiError> {
     let store = UploadStore::connect(&state.config).await?;
-    let bytes = store.get_all(&row.storage_key).await?;
-    let (sheet, csv) = match conversion {
+    let (sheet, key) = match conversion {
         Conversion::Workbook => {
-            let asked = sheet.map(str::to_owned);
-            let (name, empty, csv) = blocking(move || {
-                let read = upload_workbook::read_sheet(&bytes, asked.as_deref())?;
-                Ok::<_, WorkbookError>((
-                    read.data.name().to_owned(),
-                    read.data.is_empty(),
-                    read.data.to_csv(None),
-                ))
-            })
-            .await?;
-            if empty {
+            let info = sheets_of(state, &store, row).await?;
+            let (name, position) = sheet_position(&info, sheet)?;
+            let key = converted_text_key(&row.storage_key, position);
+            let answer_key = converted_answer_key(&row.storage_key, position);
+            // The answer of the conversion says whether the sheet has cells
+            // at all; it is stored beside the text (`SEC-22` D5), so a load
+            // that finds the text finds the answer too.
+            let stored_answer = match store.get_all(&answer_key).await {
+                Ok(bytes) => match serde_json::from_slice::<Answer>(&bytes) {
+                    Ok(answer) => Some(answer),
+                    Err(err) => {
+                        tracing::warn!(%err, key = %answer_key, "the stored answer of a conversion could not be read");
+                        None
+                    }
+                },
+                // There is no answer: the file was uploaded before `SEC-22`,
+                // or a conversion that failed left none.
+                Err(crate::upload_store::UploadStoreError::Unavailable("not found")) => None,
+                Err(err) => return Err(err.into()),
+            };
+            if let Some(Answer::Sheet { empty: true, .. }) = stored_answer {
                 return Err(ApiError::BadRequest(EMPTY_SHEET.to_owned()));
             }
-            (Some(name), csv)
+            let stored = store.object_size(&key).await?;
+            if stored.is_none() {
+                let source = stored_source(&store, row);
+                let answer = state
+                    .conversion_runner
+                    .convert_and_store(
+                        Operation::ConvertSheet(Some(name.clone())),
+                        source,
+                        &store,
+                        &key,
+                        &answer_key,
+                    )
+                    .await
+                    .map_err(|err| conversion_error(FileKind::Workbook, err))?;
+                if let Answer::Sheet { empty: true, .. } = answer {
+                    return Err(ApiError::BadRequest(EMPTY_SHEET.to_owned()));
+                }
+            }
+            (Some(name), key)
         }
         // A Parquet file is not converted: the job reads it natively (`DATA-17`
         // T2.2), and `ingest` checks its footer.
         Conversion::Parquet => return Err(ApiError::Internal(CONVERSION_FAILED.to_owned())),
     };
-    let key = converted_key(&row.storage_key);
-    store.put(&key, Bytes::from(csv)).await?;
     Ok(Converted { key, sheet })
 }
 
@@ -2851,10 +3163,27 @@ pub async fn delete(
         // the caller asked for.)
         sessions::abort_session(&store, &row).await?;
     } else if conversion_for_name(&row.storage_key).is_some() {
-        // The converted text of a workbook or a Parquet file, if a load wrote
-        // one: derived data goes first, and a key that is not there is
-        // success. A text file named `.xls` or `.parquet` has none, and
-        // deleting a missing key is a no-op.
+        // The derived data of a workbook (`SEC-22` D8): the list of its
+        // sheets, the converted text of each sheet and the answer beside it,
+        // and the legacy converted text of an upload made before `SEC-22`.
+        // Derived data goes first, and a key that is not there is success.
+        // A text file named `.xls` or `.parquet` has none, and deleting a
+        // missing key is a no-op.
+        let sheets = sheets_key(&row.storage_key);
+        let sheets_count = match store.get_all(&sheets).await {
+            Ok(bytes) => stored_sheets(&bytes).map_or(0, |info| info.sheets.len()),
+            Err(crate::upload_store::UploadStoreError::Unavailable("not found")) => 0,
+            Err(err) => return Err(err.into()),
+        };
+        for position in 0..sheets_count {
+            store
+                .delete(&converted_text_key(&row.storage_key, position))
+                .await?;
+            store
+                .delete(&converted_answer_key(&row.storage_key, position))
+                .await?;
+        }
+        store.delete(&sheets).await?;
         store.delete(&converted_key(&row.storage_key)).await?;
     }
     store.delete(&row.storage_key).await?;

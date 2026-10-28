@@ -12,7 +12,7 @@
 //!
 //! The load job reads delimited text and nothing else (ADR 0014, decision 3:
 //! two readers, one dialect). A workbook is brought to that dialect here, once,
-//! in the API: [`read_sheet`] turns the chosen sheet into text, [`SheetData::to_csv`]
+//! in the API: [`read_sheet`] turns the chosen sheet into text, [`SheetData::write_csv`]
 //! writes it as UTF-8 text separated by commas, and the routes store that beside
 //! the original and hand it to the unchanged job. The output is pinned by
 //! `ops/fixtures/uploads/converted_sheet.csv`, which `upload_parse` and the
@@ -441,7 +441,10 @@ impl SheetData {
         &self.name
     }
 
-    /// Records in the used range (0 for a sheet with no cells).
+    /// Records in the used range (0 for a sheet with no cells). Tests only:
+    /// the text is what the routes read, and it says how many records it
+    /// holds.
+    #[cfg(test)]
     #[must_use]
     pub fn rows(&self) -> usize {
         self.rows
@@ -482,6 +485,10 @@ impl SheetData {
     /// whole — the child process of `SEC-22`, which writes the text to a
     /// stream — uses [`Self::write_csv`] instead, which writes the same text
     /// in the same order, one record at a time.
+    ///
+    /// Tests only: the child writes its text to a stream, and the routes
+    /// read the stored text.
+    #[cfg(test)]
     #[must_use]
     pub fn to_csv(&self, max_records: Option<usize>) -> Vec<u8> {
         let mut out = Vec::new();
