@@ -312,12 +312,13 @@ jobs:
     needs: changes
     if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.all == 'true'
     runs-on: ubuntu-latest
-    # 60, not 40: the three last green runs of this job on `main` took 30m07s,
-    # 36m12s and 38m42s (runs 40628462938, 40667618267, 40465427942), and
-    # three runs on 2026-10-28 (40634916754, 40673812061, 40674201583) were
-    # cancelled at the 40-minute budget with every test that ran up to the
-    # cancel passing. The budget is a guard against a hung test, not a speed
-    # target; a hang still ends here.
+    # 60, not 40: the three last green runs of this job on `main` took 39m18s,
+    # 30m07s and 36m12s (runs 40627697997, 40628462938, 40667618267), the
+    # longest took 39m27s (40387475151), and the job was cancelled at the
+    # 40-minute budget in three runs on 2026-10-28 (40634916754, 40673812061,
+    # 40674201583), with every test that ran up to the cancel passing. The
+    # budget is a guard against a hung test, not a speed target; a hang still
+    # ends here.
     timeout-minutes: 60
     # OPS-12: this job links one test binary per file in
     # `rust/crates/lakehouse-api/tests/` (68 of them), each against the whole
