@@ -136,7 +136,14 @@ export type QueryResult = {
   engine: QueryEngine | string
   /** How many rows the query produced, which `rows` may only be part of (`total_rows`). */
   rowCount: number
-  /** True when `rows` was cut to `rowLimit` (64,000 by default) before being sent. */
+  /**
+   * Which limit cut the result: `"rows"` for the Query Studio row limit
+   * (64,000 by default), `"bytes"` for the server-side 10 MB cap. The key is
+   * absent when nothing was cut — the server sends no `cutBy` at all then,
+   * so an absent field and a `null` never have to be told apart.
+   */
+  cutBy?: "rows" | "bytes"
+  /** True when the result was cut, by either limit. */
   truncated: boolean
   rowLimit: number
   metrics: {

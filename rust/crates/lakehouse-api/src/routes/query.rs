@@ -903,6 +903,16 @@ pub(crate) async fn check_statement_would_run(
 // default) beyond the cap can still arrive; the route keeps `studio_rows` of
 // them. `Trino`'s client bounds its own result.
 
+// The most bytes one result may carry to the browser: 10 MB (10 * 1024 * 1024 bytes)
+// of cell text.
+//
+// The row limit bounds how many rows arrive; this bounds how much they
+// weigh. A result of few, wide rows passes the row limit and still fills
+// the browser's memory, so the bytes are capped too (`QS-2`). The cap
+// is applied after the row cut and cuts at the last whole row that fits, so
+// a result is never half a row.
+const RESULT_BYTE_CAP: usize = 10 * 1024 * 1024;
+
 /// `POST /api/query/run` — execute a read-only `SQL` statement against
 /// `ClickHouse` (`engine` absent or `"clickhouse"`) or `Trino`
 /// (`engine: "trino"`, WS2 §4) and return it in `QueryResult` shape.
@@ -1108,8 +1118,25 @@ pub async fn run(
     // `Trino` in its client); this keeps exactly `row_limit` of what
     // arrived, and the response says when it did.
     let total_rows = rows.len();
-    let truncated = total_rows > row_limit;
+    let cut_by_rows = total_rows > row_limit;
     rows.truncate(row_limit);
+
+    // `QS-2`: the byte cap, after the row cut. The row limit bounds how
+    // many rows arrive; a result of few, wide rows passes it and still
+    // weighs more than the browser should take, so the bytes are capped as
+    // well. The cap cuts at the last whole row that fits and never empties a
+    // result.
+    let (rows, cut_by_bytes) = cut_rows_by_bytes(rows, RESULT_BYTE_CAP);
+    // The byte cap is applied last, so it is the limit that decided how many
+    // rows the browser got; when it cut, it is the one the response names.
+    // The row limit is named when only it cut.
+    let cut_by = if cut_by_bytes {
+        Some("bytes")
+    } else if cut_by_rows {
+        Some("rows")
+    } else {
+        None
+    };
 
     let cost_units = std::cmp::max(1, bytes_to_cost_units(scanned_bytes));
     let id = format!("q-{started_epoch_ms}");
@@ -1171,7 +1198,8 @@ pub async fn run(
         &id,
         &json!(columns),
         &json!(rows),
-        (total_rows, truncated, row_limit),
+        (total_rows, row_limit),
+        cut_by,
         duration_ms,
         scanned_bytes,
         cost_units,
@@ -1348,6 +1376,51 @@ fn map_trino_error(err: TrinoError) -> ApiError {
     }
 }
 
+/// The byte cost of one cell: the length of its text — a JSON string's own
+/// bytes without the quotes, any other value's compact JSON text — plus one
+/// byte for the separator (`QS-2`).
+fn cell_byte_cost(cell: &Value) -> usize {
+    let text = match cell {
+        Value::String(text) => text.len(),
+        other => other.to_string().len(),
+    };
+    text + 1
+}
+
+/// The byte cost of one row: the sum of its cells' costs.
+///
+/// The run path builds object rows (one field per column, see
+/// [`execute_query_against_engine`]); an array row (one element per column)
+/// is counted the same way, so the rule does not depend on the row shape.
+fn row_byte_cost(row: &Value) -> usize {
+    match row {
+        Value::Object(cells) => cells.values().map(cell_byte_cost).sum(),
+        Value::Array(cells) => cells.iter().map(cell_byte_cost).sum(),
+        other => cell_byte_cost(other),
+    }
+}
+
+/// Cut `rows` to the last whole row that fits in `cap` bytes.
+///
+/// Returns the rows to keep and whether the cap cut anything. A first row
+/// that does not fit is kept anyway: the byte cap never empties a result
+/// (`QS-2`) — one enormous row is still an answer.
+fn cut_rows_by_bytes(rows: Vec<Value>, cap: usize) -> (Vec<Value>, bool) {
+    let mut kept: Vec<Value> = Vec::with_capacity(rows.len());
+    let mut total = 0usize;
+    let mut cut = false;
+    for row in rows {
+        let cost = row_byte_cost(&row);
+        if !kept.is_empty() && total.saturating_add(cost) > cap {
+            cut = true;
+            break;
+        }
+        total = total.saturating_add(cost);
+        kept.push(row);
+    }
+    (kept, cut)
+}
+
 /// Build the `/api/query/run` response body from already-computed values.
 ///
 /// Extracted from [`run`] so the transparency-panel contract — which fields
@@ -1359,6 +1432,11 @@ fn map_trino_error(err: TrinoError) -> ApiError {
 /// `metrics.engine`, which stays the fixed string `"hot-store"` describing
 /// `ClickHouse`'s storage tier regardless of which top-level engine ran.
 /// Neither renames nor removes the other.
+///
+/// `cut_by` names the limit that cut the result (`"rows"` for the Query
+/// Studio row limit, `"bytes"` for the 10 MB cap) and is absent when
+/// nothing was cut: the key is then not in the JSON at all, not `null`.
+/// `truncated` is derived from it, so the two can never disagree.
 #[allow(
     clippy::too_many_arguments,
     reason = "one flat result row, no natural grouping"
@@ -1367,19 +1445,20 @@ fn run_result_json(
     id: &str,
     columns: &Value,
     rows: &Value,
-    (total_rows, truncated, row_limit): (usize, bool, usize),
+    (total_rows, row_limit): (usize, usize),
+    cut_by: Option<&str>,
     duration_ms: u64,
     scanned_bytes: u64,
     cost_units: u64,
     engine: &str,
 ) -> Value {
-    json!({
+    let mut body = json!({
         "id": id,
         "engine": engine,
         "columns": columns,
         "rows": rows,
         "rowCount": total_rows,
-        "truncated": truncated,
+        "truncated": cut_by.is_some(),
         "rowLimit": row_limit,
         "metrics": {
             "durationMs": duration_ms,
@@ -1401,7 +1480,15 @@ fn run_result_json(
         // regardless of what `ClickHouse` actually did. Null until a real
         // plan is computed.
         "plan": Value::Null,
-    })
+    });
+    // The body is the object the macro above built, so this always finds
+    // it; the `let` keeps the `unwrap` out of the code (AGENTS.md, Rust).
+    if let Some(cut_by) = cut_by
+        && let Some(object) = body.as_object_mut()
+    {
+        object.insert("cutBy".to_owned(), json!(cut_by));
+    }
+    body
 }
 
 /// Current time as Unix milliseconds, matching JavaScript's `Date.now()`
@@ -2683,7 +2770,8 @@ mod tests {
             "q-1",
             &json!([]),
             &json!([]),
-            (0, false, 2_000),
+            (0, 2_000),
+            None,
             12,
             34,
             1,
@@ -2716,6 +2804,105 @@ mod tests {
         // concepts and must not collapse into one value.
         assert_eq!(v["engine"], json!("clickhouse"));
         assert_eq!(v["metrics"]["engine"], json!("hot-store"));
+    }
+
+    // ── The server-side byte cap (`QS-2`) ────────────────────────────────
+
+    #[test]
+    fn a_cell_costs_its_text_plus_one_byte_for_the_separator() {
+        // A JSON string's own bytes, without the quotes.
+        assert_eq!(cell_byte_cost(&json!("abc")), 4);
+        // Any other value's compact JSON text.
+        assert_eq!(cell_byte_cost(&json!(5)), 2);
+        assert_eq!(cell_byte_cost(&json!(true)), 5);
+        assert_eq!(cell_byte_cost(&json!(null)), 5);
+    }
+
+    #[test]
+    fn a_row_costs_the_sum_of_its_cells() {
+        assert_eq!(row_byte_cost(&json!({"a": "xx", "b": "yyy"})), 3 + 4);
+        assert_eq!(row_byte_cost(&json!(["xx", "yyy"])), 3 + 4);
+    }
+
+    #[test]
+    fn a_result_under_the_byte_cap_is_kept_whole() {
+        let (kept, cut) = cut_rows_by_bytes(vec![json!({"a": "xxx"}), json!({"a": "yyy"})], 1_000);
+        assert!(!cut, "nothing was cut");
+        assert_eq!(kept.len(), 2);
+    }
+
+    #[test]
+    fn the_byte_cap_cuts_at_the_last_whole_row_that_fits() {
+        // Three rows of four bytes each; the cap holds two of them.
+        let rows = vec![
+            json!({"a": "xxx"}),
+            json!({"a": "yyy"}),
+            json!({"a": "zzz"}),
+        ];
+        let (kept, cut) = cut_rows_by_bytes(rows, 8);
+        assert!(cut, "the third row did not fit");
+        assert_eq!(kept, vec![json!({"a": "xxx"}), json!({"a": "yyy"})]);
+    }
+
+    #[test]
+    fn a_first_row_over_the_byte_cap_is_kept_anyway() {
+        // The byte cap never empties a result: one enormous row is still an
+        // answer.
+        let rows = vec![json!({"a": "x".repeat(100)}), json!({"a": "y"})];
+        let (kept, cut) = cut_rows_by_bytes(rows, 10);
+        assert!(cut, "the second row did not fit");
+        assert_eq!(kept.len(), 1);
+    }
+
+    #[test]
+    fn a_run_result_without_a_cut_carries_no_cut_by_key() {
+        let v = run_result_json(
+            "q-1",
+            &json!([]),
+            &json!([]),
+            (0, 2_000),
+            None,
+            12,
+            34,
+            1,
+            "clickhouse",
+        );
+        // The key is absent when nothing was cut — not `null`, which would
+        // claim a cut that did not happen.
+        assert!(v.get("cutBy").is_none(), "no cut, no key: {v}");
+        assert_eq!(v["truncated"], json!(false));
+    }
+
+    #[test]
+    fn a_run_result_names_the_limit_that_cut_it() {
+        let rows = json!([{"a": "x"}]);
+        let by_rows = run_result_json(
+            "q-2",
+            &json!([]),
+            &rows,
+            (2, 1),
+            Some("rows"),
+            12,
+            34,
+            1,
+            "clickhouse",
+        );
+        assert_eq!(by_rows["cutBy"], json!("rows"));
+        assert_eq!(by_rows["truncated"], json!(true));
+
+        let by_bytes = run_result_json(
+            "q-3",
+            &json!([]),
+            &rows,
+            (2, 1),
+            Some("bytes"),
+            12,
+            34,
+            1,
+            "clickhouse",
+        );
+        assert_eq!(by_bytes["cutBy"], json!("bytes"));
+        assert_eq!(by_bytes["truncated"], json!(true));
     }
 
     #[test]
