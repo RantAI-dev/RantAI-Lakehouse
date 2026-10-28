@@ -78,29 +78,40 @@
 //! # Excel workbooks
 //!
 //! An `.xls` or `.xlsx` is accepted (ADR 0014, amendment of 2026-10-07): the
-//! workbook is stored as it arrived, the preview converts the chosen sheet to
-//! delimited text in memory ([`crate::upload_workbook`]) and shows it through
-//! the same preview as a CSV, and an ingest stores that text as a CSV object
-//! beside the original ([`converted_key`]) and launches the unchanged
-//! `file_ingest_job` on it with a fixed dialect (UTF-8, comma). Whether an
-//! upload IS a workbook is decided by its stored name AND its first bytes
-//! ([`conversion_of_head`]): a text export named `.xls` (the file that motivated
-//! the feature) is still text. The chosen sheet cannot go in the job's run
-//! configuration (its schema is closed and the job does not change), so it is
-//! recorded in the upload's `parse_options` and in the audit event.
+//! workbook is stored as it arrived, the preview shows the chosen sheet as
+//! delimited text through the same preview as a CSV, and an ingest launches
+//! the unchanged `file_ingest_job` on that text with a fixed dialect (UTF-8,
+//! comma).
+//!
+//! `SEC-22` D1a: the workbook is NEVER read in this process. A file
+//! declares how much memory its reader will want, and an allocation failure
+//! ends the process that made it — so the read happens in a child process
+//! ([`crate::upload_convert`]), which is this binary started again as
+//! `inspect-upload` and runs under a memory limit of its own. The sheet is
+//! converted ONCE (`SEC-22` D5) and stored beside the original as
+//! `<key>.converted.<n>.csv` (n is the sheet's position in the workbook's
+//! list), with the list of the sheets as `<key>.sheets.json` and the answer
+//! of the conversion as `<key>.converted.<n>.json`; a preview reads the
+//! stored text, the first 256 KiB of it, and a load uses the same text.
+//! Whether an upload IS a workbook is decided by its stored name AND its
+//! first bytes ([`conversion_of_head`]): a text export named `.xls` (the
+//! file that motivated the feature) is still text. The chosen sheet cannot
+//! go in the job's run configuration (its schema is closed and the job does
+//! not change), so it is recorded in the upload's `parse_options` and in the
+//! audit event.
 //!
 //! # Parquet files
 //!
 //! A `.parquet` file takes the same path as a workbook (section 11 of
-//! `docs/superpowers/plans/2026-10-07-upload-excel.md`): stored as it arrived,
-//! converted in memory for the preview ([`crate::upload_parquet`]) and, at
-//! ingest, stored as a CSV object beside the original ([`converted_key`]) that
-//! the unchanged job loads with the fixed dialect. A file has one table and its
-//! own column names, so there is no sheet and the header row is fixed at 0
-//! (`headerRow` in a request is not read). Whether an upload IS a Parquet file
-//! is decided by its stored name AND its first bytes, as for a workbook
-//! ([`conversion_of_head`]). Where the code branches on "is this converted
-//! before it is loaded", it branches on [`Conversion`], not on a workbook.
+//! `docs/superpowers/plans/2026-10-07-upload-excel.md`): stored as it
+//! arrived, read by the same child process (`SEC-22` D1a), and, at ingest,
+//! read by the unchanged job, which streams it by row group. A file has one
+//! table and its own column names, so there is no sheet and the header row
+//! is fixed at 0 (`headerRow` in a request is not read). Whether an upload IS
+//! a Parquet file is decided by its stored name AND its first bytes, as for a
+//! workbook ([`conversion_of_head`]). Where the code branches on "is this
+//! converted before it is loaded", it branches on [`Conversion`], not on a
+//! workbook.
 //!
 //! # Statuses
 //!
@@ -762,9 +773,13 @@ async fn conversion_of(state: &AppState, row: &Upload) -> Result<Option<Conversi
     Ok(conversion_of_head(&row.storage_key, &head))
 }
 
-/// Run a conversion on a blocking thread (parsing is CPU work on up to 50 MB)
-/// and turn its refusal into a 400 with the refusal's own sentence. A task that
-/// did not finish is logged and answered with a fixed sentence.
+/// Run an ARCHIVE check on a blocking thread (unpacking is CPU work on up to
+/// 50 MB) and turn its refusal into a 400 with the refusal's own sentence.
+/// A task that did not finish is logged and answered with a fixed sentence.
+///
+/// The workbook and Parquet reads do NOT come here: they are done by the
+/// child process (`SEC-22` D1a), which is the only place a file somebody
+/// chose is parsed.
 async fn blocking<T: Send + 'static, E: std::fmt::Display + Send + 'static>(
     work: impl FnOnce() -> Result<T, E> + Send + 'static,
 ) -> Result<T, ApiError> {

@@ -64,13 +64,26 @@
 //! # Limits
 //!
 //! A workbook is compressed and can hold far more than the bytes of the upload
-//! suggest, and the API converts it in memory. A sheet whose used range is
-//! more than [`MAX_SHEET_CELLS`] cells (rows times columns, empty cells
+//! suggest, and the reader holds the sheet it opens. A sheet whose used range
+//! is more than [`MAX_SHEET_CELLS`] cells (rows times columns, empty cells
 //! included) is refused ([`WorkbookError::TooLarge`]). The number is a cap, not
 //! a measurement. For `.xlsx` the cap is checked while the sheet streams in, so
 //! a sheet that only claims a huge range costs no more than the cells it has;
 //! for `.xls` the library builds the sheet before this module sees it, and the
 //! format itself bounds it (65,536 rows by 256 columns).
+//!
+//! That cap is NOT the whole bound, and this module used to say it was: the
+//! reader of a workbook believes the counts the file declares, so a workbook
+//! can ask for more memory than the machine has BEFORE a single cell is read
+//! (the shared strings of an `.xlsx` are the worst case: the header of the
+//! part declares how many there are, and the reader reserves room for all of
+//! them). Rust ABORTS the process on an allocation failure, and
+//! `catch_unwind` cannot catch that, so the API must not be the process that
+//! opens a workbook somebody uploaded. `SEC-22` D1a: this module runs in the
+//! CHILD process (`crate::upload_convert`), which sets a memory limit on
+//! itself before it reads anything — so a workbook that asks for too much
+//! ends the child and never the API. The limit is the real bound; the cell
+//! cap is a second one, in front of it.
 //!
 //! # What is accepted
 //!
