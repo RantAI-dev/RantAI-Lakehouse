@@ -913,9 +913,12 @@ pub struct Config {
     /// resolution ([`ConfigError::InvalidUploadLimit`]).
     pub upload_max_conversions: u32,
     /// The memory limit the child that reads an uploaded file sets for
-    /// itself: `UPLOAD_CONVERT_MEMORY_MB`, default 1024 (1 GiB) until
-    /// `SEC-22` T5 measures the real peak. A value that is not a whole
-    /// number of 1 or more fails config resolution
+    /// itself: `UPLOAD_CONVERT_MEMORY_MB`, default 896 MiB. The number is
+    /// the measured peak of the largest allowed workbook times 1.5, rounded
+    /// up to 128 MiB (`SEC-22` D7; the measurement is in
+    /// `ops/g9/sec22_measure.py` and its numbers in
+    /// `docs/plans/SEC-22-RESULT.md`). A value that is not a whole number of
+    /// 1 or more fails config resolution
     /// ([`ConfigError::InvalidUploadLimit`]).
     pub upload_convert_memory_mb: u32,
     /// Hours after which an upload session whose pieces never all arrived
@@ -1554,7 +1557,11 @@ impl Config {
             upload_max_concurrent_per_user: parse_limit(env, "UPLOAD_MAX_CONCURRENT_PER_USER", 4)?,
             upload_max_concurrent: parse_limit(env, "UPLOAD_MAX_CONCURRENT", 16)?,
             upload_max_conversions: parse_limit(env, "UPLOAD_MAX_CONVERSIONS", 2)?,
-            upload_convert_memory_mb: parse_limit(env, "UPLOAD_CONVERT_MEMORY_MB", 1024)?,
+            upload_convert_memory_mb: parse_limit(
+                env,
+                "UPLOAD_CONVERT_MEMORY_MB",
+                crate::upload_convert::DEFAULT_MEMORY_MIB,
+            )?,
             upload_session_ttl_hours: parse_limit(env, "UPLOAD_SESSION_TTL_HOURS", 24)?,
             connector_auto_disable_after: i32::try_from(parse_positive_u32_or_default(
                 env,
@@ -2711,7 +2718,7 @@ mod tests {
     // ── SEC-22: the limits of the child that reads an uploaded file ─────
 
     #[test]
-    fn the_conversion_limits_default_to_two_conversions_and_a_gibibyte() {
+    fn the_conversion_limits_default_to_two_conversions_and_the_measured_peak() {
         for env in [
             HashMap::new(),
             env_with("UPLOAD_MAX_CONVERSIONS", ""),
@@ -2719,7 +2726,10 @@ mod tests {
         ] {
             let cfg = Config::from_map(&env).unwrap();
             assert_eq!(cfg.upload_max_conversions, 2);
-            assert_eq!(cfg.upload_convert_memory_mb, 1024);
+            assert_eq!(
+                cfg.upload_convert_memory_mb,
+                crate::upload_convert::DEFAULT_MEMORY_MIB
+            );
         }
     }
 

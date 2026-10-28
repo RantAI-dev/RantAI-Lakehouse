@@ -99,14 +99,40 @@ pub const MEMORY_ENV: &str = "LAKEHOUSE_CONVERT_MEMORY_MIB";
 /// fixture.
 pub const OUTPUT_ENV: &str = "LAKEHOUSE_CONVERT_MAX_OUTPUT_BYTES";
 
-/// The child's memory limit when nothing says otherwise: 1 GiB, the number
-/// `SEC-22` D7 starts from. `SEC-22` T5 measures the real peak and sets the
-/// default from it.
-pub const DEFAULT_MEMORY_MIB: u64 = 1024;
+/// The environment variable the child's CPU limit comes from.
+///
+/// An INTERNAL variable, like [`MEMORY_ENV`]. The limit is
+/// [`DEFAULT_CPU_SECONDS`] unless this says otherwise; the variable exists
+/// so that the measurement of `SEC-22` T5 can run without the limit ending
+/// the run it is measuring.
+pub const CPU_ENV: &str = "LAKEHOUSE_CONVERT_CPU_SECONDS";
 
-/// The child's CPU limit, in seconds: 60. The API's own wall-clock limit is
-/// 90 s (`SEC-22` D3), so the CPU limit is the one that ends a conversion
-/// that spins.
+/// The child's memory limit when nothing says otherwise: 896 MiB.
+///
+/// `SEC-22` D7: the limit is the measured peak times 1.5, rounded up to
+/// 128 MiB. Measured on 2026-10-28 on the machine this was written on, with
+/// the script of `ops/g9/sec22_measure.py` and the fixtures it builds (the
+/// numbers are in `docs/plans/SEC-22-RESULT.md`, written by the planner
+/// from the handoff of `SEC-22`):
+///
+/// - the baseline, the child with an empty input: 23.9 MiB;
+/// - `convert-sheet` on a workbook of 5,000,000 cells: 549.2 MiB;
+/// - `preview-parquet` on a Parquet file of 50 MiB: 136.2 MiB.
+///
+/// 549.2 MiB times 1.5 is 823.9 MiB, which rounds up to 896 MiB. Two
+/// conversions at once are 1.75 GiB, which a machine with 12 GB of memory
+/// affords.
+pub const DEFAULT_MEMORY_MIB: u32 = 896;
+
+/// The child's CPU limit, in seconds: 60 (`SEC-22` D7). The API's own
+/// wall-clock limit is 90 s (`SEC-22` D3), so the CPU limit is the one that
+/// ends a conversion that spins.
+///
+/// The measurement of `SEC-22` T5 took 82.9 s of wall-clock time for the
+/// largest allowed workbook, in a BUILD WITHOUT OPTIMISATIONS: the
+/// dependencies of the parser are unoptimised there, and the deployment's
+/// binary is not. The release build was not measured, so the headroom of
+/// this limit is not proven (`SEC-22` T5, handoff).
 pub const DEFAULT_CPU_SECONDS: u64 = 60;
 
 /// The most text a conversion may produce: 512 MiB (`SEC-22` D6, the number
@@ -384,7 +410,7 @@ pub struct ChildLimits {
 impl Default for ChildLimits {
     fn default() -> Self {
         Self {
-            memory_bytes: DEFAULT_MEMORY_MIB * 1024 * 1024,
+            memory_bytes: u64::from(DEFAULT_MEMORY_MIB) * 1024 * 1024,
             cpu_seconds: DEFAULT_CPU_SECONDS,
             max_output_bytes: MAX_OUTPUT_BYTES,
             max_input_bytes: MAX_INPUT_BYTES,
@@ -394,17 +420,19 @@ impl Default for ChildLimits {
 
 impl ChildLimits {
     /// The limits the child runs under, with the memory limit from the
-    /// environment ([`MEMORY_ENV`]) and the output cap from the environment
-    /// ([`OUTPUT_ENV`]) when they say something usable.
+    /// environment ([`MEMORY_ENV`]), the output cap from the environment
+    /// ([`OUTPUT_ENV`]) and the CPU limit from the environment
+    /// ([`CPU_ENV`]) when they say something usable.
     ///
-    /// The child reads these two variables and nothing else: it never
+    /// The child reads these three variables and nothing else: it never
     /// resolves the API's configuration, so it needs no environment of its
     /// own to read a file (`SEC-22` D1).
     #[must_use]
     pub fn from_env() -> Self {
         let memory = std::env::var(MEMORY_ENV).ok();
         let output = std::env::var(OUTPUT_ENV).ok();
-        Self::with_limits(memory.as_deref(), output.as_deref())
+        let cpu = std::env::var(CPU_ENV).ok();
+        Self::with_limits(memory.as_deref(), output.as_deref(), cpu.as_deref())
     }
 
     /// The limits the child runs under, with the memory limit `raw` names,
@@ -416,15 +444,16 @@ impl ChildLimits {
     )]
     #[must_use]
     pub fn with_memory(raw: Option<&str>) -> Self {
-        Self::with_limits(raw, None)
+        Self::with_limits(raw, None, None)
     }
 
     /// The limits the child runs under, with the memory limit `memory` names
-    /// in mebibytes and the output cap `output` names in bytes. Anything that
-    /// is not a whole number of 1 or more keeps the default: a limit that
-    /// cannot be read is no limit at all.
+    /// in mebibytes, the output cap `output` names in bytes and the CPU
+    /// limit `cpu` names in seconds. Anything that is not a whole number of
+    /// 1 or more keeps the default: a limit that cannot be read is no limit
+    /// at all.
     #[must_use]
-    pub fn with_limits(memory: Option<&str>, output: Option<&str>) -> Self {
+    pub fn with_limits(memory: Option<&str>, output: Option<&str>, cpu: Option<&str>) -> Self {
         let mut limits = Self::default();
         if let Some(mib) = memory
             .map(str::trim)
@@ -439,6 +468,13 @@ impl ChildLimits {
             .filter(|bytes| *bytes > 0)
         {
             limits.max_output_bytes = bytes;
+        }
+        if let Some(seconds) = cpu
+            .map(str::trim)
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .filter(|seconds| *seconds > 0)
+        {
+            limits.cpu_seconds = seconds;
         }
         limits
     }
@@ -773,6 +809,8 @@ pub struct ConversionRunner {
     memory_mib: u64,
     /// The most text the child may produce, in bytes.
     max_output_bytes: u64,
+    /// The CPU limit the child sets for itself, in seconds.
+    cpu_seconds: u64,
     /// The wall-clock limit of one conversion.
     wall: Duration,
     /// How many children this process has started.
@@ -786,6 +824,7 @@ impl std::fmt::Debug for ConversionRunner {
         f.debug_struct("ConversionRunner")
             .field("memory_mib", &self.memory_mib)
             .field("max_output_bytes", &self.max_output_bytes)
+            .field("cpu_seconds", &self.cpu_seconds)
             .field("wall", &self.wall)
             .finish_non_exhaustive()
     }
@@ -807,6 +846,7 @@ impl ConversionRunner {
             slots: Arc::new(Semaphore::new(max_conversions.max(1))),
             memory_mib,
             max_output_bytes: MAX_OUTPUT_BYTES,
+            cpu_seconds: DEFAULT_CPU_SECONDS,
             wall: CONVERSION_WALL,
             runs: Arc::new(AtomicU64::new(0)),
         }
@@ -830,6 +870,7 @@ impl ConversionRunner {
             slots: Arc::clone(&self.slots),
             memory_mib: self.memory_mib,
             max_output_bytes: self.max_output_bytes,
+            cpu_seconds: self.cpu_seconds,
             wall: self.wall,
             runs: Arc::clone(&self.runs),
         }
@@ -850,6 +891,7 @@ impl ConversionRunner {
             slots: Arc::clone(&self.slots),
             memory_mib: self.memory_mib,
             max_output_bytes,
+            cpu_seconds: self.cpu_seconds,
             wall: self.wall,
             runs: Arc::clone(&self.runs),
         }
@@ -868,6 +910,7 @@ impl ConversionRunner {
             slots: Arc::clone(&self.slots),
             memory_mib: self.memory_mib,
             max_output_bytes: self.max_output_bytes,
+            cpu_seconds: self.cpu_seconds,
             wall,
             runs: Arc::clone(&self.runs),
         }
@@ -1112,7 +1155,8 @@ impl ConversionRunner {
             // It gets the two variables it needs and nothing else.
             .env_clear()
             .env(MEMORY_ENV, self.memory_mib.to_string())
-            .env(OUTPUT_ENV, self.max_output_bytes.to_string());
+            .env(OUTPUT_ENV, self.max_output_bytes.to_string())
+            .env(CPU_ENV, self.cpu_seconds.to_string());
         let mut child = command.spawn().map_err(|err| {
             tracing::warn!(%err, "the child that reads an uploaded file could not be started");
             ConversionError::NotStarted
@@ -1594,7 +1638,10 @@ mod tests {
     #[test]
     fn the_memory_limit_comes_from_the_environment() {
         let limits = ChildLimits::from_env();
-        assert_eq!(limits.memory_bytes, DEFAULT_MEMORY_MIB * 1024 * 1024);
+        assert_eq!(
+            limits.memory_bytes,
+            u64::from(DEFAULT_MEMORY_MIB) * 1024 * 1024
+        );
         assert_eq!(limits.cpu_seconds, DEFAULT_CPU_SECONDS);
         assert_eq!(
             ChildLimits::with_memory(Some("512")).memory_bytes,
@@ -1604,7 +1651,7 @@ mod tests {
         for raw in ["not a number", "0", "", "  "] {
             assert_eq!(
                 ChildLimits::with_memory(Some(raw)).memory_bytes,
-                DEFAULT_MEMORY_MIB * 1024 * 1024,
+                u64::from(DEFAULT_MEMORY_MIB) * 1024 * 1024,
                 "{raw:?}"
             );
         }
