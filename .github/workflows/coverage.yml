@@ -16,10 +16,59 @@ jobs:
   coverage:
     name: cargo llvm-cov (lcov)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # 90, not 30: the last two green runs before the disk failure started
+    # (runs 40149263708 and 40186521664) took 27m30s and 29m03s, so 30
+    # minutes is the next wall for this job (OPS-14). The disk is freed by
+    # the job's own "Free runner disk" step, and no run with the freed disk
+    # exists yet. The budget is a guard against a hung job, not a speed
+    # target; a hang still ends here.
+    timeout-minutes: 90
+    # OPS-14: this job builds the whole workspace with `cargo llvm-cov`, and
+    # the workspace's debug information is what filled the runner's disk ("No
+    # space left on device", run 40667618517). `line-tables-only` keeps the
+    # file:line a backtrace prints and drops the rest of the debug information.
+    # The `test` job in ci.yml made the same change for the same reason.
+    #
+    # Both profiles are named because the `test` profile inherits from `dev`:
+    # dependencies are built with `dev`, the test binaries themselves with
+    # `test`.
+    #
+    # The cache key needs no change. Swatinem/rust-cache matches the
+    # environment variable names by prefix and hashes the value of every
+    # match into its key, and the prefixes it matches by default are
+    # `CARGO CC CFLAGS CXX CMAKE RUST`. `CARGO` is in that list, so both
+    # variables move the key on their own.
+    #
+    # OPS-14 review fix (SHOULD-FIX 3): the earlier wording said it
+    # hashes every `CARGO`-prefixed variable; it matches a fixed list
+    # of prefixes.
+    #
+    # The rest of the key is the lockfile and the toolchain. Cargo's own
+    # fingerprinting covers the debug setting, so a cache that was built
+    # with other debug settings is rebuilt by Cargo instead of being reused.
+    #
+    # The `env-vars` input needs nothing added: the `CARGO` prefix already
+    # covers both variables, so naming them there would restate it.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+
+      # OPS-14: the disk that ran out is the runner's, and the runner ships
+      # toolchains this job never uses. Deleting them is free space for the
+      # workspace this job builds; the Postgres image the job's integration
+      # tests need is pulled by testcontainers itself later, so nothing this
+      # job requires is removed. `df -h /` before and after prints what the
+      # step actually freed, so the run's log carries the measurement instead
+      # of a guess. The `test` job in ci.yml frees the disk the same way.
+      - name: Free runner disk
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          df -h /
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
