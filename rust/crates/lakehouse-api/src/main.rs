@@ -18,6 +18,7 @@ mod connector_listing;
 mod connector_oauth;
 mod connector_probe;
 mod connector_secret_store;
+mod crypto_provider;
 mod csv_export;
 mod csv_safe;
 mod error;
@@ -32,6 +33,7 @@ mod lakehouse_catalog;
 mod lakekeeper_token;
 mod next_run;
 mod pdf;
+mod pg_probe;
 mod pipeline_lag;
 mod pipeline_source;
 mod policy;
@@ -49,6 +51,13 @@ mod state;
 mod tenant;
 mod tenant_scope;
 mod tile_pool;
+
+// Test-only: the TLS-terminating proxy in front of the shared test
+// Postgres (`SEC-14` part B). Declared in both this crate's module roots
+// because `main.rs` compiles the same sources into the binary.
+#[cfg(test)]
+mod tls_proxy;
+
 mod transform_grammar;
 mod upload_formats;
 mod upload_limits;
@@ -72,6 +81,12 @@ use state::AppState;
 /// thread stack size: phase 2 catch-up with main (sqlparser 0.63), see
 /// [`config::WORKER_STACK_BYTES`] for the measurement behind the value.
 fn main() -> anyhow::Result<()> {
+    // PR #192 review BLOCKER 10: install `ring` crypto provider before any task dials.
+    if let Err(err) = crypto_provider::install_default_provider() {
+        eprintln!("fatal: failed to install default rustls crypto provider: {err}");
+        std::process::exit(1);
+    }
+
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_stack_size(config::WORKER_STACK_BYTES)

@@ -723,6 +723,55 @@ API refuses to dial an internal address unless the operator allows it:
 The CI gates that save ingest specs aimed at compose-network fixtures set the
 variable themselves, in their own override (`ops/g6/`), marked gate-only.
 
+### Connector TLS and certificate verification (`SEC-14` part B)
+
+Connector connection tests (`POST /api/connectors/{id}/test`), table discovery
+(`POST /api/connectors/{id}/discover`), and CDC clean-up require TLS for
+PostgreSQL and SQL Server dials:
+
+- **PostgreSQL connection test (`pg_probe`):** Connection tests send an
+  `SSLRequest` before the PostgreSQL startup packet. If the server declines TLS
+  (responds `N`), the probe fails immediately without sending credentials. The
+  probe only negotiates `SCRAM-SHA-256`; if the server requests clear-text
+  (`AuthenticationCleartextPassword`) or MD5 (`AuthenticationMD5Password`)
+  authentication, the probe refuses and terminates the connection without
+  transmitting the password. Plain `SCRAM-SHA-256` without channel binding
+  is used (`channel_binding=disable`); without a CA certificate configured,
+  a relaying server performing a man-in-the-middle attack cannot be detected.
+- **Certificate verification (`CONNECTOR_TLS_CA_FILE`):**
+  - Unset or empty: PostgreSQL and SQL Server dials require encryption
+    (`Require` / `EncryptionLevel::Required`) without checking the server
+    certificate against a custom root CA.
+  - Set to a PEM file path: the PostgreSQL connection test (`pg_probe`) verifies
+    the server certificate and the host name (`verify-full`) against that bundle
+    alone. The `sqlx` dials (table discovery, table listing, CDC clean-up)
+    verify the chain only (`VerifyCa`): they dial the approved address rather
+    than the name, so a name check could never pass; they trust the bundle
+    plus the public webpki roots `sqlx` ships with. SQL Server dials verify the
+    server certificate against that CA bundle via Tiberius's `trust_cert_ca`,
+    which adds the CA to the native system roots (so SQL Server accepts either
+    the configured CA or any public root, unlike the PostgreSQL connection
+    test, which trusts only the configured CA bundle).
+  - If `CONNECTOR_TLS_CA_FILE` is set to an unreadable or non-existent path,
+    or contains no valid PEM certificates, `lakehouse-api` fails fast at startup
+    with an error naming the variable.
+- **Docker Compose:** The default `docker-compose.yml` includes a one-shot
+  `postgres-cert-init` service that generates a local CA and server certificate
+  (SAN `DNS:postgres`) into the named volume `lakehouse_postgres_tls`. The
+  bundled `postgres` container runs with `ssl=on`. `lakehouse-api` mounts this
+  CA at `/run/certs/postgres/ca.crt` and defaults
+  `CONNECTOR_TLS_CA_FILE=/run/certs/postgres/ca.crt`, allowing the seeded
+  `conn-pg-lakehouse` connector test to pass over `verify-full`.
+- **Operators with external databases:**
+  - Because `docker-compose.yml` defaults `CONNECTOR_TLS_CA_FILE` to
+    `/run/certs/postgres/ca.crt` if unset or empty via `${CONNECTOR_TLS_CA_FILE:-/run/certs/postgres/ca.crt}`,
+    it cannot be cleared to empty in `.env`.
+  - To connect to external databases using custom internal CAs or public system
+    roots alongside the bundled PostgreSQL, create a combined CA bundle containing
+    the bundled CA (`/run/certs/postgres/ca.crt`) plus your corporate internal CA
+    or system root certificates. Mount the combined bundle into the `lakehouse-api`
+    container and set `CONNECTOR_TLS_CA_FILE` to its mounted path.
+
 ### Connector credentials at rest (`SRC-12`, ADR 0002 addendum 5)
 
 A credential typed in the console is stored on the `connector_secrets`

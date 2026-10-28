@@ -151,6 +151,16 @@ zip = { version = "8.6", default-features = false, features = ["deflate"] }
 # rustls-webpki 0.101.7 (RUSTSEC-2026-0098/0099/0104, no fixed 0.101.x);
 # the 0.13 line is on rustls 0.23 -> webpki 0.103.15, all three fixed.
 tiberius = { version = "0.13", default-features = false, features = ["tds73", "rustls", "chrono"] }
+# SEC-14 part B (`pg_probe`): the Postgres connection test speaks the wire
+# protocol itself, so it can refuse every authentication method but
+# SCRAM-SHA-256, and always upgrades to TLS before the startup packet. See
+# the workspace `Cargo.toml` entries for what each crate is and why it is
+# here.
+postgres-protocol = { workspace = true }
+fallible-iterator = { workspace = true }
+bytes = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
 # `tiberius::Client::connect` takes a Tokio-`AsyncRead`/`AsyncWrite`
 # stream wrapped for the `futures`-crate traits tiberius itself uses
 # (tiberius's own doc comment, `src/lib.rs`'s "Connecting with Tokio"
@@ -225,7 +235,12 @@ testcontainers-modules = { version = "0.15", features = ["clickhouse"] }
 # `secret_manager::gcp`'s tests also generate a service-account key with it.
 rsa = "0.9"
 
-tempfile = { workspace = true }
+# `SEC-14` part B (dev-only): the TLS-terminating proxy in front of the
+# shared test `Postgres` (`src/tls_proxy.rs`) needs a server certificate,
+# and a test can only get one by generating it -- no certificate is
+# committed to this repository (gitleaks reads a committed private key as a
+# leak). `ring` and no `crypto` defaults, matching the workspace's one
+# rustls provider story (the workspace `rustls` entry); MIT OR Apache-2.0.
 # `SEC-41` decision 7 / AC1: `tests/sec41_verify_ca.rs` puts a TLS
 # terminator in front of the shared test Postgres (answer `SSLRequest` with
 # `S`, then rustls, then forward bytes) and needs a certificate chain per
@@ -236,6 +251,8 @@ tempfile = { workspace = true }
 # `sqlx-core` turns on); MIT OR Apache-2.0. Its `yasna` dependency is the
 # only package it adds to `Cargo.lock`.
 rcgen = { version = "0.13", default-features = false, features = ["ring"] }
+
+tempfile = { workspace = true }
 # The terminator's own TLS server side, and the provider named explicitly so
 # it does not depend on which rustls consumer set the process default first.
 # Both are already in `Cargo.lock` (through `reqwest`/`object_store`/

@@ -33,6 +33,9 @@ use uuid::Uuid;
 // crate's doc comment).
 use lakehouse_test_support as _;
 
+#[path = "../../src/tls_proxy.rs"]
+pub mod tls_proxy;
+
 /// A running [`AppState`]/[`axum::Router`] pair over an isolated,
 /// migrated-and-seeded test database, plus the raw pool for direct setup
 /// (minting sessions, inserting throwaway fixtures) that goes around the
