@@ -1,4 +1,4 @@
-//! Whole-result downloads, CSV and Excel (`BI-1`, plan decisions D6 and D8).
+//! Whole-result downloads, CSV, TSV and Excel (`BI-1`, plan decisions D6 and D8).
 //!
 //! The rows come from `ClickHouse` one line at a time ([`RowSource`]) and are
 //! written to a file on disk as they arrive, so a million rows never sit in
@@ -13,13 +13,20 @@
 //! writer's own working files sit there while it runs), so a process killed in
 //! that window leaves them behind (BI-1 review fix (SHOULD-FIX) R10).
 //!
+//! Two limits can cut a file short: the caller's row cap and the caller's byte
+//! cap. The comma and tab files count the bytes they write, the byte-order
+//! mark and the header among them; the workbook counts the text of its cells,
+//! the workbook being compressed, so the file on disk is never bigger than the
+//! counted text. A cap cuts at the last whole row that fits, and a file that
+//! ends exactly at its cap is not cut.
+//!
 //! One rule per concern, shared with the older export: formula
-//! neutralising is `csv_export::neutralise` for a CSV cell and an Excel text
-//! cell alike. Excel keeps numbers as numbers (feature decision 7): with
-//! "formatted", a column whose chart has a value format gets the Excel number
-//! format `lakehouse_bi::export_format::excel_number_format` returns; with
-//! "raw" nothing is formatted. A CSV "formatted" file holds the text the chart
-//! shows (`format_text`).
+//! neutralising is `csv_export::neutralise` for a CSV cell, a tab-separated
+//! cell and an Excel text cell alike. Excel keeps numbers as numbers (feature
+//! decision 7): with "formatted", a column whose chart has a value format gets
+//! the Excel number format `lakehouse_bi::export_format::excel_number_format`
+//! returns; with "raw" nothing is formatted. A CSV "formatted" file holds the
+//! text the chart shows (`format_text`).
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -47,12 +54,27 @@ pub(crate) const EXPORT_TIMEOUT: std::time::Duration = std::time::Duration::from
 pub(crate) enum FileFormat {
     /// UTF-8 text with a byte-order mark.
     Csv,
+    /// UTF-8 text with a byte-order mark, its fields separated by a tab.
+    ///
+    /// # Why this is `#[allow(dead_code)]`
+    ///
+    /// The Query Studio download route (`QS-2`) is the caller that offers the
+    /// tab-separated file: it builds this variant itself, and the allow above
+    /// goes away when that route lands.
+    #[allow(
+        dead_code,
+        reason = "the Query Studio download route builds it (QS-2); the allow goes away there"
+    )]
+    Tsv,
     /// An Excel workbook, one sheet.
     Xlsx,
 }
 
 impl FileFormat {
     /// The parameter value (`csv`, `xlsx`).
+    ///
+    /// The tab-separated file has no parameter value: the callers that take
+    /// one offer the comma file and the workbook.
     pub(crate) fn parse(raw: &str) -> Option<Self> {
         match raw {
             "csv" => Some(Self::Csv),
@@ -65,6 +87,7 @@ impl FileFormat {
     pub(crate) const fn extension(self) -> &'static str {
         match self {
             Self::Csv => "csv",
+            Self::Tsv => "tsv",
             Self::Xlsx => "xlsx",
         }
     }
@@ -73,6 +96,7 @@ impl FileFormat {
     pub(crate) const fn content_type(self) -> &'static str {
         match self {
             Self::Csv => "text/csv; charset=utf-8",
+            Self::Tsv => "text/tab-separated-values; charset=utf-8",
             Self::Xlsx => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         }
     }
@@ -262,6 +286,11 @@ impl Drop for TempPath {
 
 /// Read `source` to its end (or the cap) and write it as `options` say.
 ///
+/// This entry has no byte cap: the dashboard's download is bounded by its row
+/// cap alone, and its files are what they were before the byte cap existed.
+/// The Query Studio download, which has a cap of its own, calls
+/// [`write_export_with_byte_cap`].
+///
 /// # Errors
 ///
 /// [`ExportError`]: the source failed, the disk failed, or the workbook writer
@@ -270,9 +299,39 @@ pub(crate) async fn write_export<S: RowSource>(
     source: &mut S,
     options: &ExportOptions<'_>,
 ) -> Result<Written, ExportError> {
+    write_export_with_byte_cap(source, options, None).await
+}
+
+/// Read `source` to its end (or the caps) and write it as `options` say.
+///
+/// `byte_cap` is the most bytes the file may hold, `None` for no byte cap.
+/// The Query Studio download (`QS-2`) is the caller that has one: it stops a
+/// result that passes its cap at the last whole row, and tells the person
+/// which limit cut the file. The comma and tab files count the bytes they
+/// write, the byte-order mark and the header among them; the workbook counts
+/// the text of its cells, the workbook being compressed, so the file on disk
+/// is never bigger than the counted text. A cap cuts at the last whole row
+/// that fits, and a file that ends exactly at its cap is not cut.
+///
+/// # Errors
+///
+/// [`ExportError`]: the source failed, the disk failed, or the workbook writer
+/// refused a cell.
+pub(crate) async fn write_export_with_byte_cap<S: RowSource>(
+    source: &mut S,
+    options: &ExportOptions<'_>,
+    byte_cap: Option<u64>,
+) -> Result<Written, ExportError> {
     match options.format {
-        FileFormat::Csv => write_csv_file(source, options).await,
-        FileFormat::Xlsx => write_xlsx_file(source, options).await,
+        FileFormat::Csv => {
+            let (header_of, line_of) = (csv_export::header, csv_export::line);
+            write_delimited_file(source, options, header_of, line_of, byte_cap).await
+        }
+        FileFormat::Tsv => {
+            let (header_of, line_of) = (csv_export::tsv_header, csv_export::tsv_line);
+            write_delimited_file(source, options, header_of, line_of, byte_cap).await
+        }
+        FileFormat::Xlsx => write_xlsx_file(source, options, byte_cap).await,
     }
 }
 
@@ -305,12 +364,19 @@ fn columns<S: RowSource>(source: &S, options: &ExportOptions<'_>) -> Columns {
     }
 }
 
-async fn write_csv_file<S: RowSource>(
+/// Write the rows as a delimited file: the comma file or the tab-separated
+/// one, which differ in their separator and in nothing else. `header_of` and
+/// `line_of` are the two rules of that file, from `csv_export`. `byte_cap` is
+/// the most bytes the file may hold, `None` for no byte cap.
+async fn write_delimited_file<S: RowSource>(
     source: &mut S,
     options: &ExportOptions<'_>,
+    header_of: fn(&[String]) -> String,
+    line_of: fn(&[String]) -> String,
+    byte_cap: Option<u64>,
 ) -> Result<Written, ExportError> {
     let cols = columns(source, options);
-    let path = TempPath::new("csv");
+    let path = TempPath::new(options.format.extension());
     let file = tokio::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -320,8 +386,11 @@ async fn write_csv_file<S: RowSource>(
     // Unlinked at once: the open file stays usable, nothing is left to clean up.
     drop(tokio::fs::remove_file(&path.0).await);
     let mut out = BufWriter::new(file);
-    out.write_all(csv_export::header(&cols.labels).as_bytes())
-        .await?;
+    let header = header_of(&cols.labels);
+    // The byte cap counts what the file holds: the byte-order mark and the
+    // header are part of it.
+    let mut bytes = header.len() as u64;
+    out.write_all(header.as_bytes()).await?;
     let mut rows = 0;
     let mut cut = false;
     loop {
@@ -344,7 +413,17 @@ async fn write_csv_file<S: RowSource>(
                         )
                     })
                     .collect();
-                out.write_all(csv_export::line(&fields).as_bytes()).await?;
+                let line = line_of(&fields);
+                // The cap cuts at the last whole row that fits: a row that
+                // would pass it is not written, not half written.
+                if let Some(cap) = byte_cap
+                    && bytes + line.len() as u64 > cap
+                {
+                    cut = true;
+                    break;
+                }
+                out.write_all(line.as_bytes()).await?;
+                bytes += line.len() as u64;
                 rows += 1;
             }
         }
@@ -364,6 +443,26 @@ async fn write_csv_file<S: RowSource>(
 /// Excel's longest cell text.
 const XLSX_CELL_CHARS: usize = 32_767;
 
+/// Excel's sheet holds 1,048,576 rows, the header among them: 1,048,575 data
+/// rows. Public because the download route names the same number when it
+/// says which limit cut its file.
+pub(crate) const XLSX_DATA_ROW_CAP: usize = 1_048_575;
+
+/// The rows a workbook may hold: the caller's own cap, or the sheet's when the
+/// sheet's is smaller.
+fn xlsx_row_cap(caller_cap: usize) -> usize {
+    caller_cap.min(XLSX_DATA_ROW_CAP)
+}
+
+/// The bytes a cell holds as text: the text a reader sees. A number is stored
+/// as a number, so it costs its own digits; a null cell holds nothing.
+fn xlsx_cell_bytes(value: &Value, numeric_column: bool) -> u64 {
+    match cell_number(value, numeric_column) {
+        Some(n) => n.to_string().len() as u64,
+        None => csv_export::cell_text(Some(value)).len() as u64,
+    }
+}
+
 fn xlsx_err(e: &rust_xlsxwriter::XlsxError) -> ExportError {
     ExportError::Xlsx(e.to_string())
 }
@@ -371,6 +470,7 @@ fn xlsx_err(e: &rust_xlsxwriter::XlsxError) -> ExportError {
 async fn write_xlsx_file<S: RowSource>(
     source: &mut S,
     options: &ExportOptions<'_>,
+    byte_cap: Option<u64>,
 ) -> Result<Written, ExportError> {
     use rust_xlsxwriter::{Format, Workbook};
 
@@ -398,14 +498,36 @@ async fn write_xlsx_file<S: RowSource>(
     }
     let mut rows = 0_usize;
     let mut cut = false;
+    // The byte cap counts the text of the cells the workbook holds, the
+    // workbook being compressed: the file on disk is never bigger than this.
+    let mut bytes: u64 = cols
+        .labels
+        .iter()
+        .map(|label| csv_export::neutralise(label).len() as u64)
+        .sum();
+    let cap = xlsx_row_cap(options.cap);
     loop {
-        match next_capped(source, rows, options.cap).await? {
+        match next_capped(source, rows, cap).await? {
             Next::End => break,
             Next::Cut => {
                 cut = true;
                 break;
             }
             Next::Row(row) => {
+                let row_bytes: u64 = row
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| xlsx_cell_bytes(v, cols.numeric.get(i).copied().unwrap_or(false)))
+                    .sum();
+                // The cap cuts at the last whole row that fits: a row that
+                // would pass it is not written, not half written.
+                if let Some(cap) = byte_cap
+                    && bytes + row_bytes > cap
+                {
+                    cut = true;
+                    break;
+                }
+                bytes += row_bytes;
                 let r = u32::try_from(rows + 1)
                     .map_err(|_| ExportError::Xlsx("more rows than a sheet has".to_owned()))?;
                 for (i, value) in row.iter().enumerate() {
@@ -602,6 +724,61 @@ mod tests {
         assert_eq!(w.rows, 5);
     }
 
+    /// The byte cap counts what the file holds: the byte-order mark and the
+    /// header are 16 bytes, every row 8.
+    #[tokio::test]
+    async fn a_file_past_the_byte_cap_is_cut_at_a_whole_row() {
+        let (labels, formats) = (HashMap::new(), HashMap::new());
+        let make = |i: usize| vec![json!("xxxx"), json!(i)];
+        let cap = 16 + 8 * 2;
+        let w = write_export_with_byte_cap(
+            &mut source(10, make),
+            &options(FileFormat::Csv, Values::Raw, 10, &labels, &formats),
+            Some(cap),
+        )
+        .await
+        .unwrap();
+        assert!(w.cut);
+        assert_eq!(w.rows, 2);
+        let text = String::from_utf8(read_all(w).await).unwrap();
+        assert_eq!(text, "\u{feff}name,amount\r\nxxxx,1\r\nxxxx,2\r\n");
+    }
+
+    #[tokio::test]
+    async fn a_file_exactly_at_the_byte_cap_is_not_cut() {
+        let (labels, formats) = (HashMap::new(), HashMap::new());
+        let make = |i: usize| vec![json!("xxxx"), json!(i)];
+        let cap = 16 + 8 * 3;
+        let w = write_export_with_byte_cap(
+            &mut source(3, make),
+            &options(FileFormat::Csv, Values::Raw, 10, &labels, &formats),
+            Some(cap),
+        )
+        .await
+        .unwrap();
+        assert!(!w.cut);
+        assert_eq!(w.rows, 3);
+        assert_eq!(w.len, cap);
+    }
+
+    #[tokio::test]
+    async fn a_tab_separated_file_is_cut_at_a_whole_row_by_the_byte_cap_too() {
+        let (labels, formats) = (HashMap::new(), HashMap::new());
+        let make = |i: usize| vec![json!("xxxx"), json!(i)];
+        let cap = 16 + 8 * 2;
+        let w = write_export_with_byte_cap(
+            &mut source(10, make),
+            &options(FileFormat::Tsv, Values::Raw, 10, &labels, &formats),
+            Some(cap),
+        )
+        .await
+        .unwrap();
+        assert!(w.cut);
+        assert_eq!(w.rows, 2);
+        let text = String::from_utf8(read_all(w).await).unwrap();
+        assert_eq!(text, "\u{feff}name\tamount\r\nxxxx\t1\r\nxxxx\t2\r\n");
+    }
+
     /// 1,000,001 generated rows against the real cap: the file is cut at
     /// 1,000,000 and the source was asked for exactly one row more. The rows
     /// are made one at a time and written as they come (the source is the
@@ -631,6 +808,41 @@ mod tests {
             "one probe row, no more"
         );
         assert!(w.len > 0);
+    }
+
+    #[tokio::test]
+    async fn a_tab_separated_file_has_the_bom_the_tabs_and_the_line_ends_of_the_comma_one() {
+        let (labels, formats) = (HashMap::new(), HashMap::new());
+        let make = |i: usize| {
+            if i == 1 {
+                vec![json!("x\ty"), json!(2)]
+            } else {
+                vec![json!("=1+1"), json!("1234567")]
+            }
+        };
+        let w = write_export(
+            &mut source(2, make),
+            &options(FileFormat::Tsv, Values::Raw, 10, &labels, &formats),
+        )
+        .await
+        .unwrap();
+        let text = String::from_utf8(read_all(w).await).unwrap();
+        // The tab is quoted, the formula is guarded, and the quoted 64-bit
+        // integer stays the number the comma file writes.
+        assert_eq!(
+            text,
+            "\u{feff}name\tamount\r\n\"x\ty\"\t2\r\n'=1+1\t1234567\r\n"
+        );
+    }
+
+    #[test]
+    fn the_tab_separated_file_has_its_own_extension_and_type_and_is_not_a_parameter_value() {
+        assert_eq!(FileFormat::Tsv.extension(), "tsv");
+        assert_eq!(
+            FileFormat::Tsv.content_type(),
+            "text/tab-separated-values; charset=utf-8"
+        );
+        assert_eq!(FileFormat::parse("tsv"), None);
     }
 
     #[tokio::test]
@@ -670,6 +882,48 @@ mod tests {
             sheet.contains("'=HYPERLINK") || shared.contains("'=HYPERLINK"),
             "{sheet} {shared}"
         );
+    }
+
+    #[test]
+    fn a_workbook_holds_the_smaller_of_the_callers_rows_and_the_sheet() {
+        assert_eq!(xlsx_row_cap(10), 10, "the caller's own cap is smaller");
+        assert_eq!(
+            xlsx_row_cap(usize::MAX),
+            1_048_575,
+            "the sheet's own cap wins"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_workbook_past_the_row_cap_is_cut() {
+        let (labels, formats) = (HashMap::new(), HashMap::new());
+        let make = |i: usize| vec![json!("x"), json!(i)];
+        let w = write_export(
+            &mut source(6, make),
+            &options(FileFormat::Xlsx, Values::Raw, 5, &labels, &formats),
+        )
+        .await
+        .unwrap();
+        assert!(w.cut);
+        assert_eq!(w.rows, 5);
+    }
+
+    /// The workbook's byte cap counts the text of its cells: the header cells
+    /// hold 10 bytes, every row 2.
+    #[tokio::test]
+    async fn a_workbook_past_the_byte_cap_is_cut() {
+        let (labels, formats) = (HashMap::new(), HashMap::new());
+        let make = |i: usize| vec![json!("x"), json!(i)];
+        let cap = 10 + 2 * 3;
+        let w = write_export_with_byte_cap(
+            &mut source(10, make),
+            &options(FileFormat::Xlsx, Values::Raw, 10, &labels, &formats),
+            Some(cap),
+        )
+        .await
+        .unwrap();
+        assert!(w.cut);
+        assert_eq!(w.rows, 3);
     }
 
     #[tokio::test]
