@@ -189,6 +189,7 @@ estimate (S, M, L), which the base has no field for.
 | `DATA-17` | Feature | Upload more formats (Excel, JSON, Parquet, Avro), up to 10 files at once in parallel, up to 2 GB per upload once measured (Databricks' limits) | Data | P2 | In Acceptance | [#76](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/76), [#186](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/186) | `reference/competitive-comparison.md` (Data matrix) |
 | `DATA-18` | Feature | Column types on upload, with names and types editable before loading | Data | P2 | In Acceptance | [#186](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/186) | `reference/competitive-comparison.md` (Data matrix) |
 | `DATA-19` | Feature | Uploaded tables can feed pipelines and so reach dashboards. | Data | P2 | Released | #165 | `reference/competitive-comparison.md` (Data matrix) |
+| `DATA-35` | Feature | Folders for uploaded files on Sources: a grouping only (a file's table keeps its name), chosen while uploading or moved later, folders inside folders, empty folders allowed and deletable, a folder with files cannot be deleted. Uploaded files only, for now. Feature page `features/upload-folders.md` | Data | P2 | Planned |  | Product owner, 2026-10-26; [spec](specs/data-35.md) |
 | `QS-1` | Feature | Query Studio editor basics: column autocomplete, schema browser, several statements, tabs, formatting rules | Query Studio | P2 | In Acceptance | #237 | `reference/competitive-comparison.md` (Query Studio matrix) |
 | `QS-2` | Feature | Query Studio results: up to 64,000 rows or 10 MB shown, grid filters and column stats, full server downloads up to 5 GB (Databricks' limits), server-side Stop, configurable timeouts. | Query Studio | P2 | Planned |  | `reference/competitive-comparison.md` (Query Studio matrix) |
 | `QS-3` | Feature | Saved queries done properly: edit, delete, folders, sharing levels, version history. **Blocked by `SEC-20`** | Query Studio | P2 | Planned |  | `reference/competitive-comparison.md` (Query Studio matrix) |
@@ -333,7 +334,7 @@ parity), built after it.
 
 **Ready to start** (Todo, Planned or Idea, nothing open blocks it; Idea items still need a spec):
 
-`ADM-1`, `ADM-2`, `AI-10`, `AI-21`, `AI-22`, `BI-14`, `BI-20`, `BI-27`, `BI-28`, `BI-29`, `BI-3`, `BI-30`, `BI-31`, `BI-32`, `BI-33`, `BI-34`, `BI-35`, `BI-36`, `BIZ-1`, `BIZ-2`, `BLD-10`, `BLD-6`, `DATA-20`, `DATA-21`, `DATA-22`, `DATA-23`, `DATA-24`, `DATA-25`, `DATA-26`, `DATA-27`, `DATA-28`, `DATA-29`, `DATA-30`, `DATA-31`, `DATA-32`, `DATA-33`, `DATA-34`, `DATA-36`, `DATA-4`, `DATA-5`, `DATA-6`, `DATA-8`, `DOC-2`, `GOV-1`, `GOV-3`, `GOV-5`, `INT-2`, `OPS-13`, `OPS-2`, `OPS-3`, `OPS-6`, `OPS-8`, `QA-1`, `QRY-1`, `QS-2`, `QS-3`, `REL-1`, `REL-2`, `REL-4`, `REL-7`, `SEC-22`, `SEC-34`, `SEC-4`, `SEC-40`, `SEC-50`, `SEC-7`, `SRC-15`, `SRC-18`, `SRC-2`, `SRC-22`, `SRC-23`, `SRC-24`, `SRC-25`, `SRC-26`, `SRC-27`, `SRC-28`, `SRC-30`, `SRC-31`, `SRC-33`, `SRC-34`, `SRC-5`, `VER-1`
+`ADM-1`, `ADM-2`, `AI-10`, `AI-21`, `AI-22`, `BI-14`, `BI-20`, `BI-27`, `BI-28`, `BI-29`, `BI-3`, `BI-30`, `BI-31`, `BI-32`, `BI-33`, `BI-34`, `BI-35`, `BI-36`, `BIZ-1`, `BIZ-2`, `BLD-10`, `BLD-6`, `DATA-20`, `DATA-21`, `DATA-22`, `DATA-23`, `DATA-24`, `DATA-25`, `DATA-26`, `DATA-27`, `DATA-28`, `DATA-29`, `DATA-30`, `DATA-31`, `DATA-32`, `DATA-33`, `DATA-34`, `DATA-35`, `DATA-36`, `DATA-4`, `DATA-5`, `DATA-6`, `DATA-8`, `DOC-2`, `GOV-1`, `GOV-3`, `GOV-5`, `INT-2`, `OPS-13`, `OPS-2`, `OPS-3`, `OPS-6`, `OPS-8`, `QA-1`, `QRY-1`, `QS-2`, `QS-3`, `REL-1`, `REL-2`, `REL-4`, `REL-7`, `SEC-22`, `SEC-34`, `SEC-4`, `SEC-40`, `SEC-50`, `SEC-7`, `SRC-15`, `SRC-18`, `SRC-2`, `SRC-22`, `SRC-23`, `SRC-24`, `SRC-25`, `SRC-26`, `SRC-27`, `SRC-28`, `SRC-30`, `SRC-31`, `SRC-33`, `SRC-34`, `SRC-5`, `VER-1`
 
 ## Dates
 
@@ -609,6 +610,7 @@ builds it (`AGENTS.md`).
 | [`DATA-17`](specs/data-17.md) | More formats, more files, bigger files | Next | M |
 | [`DATA-18`](specs/data-18.md) | Column types on upload | Next | M |
 | [`DATA-19`](specs/data-19.md) | Uploaded tables feed pipelines and dashboards | Next | M |
+| [`DATA-35`](specs/data-35.md) | Folders for uploaded files | Next | S |
 | [`SRC-4`](specs/src-4.md) | More databases, with live change capture | Next | L |
 | [`SRC-3`](specs/src-3.md) | Connectors for business apps | Later | L |
 

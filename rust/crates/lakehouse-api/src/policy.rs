@@ -889,6 +889,13 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("PUT",  "/api/uploads/{id}/parts/{n}",  Policy::RequiresPermission("connector:manage")),
     ("GET",  "/api/uploads/{id}/parts",      Policy::RequiresPermission("connector:manage")),
     ("POST", "/api/uploads/{id}/complete",   Policy::RequiresPermission("connector:manage")),
+    // DATA-35 decision 4: folders for uploaded files, the same permission as the
+    // uploads they group. Tenant scope is the store's (`upload_folders`, SEC-16).
+    ("GET",  "/api/uploads/folders",         Policy::RequiresPermission("connector:manage")),
+    ("POST", "/api/uploads/folders",         Policy::RequiresPermission("connector:manage")),
+    ("PATCH", "/api/uploads/folders/{id}",   Policy::RequiresPermission("connector:manage")),
+    ("DELETE", "/api/uploads/folders/{id}",  Policy::RequiresPermission("connector:manage")),
+    ("POST", "/api/uploads/move",            Policy::RequiresPermission("connector:manage")),
 
     // ── Uploaded maps (`BI-16` part C2b, plan D5): a map is visible to
     //    everyone who can make charts, so reading is `RequiresAuth`; only
