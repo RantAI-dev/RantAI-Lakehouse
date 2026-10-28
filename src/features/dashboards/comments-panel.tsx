@@ -63,6 +63,9 @@ export function CommentsPanel({ board }: { readonly board: string }) {
   const [text, setText] = React.useState("");
   const [picked, setPicked] = React.useState<CommentPerson[]>([]);
   const [people, setPeople] = React.useState<CommentPerson[]>([]);
+  // BI-19 owner QA 2026-10-28, QA-4: the `@word` whose lookup has finished, so "nobody matches"
+  // is never said while the debounced request is still pending (or after it failed).
+  const [lookedUp, setLookedUp] = React.useState<string | null>(null);
   const [busy, setBusy] = React.useState(false);
   const [message, setMessage] = React.useState<string | null>(null);
   const [editing, setEditing] = React.useState<{ id: string; text: string } | null>(null);
@@ -72,13 +75,13 @@ export function CommentsPanel({ board }: { readonly board: string }) {
   // the server, so wait for a pause in typing and cancel the lookup a newer
   // keystroke makes useless.
   React.useEffect(() => {
-    if (word === null) { setPeople([]); return; }
+    if (word === null) { setPeople([]); setLookedUp(null); return; }
     const controller = new AbortController();
     const timer = setTimeout(() => {
       dashboardService
         .commentPeople(board, word, controller.signal)
-        .then((found) => { if (!controller.signal.aborted) setPeople(found); })
-        .catch(() => { if (!controller.signal.aborted) setPeople([]); });
+        .then((found) => { if (!controller.signal.aborted) { setPeople(found); setLookedUp(word); } })
+        .catch(() => { if (!controller.signal.aborted) { setPeople([]); setLookedUp(null); } });
     }, PICKER_DEBOUNCE_MS);
     return () => { clearTimeout(timer); controller.abort(); };
   }, [board, word]);
@@ -95,12 +98,15 @@ export function CommentsPanel({ board }: { readonly board: string }) {
     } finally { setBusy(false); }
   }
 
+  const notifyIds = mentionedIds(text, picked);
+  const notifyNames = picked.filter((p) => notifyIds.includes(p.id)).map((p) => p.name);
+  const nobodyMatches = word !== null && word !== "" && lookedUp === word && people.length === 0;
   const trimmed = text.trim();
   const tooLong = trimmed.length > MAX_COMMENT_CHARS;
 
   function post() {
     void act(
-      () => dashboardService.postComment({ board, body: trimmed, mentions: mentionedIds(text, picked) }),
+      () => dashboardService.postComment({ board, body: trimmed, mentions: notifyIds }),
       () => { setText(""); setPicked([]); },
     );
   }
@@ -192,6 +198,14 @@ export function CommentsPanel({ board }: { readonly board: string }) {
               </li>
             ))}
           </ul>
+        ) : null}
+        {nobodyMatches ? (
+          <p role="status" className="text-xs text-muted-foreground">
+            Nobody who can see this dashboard matches “{word}”.
+          </p>
+        ) : null}
+        {notifyNames.length > 0 ? (
+          <p className="text-xs text-muted-foreground">Will notify: {notifyNames.join(", ")}</p>
         ) : null}
         <div className="flex items-center justify-between">
           <span className={tooLong ? "text-xs text-destructive" : "text-xs text-muted-foreground"}>

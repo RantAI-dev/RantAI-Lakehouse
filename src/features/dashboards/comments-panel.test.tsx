@@ -126,6 +126,33 @@ describe("CommentsPanel", () => {
     expect(calls.find((c) => c.url.includes("/people"))!.url).toContain("q=bob")
   })
 
+  it("lists who will be notified once a person is picked (BI-19 QA-4)", async () => {
+    stub([])
+    render(<CommentsPanel board="b_1" />)
+    const box = (await screen.findByLabelText("Write a comment")) as HTMLTextAreaElement
+    expect(screen.queryByText(/Will notify/)).toBeNull()
+    fireEvent.change(box, { target: { value: "hi @bo" } })
+    fireEvent.click(await screen.findByText("Bob"))
+    expect(screen.getByText("Will notify: Bob")).toBeTruthy()
+    // Deleting the name from the text drops the mention, and the line with it.
+    fireEvent.change(box, { target: { value: "hi" } })
+    expect(screen.queryByText(/Will notify/)).toBeNull()
+  })
+
+  it("says nobody matches an @word only after the lookup finished empty (BI-19 QA-4)", async () => {
+    global.fetch = mock(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes("/comments/people")) return json({ items: [] })
+      return json({ comments: [], truncated: false })
+    }) as unknown as typeof fetch
+    render(<CommentsPanel board="b_1" />)
+    const box = await screen.findByLabelText("Write a comment")
+    fireEvent.change(box, { target: { value: "hi @zed" } })
+    // The debounced request has not run yet: no claim.
+    expect(screen.queryByText(/Nobody who can see/)).toBeNull()
+    expect(await screen.findByText("Nobody who can see this dashboard matches “zed”.")).toBeTruthy()
+  })
+
   it("says when older comments are not shown (BI-19 E review E-6c)", async () => {
     stub([COMMENT], undefined, true)
     render(<CommentsPanel board="b_1" />)
