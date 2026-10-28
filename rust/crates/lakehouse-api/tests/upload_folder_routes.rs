@@ -204,7 +204,7 @@ async fn a_folder_is_made_listed_renamed_moved_and_deleted_and_each_is_audited()
             &bayu,
             "PATCH",
             &format!("/api/uploads/folders/{archive}"),
-            Some(json!({ "name": "Old" })),
+            Some(json!({ "name": "  Old  " })),
         )
         .await;
     assert_eq!(renamed.status, StatusCode::OK, "{}", renamed.text);
@@ -252,6 +252,15 @@ async fn a_folder_is_made_listed_renamed_moved_and_deleted_and_each_is_audited()
             "upload.folder.delete",
         ]
     );
+    // The rename audit records the name the folder ended up with, not the one that
+    // was typed: the store trims it (`PR #259 review SHOULD-FIX 5`).
+    let rename = stack
+        .audit()
+        .await
+        .into_iter()
+        .find(|a| a.0 == "upload.folder.rename")
+        .unwrap();
+    assert_eq!(rename.3["name"], "Old");
 }
 
 /// Every rule answers its own fixed sentence and changes nothing.

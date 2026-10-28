@@ -281,7 +281,10 @@ const TABLE_NAME_RULE: &str = "Table names start with a lower-case letter and us
 const MODE_RULE: &str = "mode must be replace or append.";
 const ALSO_UPLOADS_RULE: &str =
     "alsoUploads must be a list of at most 9 upload ids, each used once, none of them this upload.";
-const FOLDER_ID_RULE: &str = "folderId must be text or null.";
+/// The sentence a `folderId` that is neither text nor null gets. One sentence for
+/// the ingest and for the move (`PR #259 review SHOULD-FIX 5`, rule 4): the
+/// folders' own routes read this one.
+pub(super) const FOLDER_ID_RULE: &str = "folderId must be text or null.";
 const OTHER_BUSY: &str = "One of the other files is already being loaded.";
 const ENCODING_RULE: &str = "encoding must be utf-8 or utf-16.";
 const DELIMITER_RULE: &str = "delimiter must be a comma, a semicolon, a tab or a pipe.";

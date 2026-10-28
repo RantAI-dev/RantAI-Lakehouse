@@ -33,7 +33,7 @@ use lakehouse_store::upload_folders::{self, FolderError, FolderPatch, ParentChan
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
-use super::{BODY_NOT_AN_OBJECT, NOT_FOUND, pool, record_audit};
+use super::{BODY_NOT_AN_OBJECT, FOLDER_ID_RULE, NOT_FOUND, pool, record_audit};
 use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::state::AppState;
@@ -52,7 +52,6 @@ const NAME_TEXT: &str = "name must be text.";
 const PARENT_TEXT: &str = "parentId must be text or null.";
 const NOTHING_TO_CHANGE: &str = "Send a name, a parentId, or both.";
 const UPLOAD_IDS_RULE: &str = "uploadIds must be a list of 1 to 500 upload ids.";
-const FOLDER_ID_RULE: &str = "folderId must be text or null.";
 
 /// The most files one move names. The tab lists at most 100 at a time, so this is
 /// a bound on the request, not a product number; it matches the store's listing
@@ -274,8 +273,10 @@ pub async fn update(
     .await
     .map_err(refusal)?;
     // One event per kind of change, so the audit log reads "renamed" and "moved".
-    if let Some(name) = name {
-        let args = json!({ "name": name });
+    if name.is_some() {
+        // The name the folder ended up with, not the one that was typed: the
+        // store trims it (`PR #259 review SHOULD-FIX 5`).
+        let args = json!({ "name": changed.name });
         record_audit(
             pool,
             folder_audit_event(
