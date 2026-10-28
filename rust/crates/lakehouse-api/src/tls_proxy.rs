@@ -136,7 +136,7 @@ fn self_signed_acceptor() -> (TlsAcceptor, String) {
         .expect("a self-signed certificate for the test proxy");
     let certificate = certified.cert.der().clone();
     let key = rustls::pki_types::PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(
-        certified.key_pair.serialize_der(),
+        certified.signing_key.serialize_der(),
     ));
     let config = rustls::ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),

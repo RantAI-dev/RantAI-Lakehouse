@@ -53,6 +53,11 @@ const CERTIFICATE_NAME: &str = "db.internal";
 
 /// A certificate authority minted for one test.
 struct TestCa {
+    /// The CA's own parameters. `rcgen` 0.14 unbundles the parameters from
+    /// the issued certificate, so signing a leaf needs them again: the
+    /// issuer's distinguished name, key identifier method and key usages
+    /// come from here, not from the CA's certificate.
+    params: rcgen::CertificateParams,
     certificate: rcgen::Certificate,
     key: rcgen::KeyPair,
 }
@@ -67,7 +72,11 @@ impl TestCa {
             .push(rcgen::DnType::CommonName, common_name);
         let key = rcgen::KeyPair::generate().expect("a CA key pair");
         let certificate = params.self_signed(&key).expect("a self-signed CA");
-        Self { certificate, key }
+        Self {
+            params,
+            certificate,
+            key,
+        }
     }
 
     /// A server certificate for [`CERTIFICATE_NAME`], signed by this CA.
@@ -78,8 +87,12 @@ impl TestCa {
             .distinguished_name
             .push(rcgen::DnType::CommonName, CERTIFICATE_NAME);
         let key = rcgen::KeyPair::generate().expect("a server key pair");
+        // `rcgen` 0.14 signs through an `Issuer` -- the issuer's own
+        // parameters together with its signing key -- instead of taking
+        // the issuer's certificate and key as two separate arguments.
+        let issuer = rcgen::Issuer::from_params(&self.params, &self.key);
         let certificate = params
-            .signed_by(&key, &self.certificate, &self.key)
+            .signed_by(&key, &issuer)
             .expect("a certificate signed by the test CA");
         (certificate, key)
     }

@@ -248,9 +248,13 @@ rsa = "0.9"
 # history (SEC-36) reads a committed private key as a leak, so the chain is
 # minted at test time. `rcgen` with `ring` and no `crypto`/`pem` defaults,
 # matching this workspace's one rustls provider story (the `rustls` feature
-# `sqlx-core` turns on); MIT OR Apache-2.0. Its `yasna` dependency is the
-# only package it adds to `Cargo.lock`.
-rcgen = { version = "0.13", default-features = false, features = ["ring"] }
+# `sqlx-core` turns on); MIT OR Apache-2.0. 0.14 compiles no crate the lock
+# did not already carry -- `ring`, `time` and `rustls-pki-types` are in it,
+# and `yasna` moves 0.5.2 -> 0.6.0 -- but it does add entries for the
+# optional `x509-parser` 0.18.1 (with its tree) and `bit-vec` 0.9.1, plus a
+# second `nom` (7.1.3 beside 8.0.0). None of those is built: `rcgen` and
+# `yasna` only name them weakly (`x509-parser?/verify`, `bit-vec?/std`).
+rcgen = { version = "0.14", default-features = false, features = ["ring"] }
 
 tempfile = { workspace = true }
 # The terminator's own TLS server side, and the provider named explicitly so
