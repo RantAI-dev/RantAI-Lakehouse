@@ -62,34 +62,36 @@
 //! VM on 2026-10-26 (`OPS-13`).
 //!
 //! So this crate sweeps them: every 30 seconds it drops the databases
-//! whose name carries one of the three test prefixes, that nobody is
-//! connected to, and that were already idle on the previous pass. A
-//! database that was created a moment ago and is not connected to yet is
-//! left alone on the first pass, and a database with an open connection is
-//! left alone altogether.
+//! whose name carries one of the three test prefixes and that were idle
+//! at two passes in a row. A database is idle at a pass when no backend
+//! was connected to it at that pass: `pg_stat_activity` holds one row
+//! per backend, so a database with an open connection is never idle. A
+//! database that was created a moment ago and is not connected to yet
+//! is seen idle for the first time and left alone.
 //!
 //! Nothing else on the server is ever dropped: not `postgres`, not
 //! `template0`/`template1`, not a database whose name carries none of the
 //! three prefixes. The sweep never fails a test — a failure is reported on
 //! stderr, once per process, and the next pass tries again.
 //!
-//! The sweep is not a cleanup that can only help: it can drop a database
-//! that a running test still needs. A test must therefore not go 30
-//! seconds without touching its database. The sweep runs every 30
-//! seconds and drops a database that was idle on two passes in a row, so
-//! a test that creates a database and then leaves it alone for longer
-//! than that has its database dropped underneath it, and the next query
-//! fails with "database ... does not exist". Keep a query running
-//! against the database, or keep the test short enough that the sweep's
-//! next pass does not see the database as idle (`OPS-13` review fix
+//! The sweep is not a cleanup that can only help: it can drop a
+//! database that a running test still needs. A database that had no
+//! backend at two passes in a row is dropped, and the passes are 30
+//! seconds apart, so a database nobody touches is taken away between
+//! 30 and 60 seconds after its last query. A test that leaves its
+//! database alone that long has it dropped underneath it, and the next
+//! query fails with "database ... does not exist". Keep a query running
+//! against the database, or keep the test short enough that the sweep
+//! does not see the database as idle twice (`OPS-13` review fix
 //! (SHOULD-FIX 2): the section did not state the rule the sweep imposes
 //! on a test).
 //!
 //! A database can look idle while its test is still running. sqlx's test
 //! pool closes an idle connection after one second (`idle_timeout = 1 s`,
 //! `sqlx-postgres-0.9.0/src/testing/mod.rs:175-179`), so a database that
-//! nobody touches has no backend on it, and the sweep cannot tell an
-//! abandoned database from a paused test.
+//! nobody touches has no backend on it at the next pass — idle in the
+//! sense above — and the sweep cannot tell an abandoned database from a
+//! paused test.
 //!
 //! A connection that is held open does keep the database alive:
 //! `pg_stat_activity` shows the backend of an open connection, and a
@@ -102,14 +104,17 @@
 //! state, so the sweep of one process can drop a database that a test of
 //! another process has just created and has not connected to yet.
 //!
-//! That is the rule above, seen from the other side: a test that
-//! connects to its database, and keeps touching it, is safe against the
-//! sweep of its own process and against the sweep of another process
-//! alike. A test that cannot connect right away cannot hold its
-//! database against either of them: it must not leave the database
-//! unconnected for more than about 30 seconds, or a sweep may take it
-//! away. The tests of this crate therefore take a turn, one test at a
-//! time, so that they do not drop each other's databases.
+//! That is the rule above, seen from the other side: a database that
+//! still has a backend on it is left alone by every sweep, its own
+//! process's and another process's alike. A backend lasts only as long
+//! as its connection is open, and the pool closes an idle connection
+//! after one second, so a test that pauses for more than about a second
+//! between two queries has no backend on its database in between. A test
+//! must therefore not leave its database without a backend for two
+//! passes in a row — between 30 and 60 seconds — or a sweep, its own
+//! process's or another process's, may take it away. The tests of this
+//! crate therefore take a turn, one test at a time, so that they do not
+//! drop each other's databases.
 //!
 //! # Requirements
 //!
