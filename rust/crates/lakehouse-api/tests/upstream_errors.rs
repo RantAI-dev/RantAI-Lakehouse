@@ -57,12 +57,28 @@ async fn send(router: &axum::Router, request: Request<Body>) -> (StatusCode, Str
 #[tokio::test]
 async fn the_public_dashboard_link_never_carries_the_database_text() {
     let ch = failing_clickhouse().await;
-    let TestApp { router, .. } = app_over(&ch).await;
+    let TestApp { router, pool } = app_over(&ch).await;
+    // PR #235 CI: BI-19 made a public link a Postgres record, and an unknown
+    // token answers 404 before `ClickHouse` is asked anything, so the old
+    // "some-token" no longer reached the data path this test exists for
+    // (SEC-11). A live link without a password sends the request on to the
+    // board read, which fails over the stand-in.
+    let token = "p_sec11_live_link_token";
+    lakehouse_store::public_links::replace(
+        &pool,
+        "b_sec11",
+        token,
+        time::OffsetDateTime::now_utc() + time::Duration::days(1),
+        None,
+        None,
+    )
+    .await
+    .expect("store a live public link");
 
     let (status, body) = send(
         &router,
         Request::builder()
-            .uri("/api/public/dashboard/some-token")
+            .uri(format!("/api/public/dashboard/{token}"))
             .body(Body::empty())
             .expect("build request"),
     )
@@ -72,8 +88,15 @@ async fn the_public_dashboard_link_never_carries_the_database_text() {
     assert!(!body.contains(MARKER), "the database text leaked: {body}");
     assert!(!body.contains("version 0.0.0"), "{body}");
     let json: Value = serde_json::from_str(&body).expect("a JSON body");
-    assert_eq!(json["error"], "The database request failed.");
-    assert!(json["errorId"].is_string(), "{body}");
+    // PR #235 CI: `ApiError::Internal` renders `{ "error": "<message>
+    // Reference: <id>" }` (the `UpstreamFailure` Display); there is no
+    // separate `errorId` field on this route, so the id is read from the
+    // message.
+    let message = json["error"].as_str().expect("an error message");
+    let reference = message
+        .strip_prefix("The database request failed. Reference: ")
+        .unwrap_or_else(|| panic!("not the fixed message with a reference: {body}"));
+    assert!(!reference.trim().is_empty(), "{body}");
 }
 
 #[tokio::test]

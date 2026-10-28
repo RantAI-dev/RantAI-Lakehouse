@@ -9,11 +9,22 @@ describe("toolsFromCaps", () => {
     expect(toolsFromCaps(new Set(["data"]), "build")).toContain("ask_user")
   })
 
+  it("offers the query-limit tools with Query Data in both modes (BI-5)", () => {
+    for (const mode of ["ask", "build"] as const) {
+      for (const tool of ["get_query_limits", "stop_query"]) expect(toolsFromCaps(new Set(["data"]), mode)).toContain(tool)
+    }
+  })
+
   it("offers the read-only metric tools with Query Data in both modes (AI-7)", () => {
     for (const mode of ["ask", "build"] as const) {
       for (const tool of ["list_metrics", "describe_metric", "query_metric"]) expect(toolsFromCaps(new Set(["data"]), mode)).toContain(tool)
       expect(toolsFromCaps(new Set(["data"]), mode)).not.toContain("create_metric")
     }
+  })
+
+  it("offers set_cache_rule with the Dashboard Builder in build mode and not in ask mode (BI-4)", () => {
+    expect(toolsFromCaps(new Set(["dashboard"]), "build")).toContain("set_cache_rule")
+    expect(toolsFromCaps(new Set(["dashboard"]), "ask")).not.toContain("set_cache_rule")
   })
 
   it("does not offer ask_user when Query Data is off", () => {
@@ -68,5 +79,46 @@ describe("the dashboard capability against the server's tool list", () => {
 
   it("names no tool the server does not have", () => {
     for (const name of toolsFromCaps(new Set(["dashboard"]), "build")) expect(serverTools).toContain(name)
+  })
+})
+
+// BI-1 / AI-10: the export tools, named here or they never reach the model.
+describe("the export tools", () => {
+  const fixture = JSON.parse(
+    readFileSync(`${process.cwd()}/rust/crates/lakehouse-api/tests/fixtures/tool_schemas.json`, "utf8")
+  ) as { function: { name: string } }[]
+  const serverTools = fixture.map((t) => t.function.name)
+
+  it("are on the server and offered with Query Data in both modes and with the Dashboard Builder", () => {
+    expect(serverTools).toContain("export_dashboard")
+    expect(serverTools).toContain("export_chart")
+    for (const mode of ["ask", "build"] as const) {
+      for (const tool of ["export_dashboard", "export_chart"]) expect(toolsFromCaps(new Set(["data"]), mode)).toContain(tool)
+    }
+    for (const tool of ["export_dashboard", "export_chart"]) expect(toolsFromCaps(new Set(["dashboard"]), "build")).toContain(tool)
+  })
+})
+
+// RPT-1 / AI-10: the scheduled-report tools, named here or they never reach the model.
+describe("the scheduled-report tools", () => {
+  const fixture = JSON.parse(
+    readFileSync(`${process.cwd()}/rust/crates/lakehouse-api/tests/fixtures/tool_schemas.json`, "utf8")
+  ) as { function: { name: string } }[]
+  const serverTools = fixture.map((t) => t.function.name)
+  const writers = ["create_report_subscription", "update_report_subscription", "delete_report_subscription"]
+
+  it("are on the server", () => {
+    for (const tool of [...writers, "list_report_subscriptions"]) expect(serverTools).toContain(tool)
+  })
+
+  it("lists in both modes, and creates, changes and deletes in build mode only", () => {
+    for (const mode of ["ask", "build"] as const) {
+      expect(toolsFromCaps(new Set(["data"]), mode)).toContain("list_report_subscriptions")
+    }
+    for (const tool of writers) {
+      expect(toolsFromCaps(new Set(["dashboard"]), "build")).toContain(tool)
+      expect(toolsFromCaps(new Set(["dashboard"]), "ask")).not.toContain(tool)
+      expect(toolsFromCaps(new Set(["data"]), "build")).not.toContain(tool)
+    }
   })
 })

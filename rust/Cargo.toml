@@ -34,6 +34,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 indexmap = { version = "2", features = ["serde"] }
 hmac = "0.13"
 sha2 = "0.11"
+# In-process store of remembered dashboard results (`BI-4` part B). Already in
+# `Cargo.lock` (0.12.16, via `iceberg`) with the `future` feature, so it adds no crate.
+moka = { version = "0.12.16", default-features = false, features = ["future"] }
 base64 = "0.23"
 rand = "0.10"
 # `SRC-12` decision 4: AES-256-GCM for managed connector credentials at rest
@@ -54,6 +57,12 @@ url = "2"
 # first DIRECT use, so it needs its own workspace entry.
 ipnet = "2"
 time = { version = "0.3", features = ["formatting", "parsing", "serde"] }
+# `RPT-1` (`lakehouse-store::report_schedule`): zone-aware schedule maths needs a
+# time zone database in Rust, and the workspace had none (the zone list lives
+# in the engine). `jiff` was already in `Cargo.lock` through `serde_with`, with
+# its bundled database `jiff-tzdb`, so this adds no package; `tzdb-bundle-always`
+# makes the schedule independent of the container image having `tzdata`.
+jiff = { version = "0.2", default-features = false, features = ["std", "tzdb-bundle-always"] }
 lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "rustls-tls", "builder", "tokio1-rustls-tls"] }
 wiremock = "0.6"
 tempfile = "3"

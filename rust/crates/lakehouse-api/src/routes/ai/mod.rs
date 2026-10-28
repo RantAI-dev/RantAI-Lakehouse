@@ -913,7 +913,13 @@ async fn run_chat(
             // have the call silently dropped) so it can tell the user
             // instead of assuming a write (or a read it wasn't allowed)
             // it never got.
-            let gate_result = gate::decide_by_name(is_build, perms, &call.function.name, &args);
+            // RPT-1 review fix (BLOCKER) R2: who an update leaves receiving the
+            // report is looked up here, before the gate, and given to it as a
+            // server-side fact.
+            let audience =
+                tools::report_audience(state, principal, &call.function.name, &args).await;
+            let gate_result =
+                gate::decide_by_name(is_build, perms, &call.function.name, &args, audience);
             // plan 17: with an allowlist, the tools the console named are the
             // only ones a call may reach. The check is against the offered
             // list, not the request's strings, so a tool the switch removed,
@@ -932,18 +938,9 @@ async fn run_chat(
                     };
                     let (_, resource_id) =
                         audit::resource_for(&call.function.name, &args, &json!({}));
-                    let redacted = audit::redact(&Value::Object(args.clone()));
-                    let actor =
-                        principal.map_or_else(|| "unknown".to_owned(), |p| p.display_name.clone());
-                    let approval_result = gate::create_write_high_approval(
-                        state.pg.as_deref(),
-                        &actor,
-                        spec,
-                        &args,
-                        &redacted,
-                        resource_id.as_deref(),
-                    )
-                    .await;
+                    let approval_result =
+                        request_approval(state, principal, spec, &args, resource_id.as_deref())
+                            .await;
                     let (run_id, approval_id) = if approval_result
                         .get("needs_approval")
                         .and_then(Value::as_bool)
@@ -1164,7 +1161,13 @@ fn stream_chat(state: AppState, principal: Option<Principal>, run: PreparedChat)
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
     let (mut writer, reader) = tokio::io::duplex(16 * 1024);
 
-    tokio::spawn(async move {
+    // BI-5 review B2: the chat's tools (`run_sql`, `stop_query`) run in this
+    // spawned task, which does not inherit the request's task-local run. Without
+    // the run below they would use the compiled-in limits, a nil principal and
+    // a query id nobody's Stop can match. The run is taken here, in the
+    // request's task, and handed to the spawned one.
+    let query_run = crate::query_limits::QueryRun::current_or_detached();
+    tokio::spawn(crate::query_limits::scope(query_run, async move {
         let last = match run_chat(&state, principal.as_ref(), run, Some(&tx)).await {
             Ok(body) => json!({ "type": "done", "body": body }),
             Err(err) => json!({
@@ -1174,7 +1177,7 @@ fn stream_chat(state: AppState, principal: Option<Principal>, run: PreparedChat)
             }),
         };
         let _ = tx.send(last);
-    });
+    }));
     // Dropping `rx` when a write fails (client gone) makes the loop's next
     // `report` return false.
     tokio::spawn(async move {
@@ -1256,21 +1259,24 @@ pub async fn tool_call(
     };
     let is_build = parsed.mode.as_deref() == Some("build");
 
-    let gate_result = gate::decide(is_build, perms, spec, &parsed.args);
+    // RPT-1 review fix (BLOCKER) R2: as in the chat loop, the audience of a
+    // report update is looked up before the gate.
+    let audience = tools::report_audience(
+        &state,
+        principal.as_ref().map(|Extension(p)| p),
+        &parsed.tool,
+        &parsed.args,
+    )
+    .await;
+    let gate_result = gate::decide_with(is_build, perms, spec, &parsed.args, audience);
     let (result, outcome, run_id, approval_id) = if let Some(refusal) = gate_result {
         if gate::is_write_high_pending(&refusal) {
             let (_, resource_id) = audit::resource_for(&parsed.tool, &parsed.args, &json!({}));
-            let redacted = audit::redact(&Value::Object(parsed.args.clone()));
-            let actor = principal.as_ref().map_or_else(
-                || "unknown".to_owned(),
-                |Extension(p)| p.display_name.clone(),
-            );
-            let approval_result = gate::create_write_high_approval(
-                state.pg.as_deref(),
-                &actor,
+            let approval_result = request_approval(
+                &state,
+                principal.as_ref().map(|Extension(p)| p),
                 spec,
                 &parsed.args,
-                &redacted,
                 resource_id.as_deref(),
             )
             .await;
@@ -1335,6 +1341,39 @@ pub async fn tool_call(
         ApiJson(json!({ "tool": parsed.tool, "outcome": outcome, "result": result })),
     )
         .into_response()
+}
+
+/// Create the approval for a `WriteHigh` call that [`gate::decide`] flagged, and
+/// return what the model and the console see. The one copy for the chat loop and
+/// `POST /api/ai/tool`.
+///
+/// `RPT-1`: the report tools check the requester's rights now, before any
+/// approval exists, and carry the requester into the stored arguments
+/// (`ownerId`, see `tools::approval_args`); every other tool's arguments are
+/// stored as they are. A refusal is returned instead of an approval.
+async fn request_approval(
+    state: &AppState,
+    principal: Option<&Principal>,
+    spec: &registry::ToolSpec,
+    args: &Map<String, Value>,
+    resource_id: Option<&str>,
+) -> Value {
+    let actor = principal.map_or_else(|| "unknown".to_owned(), |p| p.display_name.clone());
+    match tools::approval_args(state, principal, spec.name, args).await {
+        Ok(stored) => {
+            let redacted = audit::redact(&Value::Object(stored.clone()));
+            gate::create_write_high_approval(
+                state.pg.as_deref(),
+                &actor,
+                spec,
+                &stored,
+                &redacted,
+                resource_id,
+            )
+            .await
+        }
+        Err(refusal) => refusal,
+    }
 }
 
 /// Builds the `/api/ai/chat` response body, matching the TypeScript's

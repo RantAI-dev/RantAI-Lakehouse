@@ -21,6 +21,7 @@ mod connector_secret_store;
 mod csv_export;
 mod csv_safe;
 mod error;
+mod export;
 mod gold_export;
 mod gold_export_history;
 mod gold_lock;
@@ -30,10 +31,13 @@ mod json;
 mod lakehouse_catalog;
 mod lakekeeper_token;
 mod next_run;
+mod pdf;
 mod pipeline_lag;
 mod pipeline_source;
 mod policy;
 mod policy_engine;
+mod query_limits;
+mod result_cache;
 mod routes;
 mod rustfs_client;
 mod secret_crypto;
@@ -44,6 +48,7 @@ mod sql_rewrite;
 mod state;
 mod tenant;
 mod tenant_scope;
+mod tile_pool;
 mod transform_grammar;
 mod upload_formats;
 mod upload_limits;
@@ -175,6 +180,12 @@ async fn run() -> anyhow::Result<()> {
     // SRC-11 D5/D6: the daily removal of run log lines and attempts older
     // than 30 days.
     spawn_run_log_cleanup(&state);
+    // RPT-1 D3: the scheduled-report runner (a tick every minute, a daily
+    // 90-day cleanup of deliveries).
+    routes::report_runner::spawn(&state);
+    // BI-19 part A (D2): the public links dashboards carried before links
+    // moved to Postgres, copied once, each expiring in 30 days.
+    routes::public_links::spawn_legacy_copy(&state);
     // DATA-17 decision 8: abort and remove chunked uploads nobody finished.
     spawn_upload_session_sweep(&state);
 

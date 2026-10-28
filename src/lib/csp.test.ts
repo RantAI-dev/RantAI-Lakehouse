@@ -94,9 +94,12 @@ describe("contentSecurityPolicy", () => {
       nonce: NONCE,
       frameAncestors: ["https://app.customer.example", "http://localhost:3000"],
     })
-    expect(policy.endsWith("frame-ancestors https://app.customer.example http://localhost:3000")).toBe(true)
-    // A frame origin list that is not plain origins is still none.
-    expect(contentSecurityPolicy({ nonce: NONCE, frameAncestors: ["*"] })).toBe(NO_SITES)
+    // BI-26 R4: the console itself (the Share dialog's preview) always may.
+    expect(policy.endsWith("frame-ancestors 'self' https://app.customer.example http://localhost:3000")).toBe(true)
+    // A list with nothing acceptable is only 'self' (an embed whose board lists
+    // no site); no list at all (every other page, or an unreadable answer) is none.
+    expect(contentSecurityPolicy({ nonce: NONCE, frameAncestors: ["*"] }).endsWith("frame-ancestors 'self'")).toBe(true)
+    expect(contentSecurityPolicy({ nonce: NONCE, frameAncestors: null })).toBe(NO_SITES)
   })
 
   it("development adds 'unsafe-eval' and the HMR websocket; production never has them", () => {

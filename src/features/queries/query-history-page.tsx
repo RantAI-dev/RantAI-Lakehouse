@@ -7,7 +7,7 @@ import { EmptyState, ErrorState, LoadingSkeleton } from "@/components/patterns/p
 import { StatusBadge } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
-import { useService } from "@/hooks/use-service"
+import { useService, useServiceAction } from "@/hooks/use-service"
 import { formatDateTime, formatDuration } from "@/lib/format"
 import { HISTORY_PAGE_LIMIT, historyQueryString } from "@/lib/history-query-params"
 import { cn } from "@/lib/utils"
@@ -89,18 +89,34 @@ export function QueryHistoryPage() {
   // filter is a new question, so what an older question appended is
   // dropped when the query string changes.
   const [older, setOlder] = React.useState<QueryHistoryItem[]>([])
-  const [loadingMore, setLoadingMore] = React.useState(false)
-  const [moreError, setMoreError] = React.useState<string | null>(null)
   // Whether the newest answer still promises an older page: only a page
   // of HISTORY_PAGE_LIMIT rows does. A shorter page — including the
   // first — was the last one, and the button stays hidden.
   const [lastPageFull, setLastPageFull] = React.useState(false)
 
+  // The older page is a call the person asks for, so it goes through the
+  // action hook: the button reads its pending state, and a refusal
+  // carries the server's sentence.
+  const loadMoreAction = useServiceAction(
+    (signal, nextFilter: QueryHistoryFilter, before: { at: string; id: string }) =>
+      queryService.listHistory({ ...nextFilter, before }, signal),
+  )
+  const { reset: resetLoadMore } = loadMoreAction
+
+  // The question the older page was asked for. The answer arrives after
+  // the render that asked for it, so the question is kept in a ref; it is
+  // written outside the render, never during it.
+  const queryRef = React.useRef(query)
+
   React.useEffect(() => {
+    // The question changed: what the older question appended is dropped,
+    // the refusal that belonged to it goes with it, and the ref remembers
+    // the new question for the guard in loadMore.
+    queryRef.current = query
     setOlder([])
     setLastPageFull(false)
-    setMoreError(null)
-  }, [query])
+    resetLoadMore()
+  }, [query, resetLoadMore])
 
   // The first page lands through the hook, not through loadMore, so its
   // fullness is read here.
@@ -115,31 +131,18 @@ export function QueryHistoryPage() {
     [state.status, state.data, older],
   )
 
-  const queryRef = React.useRef(query)
-  queryRef.current = query
-
   async function loadMore() {
     const last = rows[rows.length - 1]
-    if (!last || loadingMore) return
-    setLoadingMore(true)
-    setMoreError(null)
+    if (!last || loadMoreAction.status === "pending") return
     const forQuery = queryRef.current
-    try {
-      const next = await queryService.listHistory({
-        ...filter,
-        before: { at: last.at, id: last.id },
-      })
-      if (queryRef.current !== forQuery) return // the question changed under us
-      const seen = new Set(rows.map((r) => r.id))
-      setOlder((prev) => [...prev, ...next.filter((r) => !seen.has(r.id))])
-      setLastPageFull(next.length >= HISTORY_PAGE_LIMIT)
-    } catch (error) {
-      // The page keeps the rows it has; the message says why there is no
-      // older page yet.
-      setMoreError(error instanceof Error ? error.message : String(error))
-    } finally {
-      setLoadingMore(false)
-    }
+    // The hook owns the call: it aborts it, holds the refusal, and hands
+    // back the page. A failure resolves to null and keeps the rows.
+    const next = await loadMoreAction.run(filter, { at: last.at, id: last.id })
+    if (next === null) return
+    if (queryRef.current !== forQuery) return // the question changed under us
+    const seen = new Set(rows.map((r) => r.id))
+    setOlder((prev) => [...prev, ...next.filter((r) => !seen.has(r.id))])
+    setLastPageFull(next.length >= HISTORY_PAGE_LIMIT)
   }
 
   const hasFilter = query !== ""
@@ -300,18 +303,20 @@ export function QueryHistoryPage() {
           </div>
         )
       ) : null}
-      {moreError ? <p className="text-sm text-destructive">{moreError}</p> : null}
+      {loadMoreAction.status === "error" ? (
+        <p className="text-sm text-destructive">{loadMoreAction.error.message}</p>
+      ) : null}
       {state.status === "success" && rows.length > 0 && lastPageFull ? (
         <Button
           variant="outline"
           size="sm"
           className="self-center"
-          disabled={loadingMore}
+          disabled={loadMoreAction.status === "pending"}
           onClick={() => {
             void loadMore()
           }}
         >
-          {loadingMore ? "Loading…" : "Load more"}
+          {loadMoreAction.status === "pending" ? "Loading…" : "Load more"}
         </Button>
       ) : null}
     </div>

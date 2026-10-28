@@ -1,4 +1,5 @@
 import type { FilterDef } from "../clients/bi-store"
+import type { TileLimit } from "./settings"
 
 /**
  * Kontrak untuk halaman DAFTAR dashboard (`/dashboards/browse`) dan untuk
@@ -132,7 +133,17 @@ export type DashboardService = {
    * a sample token, what has been withdrawn and which sites may frame it.
    * Needs `dashboard:read`.
    */
-  getEmbedInfo(board: string, signal?: AbortSignal): Promise<EmbedInfo>
+  getEmbedInfo(board: string, signal?: AbortSignal, chart?: string): Promise<EmbedInfo>
+  /** `BI-26`: save each filter's embed mode. Needs `dashboard:write`. */
+  setEmbedFilterModes(board: string, modes: Record<string, FilterMode>, signal?: AbortSignal): Promise<void>
+  /** `BI-26`: the charts of a dashboard, for the chart picker of the embed section. */
+  listBoardCharts(board: string, signal?: AbortSignal): Promise<BoardChart[]>
+  /** `BI-19` part A. Needs `dashboard:write`. */
+  getPublicLink(board: string, signal?: AbortSignal): Promise<PublicLinkState>
+  /** Make a link or change its expiry or password; refusals carry the server's sentence. */
+  savePublicLink(input: PublicLinkInput, signal?: AbortSignal): Promise<PublicLink>
+  /** End the link at once. */
+  endPublicLink(board: string, signal?: AbortSignal): Promise<void>
   /**
    * Replace the sites allowed to frame the board's embed pages. The server
    * validates and normalises them; a refusal arrives as `invalid_request`
@@ -175,6 +186,13 @@ export type DashboardService = {
   setFavourite(kind: ItemKind, id: string, on: boolean, signal?: AbortSignal): Promise<void>
   /** Note that the caller opened an item (best effort). */
   touchRecent(kind: ItemKind, id: string, signal?: AbortSignal): Promise<void>
+  /**
+   * `GET /api/dashboard/charts/{id}/lineage` (`BI-14` plan D1): the path from a
+   * chart to its sources. Needs `lineage:read`; without it the server answers
+   * 403 and the call throws `permission_denied`. **Not on the server yet** (T2
+   * of the BI-14 plan).
+   */
+  chartLineage(id: string, signal?: AbortSignal): Promise<ChartLineage>
   /** Dashboards and charts whose name contains `text`, across what the caller may read. */
   searchItems(text: string, signal?: AbortSignal): Promise<ShortcutItem[]>
 }
@@ -265,6 +283,51 @@ export type EmbedInfo = {
   revokedBefore: number | null
   /** Sites allowed to frame the embed pages. */
   allowedOrigins: string[]
+  /** `BI-26`: each filter column's embed mode; a column not listed is hidden. */
+  filterModes?: Record<string, FilterMode>
+  /** `BI-26`: the dashboard's saved filter columns, the ones that can be given a mode. */
+  filterColumns?: string[]
+  /** `BI-26` review fix R3: filter columns that do not pick values; they can only be hidden. */
+  hiddenOnlyColumns?: string[]
+}
+
+/** What a viewer of a signed embed may do with one dashboard filter (`BI-26`). */
+export type FilterMode = "locked" | "editable" | "hidden"
+
+/** A chart of a dashboard, for the embed chart picker. */
+export type BoardChart = { id: string; title: string }
+
+/**
+ * A dashboard's public link (`BI-19` part A), from `GET`/`PUT
+ * /api/dashboard/public-link`. The password is never sent back: only
+ * `hasPassword`.
+ */
+export type PublicLink = {
+  token: string
+  /** RFC 3339. */
+  expiresAt: string
+  /** True once `expiresAt` has passed; the link no longer works. */
+  expired: boolean
+  hasPassword: boolean
+  createdAt: string
+}
+
+export type PublicLinkState = {
+  /** False while an administrator has switched public links off (Admin > Settings). */
+  enabled: boolean
+  link: PublicLink | null
+}
+
+/**
+ * What a save sends. `password` absent keeps it, `null` removes it, a string
+ * (8 to 128 characters) sets it; `newLink` makes a new token even when a live
+ * link exists.
+ */
+export type PublicLinkInput = {
+  board: string
+  expiresAt: string
+  password?: string | null
+  newLink?: boolean
 }
 
 export type CreateBoardInput = {
@@ -368,4 +431,47 @@ export type DashboardFolder = {
  * wrote itself (a refused statement, a deleted source). Mirrors
  * `rust/crates/lakehouse-api/src/upstream_error.rs` (`UpstreamFailure::to_json`).
  */
-export type TileFailure = { error: string; errorId?: string }
+export type TileFailure = {
+  error: string
+  errorId?: string
+  /** `BI-5` plan D6: set when the time limit ended the tile; the console says the limit. Not on the server yet. */
+  limit?: TileLimit
+}
+
+/**
+ * One step of a chart's path (`BI-14` plan D1). `kind` is `chart`,
+ * `sql_source`, `metric`, `gold`, `silver`, `bronze`, `connector`, `upload` or
+ * `pipeline`. `refreshedAt` is an ISO time; `refreshSource` names the record it
+ * comes from ("last Gold build", "Iceberg last update", "last connector run",
+ * "upload time"); `notRecorded` is true when no record exists, and then there is
+ * no `refreshedAt` (never a guess).
+ */
+export type LineageStep = {
+  id: string
+  kind: "chart" | "sql_source" | "metric" | "gold" | "silver" | "bronze" | "connector" | "upload" | "pipeline" | string
+  label: string
+  refreshedAt?: string
+  refreshSource?: string
+  notRecorded?: boolean
+}
+
+/** A recorded connection between two steps; `from` feeds `to`. Same shape as the lineage page's edges. */
+export type LineageStepEdge = { id: string; from: string; to: string; kind: string; evidence?: string }
+
+/** The columns one field of the chart comes from, step by step (`via` names the step: a build, a formula or a SQL source). */
+export type FieldColumns = { field: string; columns: { table: string; column: string; via: string }[] }
+
+/**
+ * `GET /api/dashboard/charts/{id}/lineage` (`BI-14` plan D1). `chart` is the
+ * chart's id and title (the plan names the field, not its shape: the console's
+ * choice, the contract for T2). `steps` come in path order, the chart first.
+ * `coverage` lists in words what the path leaves out.
+ */
+export type ChartLineage = {
+  chart: { id: string; title: string }
+  steps: LineageStep[]
+  edges: LineageStepEdge[]
+  fields: FieldColumns[]
+  coverage: string[]
+  supported: boolean
+}

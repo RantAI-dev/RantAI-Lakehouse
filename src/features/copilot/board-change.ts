@@ -8,7 +8,7 @@
 const BOARD_TOOLS: ReadonlySet<string> = new Set([
   "create_tab", "rename_tab", "move_charts_to_tab", "move_tab", "delete_tab",
   "update_chart", "format_chart", "delete_chart", "move_chart",
-  "arrange_board", "rename_board", "delete_board", "save_board_filters", "set_dashboard_theme",
+  "arrange_board", "rename_board", "delete_board", "save_board_filters", "set_dashboard_theme", "set_cache_rule",
   "create_board", "create_chart",
 ])
 

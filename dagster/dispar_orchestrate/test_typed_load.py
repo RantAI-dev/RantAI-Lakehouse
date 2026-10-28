@@ -369,6 +369,30 @@ def test_phase_3_slice_3_review_blocker_1_a_failure_inside_the_transaction_leave
 
 
 @loader
+def test_pr_186_review_should_fix_1_a_type_change_and_a_new_column_writes_the_new_column(local_catalog, tmp_path):
+    """`PR #186 review SHOULD-FIX 1`: a replace that changes a column's type AND brings a
+    column the table does not have wrote the rows but not the new column, and reported
+    success. The new column is added to the table and written."""
+    _, table = _text_table(str(tmp_path))
+    types = {"a": "long", "b": "string", "c": "double", "d": "string"}
+    typed = pa.table({
+        "a": pa.array([7, 8, 9], pa.int64()),
+        "b": pa.array(["p", "q", "r"], pa.string()),
+        "c": pa.array([1.0, 2.0, 3.0], pa.float64()),
+        "d": pa.array(["x", "y", "z"], pa.string()),
+    })
+    changed = sink_module._changed_columns(table, types)
+    assert changed == ["a", "c"], "only the columns whose type differs"
+    written = sink_module._replace_changing_types(table, _source(typed, []), changed, types)
+    assert written == 3
+    full = table.scan().to_arrow()
+    assert "d" in full.schema.names, "the table carries the new column"
+    assert sorted(full.column("d").to_pylist()) == ["x", "y", "z"], "the new column is written, not dropped"
+    assert sorted(full.column("a").to_pylist()) == [7, 8, 9], "the changed type is written"
+    assert dict((f.name, str(f.field_type)) for f in table.schema().fields)["d"] == "string"
+
+
+@loader
 def test_the_sink_writes_a_type_changing_replace_through_the_transaction_and_other_loads_through_dlt(local_catalog, tmp_path, monkeypatch):
     directory = str(tmp_path)
     pipeline, table = _text_table(directory)

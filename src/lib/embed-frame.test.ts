@@ -7,13 +7,13 @@ import {
 } from "./embed-frame"
 
 describe("frameAncestorsPolicy", () => {
-  it("an empty list is frame-ancestors 'none'", () => {
-    expect(frameAncestorsPolicy([])).toBe("frame-ancestors 'none'")
+  it("an empty list lets only the console's own origin frame it (BI-26 review fix R4: the Share dialog's preview)", () => {
+    expect(frameAncestorsPolicy([])).toBe("frame-ancestors 'self'")
   })
 
   it("a list is the sites, in order", () => {
     expect(frameAncestorsPolicy(["https://app.customer.example", "http://localhost:3000"])).toBe(
-      "frame-ancestors https://app.customer.example http://localhost:3000",
+      "frame-ancestors 'self' https://app.customer.example http://localhost:3000",
     )
   })
 
@@ -31,11 +31,11 @@ describe("frameAncestorsPolicy", () => {
         null,
         "https://ok.example",
       ]),
-    ).toBe("frame-ancestors https://ok.example")
+    ).toBe("frame-ancestors 'self' https://ok.example")
   })
 
-  it("a list with nothing acceptable, or no list at all, is frame-ancestors 'none'", () => {
-    expect(frameAncestorsPolicy(["*"])).toBe(FRAME_ANCESTORS_NONE)
+  it("a list with nothing acceptable is only 'self'; no list at all is frame-ancestors 'none'", () => {
+    expect(frameAncestorsPolicy(["*"])).toBe("frame-ancestors 'self'")
     expect(frameAncestorsPolicy(undefined)).toBe(FRAME_ANCESTORS_NONE)
     expect(frameAncestorsPolicy("https://a.example")).toBe(FRAME_ANCESTORS_NONE)
     expect(frameAncestorsPolicy({ origins: [] })).toBe(FRAME_ANCESTORS_NONE)
@@ -43,9 +43,9 @@ describe("frameAncestorsPolicy", () => {
 
   it("lists no more than twenty sites, once each", () => {
     const many = Array.from({ length: 25 }, (_, i) => `https://s${i}.example`)
-    expect(frameAncestorsPolicy(many).split(" ").length).toBe(1 + 20)
+    expect(frameAncestorsPolicy(many).split(" ").length).toBe(2 + 20)
     expect(frameAncestorsPolicy(["https://a.example", "https://a.example"])).toBe(
-      "frame-ancestors https://a.example",
+      "frame-ancestors 'self' https://a.example",
     )
   })
 })
@@ -113,12 +113,18 @@ describe("embedFrame", () => {
     const failing = async () => {
       throw new Error("connection refused")
     }
-    expect(await embedFrame("/embed/signed/a.b.c", failing)).toEqual({ origins: [], contentSites: [] })
+    // `null` origins is `frame-ancestors 'none'`; an empty list would be 'self'
+    // (BI-26 R4), so a failure must not look like one.
+    expect(await embedFrame("/embed/signed/a.b.c", failing)).toEqual({ origins: null, contentSites: [] })
     expect(await embedFrame("/embed/signed/a.b.c", async () => "not an object")).toEqual({
-      origins: [],
+      origins: null,
       contentSites: [],
     })
-    expect(await embedFrame("/embed/signed/a.b.c", async () => null)).toEqual({ origins: [], contentSites: [] })
+    expect(await embedFrame("/embed/signed/a.b.c", async () => null)).toEqual({ origins: null, contentSites: [] })
+    expect(await embedFrame("/embed/signed/a.b.c", async () => ({ contentSites: [] }))).toEqual({
+      origins: null,
+      contentSites: [],
+    })
   })
 
   it("a body with no content sites is no site, and a non-string entry is dropped", async () => {
@@ -138,6 +144,6 @@ describe("embedFrame", () => {
       return { origins: ["https://a.example"], contentSites: ["https://img.example"] }
     })
     expect(asked).toBe(false)
-    expect(frame).toEqual({ origins: [], contentSites: [] })
+    expect(frame).toEqual({ origins: null, contentSites: [] })
   })
 })

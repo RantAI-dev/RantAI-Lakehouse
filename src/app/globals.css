@@ -162,6 +162,8 @@
     min-height: 0 !important;
   }
   .dash-canvas > .dash-canvas-grid { display: none !important; } /* garis grid */
+  /* BI-1: each tab of the PDF print view after the first starts a new page. */
+  .render-tab-break { break-before: page; }
   .dash-tile {
     position: static !important;
     left: auto !important; top: auto !important;

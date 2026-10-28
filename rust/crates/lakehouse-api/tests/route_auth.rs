@@ -2289,6 +2289,35 @@ async fn the_table_export_needs_dashboard_read_and_not_query_read() {
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
 
+/// BI-1 (D6): the chart download needs `dashboard:read` and nothing more,
+/// and not the Query Studio permission. Both ways, as for the table export.
+#[tokio::test]
+async fn the_chart_export_needs_dashboard_read_and_not_query_read() {
+    let TestApp { router, pool } = spin_up().await;
+    assert_eq!(
+        POLICY_TABLE
+            .iter()
+            .find(|(m, p, _)| *m == "GET" && *p == "/api/dashboard/chart-export")
+            .map(|(_, _, policy)| *policy),
+        Some(Policy::RequiresPermission("dashboard:read"))
+    );
+    let uri = "/api/dashboard/chart-export?chart=x&format=xlsx";
+    let viewer = common::create_principal_with_permissions(&pool, "dashboard:read").await;
+    let cookie = common::session_cookie_for_user(&pool, viewer).await;
+    let resp = request_with_cookie(&router, "GET", uri, &cookie).await;
+    assert!(
+        resp.status() != StatusCode::UNAUTHORIZED && resp.status() != StatusCode::FORBIDDEN,
+        "a dashboard viewer must get past the gate, got {}",
+        resp.status()
+    );
+    let analyst = common::create_principal_with_permissions(&pool, "query:read").await;
+    let cookie = common::session_cookie_for_user(&pool, analyst).await;
+    let resp = request_with_cookie(&router, "GET", uri, &cookie).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let resp = request_with_cookie(&router, "GET", uri, "").await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
 /// BLD-2 (T4): the target-lag route needs `pipeline:write` and nothing less.
 /// Asserted both ways: a principal holding `pipeline:write` gets past the gate,
 /// one holding only `pipeline:read` is refused with 403.
@@ -2521,6 +2550,95 @@ async fn parameters_are_read_with_dashboard_read_and_defined_with_dashboard_writ
     }
 }
 
+/// BI-1 (D3): the print view's data route is `Policy::Public` (the renderer has
+/// no session) and the one such route that reads as a person, so it is pinned
+/// by name; the table-driven loops above walk it with no credentials, and the
+/// route's own tests (`render_data.rs`) show a session cookie changes nothing.
+#[test]
+fn the_render_data_route_is_public_and_token_authenticated() {
+    assert_eq!(
+        POLICY_TABLE
+            .iter()
+            .find(|(m, p, _)| *m == "POST" && *p == "/api/render/data")
+            .map(|(_, _, policy)| *policy),
+        Some(Policy::Public)
+    );
+}
+
+/// BI-1 review fix (SHOULD-FIX) R8: the PDF route needs `dashboard:read` and
+/// nothing more, and not the Query Studio permission; both ways, as for the
+/// chart download.
+#[tokio::test]
+async fn the_pdf_export_needs_dashboard_read_and_not_query_read() {
+    let TestApp { router, pool } = spin_up().await;
+    assert_eq!(
+        POLICY_TABLE
+            .iter()
+            .find(|(m, p, _)| *m == "GET" && *p == "/api/dashboard/export/pdf")
+            .map(|(_, _, policy)| *policy),
+        Some(Policy::RequiresPermission("dashboard:read"))
+    );
+    let uri = "/api/dashboard/export/pdf?board=x";
+    let viewer = common::create_principal_with_permissions(&pool, "dashboard:read").await;
+    let cookie = common::session_cookie_for_user(&pool, viewer).await;
+    let resp = request_with_cookie(&router, "GET", uri, &cookie).await;
+    assert!(
+        resp.status() != StatusCode::UNAUTHORIZED && resp.status() != StatusCode::FORBIDDEN,
+        "a dashboard viewer must get past the gate, got {}",
+        resp.status()
+    );
+    let analyst = common::create_principal_with_permissions(&pool, "query:read").await;
+    let cookie = common::session_cookie_for_user(&pool, analyst).await;
+    let resp = request_with_cookie(&router, "GET", uri, &cookie).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let resp = request_with_cookie(&router, "GET", uri, "").await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// `RPT-1` (D7): every scheduled-report route needs `dashboard:read` and nothing
+/// less or other, asserted both ways: no session is 401, a principal without it
+/// is 403, a dashboard viewer gets past the gate (the handler's own owner and
+/// download rules are in `report_routes.rs`).
+#[tokio::test]
+async fn the_report_routes_need_dashboard_read_both_ways() {
+    let TestApp { router, pool } = spin_up().await;
+    let routes: Vec<(&str, &str)> = POLICY_TABLE
+        .iter()
+        .filter(|(_, p, _)| p.starts_with("/api/reports/"))
+        .map(|(m, p, policy)| {
+            assert_eq!(
+                *policy,
+                Policy::RequiresPermission("dashboard:read"),
+                "{m} {p}"
+            );
+            (*m, *p)
+        })
+        .collect();
+    assert_eq!(
+        routes.len(),
+        8,
+        "the seven subscription routes and the picker"
+    );
+    let viewer = common::create_principal_with_permissions(&pool, "dashboard:read").await;
+    let viewer_cookie = common::session_cookie_for_user(&pool, viewer).await;
+    let analyst = common::create_principal_with_permissions(&pool, "query:read").await;
+    let analyst_cookie = common::session_cookie_for_user(&pool, analyst).await;
+    for (method, path) in routes {
+        let uri = path.replace("{id}", "00000000-0000-0000-0000-000000000000");
+        let none = request_with_cookie(&router, method, &uri, "").await;
+        assert_eq!(none.status(), StatusCode::UNAUTHORIZED, "{method} {uri}");
+        let refused = request_with_cookie(&router, method, &uri, &analyst_cookie).await;
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN, "{method} {uri}");
+        let through = request_with_cookie(&router, method, &uri, &viewer_cookie).await;
+        assert!(
+            through.status() != StatusCode::UNAUTHORIZED
+                && through.status() != StatusCode::FORBIDDEN,
+            "{method} {uri} got {}",
+            through.status()
+        );
+    }
+}
+
 /// BLD-2 review R1 BLOCKER 7: lag-check route authorization asserted both ways.
 #[tokio::test]
 async fn lag_check_route_authorization_asserted_both_ways() {
@@ -2555,4 +2673,234 @@ async fn lag_check_route_authorization_asserted_both_ways() {
         "allowed principal must get past auth gate, got {}",
         resp.status()
     );
+}
+
+/// `BI-19` part A (D4, D5): the three link-management routes are in
+/// `POLICY_TABLE` as `dashboard:write` and the unlock route as public, and the
+/// gate agrees both ways: no session is 401, `dashboard:read` alone is 403,
+/// `dashboard:write` gets past, and a visitor with no session reaches the
+/// public routes (the handler then says 404, never 401 or 403).
+#[tokio::test]
+async fn the_public_link_routes_are_gated_in_both_directions() {
+    let TestApp { router, pool } = spin_up().await;
+    let policy_of = |method: &str, path: &str| {
+        POLICY_TABLE
+            .iter()
+            .find(|(m, p, _)| *m == method && *p == path)
+            .map(|(_, _, policy)| *policy)
+    };
+    let managed = [
+        ("GET", "/api/dashboard/public-link?board=b_x"),
+        ("PUT", "/api/dashboard/public-link"),
+        ("DELETE", "/api/dashboard/public-link?board=b_x"),
+    ];
+    for (method, uri) in managed {
+        let pattern = uri.split('?').next().unwrap();
+        assert_eq!(
+            policy_of(method, pattern),
+            Some(Policy::RequiresPermission("dashboard:write")),
+            "{method} {pattern}"
+        );
+        let reader = create_principal_with_permissions(&pool, "dashboard:read").await;
+        let cookie = session_cookie_for_user(&pool, reader).await;
+        let resp = request_with_cookie(&router, method, uri, &cookie).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{method} read-only");
+        let writer = create_principal_with_permissions(&pool, "dashboard:write").await;
+        let cookie = session_cookie_for_user(&pool, writer).await;
+        let resp = request_with_cookie(&router, method, uri, &cookie).await;
+        assert!(
+            resp.status() != StatusCode::UNAUTHORIZED && resp.status() != StatusCode::FORBIDDEN,
+            "{method} writer got {}",
+            resp.status()
+        );
+        let resp = request_with_cookie(&router, method, uri, "").await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "{method} anonymous"
+        );
+    }
+    assert_eq!(
+        policy_of("POST", "/api/public/dashboard/{token}/unlock"),
+        Some(Policy::Public)
+    );
+    for (method, uri) in [
+        ("POST", "/api/public/dashboard/p_nothing/unlock"),
+        ("GET", "/api/public/dashboard/p_nothing"),
+    ] {
+        let resp = request_with_cookie(&router, method, uri, "").await;
+        assert!(
+            resp.status() != StatusCode::UNAUTHORIZED && resp.status() != StatusCode::FORBIDDEN,
+            "{method} {uri} anonymous got {}",
+            resp.status()
+        );
+    }
+}
+
+/// `BI-26` (D5, D8): the values route is public (the signed token is the
+/// credential: with no token it answers 400, never 401 or 403, and nothing is
+/// read), and the settings route is `dashboard:write`: no session is 401,
+/// `dashboard:read` alone is 403, `dashboard:write` gets past the gate.
+#[tokio::test]
+async fn the_embed_values_and_settings_routes_are_gated_in_both_directions() {
+    let TestApp { router, pool } = spin_up().await;
+    let policy_of = |method: &str, path: &str| {
+        POLICY_TABLE
+            .iter()
+            .find(|(m, p, _)| *m == method && *p == path)
+            .map(|(_, _, policy)| *policy)
+    };
+    assert_eq!(policy_of("POST", "/api/embed/values"), Some(Policy::Public));
+    let resp =
+        request_with_cookie_and_body(&router, "POST", "/api/embed/values", "", b"{}".to_vec())
+            .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let path = "/api/dashboard/embed-settings";
+    assert_eq!(
+        policy_of("PUT", path),
+        Some(Policy::RequiresPermission("dashboard:write"))
+    );
+    let body = br#"{"board":"b_x","filterModes":{}}"#.to_vec();
+    let resp = request_with_cookie_and_body(&router, "PUT", path, "", body.clone()).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let reader = create_principal_with_permissions(&pool, "dashboard:read").await;
+    let cookie = session_cookie_for_user(&pool, reader).await;
+    let resp = request_with_cookie_and_body(&router, "PUT", path, &cookie, body.clone()).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let writer = create_principal_with_permissions(&pool, "dashboard:write").await;
+    let cookie = session_cookie_for_user(&pool, writer).await;
+    let resp = request_with_cookie_and_body(&router, "PUT", path, &cookie, body).await;
+    assert!(
+        resp.status() != StatusCode::UNAUTHORIZED && resp.status() != StatusCode::FORBIDDEN,
+        "a writer got {}",
+        resp.status()
+    );
+}
+
+// ── Query limits (BI-5) ─────────────────────────────────────────────────
+
+/// `GET /api/settings/limits` is open to any login and `PUT` needs
+/// `settings:write`, asserted both ways: a principal without it is refused
+/// the write (403) and nothing is stored, one holding it alone is past the
+/// gate (an empty body then answers 400, not 401/403), and a principal with
+/// no permission at all may still read.
+#[tokio::test]
+async fn the_query_limits_routes_are_gated_in_both_directions() {
+    let TestApp { router, pool } = common::spin_up().await;
+    let plain = create_principal_with_permissions(&pool, "dashboard:read").await;
+    let admin = create_principal_with_permissions(&pool, "settings:write").await;
+    let plain_cookie = session_cookie_for_user(&pool, plain).await;
+    let admin_cookie = session_cookie_for_user(&pool, admin).await;
+
+    let read = request_with_cookie(&router, "GET", "/api/settings/limits", &plain_cookie).await;
+    assert_eq!(read.status(), StatusCode::OK, "any login may read");
+    let refused = request_with_cookie(&router, "PUT", "/api/settings/limits", &plain_cookie).await;
+    assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+    let reached = request_with_cookie(&router, "PUT", "/api/settings/limits", &admin_cookie).await;
+    assert_eq!(
+        reached.status(),
+        StatusCode::BAD_REQUEST,
+        "settings:write reaches the handler, which refuses the empty body"
+    );
+    let anonymous = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/settings/limits")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("router answers");
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// `POST /api/query/cancel` (Stop) is open to any login (it can only end the
+/// caller's own run) and refuses an anonymous caller; a body that is not a
+/// run id UUID never reaches the engine.
+#[tokio::test]
+async fn the_query_cancel_route_needs_a_login_and_a_uuid_run_id() {
+    let TestApp { router, pool } = common::spin_up().await;
+    let plain = create_zero_permission_principal(&pool).await;
+    let cookie = session_cookie_for_user(&pool, plain).await;
+
+    let anonymous = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/query/cancel")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"runId":"22222222-2222-4222-8222-222222222222"}"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("router answers");
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+
+    let bad = request_with_cookie_and_body(
+        &router,
+        "POST",
+        "/api/query/cancel",
+        &cookie,
+        br#"{"runId":"%"}"#.to_vec(),
+    )
+    .await;
+    assert_eq!(
+        bad.status(),
+        StatusCode::BAD_REQUEST,
+        "a login is enough to reach the handler"
+    );
+}
+
+/// `PR #246 review BLOCKER 1`: the public link's and the embed's map
+/// boundary routes are `Policy::Public`, because the token is the credential
+/// there, exactly as it is for the board's data (`GET
+/// /api/public/dashboard/{token}` and `POST /api/embed/data`).
+///
+/// The two table-driven loops above walk both entries by construction (a
+/// `Policy::Public` entry is not refused by the gate, and the Platform Admin
+/// is never refused on it); this names them, so a change of their
+/// classification is caught here and not only in the table.
+///
+/// With no credentials at all the gate must let the request through to the
+/// handler, which answers 404 (no such board) or 400 (no jwt) — never a 401,
+/// which the console would turn into a redirect to the login page for a
+/// viewer who has no account.
+#[tokio::test]
+async fn the_public_map_boundary_routes_are_not_refused_by_the_auth_gate() {
+    let TestApp { router, .. } = spin_up().await;
+    for (method, path) in [
+        (
+            "GET",
+            "/api/public/dashboard/tok/maps/m_0123456789ab/geojson",
+        ),
+        ("POST", "/api/embed/maps/m_0123456789ab/geojson"),
+    ] {
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("router never fails a request outright");
+        assert_ne!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "{method} {path}: a public route must not answer 401 with no credentials"
+        );
+        assert_ne!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "{method} {path}: a public route must not answer 403 with no credentials"
+        );
+    }
 }

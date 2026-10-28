@@ -1,7 +1,7 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock } from "bun:test"
 import type { CondRule, StyleFields, ValueFormat } from "@/lib/chart-style"
-import { formatRules } from "@/lib/style-draft"
+import { formatRules, styleFromDef, stylePayload } from "@/lib/style-draft"
 import { ConditionalEditor, FormatSection, ValueFormatEditor } from "./format-section"
 
 afterEach(cleanup)
@@ -96,5 +96,77 @@ describe("FormatSection", () => {
     expect(screen.getByRole("combobox", { name: "Palette" }).textContent).toContain("Company palette")
     choose(screen.getByRole("combobox", { name: "Palette" }), "Default")
     expect(onChange).toHaveBeenLastCalledWith({ colors: { palette: "default" } })
+  })
+})
+
+describe("FormatSection clusters (BI-17 part B)", () => {
+  const scatter = formatRules({ kind: "scatter", breakdown: false, measures: 2 })
+
+  it("switches clusters on at Automatic, takes a number of groups, and switches them off", () => {
+    const onChange = mock<(s: StyleFields) => void>(() => {})
+    const { rerender } = render(<FormatSection rules={scatter} style={{}} onChange={onChange} valueNames={["x", "y"]} seriesNames={[]} paletteValue="default" />)
+    fireEvent.click(screen.getByRole("switch", { name: "Colour points by cluster" }))
+    expect(onChange.mock.calls[0]![0]).toEqual({ clusters: { k: "auto" } })
+    rerender(<FormatSection rules={scatter} style={{ clusters: { k: "auto" } }} onChange={onChange} valueNames={["x", "y"]} seriesNames={[]} paletteValue="default" />)
+    choose(screen.getByLabelText("Number of clusters"), "4")
+    expect(onChange.mock.calls[1]![0]).toEqual({ clusters: { k: 4 } })
+    rerender(<FormatSection rules={scatter} style={{ clusters: { k: 4 } }} onChange={onChange} valueNames={["x", "y"]} seriesNames={[]} paletteValue="default" />)
+    fireEvent.click(screen.getByRole("switch", { name: "Colour points by cluster" }))
+    expect(onChange.mock.calls[2]![0].clusters).toBeUndefined()
+  })
+
+  it("offers no clusters on a line chart", () => {
+    render(<FormatSection rules={formatRules({ kind: "line", breakdown: false, measures: 1 })} style={{}} onChange={() => {}} valueNames={["v"]} seriesNames={[]} paletteValue="default" />)
+    expect(screen.queryByRole("switch", { name: "Colour points by cluster" })).toBeNull()
+  })
+})
+
+describe("Clusters (BI-17 part B)", () => {
+  const scatter = formatRules({ kind: "scatter", breakdown: false, measures: 2 })
+  const section = (style: StyleFields, onChange: (s: StyleFields) => void, rules = scatter) =>
+    <FormatSection rules={rules} style={style} onChange={onChange} valueNames={["sales", "visits"]} paletteValue="default" />
+
+  it("switches clusters on at automatic, then takes 2 to 10 groups, and switches them off", () => {
+    const onChange = mock<(s: StyleFields) => void>(() => {})
+    const { rerender } = render(section({}, onChange))
+    expect(screen.queryByLabelText("Number of clusters")).toBeNull()
+    fireEvent.click(screen.getByRole("switch", { name: "Colour points by cluster" }))
+    expect(onChange.mock.calls[0]![0].clusters).toEqual({ k: "auto" })
+    rerender(section({ clusters: { k: "auto" } }, onChange))
+    choose(screen.getByLabelText("Number of clusters"), "4")
+    expect(onChange.mock.calls[1]![0].clusters).toEqual({ k: 4 })
+    fireEvent.click(screen.getByRole("switch", { name: "Colour points by cluster" }))
+    expect(onChange.mock.calls[2]![0].clusters).toBeUndefined()
+  })
+
+  it("is not offered on a chart kind that cannot cluster", () => {
+    render(section({}, () => {}, formatRules({ kind: "bar", breakdown: false, measures: 1 })))
+    expect(screen.queryByRole("switch", { name: "Colour points by cluster" })).toBeNull()
+  })
+})
+
+describe("FormatSection Gantt today line (BI-16 part C1)", () => {
+  const gantt = formatRules({ kind: "gantt", breakdown: false, measures: 0 })
+
+  it("is on by default, switches off as todayLine false, and back on by dropping the field", () => {
+    const onChange = mock<(s: StyleFields) => void>(() => {})
+    const { rerender } = render(<FormatSection rules={gantt} style={{}} onChange={onChange} valueNames={[]} seriesNames={[]} paletteValue="default" />)
+    const sw = screen.getByRole("switch", { name: "Today line" })
+    expect(sw.getAttribute("aria-checked")).toBe("true")
+    fireEvent.click(sw)
+    expect(onChange.mock.calls[0]![0].todayLine).toBe(false)
+    rerender(<FormatSection rules={gantt} style={{ todayLine: false }} onChange={onChange} valueNames={[]} seriesNames={[]} paletteValue="default" />)
+    expect(screen.getByRole("switch", { name: "Today line" }).getAttribute("aria-checked")).toBe("false")
+    fireEvent.click(screen.getByRole("switch", { name: "Today line" }))
+    expect(onChange.mock.calls[1]![0].todayLine).toBeUndefined()
+  })
+
+  it("is offered on a Gantt chart only, and is sent only when off", () => {
+    render(<FormatSection rules={formatRules({ kind: "bar", breakdown: false, measures: 1 })} style={{}} onChange={() => {}} valueNames={["v"]} seriesNames={[]} paletteValue="default" />)
+    expect(screen.queryByRole("switch", { name: "Today line" })).toBeNull()
+    expect(stylePayload({ todayLine: false }, gantt)).toEqual({ todayLine: false })
+    expect(stylePayload({ todayLine: true }, gantt)).toEqual({})
+    expect(stylePayload({ todayLine: false }, formatRules({ kind: "bar", breakdown: false, measures: 1 }))).toEqual({})
+    expect(styleFromDef({ todayLine: false })).toEqual({ todayLine: false })
   })
 })

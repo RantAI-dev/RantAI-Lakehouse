@@ -81,7 +81,10 @@ fn parse_body(body: &Bytes) -> Result<SqlBody, ApiError> {
 /// `AGENTS.md` rule 4) when obligations cannot be resolved or `sql` fails
 /// classification/substitution, and 404 [`ApiError::NotFound`] with the
 /// fixed sentence of [`table_not_available`] when the statement reads a
-/// table the caller may not read (`SEC-20`).
+/// table the caller may not read (`SEC-20`), and 422
+/// [`ApiError::Unprocessable`] with the fixed sentence of
+/// [`LISTING_NOT_AVAILABLE`] when the statement lists objects without
+/// naming a table and the caller may not list them (`SEC-20`).
 pub(crate) async fn rewrite_sql_for_principal(
     state: &AppState,
     sql: &str,
@@ -148,13 +151,21 @@ async fn rewrite_sql_for_principal_inner(
     // statement that reads a table the caller may not read is refused
     // before the policy's own prefetch asks the engine about that table,
     // and before the statement reaches the engine at all.
-    refuse_unreachable_tables(
-        state,
-        principal,
-        headers,
-        &referenced_table_names(sql, is_trino_engine(engine)),
-    )
-    .await?;
+    //
+    // The gate's targets come from ONE parse, with the dialect of the
+    // engine the statement names (the same choice the policy rewrite
+    // below makes): the tables the statement names, or the fact that it
+    // lists objects without naming one. A statement that does not parse
+    // has no targets at all: the policy rewrite refuses it with a 422 of
+    // its own, so there is nothing here to gate.
+    let gate_dialect: &dyn sqlparser::dialect::Dialect = if is_trino_engine(engine) {
+        &sqlparser::dialect::GenericDialect {}
+    } else {
+        &sqlparser::dialect::ClickHouseDialect {}
+    };
+    if let Some(targets) = crate::sql_rewrite::gate_targets(sql, gate_dialect) {
+        refuse_unreachable_tables(state, principal, headers, &targets).await?;
+    }
 
     // WS7 item D1/D2: the actual referenced-tables/prefetch/enforce
     // sequence now lives in ONE place —
@@ -239,6 +250,19 @@ fn table_not_available(table: &str) -> ApiError {
         "Table not found or not available to your organisation: {table}"
     ))
 }
+
+/// `SEC-20`: the one sentence a statement that lists objects without
+/// naming one table is refused with.
+///
+/// A 422, never a 403: the statement is refused for what it DOES (it
+/// lists), not because the caller lacks a permission, and the sentence
+/// says nothing about what the deployment holds — the same sentence for
+/// every caller, so it cannot be an oracle.
+///
+/// A listing is refused rather than passed because no table is named, so
+/// the gate has nothing to compare the caller's tenant against: letting
+/// it through would show one tenant the shared catalog's table names.
+const LISTING_NOT_AVAILABLE: &str = "This statement is not available to your organisation.";
 
 /// `SEC-20`: the caller's reach over tables, resolved once per request.
 ///
@@ -498,41 +522,75 @@ async fn claim_on(state: &AppState, tenant_id: Uuid, table: &str) -> Result<Tabl
         })
 }
 
-/// `SEC-20`: refuse a statement that reads a table the caller may not
-/// read.
+/// `SEC-20`: refuse a statement the caller's tenant may not run.
 ///
-/// The tables are the ones the statement names, as
-/// [`crate::sql_rewrite::referenced_tables`] canonicalises them (a
-/// `CTE`'s own name is not a table), and the first table out of reach is
-/// the one the refusal names.
+/// The targets are what the statement means to the gate: the tables it
+/// names — canonicalised the way the policy rewrite canonicalises them
+/// ([`crate::sql_rewrite::canonicalize`]), so a `CTE`'s own name is not a
+/// table — or the fact that it lists objects without naming one table.
+///
+/// A named table is checked one by one, and the first table out of reach
+/// is the one the refusal names. A listing names no table, so there is
+/// nothing to check table by table: it passes for the catalog's own
+/// tenant (and for a deployment with one tenant) and is refused
+/// otherwise.
 ///
 /// # Errors
 ///
 /// 404 with the fixed sentence of [`table_not_available`] for a table the
-/// caller may not read; 404 for an `X-Tenant` header the caller does not
-/// belong to; 503 when a claim cannot be read.
+/// caller may not read; 422 with the fixed sentence of
+/// [`LISTING_NOT_AVAILABLE`] for a statement that lists objects and the
+/// caller may not list them; 404 for an `X-Tenant` header the caller does
+/// not belong to; 503 when a claim cannot be read.
 async fn refuse_unreachable_tables(
     state: &AppState,
     principal: &Principal,
     headers: &HeaderMap,
-    tables: &[String],
+    targets: &crate::sql_rewrite::GateTargets,
 ) -> Result<(), ApiError> {
-    if tables.is_empty() {
-        return Ok(());
-    }
-    let reach = resolve_reach(state, principal, headers).await?;
-    let tenant_id = match reach {
-        TenantReach::All => return Ok(()),
-        TenantReach::NoTenant => return Err(table_not_available(&tables[0])),
-        TenantReach::Tenant { tenant_id, .. } => tenant_id,
-    };
-    let mut claims = Vec::with_capacity(tables.len());
-    for table in tables {
-        claims.push(claim_on(state, tenant_id, table).await?);
-    }
-    match first_unreachable(reach, &claims) {
-        Some(at) => Err(table_not_available(&tables[at])),
-        None => Ok(()),
+    match targets {
+        crate::sql_rewrite::GateTargets::Tables(tables) => {
+            if tables.is_empty() {
+                return Ok(());
+            }
+            let reach = resolve_reach(state, principal, headers).await?;
+            let tenant_id = match reach {
+                TenantReach::All => return Ok(()),
+                TenantReach::NoTenant => return Err(table_not_available(&tables[0])),
+                TenantReach::Tenant { tenant_id, .. } => tenant_id,
+            };
+            let mut claims = Vec::with_capacity(tables.len());
+            for table in tables {
+                claims.push(claim_on(state, tenant_id, table).await?);
+            }
+            match first_unreachable(reach, &claims) {
+                Some(at) => Err(table_not_available(&tables[at])),
+                None => Ok(()),
+            }
+        }
+        crate::sql_rewrite::GateTargets::ListsObjects => {
+            // The reach is resolved FIRST: a header naming a tenant the
+            // caller does not belong to is a 404 everywhere else, and it
+            // must not be answered with the listing's own 422.
+            let reach = resolve_reach(state, principal, headers).await?;
+            match reach {
+                // Every permission, or a deployment with one tenant: there
+                // is no other tenant's listing to keep. The catalog's own
+                // tenant may list the shared catalog.
+                TenantReach::All
+                | TenantReach::Tenant {
+                    owns_catalog: true, ..
+                } => Ok(()),
+                // A member of another tenant, or a caller in no tenant.
+                TenantReach::Tenant {
+                    owns_catalog: false,
+                    ..
+                }
+                | TenantReach::NoTenant => {
+                    Err(ApiError::Unprocessable(LISTING_NOT_AVAILABLE.to_owned()))
+                }
+            }
+        }
     }
 }
 
@@ -699,6 +757,10 @@ async fn execute_query_against_engine(
     sql: &str,
     user_id: &str,
     started: Instant,
+    (run, limits): (
+        &crate::query_limits::QueryRun,
+        &crate::query_limits::TileLimits,
+    ),
 ) -> Result<(Vec<String>, Vec<Value>, u64, u64), ApiError> {
     if engine == "trino" {
         let trino_user = format!("console-{user_id}");
@@ -720,11 +782,26 @@ async fn execute_query_against_engine(
         // SEC-21: the engine stops producing rows past the cap, so a huge
         // result never reaches this process. One row more than the route
         // keeps is asked for, so `truncated` stays honest.
+        //
+        // BI-5: the cap is the administrator's Query Studio row limit, the
+        // engine also stops the query at the time limit, and the query is
+        // named so Stop can end it (`QueryRun::options`). A query the limit
+        // or a Stop ended gets a fixed sentence (plan D6), not the engine's
+        // text.
+        let options = run.options(limits, limits.studio_rows);
         let result = state
             .clickhouse
-            .query_limited(sql, MAX_RESULT_ROWS + 1, None)
+            .query_with_options(sql, &options, None)
             .await
-            .map_err(|e| upstream_error::ch_error_for_author(&upstream_error::DATABASE, &e))?;
+            .map_err(|e| {
+                if e.is_time_limit() {
+                    ApiError::Unprocessable(crate::query_limits::time_sentence("query", limits))
+                } else if e.is_killed_on_engine() {
+                    ApiError::Unprocessable(crate::query_limits::STOPPED_SENTENCE.to_owned())
+                } else {
+                    upstream_error::ch_error_for_author(&upstream_error::DATABASE, &e)
+                }
+            })?;
 
         let columns: Vec<String> = result.meta.iter().map(|m| m.name.clone()).collect();
         let rows: Vec<Value> = result
@@ -811,19 +888,19 @@ pub(crate) async fn check_statement_would_run(
         .map_err(|err| upstream_error::ch_message_for_author(&upstream_error::DATABASE, &err))
 }
 
-/// The most rows one run hands back to the browser.
-///
-/// The console renders every row it receives, so an unbounded `SELECT *`
-/// used to be enough to freeze the tab. The response says when the cap
-/// applied (`truncated`), so nobody reads a partial answer as the whole one.
-///
-/// `ClickHouse` is asked to stop at the cap (`ChClient::query_limited`), so
-/// a huge result does not fill this process's memory before `truncate`
-/// runs (SEC-21). `result_overflow_mode = 'break'` stops at a block
-/// boundary, so up to one block (`max_block_size`, about 65,000 rows by
-/// default) beyond the cap can still arrive; the route keeps
-/// `MAX_RESULT_ROWS` of them. `Trino`'s client bounds its own result.
-const MAX_RESULT_ROWS: usize = 2_000;
+// The most rows one run hands back to the browser is the administrator's
+// Query Studio row limit (`TileLimits::studio_rows`, default 2,000; `BI-5`).
+//
+// The console renders every row it receives, so an unbounded `SELECT *`
+// used to be enough to freeze the tab. The response says when the cap
+// applied (`truncated`), so nobody reads a partial answer as the whole one.
+//
+// `ClickHouse` is asked to stop at the cap (`ChClient::query_with_options`),
+// so a huge result does not fill this process's memory before `truncate`
+// runs (SEC-21). `result_overflow_mode = 'break'` stops at a block
+// boundary, so up to one block (`max_block_size`, about 65,000 rows by
+// default) beyond the cap can still arrive; the route keeps `studio_rows` of
+// them. `Trino`'s client bounds its own result.
 
 /// `POST /api/query/run` — execute a read-only `SQL` statement against
 /// `ClickHouse` (`engine` absent or `"clickhouse"`) or `Trino`
@@ -836,11 +913,11 @@ const MAX_RESULT_ROWS: usize = 2_000;
 /// with the exact message the response carries and the tables the
 /// statement names (`QS-4`). A run whose body does not parse, whose `sql`
 /// is empty, or that has no principal is not recorded — nobody, or
-/// nothing, to record; a run the caller stops is not recorded either,
-/// because the server is not told (Stop closes the browser's request;
-/// `QS-2` is what stops a query on the server). The audit trail's own
-/// refusal path stays what WS7 built it for: enforcement decisions, not
-/// this route's history write.
+/// nothing, to record. A run the caller stops is recorded as `failed`
+/// too (`BI-5`): Stop ends the statement on the server, so the server is
+/// told, and the row carries the stop's own fixed sentence. The audit
+/// trail's own refusal path stays what WS7 built it for: enforcement
+/// decisions, not this route's history write.
 ///
 /// # Errors
 ///
@@ -924,6 +1001,11 @@ pub async fn run(
         return Err(ApiError::unauthorized().into());
     };
     let user_id = p.id.uuid().to_string();
+    // BI-5: this caller's limits and the run (`X-Run-Id`) the statement
+    // belongs to, so Stop can find it.
+    let run = crate::query_limits::QueryRun::current_or_detached();
+    let limits = run.limits().await?;
+    let row_limit = limits.studio_rows as usize;
 
     if engine == "trino" && !is_trino_safe(&statement) {
         let refusal = ApiError::Unprocessable(
@@ -987,33 +1069,46 @@ pub async fn run(
     let started = Instant::now();
     let started_epoch_ms = epoch_ms();
 
-    let (columns, mut rows, duration_ms, scanned_bytes) =
-        match execute_query_against_engine(&state, &engine, &rewritten, &user_id, started).await {
-            Ok(result) => result,
-            Err(err) => {
-                record_uncompleted_run(
-                    &state,
-                    &p,
-                    &statement,
-                    &engine,
-                    "failed",
-                    &err.to_string(),
-                    &tables_read,
-                    started.elapsed().as_millis(),
-                )
-                .await;
-                return Err(err.into());
-            }
-        };
+    // QS-4: every run that reaches the engine is recorded, whether it
+    // answered or not. BI-5's limits travel with the call, so a run the time
+    // limit or a Stop ended ends here with the limit's own fixed sentence —
+    // and that sentence, not the engine's text, is what the history row
+    // carries, exactly as the response does.
+    let (columns, mut rows, duration_ms, scanned_bytes) = match execute_query_against_engine(
+        &state,
+        &engine,
+        &rewritten,
+        &user_id,
+        started,
+        (&run, &limits),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(err) => {
+            record_uncompleted_run(
+                &state,
+                &p,
+                &statement,
+                &engine,
+                "failed",
+                &err.to_string(),
+                &tables_read,
+                started.elapsed().as_millis(),
+            )
+            .await;
+            return Err(err.into());
+        }
+    };
 
     // The console renders every row it receives, so an unbounded `SELECT *`
-    // used to be enough to freeze the tab — see `MAX_RESULT_ROWS`'s own doc
-    // comment. The engines stop at the cap (`ClickHouse` inside the engine,
-    // `Trino` in its client); this keeps exactly `MAX_RESULT_ROWS` of what
+    // used to be enough to freeze the tab — see the note above this function.
+    // The engines stop at the cap (`ClickHouse` inside the engine,
+    // `Trino` in its client); this keeps exactly `row_limit` of what
     // arrived, and the response says when it did.
     let total_rows = rows.len();
-    let truncated = total_rows > MAX_RESULT_ROWS;
-    rows.truncate(MAX_RESULT_ROWS);
+    let truncated = total_rows > row_limit;
+    rows.truncate(row_limit);
 
     let cost_units = std::cmp::max(1, bytes_to_cost_units(scanned_bytes));
     let id = format!("q-{started_epoch_ms}");
@@ -1075,8 +1170,7 @@ pub async fn run(
         &id,
         &json!(columns),
         &json!(rows),
-        total_rows,
-        truncated,
+        (total_rows, truncated, row_limit),
         duration_ms,
         scanned_bytes,
         cost_units,
@@ -1272,8 +1366,7 @@ fn run_result_json(
     id: &str,
     columns: &Value,
     rows: &Value,
-    total_rows: usize,
-    truncated: bool,
+    (total_rows, truncated, row_limit): (usize, bool, usize),
     duration_ms: u64,
     scanned_bytes: u64,
     cost_units: u64,
@@ -1286,7 +1379,7 @@ fn run_result_json(
         "rows": rows,
         "rowCount": total_rows,
         "truncated": truncated,
-        "rowLimit": MAX_RESULT_ROWS,
+        "rowLimit": row_limit,
         "metrics": {
             "durationMs": duration_ms,
             "scannedBytes": scanned_bytes,
@@ -2589,8 +2682,7 @@ mod tests {
             "q-1",
             &json!([]),
             &json!([]),
-            0,
-            false,
+            (0, false, 2_000),
             12,
             34,
             1,

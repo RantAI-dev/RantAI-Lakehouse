@@ -117,8 +117,15 @@ fn all_queries(stmt: &sqlparser::ast::Statement) -> Vec<Query> {
 /// which tables get substituted.
 pub fn referenced_tables(sql: &str, dialect: &dyn Dialect) -> Option<Vec<String>> {
     let statements = Parser::parse_sql(dialect, sql).ok()?;
+    Some(referenced_tables_of(&statements).into_iter().collect())
+}
+
+/// Every real table the queries in `statements` reference — the
+/// collection [`referenced_tables`] performs, over an already parsed
+/// statement list, so both share ONE collector (`AGENTS.md` rule 4).
+fn referenced_tables_of(statements: &[Statement]) -> HashSet<String> {
     let mut queries = Vec::new();
-    for stmt in &statements {
+    for stmt in statements {
         queries.extend(all_queries(stmt));
     }
     let ctes: HashSet<String> = queries
@@ -136,7 +143,124 @@ pub fn referenced_tables(sql: &str, dialect: &dyn Dialect) -> Option<Vec<String>
             }
         }
     }
-    Some(out.into_iter().collect())
+    out
+}
+
+/// What the tenant gate must check for a statement.
+///
+/// Either the tables the statement names — the gate checks each of them,
+/// whatever the statement's kind — or the fact that it lists objects
+/// without naming one table, which no table-level check can cover.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GateTargets {
+    /// The tables the statement names, canonicalised (see [`canonicalize`])
+    /// and sorted, so the same statement always hands the gate the same
+    /// list.
+    Tables(Vec<String>),
+    /// The statement lists objects (`SHOW TABLES`, `SHOW DATABASES`, ...)
+    /// without naming one table to gate.
+    ListsObjects,
+}
+
+/// The tables `sql` names, or that it lists objects without naming one
+/// table — what the tenant gate must check, from ONE parse.
+///
+/// A statement that names tables is gated table by table: a `SELECT`'s
+/// tables are the ones [`referenced_tables`] finds in it (the SAME
+/// collector, not a second one), a `DESCRIBE`/`DESC` gates the table it
+/// names, and a `SHOW COLUMNS FROM tbl` gates `tbl`. A statement that
+/// lists objects without naming one table names no table the gate could
+/// check, so it is reported as [`GateTargets::ListsObjects`] and the
+/// caller decides who may run it — never as "no tables", which would let
+/// it through unchecked.
+///
+/// Several statements in one input are gated as ONE: any statement that
+/// lists objects makes the whole input a listing (fail closed), otherwise
+/// the tables of every statement are unioned, so a table named by any
+/// statement is gated.
+///
+/// `None` means `sql` did not parse at all. The caller refuses such a
+/// statement anyway — the policy rewrite refuses it first — so the gate
+/// adds nothing to it.
+///
+/// # Which `Statement` variant each form becomes (sqlparser 0.63)
+///
+/// `ClickHouseDialect` and `GenericDialect` agree on every form below:
+/// - `DESCRIBE x` / `DESC x` become `Statement::ExplainTable { table_name, .. }`
+///   (`ast/mod.rs:4661-4674`). `ClickHouseDialect::describe_requires_table_keyword()`
+///   is `true` (`dialect/clickhouse.rs:50-52`), and both spellings parse
+///   anyway — the `TABLE` keyword is optional in the grammar.
+/// - `SHOW COLUMNS FROM tbl` / `FROM db.tbl` become
+///   `Statement::ShowColumns { show_options, .. }`, the named table at
+///   `show_options.show_in.parent_name` (`ast/mod.rs:4186-4193`,
+///   `:11064-11072`; the parser fills it in `parser/mod.rs:21051-21064`).
+/// - `SHOW TABLES [FROM db]` becomes `Statement::ShowTables { show_options, .. }`
+///   (`ast/mod.rs:4252-4265`): the database lands in the same
+///   `parent_name`, and it is a DATABASE, not a table to gate.
+/// - `SHOW DATABASES` / `SHOW SCHEMAS` become `Statement::ShowDatabases` /
+///   `Statement::ShowSchemas` (`ast/mod.rs:4208-4235`).
+/// - `EXPLAIN DESCRIBE x` does NOT parse at all (`parser/mod.rs:14480-14483`:
+///   "Explain must be root of the plan"), so it is a `None`.
+#[must_use]
+pub fn gate_targets(sql: &str, dialect: &dyn Dialect) -> Option<GateTargets> {
+    let statements = Parser::parse_sql(dialect, sql).ok()?;
+    let mut tables: HashSet<String> = HashSet::new();
+    for stmt in &statements {
+        match statement_gate_targets(stmt) {
+            GateTargets::Tables(named) => tables.extend(named),
+            // Fail closed: one statement that lists objects makes the
+            // whole input a listing, whatever the others name.
+            GateTargets::ListsObjects => return Some(GateTargets::ListsObjects),
+        }
+    }
+    // Sorted: the same statement must hand the gate the same list every
+    // time.
+    let mut tables: Vec<String> = tables.into_iter().collect();
+    tables.sort();
+    Some(GateTargets::Tables(tables))
+}
+
+/// What ONE statement means to the tenant gate — see [`gate_targets`].
+fn statement_gate_targets(stmt: &Statement) -> GateTargets {
+    match stmt {
+        // A query's tables are the ones `referenced_tables` finds in it.
+        Statement::Query(_) => GateTargets::Tables(
+            referenced_tables_of(std::slice::from_ref(stmt))
+                .into_iter()
+                .collect(),
+        ),
+        Statement::Explain { statement, .. } => statement_gate_targets(statement),
+        Statement::ExplainTable { table_name, .. } => {
+            GateTargets::Tables(vec![canonical_object_name(table_name)])
+        }
+        Statement::ShowColumns { show_options, .. } => {
+            if let Some(name) = show_columns_table(show_options) {
+                GateTargets::Tables(vec![canonical_object_name(name)])
+            } else {
+                GateTargets::ListsObjects
+            }
+        }
+        // Every other kind names no table the gate could check: it is a
+        // listing, never "no tables".
+        _ => GateTargets::ListsObjects,
+    }
+}
+
+/// The table a `SHOW COLUMNS` statement names, when it names one.
+///
+/// `SHOW COLUMNS FROM tbl` and `SHOW COLUMNS FROM db.tbl` name a table.
+/// `SHOW COLUMNS IN DATABASE db` and `IN SCHEMA db` name a database or a
+/// schema, and `SHOW COLUMNS` alone names nothing: the statement then
+/// lists the columns of every table it can see, so there is no table to
+/// gate and the caller must treat it as a listing.
+fn show_columns_table(show_options: &sqlparser::ast::ShowStatementOptions) -> Option<&ObjectName> {
+    let show_in = show_options.show_in.as_ref()?;
+    let name = show_in.parent_name.as_ref()?;
+    match &show_in.parent_type {
+        None | Some(sqlparser::ast::ShowStatementInParentType::Table) => Some(name),
+        // A DATABASE or a SCHEMA: the name is not a table.
+        _ => None,
+    }
 }
 
 /// Replaces every literal of a statement with a `?` placeholder.
@@ -223,6 +347,106 @@ pub fn identifiers_used(sql: &str, dialect: &dyn Dialect) -> Option<HashSet<Stri
         let _: ControlFlow<Infallible> = stmt.visit(&mut collector);
     }
     Some(collector.found)
+}
+
+/// What a statement reads or calls that its table names do not show
+/// (`BI-4` B review P-B1, P-S1). See [`reads_beyond_tables`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BeyondTables {
+    /// A clock or random function: the answer changes with no change to any
+    /// table (`now`, `today`, `rand*`, `generateUUID*`, ...).
+    pub clock_or_random: bool,
+    /// Data read through a name no `FROM`/`JOIN` factor carries: a
+    /// `dictGet*`/`joinGet*` call, or `IN <table>`.
+    pub outside_from: bool,
+}
+
+/// The functions whose value is not a function of the tables: lower-cased
+/// exact names; the `rand` and `generateuuid` families are matched by prefix
+/// in [`is_clock_or_random_function`].
+const CLOCK_FUNCTIONS: &[&str] = &[
+    "now",
+    "now64",
+    "nowinblock",
+    "nowinblock64",
+    "today",
+    "yesterday",
+    "current_date",
+    "current_time",
+    "current_timestamp",
+    "localtime",
+    "localtimestamp",
+    "currentdate",
+    "uuid",
+    "uptime",
+];
+
+/// Whether `name` (any case, last segment) is a clock or random function.
+/// The prefixes keep a variant this list missed (`randCanonical`,
+/// `randomString`, `generateUUIDv4`, `generateSnowflakeID`) from slipping
+/// through; a false positive only shortens a result's life.
+fn is_clock_or_random_function(name: &str) -> bool {
+    let last = name.rsplit('.').next().unwrap_or(name).to_ascii_lowercase();
+    CLOCK_FUNCTIONS.contains(&last.as_str())
+        || last.starts_with("rand")
+        || last.starts_with("generateuuid")
+        || last.starts_with("generatesnowflake")
+}
+
+struct BeyondTablesFinder {
+    found: BeyondTables,
+}
+
+impl Visitor for BeyondTablesFinder {
+    type Break = Infallible;
+
+    fn pre_visit_expr(&mut self, expr: &sqlparser::ast::Expr) -> ControlFlow<Infallible> {
+        use sqlparser::ast::Expr;
+        match expr {
+            Expr::Function(f) => {
+                let name = f.name.to_string();
+                if is_clock_or_random_function(&name) {
+                    self.found.clock_or_random = true;
+                }
+                if is_dict_or_join_function(&name) {
+                    self.found.outside_from = true;
+                }
+            }
+            // `x IN tbl` names a table without a table factor; `x IN (a)` with
+            // a column is caught too, which only shortens a result's life.
+            Expr::InList { list, .. }
+                if matches!(
+                    list.as_slice(),
+                    [Expr::Identifier(_) | Expr::CompoundIdentifier(_)]
+                ) =>
+            {
+                self.found.outside_from = true;
+            }
+            _ => {}
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+/// Whether `sql` calls a clock or random function, or reads data through a
+/// name no table factor carries (`dictGet*`/`joinGet*`, `IN <table>`), so the
+/// table fingerprint cannot vouch for its result. A statement that does not
+/// parse answers both `true` (nothing can be said, so nothing is trusted).
+#[must_use]
+pub fn reads_beyond_tables(sql: &str, dialect: &dyn Dialect) -> BeyondTables {
+    let Ok(statements) = Parser::parse_sql(dialect, sql) else {
+        return BeyondTables {
+            clock_or_random: true,
+            outside_from: true,
+        };
+    };
+    let mut finder = BeyondTablesFinder {
+        found: BeyondTables::default(),
+    };
+    for stmt in &statements {
+        let _: ControlFlow<Infallible> = stmt.visit(&mut finder);
+    }
+    finder.found
 }
 
 struct QuotedIdentChecker<'a, S> {
@@ -314,12 +538,7 @@ fn collect_table_factor_name(
             if args.is_some() {
                 return;
             }
-            let parts: Vec<String> = name
-                .0
-                .iter()
-                .filter_map(sqlparser::ast::ObjectNamePart::as_ident)
-                .map(|ident| ident.value.to_ascii_lowercase())
-                .collect();
+            let parts = object_name_parts(name);
             if parts.len() == 1 && ctes.contains(&parts[0]) {
                 return; // a CTE reference, not a real table
             }
@@ -522,6 +741,134 @@ mod table_resolution {
             referenced_tables(self_join, &ClickHouseDialect {}).unwrap(),
             vec!["silver.customers".to_owned()]
         );
+    }
+}
+
+/// The tenant gate's view of a statement: the tables it names, or that it
+/// lists objects without naming one table.
+#[cfg(test)]
+mod gate_targets {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use sqlparser::dialect::{ClickHouseDialect, Dialect, GenericDialect};
+
+    use super::GateTargets;
+
+    /// The two dialects the API reads SQL with.
+    fn dialects() -> Vec<Box<dyn Dialect>> {
+        vec![Box::new(ClickHouseDialect {}), Box::new(GenericDialect {})]
+    }
+
+    #[test]
+    fn describe_parses_to_its_table_in_both_dialects() {
+        for sql in ["DESCRIBE bronze.orders", "DESC bronze.orders"] {
+            for dialect in dialects() {
+                assert_eq!(
+                    super::gate_targets(sql, dialect.as_ref()),
+                    Some(GateTargets::Tables(vec!["bronze.orders".to_owned()])),
+                    "sql={sql}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn show_columns_gates_the_table_it_names_in_both_dialects() {
+        for dialect in dialects() {
+            assert_eq!(
+                super::gate_targets("SHOW COLUMNS FROM bronze.orders", dialect.as_ref()),
+                Some(GateTargets::Tables(vec!["bronze.orders".to_owned()]))
+            );
+        }
+    }
+
+    #[test]
+    fn show_columns_gates_an_unqualified_table_name_in_both_dialects() {
+        for dialect in dialects() {
+            assert_eq!(
+                super::gate_targets("SHOW COLUMNS FROM orders", dialect.as_ref()),
+                Some(GateTargets::Tables(vec!["orders".to_owned()]))
+            );
+        }
+    }
+
+    #[test]
+    fn show_tables_and_show_databases_list_objects_without_naming_a_table() {
+        // The database of `SHOW TABLES FROM bronze` is not a table: a
+        // listing names no table the gate could check.
+        for sql in [
+            "SHOW TABLES",
+            "SHOW TABLES FROM bronze",
+            "SHOW DATABASES",
+            "SHOW SCHEMAS",
+        ] {
+            for dialect in dialects() {
+                assert_eq!(
+                    super::gate_targets(sql, dialect.as_ref()),
+                    Some(GateTargets::ListsObjects),
+                    "sql={sql}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_query_still_yields_its_referenced_tables() {
+        for dialect in dialects() {
+            assert_eq!(
+                super::gate_targets("SELECT * FROM bronze.orders", dialect.as_ref()),
+                Some(GateTargets::Tables(vec!["bronze.orders".to_owned()]))
+            );
+            // A CTE's own name is not a table.
+            assert_eq!(
+                super::gate_targets(
+                    "WITH orders AS (SELECT 1) SELECT * FROM orders",
+                    dialect.as_ref()
+                ),
+                Some(GateTargets::Tables(vec![]))
+            );
+        }
+    }
+
+    #[test]
+    fn explain_recurses_into_the_statement_it_explains() {
+        for dialect in dialects() {
+            assert_eq!(
+                super::gate_targets("EXPLAIN SELECT * FROM bronze.orders", dialect.as_ref()),
+                Some(GateTargets::Tables(vec!["bronze.orders".to_owned()]))
+            );
+        }
+    }
+
+    #[test]
+    fn explain_describe_does_not_parse_so_the_gate_sees_nothing() {
+        for dialect in dialects() {
+            assert_eq!(
+                super::gate_targets("EXPLAIN DESCRIBE bronze.orders", dialect.as_ref()),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn two_statements_fail_closed_when_one_lists_objects() {
+        for dialect in dialects() {
+            assert_eq!(
+                super::gate_targets("SELECT 1; SHOW TABLES", dialect.as_ref()),
+                Some(GateTargets::ListsObjects)
+            );
+            assert_eq!(
+                super::gate_targets("SELECT * FROM a; SELECT * FROM b", dialect.as_ref()),
+                Some(GateTargets::Tables(vec!["a".to_owned(), "b".to_owned()]))
+            );
+        }
+    }
+
+    #[test]
+    fn sql_that_does_not_parse_has_no_gate_targets() {
+        for dialect in dialects() {
+            assert_eq!(super::gate_targets("SELECT !?", dialect.as_ref()), None);
+        }
     }
 }
 
@@ -3145,13 +3492,17 @@ mod default_expression_analysis {
 }
 
 fn canonical_object_name(name: &ObjectName) -> String {
-    let parts: Vec<String> = name
-        .0
+    canonicalize(&object_name_parts(name))
+}
+
+/// The parts of `name`, lower-cased — the ONE place an `ObjectName`
+/// becomes the strings [`canonicalize`] works on.
+fn object_name_parts(name: &ObjectName) -> Vec<String> {
+    name.0
         .iter()
         .filter_map(ObjectNamePart::as_ident)
         .map(|ident| ident.value.to_ascii_lowercase())
-        .collect();
-    canonicalize(&parts)
+        .collect()
 }
 
 /// Read-only classification pass, run via `sqlparser`'s own derived

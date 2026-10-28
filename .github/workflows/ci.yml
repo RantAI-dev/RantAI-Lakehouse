@@ -317,9 +317,44 @@ jobs:
     # twice with every test passing up to the cancel. The budget is a guard
     # against a hung test, not a speed target; a hang still ends here.
     timeout-minutes: 40
+    # OPS-12: this job links one test binary per file in
+    # `rust/crates/lakehouse-api/tests/` (68 of them), each against the whole
+    # crate, and full debug info in every binary is what filled the runner's
+    # disk (PR #186 run 40268340415: "No space left on device" in this job's
+    # step; commit 820484ba (QS-4) hit the same wall and worked around it by
+    # merging two test binaries instead of fixing the cause). `line-tables-only`
+    # keeps the file:line a backtrace prints and drops the rest of the debug
+    # information, so the same binaries take a fraction of the space.
+    #
+    # Both profiles are named because the `test` profile inherits from `dev`:
+    # dependencies are built with `dev`, the test binaries themselves with
+    # `test`.
+    #
+    # The cache key needs no change: Swatinem/rust-cache hashes the value of
+    # every environment variable whose name starts with `CARGO` into its key
+    # (its README's `env-vars` default is "CARGO CC CFLAGS CXX CMAKE RUST"),
+    # these two variables move the key on their own. The entry built with full
+    # debug info is simply not restored, and the first run after this change
+    # rebuilds the dependencies once and, on `main`, saves the new entry.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+
+      # OPS-12: the disk that ran out is the runner's, and the runner ships
+      # toolchains this job never uses. Deleting them is free space for the
+      # test binaries; the Postgres image this job needs is pulled by
+      # testcontainers itself later, so nothing this job requires is removed.
+      # `df -h /` before and after prints what the step actually freed, so the
+      # run's log carries the measurement instead of a guess.
+      - name: Free runner disk
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          df -h /
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable

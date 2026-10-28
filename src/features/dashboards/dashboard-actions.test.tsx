@@ -89,13 +89,61 @@ describe("DashboardActionsMenu history and personal space", () => {
   })
 })
 
+describe("DashboardActionsMenu downloads (BI-1)", () => {
+  it("offers Download PDF and Print when the deployment can make a PDF", async () => {
+    const onDownloadPdf = mock(() => {})
+    const onExportPdf = mock(() => {})
+    renderMenu({ onDownloadPdf, onExportPdf, pdfSupported: true })
+    fireEvent.click(await screen.findByText("Download PDF…"))
+    expect(onDownloadPdf).toHaveBeenCalledTimes(1)
+    cleanup()
+    renderMenu({ onDownloadPdf, onExportPdf, pdfSupported: true })
+    fireEvent.click(await screen.findByText("Print…"))
+    expect(onExportPdf).toHaveBeenCalledTimes(1)
+    expect(screen.queryByText("Export PDF (print)")).toBeNull()
+  })
+
+  it("keeps Download PDF disabled, saying why, when the deployment has no renderer, and Print still works", async () => {
+    const onDownloadPdf = mock(() => {})
+    const onExportPdf = mock(() => {})
+    renderMenu({ onDownloadPdf, onExportPdf, pdfSupported: false })
+    const item = (await screen.findByText("Download PDF…")).closest("[role='menuitem']") as HTMLElement
+    expect(item.getAttribute("aria-disabled") === "true" || item.hasAttribute("data-disabled")).toBe(true)
+    fireEvent.click(item)
+    expect(onDownloadPdf).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByText("Print…"))
+    expect(onExportPdf).toHaveBeenCalledTimes(1)
+  })
+
+  it("hides Download PDF for a person whose every role is switched off from downloading, and keeps Print", async () => {
+    renderMenu({ onDownloadPdf: () => {}, pdfSupported: true, canDownload: false })
+    await screen.findByText("Print…")
+    expect(screen.queryByText("Download PDF…")).toBeNull()
+  })
+})
+
+describe("DashboardActionsMenu Subscriptions… (RPT-1)", () => {
+  it("opens the subscriptions for a viewer who may download", async () => {
+    const onSubscriptions = mock(() => {})
+    renderMenu({ onSubscriptions, canWrite: false })
+    fireEvent.click(await screen.findByText("Subscriptions…"))
+    expect(onSubscriptions).toHaveBeenCalledTimes(1)
+  })
+
+  it("leaves the item out when downloads are switched off for the viewer", async () => {
+    renderMenu({ onSubscriptions: () => {}, canDownload: false })
+    await screen.findByText("Print…")
+    expect(screen.queryByText("Subscriptions…")).toBeNull()
+  })
+})
+
 // BI-18 part C review fix (SHOULD-FIX) R18: no write control for a caller without dashboard:write.
 describe("write controls (R18)", () => {
   it("the dashboard menu leaves out Rename, Duplicate and Delete for a viewer, and keeps the read actions", async () => {
     renderMenu({ canWrite: false })
     await screen.findByText("Manual")
     for (const label of ["Rename", "Duplicate", "Delete dashboard"]) expect(screen.queryByText(label)).toBeNull()
-    for (const label of ["Refresh now", "Fullscreen", "Export PDF (print)", "Export YAML", "Share…"]) {
+    for (const label of ["Refresh now", "Fullscreen", "Print…", "Export YAML", "Share…"]) {
       expect(screen.getByText(label)).toBeTruthy()
     }
   })

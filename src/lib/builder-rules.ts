@@ -63,12 +63,14 @@ const LINE_KINDS = ["bar", "hbar", "line", "area", "stacked", "combo"]
 // BI-16 part B: a progress bar is one row like a KPI; a histogram counts per range in range order, so neither sorts nor limits.
 const SINGLE_KINDS = ["kpi", "gauge", "progress", "histogram"]
 const POINT_KINDS = ["pointmap", "geoheat"]
+// BI-16 part C1 (plan D2): a Gantt chart has its own statement, ordered by start and limited to 1,001 rows, so it neither sorts nor limits.
+const OWN_STATEMENT_KINDS = ["gantt"]
 
 export function builderRules(s: BuilderState): BuilderRules {
   // BI-18 part C: heading, divider and section are static like a text note (title and content only, no data).
   const text = isStaticKind(s.kind)
   const ownColumns = s.kind === "pivot" || (s.kind === "table" && s.rowsMode)
-  const noSortOrLimit = text || SINGLE_KINDS.includes(s.kind) || POINT_KINDS.includes(s.kind) || ownColumns
+  const noSortOrLimit = text || SINGLE_KINDS.includes(s.kind) || POINT_KINDS.includes(s.kind) || OWN_STATEMENT_KINDS.includes(s.kind) || ownColumns
   // A bullet graph keeps its default order (the largest values first); only its limit is the person's.
   const sort: SortControl = noSortOrLimit || s.kind === "bullet" ? "none" : s.kind === "boxplot" ? "by-category" : s.kind === "calendar" ? "by-date" : "choice"
   const otherApplies = takesOther(s.kind, s.rowsMode) && !s.grained && !s.multiGrouped && s.limitHasEffect
@@ -107,10 +109,12 @@ export type MoreOptionsUse = {
   columnSettings: number
   /** A KPI compared with an earlier period or a goal. */
   compare: boolean
+  /** A freshness rule of the chart's own (`BI-4` part B). */
+  freshness?: boolean
 }
 
 export function moreOptionsUsed(u: MoreOptionsUse): boolean {
-  return u.steps > 0 || u.layers > 0 || u.click || u.columnSettings > 0 || u.compare
+  return u.steps > 0 || u.layers > 0 || u.click || u.columnSettings > 0 || u.compare || u.freshness === true
 }
 
 /**

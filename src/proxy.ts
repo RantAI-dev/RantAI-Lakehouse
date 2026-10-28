@@ -22,6 +22,10 @@ import { embedFrame, type EmbedPageToken } from "@/lib/embed-frame"
  * prerendered at build time would carry scripts without a nonce and a browser
  * would refuse all of them.
  *
+ * `BI-1`: the PDF print view (`/render/*`) gets the same policy (its
+ * `frame-ancestors` is `'none'`, no content site: the Gotenberg container
+ * sends no cookie) plus the headers in `renderHeaders`.
+ *
  * The sites `img-src` and `frame-src` allow are `BI-16` part B's content
  * sites, so a redirect from an allowed site to anywhere else is refused by
  * the browser:
@@ -76,9 +80,29 @@ const readContentSites = contentSiteReader((cookie, signal) =>
   }),
 )
 
+/** Whether `pathname` is (or is under) the PDF print view (`BI-1`). */
+function isRenderPath(pathname: string): boolean {
+  return pathname === "/render" || pathname.startsWith("/render/")
+}
+
 /** Whether `pathname` is (or is under) the embed pages, which get the board's own list. */
 function isEmbedPath(pathname: string): boolean {
   return pathname === "/embed" || pathname.startsWith("/embed/")
+}
+
+/**
+ * `BI-1`: the PDF print view (`/render/dashboard/<token>`) is opened by the
+ * Gotenberg container with a 2-minute token in the address. It must not be
+ * framed, cached, indexed, or leak the token in a `Referer`; the headers say
+ * so. Nothing here asks the API: the page itself posts the token to
+ * `POST /api/render/data`.
+ */
+export function renderHeaders(): Record<string, string> {
+  return {
+    "Cache-Control": "no-store",
+    "Referrer-Policy": "no-referrer",
+    "X-Robots-Tag": "noindex",
+  }
 }
 
 export async function proxy(request: NextRequest) {
@@ -87,7 +111,13 @@ export async function proxy(request: NextRequest) {
   const { pathname } = request.nextUrl
 
   let policy: string
-  if (isEmbedPath(pathname)) {
+  if (isRenderPath(pathname)) {
+    // `BI-1`: the print view is opened by Gotenberg with a 2-minute token in the
+    // address and no session, so there is no content-site list to read (the
+    // call would only be a `401`). Same builder as every page, so SEC-47's
+    // script, connect and frame rules apply; `frame-ancestors` stays `'none'`.
+    policy = contentSecurityPolicy({ nonce, development })
+  } else if (isEmbedPath(pathname)) {
     const frame = await embedFrame(pathname, askFrame)
     policy = contentSecurityPolicy({
       nonce,
@@ -111,6 +141,9 @@ export async function proxy(request: NextRequest) {
   requestHeaders.set(CSP_HEADER, policy)
   const response = NextResponse.next({ request: { headers: requestHeaders } })
   response.headers.set(CSP_HEADER, policy)
+  if (isRenderPath(pathname)) {
+    for (const [name, value] of Object.entries(renderHeaders())) response.headers.set(name, value)
+  }
   return response
 }
 

@@ -350,7 +350,8 @@ pub async fn restore_board(ch: &ChClient, id: &str, viewer: &Viewer) -> Result<R
     if !folder.is_empty() {
         let live = crate::folders::list_folders(ch, &Viewer::system()).await?;
         if !live.iter().any(|f| f.id == folder) {
-            crate::store::move_board(ch, id, "").await?;
+            // Back to the root: never a personal space, so no link matters here.
+            crate::store::move_board(ch, id, "", false).await?;
         }
     }
     Ok(Restored {

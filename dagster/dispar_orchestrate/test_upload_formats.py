@@ -178,16 +178,15 @@ def test_an_avro_file_with_a_binary_column_or_a_scalar_schema_or_other_bytes_is_
         assert harness.loads == []
 
 
-def test_an_avro_file_with_a_codec_other_than_null_or_deflate_is_unreadable_and_deflate_loads():
+def test_pr_186_review_blocker_1_an_avro_file_with_a_codec_other_than_null_is_unreadable():
+    # `PR #186 review BLOCKER 1`: the null codec only. Both readers inflate a whole block
+    # with no limit on the output, so a compressed container is refused before anything is
+    # decoded, on this side and in the API alike.
     schema = fastavro.parse_schema({"type": "record", "name": "R", "fields": [{"name": "a", "type": "int"}]})
-    for codec in ("bzip2", "xz"):
+    for codec in ("bzip2", "xz", "deflate"):
         buffer = io.BytesIO()
         fastavro.writer(buffer, schema, [{"a": 1}], codec=codec)
         _fails_with(_Harness(raw=buffer.getvalue()), UNREADABLE, _params(format="avro"))
-    buffer = io.BytesIO()
-    fastavro.writer(buffer, schema, [{"a": 1}], codec="deflate")
-    _, loaded = _load(buffer.getvalue(), "avro", "none")
-    assert loaded["rows"] == [{"a": "1"}]
 
 
 def test_an_avro_file_with_no_records_has_no_rows():

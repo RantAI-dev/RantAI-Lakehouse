@@ -74,12 +74,13 @@ Each default was the planner's recommendation.
 ## Limits to tell a customer
 
 - Up to 10 files and 2 GB (GiB: 2,147,483,648 bytes) per upload, counting all the files of one load together. A gzip or zip counts its unpacked size. Excel workbooks stay at 50 MB each. There is no row cap any more: the old 2,000,000-row limit was removed because the job's memory was measured not to follow the size of the file (`docs/plans/DATA-17-RESULT.md`).
-- The 2 GB figure is measured for **one** load at a time, on one 16 GB GitHub-hosted runner: a 2 GiB load of CSV, JSON Lines, gzip or Parquet grew the load job by 0.9 to 2.3 GiB, and finished in under two minutes (CSV 107 s). Not measured, and so not promised:
+- The 2 GB figure is measured for **one** load at a time, on one 16 GB GitHub-hosted runner: a 2 GiB load of CSV, JSON Lines, a gzipped CSV or ten Parquet files in one load grew the load job by 0.9 to 2.3 GiB, and finished in under two minutes (CSV 107 s). Those four are the formats the measurement covered. Not measured, and so not promised:
+  - a JSON array, an Avro file, a zip, or a single Parquet file at large sizes (they were measured before the streaming fix, not after it);
   - two 2 GB loads at the same time (the installation allows up to 16 loads at once, `SEC-17`);
   - a Parquet file whose single row group is larger than memory (the reader decodes one row group whole);
-  - Avro and zip files at large sizes;
   - any machine other than that runner.
 - A zip may not hold a Parquet file (decision 13; `DATA-28`).
+- An Avro file must be **uncompressed** (the null codec). A compressed container is refused, on both sides, with "This Avro file is compressed. Save it with no compression.": the Avro readers inflate a whole block with no limit on the output (apache-avro 0.21 in the API, fastavro 1.13.1 in the job), so a few MB of a compressed file of zeros would ask for gigabytes of memory. Uncompressed Avro files are the norm for an upload (`PR #186 review BLOCKER 1`).
 - An upload continues after a dropped connection only while its page stays open.
 - Several files load into one table only when their columns match.
 - Nested JSON and Avro values are kept as JSON text, not spread into columns.
@@ -92,7 +93,7 @@ Against `docs/core/specs/data-17.md`, as built in #186. "Met" means built and co
 
 | Spec row | Target | Result |
 | --- | --- | --- |
-| Formats | CSV, TSV, JSON, JSON Lines, Avro, Parquet, Excel (one sheet) | Met. JSON is a top-level array of objects (decision 11); Avro is an object container file whose top level is a record, with no codec or the deflate codec |
+| Formats | CSV, TSV, JSON, JSON Lines, Avro, Parquet, Excel (one sheet) | Met. JSON is a top-level array of objects (decision 11); Avro is an object container file whose top level is a record and which is uncompressed (the null codec: a compressed container is refused, see the limits above) |
 | Files per upload | Up to 10, in parallel | Met. Up to 10; up to 4 pieces in flight per user (decision 6) |
 | Size | Up to 2 GB, memory measured in a RESULT document | Met for one load at a time, see the limits above and `docs/plans/DATA-17-RESULT.md`. Time was not a target; it grew by 30 to 60 percent with the streaming fix |
 | Upload method | Resumable chunks, a progress bar per file | Met, with the reach of decision 7: resuming works while the page stays open |

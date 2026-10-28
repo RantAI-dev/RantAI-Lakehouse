@@ -406,13 +406,70 @@ fn elapsed_ms(elapsed_secs: f64) -> i64 {
 // `KILL QUERY` statement server-side; it is never serialized back to the
 // client.
 
-/// Build `KILL QUERY WHERE query_id = '<escaped>'` for `query_id`.
+/// Which queries a `KILL QUERY` ends. One builder for both callers (rule 4):
+/// the Operations cancel names one query by its exact id, and Stop
+/// (`POST /api/query/cancel`, `BI-5` plan D5) names every query of one run of
+/// the caller.
+pub(crate) enum KillTarget<'a> {
+    /// The query with exactly this id.
+    Exact(&'a str),
+    /// Every query whose id starts `<principal uuid>:<run id>:`. Built only
+    /// by [`KillTarget::own_run`], which takes the principal as a `Uuid` and
+    /// checks the run id is one, so the pattern cannot hold a `LIKE`
+    /// wildcard, a quote or anyone else's prefix.
+    OwnRun(String),
+    /// Every query whose id starts `<principal uuid>:`, that is every run of
+    /// the caller: the assistant's `stop_query` with no run named. Built only
+    /// by [`KillTarget::own_all`], from a `Uuid`.
+    OwnAll(String),
+}
+
+impl KillTarget<'_> {
+    /// The caller's own run: `None` unless `run_id` is a UUID.
+    pub(crate) fn own_run(principal: uuid::Uuid, run_id: &str) -> Option<KillTarget<'static>> {
+        let run = uuid::Uuid::parse_str(run_id.trim()).ok()?;
+        Some(KillTarget::OwnRun(format!("{principal}:{run}:%")))
+    }
+
+    /// All of the caller's own running queries (`stop_query` without a run).
+    pub(crate) fn own_all(principal: uuid::Uuid) -> KillTarget<'static> {
+        KillTarget::OwnAll(format!("{principal}:%"))
+    }
+
+    /// The `WHERE` condition that selects the target's queries.
+    fn condition(&self) -> String {
+        match self {
+            Self::Exact(id) => format!("query_id = {}", SqlLiteral::from(*id)),
+            Self::OwnRun(pattern) | Self::OwnAll(pattern) => {
+                format!("query_id LIKE {}", SqlLiteral::from(pattern.as_str()))
+            }
+        }
+    }
+
+    /// How many running queries the target selects right now.
+    pub(crate) fn count_sql(&self) -> String {
+        format!(
+            "SELECT count() AS n FROM system.processes WHERE {}",
+            self.condition()
+        )
+    }
+}
+
+/// Build the `KILL QUERY` for `target`. An exact id is killed as before; a
+/// person's run or runs are killed `ASYNC`, so the request answers without waiting for
+/// each query to wind down.
+///
 /// Extracted from [`cancel_workload_body`] purely so it can be unit tested
 /// (string construction only) without ever touching `ClickHouse` — see the
 /// module-level safety note in the Task 2.6 brief: no `KILL QUERY` may run
 /// against the live cluster during this work.
-fn kill_query_sql(query_id: &str) -> String {
-    format!("KILL QUERY WHERE query_id = {}", SqlLiteral::from(query_id))
+pub(crate) fn kill_query_sql(target: &KillTarget<'_>) -> String {
+    let asynchronous = !matches!(target, KillTarget::Exact(_));
+    format!(
+        "KILL QUERY WHERE {}{}",
+        target.condition(),
+        if asynchronous { " ASYNC" } else { "" }
+    )
 }
 
 /// `POST /api/ops/workloads/{id}/cancel` — kill the `ClickHouse` query
@@ -459,7 +516,8 @@ async fn cancel_workload_body(ch: &ChClient, id: &str) -> Result<Option<Value>, 
     if query_id.is_empty() {
         return Ok(None);
     }
-    ch.exec(&kill_query_sql(query_id), None).await?;
+    ch.exec(&kill_query_sql(&KillTarget::Exact(query_id)), None)
+        .await?;
     let elapsed_secs = str_col(row, "elapsed").parse::<f64>().unwrap_or(0.0);
     Ok(Some(json!({
         "id": id,
@@ -916,7 +974,7 @@ mod tests {
     #[test]
     fn kill_query_sql_targets_the_exact_query_id() {
         assert_eq!(
-            kill_query_sql("abcd-1234"),
+            kill_query_sql(&KillTarget::Exact("abcd-1234")),
             "KILL QUERY WHERE query_id = 'abcd-1234'"
         );
     }
@@ -928,9 +986,40 @@ mod tests {
         // same escaping discipline as `lineage_body`'s `SqlLiteral` usage
         // applies here.
         assert_eq!(
-            kill_query_sql("o'brien"),
+            kill_query_sql(&KillTarget::Exact("o'brien")),
             "KILL QUERY WHERE query_id = 'o''brien'"
         );
+    }
+
+    #[test]
+    fn a_runs_queries_are_killed_by_the_callers_own_prefix_and_async() {
+        let me = uuid::Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
+        let target =
+            KillTarget::own_run(me, "22222222-2222-4222-8222-222222222222").expect("a uuid");
+        assert_eq!(
+            kill_query_sql(&target),
+            "KILL QUERY WHERE query_id LIKE \
+             '11111111-1111-4111-8111-111111111111:22222222-2222-4222-8222-222222222222:%' ASYNC"
+        );
+        assert_eq!(
+            target.count_sql(),
+            "SELECT count() AS n FROM system.processes WHERE query_id LIKE \
+             '11111111-1111-4111-8111-111111111111:22222222-2222-4222-8222-222222222222:%'"
+        );
+    }
+
+    #[test]
+    fn a_run_id_that_is_not_a_uuid_builds_no_statement() {
+        let me = uuid::Uuid::nil();
+        for bad in [
+            "",
+            "%",
+            "x' OR '1'='1",
+            "2222:%",
+            "22222222-2222-4222-8222-22222222222%",
+        ] {
+            assert!(KillTarget::own_run(me, bad).is_none(), "{bad}");
+        }
     }
 
     #[test]

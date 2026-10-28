@@ -27,6 +27,16 @@ orphan clean-up, as with `sink._replace_changing_types`).
 `install()` is idempotent and is called by `sink.py` before a pipeline is built. If a `dlt`
 upgrade changes the job, the marker is not produced, the load goes back to the old path, and
 `test_load_memory.py` fails: the memory test is the guard of this module.
+
+# The schemas of the files (`PR #186 review SHOULD-FIX 2`)
+
+The files of one load do not all have the same schema: `dlt` starts a new normalized file when a
+table's column count changes, which a REST or Mongo source does when a later record brings a
+field. `pa.Table.from_batches` refuses batches of different schemas, so the schemas are unified
+first (`unified_schema`) and every batch is laid out as the unified one, a column a file does not
+have becoming null in it. The table is evolved to that schema inside the same transaction, so the
+schema and the rows commit together: `dlt` evolves the table with the schema of its dataset (the
+first file's), which leaves a later file's new column out of the table and the write refused.
 """
 
 from __future__ import annotations
@@ -70,7 +80,38 @@ class _StreamedDataset:
         return _Streamed(self._dataset)
 
 
-def groups(dataset: Any) -> Iterator[pa.Table]:
+def unified_schema(dataset: Any) -> pa.Schema:
+    """The one schema every file of `dataset` is read as.
+
+    `PR #186 review SHOULD-FIX 2`: `dlt` starts a new normalized file when a table's column
+    count changes (a later record of a REST or Mongo source brings a field), so the files of
+    one load do not all have the same schema. `pa.Table.from_batches` refuses batches of
+    different schemas, which is where the streamed write failed. The schemas are unified
+    here instead: a column a file does not have becomes null in it, and the column is kept
+    (`dlt`'s own path drops it, because the dataset it reads takes the schema of its first
+    file). The promotion is the permissive one, as the dataset scanner's is."""
+    schemas = []
+    for path in dataset.files:
+        with pq.ParquetFile(path, pre_buffer=False) as parquet_file:
+            schemas.append(parquet_file.schema_arrow)
+    if not schemas:
+        return dataset.schema
+    return pa.unify_schemas(schemas, promote_options="permissive")
+
+
+def _fitted(batch: pa.RecordBatch, schema: pa.Schema) -> pa.RecordBatch:
+    """`batch` with the unified schema: the columns it has cast to it, the ones it does not
+    have as nulls (`PR #186 review SHOULD-FIX 2`)."""
+    arrays = []
+    for field in schema:
+        if field.name in batch.schema.names:
+            arrays.append(batch[field.name].cast(field.type))
+        else:
+            arrays.append(pa.nulls(batch.num_rows, type=field.type))
+    return pa.RecordBatch.from_arrays(arrays, schema=schema)
+
+
+def groups(dataset: Any, schema: pa.Schema | None = None) -> Iterator[pa.Table]:
     """The rows of `dataset`'s files as tables of up to `FLUSH_BYTES` bytes (the last smaller).
 
     Each file is read with `ParquetFile.iter_batches` and `pre_buffer=False`, not through the
@@ -78,19 +119,26 @@ def groups(dataset: Any) -> Iterator[pa.Table]:
     own threads without regard to how slowly its consumer writes (a 328 MiB file, written in
     6 MiB groups, held 300 MiB of Arrow memory at once; 36 MiB through `iter_batches`), and
     `pre_buffer=True`, the default, caches every byte range it fetched until the file is closed
-    (the whole file again). Lists the files in the order `dlt` gave them."""
+    (the whole file again). Lists the files in the order `dlt` gave them.
+
+    `PR #186 review SHOULD-FIX 2`: every batch is laid out as `schema`, the one schema the
+    files of the load share (`unified_schema`), so files of different columns join into one
+    table instead of raising."""
+    if schema is None:
+        schema = unified_schema(dataset)
     pending: list[pa.RecordBatch] = []
     size = 0
     for path in dataset.files:
         with pq.ParquetFile(path, pre_buffer=False) as parquet_file:
             for batch in parquet_file.iter_batches(batch_size=READ_ROWS):
-                pending.append(batch)
-                size += batch.nbytes
+                fitted = _fitted(batch, schema)
+                pending.append(fitted)
+                size += fitted.nbytes
                 if size >= FLUSH_BYTES:
-                    yield pa.Table.from_batches(pending)
+                    yield pa.Table.from_batches(pending, schema=schema)
                     pending, size = [], 0
     if pending:
-        yield pa.Table.from_batches(pending)
+        yield pa.Table.from_batches(pending, schema=schema)
 
 
 def _write(table: Any, data: Any, write_disposition: str, original: Any) -> None:
@@ -102,11 +150,27 @@ def _write(table: Any, data: Any, write_disposition: str, original: Any) -> None
     if not isinstance(data, _Streamed):
         original(table=table, data=data, write_disposition=write_disposition)
         return
-    from dlt.common.libs.pyiceberg import ensure_iceberg_compatible_arrow_data
+    from dlt.common.libs.pyiceberg import (
+        ensure_iceberg_compatible_arrow_data,
+        ensure_iceberg_compatible_arrow_schema,
+    )
 
+    schema = unified_schema(data.dataset)
     first = True
     with table.transaction() as transaction:
-        for group in groups(data.dataset):
+        # The table must carry every column the load writes: the files of one load do not
+        # all have the same columns (`PR #186 review SHOULD-FIX 2`), and the unified schema
+        # is their union. `dlt` evolves the table with the schema of its dataset (the first
+        # file's), which leaves a later file's new column out of the table; the write is
+        # then refused ("PyArrow table contains more columns"). The column is added here,
+        # inside the transaction, so the schema and the rows commit together. Only the
+        # columns the table does not have are added: the ones it has are left as they are.
+        held = {field.name for field in table.schema().fields}
+        missing = pa.schema([field for field in schema if field.name not in held])
+        if missing.names:
+            with transaction.update_schema() as update:
+                update.union_by_name(ensure_iceberg_compatible_arrow_schema(missing))
+        for group in groups(data.dataset, schema):
             fitted = ensure_iceberg_compatible_arrow_data(group)
             if write_disposition == "replace" and first:
                 transaction.overwrite(fitted)
@@ -118,7 +182,7 @@ def _write(table: Any, data: Any, write_disposition: str, original: Any) -> None
             # callers rely on: it is the snapshot that carries a schema the load just evolved
             # (`history.ensure_columns` adds a column with a zero-row load, and a scan reads the
             # schema of the table's CURRENT SNAPSHOT, so without it the column is not seen).
-            empty = ensure_iceberg_compatible_arrow_data(data.dataset.schema.empty_table())
+            empty = ensure_iceberg_compatible_arrow_data(schema.empty_table())
             (transaction.overwrite if write_disposition == "replace" else transaction.append)(empty)
 
 

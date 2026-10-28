@@ -314,6 +314,8 @@ function stubApi({
     if (path.includes("/api/auth/me")) {
       return json({ id: "u1", name: "Reader", email: null, roles: ["Analyst"], permissions, tenants: [] })
     }
+    // BI-14: "Used by" on the Lineage tab (no chart reads the stubbed table).
+    if (path.includes("/api/governance/lineage/used-by")) return json({ supported: true, table: "bronze.demo_orders", charts: [], hiddenCount: 0 })
     if (path.includes("/api/governance/lineage")) return json(lineage)
     if (path.endsWith("/profile")) return profile instanceof Response ? profile.clone() : json(profile)
     if (path.endsWith("/maintenance")) return json({ configured: false })

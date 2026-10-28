@@ -32,7 +32,49 @@
 //! expires; the maximum lifetime bounds that. Withdraw one by `jti` is
 //! exact.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
+
+/// What a viewer of a signed embed may do with one dashboard filter
+/// (`BI-26`, feature decision 5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FilterMode {
+    /// The token must set it and the viewer cannot change it.
+    Locked,
+    /// The viewer sees it and changes it.
+    Editable,
+    /// Not shown; the dashboard's saved value applies. The default for a
+    /// filter nobody has chosen a mode for.
+    Hidden,
+}
+
+/// At most this many filter modes are stored per dashboard.
+pub const MAX_FILTER_MODES: usize = 100;
+
+/// Validate the filter modes a manager saves: at most [`MAX_FILTER_MODES`]
+/// entries, each keyed by a non-empty column name of at most 200 characters.
+/// Whether each column is a filter of the dashboard is the route's check (it
+/// has the dashboard).
+///
+/// # Errors
+///
+/// A fixed sentence.
+pub fn validate_filter_modes(modes: &BTreeMap<String, FilterMode>) -> Result<(), String> {
+    if modes.len() > MAX_FILTER_MODES {
+        return Err(format!(
+            "at most {MAX_FILTER_MODES} filter modes can be saved per dashboard."
+        ));
+    }
+    if modes
+        .keys()
+        .any(|c| c.is_empty() || c.chars().count() > 200)
+    {
+        return Err("a filter mode needs a column name of 1 to 200 characters.".to_owned());
+    }
+    Ok(())
+}
 
 /// At most this many allowed origins per dashboard.
 pub const MAX_ORIGINS: usize = 20;
@@ -66,6 +108,9 @@ pub struct EmbedAccess {
     pub withdrawn: Vec<WithdrawnToken>,
     /// Sites allowed to frame the embed pages, normalised.
     pub origins: Vec<String>,
+    /// Each dashboard filter's embed mode, by column (`BI-26`, plan D2). A
+    /// column missing here is [`FilterMode::Hidden`]; see [`Self::mode_of`].
+    pub filter_modes: BTreeMap<String, FilterMode>,
 }
 
 impl EmbedAccess {
@@ -98,7 +143,19 @@ impl EmbedAccess {
             revoked_before,
             withdrawn,
             origins,
+            filter_modes: BTreeMap::new(),
         }
+    }
+
+    /// The embed mode of the filter on `column`: what a manager chose, else
+    /// [`FilterMode::Hidden`] (a new filter shows nothing until someone
+    /// chooses; feature decision 5).
+    #[must_use]
+    pub fn mode_of(&self, column: &str) -> FilterMode {
+        self.filter_modes
+            .get(column)
+            .copied()
+            .unwrap_or(FilterMode::Hidden)
     }
 
     /// Whether a token with this `iat` and `jti` has been withdrawn.
@@ -303,6 +360,29 @@ mod tests {
 
     fn strings(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn a_filter_without_a_chosen_mode_is_hidden_and_the_modes_are_bounded() {
+        let mut access = EmbedAccess::default();
+        assert_eq!(access.mode_of("region"), FilterMode::Hidden);
+        access
+            .filter_modes
+            .insert("region".to_owned(), FilterMode::Editable);
+        assert_eq!(access.mode_of("region"), FilterMode::Editable);
+        assert_eq!(access.mode_of("year"), FilterMode::Hidden);
+        let mut modes = BTreeMap::new();
+        assert!(validate_filter_modes(&modes).is_ok());
+        modes.insert(String::new(), FilterMode::Locked);
+        assert!(validate_filter_modes(&modes).is_err());
+        let many: BTreeMap<String, FilterMode> = (0..=MAX_FILTER_MODES)
+            .map(|i| (format!("c{i}"), FilterMode::Hidden))
+            .collect();
+        assert!(validate_filter_modes(&many).is_err());
+        assert_eq!(
+            serde_json::to_string(&FilterMode::Locked).unwrap(),
+            "\"locked\""
+        );
     }
 
     #[test]

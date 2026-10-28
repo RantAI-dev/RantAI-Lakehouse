@@ -11,8 +11,9 @@ use lakehouse_test_support as _;
 use lakehouse_store::reporting_settings::{ReportingSettings, get, upsert};
 use sqlx::PgPool;
 
-/// Settings with the formatting defaults of migration `0086` and the empty
-/// content-site list of `0087`.
+/// Settings with the formatting defaults of migration `0086`, the empty
+/// content-site list of `0087`, the empty denied-roles list of `0088` and the
+/// empty report-domain list of `0089`.
 fn settings(zone: &str, week: &str) -> ReportingSettings {
     ReportingSettings {
         time_zone: zone.to_owned(),
@@ -21,6 +22,11 @@ fn settings(zone: &str, week: &str) -> ReportingSettings {
         company_palette: Vec::new(),
         fonts: SHIPPED.iter().map(|f| (*f).to_owned()).collect(),
         content_sites: Vec::new(),
+        download_denied_roles: Vec::new(),
+        report_allowed_domains: Vec::new(),
+        public_links_enabled: true,
+        result_cache_mode: "default".to_owned(),
+        result_cache_minutes: None,
     }
 }
 
@@ -106,8 +112,28 @@ async fn the_formatting_settings_round_trip_and_a_row_saved_before_them_keeps_th
         "https://img.example".to_owned(),
         "https://cdn.example:8443".to_owned(),
     ];
+    chosen.download_denied_roles = vec!["Viewer".to_owned(), "Guest".to_owned()];
+    chosen.report_allowed_domains = vec!["example.com".to_owned(), "partner.example".to_owned()];
+    chosen.public_links_enabled = false;
     assert_eq!(upsert(&pool, &chosen, "u").await.expect("upsert"), chosen);
     assert_eq!(get(&pool).await.expect("get"), Some(chosen));
+    Ok(())
+}
+
+/// `BI-1` T1 (D7): the table is the backstop for the denied-role list's shape.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_table_refuses_an_empty_role_name_and_more_than_a_hundred(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    for roles in [
+        vec![String::new()],
+        (0..101).map(|i| format!("role-{i}")).collect::<Vec<_>>(),
+    ] {
+        let mut s = settings("UTC", "monday");
+        s.download_denied_roles = roles;
+        assert!(upsert(&pool, &s, "u").await.is_err());
+    }
+    assert_eq!(get(&pool).await.expect("get"), None, "nothing was stored");
     Ok(())
 }
 
@@ -173,5 +199,70 @@ async fn the_table_refuses_content_sites_that_are_not_https_origins_or_are_too_m
     let mut fifty = settings("UTC", "monday");
     fifty.content_sites = (0..50).map(|i| format!("https://s{i}.example")).collect();
     assert_eq!(upsert(&pool, &fifty, "u").await.expect("fifty"), fifty);
+    Ok(())
+}
+
+/// `RPT-1` T1 (D1): the table is the backstop for the report-domain list's shape.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_table_refuses_an_empty_report_domain_and_more_than_fifty(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    for domains in [
+        vec![String::new()],
+        (0..51).map(|i| format!("d{i}.example")).collect::<Vec<_>>(),
+    ] {
+        let mut s = settings("UTC", "monday");
+        s.report_allowed_domains = domains;
+        assert!(upsert(&pool, &s, "u").await.is_err());
+    }
+    assert_eq!(get(&pool).await.expect("get"), None, "nothing was stored");
+    Ok(())
+}
+
+/// `BI-4` part B T3 (D7): the rule round-trips, a row saved before it reads
+/// as `default`, and the table refuses minutes out of range or sent with a
+/// mode that takes none.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_result_cache_rule_round_trips_and_the_table_refuses_a_bad_one(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let stored = upsert(&pool, &settings("UTC", "monday"), "u")
+        .await
+        .expect("upsert");
+    assert_eq!(stored.result_cache_mode, "default");
+    assert_eq!(stored.result_cache_minutes, None);
+
+    for (mode, minutes) in [
+        ("fresh", None),
+        ("minutes", Some(1)),
+        ("minutes", Some(1440)),
+    ] {
+        let mut s = settings("UTC", "monday");
+        s.result_cache_mode = mode.to_owned();
+        s.result_cache_minutes = minutes;
+        let back = upsert(&pool, &s, "u").await.expect("upsert");
+        assert_eq!(back, s);
+        assert_eq!(get(&pool).await.expect("get"), Some(s));
+    }
+
+    for (mode, minutes) in [
+        ("minutes", Some(0)),
+        ("minutes", Some(1441)),
+        ("minutes", None),
+        ("fresh", Some(5)),
+        ("default", Some(5)),
+        ("sometimes", None),
+    ] {
+        let mut s = settings("UTC", "monday");
+        s.result_cache_mode = mode.to_owned();
+        s.result_cache_minutes = minutes;
+        assert!(upsert(&pool, &s, "u").await.is_err(), "{mode} {minutes:?}");
+    }
+    let kept = get(&pool).await.expect("get").expect("row");
+    assert_eq!(
+        kept.result_cache_minutes,
+        Some(1440),
+        "a refusal changes nothing"
+    );
     Ok(())
 }

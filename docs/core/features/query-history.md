@@ -65,6 +65,8 @@ recorded the same way; the chat's `run_sql` is not recorded, as today.
 - History covers 14 days. Runs from before this release have no table list, so the table filter misses them.
 - A Bronze table's name is known once its detail is loaded, so the first suggestion for a new Bronze table may wait
   for that request.
+- History is per user, not per tenant: a user who changes tenant still sees their own earlier runs from the
+  other tenant.
 
 ## Acceptance checklist
 

@@ -395,13 +395,24 @@ async fn dependent_charts(
 /// The table key a graph node id stands for: `table:silver.x` and
 /// `table:serving.x` are warehouse tables, `bronze:x` is `bronze.x`; every
 /// other node (a dataset, a connector, an Iceberg copy) has no columns here.
-fn node_table_key(node_id: &str) -> Option<String> {
+pub(super) fn node_table_key(node_id: &str) -> Option<String> {
     if let Some(table) = node_id.strip_prefix("table:") {
         return Some(graph_key(&table.to_ascii_lowercase()));
     }
     node_id
         .strip_prefix("bronze:")
         .map(|t| format!("bronze.{}", t.to_ascii_lowercase()))
+}
+
+/// The rows `principal` may read: the one rule the graph's `columnMappings`,
+/// the chart route and the used-by list all apply (`BI-14`).
+pub(super) fn scope_for(principal: &Principal, tenant: Option<uuid::Uuid>, shared: bool) -> Scope {
+    Scope {
+        tenant,
+        all_tenants: tenant.is_none() && crate::routes::catalog::is_unrestricted(principal),
+        shared,
+        dashboards: principal.has("dashboard:read"),
+    }
 }
 
 /// The recorded mappings that touch any of the focus nodes, as the table
@@ -418,12 +429,7 @@ pub(crate) async fn mappings_touching(
     let Some(pool) = state.pg.as_deref() else {
         return json!([]);
     };
-    let scope = Scope {
-        tenant,
-        all_tenants: tenant.is_none() && crate::routes::catalog::is_unrestricted(principal),
-        shared,
-        dashboards: principal.has("dashboard:read"),
-    };
+    let scope = scope_for(principal, tenant, shared);
     let keys: BTreeSet<String> = focus_nodes
         .iter()
         .filter_map(|n| node_table_key(n))

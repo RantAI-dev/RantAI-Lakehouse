@@ -162,6 +162,8 @@ pub(super) fn handles(name: &str) -> bool {
     super::metrics::handles(name)
         // BI-18 part C: the tab tools ride the same guard arm.
         || super::tabs::handles(name)
+        // BI-16 part C2: the map list rides it too.
+        || super::maps::handles(name)
         || matches!(
             name,
             "list_formula_functions"
@@ -195,6 +197,9 @@ pub(super) async fn run(
     if super::tabs::handles(name) {
         return super::tabs::run(state, principal, name, args).await;
     }
+    if super::maps::handles(name) {
+        return super::maps::list_maps(state).await;
+    }
     match name {
         "list_formula_functions" => list_formula_functions(),
         "list_calculated_fields" => list_calculated_fields(state, args).await,
@@ -227,5 +232,30 @@ pub(super) async fn run(
             api_result_to_value(params::delete(State(state.clone()), who, Query(q)).await).await
         }
         other => json!({ "error": format!("unknown tool: {other}") }),
+    }
+}
+
+#[cfg(test)]
+mod spatial_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    /// `BI-16` part C3 (T10): the function list the assistant reads has both
+    /// spatial functions, with their help.
+    #[test]
+    fn list_formula_functions_lists_distance_and_region_of() {
+        let listed = super::list_formula_functions();
+        let functions = listed["functions"].as_array().expect("the function list");
+        for name in ["Distance", "RegionOf"] {
+            let entry = functions
+                .iter()
+                .find(|f| f["name"] == name)
+                .unwrap_or_else(|| panic!("{name} is not listed"));
+            assert_eq!(entry["category"], "spatial");
+            assert!(
+                entry["signature"]
+                    .as_str()
+                    .is_some_and(|s| s.starts_with(name))
+            );
+        }
     }
 }
