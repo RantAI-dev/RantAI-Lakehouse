@@ -1009,3 +1009,52 @@ After the gates: every `pr192*` container, volume and image was removed
   `sqlx` 0.9, through the production helper, with a regression test
   and a mutation; G6's "PostgreSQL discover" passes.
 - No open BLOCKER from this round.
+
+### Review round 4 (planner, 2026-10-28, at `1bd6e23d`)
+
+The tree reviewed is the round 4 handoff (`b271254f`) plus a conflict-free
+merge of `main` at `54b4c33c` (PR #269: the test server sweeps its
+databases, and the Rust test job's budget is 60 minutes). The PR's earlier
+CI run on `b271254f` was cancelled at the old 40-minute budget, not failed
+by a test.
+
+- **BLOCKER 10 (provider install): closed.** `main()` installs `ring`
+  first, before the runtime is built (`src/main.rs`). Calling
+  `install_default_provider` again is safe: it returns `Ok` when a default
+  is already present, so two tests in one binary can both call it. The
+  consumer table in the handoff (section 5) matches `Cargo.toml` and the
+  cited sources.
+- **BLOCKER 12 (`VerifyCa` at an IP): closed.**
+  `tests/crypto_provider.rs` dials the production helper
+  `pg_options_for_address` at `127.0.0.1` through the shared `tls_proxy`,
+  with a certificate that names `localhost`. The mutation (install
+  removed → rustls panic) is quoted. G6 "PostgreSQL discover" passes,
+  locally and in CI.
+- **The `sqlx` 0.9 merge:** the one run-time statement this branch owns
+  (`connector_deprovision::drop_publication`) is wrapped in
+  `AssertSqlSafe`, with the reason at the site. No blanket wrapper.
+- **The lock:** `main`'s lock plus `postgres-protocol` 0.6.12 and
+  `fallible-iterator` 0.2.0, as stated. `cargo metadata --locked
+  --offline` passes, and `rust/Cargo.lock` is unchanged after the full
+  run.
+- **Note, not a finding:** in `rust/crates/lakehouse-api/Cargo.toml` the
+  `SEC-14` comment for `rcgen` now sits above `SEC-41`'s comment for the
+  same entry. Both reasons are true; tidy when the file is next touched.
+
+Reviewer's verification at `1bd6e23d`, foreground, shared target,
+`--locked` on every cargo step:
+
+- `cargo metadata --locked --offline --format-version 1`: ok.
+- `cargo fmt --check`: ok.
+- `cargo clippy --locked --workspace --all-targets --all-features -j 2 -- -D warnings`:
+  exit 0, `Finished` in 5m 09s.
+- `cargo test --locked --workspace --no-fail-fast -j 2`: 158 binaries,
+  **8397 passed, 0 failed, 49 ignored**.
+- `cargo deny check`: advisories, bans, licenses and sources ok.
+- `docker compose -f docker-compose.yml --profile '*' config --quiet`,
+  with dummy values for the must-set variables: ok.
+- `git status`: clean.
+- CI on `1bd6e23d`: 36 pass, 3 skipped, 0 failed. That includes G4, both
+  G6 matrices, the G6 Oracle job, `cargo deny` and both gitleaks jobs.
+
+**No open BLOCKER. Ready to merge.**
