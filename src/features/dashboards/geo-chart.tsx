@@ -41,12 +41,16 @@ export function GeoChart({ spec, rows, dark, onDataClick, format, locale, byValu
   // The outcome is keyed by the map it is for, so switching maps shows the
   // loading state until the new one answers (no state reset inside the effect).
   const [loaded, setLoaded] = React.useState<{ id: string; ok: boolean } | null>(null);
+  // Depend on whether the map is known, not on `entry`: an uploaded map's
+  // entry is rebuilt on every `mapEntry` call, so depending on the object
+  // re-ran this effect each render and looped forever (found in BI-19 QA).
+  const known = entry !== undefined;
   React.useEffect(() => {
-    if (!entry) return;
+    if (!known) return;
     let alive = true;
     void ensureMap(mapId, loadMap).then((ok) => { if (alive) setLoaded({ id: mapId, ok }); });
     return () => { alive = false; };
-  }, [mapId, entry, loadMap]);
+  }, [mapId, known, loadMap]);
 
   if (!entry) {
     return (
