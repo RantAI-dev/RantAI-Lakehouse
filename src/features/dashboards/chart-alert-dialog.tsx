@@ -11,6 +11,8 @@ import { readableErrorMessage } from "@/lib/notify-message";
 import { notifySuccess } from "@/lib/notify";
 import { alertRuleService } from "@/services";
 import type { AlertCondition } from "@/services/contracts/alerts";
+import { displayColumn } from "@/lib/chart-joins";
+import { OTHER_FLAG } from "@/lib/chart-shape";
 import { alertNumberShape } from "./chart-alert";
 
 const selectClass = "h-8 rounded-md border border-input bg-background px-2 text-sm";
@@ -35,6 +37,8 @@ export type AlertChart = {
    * the server's save-time check stays the authority. Absent means true.
    */
   readonly latestPoint?: boolean;
+  /** Result column to the legend's label ("sum of visitors"); a column not in it reads as itself (QA-7). */
+  readonly labels?: Readonly<Record<string, string>>;
 };
 
 /** The sentence for a chart sorted by value. */
@@ -61,10 +65,11 @@ export function ChartAlertDialog({
   const shape = alertNumberShape(chart.kind);
   const sortedByValue = shape === "series" && chart.latestPoint === false;
   const conditions: AlertCondition[] = shape === "none" || sortedByValue ? ["any_rows"] : ["above", "below", "any_rows"];
-
+  // QA-7: the top-N "Other" bucket's flag is not a series; the rest read as the legend does.
+  const seriesChoices = chart.measures.filter((m) => m !== OTHER_FLAG);
   const [condition, setCondition] = React.useState<AlertCondition>(conditions[0]);
   const [threshold, setThreshold] = React.useState("");
-  const [series, setSeries] = React.useState(chart.measures[0] ?? "");
+  const [series, setSeries] = React.useState(seriesChoices[0] ?? "");
   const [target, setTarget] = React.useState(userEmail ?? "");
   const [name, setName] = React.useState(`Alert: ${chart.title}`);
   const [problem, setProblem] = React.useState<string | null>(null);
@@ -135,7 +140,7 @@ export function ChartAlertDialog({
             <div className="grid gap-1.5">
               <Label htmlFor="chart-alert-series">Series (its latest point is read)</Label>
               <select id="chart-alert-series" className={selectClass} value={series} onChange={(e) => setSeries(e.target.value)}>
-                {chart.measures.map((m) => <option key={m} value={m}>{m}</option>)}
+                {seriesChoices.map((m) => <option key={m} value={m}>{chart.labels?.[m] ?? displayColumn(m)}</option>)}
               </select>
             </div>
           ) : null}

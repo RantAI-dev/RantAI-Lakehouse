@@ -51,6 +51,19 @@ describe("chartHasLatestPoint", () => {
 })
 
 describe("ChartAlertDialog", () => {
+  it("leaves the top-N __other column out of the series and labels the rest as the legend does", async () => {
+    // BI-19 owner QA 2026-10-28, QA-7
+    const calls = mockApi()
+    open({ id: "c5", title: "Trend", kind: "line", measures: ["sum_visitors", "__other", "avg_visitors"], labels: { sum_visitors: "sum of visitors", avg_visitors: "avg of visitors" } } as typeof line)
+    const series = screen.getByLabelText(/Series/) as HTMLSelectElement
+    expect(Array.from(series.options).map((o) => o.value)).toEqual(["sum_visitors", "avg_visitors"])
+    expect(Array.from(series.options).map((o) => o.textContent)).toEqual(["sum of visitors", "avg of visitors"])
+    fireEvent.change(screen.getByLabelText("Line"), { target: { value: "5" } })
+    fireEvent.click(screen.getByRole("button", { name: "Save alert" }))
+    await waitFor(() => expect(calls.length).toBe(1))
+    expect(calls[0].body).toMatchObject({ series: "sum_visitors" })
+  })
+
   it("offers only 'returns any rows' for a chart sorted by value, with the reason, and hides the series", async () => {
     const calls = mockApi()
     open({ id: "c4", title: "By province", kind: "bar", measures: ["sum_visitors"], latestPoint: false } as typeof line)
