@@ -742,12 +742,16 @@ PostgreSQL and SQL Server dials:
   - Unset or empty: PostgreSQL and SQL Server dials require encryption
     (`Require` / `EncryptionLevel::Required`) without checking the server
     certificate against a custom root CA.
-  - Set to a PEM file path: PostgreSQL dials verify the server certificate and
-    hostname (`verify-full` in `pg_probe`, `VerifyCa` in sqlx). SQL Server
-    dials verify the server certificate against that CA bundle via Tiberius's
-    `trust_cert_ca`, which adds the CA to the native system roots (so SQL Server
-    accepts either the configured CA or any public root, unlike PostgreSQL which
-    trusts only the configured CA bundle).
+  - Set to a PEM file path: the PostgreSQL connection test (`pg_probe`) verifies
+    the server certificate and the host name (`verify-full`) against that bundle
+    alone. The `sqlx` dials (table discovery, table listing, CDC clean-up)
+    verify the chain only (`VerifyCa`): they dial the approved address rather
+    than the name, so a name check could never pass; they trust the bundle
+    plus the public webpki roots `sqlx` ships with. SQL Server dials verify the
+    server certificate against that CA bundle via Tiberius's `trust_cert_ca`,
+    which adds the CA to the native system roots (so SQL Server accepts either
+    the configured CA or any public root, unlike the PostgreSQL connection
+    test, which trusts only the configured CA bundle).
   - If `CONNECTOR_TLS_CA_FILE` is set to an unreadable or non-existent path,
     or contains no valid PEM certificates, `lakehouse-api` fails fast at startup
     with an error naming the variable.
