@@ -145,3 +145,153 @@ Rejected:
 - 7: rejected (BLOCKER 1).
 
 Open: BLOCKER 1, SHOULD-FIX 2 to 5.
+
+### Handoff (round 1 fixes)
+
+Developer: a non-Opus agent. Branch `feat/data-35-upload-folders`, worktree
+`/home/shiro/rantai/wt-pr259`, base `main` at `481fd7e8`. Nothing was opened,
+merged or pushed to `main`; the branch is pushed to
+`origin/feat/data-35-upload-folders`.
+
+#### Commits
+
+| Finding | Commit | What |
+| --- | --- | --- |
+| SHOULD-FIX 3 (the merge) | `d04a84cf` | `main` merged in; `CHANGELOG.md` and `docs/core/BACKLOG.md` resolved by hand |
+| BLOCKER 1 | `76fa1a5e` | the console sends the folder the Table step shows; the store's folder input is three states |
+| SHOULD-FIX 2 | `59f3d47e` | the migration header's false reason for `NO ACTION`; `delete_tenant`'s `# Errors` |
+| SHOULD-FIX 4 | `59185a9f` | the stale sentence at the end of the `DATA-35` changelog entry |
+| SHOULD-FIX 5 | `4b7dc55e` | one `FOLDER_ID_RULE`; the rename audit records `changed.name` |
+
+#### What each finding got
+
+**BLOCKER 1.** The console now sends what the picker shows: `upload-file-page.tsx`
+sends `folderId: folderId ?? null` whenever the picker is rendered (a picker that
+could not be read sends no folder, and the table's remembered folder applies),
+and `uploads.ts` `retryInput` sends `upload.folderId ?? null`. The store's folder
+input became three states, `ClaimFolder` (`Keep`, `None`, `Some(folder)`, not an
+`Option<Option<String>>`): an explicit "no folder" sets `folder_id = NULL` on the
+primary and on every file of a grouped load and sets the claim's folder to none
+(the claim records the latest load's choice, AD-4); an absent `folderId` still
+falls back to the claim's folder, for API callers. The comment at
+`upload-file-page.tsx` that said the folder shown is the one sent was false and
+now says what the code does. Tests: a store test for the three states, and three
+route tests (a re-load with `folderId: null` of a file that sits in a folder; an
+absent `folderId` that uses the claim's folder; a grouped load with `null`). The
+three console tests that pinned the omission now pin the sending of `null`. The
+feature page's line about a table remembering its folder and the `DATA-35`
+changelog entry were rewritten to match.
+
+**SHOULD-FIX 2.** `NO ACTION` is kept; the sentence that said `RESTRICT` "would
+fail on whichever row the cascade reached first" is corrected (both are checked at
+the end of the statement, so a tenant cascade over a chain of folders succeeds
+under either; `NO ACTION` can also be deferred). The real consequence is now
+written where the reader looks: `identity::delete_tenant`'s `# Errors` names the
+`23503` through `file_upload.folder_id`'s `RESTRICT`.
+
+**SHOULD-FIX 4.** The sentence "The Rust and console tests of this change were
+written but not run on the machine they were written on; the pull request's CI
+runs them." is gone.
+
+**SHOULD-FIX 5.** `FOLDER_ID_RULE` is defined once, in `routes/uploads.rs`, and
+the folders' routes read it (`pub(super)`). The rename audit records
+`changed.name`, the name the folder ended up with, not the one that was typed
+(the store trims it); the route test renames a folder to `"  Old  "` and pins the
+audit's name as `"Old"`.
+
+#### The merge, per file
+
+- `docs/core/BACKLOG.md`: every row is `main`'s, unchanged — the statuses, the PR
+  numbers and the dates of `BI-1`, `BI-4`, `BI-5`, `BI-16`, `BI-17`, `BI-19`,
+  `BI-26`, `DATA-17`, `DATA-18`, `SEC-20`, `OPS-12`, `OPS-13` and the rest. Only
+  `DATA-35`'s own text is this branch's: its row in the feature table, its entry
+  in "Ready to start", and its line in the "Next" table. No other row's status,
+  PR or date was touched.
+- `CHANGELOG.md`: both sides' entries are kept. `main`'s `Added` entries (the
+  embedding `BI-26`, the public links `BI-19`, the uploads of 2 GB, the file
+  formats, the scheduled reports `RPT-1`, the export `BI-1`), its `Changed` entry
+  (the Rust CI job, `OPS-12`) and its `Fixed` entries (the catalog sample per
+  tenant, the history page's cursor) are all there, and `DATA-35`'s entry stands
+  at the top of `Added`.
+- `policy.rs`, `routes/mod.rs`, `tests/route_auth.rs` and
+  `lakehouse-store/src/lib.rs` merged without a conflict.
+
+#### Commands run, with results
+
+Per commit, on the tree of that commit (the machine's `cargo` lock serialises
+every invocation behind another worktree's build, so the runs are one per
+finding, not one per file):
+
+- `cd rust && cargo-locked fmt --check`: clean, on every commit.
+- `cd rust && cargo-locked clippy -p lakehouse-store -p lakehouse-api --all-targets -- -D warnings` (BLOCKER 1's tree): clean.
+- `cd rust && cargo-locked clippy -p lakehouse-store --all-targets -- -D warnings` (SHOULD-FIX 2's tree): clean.
+- `cd rust && cargo-locked clippy -p lakehouse-api --all-targets -- -D warnings` (SHOULD-FIX 5's tree): clean.
+- `cd rust && cargo-locked test -p lakehouse-store --test upload_folders --test uploads` (BLOCKER 1's and SHOULD-FIX 2's trees): 14 and 59 pass, 0 fail.
+- `cd rust && cargo-locked test -p lakehouse-api --test upload_routes --test upload_folder_routes` (BLOCKER 1's tree): 147 and 6 pass, 0 fail.
+- `cd rust && cargo-locked test -p lakehouse-api --test upload_folder_routes` (SHOULD-FIX 5's tree): 6 pass, 0 fail.
+- `bun run typecheck`: clean. `bun run lint`: 0 errors, 11 warnings (all pre-existing). `bun run test`: 2925 pass, 1 skip, 0 fail, 8031 assertions, 299 files.
+
+The full block, on the final commit (`4b7dc55e`):
+
+- `cd rust && cargo-locked fmt --check`: clean.
+- `cd rust && cargo-locked clippy --workspace --all-targets --all-features -- -D warnings`: clean.
+- `cd rust && cargo-locked test --workspace`: **157 binaries, 8271 pass, 0 fail, 49 ignored**. (Built with `CARGO_PROFILE_DEV_DEBUG=line-tables-only` and
+  `CARGO_PROFILE_TEST_DEBUG=line-tables-only`, as CI does (`OPS-12`): with the
+  full debug information the 68 `lakehouse-api` test binaries filled the disk and
+  the linker died with a bus error. The shared `CARGO_TARGET_DIR` was pruned with
+  the repo's own `cargo-target-prune.sh` under the heavy lock; no `cargo clean`,
+  no per-worktree `target/`.)
+- `bun run typecheck`, `bun run lint`, `bun run test`: as above.
+- `python3 -m py_compile ops/g9/upload_test.py`: compiles.
+- `python3 ops/lint/check_intra_package_imports.py`: "all intra-package
+  dispar_orchestrate imports resolve".
+- `python3 ops/lint/check_bare_iceberg_count.py`: "no bare count() against a
+  Bronze Iceberg table found".
+- `cd dagster && python -m pytest dispar_orchestrate -q`: **2083 pass, 1 skip,
+  306 deselected** (`-m "not loader"`, 46.88 s) and **306 pass, 2084 deselected**
+  (`-m loader`, 1289.69 s). Run with `/home/shiro/rantai/venv-pr186/bin/python`
+  (pytest 9.1.1, not CI's 8.3.4): the machine's system `python3` has no pytest.
+- `docker compose --profile '*' config --quiet`: clean with the CI's throwaway
+  values. Without them it refuses to start, as it must (`SEC-18`: no default
+  credentials).
+- `git status`: clean; nothing generated is staged.
+- `ls rust/migrations | cut -c1-4 | sort | uniq -d`: empty (no duplicate number).
+- `grep -rn '^<<<<<<<\|^>>>>>>>'` over the tracked files: no conflict marker left.
+- Exited testcontainers: `docker ps -a --filter
+  label=org.testcontainers.managed-by=testcontainers --filter status=exited -q |
+  xargs -r docker rm -v` removed 0 (the shared container is still up).
+
+#### Not verified, and why
+
+- **The gate `ops/g9/upload_test.py` `step_folders`: not run.** It needs a
+  deployed stack (the API, the object store, Dagster and Postgres), and this
+  machine has none running.
+- **No browser check** of the Uploaded files tab or of the Table step: the
+  feature page's checklist `DATA-35-AC1` to `AC7` are all "Not run", which needs
+  a running stack and a browser.
+- **`cargo deny check` and `cargo audit`: not run.** They are the security
+  workflow's checks, not the verification block, and they need the network to
+  fetch the advisory database. `rust/deny.toml` was not touched by this round.
+- **The `lakehouse-api` test binaries were built with `line-tables-only`**, as
+  CI does, so a backtrace prints a file and a line but not the full debug
+  information. Nothing else differs from a default build.
+- **The dagster tests ran on pytest 9.1.1**, not CI's 8.3.4; both runs are
+  green.
+
+#### Where the code differs from the plan's words
+
+1. **The three states live in the store, not in the route.** `ClaimFolder` is a
+   store type (`lakehouse_store::uploads`), and the API's `FolderRef` maps onto
+   it in `effective_folder`. The plan's AD-4 only says the load records the
+   folder on the claim; the three states are the review's BLOCKER 1, applied at
+   the store so that the file, the group and the claim are written by one
+   statement each.
+2. **An absent `folderId` leaves the file's folder alone** when the table's
+   claim remembers none. The plan and the review say "absent means the claim's
+   folder"; a table that remembers none has no folder to join, and a file that
+   was moved after its load keeps the folder it was moved to. Only an explicit
+   `null` changes a file's folder.
+3. **The console sends no folder at all when the picker could not be rendered**
+   (the folder list could not be read). The plan's deviation 5 says the console
+   always sends what the Table step shows; with no picker there is nothing to
+   show, and the table's remembered folder applies, as it did before.
