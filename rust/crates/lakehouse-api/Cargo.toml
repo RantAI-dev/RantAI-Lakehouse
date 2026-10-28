@@ -250,7 +250,7 @@ rsa = "0.9"
 # matching this workspace's one rustls provider story (the `rustls` feature
 # `sqlx-core` turns on); MIT OR Apache-2.0. Its `yasna` dependency is the
 # only package it adds to `Cargo.lock`.
-rcgen = { version = "0.13", default-features = false, features = ["ring"] }
+rcgen = { version = "0.14", default-features = false, features = ["ring"] }
 
 tempfile = { workspace = true }
 # The terminator's own TLS server side, and the provider named explicitly so
