@@ -583,3 +583,48 @@ the pinned image; the gate keeps the TLS terminator and says so (proxy config,
 gate docstring, `coverage.json`). SHOULD-FIX 3: the Oracle service name is
 validated as an identifier in the API and in the orchestrator. No open
 `BLOCKER`. Slice 1 is closed.
+
+### Slice 2, review round 1 (planner, 2026-10-29, head `33d8b758`)
+
+Checked by the planner, not taken from the handoff: CI run on `33d8b758` all
+green (39 checks), and the `Rust · G4 change capture into Bronze` job log read
+line by line. It shows 20,000 + 20,000 rows after the first copy; insert,
+update and delete visible in 23 to 32 s (target 120 s) in both modes; Bronze
+equal to the source after a pause with 20,000 changes per table and after a
+`kafka-connect` restart during a stream; the added column reached Bronze and
+is listed as a schema change; the Kafka Connect config holds only the file
+reference; `DELETE` removed the connector, slot, publication and password
+file; WAL alert and OIDC steps pass. Diff `3a7604ca..33d8b758` read against
+S2-a, S2-b, S2-h, S2-i, S2-j: compose blocks pinned by digest, no published
+ports, tmpfs secrets volume read-only in `kafka-connect`; the `debezium-
+properties` route is gone from the router, `POLICY_TABLE` and the tests; the
+three removed SEC-11 `ALLOWED` entries match no line any more; the Lakekeeper
+`debezium` principal is gone from `MACHINE_GRANTS`. Not re-run locally (disk,
+no cargo or docker on this VM): CI is the evidence.
+
+- **BLOCKER-1 (fixed, `3b21ec7b`).** `remove_connect_connector` put Kafka
+  Connect's error text into the 409 body (principle 4, SEC-11). Now logged with
+  the connector id; the response text is fixed. Closed.
+- **SHOULD-FIX 1 (T2.9).** The gate sets `INGEST_ALLOW_INTERNAL_HOSTS=true` on
+  the code location, and `ops/g4/docker-compose.g4.override.yml` says it is so
+  "the applier may dial" the broker, but `cdc_apply.py` (lines 75 to 78, 328)
+  says the broker dial goes around `ssrf_guard` on purpose, so the flag should
+  not be needed. A gate switch that production does not set can hide a
+  production failure. Drop the flag from the g4 override and let CI run the
+  gate: if it passes, the flag is gone and the comment with it; if it fails,
+  name in the handoff what dialled the internal address and why production
+  would not need it (or fix it), and correct the comment to say that.
+- **SHOULD-FIX 2 (T2.8, rule 1).** Comments still name code that is gone:
+  `dagster/dispar_orchestrate/replication_metrics.py` lines 288 and 313 name
+  `lakehouse_store::cdc::render_debezium_properties` as the owner of the slot
+  name (now `render_connect_config`, which takes the dial's slot and
+  publication); `rust/crates/lakehouse-api/src/config.rs:632` lists
+  `debezium-server` as an example service; `connectors.rs:3588` and
+  `.github/workflows/ci.yml:1239` say "the removed `debezium-server`" (fine as
+  history, keep). Fix the first two.
+- **Note, no change asked.** A deployment upgraded from `main` keeps the
+  Lakekeeper `debezium` principal and its warehouse grant (nothing removes
+  them; no service holds its token any more). Harmless; `OPERATIONS.md`
+  should say it can be revoked by hand. Add one sentence with SHOULD-FIX 2.
+- **Note.** `Config::oracle_cdc_logminer_enabled` read by nothing: slice 6
+  decides, as the handoff says.
