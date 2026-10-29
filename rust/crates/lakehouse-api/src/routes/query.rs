@@ -1140,7 +1140,7 @@ pub async fn run(
     };
 
     let cost_units = std::cmp::max(1, bytes_to_cost_units(scanned_bytes));
-    let id = format!("q-{started_epoch_ms}");
+    let id = history_id(started_epoch_ms);
 
     // Record a real audit_event for this run — best-effort, the same
     // non-fatal posture as the history write just below: the query already
@@ -1245,7 +1245,7 @@ async fn record_uncompleted_run(
         return;
     };
     let user_id = principal.id.uuid().to_string();
-    let id = format!("q-{}", epoch_ms());
+    let id = history_id(epoch_ms());
     let input = RecordHistoryInput {
         id: &id,
         sql: statement,
@@ -1503,6 +1503,21 @@ fn epoch_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as i64)
+}
+
+/// The id a recorded run carries: `q-<epoch_ms>-<uuid simple>`.
+///
+/// The epoch milliseconds keep the id readable and roughly ordered; the
+/// uuid's simple form — 32 lowercase hex characters — makes it unique.
+/// The store inserts the history row with `ON CONFLICT (id) DO NOTHING`, so
+/// two runs whose ids collided would leave one of the two rows out of the
+/// history, and the epoch milliseconds alone collide whenever two runs
+/// land in the same millisecond.
+///
+/// One place mints this id, so the two callers cannot drift apart: the
+/// answered run and the refused or failed one.
+fn history_id(epoch_ms: i64) -> String {
+    format!("q-{epoch_ms}-{}", Uuid::new_v4().simple())
 }
 
 /// Wall-clock duration since `started`, in milliseconds — the fallback
@@ -1849,10 +1864,11 @@ pub async fn list_saved(
 
 /// The `GET /api/query/history` query string (`QS-4`, decision 5). Every
 /// field stays a raw string on purpose: this struct parses whatever the
-/// caller sends, so the extractor itself can never reject, and
-/// [`parse_history_query`] is the one place a bad value becomes a 400
-/// with this route's own fixed message — never `serde_urlencoded`'s
-/// rendering of a serde error.
+/// caller sends, so a bad *value* becomes a 400 with this route's own
+/// fixed message in [`parse_history_query`] — never `serde_urlencoded`'s
+/// rendering of a serde error. A query string the extractor itself cannot
+/// read (a parameter sent twice) never reaches this struct: it is refused
+/// with the fixed sentence of [`HISTORY_QUERY_UNREADABLE`].
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HistoryQueryRaw {
@@ -1873,6 +1889,14 @@ const HISTORY_STATUSES: [&str; 4] = ["completed", "failed", "cancelled", "blocke
 
 /// The engines [`run`] records.
 const HISTORY_ENGINES: [&str; 2] = ["clickhouse", "trino"];
+
+/// What a query string the route cannot read is told.
+///
+/// The twin of this sentence lives in `routes/uploads.rs`
+/// (`QUERY_UNREADABLE`). The two cannot be one constant yet: the place
+/// both could share is `routes/mod.rs`, and that file is held by another
+/// open pull request.
+const HISTORY_QUERY_UNREADABLE: &str = "The query string could not be read.";
 
 /// Parse the history query string into a [`HistoryFilter`], refusing a
 /// bad value with a fixed 400 before the store sees it.
@@ -1950,14 +1974,24 @@ fn history_time(field: &str, raw: Option<&str>) -> Result<Option<OffsetDateTime>
 ///
 /// 401 when nobody is signed in — history belongs to a person, so there is
 /// no sensible answer for "everyone's". 400 for a bad filter value, with a
-/// fixed message naming the field. 503 if no pool is configured; 500 on a
+/// fixed message naming the field, and for a query string the route cannot
+/// read (a parameter sent twice), with the fixed sentence of
+/// [`HISTORY_QUERY_UNREADABLE`]. 503 if no pool is configured; 500 on a
 /// database failure.
 pub async fn list_history(
     State(state): State<AppState>,
     principal: Option<Extension<Principal>>,
-    Query(raw): Query<HistoryQueryRaw>,
+    query: Result<Query<HistoryQueryRaw>, axum::extract::rejection::QueryRejection>,
 ) -> ApiResult<ApiJson<Vec<QueryHistoryItem>>> {
     let owner = caller_id(principal.as_ref())?;
+    // A query string the extractor cannot read — a parameter sent twice, for
+    // instance — is refused with this route's own sentence. The rejection's
+    // own text is serde's, and it stays in the log: a response never
+    // carries a library's rendering of the caller's request.
+    let Query(raw) = query.map_err(|err| {
+        tracing::warn!(%err, "a query history query string could not be read");
+        ApiError::BadRequest(HISTORY_QUERY_UNREADABLE.to_owned())
+    })?;
     let filter = parse_history_query(&raw)?;
     Ok(ApiJson(
         queries::list_history(pool(&state)?, owner, &filter).await?,
@@ -2167,6 +2201,15 @@ const DOWNLOAD_BYTE_CAP: u64 = 5 * 1024 * 1024 * 1024;
 const DOWNLOAD_TOO_LARGE: &str =
     "This result is larger than 5 GB. Add a filter or download it as CSV.";
 
+/// What a query string the download route cannot read is told.
+///
+/// The twin of this sentence lives in `routes/uploads.rs`
+/// (`QUERY_UNREADABLE`), and this file's history route has its own copy of
+/// it (`HISTORY_QUERY_UNREADABLE`). The three cannot be one constant yet:
+/// the place they could share is `routes/mod.rs`, and that file is held by
+/// another open pull request.
+const DOWNLOAD_QUERY_UNREADABLE: &str = "The query string could not be read.";
+
 /// The name the download's query carries on the engine: the caller's own id,
 /// the run, and what the query is. Stop's pattern
 /// (`<caller uuid>:<runId>:%`) finds it, so Stop reaches the download's
@@ -2184,14 +2227,31 @@ fn download_file_name(id: &str, format: DownloadFormat, cut_rows: Option<usize>)
     }
 }
 
-/// `query_history.id` shape: `q-<epoch_ms>`, digits only after the
-/// prefix. Validated before `id` is ever interpolated into the
+/// `query_history.id` shape: the old `q-<epoch_ms>`, which every row
+/// recorded so far carries, and the new `q-<epoch_ms>-<32 lowercase hex>`.
+/// Validated before `id` is ever interpolated into the
 /// `Content-Disposition` header (WS2 plan review W9) — this is a
 /// header-injection guard, not a lookup optimization; the database lookup
 /// itself already binds `id` as a parameter and needs no such check.
 fn is_valid_history_id(id: &str) -> bool {
-    id.strip_prefix("q-")
-        .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+    let Some(rest) = id.strip_prefix("q-") else {
+        return false;
+    };
+    // The old shape: the epoch milliseconds and nothing else.
+    if !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()) {
+        return true;
+    }
+    // The new shape: the epoch milliseconds, a `-`, and the uuid's simple
+    // form — 32 lowercase hex characters, and nothing else.
+    let Some((epoch, suffix)) = rest.rsplit_once('-') else {
+        return false;
+    };
+    !epoch.is_empty()
+        && epoch.bytes().all(|b| b.is_ascii_digit())
+        && suffix.len() == 32
+        && suffix
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// Only these `query_history.engine` values may be re-run through this
@@ -2397,8 +2457,11 @@ fn download_response(
 /// # Errors
 ///
 /// - 400 [`ApiError::BadRequest`] when `format` is none of `csv`, `tsv`,
-///   `xlsx` and `parquet`, when `runId` is not a UUID, or when `id` does not
-///   match the `query_history.id` shape (`q-<digits>`).
+///   `xlsx` and `parquet`, when `runId` is not a UUID, when `id` does not
+///   match the `query_history.id` shape (`q-<digits>` or
+///   `q-<digits>-<32 lowercase hex>`), or when the query string cannot be
+///   read at all — a repeated parameter, or no `format` — with the fixed
+///   sentence of [`DOWNLOAD_QUERY_UNREADABLE`].
 /// - 403 [`ApiError::PermissionDenied`] when every role of the caller is
 ///   switched off from downloading.
 /// - 404 [`ApiError::NotFound`] when no history row matches `id`, or when
@@ -2416,10 +2479,18 @@ fn download_response(
 pub async fn download(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    Query(query): Query<DownloadQuery>,
+    query: Result<Query<DownloadQuery>, axum::extract::rejection::QueryRejection>,
     principal: Option<Extension<Principal>>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
+    // A query string the extractor cannot read — a repeated parameter, or no
+    // `format` at all — is refused with this route's own sentence. The
+    // rejection's own text is serde's, and it stays in the log: a response
+    // never carries a library's rendering of the caller's request.
+    let Query(query) = query.map_err(|err| {
+        tracing::warn!(%err, "a download query string could not be read");
+        ApiError::BadRequest(DOWNLOAD_QUERY_UNREADABLE.to_owned())
+    })?;
     let Some(format) = DownloadFormat::parse(&query.format) else {
         return Err(
             ApiError::BadRequest("format must be csv, tsv, xlsx or parquet".to_owned()).into(),
@@ -4036,14 +4107,20 @@ mod tests {
             assert!(!is_downloadable_engine("something-else"));
         }
 
+        /// The id shape the download accepts: the old one, which every row
+        /// recorded so far carries, and the new one. Both, because a row
+        /// recorded before the change must stay downloadable.
         #[test]
-        fn valid_history_ids_are_the_q_dash_digits_shape() {
+        fn valid_history_ids_are_the_old_and_the_new_shape() {
             assert!(is_valid_history_id("q-1"));
             assert!(is_valid_history_id("q-1736200000000"));
+            assert!(is_valid_history_id(
+                "q-1736200000000-0123456789abcdef0123456789abcdef"
+            ));
         }
 
         #[test]
-        fn ids_without_the_q_dash_digits_shape_are_rejected() {
+        fn ids_outside_the_two_shapes_are_rejected() {
             for id in [
                 "",
                 "q-",
@@ -4052,6 +4129,18 @@ mod tests {
                 "q-1;DROP TABLE t",
                 "../q-1",
                 "q-1\r\nSet-Cookie: x=y",
+                // The new shape, but not exactly: no epoch, an epoch that is
+                // not digits, a suffix that is not 32 characters, an
+                // uppercase hex digit, a character that is not hex at all,
+                // and an empty part.
+                "q--0123456789abcdef0123456789abcdef",
+                "q-abc-0123456789abcdef0123456789abcdef",
+                "q-1736200000000-0123456789abcdef0123456789abcde",
+                "q-1736200000000-0123456789abcdef0123456789abcdef0",
+                "q-1736200000000-0123456789ABCDEF0123456789ABCDEF",
+                "q-1736200000000-0123456789abcdef0123456789abcdeg",
+                "q-1736200000000-",
+                "q-1736200000000--0123456789abcdef0123456789abcdef",
             ] {
                 assert!(!is_valid_history_id(id), "expected rejected: {id:?}");
             }

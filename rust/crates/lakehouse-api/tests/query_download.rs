@@ -40,6 +40,9 @@ const OWNER_TENANT: &str = "11111111-1111-4111-8111-000000000001";
 const OWNED_TABLE: &str = "group_orders";
 /// The refusal of a table of another tenant, byte for byte.
 const REFUSAL: &str = "Table not found or not available to your organisation: bronze.group_orders";
+/// What a query string the route cannot read is told — the route's own
+/// sentence, byte for byte.
+const QUERY_UNREADABLE: &str = "The query string could not be read.";
 
 async fn seeded_user_id(pool: &PgPool, email: &str) -> Uuid {
     sqlx::query_scalar("SELECT id FROM app_user WHERE email = $1")
@@ -892,6 +895,107 @@ async fn a_run_id_that_is_not_a_uuid_is_refused() {
         ch.received_requests().await.unwrap().len(),
         0,
         "a refused run id reads nothing"
+    );
+}
+
+/// A row recorded before the id's shape changed still downloads.
+///
+/// The id's shape is the download's header-injection guard, so it accepts
+/// the shape every row recorded so far carries (`q-<epoch_ms>`) as well as
+/// the new one (`q-<epoch_ms>-<32 lowercase hex>`). A row nobody can
+/// download is a row nobody can use again.
+#[tokio::test]
+async fn a_run_id_of_the_old_shape_still_downloads() {
+    let ch = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(row_stream("n", 1)))
+        .mount(&ch)
+        .await;
+    let TestApp { router, pool } = spin_up_with_clickhouse(&ch.uri()).await;
+
+    let owner_id = seeded_user_id(&pool, "rina@meridian.example").await;
+    let cookie = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+    insert_history_row(
+        &pool,
+        "q-1736200000000",
+        "SELECT n FROM t",
+        Some(owner_id),
+        "clickhouse",
+    )
+    .await;
+
+    let resp = download_with_cookie(&router, "q-1736200000000", "format=csv", &cookie).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get("content-disposition").unwrap(),
+        "attachment; filename=\"q-1736200000000.csv\""
+    );
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(&bytes[..], "\u{feff}n\r\n1\r\n".as_bytes());
+}
+
+/// An id that is neither of the two shapes is refused before anything is
+/// looked up: the id goes into the `Content-Disposition` file name, so a
+/// character that is not a digit, a `-` or a lowercase hex digit never
+/// reaches it.
+#[tokio::test]
+async fn an_id_of_any_other_character_is_a_400() {
+    let ch = MockServer::start().await;
+    let TestApp { router, pool } = spin_up_with_clickhouse(&ch.uri()).await;
+
+    let cookie = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+
+    for id in [
+        // The percent-encoded forms of a space and of a line break: the
+        // path decodes them before the route sees them.
+        "q-1;DROP%20TABLE%20t",
+        "q-1%0D%0ASet-Cookie:%20x=y",
+        "q-1736200000000-0123456789ABCDEF0123456789ABCDEF",
+        "q-1736200000000-0123456789abcdef0123456789abcdeg",
+    ] {
+        let resp = download_with_cookie(&router, id, "format=csv", &cookie).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{id:?}");
+        let body = error_body(resp).await;
+        assert_eq!(body["error"], "id must look like a query run id", "{id:?}");
+    }
+    assert_eq!(
+        ch.received_requests().await.unwrap().len(),
+        0,
+        "a refused id reads nothing"
+    );
+}
+
+/// A query string the extractor itself cannot read — a repeated parameter,
+/// or no `format` at all — is refused with this route's own sentence, never
+/// with serde's rendering of what went wrong. Nothing is asked of the
+/// engine either way.
+#[tokio::test]
+async fn a_query_string_the_route_cannot_read_is_a_400_with_the_fixed_sentence() {
+    let ch = MockServer::start().await;
+    let TestApp { router, pool } = spin_up_with_clickhouse(&ch.uri()).await;
+
+    let cookie = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+
+    for query in [
+        "format=csv&format=tsv",
+        "runId=22222222-2222-4222-8222-222222222222",
+    ] {
+        let resp = download_with_cookie(&router, "q-1", query, &cookie).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{query}");
+        let body = error_body(resp).await;
+        assert_eq!(body["error"], QUERY_UNREADABLE, "{query}");
+        let rendered = body.to_string();
+        assert!(
+            !rendered.contains("duplicate field")
+                && !rendered.contains("missing field")
+                && !rendered.contains("serde"),
+            "{query}: the response carries a library error: {rendered}"
+        );
+    }
+    assert_eq!(
+        ch.received_requests().await.unwrap().len(),
+        0,
+        "a refused query string reads nothing"
     );
 }
 
