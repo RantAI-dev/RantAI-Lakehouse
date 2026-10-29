@@ -7999,12 +7999,12 @@ fn endless_child() -> std::path::PathBuf {
     let dir = tempfile::tempdir().expect("a temporary directory for the stand-in child");
     let path = dir.path().join("endless-child");
     // The answer never ends: there is no newline in it, and the text after
-    // it is endless too.
+    // it is endless too. `exec` replaces the shell with the writer, so that
+    // killing the child really ends it: a grandchild holding the pipe open
+    // would keep the API waiting for the end of the output.
     std::fs::write(
         &path,
-        "#!/bin/sh\n\
-         printf '{\"kind\":\"sheet\",\"sheet\":\"Stock\"'\n\
-         head -c 4000000 /dev/zero | tr '\\0' 'x'\n",
+        "#!/bin/sh\nexec dd if=/dev/zero bs=1024 count=4000 2>/dev/null\n",
     )
     .expect("the stand-in child is written");
     let mut permissions = std::fs::metadata(&path)
@@ -8020,6 +8020,81 @@ fn endless_child() -> std::path::PathBuf {
     // already been read by then, and the API starts it by path.
     std::mem::forget(dir);
     path
+}
+
+/// A stand-in for the child that says nothing and exits: the API must read
+/// that as the child having died before its answer (`PR #187` review
+/// SHOULD-FIX 4).
+fn silent_child() -> std::path::PathBuf {
+    let dir = tempfile::tempdir().expect("a temporary directory for the stand-in child");
+    let path = dir.path().join("silent-child");
+    std::fs::write(&path, "#!/bin/sh\nexit 0\n").expect("the stand-in child is written");
+    let mut permissions = std::fs::metadata(&path)
+        .expect("the stand-in child exists")
+        .permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        permissions.set_mode(0o755);
+    }
+    std::fs::set_permissions(&path, permissions).expect("the stand-in child is executable");
+    // The directory is removed when it goes out of scope; the child has
+    // already been read by then, and the API starts it by path.
+    std::mem::forget(dir);
+    path
+}
+
+#[tokio::test]
+async fn a_child_that_says_nothing_is_a_resource_limit() {
+    let stack = Stack::with(Options {
+        conversion_child: Some(silent_child()),
+        ..Options::default()
+    })
+    .await;
+    let bayu = stack.bayu().await;
+    let reply = stack
+        .send(
+            &bayu,
+            "POST",
+            "/api/uploads",
+            file_form(
+                "stock.xlsx",
+                "application/octet-stream",
+                &workbook("stock.xlsx"),
+            ),
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.text);
+    assert_eq!(reply.json["error"], NEEDS_MORE_MEMORY, "{}", reply.text);
+}
+
+#[tokio::test]
+async fn a_store_failure_while_the_child_is_fed_is_a_503_and_not_the_file_s_fault() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    let upload = stack
+        .upload(&bayu, "stock.xlsx", &workbook("stock.xlsx"))
+        .await;
+    let id = id_of(&upload);
+
+    // The store is broken: the preview cannot feed the child the file.
+    break_bucket(&stack.s3).await;
+    let reply = stack
+        .get(&bayu, &format!("/api/uploads/{id}/preview"))
+        .await;
+    assert_eq!(
+        reply.status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "{}",
+        reply.text
+    );
+    assert!(
+        reply.json["error"]
+            .as_str()
+            .is_some_and(|sentence| sentence.starts_with("Upload storage is unavailable")),
+        "the store's own sentence: {}",
+        reply.text
+    );
 }
 
 #[tokio::test]

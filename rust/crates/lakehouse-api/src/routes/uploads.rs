@@ -623,7 +623,12 @@ fn conversion_error(kind: FileKind, err: ConversionError) -> ApiError {
             message: upload_convert::TOO_MANY_CONVERSIONS.to_owned(),
             retry_after_secs: RETRY_AFTER_SECS,
         },
-        ConversionError::NotStarted => ApiError::Internal(CONVERSION_FAILED.to_owned()),
+        // A child that could not be started, and a child that could not set
+        // its own limits, are both the installation's fault and not the
+        // file's (`PR #187` review SHOULD-FIX 4).
+        ConversionError::NotStarted | ConversionError::LimitFailed => {
+            ApiError::Internal(CONVERSION_FAILED.to_owned())
+        }
         ConversionError::ResourceLimit => {
             ApiError::BadRequest(upload_convert::NEEDS_MORE_MEMORY.to_owned())
         }
@@ -3370,6 +3375,20 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    // ── the conversion's answer ──────────────────────────────────────────
+
+    /// A child that could not set its own limits is the installation's
+    /// fault, not the file's: it is a 500, and it says the same sentence as
+    /// a child that could not be started (`PR #187` review SHOULD-FIX 4).
+    #[test]
+    fn a_child_that_could_not_set_its_limits_is_a_500() {
+        let err = conversion_error(FileKind::Workbook, ConversionError::LimitFailed);
+        assert!(
+            matches!(err, ApiError::Internal(_)),
+            "the answer is a 500: {err:?}"
+        );
+    }
 
     // ── the storage key ─────────────────────────────────────────────────
 

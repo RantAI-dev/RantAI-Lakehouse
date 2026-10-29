@@ -249,6 +249,9 @@ pub mod exit {
     pub const INPUT_TOO_LARGE: i32 = 10;
     /// The child ran out of memory or out of time.
     pub const RESOURCE_LIMIT: i32 = 11;
+    /// The child could not set its own limits. That is an installation
+    /// fault, not a bad file, and it is answered with a 500.
+    pub const LIMIT_FAILED: i32 = 12;
 }
 
 /// What the child was asked to do.
@@ -649,8 +652,11 @@ pub fn run_child_if_asked(args: &[String]) -> Option<i32> {
     }
     let limits = ChildLimits::from_env();
     if let Err(err) = set_limits(&limits) {
+        // Its own limits are what keep a crafted file from ending the API,
+        // so a child that could not set them is an installation fault and
+        // says so with a code of its own (`PR #187` review SHOULD-FIX 4).
         eprintln!("[inspect-upload] the limits could not be set: {err}");
-        return Some(exit::RESOURCE_LIMIT);
+        return Some(exit::LIMIT_FAILED);
     }
     let operation = Operation::parse(args.get(2..).unwrap_or_default());
     // The operation decides how much the child reads: a Parquet file is fed
@@ -1025,6 +1031,9 @@ pub enum ConversionError {
     Busy,
     /// The child could not be started: 500.
     NotStarted,
+    /// The child could not set its own limits: 500. That is an installation
+    /// fault, not a bad file (`PR #187` review SHOULD-FIX 4).
+    LimitFailed,
     /// The child was killed, ran out of time, or answered something the
     /// protocol does not allow: 400, with the one sentence for all of them.
     ResourceLimit,
@@ -1244,39 +1253,57 @@ impl ConversionRunner {
         let Some(_slot) = self.try_slot() else {
             return Err(ConversionError::Busy);
         };
-        match tokio::time::timeout(self.wall, Box::pin(self.answer_inner(operation, source))).await
-        {
-            Ok(result) => result,
-            // Past the wall clock: the child is killed with it (the child is
-            // dropped, and `kill_on_drop` is set).
-            Err(_elapsed) => Err(ConversionError::ResourceLimit),
-        }
+        // ONE deadline for the whole conversion: the answer, the text and
+        // the child's ending. Every step is bounded by it, so the child is
+        // ours when the time is up: it is killed and its ending is logged
+        // (`PR #187` review SHOULD-FIX 4).
+        let deadline = tokio::time::Instant::now() + self.wall;
+        // Boxed: the future of the conversion holds the child's handles and
+        // its buffers, and the caller's future would otherwise be that big.
+        Box::pin(self.answer_inner(operation, source, deadline)).await
     }
 
     async fn answer_inner(
         &self,
         operation: Operation,
         source: Source,
+        deadline: tokio::time::Instant,
     ) -> Result<Answer, ConversionError> {
-        let started = self.start(&operation, source).await?;
+        let started = self.start(&operation, source, deadline).await?;
         let Started {
             answer,
             child,
             mut stdout,
             stderr,
+            feed,
         } = started;
         if let Answer::Refusal { refusal } = &answer {
+            // The child refused the file: it is finished, and what it said
+            // on its standard error is logged (`PR #187` review SHOULD-FIX
+            // 4).
+            let _ = self.wait(child, stderr, feed, deadline).await;
             return Err(ConversionError::Refused(refusal.clone()));
         }
         // The rest of the output is text this operation does not produce; it
         // is read and dropped, so the child is never blocked on a full pipe.
         let mut piece = [0_u8; 8192];
-        while let Ok(read) = stdout.read(&mut piece).await {
-            if read == 0 {
-                break;
+        let read_to_the_end = async {
+            while let Ok(read) = stdout.read(&mut piece).await {
+                if read == 0 {
+                    break;
+                }
             }
+        };
+        if tokio::time::timeout_at(deadline, read_to_the_end)
+            .await
+            .is_err()
+        {
+            // Past the wall clock: the child is killed, and its ending is
+            // logged.
+            let _ = self.wait(child, stderr, feed, deadline).await;
+            return Err(ConversionError::ResourceLimit);
         }
-        self.wait(child, stderr).await?;
+        self.wait(child, stderr, feed, deadline).await?;
         Ok(answer)
     }
 
@@ -1295,43 +1322,58 @@ impl ConversionRunner {
         let Some(_slot) = self.try_slot() else {
             return Err(ConversionError::Busy);
         };
-        match tokio::time::timeout(self.wall, Box::pin(self.text_inner(operation, source))).await {
-            Ok(result) => result,
-            Err(_elapsed) => Err(ConversionError::ResourceLimit),
-        }
+        let deadline = tokio::time::Instant::now() + self.wall;
+        Box::pin(self.text_inner(operation, source, deadline)).await
     }
 
     async fn text_inner(
         &self,
         operation: Operation,
         source: Source,
+        deadline: tokio::time::Instant,
     ) -> Result<(Answer, Bytes), ConversionError> {
-        let started = self.start(&operation, source).await?;
+        let started = self.start(&operation, source, deadline).await?;
         let Started {
             answer,
             child,
             mut stdout,
             stderr,
+            feed,
         } = started;
         if let Answer::Refusal { refusal } = &answer {
+            let _ = self.wait(child, stderr, feed, deadline).await;
             return Err(ConversionError::Refused(refusal.clone()));
         }
         let mut text = Vec::new();
         let mut piece = [0_u8; 16 * 1024];
-        loop {
-            let read = stdout
-                .read(&mut piece)
-                .await
-                .map_err(|_err| ConversionError::Refused(Refusal::ResourceLimit))?;
-            if read == 0 {
-                break;
+        let read_to_the_end = async {
+            loop {
+                let read = stdout
+                    .read(&mut piece)
+                    .await
+                    .map_err(|_err| ConversionError::Refused(Refusal::ResourceLimit))?;
+                if read == 0 {
+                    break;
+                }
+                text.extend_from_slice(&piece[..read]);
+                if u64::try_from(text.len()).unwrap_or(u64::MAX) > MAX_OUTPUT_BYTES {
+                    return Err(ConversionError::Refused(Refusal::TooMuchText));
+                }
             }
-            text.extend_from_slice(&piece[..read]);
-            if u64::try_from(text.len()).unwrap_or(u64::MAX) > MAX_OUTPUT_BYTES {
-                return Err(ConversionError::Refused(Refusal::TooMuchText));
+            Ok::<(), ConversionError>(())
+        };
+        match tokio::time::timeout_at(deadline, read_to_the_end).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                let _ = self.wait(child, stderr, feed, deadline).await;
+                return Err(err);
+            }
+            Err(_elapsed) => {
+                let _ = self.wait(child, stderr, feed, deadline).await;
+                return Err(ConversionError::ResourceLimit);
             }
         }
-        self.wait(child, stderr).await?;
+        self.wait(child, stderr, feed, deadline).await?;
         Ok((answer, Bytes::from(text)))
     }
 
@@ -1359,15 +1401,8 @@ impl ConversionRunner {
         let Some(_slot) = self.try_slot() else {
             return Err(ConversionError::Busy);
         };
-        match tokio::time::timeout(
-            self.wall,
-            Box::pin(self.store_inner(operation, source, store, text_key, answer_key)),
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(_elapsed) => Err(ConversionError::ResourceLimit),
-        }
+        let deadline = tokio::time::Instant::now() + self.wall;
+        Box::pin(self.store_inner(operation, source, store, text_key, answer_key, deadline)).await
     }
 
     async fn store_inner(
@@ -1377,13 +1412,15 @@ impl ConversionRunner {
         store: &UploadStore,
         text_key: &str,
         answer_key: &str,
+        deadline: tokio::time::Instant,
     ) -> Result<Answer, ConversionError> {
-        let started = self.start(&operation, source).await?;
+        let started = self.start(&operation, source, deadline).await?;
         let Started {
             answer,
             child,
             mut stdout,
             stderr,
+            feed,
         } = started;
         if let Answer::Refusal { refusal } = &answer {
             return Err(ConversionError::Refused(refusal.clone()));
@@ -1391,9 +1428,10 @@ impl ConversionRunner {
         // The text is written as a multipart upload that is NOT assembled
         // yet (`SEC-22` P2): the object at the key does not exist until the
         // child has exited 0, so a truncated text is never visible.
-        let pending = match write_text_to_store(store, text_key, &mut stdout).await {
-            Ok(pending) => pending,
-            Err(err) => {
+        let written = write_text_to_store(store, text_key, &mut stdout);
+        let pending = match tokio::time::timeout_at(deadline, written).await {
+            Ok(Ok(pending)) => pending,
+            Ok(Err(err)) => {
                 // The stream stopped early: read what is left of the child's
                 // output, so the child is never left writing into a pipe
                 // nobody reads.
@@ -1403,14 +1441,20 @@ impl ConversionRunner {
                         break;
                     }
                 }
-                let _ = self.wait(child, stderr).await;
+                let _ = self.wait(child, stderr, feed, deadline).await;
                 return Err(ConversionError::Store(err));
+            }
+            Err(_elapsed) => {
+                // Past the wall clock: the child is killed, and its ending
+                // is logged.
+                let _ = self.wait(child, stderr, feed, deadline).await;
+                return Err(ConversionError::ResourceLimit);
             }
         };
         // The child's own ending decides the answer: it may have stopped
         // (refused, killed, out of time) even though the store took what
         // came of it.
-        match self.wait(child, stderr).await {
+        match self.wait(child, stderr, feed, deadline).await {
             Ok(()) => {
                 // The child exited 0: the text is the whole text, and it is
                 // assembled now.
@@ -1449,6 +1493,7 @@ impl ConversionRunner {
         &self,
         operation: &Operation,
         source: Source,
+        deadline: tokio::time::Instant,
     ) -> Result<Started, ConversionError> {
         if self.check_binary && !is_our_binary(&self.binary) {
             tracing::warn!(
@@ -1490,10 +1535,10 @@ impl ConversionRunner {
         };
         // The file is fed in another task: the child reads all of it before
         // it answers, and the answer would never come if the feeding
-        // waited for it.
-        tokio::spawn(async move {
-            let _fed = feed(stdin, source).await;
-        });
+        // waited for it. The task is kept, so that a store failure in it can
+        // be told from the file's own refusal (`PR #187` review SHOULD-FIX
+        // 3).
+        let feed = tokio::spawn(async move { feed(stdin, source).await });
         // The standard error is drained in another task, so the child never
         // blocks on a full pipe; only the first [`MAX_STDERR_BYTES`] are kept.
         let stderr = tokio::spawn(async move {
@@ -1515,24 +1560,40 @@ impl ConversionRunner {
         // The answer is read through a cap: it is one JSON line, and a child
         // that writes an endless one must not fill the API's memory
         // (`PR #187` review BLOCKER 4).
-        let read = {
+        let read_answer = async {
             let mut limited =
                 (&mut stdout).take(u64::try_from(MAX_ANSWER_BYTES).unwrap_or(u64::MAX) + 1);
             limited.read_until(b'\n', &mut line).await
         };
-        let read = read.map_err(|_err| ConversionError::Refused(Refusal::ResourceLimit))?;
+        let read = match tokio::time::timeout_at(deadline, read_answer).await {
+            Ok(result) => {
+                result.map_err(|_err| ConversionError::Refused(Refusal::ResourceLimit))?
+            }
+            Err(_elapsed) => {
+                // Past the wall clock: the child is killed, and its ending
+                // is logged (`PR #187` review SHOULD-FIX 4).
+                let _killed = child.start_kill();
+                let _ = self.wait(child, stderr, feed, deadline).await;
+                return Err(ConversionError::ResourceLimit);
+            }
+        };
         if read == 0 {
-            // The child said nothing: it died before its answer.
+            // The child said nothing: it died before its answer. Its ending
+            // is logged, and that is where the out-of-memory abort shows up.
+            let _ = self.wait(child, stderr, feed, deadline).await;
             return Err(ConversionError::ResourceLimit);
         }
         if !answer_line_fits(&line) {
             // The answer is over the cap, or the child stopped before the
             // line was finished. The child is killed with this request
-            // (`kill_on_drop`), and the answer is a resource limit.
+            // (`kill_on_drop`), its ending is logged, and the answer is a
+            // resource limit.
             tracing::warn!(
                 bytes = line.len(),
                 "the answer of the child that reads an uploaded file is over its cap"
             );
+            let _killed = child.start_kill();
+            let _ = self.wait(child, stderr, feed, deadline).await;
             return Err(ConversionError::ResourceLimit);
         }
         let answer: Answer = serde_json::from_slice(&line)
@@ -1542,34 +1603,99 @@ impl ConversionRunner {
             child,
             stdout,
             stderr,
+            feed,
         })
     }
 
     /// Wait for the child to end, and read what it said on its standard
     /// error.
+    ///
+    /// The task that feeds the child is joined here: a store failure in it
+    /// is the REAL reason the child did not finish, and it must not be
+    /// reported as the file's own (`PR #187` review SHOULD-FIX 3).
+    ///
+    /// Every failure path logs the child's status and the first
+    /// [`MAX_STDERR_BYTES`] of its standard error (`PR #187` review
+    /// SHOULD-FIX 4): a child that was killed by a signal says why there, and
+    /// the log is the only place that says it.
     async fn wait(
         &self,
         mut child: Child,
         stderr: tokio::task::JoinHandle<Vec<u8>>,
+        feed: tokio::task::JoinHandle<Result<(), ConversionError>>,
+        deadline: tokio::time::Instant,
     ) -> Result<(), ConversionError> {
-        let status = child
-            .wait()
-            .await
-            .map_err(|_err| ConversionError::ResourceLimit)?;
-        if let Ok(kept) = stderr.await {
-            let text = String::from_utf8_lossy(&kept);
-            let text = text.trim();
-            if !text.is_empty() {
-                tracing::warn!(stderr = %text, "the child that reads an uploaded file said something");
+        let feeding = match tokio::time::timeout_at(deadline, feed).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_join)) => Err(ConversionError::Refused(Refusal::ResourceLimit)),
+            Err(_elapsed) => Err(ConversionError::Refused(Refusal::ResourceLimit)),
+        };
+        let status = match tokio::time::timeout_at(deadline, child.wait()).await {
+            Ok(Ok(status)) => status,
+            Ok(Err(_err)) => {
+                tracing::warn!("the child that reads an uploaded file could not be waited for");
+                return Err(ConversionError::ResourceLimit);
             }
+            Err(_elapsed) => {
+                // Past the wall clock: the child is killed, and what it said
+                // is logged.
+                let _killed = child.start_kill();
+                let status = child.wait().await;
+                let kept = match tokio::time::timeout_at(deadline, stderr).await {
+                    Ok(Ok(kept)) => kept,
+                    Ok(Err(_join)) => Vec::new(),
+                    Err(_elapsed) => Vec::new(),
+                };
+                let text = String::from_utf8_lossy(&kept);
+                tracing::warn!(
+                    status = ?status,
+                    stderr = %text.trim(),
+                    "the child that reads an uploaded file did not finish in time"
+                );
+                return Err(ConversionError::ResourceLimit);
+            }
+        };
+        // The standard error is read through the deadline as well: a child
+        // that leaves a grandchild holding the pipe open must not hold the
+        // request (`PR #187` review SHOULD-FIX 4).
+        let kept = match tokio::time::timeout_at(deadline, stderr).await {
+            Ok(Ok(kept)) => kept,
+            Ok(Err(_join)) => Vec::new(),
+            Err(_elapsed) => Vec::new(),
+        };
+        let text = String::from_utf8_lossy(&kept);
+        let text = text.trim().to_owned();
+        // A store failure while the file was fed is the real reason, and it
+        // is a 503: the file may well read once the store is back.
+        if let Err(ConversionError::Store(err)) = &feeding {
+            let err = *err;
+            tracing::warn!(%err, status = ?status, stderr = %text, "the store could not be read while the child was fed");
+            return Err(ConversionError::Store(err));
         }
         match status.code() {
-            Some(exit::OK) => Ok(()),
-            Some(code) => Err(ConversionError::Refused(
-                Refusal::for_exit_code(code).unwrap_or(Refusal::Unreadable),
-            )),
+            Some(exit::OK) => {
+                if !text.is_empty() {
+                    tracing::warn!(stderr = %text, "the child that reads an uploaded file said something");
+                }
+                Ok(())
+            }
+            Some(exit::LIMIT_FAILED) => {
+                // The child could not set its own limits: an installation
+                // fault, not a bad file (`PR #187` review SHOULD-FIX 4).
+                tracing::warn!(stderr = %text, "the child could not set its own limits");
+                Err(ConversionError::LimitFailed)
+            }
+            Some(code) => {
+                tracing::warn!(code, stderr = %text, "the child that reads an uploaded file did not finish");
+                Err(ConversionError::Refused(
+                    Refusal::for_exit_code(code).unwrap_or(Refusal::Unreadable),
+                ))
+            }
             // Killed by a signal: out of memory, out of time, or killed.
-            None => Err(ConversionError::ResourceLimit),
+            None => {
+                tracing::warn!(status = ?status, stderr = %text, "the child that reads an uploaded file was killed");
+                Err(ConversionError::ResourceLimit)
+            }
         }
     }
 }
@@ -1584,6 +1710,9 @@ struct Started {
     stdout: BufReader<ChildStdout>,
     /// Its standard error, read in another task.
     stderr: tokio::task::JoinHandle<Vec<u8>>,
+    /// The task that feeds it the file: a store failure in it is the real
+    /// reason the child did not finish (`PR #187` review SHOULD-FIX 3).
+    feed: tokio::task::JoinHandle<Result<(), ConversionError>>,
 }
 
 /// Write the text the child produced into the store, as one multipart
