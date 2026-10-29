@@ -1030,18 +1030,21 @@ export type ConnectorRunLog = {
 /** `POST /api/connectors/{id}/resume`. */
 export type ResumeConnectorResponse = { resumed: boolean }
 
+/** `POST /api/connectors/{id}/pause` (`SRC-4` decision S2-e). */
+export type PauseConnectorResponse = { paused: boolean }
+
 /**
- * `GET /api/connectors/{id}/debezium-properties?table=`'s response.
- * Mirrors Rust `DebeziumPropertiesResponse`
- * (`rust/crates/lakehouse-api/src/routes/connectors.rs`). `properties`
- * contains ONLY `${ENV_VAR_NAME}` references for every credential-shaped
- * field, never a resolved secret — rendered as literal text, labeled with
- * `note`, and never resolved client-side.
+ * `GET /api/connectors/{id}/change-capture`'s response (`SRC-4` decision S2-h). Mirrors Rust
+ * `ChangeCaptureResponse` (`rust/crates/lakehouse-api/src/routes/connector_runs.rs`).
+ * `supported: false` carries a fixed `reason` (a connector that captures no changes, or a
+ * deployment without Kafka Connect). `state` is `running`, `paused`, `failed`, `starting`,
+ * `not_created` (the capture service has no such connector yet) or `unreachable` (it could not
+ * be asked); never a made-up `running`.
  */
-export type DebeziumProperties = {
-  properties: string
-  table: string
-  note: string
+export type ChangeCaptureState = {
+  supported: boolean
+  reason?: string
+  state?: "running" | "paused" | "failed" | "starting" | "not_created" | "unreachable" | string
 }
 
 /**
@@ -1099,20 +1102,12 @@ export interface ConnectorService {
   getConnectorRunLog(connectorId: string, runId: string, signal?: AbortSignal): Promise<ConnectorRunLog>
   /** The same log as text (`?format=text`), for the Download log button. */
   downloadConnectorRunLog(connectorId: string, runId: string, signal?: AbortSignal): Promise<string>
-  /** `POST /api/connectors/{id}/resume` (`SRC-11` decision 4): lifts a pause set by repeated failures, and only that one. */
+  /** `POST /api/connectors/{id}/resume` (`SRC-11` decision 4): lifts a pause set by repeated failures, or by a person (`SRC-4`); no other. */
   resumeConnector(connectorId: string, signal?: AbortSignal): Promise<ResumeConnectorResponse>
-  /**
-   * `GET /api/connectors/{id}/debezium-properties?table=` — a read-only
-   * rendering of the `Debezium` `.properties` file body for a `cdc`
-   * adapter's captured table, `${ENV_VAR_NAME}` references only, never a
-   * resolved secret. `table` is required: no registry column stores which
-   * table alone until an ingest spec names one via `sourceObjects`.
-   */
-  getDebeziumProperties(
-    id: string,
-    table: string,
-    signal?: AbortSignal
-  ): Promise<DebeziumProperties>
+  /** `POST /api/connectors/{id}/pause` (`SRC-4`): pauses the connector until a person resumes it. */
+  pauseConnector(connectorId: string, signal?: AbortSignal): Promise<PauseConnectorResponse>
+  /** `GET /api/connectors/{id}/change-capture` (`SRC-4`): the connector's state in the capture service. */
+  getChangeCapture(connectorId: string, signal?: AbortSignal): Promise<ChangeCaptureState>
   /**
    * `GET /api/connectors/{id}/probe-history?limit=` — the connector's most
    * recent connectivity-probe results, newest first. `limit` defaults to

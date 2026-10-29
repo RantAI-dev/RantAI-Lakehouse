@@ -81,9 +81,8 @@ function stubFetch(
       return body ? json(body) : json({ error: "not found" }, 404)
     }
     if (url.endsWith("/resume") && method === "POST") return options.onResume ? options.onResume() : json({ resumed: true })
-    if (url.includes("/debezium-properties")) {
-      return json({ table: "public.orders", properties: "database.password=${DB_PASSWORD}", note: "References only." })
-    }
+    if (url.endsWith("/change-capture") && method === "GET") return json({ supported: true, state: "running" })
+    if (url.endsWith("/pause") && method === "POST") return json({ paused: true })
     // SRC-13: names first (`/discovery/list`), the columns of one object when it is opened (`/discovery/preview`).
     if (url.endsWith("/discovery/list") && method === "POST") {
       return json({
@@ -125,6 +124,10 @@ describe("ingest panel helpers", () => {
     // ... and a key (the two lines below named no key before the key field existed).
     expect(loadModeProblem({ loadMode: "incremental_dedup", incrementalKey: "updated_at", primaryKey: ["id"] })).toBeNull()
     expect(loadModeProblem({ loadMode: "replace_dedup", primaryKey: ["id"] })).toBeNull()
+    // SRC-4 S2-g: change capture needs a key and no cursor.
+    expect(loadModeProblem({ loadMode: "incremental_dedup", primaryKey: ["id"], adapter: "cdc" })).toBeNull()
+    expect(loadModeProblem({ loadMode: "history", primaryKey: ["id"], adapter: "cdc" })).toBeNull()
+    expect(loadModeProblem({ loadMode: "incremental_dedup", adapter: "cdc" })).toMatch(/cannot follow a table without a key/)
     // PR #216 final review BLOCKER 18: `incremental` appends a changed business-app record as a second row.
     expect(loadModeProblem({ loadMode: "incremental", incrementalKey: "updated_at", adapter: "saas" })).toMatch(/one per key/)
     expect(loadModeProblem({ loadMode: "incremental", incrementalKey: "updated_at", adapter: "sql" })).toBeNull()
@@ -435,7 +438,7 @@ describe("ConnectorIngestPanel layout", () => {
     const { container } = render(
       <ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />
     )
-    await screen.findByText(/Debezium properties/)
+    await screen.findByText("Change capture")
     expect(cardTitles(container)).toEqual(["Tables to ingest", "Runs"])
     const tables = (screen.getByText("Tables to ingest", { selector: "[data-slot=card-title]" }).closest(
       "[data-slot=card]"
@@ -941,6 +944,36 @@ describe("ConnectorIngestPanel refresh and clear", () => {
     expect(await screen.findByText(refusal)).toBeDefined()
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }))
     await waitFor(() => expect(screen.queryByRole("button", { name: "Cancel" })).toBeNull())
+  })
+
+  it("offers a change-capture table the current row per key and history only, and asks for no cursor", async () => {
+    stubFetch({
+      ...SPEC,
+      adapter: "cdc",
+      ingestMode: "cdc",
+      dial: { ...SPEC.dial, driver: "postgres" },
+      sourceObjects: [{ name: "public.orders", target: "northwind_orders", loadMode: "incremental_dedup", primaryKey: ["id"] }],
+    })
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
+    const mode = (await screen.findByLabelText("Load mode for public.orders")) as HTMLSelectElement
+    expect([...mode.options].map((o) => o.text)).toEqual(["Current row per key", "Keep history"])
+    expect(mode.value).toBe("incremental_dedup")
+    expect(screen.queryByLabelText("New-row column for public.orders")).toBeNull()
+    expect(screen.getByText(/The table holds the current row of each key/)).toBeDefined()
+  })
+
+  it("shows the capture state in fixed words and pauses on request", async () => {
+    const calls = stubFetch({
+      ...SPEC,
+      adapter: "cdc",
+      ingestMode: "cdc",
+      dial: { ...SPEC.dial, driver: "postgres" },
+      sourceObjects: [{ name: "public.orders", target: "northwind_orders", loadMode: "incremental_dedup", primaryKey: ["id"] }],
+    })
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
+    expect((await screen.findAllByText("Running")).length).toBeGreaterThan(0)
+    fireEvent.click(screen.getByRole("button", { name: "Pause" }))
+    await waitFor(() => expect(calls.some((c) => c.method === "POST" && c.url.endsWith("/pause"))).toBe(true))
   })
 
   it("has no table menu for a CDC connector, whose tables stream", async () => {

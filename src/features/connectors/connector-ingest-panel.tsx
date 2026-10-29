@@ -139,6 +139,9 @@ type Selection = Selected[]
 /** What a table gets when it is ticked: one copy of the source per run. */
 const DEFAULT_LOAD_MODE: LoadMode = "replace"
 
+/** `SRC-4` decision S2-g: a change-capture table keeps the current row per key unless history is chosen. */
+const defaultLoadMode = (adapter: string): LoadMode => (adapter === "cdc" ? "incremental_dedup" : DEFAULT_LOAD_MODE)
+
 const LOAD_MODE_LABEL: Record<LoadMode, string> = {
   replace: "Replace all rows",
   incremental: "Add only new rows",
@@ -146,6 +149,23 @@ const LOAD_MODE_LABEL: Record<LoadMode, string> = {
   replace_dedup: "Replace all rows, one per key",
   incremental_dedup: "Add only new rows, one per key",
   history: "Keep history",
+}
+
+/** `SRC-4` decision S2-g: the two modes change capture offers, in the words the product owner signed. */
+const CHANGE_CAPTURE_LABEL: Partial<Record<LoadMode, string>> = {
+  incremental_dedup: "Current row per key",
+  history: "Keep history",
+}
+
+const modeLabel = (mode: LoadMode, changeCapture: boolean): string =>
+  (changeCapture ? CHANGE_CAPTURE_LABEL[mode] : undefined) ?? LOAD_MODE_LABEL[mode]
+
+/** What a mode does for change capture, in one line under the choice. */
+function changeCaptureHint(mode: LoadMode): string {
+  if (mode === "history") {
+    return "Every change is kept as a row, with its operation (_op), the time it happened at the source (_source_ts_ms), whether it deleted the row (_deleted) and its position (_offset)."
+  }
+  return "The table holds the current row of each key: a change updates the row and a delete removes it. A first copy of the source is taken when capture starts."
 }
 
 /** What a mode does on each run, in one line under the choice, including what happens to the rows already there. */
@@ -176,6 +196,8 @@ function loadModeHint(mode: LoadMode, cursor: string): string {
  * no other adapter runs them (SRC-10 decision 2).
  */
 function loadModesFor(adapter: string): LoadMode[] {
+  // SRC-4 decision S2-g: change capture keeps the current row per key (the default) or every change.
+  if (adapter === "cdc") return ["incremental_dedup", "history"]
   // SRC-3 AD6: a business-app object loads incrementally by the cursor its vendor declares (the finder shows
   // which objects have one). PR #216 final review BLOCKER 18: plain `incremental` appends a changed record as
   // a second row, so `saas` offers only the mode that merges on the vendor's key.
@@ -186,7 +208,8 @@ function loadModesFor(adapter: string): LoadMode[] {
 }
 
 /** Why a source cannot offer the incremental modes, or `null` when it can. */
-function missingModesNote(modes: LoadMode[]): string | null {
+function missingModesNote(modes: LoadMode[], changeCapture = false): string | null {
+  if (changeCapture) return null
   return modes.includes("incremental") || modes.includes("incremental_dedup")
     ? null
     : "Adding only new rows, with or without one row per key, is offered for SQL sources and business apps only: they can ask the source for just the new rows."
@@ -221,12 +244,16 @@ export function loadModeProblem(selected: {
     return "A business app can only add new rows one per key: choose “Add only new rows, one per key”."
   }
   if (
+    selected.adapter !== "cdc" &&
     (selected.loadMode === "incremental" || selected.loadMode === "incremental_dedup") &&
     !(selected.incrementalKey ?? "").trim()
   ) {
     return "Pick the column that marks new rows, such as an id or an updated-at time."
   }
   if (needsKey(selected.loadMode) && (selected.primaryKey ?? []).length === 0) {
+    if (selected.adapter === "cdc") {
+      return "Name the column, or the columns together, that identify one row. Change capture cannot follow a table without a key."
+    }
     return "Name the column, or the columns together, that identify one row. A mode with one row per key cannot be saved without a key."
   }
   return null
@@ -278,25 +305,25 @@ function fromSpec(spec: IngestSpec): Selection {
   return spec.sourceObjects.map((o) => ({
     name: o.name,
     target: o.target,
-    // Saved before load modes existed: the ingest job replaces.
-    loadMode: o.loadMode ?? DEFAULT_LOAD_MODE,
+    // Saved before load modes existed: the ingest job replaces; change capture keeps the current row per key.
+    loadMode: o.loadMode ?? defaultLoadMode(spec.adapter ?? ""),
     incrementalKey: o.incrementalKey,
     primaryKey: o.primaryKey,
     excludedColumns: o.excludedColumns,
   }))
 }
 
-/** `withModes: false` for CDC, whose tables stream and are never loaded by a run. */
-function toSourceObjects(selection: Selection, withModes: boolean): SourceObject[] {
+/** `withCursor: false` for change capture, whose tables follow the source's changes and read no cursor column. */
+function toSourceObjects(selection: Selection, withCursor: boolean): SourceObject[] {
   return selection.map((s) => ({
     name: s.name,
     target: s.target,
-    ...(withModes ? { loadMode: s.loadMode } : {}),
-    ...(withModes && (s.loadMode === "incremental" || s.loadMode === "incremental_dedup") && s.incrementalKey?.trim()
+    loadMode: s.loadMode,
+    ...(withCursor && (s.loadMode === "incremental" || s.loadMode === "incremental_dedup") && s.incrementalKey?.trim()
       ? { incrementalKey: s.incrementalKey.trim() }
       : {}),
-    ...(withModes && s.primaryKey && s.primaryKey.length > 0 ? { primaryKey: s.primaryKey } : {}),
-    ...(withModes && effectiveExcluded(s).length > 0 ? { excludedColumns: effectiveExcluded(s) } : {}),
+    ...(s.primaryKey && s.primaryKey.length > 0 ? { primaryKey: s.primaryKey } : {}),
+    ...(effectiveExcluded(s).length > 0 ? { excludedColumns: effectiveExcluded(s) } : {}),
   }))
 }
 
@@ -461,7 +488,7 @@ function IngestEditor({
       selection.filter((_, j) => j !== i).map((o) => o.target)
     )
   )
-  const modeProblems = selection.map((s) => (isCdc ? null : loadModeProblem({ ...s, adapter })))
+  const modeProblems = selection.map((s) => loadModeProblem({ ...s, adapter }))
   const scheduleProblem = !isCdc && cronChoice === "custom" ? cronProblem(customCron) : null
   const dirty =
     JSON.stringify(toSourceObjects(selection, !isCdc)) !== JSON.stringify(toSourceObjects(saved, !isCdc)) ||
@@ -518,7 +545,7 @@ function IngestEditor({
     return {
       name,
       target: label ? labelTarget(connectorName, label) : defaultTarget(connectorName, name),
-      loadMode: DEFAULT_LOAD_MODE,
+      loadMode: defaultLoadMode(adapter),
       ...(detected ? { primaryKey: detected } : {}),
     }
   }
@@ -591,7 +618,9 @@ function IngestEditor({
   const page = layout === "page"
   const tablesIntro = isStream
     ? "A Kafka connector reads its topic; each run takes one micro-batch."
-    : "Each table here lands in its own Bronze table. A run replaces its rows, or adds to them, as chosen per table. Nothing is ingested until at least one table is saved."
+    : isCdc
+      ? "Each table here lands in its own Bronze table, kept in step with the source by following its changes. Nothing is captured until at least one table is saved."
+      : "Each table here lands in its own Bronze table. A run replaces its rows, or adds to them, as chosen per table. Nothing is ingested until at least one table is saved."
 
   const cdcNotes = (
     <>
@@ -600,7 +629,7 @@ function IngestEditor({
           {backfillTriggerMessage(typeof spec.dial.driver === "string" ? spec.dial.driver : "cdc")}
         </p>
       ) : null}
-      {isCdc && saved[0] ? <DebeziumPanel connectorId={connectorId} table={saved[0].name} /> : null}
+      {isCdc ? <ChangeCapturePanel connectorId={connectorId} pausedReason={pausedReason} onChanged={onResumed} /> : null}
     </>
   )
 
@@ -669,17 +698,16 @@ function IngestEditor({
                   />
                 </div>
                 {problems[i] ? <p className="text-xs text-destructive">{problems[i]}</p> : null}
-                {!isCdc ? (
-                  <LoadModeFields
-                    selected={s}
-                    modes={loadModesFor(adapter)}
-                    savedMode={saved.find((t) => t.name === s.name)?.loadMode ?? null}
-                    columns={columnsOf.get(s.name) ?? null}
-                    detectedKey={keysOf.get(s.name) ?? null}
-                    problem={modeProblems[i]}
-                    onChange={(patch) => change(s.name, patch)}
-                  />
-                ) : null}
+                <LoadModeFields
+                  selected={s}
+                  modes={loadModesFor(adapter)}
+                  savedMode={saved.find((t) => t.name === s.name)?.loadMode ?? null}
+                  columns={columnsOf.get(s.name) ?? null}
+                  detectedKey={keysOf.get(s.name) ?? null}
+                  problem={modeProblems[i]}
+                  changeCapture={isCdc}
+                  onChange={(patch) => change(s.name, patch)}
+                />
                 {columnChoice ? (
                   <ColumnChoice
                     selected={s}
@@ -963,6 +991,7 @@ function LoadModeFields({
   columns,
   detectedKey,
   problem,
+  changeCapture,
   onChange,
 }: {
   selected: Selected
@@ -973,6 +1002,8 @@ function LoadModeFields({
   /** The key the source declares for this table, when it was found and declares one. */
   detectedKey: string[] | null
   problem: string | null
+  /** `SRC-4`: a change-capture table reads no cursor column and has its own words for the two modes. */
+  changeCapture: boolean
   onChange: (patch: Partial<Selected>) => void
 }) {
   const cursor = selected.incrementalKey ?? ""
@@ -980,11 +1011,11 @@ function LoadModeFields({
   // silently reading as another one.
   const offered = modes.includes(selected.loadMode) ? modes : [...modes, selected.loadMode]
   const fieldClass = "h-7 rounded-lg border border-input bg-transparent px-2 text-xs"
-  const note = missingModesNote(modes)
+  const note = missingModesNote(modes, changeCapture)
   return (
     <div className="space-y-1">
       <div className="flex flex-wrap items-center gap-1.5">
-        <span className="shrink-0 text-xs text-muted-foreground">Each run</span>
+        <span className="shrink-0 text-xs text-muted-foreground">{changeCapture ? "Keep" : "Each run"}</span>
         <select
           aria-label={`Load mode for ${selected.name}`}
           className={fieldClass}
@@ -993,11 +1024,11 @@ function LoadModeFields({
         >
           {offered.map((mode) => (
             <option key={mode} value={mode}>
-              {LOAD_MODE_LABEL[mode]}
+              {modeLabel(mode, changeCapture)}
             </option>
           ))}
         </select>
-        {selected.loadMode === "incremental" || selected.loadMode === "incremental_dedup" ? (
+        {!changeCapture && (selected.loadMode === "incremental" || selected.loadMode === "incremental_dedup") ? (
           <>
             <span className="shrink-0 text-xs text-muted-foreground">by</span>
             {columns && columns.length > 0 ? (
@@ -1041,9 +1072,9 @@ function LoadModeFields({
         />
       ) : null}
       <p className={problem ? "text-xs text-destructive" : "text-xs text-muted-foreground"}>
-        {problem ?? loadModeHint(selected.loadMode, cursor.trim())}
+        {problem ?? (changeCapture ? changeCaptureHint(selected.loadMode) : loadModeHint(selected.loadMode, cursor.trim()))}
       </p>
-      {crossesHistoryBoundary(savedMode, selected.loadMode) ? (
+      {!changeCapture && crossesHistoryBoundary(savedMode, selected.loadMode) ? (
         <p className="text-xs text-muted-foreground">{HISTORY_BOUNDARY_NOTE}</p>
       ) : null}
     </div>
@@ -1390,6 +1421,13 @@ export function isAutoDisablePause(reason: string | null | undefined): boolean {
   return /^Paused after \d+ failed runs in a row$/.test(reason ?? "")
 }
 
+/** The reason a person's own pause carries (`PERSON_PAUSE_REASON` in `connectors.rs`, `SRC-4`); Resume lifts it too. */
+export const PERSON_PAUSE_REASON = "Paused by a person"
+
+/** A pause Resume can lift: repeated failures set it, or a person did. */
+export const isLiftablePause = (reason: string | null | undefined): boolean =>
+  isAutoDisablePause(reason) || reason === PERSON_PAUSE_REASON
+
 /**
  * The connector's runs from the product's own record (newest 50), each opening
  * to its log, and a Run now that stays disabled while a run is going: Bronze is
@@ -1518,10 +1556,12 @@ function PausedNote({
   return (
     <div className="space-y-1.5 rounded-md border border-border bg-muted/30 px-3 py-2">
       <p className="text-xs">Paused: {reason}</p>
-      {isAutoDisablePause(reason) ? (
+      {isLiftablePause(reason) ? (
         <>
           <p className="text-xs text-muted-foreground">
-            Fix the cause, then resume. The count of failed runs starts again from zero.
+            {isAutoDisablePause(reason)
+              ? "Fix the cause, then resume. The count of failed runs starts again from zero."
+              : "Resume when you want it to run again."}
           </p>
           <Button
             type="button"
@@ -1731,28 +1771,75 @@ function RunLog({ connectorId, runId }: { connectorId: string; runId: string }) 
   )
 }
 
+/** The words for the states `GET /api/connectors/{id}/change-capture` answers. Anything else is shown as sent. */
+const CAPTURE_STATE_WORDS: Record<string, { label: string; tone: "success" | "warning" | "destructive" | "neutral"; note: string }> = {
+  running: { label: "Running", tone: "success", note: "Changes at the source are being captured." },
+  paused: { label: "Paused", tone: "warning", note: "Capture is stopped; the changes made meanwhile are kept and applied after Resume." },
+  failed: { label: "Failed", tone: "destructive", note: "Capture stopped on an error. The source's recent changes are kept for seven days." },
+  starting: { label: "Starting", tone: "neutral", note: "Capture is starting. The first copy of each table is taken now." },
+  not_created: { label: "Not started", tone: "neutral", note: "Capture starts when the tables are saved." },
+  unreachable: { label: "Not reachable", tone: "warning", note: "The capture service did not answer; this is not a statement about the connector." },
+}
+
 /**
- * Read-only `Debezium` `.properties` rendering for a `cdc` adapter's
- * captured table. `properties` holds ONLY `${ENV_VAR_NAME}` references —
- * labeled explicitly as such, never resolved here or anywhere in the
- * console.
+ * The state of a change-capture connector in the capture service, in fixed words, with Pause and Resume
+ * (`SRC-4` decisions S2-e, S2-h; it replaces the Debezium properties panel). A deployment without the service
+ * says so (`supported: false`), and nothing is shown as running that was not asked.
  */
-function DebeziumPanel({ connectorId, table }: { connectorId: string; table: string }) {
-  const props = useService(
-    (signal) => connectorService.getDebeziumProperties(connectorId, table, signal),
-    [connectorId, table]
-  )
+function ChangeCapturePanel({
+  connectorId,
+  pausedReason,
+  onChanged,
+}: {
+  connectorId: string
+  pausedReason: string | null
+  onChanged?: () => void
+}) {
+  const capture = useService((signal) => connectorService.getChangeCapture(connectorId, signal), [connectorId, pausedReason])
+  const pause = useServiceAction(async (signal) => {
+    const result = await connectorService.pauseConnector(connectorId, signal)
+    if (!signal.aborted) notifySuccess("Paused; the changes made meanwhile are kept")
+    return result
+  })
 
-  if (props.status === "loading") return <LoadingSkeleton rows={2} />
-  if (props.status === "error") return <ErrorState error={props.error} onRetry={props.reload} />
-
+  if (capture.status === "loading") return <LoadingSkeleton rows={1} />
+  if (capture.status === "error") return <ErrorState error={capture.error} onRetry={capture.reload} />
+  if (!capture.data.supported) {
+    return (
+      <p className="rounded-md border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+        {capture.data.reason ?? "Change capture is not available for this connector."}
+      </p>
+    )
+  }
+  const word = CAPTURE_STATE_WORDS[capture.data.state ?? ""]
   return (
-    <div>
-      <p className="text-xs font-medium text-muted-foreground">Debezium properties · {props.data.table}</p>
-      <p className="mt-0.5 text-xs text-muted-foreground">{props.data.note}</p>
-      <pre className="mt-1.5 overflow-x-auto rounded-md border bg-muted p-2 font-mono text-xs">
-        {props.data.properties}
-      </pre>
+    <div className="space-y-1.5 rounded-md border border-border bg-muted/30 px-3 py-2">
+      <div className="flex flex-wrap items-center gap-2">
+        <p className="text-xs font-medium text-muted-foreground">Change capture</p>
+        <Pill tone={word?.tone ?? "neutral"}>{word?.label ?? capture.data.state ?? "Unknown"}</Pill>
+        {!pausedReason ? (
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            disabled={pause.status === "pending"}
+            onClick={async () => {
+              if (await pause.run()) {
+                onChanged?.()
+                capture.reload()
+              }
+            }}
+          >
+            {pause.status === "pending" ? "Pausing…" : "Pause"}
+          </Button>
+        ) : null}
+      </div>
+      <p className="text-xs text-muted-foreground">{word?.note ?? ""}</p>
+      {pause.status === "error" ? (
+        <p role="alert" className="text-xs text-destructive">
+          {pause.error.message}
+        </p>
+      ) : null}
     </div>
   )
 }
