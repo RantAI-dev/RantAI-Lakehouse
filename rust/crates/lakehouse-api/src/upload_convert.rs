@@ -173,14 +173,13 @@ pub const DEFAULT_TEXT_LIMIT: u64 = crate::upload_types::SAMPLE_BYTES as u64;
 /// - `convert-sheet` on a workbook of 5,000,000 cells whose text is INLINE
 ///   strings: 523.8 MiB;
 /// - `convert-sheet` on the same workbook whose text is in a SHARED-STRINGS
-///   part, the way Excel writes one: 801.4 MiB (the reader reserves room for
+///   part, the way Excel writes one: 801.5 MiB (the reader reserves room for
 ///   the whole table of the strings before it reads a cell);
 /// - `preview-parquet` on 2,000 rows of a file whose first row group is near
-///   `MAX_PREVIEW_GROUP_BYTES`: 162.6 MiB.
+///   `MAX_PREVIEW_GROUP_BYTES`: 163.5 MiB.
 ///
-/// 801.4 MiB times 1.5 is 1202.1 MiB, which rounds up to 1280 MiB. The
-/// numbers are the ones of `docs/plans/SEC-22-RESULT.md` (to be written by
-/// the planner from the round 1 handoff numbers).
+/// 801.5 MiB times 1.5 is 1202.3 MiB, which rounds up to 1280 MiB. The
+/// numbers are the ones of `docs/plans/SEC-22-RESULT.md`.
 ///
 /// Two conversions at once are 2.5 GiB, which a machine with 12 GB of memory
 /// affords.
@@ -1083,7 +1082,9 @@ pub enum ConversionError {
     ResourceLimit,
     /// The file was refused: 400, with the refusal's own sentence.
     Refused(Refusal),
-    /// The store failed while the text was written: 503.
+    /// The store failed while the file was fed, or while the text was
+    /// written: 503. The file may well read once the store is back, and it
+    /// is not the file's fault (`PR #187` review round 2 B1).
     Store(UploadStoreError),
 }
 
