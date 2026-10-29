@@ -8068,6 +8068,66 @@ async fn a_child_that_says_nothing_is_a_resource_limit() {
     assert_eq!(reply.json["error"], NEEDS_MORE_MEMORY, "{}", reply.text);
 }
 
+/// A stand-in for the child that writes an answer that is not JSON and then
+/// kills itself: the answer must be a resource limit, and not the file's
+/// unreadability (`PR #187` review SHOULD-FIX 5).
+fn garbled_child() -> std::path::PathBuf {
+    let dir = tempfile::tempdir().expect("a temporary directory for the stand-in child");
+    let garbage = dir.path().join("garbage");
+    std::fs::write(&garbage, "this is not the JSON the protocol asks for")
+        .expect("the garbage is written");
+    let path = dir.path().join("garbled-child");
+    std::fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\ncat {garbage}\nkill -9 $$\n",
+            garbage = garbage.display()
+        ),
+    )
+    .expect("the stand-in child is written");
+    let mut permissions = std::fs::metadata(&path)
+        .expect("the stand-in child exists")
+        .permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        permissions.set_mode(0o755);
+    }
+    std::fs::set_permissions(&path, permissions).expect("the stand-in child is executable");
+    // The directory is removed when it goes out of scope; the child has
+    // already been read by then, and the API starts it by path.
+    std::mem::forget(dir);
+    path
+}
+
+#[tokio::test]
+async fn a_garbled_answer_from_a_killed_child_is_a_resource_limit() {
+    let stack = Stack::with(Options {
+        conversion_child: Some(garbled_child()),
+        ..Options::default()
+    })
+    .await;
+    let bayu = stack.bayu().await;
+    let reply = stack
+        .send(
+            &bayu,
+            "POST",
+            "/api/uploads",
+            file_form(
+                "stock.xlsx",
+                "application/octet-stream",
+                &workbook("stock.xlsx"),
+            ),
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.text);
+    assert_eq!(
+        reply.json["error"], NEEDS_MORE_MEMORY,
+        "the child was killed, so it is a resource limit: {}",
+        reply.text
+    );
+}
+
 #[tokio::test]
 async fn a_store_failure_while_the_child_is_fed_is_a_503_and_not_the_file_s_fault() {
     let stack = Stack::start().await;

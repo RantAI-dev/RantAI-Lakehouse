@@ -1572,16 +1572,13 @@ impl ConversionRunner {
             Err(_elapsed) => {
                 // Past the wall clock: the child is killed, and its ending
                 // is logged (`PR #187` review SHOULD-FIX 4).
-                let _killed = child.start_kill();
-                let _ = self.wait(child, stderr, feed, deadline).await;
-                return Err(ConversionError::ResourceLimit);
+                return Err(self.refuse_the_child(child, stderr, feed, deadline).await);
             }
         };
         if read == 0 {
             // The child said nothing: it died before its answer. Its ending
             // is logged, and that is where the out-of-memory abort shows up.
-            let _ = self.wait(child, stderr, feed, deadline).await;
-            return Err(ConversionError::ResourceLimit);
+            return Err(self.refuse_the_child(child, stderr, feed, deadline).await);
         }
         if !answer_line_fits(&line) {
             // The answer is over the cap, or the child stopped before the
@@ -1592,12 +1589,24 @@ impl ConversionRunner {
                 bytes = line.len(),
                 "the answer of the child that reads an uploaded file is over its cap"
             );
-            let _killed = child.start_kill();
-            let _ = self.wait(child, stderr, feed, deadline).await;
-            return Err(ConversionError::ResourceLimit);
+            return Err(self.refuse_the_child(child, stderr, feed, deadline).await);
         }
-        let answer: Answer = serde_json::from_slice(&line)
-            .map_err(|_err| ConversionError::Refused(Refusal::Unreadable))?;
+        let answer: Answer = match serde_json::from_slice(&line) {
+            Ok(answer) => answer,
+            Err(err) => {
+                tracing::warn!(%err, "the answer of the child that reads an uploaded file is not JSON");
+                // The child's own ending decides (`PR #187` review
+                // SHOULD-FIX 5): a signal means it was killed — out of
+                // memory, out of time — and that is a resource limit; any
+                // other ending is the file's own unreadability.
+                let ending = self.wait(child, stderr, feed, deadline).await;
+                return Err(match ending {
+                    Err(ConversionError::ResourceLimit) => ConversionError::ResourceLimit,
+                    Err(ConversionError::Store(err)) => ConversionError::Store(err),
+                    _ => ConversionError::Refused(Refusal::Unreadable),
+                });
+            }
+        };
         Ok(Started {
             answer,
             child,
@@ -1605,6 +1614,20 @@ impl ConversionRunner {
             stderr,
             feed,
         })
+    }
+
+    /// The child is not to be trusted with the answer: it is killed, its
+    /// ending is logged, and the answer is a resource limit.
+    async fn refuse_the_child(
+        &self,
+        mut child: Child,
+        stderr: tokio::task::JoinHandle<Vec<u8>>,
+        feed: tokio::task::JoinHandle<Result<(), ConversionError>>,
+        deadline: tokio::time::Instant,
+    ) -> ConversionError {
+        let _killed = child.start_kill();
+        let _ = self.wait(child, stderr, feed, deadline).await;
+        ConversionError::ResourceLimit
     }
 
     /// Wait for the child to end, and read what it said on its standard
