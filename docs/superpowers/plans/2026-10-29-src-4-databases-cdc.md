@@ -330,9 +330,6 @@ for the job. Not started. The gate's `connect` step stays `refused` in
   proven: the product's `tcps` dial, chain and DN. Not proven: Oracle's own TCPS
   endpoint. Written in `oracle-tls-proxy.conf`, the gate docstring and
   `coverage.json`. Say if you want the real wallet attempted.
-- Pre-existing, not changed: `database` (service name) is interpolated into the
-  connect descriptor by `oracledb` unescaped (a `)(` in it injects). Noted for
-  the backlog.
 - `route_auth.rs::ingest_spec_put_refuses_excluded_columns_the_source_cannot_honour`
   used Oracle as its "cannot list columns" case; its case is now Oracle's
   key-column refusal (still 422), the non-listing-source refusal stays in the
