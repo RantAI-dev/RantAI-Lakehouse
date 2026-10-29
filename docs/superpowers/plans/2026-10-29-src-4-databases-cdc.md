@@ -546,6 +546,17 @@ Open items for the reviewer:
 - `docs/plans/P5-*.md`, `LAKEHOUSE-FOUNDATION-PLAN.md` and ADRs keep their historical
   `debezium-server` text on purpose (they record what was measured then).
 
+### Slice 2, round 1 fixes (developer, Sonnet, 2026-10-29)
+
+Commit `0d6be072`. `SRC-4 S2 review SHOULD-FIX 1`: `INGEST_ALLOW_INTERNAL_HOSTS` is removed
+from the g4 override and its comment now says the applier does not need it. CI on `0d6be072`:
+`Rust · G4 change capture into Bronze` concluded `pass` (8m24s, run 40870630314), so the
+applier never dials a guarded address and production needs no such flag; the open item in the
+slice 2 entry above is closed. `SHOULD-FIX 2`: `replication_metrics.py` (two places) now names
+`render_connect_config`, `config.rs` no longer names `debezium-server`, and `docs/OPERATIONS.md`
+says an upgraded deployment keeps the Lakekeeper `debezium` principal and grant, revocable by
+hand. Other checks on that run are in the PR; only the G4 conclusion was read by me.
+
 ## Review
 
 (The planner writes findings here, tagged `BLOCKER` or `SHOULD-FIX`.)
