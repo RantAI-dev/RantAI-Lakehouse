@@ -323,6 +323,12 @@ pub struct Config {
     /// read-only `SELECT`) neither assumes nor configures. See
     /// `docs/adr/0008-initial-snapshot-backfill.md`.
     pub oracle_cdc_logminer_enabled: bool,
+    /// Where the API reaches `Kafka Connect`'s REST API (`KAFKA_CONNECT_URL`,
+    /// `SRC-4` slice 2, ADR 0016). `None` when unset or blank: a change-capture
+    /// connector then answers `supported: false` with a fixed sentence instead
+    /// of dialing a guessed address (fail closed). Operator-set, never taken
+    /// from a request; the address is internal to the deployment's network.
+    pub kafka_connect_url: Option<String>,
     /// `ClickHouse` HTTP interface URL. Default
     /// `"http://localhost:18123"` (`clickhouse.ts:11`, `??`).
     pub ch_url: String,
@@ -1080,6 +1086,7 @@ impl std::fmt::Debug for Config {
                 "oracle_cdc_logminer_enabled",
                 &self.oracle_cdc_logminer_enabled,
             )
+            .field("kafka_connect_url", &self.kafka_connect_url)
             .field("oidc_clock_skew_seconds", &self.oidc_clock_skew_seconds)
             .field("oidc_authorize_url", &self.oidc_authorize_url)
             .field("oidc_token_url", &self.oidc_token_url)
@@ -1470,6 +1477,7 @@ impl Config {
             oracle_cdc_logminer_enabled: env
                 .get("ORACLE_CDC_LOGMINER_ENABLED")
                 .is_some_and(|v| v == "true"),
+            kafka_connect_url: truthy(env, "KAFKA_CONNECT_URL"),
             oidc_clock_skew_seconds: env
                 .get("OIDC_CLOCK_SKEW_SECONDS")
                 .and_then(|v| v.parse::<u64>().ok())
@@ -2075,6 +2083,24 @@ mod tests {
     fn oracle_cdc_logminer_enabled_defaults_to_false() {
         let cfg = Config::from_map(&HashMap::new()).unwrap();
         assert!(!cfg.oracle_cdc_logminer_enabled);
+    }
+
+    /// `KAFKA_CONNECT_URL` is unset by default, and a blank value is unset too:
+    /// the API never dials a guessed address (`SRC-4` decision S2-b).
+    #[test]
+    fn kafka_connect_url_is_unset_by_default_and_blank_counts_as_unset() {
+        assert_eq!(
+            Config::from_map(&HashMap::new()).unwrap().kafka_connect_url,
+            None
+        );
+        let cfg = Config::from_map(&map(&[("KAFKA_CONNECT_URL", "")])).unwrap();
+        assert_eq!(cfg.kafka_connect_url, None);
+        let cfg =
+            Config::from_map(&map(&[("KAFKA_CONNECT_URL", "http://kafka-connect:8083")])).unwrap();
+        assert_eq!(
+            cfg.kafka_connect_url.as_deref(),
+            Some("http://kafka-connect:8083")
+        );
     }
 
     /// The codebase's boolean-parsing rule is exact

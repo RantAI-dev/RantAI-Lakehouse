@@ -45,6 +45,7 @@ pub mod gold_lock;
 pub mod health;
 pub mod internal_hosts;
 pub mod json;
+pub mod kafka_connect;
 pub mod lakehouse_catalog;
 pub mod lakekeeper_token;
 pub mod next_run;
