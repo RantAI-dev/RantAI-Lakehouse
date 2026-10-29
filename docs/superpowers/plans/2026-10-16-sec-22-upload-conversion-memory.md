@@ -510,6 +510,137 @@ yet.
   failed" (exit 134), and the API answered 400 with the one sentence and
   was still there for the next request.
 
+### Handoff (review round 2)
+
+Round 2 of the review (the plan's section 8, "Review round 2", at
+`2c252c32`). The branch is `fix/sec-22-upload-conversion-memory`; the last
+CODE commit of this round is `a93c3663`, and this handoff is the commit
+after it.
+
+#### The commits, one line each
+
+| commit | what it does | the finding it answers |
+| --- | --- | --- |
+| `feabcfa6` | the feed tells a store failure and a broken pipe apart, and every refusal path waits for the child's ending | BLOCKER 1 |
+| `f616dfbe` | the child that said nothing is waited for before it is killed, and what it said is read under a fresh bound | BLOCKER 2, SHOULD-FIX 3 |
+| `b522ec80` | a text whose marker could not be written is not deleted | SHOULD-FIX 1 |
+| `6adb9765` | the row group the child answers is checked against the file | SHOULD-FIX 2 |
+| `c3cc40f2` | the child's own Parquet input checks | SHOULD-FIX 4 |
+| `591fb692` | the measurement checks the answer, and the Parquet input is copied once | SHOULD-FIX 5 |
+| `e1e442a8` | the comments, the docs and the test gaps | SHOULD-FIX 6 |
+| `a93c3663` | the memory limit's own numbers, and the store failure's own doc | SHOULD-FIX 6, BLOCKER 1 |
+
+#### The commands, with their counts
+
+Every cargo command ran through `/home/shiro/rantai/bin/cargo-locked` (the
+machine-wide lock, `--locked`, `-j 2`), in the foreground, on the branch's
+own worktree (`/home/shiro/rantai/wt-sec22`).
+
+Per commit, on the crate the commit touched:
+
+- `cargo fmt --check` — clean, on every commit of the round.
+- `cargo clippy --locked -p lakehouse-api --all-targets -j 2 -- -D warnings`
+  — clean, on every commit of the round.
+- `cargo test --locked -p lakehouse-api -j 2 --test upload_routes <filter>`
+  and `cargo test --locked -p lakehouse-api -j 2 --lib <filter>`:
+
+| commit | the test command | the counts |
+| --- | --- | --- |
+| `feabcfa6` | `--test upload_routes store` | 17 passed, 0 failed |
+| `f616dfbe` | `--test upload_routes child` | 9 passed, 0 failed |
+| `f616dfbe` | `--lib upload_` | 194 passed, 0 failed, 1 ignored |
+| `b522ec80` | `--lib upload_` | 194 passed, 0 failed, 1 ignored |
+| `b522ec80` | `--test upload_routes converted` | 5 passed, 0 failed |
+| `6adb9765` | `--test upload_routes parquet` | 18 passed, 0 failed |
+| `6adb9765` | `--test upload_routes row_group` | 1 passed, 0 failed |
+| `c3cc40f2` | `--lib upload_convert` | 14 passed, 0 failed |
+| `591fb692` | `--lib upload_convert` | 14 passed, 0 failed |
+| `e1e442a8` | `--test upload_routes list_of_sheets` | 2 passed, 0 failed |
+| `a93c3663` | the whole block below | — |
+
+On the final commit (`a93c3663`), the whole block of `AGENTS.md`:
+
+- `cargo fmt --check` — clean.
+- `cargo clippy --locked --workspace --all-targets --all-features -j 2 -- -D warnings`
+  — clean (exit 0).
+- `cargo test --locked --workspace --no-fail-fast -j 2` — **159 test
+  binaries, 8468 passed, 0 failed, 51 ignored** (exit 0). The
+  `upload_routes` binary alone: 173 passed, 0 failed.
+- `cargo deny check` (in `rust/`) — "advisories ok, bans ok, licenses ok,
+  sources ok" (exit 0).
+- `docker compose -f docker-compose.yml --profile '*' config --quiet`,
+  with dummy values for `POSTGRES_PASSWORD`, `RUSTFS_ACCESS_KEY`,
+  `RUSTFS_SECRET_KEY`, `LAKEKEEPER_ENCRYPTION_KEY` and
+  `CONNECTOR_SECRETS_KEY` — clean.
+- The `g9-upload` gate, as `.github/workflows/ci.yml` runs it, on the
+  project name `g9sec22r2`: the API image of this branch
+  (`LAKEHOUSE_API_IMAGE=rantai-lakehouse-api:local`, built from this branch
+  with `docker compose build lakehouse-api`), the dagster image that was on
+  the machine (`rantai-lakehouse-dagster:local`), the `oidc-mock` fixture
+  image built for it, and the stack up with
+  `docker compose -p g9sec22r2 --profile dagster up -d --no-build
+  lakehouse-api dagster-code-location dagster-webserver dagster-daemon
+  clickhouse-iceberg-init`. Then `docker compose -p g9sec22r2 --profile
+  dagster run --rm g9-test-runner` — exit 0 and "[g9] PASS", with the
+  `SEC-22` steps of the gate: "[g9] workbook: PASS (the upload is gone, the
+  table stays)", "[g9] parquet: PASS (the upload is gone, the table stays)"
+  and "[g9] hostile workbook: refused with the one sentence, the API is
+  still there". The stack was taken down afterwards (`down -v`) and the
+  images this round built were removed. The gate's own throwaway `.env` is
+  gitignored and was removed with them.
+- `git status` — the tree is clean; nothing generated is staged.
+
+#### The measurement, and what moved
+
+The Parquet child copies its input once now (`591fb692`), so the release
+measurement was run again: `ops/g9/sec22_measure.py` against the RELEASE
+binary of the gate's image (`rantai-lakehouse-api:local`, built from this
+branch), with `pyarrow` on `PYTHONPATH` for the Parquet fixture (the
+script skips that fixture without it, and says so).
+
+| run | the fixture | peak RSS | CPU | wall | exit | at the limits |
+| --- | --- | --- | --- | --- | --- | --- |
+| the baseline (an empty input) | 0 B | 10.0 MiB | 0.00 s | 0:00.00 | 2 | 2 |
+| `convert-sheet`, inline strings | 17,070,628 B | 524.0 MiB | 4.71 s | 0:04.76 | 0 | 0 |
+| `convert-sheet`, shared strings | 27,974,678 B | 801.4 MiB | 6.07 s | 0:06.20 | 0 | 0 |
+| `preview-parquet`, 2,000 rows | 61,222,470 B (the child is fed 77,998,929 B of it) | 163.1 MiB | 0.18 s | 0:00.20 | 0 | 0 |
+
+Against the round 1 numbers of `docs/plans/SEC-22-RESULT.md` (9.9, 523.8,
+801.5 and 163.5 MiB), the peaks move by less than a MiB: the same
+measurement, run twice, on the same machine. **No limit moves**: 801.4 MiB
+times 1.5 is 1202.1 MiB, which rounds up to 1280 MiB, and the CPU (6.07 s
+here, 6.10 s in the round 1 run) is far under the 60 s limit.
+
+Two things the reviewer should know about the copy:
+
+- The copy cuts the Parquet child's peak by 0.4 MiB and no more, because
+  the pieces the reader is given are the whole input between them: one
+  copy of the input costs what two copies of its parts cost. The review's
+  "this cuts the Parquet child's peak" is true and small.
+- The script now checks the answer as well: every run answered, and the
+  Parquet preview read its 2,000 rows ("[sec22] preview-parquet, 2000
+  rows: the preview read 2000 rows"). A run that read the wrong range
+  exits 0 and is caught by the script now.
+
+The constant `upload_convert::DEFAULT_MEMORY_MIB` cites the RESULT doc's
+numbers (801.5, 163.5, 1202.3) as the review asks, and the planner may
+update the doc from the table above.
+
+#### Not verified, and why
+
+- **The TypeScript and the Dagster code location were not checked.** This
+  round touches no file under `src/` and none under `dagster/`, so the
+  checks of `AGENTS.md` that belong to them (`bun run typecheck`,
+  `bun run lint`, `bun run test`, `pytest dispar_orchestrate`) were not
+  run. The Python that did change (`ops/g9/sec22_measure.py`) is a gate
+  script, not the code location, and it ran as the measurement (and the
+  gate that reads the fixtures it builds ran too).
+- **The `SEC-22` T1 reproduction was not re-run in this round.** The
+  hostile fixtures were not read by hand under `ulimit -v` as T1 did; the
+  gate's own hostile workbook step ran against the image of this branch
+  ("[g9] hostile workbook: refused with the one sentence, the API is still
+  there"), and that is the same fixture and the same child.
+
 ## 8. Review
 
 ### Review round 1 (planner, 2026-10-29, at `17957613`; the merge `560ec754` changes none of it)
