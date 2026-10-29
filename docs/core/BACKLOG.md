@@ -65,6 +65,7 @@ estimate (S, M, L), which the base has no field for.
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `AI-18` | Feature | Copilot Chat: ask a question or give an instruction in plain language, and the assistant answers or acts with the console's own tools; risky actions wait for approval. Built before this backlog tracked PRs; never accepted | AI Copilot | P1 | In Acceptance | #169 | `PRODUCT.md` §2 (Home, History) |
 | `SEC-22` | Task | Converting an uploaded workbook can exhaust the API's memory and stop the API for every user; the conversion must not be able to end the API process. Also: the Parquet reader trusts sizes from the file's footer the same way (by reading, not run); no limit on conversions running at once; no byte cap on workbook text; each preview converts the whole file again; the limits doc in `upload_workbook.rs` says the opposite of the code | Administration & Security | P0 | In Progress | #187 | PR #76 review, BLOCKER 1 (merged without the fix); `superpowers/plans/2026-10-12-delivery-review.md` |
+| `SEC-55` | Task | Previewing a Parquet file in an S3 files connector reads it in the API process (`connector_listing.rs`, `upload_parquet::inspect` on up to 64 MiB), so a crafted footer can end the API for every tenant, as `SEC-22` found for uploads: `parquet` reserves list space from counts the footer declares before any check runs. Fix: send it to the `SEC-22` child with its tail only. **Waits for `SEC-22`** | Administration & Security | P1 | Todo |  | PR #187 review round 1, P3 (`superpowers/plans/2026-10-16-sec-22-upload-conversion-memory.md`) |
 | `SEC-23` | Task | Adding a quality, classification or residency rule asked only for a login, while changing one asks for `governance:write`; adding now asks for it too, in the API, the assistant's tools and the console | Administration & Security | P1 | Done | #97 | `features/governance-rule-create.md` |
 | `DATA-1` | Feature | Gold tables publish to open format automatically, as an option per table | Build | P1 | In Acceptance | #60, #63, #64 | `features/gold-publish-per-mart.md` |
 | `QA-1` | Task | Accept each built feature with a checklist, starting with what a demo shows | Delivery | P1 | Todo |  | PRODUCT §4 blocker 1 |
@@ -322,6 +323,7 @@ parity), built after it.
 | `DEC-8` | Decided | — | `AI-11` |
 | `QS-5` | Planned | `BI-18` (the dashboard date filter) | `AI-12` (variables part) |
 | `SEC-20` | In Progress | — | `QS-3` |
+| `SEC-22` | In Progress | — | `SEC-55` (the child process) |
 | `AI-11` | Planned | `BI-19`, `DEC-8` | — |
 | `AI-12` | Building | `QS-5` (variables part) | — |
 | `AI-13` | Planned | `BI-14` | — |
@@ -332,6 +334,7 @@ parity), built after it.
 | `DATA-3` | Planned | `DATA-4` | — |
 | `QS-3` | Planned | `SEC-20` | — |
 | `REL-6` | Todo | `BLD-1` | — |
+| `SEC-55` | Todo | `SEC-22` (the child process) | — |
 
 **Ready to start** (Todo, Planned or Idea, nothing open blocks it; Idea items still need a spec):
 
