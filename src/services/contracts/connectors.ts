@@ -170,6 +170,12 @@ export type ConnectorTestResult = {
   message: string
   /** `null` when `supported` is `false`: an unsupported type was never actually dialed. */
   testedAt: string | null
+  /**
+   * `true` only while a test that runs in the orchestrator has not finished (`SRC-4` T1.1: Oracle). Nothing was
+   * dialled yet, so `ok: false` is not a failure; read the end of it with `getDiscovery(id, "test")` and the
+   * probe history, as `runConnectionTest` does. Absent otherwise.
+   */
+  pending?: boolean
 }
 
 /**
@@ -792,6 +798,13 @@ export type ConnectorType = {
  */
 export type DiscoveryKind = "list" | "preview"
 
+/**
+ * What a discovery answer or poll can be about: the two a person starts, and `test` (`SRC-4` T1.1), the connection
+ * test of a connector only the orchestrator can dial, which `POST /api/connectors/{id}/test` launches. A test is
+ * never started on the discovery route (the API answers 400), only read there.
+ */
+export type DiscoveryReadKind = DiscoveryKind | "test"
+
 /** `running` only for the sources the orchestrator reads; the console polls until it ends. */
 export type DiscoveryState = "running" | "done" | "failed"
 
@@ -862,7 +875,7 @@ export type DiscoveryColumn = {
  * topic, collection or file, not a failure.
  */
 export type DiscoveryAnswer = {
-  kind: DiscoveryKind
+  kind: DiscoveryReadKind
   state: DiscoveryState
   /** What a list was narrowed by (the schema or the glob), when it was. */
   scope?: string
@@ -872,6 +885,8 @@ export type DiscoveryAnswer = {
   truncated?: boolean
   columns?: DiscoveryColumn[]
   primaryKey?: string[]
+  /** A finished connection test: the milliseconds the connection took, as the orchestrator measured them. */
+  latencyMs?: number
   errorClass?: DiscoveryErrorClass
   reason?: string
   startedAt?: string
@@ -1075,7 +1090,7 @@ export interface ConnectorService {
    */
   startDiscovery(id: string, kind: DiscoveryKind, request: DiscoveryRequest, signal?: AbortSignal): Promise<DiscoveryAnswer>
   /** `GET /api/connectors/{id}/discovery/{kind}`: the latest answer of that kind (404 when none was asked for). */
-  getDiscovery(id: string, kind: DiscoveryKind, signal?: AbortSignal): Promise<DiscoveryAnswer>
+  getDiscovery(id: string, kind: DiscoveryReadKind, signal?: AbortSignal): Promise<DiscoveryAnswer>
   /** With `table`, a run of that one table with an action (`SRC-10`); without, every table. */
   runIngest(id: string, signal?: AbortSignal, table?: IngestTableRequest): Promise<IngestRunResult>
   /** `GET /api/connectors/{id}/runs` (`SRC-11`): the newest 50 runs from the product's own run record. */

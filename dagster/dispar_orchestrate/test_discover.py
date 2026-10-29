@@ -713,6 +713,59 @@ def test_oracle_previews_declared_columns_and_the_primary_key_in_key_order() -> 
         discover.discover(_ORACLE, _request("preview", object="ORDERS"), backends=_oracle_backends(_Engine({})))
 
 
+# --- the connection test (SRC-4 T1.1) -----------------------------------------------------------
+
+
+def test_an_oracle_connection_test_connects_runs_one_statement_and_reports_only_the_time() -> None:
+    engine = _Engine({"SELECT 1 FROM DUAL": [(1,)]})
+    result = discover.discover(_ORACLE, _request("test"), backends=_oracle_backends(engine))
+    assert list(result) == ["latencyMs"]
+    assert isinstance(result["latencyMs"], int) and result["latencyMs"] >= 0
+    assert [sql for sql, _ in engine.connection.statements] == ["SELECT 1 FROM DUAL"]
+    assert engine.disposed is True
+
+    body = discover.result_body(_request("test"), result=result, error_class=None)
+    assert body == {"requestId": "req-1", "kind": "test", "state": "done", "latencyMs": result["latencyMs"]}
+
+
+def test_a_refused_login_is_posted_as_sign_in_refused_and_an_unreachable_host_as_unreachable() -> None:
+    import sqlalchemy.exc
+
+    def refused(code: str):
+        arg = SimpleNamespace(full_code=code)
+        return sqlalchemy.exc.DatabaseError("connect", {}, _driver_error("oracledb", "DatabaseError")(arg))
+
+    for exc, expected in [(refused("ORA-01017"), "sign_in_refused"), (ConnectionRefusedError(), "unreachable")]:
+
+        def engine_that_fails(spec, secrets, *, resolve_checked, _exc=exc):
+            raise _exc
+
+        posted: list[dict] = []
+        error_class = discover.run_request(
+            _request("test"),
+            connector_loader=lambda cid: _ORACLE,
+            poster=posted.append,
+            backends=_backends(oracle_engine=engine_that_fails),
+        )
+        assert error_class == expected
+        assert posted == [{"requestId": "req-1", "kind": "test", "state": "failed", "errorClass": expected}]
+        assert SECRET_TEXT not in json.dumps(posted)
+
+
+def test_only_oracle_is_tested_by_the_orchestrator() -> None:
+    posted: list[dict] = []
+    error_class = discover.run_request(
+        _request("test"), connector_loader=lambda cid: _MONGO, poster=posted.append
+    )
+    assert error_class == "not_supported"
+    assert posted[0]["kind"] == "test" and posted[0]["state"] == "failed"
+    assert discover.DiscoverRequest.from_op_config(
+        {"connector_id": "c", "request_id": "r", "kind": "test"}
+    ).kind == "test"
+    with pytest.raises(ValueError):
+        discover.DiscoverRequest.from_op_config({"connector_id": "c", "request_id": "r", "kind": "tests"})
+
+
 # --- REST (the column preview) -------------------------------------------------------------
 
 

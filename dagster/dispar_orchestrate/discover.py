@@ -23,6 +23,7 @@ never writes to the source.
     preview, done  {"requestId", "kind": "preview", "state": "done",
                     "columns": [{"name", "typeName", "inferred"}],
                     "primaryKey"?: [name]}
+    test, done     {"requestId", "kind": "test", "state": "done", "latencyMs": int}
     failed         {"requestId", "kind", "state": "failed", "errorClass"}
 
 `errorClass` is one of `ERROR_CLASSES` (decision D10's six words, `unreachable`
@@ -137,7 +138,10 @@ ERROR_CLASSES = frozenset(
     {UNREACHABLE, SIGN_IN_REFUSED, ADDRESS_REFUSED, NO_PERMISSION, TIMEOUT, TOO_MANY_OBJECTS, NOT_SUPPORTED, FAILED}
 )
 
-KINDS = ("list", "preview")
+# `test` (SRC-4 T1.1) is not a listing: it is the connection test of a connector whose driver only this
+# code location has (Oracle). `POST /api/connectors/{id}/test` launches it; the result is the time the
+# connection took, or a class, and the API records it as a connection test.
+KINDS = ("list", "preview", "test")
 
 
 class NotSupported(Exception):
@@ -207,11 +211,11 @@ class DiscoverRequest:
 
         # Errors
 
-        `ValueError` for a kind that is not `list`/`preview`.
+        `ValueError` for a kind that is not `list`/`preview`/`test`.
         """
         kind = config["kind"]
         if kind not in KINDS:
-            raise ValueError("kind must be list or preview")
+            raise ValueError("kind must be list, preview or test")
         return cls(
             connector_id=config["connector_id"],
             request_id=config["request_id"],
@@ -667,11 +671,19 @@ def _oracle(dial: dict, secrets: dict, request: DiscoverRequest, b: Backends) ->
     from sqlalchemy import text
 
     engine = b.oracle_engine(dial, secrets, resolve_checked=b.resolve_checked)
+    started = time.monotonic()
     try:
         with b.checking_resolver(), engine.connect() as connection:
-
             def rows(sql: str, **params: Any) -> list[tuple]:
                 return [tuple(r) for r in connection.execute(text(sql), params)]
+
+            if request.kind == "test":
+                # SRC-4 T1.1: the connection test. Connecting is the proof (the dial is the load's: the
+                # checked IP literal, tcps with the operator's DN when `sslMode` asks, the service name); one
+                # trivial statement shows the login can use the session. What is returned is the elapsed
+                # time, measured here, from before the connect.
+                rows("SELECT 1 FROM DUAL")
+                return {"latencyMs": max(0, round((time.monotonic() - started) * 1000))}
 
             search = like_escape(request.search) or None
             fetch = request.limit + 1
@@ -780,6 +792,9 @@ def discover(connector: dict, request: DiscoverRequest, *, backends: Backends | 
     errors -- for `classify_discovery` to name. Nothing is caught here.
     """
     reader = _reader_for(connector)
+    if request.kind == "test" and reader is not _oracle:
+        # SRC-4 T1.1: only Oracle is tested here; the API tests the rest itself or says it cannot.
+        raise NotSupported("the orchestrator tests only Oracle connections")
     dial = connector["dial"]
     secrets = secret_resolver.resolve_secrets(
         connector["adapter"],
@@ -867,7 +882,7 @@ def _fetch_connector(connector_id: str) -> dict:
     config_schema={
         "connector_id": Field(str, description="The connector.id to read."),
         "request_id": Field(str, description="The API's id for this request; echoed in the result."),
-        "kind": Field(str, description="list | preview."),
+        "kind": Field(str, description="list | preview | test."),
         "object": Field(str, default_value="", description="The object to preview."),
         "schema": Field(str, default_value="", description="A SQL source's schema."),
         "glob": Field(str, default_value="", description="A file glob (SFTP)."),

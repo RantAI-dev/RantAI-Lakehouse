@@ -22,6 +22,7 @@ import { Button } from "@/components/ui/button"
 import { Tabs, TabsContent } from "@/components/ui/tabs"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { SECRET_MANAGER_LABEL, type SecretManager } from "@/lib/connectors/secret-reference"
+import { runConnectionTest } from "@/lib/connectors/run-connection-test"
 import { TEST_OUTCOME_TOAST, testOutcome, type TestOutcome } from "@/lib/connectors/test-result"
 import { formatDateTime, formatRelativeTime } from "@/lib/format"
 import { notifyError, notifyFailure, notifyInfo, notifySuccess } from "@/lib/notify"
@@ -203,7 +204,7 @@ export function ConnectorDetailPage({ connectorId: id }: { connectorId: string }
   }
   const testAction = useServiceAction(async (signal, connectorId: string) => {
     try {
-      const result = await connectorService.testConnection(connectorId, signal)
+      const result = await runConnectionTest(connectorService, connectorId, signal)
       // A cancelled request is not an answer; announce nothing for it.
       if (!signal.aborted) announceTest(result)
       return result

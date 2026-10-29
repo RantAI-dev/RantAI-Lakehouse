@@ -69,7 +69,7 @@ use lakehouse_auth::Principal;
 use lakehouse_core::ApiError;
 use lakehouse_store::connector_discovery::{
     self, Answer, ErrorClass, Kind, ListedColumn, ListedObject, Listing, MAX_NAME_CHARS,
-    MAX_OBJECTS, Outcome, Preview, State as RequestState,
+    MAX_OBJECTS, Outcome, Preview, State as RequestState, Tested,
 };
 use lakehouse_store::connectors;
 use serde::{Deserialize, Serialize};
@@ -78,9 +78,10 @@ use time::OffsetDateTime;
 
 use super::schema_changes::{check_name, require_orchestrator};
 use crate::connector_listing::{self, Dispatch, Request};
+use crate::connector_probe;
 use crate::error::ApiResult;
 use crate::json::ApiJson;
-use crate::routes::connectors::{parse_body, pool};
+use crate::routes::connectors::{parse_body, pool, record_test_outcome};
 use crate::state::AppState;
 
 /// The orchestrator's job (`dagster/dispar_orchestrate/discover.py`).
@@ -111,10 +112,23 @@ pub struct StartBody {
     object: Option<String>,
 }
 
-/// The `{kind}` path segment.
-fn kind_of(segment: &str) -> Result<Kind, ApiError> {
-    Kind::parse(segment)
-        .ok_or_else(|| ApiError::BadRequest("kind must be \"list\" or \"preview\"".to_owned()))
+/// The `{kind}` path segment of a request a person starts: `list` or `preview`.
+/// A connection test (`test`) is started only by `POST /api/connectors/{id}/test`
+/// (`SRC-4` T1.1), never here: one way to test one connector.
+fn kind_to_start(segment: &str) -> Result<Kind, ApiError> {
+    match Kind::parse(segment) {
+        Some(kind @ (Kind::List | Kind::Preview)) => Ok(kind),
+        Some(Kind::Test) | None => Err(ApiError::BadRequest(
+            "kind must be \"list\" or \"preview\"".to_owned(),
+        )),
+    }
+}
+
+/// The `{kind}` path segment of a poll: `list`, `preview` or `test`.
+fn kind_to_read(segment: &str) -> Result<Kind, ApiError> {
+    Kind::parse(segment).ok_or_else(|| {
+        ApiError::BadRequest("kind must be \"list\", \"preview\" or \"test\"".to_owned())
+    })
 }
 
 /// A string field as accepted: at most 256 characters, no control character.
@@ -161,7 +175,8 @@ fn request_of(kind: Kind, body: StartBody) -> Result<Request, ApiError> {
 ///
 /// # Errors
 ///
-/// 400 for a kind other than `list`/`preview`, a body that is not the documented
+/// 400 for a kind other than `list`/`preview` (a `test` is started by
+/// `POST /api/connectors/{id}/test` only), a body that is not the documented
 /// JSON, or a field outside its bounds; 404 for an unknown connector (the route
 /// layer); 503/500 as the store reports. A source that cannot be read is NOT an
 /// error here: it is a 200 answer with `state: "failed"` and an `errorClass`.
@@ -170,7 +185,7 @@ pub async fn start(
     Path((id, kind)): Path<(String, String)>,
     body: Bytes,
 ) -> ApiResult<ApiJson<Answer>> {
-    let kind = kind_of(&kind)?;
+    let kind = kind_to_start(&kind)?;
     let parsed: StartBody = if body.iter().all(u8::is_ascii_whitespace) {
         StartBody::default()
     } else {
@@ -263,18 +278,35 @@ async fn launch(
     Ok(answer)
 }
 
+/// Launch the orchestrator's connection test (`SRC-4` T1.1) for `id`, for
+/// `POST /api/connectors/{id}/test`. It is the same job and the same request
+/// row as a listing, in the connector's own `test` row, so a test never
+/// overwrites the person's table list. The caller answers "pending"; the result
+/// is recorded by [`report_result`].
+///
+/// # Errors
+///
+/// As [`launch`].
+pub(super) async fn launch_test(state: &AppState, id: &str) -> Result<(), ApiError> {
+    let request = Request {
+        limit: 1,
+        ..Request::default()
+    };
+    launch(state, id, Kind::Test, &request).await.map(drop)
+}
+
 /// `GET /api/connectors/{id}/discovery/{kind}` -- the latest answer of that
 /// kind, as the orchestrator's job posted it.
 ///
 /// # Errors
 ///
-/// 400 for a kind other than `list`/`preview`; 404 when no request of that kind
+/// 400 for a kind other than `list`/`preview`/`test`; 404 when no request of that kind
 /// was ever made for this connector; 503/500 as the store reports.
 pub async fn poll(
     State(state): State<AppState>,
     Path((id, kind)): Path<(String, String)>,
 ) -> ApiResult<ApiJson<Answer>> {
-    let kind = kind_of(&kind)?;
+    let kind = kind_to_read(&kind)?;
     let stored = connector_discovery::get(pool(&state)?, &id, kind)
         .await?
         .ok_or_else(|| {
@@ -302,6 +334,9 @@ pub struct ResultBody {
     columns: Option<Vec<ListedColumn>>,
     #[serde(default)]
     primary_key: Option<Vec<String>>,
+    /// A finished test's connection time (`SRC-4` T1.1).
+    #[serde(default)]
+    latency_ms: Option<i64>,
 }
 
 /// What the result route answers: whether this call stored the answer (`false`
@@ -326,6 +361,7 @@ fn outcome_of(body: ResultBody) -> Result<Outcome, ApiError> {
                 || body.truncated.is_some()
                 || body.columns.is_some()
                 || body.primary_key.is_some()
+                || body.latency_ms.is_some()
             {
                 return Err(bad("a failure carries no result"));
             }
@@ -340,7 +376,10 @@ fn outcome_of(body: ResultBody) -> Result<Outcome, ApiError> {
                     let objects = body
                         .objects
                         .ok_or_else(|| bad("a list carries its objects"))?;
-                    if body.columns.is_some() || body.primary_key.is_some() {
+                    if body.columns.is_some()
+                        || body.primary_key.is_some()
+                        || body.latency_ms.is_some()
+                    {
                         return Err(bad("a list carries no columns"));
                     }
                     Ok(Outcome::Listing(Listing {
@@ -352,13 +391,29 @@ fn outcome_of(body: ResultBody) -> Result<Outcome, ApiError> {
                     let columns = body
                         .columns
                         .ok_or_else(|| bad("a preview carries its columns"))?;
-                    if body.objects.is_some() || body.truncated.is_some() {
+                    if body.objects.is_some()
+                        || body.truncated.is_some()
+                        || body.latency_ms.is_some()
+                    {
                         return Err(bad("a preview carries no objects"));
                     }
                     Ok(Outcome::Preview(Preview {
                         columns,
                         primary_key: body.primary_key,
                     }))
+                }
+                Kind::Test => {
+                    let latency_ms = body
+                        .latency_ms
+                        .ok_or_else(|| bad("a test carries its latencyMs"))?;
+                    if body.objects.is_some()
+                        || body.truncated.is_some()
+                        || body.columns.is_some()
+                        || body.primary_key.is_some()
+                    {
+                        return Err(bad("a test carries only its latencyMs"));
+                    }
+                    Ok(Outcome::Tested(Tested { latency_ms }))
                 }
             }
         }
@@ -398,6 +453,14 @@ pub async fn report_result(
         OffsetDateTime::now_utc(),
     )
     .await?;
+    // `SRC-4` T1.1: the first report of a connection test is recorded as a test
+    // is: stored health, probe history and an audit event, in the fixed
+    // sentences of `connector_probe`. A repeat or a replaced request
+    // (`recorded: false`) records nothing, so one test leaves one trace.
+    if recorded && kind == Kind::Test {
+        let probed = connector_probe::outcome_of_orchestrator_test(&outcome);
+        record_test_outcome(&state, &principal, &id, &probed).await?;
+    }
     Ok(ApiJson(Recorded { recorded }))
 }
 
@@ -510,10 +573,46 @@ mod tests {
     }
 
     #[test]
-    fn only_list_and_preview_are_kinds() {
-        assert_eq!(kind_of("list").unwrap(), Kind::List);
-        assert_eq!(kind_of("preview").unwrap(), Kind::Preview);
-        assert!(kind_of("LIST").is_err());
-        assert!(kind_of("columns").is_err());
+    fn only_list_and_preview_are_started_and_a_test_is_only_read() {
+        assert_eq!(kind_to_start("list").unwrap(), Kind::List);
+        assert_eq!(kind_to_start("preview").unwrap(), Kind::Preview);
+        // `SRC-4` T1.1: one way to test one connector, `POST .../test`.
+        assert!(kind_to_start("test").is_err());
+        assert!(kind_to_start("LIST").is_err());
+        assert!(kind_to_start("columns").is_err());
+
+        assert_eq!(kind_to_read("list").unwrap(), Kind::List);
+        assert_eq!(kind_to_read("preview").unwrap(), Kind::Preview);
+        assert_eq!(kind_to_read("test").unwrap(), Kind::Test);
+        assert!(kind_to_read("TEST").is_err());
+        assert!(kind_to_read("columns").is_err());
+    }
+
+    /// `SRC-4` T1.1: a test's result is its latency or a class, nothing else.
+    #[test]
+    fn a_test_result_body_is_a_latency_or_a_class_and_nothing_else() {
+        let done = result(json!({
+            "requestId": "r", "kind": "test", "state": "done", "latencyMs": 212,
+        }))
+        .unwrap();
+        assert_eq!(done, Outcome::Tested(Tested { latency_ms: 212 }));
+        let failed = result(json!({
+            "requestId": "r", "kind": "test", "state": "failed", "errorClass": "sign_in_refused",
+        }))
+        .unwrap();
+        assert_eq!(failed, Outcome::Failed(ErrorClass::SignInRefused));
+        for body in [
+            json!({"requestId": "r", "kind": "test", "state": "done"}),
+            json!({"requestId": "r", "kind": "test", "state": "done", "latencyMs": 1,
+                   "objects": []}),
+            json!({"requestId": "r", "kind": "test", "state": "failed",
+                   "errorClass": "failed", "latencyMs": 1}),
+            json!({"requestId": "r", "kind": "list", "state": "done", "objects": [],
+                   "latencyMs": 1}),
+            json!({"requestId": "r", "kind": "preview", "state": "done", "columns": [],
+                   "latencyMs": 1}),
+        ] {
+            assert!(result(body.clone()).is_err(), "{body}");
+        }
     }
 }

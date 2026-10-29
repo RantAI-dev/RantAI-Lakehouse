@@ -871,6 +871,9 @@ async fn sql_answer(
             };
             SqlOp::Columns { schema, table }
         }
+        // `SRC-4` T1.1: a connection test is launched by `POST .../test`, never
+        // answered by a listing; `dispatch` refuses it before it gets here.
+        Kind::Test => return Answer::failed(kind, ErrorClass::NotSupported),
     };
     match run_sql(target, &info.secret_ref, &op, resolver, internal_hosts, ca).await {
         Ok(SqlOut::Names { names, truncated }) => {
@@ -1065,6 +1068,8 @@ async fn files_answer(
             Kind::Preview => preview_s3(&client, dial.format, &request.object)
                 .await
                 .map(|preview| Answer::preview(&request.object, preview)),
+            // See `sql_answer`: `dispatch` refuses a test before this.
+            Kind::Test => Ok(Answer::failed(kind, ErrorClass::NotSupported)),
         }
     })
     .await;
@@ -1108,6 +1113,11 @@ pub async fn dispatch(
     internal_hosts: &InternalHosts,
     ca: Option<&Path>,
 ) -> Dispatch {
+    if kind == Kind::Test {
+        // `SRC-4` T1.1: a connection test is not a listing; it has its own
+        // route (`POST /api/connectors/{id}/test`).
+        return Dispatch::Done(Answer::failed(kind, ErrorClass::NotSupported));
+    }
     let Some(adapter) = info.adapter.as_deref() else {
         // No ingest spec yet: there is no dial to read.
         return Dispatch::Done(Answer::failed(kind, ErrorClass::NotSupported));

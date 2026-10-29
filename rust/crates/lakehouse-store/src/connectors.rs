@@ -954,6 +954,29 @@ pub struct ConnectorTestResult {
     /// an unsupported type was never actually dialed, so no test time was
     /// stamped — see [`record_test_result`].
     pub tested_at: Option<String>,
+    /// `true` only for a test launched in the orchestrator that has not
+    /// finished (`SRC-4` T1.1): nothing was dialled yet, so `ok` is `false`
+    /// without being a failure, and the result is read from
+    /// `GET /api/connectors/{id}/discovery/test` and the probe history.
+    /// Left out of the JSON otherwise.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub pending: bool,
+}
+
+impl ConnectorTestResult {
+    /// The answer of a test launched in the orchestrator: supported, not
+    /// passed, no latency, no time (nothing has run), `message` saying so.
+    #[must_use]
+    pub fn pending(message: &str) -> Self {
+        Self {
+            ok: false,
+            supported: true,
+            latency_ms: None,
+            message: message.to_owned(),
+            tested_at: None,
+            pending: true,
+        }
+    }
 }
 
 /// Fetch the connectivity-relevant fields (`type`, `host`, `secret_ref`,
@@ -1626,6 +1649,7 @@ pub async fn record_test_result(
         latency_ms,
         message: message.to_owned(),
         tested_at: iso_opt(tested_at),
+        pending: false,
     })
 }
 

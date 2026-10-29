@@ -1036,10 +1036,14 @@ async fn remove_managed_credentials(
 /// `PostgreSQL`, `MySQL`/`MariaDB`, SQL Server, REST and S3-compatible
 /// object-storage connectors (an object-storage connector is tested at the
 /// endpoint in its `dial`, `SRC-6`) — see `crate::connector_probe`'s module
-/// doc comment for exactly what that does and does not cover. Every other
-/// connector gets an honest `supported: false` result, never a fabricated
-/// latency or success: Oracle, `MongoDB`, Kafka and SFTP connect only from
-/// the orchestrator (`SRC-6` F3, F4), and a stored `health` is left alone.
+/// doc comment for exactly what that does and does not cover. Oracle connects
+/// only from the orchestrator, so its test runs there (`SRC-4` T1.1): the
+/// answer is `pending: true` at once, the job's result is recorded when it
+/// posts (stored health, audit, probe history) and the console polls
+/// `GET /api/connectors/{id}/discovery/test`. Every other connector gets an
+/// honest `supported: false` result, never a fabricated latency or success:
+/// `MongoDB`, Kafka and SFTP connect only from the orchestrator (`SRC-6` F3,
+/// F4), and a stored `health` is left alone.
 ///
 /// # Errors
 ///
@@ -1061,6 +1065,12 @@ pub async fn test_connection(
     let Some(dial_info) = dial_info else {
         return Err(ApiError::NotFound(format!("Connector {id} not found")).into());
     };
+    // `SRC-4` T1.1: a type only the orchestrator can dial (Oracle) is tested
+    // there. The answer is "running", never a success this API has not seen.
+    if connector_probe::is_tested_in_orchestrator(&dial_info) {
+        let pending = start_orchestrator_test(&state, &principal, &id).await?;
+        return Ok(ApiJson(pending));
+    }
     let mut outcome = run_probe(&state, &dial_info, state.connector_secret_resolver.as_ref()).await;
     // `SRC-12` part C: a provider that rotates refresh tokens retired the one
     // the test just used; keep the new one or the test would sign the
@@ -1074,9 +1084,29 @@ pub async fn test_connection(
         )
         .await?;
     }
+    let result = record_test_outcome(&state, &principal, &id, &outcome).await?;
+    Ok(ApiJson(result))
+}
+
+/// Record a finished connection test the way every test is recorded: the stored
+/// health and the probe history (`connectors::record_test_result`) and one
+/// audit event. Shared by [`test_connection`] (a test the API ran itself) and
+/// by the discovery result route (a test the orchestrator ran for Oracle,
+/// `SRC-4` T1.1), so both answer with the same fixed `Outcome` sentences and
+/// leave the same traces.
+///
+/// # Errors
+///
+/// 404 if the connector is gone; 503/500 as the store reports.
+pub(super) async fn record_test_outcome(
+    state: &AppState,
+    principal: &Principal,
+    id: &str,
+    outcome: &connector_probe::Outcome,
+) -> Result<connectors::ConnectorTestResult, ApiError> {
     match connectors::record_test_result(
-        pool(&state)?,
-        &id,
+        pool(state)?,
+        id,
         outcome.ok,
         outcome.supported,
         outcome.latency_ms,
@@ -1091,22 +1121,57 @@ pub async fn test_connection(
             // detail). Best-effort: a failed audit write never turns a
             // completed test into an error response.
             let event = connector_audit_event(
-                &principal,
+                principal,
                 "connector.test",
-                &id,
+                id,
                 json!({ "supported": result.supported, "ok": result.ok }),
                 "executed",
             );
-            if let Err(err) = store_audit::insert(pool(&state)?, event).await {
+            if let Err(err) = store_audit::insert(pool(state)?, event).await {
                 tracing::warn!(%err, connector_id = %id, "failed to record connector.test audit event");
             }
-            Ok(ApiJson(result))
+            Ok(result)
         }
         Err(lakehouse_store::StoreError::NotFound) => {
-            Err(ApiError::NotFound(format!("Connector {id} not found")).into())
+            Err(ApiError::NotFound(format!("Connector {id} not found")))
         }
-        Err(err) => Err(ApiError::from(err).into()),
+        Err(err) => Err(ApiError::from(err)),
     }
+}
+
+/// The fixed sentence a launched Oracle test answers with: it ran nowhere yet,
+/// so it claims nothing about the connection (AGENTS.md principle 2).
+const ORCHESTRATOR_TEST_RUNNING: &str = "The connection test is running in the orchestrator. \
+     Read its result from GET /api/connectors/{id}/discovery/test, and from the probe history.";
+
+/// Launch the orchestrator's connection test for `id` (`SRC-4` T1.1) and answer
+/// at once with a pending result. The result is recorded when the job posts it
+/// (`routes::connector_discovery::report_result`); until then the stored health
+/// is not touched.
+///
+/// # Errors
+///
+/// 422/503 with the fixed texts of the discovery launch when the orchestrator
+/// refuses or cannot be reached; 503/500 as the store reports.
+async fn start_orchestrator_test(
+    state: &AppState,
+    principal: &Principal,
+    id: &str,
+) -> Result<connectors::ConnectorTestResult, ApiError> {
+    super::connector_discovery::launch_test(state, id).await?;
+    let event = connector_audit_event(
+        principal,
+        "connector.test",
+        id,
+        json!({ "supported": true, "pending": true }),
+        "executed",
+    );
+    if let Err(err) = store_audit::insert(pool(state)?, event).await {
+        tracing::warn!(%err, connector_id = %id, "failed to record connector.test audit event");
+    }
+    Ok(connectors::ConnectorTestResult::pending(
+        ORCHESTRATOR_TEST_RUNNING,
+    ))
 }
 
 /// `?limit=` query for `GET /api/connectors/{id}/probe-history`.

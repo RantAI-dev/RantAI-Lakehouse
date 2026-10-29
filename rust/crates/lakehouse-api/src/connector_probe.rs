@@ -39,7 +39,11 @@
 //!
 //! Oracle, `MongoDB`, Kafka and SFTP connect only from the orchestrator
 //! (`dagster/dispar_orchestrate/adapters/`); this build has no client for
-//! them. They report [`Outcome::not_testable_here`] (`SRC-6` F3, F4):
+//! them. (Oracle's connection test runs there since `SRC-4` T1.1:
+//! `POST /api/connectors/{id}/test` launches it and the result is recorded
+//! with the sentences of [`outcome_of_orchestrator_test`]; the probes below
+//! stay what the credential flows use.) They report
+//! [`Outcome::not_testable_here`] (`SRC-6` F3, F4):
 //! `supported: false`, no latency, so a credential change saves with
 //! `verified: false` and the connector's stored health is not touched. Any
 //! other type with no dial implementation and no adapter (MQTT, SAP/ERP,
@@ -254,6 +258,76 @@ impl Outcome {
             message: message.into(),
             rotated_refresh_token: None,
         }
+    }
+}
+
+/// Whether `info` is tested by the orchestrator instead of by this API
+/// (`SRC-4` T1.1): an Oracle `sql` connector. The API has no Oracle client; its
+/// own answer for such a connector stays [`Outcome::not_testable_here`] (the
+/// credential-change and rotate-secret flows probe with [`probe_with`] and keep
+/// `verified: false`), and only `POST /api/connectors/{id}/test` launches the
+/// real test.
+#[must_use]
+pub fn is_tested_in_orchestrator(info: &ConnectorDialInfo) -> bool {
+    info.adapter.as_deref() == Some("sql")
+        && matches!(
+            Dial::parse("sql", &info.dial),
+            Ok(Dial::Sql(dial)) if dial.driver == SqlDriver::Oracle
+        )
+}
+
+/// The fixed `Outcome` of a connection test the orchestrator ran for Oracle and
+/// posted (`SRC-4` T1.1), in the sentences the other drivers use
+/// ("Connected via X and ran SELECT 1.", "X connection failed: <class>"): the
+/// orchestrator sends a latency or a closed error class, never text, so the
+/// sentence is this module's own (AGENTS.md principle 4). A figure the
+/// orchestrator did not measure is not invented: a failure carries no latency.
+#[must_use]
+pub(crate) fn outcome_of_orchestrator_test(
+    outcome: &lakehouse_store::connector_discovery::Outcome,
+) -> Outcome {
+    use lakehouse_store::connector_discovery::{ErrorClass, Outcome as Reported};
+    match outcome {
+        Reported::Tested(tested) => Outcome::success(
+            Duration::from_millis(u64::try_from(tested.latency_ms).unwrap_or(0)),
+            "Connected via Oracle and ran SELECT 1 FROM DUAL.",
+        ),
+        Reported::Failed(ErrorClass::Timeout) => Outcome {
+            ok: false,
+            supported: true,
+            latency_ms: None,
+            message: "Oracle connection timed out".to_owned(),
+            rotated_refresh_token: None,
+        },
+        Reported::Failed(class) => {
+            let phrase = match class {
+                ErrorClass::Unreachable | ErrorClass::Failed | ErrorClass::Timeout => {
+                    "connection failed"
+                }
+                ErrorClass::SignInRefused => "authentication failed",
+                ErrorClass::AddressRefused => "address not allowed by this installation",
+                ErrorClass::NoPermission => "permission denied",
+                ErrorClass::TooManyObjects | ErrorClass::NotSupported => {
+                    "the connector has no saved connection settings to test"
+                }
+            };
+            Outcome {
+                ok: false,
+                supported: true,
+                latency_ms: None,
+                message: format!("Oracle connection failed: {phrase}"),
+                rotated_refresh_token: None,
+            }
+        }
+        // A listing or a preview is not a test result; `finish` refuses it for
+        // a test request, so this arm is not reached from the result route.
+        Reported::Listing(_) | Reported::Preview(_) => Outcome {
+            ok: false,
+            supported: true,
+            latency_ms: None,
+            message: "Oracle connection failed: connection failed".to_owned(),
+            rotated_refresh_token: None,
+        },
     }
 }
 
@@ -3354,5 +3428,67 @@ mod tests {
         let other = sqlx::Error::Configuration("some other option".into());
         assert!(!is_mysql_plaintext_password_refusal(&other));
         assert_eq!(classify_sqlx_error(&other), "connection failed");
+    }
+
+    /// `SRC-4` T1.1: only an Oracle `sql` connector is tested by the
+    /// orchestrator; the others keep their own answer.
+    #[test]
+    fn only_an_oracle_sql_connector_is_tested_in_the_orchestrator() {
+        let mut row = info("Oracle", "h", "env:X", None);
+        row.adapter = Some("sql".to_owned());
+        row.dial = serde_json::json!({
+            "driver": "oracle", "host": "db.invalid", "port": 1521,
+            "database": "ORCL", "user": "u", "sslMode": "disable"
+        });
+        assert!(is_tested_in_orchestrator(&row));
+
+        row.dial = serde_json::json!({
+            "driver": "postgres", "host": "db.invalid", "port": 5432,
+            "database": "d", "user": "u"
+        });
+        assert!(!is_tested_in_orchestrator(&row));
+
+        let mut mongo = info("MongoDB", "h", "env:X", None);
+        mongo.adapter = Some("mongodb".to_owned());
+        assert!(!is_tested_in_orchestrator(&mongo));
+        assert!(!is_tested_in_orchestrator(&info(
+            "Oracle", "h", "env:X", None
+        )));
+    }
+
+    /// `SRC-4` T1.1: what the orchestrator reports becomes the fixed sentences,
+    /// with a latency only for a success.
+    #[test]
+    fn the_orchestrators_test_result_becomes_a_fixed_outcome() {
+        use lakehouse_store::connector_discovery::{ErrorClass, Outcome as Reported, Tested};
+
+        let passed = outcome_of_orchestrator_test(&Reported::Tested(Tested { latency_ms: 212 }));
+        assert!(passed.ok && passed.supported);
+        assert_eq!(passed.latency_ms, Some(212));
+        assert_eq!(
+            passed.message,
+            "Connected via Oracle and ran SELECT 1 FROM DUAL."
+        );
+
+        for (class, sentence) in [
+            (
+                ErrorClass::SignInRefused,
+                "Oracle connection failed: authentication failed",
+            ),
+            (
+                ErrorClass::Unreachable,
+                "Oracle connection failed: connection failed",
+            ),
+            (ErrorClass::Timeout, "Oracle connection timed out"),
+            (
+                ErrorClass::NoPermission,
+                "Oracle connection failed: permission denied",
+            ),
+        ] {
+            let failed = outcome_of_orchestrator_test(&Reported::Failed(class));
+            assert!(!failed.ok && failed.supported, "{class:?}");
+            assert!(failed.latency_ms.is_none(), "no latency was measured");
+            assert_eq!(failed.message, sentence);
+        }
     }
 }

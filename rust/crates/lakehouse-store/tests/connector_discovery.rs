@@ -8,7 +8,7 @@ use lakehouse_test_support as _;
 use lakehouse_store::StoreError;
 use lakehouse_store::connector_discovery::{
     Answer, ErrorClass, Kind, ListedColumn, ListedObject, Listing, MAX_COLUMNS, MAX_OBJECTS,
-    ObjectKind, Outcome, Preview, STALE_AFTER_SECONDS, State, begin, finish, get,
+    ObjectKind, Outcome, Preview, STALE_AFTER_SECONDS, State, Tested, begin, finish, get,
 };
 use sqlx::PgPool;
 use time::{Duration, OffsetDateTime};
@@ -492,4 +492,112 @@ fn answers_serialize_to_the_documented_shapes() {
         running,
         serde_json::json!({"kind": "list", "state": "running"})
     );
+}
+
+/// `SRC-4` T1.1 (migration 0115): a connection test has a row of its own, so it
+/// never overwrites the person's list; its result is the connection time, a
+/// wrong shape is refused, and a test names no object.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_connection_test_has_its_own_row_and_holds_only_a_latency(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let t0 = OffsetDateTime::now_utc();
+    begin(&pool, PG, Kind::List, "list-1", "", "public", t0)
+        .await
+        .unwrap();
+    finish(
+        &pool,
+        PG,
+        Kind::List,
+        "list-1",
+        &Outcome::Listing(listing(&["public.a"])),
+        t0,
+    )
+    .await
+    .unwrap();
+
+    begin(&pool, PG, Kind::Test, "test-1", "", "", t0)
+        .await
+        .unwrap();
+    let running = get(&pool, PG, Kind::Test).await.unwrap().unwrap();
+    assert_eq!(running.state, State::Running);
+
+    // A listing is not a test result, and a latency past the bound is not a
+    // measurement.
+    let wrong = finish(
+        &pool,
+        PG,
+        Kind::Test,
+        "test-1",
+        &Outcome::Listing(listing(&["x"])),
+        t0,
+    )
+    .await;
+    assert!(matches!(wrong, Err(StoreError::Validation(_))));
+    let absurd = finish(
+        &pool,
+        PG,
+        Kind::Test,
+        "test-1",
+        &Outcome::Tested(Tested {
+            latency_ms: 3_600_001,
+        }),
+        t0,
+    )
+    .await;
+    assert!(matches!(absurd, Err(StoreError::Validation(_))));
+
+    assert!(
+        finish(
+            &pool,
+            PG,
+            Kind::Test,
+            "test-1",
+            &Outcome::Tested(Tested { latency_ms: 212 }),
+            t0,
+        )
+        .await
+        .unwrap()
+    );
+    let answer = get(&pool, PG, Kind::Test)
+        .await
+        .unwrap()
+        .unwrap()
+        .into_answer(t0);
+    assert_eq!(answer.kind, Kind::Test);
+    assert_eq!(answer.state, State::Done);
+    assert_eq!(answer.latency_ms, Some(212));
+    assert!(answer.objects.is_none());
+
+    // The list is untouched.
+    let list = get(&pool, PG, Kind::List).await.unwrap().unwrap();
+    assert_eq!(list.state, State::Done);
+    assert!(list.listing.is_some());
+
+    // A failed test holds a class; a test names no object.
+    begin(&pool, PG, Kind::Test, "test-2", "", "", t0)
+        .await
+        .unwrap();
+    finish(
+        &pool,
+        PG,
+        Kind::Test,
+        "test-2",
+        &Outcome::Failed(ErrorClass::SignInRefused),
+        t0,
+    )
+    .await
+    .unwrap();
+    let failed = get(&pool, PG, Kind::Test)
+        .await
+        .unwrap()
+        .unwrap()
+        .into_answer(t0);
+    assert_eq!(failed.error_class, Some(ErrorClass::SignInRefused));
+    assert!(
+        begin(&pool, PG, Kind::Test, "test-3", "public.a", "", t0)
+            .await
+            .is_err()
+    );
+    Ok(())
 }
