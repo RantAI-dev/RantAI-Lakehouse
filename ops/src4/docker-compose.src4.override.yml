@@ -23,7 +23,8 @@ services:
   # Replication factor 1 everywhere (one node); the group rebalance delay is 0 so
   # the applier's consumer group does not wait 3 s to start on every run.
   kafka-src4:
-    image: apache/kafka:3.8.0
+    # Tag and digest (the digest the first CI run of slice 0 pulled for the tag).
+    image: apache/kafka:3.8.0@sha256:c89f315cff967322c5d2021434b32271393cb193aa7ec1d43e97341924e57069
     restart: "no"
     environment:
       KAFKA_NODE_ID: "1"

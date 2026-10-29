@@ -428,7 +428,10 @@ def connect(method: str, path: str, body: dict[str, Any] | None = None, expect: 
 
 
 def connector_state() -> tuple[str, list[str]]:
-    status = connect("GET", f"/connectors/{CONNECTOR}/status")
+    # 404 for a moment after the connector is created: its status is not written yet.
+    status = connect("GET", f"/connectors/{CONNECTOR}/status", expect=(200, 404))
+    if "connector" not in status:
+        return "UNKNOWN", []
     return status["connector"]["state"], [t["state"] for t in status.get("tasks", [])]
 
 
