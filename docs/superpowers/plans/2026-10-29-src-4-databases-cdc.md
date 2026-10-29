@@ -262,7 +262,69 @@ same limit (it never deletes); not in `SRC-4`'s scope, noted for the backlog.
 
 ## Handoff
 
-(The developer appends one entry per slice.)
+### Slice 1, Oracle batch (developer, Sonnet, 2026-10-29)
+
+**Commits** (branch `feat/data-phase-4-src-4`, after `130e3ee3`):
+`be505478` T1.2 column choice; `5b539988` T1.3 incremental; `bc090b3b` T1.4
+encrypted dial and TLS fixture; `500f1534` T1.5 gate; `322ccfc2` R11-lint fix
+in the gate. **T1.1 is not done: stopped, see below.**
+
+**T1.1 stop report (the route question).** `SRC-13` cannot carry a connection
+test without a planner decision. (1) The orchestrator path is asynchronous
+(`POST .../discovery/{kind}` launches `discover_job`, the console polls) while
+`POST /api/connectors/{id}/test` (`connectors.rs::test_connection`) is
+synchronous and writes `record_test_result`, the audit event and the stored
+health. (2) The store keeps one row per `(connector_id, kind)` and `kind` is the
+closed set `list|preview` (`connector_discovery::Kind`, CHECK constraint in
+`0075_connector_discovery.sql`, the result route's body); "latest wins", so
+reusing `list` for a test would overwrite the person's table list. (3) So a
+test needs either a third kind (Rust enum, migration for the CHECK, result
+route, TS contract) or a new route, and `/test` would have to launch and wait
+for the job. Not started. The gate's `connect` step stays `refused` in
+`coverage.json` until you decide.
+
+**Findings beyond the plan.**
+- *Spelling.* The console takes Oracle column names from the preview in
+  Oracle's spelling (`CREATED_AT`); `sql_database` reflects `created_at`.
+  Unmapped, `excludedColumns` leaves nothing out (`_leave_out_columns` compares
+  exact names) and the cursor is not found (`table.c[...]`; reproduced with
+  SQLite in a test). `adapters/oracle.py::in_reflected_spelling` maps
+  `excludedColumns`, `primaryKey`, `incrementalKey` with the dialect's
+  `normalize_name` (as table names already were); `ingest_factory` applies it
+  to the plan and the gate for the Oracle branch only.
+- *The existing Oracle TLS mode was clear text.* SQLAlchemy's `makedsn` writes
+  `(PROTOCOL=TCP)`; with that descriptor thin mode ignores `protocol` and
+  `ssl_server_cert_dn`. Measured with `oracledb==2.5.1` against a loopback TLS
+  server: no handshake. `connection_parts` now passes structured keywords
+  (`dsn=None`, `host`, `port`, `service_name`, `protocol="tcps"`,
+  `ssl_server_cert_dn`); the test `test_a_tls_dial_really_encrypts_and_checks_the_certificate_dn`
+  shows the handshake, chain check through `SSL_CERT_FILE`, and `DPY-6002` for a
+  wrong DN. The `ssl_server_cert_dn` rule in `ingest_spec.rs` is unchanged.
+- *Decision for you, T1.4 fixture.* The gate's TLS fixture is an nginx `stream`
+  TLS terminator (`oracle-tls-g6`, pinned by digest) in front of Oracle's plain
+  listener, with a CA the gate generates (`oracle-g6-cert-init`). Oracle's own
+  TCPS needs a wallet built with `orapki`, which I could not check here. What is
+  proven: the product's `tcps` dial, chain and DN. Not proven: Oracle's own TCPS
+  endpoint. Written in `oracle-tls-proxy.conf`, the gate docstring and
+  `coverage.json`. Say if you want the real wallet attempted.
+- Pre-existing, not changed: `database` (service name) is interpolated into the
+  connect descriptor by `oracledb` unescaped (a `)(` in it injects). Noted for
+  the backlog.
+- `route_auth.rs::ingest_spec_put_refuses_excluded_columns_the_source_cannot_honour`
+  used Oracle as its "cannot list columns" case; its case is now Oracle's
+  key-column refusal (still 422), the non-listing-source refusal stays in the
+  unit test `excluded_columns_are_accepted_only_for_sources_that_list_their_columns`.
+
+**Commands run locally (rule 7)**
+- `cd dagster && /home/hv/.cache/rantai-dagster-venv/bin/python -m pytest dispar_orchestrate/test_adapters_oracle.py dispar_orchestrate/test_discover.py dispar_orchestrate/test_ingest_factory.py -q`: 164 passed.
+- `rustfmt --edition 2024 --check` on the two changed Rust files: clean.
+- `python3 ops/lint/check_bare_iceberg_count.py`, `check_intra_package_imports.py`, `check_connector_gate_coverage.py`: OK.
+- `docker compose ... config --quiet` on the g6-oracle override: rc 0.
+- *Not verified locally* (machine limits): cargo fmt/clippy/test, bun typecheck/lint/test, the compose `up`, the gate. CI is the proof below.
+
+**CI** (PR #264): run `40807707774` (first push, failed only `Repo lints`: the R11 lint matched a docstring; fixed in `322ccfc2`); run `40807993582` on `322ccfc2`: Repo lints, fmt, clippy, build, MSRV, Frontend, G1, G2, G3, G4, G8, G10, SRC-11/12/13/17, Dagster unit tests, images and the image smoke pass; `Rust · G6 Oracle connector` **passed in 4m16s** (the gate itself `PASS (77s)`; `connect` refused-as-expected, discover, load, reload pass; load: 3 rows, `NOTE` left out, over tcps; reload: 2 new rows read, 5 in Bronze). Remaining jobs at the time of writing: see the PR checks.
+
+(Further entries follow, one per slice.)
 
 ## Review
 
