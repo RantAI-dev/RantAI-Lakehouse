@@ -692,6 +692,18 @@ def _bronze_pipeline(bronze_table_name: str, config: SinkConfig) -> Any:
     )
 
 
+def open_bronze_table(bronze_table_name: str, config: SinkConfig) -> Any | None:
+    """The `pyiceberg` table of one Bronze table through Lakekeeper's REST catalog,
+    or `None` when `dlt` does not know it yet. For a writer that commits its own
+    `pyiceberg` transaction (the change-capture applier, `cdc_apply.py`, which must
+    delete and append in one commit: `dlt`'s Iceberg merge cannot delete, plan
+    `SRC-4` amendment 1). Addresses the table the way `load_via_sink` and
+    `clear_table` do, so both see the same one."""
+    _install_catalog_env(config)
+    pipeline = _bronze_pipeline(bronze_table_name, config)
+    return history.open_table(pipeline, bronze_table_name)
+
+
 def empty_table(pipeline: Any, bronze_table_name: str, author: str = "") -> bool:
     """Delete every row of a Bronze table in ONE `pyiceberg` transaction, keeping the
     table: its columns, its day partition on `_ingested_at`, `format-version` 2 and its
