@@ -23,10 +23,9 @@
 #
 # 3. Change capture (SRC-4 slice 2). `KAFKA_CONNECT_URL` points the API at the
 #    `cdc` profile's `kafka-connect` (unset in the template, which keeps change
-#    capture off), `CDC_KAFKA_BOOTSTRAP` points the applier at its broker, and the
-#    applier may dial that internal address (`INGEST_ALLOW_INTERNAL_HOSTS`, the
-#    switch `ops/g6/docker-compose.g6.override.yml` sets for its fixtures; never a
-#    default of the template). The runner also mounts `lakehouse_cdc_secrets`
+#    capture off) and `CDC_KAFKA_BOOTSTRAP` points the applier at its broker. The
+#    applier needs no `INGEST_ALLOW_INTERNAL_HOSTS`: it does not apply the SSRF
+#    guard to its own broker (`cdc_apply.py`; SRC-4 S2 review SHOULD-FIX 1). The runner also mounts `lakehouse_cdc_secrets`
 #    READ-ONLY so the gate can prove that the password file exists with the
 #    source password and is removed on DELETE; production mounts that volume in
 #    `lakehouse-api` and `kafka-connect` only (docker-compose.yml explains why).
@@ -51,7 +50,6 @@ services:
   dagster-code-location:
     environment:
       CDC_KAFKA_BOOTSTRAP: kafka:9092
-      INGEST_ALLOW_INTERNAL_HOSTS: "true"
 
   g4-test-runner:
     environment:

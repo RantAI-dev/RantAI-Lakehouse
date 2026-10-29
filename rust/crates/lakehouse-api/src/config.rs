@@ -629,7 +629,7 @@ pub struct Config {
     /// minted at compose bring-up by `ops/oidc-mock` onto a shared volume
     /// (`lakehouse_oidc_tokens`) every writer in this stack already reads
     /// directly from disk the same way (`docker-compose.yml`'s
-    /// `g1-test-runner`, `debezium-server`, `trino`, ...) — there is no
+    /// `g1-test-runner`, `trino`, ...; SRC-4 S2 review SHOULD-FIX 2) — there is no
     /// static value to put behind an `env:` `secretRef` ahead of time.
     /// Always set to a default path — `/tokens/gold-export.jwt`, matching
     /// where `docker-compose.yml`'s `lakehouse-api` service mounts the

@@ -310,7 +310,9 @@ down, changes wait in the topics, which the broker keeps 7 days
 console leaves its topics to that retention. The two services use about
 1.2 GiB together (`docs/plans/SRC-4-RESULT.md`). The fixed `debezium-server` demo
 pipeline that this replaces is gone, with `ops/debezium/` and the
-`debezium-properties` route.
+`debezium-properties` route. A deployment upgraded from it keeps the Lakekeeper
+`debezium` principal and its warehouse grant (nothing removes them); once no
+older stack uses them they can be revoked by hand.
 
 **DNS gotcha found during verification:** on a host whose own
 `/etc/resolv.conf` carries a DNS search domain (VPN/corporate DNS,
