@@ -528,7 +528,10 @@ def step_schema_history_never_expires(connector_id: str) -> None:
         def check():
             if topic not in admin.list_topics():
                 raise G4Failure(f"the schema-history topic {topic} does not exist yet")
-            (answer,) = admin.describe_configs([ConfigResource(ConfigResourceType.TOPIC, topic)])
+            answer = admin.describe_configs([ConfigResource(ConfigResourceType.TOPIC, topic)])
+            # kafka-python returns one response, or a list of them, by version.
+            if isinstance(answer, list):
+                answer = answer[0]
             entries = {}
             for resource in answer.resources:
                 # (error_code, error_message, resource_type, resource_name, config_entries)

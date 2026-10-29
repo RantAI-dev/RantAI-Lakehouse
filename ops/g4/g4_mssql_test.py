@@ -78,6 +78,10 @@ class MsSqlSource(cdc_gate.Source):
             cur = conn.cursor()
             for statement in statements:
                 cur.execute(statement)
+                # A stored procedure (`sp_cdc_enable_*`) answers with result sets; the next
+                # statement on this connection fails with "connection is busy" until they are read.
+                while cur.nextset():
+                    pass
         finally:
             conn.close()
 
