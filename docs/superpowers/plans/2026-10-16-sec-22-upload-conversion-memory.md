@@ -272,4 +272,190 @@ verified, with the reason.)
 
 ## 8. Review
 
-(Planner: findings tagged `BLOCKER` or `SHOULD-FIX`.)
+### Review round 1 (planner, 2026-10-29, at `17957613`; the merge `560ec754` changes none of it)
+
+The review covers T1 to T6. Two passes read the diff, one on the child and
+runner and one on the API side, and I checked the blockers in the source
+myself. Nothing was run: the round 3 verification was stopped because these
+findings change the code.
+
+T1's reproduction, T2's `RLIMIT_DATA` finding, `env_clear()`, the dispatch
+order (the child first, then #192's provider install), `kill_on_drop`, the
+2-slot semaphore and its 429, and the fixed sentences are correct, with
+tests. The findings below are what is left.
+
+#### Planner decisions for this round
+
+- **P1. Parquet goes to the child by ranges, never whole.** This replaces
+  D1b for Parquet. The child gets the file's size on argv and, on stdin,
+  only the byte ranges it needs. It reads them through a sparse
+  `ChunkReader` that refuses any range it was not given.
+  - `inspect-parquet <file_size>` is fed the last
+    `min(file_size, MAX_FOOTER_BYTES + 8)` bytes. It answers `ParquetInfo`
+    plus the byte range of the first row group, which `check_layout`
+    already bounds by `MAX_PREVIEW_GROUP_BYTES`.
+  - `preview-parquet <max_rows> <file_size> <group_offset> <group_len>` is
+    fed that tail followed by the first row group's bytes.
+  - So the API runs `inspect-parquet` first, then fetches the range it
+    answered, then runs `preview-parquet`.
+  - The child's input cap for Parquet becomes
+    `MAX_FOOTER_BYTES + 8 + MAX_PREVIEW_GROUP_BYTES`. It no longer depends
+    on the file's size, so a 2 GiB chunked-upload Parquet file is read the
+    same way.
+  - The cost noted under D1b (moving the whole file) goes away.
+- **P2. A conversion is committed only after the child exits 0.**
+  - `put_stream` does not complete the multipart upload on EOF. It hands
+    back the upload, and the caller completes it after `wait()` returns
+    success, or aborts it otherwise.
+  - `.converted.<n>.json` is written **last**, and it is the commit marker.
+    A preview or an ingest treats a `.csv` with no `.json` as missing and
+    converts.
+  - A failed run removes only objects it completed itself.
+  - Two runs for the same sheet write the same bytes, so a second
+    complete is harmless.
+- **P3. `connector_listing.rs:1022`** (an in-process `inspect` on a tenant's
+  S3 Parquet file, up to 64 MiB) is the same kind of bug outside this
+  task's scope. The planner files it as a backlog item. Leave it here, but
+  P1 makes the fix a one-line reuse.
+
+#### BLOCKER
+
+1. **A crafted Parquet footer still ends the API through the chunked
+   upload.**
+   - Where: `routes/uploads/sessions.rs:640-659` (`open_whole`) runs
+     `upload_parquet::inspect` in the API process.
+   - Cause: `parquet` 58.4.0 reserves list space from the file's own
+     count, at `parquet_thrift.rs:707` and
+     `file/metadata/thrift/mod.rs:804`
+     (`Vec::with_capacity(list_ident.size)`). That happens during the
+     footer decode, before `check_layout` runs. So a footer of a few
+     dozen bytes can ask for more than 100 GB.
+   - The comment at the site says the read "cannot be made to ask for more
+     memory than it has". That is false (rule 1).
+   - Fix: P1. The comment goes.
+2. **Parquet over 64 MiB from the chunked upload can no longer be
+   previewed or loaded** (a `DATA-17` regression).
+   - `parquet_preview` and `check_parquet_footer` stream the whole file into
+     a child capped at 64 MiB, which refuses it with "larger than the 50 MB
+     limit".
+   - That is false for a route that accepts 2 GiB. Ingest of those files,
+     and of groups containing them, now fails.
+   - Fix: P1. Add a route test with a Parquet file over 64 MiB made by a
+     test-only builder, or a smaller cap through a test-only constructor,
+     covering preview and ingest.
+3. **A truncated conversion is completed in the store before the child's
+   status is known** (D6). Reported by both passes.
+   - `store_inner` calls `put_stream`, which completes on EOF. Only after
+     that does `wait()` see a signal or `TOO_MUCH_TEXT`, and
+     `remove_stored` is best effort.
+   - Scenario: if that delete fails, or the API restarts in the window, the
+     truncated `.csv` stays. Every later preview shows it, and ingest loads
+     a cut table. A concurrent preview in the window reads it too.
+   - Fix: P2.
+4. **The parent reads the child's answer line with no cap.**
+   - Where: `upload_convert.rs:1196-1206`, `read_until(b'
+')`.
+   - Scenario: a workbook with many sheets and long names makes the
+     `list-sheets` line hundreds of MiB, within the child's 896 MiB. The
+     API holds it, parses a second copy and stores it. That is the memory
+     failure `SEC-22` exists to stop.
+   - Fix: read through `take(MAX_ANSWER_BYTES + 1)`, with
+     `MAX_ANSWER_BYTES` = 1 MiB. Over the cap, or EOF before a newline,
+     answers `ResourceLimit`, and the child is killed and reaped. Add a
+     test with a stand-in child that writes an endless line.
+5. **The memory default is not shown to admit the largest allowed file**
+   (D7, principle 5).
+   - Peak RSS was measured, but the limit is `RLIMIT_DATA`, which also
+     counts reserved, untouched memory.
+   - The workbook fixture uses inline strings, while Excel writes shared
+     strings.
+   - The Parquet run previews 20 rows; the route asks for
+     `PARQUET_PREVIEW_ROWS` = 2000.
+   - It was a debug build. `convert-sheet` took 82.9 s of wall time
+     against a 60 s CPU limit and a 90 s wall clock, so the headroom of
+     both limits is unproven.
+   - Fix: extend `ops/g9/sec22_measure.py` and re-run it with the
+     **release** binary. Run it from the gate's image,
+     `rantai-lakehouse-api:local` at `/usr/local/bin/lakehouse-api`, or
+     from `cargo build --release -p lakehouse-api` if RAM allows.
+     - Fixtures: a 5,000,000-cell sheet with inline strings, the same
+       with shared strings, and P1's preview at 2000 rows with a first row
+       group near `MAX_PREVIEW_GROUP_BYTES`.
+     - Quote peak RSS, CPU seconds and wall time for each.
+     - Add a pass/fail run of each at the chosen limits, and quote the
+       exit codes.
+   - Set the defaults from those numbers (peak × 1.5, rounded up to
+     128 MiB). If the release `convert-sheet` CPU time × 1.5 passes 60 s,
+     or its wall time passes 90 s, stop and report: do not raise a limit
+     quietly.
+   - The planner writes `docs/plans/SEC-22-RESULT.md` from the numbers.
+     Until then, the constant must not cite a file that does not exist.
+
+#### SHOULD-FIX
+
+1. **A retryable answer at chunked-upload completion deletes the user's
+   file.**
+   - Where: `sessions.rs:555-558` sends every `Err` from `open_whole` to
+     `refuse_and_remove`.
+   - The new 429 (busy), 500 (not started), 503 (store) and a failed
+     `sheets.json` write all delete the object and the row, so the retry
+     gets 404.
+   - The existing `too_many_uploads()` 429 at `:664-666` has the same bug,
+     which contradicts its own comment.
+   - Only a refusal of the FILE (400) may remove it. Test the 429 case.
+2. **Workbook type sampling fell from 10,050 records to 256 KiB.**
+   - `workbook_preview` builds `sample_records`, which feeds the `DATA-18`
+     type guess and the `DATA-17` group check, from the `PREVIEW_BYTES`
+     head.
+   - D5 changed the preview's cut, not the sample's.
+   - Sample with `head_bytes(text_key, SAMPLE_BYTES)` as the text path
+     does (`uploads.rs:1814-1822`), and fix the doc that says it already
+     does.
+3. **Feed errors are dropped.** In `start`, `let _fed = feed(..)` throws
+   away the result.
+   - A store failure mid-feed truncates the child's input, and the user is
+     told the file cannot be opened. That is a false reason (principle 2).
+   - Join the feed task in `wait`, and let a store error win, giving the
+     fixed 503.
+4. **Stderr and the exit status are logged only on the success path's
+   `wait()`.**
+   - Not logged: EOF before the answer (how the out-of-memory abort shows
+     up), the timeout, an early refusal, and a failed `setrlimit`.
+   - Log the status and 2 KiB of stderr at warn on every failure path.
+   - Give a failed `setrlimit` its own exit code, mapped to 500
+     `CONVERSION_FAILED`. It is an installation fault, not a bad file.
+5. **A garbled answer line becomes "unreadable".** Decide by the child's
+   status instead: a signal gives `ResourceLimit`. Or make the
+   `ResourceLimit` doc match.
+6. **A Parquet preview buffers up to 512 MiB in the API.**
+   `answer_with_text` caps at `MAX_OUTPUT_BYTES` and ignores
+   `with_max_output_bytes`. Stop reading at `SAMPLE_BYTES`, kill the
+   child, and mark the preview as cut.
+7. **Delete counts sheets from `sheets.json`.** If that object is
+   unreadable, the count is 0 and every `.converted.<n>` object is left
+   behind. Delete by a bounded prefix listing of `<key>.converted.`, or
+   over `0..MAX_SHEETS` with a cap stated at the constant.
+8. **Comments and tests (rule 1).**
+   - `rust/Cargo.toml` and `lakehouse-api/Cargo.toml` say `RLIMIT_AS`; the
+     code sets `RLIMIT_DATA`.
+   - `with_wall`'s `#[allow(dead_code, reason = ...)]` names a test that
+     does not exist. Add it: a slow stand-in child with `with_wall(1s)`,
+     expecting 400 with the D4 sentence and no live child.
+   - `sessions.rs` docs describe reading in pieces from the store.
+   - The message at `upload_routes.rs:4422` contradicts its assertion.
+   - `# Errors` of `sheets_of` and `convert_upload` omit 429 and 500.
+   - `.env.example` gives values; the plan and the file's own convention
+     are no value.
+   - Missing tests:
+     - a legacy upload with no `sheets.json` lists once, stores it, and the
+       next preview runs no child;
+     - delete of a legacy `.converted.csv`;
+     - after the hostile Parquet file, the next request answers normally.
+   - The 429 test sleeps a fixed 500 ms. Poll until `runs() == 1` instead,
+     or it will flake.
+
+**Open: 5 BLOCKERs.** One fix round: P1 and P2 first, then the blockers
+and should-fixes in order, one commit per finding or per tight group,
+each citing "PR #187 review B<n>/S<n>" at the site (rule 13). Then the
+full verification and the section 7 handoff.
+
