@@ -1328,9 +1328,11 @@ impl ConversionRunner {
     /// Run the operation on the file and store the text it produced at
     /// `text_key`, and the answer at `answer_key`.
     ///
-    /// The text is written as one multipart upload, and the upload is
-    /// aborted when anything goes wrong: a partial object is never kept
-    /// (`SEC-22` D6).
+    /// The text is written as one multipart upload that is NOT assembled
+    /// until the child has exited 0, and the answer is written after it, as
+    /// the MARKER of a finished conversion: a text without its answer is a
+    /// conversion that did not finish, and is converted again
+    /// (`SEC-22` P2).
     ///
     /// # Errors
     ///
@@ -1376,42 +1378,59 @@ impl ConversionRunner {
         if let Answer::Refusal { refusal } = &answer {
             return Err(ConversionError::Refused(refusal.clone()));
         }
-        // The answer is stored first: it says what the text is, so a reader
-        // that finds the text can tell what it is without running a child.
-        let line = serde_json::to_vec(&answer)
-            .map_err(|_err| ConversionError::Refused(Refusal::Unreadable))?;
-        store
-            .put(answer_key, Bytes::from(line))
-            .await
-            .map_err(ConversionError::Store)?;
-        let written = write_text_to_store(store, text_key, &mut stdout).await;
-        if written.is_err() {
-            // The stream stopped early: read what is left of the child's
-            // output, so the child is never left writing into a pipe nobody
-            // reads.
-            let mut sink = [0_u8; 8192];
-            while let Ok(read) = stdout.read(&mut sink).await {
-                if read == 0 {
-                    break;
+        // The text is written as a multipart upload that is NOT assembled
+        // yet (`SEC-22` P2): the object at the key does not exist until the
+        // child has exited 0, so a truncated text is never visible.
+        let pending = match write_text_to_store(store, text_key, &mut stdout).await {
+            Ok(pending) => pending,
+            Err(err) => {
+                // The stream stopped early: read what is left of the child's
+                // output, so the child is never left writing into a pipe
+                // nobody reads.
+                let mut sink = [0_u8; 8192];
+                while let Ok(read) = stdout.read(&mut sink).await {
+                    if read == 0 {
+                        break;
+                    }
                 }
+                let _ = self.wait(child, stderr).await;
+                return Err(ConversionError::Store(err));
             }
-        }
+        };
         // The child's own ending decides the answer: it may have stopped
         // (refused, killed, out of time) even though the store took what
         // came of it.
-        match (self.wait(child, stderr).await, written) {
-            (Err(err), _) => {
-                // The child did not finish: what it wrote is not the whole
-                // text, so the objects are taken back out (`SEC-22` D6: a
-                // partial object is never kept).
-                remove_stored(store, text_key, answer_key).await;
+        match self.wait(child, stderr).await {
+            Ok(()) => {
+                // The child exited 0: the text is the whole text, and it is
+                // assembled now.
+                if let Err(err) = store.complete_pending(&pending).await {
+                    let _aborted = store.abort_pending(&pending).await;
+                    return Err(ConversionError::Store(err));
+                }
+                // The answer is written LAST, and it is the MARKER: a text
+                // without it is a conversion that did not finish, and is
+                // converted again (`SEC-22` P2).
+                let line = serde_json::to_vec(&answer)
+                    .map_err(|_err| ConversionError::Refused(Refusal::Unreadable))?;
+                if let Err(err) = store.put(answer_key, Bytes::from(line)).await {
+                    // The text is there but the marker is not, so the text is
+                    // not a conversion: it goes. Only what this run wrote is
+                    // removed (`SEC-22` P2).
+                    if let Err(cleanup) = store.delete(text_key).await {
+                        tracing::warn!(%cleanup, key = %text_key, "the text of a conversion that could not be marked could not be removed");
+                    }
+                    return Err(ConversionError::Store(err));
+                }
+                Ok(answer)
+            }
+            Err(err) => {
+                // The child did not finish: nothing was assembled, so there
+                // is no object to take back out, and the objects of an
+                // earlier run are left alone (`SEC-22` P2).
+                let _aborted = store.abort_pending(&pending).await;
                 Err(err)
             }
-            (Ok(()), Err(err)) => {
-                remove_stored(store, text_key, answer_key).await;
-                Err(ConversionError::Store(err))
-            }
-            (Ok(()), Ok(_written)) => Ok(answer),
         }
     }
 
@@ -1543,27 +1562,16 @@ struct Started {
 }
 
 /// Write the text the child produced into the store, as one multipart
-/// upload, and complete it. The upload is aborted when anything goes wrong.
+/// upload that is NOT assembled: the caller assembles it once the child's
+/// ending is known (`SEC-22` P2).
 async fn write_text_to_store(
     store: &UploadStore,
     key: &str,
     stdout: &mut BufReader<ChildStdout>,
-) -> Result<u64, UploadStoreError> {
+) -> Result<crate::upload_store::PendingText, UploadStoreError> {
     // Boxed: the multipart write holds a good deal of state, and the future
     // of the caller would otherwise be that big.
     Box::pin(store.put_stream(key, stdout)).await
-}
-
-/// Take back out the objects a conversion that did not finish left behind.
-///
-/// Best effort: the caller is already answering with the failure, and a
-/// store that cannot delete either answers that one.
-async fn remove_stored(store: &UploadStore, text_key: &str, answer_key: &str) {
-    for key in [text_key, answer_key] {
-        if let Err(err) = store.delete(key).await {
-            tracing::warn!(%err, key, "the objects of a conversion that failed could not be removed");
-        }
-    }
 }
 
 /// Feed the child its file.

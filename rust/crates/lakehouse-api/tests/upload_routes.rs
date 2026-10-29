@@ -7935,6 +7935,102 @@ async fn a_parquet_file_over_the_input_cap_is_previewed_and_loaded() {
     );
 }
 
+/// A stand-in for the child that reads an uploaded file: it answers, writes a
+/// little of the text, and then kills itself, so the conversion is cut in the
+/// middle (`SEC-22` P2).
+///
+/// The answers are `cat`-ed, not printed: a shell's own buffer is lost when
+/// it is killed, and the text must reach the API for the test to mean
+/// anything.
+fn dying_child() -> std::path::PathBuf {
+    let dir = tempfile::tempdir().expect("a temporary directory for the stand-in child");
+    let sheets = dir.path().join("answer-sheets");
+    std::fs::write(
+        &sheets,
+        "{\"kind\":\"sheets\",\"info\":{\"sheets\":[{\"name\":\"Stock\",\"visible\":true}],\
+         \"defaultSheet\":\"Stock\"}}\n",
+    )
+    .expect("the answer of the sheets is written");
+    let sheet = dir.path().join("answer-sheet");
+    std::fs::write(
+        &sheet,
+        "{\"kind\":\"sheet\",\"sheet\":\"Stock\",\"info\":{\"sheets\":[{\"name\":\"Stock\",\
+         \"visible\":true}],\"defaultSheet\":\"Stock\"},\"empty\":false}\n",
+    )
+    .expect("the answer of the sheet is written");
+    let text = dir.path().join("text");
+    std::fs::write(&text, "a,b\n1,2\n").expect("the text is written");
+    let path = dir.path().join("dying-child");
+    std::fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\n\
+             if [ \"$2\" = \"convert-sheet\" ]; then\n\
+             \x20 cat {sheet}\n\
+             \x20 cat {text}\n\
+             \x20 kill -9 $$\n\
+             fi\n\
+             cat {sheets}\n",
+            sheet = sheet.display(),
+            text = text.display(),
+            sheets = sheets.display(),
+        ),
+    )
+    .expect("the stand-in child is written");
+    let mut permissions = std::fs::metadata(&path)
+        .expect("the stand-in child exists")
+        .permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        permissions.set_mode(0o755);
+    }
+    std::fs::set_permissions(&path, permissions).expect("the stand-in child is executable");
+    // The directory is removed when it goes out of scope; the child has
+    // already been read by then, and the API starts it by path.
+    std::mem::forget(dir);
+    path
+}
+
+#[tokio::test]
+async fn a_child_killed_mid_stream_leaves_no_converted_text() {
+    let stack = Stack::with(Options {
+        conversion_child: Some(dying_child()),
+        ..Options::default()
+    })
+    .await;
+    let bayu = stack.bayu().await;
+    let upload = stack
+        .upload(&bayu, "stock.xlsx", &workbook("stock.xlsx"))
+        .await;
+    let id = id_of(&upload);
+
+    // The preview converts the sheet, and the child is killed in the middle
+    // of it: the conversion fails and the text is not committed.
+    let reply = stack
+        .get(&bayu, &format!("/api/uploads/{id}/preview"))
+        .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.text);
+    assert_eq!(reply.json["error"], NEEDS_MORE_MEMORY, "{}", reply.text);
+
+    // The store lists no converted text: the upload was never assembled, so
+    // there is no object at all (`SEC-22` P2).
+    let keys = stack.bucket.keys();
+    assert!(
+        !keys.iter().any(|key| key.ends_with(".converted.0.csv")),
+        "no converted text was committed: {keys:?}"
+    );
+    assert!(
+        !keys.iter().any(|key| key.ends_with(".converted.0.json")),
+        "no marker was written: {keys:?}"
+    );
+    assert!(
+        stack.bucket.open_multiparts().is_empty(),
+        "the pieces of the cut text were thrown away: {:?}",
+        stack.bucket.open_multiparts()
+    );
+}
+
 #[tokio::test]
 async fn a_second_preview_of_a_workbook_reads_the_stored_text_and_runs_no_child() {
     let stack = Stack::start().await;

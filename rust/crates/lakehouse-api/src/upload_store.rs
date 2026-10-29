@@ -484,11 +484,14 @@ impl UploadStore {
     }
 
     /// Write everything `reader` yields to `key` as ONE multipart upload, and
-    /// assemble it there. The number of bytes written is returned.
+    /// LEAVE IT UNASSEMBLED.
     ///
     /// Nothing is stored at `key` until the upload is completed, and the
     /// upload is ABORTED when anything goes wrong: a partial object is never
-    /// kept (`SEC-22` D6).
+    /// kept (`SEC-22` D6). The caller decides when the object is assembled
+    /// ([`Self::complete_pending`]) or thrown away ([`Self::abort_pending`]):
+    /// a conversion is committed only after the child that wrote it has
+    /// exited 0 (`SEC-22` P2), so the text must not be visible before that.
     ///
     /// The pieces are [`PART_SIZE`] bytes each, except the last: S3 refuses
     /// to assemble an upload whose pieces before the last are under 5 MiB.
@@ -497,7 +500,11 @@ impl UploadStore {
     ///
     /// [`UploadStoreError::Unavailable`] when the store refuses or cannot be
     /// reached, or when the stream cannot be read.
-    pub async fn put_stream<R>(&self, key: &str, reader: &mut R) -> Result<u64, UploadStoreError>
+    pub async fn put_stream<R>(
+        &self,
+        key: &str,
+        reader: &mut R,
+    ) -> Result<PendingText, UploadStoreError>
     where
         R: tokio::io::AsyncRead + Unpin + Send,
     {
@@ -555,14 +562,73 @@ impl UploadStore {
         if etags.is_empty() {
             // Nothing was written: an empty object is not a multipart upload,
             // and a store refuses to assemble one with no pieces. The upload
-            // is thrown away and the object is written whole.
+            // is thrown away, and the text is written whole when the caller
+            // completes it.
             let _aborted = self.abort_multipart(key, &id).await;
-            self.put(key, Bytes::new()).await?;
-            return Ok(0);
+            return Ok(PendingText {
+                key: key.to_owned(),
+                upload: None,
+                etags,
+                written,
+            });
         }
-        self.complete_multipart(key, &id, &etags).await?;
-        Ok(written)
+        Ok(PendingText {
+            key: key.to_owned(),
+            upload: Some(id),
+            etags,
+            written,
+        })
     }
+
+    /// Assemble a pending text into the object at its key.
+    ///
+    /// # Errors
+    ///
+    /// [`UploadStoreError::Unavailable`] when the store refuses or cannot be
+    /// reached.
+    pub async fn complete_pending(&self, pending: &PendingText) -> Result<(), UploadStoreError> {
+        match pending.upload.as_deref() {
+            Some(id) => {
+                self.complete_multipart(&pending.key, id, &pending.etags)
+                    .await
+            }
+            None => self.put(&pending.key, Bytes::new()).await,
+        }
+    }
+
+    /// Throw a pending text away, with its pieces: the bytes a store keeps
+    /// and bills for are not left behind, and the object at the key is NOT
+    /// touched (it is not there: a pending text was never assembled).
+    ///
+    /// # Errors
+    ///
+    /// [`UploadStoreError::Unavailable`] when the abort fails for any other
+    /// reason.
+    pub async fn abort_pending(&self, pending: &PendingText) -> Result<(), UploadStoreError> {
+        match pending.upload.as_deref() {
+            Some(id) => self.abort_multipart(&pending.key, id).await,
+            None => Ok(()),
+        }
+    }
+}
+
+/// A text that has been written to the store but NOT yet assembled.
+///
+/// `SEC-22` P2: a conversion is committed only after the child that wrote it
+/// has exited 0, so the text is written as a multipart upload that the caller
+/// assembles ([`UploadStore::complete_pending`]) or throws away
+/// ([`UploadStore::abort_pending`]) once the child's ending is known.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingText {
+    /// The key the text is at.
+    key: String,
+    /// The multipart upload's id, or `None` when nothing was written: a
+    /// store refuses to assemble an upload with no pieces.
+    upload: Option<String>,
+    /// The pieces' `ETags`, in piece-number order.
+    etags: Vec<String>,
+    /// How many bytes were written.
+    written: u64,
 }
 
 #[cfg(test)]

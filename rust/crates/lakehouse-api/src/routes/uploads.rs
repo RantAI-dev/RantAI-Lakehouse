@@ -2186,8 +2186,13 @@ async fn workbook_preview(
     let (name, position) = sheet_position(&info, sheet.as_deref())?;
     let text_key = converted_text_key(&row.storage_key, position);
     let answer_key = converted_answer_key(&row.storage_key, position);
+    // The answer beside the text is the MARKER of a finished conversion: a
+    // text without it is a conversion that did not finish, and is converted
+    // again (`SEC-22` P2).
+    let committed = store.object_size(&answer_key).await?.is_some()
+        && store.object_size(&text_key).await?.is_some();
     let mut size = store.object_size(&text_key).await?;
-    if size.is_none() {
+    if !committed {
         let source = stored_source(store, row);
         state
             .conversion_runner
@@ -2817,7 +2822,9 @@ async fn convert_upload(
             let answer_key = converted_answer_key(&row.storage_key, position);
             // The answer of the conversion says whether the sheet has cells
             // at all; it is stored beside the text (`SEC-22` D5), so a load
-            // that finds the text finds the answer too.
+            // that finds the text finds the answer too. It is also the
+            // MARKER of a finished conversion (`SEC-22` P2): a text without
+            // it is a conversion that did not finish.
             let stored_answer = match store.get_all(&answer_key).await {
                 Ok(bytes) => match serde_json::from_slice::<Answer>(&bytes) {
                     Ok(answer) => Some(answer),
@@ -2834,8 +2841,8 @@ async fn convert_upload(
             if let Some(Answer::Sheet { empty: true, .. }) = stored_answer {
                 return Err(ApiError::BadRequest(EMPTY_SHEET.to_owned()));
             }
-            let stored = store.object_size(&key).await?;
-            if stored.is_none() {
+            let committed = stored_answer.is_some() && store.object_size(&key).await?.is_some();
+            if !committed {
                 let source = stored_source(&store, row);
                 let answer = state
                     .conversion_runner
