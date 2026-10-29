@@ -22,7 +22,11 @@
 //! deployment orchestration, not this crate's job — see ADR 0007's "what
 //! P5 does NOT do" for why that stays out of scope this phase.
 
+use std::collections::BTreeMap;
+
 use lakehouse_core::secret::SecretValue;
+
+use crate::ingest_spec::{CdcDial, SqlDriver};
 
 /// One column of a source table, as a future schema-discovery step would
 /// report it — `type_name` is whatever string the source system names the
@@ -151,6 +155,42 @@ pub enum CdcSpecError {
         /// states for a rejected slug).
         value: String,
     },
+
+    /// A connector id that cannot be a Kafka Connect connector name, a topic
+    /// prefix and a file name at once (`SRC-4` T2.1). The id is a registry
+    /// key, never a credential, so it is safe to carry.
+    #[error("connector id {id:?} is invalid: must match ^[A-Za-z0-9][A-Za-z0-9_-]{{0,62}}$")]
+    InvalidConnectorId {
+        /// The rejected id, as given.
+        id: String,
+    },
+
+    /// A source table that is not `schema.table` of plain identifier
+    /// characters. `table.include.list` is a comma-separated list of regular
+    /// expressions, so a comma or a metacharacter in a name would change what
+    /// is captured instead of naming a table.
+    #[error("source table {name:?} is not a schema.table of letters, digits, '_' and '$'")]
+    InvalidTableName {
+        /// The rejected name, as given (a table name is not a credential).
+        name: String,
+    },
+
+    /// No source table to capture.
+    #[error("a change-capture connector needs at least one source table")]
+    NoTables,
+
+    /// A slot or publication name `PostgreSQL` logical replication cannot
+    /// use (`Debezium` takes lowercase letters, digits and `_` only).
+    #[error("{field} must be 1 to 63 lowercase letters, digits or underscores")]
+    InvalidReplicationName {
+        /// Which of the two names it was.
+        field: &'static str,
+    },
+
+    /// The dial names a driver this renderer has no `Debezium` connector
+    /// for yet (`MySQL`, `SQL Server` and `Oracle` come with their slices).
+    #[error("change capture is not built for this source driver yet")]
+    UnsupportedDriver,
 }
 
 /// A connector identifier constrained to `^[a-z0-9][a-z0-9_]{0,62}$` —
@@ -710,6 +750,180 @@ pub fn render_debezium_properties_template(
     ))
 }
 
+/// The directory the API writes each change-capture connector's source password
+/// into, and `Kafka Connect`'s `DirectoryConfigProvider` reads it from
+/// (`SRC-4` decision S2-a, ADR 0016 point 4). A memory-only volume, mounted
+/// read-write in `lakehouse-api` and read-only in `kafka-connect`.
+pub const CDC_SECRETS_DIR: &str = "/run/cdc-secrets";
+
+/// `Debezium`'s `PostgreSQL` connector class, the one connector class this
+/// build starts so far (`SRC-4` slice 2). `MySQL`, `SQL Server`, `MongoDB` and
+/// `Oracle` are added by their slices, with the allowlist in the API's
+/// `kafka_connect` module.
+pub const POSTGRES_CONNECTOR_CLASS: &str = "io.debezium.connector.postgresql.PostgresConnector";
+
+/// Whether `id` is fit to be a Kafka Connect connector name, a topic prefix
+/// and a file name in [`CDC_SECRETS_DIR`] at once: no path separator, no `:`
+/// (the config provider's own separator), no control character.
+fn is_connector_id(id: &str) -> bool {
+    id.len() <= 63
+        && id.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+}
+
+/// The Kafka Connect connector name for registry connector `id`.
+///
+/// # Errors
+///
+/// [`CdcSpecError::InvalidConnectorId`] if `id` is not a plain identifier.
+pub fn connect_connector_name(id: &str) -> Result<String, CdcSpecError> {
+    if is_connector_id(id) {
+        Ok(format!("lakehouse-{id}"))
+    } else {
+        Err(CdcSpecError::InvalidConnectorId { id: id.to_owned() })
+    }
+}
+
+/// The `Kafka Connect` config-provider reference to registry connector
+/// `id`'s password: `${dir:/run/cdc-secrets:<id>}`. It is the only form of the
+/// password the connector JSON ever holds.
+///
+/// # Errors
+///
+/// [`CdcSpecError::InvalidConnectorId`] if `id` is not a plain identifier.
+pub fn connect_password_reference(id: &str) -> Result<String, CdcSpecError> {
+    if is_connector_id(id) {
+        Ok(format!("${{dir:{CDC_SECRETS_DIR}:{id}}}"))
+    } else {
+        Err(CdcSpecError::InvalidConnectorId { id: id.to_owned() })
+    }
+}
+
+/// Whether `name` is a `PostgreSQL` slot or publication name `Debezium`
+/// accepts: 1 to 63 of lowercase letters, digits and `_`.
+fn is_replication_name(name: &str) -> bool {
+    (1..=63).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
+
+/// Whether `name` is `schema.table`, each part plain identifier characters.
+fn split_table_name(name: &str) -> Option<(&str, &str)> {
+    let (schema, table) = name.split_once('.')?;
+    let plain = |part: &str| {
+        !part.is_empty()
+            && part
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'$'))
+    };
+    (plain(schema) && plain(table)).then_some((schema, table))
+}
+
+/// Render the `Kafka Connect` connector configuration for a `PostgreSQL`
+/// change-capture connector (`SRC-4` slice 2, decision S2-c): what the API
+/// sends to `PUT /connectors/<name>/config`. It replaces the `Debezium Server`
+/// properties template.
+///
+/// The slot and publication are the dial's own (`slotName`, `publicationName`),
+/// the tables are the connector's source objects, the password is the
+/// config-provider reference of [`connect_password_reference`], never a value,
+/// and every value is a string, as `Kafka Connect` wants. The unwrap transform
+/// writes `delete.tombstone.handling.mode=rewrite`: `Debezium` 3.8 ignores
+/// `delete.handling.mode` and `drop.tombstones`, and with them every delete
+/// reaches the topic as a message with no value (`docs/plans/SRC-4-RESULT.md`).
+///
+/// With `verify-ca` and `verify-full` the worker uses its own trust store:
+/// this renderer sets no root certificate.
+///
+/// # Errors
+///
+/// [`CdcSpecError::UnsupportedDriver`] for a driver other than `PostgreSQL`,
+/// [`CdcSpecError::InvalidConnectorId`], [`CdcSpecError::NoTables`],
+/// [`CdcSpecError::InvalidTableName`], [`CdcSpecError::InvalidReplicationName`]
+/// or [`CdcSpecError::ControlCharacterInField`] for a host, database or user
+/// holding a control character.
+pub fn render_connect_config(
+    connector_id: &str,
+    dial: &CdcDial,
+    tables: &[&str],
+) -> Result<BTreeMap<String, String>, CdcSpecError> {
+    if dial.driver != SqlDriver::Postgres {
+        return Err(CdcSpecError::UnsupportedDriver);
+    }
+    let password = connect_password_reference(connector_id)?;
+    if tables.is_empty() {
+        return Err(CdcSpecError::NoTables);
+    }
+    for (field, value) in [
+        ("slotName", dial.slot_name.as_str()),
+        ("publicationName", dial.publication_name.as_str()),
+    ] {
+        if !is_replication_name(value) {
+            return Err(CdcSpecError::InvalidReplicationName { field });
+        }
+    }
+    reject_control_characters("host", &dial.host)?;
+    reject_control_characters("database", &dial.database)?;
+    reject_control_characters("user", &dial.user)?;
+
+    let mut schemas: Vec<&str> = Vec::new();
+    for name in tables {
+        let (schema, _) = split_table_name(name).ok_or_else(|| CdcSpecError::InvalidTableName {
+            name: (*name).to_owned(),
+        })?;
+        if !schemas.contains(&schema) {
+            schemas.push(schema);
+        }
+    }
+
+    let entries = [
+        ("connector.class", POSTGRES_CONNECTOR_CLASS.to_owned()),
+        ("tasks.max", "1".to_owned()),
+        ("database.hostname", dial.host.clone()),
+        ("database.port", dial.port.to_string()),
+        ("database.user", dial.user.clone()),
+        ("database.password", password),
+        ("database.dbname", dial.database.clone()),
+        ("database.sslmode", dial.ssl_mode.as_debezium().to_owned()),
+        ("topic.prefix", format!("cdc.{connector_id}")),
+        ("schema.include.list", schemas.join(",")),
+        ("table.include.list", tables.join(",")),
+        ("plugin.name", "pgoutput".to_owned()),
+        ("slot.name", dial.slot_name.clone()),
+        ("publication.name", dial.publication_name.clone()),
+        ("publication.autocreate.mode", "disabled".to_owned()),
+        ("snapshot.mode", "initial".to_owned()),
+        ("decimal.handling.mode", "string".to_owned()),
+        (
+            "key.converter",
+            "org.apache.kafka.connect.json.JsonConverter".to_owned(),
+        ),
+        ("key.converter.schemas.enable", "false".to_owned()),
+        (
+            "value.converter",
+            "org.apache.kafka.connect.json.JsonConverter".to_owned(),
+        ),
+        ("value.converter.schemas.enable", "false".to_owned()),
+        ("transforms", "unwrap".to_owned()),
+        (
+            "transforms.unwrap.type",
+            "io.debezium.transforms.ExtractNewRecordState".to_owned(),
+        ),
+        (
+            "transforms.unwrap.delete.tombstone.handling.mode",
+            "rewrite".to_owned(),
+        ),
+        ("transforms.unwrap.add.fields", "op,source.ts_ms".to_owned()),
+    ];
+    Ok(entries
+        .into_iter()
+        .map(|(key, value)| (key.to_owned(), value))
+        .collect())
+}
+
 /// The Debezium `MongoDB` connector's class name — a single constant
 /// referenced from both [`render_debezium_properties_template`]'s
 /// source-block branch (which renders the mongo-specific properties when
@@ -726,6 +940,108 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
+
+    fn pg_dial(ssl_mode: &str) -> CdcDial {
+        serde_json::from_value(serde_json::json!({
+            "driver": "postgres", "host": "db.internal", "port": 5432,
+            "database": "orders", "user": "app_reader",
+            "slotName": "orders_slot", "publicationName": "orders_pub",
+            "sslMode": ssl_mode
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn connect_config_uses_the_dials_own_slot_publication_and_tls_mode() {
+        let config = render_connect_config(
+            "conn-orders-ab12",
+            &pg_dial("verify-full"),
+            &["public.orders", "sales.items"],
+        )
+        .unwrap();
+        assert_eq!(config["connector.class"], POSTGRES_CONNECTOR_CLASS);
+        assert_eq!(config["slot.name"], "orders_slot");
+        assert_eq!(config["publication.name"], "orders_pub");
+        assert_eq!(config["publication.autocreate.mode"], "disabled");
+        assert_eq!(config["database.sslmode"], "verify-full");
+        assert_eq!(config["database.hostname"], "db.internal");
+        assert_eq!(config["table.include.list"], "public.orders,sales.items");
+        assert_eq!(config["schema.include.list"], "public,sales");
+        assert_eq!(config["topic.prefix"], "cdc.conn-orders-ab12");
+        assert_eq!(config["snapshot.mode"], "initial");
+        // Amendment 3: Debezium 3.8 ignores delete.handling.mode and drop.tombstones.
+        assert_eq!(
+            config["transforms.unwrap.delete.tombstone.handling.mode"],
+            "rewrite"
+        );
+        assert_eq!(config["transforms.unwrap.add.fields"], "op,source.ts_ms");
+        assert!(!config.contains_key("transforms.unwrap.delete.handling.mode"));
+        assert!(!config.contains_key("transforms.unwrap.drop.tombstones"));
+    }
+
+    #[test]
+    fn connect_config_holds_the_password_only_as_a_provider_reference() {
+        let config =
+            render_connect_config("conn-orders-ab12", &pg_dial("require"), &["public.orders"])
+                .unwrap();
+        assert_eq!(
+            config["database.password"],
+            "${dir:/run/cdc-secrets:conn-orders-ab12}"
+        );
+        assert_eq!(
+            connect_connector_name("conn-orders-ab12").unwrap(),
+            "lakehouse-conn-orders-ab12"
+        );
+    }
+
+    #[test]
+    fn connect_config_refuses_what_could_change_what_is_captured() {
+        let dial = pg_dial("require");
+        for table in [
+            "orders",
+            "public.orders,public.secrets",
+            "public.or ders",
+            "a.b.c",
+            ".x",
+        ] {
+            assert!(
+                matches!(
+                    render_connect_config("conn-a", &dial, &[table]),
+                    Err(CdcSpecError::InvalidTableName { .. })
+                ),
+                "{table}"
+            );
+        }
+        assert_eq!(
+            render_connect_config("conn-a", &dial, &[]),
+            Err(CdcSpecError::NoTables)
+        );
+        for id in ["", "../x", "a:b", "-a", "a/b", "a\nb"] {
+            assert!(
+                matches!(
+                    render_connect_config(id, &dial, &["public.t"]),
+                    Err(CdcSpecError::InvalidConnectorId { .. })
+                ),
+                "{id}"
+            );
+        }
+    }
+
+    #[test]
+    fn connect_config_refuses_a_slot_name_debezium_would_reject_and_other_drivers() {
+        let mut dial = pg_dial("require");
+        dial.slot_name = "Orders-Slot".to_owned();
+        assert!(matches!(
+            render_connect_config("conn-a", &dial, &["public.t"]),
+            Err(CdcSpecError::InvalidReplicationName { field: "slotName" })
+        ));
+        let mut dial = pg_dial("require");
+        dial.driver = SqlDriver::Mysql;
+        assert_eq!(
+            render_connect_config("conn-a", &dial, &["public.t"]),
+            Err(CdcSpecError::UnsupportedDriver)
+        );
+    }
 
     fn col(name: &str, type_name: &str) -> SourceColumn {
         SourceColumn {

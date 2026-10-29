@@ -115,6 +115,44 @@ pub struct CdcDial {
     /// An optional numeric server id, used by drivers (e.g. `MySQL`
     /// binlog replication) that need one.
     pub server_id: Option<u32>,
+    /// How the change-capture worker secures its connection to the source
+    /// (`SRC-4` decision S2-d). Absent means [`CdcSslMode::Require`]: a
+    /// stored credential is never dialed in plain text unless the person
+    /// chose `disable`, which the console shows as such (`SEC-14`'s rule).
+    #[serde(default)]
+    pub ssl_mode: CdcSslMode,
+}
+
+/// The TLS modes a change-capture `dial` may name: the four a person can
+/// choose, a closed set so a typo fails at parse time. Not `prefer` or
+/// `allow` (attempt TLS, fall back to plain text): those would dial a stored
+/// credential in the clear without anyone having said so.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CdcSslMode {
+    /// No TLS. Only when the person chose it.
+    Disable,
+    /// Encrypt and take the server certificate as presented.
+    #[default]
+    Require,
+    /// Encrypt and verify the certificate chain.
+    VerifyCa,
+    /// Encrypt, verify the chain and that the certificate names the host.
+    VerifyFull,
+}
+
+impl CdcSslMode {
+    /// The value `Debezium`'s `database.sslmode` takes for this mode (the
+    /// same four words, `PostgreSQL` JDBC's own spelling).
+    #[must_use]
+    pub const fn as_debezium(self) -> &'static str {
+        match self {
+            Self::Disable => "disable",
+            Self::Require => "require",
+            Self::VerifyCa => "verify-ca",
+            Self::VerifyFull => "verify-full",
+        }
+    }
 }
 
 /// A closed set of object-storage protocols a `files` adapter's `dial`
@@ -2248,6 +2286,30 @@ mod tests {
         });
         let err = serde_json::from_value::<CdcDial>(json).unwrap_err();
         assert!(err.to_string().contains("missing field"));
+    }
+
+    #[test]
+    fn cdc_dial_ssl_mode_defaults_to_require_and_names_a_closed_set() {
+        let mut json = serde_json::json!({
+            "driver": "postgres", "host": "db.internal", "port": 5432,
+            "database": "orders", "user": "app_reader",
+            "slotName": "orders_slot", "publicationName": "orders_pub"
+        });
+        let dial = serde_json::from_value::<CdcDial>(json.clone()).unwrap();
+        assert_eq!(dial.ssl_mode, CdcSslMode::Require);
+        for (word, mode) in [
+            ("disable", CdcSslMode::Disable),
+            ("require", CdcSslMode::Require),
+            ("verify-ca", CdcSslMode::VerifyCa),
+            ("verify-full", CdcSslMode::VerifyFull),
+        ] {
+            json["sslMode"] = serde_json::json!(word);
+            let dial = serde_json::from_value::<CdcDial>(json.clone()).unwrap();
+            assert_eq!(dial.ssl_mode, mode);
+            assert_eq!(dial.ssl_mode.as_debezium(), word);
+        }
+        json["sslMode"] = serde_json::json!("prefer");
+        assert!(serde_json::from_value::<CdcDial>(json).is_err());
     }
 
     #[test]
