@@ -23,12 +23,12 @@
 still missing:
 
 - The result has no size cap in bytes, and the "of M rows" in the cut banner is not the engine's total
-  (`query-results-section.tsx:142-150`; `rowCount` counts the rows that arrived).
+  (`query-results-section.tsx`; `rowCount` counts the rows that arrived).
 - The grid sorts and scrolls (TanStack Table, `src/components/data-table/data-table.tsx`) but has no per-column
   filter, no column statistics, no cell inspector and no copy.
-- The only download button is a browser CSV of the rows already shown (`query-results-section.tsx:112-129`).
+- The only download button is a browser CSV of the rows already shown (`query-results-section.tsx`).
   The server route `GET /api/query/run/{id}/download` exists with no button: CSV or Parquet, cut at 10,000 rows
-  (`routes/query.rs:1972`), buffered in memory (`ChClient::raw_bytes`), and it ignores the role download switch
+  (`routes/query.rs`), buffered in memory (`ChClient::raw_bytes`), and it ignores the role download switch
   that dashboard exports honour (`routes/settings.rs:420`).
 - Nothing shows how long a running query has taken.
 
@@ -62,16 +62,18 @@ No new tool. The chat's `run_sql` keeps its own limit. Downloads are a console a
 | 4 | Filter, statistics and histogram work on the rows shown, not the whole result, and the panel says "of the N rows shown". Exact statistics over the full table stay on the catalog page (`asset-columns.tsx`) | none | Owner, 2026-10-28 |
 | 5 | Download uses the existing route `GET /api/query/run/{id}/download` (the run in History), so there is no new route and no `POLICY_TABLE` change. It re-runs the SQL with the caller's current masks and row filters, as today | none | Owner, 2026-10-28 |
 | 6 | Download formats: CSV, TSV, Excel, Parquet. CSV, TSV and Excel are written by the API from streamed rows, with the formula guard dashboard exports use (`csv_export::neutralise`). Parquet is written by ClickHouse (`FORMAT Parquet`), so no new dependency | none | Owner, 2026-10-28 |
-| 7 | A download stops at 5 GB (Databricks). Excel stops at 1,048,576 rows, the sheet's limit. Either cut is said in the file name and in a message, never silent | 5 GB, 1,048,576 rows | Owner, 2026-10-28 |
+| 7 | A download stops at 5 GB (Databricks). Excel stops at 1,048,575 data rows (1,048,576 with the header), the sheet's limit. Either cut is said in the file name and in a message, never silent | 5 GB, 1,048,575 data rows | Owner, 2026-10-28 |
 | 8 | A download honours the role download switch (`DOWNLOADS_OFF`), as dashboard exports do, and the run's time limit. A download in progress can be stopped with Stop | none | Owner, 2026-10-28 |
 | 9 | Elapsed time is counted in the browser from the moment Run is pressed | none | Owner, 2026-10-28 |
 
 ## Limits to tell a customer
 
-- Statistics and filters in the grid cover the rows shown, up to 64,000, not the whole result.
-- A result is cut at 64,000 rows or at 10 MB of row data; the banner says which limit cut it.
+- Statistics and filters in the grid cover the rows shown, up to 64,000, not the whole result. A numeric column's
+  histogram has ten equal-width buckets, a text column's the ten most frequent values.
+- A result is cut at 64,000 rows or at 10 MB of row data; the banner says which limit cut it. The product's "MB"
+  is MiB: 10 MB is 10,485,760 bytes.
 - A download re-runs the query. If the data changed since the run, the file shows the new data.
-- Downloads stop at 5 GB, and Excel at 1,048,576 rows.
+- Downloads stop at 5 GB, and Excel at 1,048,575 data rows (1,048,576 with the header).
 - A comma or tab file over 5 GB is cut at the last whole row that fits, and the file's name says how many rows it
   holds. A Parquet result over 5 GB is refused whole, never sent half.
 - The grid copies the rows it shows as TSV, and one cell's value from the inspector; a selection of several cells

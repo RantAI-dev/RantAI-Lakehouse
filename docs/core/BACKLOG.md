@@ -313,7 +313,7 @@ parity), built after it.
 
 | Item | Status | Blocked by | Blocks |
 | --- | --- | --- | --- |
-| `BI-18` | Building | — | `AI-2`, `AI-9` (templates part), `QS-5` (the dashboard date filter) |
+| `BI-18` | Building | — | `AI-2`, `AI-9` (templates part) |
 | `BI-14` | Planned | — | `AI-13` |
 | `BI-16` | Building | — | `AI-5` (per chart type as it lands) |
 | `BI-17` | Building | — | `AI-8` |
@@ -338,7 +338,7 @@ parity), built after it.
 
 **Ready to start** (Todo, Planned or Idea, nothing open blocks it; Idea items still need a spec):
 
-`ADM-1`, `ADM-2`, `AI-10`, `AI-21`, `AI-22`, `BI-14`, `BI-20`, `BI-27`, `BI-28`, `BI-29`, `BI-3`, `BI-30`, `BI-31`, `BI-32`, `BI-33`, `BI-34`, `BI-35`, `BI-36`, `BIZ-1`, `BIZ-2`, `BLD-10`, `BLD-6`, `DATA-20`, `DATA-21`, `DATA-22`, `DATA-23`, `DATA-24`, `DATA-25`, `DATA-26`, `DATA-27`, `DATA-28`, `DATA-29`, `DATA-30`, `DATA-31`, `DATA-32`, `DATA-33`, `DATA-34`, `DATA-36`, `DATA-4`, `DATA-5`, `DATA-6`, `DATA-8`, `DOC-2`, `GOV-1`, `GOV-3`, `GOV-5`, `INT-2`, `OPS-2`, `OPS-3`, `OPS-6`, `OPS-8`, `QA-1`, `QRY-1`, `REL-1`, `REL-2`, `REL-4`, `REL-7`, `SEC-34`, `SEC-4`, `SEC-40`, `SEC-50`, `SEC-54`, `SEC-7`, `SRC-15`, `SRC-18`, `SRC-2`, `SRC-22`, `SRC-23`, `SRC-24`, `SRC-25`, `SRC-26`, `SRC-27`, `SRC-28`, `SRC-30`, `SRC-31`, `SRC-33`, `SRC-34`, `SRC-4`, `SRC-5`, `VER-1`
+`ADM-1`, `ADM-2`, `AI-10`, `AI-21`, `AI-22`, `BI-14`, `BI-20`, `BI-27`, `BI-28`, `BI-29`, `BI-3`, `BI-30`, `BI-31`, `BI-32`, `BI-33`, `BI-34`, `BI-35`, `BI-36`, `BIZ-1`, `BIZ-2`, `BLD-10`, `BLD-6`, `DATA-20`, `DATA-21`, `DATA-22`, `DATA-23`, `DATA-24`, `DATA-25`, `DATA-26`, `DATA-27`, `DATA-28`, `DATA-29`, `DATA-30`, `DATA-31`, `DATA-32`, `DATA-33`, `DATA-34`, `DATA-36`, `DATA-4`, `DATA-5`, `DATA-6`, `DATA-8`, `DOC-2`, `GOV-1`, `GOV-3`, `GOV-5`, `INT-2`, `OPS-2`, `OPS-3`, `OPS-6`, `OPS-8`, `QA-1`, `QRY-1`, `QS-5`, `REL-1`, `REL-2`, `REL-4`, `REL-7`, `SEC-34`, `SEC-4`, `SEC-40`, `SEC-50`, `SEC-54`, `SEC-7`, `SRC-15`, `SRC-18`, `SRC-2`, `SRC-22`, `SRC-23`, `SRC-24`, `SRC-25`, `SRC-26`, `SRC-27`, `SRC-28`, `SRC-30`, `SRC-31`, `SRC-33`, `SRC-34`, `SRC-4`, `SRC-5`, `VER-1`
 
 ## Dates
 
