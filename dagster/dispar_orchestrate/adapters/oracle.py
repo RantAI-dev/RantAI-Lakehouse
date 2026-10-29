@@ -70,6 +70,16 @@ before `SRC-9` and the picker names the field a service name. Limit: a
 database reachable only by SID (a container database with no service
 registered, or a legacy listener) is not supported; it would need a separate
 dial field, for example `sid`, which does not exist.
+
+**Load modes and column choice (`SRC-4` T1.2, T1.3).** `incremental` and
+`incremental_dedup` need nothing Oracle-specific in the sink: `sql_database`
+pushes the cursor into the query like it does for every SQL driver
+(`sink._apply_cursor`). What is Oracle's own is the spelling of column names:
+the console takes them from the preview (`discover.py`), in Oracle's spelling
+(`CREATED_AT`), while the reflected table, the rows and dlt's cursor lookup say
+`created_at`. `in_reflected_spelling` maps `excludedColumns`, `primaryKey` and
+`incrementalKey` the way `build_source` already maps table names, before
+`ingest_factory` builds the plan and the before-load gate.
 """
 from __future__ import annotations
 

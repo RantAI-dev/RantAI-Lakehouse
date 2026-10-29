@@ -278,3 +278,33 @@ def test_a_column_left_out_by_its_oracle_spelling_is_left_out_of_the_load():
     excluded = frozenset(in_reflected_spelling({"excludedColumns": ["NOTE"]})["excludedColumns"])
     kept, left_out = _leave_out_columns(decision, reflected, excluded)
     assert left_out == 1 and kept.columns == ["id"]
+
+
+def test_an_incremental_cursor_in_the_preview_spelling_is_found_only_after_the_mapping(tmp_path):
+    # SRC-4 T1.3: `sql_database` looks the cursor up as `table.c[name]`, exactly. Oracle's
+    # preview says `CREATED_AT` while the reflected column is `created_at` (SQLite stands in
+    # for the reflected spelling; no server). The sink's `_apply_cursor` is the real one.
+    import sqlite3
+
+    from dlt.extract.exceptions import ResourceExtractionError
+    from dlt.sources.sql_database import sql_database
+
+    from dispar_orchestrate.adapters import sink
+    from dispar_orchestrate.adapters.oracle import in_reflected_spelling
+
+    db = tmp_path / "src.db"
+    with sqlite3.connect(db) as conn:
+        conn.execute("create table orders (id integer primary key, created_at integer)")
+        conn.executemany("insert into orders values (?, ?)", [(1, 10), (2, 20)])
+    obj = {"name": "ORDERS", "target": "orders", "loadMode": "incremental", "incrementalKey": "CREATED_AT"}
+
+    def rows_for(cursor: str) -> list[dict]:
+        source = sql_database(credentials={"drivername": "sqlite", "database": str(db)}, table_names=["orders"])
+        sink._apply_cursor(source, cursor)
+        return list(source.orders)
+
+    with pytest.raises(ResourceExtractionError, match="CREATED_AT"):
+        rows_for(obj["incrementalKey"])
+    plan = sink.LoadPlan.from_source_object(in_reflected_spelling(obj))
+    assert plan.cursor == "created_at"
+    assert [r["id"] for r in rows_for(plan.cursor)] == [1, 2]
