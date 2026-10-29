@@ -27,6 +27,11 @@ are for the handoff; the planner writes them into
 `docs/plans/SEC-22-RESULT.md`, and the default in `upload_convert.rs` is
 set from them.
 
+Every run must ANSWER, and the Parquet preview must read the rows it was
+asked for: a run that read the wrong range still exits 0, so the script
+fails when the answer is missing or the rows are not there
+(`PR #187` review round 2 S5).
+
 Every fixture is run TWICE: once with the child's limits out of the way (so
 the peak is the peak of the work and not of the limit), and once with the
 LIMITS AS THEY ARE, which is the pass or fail of the file under them. The
@@ -368,7 +373,7 @@ def measure(
             finished = subprocess.run(
                 command,
                 stdin=handle,
-                stdout=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 env=environment,
                 check=False,
@@ -379,9 +384,10 @@ def measure(
             finished = subprocess.run(
                 command,
                 stdin=handle,
-                # The child's text is not what is measured, and a workbook of
-                # 5,000,000 cells is a hundred megabytes of it.
-                stdout=subprocess.DEVNULL,
+                # The child's text is read, not thrown away: a measurement
+                # that never looks at the answer cannot tell a run that read
+                # the file from one that read nothing.
+                stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 env=environment,
                 check=False,
@@ -392,6 +398,7 @@ def measure(
     user = re.search(r"User time \(seconds\): ([\d.]+)", report)
     system = re.search(r"System time \(seconds\): ([\d.]+)", report)
     wall = re.search(r"Elapsed \(wall clock\) time.*?: ([\d:.]+)", report)
+    answer, rows = answer_of(finished.stdout)
     return {
         "operation": " ".join(operation),
         "file": source.name,
@@ -402,7 +409,27 @@ def measure(
         "system_seconds": float(system.group(1)) if system else None,
         "wall_seconds": wall.group(1) if wall else None,
         "stderr_tail": report.strip().splitlines()[-3:],
+        "answer": answer,
+        "rows": rows,
     }
+
+
+def answer_of(output: bytes) -> tuple[dict | None, int]:
+    """The child's answer line, and the rows of the text after it.
+
+    The answer is one JSON line, and the text after it is the child's rows:
+    the first line of it is the header. A run that answered nothing has
+    neither.
+    """
+    newline = output.find(b"\n")
+    if newline < 0:
+        return None, 0
+    try:
+        answer = json.loads(output[:newline].decode("utf-8", "replace"))
+    except json.JSONDecodeError:
+        return None, 0
+    rows = max(len(output[newline + 1 :].splitlines()) - 1, 0)
+    return answer, rows
 
 
 def main(argv: list[str]) -> int:
@@ -470,7 +497,7 @@ def main(argv: list[str]) -> int:
 
     results = []
     for operation, source, what in fixtures:
-        print(f"[sec22] measuring {what}")
+        print(f"[sec22] measuring {what} ({source.stat().st_size} bytes)")
         measured = measure(
             operation,
             source,
@@ -493,6 +520,23 @@ def main(argv: list[str]) -> int:
         )
         measured["checked_exit_code"] = checked["exit_code"]
         measured["checked_stderr_tail"] = checked["stderr_tail"]
+        # The child must have ANSWERED, and the preview must have read the
+        # rows it was asked for: a run that read the wrong range still exits
+        # 0, and a measurement that does not look at the answer cannot tell
+        # the two apart (`PR #187` review round 2 S5).
+        if measured["exit_code"] == 0:
+            if measured["answer"] is None:
+                print(f"[sec22] {what}: the child answered nothing")
+                return 1
+            if operation[0] == "preview-parquet":
+                rows = measured["rows"]
+                print(f"[sec22] {what}: the preview read {rows} rows")
+                if rows != PARQUET_PREVIEW_ROWS:
+                    print(
+                        f"[sec22] {what}: the preview did not read "
+                        f"{PARQUET_PREVIEW_ROWS} rows"
+                    )
+                    return 1
         results.append(measured)
 
     print(f"[sec22] the fixtures took {round(time.monotonic() - started, 1)} s")

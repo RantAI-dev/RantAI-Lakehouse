@@ -837,6 +837,10 @@ fn parquet_reader(
     if input.len() < tail_len {
         return Err(Refusal::Unreadable);
     }
+    // The input is copied ONCE and the pieces are views of it: the child
+    // holds the input and one copy of it, and not one copy of the input
+    // plus one copy of every piece (`PR #187` review round 2 S5).
+    let input = Bytes::copy_from_slice(input);
     let mut parts: Vec<(u64, Bytes)> = Vec::new();
     if let Some((offset, len)) = group {
         let end = offset.checked_add(len).ok_or(Refusal::Unreadable)?;
@@ -849,13 +853,10 @@ fn parquet_reader(
             if input.len() < to {
                 return Err(Refusal::Unreadable);
             }
-            parts.push((offset, Bytes::copy_from_slice(&input[from..to])));
+            parts.push((offset, input.slice(from..to)));
         }
     }
-    parts.push((
-        size - tail_len as u64,
-        Bytes::copy_from_slice(&input[..tail_len]),
-    ));
+    parts.push((size - tail_len as u64, input.slice(..tail_len)));
     Ok(PartsReader::new(size, parts))
 }
 
