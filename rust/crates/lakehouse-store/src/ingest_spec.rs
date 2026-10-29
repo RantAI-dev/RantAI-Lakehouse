@@ -1514,6 +1514,17 @@ pub enum InvalidLoadMode {
         /// The source object's name.
         name: String,
     },
+    /// A load mode a change-capture connector does not run (`SRC-4` decision
+    /// S2-g): it keeps the current row per key (`incremental_dedup`, the
+    /// default) or every version (`history`), nothing else.
+    #[error(
+        "source object {name:?} has a loadMode that change capture does not run; use \
+         incremental_dedup (the current row per key) or history (every version)"
+    )]
+    NotForChangeCapture {
+        /// The source object's name.
+        name: String,
+    },
     /// `replace_dedup` or `incremental_dedup` without a key (`SRC-10`).
     #[error(
         "source object {name:?} asks for a deduplicating loadMode, which needs primaryKey: the \
@@ -1587,7 +1598,9 @@ fn key_is_usable(columns: &[serde_json::Value]) -> bool {
 /// cursor column that is a plain name of sensible length, with plain `incremental` on a `saas`
 /// object (it appends; a business-app record must merge on its key, final review BLOCKER 18),
 /// with a deduplicating mode and no `primaryKey`, or with a `primaryKey` that is
-/// not a usable key.
+/// not a usable key. For `cdc` (`SRC-4` decision S2-g) only `incremental_dedup` (the
+/// default when no mode is given) and `history` are accepted, both with a key, and
+/// no cursor is asked for: [`InvalidLoadMode::NotForChangeCapture`] otherwise.
 pub fn validate_load_modes(
     adapter: &str,
     source_objects: &serde_json::Value,
@@ -1611,7 +1624,11 @@ pub fn validate_load_modes(
             Some(serde_json::Value::Array(columns)) if key_is_usable(columns) => true,
             Some(_) => return Err(InvalidLoadMode::BadKey { name }),
         };
+        // `SRC-4` decision S2-g: a change-capture object with no mode is the
+        // default, the current row per key, and so needs a key like any other.
+        let change_capture = adapter == "cdc";
         let mode = match object.get("loadMode") {
+            None | Some(serde_json::Value::Null) if change_capture => LoadMode::IncrementalDedup,
             None | Some(serde_json::Value::Null) => continue,
             Some(value) => match LoadMode::deserialize(value) {
                 Ok(mode) => mode,
@@ -1625,6 +1642,9 @@ pub fn validate_load_modes(
                 }
             },
         };
+        if change_capture && !matches!(mode, LoadMode::IncrementalDedup | LoadMode::History) {
+            return Err(InvalidLoadMode::NotForChangeCapture { name });
+        }
         if mode.needs_key() && !has_key {
             return Err(InvalidLoadMode::NoKey { name });
         }
@@ -1650,7 +1670,9 @@ pub fn validate_load_modes(
                 return Err(InvalidLoadMode::ReservedKeyColumn { name });
             }
         }
-        if !mode.is_incremental() {
+        // A change-capture `incremental_dedup` reads no cursor: the changes
+        // arrive in order, and the key merges them.
+        if !mode.is_incremental() || change_capture {
             continue;
         }
         // PR #216 final review BLOCKER 18: `incremental` appends, so every changed vendor record
@@ -2575,6 +2597,56 @@ mod tests {
             ),
             Err(InvalidLoadMode::NoKey { .. })
         ));
+    }
+
+    /// `SRC-4` decision S2-g: change capture runs the current row per key (the
+    /// default) and history, both need a key, neither asks for a cursor.
+    #[test]
+    fn validate_load_modes_for_change_capture_accepts_two_modes_with_a_key() {
+        let check =
+            |object: serde_json::Value| validate_load_modes("cdc", &serde_json::json!([object]));
+        for object in [
+            serde_json::json!({ "name": "a", "target": "a", "primaryKey": ["id"] }),
+            serde_json::json!({ "name": "a", "target": "a", "loadMode": "incremental_dedup",
+                "primaryKey": ["id"] }),
+            serde_json::json!({ "name": "a", "target": "a", "loadMode": "history",
+                "primaryKey": ["id"] }),
+        ] {
+            assert_eq!(check(object.clone()), Ok(()), "{object}");
+        }
+        for mode in ["replace", "append", "incremental", "replace_dedup"] {
+            assert!(
+                matches!(
+                    check(
+                        serde_json::json!({ "name": "a", "target": "a", "loadMode": mode,
+                        "incrementalKey": "u", "primaryKey": ["id"] })
+                    ),
+                    Err(InvalidLoadMode::NotForChangeCapture { .. })
+                ),
+                "{mode}"
+            );
+        }
+        // No key, with or without a stated mode, is refused.
+        for object in [
+            serde_json::json!({ "name": "a", "target": "a" }),
+            serde_json::json!({ "name": "a", "target": "a", "loadMode": "history" }),
+            serde_json::json!({ "name": "a", "target": "a", "loadMode": "incremental_dedup" }),
+        ] {
+            assert!(
+                matches!(check(object.clone()), Err(InvalidLoadMode::NoKey { .. })),
+                "{object}"
+            );
+        }
+        // History still takes no cursor.
+        assert!(matches!(
+            check(
+                serde_json::json!({ "name": "a", "target": "a", "loadMode": "history",
+                "incrementalKey": "u", "primaryKey": ["id"] })
+            ),
+            Err(InvalidLoadMode::HistoryHasCursor { .. })
+        ));
+        // An empty list of objects (nothing chosen yet) is still saved.
+        assert_eq!(validate_load_modes("cdc", &serde_json::json!([])), Ok(()));
     }
 
     #[test]
