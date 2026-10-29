@@ -23,9 +23,9 @@ of two modes, and commits the Kafka offsets only after the Bronze commit:
   `merge_iceberg_table`) accepts only the `upsert` and `insert-only` strategies
   and has no delete branch (plan Amendment 1).
 - `history`: every event is appended through `adapters/sink.py` (`LoadPlan`
-  `append`), with its operation (`__op`), the source commit time
-  (`__source_ts_ms`), the delete flag (`__deleted`) and the Kafka offset
-  (`__offset`, the order of the events of one key).
+  `append`), with its operation (`_op`), the source commit time
+  (`_source_ts_ms`), the delete flag (`_deleted`) and the Kafka offset
+  (`_offset`, the order of the events of one key).
 
 The table is created by the first batch through `sink.load_via_sink`, so it is
 the table every other load mode makes (day partition on `_ingested_at`,
@@ -82,7 +82,8 @@ from dispar_orchestrate.op_metadata import DEFAULT_RETRY_POLICY, source_metadata
 
 MODES = ("current", "history")
 # Columns the applier adds or Debezium adds; none is a column of the source table.
-EVENT_COLUMNS = ("__op", "__source_ts_ms", "__deleted", "__offset")
+DEBEZIUM_FIELDS = ("__op", "__source_ts_ms", "__deleted")
+EVENT_COLUMNS = ("_op", "_source_ts_ms", "_deleted", "_offset")
 BATCH_EVENTS = 10_000
 POLL_MS = 1_000
 # The longest one run keeps applying batches before it ends; the sensor starts the
@@ -154,9 +155,14 @@ def event_to_row(value: bytes | str | None, offset: int) -> dict[str, Any] | Non
         return None
     if not isinstance(payload, dict) or "__op" not in payload:
         raise CdcEventError("a change message is not a flattened Debezium event with an __op")
-    row = dict(payload)
-    row["__deleted"] = row.get("__deleted") in (True, "true")
-    row["__offset"] = offset
+    # The columns the applier adds are named the way `dlt` names them (a leading double
+    # underscore becomes one: measured on the first CI run, a table made by `dlt` had
+    # `_source_ts_ms`, and a row carrying `__source_ts_ms` was refused as a new column).
+    row = {name: value for name, value in payload.items() if name not in DEBEZIUM_FIELDS}
+    row["_op"] = payload["__op"]
+    row["_source_ts_ms"] = payload.get("__source_ts_ms")
+    row["_deleted"] = payload.get("__deleted") in (True, "true")
+    row["_offset"] = offset
     return row
 
 
@@ -176,9 +182,9 @@ def split_current(
     `__source_ts_ms`) and every key the batch touched (to delete first)."""
     last = last_per_key(rows, key)
     survivors = [
-        {column: value for column, value in row.items() if column not in ("__op", "__deleted", "__offset")}
+        {column: value for column, value in row.items() if column not in ("_op", "_deleted", "_offset")}
         for row in last.values()
-        if not row["__deleted"]
+        if not row["_deleted"]
     ]
     return survivors, list(last)
 

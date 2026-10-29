@@ -48,14 +48,26 @@ def test_a_create_update_and_snapshot_event_become_live_rows() -> None:
     for op in ("c", "u", "r"):
         row = event_to_row(_event(op, 7), offset=41)
         assert row is not None
-        assert row["__op"] == op and row["__deleted"] is False and row["__offset"] == 41
+        assert row["_op"] == op and row["_deleted"] is False and row["_offset"] == 41
         assert row["id"] == 7 and row["amount"] == "10.50"
 
 
 def test_a_delete_event_becomes_a_deleted_row_that_keeps_the_old_values() -> None:
     row = event_to_row(_event("d", 9, customer="old"), offset=3)
     assert row is not None
-    assert row["__deleted"] is True and row["customer"] == "old"
+    assert row["_deleted"] is True and row["customer"] == "old"
+
+
+def test_the_columns_the_applier_adds_are_the_names_dlt_gives_them() -> None:
+    # First CI run of slice 0: dlt turned `__source_ts_ms` into `_source_ts_ms`, so the table
+    # lacked the column the row carried. Every name the applier writes must be a fixed point.
+    from dlt.common.normalizers.naming.snake_case import NamingConvention
+
+    naming = NamingConvention()
+    row = event_to_row(_event("c", 1), 0)
+    assert row is not None
+    for name in row:
+        assert naming.normalize_identifier(name) == name, name
 
 
 def test_a_tombstone_and_a_json_null_carry_nothing() -> None:
@@ -88,7 +100,7 @@ def test_a_key_whose_last_event_is_a_delete_is_touched_but_not_written() -> None
     survivors, touched = split_current([r for r in rows if r], ("id",))
     assert touched == [(1,), (2,), (3,)]
     assert [(r["id"], r["customer"]) for r in survivors] == [(3, "back")]
-    assert set(survivors[0]) == {"id", "customer", "amount", "status", "updated_at", "__source_ts_ms"}
+    assert set(survivors[0]) == {"id", "customer", "amount", "status", "updated_at", "_source_ts_ms"}
 
 
 # ── apply_once: the offsets are committed only after the Bronze write ────────────────
@@ -186,7 +198,7 @@ SCHEMA = pa.schema(
         pa.field("amount", pa.string()),
         pa.field("status", pa.string()),
         pa.field("updated_at", UTC),
-        pa.field("__source_ts_ms", pa.int64()),
+        pa.field("_source_ts_ms", pa.int64()),
         pa.field("_ingested_at", UTC),
         pa.field("_dlt_load_id", pa.string(), nullable=False),
         pa.field("_dlt_id", pa.string(), nullable=False),

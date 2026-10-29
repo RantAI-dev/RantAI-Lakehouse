@@ -58,7 +58,7 @@ CONNECTOR = "src4"
 TOPIC_PREFIX = "s4"
 FRESH_PER_KIND = 30
 FRESH_GAP_S = 2.0
-FRESH_TIMEOUT_S = 600.0
+FRESH_TIMEOUT_S = 300.0
 SEED_ROWS = 10_000
 BULK_UPDATES = 75_600
 BULK_INSERTS = 21_600
@@ -534,7 +534,7 @@ def expected_history(table: str) -> list[tuple[str, str, str, str]]:
 
 
 def bronze_history_rows(mode: str) -> list[tuple[str, ...]]:
-    return tsv(ch(f"SELECT id, `__op`, coalesce(customer,''), coalesce(status,''), `__offset` FROM {bronze_table(mode)} WHERE 1 FORMAT TSV"))
+    return tsv(ch(f"SELECT id, `_op`, coalesce(customer,''), coalesce(status,''), `_offset` FROM {bronze_table(mode)} WHERE 1 FORMAT TSV"))
 
 
 def verify(mode: str, table: str) -> dict[str, Any]:
@@ -551,7 +551,7 @@ def poll_visible(mode: str, events: list[ChangeEvent]) -> tuple[set[int], float]
         rows = {int(a): b for a, b in tsv(ch(f"SELECT id, customer FROM {bronze_table(mode)} WHERE id IN ({ids}) FORMAT TSV"))}
         seen = {i for i, e in enumerate(events) if visible_in_current(e, rows)}
     else:
-        hist = {(int(a), b, c) for a, b, c in tsv(ch(f"SELECT id, `__op`, coalesce(customer,'') FROM {bronze_table(mode)} WHERE id IN ({ids}) FORMAT TSV"))}
+        hist = {(int(a), b, c) for a, b, c in tsv(ch(f"SELECT id, `_op`, coalesce(customer,'') FROM {bronze_table(mode)} WHERE id IN ({ids}) FORMAT TSV"))}
         seen = {i for i, e in enumerate(events) if visible_in_history(e, hist)}
     return seen, time.time() - started
 
@@ -642,12 +642,23 @@ def measure_catch_up(mode: str, table: str) -> dict[str, Any]:
             break
         time.sleep(5)
     if caught_up is None:
-        raise HarnessFailure(f"{mode}: the last change did not reach Bronze within {CATCH_UP_TIMEOUT_S}s of resuming")
+        raise HarnessFailure(f"{mode}: the last change did not reach Bronze within {CATCH_UP_TIMEOUT_S}s of resuming; applier runs: {recent_runs()}")
     log(f"{mode}: caught up {BULK_TOTAL} changes in {caught_up:.0f}s")
     return {"changes": audited, "by_op": by_op, "source_write_s": round(wrote_s, 1), "catch_up_s": round(caught_up, 1)}
 
 
 CATCH_UP_TIMEOUT_S = CATCHUP_TIMEOUT_S
+
+
+def recent_runs() -> str:
+    """The last few applier runs and their status, for a failure message."""
+    try:
+        runs = gql(
+            "query{ runsOrError(filter:{pipelineName:\"%s\"}, limit: 8){ __typename ... on Runs { results { runId status tags { key value } } } } }" % JOB
+        )["runsOrError"].get("results", [])
+        return "; ".join(f"{r['status']} {next((t['value'] for t in r['tags'] if t['key'] == 'cdc/target'), '?')}" for r in runs) or "no runs"
+    except Exception as exc:  # noqa: BLE001
+        return f"runs unreadable ({str(exc)[:80]})"
 
 
 def applier_batches(since: float) -> list[dict[str, Any]]:
@@ -695,6 +706,8 @@ def run_mode(mode: str, first_copy_s: float) -> dict[str, Any]:
     log(f"== {mode} mode, source table {SCHEMA}.{table}")
     out: dict[str, Any] = {"first_copy_s": round(first_copy_s, 1)}
     out["freshness"] = measure_freshness(mode, table)
+    if all(out["freshness"][k]["not_visible"] == FRESH_PER_KIND for k in KINDS):
+        raise HarnessFailure(f"{mode}: none of the 90 changes reached Bronze; applier runs: {recent_runs()}")
     log(f"{mode} freshness: {json.dumps(out['freshness'])}")
     # All 90 must be in Bronze before the equality check; the freshness step only ends when they are or time ran out.
     check = verify(mode, table)
