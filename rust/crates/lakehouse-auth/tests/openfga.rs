@@ -179,7 +179,7 @@ async fn ensure_warehouse_classifies_a_5xx_as_server() {
 }
 
 #[tokio::test]
-async fn grant_machine_principals_sends_the_five_fixed_grants_lakekeeper_authz_init_sends() {
+async fn grant_machine_principals_sends_the_four_fixed_grants_lakekeeper_authz_init_sends() {
     let server = MockServer::start().await;
     // Matches `docker-compose.yml`'s `lakekeeper-authz-init` `grant()`
     // calls exactly (principal, verb set, and the `oidc~<principal>`
@@ -188,7 +188,6 @@ async fn grant_machine_principals_sends_the_five_fixed_grants_lakekeeper_authz_i
     // test, not just a production tenant-provisioning run.
     let expected_grants: &[(&str, &[&str])] = &[
         ("rust-iceberg", &["create", "modify", "select"]),
-        ("debezium", &["create", "modify", "select"]),
         ("dlt", &["create", "modify", "select"]),
         ("clickhouse-reader", &["select", "modify"]),
         ("trino", &["select", "modify"]),

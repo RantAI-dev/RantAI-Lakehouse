@@ -15,7 +15,7 @@ import { getIngestionColumns } from "./ingestion-columns"
 
 /**
  * CDC ingestion health (P5/P6): one row per Postgres logical-replication
- * slot backing a Debezium Server connector into Bronze. Reads `GET
+ * slot backing a Kafka Connect change-capture connector into Bronze. Reads `GET
  * /api/governance/replication`, which surfaces `lake.bronze_meta.
  * replication_slot` — written every 15 minutes by `dagster/
  * dispar_orchestrate/replication_metrics.py`'s `replication_slot_check_job`
@@ -71,7 +71,7 @@ export function IngestionPage() {
     <div className="flex flex-col gap-4">
       <PageHeader
         title="Ingestion (CDC)"
-        description="Postgres logical-replication slot health per CDC connector — WAL retention, flush lag, and connection state. Not a streaming engine: this is Debezium Server capturing row-level changes into Bronze Iceberg."
+        description="Postgres logical-replication slot health per CDC connector — WAL retention, flush lag, and connection state. Not a streaming engine: this is Debezium on Kafka Connect capturing row-level changes, which the applier writes to Bronze Iceberg."
       />
       {state.status === "loading" ? <LoadingSkeleton /> : null}
       {state.status === "error" ? (

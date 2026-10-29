@@ -8,7 +8,7 @@ pre-mint one long-lived RS256 token per principal this stack needs to
 identify (see PRINCIPALS below). Every token is also minted once at
 container start and written to a shared volume other compose services
 read directly from disk, for writers that accept a static bearer token
-outright (`iceberg-catalog-rest`'s `token` property, Debezium, dlt).
+outright (`iceberg-catalog-rest`'s `token` property, dlt).
 
 ClickHouse's `DataLakeCatalog` REST engine is the one writer in this build
 that does NOT accept a static bearer token — its `catalog_credential`
@@ -80,7 +80,6 @@ TOKEN_LIFETIME_SECONDS = 30 * 24 * 3600
 PRINCIPALS = [
     "admin",
     "rust-iceberg",
-    "debezium",
     "dlt",
     "clickhouse-reader",
     "trino",
@@ -92,8 +91,8 @@ PRINCIPALS = [
     # identity is independently auditable/revocable even though ADR
     # 0011's grants are warehouse-scoped (not per-namespace) — the same
     # identity-separation rationale ADR 0011 gives for keeping
-    # `rust-iceberg`/`debezium`/`dlt` as three principals instead of one,
-    # despite all three holding the same relation set today.
+    # `rust-iceberg`/`dlt` as separate principals instead of one,
+    # despite both holding the same relation set today.
     "gold-export",
     # WS2 amendment A0 — `lakehouse-api`'s upcoming `/api/lakehouse/*`
     # routes (WS2's Iceberg-catalog surface) need read-only metadata access

@@ -782,7 +782,6 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // The tenant gate is the route layer.
     ("POST", "/api/connectors/{id}/discovery/{kind}", Policy::RequiresPermission("connector:manage")),
     ("GET",  "/api/connectors/{id}/discovery/{kind}", Policy::RequiresPermission("connector:manage")),
-    ("GET",  "/api/connectors/{id}/debezium-properties", Policy::RequiresPermission("connector:manage")),
     // `ingest-spec` GET/PUT deliberately carry DIFFERENT permissions, unlike
     // every other connector route above: `connector:manage` is a broad
     // write-capable grant, and a read-only caller (Phase G's ingest

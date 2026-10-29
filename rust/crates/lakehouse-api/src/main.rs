@@ -810,7 +810,7 @@ async fn bootstrap_lakehouse_maintenance_service(state: &AppState) {
 /// Lets `dagster/dispar_orchestrate`'s ingest schedule factory
 /// authenticate against `GET /api/connectors/ingestible`'s
 /// `Policy::RequiresPermission("ingest:read")` and a CDC connector's
-/// `dial` read (`ops/debezium/render_compose.py`'s caller), from
+/// `dial` read (the change-capture applier's), from
 /// [`Config::ingest_service_token`] — the exact same `auth_gate`-floor
 /// problem [`bootstrap_agent_run_service`]/[`bootstrap_alerts_run_service`]/
 /// [`bootstrap_lakehouse_maintenance_service`] solve for their own
@@ -821,7 +821,7 @@ async fn bootstrap_lakehouse_maintenance_service(state: &AppState) {
 ///
 /// This caller reads connector rows (`GET /api/connectors/ingestible`,
 /// `routes::connectors::list_ingestible`) and a CDC connector's `dial`
-/// (`ops/debezium/render_compose.py`) — it never creates, updates, or
+/// (the applier's) — it never creates, updates, or
 /// deletes a connector.
 /// `connector:manage` would be a STRICTLY BROADER grant than this caller
 /// ever needs: a leaked `INGEST_SERVICE_TOKEN` would then also let its

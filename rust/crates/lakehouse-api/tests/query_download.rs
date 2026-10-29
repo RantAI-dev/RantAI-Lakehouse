@@ -6,8 +6,7 @@
 //! exercise it end to end — this file drives it through the real router,
 //! a real per-test Postgres database (`common::spin_up_with_env`), and a
 //! `wiremock` stand-in for `ClickHouse` (`CH_URL` override), following
-//! `tests/debezium_properties.rs`'s exact real-database-plus-real-router
-//! shape. Two seeded users (`rina@meridian.example`,
+//! `tests/route_auth.rs`'s real-database-plus-real-router shape. Two seeded users (`rina@meridian.example`,
 //! `sari@meridian.example`, both `Analyst` / `query:read` —
 //! `0002_seed_identity.sql`) stand in for "the owner" and "a different
 //! principal": there is no public `Principal` constructor, so every

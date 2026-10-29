@@ -732,10 +732,6 @@ fn per_connector_router(state: &AppState) -> Router<AppState> {
             axum::routing::post(connector_discovery::start).get(connector_discovery::poll),
         )
         .route(
-            "/api/connectors/{id}/debezium-properties",
-            get(connectors::debezium_properties),
-        )
-        .route(
             "/api/connectors/{id}/ingest-spec",
             get(connectors::ingest_spec_get).put(connectors::ingest_spec_put),
         )

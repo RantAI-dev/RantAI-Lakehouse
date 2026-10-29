@@ -1202,15 +1202,12 @@ jobs:
         # profiles: this project also activates "dagster" (for
         # dagster-webserver/-daemon, which g6_ingest_matrix_test.py polls
         # while a triggered connector run executes), and that profile
-        # also contains `debezium-server`, pinned to a Debezium image
-        # digest no longer resolvable upstream (g4-cdc's own known,
-        # unrepinned gap — a human decision, out of this job's scope). A
-        # bare `up` with no service names starts every service in an
-        # active profile, including that one, and fails the whole step;
-        # naming exactly what the SQL half of
+        # also holds other gates' runners and source fixtures (`SRC-4` slice 2
+        # removed `debezium-server`, which used to be the one that failed a
+        # bare `up`). A bare `up` with no service names starts every service
+        # in an active profile; naming exactly what the SQL half of
         # `ops/g6/g6_ingest_matrix_test.py` needs starts only those
-        # services' own dependency closures, which does not reach
-        # `debezium-server`. `--profile g6-sql`, not `g6`: the runner's
+        # services' own dependency closures. `--profile g6-sql`, not `g6`: the runner's
         # `depends_on` then skips the fixtures of the other half.
         run: >
           docker compose -p g6ci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml
@@ -1276,7 +1273,7 @@ jobs:
 
   # ── SRC-9 decision 9: the second half of the G6 gate (G6_GROUP=other),
   # in a job of its own so each half stays under 20 minutes: object storage,
-  # REST, MongoDB, Kafka and SFTP, the MongoDB Debezium-template check, and
+  # REST, MongoDB, Kafka and SFTP, and
   # the SEPARATE, override-free link-local project (it needs a Kafka
   # fixture). It brings up only the fixtures these need (profile `g6-other`,
   # no MySQL, MariaDB, SQL Server or `g3a-source-init`). Same script, same
@@ -1353,7 +1350,7 @@ jobs:
 
       - name: Bring up the g6 files, APIs and streams matrix (gate-only INGEST_ALLOW_INTERNAL_HOSTS override)
         # Explicit service list, as `g6-ingest` explains (the dagster profile
-        # also holds debezium-server). `--profile g6-other`: the runner's
+        # also holds other gates' services). `--profile g6-other`: the runner's
         # `depends_on` skips the SQL fixtures.
         run: >
           docker compose -p g6otherci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml
@@ -1411,9 +1408,8 @@ jobs:
         # see its own header — and is required: without it, neither
         # `dagster-code-location` nor `g6-test-runner-linklocal` has the
         # `g6_linklocal_secrets` mount the REST connector's credential
-        # write needs. Explicit service list, same "debezium-server is
-        # profile dagster too" reason as the g6 matrix `up` step above —
-        # a bare `up` here would try to start it and fail. `dagster-
+        # write needs. Explicit service list, same reason as the g6
+        # matrix `up` step above (a bare `up` starts all of profile dagster). `dagster-
         # webserver`/`dagster-daemon` are both needed too, same as the g6
         # matrix half above: `POST /api/connectors/{id}/ingest/run`
         # launches the run through `lakehouse-api`'s own `DAGSTER_URL`
@@ -1510,7 +1506,7 @@ jobs:
 
       - name: Bring up the Oracle gate stack (gate-only INGEST_ALLOW_INTERNAL_HOSTS override)
         # Explicit service list, as g6-ingest explains (the dagster profile
-        # also holds debezium-server). No mysql/mssql/mongo/kafka/mariadb/sftp
+        # also holds other gates' services). No mysql/mssql/mongo/kafka/mariadb/sftp
         # fixtures and no g3a-source-init: this gate loads no other connector.
         run: >
           docker compose -p g6oracleci -f docker-compose.yml -f ops/g6/docker-compose.g6-oracle.override.yml
@@ -1622,7 +1618,7 @@ jobs:
 
       - name: Bring up lakehouse-api, Dagster and the API's Iceberg query database
         # Explicit service list, as g6-ingest explains: a bare `up` on the
-        # dagster profile would also start debezium-server. clickhouse-
+        # dagster profile would also start every gate's services. clickhouse-
         # iceberg-init is named because nothing but the gate depends on it.
         run: >
           docker compose -p g9ci --profile dagster up -d --no-build
@@ -1733,7 +1729,7 @@ jobs:
 
       - name: Bring up the alert delivery stack (gate-only INGEST_ALLOW_INTERNAL_HOSTS override)
         # Explicit service list, as g6-ingest explains (the dagster profile
-        # also holds debezium-server). `--profile g6-sql` makes `mysql-g6`
+        # also holds other gates' services). `--profile g6-sql` makes `mysql-g6`
         # a valid dependency of the runner; only the services named here start.
         run: >
           docker compose -p g6alertsci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml

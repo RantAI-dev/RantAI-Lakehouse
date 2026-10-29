@@ -314,10 +314,11 @@ pub struct Config {
     /// connector is wanted. Default `false`; `true` only for the exact string
     /// `"true"`.
     ///
-    /// It names an extension point, not a working feature: this build ships
-    /// no Oracle `LogMiner` property template, so `GET
-    /// /api/connectors/{id}/debezium-properties` refuses every Oracle-driver
-    /// connector in both states and only its explanation changes. `LogMiner`
+    /// It names an extension point, not a working feature: change capture runs
+    /// on `Kafka Connect` now (`SRC-4`), and this build has no Oracle
+    /// `LogMiner` connector class on its allowlist, so the flag changes
+    /// nothing today (the `debezium-properties` route that used to read it was
+    /// removed in `SRC-4` slice 2, decision S2-h). `LogMiner`
     /// capture also needs `ARCHIVELOG` mode and supplemental logging on the
     /// source database, which the batch sql adapter (`adapters/oracle.py`,
     /// read-only `SELECT`) neither assumes nor configures. See

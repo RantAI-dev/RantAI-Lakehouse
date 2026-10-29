@@ -1002,7 +1002,7 @@ mod tests {
         // RequiresAuth still runs before the handler body, so this proves
         // routing + policy wiring (never 404), matching every other
         // "route is registered" test in this crate's style (see
-        // routes::connectors::tests::debezium_properties_route_is_registered).
+        // routes::connectors::tests, the other "route is registered" tests).
         assert_ne!(response.status(), StatusCode::NOT_FOUND);
     }
 

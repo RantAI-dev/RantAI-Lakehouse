@@ -314,7 +314,7 @@ export type MaintenanceRun = {
 /**
  * One row of `GET /api/governance/replication` — a point-in-time snapshot
  * of one Postgres logical-replication slot backing a CDC connector
- * (Debezium Server, P5). `status` is `"ok" | "warning" | "critical"`,
+ * (Debezium on Kafka Connect, `SRC-4`). `status` is `"ok" | "warning" | "critical"`,
  * computed in `dagster/dispar_orchestrate/replication_metrics.py` from WAL
  * retention thresholds and whether the slot is still `active` — an
  * inactive slot is flagged `critical` regardless of byte thresholds,

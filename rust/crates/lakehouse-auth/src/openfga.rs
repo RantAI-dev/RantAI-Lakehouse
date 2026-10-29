@@ -48,7 +48,7 @@ use serde_json::json;
 
 use crate::secret::Secret;
 
-/// The five machine principals every provisioned warehouse needs granted
+/// The four machine principals every provisioned warehouse needs granted
 /// onto it so the stack's existing services can actually read/write a
 /// new tenant's data — see the module doc comment for why this is a
 /// fixed list, not the calling user's own identity: these are the
@@ -61,7 +61,6 @@ pub const DELETE_RETENTION_SECONDS: u64 = 604_800;
 
 const MACHINE_GRANTS: &[(&str, &[&str])] = &[
     ("rust-iceberg", &["create", "modify", "select"]),
-    ("debezium", &["create", "modify", "select"]),
     ("dlt", &["create", "modify", "select"]),
     ("clickhouse-reader", &["select", "modify"]),
     ("trino", &["select", "modify"]),
