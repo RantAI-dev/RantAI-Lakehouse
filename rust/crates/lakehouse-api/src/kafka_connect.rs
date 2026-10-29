@@ -16,8 +16,8 @@
 //!
 //! Only a connector class in [`ALLOWED_CONNECTOR_CLASSES`] is ever sent: the
 //! class is data the registry row decides, and `Kafka Connect` will load any
-//! plugin class on its path. `PostgreSQL` now; the other `Debezium` classes
-//! are added by the slice that builds each source.
+//! plugin class on its path. `PostgreSQL`, `MySQL` and `SQL Server` now; the other
+//! `Debezium` classes are added by the slice that builds each source.
 //!
 //! # Upstream text never reaches a response
 //!
@@ -39,13 +39,19 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use lakehouse_core::ApiError;
-use lakehouse_store::cdc::POSTGRES_CONNECTOR_CLASS;
+use lakehouse_store::cdc::{
+    MYSQL_CONNECTOR_CLASS, POSTGRES_CONNECTOR_CLASS, SQLSERVER_CONNECTOR_CLASS,
+};
 use serde_json::Value;
 
 use crate::config::Config;
 
 /// The `connector.class` values this build may start. See the module docs.
-pub const ALLOWED_CONNECTOR_CLASSES: [&str; 1] = [POSTGRES_CONNECTOR_CLASS];
+pub const ALLOWED_CONNECTOR_CLASSES: [&str; 3] = [
+    POSTGRES_CONNECTOR_CLASS,
+    MYSQL_CONNECTOR_CLASS,
+    SQLSERVER_CONNECTOR_CLASS,
+];
 
 /// What a change-capture connector answers while `KAFKA_CONNECT_URL` is unset.
 pub const NOT_CONFIGURED: &str = "Change capture is not available on this deployment: it needs \

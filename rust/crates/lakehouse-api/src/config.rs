@@ -330,6 +330,13 @@ pub struct Config {
     /// of dialing a guessed address (fail closed). Operator-set, never taken
     /// from a request; the address is internal to the deployment's network.
     pub kafka_connect_url: Option<String>,
+    /// The broker's address as `Kafka Connect` reaches it (`CDC_KAFKA_BOOTSTRAP`,
+    /// the variable the code location's applier reads too; `SRC-4` slice 3,
+    /// decision S3-b). A `MySQL` or `SQL Server` connector keeps its schema
+    /// history in a topic on this broker and cannot start without it; unset, such
+    /// a connector answers the same fixed "not configured" sentence as an unset
+    /// `KAFKA_CONNECT_URL`. `PostgreSQL` does not need it.
+    pub cdc_kafka_bootstrap: Option<String>,
     /// The directory the API writes each change-capture connector's source
     /// password into (`CDC_SECRETS_DIR`, `SRC-4` decision S2-a). Default
     /// `/run/cdc-secrets`, the `tmpfs` volume `docker-compose.yml` mounts here
@@ -1094,6 +1101,7 @@ impl std::fmt::Debug for Config {
                 &self.oracle_cdc_logminer_enabled,
             )
             .field("kafka_connect_url", &self.kafka_connect_url)
+            .field("cdc_kafka_bootstrap", &self.cdc_kafka_bootstrap)
             .field("cdc_secrets_dir", &self.cdc_secrets_dir)
             .field("oidc_clock_skew_seconds", &self.oidc_clock_skew_seconds)
             .field("oidc_authorize_url", &self.oidc_authorize_url)
@@ -1486,6 +1494,7 @@ impl Config {
                 .get("ORACLE_CDC_LOGMINER_ENABLED")
                 .is_some_and(|v| v == "true"),
             kafka_connect_url: truthy(env, "KAFKA_CONNECT_URL"),
+            cdc_kafka_bootstrap: truthy(env, "CDC_KAFKA_BOOTSTRAP"),
             cdc_secrets_dir: or_default(
                 env,
                 "CDC_SECRETS_DIR",
@@ -2114,6 +2123,20 @@ mod tests {
             cfg.kafka_connect_url.as_deref(),
             Some("http://kafka-connect:8083")
         );
+    }
+
+    /// `CDC_KAFKA_BOOTSTRAP` is unset by default and blank counts as unset: a
+    /// `MySQL` or `SQL Server` connector then answers "not configured".
+    #[test]
+    fn cdc_kafka_bootstrap_is_unset_by_default_and_blank_counts_as_unset() {
+        assert_eq!(
+            Config::from_map(&HashMap::new()).unwrap().cdc_kafka_bootstrap,
+            None
+        );
+        let cfg = Config::from_map(&map(&[("CDC_KAFKA_BOOTSTRAP", "")])).unwrap();
+        assert_eq!(cfg.cdc_kafka_bootstrap, None);
+        let cfg = Config::from_map(&map(&[("CDC_KAFKA_BOOTSTRAP", "kafka:9092")])).unwrap();
+        assert_eq!(cfg.cdc_kafka_bootstrap.as_deref(), Some("kafka:9092"));
     }
 
     /// The codebase's boolean-parsing rule is exact

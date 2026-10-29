@@ -21,7 +21,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::ingest_spec::{CdcDial, SqlDriver};
+use crate::ingest_spec::{CdcDial, CdcSslMode, SqlDriver};
 
 /// One column of a source table, as a future schema-discovery step would
 /// report it — `type_name` is whatever string the source system names the
@@ -173,9 +173,24 @@ pub enum CdcSpecError {
     },
 
     /// The dial names a driver this renderer has no `Debezium` connector
-    /// for yet (`MySQL`, `SQL Server` and `Oracle` come with their slices).
+    /// for yet (`Oracle` comes with its slice).
     #[error("change capture is not built for this source driver yet")]
     UnsupportedDriver,
+
+    /// A `MySQL` dial without its `serverId` (`Dial::parse` requires it; a
+    /// hand-built dial is refused here the same way).
+    #[error("a MySQL change-capture connector needs a serverId")]
+    NoServerId,
+
+    /// `MySQL` and `SQL Server` connectors keep their schema history in a Kafka
+    /// topic and cannot start without the broker's address.
+    #[error("a MySQL or SQL Server change-capture connector needs the schema-history broker")]
+    NoSchemaHistoryBroker,
+
+    /// The schema-history broker list is not `host:port[,host:port]` of plain
+    /// characters.
+    #[error("the schema-history broker is not a host:port list of plain characters")]
+    InvalidSchemaHistoryBroker,
 }
 
 /// A connector identifier constrained to `^[a-z0-9][a-z0-9_]{0,62}$` —
@@ -287,6 +302,29 @@ pub const CDC_SECRETS_DIR: &str = "/run/cdc-secrets";
 /// `kafka_connect` module.
 pub const POSTGRES_CONNECTOR_CLASS: &str = "io.debezium.connector.postgresql.PostgresConnector";
 
+/// `Debezium`'s `MySQL` connector class (`SRC-4` slice 3).
+pub const MYSQL_CONNECTOR_CLASS: &str = "io.debezium.connector.mysql.MySqlConnector";
+
+/// `Debezium`'s `SQL Server` connector class (`SRC-4` slice 3).
+pub const SQLSERVER_CONNECTOR_CLASS: &str = "io.debezium.connector.sqlserver.SqlServerConnector";
+
+/// The Kafka topic a `MySQL` or `SQL Server` connector keeps its schema history
+/// in (`SRC-4` decision S3-b/S3-d). `Debezium` creates it with unlimited
+/// retention; the broker's 7-day default must never apply to it, because a
+/// connector whose history is gone cannot restart. It is never read by the
+/// applier and never deleted with the connector (Kafka Connect has no topic API).
+///
+/// # Errors
+///
+/// [`CdcSpecError::InvalidConnectorId`] if `id` is not a plain identifier.
+pub fn schema_history_topic(id: &str) -> Result<String, CdcSpecError> {
+    if is_connector_id(id) {
+        Ok(format!("cdc.{id}.schema-history"))
+    } else {
+        Err(CdcSpecError::InvalidConnectorId { id: id.to_owned() })
+    }
+}
+
 /// Whether `id` is fit to be a Kafka Connect connector name, a topic prefix
 /// and a file name in [`CDC_SECRETS_DIR`] at once: no path separator, no `:`
 /// (the config provider's own separator), no control character.
@@ -357,88 +395,118 @@ fn split_table_name(name: &str) -> Option<(&str, &str)> {
     (plain(schema) && plain(table)).then_some((schema, table))
 }
 
-/// Render the `Kafka Connect` connector configuration for a `PostgreSQL`
-/// change-capture connector (`SRC-4` slice 2, decision S2-c): what the API
-/// sends to `PUT /connectors/<name>/config`. It replaces the `Debezium Server`
-/// properties template.
+/// Whether `list` is `host:port[,host:port]...` of plain characters (letters,
+/// digits, `.`, `-`, `_`; a decimal port), as `schema.history.internal.kafka.
+/// bootstrap.servers` takes it.
+fn is_bootstrap_list(list: &str) -> bool {
+    !list.is_empty()
+        && list.split(',').all(|entry| {
+            entry.split_once(':').is_some_and(|(host, port)| {
+                !host.is_empty()
+                    && host
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+                    && !port.is_empty()
+                    && port.bytes().all(|b| b.is_ascii_digit())
+            })
+        })
+}
+
+/// `MySQL` connector's `database.ssl.mode` for a dial's mode: `Debezium` spells
+/// them `disabled`, `required`, `verify_ca` and `verify_identity`.
+const fn mysql_ssl_mode(mode: CdcSslMode) -> &'static str {
+    match mode {
+        CdcSslMode::Disable => "disabled",
+        CdcSslMode::Require => "required",
+        CdcSslMode::VerifyCa => "verify_ca",
+        CdcSslMode::VerifyFull => "verify_identity",
+    }
+}
+
+/// `SQL Server` connector's `(database.encrypt, database.trustServerCertificate)`
+/// for a dial's mode. `require` encrypts and takes the certificate as presented,
+/// the meaning it has for `PostgreSQL`. `verify-ca` and `verify-full` both
+/// encrypt and verify: the `SQL Server` driver cannot check the chain without
+/// also checking the host name, so `verify-ca` is stricter here, never looser.
+const fn mssql_tls(mode: CdcSslMode) -> (&'static str, &'static str) {
+    match mode {
+        CdcSslMode::Disable => ("false", "false"),
+        CdcSslMode::Require => ("true", "true"),
+        CdcSslMode::VerifyCa | CdcSslMode::VerifyFull => ("true", "false"),
+    }
+}
+
+/// Render the `Kafka Connect` connector configuration for a change-capture
+/// connector (`SRC-4` slice 2 decision S2-c, slice 3 decision S3-b): what the
+/// API sends to `PUT /connectors/<name>/config`. It replaces the `Debezium
+/// Server` properties template.
 ///
-/// The slot and publication are the dial's own (`slotName`, `publicationName`),
-/// the tables are the connector's source objects, the password is the
-/// config-provider reference of [`connect_password_reference`], never a value,
-/// and every value is a string, as `Kafka Connect` wants. The unwrap transform
-/// writes `delete.tombstone.handling.mode=rewrite`: `Debezium` 3.8 ignores
-/// `delete.handling.mode` and `drop.tombstones`, and with them every delete
-/// reaches the topic as a message with no value (`docs/plans/SRC-4-RESULT.md`).
+/// One renderer, three drivers. The keys every driver shares: the password
+/// reference, `topic.prefix=cdc.<id>`, the JSON converters without schemas, the
+/// `unwrap` transform with `delete.tombstone.handling.mode=rewrite` and
+/// `add.fields=op,source.ts_ms`, `snapshot.mode=initial` and
+/// `decimal.handling.mode=string`. `PostgreSQL` adds the dial's own slot and
+/// publication; `MySQL` its `serverId`, the databases of the source objects and
+/// the schema-history topic; `SQL Server` its database name and the
+/// schema-history topic. The password is the config-provider reference of
+/// [`connect_password_reference`], never a value, and every value is a string,
+/// as `Kafka Connect` wants. `delete.tombstone.handling.mode=rewrite`:
+/// `Debezium` 3.8 ignores `delete.handling.mode` and `drop.tombstones`, and
+/// with them every delete reaches the topic as a message with no value
+/// (`docs/plans/SRC-4-RESULT.md`).
 ///
-/// With `verify-ca` and `verify-full` the worker uses its own trust store:
-/// this renderer sets no root certificate.
+/// With `verify-ca` and `verify-full` the worker uses its own trust store: this
+/// renderer sets no root certificate.
+///
+/// `schema_history_bootstrap` is the broker address `MySQL` and `SQL Server`
+/// connectors keep their schema history on; `PostgreSQL` ignores it.
 ///
 /// # Errors
 ///
-/// [`CdcSpecError::UnsupportedDriver`] for a driver other than `PostgreSQL`,
+/// [`CdcSpecError::UnsupportedDriver`] for `Oracle`,
 /// [`CdcSpecError::InvalidConnectorId`], [`CdcSpecError::InvalidSecretsDir`],
-/// [`CdcSpecError::NoTables`],
-/// [`CdcSpecError::InvalidTableName`], [`CdcSpecError::InvalidReplicationName`]
-/// or [`CdcSpecError::ControlCharacterInField`] for a host, database or user
+/// [`CdcSpecError::NoTables`], [`CdcSpecError::InvalidTableName`],
+/// [`CdcSpecError::InvalidReplicationName`] (`PostgreSQL`),
+/// [`CdcSpecError::NoServerId`] (`MySQL`),
+/// [`CdcSpecError::NoSchemaHistoryBroker`] or
+/// [`CdcSpecError::InvalidSchemaHistoryBroker`] (`MySQL`, `SQL Server`), or
+/// [`CdcSpecError::ControlCharacterInField`] for a host, database or user
 /// holding a control character.
 pub fn render_connect_config(
     connector_id: &str,
     dial: &CdcDial,
     tables: &[&str],
     secrets_dir: &str,
+    schema_history_bootstrap: Option<&str>,
 ) -> Result<BTreeMap<String, String>, CdcSpecError> {
-    if dial.driver != SqlDriver::Postgres {
-        return Err(CdcSpecError::UnsupportedDriver);
-    }
     let password = connect_password_reference(connector_id, secrets_dir)?;
     if tables.is_empty() {
         return Err(CdcSpecError::NoTables);
-    }
-    let (Some(slot_name), Some(publication_name)) =
-        (dial.slot_name.as_deref(), dial.publication_name.as_deref())
-    else {
-        // `Dial::parse` requires both for PostgreSQL; a hand-built dial
-        // without them is refused the same way a bad name is.
-        return Err(CdcSpecError::InvalidReplicationName { field: "slotName" });
-    };
-    for (field, value) in [
-        ("slotName", slot_name),
-        ("publicationName", publication_name),
-    ] {
-        if !is_replication_name(value) {
-            return Err(CdcSpecError::InvalidReplicationName { field });
-        }
     }
     reject_control_characters("host", &dial.host)?;
     reject_control_characters("database", &dial.database)?;
     reject_control_characters("user", &dial.user)?;
 
-    let mut schemas: Vec<&str> = Vec::new();
+    // The first part of every table name: a schema (`PostgreSQL`, `SQL Server`)
+    // or a database (`MySQL`).
+    let mut first_parts: Vec<&str> = Vec::new();
     for name in tables {
-        let (schema, _) = split_table_name(name).ok_or_else(|| CdcSpecError::InvalidTableName {
+        let (first, _) = split_table_name(name).ok_or_else(|| CdcSpecError::InvalidTableName {
             name: (*name).to_owned(),
         })?;
-        if !schemas.contains(&schema) {
-            schemas.push(schema);
+        if !first_parts.contains(&first) {
+            first_parts.push(first);
         }
     }
 
-    let entries = [
-        ("connector.class", POSTGRES_CONNECTOR_CLASS.to_owned()),
+    let mut entries: Vec<(&str, String)> = vec![
         ("tasks.max", "1".to_owned()),
         ("database.hostname", dial.host.clone()),
         ("database.port", dial.port.to_string()),
         ("database.user", dial.user.clone()),
         ("database.password", password),
-        ("database.dbname", dial.database.clone()),
-        ("database.sslmode", dial.ssl_mode.as_debezium().to_owned()),
         ("topic.prefix", format!("cdc.{connector_id}")),
-        ("schema.include.list", schemas.join(",")),
         ("table.include.list", tables.join(",")),
-        ("plugin.name", "pgoutput".to_owned()),
-        ("slot.name", slot_name.to_owned()),
-        ("publication.name", publication_name.to_owned()),
-        ("publication.autocreate.mode", "disabled".to_owned()),
         ("snapshot.mode", "initial".to_owned()),
         ("decimal.handling.mode", "string".to_owned()),
         (
@@ -462,10 +530,94 @@ pub fn render_connect_config(
         ),
         ("transforms.unwrap.add.fields", "op,source.ts_ms".to_owned()),
     ];
+
+    match dial.driver {
+        SqlDriver::Postgres => {
+            let (Some(slot_name), Some(publication_name)) =
+                (dial.slot_name.as_deref(), dial.publication_name.as_deref())
+            else {
+                // `Dial::parse` requires both for PostgreSQL; a hand-built dial
+                // without them is refused the same way a bad name is.
+                return Err(CdcSpecError::InvalidReplicationName { field: "slotName" });
+            };
+            for (field, value) in [
+                ("slotName", slot_name),
+                ("publicationName", publication_name),
+            ] {
+                if !is_replication_name(value) {
+                    return Err(CdcSpecError::InvalidReplicationName { field });
+                }
+            }
+            entries.extend([
+                ("connector.class", POSTGRES_CONNECTOR_CLASS.to_owned()),
+                ("database.dbname", dial.database.clone()),
+                ("database.sslmode", dial.ssl_mode.as_debezium().to_owned()),
+                ("schema.include.list", first_parts.join(",")),
+                ("plugin.name", "pgoutput".to_owned()),
+                ("slot.name", slot_name.to_owned()),
+                ("publication.name", publication_name.to_owned()),
+                ("publication.autocreate.mode", "disabled".to_owned()),
+            ]);
+        }
+        SqlDriver::Mysql => {
+            let server_id = dial.server_id.ok_or(CdcSpecError::NoServerId)?;
+            entries.extend([
+                ("connector.class", MYSQL_CONNECTOR_CLASS.to_owned()),
+                ("database.server.id", server_id.to_string()),
+                ("database.include.list", first_parts.join(",")),
+                (
+                    "database.ssl.mode",
+                    mysql_ssl_mode(dial.ssl_mode).to_owned(),
+                ),
+                // No topic named after the prefix alone: the applier reads the
+                // table topics only.
+                ("include.schema.changes", "false".to_owned()),
+            ]);
+            entries.extend(schema_history_entries(
+                connector_id,
+                schema_history_bootstrap,
+            )?);
+        }
+        SqlDriver::Mssql => {
+            let (encrypt, trust) = mssql_tls(dial.ssl_mode);
+            entries.extend([
+                ("connector.class", SQLSERVER_CONNECTOR_CLASS.to_owned()),
+                ("database.names", dial.database.clone()),
+                ("database.encrypt", encrypt.to_owned()),
+                ("database.trustServerCertificate", trust.to_owned()),
+            ]);
+            entries.extend(schema_history_entries(
+                connector_id,
+                schema_history_bootstrap,
+            )?);
+        }
+        SqlDriver::Oracle => return Err(CdcSpecError::UnsupportedDriver),
+    }
     Ok(entries
         .into_iter()
         .map(|(key, value)| (key.to_owned(), value))
         .collect())
+}
+
+/// The two schema-history keys of a `MySQL` or `SQL Server` connector.
+fn schema_history_entries(
+    connector_id: &str,
+    bootstrap: Option<&str>,
+) -> Result<[(&'static str, String); 2], CdcSpecError> {
+    let bootstrap = bootstrap.ok_or(CdcSpecError::NoSchemaHistoryBroker)?;
+    if !is_bootstrap_list(bootstrap) {
+        return Err(CdcSpecError::InvalidSchemaHistoryBroker);
+    }
+    Ok([
+        (
+            "schema.history.internal.kafka.bootstrap.servers",
+            bootstrap.to_owned(),
+        ),
+        (
+            "schema.history.internal.kafka.topic",
+            schema_history_topic(connector_id)?,
+        ),
+    ])
 }
 
 #[cfg(test)]
@@ -491,6 +643,7 @@ mod tests {
             &pg_dial("verify-full"),
             &["public.orders", "sales.items"],
             CDC_SECRETS_DIR,
+            None,
         )
         .unwrap();
         assert_eq!(config["connector.class"], POSTGRES_CONNECTOR_CLASS);
@@ -520,6 +673,7 @@ mod tests {
             &pg_dial("require"),
             &["public.orders"],
             CDC_SECRETS_DIR,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -548,20 +702,20 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    render_connect_config("conn-a", &dial, &[table], CDC_SECRETS_DIR),
+                    render_connect_config("conn-a", &dial, &[table], CDC_SECRETS_DIR, None),
                     Err(CdcSpecError::InvalidTableName { .. })
                 ),
                 "{table}"
             );
         }
         assert_eq!(
-            render_connect_config("conn-a", &dial, &[], CDC_SECRETS_DIR),
+            render_connect_config("conn-a", &dial, &[], CDC_SECRETS_DIR, None),
             Err(CdcSpecError::NoTables)
         );
         for id in ["", "../x", "a:b", "-a", "a/b", "a\nb"] {
             assert!(
                 matches!(
-                    render_connect_config(id, &dial, &["public.t"], CDC_SECRETS_DIR),
+                    render_connect_config(id, &dial, &["public.t"], CDC_SECRETS_DIR, None),
                     Err(CdcSpecError::InvalidConnectorId { .. })
                 ),
                 "{id}"
@@ -574,15 +728,207 @@ mod tests {
         let mut dial = pg_dial("require");
         dial.slot_name = Some("Orders-Slot".to_owned());
         assert!(matches!(
-            render_connect_config("conn-a", &dial, &["public.t"], CDC_SECRETS_DIR),
+            render_connect_config("conn-a", &dial, &["public.t"], CDC_SECRETS_DIR, None),
             Err(CdcSpecError::InvalidReplicationName { field: "slotName" })
         ));
         let mut dial = pg_dial("require");
-        dial.driver = SqlDriver::Mysql;
+        dial.driver = SqlDriver::Oracle;
         assert_eq!(
-            render_connect_config("conn-a", &dial, &["public.t"], CDC_SECRETS_DIR),
+            render_connect_config("conn-a", &dial, &["public.t"], CDC_SECRETS_DIR, None),
             Err(CdcSpecError::UnsupportedDriver)
         );
+    }
+
+    const BROKER: &str = "kafka:9092";
+
+    fn other_dial(driver: &str, ssl_mode: &str) -> CdcDial {
+        let mut json = serde_json::json!({
+            "driver": driver, "host": "db.internal", "port": 3306,
+            "database": "orders", "user": "app_reader", "sslMode": ssl_mode
+        });
+        if driver == "mysql" {
+            json["serverId"] = serde_json::json!(5400);
+        }
+        serde_json::from_value(json).unwrap()
+    }
+
+    fn render_other(driver: &str, ssl_mode: &str, tables: &[&str]) -> BTreeMap<String, String> {
+        render_connect_config(
+            "conn-x1",
+            &other_dial(driver, ssl_mode),
+            tables,
+            CDC_SECRETS_DIR,
+            Some(BROKER),
+        )
+        .unwrap()
+    }
+
+    /// The keys every driver shares, so a change to the shared part is seen once.
+    fn assert_shared_keys(config: &BTreeMap<String, String>) {
+        assert_eq!(
+            config["database.password"],
+            "${dir:/run/cdc-secrets:conn-x1}"
+        );
+        assert_eq!(config["topic.prefix"], "cdc.conn-x1");
+        assert_eq!(config["snapshot.mode"], "initial");
+        assert_eq!(config["decimal.handling.mode"], "string");
+        assert_eq!(config["tasks.max"], "1");
+        assert_eq!(
+            config["transforms.unwrap.delete.tombstone.handling.mode"],
+            "rewrite"
+        );
+        assert_eq!(config["transforms.unwrap.add.fields"], "op,source.ts_ms");
+        assert_eq!(config["value.converter.schemas.enable"], "false");
+        assert!(!config.values().any(|v| v.contains("s3cret")));
+    }
+
+    #[test]
+    fn mysql_config_has_exactly_its_keys() {
+        let config = render_other(
+            "mysql",
+            "require",
+            &["shop.orders", "shop.items", "crm.users"],
+        );
+        assert_shared_keys(&config);
+        assert_eq!(config["connector.class"], MYSQL_CONNECTOR_CLASS);
+        assert_eq!(config["database.server.id"], "5400");
+        assert_eq!(config["database.include.list"], "shop,crm");
+        assert_eq!(
+            config["table.include.list"],
+            "shop.orders,shop.items,crm.users"
+        );
+        assert_eq!(config["include.schema.changes"], "false");
+        assert_eq!(
+            config["schema.history.internal.kafka.bootstrap.servers"],
+            BROKER
+        );
+        assert_eq!(
+            config["schema.history.internal.kafka.topic"],
+            "cdc.conn-x1.schema-history"
+        );
+        // None of PostgreSQL's keys.
+        for key in [
+            "slot.name",
+            "publication.name",
+            "plugin.name",
+            "database.sslmode",
+            "database.dbname",
+            "database.names",
+        ] {
+            assert!(!config.contains_key(key), "{key}");
+        }
+    }
+
+    #[test]
+    fn sql_server_config_has_exactly_its_keys() {
+        let config = render_other("mssql", "require", &["dbo.orders", "sales.items"]);
+        assert_shared_keys(&config);
+        assert_eq!(config["connector.class"], SQLSERVER_CONNECTOR_CLASS);
+        assert_eq!(config["database.names"], "orders");
+        assert_eq!(config["table.include.list"], "dbo.orders,sales.items");
+        assert_eq!(
+            config["schema.history.internal.kafka.bootstrap.servers"],
+            BROKER
+        );
+        assert_eq!(
+            config["schema.history.internal.kafka.topic"],
+            "cdc.conn-x1.schema-history"
+        );
+        for key in [
+            "slot.name",
+            "database.server.id",
+            "database.include.list",
+            "database.sslmode",
+            "database.ssl.mode",
+            "include.schema.changes",
+        ] {
+            assert!(!config.contains_key(key), "{key}");
+        }
+    }
+
+    #[test]
+    fn each_ssl_mode_maps_to_the_right_setting_per_driver() {
+        for (mode, mysql, encrypt, trust) in [
+            ("disable", "disabled", "false", "false"),
+            ("require", "required", "true", "true"),
+            ("verify-ca", "verify_ca", "true", "false"),
+            ("verify-full", "verify_identity", "true", "false"),
+        ] {
+            let config = render_other("mysql", mode, &["shop.orders"]);
+            assert_eq!(config["database.ssl.mode"], mysql, "{mode}");
+            let config = render_other("mssql", mode, &["dbo.orders"]);
+            assert_eq!(config["database.encrypt"], encrypt, "{mode}");
+            assert_eq!(config["database.trustServerCertificate"], trust, "{mode}");
+        }
+    }
+
+    #[test]
+    fn mysql_and_sql_server_refuse_a_bad_table_name_and_a_missing_or_bad_history_broker() {
+        for driver in ["mysql", "mssql"] {
+            let dial = other_dial(driver, "require");
+            for table in ["orders", "a.b.c", "x.y,z.w", "x. y"] {
+                assert!(
+                    matches!(
+                        render_connect_config(
+                            "conn-x1",
+                            &dial,
+                            &[table],
+                            CDC_SECRETS_DIR,
+                            Some(BROKER)
+                        ),
+                        Err(CdcSpecError::InvalidTableName { .. })
+                    ),
+                    "{driver} {table}"
+                );
+            }
+            assert_eq!(
+                render_connect_config("conn-x1", &dial, &["a.b"], CDC_SECRETS_DIR, None),
+                Err(CdcSpecError::NoSchemaHistoryBroker)
+            );
+            for bad in [
+                "",
+                "kafka",
+                "kafka:",
+                ":9092",
+                "ka fka:9092",
+                "k:9092,",
+                "k:9092\nx:1",
+            ] {
+                assert_eq!(
+                    render_connect_config("conn-x1", &dial, &["a.b"], CDC_SECRETS_DIR, Some(bad)),
+                    Err(CdcSpecError::InvalidSchemaHistoryBroker),
+                    "{bad:?}"
+                );
+            }
+        }
+        let mut dial = other_dial("mysql", "require");
+        dial.server_id = None;
+        assert_eq!(
+            render_connect_config("conn-x1", &dial, &["a.b"], CDC_SECRETS_DIR, Some(BROKER)),
+            Err(CdcSpecError::NoServerId)
+        );
+    }
+
+    #[test]
+    fn postgres_ignores_the_schema_history_broker() {
+        let with = render_connect_config(
+            "c1",
+            &pg_dial("require"),
+            &["public.t"],
+            CDC_SECRETS_DIR,
+            Some(BROKER),
+        )
+        .unwrap();
+        let without = render_connect_config(
+            "c1",
+            &pg_dial("require"),
+            &["public.t"],
+            CDC_SECRETS_DIR,
+            None,
+        )
+        .unwrap();
+        assert_eq!(with, without);
+        assert!(!with.keys().any(|k| k.starts_with("schema.history")));
     }
 
     fn col(name: &str, type_name: &str) -> SourceColumn {

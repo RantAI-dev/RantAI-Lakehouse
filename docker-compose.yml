@@ -448,6 +448,10 @@ services:
       # purpose: a deployment without change capture keeps the default and a
       # change-capture connector answers `supported: false` (fail closed).
       KAFKA_CONNECT_URL: ${KAFKA_CONNECT_URL:-}
+      # SRC-4 slice 3: the same broker address the applier reads below. A MySQL
+      # or SQL Server connector keeps its schema history in a topic on it and
+      # cannot start without it (unset: "not configured", fail closed).
+      CDC_KAFKA_BOOTSTRAP: ${CDC_KAFKA_BOOTSTRAP:-}
       # SRC-11 D3: this many failed runs in a row pause a connector and raise
       # `connector_disabled` once. Unset or empty keeps the code's default,
       # 30 (the spec's number); zero, negative or garbage does too. A

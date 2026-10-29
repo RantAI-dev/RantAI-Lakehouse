@@ -58,7 +58,8 @@ fn secret_error(err: CdcSecretError) -> ApiError {
 pub enum Provisioned {
     /// The connector is created or updated in `Kafka Connect`.
     Started,
-    /// `KAFKA_CONNECT_URL` is not set: nothing was started (fail closed).
+    /// `KAFKA_CONNECT_URL` is not set, or the connector is `MySQL` or `SQL Server`
+    /// and `CDC_KAFKA_BOOTSTRAP` is not: nothing was started (fail closed).
     NotConfigured,
     /// The connector is not a change-capture connector, or it names no table
     /// yet: there is nothing to capture.
@@ -109,8 +110,21 @@ pub async fn provision(state: &AppState, id: &str) -> Result<Provisioned, ApiErr
         return Ok(Provisioned::NothingToCapture);
     };
     let table_refs: Vec<&str> = tables.iter().map(String::as_str).collect();
-    let config = render_connect_config(id, dial, &table_refs, &state.config.cdc_secrets_dir)
-        .map_err(|err| ApiError::Unprocessable(err.to_string()))?;
+    // `MySQL` and `SQL Server` keep their schema history in a Kafka topic and
+    // cannot start without the broker's address: unset is the same fail-closed
+    // answer as an unset `KAFKA_CONNECT_URL` (`SRC-4` decision S3-b).
+    let bootstrap = state.config.cdc_kafka_bootstrap.as_deref();
+    if bootstrap.is_none() && dial.driver != lakehouse_store::ingest_spec::SqlDriver::Postgres {
+        return Ok(Provisioned::NotConfigured);
+    }
+    let config = render_connect_config(
+        id,
+        dial,
+        &table_refs,
+        &state.config.cdc_secrets_dir,
+        bootstrap,
+    )
+    .map_err(|err| ApiError::Unprocessable(err.to_string()))?;
     let name =
         connect_connector_name(id).map_err(|err| ApiError::Unprocessable(err.to_string()))?;
 
