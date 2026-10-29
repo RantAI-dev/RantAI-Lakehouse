@@ -3096,6 +3096,36 @@ fn deprovision_error_message(
     )
 }
 
+/// `SRC-4` slice 2 (S2-e): remove a change-capture connector from Kafka Connect
+/// before its slot is dropped (the slot cannot be dropped while the worker reads
+/// it). With `force` a worker that cannot do it is logged and the delete goes on.
+///
+/// # Errors
+///
+/// 409 with a fixed text when Kafka Connect did not remove it and `force` is not
+/// set.
+async fn remove_connect_connector(state: &AppState, id: &str, force: bool) -> Result<(), ApiError> {
+    let Err(err) = crate::cdc_lifecycle::remove_from_connect(state, id).await else {
+        return Ok(());
+    };
+    if force {
+        tracing::error!(
+            connector_id = %id,
+            error = %err,
+            "force-deleting connector despite Kafka Connect not removing its connector: \
+             it may keep reading the source until removed by hand"
+        );
+        return Ok(());
+    }
+    Err(ApiError::Conflict(format!(
+        "connector {id} was NOT deleted: Kafka Connect did not remove its \
+         change-capture connector ({err}); the registry row is kept so the \
+         connector stays visible. Retry once Kafka Connect is reachable, or pass \
+         ?force=true to delete the row anyway (the connector will then have to be \
+         removed from Kafka Connect by hand)."
+    )))
+}
+
 /// `DELETE /api/connectors/{id}` — remove a connector registration.
 ///
 /// # CDC deprovisioning happens FIRST, decided by `adapter` not `kind`
@@ -3186,26 +3216,8 @@ pub async fn delete(
 
     // `SRC-4` slice 2 (S2-e): the worker's connector goes first, because the
     // slot cannot be dropped while the worker reads it.
-    if dial_info.adapter.as_deref() == Some("cdc")
-        && let Err(err) = crate::cdc_lifecycle::remove_from_connect(&state, &id).await
-    {
-        if query.force {
-            tracing::error!(
-                connector_id = %id,
-                error = %err,
-                "force-deleting connector despite Kafka Connect not removing its connector: \
-                 it may keep reading the source until removed by hand"
-            );
-        } else {
-            return Err(ApiError::Conflict(format!(
-                "connector {id} was NOT deleted: Kafka Connect did not remove its \
-                 change-capture connector ({err}); the registry row is kept so the \
-                 connector stays visible. Retry once Kafka Connect is reachable, or pass \
-                 ?force=true to delete the row anyway (the connector will then have to be \
-                 removed from Kafka Connect by hand)."
-            ))
-            .into());
-        }
+    if dial_info.adapter.as_deref() == Some("cdc") {
+        remove_connect_connector(&state, &id, query.force).await?;
     }
 
     if let Err(err) = deprovision_postgres_connector(&state, &id, &dial_info).await {

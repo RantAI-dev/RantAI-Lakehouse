@@ -361,7 +361,7 @@ mod tests {
             {"name": "sales.items", "target": "b"},
         ]);
         assert_eq!(table_names(&objects), ["public.orders", "sales.items"]);
-        assert!(table_names(&json!({})).is_empty());
-        assert!(table_names(&json!([])).is_empty());
+        assert_eq!(table_names(&json!({})), Vec::<String>::new());
+        assert_eq!(table_names(&json!([])), Vec::<String>::new());
     }
 }
