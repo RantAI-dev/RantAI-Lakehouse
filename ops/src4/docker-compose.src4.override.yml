@@ -1,0 +1,155 @@
+# ops/src4/docker-compose.src4.override.yml -- SRC-4 slice 0 (MEASUREMENT ONLY).
+#
+# Why this exists: ADR 0016 proposes one Kafka Connect worker (Debezium's
+# distribution) and one Kafka broker for every change-capture connector, and a
+# Dagster job (the applier) that writes the change topics to Bronze. Decision 13
+# of docs/core/features/databases-and-change-capture.md says to measure that
+# before any product code. This file is the stack the measurement runs on; it is
+# never merged and never part of the deployment template (slice 2 adds the real
+# `cdc` profile to docker-compose.yml).
+#
+# Used as
+#   docker compose -p src4 -f docker-compose.yml -f ops/src4/docker-compose.src4.override.yml \
+#     --profile dagster up -d --build ...
+#
+# Nothing here is a default for a real installation: the credentials are the
+# stack's own `${POSTGRES_PASSWORD:?}` (a missing one stops compose), and Kafka
+# Connect's REST API is published on the runner's loopback only because the
+# harness (`ops/src4/measure_cdc.py`) calls it directly; ADR 0016 point 1 keeps it
+# internal in the product.
+
+services:
+  # The broker: KRaft, one node, the shape of `kafka-g6` in docker-compose.yml.
+  # Replication factor 1 everywhere (one node); the group rebalance delay is 0 so
+  # the applier's consumer group does not wait 3 s to start on every run.
+  kafka-src4:
+    image: apache/kafka:3.8.0
+    restart: "no"
+    environment:
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      KAFKA_LISTENERS: "PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka-src4:9092"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka-src4:9093"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+      KAFKA_NUM_PARTITIONS: "1"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  # The source: the stack's own `postgres:16` (wal_level=logical already), a
+  # schema `src4` of its own with TWO identical tables, one per load mode, so that
+  # each mode's measurement starts from a clean source and its own topic and
+  # Bronze table (`orders` for "current row per key", `orders_history` for
+  # "history"). REPLICA IDENTITY FULL so a delete event carries the old row. Its own
+  # publication; the slot (`src4_slot`) is made by the connector. Never `p5cdc_*`.
+  #
+  # `src4.audit` is the measurement's ground truth: a row trigger records every
+  # change the source commits, in commit order of the statement that made it, so the
+  # history mode can be checked event by event (the harness never trusts the
+  # pipeline to describe itself). It is not captured (not in the publication).
+  src4-source-init:
+    image: postgres:16
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: ${POSTGRES_USER:-lakehouse}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}
+      PGDATABASE: ${POSTGRES_DB:-lakehouse}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        psql -v ON_ERROR_STOP=1 <<'SQL'
+        CREATE SCHEMA IF NOT EXISTS src4;
+        CREATE TABLE IF NOT EXISTS src4.orders (
+          id bigint PRIMARY KEY,
+          customer text,
+          amount numeric(12,2),
+          status text,
+          updated_at timestamptz
+        );
+        CREATE TABLE IF NOT EXISTS src4.orders_history (LIKE src4.orders INCLUDING ALL);
+        ALTER TABLE src4.orders REPLICA IDENTITY FULL;
+        ALTER TABLE src4.orders_history REPLICA IDENTITY FULL;
+        CREATE TABLE IF NOT EXISTS src4.audit (
+          seq bigserial PRIMARY KEY,
+          tbl text NOT NULL,
+          op char(1) NOT NULL,
+          id bigint NOT NULL,
+          customer text,
+          status text
+        );
+        CREATE OR REPLACE FUNCTION src4.audit_change() RETURNS trigger LANGUAGE plpgsql AS $$f$$
+        BEGIN
+          IF TG_OP = 'DELETE' THEN
+            INSERT INTO src4.audit (tbl, op, id, customer, status) VALUES (TG_TABLE_NAME, 'd', OLD.id, OLD.customer, OLD.status);
+            RETURN OLD;
+          END IF;
+          INSERT INTO src4.audit (tbl, op, id, customer, status)
+            VALUES (TG_TABLE_NAME, CASE TG_OP WHEN 'INSERT' THEN 'c' ELSE 'u' END, NEW.id, NEW.customer, NEW.status);
+          RETURN NEW;
+        END $$f$$;
+        DROP TRIGGER IF EXISTS audit ON src4.orders;
+        CREATE TRIGGER audit AFTER INSERT OR UPDATE OR DELETE ON src4.orders
+          FOR EACH ROW EXECUTE FUNCTION src4.audit_change();
+        DROP TRIGGER IF EXISTS audit ON src4.orders_history;
+        CREATE TRIGGER audit AFTER INSERT OR UPDATE OR DELETE ON src4.orders_history
+          FOR EACH ROW EXECUTE FUNCTION src4.audit_change();
+        SQL
+        psql -v ON_ERROR_STOP=1 -tc "SELECT 1 FROM pg_publication WHERE pubname = 'src4_pub'" | grep -q 1 ||
+          psql -v ON_ERROR_STOP=1 -c "CREATE PUBLICATION src4_pub FOR TABLE src4.orders, src4.orders_history;"
+    restart: "no"
+
+  # Kafka Connect: Debezium's own distribution, pinned by tag AND digest (the tag
+  # `3.8` is the newest 3.x tag on quay.io/debezium/connect on 2026-10-29; it is a
+  # moving minor tag, so the digest is the pin; the version it reports is printed
+  # by the harness). Config, offsets and status live in Kafka topics (replication
+  # factor 1), not in files (ADR 0016 point 2).
+  connect-src4:
+    image: quay.io/debezium/connect:3.8@sha256:d67d678c726d1659f458e057e4a3a50a3b14c3e85a3be7f31de9db53dfb46668
+    depends_on:
+      kafka-src4:
+        condition: service_healthy
+      src4-source-init:
+        condition: service_completed_successfully
+    environment:
+      BOOTSTRAP_SERVERS: kafka-src4:9092
+      GROUP_ID: src4-connect
+      CONFIG_STORAGE_TOPIC: src4_connect_configs
+      OFFSET_STORAGE_TOPIC: src4_connect_offsets
+      STATUS_STORAGE_TOPIC: src4_connect_status
+      CONFIG_STORAGE_REPLICATION_FACTOR: "1"
+      OFFSET_STORAGE_REPLICATION_FACTOR: "1"
+      STATUS_STORAGE_REPLICATION_FACTOR: "1"
+      # The harness reads the worker's own memory peak with `docker stats`.
+      HEAP_OPTS: "-Xms256M -Xmx1G"
+    ports:
+      - "127.0.0.1:8083:8083"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8083/ >/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+      start_period: 20s
+    restart: "no"
+
+  # The applier (`cdc_apply.py`) runs in the code location's run processes. It needs
+  # the broker's address and, GATE ONLY, to be allowed to dial it: the broker is an
+  # internal address and the SSRF guard (`ssrf_guard.py`) refuses those unless this
+  # is set (the same switch `ops/g6/docker-compose.g6.override.yml` sets for its
+  # fixtures; never a default of the template).
+  dagster-code-location:
+    environment:
+      INGEST_ALLOW_INTERNAL_HOSTS: "true"
+      SRC4_KAFKA_BOOTSTRAP: kafka-src4:9092
