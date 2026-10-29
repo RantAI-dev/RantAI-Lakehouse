@@ -13,29 +13,38 @@ Only what is Oracle's own lives here: the fixture and the dial.
 
 # What each step must show (`ops/gates/coverage.json`, type `Oracle`)
 
-- `connect`: refused, honestly. The API has no Oracle client; `POST .../test`
-  answers `supported: false` (SRC-5, `connector_probe.rs`).
+- `connect`: refused, honestly, until `SRC-4` T1.1 lands. The API has no
+  Oracle client; `POST .../test` answers `supported: false` (SRC-5,
+  `connector_probe.rs`).
 - `discover`: real (SRC-13 D5, D12). The orchestrator lists Oracle: the
   schemas the login can read hold `G6_INGEST`, that schema's tables hold
-  `G6_INGEST.ORDERS`, and the preview shows its declared columns `ID` and
-  `AMOUNT` (types not inferred). The source object of the load below is that
-  listed name, `G6_INGEST.ORDERS`, so the gate also proves that what the
-  listing offers loads (SRC-13 review 1 SHOULD-FIX 1: the schema part and the
-  upper-case spelling).
-- `load`: real. The run succeeds and Bronze holds every seeded row.
-- `reload`: real. The connector has no `loadMode`, so the default `replace`
-  applies and a second run leaves the same rows.
+  `G6_INGEST.ORDERS`, and the preview shows its declared columns `ID`,
+  `AMOUNT` and `NOTE` (types not inferred). The source object of the load
+  below is that listed name, `G6_INGEST.ORDERS`, so the gate also proves that
+  what the listing offers loads (SRC-13 review 1 SHOULD-FIX 1: the schema part
+  and the upper-case spelling).
+- `load`: real (`SRC-4` T1.2, T1.3). The table is saved with column choice
+  (`NOTE` left out, spelled as the preview spells it) and the `incremental`
+  load mode with the cursor `ID`. The run succeeds, Bronze holds every seeded
+  row, has `id` and `amount`, and has no `note` column.
+- `reload`: real (`SRC-4` T1.3). Two rows are inserted at the source and the
+  run again: only those two rows are read (the run's own row count is 2, not
+  the 5 of the table) and Bronze holds the five, no row twice.
 
-# The dial
+# The dial, over TLS (`SRC-4` T1.4)
 
-`driver: oracle`, host and port of the container, `database` = the pluggable
-database's service name (the console's field is labelled "Database (service
-name)", `oracle-dial-form.tsx`), a literal user, and no `sslMode`. The Oracle
-adapter refuses TLS without an operator-typed `sslServerCertDn`
-(`adapters/oracle.py`, `OracleTlsConfigError`), and a fixture container has no
-certificate whose DN means anything, so this gate uses the plaintext mode the
-dial allows. That is a limit of what is proven: TLS to Oracle is not
-exercised here.
+`driver: oracle`, `sslMode: required`, `sslServerCertDn: CN=oracle-tls-g6`,
+host `oracle-tls-g6` and port 2484: the TLS front of the fixture
+(`ops/g6/oracle-tls-proxy.conf`), with a certificate from a CA the gate's
+`oracle-g6-cert-init` generates and the Dagster code location trusts through
+`SSL_CERT_FILE`. `database` is the pluggable database's service name (the
+console's field is labelled "Database (service name)",
+`oracle-dial-form.tsx`). Everything the orchestrator does with this connector
+(discovery, the loads) is one `tcps` dial with the chain and the DN checked.
+Limit of what is proven: Oracle's own TCPS listener and wallet are not
+exercised, the proxy terminates TLS in front of the plaintext listener (the
+reason is in the proxy's config file). The fixture seeds over plaintext (the
+gate's own login, not the product's).
 
 # Settings (environment)
 
@@ -61,8 +70,13 @@ NAME = "g6-oracle"
 TYPE_NAME = "Oracle"
 BRONZE_TABLE = "g6_oracle_orders"
 
+# Where the gate's own seeding logs in: the listener, in clear text (not the product's dial).
 ORACLE_HOST = "oracle-g6"
 ORACLE_PORT = 1521
+# Where the connector dials: the TLS front, and the DN of its certificate (CN = the host name).
+ORACLE_TLS_HOST = "oracle-tls-g6"
+ORACLE_TLS_PORT = 2484
+ORACLE_TLS_DN = "CN=oracle-tls-g6"
 # The default pluggable database of the image; the application user exists
 # there, and the connector's `database` is its service name.
 ORACLE_SERVICE = "FREEPDB1"
@@ -74,7 +88,13 @@ CONNECTOR_ORACLE_PASSWORD = os.environ.get("CONNECTOR_ORACLE_PASSWORD", "")
 # The name the listing offers for the fixture table, and what the load's source object is called
 # (SRC-13: a listed name must load).
 SOURCE_OBJECT = f"{ORACLE_SCHEMA}.ORDERS"
-FIXTURE_ROWS = [(1, 10.5), (2, 20.25), (3, 30.0)]
+FIXTURE_ROWS = [(1, 10.5, "one"), (2, 20.25, "two"), (3, 30.0, "three")]
+# Inserted before the second run: the only rows an incremental load may read then.
+NEW_ROWS = [(4, 40.0, "four"), (5, 50.5, "five")]
+# The column left out of the load, spelled as the preview spells it (Oracle's own, upper case); the
+# cursor likewise. Bronze has the reflected spelling, lower case (`adapters/oracle.py`).
+LEFT_OUT_COLUMN = "NOTE"
+CURSOR_COLUMN = "ID"
 SIGN_IN_TIMEOUT_S = 300
 
 
@@ -101,17 +121,18 @@ def _wait_for_sign_in() -> None:
 
 
 def _seed_oracle_fixture() -> None:
-    """`G6_INGEST.ORDERS(ID, AMOUNT)` with `FIXTURE_ROWS`, as the application
+    """`G6_INGEST.ORDERS(ID, AMOUNT, NOTE)` with `FIXTURE_ROWS`, as the application
     user. Idempotent: rows are replaced, not added to."""
     conn = _connect_oracle()
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "BEGIN EXECUTE IMMEDIATE 'CREATE TABLE orders (id NUMBER(10) PRIMARY KEY, amount NUMBER(10,2))'; "
+                "BEGIN EXECUTE IMMEDIATE 'CREATE TABLE orders (id NUMBER(10) PRIMARY KEY, amount NUMBER(10,2), "
+                "note VARCHAR2(40))'; "
                 "EXCEPTION WHEN OTHERS THEN IF SQLCODE != -955 THEN RAISE; END IF; END;"
             )
             cur.execute("DELETE FROM orders")
-            cur.executemany("INSERT INTO orders (id, amount) VALUES (:1, :2)", FIXTURE_ROWS)
+            cur.executemany("INSERT INTO orders (id, amount, note) VALUES (:1, :2, :3)", FIXTURE_ROWS)
         conn.commit()
     finally:
         conn.close()
@@ -132,7 +153,7 @@ def _install_oracle_into_matrix() -> None:
     matrix.DISCOVER_FIXTURES = {
         TYPE_NAME: {
             "schema": ORACLE_SCHEMA, "object": SOURCE_OBJECT, "kind": "table",
-            "columns": {"ID", "AMOUNT"}, "inferred": False,
+            "columns": {"ID", "AMOUNT", "NOTE"}, "inferred": False,
         }
     }
 
@@ -158,8 +179,74 @@ def _check_load(run_id: str) -> int | None:
             f"expected _ingested_at on every row of bronze.{BRONZE_TABLE}, {null_ingested_at} of {count} rows lack it",
         )
         return None
-    matrix._record(TYPE_NAME, "load", "pass", f"{count} rows in bronze.{BRONZE_TABLE}")
+    try:
+        columns = matrix._bronze_columns(BRONZE_TABLE)
+    except matrix.G6Failure as exc:
+        matrix._record_fail(TYPE_NAME, "load", str(exc))
+        return None
+    if LEFT_OUT_COLUMN.lower() in columns or not {"id", "amount"} <= set(columns):
+        matrix._record_fail(
+            TYPE_NAME, "load",
+            f"expected id and amount and no {LEFT_OUT_COLUMN.lower()} in bronze.{BRONZE_TABLE}, got {columns}",
+        )
+        return None
+    matrix._record(
+        TYPE_NAME, "load", "pass",
+        f"{count} rows in bronze.{BRONZE_TABLE}, {LEFT_OUT_COLUMN} left out, over tcps",
+    )
     return count
+
+
+def _insert_new_rows() -> None:
+    """The rows the second run must pick up, as the application user."""
+    conn = _connect_oracle()
+    try:
+        with conn.cursor() as cur:
+            cur.executemany("INSERT INTO orders (id, amount, note) VALUES (:1, :2, :3)", NEW_ROWS)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _check_reload(connector_id: str, first_count: int) -> None:
+    """`reload` (`SRC-4` T1.3): new rows at the source, a second run, and only
+    those rows read. The run's own row count (`GET /api/governance/ingest-runs`,
+    what the run wrote) tells an incremental load from a `replace`, which would
+    also leave five rows in Bronze but read all five."""
+    want = first_count + len(NEW_ROWS)
+    try:
+        _insert_new_rows()
+        run_id = matrix._post_ingest_run(connector_id).json().get("runId")
+        if not run_id:
+            matrix._record_fail(TYPE_NAME, "reload", "the second ingest/run returned no runId")
+            return
+        matrix.step_wait_for_run_success(run_id)
+        matrix._wait_for(
+            f"bronze.{BRONZE_TABLE} has {want} rows after the second run",
+            lambda: matrix._bronze_row_count(BRONZE_TABLE) == want or None, 30, interval_s=3.0,
+        )
+        runs = matrix._src10_runs_of(connector_id, SOURCE_OBJECT)  # newest first
+        latest = runs[0] if runs else None
+        if latest is None or latest.get("status") != "succeeded" or latest.get("rows") != len(NEW_ROWS):
+            matrix._record_fail(
+                TYPE_NAME, "reload",
+                f"expected the second run to read exactly the {len(NEW_ROWS)} new rows, got "
+                f"{None if latest is None else {k: latest.get(k) for k in ('status', 'rows')}}",
+            )
+            return
+        # A freshly written Iceberg table can show its previous snapshot to ClickHouse for a moment: read again.
+        time.sleep(6.0)
+        again = matrix._bronze_row_count(BRONZE_TABLE)
+    except matrix.G6Failure as exc:
+        matrix._record_fail(TYPE_NAME, "reload", str(exc))
+        return
+    if again != want:
+        matrix._record_fail(TYPE_NAME, "reload", f"bronze.{BRONZE_TABLE} had {want} rows after the second run and {again} a few seconds later")
+        return
+    matrix._record(
+        TYPE_NAME, "reload", "pass",
+        f"{len(NEW_ROWS)} new rows read, {want} rows in bronze.{BRONZE_TABLE}: incremental brought only the new rows",
+    )
 
 
 def run() -> None:
@@ -180,12 +267,18 @@ def run() -> None:
 
     connector_ids: dict[str, str] = {}
     run_id = matrix._register_and_run(
-        name=NAME, kind=TYPE_NAME, host=f"{ORACLE_HOST}:{ORACLE_PORT}",
+        name=NAME, kind=TYPE_NAME, host=f"{ORACLE_TLS_HOST}:{ORACLE_TLS_PORT}",
         credential={"source": "file", "primary": "password"},
         credential_values={"primary": CONNECTOR_ORACLE_PASSWORD},
         adapter="sql",
-        dial={"driver": "oracle", "host": ORACLE_HOST, "port": ORACLE_PORT, "database": ORACLE_SERVICE, "user": ORACLE_USER},
-        source_objects=[{"name": SOURCE_OBJECT, "target": BRONZE_TABLE}],
+        dial={
+            "driver": "oracle", "host": ORACLE_TLS_HOST, "port": ORACLE_TLS_PORT, "database": ORACLE_SERVICE,
+            "user": ORACLE_USER, "sslMode": "required", "sslServerCertDn": ORACLE_TLS_DN,
+        },
+        source_objects=[{
+            "name": SOURCE_OBJECT, "target": BRONZE_TABLE, "loadMode": "incremental",
+            "incrementalKey": CURSOR_COLUMN, "excludedColumns": [LEFT_OUT_COLUMN],
+        }],
         connector_ids=connector_ids,
     )
     connector_id = connector_ids[NAME]
@@ -202,7 +295,7 @@ def run() -> None:
     if count is None:
         matrix._record(TYPE_NAME, "reload", "skipped", "the first load did not complete, so there is nothing to load again")
         return
-    matrix._step_reload({NAME: connector_id}, {NAME: count})
+    _check_reload(connector_id, count)
 
 
 def main() -> int:
