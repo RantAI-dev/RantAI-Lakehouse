@@ -531,72 +531,95 @@ pub fn render_connect_config(
         ("transforms.unwrap.add.fields", "op,source.ts_ms".to_owned()),
     ];
 
-    match dial.driver {
-        SqlDriver::Postgres => {
-            let (Some(slot_name), Some(publication_name)) =
-                (dial.slot_name.as_deref(), dial.publication_name.as_deref())
-            else {
-                // `Dial::parse` requires both for PostgreSQL; a hand-built dial
-                // without them is refused the same way a bad name is.
-                return Err(CdcSpecError::InvalidReplicationName { field: "slotName" });
-            };
-            for (field, value) in [
-                ("slotName", slot_name),
-                ("publicationName", publication_name),
-            ] {
-                if !is_replication_name(value) {
-                    return Err(CdcSpecError::InvalidReplicationName { field });
-                }
-            }
-            entries.extend([
-                ("connector.class", POSTGRES_CONNECTOR_CLASS.to_owned()),
-                ("database.dbname", dial.database.clone()),
-                ("database.sslmode", dial.ssl_mode.as_debezium().to_owned()),
-                ("schema.include.list", first_parts.join(",")),
-                ("plugin.name", "pgoutput".to_owned()),
-                ("slot.name", slot_name.to_owned()),
-                ("publication.name", publication_name.to_owned()),
-                ("publication.autocreate.mode", "disabled".to_owned()),
-            ]);
-        }
+    let driver_entries = match dial.driver {
+        SqlDriver::Postgres => postgres_entries(dial, &first_parts)?,
         SqlDriver::Mysql => {
-            let server_id = dial.server_id.ok_or(CdcSpecError::NoServerId)?;
-            entries.extend([
-                ("connector.class", MYSQL_CONNECTOR_CLASS.to_owned()),
-                ("database.server.id", server_id.to_string()),
-                ("database.include.list", first_parts.join(",")),
-                (
-                    "database.ssl.mode",
-                    mysql_ssl_mode(dial.ssl_mode).to_owned(),
-                ),
-                // No topic named after the prefix alone: the applier reads the
-                // table topics only.
-                ("include.schema.changes", "false".to_owned()),
-            ]);
-            entries.extend(schema_history_entries(
-                connector_id,
-                schema_history_bootstrap,
-            )?);
+            mysql_entries(connector_id, dial, &first_parts, schema_history_bootstrap)?
         }
-        SqlDriver::Mssql => {
-            let (encrypt, trust) = mssql_tls(dial.ssl_mode);
-            entries.extend([
-                ("connector.class", SQLSERVER_CONNECTOR_CLASS.to_owned()),
-                ("database.names", dial.database.clone()),
-                ("database.encrypt", encrypt.to_owned()),
-                ("database.trustServerCertificate", trust.to_owned()),
-            ]);
-            entries.extend(schema_history_entries(
-                connector_id,
-                schema_history_bootstrap,
-            )?);
-        }
+        SqlDriver::Mssql => mssql_entries(connector_id, dial, schema_history_bootstrap)?,
         SqlDriver::Oracle => return Err(CdcSpecError::UnsupportedDriver),
-    }
+    };
+    entries.extend(driver_entries);
     Ok(entries
         .into_iter()
         .map(|(key, value)| (key.to_owned(), value))
         .collect())
+}
+
+/// The `PostgreSQL` connector's own keys: class, database, TLS, schemas, and the
+/// dial's slot and publication.
+fn postgres_entries(
+    dial: &CdcDial,
+    schemas: &[&str],
+) -> Result<Vec<(&'static str, String)>, CdcSpecError> {
+    let (Some(slot_name), Some(publication_name)) =
+        (dial.slot_name.as_deref(), dial.publication_name.as_deref())
+    else {
+        // `Dial::parse` requires both for PostgreSQL; a hand-built dial without
+        // them is refused the same way a bad name is.
+        return Err(CdcSpecError::InvalidReplicationName { field: "slotName" });
+    };
+    for (field, value) in [
+        ("slotName", slot_name),
+        ("publicationName", publication_name),
+    ] {
+        if !is_replication_name(value) {
+            return Err(CdcSpecError::InvalidReplicationName { field });
+        }
+    }
+    Ok(vec![
+        ("connector.class", POSTGRES_CONNECTOR_CLASS.to_owned()),
+        ("database.dbname", dial.database.clone()),
+        ("database.sslmode", dial.ssl_mode.as_debezium().to_owned()),
+        ("schema.include.list", schemas.join(",")),
+        ("plugin.name", "pgoutput".to_owned()),
+        ("slot.name", slot_name.to_owned()),
+        ("publication.name", publication_name.to_owned()),
+        ("publication.autocreate.mode", "disabled".to_owned()),
+    ])
+}
+
+/// The `MySQL` connector's own keys: class, server id, databases, TLS, and the
+/// schema-history topic.
+fn mysql_entries(
+    connector_id: &str,
+    dial: &CdcDial,
+    databases: &[&str],
+    bootstrap: Option<&str>,
+) -> Result<Vec<(&'static str, String)>, CdcSpecError> {
+    let server_id = dial.server_id.ok_or(CdcSpecError::NoServerId)?;
+    let mut entries = vec![
+        ("connector.class", MYSQL_CONNECTOR_CLASS.to_owned()),
+        ("database.server.id", server_id.to_string()),
+        ("database.include.list", databases.join(",")),
+        (
+            "database.ssl.mode",
+            mysql_ssl_mode(dial.ssl_mode).to_owned(),
+        ),
+        // No topic named after the prefix alone: the applier reads the table
+        // topics only.
+        ("include.schema.changes", "false".to_owned()),
+    ];
+    entries.extend(schema_history_entries(connector_id, bootstrap)?);
+    Ok(entries)
+}
+
+/// The `SQL Server` connector's own keys: class, database, TLS, and the
+/// schema-history topic.
+fn mssql_entries(
+    connector_id: &str,
+    dial: &CdcDial,
+    bootstrap: Option<&str>,
+) -> Result<Vec<(&'static str, String)>, CdcSpecError> {
+    let (encrypt, trust) = mssql_tls(dial.ssl_mode);
+    let mut entries = vec![
+        ("connector.class", SQLSERVER_CONNECTOR_CLASS.to_owned()),
+        ("database.names", dial.database.clone()),
+        ("database.encrypt", encrypt.to_owned()),
+        ("database.trustServerCertificate", trust.to_owned()),
+    ];
+    entries.extend(schema_history_entries(connector_id, bootstrap)?);
+    Ok(entries)
 }
 
 /// The two schema-history keys of a `MySQL` or `SQL Server` connector.

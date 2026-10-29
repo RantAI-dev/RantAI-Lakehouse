@@ -2130,7 +2130,9 @@ mod tests {
     #[test]
     fn cdc_kafka_bootstrap_is_unset_by_default_and_blank_counts_as_unset() {
         assert_eq!(
-            Config::from_map(&HashMap::new()).unwrap().cdc_kafka_bootstrap,
+            Config::from_map(&HashMap::new())
+                .unwrap()
+                .cdc_kafka_bootstrap,
             None
         );
         let cfg = Config::from_map(&map(&[("CDC_KAFKA_BOOTSTRAP", "")])).unwrap();
