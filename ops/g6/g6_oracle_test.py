@@ -210,9 +210,9 @@ def _insert_new_rows() -> None:
 
 def _check_reload(connector_id: str, first_count: int) -> None:
     """`reload` (`SRC-4` T1.3): new rows at the source, a second run, and only
-    those rows read. The run's own row count (`GET /api/governance/ingest-runs`,
-    what the run wrote) tells an incremental load from a `replace`, which would
-    also leave five rows in Bronze but read all five."""
+    those rows read. What the run wrote, from `GET /api/governance/ingest-runs`,
+    tells an incremental load from a `replace`, which would also leave five rows
+    in Bronze but read all five."""
     want = first_count + len(NEW_ROWS)
     try:
         _insert_new_rows()
