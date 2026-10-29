@@ -135,10 +135,27 @@ type OpenMultipart = (String, std::collections::BTreeMap<u32, Vec<u8>>);
 #[derive(Clone, Default)]
 struct Multiparts(Arc<Mutex<HashMap<String, OpenMultipart>>>);
 
+/// The range reads the fake bucket has served, and the number of them after
+/// which it refuses (`PR #187` review round 2 B1).
+///
+/// A store that fails while the child is fed is the reason the conversion
+/// did not finish, and it must not be reported as the file's own refusal.
+/// The count starts at the call that arms it, so a test can let the reads
+/// that come before the failure through.
+#[derive(Default)]
+struct RangeReads {
+    served: u64,
+    fail_after: Option<u64>,
+}
+
 /// What the fake bucket holds, by object key, and the multipart uploads it has
 /// open.
 #[derive(Clone, Default)]
-struct Bucket(Arc<Mutex<HashMap<String, Vec<u8>>>>, Multiparts);
+struct Bucket(
+    Arc<Mutex<HashMap<String, Vec<u8>>>>,
+    Multiparts,
+    Arc<Mutex<RangeReads>>,
+);
 
 impl Bucket {
     fn keys(&self) -> Vec<String> {
@@ -171,6 +188,35 @@ impl Bucket {
             .lock()
             .unwrap()
             .insert(key.to_owned(), bytes.to_vec());
+    }
+
+    /// Refuse the range reads after `count` of them have been served
+    /// (`PR #187` review round 2 B1).
+    ///
+    /// The count starts here: the reads before this call are served as they
+    /// were, and the read after the `count`-th one is refused. A refusal is
+    /// a 403 and not a 5xx, because `object_store` retries a 5xx for the
+    /// better part of a minute.
+    fn fail_range_reads_after(&self, count: u64) {
+        let mut reads = self.2.lock().unwrap();
+        reads.served = 0;
+        reads.fail_after = Some(count);
+    }
+
+    /// Serve every range read again: the store is well again.
+    fn serve_range_reads(&self) {
+        let mut reads = self.2.lock().unwrap();
+        reads.served = 0;
+        reads.fail_after = None;
+    }
+
+    /// Whether this range read must be refused: the reads are counted, and
+    /// the one after the count the test gave is refused.
+    fn refuses_this_range_read(&self) -> bool {
+        let mut reads = self.2.lock().unwrap();
+        let served = reads.served;
+        reads.served = served.saturating_add(1);
+        matches!(reads.fail_after, Some(limit) if served >= limit)
     }
 }
 
@@ -224,6 +270,11 @@ impl Respond for GetRange {
         let Some((start, end)) = range else {
             return object_headers(ResponseTemplate::new(200).set_body_bytes(bytes));
         };
+        // A range read is counted, so that a test can make the store fail
+        // while the child is fed (`PR #187` review round 2 B1).
+        if self.0.refuses_this_range_read() {
+            return ResponseTemplate::new(403).set_body_string(format!("{MARKER} <Error/>"));
+        }
         let end = end.min(bytes.len().saturating_sub(1));
         object_headers(
             ResponseTemplate::new(206)
@@ -8173,7 +8224,7 @@ async fn a_garbled_answer_from_a_killed_child_is_a_resource_limit() {
 }
 
 #[tokio::test]
-async fn a_store_failure_while_the_child_is_fed_is_a_503_and_not_the_file_s_fault() {
+async fn a_broken_store_is_a_503_and_not_the_file_s_fault() {
     let stack = Stack::start().await;
     let bayu = stack.bayu().await;
     let upload = stack
@@ -8181,7 +8232,8 @@ async fn a_store_failure_while_the_child_is_fed_is_a_503_and_not_the_file_s_faul
         .await;
     let id = id_of(&upload);
 
-    // The store is broken: the preview cannot feed the child the file.
+    // The store is broken: the preview cannot even read the list of the
+    // sheets it stored when the file arrived.
     break_bucket(&stack.s3).await;
     let reply = stack
         .get(&bayu, &format!("/api/uploads/{id}/preview"))
@@ -8199,6 +8251,131 @@ async fn a_store_failure_while_the_child_is_fed_is_a_503_and_not_the_file_s_faul
         "the store's own sentence: {}",
         reply.text
     );
+}
+
+/// A store that fails the read that FEEDS the child is the reason the
+/// conversion did not finish, and not the file's fault
+/// (`PR #187` review round 2 B1).
+#[tokio::test]
+async fn a_store_failure_while_a_workbook_is_fed_is_a_503_and_not_the_file_s_fault() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    let upload = stack
+        .upload(&bayu, "stock.xlsx", &workbook("stock.xlsx"))
+        .await;
+    let id = id_of(&upload);
+
+    // The store fails the read that feeds the child the workbook. The child
+    // is given a workbook that stops half way, and it refuses it: the store
+    // is the reason, and it is a 503.
+    stack.bucket.fail_range_reads_after(0);
+    let reply = stack
+        .get(&bayu, &format!("/api/uploads/{id}/preview"))
+        .await;
+    assert_eq!(
+        reply.status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "{}",
+        reply.text
+    );
+    assert!(
+        reply.json["error"]
+            .as_str()
+            .is_some_and(|sentence| sentence.starts_with("Upload storage is unavailable")),
+        "the store's own sentence: {}",
+        reply.text
+    );
+    assert!(
+        !reply.text.contains(NEEDS_MORE_MEMORY),
+        "the file is not at fault: {}",
+        reply.text
+    );
+}
+
+/// The same for a Parquet file, whose tail the child is fed by RANGES
+/// (`PR #187` review round 2 B1).
+#[tokio::test]
+async fn a_store_failure_while_a_parquet_file_is_fed_is_a_503_and_not_the_file_s_fault() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    let upload = stack
+        .upload(&bayu, "orders.parquet", &parquet_file("orders.parquet"))
+        .await;
+    let id = id_of(&upload);
+
+    // The store fails the read that feeds the child the file's tail.
+    stack.bucket.fail_range_reads_after(0);
+    let reply = stack
+        .get(&bayu, &format!("/api/uploads/{id}/preview"))
+        .await;
+    assert_eq!(
+        reply.status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "{}",
+        reply.text
+    );
+    assert!(
+        reply.json["error"]
+            .as_str()
+            .is_some_and(|sentence| sentence.starts_with("Upload storage is unavailable")),
+        "the store's own sentence: {}",
+        reply.text
+    );
+}
+
+/// A store that fails while a chunked upload is completed is a 503, and the
+/// user's file is still there: the completion may be retried
+/// (`PR #187` review round 2 B1). Before this round the failure was reported
+/// as the file's own refusal, and the completion DELETED the object and the
+/// row.
+#[tokio::test]
+async fn a_store_failure_while_a_chunked_upload_is_completed_keeps_the_file() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    let bytes = workbook("stock.xlsx");
+    let id = stack.session(&bayu, "stock.xlsx", bytes.len()).await;
+    for (index, piece) in bytes.chunks(8 * MIB).enumerate() {
+        let sent = stack
+            .put_part(&bayu, &id, &(index + 1).to_string(), piece)
+            .await;
+        assert_eq!(sent.status, StatusCode::OK, "{}", sent.text);
+    }
+
+    // The completion reads the head of the file (the sniff) and then feeds
+    // the child with the whole of it: the store fails the SECOND range read,
+    // which is the one that feeds the child.
+    stack.bucket.fail_range_reads_after(1);
+    let refused = stack.complete(&bayu, &id).await;
+    assert_eq!(
+        refused.status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "{}",
+        refused.text
+    );
+    assert!(
+        !refused.text.contains(NEEDS_MORE_MEMORY),
+        "the file is not at fault: {}",
+        refused.text
+    );
+
+    // The file is still there: the object and the row.
+    let key = format!("uploads/{GROUP}/{id}.xlsx");
+    assert!(
+        stack.bucket.keys().contains(&key),
+        "the refused file was deleted: {:?}",
+        stack.bucket.keys()
+    );
+    assert_eq!(stack.row_count(&id).await, 1, "the row was deleted");
+    assert_eq!(
+        stack.status_of(&id).await.0,
+        "receiving",
+        "the upload is still being received"
+    );
+
+    // The store is well again, and the retry completes the upload.
+    stack.bucket.serve_range_reads();
+    let again = stack.complete(&bayu, &id).await;
+    assert_eq!(again.status, StatusCode::OK, "{}", again.text);
 }
 
 #[tokio::test]

@@ -1346,9 +1346,11 @@ impl ConversionRunner {
         if let Answer::Refusal { refusal } = &answer {
             // The child refused the file: it is finished, and what it said
             // on its standard error is logged (`PR #187` review SHOULD-FIX
-            // 4).
-            let _ = self.wait(child, stderr, feed, deadline).await;
-            return Err(ConversionError::Refused(refusal.clone()));
+            // 4). The ending is waited for, because a store that failed
+            // while the file was fed is the REAL reason the child refused
+            // what it was given (`PR #187` review round 2 B1).
+            let ending = self.wait(child, stderr, feed, deadline).await;
+            return Err(refusal_wins_over_store(refusal, &ending));
         }
         // The rest of the output is text this operation does not produce; it
         // is read and dropped, so the child is never blocked on a full pipe.
@@ -1416,8 +1418,11 @@ impl ConversionRunner {
             feed,
         } = started;
         if let Answer::Refusal { refusal } = &answer {
-            let _ = self.wait(child, stderr, feed, deadline).await;
-            return Err(ConversionError::Refused(refusal.clone()));
+            // The ending is waited for, because a store that failed while
+            // the file was fed is the REAL reason the child refused what it
+            // was given (`PR #187` review round 2 B1).
+            let ending = self.wait(child, stderr, feed, deadline).await;
+            return Err(refusal_wins_over_store(refusal, &ending));
         }
         let mut text = Vec::new();
         let mut piece = [0_u8; 16 * 1024];
@@ -1516,7 +1521,13 @@ impl ConversionRunner {
             feed,
         } = started;
         if let Answer::Refusal { refusal } = &answer {
-            return Err(ConversionError::Refused(refusal.clone()));
+            // The ending is waited for, because a store that failed while
+            // the file was fed is the REAL reason the child refused what it
+            // was given (`PR #187` review round 2 B1). Before this round
+            // this path did not wait at all: the child was left behind, and
+            // a store failure was reported as the file's own refusal.
+            let ending = self.wait(child, stderr, feed, deadline).await;
+            return Err(refusal_wins_over_store(refusal, &ending));
         }
         // The text is written as a multipart upload that is NOT assembled
         // yet (`SEC-22` P2): the object at the key does not exist until the
@@ -1845,92 +1856,140 @@ async fn write_text_to_store(
 }
 
 /// Feed the child its file.
+///
+/// Two failures are told apart (`PR #187` review round 2 B1): a store that
+/// could not be read is [`ConversionError::Store`] — the file may well read
+/// once the store is back, and it is a 503 — and a pipe that broke is
+/// [`ConversionError::Refused`] with [`Refusal::ResourceLimit`]. Before this
+/// round every failure of the feed was a resource limit, so a store that was
+/// down was told to the user as a file that could not be read.
 async fn feed(mut stdin: ChildStdin, source: Source) -> Result<(), ConversionError> {
     let result = match source {
-        Source::Bytes(bytes) => stdin.write_all(&bytes).await,
-        Source::Stored { store, key } => {
-            let size = store
-                .object_size(&key)
-                .await
-                .map_err(ConversionError::Store)?;
-            let Some(size) = size else {
-                return Err(ConversionError::Store(UploadStoreError::Unavailable(
-                    "not found",
-                )));
-            };
-            let mut offset: u64 = 0;
-            let mut result = Ok(());
-            while offset < size {
-                let len = FEED_CHUNK_BYTES.min(size - offset);
-                let chunk = store
-                    .read_range(&key, offset, len)
-                    .await
-                    .map_err(ConversionError::Store)?;
-                if chunk.is_empty() {
-                    break;
-                }
-                if let Err(err) = stdin.write_all(&chunk).await {
-                    result = Err(err);
-                    break;
-                }
-                offset = offset.saturating_add(chunk.len() as u64);
-            }
-            result
-        }
-        Source::Parts { bytes, parts } => {
-            let mut result = Ok(());
-            for part in parts {
-                let from = usize::try_from(part.offset).unwrap_or(usize::MAX);
-                let to = from.saturating_add(usize::try_from(part.length).unwrap_or(usize::MAX));
-                let Some(slice) = bytes.get(from..to) else {
-                    result = Err(std::io::Error::other("a part outside the file"));
-                    break;
-                };
-                if let Err(err) = stdin.write_all(slice).await {
-                    result = Err(err);
-                    break;
-                }
-            }
-            result
-        }
+        Source::Bytes(bytes) => stdin.write_all(&bytes).await.map_err(pipe_failure),
+        Source::Stored { store, key } => feed_stored(&store, &key, &mut stdin).await,
+        Source::Parts { bytes, parts } => feed_parts(&bytes, &parts, &mut stdin).await,
         Source::StoredParts { store, key, parts } => {
-            let mut result = Ok(());
-            for part in parts {
-                if let Err(err) = feed_range(&store, &key, part, &mut stdin).await {
-                    result = Err(err);
-                    break;
-                }
-            }
-            result
+            feed_stored_parts(&store, &key, &parts, &mut stdin).await
         }
     };
     // The child's input ends here, so it can read the whole file.
     let _closed = stdin.shutdown().await;
-    result.map_err(|_err| ConversionError::Refused(Refusal::ResourceLimit))
+    result
+}
+
+/// The failure of the pipe to the child: the child is gone, or will not take
+/// the file. It is a resource limit (`SEC-22` D4), and never the store's.
+fn pipe_failure(_err: std::io::Error) -> ConversionError {
+    ConversionError::Refused(Refusal::ResourceLimit)
+}
+
+/// Feed the child a stored object, in pieces of [`FEED_CHUNK_BYTES`]: the API
+/// never holds more than one piece of it at a time.
+async fn feed_stored(
+    store: &UploadStore,
+    key: &str,
+    stdin: &mut ChildStdin,
+) -> Result<(), ConversionError> {
+    let size = store
+        .object_size(key)
+        .await
+        .map_err(ConversionError::Store)?;
+    let Some(size) = size else {
+        return Err(ConversionError::Store(UploadStoreError::Unavailable(
+            "not found",
+        )));
+    };
+    let mut offset: u64 = 0;
+    while offset < size {
+        let len = FEED_CHUNK_BYTES.min(size - offset);
+        let chunk = store
+            .read_range(key, offset, len)
+            .await
+            .map_err(ConversionError::Store)?;
+        if chunk.is_empty() {
+            break;
+        }
+        stdin.write_all(&chunk).await.map_err(pipe_failure)?;
+        offset = offset.saturating_add(chunk.len() as u64);
+    }
+    Ok(())
+}
+
+/// Feed the child parts of a file that is already in memory, in order.
+async fn feed_parts(
+    bytes: &Bytes,
+    parts: &[Part],
+    stdin: &mut ChildStdin,
+) -> Result<(), ConversionError> {
+    for part in parts {
+        let from = usize::try_from(part.offset).unwrap_or(usize::MAX);
+        let to = from.saturating_add(usize::try_from(part.length).unwrap_or(usize::MAX));
+        let Some(slice) = bytes.get(from..to) else {
+            // The parts are the API's own, and they lie about the file: that
+            // is a fault of this process and not of the file, and it is
+            // refused like any other broken input.
+            return Err(ConversionError::Refused(Refusal::ResourceLimit));
+        };
+        stdin.write_all(slice).await.map_err(pipe_failure)?;
+    }
+    Ok(())
+}
+
+/// Feed the child parts of a stored object, in order.
+async fn feed_stored_parts(
+    store: &UploadStore,
+    key: &str,
+    parts: &[Part],
+    stdin: &mut ChildStdin,
+) -> Result<(), ConversionError> {
+    for part in parts {
+        feed_range(store, key, *part, stdin).await?;
+    }
+    Ok(())
 }
 
 /// Feed the child one part of a stored object, in pieces of
 /// [`FEED_CHUNK_BYTES`]: the API never holds more than one piece at a time.
+///
+/// A store that could not be read is [`ConversionError::Store`] and a pipe
+/// that broke is a resource limit. The two are not the same fault, and the
+/// store's must not be reported as the file's (`PR #187` review round 2 B1).
 async fn feed_range(
     store: &UploadStore,
     key: &str,
     part: Part,
     stdin: &mut ChildStdin,
-) -> std::io::Result<()> {
+) -> Result<(), ConversionError> {
     let mut done: u64 = 0;
     while done < part.length {
         let len = FEED_CHUNK_BYTES.min(part.length - done);
         let chunk = store
             .read_range(key, part.offset.saturating_add(done), len)
             .await
-            .map_err(|_err| std::io::Error::other("the store could not be read"))?;
+            .map_err(ConversionError::Store)?;
         if chunk.is_empty() {
             break;
         }
-        stdin.write_all(&chunk).await?;
+        stdin.write_all(&chunk).await.map_err(pipe_failure)?;
         done = done.saturating_add(chunk.len() as u64);
     }
     Ok(())
+}
+
+/// The error a refusal is answered with: the child's own refusal, unless the
+/// store failed while the file was fed.
+///
+/// A store that failed is the REAL reason the child refused what it was
+/// given — it read a file that was cut short — and it is a 503: the file may
+/// well read once the store is back (`PR #187` review round 2 B1).
+fn refusal_wins_over_store(
+    refusal: &Refusal,
+    ending: &Result<(), ConversionError>,
+) -> ConversionError {
+    match ending {
+        Err(ConversionError::Store(err)) => ConversionError::Store(*err),
+        _ => ConversionError::Refused(refusal.clone()),
+    }
 }
 
 /// Whether `binary` is this API's own binary, which is what the child must
