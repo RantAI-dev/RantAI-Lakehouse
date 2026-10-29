@@ -18,6 +18,7 @@ from dispar_orchestrate.authored_factory import (
     authored_lag_sensors,
     authored_schedules,
 )
+from dispar_orchestrate.cdc_apply import cdc_apply_job, cdc_apply_sensors
 from dispar_orchestrate.capacity_snapshot import (
     capacity_snapshot_job,
     capacity_snapshot_schedule,
@@ -109,6 +110,8 @@ defs = Definitions(
         ingest_job,
         file_ingest_job,
         discover_job,
+        # SRC-4 slice 0 (measure/src-4-cdc, never merged): the change-capture applier.
+        cdc_apply_job,
         *authored_jobs,
     ],
     schedules=[
@@ -125,6 +128,7 @@ defs = Definitions(
         # lakehouse-api, so a schedule saved in the console needs no reload --
         # see `ingest_factory.py`'s "Schedules" section.
         ingest_schedule_sensor,
+        *cdc_apply_sensors,
         pipeline_run_failed_sensor,
         pipeline_run_finished_sensor,
         gold_export_after_authored_sensor,
