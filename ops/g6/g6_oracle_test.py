@@ -80,9 +80,9 @@ BRONZE_TABLE = "g6_oracle_orders"
 ORACLE_HOST = "oracle-g6"
 ORACLE_PORT = 1521
 # Where the connector dials: the TLS front, and the DN of its certificate (CN = the host name).
-ORACLE_TLS_HOST = "oracle-g6"
+ORACLE_TLS_HOST = "oracle-tls-g6"
 ORACLE_TLS_PORT = 2484
-ORACLE_TLS_DN = "CN=oracle-g6"
+ORACLE_TLS_DN = "CN=oracle-tls-g6"
 # The default pluggable database of the image; the application user exists
 # there, and the connector's `database` is its service name.
 ORACLE_SERVICE = "FREEPDB1"

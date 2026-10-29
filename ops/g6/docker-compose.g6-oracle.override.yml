@@ -93,12 +93,6 @@ services:
     image: gvenzl/oracle-free:23.26.2-slim-faststart@sha256:5e340d72c5cd93b5ce8bab6c128b8f37a5ec485d5d9d98dc2cdc5353fe640f96
     profiles: ["g6-oracle"]
     restart: "no"
-    depends_on:
-      oracle-g6-cert-init:
-        condition: service_completed_successfully
-    volumes:
-      - oracle_g6_tls:/etc/oracle-tls:ro
-      - ./ops/g6/oracle-enable-tcps.sh:/container-entrypoint-startdb.d/10-tcps.sh:ro
     environment:
       ORACLE_PASSWORD: ${ORACLE_G6_PASSWORD:?}
       APP_USER: g6_ingest
@@ -128,7 +122,7 @@ services:
     entrypoint: ["/bin/sh", "-c"]
     command:
       - >
-        test -f /out/ca.crt && test -f /out/server.pem && test -f /out/server.key && test -f /out/oracle.p12 ||
+        test -f /out/ca.crt && test -f /out/server.pem && test -f /out/server.key ||
         { for i in 1 2 3 4 5; do apk add --no-cache openssl >/dev/null && break; sleep 3; done;
         command -v openssl >/dev/null &&
         openssl req -x509 -newkey rsa:2048 -nodes -days 3650
@@ -136,25 +130,16 @@ services:
         -subj "/CN=oracle-g6-ca"
         -addext "basicConstraints=critical,CA:TRUE"
         -addext "keyUsage=critical,keyCertSign,cRLSign" &&
-        for NAME in server oracle; do
-        CN=$$( [ "$$NAME" = server ] && echo oracle-tls-g6 || echo oracle-g6 ) &&
         openssl req -new -newkey rsa:2048 -nodes
-        -keyout /out/$$NAME.key -out /out/$$NAME.csr
-        -subj "/CN=$$CN" &&
-        printf "subjectAltName=DNS:$$CN\nbasicConstraints=CA:FALSE\nextendedKeyUsage=serverAuth\nkeyUsage=digitalSignature,keyEncipherment\n" > /out/$$NAME.ext &&
-        openssl x509 -req -in /out/$$NAME.csr -days 3650
+        -keyout /out/server.key -out /out/server.csr
+        -subj "/CN=oracle-tls-g6" &&
+        printf "subjectAltName=DNS:oracle-tls-g6\nbasicConstraints=CA:FALSE\nextendedKeyUsage=serverAuth\nkeyUsage=digitalSignature,keyEncipherment\n" > /out/server.ext &&
+        openssl x509 -req -in /out/server.csr -days 3650
         -CA /out/ca.crt -CAkey /out/ca.key -CAcreateserial
-        -out /out/$$NAME.pem
-        -extfile /out/$$NAME.ext; done &&
-        openssl rand -hex 16 > /out/p12.pwd &&
-        openssl pkcs12 -export -in /out/oracle.pem -inkey /out/oracle.key -certfile /out/ca.crt
-        -name oracle -out /out/oracle.p12 -passout file:/out/p12.pwd
-        -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -macalg sha1 &&
-        openssl pkcs12 -export -in /out/oracle.pem -inkey /out/oracle.key -certfile /out/ca.crt
-        -name oracle -out /out/oracle-nopw.p12 -passout pass:
-        -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -macalg sha1 &&
-        rm -f /out/*.csr /out/*.ext /out/ca.key /out/ca.srl &&
-        chmod 644 /out/ca.crt /out/server.key /out/server.pem /out/oracle.key /out/oracle.pem /out/oracle.p12 /out/oracle-nopw.p12 /out/p12.pwd; }
+        -out /out/server.pem
+        -extfile /out/server.ext &&
+        rm -f /out/server.csr /out/server.ext /out/ca.key /out/ca.srl &&
+        chmod 644 /out/ca.crt /out/server.key /out/server.pem; }
 
   # SRC-4 T1.4: the TLS front of `oracle-g6` (`oracle-tls-proxy.conf` says why
   # a proxy and what it leaves unproven). `nginx:1.27-alpine` has the stream

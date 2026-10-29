@@ -361,6 +361,8 @@ for the job. Not started. The gate's `connect` step stays `refused` in
 
 **CI** (PR #264): run `40807707774` (first push, failed only `Repo lints`: the R11 lint matched a docstring; fixed in `322ccfc2`); run `40807993582` on `322ccfc2`: Repo lints, fmt, clippy, build, MSRV, Frontend, G1, G2, G3, G4, G8, G10, SRC-11/12/13/17, Dagster unit tests, images and the image smoke pass; `Rust · G6 Oracle connector` **passed in 4m16s** (the gate itself `PASS (77s)`; `connect` refused-as-expected, discover, load, reload pass; load: 3 rows, `NOTE` left out, over tcps; reload: 2 new rows read, 5 in Bronze). Remaining jobs at the time of writing: see the PR checks.
 
+- *Review round 1, SHOULD-FIX 2 (T1.4).* Oracle's own TCPS was attempted twice and is left unproven: first with `orapki` (the image has no Java, so no wallet), then with a PKCS#12 wallet made by `openssl` (the listener answered `ORA-28759` / `TNS-00566`, failed to open the wallet, and never came up on 2484). The gate is back on the nginx TLS terminator that passed; the honest note stays in `oracle-tls-proxy.conf`, the gate docstring and `coverage.json`.
+
 (Further entries follow, one per slice.)
 
 ## Review
