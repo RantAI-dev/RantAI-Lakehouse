@@ -72,9 +72,14 @@ commits to `feat/data-phase-4-src-4`.
   `ExtractNewRecordState` transform on the connector with
   `delete.handling.mode=rewrite` and `add.fields=op,source.ts_ms`, JSON
   without schemas. Modes:
-  - *current row per key*: `dlt` merge on the primary key, the `__deleted`
-    column hinted `hard_delete` so a delete removes the row; within one batch
-    only the last event per key is written.
+  - *current row per key*: within one batch only the last event per key
+    counts; the batch is applied in **one `pyiceberg` transaction of the
+    applier's own**, as `adapters/history.py` does: delete the batch's keys
+    from the table, then append the last version of each key whose last
+    event is not a delete. A delete event only deletes. Replaying a batch
+    gives the same table. The table is still created and evolved through
+    `sink`'s helpers. (Amendment 1: `dlt`'s `hard_delete` does nothing on
+    this path.)
   - *history*: append every event with `__op` and `__source_ts_ms`.
   A Dagster job `cdc_apply_job` (config: topic, table, key, mode) and a
   sensor that launches it when the topic has unconsumed messages,
@@ -239,6 +244,21 @@ the dashboards assistant (not a BI feature).
 ## Plan amendments
 
 (Each slice's detailed task list is added here before it is dispatched.)
+
+**Amendment 1 (2026-10-29, slice 0 developer's stop report, verified by the
+planner).** `dlt` 1.30.0's `hard_delete` hint is implemented only in its SQL
+merge jobs. The path `adapters/sink.py` uses (filesystem destination,
+`table_format=iceberg`) calls `dlt.common.libs.pyiceberg.merge_iceberg_table`,
+which accepts only the `upsert` and `insert-only` strategies and has no
+delete branch (`site-packages/dlt/common/libs/pyiceberg.py`, around :99-118;
+no `hard_delete` anywhere under `destinations/impl/filesystem/`). So T0.2's
+current mode applies each batch in one `pyiceberg` transaction of its own
+(delete the batch's keys, append the surviving last versions), the
+`history.py` pattern; a plain `sink.load_via_sink` call does not cover that
+mode. Rejected: keeping deletes as rows marked `__deleted` (fails decision 4);
+a `dlt` merge followed by a separate delete (two commits, a crash between them
+shows a half-applied batch). The existing `incremental_dedup` mode has the
+same limit (it never deletes); not in `SRC-4`'s scope, noted for the backlog.
 
 ## Handoff
 
