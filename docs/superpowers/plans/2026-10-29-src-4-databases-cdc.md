@@ -506,3 +506,16 @@ map, and the earlier "TLS" dial that sent `(PROTOCOL=TCP)` in clear text.
 - **Not a finding:** `g6-oracle` ran in about 3.5 min against 13-16 min in
   `SRC-9-RESULT.md`; the gate's own `PASS (77s)` and its step lines show
   nothing was skipped.
+
+### Slice 1, review round 2 (planner, 2026-10-29, head `89277bad`): closed
+
+CI 39/39 green on `89277bad` (`g6-oracle` 3m58s). BLOCKER 1 fixed: the Oracle
+connection test runs in the orchestrator as discovery kind `test` (migration
+0115 widens 0075's CHECK without editing it; `/test` answers `pending` with
+`ok: false`, never a success it has not seen; the result is recorded once, as a
+synchronous test is; a `test` cannot be started through the discovery route).
+SHOULD-FIX 2: Oracle's own TCPS listener was tried twice and did not start in
+the pinned image; the gate keeps the TLS terminator and says so (proxy config,
+gate docstring, `coverage.json`). SHOULD-FIX 3: the Oracle service name is
+validated as an identifier in the API and in the orchestrator. No open
+`BLOCKER`. Slice 1 is closed.
