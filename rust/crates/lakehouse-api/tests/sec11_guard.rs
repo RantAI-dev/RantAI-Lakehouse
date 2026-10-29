@@ -230,21 +230,6 @@ const ALLOWED: &[(&str, &str, &str)] = &[
     ),
     (
         "connectors.rs",
-        "dial does not parse as its own adapter {adapter:?}: {err}",
-        "IngestSpecError never echoes the dial's values",
-    ),
-    (
-        "connectors.rs",
-        "dial does not parse as a mongodb dial: {err}",
-        "IngestSpecError never echoes the dial's values",
-    ),
-    (
-        "connectors.rs",
-        "fields are invalid: {err}",
-        "debezium template validation's own message",
-    ),
-    (
-        "connectors.rs",
         "does not map to a valid CDC slug: {err}",
         "slug validation's own message",
     ),
