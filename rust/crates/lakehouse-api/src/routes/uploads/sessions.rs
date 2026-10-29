@@ -462,6 +462,10 @@ fn parts_digest(parts: &[UploadPart]) -> Option<Vec<u8>> {
 /// Remove a file the rules refused, object and row, and give the refusal back.
 /// A failed removal is logged: the sweep ([`crate::upload_sweep`]) finds the
 /// row again, which is why the row is deleted last.
+///
+/// Only a refusal of the FILE comes here: a refusal that a retry can answer
+/// differently (a busy installation, a store that is down) leaves the file
+/// where it is, so the retry finds it (`PR #187` review SHOULD-FIX 1).
 async fn refuse_and_remove(
     pool: &PgPool,
     store: &UploadStore,
@@ -555,7 +559,16 @@ pub async fn complete(
     };
     let facts = match open_whole(&state, &store, &row, accepted, declared).await {
         Ok(facts) => facts,
-        Err(refusal) => return Err(refuse_and_remove(pool, &store, &row, refusal).await.into()),
+        Err(refusal) => {
+            // Only a refusal of the FILE removes it (`PR #187` review
+            // SHOULD-FIX 1). A busy installation (429), a child that could
+            // not be started (500) and a store that is down (503) are all
+            // retryable, and the retry must find the file still there.
+            if matches!(refusal, ApiError::BadRequest(_)) {
+                return Err(refuse_and_remove(pool, &store, &row, refusal).await.into());
+            }
+            return Err(refusal.into());
+        }
     };
 
     let size = i64::try_from(declared).unwrap_or(i64::MAX);

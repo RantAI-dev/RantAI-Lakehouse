@@ -8023,6 +8023,46 @@ fn endless_child() -> std::path::PathBuf {
 }
 
 #[tokio::test]
+async fn a_busy_installation_does_not_delete_the_uploaded_file() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    let bytes = workbook("stock.xlsx");
+    let id = stack.session(&bayu, "stock.xlsx", bytes.len()).await;
+    for (index, piece) in bytes.chunks(8 * MIB).enumerate() {
+        let sent = stack
+            .put_part(&bayu, &id, &(index + 1).to_string(), piece)
+            .await;
+        assert_eq!(sent.status, StatusCode::OK, "{}", sent.text);
+    }
+    // The installation is busy: every place the user may hold is taken, so
+    // the completion is refused with a 429 (`PR #187` review SHOULD-FIX 1).
+    // The places are counted by the user's display name, which is what the
+    // upload row carries.
+    let held: Vec<_> = (0..4)
+        .map(|_| {
+            stack
+                .state
+                .upload_receive
+                .try_acquire("Bayu Pratama")
+                .expect("a place within the limit")
+        })
+        .collect();
+    let busy = stack.complete(&bayu, &id).await;
+    assert_eq!(busy.status, StatusCode::TOO_MANY_REQUESTS, "{}", busy.text);
+    drop(held);
+
+    // The file is still there: a retry finds it and completes it.
+    let key = format!("uploads/{GROUP}/{id}.xlsx");
+    assert!(
+        stack.bucket.keys().contains(&key),
+        "the refused file was not deleted: {:?}",
+        stack.bucket.keys()
+    );
+    let again = stack.complete(&bayu, &id).await;
+    assert_eq!(again.status, StatusCode::OK, "{}", again.text);
+}
+
+#[tokio::test]
 async fn an_endless_answer_line_is_refused_and_the_api_is_still_there() {
     let stack = Stack::with(Options {
         conversion_child: Some(endless_child()),
