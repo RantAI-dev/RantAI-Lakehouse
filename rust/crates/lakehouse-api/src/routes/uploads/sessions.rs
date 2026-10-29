@@ -34,8 +34,9 @@
 //! session reads no file, and completing a text file reads 64 KiB. Completing
 //! a Parquet file reads its footer — by the CHILD, which is given the tail
 //! of the file and not the file (`SEC-22` P1). Completing a workbook reads
-//! the whole object — but in the CHILD (`SEC-22` D1a), which reads it in
-//! pieces from the store, so the API holds none of it; that path takes a
+//! the whole object — but in the CHILD (`SEC-22` D1a): the API feeds the
+//! stored object to the child in pieces of 8 MiB, so the API holds one piece
+//! at a time and the child never reads the store (D1); that path takes a
 //! place too and is refused above [`super::MAX_UPLOAD_BYTES`]: a workbook
 //! stays at 50 MB (feature page, decision 9).
 //!
@@ -612,10 +613,11 @@ struct WholeFacts {
 }
 
 /// Open a workbook or a Parquet file, the way `POST /api/uploads` does before
-/// it stores one. A workbook is opened by the CHILD (`SEC-22` D1a), which
-/// reads it in pieces from the store; the read takes a `SEC-17` place (the
-/// child reads up to [`MAX_UPLOAD_BYTES`] at a time), and a workbook above
-/// that size is refused with the existing sentence; this is where a workbook's
+/// it stores one. A workbook is opened by the CHILD (`SEC-22` D1a): the API
+/// feeds the stored object to the child in pieces of 8 MiB, and the child
+/// never reads the store (D1); the read takes a `SEC-17` place (the child
+/// reads up to [`MAX_UPLOAD_BYTES`] at a time), and a workbook above that
+/// size is refused with the existing sentence; this is where a workbook's
 /// 50 MB limit stays when sessions accept more (feature page, decision 9). A
 /// Parquet file's footer is read by the CHILD as well (`SEC-22` P1), which is
 /// given the file's tail, and the file is not held. A text file is not read
@@ -683,8 +685,9 @@ async fn open_whole(
         // `SEC-22` D1a: the workbook is opened by the CHILD, never by this
         // process. A workbook declares how much memory its reader will want,
         // and an allocation failure ends the process that made it — so the
-        // API must not be the one making it. The child reads the stored
-        // object in pieces, so the API holds none of it.
+        // API must not be the one making it. The API feeds the stored object
+        // to the child in pieces of 8 MiB, so the API holds one piece at a
+        // time and the child never reads the store (D1).
         let source = Source::Stored {
             store: store.clone(),
             key: row.storage_key.clone(),

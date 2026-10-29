@@ -193,8 +193,9 @@ pub const DEFAULT_MEMORY_MIB: u32 = 1280;
 /// The measurement of `SEC-22` T5 took 82.9 s of wall-clock time for the
 /// largest allowed workbook, in a BUILD WITHOUT OPTIMISATIONS: the
 /// dependencies of the parser are unoptimised there, and the deployment's
-/// binary is not. The release build was not measured, so the headroom of
-/// this limit is not proven (`SEC-22` T5, handoff).
+/// binary is not. The RELEASE build takes 6.10 s of CPU for the same
+/// workbook, so the headroom of this limit is proven
+/// (`docs/plans/SEC-22-RESULT.md`).
 pub const DEFAULT_CPU_SECONDS: u64 = 60;
 
 /// The most text a conversion may produce: 512 MiB (`SEC-22` D6, the number

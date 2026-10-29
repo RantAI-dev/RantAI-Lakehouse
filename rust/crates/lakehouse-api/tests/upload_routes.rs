@@ -4528,7 +4528,7 @@ async fn a_workbook_ingest_that_cannot_convert_claims_nothing_and_launches_nothi
             format!("uploads/{GROUP}/{id}.xlsx.converted.4.json"),
             format!("uploads/{GROUP}/{id}.xlsx.sheets.json"),
         ],
-        "no converted object for a sheet that could not be converted"
+        "only the empty sheet was converted; no sheet that could not be converted was"
     );
 }
 
@@ -8568,6 +8568,11 @@ async fn an_upload_without_a_list_of_sheets_is_listed_once_and_stores_it() {
         stack.bucket.keys().contains(&format!("{key}.sheets.json")),
         "the list of the sheets is stored: {:?}",
         stack.bucket.keys()
+    );
+    assert_eq!(
+        stack.state.conversion_runner.runs(),
+        2,
+        "the first preview ran two children: the listing of the sheets and the conversion of the sheet"
     );
     let runs = stack.state.conversion_runner.runs();
 

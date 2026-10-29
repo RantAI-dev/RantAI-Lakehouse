@@ -73,7 +73,7 @@ memory allocation of 192000000000 bytes failed
 Aborted (exit 134)
 ```
 
-The `.xls` case needs no fixture
+## The `.xls` case needs no fixture
 
 `SEC-22`'s plan asks for an `.xls` whose shared string table declares a huge
 count, *if the reader reads that count*. `calamine` 0.37 does not:
