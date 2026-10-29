@@ -230,3 +230,51 @@ def test_a_listed_upper_case_table_name_is_spelled_the_way_sqlalchemy_reflects_i
         resolve_checked=_resolve,
     )
     assert captured[0]["table_names"] == ["employees", "MixedCase", "orders"]
+
+
+def test_column_names_from_the_preview_are_mapped_to_the_spelling_dlt_reflects():
+    # SRC-4 T1.2/T1.3: the console offers Oracle's own `NOTE`, `ID`, `CREATED_AT`; the
+    # reflected table says `note`, `id`, `created_at`. A name kept in the preview's spelling
+    # would leave nothing out and fail to find the cursor column (`table.c[...]`).
+    from dispar_orchestrate.adapters.oracle import in_reflected_spelling
+
+    obj = {
+        "name": "HR.ORDERS",
+        "target": "orders",
+        "excludedColumns": ["NOTE", "Mixed", "already_lower"],
+        "primaryKey": ["ID", "REGION"],
+        "incrementalKey": " CREATED_AT ",
+        "loadMode": "incremental_dedup",
+    }
+    changed = in_reflected_spelling(obj)
+    assert changed["excludedColumns"] == ["note", "Mixed", "already_lower"]
+    assert changed["primaryKey"] == ["id", "region"]
+    assert changed["incrementalKey"] == "created_at"
+    # The object's own name is not a column: untouched, and the input is not modified.
+    assert changed["name"] == "HR.ORDERS" and obj["incrementalKey"] == " CREATED_AT "
+
+
+def test_an_object_without_column_names_passes_through_unchanged():
+    from dispar_orchestrate.adapters.oracle import in_reflected_spelling
+
+    obj = {"name": "ORDERS", "target": "orders"}
+    assert in_reflected_spelling(obj) == obj
+
+
+def test_a_column_left_out_by_its_oracle_spelling_is_left_out_of_the_load():
+    # Through the gate's own function: `NOTE` from the console must remove the reflected `note`.
+    from dispar_orchestrate import schema_observer
+    from dispar_orchestrate.adapters.oracle import in_reflected_spelling
+    from dispar_orchestrate.ingest_factory import _leave_out_columns
+
+    reflected = schema_observer.ReflectedTable(
+        columns=(
+            schema_observer.ReflectedColumn(name="id", type_name="NUMBER", nullable=False),
+            schema_observer.ReflectedColumn(name="note", type_name="VARCHAR2", nullable=True),
+        ),
+        primary_key=("id",),
+    )
+    decision = schema_observer.Decision(action="load", columns=None, changes=[])
+    excluded = frozenset(in_reflected_spelling({"excludedColumns": ["NOTE"]})["excludedColumns"])
+    kept, left_out = _leave_out_columns(decision, reflected, excluded)
+    assert left_out == 1 and kept.columns == ["id"]

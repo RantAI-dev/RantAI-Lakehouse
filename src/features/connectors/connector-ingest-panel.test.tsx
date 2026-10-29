@@ -1318,7 +1318,7 @@ describe("ConnectorIngestPanel column choice", () => {
     expect(await screen.findByText(/Left out: discount\. Cannot read the columns · The source could not be read\./)).toBeDefined()
   })
 
-  it.each(["mysql", "mssql"])("is offered for the %s driver too", async (driver) => {
+  it.each(["mysql", "mssql", "oracle"])("is offered for the %s driver too", async (driver) => {
     stubFetch(saved({}, { ...SPEC, dial: { ...SPEC.dial, driver } }), undefined, { discovered: FOUND })
     render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
     await openColumns()
@@ -1326,7 +1326,6 @@ describe("ConnectorIngestPanel column choice", () => {
   })
 
   it.each([
-    ["Oracle", { ...SPEC, dial: { ...SPEC.dial, driver: "oracle" } }],
     ["files", { ...SPEC, adapter: "files", dial: {} }],
     ["REST", { ...SPEC, adapter: "rest", dial: {} }],
   ])("says column choice is not available for a %s source and offers no column list", async (_label, spec) => {

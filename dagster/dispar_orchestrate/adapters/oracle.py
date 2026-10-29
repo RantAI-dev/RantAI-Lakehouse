@@ -149,6 +149,33 @@ def connection_parts(
     return credentials, engine_kwargs, resolved
 
 
+def in_reflected_spelling(obj: dict) -> dict:
+    """A copy of a source object whose column names (`excludedColumns`,
+    `incrementalKey`, `primaryKey`) are spelled the way `sql_database` reflects
+    them (`SRC-4` T1.2, T1.3).
+
+    The console takes column names from the preview (`discover.py _oracle`),
+    which reads Oracle's own spelling, `CREATED_AT`. SQLAlchemy's Oracle dialect
+    reports an all-upper-case name in lower case, so the reflected table, the
+    rows and the cursor lookup (`table.c[...]`) say `created_at`, and a name left
+    in the preview's spelling would leave nothing out (`ingest_factory.
+    _leave_out_columns` compares exact names) or fail to find its cursor column.
+    The dialect's own `normalize_name` is the same map `build_source` uses for
+    table names, so a name that is already lower case, or a quoted mixed-case
+    one, passes through unchanged.
+    """
+    normalize = OracleDialect_oracledb().normalize_name
+    changed = dict(obj)
+    for field in ("excludedColumns", "primaryKey"):
+        names = obj.get(field)
+        if isinstance(names, (list, tuple)):
+            changed[field] = [normalize(n) if isinstance(n, str) else n for n in names]
+    cursor = obj.get("incrementalKey")
+    if isinstance(cursor, str) and cursor.strip():
+        changed["incrementalKey"] = normalize(cursor.strip())
+    return changed
+
+
 def build_source(
     spec: dict,
     secrets: dict[str, str],

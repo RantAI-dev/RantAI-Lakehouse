@@ -234,15 +234,16 @@ export function loadModeProblem(selected: {
 
 /**
  * `SRC-11` decision 9: the sources whose columns the product lists before loading, so a column can be left
- * out: `sql` connectors on the PostgreSQL, MySQL (MariaDB uses it) or SQL Server driver. Oracle is listed by
- * `SRC-13` but the API refuses `excludedColumns` for it (`validate_excluded_columns`), so it is not offered here;
- * files, REST, MongoDB, Kafka and SFTP have no declared column list to choose from. Business apps (`saas`, `SRC-3`
+ * out: `sql` connectors on the PostgreSQL, MySQL (MariaDB uses it), SQL Server or Oracle driver (Oracle since
+ * `SRC-4` T1.2: `SRC-13` lists its columns and the orchestrator maps their spelling to the reflected one, as
+ * `supports_column_choice` in `ingest_spec.rs` says); files, REST, MongoDB, Kafka and SFTP have no declared column
+ * list to choose from. Business apps (`saas`, `SRC-3`
  * AD6) are offered it too: a vendor that describes its fields lists them. The columns come from the
  * preview route (`useColumnPreviews`), also for a table saved in an earlier visit.
  */
 export function supportsColumnChoice(adapter: string, dial: Dial | null | undefined): boolean {
   const driver = typeof dial?.driver === "string" ? dial.driver : ""
-  return adapter === "saas" || (adapter === "sql" && (driver === "postgres" || driver === "mysql" || driver === "mssql"))
+  return adapter === "saas" || (adapter === "sql" && (driver === "postgres" || driver === "mysql" || driver === "mssql" || driver === "oracle"))
 }
 
 /**

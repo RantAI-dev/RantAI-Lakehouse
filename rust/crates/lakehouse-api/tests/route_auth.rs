@@ -924,9 +924,11 @@ async fn seeded_data_engineer_may_get_and_put_ingest_spec() {
 }
 
 /// `SRC-11` decisions D9 and D11 at the route: leaving columns out is refused
-/// with a 422 for a source type that cannot list its columns (Oracle) and for a
-/// key column of a deduplicating table, and a malformed list is a 400. All
-/// three are refused before the address check or any write, so no connection
+/// with a 422 for the key column of a deduplicating table (on `PostgreSQL`, and
+/// on Oracle since `SRC-4` T1.2 made column choice available for it; the
+/// refusal for a source that cannot list its columns is the unit test
+/// `excluded_columns_are_accepted_only_for_sources_that_list_their_columns`),
+/// and a malformed list is a 400. All three are refused before the address check or any write, so no connection
 /// is made and nothing is stored.
 #[tokio::test]
 async fn ingest_spec_put_refuses_excluded_columns_the_source_cannot_honour() {
@@ -956,7 +958,8 @@ async fn ingest_spec_put_refuses_excluded_columns_the_source_cannot_honour() {
         (
             "oracle",
             serde_json::json!([{
-                "name": "APP.ORDERS", "target": "orders", "excludedColumns": ["NOTE"]
+                "name": "APP.ORDERS", "target": "orders", "loadMode": "replace_dedup",
+                "primaryKey": ["ID"], "excludedColumns": ["ID"]
             }]),
             StatusCode::UNPROCESSABLE_ENTITY,
         ),

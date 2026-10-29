@@ -1681,7 +1681,7 @@ pub const fn supports_column_choice(dial: &Dial) -> bool {
     matches!(
         dial,
         Dial::Sql(SqlDial {
-            driver: SqlDriver::Postgres | SqlDriver::Mysql | SqlDriver::Mssql,
+            driver: SqlDriver::Postgres | SqlDriver::Mysql | SqlDriver::Mssql | SqlDriver::Oracle,
             ..
         }) | Dial::Saas(_)
     )
@@ -3487,14 +3487,15 @@ mod target_identity_tests {
         .expect("valid sql dial")
     }
 
-    /// `SRC-11` D9: column choice for the four sources that list columns
-    /// before loading; a refusal for Oracle, change capture and the rest.
+    /// `SRC-11` D9 and `SRC-4` T1.2: column choice for the four SQL drivers
+    /// that list columns before loading (Oracle since `SRC-4`); a refusal for
+    /// change capture and the rest.
     #[test]
     fn excluded_columns_are_accepted_only_for_sources_that_list_their_columns() {
         let objects = serde_json::json!([
             { "name": "public.orders", "target": "orders", "excludedColumns": ["note"] }
         ]);
-        for driver in ["postgres", "mysql", "mssql"] {
+        for driver in ["postgres", "mysql", "mssql", "oracle"] {
             assert_eq!(
                 validate_excluded_columns(&sql_dial_of(driver), &objects),
                 Ok(()),
@@ -3504,10 +3505,6 @@ mod target_identity_tests {
         let refused = Err(InvalidExcludedColumns::NotForSource {
             name: "public.orders".to_owned(),
         });
-        assert_eq!(
-            validate_excluded_columns(&sql_dial_of("oracle"), &objects),
-            refused
-        );
         let cdc = Dial::parse(
             "cdc",
             &serde_json::json!({
@@ -3519,6 +3516,7 @@ mod target_identity_tests {
         .expect("valid cdc dial");
         assert_eq!(validate_excluded_columns(&cdc, &objects), refused);
         assert!(supports_column_choice(&sql_dial_of("postgres")));
+        assert!(supports_column_choice(&sql_dial_of("oracle")));
         assert!(!supports_column_choice(&cdc));
     }
 
