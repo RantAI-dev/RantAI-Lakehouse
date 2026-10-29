@@ -2173,8 +2173,10 @@ async fn layout_sample(
 /// it (UTF-8, comma).
 ///
 /// The sheet is converted ONCE and stored (`SEC-22` D5); the preview reads
-/// the stored text, exactly as it reads a text upload, so a second preview —
-/// a header row the user changed, say — runs no child at all.
+/// the stored text, exactly as it reads a text upload — the first
+/// [`PREVIEW_BYTES`] of it for the preview, and the first
+/// [`columns::SAMPLE_BYTES`] for the guess — so a second preview, a header
+/// row the user changed, say, runs no child at all.
 async fn workbook_preview(
     state: &AppState,
     store: &UploadStore,
@@ -2217,7 +2219,16 @@ async fn workbook_preview(
     let head = store.head_bytes(&text_key, PREVIEW_BYTES).await?;
     let cut = size.unwrap_or(0) > u64::try_from(PREVIEW_BYTES).unwrap_or(u64::MAX);
     let preview = upload_parse::preview(&head, cut, overrides, PREVIEW_ROWS);
-    let rows = upload_parse::sample_records(&head, cut, preview.using, columns::SAMPLE_ROWS);
+    // The guess reads more than the preview shows (decision 1): up to
+    // [`columns::SAMPLE_BYTES`], and of that the first 10,000 data rows —
+    // the text path's sample, of the stored text. It fell to the preview's
+    // 256 KiB when the workbook's text became stored text
+    // (`PR #187` review SHOULD-FIX 2), so a wide sheet was guessed from far
+    // fewer rows than the same sheet as a CSV.
+    let sample_bytes = columns::SAMPLE_BYTES;
+    let wide = store.head_bytes(&text_key, sample_bytes).await?;
+    let wide_cut = size.unwrap_or(0) > u64::try_from(sample_bytes).unwrap_or(u64::MAX);
+    let rows = upload_parse::sample_records(&wide, wide_cut, preview.using, columns::SAMPLE_ROWS);
     let sample = Sample {
         header: preview.columns.clone(),
         rows,
