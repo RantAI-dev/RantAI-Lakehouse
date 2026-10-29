@@ -58,7 +58,7 @@ url = "2"
 ipnet = "2"
 # `SEC-22`: the child process that reads an uploaded workbook or a Parquet
 # file (`lakehouse-api::upload_convert`) sets its OWN resource limits
-# (`RLIMIT_AS`, `RLIMIT_CPU`) before it reads anything, so a crafted file
+# (`RLIMIT_DATA`, `RLIMIT_CPU`) before it reads anything, so a crafted file
 # that asks for more memory than the machine has ends the child and never
 # the API. `nix` does that without `unsafe` (`Command::pre_exec` is the
 # other way). Already in `Cargo.lock` (0.31.3) through other crates, so the

@@ -596,6 +596,9 @@ struct Options {
     /// `SEC-22` D6: the output cap the child is given. The real one is
     /// 512 MiB, which no test writes.
     conversion_output_cap: Option<u64>,
+    /// `SEC-22` D3: the wall-clock limit of one conversion. The real one is
+    /// 90 s, and no test waits for that.
+    conversion_wall: Option<Duration>,
     /// `SEC-22` P1: the bounds the child is given for a Parquet file: the
     /// bytes of the file's end, and the bytes of its first row group. The
     /// real ones are 16 MiB and 64 MiB, and no test writes those.
@@ -614,6 +617,7 @@ impl Default for Options {
             upload_max_conversions: None,
             conversion_child: None,
             conversion_output_cap: None,
+            conversion_wall: None,
             conversion_parquet_limits: None,
             conversion_text_limit: None,
         }
@@ -719,6 +723,7 @@ impl Stack {
         }
         let child = options.conversion_child.clone();
         let output_cap = options.conversion_output_cap;
+        let wall = options.conversion_wall;
         let parquet_limits = options.conversion_parquet_limits;
         let text_limit = options.conversion_text_limit;
         let (app, state) = spin_up_with_state(&env, |state| {
@@ -729,6 +734,9 @@ impl Stack {
             }
             if let Some(cap) = output_cap {
                 state.conversion_runner = state.conversion_runner.with_max_output_bytes(cap);
+            }
+            if let Some(wall) = wall {
+                state.conversion_runner = state.conversion_runner.with_wall(wall);
             }
             if let Some((tail, group)) = parquet_limits {
                 state.conversion_runner = state.conversion_runner.with_parquet_limits(tail, group);
@@ -860,6 +868,30 @@ impl Stack {
             Payload::Json(body),
         )
         .await
+    }
+
+    /// Put an upload of `tenant` in the store and its bytes in the bucket,
+    /// without going through the route, as an upload made before `SEC-22`:
+    /// no list of the sheets, no converted text.
+    async fn seed_workbook(&self, tenant: &str, id: &str, bytes: &[u8]) -> Upload {
+        let tenant_id: Uuid = tenant.parse().unwrap();
+        let key = format!("uploads/{tenant_id}/{id}.xlsx");
+        self.bucket.put(&key, bytes);
+        uploads::insert(
+            &self.app.pool,
+            &NewUpload {
+                id,
+                original_filename: "stock.xlsx",
+                storage_key: &key,
+                content_type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                size_bytes: i64::try_from(bytes.len()).unwrap(),
+                sha256: &sha256_hex(bytes),
+                uploaded_by: "Seeded Uploader",
+                tenant_id,
+            },
+        )
+        .await
+        .unwrap()
     }
 
     /// Put an upload of `tenant` in the store and its bytes in the bucket,
@@ -7817,6 +7849,10 @@ async fn a_hostile_parquet_file_is_refused_with_the_readers_own_reason() {
     assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.text);
     assert_eq!(reply.json["error"], UNREADABLE_PARQUET, "{}", reply.text);
     assert_eq!(stack.bucket.keys(), [] as [String; 0]);
+
+    // The API is still there: the next request answers normally.
+    let upload = stack.upload(&bayu, "a.csv", b"a,b\n1,2\n").await;
+    assert_eq!(upload["status"], "uploaded");
 }
 
 #[tokio::test]
@@ -8273,6 +8309,74 @@ async fn a_child_killed_mid_stream_leaves_no_converted_text() {
 }
 
 #[tokio::test]
+async fn an_upload_without_a_list_of_sheets_is_listed_once_and_stores_it() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    // An upload made before `SEC-22`: no list of the sheets, no converted
+    // text.
+    let id = "up-legacy-1";
+    stack
+        .seed_workbook(GROUP, id, &workbook("stock.xlsx"))
+        .await;
+    let uri = format!("/api/uploads/{id}/preview");
+    let first = stack.get(&bayu, &uri).await;
+    assert_eq!(first.status, StatusCode::OK, "{}", first.text);
+    let key = format!("uploads/{GROUP}/{id}.xlsx");
+    assert!(
+        stack.bucket.keys().contains(&format!("{key}.sheets.json")),
+        "the list of the sheets is stored: {:?}",
+        stack.bucket.keys()
+    );
+    let runs = stack.state.conversion_runner.runs();
+
+    // The next preview runs no child: the list and the text are stored.
+    let second = stack.get(&bayu, &uri).await;
+    assert_eq!(second.status, StatusCode::OK, "{}", second.text);
+    assert_eq!(
+        stack.state.conversion_runner.runs(),
+        runs,
+        "the second preview ran no child"
+    );
+}
+
+#[tokio::test]
+async fn deleting_an_upload_removes_the_converted_text_of_an_older_upload() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    let id = "up-legacy-2";
+    stack
+        .seed_workbook(GROUP, id, &workbook("stock.xlsx"))
+        .await;
+    let key = format!("uploads/{GROUP}/{id}.xlsx");
+    // The converted text of an upload made before `SEC-22`.
+    stack
+        .bucket
+        .put(&format!("{key}.converted.csv"), b"a,b\n1,2\n");
+    assert!(
+        stack
+            .bucket
+            .keys()
+            .contains(&format!("{key}.converted.csv"))
+    );
+
+    let gone = stack
+        .send(
+            &bayu,
+            "DELETE",
+            &format!("/api/uploads/{id}"),
+            Payload::None,
+        )
+        .await;
+    assert_eq!(gone.status, StatusCode::NO_CONTENT, "{}", gone.text);
+    let keys = stack.bucket.keys();
+    assert!(
+        !keys.contains(&format!("{key}.converted.csv")),
+        "the converted text of the older upload is gone: {keys:?}"
+    );
+    assert!(!keys.contains(&key), "the upload itself is gone: {keys:?}");
+}
+
+#[tokio::test]
 async fn a_second_preview_of_a_workbook_reads_the_stored_text_and_runs_no_child() {
     let stack = Stack::start().await;
     let bayu = stack.bayu().await;
@@ -8371,7 +8475,18 @@ async fn a_conversion_that_is_already_running_makes_the_next_one_a_429() {
     let bayu = stack.bayu().await;
     // The first request holds the only slot: its child takes its time.
     let first = stack.spawn_upload(&bayu, "stock.xlsx", &workbook("stock.xlsx"));
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Wait for the child to be running: a fixed sleep is a race, and this
+    // test must not flake (`PR #187` review SHOULD-FIX 8).
+    for _ in 0..200 {
+        if stack.state.conversion_runner.runs() >= 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        stack.state.conversion_runner.runs() >= 1,
+        "the child of the first request is running"
+    );
 
     let second = stack
         .send(
@@ -8396,6 +8511,70 @@ async fn a_conversion_that_is_already_running_makes_the_next_one_a_429() {
 
     // The held request is dropped: its child is killed with it.
     first.abort();
+}
+
+/// A stand-in for the child that takes its time and writes its process id
+/// where the test can see it: the test then proves the child is gone.
+fn slow_child_with_pid(pid_file: &std::path::Path) -> std::path::PathBuf {
+    let dir = tempfile::tempdir().expect("a temporary directory for the stand-in child");
+    let path = dir.path().join("slow-child");
+    std::fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\necho $$ > {pid}\nexec sleep 30\n",
+            pid = pid_file.display()
+        ),
+    )
+    .expect("the stand-in child is written");
+    let mut permissions = std::fs::metadata(&path)
+        .expect("the stand-in child exists")
+        .permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        permissions.set_mode(0o755);
+    }
+    std::fs::set_permissions(&path, permissions).expect("the stand-in child is executable");
+    // The directory is removed when it goes out of scope; the child has
+    // already been read by then, and the API starts it by path.
+    std::mem::forget(dir);
+    path
+}
+
+#[tokio::test]
+async fn a_conversion_past_its_wall_clock_is_refused_and_leaves_no_child() {
+    let dir = tempfile::tempdir().expect("a temporary directory for the pid");
+    let pid_file = dir.path().join("pid");
+    let stack = Stack::with(Options {
+        conversion_child: Some(slow_child_with_pid(&pid_file)),
+        conversion_wall: Some(Duration::from_secs(1)),
+        ..Options::default()
+    })
+    .await;
+    let bayu = stack.bayu().await;
+    let reply = stack
+        .send(
+            &bayu,
+            "POST",
+            "/api/uploads",
+            file_form("stock.xlsx", "text/csv", &workbook("stock.xlsx")),
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.text);
+    assert_eq!(reply.json["error"], NEEDS_MORE_MEMORY, "{}", reply.text);
+
+    // The child is gone: the API killed it with the request that gave up
+    // on it (`SEC-22` D3).
+    let pid = std::fs::read_to_string(&pid_file)
+        .expect("the child wrote its process id")
+        .trim()
+        .to_owned();
+    let alive = std::process::Command::new("kill")
+        .arg("-0")
+        .arg(&pid)
+        .status()
+        .is_ok_and(|status| status.success());
+    assert!(!alive, "the child {pid} is still alive");
 }
 
 #[tokio::test]

@@ -645,8 +645,9 @@ fn conversion_error(kind: FileKind, err: ConversionError) -> ApiError {
 ///
 /// # Errors
 ///
-/// 400 with the child's own sentence for a file that cannot be read; 503
-/// when the object store is unavailable.
+/// 400 with the child's own sentence for a file that cannot be read; 429
+/// when every conversion slot is taken; 500 when the child could not be
+/// started; 503 when the object store is unavailable.
 async fn sheets_of(
     state: &AppState,
     store: &UploadStore,
@@ -2828,8 +2829,9 @@ async fn check_parquet_footer(state: &AppState, row: &Upload) -> Result<(), ApiE
 /// # Errors
 ///
 /// 400 with the child's own sentence for a file that cannot be read, a sheet
-/// the workbook does not have, or a sheet with no cells; 503 when the object
-/// store is unavailable.
+/// the workbook does not have, or a sheet with no cells; 429 when every
+/// conversion slot is taken; 500 when the child could not be started; 503
+/// when the object store is unavailable.
 async fn convert_upload(
     state: &AppState,
     row: &Upload,
