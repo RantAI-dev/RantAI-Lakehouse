@@ -28,18 +28,34 @@
     ADMIN="${TNS_ADMIN:-$ORACLE_HOME/network/admin}"
     WALLET=/opt/oracle/tcps-wallet
     mkdir -p "$ADMIN"
+    # The same text, byte for byte, that the first attempt's listener accepted (it started on 1521 and only
+    # refused the missing wallet); the two attempts after it built the file with `echo` and the listener
+    # answered TNS-01150 / NL-00303 for every one, the plain fallback included, so what they were trying was
+    # never tested.
     write_listener() {
-        local tcps="$1"
-        {
-            echo "LISTENER = (DESCRIPTION_LIST = (DESCRIPTION ="
-            echo "  (ADDRESS = (PROTOCOL = TCP)(HOST = 0.0.0.0)(PORT = 1521))"
-            [ "$tcps" = yes ] && echo "  (ADDRESS = (PROTOCOL = TCPS)(HOST = 0.0.0.0)(PORT = 2484))"
-            echo ")))"
-            if [ "$tcps" = yes ]; then
-                echo "WALLET_LOCATION = (SOURCE = (METHOD = FILE)(METHOD_DATA = (DIRECTORY = $WALLET)))"
-                echo "SSL_CLIENT_AUTHENTICATION = FALSE"
-            fi
-        } > "$ADMIN/listener.ora"
+        if [ "$1" = yes ]; then
+            cat > "$ADMIN/listener.ora" <<LISTENER
+LISTENER =
+  (DESCRIPTION_LIST =
+    (DESCRIPTION =
+      (ADDRESS = (PROTOCOL = TCP)(HOST = 0.0.0.0)(PORT = 1521))
+      (ADDRESS = (PROTOCOL = TCPS)(HOST = 0.0.0.0)(PORT = 2484))
+    )
+  )
+WALLET_LOCATION =
+  (SOURCE = (METHOD = FILE)(METHOD_DATA = (DIRECTORY = $WALLET)))
+SSL_CLIENT_AUTHENTICATION = FALSE
+LISTENER
+        else
+            cat > "$ADMIN/listener.ora" <<LISTENER
+LISTENER =
+  (DESCRIPTION_LIST =
+    (DESCRIPTION =
+      (ADDRESS = (PROTOCOL = TCP)(HOST = 0.0.0.0)(PORT = 1521))
+    )
+  )
+LISTENER
+        fi
     }
     try_wallet() {
         local label="$1" p12="$2"
