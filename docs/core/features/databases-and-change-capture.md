@@ -6,7 +6,7 @@
 | Backlog | `SRC-4` |
 | Kind | Feature |
 | Spec | `docs/core/specs/src-4.md`. This page follows it row by row; three of its "Today" cells are out of date and are corrected under Problem. Its one *(proposed)* number, the 15-minute lag alert, is decision 7 |
-| Status | Planned. Decisions below are the planner's defaults, awaiting the product owner's signature. **Waits for `SEC-14` part B** (#192, draft) for any code that dials a source (decision 10) |
+| Status | Planned. Decisions below are the planner's defaults, awaiting the product owner's signature. Nothing blocks it any more: `SEC-14` part B merged in #192 on 2026-10-28 (decision 10) |
 | Priority | P2 |
 | Owner | The module's owner, in the base. Not named here (the repo is public). |
 | Acceptor | Who runs the acceptance checklist; not the Owner. Held in the base. |
@@ -102,7 +102,7 @@ to the AI team in `AI-16`.
 | 7 | Lag alert | Per connector, default **15 minutes** (the spec's proposal), changeable on the connector; sent through the `SRC-7` alert channels as a new kind `connector_lag`, once when crossed and once when back under | |
 | 8 | Oracle batch | Add a connection test, column choice, incremental loads and an encrypted dial (native network encryption or TLS, as the source offers), each in the `g6-oracle` gate. The Oracle JDBC driver is fetched into the image at build time, never committed | |
 | 9 | Setup checks in the connection test | Per database, fixed sentences: PostgreSQL `wal_level=logical`, replication permission, publication; MySQL `binlog_format=ROW`, `binlog_row_image=FULL`, replication grants, binlog retention; SQL Server CDC enabled on the database and the table, SQL Server Agent running; Oracle `ARCHIVELOG`, supplemental logging, LogMiner grants; MongoDB replica set and change-stream permission. A failed check names the setting and the command that sets it; the connector can still be saved | |
-| 10 | Order against `SEC-14` part B (#192) | Everything that does not dial a source may start now: the ADR, the Kafka Connect service, the applier job, lag, alerts, the console, and a measurement branch for decision 5. The connection test, setup checks and the Oracle dial change the same files as #192 (`connector_probe.rs`, `connector_discover.rs`, `connector_listing.rs`) and **wait for it to merge** | |
+| 10 | Building on `SEC-14` part B (#192, merged 2026-10-28) | The connection test and the setup checks build on what #192 left: PostgreSQL is tested by the console's own minimal client (`pg_probe.rs`: TLS required, `SCRAM-SHA-256` only, one fixed `SELECT 1`), so its setup checks extend that client with a few more fixed statements rather than going back to `sqlx`; SQL Server keeps encryption required; MySQL keeps `Preferred` (#192's D9). The Oracle connection test needs an Oracle client in the API, or runs in the orchestrator as discovery does today: decided in the plan | |
 | 11 | ADR | A new ADR replaces ADR 0007's "no per-connector provisioning" with decision 1, written before the first code slice | |
 | 12 | Gates | One CI job per change-capture source (each needs its own database and Kafka Connect, and the slowest connector job must stay under 20 minutes, `SRC-9` decision 1). Today's `g4-cdc` moves to the new runtime. Each gate proves: first copy, insert, update, delete, a one-hour-equivalent stop and catch-up without gaps or duplicates, lag shown, setup check failing on a missing setting | |
 
