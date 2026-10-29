@@ -45,7 +45,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 
 use lakehouse_core::secret::{DynSecretResolver, SecretValue};
-use lakehouse_store::cdc::{CDC_SECRETS_DIR, connect_connector_name};
+use lakehouse_store::cdc::connect_connector_name;
 
 /// What a [`CdcSecretStore::write`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,7 +75,7 @@ pub enum CdcSecretError {
     Io,
 }
 
-/// The directory behind `lakehouse_cdc_secrets`, and the only thing that
+/// The directory behind `lakehouse_cdc_secrets` (`Config::cdc_secrets_dir`), and the only thing that
 /// writes it. See the module docs.
 #[derive(Debug, Clone)]
 pub struct CdcSecretStore {
@@ -87,12 +87,6 @@ impl CdcSecretStore {
     #[must_use]
     pub fn new(dir: impl Into<PathBuf>) -> Self {
         Self { dir: dir.into() }
-    }
-
-    /// The store at its fixed place in a deployment, [`CDC_SECRETS_DIR`].
-    #[must_use]
-    pub fn at_default_dir() -> Self {
-        Self::new(CDC_SECRETS_DIR)
     }
 
     /// The file name for `connector_id`, after validating the id.
@@ -145,12 +139,6 @@ impl CdcSecretStore {
         } else {
             WriteOutcome::Created
         })
-    }
-
-    /// Whether `connector_id` has a file now.
-    #[must_use]
-    pub fn exists(&self, connector_id: &str) -> bool {
-        Self::file_name(connector_id).is_ok_and(|name| self.dir.join(name).is_file())
     }
 
     /// Remove `connector_id`'s file. A file that is not there is success.
@@ -213,14 +201,14 @@ mod tests {
         let dir = temp_dir("write");
         let store = CdcSecretStore::new(&dir);
         let id = "conn-orders-ab12";
-        assert!(!store.exists(id));
+        assert!(!dir.join(id).exists());
         assert_eq!(
             store
                 .write(id, &SecretValue::new("s3cret".to_owned()))
                 .unwrap(),
             WriteOutcome::Created
         );
-        assert!(store.exists(id));
+        assert!(dir.join(id).exists());
         assert_eq!(std::fs::read_to_string(dir.join(id)).unwrap(), "s3cret");
         let mode = std::fs::metadata(dir.join(id))
             .unwrap()
@@ -245,7 +233,7 @@ mod tests {
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
         store.remove(id).unwrap();
         store.remove(id).unwrap();
-        assert!(!store.exists(id));
+        assert!(!dir.join(id).exists());
     }
 
     #[test]

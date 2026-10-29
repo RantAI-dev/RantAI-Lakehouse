@@ -230,6 +230,21 @@ impl KafkaConnectClient {
         self.send(request).await.map(|_| ())
     }
 
+    /// Restart connector `name` and its tasks (`POST
+    /// /connectors/<name>/restart`), so the tasks read a changed password file
+    /// (the worker reads it when a task starts).
+    ///
+    /// # Errors
+    ///
+    /// The class of the failure; [`ConnectError::NotFound`] if it is not there.
+    pub async fn restart(&self, name: &str) -> Result<(), ConnectError> {
+        let request = self.http.post(format!(
+            "{}/connectors/{name}/restart?includeTasks=true&onlyFailed=false",
+            self.base
+        ));
+        self.send(request).await.map(|_| ())
+    }
+
     /// Delete connector `name`. A connector that is not there is success: the
     /// call is made again after a half-finished delete.
     ///
@@ -405,6 +420,20 @@ mod tests {
         assert!(!err.to_string().contains("secret-user"));
         let api: ApiError = err.into();
         assert!(!format!("{api:?}").contains("secret-user"));
+    }
+
+    #[tokio::test]
+    async fn restart_asks_for_the_tasks_too() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/connectors/lakehouse-a/restart"))
+            .and(wiremock::matchers::query_param("includeTasks", "true"))
+            .respond_with(ResponseTemplate::new(202))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = KafkaConnectClient::new(&server.uri()).unwrap();
+        client.restart("lakehouse-a").await.unwrap();
     }
 
     #[tokio::test]

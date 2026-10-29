@@ -3184,6 +3184,30 @@ pub async fn delete(
         .into());
     }
 
+    // `SRC-4` slice 2 (S2-e): the worker's connector goes first, because the
+    // slot cannot be dropped while the worker reads it.
+    if dial_info.adapter.as_deref() == Some("cdc")
+        && let Err(err) = crate::cdc_lifecycle::remove_from_connect(&state, &id).await
+    {
+        if query.force {
+            tracing::error!(
+                connector_id = %id,
+                error = %err,
+                "force-deleting connector despite Kafka Connect not removing its connector: \
+                 it may keep reading the source until removed by hand"
+            );
+        } else {
+            return Err(ApiError::Conflict(format!(
+                "connector {id} was NOT deleted: Kafka Connect did not remove its \
+                 change-capture connector ({err}); the registry row is kept so the \
+                 connector stays visible. Retry once Kafka Connect is reachable, or pass \
+                 ?force=true to delete the row anyway (the connector will then have to be \
+                 removed from Kafka Connect by hand)."
+            ))
+            .into());
+        }
+    }
+
     if let Err(err) = deprovision_postgres_connector(&state, &id, &dial_info).await {
         if query.force {
             let slug = connector_slug_for_id(&id).ok();
@@ -3218,6 +3242,10 @@ pub async fn delete(
     let deleted = connectors::delete_connector(pool(&state)?, &id).await?;
     if !deleted {
         return Err(ApiError::NotFound(format!("Connector {id} not found")).into());
+    }
+    if dial_info.adapter.as_deref() == Some("cdc") {
+        // The password file is memory only and the row is gone: remove it now.
+        crate::cdc_lifecycle::remove_secret(&state, &id);
     }
     // `SRC-12` part C, decision 8: an OAuth connector's refresh token is told
     // to the provider before the file goes. Best effort: the connector is gone
@@ -3683,6 +3711,27 @@ pub async fn ingest_spec_put(
     Path(id): Path<String>,
     body: Bytes,
 ) -> ApiResult<ApiJson<IngestSpecResponse>> {
+    let saved = save_ingest_spec(&state, principal, &id, body).await?;
+    // `SRC-4` slice 2 (S2-e): a saved change-capture connector is created or
+    // updated in Kafka Connect. The spec is already stored; a failure here says
+    // so, and saving again repeats the provisioning (it is idempotent).
+    if saved.0.spec.adapter.as_deref() == Some("cdc") {
+        crate::cdc_lifecycle::provision(&state, &id)
+            .await
+            .map_err(crate::cdc_lifecycle::after_save)?;
+    }
+    Ok(saved)
+}
+
+/// The save behind [`ingest_spec_put`]; see its doc for the order of the answers.
+async fn save_ingest_spec(
+    state: &AppState,
+    principal: Option<Extension<Principal>>,
+    id: &str,
+    body: Bytes,
+) -> ApiResult<ApiJson<IngestSpecResponse>> {
+    let state = state.clone();
+    let id = id.to_owned();
     let body: IngestSpecBody = parse_body(&body)?;
     // Refused here rather than at the first tick: the schedule sensor
     // would otherwise skip a malformed cron without a word, forever.

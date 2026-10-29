@@ -823,6 +823,10 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("GET",  "/api/connectors/{id}/runs", Policy::RequiresPermission("connector:manage")),
     ("GET",  "/api/connectors/{id}/runs/{runId}/log", Policy::RequiresPermission("connector:manage")),
     ("POST", "/api/connectors/{id}/resume", Policy::RequiresPermission("connector:manage")),
+    // `SRC-4` slice 2: a person's pause (resume above lifts it), and a change-capture
+    // connector's state in Kafka Connect; same permission and tenant gate.
+    ("POST", "/api/connectors/{id}/pause", Policy::RequiresPermission("connector:manage")),
+    ("GET",  "/api/connectors/{id}/change-capture", Policy::RequiresPermission("connector:manage")),
     // `SRC-11`: the orchestrator reports a run's start, each attempt, a line of
     // the closed log list, and the run's end. `ingest:read`, the one
     // permission its service identity holds; a user can hold it too (Data

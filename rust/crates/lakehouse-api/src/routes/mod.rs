@@ -755,6 +755,16 @@ fn per_connector_router(state: &AppState) -> Router<AppState> {
             "/api/connectors/{id}/resume",
             axum::routing::post(connector_runs::resume),
         )
+        // `SRC-4` slice 2 (S2-e, S2-h): a person's pause, and the state of a
+        // change-capture connector in Kafka Connect.
+        .route(
+            "/api/connectors/{id}/pause",
+            axum::routing::post(connector_runs::pause),
+        )
+        .route(
+            "/api/connectors/{id}/change-capture",
+            get(connector_runs::change_capture),
+        )
         // `SRC-12` part C: signing a REST connector in with `OAuth2`, for a
         // person with `connector:manage` on a connector of their own tenant.
         .route("/api/connectors/{id}/oauth", get(connector_oauth::status))

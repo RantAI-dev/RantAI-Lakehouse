@@ -11,6 +11,8 @@ mod auth;
 mod bounded;
 mod bronze_stats_cache;
 mod catalog_search_cache;
+mod cdc_lifecycle;
+mod cdc_secrets;
 mod config;
 mod connector_deprovision;
 mod connector_discover;
@@ -29,6 +31,7 @@ mod gold_lock;
 mod health;
 mod internal_hosts;
 mod json;
+mod kafka_connect;
 mod lakehouse_catalog;
 mod lakekeeper_token;
 mod next_run;
@@ -203,6 +206,10 @@ async fn run() -> anyhow::Result<()> {
     routes::public_links::spawn_legacy_copy(&state);
     // DATA-17 decision 8: abort and remove chunked uploads nobody finished.
     spawn_upload_session_sweep(&state);
+    // `SRC-4` slice 2 (S2-a): write the change-capture password files again
+    // (`tmpfs` empties on a restart) and start the connectors that need it.
+    let cdc_state = state.clone();
+    tokio::spawn(async move { cdc_lifecycle::reconcile_at_start(&cdc_state).await });
 
     let app = routes::router(state);
 

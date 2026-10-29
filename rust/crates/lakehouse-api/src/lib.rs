@@ -27,6 +27,7 @@ pub mod auth;
 pub mod bounded;
 pub mod bronze_stats_cache;
 pub mod catalog_search_cache;
+pub mod cdc_lifecycle;
 pub mod cdc_secrets;
 pub mod config;
 pub mod connector_deprovision;

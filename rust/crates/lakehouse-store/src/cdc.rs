@@ -175,6 +175,10 @@ pub enum CdcSpecError {
         name: String,
     },
 
+    /// The secrets directory cannot be named in a config-provider reference.
+    #[error("the change-capture secrets directory is not an absolute path of plain characters")]
+    InvalidSecretsDir,
+
     /// No source table to capture.
     #[error("a change-capture connector needs at least one source table")]
     NoTables,
@@ -787,15 +791,25 @@ pub fn connect_connector_name(id: &str) -> Result<String, CdcSpecError> {
 }
 
 /// The `Kafka Connect` config-provider reference to registry connector
-/// `id`'s password: `${dir:/run/cdc-secrets:<id>}`. It is the only form of the
-/// password the connector JSON ever holds.
+/// `id`'s password: `${dir:<secrets_dir>:<id>}`, `secrets_dir` being
+/// [`CDC_SECRETS_DIR`] in a deployment. It is the only form of the password the
+/// connector JSON ever holds.
 ///
 /// # Errors
 ///
-/// [`CdcSpecError::InvalidConnectorId`] if `id` is not a plain identifier.
-pub fn connect_password_reference(id: &str) -> Result<String, CdcSpecError> {
+/// [`CdcSpecError::InvalidConnectorId`] if `id` is not a plain identifier;
+/// [`CdcSpecError::InvalidSecretsDir`] if `secrets_dir` is not an absolute path
+/// of plain characters (a `:` or `}` would end the reference early).
+pub fn connect_password_reference(id: &str, secrets_dir: &str) -> Result<String, CdcSpecError> {
+    let plain_dir = secrets_dir.starts_with('/')
+        && secrets_dir
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'_' | b'-' | b'.'));
+    if !plain_dir {
+        return Err(CdcSpecError::InvalidSecretsDir);
+    }
     if is_connector_id(id) {
-        Ok(format!("${{dir:{CDC_SECRETS_DIR}:{id}}}"))
+        Ok(format!("${{dir:{secrets_dir}:{id}}}"))
     } else {
         Err(CdcSpecError::InvalidConnectorId { id: id.to_owned() })
     }
@@ -841,7 +855,8 @@ fn split_table_name(name: &str) -> Option<(&str, &str)> {
 /// # Errors
 ///
 /// [`CdcSpecError::UnsupportedDriver`] for a driver other than `PostgreSQL`,
-/// [`CdcSpecError::InvalidConnectorId`], [`CdcSpecError::NoTables`],
+/// [`CdcSpecError::InvalidConnectorId`], [`CdcSpecError::InvalidSecretsDir`],
+/// [`CdcSpecError::NoTables`],
 /// [`CdcSpecError::InvalidTableName`], [`CdcSpecError::InvalidReplicationName`]
 /// or [`CdcSpecError::ControlCharacterInField`] for a host, database or user
 /// holding a control character.
@@ -849,11 +864,12 @@ pub fn render_connect_config(
     connector_id: &str,
     dial: &CdcDial,
     tables: &[&str],
+    secrets_dir: &str,
 ) -> Result<BTreeMap<String, String>, CdcSpecError> {
     if dial.driver != SqlDriver::Postgres {
         return Err(CdcSpecError::UnsupportedDriver);
     }
-    let password = connect_password_reference(connector_id)?;
+    let password = connect_password_reference(connector_id, secrets_dir)?;
     if tables.is_empty() {
         return Err(CdcSpecError::NoTables);
     }
@@ -957,6 +973,7 @@ mod tests {
             "conn-orders-ab12",
             &pg_dial("verify-full"),
             &["public.orders", "sales.items"],
+            CDC_SECRETS_DIR,
         )
         .unwrap();
         assert_eq!(config["connector.class"], POSTGRES_CONNECTOR_CLASS);
@@ -981,12 +998,20 @@ mod tests {
 
     #[test]
     fn connect_config_holds_the_password_only_as_a_provider_reference() {
-        let config =
-            render_connect_config("conn-orders-ab12", &pg_dial("require"), &["public.orders"])
-                .unwrap();
+        let config = render_connect_config(
+            "conn-orders-ab12",
+            &pg_dial("require"),
+            &["public.orders"],
+            CDC_SECRETS_DIR,
+        )
+        .unwrap();
         assert_eq!(
             config["database.password"],
             "${dir:/run/cdc-secrets:conn-orders-ab12}"
+        );
+        assert_eq!(
+            connect_password_reference("conn-a", "/tmp/x:y"),
+            Err(CdcSpecError::InvalidSecretsDir)
         );
         assert_eq!(
             connect_connector_name("conn-orders-ab12").unwrap(),
@@ -1006,20 +1031,20 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    render_connect_config("conn-a", &dial, &[table]),
+                    render_connect_config("conn-a", &dial, &[table], CDC_SECRETS_DIR),
                     Err(CdcSpecError::InvalidTableName { .. })
                 ),
                 "{table}"
             );
         }
         assert_eq!(
-            render_connect_config("conn-a", &dial, &[]),
+            render_connect_config("conn-a", &dial, &[], CDC_SECRETS_DIR),
             Err(CdcSpecError::NoTables)
         );
         for id in ["", "../x", "a:b", "-a", "a/b", "a\nb"] {
             assert!(
                 matches!(
-                    render_connect_config(id, &dial, &["public.t"]),
+                    render_connect_config(id, &dial, &["public.t"], CDC_SECRETS_DIR),
                     Err(CdcSpecError::InvalidConnectorId { .. })
                 ),
                 "{id}"
@@ -1032,13 +1057,13 @@ mod tests {
         let mut dial = pg_dial("require");
         dial.slot_name = "Orders-Slot".to_owned();
         assert!(matches!(
-            render_connect_config("conn-a", &dial, &["public.t"]),
+            render_connect_config("conn-a", &dial, &["public.t"], CDC_SECRETS_DIR),
             Err(CdcSpecError::InvalidReplicationName { field: "slotName" })
         ));
         let mut dial = pg_dial("require");
         dial.driver = SqlDriver::Mysql;
         assert_eq!(
-            render_connect_config("conn-a", &dial, &["public.t"]),
+            render_connect_config("conn-a", &dial, &["public.t"], CDC_SECRETS_DIR),
             Err(CdcSpecError::UnsupportedDriver)
         );
     }

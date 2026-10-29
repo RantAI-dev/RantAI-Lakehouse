@@ -329,6 +329,12 @@ pub struct Config {
     /// of dialing a guessed address (fail closed). Operator-set, never taken
     /// from a request; the address is internal to the deployment's network.
     pub kafka_connect_url: Option<String>,
+    /// The directory the API writes each change-capture connector's source
+    /// password into (`CDC_SECRETS_DIR`, `SRC-4` decision S2-a). Default
+    /// `/run/cdc-secrets`, the `tmpfs` volume `docker-compose.yml` mounts here
+    /// and read-only in `kafka-connect` at the SAME path, because the connector
+    /// JSON names the file by this path. Set it only in a test.
+    pub cdc_secrets_dir: String,
     /// `ClickHouse` HTTP interface URL. Default
     /// `"http://localhost:18123"` (`clickhouse.ts:11`, `??`).
     pub ch_url: String,
@@ -1087,6 +1093,7 @@ impl std::fmt::Debug for Config {
                 &self.oracle_cdc_logminer_enabled,
             )
             .field("kafka_connect_url", &self.kafka_connect_url)
+            .field("cdc_secrets_dir", &self.cdc_secrets_dir)
             .field("oidc_clock_skew_seconds", &self.oidc_clock_skew_seconds)
             .field("oidc_authorize_url", &self.oidc_authorize_url)
             .field("oidc_token_url", &self.oidc_token_url)
@@ -1478,6 +1485,11 @@ impl Config {
                 .get("ORACLE_CDC_LOGMINER_ENABLED")
                 .is_some_and(|v| v == "true"),
             kafka_connect_url: truthy(env, "KAFKA_CONNECT_URL"),
+            cdc_secrets_dir: or_default(
+                env,
+                "CDC_SECRETS_DIR",
+                lakehouse_store::cdc::CDC_SECRETS_DIR,
+            ),
             oidc_clock_skew_seconds: env
                 .get("OIDC_CLOCK_SKEW_SECONDS")
                 .and_then(|v| v.parse::<u64>().ok())
