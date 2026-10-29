@@ -132,7 +132,8 @@ class MySqlSource(cdc_gate.Source):
         try:
             with conn.cursor() as cur:
                 cur.execute(f"DROP USER IF EXISTS '{CDC_USER}'@'%'")
-                cur.execute(f"CREATE USER '{CDC_USER}'@'%' IDENTIFIED BY %s", (self.password,))
+                # `%%`: the statement has a parameter, so pymysql applies Python's % formatting to it.
+                cur.execute(f"CREATE USER '{CDC_USER}'@'%%' IDENTIFIED BY %s", (self.password,))
                 cur.execute(f"GRANT SELECT ON {DATABASE}.* TO '{CDC_USER}'@'%'")
                 cur.execute(
                     f"GRANT RELOAD, SHOW DATABASES, REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO '{CDC_USER}'@'%'"
