@@ -7,17 +7,30 @@ import type { CdcDial, SqlDriver } from "@/services/contracts/connectors"
 import { DEFAULT_SQL_PORT } from "./sql-dial-form"
 
 /**
- * `dial` for the `cdc` adapter — `SqlDialForm`'s fields plus
- * `slotName`/`publicationName`, both required server-side with no
- * fallback (`ingest_spec.rs`'s `CdcDial`, no `Option`). This form does
- * not add a client-side required-field rule for either — `Dial::parse`
- * already rejects an empty/missing value with its own error text on
- * every `PUT`, and duplicating that check here would risk drifting from
- * it.
+ * `dial` for the `cdc` adapter — `SqlDialForm`'s fields plus the setting of
+ * the driver (`SRC-4` decision S3-a): `slotName` and `publicationName` for
+ * PostgreSQL only, `serverId` for MySQL only, nothing for SQL Server. A field
+ * the driver does not use is not in the dial at all (the server refuses a
+ * present one). This form does not add a client-side required-field rule:
+ * `Dial::parse` already rejects a missing value with its own fixed sentence
+ * on every `PUT`, and duplicating that check here would risk drifting from it.
  *
  * `driver` works as in `SqlDialForm`: the type already names the database,
  * so the form starts there and only asks when a stored dial disagrees.
  */
+/** The dial as the driver wants it: only its own setting, PostgreSQL's two names
+ * kept as typed (empty until typed), MySQL's server id only when a number was given. */
+export function shapeCdcDial(dial: CdcDial): CdcDial {
+  const { slotName, publicationName, serverId, ...common } = dial
+  if (dial.driver === "postgres") {
+    return { ...common, slotName: slotName ?? "", publicationName: publicationName ?? "" }
+  }
+  if (dial.driver === "mysql") {
+    return typeof serverId === "number" ? { ...common, serverId } : common
+  }
+  return common
+}
+
 export function CdcDialForm({
   value,
   onChange,
@@ -34,13 +47,11 @@ export function CdcDialForm({
     port: DEFAULT_SQL_PORT[initialDriver],
     database: "",
     user: "",
-    slotName: "",
-    publicationName: "",
-    serverId: null,
+    ...(initialDriver === "postgres" ? { slotName: "", publicationName: "" } : {}),
   }
   const askDriver = !driver || dial.driver !== driver
   function set<K extends keyof CdcDial>(key: K, v: CdcDial[K]) {
-    onChange({ ...dial, [key]: v })
+    onChange(shapeCdcDial({ ...dial, [key]: v }))
   }
   return (
     <div className="grid gap-3 sm:grid-cols-2">
@@ -101,36 +112,45 @@ export function CdcDialForm({
           autoComplete="off"
         />
       </div>
-      <div className="space-y-1.5">
-        <Label htmlFor="cdc-dial-slot-name">Replication slot name</Label>
-        <Input
-          id="cdc-dial-slot-name"
-          value={dial.slotName}
-          onChange={(e) => set("slotName", e.target.value)}
-          placeholder="lakehouse_slot"
-          autoComplete="off"
-        />
-      </div>
-      <div className="space-y-1.5">
-        <Label htmlFor="cdc-dial-publication-name">Publication name</Label>
-        <Input
-          id="cdc-dial-publication-name"
-          value={dial.publicationName}
-          onChange={(e) => set("publicationName", e.target.value)}
-          placeholder="lakehouse_pub"
-          autoComplete="off"
-        />
-      </div>
-      <div className="space-y-1.5">
-        <Label htmlFor="cdc-dial-server-id">Server id (optional)</Label>
-        <Input
-          id="cdc-dial-server-id"
-          type="number"
-          value={dial.serverId ?? ""}
-          onChange={(e) => set("serverId", e.target.value === "" ? null : Number(e.target.value))}
-          autoComplete="off"
-        />
-      </div>
+      {dial.driver === "postgres" ? (
+        <>
+          <div className="space-y-1.5">
+            <Label htmlFor="cdc-dial-slot-name">Replication slot name</Label>
+            <Input
+              id="cdc-dial-slot-name"
+              value={dial.slotName ?? ""}
+              onChange={(e) => set("slotName", e.target.value)}
+              placeholder="lakehouse_slot"
+              autoComplete="off"
+            />
+          </div>
+          <div className="space-y-1.5">
+            <Label htmlFor="cdc-dial-publication-name">Publication name</Label>
+            <Input
+              id="cdc-dial-publication-name"
+              value={dial.publicationName ?? ""}
+              onChange={(e) => set("publicationName", e.target.value)}
+              placeholder="lakehouse_pub"
+              autoComplete="off"
+            />
+          </div>
+        </>
+      ) : null}
+      {dial.driver === "mysql" ? (
+        <div className="space-y-1.5 sm:col-span-2">
+          <Label htmlFor="cdc-dial-server-id">Server id</Label>
+          <Input
+            id="cdc-dial-server-id"
+            type="number"
+            min={1}
+            max={4294967295}
+            value={dial.serverId ?? ""}
+            onChange={(e) => set("serverId", e.target.value === "" ? undefined : Number(e.target.value))}
+            autoComplete="off"
+          />
+          <p className="text-xs text-muted-foreground">A number no other MySQL replica uses (1 to 4294967295).</p>
+        </div>
+      ) : null}
     </div>
   )
 }

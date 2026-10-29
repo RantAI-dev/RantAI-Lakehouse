@@ -488,17 +488,21 @@ export type SqlDial = {
   sslServerCertDn?: string | null
 }
 
-/** `CdcDial` = `SqlDial`'s fields plus `slotName`/`publicationName`,
- * both required with no fallback (`ingest_spec.rs`'s `CdcDial`). */
+/** `CdcDial` = `SqlDial`'s fields plus the change-capture settings of the
+ * driver (`ingest_spec.rs`'s `CdcDial`, `SRC-4` decision S3-a): PostgreSQL
+ * requires `slotName` and `publicationName` and refuses `serverId`; MySQL
+ * requires `serverId` (1 to 4294967295) and refuses the other two; SQL Server
+ * refuses all three. A field the driver does not use is omitted, never sent
+ * empty, because the server refuses a present one. */
 export type CdcDial = {
   driver: SqlDriver
   host: string
   port: number
   database: string
   user: string
-  slotName: string
-  publicationName: string
-  serverId: number | null
+  slotName?: string
+  publicationName?: string
+  serverId?: number | null
 }
 
 export type FilesProtocol = "s3" | "sftp"

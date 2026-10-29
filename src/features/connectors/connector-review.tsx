@@ -54,7 +54,10 @@ export function connectionReviewItems(adapter: string | null, dial: Record<strin
         { label: "Server", value: hostPort(d) },
         { label: "Database", value: text(d.database) },
         { label: "User", value: text(d.user) },
-        { label: "Slot / publication", value: [text(d.slotName), text(d.publicationName)].filter(Boolean).join(" / ") },
+        ...(text(d.slotName) || text(d.publicationName)
+          ? [{ label: "Slot / publication", value: [text(d.slotName), text(d.publicationName)].filter(Boolean).join(" / ") }]
+          : []),
+        ...(text(d.serverId) ? [{ label: "Server id", value: text(d.serverId) }] : []),
       ]
     case "files":
       return [

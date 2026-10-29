@@ -33,6 +33,42 @@ describe("dial forms", () => {
     expect(screen.queryByLabelText("Driver")).toBeNull()
     expect((screen.getByLabelText("Port") as HTMLInputElement).value).toBe("1433")
   })
+  it("CdcDialForm shows the slot and publication for PostgreSQL only and sends no server id", () => {
+    const onChange = mock()
+    render(<CdcDialForm value={null} onChange={onChange} driver="postgres" />)
+    expect(screen.getByLabelText("Replication slot name")).toBeDefined()
+    expect(screen.getByLabelText("Publication name")).toBeDefined()
+    expect(screen.queryByLabelText("Server id")).toBeNull()
+    fireEvent.change(screen.getByLabelText("Host"), { target: { value: "h" } })
+    const sent = onChange.mock.calls[0][0] as Record<string, unknown>
+    expect(sent).toMatchObject({ slotName: "", publicationName: "" })
+    expect("serverId" in sent).toBe(false)
+  })
+  it("CdcDialForm asks MySQL for a server id, empty by default, and sends no slot or publication", () => {
+    const onChange = mock()
+    render(<CdcDialForm value={null} onChange={onChange} driver="mysql" />)
+    expect(screen.queryByLabelText("Replication slot name")).toBeNull()
+    expect(screen.queryByLabelText("Publication name")).toBeNull()
+    expect((screen.getByLabelText("Server id") as HTMLInputElement).value).toBe("")
+    expect(screen.getByText(/no other MySQL replica uses/)).toBeDefined()
+    fireEvent.change(screen.getByLabelText("Host"), { target: { value: "h" } })
+    const empty = onChange.mock.calls[0][0] as Record<string, unknown>
+    expect("serverId" in empty).toBe(false)
+    expect("slotName" in empty).toBe(false)
+    expect("publicationName" in empty).toBe(false)
+    fireEvent.change(screen.getByLabelText("Server id"), { target: { value: "5400" } })
+    expect(onChange.mock.calls[1][0]).toMatchObject({ serverId: 5400 })
+  })
+  it("CdcDialForm shows nothing of the three for SQL Server", () => {
+    const onChange = mock()
+    render(<CdcDialForm value={null} onChange={onChange} driver="mssql" />)
+    for (const label of ["Replication slot name", "Publication name", "Server id"]) {
+      expect(screen.queryByLabelText(label)).toBeNull()
+    }
+    fireEvent.change(screen.getByLabelText("Host"), { target: { value: "h" } })
+    const sent = onChange.mock.calls[0][0] as Record<string, unknown>
+    for (const key of ["slotName", "publicationName", "serverId"]) expect(key in sent).toBe(false)
+  })
   it("FilesDialForm offers no SFTP choice and keeps emitting protocol s3 (SRC-6 F8)", () => {
     const onChange = mock()
     render(<FilesDialForm value={null} onChange={onChange} />)
