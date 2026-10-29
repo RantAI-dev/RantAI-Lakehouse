@@ -482,6 +482,70 @@ for the job. Not started. The gate's `connect` step stays `refused` in
 
 (Further entries follow, one per slice.)
 
+### Slice 2, PostgreSQL change capture on Kafka Connect (developer, Sonnet, 2026-10-29)
+
+Commits on `feat/data-phase-4-src-4`, in order:
+
+- `T2.1` to `T2.7`: before this entry (Rust renderer, client, secrets, lifecycle, load
+  modes, applier, console). Added in this stretch: `27fa46f1` fixes the TS2353 typecheck
+  failure of T2.7 (the saved-object fixture in `connector-ingest-panel.test.tsx` was typed
+  `{ name; target }[]`; it now uses the contract's own fields).
+- `95457d56` T2.8: the fixed pipeline goes (S2-h) and `kafka` + `kafka-connect` come in
+  under the `cdc` profile (S2-i).
+- `c1ef8483` T2.9: the `g4-cdc` gate on the new path (S2-j).
+- `b9d16250` T2.10: docs. A fix commit between: no Kafka Connect error text in the delete
+  refusal (`SRC-4 S2 review BLOCKER-1`, principle 4); and `33d8b758` drops three SEC-11
+  `ALLOWED` entries that belonged to the removed handler.
+
+What T2.8 removed: `debezium-server`, `debezium-localhost-proxy`, `g4-source-init`, the
+`lakehouse_debezium_data` volume, the Lakekeeper `debezium` principal, token and grant
+(compose, `ops/oidc-mock`, `MACHINE_GRANTS` and its test: now four fixed grants),
+`ops/debezium/*`, `GET /api/connectors/{id}/debezium-properties` (handler, route, policy
+row, tests), `render_debezium_properties*` and its types and the test that read the
+compose file (`lakehouse-store/src/cdc.rs`), the g6 MongoDB template step, and the CI
+comments that avoided `--profile dagster` because of `debezium-server`. The `ingest/run`
+reason for a `cdc` connector now names Kafka Connect, not a compose service.
+
+Compose: `kafka` and `kafka-connect` pinned by tag and digest, no published ports,
+`KAFKA_LOG_RETENTION_HOURS=168`, `lakehouse_kafka_data`, `lakehouse_cdc_secrets` (tmpfs,
+`mode=1777`, read-write in `lakehouse-api`, read-only in `kafka-connect`),
+`CONNECT_CONFIG_PROVIDERS*` for `DirectoryConfigProvider`; `KAFKA_CONNECT_URL` and
+`CDC_KAFKA_BOOTSTRAP` as `${X:-}` (empty keeps change capture off). The image's
+`CONNECT_*` mapping was checked by the gate (the password is not in the stored config and
+the `${dir:...}` reference is).
+
+`.env.staging` (product owner's file; edited in this branch only): lines 30 to 32, the
+comment above `LAKEKEEPER_CATALOG_URI` that named `debezium-server` and
+`DEBEZIUM_SINK_ICEBERG_URI`, reworded to name no service. No value changed. `.env.example`
+gains `KAFKA_CONNECT_URL=` and `CDC_KAFKA_BOOTSTRAP=` (empty) and its Oracle LogMiner
+comment is corrected.
+
+The gate (`ops/g4/g4_test.py`): its own source (two tables, 20,000 rows each, one
+publication); the connector registered as the console does it; the stored config holds
+the `${dir:...}` reference and not the password; the password file exists; first copy;
+insert, update, delete within 120 s in both modes; pause, 20,000 changes per table,
+resume; a restart of `kafka-connect` during a stream of changes (the CI step restarts the
+container when the gate prints `G4-RESTART-KAFKA-CONNECT`, because the runner has no
+Docker access); a schema change observed; the WAL alert and OIDC steps as before;
+`DELETE` removes the Kafka Connect connector, slot, publication and password file. The job
+timeout stays 20 minutes.
+
+Verified by CI on the PR at `33d8b758` (the run before this handoff commit): every check green, including `Rust · clippy`, `Rust · test (stable)` (after the two fixes above; its first run failed `sec11_guard`) and `Rust · G4 change capture into Bronze` (green on its first run; `g4-cdc` also passed on `c1ef8483`). The gate summary table was not read by the developer. **Not verified locally:**
+everything. This VM has no room for `cargo`, `docker` or the full suites, so the only local
+checks were `rustfmt --check` on the touched Rust files, `ast.parse` and an import of
+`g4_test.py`, YAML parse of the compose and workflow files, `bun test` and `tsc --noEmit`
+for the one TS fix, and `ops/gates` unit tests (29 passed).
+
+Open items for the reviewer:
+
+- `ORACLE_CDC_LOGMINER_ENABLED` / `Config::oracle_cdc_logminer_enabled` is now read by
+  nothing; kept (its doc says so) so that slice 6 can decide, not deleted here.
+- `ops/g4` uses `INGEST_ALLOW_INTERNAL_HOSTS=true` on the code location (gate only), as
+  the slice 0 measurement did, although `cdc_apply.py` says the guard is not applied to the
+  broker; harmless if true, and not proved either way.
+- `docs/plans/P5-*.md`, `LAKEHOUSE-FOUNDATION-PLAN.md` and ADRs keep their historical
+  `debezium-server` text on purpose (they record what was measured then).
+
 ## Review
 
 (The planner writes findings here, tagged `BLOCKER` or `SHOULD-FIX`.)
