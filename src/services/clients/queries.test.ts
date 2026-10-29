@@ -358,7 +358,17 @@ describe("the query download", () => {
     expect(out.rows).toBeNull()
     expect(out.cut).toBe(false)
     expect(out.cutBy).toBeNull()
-    expect(out.fileName).toBe("query.csv")
+    // The download asked for a Parquet file, so the fallback name is a
+    // Parquet file: a Parquet file named `query.csv` will not open.
+    expect(out.fileName).toBe("query.parquet")
+  })
+
+  it("names the file after the format it asked for when the server names no file", async () => {
+    for (const format of ["csv", "tsv", "xlsx", "parquet"] as const) {
+      stubFetch(() => new Response("x", { status: 200 }))
+      const out = await clickhouseQueryService.download("q-1", format, RUN_ID)
+      expect(out.fileName).toBe(`query.${format}`)
+    }
   })
 
   it("throws the server's own sentence when the download is refused", async () => {
@@ -368,6 +378,15 @@ describe("the query download", () => {
     await expect(
       clickhouseQueryService.download("q-1", "csv", RUN_ID),
     ).rejects.toThrow("Downloads are switched off for your role.")
+  })
+
+  it("rejects a refused download with the ServiceError the status implies", async () => {
+    stubFetch(() =>
+      json({ error: "permission_denied: Downloads are switched off for your role." }, 403),
+    )
+    const err = await rejection(clickhouseQueryService.download("q-1", "csv", RUN_ID))
+    expect(err.code).toBe("permission_denied")
+    expect(err.message).toBe("Downloads are switched off for your role.")
   })
 })
 

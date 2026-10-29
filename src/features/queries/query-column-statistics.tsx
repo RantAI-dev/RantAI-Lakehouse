@@ -45,6 +45,15 @@ export function QueryColumnStatistics({
   // reads even when the counts are small.
   const width = (count: number) =>
     maxCount > 0 ? (count / maxCount) * 100 : 0
+  // The bars of a numeric column are value ranges, the bars of a text column
+  // are the values that occur most often. The label says which one is on
+  // screen: the two read alike otherwise, and a reader cannot tell a
+  // distribution from a top-N list.
+  const histogramLabel =
+    shape.kind === "bins" ? "Value range" : "Most frequent values"
+  // A column that holds no value has no histogram to label.
+  const showsHistogram =
+    shape.kind === "bins" ? shape.bins.length > 0 : shape.values.length > 0
 
   return (
     <section
@@ -91,6 +100,10 @@ export function QueryColumnStatistics({
           <dd className="font-mono tabular-nums">{stats.max ?? "—"}</dd>
         </div>
       </dl>
+
+      {showsHistogram ? (
+        <p className="text-xs font-medium">{histogramLabel}</p>
+      ) : null}
 
       {shape.kind === "bins" ? (
         <ul className="space-y-1">

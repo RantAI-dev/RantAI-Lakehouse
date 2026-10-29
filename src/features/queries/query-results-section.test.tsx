@@ -231,16 +231,52 @@ describe("the statistics panel", () => {
       "30"
     )
   })
+
+  it("says the histogram of a text column shows the most frequent values", () => {
+    renderSection(result())
+    // The first column is a text one: its bars are values, not ranges.
+    expect(panel().getByText("Most frequent values")).toBeTruthy()
+    expect(panel().queryAllByText("Value range")).toHaveLength(0)
+  })
+
+  it("says the histogram of a numeric column shows value ranges", () => {
+    renderSection(result())
+    fireEvent.change(screen.getByLabelText("Column"), {
+      target: { value: "amount" },
+    })
+    expect(panel().getByText("Value range")).toBeTruthy()
+    expect(panel().queryAllByText("Most frequent values")).toHaveLength(0)
+  })
+
+  it("shows no histogram label when the column holds no value", () => {
+    renderSection(result({ rows: [{ city: null, amount: null }] }))
+    expect(panel().queryAllByText("Value range")).toHaveLength(0)
+    expect(panel().queryAllByText("Most frequent values")).toHaveLength(0)
+  })
 })
 
 describe("the cell inspector", () => {
+  it("names the column and the row in the button, so two rows do not read the same", () => {
+    renderSection(result())
+    const names = screen
+      .getAllByRole("button", { name: /^Inspect city, row \d+$/ })
+      .map((button) => button.getAttribute("aria-label"))
+    // The rows are numbered the way a reader counts them, so the name of a
+    // button points at the row on the screen.
+    expect(names).toEqual([
+      "Inspect city, row 1",
+      "Inspect city, row 2",
+      "Inspect city, row 3",
+    ])
+  })
+
   it("shows the whole value of a cell", async () => {
     renderSection(
       result({
         rows: [{ city: "a very long city name", amount: 10 }],
       })
     )
-    fireEvent.click(screen.getAllByRole("button", { name: "Inspect city" })[0])
+    fireEvent.click(screen.getByRole("button", { name: "Inspect city, row 1" }))
     const dialog = await screen.findByRole("dialog")
     expect(within(dialog).getByText("a very long city name")).toBeTruthy()
   })
@@ -251,7 +287,7 @@ describe("the cell inspector", () => {
         rows: [{ city: '{"name":"Ada","age":36}', amount: 10 }],
       })
     )
-    fireEvent.click(screen.getAllByRole("button", { name: "Inspect city" })[0])
+    fireEvent.click(screen.getByRole("button", { name: "Inspect city, row 1" }))
     const dialog = await screen.findByRole("dialog")
     const shown = within(dialog).getByText(/"name": "Ada"/)
     expect(shown.textContent).toContain("\n")
@@ -264,7 +300,7 @@ describe("the cell inspector", () => {
         rows: [{ city: '{"name":"Ada","age":36}', amount: 10 }],
       })
     )
-    fireEvent.click(screen.getAllByRole("button", { name: "Inspect city" })[0])
+    fireEvent.click(screen.getByRole("button", { name: "Inspect city, row 1" }))
     fireEvent.click(await screen.findByRole("button", { name: "Copy value" }))
 
     await waitFor(() => expect(copied).toEqual(['{"name":"Ada","age":36}']))

@@ -99,7 +99,7 @@ function buildQueryResultColumns(
           align={numeric ? "right" : undefined}
         />
       ),
-      cell: ({ getValue }) => {
+      cell: ({ row, getValue }) => {
         const value = getValue() as QueryCell
         return (
           <span
@@ -120,12 +120,15 @@ function buildQueryResultColumns(
             </span>
             {/* The shared table has no cell click, so the inspector is opened
                 from a button of its own. It stays quiet: the value is the
-                thing the reader came for. */}
+                thing the reader came for. Its name carries the row as well
+                as the column: the grid holds thousands of rows, and "Inspect
+                city" alone leaves a reader who cannot see the screen with
+                hundreds of buttons that read the same. */}
             <Button
               type="button"
               variant="ghost"
               size="icon-xs"
-              aria-label={`Inspect ${colName}`}
+              aria-label={`Inspect ${colName}, row ${row.index + 1}`}
               onClick={() => onInspect(colName, value)}
             >
               <Search className="size-3" aria-hidden />

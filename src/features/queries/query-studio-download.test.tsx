@@ -24,8 +24,8 @@ mock.module("next/navigation", () => ({
   }),
 }))
 
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
-import { afterEach, describe, expect, it, mock, spyOn } from "bun:test"
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { afterEach, describe, expect, it, jest, mock, spyOn } from "bun:test"
 import { TableProviders } from "@/components/app-shell/table-providers"
 import { AuthProvider } from "@/features/auth/auth-provider"
 import { CopilotProvider } from "@/features/copilot/use-copilot"
@@ -39,6 +39,9 @@ import { QueryStudioPage } from "./query-studio-page"
 afterEach(() => {
   cleanup()
   mock.restore()
+  // The clock is faked in one test only; the next one starts from the real
+  // one again.
+  jest.useRealTimers()
   window.localStorage.clear()
 })
 
@@ -282,5 +285,34 @@ describe("the elapsed time of a run", () => {
     fireEvent.click(runButton)
     const timer = await screen.findByRole("timer", { name: "Elapsed time" })
     expect(timer.textContent).toContain("ms")
+  })
+
+  it("ticks every second while the run is in flight", async () => {
+    // The clock is faked, so the test drives the seconds itself: the page's
+    // own interval is the only thing that can move the elapsed time on.
+    jest.useFakeTimers()
+    stubNetwork()
+    spyOn(queryService, "run").mockImplementation((() => new Promise(() => {})) as never)
+    seedDraft("SELECT 1")
+    renderPage()
+
+    const runButton = await screen.findByRole("button", { name: "Run query" })
+    await waitFor(() => expect((runButton as HTMLButtonElement).disabled).toBe(false))
+
+    fireEvent.click(runButton)
+    const timer = await screen.findByRole("timer", { name: "Elapsed time" })
+    expect(timer.textContent).toBe("0 ms")
+
+    await act(async () => {
+      jest.advanceTimersByTime(1000)
+    })
+    // One second later the run has been going for a second, and the page says
+    // so: the clock ticks every second, not every other one.
+    expect(timer.textContent).toBe("1.0 s")
+
+    await act(async () => {
+      jest.advanceTimersByTime(1000)
+    })
+    expect(timer.textContent).toBe("2.0 s")
   })
 })

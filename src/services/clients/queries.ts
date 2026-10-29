@@ -175,7 +175,8 @@ async function proposeFix(
  *
  * The response says what the file holds in its headers (`X-Export-Rows`,
  * `X-Export-Cut`, `X-Export-Cut-By`), so a cut is never silent. A refusal
- * carries the server's own sentence, which is thrown as it is.
+ * carries the server's own sentence, thrown as a `ServiceError` whose code
+ * the status implies.
  */
 async function download(
   id: string,
@@ -188,9 +189,13 @@ async function download(
     `/api/query/run/${encodeURIComponent(id)}/download?${query.toString()}`,
     { signal, cache: "no-store" }
   );
-  if (!res.ok) throw new Error(await refusalOf(res, "The download failed."));
+  if (!res.ok) {
+    throw errorFor(res.status, await refusalOf(res, "The download failed."));
+  }
   const blob = await res.blob();
-  const fileName = fileNameOf(res.headers.get("content-disposition"), "query.csv");
+  // The fallback name carries the format's own extension: a file named
+  // `query.csv` that holds Parquet bytes will not open.
+  const fileName = fileNameOf(res.headers.get("content-disposition"), `query.${format}`);
   const rowsHeader = res.headers.get("x-export-rows");
   const rows = rowsHeader === null ? Number.NaN : Number(rowsHeader);
   const cutBy = res.headers.get("x-export-cut-by");
