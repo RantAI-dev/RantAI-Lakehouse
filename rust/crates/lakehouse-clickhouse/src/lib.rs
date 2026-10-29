@@ -171,6 +171,28 @@ fn progress_interval_ms(limit: std::time::Duration) -> u128 {
     (limit.as_millis() / PROGRESS_HEADERS_MAX).max(1000)
 }
 
+/// The `max_execution_time` URL setting for `limit`: whole seconds, rounded
+/// up, so a limit is never shortened.
+fn max_execution_time_seconds(limit: std::time::Duration) -> String {
+    limit
+        .as_secs()
+        .saturating_add(u64::from(limit.subsec_nanos() > 0))
+        .to_string()
+}
+
+/// The progress-header settings of a limited request.
+///
+/// The headers give the server something to write while the query runs, so a
+/// client that goes away is noticed on the engine. The interval keeps the
+/// number of headers under [`PROGRESS_HEADERS_MAX`].
+fn push_progress_settings(limit: std::time::Duration, settings: &mut Vec<(&str, String)>) {
+    settings.push(("send_progress_in_http_headers", "1".to_owned()));
+    settings.push((
+        "http_headers_progress_interval_ms",
+        progress_interval_ms(limit).to_string(),
+    ));
+}
+
 impl QueryOptions {
     /// The request's own timeout: the time limit plus [`LIMIT_MARGIN`], or
     /// `None` (the client's default) without a limit.
@@ -325,14 +347,7 @@ impl ChClient {
     ) -> Result<ChResult, ChError> {
         let mut settings: Vec<(&str, String)> = Vec::new();
         if let Some(limit) = options.max_execution_time {
-            // Whole seconds, rounded up: a limit is never shortened.
-            settings.push((
-                "max_execution_time",
-                limit
-                    .as_secs()
-                    .saturating_add(u64::from(limit.subsec_nanos() > 0))
-                    .to_string(),
-            ));
+            settings.push(("max_execution_time", max_execution_time_seconds(limit)));
             settings.push(("wait_end_of_query", "1".to_owned()));
             // `cancel_http_readonly_queries_on_client_close` only takes effect
             // when the server writes to the connection and finds it closed; a
@@ -343,11 +358,7 @@ impl ChClient {
             // 1 s after the client closed. hyper reads at most 100 response
             // headers, so the interval is stretched until a limit's headers
             // stay under `PROGRESS_HEADERS_MAX`.
-            settings.push(("send_progress_in_http_headers", "1".to_owned()));
-            settings.push((
-                "http_headers_progress_interval_ms",
-                progress_interval_ms(limit).to_string(),
-            ));
+            push_progress_settings(limit, &mut settings);
         }
         if let Some(rows) = options.max_result_rows {
             settings.push(("max_result_rows", rows.to_string()));
@@ -515,6 +526,9 @@ impl ChClient {
     /// cancel the query when the client goes (`BI-1` review fix (SHOULD-FIX)
     /// R10; the comment used to say the close alone did it).
     ///
+    /// This is [`ChClient::query_stream_with_options`] with the default
+    /// options: no query id and no time limit.
+    ///
     /// # Errors
     ///
     /// [`ChError::Transport`] on a network failure, [`ChError::Server`] on a
@@ -524,18 +538,68 @@ impl ChClient {
         sql: &str,
         timeout: std::time::Duration,
     ) -> Result<RowStream, ChError> {
+        self.query_stream_with_options(sql, timeout, &QueryOptions::default())
+            .await
+    }
+
+    /// Run `sql` like [`ChClient::query_stream`], under the identity and the
+    /// time limit of `options`.
+    ///
+    /// `query_id` and `max_execution_time` travel as URL settings of this one
+    /// request, together with the progress headers a limited request needs,
+    /// so the statement the caller wrote is the statement that runs. The
+    /// request's own timeout is the longer of `timeout` and
+    /// `options.request_timeout()` (the time limit plus [`LIMIT_MARGIN`]): the
+    /// engine's own "time limit" answer then arrives instead of a bare
+    /// transport timeout.
+    ///
+    /// `wait_end_of_query` is **not** sent: the rows are handed over while
+    /// the query runs, and a query that hits its time limit after the first
+    /// rows are out ends the stream with a line that is not a row.
+    ///
+    /// `options.max_result_rows` is not sent either: this stream is not
+    /// capped by the engine's row limit. The caller that owns the cap counts
+    /// the rows as they arrive, and the engine's own cap would cut the
+    /// result at a block boundary anyway.
+    ///
+    /// # Errors
+    ///
+    /// See [`ChClient::query_stream`].
+    pub async fn query_stream_with_options(
+        &self,
+        sql: &str,
+        timeout: std::time::Duration,
+        options: &QueryOptions,
+    ) -> Result<RowStream, ChError> {
+        let mut settings: Vec<(&str, String)> = Vec::new();
+        if let Some(limit) = options.max_execution_time {
+            settings.push(("max_execution_time", max_execution_time_seconds(limit)));
+            push_progress_settings(limit, &mut settings);
+        }
+        if let Some(id) = &options.query_id {
+            settings.push(("query_id", id.clone()));
+        }
+        settings.push((
+            "cancel_http_readonly_queries_on_client_close",
+            "1".to_owned(),
+        ));
+        let borrowed: Vec<(&str, &str)> = settings.iter().map(|(k, v)| (*k, v.as_str())).collect();
         let body = format!(
             "{}\nFORMAT JSONCompactEachRowWithNamesAndTypes",
             strip_trailing_semicolon(sql)
         );
+        let request_timeout = match options.request_timeout() {
+            Some(limit_timeout) => timeout.max(limit_timeout),
+            None => timeout,
+        };
         let response = self
             .client
             .post(&self.url)
             .basic_auth(&self.user, Some(&self.password))
             .header(CONTENT_TYPE, "text/plain; charset=utf-8")
             .header(CACHE_CONTROL, "no-store")
-            .query(&[("cancel_http_readonly_queries_on_client_close", "1")])
-            .timeout(timeout)
+            .query(&borrowed)
+            .timeout(request_timeout)
             .body(body)
             .send()
             .await?;
@@ -556,6 +620,75 @@ impl ChClient {
         stream.names = header_strings(names.as_deref())?;
         stream.types = header_strings(types.as_deref())?;
         Ok(stream)
+    }
+
+    /// Run `sql` and hand the response body back as bytes, as they arrive.
+    ///
+    /// The statement goes to the engine verbatim — no `FORMAT` is appended —
+    /// so the caller says which format it wants (`FORMAT Parquet`).
+    ///
+    /// The body is not held: [`ByteStream::next_chunk`] hands over one chunk
+    /// at a time, so a big file costs no more memory than the chunk in the
+    /// caller's hands.
+    ///
+    /// The URL settings are `query_id` and `max_execution_time` when
+    /// `options` names them, plus `wait_end_of_query=1` when a time limit is
+    /// set: the engine writes a file whole, so a failure after the first
+    /// bytes arrives as a status instead of as bytes, and the caller learns
+    /// that the file is incomplete rather than writing a truncated one. The
+    /// progress headers of a limited request are sent too, and
+    /// `cancel_http_readonly_queries_on_client_close=1` always, so a dropped
+    /// download stops the query on the engine.
+    ///
+    /// The request's own timeout is `options.request_timeout()` (the time
+    /// limit plus [`LIMIT_MARGIN`]); without a time limit the client's own
+    /// default applies.
+    ///
+    /// # Errors
+    ///
+    /// [`ChError::Transport`] on a network failure, [`ChError::Server`] when
+    /// `ClickHouse` responds with a non-2xx status.
+    pub async fn byte_stream(
+        &self,
+        sql: &str,
+        options: &QueryOptions,
+    ) -> Result<ByteStream, ChError> {
+        let mut settings: Vec<(&str, String)> = Vec::new();
+        if let Some(limit) = options.max_execution_time {
+            settings.push(("max_execution_time", max_execution_time_seconds(limit)));
+            settings.push(("wait_end_of_query", "1".to_owned()));
+            push_progress_settings(limit, &mut settings);
+        }
+        if let Some(id) = &options.query_id {
+            settings.push(("query_id", id.clone()));
+        }
+        settings.push((
+            "cancel_http_readonly_queries_on_client_close",
+            "1".to_owned(),
+        ));
+        let borrowed: Vec<(&str, &str)> = settings.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let mut request = self
+            .client
+            .post(&self.url)
+            .basic_auth(&self.user, Some(&self.password))
+            .header(CONTENT_TYPE, "text/plain; charset=utf-8")
+            .header(CACHE_CONTROL, "no-store")
+            .query(&borrowed)
+            .body(sql.to_owned());
+        if let Some(timeout) = options.request_timeout() {
+            request = request.timeout(timeout);
+        }
+        let response = request.send().await?;
+        let status = response.status();
+        if !status.is_success() {
+            let text = response.text().await?;
+            return Err(ChError::Server(server_error_message(status, &text)));
+        }
+        Ok(ByteStream {
+            response,
+            bytes_read: 0,
+            checked_first_chunk: false,
+        })
     }
 }
 
@@ -641,6 +774,63 @@ impl RowStream {
                 None => self.finished = true,
             }
         }
+    }
+}
+
+/// A `ClickHouse` response body read as bytes (see [`ChClient::byte_stream`]).
+///
+/// The body is handed over chunk by chunk, as it arrives: nothing is held
+/// but the chunk the caller has in its hands. Dropping the stream closes the
+/// connection, and the engine is told to cancel the query when the client
+/// goes.
+pub struct ByteStream {
+    response: reqwest::Response,
+    bytes_read: u64,
+    checked_first_chunk: bool,
+}
+
+impl ByteStream {
+    /// The next chunk of the body as it arrives, or `None` at the end of the
+    /// body.
+    ///
+    /// The first chunk is checked for the engine's exception text: a query
+    /// that fails before the engine writes anything answers with a `200` and
+    /// that text in the body, and handing it over as bytes would write an
+    /// error message into the file. Only the first chunk is checked — the
+    /// rest of the body is not held, so a failure after it is not caught
+    /// here; the time limit a download runs under is what covers that (the
+    /// engine writes the file whole, so its failure arrives as a status).
+    ///
+    /// # Errors
+    ///
+    /// [`ChError::Transport`] when the connection fails or times out
+    /// mid-body; [`ChError::Server`] when the first chunk holds the engine's
+    /// exception text.
+    pub async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, ChError> {
+        let Some(chunk) = self.response.chunk().await? else {
+            return Ok(None);
+        };
+        if !self.checked_first_chunk {
+            self.checked_first_chunk = true;
+            // Read as text, lossy: a `Parquet` file starts with `PAR1` and
+            // does not match the engine's exception text.
+            let text = String::from_utf8_lossy(&chunk);
+            if body_is_exception(&text) {
+                return Err(ChError::Server(text.into_owned()));
+            }
+        }
+        self.bytes_read = self.bytes_read.saturating_add(chunk.len() as u64);
+        Ok(Some(chunk.to_vec()))
+    }
+
+    /// How many bytes have been handed over so far.
+    ///
+    /// A chunk that turned out to be the engine's exception is not counted:
+    /// it was never handed over. The download route counts the same way to
+    /// decide when to refuse a result that is over its cap.
+    #[must_use]
+    pub fn bytes_read(&self) -> u64 {
+        self.bytes_read
     }
 }
 
@@ -1331,5 +1521,313 @@ mod tests {
             None
         );
         assert_eq!(ChError::Cancelled.server_code(), None);
+    }
+
+    // -- the row stream under options --------------------------------------
+
+    /// The URL settings of a request a mock server received, as decoded
+    /// pairs.
+    fn url_settings(request: &wiremock::Request) -> Vec<(String, String)> {
+        request
+            .url
+            .query_pairs()
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn the_row_stream_carries_the_query_id_and_the_time_limit_and_never_waits_for_the_end() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("[\"a\"]\n[\"Int64\"]\n"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let options = QueryOptions {
+            max_execution_time: Some(std::time::Duration::from_secs(45)),
+            query_id: Some("u:r:1".to_owned()),
+            ..QueryOptions::default()
+        };
+        let rows = client(&server.uri())
+            .query_stream_with_options("SELECT 1", std::time::Duration::from_secs(5), &options)
+            .await
+            .unwrap();
+        assert_eq!(rows.names(), ["a"]);
+        let requests = server.received_requests().await.unwrap();
+        let settings = url_settings(&requests[0]);
+        assert!(
+            settings.contains(&("query_id".to_owned(), "u:r:1".to_owned())),
+            "{settings:?}"
+        );
+        assert!(
+            settings.contains(&("max_execution_time".to_owned(), "45".to_owned())),
+            "{settings:?}"
+        );
+        assert!(
+            settings.contains(&("send_progress_in_http_headers".to_owned(), "1".to_owned())),
+            "{settings:?}"
+        );
+        assert!(
+            !settings.iter().any(|(key, _)| key == "wait_end_of_query"),
+            "the row stream answers while the query runs: {settings:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_row_stream_is_not_capped_by_the_engine_row_limit() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("[\"a\"]\n[\"Int64\"]\n"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let options = QueryOptions {
+            max_result_rows: Some(10),
+            ..QueryOptions::default()
+        };
+        client(&server.uri())
+            .query_stream_with_options("SELECT 1", std::time::Duration::from_secs(5), &options)
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let settings = url_settings(&requests[0]);
+        assert!(
+            !settings.iter().any(|(key, _)| key == "max_result_rows"),
+            "{settings:?}"
+        );
+        assert!(
+            !settings
+                .iter()
+                .any(|(key, _)| key == "result_overflow_mode"),
+            "{settings:?}"
+        );
+    }
+
+    // -- the byte stream ---------------------------------------------------
+
+    #[tokio::test]
+    async fn the_byte_stream_sends_the_statement_verbatim() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("FORMAT Parquet"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"PAR1payloadPAR1"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut stream = client(&server.uri())
+            .byte_stream("SELECT 1 FORMAT Parquet", &QueryOptions::default())
+            .await
+            .unwrap();
+        let mut body = Vec::new();
+        while let Some(chunk) = stream.next_chunk().await.unwrap() {
+            body.extend_from_slice(&chunk);
+        }
+        assert_eq!(body, b"PAR1payloadPAR1");
+
+        let requests = server.received_requests().await.unwrap();
+        let sent = String::from_utf8(requests[0].body.clone()).unwrap();
+        assert_eq!(
+            sent, "SELECT 1 FORMAT Parquet",
+            "the statement goes to the engine as it was written"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_byte_stream_carries_the_query_id_the_time_limit_and_the_wait_for_the_end() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"PAR1"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let options = QueryOptions {
+            max_execution_time: Some(std::time::Duration::from_secs(45)),
+            query_id: Some("u:r:1:download".to_owned()),
+            ..QueryOptions::default()
+        };
+        client(&server.uri())
+            .byte_stream("SELECT 1 FORMAT Parquet", &options)
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let settings = url_settings(&requests[0]);
+        assert!(
+            settings.contains(&("query_id".to_owned(), "u:r:1:download".to_owned())),
+            "{settings:?}"
+        );
+        assert!(
+            settings.contains(&("max_execution_time".to_owned(), "45".to_owned())),
+            "{settings:?}"
+        );
+        assert!(
+            settings.contains(&("wait_end_of_query".to_owned(), "1".to_owned())),
+            "the engine writes the file whole, so a failure arrives as a status: {settings:?}"
+        );
+        assert!(
+            settings.contains(&("send_progress_in_http_headers".to_owned(), "1".to_owned())),
+            "{settings:?}"
+        );
+        assert!(
+            settings.contains(&(
+                "cancel_http_readonly_queries_on_client_close".to_owned(),
+                "1".to_owned()
+            )),
+            "{settings:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_byte_stream_without_a_time_limit_never_waits_for_the_end() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"PAR1"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        client(&server.uri())
+            .byte_stream("SELECT 1 FORMAT Parquet", &QueryOptions::default())
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let settings = url_settings(&requests[0]);
+        assert!(
+            !settings.iter().any(|(key, _)| key == "wait_end_of_query"),
+            "{settings:?}"
+        );
+        assert!(
+            !settings.iter().any(|(key, _)| key == "max_execution_time"),
+            "{settings:?}"
+        );
+        assert!(
+            settings.contains(&(
+                "cancel_http_readonly_queries_on_client_close".to_owned(),
+                "1".to_owned()
+            )),
+            "a dropped download stops the query on the engine: {settings:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_byte_stream_fails_when_the_engine_writes_its_exception_instead_of_a_file() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "Code: 159. DB::Exception: Timeout exceeded: elapsed 45000.0 ms, maximum: 45000. (TIMEOUT_EXCEEDED)",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut stream = client(&server.uri())
+            .byte_stream("SELECT 1 FORMAT Parquet", &QueryOptions::default())
+            .await
+            .unwrap();
+        let err = stream.next_chunk().await.unwrap_err();
+        assert!(
+            matches!(&err, ChError::Server(msg) if msg.contains("TIMEOUT_EXCEEDED")),
+            "{err:?}"
+        );
+        assert!(err.is_time_limit(), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn the_byte_stream_maps_a_non_2xx_status_to_ch_error_server() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(500).set_body_string("Code: 47. Unknown identifier"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let Err(err) = client(&server.uri())
+            .byte_stream("SELECT bogus FORMAT Parquet", &QueryOptions::default())
+            .await
+        else {
+            panic!("the engine's answer was taken for a file");
+        };
+        assert!(
+            matches!(&err, ChError::Server(msg) if msg.contains("Unknown identifier")),
+            "{err:?}"
+        );
+    }
+
+    /// A server that answers with a chunked body: the first chunk goes out at
+    /// once, the second one after `pause`. A client that held the whole body
+    /// before handing anything over could not answer before the pause is
+    /// over.
+    fn chunked_body_server(first: &[u8], second: &[u8], pause: std::time::Duration) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let first = first.to_vec();
+        let second = second.to_vec();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            // Read the request head; the body is short and the client writes
+            // it before it reads the response.
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                match stream.read(&mut byte) {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => head.push(byte[0]),
+                }
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+                .unwrap();
+            for (index, chunk) in [&first, &second].into_iter().enumerate() {
+                if index > 0 {
+                    std::thread::sleep(pause);
+                }
+                stream
+                    .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
+                    .unwrap();
+                stream.write_all(chunk).unwrap();
+                stream.write_all(b"\r\n").unwrap();
+                stream.flush().unwrap();
+            }
+            stream.write_all(b"0\r\n\r\n").unwrap();
+            stream.flush().unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn the_byte_stream_hands_the_body_over_as_it_arrives() {
+        let url = chunked_body_server(
+            b"PAR1first",
+            b"secondPAR1",
+            std::time::Duration::from_secs(2),
+        );
+        let mut stream = client(&url)
+            .byte_stream("SELECT 1 FORMAT Parquet", &QueryOptions::default())
+            .await
+            .unwrap();
+
+        let first = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next_chunk())
+            .await
+            .expect("the first chunk arrives before the rest of the body exists")
+            .unwrap()
+            .unwrap();
+        assert_eq!(first, b"PAR1first");
+        assert_eq!(stream.bytes_read(), 9);
+
+        let mut body = first;
+        while let Some(chunk) = stream.next_chunk().await.unwrap() {
+            body.extend_from_slice(&chunk);
+        }
+        assert_eq!(body, b"PAR1firstsecondPAR1");
+        assert_eq!(stream.bytes_read(), 19);
     }
 }
