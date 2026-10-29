@@ -228,6 +228,23 @@ pub const MAX_STDERR_BYTES: usize = 2 * 1024;
 /// proxy gives up at 130 s, so the conversion answers first.
 pub const CONVERSION_WALL: Duration = Duration::from_secs(90);
 
+/// How long the API waits for a child that said nothing to end, before it is
+/// killed (`PR #187` review round 2 B2).
+///
+/// A child that closed its output has usually ended, and its exit code is
+/// what says that the installation is at fault ([`exit::LIMIT_FAILED`]). One
+/// that closed its output and kept running must not hold the request, so it
+/// is killed under this bound.
+const SILENT_CHILD_WAIT: Duration = Duration::from_secs(5);
+
+/// How long the API waits for the child's own ending once the wall clock has
+/// passed (`PR #187` review round 2 S3).
+///
+/// After a kill the deadline is behind us, so the standard error and the
+/// task that feeds the child are read under a FRESH bound of their own: what
+/// the child said is the only place that says why it died.
+const ENDING_WAIT: Duration = Duration::from_secs(1);
+
 /// The sentence for a file that needed more memory or more time than a read
 /// is allowed (`SEC-22` D4). The cases cannot be told apart reliably — a
 /// signal, an allocation failure and a timeout look the same from here — so
@@ -1681,8 +1698,14 @@ impl ConversionRunner {
         };
         if read == 0 {
             // The child said nothing: it died before its answer. Its ending
-            // is logged, and that is where the out-of-memory abort shows up.
-            return Err(self.refuse_the_child(child, stderr, feed, deadline).await);
+            // is the reason — that is where the out-of-memory abort shows up
+            // — and it is read BEFORE the child is killed: a child that
+            // could not set its own limits says so with its exit code, and a
+            // kill would hide that code behind `SIGKILL`
+            // (`PR #187` review round 2 B2).
+            return Err(self
+                .ending_of_a_silent_child(child, stderr, feed, deadline)
+                .await);
         }
         if !answer_line_fits(&line) {
             // The answer is over the cap, or the child stopped before the
@@ -1722,6 +1745,9 @@ impl ConversionRunner {
 
     /// The child is not to be trusted with the answer: it is killed, its
     /// ending is logged, and the answer is a resource limit.
+    ///
+    /// A store that failed while the file was fed is the real reason, and it
+    /// is a 503 (`PR #187` review round 2 B1).
     async fn refuse_the_child(
         &self,
         mut child: Child,
@@ -1730,8 +1756,63 @@ impl ConversionRunner {
         deadline: tokio::time::Instant,
     ) -> ConversionError {
         let _killed = child.start_kill();
-        let _ = self.wait(child, stderr, feed, deadline).await;
-        ConversionError::ResourceLimit
+        match self.wait(child, stderr, feed, deadline).await {
+            Err(ConversionError::Store(err)) => ConversionError::Store(err),
+            _ => ConversionError::ResourceLimit,
+        }
+    }
+
+    /// The ending of a child that said nothing: it is waited for BEFORE it is
+    /// killed, so that its exit code is not hidden behind `SIGKILL`
+    /// (`PR #187` review round 2 B2).
+    ///
+    /// A child that could not set its own limits exits with
+    /// [`exit::LIMIT_FAILED`] and writes no answer, so the API sees the end
+    /// of the output and not a refusal. That exit code is what says the
+    /// installation is at fault, and it is a 500 — not the file's sentence.
+    async fn ending_of_a_silent_child(
+        &self,
+        mut child: Child,
+        stderr: tokio::task::JoinHandle<Vec<u8>>,
+        feed: tokio::task::JoinHandle<Result<(), ConversionError>>,
+        deadline: tokio::time::Instant,
+    ) -> ConversionError {
+        // The child closed its output. It has usually ended, and its ending
+        // is the reason; one that closed its output and kept running is
+        // killed under [`SILENT_CHILD_WAIT`], so that it does not hold the
+        // request.
+        let bound = tokio::time::Instant::now() + SILENT_CHILD_WAIT;
+        let status = match tokio::time::timeout_at(bound.min(deadline), child.wait()).await {
+            Ok(Ok(status)) => status,
+            Ok(Err(_err)) => {
+                tracing::warn!("the child that reads an uploaded file could not be waited for");
+                return ConversionError::ResourceLimit;
+            }
+            Err(_elapsed) => {
+                // It is still running: it is killed, and the answer is a
+                // resource limit.
+                let _killed = child.start_kill();
+                let status = child.wait().await;
+                let feeding = self.join_the_feed(feed, deadline).await;
+                let text = self.join_the_stderr(stderr, deadline).await;
+                tracing::warn!(
+                    status = ?status,
+                    stderr = %text,
+                    "the child that reads an uploaded file said nothing and did not end"
+                );
+                return match feeding {
+                    Err(ConversionError::Store(err)) => ConversionError::Store(err),
+                    _ => ConversionError::ResourceLimit,
+                };
+            }
+        };
+        let feeding = self.join_the_feed(feed, deadline).await;
+        let text = self.join_the_stderr(stderr, deadline).await;
+        match the_ending(&feeding, status, &text) {
+            Err(ConversionError::LimitFailed) => ConversionError::LimitFailed,
+            Err(ConversionError::Store(err)) => ConversionError::Store(err),
+            _ => ConversionError::ResourceLimit,
+        }
     }
 
     /// Wait for the child to end, and read what it said on its standard
@@ -1752,11 +1833,7 @@ impl ConversionRunner {
         feed: tokio::task::JoinHandle<Result<(), ConversionError>>,
         deadline: tokio::time::Instant,
     ) -> Result<(), ConversionError> {
-        let feeding = match tokio::time::timeout_at(deadline, feed).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_join)) => Err(ConversionError::Refused(Refusal::ResourceLimit)),
-            Err(_elapsed) => Err(ConversionError::Refused(Refusal::ResourceLimit)),
-        };
+        let feeding = self.join_the_feed(feed, deadline).await;
         let status = match tokio::time::timeout_at(deadline, child.wait()).await {
             Ok(Ok(status)) => status,
             Ok(Err(_err)) => {
@@ -1768,61 +1845,106 @@ impl ConversionRunner {
                 // is logged.
                 let _killed = child.start_kill();
                 let status = child.wait().await;
-                let kept = match tokio::time::timeout_at(deadline, stderr).await {
-                    Ok(Ok(kept)) => kept,
-                    Ok(Err(_join)) => Vec::new(),
-                    Err(_elapsed) => Vec::new(),
-                };
-                let text = String::from_utf8_lossy(&kept);
+                let text = self.join_the_stderr(stderr, deadline).await;
                 tracing::warn!(
                     status = ?status,
-                    stderr = %text.trim(),
+                    stderr = %text,
                     "the child that reads an uploaded file did not finish in time"
                 );
-                return Err(ConversionError::ResourceLimit);
+                // The killed child's own status is a signal, so the ending
+                // is a resource limit — unless the store failed while the
+                // file was fed, which is the real reason.
+                let Ok(status) = status else {
+                    return Err(ConversionError::ResourceLimit);
+                };
+                return the_ending(&feeding, status, &text);
             }
         };
         // The standard error is read through the deadline as well: a child
         // that leaves a grandchild holding the pipe open must not hold the
         // request (`PR #187` review SHOULD-FIX 4).
-        let kept = match tokio::time::timeout_at(deadline, stderr).await {
+        let text = self.join_the_stderr(stderr, deadline).await;
+        the_ending(&feeding, status, &text)
+    }
+
+    /// The task that feeds the child, joined under a bound.
+    ///
+    /// The bound is FRESH once the wall clock has passed: the task is
+    /// usually blocked writing to a child that is gone, and it must not be
+    /// left behind, and a store failure in it must still be found
+    /// (`PR #187` review round 2 S3).
+    async fn join_the_feed(
+        &self,
+        feed: tokio::task::JoinHandle<Result<(), ConversionError>>,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), ConversionError> {
+        let bound = deadline.max(tokio::time::Instant::now() + ENDING_WAIT);
+        match tokio::time::timeout_at(bound, feed).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_join)) => Err(ConversionError::Refused(Refusal::ResourceLimit)),
+            Err(_elapsed) => Err(ConversionError::Refused(Refusal::ResourceLimit)),
+        }
+    }
+
+    /// What the child said on its standard error, under a bound.
+    ///
+    /// The bound is FRESH once the wall clock has passed: after a kill the
+    /// deadline is behind us, and what the child said is the only place that
+    /// says why it died (`PR #187` review round 2 S3).
+    async fn join_the_stderr(
+        &self,
+        stderr: tokio::task::JoinHandle<Vec<u8>>,
+        deadline: tokio::time::Instant,
+    ) -> String {
+        let bound = deadline.max(tokio::time::Instant::now() + ENDING_WAIT);
+        let kept = match tokio::time::timeout_at(bound, stderr).await {
             Ok(Ok(kept)) => kept,
             Ok(Err(_join)) => Vec::new(),
             Err(_elapsed) => Vec::new(),
         };
-        let text = String::from_utf8_lossy(&kept);
-        let text = text.trim().to_owned();
-        // A store failure while the file was fed is the real reason, and it
-        // is a 503: the file may well read once the store is back.
-        if let Err(ConversionError::Store(err)) = &feeding {
-            let err = *err;
-            tracing::warn!(%err, status = ?status, stderr = %text, "the store could not be read while the child was fed");
-            return Err(ConversionError::Store(err));
+        String::from_utf8_lossy(&kept).trim().to_owned()
+    }
+}
+
+/// The ending of the child, as the answer: its exit code, and the store
+/// failure that may have stopped it.
+///
+/// A store failure while the file was fed is the real reason, and it wins
+/// over the child's own ending: the file may well read once the store is
+/// back, and it is a 503 (`PR #187` review round 2 B1).
+fn the_ending(
+    feeding: &Result<(), ConversionError>,
+    status: std::process::ExitStatus,
+    text: &str,
+) -> Result<(), ConversionError> {
+    if let Err(ConversionError::Store(err)) = &feeding {
+        let err = *err;
+        tracing::warn!(%err, status = ?status, stderr = %text, "the store could not be read while the child was fed");
+        return Err(ConversionError::Store(err));
+    }
+    match status.code() {
+        Some(exit::OK) => {
+            if !text.is_empty() {
+                tracing::warn!(stderr = %text, "the child that reads an uploaded file said something");
+            }
+            Ok(())
         }
-        match status.code() {
-            Some(exit::OK) => {
-                if !text.is_empty() {
-                    tracing::warn!(stderr = %text, "the child that reads an uploaded file said something");
-                }
-                Ok(())
-            }
-            Some(exit::LIMIT_FAILED) => {
-                // The child could not set its own limits: an installation
-                // fault, not a bad file (`PR #187` review SHOULD-FIX 4).
-                tracing::warn!(stderr = %text, "the child could not set its own limits");
-                Err(ConversionError::LimitFailed)
-            }
-            Some(code) => {
-                tracing::warn!(code, stderr = %text, "the child that reads an uploaded file did not finish");
-                Err(ConversionError::Refused(
-                    Refusal::for_exit_code(code).unwrap_or(Refusal::Unreadable),
-                ))
-            }
-            // Killed by a signal: out of memory, out of time, or killed.
-            None => {
-                tracing::warn!(status = ?status, stderr = %text, "the child that reads an uploaded file was killed");
-                Err(ConversionError::ResourceLimit)
-            }
+        Some(exit::LIMIT_FAILED) => {
+            // The child could not set its own limits: an installation
+            // fault, not a bad file (`PR #187` review SHOULD-FIX 4).
+            tracing::warn!(stderr = %text, "the child could not set its own limits");
+            Err(ConversionError::LimitFailed)
+        }
+        Some(code) => {
+            tracing::warn!(code, stderr = %text, "the child that reads an uploaded file did not finish");
+            Err(ConversionError::Refused(
+                Refusal::for_exit_code(code).unwrap_or(Refusal::Unreadable),
+            ))
+        }
+        // Killed by a signal: out of memory, out of time, or killed.
+        None => {
+            tracing::warn!(status = ?status, stderr = %text, "the child that reads an uploaded file was killed");
+            Err(ConversionError::ResourceLimit)
         }
     }
 }

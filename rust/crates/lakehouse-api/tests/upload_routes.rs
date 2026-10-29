@@ -7827,6 +7827,10 @@ const NEEDS_MORE_MEMORY: &str = "This file needs more memory or time to read tha
 const TOO_MANY_CONVERSIONS: &str =
     "Too many files are being read right now. Try again in a few seconds.";
 
+/// The sentence of a conversion that could not be made at all: the
+/// installation is at fault, and not the file (`SEC-22` D4).
+const CONVERSION_FAILED: &str = "The file could not be converted.";
+
 /// A stand-in for the child that reads an uploaded file: it takes its time
 /// and answers nothing, so a test can hold a conversion slot for as long as
 /// it needs one.
@@ -8139,6 +8143,30 @@ fn silent_child() -> std::path::PathBuf {
     path
 }
 
+/// A stand-in for the child that could not set its OWN limits: it exits with
+/// the code of that fault (`upload_convert::exit::LIMIT_FAILED`) and writes
+/// no answer (`PR #187` review round 2 B2).
+///
+/// The installation is at fault, and not the file, so the answer is a 500.
+fn limits_failed_child() -> std::path::PathBuf {
+    let dir = tempfile::tempdir().expect("a temporary directory for the stand-in child");
+    let path = dir.path().join("limits-failed-child");
+    std::fs::write(&path, "#!/bin/sh\nexit 12\n").expect("the stand-in child is written");
+    let mut permissions = std::fs::metadata(&path)
+        .expect("the stand-in child exists")
+        .permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        permissions.set_mode(0o755);
+    }
+    std::fs::set_permissions(&path, permissions).expect("the stand-in child is executable");
+    // The directory is removed when it goes out of scope; the child has
+    // already been read by then, and the API starts it by path.
+    std::mem::forget(dir);
+    path
+}
+
 #[tokio::test]
 async fn a_child_that_says_nothing_is_a_resource_limit() {
     let stack = Stack::with(Options {
@@ -8161,6 +8189,43 @@ async fn a_child_that_says_nothing_is_a_resource_limit() {
         .await;
     assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.text);
     assert_eq!(reply.json["error"], NEEDS_MORE_MEMORY, "{}", reply.text);
+}
+
+/// A child that could not set its own limits is the INSTALLATION's fault,
+/// and not the file's: it is a 500, and not the sentence that tells the user
+/// to save the file as a CSV (`PR #187` review round 2 B2).
+#[tokio::test]
+async fn a_child_that_could_not_set_its_own_limits_is_a_500_and_not_the_file_s_fault() {
+    let stack = Stack::with(Options {
+        conversion_child: Some(limits_failed_child()),
+        ..Options::default()
+    })
+    .await;
+    let bayu = stack.bayu().await;
+    let reply = stack
+        .send(
+            &bayu,
+            "POST",
+            "/api/uploads",
+            file_form(
+                "stock.xlsx",
+                "application/octet-stream",
+                &workbook("stock.xlsx"),
+            ),
+        )
+        .await;
+    assert_eq!(
+        reply.status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "{}",
+        reply.text
+    );
+    assert_eq!(reply.json["error"], CONVERSION_FAILED, "{}", reply.text);
+    assert!(
+        !reply.text.contains(NEEDS_MORE_MEMORY),
+        "the file is not at fault: {}",
+        reply.text
+    );
 }
 
 /// A stand-in for the child that writes an answer that is not JSON and then
