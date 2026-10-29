@@ -52,6 +52,10 @@ volumes:
   # SRC-9 task 4: the SFTP fixture's host key, minted once by
   # `sftp-g6-hostkey-init`; read-only in `sftp-g6` and in `g6-test-runner`.
   sftp_g6_hostkey:
+  # PR #192 review BLOCKER 11, GATE-ONLY: a combined CA bundle containing the
+  # Postgres CA (`ca.crt`) plus `mssql-g6`'s CA certificate
+  # (`ca.crt`), written by `g6-ca-bundle-init`.
+  g6_connector_ca:
 
 services:
   dagster-code-location:
@@ -59,12 +63,13 @@ services:
       INGEST_ALLOW_INTERNAL_HOSTS: "true"
       # OpenSSL (Microsoft ODBC Driver 18's TLS implementation on Linux)
       # honours SSL_CERT_FILE for the default trust store -- pointed at
-      # mssql-g6-cert-init's self-signed cert (mounted below) so the
+      # mssql-g6-cert-init's CA cert (mounted below) so the
       # `mssql` adapter's real `TrustServerCertificate=no` verification
       # has a CA it can actually verify `mssql-g6`'s certificate against.
       # Gate-only: a real deployment dials real, CA-issued SQL Server
       # certificates and needs no override of the system trust store.
-      SSL_CERT_FILE: /etc/mssql-tls/mssql-g6.pem
+      # PR #192 review BLOCKER 11: point at fixture's CA cert, not server cert.
+      SSL_CERT_FILE: /etc/mssql-tls/ca.crt
     volumes:
       - type: volume
         source: g6_secrets
@@ -75,7 +80,37 @@ services:
         target: /etc/mssql-tls
         read_only: true
 
+  # PR #192 review BLOCKER 11, GATE-ONLY: combine the Postgres CA (`ca.crt`)
+  # and mssql-g6's CA certificate (`ca.crt`) into a single CA bundle
+  # for lakehouse-api. The API trusts this bundle via CONNECTOR_TLS_CA_FILE so both
+  # the bundled Postgres connector and mssql-g6 verify TLS without loosening
+  # encryption levels or using trust_cert.
+  g6-ca-bundle-init:
+    image: alpine:3.20
+    restart: "no"
+    depends_on:
+      postgres-cert-init:
+        condition: service_completed_successfully
+      mssql-g6-cert-init:
+        condition: service_completed_successfully
+        required: false
+    volumes:
+      - lakehouse_postgres_ca:/postgres-ca:ro
+      - mssql_g6_tls:/mssql-tls:ro
+      - g6_connector_ca:/out
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        cat /postgres-ca/ca.crt > /out/ca-bundle.crt &&
+        if [ -f /mssql-tls/ca.crt ]; then
+          cat /mssql-tls/ca.crt >> /out/ca-bundle.crt;
+        fi &&
+        chmod 644 /out/ca-bundle.crt
+
   lakehouse-api:
+    depends_on:
+      g6-ca-bundle-init:
+        condition: service_completed_successfully
     environment:
       # SEC-15, GATE-ONLY: the default docker-compose.yml now blocks
       # internal addresses for the API's connection test, discovery and
@@ -94,10 +129,17 @@ services:
       # Loopback, link-local and the cloud metadata address stay closed
       # whatever this lists. Not for a real deployment.
       WEBHOOK_ALLOWED_CIDRS: "10.213.67.0/24"
+      # PR #192 review BLOCKER 11, GATE-ONLY: point CONNECTOR_TLS_CA_FILE at the
+      # combined bundle containing both the Postgres CA and mssql-g6 certificate.
+      CONNECTOR_TLS_CA_FILE: /run/certs/gate-ca/ca-bundle.crt
     volumes:
       - type: volume
         source: g6_secrets
         target: /run/secrets
+        read_only: true
+      - type: volume
+        source: g6_connector_ca
+        target: /run/certs/gate-ca
         read_only: true
 
   mysql-g6:

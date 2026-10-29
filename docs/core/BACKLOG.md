@@ -64,7 +64,8 @@ estimate (S, M, L), which the base has no field for.
 | ID | Kind | Item | Module | Priority | Status | PR | Source |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `AI-18` | Feature | Copilot Chat: ask a question or give an instruction in plain language, and the assistant answers or acts with the console's own tools; risky actions wait for approval. Built before this backlog tracked PRs; never accepted | AI Copilot | P1 | In Acceptance | #169 | `PRODUCT.md` §2 (Home, History) |
-| `SEC-22` | Task | Converting an uploaded workbook can exhaust the API's memory and stop the API for every user; the conversion must not be able to end the API process. Also: the Parquet reader trusts sizes from the file's footer the same way (by reading, not run); no limit on conversions running at once; no byte cap on workbook text; each preview converts the whole file again; the limits doc in `upload_workbook.rs` says the opposite of the code | Administration & Security | P0 | Todo |  | PR #76 review, BLOCKER 1 (merged without the fix); `superpowers/plans/2026-10-12-delivery-review.md` |
+| `SEC-22` | Task | Converting an uploaded workbook can exhaust the API's memory and stop the API for every user; the conversion must not be able to end the API process. Also: the Parquet reader trusts sizes from the file's footer the same way (by reading, not run); no limit on conversions running at once; no byte cap on workbook text; each preview converts the whole file again; the limits doc in `upload_workbook.rs` says the opposite of the code | Administration & Security | P0 | In Progress | #187 | PR #76 review, BLOCKER 1 (merged without the fix); `superpowers/plans/2026-10-12-delivery-review.md` |
+| `SEC-55` | Task | Previewing a Parquet file in an S3 files connector reads it in the API process (`connector_listing.rs`, `upload_parquet::inspect` on up to 64 MiB), so a crafted footer can end the API for every tenant, as `SEC-22` found for uploads: `parquet` reserves list space from counts the footer declares before any check runs. Fix: send it to the `SEC-22` child with its tail only. **Waits for `SEC-22`** | Administration & Security | P1 | Todo |  | PR #187 review round 1, P3 (`superpowers/plans/2026-10-16-sec-22-upload-conversion-memory.md`) |
 | `SEC-23` | Task | Adding a quality, classification or residency rule asked only for a login, while changing one asks for `governance:write`; adding now asks for it too, in the API, the assistant's tools and the console | Administration & Security | P1 | Done | #97 | `features/governance-rule-create.md` |
 | `DATA-1` | Feature | Gold tables publish to open format automatically, as an option per table | Build | P1 | In Acceptance | #60, #63, #64 | `features/gold-publish-per-mart.md` |
 | `QA-1` | Task | Accept each built feature with a checklist, starting with what a demo shows | Delivery | P1 | Todo |  | PRODUCT §4 blocker 1 |
@@ -74,7 +75,7 @@ estimate (S, M, L), which the base has no field for.
 | `GOV-2` | Decision | Decide which role may publish a table in open format | Governance | P1 | Open |  | PRODUCT §6 |
 | `SEC-10` | Task | Alert webhooks can be pointed at internal addresses; use the allowlisted resolver. The `SRC-17` gate (`ops/g6/src17_alert_delivery_test.py`) receives webhooks on its own network: this item gives that gate its documented opt-in | Administration & Security | P1 | Done | #105 | `lakehouse-notify` |
 | `SEC-11` | Task | Dashboard tiles and public/embed links return raw database error text. Same rule as `SEC-6` | Administration & Security | P1 | Done | #105 | `routes/support.rs` |
-| `SEC-14` | Feature | A stored connector password can be stolen by re-pointing the connector: a host change keeps the secret and the next test sends it to the new server. Part B (#192): **Blocked by `SEC-41`** | Administration & Security | P0 | Building | #85 | `routes/connectors.rs`, `connector_probe.rs` |
+| `SEC-14` | Feature | A stored connector password can be stolen by re-pointing the connector: a host change keeps the secret and the next test sends it to the new server. Part B (#192): TLS for every connector dial, and the password test refuses anything but SCRAM | Administration & Security | P0 | In Acceptance | #85, #192 | `routes/connectors.rs`, `connector_probe.rs` |
 | `SEC-15` | Feature | Connection tests can reach internal addresses: the block is off by default in compose, the REST test follows redirects, no address pinning, CDC delete skips the check | Administration & Security | P0 | Released | #82 | `docker-compose.yml`, `connector_probe.rs` |
 | `SEC-13` | Task | Check `.env.staging`, pushed straight to `main` in `7ec3a81`, for real credentials or hostnames; rotate anything real | Administration & Security | P1 | Done | #130 | commit `7ec3a81` |
 | `SEC-24` | Task | The assistant's system prompt gives any signed-in user the DATA MAP (tables, row counts, sample values) without `catalog:read`; a Dashboard Viewer sees samples Query Studio would refuse it. Give the map only with `catalog:read`, and sample values only with `query:read` | Administration & Security | P1 | Done | #202 | `superpowers/plans/2026-10-12-delivery-review.md` (`SEC-9` gap) |
@@ -321,8 +322,8 @@ parity), built after it.
 | `DATA-4` | Planned | — | `DATA-3` |
 | `DEC-8` | Decided | — | `AI-11` |
 | `QS-5` | Planned | — | `AI-12` (variables part) |
-| `SEC-14` | Building | — | `SRC-4` (credentials) |
 | `SEC-20` | In Progress | — | `QS-3` |
+| `SEC-22` | In Progress | — | `SEC-55` (the child process) |
 | `AI-11` | Planned | `BI-19`, `DEC-8` | — |
 | `AI-12` | Building | `QS-5` (variables part) | — |
 | `AI-13` | Planned | `BI-14` | — |
@@ -333,11 +334,11 @@ parity), built after it.
 | `DATA-3` | Planned | `DATA-4` | — |
 | `QS-3` | Planned | `SEC-20` | — |
 | `REL-6` | Todo | `BLD-1` | — |
-| `SRC-4` | Planned | `SEC-14` (credentials) | — |
+| `SEC-55` | Todo | `SEC-22` (the child process) | — |
 
 **Ready to start** (Todo, Planned or Idea, nothing open blocks it; Idea items still need a spec):
 
-`ADM-1`, `ADM-2`, `AI-10`, `AI-21`, `AI-22`, `BI-14`, `BI-20`, `BI-27`, `BI-28`, `BI-29`, `BI-3`, `BI-30`, `BI-31`, `BI-32`, `BI-33`, `BI-34`, `BI-35`, `BI-36`, `BIZ-1`, `BIZ-2`, `BLD-10`, `BLD-6`, `DATA-20`, `DATA-21`, `DATA-22`, `DATA-23`, `DATA-24`, `DATA-25`, `DATA-26`, `DATA-27`, `DATA-28`, `DATA-29`, `DATA-30`, `DATA-31`, `DATA-32`, `DATA-33`, `DATA-34`, `DATA-36`, `DATA-4`, `DATA-5`, `DATA-6`, `DATA-8`, `DOC-2`, `GOV-1`, `GOV-3`, `GOV-5`, `INT-2`, `OPS-2`, `OPS-3`, `OPS-6`, `OPS-8`, `QA-1`, `QRY-1`, `REL-1`, `REL-2`, `REL-4`, `REL-7`, `SEC-22`, `SEC-34`, `SEC-4`, `SEC-40`, `SEC-50`, `SEC-54`, `SEC-7`, `SRC-15`, `SRC-18`, `SRC-2`, `SRC-22`, `SRC-23`, `SRC-24`, `SRC-25`, `SRC-26`, `SRC-27`, `SRC-28`, `SRC-30`, `SRC-31`, `SRC-33`, `SRC-34`, `SRC-5`, `VER-1`
+`ADM-1`, `ADM-2`, `AI-10`, `AI-21`, `AI-22`, `BI-14`, `BI-20`, `BI-27`, `BI-28`, `BI-29`, `BI-3`, `BI-30`, `BI-31`, `BI-32`, `BI-33`, `BI-34`, `BI-35`, `BI-36`, `BIZ-1`, `BIZ-2`, `BLD-10`, `BLD-6`, `DATA-20`, `DATA-21`, `DATA-22`, `DATA-23`, `DATA-24`, `DATA-25`, `DATA-26`, `DATA-27`, `DATA-28`, `DATA-29`, `DATA-30`, `DATA-31`, `DATA-32`, `DATA-33`, `DATA-34`, `DATA-36`, `DATA-4`, `DATA-5`, `DATA-6`, `DATA-8`, `DOC-2`, `GOV-1`, `GOV-3`, `GOV-5`, `INT-2`, `OPS-2`, `OPS-3`, `OPS-6`, `OPS-8`, `QA-1`, `QRY-1`, `REL-1`, `REL-2`, `REL-4`, `REL-7`, `SEC-34`, `SEC-4`, `SEC-40`, `SEC-50`, `SEC-54`, `SEC-7`, `SRC-15`, `SRC-18`, `SRC-2`, `SRC-22`, `SRC-23`, `SRC-24`, `SRC-25`, `SRC-26`, `SRC-27`, `SRC-28`, `SRC-30`, `SRC-31`, `SRC-33`, `SRC-34`, `SRC-4`, `SRC-5`, `VER-1`
 
 ## Dates
 
@@ -360,7 +361,8 @@ set by the product owner and are left empty until they are.
 | `AI-17` | | 2026-10-08; late-ask wording 2026-10-18 (#208) | |
 | `AI-15` | | first run 2026-10-15 | |
 | `BLD-4` | 2026-10-15 | 2026-10-16 | |
-| `SEC-14` | 2026-10-08 | first PR, 2026-10-08 | |
+| `SEC-14` | 2026-10-08 | first PR, 2026-10-08; part B, 2026-10-28 (#192) | |
+| `SEC-22` | 2026-10-16 | | |
 | `SEC-15` | 2026-10-08 | 2026-10-08 | |
 | `DATA-11` | 2026-10-09 | 2026-10-09 | |
 | `DATA-12` | 2026-10-09 | 2026-10-21 | |

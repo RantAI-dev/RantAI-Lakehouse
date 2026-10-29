@@ -24,12 +24,12 @@ Changing where a connector points can never send its stored password anywhere ne
 | --- | --- | --- |
 | Host, port, database or adapter change on PUT ingest-spec | Keeps the stored password | Requires new credentials in the same request, otherwise 409 |
 | Dial override on PUT credential | Same gap | Same rule for the slot not being changed |
-| PostgreSQL test TLS | Prefer (server may decline) | sslmode=require at least; verify-full when a CA is configured; never clear-text password authentication |
-| SQL Server test TLS | Encryption optional | Encryption required |
+| PostgreSQL test TLS | Require at least; verify-full when a CA is configured; SCRAM-SHA-256 only (cleartext and MD5 refused before credentials sent) | sslmode=require at least; verify-full when a CA is configured; never clear-text password authentication |
+| SQL Server test TLS | Encryption required; server cert verified against CA when configured | Encryption required |
 
 ## Benchmark
 
-Re-checked by the planner: lakehouse-store connectors.rs set_ingest_spec keeps secret_ref; connector_probe.rs uses PgSslMode::Prefer.
+Re-checked by the planner: lakehouse-store connectors.rs set_ingest_spec keeps secret_ref; connector_probe.rs uses pg_probe (verify-full with CA or Require without, SCRAM-SHA-256 only); sqlx dials require TLS; SQL Server requires encryption.
 
 ## Acceptance checklist
 
