@@ -2692,9 +2692,16 @@ async fn remove_connect_connector(state: &AppState, id: &str, force: bool) -> Re
         );
         return Ok(());
     }
+    // SRC-4 S2 review BLOCKER-1 (principle 4, SEC-11): Kafka Connect's error text is
+    // logged for the operator and never put in the response body.
+    tracing::error!(
+        connector_id = %id,
+        error = %err,
+        "Kafka Connect did not remove the change-capture connector; delete refused"
+    );
     Err(ApiError::Conflict(format!(
         "connector {id} was NOT deleted: Kafka Connect did not remove its \
-         change-capture connector ({err}); the registry row is kept so the \
+         change-capture connector; the registry row is kept so the \
          connector stays visible. Retry once Kafka Connect is reachable, or pass \
          ?force=true to delete the row anyway (the connector will then have to be \
          removed from Kafka Connect by hand)."
