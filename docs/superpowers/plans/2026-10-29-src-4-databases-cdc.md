@@ -283,6 +283,23 @@ Rejected: a synchronous `/test` that waits for a Dagster run (a run takes tens
 of seconds to start; an HTTP request held that long is a timeout waiting to
 happen); a new route (a second way to test one connector).
 
+**Amendment 3 (2026-10-29, slice 0 result, verified by the planner from both
+runs' `src4-result.json`).** Slice 0 met every target; ADR 0016 is Accepted.
+What slice 2 must carry over from it (each is in `docs/plans/SRC-4-RESULT.md`):
+- Debezium 3.8 ignores `delete.handling.mode` and `drop.tombstones`; the
+  connector renderer writes `delete.tombstone.handling.mode=rewrite`.
+- `dlt` renames double-underscore columns: the event columns are `_op`,
+  `_source_ts_ms`, `_deleted`, `_offset`, with a test that `dlt`'s naming
+  leaves them unchanged.
+- A refused schema is not retryable: the applier's op must not retry it (the
+  default retry policy hid a refusal for 13 minutes).
+- Not yet measured, so slice 2's gate covers it: the secret outside the
+  connector JSON (ADR 0016 point 4), a crash or a Kafka Connect restart
+  between the Bronze commit and the offset commit, schema change, a source
+  above 10,000 rows, several connectors at once.
+- Images: `quay.io/debezium/connect:3.8@sha256:d67d678c…` and
+  `apache/kafka:3.8.0@sha256:c89f315c…` (full digests in the result file).
+
 ## Handoff
 
 ### Slice 1, Oracle batch (developer, Sonnet, 2026-10-29)

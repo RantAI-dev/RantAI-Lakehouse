@@ -1,8 +1,10 @@
 # ADR 0016 — change capture per connector, on Kafka Connect
 
-- **Status:** Proposed. Accepted when the slice 0 measurement
-  (`docs/plans/SRC-4-RESULT.md`) meets the targets below; rejected and
-  rewritten if it does not (`SRC-4` decision 13)
+- **Status:** Accepted, 2026-10-29: the slice 0 measurement met every target
+  in two runs (`docs/plans/SRC-4-RESULT.md`, CI runs 40816001350 and
+  40817900374; worst p95 40.3 s against 120 s; Bronze equal to the source
+  after 90 changes and after 108,000, nothing missing or duplicated, in both
+  load modes). Was Proposed until then (`SRC-4` decision 13)
 - **Phase:** Data roadmap phase 4, `SRC-4`
 - **Date:** 2026-10-29
 - **Supersedes:** ADR 0007's "no dynamic per-connector provisioning" (its
@@ -57,10 +59,13 @@ MongoDB, created by the user in the console, with no operator step
 
 ## Consequences
 
-- The deployment grows by a broker and a Kafka Connect worker (roughly 1.5 to
-  2 GB of memory together; measured in slice 0).
-- A change reaches Bronze in minutes, not the fixed pipeline's 20 seconds:
-  the target is 2 minutes (decision 5, measured in slice 0).
+- The deployment grows by a broker and a Kafka Connect worker: measured at
+  1.2 to 1.3 GiB peak together in slice 0 (broker 580-637 MiB, worker
+  632-735 MiB), with one connector and two tables; more connectors were not
+  measured.
+- A change reaches Bronze in under a minute at p95 (measured 18 to 40 s, the
+  applier's 30-second sensor interval dominating), against the 2-minute target
+  (decision 5); the fixed pipeline did it in 20 s without the load modes.
 - Lag can be measured honestly in seconds: the applier knows the source
   commit time of the last change it applied, and Kafka knows the backlog.
 - Kafka Connect's REST API can run arbitrary connector classes; it must
