@@ -34,7 +34,7 @@
             echo "LISTENER = (DESCRIPTION_LIST = (DESCRIPTION ="
             echo "  (ADDRESS = (PROTOCOL = TCP)(HOST = 0.0.0.0)(PORT = 1521))"
             [ "$tcps" = yes ] && echo "  (ADDRESS = (PROTOCOL = TCPS)(HOST = 0.0.0.0)(PORT = 2484))"
-            echo "))"
+            echo ")))"
             if [ "$tcps" = yes ]; then
                 echo "WALLET_LOCATION = (SOURCE = (METHOD = FILE)(METHOD_DATA = (DIRECTORY = $WALLET)))"
                 echo "SSL_CLIENT_AUTHENTICATION = FALSE"
