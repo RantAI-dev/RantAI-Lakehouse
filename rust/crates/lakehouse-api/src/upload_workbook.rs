@@ -105,6 +105,16 @@ use serde::{Deserialize, Serialize};
 /// the conversion's memory bounded, not a measured limit.
 pub const MAX_SHEET_CELLS: u64 = 5_000_000;
 
+/// The most sheets the delete of an upload looks for when the number of
+/// sheets is not known (`SEC-22` review SHOULD-FIX 7).
+///
+/// The list of a workbook's sheets is written by the API itself, so the
+/// number of sheets is normally known exactly and this bound never applies.
+/// It applies when the list cannot be read: the delete then looks for this
+/// many sheets, and a workbook with more leaves the converted text of its
+/// last sheets behind. A bound, not a measurement.
+pub const MAX_SHEETS: usize = 256;
+
 /// Why a workbook could not be read. Each is a fixed sentence: nothing the
 /// library said reaches a response.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]

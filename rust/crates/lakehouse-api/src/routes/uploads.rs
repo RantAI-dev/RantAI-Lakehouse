@@ -3341,8 +3341,17 @@ pub async fn delete(
         // A text file named `.xls` or `.parquet` has none, and deleting a
         // missing key is a no-op.
         let sheets = sheets_key(&row.storage_key);
+        // The number of sheets is normally known: the API wrote the list
+        // itself. When the list is there but cannot be read, the delete
+        // looks for [`upload_workbook::MAX_SHEETS`] of them, so a workbook
+        // whose list was damaged does not leave its converted text behind
+        // (`PR #187` review SHOULD-FIX 7). When there is no list at all,
+        // there is no converted text under the new names either: an upload
+        // from before `SEC-22` has the legacy one, which is removed below.
         let sheets_count = match store.get_all(&sheets).await {
-            Ok(bytes) => stored_sheets(&bytes).map_or(0, |info| info.sheets.len()),
+            Ok(bytes) => {
+                stored_sheets(&bytes).map_or(upload_workbook::MAX_SHEETS, |info| info.sheets.len())
+            }
             Err(crate::upload_store::UploadStoreError::Unavailable("not found")) => 0,
             Err(err) => return Err(err.into()),
         };

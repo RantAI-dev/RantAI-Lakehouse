@@ -8470,3 +8470,50 @@ async fn deleting_a_workbook_removes_its_converted_objects() {
     assert_eq!(gone.status, StatusCode::NO_CONTENT, "{}", gone.text);
     assert!(stack.bucket.keys().is_empty(), "{:?}", stack.bucket.keys());
 }
+
+#[tokio::test]
+async fn deleting_a_workbook_whose_list_of_sheets_is_unreadable_still_removes_its_text() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    let upload = stack
+        .upload(&bayu, "stock.xlsx", &workbook("stock.xlsx"))
+        .await;
+    let id = id_of(&upload);
+    let preview = stack
+        .get(&bayu, &format!("/api/uploads/{id}/preview"))
+        .await;
+    assert_eq!(preview.status, StatusCode::OK, "{}", preview.text);
+    let original = format!("uploads/{GROUP}/{id}.xlsx");
+    assert!(
+        stack
+            .bucket
+            .keys()
+            .contains(&format!("{original}.converted.0.csv"))
+    );
+
+    // The list of the sheets cannot be read: the number of sheets is not
+    // known, and the delete must not leave the converted text behind
+    // (`PR #187` review SHOULD-FIX 7).
+    stack.bucket.put(
+        &format!("{original}.sheets.json"),
+        b"not the list of the sheets",
+    );
+    let gone = stack
+        .send(
+            &bayu,
+            "DELETE",
+            &format!("/api/uploads/{id}"),
+            Payload::None,
+        )
+        .await;
+    assert_eq!(gone.status, StatusCode::NO_CONTENT, "{}", gone.text);
+    let keys = stack.bucket.keys();
+    assert!(
+        !keys.contains(&format!("{original}.converted.0.csv")),
+        "the converted text is gone: {keys:?}"
+    );
+    assert!(
+        !keys.contains(&format!("{original}.converted.0.json")),
+        "the answer is gone: {keys:?}"
+    );
+}
