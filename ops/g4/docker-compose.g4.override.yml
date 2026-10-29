@@ -2,7 +2,8 @@
 #
 # `ops/g4/g4_test.py` registers the demo CDC source in the connector registry
 # (type `PostgreSQL CDC`) and calls the routes the console calls on it:
-# `POST .../test` and `POST .../discover`. Two things are needed that the
+# `POST .../test` and the discovery routes, and it creates the connector in Kafka
+# Connect through the API. Three things are needed that the
 # default docker-compose.yml deliberately does not give a real deployment, and
 # this file gives them to this gate's stack only, as
 # ops/g6/docker-compose.g6.override.yml does for its fixtures:
@@ -20,9 +21,19 @@
 #    /gate-secrets in the runner, which writes the Postgres password there.
 #    Nothing else in this stack reads it.
 #
+# 3. Change capture (SRC-4 slice 2). `KAFKA_CONNECT_URL` points the API at the
+#    `cdc` profile's `kafka-connect` (unset in the template, which keeps change
+#    capture off), `CDC_KAFKA_BOOTSTRAP` points the applier at its broker, and the
+#    applier may dial that internal address (`INGEST_ALLOW_INTERNAL_HOSTS`, the
+#    switch `ops/g6/docker-compose.g6.override.yml` sets for its fixtures; never a
+#    default of the template). The runner also mounts `lakehouse_cdc_secrets`
+#    READ-ONLY so the gate can prove that the password file exists with the
+#    source password and is removed on DELETE; production mounts that volume in
+#    `lakehouse-api` and `kafka-connect` only (docker-compose.yml explains why).
+#
 # Used as
 #   docker compose -p g4ci -f docker-compose.yml -f ops/g4/docker-compose.g4.override.yml \
-#     --profile dagster up -d --build ...
+#     --profile dagster --profile cdc up -d --build ...
 volumes:
   g4_secrets:
 
@@ -30,14 +41,28 @@ services:
   lakehouse-api:
     environment:
       CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS: "true"
+      KAFKA_CONNECT_URL: http://kafka-connect:8083
     volumes:
       - type: volume
         source: g4_secrets
         target: /run/secrets
         read_only: true
 
+  dagster-code-location:
+    environment:
+      CDC_KAFKA_BOOTSTRAP: kafka:9092
+      INGEST_ALLOW_INTERNAL_HOSTS: "true"
+
   g4-test-runner:
+    environment:
+      KAFKA_CONNECT_URL: http://kafka-connect:8083
+      # The gate prints a marker line the CI job waits for: no buffering.
+      PYTHONUNBUFFERED: "1"
     volumes:
       - type: volume
         source: g4_secrets
         target: /gate-secrets
+      - type: volume
+        source: lakehouse_cdc_secrets
+        target: /cdc-secrets
+        read_only: true

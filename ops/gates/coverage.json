@@ -24,9 +24,9 @@
       "notes": {
         "all": "SRC-9 plan task 6: ops/g4/g4_test.py records all four steps through gate_summary.",
         "connect": "ops/g4 registers the demo source as a 'PostgreSQL CDC' connector (adapter cdc) and POST .../test must answer supported:true, ok:true, like its SQL twin.",
-        "discover": "ops/g4: the schemas hold p5_cdc, the list of p5_cdc holds p5_cdc.orders, and its preview shows its columns (SRC-13 routes).",
-        "load": "ops/g4: the initial snapshot reaches Bronze and holds the seeded rows (first copy).",
-        "reload": "ops/g4: an insert, an update and a delete arriving within the latency budget."
+        "discover": "ops/g4: the schemas hold g4_cdc, the list of g4_cdc holds g4_cdc.orders, and its preview shows its columns (SRC-13 routes).",
+        "load": "ops/g4: the connector is created through the API (which provisions Kafka Connect) and its first copy reaches Bronze: 20,000 seeded rows in each of the two load modes.",
+        "reload": "ops/g4: an insert, an update and a delete each visible in Bronze within 120 s in both modes (SRC-4 D5); then a pause with 20,000 changes per table, a resume, a restart of kafka-connect during a stream of changes and a source schema change, each ending with Bronze equal to the source."
       }
     },
     "MySQL": {

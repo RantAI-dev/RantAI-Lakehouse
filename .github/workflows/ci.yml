@@ -901,11 +901,14 @@ jobs:
         if: always()
         run: docker compose -p g3ci down -v
 
-  # ── P5 (G4) acceptance (docs/plans/LAKEHOUSE-FOUNDATION-PLAN.md §3,
-  # docs/plans/P5-RESULT.md) — Debezium Server + debezium-server-iceberg
-  # captures a real Postgres table via logical replication; INSERT/UPDATE/
-  # DELETE are all visible in ClickHouse within the agreed latency, and
-  # replication-slot cleanup on connector delete is verified. WS5 item C3:
+  # ── G4 acceptance (SRC-4 slice 2, ADR 0016; docs/plans/P5-RESULT.md for the
+  # history) — PostgreSQL change capture on Kafka Connect: the connector is
+  # created through the API, INSERT/UPDATE/DELETE are all visible in ClickHouse
+  # within the agreed latency in both load modes, a pause and a restart of
+  # kafka-connect lose nothing, and the slot, publication and password file
+  # are gone after DELETE. The job restarts the kafka-connect container when
+  # the gate asks (the runner has no Docker access; see ops/g4/g4_test.py).
+  # WS5 item C3:
   # this job ALSO now needs the Dagster webserver/daemon and
   # lakehouse-api -- g4_test.py's step_wal_breach_produces_a_
   # silenceable_alert_instance (WS5 acceptance) logs into lakehouse-api,
@@ -916,7 +919,7 @@ jobs:
   # dagster-daemon set g3a-dagster/g3-maintenance already use, for the
   # same reason. See ops/g4/g4_test.py. ──
   g4-cdc:
-    name: Rust · G4 Debezium CDC into Bronze
+    name: Rust · G4 change capture into Bronze
     needs: [changes, images]
     if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
     runs-on: ubuntu-latest
@@ -976,34 +979,64 @@ jobs:
           OIDC_REDIRECT_URI=http://lakehouse-api:8080/api/auth/oidc/callback
           OIDC_JIT_PROVISIONING=true
           OIDC_ROLE_MAP=lakehouse-analysts=Analyst
+          # SRC-4: the change-capture applier's sensor reads the connector list
+          # as the ingest service identity (unset, it skips) and posts run
+          # reports as the pipeline-run identity; CI-ONLY throwaway values.
+          INGEST_SERVICE_TOKEN=ci-ingest-service-token-not-real-123
+          PIPELINE_RUN_TOKEN=ci-pipeline-run-token-not-real-123
           EOF
           # SEC-36: generated per run; no key-shaped literal in the repository.
           echo "CONNECTOR_SECRETS_KEY=$(openssl rand -base64 32)" >> .env
 
       # Fixture image, built here rather than shared; see `g3a-dagster`.
       - name: Build the oidc-mock fixture image
-        run: docker compose -p g4ci -f docker-compose.yml -f ops/g4/docker-compose.g4.override.yml --profile dagster build oidc-mock
+        run: docker compose -p g4ci -f docker-compose.yml -f ops/g4/docker-compose.g4.override.yml --profile dagster --profile cdc build oidc-mock
 
-      - name: Bring up Postgres/ClickHouse/RustFS/Lakekeeper, the demo CDC source, Debezium Server, and Dagster
+      - name: Bring up Postgres/ClickHouse/RustFS/Lakekeeper, Kafka, Kafka Connect, and Dagster
         # SRC-9 task 6: the `-f` pair on every compose call of this job (the
         # override adds the `file:` credential store and the internal-host
         # flag the connect and discover steps of the gate need).
         run: >
           docker compose -p g4ci -f docker-compose.yml -f ops/g4/docker-compose.g4.override.yml
-          --profile dagster up -d --no-build
+          --profile dagster --profile cdc up -d --no-build
           postgres clickhouse rustfs rustfs-bucket-init
           lakekeeper-db-init lakekeeper-migrate lakekeeper lakekeeper-warehouse-init
-          g4-source-init debezium-server
+          kafka kafka-connect
           lakehouse-api dagster-code-location dagster-webserver dagster-daemon
 
       - name: Run the G4 acceptance test inside the compose network
-        # `tee` and `-T`: the gate prints its connector table between two
-        # marker lines and the next step copies it to the job summary (same
-        # as g6-ingest). `shell: bash` for pipefail.
+        # The gate asks for one container restart (kafka-connect, during a
+        # stream of changes) by printing a marker line; the runner has no Docker
+        # access, so this step watches its log, restarts the container, and
+        # tells the runner with a file. `-T`: no TTY. `shell: bash` for
+        # pipefail. The log is streamed with `tail -f` and printed whole by
+        # the summary step after.
         shell: bash
         run: |
-          docker compose -p g4ci -f docker-compose.yml -f ops/g4/docker-compose.g4.override.yml \
-            --profile dagster run --rm -T g4-test-runner 2>&1 | tee "$RUNNER_TEMP/g4-run.log"
+          set -u
+          compose() {
+            docker compose -p g4ci -f docker-compose.yml -f ops/g4/docker-compose.g4.override.yml --profile dagster --profile cdc "$@"
+          }
+          log="$RUNNER_TEMP/g4-run.log"
+          : > "$log"
+          compose run --rm -T --name g4-runner g4-test-runner > "$log" 2>&1 &
+          run_pid=$!
+          tail -n +1 -f "$log" &
+          tail_pid=$!
+          restarted=0
+          while kill -0 "$run_pid" 2>/dev/null; do
+            if [ "$restarted" = 0 ] && grep -q '^G4-RESTART-KAFKA-CONNECT$' "$log"; then
+              compose restart kafka-connect
+              docker exec g4-runner touch /tmp/g4-kafka-connect-restarted
+              restarted=1
+            fi
+            sleep 2
+          done
+          status=0
+          wait "$run_pid" || status=$?
+          sleep 1
+          kill "$tail_pid" 2>/dev/null || true
+          exit "$status"
 
       - name: Add the connector gate table to the job summary
         if: always()
@@ -1016,11 +1049,11 @@ jobs:
 
       - name: Compose logs (on failure)
         if: failure()
-        run: docker compose -p g4ci -f docker-compose.yml -f ops/g4/docker-compose.g4.override.yml --profile dagster logs
+        run: docker compose -p g4ci -f docker-compose.yml -f ops/g4/docker-compose.g4.override.yml --profile dagster --profile cdc logs
 
       - name: Tear down
         if: always()
-        run: docker compose -p g4ci -f docker-compose.yml -f ops/g4/docker-compose.g4.override.yml --profile dagster down -v
+        run: docker compose -p g4ci -f docker-compose.yml -f ops/g4/docker-compose.g4.override.yml --profile dagster --profile cdc down -v
 
   # ── G10 (SEC-3) acceptance — a real sign-in through a real OIDC provider:
   # Keycloak answers the discovery document, the console's authorization-code
