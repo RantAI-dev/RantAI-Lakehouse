@@ -389,7 +389,7 @@ impl Tested {
     ///
     /// [`StoreError::Validation`] for a negative latency or one past
     /// [`MAX_TEST_LATENCY_MS`].
-    pub fn validate(&self) -> Result<(), StoreError> {
+    pub fn validate(self) -> Result<(), StoreError> {
         if !(0..=MAX_TEST_LATENCY_MS).contains(&self.latency_ms) {
             return Err(StoreError::Validation(format!(
                 "latencyMs must be between 0 and {MAX_TEST_LATENCY_MS}"
