@@ -27,6 +27,11 @@
 //! the Excel number format `lakehouse_bi::export_format::excel_number_format`
 //! returns; with "raw" nothing is formatted. A CSV "formatted" file holds the
 //! text the chart shows (`format_text`).
+//!
+//! A file the engine writes itself — the `Parquet` file — does not arrive as
+//! rows but as bytes: [`write_bytes_file`] writes them to a file on disk and
+//! counts them, and refuses a file that would pass the caller's byte cap
+//! rather than sending half of it.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -55,16 +60,6 @@ pub(crate) enum FileFormat {
     /// UTF-8 text with a byte-order mark.
     Csv,
     /// UTF-8 text with a byte-order mark, its fields separated by a tab.
-    ///
-    /// # Why this is `#[allow(dead_code)]`
-    ///
-    /// The Query Studio download route (`QS-2`) is the caller that offers the
-    /// tab-separated file: it builds this variant itself, and the allow above
-    /// goes away when that route lands.
-    #[allow(
-        dead_code,
-        reason = "the Query Studio download route builds it (QS-2); the allow goes away there"
-    )]
     Tsv,
     /// An Excel workbook, one sheet.
     Xlsx,
@@ -178,6 +173,21 @@ impl RowSource for lakehouse_clickhouse::RowStream {
     }
     fn next_row(&mut self) -> impl Future<Output = Result<Option<Vec<Value>>, ChError>> + Send {
         Self::next_row(self)
+    }
+}
+
+/// Bytes read one chunk at a time. The real source is
+/// [`lakehouse_clickhouse::ByteStream`], the body of a file the engine writes
+/// itself; the tests use a generator, so a big file can be counted without
+/// being held.
+pub(crate) trait ByteSource {
+    /// The next chunk of bytes, or `None` at the end of the body.
+    fn next_chunk(&mut self) -> impl Future<Output = Result<Option<Vec<u8>>, ChError>> + Send;
+}
+
+impl ByteSource for lakehouse_clickhouse::ByteStream {
+    fn next_chunk(&mut self) -> impl Future<Output = Result<Option<Vec<u8>>, ChError>> + Send {
+        Self::next_chunk(self)
     }
 }
 
@@ -335,6 +345,60 @@ pub(crate) async fn write_export_with_byte_cap<S: RowSource>(
     }
 }
 
+/// A file of bytes, open for reading from its start.
+pub(crate) struct ByteFile {
+    /// The file itself, at its first byte.
+    pub(crate) file: tokio::fs::File,
+    /// How many bytes it holds.
+    pub(crate) len: u64,
+}
+
+/// Read `source` to its end and write the bytes to a file on disk.
+///
+/// `byte_cap` is the most bytes the file may hold, `None` for no byte cap.
+/// A file that would pass the cap is not sent: the answer is `Ok(None)`, and
+/// the bytes written so far are removed with the file. A file that ends
+/// exactly at its cap is kept — the cap is a limit, not a reservation.
+///
+/// The bytes are counted as they arrive, so a file bigger than the cap costs
+/// no more memory than the chunk in the caller's hands.
+///
+/// # Errors
+///
+/// [`ExportError`]: the source failed or the disk failed.
+pub(crate) async fn write_bytes_file<S: ByteSource>(
+    source: &mut S,
+    byte_cap: Option<u64>,
+) -> Result<Option<ByteFile>, ExportError> {
+    let path = TempPath::new("bin");
+    let file = tokio::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path.0)
+        .await?;
+    // Unlinked at once: the open file stays usable, nothing is left to clean up.
+    drop(tokio::fs::remove_file(&path.0).await);
+    let mut out = BufWriter::new(file);
+    let mut bytes = 0_u64;
+    while let Some(chunk) = source.next_chunk().await? {
+        let len = chunk.len() as u64;
+        if let Some(cap) = byte_cap
+            && bytes + len > cap
+        {
+            // Past the cap: the file is not sent, not even half of it.
+            return Ok(None);
+        }
+        out.write_all(&chunk).await?;
+        bytes += len;
+    }
+    out.flush().await?;
+    let mut file = out.into_inner();
+    let len = file.seek(SeekFrom::End(0)).await?;
+    file.seek(SeekFrom::Start(0)).await?;
+    Ok(Some(ByteFile { file, len }))
+}
+
 /// The per-column facts both writers need.
 struct Columns {
     labels: Vec<String>,
@@ -450,7 +514,7 @@ pub(crate) const XLSX_DATA_ROW_CAP: usize = 1_048_575;
 
 /// The rows a workbook may hold: the caller's own cap, or the sheet's when the
 /// sheet's is smaller.
-fn xlsx_row_cap(caller_cap: usize) -> usize {
+pub(crate) fn xlsx_row_cap(caller_cap: usize) -> usize {
     caller_cap.min(XLSX_DATA_ROW_CAP)
 }
 
@@ -982,5 +1046,63 @@ mod tests {
         assert_eq!(numeric_string("12345"), Some(12345.0));
         assert_eq!(numeric_string("1234567890123456789"), None);
         assert_eq!(numeric_string("abc"), None);
+    }
+
+    /// Bytes made on demand, so no test holds the file it counts.
+    struct GeneratedBytes {
+        chunks: Vec<Vec<u8>>,
+        next: usize,
+    }
+
+    impl ByteSource for GeneratedBytes {
+        // A plain `fn` returning a finished future, not an `async fn`: the
+        // generator has nothing to await (the same shape as `Generated`).
+        fn next_chunk(
+            &mut self,
+        ) -> impl std::future::Future<Output = Result<Option<Vec<u8>>, ChError>> + Send {
+            let chunk = self.chunks.get(self.next).cloned();
+            self.next += 1;
+            std::future::ready(Ok(chunk))
+        }
+    }
+
+    fn bytes(chunks: &[&[u8]]) -> GeneratedBytes {
+        GeneratedBytes {
+            chunks: chunks.iter().map(|c| c.to_vec()).collect(),
+            next: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_file_past_the_byte_cap_is_refused_and_nothing_of_it_is_kept() {
+        let mut source = bytes(&[b"PAR1", b"\x00\x00\x00\x00", b"PAR1"]);
+        let written = write_bytes_file(&mut source, Some(8)).await.unwrap();
+        assert!(
+            written.is_none(),
+            "a file of 12 bytes is over a cap of 8 and must not be sent"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_file_exactly_at_the_byte_cap_is_kept_with_its_bytes() {
+        let mut source = bytes(&[b"PAR1", b"\x00\x00\x00\x00"]);
+        let mut written = write_bytes_file(&mut source, Some(8))
+            .await
+            .unwrap()
+            .expect("a file of exactly the cap is kept");
+        assert_eq!(written.len, 8);
+        let mut out = Vec::new();
+        written.file.read_to_end(&mut out).await.unwrap();
+        assert_eq!(out, b"PAR1\x00\x00\x00\x00");
+    }
+
+    #[tokio::test]
+    async fn a_file_without_a_cap_is_kept_whatever_its_size() {
+        let mut source = bytes(&[b"PAR1", b"\x00\x00\x00\x00"]);
+        let written = write_bytes_file(&mut source, None)
+            .await
+            .unwrap()
+            .expect("no cap, no refusal");
+        assert_eq!(written.len, 8);
     }
 }

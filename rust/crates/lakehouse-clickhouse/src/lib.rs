@@ -869,7 +869,12 @@ fn build_query_body(sql: &str) -> String {
 /// mirroring the TypeScript `sql.replace(/;\s*$/, "")`. If `sql` has no
 /// trailing `;`, it is returned unchanged — including any trailing
 /// whitespace, which is then carried into the `FORMAT JSON` line.
-fn strip_trailing_semicolon(sql: &str) -> &str {
+///
+/// Public because a caller that appends its own `FORMAT` clause to a
+/// statement it sends verbatim needs the same rule this crate applies to
+/// the statements it formats itself.
+#[must_use]
+pub fn strip_trailing_semicolon(sql: &str) -> &str {
     let end_trimmed = sql.trim_end_matches(char::is_whitespace);
     end_trimmed.strip_suffix(';').unwrap_or(sql)
 }
