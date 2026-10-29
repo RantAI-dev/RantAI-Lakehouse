@@ -300,6 +300,121 @@ What slice 2 must carry over from it (each is in `docs/plans/SRC-4-RESULT.md`):
 - Images: `quay.io/debezium/connect:3.8@sha256:d67d678c…` and
   `apache/kafka:3.8.0@sha256:c89f315c…` (full digests in the result file).
 
+**Amendment 4 (2026-10-29): slice 2 in detail.** Anchors verified in the
+working tree at `d7e24aad` (the slice 2 survey; line numbers drift, so the
+developer finds each by its name). Slice 2 runs after slice 1 is closed, on the
+same branch, one task per commit. Planner's decisions (technical, within the
+signed decisions; none changes what the product owner signed):
+
+- **S2-a Secrets reach Kafka Connect through a memory-only file the API
+  writes.** Managed credentials are sealed with AES-256-GCM (ADR 0002
+  addendum 5) and only the API (and the orchestrator) can open them; manager
+  references must pass `SECRET_MANAGER_ALLOWED_PREFIXES` at every use
+  (addendum 6). So the API resolves the connector's `secretRef` through its own
+  allowlisted resolver (`state.rs` `connector_secret_resolver`) and writes the
+  plain value to `/run/cdc-secrets/<connector id>` (mode 0400) on a volume
+  `lakehouse_cdc_secrets` that is **tmpfs** (`driver_opts: type: tmpfs`), mounted
+  read-write in `lakehouse-api` and read-only in `kafka-connect`, nowhere else.
+  The connector config names it with Kafka Connect's built-in
+  `DirectoryConfigProvider` (`${dir:/run/cdc-secrets:<connector id>}`), so the
+  password is never in the connector JSON, the config topic or the REST API's
+  answers. tmpfs empties on restart: on start, and on every provisioning call,
+  the API rewrites the file for each change-capture connector before it
+  touches Kafka Connect. A rotated secret is rewritten and the connector
+  restarted. The developer first checks that the pinned
+  `quay.io/debezium/connect:3.8` image turns `CONNECT_CONFIG_PROVIDERS*`
+  environment variables into worker settings; if not, stop and report. ADR
+  0016 point 4 is amended to say this (a plain copy in memory only, the same
+  exposure as the worker's own process memory).
+- **S2-b The API is Kafka Connect's only client** (`kafka_connect.rs`): base URL
+  `KAFKA_CONNECT_URL`; unset means a change-capture connector answers
+  `supported: false` with a fixed sentence (fail closed), never a 500. An
+  allowlist of connector classes (PostgreSQL now; MySQL, SQL Server, MongoDB,
+  Oracle added by their slices). Kafka Connect's error text never reaches a
+  response (classified, principle 4). Connector name `lakehouse-<connector id>`,
+  topic prefix `cdc.<connector id>`.
+- **S2-c Rendering** (`lakehouse-store/src/cdc.rs`): a new renderer produces the
+  Kafka Connect connector JSON for PostgreSQL from the registry row and the
+  ingest spec: the dial's own `slotName` and `publicationName` (today's template
+  ignores them and invents `{slug}_slot`), `table.include.list` from the source
+  objects, `snapshot.mode=initial`, `publication.autocreate.mode=disabled`, JSON
+  converter without schemas, `ExtractNewRecordState` with
+  `delete.tombstone.handling.mode=rewrite` and `add.fields=op,source.ts_ms`
+  (amendment 3), the password as the config-provider reference. The Debezium
+  Server properties renderer and its test that reads the compose file go.
+- **S2-d TLS to the source.** `CdcDial` gains `sslMode` like `SqlDial`
+  (`disable | require | verify-ca | verify-full`, default `require`), rendered
+  into `database.sslmode`; `SEC-14`'s rule applies (no plain-text dial of a
+  stored credential unless the person chose `disable`, shown as such).
+- **S2-e Lifecycle.** Create or `PUT ingest-spec` of a change-capture connector
+  provisions (write secret, `PUT /connectors/<name>/config`, which creates or
+  updates); a new `POST /api/connectors/{id}/pause` (`connector:manage`, in
+  `POLICY_TABLE` and `tests/route_auth.rs` both ways) sets `paused_reason` to a
+  fixed "paused by a person" and pauses it in Kafka Connect; `resume` lifts that
+  reason too and resumes it; the existing pauses (schema change, auto-disable)
+  pause it in Kafka Connect as well; `DELETE` removes the Kafka Connect connector
+  first, then drops the slot and publication as today, then the secret file.
+  Topics are left to the broker's retention (7 days, stated in the limits).
+  No migration is needed (`paused_reason` is free text); if one turns out to be,
+  the first free number is 0116.
+- **S2-f The applier, productionised** (from `origin/measure/src-4-cdc`
+  `cdc_apply.py`): one static `cdc_apply_job` with config `connector_id`, one
+  sensor `cdc_apply_sensor` (30 s, `default_status=RUNNING` with the reason)
+  that lists change-capture connectors from `GET /api/connectors/ingestible`
+  (which today filters `cdc` out of what is due: give the sensor its own
+  query), skips paused and busy ones, and launches a run for a connector whose
+  topics have unread messages (`adapters/kafka.py` `compute_lag`). Each run
+  posts run reports (`run_reports.py`) so `SRC-11`'s streak and `SRC-7`'s alerts
+  apply unchanged; observes each table's columns through `schema_observer`
+  (`SRC-8`), pausing the connector on a "wait" decision; and fails without retry
+  on a refused schema (`Failure(allow_retries=False)`, amendment 3; the op keeps
+  `DEFAULT_RETRY_POLICY` for everything else, `test_op_source_metadata.py`
+  stays as it is).
+- **S2-g Load modes for change capture** (D4, without a new enum value):
+  `validate_load_modes` accepts for `cdc` exactly `incremental_dedup`, shown as
+  "Current row per key" (the default), and `history`; both need a primary key.
+  The console's change-capture setup stops hiding `LoadModeFields` and shows
+  those two only.
+- **S2-h The fixed pipeline goes**, everything in the survey's list:
+  `debezium-server`, `debezium-localhost-proxy`, `g4-source-init`'s `p5_cdc`
+  seed (replaced by the gate's own source setup), the `lakehouse_debezium_data`
+  volume, the Lakekeeper `debezium` principal and its token, `ops/debezium/*`,
+  `/debezium-properties` and its console panel (replaced by the Kafka Connect
+  connector's state, in fixed words: running, paused, failed), the CI comments
+  that avoided `--profile dagster` because of it, and the docs (`OPERATIONS.md`,
+  `ARCHITECTURE.md`, README). `.env.staging` is the product owner's file: its
+  lines are removed in the branch only, and the handoff names them.
+- **S2-i Compose**: `kafka` and `kafka-connect` under a `cdc` profile, pinned by
+  digest (amendment 3), no published ports (comment saying why), `${X:?}` for
+  what must be set, the tmpfs volume of S2-a, broker retention 7 days.
+- **S2-j The `g4-cdc` gate on the new path** (timeout stays 20 min; slowest
+  connector job under 20 min, `SRC-9`): create the connector through the API
+  (provisions Kafka Connect); two tables, one per mode, 20,000 seeded rows each;
+  first copy; insert, update and delete each visible within **120 s** (D5);
+  `GET` the connector's config from Kafka Connect and assert the password is
+  not in it; pause through the new route, write 20,000 changes, resume, Bronze
+  equals the source with nothing missing or twice; restart `kafka-connect`
+  during a stream of changes, again equal; a schema change is observed;
+  `DELETE` removes the Kafka Connect connector, the slot and the secret file;
+  the WAL alert and OIDC steps stay. `coverage.json` follows.
+
+Tasks, in order (one commit each; Rust together, then Python, then console,
+then compose and gate; scoped checks per commit, the full block before
+handoff):
+T2.1 `CdcDial.sslMode` and the Kafka Connect renderer (S2-c, S2-d).
+T2.2 `kafka_connect.rs` client and config (S2-b).
+T2.3 secret materialisation (S2-a), with the ADR 0016 amendment.
+T2.4 lifecycle: provision, pause route, resume, delete (S2-e), `POLICY_TABLE`,
+`route_auth.rs`.
+T2.5 load modes for `cdc` (S2-g, Rust side).
+T2.6 the applier and its sensor (S2-f), with unit tests (no network).
+T2.7 the console: load modes, connector state, pause and resume (S2-g, S2-e).
+T2.8 compose (S2-i) and removal of the fixed pipeline (S2-h).
+T2.9 the gate (S2-j) and `coverage.json`.
+T2.10 docs: feature page "Limits", OPERATIONS, CHANGELOG.
+*Acceptance:* `SRC-4-AC1`, `AC2` and `AC5` for PostgreSQL in `g4-cdc`; every
+other check that passes on `main` passes.
+
 ## Handoff
 
 ### Slice 1, Oracle batch (developer, Sonnet, 2026-10-29)
