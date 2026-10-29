@@ -3,7 +3,7 @@
 import * as React from "react"
 import Link from "next/link"
 import type { ColumnDef } from "@tanstack/react-table"
-import { Copy, Download, Search } from "lucide-react"
+import { Copy, Search } from "lucide-react"
 import { DataTable } from "@/components/data-table/data-table"
 import { DataTableColumnHeader } from "@/components/data-table/data-table-column-header"
 import { MetadataList } from "@/components/patterns/metadata-list"
@@ -12,15 +12,19 @@ import { SectionCard } from "@/components/patterns/section-card"
 import { Button } from "@/components/ui/button"
 import { useDataTable } from "@/hooks/use-data-table"
 import { copyText } from "@/lib/copy-text"
-import { downloadCsv, toTsv } from "@/lib/csv"
-import { csvFileName, tableCsv } from "@/lib/table-csv"
+import { toTsv } from "@/lib/csv"
 import { formatBytes, formatCost, formatDuration, formatNumber } from "@/lib/format"
 import { notifyFailure, notifySuccess } from "@/lib/notify"
 import { ENGINE_CATEGORY_LABEL, WORKLOAD_CLASS_LABEL } from "@/lib/status"
-import type { QueryCell, QueryResult } from "@/services/contracts/queries"
+import type {
+  QueryCell,
+  QueryDownloadFormat,
+  QueryResult,
+} from "@/services/contracts/queries"
 import { QueryCellInspector } from "./query-cell-inspector"
 import { QueryColumnFilters } from "./query-column-filters"
 import { QueryColumnStatistics } from "./query-column-statistics"
+import { QueryDownloadMenu } from "./query-download-menu"
 import { QueryResultBanner } from "./query-result-banner"
 import { cellText, filterRows, type QueryRow } from "./query-grid-tools"
 import { QueryPlanPanel } from "./query-transparency-panel"
@@ -138,6 +142,12 @@ function buildQueryResultColumns(
 
 interface QueryResultsSectionProps {
   readonly result: QueryResult
+  /** The id the run of this result had, or null when there is none. */
+  readonly runId: string | null
+  /** Asks the server for the result as a file, in the chosen format. */
+  readonly onDownload: (format: QueryDownloadFormat) => void
+  /** The file kind being downloaded, or null when none is. */
+  readonly downloadBusy: QueryDownloadFormat | null
 }
 
 /** Query result rows plus the actual execution metrics beneath them. */
@@ -203,23 +213,12 @@ export function QueryResultsSection(props: QueryResultsSectionProps) {
             <Copy className="size-4" aria-hidden />
             Copy as TSV
           </Button>
-          <Button
-            size="sm"
-            variant="outline"
-            disabled={result.rows.length === 0}
-            onClick={() =>
-              downloadCsv(
-                csvFileName("query results"),
-                tableCsv(
-                  result.columns.map((c) => ({ id: c, label: c })),
-                  result.rows
-                )
-              )
-            }
-          >
-            <Download className="size-4" aria-hidden />
-            Export CSV
-          </Button>
+          <QueryDownloadMenu
+            resultId={props.runId === null ? null : result.id}
+            engine={result.engine}
+            busy={props.downloadBusy}
+            onDownload={props.onDownload}
+          />
           {result.auditEventId ? (
             <Button
               size="sm"

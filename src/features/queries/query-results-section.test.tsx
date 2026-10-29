@@ -96,7 +96,12 @@ function result(overrides: Partial<QueryResult> = {}): QueryResult {
 function renderSection(r: QueryResult) {
   return render(
     <TableProviders>
-      <QueryResultsSection result={r} />
+      <QueryResultsSection
+        result={r}
+        runId="7f0c0f0e-3c7e-4a3e-9d4f-0a1b2c3d4e5f"
+        downloadBusy={null}
+        onDownload={() => {}}
+      />
     </TableProviders>
   )
 }

@@ -220,6 +220,27 @@ export type SqlProposal = { sql: string; reason: string }
  */
 export type SqlFixOutcome = SqlProposal | { answer: string }
 
+/**
+ * The file kinds a Query Studio download can be.
+ */
+export type QueryDownloadFormat = "csv" | "tsv" | "xlsx" | "parquet"
+
+/**
+ * What a finished download holds.
+ */
+export type QueryDownload = {
+  /** The file the server sent. */
+  blob: Blob
+  /** The name the server gave it (from `Content-Disposition`). */
+  fileName: string
+  /** The rows the file holds; null when the server does not say (the engine-written file). */
+  rows: number | null
+  /** Whether a limit cut the file short. */
+  cut: boolean
+  /** Which limit cut it; null when the file was not cut. */
+  cutBy: "rows" | "bytes" | null
+}
+
 export interface QueryService {
   listSaved(signal?: AbortSignal): Promise<SavedQuery[]>
   saveQuery(input: SaveQueryInput, signal?: AbortSignal): Promise<SavedQuery>
@@ -242,6 +263,18 @@ export interface QueryService {
    * the call answers 404 until then; Stop aborts the request either way.
    */
   cancel(runId: string, signal?: AbortSignal): Promise<{ stopped: number }>
+  /**
+   * Downloads the result of a run as a file (`GET /api/query/run/{id}/download`).
+   * The server re-runs the stored statement with the caller's current masks
+   * and row filters; `runId` names the run, so Stop reaches the download's
+   * query on the engine.
+   */
+  download(
+    id: string,
+    format: QueryDownloadFormat,
+    runId: string,
+    signal?: AbortSignal
+  ): Promise<QueryDownload>
   /** Asks the chat's engine; masking, row filters and `query:read` apply to the SQL it runs. */
   askQuestion(question: string, signal?: AbortSignal): Promise<NlAnswer>
   generateSql(question: string, signal?: AbortSignal): Promise<{ sql: string; explanation: string }>

@@ -322,6 +322,55 @@ describe("Stop (BI-5 plan D5)", () => {
   })
 })
 
+describe("the query download", () => {
+  const RUN_ID = "7f0c0f0e-3c7e-4a3e-9d4f-0a1b2c3d4e5f"
+
+  it("asks for the file of one run, with the format and the run the run had", async () => {
+    const calls = stubFetch(() => new Response("a,b\r\n", { status: 200 }))
+    await clickhouseQueryService.download("q-1", "csv", RUN_ID)
+    expect(calls[0].url).toBe(`/api/query/run/q-1/download?format=csv&runId=${RUN_ID}`)
+  })
+
+  it("reads the name, the rows, the cut and the limit that cut the file from the response headers", async () => {
+    stubFetch(() =>
+      new Response("a,b\r\n", {
+        status: 200,
+        headers: {
+          "content-disposition": 'attachment; filename="q-1-first-100-rows.csv"',
+          "x-export-rows": "100",
+          "x-export-cut": "true",
+          "x-export-cut-by": "rows",
+        },
+      }),
+    )
+    const out = await clickhouseQueryService.download("q-1", "csv", RUN_ID)
+    expect(out.fileName).toBe("q-1-first-100-rows.csv")
+    expect(out.rows).toBe(100)
+    expect(out.cut).toBe(true)
+    expect(out.cutBy).toBe("rows")
+  })
+
+  it("counts no rows and claims no cut when the server says neither", async () => {
+    stubFetch(() =>
+      new Response("x", { status: 200, headers: { "x-export-cut": "false" } }),
+    )
+    const out = await clickhouseQueryService.download("q-1", "parquet", RUN_ID)
+    expect(out.rows).toBeNull()
+    expect(out.cut).toBe(false)
+    expect(out.cutBy).toBeNull()
+    expect(out.fileName).toBe("query.csv")
+  })
+
+  it("throws the server's own sentence when the download is refused", async () => {
+    stubFetch(() =>
+      json({ error: "permission_denied: Downloads are switched off for your role." }, 403),
+    )
+    await expect(
+      clickhouseQueryService.download("q-1", "csv", RUN_ID),
+    ).rejects.toThrow("Downloads are switched off for your role.")
+  })
+})
+
 describe("clickhouseQueryService.listHistory", () => {
   it("asks /api/query/history with no query string when no filter is given", async () => {
     const calls = stubFetch(() => json([]))
