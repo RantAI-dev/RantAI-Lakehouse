@@ -12,6 +12,10 @@ import {
   REST_OLD_OBJECT_NOTE,
   targetProblem,
 } from "./connector-ingest-panel"
+import type { SourceObject } from "@/services/contracts/connectors"
+
+/** A saved object as the server sends it: the same fields as the contract, with the mode a plain string so fixtures stay literals. */
+type WireSourceObject = Omit<SourceObject, "loadMode"> & { loadMode?: string }
 
 const originalFetch = global.fetch
 
@@ -28,7 +32,7 @@ const SPEC = {
   adapter: "sql",
   ingestMode: "batch",
   dial: { driver: "postgres", host: "192.168.18.205", port: 55432, database: "northwind", user: "postgres", sslMode: null },
-  sourceObjects: [] as { name: string; target: string }[],
+  sourceObjects: [] as WireSourceObject[],
   scheduleCron: null as string | null,
   secretRefs: { primary: "file:/run/secrets/connector_managed_x_password", secondary: null },
   nextRunAt: null as string | null,
