@@ -267,8 +267,248 @@ numbers below are at `f40b20eb`; `R` is still `routes/uploads.rs`.
 
 ## 7. Handoff
 
-(Developer: commits, the exact commands with their counts, and what was not
-verified, with the reason.)
+Round 1 (the review of 2026-10-29, at `17957613`). The branch is
+`fix/sec-22-upload-conversion-memory`; the last CODE commit of this round
+is `0fa53a78`, and this handoff is the commit after it.
+
+### The commits, one line each
+
+| commit | what it does | the finding it answers |
+| --- | --- | --- |
+| `bbeab4d5` | the hostile fixtures and the reproduction of the failure (T1) | the plan's T1 |
+| `af2be706` | the child process: the four operations, the exit-code table, the limits (T2) | the plan's T2 |
+| `8c38a5cc` | the API side: the runner, the stored conversion, the slots (T3) | the plan's T3 |
+| `20be76a9` | the route tests run the real child and count its runs (T4) | the plan's T4 |
+| `546ed291` | the limits from the first measurement (896 MiB) and the script (T5) | the plan's T5 (superseded by `0fa53a78`) |
+| `17957613` | the gate refuses the hostile workbook and the API is still there (T6) | the plan's T6 |
+| `560ec754` | the merge of `origin/main` (PR #192's crypto provider) into the branch | the merge the review names |
+| `c99557d8` | the plan: the review round 1 (the planner's commit, not mine) | — |
+| `d3fd0d60` | a Parquet file goes to the child by RANGES, never whole: the sparse reader, the two Parquet operations, the four call sites | BLOCKER 1, BLOCKER 2, P1 |
+| `668ca710` | a conversion is committed only after the child exits 0: `put_stream` leaves the upload unassembled, the `.json` is the marker | BLOCKER 3, P2 |
+| `7830679f` | the child's answer line is read through a 1 MiB cap | BLOCKER 4 |
+| `1cc8f3d0` | a retryable answer at the chunked-upload completion keeps the file | SHOULD-FIX 1 |
+| `a1929e08` | a workbook's type guess reads the same sample as a text file | SHOULD-FIX 2 |
+| `039b86fe` | the child's failure paths are joined and logged: the feed's errors, the status and the standard error, one deadline, the child's own limit code | SHOULD-FIX 3, SHOULD-FIX 4 |
+| `3a6b1440` | a garbled answer is judged by the child's ending | SHOULD-FIX 5 |
+| `08b82bfc` | a Parquet preview reads the sample of the text, not all of it | SHOULD-FIX 6 |
+| `066589c0` | the delete of a workbook does not trust an unreadable list of sheets | SHOULD-FIX 7 |
+| `5420be8e` | the comments, the docs and the missing tests | SHOULD-FIX 8 |
+| `0fa53a78` | the memory limit from the RELEASE measurement: 1280 MiB, and the script that measured it | BLOCKER 5 |
+
+### The commands, with their counts
+
+Every command ran through `/home/shiro/rantai/bin/cargo-locked` (the
+machine-wide lock, `--locked`, `-j 2`), in the foreground, on the branch's
+own worktree (`/home/shiro/rantai/wt-sec22`).
+
+Per commit, on the crates the commit touched:
+
+- `cargo fmt --check` — clean.
+- `cargo clippy --locked -p lakehouse-api --all-targets -j 2 -- -D warnings`
+  — clean, on every commit of the round.
+- `cargo test --locked -p lakehouse-api -j 2 --lib upload_` — 194 passed, 0
+  failed, 1 ignored (the `#[ignore]`d child role of the hostile fixtures).
+- `cargo test --locked -p lakehouse-api -j 2 --test upload_routes` — 168
+  passed, 0 failed (the last run, after the last commit).
+
+On the final commit (`0fa53a78`), the whole block of `AGENTS.md`:
+
+- `cargo fmt --check` — clean.
+- `cargo clippy --locked --workspace --all-targets --all-features -j 2 -- -D warnings`
+  — clean.
+- `cargo test --locked --workspace --no-fail-fast -j 2` — 159 test
+  binaries, 8457 passed, 0 failed, 51 ignored.
+- `cargo deny check` (in `rust/`) — "advisories ok, bans ok, licenses ok,
+  sources ok".
+- `docker compose -f docker-compose.yml --profile '*' config --quiet`,
+  with dummy values for `POSTGRES_PASSWORD`, `RUSTFS_ACCESS_KEY`,
+  `RUSTFS_SECRET_KEY`, `LAKEKEEPER_ENCRYPTION_KEY` and
+  `CONNECTOR_SECRETS_KEY` — clean.
+- The `g9-upload` gate, as `.github/workflows/ci.yml` runs it, on the
+  project name `g9sec22`: the API image of this branch
+  (`LAKEHOUSE_API_IMAGE=rantai-lakehouse-api:local`, built from this
+  branch), the dagster image that was on the machine, the `oidc-mock`
+  fixture image built for it, and the stack up with
+  `docker compose -p g9sec22 --profile dagster up -d --no-build
+  lakehouse-api dagster-code-location dagster-webserver dagster-daemon
+  clickhouse-iceberg-init`. Then `docker compose -p g9sec22 --profile
+  dagster run --rm g9-test-runner` — exit 0, "[g9] PASS", and the `SEC-22`
+  step of the gate: "[g9] hostile workbook: refused with the one sentence,
+  the API is still there". The Parquet steps of the gate passed too ("[g9]
+  parquet: PASS (the upload is gone, the table stays)"), so a Parquet file
+  was uploaded, previewed and loaded through the child in the real image.
+  The stack was taken down afterwards (`down -v`) and the images this round
+  built were removed.
+- `git status` — the tree is clean; nothing generated is staged.
+### T1's reproduction, T2's finding, and the release measurement
+
+**T1's reproduction** (the fixtures of
+`ops/fixtures/uploads/hostile/`, read in a child process under
+`ulimit -v 524288`, i.e. 512 MiB of address space; the test is
+`rust/crates/lakehouse-api/tests/hostile_uploads.rs`, run with
+`cargo test -p lakehouse-api --test hostile_uploads -- --ignored --nocapture`):
+
+```text
+[sec22] huge_shared_strings.xlsx: child status ExitStatus(unix_wait_status(134))
+[sec22] huge_shared_strings.xlsx: memory allocation of 48000000000 bytes failed
+[sec22] huge_footer.parquet: child status ExitStatus(unix_wait_status(0))
+[sec22] huge_footer.parquet: REFUSED: This file could not be opened as a Parquet file.
+[sec22] the process that ran the fixtures is still here
+```
+
+134 is 128 + SIGABRT: the shared-strings header of the workbook declares
+two billion strings, `calamine` 0.37 reserves room for all of them before
+it reads one (`read_shared_strings`: `self.strings.reserve(n)`), and the
+reservation is 48 GB. The process that READ the file died; the process
+that ran it was still there. The Parquet file declares a row group of one
+tebibyte in 123 bytes and is refused with the reader's own sentence, which
+is the counter-example: the Parquet reader bounds what the footer declares
+and the workbook reader does not.
+
+The `.xls` case of the plan needs no fixture: `calamine` 0.37 does not
+read the shared string table's count (`src/xls.rs`, `parse_sst` skips the
+`cstTotal` and `cstUnique` headers), so a count that lies costs nothing.
+
+**The new fixture of this round.** `ops/fixtures/uploads/hostile/huge_list_footer.parquet`
+(48 bytes) is a Parquet file whose footer declares two billion row groups.
+The list header of the Thrift compact protocol carries the count BEFORE the
+elements, and the reader reserves room for the whole list before it reads
+the first one (`parquet` 58.4.0, `file/metadata/thrift/mod.rs:804`:
+`Vec::with_capacity(list_ident.size)`): the reservation is 192 GB, and the
+child that reads it aborts (exit 134, "memory allocation of 192000000000
+bytes failed"). It is the case BLOCKER 1 is about: the footer decode used
+to run in the API's own process, and it is now the child's.
+
+**T2's `RLIMIT_AS` against `RLIMIT_DATA` finding** (measured on this VM,
+kernel 6.8, with the T1 hostile workbook):
+
+- `RLIMIT_AS` of 64 MiB: the child dies of SIGSEGV (exit 139) before it
+  reads anything, even on a VALID workbook. The address-space limit counts
+  the binary's own mappings, the stacks and the allocator's arenas, none of
+  which are the parser's memory.
+- `RLIMIT_DATA` of 64 MiB: the child reads a valid workbook and refuses
+  the hostile one, which ends it with "memory allocation of 48000000000
+  bytes failed" — the same abort, at a limit the child can run under.
+
+So the child sets `RLIMIT_DATA` and `RLIMIT_CPU`. The two `Cargo.toml`
+comments that still said `RLIMIT_AS` are fixed in `5420be8e`.
+
+**The release measurement** (BLOCKER 5). Measured on 2026-10-29 with the
+RELEASE binary of the gate's image (`rantai-lakehouse-api:local`, built
+from this branch with `docker compose build lakehouse-api`, the binary at
+`/usr/local/bin/lakehouse-api`), with `ops/g9/sec22_measure.py`, which
+builds the fixtures and runs the child INSIDE that image under
+`/usr/bin/time -v`:
+
+| what                                  | peak RSS | user s | sys s | CPU s | wall     | exit | at the limits |
+| ------------------------------------- | -------- | ------ | ------ | ----- | --------- | ---- | ------------- |
+| the baseline (an empty input)         | 9.9 MiB  | 0.00   | 0.00   | 0.00  | 0:00.00   | 2    | 2             |
+| `convert-sheet`, inline strings       | 523.8 MiB| 4.49   | 0.45   | 4.94  | 0:05.05   | 0    | 0             |
+| `convert-sheet`, shared strings       | 801.5 MiB| 5.50   | 0.60   | 6.10  | 0:06.25   | 0    | 0             |
+| `preview-parquet`, 2,000 rows         | 163.5 MiB| 0.03   | 0.15   | 0.18  | 0:00.21   | 0    | 0             |
+
+The workbook is 5,000,000 cells (100 columns of 50,000 rows), the most a
+sheet may hold (`upload_workbook::MAX_SHEET_CELLS`). The "shared strings"
+row is the SAME workbook with the text in a shared-strings part, which is
+the way Excel writes one: the reader reserves room for the whole table of
+the strings before it reads a cell, and that is 200 MB of reservation for
+5,000,000 of them. The Parquet file's first row group is near
+`MAX_PREVIEW_GROUP_BYTES` (61 MiB of it) and the preview asks for the
+route's 2,000 rows, fed by ranges (`SEC-22` P1: the tail of the file and
+that group).
+
+The "at the limits" column is the same run under the product's own limits
+(1280 MiB of memory, 60 s of CPU): every exit code is the one of the run
+beside it, so every file passes under the limits the product sets.
+
+Two things this measurement says that the old one did not:
+
+- under the OLD default (896 MiB) the shared-strings workbook ABORTED
+  (exit 134): the limit did not admit the largest allowed file, and the
+  file it refused is the way Excel writes a workbook;
+- the release `convert-sheet` of the largest allowed workbook takes 6.10 s
+  of CPU and 6.25 s of wall time. Times 1.5 that is 9.2 s of CPU (under the
+  60 s limit) and 9.4 s of wall time (under the 90 s one), so no limit
+  had to be raised and the plan's stop condition is not met.
+
+**The new default.** 801.5 MiB times 1.5 is 1202.3 MiB, which rounds up to
+1280 MiB: `upload_convert::DEFAULT_MEMORY_MIB` and, through it,
+`UPLOAD_CONVERT_MEMORY_MB`. Two conversions at once are 2.5 GiB, which a
+machine with 12 GB of memory affords. The constant cites
+`docs/plans/SEC-22-RESULT.md (to be written by the planner from the round 1
+handoff numbers)`, so the reference is honest: the file does not exist
+yet.
+
+### Section 6, item by item
+
+1. **"Under the chosen limit, a failing allocation in the child ends the
+   child with a signal or an abort. The kernel's OOM killer must not pick
+   another process. Proven in T2 with the T1 fixture."** — Yes, and again
+   in this round: the T1 workbook aborts the child (exit 134) with
+   "memory allocation of 48000000000 bytes failed", and the new
+   `huge_list_footer.parquet` aborts it with "memory allocation of
+   192000000000 bytes failed" (exit 134). The API is a separate process
+   with its own limit, so the kernel's OOM killer has nothing to pick but
+   the child. The route test `a_hostile_workbook_ends_the_child_and_leaves_the_api_alone`
+   and `a_hostile_parquet_footer_ends_the_child_and_leaves_the_api_alone`
+   prove it end to end: the API answers 400 with the one sentence of
+   `SEC-22` D4 and the next request answers normally.
+2. **"The child's baseline memory: binary mapping and allocator with no
+   tokio. It must leave room under the limit for the largest allowed
+   file (T5)."** — Yes: the baseline is 9.9 MiB (the table above) and the
+   limit is 1280 MiB, which admits the largest allowed file (801.5 MiB) and
+   leaves 470 MiB over the baseline. Two conversions at once are 2.5 GiB.
+3. **"`object_store`'s multipart write works against RustFS for the
+   converted text, including abort on error."** — Yes, twice. The route
+   tests prove it against the fake S3 of the harness (`upload_routes.rs`'s
+   `Bucket`): the converted text is written as one multipart upload and
+   assembled, and a child that is killed mid-stream leaves no object and
+   no open multipart upload
+   (`a_child_killed_mid_stream_leaves_no_converted_text`). The g9 gate
+   proves it against RustFS itself: the workbook of the gate was uploaded,
+   previewed and loaded, and the file's rows are in the table.
+4. **"`CARGO_BIN_EXE_lakehouse-api` is set for `lakehouse-api`'s
+   integration tests, and the child built for tests is the current
+   code."** — Yes: the harness points the runner at
+   `env!("CARGO_BIN_EXE_lakehouse-api")` (`tests/common/mod.rs`), which
+   Cargo sets for the integration tests of a package with that bin target,
+   and the runner refuses any binary that is not this API's own
+   (`is_our_binary`), so the child the route tests run is the one Cargo
+   built from the branch's code.
+5. **"In the runtime image (`rust/Dockerfile`, `debian:trixie-slim`, the
+   entrypoint's user), `current_exe()` resolves and the API may start the
+   child. g9 proves this."** — Yes. The g9 gate ran on the image of this
+   branch (`rantai-lakehouse-api:local`, built with `docker compose build
+   lakehouse-api` as the gate's `images` job does): the API started the
+   child for every workbook and Parquet file of the gate (the gate's own
+   output names the sheets it read and the columns of the Parquet file),
+   and the hostile workbook ended the CHILD, not the API. The measurement
+   of this round ran the child inside the same image as well (`docker run
+   --entrypoint /usr/bin/time ... /usr/local/bin/lakehouse-api
+   inspect-upload ...`).
+6. **"A preview through the console's proxy finishes under its 130 s
+   timeout for the T5 files, or the 90 s wall answers first."** — The
+   release `convert-sheet` of the largest allowed workbook takes 6.25 s of
+   wall time and the release `preview-parquet` of 2,000 rows takes 0.21 s:
+   both are far inside the 90 s wall and the 130 s proxy timeout. The
+   child's own CPU limit (60 s) is 9.2 s of headroom over the measured
+   CPU times 1.5.
+
+### Not verified, and why
+
+- **The TypeScript and the Dagster code location were not checked.** This
+  round touches no file under `src/` and none under `dagster/`, so the
+  checks of `AGENTS.md` that belong to them (`bun run typecheck`,
+  `bun run lint`, `bun run test`, `pytest dispar_orchestrate`) were not
+  run. The Python that did change (`ops/g9/sec22_measure.py`) is a gate
+  script, not the code location, and it ran as the measurement (and the
+  gate that reads the fixtures it builds ran too).
+- **The `SEC-22` T1 reproduction was not re-run in this round.** Its
+  numbers are the ones of T1 (quoted above), and the hostile fixture of
+  this round (`huge_list_footer.parquet`) was run by hand in the gate's
+  image: the child aborted with "memory allocation of 192000000000 bytes
+  failed" (exit 134), and the API answered 400 with the one sentence and
+  was still there for the next request.
 
 ## 8. Review
 
