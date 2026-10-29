@@ -16,45 +16,49 @@
     set +e
     log() { echo "[oracle-tcps] $*"; }
 
-    if ! command -v orapki >/dev/null 2>&1; then
-        log "orapki is not in this image: no wallet can be built"
-        exit 0
+    # Attempt 1 (kept in the log as evidence): orapki is in the image, but it needs a Java runtime that
+    # the slim image does not ship ("ERROR: No Java"), so it cannot build a wallet.
+    if command -v orapki >/dev/null 2>&1; then
+        log "orapki: $(command -v orapki); a wallet from it: $(orapki wallet create -wallet /tmp/probe-wallet -pwd Probe1234567 -auto_login 2>&1 | head -1)"
     fi
-    log "orapki: $(command -v orapki)"
 
-    WALLET=/opt/oracle/tcps-wallet
-    P12_PASSWORD="$(cat /etc/oracle-tls/p12.pwd)"
-    mkdir -p "$WALLET" && chmod 700 "$WALLET"
-
-    orapki wallet create -wallet "$WALLET" -pwd "$P12_PASSWORD" -auto_login 2>&1 | sed 's/^/[oracle-tcps] create: /'
-    orapki wallet import_pkcs12 -wallet "$WALLET" -pwd "$P12_PASSWORD" \
-        -pkcs12file /etc/oracle-tls/oracle.p12 -pkcs12pwd "$P12_PASSWORD" 2>&1 | sed 's/^/[oracle-tcps] import: /'
-    orapki wallet display -wallet "$WALLET" -pwd "$P12_PASSWORD" 2>&1 | sed 's/^/[oracle-tcps] display: /'
-    ls -l "$WALLET" | sed 's/^/[oracle-tcps] wallet: /'
-
+    # Attempt 2: a PKCS#12 wallet made with openssl (`ewallet.p12`), with the generated password and then with an
+    # empty one, each offered to the listener as it is. Each try rewrites listener.ora and restarts the listener
+    # and logs what it said; the first that listens on 2484 stays.
     ADMIN="${TNS_ADMIN:-$ORACLE_HOME/network/admin}"
+    WALLET=/opt/oracle/tcps-wallet
     mkdir -p "$ADMIN"
-    cat > "$ADMIN/listener.ora" <<LISTENER
-LISTENER =
-  (DESCRIPTION_LIST =
-    (DESCRIPTION =
-      (ADDRESS = (PROTOCOL = TCP)(HOST = 0.0.0.0)(PORT = 1521))
-      (ADDRESS = (PROTOCOL = TCPS)(HOST = 0.0.0.0)(PORT = 2484))
-    )
-  )
-WALLET_LOCATION =
-  (SOURCE = (METHOD = FILE)(METHOD_DATA = (DIRECTORY = $WALLET)))
-SSL_CLIENT_AUTHENTICATION = FALSE
-LISTENER
-    cat >> "$ADMIN/sqlnet.ora" <<SQLNET
-WALLET_LOCATION =
-  (SOURCE = (METHOD = FILE)(METHOD_DATA = (DIRECTORY = $WALLET)))
-SSL_CLIENT_AUTHENTICATION = FALSE
-SQLNET
-    log "listener.ora and sqlnet.ora written in $ADMIN"
-
-    lsnrctl stop 2>&1 | sed 's/^/[oracle-tcps] stop: /'
-    lsnrctl start 2>&1 | sed 's/^/[oracle-tcps] start: /'
+    write_listener() {
+        local tcps="$1"
+        {
+            echo "LISTENER = (DESCRIPTION_LIST = (DESCRIPTION ="
+            echo "  (ADDRESS = (PROTOCOL = TCP)(HOST = 0.0.0.0)(PORT = 1521))"
+            [ "$tcps" = yes ] && echo "  (ADDRESS = (PROTOCOL = TCPS)(HOST = 0.0.0.0)(PORT = 2484))"
+            echo "))"
+            if [ "$tcps" = yes ]; then
+                echo "WALLET_LOCATION = (SOURCE = (METHOD = FILE)(METHOD_DATA = (DIRECTORY = $WALLET)))"
+                echo "SSL_CLIENT_AUTHENTICATION = FALSE"
+            fi
+        } > "$ADMIN/listener.ora"
+    }
+    try_wallet() {
+        local label="$1" p12="$2"
+        rm -rf "$WALLET" && mkdir -p "$WALLET" && chmod 700 "$WALLET"
+        cp "$p12" "$WALLET/ewallet.p12"
+        write_listener yes
+        lsnrctl stop >/dev/null 2>&1
+        lsnrctl start 2>&1 | grep -i -E "listening on|error|TNS-|ORA-" | sed "s/^/[oracle-tcps] $label: /"
+        lsnrctl status 2>&1 | grep -c -i "PROTOCOL=tcps" | sed "s/^/[oracle-tcps] $label: tcps endpoints listed: /"
+        lsnrctl status 2>&1 | grep -qi "PROTOCOL=tcps"
+    }
+    if try_wallet "password p12" /etc/oracle-tls/oracle.p12 || try_wallet "empty-password p12" /etc/oracle-tls/oracle-nopw.p12; then
+        log "the listener has a TCPS endpoint"
+    else
+        log "no wallet the listener accepts: back to the plain listener"
+        write_listener no
+        lsnrctl stop >/dev/null 2>&1
+        lsnrctl start 2>&1 | grep -i -E "listening on|error|TNS-" | sed 's/^/[oracle-tcps] plain: /'
+    fi
     echo "alter system register;" | sqlplus -s / as sysdba 2>&1 | sed 's/^/[oracle-tcps] register: /'
     sleep 5
     lsnrctl status 2>&1 | grep -i -E "tcps|2484|FREEPDB1|error|TNS-" | sed 's/^/[oracle-tcps] status: /'

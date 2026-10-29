@@ -150,8 +150,11 @@ services:
         openssl pkcs12 -export -in /out/oracle.pem -inkey /out/oracle.key -certfile /out/ca.crt
         -name oracle -out /out/oracle.p12 -passout file:/out/p12.pwd
         -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -macalg sha1 &&
+        openssl pkcs12 -export -in /out/oracle.pem -inkey /out/oracle.key -certfile /out/ca.crt
+        -name oracle -out /out/oracle-nopw.p12 -passout pass:
+        -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -macalg sha1 &&
         rm -f /out/*.csr /out/*.ext /out/ca.key /out/ca.srl &&
-        chmod 644 /out/ca.crt /out/server.key /out/server.pem /out/oracle.key /out/oracle.pem /out/oracle.p12 /out/p12.pwd; }
+        chmod 644 /out/ca.crt /out/server.key /out/server.pem /out/oracle.key /out/oracle.pem /out/oracle.p12 /out/oracle-nopw.p12 /out/p12.pwd; }
 
   # SRC-4 T1.4: the TLS front of `oracle-g6` (`oracle-tls-proxy.conf` says why
   # a proxy and what it leaves unproven). `nginx:1.27-alpine` has the stream
