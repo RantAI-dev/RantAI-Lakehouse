@@ -260,6 +260,29 @@ a `dlt` merge followed by a separate delete (two commits, a crash between them
 shows a half-applied batch). The existing `incremental_dedup` mode has the
 same limit (it never deletes); not in `SRC-4`'s scope, noted for the backlog.
 
+**Amendment 2 (2026-10-29, slice 1 developer's T1.1 stop report, decided by
+the planner).** `POST /api/connectors/{id}/test` is synchronous and writes the
+stored health, the audit event and the probe history; discovery (`SRC-13`) is
+asynchronous (`discover_job`, the console polls), and its store keeps one row
+per `(connector_id, kind)` with `kind` in `list | preview`, so reusing `list`
+would overwrite the person's table list. Decision: **a third kind, `test`.**
+- A new migration widens the `connector_discovery` kind CHECK to add `test`
+  (never edit `0075`); the enum, the result route body and the TS contract
+  follow.
+- For a driver the API cannot dial (Oracle now; MongoDB's setup checks in
+  slice 4), `/test` launches `discover_job` with `kind = test` and answers at
+  once with a fixed sentence that the test is running in the orchestrator; it
+  never reports a success it has not seen (principle 2).
+- When the orchestrator posts the `test` result, the API records it exactly as
+  a synchronous test would: stored health, audit event, probe history, the
+  same fixed `Outcome` sentences (upstream text classified, principle 4).
+- The console shows "testing…" and polls the result, as it does for listing.
+- `g6-oracle`'s connect step becomes real (pass, wrong password, unreachable
+  host) and `coverage.json` moves from `refused`.
+Rejected: a synchronous `/test` that waits for a Dagster run (a run takes tens
+of seconds to start; an HTTP request held that long is a timeout waiting to
+happen); a new route (a second way to test one connector).
+
 ## Handoff
 
 ### Slice 1, Oracle batch (developer, Sonnet, 2026-10-29)
@@ -329,3 +352,24 @@ for the job. Not started. The gate's `connect` step stays `refused` in
 ## Review
 
 (The planner writes findings here, tagged `BLOCKER` or `SHOULD-FIX`.)
+
+### Slice 1, review round 1 (planner, 2026-10-29, head `b4f11a9a`)
+
+CI run `40809657037` green on `b4f11a9a`; the `g6-oracle` gate printed every
+step (discover; load of 3 rows with `NOTE` left out over `tcps`; incremental
+reload reading 2 new rows, 5 in Bronze). Read: `adapters/oracle.py`
+(`in_reflected_spelling`, structured `tcps` keywords), the gate and fixture.
+Two findings beyond the plan were right and are kept: the column-name spelling
+map, and the earlier "TLS" dial that sent `(PROTOCOL=TCP)` in clear text.
+
+- **BLOCKER 1 (T1.1).** The Oracle connection test is not built. Build it as
+  Amendment 2 says.
+- **SHOULD-FIX 2 (T1.4).** The gate proves our `tcps` dial against an nginx
+  TLS terminator, not Oracle's own TCPS listener. Try Oracle's listener with a
+  wallet once (`orapki` if the pinned image has it, or a wallet generated with
+  `openssl` in the PKCS#12 form Oracle reads); if the image cannot do it, keep
+  the terminator and leave the honest note where it is (proxy config, gate
+  docstring, `coverage.json`).
+- **Not a finding:** `g6-oracle` ran in about 3.5 min against 13-16 min in
+  `SRC-9-RESULT.md`; the gate's own `PASS (77s)` and its step lines show
+  nothing was skipped.
