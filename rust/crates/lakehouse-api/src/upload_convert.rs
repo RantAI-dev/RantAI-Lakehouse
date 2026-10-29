@@ -2511,6 +2511,82 @@ mod tests {
         );
     }
 
+    /// The reader over the pieces of a Parquet file refuses what does not
+    /// fit inside the file (`PR #187` review round 2 S4).
+    ///
+    /// The child is given the file's tail and its first row group, and every
+    /// range it is given must lie inside the file: a group that ends past
+    /// the end of the file, or one whose end overflows, is refused before
+    /// anything is read.
+    #[test]
+    fn the_parquet_reader_refuses_a_range_outside_the_file() {
+        let mut limits = limits();
+        limits.parquet_tail_bytes = 64;
+        limits.parquet_group_bytes = 64;
+        let input = vec![7_u8; 1024];
+        // The group ends past the end of the file.
+        assert!(
+            parquet_reader(1024, Some((1000, 64)), &input, &limits).is_err(),
+            "a group past the end of the file"
+        );
+        // The end of the group overflows.
+        assert!(
+            parquet_reader(u64::MAX, Some((u64::MAX - 1, 8)), &input, &limits).is_err(),
+            "a group whose end overflows"
+        );
+        // The input is shorter than the tail the file needs.
+        assert!(
+            parquet_reader(1024, None, &input[..32], &limits).is_err(),
+            "an input shorter than the tail"
+        );
+        // The input is shorter than the tail plus the group.
+        assert!(
+            parquet_reader(1024, Some((0, 32)), &input[..80], &limits).is_err(),
+            "an input shorter than the tail and the group"
+        );
+    }
+
+    /// A group over the bound is not given to the reader at all: the file is
+    /// shown as its columns and no rows, and its bytes are not moved
+    /// (`PR #187` review round 2 S4).
+    #[test]
+    fn a_group_over_the_bound_is_not_given_to_the_reader() {
+        let mut limits = limits();
+        limits.parquet_tail_bytes = 64;
+        limits.parquet_group_bytes = 64;
+        let input = vec![7_u8; 1024];
+        // The group is inside the file and inside the bound: it is given.
+        let reader = parquet_reader(1024, Some((32, 16)), &input, &limits).expect("the reader");
+        assert!(was_given(&reader, 32, 16), "the group was given");
+
+        // The group is over the bound: it is not.
+        let mut tighter = limits;
+        tighter.parquet_group_bytes = 8;
+        let reader = parquet_reader(1024, Some((32, 16)), &input, &tighter).expect("the reader");
+        assert!(!was_given(&reader, 32, 16), "the group was not given");
+    }
+
+    /// Whether the reader was given the range.
+    fn was_given(reader: &PartsReader, start: u64, length: usize) -> bool {
+        <PartsReader as parquet::file::reader::ChunkReader>::get_bytes(reader, start, length)
+            .is_ok()
+    }
+
+    /// The Parquet bounds come from the environment, and a bound that is not
+    /// a number is no bound at all.
+    #[test]
+    fn the_parquet_bounds_come_from_the_environment() {
+        let limits =
+            ChildLimits::with_limits(None, None, None).with_parquet(Some("1024"), Some("2048"));
+        assert_eq!(limits.parquet_tail_bytes, 1024);
+        assert_eq!(limits.parquet_group_bytes, 2048);
+        for raw in ["not a number", "0", "", "  "] {
+            let limits = ChildLimits::default().with_parquet(Some(raw), Some(raw));
+            assert_eq!(limits.parquet_tail_bytes, PARQUET_TAIL_BYTES, "{raw:?}");
+            assert_eq!(limits.parquet_group_bytes, PARQUET_GROUP_BYTES, "{raw:?}");
+        }
+    }
+
     /// The limits the child runs under are the ones the environment names.
     #[test]
     fn the_memory_limit_comes_from_the_environment() {
