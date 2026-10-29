@@ -68,6 +68,9 @@ class MigrationShapeError(Exception):
 class TypeState:
     adapter: str | None
     supported: bool
+    # The `unsupported_reason` text, tracked so a later UPDATE may name the exact
+    # text it replaces (`WHERE unsupported_reason = '...'`, `SRC-4` slice 3, `0117`).
+    reason: str | None = None
 
 
 def _strip_comments(sql: str) -> str:
@@ -230,8 +233,11 @@ def _apply_update(statement: str, types: dict[str, TypeState]) -> None:
         else:
             column, eq, value = (x.strip() for x in part.partition("="))
             column = column.lower()
-            if not eq or column not in ("name", "adapter", "supported") or column in conditions:
-                raise ValueError(f"WHERE of {part!r}: only name = '...', adapter = '...' | IS NULL and supported = true|false are understood")
+            if not eq or column not in ("name", "adapter", "supported", "unsupported_reason") or column in conditions:
+                raise ValueError(
+                    f"WHERE of {part!r}: only name = '...', adapter = '...' | IS NULL, supported = true|false "
+                    "and unsupported_reason = '...' are understood"
+                )
         conditions[column] = value
     if "name" not in conditions:
         raise ValueError("a WHERE without name = '...'")
@@ -243,10 +249,14 @@ def _apply_update(statement: str, types: dict[str, TypeState]) -> None:
         return
     if "supported" in conditions and _bool(conditions["supported"]) != state.supported:
         return
+    if "unsupported_reason" in conditions and _literal(conditions["unsupported_reason"]) != state.reason:
+        return
     if "supported" in assignments:
         state.supported = _bool(assignments["supported"])
     if "adapter" in assignments:
         state.adapter = _literal(assignments["adapter"])
+    if "unsupported_reason" in assignments:
+        state.reason = _literal(assignments["unsupported_reason"])
 
 
 def supported_types(migrations_dir: Path) -> list[str]:

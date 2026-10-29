@@ -241,6 +241,38 @@
       "notes": {
         "all": "SRC-3 slice 7: proven in the CI job \"Rust · SRC-3 business-app connectors (B)\" (g6-saas-b), against the mock vendor in ops/g6/saas_stub.py, not a real account. Connect is the API's test route, discover lists the vendor's objects and the preview is honestly not supported (the vendor does not describe its fields), load is a first copy to Bronze, reload is a second run that picks up a changed record (and a delete where the vendor reports one)."
       }
+    },
+    "MySQL CDC": {
+      "gate": "g4-mysql",
+      "steps": {
+        "connect": "real",
+        "discover": "real",
+        "load": "real",
+        "reload": "real"
+      },
+      "notes": {
+        "all": "SRC-4 slice 3: ops/g4/g4_test.py runs for MySQL as the g4-mysql job and records the four steps through gate_summary.",
+        "connect": "MySQL: POST .../test must answer supported:true, ok:true for the least-privilege gate user.",
+        "discover": "The discovery routes list the source's tables and preview a table's columns (SRC-13 routes).",
+        "load": "The connector is created through the API (which provisions Kafka Connect) and its first copy reaches Bronze: 20,000 seeded rows in each of the two load modes.",
+        "reload": "An insert, an update and a delete each visible in Bronze within 120 s in both modes (SRC-4 D5); then a pause with 20,000 changes per table, a resume, a restart of kafka-connect during a stream of changes and a schema change, each ending with Bronze equal to the source."
+      }
+    },
+    "SQL Server CDC": {
+      "gate": "g4-mssql",
+      "steps": {
+        "connect": "real",
+        "discover": "real",
+        "load": "real",
+        "reload": "real"
+      },
+      "notes": {
+        "all": "SRC-4 slice 3: ops/g4/g4_test.py runs for SQL Server as the g4-mssql job and records the four steps through gate_summary.",
+        "connect": "SQL Server: POST .../test must answer supported:true, ok:true for the least-privilege gate user.",
+        "discover": "The discovery routes list the source's tables and preview a table's columns (SRC-13 routes).",
+        "load": "The connector is created through the API (which provisions Kafka Connect) and its first copy reaches Bronze: 20,000 seeded rows in each of the two load modes.",
+        "reload": "An insert, an update and a delete each visible in Bronze within 120 s in both modes (SRC-4 D5); then a pause with 20,000 changes per table, a resume, a restart of kafka-connect during a stream of changes and a schema change, each ending with Bronze equal to the source."
+      }
     }
   }
 }

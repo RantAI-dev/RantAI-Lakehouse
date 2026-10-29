@@ -63,22 +63,16 @@ const SAAS_TYPES: [&str; 10] = [
 /// real account.
 const SAAS_STILL_UNSUPPORTED: [&str; 2] = ["Workday Reports", "NetSuite"];
 
-/// The unsupported types that carry a reason and keep an adapter: the earlier
-/// named three and the two `saas` types above. The other eight `saas` types
-/// are supported after `0096` and carry no reason.
-const TYPES_WITH_REASON_AND_ADAPTER: [&str; 5] = [
-    "Google Sheets",
-    "MySQL CDC",
-    "SQL Server CDC",
-    "Workday Reports",
-    "NetSuite",
-];
+/// The unsupported types that carry a reason and keep an adapter: Google Sheets
+/// and the two `saas` types above. The other eight `saas` types are supported
+/// after `0096` and carry no reason; `MySQL CDC` and `SQL Server CDC` are
+/// supported again after `0117` (`SRC-4` slice 3) and carry none either.
+const TYPES_WITH_REASON_AND_ADAPTER: [&str; 3] = ["Google Sheets", "Workday Reports", "NetSuite"];
 
-/// Every `supported = false` row other than the five that keep an adapter
+/// Every `supported = false` row other than the three that keep an adapter
 /// has `adapter = NULL` — there is no `Dial::parse` shape yet for a type this
-/// build cannot dial. Google Sheets (`SRC-6` F5, `0062`), `MySQL` CDC / SQL
-/// Server CDC (`SRC-9` decision 8, `0066`) and the two still-unsupported
-/// `saas` types (`0095`, `0096`)
+/// build cannot dial. Google Sheets (`SRC-6` F5, `0062`) and the two
+/// still-unsupported `saas` types (`0095`, `0096`)
 /// keep their adapter so existing connectors still open. The list is named,
 /// not loosened for other rows.
 #[sqlx::test(migrations = "../../migrations")]
@@ -139,42 +133,27 @@ async fn google_sheets_is_listed_as_unsupported_with_a_reason(pool: PgPool) -> s
     Ok(())
 }
 
-/// `0066` (`SRC-9` decision 8): `MySQL` CDC and `SQL Server` CDC are listed,
-/// unsupported, with a reason, and keep their `cdc` adapter.
+/// `0117` (`SRC-4` slice 3): `MySQL` CDC and `SQL Server` CDC are supported
+/// again, keep their `cdc` adapter and carry no reason.
 #[sqlx::test(migrations = "../../migrations")]
-async fn mysql_and_sql_server_cdc_are_listed_as_unsupported_with_a_reason(
-    pool: PgPool,
-) -> sqlx::Result<()> {
+async fn mysql_and_sql_server_cdc_are_supported_again_after_0117(pool: PgPool) -> sqlx::Result<()> {
     let types = list_connector_types(&pool)
         .await
         .expect("list_connector_types should succeed");
-    for (name, reason) in [
-        (
-            "MySQL CDC",
-            "Change capture for MySQL is not built yet: this build can only prepare it for PostgreSQL.",
-        ),
-        (
-            "SQL Server CDC",
-            "Change capture for SQL Server is not built yet: this build can only prepare it for PostgreSQL.",
-        ),
-    ] {
+    for name in ["MySQL CDC", "SQL Server CDC"] {
         let found = types
             .iter()
             .find(|t| t.name == name)
             .expect("the type must stay listed");
-        assert!(!found.supported, "{found:?}");
+        assert!(found.supported, "{found:?}");
         assert_eq!(found.adapter.as_deref(), Some("cdc"), "{found:?}");
-        assert_eq!(
-            found.unsupported_reason.as_deref(),
-            Some(reason),
-            "{found:?}"
-        );
+        assert_eq!(found.unsupported_reason, None, "{found:?}");
     }
     Ok(())
 }
 
-/// `0062`, `0066` and `0096`: only Google Sheets, `MySQL` CDC, `SQL Server` CDC
-/// and the two still-unsupported `saas` types carry a reason; the other roadmap rows keep the
+/// `0062` and `0096`: only Google Sheets and the two still-unsupported `saas`
+/// types carry a reason; the other roadmap rows keep the
 /// generic "Not available yet" in the console, and supported rows have none.
 #[sqlx::test(migrations = "../../migrations")]
 async fn only_the_named_types_have_an_unsupported_reason(pool: PgPool) -> sqlx::Result<()> {
