@@ -135,9 +135,22 @@ def connection_parts(
                 "identity cannot be verified when connecting by IP; set sslServerCertDn to the "
                 "certificate's expected Distinguished Name, or set sslMode to disable"
             )
-        # The operator-supplied DN, passed through EXACTLY as configured
-        # -- never derived from spec["host"].
-        engine_kwargs["connect_args"] = {"ssl_server_cert_dn": cert_dn}
+        # SRC-4 T1.4: `tcps` is a property of the ADDRESS, not of the connect call. Before, only
+        # `ssl_server_cert_dn` was passed, and SQLAlchemy's `makedsn` always writes
+        # `(PROTOCOL=TCP)` into the descriptor, which makes thin mode ignore both `protocol` and
+        # the DN: a dial with `sslMode` set connected in clear text (measured against a TLS
+        # listener: no handshake arrived). So the dial's own address is handed to `oracledb` as
+        # structured keywords, with `dsn` unset (`None` overrides the descriptor SQLAlchemy built
+        # from the URL): `protocol="tcps"`, the checked IP literal, and the OPERATOR-SUPPLIED DN,
+        # passed through EXACTLY as configured -- never derived from spec["host"].
+        engine_kwargs["connect_args"] = {
+            "dsn": None,
+            "host": resolved.ip,  # the CHECKED literal IP -- never spec["host"]
+            "port": spec["port"],
+            "service_name": spec["database"],
+            "protocol": "tcps",
+            "ssl_server_cert_dn": cert_dn,
+        }
 
     # `credentials` is a plain Python dict of STRUCTURED fields handed to SQLAlchemy's
     # `create_engine`, never an interpolated DSN string -- a

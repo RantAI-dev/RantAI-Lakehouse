@@ -308,3 +308,137 @@ def test_an_incremental_cursor_in_the_preview_spelling_is_found_only_after_the_m
     plan = sink.LoadPlan.from_source_object(in_reflected_spelling(obj))
     assert plan.cursor == "created_at"
     assert [r["id"] for r in rows_for(plan.cursor)] == [1, 2]
+
+
+def test_a_tls_dial_hands_oracledb_a_tcps_address_not_a_tcp_descriptor():
+    # SRC-4 T1.4: `makedsn` always writes (PROTOCOL=TCP), and thin mode ignores `protocol` and the
+    # DN for such a descriptor, so the keywords below (and `dsn=None`) are what make it TLS.
+    from dispar_orchestrate.adapters.oracle import connection_parts
+
+    spec = {**_SPEC, "port": 2484, "sslMode": "required", "sslServerCertDn": "CN=ora.invalid"}
+    _credentials, engine_kwargs, _resolved = connection_parts(spec, {"password": "x"}, resolve_checked=_resolve)
+    assert engine_kwargs["connect_args"] == {
+        "dsn": None,
+        "host": "10.0.0.9",  # the checked literal, never the name
+        "port": 2484,
+        "service_name": "ORCLPDB1",
+        "protocol": "tcps",
+        "ssl_server_cert_dn": "CN=ora.invalid",
+    }
+    plain = connection_parts(_SPEC, {"password": "x"}, resolve_checked=_resolve)[1]
+    assert "connect_args" not in plain  # no sslMode: the dial stays plaintext, as documented
+
+
+def _tls_server(tmp_path, monkeypatch, common_name: str):
+    """A TLS listener on loopback with a certificate from a throwaway CA, and that CA as the
+    default trust store (`SSL_CERT_FILE`, as the gate does for its fixture). It completes the
+    handshake and closes: what the test reads is whether `oracledb` got that far, and how it
+    answered the certificate. Returns `(port, handshakes)`."""
+    import datetime
+    import socket
+    import ssl
+    import threading
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+
+    def name(cn: str) -> x509.Name:
+        return x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)])
+
+    def key():
+        return rsa.generate_private_key(public_exponent=65537, key_size=2048)
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    ca_key, server_key = key(), key()
+    ca = (
+        x509.CertificateBuilder().subject_name(name("g6-test-ca")).issuer_name(name("g6-test-ca"))
+        .public_key(ca_key.public_key()).serial_number(1)
+        .not_valid_before(now - datetime.timedelta(minutes=1)).not_valid_after(now + datetime.timedelta(days=1))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .sign(ca_key, hashes.SHA256())
+    )
+    leaf = (
+        x509.CertificateBuilder().subject_name(name(common_name)).issuer_name(ca.subject)
+        .public_key(server_key.public_key()).serial_number(2)
+        .not_valid_before(now - datetime.timedelta(minutes=1)).not_valid_after(now + datetime.timedelta(days=1))
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .sign(ca_key, hashes.SHA256())
+    )
+    ca_file, cert_file, key_file = tmp_path / "ca.pem", tmp_path / "server.pem", tmp_path / "server.key"
+    ca_file.write_bytes(ca.public_bytes(serialization.Encoding.PEM))
+    cert_file.write_bytes(leaf.public_bytes(serialization.Encoding.PEM))
+    key_file.write_bytes(
+        server_key.private_bytes(
+            serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()
+        )
+    )
+    monkeypatch.setenv("SSL_CERT_FILE", str(ca_file))
+
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(cert_file, key_file)
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(5)
+    handshakes: list[str] = []
+
+    def serve() -> None:
+        while True:
+            try:
+                connection, _ = listener.accept()
+            except OSError:
+                return
+            try:
+                with context.wrap_socket(connection, server_side=True) as tls:
+                    handshakes.append("ok")
+                    tls.recv(16)
+            except (ssl.SSLError, OSError):
+                handshakes.append("refused")
+
+    threading.Thread(target=serve, daemon=True).start()
+    return listener, handshakes
+
+
+def _dial_tls(port: int, dn: str) -> str:
+    """Open the engine `connection_parts` describes and return `oracledb`'s own message."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.engine import URL
+    from sqlalchemy.exc import DBAPIError
+
+    from dispar_orchestrate.adapters.oracle import connection_parts
+
+    spec = {**_SPEC, "host": "ora.invalid", "port": port, "sslMode": "required", "sslServerCertDn": dn}
+    credentials, engine_kwargs, _ = connection_parts(
+        spec, {"password": "x"}, resolve_checked=lambda h, p: ResolvedAddress(ip="127.0.0.1", port=p, family=2)
+    )
+    engine = create_engine(URL.create(**credentials), **engine_kwargs)
+    try:
+        with pytest.raises(DBAPIError) as failure:
+            engine.connect()
+    finally:
+        engine.dispose()
+    return str(failure.value.orig)
+
+
+def test_a_tls_dial_really_encrypts_and_checks_the_certificate_dn(tmp_path, monkeypatch):
+    # SRC-4 T1.4, measured not assumed: a loopback TLS server signed by a private CA. The old
+    # call (a `makedsn` descriptor plus `ssl_server_cert_dn`) never produced a handshake.
+    import time
+
+    listener, handshakes = _tls_server(tmp_path, monkeypatch, "oracle-tls-g6")
+    try:
+        port = listener.getsockname()[1]
+
+        # The right DN: the handshake completes and the driver goes on to speak TNS, which the
+        # stand-in server does not, so the connection ends (DPY-4011) -- but not on the certificate.
+        right = _dial_tls(port, "CN=oracle-tls-g6")
+        time.sleep(0.3)
+        assert handshakes == ["ok"]
+        assert "DPY-6002" not in right
+
+        # A DN the certificate does not carry: refused by the driver, whatever the chain.
+        wrong = _dial_tls(port, "CN=somebody-else")
+        assert "DPY-6002" in wrong
+    finally:
+        listener.close()

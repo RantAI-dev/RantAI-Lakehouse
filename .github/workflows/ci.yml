@@ -1515,7 +1515,7 @@ jobs:
         run: >
           docker compose -p g6oracleci -f docker-compose.yml -f ops/g6/docker-compose.g6-oracle.override.yml
           --profile g6-oracle --profile dagster up -d --no-build
-          lakehouse-api dagster-code-location dagster-webserver dagster-daemon oracle-g6
+          lakehouse-api dagster-code-location dagster-webserver dagster-daemon oracle-g6 oracle-tls-g6
 
       - name: Run the G6 Oracle gate inside the compose network
         # `shell: bash` for pipefail, `-T` for no pseudo-terminal: the same
