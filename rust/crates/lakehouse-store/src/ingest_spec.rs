@@ -1266,6 +1266,20 @@ fn validate_sql_dial_post_parse(adapter: &str, dial: &SqlDial) -> Result<(), Ing
     }
 
     if dial.driver == SqlDriver::Oracle {
+        // SRC-4 slice 1 review SHOULD-FIX 3: the Oracle `database` is a service name, and a
+        // service name is an identifier. Letters, digits, `_`, `.` and `-` (the characters a
+        // domain-qualified service name such as `FREEPDB1` or `sales.example.com` uses) in
+        // 1 to 128 characters; the same rule is in `adapters/oracle.py`. The sentence is fixed
+        // and does not repeat the value.
+        if !is_oracle_service_name(&dial.database) {
+            return Err(IngestSpecError::InvalidDial {
+                adapter: adapter.to_owned(),
+                source: serde::de::Error::custom(
+                    "database must be an Oracle service name: 1 to 128 letters, digits, \
+                     underscores, dots or hyphens",
+                ),
+            });
+        }
         let tls_required = dial
             .ssl_mode
             .as_deref()
@@ -1283,6 +1297,15 @@ fn validate_sql_dial_post_parse(adapter: &str, dial: &SqlDial) -> Result<(), Ing
     }
 
     Ok(())
+}
+
+/// Whether `name` is an identifier fit to be an Oracle service name
+/// (`^[A-Za-z0-9_.-]{1,128}$`; SRC-4 slice 1 review SHOULD-FIX 3).
+fn is_oracle_service_name(name: &str) -> bool {
+    (1..=128).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
 }
 
 /// A `dial` failed to parse or validate.
@@ -2883,6 +2906,36 @@ mod tests {
             msg.contains("control character"),
             "control character must be refused at Dial::parse, got: {msg}"
         );
+    }
+
+    #[test]
+    fn dial_parse_accepts_an_oracle_service_name_that_is_an_identifier() {
+        // SRC-4 slice 1 review SHOULD-FIX 3.
+        for name in ["FREEPDB1", "ORCLPDB1", "sales.example.com", "g6_ingest-2"] {
+            let json = serde_json::json!({
+                "driver": "oracle", "host": "oracle.internal", "port": 1521,
+                "database": name, "user": "reader"
+            });
+            assert!(Dial::parse("sql", &json).is_ok(), "{name} must be accepted");
+        }
+    }
+
+    #[test]
+    fn dial_parse_refuses_an_oracle_service_name_that_is_not_an_identifier() {
+        // SRC-4 slice 1 review SHOULD-FIX 3: a fixed sentence, never the value.
+        let too_long = "A".repeat(129);
+        for name in ["a)(b", "a=b", "a b", "(a", "", too_long.as_str()] {
+            let json = serde_json::json!({
+                "driver": "oracle", "host": "oracle.internal", "port": 1521,
+                "database": name, "user": "reader"
+            });
+            let msg = Dial::parse("sql", &json).unwrap_err().to_string();
+            assert!(msg.contains("Oracle service name"), "{name:?}: {msg}");
+            assert!(
+                name.is_empty() || !msg.contains(name),
+                "the message must not repeat the value: {msg}"
+            );
+        }
     }
 
     #[test]

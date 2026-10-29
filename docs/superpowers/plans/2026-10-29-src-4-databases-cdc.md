@@ -363,6 +363,8 @@ for the job. Not started. The gate's `connect` step stays `refused` in
 
 - *Review round 1, SHOULD-FIX 2 (T1.4).* Oracle's own TCPS was attempted twice and is left unproven: first with `orapki` (the image has no Java, so no wallet), then with a PKCS#12 wallet made by `openssl` (the listener answered `ORA-28759` / `TNS-00566`, failed to open the wallet, and never came up on 2484). The gate is back on the nginx TLS terminator that passed; the honest note stays in `oracle-tls-proxy.conf`, the gate docstring and `coverage.json`.
 
+- *Review round 1, SHOULD-FIX 3 (T1.1).* The Oracle service name is validated as an identifier, `^[A-Za-z0-9_.-]{1,128}$` (letters, digits, `_`, `.`, `-`: the characters of a plain or domain-qualified service name; no wider set was needed). Checked in `ingest_spec.rs` (`is_oracle_service_name`, a fixed 422 sentence) and again in `adapters/oracle.py` (`OracleServiceNameError`, mapped to a rejected setting). Tests: two Rust unit tests and one parametrised Python test. Python: `test_adapters_oracle.py` plus `test_ingest_factory.py`, 108 passed. Rust tests *not verified locally* (disk full); CI is the proof.
+
 (Further entries follow, one per slice.)
 
 ## Review

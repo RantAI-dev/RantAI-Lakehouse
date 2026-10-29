@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from dispar_orchestrate.adapters.oracle import OracleTlsConfigError, build_source
+from dispar_orchestrate.adapters.oracle import OracleServiceNameError, OracleTlsConfigError, build_source
 from dispar_orchestrate.ssrf_guard import ResolvedAddress, SsrfBlocked
 
 
@@ -442,3 +442,17 @@ def test_a_tls_dial_really_encrypts_and_checks_the_certificate_dn(tmp_path, monk
         assert "DPY-6002" in wrong
     finally:
         listener.close()
+
+
+@pytest.mark.parametrize("name", ["a)(b", "a=b", "a b", "(a", "", "A" * 129])
+def test_build_source_refuses_a_service_name_that_is_not_an_identifier(monkeypatch, name):
+    # SRC-4 slice 1 review SHOULD-FIX 3: a fixed error that does not repeat the value.
+    monkeypatch.setattr("dispar_orchestrate.adapters.oracle.sql_database", lambda **_: pytest.fail("must not be called"))
+    with pytest.raises(OracleServiceNameError) as err:
+        build_source(
+            {"driver": "oracle", "host": "ora.invalid", "port": 1521, "database": name, "user": "reader"},
+            secrets={"password": "s3cret"},
+            source_objects=[],
+            resolve_checked=lambda h, p: ResolvedAddress(ip="10.0.0.9", port=p, family=2),
+        )
+    assert name == "" or name not in str(err.value)

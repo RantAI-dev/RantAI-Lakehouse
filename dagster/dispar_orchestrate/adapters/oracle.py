@@ -83,6 +83,7 @@ the console takes them from the preview (`discover.py`), in Oracle's spelling
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -96,6 +97,15 @@ class OracleTlsConfigError(Exception):
     """`sslMode` requires TLS but no `sslServerCertDn` was supplied --
     refused, never a silent connection with the server's identity
     unverified."""
+
+
+class OracleServiceNameError(Exception):
+    """The dial's `database` is not an identifier fit to be an Oracle service name."""
+
+
+# SRC-4 slice 1 review SHOULD-FIX 3: the service name is an identifier; the same rule as
+# `is_oracle_service_name` in `ingest_spec.rs`, checked again here before connect args are built.
+_SERVICE_NAME = re.compile(r"[A-Za-z0-9_.-]{1,128}")
 
 
 @dataclass(frozen=True)
@@ -120,9 +130,16 @@ def connection_parts(
 
     # Errors
 
+    `OracleServiceNameError` when `database` is not an identifier;
     `OracleTlsConfigError` when `sslMode` requires TLS and `sslServerCertDn` is
     unset; whatever `resolve_checked` raises for a blocked host.
     """
+    service_name = spec["database"]
+    if not isinstance(service_name, str) or not _SERVICE_NAME.fullmatch(service_name):
+        # Fixed text: the value is not repeated.
+        raise OracleServiceNameError(
+            "database must be an Oracle service name: 1 to 128 letters, digits, underscores, dots or hyphens"
+        )
     resolved = resolve_checked(spec["host"], spec["port"])
 
     tls_required = bool(spec.get("sslMode")) and spec["sslMode"] != "disable"
