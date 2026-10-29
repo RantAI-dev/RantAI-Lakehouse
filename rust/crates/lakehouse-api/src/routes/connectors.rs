@@ -2521,6 +2521,20 @@ async fn deprovision_postgres_connector(
             if cdc.driver != SqlDriver::Postgres {
                 return Ok(None);
             }
+            // `Dial::parse` requires both names for PostgreSQL; a row without
+            // them is a data-integrity problem, refused with fixed text.
+            let (Some(slot_name), Some(publication_name)) =
+                (cdc.slot_name.as_deref(), cdc.publication_name.as_deref())
+            else {
+                tracing::error!(
+                    connector_id = %id,
+                    "a PostgreSQL change-capture dial has no slot or publication name"
+                );
+                return Err(ApiError::Internal(format!(
+                    "connector {id} is a PostgreSQL change-capture connector whose stored dial \
+                     has no slot or publication name"
+                )));
+            };
             // The wizard stores `host` as a bare hostname; user, port and
             // database live only in `dial` (same as `connector_probe`).
             let target = PgHost {
@@ -2529,16 +2543,9 @@ async fn deprovision_postgres_connector(
                 user: cdc.user.clone(),
                 database: cdc.database.clone(),
             };
-            deprovision_with_names(
-                state,
-                id,
-                dial_info,
-                &target,
-                &cdc.slot_name,
-                &cdc.publication_name,
-            )
-            .await
-            .map(Some)
+            deprovision_with_names(state, id, dial_info, &target, slot_name, publication_name)
+                .await
+                .map(Some)
         }
         None if dial_info.kind.to_lowercase().contains("postgres") => {
             let slug = connector_slug_for_id(id)?;

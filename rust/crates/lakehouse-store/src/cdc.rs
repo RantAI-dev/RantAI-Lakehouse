@@ -394,9 +394,16 @@ pub fn render_connect_config(
     if tables.is_empty() {
         return Err(CdcSpecError::NoTables);
     }
+    let (Some(slot_name), Some(publication_name)) =
+        (dial.slot_name.as_deref(), dial.publication_name.as_deref())
+    else {
+        // `Dial::parse` requires both for PostgreSQL; a hand-built dial
+        // without them is refused the same way a bad name is.
+        return Err(CdcSpecError::InvalidReplicationName { field: "slotName" });
+    };
     for (field, value) in [
-        ("slotName", dial.slot_name.as_str()),
-        ("publicationName", dial.publication_name.as_str()),
+        ("slotName", slot_name),
+        ("publicationName", publication_name),
     ] {
         if !is_replication_name(value) {
             return Err(CdcSpecError::InvalidReplicationName { field });
@@ -429,8 +436,8 @@ pub fn render_connect_config(
         ("schema.include.list", schemas.join(",")),
         ("table.include.list", tables.join(",")),
         ("plugin.name", "pgoutput".to_owned()),
-        ("slot.name", dial.slot_name.clone()),
-        ("publication.name", dial.publication_name.clone()),
+        ("slot.name", slot_name.to_owned()),
+        ("publication.name", publication_name.to_owned()),
         ("publication.autocreate.mode", "disabled".to_owned()),
         ("snapshot.mode", "initial".to_owned()),
         ("decimal.handling.mode", "string".to_owned()),
@@ -565,7 +572,7 @@ mod tests {
     #[test]
     fn connect_config_refuses_a_slot_name_debezium_would_reject_and_other_drivers() {
         let mut dial = pg_dial("require");
-        dial.slot_name = "Orders-Slot".to_owned();
+        dial.slot_name = Some("Orders-Slot".to_owned());
         assert!(matches!(
             render_connect_config("conn-a", &dial, &["public.t"], CDC_SECRETS_DIR),
             Err(CdcSpecError::InvalidReplicationName { field: "slotName" })

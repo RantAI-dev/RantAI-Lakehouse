@@ -85,13 +85,14 @@ pub struct SqlDial {
 
 /// The connection shape for a change-data-capture `cdc` adapter's `dial`.
 ///
-/// `slot_name`/`publication_name` are **required**, not `Option`: a `cdc`
-/// connector's replication slot/publication come from `dial` with no
-/// fallback, so a `cdc` dial missing either is a construction-time (400)
-/// error, not a later runtime surprise — see
-/// `docs/adr/0013-registry-driven-ingestion.md`'s "the same connection
-/// fields as `sql`, plus `slotName` and `publicationName` as **required**"
-/// decision.
+/// Which of `slot_name`, `publication_name` and `server_id` a dial carries
+/// depends on the driver (`SRC-4` slice 3, decision S3-a), checked by
+/// [`Dial::parse`] (`validate_cdc_dial_post_parse`), not by serde: `PostgreSQL`
+/// requires `slotName` and `publicationName` and refuses `serverId`; `MySQL`
+/// requires `serverId` and refuses the other two; `SQL Server` refuses all
+/// three. A `cdc` dial that breaks this is a construction-time (400) error, not
+/// a later runtime surprise. ADR 0013's "required" is "required for
+/// `PostgreSQL`" (dated note there).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct CdcDial {
@@ -108,12 +109,17 @@ pub struct CdcDial {
     /// A literal username, never a `secretRef`-shaped indirection — see
     /// [`SqlDial::user`].
     pub user: String,
-    /// The replication slot name, required with no fallback.
-    pub slot_name: String,
-    /// The publication name, required with no fallback.
-    pub publication_name: String,
-    /// An optional numeric server id, used by drivers (e.g. `MySQL`
-    /// binlog replication) that need one.
+    /// The replication slot name: required for `PostgreSQL` with no fallback,
+    /// refused for the other drivers.
+    #[serde(default)]
+    pub slot_name: Option<String>,
+    /// The publication name: required for `PostgreSQL` with no fallback,
+    /// refused for the other drivers.
+    #[serde(default)]
+    pub publication_name: Option<String>,
+    /// The `MySQL` binlog client's server id (1 to 4294967295): required for
+    /// `MySQL`, refused for the other drivers.
+    #[serde(default)]
     pub server_id: Option<u32>,
     /// How the change-capture worker secures its connection to the source
     /// (`SRC-4` decision S2-d). Absent means [`CdcSslMode::Require`]: a
@@ -612,6 +618,7 @@ impl Dial {
             "cdc" => {
                 let dial: CdcDial = parse_dial(adapter, raw)?;
                 check_hostname(adapter, "host", &dial.host)?;
+                validate_cdc_dial_post_parse(adapter, &dial)?;
                 Ok(Dial::Cdc(dial))
             }
             "mongodb" => {
@@ -1053,6 +1060,82 @@ fn parse_dial<T: for<'de> Deserialize<'de>>(
         adapter: adapter.to_owned(),
         source,
     })
+}
+
+/// The per-driver rule for a `cdc` dial's `slotName`, `publicationName` and
+/// `serverId` (`SRC-4` decision S3-a). Every refusal is one fixed sentence
+/// naming the field and the driver, never a value.
+///
+/// # Errors
+///
+/// Returns [`IngestSpecError::InvalidDial`] when a field the driver needs is
+/// missing, a field it does not use is present, or `serverId` is 0.
+fn validate_cdc_dial_post_parse(adapter: &str, dial: &CdcDial) -> Result<(), IngestSpecError> {
+    let refuse = |message: &'static str| IngestSpecError::InvalidDial {
+        adapter: adapter.to_owned(),
+        source: serde::de::Error::custom(message),
+    };
+    match dial.driver {
+        SqlDriver::Postgres => {
+            if dial.slot_name.is_none() {
+                return Err(refuse(
+                    "slotName is required for a PostgreSQL change-capture connector",
+                ));
+            }
+            if dial.publication_name.is_none() {
+                return Err(refuse(
+                    "publicationName is required for a PostgreSQL change-capture connector",
+                ));
+            }
+            if dial.server_id.is_some() {
+                return Err(refuse(
+                    "serverId is only for a MySQL change-capture connector",
+                ));
+            }
+        }
+        SqlDriver::Mysql => {
+            match dial.server_id {
+                None => {
+                    return Err(refuse(
+                        "serverId is required for a MySQL change-capture connector",
+                    ));
+                }
+                Some(0) => return Err(refuse("serverId must be between 1 and 4294967295")),
+                Some(_) => {}
+            }
+            if dial.slot_name.is_some() {
+                return Err(refuse(
+                    "slotName is only for a PostgreSQL change-capture connector",
+                ));
+            }
+            if dial.publication_name.is_some() {
+                return Err(refuse(
+                    "publicationName is only for a PostgreSQL change-capture connector",
+                ));
+            }
+        }
+        SqlDriver::Mssql => {
+            if dial.slot_name.is_some() {
+                return Err(refuse(
+                    "slotName is only for a PostgreSQL change-capture connector",
+                ));
+            }
+            if dial.publication_name.is_some() {
+                return Err(refuse(
+                    "publicationName is only for a PostgreSQL change-capture connector",
+                ));
+            }
+            if dial.server_id.is_some() {
+                return Err(refuse(
+                    "serverId is only for a MySQL change-capture connector",
+                ));
+            }
+        }
+        // Oracle change capture is slice 6; until then its dial is parsed as
+        // before, with none of the three.
+        SqlDriver::Oracle => {}
+    }
+    Ok(())
 }
 
 /// Check `host` via [`validate_hostname`], wrapping a rejection as
@@ -2301,13 +2384,52 @@ mod tests {
     }
 
     #[test]
-    fn cdc_dial_requires_slot_and_publication_name() {
-        let json = serde_json::json!({
-            "driver": "postgres", "host": "db.internal", "port": 5432,
-            "database": "orders", "user": "app_reader"
-        });
-        let err = serde_json::from_value::<CdcDial>(json).unwrap_err();
-        assert!(err.to_string().contains("missing field"));
+    fn cdc_dial_fields_follow_the_driver() {
+        let base = |driver: &str| {
+            serde_json::json!({
+                "driver": driver, "host": "db.internal", "port": 5432,
+                "database": "orders", "user": "app_reader"
+            })
+        };
+        let refusal = |json: serde_json::Value| Dial::parse("cdc", &json).unwrap_err().to_string();
+        // PostgreSQL: both names required, no server id; stored rows parse unchanged.
+        assert!(refusal(base("postgres")).contains("slotName is required"));
+        let mut pg = base("postgres");
+        pg["slotName"] = serde_json::json!("s");
+        assert!(refusal(pg.clone()).contains("publicationName is required"));
+        pg["publicationName"] = serde_json::json!("p");
+        assert!(Dial::parse("cdc", &pg).is_ok());
+        pg["serverId"] = serde_json::json!(5);
+        assert!(refusal(pg).contains("serverId is only for a MySQL"));
+        // MySQL: a server id in 1..=4294967295, neither name.
+        assert!(refusal(base("mysql")).contains("serverId is required"));
+        let mut my = base("mysql");
+        my["serverId"] = serde_json::json!(0);
+        assert!(refusal(my.clone()).contains("between 1 and 4294967295"));
+        my["serverId"] = serde_json::json!(4_294_967_295_u64);
+        assert!(Dial::parse("cdc", &my).is_ok());
+        my["serverId"] = serde_json::json!(4_294_967_296_u64);
+        assert!(Dial::parse("cdc", &my).is_err());
+        my["serverId"] = serde_json::json!(7);
+        my["slotName"] = serde_json::json!("s");
+        assert!(refusal(my.clone()).contains("slotName is only for a PostgreSQL"));
+        my.as_object_mut().unwrap().remove("slotName");
+        my["publicationName"] = serde_json::json!("p");
+        assert!(refusal(my).contains("publicationName is only for a PostgreSQL"));
+        // SQL Server: none of the three.
+        assert!(Dial::parse("cdc", &base("mssql")).is_ok());
+        for (field, value) in [
+            ("slotName", serde_json::json!("s")),
+            ("publicationName", serde_json::json!("p")),
+            ("serverId", serde_json::json!(1)),
+        ] {
+            let mut ms = base("mssql");
+            ms[field] = value;
+            assert!(
+                Dial::parse("cdc", &ms).is_err(),
+                "{field} must be refused for SQL Server"
+            );
+        }
     }
 
     #[test]
@@ -2425,7 +2547,7 @@ mod tests {
         });
         let dial = Dial::parse("cdc", &json).expect("valid cdc dial");
         assert_eq!(
-            dial.as_cdc().map(|cdc| cdc.slot_name.as_str()),
+            dial.as_cdc().and_then(|cdc| cdc.slot_name.as_deref()),
             Some("orders_slot")
         );
     }
