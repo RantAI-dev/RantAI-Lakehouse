@@ -134,6 +134,27 @@ def _object(name: str = "public.orders", **extra: Any) -> dict[str, Any]:
     return {"name": name, "target": "orders", "primaryKey": ["id"], **extra}
 
 
+@pytest.mark.parametrize(
+    ("dial", "name", "topic"),
+    [
+        ({"driver": "postgres", "database": "orders"}, "public.orders", "cdc.conn-a.public.orders"),
+        ({"driver": "mysql", "database": "shop"}, "shop.orders", "cdc.conn-a.shop.orders"),
+        ({"driver": "mssql", "database": "shop"}, "dbo.orders", "cdc.conn-a.shop.dbo.orders"),
+        (None, "public.orders", "cdc.conn-a.public.orders"),
+    ],
+)
+def test_the_topic_of_a_table_follows_the_drivers_naming(dial, name, topic) -> None:
+    connector = {**_connector(_object(name)), "dial": dial}
+    (target,) = targets_of(connector)
+    assert target.topic == topic
+
+
+def test_a_sql_server_dial_without_a_database_is_a_setup_error_not_a_guessed_topic() -> None:
+    connector = {**_connector(_object("dbo.orders")), "dial": {"driver": "mssql"}}
+    with pytest.raises(CdcSetupError):
+        targets_of(connector)
+
+
 def test_a_table_with_no_mode_is_the_current_row_per_key() -> None:
     (target,) = targets_of(_connector(_object()))
     assert target.topic == "cdc.conn-a.public.orders"

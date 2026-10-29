@@ -202,9 +202,26 @@ def group_of(connector_id: str) -> str:
     return f"lakehouse-cdc-{connector_id}"
 
 
-def topic_of(connector_id: str, object_name: str) -> str:
+def topic_of(connector_id: str, object_name: str, dial: Mapping[str, Any] | None = None) -> str:
     """The topic `Kafka Connect` writes a table to: `topic.prefix` is `cdc.<id>`
-    (`lakehouse_store::cdc::render_connect_config`), then `<schema>.<table>`."""
+    (`lakehouse_store::cdc::render_connect_config`), then the name Debezium gives the table.
+
+    - PostgreSQL: `<schema>.<table>`. MySQL: `<database>.<table>` (the source object's own name).
+      Both are `cdc.<id>.<object name>`.
+    - SQL Server (`dial.driver == "mssql"`): `<database>.<schema>.<table>`, the database being
+      the dial's, because the object name is `<schema>.<table>` (`SRC-4` decision S3-c).
+
+    The schema-history topic of MySQL and SQL Server (`cdc.<id>.schema-history`) is never read:
+    only the topics of the connector's source objects are.
+
+    # Errors
+
+    `CdcSetupError` for a SQL Server dial that names no database."""
+    if (dial or {}).get("driver") == "mssql":
+        database = (dial or {}).get("database")
+        if not isinstance(database, str) or not database:
+            raise CdcSetupError("a SQL Server change-capture connector has no database in its dial")
+        return f"{TOPIC_PREFIX}.{connector_id}.{database}.{object_name}"
     return f"{TOPIC_PREFIX}.{connector_id}.{object_name}"
 
 
@@ -239,7 +256,7 @@ def targets_of(connector: Mapping[str, Any]) -> list[ApplyTarget]:
             ApplyTarget(
                 connector_id=connector_id,
                 name=name,
-                topic=topic_of(connector_id, name),
+                topic=topic_of(connector_id, name, connector.get("dial")),
                 table=table,
                 key=key,
                 mode=mode,
@@ -854,7 +871,11 @@ def evaluate(
 
 def _lag_of(config: CdcConfig) -> Callable[[Mapping[str, Any]], int | None]:
     def lag(connector: Mapping[str, Any]) -> int | None:
-        topics = [topic_of(connector["id"], o["name"]) for o in connector.get("sourceObjects") or [] if o.get("name")]
+        topics = [
+            topic_of(connector["id"], o["name"], connector.get("dial"))
+            for o in connector.get("sourceObjects") or []
+            if o.get("name")
+        ]
         return unconsumed(config, group_of(connector["id"]), topics)
 
     return lag
