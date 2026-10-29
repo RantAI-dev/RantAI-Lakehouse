@@ -106,7 +106,7 @@ pub struct Request {
 #[derive(Debug)]
 pub enum Dispatch {
     /// The API answered (or refused) itself.
-    Done(Answer),
+    Done(Box<Answer>),
     /// The orchestrator must read the source (D1): launch `discover_job`.
     Orchestrator,
 }
@@ -1116,14 +1116,14 @@ pub async fn dispatch(
     if kind == Kind::Test {
         // `SRC-4` T1.1: a connection test is not a listing; it has its own
         // route (`POST /api/connectors/{id}/test`).
-        return Dispatch::Done(Answer::failed(kind, ErrorClass::NotSupported));
+        return Dispatch::Done(Box::new(Answer::failed(kind, ErrorClass::NotSupported)));
     }
     let Some(adapter) = info.adapter.as_deref() else {
         // No ingest spec yet: there is no dial to read.
-        return Dispatch::Done(Answer::failed(kind, ErrorClass::NotSupported));
+        return Dispatch::Done(Box::new(Answer::failed(kind, ErrorClass::NotSupported)));
     };
     let Ok(dial) = Dial::parse(adapter, &info.dial) else {
-        return Dispatch::Done(Answer::failed(kind, ErrorClass::Failed));
+        return Dispatch::Done(Box::new(Answer::failed(kind, ErrorClass::Failed)));
     };
     let answer = match &dial {
         Dial::Sql(sql) if sql.driver != SqlDriver::Oracle => {
@@ -1169,7 +1169,7 @@ pub async fn dispatch(
         | Dial::Sftp(_)
         | Dial::Saas(_) => return Dispatch::Orchestrator,
     };
-    Dispatch::Done(answer)
+    Dispatch::Done(Box::new(answer))
 }
 
 #[cfg(test)]
@@ -1384,6 +1384,7 @@ mod tests {
         else {
             panic!("the API answers a PostgreSQL source itself");
         };
+        let answer = *answer;
         assert_eq!(answer.error_class, Some(ErrorClass::AddressRefused));
         assert_eq!(answer.reason, Some(ErrorClass::AddressRefused.reason()));
     }
@@ -1469,6 +1470,7 @@ mod tests {
         else {
             panic!("the API lists REST endpoints itself");
         };
+        let answer = *answer;
         let names: Vec<&str> = answer
             .objects
             .as_ref()
@@ -1527,6 +1529,7 @@ mod tests {
             else {
                 panic!("answered by the API");
             };
+            let answer = *answer;
             assert_eq!(answer.error_class, Some(ErrorClass::NotSupported));
             assert!(
                 !answer.reason.unwrap().contains("unknown adapter"),

@@ -205,7 +205,7 @@ pub async fn start(
     )
     .await;
     let answer = match dispatched {
-        Dispatch::Done(answer) => answer,
+        Dispatch::Done(answer) => *answer,
         Dispatch::Orchestrator => launch(&state, &id, kind, &request).await?,
     };
     Ok(ApiJson(answer))
