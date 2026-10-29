@@ -1,0 +1,124 @@
+# SRC-4 slice 0 (docs/superpowers/plans/2026-10-29-src-4-databases-cdc.md, T0.4): the
+# measurement of ADR 0016, Debezium on Kafka Connect plus a Dagster applier into Bronze,
+# against the targets of the plan. THIS WORKFLOW EXISTS ONLY ON `measure/src-4-cdc`,
+# a branch that is never merged and is deleted once docs/plans/SRC-4-RESULT.md lands.
+#
+# It is a MEASUREMENT, not an acceptance gate (the shape of g9-upload-large.yml): it is
+# not in ci.yml, not in `ci-required`, and cannot block a merge. It runs on `push` to
+# the measure branch and by hand.
+#
+# It builds the Dagster image in the job (the applier is in it), brings up the
+# Lakekeeper/RustFS/ClickHouse/Dagster services the Bronze write and read need, plus the
+# broker, Kafka Connect and the source of ops/src4/docker-compose.src4.override.yml, and
+# runs ops/src4/measure_cdc.py ON THE RUNNER (it calls `docker compose exec` and
+# `docker stats`). lakehouse-api is not started: the API is not touched in this slice.
+name: src4-measure
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [measure/src-4-cdc]
+
+permissions:
+  contents: read
+
+env:
+  COMPOSE: docker compose -p src4 -f docker-compose.yml -f ops/src4/docker-compose.src4.override.yml --profile dagster
+
+jobs:
+  src4-measure:
+    name: SRC-4 slice 0 measurement
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Free runner disk
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          df -h /
+
+      - name: Write CI-only .env
+        run: |
+          cat > .env <<'EOF2'
+          AUTH_BOOTSTRAP_EMAIL=ci@example.com
+          AUTH_BOOTSTRAP_PASSWORD=ci-password-not-real-123
+          # SEC-18: no default credentials in docker-compose.yml. CI-ONLY throwaway
+          # values for this job's own throwaway stack.
+          POSTGRES_PASSWORD=ci-only-pg-password-0001
+          RUSTFS_ACCESS_KEY=ci-only-rustfs-access
+          RUSTFS_SECRET_KEY=ci-only-rustfs-secret-0001
+          LAKEKEEPER_ENCRYPTION_KEY=ci-only-lakekeeper-key-0001
+          LAKEKEEPER_BASE_URI=http://lakekeeper:8181
+          DAGSTER_URL=http://dagster-webserver:3000/graphql
+          PIPELINE_RUN_TOKEN=ci-pipeline-run-token-not-real-123
+          EOF2
+          echo "CONNECTOR_SECRETS_KEY=$(openssl rand -base64 32)" >> .env
+
+      - name: The compose files parse
+        run: $COMPOSE config --quiet
+
+      - name: Bring up the stack
+        run: >
+          $COMPOSE up -d --build
+          postgres clickhouse rustfs rustfs-bucket-init
+          lakekeeper-db-init lakekeeper-migrate lakekeeper lakekeeper-warehouse-init
+          clickhouse-iceberg-init
+          dagster-code-location dagster-webserver dagster-daemon
+          kafka-src4 src4-source-init connect-src4
+
+      - name: Stack state and image digests
+        run: |
+          $COMPOSE ps
+          {
+            echo '### Images'
+            echo '```'
+            for s in kafka-src4 connect-src4 postgres clickhouse dagster-code-location; do
+              id=$($COMPOSE images -q "$s" | head -n1)
+              echo "$s $(docker image inspect "$id" --format '{{.RepoTags}} {{.RepoDigests}} {{.Id}}')"
+            done
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY" "$RUNNER_TEMP/images.txt"
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Unit tests of the harness
+        run: |
+          python3 -m pip install --quiet requests pytest
+          python3 -m pytest ops/src4/test_measure_cdc.py -q
+
+      - name: Run the measurement
+        env:
+          POSTGRES_PASSWORD: ci-only-pg-password-0001
+        run: |
+          # Fail closed: without pipefail the pipe into `tee` hides a failed harness.
+          set -o pipefail
+          python3 ops/src4/measure_cdc.py --out "$RUNNER_TEMP/src4-result.json" | tee "$RUNNER_TEMP/src4-run.txt"
+          { echo '### SRC-4 slice 0'; echo '```'; sed -n '/^GATE-SUMMARY/,$p' "$RUNNER_TEMP/src4-run.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Collect logs and the result
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/out"
+          cp -f "$RUNNER_TEMP/src4-result.json" "$RUNNER_TEMP/src4-run.txt" "$RUNNER_TEMP/images.txt" "$RUNNER_TEMP/out/" 2>/dev/null || true
+          for s in connect-src4 kafka-src4 dagster-code-location dagster-daemon; do
+            $COMPOSE logs --no-color --tail 3000 "$s" > "$RUNNER_TEMP/out/$s.log" 2>&1 || true
+          done
+
+      - name: Upload the result and logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: src4-result
+          path: ${{ runner.temp }}/out
+          if-no-files-found: warn
+
+      - name: Tear down
+        if: always()
+        run: $COMPOSE down -v
