@@ -1590,11 +1590,13 @@ impl ConversionRunner {
                     .map_err(|_err| ConversionError::Refused(Refusal::Unreadable))?;
                 if let Err(err) = store.put(answer_key, Bytes::from(line)).await {
                     // The text is there but the marker is not, so the text is
-                    // not a conversion: it goes. Only what this run wrote is
-                    // removed (`SEC-22` P2).
-                    if let Err(cleanup) = store.delete(text_key).await {
-                        tracing::warn!(%cleanup, key = %text_key, "the text of a conversion that could not be marked could not be removed");
-                    }
+                    // not a conversion: it is converted again, and it is NOT
+                    // removed. The object at the text's key may be another
+                    // run's finished text, and that run's preview or its
+                    // launched job is about to read it (`PR #187` review
+                    // round 2 S1). A text without its marker counts as
+                    // missing in the preview and in the ingest, and the
+                    // delete of the upload removes it.
                     return Err(ConversionError::Store(err));
                 }
                 Ok(answer)
