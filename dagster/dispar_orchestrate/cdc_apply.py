@@ -35,7 +35,7 @@ format-version 2). A later batch that brings a column the table lacks is refused
 # Event shape
 
 Debezium's `ExtractNewRecordState` transform on the connector with
-`delete.handling.mode=rewrite` and `add.fields=op,source.ts_ms`, JSON converter
+`delete.tombstone.handling.mode=rewrite` (Debezium 3.8's name; the older `delete.handling.mode` is ignored there) and `add.fields=op,source.ts_ms`, JSON converter
 without schemas: a flat object of the row's columns plus `__op` (`c`, `u`, `d`,
 `r`), `__source_ts_ms` and `__deleted` (`"true"`/`"false"`). A delete carries
 the old row (the source tables are `REPLICA IDENTITY FULL`). A tombstone (a

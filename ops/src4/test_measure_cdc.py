@@ -139,7 +139,9 @@ def test_history_with_a_lost_a_repeated_or_reordered_event_is_never_equal() -> N
 def test_the_connector_flattens_rewrites_deletes_and_adds_the_two_fields_the_applier_reads() -> None:
     cfg = m.connector_config("pw")
     assert cfg["transforms.unwrap.type"].endswith("ExtractNewRecordState")
-    assert cfg["transforms.unwrap.delete.handling.mode"] == "rewrite"
+    assert cfg["transforms.unwrap.delete.tombstone.handling.mode"] == "rewrite"
+    # The deprecated spellings are ignored by Debezium 3.8 (they cost the second CI run its deletes).
+    assert "transforms.unwrap.delete.handling.mode" not in cfg and "transforms.unwrap.drop.tombstones" not in cfg
     assert cfg["transforms.unwrap.add.fields"] == "op,source.ts_ms"
     assert cfg["value.converter.schemas.enable"] == "false"
     assert cfg["slot.name"] == "src4_slot" and cfg["publication.name"] == "src4_pub"

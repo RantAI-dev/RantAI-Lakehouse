@@ -277,7 +277,7 @@ def check_history(
 
 def connector_config(password: str) -> dict[str, str]:
     """Debezium's PostgreSQL connector as the applier expects its events: flattened by
-    `ExtractNewRecordState`, deletes rewritten (the old row plus `__deleted=true`), the
+    `ExtractNewRecordState`, deletes rewritten (the old row plus `__deleted=true`, see the option's comment), the
     operation and source commit time added, JSON without schemas, decimals as text. The
     password is the CI stack's own throwaway one (see the override)."""
     return {
@@ -303,9 +303,13 @@ def connector_config(password: str) -> dict[str, str]:
         "value.converter.schemas.enable": "false",
         "transforms": "unwrap",
         "transforms.unwrap.type": "io.debezium.transforms.ExtractNewRecordState",
-        "transforms.unwrap.delete.handling.mode": "rewrite",
+        # Debezium 3.8 names this `delete.tombstone.handling.mode`; the plan's `delete.handling.mode`
+        # plus `drop.tombstones` pair is the deprecated spelling and is IGNORED there (second CI run:
+        # the effective mode logged was `tombstone`, so every delete reached the topic as a message
+        # with no value and no delete ever reached Bronze). `rewrite` keeps the old row with
+        # `__deleted=true` and drops the tombstone.
+        "transforms.unwrap.delete.tombstone.handling.mode": "rewrite",
         "transforms.unwrap.add.fields": "op,source.ts_ms",
-        "transforms.unwrap.drop.tombstones": "true",
     }
 
 
