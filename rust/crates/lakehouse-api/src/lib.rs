@@ -34,6 +34,7 @@ pub mod connector_listing;
 pub mod connector_oauth;
 pub mod connector_probe;
 pub mod connector_secret_store;
+pub mod crypto_provider;
 pub mod csv_export;
 pub mod csv_safe;
 pub mod error;
@@ -48,6 +49,7 @@ pub mod lakehouse_catalog;
 pub mod lakekeeper_token;
 pub mod next_run;
 pub mod pdf;
+pub mod pg_probe;
 pub mod pipeline_lag;
 pub mod pipeline_source;
 pub mod policy;
@@ -65,6 +67,13 @@ pub mod state;
 pub mod tenant;
 pub mod tenant_scope;
 pub mod tile_pool;
+
+// Test-only: the TLS-terminating proxy in front of the shared test
+// Postgres (`SEC-14` part B). Declared in both this crate's module roots
+// because `main.rs` compiles the same sources into the binary.
+#[cfg(test)]
+mod tls_proxy;
+
 pub mod transform_grammar;
 pub mod upload_formats;
 pub mod upload_limits;

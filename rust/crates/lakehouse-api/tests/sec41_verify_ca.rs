@@ -10,8 +10,10 @@
 //! recognised rustls' `NotValidForName`; rustls 0.23.46 reports
 //! `NotValidForNameContext`, so every such dial failed (SEC-41's spec, "Why").
 //! `sqlx-core` 0.9.0 recognises both. This test pins that half of the fix
-//! down; the production `VerifyCa` call itself lands with `SEC-14` part B
-//! (#192), which rebases on `SEC-41`.
+//! down; the production `VerifyCa` call itself landed with `SEC-14` part B
+//! (#192), which merged `SEC-41` into `main` and now dials
+//! `lakehouse_api::connector_probe::pg_options_for_address` at an IP -- see
+//! `tests/crypto_provider.rs` for that dial through the production helper.
 //!
 //! # The TLS terminator
 //!
@@ -21,9 +23,8 @@
 //! Postgres' 8-byte `SSLRequest` with `S`, run a rustls handshake with a
 //! certificate minted per test, then forward the decrypted bytes to the real
 //! server. Everything behind it is a REAL Postgres. The shape is copied from
-//! `SEC-14` part B's `rust/crates/lakehouse-api/src/tls_proxy.rs`
-//! (`origin/fix/sec-14-part-b-tls`), trimmed to one certificate chain and no
-//! fixed name constant.
+//! `SEC-14` part B's `rust/crates/lakehouse-api/src/tls_proxy.rs`, trimmed to
+//! one certificate chain and no fixed name constant.
 //!
 //! The two authorities are minted at test time, never committed: a committed
 //! private key is a leak (`.gitleaksignore` history, `SEC-36`).
@@ -52,6 +53,11 @@ const CERTIFICATE_NAME: &str = "db.internal";
 
 /// A certificate authority minted for one test.
 struct TestCa {
+    /// The CA's own parameters. `rcgen` 0.14 unbundles the parameters from
+    /// the issued certificate, so signing a leaf needs them again: the
+    /// issuer's distinguished name, key identifier method and key usages
+    /// come from here, not from the CA's certificate.
+    params: rcgen::CertificateParams,
     certificate: rcgen::Certificate,
     key: rcgen::KeyPair,
 }
@@ -66,7 +72,11 @@ impl TestCa {
             .push(rcgen::DnType::CommonName, common_name);
         let key = rcgen::KeyPair::generate().expect("a CA key pair");
         let certificate = params.self_signed(&key).expect("a self-signed CA");
-        Self { certificate, key }
+        Self {
+            params,
+            certificate,
+            key,
+        }
     }
 
     /// A server certificate for [`CERTIFICATE_NAME`], signed by this CA.
@@ -77,8 +87,12 @@ impl TestCa {
             .distinguished_name
             .push(rcgen::DnType::CommonName, CERTIFICATE_NAME);
         let key = rcgen::KeyPair::generate().expect("a server key pair");
+        // `rcgen` 0.14 signs through an `Issuer` -- the issuer's own
+        // parameters together with its signing key -- instead of taking
+        // the issuer's certificate and key as two separate arguments.
+        let issuer = rcgen::Issuer::from_params(&self.params, &self.key);
         let certificate = params
-            .signed_by(&key, &self.certificate, &self.key)
+            .signed_by(&key, &issuer)
             .expect("a certificate signed by the test CA");
         (certificate, key)
     }
@@ -187,9 +201,9 @@ async fn accept_ssl_upgrade(mut inbound: TcpStream) -> Option<TcpStream> {
 /// features — so rustls cannot pick one and panics ("Could not
 /// automatically determine the process-level `CryptoProvider`") on the first
 /// `VerifyCa` dial. This test installs `ring` for itself so the sqlx half can
-/// be exercised; the API binary needs the same install (or a chosen provider
-/// for every rustls consumer) before `SEC-14` part B's first production
-/// `VerifyCa` dial, which is that item's decision, not this test's.
+/// be exercised; the API binary does the same, in `main`, through
+/// `lakehouse_api::crypto_provider::install_default_provider` (SEC-14 part B,
+/// PR #192 review BLOCKER 10), before any task can dial.
 fn install_rustls_provider() {
     static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     ONCE.get_or_init(|| {

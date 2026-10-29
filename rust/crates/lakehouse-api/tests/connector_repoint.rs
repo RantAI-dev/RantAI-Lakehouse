@@ -487,13 +487,14 @@ async fn the_first_dial_of_a_connector_is_saved_and_the_next_host_is_refused() {
 async fn a_re_point_with_credentials_is_probed_and_saved_together() {
     let url = lakehouse_test_support::database_url();
     let (user, password, host, port) = parse_postgres_url(&url);
+    let proxy = common::tls_proxy::TlsProxy::start(&host, port).await;
     let fx = fixture(true).await;
     let (database,): (String,) = sqlx::query_as("SELECT current_database()")
         .fetch_one(&fx.app.pool)
         .await
         .unwrap();
 
-    let mut spec = sql_spec(&host, port, &database, &user);
+    let mut spec = sql_spec(&host, proxy.port(), &database, &user);
     spec["credential"] = json!({ "primary": { "kind": "password", "value": password } });
     let (status, body) = put_spec(&fx, "conn-pg-lakehouse", spec).await;
     assert_eq!(status, StatusCode::OK, "{body}");

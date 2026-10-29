@@ -124,11 +124,18 @@ pub async fn load_principal_for_user(
             .chain(grant_rows.iter().map(|(perm,)| PermissionSet::parse(perm))),
     );
 
-    let tenant_ids: Vec<(Uuid,)> =
-        sqlx::query_as("SELECT tenant_id FROM app_user_tenant WHERE user_id = $1")
-            .bind(user_id)
-            .fetch_all(pool)
-            .await?;
+    // The lowest `tenant_id` first, whatever order the memberships were
+    // written in: a principal's FIRST tenant is who acts when a request
+    // carries no `X-Tenant` header — the chat, the saved-query tools and the
+    // catalog sample and profile fall back to it (SEC-20) — and an unordered
+    // read lets that choice follow the heap instead, so the same user could
+    // act as two different tenants on two requests.
+    let tenant_ids: Vec<(Uuid,)> = sqlx::query_as(
+        "SELECT tenant_id FROM app_user_tenant WHERE user_id = $1 ORDER BY tenant_id",
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
 
     Ok(Principal {
         id: PrincipalId::User(user_id),

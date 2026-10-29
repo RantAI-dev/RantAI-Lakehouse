@@ -494,10 +494,18 @@ const HISTORY_PAGE_LIMIT: i64 = 50;
 ///
 /// # The cursor (decision 5)
 ///
-/// `(q.at, q.id) < ($8::timestamptz, $9::text)` under
-/// `ORDER BY q.at DESC, q.id DESC` pages by the `at` *and* `id` of the
-/// last row seen: a cursor on `at` alone would repeat or skip every row
-/// that shares its millisecond.
+/// `(date_trunc('milliseconds', q.at), q.id) < ($8::timestamptz, $9::text)`
+/// under `ORDER BY date_trunc('milliseconds', q.at) DESC, q.id DESC` pages
+/// by the `at` *and* `id` of the last row seen: a cursor on `at` alone
+/// would repeat or skip every row that shares its millisecond.
+///
+/// The millisecond is the value the cursor carries: a row's `at` leaves
+/// the store cut to milliseconds ([`iso_millis`]), so the console's cursor
+/// holds `T.000` for a row at `T.000150`. Comparing that millisecond
+/// against the stored microsecond `at` skips every row inside the last
+/// page's millisecond — `T.000100` is not below `T.000` — so the order
+/// and the comparison both run on `date_trunc('milliseconds', q.at)`, the
+/// value the cursor holds.
 ///
 /// # The `table` match (decision 7)
 ///
@@ -549,8 +557,8 @@ pub async fn list_history(
            AND q.at >= GREATEST(COALESCE($6::timestamptz, now() - interval '14 days'), \
                                 now() - interval '14 days') \
            AND ($7::timestamptz IS NULL OR q.at <= $7) \
-           AND ($8::timestamptz IS NULL OR (q.at, q.id) < ($8::timestamptz, $9::text)) \
-         ORDER BY q.at DESC, q.id DESC \
+           AND ($8::timestamptz IS NULL OR (date_trunc('milliseconds', q.at), q.id) < ($8::timestamptz, $9::text)) \
+         ORDER BY date_trunc('milliseconds', q.at) DESC, q.id DESC \
          LIMIT $10",
     )
     .bind(owner_id)

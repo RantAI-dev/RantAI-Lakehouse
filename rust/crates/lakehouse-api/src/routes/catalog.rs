@@ -1428,9 +1428,9 @@ pub async fn detail(
             .into_response());
     }
     if id.starts_with("silver.") || id.starts_with("serving.") {
-        return clickhouse_asset_detail(&state, &principal, &id).await;
+        return clickhouse_asset_detail(&state, &principal, &headers, &id).await;
     }
-    bronze_asset_detail(&state, &principal, &id).await
+    bronze_asset_detail(&state, &principal, &headers, &id).await
 }
 
 /// The permission reading an asset's rows needs — the same one
@@ -2029,7 +2029,7 @@ pub async fn sample(
         .unwrap_or(DETAIL_SAMPLE_ROWS)
         .clamp(1, SAMPLE_MAX_ROWS);
     let source = super::catalog_profile::resolve_source(&state, &id).await?;
-    let (rows, _) = governed_sample(&state, &principal, source.as_ref(), limit).await;
+    let (rows, _) = governed_sample(&state, &principal, &headers, source.as_ref(), limit).await;
     Ok(ApiJson(json!({ "rows": rows, "limit": limit })))
 }
 
@@ -2039,16 +2039,20 @@ pub async fn sample(
 /// since they describe policy, not data.
 ///
 /// The sample is data, so it goes through the same
-/// `query::rewrite_sql_for_principal` as `POST /api/query/run`: masked
-/// columns come back as `***` and row filters apply. Every failure along
-/// the way — an invalid name, unresolvable obligations, a refused rewrite,
-/// a missing table — yields NO rows rather than the raw ones: an empty
-/// sample is an honest "not available", an unmasked one is a leak.
+/// `query::rewrite_sql_for_principal_with_headers` as
+/// `POST /api/query/run`: masked columns come back as `***` and row
+/// filters apply. The request's headers go with it, so the sample is read
+/// as the organisation the console picked (`X-Tenant`), not as the
+/// caller's first tenant (`SEC-20`). Every failure along the way — an
+/// invalid name, unresolvable obligations, a refused rewrite, a missing
+/// table — yields NO rows rather than the raw ones: an empty sample is
+/// an honest "not available", an unmasked one is a leak.
 ///
 /// Every cell is a string, except a `NULL`, which is JSON `null`.
 async fn governed_sample(
     state: &AppState,
     principal: &Principal,
+    headers: &HeaderMap,
     source: Option<&ReadSource>,
     limit: u32,
 ) -> (Vec<Value>, HashSet<String>) {
@@ -2078,11 +2082,12 @@ async fn governed_sample(
         "SELECT * FROM {} LIMIT {limit} SETTINGS max_execution_time = {SAMPLE_MAX_SECONDS}",
         source.from
     );
-    let sql = match crate::routes::query::rewrite_sql_for_principal(
+    let sql = match crate::routes::query::rewrite_sql_for_principal_with_headers(
         state,
         &raw_sql,
         "clickhouse",
         principal,
+        headers,
     )
     .await
     {
@@ -2157,6 +2162,7 @@ async fn mark_schema_versions(ch: &ChClient, body: &mut Value, table_key: &str) 
 async fn clickhouse_asset_detail(
     state: &AppState,
     principal: &Principal,
+    headers: &HeaderMap,
     id: &str,
 ) -> ApiResult<Response> {
     let ch = &state.clickhouse;
@@ -2171,7 +2177,7 @@ async fn clickhouse_asset_detail(
         return Err(not_found());
     };
     let (sample, masked) =
-        governed_sample(state, principal, Some(&source), DETAIL_SAMPLE_ROWS).await;
+        governed_sample(state, principal, headers, Some(&source), DETAIL_SAMPLE_ROWS).await;
     let schema: Vec<Value> = source
         .columns
         .iter()
@@ -2262,9 +2268,10 @@ async fn clickhouse_asset_detail(
 async fn bronze_asset_detail(
     state: &AppState,
     principal: &Principal,
+    headers: &HeaderMap,
     id: &str,
 ) -> ApiResult<Response> {
-    match bronze_asset_detail_body(state, principal, id).await {
+    match bronze_asset_detail_body(state, principal, headers, id).await {
         Ok(Some(body)) => Ok((StatusCode::OK, ApiJson(body)).into_response()),
         Ok(None) => Err(not_found()),
         // `catch (e) { return NextResponse.json({ error: String(e) }, {
@@ -2287,6 +2294,7 @@ async fn bronze_asset_detail(
 async fn bronze_asset_detail_body(
     state: &AppState,
     principal: &Principal,
+    headers: &HeaderMap,
     id: &str,
 ) -> Result<Option<Value>, ChError> {
     let ch = &state.clickhouse;
@@ -2340,8 +2348,14 @@ async fn bronze_asset_detail_body(
             .flatten()
             .is_some(),
     };
-    let (sample, masked) =
-        governed_sample(state, principal, source.as_ref(), DETAIL_SAMPLE_ROWS).await;
+    let (sample, masked) = governed_sample(
+        state,
+        principal,
+        headers,
+        source.as_ref(),
+        DETAIL_SAMPLE_ROWS,
+    )
+    .await;
     // Declared types from whichever table was found; the registry's own
     // `tipe` otherwise (see the `data_type` fallback below).
     let type_of: HashMap<String, String> = source
@@ -5844,6 +5858,11 @@ mod tests {
         /// catalog tenant below, so a member passes the tenant gate.
         const TENANT_A: &str = "11111111-1111-4111-8111-000000000001";
 
+        /// `0002_seed_identity.sql`'s second tenant. The tenant tests
+        /// below make it the owner of the shared catalog, so it is never
+        /// the caller's FIRST tenant.
+        const TENANT_B: &str = "11111111-1111-4111-8111-000000000002";
+
         /// An Analyst in the catalog tenant holding `permissions`. Masking
         /// keys on `role_names`, so the policy below binds them either way.
         fn analyst(permissions: &str) -> Principal {
@@ -5856,6 +5875,30 @@ mod tests {
                 must_change_password: false,
                 role_names: vec!["Analyst".to_owned()],
             }
+        }
+
+        /// An Analyst in BOTH tenants, the lower id first — the order the
+        /// authentication layer loads them in, so this caller's FIRST
+        /// tenant is `TENANT_A`, which the tenant tests below do NOT make
+        /// the owner of the shared catalog.
+        fn analyst_of_both_tenants(permissions: &str) -> Principal {
+            Principal {
+                id: PrincipalId::User(Uuid::nil()),
+                tenant_ids: vec![TENANT_A.parse().unwrap(), TENANT_B.parse().unwrap()],
+                display_name: "alice".to_owned(),
+                permissions: PermissionSet::parse(permissions),
+                provider: "session".to_owned(),
+                must_change_password: false,
+                role_names: vec!["Analyst".to_owned()],
+            }
+        }
+
+        /// The headers the console sends when its organisation picker
+        /// names `tenant_id`.
+        fn headers_for(tenant_id: &str) -> HeaderMap {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-tenant", tenant_id.parse().expect("a tenant id is ASCII"));
+            headers
         }
 
         fn ch_json(meta: &[(&str, &str)], data: &Value) -> ResponseTemplate {
@@ -6074,6 +6117,110 @@ mod tests {
             .await
             .expect("sample answers");
             assert_eq!(body["rows"], expected);
+            Ok(())
+        }
+
+        /// The sample follows the organisation the console picked: with an
+        /// `X-Tenant` header naming the tenant that owns the shared
+        /// catalog, the sample is read as THAT tenant, not as the
+        /// caller's first tenant — which does not own the catalog here
+        /// and may not read the shared table at all.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn the_sample_follows_the_x_tenant_header_when_it_names_a_second_tenant(
+            pool: lakehouse_store::PgPool,
+        ) -> sqlx::Result<()> {
+            let server = MockServer::start().await;
+            // Seeds the policy and mounts the mocks.
+            detail_as(&pool, &server, analyst("catalog:read, query:read")).await;
+            let mut env = HashMap::new();
+            env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
+            env.insert("CH_URL".to_owned(), server.uri());
+            // The shared catalog belongs to the SECOND tenant here, so a
+            // read that ignores the header (and reads as the caller's
+            // first tenant) is refused for the shared table.
+            env.insert("CATALOG_TENANT_ID".to_owned(), TENANT_B.to_owned());
+            let state = AppState::new(Config::from_map(&env).expect("a valid test Config"));
+
+            let ApiJson(body) = sample(
+                State(state),
+                Extension(analyst_of_both_tenants("catalog:read, query:read")),
+                headers_for(TENANT_B),
+                Path("serving.mart_x".to_owned()),
+                Query(SampleQuery { limit: Some(7) }),
+            )
+            .await
+            .expect("sample answers");
+
+            assert_eq!(body["rows"], json!([{"id": "1", "email": "***"}]));
+            let requests = server.received_requests().await.expect("recorded");
+            let read_the_sample = requests
+                .iter()
+                .any(|r| String::from_utf8_lossy(&r.body).contains("LIMIT 7"));
+            assert!(
+                read_the_sample,
+                "the sample must be read as the tenant the header named"
+            );
+            Ok(())
+        }
+
+        /// The profile follows the same organisation the console picked:
+        /// with an `X-Tenant` header naming the tenant that owns the
+        /// shared catalog, the aggregate is read as THAT tenant, not as
+        /// the caller's first tenant.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn the_profile_follows_the_x_tenant_header_when_it_names_a_second_tenant(
+            pool: lakehouse_store::PgPool,
+        ) -> sqlx::Result<()> {
+            let server = MockServer::start().await;
+            // Seeds the policy and mounts the mocks.
+            detail_as(&pool, &server, analyst("catalog:read, query:read")).await;
+            // The profile's own aggregate, answered at a higher priority
+            // than the sample's read, so the profile route gets a row of
+            // its own shape.
+            Mock::given(method("POST"))
+                .and(body_string_contains("approx_top_k"))
+                .respond_with(ch_json(
+                    &[
+                        ("__rows", "UInt64"),
+                        ("c0_nulls", "UInt64"),
+                        ("c0_distinct", "UInt64"),
+                        ("c0_top", "String"),
+                        ("c1_nulls", "UInt64"),
+                        ("c1_distinct", "UInt64"),
+                        ("c1_top", "String"),
+                    ],
+                    &json!([{
+                        "__rows": "4",
+                        "c0_nulls": "0",
+                        "c0_distinct": "4",
+                        "c0_top": "[]",
+                        "c1_nulls": "1",
+                        "c1_distinct": "3",
+                        "c1_top": "[]",
+                    }]),
+                ))
+                .with_priority(1)
+                .mount(&server)
+                .await;
+            let mut env = HashMap::new();
+            env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
+            env.insert("CH_URL".to_owned(), server.uri());
+            env.insert("CATALOG_TENANT_ID".to_owned(), TENANT_B.to_owned());
+            let state = AppState::new(Config::from_map(&env).expect("a valid test Config"));
+
+            let resp = crate::routes::catalog_profile::profile(
+                State(state),
+                Extension(analyst_of_both_tenants("catalog:read, query:read")),
+                headers_for(TENANT_B),
+                Path("serving.mart_x".to_owned()),
+            )
+            .await
+            .expect("profile answers");
+            let (status, body) = response_json(resp).await;
+
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["supported"], json!(true));
+            assert_eq!(body["rowsProfiled"], json!(4));
             Ok(())
         }
 

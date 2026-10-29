@@ -61,6 +61,8 @@ chat's saved-query tools know who asks (owner's exception, 2026-10-23 for the on
 | 5 | Saved queries get a tenant column, set from the caller's tenant when a query is saved (console and chat). Saved queries from before this change have none; they belong to the tenant that owns the catalog, so that tenant's members still see them, and so does everyone in a one-tenant deployment | none | Owner, 2026-10-24 |
 | 6 | A principal with no tenant (a service token) in a deployment with more than one tenant sees no saved queries, and its SQL on shared tables is refused, as the catalog refuses it today. With `*:*` it passes | none | Owner, 2026-10-24 |
 | 7 | No on/off switch. Tenant scoping follows the `tenant` table, as the catalog does | none | Owner, 2026-10-24 |
+| 8 | A statement that lists objects without naming one table (`SHOW TABLES`, `SHOW DATABASES`, `SHOW SCHEMAS`, `SHOW VIEWS`, and every other `SHOW` form the read-only guard lets through except `SHOW COLUMNS`) is refused for a member of a tenant that does not own the catalog, with a 422 and one fixed sentence, "This statement is not available to your organisation." It passes for a deployment with one tenant, a principal with every permission (`*:*`), and the catalog's own tenant | 422 | Owner, 2026-10-26 |
+| 9 | `DESCRIBE`, `DESC` and `SHOW COLUMNS FROM <table>` are tenant-gated like a `SELECT`: the table they name must be the caller's to read, and the refusal is the same 404 sentence a refused `SELECT` gets | 404 | Owner, 2026-10-26 |
 
 ## Limits to tell a customer
 
@@ -74,6 +76,8 @@ chat's saved-query tools know who asks (owner's exception, 2026-10-23 for the on
   is listed for the tenant that owns the shared catalog.
 - On a dataset's page, the "used by" list is resolved against your first tenant while the page's own gate is
   resolved against the header's tenant, so with a header naming a second tenant the two can disagree.
+- A member of another tenant cannot list tables or databases (`SHOW TABLES`, `SHOW DATABASES`), and `DESCRIBE`
+  of another tenant's table reads as not found, like a `SELECT` of it.
 
 ## Acceptance checklist
 
@@ -89,6 +93,7 @@ each (operator).
 | `SEC-20-AC5` | As the tenant B user, ask the chat to run tenant A's saved query by its id | Refused; the chat says it cannot find it | Not run |
 | `SEC-20-AC6` | In Query Studio, Run all three statements where only the second reads tenant A's table | 1 shows rows, 2 is refused with the sentence above, 3 says "Not run" (not "refused") | Not run |
 | `SEC-20-AC7` | (operator) On a deployment with one tenant, run the same SQL as before the change | Same result as before | Not run |
+| `SEC-20-AC8` | As a tenant-B user, run `DESCRIBE <tenant A's uploaded table>` and `SHOW TABLES FROM bronze` | The 404 sentence for the `DESCRIBE` and the 422 listing sentence for `SHOW TABLES` | Not run |
 
 **Acceptor** (not the Owner): __________ **Date:** ______ **Build:** ______
 
