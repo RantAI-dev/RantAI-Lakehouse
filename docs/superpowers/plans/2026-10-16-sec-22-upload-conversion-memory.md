@@ -699,3 +699,135 @@ and should-fixes in order, one commit per finding or per tight group,
 each citing "PR #187 review B<n>/S<n>" at the site (rule 13). Then the
 full verification and the section 7 handoff.
 
+
+### Review round 2 (planner, 2026-10-29, at `2c252c32`)
+
+The review covers the round 1 fixes `d3fd0d60..0fa53a78` and the handoff.
+Two passes read the diff, one on the child and runner and one on the API
+side, and I checked BLOCKER 1 below in the source myself. The planner
+wrote `docs/plans/SEC-22-RESULT.md` (`6ea20e41`) from the handoff's
+numbers.
+
+**Closed:**
+- P1, BLOCKER 1, BLOCKER 2: the sparse `PartsReader`, the tail-only
+  footer, the group cap checked in the API before the fetch, and the
+  over-the-cap and hostile-footer tests.
+- P2, BLOCKER 3: the text is completed only after exit 0, the `.json` is
+  written last, and a `.csv` without its `.json` counts as missing in
+  both the preview and ingest.
+- BLOCKER 4: the 1 MiB `take` cap, with the endless-child test.
+- BLOCKER 5: the release measurement gives 1280 MiB. The arithmetic holds,
+  and the CPU and wall limits are unchanged.
+- SHOULD-FIX 1, 2, 5, 6 and 7. The `RLIMIT_DATA` comments and the
+  `with_wall` test from SHOULD-FIX 8 are also closed.
+
+#### BLOCKER
+
+1. **A store error while the child is fed still becomes "the file's
+   fault", and a chunked completion then deletes the user's file.** This
+   is round 1's SHOULD-FIX 3, reopened. Raised to a blocker because it
+   deletes user data.
+   - Parquet: `feed_range` (`upload_convert.rs:1921-1926`) maps a store
+     error to `io::Error`, and `feed` (`:1908`) maps every I/O error to
+     `Refused(ResourceLimit)`. So `Source::StoredParts` can never yield
+     `Store`.
+   - Workbooks: the child reads stdin to EOF and then answers. A truncated
+     feed therefore always produces a well-formed refusal line, and every
+     refusal path drops what `wait` returns: `answer_inner` `:1350-1351`,
+     `text_inner` `:1419-1420`, and `store_inner` `:1518-1519`, which does
+     not wait at all. "Store wins" is reached only on the success path.
+   - Scenario:
+     1. RustFS returns one 5xx on a `read_range` while a chunked upload
+        completes.
+     2. The child refuses the short input.
+     3. The route answers 400.
+     4. `sessions.rs:563-567` removes the object and the row, so a 2 GiB
+        upload is gone. A preview gives a false reason (principle 2).
+   - The test `a_store_failure_while_the_child_is_fed_is_a_503…`
+     (`tests/upload_routes.rs:8176`) breaks the bucket before
+     `sheets_of`, so it gets the 503 before any child starts and does not
+     test the feed.
+   - Fix:
+     - The feed keeps `ConversionError::Store` apart from a pipe error;
+       only a pipe error is `ResourceLimit`.
+     - Every refusal path awaits `wait`, and a `Store` from the feed wins
+       over the child's refusal.
+   - Tests: a store stand-in that fails `read_range` only after N calls,
+     covering:
+     - a workbook preview, expecting 503;
+     - a Parquet preview, expecting 503;
+     - a chunked completion, expecting 503 with the object and the row
+       still there.
+2. **A failed `setrlimit` answers 400 "needs more memory", not 500.** This
+   is round 1's SHOULD-FIX 4, reopened. Raised to a blocker because it
+   turns an installation fault into a refusal of every workbook, and with
+   BLOCKER 1's path into deleted uploads.
+   - `run_child_if_asked` exits with `LIMIT_FAILED` and writes no answer
+     line (`:671-675`).
+   - The parent sees EOF (`:1671`), and `refuse_the_child` drops `wait`'s
+     `Err(LimitFailed)` (`:1722`) and returns `ResourceLimit`. Killing
+     before `wait` would also hide the exit code behind SIGKILL.
+   - Fix: on EOF, `wait` first, then kill, and let `LimitFailed` and
+     `Store` through. Or have the child write a refusal line of its own
+     kind before it exits.
+   - Test: a stand-in child that exits with `LIMIT_FAILED`, expecting 500
+     `CONVERSION_FAILED`.
+
+#### SHOULD-FIX
+
+1. **A failed marker write deletes another run's good text.** When the
+   `.json` `put` fails, `store_inner` (`:1563-1571`) deletes `text_key`.
+   That object may be a concurrent run's completed text, which that run's
+   preview or launched job is about to read.
+   - Fix: do not delete. A `.csv` without its `.json` already counts as
+     missing, and delete removes it.
+2. **The child's row-group answer is half-checked.** `uploads.rs:2276-2278`
+   checks `len`, but not `offset + len <= size`, and `read_range` does not
+   clamp. A lying answer reaches the store as an out-of-range read and
+   ends with the resource-limit sentence.
+   - Fix: `checked_add` against the object size, else 400
+     `UNREADABLE_PARQUET` before the fetch.
+3. **On a timeout, stderr is never logged.** `timeout_at(deadline, stderr)`
+   runs with a deadline that has already passed (`:1755-1763` and every
+   `refuse_the_child` after the deadline).
+   - Fix: after the kill, read stderr under a short fresh timeout (1 s).
+4. **No unit tests for the child's own Parquet input checks.**
+   `parquet_reader` (`:813-846`) needs tests for:
+   - `off + len > size`;
+   - overflow;
+   - `len > cap`;
+   - input shorter than the tail;
+   - input shorter than tail plus group;
+   - `with_parquet` with garbage values.
+5. **The measurement script does not check the preview read the group.**
+   `sec22_measure.py` discards stdout, so a wrong range would still exit
+   0.
+   - Fix:
+     - Assert that the answer line and 2000 rows come out.
+     - Print each fixture's size, which shows the shared-strings workbook
+       is under 50 MiB.
+     - Optional: build one `Bytes` from the input and `slice` it rather
+       than `copy_from_slice` twice (`:833`, `:838`). This cuts the
+       Parquet child's peak.
+   - If the numbers change, give them in the handoff; the planner updates
+     the RESULT doc.
+6. **Comments (rule 1) and two test gaps.**
+   - `DEFAULT_MEMORY_MIB` (`:175-183`) says 801.4, 162.6 and 1202.1 MiB,
+     and that the RESULT doc is "to be written". Use the measured 801.5,
+     163.5 and 1202.3, and cite `docs/plans/SEC-22-RESULT.md`, which now
+     exists.
+   - `DEFAULT_CPU_SECONDS` (`:192-197`) still says the release build was
+     not measured. It was: 6.10 s.
+   - `sessions.rs:37-38`, `:615-617` and `:686-687` say the child "reads it
+     in pieces from the store". The API feeds the stored object to the
+     child in 8 MiB pieces; the child never reads the store (D1).
+   - The message at `upload_routes.rs:4480` contradicts the assertion
+     above it.
+   - The legacy-upload test never asserts the FIRST preview's run count
+     (`2`: one listing, one conversion).
+   - The hostile fixture `README.md` lost a `##` heading.
+
+**Open: 2 BLOCKERs.** One more fix round, in order: BLOCKER 1, BLOCKER 2,
+then SHOULD-FIX 1 to 6. Each cites "PR #187 review round 2 B<n>/S<n>" at
+the site. Then the full verification block and a short round 2 handoff
+under section 7: commits, commands with counts, and any changed numbers.
