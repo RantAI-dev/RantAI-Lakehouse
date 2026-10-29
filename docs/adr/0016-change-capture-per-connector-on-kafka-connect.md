@@ -41,8 +41,11 @@ MongoDB, created by the user in the console, with no operator step
 3. **A Dagster job, the applier, writes changes to Bronze** in small batches
    through the same writer batch loads use (`adapters/sink.py`), so the
    `SRC-10` load modes apply: current row per key (a delete removes the
-   row, `dlt` merge with a hard-delete column) or history (every change
-   kept with its operation and source commit time). It commits its Kafka
+   row; each batch applied in one `pyiceberg` transaction, delete then
+   append, as the history mode already writes, because `dlt`'s merge into
+   Iceberg cannot delete) or history (every change kept with its operation
+   and source commit time). The table is created and evolved through the
+   batch writer's helpers. It commits its Kafka
    offsets only after the Bronze commit, so a crash replays rather than
    loses; the merge on the key makes a replay harmless.
 4. **Secrets** reach Kafka Connect through a config provider that reads the
