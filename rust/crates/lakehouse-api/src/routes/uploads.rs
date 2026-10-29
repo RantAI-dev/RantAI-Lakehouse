@@ -2255,6 +2255,44 @@ async fn workbook_preview(
     ))
 }
 
+/// The first row group of a Parquet file, as the child answered it, when it
+/// is one the API may fetch.
+///
+/// The child's answer is checked against the file before anything is
+/// fetched: a group that lies about where it is, or how long it is, must
+/// not reach the store as a read outside the file. `read_range` does not
+/// clamp, and a read outside the file ends with the resource-limit sentence
+/// — a false reason for a file that is fine (`PR #187` review round 2 S2).
+///
+/// A group over the bound is `None`: the file is shown as its columns and no
+/// rows, and its bytes are not moved at all.
+///
+/// # Errors
+///
+/// 400 with the Parquet reader's own sentence for a group that lies about
+/// the file.
+fn parquet_group(
+    group: Option<upload_parquet::GroupRange>,
+    size: u64,
+    bound: u64,
+) -> Result<Option<upload_parquet::GroupRange>, ApiError> {
+    let Some(group) = group else {
+        return Ok(None);
+    };
+    let end = group.offset.checked_add(group.len).ok_or_else(|| {
+        ApiError::BadRequest(upload_parquet::ParquetFileError::Unreadable.to_string())
+    })?;
+    if end > size {
+        return Err(ApiError::BadRequest(
+            upload_parquet::ParquetFileError::Unreadable.to_string(),
+        ));
+    }
+    if group.len > bound {
+        return Ok(None);
+    }
+    Ok(Some(group))
+}
+
 /// The preview of a Parquet file: its first rows as text, read the way the load
 /// reads them (UTF-8, comma, the first record is the header).
 ///
@@ -2273,9 +2311,11 @@ async fn parquet_preview(
     let footer = parquet_footer(state, &file).await?;
     let info = footer.info;
     let size = file.size();
-    let group = footer
-        .group
-        .filter(|group| group.len <= state.conversion_runner.parquet_group_bytes());
+    let group = parquet_group(
+        footer.group,
+        size,
+        state.conversion_runner.parquet_group_bytes(),
+    )?;
     let mut cut_text = false;
     let csv = match group {
         Some(group) => {

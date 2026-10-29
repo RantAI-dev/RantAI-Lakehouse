@@ -8674,6 +8674,73 @@ async fn a_parquet_preview_reads_the_file_through_the_child() {
     );
 }
 
+/// A stand-in for the child that answers with a row group that lies about
+/// where it is (`PR #187` review round 2 S2).
+///
+/// The group is outside the file, so the API must refuse it before it
+/// fetches anything: `read_range` does not clamp, and a read outside the
+/// file ends with the resource-limit sentence — a false reason for a file
+/// that is fine.
+fn lying_group_child() -> std::path::PathBuf {
+    let dir = tempfile::tempdir().expect("a temporary directory for the stand-in child");
+    let answer = dir.path().join("answer-parquet");
+    std::fs::write(
+        &answer,
+        "{\"kind\":\"parquet\",\"info\":{\"columns\":[{\"name\":\"id\",\"type\":\"int64\"}],\
+         \"rows\":1},\"group\":{\"offset\":999999,\"len\":100}}\n",
+    )
+    .expect("the answer of the footer is written");
+    let path = dir.path().join("lying-group-child");
+    std::fs::write(
+        &path,
+        format!("#!/bin/sh\ncat {answer}\n", answer = answer.display()),
+    )
+    .expect("the stand-in child is written");
+    let mut permissions = std::fs::metadata(&path)
+        .expect("the stand-in child exists")
+        .permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        permissions.set_mode(0o755);
+    }
+    std::fs::set_permissions(&path, permissions).expect("the stand-in child is executable");
+    // The directory is removed when it goes out of scope; the child has
+    // already been read by then, and the API starts it by path.
+    std::mem::forget(dir);
+    path
+}
+
+/// A child that answers with a row group outside the file is refused before
+/// the API fetches anything (`PR #187` review round 2 S2).
+#[tokio::test]
+async fn a_parquet_file_whose_row_group_lies_about_the_file_is_refused() {
+    let stack = Stack::with(Options {
+        conversion_child: Some(lying_group_child()),
+        ..Options::default()
+    })
+    .await;
+    let bayu = stack.bayu().await;
+    let upload = stack
+        .upload(&bayu, "orders.parquet", &parquet_file("orders.parquet"))
+        .await;
+    let id = id_of(&upload);
+
+    // The child answered with a row group that is outside the file: the
+    // preview must refuse it, and it must not fetch a range that is not
+    // there.
+    let reply = stack
+        .get(&bayu, &format!("/api/uploads/{id}/preview"))
+        .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.text);
+    assert_eq!(reply.json["error"], UNREADABLE_PARQUET, "{}", reply.text);
+    assert!(
+        !reply.text.contains(NEEDS_MORE_MEMORY),
+        "the file is not at fault: {}",
+        reply.text
+    );
+}
+
 #[tokio::test]
 async fn a_parquet_preview_reads_only_the_sample_of_the_text() {
     // `PR #187` review SHOULD-FIX 6: a Parquet file may hold 512 MiB of
