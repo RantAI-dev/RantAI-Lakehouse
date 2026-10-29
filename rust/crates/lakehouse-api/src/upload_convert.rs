@@ -160,22 +160,31 @@ pub const PARQUET_GROUP_BYTES: u64 = upload_parquet::MAX_PREVIEW_GROUP_BYTES as 
 /// to show twenty rows of it (`PR #187` review SHOULD-FIX 6).
 pub const DEFAULT_TEXT_LIMIT: u64 = crate::upload_types::SAMPLE_BYTES as u64;
 
-/// The child's memory limit when nothing says otherwise: 896 MiB.
+/// The child's memory limit when nothing says otherwise: 1280 MiB.
 ///
 /// `SEC-22` D7: the limit is the measured peak times 1.5, rounded up to
-/// 128 MiB. Measured on 2026-10-28 on the machine this was written on, with
-/// the script of `ops/g9/sec22_measure.py` and the fixtures it builds (the
-/// numbers are in `docs/plans/SEC-22-RESULT.md`, written by the planner
-/// from the handoff of `SEC-22`):
+/// 128 MiB. Measured on 2026-10-29 with the RELEASE binary of the gate's
+/// image (`rantai-lakehouse-api:local`, the binary at
+/// `/usr/local/bin/lakehouse-api`) and the script of
+/// `ops/g9/sec22_measure.py`, which builds the fixtures and runs the child
+/// in that image:
 ///
-/// - the baseline, the child with an empty input: 23.9 MiB;
-/// - `convert-sheet` on a workbook of 5,000,000 cells: 549.2 MiB;
-/// - `preview-parquet` on a Parquet file of 50 MiB: 136.2 MiB.
+/// - the baseline, the child with an empty input: 9.9 MiB;
+/// - `convert-sheet` on a workbook of 5,000,000 cells whose text is INLINE
+///   strings: 523.8 MiB;
+/// - `convert-sheet` on the same workbook whose text is in a SHARED-STRINGS
+///   part, the way Excel writes one: 801.4 MiB (the reader reserves room for
+///   the whole table of the strings before it reads a cell);
+/// - `preview-parquet` on 2,000 rows of a file whose first row group is near
+///   `MAX_PREVIEW_GROUP_BYTES`: 162.6 MiB.
 ///
-/// 549.2 MiB times 1.5 is 823.9 MiB, which rounds up to 896 MiB. Two
-/// conversions at once are 1.75 GiB, which a machine with 12 GB of memory
+/// 801.4 MiB times 1.5 is 1202.1 MiB, which rounds up to 1280 MiB. The
+/// numbers are the ones of `docs/plans/SEC-22-RESULT.md` (to be written by
+/// the planner from the round 1 handoff numbers).
+///
+/// Two conversions at once are 2.5 GiB, which a machine with 12 GB of memory
 /// affords.
-pub const DEFAULT_MEMORY_MIB: u32 = 896;
+pub const DEFAULT_MEMORY_MIB: u32 = 1280;
 
 /// The child's CPU limit, in seconds: 60 (`SEC-22` D7). The API's own
 /// wall-clock limit is 90 s (`SEC-22` D3), so the CPU limit is the one that

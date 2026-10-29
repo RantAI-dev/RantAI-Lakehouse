@@ -937,7 +937,7 @@ pub struct Config {
     /// resolution ([`ConfigError::InvalidUploadLimit`]).
     pub upload_max_conversions: u32,
     /// The memory limit the child that reads an uploaded file sets for
-    /// itself: `UPLOAD_CONVERT_MEMORY_MB`, default 896 MiB. The number is
+    /// itself: `UPLOAD_CONVERT_MEMORY_MB`, default 1280 MiB. The number is
     /// the measured peak of the largest allowed workbook times 1.5, rounded
     /// up to 128 MiB (`SEC-22` D7; the measurement is in
     /// `ops/g9/sec22_measure.py` and its numbers in
