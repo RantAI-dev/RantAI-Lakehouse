@@ -146,7 +146,7 @@ parquet = "58"
 # `zip` has `deflate` as `calamine` already enables it; `flate2` reads the gzip prefix.
 apache-avro = { version = "0.21", default-features = false }
 flate2 = "1.1"
-zip = { version = "8.6", default-features = false, features = ["deflate"] }
+zip = { version = "9.1", default-features = false, features = ["deflate"] }
 # 0.13, not 0.12: SEC-8 — tiberius 0.12 pulls rustls 0.21 ->
 # rustls-webpki 0.101.7 (RUSTSEC-2026-0098/0099/0104, no fixed 0.101.x);
 # the 0.13 line is on rustls 0.23 -> webpki 0.103.15, all three fixed.
@@ -190,7 +190,7 @@ rust_xlsxwriter = { version = "=0.99.1", features = ["constant_memory"] }
 # `BI-1` T2: the export tests open the .xlsx they wrote to read its cells and
 # styles. Same version and features as `calamine` and `rust_xlsxwriter` already
 # ask for, so the lockfile gains no package.
-zip = { version = "8.6", default-features = false, features = ["deflate"] }
+zip = { version = "9.1", default-features = false, features = ["deflate"] }
 tower = { workspace = true, features = ["util"] }
 wiremock = { workspace = true }
 uuid = { workspace = true }

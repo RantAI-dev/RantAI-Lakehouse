@@ -2598,7 +2598,7 @@ dependencies = [
  "url",
  "uuid",
  "wiremock",
- "zip 8.6.0",
+ "zip 9.1.2",
 ]
 
 [[package]]
