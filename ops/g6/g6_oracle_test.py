@@ -13,9 +13,15 @@ Only what is Oracle's own lives here: the fixture and the dial.
 
 # What each step must show (`ops/gates/coverage.json`, type `Oracle`)
 
-- `connect`: refused, honestly, until `SRC-4` T1.1 lands. The API has no
-  Oracle client; `POST .../test` answers `supported: false` (SRC-5,
-  `connector_probe.rs`).
+- `connect`: real (`SRC-4` T1.1, plan Amendment 2). The API has no Oracle
+  client, so `POST .../test` launches the test in the orchestrator and answers
+  `pending: true` at once (`ok: false`, no latency: nothing is claimed). The
+  gate polls `GET .../discovery/test` and reads the probe the API recorded:
+  with the right password it is `ok` with the orchestrator's latency and the
+  stored health is `healthy`; with a wrong password it is a failure with the
+  fixed sentence "Oracle connection failed: authentication failed"; against a
+  port nobody listens on, "... connection failed" (class `unreachable`); both
+  unhealthy, with no latency.
 - `discover`: real (SRC-13 D5, D12). The orchestrator lists Oracle: the
   schemas the login can read hold `G6_INGEST`, that schema's tables hold
   `G6_INGEST.ORDERS`, and the preview shows its declared columns `ID`,
@@ -158,6 +164,111 @@ def _install_oracle_into_matrix() -> None:
     }
 
 
+def _pending_test(connector_id: str) -> dict:
+    """`POST .../test` of an Oracle connector: the answer must be the pending one
+    (`SRC-4` T1.1) and claim nothing; then the connector's `test` row is polled
+    until the orchestrator's job has posted. Returns that answer.
+
+    # Errors
+
+    `G6Failure` for an answer that is not pending, that claims a pass or a latency
+    before anything ran, or a test that does not end."""
+    resp = matrix.API.post(f"{matrix.API_URL}/api/connectors/{connector_id}/test", timeout=30)
+    if not resp.ok:
+        raise matrix.G6Failure(f"POST .../test answered {resp.status_code} {resp.text[:200]}")
+    body = resp.json()
+    if (
+        body.get("pending") is not True or body.get("supported") is not True or body.get("ok") is not False
+        or body.get("latencyMs") is not None or body.get("testedAt") is not None
+    ):
+        raise matrix.G6Failure(f"expected a pending answer that claims nothing, got {body}")
+
+    def ended() -> dict | None:
+        poll = matrix.API.get(f"{matrix.API_URL}/api/connectors/{connector_id}/discovery/test", timeout=30)
+        if not poll.ok:
+            raise matrix.G6Failure(f"GET .../discovery/test answered {poll.status_code} {poll.text[:200]}")
+        answer = poll.json()
+        return answer if answer.get("state") != "running" else None
+
+    return matrix._wait_for(f"the connection test of {connector_id} to end", ended, 150, interval_s=2.0)
+
+
+def _latest_probe(connector_id: str) -> dict:
+    resp = matrix.API.get(f"{matrix.API_URL}/api/connectors/{connector_id}/probe-history?limit=1", timeout=30)
+    if not resp.ok or not resp.json().get("results"):
+        raise matrix.G6Failure(f"GET .../probe-history answered {resp.status_code} {resp.text[:200]}")
+    return resp.json()["results"][0]
+
+
+def _health_of(connector_id: str) -> str:
+    resp = matrix.API.get(f"{matrix.API_URL}/api/connectors/{connector_id}", timeout=30)
+    if not resp.ok:
+        raise matrix.G6Failure(f"GET connector answered {resp.status_code}")
+    return str(resp.json().get("health"))
+
+
+def _other_connector(name: str, password: str, port: int) -> str:
+    """A second Oracle connector for a connection test that must fail: the same
+    dial as the gate's, with the given password and port. It is registered and
+    given its ingest spec (the orchestrator reads the dial from there) but never
+    run."""
+    created = matrix._create_connector(
+        name=name, kind=TYPE_NAME, host=f"{ORACLE_TLS_HOST}:{port}", credential={"source": "file", "primary": "password"},
+    )
+    derived = created.get("credential") or {}
+    matrix._write_credential_file(derived["primary"], password)
+    spec = matrix.API.put(
+        f"{matrix.API_URL}/api/connectors/{created['id']}/ingest-spec",
+        json={
+            "adapter": "sql", "ingestMode": "batch",
+            "dial": {
+                "driver": "oracle", "host": ORACLE_TLS_HOST, "port": port, "database": ORACLE_SERVICE,
+                "user": ORACLE_USER, "sslMode": "required", "sslServerCertDn": ORACLE_TLS_DN,
+            },
+            "sourceObjects": [{"name": SOURCE_OBJECT, "target": f"{BRONZE_TABLE}_{name.replace('-', '_')}"}],
+        },
+        timeout=10,
+    )
+    if not spec.ok:
+        raise matrix.G6Failure(f"set ingest-spec for {name!r} failed: {spec.status_code} {spec.text[:200]}")
+    return created["id"]
+
+
+def _check_connect(connector_id: str) -> None:
+    """`connect` (`SRC-4` T1.1): pass, wrong password, unreachable (module docs)."""
+    try:
+        if matrix._expectation(TYPE_NAME, "connect") is None:
+            return
+        answer = _pending_test(connector_id)
+        probe = _latest_probe(connector_id)
+        if answer.get("state") != "done" or not isinstance(answer.get("latencyMs"), int):
+            raise matrix.G6Failure(f"expected a finished test with a latency, got {answer}")
+        if probe.get("ok") is not True or probe.get("latencyMs") != answer["latencyMs"]:
+            raise matrix.G6Failure(f"expected the recorded probe to be the pass with the same latency, got {probe}")
+        if _health_of(connector_id) != "healthy":
+            raise matrix.G6Failure("a passed test left the connector not healthy")
+        passed = f"{answer['latencyMs']} ms, recorded as a probe"
+
+        for label, password, port, error_class, sentence in [
+            ("wrong password", "NotTheRealPassword123", ORACLE_TLS_PORT, "sign_in_refused",
+             "Oracle connection failed: authentication failed"),
+            ("unreachable", CONNECTOR_ORACLE_PASSWORD, ORACLE_TLS_PORT + 1, "unreachable",
+             "Oracle connection failed: connection failed"),
+        ]:
+            other = _other_connector(f"g6-oracle-{label.replace(' ', '-')}", password, port)
+            failed = _pending_test(other)
+            row = _latest_probe(other)
+            if failed.get("state") != "failed" or failed.get("errorClass") != error_class:
+                raise matrix.G6Failure(f"{label}: expected a failed test of class {error_class}, got {failed}")
+            if row.get("ok") is not False or row.get("latencyMs") is not None or row.get("message") != sentence:
+                raise matrix.G6Failure(f"{label}: expected the fixed sentence {sentence!r} with no latency, got {row}")
+            if _health_of(other) != "unhealthy":
+                raise matrix.G6Failure(f"{label}: a failed test left the connector not unhealthy")
+        matrix._record(TYPE_NAME, "connect", "pass", f"{passed}; wrong password and unreachable port fail with their fixed sentences")
+    except matrix.G6Failure as exc:
+        matrix._record_fail(TYPE_NAME, "connect", str(exc))
+
+
 def _check_load(run_id: str) -> int | None:
     """`load`: the run succeeds and Bronze holds every seeded row, each with
     `_ingested_at`. Returns the row count, or None after recording a failure."""
@@ -282,15 +393,15 @@ def run() -> None:
         connector_ids=connector_ids,
     )
     connector_id = connector_ids[NAME]
-    # While the first run is in flight: `connect` is a quick, read-only call. `discover` is Dagster runs of its
-    # own (the orchestrator lists Oracle), so it waits for the load below to end and not for a run slot.
-    matrix._check_connect(NAME, connector_id)
-
+    # `connect` and `discover` are Dagster runs of their own (the orchestrator tests and lists Oracle), so
+    # they wait for the load below to end and not for a run slot.
     if run_id is None:
         matrix._record_fail(TYPE_NAME, "load", "ingest/run answered supported=false for an Oracle sql connector")
+        _check_connect(connector_id)
         matrix._check_discover(NAME, connector_id)
         return
     count = _check_load(run_id)
+    _check_connect(connector_id)
     matrix._check_discover(NAME, connector_id)
     if count is None:
         matrix._record(TYPE_NAME, "reload", "skipped", "the first load did not complete, so there is nothing to load again")

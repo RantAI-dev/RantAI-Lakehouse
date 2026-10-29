@@ -92,14 +92,14 @@
     "Oracle": {
       "gate": "g6-oracle",
       "steps": {
-        "connect": "refused",
+        "connect": "real",
         "discover": "real",
         "load": "real",
         "reload": "real"
       },
       "notes": {
         "all": "SRC-9 plan task 5, SRC-4 T1.2 to T1.5: ops/g6/g6_oracle_test.py in its own job (g6-oracle), against Oracle Database Free (gvenzl/oracle-free, slim-faststart) in ops/g6/docker-compose.g6-oracle.override.yml. The connector dials over TLS (tcps, sslServerCertDn, a CA the gate generates) to a TLS front of the listener (nginx stream), so Oracle's own TCPS endpoint and wallet are not exercised.",
-        "connect": "SRC-5: an Oracle connector cannot be tested from the console (the API has no Oracle client).",
+        "connect": "SRC-4 T1.1: the API has no Oracle client, so POST .../test launches the test in the orchestrator (discover_job, kind test) and answers pending; the gate reads the result from GET .../discovery/test and the probe history: a pass with the orchestrator's latency, a wrong password (sign_in_refused) and a closed port (unreachable) with their fixed sentences and an unhealthy connector.",
         "discover": "SRC-13 D12: the orchestrator lists the schemas the login can read (G6_INGEST among them) and that schema's tables (G6_INGEST.ORDERS); the preview shows the declared columns ID, AMOUNT and NOTE. The load's source object is the listed name.",
         "load": "SRC-4 T1.2, T1.3: the source object is saved with column choice (NOTE left out, spelled as the preview spells it) and the incremental load mode with the cursor ID; Bronze has id and amount and no note.",
         "reload": "SRC-4 T1.3: two rows inserted at the source, a second run reads exactly those two (the run record says so) and Bronze holds all five."
