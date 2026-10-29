@@ -182,7 +182,7 @@ amendments", with anchors verified at that commit). Scope:
 
 ## Slice 3: MySQL, then SQL Server (D3, D12)
 
-Amended in detail before dispatch. Fixtures with the source settings on
+Amended in detail before dispatch (Amendment 5). Fixtures with the source settings on
 (MySQL `binlog_format=ROW`, `binlog_row_image=FULL`; SQL Server Agent on,
 CDC enabled on the database and table); the types flipped back from `0066`
 with a targeted `UPDATE ... AND supported = false` (a new migration);
@@ -414,6 +414,163 @@ T2.9 the gate (S2-j) and `coverage.json`.
 T2.10 docs: feature page "Limits", OPERATIONS, CHANGELOG.
 *Acceptance:* `SRC-4-AC1`, `AC2` and `AC5` for PostgreSQL in `g4-cdc`; every
 other check that passes on `main` passes.
+
+**Amendment 5 (2026-10-29): slice 3 in detail, MySQL then SQL Server.**
+Anchors verified at `a1e3dd65` (slice 2 closed); line numbers drift, so the
+developer finds each by its name. Slice 3 runs on the same branch, one task per
+commit, after slice 2. Planner's decisions (technical, within the signed
+decisions; none changes what the product owner signed):
+
+- **S3-a The dial per driver.** `CdcDial` (`lakehouse-store/src/ingest_spec.rs`)
+  keeps one shape, but `slotName` and `publicationName` become
+  `Option<String>`, and `Dial::parse` checks them per driver:
+  - PostgreSQL: both required, as today. Stored PostgreSQL rows parse unchanged.
+  - MySQL: `serverId` required, in `1..=4294967295`. `slotName` and
+    `publicationName` are refused.
+  - SQL Server: `slotName`, `publicationName` and `serverId` all refused.
+
+  A refused or missing field is a 400 with a fixed sentence naming the field.
+  ADR 0013 gets a dated note: "required for PostgreSQL" replaces "required".
+  The TS contract mirrors serde (`slotName?`, `publicationName?`).
+- **S3-b One renderer, three drivers** (`lakehouse-store/src/cdc.rs`
+  `render_connect_config`). These keys stay the same for every driver:
+  - The password reference.
+  - `topic.prefix=cdc.<id>`.
+  - The JSON converters without schemas.
+  - The `unwrap` transform with `delete.tombstone.handling.mode=rewrite` and
+    `add.fields=op,source.ts_ms`.
+  - `snapshot.mode=initial` and `decimal.handling.mode=string`.
+
+  Per driver:
+  - **MySQL** (`io.debezium.connector.mysql.MySqlConnector`):
+    - Connection: `database.server.id` from the dial, `database.include.list`
+      from the source objects' first part (`<database>.<table>`), and
+      `table.include.list`.
+    - TLS: `database.ssl.mode` is `disabled`, `required`, `verify_ca` or
+      `verify_identity` for `disable`, `require`, `verify-ca` or `verify-full`.
+    - `include.schema.changes=false`, so no topic is named after the prefix
+      alone.
+  - **SQL Server** (`io.debezium.connector.sqlserver.SqlServerConnector`):
+    - Connection: `database.names` is the dial's database, and
+      `table.include.list` is `<schema>.<table>`.
+    - TLS: `disable` sets `database.encrypt=false`. `require` sets
+      `database.encrypt=true` and `database.trustServerCertificate=true`, the
+      same meaning `require` has for PostgreSQL. `verify-ca` and
+      `verify-full` both set `database.encrypt=true` and
+      `database.trustServerCertificate=false`. The SQL Server driver cannot
+      check the chain without the host name, so `verify-ca` is stricter here,
+      never looser; the code says so.
+  - **Schema history** (MySQL and SQL Server only; both refuse to start
+    without it):
+    - `schema.history.internal.kafka.bootstrap.servers` comes from a new API
+      setting.
+    - `schema.history.internal.kafka.topic=cdc.<id>.schema-history`.
+
+    The API reads `CDC_KAFKA_BOOTSTRAP` (the variable the code location
+    already uses; compose passes it to `lakehouse-api` too). If it is unset,
+    a MySQL or SQL Server connector answers the same fixed
+    "not configured" sentence that `KAFKA_CONNECT_URL` gets (fail closed).
+    PostgreSQL does not need it.
+
+  Both classes join `ALLOWED_CONNECTOR_CLASSES` (`kafka_connect.rs`). Unit
+  tests, one per driver, check:
+  - The exact keys.
+  - That no password value appears anywhere in the JSON.
+  - That a table name that is not two plain parts is refused.
+  - That each SSL mode maps to the right setting.
+- **S3-c Topics.** MySQL writes `cdc.<id>.<database>.<table>`, which is the same
+  shape as PostgreSQL. SQL Server writes `cdc.<id>.<database>.<schema>.<table>`.
+  `cdc_apply.py` `topic_of` takes the driver from the connector's dial (already
+  in `GET /api/connectors/ingestible`), and has one unit test per driver. The
+  applier reads only the table topics, never the schema-history topic.
+- **S3-d The schema-history topic must never expire.** Debezium creates the
+  topic with unlimited retention when it is missing. If it is ever deleted by
+  the broker's 7-day retention, the connector cannot restart. The gates check
+  the topic's `retention.ms` (and `retention.bytes`) after the first copy. If
+  Debezium 3.8 does not create it that way, stop and report; do not raise the
+  broker default. `DELETE` cannot remove the topic (Kafka Connect has no topic
+  API, and the API has no Kafka admin client). It is a few kilobytes per
+  connector, and "Limits" says so.
+- **S3-e Source settings, proven by the gates and written in "Limits"** (the
+  checks with fixed sentences are slice 4's). The gates use a least-privilege
+  user, not `root` or `sa`, so the written grants are proven to be enough.
+  - MySQL: `log_bin` on, `binlog_format=ROW`, `binlog_row_image=FULL`. These are
+    MySQL 8's defaults; the gate asserts them, it does not assume them. The
+    user needs `SELECT`, `RELOAD`, `SHOW DATABASES`, `REPLICATION SLAVE` and
+    `REPLICATION CLIENT` (`RELOAD` for the snapshot's short global read lock,
+    `snapshot.locking.mode=minimal`, Debezium's default).
+  - SQL Server:
+    - SQL Server Agent must be running (`MSSQL_AGENT_ENABLED=true` in the
+      fixture).
+    - CDC must be enabled on the database (`sys.sp_cdc_enable_db`) and on each
+      table (`sys.sp_cdc_enable_table`), by an administrator.
+    - The user is a non-`sa` login with `SELECT` on the tables and on the `cdc`
+      schema, plus `VIEW DATABASE STATE`. The developer confirms that list
+      against Debezium 3.8's documentation and the gate. If more is needed,
+      write down what and why.
+  - SQL Server schema changes are not picked up by themselves. A new column
+    needs a second capture instance (Debezium's "online schema update"). The
+    gate runs that procedure and checks the column arrives, and "Limits"
+    gives the steps.
+- **S3-f Fixtures.** The gates reuse `mysql-g6` and `mssql-g6` with the
+  `kafka`, `kafka-connect` and `cdc` profile settings of `g4-cdc`, through
+  their own overrides (`ops/g4/docker-compose.g4-mysql.override.yml`, `…-mssql…`).
+  Credentials are `${X:?}`, as in g6. `mssql-g6` gets `MSSQL_AGENT_ENABLED`
+  only in the gate override, so the g6 gates are unchanged. MySQL TLS uses
+  `require` (MySQL 8's own self-signed certificate). SQL Server uses `require`
+  too: the fixture's private CA is not in Kafka Connect's trust store. The
+  verify modes are covered by the renderer's unit tests, as for PostgreSQL,
+  and "Limits" says the worker's trust store must hold the source's CA.
+- **S3-g The two types become supported.** Migration **0117** (0113 to 0116
+  are taken on other branches; re-check before committing) sets
+  `supported = true, unsupported_reason = NULL` for `MySQL CDC` and
+  `SQL Server CDC`. The update is targeted: `AND supported = false AND
+  adapter = 'cdc' AND unsupported_reason = '<0066's exact text>'`. It has a
+  why-header. `tests/connector_type.rs`, `ops/lint/test_check_connector_gate_coverage.py`
+  and `coverage.json` follow.
+- **S3-h The console.** `cdc-dial-form.tsx` shows `slotName` and
+  `publicationName` for PostgreSQL only. It shows `serverId` for MySQL only,
+  required, empty by default, with a hint ("a number no other MySQL replica
+  uses"). The field is never pre-filled with an invented value. Nothing is
+  shown for SQL Server beyond the shared fields.
+- **S3-i Gates `g4-mysql` and `g4-mssql`** (one CI job each, D12; each under 20
+  minutes). The PostgreSQL-free part of `ops/g4/g4_test.py` moves into a shared
+  module that all three gates use; `g4-cdc`'s steps and output stay the same.
+  Each new gate creates the connector through the API and runs:
+  - Two tables, one per load mode, with 20,000 seeded rows each, and the first
+    copy.
+  - An insert, update and delete each visible within **120 s** (D5).
+  - The config from Kafka Connect, checked to hold no password.
+  - The schema-history topic's retention (S3-d).
+  - A pause through the route, 20,000 changes per table, then a resume: Bronze
+    equals the source.
+  - A `kafka-connect` restart during a stream of changes: equal again.
+  - A schema change observed (for SQL Server, by the procedure in S3-e).
+  - `DELETE`, which removes the Kafka Connect connector and the secret file.
+
+  The gate summary table prints a `MySQL CDC` row and a `SQL Server CDC` row.
+
+Tasks, in order (one commit each; Rust together, then Python, then console,
+then compose and gates; scoped checks per commit, the full block before
+handoff):
+T3.1 the dial per driver (S3-a), ADR 0013 note.
+T3.2 the renderer for MySQL and SQL Server, schema history, `CDC_KAFKA_BOOTSTRAP`
+in the API's config, allowlist (S3-b).
+T3.3 migration 0117 and the type tests (S3-g).
+T3.4 `topic_of` per driver (S3-c), unit tests.
+T3.5 the console dial form (S3-h), contract.
+T3.6 the shared gate module; `g4-cdc` unchanged in behaviour (CI proves it).
+T3.7 `g4-mysql`: override, gate, CI job, `coverage.json` (S3-d, S3-e, S3-f, S3-i).
+T3.8 `g4-mssql`: the same.
+T3.9 docs: feature page "Limits" (grants and settings per source, the SQL
+Server schema-change steps, the schema-history topic kept), `OPERATIONS.md`,
+`CHANGELOG.md`.
+*Acceptance:* `SRC-4-AC1`, `AC2` and `AC5` for MySQL and SQL Server in their
+gates; `g4-cdc` still passes; every other check that passes on `main` passes.
+Stop and report, do not improvise, if: Debezium 3.8 refuses a key above;
+the schema-history topic is not created with unlimited retention; SQL Server
+needs more than the grants above; or discovery (`SRC-13`) cannot list a
+change-capture MySQL or SQL Server source's tables.
 
 ## Handoff
 
