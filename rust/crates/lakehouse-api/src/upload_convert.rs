@@ -35,6 +35,26 @@
 //! sheet, which columns, whether the sheet was empty) before it reads the
 //! text, and so that a refusal is a complete answer on its own.
 //!
+//! # A Parquet file goes by ranges, never whole (`SEC-22` P1)
+//!
+//! A Parquet file may be two gibibytes long (the chunked upload's cap), and
+//! nothing but its footer and its first row group is read. So the two Parquet
+//! operations take the file's SIZE on the command line and are fed only the
+//! ranges they need:
+//!
+//! - `inspect-parquet <file_size>` is fed the file's TAIL — the last
+//!   `min(file_size, MAX_FOOTER_BYTES + 8)` bytes, which hold the footer —
+//!   and answers the footer's account of the file and the byte range of its
+//!   first row group;
+//! - `preview-parquet <max_rows> <file_size> <group_offset> <group_len>` is
+//!   fed that tail and then the first row group's bytes.
+//!
+//! The child reads them through a sparse reader
+//! ([`crate::upload_parquet_parts`]) that answers the ranges it was given and
+//! refuses every other one. So the child's input no longer depends on the
+//! file's size: a two-gibibyte Parquet file is read exactly as a small one
+//! is.
+//!
 //! # The limits
 //!
 //! The child sets [`Resource::RLIMIT_DATA`] and [`Resource::RLIMIT_CPU`] on
@@ -59,9 +79,10 @@
 //! process, and a request that arrives when every slot is taken is refused
 //! at once (429) rather than waiting.
 //!
-//! The child is started with an EMPTY environment and the two variables it
-//! needs ([`MEMORY_ENV`] and [`OUTPUT_ENV`]): a process that parses an
-//! untrusted file must not inherit the API's secrets.
+//! The child is started with an EMPTY environment and the variables it
+//! needs ([`MEMORY_ENV`], [`OUTPUT_ENV`], [`CPU_ENV`], [`PARQUET_TAIL_ENV`]
+//! and [`PARQUET_GROUP_ENV`]): a process that parses an untrusted file must
+//! not inherit the API's secrets.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -75,7 +96,8 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use crate::upload_parquet::{self, ParquetFileError, ParquetInfo};
+use crate::upload_parquet::{self, GroupRange, ParquetFileError, ParquetInfo};
+use crate::upload_parquet_parts::{Part, PartsReader};
 use crate::upload_store::{UploadStore, UploadStoreError};
 use crate::upload_workbook::{self, WorkbookError, WorkbookInfo};
 
@@ -106,6 +128,30 @@ pub const OUTPUT_ENV: &str = "LAKEHOUSE_CONVERT_MAX_OUTPUT_BYTES";
 /// so that the measurement of `SEC-22` T5 can run without the limit ending
 /// the run it is measuring.
 pub const CPU_ENV: &str = "LAKEHOUSE_CONVERT_CPU_SECONDS";
+
+/// The environment variable the child's Parquet tail bound comes from.
+///
+/// An INTERNAL variable, like [`MEMORY_ENV`]. It is how many bytes of a
+/// Parquet file's end the child is given: the footer and the eight bytes
+/// that follow it. The API sets it on the child it starts, so that both
+/// sides agree on where the tail begins.
+pub const PARQUET_TAIL_ENV: &str = "LAKEHOUSE_CONVERT_MAX_PARQUET_TAIL_BYTES";
+
+/// The environment variable the child's Parquet row-group bound comes from.
+///
+/// An INTERNAL variable, like [`MEMORY_ENV`]. It is how many bytes of a
+/// Parquet file's first row group the child is given.
+pub const PARQUET_GROUP_ENV: &str = "LAKEHOUSE_CONVERT_MAX_PARQUET_GROUP_BYTES";
+
+/// The most bytes of a Parquet file the child is given as its tail: the
+/// footer, which is at most [`upload_parquet::MAX_FOOTER_BYTES`], and the
+/// eight bytes that hold its length and its magic (`SEC-22` P1).
+pub const PARQUET_TAIL_BYTES: u64 = upload_parquet::MAX_FOOTER_BYTES + 8;
+
+/// The most bytes of a Parquet file's first row group the child is given: the
+/// bound the reader already had on what a preview fetches
+/// ([`upload_parquet::MAX_PREVIEW_GROUP_BYTES`]).
+pub const PARQUET_GROUP_BYTES: u64 = upload_parquet::MAX_PREVIEW_GROUP_BYTES as u64;
 
 /// The child's memory limit when nothing says otherwise: 896 MiB.
 ///
@@ -203,10 +249,25 @@ pub enum Operation {
     /// One sheet of a workbook as text: the named sheet, or the default one
     /// when no name is given.
     ConvertSheet(Option<String>),
-    /// What a Parquet file's footer says.
-    InspectParquet,
-    /// The first rows of a Parquet file, as text.
-    PreviewParquet(usize),
+    /// What a Parquet file's footer says. The size is the size of the WHOLE
+    /// file: the child is given the file's tail and reads the footer out of
+    /// it (`SEC-22` P1).
+    InspectParquet {
+        /// The size of the file, in bytes.
+        size: u64,
+    },
+    /// The first rows of a Parquet file, as text. The size and the row
+    /// group's range are the file's own (`SEC-22` P1).
+    PreviewParquet {
+        /// How many rows to decode at most.
+        rows: usize,
+        /// The size of the whole file, in bytes.
+        size: u64,
+        /// Where the first row group starts in the file.
+        group_offset: u64,
+        /// How many bytes the first row group takes.
+        group_len: u64,
+    },
 }
 
 impl Operation {
@@ -221,10 +282,21 @@ impl Operation {
         match name.as_str() {
             "list-sheets" => Some(Self::ListSheets),
             "convert-sheet" => Some(Self::ConvertSheet(rest.first().cloned())),
-            "inspect-parquet" => Some(Self::InspectParquet),
+            "inspect-parquet" => {
+                let size = rest.first()?.parse::<u64>().ok()?;
+                Some(Self::InspectParquet { size })
+            }
             "preview-parquet" => {
                 let rows = rest.first()?.parse::<usize>().ok()?;
-                Some(Self::PreviewParquet(rows))
+                let size = rest.get(1)?.parse::<u64>().ok()?;
+                let group_offset = rest.get(2)?.parse::<u64>().ok()?;
+                let group_len = rest.get(3)?.parse::<u64>().ok()?;
+                Some(Self::PreviewParquet {
+                    rows,
+                    size,
+                    group_offset,
+                    group_len,
+                })
             }
             _ => None,
         }
@@ -237,11 +309,30 @@ impl Operation {
             Self::ListSheets => vec!["list-sheets".to_owned()],
             Self::ConvertSheet(None) => vec!["convert-sheet".to_owned()],
             Self::ConvertSheet(Some(name)) => vec!["convert-sheet".to_owned(), name.clone()],
-            Self::InspectParquet => vec!["inspect-parquet".to_owned()],
-            Self::PreviewParquet(rows) => {
-                vec!["preview-parquet".to_owned(), rows.to_string()]
-            }
+            Self::InspectParquet { size } => vec!["inspect-parquet".to_owned(), size.to_string()],
+            Self::PreviewParquet {
+                rows,
+                size,
+                group_offset,
+                group_len,
+            } => vec![
+                "preview-parquet".to_owned(),
+                rows.to_string(),
+                size.to_string(),
+                group_offset.to_string(),
+                group_len.to_string(),
+            ],
         }
+    }
+
+    /// Whether this operation reads a Parquet file, and so is fed ranges of
+    /// it rather than the whole file (`SEC-22` P1).
+    #[must_use]
+    pub fn is_parquet(&self) -> bool {
+        matches!(
+            self,
+            Self::InspectParquet { .. } | Self::PreviewParquet { .. }
+        )
     }
 }
 
@@ -386,6 +477,10 @@ pub enum Answer {
     Parquet {
         /// The file's columns and its row count.
         info: ParquetInfo,
+        /// The first row group's byte range, when the answer is the footer's
+        /// alone (`SEC-22` P1: the caller fetches that range and asks for the
+        /// rows next).
+        group: Option<GroupRange>,
     },
     /// The file could not be read.
     Refusal {
@@ -405,6 +500,11 @@ pub struct ChildLimits {
     pub max_output_bytes: u64,
     /// The most the child reads from its standard input, in bytes.
     pub max_input_bytes: u64,
+    /// The most bytes of a Parquet file's end the child is given, in bytes.
+    pub parquet_tail_bytes: u64,
+    /// The most bytes of a Parquet file's first row group the child is given,
+    /// in bytes.
+    pub parquet_group_bytes: u64,
 }
 
 impl Default for ChildLimits {
@@ -414,6 +514,8 @@ impl Default for ChildLimits {
             cpu_seconds: DEFAULT_CPU_SECONDS,
             max_output_bytes: MAX_OUTPUT_BYTES,
             max_input_bytes: MAX_INPUT_BYTES,
+            parquet_tail_bytes: PARQUET_TAIL_BYTES,
+            parquet_group_bytes: PARQUET_GROUP_BYTES,
         }
     }
 }
@@ -421,10 +523,11 @@ impl Default for ChildLimits {
 impl ChildLimits {
     /// The limits the child runs under, with the memory limit from the
     /// environment ([`MEMORY_ENV`]), the output cap from the environment
-    /// ([`OUTPUT_ENV`]) and the CPU limit from the environment
-    /// ([`CPU_ENV`]) when they say something usable.
+    /// ([`OUTPUT_ENV`]), the CPU limit from the environment ([`CPU_ENV`]) and
+    /// the two Parquet bounds from the environment ([`PARQUET_TAIL_ENV`] and
+    /// [`PARQUET_GROUP_ENV`]) when they say something usable.
     ///
-    /// The child reads these three variables and nothing else: it never
+    /// The child reads these five variables and nothing else: it never
     /// resolves the API's configuration, so it needs no environment of its
     /// own to read a file (`SEC-22` D1).
     #[must_use]
@@ -432,7 +535,10 @@ impl ChildLimits {
         let memory = std::env::var(MEMORY_ENV).ok();
         let output = std::env::var(OUTPUT_ENV).ok();
         let cpu = std::env::var(CPU_ENV).ok();
+        let tail = std::env::var(PARQUET_TAIL_ENV).ok();
+        let group = std::env::var(PARQUET_GROUP_ENV).ok();
         Self::with_limits(memory.as_deref(), output.as_deref(), cpu.as_deref())
+            .with_parquet(tail.as_deref(), group.as_deref())
     }
 
     /// The limits the child runs under, with the memory limit `raw` names,
@@ -478,6 +584,45 @@ impl ChildLimits {
         }
         limits
     }
+
+    /// The same limits, with the two Parquet bounds: how many bytes of the
+    /// file's end the child is given, and how many bytes of its first row
+    /// group. Anything that is not a whole number of 1 or more keeps the
+    /// default.
+    #[must_use]
+    pub fn with_parquet(self, tail: Option<&str>, group: Option<&str>) -> Self {
+        let mut limits = self;
+        if let Some(bytes) = tail
+            .map(str::trim)
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .filter(|bytes| *bytes > 0)
+        {
+            limits.parquet_tail_bytes = bytes;
+        }
+        if let Some(bytes) = group
+            .map(str::trim)
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .filter(|bytes| *bytes > 0)
+        {
+            limits.parquet_group_bytes = bytes;
+        }
+        limits
+    }
+
+    /// The most the child reads from its standard input, for this operation.
+    ///
+    /// A workbook is fed whole, so the cap is [`MAX_INPUT_BYTES`]. A Parquet
+    /// file is fed its tail and its first row group, so the cap is the two
+    /// bounds together (`SEC-22` P1) and does not depend on the file's size.
+    #[must_use]
+    pub fn input_cap(&self, operation: &Operation) -> u64 {
+        if operation.is_parquet() {
+            self.parquet_tail_bytes
+                .saturating_add(self.parquet_group_bytes)
+        } else {
+            self.max_input_bytes
+        }
+    }
 }
 
 /// Run the child, if this process was started as one.
@@ -497,7 +642,14 @@ pub fn run_child_if_asked(args: &[String]) -> Option<i32> {
         eprintln!("[inspect-upload] the limits could not be set: {err}");
         return Some(exit::RESOURCE_LIMIT);
     }
-    let input = match read_input(limits.max_input_bytes) {
+    let operation = Operation::parse(args.get(2..).unwrap_or_default());
+    // The operation decides how much the child reads: a Parquet file is fed
+    // ranges of it, a workbook the whole of it (`SEC-22` P1).
+    let cap = match &operation {
+        Some(operation) => limits.input_cap(operation),
+        None => limits.max_input_bytes,
+    };
+    let input = match read_input(cap) {
         Ok(bytes) => bytes,
         Err(refusal) => {
             let mut out = std::io::stdout().lock();
@@ -510,7 +662,6 @@ pub fn run_child_if_asked(args: &[String]) -> Option<i32> {
             return Some(refusal.exit_code());
         }
     };
-    let operation = Operation::parse(args.get(2..).unwrap_or_default());
     let mut out = std::io::stdout().lock();
     let mut buffered = std::io::BufWriter::new(&mut out);
     let code = if let Some(operation) = operation {
@@ -562,24 +713,47 @@ pub fn run(operation: &Operation, input: &[u8], limits: &ChildLimits, out: &mut 
                 Err(WriteFailure::Failed) => exit::UNREADABLE,
             }
         }
-        Operation::InspectParquet => {
-            let bytes = Bytes::copy_from_slice(input);
-            match upload_parquet::inspect(&bytes) {
-                Ok(info) => match write_answer(out, &Answer::Parquet { info }) {
-                    Ok(()) => exit::OK,
-                    Err(_) => exit::UNREADABLE,
-                },
+        Operation::InspectParquet { size } => {
+            let reader = match parquet_reader(*size, None, input, limits) {
+                Ok(reader) => reader,
+                Err(refusal) => return refuse(out, FileKind::Parquet, &refusal),
+            };
+            match upload_parquet::inspect_parts(&reader) {
+                Ok(footer) => {
+                    let answer = Answer::Parquet {
+                        info: footer.info,
+                        group: footer.group,
+                    };
+                    match write_answer(out, &answer) {
+                        Ok(()) => exit::OK,
+                        Err(_) => exit::UNREADABLE,
+                    }
+                }
                 Err(err) => refuse(out, FileKind::Parquet, &parquet_refusal(err)),
             }
         }
-        Operation::PreviewParquet(rows) => {
-            let bytes = Bytes::copy_from_slice(input);
-            let converted = match upload_parquet::convert(&bytes, Some(*rows)) {
+        Operation::PreviewParquet {
+            rows,
+            size,
+            group_offset,
+            group_len,
+        } => {
+            let reader =
+                match parquet_reader(*size, Some((*group_offset, *group_len)), input, limits) {
+                    Ok(reader) => reader,
+                    Err(refusal) => return refuse(out, FileKind::Parquet, &refusal),
+                };
+            let converted = match upload_parquet::convert_parts(
+                &reader,
+                Some(*rows),
+                limits.parquet_group_bytes,
+            ) {
                 Ok(converted) => converted,
                 Err(err) => return refuse(out, FileKind::Parquet, &parquet_refusal(err)),
             };
             let answer = Answer::Parquet {
                 info: converted.info.clone(),
+                group: None,
             };
             if write_answer(out, &answer).is_err() {
                 return exit::UNREADABLE;
@@ -591,6 +765,49 @@ pub fn run(operation: &Operation, input: &[u8], limits: &ChildLimits, out: &mut 
             }
         }
     }
+}
+
+/// The reader over the pieces of a Parquet file the child was given.
+///
+/// The file's TAIL comes first and is as long as the tail bound says, or as
+/// long as the file itself when the file is shorter. The first row group's
+/// bytes follow it, when the group is within the bound: a group over it is
+/// shown as its columns and no rows, and its bytes are not moved at all.
+///
+/// The group's bytes are the ones the caller sent after the tail. They are
+/// the same bytes the tail holds when the file is small enough that its first
+/// row group is inside the tail, so the reader answers either way.
+fn parquet_reader(
+    size: u64,
+    group: Option<(u64, u64)>,
+    input: &[u8],
+    limits: &ChildLimits,
+) -> Result<PartsReader, Refusal> {
+    let tail_len = size.min(limits.parquet_tail_bytes);
+    let tail_len = usize::try_from(tail_len).unwrap_or(usize::MAX);
+    if input.len() < tail_len {
+        return Err(Refusal::Unreadable);
+    }
+    let mut parts: Vec<(u64, Bytes)> = Vec::new();
+    if let Some((offset, len)) = group {
+        let end = offset.checked_add(len).ok_or(Refusal::Unreadable)?;
+        if end > size {
+            return Err(Refusal::Unreadable);
+        }
+        if len > 0 && len <= limits.parquet_group_bytes {
+            let from = tail_len;
+            let to = tail_len.saturating_add(usize::try_from(len).unwrap_or(usize::MAX));
+            if input.len() < to {
+                return Err(Refusal::Unreadable);
+            }
+            parts.push((offset, Bytes::copy_from_slice(&input[from..to])));
+        }
+    }
+    parts.push((
+        size - tail_len as u64,
+        Bytes::copy_from_slice(&input[..tail_len]),
+    ));
+    Ok(PartsReader::new(size, parts))
 }
 
 /// Write the refusal and return its exit code.
@@ -767,6 +984,24 @@ pub enum Source {
         /// The key the object is under.
         key: String,
     },
+    /// Parts of a file that is already in memory, in order (`SEC-22` P1: a
+    /// Parquet file is read by ranges, never whole).
+    Parts {
+        /// The whole file, in memory.
+        bytes: Bytes,
+        /// The parts to feed, in order.
+        parts: Vec<Part>,
+    },
+    /// Parts of a stored object, in order. The API never holds more than one
+    /// piece of it at a time.
+    StoredParts {
+        /// The store the object is in.
+        store: UploadStore,
+        /// The key the object is under.
+        key: String,
+        /// The parts to feed, in order.
+        parts: Vec<Part>,
+    },
 }
 
 /// Why a conversion did not answer.
@@ -811,6 +1046,10 @@ pub struct ConversionRunner {
     max_output_bytes: u64,
     /// The CPU limit the child sets for itself, in seconds.
     cpu_seconds: u64,
+    /// The most bytes of a Parquet file's end the child is given.
+    parquet_tail_bytes: u64,
+    /// The most bytes of a Parquet file's first row group the child is given.
+    parquet_group_bytes: u64,
     /// The wall-clock limit of one conversion.
     wall: Duration,
     /// How many children this process has started.
@@ -847,6 +1086,8 @@ impl ConversionRunner {
             memory_mib,
             max_output_bytes: MAX_OUTPUT_BYTES,
             cpu_seconds: DEFAULT_CPU_SECONDS,
+            parquet_tail_bytes: PARQUET_TAIL_BYTES,
+            parquet_group_bytes: PARQUET_GROUP_BYTES,
             wall: CONVERSION_WALL,
             runs: Arc::new(AtomicU64::new(0)),
         }
@@ -871,6 +1112,8 @@ impl ConversionRunner {
             memory_mib: self.memory_mib,
             max_output_bytes: self.max_output_bytes,
             cpu_seconds: self.cpu_seconds,
+            parquet_tail_bytes: self.parquet_tail_bytes,
+            parquet_group_bytes: self.parquet_group_bytes,
             wall: self.wall,
             runs: Arc::clone(&self.runs),
         }
@@ -892,6 +1135,34 @@ impl ConversionRunner {
             memory_mib: self.memory_mib,
             max_output_bytes,
             cpu_seconds: self.cpu_seconds,
+            parquet_tail_bytes: self.parquet_tail_bytes,
+            parquet_group_bytes: self.parquet_group_bytes,
+            wall: self.wall,
+            runs: Arc::clone(&self.runs),
+        }
+    }
+
+    /// The same runner, with other bounds for what a Parquet file costs the
+    /// child: how many bytes of the file's end it is given, and how many
+    /// bytes of its first row group.
+    ///
+    /// For the tests: the real bounds are 16 MiB and 64 MiB, and a test that
+    /// proves a Parquet file is read by ranges must not write 80 MiB.
+    #[allow(
+        dead_code,
+        reason = "the route tests set smaller bounds for the child; the binary does not"
+    )]
+    #[must_use]
+    pub fn with_parquet_limits(&self, tail_bytes: u64, group_bytes: u64) -> Self {
+        Self {
+            binary: self.binary.clone(),
+            check_binary: self.check_binary,
+            slots: Arc::clone(&self.slots),
+            memory_mib: self.memory_mib,
+            max_output_bytes: self.max_output_bytes,
+            cpu_seconds: self.cpu_seconds,
+            parquet_tail_bytes: tail_bytes,
+            parquet_group_bytes: group_bytes,
             wall: self.wall,
             runs: Arc::clone(&self.runs),
         }
@@ -911,6 +1182,8 @@ impl ConversionRunner {
             memory_mib: self.memory_mib,
             max_output_bytes: self.max_output_bytes,
             cpu_seconds: self.cpu_seconds,
+            parquet_tail_bytes: self.parquet_tail_bytes,
+            parquet_group_bytes: self.parquet_group_bytes,
             wall,
             runs: Arc::clone(&self.runs),
         }
@@ -925,6 +1198,20 @@ impl ConversionRunner {
     #[must_use]
     pub fn runs(&self) -> u64 {
         self.runs.load(Ordering::Relaxed)
+    }
+
+    /// How many bytes of a Parquet file's end the child is given (`SEC-22`
+    /// P1). The API fetches exactly that many bytes and hands them over.
+    #[must_use]
+    pub fn parquet_tail_bytes(&self) -> u64 {
+        self.parquet_tail_bytes
+    }
+
+    /// How many bytes of a Parquet file's first row group the child is given
+    /// (`SEC-22` P1). A group over this is shown as its columns and no rows.
+    #[must_use]
+    pub fn parquet_group_bytes(&self) -> u64 {
+        self.parquet_group_bytes
     }
 
     /// Take a place, or `None` when every slot is taken.
@@ -1152,11 +1439,13 @@ impl ConversionRunner {
             .kill_on_drop(true)
             // The child parses a file somebody chose, so it must not inherit
             // the API's environment: no secret, no endpoint, no password.
-            // It gets the two variables it needs and nothing else.
+            // It gets the variables it needs and nothing else.
             .env_clear()
             .env(MEMORY_ENV, self.memory_mib.to_string())
             .env(OUTPUT_ENV, self.max_output_bytes.to_string())
-            .env(CPU_ENV, self.cpu_seconds.to_string());
+            .env(CPU_ENV, self.cpu_seconds.to_string())
+            .env(PARQUET_TAIL_ENV, self.parquet_tail_bytes.to_string())
+            .env(PARQUET_GROUP_ENV, self.parquet_group_bytes.to_string());
         let mut child = command.spawn().map_err(|err| {
             tracing::warn!(%err, "the child that reads an uploaded file could not be started");
             ConversionError::NotStarted
@@ -1310,10 +1599,60 @@ async fn feed(mut stdin: ChildStdin, source: Source) -> Result<(), ConversionErr
             }
             result
         }
+        Source::Parts { bytes, parts } => {
+            let mut result = Ok(());
+            for part in parts {
+                let from = usize::try_from(part.offset).unwrap_or(usize::MAX);
+                let to = from.saturating_add(usize::try_from(part.length).unwrap_or(usize::MAX));
+                let Some(slice) = bytes.get(from..to) else {
+                    result = Err(std::io::Error::other("a part outside the file"));
+                    break;
+                };
+                if let Err(err) = stdin.write_all(slice).await {
+                    result = Err(err);
+                    break;
+                }
+            }
+            result
+        }
+        Source::StoredParts { store, key, parts } => {
+            let mut result = Ok(());
+            for part in parts {
+                if let Err(err) = feed_range(&store, &key, part, &mut stdin).await {
+                    result = Err(err);
+                    break;
+                }
+            }
+            result
+        }
     };
     // The child's input ends here, so it can read the whole file.
     let _closed = stdin.shutdown().await;
     result.map_err(|_err| ConversionError::Refused(Refusal::ResourceLimit))
+}
+
+/// Feed the child one part of a stored object, in pieces of
+/// [`FEED_CHUNK_BYTES`]: the API never holds more than one piece at a time.
+async fn feed_range(
+    store: &UploadStore,
+    key: &str,
+    part: Part,
+    stdin: &mut ChildStdin,
+) -> std::io::Result<()> {
+    let mut done: u64 = 0;
+    while done < part.length {
+        let len = FEED_CHUNK_BYTES.min(part.length - done);
+        let chunk = store
+            .read_range(key, part.offset.saturating_add(done), len)
+            .await
+            .map_err(|_err| std::io::Error::other("the store could not be read"))?;
+        if chunk.is_empty() {
+            break;
+        }
+        stdin.write_all(&chunk).await?;
+        done = done.saturating_add(chunk.len() as u64);
+    }
+    Ok(())
 }
 
 /// Whether `binary` is this API's own binary, which is what the child must
@@ -1506,12 +1845,29 @@ mod tests {
             Some(Operation::ConvertSheet(Some("Quirks".to_owned())))
         );
         assert_eq!(
-            Operation::parse(&["inspect-parquet".to_owned()]),
-            Some(Operation::InspectParquet)
+            Operation::parse(&["inspect-parquet".to_owned(), "1024".to_owned()]),
+            Some(Operation::InspectParquet { size: 1024 })
         );
         assert_eq!(
+            Operation::parse(&[
+                "preview-parquet".to_owned(),
+                "10".to_owned(),
+                "1024".to_owned(),
+                "16".to_owned(),
+                "64".to_owned(),
+            ]),
+            Some(Operation::PreviewParquet {
+                rows: 10,
+                size: 1024,
+                group_offset: 16,
+                group_len: 64,
+            })
+        );
+        assert_eq!(Operation::parse(&["inspect-parquet".to_owned()]), None);
+        assert_eq!(
             Operation::parse(&["preview-parquet".to_owned(), "10".to_owned()]),
-            Some(Operation::PreviewParquet(10))
+            None,
+            "a preview needs the file's size and its row group's range"
         );
     }
 
@@ -1567,23 +1923,43 @@ mod tests {
     }
 
     /// A Parquet file's footer, and its first rows as text.
+    ///
+    /// The child is given the file's TAIL for the footer, and that tail and
+    /// the first row group for the rows (`SEC-22` P1).
     #[test]
     fn the_child_answers_with_a_parquet_file_and_its_rows() {
+        let size = u64::try_from(ORDERS.len()).unwrap();
         let mut out: Vec<u8> = Vec::new();
-        let code = run(&Operation::InspectParquet, ORDERS, &limits(), &mut out);
+        let code = run(
+            &Operation::InspectParquet { size },
+            &tail_of(ORDERS),
+            &limits(),
+            &mut out,
+        );
         assert_eq!(code, exit::OK);
         let (answer, text) = split(&out);
-        let Answer::Parquet { info } = answer else {
+        let Answer::Parquet { info, group } = answer else {
             panic!("the answer is the footer: {answer:?}");
         };
         assert_eq!(info.rows, 3);
         assert!(text.is_empty(), "the footer is no text");
+        let group = group.expect("the file has a row group");
 
         let mut out: Vec<u8> = Vec::new();
-        let code = run(&Operation::PreviewParquet(10), ORDERS, &limits(), &mut out);
+        let code = run(
+            &Operation::PreviewParquet {
+                rows: 10,
+                size,
+                group_offset: group.offset,
+                group_len: group.len,
+            },
+            &preview_input(ORDERS, group),
+            &limits(),
+            &mut out,
+        );
         assert_eq!(code, exit::OK);
         let (answer, text) = split(&out);
-        let Answer::Parquet { info } = answer else {
+        let Answer::Parquet { info, .. } = answer else {
             panic!("the answer is the footer: {answer:?}");
         };
         assert_eq!(info.rows, 3);
@@ -1594,11 +1970,35 @@ mod tests {
         );
     }
 
+    /// The tail of a Parquet file: the bytes the child is given to read the
+    /// footer out of.
+    fn tail_of(bytes: &[u8]) -> Vec<u8> {
+        let bound = usize::try_from(PARQUET_TAIL_BYTES).unwrap_or(usize::MAX);
+        let len = bytes.len().min(bound);
+        bytes[bytes.len() - len..].to_vec()
+    }
+
+    /// The bytes the child is given for a preview: the file's tail, then its
+    /// first row group's bytes.
+    fn preview_input(bytes: &[u8], group: GroupRange) -> Vec<u8> {
+        let mut input = tail_of(bytes);
+        let from = usize::try_from(group.offset).unwrap();
+        let to = from + usize::try_from(group.len).unwrap();
+        input.extend_from_slice(&bytes[from..to]);
+        input
+    }
+
     /// A column with no text form is refused, and the refusal names it.
     #[test]
     fn a_column_with_no_text_form_is_refused_by_name() {
+        let size = u64::try_from(BINARY.len()).unwrap();
         let mut out: Vec<u8> = Vec::new();
-        let code = run(&Operation::InspectParquet, BINARY, &limits(), &mut out);
+        let code = run(
+            &Operation::InspectParquet { size },
+            &tail_of(BINARY),
+            &limits(),
+            &mut out,
+        );
         assert_eq!(code, exit::UNSUPPORTED_COLUMN);
         let (answer, _) = split(&out);
         assert_eq!(

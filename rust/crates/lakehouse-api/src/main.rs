@@ -63,6 +63,7 @@ mod upload_convert;
 mod upload_formats;
 mod upload_limits;
 mod upload_parquet;
+mod upload_parquet_parts;
 mod upload_parquet_range;
 mod upload_parse;
 mod upload_store;

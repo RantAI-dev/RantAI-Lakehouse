@@ -596,6 +596,10 @@ struct Options {
     /// `SEC-22` D6: the output cap the child is given. The real one is
     /// 512 MiB, which no test writes.
     conversion_output_cap: Option<u64>,
+    /// `SEC-22` P1: the bounds the child is given for a Parquet file: the
+    /// bytes of the file's end, and the bytes of its first row group. The
+    /// real ones are 16 MiB and 64 MiB, and no test writes those.
+    conversion_parquet_limits: Option<(u64, u64)>,
 }
 
 impl Default for Options {
@@ -607,6 +611,7 @@ impl Default for Options {
             upload_max_conversions: None,
             conversion_child: None,
             conversion_output_cap: None,
+            conversion_parquet_limits: None,
         }
     }
 }
@@ -710,6 +715,7 @@ impl Stack {
         }
         let child = options.conversion_child.clone();
         let output_cap = options.conversion_output_cap;
+        let parquet_limits = options.conversion_parquet_limits;
         let (app, state) = spin_up_with_state(&env, |state| {
             // `SEC-22`: the runner may start another child, and the child may
             // have a smaller cap than the real one.
@@ -718,6 +724,9 @@ impl Stack {
             }
             if let Some(cap) = output_cap {
                 state.conversion_runner = state.conversion_runner.with_max_output_bytes(cap);
+            }
+            if let Some((tail, group)) = parquet_limits {
+                state.conversion_runner = state.conversion_runner.with_parquet_limits(tail, group);
             }
         })
         .await;
@@ -7803,6 +7812,130 @@ async fn a_hostile_parquet_file_is_refused_with_the_readers_own_reason() {
 }
 
 #[tokio::test]
+async fn a_hostile_parquet_footer_ends_the_child_and_leaves_the_api_alone() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    // The footer declares two billion row groups: the reader reserves room for
+    // the whole list before it reads one, and the reservation is 192 GB
+    // (`PR #187` review BLOCKER 1; the fixture is
+    // `ops/fixtures/uploads/hostile/huge_list_footer.parquet`). The CHILD is
+    // the one that ends; the API is not.
+    let hostile = fixture("hostile/huge_list_footer.parquet");
+    let reply = stack
+        .send(
+            &bayu,
+            "POST",
+            "/api/uploads",
+            file_form("hostile.parquet", "application/octet-stream", &hostile),
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.text);
+    assert_eq!(reply.json["error"], NEEDS_MORE_MEMORY, "{}", reply.text);
+    assert!(
+        stack.bucket.keys().is_empty(),
+        "nothing of the refused file was stored: {:?}",
+        stack.bucket.keys()
+    );
+
+    // The API is still there: the next request answers normally.
+    let upload = stack.upload(&bayu, "a.csv", b"a,b\n1,2\n").await;
+    assert_eq!(upload["status"], "uploaded");
+}
+
+/// A Parquet file of `rows` rows, written by the crate's own writer.
+///
+/// `per_group` is how many rows a row group holds: the first row group is
+/// what a preview decodes, so a test that wants its rows must keep it
+/// inside the bound the child is given.
+fn written_parquet(rows: usize, per_group: usize) -> Vec<u8> {
+    use std::sync::Arc;
+
+    use arrow_array::{ArrayRef, Int64Array, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+    use parquet::arrow::ArrowWriter;
+    use parquet::file::properties::WriterProperties;
+
+    let schema = Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("note", DataType::Utf8, false),
+    ]);
+    let ids = Int64Array::from_iter_values(0..i64::try_from(rows).unwrap());
+    let notes: StringArray = (0..rows)
+        .map(|n| format!("row {n} of a file whose text does not compress"))
+        .collect::<Vec<String>>()
+        .into();
+    let batch = arrow_array::RecordBatch::try_new(
+        Arc::new(schema),
+        vec![Arc::new(ids) as ArrayRef, Arc::new(notes) as ArrayRef],
+    )
+    .unwrap();
+    let properties = WriterProperties::builder()
+        .set_max_row_group_row_count(Some(per_group))
+        .set_dictionary_enabled(false)
+        .build();
+    let mut out = Vec::new();
+    let mut writer = ArrowWriter::try_new(&mut out, batch.schema(), Some(properties)).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+    out
+}
+
+#[tokio::test]
+async fn a_parquet_file_over_the_input_cap_is_previewed_and_loaded() {
+    // The child's input for a Parquet file is the file's tail and its first
+    // row group, NOT the file (`SEC-22` P1). The bounds here are small, so
+    // the file below is over the cap the child is given — and it is read
+    // anyway, because the file's size is not what the child reads. This is
+    // the `PR #187` review BLOCKER 2: a Parquet file of the chunked upload's
+    // cap (2 GiB) used to be refused by the child's 64 MiB input cap.
+    let tail = 32 * 1024;
+    let group = 64 * 1024;
+    let stack = Stack::with(Options {
+        conversion_parquet_limits: Some((tail, group)),
+        ..Options::default()
+    })
+    .await;
+    let bayu = stack.bayu().await;
+    let bytes = written_parquet(4_000, 500);
+    assert!(
+        bytes.len() > usize::try_from(tail + group).unwrap(),
+        "the file is over the cap the child is given: {} bytes",
+        bytes.len()
+    );
+
+    let upload = stack.upload(&bayu, "big.parquet", &bytes).await;
+    let id = id_of(&upload);
+    assert_eq!(upload["status"], "uploaded");
+    assert_eq!(upload["parquet"]["rows"], 4_000);
+
+    // The preview reads the footer and the first row group, and shows rows.
+    let reply = stack
+        .get(&bayu, &format!("/api/uploads/{id}/preview"))
+        .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text);
+    assert_eq!(reply.json["columns"], json!(["id", "note"]));
+    assert_eq!(
+        reply.json["rows"].as_array().map(Vec::len),
+        Some(20),
+        "the preview shows twenty rows: {}",
+        reply.text
+    );
+
+    // The load reads the footer again, and the job is handed the file.
+    mount_free_table(&stack.ch).await;
+    mount_launch(&stack.dagster, "run-1").await;
+    let loaded = stack
+        .ingest(&bayu, &id, parquet_ingest_body("big_raw"))
+        .await;
+    assert_eq!(loaded.status, StatusCode::OK, "{}", loaded.text);
+    assert!(
+        loaded.json["runId"].is_string(),
+        "the load was launched: {}",
+        loaded.text
+    );
+}
+
+#[tokio::test]
 async fn a_second_preview_of_a_workbook_reads_the_stored_text_and_runs_no_child() {
     let stack = Stack::start().await;
     let bayu = stack.bayu().await;
@@ -7853,8 +7986,8 @@ async fn a_parquet_preview_reads_the_file_through_the_child() {
     assert_eq!(reply.json["parquet"]["columns"], orders_columns());
     assert_eq!(
         stack.state.conversion_runner.runs(),
-        2,
-        "the upload read the footer and the preview read the rows"
+        3,
+        "the upload read the footer, and the preview read the footer and the rows"
     );
 }
 

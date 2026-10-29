@@ -16,9 +16,14 @@
 //! that [`convert`] writes here. What stays here is what the API needs to
 //! SHOW: [`inspect`] (the footer: columns, types, row count) and [`convert`]
 //! with `max_rows`, which writes the first rows of the first row group as the
-//! preview's text. Both read through a `ChunkReader`, and for a stored file
-//! that is `upload_parquet_range::RangeReader`, which fetches only the ranges
-//! asked for, so the API never holds a Parquet file; what the footer declares
+//! preview's text. Both read through a `ChunkReader`.
+//!
+//! Since `SEC-22` P1 the API reads NOTHING of a Parquet file itself: the
+//! child process does, and it is given the ranges it needs — the tail of the
+//! file, which holds the footer, and the first row group — through the
+//! sparse reader of `upload_parquet_parts`. That is [`inspect_parts`] and
+//! [`convert_parts`], which are the same reads as [`inspect`] and [`convert`]
+//! over a reader that has no other byte of the file. What the footer declares
 //! (its length, where every column chunk lies, the size of every row group) is
 //! bounded before it is trusted ([`MAX_FOOTER_BYTES`], `check_layout`).
 //! `convert` is also the oracle of the text rules: `ops/fixtures/parquet/
@@ -231,6 +236,32 @@ pub struct ParquetInfo {
     pub rows: u64,
 }
 
+/// The byte range of a Parquet file's first row group.
+///
+/// The row group is what a preview decodes, so the range is what the child
+/// must be given (`SEC-22` P1: the file goes to the child by ranges, never
+/// whole). The range is the span of the group's column chunks, which is
+/// where every byte the preview reads lies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupRange {
+    /// Where the first row group starts in the file.
+    pub offset: u64,
+    /// How many bytes it takes.
+    pub len: u64,
+}
+
+/// What a file's footer says: its columns and its row count, and where its
+/// first row group is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParquetFooter {
+    /// The columns and the row count.
+    pub info: ParquetInfo,
+    /// The first row group's byte range, or `None` for a file with no row
+    /// group (a file with no rows has none).
+    pub group: Option<GroupRange>,
+}
+
 /// A file converted to delimited text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Converted {
@@ -253,9 +284,9 @@ fn guarded<T>(work: impl FnOnce() -> Result<T, ParquetFileError>) -> Result<T, P
 struct Opened {
     meta: ArrowReaderMetadata,
     info: ParquetInfo,
-    /// Compressed size of the first row group, from the footer; `0` for a file
-    /// with none.
-    first_group_bytes: i64,
+    /// The first row group's byte range, or `None` for a file with no row
+    /// group.
+    group: Option<GroupRange>,
 }
 
 /// The options both reads use: the Arrow schema some writers embed is ignored.
@@ -273,6 +304,10 @@ pub fn has_encrypted_magic(bytes: &[u8]) -> bool {
 /// footer is read: the length it announces fits in the file and under
 /// [`MAX_FOOTER_BYTES`]. A file shorter than a magic, a footer length and a
 /// magic is not Parquet.
+///
+/// A footer whose magic is `PARE` is an ENCRYPTED footer, and that is said
+/// as such: the file cannot be read, and the reason is the encryption, not a
+/// damaged file.
 fn check_footer_length<R: ChunkReader>(reader: &R) -> Result<u64, ParquetFileError> {
     let size = reader.len();
     if size < 12 {
@@ -281,8 +316,10 @@ fn check_footer_length<R: ChunkReader>(reader: &R) -> Result<u64, ParquetFileErr
     let tail = reader
         .get_bytes(size - 8, 8)
         .map_err(|_err| ParquetFileError::Unreadable)?;
-    if tail.get(4..8) != Some(MAGIC) {
-        return Err(ParquetFileError::Unreadable);
+    match tail.get(4..8) {
+        Some(magic) if magic == MAGIC => {}
+        Some(magic) if magic == ENCRYPTED_MAGIC => return Err(ParquetFileError::Encrypted),
+        _ => return Err(ParquetFileError::Unreadable),
     }
     let announced = tail
         .get(0..4)
@@ -318,19 +355,33 @@ fn check_layout(metadata: &ParquetMetaData, data_end: u64) -> Result<(), Parquet
     Ok(())
 }
 
-fn open<R: ChunkReader + 'static>(reader: &R, cap: u64) -> Result<Opened, ParquetFileError> {
-    if reader.len() >= 4 {
-        let head = reader
-            .get_bytes(0, 4)
-            .map_err(|_err| ParquetFileError::Unreadable)?;
-        if has_encrypted_magic(&head) {
-            return Err(ParquetFileError::Encrypted);
-        }
-        if !head.starts_with(MAGIC) {
+/// Open a Parquet file's metadata.
+///
+/// `head` says whether the reader has the file's FIRST bytes. It does when
+/// the whole file is in memory, and it does not when only the file's tail is
+/// (`SEC-22` P1: the child is given the tail of the file and the first row
+/// group, never the whole file). Without the first bytes the magic cannot be
+/// read, so the file's PARQUET-ness is decided by the footer's own magic —
+/// which is the same four bytes — and the encrypted-footer case is said as
+/// the encryption it is.
+fn open<R: ChunkReader + 'static>(
+    reader: &R,
+    cap: u64,
+    head: bool,
+) -> Result<Opened, ParquetFileError> {
+    if head {
+        if reader.len() < 4 {
             return Err(ParquetFileError::Unreadable);
         }
-    } else {
-        return Err(ParquetFileError::Unreadable);
+        let first = reader
+            .get_bytes(0, 4)
+            .map_err(|_err| ParquetFileError::Unreadable)?;
+        if has_encrypted_magic(&first) {
+            return Err(ParquetFileError::Encrypted);
+        }
+        if !first.starts_with(MAGIC) {
+            return Err(ParquetFileError::Unreadable);
+        }
     }
     let footer = check_footer_length(reader)?;
     let loaded = ArrowReaderMetadata::load(reader, plain_options())
@@ -396,15 +447,30 @@ fn open<R: ChunkReader + 'static>(reader: &R, cap: u64) -> Result<Opened, Parque
     } else {
         loaded
     };
-    let first_group_bytes = meta
-        .metadata()
-        .row_groups()
-        .first()
-        .map_or(0, RowGroupMetaData::compressed_size);
-    Ok(Opened {
-        meta,
-        info,
-        first_group_bytes,
+    let group = first_group_range(meta.metadata());
+    Ok(Opened { meta, info, group })
+}
+
+/// The byte range of the first row group, or `None` for a file with none.
+///
+/// The range is the span of the group's column chunks: every byte a preview
+/// of this file reads lies inside it.
+fn first_group_range(metadata: &ParquetMetaData) -> Option<GroupRange> {
+    let group = metadata.row_groups().first()?;
+    let mut start = u64::MAX;
+    let mut end = 0_u64;
+    for column in group.columns() {
+        let (offset, length) = column.byte_range();
+        let column_end = offset.checked_add(length)?;
+        start = start.min(offset);
+        end = end.max(column_end);
+    }
+    if start == u64::MAX {
+        return None;
+    }
+    Some(GroupRange {
+        offset: start,
+        len: end - start,
     })
 }
 
@@ -542,18 +608,49 @@ fn inspect_capped<R: ChunkReader + 'static>(
     reader: &R,
     cap: u64,
 ) -> Result<ParquetInfo, ParquetFileError> {
-    guarded(|| open(reader, cap).map(|opened| opened.info))
+    guarded(|| open(reader, cap, true).map(|opened| opened.info))
+}
+
+/// What the footer of a file says, read through a reader that holds only the
+/// TAIL of the file and not its first bytes (`SEC-22` P1: the child is given
+/// the ranges it needs, never the whole file).
+///
+/// The answer is the footer and the byte range of the first row group, which
+/// is what a preview needs to be given next.
+///
+/// # Errors
+///
+/// As [`inspect`].
+pub fn inspect_parts<R: ChunkReader + 'static>(
+    reader: &R,
+) -> Result<ParquetFooter, ParquetFileError> {
+    guarded(|| {
+        let opened = open(reader, u64::MAX, false)?;
+        Ok(ParquetFooter {
+            info: opened.info,
+            group: opened.group,
+        })
+    })
 }
 
 /// The file in `bytes` as delimited text: a first record of column names, then
 /// at most `max_rows` rows (all when `None`). See the module doc for every
 /// rule.
 ///
+/// The product no longer converts a whole Parquet file — the load job reads
+/// the file natively (`DATA-17` T2.2) — so this is the ORACLE of the text
+/// rules: the tests read it and compare with what the job's reader writes
+/// (`ops/fixtures/parquet/types.expected.json`).
+///
 /// # Errors
 ///
 /// Those of [`inspect`]; [`ParquetFileError::Unreadable`] also when a page of
 /// the file cannot be decoded; [`ParquetFileError::TooMuchText`] past
 /// [`MAX_OUTPUT_BYTES`].
+#[allow(
+    dead_code,
+    reason = "the product converts no whole Parquet file; the tests read this as the oracle of the text rules"
+)]
 pub fn convert<R: ChunkReader + Clone + 'static>(
     reader: &R,
     max_rows: Option<usize>,
@@ -563,7 +660,34 @@ pub fn convert<R: ChunkReader + Clone + 'static>(
         max_rows,
         cell_cap_for(max_rows),
         MAX_OUTPUT_BYTES,
-        MAX_PREVIEW_GROUP_BYTES,
+        MAX_PREVIEW_GROUP_BYTES as u64,
+        true,
+    )
+}
+
+/// The rows of a file read through a reader that holds the file's TAIL and its
+/// first row group, and nothing else (`SEC-22` P1).
+///
+/// `group_cap` is the most the first row group may take: a group over it is
+/// shown as its columns and no rows, because the bytes it takes are not
+/// worth moving (the reader decodes a group's column chunks whole, so the
+/// bound is what keeps a preview's memory bounded).
+///
+/// # Errors
+///
+/// As [`convert`].
+pub fn convert_parts<R: ChunkReader + Clone + 'static>(
+    reader: &R,
+    max_rows: Option<usize>,
+    group_cap: u64,
+) -> Result<Converted, ParquetFileError> {
+    convert_capped(
+        reader,
+        max_rows,
+        cell_cap_for(max_rows),
+        MAX_OUTPUT_BYTES,
+        group_cap,
+        false,
     )
 }
 
@@ -572,14 +696,11 @@ fn convert_capped<R: ChunkReader + Clone + 'static>(
     max_rows: Option<usize>,
     cell_cap: u64,
     byte_cap: usize,
-    group_cap: i64,
+    group_cap: u64,
+    head: bool,
 ) -> Result<Converted, ParquetFileError> {
     guarded(|| {
-        let Opened {
-            meta,
-            info,
-            first_group_bytes,
-        } = open(reader, cell_cap)?;
+        let Opened { meta, info, group } = open(reader, cell_cap, head)?;
         let mut out = Vec::new();
         let names: Vec<&str> = info.columns.iter().map(|c| c.name.as_str()).collect();
         write_record(&mut out, &names).map_err(|_err| ParquetFileError::Unreadable)?;
@@ -591,7 +712,8 @@ fn convert_capped<R: ChunkReader + Clone + 'static>(
         let mut builder = ParquetRecordBatchReaderBuilder::new_with_metadata(reader.clone(), meta)
             .with_batch_size(BATCH_ROWS);
         if let Some(limit) = max_rows {
-            if first_group_bytes > group_cap || info.rows == 0 {
+            let group_fits = group.is_some_and(|range| range.len <= group_cap);
+            if !group_fits || info.rows == 0 {
                 return Ok(Converted {
                     info,
                     csv: finish_text(out),
@@ -1297,7 +1419,7 @@ mod tests {
             ParquetFileError::TooLarge
         );
         assert_eq!(
-            convert_capped(&bytes, None, 14, MAX_OUTPUT_BYTES, i64::MAX).unwrap_err(),
+            convert_capped(&bytes, None, 14, MAX_OUTPUT_BYTES, u64::MAX, true).unwrap_err(),
             ParquetFileError::TooLarge
         );
         // A file with no rows is no cells, whatever its columns.
@@ -1321,7 +1443,7 @@ mod tests {
     #[test]
     fn a_conversion_past_the_text_cap_is_refused() {
         assert_eq!(
-            convert_capped(&fixture(ORDERS), None, MAX_CELLS, 40, i64::MAX).unwrap_err(),
+            convert_capped(&fixture(ORDERS), None, MAX_CELLS, 40, u64::MAX, true).unwrap_err(),
             ParquetFileError::TooMuchText
         );
     }
@@ -1558,7 +1680,7 @@ mod tests {
     #[test]
     fn a_first_row_group_over_the_preview_bound_shows_the_columns_and_no_rows() {
         let file = grouped(2, 1_000);
-        let shown = convert_capped(&file, Some(20), MAX_CELLS, MAX_OUTPUT_BYTES, 1).unwrap();
+        let shown = convert_capped(&file, Some(20), MAX_CELLS, MAX_OUTPUT_BYTES, 1, true).unwrap();
         assert_eq!(records(&shown), rows(&[&["id", "text"]]));
         assert_eq!(
             shown.info.rows, 2_000,

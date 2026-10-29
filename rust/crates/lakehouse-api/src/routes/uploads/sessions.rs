@@ -31,13 +31,13 @@
 //! ReceiveLimiter`] place of `SEC-17` is taken BEFORE the body is read and
 //! held until the handler returns, so "four per user, sixteen in all" bounds
 //! the memory of this route as it bounds `POST /api/uploads`. Opening a
-//! session reads no file, and completing a text file reads 64 KiB. Completing a
-//! Parquet file reads its footer, by range (`upload_parquet_range`), never the
-//! file. Completing a workbook reads the whole object — but in the CHILD
-//! (`SEC-22` D1a), which reads it in pieces from the store, so the API holds
-//! none of it; that path takes a place too and is refused above
-//! [`super::MAX_UPLOAD_BYTES`]: a workbook stays at 50 MB (feature page,
-//! decision 9).
+//! session reads no file, and completing a text file reads 64 KiB. Completing
+//! a Parquet file reads its footer — by the CHILD, which is given the tail
+//! of the file and not the file (`SEC-22` P1). Completing a workbook reads
+//! the whole object — but in the CHILD (`SEC-22` D1a), which reads it in
+//! pieces from the store, so the API holds none of it; that path takes a
+//! place too and is refused above [`super::MAX_UPLOAD_BYTES`]: a workbook
+//! stays at 50 MB (feature page, decision 9).
 //!
 //! # Posture
 //!
@@ -65,8 +65,9 @@ use uuid::Uuid;
 
 use super::{
     Accepted, CONVERSION_FAILED, CreateResponse, EMPTY_FILE, MAX_UNPACKED_BYTES, MAX_UPLOAD_BYTES,
-    NO_TENANT, UploadView, blocking, classify_head, conversion_error, display_name, not_found,
-    pool, record_audit, sha256_hex, sheets_key, sheets_of_answer, storage_key, upload_audit_event,
+    NO_TENANT, ParquetFile, UploadView, blocking, classify_head, conversion_error, display_name,
+    not_found, parquet_footer, pool, record_audit, sha256_hex, sheets_key, sheets_of_answer,
+    storage_key, upload_audit_event,
 };
 use crate::error::ApiResult;
 use crate::json::ApiJson;
@@ -603,8 +604,9 @@ struct WholeFacts {
 /// child reads up to [`MAX_UPLOAD_BYTES`] at a time), and a workbook above
 /// that size is refused with the existing sentence; this is where a workbook's
 /// 50 MB limit stays when sessions accept more (feature page, decision 9). A
-/// Parquet file's footer is read by range and checked (`DATA-17` T2.2), and the
-/// file is not held. A text file is not read at all.
+/// Parquet file's footer is read by the CHILD as well (`SEC-22` P1), which is
+/// given the file's tail, and the file is not held. A text file is not read
+/// at all.
 async fn open_whole(
     state: &AppState,
     store: &UploadStore,
@@ -637,25 +639,24 @@ async fn open_whole(
         Accepted::Parquet | Accepted::Workbook => {}
     }
     if accepted == Accepted::Parquet {
-        // `DATA-17` T2.2: only the footer is read, by range. The file is never
-        // held, so it has no size cap here beyond the session's (2 GiB), and no cell cap
-        // either: the job streams the file by row group (`DATA-17-RESULT.md`, plan T6.2
-        // item 3). The footer is bounded by `MAX_FOOTER_BYTES` before it is read.
+        // `DATA-17` T2.2: only the footer is read. The file is never held, so
+        // it has no size cap here beyond the session's (2 GiB), and no cell cap
+        // either: the job streams the file by row group (`DATA-17-RESULT.md`,
+        // plan T6.2 item 3). The footer is bounded by `MAX_FOOTER_BYTES` before
+        // it is read.
         //
-        // `SEC-22` D1a sends every workbook and Parquet read to the child,
-        // and this footer read is the ONE that stays here: a session's
-        // Parquet file may be 2 GiB, and the child reads its input whole
-        // (`upload_convert::MAX_INPUT_BYTES` is 64 MiB), so the child cannot
-        // read this file at all. The footer read is bounded — it reads
-        // `MAX_FOOTER_BYTES` at most and decodes no page — and what it
-        // trusts it checks against the file (`upload_parquet::check_layout`),
-        // so it cannot be made to ask for more memory than it has. The
-        // planner has the mismatch in the handoff.
-        let reader = RangeReader::open(store, &row.storage_key).await?;
-        let opened = blocking(move || upload_parquet::inspect(&reader)).await?;
+        // `SEC-22` P1: the footer is read by the CHILD, which is given the
+        // file's TAIL — the bytes the footer is in — and never the whole
+        // file. So a session's Parquet file may be 2 GiB and is read exactly
+        // as a small one is, and a footer that asks for more memory than the
+        // machine has ends the CHILD and never this process (`PR #187` review
+        // BLOCKER 1: the footer decode reserved the file's own counts, and
+        // that decode used to run here).
+        let file = ParquetFile::stored(store, &row.storage_key).await?;
+        let footer = parquet_footer(state, &file).await?;
         return Ok(WholeFacts {
             workbook: None,
-            parquet: Some(opened),
+            parquet: Some(footer.info),
         });
     }
     if declared > u64::try_from(MAX_UPLOAD_BYTES).unwrap_or(u64::MAX) {

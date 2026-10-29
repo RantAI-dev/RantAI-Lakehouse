@@ -79,6 +79,7 @@ pub mod upload_convert;
 pub mod upload_formats;
 pub mod upload_limits;
 pub mod upload_parquet;
+pub mod upload_parquet_parts;
 pub mod upload_parquet_range;
 pub mod upload_parse;
 pub mod upload_store;

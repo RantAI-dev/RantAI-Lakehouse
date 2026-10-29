@@ -105,13 +105,15 @@
 //! A `.parquet` file takes the same path as a workbook (section 11 of
 //! `docs/superpowers/plans/2026-10-07-upload-excel.md`): stored as it
 //! arrived, read by the same child process (`SEC-22` D1a), and, at ingest,
-//! read by the unchanged job, which streams it by row group. A file has one
-//! table and its own column names, so there is no sheet and the header row
-//! is fixed at 0 (`headerRow` in a request is not read). Whether an upload IS
-//! a Parquet file is decided by its stored name AND its first bytes, as for a
-//! workbook ([`conversion_of_head`]). Where the code branches on "is this
-//! converted before it is loaded", it branches on [`Conversion`], not on a
-//! workbook.
+//! read by the unchanged job, which streams it by row group. The child is
+//! given the file by RANGES (`SEC-22` P1) — the tail of the file, which holds
+//! the footer, and its first row group — and never the file itself, which
+//! may be two gibibytes long. A file has one table and its own column names,
+//! so there is no sheet and the header row is fixed at 0 (`headerRow` in a
+//! request is not read). Whether an upload IS a Parquet file is decided by
+//! its stored name AND its first bytes, as for a workbook
+//! ([`conversion_of_head`]). Where the code branches on "is this converted
+//! before it is loaded", it branches on [`Conversion`], not on a workbook.
 //!
 //! # Statuses
 //!
@@ -161,11 +163,12 @@ use crate::state::AppState;
 use crate::upload_convert::{self, Answer, ConversionError, FileKind, Operation, Source};
 use crate::upload_formats::{self, ByName, Compression, Format, Layout, Refusal};
 use crate::upload_limits::{RETRY_AFTER_SECS, too_many_uploads};
-use crate::upload_parquet::{self, ParquetInfo};
+use crate::upload_parquet::{self, ParquetFooter, ParquetInfo};
+use crate::upload_parquet_parts::Part;
 use crate::upload_parquet_range::RangeReader;
 use crate::upload_parse::{self, Encoding, Kind, Overrides, Preview};
-use crate::upload_store::{PREFIX, UploadStore};
-use crate::upload_workbook::WorkbookInfo;
+use crate::upload_store::{PREFIX, UploadStore, UploadStoreError};
+use crate::upload_workbook::{self, WorkbookInfo};
 
 pub(super) mod columns;
 pub(super) mod folders;
@@ -695,14 +698,18 @@ fn sheets_of_answer(answer: &Answer) -> Result<WorkbookInfo, ApiError> {
     }
 }
 
-/// What a Parquet file's footer says, as an answer holds it.
+/// What a Parquet answer holds: the footer's account of the file, and where
+/// its first row group is.
 ///
 /// # Errors
 ///
 /// 500 when the answer is not one of the answers this module knows.
-fn parquet_of_answer(answer: &Answer) -> Result<ParquetInfo, ApiError> {
+fn parquet_of_answer(answer: &Answer) -> Result<ParquetFooter, ApiError> {
     match answer {
-        Answer::Parquet { info } => Ok(info.clone()),
+        Answer::Parquet { info, group } => Ok(ParquetFooter {
+            info: info.clone(),
+            group: *group,
+        }),
         Answer::Sheets { .. } | Answer::Sheet { .. } | Answer::Refusal { .. } => {
             Err(ApiError::Internal(CONVERSION_FAILED.to_owned()))
         }
@@ -737,6 +744,101 @@ fn stored_source(store: &UploadStore, row: &Upload) -> Source {
         store: store.clone(),
         key: row.storage_key.clone(),
     }
+}
+
+/// A Parquet file the API reads, and where its bytes are.
+///
+/// A Parquet file is read by RANGES and never whole (`SEC-22` P1): the child
+/// is given the file's tail, which holds the footer, and its first row
+/// group. A file of the chunked upload's cap is two gibibytes long, and the
+/// API moves neither more nor less than those two ranges.
+enum ParquetFile<'a> {
+    /// The bytes of an upload that has just arrived.
+    Bytes(&'a Bytes),
+    /// A stored object, with the size the store reports.
+    Stored {
+        /// The store the object is in.
+        store: &'a UploadStore,
+        /// The key the object is under.
+        key: &'a str,
+        /// The size of the object, in bytes.
+        size: u64,
+    },
+}
+
+impl<'a> ParquetFile<'a> {
+    /// The stored object at `key`, with its size.
+    ///
+    /// # Errors
+    ///
+    /// 503 when the object is missing or the store fails.
+    async fn stored(store: &'a UploadStore, key: &'a str) -> Result<Self, ApiError> {
+        let size = store.object_size(key).await?;
+        let Some(size) = size else {
+            return Err(UploadStoreError::Unavailable("not found").into());
+        };
+        Ok(Self::Stored { store, key, size })
+    }
+
+    /// The size of the file, in bytes.
+    fn size(&self) -> u64 {
+        match self {
+            Self::Bytes(bytes) => u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            Self::Stored { size, .. } => *size,
+        }
+    }
+
+    /// The source that feeds the child the given parts of this file.
+    fn source(&self, parts: Vec<Part>) -> Source {
+        match self {
+            Self::Bytes(bytes) => Source::Parts {
+                bytes: (*bytes).clone(),
+                parts,
+            },
+            Self::Stored { store, key, .. } => Source::StoredParts {
+                store: (*store).clone(),
+                key: (*key).to_owned(),
+                parts,
+            },
+        }
+    }
+}
+
+/// What a Parquet file's footer says, read by the child (`SEC-22` P1).
+///
+/// The child is given the file's TAIL — the footer and the eight bytes that
+/// follow it — and answers the footer's account of the file and the byte
+/// range of its first row group. The API never decodes a footer itself: a
+/// footer declares how much memory its reader will want, and that allocation
+/// ends the process that makes it.
+///
+/// # Errors
+///
+/// 400 with the child's own sentence for a file that cannot be read; 429 when
+/// every conversion slot is taken; 500 when the child could not be started;
+/// 503 when the object store is unavailable.
+async fn parquet_footer(
+    state: &AppState,
+    file: &ParquetFile<'_>,
+) -> Result<ParquetFooter, ApiError> {
+    let tail = Part::tail(file.size(), state.conversion_runner.parquet_tail_bytes());
+    let source = file.source(vec![tail]);
+    let answer = state
+        .conversion_runner
+        .answer(Operation::InspectParquet { size: file.size() }, source)
+        .await
+        .map_err(|err| conversion_error(FileKind::Parquet, err))?;
+    parquet_of_answer(&answer)
+}
+
+/// The text of a Parquet file's columns and no rows: what a preview shows
+/// when the file's first row group is over the bound and its bytes are not
+/// worth moving (`SEC-22` P1).
+fn parquet_header(info: &ParquetInfo) -> Bytes {
+    let mut out = Vec::new();
+    let names: Vec<&str> = info.columns.iter().map(|c| c.name.as_str()).collect();
+    let _written = upload_workbook::write_record(&mut out, &names);
+    Bytes::from(upload_workbook::finish_text(out))
 }
 
 /// The conversion an upload needs, judged from its stored name AND its first
@@ -1038,16 +1140,13 @@ async fn read_with_child(
             })
         }
         Accepted::Parquet => {
-            let source = Source::Bytes(bytes.clone());
-            let answer = state
-                .conversion_runner
-                .answer(Operation::InspectParquet, source)
-                .await
-                .map_err(|err| conversion_error(FileKind::Parquet, err))?;
-            let parquet = parquet_of_answer(&answer)?;
+            // `SEC-22` P1: the child is given the file's TAIL, which holds
+            // the footer, and never the whole file.
+            let file = ParquetFile::Bytes(bytes);
+            let footer = parquet_footer(state, &file).await?;
             Ok(ChildReading {
                 workbook: None,
-                parquet: Some(parquet),
+                parquet: Some(footer.info),
                 sheets: None,
             })
         }
@@ -2137,22 +2236,52 @@ async fn workbook_preview(
 /// The preview of a Parquet file: its first rows as text, read the way the load
 /// reads them (UTF-8, comma, the first record is the header).
 ///
-/// `SEC-22` D1b: the file is moved from the store to the child whole (at
-/// most 50 MiB), where it is read under the child's own memory limit. The
-/// preview is not stored: its header row is fixed, so a second preview is
-/// rare.
+/// `SEC-22` P1: the file is read by RANGES and never whole. The child is
+/// given the file's tail — which holds the footer — and answers where the
+/// file's first row group is; the group's bytes are fetched then, and the
+/// child is asked for the rows. A file whose first row group is over the
+/// bound is shown as its columns and no rows, and its group's bytes are not
+/// moved at all.
 async fn parquet_preview(
     state: &AppState,
     store: &UploadStore,
     row: &Upload,
 ) -> Result<(PreviewResponse, Sample), ApiError> {
-    let source = stored_source(store, row);
-    let (answer, csv) = state
-        .conversion_runner
-        .answer_with_text(Operation::PreviewParquet(PARQUET_PREVIEW_ROWS), source)
-        .await
-        .map_err(|err| conversion_error(FileKind::Parquet, err))?;
-    let info = parquet_of_answer(&answer)?;
+    let file = ParquetFile::stored(store, &row.storage_key).await?;
+    let footer = parquet_footer(state, &file).await?;
+    let info = footer.info;
+    let size = file.size();
+    let group = footer
+        .group
+        .filter(|group| group.len <= state.conversion_runner.parquet_group_bytes());
+    let csv = match group {
+        Some(group) => {
+            let parts = vec![
+                Part::tail(size, state.conversion_runner.parquet_tail_bytes()),
+                Part {
+                    offset: group.offset,
+                    length: group.len,
+                },
+            ];
+            let source = file.source(parts);
+            let (_answer, text) = state
+                .conversion_runner
+                .answer_with_text(
+                    Operation::PreviewParquet {
+                        rows: PARQUET_PREVIEW_ROWS,
+                        size,
+                        group_offset: group.offset,
+                        group_len: group.len,
+                    },
+                    source,
+                )
+                .await
+                .map_err(|err| conversion_error(FileKind::Parquet, err))?;
+            text
+        }
+        // The first row group is over the bound: the columns and no rows.
+        None => parquet_header(&info),
+    };
     let cut = info.rows > u64::try_from(PARQUET_PREVIEW_ROWS).unwrap_or(u64::MAX);
     let overrides = Overrides {
         encoding: Some(Encoding::Utf8),
@@ -2634,11 +2763,12 @@ struct Converted {
 }
 
 /// Check what a Parquet file's footer says, by reading it in a child process
-/// (`SEC-22` D1a).
+/// (`SEC-22` D1a, P1).
 ///
 /// The checks the conversion used to make at ingest, now made on the footer
 /// alone (`DATA-17` T2.2): the file opens, has rows, and has no more columns
-/// than a table may.
+/// than a table may. The child is given the file's tail, so a file of any
+/// size is checked the same way.
 ///
 /// # Errors
 ///
@@ -2648,13 +2778,9 @@ struct Converted {
 /// one with more than 1,000 columns; 503 when the object store is unavailable.
 async fn check_parquet_footer(state: &AppState, row: &Upload) -> Result<(), ApiError> {
     let store = UploadStore::connect(&state.config).await?;
-    let source = stored_source(&store, row);
-    let answer = state
-        .conversion_runner
-        .answer(Operation::InspectParquet, source)
-        .await
-        .map_err(|err| conversion_error(FileKind::Parquet, err))?;
-    let info = parquet_of_answer(&answer)?;
+    let file = ParquetFile::stored(&store, &row.storage_key).await?;
+    let footer = parquet_footer(state, &file).await?;
+    let info = footer.info;
     if info.rows == 0 {
         return Err(ApiError::BadRequest(EMPTY_PARQUET.to_owned()));
     }

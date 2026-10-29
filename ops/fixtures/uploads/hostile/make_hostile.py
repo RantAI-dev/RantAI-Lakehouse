@@ -206,6 +206,16 @@ def parquet_footer() -> bytes:
     )
 
 
+# The count the Parquet footer's row-group list declares. The list header of
+# the compact protocol carries the count BEFORE the elements, and the reader
+# reserves room for the whole list before it reads the first one
+# (`parquet::file::metadata::thrift`: `Vec::with_capacity(list_ident.size)`).
+# So a footer of a few dozen bytes asks for hundreds of gigabytes, and the
+# allocation failure ends the process that made it (SEC-22, `PR #187` review
+# BLOCKER 1).
+DECLARED_GROUPS = 2_000_000_000
+
+
 def build_parquet() -> None:
     """A Parquet file whose footer declares a tebibyte of data it does not hold."""
     footer = parquet_footer()
@@ -218,6 +228,53 @@ def build_parquet() -> None:
     print(f"wrote {target.name}: {target.stat().st_size} bytes")
 
 
+def huge_list_footer() -> bytes:
+    """A Parquet `FileMetaData` whose row-group list declares billions of groups.
+
+    The list header carries the count, and the elements are never there: the
+    reader reserves room for the whole list before it reads the first
+    element, which is the reservation that ends the process.
+    """
+    root = [(4, BINARY, "schema"), (5, I32, 1)]
+    leaf = [
+        (1, I32, 6),  # BYTE_ARRAY
+        (3, I32, 1),  # OPTIONAL
+        (4, BINARY, "id"),
+        (6, I32, 0),  # UTF8
+    ]
+    out = bytearray()
+    last = 0
+    header, last = field_header(1, last, I32)
+    out += header
+    write_value(out, I32, 1)  # version
+    header, last = field_header(2, last, LIST)
+    out += header
+    write_value(out, LIST, (STRUCT, [root, leaf]))  # schema
+    header, last = field_header(3, last, I64)
+    out += header
+    write_value(out, I64, 1)  # num_rows
+    header, last = field_header(4, last, LIST)
+    out += header
+    # The row groups: the count is in the header, the elements are not there.
+    out.append(0xF0 | STRUCT)
+    out += varint(DECLARED_GROUPS)
+    out.append(STOP)
+    return bytes(out)
+
+
+def build_huge_list_parquet() -> None:
+    """A Parquet file whose footer asks for more memory than the machine has."""
+    footer = huge_list_footer()
+    target = HERE / "huge_list_footer.parquet"
+    with target.open("wb") as out:
+        out.write(b"PAR1")
+        out.write(footer)
+        out.write(len(footer).to_bytes(4, "little"))
+        out.write(b"PAR1")
+    print(f"wrote {target.name}: {target.stat().st_size} bytes")
+
+
 if __name__ == "__main__":
     build_xlsx()
     build_parquet()
+    build_huge_list_parquet()
