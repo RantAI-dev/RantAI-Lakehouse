@@ -53,7 +53,24 @@ MongoDB, created by the user in the console, with no operator step
 4. **Secrets** reach Kafka Connect through a config provider that reads the
    connector's `secretRef` at start, never as a literal in the connector's
    JSON (which Kafka Connect stores in a topic and returns from its API).
-   The mechanism is settled in slice 2 against ADR 0002.
+   The mechanism, settled in slice 2 against ADR 0002 (`SRC-4` decision
+   S2-a): managed credentials are sealed (ADR 0002 addendum 5) and a manager
+   reference must pass `SECRET_MANAGER_ALLOWED_PREFIXES` at every use
+   (addendum 6), and Kafka Connect can do neither, so **the API resolves the
+   `secretRef` through its own allowlisted resolver and writes the plain value
+   to `/run/cdc-secrets/<connector id>`**, on a `tmpfs` volume mounted
+   read-write in `lakehouse-api` and read-only in `kafka-connect`, nowhere
+   else. The connector JSON names it with Kafka Connect's built-in
+   `DirectoryConfigProvider` (`${dir:/run/cdc-secrets:<connector id>}`), which
+   the worker is given through `CONNECT_CONFIG_PROVIDERS*` environment
+   variables (the pinned image maps every `CONNECT_*` variable into a worker
+   setting; checked on a CI runner in slice 2). The plain copy exists in
+   memory only, the same exposure as the worker's own process memory, which
+   holds the password to dial the source. `tmpfs` empties on a restart, so
+   the API rewrites every file on start and on every provisioning call; a
+   rotated secret is rewritten and the connector restarted. The file mode is
+   `0444` because the two containers run as different users; the volume is
+   the boundary.
 5. **The fixed pipeline goes**: `debezium-server` and its sidecar are removed
    once PostgreSQL change capture runs on this path and `g4-cdc` passes on it.
 
