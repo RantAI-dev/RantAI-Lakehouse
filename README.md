@@ -403,12 +403,11 @@ their opt-in compose profiles:
 | `GOLD_EXPORT_RUN_TOKEN` | Shared token required by `POST /api/gold/export/{mart}`. Seeds the `gold-export-scheduler` service identity at API boot, so the nightly schedule authenticates. Generate your own | unset | No |
 | `GOLD_MART_NAME` / `GOLD_EXPORT_ROW_COUNT` | Mart name and row count the Gold export acceptance test seeds | `gold_export_smoke` / `7` | No |
 
-Debezium Server's image (`ghcr.io/memiiso/debezium-server-iceberg`) is
-pinned by digest in `docker-compose.yml`, not by an env var — see the
-service definition's comment and R4 in the risk register for why (no
-versioned tag is published upstream). Its config
-(`ops/debezium/application.properties.tmpl`) is rendered from the
-connector-registry (ADR 0007), not from top-level env vars.
+Change capture (`SRC-4`, ADR 0016) runs on Kafka Connect: the `cdc` profile's
+`kafka` and `kafka-connect` images are pinned by digest in `docker-compose.yml`,
+and the API and the applier find them through `KAFKA_CONNECT_URL` and
+`CDC_KAFKA_BOOTSTRAP` (both empty by default, which turns change capture off;
+see `docs/OPERATIONS.md`).
 
 ## Status / Known limitations
 
@@ -498,7 +497,7 @@ issue about any of the following — they're known, not bugs:
   "openfga"`, not `"allow-all"`.** `docker compose up` now brings up
   OpenFGA and a mock OIDC issuer (`ops/oidc-mock`) alongside Lakekeeper,
   and every writer this repo's own tests exercise (the Rust `g1-lakekeeper`
-  test path, `debezium-server`, the dlt pipeline) authenticates as a
+  test path, the dlt pipeline) authenticates as a
   granted principal — see `docs/adr/0011-lakekeeper-authorization.md` for
   the model, the grants, and the default-posture decision. **What is still
   open:** ClickHouse's `CREATE TABLE` through the catalog does not work on

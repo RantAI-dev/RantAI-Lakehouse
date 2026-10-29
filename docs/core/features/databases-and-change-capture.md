@@ -32,19 +32,28 @@ at `f3a3196` and three of its "Today" cells have moved since:
 
 Live change capture:
 
-- **One change-capture pipeline exists, and it is fixed in the deployment.**
-  A single Debezium Server (`docker-compose.yml`, service `debezium-server`)
-  reads one hand-written PostgreSQL table (`p5_cdc.orders`) and writes it to
-  Iceberg. A user who creates a "PostgreSQL CDC" connector in the console
-  gets a row in the registry and a rendered settings file, but nothing
-  starts reading their database: ADR 0007 chose "no dynamic per-connector
-  provisioning". Debezium Server runs one source per process.
+- **PostgreSQL change capture runs per connector** (`SRC-4` slice 2, ADR 0016).
+  Saving a "PostgreSQL CDC" connector's ingest spec creates a Debezium connector
+  in one shared Kafka Connect worker; a Dagster job (`cdc_apply_job`, started by
+  a 30-second sensor) writes its topics to Bronze. It needs the `cdc` profile and
+  `KAFKA_CONNECT_URL` and `CDC_KAFKA_BOOTSTRAP` to be set; without them the
+  connector answers "not supported on this deployment". The two services cost
+  about 1.2 GiB. Freshness measured in slice 0: p95 18 to 40 s, 108,000 changes
+  caught up in 60 to 105 s (`docs/plans/SRC-4-RESULT.md`).
+- **Load modes for change capture are two**: "Current row per key" (the default)
+  and "Keep history"; both need a primary key. A deleted row is removed in the
+  first and kept as an event (`_op` = `d`) in the second.
+- **Topics are not removed when a connector is deleted**; the broker's 7-day
+  retention removes them. A change older than 7 days that the applier has not
+  read is lost.
+- **`date` and `timestamp` (without time zone) columns arrive as integers**
+  (Debezium's temporal types) and their Bronze column is an integer.
+- **Oracle, SQL Server, MySQL and MongoDB capture are added by their own slices**;
+  until then their connector types are listed as not supported, as below.
 - **MySQL CDC and SQL Server CDC are listed as not supported** since
   `SRC-9` decision 8 (migration `0066`): their settings could not run.
   Oracle CDC is refused by the API. MongoDB CDC has no type; the MongoDB
   test database is a single server, and change streams need a replica set.
-- **Deletes are kept as rows marked `__deleted`**, and the `SRC-10` load
-  modes (current row per key, or history) do not apply to change capture.
 - **No lag in time is measured.** A job measures the PostgreSQL slot's
   retained bytes, for the deployment's own database only; `health.rs` says
   plainly that bytes cannot be turned into seconds honestly.

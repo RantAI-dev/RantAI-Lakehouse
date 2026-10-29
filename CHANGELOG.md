@@ -9,6 +9,10 @@ once a first release is tagged.
 
 ## [Unreleased]
 
+### Changed
+
+- PostgreSQL change capture runs per connector on Kafka Connect (backlog `SRC-4`, slice 2; ADR 0016; plan `docs/superpowers/plans/2026-10-29-src-4-databases-cdc.md`). The fixed `debezium-server` demo pipeline is removed (service, sidecar, volume, Lakekeeper `debezium` principal and token, `ops/debezium/`, the `p5_cdc` seed and `GET /api/connectors/{id}/debezium-properties`); `kafka` and `kafka-connect` are new under the `cdc` profile, with no published ports. Off unless `KAFKA_CONNECT_URL` and `CDC_KAFKA_BOOTSTRAP` are set. A change-capture connector has two load modes (current row per key, history), a person can pause and resume it (`POST /api/connectors/{id}/pause`), and its state shows in fixed words (`GET /api/connectors/{id}/change-capture`). The source password never enters Kafka Connect's config: the API writes it to a memory-only volume and the connector names the file. **Limits:** topics are kept 7 days and not deleted with the connector; `date` and `timestamp` columns arrive as integers. `.env.staging`: the comment above `LAKEKEEPER_CATALOG_URI` no longer names `debezium-server`; no value changed.
+
 ### Security
 
 - `DESCRIBE`, `DESC` and `SHOW COLUMNS FROM <table>` are tenant-gated like a `SELECT` (backlog `SEC-20`): the table they name must be the caller's to read, and a table that is not answers the same 404 sentence a refused `SELECT` gets, "Table not found or not available to your organisation"; nothing reaches the engine. A deployment with one tenant, a principal with every permission (`*:*`) and the catalog's own tenant behave as before.
