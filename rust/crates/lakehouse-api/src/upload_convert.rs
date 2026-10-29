@@ -190,6 +190,16 @@ pub const MAX_OUTPUT_BYTES: u64 = crate::upload_parquet::MAX_OUTPUT_BYTES as u64
 /// the backstop for a caller that is not the API.
 pub const MAX_INPUT_BYTES: u64 = 64 * 1024 * 1024;
 
+/// The most the answer line may be, in bytes: 1 MiB.
+///
+/// The answer is one JSON line, and it says what the file holds: a workbook
+/// with many sheets and long names makes it long. It must not be read
+/// without a bound, because the API holds it, parses a second copy of it and
+/// stores it — which is the memory failure `SEC-22` exists to stop
+/// (`PR #187` review BLOCKER 4). An answer over the cap is refused as a
+/// resource limit, and the child is killed with it.
+pub const MAX_ANSWER_BYTES: usize = 1024 * 1024;
+
 /// The most bytes the child is fed at a time: 8 MiB, the piece size the
 /// chunked upload uses (`SEC-22` D1b). The API never holds the whole file.
 pub const FEED_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
@@ -1502,12 +1512,27 @@ impl ConversionRunner {
         });
         let mut stdout = BufReader::new(stdout);
         let mut line = Vec::new();
-        let read = stdout
-            .read_until(b'\n', &mut line)
-            .await
-            .map_err(|_err| ConversionError::Refused(Refusal::ResourceLimit))?;
+        // The answer is read through a cap: it is one JSON line, and a child
+        // that writes an endless one must not fill the API's memory
+        // (`PR #187` review BLOCKER 4).
+        let read = {
+            let mut limited =
+                (&mut stdout).take(u64::try_from(MAX_ANSWER_BYTES).unwrap_or(u64::MAX) + 1);
+            limited.read_until(b'\n', &mut line).await
+        };
+        let read = read.map_err(|_err| ConversionError::Refused(Refusal::ResourceLimit))?;
         if read == 0 {
             // The child said nothing: it died before its answer.
+            return Err(ConversionError::ResourceLimit);
+        }
+        if !answer_line_fits(&line) {
+            // The answer is over the cap, or the child stopped before the
+            // line was finished. The child is killed with this request
+            // (`kill_on_drop`), and the answer is a resource limit.
+            tracing::warn!(
+                bytes = line.len(),
+                "the answer of the child that reads an uploaded file is over its cap"
+            );
             return Err(ConversionError::ResourceLimit);
         }
         let answer: Answer = serde_json::from_slice(&line)
@@ -1675,6 +1700,22 @@ fn is_our_binary(binary: &Path) -> bool {
     binary
         .file_stem()
         .is_some_and(|stem| stem == "lakehouse-api")
+}
+
+/// Whether the answer line fits its cap: it ends with a newline, and it is
+/// at most [`MAX_ANSWER_BYTES`] bytes of content.
+///
+/// A line that does not end with a newline is a child that stopped in the
+/// middle of it, or a line that is over the cap: the caller cannot tell the
+/// two apart, and answers both the same way.
+fn answer_line_fits(line: &[u8]) -> bool {
+    let Some(last) = line.last() else {
+        return false;
+    };
+    if *last != b'\n' {
+        return false;
+    }
+    line.len() - 1 <= MAX_ANSWER_BYTES
 }
 
 #[cfg(test)]

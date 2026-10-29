@@ -7992,6 +7992,64 @@ fn dying_child() -> std::path::PathBuf {
     path
 }
 
+/// A stand-in for the child that writes an endless answer line: the API must
+/// stop reading at its cap instead of filling its memory
+/// (`PR #187` review BLOCKER 4).
+fn endless_child() -> std::path::PathBuf {
+    let dir = tempfile::tempdir().expect("a temporary directory for the stand-in child");
+    let path = dir.path().join("endless-child");
+    // The answer never ends: there is no newline in it, and the text after
+    // it is endless too.
+    std::fs::write(
+        &path,
+        "#!/bin/sh\n\
+         printf '{\"kind\":\"sheet\",\"sheet\":\"Stock\"'\n\
+         head -c 4000000 /dev/zero | tr '\\0' 'x'\n",
+    )
+    .expect("the stand-in child is written");
+    let mut permissions = std::fs::metadata(&path)
+        .expect("the stand-in child exists")
+        .permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        permissions.set_mode(0o755);
+    }
+    std::fs::set_permissions(&path, permissions).expect("the stand-in child is executable");
+    // The directory is removed when it goes out of scope; the child has
+    // already been read by then, and the API starts it by path.
+    std::mem::forget(dir);
+    path
+}
+
+#[tokio::test]
+async fn an_endless_answer_line_is_refused_and_the_api_is_still_there() {
+    let stack = Stack::with(Options {
+        conversion_child: Some(endless_child()),
+        ..Options::default()
+    })
+    .await;
+    let bayu = stack.bayu().await;
+    let reply = stack
+        .send(
+            &bayu,
+            "POST",
+            "/api/uploads",
+            file_form(
+                "stock.xlsx",
+                "application/octet-stream",
+                &workbook("stock.xlsx"),
+            ),
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.text);
+    assert_eq!(reply.json["error"], NEEDS_MORE_MEMORY, "{}", reply.text);
+
+    // The API is still there: the next request answers normally.
+    let upload = stack.upload(&bayu, "a.csv", b"a,b\n1,2\n").await;
+    assert_eq!(upload["status"], "uploaded");
+}
+
 #[tokio::test]
 async fn a_child_killed_mid_stream_leaves_no_converted_text() {
     let stack = Stack::with(Options {
