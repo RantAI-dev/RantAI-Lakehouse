@@ -639,3 +639,13 @@ no cargo or docker on this VM): CI is the evidence.
   should say it can be revoked by hand. Add one sentence with SHOULD-FIX 2.
 - **Note.** `Config::oracle_cdc_logminer_enabled` read by nothing: slice 6
   decides, as the handoff says.
+
+### Slice 2, review round 2 (planner, 2026-10-29, head `803735c0`): closed
+
+SHOULD-FIX 1: `INGEST_ALLOW_INTERNAL_HOSTS` dropped from the g4 override; the
+gate passes without it, so production (which never sets it) needs it no more
+than the gate does. SHOULD-FIX 2: `replication_metrics.py` and `config.rs`
+name only code that exists; `OPERATIONS.md` says the leftover Lakekeeper
+`debezium` principal and grant can be revoked by hand. Checked by the planner:
+CI run on `803735c0` success, 34 of 34 jobs (G4 change capture into Bronze
+among them), Security 5 of 5. No open `BLOCKER`. Slice 2 is closed.
