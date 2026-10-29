@@ -2275,6 +2275,7 @@ async fn parquet_preview(
     let group = footer
         .group
         .filter(|group| group.len <= state.conversion_runner.parquet_group_bytes());
+    let mut cut_text = false;
     let csv = match group {
         Some(group) => {
             let parts = vec![
@@ -2285,7 +2286,11 @@ async fn parquet_preview(
                 },
             ];
             let source = file.source(parts);
-            let (_answer, text) = state
+            // The API reads at most the sample's worth of text: a Parquet
+            // file may hold 512 MiB of it, and the API must not hold that
+            // (`PR #187` review SHOULD-FIX 6). A child that writes more is
+            // killed, and the preview says the text is cut.
+            let read = state
                 .conversion_runner
                 .answer_with_text(
                     Operation::PreviewParquet {
@@ -2295,15 +2300,17 @@ async fn parquet_preview(
                         group_len: group.len,
                     },
                     source,
+                    state.conversion_runner.text_limit(),
                 )
                 .await
                 .map_err(|err| conversion_error(FileKind::Parquet, err))?;
-            text
+            cut_text = read.cut;
+            read.text
         }
         // The first row group is over the bound: the columns and no rows.
         None => parquet_header(&info),
     };
-    let cut = info.rows > u64::try_from(PARQUET_PREVIEW_ROWS).unwrap_or(u64::MAX);
+    let cut = cut_text || info.rows > u64::try_from(PARQUET_PREVIEW_ROWS).unwrap_or(u64::MAX);
     let overrides = Overrides {
         encoding: Some(Encoding::Utf8),
         delimiter: Some(','),

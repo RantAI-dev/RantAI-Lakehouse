@@ -153,6 +153,13 @@ pub const PARQUET_TAIL_BYTES: u64 = upload_parquet::MAX_FOOTER_BYTES + 8;
 /// ([`upload_parquet::MAX_PREVIEW_GROUP_BYTES`]).
 pub const PARQUET_GROUP_BYTES: u64 = upload_parquet::MAX_PREVIEW_GROUP_BYTES as u64;
 
+/// The most text the API reads from a child that converts: the sample's
+/// worth of it ([`crate::upload_types::SAMPLE_BYTES`]).
+///
+/// A Parquet file may hold 512 MiB of text, and the API must not hold that
+/// to show twenty rows of it (`PR #187` review SHOULD-FIX 6).
+pub const DEFAULT_TEXT_LIMIT: u64 = crate::upload_types::SAMPLE_BYTES as u64;
+
 /// The child's memory limit when nothing says otherwise: 896 MiB.
 ///
 /// `SEC-22` D7: the limit is the measured peak times 1.5, rounded up to
@@ -1020,6 +1027,15 @@ pub enum Source {
     },
 }
 
+/// What the child said, the text it produced, and whether the text is cut.
+pub struct ReadText {
+    /// The text, at most the limit the caller asked for.
+    pub text: Bytes,
+    /// Whether the child wrote more than the limit: the text is the start of
+    /// the whole, and the child was killed (`PR #187` review SHOULD-FIX 6).
+    pub cut: bool,
+}
+
 /// Why a conversion did not answer.
 ///
 /// Each is one answer, never a mixture: a busy installation says so, a
@@ -1069,6 +1085,8 @@ pub struct ConversionRunner {
     parquet_tail_bytes: u64,
     /// The most bytes of a Parquet file's first row group the child is given.
     parquet_group_bytes: u64,
+    /// The most text the API reads from a child that converts.
+    text_limit: u64,
     /// The wall-clock limit of one conversion.
     wall: Duration,
     /// How many children this process has started.
@@ -1107,6 +1125,7 @@ impl ConversionRunner {
             cpu_seconds: DEFAULT_CPU_SECONDS,
             parquet_tail_bytes: PARQUET_TAIL_BYTES,
             parquet_group_bytes: PARQUET_GROUP_BYTES,
+            text_limit: DEFAULT_TEXT_LIMIT,
             wall: CONVERSION_WALL,
             runs: Arc::new(AtomicU64::new(0)),
         }
@@ -1133,6 +1152,7 @@ impl ConversionRunner {
             cpu_seconds: self.cpu_seconds,
             parquet_tail_bytes: self.parquet_tail_bytes,
             parquet_group_bytes: self.parquet_group_bytes,
+            text_limit: self.text_limit,
             wall: self.wall,
             runs: Arc::clone(&self.runs),
         }
@@ -1156,6 +1176,7 @@ impl ConversionRunner {
             cpu_seconds: self.cpu_seconds,
             parquet_tail_bytes: self.parquet_tail_bytes,
             parquet_group_bytes: self.parquet_group_bytes,
+            text_limit: self.text_limit,
             wall: self.wall,
             runs: Arc::clone(&self.runs),
         }
@@ -1182,6 +1203,33 @@ impl ConversionRunner {
             cpu_seconds: self.cpu_seconds,
             parquet_tail_bytes: tail_bytes,
             parquet_group_bytes: group_bytes,
+            text_limit: self.text_limit,
+            wall: self.wall,
+            runs: Arc::clone(&self.runs),
+        }
+    }
+
+    /// The same runner, with another limit for the text it reads from a
+    /// child that converts.
+    ///
+    /// For the tests: the real limit is the sample's worth of text, and a
+    /// test that proves the text is cut must not write that much.
+    #[allow(
+        dead_code,
+        reason = "the route tests set a smaller limit for the text; the binary does not"
+    )]
+    #[must_use]
+    pub fn with_text_limit(&self, text_limit: u64) -> Self {
+        Self {
+            binary: self.binary.clone(),
+            check_binary: self.check_binary,
+            slots: Arc::clone(&self.slots),
+            memory_mib: self.memory_mib,
+            max_output_bytes: self.max_output_bytes,
+            cpu_seconds: self.cpu_seconds,
+            parquet_tail_bytes: self.parquet_tail_bytes,
+            parquet_group_bytes: self.parquet_group_bytes,
+            text_limit,
             wall: self.wall,
             runs: Arc::clone(&self.runs),
         }
@@ -1203,6 +1251,7 @@ impl ConversionRunner {
             cpu_seconds: self.cpu_seconds,
             parquet_tail_bytes: self.parquet_tail_bytes,
             parquet_group_bytes: self.parquet_group_bytes,
+            text_limit: self.text_limit,
             wall,
             runs: Arc::clone(&self.runs),
         }
@@ -1231,6 +1280,14 @@ impl ConversionRunner {
     #[must_use]
     pub fn parquet_group_bytes(&self) -> u64 {
         self.parquet_group_bytes
+    }
+
+    /// How much text the API reads from a child that converts
+    /// (`PR #187` review SHOULD-FIX 6). A child that writes more is killed,
+    /// and the answer says the text is cut.
+    #[must_use]
+    pub fn text_limit(&self) -> u64 {
+        self.text_limit
     }
 
     /// Take a place, or `None` when every slot is taken.
@@ -1308,8 +1365,13 @@ impl ConversionRunner {
     }
 
     /// Run the operation on the file and answer with what the child said and
-    /// the text it produced. The text is read into memory, so this is for
-    /// the small ones: a Parquet preview.
+    /// the text it produced, at most `limit` bytes of text.
+    ///
+    /// The text is read into memory, so this is for the small ones: a
+    /// Parquet preview. The limit is the caller's: a Parquet file may hold
+    /// 512 MiB of text, and the API must not hold that
+    /// (`PR #187` review SHOULD-FIX 6). A child that writes more is killed,
+    /// and the answer says the text is cut.
     ///
     /// # Errors
     ///
@@ -1318,12 +1380,13 @@ impl ConversionRunner {
         &self,
         operation: Operation,
         source: Source,
-    ) -> Result<(Answer, Bytes), ConversionError> {
+        limit: u64,
+    ) -> Result<ReadText, ConversionError> {
         let Some(_slot) = self.try_slot() else {
             return Err(ConversionError::Busy);
         };
         let deadline = tokio::time::Instant::now() + self.wall;
-        Box::pin(self.text_inner(operation, source, deadline)).await
+        Box::pin(self.text_inner(operation, source, deadline, limit)).await
     }
 
     async fn text_inner(
@@ -1331,11 +1394,14 @@ impl ConversionRunner {
         operation: Operation,
         source: Source,
         deadline: tokio::time::Instant,
-    ) -> Result<(Answer, Bytes), ConversionError> {
+        limit: u64,
+    ) -> Result<ReadText, ConversionError> {
+        // The child is killed when it writes more text than the caller
+        // reads, so it is `mut` from here on.
         let started = self.start(&operation, source, deadline).await?;
         let Started {
             answer,
-            child,
+            mut child,
             mut stdout,
             stderr,
             feed,
@@ -1346,6 +1412,7 @@ impl ConversionRunner {
         }
         let mut text = Vec::new();
         let mut piece = [0_u8; 16 * 1024];
+        let mut cut = false;
         let read_to_the_end = async {
             loop {
                 let read = stdout
@@ -1356,8 +1423,14 @@ impl ConversionRunner {
                     break;
                 }
                 text.extend_from_slice(&piece[..read]);
-                if u64::try_from(text.len()).unwrap_or(u64::MAX) > MAX_OUTPUT_BYTES {
-                    return Err(ConversionError::Refused(Refusal::TooMuchText));
+                if u64::try_from(text.len()).unwrap_or(u64::MAX) >= limit {
+                    // The child wrote more than the caller reads: the rest
+                    // of it is of no use, and the child is killed
+                    // (`PR #187` review SHOULD-FIX 6). The text stops AT
+                    // the limit, not past it.
+                    text.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+                    cut = true;
+                    break;
                 }
             }
             Ok::<(), ConversionError>(())
@@ -1373,8 +1446,19 @@ impl ConversionRunner {
                 return Err(ConversionError::ResourceLimit);
             }
         }
-        self.wait(child, stderr, feed, deadline).await?;
-        Ok((answer, Bytes::from(text)))
+        let ending = if cut {
+            let _killed = child.start_kill();
+            self.wait(child, stderr, feed, deadline).await
+        } else {
+            self.wait(child, stderr, feed, deadline).await
+        };
+        if !cut {
+            ending?;
+        }
+        Ok(ReadText {
+            text: Bytes::from(text),
+            cut,
+        })
     }
 
     /// Run the operation on the file and store the text it produced at

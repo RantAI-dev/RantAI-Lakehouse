@@ -600,6 +600,9 @@ struct Options {
     /// bytes of the file's end, and the bytes of its first row group. The
     /// real ones are 16 MiB and 64 MiB, and no test writes those.
     conversion_parquet_limits: Option<(u64, u64)>,
+    /// `PR #187` review SHOULD-FIX 6: the most text the API reads from a
+    /// child that converts. The real one is 16 MiB, and no test writes that.
+    conversion_text_limit: Option<u64>,
 }
 
 impl Default for Options {
@@ -612,6 +615,7 @@ impl Default for Options {
             conversion_child: None,
             conversion_output_cap: None,
             conversion_parquet_limits: None,
+            conversion_text_limit: None,
         }
     }
 }
@@ -716,6 +720,7 @@ impl Stack {
         let child = options.conversion_child.clone();
         let output_cap = options.conversion_output_cap;
         let parquet_limits = options.conversion_parquet_limits;
+        let text_limit = options.conversion_text_limit;
         let (app, state) = spin_up_with_state(&env, |state| {
             // `SEC-22`: the runner may start another child, and the child may
             // have a smaller cap than the real one.
@@ -727,6 +732,9 @@ impl Stack {
             }
             if let Some((tail, group)) = parquet_limits {
                 state.conversion_runner = state.conversion_runner.with_parquet_limits(tail, group);
+            }
+            if let Some(limit) = text_limit {
+                state.conversion_runner = state.conversion_runner.with_text_limit(limit);
             }
         })
         .await;
@@ -8317,6 +8325,38 @@ async fn a_parquet_preview_reads_the_file_through_the_child() {
         stack.state.conversion_runner.runs(),
         3,
         "the upload read the footer, and the preview read the footer and the rows"
+    );
+}
+
+#[tokio::test]
+async fn a_parquet_preview_reads_only_the_sample_of_the_text() {
+    // `PR #187` review SHOULD-FIX 6: a Parquet file may hold 512 MiB of
+    // text, and the API must not hold it to show twenty rows. The limit is
+    // small here, so the test writes no megabytes.
+    let stack = Stack::with(Options {
+        conversion_text_limit: Some(64),
+        ..Options::default()
+    })
+    .await;
+    let bayu = stack.bayu().await;
+    let upload = stack
+        .upload(&bayu, "orders.parquet", &parquet_file("orders.parquet"))
+        .await;
+    let id = id_of(&upload);
+    let reply = stack
+        .get(&bayu, &format!("/api/uploads/{id}/preview"))
+        .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text);
+    assert_eq!(
+        reply.json["columns"],
+        json!(["sku", "name", "qty", "price", "received"])
+    );
+    assert_eq!(reply.json["truncated"], true, "{}", reply.text);
+    assert_eq!(
+        reply.json["rows"],
+        json!([]),
+        "the text was cut before the first row: {}",
+        reply.text
     );
 }
 
