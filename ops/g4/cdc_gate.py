@@ -514,6 +514,27 @@ def step_connector_holds_no_password(connector_id: str) -> None:
     print("[g4] the connector's Kafka Connect config holds only a file reference; the file holds the password", flush=True)
 
 
+def _config_entries(node) -> dict[str, str]:
+    """Every (name, value) config pair found in a `describe_configs` answer, whatever shape the
+    installed kafka-python gives it (a dict with `config_names`/`config_name` and `config_value`,
+    a tuple `(name, value, ...)` of the wire format, or an object with `.resources`)."""
+    found: dict[str, str] = {}
+    if isinstance(node, dict):
+        name = node.get("config_names", node.get("config_name"))
+        if isinstance(name, str) and "config_value" in node:
+            found[name] = node["config_value"]
+        for value in node.values():
+            found.update(_config_entries(value))
+    elif hasattr(node, "resources") and not isinstance(node, (list, tuple)):
+        found.update(_config_entries(node.resources))
+    elif isinstance(node, (list, tuple)):
+        if len(node) >= 2 and isinstance(node[0], str) and (node[1] is None or isinstance(node[1], str)) and "." in node[0]:
+            found[node[0]] = node[1]
+        for item in node:
+            found.update(_config_entries(item))
+    return found
+
+
 def step_schema_history_never_expires(connector_id: str) -> None:
     """`SRC-4` decision S3-d: a `MySQL` or `SQL Server` connector keeps its schema history in the
     topic `cdc.<id>.schema-history`. Debezium creates it with unlimited retention; if the broker's
@@ -529,14 +550,11 @@ def step_schema_history_never_expires(connector_id: str) -> None:
             if topic not in admin.list_topics():
                 raise G4Failure(f"the schema-history topic {topic} does not exist yet")
             answer = admin.describe_configs([ConfigResource(ConfigResourceType.TOPIC, topic)])
-            # kafka-python returns one response, or a list of them, by version.
-            if isinstance(answer, list):
-                answer = answer[0]
-            entries = {}
-            for resource in answer.resources:
-                # (error_code, error_message, resource_type, resource_name, config_entries)
-                for entry in resource[4]:
-                    entries[entry[0]] = entry[1]
+            # kafka-python returns a response object, a list of them or plain dicts, by version:
+            # walk whatever came back for config entries (a name and a value).
+            entries = _config_entries(answer)
+            if not entries:
+                raise G4Failure(f"no config entries in the answer for {topic}: {str(answer)[:300]}")
             return entries
 
         entries = _wait_for(f"the schema-history topic {topic} exists", check, 120, interval_s=5)
