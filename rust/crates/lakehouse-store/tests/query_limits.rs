@@ -18,7 +18,7 @@ static MIGRATOR: Migrator = sqlx::migrate!("../../migrations");
 
 /// The version of the migration that moves the Query Studio row default
 /// from 2,000 to 64,000 (`QS-2`).
-const STUDIO_ROWS_MIGRATION: i64 = 115;
+const STUDIO_ROWS_MIGRATION: i64 = 116;
 
 async fn role_id(pool: &PgPool, name: &str) -> Uuid {
     sqlx::query_scalar("SELECT id FROM role WHERE name = $1")

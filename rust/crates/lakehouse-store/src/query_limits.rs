@@ -26,7 +26,7 @@ pub struct QueryLimits {
 
 impl Default for QueryLimits {
     /// The feature page's defaults (decisions 1 and 2): the column defaults
-    /// of migration `0101`, with the Query Studio rows from migration `0115`.
+    /// of migration `0101`, with the Query Studio rows from migration `0116`.
     fn default() -> Self {
         Self {
             timeout_seconds: 60,

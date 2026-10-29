@@ -612,11 +612,11 @@ mod tests {
                 "{column} {value}"
             );
         }
-        // The Query Studio rows moved in migration `0115`, so their column
+        // The Query Studio rows moved in migration `0116`, so their column
         // default is set there and not in `0101`.
-        let migration_0115 = include_str!("../../../migrations/0115_query_studio_rows_default.sql");
+        let migration_0116 = include_str!("../../../migrations/0116_query_studio_rows_default.sql");
         assert!(
-            migration_0115.contains(&format!(
+            migration_0116.contains(&format!(
                 "ALTER COLUMN studio_rows SET DEFAULT {}",
                 d.studio_rows
             )),

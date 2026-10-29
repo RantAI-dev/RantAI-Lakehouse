@@ -31,7 +31,7 @@ use common::{
 };
 
 /// What the browser is handed: the install's Query Studio row limit
-/// (`QueryLimits::studio_rows`), which migration `0115` set to 64,000.
+/// (`QueryLimits::studio_rows`), which migration `0116` set to 64,000.
 const ROWS_KEPT: usize = 64_000;
 
 /// The table the huge result is read from. A table function such as

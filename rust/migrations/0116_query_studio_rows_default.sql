@@ -23,9 +23,9 @@
 -- default rather than a choice. An administrator who wants another number
 -- sets it again in Admin > Settings > Query limits.
 --
--- Number choice: 0115, the next free number above every number taken on
--- `main` (0112) and above the numbers the open PR #250 holds (0103, 0113
--- and 0114); a gap costs nothing.
+-- Number choice: 0116, the next free number above every number taken on
+-- `main` (0112) and above the numbers the open pull requests hold (0103,
+-- 0113, 0114 and 0115); a gap costs nothing.
 ALTER TABLE query_limits
     ALTER COLUMN studio_rows SET DEFAULT 64000;
 
