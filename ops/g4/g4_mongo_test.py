@@ -1,0 +1,458 @@
+#!/usr/bin/env python3
+"""G4 acceptance test for MongoDB change capture (`SRC-4` slice 5, plan task T5.7; ADR 0016).
+
+It proves the same things as the other change-capture gates (`cdc_gate.py`): the connector is
+created through the API, 20,000 documents per collection are copied, each kind of change is
+visible within 120 s in both load modes, a pause and a restart of `kafka-connect` lose nothing, a
+new field is observed as a schema change, and `DELETE` removes the connector and its password
+file. It reuses the shared module's low-level parts (the API session, the sign-in, waiting,
+ClickHouse, the credential file, the discovery poll, the first copy, the restart handshake, the
+password check, the schema change and the delete) and has its own orchestration and comparison,
+because MongoDB differs where those parts are SQL-shaped:
+
+- A source object is a bare collection name, not `schema.table`, and its key is `_id`.
+- The documents carry `_id` = an `ObjectId` made from the number `n` (`ObjectId(f"{n:024x}")`)
+  AND an integer field `id` = `n`. The `ObjectId` proves the real conversion (Debezium's key and
+  value to the hex text the batch adapter stores); `id` lets the shared first-copy step and the
+  freshness checks read Bronze as they read every other source.
+- A MongoDB delete event carries the key only, no old document (the SQL sources send the old
+  row). So the history table's delete rows have `_id` and nothing else, and the expected events of
+  a delete are `(id, 'd', '')`, found by decoding `_id`.
+- The connection test runs in the orchestrator (the API has no MongoDB client): `POST .../test`
+  answers pending and the gate polls `GET .../discovery/test`.
+
+# The source
+
+`mongo-cdc-g4` (`ops/g4/docker-compose.g4-mongo.override.yml`): `mongo:7` as a one-member replica
+set with authentication, started by the override; `mongo-cdc-g4-init` runs `rs.initiate` and
+waits until the member is primary. The database `g4_cdc` has the collections `orders` and
+`orders_history`. The connector dials as a LEAST-PRIVILEGE user: the built-in `read` role on
+`g4_cdc` and nothing else (decision S5-h; the renderer sets `capture.scope=database`, whose
+documented requirement is read access to that database). TLS is `disable`: the fixture has no
+certificate, and the four modes are covered by the renderer's unit tests.
+"""
+
+from __future__ import annotations
+
+import collections
+import datetime
+import decimal
+import os
+import sys
+import threading
+import time
+
+import requests
+
+import cdc_gate as g
+import gate_summary
+from cdc_gate import G4Failure
+
+DATABASE = "g4_cdc"
+HOST = "mongo-cdc-g4"
+PORT = 27017
+REPLICA_SET = "rs0"
+CDC_USER = "g4_cdc"
+DISCOVER_FIELDS = {"_id", "id", "customer", "amount", "status", "updated_at"}
+
+
+def oid(n: int):
+    """The `ObjectId` of document number `n`: 24 hex digits, the number in the low ones."""
+    from bson import ObjectId
+
+    return ObjectId(f"{n:024x}")
+
+
+def number_of(hex_id: str) -> int:
+    """The inverse of `oid`, for a Bronze `_id` (the hex text)."""
+    return int(hex_id, 16)
+
+
+def document(n: int, customer: str, status: str, amount: float) -> dict:
+    return {
+        "_id": oid(n), "id": n, "customer": customer, "amount": amount, "status": status,
+        "updated_at": datetime.datetime.now(datetime.timezone.utc),
+    }
+
+
+def _client():
+    from pymongo import MongoClient
+
+    return MongoClient(
+        host=HOST, port=PORT, username=os.environ["MONGO_CDC_G4_ROOT_USER"],
+        password=os.environ["MONGO_CDC_G4_ROOT_PASSWORD"], authSource="admin",
+        serverSelectionTimeoutMS=10_000,
+    )
+
+
+class MongoSource(g.Source):
+    cdc_type = "MongoDB CDC"
+    gate = "g4-mongo"
+    catalog_db = "icecat_g4_mongo"
+    schema = DATABASE
+    host_for_registry = f"{HOST}:{PORT}"
+
+    def __init__(self) -> None:
+        self.password = os.environ["CONNECTOR_MONGO_CDC_PASSWORD"]
+        self.client = _client()
+
+    def coll(self, table: str):
+        return self.client[DATABASE][table]
+
+    def ping(self) -> None:
+        # The member must be PRIMARY, not just up: the init service may still be initiating.
+        hello = self.client.admin.command("hello")
+        if not hello.get("isWritablePrimary"):
+            raise G4Failure("the replica set has no primary yet")
+
+    def dial(self) -> dict:
+        return {
+            "driver": "mongodb", "hosts": [f"{HOST}:{PORT}"], "database": DATABASE,
+            "user": CDC_USER, "replicaSet": REPLICA_SET, "sslMode": "disable",
+        }
+
+    def object_name(self, mode: str) -> str:
+        return g.TABLES[mode]  # the bare collection name, as discovery lists it
+
+    def setup(self) -> None:
+        self.client.drop_database(DATABASE)
+        for table in g.TABLES.values():
+            collection = self.coll(table)
+            for lo in range(1, g.SEED_ROWS + 1, 5000):
+                collection.insert_many(
+                    [document(n, f"seed_{n}", "seed", (n % 1000) + 0.5) for n in range(lo, min(lo + 5000, g.SEED_ROWS + 1))]
+                )
+        admin_db = self.client["admin"]
+        if admin_db.command("usersInfo", CDC_USER)["users"]:
+            admin_db.command("dropUser", CDC_USER)
+        # The least-privilege user (decision S5-h): the built-in `read` role on the one database.
+        admin_db.command("createUser", CDC_USER, pwd=self.password, roles=[{"role": "read", "db": DATABASE}])
+
+    def add_column_and_observe(self) -> None:
+        # A new field in one document is a new column: MongoDB has no schema to alter.
+        self.coll("orders").update_one({"id": 2}, {"$set": {"note": "schema_note"}})
+
+    # ── source changes: the same change on both collections ─────────────────────────────
+    def each(self, action) -> None:
+        for table in g.TABLES.values():
+            action(self.coll(table))
+
+
+# What the history collection must hold: (id, op, customer). A delete has customer '' (no old document).
+EXPECTED: collections.Counter = collections.Counter()
+
+
+def _expect(ids, op: str, customer) -> None:
+    for i in ids:
+        EXPECTED[(i, op, customer(i) if callable(customer) else customer)] += 1
+
+
+def src() -> MongoSource:
+    return g.SOURCE  # type: ignore[return-value]
+
+
+# ── comparison ──────────────────────────────────────────────────────────────────────────
+
+
+def _current_diff() -> str | None:
+    source = sorted(
+        (d["id"], d["customer"], decimal.Decimal(str(d["amount"])), d["status"])
+        for d in src().coll(g.TABLES["current"]).find({}, {"id": 1, "customer": 1, "amount": 1, "status": 1})
+    )
+    found = sorted(
+        (int(r[0]), r[1], decimal.Decimal(r[2]), r[3])
+        for r in g.ch_rows(f"SELECT id, customer, amount, status FROM {g.bronze('current')} WHERE id > 0")
+    )
+    ids = [r[0] for r in found]
+    duplicated = len(ids) - len(set(ids))
+    missing = {r[0] for r in source} - set(ids)
+    extra = set(ids) - {r[0] for r in source}
+    different = len({r for r in set(source) - set(found) if r[0] in set(ids)})
+    if not (missing or extra or duplicated or different) and len(source) == len(found):
+        return None
+    return (
+        f"current: source {len(source)} documents, Bronze {len(found)}; missing {len(missing)}, extra {len(extra)}, "
+        f"duplicated {duplicated}, different {different}"
+    )
+
+
+def _history_found() -> collections.Counter:
+    found: collections.Counter = collections.Counter()
+    for _id, op, customer in g.ch_rows(
+        f"SELECT `_id`, `_op`, coalesce(customer, '') FROM {g.bronze('history')} WHERE `_op` != ''"
+    ):
+        found[(number_of(_id), op, customer)] += 1
+    return found
+
+
+def _history_diff() -> str | None:
+    found = _history_found()
+    missing, extra = EXPECTED - found, found - EXPECTED
+    if not missing and not extra:
+        return None
+    return (
+        f"history: expected {sum(EXPECTED.values())} events, Bronze {sum(found.values())}; "
+        f"missing {sum(missing.values())} (e.g. {list(missing)[:3]}), twice or unexpected {sum(extra.values())} (e.g. {list(extra)[:3]})"
+    )
+
+
+def _wait_equal(label: str, timeout_s: float) -> None:
+    def check():
+        problems = [d for d in (_current_diff(), _history_diff()) if d]
+        if problems:
+            raise G4Failure("; ".join(problems))
+        return True
+
+    g._wait_for(f"Bronze equals the source ({label})", check, timeout_s, interval_s=10)
+
+
+def step_ids_are_the_object_id_text() -> None:
+    """The real conversion, end to end: every Bronze `_id` is the lower-case 24-digit hex text of
+    the `ObjectId` the source holds (here made from `id`), in both collections."""
+    for mode in g.MODES:
+        wrong = g.ch_rows(
+            f"SELECT `_id`, id FROM {g.bronze(mode)} WHERE id > 0 "
+            "AND `_id` != lower(leftPad(hex(id), 24, '0')) LIMIT 5"
+        )
+        if wrong:
+            raise G4Failure(f"the {mode} table holds _id values that are not the ObjectId hex text: {wrong}")
+    print("[g4] every Bronze _id is the ObjectId's hex text", flush=True)
+
+
+# ── registration, connect, discover ─────────────────────────────────────────────────────
+
+
+def _register(tenant_id: str) -> str:
+    created = g.API.post(
+        f"{g.API_URL}/api/connectors",
+        json={
+            "name": "g4-mongo-demo-cdc", "type": src().cdc_type, "direction": "source",
+            "host": src().host_for_registry, "credential": {"source": "file", "primary": "password"},
+            "environment": "production", "tenant": "g4", "tenantId": tenant_id, "residency": "", "capabilities": [],
+        },
+        timeout=10,
+    )
+    if not created.ok:
+        raise G4Failure(f"create the MongoDB CDC connector failed: {created.status_code} {created.text[:300]}")
+    body = created.json()
+    connector_id = body["id"]
+    derived = (body.get("credential") or {}).get("primary")
+    if not derived:
+        raise G4Failure("the create response carries no derived credential name")
+    g._write_credential_file(derived, src().password)
+    spec = g.API.put(
+        f"{g.API_URL}/api/connectors/{connector_id}/ingest-spec",
+        json={
+            "adapter": "cdc", "ingestMode": "cdc", "dial": src().dial(),
+            "sourceObjects": [
+                {"name": g.TABLES[m], "target": g.TARGETS[m], "loadMode": g.LOAD_MODES[m], "primaryKey": ["_id"]}
+                for m in g.MODES
+            ],
+        },
+        timeout=60,
+    )
+    if not spec.ok:
+        raise G4Failure(f"set the connector's ingest-spec failed: {spec.status_code} {spec.text[:300]}")
+    return connector_id
+
+
+def _check_connect(connector_id: str) -> None:
+    """`connect`: `POST .../test` is answered by the orchestrator (pending), and its job reports a
+    successful connection for the least-privilege user."""
+    if not g._expects_real("connect"):
+        return
+    try:
+        started = g.API.post(f"{g.API_URL}/api/connectors/{connector_id}/test", timeout=30)
+        if not started.ok or started.json().get("pending") is not True:
+            g._record("connect", "fail", f"POST .../test answered {started.status_code} {started.text[:200]}")
+            return
+        deadline = time.time() + 240
+        answer: dict = {"state": "running"}
+        while answer.get("state") == "running" and time.time() < deadline:
+            time.sleep(2)
+            polled = g.API.get(f"{g.API_URL}/api/connectors/{connector_id}/discovery/test", timeout=30)
+            if polled.ok:
+                answer = polled.json()
+    except (requests.RequestException, ValueError) as exc:
+        g._record("connect", "fail", f"the connection test did not answer cleanly ({type(exc).__name__})")
+        return
+    if answer.get("state") == "done" and isinstance(answer.get("latencyMs"), int):
+        g._record("connect", "pass", f"{answer['latencyMs']} ms, tested in the orchestrator")
+    else:
+        g._record("connect", "fail", f"expected state=done with a latency, got state={answer.get('state')!r} errorClass={answer.get('errorClass')!r}")
+
+
+def _check_discover(connector_id: str) -> None:
+    """`discover`: the database's collections are listed and the preview of one names its fields
+    and `_id` as the key."""
+    if not g._expects_real("discover"):
+        return
+    try:
+        listing = g._discovery(connector_id, "list", {})
+        preview = g._discovery(connector_id, "preview", {"object": g.TABLES["current"]})
+    except (requests.RequestException, ValueError, G4Failure) as exc:
+        g._record("discover", "fail", f"the discovery routes did not answer cleanly ({type(exc).__name__}: {str(exc)[:200]})")
+        return
+    listed = {o.get("name") for o in listing.get("objects") or []}
+    if listing.get("state") != "done" or not set(g.TABLES.values()) <= listed:
+        g._record("discover", "fail", f"expected both collections listed, got state={listing.get('state')!r} reason={listing.get('reason')!r} {sorted(listed)[:20]}")
+        return
+    found = {c.get("name") for c in preview.get("columns") or []}
+    if preview.get("state") != "done" or not DISCOVER_FIELDS <= found or preview.get("primaryKey") != ["_id"]:
+        g._record("discover", "fail", f"preview: state={preview.get('state')!r}, missing {sorted(DISCOVER_FIELDS - found)}, primaryKey={preview.get('primaryKey')!r}")
+        return
+    g._record("discover", "pass", f"{len(listed)} collections; {g.TABLES['current']} with {len(found)} fields, key _id")
+
+
+# ── changes ─────────────────────────────────────────────────────────────────────────────
+
+
+def _visible(mode: str, kind: str, row_id: int, marker: str) -> bool:
+    if mode == "current":
+        rows = g.ch_rows(f"SELECT customer FROM {g.bronze('current')} WHERE id = {row_id}")
+        return (not rows) if kind == "delete" else any(r[0] == marker for r in rows)
+    op = {"insert": "c", "update": "u", "delete": "d"}[kind]
+    if kind == "delete":
+        # The delete event has `_id` only.
+        n = g.ch_rows(f"SELECT count() FROM {g.bronze('history')} WHERE `_id` = '{oid(row_id)}' AND `_op` = 'd'")
+    else:
+        n = g.ch_rows(f"SELECT count() FROM {g.bronze('history')} WHERE id = {row_id} AND `_op` = '{op}' AND customer = '{marker}'")
+    return int(n[0][0]) > 0
+
+
+def step_changes_visible_within_budget() -> None:
+    new_id, upd_id, del_id = 900_001, 1, g.SEED_ROWS
+    changes = [
+        ("insert", new_id, "fresh_i", lambda c: c.insert_one(document(new_id, "fresh_i", "fresh", 5.0)), lambda: _expect([new_id], "c", "fresh_i")),
+        ("update", upd_id, "fresh_u", lambda c: c.update_one({"id": upd_id}, {"$set": {"customer": "fresh_u", "updated_at": _now()}}), lambda: _expect([upd_id], "u", "fresh_u")),
+        ("delete", del_id, "", lambda c: c.delete_one({"id": del_id}), lambda: _expect([del_id], "d", "")),
+    ]
+    latencies = []
+    try:
+        for kind, row_id, marker, action, events in changes:
+            t0 = time.time()
+            src().each(action)
+            events()
+            for mode in g.MODES:
+                g._wait_for(
+                    f"{kind} of id {row_id} in the {mode} collection",
+                    lambda m=mode, k=kind, i=row_id, mk=marker: True if _visible(m, k, i, mk) else None,
+                    g.FRESHNESS_BUDGET_SECONDS, interval_s=2,
+                )
+                latencies.append(f"{kind}/{mode} {time.time() - t0:.0f}s")
+    except G4Failure as exc:
+        g._record("reload", "fail", str(exc))
+        raise
+    g._record("reload", "pass", f"each kind of change visible within {g.FRESHNESS_BUDGET_SECONDS:.0f}s in both modes ({', '.join(latencies)})")
+
+
+def _now():
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def _bulk_changes() -> None:
+    """20,000 changes per collection: 10,000 updates, 5,000 deletes, 5,000 inserts."""
+    src().each(lambda c: c.update_many({"id": {"$gte": 1, "$lte": 10_000}}, {"$set": {"customer": "bulk_u", "updated_at": _now()}}))
+    _expect(range(1, 10_001), "u", "bulk_u")
+    src().each(lambda c: c.delete_many({"id": {"$gte": 10_001, "$lte": 15_000}}))
+    _expect(range(10_001, 15_001), "d", "")
+    src().each(lambda c: c.insert_many([document(n, "bulk_i", "bulk", 5.0) for n in range(100_001, 105_001)]))
+    _expect(range(100_001, 105_001), "c", "bulk_i")
+
+
+def step_pause_and_resume_lose_nothing(connector_id: str) -> None:
+    paused = g.API.post(f"{g.API_URL}/api/connectors/{connector_id}/pause", timeout=30)
+    if not paused.ok:
+        raise G4Failure(f"POST .../pause answered {paused.status_code} {paused.text[:200]}")
+    g._wait_capture_state(connector_id, "paused", 90)
+    _bulk_changes()
+    print("[g4] 20,000 changes per collection written while the connector is paused", flush=True)
+    resumed = g.API.post(f"{g.API_URL}/api/connectors/{connector_id}/resume", timeout=30)
+    if not resumed.ok:
+        raise G4Failure(f"POST .../resume answered {resumed.status_code} {resumed.text[:200]}")
+    g._wait_capture_state(connector_id, "running", 90)
+    _wait_equal("after a pause and a resume", g.CATCH_UP_TIMEOUT_SECONDS)
+
+
+def step_restart_kafka_connect_during_changes(connector_id: str) -> None:
+    """As `cdc_gate.step_restart_kafka_connect_during_changes`: the CI job restarts the worker
+    when the marker line is printed, and the writer keeps writing across the restart."""
+    if os.path.exists(g.RESTART_DONE_FILE):
+        os.remove(g.RESTART_DONE_FILE)
+    started = threading.Event()
+    errors: list[BaseException] = []
+
+    def writer() -> None:
+        try:
+            for k in range(18):
+                lo = 15_001 + 250 * k
+                hi = lo + 249
+                src().each(lambda c, lo=lo, hi=hi, k=k: c.update_many({"id": {"$gte": lo, "$lte": hi}}, {"$set": {"customer": f"stream_{k}", "updated_at": _now()}}))
+                _expect(range(lo, hi + 1), "u", f"stream_{k}")
+                if k == 4:
+                    started.set()
+                time.sleep(1.0)
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+            started.set()
+
+    thread = threading.Thread(target=writer, daemon=True)
+    thread.start()
+    started.wait(120)
+    print(g.RESTART_MARKER, flush=True)
+    g._wait_for("the CI job restarted kafka-connect", lambda: True if os.path.exists(g.RESTART_DONE_FILE) else None, g.RESTART_WAIT_SECONDS, interval_s=2)
+    thread.join()
+    if errors:
+        raise G4Failure(f"the change writer failed: {errors[0]}")
+    g._wait_capture_state(connector_id, "running", 240)
+    _wait_equal("after a restart of kafka-connect during a stream of changes", g.CATCH_UP_TIMEOUT_SECONDS)
+
+
+def main() -> int:
+    source = MongoSource()
+    g.SOURCE = source
+    try:
+        g.RECORDER = gate_summary.Recorder(gate_summary.Registry.load(), source.gate)
+        owner = g.RECORDER.registry.gate_of(source.cdc_type)
+        if owner != source.gate:
+            raise G4Failure(f"ops/gates/coverage.json gives {source.cdc_type!r} to gate {owner!r}, but {source.gate} runs it")
+        g.step_wait_for_services()
+        g.step_login()
+        source.setup()
+        for n in range(1, g.SEED_ROWS + 1):
+            EXPECTED[(n, "r", f"seed_{n}")] += 1
+        print(f"[g4] seeded {g.SEED_ROWS} documents into each of {', '.join(g.TABLES.values())}", flush=True)
+        g.step_create_catalog_database()
+        try:
+            connector_id = _register(g._ensure_gate_tenant())
+        except (G4Failure, requests.RequestException, KeyError, ValueError) as exc:
+            detail = f"could not register the demo CDC connector: {type(exc).__name__}: {exc}"
+            g._record("connect", "fail", detail)
+            g._record("discover", "fail", detail)
+            raise G4Failure("the demo connector could not be registered, so nothing below can run") from exc
+        _check_connect(connector_id)
+        _check_discover(connector_id)
+        g._wait_capture_state(connector_id, "running", 240)
+        g.step_connector_holds_no_password(connector_id)
+        g.step_first_copy_reached_bronze()
+        step_ids_are_the_object_id_text()
+        step_changes_visible_within_budget()
+        step_pause_and_resume_lose_nothing(connector_id)
+        step_restart_kafka_connect_during_changes(connector_id)
+        g.step_schema_change_is_observed(connector_id)
+        g.step_delete_removes_everything(connector_id)
+        failed = g.RECORDER.failures()
+        if failed:
+            raise G4Failure("connector gate steps failed: " + "; ".join(f"{t} {s}: {d}" for t, s, d in failed))
+    except G4Failure as exc:
+        print(f"[g4] FAILED: {exc}", file=sys.stderr, flush=True)
+        return 1
+    finally:
+        if g.RECORDER is not None:
+            g.RECORDER.emit()
+    print("[g4] PASS", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
