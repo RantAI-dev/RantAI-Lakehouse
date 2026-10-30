@@ -712,6 +712,114 @@ Stop and report, do not improvise, if: Debezium 3.8 refuses a key above; the
 not enough; the connection test or discovery needs a new route; or a file
 slice 3 is changing would have to be rewritten rather than added to.
 
+### Amendment 8 (planner, 2026-10-30): slice 5 merges slice 4, then MongoDB's setup checks
+
+Slice 4 is closed (phase head `0fede55d`, code `9bcc546f`, CI green; session
+`lakehouse-e1`). Slice 5 still builds on `feat/src-4-slice-5`, with CI from
+draft PR #277. Migration 0118 is slice 4's; anything new from here takes 0120
+or later.
+
+**S8-a The merge (task T5.9).** Merge `origin/feat/data-phase-4-src-4` into
+`feat/src-4-slice-5` with `git merge`. No rebase, no `--ours` or `--theirs` on
+a file both sides changed (AGENTS.md rule 9).
+- Resolve hunk by hunk. The files both sides touched are listed in the slice 5
+  handoff.
+- Keep both sides' additions in `ci.yml`, `ops/g4/*`, `coverage.json`, the
+  connector-type count tests, `connectors.ts`, `connector-review.tsx` and
+  `dial-forms.test.tsx`.
+- The count tests take the sum of both sides. Recount from the migrations, do
+  not add the two numbers by hand.
+- `cdc-mongo-dial-form.tsx` stays its own file. If slice 3 or 4 gave
+  `CdcDialForm` a TLS select, the MongoDB form does not get one in this
+  amendment.
+- After the merge, run `cargo fmt --check`, pytest and bun on the touched files
+  locally, then push. CI on #277 proves the rest.
+- The merge commit body lists every file resolved by hand.
+
+**S8-b Lag.** No work. The sensor reads topics through `cdc_apply.topic_of`,
+which already names `cdc.<id>.<database>.<collection>` for MongoDB. The gate
+`g4-mongo` gains one step: after the D5 changes, `GET` the connector's lag and
+assert a measured value. Assert no number from the gate; assert that it is
+present and not negative. If slice 4's lag route needs anything per driver,
+stop and report.
+
+**S8-c Facts from the orchestrator's test (task T5.10).** The API has no
+MongoDB client, so the facts come with the orchestrator's test result
+(`discover._cdc_mongo`, `kind=test`). Run them after `ping`, inside the same
+`checking_resolver`, each in its own `try`. An exception leaves that fact out;
+it is never guessed.
+
+| Fact | Read by | Values (closed set) |
+| --- | --- | --- |
+| `replicaSet` | `hello` → `setName`, compared in Python with the dial's `replicaSet` | `matches`, `differs`, `none` (no `setName`) |
+| `primary` | `hello` → `isWritablePrimary` | `true`, `false` |
+| `changeStream` | `connectionStatus` with `showPrivileges: true`: are `find` and `changeStream` granted on `{db: <database>, collection: ""}` or wider (`{db: "", collection: ""}`, `anyResource`)? | `granted`, `missing` |
+
+- The body posts `mongoSetup: {replicaSet?, primary?, changeStream?}` beside
+  `latencyMs`. Each key is optional, and an absent key means "not read". No
+  server text is posted, ever.
+- `Tested` (`lakehouse-store/src/connector_discovery.rs`) gains
+  `mongo_setup: Option<MongoSetupFacts>`, with `deny_unknown_fields` and one
+  serde enum per fact.
+- The result route's `outcome_of` accepts it only for `Kind::Test`. A value
+  outside the set is a 400 at the route.
+- It is stored in the existing `result` JSON column. No migration is needed;
+  if one turns out to be needed, stop and report.
+
+**S8-d The checks (task T5.10).** Add
+`cdc_setup_check::mongo_checks(facts: Option<&MongoSetupFacts>, dial: &CdcMongoDial) -> Vec<SetupCheck>`.
+It is pure, beside the other drivers' functions.
+- **Fixed text only.** Every `message` is a constant in that file.
+- **Absent means `unchecked`.** An absent fact, or absent facts, gives
+  `unchecked` with the file's `UNREAD`-style sentence, never `ok`
+  (lakehouse-e1's conditions).
+- **`replicaSet`.** `matches` → ok. `differs` → missing: "The server's replica
+  set has another name. Use the name in `rs.status().set`." with no command.
+  `none` → missing: "The server is not a replica set member; change streams
+  need a replica set." with no command.
+- **`primary`.** `true` → ok. `false` → missing: "This host is not the
+  primary. The connector reads change streams through the one host it names,
+  so name the primary." with no command. (Slice 5 review BLOCKER 1: one host.)
+- **`changeStream`.** `granted` → ok. `missing` → missing, with the command
+  `db.getSiblingDB("<database>").grantRolesToUser("<user>", [{ role: "read", db: "<database>" }])`.
+  The command is built only from the dial's validated `database` and `user`,
+  quoted as JSON strings for mongosh. The user is any string the dial
+  accepted, so quote it with `serde_json::to_string`, never by hand.
+
+**S8-e Showing them (task T5.10).**
+- `Answer` gains `setup_checks: Option<Vec<SetupCheck>>`.
+- The poll route (`routes/connector_discovery.rs` `poll`) fills it for a
+  finished `test` when the connector's dial is `Dial::CdcMongo`. It uses the
+  stored facts and the dial as it is now, through `mongo_checks`.
+- Every other kind and connector leaves it out.
+- The console's poll of `getDiscovery(id, "test")` renders `setupChecks` with
+  the same `ConnectorSetupChecks` component the synchronous test uses. The
+  `DiscoveryAnswer` contract gains `setupChecks?: SetupCheck[]`.
+- The checks never change `ok` (S4-f).
+- Regenerate nothing else.
+
+**S8-f Gate.** In `g4-mongo`, after the connection test:
+- Poll the test answer and assert three checks, all `ok`. The fixture's user
+  has `read` on its database, and the one host is the primary.
+- Make a second connector with a wrong `replicaSet`, and assert `replicaSet`
+  is `missing` with no command and the other two are unaffected.
+
+Unit tests:
+- `mongo_checks`: every value of every fact; absent facts; the command's
+  quoting with a `"` in the user.
+- `outcome_of`: refuses an unknown fact value and a `mongoSetup` on a list.
+- `_cdc_mongo`: posts no key for a fact whose command raised.
+
+**Tasks.**
+- T5.9: merge (S8-a), lag step (S8-b).
+- T5.10: facts, checks, poll, console, gate (S8-c to S8-f).
+
+Each task is its own commit, or commits, with its acceptance check above.
+Stop and report if:
+- the merge needs a slice 4 file rewritten rather than added to;
+- `connectionStatus` cannot show the privileges for the fixture's user;
+- the poll route cannot carry `setupChecks` without a new route.
+
 ## Handoff
 
 ### Slice 1, Oracle batch (developer, Sonnet, 2026-10-29)
@@ -1123,3 +1231,20 @@ that fails open on bad input is the wrong default.
 **Note, not a finding of this slice.** The worker log reports Debezium
 3.7.0.Final while the image tag says 3.8. Slice 4 or the phase PR reconciles
 the version claim (AGENTS.md principle 5).
+
+### Slice 5, review round 2 (planner, 2026-10-30, head `b3e29e7d`; code at `ef25a462`): round 1 closed
+
+Checked by the planner. CI run `41023910090` on `ef25a462` passed 37 of 37
+jobs, `g4-mongo` among them. BLOCKER 1:
+- `Dial::parse` and `render_mongodb_connect_config` refuse anything but one
+  host, with the fixed sentence `CDC_MONGO_ONE_HOST`.
+- The connection string always carries `directConnection=true`.
+- The form has one host field.
+- The docs no longer describe advertised member addresses.
+- What happens when the host stops being primary is written *not verified*.
+
+SHOULD-FIX 1: one constant, its exact text tested. SHOULD-FIX 2:
+`check_dial_ssrf` refuses an unreadable seed. No open `BLOCKER`. The handoff
+text written before the review still describes several hosts; this entry
+supersedes it. Slice 5 continues with Amendment 8 (T5.9 merge, T5.10 MongoDB
+setup checks).
