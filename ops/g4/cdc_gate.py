@@ -524,11 +524,28 @@ def topic_config_value(answer: dict, topic: str, key: str) -> str | None:
     return None if entry is None else entry.get("value")
 
 
+# What Debezium 3.8 really sets (seen in CI, run 40997876457): `KafkaSchemaHistory` creates the topic
+# with `retention.ms` = Java's `Long.MAX_VALUE`, not -1. It is Debezium's own spelling of "keep
+# forever" (about 292 million years); only a value that expires is a failure. The broker default,
+# 7 days = 604800000 ms, is what the topic would inherit if Debezium had not set it.
+UNLIMITED_RETENTION_MS = 9_223_372_036_854_775_807
+
+
+def retention_is_unlimited(value) -> bool:
+    """True for -1 (Kafka's "no limit") and for Debezium's `Long.MAX_VALUE` retention.ms."""
+    try:
+        number = int(str(value))
+    except ValueError:
+        return False
+    return number == -1 or number == UNLIMITED_RETENTION_MS
+
+
 def step_schema_history_never_expires(connector_id: str) -> None:
     """`SRC-4` decision S3-d: a `MySQL` or `SQL Server` connector keeps its schema history in the
     topic `cdc.<id>.schema-history`. Debezium creates it with unlimited retention; if the broker's
     7-day default applied instead, the connector could not restart after a week. Asked of the
-    broker (kafka-python's admin client): `retention.ms` and `retention.bytes` must both be -1.
+    broker (kafka-python's admin client): `retention.ms` and `retention.bytes` must both be unlimited
+    (-1, or Debezium's `Long.MAX_VALUE` for retention.ms: see `retention_is_unlimited`).
     If they are not, this gate fails: the answer is never to raise the broker default."""
     from kafka.admin import ConfigResource, ConfigResourceType, KafkaAdminClient
 
@@ -551,9 +568,9 @@ def step_schema_history_never_expires(connector_id: str) -> None:
     finally:
         admin.close()
     for key in ("retention.ms", "retention.bytes"):
-        if str(entries.get(key)) != "-1":
-            raise G4Failure(f"the schema-history topic {topic} has {key}={entries.get(key)!r}, not -1 (unlimited)")
-    print(f"[g4] the schema-history topic {topic} has unlimited retention (retention.ms=-1, retention.bytes=-1)", flush=True)
+        if not retention_is_unlimited(entries.get(key)):
+            raise G4Failure(f"the schema-history topic {topic} has {key}={entries.get(key)!r}, which expires (the broker default is 7 days)")
+    print(f"[g4] the schema-history topic {topic} has unlimited retention (retention.ms={entries['retention.ms']}, retention.bytes={entries['retention.bytes']})", flush=True)
 
 
 # ── Comparing Bronze with the source ────────────────────────────────────────

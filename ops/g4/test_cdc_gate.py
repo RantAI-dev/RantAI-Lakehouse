@@ -40,5 +40,16 @@ class TopicConfigValueTests(unittest.TestCase):
         self.assertEqual(cdc_gate.topic_config_value(answer, TOPIC, "retention.ms"), "604800000")
 
 
+class RetentionTests(unittest.TestCase):
+    def test_minus_one_and_debeziums_long_max_value_are_unlimited(self) -> None:
+        self.assertTrue(cdc_gate.retention_is_unlimited("-1"))
+        self.assertTrue(cdc_gate.retention_is_unlimited("9223372036854775807"))
+
+    def test_the_brokers_seven_day_default_and_junk_are_not(self) -> None:
+        self.assertFalse(cdc_gate.retention_is_unlimited("604800000"))
+        self.assertFalse(cdc_gate.retention_is_unlimited(None))
+        self.assertFalse(cdc_gate.retention_is_unlimited("not a number"))
+
+
 if __name__ == "__main__":
     unittest.main()
