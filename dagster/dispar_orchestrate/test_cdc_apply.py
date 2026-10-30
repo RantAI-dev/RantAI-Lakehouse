@@ -140,6 +140,8 @@ def _object(name: str = "public.orders", **extra: Any) -> dict[str, Any]:
         ({"driver": "postgres", "database": "orders"}, "public.orders", "cdc.conn-a.public.orders"),
         ({"driver": "mysql", "database": "shop"}, "shop.orders", "cdc.conn-a.shop.orders"),
         ({"driver": "mssql", "database": "shop"}, "dbo.orders", "cdc.conn-a.shop.dbo.orders"),
+        # Oracle: the topic has no database part, and the name is the dictionary's upper case.
+        ({"driver": "oracle", "database": "FREE", "pdbName": "FREEPDB1"}, "SHOP.ORDERS", "cdc.conn-a.SHOP.ORDERS"),
         (None, "public.orders", "cdc.conn-a.public.orders"),
     ],
 )
@@ -147,6 +149,21 @@ def test_the_topic_of_a_table_follows_the_drivers_naming(dial, name, topic) -> N
     connector = {**_connector(_object(name)), "dial": dial}
     (target,) = targets_of(connector)
     assert target.topic == topic
+
+
+def test_an_oracle_change_event_lands_in_the_spelling_a_batch_load_uses() -> None:
+    """Oracle's columns arrive upper case (`ID`, `CREATED_AT`); the key and the row go through dlt's
+    naming, the lower-case spelling `adapters/oracle.py::in_reflected_spelling` gives a batch load."""
+    from dispar_orchestrate.adapters.oracle import in_reflected_spelling
+
+    connector = {
+        **_connector({"name": "SHOP.ORDERS", "target": "ora_orders", "primaryKey": ["ID"]}),
+        "dial": {"driver": "oracle", "database": "FREE"},
+    }
+    (target,) = targets_of(connector)
+    assert target.key == tuple(in_reflected_spelling({"primaryKey": ["ID"]})["primaryKey"]) == ("id",)
+    row = event_to_row(b'{"ID": "7", "CREATED_AT": 1, "__op": "c", "__source_ts_ms": 5, "__deleted": "false"}', 0)
+    assert row is not None and row["id"] == "7" and row["created_at"] == 1
 
 
 def test_a_sql_server_dial_without_a_database_is_a_setup_error_not_a_guessed_topic() -> None:

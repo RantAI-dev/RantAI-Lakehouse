@@ -3412,6 +3412,13 @@ async fn save_ingest_spec(
     // `check_dial_ssrf`, which `set_ingest_spec` never returns.
     let dial = Dial::parse(&body.adapter, &body.dial)
         .map_err(|err| ApiError::BadRequest(err.to_string()))?;
+    // `SRC-4` slice 6 (S10-c): an Oracle change-capture connector's tables are
+    // typed by hand, so each is checked as SCHEMA.TABLE in Oracle's spelling.
+    lakehouse_store::ingest_spec::validate_oracle_change_capture_tables(
+        &dial,
+        &body.source_objects,
+    )
+    .map_err(|err| ApiError::BadRequest(err.to_string()))?; // SEC-11 allowlisted: InvalidOracleTable is fixed text
     // `SRC-11` decisions D9 to D11: columns left out of a load. A malformed
     // list is a 400; a source that cannot list its columns, and a key or
     // cursor column, are well-formed requests the product refuses: 422, with

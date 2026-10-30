@@ -1717,6 +1717,66 @@ fn key_is_usable(columns: &[serde_json::Value]) -> bool {
     })
 }
 
+/// An Oracle change-capture table that is not `SCHEMA.TABLE` of two Oracle
+/// identifiers in Oracle's own spelling (`SRC-4` slice 6, decision S10-c).
+/// Fixed text; it names the object the request itself sent.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "source object {name:?} is not an Oracle table: write it as SCHEMA.TABLE in upper case, \
+     letters, digits, '_' and '$'"
+)]
+pub struct InvalidOracleTable {
+    /// The offending source object's name.
+    pub name: String,
+}
+
+/// Whether `part` is an unquoted Oracle identifier as the data dictionary
+/// spells it: upper-case, starting with a letter, at most 128 characters.
+fn is_oracle_dictionary_name(part: &str) -> bool {
+    (1..=128).contains(&part.len())
+        && part.bytes().next().is_some_and(|b| b.is_ascii_uppercase())
+        && part
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || matches!(b, b'_' | b'$'))
+}
+
+/// An Oracle change-capture connector's tables are entered by hand (the
+/// orchestrator cannot list them with the connector's native encryption, S10-c),
+/// so each name is checked here as two identifiers in the spelling Debezium
+/// matches: Oracle stores unquoted names in upper case. Other sources are not
+/// checked here.
+///
+/// # Errors
+///
+/// [`InvalidOracleTable`] for the first object of an Oracle `cdc` dial whose
+/// name is not `SCHEMA.TABLE` of two such identifiers.
+pub fn validate_oracle_change_capture_tables(
+    dial: &Dial,
+    source_objects: &serde_json::Value,
+) -> Result<(), InvalidOracleTable> {
+    let Dial::Cdc(cdc) = dial else {
+        return Ok(());
+    };
+    if cdc.driver != SqlDriver::Oracle {
+        return Ok(());
+    }
+    for object in source_objects.as_array().into_iter().flatten() {
+        let name = object
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let valid = name.split_once('.').is_some_and(|(schema, table)| {
+            is_oracle_dictionary_name(schema) && is_oracle_dictionary_name(table)
+        });
+        if !valid {
+            return Err(InvalidOracleTable {
+                name: name.to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Check each source object's load mode, the one part of `sourceObjects`
 /// checked at save time: a mode the ingest job cannot run would otherwise
 /// surface only as a rejected run. Everything else in an object is left
@@ -2541,6 +2601,55 @@ mod tests {
             o["sslMode"] = serde_json::json!(word);
             assert!(refusal(o).contains("not supported for an Oracle"), "{word}");
         }
+    }
+
+    #[test]
+    fn oracle_change_capture_tables_are_two_upper_case_identifiers() {
+        let oracle = Dial::parse(
+            "cdc",
+            &serde_json::json!({
+                "driver": "oracle", "host": "db.internal", "port": 1521,
+                "database": "FREE", "user": "u"
+            }),
+        )
+        .unwrap();
+        let objects = |names: &[&str]| {
+            serde_json::Value::Array(
+                names
+                    .iter()
+                    .map(|n| serde_json::json!({"name": n, "target": "t"}))
+                    .collect(),
+            )
+        };
+        assert!(
+            validate_oracle_change_capture_tables(&oracle, &objects(&["SHOP.ORDERS", "A1.B_2$"]))
+                .is_ok()
+        );
+        for bad in [
+            "shop.orders",
+            "SHOP",
+            "SHOP.",
+            ".ORDERS",
+            "A.B.C",
+            "1A.B",
+            "SHOP.OR DERS",
+            "SHOP.ORD,ERS",
+            "SHOP.\"ORDERS\"",
+        ] {
+            let err = validate_oracle_change_capture_tables(&oracle, &objects(&["OK.OK", bad]))
+                .unwrap_err();
+            assert_eq!(err.name, bad);
+        }
+        // Other sources are not subject to the rule.
+        let pg = Dial::parse(
+            "cdc",
+            &serde_json::json!({
+                "driver": "postgres", "host": "db.internal", "port": 5432,
+                "database": "d", "user": "u", "slotName": "s", "publicationName": "p"
+            }),
+        )
+        .unwrap();
+        assert!(validate_oracle_change_capture_tables(&pg, &objects(&["public.orders"])).is_ok());
     }
 
     #[test]

@@ -41,7 +41,7 @@ every other load mode makes (day partition on `_ingested_at`, format version 2).
 # Event shape
 
 Debezium's `ExtractNewRecordState` with `delete.tombstone.handling.mode=rewrite` (the name
-Debezium 3.8 reads; `delete.handling.mode` is ignored there, `docs/plans/SRC-4-RESULT.md`)
+Debezium 3.7.0 reads, the version the pinned `3.8` image tag really holds; `delete.handling.mode` is ignored there, `docs/plans/SRC-4-RESULT.md`)
 and `add.fields=op,source.ts_ms`, JSON without schemas: a flat object of the row's
 columns plus `__op` (`c`, `u`, `d`, `r`), `__source_ts_ms` and `__deleted`. A delete
 carries the old row (the source tables are `REPLICA IDENTITY FULL`). A tombstone (a
@@ -224,6 +224,13 @@ def topic_of(connector_id: str, object_name: str, dial: Mapping[str, Any] | None
       Both are `cdc.<id>.<object name>`.
     - SQL Server (`dial.driver == "mssql"`): `<database>.<schema>.<table>`, the database being
       the dial's, because the object name is `<schema>.<table>` (`SRC-4` decision S3-c).
+    - Oracle: `<SCHEMA>.<TABLE>`, no database part (Debezium's Oracle connector names a topic
+      `<prefix>.<schema>.<table>` whatever the container database is), so Oracle needs no branch
+      here. The object name is Oracle's own spelling, upper case, and the API refuses any other
+      (`validate_oracle_change_capture_tables`, `SRC-4` decision S6-e, S10-c). The Bronze table is
+      named by the object's `target`, which the console derives lower-cased as for every source, and
+      the columns go through `dlt`'s naming (`_loaded_name`), so a batch and a change-capture
+      connector on the same Oracle table write the same Bronze spelling.
 
     The schema-history topic of MySQL and SQL Server (`cdc.<id>.schema-history`) is never read:
     only the topics of the connector's source objects are.
