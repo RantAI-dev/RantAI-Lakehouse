@@ -461,13 +461,11 @@ mod tests {
 
     use super::*;
 
-    fn rows(values: &[&[&str]]) -> Option<Rows> {
-        Some(
-            values
-                .iter()
-                .map(|row| row.iter().map(|c| Some((*c).to_owned())).collect())
-                .collect(),
-        )
+    fn rows(values: &[&[&str]]) -> Rows {
+        values
+            .iter()
+            .map(|row| row.iter().map(|c| Some((*c).to_owned())).collect())
+            .collect()
     }
 
     fn statuses(checks: &[SetupCheck]) -> Vec<SetupStatus> {
@@ -476,14 +474,14 @@ mod tests {
 
     fn pg_ready() -> PgFacts {
         PgFacts {
-            wal_level: rows(&[&["logical"]]),
-            replication: rows(&[&["t"]]),
-            publications: rows(&[&["other_pub"], &["orders_pub"]]),
-            published: rows(&[
+            wal_level: Some(rows(&[&["logical"]])),
+            replication: Some(rows(&[&["t"]])),
+            publications: Some(rows(&[&["other_pub"], &["orders_pub"]])),
+            published: Some(rows(&[
                 &["orders_pub", "public", "orders"],
                 &["orders_pub", "public", "items"],
                 &["other_pub", "public", "extra"],
-            ]),
+            ])),
         }
     }
 
@@ -502,8 +500,8 @@ mod tests {
     #[test]
     fn each_missing_postgres_setting_names_its_command() {
         let facts = PgFacts {
-            wal_level: rows(&[&["replica"]]),
-            replication: rows(&[&["f"]]),
+            wal_level: Some(rows(&[&["replica"]])),
+            replication: Some(rows(&[&["f"]])),
             ..pg_ready()
         };
         let checks = postgres_checks(&facts, "app", "orders_pub", &tables());
@@ -546,7 +544,7 @@ mod tests {
     #[test]
     fn a_table_the_publication_lacks_is_added_by_its_command() {
         let mut facts = pg_ready();
-        facts.published = rows(&[&["orders_pub", "public", "orders"]]);
+        facts.published = Some(rows(&[&["orders_pub", "public", "orders"]]));
         let checks = postgres_checks(&facts, "app", "orders_pub", &tables());
         assert_eq!(checks[3].status, SetupStatus::Missing);
         assert_eq!(

@@ -130,6 +130,6 @@ async fn deleting_a_connector_deletes_its_capture_rows(pool: PgPool) -> sqlx::Re
         .bind(PG)
         .execute(&pool)
         .await?;
-    assert!(list_tables(&pool, PG).await.unwrap().is_empty());
+    assert_eq!(list_tables(&pool, PG).await.unwrap().len(), 0);
     Ok(())
 }

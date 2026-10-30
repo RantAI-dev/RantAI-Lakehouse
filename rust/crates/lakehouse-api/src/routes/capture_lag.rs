@@ -738,7 +738,7 @@ mod tests {
         ]});
         let (status, _) = post(&h, &id, behind).await;
         assert_eq!(status, StatusCode::OK);
-        assert!(deliveries(&h).await.is_empty());
+        assert_eq!(deliveries(&h).await.len(), 0);
         assert!(!open_flag(&pool, &id).await);
     }
 
@@ -775,7 +775,7 @@ mod tests {
             let (status, answer) = post(&h, &id, body.clone()).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{body} -> {answer}");
         }
-        assert!(store::list_tables(&pool, &id).await.unwrap().is_empty());
+        assert_eq!(store::list_tables(&pool, &id).await.unwrap().len(), 0);
 
         let plain = {
             let id = cdc_connector(&h, "lag five").await;
