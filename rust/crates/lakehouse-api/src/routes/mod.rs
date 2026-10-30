@@ -15,6 +15,7 @@ pub mod auth;
 // the drift the one definition exists to prevent.
 pub(crate) mod authored_pipelines;
 mod calc_fields;
+mod capture_lag;
 mod catalog;
 mod catalog_governance;
 mod catalog_grants;
@@ -791,6 +792,26 @@ fn per_connector_router(state: &AppState) -> Router<AppState> {
         ))
 }
 
+/// The change-capture lag routes (`SRC-4` slice 4), merged into
+/// [`connectors_router`] and split from it for `clippy::too_many_lines`. The orchestrator's
+/// observations sit outside the tenant gate (a service identity belongs to no
+/// tenant; the handler checks `schema_changes::require_orchestrator`); a
+/// person's lag limit sits behind it.
+fn capture_lag_router(state: &AppState) -> Router<AppState> {
+    let gated = Router::new()
+        .route("/api/connectors/{id}/lag-limit", put(capture_lag::set_limit))
+        .route_layer(from_fn_with_state(
+            state.clone(),
+            connectors::require_connector_in_tenants,
+        ));
+    Router::new()
+        .route(
+            "/api/connectors/{id}/capture/observations",
+            post(capture_lag::observe),
+        )
+        .merge(gated)
+}
+
 /// The `/api/connectors/*` sub-router (Task 2.7), split out for the same
 /// `clippy::too_many_lines` reason as [`pipelines_router`].
 ///
@@ -895,6 +916,7 @@ fn connectors_router(state: &AppState) -> Router<AppState> {
             )),
         )
         .merge(per_connector)
+        .merge(capture_lag_router(state))
 }
 
 /// The `/api/uploads/*` sub-router (ADR 0014, plan T6), shaped like

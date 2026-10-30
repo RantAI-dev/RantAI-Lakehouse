@@ -309,7 +309,7 @@ pub struct ChangeCaptureResponse {
 }
 
 /// Shown for a connector that does not capture changes.
-const NOT_CHANGE_CAPTURE: &str = "This connector does not capture changes.";
+pub(super) const NOT_CHANGE_CAPTURE: &str = "This connector does not capture changes.";
 
 /// `GET /api/connectors/{id}/change-capture` -- the connector's state in
 /// `Kafka Connect`, in the fixed words of [`ChangeCaptureResponse`]

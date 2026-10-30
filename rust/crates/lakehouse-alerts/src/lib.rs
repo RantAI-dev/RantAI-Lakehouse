@@ -198,6 +198,13 @@ pub enum AlertKind {
     /// with no such rule no success alert is ever sent.
     #[serde(rename = "connector_success")]
     ConnectorSuccess,
+    /// Fires when a change-capture connector's lag passes its limit, and once
+    /// more when it is back under (`SRC-4` decision S4-d). Scoped by connector
+    /// like [`AlertKind::ConnectorFailure`]; evaluated by
+    /// `lakehouse-api`'s capture-observation route through
+    /// [`evaluate_connector_event`], never by `run_rules`.
+    #[serde(rename = "connector_lag")]
+    ConnectorLag,
     /// Fires when a file upload's load fails. Always stored with the
     /// connector scope `"*"`: an upload belongs to no connector (`SRC-7`).
     #[serde(rename = "upload_failure")]
@@ -213,7 +220,7 @@ pub enum AlertKind {
 
 impl AlertKind {
     /// Whether the kind is scoped by the `connector` column (`SRC-7`): the
-    /// five `connector_*` kinds and `upload_failure`.
+    /// six `connector_*` kinds and `upload_failure`.
     #[must_use]
     pub const fn is_connector_scoped(self) -> bool {
         matches!(
@@ -223,6 +230,7 @@ impl AlertKind {
                 | Self::ConnectorDisabled
                 | Self::ConnectorSchemaChange
                 | Self::ConnectorSuccess
+                | Self::ConnectorLag
                 | Self::UploadFailure
         )
     }
@@ -251,6 +259,7 @@ impl AlertKind {
             "connector_disabled" => Some(Self::ConnectorDisabled),
             "connector_schema_change" => Some(Self::ConnectorSchemaChange),
             "connector_success" => Some(Self::ConnectorSuccess),
+            "connector_lag" => Some(Self::ConnectorLag),
             "upload_failure" => Some(Self::UploadFailure),
             _ => None,
         }
@@ -273,6 +282,7 @@ impl AlertKind {
             Self::ConnectorDisabled => "connector_disabled",
             Self::ConnectorSchemaChange => "connector_schema_change",
             Self::ConnectorSuccess => "connector_success",
+            Self::ConnectorLag => "connector_lag",
             Self::UploadFailure => "upload_failure",
             Self::QualityIncident => "quality_incident",
         }
@@ -813,7 +823,7 @@ fn is_connector_id_shape(id: &str) -> bool {
 }
 
 /// Validate the scope of the `SRC-7` kinds. `upload_failure` takes no input
-/// and stores `"*"`; the five `connector_*` kinds need a connector id or
+/// and stores `"*"`; the six `connector_*` kinds need a connector id or
 /// `"*"`, and `connector_success` refuses `"*"` (decision D4). Messages are
 /// fixed text, never an echo of the input.
 fn validate_connector_scoped(
@@ -2400,6 +2410,7 @@ async fn run_one(
         | AlertKind::ConnectorDisabled
         | AlertKind::ConnectorSchemaChange
         | AlertKind::ConnectorSuccess
+        | AlertKind::ConnectorLag
         | AlertKind::UploadFailure => skipped(
             rule,
             "connector and upload rules are evaluated by their event, not run_rules".to_owned(),
@@ -4385,6 +4396,7 @@ mod tests {
             (AlertKind::ConnectorDisabled, "connector_disabled"),
             (AlertKind::ConnectorSchemaChange, "connector_schema_change"),
             (AlertKind::ConnectorSuccess, "connector_success"),
+            (AlertKind::ConnectorLag, "connector_lag"),
             (AlertKind::UploadFailure, "upload_failure"),
         ] {
             assert_eq!(kind.as_str(), wire);

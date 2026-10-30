@@ -10,6 +10,7 @@
 mod auth;
 mod bounded;
 mod bronze_stats_cache;
+mod capture_lag;
 mod catalog_search_cache;
 mod cdc_lifecycle;
 mod cdc_secrets;
