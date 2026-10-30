@@ -16,7 +16,7 @@
 //!
 //! Only a connector class in [`ALLOWED_CONNECTOR_CLASSES`] is ever sent: the
 //! class is data the registry row decides, and `Kafka Connect` will load any
-//! plugin class on its path. `PostgreSQL`, `MySQL` and `SQL Server` now; the other
+//! plugin class on its path. `PostgreSQL`, `MySQL`, `SQL Server` and `Oracle` now; the other
 //! `Debezium` classes are added by the slice that builds each source.
 //!
 //! # Upstream text never reaches a response
@@ -156,6 +156,52 @@ pub fn classify_status(status: &Value) -> ConnectState {
     }
 }
 
+/// What `Kafka Connect` answered to a configuration validation (`SRC-4`
+/// slice 6, decision S10-a): how many settings it found wrong and the texts it
+/// gave. The texts can name hosts, users and driver messages, so they exist only
+/// to be classified by the caller (`crate::cdc_oracle`): this type has no
+/// `Debug` and no accessor that hands them out for display.
+pub struct ConfigValidation {
+    error_count: u64,
+    messages: Vec<String>,
+}
+
+impl ConfigValidation {
+    /// Read `PUT /connector-plugins/<class>/config/validate`'s answer: its
+    /// `error_count` and every `configs[].value.errors[]` text. An answer
+    /// without an `error_count` is not a validation: `None`.
+    #[must_use]
+    pub fn from_answer(answer: &Value) -> Option<Self> {
+        let error_count = answer.get("error_count").and_then(Value::as_u64)?;
+        let messages = answer
+            .get("configs")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|config| config.pointer("/value/errors").and_then(Value::as_array))
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect();
+        Some(Self {
+            error_count,
+            messages,
+        })
+    }
+
+    /// Whether `Kafka Connect` found nothing wrong.
+    #[must_use]
+    pub const fn is_valid(&self) -> bool {
+        self.error_count == 0
+    }
+
+    /// The error texts, for matching against fixed patterns only.
+    #[must_use]
+    pub fn messages_for_classification(&self) -> &[String] {
+        &self.messages
+    }
+}
+
 /// The client. Cheap to build: one per use, from [`Config`].
 pub struct KafkaConnectClient {
     base: String,
@@ -212,6 +258,56 @@ impl KafkaConnectClient {
             .put(format!("{}/connectors/{name}/config", self.base))
             .json(config);
         self.send(request).await.map(|_| ())
+    }
+
+    /// Ask the connector plugin to validate `config` without creating anything
+    /// (`PUT /connector-plugins/<class>/config/validate`, `SRC-4` slice 6,
+    /// decision S10-a). The plugin opens the connection the connector would,
+    /// with the same driver and settings, and reports what failed. `config`
+    /// holds the password as a `${dir:...}` reference, never a value: the worker
+    /// resolves config providers before it validates. The same class allowlist
+    /// as [`Self::put_config`].
+    ///
+    /// # Errors
+    ///
+    /// [`ConnectError::ClassNotAllowed`] before anything is sent;
+    /// [`ConnectError::Unavailable`] for an unreachable worker or an answer
+    /// that is not a validation; otherwise the class of the failure.
+    pub async fn validate_config(
+        &self,
+        config: &BTreeMap<String, String>,
+    ) -> Result<ConfigValidation, ConnectError> {
+        let class = config.get("connector.class").map(String::as_str);
+        let Some(class) = class.filter(|c| ALLOWED_CONNECTOR_CLASSES.contains(c)) else {
+            return Err(ConnectError::ClassNotAllowed);
+        };
+        let request = self
+            .http
+            .put(format!(
+                "{}/connector-plugins/{class}/config/validate",
+                self.base
+            ))
+            .json(config);
+        let body = self.send(request).await?;
+        let answer: Value = serde_json::from_slice(&body).map_err(|_| ConnectError::Unavailable)?;
+        ConfigValidation::from_answer(&answer).ok_or(ConnectError::Unavailable)
+    }
+
+    /// The failure text of connector `name`: the connector's own trace and its
+    /// tasks', from `GET /connectors/<name>/status`. `None` when nothing failed.
+    /// For matching against fixed patterns only (`crate::cdc_oracle_failure`);
+    /// the text is never shown (principle 4).
+    ///
+    /// # Errors
+    ///
+    /// The class of the failure; [`ConnectError::NotFound`] if it is not there.
+    pub async fn failure_trace(&self, name: &str) -> Result<Option<String>, ConnectError> {
+        let request = self
+            .http
+            .get(format!("{}/connectors/{name}/status", self.base));
+        let body = self.send(request).await?;
+        let status: Value = serde_json::from_slice(&body).map_err(|_| ConnectError::Unavailable)?;
+        Ok(trace_of(&status))
     }
 
     /// Pause connector `name` (`PUT /connectors/<name>/pause`).
@@ -314,6 +410,23 @@ impl KafkaConnectClient {
     }
 }
 
+/// The traces of the parts of `status` that failed, joined; `None` if none did.
+fn trace_of(status: &Value) -> Option<String> {
+    let connector = status.pointer("/connector");
+    let tasks = status
+        .get("tasks")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten();
+    let traces: Vec<&str> = connector
+        .into_iter()
+        .chain(tasks)
+        .filter(|part| part.get("state").and_then(Value::as_str) == Some("FAILED"))
+        .filter_map(|part| part.get("trace").and_then(Value::as_str))
+        .collect();
+    (!traces.is_empty()).then(|| traces.join("\n"))
+}
+
 /// The class of a non-success HTTP status. 404 is a missing connector, 400 and
 /// 422 are a configuration the worker refuses; everything else, including 409
 /// (a rebalance in progress) and 5xx, is the worker not being ready, which a
@@ -394,6 +507,72 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err, ConnectError::ClassNotAllowed);
+    }
+
+    #[tokio::test]
+    async fn validate_asks_the_plugin_and_reads_its_error_count() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path(format!(
+                "/connector-plugins/{ORACLE_CONNECTOR_CLASS}/config/validate"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "name": "x", "error_count": 1,
+                "configs": [
+                    {"definition": {"name": "a"}, "value": {"name": "a", "errors": []}},
+                    {"definition": {"name": "database.hostname"},
+                     "value": {"name": "database.hostname", "errors": ["ORA-01017: invalid"]}}
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = KafkaConnectClient::new(&server.uri()).unwrap();
+        let validation = client
+            .validate_config(&config(ORACLE_CONNECTOR_CLASS))
+            .await
+            .unwrap();
+        assert!(!validation.is_valid());
+        assert_eq!(
+            validation.messages_for_classification(),
+            ["ORA-01017: invalid"]
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_never_sends_a_class_outside_the_allowlist_and_needs_an_error_count() {
+        let server = MockServer::start().await;
+        let client = KafkaConnectClient::new(&server.uri()).unwrap();
+        assert!(matches!(
+            client
+                .validate_config(&config("org.example.EvilConnector"))
+                .await,
+            Err(ConnectError::ClassNotAllowed)
+        ));
+        assert!(server.received_requests().await.unwrap().is_empty());
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"unexpected": 1})))
+            .mount(&server)
+            .await;
+        assert!(matches!(
+            client
+                .validate_config(&config(ORACLE_CONNECTOR_CLASS))
+                .await,
+            Err(ConnectError::Unavailable)
+        ));
+    }
+
+    #[test]
+    fn the_failure_trace_joins_the_failed_parts_only() {
+        let status = json!({
+            "connector": {"state": "RUNNING"},
+            "tasks": [
+                {"id": 0, "state": "FAILED", "trace": "boom one"},
+                {"id": 1, "state": "RUNNING", "trace": "not a failure"}
+            ]
+        });
+        assert_eq!(trace_of(&status).as_deref(), Some("boom one"));
+        assert_eq!(trace_of(&json!({"connector": {"state": "RUNNING"}})), None);
     }
 
     #[tokio::test]

@@ -1071,7 +1071,23 @@ pub async fn test_connection(
         let pending = start_orchestrator_test(&state, &principal, &id).await?;
         return Ok(ApiJson(pending));
     }
-    let mut outcome = run_probe(&state, &dial_info, state.connector_secret_resolver.as_ref()).await;
+    // `SRC-4` slice 6 (S10-a): an Oracle change-capture connector is tested by
+    // `Kafka Connect`, with the driver and encryption the connector uses.
+    let oracle_tables = if crate::cdc_oracle::is_oracle_cdc(&dial_info) {
+        // The checks never decide a test: a store error leaves the placeholder table.
+        super::capture_lag::selected_tables(pool(&state)?, &id)
+            .await
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let mut outcome = if let Some(tested) =
+        crate::cdc_oracle::test(&state, &dial_info, &id, &oracle_tables).await
+    {
+        tested
+    } else {
+        run_probe(&state, &dial_info, state.connector_secret_resolver.as_ref()).await
+    };
     // `SRC-12` part C: a provider that rotates refresh tokens retired the one
     // the test just used; keep the new one or the test would sign the
     // connector out.

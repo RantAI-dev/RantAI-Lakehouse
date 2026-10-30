@@ -29,6 +29,7 @@ pub mod bronze_stats_cache;
 pub mod capture_lag;
 pub mod catalog_search_cache;
 pub mod cdc_lifecycle;
+pub mod cdc_oracle;
 pub mod cdc_secrets;
 pub mod cdc_setup_check;
 pub mod cdc_setup_probe;
