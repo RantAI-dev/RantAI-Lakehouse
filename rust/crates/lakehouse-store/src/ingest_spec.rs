@@ -3412,6 +3412,11 @@ mod target_identity_tests {
         assert!(Dial::parse("sql", &missing).is_err());
     }
 
+    /// The target identity of a `cdc` dial is its driver, host, port and database, and nothing
+    /// else. `SRC-4` slice 3 (decision S3-a) makes `slotName`/`publicationName` PostgreSQL-only and
+    /// `serverId` MySQL-only, so this test's old fixture (a PostgreSQL dial given a `serverId` and
+    /// switched to `mysql` with slot names) is no longer a dial `Dial::parse` accepts. The intent is
+    /// unchanged: each field below is varied on a dial that is valid for its driver.
     #[test]
     fn a_cdc_dial_is_re_pointed_by_driver_host_port_or_database_only() {
         let base = json!({
@@ -3419,14 +3424,23 @@ mod target_identity_tests {
             "database": "orders", "user": "reader",
             "slotName": "slot_a", "publicationName": "pub_a"
         });
-        assert!(!same("cdc", &base, "driver", json!("mysql")));
         assert!(!same("cdc", &base, "host", json!("other.internal")));
         assert!(!same("cdc", &base, "port", json!(5433)));
         assert!(!same("cdc", &base, "database", json!("billing")));
         assert!(same("cdc", &base, "user", json!("someone_else")));
         assert!(same("cdc", &base, "slotName", json!("slot_b")));
         assert!(same("cdc", &base, "publicationName", json!("pub_b")));
-        assert!(same("cdc", &base, "serverId", json!(7)));
+        // The driver: the same host, port and database under another driver is another target.
+        let mysql = json!({
+            "driver": "mysql", "host": "db.internal", "port": 5432,
+            "database": "orders", "user": "reader", "serverId": 7
+        });
+        assert_ne!(
+            parse("cdc", &base).target_identity(),
+            parse("cdc", &mysql).target_identity()
+        );
+        // MySQL's server id is not part of the target.
+        assert!(same("cdc", &mysql, "serverId", json!(8)));
     }
 
     #[test]

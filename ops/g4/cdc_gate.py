@@ -514,25 +514,14 @@ def step_connector_holds_no_password(connector_id: str) -> None:
     print("[g4] the connector's Kafka Connect config holds only a file reference; the file holds the password", flush=True)
 
 
-def _config_entries(node) -> dict[str, str]:
-    """Every (name, value) config pair found in a `describe_configs` answer, whatever shape the
-    installed kafka-python gives it (a dict with `config_names`/`config_name` and `config_value`,
-    a tuple `(name, value, ...)` of the wire format, or an object with `.resources`)."""
-    found: dict[str, str] = {}
-    if isinstance(node, dict):
-        name = node.get("config_names", node.get("config_name"))
-        if isinstance(name, str) and "config_value" in node:
-            found[name] = node["config_value"]
-        for value in node.values():
-            found.update(_config_entries(value))
-    elif hasattr(node, "resources") and not isinstance(node, (list, tuple)):
-        found.update(_config_entries(node.resources))
-    elif isinstance(node, (list, tuple)):
-        if len(node) >= 2 and isinstance(node[0], str) and (node[1] is None or isinstance(node[1], str)) and "." in node[0]:
-            found[node[0]] = node[1]
-        for item in node:
-            found.update(_config_entries(item))
-    return found
+def topic_config_value(answer: dict, topic: str, key: str) -> str | None:
+    """`key`'s value in the answer of kafka-python 3.0.11's `KafkaAdminClient.describe_configs` (the
+    version the code location pins; its `admin/_configs.py`): a dict
+    `{"topic": {<topic name>: {<config key>: {"value": ..., "read_only": ..., ...}}}}`. With
+    `config_filter="all"` every key is present, with its effective value, so a key that is missing
+    is an unexpected answer, not a default. Returns None for a key that is not in the answer."""
+    entry = ((answer.get("topic") or {}).get(topic) or {}).get(key)
+    return None if entry is None else entry.get("value")
 
 
 def step_schema_history_never_expires(connector_id: str) -> None:
@@ -549,13 +538,14 @@ def step_schema_history_never_expires(connector_id: str) -> None:
         def check():
             if topic not in admin.list_topics():
                 raise G4Failure(f"the schema-history topic {topic} does not exist yet")
-            answer = admin.describe_configs([ConfigResource(ConfigResourceType.TOPIC, topic)])
-            # kafka-python returns a response object, a list of them or plain dicts, by version:
-            # walk whatever came back for config entries (a name and a value).
-            entries = _config_entries(answer)
-            if not entries:
-                raise G4Failure(f"no config entries in the answer for {topic}: {str(answer)[:300]}")
-            return entries
+            # `config_filter="all"`: the effective value of every key, not only the modified ones.
+            answer = admin.describe_configs([ConfigResource(ConfigResourceType.TOPIC, topic)], config_filter="all")
+            values = {key: topic_config_value(answer, topic, key) for key in ("retention.ms", "retention.bytes")}
+            if any(v is None for v in values.values()):
+                # The topic exists but the answer does not hold what was asked: say so, with the
+                # whole answer (a topic's config is not secret).
+                raise G4Failure(f"the topic {topic} exists but its config answer has no retention keys: {answer!r}"[:1500])
+            return values
 
         entries = _wait_for(f"the schema-history topic {topic} exists", check, 120, interval_s=5)
     finally:
