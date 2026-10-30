@@ -862,18 +862,7 @@ impl Dial {
                     ("database", cdc.database.clone()),
                 ],
             ),
-            // `SRC-4` S5-a: the hosts as a set, the database and the replica
-            // set. A different replica set is a different cluster, so the
-            // stored credential must be supplied again.
-            Dial::CdcMongo(mongo) => TargetIdentity::new(
-                "cdc",
-                vec![
-                    ("driver", "mongodb".to_owned()),
-                    ("hosts", host_port_set_key(&mongo.hosts)),
-                    ("database", mongo.database.clone()),
-                    ("replicaSet", mongo.replica_set.clone()),
-                ],
-            ),
+            Dial::CdcMongo(mongo) => cdc_mongo_target_identity(mongo),
             Dial::Files(files) => TargetIdentity::new(
                 "files",
                 vec![
@@ -980,6 +969,21 @@ impl TargetIdentity {
     pub fn adapter(&self) -> &'static str {
         self.adapter
     }
+}
+
+/// The re-point identity of a `MongoDB` change-capture dial (`SRC-4` S5-a): the
+/// hosts as a set, the database and the replica set. A different replica set is a
+/// different cluster, so the stored credential must be supplied again.
+fn cdc_mongo_target_identity(mongo: &CdcMongoDial) -> TargetIdentity {
+    TargetIdentity::new(
+        "cdc",
+        vec![
+            ("driver", "mongodb".to_owned()),
+            ("hosts", host_port_set_key(&mongo.hosts)),
+            ("database", mongo.database.clone()),
+            ("replicaSet", mongo.replica_set.clone()),
+        ],
+    )
 }
 
 /// The target identity of a `saas` dial. `SRC-3` AD2: every address of a
