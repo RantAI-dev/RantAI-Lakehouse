@@ -1365,6 +1365,16 @@ pub struct EnforceBody {
 /// pipeline was created. A user who loses a role loses it here too, on the
 /// next run.
 ///
+/// # Which tenant the statement acts as (`SEC-50`)
+///
+/// The pipeline's OWN tenant (`pipeline_definition.tenant_id`), not the
+/// caller's: the caller is the orchestrator, which has no tenant of its
+/// own. The tenant is applied exactly as if the author had sent it in an
+/// `X-Tenant` header, so an author who left that tenant is refused, and a
+/// pipeline with no tenant at all reaches nothing. A pipeline in tenant B
+/// may not read tenant A's uploaded table, which is the one path in this
+/// service that can name a `bronze.*` table.
+///
 /// # Who may call it
 ///
 /// The same rule as [`runnable`]: a service identity or a Platform Admin,
@@ -1375,9 +1385,12 @@ pub struct EnforceBody {
 /// # Errors
 ///
 /// 403 for anyone but a service identity or a Platform Admin; 404 for an
-/// unknown pipeline id (and for another tenant's, so the id space is not
-/// probeable across tenants); 409 with [`NO_AUTHOR_REASON`] when the
-/// pipeline has no author or its author is deactivated; 422 with
+/// unknown pipeline id (the route reads the pipeline by id alone, so it
+/// 404s only an id that does not exist); 409 with [`NO_AUTHOR_REASON`]
+/// when the pipeline has no author or its author is deactivated; 404 with
+/// the tenant gate's fixed sentence when the statement reads a table the
+/// pipeline's tenant may not read, and 404 when the author is not a
+/// member of that tenant (`SEC-50`); 422 with
 /// [`crate::policy_engine::enforcement_error_message`] when the rewrite is
 /// refused; 400 for a malformed body; 503 if no pool is configured or
 /// Postgres is unreachable; 500 on any other database failure. No error
@@ -1459,6 +1472,23 @@ pub async fn enforce_pipeline_sql(
         principal_tenant_ids: author.tenant_ids.iter().map(ToString::to_string).collect(),
     };
     let obligations_source = crate::policy_engine::PolicyEngineObligations::from_state(&state);
+    // SEC-50: the tenant gate runs BEFORE the policy rewrite, so a
+    // statement that reads a table the pipeline's own tenant may not
+    // read is refused before the policy's own prefetch asks the engine
+    // about that table, and before the statement reaches the engine at
+    // all. The pipeline acts as its OWN tenant (`pipeline_definition
+    // .tenant_id`), applied as if the author had sent it in `X-Tenant`:
+    // the caller is the orchestrator, which has no tenant of its own.
+    crate::routes::query::gate_statement(
+        &state,
+        &sql,
+        &sqlparser::dialect::ClickHouseDialect {},
+        crate::routes::query::GateActor::AsTenant {
+            principal: &author,
+            tenant_id: pipeline.tenant_id,
+        },
+    )
+    .await?;
     let rewritten = crate::policy_engine::rewrite_sql_for_roles(
         &sql,
         &sqlparser::dialect::ClickHouseDialect {},

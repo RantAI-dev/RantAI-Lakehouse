@@ -15,6 +15,13 @@
 //! a fixed message, a non-orchestrator caller cannot reach it, and an id
 //! that is not this caller's pipeline answers the same 404 as an id that
 //! does not exist at all.
+//!
+//! `SEC-50` adds the tenant gate: a pipeline acts as its OWN tenant
+//! (`pipeline_definition.tenant_id`), so a pipeline of tenant B may not
+//! read a `bronze.*` upload table that tenant A claimed. The fixtures
+//! below give every pipeline a tenant and the deployment a catalog
+//! tenant, because that is what a pipeline that can run at all looks
+//! like; the gate is exercised by the tests at the end of this file.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -24,6 +31,7 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use lakehouse_store::governance::{self, CreatePolicyInput};
 use lakehouse_store::pipelines::{self, CreatePipelineInput};
+use lakehouse_store::uploads::claim_table;
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use tower::ServiceExt;
@@ -37,6 +45,27 @@ use common::{TestApp, session_cookie_for_seeded_user, spin_up_with_env};
 /// what an authored pipeline actually reads, and a name no other test in
 /// this binary shares.
 const SQL: &str = "SELECT email FROM serving.enforced_x";
+
+/// `SEC-50`: the upload table a pipeline may name — `bronze.*` is where
+/// another tenant's upload lives, and it is the only namespace an
+/// authored pipeline can read that a tenant owns.
+const BRONZE_SQL: &str = "SELECT * FROM bronze.group_orders";
+
+/// The raw name that upload table is claimed under.
+const BRONZE_TABLE: &str = "group_orders";
+
+/// The refusal of [`BRONZE_SQL`], byte for byte (`SEC-20`'s sentence).
+const BRONZE_REFUSAL: &str =
+    "Table not found or not available to your organisation: bronze.group_orders";
+
+/// The tenant that owns the shared catalog in these tests — Meridian
+/// Group, the tenant the seeded identity migration gives `rina` and
+/// `yoga`.
+const CATALOG_TENANT: &str = "11111111-1111-4111-8111-000000000001";
+
+/// Another tenant of the same deployment — Meridian Retail, the tenant
+/// the seeded identity migration gives `sari`.
+const OTHER_TENANT: &str = "11111111-1111-4111-8111-000000000002";
 
 async fn mount(ch: &MockServer) {
     // The column metadata the mask needs: the obligations source reads a
@@ -72,10 +101,22 @@ async fn mount(ch: &MockServer) {
 }
 
 async fn app() -> (axum::Router, PgPool, String) {
+    let (router, pool, cookie, _engine) = app_with_engine().await;
+    (router, pool, cookie)
+}
+
+/// The same app, with the `ClickHouse` stand-in: a test that has to
+/// prove what did NOT reach the engine needs it.
+///
+/// `SEC-50`: the deployment names its catalog tenant, because a
+/// pipeline that can read the shared catalog at all is a pipeline whose
+/// own tenant owns it.
+async fn app_with_engine() -> (axum::Router, PgPool, String, MockServer) {
     let ch = MockServer::start().await;
     mount(&ch).await;
     let mut overrides = std::collections::HashMap::new();
     overrides.insert("CH_URL".to_owned(), ch.uri());
+    overrides.insert("CATALOG_TENANT_ID".to_owned(), CATALOG_TENANT.to_owned());
     let TestApp { router, pool } = spin_up_with_env(&overrides).await;
     // A Platform Admin: `runnable`'s rule allows a service identity OR an
     // unrestricted principal, and a test cannot mint the orchestrator's
@@ -83,7 +124,7 @@ async fn app() -> (axum::Router, PgPool, String) {
     // of the same rule, so the allowed-path tests still prove the route is
     // reachable and that `route_auth.rs` proves the permission floor.
     let cookie = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
-    (router, pool, cookie)
+    (router, pool, cookie, ch)
 }
 
 async fn seed_mask(pool: &PgPool, role: &str) {
@@ -271,7 +312,7 @@ async fn a_masked_column_is_rewritten_for_an_author_who_has_the_obligation() {
     let id = seed_pipeline(
         &pool,
         Some(seeded_user_id(&pool, "rina@meridian.example").await),
-        None,
+        Some(first_tenant_of(&pool, "rina@meridian.example").await),
     )
     .await;
 
@@ -302,7 +343,7 @@ async fn an_author_without_the_obligation_gets_the_query_unchanged() {
     let id = seed_pipeline(
         &pool,
         Some(seeded_user_id(&pool, "yoga@meridian.example").await),
-        None,
+        Some(first_tenant_of(&pool, "yoga@meridian.example").await),
     )
     .await;
 
@@ -384,7 +425,7 @@ async fn a_refused_construct_is_refused_with_the_fixed_message_only() {
     let id = seed_pipeline(
         &pool,
         Some(seeded_user_id(&pool, "rina@meridian.example").await),
-        None,
+        Some(first_tenant_of(&pool, "rina@meridian.example").await),
     )
     .await;
 
@@ -401,6 +442,11 @@ async fn a_refused_construct_is_refused_with_the_fixed_message_only() {
 /// The orchestrator-only rule: a seeded Data Engineer holds `pipeline:*`
 /// (so they pass the policy floor) and is still refused, because this
 /// route answers for every tenant's pipelines.
+///
+/// The pipeline below has no tenant of its own on purpose: the refusal
+/// is the caller's, and it comes before the tenant gate (`SEC-50`) — a
+/// pipeline with no tenant would be refused by that gate, so this test
+/// also proves the order.
 #[tokio::test]
 async fn a_caller_who_is_neither_service_nor_admin_is_refused() {
     let (router, pool, _cookie) = app().await;
@@ -461,7 +507,12 @@ async fn the_authors_roles_are_read_at_enforcement_time_not_at_create() {
     let (router, pool, cookie) = app().await;
     seed_mask(&pool, "Analyst").await;
     let author = seeded_user_id(&pool, "yoga@meridian.example").await;
-    let id = seed_pipeline(&pool, Some(author), None).await;
+    let id = seed_pipeline(
+        &pool,
+        Some(author),
+        Some(first_tenant_of(&pool, "yoga@meridian.example").await),
+    )
+    .await;
 
     let (status, body) = enforce(&router, &cookie, &id, SQL).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -583,4 +634,114 @@ async fn an_upstream_database_failure_loading_the_author_carries_no_upstream_tex
             "the upstream text {upstream:?} reached the response: {message}"
         );
     }
+}
+
+/// A tenant claims an upload table, the way an upload does.
+async fn claim_table_for(pool: &PgPool, tenant: &str) {
+    let claimed = claim_table(
+        pool,
+        tenant.parse::<Uuid>().expect("a seeded tenant id"),
+        BRONZE_TABLE,
+        "upload-group-orders",
+    )
+    .await
+    .expect("claim the upload table for the tenant");
+    assert!(claimed, "the tenant must hold the claim");
+}
+
+/// `SEC-50`: a pipeline acts as its OWN tenant, so a pipeline of tenant B
+/// may not read an upload table that tenant A claimed — the one path in
+/// this service that can name another tenant's `bronze.*` table. The
+/// refusal is `SEC-20`'s, and it comes before the statement reaches the
+/// engine.
+#[tokio::test]
+async fn a_pipeline_cannot_read_an_upload_table_another_tenant_claimed() {
+    let (router, pool, cookie, engine) = app_with_engine().await;
+    // The table belongs to the catalog's tenant; the pipeline belongs to
+    // the other one.
+    claim_table_for(&pool, CATALOG_TENANT).await;
+    let id = seed_pipeline(
+        &pool,
+        Some(seeded_user_id(&pool, "sari@meridian.example").await),
+        Some(OTHER_TENANT.parse::<Uuid>().expect("a seeded tenant id")),
+    )
+    .await;
+
+    let (status, body) = enforce(&router, &cookie, &id, BRONZE_SQL).await;
+
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"].as_str(), Some(BRONZE_REFUSAL), "{body}");
+    let requests = engine
+        .received_requests()
+        .await
+        .expect("the mock engine records requests");
+    assert!(
+        requests.is_empty(),
+        "the refusal precedes the engine: nothing may be asked: {requests:?}"
+    );
+}
+
+/// The other half of the same rule: the tenant that HOLDS the table
+/// reads it, and the pipeline's own tenant is the one that acts.
+#[tokio::test]
+async fn a_pipeline_reads_an_upload_table_its_own_tenant_claimed() {
+    let (router, pool, cookie, _engine) = app_with_engine().await;
+    claim_table_for(&pool, OTHER_TENANT).await;
+    let id = seed_pipeline(
+        &pool,
+        Some(seeded_user_id(&pool, "sari@meridian.example").await),
+        Some(OTHER_TENANT.parse::<Uuid>().expect("a seeded tenant id")),
+    )
+    .await;
+
+    let (status, body) = enforce(&router, &cookie, &id, BRONZE_SQL).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["sql"].as_str(), Some(BRONZE_SQL), "{body}");
+}
+
+/// `SEC-50`: a pipeline with no tenant of its own reaches nothing — the
+/// migration's own fail-closed rule for an unassigned pipeline.
+#[tokio::test]
+async fn a_pipeline_with_no_tenant_is_refused() {
+    let (router, pool, cookie, _engine) = app_with_engine().await;
+    claim_table_for(&pool, OTHER_TENANT).await;
+    let id = seed_pipeline(
+        &pool,
+        Some(seeded_user_id(&pool, "sari@meridian.example").await),
+        None,
+    )
+    .await;
+
+    let (status, body) = enforce(&router, &cookie, &id, BRONZE_SQL).await;
+
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"].as_str(), Some(BRONZE_REFUSAL), "{body}");
+}
+
+/// `SEC-50`: the author is applied as if they had sent the pipeline's
+/// tenant in `X-Tenant`, so an author who left that tenant is refused —
+/// the same 404 a header naming a foreign tenant gets.
+#[tokio::test]
+async fn an_author_who_left_the_pipelines_tenant_is_refused() {
+    let (router, pool, cookie, _engine) = app_with_engine().await;
+    claim_table_for(&pool, OTHER_TENANT).await;
+    let author = seeded_user_id(&pool, "sari@meridian.example").await;
+    let id = seed_pipeline(
+        &pool,
+        Some(author),
+        Some(OTHER_TENANT.parse::<Uuid>().expect("a seeded tenant id")),
+    )
+    .await;
+    // The author leaves the tenant the pipeline belongs to.
+    sqlx::query("DELETE FROM app_user_tenant WHERE user_id = $1")
+        .bind(author)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let (status, body) = enforce(&router, &cookie, &id, BRONZE_SQL).await;
+
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"].as_str(), Some("tenant not found"), "{body}");
 }
