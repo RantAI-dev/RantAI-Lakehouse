@@ -530,8 +530,11 @@ the handoff started, and the final verification above ran on the restored tree.
 - **NIT 1.** `GoldExportError::TenantGateRefused` has no `#[from]`; the gate call
   wraps the error explicitly.
 - **NIT 2.** `docs/OPERATIONS.md` and the feature page now say that the 422
-  hits the scheduled export, a manual trigger done as a service and the
-  assistant's own tool -- not only the schedule.
+  hits the scheduled export and a manual trigger done as a service -- not only
+  the schedule. (Corrected by `PR #281 review round 2 S1`: the assistant's own
+  tool is a SIGNED-IN PERSON's call -- `routes/ai/tools/gold.rs` gates it as
+  `Caller` -- so it never reaches this 422; a person of another tenant gets the
+  gate's own 404 instead.)
 
 #### Two changes the review did not ask for, and why
 

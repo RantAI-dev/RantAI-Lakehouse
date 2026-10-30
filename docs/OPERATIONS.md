@@ -1592,11 +1592,14 @@ catalog belongs to the tenant this setting names:
 - **the Gold export** is gated by whoever asked for it: a signed-in
   person acts as themselves, so their own tenant must own the shared
   catalog, while a service identity or the shared run token — the
-  scheduled export, a manual trigger done as a service, the assistant's
-  own tool — has no user behind it and acts as the tenant that owns the
-  shared catalog. A deployment with several tenants and no
-  `CATALOG_TENANT_ID` **refuses the export outright**, with a 422 that
-  names this setting;
+  scheduled export, a manual trigger done as a service — has no user
+  behind it and acts as the tenant that owns the shared catalog. The
+  assistant's own tool is a **signed-in person's** call, so it is gated as
+  that person, not as the catalog's tenant. A deployment with several
+  tenants and no `CATALOG_TENANT_ID` **refuses the job-with-no-user
+  export outright**, with a 422 that names this setting; a signed-in
+  person of another tenant is refused too, but with the gate's own 404
+  (the mart reads "not available to your organisation");
 - the **dashboards, the embeds, the public links and the alerts** read the
   same shared catalog and follow in the second slice of `SEC-50`. They are
   **not** gated yet, so they still serve what they served before.
