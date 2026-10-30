@@ -313,7 +313,7 @@ parity), built after it.
 
 | Item | Status | Blocked by | Blocks |
 | --- | --- | --- | --- |
-| `BI-18` | Building | — | `AI-2`, `AI-9` (templates part) |
+| `BI-18` | Building | — | `AI-2`, `AI-9` (templates part), `QS-5` (the dashboard date filter) |
 | `BI-14` | Planned | — | `AI-13` |
 | `BI-16` | Building | — | `AI-5` (per chart type as it lands) |
 | `BI-17` | Building | — | `AI-8` |
@@ -321,7 +321,7 @@ parity), built after it.
 | `BLD-1` | Building | — | `REL-6` |
 | `DATA-4` | Planned | — | `DATA-3` |
 | `DEC-8` | Decided | — | `AI-11` |
-| `QS-5` | Planned | — | `AI-12` (variables part) |
+| `QS-5` | Planned | `BI-18` (the dashboard date filter) | `AI-12` (variables part) |
 | `SEC-20` | In Progress | — | `QS-3` |
 | `AI-11` | Planned | `BI-19`, `DEC-8` | — |
 | `AI-12` | Building | `QS-5` (variables part) | — |
