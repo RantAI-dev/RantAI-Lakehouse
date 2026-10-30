@@ -1111,7 +1111,15 @@ async fn change_capture_setup_checks(
     if info.adapter.as_deref() != Some("cdc") {
         return Ok(Vec::new());
     }
-    let tables = super::capture_lag::selected_tables(pool(state)?, id).await?;
+    // Slice 4 review SHOULD-FIX 9: the checks never change the outcome of a test, so a
+    // store error here is logged (class only) and answers no checks, not a 500.
+    let tables = match super::capture_lag::selected_tables(pool(state)?, id).await {
+        Ok(tables) => tables,
+        Err(err) => {
+            tracing::warn!(?err, connector_id = %id, "the tables for the setup checks could not be read");
+            return Ok(Vec::new());
+        }
+    };
     Ok(crate::cdc_setup_probe::setup_checks(
         info,
         state.connector_secret_resolver.as_ref(),
