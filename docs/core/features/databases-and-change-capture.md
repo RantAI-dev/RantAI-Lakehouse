@@ -48,12 +48,50 @@ Live change capture:
   read is lost.
 - **`date` and `timestamp` (without time zone) columns arrive as integers**
   (Debezium's temporal types) and their Bronze column is an integer.
-- **Oracle, SQL Server, MySQL and MongoDB capture are added by their own slices**;
-  until then their connector types are listed as not supported, as below.
-- **MySQL CDC and SQL Server CDC are listed as not supported** since
-  `SRC-9` decision 8 (migration `0066`): their settings could not run.
-  Oracle CDC is refused by the API. MongoDB CDC has no type; the MongoDB
-  test database is a single server, and change streams need a replica set.
+- **MySQL and SQL Server change capture run the same way** (`SRC-4` slice 3):
+  the same worker, the same applier, the same two load modes, and the types
+  "MySQL CDC" and "SQL Server CDC" are supported again (migration `0117`). Each
+  has its own gate in CI (`g4-mysql`, `g4-mssql`), which creates the connector
+  through the API and reads the result back. What each source needs, all proven
+  by the gates with a user that is not `root` or `sa`:
+  - **MySQL**: `log_bin` on, `binlog_format=ROW`, `binlog_row_image=FULL` (MySQL
+    8's defaults; the gate asserts them). The user needs `SELECT` on the
+    database, and the global `RELOAD`, `SHOW DATABASES`, `REPLICATION SLAVE` and
+    `REPLICATION CLIENT`. The connector needs a `serverId` (a number no other
+    replica of that server uses, 1 to 4294967295), which the console asks for and
+    never fills in.
+  - **SQL Server**: SQL Server Agent running; CDC enabled on the database
+    (`sys.sp_cdc_enable_db`) and on each table (`sys.sp_cdc_enable_table`) by an
+    administrator; a login that is not `sa` with `SELECT` on the tables and on the
+    `cdc` schema, and `VIEW DATABASE STATE`. Debezium also calls
+    `sys.sp_cdc_help_jobs` to read the capture job's polling interval; that
+    procedure needs `db_owner` (Microsoft's documentation), so with the grants
+    above Debezium logs a warning and goes on, and the gate passes
+    (`docs/superpowers/plans/2026-10-29-src-4-databases-cdc.md`, Slice 3 handoff).
+  - **A new column in SQL Server is not picked up by itself.** A capture instance
+    has the columns the table had when it was enabled. To add a column: add it to
+    the table; enable a second capture instance on the table
+    (`sys.sp_cdc_enable_table @capture_instance = '<schema>_<table>_v2', ...`);
+    change a row; once the column has reached Bronze, drop the old instance
+    (`sys.sp_cdc_disable_table @capture_instance = '<old name>'`). A table may
+    have two instances at a time. The gate runs the first three steps.
+  - **TLS to the source.** `require` encrypts and takes the certificate as
+    presented. `verify-ca` and `verify-full` use Kafka Connect's own trust store,
+    so the source's CA must be in the worker's image or mounted into it; the
+    gates run `require`, and the renderer's unit tests cover the other modes. For
+    SQL Server `verify-ca` is stricter than its name, never looser: the driver
+    cannot check the chain without the host name.
+  - **The schema-history topic is kept.** `MySQL` and `SQL Server` connectors keep
+    their table definitions in a Kafka topic, `cdc.<connector id>.schema-history`,
+    which needs the broker address (`CDC_KAFKA_BOOTSTRAP` on the API as well as
+    on the code location; unset, the connector answers "not supported on this
+    deployment"). Debezium creates it with retention `Long.MAX_VALUE` (measured in
+    CI), so the broker's 7-day retention does not apply to it and a connector can
+    restart after any time. It is never deleted with the connector (Kafka
+    Connect has no topic API); it is a few kilobytes.
+- **Oracle and MongoDB capture are added by their own slices.** Oracle CDC is
+  refused by the API. MongoDB CDC has no type; the MongoDB test database is a
+  single server, and change streams need a replica set.
 - **No lag in time is measured.** A job measures the PostgreSQL slot's
   retained bytes, for the deployment's own database only; `health.rs` says
   plainly that bytes cannot be turned into seconds honestly.

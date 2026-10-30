@@ -293,6 +293,8 @@ them with `--profile cdc` and set in `.env`:
 - `CDC_KAFKA_BOOTSTRAP=kafka:9092` (the Dagster applier reads the topics and
   writes Bronze).
 
+`MySQL` and `SQL Server` connectors also keep a schema-history topic on the
+broker, so the API needs `CDC_KAFKA_BOOTSTRAP` too (compose passes it to both).
 Both unset means change capture is off: a change-capture connector answers
 `supported: false` and nothing is started. The source password never appears in
 a connector's JSON: `lakehouse-api` writes it to `/run/cdc-secrets/<connector id>`
