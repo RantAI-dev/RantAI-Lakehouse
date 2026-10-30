@@ -1046,3 +1046,51 @@ name only code that exists; `OPERATIONS.md` says the leftover Lakekeeper
 `debezium` principal and grant can be revoked by hand. Checked by the planner:
 CI run on `803735c0` success, 34 of 34 jobs (G4 change capture into Bronze
 among them), Security 5 of 5. No open `BLOCKER`. Slice 2 is closed.
+
+### Slice 5, review round 1 (planner, 2026-10-30, head `6941cb33`; code at `48046107`)
+
+Checked by the planner: CI on PR #277 at `48046107`, 42 of 42 jobs passed,
+`g4-mongo` among them. The two commits after it change only docs. Read: the
+dial and its parse rules, the re-point identity, `check_dial_ssrf`, the renderer
+and its tests, the allowlist, migration 0119, `cdc_lifecycle::provision`, the
+orchestrator test and its recording, `cdc_apply` (`topic_of`, `key_id`,
+`document_to_columns`), `discover._cdc_mongo` and the console form. The
+deviations listed in the handoff are accepted: bare collection names, the
+separate form file, the gate's own orchestration, a gate run with TLS
+`disable`, and the test and listing dialling one host. Also accepted, as the
+feature page now states them: `require` skips only the host-name check, and a
+nested value stops the table's load.
+
+**BLOCKER 1 (S5-b, the planner's decision): one host only, always
+`directConnection=true`.** With several seeds, the worker dials the member
+addresses the replica set reports. Nothing checks those addresses against the
+installation's address rules, and no gate covers that case. That is not fail
+closed (AGENTS.md principle 3). Fix:
+
+- `validate_cdc_mongo_dial_post_parse` refuses any `hosts` that is not exactly
+  one entry, with one fixed sentence that names the field.
+- `render_mongodb_connect_config` refuses the same and always writes
+  `directConnection=true`.
+- The console form shows one host field, with no "Add host" or "Remove". The
+  contract keeps `hosts: string[]`, so the shape can grow later.
+- A test refuses a two-host dial at parse time and at render time.
+- The feature page "Limits", `OPERATIONS.md` and `CHANGELOG.md` say only that
+  the connector takes one host, which must be a member the connector can read
+  change streams from. Remove the sentences about advertised addresses.
+- If the gate shows what happens when that host stops being primary, write it
+  down. If not, write *not verified*.
+- Anything that needs the dial to change shape again: stop and report.
+
+**SHOULD-FIX 1.** The `replicaSet` refusal sentence in
+`validate_cdc_mongo_dial_post_parse` carries a run of spaces. The string
+literal wraps across lines without a `\`. Make it one sentence with single
+spaces, and test the exact text.
+
+**SHOULD-FIX 2.** In `check_dial_ssrf`, a `CdcMongo` seed that does not split
+into `host:port` is skipped with `continue`. Refuse it with a fixed
+`BadRequest` sentence instead. `Dial::parse` already refuses it, but a check
+that fails open on bad input is the wrong default.
+
+**Note, not a finding of this slice.** The worker log reports Debezium
+3.7.0.Final while the image tag says 3.8. Slice 4 or the phase PR reconciles
+the version claim (AGENTS.md principle 5).
