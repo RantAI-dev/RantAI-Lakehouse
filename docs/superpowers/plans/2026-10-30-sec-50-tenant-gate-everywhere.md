@@ -181,6 +181,7 @@ Listed so the scope is fixed now. A separate plan section and PR.
   rule.
 - **S6.** The report runner (tick and send-now): `GateActor::Caller` with the subscription
   owner's principal and an empty `HeaderMap`, which means the owner's first tenant.
+- **S8** (review round 1). Gate the two fingerprint reads, or document why not: `publication_body` (`gold.rs:~775`) and `pipeline_lag::clickhouse_fingerprint_token` (`pipeline_lag.rs:279`).
 - **S7.** Tests: for each route, a non-catalog tenant is refused, the catalog tenant passes, and
   `*:*` passes. Plus the mutation checks of section 5.
 
@@ -379,3 +380,115 @@ which is the route's own path.
 - No pull request was opened or merged (the developer never does).
 
 ## 9. Review (planner appends below)
+
+### Review round 1 (planner, 2026-10-30, at `1f15d91f`)
+
+The review covers `8343ccf6..1f15d91f` and the handoff. An independent read-only pass read the
+whole diff and the CI workflow. I checked both blockers myself in `ci.yml` and the harnesses.
+
+**What holds:**
+- **The gate.** `Caller` is unchanged for Query Studio. `AsTenant(None)` gives `NoTenant`.
+  `AsTenant(Some)` goes through `tenant_scope::headers_for_tenant` and `resolve_reach`, one rule,
+  not two. `CatalogTenant` gives `All`, then `Tenant`, then the D6 sentence, byte for byte.
+- **Pipelines.** The gate runs before the role rewrite and before the engine, and the test proves
+  the engine is never asked. The wrong doc comment is corrected truthfully.
+- **Gold.** The route gates before the fingerprint, and `export_mart` gates before the count, the
+  `LIMIT 0` probe and the batch.
+- **The three files outside the plan** are justified: `mod query` becomes `pub(crate)`, which
+  `gold_export.rs` needs; `tenant_scope::headers_for_tenant` reuses `resolve`; `gold.rs` was named
+  in T3.
+- **No assertion was weakened.** The `column_lineage_pipeline.rs` fixture change (`abda61c4`) and
+  the `pipeline_enforce.rs` fixture change in T2 are both right under D5. The handoff should have
+  named the second one.
+
+#### Planner decisions for this round (amend D3 and D5)
+
+- **R1, amends D5.** A `*:*` author passes `AsTenant` in both cases, `None` or `Some(t)` whether
+  or not the author is in `t`. This is `SEC-20`'s signed rule ("a principal holding `*:*`
+  passes"), and an unrestricted principal reads everything in Query Studio anyway, so a pipeline
+  running as that principal reaches no more than the principal does. Check `is_unrestricted`
+  first in the `AsTenant` arm, and say so in the doc at `authored_pipelines.rs:1368-1393`.
+- **R2.** On `POST /api/pipelines/runnable/{id}/enforce`, which only the orchestrator calls, a
+  gate refusal answers **422** with the same fixed sentence, not 404.
+  - The orchestrator treats only 409 and 422 as final (`authored_factory.py:413`). A 404 is
+    retried as a transient failure and shows the operator a generic `HTTPError`.
+  - `SEC-20`'s reasons for a 404 (no oracle for a person, Query Studio's *Run all*) do not apply
+    to a service caller.
+- **R3.** A pipeline whose `tenant_id` is NULL, with an author who is not `*:*`, is refused with
+  its own fixed **409**, before the gate: `This pipeline belongs to no tenant. An administrator
+  assigns one with PUT /api/pipelines/{id}/tenant.` The table sentence would mislead, and 409 is
+  final for the orchestrator.
+- **R4, amends D3.** Gold export:
+  - a **signed-in person** is gated as `GateActor::Caller`, so their tenant must own the
+    catalog;
+  - a **service principal or the run token** is gated as `CatalogTenant`.
+  D3 covers jobs with no user. A person from another tenant who holds `gold:export` must not
+  export the shared catalog.
+- **R5.** With no pool, `CatalogTenant` refuses with the D6 sentence (count `None` and the setting
+  set → refuse). That is `SEC-20`'s own rule: `catalog_tenant_refusal` refuses with no pool,
+  `routes/catalog.rs:173-175`.
+
+#### BLOCKER
+
+1. **The G7 check (`Rust · G3a Dagster + dlt Bronze ingest`) will go red.**
+   - `ops/g7/g7_pipeline_test.py:420-431` and `:933-946` create Bronze pipelines as the bootstrap
+     admin. That admin is `*:*` and has no tenant (`main.rs` `bootstrap_admin`), and no `X-Tenant`
+     is sent. So the pipelines are stored with a NULL tenant, and D5 refuses them with a 404.
+   - The job is green on `main`, runs on every Rust change, and was not run in the handoff.
+   - Fix: R1. The harness does not change.
+2. **The CI check `Rust · Gold export to Iceberg (ADR 0010)` will go red.**
+   - Its `.env` (`ci.yml:~2681-2702`) names no `CATALOG_TENANT_ID`, and migration `0002` seeds
+     four tenants. So `CatalogTenant` answers 422 to `ops/gold_export/gold_export_test.py:181`.
+   - Fix: add `CATALOG_TENANT_ID=11111111-1111-4111-8111-000000000001` to that job's `.env`, with
+     a comment saying why. This is exactly what #244 did for the two G8 jobs (`ci.yml:2777`,
+     `:2922`). It is D2/D3's documented contract, not a weaker gate.
+
+#### SHOULD-FIX
+
+1. R2: the 422 on the enforce route, with a test that a cross-tenant statement answers 422 there.
+2. R3: the 409 for a NULL-tenant pipeline, with a test.
+3. R4: Gold by a person is `Caller`. Test: a user of another tenant holding `gold:export` is
+   refused, and a user of the catalog's tenant passes.
+4. R5: `CatalogTenant` with no pool refuses. Add a unit test.
+5. **`export_mart`'s own gate is untested.** The AI tool's only gate is the one at
+   `gold_export.rs:~670`, and the route's gate fires first in every test. Add a test through
+   `export_mart` (or the AI tool) with several tenants and no setting: the D6 sentence, and
+   nothing reaches the engine. Run the mutation check on that gate and quote it.
+6. **R1's unit tests:** a `*:*` principal with `AsTenant(None)` and with `AsTenant(Some(t))` for a
+   `t` it is not in → `All`.
+7. **Docs that are not true for slice 1:**
+   - The boot warning (`main.rs:~1199-1206`) says dashboards, embeds, public links and alerts are
+     refused. They are not gated until slice 2. Name only what is gated now, and say the rest
+     follows in slice 2.
+   - `docs/OPERATIONS.md:~1577` says `.env.example` uses the same wording. Update `.env.example`
+     (`:559-565`) to match.
+   - `docs/OPERATIONS.md:~1599-1603`: without the setting, a regular member "sees no shared rows".
+     Not true for dashboards until slice 2. Also, with the setting unset there is no catalog
+     tenant at all, so "a member of any tenant other than the catalog's own" is wrong.
+   - Add to `OPERATIONS.md`: how to find pipelines with no tenant, and how to assign one (`PUT
+     /api/pipelines/{id}/tenant`), checked against the code. Since `0042` no backfill was ever
+     done, so older deployments have such pipelines, and R3 now refuses them.
+   - The feature page (`queries-scoped-to-the-tenant.md:~41`) says two paths can name
+     `bronze.*`. Only pipelines can (plan section 0).
+
+#### NIT
+
+- `TenantGateRefused(#[from] ApiError)` (`gold_export.rs:~145`) would turn any future `?` on an
+  `ApiError` in that file into "tenant gate refused". Use an explicit `.map_err`.
+- `OPERATIONS.md:~1591` says "the scheduled Gold export". The 422 also hits a manual or assistant
+  export done as a service.
+
+#### Added to slice 2 (section 4)
+
+- **S8.** The two fingerprint reads that remain ungated:
+  - `publication_body`'s fingerprint (`gold.rs:~775`, answers a boolean only);
+  - `pipeline_lag::clickhouse_fingerprint_token` (`pipeline_lag.rs:279`, orchestrator only).
+  Neither leaks rows. Gate both or document why not.
+
+**Open: 2 BLOCKERs.** One fix round, in order: BLOCKER 1 (R1), BLOCKER 2, then SHOULD-FIX 1-7,
+then the NITs.
+- Cite `PR #NN review round 1 B<n>/S<n>` at each site. The PR number is filled in when it is
+  opened; until then, cite `SEC-50 review round 1 B<n>/S<n>`.
+- Then the full verification block, plus the two CI checks above run locally if possible. If not,
+  say so: CI runs them on the PR.
+- Then a short round 1 handoff under section 8.
