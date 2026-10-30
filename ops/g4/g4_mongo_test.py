@@ -432,6 +432,26 @@ def _bulk_changes() -> None:
     _expect(range(100_001, 105_001), "c", "bulk_i")
 
 
+def step_lag_is_measured(connector_id: str) -> None:
+    """`SRC-4` Amendment 8, S8-b: after the changes of the freshness step, `GET .../change-capture`
+    carries a measured lag for both collections (slice 4's route; the sensor reads the topics through
+    `topic_of`, which names `cdc.<id>.<database>.<collection>`). No number is asserted: each table
+    reports a status, and a seconds value, when there is one, is not negative."""
+    try:
+        words = g._wait_up_to_date(connector_id, g.UP_TO_DATE_TIMEOUT_SECONDS)
+        tables = g._capture(connector_id)["lag"]["tables"]
+        names = {t.get("table") for t in tables}
+        if names != set(g.TABLES.values()):
+            raise G4Failure(f"the lag names the tables {sorted(map(str, names))}, expected {sorted(g.TABLES.values())}")
+        for t in tables:
+            if t.get("status") is None or (t.get("seconds") is not None and t["seconds"] < 0):
+                raise G4Failure(f"a table's lag is not a measured value: {t}")
+    except G4Failure as exc:
+        g._say("lag", "fail", str(exc))
+        raise
+    g._say("lag", "pass", f"after the changes: {words}")
+
+
 def step_pause_and_resume_lose_nothing(connector_id: str) -> None:
     paused = g.API.post(f"{g.API_URL}/api/connectors/{connector_id}/pause", timeout=30)
     if not paused.ok:
@@ -511,6 +531,7 @@ def main() -> int:
         g.step_first_copy_reached_bronze()
         step_ids_are_the_object_id_text()
         step_changes_visible_within_budget()
+        step_lag_is_measured(connector_id)
         step_pause_and_resume_lose_nothing(connector_id)
         step_restart_kafka_connect_during_changes(connector_id)
         g.step_schema_change_is_observed(connector_id)
