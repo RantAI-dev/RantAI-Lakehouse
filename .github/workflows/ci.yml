@@ -2706,12 +2706,21 @@ jobs:
           LAKEKEEPER_BASE_URI=http://lakekeeper:8181
           GOLD_EXPORT_RUN_TOKEN=ci-gold-export-token-not-a-real-secret
           DAGSTER_URL=http://dagster-webserver:3000/graphql
-          # SEC-50: the Gold export is a job with no user, so it acts as
-          # the tenant that owns this deployment's shared catalog. With
-          # the four migration-seeded tenants and no catalog tenant, the
-          # export is refused with a 422 that names this setting -- so
-          # this job needs it, exactly as the two G8 jobs already do
-          # (#244). Same contract, not a weaker gate.
+          # SEC-50: the shared catalog belongs to a tenant, and every
+          # multi-tenant deployment must name that tenant here -- with
+          # the four migration-seeded tenants and no catalog tenant there
+          # is no tenant whose reach covers the shared catalog, so a job
+          # with no user (the scheduled export, a service identity) is
+          # refused with a 422 that names this setting.
+          #
+          # THIS job's own harness signs in as the `*:*` bootstrap admin
+          # (`ops/gold_export/gold_export_test.py`'s `step_login`), so
+          # its export passes the gate as a `Caller` with every table in
+          # reach and does not lean on this setting -- but an exporter
+          # that is NOT an unrestricted admin does, and the setting
+          # belongs here either way. The same value and the same contract
+          # the two G8 jobs already use (#244) -- not a weaker gate.
+          # (PR #281 review round 2 NIT)
           CATALOG_TENANT_ID=11111111-1111-4111-8111-000000000001
           # DATA-2 review BLOCKER 2: credentials in CI-only .env matching the RustFS keys
           CONNECTOR_S3_ACCESS_KEY=ci-only-rustfs-access
