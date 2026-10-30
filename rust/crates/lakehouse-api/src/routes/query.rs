@@ -236,6 +236,15 @@ pub(crate) enum GateActor<'a> {
     /// belong to it is refused with the same 404 an `X-Tenant` header
     /// naming a foreign tenant gets. `None` means the site has no
     /// tenant at all, and reaches nothing.
+    ///
+    /// `SEC-50` R1: a principal holding the unrestricted (`"*:*"`) grant
+    /// passes this actor TOO, in both cases — with a tenant and without
+    /// one, whether or not the principal belongs to that tenant. That is
+    /// `SEC-20`'s own signed rule ("a principal holding `*:*` passes"),
+    /// and it is safe here for the same reason it is safe in Query
+    /// Studio: an unrestricted principal already reads everything there,
+    /// so a statement running as that principal reaches no more than the
+    /// principal itself reaches.
     AsTenant {
         principal: &'a Principal,
         tenant_id: Option<Uuid>,
@@ -311,19 +320,40 @@ async fn reach_for_actor(state: &AppState, actor: GateActor<'_>) -> Result<Tenan
         GateActor::AsTenant {
             principal,
             tenant_id,
-        } => match tenant_id {
-            // D5: the site has no tenant at all (a pipeline whose own
-            // `tenant_id` is NULL). It reaches nothing — the migration's
-            // own fail-closed rule.
-            None => Ok(TenantReach::NoTenant),
-            // D5: the tenant is checked and resolved exactly as an
-            // `X-Tenant` header is, so the reach is the one the
-            // principal would have with that header — one rule, not two.
-            Some(tenant_id) => {
-                let headers = crate::tenant_scope::headers_for_tenant(tenant_id)?;
-                resolve_reach(state, principal, &headers).await
+        } => {
+            // `SEC-50` R1 (review round 1, BLOCKER 1): the unrestricted
+            // grant is checked FIRST, before the tenant is looked at at
+            // all. `SEC-20`'s own rule is that a principal holding
+            // `*:*` passes, and it is the same rule here: an
+            // unrestricted principal reads every table in Query Studio
+            // already, so a statement that runs as that principal
+            // reaches no more than the principal itself reaches.
+            //
+            // Checked first, this also answers the case of a site with
+            // NO tenant of its own (a pipeline whose `tenant_id` is
+            // NULL): an unrestricted author reads everything, so the
+            // pipeline is not refused for the tenant it never had.
+            // Without this, the G7 harness's bootstrap-admin pipelines
+            // (created by a `*:*` admin that belongs to no tenant) would
+            // be refused for a tenant they never had.
+            if crate::routes::catalog::is_unrestricted(principal) {
+                return Ok(TenantReach::All);
             }
-        },
+            match tenant_id {
+                // D5: the site has no tenant at all (a pipeline whose own
+                // `tenant_id` is NULL). It reaches nothing — the
+                // migration's own fail-closed rule.
+                None => Ok(TenantReach::NoTenant),
+                // D5: the tenant is checked and resolved exactly as an
+                // `X-Tenant` header is, so the reach is the one the
+                // principal would have with that header — one rule, not
+                // two.
+                Some(tenant_id) => {
+                    let headers = crate::tenant_scope::headers_for_tenant(tenant_id)?;
+                    resolve_reach(state, principal, &headers).await
+                }
+            }
+        }
         GateActor::CatalogTenant => {
             let tenant_count = deployment_tenant_count(state).await?;
             catalog_tenant_reach(tenant_count, state.config.catalog_tenant_id)
@@ -4993,6 +5023,21 @@ mod sec50_gate_tests {
         }
     }
 
+    /// `SEC-50` R1: a principal holding the unrestricted (`"*:*"`) grant.
+    /// It belongs to no tenant at all, exactly like the bootstrap admin
+    /// the G7 harness creates its pipelines as.
+    fn unrestricted_principal() -> Principal {
+        Principal {
+            id: PrincipalId::User(Uuid::from_u128(2)),
+            tenant_ids: Vec::new(),
+            display_name: "Bootstrap Admin".to_owned(),
+            permissions: PermissionSet::parse("*:*"),
+            provider: "session".to_owned(),
+            must_change_password: false,
+            role_names: Vec::new(),
+        }
+    }
+
     /// A state with no pool at all: the deployment's own answers are
     /// missing, so the gate must fail closed rather than guess.
     fn state_without_a_database() -> AppState {
@@ -5060,6 +5105,47 @@ mod sec50_gate_tests {
         .await
         .expect("the reach of a site with no tenant at all");
         assert_eq!(reach, TenantReach::NoTenant);
+    }
+
+    /// `SEC-50` R1 (review round 1, BLOCKER 1): a principal holding the
+    /// unrestricted grant reaches everything, even through a site that
+    /// acts as no tenant at all. `SEC-20`'s own rule is that such a
+    /// principal passes, and it reads every table in Query Studio
+    /// already.
+    #[tokio::test]
+    async fn an_unrestricted_principal_reaches_everything_even_as_a_site_with_no_tenant() {
+        let state = state_without_a_database();
+        let principal = unrestricted_principal();
+        let reach = reach_for_actor(
+            &state,
+            GateActor::AsTenant {
+                principal: &principal,
+                tenant_id: None,
+            },
+        )
+        .await
+        .expect("the reach of an unrestricted principal");
+        assert_eq!(reach, TenantReach::All);
+    }
+
+    /// `SEC-50` R1: the same rule for a site that acts as a NAMED tenant
+    /// the principal does not belong to — the unrestricted grant is
+    /// checked before the tenant, so the principal is not refused for a
+    /// tenant it never had.
+    #[tokio::test]
+    async fn an_unrestricted_principal_reaches_everything_even_as_a_tenant_it_is_not_in() {
+        let state = state_without_a_database();
+        let principal = unrestricted_principal();
+        let reach = reach_for_actor(
+            &state,
+            GateActor::AsTenant {
+                principal: &principal,
+                tenant_id: Some(OTHER_TENANT),
+            },
+        )
+        .await
+        .expect("the reach of an unrestricted principal");
+        assert_eq!(reach, TenantReach::All);
     }
 
     #[tokio::test]

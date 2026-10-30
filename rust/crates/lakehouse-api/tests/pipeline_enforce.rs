@@ -719,6 +719,33 @@ async fn a_pipeline_with_no_tenant_is_refused() {
     assert_eq!(body["error"].as_str(), Some(BRONZE_REFUSAL), "{body}");
 }
 
+/// `SEC-50` R1 (review round 1, BLOCKER 1): an author holding the
+/// unrestricted (`*:*`) grant reaches everything, so a pipeline of such an
+/// author is not refused for a tenant it never had — neither for a
+/// pipeline with no tenant of its own, nor for one in a tenant the author
+/// is not a member of.
+///
+/// This is the shape the G7 harness creates: the bootstrap admin holds
+/// `*:*`, belongs to no tenant, and creates its Bronze pipelines with no
+/// `X-Tenant` header, so the pipeline is stored with no tenant.
+#[tokio::test]
+async fn a_pipeline_authored_by_an_unrestricted_principal_is_not_refused_for_its_tenant() {
+    let (router, pool, cookie, _engine) = app_with_engine().await;
+    claim_table_for(&pool, OTHER_TENANT).await;
+    // `fajar` is the seeded Platform Admin: its role grants `*:*`.
+    let id = seed_pipeline(
+        &pool,
+        Some(seeded_user_id(&pool, "fajar@meridian.example").await),
+        None,
+    )
+    .await;
+
+    let (status, body) = enforce(&router, &cookie, &id, BRONZE_SQL).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["sql"].as_str(), Some(BRONZE_SQL), "{body}");
+}
+
 /// `SEC-50`: the author is applied as if they had sent the pipeline's
 /// tenant in `X-Tenant`, so an author who left that tenant is refused —
 /// the same 404 a header naming a foreign tenant gets.

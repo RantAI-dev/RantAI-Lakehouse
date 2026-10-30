@@ -1375,6 +1375,16 @@ pub struct EnforceBody {
 /// may not read tenant A's uploaded table, which is the one path in this
 /// service that can name a `bronze.*` table.
 ///
+/// `SEC-50` R1: an author who holds the unrestricted (`"*:*"`) grant
+/// passes this gate whatever the pipeline's own tenant is — including a
+/// pipeline with no tenant at all, and a tenant the author does not
+/// belong to. That is `SEC-20`'s own signed rule ("a principal holding
+/// `*:*` passes"), and it is safe here for the same reason it is safe in
+/// Query Studio: an unrestricted principal already reads every table
+/// there, so a pipeline running as that principal reaches no more than
+/// the principal itself reaches. The check is made before the tenant is
+/// looked at, in [`crate::routes::query::GateActor::AsTenant`]'s own arm.
+///
 /// # Who may call it
 ///
 /// The same rule as [`runnable`]: a service identity or a Platform Admin,
