@@ -92,4 +92,51 @@ Any change to what counts as a reader, the lag rules themselves, or `pipeline_la
 
 ## 6. Handoff (developer appends below)
 
+### Handoff (written by the planner from the developer's logs)
+
+Both developer sessions ended early, and neither wrote this entry. The first was stopped when the
+planner's turn was interrupted. The second failed with a provider error (MiniMax `2013 invalid
+params`) after its full test run had finished. The planner copied the lines below from the
+developer's own logs on the planner machine, at `cda966e1`. It did not re-run them here.
+
+**Commits**
+- `c1b386f1` test(store): the batched lag reader check agrees with the per-row count (BLD-6 T1)
+- `cda966e1` refactor(store): one lag reader predicate for both queries (BLD-6 T2)
+
+**Commands and counts**, all on `cda966e1`, through `bin/cargo-locked`, with `-j 2`:
+
+| Command | Result |
+| --- | --- |
+| `cargo fmt --check` | clean (empty output) |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | `Finished dev profile ... in 7m 31s` |
+| `cargo test -p lakehouse-store --test pipelines lag` | `ok. 15 passed; 0 failed` |
+| `cargo test -p lakehouse-api pipeline_lag` | `ok. 42 passed; 0 failed` |
+| `cargo test --workspace` | 159 binaries, 8,550 passed, 0 failed, 51 ignored |
+
+**Mutation check (plan T2).** With the shared predicate broken in a scratch edit,
+`the_batched_lag_reader_check_agrees_with_the_per_row_count ... FAILED` (`test result: FAILED. 0
+passed; 1 failed`, in `/tmp/bld6-mutation.log` and `/tmp/bld6-mutation3.log`). The tree was clean
+afterwards (`git status` showed no tracked change at `cda966e1`).
+
+**Not verified:** `git status` after the full run was not recorded by the developer. The planner
+checked the worktree afterwards and found no tracked change.
+
 ## 7. Review (planner appends below)
+
+### Review round 1 (planner, 2026-10-30, at `cda966e1`)
+
+- **The SQL means the same.** I checked each placeholder against the old text.
+  - Per-row: `p.tenant_id = $3`, `p.id != $1`, `p.source = $2`, and `u.tenant_id = $3 AND
+    u.target = $2` in the `depends_on` branch.
+  - Batched: the same, with `c.tenant_id`, `c.id`, `c.target`.
+  - The NULL-tenant early `return Ok(0)` is kept (D4). Both signatures are unchanged, and
+    `pipeline_lag.rs` is untouched.
+- **`format!`** takes only the six constant expressions, values stay bound, and both sites carry
+  the `SEC-41` comment (D1).
+- **The test covers every case D2 lists**, plus one: a reader without a target lag does not
+  count. It writes the self-reading row with a bound `UPDATE`, because the store refuses to
+  create one. That is right, and the test says why.
+- **Nit, not a finding:** the batched doc says "D3: the store test ... keeps the two answers in
+  step". In this plan the test is D2 and the comment is D3. Fix it when the file is next touched.
+
+**Open: no BLOCKER, no SHOULD-FIX.**
