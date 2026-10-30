@@ -122,11 +122,14 @@ class MongoSource(g.Source):
                 collection.insert_many(
                     [document(n, f"seed_{n}", "seed", (n % 1000) + 0.5) for n in range(lo, min(lo + 5000, g.SEED_ROWS + 1))]
                 )
-        admin_db = self.client["admin"]
-        if admin_db.command("usersInfo", CDC_USER)["users"]:
-            admin_db.command("dropUser", CDC_USER)
+        # The user lives in the captured database itself: the connector's `mongodb.authsource` and the
+        # orchestrator's `authSource` are both the dial's database (decision S5-c). It is dropped with
+        # the database above, so a rerun starts clean.
+        users = self.client[DATABASE]
+        if users.command("usersInfo", CDC_USER)["users"]:
+            users.command("dropUser", CDC_USER)
         # The least-privilege user (decision S5-h): the built-in `read` role on the one database.
-        admin_db.command("createUser", CDC_USER, pwd=self.password, roles=[{"role": "read", "db": DATABASE}])
+        users.command("createUser", CDC_USER, pwd=self.password, roles=[{"role": "read", "db": DATABASE}])
 
     def add_column_and_observe(self) -> None:
         # A new field in one document is a new column: MongoDB has no schema to alter.
