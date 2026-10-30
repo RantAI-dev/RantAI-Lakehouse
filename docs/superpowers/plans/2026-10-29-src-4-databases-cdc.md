@@ -1325,3 +1325,30 @@ privileges` missing alone with `REPLICATION SLAVE` granted; `g4-mssql` (7m20s) `
 `CDC on table dbo.orders_plain` missing alone. Locally: `cargo fmt --check` clean, `test_cdc_apply.py` 56
 passed, `test_cdc_gate.py` 10, `bun test src/features/connectors` 428 passed, `tsc` clean, lint 0 errors. Not
 verified locally: every Rust change and the gates (CI only).
+
+### Slice 4, review round 2 (planner, 2026-10-30, code `9bcc546f`): closed
+
+Checked by the planner: CI run 41019425163 on `9bcc546f` success (the three
+change-capture gates among the jobs). Fix commits read against round 1:
+SHOULD-FIX 1 (the doc says upper bound); 2 (a future source time stored as
+now with a `warn`, route test); 3 (the resume moves `caught_up_at` in the
+transaction that clears the pause, store test); 4 (a missing topic is
+`None` in the lag post, 0 only for the sensor's run decision, unit test);
+5 (Pause and Resume render from `pausedReason` when the state read fails,
+test); 6, 7, 8 (`@@expire_logs_days` read, an empty Agent result is
+`unchecked`, the `GRANT` names `CURRENT_USER()`); 9 (a store error answers
+no checks); 10 (the alert text asserted, the MySQL login lacks only
+`REPLICATION CLIENT`, the setting-name list asserted per gate). Each fix
+cites its finding at the site.
+
+Accepted as a known edge, not a finding: a failed read of
+`@@expire_logs_days` counts as 0, because MySQL 8.4 removed the variable and
+a failed read cannot be told apart from that. A server that refuses the read
+for another reason and has `binlog_expire_logs_seconds = 0` reads "never
+expire". Reading a global variable needs no privilege, so this is not
+expected in practice. NITs left open, as the handoff says: the `USE [db];`
+prefix, the probe `debug` line, and the `?tab=capture` wait.
+
+No open `BLOCKER`. Slice 4 is closed. Next: slice 5 (MongoDB, session
+lakehouse-35) merges in hunk by hunk and adds MongoDB's setup check on this
+mechanism; then slice 6 (Oracle).
