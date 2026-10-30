@@ -954,6 +954,35 @@ Count tests will clash with slice 3/4 additions: 27 connector types (`tests/conn
 22 supported types (lint test, `test_gate_summary.py`) assume this branch's own additions only.
 Migration 0119 is mine; 0118 is untouched.
 
+### Slice 5, round 1 fixes (developer, Sonnet, 2026-10-30)
+
+Commit `ef25a462` on `feat/src-4-slice-5` (after the review commit `69b7eec1`). It answers the three
+findings of "Slice 5, review round 1"; each fix site cites the finding.
+
+- *BLOCKER 1.* `Dial::parse` refuses any `hosts` that is not one entry (`CDC_MONGO_ONE_HOST`, one fixed
+  sentence naming the field); `render_mongodb_connect_config` refuses the same (`InvalidMongoHosts`) and
+  always writes `directConnection=true`. Tests: a two-host dial refused at parse (exact sentence) and at
+  render; the re-point and parse fixtures are one-host. The console form has one host field, no add or
+  remove (a test pins that); the contract keeps `hosts: string[]`. "Limits", `OPERATIONS.md` and
+  `CHANGELOG.md` now say only that the connector takes one host that change streams can be read from;
+  the advertised-address sentences are removed. What happens when that host stops being primary is
+  written as *not verified* (the gate does not stop it). The dial did not need any other change of
+  shape. The plan text under "Slice 5, MongoDB change capture" above, written before the review, still
+  describes the several-host case: the review supersedes it.
+- *SHOULD-FIX 1.* The `replicaSet` sentence is the constant `CDC_MONGO_REPLICA_SET`, one line with single
+  spaces; a test checks the exact text and that it has no double space.
+- *SHOULD-FIX 2.* `check_dial_ssrf` answers a fixed `BadRequest` ("a MongoDB change-capture host must be
+  written host:port") for a seed it cannot split, instead of `continue`.
+
+**Local commands:** `cargo fmt --check` clean; `pytest dispar_orchestrate/test_discover.py` 71 passed;
+`bun test src/features/connectors/dial-forms/dial-forms.test.tsx` 23 pass, 0 fail; `bun run typecheck`
+clean. Rust tests were not run locally.
+
+**CI:** run `41023910090` on `ef25a462` concluded success, 42 of 42 checks pass (36m15s), including
+`Rust · clippy`, `Rust · test (stable)`, `Rust · G4 MongoDB change capture into Bronze`, `g4-cdc`,
+`g4-mysql` and `g4-mssql`; Security run `41023909997` success. The gate itself needed no change (its
+dial already had one host).
+
 ## Review
 
 (The planner writes findings here, tagged `BLOCKER` or `SHOULD-FIX`.)
