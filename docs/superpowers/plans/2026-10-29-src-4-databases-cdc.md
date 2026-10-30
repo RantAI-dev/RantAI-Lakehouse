@@ -740,6 +740,176 @@ Stop and report, do not improvise, if:
 - the sensor cannot see a failed connector's topics;
 - the alert cannot be made to fire exactly once per crossing.
 
+**Amendment 9 (2026-10-30): slice 6 in detail, Oracle change capture.**
+(Amendments 6 and 8 are slice 5's, on `feat/src-4-slice-5`.) Anchors verified
+at `0fede55d`. Facts checked outside the repo on 2026-10-30 (sources in the
+planner's notes; each one the developer re-checks where a task depends on it):
+
+- **The image runs Debezium 3.7.0.Final, not 3.8.** The digest pinned at
+  `docker-compose.yml:3164` (tag `3.8`) has `DEBEZIUM_VERSION=3.7.0.Final`
+  in its config; Debezium's own `connect/3.8` Dockerfile sets the same.
+  Every "Debezium 3.8" in the repo is corrected by name (principle 5):
+  `docs/plans/SRC-4-RESULT.md:26,120,134`, `lakehouse-store/src/cdc.rs:454,682`,
+  and this plan's earlier amendments get a one-line correction note.
+- **The Oracle JDBC driver is already in that image**
+  (`kafka/connect/debezium-connector-oracle/ojdbc11-23.26.1.0.0.jar`, with
+  `orai18n`), shipped with the connector since DBZ-7364. Decision 8's
+  "fetched into the image at build time" and the feature page's "does not
+  ship Oracle's JDBC driver" are corrected: no image build, no download, the
+  pinned image as it is. LogMiner needs no `xstreams.jar`.
+- **DBZ-9681** (the connector could not parse the version banner of
+  `gvenzl/oracle-free`, "Oracle AI Database 26ai Free …") is fixed in
+  3.2.7, 3.3.3 and 3.4.0; 3.7.0 includes the fix. The gate proves it.
+- **`source.ts_ms` is the change time of the redo row, not the commit time**
+  (`source.commit_ts_ms` holds that). The applier keeps `source.ts_ms`, as for
+  the other drivers: the lag stays an upper bound (S4-c), never smaller.
+
+Decisions:
+
+- **S6-a Type.** A new connector type `Oracle CDC` (`adapter = 'cdc'`,
+  `supported = true`), migration **0120** (`0118` is slice 4's, `0119`
+  slice 5's; re-check every remote branch before writing it), the shape
+  `check_connector_gate_coverage.py` replays, a `coverage.json` row for the
+  new gate. The batch `Oracle` type is unchanged.
+- **S6-b Dial.** `CdcDial` with `driver = "oracle"`: `database` is the
+  container database's name (`database.dbname`, `FREE` in the gate), new
+  optional `pdbName` (`database.pdb.name`; absent for a non-container
+  database), both checked as Oracle identifiers with the existing
+  `is_oracle_service_name` rule; `slotName`, `publicationName` and
+  `serverId` are refused for Oracle, as for SQL Server. `Dial::parse`
+  refuses `pdbName` for the other drivers.
+- **S6-c Encryption.** Oracle's JDBC driver does TLS only over TCPS with a
+  Java trust store, and slice 1 could not get Oracle Free's own TCPS
+  listener up (`ORA-28759`). So for Oracle change capture:
+  - `sslMode = require` (the default) means Oracle native network encryption
+    required: `driver.oracle.net.encryption_client=REQUIRED`,
+    `driver.oracle.net.encryption_types_client=(AES256)`,
+    `driver.oracle.net.crypto_checksum_client=REQUIRED`,
+    `driver.oracle.net.crypto_checksum_types_client=(SHA256)`. Encrypted,
+    server not authenticated: the same posture `require` has for the other
+    drivers, and the console label says so.
+  - `disable` sends none of these, labelled "not encrypted".
+  - `verify-ca` and `verify-full` are refused by `Dial::parse` for Oracle
+    with a fixed sentence (unsupported, honestly; rule 14). The planner adds
+    `SRC-37` "Oracle change capture over TLS with certificate checking" to
+    the backlog. The console offers only the two modes for Oracle.
+  - The gate proves encryption is on: as `SYS`,
+    `v$session_connect_info.network_service_banner` for the connector's
+    sessions names the AES256 encryption adapter.
+- **S6-d Renderer.** `oracle_entries` in `lakehouse-store/src/cdc.rs`
+  beside the other three: `io.debezium.connector.oracle.OracleConnector`,
+  `database.hostname/port/user/dbname`, `database.pdb.name` when set, the
+  password as `${dir:/run/cdc-secrets:<id>}`, `table.include.list` built
+  the way the other drivers build it (escaped, anchored), the
+  schema-history keys (`schema_history_entries`, required as for MySQL and
+  SQL Server), the S6-c keys, and nothing else: `log.mining.strategy` and
+  `snapshot.mode` keep their defaults (`online_catalog`, `initial`). The
+  class joins `ALLOWED_CONNECTOR_CLASSES` (`kafka_connect.rs`).
+  `CdcSpecError::UnsupportedDriver` stays for no driver; remove the variant
+  if nothing returns it.
+- **S6-e Names.** Oracle stores unquoted names in upper case, so tables are
+  selected and matched in Oracle's spelling (`SCHEMA.TABLE`), and the topic
+  is `cdc.<id>.<SCHEMA>.<TABLE>` (no database part; `topic_of` needs no
+  Oracle branch: say so in its doc). The Bronze table name follows the rule
+  the batch Oracle adapter already uses (`adapters/oracle.py`
+  `in_reflected_spelling`), so a batch and a change-capture connector on the
+  same table land under the same spelling. Table listing for an Oracle
+  change-capture connector uses the orchestrator's existing Oracle
+  discovery (`discover.py` `_oracle`, Amendment 2's route); if the CDC dial
+  is not wired to it, wire it, no second lister.
+- **S6-f Connection test.** As batch Oracle (Amendment 2): `/test` launches
+  the orchestrator test with the change-capture dial (encryption as S6-c,
+  in `oracledb` thin mode's own native-encryption settings, or stop and
+  report if thin mode cannot require it), connecting to the container
+  database as the change-capture user.
+- **S6-g Setup checks** (decision 9). **Waits for slice 5's merge**: it
+  builds on slice 5's mechanism (S8-c, S8-d: the orchestrator test returns
+  a closed set of facts, the API turns them into `SetupCheck`s in
+  `cdc_setup_check.rs`, an absent or unknown fact is `unchecked`, fixed
+  text only). Oracle's facts, read with fixed statements:
+  - `ARCHIVELOG`: `SELECT log_mode FROM v$database`.
+  - Minimal supplemental logging: `SELECT supplemental_log_data_min FROM
+    v$database` (`YES` or `IMPLICIT` is ok).
+  - All-column logging per selected table: in the PDB (`ALTER SESSION SET
+    CONTAINER` with the validated `pdbName`, or a fixed query on
+    `cdb_log_groups` filtered in Python, never a value in SQL),
+    `log_group_type = 'ALL COLUMN LOGGING'` for each selected table.
+  - LogMiner grants: `SELECT privilege FROM session_privs` and `SELECT role
+    FROM session_roles`, compared in Python with the documented list
+    (`LOGMINING`, `SELECT ANY TRANSACTION`, `SET CONTAINER`, `CREATE
+    SESSION`, `FLASHBACK ANY TABLE` or per-table `FLASHBACK`, `SELECT ANY
+    TABLE` or per-table `SELECT`, `EXECUTE_CATALOG_ROLE`,
+    `SELECT_CATALOG_ROLE`, `CREATE TABLE`, `LOCK ANY TABLE`, `CREATE
+    SEQUENCE`); the fact is the closed set of missing names.
+  - Commands: `ALTER DATABASE ADD SUPPLEMENTAL LOG DATA;`, `ALTER TABLE
+    "S"."T" ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;` (identifiers quoted,
+    `"` doubled), `GRANT … TO "<user>" CONTAINER=ALL;`; `ARCHIVELOG` has no
+    one-line command (it needs a restart), so its message names the steps
+    and gives no command.
+- **S6-h Fixture and gate** `g4-oracle` (D12), on `ops/g4/cdc_gate.py`
+  like the other three:
+  - `gvenzl/oracle-free` pinned by digest (the `g6-oracle` pin, or a newer
+    one if that one fails, with the reason in the override). `ARCHIVELOG`
+    and minimal supplemental logging are set by an idempotent script in
+    `/container-entrypoint-startdb.d` (checks `log_mode` first; `shutdown
+    immediate`, `startup mount`, `alter database archivelog`, `alter
+    database open`), with `db_recovery_file_dest_size` set for the CI disk.
+    The common user `c##dbzuser` with exactly the documented grants (no
+    `DBA`), its tablespace in the CDB and the PDB, two tables with
+    all-column logging, and a third table without it for the setup-check
+    case. Readiness is polled, not assumed (Oracle restarts once).
+  - The gate asserts what the other three assert: first copy, insert,
+    update and delete within 120 s (D5, measured and printed), both load
+    modes, a pause and a `kafka-connect` restart without loss, lag `up to
+    date` for both tables, the setup checks (the gate source's exact list of
+    setting names ok; the third table's all-column logging missing alone),
+    the encryption banner (S6-c), and the delete removing the connector.
+  - A new column: assert it if `online_catalog` captures it; if it does not,
+    stop and report (the planner decides between `hybrid` and a "Limits"
+    line), never a quiet skip.
+  - The job stays under 20 minutes; the Oracle image is large, so the
+    image pull is cached as `g6-oracle` does.
+- **S6-i Console.** The `Oracle CDC` type: the driver preset from the type
+  (as the other `… CDC` types), a "PDB name" field, the TLS select with the
+  two Oracle modes and its hint, the review step, the brand mark (the
+  existing Oracle mark), the setup checks shown as for the others.
+- **S6-j Clean up.** `ORACLE_CDC_LOGMINER_ENABLED`
+  (`config.rs:313-326`, `:1512`, its tests, `.env.example`, compose, the
+  comment in `oracle-dial-form.tsx:15-16`) is read by nothing since slice 2:
+  remove it and say so in `CHANGELOG.md`. A deployment that still sets it
+  loses nothing.
+- **S6-k Docs.** The feature page: decision 8's wording corrected (the
+  driver ships in the image), "Limits" for Oracle (no certificate checking,
+  `SRC-37`; `ARCHIVELOG` needs a restart; archived logs must be kept as long
+  as a stopped connector may need to catch up; Debezium leaves its
+  `LOG_MINING_FLUSH` table in the user's schema after the connector is
+  deleted; `source.ts_ms` is the change time), the documented grants;
+  `docs/OPERATIONS.md`; `CHANGELOG.md`; the 3.7.0 corrections above.
+
+Tasks, in this order (Rust together, the setup check last):
+- **T6.1** Migration 0120, `CdcDial` (`pdbName`, Oracle's refusals, S6-c's
+  mode refusal), the renderer and the class allowlist, unit tests per key.
+- **T6.2** Orchestrator: the Oracle change-capture dial in the test and in
+  discovery (S6-e, S6-f); Bronze naming; unit tests.
+- **T6.3** Fixture and gate `g4-oracle`, `ci.yml` job, `coverage.json`.
+  Push after it and read the gate log before going on.
+- **T6.4** Console (S6-i).
+- **T6.5** Setup checks (S6-g), only after slice 5 is merged into this
+  branch; add their lines to `g4-oracle`.
+- **T6.6** Clean-up and docs (S6-j, S6-k).
+
+Stop and report (do not improvise):
+- the connector does not start against the pinned Oracle Free image
+  (DBZ-9681 or anything else) after reading the worker log;
+- `ARCHIVELOG` cannot be set in the container, or the gate cannot finish
+  under 20 minutes;
+- native encryption cannot be required from the JDBC or the thin driver;
+- a grant beyond the documented list is needed;
+- a setup check needs a value inside SQL;
+- the new column is not captured (S6-h).
+If the gate cannot pass, the planner proposes splitting Oracle change
+capture into its own backlog item, and the other four sources ship (D13).
+
 ## Handoff
 
 ### Slice 1, Oracle batch (developer, Sonnet, 2026-10-29)
