@@ -141,6 +141,8 @@ class MongoSource(g.Source):
             action(self.coll(table))
 
 
+CONNECTOR_ID = ""
+
 # What the history collection must hold: (id, op, customer). A delete has customer '' (no old document).
 EXPECTED: collections.Counter = collections.Counter()
 
@@ -374,9 +376,46 @@ def step_changes_visible_within_budget() -> None:
                 )
                 latencies.append(f"{kind}/{mode} {time.time() - t0:.0f}s")
     except G4Failure as exc:
+        _dump_topic_tail()
         g._record("reload", "fail", str(exc))
         raise
     g._record("reload", "pass", f"each kind of change visible within {g.FRESHNESS_BUDGET_SECONDS:.0f}s in both modes ({', '.join(latencies)})")
+
+
+def _dump_topic_tail(count: int = 4) -> None:
+    """On a failed wait, print the last messages of the current-mode topic and what the applier's own
+    reader makes of each: the key names, the operation, and either the row's keys or the fixed
+    refusal. Values are printed for the keys the gate's own documents carry only (`id`, `customer`,
+    `_op`): the gate's data, not a customer's, and no credential is ever in a topic."""
+    try:
+        import json
+
+        from kafka import KafkaConsumer, TopicPartition
+
+        from dispar_orchestrate import cdc_apply
+
+        topic = f"cdc.{CONNECTOR_ID}.{DATABASE}.{g.TABLES['current']}"
+        consumer = KafkaConsumer(bootstrap_servers=[g.KAFKA_BOOTSTRAP], enable_auto_commit=False, consumer_timeout_ms=5000)
+        try:
+            partitions = [TopicPartition(topic, p) for p in sorted(consumer.partitions_for_topic(topic) or [])]
+            consumer.assign(partitions)
+            for tp in partitions:
+                end = consumer.end_offsets([tp])[tp]
+                consumer.seek(tp, max(0, end - count))
+            for record in consumer:
+                try:
+                    shown = json.loads(record.value) if record.value else None
+                    keys = sorted(shown) if isinstance(shown, dict) else shown
+                    ops = shown.get("__op") if isinstance(shown, dict) else None
+                    verdict = cdc_apply.event_to_row(record.value, record.offset, document=True)
+                    verdict = sorted(verdict) if verdict else verdict
+                except Exception as exc:  # noqa: BLE001
+                    verdict = f"{type(exc).__name__}: {exc}"
+                print(f"[g4] topic tail {topic}@{record.offset}: key={record.key!r} op={ops!r} value-keys={keys} -> {verdict}", flush=True)
+        finally:
+            consumer.close()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[g4] could not read the topic tail ({type(exc).__name__}: {exc})", flush=True)
 
 
 def _now():
@@ -463,6 +502,8 @@ def main() -> int:
             g._record("connect", "fail", detail)
             g._record("discover", "fail", detail)
             raise G4Failure("the demo connector could not be registered, so nothing below can run") from exc
+        global CONNECTOR_ID
+        CONNECTOR_ID = connector_id
         _check_connect(connector_id)
         _check_discover(connector_id)
         g._wait_capture_state(connector_id, "running", 240)
