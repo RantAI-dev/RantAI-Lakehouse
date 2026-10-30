@@ -572,6 +572,146 @@ the schema-history topic is not created with unlimited retention; SQL Server
 needs more than the grants above; or discovery (`SRC-13`) cannot list a
 change-capture MySQL or SQL Server source's tables.
 
+**Amendment 6 (2026-10-30): slice 5 in detail, MongoDB, in parallel with
+slice 3.** The product owner asked for slice 5 to run while slice 3 is still
+open ("jalankan paralel untuk slice 5", 2026-10-30). Slice 5 depends only on
+slice 2's runtime, which is closed. Anchors verified at `8cfd0a91` (slice 3's
+head that day); line numbers drift, so the developer finds each by its name.
+
+How the parallel work is kept apart:
+- **Branch.** `feat/src-4-slice-5`, cut from `feat/data-phase-4-src-4` at
+  `8cfd0a91`, worktree `/home/hv/lakehouse-src4-slice5`. CI runs only for
+  pull requests into `main` or `lakehouse/**`, so a draft pull request into
+  `main`, titled as never to be merged, gives it CI. The branch is merged into
+  the phase branch after slice 3 closes, hunk by hunk (rule 9), and that draft
+  is then closed. #264 stays the one pull request to `main`.
+- **Migration numbers.** 0118 is kept for slice 4 and **0119** is slice 5's
+  (0113 to 0117 are taken). Re-check across all branches before committing.
+- **Files slice 3 is still changing** (`ingest_spec.rs`, `cdc.rs`,
+  `kafka_connect.rs`, `cdc_apply.py`, `cdc-dial-form.tsx`, `ops/g4/*`,
+  `ci.yml`, `coverage.json`): slice 5 adds to them and does not rewrite what
+  slice 3 wrote, so the merge stays additive.
+- **Machine.** No local `cargo build`, `clippy`, `test`, `docker build` or
+  `compose up` (the disk has under 6 GB free). `cargo fmt`, pure `pytest` and
+  single-file `bun test` locally. CI does the rest.
+
+Planner's decisions (technical, within the signed decisions; none changes what
+the product owner signed):
+
+- **S5-a The dial.** A change-capture MongoDB connector is a `cdc` connector
+  with its own dial shape, not a fifth `SqlDriver` (MongoDB is not SQL, and
+  `SqlDriver` also feeds the batch `sql` adapter). `Dial::parse` for `cdc`
+  reads `driver` first: `"mongodb"` parses a new `CdcMongoDial`, anything else
+  parses `CdcDial` as today. `CdcMongoDial` (`deny_unknown_fields`, camelCase):
+  `driver` (always `mongodb`), `hosts` (explicit `host:port` seeds, each through
+  `validate_hostname`, as `MongoDial`), `database`, `user`, `replicaSet` (the
+  replica set's name, required: change streams need one), and `sslMode`
+  (`CdcSslMode`, default `require`). No `mongodb+srv`, no free-form connection
+  string. Its `TargetIdentity` (`SEC-14` re-point rule) is the hosts as a set,
+  the database and the replica set name, so changing any of them needs new
+  credentials. The TS contract mirrors serde.
+- **S5-b The host check.** Whatever slice 2 and 3 do to check a `cdc` dial's
+  host before Kafka Connect is asked to dial it is done for **every** entry of
+  `hosts`. The connection string the renderer writes names only those hosts.
+  Kafka Connect's MongoDB driver discovers the other members of the replica set
+  from the server; the developer checks whether Debezium 3.8 accepts
+  `directConnection=true` together with change streams on a one-member set. If
+  it does, the renderer sets it. If it does not, stop and report: the planner
+  decides, and "Limits" will say the worker reaches every member the replica
+  set advertises.
+- **S5-c The renderer** (`lakehouse-store/src/cdc.rs`, beside slice 3's
+  drivers): class `io.debezium.connector.mongodb.MongoDbConnector`;
+  `mongodb.connection.string` built from `hosts`, `replicaSet` and the TLS
+  setting, with the user and the password as the config-provider reference
+  (`DirectoryConfigProvider`, decision S2-a), never a literal;
+  `mongodb.authsource` = the database; `collection.include.list` =
+  `<database>.<collection>` from the source objects; `capture.mode` =
+  `change_streams_update_full` (an update carries the whole document, which the
+  current-row mode needs); `topic.prefix=cdc.<id>`; the JSON converters without
+  schemas; `snapshot.mode=initial`. The unwrap transform is MongoDB's own
+  `io.debezium.connector.mongodb.transforms.ExtractNewDocumentState` with
+  `delete.tombstone.handling.mode=rewrite` and `add.fields=op,source.ts_ms`
+  (amendment 3's settings, the other class). TLS: `disable` sets
+  `mongodb.ssl.enabled=false`; the other three set it `true`, and
+  `verify-ca` / `verify-full` also set
+  `mongodb.ssl.invalid.hostname.allowed=false` (`require` sets it `true`; say in
+  the code that `require` takes the certificate as presented, as for the
+  others). The class joins `ALLOWED_CONNECTOR_CLASSES` (`kafka_connect.rs`).
+  Unit tests: the exact keys, no password anywhere in the JSON, a collection
+  name that is not two plain parts refused, each SSL mode's setting.
+- **S5-d Documents into rows** (`cdc_apply.py`). The topic is
+  `cdc.<id>.<database>.<collection>`; `topic_of` gets a MongoDB case and a unit
+  test. The key is `_id`. Values are turned into columns the same way the batch
+  adapter does (`adapters/mongodb.py`: `ObjectId` to its hex string, nested
+  documents and arrays as it stores them today), so a batch MongoDB table and a
+  change-capture one of the same collection look alike. Reuse its helper; do not
+  write a second one (rule 4). Unit tests (no network): insert, update, delete,
+  the snapshot read, and an `ObjectId` key.
+- **S5-e Load modes.** The two of S2-g, with `_id` as the key filled in by
+  default. No other mode is offered.
+- **S5-f Connection test and discovery.** The API has no MongoDB client, so the
+  connection test of a MongoDB change-capture connector runs in the
+  orchestrator through discovery kind `test` (amendment 2's route, as Oracle
+  does). Discovery lists the database's collections through `discover.py`'s
+  MongoDB code (`_mongo`), reached for the `cdc` adapter when the driver is
+  `mongodb`. Fixed sentences, no driver text (principle 4). If either cannot be
+  reached without a new route, stop and report.
+- **S5-g The type.** Migration **0119** with a why-header: a plain
+  `INSERT INTO connector_type (name, adapter, supported, docs_url) VALUES
+  ('MongoDB CDC', 'cdc', true, NULL) ON CONFLICT DO NOTHING` (the shape the
+  coverage lint replays). `tests/connector_type.rs`,
+  `ops/lint/test_check_connector_gate_coverage.py` and `coverage.json` follow.
+  The wizard shows it beside the other change-capture types.
+- **S5-h Source settings, proven by the gate and written in "Limits"** (the
+  checks with fixed sentences are slice 4's). A replica set is required (a
+  standalone server has no change streams); sharded clusters are out of scope
+  and "Limits" says so. The gate's user is not `root`: the least roles that
+  Debezium 3.8's documentation names for change streams on one database
+  (expected: `read` on the database, plus what the snapshot and the
+  resume-token storage need). The developer confirms the list against the
+  documentation and the gate; if more is needed, write down what and why.
+- **S5-i The console.** `cdc-dial-form.tsx` shows, for MongoDB only: a hosts
+  list (one or more `host:port`), the database, the user, and the replica set
+  name (required, empty by default, hint "the name in the server's replica set
+  configuration"). Nothing pre-filled with an invented value. The shared
+  password and TLS fields stay.
+- **S5-j Fixture and gate.** A new service `mongo-cdc-g4` in
+  `ops/g4/docker-compose.g4-mongo.override.yml` (not a change to `mongo-g6`,
+  so the g6 gate is untouched): `mongo:7` started with `--replSet` and one
+  member, an init step that runs `rs.initiate` with the service's own host name
+  and polls until it is primary (real readiness), and the gate user.
+  Credentials `${X:?}`. One CI job `g4-mongo` (D12, under 20 minutes), shaped
+  like `g4-mysql` and using the shared gate module from T3.6. It creates the
+  connector through the API and runs: two collections, one per load mode, with
+  20,000 seeded documents each, and the first copy; an insert, update and
+  delete each visible within **120 s** (D5); the config from Kafka Connect,
+  checked to hold no password; a pause through the route, 20,000 changes per
+  collection, a resume, and Bronze equals the source with nothing missing or
+  twice; a `kafka-connect` restart during a stream of changes, equal again; a
+  new field in a document observed as a schema change (`SRC-8`); `DELETE`, which
+  removes the Kafka Connect connector and the secret file. The gate summary
+  prints a `MongoDB CDC` row.
+
+Tasks, in order (one commit each; Rust together, then Python, then console,
+then compose and gate; scoped checks per commit, the full block before
+handoff, every Rust and gate check in CI):
+T5.1 `CdcMongoDial`, its parse, its `TargetIdentity`, the host check (S5-a,
+S5-b).
+T5.2 the renderer and the allowlist (S5-c).
+T5.3 migration 0119 and the type tests (S5-g).
+T5.4 `topic_of`, documents into rows, load modes (S5-d, S5-e), unit tests.
+T5.5 connection test and discovery through the orchestrator (S5-f).
+T5.6 the console dial form and the contract (S5-i).
+T5.7 fixture, gate `g4-mongo`, CI job, `coverage.json` (S5-h, S5-j).
+T5.8 docs: feature page "Limits" (replica set required, no sharded clusters,
+the roles, what `directConnection` decided), `OPERATIONS.md`, `CHANGELOG.md`.
+*Acceptance:* `SRC-4-AC1`, `AC2` and `AC5` for MongoDB in `g4-mongo`; every
+other check that passes on `main` passes.
+Stop and report, do not improvise, if: Debezium 3.8 refuses a key above; the
+`directConnection` question of S5-b has no clean answer; the roles of S5-h are
+not enough; the connection test or discovery needs a new route; or a file
+slice 3 is changing would have to be rewritten rather than added to.
+
 ## Handoff
 
 ### Slice 1, Oracle batch (developer, Sonnet, 2026-10-29)
