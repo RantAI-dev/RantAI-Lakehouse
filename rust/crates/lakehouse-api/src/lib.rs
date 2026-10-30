@@ -30,6 +30,8 @@ pub mod capture_lag;
 pub mod catalog_search_cache;
 pub mod cdc_lifecycle;
 pub mod cdc_secrets;
+pub mod cdc_setup_check;
+pub mod cdc_setup_probe;
 pub mod config;
 pub mod connector_deprovision;
 pub mod connector_discover;

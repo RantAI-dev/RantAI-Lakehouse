@@ -14,6 +14,8 @@ mod capture_lag;
 mod catalog_search_cache;
 mod cdc_lifecycle;
 mod cdc_secrets;
+mod cdc_setup_check;
+mod cdc_setup_probe;
 mod config;
 mod connector_deprovision;
 mod connector_discover;

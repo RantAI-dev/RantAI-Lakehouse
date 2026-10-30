@@ -1084,8 +1084,42 @@ pub async fn test_connection(
         )
         .await?;
     }
-    let result = record_test_outcome(&state, &principal, &id, &outcome).await?;
+    // `SRC-4` slice 4 (S4-f): a change-capture source is also asked what it must
+    // have switched on. Only after the test passed (there is nothing to read from
+    // a source that cannot be reached), and never part of `ok`.
+    let setup_checks = if outcome.ok {
+        change_capture_setup_checks(&state, &dial_info, &id).await?
+    } else {
+        Vec::new()
+    };
+    let mut result = record_test_outcome(&state, &principal, &id, &outcome).await?;
+    result.setup_checks = setup_checks;
     Ok(ApiJson(result))
+}
+
+/// The setup checks of change-capture connector `id` (empty for any other
+/// connector), for the tables its spec selects.
+///
+/// # Errors
+///
+/// 404 if the connector is gone; 503/500 as the store reports.
+async fn change_capture_setup_checks(
+    state: &AppState,
+    info: &ConnectorDialInfo,
+    id: &str,
+) -> Result<Vec<connectors::SetupCheck>, ApiError> {
+    if info.adapter.as_deref() != Some("cdc") {
+        return Ok(Vec::new());
+    }
+    let tables = super::capture_lag::selected_tables(pool(state)?, id).await?;
+    Ok(crate::cdc_setup_probe::setup_checks(
+        info,
+        state.connector_secret_resolver.as_ref(),
+        &state.config.connector_internal_hosts(),
+        state.config.connector_tls_ca(),
+        &tables,
+    )
+    .await)
 }
 
 /// Record a finished connection test the way every test is recorded: the stored

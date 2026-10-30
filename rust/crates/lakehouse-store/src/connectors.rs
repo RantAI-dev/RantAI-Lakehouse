@@ -961,6 +961,41 @@ pub struct ConnectorTestResult {
     /// Left out of the JSON otherwise.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub pending: bool,
+    /// For a change-capture connector (`SRC-4` decision S4-f): what the source
+    /// must have switched on, read with fixed statements. Empty, and left out of
+    /// the JSON, for every other connector. Never decides `ok`: a connector can
+    /// be saved whatever these say.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub setup_checks: Vec<SetupCheck>,
+}
+
+/// How one setting a change-capture source needs came out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SetupStatus {
+    /// The setting is as change capture needs it.
+    Ok,
+    /// It is not; `command` says how to set it.
+    Missing,
+    /// It could not be read (usually a permission); nothing is claimed.
+    Unchecked,
+}
+
+/// One setting a change-capture source needs (`SRC-4` decision S4-f). Every
+/// word is chosen by this build from a fixed table; none is text from the
+/// server, so none can leak one (principle 4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetupCheck {
+    /// The setting's name, as the person would look for it.
+    pub setting: String,
+    /// How it came out.
+    pub status: SetupStatus,
+    /// A fixed sentence about the result.
+    pub message: String,
+    /// The statement or line that sets it; present for `missing`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
 }
 
 impl ConnectorTestResult {
@@ -975,6 +1010,7 @@ impl ConnectorTestResult {
             message: message.to_owned(),
             tested_at: None,
             pending: true,
+            setup_checks: Vec::new(),
         }
     }
 }
@@ -1650,6 +1686,7 @@ pub async fn record_test_result(
         message: message.to_owned(),
         tested_at: iso_opt(tested_at),
         pending: false,
+        setup_checks: Vec::new(),
     })
 }
 

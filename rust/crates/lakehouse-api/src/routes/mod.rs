@@ -799,7 +799,10 @@ fn per_connector_router(state: &AppState) -> Router<AppState> {
 /// person's lag limit sits behind it.
 fn capture_lag_router(state: &AppState) -> Router<AppState> {
     let gated = Router::new()
-        .route("/api/connectors/{id}/lag-limit", put(capture_lag::set_limit))
+        .route(
+            "/api/connectors/{id}/lag-limit",
+            put(capture_lag::set_limit),
+        )
         .route_layer(from_fn_with_state(
             state.clone(),
             connectors::require_connector_in_tenants,
