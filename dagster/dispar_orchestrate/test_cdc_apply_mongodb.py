@@ -120,11 +120,43 @@ def test_an_update_event_carries_the_whole_document() -> None:
     assert (row["_op"], row["amount"], row["_offset"]) == ("u", 99, 7)
 
 
-def test_a_delete_event_is_a_deleted_row_with_only_the_key() -> None:
-    row = _row(_event("d"))
+def _delete_without_id() -> bytes:
+    # Seen in CI (`g4-mongo`, Debezium 3.8): a delete's value has no document and no `_id`, only these.
+    return json.dumps({"__op": "d", "__source_ts_ms": 5_000, "__deleted": "true"}).encode()
+
+
+def test_a_delete_event_takes_its_id_from_the_message_key_because_its_value_has_none() -> None:
+    row = event_to_row(_delete_without_id(), 3, document=True, key=json.dumps({"id": HEX}).encode())
+    assert row is not None
     assert row["_id"] == HEX
-    assert row["_deleted"] is True
+    assert (row["_op"], row["_deleted"], row["_offset"]) == ("d", True, 3)
     assert "customer" not in row
+
+
+def test_a_delete_whose_value_does_carry_the_id_keeps_it() -> None:
+    row = _row(_event("d"))
+    assert row["_id"] == HEX and row["_deleted"] is True
+
+
+def test_the_key_id_of_an_object_id_is_its_hex_text_and_other_ids_are_parsed() -> None:
+    def key(text: Any) -> bytes:
+        return json.dumps({"id": text}).encode()
+
+    assert cdc_apply.key_id(key(HEX)) == HEX
+    assert cdc_apply.key_id(key(HEX.upper())) == HEX  # the same ObjectId, one spelling
+    # 24 digits are an ObjectId, not the number they would read as.
+    assert cdc_apply.key_id(key("123456789012345678901234")) == "123456789012345678901234"
+    assert cdc_apply.key_id(key("1234")) == 1234  # a numeric `_id`
+    assert cdc_apply.key_id(key('"abc"')) == "abc"  # a string `_id`: extended JSON text, quotes included
+    assert cdc_apply.key_id(key('{"$oid": "' + HEX + '"}')) == HEX
+    assert cdc_apply.key_id(key("not json, not hex")) == "not json, not hex"
+    for nothing in (None, b"not json", b"[1]", json.dumps({"other": 1}).encode()):
+        assert cdc_apply.key_id(nothing) is None
+
+
+def test_a_delete_without_a_key_has_no_id_and_is_still_a_row_not_a_crash() -> None:
+    row = event_to_row(_delete_without_id(), 0, document=True)
+    assert row is not None and "_id" not in row
 
 
 def test_an_object_id_in_extended_json_becomes_its_hex_string_whichever_way_it_arrives() -> None:
@@ -190,7 +222,7 @@ def test_the_id_is_the_key_and_only_the_last_event_per_key_counts() -> None:
 
 class _Consumer:
     def __init__(self, values: list[bytes | None]) -> None:
-        self._batches = [[SimpleNamespace(offset=i, value=v) for i, v in enumerate(values)]]
+        self._batches = [[SimpleNamespace(offset=i, value=v, key=None) for i, v in enumerate(values)]]
 
     def poll(self, timeout_ms: int, max_records: int):
         return {TP: self._batches.pop(0)} if self._batches else {}
@@ -257,3 +289,16 @@ def test_the_id_column_name_is_the_name_bronze_has() -> None:
     # `dlt` keeps `_id`, so the key of the source object and the column of the row agree.
     assert cdc_apply._loaded_name("_id") == "_id"
     assert ApplyTarget("c", "orders", "t", "orders", ("_id",), "current", "g", True).document
+
+
+def test_read_batch_hands_each_records_key_to_the_document_reader() -> None:
+    class _Keyed:
+        def poll(self, timeout_ms: int, max_records: int):
+            if getattr(self, "done", False):
+                return {}
+            self.done = True
+            record = SimpleNamespace(offset=0, value=_delete_without_id(), key=json.dumps({"id": HEX}).encode())
+            return {TP: [record]}
+
+    batch = read_batch(_Keyed(), poll_ms=0, document=True)
+    assert [(r["_id"], r["_op"], r["_deleted"]) for r in batch.rows] == [(HEX, "d", True)]

@@ -95,6 +95,7 @@ import functools
 import json
 import logging
 import os
+import re
 import time
 import warnings
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -305,7 +306,36 @@ def _object_id_text(value: Any) -> Any:
     return value
 
 
-def document_to_columns(payload: dict[str, Any]) -> dict[str, Any]:
+_OBJECT_ID_HEX = re.compile(r"[0-9a-fA-F]{24}")
+
+
+def key_id(key: bytes | str | None) -> Any:
+    """The document `_id` a MongoDB change message's KEY carries: `{"id": "<text>"}`, Debezium's
+    extended-JSON text of the id. An `ObjectId` arrives as its 24 hex digits (seen in CI: run of
+    `g4-mongo`, `"id":"000000000000000000004e20"`), which is NOT parsed as JSON (all-digit hex would
+    read as a number); any other id is JSON text (`5` is a number, `"abc"` a string, `{"$oid": ...}`
+    an object id), parsed. Returns `None` when the key holds no id.
+
+    A delete event's VALUE has no `_id` (seen in CI: its keys are the three `__` fields only), so this
+    is where a delete learns which document it removes."""
+    if key is None:
+        return None
+    try:
+        body = json.loads(key)
+    except (ValueError, TypeError):
+        return None
+    text = body.get("id") if isinstance(body, dict) else None
+    if not isinstance(text, str):
+        return text
+    if _OBJECT_ID_HEX.fullmatch(text):
+        return text.lower()
+    try:
+        return _object_id_text(json.loads(text))
+    except ValueError:
+        return text
+
+
+def document_to_columns(payload: dict[str, Any], key: bytes | str | None = None) -> dict[str, Any]:
     """A flattened MongoDB change event as the columns of a row (`SRC-4` decision S5-d).
 
     Debezium's `ExtractNewDocumentState` flattens the document and adds `__op`,
@@ -316,8 +346,9 @@ def document_to_columns(payload: dict[str, Any]) -> dict[str, Any]:
     A nested document or array is refused, as the batch adapter refuses it
     (`column_gate.reject_unsupported_column_types_from_sample`), here for every event: change
     capture has no registration-time sample, and a nested value silently dropped or
-    flattened would make Bronze differ from the source. A delete event carries the key only
-    (MongoDB keeps no old document), so its row has `_id` and nulls.
+    flattened would make Bronze differ from the source. A delete event's value carries no
+    document and no `_id` (MongoDB keeps no old document), so `_id` is read from the message
+    KEY (`key_id`) when the value lacks it, and the rest of the row is null.
 
     # Errors
 
@@ -328,6 +359,10 @@ def document_to_columns(payload: dict[str, Any]) -> dict[str, Any]:
         for name, value in payload.items()
         if name not in DEBEZIUM_FIELDS
     }
+    if "_id" not in document:
+        identity = key_id(key)
+        if identity is not None:
+            document["_id"] = identity
     try:
         reject_unsupported_column_types_from_sample(document)
     except UnsupportedColumnType:
@@ -338,9 +373,11 @@ def document_to_columns(payload: dict[str, Any]) -> dict[str, Any]:
     return {**document, **{name: payload[name] for name in DEBEZIUM_FIELDS if name in payload}}
 
 
-def event_to_row(value: bytes | str | None, offset: int, *, document: bool = False) -> dict[str, Any] | None:
+def event_to_row(
+    value: bytes | str | None, offset: int, *, document: bool = False, key: bytes | str | None = None
+) -> dict[str, Any] | None:
     """One message as a row, or `None` for a tombstone. `document` marks a MongoDB event
-    (`document_to_columns`).
+    (`document_to_columns`, which reads a delete's `_id` from `key`).
 
     # Errors
 
@@ -357,7 +394,7 @@ def event_to_row(value: bytes | str | None, offset: int, *, document: bool = Fal
     if not isinstance(payload, dict) or "__op" not in payload:
         raise CdcEventError("a change message is not a flattened Debezium event with an __op")
     if document:
-        payload = document_to_columns(payload)
+        payload = document_to_columns(payload, key)
     row = {_loaded_name(name): value for name, value in payload.items() if name not in DEBEZIUM_FIELDS}
     row["_op"] = payload["__op"]
     row["_source_ts_ms"] = payload.get("__source_ts_ms")
@@ -429,7 +466,7 @@ def read_batch(
         for tp, records in polled.items():
             for record in records:
                 next_offsets[tp] = max(next_offsets.get(tp, 0), record.offset + 1)
-                row = event_to_row(record.value, record.offset, document=document)
+                row = event_to_row(record.value, record.offset, document=document, key=getattr(record, "key", None))
                 if row is not None:
                     rows.append(row)
     return Batch(rows=rows, next_offsets=next_offsets)
