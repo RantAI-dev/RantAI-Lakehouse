@@ -190,7 +190,7 @@ with a targeted `UPDATE ... AND supported = false` (a new migration);
 
 ## Slice 4: lag, the alert, setup checks (D6, D7, D9)
 
-Amended in detail before dispatch. Lag per table (now minus the source
+Amended in detail before dispatch (Amendment 7). Lag per table (now minus the source
 commit time of the last change applied; "up to date" when the topic has no
 backlog); a migration for the per-connector limit, default 15 minutes; a
 "Change capture" view on the connector page; alert kind `connector_lag`
@@ -571,6 +571,174 @@ Stop and report, do not improvise, if: Debezium 3.8 refuses a key above;
 the schema-history topic is not created with unlimited retention; SQL Server
 needs more than the grants above; or discovery (`SRC-13`) cannot list a
 change-capture MySQL or SQL Server source's tables.
+
+**Amendment 7 (2026-10-30): slice 4 in detail, lag, the lag alert, setup checks.**
+(Amendment 6 is slice 5's, on `feat/src-4-slice-5`, written by session
+lakehouse-35; it arrives with that branch's merge.) Anchors verified at
+`070cf04e` (slice 3 closed). Line numbers drift, so the developer finds each
+anchor by its name. Slice 4 runs on this branch, one task per commit. The
+planner's decisions are technical, within the signed decisions D6, D7, D9 and
+D12; the MySQL binlog number in S4-f is the planner's, and the product owner
+is told:
+
+- **S4-a Scope.** This slice covers lag and the lag alert for every
+  change-capture connector, and setup checks for PostgreSQL, MySQL and
+  SQL Server. It leaves out:
+  - **MongoDB's setup check:** slice 5 adds it on top of S4-f's mechanism
+    (agreed with lakehouse-35).
+  - **Oracle's setup check:** it moves to slice 6. Oracle change capture
+    does not exist before slice 6, and a check for a type nobody can create
+    would be dead code.
+- **S4-b Where lag comes from.** The pattern of `pipeline_lag.rs` is reused:
+  the orchestrator observes, and the API decides.
+  - **Backlog per table.** On every tick (30 s), `cdc_apply_sensor` posts
+    each table's backlog (unread messages on its topic, `adapters/kafka.py`
+    `compute_lag`) for **every** change-capture connector. That includes
+    paused, busy and failed connectors; a failed connector is exactly the
+    case the alert exists for.
+  - **Last applied change per table.** After each Bronze commit, the applier
+    posts, per table, the source commit time of the last change it applied:
+    the largest `_source_ts_ms` in the batch.
+  - **The route.** Both posts go to one route,
+    `POST /api/connectors/{id}/capture/observations`. It uses the same
+    service-token auth the orchestrator's run reports use, has a row in
+    `POLICY_TABLE`, and is asserted both ways in `tests/route_auth.rs`. The
+    body is `{tables: [{table, backlog?, lastSourceTsMs?}]}`; a table the
+    connector does not select is refused.
+- **S4-c What lag is (D6), one pure function.** The function takes `now` as a
+  parameter and is unit-tested like `run_lag_check`. Per table:
+  - **"Up to date", lag 0:** the backlog is 0 and Kafka Connect says
+    `running`. The table's `caught_up_at` is then set to `now`.
+  - **Otherwise, a number:** lag is now minus the later of the last applied
+    change's source time and `caught_up_at`. Taking the later of the two
+    stops a table that was quiet for a day, then gets one change, from
+    reading as a day behind; the true lag is never larger than this. The code
+    comment says so.
+  - **"Not known yet":** neither time exists.
+  - **"Not known since <time>":** the newest observation is older than 2
+    minutes (the orchestrator is down). The function never shows a number it
+    has not seen (principle 2).
+  - **A connector paused by a person** shows "paused" and no number.
+
+  The connector's lag is its worst table's lag.
+- **S4-d The lag alert (D7).** Per connector, `lag_alert_minutes` is a whole
+  number from 1 to 1440, default 15. A person with `connector:manage` changes
+  it through `PUT /api/connectors/{id}/lag-limit` (in `POLICY_TABLE` and
+  `route_auth.rs`, both ways).
+  - **The kind.** A new `AlertKind::ConnectorLag` (`connector_lag`), scoped
+    by connector like `ConnectorFailure`.
+  - **Delivery** goes through `evaluate_connector_event`.
+  - **Firing.** Each observation post re-evaluates the connector. When its
+    lag first passes the limit, one alert fires: the connector, the worst
+    table, the lag in minutes and the limit, in fixed words. When the lag
+    comes back under the limit, a second alert fires, saying it is back
+    under. An open flag on the connector keeps each to once per episode.
+  - **Paused by a person:** no evaluation.
+  - **Console:** the alert rule editor lists the kind.
+
+  Limit: if the orchestrator is down, nothing posts and no lag alert fires
+  ("Limits" says so; the S4-c read still shows "not known since").
+- **S4-e Storage, migration 0118** (reserved for this slice; re-check that it
+  is free across `git branch -r` before committing). It has a why-header and
+  adds:
+  - `connector_capture_table`: `connector_id`, `table_name`,
+    `last_source_ts`, `caught_up_at`, `backlog`, `observed_at`, with primary
+    key `(connector_id, table_name)` and `ON DELETE CASCADE` from `connector`.
+  - On `connector`: `lag_alert_minutes integer NOT NULL DEFAULT 15` with a
+    `CHECK` for 1 to 1440, and `lag_alert_open boolean NOT NULL DEFAULT false`.
+- **S4-f Setup checks in the connection test (D9).** For a change-capture
+  connector, `POST /api/connectors/{id}/test` adds `setupChecks`, a list of
+  `{setting, status: "ok" | "missing" | "unchecked", message, command?}`.
+  - **Fixed text.** Every message and command is a fixed string from one
+    table in the code. A `missing` check names the setting and the command
+    that sets it. An `unchecked` check says why it could not be read (usually
+    a permission). Server text never reaches the answer (principle 4).
+  - **The connector can still be saved** whatever the checks say.
+  - **Fixed statements only, no value in SQL.** Values to compare (the
+    publication name, the selected tables) are compared in Rust against what
+    a fixed statement returns.
+  - **PostgreSQL** extends `pg_probe.rs`'s own client with fixed statements
+    (D10, never back to `sqlx`):
+    - `SHOW wal_level` must be `logical`.
+    - The role must have replication: `rolreplication` or `rolsuper` of
+      `current_user` in `pg_roles`.
+    - The dial's publication must exist (`SELECT pubname FROM pg_publication`).
+    - The publication must hold each selected table (`pg_publication_tables`).
+  - **MySQL:**
+    - `@@log_bin` on, `@@binlog_format` = `ROW`, `@@binlog_row_image` = `FULL`.
+    - `SHOW GRANTS FOR CURRENT_USER()` must hold `REPLICATION SLAVE` and
+      `REPLICATION CLIENT` (or `ALL PRIVILEGES`).
+    - Binlog retention: `@@binlog_expire_logs_seconds` 0 (never expires), or
+      at least **7 days**. 7 days is the broker's own retention (S2-i), the
+      window in which a stopped connector can still catch up; it is the
+      planner's number and the product owner is told.
+  - **SQL Server:**
+    - `is_cdc_enabled` for `DB_NAME()` in `sys.databases`.
+    - `is_tracked_by_cdc` for each selected table.
+    - SQL Server Agent running, through `sys.dm_server_services`. That needs
+      `VIEW SERVER STATE`, which the documented login does not have, so
+      without it the check is `unchecked` with that reason. It is never
+      reported as a pass, and the login is never widened.
+- **S4-g The console.** A **"Change capture"** tab on the connector page
+  (`connector-detail-page.tsx` tabs), only for change-capture connectors,
+  holds:
+  - The Kafka Connect state in fixed words, and pause and resume (moved here
+    from the ingest panel, not copied).
+  - Each table's lag as S4-c words it.
+  - The lag limit editor.
+
+  The read uses the existing capture-state route (`routes/connector_runs.rs`),
+  extended with the tables and the limit. The connection test result lists
+  the setup checks: missing first, each command copyable.
+- **S4-h Gates (D12).** Every change-capture gate (`g4-cdc`, `g4-mysql`,
+  `g4-mssql`), through the shared module:
+  - Reads the capture route after the first copy and expects "up to date"
+    for both tables.
+  - Runs one setup check that fails on a missing setting:
+    - PostgreSQL: a test with a publication name that does not exist.
+    - MySQL: a second login without `REPLICATION CLIENT`.
+    - SQL Server: a third table not enabled for CDC, selected.
+
+    Each expects `missing` with the fixed sentence, and the rest `ok`, or
+    `unchecked` for the SQL Server Agent check.
+
+  **`g4-cdc` only (AC7):**
+  - Set the limit to 1 minute.
+  - The CI step stops `kafka-connect` (the marker pattern of the restart
+    step), and the gate writes changes.
+  - Expect one `connector_lag` alert instance and a lag above 60 s on the
+    capture route.
+  - Start `kafka-connect` again, wait until caught up, and expect the
+    "back under" alert, with exactly two instances in total.
+
+  Each gate stays under 20 minutes.
+
+Tasks, in order (one commit each; Rust together, then Python, then the
+console, then the gates; scoped checks per commit, the full block before
+handoff):
+T4.1 migration 0118 and its store functions (S4-e).
+T4.2 the lag function, the observations route, `ConnectorLag`, the
+evaluation, the lag-limit route, `POLICY_TABLE`, `route_auth.rs` (S4-b, S4-c,
+S4-d).
+T4.3 the capture-state route extended (S4-c, S4-g's read).
+T4.4 setup checks for PostgreSQL, MySQL and SQL Server (S4-f).
+T4.5 Dagster: the sensor's backlog posts and the applier's last-change posts,
+with unit tests and no network (S4-b).
+T4.6 the console: the "Change capture" tab, setup checks in the test result,
+the alert kind in the rule editor (S4-g).
+T4.7 the gates (S4-h), `coverage.json` if a column is added.
+T4.8 docs: feature page "Limits" (lag's meaning, the orchestrator-down limit,
+the 7-day binlog check, the Agent check's permission), `OPERATIONS.md`,
+`CHANGELOG.md`.
+*Acceptance:* `SRC-4-AC3` (setup check) and `AC7` (lag and one alert) for the
+three databases, `AC7`'s alert in `g4-cdc`. All three gates still pass, and
+every other check that passes on `main` passes.
+Stop and report, do not improvise, if:
+- a setup check needs a statement with a value in it, or a grant beyond the
+  documented ones;
+- `pg_probe.rs`'s client cannot run a statement that returns rows;
+- the sensor cannot see a failed connector's topics;
+- the alert cannot be made to fire exactly once per crossing.
 
 ## Handoff
 
