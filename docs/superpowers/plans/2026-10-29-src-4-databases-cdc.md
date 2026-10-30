@@ -1288,3 +1288,40 @@ citing `Slice 4 review SHOULD-FIX n` at the fix site and in the body; push
 after the Rust group, after the Python/console group and after the gates;
 then a "Slice 4, round 1 fixes" handoff with the CI run on the final code
 commit.
+
+### Slice 4, round 1 fixes (developer, Sonnet, 2026-10-30)
+
+**Commits** (after `f56f9b3d`), each citing `Slice 4 review SHOULD-FIX n` at the fix site and in the body:
+SF1 `27634018` (doc: the number is an upper bound); SF2 `c4679c5a` (a future source time stored as now, warn,
+route test); SF3 `4a2dde20` (the resume sets `caught_up_at = GREATEST(caught_up_at, now())` in its
+transaction, store test); SF6, 7, 8 `32f888e2` (`@@expire_logs_days` read, absent = 0, with seconds taking
+precedence when non-zero; an Agent query with no row is `unchecked` through a new `NotListed` state; the
+`GRANT` names the account of `SELECT CURRENT_USER()`); SF9 `819a7909` (a store error reading the tables is
+logged and answers no checks); SF4 (Python) and SF5 (console) and the gates SF10 `9bcc546f`.
+Pushed after the Rust group (`819a7909`), after Python/console (`736ca3e9`) and after the gates (`9bcc546f`).
+
+**SF4 detail.** `measure_backlogs` posts a missing topic as unmeasured (left out). One table without a topic
+would then have made the whole connector "could not be measured" for the sensor's run decision, so
+`run_backlogs` re-measures only such a connector with `absent=0`: the run decision counts a missing topic as 0,
+the other tables are not held back. Unit test `test_a_table_without_a_topic_yet_...`.
+
+**SF10.** (a) the "still 1" assertion is gone; the gate asserts the listed `detail` names the connector, a
+selected table and "over the limit of 1 min". (b) the MySQL second login has `REPLICATION SLAVE` and lacks only
+`REPLICATION CLIENT`. (c) each gate asserts its source's exact setting names (`Source.expected_settings`).
+
+**NITs done:** privilege list parsed between `GRANT ` and ` ON` (a table named like a privilege no longer
+matches); `SET PERSIST`; SQL Server table names compared case-insensitively; the "tried again" doc and the
+feature page Limits (resume counts from the resume, Kafka Connect unreachable = not running, two-fault
+ordering, legacy `expire_logs_days`). **NITs not done:** `USE [db];` before the SQL Server enable commands;
+a classified `debug` line when a probe statement fails; rendering the capture tab for `?tab=capture` without
+waiting on the ingest spec.
+
+**CI on `9bcc546f`** (run 41019425163): all 41 checks `pass`, `Rust · test (stable)` 8,649 passed 0 failed
+(41m56s), clippy and fmt pass. Gates read in the job logs: `g4-cdc` (12m57s) lag after the first copy both
+`up_to_date`, setup checks ok / `publication` missing alone, lag alert line "lag 64s, 1 instance
+('Connector g4-demo-cdc (conn-g4-demo-cdc-mvunrev0): change capture of g4_cdc.orders_history is 1 min behind the
+source, o...'); started again: both up_to_date, alert closed"; `g4-mysql` (7m47s) 5 checks ok, `replication
+privileges` missing alone with `REPLICATION SLAVE` granted; `g4-mssql` (7m20s) `SQL Server Agent` `unchecked`,
+`CDC on table dbo.orders_plain` missing alone. Locally: `cargo fmt --check` clean, `test_cdc_apply.py` 56
+passed, `test_cdc_gate.py` 10, `bun test src/features/connectors` 428 passed, `tsc` clean, lint 0 errors. Not
+verified locally: every Rust change and the gates (CI only).
