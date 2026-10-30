@@ -1401,6 +1401,67 @@ three test-only clippy lints and on a store test that compared nanoseconds with 
 fixed (commits above) and green on `510052be`. The MySQL `SHOW GRANTS` and `CAST(... AS CHAR)` decoding and
 the tiberius row reads were first exercised by the gates.
 
+### Slice 5, Amendment 8 (developer, Sonnet, 2026-10-30)
+
+Branch `feat/src-4-slice-5`; final code commit `334b07ee`. No migration was needed (the facts live in the
+existing `result` JSON column); 0120 and 0121 were not taken.
+
+**T5.9, the merge (S8-a).** `git merge origin/feat/data-phase-4-src-4` as it stood when I started (slice 4
+closed, migration 0118), commit `c57a890d`. Three files resolved by hand, all additions on both sides with
+no line dropped: `docs/OPERATIONS.md`, `docs/core/BACKLOG.md` (the SRC-4 row existed on both sides, kept
+once) and this plan (three hunks: slice 5's amendments, handoffs and reviews beside slice 3's). Auto-merged
+and read afterwards: `ci.yml`, `CHANGELOG.md`, `docs/CI.md`, the feature page, `cdc_apply.py`,
+`test_cdc_apply.py`, `ops/g4/*`, `cdc_lifecycle.rs`, `routes/connectors.rs`, `connector-review.tsx`,
+`connectors.ts`, `dial-forms.test.tsx`. Slice 4's `cdc_setup_probe` takes only `Dial::Cdc`, so a MongoDB
+connector reaches none of the SQL checks. The connector-type counts were recounted from the migrations
+(slice 4 added no type): 27 types, 22 supported, as before. `cdc-dial-form.tsx` got no TLS select from
+slice 3 or 4, and `cdc-mongo-dial-form.tsx` is unchanged. The phase head moved again after I started
+(slice 6); that newer head is not merged, as agreed.
+
+**S8-b, lag.** No sensor work. `g4-mongo` has a new step after the freshness changes: `GET .../change-capture`
+must carry a lag for exactly the two collections, each with a status, `seconds` not negative; no number is
+asserted. Result line: `MongoDB CDC lag: pass (after the changes: orders up_to_date, orders_history
+up_to_date)`.
+
+**T5.10, setup checks (S8-c to S8-f).**
+- *Facts.* `discover.mongo_setup_facts` runs after `ping`, inside the same `checking_resolver`, `hello`
+  (set name against the dial's, `isWritablePrimary`) and `connectionStatus` with `showPrivileges`, each in
+  its own `try`; a command that raised leaves its fact out and keeps no text. `Tested.mongo_setup` is
+  `MongoSetupFacts` (`deny_unknown_fields`; `ReplicaSetFact` and `ChangeStreamFact` are serde enums,
+  `primary` is a JSON boolean, which is already a closed set, so it has no enum).
+- *Result route.* Accepts `mongoSetup` for a finished `test` only; a value outside the set, a free-text
+  value or an unknown key does not parse (400); on a list, preview or failure `outcome_of` refuses it.
+- *Checks.* `cdc_setup_check::mongo_checks(Option<&MongoSetupFacts>, &CdcMongoDial)`: fixed sentences from
+  the amendment; `differs`, `none` and "not the primary" are `missing` with no command; the grant command is
+  built from the dial's database and user, each quoted with `serde_json` (a test puts `"` and `\` in the
+  user); absent facts are `unchecked`. The setting names are `replicaSet`, `primary`, `changeStream`.
+- *Poll.* `Answer.setup_checks` is filled by `poll` for a finished `test` of a `Dial::CdcMongo` connector
+  from the stored facts; absent for everything else. No new route.
+- *Console.* `DiscoveryAnswer.setupChecks`; `runConnectionTest` hands it to the answer shown and the detail
+  page's existing `TestNotice` renders it with `ConnectorSetupChecks`. The edit page also uses
+  `runConnectionTest` but renders no setup checks, as before. The checks never change `ok`.
+- *Gate.* After the first copy: the connector's test lists the three settings, all `ok`; a second connector
+  with `replicaSet` "not-the-replica-set" (Kafka Connect refuses its config, the API saves the settings and
+  answers 422, or 503 when the worker's validation outlasts the API's 10 s: both accepted) gets `replicaSet`
+  `missing` with the fixed sentence and no command, the other two `ok`; it is deleted afterwards.
+  `connectionStatus` showed the fixture user's privileges (`granted`); no stop condition was met.
+
+**Fixes CI found:** `334b07ee` (the 503 above); the first run on `e9f094b2` failed only that step.
+
+**Local commands:** `cargo fmt --check` clean; `pytest dispar_orchestrate/test_discover.py` 74 passed (and
+`test_cdc_apply.py`, `test_cdc_apply_mongodb.py` 149 together with it after the merge); `bun test
+src/features/connectors` 431 pass, 0 fail (after the merge); `bun test src/lib/connectors/run-connection-test.test.ts`
+4 pass; `bun run typecheck` clean; `ops/g4` unittest `test_g4_mongo test_cdc_gate` OK; connector-gate-coverage
+lint OK (22 supported); `test_gate_summary.py` 29, `test_required_gate.sh` 56. Rust tests were not run locally.
+
+**CI:** run `41031878318` on `334b07ee` concluded success (45m11s; 37 jobs success, 41 checks pass in
+`gh pr checks`, plus Security run `41031878334` success). `Rust · G4 MongoDB change capture into Bronze`
+passed with: connect, discover, load, `setup checks` (3 ok, wrong replicaSet missing alone), reload (each
+kind within 120 s, 26 to 43 s), `lag` and PASS. `g4-cdc`, `g4-mysql`, `g4-mssql` also passed on the merged
+code. One status, "Dependency review (PR only)", still read *pending* in `gh pr checks` after the runs had
+concluded; the Security run itself is success. *Not verified:* that status's own state; the setup checks'
+text in a browser (unit tests only).
+
 ## Review
 
 (The planner writes findings here, tagged `BLOCKER` or `SHOULD-FIX`.)
