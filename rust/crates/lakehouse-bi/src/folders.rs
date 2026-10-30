@@ -238,7 +238,7 @@ pub async fn list_folders(ch: &ChClient, viewer: &Viewer) -> Result<Vec<Folder>,
         .rows(
             &format!(
                 "SELECT {FOLDER_COLS} FROM console.bi_folder FINAL WHERE is_deleted = 0{} ORDER BY name",
-                viewer.owner_clause()
+                viewer.folder_clause()
             ),
             None,
         )

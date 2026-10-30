@@ -14,7 +14,7 @@ use lakehouse_store::report_subscriptions::{
     DeliveryStatus, NewDelivery, NewSubscription, PAUSE_AFTER_FAILURES, Recipient,
     UNSCHEDULABLE_REASON, claim_due, create, delete, get, last_deliveries, list_deliveries,
     list_for_board, list_for_owner, note_outcome, prune_deliveries, recipients, record_delivery,
-    retry_at, search_active_users, set_paused, update,
+    retry_at, search_active_user_names, search_active_users, set_paused, update,
 };
 use serde_json::json;
 use sqlx::PgPool;
@@ -615,5 +615,33 @@ async fn a_retry_brings_the_next_time_forward_and_never_pushes_it_back(
             .await
             .unwrap()
     );
+    Ok(())
+}
+
+/// `BI-19` E review E-2: the comment picker searches names only. An address (or a
+/// piece of one) matches nobody, so the picker is no way to look up who has
+/// which address.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_name_picker_never_matches_an_email_substring(pool: PgPool) -> sqlx::Result<()> {
+    let id: Uuid = sqlx::query_scalar(
+        "INSERT INTO app_user (name, email) VALUES ('Zelda Quill', 'kzx9@mailhost.test') \
+         RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await?;
+
+    let by_name = search_active_user_names(&pool, "quill", 10, &[])
+        .await
+        .unwrap();
+    assert_eq!(by_name, vec![(id, "Zelda Quill".to_owned())]);
+    for needle in ["kzx9@mailhost.test", "kzx9", "@mailhost", "mailhost.test"] {
+        let found = search_active_user_names(&pool, needle, 10, &[])
+            .await
+            .unwrap();
+        assert!(found.is_empty(), "{needle:?} matched by address");
+    }
+    // The address search the recipient picker has still finds the same person.
+    let by_address = search_active_users(&pool, "kzx9", 10, &[]).await.unwrap();
+    assert_eq!(by_address.len(), 1);
     Ok(())
 }

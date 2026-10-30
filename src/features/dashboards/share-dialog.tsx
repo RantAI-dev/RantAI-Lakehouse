@@ -12,6 +12,7 @@ import { apiFetch } from "@/services/http";
 import { dashboardService, type EmbedInfo } from "@/services";
 import { copyText as copyToClipboard } from "@/lib/copy-text";
 import { PublicLinkPanel } from "./public-link-panel";
+import { PeoplePanel } from "./people-panel";
 import { AllowedSitesEditor, WithdrawTokens } from "./embed-access-panel";
 import { Input } from "@/components/ui/input";
 import { tokenRules } from "./share-embed";
@@ -110,6 +111,7 @@ export function ShareDialog({
           <DialogTitle className="flex items-center gap-2"><Share2 className="size-4" /> Share “{dashName}”</DialogTitle>
         </DialogHeader>
         <div className="space-y-3">
+          <PeoplePanel kind="board" id={board} />
           <PublicLinkPanel board={board} />
 
           <div className="space-y-2 rounded-lg border border-border bg-muted/20 p-3">

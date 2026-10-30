@@ -17,7 +17,7 @@ use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use lakehouse_auth::Principal;
-use lakehouse_bi::access::Viewer;
+use lakehouse_bi::access::{Level, Viewer};
 use lakehouse_bi::builder::{ReadContext, RelationColumns};
 use lakehouse_bi::filters::{ColumnKind, validate_filters, without_inert};
 use lakehouse_bi::grain::{Grain, TimeContext};
@@ -31,9 +31,10 @@ use serde_json::{Map, Value, json};
 use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::policy_engine::PolicyEngineObligations;
+use crate::routes::dashboard_access::{require_entitled, viewer_for};
 use crate::routes::dashboard_organise::{
-    drop_tile, place_new_chart, require_board, require_chart_board, require_editable_chart,
-    snapshot, viewer_of, visible_live_chart_board,
+    BOARD_NOT_FOUND, drop_tile, place_new_chart, require_board, require_chart_board,
+    require_editable_chart, snapshot, visible_live_chart_board,
 };
 use crate::routes::support::{
     effective_chart, is_numeric_type, mart_columns, render_stored_spec, run_spec_sql, sources_for,
@@ -101,6 +102,18 @@ impl DashboardQuery {
         self.fresh = Some("1".to_owned());
         self
     }
+
+    /// The same read with only chart `id` computed fresh (`fresh=<id>`), the
+    /// other tiles of the board staying as remembered. For a caller that
+    /// decides from one tile's number *now* (a chart alert's crossing and
+    /// recovery, `BI-19` C, PR #250 CI): a remembered number would delay a
+    /// recovery by the cache's age, and computing the whole board every
+    /// check would cost far more than the one tile the rule watches.
+    #[must_use]
+    pub(crate) fn fresh_chart(mut self, id: &str) -> Self {
+        self.fresh = Some(id.to_owned());
+        self
+    }
 }
 
 /// Why [`get_body`] stopped: the store failed, or the request's parameter
@@ -109,6 +122,10 @@ impl DashboardQuery {
 enum BodyError {
     Store(lakehouse_clickhouse::ChError),
     Params(ApiError),
+    /// The dashboard asked for is not one the caller may see (`BI-19` part B1):
+    /// unknown, in the trash, private to somebody else, or outside what their
+    /// rules give. One answer for all, so an id guess learns nothing.
+    NotFound,
 }
 
 impl From<lakehouse_clickhouse::ChError> for BodyError {
@@ -226,6 +243,16 @@ pub(crate) async fn payload_for(
             .collect(),
     };
     let reject = |err: ApiError| crate::error::ApiRejection(err).into_response();
+    // BI-18 part C, part 2: a board in the trash or in somebody else's
+    // personal space reads as a board that does not exist. BI-19 part B1: so
+    // does one the caller's rules leave out, and the caller who holds no
+    // `dashboard:read` and no rule is refused here (the router floor is "signed
+    // in", plan D8).
+    // BI-19 B2 review note: one resolution serves the read and the level.
+    let scope = crate::routes::dashboard_access::payload_scope(state, principal)
+        .await
+        .map_err(reject)?;
+    let viewer = scope.viewer.clone();
     // BI-18: a malformed `filters` used to be ignored without a word, which
     // showed an unfiltered dashboard for a filter the caller believed was on.
     let param_filters = parse_filters_param(q.filters.as_deref()).map_err(reject)?;
@@ -239,18 +266,16 @@ pub(crate) async fn payload_for(
         .await
         .map_err(reject)?;
     let obligations = PolicyEngineObligations::from_state(state);
-    // BI-18 part C, part 2: a board in the trash or in somebody else's
-    // personal space reads as a board that does not exist.
-    let viewer = viewer_of(principal);
     // BI-4 part B: open the scope remembered results are looked up in, with
     // the install's rule; `get_body` narrows it to the board's and the charts'.
-    let scope = crate::result_cache::CacheScope::new(
+    // (`cache_scope`, not `scope`: that name is BI-19's access scope above.)
+    let cache_scope = crate::result_cache::CacheScope::new(
         std::sync::Arc::clone(&state.result_cache),
         format.result_cache,
         crate::result_cache::Fresh::parse(q.fresh.as_deref()),
     );
     match crate::result_cache::scoped(
-        scope,
+        cache_scope,
         get_body(
             &state.clickhouse,
             q,
@@ -267,7 +292,16 @@ pub(crate) async fn payload_for(
             crate::routes::settings::add_formatting(&mut body, &format);
             // BI-1 D7: the console hides the download items for a person
             // whose every role is switched off; the routes refuse anyway.
+            let level = crate::routes::dashboard_access::payload_level(
+                state,
+                &scope,
+                q.board.as_deref().unwrap_or(store::DEFAULT_BOARD_ID),
+            )
+            .await;
             if let Some(map) = body.as_object_mut() {
+                // BI-19 B2 (T9): what the caller may do with this dashboard, so
+                // the console offers only that; the server checks it anyway.
+                map.insert("access".to_owned(), json!({ "level": level.as_str() }));
                 // BI-1 D1/feature decision 6: the console offers the PDF item
                 // only when the deployment has a renderer and a key for its token.
                 map.insert(
@@ -285,6 +319,7 @@ pub(crate) async fn payload_for(
             Ok(body)
         }
         Err(BodyError::Params(err)) => Err(reject(err)),
+        Err(BodyError::NotFound) => Err(reject(ApiError::NotFound(BOARD_NOT_FOUND.to_owned()))),
         Err(BodyError::Store(err)) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             ApiJson(upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json()),
@@ -353,6 +388,22 @@ async fn get_body(
         .iter()
         .find(|b| b.id == board)
         .or(default_row.as_ref());
+    // BI-19 part B1 (plan D8): a dashboard the caller may not see is a 404,
+    // whether it is unknown, trashed, private or left out by their rules. A
+    // store failure above leaves `boards` empty and has already been recorded,
+    // so it is not mistaken for a missing dashboard. The built-in board and
+    // `all` (which adds the built-in tiles) are shown only to somebody with a
+    // starting point.
+    // BI-19 B1 review R13: the built-in check does not depend on the store
+    // having answered; a viewer without a starting point is refused whatever
+    // the store error, so no payload (tiles, filter values) is built for it.
+    let is_builtin = board == store::DEFAULT_BOARD_ID || board == "all";
+    if is_builtin && !viewer.sees_builtin() {
+        return Err(BodyError::NotFound);
+    }
+    if store_error.is_none() && !is_builtin && board_obj.is_none() {
+        return Err(BodyError::NotFound);
+    }
     let layout = board_obj.and_then(|b| b.layout.clone()).unwrap_or_default();
     // BI-18 part C: the tabs decide which filters each tile is given.
     let tabs: Vec<lakehouse_bi::layout::Tab> =
@@ -842,7 +893,12 @@ pub async fn specs_list(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
 ) -> Response {
-    match store::list_stored_charts(&state.clickhouse, &viewer_of(&principal)).await {
+    // BI-19 part B1: the charts of a restricted dashboard are not the caller's.
+    let viewer = match viewer_for(&state, &principal).await {
+        Ok(viewer) => viewer,
+        Err(err) => return crate::error::ApiRejection(err).into_response(),
+    };
+    match store::list_stored_charts(&state.clickhouse, &viewer).await {
         Ok(stored) => {
             let charts: Vec<Value> = stored.iter().map(render_stored_chart).collect();
             (StatusCode::OK, ApiJson(json!({ "charts": charts }))).into_response()
@@ -881,11 +937,28 @@ pub async fn specs_create(
     Extension(principal): Extension<Principal>,
     body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
+    // BI-19 B2 (plan D8): a caller who holds less than `edit` everywhere is
+    // refused first, whatever the request says.
+    crate::routes::dashboard_access::require_can_ever(&state, &principal, Level::Edit).await?;
     let input = parse_chart_input(&body)?;
     // BI-18 part C, part 2: a chart cannot be put on a dashboard that is in
     // the trash or in somebody else's personal space.
-    let viewer = viewer_of(&principal);
-    require_chart_board(&state.clickhouse, input.board.as_deref(), &viewer).await?;
+    // BI-19 B1 review R5: the resolved viewer, so a restricted dashboard is a 404.
+    // BI-19 B2 (plan D8): and `edit` on that dashboard, else 403.
+    let scope = crate::routes::dashboard_access::scope_for_write(&state, &principal).await?;
+    require_chart_board(&state.clickhouse, input.board.as_deref(), &scope.viewer).await?;
+    crate::routes::dashboard_access::require_board_level(
+        &state,
+        &scope,
+        input.board.as_deref().unwrap_or_default(),
+        Level::Edit,
+    )
+    .await?;
+    // BI-19 B2 re-review S4-b: a source in a folder the caller cannot see is
+    // the unknown-source answer, as for the sources routes.
+    store::ensure_sources_visible(&state.clickhouse, &input, &scope.viewer, &[])
+        .await
+        .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
     let time = crate::routes::settings::time_context(&state).await?;
     let spec = store::spec_from_input(
         &state.clickhouse,
@@ -913,12 +986,58 @@ pub async fn specs_create(
     ))
 }
 
+/// The definition `specs_preview` runs: a drill rebuilt from the saved chart, or
+/// the posted definition.
+///
+/// `BI-19` B1 review R2 (and R9): a drill reads a saved chart, so it goes
+/// through the resolved viewer. A chart of a restricted dashboard the caller
+/// cannot see is the same 404 as an unknown chart (no existence oracle), and
+/// somebody who holds only a rule can still drill the charts it shows them.
+/// Any other preview reads any table, so it still needs the permission the
+/// router used to demand: the route is "signed in" only so that a drill works
+/// for a rule-only person.
+async fn preview_input(
+    state: &AppState,
+    principal: &Principal,
+    raw: Value,
+) -> Result<ChartInput, ApiError> {
+    if raw.get("drillOf").is_some() {
+        let viewer = crate::routes::dashboard_access::viewer_for(state, principal).await?;
+        return crate::routes::drill::drill_input(&state.clickhouse, raw, &viewer).await;
+    }
+    if !principal.has("dashboard:read") {
+        return Err(ApiError::PermissionDenied("dashboard:read".to_owned()));
+    }
+    serde_json::from_value(raw)
+        .map_err(|_err| ApiError::BadRequest("body JSON is invalid".to_owned()))
+}
+
+/// `BI-19` B2 re-review S4-b: the preview reads the named source's rows, so a
+/// hidden source is the unknown-source answer here too. A drill rebuilds a
+/// saved chart's own definition (the dashboard governs it, and `drill_input`
+/// read it through the viewer).
+async fn preview_sources_visible(
+    state: &AppState,
+    principal: &Principal,
+    input: &ChartInput,
+    is_drill: bool,
+) -> Result<(), ApiError> {
+    if is_drill {
+        return Ok(());
+    }
+    let viewer = crate::routes::dashboard_access::viewer_for(state, principal).await?;
+    store::ensure_sources_visible(&state.clickhouse, input, &viewer, &[])
+        .await
+        .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))
+}
+
 /// `POST /api/dashboard/specs/preview` — validate and execute a chart input
 /// without persisting it. The builder uses this to show the user the actual
 /// result before the chart is added to a dashboard.
 ///
-/// Same posture as [`get`]: `Policy::RequiresPermission
-/// ("dashboard:read")` guarantees a real `Extension<Principal>`, whose
+/// Same posture as [`get`]: `Policy::RequiresAuth` (with `dashboard:read`
+/// checked here for everything but a drill, `BI-19` B1 review R2) guarantees a
+/// real `Extension<Principal>`, whose
 /// `role_names`/id/tenant ids are threaded into [`run_spec_sql`] so a
 /// preview is masked/row-filtered exactly like the persisted tile would be.
 #[allow(
@@ -939,12 +1058,8 @@ pub async fn specs_preview(
     // chart (not part of its definition). Checked against the definitions;
     // a value that does not fit is a 400.
     let sent_params = raw.as_object_mut().and_then(|o| o.remove("params"));
-    let input = if raw.get("drillOf").is_some() {
-        crate::routes::drill::drill_input(&state.clickhouse, raw, &viewer_of(&principal)).await?
-    } else {
-        serde_json::from_value(raw)
-            .map_err(|_err| ApiError::BadRequest("body JSON is invalid".to_owned()))?
-    };
+    let is_drill = raw.get("drillOf").is_some();
+    let input = preview_input(&state, &principal, raw).await?;
     let time = crate::routes::settings::time_context(&state).await?;
     let loaded = if sent_params.is_some() || input.uses_params() {
         let text = sent_params.as_ref().map(ToString::to_string);
@@ -956,6 +1071,7 @@ pub async fn specs_preview(
         Some(l) if l.store_error.is_none() => time.with_params(l.values.clone()),
         _ => time,
     };
+    preview_sources_visible(&state, &principal, &input, is_drill).await?;
     let spec = store::spec_from_input(
         &state.clickhouse,
         &input,
@@ -1067,6 +1183,9 @@ pub async fn specs_update(
     Extension(principal): Extension<Principal>,
     body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
+    // BI-19 B2 (plan D8): a caller who holds less than `edit` everywhere is
+    // refused first, whatever the request says.
+    crate::routes::dashboard_access::require_can_ever(&state, &principal, Level::Edit).await?;
     let raw: Value = serde_json::from_slice(&body)
         .map_err(|_err| ApiError::BadRequest("body JSON is invalid".to_owned()))?;
     let id = raw
@@ -1082,10 +1201,34 @@ pub async fn specs_update(
     // BI-18 part C, part 2: an edit may not reach a chart in the trash (it
     // would bring it back without a restore) or on somebody else's personal
     // board, nor move a chart onto such a board.
-    let viewer = viewer_of(&principal);
+    // BI-19 B1 review R5: the resolved viewer, so a restricted dashboard is a 404.
+    // BI-19 B2 (plan D8): `edit` on the dashboard the chart is on, and on the one
+    // it moves to; visible-but-below is a 403.
+    let scope = crate::routes::dashboard_access::scope_for_write(&state, &principal).await?;
     let ch = &state.clickhouse;
-    let old_board = require_editable_chart(ch, &id, &viewer).await?;
-    require_chart_board(ch, input.board.as_deref(), &viewer).await?;
+    let old_board = require_editable_chart(ch, &id, &scope.viewer).await?;
+    crate::routes::dashboard_access::require_board_level(&state, &scope, &old_board, Level::Edit)
+        .await?;
+    require_chart_board(ch, input.board.as_deref(), &scope.viewer).await?;
+    crate::routes::dashboard_access::require_board_level(
+        &state,
+        &scope,
+        input.board.as_deref().unwrap_or_default(),
+        Level::Edit,
+    )
+    .await?;
+    // BI-19 B2 re-review S4-b: a source the chart does not already read must be
+    // one the caller may see. What it reads now stays (the dashboard governs).
+    let already = store::list_stored_charts(ch, &scope.viewer)
+        .await
+        .map_err(|err| classify_dashboard_ch_error(&err))?
+        .into_iter()
+        .find(|c| c.spec.id == id)
+        .map(|c| store::sql_sources_named(&c.def))
+        .unwrap_or_default();
+    store::ensure_sources_visible(ch, &input, &scope.viewer, &already)
+        .await
+        .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
     let time = crate::routes::settings::time_context(&state).await?;
     let spec = store::spec_from_input(ch, &input, ChartSource::Ui, "ui", Some(id), &time)
         .await
@@ -1141,15 +1284,24 @@ pub async fn specs_delete(
     Extension(principal): Extension<Principal>,
     Query(q): Query<IdQuery>,
 ) -> ApiResult<ApiJson<Value>> {
+    // BI-19 B2 (plan D8): a caller who holds less than `edit` everywhere is
+    // refused first, whatever the request says.
+    crate::routes::dashboard_access::require_can_ever(&state, &principal, Level::Edit).await?;
     let Some(id) = q.id.filter(|s| !s.is_empty()) else {
         return Err(ApiError::BadRequest("id is required".to_owned()).into());
     };
     // A chart the caller may not see is answered like one that does not exist:
     // `ok`, and nothing is deleted (BI-18 part C, part 2).
     let ch = &state.clickhouse;
-    let Some(board) = visible_live_chart_board(ch, &id, &viewer_of(&principal)).await? else {
+    // BI-19 B1 review R5: the resolved viewer; a chart on a dashboard the caller
+    // cannot see is answered like one that does not exist.
+    let scope = crate::routes::dashboard_access::scope_for_write(&state, &principal).await?;
+    let Some(board) = visible_live_chart_board(ch, &id, &scope.viewer).await? else {
         return Ok(ApiJson(json!({ "ok": true })));
     };
+    // BI-19 B2 (plan D8): seen, so `edit` is checked (403 below it).
+    crate::routes::dashboard_access::require_board_level(&state, &scope, &board, Level::Edit)
+        .await?;
     store::delete_chart(ch, &id, &principal.display_name)
         .await
         .map_err(|err| {
@@ -1178,7 +1330,11 @@ pub async fn boards_list(
     Extension(principal): Extension<Principal>,
 ) -> Response {
     let ch = &state.clickhouse;
-    let viewer = viewer_of(&principal);
+    // BI-19 part B1: the list holds the dashboards the caller's rules leave them.
+    let viewer = match viewer_for(&state, &principal).await {
+        Ok(viewer) => viewer,
+        Err(err) => return crate::error::ApiRejection(err).into_response(),
+    };
     let (boards, stored) = match tokio::try_join!(
         store::list_boards(ch, &viewer),
         store::list_stored_charts(ch, &viewer)
@@ -1200,13 +1356,18 @@ pub async fn boards_list(
     // catalogue means this tenant's BUILTIN_DASHBOARD_SPEC never loaded, so
     // the built-in board has no tiles to report.
     let builtin_tiles = CHARTS.len() + KPIS.len();
-    let mut out = vec![json!({
-        "id": store::DEFAULT_BOARD_ID,
-        "name": "Main",
-        "layout": {},
-        "chartCount": builtin_tiles + counts.get(store::DEFAULT_BOARD_ID).copied().unwrap_or(0),
-        "builtin": true,
-    })];
+    // The built-in board has no rule of its own: it belongs to the starting
+    // point, so somebody who sees only what they were given does not get it.
+    let mut out = Vec::new();
+    if viewer.sees_builtin() {
+        out.push(json!({
+            "id": store::DEFAULT_BOARD_ID,
+            "name": "Main",
+            "layout": {},
+            "chartCount": builtin_tiles + counts.get(store::DEFAULT_BOARD_ID).copied().unwrap_or(0),
+            "builtin": true,
+        }));
+    }
     // BI-19 part A (plan D1): the list's "public" mark and the delete warning
     // read the live links from Postgres, never the dashboard row. `Board` does
     // not serialise its old `public_token`, so a board without a live link has
@@ -1264,11 +1425,25 @@ pub async fn boards_create(
     principal: Option<Extension<Principal>>,
     body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
+    if let Some(Extension(p)) = principal.as_ref() {
+        // BI-19 B2 (plan D8): filing a dashboard needs `edit` somewhere.
+        crate::routes::dashboard_access::require_can_ever(&state, p, Level::Edit).await?;
+    }
     // Fail closed: with nobody attached (the assistant's tool surface does not
     // come through here) the caller is anonymous and sees no personal space.
-    let viewer = principal
+    // BI-19 B1 review R5: the resolved viewer, so duplicating (or filing into) a
+    // dashboard or folder the caller cannot see is the same 404 as an unknown one.
+    // BI-19 B2 (plan D8, D14): filing a dashboard needs `edit` on the folder it
+    // goes into, and a copy needs the original to be visible.
+    let scope = match principal.as_ref() {
+        Some(Extension(p)) => {
+            Some(crate::routes::dashboard_access::scope_for_write(&state, p).await?)
+        }
+        None => None,
+    };
+    let viewer = scope
         .as_ref()
-        .map_or_else(Viewer::anonymous, |Extension(p)| viewer_of(p));
+        .map_or_else(Viewer::anonymous, |s| s.viewer.clone());
     let parsed: BoardCreateBody = if body.is_empty() {
         BoardCreateBody::default()
     } else {
@@ -1281,6 +1456,25 @@ pub async fn boards_create(
     // takes only its owner's dashboards.
     crate::routes::dashboard_folders::ensure_folder_usable(&state.clickhouse, &folder_id, &viewer)
         .await?;
+    if let Some(scope) = scope.as_ref() {
+        // BI-19 B2 review S1: a copy named for no folder lands next to its
+        // original (`store::duplicate_board`), so `edit` is asked where it will
+        // be filed, not at the root. An unknown or invisible original is left
+        // to the duplicate itself, which answers 404.
+        let mut filed_in = folder_id.clone();
+        if folder_id.is_empty()
+            && let Some(dup) = parsed.duplicate.as_deref().map(str::trim)
+            && !dup.is_empty()
+            && dup != store::DEFAULT_BOARD_ID
+            && let Some(original) = store::get_board(&state.clickhouse, dup, &viewer)
+                .await
+                .map_err(|err| crate::routes::dashboard_folders::classify_ch_error(&err))?
+            && original.owner_id.as_deref().is_none_or(str::is_empty)
+        {
+            filed_in = original.folder_id.unwrap_or_default();
+        }
+        scope.require_on_folder(&filed_in, Level::Edit)?;
+    }
     // The owner of the folder a new dashboard is filed in: it travels in the
     // first insert, so a dashboard filed in a personal space is private from
     // the moment it exists and never public in between
@@ -1429,6 +1623,20 @@ struct BoardEditBody {
 pub(crate) const CACHE_RULE_REFUSED: &str = "The freshness rule must be {\"mode\": \"default\"} or {\"mode\": \"fresh\"}, or {\"mode\": \"minutes\", \"minutes\": a whole number from 1 to 1440}.";
 
 impl BoardEditBody {
+    /// The level the body needs on the dashboard (`BI-19` part B2): `manage`
+    /// when it shares or moves it, else `edit`.
+    fn level_needed(&self) -> Level {
+        if self.embed.is_some()
+            || self.embed_revoke_all.is_some()
+            || self.embed_origins.is_some()
+            || self.folder_id.is_some()
+        {
+            Level::Manage
+        } else {
+            Level::Edit
+        }
+    }
+
     /// Whether the body changes what a version holds (`BI-18` part C, part 2):
     /// everything but sharing, the folder and the embed state.
     fn changes_content(&self) -> bool {
@@ -1747,6 +1955,9 @@ pub async fn boards_update(
     Extension(principal): Extension<Principal>,
     body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
+    // BI-19 B2 (plan D8): a caller who holds less than `edit` everywhere is
+    // refused first, whatever the request says.
+    crate::routes::dashboard_access::require_can_ever(&state, &principal, Level::Edit).await?;
     let parsed: BoardEditBody = if body.is_empty() {
         BoardEditBody::default()
     } else {
@@ -1770,9 +1981,25 @@ pub async fn boards_update(
     // edited. Without this a layout save for a deleted board would write a
     // blank live row over its trash entry, and an edit by id could reach
     // another user's draft.
-    let viewer = viewer_of(&principal);
+    // BI-19 B1 review R5: the resolved viewer, so a restricted dashboard is a 404.
+    let scope = crate::routes::dashboard_access::scope_for_write(&state, &principal).await?;
+    let viewer = scope.viewer.clone();
     if id != store::DEFAULT_BOARD_ID {
         require_board(ch, &id, &viewer).await?;
+    }
+    // BI-19 B2 (plan D8): `edit` for the content; sharing the dashboard (embed
+    // state, the sites that may frame it, withdrawing tokens) and moving it
+    // change who can reach it, so they need `manage` (feature B1, B7). The place
+    // it moves to needs `edit`, as any filing does.
+    crate::routes::dashboard_access::require_board_level(
+        &state,
+        &scope,
+        &id,
+        parsed.level_needed(),
+    )
+    .await?;
+    if let Some(folder_id) = &parsed.folder_id {
+        scope.require_on_folder(folder_id.trim(), Level::Edit)?;
     }
     // Before the first write, so a bad filter list does not leave a board
     // half-edited (BI-18).
@@ -1850,6 +2077,88 @@ pub async fn boards_update(
     Ok(ApiJson(with_embed_access(json!({ "ok": true }))))
 }
 
+/// The settings of an imported dashboard file (`BI-19` part D, plan D14), as
+/// [`apply_imported_content`] takes them.
+pub(crate) struct ImportedContent {
+    pub filters: Vec<FilterDef>,
+    pub tabs: Vec<lakehouse_bi::layout::Tab>,
+    pub layout: LayoutMap,
+    pub phone_layout: Vec<lakehouse_bi::layout::PhoneTile>,
+    pub params: Vec<lakehouse_bi::params::BoardParam>,
+    pub grain: Option<String>,
+    pub refresh_seconds: Option<u32>,
+    pub theme: Option<String>,
+    pub font: Option<String>,
+}
+
+/// Save an imported file's settings on a board the importer just made, through
+/// the same checks and writes as `PUT /api/dashboard/boards` (tab rules, filter
+/// ties, theme and font allowed by the administrator, refresh interval, saved
+/// parameters, grain), so a file cannot save what the editor could not.
+///
+/// # Errors
+///
+/// 400 with the editor's own sentence for the first check that fails, before
+/// that check's write; the caller takes the half-made board back.
+pub(crate) async fn apply_imported_content(
+    state: &AppState,
+    board: &str,
+    content: ImportedContent,
+) -> Result<(), ApiError> {
+    let ch = &state.clickhouse;
+    let parsed = BoardEditBody {
+        id: Some(board.to_owned()),
+        layout: Some(content.layout),
+        filters: Some(content.filters),
+        refresh_seconds: content.refresh_seconds.map(i64::from),
+        grain: content.grain,
+        params: Some(content.params),
+        tabs: Some(content.tabs),
+        phone_layout: Some(content.phone_layout),
+        theme: content.theme,
+        font: content.font,
+        ..BoardEditBody::default()
+    };
+    if let Some(filters) = &parsed.filters {
+        validate_filters(filters).map_err(ApiError::BadRequest)?;
+    }
+    check_tab_rules(ch, board, &parsed).await?;
+    check_theme_and_font(state, &parsed).await?;
+    let refresh = checked_refresh(parsed.refresh_seconds)?;
+    let checked_params =
+        crate::routes::params::check_board_params_opt(ch, parsed.params.as_deref()).await?;
+    if let Some(grain) = &parsed.grain
+        && !grain.trim().is_empty()
+    {
+        parse_grain_param(Some(grain))?;
+    }
+    if let Some(layout) = &parsed.layout {
+        store::update_board_layout(ch, board, layout)
+            .await
+            .map_err(|err| board_write_error(&err))?;
+    }
+    if let Some(seconds) = refresh {
+        store::update_board_refresh(ch, board, seconds)
+            .await
+            .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
+    }
+    save_grain_and_params(
+        ch,
+        board,
+        parsed.grain.as_deref(),
+        checked_params.as_deref(),
+    )
+    .await?;
+    save_tabs_and_phone_layout(ch, board, &parsed).await?;
+    if let Some(filters) = &parsed.filters {
+        let filters = without_inert(filters);
+        store::update_board_filters(ch, board, &filters)
+            .await
+            .map_err(|err| board_write_error(&err))?;
+    }
+    Ok(())
+}
+
 /// `DELETE /api/dashboard/boards?id=` — delete a board and its charts.
 ///
 /// # Errors
@@ -1860,6 +2169,9 @@ pub async fn boards_delete(
     Extension(principal): Extension<Principal>,
     Query(q): Query<IdQuery>,
 ) -> ApiResult<ApiJson<Value>> {
+    // BI-19 B2 (plan D8): a caller who holds less than `manage` everywhere is
+    // refused first, whatever the request says.
+    crate::routes::dashboard_access::require_can_ever(&state, &principal, Level::Manage).await?;
     let id = q.id.unwrap_or_default();
     if id.is_empty() || id == store::DEFAULT_BOARD_ID {
         return Err(ApiError::BadRequest("invalid dashboard".to_owned()).into());
@@ -1867,7 +2179,12 @@ pub async fn boards_delete(
     // BI-18 part C, part 2: deleting moves to the trash, and only a board the
     // caller may see can be deleted. An unknown, already deleted or private
     // board is "not found" alike.
-    require_board(&state.clickhouse, &id, &viewer_of(&principal)).await?;
+    // BI-19 B1 review R5: the resolved viewer, so a restricted dashboard is a 404.
+    let scope = crate::routes::dashboard_access::scope_for_write(&state, &principal).await?;
+    require_board(&state.clickhouse, &id, &scope.viewer).await?;
+    // BI-19 B2 (plan D8): deleting is `manage` (feature B1).
+    crate::routes::dashboard_access::require_board_level(&state, &scope, &id, Level::Manage)
+        .await?;
     store::delete_board(&state.clickhouse, &id, &principal.display_name)
         .await
         .map_err(|err| {
@@ -1906,8 +2223,19 @@ pub async fn fields(
     headers: HeaderMap,
     Query(q): Query<FieldsQuery>,
 ) -> Response {
+    // BI-19 part B1 (plan D8): the router floor is "signed in"; somebody with
+    // neither `dashboard:read` nor a rule is refused here.
+    if let Err(err) = require_entitled(&state, &principal).await {
+        return crate::error::ApiRejection(err).into_response();
+    }
     if let Some(id) = q.source.as_deref() {
-        return match source_fields_body(&state.clickhouse, id).await {
+        // BI-19 B2 review S4: the columns of a source in a folder the caller
+        // cannot see are not theirs to read either.
+        let viewer = match viewer_for(&state, &principal).await {
+            Ok(viewer) => viewer,
+            Err(err) => return crate::error::ApiRejection(err).into_response(),
+        };
+        return match source_fields_body(&state.clickhouse, &viewer, id).await {
             Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
             Err(err) => crate::error::ApiRejection(err).into_response(),
         };
@@ -2085,10 +2413,11 @@ async fn tables_schema<'a>(
 /// `?source=` branch of [`fields`]: the SQL source's columns, split the same
 /// way a mart's are. New shape (no parity corpus); errors are classified,
 /// never `ClickHouse` text.
-async fn source_fields_body(ch: &ChClient, id: &str) -> Result<Value, ApiError> {
+async fn source_fields_body(ch: &ChClient, viewer: &Viewer, id: &str) -> Result<Value, ApiError> {
     let source = lakehouse_bi::sources::get_source(ch, id.trim())
         .await
         .map_err(|err| classify_dashboard_ch_error(&err))?
+        .filter(|s| crate::routes::dashboard_sources::source_visible(viewer, s))
         .ok_or_else(|| ApiError::NotFound(format!("SQL source '{}' not found.", id.trim())))?;
     let mut dimensions = Vec::new();
     let mut measures = Vec::new();
@@ -2236,8 +2565,14 @@ pub struct JoinSuggestionsQuery {
 /// does not have; the database's failure is classified, never forwarded.
 pub async fn join_suggestions(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Query(q): Query<JoinSuggestionsQuery>,
 ) -> Response {
+    // BI-19 B2 (plan D8): "signed in" at the router; a person with neither
+    // `dashboard:read` nor a rule is refused here, as the router refused them.
+    if let Err(err) = crate::routes::dashboard_access::require_entitled(&state, &principal).await {
+        return crate::error::ApiRejection(err).into_response();
+    }
     match join_suggestions_value(&state.clickhouse, q.left.as_deref(), q.right.as_deref()).await {
         Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
         Err(rejection) => crate::error::ApiRejection(rejection).into_response(),
@@ -2411,6 +2746,17 @@ pub async fn records(
     Extension(principal): Extension<Principal>,
     Query(q): Query<RecordsQuery>,
 ) -> ApiResult<ApiJson<Value>> {
+    // BI-19 part B1 (plan D8): the entry check and the caller's rules first.
+    let viewer = viewer_for(&state, &principal).await?;
+    // BI-19 B1 review R4: somebody who holds only a rule must name a tile the
+    // resolved viewer sees (`chart_own_filters` answers 404 for any other and
+    // refuses a mart the tile does not read). Without `chart` the route reads
+    // any mart or SQL source, which only `dashboard:read` may.
+    if !principal.has("dashboard:read")
+        && q.chart.as_deref().map(str::trim).is_none_or(str::is_empty)
+    {
+        return Err(ApiError::PermissionDenied("dashboard:read".to_owned()).into());
+    }
     let placeholders = crate::sql_rewrite::PlaceholderValues {
         principal_id: Some(principal.id.uuid().to_string()),
         principal_tenant_ids: principal
@@ -2426,7 +2772,7 @@ pub async fn records(
     records_for_roles(
         &state.clickhouse,
         q,
-        (&principal.role_names, &viewer_of(&principal)),
+        (&principal.role_names, &viewer),
         &placeholders,
         &obligations,
         &time,
@@ -2895,6 +3241,20 @@ async fn records_for_roles(
             ));
         }
     };
+    // BI-19 B2 re-review S4-b: a bare `sqlSource=` resolves a source by id, so
+    // it is the same 404 as an unknown source when the source sits in a folder
+    // the caller cannot see. With a chart the dashboard governs (the chart was
+    // found through the viewer above), so a tile on a visible dashboard keeps
+    // reading its source.
+    if q.chart.as_deref().is_none_or(|c| c.trim().is_empty())
+        && let Some(id) = q
+            .sql_source
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    {
+        crate::routes::dashboard_sources::visible_source(ch, viewer, id).await?;
+    }
     let relation = records_relation(ch, &q, &joins).await?;
     let relation = with_calculated_columns(ch, relation, (&q, &own), time).await?;
     let filters = with_chart_filters(&own, dashboard_filters, &relation.cols, time)?;
@@ -3088,30 +3448,30 @@ pub struct TableExportQuery {
 pub struct ChartExportQuery {
     /// The tile to download.
     #[serde(default)]
-    chart: Option<String>,
-    /// `xlsx` or `csv` (default `csv`).
+    pub(crate) chart: Option<String>,
+    /// `xlsx` or `csv` (default `csv`), or `png` (`BI-19` part D: the chart as an image).
     #[serde(default)]
-    format: Option<String>,
+    pub(crate) format: Option<String>,
     /// `formatted` (default) or `raw`.
     #[serde(default)]
-    values: Option<String>,
+    pub(crate) values: Option<String>,
     /// The dashboard's active filters (JSON list), as `GET /api/dashboard`.
     #[serde(default)]
-    filters: Option<String>,
+    pub(crate) filters: Option<String>,
     /// The sort the viewer chose on a raw table, in place of the saved one.
     #[serde(default, rename = "sortColumn")]
-    sort_column: Option<String>,
+    pub(crate) sort_column: Option<String>,
     #[serde(default, rename = "sortDir")]
-    sort_dir: Option<String>,
+    pub(crate) sort_dir: Option<String>,
     /// The parameter values the tile was drawn with (JSON object).
     #[serde(default)]
-    params: Option<String>,
+    pub(crate) params: Option<String>,
     /// The year list a built-in dashboard filters by (`1,2`), as `GET /api/dashboard`.
     #[serde(default)]
-    year: Option<String>,
+    pub(crate) year: Option<String>,
     /// The grain switch, as `GET /api/dashboard`.
     #[serde(default)]
-    grain: Option<String>,
+    pub(crate) grain: Option<String>,
 }
 
 impl ChartExportQuery {
@@ -3503,7 +3863,8 @@ fn export_failure(err: &crate::export::ExportError) -> ApiError {
 /// # Errors
 ///
 /// 400 for a missing `chart`, an unknown `format`/`values`, a tile with no
-/// data, bad filters or sort; 403 when every role of the person is switched
+/// data, bad filters or sort; with `format=png` see
+/// [`crate::routes::pdf_export::export_chart_png`]; 403 when every role of the person is switched
 /// off from downloading; 404 for an unknown tile; 422 when the role rewrite
 /// refuses or the engine rejects the statement; 503 when the engine or the
 /// audit store is unavailable.
@@ -3512,6 +3873,11 @@ pub async fn chart_export(
     Extension(principal): Extension<Principal>,
     Query(q): Query<ChartExportQuery>,
 ) -> ApiResult<Response> {
+    // BI-19 part D (plan D13): an image is made by the renderer, not by a row
+    // stream, so it has its own path (and its own audit action).
+    if q.format.as_deref() == Some("png") {
+        return crate::routes::pdf_export::export_chart_png(&state, &principal, &q).await;
+    }
     export_chart(&state, &principal, &q, "dashboard.chart_export", false).await
 }
 
@@ -3553,7 +3919,7 @@ async fn export_tile_statement(
         .map(str::trim)
         .filter(|c| !c.is_empty())
         .ok_or_else(|| ApiError::BadRequest("chart is required".to_owned()))?;
-    let viewer = viewer_of(principal);
+    let viewer = viewer_for(state, principal).await?;
     let chart = store::list_stored_charts(ch, &viewer)
         .await
         .map_err(|err| classify_dashboard_ch_error(&err))?
@@ -3810,6 +4176,29 @@ pub async fn values(
     Extension(principal): Extension<Principal>,
     Query(q): Query<ValuesQuery>,
 ) -> ApiResult<ApiJson<Value>> {
+    // BI-19 part B1 (plan D8): the entry check and the caller's rules first.
+    let viewer = viewer_for(&state, &principal).await?;
+    // BI-19 B1 review R4: without `board` this lists the values of any mart or
+    // SQL source, so somebody who holds only a rule must name a dashboard the
+    // resolved viewer sees (404 like an unknown one otherwise; the built-in
+    // board and `all` need a starting point, hence `dashboard:read`).
+    if !principal.has("dashboard:read") {
+        let board = q
+            .board
+            .as_deref()
+            .map(str::trim)
+            .filter(|b| !b.is_empty() && *b != "all" && *b != store::DEFAULT_BOARD_ID)
+            .ok_or_else(|| ApiError::PermissionDenied("dashboard:read".to_owned()))?;
+        let seen = store::get_board(&state.clickhouse, board, &viewer)
+            .await
+            .map_err(|err| classify_dashboard_ch_error(&err))?;
+        if seen.is_none() {
+            return Err(ApiError::NotFound(
+                crate::routes::dashboard_organise::BOARD_NOT_FOUND.to_owned(),
+            )
+            .into());
+        }
+    }
     let placeholders = crate::sql_rewrite::PlaceholderValues {
         principal_id: Some(principal.id.uuid().to_string()),
         principal_tenant_ids: principal
@@ -3823,7 +4212,7 @@ pub async fn values(
     values_for_roles(
         &state.clickhouse,
         q,
-        (&principal.role_names, &viewer_of(&principal)),
+        (&principal.role_names, &viewer),
         &placeholders,
         &obligations,
         &time,
@@ -4069,6 +4458,18 @@ pub(crate) async fn values_with_limit(
 
 // ── /api/dashboard/export ───────────────────────────────────────────────
 
+/// Query of `GET /api/dashboard/export`.
+#[derive(Debug, Default, Deserialize)]
+pub struct ExportQuery {
+    /// `yaml` (default: every dashboard) or `file` (one dashboard as a JSON
+    /// file, `BI-19` part D).
+    #[serde(default)]
+    format: Option<String>,
+    /// The dashboard, with `format=file`.
+    #[serde(default)]
+    board: Option<String>,
+}
+
 /// `GET /api/dashboard/export` — every board + stored chart, as a minimal
 /// hand-rolled `YAML` document. The only non-`JSON` response in this crate:
 /// returned directly as `text/yaml`, bypassing [`ApiJson`].
@@ -4079,10 +4480,30 @@ pub(crate) async fn values_with_limit(
 pub async fn export(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
+    Query(q): Query<ExportQuery>,
 ) -> ApiResult<Response> {
+    // BI-19 part D (plan D14): `format=file` is one dashboard as a JSON file.
+    match q.format.as_deref() {
+        // BI-19 Q-D1 (owner decision 2026-10-27): the YAML export is a
+        // download like the file, so it follows the per-role switch (BI-1).
+        None | Some("" | "yaml") => {
+            crate::routes::settings::require_download(&state, &principal).await?;
+        }
+        Some("file") => {
+            return crate::routes::dashboard_file::export_file(
+                &state,
+                &principal,
+                q.board.as_deref(),
+            )
+            .await;
+        }
+        Some(_) => {
+            return Err(ApiError::BadRequest("format must be yaml or file.".to_owned()).into());
+        }
+    }
     // The file is the caller's view of the dashboards: no deleted board or
     // chart, and no other user's personal space (BI-18 part C, part 2).
-    let viewer = viewer_of(&principal);
+    let viewer = viewer_for(&state, &principal).await?;
     let (charts, boards, default_row) = tokio::try_join!(
         store::list_stored_charts(&state.clickhouse, &viewer),
         store::list_boards(&state.clickhouse, &viewer),
@@ -4100,12 +4521,15 @@ pub async fn export(
     out.push_str("# RantAI Lakehouse — dashboard as code\n");
     out.push_str("# boards & chart specs, exported from console.bi_chart\n\n");
     out.push_str("boards:\n");
-    out.push_str(&yaml_board(
-        store::DEFAULT_BOARD_ID,
-        "Main",
-        default_row.as_ref().and_then(|b| b.layout.as_ref()),
-        default_row.as_ref().and_then(|b| b.params.as_deref()),
-    ));
+    // The built-in board is part of the starting point (BI-19 part B1).
+    if viewer.sees_builtin() {
+        out.push_str(&yaml_board(
+            store::DEFAULT_BOARD_ID,
+            "Main",
+            default_row.as_ref().and_then(|b| b.layout.as_ref()),
+            default_row.as_ref().and_then(|b| b.params.as_deref()),
+        ));
+    }
     for b in &boards {
         out.push_str(&yaml_board(
             &b.id,
@@ -4485,6 +4909,11 @@ pub async fn embed_info(
     Extension(principal): Extension<Principal>,
     Query(q): Query<EmbedInfoQuery>,
 ) -> Response {
+    if let Err(err) =
+        crate::routes::dashboard_access::require_can_ever(&state, &principal, Level::Manage).await
+    {
+        return crate::error::ApiRejection(err).into_response();
+    }
     let id = q.board.unwrap_or_default();
     if id.is_empty() || id == "default" {
         return (
@@ -4493,7 +4922,26 @@ pub async fn embed_info(
         )
             .into_response();
     }
-    match embed_info_body(&state, &id, q.chart.as_deref(), &viewer_of(&principal)).await {
+    // BI-19 B2 (plan D8): this is the Share dialog's embed state and mints a
+    // sample token, so it is for somebody who manages the dashboard (404 for one
+    // they cannot see, 403 for one they only view or edit).
+    let viewer = match crate::routes::dashboard_access::scope_for_write(&state, &principal).await {
+        Ok(scope) => {
+            if let Err(err) = crate::routes::dashboard_access::require_board_level(
+                &state,
+                &scope,
+                &id,
+                Level::Manage,
+            )
+            .await
+            {
+                return crate::error::ApiRejection(err).into_response();
+            }
+            scope.viewer
+        }
+        Err(err) => return crate::error::ApiRejection(err).into_response(),
+    };
+    match embed_info_body(&state, &id, q.chart.as_deref(), &viewer).await {
         Ok(Some(body)) => (StatusCode::OK, ApiJson(body)).into_response(),
         Ok(None) => (
             StatusCode::NOT_FOUND,
@@ -5734,7 +6182,15 @@ mod typed_filters {
             ],
         )
         .await;
-        answer(server, "FROM console.bi_board FINAL", &["id"], vec![]).await;
+        // The board exists: a dashboard the store does not list is a 404 now
+        // (BI-19 part B1), as it is for a dashboard the caller may not see.
+        answer(
+            server,
+            "FROM console.bi_board FINAL",
+            &["id", "name"],
+            vec![json!({ "id": "b1", "name": "Board one" })],
+        )
+        .await;
         answer(
             server,
             "FROM console.bi_source FINAL",
@@ -5845,7 +6301,16 @@ mod typed_filters {
             charts,
         )
         .await;
-        answer(&server, "FROM console.bi_board FINAL", &["id"], vec![]).await;
+        // BI-19 x BI-4 (PR #250 CI): the board must exist; a dashboard the
+        // store does not list is a 404 (BI-19 part B1), so an empty answer
+        // here made the whole payload NotFound, not the tiles.
+        answer(
+            &server,
+            "FROM console.bi_board FINAL",
+            &["id", "name"],
+            vec![json!({ "id": "b1", "name": "Board one" })],
+        )
+        .await;
         answer(&server, "FROM console.bi_source FINAL", &["id"], vec![]).await;
         let mut cols = mart_column_rows("mart_a", &[("visitors", "UInt32"), ("kab", "String")]);
         cols.extend(mart_column_rows(

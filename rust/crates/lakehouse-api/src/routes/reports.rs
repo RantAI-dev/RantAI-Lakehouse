@@ -53,7 +53,6 @@ use super::report_runner::{
 use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::routes::dashboard::check_filters_text;
-use crate::routes::dashboard_organise::viewer_of;
 use crate::state::AppState;
 use crate::upstream_error;
 
@@ -63,6 +62,9 @@ const NOT_YOURS: &str = "Only the person who set this report up, or an administr
 const NOT_THE_OWNER: &str = "An administrator who did not set this report up can pause, resume or delete it and remove recipients; only its owner can change anything else or send it now.";
 const NO_SUCH_SUBSCRIPTION: &str = "this subscription does not exist";
 const NO_SUCH_DASHBOARD: &str = "this dashboard does not exist";
+/// The refusal for an outside address on a restricted dashboard's report
+/// (owner decision Q-R12).
+const RESTRICTED_OUTSIDE: &str = "This dashboard is restricted to the people listed, so its report can go only to people who use the console and can see it, not to outside addresses.";
 const NO_RECIPIENTS: &str = "Choose at least one recipient.";
 const TOO_MANY_RECIPIENTS: &str = "A report goes to at most 50 recipients.";
 const NOT_AN_ACTIVE_USER: &str = "Every console recipient must be an active user.";
@@ -234,7 +236,9 @@ pub(crate) async fn validate_input(
 
     // The board is one the owner can see (a trashed board and another person's
     // personal board read as missing); the built-in board has no row.
-    let found = store::get_board(&state.clickhouse, board, &viewer_of(owner))
+    // BI-19 B1 review R12: the owner's resolved viewer, not the baseline.
+    let viewer = crate::routes::dashboard_access::viewer_for(state, owner).await?;
+    let found = store::get_board(&state.clickhouse, board, &viewer)
         .await
         .map_err(|err| crate::routes::dashboard::classify_dashboard_ch_error(&err))?;
     if found.is_none() && board != store::DEFAULT_BOARD_ID {
@@ -264,6 +268,20 @@ pub(crate) async fn validate_input(
         return Err(ApiError::BadRequest(NO_PDF_SERVICE.to_owned()));
     }
     check_charts(state, owner, board, &input.attachments).await?;
+    // BI-19 B1 owner decision Q-R12: outside addresses are refused for a
+    // restricted dashboard (itself or through a folder above it); console users
+    // are judged by their own reach when the report is sent.
+    if input.recipients.iter().any(|r| r.email.is_some())
+        && crate::routes::dashboard_access::board_is_restricted(
+            state.pg.as_deref(),
+            &state.clickhouse,
+            board,
+        )
+        .await
+        .unwrap_or(true)
+    {
+        return Err(ApiError::BadRequest(RESTRICTED_OUTSIDE.to_owned()));
+    }
 
     // The dashboard values are checked as the dashboard route checks them, so a
     // malformed filter is refused here and not a blank report later.
@@ -310,7 +328,9 @@ async fn check_charts(
     if spec.charts.is_empty() {
         return Ok(());
     }
-    let charts = store::list_stored_charts(&state.clickhouse, &viewer_of(owner))
+    // BI-19 B1 review R12: the owner's resolved viewer, not the baseline.
+    let viewer = crate::routes::dashboard_access::viewer_for(state, owner).await?;
+    let charts = store::list_stored_charts(&state.clickhouse, &viewer)
         .await
         .map_err(|err| crate::routes::dashboard::classify_dashboard_ch_error(&err))?;
     let on_board = |id: &str| {
@@ -544,7 +564,9 @@ pub async fn list(
         .filter(|b| !b.is_empty())
         .ok_or_else(|| ApiError::BadRequest("board is required".to_owned()))?;
     let pool = pool_of(&state)?;
-    let found = store::get_board(&state.clickhouse, board, &viewer_of(&principal))
+    // BI-19 B1 review R12: the resolved viewer, not the baseline.
+    let viewer = crate::routes::dashboard_access::viewer_for(&state, &principal).await?;
+    let found = store::get_board(&state.clickhouse, board, &viewer)
         .await
         .map_err(|err| crate::routes::dashboard::classify_dashboard_ch_error(&err))?;
     if found.is_none() && board != store::DEFAULT_BOARD_ID {
@@ -816,6 +838,12 @@ pub async fn deliveries(
 pub struct PickerQuery {
     #[serde(default)]
     q: Option<String>,
+    /// `1`: the permissions picker (`BI-19` part B): also list roles whose
+    /// name matches. Roles are shown only to somebody who manages a dashboard
+    /// (`dashboard:write` or a `manage` rule); the report picker stays as
+    /// narrow as it was.
+    #[serde(default)]
+    roles: Option<String>,
 }
 
 /// `GET /api/reports/recipients?q=` — active users' names and addresses for the
@@ -836,7 +864,20 @@ pub async fn recipients(
     Extension(principal): Extension<Principal>,
     Query(q): Query<PickerQuery>,
 ) -> ApiResult<ApiJson<Value>> {
-    crate::routes::settings::require_download(&state, &principal).await?;
+    // BI-19 B2 (plan D10): the People panel asks with `roles=1`. Somebody who
+    // manages a dashboard through a rule alone holds no `dashboard:read` and may
+    // not be allowed to download, yet must find people to add, so that mode
+    // asks for "manages something" (the item is checked on save) and nothing
+    // else. The report picker keeps what the router asked of it before:
+    // `dashboard:read`, then the download right.
+    let permissions_picker = q.roles.as_deref() == Some("1")
+        && crate::routes::dashboard_access::manages_something(&state, &principal).await?;
+    if !permissions_picker {
+        if !principal.has("dashboard:read") {
+            return Err(ApiError::PermissionDenied("dashboard:read".to_owned()).into());
+        }
+        crate::routes::settings::require_download(&state, &principal).await?;
+    }
     let found = subscriptions::search_active_users(
         pool_of(&state)?,
         q.q.as_deref().unwrap_or("").trim(),
@@ -845,10 +886,22 @@ pub async fn recipients(
     )
     .await
     .map_err(|e| store_failed(&e))?;
+    let roles = if permissions_picker {
+        lakehouse_store::dashboard_access::search_roles(
+            pool_of(&state)?,
+            q.q.as_deref().unwrap_or("").trim(),
+            PICKER_LIMIT,
+        )
+        .await
+        .map_err(|e| store_failed(&e))?
+    } else {
+        Vec::new()
+    };
     Ok(ApiJson(json!({
         "items": found.iter().map(|(id, name, email)| json!({
             "id": id, "name": name, "email": email,
         })).collect::<Vec<_>>(),
+        "roles": roles.iter().map(|(id, name)| json!({ "id": id, "name": name })).collect::<Vec<_>>(),
     })))
 }
 

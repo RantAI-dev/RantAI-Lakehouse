@@ -21,7 +21,6 @@ use super::arg_str;
 use crate::export::{FileFormat, Values};
 use crate::pdf::{Orientation, Paper};
 use crate::routes::dashboard::{file_slug, pdf_supported};
-use crate::routes::dashboard_organise::viewer_of;
 use crate::state::AppState;
 
 /// What the model is told when the call came without a signed-in person.
@@ -220,7 +219,12 @@ async fn export_dashboard(
     if board_id.is_empty() {
         return json!({ "error": "board is required (list_boards gives the ids)." });
     }
-    let board = match store::get_board(&state.clickhouse, board_id, &viewer_of(principal)).await {
+    // BI-19 B1 review R1: the resolved viewer, not the baseline.
+    let viewer = match super::viewer_for(state, Some(principal)).await {
+        Ok(viewer) => viewer,
+        Err(error) => return error,
+    };
+    let board = match store::get_board(&state.clickhouse, board_id, &viewer).await {
         Ok(board) => board,
         Err(err) => {
             return json!({
@@ -238,7 +242,7 @@ async fn export_dashboard(
     if args.contains_key("params") || args.contains_key("filters") {
         let params = parameter_names(state).await;
         let on_board: Vec<store::StoredChartSpec> =
-            match store::list_stored_charts(&state.clickhouse, &viewer_of(principal)).await {
+            match store::list_stored_charts(&state.clickhouse, &viewer).await {
                 Ok(all) => all
                     .into_iter()
                     .filter(|c| {
@@ -288,7 +292,12 @@ async fn export_chart(state: &AppState, principal: &Principal, args: &Map<String
     if chart_id.is_empty() {
         return json!({ "error": "chart is required (list_charts gives the ids)." });
     }
-    let charts = match store::list_stored_charts(&state.clickhouse, &viewer_of(principal)).await {
+    // BI-19 B1 review R1: the resolved viewer, not the baseline.
+    let viewer = match super::viewer_for(state, Some(principal)).await {
+        Ok(viewer) => viewer,
+        Err(error) => return error,
+    };
+    let charts = match store::list_stored_charts(&state.clickhouse, &viewer).await {
         Ok(charts) => charts,
         Err(err) => {
             return json!({

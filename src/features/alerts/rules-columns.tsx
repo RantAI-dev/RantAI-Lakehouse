@@ -21,6 +21,7 @@ import {
 } from "@/components/ui/dropdown-menu"
 import { Switch } from "@/components/ui/switch"
 import { cn } from "@/lib/utils"
+import { displayColumn } from "@/lib/chart-joins"
 import { LOAD_ALERT_KINDS, QUALITY_ALERT_KIND, type AlertRule } from "@/services/contracts/alerts"
 
 /**
@@ -50,6 +51,40 @@ export const RULE_KIND_LABEL: Record<string, string> = {
 
 export function ruleKindLabel(type: string): string {
   return RULE_KIND_LABEL[type] ?? type
+}
+
+/**
+ * Whether a rule is a chart alert (`BI-19` part C): the "Alert me..." dialog
+ * saves `type: "alert"` with a `chart` id and a `condition`, and no mart.
+ * BI-19 owner QA 2026-10-28, QA-9: the list used to read it as a column rule.
+ */
+export function isChartAlert(rule: Pick<AlertRule, "type" | "chart">): boolean {
+  return rule.type === "alert" && !!rule.chart
+}
+
+/** The type badge text of a rule: "Chart alert" for a chart alert, the kind's label otherwise. */
+export function ruleTypeLabel(rule: Pick<AlertRule, "type" | "chart">): string {
+  return isChartAlert(rule) ? "Chart alert" : ruleKindLabel(rule.type)
+}
+
+/**
+ * The condition of a chart alert in words. The rule row carries the chart's id
+ * but not its title, and the page loads no dashboards' charts, so the text
+ * starts with "Dashboard chart" instead of a made-up title (QA-9).
+ */
+export function chartAlertCondition(
+  rule: Pick<AlertRule, "series" | "condition" | "threshold">
+): string {
+  const series = rule.series ? displayColumn(rule.series) : "the chart"
+  const what =
+    rule.condition === "above"
+      ? `${series} goes above ${rule.threshold}`
+      : rule.condition === "below"
+        ? `${series} goes below ${rule.threshold}`
+        : rule.condition === "any_rows"
+          ? "returns any rows"
+          : String(rule.condition ?? "")
+  return `Dashboard chart · ${what}`.trim()
 }
 
 /** Whether `type` is one of the `SRC-7` kinds for connector and upload loads. */
@@ -138,7 +173,7 @@ export function getRuleColumns(options: RuleColumnsOptions): ColumnDef<Rule>[] {
                 : "bg-sky-500/10 text-sky-600 dark:text-sky-400"
             )}
           >
-            {ruleKindLabel(row.original.type)}
+            {ruleTypeLabel(row.original)}
           </span>
         )
       },
@@ -148,6 +183,11 @@ export function getRuleColumns(options: RuleColumnsOptions): ColumnDef<Rule>[] {
       header: "Condition / Board",
       cell: ({ row }) => {
         const r = row.original
+        if (isChartAlert(r)) {
+          return (
+            <span className="text-sm text-muted-foreground">{chartAlertCondition(r)}</span>
+          )
+        }
         if (r.type === "alert" && r.metric) {
           return (
             <span className="font-mono text-xs text-muted-foreground">

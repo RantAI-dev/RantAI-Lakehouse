@@ -176,6 +176,17 @@ fn visible_and_private_charts() -> (Vec<Value>, Vec<Value>) {
 // ── GET /api/dashboard ──────────────────────────────────────────────────
 
 async fn payload(server: &MockServer, viewer: &Viewer, board: &str) -> Value {
+    payload_result(server, viewer, board)
+        .await
+        .expect("the payload builds")
+}
+
+/// The same read, with the refusal left to the caller.
+async fn payload_result(
+    server: &MockServer,
+    viewer: &Viewer,
+    board: &str,
+) -> Result<Value, super::BodyError> {
     let ch = client(server);
     let obligations = PolicyEngineObligations::new(None, &ch);
     let q = DashboardQuery {
@@ -201,7 +212,6 @@ async fn payload(server: &MockServer, viewer: &Viewer, board: &str) -> Value {
         ),
     )
     .await
-    .expect("the payload builds")
 }
 
 /// A dashboard read for `board = "all"` names every chart the caller may see:
@@ -274,8 +284,15 @@ async fn a_private_board_asked_for_by_id_reads_like_one_that_does_not_exist() {
         ),
     ])
     .await;
-    let body = payload(&server, &Viewer::user(id_of(ME), false), "b_draft").await;
-    assert_eq!(body["results"].as_object().unwrap().len(), 0, "{body}");
+    // BI-19 part B1 (plan D8): the board is not in what the viewer may list, so
+    // the read is a 404, the same one an id that never existed gets.
+    let seen = payload_result(&server, &Viewer::user(id_of(ME), false), "b_draft").await;
+    assert!(matches!(seen, Err(super::BodyError::NotFound)), "{seen:?}");
+    let unknown = payload_result(&server, &Viewer::user(id_of(ME), false), "never_existed").await;
+    assert!(
+        matches!(unknown, Err(super::BodyError::NotFound)),
+        "{unknown:?}"
+    );
 }
 
 // ── Lists ───────────────────────────────────────────────────────────────
@@ -455,6 +472,7 @@ async fn the_yaml_export_holds_only_what_the_caller_may_see() {
     let response = export(
         State(state_for(&server)),
         Extension(person(ME, "dashboard:read")),
+        Query(crate::routes::dashboard::ExportQuery::default()),
     )
     .await
     .done("the export builds");
@@ -534,10 +552,17 @@ async fn another_users_private_board_cannot_be_edited_or_deleted() {
 
 #[tokio::test]
 async fn deleting_a_board_copies_its_charts_and_then_the_board_to_the_trash() {
-    let server = engine(vec![(
-        &["SELECT is_deleted, owner_id FROM console.bi_board"],
-        vec![state_row(0, "")],
-    )])
+    let server = engine(vec![
+        // BI-19 B2: the delete reads the dashboard's row to judge `manage` on it.
+        (
+            &["FROM console.bi_board FINAL WHERE is_deleted = 0 AND id='b_old'"],
+            vec![board_row("b_old", "")],
+        ),
+        (
+            &["SELECT is_deleted, owner_id FROM console.bi_board"],
+            vec![state_row(0, "")],
+        ),
+    ])
     .await;
     boards_delete(
         State(state_for(&server)),
@@ -1619,7 +1644,7 @@ async fn a_parameter_shown_on_a_private_dashboard_blocks_its_delete_without_nami
     .await;
     let outcome = super::super::params::delete(
         State(state_for(&server)),
-        Some(Extension(person(ME, "dashboard:write"))),
+        Some(Extension(person(ME, "dashboard:read, dashboard:write"))),
         Query(serde_json::from_value(json!({ "id": "p_1" })).unwrap()),
     )
     .await;
@@ -1677,7 +1702,8 @@ async fn embed_info_for_a_private_board_is_not_found() {
     .await;
     let response = super::embed_info(
         State(state_for(&server)),
-        Extension(person(ME, "dashboard:read")),
+        // BI-19 B2: the Share dialog's embed state is for somebody who manages.
+        Extension(person(ME, "dashboard:read, dashboard:write")),
         Query(serde_json::from_value(json!({ "board": "b_draft" })).unwrap()),
     )
     .await;
@@ -1706,7 +1732,7 @@ async fn a_sql_source_used_by_a_private_chart_cannot_be_deleted_and_the_chart_is
     .await;
     let outcome = super::super::dashboard_sources::delete(
         State(state_for(&server)),
-        Extension(person(ME, "dashboard:write")),
+        Extension(person(ME, "dashboard:read, dashboard:write")),
         Query(serde_json::from_value(json!({ "id": "s_1" })).unwrap()),
     )
     .await;
@@ -2462,6 +2488,143 @@ async fn the_payload_names_the_owner_of_a_private_dashboard_and_only_that() {
     let find = |id: &str| boards.iter().find(|b| b["id"] == id).unwrap();
     assert_eq!(find("b_draft")["ownerId"], json!(id_of(ME)));
     assert!(find("b_shared").get("ownerId").is_none());
+}
+
+// ── BI-19 part B1: permissions on top of the personal space ─────────────
+//
+// The viewers below are built the way the route builds them (`AccessMap`), so
+// these tests are about what the statements ask for and what the payload then
+// shows. The route itself (rules read from Postgres) is in
+// `tests/dashboard_access_routes.rs`.
+
+fn access_viewer(
+    baseline: Option<lakehouse_bi::access::Level>,
+    folders: &[lakehouse_bi::folders::Folder],
+    grants: &[lakehouse_bi::access::Grant],
+    marks: &[(lakehouse_bi::access::ItemKind, String)],
+    boards: &[(&str, &str)],
+) -> Viewer {
+    let placements: Vec<lakehouse_bi::access::BoardPlacement> = boards
+        .iter()
+        .map(|(id, folder)| lakehouse_bi::access::BoardPlacement {
+            id: (*id).to_owned(),
+            folder_id: (*folder).to_owned(),
+            owner_id: String::new(),
+        })
+        .collect();
+    lakehouse_bi::access::AccessMap::new(id_of(ME), false, baseline, folders, grants, marks)
+        .viewer(&placements)
+        .expect("under the cap")
+}
+
+fn folder_named(id: &str) -> lakehouse_bi::folders::Folder {
+    lakehouse_bi::folders::Folder {
+        id: id.to_owned(),
+        name: id.to_owned(),
+        parent_id: String::new(),
+        created_by: String::new(),
+        updated_at: None,
+        owner_id: String::new(),
+    }
+}
+
+#[tokio::test]
+async fn somebody_given_one_dashboard_reads_that_dashboard_and_gets_a_404_for_the_rest() {
+    use lakehouse_bi::access::{Grant, ItemKind, Level};
+    let viewer = access_viewer(
+        None,
+        &[],
+        &[Grant {
+            kind: ItemKind::Board,
+            item_id: "b1".to_owned(),
+            level: Level::View,
+        }],
+        &[],
+        &[("b1", ""), ("b2", "")],
+    );
+    let mine = owner_clause(ME);
+    // A statement that kept the id list gets only the dashboard; one that did
+    // not would get both, which is how a missing clause shows up here.
+    let server = engine(vec![
+        (
+            &["FROM console.bi_chart FINAL", "board IN ('b1')"],
+            vec![chart_row("c1", "b1", "mart_a", None)],
+        ),
+        (
+            &["FROM console.bi_chart FINAL"],
+            vec![
+                chart_row("c1", "b1", "mart_a", None),
+                chart_row("c2", "b2", "mart_a", None),
+            ],
+        ),
+        (
+            &["FROM console.bi_board FINAL", mine.as_str(), "id IN ('b1')"],
+            vec![board_row("b1", "")],
+        ),
+        (
+            &["FROM console.bi_board FINAL"],
+            vec![board_row("b1", ""), board_row("b2", "")],
+        ),
+    ])
+    .await;
+    let ok = payload(&server, &viewer, "b1").await;
+    let results = ok["results"].as_object().unwrap();
+    assert!(
+        results.contains_key("c1") && !results.contains_key("c2"),
+        "{ok}"
+    );
+    for refused in ["b2", "never_existed", "default", "all"] {
+        let seen = payload_result(&server, &viewer, refused).await;
+        assert!(
+            matches!(seen, Err(super::BodyError::NotFound)),
+            "{refused}: {seen:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_restricted_folder_takes_its_dashboards_off_a_dashboard_viewers_list() {
+    use lakehouse_bi::access::{ItemKind, Level};
+    let viewer = access_viewer(
+        Some(Level::View),
+        &[folder_named("f1")],
+        &[],
+        &[(ItemKind::Folder, "f1".to_owned())],
+        &[("b_in", "f1"), ("b_out", "")],
+    );
+    let server = engine(vec![
+        (
+            &["FROM console.bi_board FINAL", "id NOT IN ('b_in')"],
+            vec![board_row("b_out", "")],
+        ),
+        (
+            &["FROM console.bi_board FINAL"],
+            vec![board_row("b_in", ""), board_row("b_out", "")],
+        ),
+        (
+            &["FROM console.bi_folder FINAL", "id NOT IN ('f1')"],
+            vec![],
+        ),
+        (
+            &["FROM console.bi_folder FINAL"],
+            vec![json!({ "id": "f1", "name": "f1", "parent_id": "" })],
+        ),
+    ])
+    .await;
+    let ch = client(&server);
+    let boards = lakehouse_bi::store::list_boards(&ch, &viewer)
+        .await
+        .unwrap();
+    let ids: Vec<&str> = boards.iter().map(|b| b.id.as_str()).collect();
+    assert_eq!(ids, ["b_out"]);
+    let folders = lakehouse_bi::folders::list_folders(&ch, &viewer)
+        .await
+        .unwrap();
+    assert!(folders.is_empty(), "{folders:?}");
+    let seen = payload_result(&server, &viewer, "b_in").await;
+    assert!(matches!(seen, Err(super::BodyError::NotFound)), "{seen:?}");
+    // The built-in board is part of the starting point, so this viewer keeps it.
+    assert!(viewer.sees_builtin());
 }
 
 // ── The real engine (scratch database) ─────────────────────────────────

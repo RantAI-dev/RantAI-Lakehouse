@@ -9,6 +9,7 @@ mod agents;
 pub(crate) mod ai;
 mod alerts;
 pub mod auth;
+mod chart_alerts;
 // `pub(crate)`, not private: `crate::pipeline_lag` (BLD-2) reads
 // `authored_pipelines::job_name` to name the job a lag run launches, and
 // re-deriving the `authored__<id>` mapping in a second place is exactly
@@ -28,6 +29,11 @@ mod connector_oauth;
 mod connector_runs;
 mod connectors;
 mod dashboard;
+pub(crate) mod dashboard_access;
+// `pub` only so the route test can build its expected 403 body from `SERVICE_REFUSED`
+// instead of a second copy of the sentence (BI-19 E, PR #250 CI).
+pub mod dashboard_comments;
+mod dashboard_file;
 mod dashboard_folders;
 pub(crate) mod dashboard_organise;
 mod dashboard_sources;
@@ -188,7 +194,11 @@ fn route_timeout(path: &str) -> Duration {
     match path {
         "/api/ai/chat" => *AI_CHAT_TIMEOUT,
         "/api/uploads" | "/api/maps" => UPLOAD_REQUEST_TIMEOUT,
-        "/api/dashboard/chart-export" | "/api/dashboard/table-export" => EXPORT_REQUEST_TIMEOUT,
+        // BI-19 part D: an import checks and runs each of up to 200 charts, so it
+        // gets the export deadline too.
+        "/api/dashboard/chart-export" | "/api/dashboard/table-export" | "/api/dashboard/import" => {
+            EXPORT_REQUEST_TIMEOUT
+        }
         "/api/dashboard/export/pdf" => PDF_REQUEST_TIMEOUT,
         // RPT-1: "Send now" makes the PDF and the chart files in the request,
         // so it gets the longest export deadline.
@@ -1270,7 +1280,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/api/dashboard/calc-fields",
-            get(calc_fields::list)
+            get(calc_fields::list_guarded)
                 .post(calc_fields::create)
                 .put(calc_fields::update)
                 .delete(calc_fields::delete),
@@ -1285,7 +1295,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/api/dashboard/metrics",
-            get(metrics::list)
+            get(metrics::list_guarded)
                 .post(metrics::create)
                 .put(metrics::update)
                 .delete(metrics::delete),
@@ -1297,21 +1307,21 @@ pub fn router(state: AppState) -> Router {
         .route("/api/dashboard/metrics/{id}/usage", get(metrics::usage))
         .route(
             "/api/dashboard/segments",
-            get(metrics::list_segments)
+            get(metrics::list_segments_guarded)
                 .post(metrics::create_segment)
                 .put(metrics::update_segment)
                 .delete(metrics::delete_segment),
         )
         .route(
             "/api/dashboard/hierarchies",
-            get(hierarchies::list)
+            get(hierarchies::list_guarded)
                 .post(hierarchies::create)
                 .put(hierarchies::update)
                 .delete(hierarchies::delete),
         )
         .route(
             "/api/dashboard/params",
-            get(params::list)
+            get(params::list_guarded)
                 .post(params::create)
                 .put(params::update)
                 .delete(params::delete),
@@ -1324,6 +1334,15 @@ pub fn router(state: AppState) -> Router {
         .route("/api/dashboard/records", get(dashboard::records))
         .route("/api/dashboard/values", get(dashboard::values))
         .route("/api/dashboard/export", get(dashboard::export))
+        // BI-19 part D (plan D14): a dashboard file in, with a mapping preview.
+        .route(
+            "/api/dashboard/import/preview",
+            axum::routing::post(dashboard_file::import_preview),
+        )
+        .route(
+            "/api/dashboard/import",
+            axum::routing::post(dashboard_file::import),
+        )
         .route("/api/dashboard/table-export", get(dashboard::table_export))
         .route("/api/dashboard/chart-export", get(dashboard::chart_export))
         // BI-14 (D1): where a chart comes from. `lineage:read` (owner decision Q6).
@@ -1381,6 +1400,33 @@ pub fn router(state: AppState) -> Router {
             axum::routing::post(public_links::unlock),
         )
         // BI-19 part A (D5): make, change and end a dashboard's public link.
+        // BI-19 part B1 (plan D10): who has what on a dashboard or folder.
+        .route(
+            "/api/dashboard/access",
+            get(dashboard_access::get_access).put(dashboard_access::put_access),
+        )
+        .route(
+            "/api/dashboard/access-preview",
+            get(dashboard_access::access_preview),
+        )
+        // BI-19 part E (D15): comments. The router asks "signed in"; `view` on the
+        // dashboard (and author or `manage` for delete) is checked in the handler.
+        .route(
+            "/api/dashboard/comments",
+            get(dashboard_comments::list).post(dashboard_comments::post),
+        )
+        .route(
+            "/api/dashboard/comments/people",
+            get(dashboard_comments::people),
+        )
+        .route(
+            "/api/dashboard/comments/mentions/read",
+            axum::routing::post(dashboard_comments::mark_read),
+        )
+        .route(
+            "/api/dashboard/comments/{id}",
+            axum::routing::put(dashboard_comments::edit).delete(dashboard_comments::remove),
+        )
         .route(
             "/api/dashboard/public-link",
             get(public_links::get_link)
@@ -1661,6 +1707,16 @@ mod tests {
         );
         assert_eq!(
             route_timeout("/api/reports/subscriptions/0b7e"),
+            DEFAULT_REQUEST_TIMEOUT
+        );
+        // BI-19 D review SF-D6: an import runs up to 200 charts; its preview is
+        // one schema read per table and keeps the default.
+        assert_eq!(
+            route_timeout("/api/dashboard/import"),
+            EXPORT_REQUEST_TIMEOUT
+        );
+        assert_eq!(
+            route_timeout("/api/dashboard/import/preview"),
             DEFAULT_REQUEST_TIMEOUT
         );
     }

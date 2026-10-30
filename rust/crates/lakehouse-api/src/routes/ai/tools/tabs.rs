@@ -28,7 +28,6 @@ use serde_json::{Map, Value, json};
 
 use super::{api_result_to_value, arg_str};
 use crate::routes::dashboard;
-use crate::routes::dashboard_organise::viewer_of;
 use crate::state::AppState;
 use crate::upstream_error;
 
@@ -86,7 +85,9 @@ async fn load_board(
             "error": "the built-in dashboard has no tabs; duplicate it first, or use another dashboard."
         }));
     }
-    match store::get_board(&state.clickhouse, &id, &viewer_of(principal)).await {
+    // BI-19 B1 review R1: the resolved viewer, not the baseline.
+    let viewer = super::viewer_for_write(state, Some(principal)).await?;
+    match store::get_board(&state.clickhouse, &id, &viewer).await {
         Ok(Some(board)) => Ok(board),
         Ok(None) => Err(json!({ "error": "dashboard not found." })),
         Err(err) => Err(upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json()),
@@ -193,17 +194,20 @@ async fn move_charts_to_tab(who: Who<'_>, board: Board, args: &Map<String, Value
         return json!({ "error": "chartIds is required: the ids from list_charts." });
     }
     // Only charts that are on this dashboard; a stray id is named, not guessed at.
-    let on_board: Vec<String> =
-        match store::list_stored_charts(&who.0.clickhouse, &viewer_of(who.1)).await {
-            Ok(all) => all
-                .into_iter()
-                .filter(|c| c.board == board.id)
-                .map(|c| c.spec.id)
-                .collect(),
-            Err(err) => {
-                return upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json();
-            }
-        };
+    let viewer = match super::viewer_for_write(who.0, Some(who.1)).await {
+        Ok(viewer) => viewer,
+        Err(error) => return error,
+    };
+    let on_board: Vec<String> = match store::list_stored_charts(&who.0.clickhouse, &viewer).await {
+        Ok(all) => all
+            .into_iter()
+            .filter(|c| c.board == board.id)
+            .map(|c| c.spec.id)
+            .collect(),
+        Err(err) => {
+            return upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json();
+        }
+    };
     if let Some(stray) = wanted.iter().find(|id| !on_board.contains(id)) {
         return json!({ "error": format!("chart {stray} is not on this dashboard.") });
     }

@@ -33,6 +33,7 @@
 // re-expand and pick up the new migration for every `#[sqlx::test]` in this
 // crate's `tests/` binaries.
 pub mod agents;
+pub mod alert_state;
 pub mod annotation;
 pub mod audit;
 pub mod cdc;
@@ -44,6 +45,8 @@ pub mod connector_probe_result;
 pub mod connector_run;
 pub mod connector_type;
 pub mod connectors;
+pub mod dashboard_access;
+pub mod dashboard_comments;
 pub mod error;
 pub mod geo_map;
 pub mod gold_publication;

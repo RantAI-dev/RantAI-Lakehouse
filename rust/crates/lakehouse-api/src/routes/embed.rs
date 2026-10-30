@@ -584,8 +584,8 @@ struct SettingsBody {
 }
 
 /// `PUT /api/dashboard/embed-settings` — set each filter's embed mode
-/// (`BI-26` plan D8). Needs `dashboard:write` until `BI-19` part B (feature
-/// decision 11: manage on the dashboard). The columns must be the dashboard's
+/// (`BI-26` plan D8). Needs `manage` on the dashboard (`BI-19` part B2, feature
+/// decision 11). The columns must be the dashboard's
 /// saved filters; the change is audited (`dashboard.embed_settings`) before it
 /// is made.
 ///
@@ -599,6 +599,13 @@ pub async fn put_settings(
     axum::Extension(principal): axum::Extension<lakehouse_auth::Principal>,
     body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
+    // BI-19 B2 (plan D8): refused first when the caller manages nothing.
+    crate::routes::dashboard_access::require_can_ever(
+        &state,
+        &principal,
+        lakehouse_bi::access::Level::Manage,
+    )
+    .await?;
     let parsed: SettingsBody = serde_json::from_slice(&body).map_err(|_| {
         ApiError::BadRequest(
             "body must be {\"board\": string, \"filterModes\": {column: \"locked\"|\"editable\"|\"hidden\"}}"
@@ -804,7 +811,7 @@ struct RevokeBody {
 }
 
 /// `POST /api/dashboard/embed-revoke` — withdraw ONE signed embed token of a
-/// dashboard (`SEC-12`). Needs `dashboard:write`.
+/// dashboard (`SEC-12`). Needs `manage` on the dashboard (`BI-19` part B2).
 ///
 /// The caller presents the whole token, never a bare `jti`: the server
 /// verifies the signature and reads the `jti` and `exp` itself, so nobody can
@@ -817,7 +824,18 @@ struct RevokeBody {
 /// same fixed message as everywhere), a token for another dashboard, a token
 /// with no `jti`, an unknown dashboard or a full withdrawal list; `503` when
 /// `EMBED_SECRET` is unset; the usual classified store errors otherwise.
-pub async fn revoke_token(State(state): State<AppState>, body: Bytes) -> ApiResult<ApiJson<Value>> {
+pub async fn revoke_token(
+    State(state): State<AppState>,
+    axum::Extension(principal): axum::Extension<lakehouse_auth::Principal>,
+    body: Bytes,
+) -> ApiResult<ApiJson<Value>> {
+    // BI-19 B2 (plan D8): refused first when the caller manages nothing.
+    crate::routes::dashboard_access::require_can_ever(
+        &state,
+        &principal,
+        lakehouse_bi::access::Level::Manage,
+    )
+    .await?;
     let parsed: RevokeBody = serde_json::from_slice(&body)
         .map_err(|_| ApiError::BadRequest("Body must be JSON {board, token}.".to_owned()))?;
     let board = parsed.board.as_deref().map(str::trim).unwrap_or_default();
@@ -825,6 +843,9 @@ pub async fn revoke_token(State(state): State<AppState>, body: Bytes) -> ApiResu
     if board.is_empty() || board == store::DEFAULT_BOARD_ID || token.is_empty() {
         return Err(ApiError::BadRequest("board and token are required.".to_owned()).into());
     }
+    // BI-19 B2 (plan D8): withdrawing an embed token changes who can read the
+    // dashboard, so it is `manage` on it (404 when the caller cannot see it).
+    crate::routes::public_links::managed_board(&state, &principal, Some(board)).await?;
     let Some(secret) = state.config.embed_secret.as_deref() else {
         return Err(ApiError::Unavailable(EMBEDDING_NOT_CONFIGURED.to_owned()).into());
     };
