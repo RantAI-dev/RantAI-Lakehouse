@@ -361,10 +361,12 @@ async fn gated_source_table(
 /// Returns 401/503 from [`check_export_token`], `409` if an export of the
 /// SAME mart is already in flight, 422 with the tenant gate's fixed
 /// sentence when the deployment holds several tenants and names no
-/// catalog tenant (`SEC-50`), 503 if the Lakekeeper token cannot be
-/// read, 422 for an unsupported source column, a source mart over
-/// `GOLD_EXPORT_MAX_ROWS`, or a bad `ClickHouse` query, or 500 for an
-/// Iceberg catalog/write failure.
+/// catalog tenant (`SEC-50`), 404 with the gate's own table sentence for
+/// a signed-in person whose tenant does not own the shared catalog
+/// (`SEC-50`; PR #281 review round 2 NIT), 503 if the Lakekeeper token
+/// cannot be read, 422 for an unsupported source column, a source mart
+/// over `GOLD_EXPORT_MAX_ROWS`, or a bad `ClickHouse` query, or 500 for
+/// an Iceberg catalog/write failure.
 pub async fn export(
     State(state): State<AppState>,
     Path(mart): Path<String>,
