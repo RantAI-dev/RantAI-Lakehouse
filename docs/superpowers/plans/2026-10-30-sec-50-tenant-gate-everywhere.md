@@ -379,6 +379,228 @@ which is the route's own path.
   PR and the shipped date at merge).
 - No pull request was opened or merged (the developer never does).
 
+### Handoff (review round 1)
+
+Developer: a non-Opus coding agent. Branch `fix/sec-50-tenant-gate`, on top of
+the review commit `6a0efbcd`. Every finding of review round 1 is answered below,
+in the order the review lists them. Everything was run in the foreground on
+bluefin through `/home/shiro/rantai/bin/cargo-locked`; no `cargo clean`, no
+background job, no `~/.cargo/config.toml` change.
+
+#### Commits
+
+| Commit | What |
+| --- | --- |
+| `177ebe17` | `fix(gate): an unrestricted principal passes the tenant gate (PR #281 review round 1 B1)` -- R1: `GateActor::AsTenant` checks `is_unrestricted` FIRST, so a `*:*` principal passes with a tenant and without one, whether or not it belongs to that tenant. With the R1 unit tests (S6) and an HTTP-level test. |
+| `b4978e27` | `ci(gold-export): name the catalog tenant in the Gold export job's .env (PR #281 review round 1 B2)` -- the `Rust · Gold export to Iceberg (ADR 0010)` job's `.env` names `CATALOG_TENANT_ID=11111111-1111-4111-8111-000000000001`, with a comment saying why, exactly as the two G8 jobs do. |
+| `e0d1c391` | `fix(pipelines): a gate refusal on the enforce route answers 422 (PR #281 review round 1 S1)` -- R2: the gate's own sentence, with this route's status; an upstream failure keeps its own. |
+| `1803ba76` | `test(pipelines): the enforce harness gives each test its own engine (PR #281 review round 1)` -- the one commit the review did not ask for; see "The one extra commit" below. |
+| `2144cc34` | `fix(pipelines): a pipeline with no tenant is refused with a 409 (PR #281 review round 1 S2)` -- R3: a NULL-tenant pipeline with an author who is not `*:*` is refused before the gate, with its own sentence. |
+| `8ef9a0ff` | `fix(gold): a signed-in person's Gold export is gated as that person (PR #281 review round 1 S3)` -- R4: a person is gated as `Caller`, a service identity or the run token as `CatalogTenant`, through one helper both the route and the copilot's tool use. |
+| `3f3d7964` | `fix(gate): a job with no user is refused when the deployment cannot count its tenants (PR #281 review round 1 S4)` -- R5: `CatalogTenant` with no pool refuses with D6's sentence, even with the setting named. |
+| `b6383c38` | `test(gold): the Gold export's own gate is tested (PR #281 review round 1 S5)` -- a test through `export_mart` itself: D6's sentence, and no request reaches the engine. |
+| `c3dfbe40` | `docs(sec-50): the boot warning and the operator docs say what is gated today (PR #281 review round 1 S7)` -- the boot warning, `.env.example`, `docs/OPERATIONS.md` and the feature page. Also NIT 2 (the "scheduled Gold export" wording). |
+| `25684c8f` | `refactor(gold): the gate's error is wrapped explicitly, not by a From (PR #281 review round 1 NIT)` -- NIT 1: `TenantGateRefused` loses `#[from]`, and the one gate call wraps the error itself. |
+
+#### Commands run, with their counts
+
+The full block, on the final commit (`25684c8f`), from `rust/`:
+
+```text
+cargo fmt --check
+  exit 0
+
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+  exit 0
+
+cargo test --workspace          # > /tmp/sec50-r1-test.log
+  exit 0 -- 159 binaries, 8588 passed, 0 failed, 51 ignored
+```
+
+From the repo root:
+
+```text
+POSTGRES_PASSWORD=d RUSTFS_ACCESS_KEY=d RUSTFS_SECRET_KEY=d \
+  LAKEKEEPER_ENCRYPTION_KEY=d CONNECTOR_SECRETS_KEY=d \
+    docker compose --profile '*' config --quiet
+  -> compose-ok
+
+git status
+  -> nothing to commit, working tree clean
+```
+
+Scoped, per commit (per `AGENTS.md`, "Keep build time down"):
+
+```text
+B1  cargo test -p lakehouse-api --lib sec50_gate_tests      -> 9 passed; 0 failed
+    cargo test -p lakehouse-api --test pipeline_enforce      -> 18 passed; 0 failed
+B2  (no Rust file changed -- no cargo command)
+S1  cargo test -p lakehouse-api --test pipeline_enforce      -> 18 passed; 0 failed
+    cargo test -p lakehouse-api --test column_lineage_pipeline-> 7 passed; 0 failed
+    cargo test -p lakehouse-api --test sec11_guard            -> 4 passed; 0 failed
+S2  cargo test -p lakehouse-api --test pipeline_enforce      -> 18 passed; 0 failed
+    (run four times in a row after the harness fix: 18 passed every time)
+S3  cargo test -p lakehouse-api --test gold_export_auth      -> 7 passed; 0 failed
+    cargo test -p lakehouse-api --test gold_publication      -> 14 passed; 0 failed
+    cargo test -p lakehouse-api --lib ai::tools::gold        -> 3 passed; 0 failed
+S4  cargo test -p lakehouse-api --lib sec50_gate_tests       -> 10 passed; 0 failed
+S5  cargo test -p lakehouse-api --lib gold_export            -> 33 passed; 0 failed
+S7  cargo test -p lakehouse-api --bin lakehouse-api boot_warning -> 3 passed; 0 failed
+NIT cargo test -p lakehouse-api --lib gold_export            -> 33 passed; 0 failed
+     cargo test -p lakehouse-api --test gold_export_auth     -> 7 passed; 0 failed
+route_auth (not touched, re-run at the end)                 -> 65 passed; 0 failed
+sec11_guard (re-run at the end)                             -> 4 passed; 0 failed
+```
+
+#### Mutation checks (section 5)
+
+Every new refusal was proved by removing the line that makes it and watching
+the named test FAIL. The mutations were reverted; `git status` was empty when
+the handoff started, and the final verification above ran on the restored tree.
+
+```text
+/tmp/sec50-r1-mut-b1.log   (B1 / R1: the `is_unrestricted` check in the AsTenant arm)
+  test routes::query::sec50_gate_tests::an_unrestricted_principal_reaches_everything_even_as_a_site_with_no_tenant ... FAILED
+  test result: FAILED. 8 passed; 1 failed; 0 ignored; 0 measured; 2822 filtered out; finished in 1.18s
+  test a_pipeline_authored_by_an_unrestricted_principal_is_not_refused_for_its_tenant ... FAILED
+  test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 17 filtered out; finished in 1.09s
+
+/tmp/sec50-r1-mut-s1.log   (S1 / R2: the 422 mapping on the enforce route)
+  test a_pipeline_cannot_read_an_upload_table_another_tenant_claimed ... FAILED
+    assertion `left == right` failed: {"error":"Table not found or not available to your organisation: bronze.group_orders"}
+      left: 404
+     right: 422
+  test a_pipeline_with_no_tenant_is_refused ... FAILED
+  test an_author_who_left_the_pipelines_tenant_is_refused ... FAILED
+  test result: FAILED. 15 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.64s
+
+/tmp/sec50-r1-mut-s2.log   (S2 / R3: the 409 for a NULL-tenant pipeline)
+  test a_pipeline_with_no_tenant_is_refused ... FAILED
+    assertion `left == right` failed: {"error":"Table not found or not available to your organisation: bronze.group_orders"}
+      left: 422
+     right: 409
+  test result: FAILED. 17 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.52s
+
+/tmp/sec50-r1-mut-s3.log   (S3 / R4: the actor a person is gated as)
+  test a_person_of_another_tenant_holding_gold_export_is_refused ... FAILED
+    assertion `left == right` failed: {"error":"Lakekeeper gold-export token is unavailable (check LAKEKEEPER_GOLD_EXPORT_TOKEN_FILE; see ADR 0011)"}
+      left: 503
+     right: 404
+  test result: FAILED. 6 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.49s
+
+/tmp/sec50-r1-mut-s4.log   (S4 / R5: the refusal when the tenant count cannot be read)
+  test routes::query::sec50_gate_tests::a_job_with_no_user_is_refused_in_a_deployment_that_cannot_count_its_tenants ... FAILED
+  test routes::query::sec50_gate_tests::a_job_with_no_user_in_a_deployment_that_cannot_say_who_owns_the_catalog_is_refused ... FAILED
+  test result: FAILED. 8 passed; 2 failed; 0 ignored; 0 measured; 2822 filtered out; finished in 0.97s
+
+/tmp/sec50-r1-mut-s5.log   (S5: the gate inside `export_mart`)
+  test gold_export::tests::a_job_with_no_catalog_tenant_is_refused_before_the_engine_is_asked ... FAILED
+    a deployment that names no catalog tenant must refuse the export
+  test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2832 filtered out; finished in 0.75s
+```
+
+#### What each finding became, and where
+
+- **B1 (R1).** `routes/query.rs`'s `GateActor::AsTenant` arm checks
+  `is_unrestricted` before it looks at the tenant at all, so `None` and
+  `Some(t)` both give `All`. The rule is `SEC-20`'s own signed rule, and it is
+  safe for the same reason it is safe in Query Studio. The doc at
+  `routes/authored_pipelines.rs`'s "Which tenant the statement acts as" says so.
+  Tests: two unit tests in `routes::query::sec50_gate_tests` (S6) and one
+  HTTP-level test in `tests/pipeline_enforce.rs`.
+- **B2.** `.github/workflows/ci.yml`, the `gold-export` job's "Write CI-only .env"
+  step. The harness (`ops/g7`, `ops/gold_export`) is unchanged.
+- **S1 (R2).** `routes/authored_pipelines.rs`'s `gate_refusal_as_unprocessable`
+  maps the gate's own 404 to a 422 and leaves every other status alone, so an
+  unreadable database stays a retryable 503. The sentence is the gate's.
+- **S2 (R3).** `routes/authored_pipelines.rs`'s `NO_TENANT_REASON`, checked
+  after the author is loaded and before the gate. A `*:*` author is exempt.
+- **S3 (R4).** `routes/gold.rs`'s `gold_export_gate_actor` is the one place that
+  decides, and `export_mart` now takes the actor. The copilot's tool
+  (`routes/ai/tools/gold.rs`) uses the same helper, with no `X-Tenant` header --
+  a tool call carries the model's arguments, not the chat's request headers, so
+  the person's first tenant acts, as `tenant_scope::resolve` does when no header
+  is sent.
+- **S4 (R5).** `routes/query.rs`'s `catalog_tenant_reach` refuses when the count
+  is `None`, with or without the setting.
+- **S5.** A unit test in `src/gold_export.rs` calls `export_mart` itself.
+- **S6.** The two `AsTenant` unit tests above.
+- **S7.** `main.rs`'s boot warning (and its test), `.env.example`,
+  `docs/OPERATIONS.md` and the feature page.
+- **NIT 1.** `GoldExportError::TenantGateRefused` has no `#[from]`; the gate call
+  wraps the error explicitly.
+- **NIT 2.** `docs/OPERATIONS.md` and the feature page now say that the 422
+  hits the scheduled export, a manual trigger done as a service and the
+  assistant's own tool -- not only the schedule.
+
+#### Two changes the review did not ask for, and why
+
+1. **`export_mart` became `pub(crate)`** (`8ef9a0ff`). R4 makes the export's
+   actor part of the function's signature, and the actor type is `routes::query`'s
+   `pub(crate)` `GateActor` (the plan's T1). A `pub` function cannot take a
+   `pub(crate)` type, and `export_mart` is called from inside this crate only --
+   the route and the copilot's tool. Nothing outside the crate used it.
+2. **The enforce harness gives each test its own engine** (`1803ba76`).
+   `wiremock`'s `MockServer::start()` hands out a server from a global pool, and
+   the server goes back into that pool as soon as the last handle to it is
+   dropped. `tests/pipeline_enforce.rs`'s `app()` dropped the engine it built
+   while the app's `CH_URL` still pointed at it, so the next test to ask for a
+   server was given that same address -- and that test's requests landed in the
+   first test's request log. The visible symptom was a flake in
+   `a_pipeline_cannot_read_an_upload_table_another_tenant_claimed`, whose
+   "nothing reached the engine" assertion saw another test's `system.columns`
+   queries. It was latent at the review commit (five consecutive runs green) and
+   became visible as soon as S2 moved the timing. The stand-in is now a BARE
+   server (`MockServer::builder().start()`), which is never pooled, and `app()`
+   hands the engine back so it stays alive for the whole test -- a bare server
+   stops when its last handle goes, and the app's `CH_URL` must keep pointing at
+   a running engine. No assertion was weakened: the same requests are still
+   counted, on a server that now belongs to the test that counts them.
+
+Two fixtures were updated because R4 and R3 changed what a caller must look
+like, not because a test was hard to satisfy. No assertion was weakened,
+relaxed or removed in either:
+
+- `tests/gold_publication.rs`'s `Sessions::with` now mints its principals in the
+  catalog's own tenant: under R4 a person who triggers a Gold export has to be a
+  member of it. Every assertion is the one it was.
+- `tests/gold_export_auth.rs` grants `gold:export` to two seeded people through
+  an `access_grant` row -- the production mechanism for granting a permission to
+  one person -- so that the "a person of another tenant" case and the "a person
+  of the catalog's tenant" case are the same shape.
+
+#### Not verified, with the reason
+
+- **The `Rust · G3a Dagster + dlt Bronze ingest` check (BLOCKER 1) and the
+  `Rust · Gold export to Iceberg (ADR 0010)` check (BLOCKER 2) were NOT run
+  locally.** Both need a live compose stack with a real `ClickHouse` and
+  Lakekeeper, which this machine does not run for the Rust test suite; CI runs
+  both on the pull request. What IS verified here: BLOCKER 1's fix is the R1
+  rule, and it is covered by three tests (`routes::query::sec50_gate_tests`'s two
+  and `tests/pipeline_enforce.rs`'s one, which reproduces the G7 shape -- an
+  unrestricted author, a pipeline with no tenant, the statement allowed).
+  BLOCKER 2's fix is one line in the job's `.env`, and the same value is what
+  the two G8 jobs already use.
+- `bun run typecheck && bun run lint && bun run test` -- **not run.** The branch
+  touches no TypeScript file: the ten commits above change Rust, Markdown, one
+  `.env.example` and one CI workflow.
+- `python3 ops/lint/check_intra_package_imports.py &&
+  python3 ops/lint/check_bare_iceberg_count.py` and
+  `(cd dagster && python -m pytest dispar_orchestrate -q)` -- **not run**, for
+  the same reason: no Python and no Dagster file changed.
+- `docker compose up` on a profile -- **not run.** No compose file changed;
+  `config --quiet` passed, which is what the plan's section 6 asks for.
+- `docs/core/BACKLOG.md` -- **not touched** (the reviewer sets the status, the
+  PR and the shipped date at merge).
+- `docs/core/PRODUCT.md` -- **not touched.** Its "Query tenancy" row still says
+  that "dashboards, scheduled exports, alerts and authored pipelines are not
+  scoped this way yet", which is now false for the authored pipelines and the
+  Gold export. `AGENTS.md` makes that row the planner's, at Done.
+- The reviewer's own re-run of the block above -- the reviewer's job, per
+  `AGENTS.md` step 4.
+- Slice 2's mutation checks and the two fingerprint reads of S8 -- out of this
+  slice.
+
 ## 9. Review (planner appends below)
 
 ### Review round 1 (planner, 2026-10-30, at `1f15d91f`)
