@@ -156,7 +156,35 @@ to the AI team in `AI-16`.
 
 ## Limits to tell a customer
 
-To be filled from the signed decisions and the measurements (decision 5).
+To be filled from the signed decisions and the measurements (decision 5). Slice 4 (lag,
+the lag alert, the setup checks) adds these; each is a statement the product makes, not a
+promise it keeps better than it says:
+
+- **What lag means.** Per table, the time since the later of two moments: the source commit
+  time of the last change applied to Bronze, and the last moment the table was known to be up
+  to date. Taking the later of the two keeps a table that was quiet for a day, then got one
+  change, from reading a day behind. The number is never larger than the true lag. A table is
+  "up to date" only when nothing waits on its topic **and** Kafka Connect says the connector
+  runs: an empty topic proves nothing while Kafka Connect is stopped. Just after Kafka Connect
+  starts again, a table can read "up to date" for a moment before its first events reach the
+  topic.
+- **If the orchestrator is down, no alert is sent.** The lag comes from two reports of the
+  orchestrator (the backlog every 30 seconds, the last applied change after each batch). When
+  they stop, the connector page shows "Not known since <time>" after two minutes, and no
+  `connector_lag` alert can fire, because nothing evaluates. Watch the orchestrator itself.
+- **The alert is sent once when the lag passes the limit and once when it is back under.** The
+  Alerts list keeps one row per rule within 15 minutes, so the second alert is delivered but
+  may not appear as a second row if both happen within 15 minutes. A connector a person paused
+  is not evaluated and shows "Paused", not a number.
+- **Setup checks never block saving.** They are read after a connection test passes, with
+  fixed statements; a setting the login cannot read is "Not checked", never a pass. MySQL's
+  binlog retention must be at least **7 days** (or never expire), the broker's own retention:
+  the window in which a stopped connector can still catch up (the number is the planner's).
+  SQL Server Agent can only be read with `VIEW SERVER STATE`, which the documented login does
+  not have, so that check always reads "Not checked" with that reason; the login is not
+  widened. A SQL Server table the login cannot see is reported as missing CDC.
+- **Not in this slice.** MongoDB's setup check comes with MongoDB (slice 5); Oracle's with its
+  change capture (slice 6).
 
 ## Acceptance checklist
 

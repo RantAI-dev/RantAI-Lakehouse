@@ -316,6 +316,18 @@ pipeline that this replaces is gone, with `ops/debezium/` and the
 `debezium` principal and its warehouse grant (nothing removes them); once no
 older stack uses them they can be revoked by hand.
 
+**Lag and its alert (`SRC-4` slice 4).** The Dagster sensor `cdc_apply_sensor` posts every
+change-capture connector's per-table backlog to the API every 30 seconds (paused and failed
+connectors too), and the applier posts the source time of the last change it applied after each
+batch (`POST /api/connectors/{id}/capture/observations`, the `INGEST_SERVICE_TOKEN` identity). The
+API turns those into the lag the connector's Change capture tab shows and sends the
+`connector_lag` alert (limit per connector, 1 to 1440 minutes, default 15, set with `PUT
+/api/connectors/{id}/lag-limit` or on the tab). Add an alert rule of kind `connector_lag` (Alerts)
+or nobody is told. **Failure mode:** with the orchestrator down nothing posts, so no lag alert
+fires and the tab reads "Not known since <time>" after two minutes; monitor the code location
+itself. A connector a person paused is not evaluated: an alert already open stays open until the
+connector is resumed and its lag is evaluated again.
+
 **DNS gotcha found during verification:** on a host whose own
 `/etc/resolv.conf` carries a DNS search domain (VPN/corporate DNS,
 Tailscale MagicDNS, etc.), that suffix leaks into every container's
