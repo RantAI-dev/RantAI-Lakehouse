@@ -54,6 +54,7 @@ export function connectionReviewItems(adapter: string | null, dial: Record<strin
         { label: "Server", value: hostPort(d) },
         { label: "Database", value: text(d.database) },
         { label: "User", value: text(d.user) },
+        { label: "TLS mode", value: text(d.sslMode) || "require" },
         ...(text(d.slotName) || text(d.publicationName)
           ? [{ label: "Slot / publication", value: [text(d.slotName), text(d.publicationName)].filter(Boolean).join(" / ") }]
           : []),

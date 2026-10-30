@@ -503,6 +503,12 @@ export type CdcDial = {
   slotName?: string
   publicationName?: string
   serverId?: number | null
+  /** How the change-capture worker secures its connection to the source
+   * (`SRC-4` S2-d). Absent means `require`: encrypted, certificate taken as
+   * presented. `disable` is not encrypted. `verify-ca` and `verify-full` use the
+   * worker's own trust store. Widened with `string` as the other contract
+   * enums are. */
+  sslMode?: "disable" | "require" | "verify-ca" | "verify-full" | string
 }
 
 export type FilesProtocol = "s3" | "sftp"
