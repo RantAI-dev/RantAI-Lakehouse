@@ -716,11 +716,10 @@ async fn a_pipeline_reads_an_upload_table_its_own_tenant_claimed() {
     assert_eq!(body["sql"].as_str(), Some(BRONZE_SQL), "{body}");
 }
 
-/// `SEC-50`: a pipeline with no tenant of its own reaches nothing — the
-/// migration's own fail-closed rule for an unassigned pipeline.
-///
-/// `SEC-50` R2: the status is 422, not 404, for the same reason as the
-/// cross-tenant refusal above.
+/// `SEC-50` R3: a pipeline that belongs to no tenant is refused with its
+/// OWN sentence — not the gate's table sentence, which would blame a
+/// table for a pipeline that was never assigned a tenant — and with a
+/// 409, which is final for the orchestrator.
 #[tokio::test]
 async fn a_pipeline_with_no_tenant_is_refused() {
     let (router, pool, cookie, _engine) = app_with_engine().await;
@@ -734,8 +733,14 @@ async fn a_pipeline_with_no_tenant_is_refused() {
 
     let (status, body) = enforce(&router, &cookie, &id, BRONZE_SQL).await;
 
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
-    assert_eq!(body["error"].as_str(), Some(BRONZE_REFUSAL), "{body}");
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(
+        body["error"].as_str(),
+        Some(
+            "This pipeline belongs to no tenant. An administrator assigns one with PUT /api/pipelines/{id}/tenant."
+        ),
+        "{body}"
+    );
 }
 
 /// `SEC-50` R1 (review round 1, BLOCKER 1): an author holding the

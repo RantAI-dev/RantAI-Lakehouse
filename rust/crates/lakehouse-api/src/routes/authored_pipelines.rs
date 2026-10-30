@@ -1334,6 +1334,15 @@ pub async fn set_target_lag(
 pub const NO_AUTHOR_REASON: &str =
     "this pipeline has no author to read as; an administrator must assign one";
 
+/// `SEC-50` R3: the refusal for a pipeline that belongs to no tenant.
+///
+/// Its own sentence, not the gate's: the gate's table sentence would
+/// blame a table for a pipeline that was never assigned a tenant, and it
+/// would say nothing about the one thing that can be fixed. A 409 is
+/// final for the orchestrator, so the operator is told the refusal is
+/// final and what to do about it.
+pub const NO_TENANT_REASON: &str = "This pipeline belongs to no tenant. An administrator assigns one with PUT /api/pipelines/{id}/tenant.";
+
 /// `POST /api/pipelines/runnable/{id}/enforce` body.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1433,11 +1442,13 @@ fn gate_refusal_as_unprocessable(err: ApiError) -> ApiError {
 /// 403 for anyone but a service identity or a Platform Admin; 404 for an
 /// unknown pipeline id (the route reads the pipeline by id alone, so it
 /// 404s only an id that does not exist); 409 with [`NO_AUTHOR_REASON`]
-/// when the pipeline has no author or its author is deactivated; 422 with
-/// the tenant gate's fixed sentence when the statement reads a table the
-/// pipeline's tenant may not read, and 422 when the author is not a
-/// member of that tenant (`SEC-50` R2 — the gate's sentence, with this
-/// route's status, see [`gate_refusal_as_unprocessable`]); 422 with
+/// when the pipeline has no author or its author is deactivated; 409 with
+/// [`NO_TENANT_REASON`] when the pipeline belongs to no tenant and its
+/// author is not unrestricted (`SEC-50` R3); 422 with the tenant gate's
+/// fixed sentence when the statement reads a table the pipeline's tenant
+/// may not read, and 422 when the author is not a member of that tenant
+/// (`SEC-50` R2 — the gate's sentence, with this route's status, see
+/// [`gate_refusal_as_unprocessable`]); 422 with
 /// [`crate::policy_engine::enforcement_error_message`] when the rewrite is
 /// refused; 400 for a malformed body; 503 if no pool is configured or
 /// Postgres is unreachable; 500 on any other database failure. No error
@@ -1508,6 +1519,20 @@ pub async fn enforce_pipeline_sql(
         // error string built here: log it under a reference, answer fixed.
         other => upstream_error::internal_error(&upstream_error::STORE, &other),
     })?;
+
+    // SEC-50 R3: a pipeline that belongs to NO tenant is refused with its
+    // own sentence, BEFORE the gate. The gate's table sentence would
+    // blame a table for a pipeline that was never assigned a tenant, and
+    // it would say nothing about the one thing that can be fixed; a 409
+    // is final for the orchestrator, so the operator is told what to do.
+    //
+    // An author holding the unrestricted (`*:*`) grant is exempt (R1):
+    // such an author reads every table anyway, so a pipeline of that
+    // author is not refused for a tenant it never had. This is what
+    // keeps the G7 harness's bootstrap-admin pipelines runnable.
+    if pipeline.tenant_id.is_none() && !crate::routes::catalog::is_unrestricted(&author) {
+        return Err(ApiError::Conflict(NO_TENANT_REASON.to_owned()).into());
+    }
 
     // The placeholders are the AUTHOR's, exactly as Query Studio builds
     // them for a session principal (`routes::query::
