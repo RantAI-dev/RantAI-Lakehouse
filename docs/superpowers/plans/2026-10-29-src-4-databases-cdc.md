@@ -854,6 +854,106 @@ slice 2 entry above is closed. `SHOULD-FIX 2`: `replication_metrics.py` (two pla
 says an upgraded deployment keeps the Lakekeeper `debezium` principal and grant, revocable by
 hand. Other checks on that run are in the PR; only the G4 conclusion was read by me.
 
+### Slice 5, MongoDB change capture (developer, Sonnet, 2026-10-30)
+
+Branch `feat/src-4-slice-5` (cut at `8cfd0a91`; `origin/main` merged once at `d8c1dbf7`, one conflict,
+`docs/core/BACKLOG.md`'s in-progress table, both rows kept). CI is on draft PR #277.
+
+**Commits** (one per task, then the fixes CI found):
+`b25878bb` T5.1 dial, identity, host check; `0f34957b` T5.2 renderer and allowlist; `f591c5d4` T5.3
+migration 0119 and type tests; `7bc35a7a` T5.4 documents into rows; `87d930fc` T5.5 connection test
+and discovery in the orchestrator; `9598790a` T5.6 console form; `b62d6f94` T5.7 fixture, gate, CI job;
+`b643b534` T5.8 docs. Fixes: `6d3bd705` (clippy `too_many_lines` on `Dial::target_identity`),
+`b1016d35` (`capture.scope=database`, see below), `b9ff282a`, `978336a0`, `49fa9d8e` (gate:
+diagnostics, and the gate user created in the captured database), `48046107` (a delete's `_id`
+comes from the message key).
+
+**What CI found that the plan could not know** (all in the code now):
+- Debezium's default scope is the whole deployment, which needs the right to read every database.
+  The renderer sets `capture.scope=database` and `capture.target=<database>` (Debezium's "Required
+  permissions"), so the S5-h user is the built-in `read` role on one database, nothing else. The gate
+  proves that is enough.
+- A delete event's value has NO `_id` and no document (only `__op`, `__source_ts_ms`, `__deleted`);
+  the key is `{"id":"<24 hex digits>"}`. `cdc_apply.key_id` reads the id from the key. Before the fix
+  the delete never reached Bronze and the applier run failed.
+- An ObjectId arrives as its 24 hex digits both in the key and in the value of an insert or update
+  (not as `{"$oid": ...}`); the `$oid` unwrapping written in T5.4 is a defence, not what happens.
+  BSON dates arrive as scalars (the gate documents carry `updated_at`; no nested value reached the
+  applier).
+- Debezium reported version 3.7.0.Final in the worker's log although the image tag says 3.8 (seen in
+  the first failed run). Nothing depends on it; written down because the plan says 3.8.
+
+**Deviations from the plan text** (each for a reason; say if you want any undone):
+1. *Source objects are bare collection names* (`orders`), not `<database>.<collection>`: discovery
+   (`_mongo`) lists them that way and the batch adapter reads them that way; the renderer and
+   `topic_of` take the database from the dial, as `topic_of` does for SQL Server. The "two plain parts"
+   test became "one plain name; a dotted name is refused".
+2. *The console form is a new component* (`cdc-mongo-dial-form.tsx`), wired in `DialFormFor` by the type
+   name, not a branch inside `cdc-dial-form.tsx` (slice 3's file). Same fields as S5-i. The cdc form has
+   no TLS field for any driver, so none is added; a console-made Mongo connector takes `require`.
+3. *The gate has its own orchestration* (`g4_mongo_test.py`) over the shared module's low-level parts
+   (session, sign-in, waits, ClickHouse, credential file, discovery poll, first copy, password check,
+   schema change, restart handshake, delete). `cdc_gate.py` was not edited. Reason: its steps build SQL
+   text and read `id`; Mongo needs `_id` keys, bare names, a delete that carries the key only, and a
+   connection test that runs in the orchestrator. Documents carry `_id` = an ObjectId made from the number
+   in the integer field `id`, so the shared first-copy step works and the real conversion is checked
+   (every Bronze `_id` equals the hex of `id`).
+4. *Gate TLS is `disable`* (the fixture has no certificate); the four modes are unit-tested in the
+   renderer. Not proven end to end: any TLS mode.
+5. *The connection test and the collection list dial the first host only*, directly (the batch
+   adapter's own rule: replica-set discovery would reach unchecked hosts). New optional
+   `clientOptions` in `adapters.mongodb.connect` carries the dial's TLS options.
+
+**Decisions I could not close** (for you):
+- *S5-b, `directConnection`.* Set for a one-host dial; the gate runs exactly that shape and Debezium
+  accepted it with change streams (gate passed). For several hosts the driver forbids it, so the
+  worker dials whatever the replica set advertises, and the API's save-time address check covers only
+  the written hosts. I did not stop because the one-host case is clean and the dial allows several
+  hosts as S5-a says, but the multi-host case is not proven (no gate runs it) and has the SSRF gap
+  written in "Limits". Decide: accept, or refuse a multi-host dial until a bounded allowlist exists.
+- The plan said `require` "takes the certificate as presented". Debezium cannot: the chain is always
+  checked against the worker's trust store, `require` only skips the host name. The renderer's doc and
+  "Limits" say so. Not tested against a real TLS server.
+- A nested document or array in a document stops the table's load (as the batch connector refuses it).
+  A real collection with nested fields cannot be captured. This follows "look alike", but is the
+  limit a customer will hit first.
+
+**Commands run locally (rule 7)**
+- `cd rust && cargo fmt --check`: clean after every Rust commit.
+- `cd dagster && python -m pytest dispar_orchestrate/test_cdc_apply_mongodb.py test_cdc_apply.py
+  test_discover.py test_adapters_mongodb.py test_ssrf_guard_mongo.py -q`: 22 passed in the new file;
+  68 for the two cdc_apply files; 111 for discover, mongodb adapter, the new file and ssrf guard (run
+  before the last fix; the two cdc_apply files re-run after it).
+- `bun test` dial-forms.test.tsx + brand-marks.test.ts: 32 pass, 1 skipped (pre-existing), 0 fail;
+  `bun run typecheck` clean; `bun run lint` 0 errors (11 pre-existing warnings, none in these files).
+- `python3 ops/lint/check_connector_gate_coverage.py` OK (22 supported, all covered) and its test file
+  (24 tests); `ops/gates/test_gate_summary.py` (29); `check_bare_iceberg_count.py`,
+  `check_intra_package_imports.py` OK; `scripts/ci/tests/test_required_gate.sh` 56 passed;
+  `PYTHONPATH=../gates python -m unittest test_g4_mongo test_cdc_gate` (in `ops/g4`) 10 tests OK;
+  YAML of the workflow and the override parsed.
+
+**Checks that ran only in CI** (no cargo, docker or compose locally): clippy, `cargo test` (incl.
+`tests/connector_type.rs` with 27 types), the images, and every gate. Run `41018974422` on
+`48046107`: 42 of 42 checks pass, including `Rust · clippy`, `Rust · test (stable)`, `Rust · G4
+MongoDB change capture into Bronze` (7m23s; gate table row `MongoDB CDC | g4-mongo | pass | pass |
+pass | pass`), `g4-cdc`, `g4-mysql`, `g4-mssql`, and Security 5 of 5 (run `41018974408`). Earlier
+runs failed as listed under Fixes: clippy on `3ff...` run `41003057111`, then the gate three times
+(runs on `b643b534`, `b9ff282a`, `49fa9d8e`).
+
+*Not verified:* the migration and the Rust code on a machine of mine; any TLS mode against a real
+server; a multi-host replica set; a MongoDB with nested documents (refused by design); the console
+form in a browser (unit tests only; per the QA rule it still needs owner QA); `docker compose
+--profile '*' config --quiet` (the override is not part of that command).
+
+**For the merge into the phase branch (rule 9).** Files both slices touch: `rust/crates/lakehouse-store/
+src/ingest_spec.rs` and `cdc.rs` (my additions are new items and a new match arm; the one edit inside
+slice 3's code is the `Dial::parse` `"cdc"` arm, now two arms), `kafka_connect.rs` (allowlist length 3
+to 4), `cdc_lifecycle.rs` (`provision` branches on the dial variant), `ci.yml` and `required_gate.sh`
+(new job beside `g4-mssql`), `coverage.json`, `CHANGELOG.md`, the feature page's "Limits", `OPERATIONS.md`.
+Count tests will clash with slice 3/4 additions: 27 connector types (`tests/connector_type.rs`) and
+22 supported types (lint test, `test_gate_summary.py`) assume this branch's own additions only.
+Migration 0119 is mine; 0118 is untouched.
+
 ## Review
 
 (The planner writes findings here, tagged `BLOCKER` or `SHOULD-FIX`.)
