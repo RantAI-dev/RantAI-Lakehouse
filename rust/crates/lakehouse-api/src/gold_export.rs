@@ -1067,6 +1067,93 @@ mod tests {
         assert!(message.contains("5000000") || message.contains("5_000_000"));
         assert!(message.contains("GOLD_EXPORT_MAX_ROWS"));
     }
+
+    /// The pool's own URL, for a state that reads it.
+    fn database_url_for(pool: &lakehouse_store::PgPool) -> String {
+        let options = pool.connect_options();
+        format!(
+            "postgres://{}:postgres@{}:{}/{}",
+            options.get_username(),
+            options.get_host(),
+            options.get_port(),
+            options
+                .get_database()
+                .expect("#[sqlx::test] always targets a named database"),
+        )
+    }
+
+    /// `SEC-50` S5: `export_mart`'s OWN gate.
+    ///
+    /// The HTTP route gates before the fingerprint, so every test through
+    /// the route proves the ROUTE's gate and never this one — and the
+    /// copilot's tool calls `export_mart` directly, so this gate is the
+    /// only one it passes. A deployment with several tenants (the four
+    /// the seeded identity migration creates) and no `CATALOG_TENANT_ID`
+    /// has no tenant whose reach covers the shared catalog, so the export
+    /// is refused with D6's sentence — before anything reaches the
+    /// engine.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_job_with_no_catalog_tenant_is_refused_before_the_engine_is_asked(
+        pool: lakehouse_store::PgPool,
+    ) -> sqlx::Result<()> {
+        // A BARE mock server: wiremock's pooled one can be handed to
+        // another test, and then this test's request log would carry that
+        // test's requests.
+        let engine = wiremock::MockServer::builder().start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"meta": [], "data": [], "rows": 0})),
+            )
+            .mount(&engine)
+            .await;
+
+        let mut env = std::collections::HashMap::new();
+        env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
+        env.insert("CH_URL".to_owned(), engine.uri());
+        // NO `CATALOG_TENANT_ID`: that is the deployment this refusal is
+        // about.
+        let state = AppState::new(
+            crate::config::Config::from_map(&env).expect("a valid config from a map"),
+        );
+        let obligations = crate::policy_engine::PolicyEngineObligations::from_state(&state);
+
+        let outcome = export_mart(
+            &state,
+            crate::routes::query::GateActor::CatalogTenant,
+            &state.clickhouse,
+            &iceberg_config(
+                "http://127.0.0.1:1".to_owned(),
+                "warehouse".to_owned(),
+                None,
+            ),
+            "serving.gold_smoke",
+            "gold_smoke",
+            1_000,
+            100,
+            &[],
+            &crate::sql_rewrite::PlaceholderValues::none(),
+            &obligations,
+        )
+        .await;
+
+        let Err(err) = outcome else {
+            panic!("a deployment that names no catalog tenant must refuse the export");
+        };
+        assert_eq!(
+            err.to_string(),
+            crate::routes::query::JOB_NEEDS_CATALOG_TENANT
+        );
+        let requests = engine
+            .received_requests()
+            .await
+            .expect("the mock engine records requests");
+        assert!(
+            requests.is_empty(),
+            "the refusal precedes the engine: nothing may be asked: {requests:?}"
+        );
+        Ok(())
+    }
 }
 
 // ── WS7 item D2: `export_batch_sql` goes through the same
