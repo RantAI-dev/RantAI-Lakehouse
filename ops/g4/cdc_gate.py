@@ -27,6 +27,17 @@ the API a person uses:
      marker line `G4-RESTART-KAFKA-CONNECT` and waits for the file
      `/tmp/g4-kafka-connect-restarted`; the CI job restarts the container and creates the
      file with `docker exec`;
+   - lag (`SRC-4` slice 4, decision S4-h): after the first copy `GET .../change-capture` says
+     "up to date" for both tables; the connection test lists the setup checks, all `ok` for the
+     gate's source (the SQL Server Agent one is `unchecked`: the documented login cannot read it);
+     and a second connector with ONE setting missing (a publication that does not exist, a
+     login without `REPLICATION CLIENT`, a table without CDC) gets exactly that check `missing`
+     with its fixed sentence and a command, the rest `ok`;
+   - (`g4-cdc` only, AC7) the lag alert: with the limit at 1 minute and `kafka-connect` stopped by
+     the CI job (marker `G4-STOP-KAFKA-CONNECT`, file `/tmp/g4-kafka-connect-stopped`) while
+     changes are written, the capture route reports a lag above 60 seconds and ONE `connector_lag`
+     alert instance exists; started again (`G4-START-KAFKA-CONNECT`,
+     `/tmp/g4-kafka-connect-started`) the tables come back to "up to date" and the alert closes;
    - a source schema change is observed: a new column reaches the Bronze table and
      `GET .../schema-changes` lists it;
    - (PostgreSQL only, in `g4_test.py`) the WAL-breach alert and the OIDC round trip;
@@ -59,6 +70,7 @@ filtering and overcounts. Every row-count check uses a `WHERE` predicate.
 from __future__ import annotations
 
 import collections
+import dataclasses
 import decimal
 import os
 import sys
@@ -120,12 +132,36 @@ CDC_SECRETS_DIR = "/cdc-secrets"
 RESTART_MARKER = "G4-RESTART-KAFKA-CONNECT"
 RESTART_DONE_FILE = "/tmp/g4-kafka-connect-restarted"
 RESTART_WAIT_SECONDS = 300.0
+# The lag alert step (`g4-cdc` only) asks the CI job to stop and to start `kafka-connect`, the way
+# the restart step asks for a restart: a marker line, then a file the job creates with `docker exec`.
+STOP_MARKER = "G4-STOP-KAFKA-CONNECT"
+STOP_DONE_FILE = "/tmp/g4-kafka-connect-stopped"
+START_MARKER = "G4-START-KAFKA-CONNECT"
+START_DONE_FILE = "/tmp/g4-kafka-connect-started"
+# The lag limit the alert step sets (`SRC-4` AC7), and a webhook nothing listens on: 192.0.2.0/24 is
+# TEST-NET-1, which the address check of `SEC-10` admits and nothing routes (as the WAL rule's sink).
+LAG_LIMIT_MINUTES = 1
+LAG_ALERT_SINK = "http://192.0.2.1:9/g4-lag-sink"
+UP_TO_DATE_TIMEOUT_SECONDS = 300.0
 # The broker the schema-history topics live on (`MySQL` and `SQL Server`).
 KAFKA_BOOTSTRAP = os.environ.get("CDC_KAFKA_BOOTSTRAP", "kafka:9092")
 
 
 class G4Failure(Exception):
     pass
+
+
+@dataclasses.dataclass(frozen=True)
+class MissingCase:
+    """The second connector of the setup-check step: its dial and tables, the password of its
+    login, and the one check that must come out `missing` with its fixed sentence (the text of
+    `lakehouse-api`'s `cdc_setup_check.rs`)."""
+
+    dial: dict
+    source_objects: list
+    password: str
+    setting: str
+    message: str
 
 
 class Source:
@@ -181,6 +217,19 @@ class Source:
 
     def before_delete(self, connector_id: str) -> None:
         """Source-side checks before `DELETE` (PostgreSQL: the slot exists)."""
+
+    # Whether this gate also runs the lag alert step (AC7): `g4-cdc` only.
+    lag_alert_gate = False
+
+    def missing_case(self) -> "MissingCase":
+        """A connector whose source lacks exactly one setting (`SRC-4` S4-h). May change the source
+        (a second login, a table) first."""
+        raise NotImplementedError
+
+    def unchecked_is_expected(self, check: dict) -> bool:
+        """Whether `check` may be `unchecked` for this source's documented login (SQL Server
+        Agent: reading it needs `VIEW SERVER STATE`, which the login does not have)."""
+        return False
 
     def object_name(self, mode: str) -> str:
         return f"{self.schema}.{TABLES[mode]}"
@@ -345,15 +394,16 @@ def _ingest_spec_body() -> dict:
     }
 
 
-def _register_demo_cdc_connector(tenant_id: str) -> str:
+def _register_demo_cdc_connector(tenant_id: str, *, suffix: str = "", spec: dict | None = None, password: str | None = None) -> str:
     """Register the source the way the console registers a change-capture connector: `POST
     /api/connectors` with a `file:` credential whose value is the source user's password, then
     `PUT .../ingest-spec` with the `cdc` adapter, the dial and the two tables. That PUT
-    provisions the connector in Kafka Connect (`SRC-4` decision S2-e). Returns the connector id."""
+    provisions the connector in Kafka Connect (`SRC-4` decision S2-e). Returns the connector id.
+    `suffix`, `spec` and `password` register another connector (the setup-check step's)."""
     created = API.post(
         f"{API_URL}/api/connectors",
         json={
-            "name": f"{src().gate}-demo-cdc", "type": src().cdc_type, "direction": "source",
+            "name": f"{src().gate}-demo-cdc{suffix}", "type": src().cdc_type, "direction": "source",
             "host": src().host_for_registry, "credential": {"source": "file", "primary": "password"},
             "environment": "production", "tenant": "g4", "tenantId": tenant_id, "residency": "", "capabilities": [],
         },
@@ -366,10 +416,12 @@ def _register_demo_cdc_connector(tenant_id: str) -> str:
     derived = (body.get("credential") or {}).get("primary")
     if not derived:
         raise G4Failure("the create response carries no derived credential name")
-    _write_credential_file(derived, src().password)
-    spec = API.put(f"{API_URL}/api/connectors/{connector_id}/ingest-spec", json=_ingest_spec_body(), timeout=60)
-    if not spec.ok:
-        raise G4Failure(f"set the CDC connector's ingest-spec failed: {spec.status_code} {spec.text[:300]}")
+    _write_credential_file(derived, password if password is not None else src().password)
+    answer = API.put(
+        f"{API_URL}/api/connectors/{connector_id}/ingest-spec", json=spec if spec is not None else _ingest_spec_body(), timeout=60
+    )
+    if not answer.ok:
+        raise G4Failure(f"set the CDC connector's ingest-spec failed: {answer.status_code} {answer.text[:300]}")
     return connector_id
 
 
@@ -653,6 +705,214 @@ def step_first_copy_reached_bronze() -> None:
     _record("load", "pass", f"{counts['current']} + {counts['history']} rows in Bronze after the first copy")
 
 
+# ── Lag and setup checks (SRC-4 slice 4, decision S4-h) ─────────────────────
+
+
+def _say(step: str, outcome: str, detail: str = "") -> None:
+    """Print a step's result like `_record` does. These steps are not columns of the connector
+    gate table (`ops/gates/coverage.json` gates the four steps of SRC-9); they fail the gate by
+    name and print their numbers here, for the job log."""
+    print(f"[g4] {src().cdc_type} {step}: {outcome}{' (' + detail + ')' if detail else ''}", flush=True)
+
+
+def _capture(connector_id: str) -> dict:
+    resp = API.get(f"{API_URL}/api/connectors/{connector_id}/change-capture", timeout=15)
+    if not resp.ok:
+        raise G4Failure(f"GET .../change-capture answered {resp.status_code} {resp.text[:200]}")
+    body = resp.json()
+    if body.get("supported") is not True or not isinstance(body.get("lag"), dict):
+        raise G4Failure(f"the capture route carries no lag: {str(body)[:300]}")
+    return body
+
+
+def _lag_words(capture: dict) -> str:
+    return ", ".join(
+        f"{t['table']} {t['status']}" + (f" {t['seconds']}s" if t.get("seconds") is not None else "")
+        for t in capture["lag"]["tables"]
+    )
+
+
+def _wait_up_to_date(connector_id: str, timeout_s: float) -> str:
+    """Both tables read "up to date" on the capture route: nothing waits to be applied and the
+    capture runs. Returns the lag line."""
+    def check():
+        capture = _capture(connector_id)
+        tables = capture["lag"]["tables"]
+        if len(tables) == len(MODES) and all(t["status"] == "up_to_date" for t in tables):
+            return _lag_words(capture)
+        raise G4Failure(f"not up to date yet: {_lag_words(capture)} (state {capture.get('state')})")
+
+    return _wait_for("both tables read up to date on the capture route", check, timeout_s, interval_s=5)
+
+
+def step_lag_is_up_to_date_after_the_first_copy(connector_id: str) -> None:
+    """AC7, first half: after the first copy the capture route says "up to date" for both tables."""
+    try:
+        words = _wait_up_to_date(connector_id, UP_TO_DATE_TIMEOUT_SECONDS)
+    except G4Failure as exc:
+        _say("lag", "fail", str(exc))
+        raise
+    _say("lag", "pass", f"after the first copy: {words}")
+
+
+def _test_setup_checks(connector_id: str) -> list[dict]:
+    resp = API.post(f"{API_URL}/api/connectors/{connector_id}/test", timeout=60)
+    if not resp.ok:
+        raise G4Failure(f"POST .../test answered {resp.status_code} {resp.text[:200]}")
+    body = resp.json()
+    if body.get("supported") is not True or body.get("ok") is not True:
+        raise G4Failure(f"the connection test did not pass, so no setup check was read: {str(body)[:300]}")
+    checks = body.get("setupChecks")
+    if not isinstance(checks, list) or not checks:
+        raise G4Failure(f"the test answer carries no setupChecks: {str(body)[:300]}")
+    return checks
+
+
+def _describe(checks: list[dict]) -> str:
+    return "; ".join(f"{c['setting']}={c['status']}" for c in checks)
+
+
+def _expect_rest_ok(checks: list[dict], except_setting: str | None) -> None:
+    """Every check but `except_setting` is `ok`, or `unchecked` where the source's documented
+    login cannot read it."""
+    for check in checks:
+        if check["setting"] == except_setting or check["status"] == "ok":
+            continue
+        if check["status"] == "unchecked" and src().unchecked_is_expected(check):
+            continue
+        raise G4Failure(f"setup check {check['setting']!r} is {check['status']!r}: {check.get('message')!r} ({_describe(checks)})")
+
+
+def step_setup_checks(connector_id: str) -> None:
+    """AC3: the connection test lists the setup checks. The gate's own source passes all of
+    them; a second connector whose source lacks ONE setting gets that check `missing` with the
+    fixed sentence and a command, and the rest `ok` (or `unchecked` where the documented login
+    cannot read the setting)."""
+    try:
+        good = _test_setup_checks(connector_id)
+        _expect_rest_ok(good, None)
+        case = src().missing_case()
+        spec = {"adapter": "cdc", "ingestMode": "cdc", "dial": case.dial, "sourceObjects": case.source_objects}
+        other = _register_demo_cdc_connector(_ensure_gate_tenant(), suffix="-missing", spec=spec, password=case.password)
+        try:
+            checks = _test_setup_checks(other)
+            found = [c for c in checks if c["status"] == "missing"]
+            if len(found) != 1 or found[0]["setting"] != case.setting:
+                raise G4Failure(f"expected exactly {case.setting!r} to be missing, got {_describe(checks)}")
+            if found[0].get("message") != case.message:
+                raise G4Failure(f"the missing check says {found[0].get('message')!r}, expected {case.message!r}")
+            if not found[0].get("command"):
+                raise G4Failure(f"the missing check {case.setting!r} names no command")
+            _expect_rest_ok(checks, case.setting)
+        finally:
+            deleted = API.delete(f"{API_URL}/api/connectors/{other}", timeout=120)
+            if not deleted.ok:
+                print(f"[g4] cleanup: DELETE of the setup-check connector answered {deleted.status_code}", flush=True)
+    except G4Failure as exc:
+        _say("setup checks", "fail", str(exc))
+        raise
+    _say("setup checks", "pass", f"gate source: {_describe(good)}; other connector: {case.setting!r} missing alone, the rest ok")
+
+
+def _alert_instances(rule_id: str) -> list[dict]:
+    resp = API.get(f"{API_URL}/api/overview/alerts", timeout=15)
+    if not resp.ok:
+        raise G4Failure(f"GET /api/overview/alerts answered {resp.status_code} {resp.text[:200]}")
+    return [a for a in resp.json() if a.get("ruleId") == rule_id]
+
+
+def _ask_ci_job(marker: str, done_file: str, what: str) -> None:
+    """Print `marker` and wait for the CI job to do `what` and create `done_file` (the runner has
+    no Docker access; see the module doc)."""
+    if os.path.exists(done_file):
+        os.remove(done_file)
+    print(marker, flush=True)
+    _wait_for(f"the CI job {what}", lambda: True if os.path.exists(done_file) else None, RESTART_WAIT_SECONDS, interval_s=2)
+
+
+def _wait_lag_over_the_limit(connector_id: str) -> int:
+    def check():
+        capture = _capture(connector_id)
+        worst = capture["lag"].get("worst")
+        if worst and worst["seconds"] > LAG_LIMIT_MINUTES * 60:
+            return int(worst["seconds"])
+        raise G4Failure(f"lag not over the limit yet: {_lag_words(capture)} (state {capture.get('state')})")
+
+    return _wait_for(f"the lag passes {LAG_LIMIT_MINUTES * 60}s on the capture route", check, 300, interval_s=5)
+
+
+def step_lag_alert_fires_once_and_closes(connector_id: str) -> None:
+    """`g4-cdc` only (AC7, S4-h). Limit 1 minute; the CI job stops `kafka-connect`; changes are
+    written meanwhile. The capture route reports a lag above 60 seconds and ONE `connector_lag`
+    instance exists, however many sensor ticks pass. The CI job starts `kafka-connect` again; the
+    tables come back to "up to date" and the alert closes (`alertOpen` false).
+
+    Two limits of what a gate can see, stated rather than hidden: the Alerts list dedupes a rule's
+    instances for 15 minutes (`overview::insert_from_fired_rule`), so the "back under" alert is
+    delivered but not listed as a second row, and the gate sees it as `alertOpen` going false; and
+    the lag outlasts the outage by design (it counts from the last moment the table was up to
+    date)."""
+    created = API.post(
+        f"{API_URL}/api/alerts",
+        json={
+            "name": "g4 connector lag", "type": "connector_lag", "connector": connector_id,
+            "channel": "webhook", "target": LAG_ALERT_SINK, "severity": "high",
+        },
+        timeout=15,
+    )
+    if not created.ok:
+        raise G4Failure(f"create the connector_lag rule answered {created.status_code} {created.text[:300]}")
+    rule_id = (created.json().get("rule") or {}).get("id")
+    if not rule_id:
+        raise G4Failure(f"the connector_lag rule answer carries no id: {created.text[:300]}")
+    try:
+        limit = API.put(f"{API_URL}/api/connectors/{connector_id}/lag-limit", json={"minutes": LAG_LIMIT_MINUTES}, timeout=15)
+        if not limit.ok or limit.json().get("minutes") != LAG_LIMIT_MINUTES:
+            raise G4Failure(f"PUT .../lag-limit answered {limit.status_code} {limit.text[:200]}")
+        _wait_up_to_date(connector_id, UP_TO_DATE_TIMEOUT_SECONDS)
+        if _alert_instances(rule_id):
+            raise G4Failure("an alert instance exists before any lag")
+
+        _ask_ci_job(STOP_MARKER, STOP_DONE_FILE, "stopped kafka-connect")
+        now = src().now
+        _apply(
+            lambda t: f"UPDATE {t} SET customer = 'lag_u', updated_at = {now} WHERE id BETWEEN 16001 AND 16500",
+            lambda: _history_events(range(16_001, 16_501), "u", "lag_u"),
+        )
+        over = _wait_lag_over_the_limit(connector_id)
+        instances = _wait_for("one connector_lag alert instance", lambda: _alert_instances(rule_id) or None, 240, interval_s=5)
+        if len(instances) != 1:
+            raise G4Failure(f"expected one connector_lag instance for one crossing, got {len(instances)}")
+        if _capture(connector_id)["lag"].get("alertOpen") is not True:
+            raise G4Failure("the lag passed the limit and an alert was listed, but alertOpen is not true")
+        # Two more sensor ticks over the limit: still one alert for the one crossing.
+        time.sleep(75)
+        again = _alert_instances(rule_id)
+        if len(again) != 1:
+            raise G4Failure(f"{len(again)} alert instances after more ticks over the limit; expected one per crossing")
+
+        _ask_ci_job(START_MARKER, START_DONE_FILE, "started kafka-connect")
+        _wait_capture_state(connector_id, "running", 240)
+        _wait_equal("after kafka-connect was stopped and started during changes", CATCH_UP_TIMEOUT_SECONDS)
+        words = _wait_up_to_date(connector_id, UP_TO_DATE_TIMEOUT_SECONDS)
+
+        def closed():
+            return True if _capture(connector_id)["lag"].get("alertOpen") is False else None
+
+        _wait_for("the lag alert closes (back under the limit)", closed, 120, interval_s=5)
+        final = _alert_instances(rule_id)
+    except G4Failure as exc:
+        _say("lag alert", "fail", str(exc))
+        raise
+    finally:
+        API.delete(f"{API_URL}/api/alerts", params={"id": rule_id}, timeout=15)
+    _say(
+        "lag alert", "pass",
+        f"limit {LAG_LIMIT_MINUTES} min, kafka-connect stopped: lag {over}s, {len(instances)} instance, still {len(again)} after more ticks; "
+        f"started again: {words}, alert closed, {len(final)} instance listed (15-minute dedupe)",
+    )
+
+
 # ── Changes ─────────────────────────────────────────────────────────────────
 
 
@@ -855,9 +1115,13 @@ def run(source: Source, before_delete=None, after_delete=None) -> int:
         if source.needs_schema_history:
             step_schema_history_never_expires(connector_id)
         step_first_copy_reached_bronze()
+        step_lag_is_up_to_date_after_the_first_copy(connector_id)
+        step_setup_checks(connector_id)
         step_changes_visible_within_budget()
         step_pause_and_resume_lose_nothing(connector_id)
         step_restart_kafka_connect_during_changes(connector_id)
+        if source.lag_alert_gate:
+            step_lag_alert_fires_once_and_closes(connector_id)
         step_schema_change_is_observed(connector_id)
         if before_delete is not None:
             before_delete(connector_id)

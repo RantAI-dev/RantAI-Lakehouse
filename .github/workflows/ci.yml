@@ -1024,11 +1024,24 @@ jobs:
           tail -n +1 -f "$log" &
           tail_pid=$!
           restarted=0
+          stopped=0
+          started=0
           while kill -0 "$run_pid" 2>/dev/null; do
             if [ "$restarted" = 0 ] && grep -q '^G4-RESTART-KAFKA-CONNECT$' "$log"; then
               compose restart kafka-connect
               docker exec g4-runner touch /tmp/g4-kafka-connect-restarted
               restarted=1
+            fi
+            # The lag alert step (SRC-4 S4-h, AC7): stop kafka-connect, and later start it again.
+            if [ "$stopped" = 0 ] && grep -q '^G4-STOP-KAFKA-CONNECT$' "$log"; then
+              compose stop kafka-connect
+              docker exec g4-runner touch /tmp/g4-kafka-connect-stopped
+              stopped=1
+            fi
+            if [ "$started" = 0 ] && grep -q '^G4-START-KAFKA-CONNECT$' "$log"; then
+              compose start kafka-connect
+              docker exec g4-runner touch /tmp/g4-kafka-connect-started
+              started=1
             fi
             sleep 2
           done
