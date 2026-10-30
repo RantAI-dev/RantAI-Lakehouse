@@ -714,3 +714,72 @@ then the NITs.
 - Then the full verification block, plus the two CI checks above run locally if possible. If not,
   say so: CI runs them on the PR.
 - Then a short round 1 handoff under section 8.
+
+### Review round 2 (planner, 2026-10-30, at `ba554bbb`)
+
+An independent read-only pass checked every round 1 finding against the code. All of them are
+fixed:
+- R1: `*:*` passes `AsTenant` (`query.rs:339`).
+- B2: the setting is in the right CI job.
+- R2: 422 only on the enforce route.
+- R3: the 409 comes before the gate, with `*:*` exempt.
+- R4: person versus service is decided by `PrincipalId::Service`.
+- R5, S5, S6.
+- `1803ba76` is a test-isolation change only.
+CI ran on the PR: G7 itself now **passes**, and the Gold export job passes.
+
+#### BLOCKER
+
+1. **The CI check `Rust · G3a Dagster + dlt Bronze ingest` is red at `ba554bbb`**, though not
+   because of G7. The same job's `ops/g7/bld1_pipeline_author_test.py` fails: `[bld-1] FAILED:
+   the masked-author run FAILED instead of writing masked rows`.
+   - **Cause.** The harness picks a regular Analyst as the author and scopes the pipeline to
+     that author's tenant. The job's `.env` names no `CATALOG_TENANT_ID`, and `0002` seeds four
+     tenants, so under D2/D5 the gate refuses the shared `bronze.g3a_orders`. That is the signed
+     behaviour, exactly as G8 was in #244.
+   - **Fix (decided):**
+     - add `CATALOG_TENANT_ID=11111111-1111-4111-8111-000000000001` to that job's CI-only `.env`,
+       with a comment;
+     - in the harness, choose an author who belongs to THAT tenant and scope the pipeline to it.
+       `_user_by_role` and `_tenant_shared_with` prefer the catalog's tenant (read the setting
+       from the environment, the way the harness reads its other settings) and fail with a clear
+       message if no holder of the role belongs to it.
+   - Every masking assertion stays exactly as it is.
+2. **The branch is behind `main`**, and protection requires it to be up to date. Merge `main`
+   in; do not rebase.
+
+#### SHOULD-FIX
+
+1. `docs/OPERATIONS.md:~1592-1600` lists "the assistant's own tool" among callers with no user,
+   which act as the catalog's tenant. The code gates the tool as the signed-in person
+   (`routes/ai/tools/gold.rs:~115`, `Caller`). The text also implies every Gold export in a
+   multi-tenant deployment without the setting gets the 422; a signed-in non-`*:*` person gets
+   the 404 table sentence instead. Make both true. Fix the round 1 handoff sentence that says
+   the same.
+2. Nothing proves the assistant's gold tool uses `Caller`: if it were switched to
+   `CatalogTenant`, every test would still pass. Add a test that calls the tool as a person of
+   another tenant (with `gold:export`, a catalog tenant set) and is refused, and run a mutation
+   check that swaps the actor.
+
+#### NIT
+
+- The B2 comment (`ci.yml:~2696-2701`) says the Gold export "is a job with no user". This job's
+  harness signs in as the `*:*` bootstrap admin, so it passes as `Caller` (`All`). Keep the
+  setting, but say why truthfully: it names the catalog's tenant as every multi-tenant
+  deployment must, and a non-admin exporter would need it (`AGENTS.md` rule 1).
+- `OPERATIONS.md:~1634`: "an unassigned pipeline is invisible" is half true. A `*:*` admin sees
+  every pipeline. Say so, and say `PUT /api/pipelines/{id}/tenant` needs `identity:write`.
+- `routes/gold.rs:~361-370`: the route's `# Errors` must list the 404 a person of another tenant
+  now gets.
+- `tests/pipeline_enforce.rs:~749`: the doc claims a case the test does not check. Make it match
+  the test.
+- **R5, amended (planner):** with no pool, `CatalogTenant` refuses with `SEC-20`'s own sentence
+  for that state, `ApiError::Unavailable("could not verify tenant count")`
+  (`routes/catalog.rs:179`), not D6's. D6 tells the operator to set a setting that may already
+  be set. Update its unit test.
+
+**Open: 2 BLOCKERs** (both the CI setup and the branch state, not the gate's logic). One fix
+round: the BLOCKERs, then SHOULD-FIX 1-2, then the NITs. Cite `PR #281 review round 2 B<n>/S<n>`.
+Under the owner's rule of 2026-10-30, CI is the final check: run fmt, the clippy and tests of
+`lakehouse-api` for what you touched, and the harness file's own Python checks if any. Push, and
+CI runs the whole workspace and the G-gates. Then write a short round 2 handoff.
