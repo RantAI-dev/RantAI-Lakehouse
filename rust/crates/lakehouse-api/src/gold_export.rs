@@ -627,17 +627,32 @@ pub struct GoldExportResult {
 /// export); and [`GoldExportError::TenantGateRefused`] (`SEC-50`) is
 /// returned when the tenant gate refuses the export — before any row is
 /// read.
+///
+/// # Who the export acts as (`SEC-50` R4)
+///
+/// The `actor` says whose reach the gate measures the export against: a
+/// signed-in person as themselves, a job with no user (a service
+/// identity, the shared run token) as the tenant that owns the shared
+/// catalog. `routes::gold::gold_export_gate_actor` is the one place that
+/// decides.
+///
+/// `pub(crate)`, not `pub`: the actor type is `routes::query`'s
+/// `pub(crate)` `GateActor` (the plan's T1), and this function is called
+/// from inside this crate only -- the route and the copilot's tool.
 #[allow(
     clippy::too_many_arguments,
     reason = "WS7 item D2 added roles/placeholders/obligations to the existing six \
               ch/iceberg_config/source_table/mart_name/max_rows/batch_size parameters; \
               SEC-50 added the state, which carries the gate's own answers \
-              (the deployment's tenants and CATALOG_TENANT_ID); grouping them into a \
-              struct would only move the same ten facts one level of indirection away \
-              from every call site, not reduce what a caller must supply"
+              (the deployment's tenants and CATALOG_TENANT_ID), and the actor, \
+              which says whose reach the gate measures the export against; grouping \
+              them into a struct would only move the same facts one level of \
+              indirection away from every call site, not reduce what a caller must \
+              supply"
 )]
-pub async fn export_mart(
+pub(crate) async fn export_mart(
     state: &AppState,
+    actor: crate::routes::query::GateActor<'_>,
     ch: &ChClient,
     iceberg_config: &IcebergClientConfig,
     source_table: &str,
@@ -659,19 +674,23 @@ pub async fn export_mart(
     let batch_size = batch_size.max(1);
 
     // SEC-50: the export reads the SHARED catalog (`serving.*`, Silver,
-    // Gold) and no person is behind it, so it acts as the catalog's own
-    // tenant. The gate runs BEFORE the first read of the mart — the row
-    // count below — so a deployment that holds several tenants and names
-    // no catalog tenant refuses the export before anything reaches
-    // `ClickHouse`. It is the ONE gate every statement passes
-    // (`routes::query::gate_statement`), never a second copy of the
-    // reach logic (`AGENTS.md` rule 4).
+    // Gold), so the gate asks whose reach covers it: a signed-in person's
+    // own tenant, or the catalog's own tenant for a job with no user
+    // (R4, D3). The caller decides — `routes::gold::gold_export_gate_actor`
+    // is the one place that decides — and this gate is the SAME gate the
+    // route asks before the fingerprint, never a second copy of the reach
+    // logic (`AGENTS.md` rule 4).
+    //
+    // The gate runs BEFORE the first read of the mart — the row count
+    // below — so a deployment that holds several tenants and names no
+    // catalog tenant refuses the export before anything reaches
+    // `ClickHouse`.
     let count_sql = mart_count_sql(source_table);
     crate::routes::query::gate_statement(
         state,
         &count_sql,
         &sqlparser::dialect::ClickHouseDialect {},
-        crate::routes::query::GateActor::CatalogTenant,
+        actor,
     )
     .await?;
 

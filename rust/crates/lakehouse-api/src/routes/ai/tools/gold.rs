@@ -102,8 +102,20 @@ pub(super) async fn export_gold_mart(
             .collect(),
     };
     let obligations = crate::policy_engine::PolicyEngineObligations::from_state(state);
+    // SEC-50 R4: a copilot tool call comes from a logged-in person, so the
+    // export is gated as that person -- their own tenant must own the
+    // shared catalog. The same rule the HTTP route applies, through the
+    // same helper, so the two paths cannot drift.
+    //
+    // No `X-Tenant` header here: a tool call carries the model's
+    // arguments, not the chat's request headers, so the person's FIRST
+    // tenant is the one that acts -- the same fallback
+    // `tenant_scope::resolve` uses when no header is sent.
+    let headers = axum::http::HeaderMap::new();
+    let actor = crate::routes::gold::gold_export_gate_actor(Some(principal), &headers);
     match crate::gold_export::export_mart(
         state,
+        actor,
         &state.clickhouse,
         &iceberg_config,
         &source_table,

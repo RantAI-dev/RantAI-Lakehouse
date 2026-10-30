@@ -36,7 +36,7 @@ use uuid::Uuid;
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use common::{TestApp, spin_up_with_env};
+use common::{TestApp, session_cookie_for_seeded_user, spin_up_with_env};
 
 /// The token the scheduler sends in these tests.
 const TOKEN: &str = "gold-export-scheduler-fixture-token";
@@ -185,6 +185,42 @@ fn seeded_tenant_ids() -> [&'static str; 4] {
     ]
 }
 
+/// Grants one person the `gold:export` permission, the way an approved
+/// access request does: an `access_grant` row the principal loader reads
+/// (`lakehouse_auth::repository::load_principal_for_user`).
+async fn grant_gold_export(pool: &sqlx::PgPool, email: &str) {
+    let (user_id,): (Uuid,) = sqlx::query_as("SELECT id FROM app_user WHERE email = $1")
+        .bind(email)
+        .fetch_one(pool)
+        .await
+        .expect("a seeded user");
+    sqlx::query(
+        "INSERT INTO access_grant (id, user_id, permission, expires_at, catalog_id) \
+         VALUES ($1, $2, 'gold:export', now() + interval '1 hour', 'gold-export-test')",
+    )
+    .bind(format!("grant-gold-export-{user_id}"))
+    .bind(user_id)
+    .execute(pool)
+    .await
+    .expect("grant gold:export to the seeded user");
+}
+
+/// Posts the export as a signed-in person, with the session cookie the
+/// seeded user gets.
+async fn post_export_as(app: &axum::Router, cookie: &str) -> axum::http::Response<Body> {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/gold/export/gold_export_smoke")
+                .header("cookie", cookie)
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("router never fails a request outright")
+}
+
 /// `SEC-50`: the Gold export reads the SHARED catalog and no person is
 /// behind it, so it acts as the catalog's own tenant. A deployment that
 /// holds several tenants and names no catalog tenant has no tenant whose
@@ -284,6 +320,76 @@ async fn a_deployment_with_one_tenant_reaches_the_engine_as_before() {
         status,
         StatusCode::UNPROCESSABLE_ENTITY,
         "a one-tenant deployment is never refused: {body}"
+    );
+    let requests = engine
+        .received_requests()
+        .await
+        .expect("the mock engine records requests");
+    assert!(
+        !requests.is_empty(),
+        "the export reads the mart, so the engine must have been asked"
+    );
+}
+
+/// `SEC-50` R4: a signed-in person is gated as THEMSELVES, so their own
+/// tenant must own the shared catalog. A person of another tenant who
+/// holds `gold:export` is refused — before anything reaches the engine.
+#[tokio::test]
+async fn a_person_of_another_tenant_holding_gold_export_is_refused() {
+    let engine = mount_engine().await;
+    let mut overrides = HashMap::new();
+    overrides.insert("CH_URL".to_owned(), engine.uri());
+    overrides.insert("CATALOG_TENANT_ID".to_owned(), CATALOG_TENANT.to_owned());
+    let TestApp { router, pool } = spin_up_with_env(&overrides).await;
+    // `sari` is an Analyst of `meridian-retail` — the tenant that does
+    // NOT own the shared catalog.
+    grant_gold_export(&pool, "sari@meridian.example").await;
+    let cookie = session_cookie_for_seeded_user(&pool, "sari@meridian.example").await;
+
+    let (status, body) = error_body(post_export_as(&router, &cookie).await).await;
+
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(
+        body["error"].as_str(),
+        Some("Table not found or not available to your organisation: serving.gold_export_smoke"),
+        "{body}"
+    );
+    let requests = engine
+        .received_requests()
+        .await
+        .expect("the mock engine records requests");
+    assert!(
+        requests.is_empty(),
+        "the refusal precedes the engine: nothing may be asked: {requests:?}"
+    );
+}
+
+/// `SEC-50` R4: the same person, in the tenant that DOES own the shared
+/// catalog, reads the mart as before — the gate narrows the export to
+/// the catalog's own tenant, it does not forbid it.
+#[tokio::test]
+async fn a_person_of_the_catalogs_tenant_holding_gold_export_reaches_the_engine() {
+    let engine = mount_engine().await;
+    let mut overrides = HashMap::new();
+    overrides.insert("CH_URL".to_owned(), engine.uri());
+    overrides.insert("CATALOG_TENANT_ID".to_owned(), CATALOG_TENANT.to_owned());
+    let TestApp { router, pool } = spin_up_with_env(&overrides).await;
+    // `rina` is an Analyst of `meridian-group` — the tenant that owns the
+    // shared catalog.
+    grant_gold_export(&pool, "rina@meridian.example").await;
+    let cookie = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+
+    let (status, body) = error_body(post_export_as(&router, &cookie).await).await;
+
+    assert_ne!(
+        status,
+        StatusCode::NOT_FOUND,
+        "the catalog's own tenant reads the shared catalog: {body}"
+    );
+    assert_ne!(
+        body["error"].as_str(),
+        Some("Table not found or not available to your organisation: serving.gold_export_smoke"),
+        "the catalog's own tenant reads the shared catalog: {body}"
     );
     let requests = engine
         .received_requests()
