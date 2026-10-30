@@ -133,3 +133,34 @@ async fn deleting_a_connector_deletes_its_capture_rows(pool: PgPool) -> sqlx::Re
     assert_eq!(list_tables(&pool, PG).await.unwrap().len(), 0);
     Ok(())
 }
+
+/// Slice 4 review SHOULD-FIX 3: a resume moves `caught_up_at` of every row to the resume, so
+/// a long pause does not read as lag.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_resume_counts_the_lag_from_the_resume(pool: PgPool) -> sqlx::Result<()> {
+    let old = OffsetDateTime::now_utc().replace_nanosecond(0).unwrap() - Duration::hours(3);
+    record_backlog(&pool, PG, "public.orders", 0, true, old)
+        .await
+        .unwrap();
+    record_last_change(&pool, PG, "public.items", old)
+        .await
+        .unwrap();
+    lakehouse_store::connectors::pause_connector(&pool, PG)
+        .await
+        .unwrap();
+    lakehouse_store::connectors::resume_connector(&pool, PG)
+        .await
+        .unwrap();
+    let tables = list_tables(&pool, PG).await.unwrap();
+    let before = OffsetDateTime::now_utc() - Duration::minutes(1);
+    for row in &tables {
+        assert!(
+            row.caught_up_at.unwrap() > before,
+            "{}: {:?}",
+            row.table_name,
+            row.caught_up_at
+        );
+    }
+    assert_eq!(tables.len(), 2);
+    Ok(())
+}

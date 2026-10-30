@@ -2068,6 +2068,17 @@ pub async fn resume_connector(pool: &PgPool, id: &str) -> Result<ResumeOutcome, 
     .bind(&reason)
     .execute(&mut *tx)
     .await?;
+    // Slice 4 review SHOULD-FIX 3: a person's pause is not lag. No report counts as "up to
+    // date" while the capture is paused, so without this a pause longer than the lag limit
+    // would alert as soon as the connector runs again. After a resume the lag counts from the
+    // resume; changes made during the pause show as backlog until they are applied.
+    sqlx::query(
+        "UPDATE connector_capture_table SET caught_up_at = GREATEST(caught_up_at, now()) \
+         WHERE connector_id = $1",
+    )
+    .bind(id)
+    .execute(&mut *tx)
+    .await?;
     tx.commit().await?;
     Ok(ResumeOutcome::Resumed)
 }
