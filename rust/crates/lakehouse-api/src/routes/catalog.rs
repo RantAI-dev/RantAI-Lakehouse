@@ -111,6 +111,19 @@ pub struct ListQuery {
 const CATALOG_TENANT_REFUSAL_NOT_OWNER: &str = "this deployment's shared catalog is owned by the tenant named in \
      CATALOG_TENANT_ID; the caller does not belong to it";
 
+/// `SEC-20`'s own sentence for a deployment that cannot say how many
+/// tenants it holds: the count could not be read (no pool, or the query
+/// failed), so "cannot verify it is safe" is the same answer as "verified
+/// unsafe" and the caller is refused.
+///
+/// ONE sentence, three call sites: this module's
+/// [`catalog_tenant_refusal`], `routes::catalog_grants`' own grant check,
+/// and `routes::query`'s tenant gate (the job-with-no-user actor). It is
+/// the shared catalog's own sentence, not a route-local one
+/// (`AGENTS.md` rule 4), and it says nothing about the deployment's data
+/// (`AGENTS.md` principle 4).
+pub(crate) const COULD_NOT_VERIFY_TENANT_COUNT: &str = "could not verify tenant count";
+
 /// Refusal reason when `CATALOG_TENANT_ID` is unset and more than one
 /// tenant exists — the same honest gap the first draft of this task
 /// disclosed, now naming the exact setting an operator sets to open it
@@ -176,7 +189,7 @@ pub(crate) async fn catalog_tenant_refusal(
     let (count,): (i64,) = sqlx::query_as("SELECT count(*) FROM tenant")
         .fetch_one(pool)
         .await
-        .map_err(|_err| ApiError::Unavailable("could not verify tenant count".to_owned()))?;
+        .map_err(|_err| ApiError::Unavailable(COULD_NOT_VERIFY_TENANT_COUNT.to_owned()))?;
     if count <= 1 {
         return Ok(None);
     }

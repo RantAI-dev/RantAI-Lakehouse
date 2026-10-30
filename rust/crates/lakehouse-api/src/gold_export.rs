@@ -75,12 +75,15 @@ use arrow_array::{
 };
 use iceberg::spec::{NestedField, PrimitiveType, Type};
 use lakehouse_clickhouse::{ChClient, ChColumn, ChError};
+use lakehouse_core::ApiError;
 use lakehouse_core::secret::SecretValue;
 use lakehouse_iceberg::{GoldTable, IcebergClient, IcebergClientConfig, IcebergError, gold};
 use serde_json::{Map, Value};
 use thiserror::Error;
 use time::Date;
 use time::format_description::well_known::Iso8601;
+
+use crate::state::AppState;
 
 /// Errors exporting a Gold mart to Iceberg.
 #[derive(Debug, Error)]
@@ -134,6 +137,18 @@ pub enum GoldExportError {
     /// any data is written to Iceberg at all.
     #[error("Gold export refused by the policy engine: {0}")]
     PolicyRefused(String),
+    /// `SEC-50`: the tenant gate refused the export before it read
+    /// anything. The gate's own error travels as it is, so the caller
+    /// sees the status the gate would have answered — a fixed sentence,
+    /// never an upstream text (`AGENTS.md` rule 4).
+    ///
+    /// No `#[from]`: a `From<ApiError>` on this variant would turn every
+    /// future `?` on an `ApiError` anywhere in this file into "tenant
+    /// gate refused" — a refusal the caller would read as the gate's own
+    /// sentence when it is something else entirely. The one gate call
+    /// wraps its error explicitly (`PR #281` review round 1, NIT).
+    #[error("{0}")]
+    TenantGateRefused(ApiError),
 }
 
 /// One column's resolved Iceberg + Arrow shape, plus enough to parse a
@@ -441,6 +456,21 @@ fn order_by_clause(columns: &[ChColumn]) -> String {
         .join(", ")
 }
 
+/// The statement the export's row cap reads: `SELECT count() AS c FROM
+/// <mart>`.
+///
+/// It is also the statement the `SEC-50` gate checks, because it names
+/// the mart the export reads — one statement, one name, one gate, and
+/// the gate and the read can never drift apart.
+///
+/// `source_table` is the fully-qualified name the caller built (the
+/// schema, a dot, and the mart in backticks), so the statement names
+/// the same table the export reads.
+#[must_use]
+pub(crate) fn mart_count_sql(source_table: &str) -> String {
+    format!("SELECT count() AS c FROM {source_table}")
+}
+
 /// WS7 item D2: builds the exact same `SELECT`/`ORDER BY`/`LIMIT`/
 /// `OFFSET` batch query [`export_mart`]'s loop always built inline
 /// (unmasked — [`select_projection`]'s `DateTime`-cast-only behavior is
@@ -600,16 +630,35 @@ pub struct GoldExportResult {
 /// the first means earlier, already-masked/filtered batches were already
 /// appended to Iceberg (see [`export_batch_sql`]'s own doc comment on why
 /// this is re-checked per batch rather than assumed stable for the whole
-/// export).
+/// export); and [`GoldExportError::TenantGateRefused`] (`SEC-50`) is
+/// returned when the tenant gate refuses the export — before any row is
+/// read.
+///
+/// # Who the export acts as (`SEC-50` R4)
+///
+/// The `actor` says whose reach the gate measures the export against: a
+/// signed-in person as themselves, a job with no user (a service
+/// identity, the shared run token) as the tenant that owns the shared
+/// catalog. `routes::gold::gold_export_gate_actor` is the one place that
+/// decides.
+///
+/// `pub(crate)`, not `pub`: the actor type is `routes::query`'s
+/// `pub(crate)` `GateActor` (the plan's T1), and this function is called
+/// from inside this crate only -- the route and the copilot's tool.
 #[allow(
     clippy::too_many_arguments,
     reason = "WS7 item D2 added roles/placeholders/obligations to the existing six \
               ch/iceberg_config/source_table/mart_name/max_rows/batch_size parameters; \
-              grouping them into a struct would only move the same nine facts one \
-              level of indirection away from every call site, not reduce what a \
-              caller must supply"
+              SEC-50 added the state, which carries the gate's own answers \
+              (the deployment's tenants and CATALOG_TENANT_ID), and the actor, \
+              which says whose reach the gate measures the export against; grouping \
+              them into a struct would only move the same facts one level of \
+              indirection away from every call site, not reduce what a caller must \
+              supply"
 )]
-pub async fn export_mart(
+pub(crate) async fn export_mart(
+    state: &AppState,
+    actor: crate::routes::query::GateActor<'_>,
     ch: &ChClient,
     iceberg_config: &IcebergClientConfig,
     source_table: &str,
@@ -630,14 +679,34 @@ pub async fn export_mart(
     // knob" posture `Config::gold_export_batch_size` documents.
     let batch_size = batch_size.max(1);
 
+    // SEC-50: the export reads the SHARED catalog (`serving.*`, Silver,
+    // Gold), so the gate asks whose reach covers it: a signed-in person's
+    // own tenant, or the catalog's own tenant for a job with no user
+    // (R4, D3). The caller decides — `routes::gold::gold_export_gate_actor`
+    // is the one place that decides — and this gate is the SAME gate the
+    // route asks before the fingerprint, never a second copy of the reach
+    // logic (`AGENTS.md` rule 4).
+    //
+    // The gate runs BEFORE the first read of the mart — the row count
+    // below — so a deployment that holds several tenants and names no
+    // catalog tenant refuses the export before anything reaches
+    // `ClickHouse`.
+    let count_sql = mart_count_sql(source_table);
+    crate::routes::query::gate_statement(
+        state,
+        &count_sql,
+        &sqlparser::dialect::ClickHouseDialect {},
+        actor,
+    )
+    .await
+    .map_err(GoldExportError::TenantGateRefused)?;
+
     // Fix (1/3): the row cap is checked BEFORE any row data is read — a
     // mart already over the cap must never start streaming batches only
     // to be cut off midway (which would look, from the caller's
     // perspective, exactly like the silent truncation this cap exists to
     // prevent).
-    let count_result = ch
-        .query(&format!("SELECT count() AS c FROM {source_table}"), None)
-        .await?;
+    let count_result = ch.query(&count_sql, None).await?;
     let total_rows = match count_result.data.first() {
         Some(row) => cell_as_u64(row, "c")?,
         None => 0,
@@ -1004,6 +1073,93 @@ mod tests {
         assert!(message.contains("sales_by_region"));
         assert!(message.contains("5000000") || message.contains("5_000_000"));
         assert!(message.contains("GOLD_EXPORT_MAX_ROWS"));
+    }
+
+    /// The pool's own URL, for a state that reads it.
+    fn database_url_for(pool: &lakehouse_store::PgPool) -> String {
+        let options = pool.connect_options();
+        format!(
+            "postgres://{}:postgres@{}:{}/{}",
+            options.get_username(),
+            options.get_host(),
+            options.get_port(),
+            options
+                .get_database()
+                .expect("#[sqlx::test] always targets a named database"),
+        )
+    }
+
+    /// `SEC-50` S5: `export_mart`'s OWN gate.
+    ///
+    /// The HTTP route gates before the fingerprint, so every test through
+    /// the route proves the ROUTE's gate and never this one — and the
+    /// copilot's tool calls `export_mart` directly, so this gate is the
+    /// only one it passes. A deployment with several tenants (the four
+    /// the seeded identity migration creates) and no `CATALOG_TENANT_ID`
+    /// has no tenant whose reach covers the shared catalog, so the export
+    /// is refused with D6's sentence — before anything reaches the
+    /// engine.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_job_with_no_catalog_tenant_is_refused_before_the_engine_is_asked(
+        pool: lakehouse_store::PgPool,
+    ) -> sqlx::Result<()> {
+        // A BARE mock server: wiremock's pooled one can be handed to
+        // another test, and then this test's request log would carry that
+        // test's requests.
+        let engine = wiremock::MockServer::builder().start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"meta": [], "data": [], "rows": 0})),
+            )
+            .mount(&engine)
+            .await;
+
+        let mut env = std::collections::HashMap::new();
+        env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
+        env.insert("CH_URL".to_owned(), engine.uri());
+        // NO `CATALOG_TENANT_ID`: that is the deployment this refusal is
+        // about.
+        let state = AppState::new(
+            crate::config::Config::from_map(&env).expect("a valid config from a map"),
+        );
+        let obligations = crate::policy_engine::PolicyEngineObligations::from_state(&state);
+
+        let outcome = export_mart(
+            &state,
+            crate::routes::query::GateActor::CatalogTenant,
+            &state.clickhouse,
+            &iceberg_config(
+                "http://127.0.0.1:1".to_owned(),
+                "warehouse".to_owned(),
+                None,
+            ),
+            "serving.gold_smoke",
+            "gold_smoke",
+            1_000,
+            100,
+            &[],
+            &crate::sql_rewrite::PlaceholderValues::none(),
+            &obligations,
+        )
+        .await;
+
+        let Err(err) = outcome else {
+            panic!("a deployment that names no catalog tenant must refuse the export");
+        };
+        assert_eq!(
+            err.to_string(),
+            crate::routes::query::JOB_NEEDS_CATALOG_TENANT
+        );
+        let requests = engine
+            .received_requests()
+            .await
+            .expect("the mock engine records requests");
+        assert!(
+            requests.is_empty(),
+            "the refusal precedes the engine: nothing may be asked: {requests:?}"
+        );
+        Ok(())
     }
 }
 

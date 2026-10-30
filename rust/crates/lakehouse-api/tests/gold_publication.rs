@@ -81,12 +81,23 @@ async fn shared_clickhouse() -> &'static (String, testcontainers::ContainerAsync
         .await
 }
 
+/// The tenant that owns this deployment's shared catalog -- the tenant
+/// the deployment names in `CATALOG_TENANT_ID`.
+const CATALOG_TENANT: &str = "11111111-1111-4111-8111-000000000001";
+
 /// An app wired to the shared `ClickHouse`, plus a direct `ChClient` for
 /// seeding `serving.*` marts.
 async fn spin_up_with_clickhouse() -> (TestApp, ChClient) {
     let (ch_url, _container) = shared_clickhouse().await;
     let mut overrides = HashMap::new();
     overrides.insert("CH_URL".to_owned(), ch_url.clone());
+    // `SEC-50`: the export reads the SHARED catalog, so it is gated
+    // against the tenant that owns it -- the catalog's own tenant for a
+    // job with no user, and the caller's own tenant for a signed-in
+    // person (R4). A deployment that holds several tenants (the four the
+    // seeded identity migration creates) and names no catalog tenant
+    // refuses the export outright.
+    overrides.insert("CATALOG_TENANT_ID".to_owned(), CATALOG_TENANT.to_owned());
     let app = spin_up_with_env(&overrides).await;
     let ch = ChClient::new(ch_url.clone(), "default".to_owned(), String::new());
     (app, ch)
@@ -125,8 +136,21 @@ struct Sessions {
 
 impl Sessions {
     /// A cookie for a principal holding exactly `permissions`.
+    ///
+    /// `SEC-50` R4: a signed-in person is gated as THEMSELVES, so the
+    /// person who triggers a Gold export has to be a member of the tenant
+    /// that owns the shared catalog — the tenant this deployment names in
+    /// `CATALOG_TENANT_ID`. The membership is added here, where the
+    /// principal is minted, so every test in this file has the same
+    /// shape and no test has to remember it.
     async fn with(&self, permissions: &str) -> String {
         let user = create_principal_with_permissions(&self.app.pool, permissions).await;
+        sqlx::query("INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2)")
+            .bind(user)
+            .bind(uuid::Uuid::parse_str(CATALOG_TENANT).expect("a seeded tenant id"))
+            .execute(&self.app.pool)
+            .await
+            .expect("add the test principal to the catalog's own tenant");
         session_cookie_for_user(&self.app.pool, user).await
     }
 }

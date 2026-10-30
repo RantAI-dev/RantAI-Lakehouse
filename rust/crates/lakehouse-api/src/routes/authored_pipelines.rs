@@ -1334,12 +1334,57 @@ pub async fn set_target_lag(
 pub const NO_AUTHOR_REASON: &str =
     "this pipeline has no author to read as; an administrator must assign one";
 
+/// `SEC-50` R3: the refusal for a pipeline that belongs to no tenant.
+///
+/// Its own sentence, not the gate's: the gate's table sentence would
+/// blame a table for a pipeline that was never assigned a tenant, and it
+/// would say nothing about the one thing that can be fixed. A 409 is
+/// final for the orchestrator, so the operator is told the refusal is
+/// final and what to do about it.
+pub const NO_TENANT_REASON: &str = "This pipeline belongs to no tenant. An administrator assigns one with PUT /api/pipelines/{id}/tenant.";
+
 /// `POST /api/pipelines/runnable/{id}/enforce` body.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EnforceBody {
     /// The `SELECT` the op wants to run.
     sql: String,
+}
+
+/// `SEC-50` R2: a tenant-gate refusal on this route answers **422**, not
+/// 404.
+///
+/// The sentence is the gate's own — the same fixed sentence the gate
+/// would have answered, so nothing new is written here and nothing about
+/// another tenant's data is added — and the STATUS is the only thing that
+/// changes.
+///
+/// Why the status changes here and nowhere else: `SEC-20` answers 404 for
+/// a table a caller may not read because a 403 would confirm the table
+/// exists, and because Query Studio's *Run all* reads a 404 as "this
+/// table is missing" rather than "you may not read it". Neither reason
+/// applies to a route only the orchestrator calls: there is no person to
+/// confuse and no oracle to leak. What does apply is the orchestrator's
+/// own contract — it treats only 409 and 422 as final
+/// (`dagster/dispar_orchestrate/authored_factory.py`'s
+/// `_ENFORCE_REFUSAL_STATUSES`) and retries a 404 as a transient failure,
+/// which would show the operator a generic `HTTPError` for a refusal that
+/// no retry can repair.
+///
+/// An upstream failure keeps its own status: a database that cannot be
+/// read is not a refusal, it is an outage, and it must stay retryable.
+fn gate_refusal_as_unprocessable(err: ApiError) -> ApiError {
+    match err {
+        // The gate's own refusals, every one of them a fixed sentence
+        // written in this repository: a table out of reach, a tenant the
+        // author may not act as, a listing the actor may not list.
+        ApiError::NotFound(message) | ApiError::Unprocessable(message) => {
+            ApiError::Unprocessable(message)
+        }
+        // Everything else — an unreachable database, an unreadable count —
+        // travels as it is.
+        other => other,
+    }
 }
 
 /// `POST /api/pipelines/runnable/{id}/enforce` — rewrite `sql` as the
@@ -1365,6 +1410,26 @@ pub struct EnforceBody {
 /// pipeline was created. A user who loses a role loses it here too, on the
 /// next run.
 ///
+/// # Which tenant the statement acts as (`SEC-50`)
+///
+/// The pipeline's OWN tenant (`pipeline_definition.tenant_id`), not the
+/// caller's: the caller is the orchestrator, which has no tenant of its
+/// own. The tenant is applied exactly as if the author had sent it in an
+/// `X-Tenant` header, so an author who left that tenant is refused, and a
+/// pipeline with no tenant at all reaches nothing. A pipeline in tenant B
+/// may not read tenant A's uploaded table, which is the one path in this
+/// service that can name a `bronze.*` table.
+///
+/// `SEC-50` R1: an author who holds the unrestricted (`"*:*"`) grant
+/// passes this gate whatever the pipeline's own tenant is — including a
+/// pipeline with no tenant at all, and a tenant the author does not
+/// belong to. That is `SEC-20`'s own signed rule ("a principal holding
+/// `*:*` passes"), and it is safe here for the same reason it is safe in
+/// Query Studio: an unrestricted principal already reads every table
+/// there, so a pipeline running as that principal reaches no more than
+/// the principal itself reaches. The check is made before the tenant is
+/// looked at, in [`crate::routes::query::GateActor::AsTenant`]'s own arm.
+///
 /// # Who may call it
 ///
 /// The same rule as [`runnable`]: a service identity or a Platform Admin,
@@ -1375,9 +1440,15 @@ pub struct EnforceBody {
 /// # Errors
 ///
 /// 403 for anyone but a service identity or a Platform Admin; 404 for an
-/// unknown pipeline id (and for another tenant's, so the id space is not
-/// probeable across tenants); 409 with [`NO_AUTHOR_REASON`] when the
-/// pipeline has no author or its author is deactivated; 422 with
+/// unknown pipeline id (the route reads the pipeline by id alone, so it
+/// 404s only an id that does not exist); 409 with [`NO_AUTHOR_REASON`]
+/// when the pipeline has no author or its author is deactivated; 409 with
+/// [`NO_TENANT_REASON`] when the pipeline belongs to no tenant and its
+/// author is not unrestricted (`SEC-50` R3); 422 with the tenant gate's
+/// fixed sentence when the statement reads a table the pipeline's tenant
+/// may not read, and 422 when the author is not a member of that tenant
+/// (`SEC-50` R2 — the gate's sentence, with this route's status, see
+/// [`gate_refusal_as_unprocessable`]); 422 with
 /// [`crate::policy_engine::enforcement_error_message`] when the rewrite is
 /// refused; 400 for a malformed body; 503 if no pool is configured or
 /// Postgres is unreachable; 500 on any other database failure. No error
@@ -1449,6 +1520,20 @@ pub async fn enforce_pipeline_sql(
         other => upstream_error::internal_error(&upstream_error::STORE, &other),
     })?;
 
+    // SEC-50 R3: a pipeline that belongs to NO tenant is refused with its
+    // own sentence, BEFORE the gate. The gate's table sentence would
+    // blame a table for a pipeline that was never assigned a tenant, and
+    // it would say nothing about the one thing that can be fixed; a 409
+    // is final for the orchestrator, so the operator is told what to do.
+    //
+    // An author holding the unrestricted (`*:*`) grant is exempt (R1):
+    // such an author reads every table anyway, so a pipeline of that
+    // author is not refused for a tenant it never had. This is what
+    // keeps the G7 harness's bootstrap-admin pipelines runnable.
+    if pipeline.tenant_id.is_none() && !crate::routes::catalog::is_unrestricted(&author) {
+        return Err(ApiError::Conflict(NO_TENANT_REASON.to_owned()).into());
+    }
+
     // The placeholders are the AUTHOR's, exactly as Query Studio builds
     // them for a session principal (`routes::query::
     // rewrite_sql_for_principal_inner`): a row filter or a mask that names
@@ -1459,6 +1544,28 @@ pub async fn enforce_pipeline_sql(
         principal_tenant_ids: author.tenant_ids.iter().map(ToString::to_string).collect(),
     };
     let obligations_source = crate::policy_engine::PolicyEngineObligations::from_state(&state);
+    // SEC-50: the tenant gate runs BEFORE the policy rewrite, so a
+    // statement that reads a table the pipeline's own tenant may not
+    // read is refused before the policy's own prefetch asks the engine
+    // about that table, and before the statement reaches the engine at
+    // all. The pipeline acts as its OWN tenant (`pipeline_definition
+    // .tenant_id`), applied as if the author had sent it in `X-Tenant`:
+    // the caller is the orchestrator, which has no tenant of its own.
+    //
+    // R2: a refusal here answers 422, not 404 — see
+    // `gate_refusal_as_unprocessable` for why this route's status
+    // differs from Query Studio's.
+    crate::routes::query::gate_statement(
+        &state,
+        &sql,
+        &sqlparser::dialect::ClickHouseDialect {},
+        crate::routes::query::GateActor::AsTenant {
+            principal: &author,
+            tenant_id: pipeline.tenant_id,
+        },
+    )
+    .await
+    .map_err(gate_refusal_as_unprocessable)?;
     let rewritten = crate::policy_engine::rewrite_sql_for_roles(
         &sql,
         &sqlparser::dialect::ClickHouseDialect {},

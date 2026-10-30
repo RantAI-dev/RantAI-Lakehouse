@@ -22,12 +22,36 @@
 //! access by sending a different header value, only ask to see a tenant it
 //! is already a member of, or be refused.
 
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, HeaderValue};
 use lakehouse_auth::Principal;
 use lakehouse_core::ApiError;
 use uuid::Uuid;
 
 const X_TENANT_HEADER: &str = "x-tenant";
+
+/// The one refusal every tenant answer that is not "yes" gets.
+fn not_found() -> ApiError {
+    ApiError::NotFound("tenant not found".to_owned())
+}
+
+/// The request headers a site acts as `tenant_id` with — the same
+/// `X-Tenant` header a caller sends, built here so that a site which
+/// acts as a tenant it was given (an authored pipeline acting as its
+/// own tenant, `SEC-50`) is resolved by the SAME rule as a caller that
+/// sent the header, never by a second one (`AGENTS.md` rule 4).
+///
+/// # Errors
+///
+/// [`ApiError::NotFound`] when the tenant id cannot be written as a
+/// header value. It always can — a `Uuid` is ASCII — so this never
+/// fires; the same fixed 404 as every other tenant refusal keeps it
+/// harmless if it ever does.
+pub(crate) fn headers_for_tenant(tenant_id: Uuid) -> Result<HeaderMap, ApiError> {
+    let mut headers = HeaderMap::new();
+    let value = HeaderValue::from_str(&tenant_id.to_string()).map_err(|_err| not_found())?;
+    headers.insert(X_TENANT_HEADER, value);
+    Ok(headers)
+}
 
 /// Resolve the active tenant for this request.
 ///
@@ -49,7 +73,6 @@ const X_TENANT_HEADER: &str = "x-tenant";
 /// the distinction itself becomes an oracle for "well-formed UUIDs that
 /// exist" versus "well-formed UUIDs that don't."
 pub fn resolve(principal: &Principal, headers: &HeaderMap) -> Result<Option<Uuid>, ApiError> {
-    let not_found = || ApiError::NotFound("tenant not found".to_owned());
     match headers.get(X_TENANT_HEADER) {
         Some(value) => {
             let raw = value.to_str().map_err(|_err| not_found())?;
@@ -72,6 +95,7 @@ mod tests {
     use lakehouse_auth::{PermissionSet, Principal, PrincipalId};
     use uuid::Uuid;
 
+    use super::headers_for_tenant;
     use super::resolve;
 
     const TENANT_A: Uuid = Uuid::from_u128(1);
@@ -132,6 +156,24 @@ mod tests {
     fn a_malformed_x_tenant_header_is_not_found_not_a_parse_500() {
         let principal = principal_with_tenants(&[TENANT_A]);
         let headers = headers_with_x_tenant_raw("not-a-uuid");
+        assert_eq!(resolve(&principal, &headers).unwrap_err().status(), 404);
+    }
+
+    /// `SEC-50`: the headers a site acts as a tenant with resolve the
+    /// same way a caller's own header does.
+    #[test]
+    fn the_headers_of_a_named_tenant_resolve_as_that_tenant() {
+        let principal = principal_with_tenants(&[TENANT_A, TENANT_B]);
+        let headers = headers_for_tenant(TENANT_B).expect("a UUID is a valid header value");
+        assert_eq!(resolve(&principal, &headers).unwrap(), Some(TENANT_B));
+    }
+
+    /// The same refusal as a caller's own header: a tenant the
+    /// principal does not belong to is a 404, never a 403.
+    #[test]
+    fn the_headers_of_a_tenant_the_principal_left_are_refused() {
+        let principal = principal_with_tenants(&[TENANT_A]);
+        let headers = headers_for_tenant(TENANT_B).expect("a UUID is a valid header value");
         assert_eq!(resolve(&principal, &headers).unwrap_err().status(), 404);
     }
 }

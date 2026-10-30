@@ -1191,6 +1191,28 @@ fn spawn_run_log_cleanup(state: &AppState) {
     });
 }
 
+/// The boot warning's text: what a deployment without `CATALOG_TENANT_ID`
+/// gives up, and what to set.
+///
+/// A constant, not a literal in the call, so the test can read the words
+/// an operator reads (`SEC-50` D7).
+///
+/// `SEC-50` review round 1, SHOULD-FIX 7: the warning names only what is
+/// GATED TODAY — the shared catalog and the `Dagster`-job list (`SEC-20`),
+/// the authored pipelines and the Gold export (`SEC-50`'s first slice).
+/// The dashboards, the embeds, the public links and the alerts read the
+/// same shared catalog, but they are NOT gated until `SEC-50`'s next
+/// slice, and a warning that says they are refused would be a warning
+/// about something the deployment still serves.
+const CATALOG_TENANT_UNCONFIGURED_WARNING: &str = "CATALOG_TENANT_ID is not set: on a deployment with more than one tenant, \
+     the shared catalog and the Dagster-job half of GET /api/pipelines are \
+     refused for every principal without the unrestricted grant, and so are \
+     the authored pipelines and the Gold export, which read that same shared \
+     catalog. The dashboards, the embeds, the public links and the alerts read \
+     it too and are gated in SEC-50's next slice. Set it to the id of the \
+     tenant that owns this deployment's shared catalog to restore access for \
+     that tenant's members (docs/OPERATIONS.md).";
+
 /// Log ONCE at boot when this deployment refuses the shared catalog and
 /// `Dagster`-job list to tenant-scoped callers because nobody has said who
 /// owns them.
@@ -1202,15 +1224,20 @@ fn spawn_run_log_cleanup(state: &AppState) {
 /// which may not be reachable yet at this point in startup, and the route
 /// itself already treats a single-tenant deployment as never refused. So
 /// this says what is configured, never what will happen to a given request.
+///
+/// `SEC-50` D7: the boot warning names every path that reads the
+/// shared catalog and needs the setting, so an operator reads what the
+/// setting is for and not only that it is missing.
+///
+/// `SEC-50` review round 1, SHOULD-FIX 7: it names the paths that are
+/// GATED TODAY — the shared catalog and the `Dagster`-job list
+/// (`SEC-20`), the authored pipelines and the Gold export (`SEC-50`'s
+/// first slice) — and says that the dashboards, the embeds, the public
+/// links and the alerts follow in the next slice. Those four are NOT
+/// gated yet, so the warning must not say they are refused.
 fn warn_if_catalog_tenant_unconfigured(config: &config::Config) {
     if config.catalog_tenant_id.is_none() {
-        tracing::warn!(
-            "CATALOG_TENANT_ID is not set: on a deployment with more than one tenant, \
-             the shared catalog and the Dagster-job half of GET /api/pipelines are \
-             refused for every principal without the unrestricted grant. Set it to the \
-             id of the tenant that owns this deployment's shared catalog to restore \
-             access for that tenant's members (docs/OPERATIONS.md)."
-        );
+        tracing::warn!("{CATALOG_TENANT_UNCONFIGURED_WARNING}");
     }
 }
 
@@ -1223,6 +1250,60 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+
+    /// `SEC-50` D7: the boot warning names every path that IS gated
+    /// today, so an operator reads what the setting is for and not only
+    /// that it is missing.
+    ///
+    /// `SEC-50` review round 1, SHOULD-FIX 7: only the gated paths are
+    /// named as refused. The dashboards, the embeds, the public links and
+    /// the alerts are gated in the next slice, not now.
+    #[test]
+    fn the_boot_warning_names_every_path_that_is_gated_today() {
+        for path in [
+            "shared catalog",
+            "Dagster-job",
+            "authored pipelines",
+            "Gold export",
+        ] {
+            assert!(
+                CATALOG_TENANT_UNCONFIGURED_WARNING.contains(path),
+                "the boot warning must name {path:?}: {CATALOG_TENANT_UNCONFIGURED_WARNING}"
+            );
+        }
+    }
+
+    /// The paths that are NOT gated yet are named as following later, so
+    /// the warning never claims the deployment refuses something it still
+    /// serves.
+    #[test]
+    fn the_boot_warning_says_the_paths_that_are_not_gated_yet_follow_later() {
+        for path in ["dashboards", "embeds", "public links", "alerts"] {
+            assert!(
+                CATALOG_TENANT_UNCONFIGURED_WARNING.contains(path),
+                "the boot warning must name {path:?}: {CATALOG_TENANT_UNCONFIGURED_WARNING}"
+            );
+        }
+        assert!(
+            CATALOG_TENANT_UNCONFIGURED_WARNING.contains("SEC-50's next slice"),
+            "the boot warning must say the paths that follow are gated later: \
+             {CATALOG_TENANT_UNCONFIGURED_WARNING}"
+        );
+    }
+
+    /// The warning is about a deployment that has NOT said who owns the
+    /// shared catalog, and it says what to set.
+    #[test]
+    fn the_boot_warning_names_the_setting_and_what_to_set_it_to() {
+        assert!(
+            CATALOG_TENANT_UNCONFIGURED_WARNING.contains("CATALOG_TENANT_ID"),
+            "{CATALOG_TENANT_UNCONFIGURED_WARNING}"
+        );
+        assert!(
+            CATALOG_TENANT_UNCONFIGURED_WARNING.contains("docs/OPERATIONS.md"),
+            "{CATALOG_TENANT_UNCONFIGURED_WARNING}"
+        );
+    }
 
     /// `OPS-4` decision 2: with no pool the body names the database as
     /// unavailable, so an operator reads "up but degraded" instead of a

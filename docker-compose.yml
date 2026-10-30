@@ -2668,6 +2668,15 @@ services:
       CH_OAUTH_SERVER_URI: http://oidc-mock:8090/token
       BLD1_NO_AUTHOR_PIPELINE_ID: ${BLD1_NO_AUTHOR_PIPELINE_ID:-}
       BLD1_NO_AUTHOR_FIXTURE: ${BLD1_NO_AUTHOR_FIXTURE:-}
+      # SEC-50 (PR #281 review round 2 B1): the shared Bronze table this
+      # gate's pipelines read is gated as the tenant that owns the shared
+      # catalog, so the harness has to know WHICH tenant that is -- it
+      # picks an author of that tenant and scopes their pipeline to it.
+      # The same value the API service reads (`lakehouse-api`'s own block
+      # above), passed through from the operator's `.env` the same way
+      # `BRONZE_TABLE_NAME` is. Empty default: a deployment that names no
+      # catalog tenant keeps the behaviour it had before the gate.
+      CATALOG_TENANT_ID: ${CATALOG_TENANT_ID:-}
       PYTHONDONTWRITEBYTECODE: "1"
     entrypoint: ["/bin/sh", "-c"]
     command:

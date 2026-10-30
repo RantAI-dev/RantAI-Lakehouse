@@ -315,16 +315,33 @@ fn actor_kind_of(principal_kind: Option<&str>) -> &'static str {
 }
 
 /// Same narrowing for `outcome`: `audit_event.outcome` has eight values,
-/// the TS `AuditOutcome` union has three (`"success" | "denied" |
-/// "error"`). `needs_confirmation`/`needs_approval` are in-flight, not yet
-/// allowed, so they map to `"denied"` rather than `"success"` — a viewer
-/// scanning for problems should not read a still-pending gate as clean.
+/// the TS `AuditOutcome` union has four (`"success" | "denied" | "error" |
+/// "pending"`). `needs_confirmation`/`needs_approval` are in-flight: the
+/// decision is still open, so they map to `"pending"` and not to
+/// `"denied"` — the policy refused nothing — and not to `"success"`,
+/// because a viewer scanning for problems must not read a still-pending
+/// gate as clean (`GOV-5`).
 fn outcome_of(outcome: &str) -> &'static str {
     match outcome {
         "allowed" | "executed" | "approved" => "success",
         "failed" => "error",
-        // "refused" | "rejected" | "needs_confirmation" | "needs_approval"
+        // A decision still waiting on a person: open, not refused.
+        "needs_confirmation" | "needs_approval" => "pending",
+        // "refused" | "rejected"
         _ => "denied",
+    }
+}
+
+/// The policy decision a row reports beside its outcome. A row whose
+/// decision is still open reports `"pending"` too: the policy allowed
+/// nothing and denied nothing, so neither `"allow"` nor `"deny"` would be
+/// true (`GOV-5`). A success row stays `"allow"`, everything else stays
+/// `"deny"`.
+fn policy_decision_of(outcome: &str) -> &'static str {
+    match outcome_of(outcome) {
+        "success" => "allow",
+        "pending" => "pending",
+        _ => "deny",
     }
 }
 
@@ -393,7 +410,7 @@ async fn audit(dagster: &DgClient, pg: Option<&PgPool>) -> Result<Value, GovErro
                 "action": e.action,
                 "resource": resource,
                 "outcome": outcome_of(&e.outcome),
-                "policyDecision": if outcome_of(&e.outcome) == "success" { "allow" } else { "deny" },
+                "policyDecision": policy_decision_of(&e.outcome),
                 "obligations": [],
                 "approvalId": e.approval_id,
                 "source": "copilot",
@@ -2219,18 +2236,34 @@ mod tests {
     }
 
     #[test]
-    fn outcome_of_treats_pending_gates_as_denied_not_success() {
+    fn outcome_of_reports_a_gate_still_waiting_as_pending() {
         assert_eq!(outcome_of("allowed"), "success");
         assert_eq!(outcome_of("executed"), "success");
         assert_eq!(outcome_of("approved"), "success");
         assert_eq!(outcome_of("failed"), "error");
         assert_eq!(outcome_of("refused"), "denied");
         assert_eq!(outcome_of("rejected"), "denied");
-        // The regression this test guards: a still-pending gate decision
-        // must never read as "success" just because it isn't a hard
-        // refusal yet.
-        assert_eq!(outcome_of("needs_confirmation"), "denied");
-        assert_eq!(outcome_of("needs_approval"), "denied");
+        // The regression this test guards: a gate decision that is still
+        // waiting reads "pending" — never "denied", because the policy
+        // refused nothing, and never "success", because nobody has
+        // decided yet.
+        assert_eq!(outcome_of("needs_confirmation"), "pending");
+        assert_eq!(outcome_of("needs_approval"), "pending");
+    }
+
+    /// `GOV-5`: a row whose decision is still open reports `"pending"` as
+    /// its policy decision as well — it allowed nothing and denied
+    /// nothing.
+    #[test]
+    fn policy_decision_of_reports_pending_for_a_gate_still_waiting() {
+        assert_eq!(policy_decision_of("allowed"), "allow");
+        assert_eq!(policy_decision_of("executed"), "allow");
+        assert_eq!(policy_decision_of("approved"), "allow");
+        assert_eq!(policy_decision_of("needs_confirmation"), "pending");
+        assert_eq!(policy_decision_of("needs_approval"), "pending");
+        assert_eq!(policy_decision_of("refused"), "deny");
+        assert_eq!(policy_decision_of("rejected"), "deny");
+        assert_eq!(policy_decision_of("failed"), "deny");
     }
 
     /// The merge sort in [`audit`] compares `at` strings lexicographically;
