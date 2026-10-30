@@ -1855,3 +1855,33 @@ prefix, the probe `debug` line, and the `?tab=capture` wait.
 No open `BLOCKER`. Slice 4 is closed. Next: slice 5 (MongoDB, session
 lakehouse-35) merges in hunk by hunk and adds MongoDB's setup check on this
 mechanism; then slice 6 (Oracle).
+
+### Slice 5, review round 3 (planner, 2026-10-30, head `2ab325ff`; code at `334b07ee`): Amendment 8 closed
+
+Checked by the planner: CI run `41031878318` on `334b07ee`, 37 of 37 jobs.
+
+T5.9:
+- The merge commit `c57a890d` lists its hand-resolved files.
+- The counts were recounted from the migrations: 27 types, 22 supported.
+- `cdc_setup_probe` takes `Dial::Cdc` only, so a MongoDB connector reaches no
+  SQL check.
+
+T5.10, read in full against `lakehouse-e1`'s three conditions:
+- `MongoSetupFacts` is closed. An unknown key, a value outside the set or a
+  free-text value does not parse.
+- On a list, a preview or a failure the facts are a 400.
+- `mongo_checks` uses fixed sentences, and an absent fact is `unchecked`.
+- The grant command is quoted with `serde_json`.
+- The poll route fills `setupChecks` only for a finished test of a
+  `Dial::CdcMongo`.
+- The orchestrator keeps no server text and drops a fact whose command raised.
+
+Accepted deviations:
+- `primary` is a JSON boolean.
+- The edit page shows no setup checks, as before.
+- The gate's wrong-replicaSet connector may be answered 503 as well as 422.
+  This is accepted because the assertion still needs "did not start" and what
+  is under test is the check, not the status code.
+
+No open `BLOCKER`. Left: T5.11 merges the newer phase head (slice 6), then
+the merge into the phase branch.
