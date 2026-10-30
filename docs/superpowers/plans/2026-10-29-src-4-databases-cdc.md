@@ -937,7 +937,7 @@ comes from the message key).
 `48046107`: 42 of 42 checks pass, including `Rust · clippy`, `Rust · test (stable)`, `Rust · G4
 MongoDB change capture into Bronze` (7m23s; gate table row `MongoDB CDC | g4-mongo | pass | pass |
 pass | pass`), `g4-cdc`, `g4-mysql`, `g4-mssql`, and Security 5 of 5 (run `41018974408`). Earlier
-runs failed as listed under Fixes: clippy on `3ff...` run `41003057111`, then the gate three times
+runs failed as listed under Fixes: clippy on `87d930fc`, run `41003057111`, then the gate three times
 (runs on `b643b534`, `b9ff282a`, `49fa9d8e`).
 
 *Not verified:* the migration and the Rust code on a machine of mine; any TLS mode against a real
