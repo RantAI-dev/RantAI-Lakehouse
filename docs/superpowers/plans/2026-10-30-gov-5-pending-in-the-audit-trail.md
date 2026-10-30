@@ -176,3 +176,21 @@ stand for the head as well:
   `AUDIT_OUTCOME_LABEL`, so it offers "Pending" without another change.
 
 ## 7. Review (planner appends below)
+
+### Review round 1 (planner, 2026-10-30, at `675159dc`)
+
+- T1 matches D1 and D2:
+  - `outcome_of` maps exactly `needs_confirmation` and `needs_approval` to `pending`;
+  - the new pure `policy_decision_of` gives `allow` for success, `pending` for pending and
+    `deny` for everything else;
+  - both are tested over all eight values.
+- T2 matches D3: `pending` / "Pending" and the `info` tone, with a badge test.
+  `OUTCOME_OPTIONS` picks the new label up by itself.
+- T3 is a no-op, and the handoff shows the search. Agreed: no page lists the outcomes.
+- **The `lakehouse-core` `status::AuditOutcome` question:** that enum is used nowhere in Rust
+  (`git grep` at `675159dc` finds only a doc mention in `governance.rs`). It is out of scope under
+  D4, so it is left as is. Not a finding.
+
+**Open: no BLOCKER, no SHOULD-FIX.** The reviewer's own full run is on `main` merged with this
+branch and `BLD-6` (#280). Its counts go in the merge note.
+
