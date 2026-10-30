@@ -141,8 +141,14 @@ pub enum GoldExportError {
     /// anything. The gate's own error travels as it is, so the caller
     /// sees the status the gate would have answered — a fixed sentence,
     /// never an upstream text (`AGENTS.md` rule 4).
+    ///
+    /// No `#[from]`: a `From<ApiError>` on this variant would turn every
+    /// future `?` on an `ApiError` anywhere in this file into "tenant
+    /// gate refused" — a refusal the caller would read as the gate's own
+    /// sentence when it is something else entirely. The one gate call
+    /// wraps its error explicitly (`PR #281` review round 1, NIT).
     #[error("{0}")]
-    TenantGateRefused(#[from] ApiError),
+    TenantGateRefused(ApiError),
 }
 
 /// One column's resolved Iceberg + Arrow shape, plus enough to parse a
@@ -692,7 +698,8 @@ pub(crate) async fn export_mart(
         &sqlparser::dialect::ClickHouseDialect {},
         actor,
     )
-    .await?;
+    .await
+    .map_err(GoldExportError::TenantGateRefused)?;
 
     // Fix (1/3): the row cap is checked BEFORE any row data is read — a
     // mart already over the cap must never start streaming batches only
