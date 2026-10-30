@@ -69,6 +69,40 @@ export function toCsv(
 }
 
 /**
+ * One field of a tab-separated line.
+ *
+ * The same SEC-17 formula guard as the comma one, in the same place, so a
+ * file that leaves the browser cannot carry a formula to the spreadsheet that
+ * opens it. The quoting follows RFC 4180 with the tab as the separator: a
+ * field is quoted when it holds a tab, a carriage return, a line feed or a
+ * double quote, and the double quote inside it is doubled.
+ */
+function escapeTsvCell(raw: string): string {
+  const value = neutralizeFormula(raw)
+  if (!/[\t\r\n"]/.test(value)) return value
+  return `"${value.replace(/"/g, '""')}"`
+}
+
+/**
+ * The tab-separated twin of `toCsv`: the header row first, the rows in the
+ * order they came in, CRLF line ends, and a null or undefined cell written
+ * as an empty cell rather than as the words "null".
+ *
+ * It lives beside `toCsv` so the formula guard stays in one place: a second
+ * copy of that rule is a second chance to get it wrong.
+ */
+export function toTsv(
+  columns: string[],
+  rows: Record<string, string | null | undefined>[]
+): string {
+  const header = columns.map(escapeTsvCell).join("\t")
+  const body = rows.map((row) =>
+    columns.map((c) => escapeTsvCell(row[c] ?? "")).join("\t")
+  )
+  return [header, ...body].join("\r\n")
+}
+
+/**
  * Memicu unduhan file di browser.
  *
  * Object URL sengaja dicabut setelah dipakai; tanpa itu blob-nya bertahan

@@ -55,6 +55,10 @@ mod filters {
         self, TestApp, create_principal_with_permissions, session_cookie_for_user,
     };
 
+    /// What a query string the route cannot read is told — the route's own
+    /// sentence, byte for byte.
+    const QUERY_UNREADABLE: &str = "The query string could not be read.";
+
     /// One recorded run for the pass-through test, written the way `run`
     /// writes them — the caller is the owner, the status is whatever the run
     /// reached.
@@ -112,8 +116,13 @@ mod filters {
             .await
             .unwrap();
         let status = response.status();
-        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
-        let body: Value = serde_json::from_slice(&body).unwrap();
+        let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        // A refusal the route itself builds is JSON; a refusal the extractor
+        // builds is not (it is plain text), so the body is kept as text when
+        // it is not JSON — otherwise the test could not say what the caller
+        // was actually sent.
+        let body: Value = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()));
         (status, body)
     }
 
@@ -151,6 +160,27 @@ mod filters {
                 "{query}: the response carries a library error: {rendered}"
             );
         }
+    }
+
+    /// A query string the extractor itself cannot read — a parameter sent
+    /// twice — is refused with this route's own fixed sentence, never with
+    /// serde's rendering of what went wrong. The repeated parameter is
+    /// refused, not merged: the second value is not silently dropped.
+    #[tokio::test]
+    async fn a_repeated_query_parameter_is_a_400_with_the_fixed_sentence() {
+        let app = common::spin_up().await;
+        let user = create_principal_with_permissions(&app.pool, "query:read").await;
+        let cookie = session_cookie_for_user(&app.pool, user).await;
+
+        let (status, body) = get_history(&app, &cookie, "status=completed&status=failed").await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], QUERY_UNREADABLE, "{body}");
+        let rendered = body.to_string();
+        assert!(
+            !rendered.contains("duplicate field") && !rendered.contains("serde"),
+            "the response carries a library error: {rendered}"
+        );
     }
 
     /// The parsed filters reach the rows: the endpoint answers the page's
@@ -404,6 +434,36 @@ mod recording {
             .fetch_one(pool)
             .await
             .expect("read the run history")
+    }
+
+    /// The ids the history holds, oldest first.
+    async fn recorded_ids(pool: &PgPool) -> Vec<String> {
+        sqlx::query_scalar("SELECT id FROM query_history ORDER BY at, id")
+            .fetch_all(pool)
+            .await
+            .expect("read the recorded run ids")
+    }
+
+    /// The shape a recorded run's id carries: `q-<epoch_ms>-<32 lowercase
+    /// hex>`.
+    ///
+    /// The rule is written out again here on purpose: the shape is the
+    /// contract the download route and the parity harness rely on, so the
+    /// test states it in full instead of asking the route's own helper
+    /// whether the route's own helper is right.
+    fn is_the_new_id_shape(id: &str) -> bool {
+        let Some(rest) = id.strip_prefix("q-") else {
+            return false;
+        };
+        let Some((epoch, suffix)) = rest.rsplit_once('-') else {
+            return false;
+        };
+        !epoch.is_empty()
+            && epoch.bytes().all(|b| b.is_ascii_digit())
+            && suffix.len() == 32
+            && suffix
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
     }
 
     /// The one row the caller's run recorded: its status, its message, and the
@@ -742,6 +802,38 @@ mod recording {
             vec!["bronze.group_orders".to_owned()],
             "{tables_read:?}"
         );
+    }
+
+    /// Two runs are both recorded, and their ids cannot collide.
+    ///
+    /// The store inserts the history row with `ON CONFLICT (id) DO NOTHING`,
+    /// so two runs whose ids are the same lose one of their rows: a run
+    /// that answered is then nowhere in the history. The id carries the
+    /// epoch milliseconds *and* a uuid, so two runs in the same
+    /// millisecond still get two ids and two rows.
+    #[tokio::test]
+    async fn two_runs_are_both_recorded_and_their_ids_cannot_collide() {
+        let ch = MockServer::start().await;
+        mount_engine(&ch).await;
+        let TestApp { router, pool } = spin_up_with_clickhouse(&ch.uri()).await;
+        let cookie = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+
+        let (status, body) = post_sql(&router, &cookie, "SELECT 1").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = post_sql(&router, &cookie, "SELECT 2").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        assert_eq!(
+            history_rows(&pool).await,
+            2,
+            "both runs are recorded: neither row is dropped"
+        );
+        let ids = recorded_ids(&pool).await;
+        assert_eq!(ids.len(), 2, "{ids:?}");
+        assert_ne!(ids[0], ids[1], "two runs never share an id: {ids:?}");
+        for id in &ids {
+            assert!(is_the_new_id_shape(id), "the id's shape: {id}");
+        }
     }
 
     #[tokio::test]

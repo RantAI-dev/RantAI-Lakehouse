@@ -136,7 +136,14 @@ export type QueryResult = {
   engine: QueryEngine | string
   /** How many rows the query produced, which `rows` may only be part of (`total_rows`). */
   rowCount: number
-  /** True when `rows` was cut to `rowLimit` (2,000, `MAX_RESULT_ROWS`) before being sent. */
+  /**
+   * Which limit cut the result: `"rows"` for the Query Studio row limit
+   * (64,000 by default), `"bytes"` for the server-side 10 MB cap. The key is
+   * absent when nothing was cut — the server sends no `cutBy` at all then,
+   * so an absent field and a `null` never have to be told apart.
+   */
+  cutBy?: "rows" | "bytes"
+  /** True when the result was cut, by either limit. */
   truncated: boolean
   rowLimit: number
   metrics: {
@@ -213,6 +220,27 @@ export type SqlProposal = { sql: string; reason: string }
  */
 export type SqlFixOutcome = SqlProposal | { answer: string }
 
+/**
+ * The file kinds a Query Studio download can be.
+ */
+export type QueryDownloadFormat = "csv" | "tsv" | "xlsx" | "parquet"
+
+/**
+ * What a finished download holds.
+ */
+export type QueryDownload = {
+  /** The file the server sent. */
+  blob: Blob
+  /** The name the server gave it (from `Content-Disposition`). */
+  fileName: string
+  /** The rows the file holds; null when the server does not say (the engine-written file). */
+  rows: number | null
+  /** Whether a limit cut the file short. */
+  cut: boolean
+  /** Which limit cut it; null when the file was not cut. */
+  cutBy: "rows" | "bytes" | null
+}
+
 export interface QueryService {
   listSaved(signal?: AbortSignal): Promise<SavedQuery[]>
   saveQuery(input: SaveQueryInput, signal?: AbortSignal): Promise<SavedQuery>
@@ -235,6 +263,18 @@ export interface QueryService {
    * the call answers 404 until then; Stop aborts the request either way.
    */
   cancel(runId: string, signal?: AbortSignal): Promise<{ stopped: number }>
+  /**
+   * Downloads the result of a run as a file (`GET /api/query/run/{id}/download`).
+   * The server re-runs the stored statement with the caller's current masks
+   * and row filters; `runId` names the run, so Stop reaches the download's
+   * query on the engine.
+   */
+  download(
+    id: string,
+    format: QueryDownloadFormat,
+    runId: string,
+    signal?: AbortSignal
+  ): Promise<QueryDownload>
   /** Asks the chat's engine; masking, row filters and `query:read` apply to the SQL it runs. */
   askQuestion(question: string, signal?: AbortSignal): Promise<NlAnswer>
   generateSql(question: string, signal?: AbortSignal): Promise<{ sql: string; explanation: string }>
