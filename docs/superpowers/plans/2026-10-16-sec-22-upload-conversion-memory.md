@@ -962,3 +962,43 @@ numbers.
 then SHOULD-FIX 1 to 6. Each cites "PR #187 review round 2 B<n>/S<n>" at
 the site. Then the full verification block and a short round 2 handoff
 under section 7: commits, commands with counts, and any changed numbers.
+
+### Review round 3 (planner, 2026-10-30, at `bf8d2721`)
+
+The review covers the round 2 fixes `b522ec80..a93c3663`, the handoff
+`a10ac755`, and the merge of `main` `bf8d2721` (it brings in PR #192's
+`crypto_provider::install_default_provider()`).
+
+**Closed:**
+- BLOCKER 1: a store error while the child is fed answers 503, and a
+  chunked completion keeps the file. Checked in the source, and by
+  `a_store_failure_while_a_chunked_upload_is_completed_keeps_the_file`,
+  which asserts the 503, that the object and the row are still there, and
+  that a retry answers 200.
+- BLOCKER 2: a failed `setrlimit` ends the child with `LIMIT_FAILED`, and
+  the API answers 500.
+- SHOULD-FIX 1 to 6.
+- The merge: `main()` checks `upload_convert::run_child_if_asked` first,
+  before the crypto provider is installed and before the runtime starts.
+  So the child runs no TLS setup and no runtime.
+
+**The re-measurement** (handoff): every peak moved by less than 1 MiB
+(801.4 MiB and 163.1 MiB). `SEC-22-RESULT.md` and the limits stand.
+
+**Reviewer verification at `bf8d2721`.** I ran it myself, from the
+shared target:
+- `cargo fmt --check`: ok
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`:
+  exit 0
+- `cargo test --locked --workspace --no-fail-fast -j 1`: exit 0, 159
+  binaries, 8,468 passed, 0 failed, 51 ignored
+- `cargo deny check`: advisories, bans, licenses and sources ok
+- `docker compose --profile '*' config --quiet` (with dummy values): ok
+- `git status`: clean
+
+**Nit (not a finding):** `refusal_wins_over_store` (`upload_convert.rs:2112`)
+returns the store error when the feed failed, so the store wins, not the
+refusal. Its behaviour is right but its name says the opposite. Rename it
+when that file is next touched.
+
+**Open: no BLOCKER.** Ready to merge once CI is green.
