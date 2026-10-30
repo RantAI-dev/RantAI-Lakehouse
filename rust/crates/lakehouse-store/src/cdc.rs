@@ -21,7 +21,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::ingest_spec::{CdcDial, CdcSslMode, SqlDriver};
+use crate::ingest_spec::{CdcDial, CdcMongoDial, CdcSslMode, SqlDriver};
 
 /// One column of a source table, as a future schema-discovery step would
 /// report it — `type_name` is whatever string the source system names the
@@ -191,6 +191,32 @@ pub enum CdcSpecError {
     /// characters.
     #[error("the schema-history broker is not a host:port list of plain characters")]
     InvalidSchemaHistoryBroker,
+
+    /// A `MongoDB` dial whose `hosts` are not `host:port` of plain characters
+    /// (`Dial::parse` checks them; a hand-built dial is refused here the same
+    /// way). The seeds are written into the connection string, so a `/`, `?` or
+    /// `,` inside one would change what the worker dials.
+    #[error(
+        "a MongoDB change-capture connector's hosts are not host:port entries of plain characters"
+    )]
+    InvalidMongoHosts,
+
+    /// A `MongoDB` replica-set name outside letters, digits, `_`, `-` and `.`.
+    #[error("a MongoDB replica set name is 1 to 128 letters, digits, '_', '-' and '.'")]
+    InvalidReplicaSet,
+
+    /// A `MongoDB` database name outside letters, digits, `_` and `-`.
+    #[error("a MongoDB database name is 1 to 63 letters, digits, '_' and '-'")]
+    InvalidMongoDatabase,
+
+    /// A `MongoDB` collection that is not one plain name. `collection.include.list`
+    /// is a list of regular expressions and the collection becomes part of a topic
+    /// name, so a dot or a metacharacter would change what is captured.
+    #[error("source collection {name:?} is not a plain name of letters, digits, '_' and '-'")]
+    InvalidCollectionName {
+        /// The rejected name, as given (a collection name is not a credential).
+        name: String,
+    },
 }
 
 /// A connector identifier constrained to `^[a-z0-9][a-z0-9_]{0,62}$` —
@@ -307,6 +333,14 @@ pub const MYSQL_CONNECTOR_CLASS: &str = "io.debezium.connector.mysql.MySqlConnec
 
 /// `Debezium`'s `SQL Server` connector class (`SRC-4` slice 3).
 pub const SQLSERVER_CONNECTOR_CLASS: &str = "io.debezium.connector.sqlserver.SqlServerConnector";
+
+/// `Debezium`'s `MongoDB` connector class (`SRC-4` slice 5).
+pub const MONGODB_CONNECTOR_CLASS: &str = "io.debezium.connector.mongodb.MongoDbConnector";
+
+/// `Debezium`'s unwrap transform for `MongoDB` documents. The relational
+/// `ExtractNewRecordState` does not understand a `MongoDB` change event.
+const MONGODB_UNWRAP_CLASS: &str =
+    "io.debezium.connector.mongodb.transforms.ExtractNewDocumentState";
 
 /// The Kafka topic a `MySQL` or `SQL Server` connector keeps its schema history
 /// in (`SRC-4` decision S3-b/S3-d). `Debezium` creates it with unlimited
@@ -641,6 +675,146 @@ fn schema_history_entries(
             schema_history_topic(connector_id)?,
         ),
     ])
+}
+
+/// Whether `name` is one plain `MongoDB` name (a database or a collection) as
+/// `collection.include.list` and a topic name take it.
+fn is_plain_mongo_name(name: &str, max: usize) -> bool {
+    (1..=max).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+}
+
+/// Render the `Kafka Connect` connector configuration for a `MongoDB`
+/// change-capture connector (`SRC-4` slice 5, decisions S5-b and S5-c).
+///
+/// `collections` are the source objects' names: one plain collection name each,
+/// of the dial's database (discovery lists them that way, as the batch `MongoDB`
+/// adapter reads them). The connector captures `<database>.<collection>` for
+/// each, and `Debezium` writes the topic `cdc.<id>.<database>.<collection>`.
+///
+/// The keys: the `MongoDB` connector class; `mongodb.connection.string` built
+/// from the dial's hosts and replica set and **no credential**; `mongodb.user`
+/// and `mongodb.password`, the password as the config-provider reference of
+/// [`connect_password_reference`], never a value; `mongodb.authsource` is the
+/// dial's database; `capture.mode=change_streams_update_full`, so an update
+/// carries the whole document, which the current-row mode needs; the JSON
+/// converters without schemas; `snapshot.mode=initial`; and `MongoDB`'s own
+/// `ExtractNewDocumentState` with `delete.tombstone.handling.mode=rewrite` and
+/// `add.fields=op,source.ts_ms` (the keys the relational unwrap takes in
+/// [`render_connect_config`], on the class that unwraps documents). These
+/// shared keys are written out here, not drawn from that function, so the
+/// relational renderer stays as slice 3 left it.
+///
+/// `directConnection=true` is set for a one-host dial and not otherwise: the
+/// driver refuses it together with several seeds. Then the worker discovers
+/// the other members of the replica set from the server and dials the addresses
+/// the replica set advertises, which no check of ours has seen ("Limits" of the
+/// feature page says so).
+///
+/// TLS: `disable` sets `mongodb.ssl.enabled=false`. The other three set it
+/// `true`; `require` also sets `mongodb.ssl.invalid.hostname.allowed=true`, so
+/// the host name need not match; `verify-ca` and `verify-full` set it `false`.
+/// The certificate chain is checked against the worker's trust store in every
+/// TLS mode: `Debezium` has no setting that takes a `MongoDB` certificate "as
+/// presented", so `require` is weaker than `verify-full` by the host name only.
+/// This renderer sets no root certificate.
+///
+/// # Errors
+///
+/// [`CdcSpecError::InvalidConnectorId`], [`CdcSpecError::InvalidSecretsDir`],
+/// [`CdcSpecError::NoTables`], [`CdcSpecError::InvalidCollectionName`],
+/// [`CdcSpecError::InvalidMongoHosts`], [`CdcSpecError::InvalidReplicaSet`],
+/// [`CdcSpecError::InvalidMongoDatabase`], or
+/// [`CdcSpecError::ControlCharacterInField`] for a user holding a control
+/// character.
+pub fn render_mongodb_connect_config(
+    connector_id: &str,
+    dial: &CdcMongoDial,
+    collections: &[&str],
+    secrets_dir: &str,
+) -> Result<BTreeMap<String, String>, CdcSpecError> {
+    let password = connect_password_reference(connector_id, secrets_dir)?;
+    if collections.is_empty() {
+        return Err(CdcSpecError::NoTables);
+    }
+    reject_control_characters("user", &dial.user)?;
+    if !is_plain_mongo_name(&dial.database, 63) {
+        return Err(CdcSpecError::InvalidMongoDatabase);
+    }
+    if dial.hosts.is_empty() || !is_bootstrap_list(&dial.hosts.join(",")) {
+        return Err(CdcSpecError::InvalidMongoHosts);
+    }
+    let replica_set_ok = (1..=128).contains(&dial.replica_set.len())
+        && dial
+            .replica_set
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'));
+    if !replica_set_ok {
+        return Err(CdcSpecError::InvalidReplicaSet);
+    }
+    let mut include: Vec<String> = Vec::new();
+    for name in collections {
+        if !is_plain_mongo_name(name, 120) {
+            return Err(CdcSpecError::InvalidCollectionName {
+                name: (*name).to_owned(),
+            });
+        }
+        include.push(format!("{}.{name}", dial.database));
+    }
+
+    let mut connection_string = format!(
+        "mongodb://{}/?replicaSet={}",
+        dial.hosts.join(","),
+        dial.replica_set
+    );
+    if dial.hosts.len() == 1 {
+        connection_string.push_str("&directConnection=true");
+    }
+    let (ssl_enabled, hostname_allowed) = match dial.ssl_mode {
+        CdcSslMode::Disable => ("false", None),
+        CdcSslMode::Require => ("true", Some("true")),
+        CdcSslMode::VerifyCa | CdcSslMode::VerifyFull => ("true", Some("false")),
+    };
+
+    let mut entries: Vec<(&str, String)> = vec![
+        ("connector.class", MONGODB_CONNECTOR_CLASS.to_owned()),
+        ("tasks.max", "1".to_owned()),
+        ("mongodb.connection.string", connection_string),
+        ("mongodb.user", dial.user.clone()),
+        ("mongodb.password", password),
+        ("mongodb.authsource", dial.database.clone()),
+        ("mongodb.ssl.enabled", ssl_enabled.to_owned()),
+        ("topic.prefix", format!("cdc.{connector_id}")),
+        ("collection.include.list", include.join(",")),
+        ("capture.mode", "change_streams_update_full".to_owned()),
+        ("snapshot.mode", "initial".to_owned()),
+        (
+            "key.converter",
+            "org.apache.kafka.connect.json.JsonConverter".to_owned(),
+        ),
+        ("key.converter.schemas.enable", "false".to_owned()),
+        (
+            "value.converter",
+            "org.apache.kafka.connect.json.JsonConverter".to_owned(),
+        ),
+        ("value.converter.schemas.enable", "false".to_owned()),
+        ("transforms", "unwrap".to_owned()),
+        ("transforms.unwrap.type", MONGODB_UNWRAP_CLASS.to_owned()),
+        (
+            "transforms.unwrap.delete.tombstone.handling.mode",
+            "rewrite".to_owned(),
+        ),
+        ("transforms.unwrap.add.fields", "op,source.ts_ms".to_owned()),
+    ];
+    if let Some(allowed) = hostname_allowed {
+        entries.push(("mongodb.ssl.invalid.hostname.allowed", allowed.to_owned()));
+    }
+    Ok(entries
+        .into_iter()
+        .map(|(key, value)| (key.to_owned(), value))
+        .collect())
 }
 
 #[cfg(test)]
@@ -1095,5 +1269,194 @@ mod tests {
     fn connector_slug_rejects_leading_underscore_and_hyphen() {
         assert!(ConnectorSlug::new("_orders").is_err());
         assert!(ConnectorSlug::new("-orders").is_err());
+    }
+
+    fn mongo_dial(hosts: &[&str], ssl_mode: &str) -> CdcMongoDial {
+        serde_json::from_value(serde_json::json!({
+            "driver": "mongodb", "hosts": hosts, "database": "shop",
+            "user": "app_reader", "replicaSet": "rs0", "sslMode": ssl_mode
+        }))
+        .unwrap()
+    }
+
+    fn render_mongo(
+        hosts: &[&str],
+        ssl_mode: &str,
+        collections: &[&str],
+    ) -> BTreeMap<String, String> {
+        render_mongodb_connect_config(
+            "conn-m1",
+            &mongo_dial(hosts, ssl_mode),
+            collections,
+            CDC_SECRETS_DIR,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn mongodb_config_has_exactly_the_keys_slice_five_decided() {
+        let config = render_mongo(&["mongo-a.internal:27017"], "require", &["orders", "items"]);
+        let expected: BTreeMap<String, String> = [
+            ("connector.class", MONGODB_CONNECTOR_CLASS),
+            ("tasks.max", "1"),
+            (
+                "mongodb.connection.string",
+                "mongodb://mongo-a.internal:27017/?replicaSet=rs0&directConnection=true",
+            ),
+            ("mongodb.user", "app_reader"),
+            ("mongodb.password", "${dir:/run/cdc-secrets:conn-m1}"),
+            ("mongodb.authsource", "shop"),
+            ("mongodb.ssl.enabled", "true"),
+            ("mongodb.ssl.invalid.hostname.allowed", "true"),
+            ("topic.prefix", "cdc.conn-m1"),
+            ("collection.include.list", "shop.orders,shop.items"),
+            ("capture.mode", "change_streams_update_full"),
+            ("snapshot.mode", "initial"),
+            (
+                "key.converter",
+                "org.apache.kafka.connect.json.JsonConverter",
+            ),
+            ("key.converter.schemas.enable", "false"),
+            (
+                "value.converter",
+                "org.apache.kafka.connect.json.JsonConverter",
+            ),
+            ("value.converter.schemas.enable", "false"),
+            ("transforms", "unwrap"),
+            (
+                "transforms.unwrap.type",
+                "io.debezium.connector.mongodb.transforms.ExtractNewDocumentState",
+            ),
+            (
+                "transforms.unwrap.delete.tombstone.handling.mode",
+                "rewrite",
+            ),
+            ("transforms.unwrap.add.fields", "op,source.ts_ms"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect();
+        assert_eq!(config, expected);
+        // Amendment 3's lesson holds for the other class: the ignored keys are not written.
+        assert!(!config.contains_key("transforms.unwrap.delete.handling.mode"));
+        assert!(!config.contains_key("transforms.unwrap.drop.tombstones"));
+        // No SQL-only key leaks in.
+        assert!(!config.contains_key("database.hostname"));
+        assert!(!config.contains_key("decimal.handling.mode"));
+    }
+
+    #[test]
+    fn mongodb_config_holds_no_password_value_and_no_credential_in_the_connection_string() {
+        let config = render_mongo(
+            &["mongo-a.internal:27017", "mongo-b.internal:27017"],
+            "verify-full",
+            &["orders"],
+        );
+        assert_eq!(
+            config["mongodb.connection.string"],
+            "mongodb://mongo-a.internal:27017,mongo-b.internal:27017/?replicaSet=rs0"
+        );
+        assert!(!config["mongodb.connection.string"].contains('@'));
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains("${dir:/run/cdc-secrets:conn-m1}"));
+        // The only place the password appears is the reference; nothing else carries a secret.
+        assert_eq!(json.matches("conn-m1}").count(), 1);
+    }
+
+    #[test]
+    fn mongodb_config_sets_direct_connection_for_one_host_only() {
+        let one = render_mongo(&["mongo-a.internal:27017"], "require", &["orders"]);
+        assert!(one["mongodb.connection.string"].ends_with("&directConnection=true"));
+        let two = render_mongo(
+            &["mongo-a.internal:27017", "mongo-b.internal:27017"],
+            "require",
+            &["orders"],
+        );
+        assert!(!two["mongodb.connection.string"].contains("directConnection"));
+    }
+
+    #[test]
+    fn mongodb_config_maps_each_ssl_mode() {
+        let setting = |mode: &str| {
+            let config = render_mongo(&["mongo-a.internal:27017"], mode, &["orders"]);
+            (
+                config["mongodb.ssl.enabled"].clone(),
+                config.get("mongodb.ssl.invalid.hostname.allowed").cloned(),
+            )
+        };
+        assert_eq!(setting("disable"), ("false".to_owned(), None));
+        assert_eq!(
+            setting("require"),
+            ("true".to_owned(), Some("true".to_owned()))
+        );
+        assert_eq!(
+            setting("verify-ca"),
+            ("true".to_owned(), Some("false".to_owned()))
+        );
+        assert_eq!(
+            setting("verify-full"),
+            ("true".to_owned(), Some("false".to_owned()))
+        );
+    }
+
+    #[test]
+    fn mongodb_config_refuses_what_could_change_what_is_captured_or_dialed() {
+        let dial = mongo_dial(&["mongo-a.internal:27017"], "require");
+        let render = |dial: &CdcMongoDial, collections: &[&str]| {
+            render_mongodb_connect_config("conn-m1", dial, collections, CDC_SECRETS_DIR)
+        };
+        // A collection is one plain name: not `database.collection`, not a regex, not a list.
+        for name in ["shop.orders", "or ders", "a,b", ".x", "a*", "", "a$b"] {
+            assert!(
+                matches!(
+                    render(&dial, &[name]),
+                    Err(CdcSpecError::InvalidCollectionName { .. })
+                ),
+                "{name:?}"
+            );
+        }
+        assert_eq!(render(&dial, &[]), Err(CdcSpecError::NoTables));
+        // Hosts, replica set and database written into the connection string.
+        for hosts in [
+            vec!["mongo-a.internal"],
+            vec!["mongo-a.internal:27017/admin"],
+            vec!["mongo-a.internal:27017?x=y"],
+            vec!["u:p@mongo-a.internal:27017"],
+            vec![],
+        ] {
+            let mut bad = dial.clone();
+            bad.hosts = hosts.iter().map(|h| (*h).to_owned()).collect();
+            assert_eq!(
+                render(&bad, &["orders"]),
+                Err(CdcSpecError::InvalidMongoHosts)
+            );
+        }
+        let mut bad = dial.clone();
+        bad.replica_set = "rs0&authSource=admin".to_owned();
+        assert_eq!(
+            render(&bad, &["orders"]),
+            Err(CdcSpecError::InvalidReplicaSet)
+        );
+        let mut bad = dial.clone();
+        bad.database = "shop,admin".to_owned();
+        assert_eq!(
+            render(&bad, &["orders"]),
+            Err(CdcSpecError::InvalidMongoDatabase)
+        );
+        let mut bad = dial.clone();
+        bad.user = "a\nb".to_owned();
+        assert!(matches!(
+            render(&bad, &["orders"]),
+            Err(CdcSpecError::ControlCharacterInField { field: "user" })
+        ));
+        for id in ["", "../x", "a:b", "-a", "a/b"] {
+            assert!(
+                matches!(
+                    render_mongodb_connect_config(id, &dial, &["orders"], CDC_SECRETS_DIR),
+                    Err(CdcSpecError::InvalidConnectorId { .. })
+                ),
+                "{id}"
+            );
+        }
     }
 }

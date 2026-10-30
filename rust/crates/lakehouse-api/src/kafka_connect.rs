@@ -16,7 +16,7 @@
 //!
 //! Only a connector class in [`ALLOWED_CONNECTOR_CLASSES`] is ever sent: the
 //! class is data the registry row decides, and `Kafka Connect` will load any
-//! plugin class on its path. `PostgreSQL`, `MySQL` and `SQL Server` now; the other
+//! plugin class on its path. `PostgreSQL`, `MySQL`, `SQL Server` and `MongoDB` now; the other
 //! `Debezium` classes are added by the slice that builds each source.
 //!
 //! # Upstream text never reaches a response
@@ -40,17 +40,19 @@ use std::time::Duration;
 
 use lakehouse_core::ApiError;
 use lakehouse_store::cdc::{
-    MYSQL_CONNECTOR_CLASS, POSTGRES_CONNECTOR_CLASS, SQLSERVER_CONNECTOR_CLASS,
+    MONGODB_CONNECTOR_CLASS, MYSQL_CONNECTOR_CLASS, POSTGRES_CONNECTOR_CLASS,
+    SQLSERVER_CONNECTOR_CLASS,
 };
 use serde_json::Value;
 
 use crate::config::Config;
 
 /// The `connector.class` values this build may start. See the module docs.
-pub const ALLOWED_CONNECTOR_CLASSES: [&str; 3] = [
+pub const ALLOWED_CONNECTOR_CLASSES: [&str; 4] = [
     POSTGRES_CONNECTOR_CLASS,
     MYSQL_CONNECTOR_CLASS,
     SQLSERVER_CONNECTOR_CLASS,
+    MONGODB_CONNECTOR_CLASS,
 ];
 
 /// What a change-capture connector answers while `KAFKA_CONNECT_URL` is unset.
@@ -408,6 +410,23 @@ mod tests {
             .put_config("lakehouse-a", &config(POSTGRES_CONNECTOR_CLASS))
             .await
             .unwrap();
+    }
+
+    /// `SRC-4` slice 5: `MongoDB`'s class is allowed, and the list is exactly the four
+    /// classes this build starts (a fifth needs its slice and this test).
+    #[test]
+    fn the_allowlist_is_the_four_classes_this_build_starts() {
+        let mut classes = ALLOWED_CONNECTOR_CLASSES.to_vec();
+        classes.sort_unstable();
+        assert_eq!(
+            classes,
+            [
+                "io.debezium.connector.mongodb.MongoDbConnector",
+                "io.debezium.connector.mysql.MySqlConnector",
+                "io.debezium.connector.postgresql.PostgresConnector",
+                "io.debezium.connector.sqlserver.SqlServerConnector",
+            ]
+        );
     }
 
     #[tokio::test]

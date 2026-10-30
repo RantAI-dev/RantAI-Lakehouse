@@ -24,7 +24,9 @@
 //! as a fixed sentence.
 
 use lakehouse_core::ApiError;
-use lakehouse_store::cdc::{connect_connector_name, render_connect_config};
+use lakehouse_store::cdc::{
+    connect_connector_name, render_connect_config, render_mongodb_connect_config,
+};
 use lakehouse_store::connectors;
 use lakehouse_store::ingest_spec::Dial;
 use lakehouse_store::schema_change;
@@ -104,27 +106,34 @@ pub async fn provision(state: &AppState, id: &str) -> Result<Provisioned, ApiErr
     if tables.is_empty() {
         return Ok(Provisioned::NothingToCapture);
     }
-    let dial =
+    let parsed =
         Dial::parse("cdc", &info.dial).map_err(|err| ApiError::Unprocessable(err.to_string()))?;
-    let Some(dial) = dial.as_cdc() else {
-        return Ok(Provisioned::NothingToCapture);
-    };
     let table_refs: Vec<&str> = tables.iter().map(String::as_str).collect();
-    // `MySQL` and `SQL Server` keep their schema history in a Kafka topic and
-    // cannot start without the broker's address: unset is the same fail-closed
-    // answer as an unset `KAFKA_CONNECT_URL` (`SRC-4` decision S3-b).
-    let bootstrap = state.config.cdc_kafka_bootstrap.as_deref();
-    if bootstrap.is_none() && dial.driver != lakehouse_store::ingest_spec::SqlDriver::Postgres {
-        return Ok(Provisioned::NotConfigured);
-    }
-    let config = render_connect_config(
-        id,
-        dial,
-        &table_refs,
-        &state.config.cdc_secrets_dir,
-        bootstrap,
-    )
-    .map_err(|err| ApiError::Unprocessable(err.to_string()))?;
+    let config = if let Some(mongo) = parsed.as_cdc_mongo() {
+        // `SRC-4` slice 5: a `MongoDB` connector keeps no schema history (a document
+        // has no schema to remember), so it needs no broker address of its own.
+        render_mongodb_connect_config(id, mongo, &table_refs, &state.config.cdc_secrets_dir)
+            .map_err(|err| ApiError::Unprocessable(err.to_string()))?
+    } else {
+        let Some(dial) = parsed.as_cdc() else {
+            return Ok(Provisioned::NothingToCapture);
+        };
+        // `MySQL` and `SQL Server` keep their schema history in a Kafka topic and
+        // cannot start without the broker's address: unset is the same fail-closed
+        // answer as an unset `KAFKA_CONNECT_URL` (`SRC-4` decision S3-b).
+        let bootstrap = state.config.cdc_kafka_bootstrap.as_deref();
+        if bootstrap.is_none() && dial.driver != lakehouse_store::ingest_spec::SqlDriver::Postgres {
+            return Ok(Provisioned::NotConfigured);
+        }
+        render_connect_config(
+            id,
+            dial,
+            &table_refs,
+            &state.config.cdc_secrets_dir,
+            bootstrap,
+        )
+        .map_err(|err| ApiError::Unprocessable(err.to_string()))?
+    };
     let name =
         connect_connector_name(id).map_err(|err| ApiError::Unprocessable(err.to_string()))?;
 
