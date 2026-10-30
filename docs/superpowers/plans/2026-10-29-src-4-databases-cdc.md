@@ -714,6 +714,68 @@ slice 2 entry above is closed. `SHOULD-FIX 2`: `replication_metrics.py` (two pla
 says an upgraded deployment keeps the Lakekeeper `debezium` principal and grant, revocable by
 hand. Other checks on that run are in the PR; only the G4 conclusion was read by me.
 
+### Slice 3, MySQL and SQL Server (developer, Sonnet, 2026-10-30)
+
+**Commits** (branch `feat/data-phase-4-src-4`, after `3ed4f1f0`): T3.1 `cb2af122`; T3.2 `75e387a9`
+(fix `b750d116`: rustfmt and the split of `render_connect_config`); T3.3 `9af53a17`; T3.4 `3e0bd675`;
+T3.5 `3aa06f77`; T3.6 `59d3683f`; T3.7 `2b4bb807`; T3.8 `c5991139`; T3.9 `7ba1a19a`; gate fixes
+`a95919d7`, `13e066fb`, `0f64da9d`, `09684d9d`, `8cfd0a91`. `e4bf8dac` merges `origin/main`: the PR was
+`CONFLICTING` (one generated line of `docs/core/BACKLOG.md`; main's line taken whole), and a PR in
+that state gets no CI at all.
+
+**CI on `8cfd0a91`** (run 40999921257): all 41 checks `pass`, including `Rust · test (stable)`
+(37m36s), `Rust · clippy` (3m02s), `Rust · fmt`, `Dagster · unit tests`, `Repo lints`, and the
+three change-capture gates, whose summary tables I read in their job logs:
+
+| Gate | Job | Time | Table row | Freshness, insert/update/delete, current and history (s) |
+|---|---|---|---|---|
+| `g4-cdc` (PostgreSQL) | 123887153465 | 9m08s | `g4 pass pass pass pass` | 40, 45 / 32, 32 / 36, 37 |
+| `g4-mysql` | 123887153622 | 7m23s | `g4-mysql pass pass pass pass` | 17, 21 / 34, 34 / 29, 29 |
+| `g4-mssql` | 123887153528 | 6m47s | `g4-mssql pass pass pass pass` | 17, 21 / 25, 30 / 27, 31 |
+
+All three are inside D5's 120 s. Each new gate: first copy 20,000 + 20,000 rows; pause, 20,000 changes
+per table, resume, Bronze equal to the source (MySQL 49 s, SQL Server 39 s); `kafka-connect`
+restarted during a stream of changes, equal again; a schema change observed; `DELETE` removes the
+connector and its password file. The jobs are inside the 20-minute target (7 to 9 minutes of gate;
+the images job's 13 minutes is the stack's, as for the other gates).
+
+**Findings.**
+
+- *Amendment 5 stop-and-report items.* (1) Debezium 3.8 refused no key: the MySQL keys and the SQL
+  Server keys (including `database.encrypt` and `database.trustServerCertificate`) were accepted and
+  both connectors ran. (2) The schema-history topic is created with `retention.ms` =
+  `9223372036854775807` (`Long.MAX_VALUE`, Debezium's own "forever") and `retention.bytes` = -1, read
+  from the broker. The first version of the check wanted -1 for both and failed on that; the check
+  now accepts -1 or `Long.MAX_VALUE` and fails on any value that expires. This is the planner's
+  call to confirm: the invariant (the topic never expires) holds, the spelling differs from the
+  plan's "-1". (3) SQL Server: with the login of the plan (`SELECT` on the tables and on `cdc`,
+  `VIEW DATABASE STATE`) the snapshot and the streaming worked and the gate passed, but the worker
+  logs `WARN ... Exception caught while calling sys.sp_cdc_help_jobs: SQLServerException: Caller is
+  not authorized to initiate the requested action. DBO privileges are required`
+  (`SqlServerConnection.getCdcCapturePollingInterval`, called from the
+  `SqlServerStreamingChangeEventSource` constructor). Debezium catches it and goes on; Microsoft's
+  documentation says `sys.sp_cdc_help_jobs` "requires membership in the db_owner fixed database role".
+  No more than the listed grants was needed for the gate; no `db_owner` was granted. What the warning
+  costs (the polling interval Debezium assumes) was not measured. (4) Discovery lists both sources'
+  tables (`discover` passes for both types).
+- *Beyond the plan.* The PR was `CONFLICTING` with `main` for a while and ran no CI; the merge is above.
+  A migration number: 0117 was free on every remote branch when committed.
+  `ops/lint/check_connector_gate_coverage.py` now replays `WHERE unsupported_reason = '...'` (it tracks
+  each row's reason), with a test; the plan named the shape, not the lint change.
+- *Test changed, not weakened* (rule 2): `ingest_spec::target_identity_tests::a_cdc_dial_is_re_pointed_by_driver_host_port_or_database_only`
+  built a MySQL dial that S3-a now refuses; it is rewritten with a valid dial per driver and asserts
+  the same thing (identity = driver, host, port, database).
+
+**Not verified locally** (no cargo, docker, or pytest on this VM): every Rust change, the Dagster unit
+test for `topic_of`, and the three gates were verified only by the CI run above. Locally: `rustfmt
+--check`, parse and import checks, `bun test src/features/connectors src/lib/connectors` (469 pass),
+`tsc --noEmit`, `bun run lint` (0 errors), `ops/lint` (24) and `ops/gates` (29) unit tests,
+`ops/g4/test_cdc_gate.py` (6), `scripts/ci/tests/test_required_gate.sh` (56).
+
+**Open for the reviewer.** Whether Long.MAX_VALUE is accepted as "unlimited" (above); whether the
+`sp_cdc_help_jobs` warning is acceptable or `db_owner` / a documented alternative is wanted; the TS
+`CdcDial` contract still has no `sslMode` (the dial form does not offer it; not in the plan).
+
 ## Review
 
 (The planner writes findings here, tagged `BLOCKER` or `SHOULD-FIX`.)
