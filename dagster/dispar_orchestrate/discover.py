@@ -570,9 +570,10 @@ def _cdc_mongo(dial: dict, secrets: dict, request: DiscoverRequest, b: Backends)
 
     The change-capture dial (`hosts`, `user`, `replicaSet`, `sslMode`) is turned into the batch
     adapter's (`hosts`, `username`, `directConnection`), so the read dials exactly as a batch load
-    does: the same hostname check, `resolve_checked`, `checking_resolver`. Only the FIRST host is
-    dialled, directly: the batch adapter refuses replica-set discovery, which would reach hosts
-    nothing here has checked. A listing or a test therefore needs the first host to answer.
+    does: the same hostname check, `resolve_checked`, `checking_resolver`. The dial holds exactly one
+    host (`SRC-4` slice 5 review BLOCKER 1) and it is dialled directly: the batch adapter refuses
+    replica-set discovery, which would reach hosts nothing here has checked. `[:1]` is a second
+    guard for a stored dial that predates the rule.
 
     The preview names `_id` as the key, so the wizard fills it in (every document has one)."""
     adapted = {

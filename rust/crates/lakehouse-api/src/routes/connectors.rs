@@ -3101,16 +3101,19 @@ async fn check_dial_ssrf(
         | Dial::Sftp(_)
         | Dial::Saas(_) => None,
     };
-    // `SRC-4` S5-b: Kafka Connect dials every seed the connection string names, so every
-    // entry of `hosts` is checked, not only the first. (`Dial::parse` has already refused
-    // an entry that is not `host:port` with a numeric port, so `filter_map` drops nothing.)
+    // `SRC-4` S5-b: every entry of `hosts` is checked (`Dial::parse` allows exactly one, review
+    // BLOCKER 1). `Dial::parse` has already refused an entry that is not `host:port` with a
+    // numeric port, but a check that skips what it cannot read fails open (review
+    // SHOULD-FIX 2), so such a seed is refused here with a fixed sentence.
     if let Dial::CdcMongo(mongo) = dial {
         for seed in &mongo.hosts {
             let Some((host, port)) = seed
                 .rsplit_once(':')
                 .and_then(|(host, port)| Some((host, port.parse::<u16>().ok()?)))
             else {
-                continue;
+                return Err(ApiError::BadRequest(
+                    "a MongoDB change-capture host must be written host:port".to_owned(),
+                ));
             };
             connector_probe::resolve_checked(host, port, internal_hosts)
                 .await

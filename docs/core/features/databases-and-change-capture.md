@@ -128,18 +128,18 @@ What `MongoDB CDC` needs and what it does not do. Proven by the `g4-mongo` gate 
   the connector cannot start against one. The replica set's name is a required field of the connector
   ("the name in the server's replica set configuration"): there is no default.
 - **Sharded clusters are out of scope.** The connector is not built or tested against a sharded cluster.
-- **Atlas and `mongodb+srv` are not offered.** The connector takes explicit `host:port` seeds and no connection
-  string, as the batch `MongoDB` connector does.
+- **Atlas and `mongodb+srv` are not offered.** The connector takes one explicit `host:port` and no connection
+  string, as the batch `MongoDB` connector takes explicit seeds.
 - **The user.** The connector dials as a user with the built-in `read` role on the one database, nothing more.
   The gate proves that role is enough: the connector captures only that database (`capture.scope=database`);
   Debezium's default scope, the whole deployment, would need the right to read every database. `root` is not
   needed. Debezium's documentation names the `hello` command, which any user may run.
-- **`directConnection`.** For a connector with one host the connection string carries `directConnection=true`
-  (the gate runs this shape). With several hosts the driver refuses that option, so the worker finds the other
-  members of the replica set from the server and dials the addresses the replica set advertises. Only the hosts
-  written in the connector are checked against the installation's address rules when it is saved; the
-  addresses a replica set advertises are not. The connection test and the list of collections dial the first
-  host only.
+- **One host.** The connector takes exactly one `host:port`, which must be a member of the replica set that
+  change streams can be read from, and the connection string always carries `directConnection=true`, so the
+  worker dials only that host and never the member addresses a replica set reports (the API checks only the
+  written host against the installation's address rules). A dial with another number of hosts is refused. The
+  connection test and the list of collections dial the same host. What happens when that host stops being
+  primary is *not verified*: the gate does not stop it.
 - **TLS.** `disable`, `require`, `verify-ca` and `verify-full` are all rendered and unit-tested; the gate runs
   `disable` (its fixture has no certificate). Debezium has no way to take a MongoDB certificate "as
   presented": in every TLS mode the chain is checked against the worker's trust store, so the source's CA must

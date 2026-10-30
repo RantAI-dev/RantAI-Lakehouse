@@ -8,7 +8,7 @@ import type { CdcMongoDial } from "@/services/contracts/connectors"
 /**
  * `dial` for a MongoDB change-capture connector (`SRC-4` slice 5, decision S5-i): the `cdc` adapter
  * with `driver: "mongodb"`. It is its own form beside `CdcDialForm` because the dial has another
- * shape: a list of `host:port` seeds instead of one host and port, and a required replica set name
+ * shape: one `host:port` instead of a host and a port, and a required replica set name
  * instead of a slot, a publication or a server id.
  *
  * Nothing is pre-filled with an invented value: the replica set starts empty (change streams need a
@@ -35,45 +35,22 @@ export function CdcMongoDialForm({
   function set<K extends keyof CdcMongoDial>(key: K, v: CdcMongoDial[K]) {
     onChange({ ...dial, [key]: v })
   }
-  function setHost(index: number, host: string) {
-    set(
-      "hosts",
-      dial.hosts.map((h, i) => (i === index ? host : h))
-    )
-  }
+  // One host (`SRC-4` slice 5 review BLOCKER 1): the API refuses any other count. The contract keeps
+  // `hosts` a list so the shape can grow with a bounded check later; this form edits its first entry.
   return (
     <div className="grid gap-3">
-      <div className="space-y-2">
-        <p className="text-sm font-medium">Replica set hosts (host:port)</p>
-        {dial.hosts.map((host, index) => (
-          <div key={index} className="flex items-center gap-2">
-            <Input
-              id={`cdc-mongo-dial-host-${index}`}
-              aria-label={`Host ${index + 1}`}
-              value={host}
-              onChange={(e) => setHost(index, e.target.value)}
-              placeholder="mongo-0.internal.example.com:27017"
-              autoComplete="off"
-            />
-            {dial.hosts.length > 1 ? (
-              <button
-                type="button"
-                className="text-xs text-muted-foreground underline"
-                onClick={() =>
-                  set(
-                    "hosts",
-                    dial.hosts.filter((_, i) => i !== index)
-                  )
-                }
-              >
-                Remove
-              </button>
-            ) : null}
-          </div>
-        ))}
-        <button type="button" className="text-xs text-primary underline" onClick={() => set("hosts", [...dial.hosts, ""])}>
-          Add host
-        </button>
+      <div className="space-y-1.5">
+        <Label htmlFor="cdc-mongo-dial-host">Host (host:port)</Label>
+        <Input
+          id="cdc-mongo-dial-host"
+          value={dial.hosts[0] ?? ""}
+          onChange={(e) => set("hosts", [e.target.value])}
+          placeholder="mongo-0.internal.example.com:27017"
+          autoComplete="off"
+        />
+        <p className="text-xs text-muted-foreground">
+          One member of the replica set that change streams can be read from.
+        </p>
       </div>
       <div className="space-y-1.5">
         <Label htmlFor="cdc-mongo-dial-replica-set">Replica set name</Label>

@@ -1219,6 +1219,15 @@ fn validate_cdc_dial_post_parse(adapter: &str, dial: &CdcDial) -> Result<(), Ing
     Ok(())
 }
 
+/// The fixed refusal of a `MongoDB` change-capture dial with other than one host
+/// (`SRC-4` slice 5 review BLOCKER 1); the renderer refuses the same.
+pub const CDC_MONGO_ONE_HOST: &str =
+    "hosts must hold exactly one host:port: a MongoDB change-capture connector takes one host";
+
+/// The fixed refusal of a bad `replicaSet` (`SRC-4` slice 5 review SHOULD-FIX 1: one sentence,
+/// single spaces, tested by its exact text).
+pub const CDC_MONGO_REPLICA_SET: &str = "replicaSet must be 1 to 128 letters, digits, underscores, hyphens or dots: the name in the server's replica set configuration";
+
 /// The rule for a `MongoDB` change-capture dial's fields that serde cannot
 /// check (`SRC-4` decision S5-a). Every refusal is one fixed sentence naming
 /// the field, never a value. `database` and `replicaSet` are written into the
@@ -1238,8 +1247,12 @@ fn validate_cdc_mongo_dial_post_parse(
         adapter: adapter.to_owned(),
         source: serde::de::Error::custom(message),
     };
-    if dial.hosts.is_empty() {
-        return Err(refuse("hosts needs at least one host:port"));
+    // `SRC-4` slice 5 review BLOCKER 1 (S5-b): exactly one host. With several seeds the worker
+    // dials the member addresses the replica set reports, which nothing checks against the
+    // installation's address rules (not fail closed, AGENTS.md principle 3). The contract keeps
+    // `hosts` as a list so the shape can grow with a bounded check later.
+    if dial.hosts.len() != 1 {
+        return Err(refuse(CDC_MONGO_ONE_HOST));
     }
     for host_port in &dial.hosts {
         let (host, port) = split_host_port(adapter, "hosts", host_port)?;
@@ -1260,9 +1273,7 @@ fn validate_cdc_mongo_dial_post_parse(
         ));
     }
     if !plain(&dial.replica_set, b"_-.", 128) {
-        return Err(refuse(
-            "replicaSet must be 1 to 128 letters, digits, underscores, hyphens or dots:              the name in the server's replica set configuration",
-        ));
+        return Err(refuse(CDC_MONGO_REPLICA_SET));
     }
     if dial.user.is_empty() {
         return Err(refuse("user must not be empty"));
@@ -3578,13 +3589,13 @@ mod target_identity_tests {
     fn cdc_mongo() -> Value {
         json!({
             "driver": "mongodb",
-            "hosts": ["mongo-a.internal:27017", "mongo-b.internal:27017"],
+            "hosts": ["mongo-a.internal:27017"],
             "database": "shop", "user": "reader", "replicaSet": "rs0"
         })
     }
 
-    /// `SRC-4` S5-a: the hosts as a set, the database and the replica set are the target;
-    /// the user, the TLS mode, and the order or case of the hosts are not.
+    /// `SRC-4` S5-a: the host, the database and the replica set are the target; the user, the TLS
+    /// mode and the case of the host are not.
     #[test]
     fn a_mongodb_cdc_dial_is_re_pointed_by_hosts_database_or_replica_set() {
         let base = cdc_mongo();
@@ -3592,13 +3603,13 @@ mod target_identity_tests {
             "cdc",
             &base,
             "hosts",
-            json!(["mongo-a.internal:27017"])
+            json!(["mongo-a.internal:27018"])
         ));
         assert!(!same(
             "cdc",
             &base,
             "hosts",
-            json!(["mongo-a.internal:27018", "mongo-b.internal:27017"])
+            json!(["mongo-b.internal:27017"])
         ));
         assert!(!same("cdc", &base, "database", json!("billing")));
         assert!(!same("cdc", &base, "replicaSet", json!("rs1")));
@@ -3608,7 +3619,7 @@ mod target_identity_tests {
             "cdc",
             &base,
             "hosts",
-            json!(["MONGO-B.internal:27017", "mongo-a.internal:27017"])
+            json!(["MONGO-A.internal:27017"])
         ));
         // A MongoDB target is never equal to a SQL one.
         let postgres = json!({
@@ -3626,7 +3637,7 @@ mod target_identity_tests {
     fn a_mongodb_cdc_dial_parses_to_its_own_variant_and_a_sql_one_does_not() {
         assert!(matches!(
             parse("cdc", &cdc_mongo()),
-            Dial::CdcMongo(ref dial) if dial.replica_set == "rs0" && dial.hosts.len() == 2
+            Dial::CdcMongo(ref dial) if dial.replica_set == "rs0" && dial.hosts.len() == 1
         ));
         assert!(parse("cdc", &cdc_mongo()).as_cdc().is_none());
         assert!(parse("cdc", &cdc_mongo()).as_cdc_mongo().is_some());
@@ -3664,13 +3675,28 @@ mod target_identity_tests {
         // Hosts: at least one, each host:port with a valid host and port.
         assert!(refused("hosts", json!([])));
         assert!(refused("hosts", json!(["mongo-a.internal"])));
+        // SRC-4 slice 5 review BLOCKER 1: more than one host is refused, with the fixed sentence.
+        let two = json!(["mongo-a.internal:27017", "mongo-b.internal:27017"]);
+        assert!(refused("hosts", two.clone()));
+        let mut dial = cdc_mongo();
+        dial["hosts"] = two;
+        assert!(
+            Dial::parse("cdc", &dial)
+                .unwrap_err()
+                .to_string()
+                .contains(super::CDC_MONGO_ONE_HOST)
+        );
+        // SHOULD-FIX 1: the replicaSet sentence is one line with single spaces, exactly this text.
+        let mut dial = cdc_mongo();
+        dial["replicaSet"] = json!("rs0&x");
+        assert!(Dial::parse("cdc", &dial).unwrap_err().to_string().contains(
+            "replicaSet must be 1 to 128 letters, digits, underscores, hyphens or dots: the name in the server's replica set configuration"
+        ));
+        assert!(!super::CDC_MONGO_REPLICA_SET.contains("  "));
         assert!(refused("hosts", json!(["mongo-a.internal:0"])));
         assert!(refused("hosts", json!(["mongo-a.internal:70000"])));
         assert!(refused("hosts", json!(["mongo{a}.internal:27017"])));
-        assert!(refused(
-            "hosts",
-            json!(["mongo-a.internal:27017", "bad;host:27017"])
-        ));
+        assert!(refused("hosts", json!(["bad;host:27017"])));
         // Database and user.
         assert!(refused("database", json!("")));
         assert!(refused("database", json!("shop.orders")));

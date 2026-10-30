@@ -196,9 +196,7 @@ pub enum CdcSpecError {
     /// (`Dial::parse` checks them; a hand-built dial is refused here the same
     /// way). The seeds are written into the connection string, so a `/`, `?` or
     /// `,` inside one would change what the worker dials.
-    #[error(
-        "a MongoDB change-capture connector's hosts are not host:port entries of plain characters"
-    )]
+    #[error("a MongoDB change-capture connector takes exactly one host:port of plain characters")]
     InvalidMongoHosts,
 
     /// A `MongoDB` replica-set name outside letters, digits, `_`, `-` and `.`.
@@ -707,11 +705,10 @@ fn is_plain_mongo_name(name: &str, max: usize) -> bool {
 /// shared keys are written out here, not drawn from that function, so the
 /// relational renderer stays as slice 3 left it.
 ///
-/// `directConnection=true` is set for a one-host dial and not otherwise: the
-/// driver refuses it together with several seeds. Then the worker discovers
-/// the other members of the replica set from the server and dials the addresses
-/// the replica set advertises, which no check of ours has seen ("Limits" of the
-/// feature page says so).
+/// The dial holds exactly one host and the connection string always carries
+/// `directConnection=true` (`SRC-4` slice 5 review BLOCKER 1, decision S5-b): the
+/// worker then dials only the written host, never the member addresses a replica
+/// set reports, which nothing checks against the installation's address rules.
 ///
 /// TLS: `disable` sets `mongodb.ssl.enabled=false`. The other three set it
 /// `true`; `require` also sets `mongodb.ssl.invalid.hostname.allowed=true`, so
@@ -743,7 +740,8 @@ pub fn render_mongodb_connect_config(
     if !is_plain_mongo_name(&dial.database, 63) {
         return Err(CdcSpecError::InvalidMongoDatabase);
     }
-    if dial.hosts.is_empty() || !is_bootstrap_list(&dial.hosts.join(",")) {
+    // Review BLOCKER 1: one host only, refused here as `Dial::parse` refuses it.
+    if dial.hosts.len() != 1 || !is_bootstrap_list(&dial.hosts.join(",")) {
         return Err(CdcSpecError::InvalidMongoHosts);
     }
     let replica_set_ok = (1..=128).contains(&dial.replica_set.len())
@@ -764,14 +762,11 @@ pub fn render_mongodb_connect_config(
         include.push(format!("{}.{name}", dial.database));
     }
 
-    let mut connection_string = format!(
-        "mongodb://{}/?replicaSet={}",
+    let connection_string = format!(
+        "mongodb://{}/?replicaSet={}&directConnection=true",
         dial.hosts.join(","),
         dial.replica_set
     );
-    if dial.hosts.len() == 1 {
-        connection_string.push_str("&directConnection=true");
-    }
     let (ssl_enabled, hostname_allowed) = match dial.ssl_mode {
         CdcSslMode::Disable => ("false", None),
         CdcSslMode::Require => ("true", Some("true")),
@@ -1354,14 +1349,10 @@ mod tests {
 
     #[test]
     fn mongodb_config_holds_no_password_value_and_no_credential_in_the_connection_string() {
-        let config = render_mongo(
-            &["mongo-a.internal:27017", "mongo-b.internal:27017"],
-            "verify-full",
-            &["orders"],
-        );
+        let config = render_mongo(&["mongo-a.internal:27017"], "verify-full", &["orders"]);
         assert_eq!(
             config["mongodb.connection.string"],
-            "mongodb://mongo-a.internal:27017,mongo-b.internal:27017/?replicaSet=rs0"
+            "mongodb://mongo-a.internal:27017/?replicaSet=rs0&directConnection=true"
         );
         assert!(!config["mongodb.connection.string"].contains('@'));
         let json = serde_json::to_string(&config).unwrap();
@@ -1371,15 +1362,18 @@ mod tests {
     }
 
     #[test]
-    fn mongodb_config_sets_direct_connection_for_one_host_only() {
+    fn mongodb_config_always_sets_direct_connection_and_refuses_two_hosts() {
+        // SRC-4 slice 5 review BLOCKER 1.
         let one = render_mongo(&["mongo-a.internal:27017"], "require", &["orders"]);
         assert!(one["mongodb.connection.string"].ends_with("&directConnection=true"));
-        let two = render_mongo(
+        let two = mongo_dial(
             &["mongo-a.internal:27017", "mongo-b.internal:27017"],
             "require",
-            &["orders"],
         );
-        assert!(!two["mongodb.connection.string"].contains("directConnection"));
+        assert_eq!(
+            render_mongodb_connect_config("conn-m1", &two, &["orders"], CDC_SECRETS_DIR),
+            Err(CdcSpecError::InvalidMongoHosts)
+        );
     }
 
     #[test]
