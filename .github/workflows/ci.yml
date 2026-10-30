@@ -312,11 +312,14 @@ jobs:
     needs: changes
     if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.all == 'true'
     runs-on: ubuntu-latest
-    # 40, not 25: on `main` this job took 16-23 min (last six runs before
-    # 2026-10-21), and PR #106 (catalog phase 2) ran out of the 25-min budget
-    # twice with every test passing up to the cancel. The budget is a guard
-    # against a hung test, not a speed target; a hang still ends here.
-    timeout-minutes: 40
+    # 60, not 40: the three last green runs of this job on `main` took 39m18s,
+    # 30m07s and 36m12s (runs 40627697997, 40628462938, 40667618267), the
+    # longest took 39m27s (40387475151), and the job was cancelled at the
+    # 40-minute budget in three runs on 2026-10-28 (40634916754, 40673812061,
+    # 40674201583), with every test that ran up to the cancel passing. The
+    # budget is a guard against a hung test, not a speed target; a hang still
+    # ends here.
+    timeout-minutes: 60
     # OPS-12: this job links one test binary per file in
     # `rust/crates/lakehouse-api/tests/` (68 of them), each against the whole
     # crate, and full debug info in every binary is what filled the runner's
@@ -759,6 +762,19 @@ jobs:
           # can prove; the source TEXT is proven by the local run with a
           # real commit (`ops/g7/g7_pipeline_test.py`'s module doc).
           G7_SOURCE_PROVENANCE=unavailable
+          # SEC-50: the shared catalog is gated as the tenant that owns it
+          # (`CATALOG_TENANT_ID`), and migration `0002` seeds four tenants,
+          # so a deployment without that setting has no tenant whose reach
+          # covers the shared Bronze table. The BLD-1 step below authors a
+          # pipeline whose author is a regular Analyst (not the `*:*`
+          # bootstrap admin), so its pipeline is scoped to the author's
+          # tenant and that tenant has to own the shared catalog -- without
+          # this the run is refused with the gate's 404. The harness reads
+          # the SAME setting to pick an author of that tenant
+          # (`ops/g7/bld1_pipeline_author_test.py`). Same value and the
+          # same contract the two G8 jobs already use (#244) -- not a
+          # weaker gate.
+          CATALOG_TENANT_ID=11111111-1111-4111-8111-000000000001
           EOF
           # SEC-36: generated per run; no key-shaped literal in the repository.
           echo "CONNECTOR_SECRETS_KEY=$(openssl rand -base64 32)" >> .env
@@ -2690,6 +2706,22 @@ jobs:
           LAKEKEEPER_BASE_URI=http://lakekeeper:8181
           GOLD_EXPORT_RUN_TOKEN=ci-gold-export-token-not-a-real-secret
           DAGSTER_URL=http://dagster-webserver:3000/graphql
+          # SEC-50: the shared catalog belongs to a tenant, and every
+          # multi-tenant deployment must name that tenant here -- with
+          # the four migration-seeded tenants and no catalog tenant there
+          # is no tenant whose reach covers the shared catalog, so a job
+          # with no user (the scheduled export, a service identity) is
+          # refused with a 422 that names this setting.
+          #
+          # THIS job's own harness signs in as the `*:*` bootstrap admin
+          # (`ops/gold_export/gold_export_test.py`'s `step_login`), so
+          # its export passes the gate as a `Caller` with every table in
+          # reach and does not lean on this setting -- but an exporter
+          # that is NOT an unrestricted admin does, and the setting
+          # belongs here either way. The same value and the same contract
+          # the two G8 jobs already use (#244) -- not a weaker gate.
+          # (PR #281 review round 2 NIT)
+          CATALOG_TENANT_ID=11111111-1111-4111-8111-000000000001
           # DATA-2 review BLOCKER 2: credentials in CI-only .env matching the RustFS keys
           CONNECTOR_S3_ACCESS_KEY=ci-only-rustfs-access
           CONNECTOR_S3_SECRET_KEY=ci-only-rustfs-secret-0001

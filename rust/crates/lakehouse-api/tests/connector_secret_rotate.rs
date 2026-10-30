@@ -266,6 +266,7 @@ async fn a_body_naming_the_legacy_new_secret_ref_field_is_a_400() {
 #[tokio::test]
 async fn a_derived_secret_ref_resolves_and_the_rotation_lands() {
     let (user, password, host, port) = parse_postgres_url(&lakehouse_test_support::database_url());
+    let proxy = common::tls_proxy::TlsProxy::start(&host, port).await;
 
     let mut overrides = HashMap::new();
     overrides.insert(
@@ -296,7 +297,7 @@ async fn a_derived_secret_ref_resolves_and_the_rotation_lands() {
         .fetch_one(&app.pool)
         .await
         .expect("read the test database's own name");
-    let dial_host = format!("{user}@{host}:{port}/{database}");
+    let dial_host = format!("{user}@{host}:{}/{database}", proxy.port());
 
     // `adapter` is deliberately left `NULL` (the column's own default,
     // never set here): `connector_probe::probe` dispatches an

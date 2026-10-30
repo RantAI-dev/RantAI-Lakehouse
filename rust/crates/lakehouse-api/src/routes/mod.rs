@@ -67,15 +67,25 @@ mod quality_anomaly;
 mod quality_incidents;
 mod quality_load;
 mod quality_schedules;
-mod query;
 mod query_cancel;
 mod query_limits;
+// `pub(crate)`, not private: `SEC-50`'s shared tenant gate
+// (`query::gate_statement` and `query::GateActor`) is asked by every site
+// that runs a statement through the policy rewrite — the query path, the
+// authored pipelines, the Gold export, and (from slice 2) the dashboards,
+// the embeds, the public links and the alerts. A second copy of the reach
+// logic in a second place is exactly the drift the one definition exists
+// to prevent (`AGENTS.md` rule 4).
+pub(crate) mod query;
 mod schema_changes;
 pub(crate) mod schema_versions;
 mod settings;
 mod storage;
 pub(crate) mod support;
-mod uploads;
+// `pub(crate)`, because `crate::upload_convert` (the child process's
+// protocol) needs this module's own sentences: a file that is too large is
+// refused with the same words wherever it is noticed (`SEC-22` D4).
+pub(crate) mod uploads;
 
 use std::time::Duration;
 

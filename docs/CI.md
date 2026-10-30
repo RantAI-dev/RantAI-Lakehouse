@@ -308,14 +308,14 @@ PRs (e.g. one that actually touches a manifest with a diff for it to
 evaluate) before being promoted to required in the branch-protection command
 below.
 
-## Recommended branch protection (attempted, blocked — apply manually)
+## Branch protection on `main` (applied 2026-10-30)
 
-An attempt was made to set this via `gh api` during the public-release
-hardening pass; it was blocked by a permission classifier even though the
-acting account has org-admin rights. Rather than fight that, here is the
-exact command an owner can run themselves, and the reasoning behind each
-choice, so it can be applied (or adjusted) in one step instead of clicking
-through the UI.
+Applied on 2026-10-30 with the command below, at the product owner's
+request (`REL-1`). The repository is public, so GitHub's free plan allows
+it. An earlier attempt during the public-release hardening pass had been
+blocked by a permission classifier. Check what is live with
+`gh api repos/RantAI-dev/RantAI-Lakehouse/branches/main/protection`; when a
+required job is renamed, run the command again with the new name.
 
 ```sh
 gh api \

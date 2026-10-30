@@ -20,6 +20,8 @@
 use std::collections::HashMap;
 
 use lakehouse_core::ident::Ident;
+use rustls::pki_types::CertificateDer;
+use rustls::pki_types::pem::PemObject;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -42,8 +44,9 @@ pub const WORKER_STACK_BYTES: usize = 8 * 1024 * 1024;
 /// variables.
 ///
 /// Only `PORT`, `CATALOG_TENANT_ID`, `AI_DEFAULT_REPLY_LANGUAGE`,
-/// `AI_SEMANTIC_LAYER`, `AI_ASK_BACK` and `AI_RELEVANT_TABLES` can fail
-/// resolution. `PORT` is load-bearing and Rust-only (the TypeScript
+/// `AI_SEMANTIC_LAYER`, `AI_ASK_BACK`, `AI_RELEVANT_TABLES`, `AI_SQL_HELP`,
+/// `CONNECTOR_TYPED_CREDENTIALS`, `EMBED_TOKEN_MAX_LIFETIME_SECONDS` and
+/// `CONNECTOR_TLS_CA_FILE` can fail resolution. `PORT` is load-bearing and Rust-only (the TypeScript
 /// backend runs under Next.js and never binds a port itself), so an
 /// unparseable value refusing to boot is the correct, Rust-specific failure
 /// mode. `SMTP_PORT` deliberately has no equivalent error variant —
@@ -155,6 +158,19 @@ pub enum ConfigError {
         "EMBED_TOKEN_MAX_LIFETIME_SECONDS must be a positive whole number of seconds (unset or empty means 86400), got {0:?}"
     )]
     InvalidEmbedTokenMaxLifetime(String),
+    /// `CONNECTOR_TLS_CA_FILE` names a path that cannot be read as a file
+    /// (`SEC-14` part B, D5). Fails config resolution rather than falling back
+    /// to Trust On First Use: an operator who set a CA meant the connector
+    /// dials to verify the server against it, and an unreadable path would
+    /// otherwise silently keep the trust-everything posture with nothing in
+    /// the logs to explain it.
+    #[error("CONNECTOR_TLS_CA_FILE must name a readable file, cannot read {0:?}")]
+    UnreadableConnectorTlsCaFile(std::path::PathBuf),
+    /// A set `CONNECTOR_TLS_CA_FILE` contains no valid PEM certificate. We refuse
+    /// start-up rather than discovering on the first connector dial that the CA
+    /// file cannot be used (SEC-14B review round 1, SHOULD-FIX 6).
+    #[error("CONNECTOR_TLS_CA_FILE must contain at least one PEM certificate, found none in {0:?}")]
+    EmptyConnectorTlsCaFile(std::path::PathBuf),
 }
 
 /// The language the copilot answers in when the user's message is too short
@@ -260,6 +276,14 @@ pub struct Config {
     /// (`CONNECTOR_SECRETS_KEY_PREVIOUS`; decision 5). It opens files, it
     /// never seals.
     pub connector_secrets_key_previous: Option<String>,
+    /// CA certificate (PEM) connector dials verify the database server
+    /// against (`CONNECTOR_TLS_CA_FILE`; `SEC-14` part B, D5 as amended).
+    /// `None` when unset or empty: a connector dial still requires TLS but
+    /// takes the server's certificate on trust (`require`, D5). Set to a path
+    /// that cannot be read, start-up fails
+    /// ([`ConfigError::UnreadableConnectorTlsCaFile`]) — never a silent
+    /// fall-back to the trust-everything posture.
+    pub connector_tls_ca_file: Option<std::path::PathBuf>,
     /// The installation's secret manager and how to sign in to it
     /// (`SECRET_MANAGER` and its manager's variables; `SRC-12` part B). The
     /// sign-in settings are secrets: this field's `Debug` prints the manager
@@ -905,6 +929,22 @@ pub struct Config {
     /// The same, for the whole installation: `UPLOAD_MAX_CONCURRENT`,
     /// default 16 (`SEC-17`).
     pub upload_max_concurrent: u32,
+    /// How many files may be READ at once per API process: the workbook and
+    /// Parquet files an upload converts, each read by a child process
+    /// (`SEC-22` D3). `UPLOAD_MAX_CONVERSIONS`, default 2. A request that
+    /// arrives when every slot is taken is refused at once (429), not
+    /// queued. A value that is not a whole number of 1 or more fails config
+    /// resolution ([`ConfigError::InvalidUploadLimit`]).
+    pub upload_max_conversions: u32,
+    /// The memory limit the child that reads an uploaded file sets for
+    /// itself: `UPLOAD_CONVERT_MEMORY_MB`, default 1280 MiB. The number is
+    /// the measured peak of the largest allowed workbook times 1.5, rounded
+    /// up to 128 MiB (`SEC-22` D7; the measurement is in
+    /// `ops/g9/sec22_measure.py` and its numbers in
+    /// `docs/plans/SEC-22-RESULT.md`). A value that is not a whole number of
+    /// 1 or more fails config resolution
+    /// ([`ConfigError::InvalidUploadLimit`]).
+    pub upload_convert_memory_mb: u32,
     /// Hours after which an upload session whose pieces never all arrived
     /// is aborted and removed: `UPLOAD_SESSION_TTL_HOURS`, default 24
     /// (`DATA-17`, decision 8 of the feature page, *proposed* and signed by
@@ -1038,6 +1078,7 @@ impl std::fmt::Debug for Config {
                     .as_ref()
                     .map(|_| REDACTED),
             )
+            .field("connector_tls_ca_file", &self.connector_tls_ca_file)
             .field("secret_manager", &self.secret_manager)
             .field(
                 "connector_typed_credentials",
@@ -1153,6 +1194,8 @@ impl std::fmt::Debug for Config {
                 &self.upload_max_concurrent_per_user,
             )
             .field("upload_max_concurrent", &self.upload_max_concurrent)
+            .field("upload_max_conversions", &self.upload_max_conversions)
+            .field("upload_convert_memory_mb", &self.upload_convert_memory_mb)
             .field("upload_session_ttl_hours", &self.upload_session_ttl_hours)
             .field(
                 "connector_auto_disable_after",
@@ -1244,6 +1287,32 @@ fn parse_embed_token_max_lifetime(env: &HashMap<String, String>) -> Result<u64, 
     }
 }
 
+/// `CONNECTOR_TLS_CA_FILE` (`SEC-14` part B, D5): unset or empty is "no CA,
+/// require TLS only"; a set path is read now so an unreadable one stops the
+/// API at start rather than on the first connector dial.
+fn parse_connector_tls_ca_file(
+    env: &HashMap<String, String>,
+) -> Result<Option<std::path::PathBuf>, ConfigError> {
+    let Some(raw) = truthy(env, "CONNECTOR_TLS_CA_FILE") else {
+        return Ok(None);
+    };
+    let path = std::path::PathBuf::from(raw);
+    // `read` (not `File::open`) so a directory, which opens but cannot be
+    // read as a certificate, is caught here too.
+    std::fs::read(&path).map_err(|_| ConfigError::UnreadableConnectorTlsCaFile(path.clone()))?;
+    let certificates = CertificateDer::pem_file_iter(&path)
+        .map_err(|_| ConfigError::UnreadableConnectorTlsCaFile(path.clone()))?;
+    let mut count = 0usize;
+    for cert in certificates {
+        cert.map_err(|_| ConfigError::EmptyConnectorTlsCaFile(path.clone()))?;
+        count += 1;
+    }
+    if count == 0 {
+        return Err(ConfigError::EmptyConnectorTlsCaFile(path));
+    }
+    Ok(Some(path))
+}
+
 /// Parse `OIDC_ROLE_MAP`'s `"group1=Role One,group2=Role Two"` format into
 /// a lookup from external group name to local `role.name`. A malformed
 /// entry (no `=`, or an empty group/role name) is skipped rather than
@@ -1290,7 +1359,8 @@ impl Config {
     ///   `AI_RELEVANT_TABLES` is set and non-empty but is neither `true`
     ///   nor `false`.
     /// - [`ConfigError::InvalidUploadLimit`], if
-    ///   `UPLOAD_MAX_CONCURRENT_PER_USER`, `UPLOAD_MAX_CONCURRENT` or
+    ///   `UPLOAD_MAX_CONCURRENT_PER_USER`, `UPLOAD_MAX_CONCURRENT`,
+    ///   `UPLOAD_MAX_CONVERSIONS`, `UPLOAD_CONVERT_MEMORY_MB` or
     ///   `UPLOAD_SESSION_TTL_HOURS` is set and non-empty but is not a whole number of 1 or more.
     ///
     /// An unparseable `SMTP_PORT` does NOT error — see [`Config::smtp_port`].
@@ -1334,6 +1404,10 @@ impl Config {
                 .cloned()
                 .unwrap_or_else(|| "rantai-lake@localhost".to_owned())
         });
+
+        // `CONNECTOR_TLS_CA_FILE`: read the file now so an unreadable path
+        // stops the API at start, not on the first connector dial (T1).
+        let connector_tls_ca_file = parse_connector_tls_ca_file(env)?;
 
         Ok(Self {
             ch_url: or_default(env, "CH_URL", "http://localhost:18123"),
@@ -1401,6 +1475,7 @@ impl Config {
             ),
             connector_secrets_key: truthy(env, "CONNECTOR_SECRETS_KEY"),
             connector_secrets_key_previous: truthy(env, "CONNECTOR_SECRETS_KEY_PREVIOUS"),
+            connector_tls_ca_file,
             secret_manager: crate::secret_manager::SecretManagerSettings::from_map(env)?,
             connector_typed_credentials: parse_switch(
                 env,
@@ -1537,6 +1612,12 @@ impl Config {
             auth_retention_days: parse_positive_u32_or_default(env, "AUTH_RETENTION_DAYS", 30),
             upload_max_concurrent_per_user: parse_limit(env, "UPLOAD_MAX_CONCURRENT_PER_USER", 4)?,
             upload_max_concurrent: parse_limit(env, "UPLOAD_MAX_CONCURRENT", 16)?,
+            upload_max_conversions: parse_limit(env, "UPLOAD_MAX_CONVERSIONS", 2)?,
+            upload_convert_memory_mb: parse_limit(
+                env,
+                "UPLOAD_CONVERT_MEMORY_MB",
+                crate::upload_convert::DEFAULT_MEMORY_MIB,
+            )?,
             upload_session_ttl_hours: parse_limit(env, "UPLOAD_SESSION_TTL_HOURS", 24)?,
             connector_auto_disable_after: i32::try_from(parse_positive_u32_or_default(
                 env,
@@ -1575,6 +1656,19 @@ impl Config {
         crate::connector_oauth::OAuthSettings {
             allow_http: self.connector_oauth_allow_http,
         }
+    }
+
+    /// The CA a connector dial verifies the database server against
+    /// (`CONNECTOR_TLS_CA_FILE`; `SEC-14` part B, D5/D6). `None` is D5's
+    /// `require` posture: TLS is still required, the server certificate is
+    /// trusted as-is.
+    ///
+    /// Every connector dial takes this and never reads the field directly,
+    /// so "which CA does a dial verify against" is one accessor rather than
+    /// a setting read at six call sites.
+    #[must_use]
+    pub fn connector_tls_ca(&self) -> Option<&std::path::Path> {
+        self.connector_tls_ca_file.as_deref()
     }
 
     /// The internal addresses an alert webhook may call (`SEC-10`): only the
@@ -2574,6 +2668,78 @@ mod tests {
         }
     }
 
+    /// `SEC-14` part B (D5): unset or empty means "no CA, require TLS only";
+    /// a readable file is kept as the path a dial verifies the server against.
+    #[test]
+    fn a_connector_tls_ca_file_is_absent_by_default_and_kept_when_readable() {
+        let cfg = Config::from_map(&HashMap::new()).unwrap();
+        assert_eq!(cfg.connector_tls_ca_file, None);
+
+        let dir = tempfile::tempdir().unwrap();
+        let ca = dir.path().join("ca.pem");
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert = crate::tls_proxy::pem_certificate(certified.cert.der());
+        std::fs::write(&ca, cert).unwrap();
+        let env = env_with("CONNECTOR_TLS_CA_FILE", ca.to_str().unwrap());
+        let cfg = Config::from_map(&env).unwrap();
+        assert_eq!(cfg.connector_tls_ca_file.as_deref(), Some(ca.as_path()));
+
+        // Empty is unset, exactly like every other truthy setting.
+        let cfg = Config::from_map(&env_with("CONNECTOR_TLS_CA_FILE", "")).unwrap();
+        assert_eq!(cfg.connector_tls_ca_file, None);
+    }
+
+    /// `SEC-14` T1: a set path that cannot be read stops the API at start with
+    /// a message naming the variable, never a silent fall back to trusting
+    /// every server certificate.
+    #[test]
+    fn an_unreadable_connector_tls_ca_file_stops_the_api() {
+        for path in [
+            std::path::PathBuf::from("/nonexistent/rantai/ca.pem"),
+            // A directory: opens but is not a readable certificate file.
+            std::path::PathBuf::from("/"),
+        ] {
+            let env = env_with("CONNECTOR_TLS_CA_FILE", path.to_str().unwrap());
+            let err = Config::from_map(&env).expect_err("an unreadable path must fail start-up");
+            assert_eq!(err, ConfigError::UnreadableConnectorTlsCaFile(path));
+            assert!(
+                err.to_string().contains("CONNECTOR_TLS_CA_FILE"),
+                "the message must name the variable: {err}"
+            );
+        }
+    }
+
+    /// `SEC-14` part B, SHOULD-FIX 6: a set path that contains no PEM certificate
+    /// stops the API at start with a message naming the variable, never a silent fall
+    /// back to discovering it on the first connector dial.
+    #[test]
+    fn an_empty_connector_tls_ca_file_stops_the_api() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        // File is empty (0 bytes, no PEM certificate)
+        let env = env_with("CONNECTOR_TLS_CA_FILE", temp.path().to_str().unwrap());
+        let err = Config::from_map(&env).expect_err("an empty CA file must fail start-up");
+        assert_eq!(
+            err,
+            ConfigError::EmptyConnectorTlsCaFile(temp.path().to_path_buf())
+        );
+        assert!(
+            err.to_string().contains("CONNECTOR_TLS_CA_FILE"),
+            "the message must name the variable: {err}"
+        );
+
+        // File has non-PEM text
+        std::fs::write(temp.path(), "this is not a pem certificate\n").unwrap();
+        let err = Config::from_map(&env).expect_err("a non-PEM CA file must fail start-up");
+        assert_eq!(
+            err,
+            ConfigError::EmptyConnectorTlsCaFile(temp.path().to_path_buf())
+        );
+        assert!(
+            err.to_string().contains("CONNECTOR_TLS_CA_FILE"),
+            "the message must name the variable: {err}"
+        );
+    }
+
     #[test]
     fn sql_help_is_on_when_the_setting_is_absent_or_empty() {
         assert!(Config::from_map(&HashMap::new()).unwrap().ai_sql_help);
@@ -2688,6 +2854,51 @@ mod tests {
             err,
             ConfigError::InvalidUploadLimit("UPLOAD_MAX_CONCURRENT", _)
         ));
+    }
+
+    // ── SEC-22: the limits of the child that reads an uploaded file ─────
+
+    #[test]
+    fn the_conversion_limits_default_to_two_conversions_and_the_measured_peak() {
+        for env in [
+            HashMap::new(),
+            env_with("UPLOAD_MAX_CONVERSIONS", ""),
+            env_with("UPLOAD_CONVERT_MEMORY_MB", ""),
+        ] {
+            let cfg = Config::from_map(&env).unwrap();
+            assert_eq!(cfg.upload_max_conversions, 2);
+            assert_eq!(
+                cfg.upload_convert_memory_mb,
+                crate::upload_convert::DEFAULT_MEMORY_MIB
+            );
+        }
+    }
+
+    #[test]
+    fn the_conversion_limits_are_read_from_their_variables() {
+        let mut env = env_with("UPLOAD_MAX_CONVERSIONS", "4");
+        env.insert("UPLOAD_CONVERT_MEMORY_MB".to_owned(), "256".to_owned());
+        let cfg = Config::from_map(&env).unwrap();
+        assert_eq!(cfg.upload_max_conversions, 4);
+        assert_eq!(cfg.upload_convert_memory_mb, 256);
+    }
+
+    #[test]
+    fn a_conversion_limit_that_is_not_a_whole_number_of_one_or_more_is_refused() {
+        for (name, bad) in [
+            ("UPLOAD_MAX_CONVERSIONS", "0"),
+            ("UPLOAD_CONVERT_MEMORY_MB", "0"),
+            ("UPLOAD_MAX_CONVERSIONS", "abc"),
+            ("UPLOAD_CONVERT_MEMORY_MB", "-1"),
+        ] {
+            let err = Config::from_map(&env_with(name, bad))
+                .expect_err("a bad limit must stop start-up, not fall back to the default");
+            assert_eq!(
+                err,
+                ConfigError::InvalidUploadLimit(name, bad.to_owned()),
+                "{name}"
+            );
+        }
     }
 
     /// `BI-1` D1: the PDF renderer's two addresses are plain configuration;
