@@ -252,8 +252,38 @@ def _register(tenant_id: str) -> str:
         timeout=60,
     )
     if not spec.ok:
-        raise G4Failure(f"set the connector's ingest-spec failed: {spec.status_code} {spec.text[:300]}")
+        raise G4Failure(f"set the connector's ingest-spec failed: {spec.status_code} {spec.text[:300]}{_explain_refusal()}")
     return connector_id
+
+
+def _explain_refusal() -> str:
+    """When Kafka Connect refuses the connector, the API answers a fixed sentence (principle 4: no
+    upstream text in a response). The gate may look: it asks Kafka Connect to validate the same keys
+    (with the gate's own throwaway password in place of the file reference, which validation never
+    stores) and returns the fields it objects to, so a refusal in CI says why. Field names and
+    Kafka Connect's messages only; never the password."""
+    config = {
+        "connector.class": "io.debezium.connector.mongodb.MongoDbConnector", "tasks.max": "1",
+        "mongodb.connection.string": f"mongodb://{HOST}:{PORT}/?replicaSet={REPLICA_SET}&directConnection=true",
+        "mongodb.user": CDC_USER, "mongodb.password": src().password, "mongodb.authsource": DATABASE,
+        "mongodb.ssl.enabled": "false", "topic.prefix": "cdc.diagnose",
+        "collection.include.list": ",".join(f"{DATABASE}.{t}" for t in g.TABLES.values()),
+        "capture.mode": "change_streams_update_full", "capture.scope": "database", "capture.target": DATABASE,
+        "snapshot.mode": "initial",
+    }
+    try:
+        resp = requests.put(
+            f"{g.CONNECT_URL}/connector-plugins/io.debezium.connector.mongodb.MongoDbConnector/config/validate",
+            json=config, timeout=60,
+        )
+        body = resp.json()
+    except (requests.RequestException, ValueError) as exc:
+        return f" [could not ask Kafka Connect to validate: {type(exc).__name__}]"
+    problems = [
+        f"{c['value']['name']}: {'; '.join(c['value']['errors'])}"
+        for c in body.get("configs", []) if c.get("value", {}).get("errors")
+    ]
+    return " [Kafka Connect validation: " + (" | ".join(problems) if problems else f"no field is refused, error_count={body.get('error_count')}") + "]"
 
 
 def _check_connect(connector_id: str) -> None:
