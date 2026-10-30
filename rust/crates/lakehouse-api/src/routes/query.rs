@@ -375,11 +375,24 @@ async fn reach_for_actor(state: &AppState, actor: GateActor<'_>) -> Result<Tenan
 /// with several tenants and no catalog tenant has no tenant whose reach
 /// covers the shared catalog, and failing closed is the only honest
 /// answer (D6).
+///
+/// `SEC-50` R5: a deployment that cannot COUNT its tenants refuses too.
+/// `None` means there is no database to count in, so the deployment
+/// cannot say that it holds a single tenant — and it cannot say that it
+/// holds several either. "Cannot verify it is safe" is the same answer as
+/// "verified unsafe", which is `SEC-20`'s own rule: the shared catalog's
+/// own gate refuses every principal without the unrestricted grant when
+/// there is no pool (`routes::catalog::catalog_tenant_refusal`). The
+/// setting does not change that: naming a catalog tenant in a deployment
+/// that cannot count its tenants is a claim nobody can check.
 fn catalog_tenant_reach(
     tenant_count: Option<i64>,
     catalog_tenant_id: Option<Uuid>,
 ) -> Result<TenantReach, ApiError> {
-    if tenant_count.is_some_and(|count| count <= 1) {
+    let Some(tenant_count) = tenant_count else {
+        return Err(ApiError::Unprocessable(JOB_NEEDS_CATALOG_TENANT.to_owned()));
+    };
+    if tenant_count <= 1 {
         return Ok(TenantReach::All);
     }
     match catalog_tenant_id {
@@ -5089,6 +5102,18 @@ mod sec50_gate_tests {
             JOB_NEEDS_CATALOG_TENANT,
             "This job reads the shared catalog, and no tenant owns it here. Set CATALOG_TENANT_ID to the tenant that owns this deployment's shared catalog."
         );
+    }
+
+    /// `SEC-50` R5: a deployment that cannot COUNT its tenants refuses
+    /// the job, even with the setting named. "Cannot verify it is safe"
+    /// is the same answer as "verified unsafe" — `SEC-20`'s own rule, the
+    /// one the shared catalog's own gate already follows with no pool.
+    #[test]
+    fn a_job_with_no_user_is_refused_in_a_deployment_that_cannot_count_its_tenants() {
+        let err = catalog_tenant_reach(None, Some(CATALOG_TENANT))
+            .expect_err("a deployment that cannot say how many tenants it holds");
+        assert_eq!(err.status(), 422);
+        assert_eq!(err.to_string(), JOB_NEEDS_CATALOG_TENANT);
     }
 
     #[tokio::test]
