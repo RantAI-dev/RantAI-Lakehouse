@@ -221,6 +221,9 @@ class Source:
     # Whether this gate also runs the lag alert step (AC7): `g4-cdc` only.
     lag_alert_gate = False
 
+    # The setup checks the connection test lists for this source's own connector (SHOULD-FIX 10c).
+    expected_settings: tuple = ()
+
     def missing_case(self) -> "MissingCase":
         """A connector whose source lacks exactly one setting (`SRC-4` S4-h). May change the source
         (a second login, a table) first."""
@@ -790,6 +793,11 @@ def step_setup_checks(connector_id: str) -> None:
     cannot read the setting)."""
     try:
         good = _test_setup_checks(connector_id)
+        # Slice 4 review SHOULD-FIX 10c: the settings listed are exactly this source's, so a
+        # dropped check fails the gate.
+        listed = sorted(c["setting"] for c in good)
+        if not src().expected_settings or listed != sorted(src().expected_settings):
+            raise G4Failure(f"the setup checks list {listed}, expected {sorted(src().expected_settings)}")
         _expect_rest_ok(good, None)
         case = src().missing_case()
         spec = {"adapter": "cdc", "ingestMode": "cdc", "dial": case.dial, "sourceObjects": case.source_objects}
@@ -844,7 +852,7 @@ def _wait_lag_over_the_limit(connector_id: str) -> int:
 def step_lag_alert_fires_once_and_closes(connector_id: str) -> None:
     """`g4-cdc` only (AC7, S4-h). Limit 1 minute; the CI job stops `kafka-connect`; changes are
     written meanwhile. The capture route reports a lag above 60 seconds and ONE `connector_lag`
-    instance exists, however many sensor ticks pass. The CI job starts `kafka-connect` again; the
+    instance exists naming the connector, a table and the limit. The CI job starts `kafka-connect` again; the
     tables come back to "up to date" and the alert closes (`alertOpen` false).
 
     Two limits of what a gate can see, stated rather than hidden: the Alerts list dedupes a rule's
@@ -885,11 +893,13 @@ def step_lag_alert_fires_once_and_closes(connector_id: str) -> None:
             raise G4Failure(f"expected one connector_lag instance for one crossing, got {len(instances)}")
         if _capture(connector_id)["lag"].get("alertOpen") is not True:
             raise G4Failure("the lag passed the limit and an alert was listed, but alertOpen is not true")
-        # Two more sensor ticks over the limit: still one alert for the one crossing.
-        time.sleep(75)
-        again = _alert_instances(rule_id)
-        if len(again) != 1:
-            raise G4Failure(f"{len(again)} alert instances after more ticks over the limit; expected one per crossing")
+        # Slice 4 review SHOULD-FIX 10a: what is listed names the connector, a selected table and the
+        # limit, in the API's fixed words. ("Once per crossing" rests on the compare-and-set flag and
+        # its tests: the Alerts list dedupes for 15 minutes, so a count here could not fail.)
+        detail = str(instances[0].get("detail", ""))
+        tables = [src().object_name(mode) for mode in MODES]
+        if connector_id not in detail or not any(t in detail for t in tables) or f"over the limit of {LAG_LIMIT_MINUTES} min" not in detail:
+            raise G4Failure(f"the listed alert does not name the connector, a table and the limit: {detail!r}")
 
         _ask_ci_job(START_MARKER, START_DONE_FILE, "started kafka-connect")
         _wait_capture_state(connector_id, "running", 240)
@@ -908,7 +918,7 @@ def step_lag_alert_fires_once_and_closes(connector_id: str) -> None:
         API.delete(f"{API_URL}/api/alerts", params={"id": rule_id}, timeout=15)
     _say(
         "lag alert", "pass",
-        f"limit {LAG_LIMIT_MINUTES} min, kafka-connect stopped: lag {over}s, {len(instances)} instance, still {len(again)} after more ticks; "
+        f"limit {LAG_LIMIT_MINUTES} min, kafka-connect stopped: lag {over}s, {len(instances)} instance ({detail[:120]!r}); "
         f"started again: {words}, alert closed, {len(final)} instance listed (15-minute dedupe)",
     )
 

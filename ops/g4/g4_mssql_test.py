@@ -63,6 +63,9 @@ class MsSqlSource(cdc_gate.Source):
     host_for_registry = f"{HOST}:{PORT}"
     now = "SYSDATETIME()"
     needs_schema_history = True
+    expected_settings = (
+        "CDC on the database", "CDC on table dbo.orders", "CDC on table dbo.orders_history", "SQL Server Agent",
+    )
 
     def __init__(self) -> None:
         # The connector login's password: a throwaway of this gate's stack that meets SQL Server's

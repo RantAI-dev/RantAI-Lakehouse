@@ -55,6 +55,9 @@ class MySqlSource(cdc_gate.Source):
     host_for_registry = f"{HOST}:{PORT}"
     now = "NOW(6)"
     needs_schema_history = True
+    expected_settings = (
+        "binary log", "binlog_format", "binlog_row_image", "replication privileges", "binlog retention",
+    )
 
     def __init__(self) -> None:
         # The connector user's password: this stack's own throwaway fixture value.
@@ -144,7 +147,7 @@ class MySqlSource(cdc_gate.Source):
             conn.close()
 
     def missing_case(self) -> cdc_gate.MissingCase:
-        """AC3: a second login that can read the tables but holds neither replication privilege.
+        """AC3: a second login that can read the tables and replicate, but lacks REPLICATION CLIENT.
         The connector selects no table, so nothing is started in Kafka Connect for it."""
         conn = _connect()
         try:
@@ -152,6 +155,9 @@ class MySqlSource(cdc_gate.Source):
                 cur.execute(f"DROP USER IF EXISTS '{NO_REPLICATION_USER}'@'%'")
                 cur.execute(f"CREATE USER '{NO_REPLICATION_USER}'@'%%' IDENTIFIED BY %s", (self.password,))
                 cur.execute(f"GRANT SELECT ON {DATABASE}.* TO '{NO_REPLICATION_USER}'@'%'")
+                # Slice 4 review SHOULD-FIX 10b: only REPLICATION CLIENT is missing, so the gate
+                # proves each of the two grants is checked.
+                cur.execute(f"GRANT REPLICATION SLAVE ON *.* TO '{NO_REPLICATION_USER}'@'%'")
         finally:
             conn.close()
         dial = {**self.dial(), "user": NO_REPLICATION_USER, "serverId": SERVER_ID + 1}

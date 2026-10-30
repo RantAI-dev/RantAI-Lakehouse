@@ -75,6 +75,7 @@ class PgSource(cdc_gate.Source):
     needs_schema_history = False
     # AC7: this gate also stops `kafka-connect` and watches the lag alert (`cdc_gate`).
     lag_alert_gate = True
+    expected_settings = ("wal_level", "replication role", "publication", "publication tables")
 
     def __init__(self) -> None:
         self.password = os.environ["PGPASSWORD"]
