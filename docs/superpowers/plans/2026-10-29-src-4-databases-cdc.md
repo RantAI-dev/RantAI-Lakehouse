@@ -868,3 +868,48 @@ name only code that exists; `OPERATIONS.md` says the leftover Lakekeeper
 `debezium` principal and grant can be revoked by hand. Checked by the planner:
 CI run on `803735c0` success, 34 of 34 jobs (G4 change capture into Bronze
 among them), Security 5 of 5. No open `BLOCKER`. Slice 2 is closed.
+
+### Slice 3, review round 1 (planner, 2026-10-30, head `72746884`, code `8cfd0a91`)
+
+Checked by the planner, not taken from the handoff: CI run 40999921257 on
+`8cfd0a91` success, 36 of 36 jobs; Security success. The three gate logs read
+line by line: `g4-mysql` and `g4-mssql` each seed 20,000 rows per table, load
+both, show every insert, update and delete within 120 s (MySQL 17 to 34 s,
+SQL Server 17 to 31 s), report the schema-history topic with
+`retention.ms=9223372036854775807, retention.bytes=-1`, keep Bronze equal to
+the source after a pause and after a `kafka-connect` restart, and see the new
+column; `g4-cdc` is unchanged (32 to 45 s). Diff `3ed4f1f0..8cfd0a91` read for
+the slice's own files (the `main` merge `e4bf8dac` brings SEC-22, reviewed in
+#187): the dial check per driver (S3-a), the renderer split into shared keys
+plus one helper per driver with schema history only for MySQL and SQL Server
+and the bootstrap list validated (S3-b), the three classes on the allowlist,
+`topic_of` per driver (S3-c), migration 0117 targeted on 0066's exact text
+(S3-g), `CDC_KAFKA_BOOTSTRAP` passed to `lakehouse-api` with the fail-closed
+comment. Not re-run locally (no cargo or docker on this VM): CI is the evidence.
+
+Planner decisions on the handoff's two questions:
+- **P1, SQL Server and `db_owner`: option (a), no `db_owner`.** Debezium's call
+  to `sys.sp_cdc_help_jobs` fails with the planned grants, is logged as a
+  warning, and Debezium goes on; the gate measured snapshot and streaming
+  with exactly those grants, within D5. Granting `db_owner` for one
+  informational read would give the connector login the right to change the
+  database, against least privilege. The feature page's "Limits" already says
+  so. If the product owner wants it otherwise, it is a one-line change in the
+  documented grants, not in code.
+- **P2, "unlimited" retention.** Accepted as built: Debezium 3.8 writes
+  `Long.MAX_VALUE` for `retention.ms` and `-1` for `retention.bytes`, both
+  never expire; the check fails on any finite retention. S3-d's "-1" was the
+  planner's error.
+
+Findings:
+- **SHOULD-FIX 1 (S2-d, missed in the slice 2 review).** The TypeScript
+  `CdcDial` contract has no `sslMode`, so the console cannot show or choose a
+  change-capture connector's TLS mode: every connector made in the console is
+  `require`, `verify-ca` and `verify-full` cannot be chosen, and an edit
+  cannot keep a mode set through the API. Add `sslMode` to the contract
+  (`"disable" | "require" | "verify-ca" | "verify-full" | string`, camelCase
+  as serde), a select in `cdc-dial-form.tsx` for all three drivers (default
+  `require`; `disable` labelled plainly as not encrypted, `SEC-14`'s rule; a
+  one-line hint that for SQL Server `verify-ca` checks the host too, S3-b),
+  the review step showing it, and `dial-forms.test.tsx` cases (default sent as
+  `require`, a chosen mode kept on edit). Console only; no Rust change.
