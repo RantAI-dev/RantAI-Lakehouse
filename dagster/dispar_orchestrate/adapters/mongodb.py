@@ -69,6 +69,12 @@ def _bson_safe(value: Any) -> Any:
     return value
 
 
+# The name other modules import: `cdc_apply` (SRC-4 slice 5) turns a captured document into
+# columns with this same conversion, so a batch table and a change-capture table of one
+# collection look alike. One helper, not a second copy (AGENTS.md rule 4).
+bson_safe = _bson_safe
+
+
 @dataclass(frozen=True)
 class AdapterBuildResult:
     sources: dict[str, Iterator[dict]]

@@ -52,6 +52,12 @@ its Bronze column is an integer, not a date. That is a stated limit
 (`docs/core/features/databases-and-change-capture.md`), not a conversion this module
 guesses at without the column's declared type.
 
+MongoDB (`SRC-4` slice 5): the topic is `cdc.<id>.<database>.<collection>`, the event is
+`ExtractNewDocumentState`'s (the same `__op`, `__source_ts_ms`, `__deleted`), the key is `_id`
+and the document is turned into columns by `document_to_columns`, with the batch adapter's own
+value conversion. A delete carries `_id` only (MongoDB keeps no old document). A nested
+document or array is refused, as the batch adapter refuses it.
+
 # Schema changes (`SRC-8`)
 
 A batch that brings a column the Bronze table lacks is reported to the API
@@ -115,8 +121,10 @@ from pyiceberg.expressions import And, BooleanExpression, EqualTo, In, Or
 
 from dispar_orchestrate import dlt_pipeline, ingest_errors, run_reports, schema_observer
 from dispar_orchestrate.adapters import history
+from dispar_orchestrate.adapters import mongodb as mongodb_adapter
 from dispar_orchestrate.adapters import sink as sink_adapter
 from dispar_orchestrate.adapters.kafka import compute_lag
+from dispar_orchestrate.column_gate import UnsupportedColumnType, reject_unsupported_column_types_from_sample
 from dispar_orchestrate.ingest_factory import IngestFactoryConfig, _fetch_connector_for_run, _headers
 from dispar_orchestrate.op_metadata import DEFAULT_RETRY_POLICY, source_metadata
 
@@ -189,6 +197,8 @@ class ApplyTarget:
     key: tuple[str, ...]
     mode: str
     group_id: str
+    # A MongoDB document, not a relational row (`SRC-4` slice 5): see `document_to_columns`.
+    document: bool = False
 
     def __post_init__(self) -> None:
         if self.mode not in MODES:
@@ -210,17 +220,26 @@ def topic_of(connector_id: str, object_name: str, dial: Mapping[str, Any] | None
       Both are `cdc.<id>.<object name>`.
     - SQL Server (`dial.driver == "mssql"`): `<database>.<schema>.<table>`, the database being
       the dial's, because the object name is `<schema>.<table>` (`SRC-4` decision S3-c).
+    - MongoDB (`dial.driver == "mongodb"`): `<database>.<collection>`, the database being the
+      dial's, because the object name is the bare collection (`SRC-4` decision S5-d).
 
     The schema-history topic of MySQL and SQL Server (`cdc.<id>.schema-history`) is never read:
     only the topics of the connector's source objects are.
 
     # Errors
 
-    `CdcSetupError` for a SQL Server dial that names no database."""
+    `CdcSetupError` for a SQL Server or MongoDB dial that names no database."""
     if (dial or {}).get("driver") == "mssql":
         database = (dial or {}).get("database")
         if not isinstance(database, str) or not database:
             raise CdcSetupError("a SQL Server change-capture connector has no database in its dial")
+        return f"{TOPIC_PREFIX}.{connector_id}.{database}.{object_name}"
+    if (dial or {}).get("driver") == "mongodb":
+        # `SRC-4` slice 5 (S5-d): a MongoDB source object is the bare collection name, as
+        # discovery lists it, and Debezium names the topic `<prefix>.<database>.<collection>`.
+        database = (dial or {}).get("database")
+        if not isinstance(database, str) or not database:
+            raise CdcSetupError("a MongoDB change-capture connector has no database in its dial")
         return f"{TOPIC_PREFIX}.{connector_id}.{database}.{object_name}"
     return f"{TOPIC_PREFIX}.{connector_id}.{object_name}"
 
@@ -261,6 +280,7 @@ def targets_of(connector: Mapping[str, Any]) -> list[ApplyTarget]:
                 key=key,
                 mode=mode,
                 group_id=group_of(connector_id),
+                document=(connector.get("dial") or {}).get("driver") == "mongodb",
             )
         )
     return targets
@@ -271,12 +291,61 @@ def targets_of(connector: Mapping[str, Any]) -> list[ApplyTarget]:
 # ---------------------------------------------------------------------------
 
 
-def event_to_row(value: bytes | str | None, offset: int) -> dict[str, Any] | None:
-    """One message as a row, or `None` for a tombstone.
+def _object_id_text(value: Any) -> Any:
+    """A MongoDB `ObjectId` written as extended JSON, `{"$oid": "<hex>"}` (as an object or as
+    the text of one), as its hex string: the form the batch adapter stores (`_bson_safe`).
+    Any other value is returned as it came."""
+    if isinstance(value, str) and value.startswith("{") and '"$oid"' in value:
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return value
+    if isinstance(value, dict) and set(value) == {"$oid"} and isinstance(value["$oid"], str):
+        return value["$oid"]
+    return value
+
+
+def document_to_columns(payload: dict[str, Any]) -> dict[str, Any]:
+    """A flattened MongoDB change event as the columns of a row (`SRC-4` decision S5-d).
+
+    Debezium's `ExtractNewDocumentState` flattens the document and adds `__op`,
+    `__source_ts_ms` and `__deleted`; `_id` is the key. The document's values are converted
+    with the batch adapter's own helper (`adapters.mongodb.bson_safe`: `ObjectId` to its hex
+    string, `Decimal128`, binary), so a batch table and a change-capture table of one
+    collection look alike; an `ObjectId` that arrives as extended JSON is unwrapped first.
+    A nested document or array is refused, as the batch adapter refuses it
+    (`column_gate.reject_unsupported_column_types_from_sample`), here for every event: change
+    capture has no registration-time sample, and a nested value silently dropped or
+    flattened would make Bronze differ from the source. A delete event carries the key only
+    (MongoDB keeps no old document), so its row has `_id` and nulls.
 
     # Errors
 
-    `CdcEventError` for a message that is not a JSON object with an `__op`."""
+    `CdcEventError` for a nested document or array. Fixed text: it names no field and no
+    value."""
+    document = {
+        name: mongodb_adapter.bson_safe(_object_id_text(value))
+        for name, value in payload.items()
+        if name not in DEBEZIUM_FIELDS
+    }
+    try:
+        reject_unsupported_column_types_from_sample(document)
+    except UnsupportedColumnType:
+        raise CdcEventError(
+            "a MongoDB document has a nested document or array field, which change capture does "
+            "not load (the batch MongoDB connector refuses it too)"
+        ) from None
+    return {**document, **{name: payload[name] for name in DEBEZIUM_FIELDS if name in payload}}
+
+
+def event_to_row(value: bytes | str | None, offset: int, *, document: bool = False) -> dict[str, Any] | None:
+    """One message as a row, or `None` for a tombstone. `document` marks a MongoDB event
+    (`document_to_columns`).
+
+    # Errors
+
+    `CdcEventError` for a message that is not a JSON object with an `__op`, or (`document`)
+    a nested document or array."""
     if value is None:
         return None
     try:
@@ -287,6 +356,8 @@ def event_to_row(value: bytes | str | None, offset: int) -> dict[str, Any] | Non
         return None
     if not isinstance(payload, dict) or "__op" not in payload:
         raise CdcEventError("a change message is not a flattened Debezium event with an __op")
+    if document:
+        payload = document_to_columns(payload)
     row = {_loaded_name(name): value for name, value in payload.items() if name not in DEBEZIUM_FIELDS}
     row["_op"] = payload["__op"]
     row["_source_ts_ms"] = payload.get("__source_ts_ms")
@@ -337,7 +408,9 @@ class Batch:
     next_offsets: dict[Any, int]
 
 
-def read_batch(consumer: Any, *, max_events: int = BATCH_EVENTS, poll_ms: int = POLL_MS) -> Batch:
+def read_batch(
+    consumer: Any, *, max_events: int = BATCH_EVENTS, poll_ms: int = POLL_MS, document: bool = False
+) -> Batch:
     """Read up to `max_events` messages; an empty poll ends the batch (caught up).
     Commits nothing.
 
@@ -356,7 +429,7 @@ def read_batch(consumer: Any, *, max_events: int = BATCH_EVENTS, poll_ms: int = 
         for tp, records in polled.items():
             for record in records:
                 next_offsets[tp] = max(next_offsets.get(tp, 0), record.offset + 1)
-                row = event_to_row(record.value, record.offset)
+                row = event_to_row(record.value, record.offset, document=document)
                 if row is not None:
                     rows.append(row)
     return Batch(rows=rows, next_offsets=next_offsets)
@@ -551,7 +624,7 @@ def apply_table(
     total = 0
     while time.monotonic() < deadline:
         started = time.monotonic()
-        batch = read_batch(consumer, max_events=max_events, poll_ms=poll_ms)
+        batch = read_batch(consumer, max_events=max_events, poll_ms=poll_ms, document=target.document)
         if not batch.next_offsets:
             return TableResult(CAUGHT_UP, total)
         rows = batch.rows
