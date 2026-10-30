@@ -55,6 +55,8 @@ const MYSQL_BINLOG_FORMAT: &str = "SELECT CAST(@@binlog_format AS CHAR)";
 const MYSQL_BINLOG_ROW_IMAGE: &str = "SELECT CAST(@@binlog_row_image AS CHAR)";
 const MYSQL_GRANTS: &str = "SHOW GRANTS FOR CURRENT_USER()";
 const MYSQL_EXPIRE: &str = "SELECT CAST(@@binlog_expire_logs_seconds AS CHAR)";
+const MYSQL_EXPIRE_DAYS: &str = "SELECT CAST(@@expire_logs_days AS CHAR)";
+const MYSQL_CURRENT_USER: &str = "SELECT CURRENT_USER()";
 
 const MSSQL_CDC_ENABLED: &str = "SELECT is_cdc_enabled FROM sys.databases WHERE name = DB_NAME()";
 const MSSQL_TABLES: &str = "SELECT s.name, t.name, t.is_tracked_by_cdc FROM sys.tables t \
@@ -176,6 +178,13 @@ async fn mysql_facts(
                 .await
                 .ok(),
             expire_seconds: mysql_scalar(&mut conn, MYSQL_EXPIRE).await,
+            // Slice 4 review SHOULD-FIX 6: the variable is gone on 8.4, which reads as 0.
+            expire_days: Some(
+                mysql_scalar(&mut conn, MYSQL_EXPIRE_DAYS)
+                    .await
+                    .unwrap_or_else(|| "0".to_owned()),
+            ),
+            current_user: mysql_scalar(&mut conn, MYSQL_CURRENT_USER).await,
         };
         let _ = conn.close().await;
         Some(facts)
@@ -250,6 +259,9 @@ async fn read_mssql(client: &mut MssqlClient) -> MssqlFacts {
     // refusal leaves the state unread, never "running" (decision S4-f).
     let agent = match mssql_rows(client, MSSQL_AGENT).await {
         None => AgentState::Unread,
+        // No row at all means not listed (Express, some platforms), not stopped
+        // (Slice 4 review SHOULD-FIX 7).
+        Some(rows) if rows.is_empty() => AgentState::NotListed,
         Some(rows) => {
             let running = rows.iter().any(|row| {
                 row.try_get::<&str, _>(0)

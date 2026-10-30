@@ -242,6 +242,10 @@ pub struct MysqlFacts {
     pub grants: Option<Vec<String>>,
     /// `@@binlog_expire_logs_seconds` as text.
     pub expire_seconds: Option<String>,
+    /// `@@expire_logs_days` as text; `0` where the variable no longer exists (8.4).
+    pub expire_days: Option<String>,
+    /// `CURRENT_USER()`, `user@host`: the account a `GRANT` must name.
+    pub current_user: Option<String>,
 }
 
 fn mysql_string(value: &str) -> String {
@@ -252,6 +256,16 @@ fn mysql_string(value: &str) -> String {
 /// replication privileges and the binlog retention.
 #[must_use]
 pub fn mysql_checks(facts: &MysqlFacts, user: &str) -> Vec<SetupCheck> {
+    // Slice 4 review SHOULD-FIX 8: the account is the one the server says, not the dial's
+    // user at an invented host.
+    let account = match facts
+        .current_user
+        .as_deref()
+        .and_then(|u| u.rsplit_once('@'))
+    {
+        Some((name, host)) => format!("{}@{}", mysql_string(name), mysql_string(host)),
+        None => format!("{}@'%'", mysql_string(user)),
+    };
     vec![
         mysql_log_bin(facts),
         mysql_setting(
@@ -268,7 +282,7 @@ pub fn mysql_checks(facts: &MysqlFacts, user: &str) -> Vec<SetupCheck> {
             "binlog_row_image is FULL.",
             "binlog_row_image must be FULL for change capture.",
         ),
-        mysql_grants(facts, user),
+        mysql_grants(facts, &account),
         mysql_retention(facts),
     ]
 }
@@ -300,7 +314,7 @@ fn mysql_setting(
         Some(_) => missing(
             setting,
             missing_message,
-            format!("SET GLOBAL {setting} = '{wanted}';"),
+            format!("SET PERSIST {setting} = '{wanted}';"),
         ),
     }
 }
@@ -308,19 +322,27 @@ fn mysql_setting(
 /// Whether the grants hold the two replication privileges on every database
 /// (`ON *.*`), directly or through `ALL PRIVILEGES`.
 fn has_replication_grants(grants: &[String]) -> bool {
-    let global: Vec<String> = grants
-        .iter()
-        .filter(|g| g.contains(" ON *.* "))
-        .map(|g| g.to_ascii_uppercase())
-        .collect();
-    if global.iter().any(|g| g.contains("ALL PRIVILEGES")) {
-        return true;
+    // Only the privilege list between `GRANT ` and ` ON *.*` counts (a role name or a
+    // table name that contains a privilege's words must not).
+    let mut held: Vec<String> = Vec::new();
+    for grant in grants {
+        let upper = grant.to_ascii_uppercase();
+        let Some(rest) = upper.strip_prefix("GRANT ") else {
+            continue;
+        };
+        let Some((privileges, scope)) = rest.split_once(" ON ") else {
+            continue;
+        };
+        if scope.starts_with("*.* ") {
+            held.extend(privileges.split(',').map(|p| p.trim().to_owned()));
+        }
     }
-    let holds = |privilege: &str| global.iter().any(|g| g.contains(privilege));
-    holds("REPLICATION SLAVE") && holds("REPLICATION CLIENT")
+    held.iter().any(|p| p == "ALL PRIVILEGES")
+        || (held.iter().any(|p| p == "REPLICATION SLAVE")
+            && held.iter().any(|p| p == "REPLICATION CLIENT"))
 }
 
-fn mysql_grants(facts: &MysqlFacts, user: &str) -> SetupCheck {
+fn mysql_grants(facts: &MysqlFacts, account: &str) -> SetupCheck {
     const SETTING: &str = "replication privileges";
     match facts.grants.as_deref() {
         None => unchecked(SETTING, UNREAD),
@@ -331,10 +353,7 @@ fn mysql_grants(facts: &MysqlFacts, user: &str) -> SetupCheck {
         Some(_) => missing(
             SETTING,
             "The login needs REPLICATION SLAVE and REPLICATION CLIENT.",
-            format!(
-                "GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO {}@'%';",
-                mysql_string(user)
-            ),
+            format!("GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO {account};"),
         ),
     }
 }
@@ -345,16 +364,29 @@ fn mysql_retention(facts: &MysqlFacts) -> SetupCheck {
         .expire_seconds
         .as_deref()
         .and_then(|v| v.trim().parse::<i64>().ok());
-    match seconds {
-        None => unchecked(SETTING, UNREAD),
-        Some(0) => ok(SETTING, "Binary logs never expire."),
-        Some(s) if s >= MIN_BINLOG_RETENTION_SECONDS => {
+    let days = facts
+        .expire_days
+        .as_deref()
+        .and_then(|v| v.trim().parse::<i64>().ok());
+    let (Some(seconds), Some(days)) = (seconds, days) else {
+        return unchecked(SETTING, UNREAD);
+    };
+    // Slice 4 review SHOULD-FIX 6: 0 seconds is "never expire" only when the legacy
+    // `expire_logs_days` is 0 too; a non-zero `binlog_expire_logs_seconds` takes precedence.
+    let effective = if seconds != 0 {
+        seconds
+    } else {
+        days.saturating_mul(24 * 60 * 60)
+    };
+    match effective {
+        0 => ok(SETTING, "Binary logs never expire."),
+        s if s >= MIN_BINLOG_RETENTION_SECONDS => {
             ok(SETTING, "Binary logs are kept for at least 7 days.")
         }
-        Some(_) => missing(
+        _ => missing(
             SETTING,
             "Binary logs expire in under 7 days, so a connector stopped for longer cannot catch up.",
-            format!("SET GLOBAL binlog_expire_logs_seconds = {MIN_BINLOG_RETENTION_SECONDS};"),
+            format!("SET PERSIST binlog_expire_logs_seconds = {MIN_BINLOG_RETENTION_SECONDS};"),
         ),
     }
 }
@@ -369,8 +401,11 @@ pub enum AgentState {
     Unread,
     /// The service is running.
     Running,
-    /// The service is not running or not listed.
+    /// The service is listed and is not running.
     NotRunning,
+    /// The statement ran and listed no Agent (an edition or platform without one):
+    /// not stopped, not known (Slice 4 review SHOULD-FIX 7).
+    NotListed,
 }
 
 /// What the `SQL Server` statements returned; `None` for one that could not be
@@ -419,9 +454,9 @@ fn mssql_table(facts: &MssqlFacts, qualified: &str) -> SetupCheck {
         return unchecked(&setting, UNREAD);
     };
     let (schema, table) = qualified.split_once('.').unwrap_or(("dbo", qualified));
-    let tracked = listed
-        .iter()
-        .any(|(s, t, tracked)| *tracked && s == schema && t == table);
+    let tracked = listed.iter().any(|(s, t, tracked)| {
+        *tracked && s.eq_ignore_ascii_case(schema) && t.eq_ignore_ascii_case(table)
+    });
     if tracked {
         return ok(&setting, "Change data capture is enabled on the table.");
     }
@@ -443,6 +478,11 @@ fn mssql_agent(facts: &MssqlFacts) -> SetupCheck {
             SETTING,
             "Reading it needs VIEW SERVER STATE, which the documented login does not have. \
              Check on the server that SQL Server Agent runs: the capture job runs under it.",
+        ),
+        AgentState::NotListed => unchecked(
+            SETTING,
+            "This server lists no SQL Server Agent (some editions and platforms do not). \
+             Check on the server that it runs: the capture job runs under it.",
         ),
         AgentState::Running => ok(SETTING, "SQL Server Agent is running."),
         AgentState::NotRunning => SetupCheck {
@@ -586,6 +626,8 @@ mod tests {
                 "GRANT SELECT ON `app`.* TO `cdc`@`%`".to_owned(),
             ]),
             expire_seconds: Some("2592000".to_owned()),
+            expire_days: Some("0".to_owned()),
+            current_user: Some("cdc@%".to_owned()),
         }
     }
 
@@ -648,6 +690,57 @@ mod tests {
         );
     }
 
+    /// Slice 4 review SHOULD-FIX 6 and 8, and the privilege-list NIT.
+    #[test]
+    fn legacy_expiry_days_and_the_servers_own_account_are_honoured() {
+        let days = |seconds: &str, days: &str| MysqlFacts {
+            expire_seconds: Some(seconds.to_owned()),
+            expire_days: Some(days.to_owned()),
+            ..mysql_ready()
+        };
+        assert_eq!(mysql_retention(&days("0", "0")).status, SetupStatus::Ok);
+        assert_eq!(
+            mysql_retention(&days("0", "3")).status,
+            SetupStatus::Missing
+        );
+        assert_eq!(mysql_retention(&days("0", "30")).status, SetupStatus::Ok);
+        assert_eq!(
+            mysql_retention(&days("2592000", "1")).status,
+            SetupStatus::Ok
+        );
+        let unread = MysqlFacts {
+            expire_days: None,
+            ..mysql_ready()
+        };
+        assert_eq!(mysql_retention(&unread).status, SetupStatus::Unchecked);
+
+        let facts = MysqlFacts {
+            grants: Some(vec!["GRANT SELECT ON *.* TO `o'b`@`10.0.%`".to_owned()]),
+            current_user: Some("o'b@10.0.%".to_owned()),
+            ..mysql_ready()
+        };
+        let checks = mysql_checks(&facts, "dial_user");
+        assert_eq!(
+            checks[3].command.as_deref(),
+            Some("GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'o''b'@'10.0.%';")
+        );
+        let table_named_like_a_privilege =
+            ["GRANT SELECT ON `REPLICATION SLAVE REPLICATION CLIENT`.* TO `u`@`%`".to_owned()];
+        assert!(!has_replication_grants(&table_named_like_a_privilege));
+    }
+
+    #[test]
+    fn an_agent_query_that_lists_no_agent_is_unchecked_not_stopped() {
+        let facts = MssqlFacts {
+            cdc_enabled: Some(true),
+            tables: Some(Vec::new()),
+            agent: AgentState::NotListed,
+        };
+        let checks = mssql_checks(&facts, &[]);
+        assert_eq!(checks[1].status, SetupStatus::Unchecked);
+        assert!(checks[1].message.contains("lists no SQL Server Agent"));
+    }
+
     #[test]
     fn the_wrong_binlog_format_and_row_image_each_name_their_command() {
         let facts = MysqlFacts {
@@ -660,11 +753,11 @@ mod tests {
         assert_eq!(&statuses(&checks)[..3], [SetupStatus::Missing; 3]);
         assert_eq!(
             checks[1].command.as_deref(),
-            Some("SET GLOBAL binlog_format = 'ROW';")
+            Some("SET PERSIST binlog_format = 'ROW';")
         );
         assert_eq!(
             checks[2].command.as_deref(),
-            Some("SET GLOBAL binlog_row_image = 'FULL';")
+            Some("SET PERSIST binlog_row_image = 'FULL';")
         );
     }
 
