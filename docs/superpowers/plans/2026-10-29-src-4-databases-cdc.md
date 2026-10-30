@@ -1708,6 +1708,24 @@ code. One status, "Dependency review (PR only)", still read *pending* in `gh pr 
 concluded; the Security run itself is success. *Not verified:* that status's own state; the setup checks'
 text in a browser (unit tests only).
 
+### Slice 5, T5.11 (developer, Sonnet, 2026-10-30)
+
+Merge `21103519` of `origin/feat/data-phase-4-src-4` at `dfe21ca3` (slice 6, Amendments 9 and 10, migration
+0120) into `feat/src-4-slice-5`. Conflicts, all kept on both sides, none rewrote slice 6 code: `kafka_connect.rs`
+(five classes in the allowlist and its test), `cdc.rs` (both connector-class constants), `cdc_apply.py`
+(`topic_of` docstring), `ops/gates/coverage.json` (both entries), `tests/connector_type.rs` (28 types, both
+type tests). Counts recounted from the migrations: 28 connector types, 23 supported (the lint and the registry
+tests say 23). Oracle change capture is `Dial::Cdc` with `SqlDriver::Oracle`, not a variant of its own; every
+`match` I read names `Dial::Cdc` and `Dial::CdcMongo`.
+
+**CI:** run `41038451471` on `21103519`. Every gate passes (`g4-cdc`, `g4-mysql`, `g4-mssql`, `g4-mongo`,
+`g4-oracle` among the rest), `Rust · test (stable)` passes, Security run `41038451671` success. One check fails:
+**`Rust · clippy`**, `clippy::too_many_lines` (103/100) on `validate_cdc_dial_post_parse` in
+`lakehouse-store/src/ingest_spec.rs`. That function is slice 6's, byte-identical to the phase head's
+(`dfe21ca3`), and PR #264 on the phase branch fails the same job (run `41033040481`). So it is inherited, not
+caused by the merge, and I did not edit it (it would conflict with slice 6's own fix). `ci-required` fails
+because of it. After slice 6 fixes it, one more merge of the phase head clears this branch.
+
 ## Review
 
 (The planner writes findings here, tagged `BLOCKER` or `SHOULD-FIX`.)
