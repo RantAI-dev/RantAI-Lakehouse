@@ -1569,6 +1569,40 @@ present.
 A malformed value fails startup rather than quietly disabling the check. With
 the setting unset, the API logs one warning at boot naming it.
 
+### Where the setting is described
+
+`CATALOG_TENANT_ID` is one environment variable of the API service. It is
+declared in `docker-compose.yml` with an empty default — an unset value
+degrades to the documented refusal, not a boot failure — and listed in
+`.env.example` with the same wording as this section. The API reads it
+at startup (`Config::catalog_tenant_id`), and every route that answers
+"may this caller read the shared catalog" asks the same question of it —
+there is no second setting and no second rule.
+
+### What the setting is for now (`SEC-50`)
+
+The setting is no longer about two lists. Every statement that reads
+the shared catalog passes one tenant gate, and the deployment's shared
+catalog belongs to the tenant this setting names:
+
+- **the authored pipelines** act as their own tenant
+  (`pipeline_definition.tenant_id`), so a pipeline of tenant B can no
+  longer read a `bronze.*` upload table that tenant A claimed;
+- **the scheduled Gold export** has no user behind it, so it acts as the
+  tenant that owns the shared catalog — and a deployment with several
+  tenants and no `CATALOG_TENANT_ID` **refuses the export outright**,
+  with a 422 that names this setting;
+- the **dashboards, the embeds, the public links and the alerts** read the
+  same shared catalog and follow in the second slice of `SEC-50`.
+
+**What this means for an operator.** On a deployment with more than one
+tenant, this setting is **required** for regular users to see shared data
+at all: without it, a member of any tenant other than the catalog's own
+sees no shared rows, and a job with no user (the Gold export) is refused.
+With it set, the members of that tenant read the shared catalog as
+before, and the other tenants read only their own uploads. A
+**single-tenant** deployment is unaffected either way.
+
 ## Gold export: growth and background merges
 
 Every publish of a changed mart appends one full copy — an append-only
