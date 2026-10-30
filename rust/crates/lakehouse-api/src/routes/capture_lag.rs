@@ -19,7 +19,10 @@
 //! and only the call that changed it delivers, so two posts racing over one
 //! crossing send one alert. A delivery that cannot be made (the rule store is
 //! unreadable) puts the flag back, so the next post tries again instead of
-//! losing the alert. A connector paused by a person is not evaluated.
+//! losing the alert, unless the undo fails too (then the flag stays as it was
+//! flipped and the alert is lost), and a concurrent post that closes an alert
+//! whose delivery then fails can leave the order of the two out of step. A
+//! connector paused by a person is not evaluated.
 //!
 //! # Limit
 //!
@@ -188,6 +191,15 @@ pub async fn observe(
             .await?;
         }
         if let Some(changed) = entry.last_source_ts {
+            // Slice 4 review SHOULD-FIX 2: a source time in the future would stick
+            // (`last_source_ts` only moves forward) and hide every crossing until the
+            // wall clock caught up, so it is stored as now and the cap is logged.
+            let changed = if changed > now {
+                tracing::warn!(connector_id = %id, table = %entry.table, "a source change time in the future was capped to now");
+                now
+            } else {
+                changed
+            };
             store::record_last_change(pool, &id, &entry.table, changed).await?;
         }
     }
@@ -720,6 +732,23 @@ mod tests {
         assert!(!open_flag(&pool, &id).await, "the flag was put back");
         let stored = store::list_tables(&pool, &id).await.unwrap();
         assert_eq!(stored[0].backlog, Some(5));
+    }
+
+    /// Slice 4 review SHOULD-FIX 2: a source time in the future is stored as now.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_source_time_in_the_future_is_capped_to_now(pool: sqlx::PgPool) {
+        let h = harness(&pool, true).await;
+        let id = cdc_connector(&h, "lag cap").await;
+        let (status, _) = post(
+            &h,
+            &id,
+            json!({ "tables": [{ "table": "public.orders", "lastSourceTsMs": now_ms() + 3_600_000 }] }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let stored = store::list_tables(&pool, &id).await.unwrap();
+        let changed = stored[0].last_source_ts.unwrap();
+        assert!(changed <= OffsetDateTime::now_utc(), "{changed}");
     }
 
     /// A connector paused by a person is not evaluated.
