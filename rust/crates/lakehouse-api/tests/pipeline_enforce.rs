@@ -654,6 +654,10 @@ async fn claim_table_for(pool: &PgPool, tenant: &str) {
 /// this service that can name another tenant's `bronze.*` table. The
 /// refusal is `SEC-20`'s, and it comes before the statement reaches the
 /// engine.
+///
+/// `SEC-50` R2: the status is 422, not 404. The route is called by the
+/// orchestrator and by nobody else, and the orchestrator treats only 409
+/// and 422 as final — a 404 would be retried as a transient failure.
 #[tokio::test]
 async fn a_pipeline_cannot_read_an_upload_table_another_tenant_claimed() {
     let (router, pool, cookie, engine) = app_with_engine().await;
@@ -669,7 +673,7 @@ async fn a_pipeline_cannot_read_an_upload_table_another_tenant_claimed() {
 
     let (status, body) = enforce(&router, &cookie, &id, BRONZE_SQL).await;
 
-    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
     assert_eq!(body["error"].as_str(), Some(BRONZE_REFUSAL), "{body}");
     let requests = engine
         .received_requests()
@@ -702,6 +706,9 @@ async fn a_pipeline_reads_an_upload_table_its_own_tenant_claimed() {
 
 /// `SEC-50`: a pipeline with no tenant of its own reaches nothing — the
 /// migration's own fail-closed rule for an unassigned pipeline.
+///
+/// `SEC-50` R2: the status is 422, not 404, for the same reason as the
+/// cross-tenant refusal above.
 #[tokio::test]
 async fn a_pipeline_with_no_tenant_is_refused() {
     let (router, pool, cookie, _engine) = app_with_engine().await;
@@ -715,7 +722,7 @@ async fn a_pipeline_with_no_tenant_is_refused() {
 
     let (status, body) = enforce(&router, &cookie, &id, BRONZE_SQL).await;
 
-    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
     assert_eq!(body["error"].as_str(), Some(BRONZE_REFUSAL), "{body}");
 }
 
@@ -748,7 +755,10 @@ async fn a_pipeline_authored_by_an_unrestricted_principal_is_not_refused_for_its
 
 /// `SEC-50`: the author is applied as if they had sent the pipeline's
 /// tenant in `X-Tenant`, so an author who left that tenant is refused —
-/// the same 404 a header naming a foreign tenant gets.
+/// the same sentence a header naming a foreign tenant gets.
+///
+/// `SEC-50` R2: the status is 422, not 404, for the same reason as the
+/// cross-tenant refusal above.
 #[tokio::test]
 async fn an_author_who_left_the_pipelines_tenant_is_refused() {
     let (router, pool, cookie, _engine) = app_with_engine().await;
@@ -769,6 +779,6 @@ async fn an_author_who_left_the_pipelines_tenant_is_refused() {
 
     let (status, body) = enforce(&router, &cookie, &id, BRONZE_SQL).await;
 
-    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
     assert_eq!(body["error"].as_str(), Some("tenant not found"), "{body}");
 }
