@@ -65,6 +65,20 @@ disappears is not detected here: a removed column simply stops arriving. A refus
 schema is never retried: `Failure(allow_retries=False)` (a retry hid one for 13 minutes
 in slice 0).
 
+# Lag (`SRC-4` slice 4)
+
+The orchestrator observes, the API decides what lag is (`lakehouse-api` `capture_lag.rs`). Two
+best-effort posts go to `POST /api/connectors/{id}/capture/observations`:
+
+- the sensor posts each table's backlog (unread messages on its topic) on every tick, for EVERY
+  change-capture connector, paused, busy or failed ones included: a failed connector is the case
+  the lag alert exists for. A table whose backlog could not be measured is left out, never sent as 0;
+- the applier posts, after each Bronze commit, the largest `_source_ts_ms` of the batch, the source
+  commit time of the last change it applied.
+
+A post that cannot be sent is logged by kind and the load goes on (a report never fails the load, as
+in `run_reports`); nothing is queued for later, so the API shows "not known since" instead.
+
 # Production differences from the prototype
 
 - Config comes from the connector (`GET /api/connectors/ingestible`): topics from its
@@ -524,6 +538,13 @@ def _filter_columns(rows: list[dict[str, Any]], keep: Sequence[str]) -> list[dic
     return [{name: value for name, value in row.items() if name in allowed} for row in rows]
 
 
+def last_source_ts_ms(rows: Iterable[Mapping[str, Any]]) -> int | None:
+    """The source commit time (ms) of the newest change in `rows`: the largest `_source_ts_ms`,
+    or `None` when no row carries one. Never a guess: a batch of tombstones has none."""
+    times = [ts for ts in (row.get("_source_ts_ms") for row in rows) if isinstance(ts, int) and not isinstance(ts, bool)]
+    return max(times) if times else None
+
+
 def apply_table(
     consumer: Any,
     target: ApplyTarget,
@@ -535,6 +556,7 @@ def apply_table(
     max_events: int = BATCH_EVENTS,
     poll_ms: int = POLL_MS,
     on_batch: Callable[[int, float], None] = lambda events, seconds: None,
+    on_applied: Callable[[int], None] = lambda source_ts_ms: None,
 ) -> TableResult:
     """Apply one table's topic batch by batch until it is caught up, `deadline`
     (a `time.monotonic()` value) passes, or the API asks to wait.
@@ -547,7 +569,10 @@ def apply_table(
 
     `CdcEventError` for a bad message; `CdcSchemaChange`, `history.HistoryRefused`,
     `schema_observer.ObservationRefused` and `ObservationUnreachable`; whatever the
-    sink and the catalog raise."""
+    sink and the catalog raise.
+
+    `on_applied` is called with the batch's newest source commit time after its offsets
+    are committed (for the lag the API shows); it must not raise."""
     total = 0
     while time.monotonic() < deadline:
         started = time.monotonic()
@@ -582,6 +607,9 @@ def apply_table(
                     logger.warning("%r loaded, but its schema could not be reported to the API: %s", target.name, exc)
         # Reached only when the write above returned: the Bronze commit comes first.
         commit_offsets(batch.next_offsets)
+        changed_at = last_source_ts_ms(batch.rows)
+        if changed_at is not None:
+            on_applied(changed_at)
         total += written
         on_batch(written, time.monotonic() - started)
     return TableResult(OUT_OF_TIME, total)
@@ -661,6 +689,7 @@ def run_connector(
         author=f"connector {connector_id}, run {str(context.run_id)[:8]}",
     )
     deadline = time.monotonic() + run_seconds
+    observer_cfg = schema_observer.ObserverConfig.from_env()
     consumer = _consumer(config, group_of(connector_id))
     attempt = _retry_number(context) + 1
     try:
@@ -679,6 +708,9 @@ def run_connector(
                     deadline=deadline,
                     on_batch=lambda events, seconds, name=target.name: context.log.info(
                         f"CDC_BATCH target={name} events={events} seconds={seconds:.2f}"
+                    ),
+                    on_applied=lambda ts_ms, name=target.name: post_capture_observations(
+                        observer_cfg, connector_id, [{"table": name, "lastSourceTsMs": ts_ms}]
                     ),
                 )
             except (CdcSchemaChange, history.HistoryRefused, schema_observer.ObservationRefused, CdcEventError) as exc:
@@ -795,32 +827,122 @@ def fetch_cdc_connectors(cfg: IngestFactoryConfig) -> list[dict[str, Any]]:
     return [c for c in connectors if c.get("adapter") == "cdc"]
 
 
+def _topic_backlog(consumer: Any, topic: str) -> int | None:
+    """Messages on `topic` past the consumer group's committed offsets (every partition), or
+    `None` when that could not be measured (never a made-up 0). A topic that does not exist yet
+    counts 0."""
+    from kafka import TopicPartition
+
+    try:
+        total = 0
+        for partition in sorted(consumer.partitions_for_topic(topic) or set()):
+            tp = TopicPartition(topic, partition)
+            committed = consumer.committed(tp)
+            if committed is None:
+                committed = consumer.beginning_offsets([tp]).get(tp, 0)
+            lag = compute_lag(consumer, topic=topic, partition=partition, committed_offset=committed)
+            if lag is None:
+                return None
+            total += lag
+        return total
+    except Exception:  # noqa: BLE001 -- any broker failure means "not measured"
+        return None
+
+
+def backlog_by_table(
+    config: CdcConfig, group_id: str, topics: Mapping[str, str], consumer: Any | None = None
+) -> dict[str, int | None]:
+    """The backlog of each table (`topics` maps a source object's name to its topic): the number
+    of messages the applier has not read, or `None` for a table that could not be measured."""
+    owned = consumer is None
+    consumer = consumer or _consumer(config, group_id)
+    try:
+        return {name: _topic_backlog(consumer, topic) for name, topic in topics.items()}
+    finally:
+        if owned:
+            consumer.close()
+
+
+def total_backlog(backlogs: Mapping[str, int | None]) -> int | None:
+    """The sum of the tables' backlogs, or `None` when any of them could not be measured."""
+    if any(value is None for value in backlogs.values()):
+        return None
+    return sum(value for value in backlogs.values() if value is not None)
+
+
+def _total_of(backlogs: Mapping[str, int | None] | None) -> int | None:
+    """`total_backlog`, with `None` for a connector that could not be measured at all."""
+    return None if backlogs is None else total_backlog(backlogs)
+
+
 def unconsumed(config: CdcConfig, group_id: str, topics: Sequence[str], consumer: Any | None = None) -> int | None:
     """Messages on `topics` past the group's committed offsets (every partition), or
     `None` when that could not be measured (never a made-up 0). A topic that does not
     exist yet counts 0."""
-    from kafka import TopicPartition
+    return total_backlog(backlog_by_table(config, group_id, {topic: topic for topic in topics}, consumer))
 
-    owned = consumer is None
-    consumer = consumer or _consumer(config, group_id)
+
+def post_capture_observations(cfg: schema_observer.ObserverConfig, connector_id: str, tables: list[dict[str, Any]]) -> bool:
+    """Tell the API what the orchestrator saw (`tables` is `[{table, backlog?, lastSourceTsMs?}]`).
+    Returns whether it was sent and never raises: a report never fails the load, and nothing is
+    queued (the API then shows "not known since"). The log names the kind of failure only."""
+    if not tables:
+        return True
     try:
-        total = 0
-        for topic in topics:
-            for partition in sorted(consumer.partitions_for_topic(topic) or set()):
-                tp = TopicPartition(topic, partition)
-                committed = consumer.committed(tp)
-                if committed is None:
-                    committed = consumer.beginning_offsets([tp]).get(tp, 0)
-                lag = compute_lag(consumer, topic=topic, partition=partition, committed_offset=committed)
-                if lag is None:
-                    return None
-                total += lag
-        return total
-    except Exception:  # noqa: BLE001 -- any broker failure means "not measured"
-        return None
-    finally:
-        if owned:
-            consumer.close()
+        schema_observer._post_json(
+            cfg, f"/api/connectors/{connector_id}/capture/observations", {"tables": tables}, "capture observation"
+        )
+    except (schema_observer.ObservationRefused, schema_observer.ObservationUnreachable) as exc:
+        # Their messages are fixed: the kind of failure and an HTTP status.
+        logger.warning("the capture observation of %s was not sent: %s", connector_id, exc)
+        return False
+    except Exception as exc:  # noqa: BLE001 -- a report never fails the load, whatever went wrong
+        logger.warning("the capture observation of %s was not sent (%s)", connector_id, type(exc).__name__)
+        return False
+    return True
+
+
+def topics_of(connector: Mapping[str, Any]) -> dict[str, str]:
+    """A connector's tables, each source object's name mapped to its topic.
+
+    # Errors
+
+    `CdcSetupError` for a SQL Server dial that names no database."""
+    return {
+        o["name"]: topic_of(connector["id"], o["name"], connector.get("dial"))
+        for o in connector.get("sourceObjects") or []
+        if o.get("name")
+    }
+
+
+def measure_backlogs(
+    config: CdcConfig,
+    connectors: Sequence[Mapping[str, Any]],
+    measure: Callable[[CdcConfig, str, Mapping[str, str]], dict[str, int | None]] = backlog_by_table,
+) -> dict[str, dict[str, int | None] | None]:
+    """The backlog of every table of every connector, paused or not. A connector whose topics
+    cannot even be named (a setup error) maps to `None`: the run reports that error, and the
+    sensor treats the connector as unmeasured."""
+    measured: dict[str, dict[str, int | None] | None] = {}
+    for connector in connectors:
+        try:
+            topics = topics_of(connector)
+        except CdcSetupError as exc:
+            logger.warning("the topics of %s could not be named: %s", connector["id"], exc)
+            measured[connector["id"]] = None
+            continue
+        measured[connector["id"]] = measure(config, group_of(connector["id"]), topics)
+    return measured
+
+
+def report_backlogs(
+    cfg: schema_observer.ObserverConfig, measured: Mapping[str, Mapping[str, int | None] | None]
+) -> None:
+    """Post each connector's measured backlogs. A table that was not measured is left out, not
+    sent as 0."""
+    for connector_id, backlogs in measured.items():
+        tables = [{"table": name, "backlog": value} for name, value in (backlogs or {}).items() if value is not None]
+        post_capture_observations(cfg, connector_id, tables)
 
 
 def _busy(instance: Any) -> set[str]:
@@ -869,18 +991,6 @@ def evaluate(
     return requests_, notes
 
 
-def _lag_of(config: CdcConfig) -> Callable[[Mapping[str, Any]], int | None]:
-    def lag(connector: Mapping[str, Any]) -> int | None:
-        topics = [
-            topic_of(connector["id"], o["name"], connector.get("dial"))
-            for o in connector.get("sourceObjects") or []
-            if o.get("name")
-        ]
-        return unconsumed(config, group_of(connector["id"]), topics)
-
-    return lag
-
-
 # default_status=RUNNING: a sensor that ships stopped silently never fires, and change capture
 # is a stream, not a schedule a person turns on.
 @sensor(
@@ -901,7 +1011,13 @@ def cdc_apply_sensor(context: SensorEvaluationContext) -> SensorResult:
     if not cfg.service_token:
         return SensorResult(skip_reason="INGEST_SERVICE_TOKEN is unset, so change-capture connectors cannot be read")
     connectors = fetch_cdc_connectors(cfg)
-    run_requests, notes = evaluate(context.instance, connectors, lag=_lag_of(config))
+    # Every connector's backlog is measured and reported, paused, busy or failed ones too: the
+    # API needs it for the lag, and a failed connector is what the lag alert is for.
+    measured = measure_backlogs(config, connectors)
+    report_backlogs(schema_observer.ObserverConfig.from_env(), measured)
+    run_requests, notes = evaluate(
+        context.instance, connectors, lag=lambda connector: _total_of(measured.get(connector["id"]))
+    )
     for note in notes:
         context.log.info(note)
     if not run_requests:
