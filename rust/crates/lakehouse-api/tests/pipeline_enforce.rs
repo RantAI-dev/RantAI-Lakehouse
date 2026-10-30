@@ -100,9 +100,21 @@ async fn mount(ch: &MockServer) {
         .await;
 }
 
-async fn app() -> (axum::Router, PgPool, String) {
-    let (router, pool, cookie, _engine) = app_with_engine().await;
-    (router, pool, cookie)
+/// The same app, without the engine handle.
+///
+/// The stand-in is a BARE `wiremock` server, not a pooled one. `wiremock`'s
+/// `MockServer::start()` hands out a server from a global pool, and the
+/// server goes back into that pool the moment the last handle to it is
+/// dropped — so a helper that dropped the engine it built would leave the
+/// app's `CH_URL` pointing at an address another test is then given, and
+/// that test's requests would land in this one's request log. A bare
+/// server is never pooled, so each test's engine is its own.
+///
+/// It is handed back to the caller so it stays ALIVE for the whole test:
+/// a bare server stops when its last handle goes, and the app's `CH_URL`
+/// must keep pointing at a running engine.
+async fn app() -> (axum::Router, PgPool, String, MockServer) {
+    app_with_engine().await
 }
 
 /// The same app, with the `ClickHouse` stand-in: a test that has to
@@ -112,7 +124,7 @@ async fn app() -> (axum::Router, PgPool, String) {
 /// pipeline that can read the shared catalog at all is a pipeline whose
 /// own tenant owns it.
 async fn app_with_engine() -> (axum::Router, PgPool, String, MockServer) {
-    let ch = MockServer::start().await;
+    let ch = MockServer::builder().start().await;
     mount(&ch).await;
     let mut overrides = std::collections::HashMap::new();
     overrides.insert("CH_URL".to_owned(), ch.uri());
@@ -261,7 +273,7 @@ async fn detail(
 /// invented one.
 #[tokio::test]
 async fn the_pipeline_detail_carries_the_author_name_for_the_console() {
-    let (router, pool, cookie) = app().await;
+    let (router, pool, cookie, _engine) = app().await;
     let tenant = first_tenant_of(&pool, "fajar@meridian.example").await;
     let id = seed_pipeline(
         &pool,
@@ -281,7 +293,7 @@ async fn the_pipeline_detail_carries_the_author_name_for_the_console() {
 
 #[tokio::test]
 async fn the_pipeline_detail_carries_no_author_name_when_there_is_no_author() {
-    let (router, pool, cookie) = app().await;
+    let (router, pool, cookie, _engine) = app().await;
     let tenant = first_tenant_of(&pool, "fajar@meridian.example").await;
     let id = seed_pipeline(&pool, None, Some(tenant)).await;
 
@@ -307,7 +319,7 @@ async fn seeded_user_id(pool: &PgPool, email: &str) -> Uuid {
 /// a masked value into a Silver table in clear (`GOV-4`).
 #[tokio::test]
 async fn a_masked_column_is_rewritten_for_an_author_who_has_the_obligation() {
-    let (router, pool, cookie) = app().await;
+    let (router, pool, cookie, _engine) = app().await;
     seed_mask(&pool, "Analyst").await;
     let id = seed_pipeline(
         &pool,
@@ -336,7 +348,7 @@ async fn a_masked_column_is_rewritten_for_an_author_who_has_the_obligation() {
 /// were wrong: an author the policy does not govern reads its own rows.
 #[tokio::test]
 async fn an_author_without_the_obligation_gets_the_query_unchanged() {
-    let (router, pool, cookie) = app().await;
+    let (router, pool, cookie, _engine) = app().await;
     // Masked for the Analyst; the author below is a Data Engineer, which
     // the policy does not name.
     seed_mask(&pool, "Analyst").await;
@@ -356,7 +368,7 @@ async fn an_author_without_the_obligation_gets_the_query_unchanged() {
 /// query unrewritten, and must be told why in a fixed message.
 #[tokio::test]
 async fn a_pipeline_with_no_author_is_refused_with_d2s_message() {
-    let (router, pool, cookie) = app().await;
+    let (router, pool, cookie, _engine) = app().await;
     seed_mask(&pool, "Analyst").await;
     let id = seed_pipeline(&pool, None, None).await;
 
@@ -373,7 +385,7 @@ async fn a_pipeline_with_no_author_is_refused_with_d2s_message() {
 /// its roles would enforce the query as if the user were still working.
 #[tokio::test]
 async fn a_pipeline_authored_by_a_deactivated_user_is_refused_with_d2s_message() {
-    let (router, pool, cookie) = app().await;
+    let (router, pool, cookie, _engine) = app().await;
     seed_mask(&pool, "Analyst").await;
     let author = seeded_user_id(&pool, "rina@meridian.example").await;
     let id = seed_pipeline(&pool, Some(author), None).await;
@@ -396,7 +408,7 @@ async fn a_pipeline_authored_by_a_deactivated_user_is_refused_with_d2s_message()
 /// which is the first case again — reached without anyone deciding it.
 #[tokio::test]
 async fn a_pipeline_whose_author_was_deleted_is_refused_with_d2s_message() {
-    let (router, pool, cookie) = app().await;
+    let (router, pool, cookie, _engine) = app().await;
     seed_mask(&pool, "Analyst").await;
     let author = seeded_user_id(&pool, "rina@meridian.example").await;
     let id = seed_pipeline(&pool, Some(author), None).await;
@@ -420,7 +432,7 @@ async fn a_pipeline_whose_author_was_deleted_is_refused_with_d2s_message() {
 /// (`AGENTS.md` rule 4).
 #[tokio::test]
 async fn a_refused_construct_is_refused_with_the_fixed_message_only() {
-    let (router, pool, cookie) = app().await;
+    let (router, pool, cookie, _engine) = app().await;
     seed_mask(&pool, "Analyst").await;
     let id = seed_pipeline(
         &pool,
@@ -449,7 +461,7 @@ async fn a_refused_construct_is_refused_with_the_fixed_message_only() {
 /// also proves the order.
 #[tokio::test]
 async fn a_caller_who_is_neither_service_nor_admin_is_refused() {
-    let (router, pool, _cookie) = app().await;
+    let (router, pool, _cookie, _engine) = app().await;
     seed_mask(&pool, "Analyst").await;
     let id = seed_pipeline(
         &pool,
@@ -469,7 +481,7 @@ async fn a_caller_who_is_neither_service_nor_admin_is_refused() {
 /// tell a real pipeline from a job, or a live tenant from another one.
 #[tokio::test]
 async fn an_unknown_pipeline_and_a_dagster_job_id_answer_the_same_404() {
-    let (router, pool, cookie) = app().await;
+    let (router, pool, cookie, _engine) = app().await;
     seed_mask(&pool, "Analyst").await;
     let id = seed_pipeline(
         &pool,
@@ -504,7 +516,7 @@ async fn an_unknown_pipeline_and_a_dagster_job_id_answer_the_same_404() {
 /// on its next run.
 #[tokio::test]
 async fn the_authors_roles_are_read_at_enforcement_time_not_at_create() {
-    let (router, pool, cookie) = app().await;
+    let (router, pool, cookie, _engine) = app().await;
     seed_mask(&pool, "Analyst").await;
     let author = seeded_user_id(&pool, "yoga@meridian.example").await;
     let id = seed_pipeline(
@@ -571,7 +583,7 @@ async fn seed_orchestrator_credential(pool: &PgPool, token: &str) {
 #[tokio::test]
 async fn an_upstream_database_failure_loading_the_author_carries_no_upstream_text() {
     const TOKEN: &str = "orch-pipeline-enforce-test-token";
-    let (router, pool, _cookie) = app().await;
+    let (router, pool, _cookie, _engine) = app().await;
     let id = seed_pipeline(
         &pool,
         Some(seeded_user_id(&pool, "rina@meridian.example").await),
