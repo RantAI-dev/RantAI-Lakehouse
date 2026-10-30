@@ -776,6 +776,18 @@ test for `topic_of`, and the three gates were verified only by the CI run above.
 `sp_cdc_help_jobs` warning is acceptable or `db_owner` / a documented alternative is wanted; the TS
 `CdcDial` contract still has no `sslMode` (the dial form does not offer it; not in the plan).
 
+### Slice 3, round 1 fix (developer, Sonnet, 2026-10-30)
+
+`SRC-4 S3 review SHOULD-FIX 1`, commit `e08c6644`, console only: `CdcDial` has `sslMode?`
+(`"disable" | "require" | "verify-ca" | "verify-full" | string`); `cdc-dial-form.tsx` has a "TLS mode"
+select for all three drivers (default `require` and always sent, `disable` labelled "Disable (not
+encrypted)", a hint that the verify modes use the worker's trust store and, for SQL Server, that
+Verify CA also checks the host name; a stored value the select does not list is kept as an extra
+option); the review step shows "TLS mode". Tests in `dial-forms.test.tsx`: default sent as `require`
+for each driver, a chosen mode kept on edit (and changed to `disable`). Locally: `tsc --noEmit` clean,
+`bun test src/features/connectors` 414 pass, `bun run lint` 0 errors. CI on `e08c6644`: all 41 checks
+`pass` (run for that commit, including the three change-capture gates and `Frontend`).
+
 ## Review
 
 (The planner writes findings here, tagged `BLOCKER` or `SHOULD-FIX`.)
