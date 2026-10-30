@@ -273,6 +273,22 @@
         "load": "The connector is created through the API (which provisions Kafka Connect) and its first copy reaches Bronze: 20,000 seeded rows in each of the two load modes.",
         "reload": "An insert, an update and a delete each visible in Bronze within 120 s in both modes (SRC-4 D5); then a pause with 20,000 changes per table, a resume, a restart of kafka-connect during a stream of changes and a schema change, each ending with Bronze equal to the source."
       }
+    },
+    "MongoDB CDC": {
+      "gate": "g4-mongo",
+      "steps": {
+        "connect": "real",
+        "discover": "real",
+        "load": "real",
+        "reload": "real"
+      },
+      "notes": {
+        "all": "SRC-4 slice 5: ops/g4/g4_mongo_test.py runs for MongoDB as the g4-mongo job (a one-member replica set) and records the four steps through gate_summary.",
+        "connect": "MongoDB: POST .../test is answered by the orchestrator (the API has no MongoDB client): the gate polls the discovery result of kind test for the least-privilege gate user.",
+        "discover": "The discovery routes list the database's collections and preview a collection's fields (SRC-13 routes); the preview names _id as the key.",
+        "load": "The connector is created through the API (which provisions Kafka Connect) and its first copy reaches Bronze: 20,000 seeded documents in each of the two load modes.",
+        "reload": "An insert, an update and a delete each visible in Bronze within 120 s in both modes (SRC-4 D5); then a pause with 20,000 changes per collection, a resume, a restart of kafka-connect during a stream of changes and a new field in a document, each ending with Bronze equal to the source."
+      }
     }
   }
 }
