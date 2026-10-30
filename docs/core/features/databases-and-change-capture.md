@@ -120,6 +120,40 @@ to the AI team in `AI-16`.
 
 To be filled from the signed decisions and the measurements (decision 5).
 
+### MongoDB change capture (slice 5)
+
+What `MongoDB CDC` needs and what it does not do. Proven by the `g4-mongo` gate unless a line says otherwise.
+
+- **A replica set is required.** Change streams exist only on a replica set; a standalone server has none, and
+  the connector cannot start against one. The replica set's name is a required field of the connector
+  ("the name in the server's replica set configuration"): there is no default.
+- **Sharded clusters are out of scope.** The connector is not built or tested against a sharded cluster.
+- **Atlas and `mongodb+srv` are not offered.** The connector takes explicit `host:port` seeds and no connection
+  string, as the batch `MongoDB` connector does.
+- **The user.** The connector dials as a user with the built-in `read` role on the one database, nothing more.
+  The gate proves that role is enough: the connector captures only that database (`capture.scope=database`);
+  Debezium's default scope, the whole deployment, would need the right to read every database. `root` is not
+  needed. Debezium's documentation names the `hello` command, which any user may run.
+- **`directConnection`.** For a connector with one host the connection string carries `directConnection=true`
+  (the gate runs this shape). With several hosts the driver refuses that option, so the worker finds the other
+  members of the replica set from the server and dials the addresses the replica set advertises. Only the hosts
+  written in the connector are checked against the installation's address rules when it is saved; the
+  addresses a replica set advertises are not. The connection test and the list of collections dial the first
+  host only.
+- **TLS.** `disable`, `require`, `verify-ca` and `verify-full` are all rendered and unit-tested; the gate runs
+  `disable` (its fixture has no certificate). Debezium has no way to take a MongoDB certificate "as
+  presented": in every TLS mode the chain is checked against the worker's trust store, so the source's CA must
+  be in it; `require` differs from `verify-full` only in not checking the host name. The console form does not
+  yet offer a TLS choice for any change-capture connector, so a connector made there takes `require`.
+- **Documents become rows as the batch connector makes them.** `_id` is the key; an `ObjectId` is stored as its
+  24-digit hex text. A nested document or an array in a document **stops the table's load** with a fixed message
+  (the batch connector refuses it too): flatten such fields at the source or leave them out.
+- **A delete carries the key only.** MongoDB keeps no old document, so in "History" mode a delete row has `_id`
+  and empty values; in "Current row per key" mode the row is removed.
+- **A new field in a document is a schema change** and goes through the same decision as a new column in a
+  relational table (`SRC-8`).
+- **Setup is written, not checked yet.** The fixed-sentence checks (replica set, permission) are slice 4's.
+
 ## Acceptance checklist
 
 Run on a real deployment. Mark each Pass, Fail, or Not run with the reason.

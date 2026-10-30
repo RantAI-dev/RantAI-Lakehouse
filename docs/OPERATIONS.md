@@ -314,6 +314,15 @@ pipeline that this replaces is gone, with `ops/debezium/` and the
 `debezium` principal and its warehouse grant (nothing removes them); once no
 older stack uses them they can be revoked by hand.
 
+**MongoDB change capture (`SRC-4` slice 5).** Needs a MongoDB **replica set** (change streams do not exist on a
+standalone server) and a user with the `read` role on the captured database; sharded clusters are not supported.
+Nothing to add to the stack: the same `kafka-connect` worker runs it (the MongoDB connector ships in its image).
+The connector's connection string is built from the explicit hosts and the replica set name, with no password in
+it. A one-host connector sets `directConnection=true`; with several hosts the worker dials the members the replica
+set advertises, so they must be reachable from `kafka-connect` (and are not checked by the API). The worker needs
+the source's CA in its trust store for `verify-ca`, `verify-full` and also `require`. The connection test and the
+collection list run in the orchestrator (`dagster-code-location` must reach the first host).
+
 **DNS gotcha found during verification:** on a host whose own
 `/etc/resolv.conf` carries a DNS search domain (VPN/corporate DNS,
 Tailscale MagicDNS, etc.), that suffix leaks into every container's
