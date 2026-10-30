@@ -212,7 +212,7 @@ estimate (S, M, L), which the base has no field for.
 | `SEC-37` | Task | Default credentials left in code after `SEC-18`: `rustfsadmin` fallbacks in `ops/g3/g3_loadgen.py`, `ops/g6/g6_ingest_matrix_test.py` and `dagster/dispar_orchestrate/dlt_pipeline.py`, and `postgres://lakehouse:lakehouse@localhost` as `DATABASE_URL`'s default in `lakehouse-api` `config.rs`. Compose always sets them now, so none is reached in a compose start | Administration & Security | P2 | Done | [#238](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/238) | PR #83 review |
 | `SEC-19` | Task | The query cost estimate runs raw SQL without the read-only check or table-function block, and returns database error text. The error-text half is met by `SEC-11`'s query-author exception. The author sees the engine's diagnosis with the version and addresses trimmed, and other routes still answer the fixed message | Administration & Security | P2 | Done | #203 | `routes/query.rs` |
 | `SEC-20` | Task | Queries are not scoped to the tenant: no tenant gate on query runs; saved queries listed for everyone | Administration & Security | P2 | In Progress | #244, #263 | `routes/query.rs` |
-| `SEC-50` | Task | Dashboards, gold export, alerts and authored pipelines are not scoped to the tenant: they call the role rewrite directly, not the query path that `SEC-20` gates | Administration & Security | P2 | Todo |  | `routes/dashboard.rs` |
+| `SEC-50` | Task | Dashboards, gold export, alerts and authored pipelines are not scoped to the tenant: they call the role rewrite directly, not the query path that `SEC-20` gates | Administration & Security | P2 | In Progress | #281 | `routes/dashboard.rs` |
 | `SEC-54` | Task | The `SEC-20` review follow-ups that wait for open PRs: "used by" on a table is resolved against the first tenant, not `X-Tenant` (`catalog_governance.rs`, held by an open PR); the operator docs say an unset `CATALOG_TENANT_ID` refuses only the catalog and the job list, although with the four seeded tenants it refuses every Silver and Gold query for anyone without `*:*` (`.env.example`, `README.md`, `docker-compose.yml`, `docs/OPERATIONS.md`); a save without a tenant stores `tenant_id NULL`, which the catalog's tenant then sees, and `ON DELETE SET NULL` does the same for a deleted tenant's rows (needs the owner's decision) | Administration & Security | P2 | Todo |  | PR #244 review |
 | `SEC-21` | Task | Downloads re-run SQL rewritten for an older policy; whole results buffered before the 2,000-row cut | Administration & Security | P2 | Done | #203 | `routes/query.rs` |
 | `SEC-12` | Feature | Embed tokens: require an expiry, allow revocation, keep the signing secret out of plain text, set a frame-ancestors policy | Administration & Security | P2 | In Acceptance | #105, #201 | `lakehouse-embed` |
@@ -256,7 +256,7 @@ estimate (S, M, L), which the base has no field for.
 | `BLD-4` | Task | A pipeline that names `ingest_job` in its upstreams runs after every connector's load, not only after the load of its own source table: its sensor counts any `ingest_job` success. Filter by the run's connector and target table, as `DATA-19` does for `file_ingest_job`. | Build | P3 | Done | #189 | `DATA-19` plan, section 5 |
 | `BLD-2` | Feature | Tables that refresh themselves within a target lag set per pipeline, and the same through the assistant. | Build | P3 | In Acceptance | #194 | PRODUCT §2; [spec](specs/bld-2.md) |
 | `BLD-5` | Task | `BLD-2` follow-ups from its last review (round 6 of `docs/superpowers/plans/2026-10-15-bld-2-target-lag.md`): five stale or mis-tagged comments and one copied test helper, no behaviour; and `downstream_without_readers` still runs one query per downstream candidate. | Build | P3 | Done | [#234](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/234) | `BLD-2` plan, round 6 |
-| `BLD-6` | Task | `lag_pipelines_without_readers` (the batched reader check from `BLD-5`) copies the SQL predicate of `count_lag_pipelines_reading`, and its doc says the two "cannot drift". Share the predicate, or add a store test that runs both on the same fixture, and correct the comment (AGENTS.md rule 1). Found in PR #234 review round 1, SHOULD-FIX 1 | Build | P3 | Todo |  | `rust/crates/lakehouse-store/src/pipelines.rs` |
+| `BLD-6` | Task | `lag_pipelines_without_readers` (the batched reader check from `BLD-5`) copies the SQL predicate of `count_lag_pipelines_reading`, and its doc says the two "cannot drift". Share the predicate, or add a store test that runs both on the same fixture, and correct the comment (AGENTS.md rule 1). Found in PR #234 review round 1, SHOULD-FIX 1 | Build | P3 | Done | #280 | `rust/crates/lakehouse-store/src/pipelines.rs` |
 | `SRC-5` | Feature | Real connection test for MongoDB, Kafka, SFTP, Sheets and Oracle sources | Data | P3 | Idea |  | `connector_probe.rs` |
 | `DOC-2` | Task | Step-by-step user guide checked against a running console. The planner writes it, later, and the landing page links to it (product owner, 2026-10-30) | Docs | P3 | Todo |  | `reference/user-guide.md` |
 | `DATA-3` | Feature | Store Gold in open format first; serve from a fast copy. **Blocked by `DATA-4`** and a new ADR that replaces ADR 0010's direction | Build | P3 | Planned |  | ADR 0010; [spec](specs/data-3.md) |
@@ -269,7 +269,7 @@ estimate (S, M, L), which the base has no field for.
 | `SRC-2` | Feature | Processing over streams | Data | P3 | Idea |  | PRODUCT §2 |
 | `INT-2` | Feature | Search over documents | AI Copilot | P3 | Idea |  | PRODUCT §2 |
 | `GOV-3` | Feature | Lineage that reaches outside systems | Governance | P3 | Idea |  | PRODUCT §2 |
-| `GOV-5` | Task | The audit page lists a chat draft waiting for Confirm, and a request waiting for approval, as Denied with policy `deny`: `outcome_of` in `routes/governance.rs` maps every gate outcome that is not a success to `denied`, on purpose, so a decision that is still open cannot read as a success. Decided 2026-10-30 (product owner): both read Pending | Governance | P3 | Todo |  | `AI-18` checklist row 11, 2026-10-14 |
+| `GOV-5` | Task | The audit page lists a chat draft waiting for Confirm, and a request waiting for approval, as Denied with policy `deny`: `outcome_of` in `routes/governance.rs` maps every gate outcome that is not a success to `denied`, on purpose, so a decision that is still open cannot read as a success. Decided 2026-10-30 (product owner): both read Pending | Governance | P3 | Done | #282 | `AI-18` checklist row 11, 2026-10-14 |
 | `ADM-1` | Feature | Several organisations in one install | Administration & Security | P3 | Idea |  | PRODUCT §2 |
 | `ADM-2` | Feature | Workspace settings that can be changed | Administration & Security | P3 | Idea |  | `README.md` |
 | `OPS-2` | Feature | Install with no internet access | Platform | P3 | Idea |  | Sales playbook (older; re-check) |
@@ -336,7 +336,7 @@ parity), built after it.
 
 **Ready to start** (Todo, Planned or Idea, nothing open blocks it; Idea items still need a spec):
 
-`ADM-1`, `ADM-2`, `AI-10`, `AI-21`, `AI-22`, `BI-14`, `BI-20`, `BI-27`, `BI-28`, `BI-29`, `BI-3`, `BI-30`, `BI-31`, `BI-32`, `BI-33`, `BI-34`, `BI-35`, `BI-36`, `BIZ-1`, `BIZ-2`, `BLD-10`, `BLD-6`, `DATA-20`, `DATA-21`, `DATA-22`, `DATA-23`, `DATA-24`, `DATA-25`, `DATA-26`, `DATA-27`, `DATA-28`, `DATA-29`, `DATA-30`, `DATA-31`, `DATA-32`, `DATA-33`, `DATA-34`, `DATA-36`, `DATA-4`, `DATA-5`, `DATA-6`, `DATA-8`, `DOC-2`, `GOV-1`, `GOV-3`, `GOV-5`, `INT-2`, `OPS-2`, `OPS-3`, `OPS-6`, `OPS-8`, `QRY-1`, `REL-2`, `SEC-34`, `SEC-40`, `SEC-50`, `SEC-54`, `SEC-55`, `SRC-15`, `SRC-18`, `SRC-2`, `SRC-22`, `SRC-23`, `SRC-24`, `SRC-25`, `SRC-26`, `SRC-27`, `SRC-28`, `SRC-30`, `SRC-31`, `SRC-33`, `SRC-34`, `SRC-4`, `SRC-5`, `VER-1`
+`ADM-1`, `ADM-2`, `AI-10`, `AI-21`, `AI-22`, `BI-14`, `BI-20`, `BI-27`, `BI-28`, `BI-29`, `BI-3`, `BI-30`, `BI-31`, `BI-32`, `BI-33`, `BI-34`, `BI-35`, `BI-36`, `BIZ-1`, `BIZ-2`, `BLD-10`, `DATA-20`, `DATA-21`, `DATA-22`, `DATA-23`, `DATA-24`, `DATA-25`, `DATA-26`, `DATA-27`, `DATA-28`, `DATA-29`, `DATA-30`, `DATA-31`, `DATA-32`, `DATA-33`, `DATA-34`, `DATA-36`, `DATA-4`, `DATA-5`, `DATA-6`, `DATA-8`, `DOC-2`, `GOV-1`, `GOV-3`, `INT-2`, `OPS-2`, `OPS-3`, `OPS-6`, `OPS-8`, `QRY-1`, `QS-5`, `REL-2`, `SEC-34`, `SEC-40`, `SEC-54`, `SEC-55`, `SRC-15`, `SRC-18`, `SRC-2`, `SRC-22`, `SRC-23`, `SRC-24`, `SRC-25`, `SRC-26`, `SRC-27`, `SRC-28`, `SRC-30`, `SRC-31`, `SRC-33`, `SRC-34`, `SRC-4`, `SRC-5`, `VER-1`
 
 ## Dates
 
@@ -406,7 +406,8 @@ set by the product owner and are left empty until they are.
 | `OPS-9` | 2026-10-23 | 2026-10-23 | |
 | `OPS-4` | 2026-10-23 | 2026-10-23 | |
 | `BLD-5` | 2026-10-23 | 2026-10-23 | |
-| `BLD-6` | | | |
+| `BLD-6` | 2026-10-30 | 2026-10-30 (#280) | |
+| `GOV-5` | 2026-10-30 | 2026-10-30 (#282) | |
 | `SEC-45` | 2026-10-23 | 2026-10-24 | |
 | `SEC-37` | 2026-10-23 | 2026-10-24 | |
 | `SEC-25` | 2026-10-23 | 2026-10-24 | |
