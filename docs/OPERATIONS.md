@@ -1641,8 +1641,14 @@ of the scoping, and it is also why the database is the place to look:
 SELECT id, name, run_as FROM pipeline_definition WHERE tenant_id IS NULL;
 ```
 
+One exception, so the sentence above is not read as "nobody can see them":
+a Platform Admin (`*:*`) who belongs to no tenant of their own sees every
+authored pipeline on that list, unassigned ones included (PR #281 review
+round 2 NIT).
+
 **How to assign one.** `PUT /api/pipelines/{id}/tenant` with the tenant's
-id:
+id — the route requires the `identity:write` permission (PR #281 review
+round 2 NIT):
 
 ```json
 { "tenantId": "11111111-1111-4111-8111-000000000001" }
