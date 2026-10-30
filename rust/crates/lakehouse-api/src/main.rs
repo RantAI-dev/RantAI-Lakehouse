@@ -59,9 +59,11 @@ mod tile_pool;
 mod tls_proxy;
 
 mod transform_grammar;
+mod upload_convert;
 mod upload_formats;
 mod upload_limits;
 mod upload_parquet;
+mod upload_parquet_parts;
 mod upload_parquet_range;
 mod upload_parse;
 mod upload_store;
@@ -80,7 +82,20 @@ use state::AppState;
 /// Builds the runtime by hand instead of `#[tokio::main]` only to set the
 /// thread stack size: phase 2 catch-up with main (sqlparser 0.63), see
 /// [`config::WORKER_STACK_BYTES`] for the measurement behind the value.
+///
+/// `SEC-22` D1: the child that reads an uploaded workbook or a Parquet file
+/// is this same binary, started again with `inspect-upload`. Its branch comes
+/// FIRST — before the runtime is built, before the configuration is read and
+/// before the crypto provider is installed — so the child needs no
+/// environment, starts no threads, opens no connection and dials nothing, and
+/// so that a file which asks for more memory than the machine has ends the
+/// CHILD and never the API. `PR #192` added the provider install; it stays
+/// after this branch, because a child that reads a file does not dial.
 fn main() -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(code) = upload_convert::run_child_if_asked(&args) {
+        std::process::exit(code);
+    }
     // PR #192 review BLOCKER 10: install `ring` crypto provider before any task dials.
     if let Err(err) = crypto_provider::install_default_provider() {
         eprintln!("fatal: failed to install default rustls crypto provider: {err}");

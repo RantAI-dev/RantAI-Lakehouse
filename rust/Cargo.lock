@@ -2567,6 +2567,7 @@ dependencies = [
  "lakehouse-test-support",
  "lakehouse-trino",
  "moka",
+ "nix",
  "object_store",
  "parquet",
  "postgres-protocol",
