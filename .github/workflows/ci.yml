@@ -762,6 +762,19 @@ jobs:
           # can prove; the source TEXT is proven by the local run with a
           # real commit (`ops/g7/g7_pipeline_test.py`'s module doc).
           G7_SOURCE_PROVENANCE=unavailable
+          # SEC-50: the shared catalog is gated as the tenant that owns it
+          # (`CATALOG_TENANT_ID`), and migration `0002` seeds four tenants,
+          # so a deployment without that setting has no tenant whose reach
+          # covers the shared Bronze table. The BLD-1 step below authors a
+          # pipeline whose author is a regular Analyst (not the `*:*`
+          # bootstrap admin), so its pipeline is scoped to the author's
+          # tenant and that tenant has to own the shared catalog -- without
+          # this the run is refused with the gate's 404. The harness reads
+          # the SAME setting to pick an author of that tenant
+          # (`ops/g7/bld1_pipeline_author_test.py`). Same value and the
+          # same contract the two G8 jobs already use (#244) -- not a
+          # weaker gate.
+          CATALOG_TENANT_ID=11111111-1111-4111-8111-000000000001
           EOF
           # SEC-36: generated per run; no key-shaped literal in the repository.
           echo "CONNECTOR_SECRETS_KEY=$(openssl rand -base64 32)" >> .env
