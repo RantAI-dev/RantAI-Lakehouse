@@ -60,8 +60,10 @@ pub(super) async fn save_query(
         Ok(p) => p,
         Err(err) => return err,
     };
-    // The copilot saves under the name it was given; it has no principal
-    // id of its own to record as the author.
+    // The copilot saves under the name it was given; the caller is the
+    // author, so the query lands in the caller's personal space (`QS-3`).
+    // A call with no principal has no caller: no author, no tenant, and
+    // the shared space is the only place such a row can live.
     //
     // `SEC-20`: the tenant is the caller's own — the chat sends no
     // `X-Tenant` header, so it is the caller's first one, the same
@@ -72,7 +74,10 @@ pub(super) async fn save_query(
             crate::tenant_scope::resolve(principal, &axum::http::HeaderMap::new()).ok()
         })
         .flatten();
-    match queries::create_saved_query(pool, &title, &sql, &owner, &tags, None, tenant_id).await {
+    let viewer = principal.map_or_else(queries::SavedQueryViewer::default, |principal| {
+        crate::routes::query::saved_query_viewer(principal, tenant_id)
+    });
+    match queries::create_saved_query(pool, &viewer, &title, &sql, &owner, &tags, None).await {
         Ok(saved) => json!({ "ok": true, "query": saved }),
         Err(err) => upstream_error::store(&upstream_error::STORE, &err).to_json(),
     }
@@ -319,9 +324,14 @@ mod tests {
             // The migration seed (`0006_seed_queries.sql`) lands two saved
             // queries; either would do, so take the first rather than
             // hardcoding its id here.
-            let saved = queries::list_saved(&pool, queries::SavedQueryScope::All)
-                .await
-                .expect("the migration seed provides saved queries");
+            let saved = queries::list_saved(
+                &pool,
+                queries::SavedQueryScope::All {
+                    viewer: crate::routes::query::saved_query_viewer(&alice(), None),
+                },
+            )
+            .await
+            .expect("the migration seed provides saved queries");
             let first = saved
                 .first()
                 .expect("the migration seed provides at least one saved query");
@@ -367,9 +377,14 @@ mod tests {
             env.insert("CATALOG_TENANT_ID".to_owned(), CATALOG_TENANT_ID.to_owned());
             let state = AppState::new(Config::from_map(&env).expect("valid config from a map"));
 
-            let saved = queries::list_saved(&pool, queries::SavedQueryScope::All)
-                .await
-                .expect("the migration seed provides saved queries");
+            let saved = queries::list_saved(
+                &pool,
+                queries::SavedQueryScope::All {
+                    viewer: crate::routes::query::saved_query_viewer(&alice(), None),
+                },
+            )
+            .await
+            .expect("the migration seed provides saved queries");
             let first = saved
                 .first()
                 .expect("the migration seed provides at least one saved query");

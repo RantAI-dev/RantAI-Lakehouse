@@ -12,7 +12,7 @@ use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use lakehouse_auth::Principal;
+use lakehouse_auth::{Principal, PrincipalId};
 use lakehouse_clickhouse::ChClient;
 use lakehouse_core::ApiError;
 use lakehouse_store::PgPool;
@@ -383,6 +383,32 @@ fn reach_from(
     }
 }
 
+/// The viewer the saved-query resolver asks about: who is asking, with
+/// the roles they hold and the tenant they act as.
+///
+/// This is the one place a [`Principal`] becomes a
+/// [`queries::SavedQueryViewer`], so a read path and a write path cannot
+/// disagree about who the caller is: the console's own save and the
+/// assistant's save build the same viewer from the same principal.
+///
+/// A service identity is nobody's personal space's owner and nobody's
+/// query's author — it has no `app_user` row — so its id is not carried
+/// over.
+pub(crate) fn saved_query_viewer(
+    principal: &Principal,
+    tenant_id: Option<Uuid>,
+) -> queries::SavedQueryViewer {
+    queries::SavedQueryViewer {
+        id: match principal.id {
+            PrincipalId::User(id) => Some(id),
+            PrincipalId::Service(_) => None,
+        },
+        role_names: principal.role_names.clone(),
+        tenant_id,
+        all: crate::routes::catalog::is_unrestricted(principal),
+    }
+}
+
 /// `SEC-20`: the saved queries the caller may read.
 ///
 /// The same reach the same request resolves for the tables a statement
@@ -393,6 +419,10 @@ fn reach_from(
 /// reach over saved queries end in the same place — and there is only
 /// one rule that says which tenant a request acts as
 /// ([`crate::tenant_scope::resolve`]).
+///
+/// The scope also carries the **viewer**: the resolver answers "at what
+/// level may this caller do this", and a scope that cannot say who reads
+/// cannot answer it.
 ///
 /// # Errors
 ///
@@ -405,7 +435,9 @@ pub(crate) async fn saved_query_scope(
 ) -> Result<queries::SavedQueryScope, ApiError> {
     Ok(match resolve_reach(state, principal, headers).await? {
         // Every permission, or a deployment with one tenant: every row.
-        TenantReach::All => queries::SavedQueryScope::All,
+        TenantReach::All => queries::SavedQueryScope::All {
+            viewer: saved_query_viewer(principal, None),
+        },
         // One tenant's rows; the rows that belong to no tenant are the
         // shared catalog's own, and the catalog's tenant reads them.
         TenantReach::Tenant {
@@ -414,6 +446,7 @@ pub(crate) async fn saved_query_scope(
         } => queries::SavedQueryScope::Tenant {
             tenant_id,
             include_tenantless: owns_catalog,
+            viewer: saved_query_viewer(principal, Some(tenant_id)),
         },
         // A caller in no tenant owns no saved query and reads none.
         TenantReach::NoTenant => queries::SavedQueryScope::None,
@@ -2021,7 +2054,8 @@ pub struct CreateSavedQueryBody {
 /// tenant is the one the request acts as — the `X-Tenant` header when the
 /// caller sends one, the caller's first tenant otherwise — and the row is
 /// that tenant's alone; the rows that belong to no tenant are the shared
-/// catalog's own. The author is recorded all the same.
+/// catalog's own. The author is recorded all the same, and the query
+/// lands in the caller's personal space (`QS-3`).
 ///
 /// # Errors
 ///
@@ -2049,28 +2083,28 @@ pub async fn create_saved(
         )
         .into());
     }
-    let owner_id = caller_id(principal.as_ref())?;
+    let principal = principal
+        .as_ref()
+        .map(|Extension(p)| p)
+        .ok_or_else(|| ApiError::Unauthorized("sign in required".to_owned()))?;
     // The tenant the row belongs to is the tenant the request acts as,
     // answered by the one resolver every caller without a header gets
     // (`tenant_scope::resolve`). A caller in no tenant writes a row that
     // belongs to no tenant: nobody can say whose query it is, so it is
     // not anybody's to read but the shared catalog's owner's.
-    let tenant_id = crate::tenant_scope::resolve(
-        principal
-            .as_ref()
-            .map(|Extension(p)| p)
-            .ok_or_else(|| ApiError::Unauthorized("sign in required".to_owned()))?,
-        &headers,
-    )?;
-    let owner = principal.map_or_else(|| "anonymous".to_owned(), |Extension(p)| p.display_name);
+    let tenant_id = crate::tenant_scope::resolve(principal, &headers)?;
+    let owner = principal.display_name.clone();
+    // The viewer is the caller: the row is theirs, and it lands in their
+    // personal space (`QS-3`).
+    let viewer = saved_query_viewer(principal, tenant_id);
     let saved = queries::create_saved_query(
         pool(&state)?,
+        &viewer,
         &title,
         &sql,
         &owner,
         &body.tags,
-        Some(owner_id),
-        tenant_id,
+        None,
     )
     .await?;
     Ok((StatusCode::CREATED, ApiJson(saved)))

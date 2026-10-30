@@ -21,8 +21,14 @@ use lakehouse_test_support as _;
 
 use lakehouse_store::audit::{NewAuditEvent, insert as insert_audit_event};
 use lakehouse_store::queries::{
-    HistoryFilter, RecordHistoryInput, SavedQueryScope, create_saved_query, get_history_item,
-    history_mentioning, history_recent, list_history, list_saved, record_history,
+    HistoryFilter, RecordHistoryInput, SavedQueryPatch, SavedQueryScope, SavedQueryViewer,
+    VERSION_KEEP, create_saved_query, get_history_item, get_saved, history_mentioning,
+    history_recent, list_history, list_saved, list_saved_matching, list_saved_trash, list_versions,
+    purge_trashed_before, record_history, restore_saved_query, trash_saved_query,
+    update_saved_query,
+};
+use lakehouse_store::saved_query_access::{
+    Level, NewGrant, grants_for_item, grants_for_viewer, replace_grants,
 };
 use sqlx::PgPool;
 use time::OffsetDateTime;
@@ -34,7 +40,14 @@ use uuid::Uuid;
 /// examples a new user could open both failed on Run).
 #[sqlx::test(migrations = "../../migrations")]
 async fn seed_populates_saved_queries(pool: PgPool) -> sqlx::Result<()> {
-    let saved = list_saved(&pool, SavedQueryScope::All).await.unwrap();
+    let saved = list_saved(
+        &pool,
+        SavedQueryScope::All {
+            viewer: SavedQueryViewer::default(),
+        },
+    )
+    .await
+    .unwrap();
     assert_eq!(saved.len(), 2);
     assert!(
         saved
@@ -533,32 +546,45 @@ async fn saved_queries_are_listed_per_tenant(pool: PgPool) -> sqlx::Result<()> {
     let group = tenant(GROUP_TENANT);
     let retail = tenant(RETAIL_TENANT);
 
+    // The two writers act as their own tenant and own nobody's query:
+    // a viewer with no id has no personal space, so the rows land in the
+    // shared space of their tenant.
+    let group_writer = viewer(None, Some(group));
+    let retail_writer = viewer(None, Some(retail));
+
     let groups = create_saved_query(
         &pool,
+        &group_writer,
         "Group query",
         "SELECT 1",
         "Rina",
         &[],
         None,
-        Some(group),
     )
     .await
     .unwrap();
     let retails = create_saved_query(
         &pool,
+        &retail_writer,
         "Retail query",
         "SELECT 2",
         "Sari",
         &[],
         None,
-        Some(retail),
     )
     .await
     .unwrap();
 
     // Every row: the two seeded ones (no tenant), and the two written
     // here.
-    let all = list_saved(&pool, SavedQueryScope::All).await.unwrap();
+    let all = list_saved(
+        &pool,
+        SavedQueryScope::All {
+            viewer: SavedQueryViewer::default(),
+        },
+    )
+    .await
+    .unwrap();
     assert_eq!(all.len(), 4);
 
     // One tenant's rows, and only that tenant's.
@@ -567,6 +593,7 @@ async fn saved_queries_are_listed_per_tenant(pool: PgPool) -> sqlx::Result<()> {
         SavedQueryScope::Tenant {
             tenant_id: group,
             include_tenantless: false,
+            viewer: group_writer.clone(),
         },
     )
     .await
@@ -579,6 +606,7 @@ async fn saved_queries_are_listed_per_tenant(pool: PgPool) -> sqlx::Result<()> {
         SavedQueryScope::Tenant {
             tenant_id: retail,
             include_tenantless: false,
+            viewer: retail_writer.clone(),
         },
     )
     .await
@@ -593,6 +621,7 @@ async fn saved_queries_are_listed_per_tenant(pool: PgPool) -> sqlx::Result<()> {
         SavedQueryScope::Tenant {
             tenant_id: retail,
             include_tenantless: true,
+            viewer: retail_writer.clone(),
         },
     )
     .await
@@ -1225,5 +1254,627 @@ async fn a_backslash_in_the_table_filter_matches_literally(pool: PgPool) -> sqlx
         "a percent is still a literal percent: {:?}",
         row_ids(&wildcard)
     );
+    Ok(())
+}
+
+// ── The saved-query spaces, the history and the trash (`QS-3`) ──────────
+
+/// The seeded people, role and query the saved-query tests use.
+const RINA: &str = "33333333-3333-4333-8333-000000000001";
+const SARI: &str = "33333333-3333-4333-8333-000000000005";
+const ANALYST_ROLE: &str = "22222222-2222-4222-8222-000000000001";
+const SEEDED_QUERY: &str = "99999999-9999-4999-8999-000000000001";
+
+/// A viewer who is one person of one tenant, holding no role and no
+/// `"*:*"`: the plainest reader the saved-query paths see.
+fn viewer(id: Option<Uuid>, tenant_id: Option<Uuid>) -> SavedQueryViewer {
+    SavedQueryViewer {
+        id,
+        role_names: Vec::new(),
+        tenant_id,
+        all: false,
+    }
+}
+
+/// The seeded people, as ids.
+fn person(raw: &str) -> Uuid {
+    Uuid::parse_str(raw).expect("a seeded person id")
+}
+
+/// Every row that existed before the spaces were introduced stays in the
+/// shared space and gets a first version labelled as such: the history of
+/// an old query starts where the migration found it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_queries_that_existed_before_the_migration_keep_their_place_and_get_a_first_version(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let seed_id = Uuid::parse_str(SEEDED_QUERY).expect("a seeded query id");
+    let scope = SavedQueryScope::All {
+        viewer: SavedQueryViewer::default(),
+    };
+
+    let saved = get_saved(&pool, SEEDED_QUERY, &scope)
+        .await
+        .unwrap()
+        .expect("the seeded query is there");
+    assert_eq!(
+        saved.folder_id, None,
+        "a query that existed before the spaces stays in the shared space"
+    );
+    assert_eq!(
+        saved.level, "view",
+        "the shared space is open to the organisation"
+    );
+
+    let versions = list_versions(&pool, seed_id).await.unwrap();
+    assert_eq!(versions.len(), 1, "the old row has exactly one version");
+    assert_eq!(versions[0].version, 1);
+    assert_eq!(versions[0].label, "Saved before history");
+    assert_eq!(versions[0].title, saved.title);
+    assert_eq!(versions[0].sql, saved.sql);
+    Ok(())
+}
+
+/// A personal space is one folder per tenant and person: it is created
+/// once and found again, never made twice.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_personal_space_is_one_per_person_and_tenant(pool: PgPool) -> sqlx::Result<()> {
+    let tenant_id = tenant(GROUP_TENANT);
+    let rina = person(RINA);
+    let caller = viewer(Some(rina), Some(tenant_id));
+
+    let first = create_saved_query(&pool, &caller, "Mine", "SELECT 1", "Rina Wijaya", &[], None)
+        .await
+        .unwrap();
+    let second = create_saved_query(
+        &pool,
+        &caller,
+        "Mine too",
+        "SELECT 2",
+        "Rina Wijaya",
+        &[],
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        first.folder_id.is_some(),
+        "a query of a person lands in their personal space"
+    );
+    assert_eq!(
+        first.folder_id, second.folder_id,
+        "one personal space per person, not one per query"
+    );
+
+    let spaces: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM saved_query_folder WHERE is_personal")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(spaces, 1, "the personal space is one row");
+
+    let second_space = sqlx::query(
+        "INSERT INTO saved_query_folder (tenant_id, name, is_personal, owner_id) \
+         VALUES ($1, 'Personal space of Rina Wijaya', true, $2)",
+    )
+    .bind(tenant_id)
+    .bind(rina)
+    .execute(&pool)
+    .await;
+    assert!(
+        second_space.is_err(),
+        "the database refuses a second personal space for the same person"
+    );
+    Ok(())
+}
+
+/// A folder's name is at most a hundred characters: the tree says so in
+/// the database, not only in the route.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_folder_name_is_at_most_a_hundred_characters(pool: PgPool) -> sqlx::Result<()> {
+    let too_long = sqlx::query("INSERT INTO saved_query_folder (tenant_id, name) VALUES ($1, $2)")
+        .bind(tenant(GROUP_TENANT))
+        .bind("x".repeat(101))
+        .execute(&pool)
+        .await;
+    assert!(
+        too_long.is_err(),
+        "a name of 101 characters is refused by the database"
+    );
+
+    sqlx::query("INSERT INTO saved_query_folder (tenant_id, name) VALUES ($1, $2)")
+        .bind(tenant(GROUP_TENANT))
+        .bind("x".repeat(100))
+        .execute(&pool)
+        .await?;
+    Ok(())
+}
+
+/// A version is written for every change of the title or the SQL, and for
+/// none of the changes that leave both as they were.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_version_is_written_for_a_change_and_skipped_when_nothing_changed(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let caller = viewer(Some(person(RINA)), Some(tenant(GROUP_TENANT)));
+    let saved = create_saved_query(
+        &pool,
+        &caller,
+        "First",
+        "SELECT 1",
+        "Rina Wijaya",
+        &[],
+        None,
+    )
+    .await
+    .unwrap();
+    let query_id = Uuid::parse_str(&saved.id).expect("the saved query id");
+    assert_eq!(
+        list_versions(&pool, query_id).await.unwrap().len(),
+        1,
+        "the create writes the first version"
+    );
+
+    let unchanged = update_saved_query(
+        &pool,
+        &caller,
+        &saved.id,
+        &SavedQueryPatch {
+            title: Some("First".to_owned()),
+            sql: Some("SELECT 1".to_owned()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(unchanged.title, "First");
+    assert_eq!(
+        list_versions(&pool, query_id).await.unwrap().len(),
+        1,
+        "a change that leaves the title and the SQL as they were writes no version"
+    );
+
+    update_saved_query(
+        &pool,
+        &caller,
+        &saved.id,
+        &SavedQueryPatch {
+            title: Some("Second".to_owned()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let versions = list_versions(&pool, query_id).await.unwrap();
+    assert_eq!(versions.len(), 2, "a new title is a new version");
+    assert_eq!(versions[0].version, 2);
+    assert_eq!(versions[0].title, "Second");
+    Ok(())
+}
+
+/// Only the last fifteen versions of a query are kept: the older ones go
+/// in the same transaction as the change that pushed them out.
+#[sqlx::test(migrations = "../../migrations")]
+async fn only_the_last_fifteen_versions_are_kept(pool: PgPool) -> sqlx::Result<()> {
+    let caller = viewer(Some(person(RINA)), Some(tenant(GROUP_TENANT)));
+    let saved = create_saved_query(
+        &pool,
+        &caller,
+        "Versioned",
+        "SELECT 0",
+        "Rina Wijaya",
+        &[],
+        None,
+    )
+    .await
+    .unwrap();
+    let query_id = Uuid::parse_str(&saved.id).expect("the saved query id");
+
+    for n in 1..=20 {
+        update_saved_query(
+            &pool,
+            &caller,
+            &saved.id,
+            &SavedQueryPatch {
+                sql: Some(format!("SELECT {n}")),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    let versions = list_versions(&pool, query_id).await.unwrap();
+    assert_eq!(versions.len(), VERSION_KEEP, "the history is capped");
+    assert_eq!(
+        versions[0].version, 21,
+        "the newest version is the last one written"
+    );
+    assert_eq!(
+        versions[VERSION_KEEP - 1].version,
+        7,
+        "the oldest kept version is fifteen back from the newest"
+    );
+    Ok(())
+}
+
+/// A trashed query leaves the list, waits in the trash and comes back
+/// where it was.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_trashed_query_leaves_the_list_and_can_be_restored(pool: PgPool) -> sqlx::Result<()> {
+    let caller = viewer(Some(person(RINA)), Some(tenant(GROUP_TENANT)));
+    let scope = SavedQueryScope::All {
+        viewer: caller.clone(),
+    };
+    let saved = create_saved_query(
+        &pool,
+        &caller,
+        "Doomed",
+        "SELECT 1",
+        "Rina Wijaya",
+        &[],
+        None,
+    )
+    .await
+    .unwrap();
+
+    trash_saved_query(&pool, &caller, &saved.id).await.unwrap();
+    assert!(
+        !list_saved(&pool, scope.clone())
+            .await
+            .unwrap()
+            .iter()
+            .any(|q| q.id == saved.id),
+        "a trashed query is not listed"
+    );
+    assert!(
+        list_saved_trash(&pool, &scope)
+            .await
+            .unwrap()
+            .iter()
+            .any(|q| q.id == saved.id),
+        "the trash holds it"
+    );
+
+    let restored = restore_saved_query(&pool, &caller, &saved.id)
+        .await
+        .unwrap();
+    assert_eq!(restored.id, saved.id);
+    assert_eq!(
+        restored.folder_id, saved.folder_id,
+        "it comes back in its folder"
+    );
+    assert!(
+        list_saved(&pool, scope.clone())
+            .await
+            .unwrap()
+            .iter()
+            .any(|q| q.id == saved.id),
+        "it is back in the list"
+    );
+    assert!(
+        !list_saved_trash(&pool, &scope)
+            .await
+            .unwrap()
+            .iter()
+            .any(|q| q.id == saved.id),
+        "and out of the trash"
+    );
+    Ok(())
+}
+
+/// The sweep removes the rows that were trashed more than thirty days
+/// ago, and leaves the younger ones alone.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_sweep_removes_the_rows_trashed_more_than_thirty_days_ago(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let caller = viewer(Some(person(RINA)), Some(tenant(GROUP_TENANT)));
+    let old = create_saved_query(&pool, &caller, "Old", "SELECT 1", "Rina Wijaya", &[], None)
+        .await
+        .unwrap();
+    let fresh = create_saved_query(
+        &pool,
+        &caller,
+        "Fresh",
+        "SELECT 2",
+        "Rina Wijaya",
+        &[],
+        None,
+    )
+    .await
+    .unwrap();
+    trash_saved_query(&pool, &caller, &old.id).await.unwrap();
+    trash_saved_query(&pool, &caller, &fresh.id).await.unwrap();
+    sqlx::query("UPDATE saved_query SET deleted_at = now() - interval '31 days' WHERE id = $1")
+        .bind(Uuid::parse_str(&old.id).expect("the saved query id"))
+        .execute(&pool)
+        .await?;
+
+    let removed = purge_trashed_before(&pool, OffsetDateTime::now_utc() - time::Duration::days(30))
+        .await
+        .unwrap();
+    assert_eq!(removed, 1, "the row trashed thirty-one days ago is gone");
+
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM saved_query WHERE id = $1")
+        .bind(Uuid::parse_str(&fresh.id).expect("the saved query id"))
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(left, 1, "the row trashed a moment ago is still there");
+    Ok(())
+}
+
+/// The search matches the title or the SQL, and the wildcards are
+/// literals: a `%` is a percent sign, not "anything".
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_search_matches_the_title_or_the_sql_and_treats_the_wildcards_literally(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_id = tenant(GROUP_TENANT);
+    let caller = viewer(Some(person(RINA)), Some(tenant_id));
+    let scope = SavedQueryScope::Tenant {
+        tenant_id,
+        include_tenantless: false,
+        viewer: caller.clone(),
+    };
+    create_saved_query(
+        &pool,
+        &caller,
+        "Revenue by region",
+        "SELECT region FROM gold.revenue",
+        "Rina Wijaya",
+        &[],
+        None,
+    )
+    .await
+    .unwrap();
+
+    let by_title = list_saved_matching(&pool, &scope, Some("revenue"))
+        .await
+        .unwrap();
+    assert!(
+        by_title.iter().any(|q| q.title == "Revenue by region"),
+        "the title matches"
+    );
+
+    let by_sql = list_saved_matching(&pool, &scope, Some("gold."))
+        .await
+        .unwrap();
+    assert!(
+        by_sql.iter().any(|q| q.title == "Revenue by region"),
+        "the SQL matches"
+    );
+
+    assert!(
+        list_saved_matching(&pool, &scope, Some("%"))
+            .await
+            .unwrap()
+            .is_empty(),
+        "a percent is a literal percent"
+    );
+    assert!(
+        list_saved_matching(&pool, &scope, Some("_"))
+            .await
+            .unwrap()
+            .is_empty(),
+        "an underscore is a literal underscore"
+    );
+    Ok(())
+}
+
+/// A personal space is a wall: another person sees nothing of what is
+/// inside it, until a rule opens it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_personal_space_hides_its_queries_from_everybody_else(pool: PgPool) -> sqlx::Result<()> {
+    let tenant_id = tenant(GROUP_TENANT);
+    let rina = viewer(Some(person(RINA)), Some(tenant_id));
+    let sari = viewer(Some(person(SARI)), Some(tenant_id));
+    let saved = create_saved_query(
+        &pool,
+        &rina,
+        "Private",
+        "SELECT 1",
+        "Rina Wijaya",
+        &[],
+        None,
+    )
+    .await
+    .unwrap();
+    let sari_scope = SavedQueryScope::All {
+        viewer: sari.clone(),
+    };
+
+    assert!(
+        !list_saved(&pool, sari_scope.clone())
+            .await
+            .unwrap()
+            .iter()
+            .any(|q| q.id == saved.id),
+        "a personal space gives nothing to another person"
+    );
+
+    replace_grants(
+        &pool,
+        Some(Uuid::parse_str(&saved.id).expect("the saved query id")),
+        None,
+        &[NewGrant {
+            user_id: Some(person(SARI)),
+            role_id: None,
+            level: Level::View,
+        }],
+        None,
+    )
+    .await
+    .unwrap();
+
+    let listed = list_saved(&pool, sari_scope).await.unwrap();
+    let opened = listed
+        .iter()
+        .find(|q| q.id == saved.id)
+        .expect("a rule opens the personal space");
+    assert_eq!(opened.level, "view", "the rule gives exactly what it names");
+    Ok(())
+}
+
+/// Another tenant's query gives nothing: it is not listed, and a write
+/// against it finds no row at all.
+#[sqlx::test(migrations = "../../migrations")]
+async fn another_tenants_query_gives_nothing(pool: PgPool) -> sqlx::Result<()> {
+    let group = tenant(GROUP_TENANT);
+    let retail = tenant(RETAIL_TENANT);
+    let rina = viewer(Some(person(RINA)), Some(group));
+    let saved = create_saved_query(
+        &pool,
+        &rina,
+        "The group's",
+        "SELECT 1",
+        "Rina Wijaya",
+        &[],
+        None,
+    )
+    .await
+    .unwrap();
+
+    let sari = viewer(Some(person(SARI)), Some(retail));
+    let sari_scope = SavedQueryScope::Tenant {
+        tenant_id: retail,
+        include_tenantless: false,
+        viewer: sari.clone(),
+    };
+    assert!(
+        !list_saved(&pool, sari_scope)
+            .await
+            .unwrap()
+            .iter()
+            .any(|q| q.id == saved.id),
+        "another tenant's query is not listed"
+    );
+
+    let written = update_saved_query(
+        &pool,
+        &sari,
+        &saved.id,
+        &SavedQueryPatch {
+            title: Some("Mine now".to_owned()),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(
+        matches!(written, Err(lakehouse_store::StoreError::NotFound)),
+        "another tenant's query is not found at all"
+    );
+    Ok(())
+}
+
+/// A rule names a person or a role, and one item: never two of either.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_rule_names_a_person_or_a_role_and_never_both(pool: PgPool) -> sqlx::Result<()> {
+    let query_id = Uuid::parse_str(SEEDED_QUERY).expect("a seeded query id");
+    let folder_id = Uuid::new_v4();
+
+    let both_people = replace_grants(
+        &pool,
+        Some(query_id),
+        None,
+        &[NewGrant {
+            user_id: Some(person(RINA)),
+            role_id: Some(Uuid::parse_str(ANALYST_ROLE).expect("a seeded role id")),
+            level: Level::Edit,
+        }],
+        None,
+    )
+    .await;
+    assert!(
+        matches!(both_people, Err(lakehouse_store::StoreError::Validation(_))),
+        "a rule names a person or a role, never both"
+    );
+
+    let neither = replace_grants(
+        &pool,
+        Some(query_id),
+        None,
+        &[NewGrant {
+            user_id: None,
+            role_id: None,
+            level: Level::Edit,
+        }],
+        None,
+    )
+    .await;
+    assert!(
+        matches!(neither, Err(lakehouse_store::StoreError::Validation(_))),
+        "a rule names somebody"
+    );
+
+    let both_items = replace_grants(
+        &pool,
+        Some(query_id),
+        Some(folder_id),
+        &[NewGrant {
+            user_id: Some(person(RINA)),
+            role_id: None,
+            level: Level::Edit,
+        }],
+        None,
+    )
+    .await;
+    assert!(
+        matches!(both_items, Err(lakehouse_store::StoreError::Validation(_))),
+        "a rule is on one item, never two"
+    );
+    Ok(())
+}
+
+/// The rules that name the viewer are the ones that count: a person's own
+/// rule, and the rules of the roles they hold.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_rules_of_a_person_and_of_a_role_are_read_for_the_viewer(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let query_id = Uuid::parse_str(SEEDED_QUERY).expect("a seeded query id");
+    replace_grants(
+        &pool,
+        Some(query_id),
+        None,
+        &[
+            NewGrant {
+                user_id: Some(person(RINA)),
+                role_id: None,
+                level: Level::Edit,
+            },
+            NewGrant {
+                user_id: None,
+                role_id: Some(Uuid::parse_str(ANALYST_ROLE).expect("a seeded role id")),
+                level: Level::Manage,
+            },
+        ],
+        None,
+    )
+    .await
+    .unwrap();
+
+    let own = grants_for_viewer(&pool, &viewer(Some(person(RINA)), None))
+        .await
+        .unwrap();
+    assert_eq!(own.len(), 1, "the person's own rule is read");
+    assert_eq!(own[0].level, Level::Edit);
+
+    let by_role = SavedQueryViewer {
+        id: Some(person(SARI)),
+        role_names: vec!["Analyst".to_owned()],
+        tenant_id: None,
+        all: false,
+    };
+    let through_role = grants_for_viewer(&pool, &by_role).await.unwrap();
+    assert_eq!(
+        through_role.len(),
+        1,
+        "the role's rule is read for its holders"
+    );
+    assert_eq!(through_role[0].level, Level::Manage);
+
+    let on_item = grants_for_item(&pool, Some(query_id), None).await.unwrap();
+    assert_eq!(on_item.len(), 2, "the item carries both of its rules");
     Ok(())
 }
