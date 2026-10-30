@@ -31,6 +31,7 @@ use crate::connector_secret_store::{ConnectorSecretStore, SharedKeyring};
 use crate::gold_lock::MartLocks;
 use crate::secret_crypto::{CryptoError, Keyring, MANAGED_FILE_PREFIX};
 use crate::secret_manager::{ManagerResolver, SecretManagerKind, SecretManagerSettings};
+use crate::upload_convert::ConversionRunner;
 use crate::upload_limits::ReceiveLimiter;
 
 /// The three [`lakehouse_auth::Authenticator`]s this service configures,
@@ -223,6 +224,12 @@ pub struct AppState {
     /// Counts the files being received by `POST /api/uploads` (`SEC-17`),
     /// per user and in total. Shared across clones; always populated.
     pub upload_receive: ReceiveLimiter,
+    /// Starts the child process that reads an uploaded workbook or a
+    /// Parquet file (`SEC-22` D3). The API never parses such a file in its
+    /// own process: a file that asks for more memory than the machine has
+    /// would end the API for every tenant, and `catch_unwind` cannot catch
+    /// that. Shared across clones; always populated.
+    pub conversion_runner: ConversionRunner,
     /// At most [`PDF_AT_ONCE`] PDFs are made at once per process (`BI-1` D5,
     /// feature decision 5); a third request waits for a slot. Shared across
     /// clones.
@@ -778,6 +785,22 @@ impl AppState {
             config.upload_max_concurrent_per_user,
             config.upload_max_concurrent,
         );
+        // `SEC-22` D3: the child is this binary, started again as
+        // `inspect-upload`. `current_exe` is where it is in a deployment; a
+        // build that cannot say where it is has no child, and every
+        // conversion answers "the file could not be converted" with the
+        // reason in the log.
+        let conversion_runner = ConversionRunner::new(
+            std::env::current_exe().unwrap_or_else(|err| {
+                tracing::warn!(
+                    %err,
+                    "the API cannot say where its own binary is; an uploaded workbook or Parquet file cannot be read"
+                );
+                PathBuf::new()
+            }),
+            config.upload_max_conversions as usize,
+            u64::from(config.upload_convert_memory_mb),
+        );
         Self {
             config: Arc::new(config),
             clickhouse,
@@ -807,6 +830,7 @@ impl AppState {
             lakekeeper_admin,
             throttle_policy: Arc::new(throttle_policy),
             upload_receive,
+            conversion_runner,
             pdf_slots: Arc::new(tokio::sync::Semaphore::new(PDF_AT_ONCE)),
             tile_slots: Arc::new(crate::tile_pool::slots_from_env()),
             result_cache: Arc::new(crate::result_cache::ResultCache::new(

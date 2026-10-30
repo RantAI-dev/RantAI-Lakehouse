@@ -78,9 +78,11 @@ pub mod tile_pool;
 mod tls_proxy;
 
 pub mod transform_grammar;
+pub mod upload_convert;
 pub mod upload_formats;
 pub mod upload_limits;
 pub mod upload_parquet;
+pub mod upload_parquet_parts;
 pub mod upload_parquet_range;
 pub mod upload_parse;
 pub mod upload_store;
