@@ -136,7 +136,14 @@ export function QueryStudioPage() {
               the statement that is open on it. */}
           {studio.activeRuns.length > 1 ? <QueryResultTabs studio={studio} /> : null}
           {openRun?.status === "done" ? (
-            <QueryResultsSection result={openRun.result} />
+            <QueryResultsSection
+              result={openRun.result}
+              runId={openRun.runId}
+              downloadBusy={studio.download.busy}
+              onDownload={(format) =>
+                studio.download.start(openRun.result.id, format, openRun.runId)
+              }
+            />
           ) : null}
           {openRun?.status === "error" ? (
             <div className="space-y-2">

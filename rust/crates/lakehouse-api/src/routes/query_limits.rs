@@ -232,7 +232,7 @@ mod tests {
         checked(&body)
     }
 
-    const OK: &str = r#"{"install":{"timeoutSeconds":60,"chartRows":2000,"mapPoints":5000,"studioRows":2000},"roles":[]}"#;
+    const OK: &str = r#"{"install":{"timeoutSeconds":60,"chartRows":2000,"mapPoints":5000,"studioRows":64000},"roles":[]}"#;
 
     #[test]
     fn a_body_inside_every_range_is_accepted() {
@@ -275,7 +275,8 @@ mod tests {
                     "\"{field}\":{}",
                     match field {
                         "timeoutSeconds" => 60,
-                        "chartRows" | "studioRows" => 2000,
+                        "chartRows" => 2000,
+                        "studioRows" => 64000,
                         _ => 5000,
                     }
                 ),
