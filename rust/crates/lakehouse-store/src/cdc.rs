@@ -172,19 +172,21 @@ pub enum CdcSpecError {
         field: &'static str,
     },
 
-    /// The dial names a driver this renderer has no `Debezium` connector
-    /// for yet (`Oracle` comes with its slice).
-    #[error("change capture is not built for this source driver yet")]
-    UnsupportedDriver,
-
     /// A `MySQL` dial without its `serverId` (`Dial::parse` requires it; a
     /// hand-built dial is refused here the same way).
     #[error("a MySQL change-capture connector needs a serverId")]
     NoServerId,
 
-    /// `MySQL` and `SQL Server` connectors keep their schema history in a Kafka
-    /// topic and cannot start without the broker's address.
-    #[error("a MySQL or SQL Server change-capture connector needs the schema-history broker")]
+    /// An `Oracle` dial that asks for certificate checking: the JDBC driver
+    /// does TLS only over TCPS with a Java trust store (`SRC-37`).
+    #[error("Oracle change capture cannot check the server certificate")]
+    OracleCertificateCheckUnsupported,
+
+    /// `MySQL`, `SQL Server` and `Oracle` connectors keep their schema history in
+    /// a Kafka topic and cannot start without the broker's address.
+    #[error(
+        "a MySQL, SQL Server or Oracle change-capture connector needs the schema-history broker"
+    )]
     NoSchemaHistoryBroker,
 
     /// The schema-history broker list is not `host:port[,host:port]` of plain
@@ -296,9 +298,8 @@ fn reject_control_characters(field: &'static str, value: &str) -> Result<(), Cdc
 /// read-write in `lakehouse-api` and read-only in `kafka-connect`.
 pub const CDC_SECRETS_DIR: &str = "/run/cdc-secrets";
 
-/// `Debezium`'s `PostgreSQL` connector class, the one connector class this
-/// build starts so far (`SRC-4` slice 2). `MySQL`, `SQL Server`, `MongoDB` and
-/// `Oracle` are added by their slices, with the allowlist in the API's
+/// `Debezium`'s `PostgreSQL` connector class (`SRC-4` slice 2). Each driver's
+/// class is added by its slice, with the allowlist in the API's
 /// `kafka_connect` module.
 pub const POSTGRES_CONNECTOR_CLASS: &str = "io.debezium.connector.postgresql.PostgresConnector";
 
@@ -307,6 +308,11 @@ pub const MYSQL_CONNECTOR_CLASS: &str = "io.debezium.connector.mysql.MySqlConnec
 
 /// `Debezium`'s `SQL Server` connector class (`SRC-4` slice 3).
 pub const SQLSERVER_CONNECTOR_CLASS: &str = "io.debezium.connector.sqlserver.SqlServerConnector";
+
+/// `Debezium`'s `Oracle` connector class, reading the redo log through
+/// `LogMiner` (`SRC-4` slice 6, decision S6-d). Its JDBC driver ships in the
+/// pinned `Kafka Connect` image, so nothing is fetched at build time.
+pub const ORACLE_CONNECTOR_CLASS: &str = "io.debezium.connector.oracle.OracleConnector";
 
 /// The Kafka topic a `MySQL` or `SQL Server` connector keeps its schema history
 /// in (`SRC-4` decision S3-b/S3-d). `Debezium` creates it with unlimited
@@ -441,7 +447,7 @@ const fn mssql_tls(mode: CdcSslMode) -> (&'static str, &'static str) {
 /// API sends to `PUT /connectors/<name>/config`. It replaces the `Debezium
 /// Server` properties template.
 ///
-/// One renderer, three drivers. The keys every driver shares: the password
+/// One renderer, four drivers. The keys every driver shares: the password
 /// reference, `topic.prefix=cdc.<id>`, the JSON converters without schemas, the
 /// `unwrap` transform with `delete.tombstone.handling.mode=rewrite` and
 /// `add.fields=op,source.ts_ms`, `snapshot.mode=initial` and
@@ -451,19 +457,18 @@ const fn mssql_tls(mode: CdcSslMode) -> (&'static str, &'static str) {
 /// schema-history topic. The password is the config-provider reference of
 /// [`connect_password_reference`], never a value, and every value is a string,
 /// as `Kafka Connect` wants. `delete.tombstone.handling.mode=rewrite`:
-/// `Debezium` 3.8 ignores `delete.handling.mode` and `drop.tombstones`, and
+/// `Debezium` 3.7 (the image's version; the tag says 3.8) ignores `delete.handling.mode` and `drop.tombstones`, and
 /// with them every delete reaches the topic as a message with no value
 /// (`docs/plans/SRC-4-RESULT.md`).
 ///
 /// With `verify-ca` and `verify-full` the worker uses its own trust store: this
 /// renderer sets no root certificate.
 ///
-/// `schema_history_bootstrap` is the broker address `MySQL` and `SQL Server`
-/// connectors keep their schema history on; `PostgreSQL` ignores it.
+/// `schema_history_bootstrap` is the broker address `MySQL`, `SQL Server` and
+/// `Oracle` connectors keep their schema history on; `PostgreSQL` ignores it.
 ///
 /// # Errors
 ///
-/// [`CdcSpecError::UnsupportedDriver`] for `Oracle`,
 /// [`CdcSpecError::InvalidConnectorId`], [`CdcSpecError::InvalidSecretsDir`],
 /// [`CdcSpecError::NoTables`], [`CdcSpecError::InvalidTableName`],
 /// [`CdcSpecError::InvalidReplicationName`] (`PostgreSQL`),
@@ -537,7 +542,7 @@ pub fn render_connect_config(
             mysql_entries(connector_id, dial, &first_parts, schema_history_bootstrap)?
         }
         SqlDriver::Mssql => mssql_entries(connector_id, dial, schema_history_bootstrap)?,
-        SqlDriver::Oracle => return Err(CdcSpecError::UnsupportedDriver),
+        SqlDriver::Oracle => oracle_entries(connector_id, dial, schema_history_bootstrap)?,
     };
     entries.extend(driver_entries);
     Ok(entries
@@ -622,7 +627,63 @@ fn mssql_entries(
     Ok(entries)
 }
 
-/// The two schema-history keys of a `MySQL` or `SQL Server` connector.
+/// The Oracle JDBC driver's native-network-encryption settings for a dial's
+/// mode (`SRC-4` decision S6-c). `require` makes the driver refuse a session
+/// that is not AES256-encrypted and SHA256-checksummed: encrypted, the server
+/// not authenticated, the same posture `require` has for the other drivers.
+/// `disable` sends none. `Dial::parse` refuses `verify-ca` and `verify-full`
+/// (the driver does TLS only over TCPS with a Java trust store, `SRC-37`);
+/// a hand-built dial that carries one is refused here too, so the config can
+/// never promise a check it does not make.
+fn oracle_encryption_entries(
+    mode: CdcSslMode,
+) -> Result<Vec<(&'static str, String)>, CdcSpecError> {
+    match mode {
+        CdcSslMode::Disable => Ok(Vec::new()),
+        CdcSslMode::Require => Ok(vec![
+            ("driver.oracle.net.encryption_client", "REQUIRED".to_owned()),
+            (
+                "driver.oracle.net.encryption_types_client",
+                "(AES256)".to_owned(),
+            ),
+            (
+                "driver.oracle.net.crypto_checksum_client",
+                "REQUIRED".to_owned(),
+            ),
+            (
+                "driver.oracle.net.crypto_checksum_types_client",
+                "(SHA256)".to_owned(),
+            ),
+        ]),
+        CdcSslMode::VerifyCa | CdcSslMode::VerifyFull => {
+            Err(CdcSpecError::OracleCertificateCheckUnsupported)
+        }
+    }
+}
+
+/// The `Oracle` connector's own keys: class, the container database, the
+/// pluggable database when there is one, native encryption, and the
+/// schema-history topic. `log.mining.strategy` and `snapshot.mode` keep the
+/// connector's defaults (`online_catalog`, `initial`).
+fn oracle_entries(
+    connector_id: &str,
+    dial: &CdcDial,
+    bootstrap: Option<&str>,
+) -> Result<Vec<(&'static str, String)>, CdcSpecError> {
+    let mut entries = vec![
+        ("connector.class", ORACLE_CONNECTOR_CLASS.to_owned()),
+        ("database.dbname", dial.database.clone()),
+    ];
+    if let Some(pdb) = &dial.pdb_name {
+        reject_control_characters("pdbName", pdb)?;
+        entries.push(("database.pdb.name", pdb.clone()));
+    }
+    entries.extend(oracle_encryption_entries(dial.ssl_mode)?);
+    entries.extend(schema_history_entries(connector_id, bootstrap)?);
+    Ok(entries)
+}
+
+/// The two schema-history keys of a `MySQL`, `SQL Server` or `Oracle` connector.
 fn schema_history_entries(
     connector_id: &str,
     bootstrap: Option<&str>,
@@ -679,7 +740,7 @@ mod tests {
         assert_eq!(config["schema.include.list"], "public,sales");
         assert_eq!(config["topic.prefix"], "cdc.conn-orders-ab12");
         assert_eq!(config["snapshot.mode"], "initial");
-        // Amendment 3: Debezium 3.8 ignores delete.handling.mode and drop.tombstones.
+        // Amendment 3: Debezium 3.7.0 (tag 3.8, DEBEZIUM_VERSION=3.7.0.Final) ignores delete.handling.mode and drop.tombstones.
         assert_eq!(
             config["transforms.unwrap.delete.tombstone.handling.mode"],
             "rewrite"
@@ -754,12 +815,6 @@ mod tests {
             render_connect_config("conn-a", &dial, &["public.t"], CDC_SECRETS_DIR, None),
             Err(CdcSpecError::InvalidReplicationName { field: "slotName" })
         ));
-        let mut dial = pg_dial("require");
-        dial.driver = SqlDriver::Oracle;
-        assert_eq!(
-            render_connect_config("conn-a", &dial, &["public.t"], CDC_SECRETS_DIR, None),
-            Err(CdcSpecError::UnsupportedDriver)
-        );
     }
 
     const BROKER: &str = "kafka:9092";
@@ -771,6 +826,10 @@ mod tests {
         });
         if driver == "mysql" {
             json["serverId"] = serde_json::json!(5400);
+        }
+        if driver == "oracle" {
+            json["database"] = serde_json::json!("FREE");
+            json["pdbName"] = serde_json::json!("FREEPDB1");
         }
         serde_json::from_value(json).unwrap()
     }
@@ -870,6 +929,67 @@ mod tests {
     }
 
     #[test]
+    fn oracle_config_has_exactly_its_keys() {
+        let config = render_other("oracle", "require", &["SHOP.ORDERS", "SHOP.ITEMS"]);
+        assert_shared_keys(&config);
+        assert_eq!(config["connector.class"], ORACLE_CONNECTOR_CLASS);
+        assert_eq!(config["database.dbname"], "FREE");
+        assert_eq!(config["database.pdb.name"], "FREEPDB1");
+        assert_eq!(config["table.include.list"], "SHOP.ORDERS,SHOP.ITEMS");
+        assert_eq!(
+            config["schema.history.internal.kafka.bootstrap.servers"],
+            BROKER
+        );
+        assert_eq!(
+            config["schema.history.internal.kafka.topic"],
+            "cdc.conn-x1.schema-history"
+        );
+        for (key, value) in [
+            ("driver.oracle.net.encryption_client", "REQUIRED"),
+            ("driver.oracle.net.encryption_types_client", "(AES256)"),
+            ("driver.oracle.net.crypto_checksum_client", "REQUIRED"),
+            ("driver.oracle.net.crypto_checksum_types_client", "(SHA256)"),
+        ] {
+            assert_eq!(config[key], value, "{key}");
+        }
+        // The defaults stay defaults, and none of the other drivers' keys.
+        for key in [
+            "log.mining.strategy",
+            "slot.name",
+            "database.server.id",
+            "database.include.list",
+            "database.names",
+            "database.sslmode",
+            "database.ssl.mode",
+            "database.encrypt",
+            "include.schema.changes",
+        ] {
+            assert!(!config.contains_key(key), "{key}");
+        }
+    }
+
+    #[test]
+    fn oracle_config_omits_the_pdb_without_one_and_the_encryption_when_disabled() {
+        let mut dial = other_dial("oracle", "disable");
+        dial.pdb_name = None;
+        let config =
+            render_connect_config("conn-x1", &dial, &["A.B"], CDC_SECRETS_DIR, Some(BROKER))
+                .unwrap();
+        assert!(!config.contains_key("database.pdb.name"));
+        assert!(!config.keys().any(|key| key.starts_with("driver.oracle")));
+        // A hand-built dial that asks for certificate checking is refused.
+        for mode in ["verify-ca", "verify-full"] {
+            let mut dial = other_dial("oracle", "require");
+            dial.ssl_mode = serde_json::from_value(serde_json::json!(mode)).unwrap();
+            assert_eq!(
+                render_connect_config("conn-x1", &dial, &["A.B"], CDC_SECRETS_DIR, Some(BROKER)),
+                Err(CdcSpecError::OracleCertificateCheckUnsupported),
+                "{mode}"
+            );
+        }
+    }
+
+    #[test]
     fn each_ssl_mode_maps_to_the_right_setting_per_driver() {
         for (mode, mysql, encrypt, trust) in [
             ("disable", "disabled", "false", "false"),
@@ -887,7 +1007,7 @@ mod tests {
 
     #[test]
     fn mysql_and_sql_server_refuse_a_bad_table_name_and_a_missing_or_bad_history_broker() {
-        for driver in ["mysql", "mssql"] {
+        for driver in ["mysql", "mssql", "oracle"] {
             let dial = other_dial(driver, "require");
             for table in ["orders", "a.b.c", "x.y,z.w", "x. y"] {
                 assert!(

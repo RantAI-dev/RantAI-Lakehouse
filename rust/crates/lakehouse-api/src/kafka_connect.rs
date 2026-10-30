@@ -40,17 +40,19 @@ use std::time::Duration;
 
 use lakehouse_core::ApiError;
 use lakehouse_store::cdc::{
-    MYSQL_CONNECTOR_CLASS, POSTGRES_CONNECTOR_CLASS, SQLSERVER_CONNECTOR_CLASS,
+    MYSQL_CONNECTOR_CLASS, ORACLE_CONNECTOR_CLASS, POSTGRES_CONNECTOR_CLASS,
+    SQLSERVER_CONNECTOR_CLASS,
 };
 use serde_json::Value;
 
 use crate::config::Config;
 
 /// The `connector.class` values this build may start. See the module docs.
-pub const ALLOWED_CONNECTOR_CLASSES: [&str; 3] = [
+pub const ALLOWED_CONNECTOR_CLASSES: [&str; 4] = [
     POSTGRES_CONNECTOR_CLASS,
     MYSQL_CONNECTOR_CLASS,
     SQLSERVER_CONNECTOR_CLASS,
+    ORACLE_CONNECTOR_CLASS,
 ];
 
 /// What a change-capture connector answers while `KAFKA_CONNECT_URL` is unset.

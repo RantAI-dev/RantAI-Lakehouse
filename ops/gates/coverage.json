@@ -273,6 +273,22 @@
         "load": "The connector is created through the API (which provisions Kafka Connect) and its first copy reaches Bronze: 20,000 seeded rows in each of the two load modes.",
         "reload": "An insert, an update and a delete each visible in Bronze within 120 s in both modes (SRC-4 D5); then a pause with 20,000 changes per table, a resume, a restart of kafka-connect during a stream of changes and a schema change, each ending with Bronze equal to the source."
       }
+    },
+    "Oracle CDC": {
+      "gate": "g4-oracle",
+      "steps": {
+        "connect": "real",
+        "discover": "real",
+        "load": "real",
+        "reload": "real"
+      },
+      "notes": {
+        "all": "SRC-4 slice 6: ops/g4/g4_oracle_test.py runs for Oracle (Debezium LogMiner) as the g4-oracle job and records the four steps through gate_summary.",
+        "connect": "Oracle: POST .../test must answer supported:true, ok:true for the least-privilege common user, through the orchestrator's test with native network encryption required.",
+        "discover": "The discovery routes list the source's tables and preview a table's columns (SRC-13 routes, the orchestrator's Oracle discovery).",
+        "load": "The connector is created through the API (which provisions Kafka Connect) and its first copy reaches Bronze: 20,000 seeded rows in each of the two load modes.",
+        "reload": "An insert, an update and a delete each visible in Bronze within 120 s in both modes (SRC-4 D5); then a pause with 20,000 changes per table, a resume, a restart of kafka-connect during a stream of changes and a new column, each ending with Bronze equal to the source."
+      }
     }
   }
 }

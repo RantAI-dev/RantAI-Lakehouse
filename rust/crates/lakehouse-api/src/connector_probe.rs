@@ -269,11 +269,20 @@ impl Outcome {
 /// real test.
 #[must_use]
 pub fn is_tested_in_orchestrator(info: &ConnectorDialInfo) -> bool {
-    info.adapter.as_deref() == Some("sql")
-        && matches!(
+    // `SRC-4` slice 6 (S6-f): an Oracle change-capture (`cdc`) connector is
+    // tested there too, with its own dial (the container database, native
+    // encryption), because the API has no Oracle client for it either.
+    match info.adapter.as_deref() {
+        Some("sql") => matches!(
             Dial::parse("sql", &info.dial),
             Ok(Dial::Sql(dial)) if dial.driver == SqlDriver::Oracle
-        )
+        ),
+        Some("cdc") => matches!(
+            Dial::parse("cdc", &info.dial),
+            Ok(Dial::Cdc(dial)) if dial.driver == SqlDriver::Oracle
+        ),
+        _ => false,
+    }
 }
 
 /// The fixed `Outcome` of a connection test the orchestrator ran for Oracle and
@@ -3442,6 +3451,21 @@ mod tests {
         });
         assert!(is_tested_in_orchestrator(&row));
 
+        // SRC-4 slice 6: an Oracle change-capture connector too, any other
+        // change-capture driver not.
+        row.adapter = Some("cdc".to_owned());
+        row.dial = serde_json::json!({
+            "driver": "oracle", "host": "db.invalid", "port": 1521,
+            "database": "FREE", "pdbName": "FREEPDB1", "user": "u"
+        });
+        assert!(is_tested_in_orchestrator(&row));
+        row.dial = serde_json::json!({
+            "driver": "mssql", "host": "db.invalid", "port": 1433,
+            "database": "d", "user": "u"
+        });
+        assert!(!is_tested_in_orchestrator(&row));
+
+        row.adapter = Some("sql".to_owned());
         row.dial = serde_json::json!({
             "driver": "postgres", "host": "db.invalid", "port": 5432,
             "database": "d", "user": "u"
