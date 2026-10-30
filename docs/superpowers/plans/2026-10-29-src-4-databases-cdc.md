@@ -956,6 +956,74 @@ for each driver, a chosen mode kept on edit (and changed to `disable`). Locally:
 `bun test src/features/connectors` 414 pass, `bun run lint` 0 errors. CI on `e08c6644`: all 41 checks
 `pass` (run for that commit, including the three change-capture gates and `Frontend`).
 
+### Slice 4, lag, the lag alert and the setup checks (developer, Sonnet, 2026-10-30)
+
+**Commits** (branch `feat/data-phase-4-src-4`, after `36c282b8`): T4.1 `473e4b21`; T4.2 `f0722fc4`;
+T4.3 `bc061438`; T4.4 `93b742b3` (CI fixes `de913e60`, test lints; `65915e81`, T4.1 test times);
+T4.5 `4da94629`; T4.6 `25617bda`; T4.7 `c3990e57`; T4.8 `f8765906`. `510052be` merges `origin/main`
+(the PR was `CONFLICTING` again, so no CI ran on `65915e81`; one generated line of
+`docs/core/BACKLOG.md`, both rows kept).
+
+**CI on `510052be`** (run 41013826932): all 41 checks `pass`, including `Rust · test (stable)`
+(39m44s, 8,642 tests passed, 0 failed), `Rust · clippy` (2m31s), `Frontend` (3m45s),
+`Dagster · unit tests`. Gate numbers, read in the job logs:
+
+| Gate | Job | Time | Lag after first copy | Setup checks |
+|---|---|---|---|---|
+| `g4-cdc` | 123930559369 | 13m43s | `g4_cdc.orders up_to_date, g4_cdc.orders_history up_to_date` | `wal_level`, `replication role`, `publication`, `publication tables` all ok; other connector: `publication` missing alone, rest ok |
+| `g4-mysql` | 123930559290 | 7m24s | both `up_to_date` | `binary log`, `binlog_format`, `binlog_row_image`, `replication privileges`, `binlog retention` ok; other login: `replication privileges` missing alone |
+| `g4-mssql` | 123930559286 | 7m11s | both `up_to_date` | CDC on database and both tables ok, `SQL Server Agent` = `unchecked`; third table: `CDC on table dbo.orders_plain` missing alone |
+
+`g4-cdc` lag alert line: `limit 1 min, kafka-connect stopped: lag 64s, 1 instance, still 1 after more ticks;
+started again: ... up_to_date, alert closed, 1 instance listed (15-minute dedupe)`. The lag passed 60 s
+after 60.2 s of waiting, the instance appeared 5 s later. Freshness stayed inside D5 (PostgreSQL 26 to 45 s,
+MySQL 26 to 49 s, SQL Server 27 to 39 s).
+
+**Mismatch with Amendment 7 (S4-h), stated rather than worked around.** The plan says "exactly two
+instances in total" (the crossing and the back-under). The Alerts list dedupes a rule's instances for
+15 minutes (`overview::insert_from_fired_rule_with_delivery`), and both events happen within minutes in the
+gate, so only one row is listed. The back-under alert is sent (the flag is compare-and-set and delivery
+follows it) but is not a second row. The gate therefore asserts: one instance after the crossing and
+still one after more ticks over the limit, `alertOpen` true, then up to date and `alertOpen` false. It does
+not prove the second delivery arrives (the sink is a dead address, as the WAL rule's). Options for the
+reviewer: accept; or change the dedupe for this kind (touches `overview.rs`, outside this slice); or give the
+gate a webhook receiver (the address check refuses compose-internal addresses).
+
+**Beyond the plan, or decided by the developer inside it.**
+
+- *Detached delivery.* `announce` runs the flag flip and the delivery in a `tokio::spawn` task and awaits
+  it, so an orchestrator post that times out cannot cancel the handler between the flip and the delivery
+  (that would leave the flag open and the alert unsent for good). A failed delivery puts the flag back.
+- *Templates in commands.* The check texts are fixed; the `command` of a missing check fills a fixed template
+  with values this build already holds (the dial's publication and login, the connector's selected tables),
+  quoted for the engine. They are shown, never executed. S4-f says "fixed string"; this is the reading that
+  lets the command name the table. The statements that read the facts have no value in them.
+- *Table checks omitted.* When the PostgreSQL publication does not exist, no "publication tables" check is
+  listed (the publication's command already names every table), so the gate's "the rest ok" holds.
+- *The PostgreSQL checks* use a new `pg_probe::connect_and_fetch` (SCRAM and TLS only, rows read as text
+  from `DataRow`); `authenticate_and_select` was split into `authenticate` and `run_query` with the same
+  behaviour for `SELECT 1`. No stop-and-report condition was hit: the client runs row-returning statements.
+- *SQL Server visibility.* The check reads `sys.tables`, which shows only tables the login can see; a table
+  the login cannot see reads as missing CDC. The documented login has `SELECT` on the selected tables.
+- *New steps are not columns of the SRC-9 table.* `lag`, `setup checks` and `lag alert` print their numbers
+  and fail the gate by name but are not added to `coverage.json` (no column was added).
+- *Ingest tab.* The pause button and the capture panel were moved to the new tab; on the Ingest tab a paused
+  change-capture connector says "Resume it on the Change capture tab". The Ingest tests for the moved panel
+  moved with it (`connector-change-capture-panel.test.tsx`).
+- *Migration number.* 0118 was free on every remote branch (0119 is slice 5's).
+
+**Local checks.** `cargo fmt --check` (clean). Python: `pytest dispar_orchestrate/test_cdc_apply.py` 55 passed
+(also `test_ingest_run_reports.py`, `test_schema_observer.py`: 73 passed); `ops/g4/test_cdc_gate.py` 10;
+`ops/lint` 24 and `ops/gates` 29 unit tests; `scripts/ci/tests/test_required_gate.sh` 56 and
+`test_detect_change_scope.sh` 33; `check_intra_package_imports.py` and `check_bare_iceberg_count.py` OK.
+Console: `tsc --noEmit` clean; `bun test src` 2,954 passed, 1 skipped, 0 failed; `bun run lint` 0 errors.
+
+**Not verified locally** (no cargo build, clippy, test, docker on this VM): every Rust change, the three
+gates and the `Rust · test` suite were run only by CI (above). The first CI run of the Rust changes failed on
+three test-only clippy lints and on a store test that compared nanoseconds with Postgres microseconds; both
+fixed (commits above) and green on `510052be`. The MySQL `SHOW GRANTS` and `CAST(... AS CHAR)` decoding and
+the tiberius row reads were first exercised by the gates.
+
 ## Review
 
 (The planner writes findings here, tagged `BLOCKER` or `SHOULD-FIX`.)
