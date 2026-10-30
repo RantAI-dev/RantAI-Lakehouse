@@ -247,4 +247,130 @@ mod tests {
         let read_result = get_gold_export(&s, &args).await;
         assert!(read_result.get("error").is_some(), "{read_result}");
     }
+
+    /// The tenant that owns the shared catalog in these tests — the first
+    /// tenant `0002_seed_identity.sql` seeds ("Meridian Group").
+    const CATALOG_TENANT: Uuid = uuid::uuid!("11111111-1111-4111-8111-000000000001");
+
+    /// A signed-in person of a tenant that does NOT own the shared
+    /// catalog, holding `gold:export` — the case the review names.
+    ///
+    /// The ids are the seeded ones: `sari@meridian.example`
+    /// (`000000000005`), a member of "Meridian Retail"
+    /// (`...000000000002`) only. A person the seed knows is a real
+    /// principal of another tenant, not an invented one — the gate reads
+    /// the tenant count and the memberships out of the database.
+    fn person_of_another_tenant() -> Principal {
+        Principal {
+            id: PrincipalId::User(uuid::uuid!("33333333-3333-4333-8333-000000000005")),
+            tenant_ids: vec![uuid::uuid!("11111111-1111-4111-8111-000000000002")],
+            display_name: "Sari Handayani".to_owned(),
+            permissions: PermissionSet::parse("gold:export"),
+            provider: "session".to_owned(),
+            must_change_password: false,
+            role_names: Vec::new(),
+        }
+    }
+
+    /// The pool's own URL, for a state that reads it.
+    fn database_url_for(pool: &lakehouse_store::PgPool) -> String {
+        let options = pool.connect_options();
+        format!(
+            "postgres://{}:postgres@{}:{}/{}",
+            options.get_username(),
+            options.get_host(),
+            options.get_port(),
+            options
+                .get_database()
+                .expect("#[sqlx::test] always targets a named database"),
+        )
+    }
+
+    /// A unique path under the OS temp dir, never `std::env::set_var`
+    /// (the same rule `lakekeeper_token.rs`'s own tests follow).
+    fn token_file_path() -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("lakehouse-ai-gold-token-{nanos}"))
+    }
+
+    /// `SEC-50` (PR #281 review round 2 S2): the copilot's tool gates the
+    /// export as the SIGNED-IN PERSON.
+    ///
+    /// Nothing proved it before. The HTTP route has a gate of its own, so
+    /// every test through the route says nothing about this one; and the
+    /// tool is the path that reaches `export_mart` with its OWN actor. If
+    /// the tool were gated as the catalog's tenant instead, a person of
+    /// another tenant would export the shared catalog through the
+    /// assistant, and every other test in this file would still pass.
+    ///
+    /// So the test states the case the review names: a person of ANOTHER
+    /// tenant, holding `gold:export`, in a deployment that HAS a catalog
+    /// tenant, is refused with the gate's own 404 — and nothing reaches
+    /// the engine.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_tool_gates_the_export_as_the_signed_in_person(
+        pool: lakehouse_store::PgPool,
+    ) -> sqlx::Result<()> {
+        // A BARE mock server: wiremock's pooled one can be handed to
+        // another test, and then this test's request log would carry that
+        // test's requests (the reason `gold_export.rs`'s own gate test
+        // uses the same shape).
+        let engine = wiremock::MockServer::builder().start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"meta": [], "data": [], "rows": 0})),
+            )
+            .mount(&engine)
+            .await;
+
+        let token_file = token_file_path();
+        std::fs::write(&token_file, "ci-token-not-real-123\n")
+            .expect("write the Lakekeeper token file");
+
+        let mut env = HashMap::new();
+        env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
+        env.insert("CH_URL".to_owned(), engine.uri());
+        // The deployment HAS a catalog tenant: the refusal must come from
+        // the person being of another tenant, not from a deployment that
+        // names no owner (which is refused with a different sentence
+        // entirely — D6's 422).
+        env.insert("CATALOG_TENANT_ID".to_owned(), CATALOG_TENANT.to_string());
+        env.insert(
+            "LAKEKEEPER_GOLD_EXPORT_TOKEN_FILE".to_owned(),
+            token_file.to_string_lossy().into_owned(),
+        );
+        let s = AppState::new(Config::from_map(&env).expect("a valid config from a map"));
+
+        let principal = person_of_another_tenant();
+        let mut args = Map::new();
+        args.insert("mart".to_owned(), json!("gold_export_smoke"));
+
+        let result = export_gold_mart(&s, Some(&principal), &args).await;
+
+        // The gate's own 404 sentence, verbatim: the same one the HTTP
+        // route's gate answers, so a person of another tenant learns
+        // nothing about the mart beyond what the gate always says.
+        assert_eq!(
+            result["error"].as_str(),
+            Some(
+                "Table not found or not available to your organisation: serving.gold_export_smoke"
+            ),
+            "the tool must gate the export as the signed-in person: {result}"
+        );
+        let requests = engine
+            .received_requests()
+            .await
+            .expect("the mock engine records requests");
+        assert!(
+            requests.is_empty(),
+            "the refusal precedes the engine: nothing may be asked: {requests:?}"
+        );
+
+        std::fs::remove_file(&token_file).expect("remove the Lakekeeper token file");
+        Ok(())
+    }
 }
