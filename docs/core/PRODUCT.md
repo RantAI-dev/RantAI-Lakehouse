@@ -302,8 +302,8 @@ run without the product owner fixing things by hand.
 | --- | --- | --- |
 | 1 | No feature has been accepted. "Built" means merged, not checked by a person | Run the acceptance checklist for each feature, starting with what a demo shows |
 | 2 | A leaked key is in the public git history | Confirm it was rotated; decide whether to rewrite history |
-| 3 | No human security review | Commission one |
-| 4 | The main branch can be changed without review | Apply the settings drafted in `docs/CI.md` |
+| 3 | ~~No human security review~~ | Not a blocker: the product owner dropped it on 2026-10-30 (`SEC-4`) |
+| 4 | ~~The main branch can be changed without review~~ | Cleared 2026-10-30: `main` requires five checks and blocks force-pushes (`REL-1`, `docs/CI.md`) |
 | 5 | No support commitment to put in a contract | Decide one (`reference/support-model.md`) |
 | 6 | Open high-severity security findings: connector password theft (`SEC-14`), connection tests reaching internal addresses (`SEC-15`, accepted 2026-10-23) | Fix the security items under Now in `BACKLOG.md`; their specs are in `specs/` |
 
