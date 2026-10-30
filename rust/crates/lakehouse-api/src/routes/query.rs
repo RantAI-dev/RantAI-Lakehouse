@@ -148,7 +148,7 @@ async fn rewrite_sql_for_principal_inner(
     };
     let obligations_source = crate::policy_engine::PolicyEngineObligations::from_state(state);
 
-    // SEC-20: the tenant gate runs BEFORE the policy rewrite, so a
+    // SEC-20/SEC-50: the tenant gate runs BEFORE the policy rewrite, so a
     // statement that reads a table the caller may not read is refused
     // before the policy's own prefetch asks the engine about that table,
     // and before the statement reaches the engine at all.
@@ -159,13 +159,11 @@ async fn rewrite_sql_for_principal_inner(
     // lists objects without naming one. A statement that does not parse
     // has no targets at all: the policy rewrite refuses it with a 422 of
     // its own, so there is nothing here to gate.
-    let gate_dialect: &dyn sqlparser::dialect::Dialect = if is_trino_engine(engine) {
-        &sqlparser::dialect::GenericDialect {}
+    let actor = GateActor::Caller { principal, headers };
+    if is_trino_engine(engine) {
+        gate_statement(state, sql, &sqlparser::dialect::GenericDialect {}, actor).await?;
     } else {
-        &sqlparser::dialect::ClickHouseDialect {}
-    };
-    if let Some(targets) = crate::sql_rewrite::gate_targets(sql, gate_dialect) {
-        refuse_unreachable_tables(state, principal, headers, &targets).await?;
+        gate_statement(state, sql, &sqlparser::dialect::ClickHouseDialect {}, actor).await?;
     }
 
     // WS7 item D1/D2: the actual referenced-tables/prefetch/enforce
@@ -216,6 +214,176 @@ async fn rewrite_sql_for_principal_inner(
         ApiError::Unprocessable(crate::policy_engine::enforcement_error_message(&err).to_owned())
     })
 }
+
+/// `SEC-50`: who a gated statement acts as.
+///
+/// The gate is ONE rule with three actors, not three rules: every site
+/// that runs a statement through the policy rewrite asks this gate
+/// first, and the actor says whose reach the statement is measured
+/// against. Nobody writes a second copy of the reach logic
+/// (`AGENTS.md` rule 4).
+///
+/// # Why the variants are `#[allow(dead_code)]`
+///
+/// `SEC-50` lands in slices: this task adds the shared entry point, and
+/// the tasks that follow wire the actors in (the authored pipelines
+/// construct `AsTenant`, the Gold export constructs `CatalogTenant`).
+/// Until those land, only this module's own tests construct them — and
+/// a variant nothing constructs yet is a `dead_code` warning, not a
+/// finding. The allow is removed when the last actor has a caller.
+#[allow(
+    dead_code,
+    reason = "SEC-50 T1 adds the shared gate entry point; the `AsTenant` and \
+              `CatalogTenant` actors are constructed by the tasks that wire them \
+              in (the authored pipelines and the Gold export), so until those land \
+              only this module's own tests construct them"
+)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum GateActor<'a> {
+    /// The signed-in caller, with the request's headers: the tenant is
+    /// the `X-Tenant` header when the caller sent one, else the
+    /// caller's first tenant. `SEC-20`'s rule, unchanged.
+    Caller {
+        principal: &'a Principal,
+        headers: &'a HeaderMap,
+    },
+    /// A named tenant, resolved as if it had been sent in `X-Tenant`:
+    /// the site acts as that tenant, and a principal that does not
+    /// belong to it is refused with the same 404 an `X-Tenant` header
+    /// naming a foreign tenant gets. `None` means the site has no
+    /// tenant at all, and reaches nothing.
+    AsTenant {
+        principal: &'a Principal,
+        tenant_id: Option<Uuid>,
+    },
+    /// The deployment's own catalog tenant: a job with no user (an
+    /// alert, the scheduled Gold export, an embed token).
+    CatalogTenant,
+}
+
+/// `SEC-50`: the ONE gate every statement passes before it is rewritten.
+///
+/// `SEC-20` put the tenant gate inside the query path; this is that
+/// gate, lifted out of it so that every site which runs a statement
+/// through [`crate::policy_engine::rewrite_sql_for_roles`] asks it
+/// first — the query path, the authored pipelines, the Gold export, and
+/// (from slice 2) the dashboards, the embeds, the public links and the
+/// alerts. The gate is the same code for all of them; only the actor
+/// differs, and the actor says whose reach the statement is measured
+/// against.
+///
+/// The targets come from ONE parse, with the dialect of the engine the
+/// statement names (the same choice the policy rewrite makes): the
+/// tables the statement names, or the fact that it lists objects
+/// without naming one. A statement that does not parse has no targets
+/// at all: the policy rewrite refuses it with a 422 of its own, so
+/// there is nothing here to gate.
+///
+/// # Errors
+///
+/// 404 with the fixed sentence of [`table_not_available`] for a table
+/// the actor may not read; 422 with the fixed sentence of
+/// [`LISTING_NOT_AVAILABLE`] for a statement that lists objects and the
+/// actor may not list them; 404 for a tenant the actor may not act as;
+/// 422 with the fixed sentence of [`JOB_NEEDS_CATALOG_TENANT`] for a
+/// job with no user in a deployment that holds several tenants and no
+/// `CATALOG_TENANT_ID`; 503 when the deployment's own answers cannot be
+/// read.
+pub(crate) async fn gate_statement<D>(
+    state: &AppState,
+    sql: &str,
+    dialect: &D,
+    actor: GateActor<'_>,
+) -> Result<(), ApiError>
+where
+    D: sqlparser::dialect::Dialect + Sync,
+{
+    let Some(targets) = crate::sql_rewrite::gate_targets(sql, dialect) else {
+        // A statement that does not parse has no targets: the policy
+        // rewrite refuses it with a 422 of its own, so there is nothing
+        // here to gate.
+        return Ok(());
+    };
+    refuse_unreachable_tables(state, actor, &targets).await
+}
+
+/// `SEC-50`: the reach of an actor — whose tables the statement may
+/// read.
+///
+/// Each actor answers the same question with the answers the service
+/// already has (the shared catalog's own gate, the acting tenant, the
+/// deployment's tenant count, and the setting that names the catalog's
+/// tenant), never with a rule of its own.
+///
+/// # Errors
+///
+/// 404 for a tenant the actor may not act as; 422 with the fixed
+/// sentence of [`JOB_NEEDS_CATALOG_TENANT`] for a job with no user in a
+/// deployment that holds several tenants and no `CATALOG_TENANT_ID`;
+/// 503 when the deployment's own answers cannot be read.
+async fn reach_for_actor(state: &AppState, actor: GateActor<'_>) -> Result<TenantReach, ApiError> {
+    match actor {
+        GateActor::Caller { principal, headers } => resolve_reach(state, principal, headers).await,
+        GateActor::AsTenant {
+            principal,
+            tenant_id,
+        } => match tenant_id {
+            // D5: the site has no tenant at all (a pipeline whose own
+            // `tenant_id` is NULL). It reaches nothing — the migration's
+            // own fail-closed rule.
+            None => Ok(TenantReach::NoTenant),
+            // D5: the tenant is checked and resolved exactly as an
+            // `X-Tenant` header is, so the reach is the one the
+            // principal would have with that header — one rule, not two.
+            Some(tenant_id) => {
+                let headers = crate::tenant_scope::headers_for_tenant(tenant_id)?;
+                resolve_reach(state, principal, &headers).await
+            }
+        },
+        GateActor::CatalogTenant => {
+            let tenant_count = deployment_tenant_count(state).await?;
+            catalog_tenant_reach(tenant_count, state.config.catalog_tenant_id)
+        }
+    }
+}
+
+/// `SEC-50` D3: the reach of a job with no user, as a pure function of
+/// the two answers it needs.
+///
+/// The job reads the SHARED catalog (`serving.*`, Silver, Gold), so the
+/// only tenant whose reach can cover it is the tenant that owns that
+/// catalog — which is why the job acts as the catalog's tenant and not
+/// as any person.
+///
+/// The reach is `All` when the deployment holds a single tenant (there is
+/// no other tenant's table to reach), the catalog's own tenant when
+/// `CATALOG_TENANT_ID` names it, and a refusal otherwise: a deployment
+/// with several tenants and no catalog tenant has no tenant whose reach
+/// covers the shared catalog, and failing closed is the only honest
+/// answer (D6).
+fn catalog_tenant_reach(
+    tenant_count: Option<i64>,
+    catalog_tenant_id: Option<Uuid>,
+) -> Result<TenantReach, ApiError> {
+    if tenant_count.is_some_and(|count| count <= 1) {
+        return Ok(TenantReach::All);
+    }
+    match catalog_tenant_id {
+        Some(tenant_id) => Ok(TenantReach::Tenant {
+            tenant_id,
+            owns_catalog: true,
+        }),
+        None => Err(ApiError::Unprocessable(JOB_NEEDS_CATALOG_TENANT.to_owned())),
+    }
+}
+
+/// `SEC-50` D6: the one sentence a job with no user is refused with when
+/// the deployment holds several tenants and no tenant owns the shared
+/// catalog.
+///
+/// It names the setting and what to do with it, and says nothing about
+/// the deployment's data (`AGENTS.md` principle 4).
+pub(crate) const JOB_NEEDS_CATALOG_TENANT: &str = "This job reads the shared catalog, and no tenant owns it here. Set CATALOG_TENANT_ID to the tenant that owns this deployment's shared catalog.";
 
 /// `SEC-20`: how far the caller's reach extends over the tables a
 /// statement reads.
@@ -523,7 +691,7 @@ async fn claim_on(state: &AppState, tenant_id: Uuid, table: &str) -> Result<Tabl
         })
 }
 
-/// `SEC-20`: refuse a statement the caller's tenant may not run.
+/// `SEC-20`/`SEC-50`: refuse a statement the actor's tenant may not run.
 ///
 /// The targets are what the statement means to the gate: the tables it
 /// names — canonicalised the way the policy rewrite canonicalises them
@@ -536,17 +704,22 @@ async fn claim_on(state: &AppState, tenant_id: Uuid, table: &str) -> Result<Tabl
 /// tenant (and for a deployment with one tenant) and is refused
 /// otherwise.
 ///
+/// The actor's reach is resolved only when there is something to check:
+/// a statement that names no table reads nothing, so it is let through
+/// without asking the deployment anything (`SEC-20`'s behaviour, kept).
+///
 /// # Errors
 ///
 /// 404 with the fixed sentence of [`table_not_available`] for a table the
-/// caller may not read; 422 with the fixed sentence of
+/// actor may not read; 422 with the fixed sentence of
 /// [`LISTING_NOT_AVAILABLE`] for a statement that lists objects and the
-/// caller may not list them; 404 for an `X-Tenant` header the caller does
-/// not belong to; 503 when a claim cannot be read.
+/// actor may not list them; the errors of [`reach_for_actor`] — 404 for a
+/// tenant the actor may not act as, 422 for a job with no user in a
+/// deployment with several tenants and no `CATALOG_TENANT_ID`; 503 when
+/// a claim cannot be read.
 async fn refuse_unreachable_tables(
     state: &AppState,
-    principal: &Principal,
-    headers: &HeaderMap,
+    actor: GateActor<'_>,
     targets: &crate::sql_rewrite::GateTargets,
 ) -> Result<(), ApiError> {
     match targets {
@@ -554,7 +727,7 @@ async fn refuse_unreachable_tables(
             if tables.is_empty() {
                 return Ok(());
             }
-            let reach = resolve_reach(state, principal, headers).await?;
+            let reach = reach_for_actor(state, actor).await?;
             let tenant_id = match reach {
                 TenantReach::All => return Ok(()),
                 TenantReach::NoTenant => return Err(table_not_available(&tables[0])),
@@ -573,7 +746,7 @@ async fn refuse_unreachable_tables(
             // The reach is resolved FIRST: a header naming a tenant the
             // caller does not belong to is a 404 everywhere else, and it
             // must not be answered with the listing's own 422.
-            let reach = resolve_reach(state, principal, headers).await?;
+            let reach = reach_for_actor(state, actor).await?;
             match reach {
                 // Every permission, or a deployment with one tenant: there
                 // is no other tenant's listing to keep. The catalog's own
@@ -4787,6 +4960,215 @@ mod tenant_scope_tests {
                 owns_catalog: false,
             }
         );
+    }
+}
+
+/// `SEC-50`: the shared tenant gate's actors, on their own — which reach
+/// each actor gets, and what the gate refuses.
+#[cfg(test)]
+mod sec50_gate_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::collections::HashMap;
+
+    use axum::http::HeaderMap;
+    use lakehouse_auth::{PermissionSet, Principal, PrincipalId};
+    use lakehouse_store::PgPool;
+    use lakehouse_store::uploads::claim_table;
+    use uuid::Uuid;
+
+    use super::{
+        GateActor, JOB_NEEDS_CATALOG_TENANT, TenantReach, catalog_tenant_reach, gate_statement,
+        reach_for_actor,
+    };
+    use crate::config::Config;
+    use crate::state::AppState;
+
+    /// The tenant that owns the shared catalog in these tests.
+    const CATALOG_TENANT: Uuid = uuid::uuid!("11111111-1111-4111-8111-000000000001");
+    /// Another tenant of the same deployment.
+    const OTHER_TENANT: Uuid = uuid::uuid!("11111111-1111-4111-8111-000000000002");
+    /// The upload table the claims below are about.
+    const CLAIMED_TABLE: &str = "group_orders";
+    /// The statement that reads it.
+    const STATEMENT: &str = "SELECT * FROM bronze.group_orders";
+    /// The refusal of that statement, byte for byte.
+    const REFUSAL: &str =
+        "Table not found or not available to your organisation: bronze.group_orders";
+
+    /// A principal that belongs to exactly one tenant.
+    fn principal_in(tenant_id: Uuid) -> Principal {
+        Principal {
+            id: PrincipalId::User(Uuid::from_u128(1)),
+            tenant_ids: vec![tenant_id],
+            display_name: "Rina Wijaya".to_owned(),
+            permissions: PermissionSet::parse("query:read"),
+            provider: "session".to_owned(),
+            must_change_password: false,
+            role_names: Vec::new(),
+        }
+    }
+
+    /// A state with no pool at all: the deployment's own answers are
+    /// missing, so the gate must fail closed rather than guess.
+    fn state_without_a_database() -> AppState {
+        AppState::new(Config::from_map(&HashMap::new()).expect("a config with no pool"))
+    }
+
+    /// The pool's own URL, for a state that reads it.
+    fn database_url_for(pool: &PgPool) -> String {
+        let options = pool.connect_options();
+        format!(
+            "postgres://{}:postgres@{}:{}/{}",
+            options.get_username(),
+            options.get_host(),
+            options.get_port(),
+            options
+                .get_database()
+                .expect("#[sqlx::test] always targets a named database"),
+        )
+    }
+
+    #[test]
+    fn a_job_with_no_user_reaches_everything_in_a_one_tenant_deployment() {
+        assert_eq!(
+            catalog_tenant_reach(Some(1), None).expect("a deployment with one tenant"),
+            TenantReach::All
+        );
+    }
+
+    #[test]
+    fn a_job_with_no_user_acts_as_the_tenant_that_owns_the_shared_catalog() {
+        assert_eq!(
+            catalog_tenant_reach(Some(4), Some(CATALOG_TENANT)).expect("the catalog's own tenant"),
+            TenantReach::Tenant {
+                tenant_id: CATALOG_TENANT,
+                owns_catalog: true,
+            }
+        );
+    }
+
+    #[test]
+    fn a_job_with_no_user_is_refused_when_no_tenant_owns_the_shared_catalog() {
+        let err = catalog_tenant_reach(Some(4), None)
+            .expect_err("several tenants and no tenant that owns the shared catalog");
+        assert_eq!(err.status(), 422);
+        assert_eq!(err.to_string(), JOB_NEEDS_CATALOG_TENANT);
+        // The sentence names the setting and what to do with it, and
+        // nothing about the deployment's data.
+        assert_eq!(
+            JOB_NEEDS_CATALOG_TENANT,
+            "This job reads the shared catalog, and no tenant owns it here. Set CATALOG_TENANT_ID to the tenant that owns this deployment's shared catalog."
+        );
+    }
+
+    #[tokio::test]
+    async fn a_site_that_acts_as_no_tenant_reaches_nothing() {
+        let state = state_without_a_database();
+        let principal = principal_in(CATALOG_TENANT);
+        let reach = reach_for_actor(
+            &state,
+            GateActor::AsTenant {
+                principal: &principal,
+                tenant_id: None,
+            },
+        )
+        .await
+        .expect("the reach of a site with no tenant at all");
+        assert_eq!(reach, TenantReach::NoTenant);
+    }
+
+    #[tokio::test]
+    async fn a_site_that_acts_as_a_tenant_it_may_not_act_as_is_refused() {
+        let state = state_without_a_database();
+        let principal = principal_in(CATALOG_TENANT);
+        let err = reach_for_actor(
+            &state,
+            GateActor::AsTenant {
+                principal: &principal,
+                tenant_id: Some(OTHER_TENANT),
+            },
+        )
+        .await
+        .expect_err("a principal that is not a member of that tenant");
+        // The same 404 an `X-Tenant` header naming a foreign tenant
+        // gets — never a 403, which would confirm the tenant exists.
+        assert_eq!(err.status(), 404);
+        assert_eq!(err.to_string(), "tenant not found");
+    }
+
+    #[tokio::test]
+    async fn a_job_with_no_user_in_a_deployment_that_cannot_say_who_owns_the_catalog_is_refused() {
+        let state = state_without_a_database();
+        let err = reach_for_actor(&state, GateActor::CatalogTenant)
+            .await
+            .expect_err("a deployment that cannot say who owns the shared catalog");
+        assert_eq!(err.status(), 422);
+        assert_eq!(err.to_string(), JOB_NEEDS_CATALOG_TENANT);
+    }
+
+    /// The gate itself, over a real deployment: the upload table another
+    /// tenant claimed is out of reach for every actor that does not own
+    /// it, and in reach for the tenant that does.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_gate_refuses_another_tenants_upload_table_for_every_actor(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let mut env = HashMap::new();
+        env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
+        env.insert("CH_URL".to_owned(), "http://127.0.0.1:1".to_owned());
+        env.insert("CATALOG_TENANT_ID".to_owned(), CATALOG_TENANT.to_string());
+        let state = AppState::new(Config::from_map(&env).expect("valid config from a map"));
+
+        let claimed = claim_table(&pool, OTHER_TENANT, CLAIMED_TABLE, "upload-other")
+            .await
+            .expect("claim the upload table for the other tenant");
+        assert!(claimed, "the other tenant must hold the claim");
+
+        let catalog_principal = principal_in(CATALOG_TENANT);
+        let other_principal = principal_in(OTHER_TENANT);
+
+        // The caller in the catalog's own tenant may not read the other
+        // tenant's upload.
+        let refused = gate_statement(
+            &state,
+            STATEMENT,
+            &sqlparser::dialect::ClickHouseDialect {},
+            GateActor::Caller {
+                principal: &catalog_principal,
+                headers: &HeaderMap::new(),
+            },
+        )
+        .await
+        .expect_err("another tenant's upload table");
+        assert_eq!(refused.to_string(), REFUSAL);
+
+        // A job with no user acts as the catalog's tenant, so the other
+        // tenant's upload is out of ITS reach too.
+        let refused = gate_statement(
+            &state,
+            STATEMENT,
+            &sqlparser::dialect::ClickHouseDialect {},
+            GateActor::CatalogTenant,
+        )
+        .await
+        .expect_err("another tenant's upload table");
+        assert_eq!(refused.to_string(), REFUSAL);
+
+        // The tenant that holds the table reads it — as a caller acting
+        // as itself, and as a site acting as that tenant.
+        let allowed = gate_statement(
+            &state,
+            STATEMENT,
+            &sqlparser::dialect::ClickHouseDialect {},
+            GateActor::AsTenant {
+                principal: &other_principal,
+                tenant_id: Some(OTHER_TENANT),
+            },
+        )
+        .await;
+        assert!(allowed.is_ok(), "the owning tenant reads its own upload");
+        Ok(())
     }
 }
 
