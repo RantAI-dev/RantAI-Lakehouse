@@ -21,7 +21,7 @@ const PG: &str = "conn-pg-lakehouse";
 async fn a_backlog_report_keeps_the_last_moment_the_table_was_caught_up(
     pool: PgPool,
 ) -> sqlx::Result<()> {
-    let t0 = OffsetDateTime::now_utc() - Duration::minutes(5);
+    let t0 = OffsetDateTime::now_utc().replace_nanosecond(0).unwrap() - Duration::minutes(5);
     record_backlog(&pool, PG, "public.orders", 0, true, t0)
         .await
         .unwrap();
@@ -53,7 +53,7 @@ async fn a_backlog_report_keeps_the_last_moment_the_table_was_caught_up(
 /// The last-change time never moves backwards and does not set `observed_at`.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_last_change_time_never_moves_backwards(pool: PgPool) -> sqlx::Result<()> {
-    let t0 = OffsetDateTime::now_utc() - Duration::minutes(5);
+    let t0 = OffsetDateTime::now_utc().replace_nanosecond(0).unwrap() - Duration::minutes(5);
     record_last_change(&pool, PG, "public.orders", t0)
         .await
         .unwrap();
