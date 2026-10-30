@@ -23,7 +23,9 @@
 //! A fact that could not be read (a statement the login may not run, a
 //! connection that ended) gives `unchecked` with a fixed sentence, never `ok`.
 
+use lakehouse_store::connector_discovery::{ChangeStreamFact, MongoSetupFacts, ReplicaSetFact};
 use lakehouse_store::connectors::{SetupCheck, SetupStatus};
+use lakehouse_store::ingest_spec::CdcMongoDial;
 
 /// Rows of text values, `None` for SQL `NULL`.
 pub type Rows = Vec<Vec<Option<String>>>;
@@ -495,6 +497,93 @@ fn mssql_agent(facts: &MssqlFacts) -> SetupCheck {
     }
 }
 
+// ── MongoDB ────────────────────────────────────────────────────────────────
+
+/// `value` as a JSON string literal, which `mongosh` reads as the same string: quotes,
+/// backslashes and control characters are escaped by `serde_json`, never by hand. The user is
+/// any string the dial accepted (it only has to be non-empty).
+fn json_string(value: &str) -> String {
+    serde_json::Value::String(value.to_owned()).to_string()
+}
+
+fn missing_without_command(setting: &str, message: &str) -> SetupCheck {
+    SetupCheck {
+        setting: setting.to_owned(),
+        status: SetupStatus::Missing,
+        message: message.to_owned(),
+        command: None,
+    }
+}
+
+/// The `MongoDB` checks (`SRC-4` Amendment 8, S8-d): the replica set's name, that the one host
+/// the connector names is the primary, and that the login may read change streams on its
+/// database. Pure: `facts` are what the orchestrator's connection test posted (closed words,
+/// no server text), and a fact it did not read, or no facts at all, is `unchecked`, never `ok`.
+/// Only the change-stream check carries a command, built from the dial's database and user.
+#[must_use]
+pub fn mongo_checks(facts: Option<&MongoSetupFacts>, dial: &CdcMongoDial) -> Vec<SetupCheck> {
+    let facts = facts.copied().unwrap_or_default();
+    vec![
+        mongo_replica_set(facts.replica_set),
+        mongo_primary(facts.primary),
+        mongo_change_stream(facts.change_stream, dial),
+    ]
+}
+
+fn mongo_replica_set(fact: Option<ReplicaSetFact>) -> SetupCheck {
+    const SETTING: &str = "replicaSet";
+    match fact {
+        None => unchecked(SETTING, UNREAD),
+        Some(ReplicaSetFact::Matches) => ok(
+            SETTING,
+            "The server's replica set name is the one named here.",
+        ),
+        Some(ReplicaSetFact::Differs) => missing_without_command(
+            SETTING,
+            "The server's replica set has another name. Use the name in `rs.status().set`.",
+        ),
+        Some(ReplicaSetFact::None) => missing_without_command(
+            SETTING,
+            "The server is not a replica set member; change streams need a replica set.",
+        ),
+    }
+}
+
+fn mongo_primary(fact: Option<bool>) -> SetupCheck {
+    const SETTING: &str = "primary";
+    match fact {
+        None => unchecked(SETTING, UNREAD),
+        Some(true) => ok(SETTING, "This host is the primary."),
+        // Slice 5 review BLOCKER 1: the connector reads through the one host it names.
+        Some(false) => missing_without_command(
+            SETTING,
+            "This host is not the primary. The connector reads change streams through the one host it names, so name the primary.",
+        ),
+    }
+}
+
+fn mongo_change_stream(fact: Option<ChangeStreamFact>, dial: &CdcMongoDial) -> SetupCheck {
+    const SETTING: &str = "changeStream";
+    match fact {
+        None => unchecked(SETTING, UNREAD),
+        Some(ChangeStreamFact::Granted) => ok(
+            SETTING,
+            "The login may read change streams on the database.",
+        ),
+        Some(ChangeStreamFact::Missing) => {
+            let database = json_string(&dial.database);
+            missing(
+                SETTING,
+                "The login may not read change streams on the database. Grant it the read role.",
+                format!(
+                    "db.getSiblingDB({database}).grantRolesToUser({}, [{{ role: \"read\", db: {database} }}])",
+                    json_string(&dial.user)
+                ),
+            )
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -821,5 +910,147 @@ mod tests {
         let unread = mssql_checks(&MssqlFacts::default(), &["dbo.orders".to_owned()]);
         assert_eq!(unread[0].status, SetupStatus::Unchecked);
         assert_eq!(unread[1].status, SetupStatus::Unchecked);
+    }
+
+    // ── MongoDB (SRC-4 Amendment 8) ──
+
+    fn mongo_dial(user: &str) -> CdcMongoDial {
+        serde_json::from_value(serde_json::json!({
+            "driver": "mongodb", "hosts": ["m.internal:27017"], "database": "shop",
+            "user": user, "replicaSet": "rs0"
+        }))
+        .unwrap()
+    }
+
+    fn by_setting<'a>(checks: &'a [SetupCheck], setting: &str) -> &'a SetupCheck {
+        checks.iter().find(|c| c.setting == setting).unwrap()
+    }
+
+    fn all_ok() -> MongoSetupFacts {
+        MongoSetupFacts {
+            replica_set: Some(ReplicaSetFact::Matches),
+            primary: Some(true),
+            change_stream: Some(ChangeStreamFact::Granted),
+        }
+    }
+
+    #[test]
+    fn mongo_checks_are_all_ok_when_every_fact_is_good() {
+        let checks = mongo_checks(Some(&all_ok()), &mongo_dial("reader"));
+        assert_eq!(
+            checks
+                .iter()
+                .map(|c| c.setting.as_str())
+                .collect::<Vec<_>>(),
+            ["replicaSet", "primary", "changeStream"]
+        );
+        assert!(
+            checks
+                .iter()
+                .all(|c| c.status == SetupStatus::Ok && c.command.is_none())
+        );
+    }
+
+    #[test]
+    fn a_replica_set_that_differs_or_is_none_is_missing_with_its_fixed_sentence_and_no_command() {
+        let dial = mongo_dial("reader");
+        for (fact, sentence) in [
+            (
+                ReplicaSetFact::Differs,
+                "The server's replica set has another name. Use the name in `rs.status().set`.",
+            ),
+            (
+                ReplicaSetFact::None,
+                "The server is not a replica set member; change streams need a replica set.",
+            ),
+        ] {
+            let facts = MongoSetupFacts {
+                replica_set: Some(fact),
+                ..all_ok()
+            };
+            let checks = mongo_checks(Some(&facts), &dial);
+            let check = by_setting(&checks, "replicaSet");
+            assert_eq!(
+                (check.status, check.message.as_str(), &check.command),
+                (SetupStatus::Missing, sentence, &None)
+            );
+            // The other two are unaffected.
+            assert_eq!(by_setting(&checks, "primary").status, SetupStatus::Ok);
+            assert_eq!(by_setting(&checks, "changeStream").status, SetupStatus::Ok);
+        }
+    }
+
+    #[test]
+    fn a_host_that_is_not_the_primary_is_missing_with_no_command() {
+        let facts = MongoSetupFacts {
+            primary: Some(false),
+            ..all_ok()
+        };
+        let checks = mongo_checks(Some(&facts), &mongo_dial("reader"));
+        let check = by_setting(&checks, "primary");
+        assert_eq!(check.status, SetupStatus::Missing);
+        assert_eq!(
+            check.message,
+            "This host is not the primary. The connector reads change streams through the one host it names, so name the primary."
+        );
+        assert!(check.command.is_none());
+    }
+
+    #[test]
+    fn a_missing_change_stream_privilege_carries_a_grant_built_from_the_dial() {
+        let facts = MongoSetupFacts {
+            change_stream: Some(ChangeStreamFact::Missing),
+            ..all_ok()
+        };
+        let checks = mongo_checks(Some(&facts), &mongo_dial("reader"));
+        let check = by_setting(&checks, "changeStream");
+        assert_eq!(check.status, SetupStatus::Missing);
+        assert_eq!(
+            check.command.as_deref(),
+            Some(
+                "db.getSiblingDB(\"shop\").grantRolesToUser(\"reader\", [{ role: \"read\", db: \"shop\" }])"
+            )
+        );
+    }
+
+    #[test]
+    fn the_grants_user_is_quoted_as_a_json_string_never_by_hand() {
+        // A quote and a backslash in the user cannot end the string literal.
+        let facts = MongoSetupFacts {
+            change_stream: Some(ChangeStreamFact::Missing),
+            ..all_ok()
+        };
+        let checks = mongo_checks(Some(&facts), &mongo_dial("a\"b\\c"));
+        let command = by_setting(&checks, "changeStream").command.clone().unwrap();
+        assert!(
+            command.contains(r#"grantRolesToUser("a\"b\\c","#),
+            "{command}"
+        );
+    }
+
+    #[test]
+    fn absent_facts_are_unchecked_never_ok() {
+        let dial = mongo_dial("reader");
+        for facts in [None, Some(&MongoSetupFacts::default())] {
+            let checks = mongo_checks(facts, &dial);
+            assert_eq!(checks.len(), 3);
+            assert!(
+                checks
+                    .iter()
+                    .all(|c| c.status == SetupStatus::Unchecked && c.command.is_none())
+            );
+            assert!(checks.iter().all(|c| c.message == UNREAD));
+        }
+        // One fact absent leaves only that check unchecked.
+        let facts = MongoSetupFacts {
+            primary: None,
+            ..all_ok()
+        };
+        let checks = mongo_checks(Some(&facts), &dial);
+        assert_eq!(
+            by_setting(&checks, "primary").status,
+            SetupStatus::Unchecked
+        );
+        assert_eq!(by_setting(&checks, "replicaSet").status, SetupStatus::Ok);
     }
 }

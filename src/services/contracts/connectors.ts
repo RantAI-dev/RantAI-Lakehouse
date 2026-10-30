@@ -928,6 +928,11 @@ export type DiscoveryAnswer = {
   primaryKey?: string[]
   /** A finished connection test: the milliseconds the connection took, as the orchestrator measured them. */
   latencyMs?: number
+  /**
+   * A finished test of a MongoDB change-capture connector (`SRC-4` Amendment 8, S8-e): what the source must have
+   * switched on, in the API's fixed words. Absent for every other kind and connector. Never part of `ok`.
+   */
+  setupChecks?: SetupCheck[]
   errorClass?: DiscoveryErrorClass
   reason?: string
   startedAt?: string

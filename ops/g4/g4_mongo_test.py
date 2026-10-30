@@ -227,11 +227,15 @@ def step_ids_are_the_object_id_text() -> None:
 # ── registration, connect, discover ─────────────────────────────────────────────────────
 
 
-def _register(tenant_id: str) -> str:
+def _register(tenant_id: str, *, suffix: str = "", replica_set: str | None = None, tolerate_refusal: bool = False) -> str:
+    """Register the connector the way the console does. `replica_set` and `tolerate_refusal` are for the
+    setup-check step's second connector: a wrong replica set name makes Kafka Connect refuse the config
+    (the API saves the settings first and answers 422 "did not start"), which is the case under test."""
+    dial = {**src().dial(), **({"replicaSet": replica_set} if replica_set is not None else {})}
     created = g.API.post(
         f"{g.API_URL}/api/connectors",
         json={
-            "name": "g4-mongo-demo-cdc", "type": src().cdc_type, "direction": "source",
+            "name": f"g4-mongo-demo-cdc{suffix}", "type": src().cdc_type, "direction": "source",
             "host": src().host_for_registry, "credential": {"source": "file", "primary": "password"},
             "environment": "production", "tenant": "g4", "tenantId": tenant_id, "residency": "", "capabilities": [],
         },
@@ -248,15 +252,16 @@ def _register(tenant_id: str) -> str:
     spec = g.API.put(
         f"{g.API_URL}/api/connectors/{connector_id}/ingest-spec",
         json={
-            "adapter": "cdc", "ingestMode": "cdc", "dial": src().dial(),
+            "adapter": "cdc", "ingestMode": "cdc", "dial": dial,
             "sourceObjects": [
-                {"name": g.TABLES[m], "target": g.TARGETS[m], "loadMode": g.LOAD_MODES[m], "primaryKey": ["_id"]}
+                {"name": g.TABLES[m], "target": g.TARGETS[m] if not suffix else f"g4_wrongrs_{m}", "loadMode": g.LOAD_MODES[m], "primaryKey": ["_id"]}
                 for m in g.MODES
             ],
         },
         timeout=60,
     )
-    if not spec.ok:
+    refused_on_purpose = tolerate_refusal and spec.status_code == 422 and "did not start" in spec.text
+    if not spec.ok and not refused_on_purpose:
         raise G4Failure(f"set the connector's ingest-spec failed: {spec.status_code} {spec.text[:300]}{_explain_refusal()}")
     return connector_id
 
@@ -291,30 +296,75 @@ def _explain_refusal() -> str:
     return " [Kafka Connect validation: " + (" | ".join(problems) if problems else f"no field is refused, error_count={body.get('error_count')}") + "]"
 
 
+def _run_test(connector_id: str) -> dict:
+    """`POST .../test` (answered pending: the orchestrator tests) and the final answer of
+    `GET .../discovery/test`, polled until it is no longer running. Raises `G4Failure` otherwise."""
+    started = g.API.post(f"{g.API_URL}/api/connectors/{connector_id}/test", timeout=30)
+    if not started.ok or started.json().get("pending") is not True:
+        raise G4Failure(f"POST .../test answered {started.status_code} {started.text[:200]}")
+    deadline = time.time() + 240
+    answer: dict = {"state": "running"}
+    while answer.get("state") == "running" and time.time() < deadline:
+        time.sleep(2)
+        polled = g.API.get(f"{g.API_URL}/api/connectors/{connector_id}/discovery/test", timeout=30)
+        if polled.ok:
+            answer = polled.json()
+    return answer
+
+
 def _check_connect(connector_id: str) -> None:
     """`connect`: `POST .../test` is answered by the orchestrator (pending), and its job reports a
     successful connection for the least-privilege user."""
     if not g._expects_real("connect"):
         return
     try:
-        started = g.API.post(f"{g.API_URL}/api/connectors/{connector_id}/test", timeout=30)
-        if not started.ok or started.json().get("pending") is not True:
-            g._record("connect", "fail", f"POST .../test answered {started.status_code} {started.text[:200]}")
-            return
-        deadline = time.time() + 240
-        answer: dict = {"state": "running"}
-        while answer.get("state") == "running" and time.time() < deadline:
-            time.sleep(2)
-            polled = g.API.get(f"{g.API_URL}/api/connectors/{connector_id}/discovery/test", timeout=30)
-            if polled.ok:
-                answer = polled.json()
-    except (requests.RequestException, ValueError) as exc:
-        g._record("connect", "fail", f"the connection test did not answer cleanly ({type(exc).__name__})")
+        answer = _run_test(connector_id)
+    except (requests.RequestException, ValueError, G4Failure) as exc:
+        g._record("connect", "fail", f"the connection test did not answer cleanly ({type(exc).__name__}: {str(exc)[:200]})")
         return
     if answer.get("state") == "done" and isinstance(answer.get("latencyMs"), int):
         g._record("connect", "pass", f"{answer['latencyMs']} ms, tested in the orchestrator")
     else:
         g._record("connect", "fail", f"expected state=done with a latency, got state={answer.get('state')!r} errorClass={answer.get('errorClass')!r}")
+
+
+# The fixed words of `cdc_setup_check::mongo_checks` for a wrong replica set name.
+REPLICA_SET_DIFFERS = "The server's replica set has another name. Use the name in `rs.status().set`."
+SETUP_SETTINGS = ["changeStream", "primary", "replicaSet"]
+
+
+def step_setup_checks(connector_id: str) -> None:
+    """`SRC-4` Amendment 8, S8-f: the finished test lists three setup checks, all `ok` for the gate's
+    connector (its user has `read` on the database and the one host is the primary); a second
+    connector with a wrong `replicaSet` has that check `missing` with the fixed sentence and no
+    command, and the other two unaffected. The checks never change the test's outcome."""
+    try:
+        good = _run_test(connector_id)
+        checks = good.get("setupChecks") or []
+        if sorted(c["setting"] for c in checks) != SETUP_SETTINGS or any(c["status"] != "ok" for c in checks):
+            raise G4Failure(f"expected {SETUP_SETTINGS} all ok, got {checks}")
+        other = _register(g._ensure_gate_tenant(), suffix="-wrong-rs", replica_set="not-the-replica-set", tolerate_refusal=True)
+        try:
+            answer = _run_test(other)
+            found = {c["setting"]: c for c in answer.get("setupChecks") or []}
+            if sorted(found) != SETUP_SETTINGS:
+                raise G4Failure(f"the wrong-replica-set connector lists {sorted(found)}, expected {SETUP_SETTINGS}")
+            wrong = found["replicaSet"]
+            if wrong["status"] != "missing" or wrong.get("message") != REPLICA_SET_DIFFERS or wrong.get("command"):
+                raise G4Failure(f"expected replicaSet missing with its fixed sentence and no command, got {wrong}")
+            others = [found[k]["status"] for k in ("primary", "changeStream")]
+            if others != ["ok", "ok"]:
+                raise G4Failure(f"the other two checks should be ok, got {others}")
+            if answer.get("state") != "done":
+                raise G4Failure(f"the test of the wrong-replica-set connector should still finish, got {answer.get('state')!r}")
+        finally:
+            deleted = g.API.delete(f"{g.API_URL}/api/connectors/{other}", timeout=120)
+            if not deleted.ok:
+                print(f"[g4] cleanup: DELETE of the wrong-replica-set connector answered {deleted.status_code}", flush=True)
+    except (G4Failure, requests.RequestException, KeyError, ValueError) as exc:
+        g._say("setup checks", "fail", str(exc))
+        raise G4Failure(f"setup checks: {exc}") from exc
+    g._say("setup checks", "pass", "gate connector: replicaSet, primary, changeStream all ok; wrong replicaSet: missing alone, no command")
 
 
 def _check_discover(connector_id: str) -> None:
@@ -530,6 +580,7 @@ def main() -> int:
         g.step_connector_holds_no_password(connector_id)
         g.step_first_copy_reached_bronze()
         step_ids_are_the_object_id_text()
+        step_setup_checks(connector_id)
         step_changes_visible_within_budget()
         step_lag_is_measured(connector_id)
         step_pause_and_resume_lose_nothing(connector_id)

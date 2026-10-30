@@ -379,21 +379,28 @@ _CDC_MONGO = {
 
 
 class _Admin:
-    def __init__(self, fail: Exception | None = None) -> None:
+    """`ping` answers; `hello` and `connectionStatus` answer what the test set (`answers`), or raise
+    what it set in `raises`. `fail` makes every command raise (a refused login)."""
+
+    def __init__(self, fail: Exception | None = None, answers: dict | None = None, raises: dict | None = None) -> None:
         self.commands: list[str] = []
         self.fail = fail
+        self.answers = answers or {}
+        self.raises = raises or {}
 
-    def command(self, name: str):
+    def command(self, name: str, **kwargs):
         self.commands.append(name)
         if self.fail:
             raise self.fail
-        return {"ok": 1}
+        if name in self.raises:
+            raise self.raises[name]
+        return self.answers.get(name, {"ok": 1})
 
 
 class _PingClient(_MongoClient):
-    def __init__(self, collections, fail: Exception | None = None):
+    def __init__(self, collections, fail: Exception | None = None, answers: dict | None = None, raises: dict | None = None):
         super().__init__(collections)
-        self.admin = _Admin(fail)
+        self.admin = _Admin(fail, answers, raises)
 
 
 def test_a_mongodb_cdc_connector_lists_its_databases_collections_through_the_batch_code() -> None:
@@ -455,12 +462,73 @@ def test_a_mongodb_cdc_connection_test_connects_pings_and_reports_only_the_time(
     result = discover.discover(
         _CDC_MONGO, _request("test"), backends=_backends(mongo_connect=lambda d, s, **kw: (client, []))
     )
-    assert list(result) == ["latencyMs"]
+    # A server that answers `hello` with no set name and `connectionStatus` with no privileges list: the
+    # facts that could be read are posted (`none`), the one that could not (no `authInfo`) is left out.
+    assert set(result) == {"latencyMs", "mongoSetup"}
+    assert result["mongoSetup"] == {"replicaSet": "none"}
     assert isinstance(result["latencyMs"], int) and result["latencyMs"] >= 0
-    assert client.admin.commands == ["ping"]
+    assert client.admin.commands == ["ping", "hello", "connectionStatus"]
     assert client.closed is True
     body = discover.result_body(_request("test"), result=result, error_class=None)
-    assert body == {"requestId": "req-1", "kind": "test", "state": "done", "latencyMs": result["latencyMs"]}
+    assert body == {
+        "requestId": "req-1", "kind": "test", "state": "done", "latencyMs": result["latencyMs"],
+        "mongoSetup": {"replicaSet": "none"},
+    }
+
+
+def _status(*privileges: tuple[dict, list[str]]) -> dict:
+    return {"authInfo": {"authenticatedUserPrivileges": [{"resource": r, "actions": a} for r, a in privileges]}}
+
+
+_READ_SHOP = ({"db": "shop", "collection": ""}, ["find", "changeStream", "listCollections"])
+_DIAL_SHOP = {**_CDC_MONGO["dial"], "database": "shop", "replicaSet": "rs0"}
+_SHOP = {**_CDC_MONGO, "dial": _DIAL_SHOP}
+
+
+def _facts(**answers) -> dict:
+    client = _PingClient({}, answers=answers.get("answers"), raises=answers.get("raises"))
+    result = discover.discover(_SHOP, _request("test"), backends=_backends(mongo_connect=lambda d, s, **kw: (client, [])))
+    return result.get("mongoSetup", {})
+
+
+def test_the_setup_facts_are_closed_words_read_from_hello_and_connection_status() -> None:
+    good = {"hello": {"setName": "rs0", "isWritablePrimary": True}, "connectionStatus": _status(_READ_SHOP)}
+    assert _facts(answers=good) == {"replicaSet": "matches", "primary": True, "changeStream": "granted"}
+    differs = {"hello": {"setName": "other", "isWritablePrimary": False}, "connectionStatus": _status(_READ_SHOP)}
+    assert _facts(answers=differs) == {"replicaSet": "differs", "primary": False, "changeStream": "granted"}
+    standalone = {"hello": {"isWritablePrimary": True}, "connectionStatus": _status()}
+    assert _facts(answers=standalone) == {"replicaSet": "none", "primary": True, "changeStream": "missing"}
+
+
+def test_change_stream_is_granted_only_by_privileges_that_cover_the_database_and_hold_both_actions() -> None:
+    def fact(*privileges):
+        answers = {"hello": {"setName": "rs0", "isWritablePrimary": True}, "connectionStatus": _status(*privileges)}
+        return _facts(answers=answers)["changeStream"]
+
+    both = ["find", "changeStream"]
+    assert fact(({"db": "shop", "collection": ""}, both)) == "granted"
+    assert fact(({"db": "", "collection": ""}, both)) == "granted"  # every database
+    assert fact(({"anyResource": True}, both)) == "granted"
+    # Union of the covering privileges: the two actions may come from two grants.
+    assert fact(({"db": "shop", "collection": ""}, ["find"]), ({"db": "", "collection": ""}, ["changeStream"])) == "granted"
+    # Another database, one collection only, or one action only does not count.
+    assert fact(({"db": "other", "collection": ""}, both)) == "missing"
+    assert fact(({"db": "shop", "collection": "orders"}, both)) == "missing"
+    assert fact(({"db": "shop", "collection": ""}, ["find"])) == "missing"
+    assert fact(({"cluster": True}, both)) == "missing"
+
+
+def test_a_fact_whose_command_raised_is_not_posted_and_no_error_text_is_kept() -> None:
+    boom = RuntimeError(f"not authorized {SECRET_TEXT}")
+    hello = {"setName": "rs0", "isWritablePrimary": True}
+    only_status = _facts(answers={"connectionStatus": _status(_READ_SHOP)}, raises={"hello": boom})
+    assert only_status == {"changeStream": "granted"}
+    only_hello = _facts(answers={"hello": hello}, raises={"connectionStatus": boom})
+    assert only_hello == {"replicaSet": "matches", "primary": True}
+    client = _PingClient({}, raises={"hello": boom, "connectionStatus": boom})
+    result = discover.discover(_SHOP, _request("test"), backends=_backends(mongo_connect=lambda d, s, **kw: (client, [])))
+    assert "mongoSetup" not in result  # no key at all when nothing was read
+    assert SECRET_TEXT not in json.dumps(result)
 
 
 def test_a_mongodb_cdc_test_failure_is_posted_as_its_class_and_never_its_text() -> None:

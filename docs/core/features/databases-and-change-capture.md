@@ -225,7 +225,11 @@ What `MongoDB CDC` needs and what it does not do. Proven by the `g4-mongo` gate 
   and empty values; in "Current row per key" mode the row is removed.
 - **A new field in a document is a schema change** and goes through the same decision as a new column in a
   relational table (`SRC-8`).
-- **Setup is written, not checked yet.** The fixed-sentence checks (replica set, permission) are slice 4's.
+- **Setup is checked by the connection test**, in fixed sentences (`SRC-4` Amendment 8): the replica set's name
+  against the connector's, that the host is the primary, and that the login may read change streams on the
+  database (with the command that grants the `read` role). The orchestrator reads three facts from the server
+  after the test; one it cannot read is shown as "Not checked", never as passing. The checks never change
+  whether the test passed.
 
 ## Acceptance checklist
 

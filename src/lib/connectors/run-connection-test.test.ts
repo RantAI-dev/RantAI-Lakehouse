@@ -85,4 +85,34 @@ describe("runConnectionTest (SRC-4 T1.1)", () => {
       testedAt: null,
     })
   })
+  it("carries the setup checks of the finished test to the answer shown (MongoDB change capture, S8-e)", async () => {
+    const checks = [
+      { setting: "replicaSet", status: "missing", message: "The server's replica set has another name. Use the name in `rs.status().set`." },
+      { setting: "primary", status: "ok", message: "This host is the primary." },
+    ]
+    const s = service(
+      PENDING,
+      [
+        {
+          kind: "test",
+          state: "done",
+          latencyMs: 30,
+          startedAt: "2026-10-30T10:00:00Z",
+          endedAt: "2026-10-30T10:00:05Z",
+          setupChecks: checks,
+        },
+      ],
+      { results: [{ testedAt: "2026-10-30T10:00:05Z", ok: true, latencyMs: 30, message: "Connected via MongoDB and ran ping." }] }
+    )
+    const result = await runConnectionTest(s, "c", undefined, 1)
+    expect(result.ok).toBe(true) // the checks never change ok
+    expect(result.setupChecks).toEqual(checks)
+    // No checks, no key.
+    const plain = service(
+      PENDING,
+      [{ kind: "test", state: "done", latencyMs: 30, startedAt: "2026-10-30T10:00:00Z" }],
+      { results: [{ testedAt: "2026-10-30T10:00:05Z", ok: true, latencyMs: 30, message: "Connected." }] }
+    )
+    expect("setupChecks" in (await runConnectionTest(plain, "c", undefined, 1))).toBe(false)
+  })
 })

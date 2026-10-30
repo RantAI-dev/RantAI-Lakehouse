@@ -3511,7 +3511,10 @@ mod tests {
         use lakehouse_store::connector_discovery::{ErrorClass, Outcome as Reported, Tested};
 
         let passed = outcome_of_orchestrator_test(
-            &Reported::Tested(Tested { latency_ms: 212 }),
+            &Reported::Tested(Tested {
+                latency_ms: 212,
+                mongo_setup: None,
+            }),
             OrchestratorTested::Oracle,
         );
         assert!(passed.ok && passed.supported);
@@ -3568,7 +3571,10 @@ mod tests {
         assert_eq!(orchestrator_tested_source(&row), None);
 
         let passed = outcome_of_orchestrator_test(
-            &Reported::Tested(Tested { latency_ms: 9 }),
+            &Reported::Tested(Tested {
+                latency_ms: 9,
+                mongo_setup: None,
+            }),
             OrchestratorTested::MongoDb,
         );
         assert!(passed.ok && passed.supported);

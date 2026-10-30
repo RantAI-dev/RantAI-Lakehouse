@@ -564,6 +564,52 @@ def _cdc_mongo_client_options(ssl_mode: str) -> dict[str, Any]:
     return {"tls": True, "tlsAllowInvalidHostnames": ssl_mode == "require"}
 
 
+def _mongo_covers(resource: Any, database: str) -> bool:
+    """Whether a privilege's `resource` covers every collection of `database`: that database with
+    an empty collection name, every database (`db` and `collection` empty), or `anyResource`."""
+    if not isinstance(resource, dict):
+        return False
+    if resource.get("anyResource") is True:
+        return True
+    return resource.get("collection", None) == "" and resource.get("db") in (database, "")
+
+
+def mongo_setup_facts(client: Any, dial: dict) -> dict[str, Any]:
+    """The setup facts of a MongoDB change-capture test (`SRC-4` Amendment 8, S8-c): closed words,
+    each read by its own command in its own `try`. An exception leaves that fact OUT (the API then
+    shows `unchecked`); nothing is guessed and no server text is kept.
+
+    - `replicaSet`: `hello.setName` against the dial's `replicaSet` (`matches`, `differs`, `none`);
+    - `primary`: `hello.isWritablePrimary`;
+    - `changeStream`: `connectionStatus` with `showPrivileges`: do the privileges that cover the
+      dial's database grant both `find` and `changeStream` (`granted` or `missing`)?"""
+    facts: dict[str, Any] = {}
+    try:
+        hello = client.admin.command("hello")
+        name = hello.get("setName")
+        if name is None:
+            facts["replicaSet"] = "none"
+        elif isinstance(name, str):
+            facts["replicaSet"] = "matches" if name == dial.get("replicaSet") else "differs"
+        primary = hello.get("isWritablePrimary")
+        if isinstance(primary, bool):
+            facts["primary"] = primary
+    except Exception:  # noqa: BLE001 -- an unread fact is left out, never guessed (and never quoted)
+        facts.pop("replicaSet", None)
+        facts.pop("primary", None)
+    try:
+        status = client.admin.command("connectionStatus", showPrivileges=True)
+        privileges = status["authInfo"]["authenticatedUserPrivileges"]
+        granted: set[str] = set()
+        for privilege in privileges:
+            if _mongo_covers(privilege.get("resource"), dial["database"]):
+                granted.update(a for a in privilege.get("actions", []) if isinstance(a, str))
+        facts["changeStream"] = "granted" if {"find", "changeStream"} <= granted else "missing"
+    except Exception:  # noqa: BLE001
+        pass
+    return facts
+
+
 def _cdc_mongo(dial: dict, secrets: dict, request: DiscoverRequest, b: Backends) -> dict[str, Any]:
     """A MongoDB change-capture connector (`SRC-4` slice 5, decision S5-f): its collections and a
     sample of one, read through `_mongo`, and its connection test.
@@ -592,9 +638,13 @@ def _cdc_mongo(dial: dict, secrets: dict, request: DiscoverRequest, b: Backends)
         try:
             with b.checking_resolver():
                 client.admin.command("ping")
+                latency = max(0, round((time.monotonic() - started) * 1000))
+                # S8-c: what the source must have switched on, read after the ping inside the same
+                # guarded resolver. Closed words only; a command that raises leaves its fact out.
+                facts = mongo_setup_facts(client, dial)
         finally:
             client.close()
-        return {"latencyMs": max(0, round((time.monotonic() - started) * 1000))}
+        return {"latencyMs": latency, **({"mongoSetup": facts} if facts else {})}
     result = _mongo(adapted, secrets, request, b)
     if request.kind == "preview" and any(c["name"] == "_id" for c in result["columns"]):
         result["primaryKey"] = ["_id"]

@@ -69,7 +69,7 @@ use lakehouse_auth::Principal;
 use lakehouse_core::ApiError;
 use lakehouse_store::connector_discovery::{
     self, Answer, ErrorClass, Kind, ListedColumn, ListedObject, Listing, MAX_NAME_CHARS,
-    MAX_OBJECTS, Outcome, Preview, State as RequestState, Tested,
+    MAX_OBJECTS, MongoSetupFacts, Outcome, Preview, State as RequestState, Tested,
 };
 use lakehouse_store::connectors;
 use serde::{Deserialize, Serialize};
@@ -312,7 +312,25 @@ pub async fn poll(
         .ok_or_else(|| {
             ApiError::NotFound("No discovery was requested for this connector".to_owned())
         })?;
-    Ok(ApiJson(stored.into_answer(OffsetDateTime::now_utc())))
+    // `SRC-4` Amendment 8 (S8-e): a finished `MongoDB` change-capture test also lists what the
+    // source must have switched on. The facts are the stored ones, the dial is the connector's as
+    // it is now, and the checks are ours (`cdc_setup_check::mongo_checks`); they never change `ok`.
+    let facts = stored.tested.and_then(|tested| tested.mongo_setup);
+    let finished_test = kind == Kind::Test && stored.state == RequestState::Done;
+    let mut answer = stored.into_answer(OffsetDateTime::now_utc());
+    if finished_test {
+        let info = connectors::get_connector_dial_info(pool(&state)?, &id).await?;
+        let dial = info
+            .filter(|info| info.adapter.as_deref() == Some("cdc"))
+            .and_then(|info| lakehouse_store::ingest_spec::Dial::parse("cdc", &info.dial).ok());
+        if let Some(mongo) = dial
+            .as_ref()
+            .and_then(lakehouse_store::ingest_spec::Dial::as_cdc_mongo)
+        {
+            answer.setup_checks = Some(crate::cdc_setup_check::mongo_checks(facts.as_ref(), mongo));
+        }
+    }
+    Ok(ApiJson(answer))
 }
 
 // ── The orchestrator's answer ─────────────────────────────────────────────
@@ -337,6 +355,10 @@ pub struct ResultBody {
     /// A finished test's connection time (`SRC-4` T1.1).
     #[serde(default)]
     latency_ms: Option<i64>,
+    /// What a `MongoDB` change-capture test read about the source's setup (`SRC-4`
+    /// Amendment 8, S8-c): closed words only, for a finished `test` and nothing else.
+    #[serde(default)]
+    mongo_setup: Option<MongoSetupFacts>,
 }
 
 /// What the result route answers: whether this call stored the answer (`false`
@@ -362,6 +384,7 @@ fn outcome_of(body: ResultBody) -> Result<Outcome, ApiError> {
                 || body.columns.is_some()
                 || body.primary_key.is_some()
                 || body.latency_ms.is_some()
+                || body.mongo_setup.is_some()
             {
                 return Err(bad("a failure carries no result"));
             }
@@ -370,6 +393,10 @@ fn outcome_of(body: ResultBody) -> Result<Outcome, ApiError> {
         RequestState::Done => {
             if body.error_class.is_some() {
                 return Err(bad("a finished request carries no errorClass"));
+            }
+            // S8-c: the setup facts belong to a finished test only.
+            if body.mongo_setup.is_some() && body.kind != Kind::Test {
+                return Err(bad("only a test carries mongoSetup"));
             }
             match body.kind {
                 Kind::List => {
@@ -413,7 +440,10 @@ fn outcome_of(body: ResultBody) -> Result<Outcome, ApiError> {
                     {
                         return Err(bad("a test carries only its latencyMs"));
                     }
-                    Ok(Outcome::Tested(Tested { latency_ms }))
+                    Ok(Outcome::Tested(Tested {
+                        latency_ms,
+                        mongo_setup: body.mongo_setup,
+                    }))
                 }
             }
         }
@@ -604,7 +634,13 @@ mod tests {
             "requestId": "r", "kind": "test", "state": "done", "latencyMs": 212,
         }))
         .unwrap();
-        assert_eq!(done, Outcome::Tested(Tested { latency_ms: 212 }));
+        assert_eq!(
+            done,
+            Outcome::Tested(Tested {
+                latency_ms: 212,
+                mongo_setup: None
+            })
+        );
         let failed = result(json!({
             "requestId": "r", "kind": "test", "state": "failed", "errorClass": "sign_in_refused",
         }))
@@ -620,6 +656,69 @@ mod tests {
                    "latencyMs": 1}),
             json!({"requestId": "r", "kind": "preview", "state": "done", "columns": [],
                    "latencyMs": 1}),
+        ] {
+            assert!(result(body.clone()).is_err(), "{body}");
+        }
+    }
+
+    /// `SRC-4` Amendment 8 (S8-c): the setup facts are closed words, for a finished test only.
+    #[test]
+    fn mongo_setup_facts_are_closed_words_and_belong_to_a_finished_test_only() {
+        use lakehouse_store::connector_discovery::{
+            ChangeStreamFact, MongoSetupFacts, ReplicaSetFact,
+        };
+
+        let done = result(json!({
+            "requestId": "r", "kind": "test", "state": "done", "latencyMs": 5,
+            "mongoSetup": {"replicaSet": "differs", "primary": false, "changeStream": "missing"},
+        }))
+        .unwrap();
+        assert_eq!(
+            done,
+            Outcome::Tested(Tested {
+                latency_ms: 5,
+                mongo_setup: Some(MongoSetupFacts {
+                    replica_set: Some(ReplicaSetFact::Differs),
+                    primary: Some(false),
+                    change_stream: Some(ChangeStreamFact::Missing),
+                }),
+            })
+        );
+        // A key that was not read is absent, and an empty object is still no fact.
+        let partial = result(json!({
+            "requestId": "r", "kind": "test", "state": "done", "latencyMs": 5,
+            "mongoSetup": {"primary": true},
+        }))
+        .unwrap();
+        assert!(
+            matches!(partial, Outcome::Tested(Tested { mongo_setup: Some(f), .. })
+            if f.primary == Some(true) && f.replica_set.is_none() && f.change_stream.is_none())
+        );
+        // Does not even parse (the route answers 400): the orchestrator cannot smuggle text through it.
+        for body in [
+            // A value outside the set, a free-text value, an unknown key.
+            json!({"requestId": "r", "kind": "test", "state": "done", "latencyMs": 5,
+                   "mongoSetup": {"replicaSet": "unknown"}}),
+            json!({"requestId": "r", "kind": "test", "state": "done", "latencyMs": 5,
+                   "mongoSetup": {"changeStream": "not authorized on shop"}}),
+            json!({"requestId": "r", "kind": "test", "state": "done", "latencyMs": 5,
+                   "mongoSetup": {"primary": "yes"}}),
+            json!({"requestId": "r", "kind": "test", "state": "done", "latencyMs": 5,
+                   "mongoSetup": {"message": "x"}}),
+        ] {
+            assert!(
+                serde_json::from_value::<ResultBody>(body.clone()).is_err(),
+                "{body}"
+            );
+        }
+        for body in [
+            // On a list, a preview or a failure.
+            json!({"requestId": "r", "kind": "list", "state": "done", "objects": [],
+                   "mongoSetup": {"primary": true}}),
+            json!({"requestId": "r", "kind": "preview", "state": "done", "columns": [],
+                   "mongoSetup": {"primary": true}}),
+            json!({"requestId": "r", "kind": "test", "state": "failed", "errorClass": "failed",
+                   "mongoSetup": {"primary": true}}),
         ] {
             assert!(result(body.clone()).is_err(), "{body}");
         }

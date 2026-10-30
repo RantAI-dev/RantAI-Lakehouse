@@ -541,6 +541,7 @@ async fn a_connection_test_has_its_own_row_and_holds_only_a_latency(
         "test-1",
         &Outcome::Tested(Tested {
             latency_ms: 3_600_001,
+            mongo_setup: None,
         }),
         t0,
     )
@@ -553,7 +554,10 @@ async fn a_connection_test_has_its_own_row_and_holds_only_a_latency(
             PG,
             Kind::Test,
             "test-1",
-            &Outcome::Tested(Tested { latency_ms: 212 }),
+            &Outcome::Tested(Tested {
+                latency_ms: 212,
+                mongo_setup: None,
+            }),
             t0,
         )
         .await

@@ -45,6 +45,8 @@ export async function runConnectionTest(
       latencyMs: latest.latencyMs,
       message: latest.message,
       testedAt: latest.testedAt,
+      // MongoDB change capture (`SRC-4` Amendment 8, S8-e): the source's setup checks ride with the answer.
+      ...(answer.setupChecks && answer.setupChecks.length > 0 ? { setupChecks: answer.setupChecks } : {}),
     }
   }
   return {

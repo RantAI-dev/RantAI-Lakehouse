@@ -373,6 +373,46 @@ pub struct Preview {
 /// dials with a bounded timeout, so a figure past an hour is not a measurement.
 pub const MAX_TEST_LATENCY_MS: i64 = 3_600_000;
 
+/// Whether the server's replica set name is the dial's (`SRC-4` Amendment 8, S8-c).
+/// The comparison is made in the orchestrator; only this word is posted, never the name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReplicaSetFact {
+    /// `hello.setName` is the dial's `replicaSet`.
+    Matches,
+    /// It is another name.
+    Differs,
+    /// The server reports no `setName`: it is not a replica set member.
+    None,
+}
+
+/// Whether the login may read change streams on the dial's database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChangeStreamFact {
+    /// `find` and `changeStream` are granted on the database or wider.
+    Granted,
+    /// They are not.
+    Missing,
+}
+
+/// What the orchestrator's `MongoDB` connection test read about the source's setup
+/// (`SRC-4` Amendment 8, S8-c). Every key is optional: an absent key means "not read"
+/// (the command raised), never a guess. A closed word per fact; no server text.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MongoSetupFacts {
+    /// The replica set name against the dial's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replica_set: Option<ReplicaSetFact>,
+    /// `hello.isWritablePrimary`: the one host the connector names is the primary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary: Option<bool>,
+    /// The login's change-stream privilege on the database.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_stream: Option<ChangeStreamFact>,
+}
+
 /// The result of a [`Kind::Test`] request: the connection was made.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -380,6 +420,10 @@ pub struct Tested {
     /// How long the connection took, in milliseconds, as the orchestrator
     /// measured it (never a figure the API made up).
     pub latency_ms: i64,
+    /// The setup facts a `MongoDB` change-capture test read; absent for every other
+    /// connector, and for a test stored before they existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mongo_setup: Option<MongoSetupFacts>,
 }
 
 impl Tested {
@@ -550,6 +594,10 @@ pub struct Answer {
     /// The fixed sentence for a failure, or for a cut list.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<&'static str>,
+    /// The setup checks of a finished `MongoDB` change-capture test (`SRC-4` Amendment 8,
+    /// S8-e), filled by the poll route; never part of the stored answer, never `ok`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub setup_checks: Option<Vec<crate::connectors::SetupCheck>>,
     /// When the request started, for an answer read from the store.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub started_at: Option<IsoTime>,
@@ -572,6 +620,7 @@ impl Answer {
             latency_ms: None,
             error_class: None,
             reason: None,
+            setup_checks: None,
             started_at: None,
             ended_at: None,
         }
