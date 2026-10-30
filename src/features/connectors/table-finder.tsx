@@ -30,6 +30,8 @@ export function finderKind(adapter: string, dial: Dial | null | undefined): Find
   switch (adapter) {
     case "sql":
     case "cdc":
+      // A MongoDB change-capture connector lists collections, like a batch MongoDB one (`SRC-4` slice 5).
+      if (dial?.driver === "mongodb") return "mongodb"
       return dial?.driver === "oracle" ? "oracle" : "sql"
     case "files":
     case "sftp":

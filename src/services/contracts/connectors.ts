@@ -505,6 +505,20 @@ export type CdcDial = {
   serverId?: number | null
 }
 
+/** The `dial` of a MongoDB change-capture connector (`ingest_spec.rs`'s `CdcMongoDial`, `SRC-4`
+ * slice 5, decision S5-a): a `cdc` dial whose `driver` is `mongodb`. `hosts` are the replica set's
+ * explicit `host:port` seeds; `replicaSet` is required (change streams need a replica set). There is
+ * no connection string and no `mongodb+srv`: the server refuses an unknown field. `sslMode`
+ * is omitted unless chosen; the server then takes `require`. */
+export type CdcMongoDial = {
+  driver: "mongodb"
+  hosts: string[]
+  database: string
+  user: string
+  replicaSet: string
+  sslMode?: "disable" | "require" | "verify-ca" | "verify-full" | string
+}
+
 export type FilesProtocol = "s3" | "sftp"
 export type FilesFormat = "csv" | "json" | "parquet"
 

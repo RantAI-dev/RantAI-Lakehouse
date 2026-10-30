@@ -50,6 +50,15 @@ export function connectionReviewItems(adapter: string | null, dial: Record<strin
         { label: "SSL mode", value: text(d.sslMode) || "Driver default" },
       ]
     case "cdc":
+      if (Array.isArray(d.hosts)) {
+        // MongoDB change capture (`SRC-4` slice 5): the replica set's seeds, not one host and port.
+        return [
+          { label: "Hosts", value: list(d.hosts) },
+          { label: "Replica set", value: text(d.replicaSet) },
+          { label: "Database", value: text(d.database) },
+          { label: "User", value: text(d.user) },
+        ]
+      }
       return [
         { label: "Server", value: hostPort(d) },
         { label: "Database", value: text(d.database) },

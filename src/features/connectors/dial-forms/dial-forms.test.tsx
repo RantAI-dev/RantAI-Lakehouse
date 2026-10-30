@@ -3,6 +3,10 @@ import { describe, expect, it, mock } from "bun:test"
 import { SqlDialForm } from "./sql-dial-form"
 import { RestDialForm } from "./rest-dial-form"
 import { CdcDialForm } from "./cdc-dial-form"
+import { CdcMongoDialForm } from "./cdc-mongo-dial-form"
+import { DialFormFor, hostFromDial } from "../connector-form-parts"
+import { connectionReviewItems } from "../connector-review"
+import { finderKind } from "../table-finder"
 import { FilesDialForm } from "./files-dial-form"
 import { credentialProblems, credentialSlotsFor, driverForType } from "../connector-form-parts"
 import type { RestDial } from "@/services/contracts/connectors"
@@ -68,6 +72,59 @@ describe("dial forms", () => {
     fireEvent.change(screen.getByLabelText("Host"), { target: { value: "h" } })
     const sent = onChange.mock.calls[0][0] as Record<string, unknown>
     for (const key of ["slotName", "publicationName", "serverId"]) expect(key in sent).toBe(false)
+  })
+  it("CdcMongoDialForm asks for hosts, a replica set, a database and a user, with nothing invented", () => {
+    const onChange = mock()
+    render(<CdcMongoDialForm value={null} onChange={onChange} />)
+    expect((screen.getByLabelText("Host 1") as HTMLInputElement).value).toBe("")
+    expect((screen.getByLabelText("Replica set name") as HTMLInputElement).value).toBe("")
+    expect(screen.getByText(/name in the server.s replica set configuration/)).toBeDefined()
+    // None of the SQL or other change-capture fields.
+    for (const label of ["Host", "Port", "Replication slot name", "Publication name", "Server id", "Driver"]) {
+      expect(screen.queryByLabelText(label)).toBeNull()
+    }
+    fireEvent.change(screen.getByLabelText("Replica set name"), { target: { value: "rs0" } })
+    const sent = onChange.mock.calls[0][0] as Record<string, unknown>
+    expect(sent).toEqual({ driver: "mongodb", hosts: [""], database: "", user: "", replicaSet: "rs0" })
+    // A dial with no TLS choice sends none; the server reads it as `require`.
+    expect("sslMode" in sent).toBe(false)
+  })
+  it("CdcMongoDialForm adds and removes hosts and sends them as a list", () => {
+    const onChange = mock()
+    const value = { driver: "mongodb" as const, hosts: ["a:27017"], database: "d", user: "u", replicaSet: "rs0" }
+    const { rerender } = render(<CdcMongoDialForm value={value} onChange={onChange} />)
+    expect(screen.queryByText("Remove")).toBeNull()
+    fireEvent.click(screen.getByText("Add host"))
+    expect(onChange.mock.calls[0][0]).toMatchObject({ hosts: ["a:27017", ""] })
+    const two = { ...value, hosts: ["a:27017", "b:27017"] }
+    rerender(<CdcMongoDialForm value={two} onChange={onChange} />)
+    fireEvent.change(screen.getByLabelText("Host 2"), { target: { value: "c:27018" } })
+    expect(onChange.mock.calls[1][0]).toMatchObject({ hosts: ["a:27017", "c:27018"] })
+    fireEvent.click(screen.getAllByText("Remove")[0])
+    expect(onChange.mock.calls[2][0]).toMatchObject({ hosts: ["b:27017"] })
+  })
+  it("MongoDB CDC takes its own form, a host from its first seed, the collection finder and a review of its seeds", () => {
+    const { container } = render(
+      <DialFormFor adapter="cdc" typeName="MongoDB CDC" dial={null} onChange={mock()} />
+    )
+    expect(container.querySelector("#cdc-mongo-dial-replica-set")).not.toBeNull()
+    expect(container.querySelector("#cdc-dial-host")).toBeNull()
+    const dial = { driver: "mongodb", hosts: ["a:27017", "b:27017"], database: "d", user: "u", replicaSet: "rs0" }
+    expect(hostFromDial("cdc", dial)).toBe("a:27017")
+    expect(finderKind("cdc", dial)).toBe("mongodb")
+    // The other change-capture drivers keep theirs.
+    expect(finderKind("cdc", { driver: "postgres" } as never)).toBe("sql")
+    expect(hostFromDial("cdc", { host: "h" })).toBe("h")
+    const labels = connectionReviewItems("cdc", dial).map((i) => [i.label, i.value])
+    expect(labels).toEqual([
+      ["Hosts", "a:27017, b:27017"],
+      ["Replica set", "rs0"],
+      ["Database", "d"],
+      ["User", "u"],
+    ])
+    // The relational types still get the relational form.
+    const sql = render(<DialFormFor adapter="cdc" typeName="MySQL CDC" dial={null} onChange={mock()} />)
+    expect(sql.container.querySelector("#cdc-dial-host")).not.toBeNull()
   })
   it("FilesDialForm offers no SFTP choice and keeps emitting protocol s3 (SRC-6 F8)", () => {
     const onChange = mock()

@@ -11,6 +11,7 @@ import { PencilIcon } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Label } from "@/components/ui/label"
 import { CdcDialForm } from "@/features/connectors/dial-forms/cdc-dial-form"
+import { CdcMongoDialForm } from "@/features/connectors/dial-forms/cdc-mongo-dial-form"
 import { FilesDialForm } from "@/features/connectors/dial-forms/files-dial-form"
 import { KafkaDialForm } from "@/features/connectors/dial-forms/kafka-dial-form"
 import { MongoDialForm } from "@/features/connectors/dial-forms/mongo-dial-form"
@@ -26,6 +27,7 @@ import { SECRET_MANAGER_LABEL, referenceProblem } from "@/lib/connectors/secret-
 import { saasVendorById } from "@/lib/connectors/saas-vendors"
 import type {
   CdcDial,
+  CdcMongoDial,
   CredentialKind,
   CredentialSettings,
   CredentialSource,
@@ -55,6 +57,10 @@ export function hostFromDial(adapter: string | null, dial: Record<string, unknow
     case "sql":
     case "cdc":
     case "sftp":
+      // A MongoDB change-capture dial names `hosts`, not `host` (`SRC-4` slice 5).
+      if (adapter === "cdc" && Array.isArray(dial.hosts)) {
+        return typeof dial.hosts[0] === "string" ? (dial.hosts[0] as string) : ""
+      }
       return typeof dial.host === "string" ? dial.host : ""
     case "files":
       return typeof dial.bucket === "string" ? dial.bucket : ""
@@ -292,6 +298,15 @@ export function DialFormFor({
         />
       )
     case "cdc":
+      // MongoDB change capture has its own dial (hosts and a replica set, no host and port).
+      if (typeName === "MongoDB CDC") {
+        return (
+          <CdcMongoDialForm
+            value={dial as unknown as CdcMongoDial | null}
+            onChange={(next) => onChange(next as unknown as Record<string, unknown>)}
+          />
+        )
+      }
       return (
         <CdcDialForm
           value={dial as unknown as CdcDial | null}
