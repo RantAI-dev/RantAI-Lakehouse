@@ -35,9 +35,9 @@ def small_registry() -> gs.Registry:
 
 
 class RegistryFileTests(unittest.TestCase):
-    def test_the_checked_in_registry_loads_and_lists_twenty_two_types(self) -> None:
+    def test_the_checked_in_registry_loads_and_lists_twenty_three_types(self) -> None:
         registry = gs.Registry.load(REAL_REGISTRY)
-        self.assertEqual(len(registry.type_names()), 22)
+        self.assertEqual(len(registry.type_names()), 23)
 
     def test_the_checked_in_registry_does_not_list_google_sheets(self) -> None:
         # 0062 flipped it to unsupported; a gate for it would claim coverage of nothing.
@@ -113,7 +113,7 @@ class RegistryFileTests(unittest.TestCase):
             old = os.environ.get("GATE_COVERAGE_PATH")
             os.environ["GATE_COVERAGE_PATH"] = str(path)
             try:
-                self.assertEqual(len(gs.Registry.load().type_names()), 22)
+                self.assertEqual(len(gs.Registry.load().type_names()), 23)
             finally:
                 if old is None:
                     del os.environ["GATE_COVERAGE_PATH"]

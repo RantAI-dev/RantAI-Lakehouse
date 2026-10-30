@@ -26,7 +26,7 @@ use sqlx::PgPool;
 /// named `adapter`, and six `supported = false` roadmap rows. `0095` (`SRC-3`
 /// T1.1) adds the ten business-app types, so there are twenty-six; `0096`
 /// (T7.1) flips eight of them and adds none; `0119` (`SRC-4` slice 5) adds
-/// `MongoDB CDC`, so there are twenty-seven.
+/// `MongoDB CDC` and `0120` (slice 6) `Oracle CDC`, so there are twenty-eight.
 #[sqlx::test(migrations = "../../migrations")]
 async fn seeds_sixteen_connector_types(pool: PgPool) -> sqlx::Result<()> {
     let types = list_connector_types(&pool)
@@ -34,8 +34,8 @@ async fn seeds_sixteen_connector_types(pool: PgPool) -> sqlx::Result<()> {
         .expect("list_connector_types should succeed");
     assert_eq!(
         types.len(),
-        27,
-        "expected 27 seeded connector types, got {types:?}"
+        28,
+        "expected 28 seeded connector types, got {types:?}"
     );
     Ok(())
 }
@@ -174,6 +174,28 @@ async fn mongodb_cdc_is_a_supported_cdc_type_beside_the_batch_mongodb_type(
         .find(|t| t.name == "MongoDB")
         .expect("the batch MongoDB type must stay listed");
     assert_eq!(batch.adapter.as_deref(), Some("mongodb"), "{batch:?}");
+    Ok(())
+}
+
+/// `0120` (`SRC-4` slice 6): `Oracle CDC` is a supported `cdc` type of its own, beside
+/// the batch `Oracle` type, which keeps its `sql` adapter.
+#[sqlx::test(migrations = "../../migrations")]
+async fn oracle_cdc_is_its_own_supported_cdc_type_after_0120(pool: PgPool) -> sqlx::Result<()> {
+    let types = list_connector_types(&pool)
+        .await
+        .expect("list_connector_types should succeed");
+    let cdc = types
+        .iter()
+        .find(|t| t.name == "Oracle CDC")
+        .expect("Oracle CDC must be listed");
+    assert!(cdc.supported, "{cdc:?}");
+    assert_eq!(cdc.adapter.as_deref(), Some("cdc"), "{cdc:?}");
+    assert_eq!(cdc.unsupported_reason, None, "{cdc:?}");
+    let batch = types
+        .iter()
+        .find(|t| t.name == "Oracle")
+        .expect("the batch Oracle type must stay listed");
+    assert_eq!(batch.adapter.as_deref(), Some("sql"), "{batch:?}");
     Ok(())
 }
 

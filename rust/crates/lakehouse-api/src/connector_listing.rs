@@ -1158,7 +1158,13 @@ pub async fn dispatch(
             Answer::listing("", rest_listing(&paths, request))
         }
         Dial::Sheets(_) => Answer::failed(kind, ErrorClass::NotSupported),
-        // Oracle, MongoDB, Kafka, SFTP, and the column preview of REST.
+        // `SRC-4` slice 6 (S10-c): listing would dial Oracle without the native
+        // encryption the connector requires, so an Oracle change-capture
+        // connector's tables are typed by hand and nothing is listed.
+        Dial::Cdc(cdc) if cdc.driver == SqlDriver::Oracle => {
+            Answer::failed(kind, ErrorClass::NotSupported)
+        }
+        // Oracle (batch), MongoDB, Kafka, SFTP, and the column preview of REST.
         // `SRC-3` T1.6: a `saas` connector's objects and columns are listed
         // by the vendor's own module in the orchestrator, never by the API.
         Dial::Sql(_)
@@ -1445,6 +1451,29 @@ mod tests {
             )
             .await;
             assert!(matches!(out, Dispatch::Orchestrator));
+        }
+
+        // `SRC-4` slice 6 (S10-c): an Oracle change-capture connector lists nothing, in
+        // the API, without a launch.
+        let oracle_cdc = info(
+            "cdc",
+            serde_json::json!({"driver": "oracle", "host": "o.example", "port": 1521,
+                "database": "FREE", "user": "u"}),
+        );
+        for kind in [Kind::List, Kind::Preview] {
+            let Dispatch::Done(answer) = dispatch(
+                kind,
+                &oracle_cdc,
+                &request,
+                &resolver,
+                &InternalHosts::NONE,
+                None,
+            )
+            .await
+            else {
+                panic!("an Oracle change-capture listing is answered here");
+            };
+            assert_eq!(answer.error_class, Some(ErrorClass::NotSupported));
         }
 
         let rest = info(

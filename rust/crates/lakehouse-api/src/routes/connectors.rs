@@ -1072,7 +1072,23 @@ pub async fn test_connection(
         let pending = start_orchestrator_test(&state, &principal, &id).await?;
         return Ok(ApiJson(pending));
     }
-    let mut outcome = run_probe(&state, &dial_info, state.connector_secret_resolver.as_ref()).await;
+    // `SRC-4` slice 6 (S10-a): an Oracle change-capture connector is tested by
+    // `Kafka Connect`, with the driver and encryption the connector uses.
+    let oracle_tables = if crate::cdc_oracle::is_oracle_cdc(&dial_info) {
+        // The checks never decide a test: a store error leaves the placeholder table.
+        super::capture_lag::selected_tables(pool(&state)?, &id)
+            .await
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let mut outcome = if let Some(tested) =
+        crate::cdc_oracle::test(&state, &dial_info, &id, &oracle_tables).await
+    {
+        tested
+    } else {
+        run_probe(&state, &dial_info, state.connector_secret_resolver.as_ref()).await
+    };
     // `SRC-12` part C: a provider that rotates refresh tokens retired the one
     // the test just used; keep the new one or the test would sign the
     // connector out.
@@ -3134,7 +3150,7 @@ async fn check_dial_ssrf(
         // already has (its dial names a spreadsheet id, not a
         // caller-chosen host). The authoritative check for these
         // adapters stays in Dagster, not here.
-        // `SRC-4` S5-b: a `MongoDB` change-capture dial has several hosts, all checked
+        // `SRC-4` S5-b: a `MongoDB` change-capture dial has a `hosts` list (one entry), checked
         // below, so it has no single `host_port`.
         Dial::Sheets(_)
         | Dial::Mongo(_)
@@ -3431,6 +3447,13 @@ async fn save_ingest_spec(
     // `check_dial_ssrf`, which `set_ingest_spec` never returns.
     let dial = Dial::parse(&body.adapter, &body.dial)
         .map_err(|err| ApiError::BadRequest(err.to_string()))?;
+    // `SRC-4` slice 6 (S10-c): an Oracle change-capture connector's tables are
+    // typed by hand, so each is checked as SCHEMA.TABLE in Oracle's spelling.
+    lakehouse_store::ingest_spec::validate_oracle_change_capture_tables(
+        &dial,
+        &body.source_objects,
+    )
+    .map_err(|err| ApiError::BadRequest(err.to_string()))?; // SEC-11 allowlisted: InvalidOracleTable is fixed text
     // `SRC-11` decisions D9 to D11: columns left out of a load. A malformed
     // list is a 400; a source that cannot list its columns, and a key or
     // cursor column, are well-formed requests the product refuses: 422, with

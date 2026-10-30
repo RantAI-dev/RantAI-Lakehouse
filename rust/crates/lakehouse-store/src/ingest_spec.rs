@@ -89,8 +89,9 @@ pub struct SqlDial {
 /// depends on the driver (`SRC-4` slice 3, decision S3-a), checked by
 /// [`Dial::parse`] (`validate_cdc_dial_post_parse`), not by serde: `PostgreSQL`
 /// requires `slotName` and `publicationName` and refuses `serverId`; `MySQL`
-/// requires `serverId` and refuses the other two; `SQL Server` refuses all
-/// three. A `cdc` dial that breaks this is a construction-time (400) error, not
+/// requires `serverId` and refuses the other two; `SQL Server` and `Oracle`
+/// refuse all three. `pdbName` is `Oracle`'s alone (slice 6, S6-b), and
+/// `Oracle` takes only the `disable` and `require` TLS modes (S6-c). A `cdc` dial that breaks this is a construction-time (400) error, not
 /// a later runtime surprise. ADR 0013's "required" is "required for
 /// `PostgreSQL`" (dated note there).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -121,6 +122,12 @@ pub struct CdcDial {
     /// `MySQL`, refused for the other drivers.
     #[serde(default)]
     pub server_id: Option<u32>,
+    /// The pluggable database the Oracle change-capture connector reads
+    /// (`database.pdb.name`; `SRC-4` decision S6-b): `database` then names the
+    /// container database. Absent for a non-container Oracle database;
+    /// refused for the other drivers.
+    #[serde(default)]
+    pub pdb_name: Option<String>,
     /// How the change-capture worker secures its connection to the source
     /// (`SRC-4` decision S2-d). Absent means [`CdcSslMode::Require`]: a
     /// stored credential is never dialed in plain text unless the person
@@ -1156,6 +1163,11 @@ fn validate_cdc_dial_post_parse(adapter: &str, dial: &CdcDial) -> Result<(), Ing
         adapter: adapter.to_owned(),
         source: serde::de::Error::custom(message),
     };
+    if dial.pdb_name.is_some() && dial.driver != SqlDriver::Oracle {
+        return Err(refuse(
+            "pdbName is only for an Oracle change-capture connector",
+        ));
+    }
     match dial.driver {
         SqlDriver::Postgres => {
             if dial.slot_name.is_none() {
@@ -1212,9 +1224,45 @@ fn validate_cdc_dial_post_parse(adapter: &str, dial: &CdcDial) -> Result<(), Ing
                 ));
             }
         }
-        // Oracle change capture is slice 6; until then its dial is parsed as
-        // before, with none of the three.
-        SqlDriver::Oracle => {}
+        SqlDriver::Oracle => {
+            if dial.slot_name.is_some() {
+                return Err(refuse(
+                    "slotName is only for a PostgreSQL change-capture connector",
+                ));
+            }
+            if dial.publication_name.is_some() {
+                return Err(refuse(
+                    "publicationName is only for a PostgreSQL change-capture connector",
+                ));
+            }
+            if dial.server_id.is_some() {
+                return Err(refuse(
+                    "serverId is only for a MySQL change-capture connector",
+                ));
+            }
+            if !is_oracle_service_name(&dial.database) {
+                return Err(refuse(
+                    "database must be an Oracle name of letters, digits, '_', '.' or '-'",
+                ));
+            }
+            if dial
+                .pdb_name
+                .as_deref()
+                .is_some_and(|pdb| !is_oracle_service_name(pdb))
+            {
+                return Err(refuse(
+                    "pdbName must be an Oracle name of letters, digits, '_', '.' or '-'",
+                ));
+            }
+            // S6-c: Oracle's JDBC driver does TLS only over TCPS with a Java
+            // trust store, which this build cannot set up (SRC-37), so a mode
+            // that promises certificate checking is refused, not approximated.
+            if matches!(dial.ssl_mode, CdcSslMode::VerifyCa | CdcSslMode::VerifyFull) {
+                return Err(refuse(
+                    "sslMode verify-ca and verify-full are not supported for an Oracle change-capture connector: use require (encrypted, server not authenticated) or disable",
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -1810,6 +1858,66 @@ fn key_is_usable(columns: &[serde_json::Value]) -> bool {
                 && seen.insert(name)
         })
     })
+}
+
+/// An Oracle change-capture table that is not `SCHEMA.TABLE` of two Oracle
+/// identifiers in Oracle's own spelling (`SRC-4` slice 6, decision S10-c).
+/// Fixed text; it names the object the request itself sent.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "source object {name:?} is not an Oracle table: write it as SCHEMA.TABLE in upper case, \
+     letters, digits, '_' and '$'"
+)]
+pub struct InvalidOracleTable {
+    /// The offending source object's name.
+    pub name: String,
+}
+
+/// Whether `part` is an unquoted Oracle identifier as the data dictionary
+/// spells it: upper-case, starting with a letter, at most 128 characters.
+fn is_oracle_dictionary_name(part: &str) -> bool {
+    (1..=128).contains(&part.len())
+        && part.bytes().next().is_some_and(|b| b.is_ascii_uppercase())
+        && part
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || matches!(b, b'_' | b'$'))
+}
+
+/// An Oracle change-capture connector's tables are entered by hand (the
+/// orchestrator cannot list them with the connector's native encryption, S10-c),
+/// so each name is checked here as two identifiers in the spelling Debezium
+/// matches: Oracle stores unquoted names in upper case. Other sources are not
+/// checked here.
+///
+/// # Errors
+///
+/// [`InvalidOracleTable`] for the first object of an Oracle `cdc` dial whose
+/// name is not `SCHEMA.TABLE` of two such identifiers.
+pub fn validate_oracle_change_capture_tables(
+    dial: &Dial,
+    source_objects: &serde_json::Value,
+) -> Result<(), InvalidOracleTable> {
+    let Dial::Cdc(cdc) = dial else {
+        return Ok(());
+    };
+    if cdc.driver != SqlDriver::Oracle {
+        return Ok(());
+    }
+    for object in source_objects.as_array().into_iter().flatten() {
+        let name = object
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let valid = name.split_once('.').is_some_and(|(schema, table)| {
+            is_oracle_dictionary_name(schema) && is_oracle_dictionary_name(table)
+        });
+        if !valid {
+            return Err(InvalidOracleTable {
+                name: name.to_owned(),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Check each source object's load mode, the one part of `sourceObjects`
@@ -2573,6 +2681,118 @@ mod tests {
                 "{field} must be refused for SQL Server"
             );
         }
+    }
+
+    #[test]
+    fn cdc_dial_oracle_takes_a_pdb_name_and_only_two_tls_modes() {
+        let base = || {
+            serde_json::json!({
+                "driver": "oracle", "host": "db.internal", "port": 1521,
+                "database": "FREE", "user": "c##dbzuser"
+            })
+        };
+        let refusal = |json: serde_json::Value| Dial::parse("cdc", &json).unwrap_err().to_string();
+        // A non-container database: no pdbName.
+        assert!(Dial::parse("cdc", &base()).is_ok());
+        let mut with_pdb = base();
+        with_pdb["pdbName"] = serde_json::json!("FREEPDB1");
+        assert!(Dial::parse("cdc", &with_pdb).is_ok());
+        with_pdb["pdbName"] = serde_json::json!("FREE PDB; DROP");
+        assert!(refusal(with_pdb).contains("pdbName must be an Oracle name"));
+        let mut bad_db = base();
+        bad_db["database"] = serde_json::json!("FREE'");
+        assert!(refusal(bad_db).contains("database must be an Oracle name"));
+        // Oracle uses none of the three names.
+        for (field, value, text) in [
+            ("slotName", serde_json::json!("s"), "slotName is only for"),
+            (
+                "publicationName",
+                serde_json::json!("p"),
+                "publicationName is only for",
+            ),
+            ("serverId", serde_json::json!(1), "serverId is only for"),
+        ] {
+            let mut o = base();
+            o[field] = value;
+            assert!(refusal(o).contains(text), "{field}");
+        }
+        // pdbName is Oracle's alone.
+        for driver in ["postgres", "mysql", "mssql"] {
+            let mut d = base();
+            d["driver"] = serde_json::json!(driver);
+            d["pdbName"] = serde_json::json!("FREEPDB1");
+            if driver == "postgres" {
+                d["slotName"] = serde_json::json!("s");
+                d["publicationName"] = serde_json::json!("p");
+            }
+            if driver == "mysql" {
+                d["serverId"] = serde_json::json!(7);
+            }
+            assert!(
+                refusal(d).contains("pdbName is only for an Oracle"),
+                "{driver}"
+            );
+        }
+        // S6-c: require and disable only.
+        for word in ["disable", "require"] {
+            let mut o = base();
+            o["sslMode"] = serde_json::json!(word);
+            assert!(Dial::parse("cdc", &o).is_ok(), "{word}");
+        }
+        for word in ["verify-ca", "verify-full"] {
+            let mut o = base();
+            o["sslMode"] = serde_json::json!(word);
+            assert!(refusal(o).contains("not supported for an Oracle"), "{word}");
+        }
+    }
+
+    #[test]
+    fn oracle_change_capture_tables_are_two_upper_case_identifiers() {
+        let oracle = Dial::parse(
+            "cdc",
+            &serde_json::json!({
+                "driver": "oracle", "host": "db.internal", "port": 1521,
+                "database": "FREE", "user": "u"
+            }),
+        )
+        .unwrap();
+        let objects = |names: &[&str]| {
+            serde_json::Value::Array(
+                names
+                    .iter()
+                    .map(|n| serde_json::json!({"name": n, "target": "t"}))
+                    .collect(),
+            )
+        };
+        assert!(
+            validate_oracle_change_capture_tables(&oracle, &objects(&["SHOP.ORDERS", "A1.B_2$"]))
+                .is_ok()
+        );
+        for bad in [
+            "shop.orders",
+            "SHOP",
+            "SHOP.",
+            ".ORDERS",
+            "A.B.C",
+            "1A.B",
+            "SHOP.OR DERS",
+            "SHOP.ORD,ERS",
+            "SHOP.\"ORDERS\"",
+        ] {
+            let err = validate_oracle_change_capture_tables(&oracle, &objects(&["OK.OK", bad]))
+                .unwrap_err();
+            assert_eq!(err.name, bad);
+        }
+        // Other sources are not subject to the rule.
+        let pg = Dial::parse(
+            "cdc",
+            &serde_json::json!({
+                "driver": "postgres", "host": "db.internal", "port": 5432,
+                "database": "d", "user": "u", "slotName": "s", "publicationName": "p"
+            }),
+        )
+        .unwrap();
+        assert!(validate_oracle_change_capture_tables(&pg, &objects(&["public.orders"])).is_ok());
     }
 
     #[test]
