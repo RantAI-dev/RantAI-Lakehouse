@@ -827,15 +827,19 @@ def fetch_cdc_connectors(cfg: IngestFactoryConfig) -> list[dict[str, Any]]:
     return [c for c in connectors if c.get("adapter") == "cdc"]
 
 
-def _topic_backlog(consumer: Any, topic: str) -> int | None:
+def _topic_backlog(consumer: Any, topic: str, *, absent: int | None = 0) -> int | None:
     """Messages on `topic` past the consumer group's committed offsets (every partition), or
     `None` when that could not be measured (never a made-up 0). A topic that does not exist yet
-    counts 0."""
+    is `absent`: 0 for the sensor's own run decision, `None` for the lag post (Slice 4 review
+    SHOULD-FIX 4: a table whose first copy has not started is not "up to date")."""
     from kafka import TopicPartition
 
     try:
+        partitions = consumer.partitions_for_topic(topic) or set()
+        if not partitions:
+            return absent
         total = 0
-        for partition in sorted(consumer.partitions_for_topic(topic) or set()):
+        for partition in sorted(partitions):
             tp = TopicPartition(topic, partition)
             committed = consumer.committed(tp)
             if committed is None:
@@ -850,14 +854,20 @@ def _topic_backlog(consumer: Any, topic: str) -> int | None:
 
 
 def backlog_by_table(
-    config: CdcConfig, group_id: str, topics: Mapping[str, str], consumer: Any | None = None
+    config: CdcConfig,
+    group_id: str,
+    topics: Mapping[str, str],
+    consumer: Any | None = None,
+    *,
+    absent: int | None = None,
 ) -> dict[str, int | None]:
     """The backlog of each table (`topics` maps a source object's name to its topic): the number
-    of messages the applier has not read, or `None` for a table that could not be measured."""
+    of messages the applier has not read, or `None` for a table that could not be measured. A
+    topic that does not exist yet is `absent` (default `None`: left out of the lag post)."""
     owned = consumer is None
     consumer = consumer or _consumer(config, group_id)
     try:
-        return {name: _topic_backlog(consumer, topic) for name, topic in topics.items()}
+        return {name: _topic_backlog(consumer, topic, absent=absent) for name, topic in topics.items()}
     finally:
         if owned:
             consumer.close()
@@ -879,7 +889,7 @@ def unconsumed(config: CdcConfig, group_id: str, topics: Sequence[str], consumer
     """Messages on `topics` past the group's committed offsets (every partition), or
     `None` when that could not be measured (never a made-up 0). A topic that does not
     exist yet counts 0."""
-    return total_backlog(backlog_by_table(config, group_id, {topic: topic for topic in topics}, consumer))
+    return total_backlog(backlog_by_table(config, group_id, {topic: topic for topic in topics}, consumer, absent=0))
 
 
 def post_capture_observations(cfg: schema_observer.ObserverConfig, connector_id: str, tables: list[dict[str, Any]]) -> bool:
@@ -918,11 +928,12 @@ def topics_of(connector: Mapping[str, Any]) -> dict[str, str]:
 def measure_backlogs(
     config: CdcConfig,
     connectors: Sequence[Mapping[str, Any]],
-    measure: Callable[[CdcConfig, str, Mapping[str, str]], dict[str, int | None]] = backlog_by_table,
+    measure: Callable[..., dict[str, int | None]] = backlog_by_table,
 ) -> dict[str, dict[str, int | None] | None]:
-    """The backlog of every table of every connector, paused or not. A connector whose topics
-    cannot even be named (a setup error) maps to `None`: the run reports that error, and the
-    sensor treats the connector as unmeasured."""
+    """The backlog of every table of every connector, paused or not, for the lag post: a table
+    whose topic does not exist yet is `None` (unmeasured), never 0 (Slice 4 review SHOULD-FIX 4).
+    A connector whose topics cannot even be named (a setup error) maps to `None`: the run reports
+    that error, and the sensor treats the connector as unmeasured."""
     measured: dict[str, dict[str, int | None] | None] = {}
     for connector in connectors:
         try:
@@ -933,6 +944,27 @@ def measure_backlogs(
             continue
         measured[connector["id"]] = measure(config, group_of(connector["id"]), topics)
     return measured
+
+
+def run_backlogs(
+    config: CdcConfig,
+    connectors: Sequence[Mapping[str, Any]],
+    posted: Mapping[str, Mapping[str, int | None] | None],
+    measure: Callable[..., dict[str, int | None]] = backlog_by_table,
+) -> dict[str, dict[str, int | None] | None]:
+    """The backlogs for the sensor's own run decision: as `posted`, with a missing topic counting
+    0 (nothing to apply there), so one table without a topic yet does not hold back the others. Only
+    a connector with a missing topic is measured again."""
+    decided: dict[str, dict[str, int | None] | None] = {}
+    for connector in connectors:
+        found = posted.get(connector["id"])
+        if found is None or all(v is not None for v in found.values()):
+            decided[connector["id"]] = found
+        else:
+            decided[connector["id"]] = measure(
+                config, group_of(connector["id"]), topics_of(connector), absent=0
+            )
+    return decided
 
 
 def report_backlogs(
@@ -1015,8 +1047,9 @@ def cdc_apply_sensor(context: SensorEvaluationContext) -> SensorResult:
     # API needs it for the lag, and a failed connector is what the lag alert is for.
     measured = measure_backlogs(config, connectors)
     report_backlogs(schema_observer.ObserverConfig.from_env(), measured)
+    decided = run_backlogs(config, connectors, measured)
     run_requests, notes = evaluate(
-        context.instance, connectors, lag=lambda connector: _total_of(measured.get(connector["id"]))
+        context.instance, connectors, lag=lambda connector: _total_of(decided.get(connector["id"]))
     )
     for note in notes:
         context.log.info(note)

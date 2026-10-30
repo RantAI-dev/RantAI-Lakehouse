@@ -712,7 +712,7 @@ def test_every_connector_is_measured_and_reported_paused_ones_too_and_an_unmeasu
     ]
     asked: list[tuple[str, dict[str, str]]] = []
 
-    def measure(config, group_id, topics):
+    def measure(config, group_id, topics, absent=None):
         asked.append((group_id, dict(topics)))
         return {name: (None if name == "public.items" else 7) for name in topics}
 
@@ -757,4 +757,20 @@ def test_the_backlog_of_each_table_is_measured_apart(monkeypatch) -> None:
 
     config = CdcConfig("kafka:9092")
     got = cdc_apply.backlog_by_table(config, "g", {"t1": "one", "t2": "absent"}, consumer=_Lag())
-    assert got == {"t1": 15, "t2": 0}
+    assert got == {"t1": 15, "t2": None}, "a missing topic is unmeasured for the lag post (SHOULD-FIX 4)"
+    assert cdc_apply.backlog_by_table(config, "g", {"t2": "absent"}, consumer=_Lag(), absent=0) == {"t2": 0}
+
+
+def test_a_table_without_a_topic_yet_is_left_out_of_the_post_but_does_not_hold_back_the_run() -> None:
+    """Slice 4 review SHOULD-FIX 4."""
+    connectors = [{**_connector(_object("public.orders"), _object("public.items")), "id": "conn-a"}]
+
+    def measure(config, group_id, topics, absent=None):
+        return {"public.orders": 4, "public.items": absent}
+
+    config = CdcConfig("kafka:9092")
+    posted = cdc_apply.measure_backlogs(config, connectors, measure=measure)
+    assert posted == {"conn-a": {"public.orders": 4, "public.items": None}}
+    decided = cdc_apply.run_backlogs(config, connectors, posted, measure=measure)
+    assert cdc_apply._total_of(decided["conn-a"]) == 4
+    assert cdc_apply._total_of(posted["conn-a"]) is None
