@@ -155,6 +155,9 @@ def connect(
         password=secrets["password"],
         authSource=spec["database"],
         directConnection=True,
+        # `SRC-4` slice 5: the TLS options of a change-capture dial (`discover._cdc_mongo`). The
+        # batch `MongoDial` has no TLS field, so its specs carry none and this is empty for them.
+        **spec.get("clientOptions", {}),
     )
     return client, resolved
 

@@ -360,6 +360,133 @@ def test_mongodb_hands_the_adapters_own_connection_code_the_checked_dial() -> No
     assert calls == [(["m.example:27017"], backends.resolve_checked)]
 
 
+# --- MongoDB change capture (SRC-4 slice 5, decision S5-f) ---------------------------------
+
+
+_CDC_MONGO = {
+    "id": "conn-1",
+    "adapter": "cdc",
+    "dial": {
+        "driver": "mongodb",
+        "hosts": ["m1.example:27017", "m2.example:27017"],
+        "database": "shop",
+        "user": "reader",
+        "replicaSet": "rs0",
+        "sslMode": "disable",
+    },
+    "secretRef": "env:CONNECTOR_MONGO_PASSWORD",
+}
+
+
+class _Admin:
+    def __init__(self, fail: Exception | None = None) -> None:
+        self.commands: list[str] = []
+        self.fail = fail
+
+    def command(self, name: str):
+        self.commands.append(name)
+        if self.fail:
+            raise self.fail
+        return {"ok": 1}
+
+
+class _PingClient(_MongoClient):
+    def __init__(self, collections, fail: Exception | None = None):
+        super().__init__(collections)
+        self.admin = _Admin(fail)
+
+
+def test_a_mongodb_cdc_connector_lists_its_databases_collections_through_the_batch_code() -> None:
+    client = _MongoClient({"orders": [], "system.views": [], "items": []})
+    seen = {}
+
+    def connect(dial, secrets, **kw):
+        seen.update(dial)
+        seen["password"] = secrets["password"]
+        return client, []
+
+    result = discover.discover(_CDC_MONGO, _request("list"), backends=_backends(mongo_connect=connect))
+    assert [o["name"] for o in result["objects"]] == ["items", "orders"]
+    assert client.closed is True
+    # The change-capture dial is handed over as the batch dial: one host, direct, the user as username.
+    assert seen["hosts"] == ["m1.example:27017"]
+    assert (seen["username"], seen["database"], seen["directConnection"]) == ("reader", "shop", True)
+    assert seen["password"] == SECRET_TEXT
+
+
+def test_a_mongodb_cdc_preview_names_id_as_the_key() -> None:
+    client = _MongoClient({"orders": [{"_id": "a1", "qty": 3}]})
+    result = discover.discover(
+        _CDC_MONGO, _request("preview", object="orders"), backends=_backends(mongo_connect=lambda d, s, **kw: (client, []))
+    )
+    assert [c["name"] for c in result["columns"]] == ["_id", "qty"]
+    assert result["primaryKey"] == ["_id"]
+    # An empty collection has nothing to infer: no key is invented for it.
+    empty = discover.discover(
+        _CDC_MONGO,
+        _request("preview", object="orders"),
+        backends=_backends(mongo_connect=lambda d, s, **kw: (_MongoClient({"orders": []}), [])),
+    )
+    assert empty == {"columns": []}
+
+
+def test_the_ssl_mode_of_a_mongodb_cdc_dial_becomes_the_clients_tls_options() -> None:
+    assert discover._cdc_mongo_client_options("disable") == {}
+    assert discover._cdc_mongo_client_options("require") == {"tls": True, "tlsAllowInvalidHostnames": True}
+    for mode in ("verify-ca", "verify-full"):
+        assert discover._cdc_mongo_client_options(mode) == {"tls": True, "tlsAllowInvalidHostnames": False}
+    seen = {}
+
+    def connect(dial, secrets, **kw):
+        seen.update(dial)
+        return _MongoClient({}), []
+
+    secure = {**_CDC_MONGO, "dial": {**_CDC_MONGO["dial"], "sslMode": "verify-full"}}
+    discover.discover(secure, _request("list"), backends=_backends(mongo_connect=connect))
+    assert seen["clientOptions"] == {"tls": True, "tlsAllowInvalidHostnames": False}
+    # A dial that does not name a mode is `require`, the default the API parses it with.
+    bare = {**_CDC_MONGO, "dial": {k: v for k, v in _CDC_MONGO["dial"].items() if k != "sslMode"}}
+    discover.discover(bare, _request("list"), backends=_backends(mongo_connect=connect))
+    assert seen["clientOptions"]["tls"] is True
+
+
+def test_a_mongodb_cdc_connection_test_connects_pings_and_reports_only_the_time() -> None:
+    client = _PingClient({})
+    result = discover.discover(
+        _CDC_MONGO, _request("test"), backends=_backends(mongo_connect=lambda d, s, **kw: (client, []))
+    )
+    assert list(result) == ["latencyMs"]
+    assert isinstance(result["latencyMs"], int) and result["latencyMs"] >= 0
+    assert client.admin.commands == ["ping"]
+    assert client.closed is True
+    body = discover.result_body(_request("test"), result=result, error_class=None)
+    assert body == {"requestId": "req-1", "kind": "test", "state": "done", "latencyMs": result["latencyMs"]}
+
+
+def test_a_mongodb_cdc_test_failure_is_posted_as_its_class_and_never_its_text() -> None:
+    refused = _driver_error("pymongo", "OperationFailure", code=18)(f"Authentication failed {SECRET_TEXT}")
+    for exc, expected in [(refused, "sign_in_refused"), (_driver_error("pymongo", "ServerSelectionTimeoutError")("x"), "failed")]:
+        client = _PingClient({}, fail=exc)
+        posted: list[dict] = []
+        error_class = discover.run_request(
+            _request("test"),
+            connector_loader=lambda cid: _CDC_MONGO,
+            poster=posted.append,
+            backends=_backends(mongo_connect=lambda d, s, _c=client, **kw: (_c, [])),
+        )
+        assert error_class == expected
+        assert posted == [{"requestId": "req-1", "kind": "test", "state": "failed", "errorClass": expected}]
+        assert SECRET_TEXT not in json.dumps(posted)
+        assert client.closed is True
+
+
+def test_a_sql_cdc_connector_is_still_not_read_by_the_orchestrator() -> None:
+    sql_cdc = {**_CDC_MONGO, "dial": {"driver": "postgres", "host": "h", "port": 5432, "database": "d", "user": "u"}}
+    for kind in ("list", "test"):
+        posted: list[dict] = []
+        assert discover.run_request(_request(kind), connector_loader=lambda cid: sql_cdc, poster=posted.append) == "not_supported"
+
+
 # --- Kafka -----------------------------------------------------------------------------
 
 

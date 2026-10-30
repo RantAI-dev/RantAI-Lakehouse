@@ -1036,8 +1036,9 @@ async fn remove_managed_credentials(
 /// `PostgreSQL`, `MySQL`/`MariaDB`, SQL Server, REST and S3-compatible
 /// object-storage connectors (an object-storage connector is tested at the
 /// endpoint in its `dial`, `SRC-6`) — see `crate::connector_probe`'s module
-/// doc comment for exactly what that does and does not cover. Oracle connects
-/// only from the orchestrator, so its test runs there (`SRC-4` T1.1): the
+/// doc comment for exactly what that does and does not cover. Oracle and a
+/// `MongoDB` change-capture connector connect only from the orchestrator, so
+/// their test runs there (`SRC-4` T1.1, slice 5): the
 /// answer is `pending: true` at once, the job's result is recorded when it
 /// posts (stored health, audit, probe history) and the console polls
 /// `GET /api/connectors/{id}/discovery/test`. Every other connector gets an

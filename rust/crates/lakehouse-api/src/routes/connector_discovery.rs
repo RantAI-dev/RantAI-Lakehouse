@@ -458,8 +458,17 @@ pub async fn report_result(
     // sentences of `connector_probe`. A repeat or a replaced request
     // (`recorded: false`) records nothing, so one test leaves one trace.
     if recorded && kind == Kind::Test {
-        let probed = connector_probe::outcome_of_orchestrator_test(&outcome);
-        record_test_outcome(&state, &principal, &id, &probed).await?;
+        // The sentence names the product the orchestrator tested (`SRC-4` slice 5): read from the
+        // connector's own dial. A connector the orchestrator does not test cannot have launched
+        // a test, so there is nothing to record for it.
+        let tested = connectors::get_connector_dial_info(pool, &id)
+            .await?
+            .as_ref()
+            .and_then(connector_probe::orchestrator_tested_source);
+        if let Some(source) = tested {
+            let probed = connector_probe::outcome_of_orchestrator_test(&outcome, source);
+            record_test_outcome(&state, &principal, &id, &probed).await?;
+        }
     }
     Ok(ApiJson(Recorded { recorded }))
 }

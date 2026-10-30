@@ -553,6 +553,53 @@ def _mongo(dial: dict, secrets: dict, request: DiscoverRequest, b: Backends) -> 
 # --- Kafka (decision D4, D6) -----------------------------------------------------------
 
 
+def _cdc_mongo_client_options(ssl_mode: str) -> dict[str, Any]:
+    """`pymongo` TLS options for a change-capture dial's `sslMode`, the same meaning the Kafka
+    Connect worker gets (`lakehouse_store::cdc::render_mongodb_connect_config`): `disable` is no
+    TLS; `require` is TLS with the host name not checked; `verify-ca` and `verify-full` check the
+    host name as well. The certificate chain is checked against the system trust store in every
+    TLS mode, as the worker checks it against its own."""
+    if ssl_mode == "disable":
+        return {}
+    return {"tls": True, "tlsAllowInvalidHostnames": ssl_mode == "require"}
+
+
+def _cdc_mongo(dial: dict, secrets: dict, request: DiscoverRequest, b: Backends) -> dict[str, Any]:
+    """A MongoDB change-capture connector (`SRC-4` slice 5, decision S5-f): its collections and a
+    sample of one, read through `_mongo`, and its connection test.
+
+    The change-capture dial (`hosts`, `user`, `replicaSet`, `sslMode`) is turned into the batch
+    adapter's (`hosts`, `username`, `directConnection`), so the read dials exactly as a batch load
+    does: the same hostname check, `resolve_checked`, `checking_resolver`. Only the FIRST host is
+    dialled, directly: the batch adapter refuses replica-set discovery, which would reach hosts
+    nothing here has checked. A listing or a test therefore needs the first host to answer.
+
+    The preview names `_id` as the key, so the wizard fills it in (every document has one)."""
+    adapted = {
+        "hosts": dial["hosts"][:1],
+        "username": dial["user"],
+        "database": dial["database"],
+        "directConnection": True,
+        "clientOptions": _cdc_mongo_client_options(dial.get("sslMode", "require")),
+    }
+    if request.kind == "test":
+        # The connection test: connecting authenticates (the driver signs in during the handshake)
+        # and `ping` proves the server answers. What is returned is the elapsed time, measured here
+        # from before the connect, never a driver message.
+        started = time.monotonic()
+        client, _resolved = b.mongo_connect(adapted, secrets, resolve_checked=b.resolve_checked)
+        try:
+            with b.checking_resolver():
+                client.admin.command("ping")
+        finally:
+            client.close()
+        return {"latencyMs": max(0, round((time.monotonic() - started) * 1000))}
+    result = _mongo(adapted, secrets, request, b)
+    if request.kind == "preview" and any(c["name"] == "_id" for c in result["columns"]):
+        result["primaryKey"] = ["_id"]
+    return result
+
+
 def _kafka(dial: dict, secrets: dict, request: DiscoverRequest, b: Backends) -> dict[str, Any]:
     # A group id the connector never uses (module docstring, "Kafka never commits").
     consumer = b.kafka_consumer(dial, secrets, group_id=f"lakehouse-discover-{request.request_id}")
@@ -774,6 +821,8 @@ def _reader_for(connector: dict) -> Callable[[dict, dict, DiscoverRequest, Backe
     adapter, dial = connector["adapter"], connector["dial"]
     if adapter == "sql" and dial.get("driver") == "oracle":
         return _oracle
+    if adapter == "cdc" and dial.get("driver") == "mongodb":
+        return _cdc_mongo
     readers = {"mongodb": _mongo, "kafka": _kafka, "sftp": _sftp, "rest": _rest, "saas": _saas}
     reader = readers.get(adapter)
     if reader is None:
@@ -792,9 +841,10 @@ def discover(connector: dict, request: DiscoverRequest, *, backends: Backends | 
     errors -- for `classify_discovery` to name. Nothing is caught here.
     """
     reader = _reader_for(connector)
-    if request.kind == "test" and reader is not _oracle:
-        # SRC-4 T1.1: only Oracle is tested here; the API tests the rest itself or says it cannot.
-        raise NotSupported("the orchestrator tests only Oracle connections")
+    if request.kind == "test" and reader not in (_oracle, _cdc_mongo):
+        # SRC-4 T1.1 and slice 5: only Oracle and a MongoDB change-capture connector are tested here;
+        # the API tests the rest itself or says it cannot.
+        raise NotSupported("the orchestrator tests only Oracle and MongoDB change-capture connections")
     dial = connector["dial"]
     secrets = secret_resolver.resolve_secrets(
         connector["adapter"],

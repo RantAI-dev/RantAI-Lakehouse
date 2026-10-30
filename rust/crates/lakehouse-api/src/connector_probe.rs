@@ -39,7 +39,8 @@
 //!
 //! Oracle, `MongoDB`, Kafka and SFTP connect only from the orchestrator
 //! (`dagster/dispar_orchestrate/adapters/`); this build has no client for
-//! them. (Oracle's connection test runs there since `SRC-4` T1.1:
+//! them. (Oracle's connection test runs there since `SRC-4` T1.1, and a
+//! `MongoDB` change-capture connector's since slice 5:
 //! `POST /api/connectors/{id}/test` launches it and the result is recorded
 //! with the sentences of [`outcome_of_orchestrator_test`]; the probes below
 //! stay what the credential flows use.) They report
@@ -261,23 +262,66 @@ impl Outcome {
     }
 }
 
-/// Whether `info` is tested by the orchestrator instead of by this API
-/// (`SRC-4` T1.1): an Oracle `sql` connector. The API has no Oracle client; its
-/// own answer for such a connector stays [`Outcome::not_testable_here`] (the
-/// credential-change and rotate-secret flows probe with [`probe_with`] and keep
-/// `verified: false`), and only `POST /api/connectors/{id}/test` launches the
-/// real test.
-#[must_use]
-pub fn is_tested_in_orchestrator(info: &ConnectorDialInfo) -> bool {
-    info.adapter.as_deref() == Some("sql")
-        && matches!(
-            Dial::parse("sql", &info.dial),
-            Ok(Dial::Sql(dial)) if dial.driver == SqlDriver::Oracle
-        )
+/// The connectors whose connection test runs in the orchestrator because the
+/// API has no client for them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrchestratorTested {
+    /// An Oracle `sql` connector (`SRC-4` T1.1).
+    Oracle,
+    /// A `MongoDB` change-capture connector (`SRC-4` slice 5, decision S5-f).
+    MongoDb,
 }
 
-/// The fixed `Outcome` of a connection test the orchestrator ran for Oracle and
-/// posted (`SRC-4` T1.1), in the sentences the other drivers use
+impl OrchestratorTested {
+    /// The product's name in the fixed sentences.
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Oracle => "Oracle",
+            Self::MongoDb => "MongoDB",
+        }
+    }
+
+    /// What a passed test says it did: the one statement the orchestrator ran.
+    const fn success_sentence(self) -> &'static str {
+        match self {
+            Self::Oracle => "Connected via Oracle and ran SELECT 1 FROM DUAL.",
+            Self::MongoDb => "Connected via MongoDB and ran ping.",
+        }
+    }
+}
+
+/// Which orchestrator test `info` takes, if any (`SRC-4` T1.1, slice 5): an
+/// Oracle `sql` connector or a `MongoDB` change-capture connector. The API has
+/// no client for either; its own answer for such a connector stays
+/// [`Outcome::not_testable_here`] (the credential-change and rotate-secret
+/// flows probe with [`probe_with`] and keep `verified: false`), and only
+/// `POST /api/connectors/{id}/test` launches the real test.
+#[must_use]
+pub fn orchestrator_tested_source(info: &ConnectorDialInfo) -> Option<OrchestratorTested> {
+    match info.adapter.as_deref() {
+        Some("sql") => match Dial::parse("sql", &info.dial) {
+            Ok(Dial::Sql(dial)) if dial.driver == SqlDriver::Oracle => {
+                Some(OrchestratorTested::Oracle)
+            }
+            _ => None,
+        },
+        Some("cdc") => match Dial::parse("cdc", &info.dial) {
+            Ok(Dial::CdcMongo(_)) => Some(OrchestratorTested::MongoDb),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Whether `info` is tested by the orchestrator instead of by this API; see
+/// [`orchestrator_tested_source`].
+#[must_use]
+pub fn is_tested_in_orchestrator(info: &ConnectorDialInfo) -> bool {
+    orchestrator_tested_source(info).is_some()
+}
+
+/// The fixed `Outcome` of a connection test the orchestrator ran for `source`
+/// and posted (`SRC-4` T1.1, slice 5), in the sentences the other drivers use
 /// ("Connected via X and ran SELECT 1.", "X connection failed: <class>"): the
 /// orchestrator sends a latency or a closed error class, never text, so the
 /// sentence is this module's own (AGENTS.md principle 4). A figure the
@@ -285,18 +329,19 @@ pub fn is_tested_in_orchestrator(info: &ConnectorDialInfo) -> bool {
 #[must_use]
 pub(crate) fn outcome_of_orchestrator_test(
     outcome: &lakehouse_store::connector_discovery::Outcome,
+    source: OrchestratorTested,
 ) -> Outcome {
     use lakehouse_store::connector_discovery::{ErrorClass, Outcome as Reported};
     match outcome {
         Reported::Tested(tested) => Outcome::success(
             Duration::from_millis(u64::try_from(tested.latency_ms).unwrap_or(0)),
-            "Connected via Oracle and ran SELECT 1 FROM DUAL.",
+            source.success_sentence(),
         ),
         Reported::Failed(ErrorClass::Timeout) => Outcome {
             ok: false,
             supported: true,
             latency_ms: None,
-            message: "Oracle connection timed out".to_owned(),
+            message: format!("{} connection timed out", source.name()),
             rotated_refresh_token: None,
         },
         Reported::Failed(class) => {
@@ -315,7 +360,7 @@ pub(crate) fn outcome_of_orchestrator_test(
                 ok: false,
                 supported: true,
                 latency_ms: None,
-                message: format!("Oracle connection failed: {phrase}"),
+                message: format!("{} connection failed: {phrase}", source.name()),
                 rotated_refresh_token: None,
             }
         }
@@ -325,7 +370,7 @@ pub(crate) fn outcome_of_orchestrator_test(
             ok: false,
             supported: true,
             latency_ms: None,
-            message: "Oracle connection failed: connection failed".to_owned(),
+            message: format!("{} connection failed: connection failed", source.name()),
             rotated_refresh_token: None,
         },
     }
@@ -3465,7 +3510,10 @@ mod tests {
     fn the_orchestrators_test_result_becomes_a_fixed_outcome() {
         use lakehouse_store::connector_discovery::{ErrorClass, Outcome as Reported, Tested};
 
-        let passed = outcome_of_orchestrator_test(&Reported::Tested(Tested { latency_ms: 212 }));
+        let passed = outcome_of_orchestrator_test(
+            &Reported::Tested(Tested { latency_ms: 212 }),
+            OrchestratorTested::Oracle,
+        );
         assert!(passed.ok && passed.supported);
         assert_eq!(passed.latency_ms, Some(212));
         assert_eq!(
@@ -3488,9 +3536,54 @@ mod tests {
                 "Oracle connection failed: permission denied",
             ),
         ] {
-            let failed = outcome_of_orchestrator_test(&Reported::Failed(class));
+            let failed =
+                outcome_of_orchestrator_test(&Reported::Failed(class), OrchestratorTested::Oracle);
             assert!(!failed.ok && failed.supported, "{class:?}");
             assert!(failed.latency_ms.is_none(), "no latency was measured");
+            assert_eq!(failed.message, sentence);
+        }
+    }
+
+    /// `SRC-4` slice 5 (S5-f): a `MongoDB` change-capture connector is tested by the
+    /// orchestrator too, and its result is said in `MongoDB`'s own name.
+    #[test]
+    fn a_mongodb_cdc_connector_is_tested_in_the_orchestrator_and_reported_in_its_name() {
+        use lakehouse_store::connector_discovery::{ErrorClass, Outcome as Reported, Tested};
+
+        let mut row = info("MongoDB CDC", "h", "env:X", None);
+        row.adapter = Some("cdc".to_owned());
+        row.dial = serde_json::json!({
+            "driver": "mongodb", "hosts": ["m.invalid:27017"], "database": "shop",
+            "user": "u", "replicaSet": "rs0"
+        });
+        assert_eq!(
+            orchestrator_tested_source(&row),
+            Some(OrchestratorTested::MongoDb)
+        );
+        // A SQL change-capture connector is tested by the API itself.
+        row.dial = serde_json::json!({
+            "driver": "postgres", "host": "db.invalid", "port": 5432, "database": "d",
+            "user": "u", "slotName": "s", "publicationName": "p"
+        });
+        assert_eq!(orchestrator_tested_source(&row), None);
+
+        let passed = outcome_of_orchestrator_test(
+            &Reported::Tested(Tested { latency_ms: 9 }),
+            OrchestratorTested::MongoDb,
+        );
+        assert!(passed.ok && passed.supported);
+        assert_eq!(passed.latency_ms, Some(9));
+        assert_eq!(passed.message, "Connected via MongoDB and ran ping.");
+        for (class, sentence) in [
+            (
+                ErrorClass::SignInRefused,
+                "MongoDB connection failed: authentication failed",
+            ),
+            (ErrorClass::Timeout, "MongoDB connection timed out"),
+        ] {
+            let failed =
+                outcome_of_orchestrator_test(&Reported::Failed(class), OrchestratorTested::MongoDb);
+            assert!(!failed.ok && failed.supported && failed.latency_ms.is_none());
             assert_eq!(failed.message, sentence);
         }
     }
