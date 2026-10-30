@@ -629,7 +629,6 @@ function IngestEditor({
           {backfillTriggerMessage(typeof spec.dial.driver === "string" ? spec.dial.driver : "cdc")}
         </p>
       ) : null}
-      {isCdc ? <ChangeCapturePanel connectorId={connectorId} pausedReason={pausedReason} onChanged={onResumed} /> : null}
     </>
   )
 
@@ -916,6 +915,7 @@ function IngestEditor({
       state={runState}
       pausedReason={pausedReason}
       onResumed={onResumed}
+      resumeOnCaptureTab={isCdc}
       blockedReason={
         pausedReason
           ? `Paused: ${pausedReason}`
@@ -1442,6 +1442,7 @@ function IngestRuns({
   blockedReason,
   pausedReason,
   onResumed,
+  resumeOnCaptureTab = false,
 }: {
   layout: "page" | "embedded"
   connectorId: string
@@ -1449,6 +1450,8 @@ function IngestRuns({
   blockedReason: string | null
   pausedReason: string | null
   onResumed?: () => void
+  /** A change-capture connector is paused and resumed on the Change capture tab (`SRC-4` S4-g), not here. */
+  resumeOnCaptureTab?: boolean
 }) {
   const { list, runs, activeRun, awaitingLaunch, launchedRunId, watching, refreshRuns } = state
   const runNow = useServiceAction((signal, id: string) => connectorService.runIngest(id, signal))
@@ -1473,7 +1476,12 @@ function IngestRuns({
   const body = (
     <>
       {pausedReason ? (
-        <PausedNote connectorId={connectorId} reason={pausedReason} onResumed={onResumed} />
+        <PausedNote
+          connectorId={connectorId}
+          reason={pausedReason}
+          onResumed={onResumed}
+          resumeOnCaptureTab={resumeOnCaptureTab}
+        />
       ) : blockedReason && !watching ? (
         <p className="text-xs text-muted-foreground">{blockedReason}</p>
       ) : null}
@@ -1543,10 +1551,12 @@ function PausedNote({
   connectorId,
   reason,
   onResumed,
+  resumeOnCaptureTab = false,
 }: {
   connectorId: string
   reason: string
   onResumed?: () => void
+  resumeOnCaptureTab?: boolean
 }) {
   const resume = useServiceAction(async (signal) => {
     const result = await connectorService.resumeConnector(connectorId, signal)
@@ -1556,7 +1566,9 @@ function PausedNote({
   return (
     <div className="space-y-1.5 rounded-md border border-border bg-muted/30 px-3 py-2">
       <p className="text-xs">Paused: {reason}</p>
-      {isLiftablePause(reason) ? (
+      {isLiftablePause(reason) && resumeOnCaptureTab ? (
+        <p className="text-xs text-muted-foreground">Resume it on the Change capture tab.</p>
+      ) : isLiftablePause(reason) ? (
         <>
           <p className="text-xs text-muted-foreground">
             {isAutoDisablePause(reason)
@@ -1767,79 +1779,6 @@ function RunLog({ connectorId, runId }: { connectorId: string; runId: string }) 
           ) : null}
         </>
       )}
-    </div>
-  )
-}
-
-/** The words for the states `GET /api/connectors/{id}/change-capture` answers. Anything else is shown as sent. */
-const CAPTURE_STATE_WORDS: Record<string, { label: string; tone: "success" | "warning" | "destructive" | "neutral"; note: string }> = {
-  running: { label: "Running", tone: "success", note: "Changes at the source are being captured." },
-  paused: { label: "Paused", tone: "warning", note: "Capture is stopped; the changes made meanwhile are kept and applied after Resume." },
-  failed: { label: "Failed", tone: "destructive", note: "Capture stopped on an error. The source's recent changes are kept for seven days." },
-  starting: { label: "Starting", tone: "neutral", note: "Capture is starting. The first copy of each table is taken now." },
-  not_created: { label: "Not started", tone: "neutral", note: "Capture starts when the tables are saved." },
-  unreachable: { label: "Not reachable", tone: "warning", note: "The capture service did not answer; this is not a statement about the connector." },
-}
-
-/**
- * The state of a change-capture connector in the capture service, in fixed words, with Pause and Resume
- * (`SRC-4` decisions S2-e, S2-h; it replaces the Debezium properties panel). A deployment without the service
- * says so (`supported: false`), and nothing is shown as running that was not asked.
- */
-function ChangeCapturePanel({
-  connectorId,
-  pausedReason,
-  onChanged,
-}: {
-  connectorId: string
-  pausedReason: string | null
-  onChanged?: () => void
-}) {
-  const capture = useService((signal) => connectorService.getChangeCapture(connectorId, signal), [connectorId, pausedReason])
-  const pause = useServiceAction(async (signal) => {
-    const result = await connectorService.pauseConnector(connectorId, signal)
-    if (!signal.aborted) notifySuccess("Paused; the changes made meanwhile are kept")
-    return result
-  })
-
-  if (capture.status === "loading") return <LoadingSkeleton rows={1} />
-  if (capture.status === "error") return <ErrorState error={capture.error} onRetry={capture.reload} />
-  if (!capture.data.supported) {
-    return (
-      <p className="rounded-md border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
-        {capture.data.reason ?? "Change capture is not available for this connector."}
-      </p>
-    )
-  }
-  const word = CAPTURE_STATE_WORDS[capture.data.state ?? ""]
-  return (
-    <div className="space-y-1.5 rounded-md border border-border bg-muted/30 px-3 py-2">
-      <div className="flex flex-wrap items-center gap-2">
-        <p className="text-xs font-medium text-muted-foreground">Change capture</p>
-        <Pill tone={word?.tone ?? "neutral"}>{word?.label ?? capture.data.state ?? "Unknown"}</Pill>
-        {!pausedReason ? (
-          <Button
-            type="button"
-            size="sm"
-            variant="outline"
-            disabled={pause.status === "pending"}
-            onClick={async () => {
-              if (await pause.run()) {
-                onChanged?.()
-                capture.reload()
-              }
-            }}
-          >
-            {pause.status === "pending" ? "Pausing…" : "Pause"}
-          </Button>
-        ) : null}
-      </div>
-      <p className="text-xs text-muted-foreground">{word?.note ?? ""}</p>
-      {pause.status === "error" ? (
-        <p role="alert" className="text-xs text-destructive">
-          {pause.error.message}
-        </p>
-      ) : null}
     </div>
   )
 }

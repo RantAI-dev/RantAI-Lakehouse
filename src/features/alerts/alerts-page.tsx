@@ -113,6 +113,8 @@ const KIND_NOTES: Record<string, string> = {
     "Raised once when a connector fails runs in a row (30 by default) and is paused. Resume it from its page.",
   connector_schema_change:
     "Raised when a source table's columns change or a new table appears at the source.",
+  connector_lag:
+    "Raised once when a change-capture connector falls further behind the source than its limit (set on the connector's Change capture tab, 15 minutes by default), and once more when it is back under.",
 }
 
 /**

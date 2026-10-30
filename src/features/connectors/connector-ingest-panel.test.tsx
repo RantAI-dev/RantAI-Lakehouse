@@ -85,8 +85,6 @@ function stubFetch(
       return body ? json(body) : json({ error: "not found" }, 404)
     }
     if (url.endsWith("/resume") && method === "POST") return options.onResume ? options.onResume() : json({ resumed: true })
-    if (url.endsWith("/change-capture") && method === "GET") return json({ supported: true, state: "running" })
-    if (url.endsWith("/pause") && method === "POST") return json({ paused: true })
     // SRC-13: names first (`/discovery/list`), the columns of one object when it is opened (`/discovery/preview`).
     if (url.endsWith("/discovery/list") && method === "POST") {
       return json({
@@ -442,7 +440,7 @@ describe("ConnectorIngestPanel layout", () => {
     const { container } = render(
       <ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />
     )
-    await screen.findByText("Change capture")
+    await screen.findByText("public.orders")
     expect(cardTitles(container)).toEqual(["Tables to ingest", "Runs"])
     const tables = (screen.getByText("Tables to ingest", { selector: "[data-slot=card-title]" }).closest(
       "[data-slot=card]"
@@ -964,20 +962,6 @@ describe("ConnectorIngestPanel refresh and clear", () => {
     expect(mode.value).toBe("incremental_dedup")
     expect(screen.queryByLabelText("New-row column for public.orders")).toBeNull()
     expect(screen.getByText(/The table holds the current row of each key/)).toBeDefined()
-  })
-
-  it("shows the capture state in fixed words and pauses on request", async () => {
-    const calls = stubFetch({
-      ...SPEC,
-      adapter: "cdc",
-      ingestMode: "cdc",
-      dial: { ...SPEC.dial, driver: "postgres" },
-      sourceObjects: [{ name: "public.orders", target: "northwind_orders", loadMode: "incremental_dedup", primaryKey: ["id"] }],
-    })
-    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
-    expect((await screen.findAllByText("Running")).length).toBeGreaterThan(0)
-    fireEvent.click(screen.getByRole("button", { name: "Pause" }))
-    await waitFor(() => expect(calls.some((c) => c.method === "POST" && c.url.endsWith("/pause"))).toBe(true))
   })
 
   it("has no table menu for a CDC connector, whose tables stream", async () => {
