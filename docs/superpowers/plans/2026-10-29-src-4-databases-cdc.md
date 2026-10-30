@@ -1172,3 +1172,119 @@ default and a mode kept on edit. Checked by the planner: CI on `e08c6644`
 success (the three change-capture gates among the jobs), Security success.
 No open `BLOCKER`. Slice 3 is closed; slice 5 (branch `feat/src-4-slice-5`,
 session lakehouse-35) may merge into this branch now, hunk by hunk.
+
+### Slice 4, review round 1 (planner, 2026-10-30, head `cec91312`, code `510052be`)
+
+Checked by the planner, not taken from the handoff: CI run 41013826932 on
+`510052be` success, Security success. The gate logs read: all three gates
+show both tables `up_to_date` after the first copy and exactly one failing
+setup check on the second connector (`publication`; `replication
+privileges`; `CDC on table dbo.orders_plain`), SQL Server Agent `unchecked`
+with the documented grants; `g4-cdc` crossed the 1-minute limit at 64 s,
+listed one `connector_lag` instance, and closed the alert after
+`kafka-connect` started again. The diff `070cf04e..510052be` read for the
+slice's own commits (the `main` merge brings QS-2, reviewed in #275).
+Migration 0118 is free on every remote branch, additive, with its
+why-header. No values reach SQL sent to a source; no server text reaches a
+response; both routes are in `POLICY_TABLE` and asserted both ways. Not
+re-run locally (no cargo or docker on this VM): CI is the evidence.
+
+Planner decision on the handoff's AC7 question: **option 1, accepted with
+changes.** The 15-minute dedupe of the Alerts list stays (it belongs to
+every alert kind, outside this slice), and no in-compose webhook receiver
+is added (the address check rightly refuses internal addresses). "Once per
+crossing" rests on the compare-and-set flag and its unit tests; the gate
+proves the flag goes true then false. SHOULD-FIX 10 removes the assertion
+that cannot fail. The product owner's acceptance run checks both deliveries
+with a real webhook (AC7).
+
+Findings (no `BLOCKER`):
+
+- **SHOULD-FIX 1 (rule 1), `lakehouse-api/src/capture_lag.rs:25`.** "The
+  number is never larger than the true lag" is backwards: anchoring on the
+  later of the two times makes the number an upper bound (caught up at
+  1000, change at 1020 not applied, now 1030: shown 30 s, true 10 s). Say
+  "never smaller than the true lag", as S4-c meant.
+- **SHOULD-FIX 2 (principle 2), `routes/capture_lag.rs:115-119`.** A
+  `lastSourceTsMs` in the future is accepted, and because `last_source_ts`
+  only moves forward (`GREATEST`) it sticks: the table reads "behind 0 s"
+  and no crossing fires until the wall clock catches up. Decision: the
+  route stores `min(lastSourceTsMs, now)`, logs a `warn` with the connector
+  and table when it caps, and the test
+  `a_change_time_in_the_future_never_gives_a_negative_lag` asserts the cap.
+- **SHOULD-FIX 3, a false alert pair after a resume.** During a person's
+  pause no report is `running`, so `caught_up_at` stays at its pre-pause
+  value; after resume, one tick with backlog 0 while Kafka Connect still
+  says `Starting` gives lag = the whole pause, so any pause longer than the
+  limit sends a crossing and, one tick later, "back under". Decision: a
+  person's pause does not count as lag. The resume route sets
+  `caught_up_at = GREATEST(caught_up_at, now())` for every row of the
+  connector, in the same transaction that clears the pause. The feature
+  page's "Limits" says: after a resume the lag counts from the resume;
+  changes made during the pause show as backlog until applied. A unit or
+  store test covers it.
+- **SHOULD-FIX 4 (principle 2), `cdc_apply.py:830-848`.** A topic that does
+  not exist yet counts 0 and is posted, so a table whose first copy has not
+  started reads "Up to date" and `caught_up_at` is set. Leave a missing
+  topic out of the lag post (unmeasured, so the console shows "not known
+  yet"); keep 0 only for the sensor's own run decision. A unit test covers
+  it.
+- **SHOULD-FIX 5, `connector-change-capture-panel.tsx:56-58`.** Pause and
+  Resume render only when `GET …/change-capture` succeeds with
+  `supported: true`, and the Ingest tab now points there. With that GET
+  failing (store or Kafka Connect config unreadable), a paused connector
+  has no Resume button anywhere, although the resume route does not need
+  that GET. Render the Pause/Resume control from `pausedReason` in the
+  error and unsupported branches too (state shown as unknown), and test the
+  error branch.
+- **SHOULD-FIX 6 (principle 2), `cdc_setup_check.rs:350`.** MySQL
+  `binlog_expire_logs_seconds = 0` reads "never expire", but on 8.0 a
+  legacy `expire_logs_days` still expires logs. Also read
+  `@@expire_logs_days` with a fixed statement (absent on 8.4: treat as 0);
+  0 and 0 is "never expire", a non-zero days value is checked against the
+  7 days; unreadable is `unchecked`.
+- **SHOULD-FIX 7 (principle 2), `cdc_setup_probe.rs:253-265`.** An Agent
+  query that runs but returns no Agent row becomes `NotRunning` ("SQL
+  Server Agent is not running"). No row means not listed (Express, some
+  platforms), not stopped: make it `unchecked` with a message that says so;
+  keep `missing` for a row whose status is not `Running`.
+- **SHOULD-FIX 8, `cdc_setup_check.rs:335`.** The MySQL `GRANT` command
+  hard-codes the host `'%'`, so it can grant another account or fail on
+  MySQL 8. Read the account with the fixed statement `SELECT
+  CURRENT_USER()` and quote its user and host parts in the command.
+- **SHOULD-FIX 9, `routes/connectors.rs` (`change_capture_setup_checks`).**
+  The `?` on `selected_tables` runs before `record_test_outcome`, so a store
+  error turns a passed test into a 500 and is not recorded, against "checks
+  never change the outcome". Log the error (classified) and return no
+  checks.
+- **SHOULD-FIX 10, the gates (S4-h).** (a) `cdc_gate.py:889-890` "still 1
+  after more ticks" cannot fail under the 15-minute dedupe: remove it, and
+  instead assert the listed instance's text names the connector, the worst
+  table and the limit. (b) `g4_mysql_test.py` `missing_case`: S4-h asks for
+  a login without `REPLICATION CLIENT` only; grant it `REPLICATION SLAVE`
+  so the gate proves each grant is checked. (c) `cdc_gate.py:792`: assert
+  the gate source's list of setting names per driver, so a dropped check
+  fails the gate.
+
+NITs (fix if cheap, else note in the handoff):
+- `has_replication_grants` matches substrings of the whole line; parse only
+  the privilege list between `GRANT ` and ` ON `.
+- MySQL commands: `SET PERSIST` instead of `SET GLOBAL` (8.0+), so the fix
+  survives a restart.
+- SQL Server commands: prefix `sp_cdc_enable_db`/`sp_cdc_enable_table` with
+  `USE [db];` (`]` doubled); compare table names case-insensitively.
+- `cdc_setup_probe.rs`: log a classified `debug` line (no server text) when
+  a probe statement fails, so an operator can tell why a check is
+  `unchecked`.
+- The module doc's "tried again" (`capture_lag.rs:20-22`) does not hold when
+  both delivery and undo fail; say so, and add the rare out-of-order case
+  (a concurrent post closing an alert whose delivery then fails) and "Kafka
+  Connect unreachable counts as not running" to the feature page's "Limits".
+- `connector-detail-page.tsx:242`: with `?tab=capture`, the panel waits on
+  the ingest spec; render it without that request.
+
+Rules for the fixes: one commit per finding or a few related ones, each
+citing `Slice 4 review SHOULD-FIX n` at the fix site and in the body; push
+after the Rust group, after the Python/console group and after the gates;
+then a "Slice 4, round 1 fixes" handoff with the CI run on the final code
+commit.
