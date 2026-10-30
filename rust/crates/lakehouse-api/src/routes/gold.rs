@@ -309,7 +309,10 @@ pub(crate) fn gold_export_gate_actor<'a>(
 /// The gate's own errors: 422 with the fixed sentence of
 /// [`crate::routes::query::JOB_NEEDS_CATALOG_TENANT`] for a deployment
 /// with several tenants and no catalog tenant; 404 with the gate's table
-/// sentence for a person whose tenant does not own the shared catalog.
+/// sentence for a person whose tenant does not own the shared catalog; 503
+/// with the shared catalog's own sentence for a deployment that cannot say
+/// how many tenants it holds (`SEC-50` R5, amended: a job with no user in
+/// a deployment with no database to count in).
 async fn gated_source_table(
     state: &AppState,
     mart: &str,

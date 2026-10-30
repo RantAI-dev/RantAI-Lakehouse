@@ -376,21 +376,30 @@ async fn reach_for_actor(state: &AppState, actor: GateActor<'_>) -> Result<Tenan
 /// covers the shared catalog, and failing closed is the only honest
 /// answer (D6).
 ///
-/// `SEC-50` R5: a deployment that cannot COUNT its tenants refuses too.
-/// `None` means there is no database to count in, so the deployment
-/// cannot say that it holds a single tenant — and it cannot say that it
-/// holds several either. "Cannot verify it is safe" is the same answer as
+/// `SEC-50` R5 (amended, PR #281 review round 2 NIT): a deployment that
+/// cannot COUNT its tenants refuses too — and with `SEC-20`'s OWN sentence
+/// for that state,
+/// [`crate::routes::catalog::COULD_NOT_VERIFY_TENANT_COUNT`] ("could not
+/// verify tenant count"), not D6's. D6 names a setting to set, and that is
+/// the wrong instruction here: the setting may ALREADY be set (naming a
+/// catalog tenant in a deployment that cannot count its tenants is a claim
+/// nobody can check), and what is missing is the deployment's own answer,
+/// not the setting.
+///
+/// `None` means there is no database to count in, so the deployment cannot
+/// say that it holds a single tenant — and it cannot say that it holds
+/// several either. "Cannot verify it is safe" is the same answer as
 /// "verified unsafe", which is `SEC-20`'s own rule: the shared catalog's
 /// own gate refuses every principal without the unrestricted grant when
-/// there is no pool (`routes::catalog::catalog_tenant_refusal`). The
-/// setting does not change that: naming a catalog tenant in a deployment
-/// that cannot count its tenants is a claim nobody can check.
+/// there is no pool (`routes::catalog::catalog_tenant_refusal`).
 fn catalog_tenant_reach(
     tenant_count: Option<i64>,
     catalog_tenant_id: Option<Uuid>,
 ) -> Result<TenantReach, ApiError> {
     let Some(tenant_count) = tenant_count else {
-        return Err(ApiError::Unprocessable(JOB_NEEDS_CATALOG_TENANT.to_owned()));
+        return Err(ApiError::Unavailable(
+            crate::routes::catalog::COULD_NOT_VERIFY_TENANT_COUNT.to_owned(),
+        ));
     };
     if tenant_count <= 1 {
         return Ok(TenantReach::All);
@@ -5104,16 +5113,30 @@ mod sec50_gate_tests {
         );
     }
 
-    /// `SEC-50` R5: a deployment that cannot COUNT its tenants refuses
-    /// the job, even with the setting named. "Cannot verify it is safe"
-    /// is the same answer as "verified unsafe" — `SEC-20`'s own rule, the
-    /// one the shared catalog's own gate already follows with no pool.
+    /// `SEC-50` R5 (amended, PR #281 review round 2 NIT): a deployment
+    /// that cannot COUNT its tenants refuses the job, even with the setting
+    /// named. "Cannot verify it is safe" is the same answer as "verified
+    /// unsafe" — `SEC-20`'s own rule, the one the shared catalog's own gate
+    /// already follows with no pool.
+    ///
+    /// The sentence is `SEC-20`'s own for that state ("could not verify
+    /// tenant count", a 503), NOT D6's: D6 tells the operator to set a
+    /// setting that may already be set, and the thing that is missing here
+    /// is the deployment's own answer, not the setting.
     #[test]
     fn a_job_with_no_user_is_refused_in_a_deployment_that_cannot_count_its_tenants() {
         let err = catalog_tenant_reach(None, Some(CATALOG_TENANT))
             .expect_err("a deployment that cannot say how many tenants it holds");
-        assert_eq!(err.status(), 422);
-        assert_eq!(err.to_string(), JOB_NEEDS_CATALOG_TENANT);
+        assert_eq!(err.status(), 503);
+        assert_eq!(
+            err.to_string(),
+            crate::routes::catalog::COULD_NOT_VERIFY_TENANT_COUNT
+        );
+        assert_eq!(
+            err.to_string(),
+            "could not verify tenant count",
+            "the sentence names the count, not a setting to set"
+        );
     }
 
     #[tokio::test]
@@ -5192,14 +5215,21 @@ mod sec50_gate_tests {
         assert_eq!(err.to_string(), "tenant not found");
     }
 
+    /// `SEC-50` R5 (amended, PR #281 review round 2 NIT): a deployment
+    /// with no database at all cannot say who owns the shared catalog, so
+    /// the job-with-no-user actor is refused with `SEC-20`'s own sentence
+    /// for that state (a 503) — not D6's, which names a setting to set.
     #[tokio::test]
     async fn a_job_with_no_user_in_a_deployment_that_cannot_say_who_owns_the_catalog_is_refused() {
         let state = state_without_a_database();
         let err = reach_for_actor(&state, GateActor::CatalogTenant)
             .await
             .expect_err("a deployment that cannot say who owns the shared catalog");
-        assert_eq!(err.status(), 422);
-        assert_eq!(err.to_string(), JOB_NEEDS_CATALOG_TENANT);
+        assert_eq!(err.status(), 503);
+        assert_eq!(
+            err.to_string(),
+            crate::routes::catalog::COULD_NOT_VERIFY_TENANT_COUNT
+        );
     }
 
     /// The gate itself, over a real deployment: the upload table another
