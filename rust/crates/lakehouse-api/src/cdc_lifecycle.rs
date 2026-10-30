@@ -69,7 +69,7 @@ pub enum Provisioned {
 }
 
 /// The tables a change-capture connector's source objects name.
-fn table_names(source_objects: &serde_json::Value) -> Vec<String> {
+pub(crate) fn table_names(source_objects: &serde_json::Value) -> Vec<String> {
     source_objects
         .as_array()
         .into_iter()

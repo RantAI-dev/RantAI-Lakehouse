@@ -18,10 +18,23 @@ import { DEFAULT_SQL_PORT } from "./sql-dial-form"
  * `driver` works as in `SqlDialForm`: the type already names the database,
  * so the form starts there and only asks when a stored dial disagrees.
  */
+export const DEFAULT_CDC_SSL_MODE = "require"
+
+/** The TLS modes a person can choose (`SEC-14`: a stored credential is not dialled in plain text unless
+ * `disable` is chosen, and it is labelled as such). */
+const CDC_SSL_MODES: { value: string; label: string }[] = [
+  { value: "require", label: "Require (encrypted, certificate not checked)" },
+  { value: "verify-ca", label: "Verify CA" },
+  { value: "verify-full", label: "Verify CA and host name" },
+  { value: "disable", label: "Disable (not encrypted)" },
+]
+
 /** The dial as the driver wants it: only its own setting, PostgreSQL's two names
  * kept as typed (empty until typed), MySQL's server id only when a number was given. */
 export function shapeCdcDial(dial: CdcDial): CdcDial {
-  const { slotName, publicationName, serverId, ...common } = dial
+  const { slotName, publicationName, serverId, sslMode, ...rest } = dial
+  // The TLS mode is always sent, `require` unless a person chose another (`SRC-4 S3 review SHOULD-FIX 1`).
+  const common = { ...rest, sslMode: sslMode || DEFAULT_CDC_SSL_MODE }
   if (dial.driver === "postgres") {
     return { ...common, slotName: slotName ?? "", publicationName: publicationName ?? "" }
   }
@@ -47,6 +60,7 @@ export function CdcDialForm({
     port: DEFAULT_SQL_PORT[initialDriver],
     database: "",
     user: "",
+    sslMode: DEFAULT_CDC_SSL_MODE,
     ...(initialDriver === "postgres" ? { slotName: "", publicationName: "" } : {}),
   }
   const askDriver = !driver || dial.driver !== driver
@@ -111,6 +125,28 @@ export function CdcDialForm({
           placeholder="lakehouse_cdc"
           autoComplete="off"
         />
+      </div>
+      <div className="space-y-1.5 sm:col-span-2">
+        <Label htmlFor="cdc-dial-ssl-mode">TLS mode</Label>
+        <select
+          id="cdc-dial-ssl-mode"
+          className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
+          value={dial.sslMode || DEFAULT_CDC_SSL_MODE}
+          onChange={(e) => set("sslMode", e.target.value)}
+        >
+          {CDC_SSL_MODES.map((m) => (
+            <option key={m.value} value={m.value}>
+              {m.label}
+            </option>
+          ))}
+          {dial.sslMode && !CDC_SSL_MODES.some((m) => m.value === dial.sslMode) ? (
+            <option value={dial.sslMode}>{dial.sslMode}</option>
+          ) : null}
+        </select>
+        <p className="text-xs text-muted-foreground">
+          Verify modes use the Kafka Connect worker&apos;s own trust store.
+          {dial.driver === "mssql" ? " For SQL Server, Verify CA also checks the host name." : ""}
+        </p>
       </div>
       {dial.driver === "postgres" ? (
         <>

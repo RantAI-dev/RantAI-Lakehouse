@@ -48,12 +48,50 @@ Live change capture:
   read is lost.
 - **`date` and `timestamp` (without time zone) columns arrive as integers**
   (Debezium's temporal types) and their Bronze column is an integer.
-- **Oracle, SQL Server, MySQL and MongoDB capture are added by their own slices**;
-  until then their connector types are listed as not supported, as below.
-- **MySQL CDC and SQL Server CDC are listed as not supported** since
-  `SRC-9` decision 8 (migration `0066`): their settings could not run.
-  Oracle CDC is refused by the API. MongoDB CDC has no type; the MongoDB
-  test database is a single server, and change streams need a replica set.
+- **MySQL and SQL Server change capture run the same way** (`SRC-4` slice 3):
+  the same worker, the same applier, the same two load modes, and the types
+  "MySQL CDC" and "SQL Server CDC" are supported again (migration `0117`). Each
+  has its own gate in CI (`g4-mysql`, `g4-mssql`), which creates the connector
+  through the API and reads the result back. What each source needs, all proven
+  by the gates with a user that is not `root` or `sa`:
+  - **MySQL**: `log_bin` on, `binlog_format=ROW`, `binlog_row_image=FULL` (MySQL
+    8's defaults; the gate asserts them). The user needs `SELECT` on the
+    database, and the global `RELOAD`, `SHOW DATABASES`, `REPLICATION SLAVE` and
+    `REPLICATION CLIENT`. The connector needs a `serverId` (a number no other
+    replica of that server uses, 1 to 4294967295), which the console asks for and
+    never fills in.
+  - **SQL Server**: SQL Server Agent running; CDC enabled on the database
+    (`sys.sp_cdc_enable_db`) and on each table (`sys.sp_cdc_enable_table`) by an
+    administrator; a login that is not `sa` with `SELECT` on the tables and on the
+    `cdc` schema, and `VIEW DATABASE STATE`. Debezium also calls
+    `sys.sp_cdc_help_jobs` to read the capture job's polling interval; that
+    procedure needs `db_owner` (Microsoft's documentation), so with the grants
+    above Debezium logs a warning and goes on, and the gate passes
+    (`docs/superpowers/plans/2026-10-29-src-4-databases-cdc.md`, Slice 3 handoff).
+  - **A new column in SQL Server is not picked up by itself.** A capture instance
+    has the columns the table had when it was enabled. To add a column: add it to
+    the table; enable a second capture instance on the table
+    (`sys.sp_cdc_enable_table @capture_instance = '<schema>_<table>_v2', ...`);
+    change a row; once the column has reached Bronze, drop the old instance
+    (`sys.sp_cdc_disable_table @capture_instance = '<old name>'`). A table may
+    have two instances at a time. The gate runs the first three steps.
+  - **TLS to the source.** `require` encrypts and takes the certificate as
+    presented. `verify-ca` and `verify-full` use Kafka Connect's own trust store,
+    so the source's CA must be in the worker's image or mounted into it; the
+    gates run `require`, and the renderer's unit tests cover the other modes. For
+    SQL Server `verify-ca` is stricter than its name, never looser: the driver
+    cannot check the chain without the host name.
+  - **The schema-history topic is kept.** `MySQL` and `SQL Server` connectors keep
+    their table definitions in a Kafka topic, `cdc.<connector id>.schema-history`,
+    which needs the broker address (`CDC_KAFKA_BOOTSTRAP` on the API as well as
+    on the code location; unset, the connector answers "not supported on this
+    deployment"). Debezium creates it with retention `Long.MAX_VALUE` (measured in
+    CI), so the broker's 7-day retention does not apply to it and a connector can
+    restart after any time. It is never deleted with the connector (Kafka
+    Connect has no topic API); it is a few kilobytes.
+- **Oracle and MongoDB capture are added by their own slices.** Oracle CDC is
+  refused by the API. MongoDB CDC has no type; the MongoDB test database is a
+  single server, and change streams need a replica set.
 - **No lag in time is measured.** A job measures the PostgreSQL slot's
   retained bytes, for the deployment's own database only; `health.rs` says
   plainly that bytes cannot be turned into seconds honestly.
@@ -118,7 +156,42 @@ to the AI team in `AI-16`.
 
 ## Limits to tell a customer
 
-To be filled from the signed decisions and the measurements (decision 5).
+To be filled from the signed decisions and the measurements (decision 5). Slice 4 (lag,
+the lag alert, the setup checks) adds these; each is a statement the product makes, not a
+promise it keeps better than it says:
+
+- **What lag means.** Per table, the time since the later of two moments: the source commit
+  time of the last change applied to Bronze, and the last moment the table was known to be up
+  to date. Taking the later of the two keeps a table that was quiet for a day, then got one
+  change, from reading a day behind. The number is never larger than the true lag. A table is
+  "up to date" only when nothing waits on its topic **and** Kafka Connect says the connector
+  runs: an empty topic proves nothing while Kafka Connect is stopped. Just after Kafka Connect
+  starts again, a table can read "up to date" for a moment before its first events reach the
+  topic.
+- **If the orchestrator is down, no alert is sent.** The lag comes from two reports of the
+  orchestrator (the backlog every 30 seconds, the last applied change after each batch). When
+  they stop, the connector page shows "Not known since <time>" after two minutes, and no
+  `connector_lag` alert can fire, because nothing evaluates. Watch the orchestrator itself.
+- **The alert is sent once when the lag passes the limit and once when it is back under.** The
+  Alerts list keeps one row per rule within 15 minutes, so the second alert is delivered but
+  may not appear as a second row if both happen within 15 minutes. A connector a person paused
+  is not evaluated and shows "Paused", not a number.
+- **A pause is not lag.** After a resume the lag counts from the resume; changes made during the
+  pause show as backlog until they are applied. A source change time in the future is stored as
+  now. Kafka Connect not answering counts as "not running": a table is then never "up to date".
+- **Rare ordering.** If delivering an alert fails and the flag cannot be put back, that alert is
+  lost; a concurrent post that closes an alert whose delivery then fails can leave the two out of
+  order. Both need two faults at once.
+- **Setup checks never block saving.** They are read after a connection test passes, with
+  fixed statements; a setting the login cannot read is "Not checked", never a pass. MySQL's
+  binlog retention must be at least **7 days** (or never expire), the broker's own retention:
+  the window in which a stopped connector can still catch up (the number is the planner's). The check also reads the legacy `expire_logs_days`: logs never
+  expire only when it and `binlog_expire_logs_seconds` are both 0.
+  SQL Server Agent can only be read with `VIEW SERVER STATE`, which the documented login does
+  not have, so that check always reads "Not checked" with that reason; the login is not
+  widened. A SQL Server table the login cannot see is reported as missing CDC.
+- **Not in this slice.** MongoDB's setup check comes with MongoDB (slice 5); Oracle's with its
+  change capture (slice 6).
 
 ### MongoDB change capture (slice 5)
 

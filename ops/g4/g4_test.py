@@ -73,9 +73,21 @@ class PgSource(cdc_gate.Source):
     host_for_registry = "postgres:5432"
     now = "now()"
     needs_schema_history = False
+    # AC7: this gate also stops `kafka-connect` and watches the lag alert (`cdc_gate`).
+    lag_alert_gate = True
+    expected_settings = ("wal_level", "replication role", "publication", "publication tables")
 
     def __init__(self) -> None:
         self.password = os.environ["PGPASSWORD"]
+
+    def missing_case(self) -> cdc_gate.MissingCase:
+        """AC3: a connector that names a publication that does not exist. It selects no table, so
+        nothing is started in Kafka Connect for it, and no slot is created."""
+        dial = {**self.dial(), "slotName": "g4_slot_missing", "publicationName": "g4_pub_missing"}
+        return cdc_gate.MissingCase(
+            dial=dial, source_objects=[], password=self.password,
+            setting="publication", message="The publication named in the connector does not exist.",
+        )
 
     def ping(self) -> None:
         pg_exec("SELECT 1;")

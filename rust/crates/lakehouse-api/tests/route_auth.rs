@@ -1059,6 +1059,51 @@ async fn run_history_log_and_resume_need_connector_manage_and_run_reports_need_i
     }
 }
 
+/// `SRC-4` slice 4: the lag limit is a person's (`connector:manage`); the capture
+/// observations are the orchestrator's (`ingest:read`, then the handler's
+/// service-identity check). Both ways: a `connector:manage`-only principal passes
+/// the gate of the limit route and is refused by the gate on the observations; an
+/// `ingest:read`-only principal is refused by the gate on the limit route and, on
+/// the observations, passes the gate and is refused by the handler (a user, not
+/// the service identity). The table-driven loops above cover the zero-permission
+/// and Platform-Admin directions for both entries.
+#[tokio::test]
+async fn the_lag_limit_needs_connector_manage_and_capture_observations_need_ingest_read() {
+    let TestApp { router, pool } = spin_up().await;
+    let manage = create_principal_with_permissions(&pool, "connector:manage").await;
+    let ingest = create_principal_with_permissions(&pool, "ingest:read").await;
+    let base = "/api/connectors/conn-pg-lakehouse";
+    let limit = ("PUT", format!("{base}/lag-limit"));
+    let observations = ("POST", format!("{base}/capture/observations"));
+
+    let cookie = session_cookie_for_user(&pool, manage).await;
+    let resp = request_with_cookie(&router, limit.0, &limit.1, &cookie).await;
+    assert_ne!(resp.status(), StatusCode::FORBIDDEN, "{}", limit.1);
+    assert_ne!(resp.status(), StatusCode::UNAUTHORIZED, "{}", limit.1);
+    let cookie = session_cookie_for_user(&pool, ingest).await;
+    let resp = request_with_cookie(&router, limit.0, &limit.1, &cookie).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{}", limit.1);
+
+    let cookie = session_cookie_for_user(&pool, manage).await;
+    let resp = request_with_cookie(&router, observations.0, &observations.1, &cookie).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let text = String::from_utf8_lossy(&to_bytes(resp.into_body(), usize::MAX).await.unwrap())
+        .into_owned();
+    assert!(
+        text.contains("ingest:read"),
+        "the gate names the permission: {text}"
+    );
+    let cookie = session_cookie_for_user(&pool, ingest).await;
+    let resp = request_with_cookie(&router, observations.0, &observations.1, &cookie).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let text = String::from_utf8_lossy(&to_bytes(resp.into_body(), usize::MAX).await.unwrap())
+        .into_owned();
+    assert!(
+        text.contains("service identity"),
+        "passed the gate, refused by the handler: {text}"
+    );
+}
+
 /// `SRC-13` (decision D11): the discovery routes are a person's
 /// (`connector:manage`), both ways, and the orchestrator's answer route is the
 /// service identity's (`ingest:read`, then the handler's check). A

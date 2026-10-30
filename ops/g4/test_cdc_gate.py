@@ -51,5 +51,45 @@ class RetentionTests(unittest.TestCase):
         self.assertFalse(cdc_gate.retention_is_unlimited("not a number"))
 
 
+class _AgentSource(cdc_gate.Source):
+    cdc_type = "SQL Server CDC"
+    gate = "g4-mssql"
+
+    def unchecked_is_expected(self, check: dict) -> bool:
+        return check["setting"] == "SQL Server Agent"
+
+
+class SetupCheckTests(unittest.TestCase):
+    def setUp(self) -> None:
+        cdc_gate.SOURCE = _AgentSource()
+
+    def tearDown(self) -> None:
+        cdc_gate.SOURCE = None
+
+    @staticmethod
+    def check(setting: str, status: str) -> dict:
+        return {"setting": setting, "status": status, "message": "m"}
+
+    def test_every_check_ok_or_the_expected_unchecked_one_passes(self) -> None:
+        cdc_gate._expect_rest_ok([self.check("a", "ok"), self.check("SQL Server Agent", "unchecked")], None)
+
+    def test_an_unchecked_check_the_login_could_read_is_a_failure(self) -> None:
+        with self.assertRaises(cdc_gate.G4Failure):
+            cdc_gate._expect_rest_ok([self.check("a", "unchecked")], None)
+
+    def test_a_missing_check_is_a_failure_unless_it_is_the_one_expected(self) -> None:
+        checks = [self.check("a", "ok"), self.check("b", "missing")]
+        with self.assertRaises(cdc_gate.G4Failure):
+            cdc_gate._expect_rest_ok(checks, None)
+        cdc_gate._expect_rest_ok(checks, "b")
+
+    def test_the_lag_line_names_each_table_and_its_seconds_only_when_behind(self) -> None:
+        capture = {"lag": {"tables": [
+            {"table": "g4_cdc.orders", "status": "behind", "seconds": 90},
+            {"table": "g4_cdc.orders_history", "status": "up_to_date"},
+        ]}}
+        self.assertEqual(cdc_gate._lag_words(capture), "g4_cdc.orders behind 90s, g4_cdc.orders_history up_to_date")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -11,6 +11,7 @@ import type {
   CreateConnectorInput,
   CreateConnectorResponse,
   ChangeCaptureState,
+  LagLimitResponse,
   DiscoveryAnswer,
   IngestibleConnector,
   IngestRunResult,
@@ -197,6 +198,13 @@ export const postgresConnectorService: ConnectorService = {
     return getJson<ChangeCaptureState>(
       `/api/connectors/${encodeURIComponent(connectorId)}/change-capture`,
       { signal }
+    );
+  },
+  setLagLimit(connectorId, minutes, signal) {
+    return putJson<LagLimitResponse>(
+      `/api/connectors/${encodeURIComponent(connectorId)}/lag-limit`,
+      { minutes },
+      signal
     );
   },
   listProbeHistory(id, limit, signal) {

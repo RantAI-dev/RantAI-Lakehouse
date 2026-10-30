@@ -617,3 +617,160 @@ def test_the_backlog_counts_from_the_committed_offset_and_a_missing_topic_is_zer
     config = CdcConfig("kafka:9092")
     assert cdc_apply.unconsumed(config, "g", ["present", "absent"], consumer=_Lag()) == 15
     assert cdc_apply.unconsumed(config, "g", ["absent"], consumer=_Lag()) == 0
+
+
+# ── lag: what the orchestrator tells the API (SRC-4 slice 4) ─────────────────────────────
+
+
+def test_the_newest_source_time_of_a_batch_is_the_largest_one_and_a_batch_without_one_has_none() -> None:
+    assert cdc_apply.last_source_ts_ms([{"_source_ts_ms": 5}, {"_source_ts_ms": 9}, {"_source_ts_ms": 7}]) == 9
+    assert cdc_apply.last_source_ts_ms([{"_source_ts_ms": None}, {"id": 1}, {"_source_ts_ms": True}]) is None
+    assert cdc_apply.last_source_ts_ms([]) is None
+
+
+def test_the_applier_reports_the_newest_source_time_only_after_the_offsets_are_committed() -> None:
+    log: list[str] = []
+    seen: list[int] = []
+
+    def commit(offsets):
+        log.append("commit")
+
+    def applied(ts_ms):
+        log.append("applied")
+        seen.append(ts_ms)
+
+    apply_table(
+        _FakeConsumer([[(10, _event("c", 1)), (11, _event("c", 5))]]), _target(), _FakeBronze(dict(KNOWN), log),
+        lambda columns, phase: _decision(), commit_offsets=commit, deadline=FOREVER, poll_ms=0, on_applied=applied,
+    )
+    assert log == ["write 2", "commit", "applied"]
+    assert seen == [1_005]  # `__source_ts_ms` is 1_000 + id
+
+
+def test_a_batch_of_tombstones_reports_no_source_time() -> None:
+    seen: list[int] = []
+    apply_table(
+        _FakeConsumer([[(4, None)]]), _target(), _FakeBronze(dict(KNOWN)), lambda columns, phase: _decision(),
+        commit_offsets=lambda offsets: None, deadline=FOREVER, poll_ms=0, on_applied=seen.append,
+    )
+    assert seen == []
+
+
+def test_the_run_posts_each_tables_last_applied_change_to_the_capture_route(run_env, monkeypatch) -> None:
+    posts: list[tuple[str, list[dict]]] = []
+    monkeypatch.setattr(cdc_apply, "post_capture_observations", lambda cfg, cid, tables: posts.append((cid, tables)) or True)
+
+    def fake_apply(consumer, target, bronze, observe, **kwargs):
+        kwargs["on_applied"](1_234)
+        return cdc_apply.TableResult(cdc_apply.CAUGHT_UP, 1)
+
+    monkeypatch.setattr(cdc_apply, "apply_table", fake_apply)
+    cdc_apply.run_connector(_context(), _connector(_object()), _Reporter(), config=CdcConfig("kafka:9092"))
+    assert posts == [("conn-a", [{"table": "public.orders", "lastSourceTsMs": 1_234}])]
+
+
+def _observer_cfg() -> schema_observer.ObserverConfig:
+    return schema_observer.ObserverConfig(api_url="http://api", service_token="t")
+
+
+def test_a_post_that_cannot_be_sent_is_logged_and_never_raises(monkeypatch) -> None:
+    tables = [{"table": "public.orders", "backlog": 3}]
+
+    def unreachable(*args, **kwargs):
+        raise schema_observer.ObservationUnreachable("the API could not be reached (ConnectionError)")
+
+    monkeypatch.setattr(schema_observer, "_post_json", unreachable)
+    assert cdc_apply.post_capture_observations(_observer_cfg(), "conn-a", tables) is False
+
+    def refused(*args, **kwargs):
+        raise schema_observer.ObservationRefused("the API refused the capture observation (HTTP 422)")
+
+    monkeypatch.setattr(schema_observer, "_post_json", refused)
+    assert cdc_apply.post_capture_observations(_observer_cfg(), "conn-a", tables) is False
+
+    def odd(*args, **kwargs):
+        raise RuntimeError("anything else")
+
+    monkeypatch.setattr(schema_observer, "_post_json", odd)
+    assert cdc_apply.post_capture_observations(_observer_cfg(), "conn-a", tables) is False
+
+
+def test_a_post_goes_to_the_capture_route_and_an_empty_one_is_not_sent(monkeypatch) -> None:
+    sent: list[tuple[str, dict]] = []
+    monkeypatch.setattr(schema_observer, "_post_json", lambda cfg, path, payload, what: sent.append((path, payload)))
+    assert cdc_apply.post_capture_observations(_observer_cfg(), "conn-a", []) is True
+    assert sent == []
+    assert cdc_apply.post_capture_observations(_observer_cfg(), "conn-a", [{"table": "t", "backlog": 0}]) is True
+    assert sent == [("/api/connectors/conn-a/capture/observations", {"tables": [{"table": "t", "backlog": 0}]})]
+
+
+def test_every_connector_is_measured_and_reported_paused_ones_too_and_an_unmeasured_table_is_left_out(monkeypatch) -> None:
+    connectors = [
+        {**_connector(_object("public.orders"), _object("public.items")), "id": "conn-a"},
+        {**_connector(_object("public.orders"), paused=True), "id": "conn-b"},
+        {**_connector(_object("dbo.orders")), "id": "conn-c", "dial": {"driver": "mssql"}},
+    ]
+    asked: list[tuple[str, dict[str, str]]] = []
+
+    def measure(config, group_id, topics, absent=None):
+        asked.append((group_id, dict(topics)))
+        return {name: (None if name == "public.items" else 7) for name in topics}
+
+    measured = cdc_apply.measure_backlogs(CdcConfig("kafka:9092"), connectors, measure=measure)
+    assert [group for group, _ in asked] == ["lakehouse-cdc-conn-a", "lakehouse-cdc-conn-b"]
+    assert asked[0][1] == {
+        "public.orders": "cdc.conn-a.public.orders",
+        "public.items": "cdc.conn-a.public.items",
+    }
+    assert measured["conn-c"] is None, "a SQL Server dial with no database cannot name its topics"
+
+    posts: list[tuple[str, list[dict]]] = []
+    monkeypatch.setattr(cdc_apply, "post_capture_observations", lambda cfg, cid, tables: posts.append((cid, tables)) or True)
+    cdc_apply.report_backlogs(_observer_cfg(), measured)
+    assert posts == [
+        ("conn-a", [{"table": "public.orders", "backlog": 7}]),
+        ("conn-b", [{"table": "public.orders", "backlog": 7}]),
+        ("conn-c", []),
+    ]
+
+
+def test_the_sensors_backlog_is_the_sum_of_its_tables_and_unknown_when_any_is_unmeasured() -> None:
+    assert cdc_apply._total_of({"a": 2, "b": 3}) == 5
+    assert cdc_apply._total_of({"a": 2, "b": None}) is None
+    assert cdc_apply._total_of({}) == 0
+    assert cdc_apply._total_of(None) is None
+
+
+def test_the_backlog_of_each_table_is_measured_apart(monkeypatch) -> None:
+    class _Lag:
+        def partitions_for_topic(self, topic):
+            return {0} if topic != "absent" else None
+
+        def committed(self, tp):
+            return 10
+
+        def beginning_offsets(self, tps):
+            return {tp: 0 for tp in tps}
+
+        def end_offsets(self, tps):
+            return {tp: 25 for tp in tps}
+
+    config = CdcConfig("kafka:9092")
+    got = cdc_apply.backlog_by_table(config, "g", {"t1": "one", "t2": "absent"}, consumer=_Lag())
+    assert got == {"t1": 15, "t2": None}, "a missing topic is unmeasured for the lag post (SHOULD-FIX 4)"
+    assert cdc_apply.backlog_by_table(config, "g", {"t2": "absent"}, consumer=_Lag(), absent=0) == {"t2": 0}
+
+
+def test_a_table_without_a_topic_yet_is_left_out_of_the_post_but_does_not_hold_back_the_run() -> None:
+    """Slice 4 review SHOULD-FIX 4."""
+    connectors = [{**_connector(_object("public.orders"), _object("public.items")), "id": "conn-a"}]
+
+    def measure(config, group_id, topics, absent=None):
+        return {"public.orders": 4, "public.items": absent}
+
+    config = CdcConfig("kafka:9092")
+    posted = cdc_apply.measure_backlogs(config, connectors, measure=measure)
+    assert posted == {"conn-a": {"public.orders": 4, "public.items": None}}
+    decided = cdc_apply.run_backlogs(config, connectors, posted, measure=measure)
+    assert cdc_apply._total_of(decided["conn-a"]) == 4
+    assert cdc_apply._total_of(posted["conn-a"]) is None

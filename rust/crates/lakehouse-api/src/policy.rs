@@ -826,6 +826,13 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // connector's state in Kafka Connect; same permission and tenant gate.
     ("POST", "/api/connectors/{id}/pause", Policy::RequiresPermission("connector:manage")),
     ("GET",  "/api/connectors/{id}/change-capture", Policy::RequiresPermission("connector:manage")),
+    // `SRC-4` slice 4: a person sets the lag a change-capture connector may have
+    // before it alerts; the orchestrator posts each table's backlog and last
+    // applied change. `ingest:read` is the one permission its service identity
+    // holds and a user can hold it too (Data Engineer), so the handler adds
+    // `schema_changes::require_orchestrator`, as the run reports do.
+    ("PUT",  "/api/connectors/{id}/lag-limit", Policy::RequiresPermission("connector:manage")),
+    ("POST", "/api/connectors/{id}/capture/observations", Policy::RequiresPermission("ingest:read")),
     // `SRC-11`: the orchestrator reports a run's start, each attempt, a line of
     // the closed log list, and the run's end. `ingest:read`, the one
     // permission its service identity holds; a user can hold it too (Data

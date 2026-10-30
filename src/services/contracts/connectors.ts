@@ -176,6 +176,23 @@ export type ConnectorTestResult = {
    * probe history, as `runConnectionTest` does. Absent otherwise.
    */
   pending?: boolean
+  /**
+   * For a change-capture connector (`SRC-4` decision S4-f): what the source must have switched on. Absent for every
+   * other connector. Never part of `ok`: a connector can be saved whatever these say.
+   */
+  setupChecks?: SetupCheck[]
+}
+
+/**
+ * One setting a change-capture source needs, as `POST /api/connectors/{id}/test` reports it (`SRC-4` S4-f). Every
+ * word is the API's fixed text, never the server's. `unchecked` means it could not be read (usually a permission):
+ * nothing is claimed about it. `command` is the statement or line that sets a `missing` one.
+ */
+export type SetupCheck = {
+  setting: string
+  status: "ok" | "missing" | "unchecked" | string
+  message: string
+  command?: string
 }
 
 /**
@@ -503,6 +520,12 @@ export type CdcDial = {
   slotName?: string
   publicationName?: string
   serverId?: number | null
+  /** How the change-capture worker secures its connection to the source
+   * (`SRC-4` S2-d). Absent means `require`: encrypted, certificate taken as
+   * presented. `disable` is not encrypted. `verify-ca` and `verify-full` use the
+   * worker's own trust store. Widened with `string` as the other contract
+   * enums are. */
+  sslMode?: "disable" | "require" | "verify-ca" | "verify-full" | string
 }
 
 /** The `dial` of a MongoDB change-capture connector (`ingest_spec.rs`'s `CdcMongoDial`, `SRC-4`
@@ -1063,7 +1086,33 @@ export type ChangeCaptureState = {
   supported: boolean
   reason?: string
   state?: "running" | "paused" | "failed" | "starting" | "not_created" | "unreachable" | string
+  /** How far behind the source each table is, the limit and whether its alert is open (`SRC-4` slice 4). */
+  lag?: ChangeCaptureLag
 }
+
+/**
+ * One table's lag, as the API words it (`SRC-4` decision S4-c). `behind` carries `seconds`; `not_known_since` carries
+ * `since` (the time of the newest report); the others carry neither. A number is never invented: `not_known_yet`
+ * means nothing was reported, `not_known_since` that the orchestrator stopped reporting.
+ */
+export type CaptureTableLag = {
+  table: string
+  status: "up_to_date" | "behind" | "not_known_yet" | "not_known_since" | "paused" | string
+  seconds?: number
+  since?: string
+}
+
+/** Mirrors Rust `LagReadout` (`rust/crates/lakehouse-api/src/routes/capture_lag.rs`). */
+export type ChangeCaptureLag = {
+  tables: CaptureTableLag[]
+  /** The table furthest behind; absent when none is behind by a number. */
+  worst?: { table: string; seconds: number }
+  limitMinutes: number
+  alertOpen: boolean
+}
+
+/** `PUT /api/connectors/{id}/lag-limit` (`SRC-4` S4-d). */
+export type LagLimitResponse = { minutes: number }
 
 /**
  * One connector `dagster/dispar_orchestrate/ingest_factory.py` can build
@@ -1126,6 +1175,8 @@ export interface ConnectorService {
   pauseConnector(connectorId: string, signal?: AbortSignal): Promise<PauseConnectorResponse>
   /** `GET /api/connectors/{id}/change-capture` (`SRC-4`): the connector's state in the capture service. */
   getChangeCapture(connectorId: string, signal?: AbortSignal): Promise<ChangeCaptureState>
+  /** `PUT /api/connectors/{id}/lag-limit` (`SRC-4`): the lag, in minutes (1 to 1440), at which an alert is sent. */
+  setLagLimit(connectorId: string, minutes: number, signal?: AbortSignal): Promise<LagLimitResponse>
   /**
    * `GET /api/connectors/{id}/probe-history?limit=` — the connector's most
    * recent connectivity-probe results, newest first. `limit` defaults to

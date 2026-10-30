@@ -63,6 +63,9 @@ class MsSqlSource(cdc_gate.Source):
     host_for_registry = f"{HOST}:{PORT}"
     now = "SYSDATETIME()"
     needs_schema_history = True
+    expected_settings = (
+        "CDC on the database", "CDC on table dbo.orders", "CDC on table dbo.orders_history", "SQL Server Agent",
+    )
 
     def __init__(self) -> None:
         # The connector login's password: a throwaway of this gate's stack that meets SQL Server's
@@ -165,6 +168,28 @@ class MsSqlSource(cdc_gate.Source):
                 f"GRANT SELECT ON SCHEMA::cdc TO {CDC_USER}",
                 f"GRANT VIEW DATABASE STATE TO {CDC_USER}",
             ]
+        )
+
+    def unchecked_is_expected(self, check: dict) -> bool:
+        # Reading the Agent needs VIEW SERVER STATE, which the documented login does not have: the
+        # check says so (`unchecked`) and is never a pass.
+        return check["setting"] == "SQL Server Agent"
+
+    def missing_case(self) -> cdc_gate.MissingCase:
+        """AC3: a third table, readable by the login, that CDC is not enabled on, and selected."""
+        self._run(
+            [
+                f"CREATE TABLE {SCHEMA}.orders_plain (id BIGINT PRIMARY KEY, customer NVARCHAR(100), "
+                "amount DECIMAL(12,2), status NVARCHAR(50), updated_at DATETIME2(6))",
+                f"GRANT SELECT ON {SCHEMA}.orders_plain TO {CDC_USER}",
+            ]
+        )
+        objects = [
+            {"name": f"{SCHEMA}.orders_plain", "target": "g4_orders_plain", "loadMode": "incremental_dedup", "primaryKey": ["id"]}
+        ]
+        return cdc_gate.MissingCase(
+            dial=self.dial(), source_objects=objects, password=self.password,
+            setting=f"CDC on table {SCHEMA}.orders_plain", message="Change data capture must be enabled on the table.",
         )
 
     def add_column_and_observe(self) -> None:

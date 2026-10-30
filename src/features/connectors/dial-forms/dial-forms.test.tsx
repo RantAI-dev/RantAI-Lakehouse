@@ -63,6 +63,33 @@ describe("dial forms", () => {
     fireEvent.change(screen.getByLabelText("Server id"), { target: { value: "5400" } })
     expect(onChange.mock.calls[1][0]).toMatchObject({ serverId: 5400 })
   })
+  it("CdcDialForm sends the TLS mode as require by default, for every driver (SRC-4 S3 review SHOULD-FIX 1)", () => {
+    for (const driver of ["postgres", "mysql", "mssql"] as const) {
+      const onChange = mock()
+      const { unmount } = render(<CdcDialForm value={null} onChange={onChange} driver={driver} />)
+      expect((screen.getByLabelText("TLS mode") as HTMLSelectElement).value).toBe("require")
+      fireEvent.change(screen.getByLabelText("Host"), { target: { value: "h" } })
+      expect(onChange.mock.calls[0][0]).toMatchObject({ sslMode: "require" })
+      unmount()
+    }
+  })
+  it("CdcDialForm keeps a chosen TLS mode on edit and labels disable as not encrypted", () => {
+    const onChange = mock()
+    render(
+      <CdcDialForm
+        value={{ driver: "mssql", host: "h", port: 1433, database: "d", user: "u", sslMode: "verify-full" }}
+        onChange={onChange}
+        driver="mssql"
+      />
+    )
+    expect((screen.getByLabelText("TLS mode") as HTMLSelectElement).value).toBe("verify-full")
+    expect(screen.getByRole("option", { name: "Disable (not encrypted)" })).toBeDefined()
+    expect(screen.getByText(/Verify CA also checks the host name/)).toBeDefined()
+    fireEvent.change(screen.getByLabelText("Host"), { target: { value: "h2" } })
+    expect(onChange.mock.calls[0][0]).toMatchObject({ host: "h2", sslMode: "verify-full" })
+    fireEvent.change(screen.getByLabelText("TLS mode"), { target: { value: "disable" } })
+    expect(onChange.mock.calls[1][0]).toMatchObject({ sslMode: "disable" })
+  })
   it("CdcDialForm shows nothing of the three for SQL Server", () => {
     const onChange = mock()
     render(<CdcDialForm value={null} onChange={onChange} driver="mssql" />)

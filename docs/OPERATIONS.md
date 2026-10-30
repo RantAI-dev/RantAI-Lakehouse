@@ -293,6 +293,8 @@ them with `--profile cdc` and set in `.env`:
 - `CDC_KAFKA_BOOTSTRAP=kafka:9092` (the Dagster applier reads the topics and
   writes Bronze).
 
+`MySQL` and `SQL Server` connectors also keep a schema-history topic on the
+broker, so the API needs `CDC_KAFKA_BOOTSTRAP` too (compose passes it to both).
 Both unset means change capture is off: a change-capture connector answers
 `supported: false` and nothing is started. The source password never appears in
 a connector's JSON: `lakehouse-api` writes it to `/run/cdc-secrets/<connector id>`
@@ -321,6 +323,18 @@ The connector takes one host, which must be a member of the replica set that cha
 connection string is built from it and the replica set name, always with `directConnection=true`, and holds no
 password. The worker needs the source's CA in its trust store for `verify-ca`, `verify-full` and also `require`.
 The connection test and the collection list run in the orchestrator (`dagster-code-location` must reach the host).
+
+**Lag and its alert (`SRC-4` slice 4).** The Dagster sensor `cdc_apply_sensor` posts every
+change-capture connector's per-table backlog to the API every 30 seconds (paused and failed
+connectors too), and the applier posts the source time of the last change it applied after each
+batch (`POST /api/connectors/{id}/capture/observations`, the `INGEST_SERVICE_TOKEN` identity). The
+API turns those into the lag the connector's Change capture tab shows and sends the
+`connector_lag` alert (limit per connector, 1 to 1440 minutes, default 15, set with `PUT
+/api/connectors/{id}/lag-limit` or on the tab). Add an alert rule of kind `connector_lag` (Alerts)
+or nobody is told. **Failure mode:** with the orchestrator down nothing posts, so no lag alert
+fires and the tab reads "Not known since <time>" after two minutes; monitor the code location
+itself. A connector a person paused is not evaluated: an alert already open stays open until the
+connector is resumed and its lag is evaluated again.
 
 **DNS gotcha found during verification:** on a host whose own
 `/etc/resolv.conf` carries a DNS search domain (VPN/corporate DNS,
