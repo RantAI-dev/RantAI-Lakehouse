@@ -230,7 +230,7 @@ def step_ids_are_the_object_id_text() -> None:
 def _register(tenant_id: str, *, suffix: str = "", replica_set: str | None = None, tolerate_refusal: bool = False) -> str:
     """Register the connector the way the console does. `replica_set` and `tolerate_refusal` are for the
     setup-check step's second connector: a wrong replica set name makes Kafka Connect refuse the config
-    (the API saves the settings first and answers 422 "did not start"), which is the case under test."""
+    (the API saves the settings first and answers 422, or 503 when the worker's validation outlasts the API's 10 s, "did not start"), which is the case under test."""
     dial = {**src().dial(), **({"replicaSet": replica_set} if replica_set is not None else {})}
     created = g.API.post(
         f"{g.API_URL}/api/connectors",
@@ -260,7 +260,7 @@ def _register(tenant_id: str, *, suffix: str = "", replica_set: str | None = Non
         },
         timeout=60,
     )
-    refused_on_purpose = tolerate_refusal and spec.status_code == 422 and "did not start" in spec.text
+    refused_on_purpose = tolerate_refusal and spec.status_code in (422, 503) and "did not start" in spec.text
     if not spec.ok and not refused_on_purpose:
         raise G4Failure(f"set the connector's ingest-spec failed: {spec.status_code} {spec.text[:300]}{_explain_refusal()}")
     return connector_id
