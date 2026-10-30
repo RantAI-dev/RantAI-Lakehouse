@@ -925,3 +925,14 @@ Findings:
   one-line hint that for SQL Server `verify-ca` checks the host too, S3-b),
   the review step showing it, and `dial-forms.test.tsx` cases (default sent as
   `require`, a chosen mode kept on edit). Console only; no Rust change.
+
+### Slice 3, review round 2 (planner, 2026-10-30, code `e08c6644`): closed
+
+SHOULD-FIX 1: `CdcDial.sslMode` is in the TypeScript contract; the dial form
+has a "TLS mode" select for all three drivers, `require` by default and always
+sent, `disable` labelled "not encrypted", the SQL Server hint on `verify-ca`,
+an unlisted stored value kept; the review step shows it; two tests cover the
+default and a mode kept on edit. Checked by the planner: CI on `e08c6644`
+success (the three change-capture gates among the jobs), Security success.
+No open `BLOCKER`. Slice 3 is closed; slice 5 (branch `feat/src-4-slice-5`,
+session lakehouse-35) may merge into this branch now, hunk by hunk.
