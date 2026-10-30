@@ -89,4 +89,90 @@ one folder at a time and total the counts. Say so in the handoff.
 
 ## 6. Handoff (developer appends below)
 
+### Handoff (developer, 2026-10-30)
+
+Branch `fix/gov-5-pending-audit` (base `main` at `4ce58470`, the plan commit
+`81ea5ca0` on top). Read-side only, as decided.
+
+**Commits**
+
+- `e271f8bf` — fix(governance): a gate still waiting reads Pending in the audit trail (GOV-5 T1).
+  `outcome_of` maps `needs_confirmation`/`needs_approval` to `"pending"`; the two-line
+  policy-decision mapping became the pure function `policy_decision_of`, which returns
+  `"pending"` for a pending row, `"allow"` for a success row and `"deny"` for everything
+  else. The old test is renamed to `outcome_of_reports_a_gate_still_waiting_as_pending`
+  and asserts all eight `audit_event.outcome` values; `policy_decision_of_reports_pending_for_a_gate_still_waiting`
+  is new. Nothing was written into `audit_event`; `refused`/`rejected` stay `denied`,
+  `failed` stays `error`.
+- `91ed2ebd` — feat(console): the audit trail shows a Pending badge for a decision still waiting (GOV-5 T2).
+  `AuditOutcome` in `src/lib/status.ts` gains `"pending"` with the label `Pending`;
+  `OUTCOME_TONE.pending = "info"`; `status-badge.test.tsx` gains a case asserting the
+  label and the `info` tone (and that `Denied` keeps the warning tone).
+- A last commit adds this handoff to the plan file and nothing else; its hash is the
+  branch head.
+
+**T3 (docs): nothing to change, so no commit.** No feature page and no `docs/core/PRODUCT.md`
+describes the audit outcome vocabulary. Checked with `grep -rn "Denied" docs/ --include='*.md'`
+(the only hits are the `GOV-5` row in `BACKLOG.md`, which the developer does not touch, and
+an unrelated line in `docs/archive/`), `grep -rni "denied\|audit outcome" docs/core/`
+(`calculated-fields.md` talks about a denied *column*, unrelated),
+`grep -rn "Outcome" docs/core/` (only a table header in `BACKLOG.md`) and
+`docs/core/reference/user-guide.md` (describes the Audit Log page, not its outcomes).
+`docs/core/features/` has no page for the Audit page.
+
+**Commands run, with counts**
+
+Per task, scoped to what the commit touched:
+
+- T1: `cargo fmt --check` — clean. `cargo clippy -j 2 -p lakehouse-api --all-targets -- -D warnings`
+  — clean (Finished in 6m 17s). `cargo test -j 2 -p lakehouse-api governance` — the lib
+  target 80 passed / 0 failed and the bin target 83 passed / 0 failed; both new tests ran
+  and passed (`outcome_of_reports_a_gate_still_waiting_as_pending`,
+  `policy_decision_of_reports_pending_for_a_gate_still_waiting`).
+- T2: `bun test src/components/patterns/status-badge.test.tsx src/features/governance` —
+  39 pass, 0 fail, 83 `expect()` calls, 9 files. `bun run typecheck` — clean.
+  `bun run lint` — 0 errors, 11 warnings, all pre-existing and none in a touched file.
+
+Final block on the last code commit (`91ed2ebd`), in the foreground. The
+branch head adds only this plan file, so the Rust and TypeScript results
+stand for the head as well:
+
+- `cargo fmt --check` — clean.
+- `cargo clippy -j 2 --workspace --all-targets --all-features -- -D warnings` — clean
+  (Finished in 5m 48s).
+- `cargo test -j 2 --workspace` — **159 binaries, 8551 passed, 0 failed, 51 ignored**
+  (log: `/tmp/gov5-test.log`).
+- `bun run typecheck` — clean. `bun run lint` — 0 errors, 11 warnings (pre-existing, none
+  in a touched file).
+- The bun suite one folder at a time, under `flock /home/shiro/rantai/.heavy.lock`:
+  **25 folders, every run exited 0**, log `/tmp/gov5-bun.log`. The `src` root run is the
+  whole tree: **3016 tests across 304 files — 3015 pass, 1 skip, 0 fail** (94 s; it did not
+  OOM here). The per-folder numbers overlap, because a folder run recurses into its
+  sub-folders (`src/components` alone reports 7 files, `src/lib` 116); the honest union is
+  the 3015 / 1 / 0 of the `src` root run, and the per-folder runs only prove that every
+  folder also passes on its own.
+- `git status` — clean, nothing generated staged.
+
+**Not verified / skipped**
+
+- `python3 ops/lint/check_intra_package_imports.py`, `python3 ops/lint/check_bare_iceberg_count.py`,
+  `(cd dagster && python -m pytest dispar_orchestrate -q)` and `docker compose --profile '*' config --quiet`
+  were **not run**: this branch touches no Python, no Dagster and no compose file
+  (`AGENTS.md`, "Only build what changed").
+- The `bun test src` whole-tree run was not expected to fit in memory here; it did
+  (3016 tests in 94 s). The folder-by-folder loop was run anyway, as instructed.
+
+**For the reviewer**
+
+- `lakehouse-core`'s `status::AuditOutcome` (`rust/crates/lakehouse-core/src/status.rs:215`)
+  still has three variants. It is dead code — the audit route narrows with its own
+  `outcome_of`, and `grep -rn "AuditOutcome" rust/` finds only that definition and a doc
+  comment. The plan does not list it, so it was left alone; it now differs from the console
+  union, which has four. Say whether it should gain a `Pending` variant.
+- `grep -rn "AuditOutcome" src` finds only the four places the plan lists
+  (`src/lib/status.ts`, `src/components/patterns/status-badge.tsx`,
+  `src/services/contracts/governance.ts`, `src/features/governance/audit-columns.tsx`),
+  so nothing else narrows on the union. The outcome filter on the audit page is built from
+  `AUDIT_OUTCOME_LABEL`, so it offers "Pending" without another change.
+
 ## 7. Review (planner appends below)
