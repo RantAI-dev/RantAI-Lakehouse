@@ -64,6 +64,7 @@ mod quality_schedules;
 mod query;
 mod query_cancel;
 mod query_limits;
+mod saved_queries;
 mod schema_changes;
 pub(crate) mod schema_versions;
 mod settings;
@@ -1186,6 +1187,43 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/query/saved",
             get(query::list_saved).post(query::create_saved),
+        )
+        // QS-3: the saved-query surface. Every route is `query:read` at
+        // the gate; the level the caller holds on the item (view, edit or
+        // manage) is checked in the handler, so a route that changes
+        // something needs `edit` and a route that shares, deletes or
+        // restores needs `manage`. An item the caller may not see is a
+        // 404, never a 403 (no existence leak).
+        .route(
+            "/api/query/saved/{id}",
+            get(saved_queries::get_saved)
+                .patch(saved_queries::patch_saved)
+                .delete(saved_queries::delete_saved),
+        )
+        .route(
+            "/api/query/saved/{id}/duplicate",
+            post(saved_queries::duplicate_saved),
+        )
+        .route(
+            "/api/query/saved/{id}/restore",
+            post(saved_queries::restore_saved),
+        )
+        .route("/api/query/saved-trash", get(saved_queries::list_trash))
+        .route(
+            "/api/query/saved/{id}/versions",
+            get(saved_queries::list_versions),
+        )
+        .route(
+            "/api/query/saved/{id}/versions/{version}/revert",
+            post(saved_queries::revert_version),
+        )
+        .route(
+            "/api/query/folders",
+            get(saved_queries::list_folders).post(saved_queries::create_folder),
+        )
+        .route(
+            "/api/query/folders/{id}",
+            axum::routing::patch(saved_queries::patch_folder).delete(saved_queries::delete_folder),
         )
         .route("/api/query/history", get(query::list_history))
         .route("/api/query/run/{id}/download", get(query::download))

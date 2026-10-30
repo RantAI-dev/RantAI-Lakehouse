@@ -23,8 +23,8 @@ use lakehouse_store::audit::{NewAuditEvent, insert as insert_audit_event};
 use lakehouse_store::queries::{
     HistoryFilter, RecordHistoryInput, SavedQueryPatch, SavedQueryScope, SavedQueryViewer,
     VERSION_KEEP, create_saved_query, get_history_item, get_saved, history_mentioning,
-    history_recent, list_history, list_saved, list_saved_matching, list_saved_trash, list_versions,
-    purge_trashed_before, record_history, restore_saved_query, trash_saved_query,
+    history_recent, list_history, list_saved, list_saved_matching, list_saved_trash_entries,
+    list_versions, purge_trashed_before, record_history, restore_saved_query, trash_saved_query,
     update_saved_query,
 };
 use lakehouse_store::saved_query_access::{
@@ -1530,7 +1530,7 @@ async fn a_trashed_query_leaves_the_list_and_can_be_restored(pool: PgPool) -> sq
         "a trashed query is not listed"
     );
     assert!(
-        list_saved_trash(&pool, &scope)
+        list_saved_trash_entries(&pool, &scope)
             .await
             .unwrap()
             .iter()
@@ -1555,7 +1555,7 @@ async fn a_trashed_query_leaves_the_list_and_can_be_restored(pool: PgPool) -> sq
         "it is back in the list"
     );
     assert!(
-        !list_saved_trash(&pool, &scope)
+        !list_saved_trash_entries(&pool, &scope)
             .await
             .unwrap()
             .iter()

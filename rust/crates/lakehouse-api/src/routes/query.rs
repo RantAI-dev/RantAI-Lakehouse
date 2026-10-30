@@ -30,6 +30,10 @@ use uuid::Uuid;
 
 use crate::error::ApiResult;
 use crate::json::ApiJson;
+use crate::routes::saved_queries::{
+    FolderField, NOT_READ_ONLY, QUERY_STRING_UNREADABLE, SavedQueryListQuery,
+    TITLE_AND_SQL_REQUIRED, parse_folder_filter, parse_folder_reference, require_query_placement,
+};
 use crate::sql_guard::{is_read_only, is_trino_safe};
 use crate::state::AppState;
 use crate::upstream_error;
@@ -1878,21 +1882,41 @@ fn pool(state: &AppState) -> Result<&PgPool, ApiError> {
 /// the caller's tenant's rows, and the rows that belong to no tenant
 /// when that tenant owns the shared catalog (see [`saved_query_scope`]).
 ///
+/// The list is filtered by the text typed in the search box (`?q=`, which
+/// matches the title or the SQL) and by the folder asked for (`?folder=`,
+/// an id or `"root"` for the shared space). Both filters are the store's
+/// own, applied to the visible rows only.
+///
 /// # Errors
 ///
 /// 401 when nobody is signed in — a saved query belongs to a tenant, so
-/// there is no sensible answer for "everybody's"; 404 for an `X-Tenant`
-/// header the caller does not belong to; 503 if no pool is configured;
-/// 500 on a database failure.
+/// there is no sensible answer for "everybody's"; 400 for a folder filter
+/// that is neither an id nor `"root"`, and for a query string the route
+/// cannot read; 404 for an `X-Tenant` header the caller does not belong
+/// to; 503 if no pool is configured; 500 on a database failure.
 pub async fn list_saved(
     State(state): State<AppState>,
     principal: Option<Extension<Principal>>,
     headers: HeaderMap,
+    query: Result<Query<SavedQueryListQuery>, axum::extract::rejection::QueryRejection>,
 ) -> ApiResult<ApiJson<Vec<SavedQuery>>> {
     let Extension(principal) =
         principal.ok_or_else(|| ApiError::Unauthorized("sign in required".to_owned()))?;
+    // A query string the extractor cannot read — a parameter sent twice,
+    // for instance — is refused with this surface's own sentence. The
+    // rejection's own text is serde's, and it stays in the log: a
+    // response never carries a library's rendering of the caller's
+    // request.
+    let Query(raw) = query.map_err(|rejection| {
+        tracing::warn!(%rejection, "a saved-query query string could not be read");
+        ApiError::BadRequest(QUERY_STRING_UNREADABLE.to_owned())
+    })?;
+    let needle = raw.q.as_deref().filter(|needle| !needle.is_empty());
+    let folder = parse_folder_filter(raw.folder.as_deref())?;
     let scope = saved_query_scope(&state, &principal, &headers).await?;
-    Ok(ApiJson(queries::list_saved(pool(&state)?, scope).await?))
+    Ok(ApiJson(
+        queries::list_saved_filtered(pool(&state)?, &scope, needle, folder).await?,
+    ))
 }
 
 /// The `GET /api/query/history` query string (`QS-4`, decision 5). Every
@@ -2046,6 +2070,10 @@ pub struct CreateSavedQueryBody {
     sql: String,
     #[serde(default)]
     tags: Vec<String>,
+    /// The folder the query lands in: an id, `null` for the shared space,
+    /// or absent for the caller's own personal space.
+    #[serde(default)]
+    folder_id: FolderField,
 }
 
 /// `POST /api/query/saved` — save the SQL in the editor under a name.
@@ -2055,14 +2083,18 @@ pub struct CreateSavedQueryBody {
 /// caller sends one, the caller's first tenant otherwise — and the row is
 /// that tenant's alone; the rows that belong to no tenant are the shared
 /// catalog's own. The author is recorded all the same, and the query
-/// lands in the caller's personal space (`QS-3`).
+/// lands in the folder the body names: the shared space, a folder the
+/// caller may fill, or — when the body names none — the caller's own
+/// personal space (`QS-3`).
 ///
 /// # Errors
 ///
-/// 400 on a malformed body or a blank title/SQL; 401 when nobody is signed
-/// in; 404 for an `X-Tenant` header the caller does not belong to; 422
-/// when the SQL is not read-only — a saved query is run through the same
-/// guard as anything else, so refusing it here is better than storing
+/// 400 on a malformed body, a blank title/SQL or a folder that is neither
+/// an id nor the root; 401 when nobody is signed in; 404 for an
+/// `X-Tenant` header the caller does not belong to, and for a folder the
+/// caller may not see; 403 for a folder the caller may see but not fill;
+/// 422 when the SQL is not read-only — a saved query is run through the
+/// same guard as anything else, so refusing it here is better than storing
 /// something that can never run; 503/500 as above.
 pub async fn create_saved(
     State(state): State<AppState>,
@@ -2075,13 +2107,10 @@ pub async fn create_saved(
     let title = body.title.trim().to_owned();
     let sql = body.sql.trim().to_owned();
     if title.is_empty() || sql.is_empty() {
-        return Err(ApiError::BadRequest("title and sql are required".to_owned()).into());
+        return Err(ApiError::BadRequest(TITLE_AND_SQL_REQUIRED.to_owned()).into());
     }
     if !is_read_only(&sql) {
-        return Err(ApiError::Unprocessable(
-            "only read queries (SELECT/SHOW/DESCRIBE/EXPLAIN) can be saved".to_owned(),
-        )
-        .into());
+        return Err(ApiError::Unprocessable(NOT_READ_ONLY.to_owned()).into());
     }
     let principal = principal
         .as_ref()
@@ -2094,17 +2123,24 @@ pub async fn create_saved(
     // not anybody's to read but the shared catalog's owner's.
     let tenant_id = crate::tenant_scope::resolve(principal, &headers)?;
     let owner = principal.display_name.clone();
-    // The viewer is the caller: the row is theirs, and it lands in their
-    // personal space (`QS-3`).
     let viewer = saved_query_viewer(principal, tenant_id);
-    let saved = queries::create_saved_query(
+    // The place the row lands is the caller's to choose: the shared
+    // space, one of the folders they may fill, or — when the body names
+    // no folder — their own personal space (`QS-3`).
+    let placement = require_query_placement(
+        pool(&state)?,
+        &viewer,
+        parse_folder_reference(body.folder_id)?,
+    )
+    .await?;
+    let saved = queries::create_saved_query_at(
         pool(&state)?,
         &viewer,
         &title,
         &sql,
         &owner,
         &body.tags,
-        None,
+        placement,
     )
     .await?;
     Ok((StatusCode::CREATED, ApiJson(saved)))

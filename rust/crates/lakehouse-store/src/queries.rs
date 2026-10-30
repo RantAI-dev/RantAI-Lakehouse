@@ -184,7 +184,13 @@ impl SavedQueryScope {
     /// as that tenant, and a scope that reads every tenant's rows is a
     /// scope whose viewer acts as none of them. The scope decides, so a
     /// caller cannot widen the reach by handing in a viewer of its own.
-    fn effective_viewer(&self) -> Option<SavedQueryViewer> {
+    ///
+    /// Public because a write path needs the same viewer the read path
+    /// used: the store's own writes take a [`SavedQueryViewer`] and check
+    /// the tenant boundary against it, so a route that writes has to ask
+    /// the scope — never a viewer of its own — who it writes as.
+    #[must_use]
+    pub fn effective_viewer(&self) -> Option<SavedQueryViewer> {
         match self {
             Self::All { viewer } => {
                 let mut viewer = viewer.clone();
@@ -251,7 +257,7 @@ pub async fn list_saved(
     pool: &PgPool,
     scope: SavedQueryScope,
 ) -> Result<Vec<SavedQuery>, StoreError> {
-    list_saved_matching(pool, &scope, None).await
+    list_saved_filtered(pool, &scope, None, None).await
 }
 
 /// The saved queries the scope allows whose title or SQL holds `needle`,
@@ -270,24 +276,68 @@ pub async fn list_saved_matching(
     scope: &SavedQueryScope,
     needle: Option<&str>,
 ) -> Result<Vec<SavedQuery>, StoreError> {
+    list_saved_filtered(pool, scope, needle, None).await
+}
+
+/// Which folder the list is filtered by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SavedQueryFolder {
+    /// One folder: the queries that sit in it.
+    Folder(Uuid),
+    /// The shared space: the queries that sit in no folder.
+    Root,
+}
+
+/// The saved queries the scope allows, newest first, filtered by the text
+/// typed and by the folder asked for.
+///
+/// Both filters are the same filter as the single-SQL list they replace:
+/// one statement, one pass over the visible rows, so a list that is
+/// filtered by text and by folder cannot disagree with a list that is
+/// filtered by text alone. A folder that does not exist matches no row —
+/// the answer is an empty list, not an error, because the caller asked
+/// for "what is in this folder", not "does this folder exist".
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if a query fails.
+pub async fn list_saved_filtered(
+    pool: &PgPool,
+    scope: &SavedQueryScope,
+    needle: Option<&str>,
+    folder: Option<SavedQueryFolder>,
+) -> Result<Vec<SavedQuery>, StoreError> {
     let Some(viewer) = scope.effective_viewer() else {
         // A caller that belongs to no tenant reads no row: the answer is
         // empty, and the database is never asked.
         return Ok(Vec::new());
     };
     let pattern = needle.map(escape_like_pattern);
+    // The folder filter is two bound values rather than one, because
+    // "the shared space" is the absence of a folder and cannot be spelled
+    // as an id.
+    let (folder_kind, folder_id): (Option<&str>, Option<Uuid>) = match folder {
+        None => (None, None),
+        Some(SavedQueryFolder::Root) => (Some("root"), None),
+        Some(SavedQueryFolder::Folder(id)) => (Some("folder"), Some(id)),
+    };
     let rows: Vec<SavedQueryRow> = sqlx::query_as(
         "SELECT id, title, sql, owner, updated_at, tags, folder_id, owner_id, tenant_id, deleted_at \
          FROM saved_query \
          WHERE deleted_at IS NULL \
            AND ($1::uuid IS NULL OR tenant_id = $1 OR ($2::boolean AND tenant_id IS NULL)) \
            AND ($3::text IS NULL OR title ILIKE $4 OR sql ILIKE $4) \
+           AND ($5::text IS NULL \
+                OR ($5::text = 'root' AND folder_id IS NULL) \
+                OR ($6::uuid IS NOT NULL AND folder_id = $6)) \
          ORDER BY updated_at DESC, title",
     )
     .bind(scope.tenant_id())
     .bind(scope.includes_tenantless())
     .bind(needle)
     .bind(pattern.as_deref())
+    .bind(folder_kind)
+    .bind(folder_id)
     .fetch_all(pool)
     .await?;
     let visibility = Visibility::load(pool, &viewer).await?;
@@ -313,6 +363,40 @@ pub async fn get_saved(
     id: &str,
     scope: &SavedQueryScope,
 ) -> Result<Option<SavedQuery>, StoreError> {
+    get_saved_inner(pool, id, scope, false).await
+}
+
+/// One saved query, live or waiting in the trash, when the scope allows
+/// the caller to see it.
+///
+/// The trash entry is part of managing a query, so the route that brings
+/// one back has to find it the same way the trash list finds it: with the
+/// same scope and the same resolver. A live query is found by
+/// [`get_saved`] alone.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if a query fails.
+pub async fn get_saved_including_trash(
+    pool: &PgPool,
+    id: &str,
+    scope: &SavedQueryScope,
+) -> Result<Option<SavedQuery>, StoreError> {
+    get_saved_inner(pool, id, scope, true).await
+}
+
+/// The one read behind [`get_saved`] and [`get_saved_including_trash`].
+///
+/// `include_trash` decides whether a row that waits in the trash is
+/// found; everything else — the tenant boundary and the level — is the
+/// same rule for both, so the two cannot answer differently about the
+/// same row.
+async fn get_saved_inner(
+    pool: &PgPool,
+    id: &str,
+    scope: &SavedQueryScope,
+    include_trash: bool,
+) -> Result<Option<SavedQuery>, StoreError> {
     let Some(viewer) = scope.effective_viewer() else {
         return Ok(None);
     };
@@ -322,12 +406,13 @@ pub async fn get_saved(
     let row: Option<SavedQueryRow> = sqlx::query_as(
         "SELECT id, title, sql, owner, updated_at, tags, folder_id, owner_id, tenant_id, deleted_at \
          FROM saved_query \
-         WHERE id = $1 AND deleted_at IS NULL \
+         WHERE id = $1 AND ($4::boolean OR deleted_at IS NULL) \
            AND ($2::uuid IS NULL OR tenant_id = $2 OR ($3::boolean AND tenant_id IS NULL))",
     )
     .bind(query_id)
     .bind(scope.tenant_id())
     .bind(scope.includes_tenantless())
+    .bind(include_trash)
     .fetch_optional(pool)
     .await?;
     let Some(row) = row else {
@@ -439,13 +524,20 @@ pub async fn history_recent(
     Ok(rows.into_iter().map(|(sql,)| sql).collect())
 }
 
-/// Insert a new saved query.
-///
-/// The query lands in the caller's **personal space** — the folder of the
-/// caller, created on first use — unless the caller names a folder. A
-/// caller with no person to own a space (a service identity) and no
-/// tenant to own it lands in the shared space instead, where every member
-/// of the organisation sees the query.
+/// Where a new saved query lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SavedQueryPlacement {
+    /// The caller's **personal space** — the folder of the caller,
+    /// created on first use.
+    PersonalSpace,
+    /// The organisation's **shared space**: the root of the tree, where
+    /// every member of the organisation sees the query at `view`.
+    SharedSpace,
+    /// The folder named.
+    Folder(Uuid),
+}
+
+/// Insert a new saved query in the place the caller asked for.
 ///
 /// The row belongs to the tenant the viewer acts as, and to nobody else
 /// (`SEC-20`). The author is the viewer's own id, so the author manages
@@ -457,18 +549,19 @@ pub async fn history_recent(
 /// # Errors
 ///
 /// Returns [`StoreError::Database`] if a query fails.
-pub async fn create_saved_query(
+pub async fn create_saved_query_at(
     pool: &PgPool,
     viewer: &SavedQueryViewer,
     title: &str,
     sql: &str,
     owner: &str,
     tags: &[String],
-    folder_id: Option<Uuid>,
+    placement: SavedQueryPlacement,
 ) -> Result<SavedQuery, StoreError> {
-    let folder_id = match folder_id {
-        Some(folder_id) => Some(folder_id),
-        None => match (viewer.id, viewer.tenant_id) {
+    let folder_id = match placement {
+        SavedQueryPlacement::Folder(folder_id) => Some(folder_id),
+        SavedQueryPlacement::SharedSpace => None,
+        SavedQueryPlacement::PersonalSpace => match (viewer.id, viewer.tenant_id) {
             (Some(person), Some(tenant_id)) => Some(
                 ensure_personal_space(pool, tenant_id, person, owner)
                     .await?
@@ -503,6 +596,28 @@ pub async fn create_saved_query(
     let visibility = Visibility::load(pool, viewer).await?;
     let level = visibility.level(&row.target()).unwrap_or(Level::View);
     Ok(row.into_saved(level))
+}
+
+/// Insert a new saved query in the folder named, or in the caller's
+/// personal space when no folder is named.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if a query fails.
+pub async fn create_saved_query(
+    pool: &PgPool,
+    viewer: &SavedQueryViewer,
+    title: &str,
+    sql: &str,
+    owner: &str,
+    tags: &[String],
+    folder_id: Option<Uuid>,
+) -> Result<SavedQuery, StoreError> {
+    let placement = folder_id.map_or(
+        SavedQueryPlacement::PersonalSpace,
+        SavedQueryPlacement::Folder,
+    );
+    create_saved_query_at(pool, viewer, title, sql, owner, tags, placement).await
 }
 
 /// What one update may change.
@@ -679,19 +794,47 @@ pub async fn restore_saved_query(
     Ok(restored.into_saved(level))
 }
 
+/// How long a trashed query waits before the sweep takes it away.
+///
+/// The same window the dashboards' trash keeps (`lakehouse-bi`'s
+/// `RETENTION_DAYS`), so a saved query and a dashboard wait the same
+/// length of time before they are gone for good.
+pub const TRASH_RETENTION_DAYS: i32 = 30;
+
+/// One entry in the trash: the query, the folder it waits in, and the
+/// days it has left.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedQueryTrashEntry {
+    /// The query's id.
+    pub id: String,
+    /// Its title.
+    pub title: String,
+    /// The folder it sits in; `None` is the shared space.
+    pub folder_id: Option<String>,
+    /// When it went to the trash, ISO 8601.
+    pub deleted_at: String,
+    /// How many days it has left before the sweep takes it away.
+    pub days_left: i32,
+}
+
 /// The queries in the trash the caller may manage.
 ///
 /// A trashed query waits here until it is restored or swept away; the
 /// caller sees only the ones it may manage, because the trash entry is
 /// part of managing a query.
 ///
+/// The days left are counted here rather than by the caller, so the
+/// number the console shows and the number the sweep acts on come from
+/// the same constant.
+///
 /// # Errors
 ///
 /// Returns [`StoreError::Database`] if a query fails.
-pub async fn list_saved_trash(
+pub async fn list_saved_trash_entries(
     pool: &PgPool,
     scope: &SavedQueryScope,
-) -> Result<Vec<SavedQuery>, StoreError> {
+) -> Result<Vec<SavedQueryTrashEntry>, StoreError> {
     let Some(viewer) = scope.effective_viewer() else {
         return Ok(Vec::new());
     };
@@ -707,6 +850,7 @@ pub async fn list_saved_trash(
     .fetch_all(pool)
     .await?;
     let visibility = Visibility::load(pool, &viewer).await?;
+    let now = OffsetDateTime::now_utc();
     Ok(rows
         .into_iter()
         .filter_map(|row| {
@@ -714,9 +858,30 @@ pub async fn list_saved_trash(
             if level < Level::Manage {
                 return None;
             }
-            Some(row.into_saved(level))
+            let deleted_at = row.deleted_at?;
+            Some(SavedQueryTrashEntry {
+                id: row.id.to_string(),
+                title: row.title,
+                folder_id: row.folder_id.map(|id| id.to_string()),
+                deleted_at: iso_millis(deleted_at),
+                days_left: days_left(deleted_at, now),
+            })
         })
         .collect())
+}
+
+/// The days a trashed query has left, counted from when it went to the
+/// trash.
+///
+/// Whole days, never a fraction: a query trashed a moment ago has 29
+/// days left, not 29.99. A query that is past the window has none.
+fn days_left(deleted_at: OffsetDateTime, now: OffsetDateTime) -> i32 {
+    let deadline = deleted_at + time::Duration::days(i64::from(TRASH_RETENTION_DAYS));
+    let seconds = (deadline - now).whole_seconds();
+    if seconds <= 0 {
+        return 0;
+    }
+    i32::try_from(seconds / 86_400).unwrap_or(i32::MAX)
 }
 
 /// Delete the queries that were trashed before `cutoff`, and answer how

@@ -447,6 +447,28 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("GET",  "/api/query/run/{id}/download", Policy::RequiresPermission("query:read")),
     ("GET",  "/api/query/scheduling",     Policy::RequiresPermission("query:read")),
 
+    // ── Query: the saved-query surface (`QS-3`). ─────────────────────────
+    //
+    // The gate is `query:read` for every route: the level the caller
+    // holds on the item (view, edit or manage) is the handler's business,
+    // because it is decided by the one resolver in the store and not by
+    // the permission set. A route that changes something needs `edit`,
+    // a route that deletes, restores or manages needs `manage`; an item
+    // the caller may not see is a 404, never a 403.
+    ("GET",    "/api/query/saved/{id}",                    Policy::RequiresPermission("query:read")),
+    ("PATCH",  "/api/query/saved/{id}",                    Policy::RequiresPermission("query:read")),
+    ("DELETE", "/api/query/saved/{id}",                    Policy::RequiresPermission("query:read")),
+    ("POST",   "/api/query/saved/{id}/duplicate",          Policy::RequiresPermission("query:read")),
+    ("POST",   "/api/query/saved/{id}/restore",            Policy::RequiresPermission("query:read")),
+    ("GET",    "/api/query/saved-trash",                   Policy::RequiresPermission("query:read")),
+    ("GET",    "/api/query/saved/{id}/versions",           Policy::RequiresPermission("query:read")),
+    ("POST",   "/api/query/saved/{id}/versions/{version}/revert",
+                                                            Policy::RequiresPermission("query:read")),
+    ("GET",    "/api/query/folders",                       Policy::RequiresPermission("query:read")),
+    ("POST",   "/api/query/folders",                       Policy::RequiresPermission("query:read")),
+    ("PATCH",  "/api/query/folders/{id}",                  Policy::RequiresPermission("query:read")),
+    ("DELETE", "/api/query/folders/{id}",                  Policy::RequiresPermission("query:read")),
+
     // ── Pipelines: seeded Data Engineer permission `pipeline:*`. ─────────
     ("GET",  "/api/pipelines",                        Policy::RequiresPermission("pipeline:read")),
     ("POST", "/api/pipelines",                        Policy::RequiresPermission("pipeline:write")),

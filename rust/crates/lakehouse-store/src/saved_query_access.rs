@@ -616,6 +616,48 @@ pub fn personal_space_name(display_name: &str) -> String {
         .collect()
 }
 
+/// The folders of the viewer's tenant, each with the level the viewer
+/// holds on it.
+///
+/// A folder the viewer may not see at all is not in the answer: the
+/// tree a caller sees holds only what they may see, and a personal space
+/// of somebody else is not in it.
+///
+/// The level is resolved by the one resolver ([`resolve_level`]), with
+/// the same chain and the same rules every other reader uses — so the
+/// tree and a query inside it can never disagree about who may do what.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if a query fails.
+pub async fn folders_with_levels(
+    pool: &PgPool,
+    viewer: &SavedQueryViewer,
+) -> Result<Vec<(FolderNode, Level)>, StoreError> {
+    let folders = list_folders(pool, viewer.tenant_id).await?;
+    let grants = grants_for_viewer(pool, viewer).await?;
+    let map = FolderMap::new(folders.clone());
+    let mut answer = Vec::new();
+    for folder in &folders {
+        let Some(chain) = map.chain(folder.id) else {
+            // A folder whose chain cannot be built is corrupt data, and
+            // corrupt data answers nothing.
+            continue;
+        };
+        let chain: Vec<FolderNode> = chain.into_iter().cloned().collect();
+        let target = AccessTarget {
+            id: folder.id,
+            owner_id: folder.owner_id,
+            folder_id: folder.parent_id,
+            tenant_id: Some(folder.tenant_id),
+        };
+        if let Some(level) = resolve_level(&target, &chain, &grants, viewer) {
+            answer.push((folder.clone(), level));
+        }
+    }
+    Ok(answer)
+}
+
 /// The personal space of one person of one tenant, created on first use.
 ///
 /// One folder per tenant and person: the partial unique index on
