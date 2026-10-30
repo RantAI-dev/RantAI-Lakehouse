@@ -176,10 +176,17 @@ promise it keeps better than it says:
   Alerts list keeps one row per rule within 15 minutes, so the second alert is delivered but
   may not appear as a second row if both happen within 15 minutes. A connector a person paused
   is not evaluated and shows "Paused", not a number.
+- **A pause is not lag.** After a resume the lag counts from the resume; changes made during the
+  pause show as backlog until they are applied. A source change time in the future is stored as
+  now. Kafka Connect not answering counts as "not running": a table is then never "up to date".
+- **Rare ordering.** If delivering an alert fails and the flag cannot be put back, that alert is
+  lost; a concurrent post that closes an alert whose delivery then fails can leave the two out of
+  order. Both need two faults at once.
 - **Setup checks never block saving.** They are read after a connection test passes, with
   fixed statements; a setting the login cannot read is "Not checked", never a pass. MySQL's
   binlog retention must be at least **7 days** (or never expire), the broker's own retention:
-  the window in which a stopped connector can still catch up (the number is the planner's).
+  the window in which a stopped connector can still catch up (the number is the planner's). The check also reads the legacy `expire_logs_days`: logs never
+  expire only when it and `binlog_expire_logs_seconds` are both 0.
   SQL Server Agent can only be read with `VIEW SERVER STATE`, which the documented login does
   not have, so that check always reads "Not checked" with that reason; the login is not
   widened. A SQL Server table the login cannot see is reported as missing CDC.
