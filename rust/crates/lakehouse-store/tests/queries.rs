@@ -28,7 +28,9 @@ use lakehouse_store::queries::{
     update_saved_query,
 };
 use lakehouse_store::saved_query_access::{
-    Level, NewGrant, grants_for_item, grants_for_viewer, replace_grants,
+    FolderError, Level, NewGrant, create_folder, delete_folder, ensure_personal_space,
+    grants_for_item, grants_for_viewer, move_folder, rename_folder, replace_grants,
+    search_grantees,
 };
 use sqlx::PgPool;
 use time::OffsetDateTime;
@@ -1876,5 +1878,488 @@ async fn the_rules_of_a_person_and_of_a_role_are_read_for_the_viewer(
 
     let on_item = grants_for_item(&pool, Some(query_id), None).await.unwrap();
     assert_eq!(on_item.len(), 2, "the item carries both of its rules");
+    Ok(())
+}
+
+// ── The folder writes and the grantee search ─────────────────────────────
+
+/// A folder is made at the root and under a parent, and comes back with
+/// the name, the parent and the owner it was given.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_folder_is_created_at_the_root_and_under_a_parent(pool: PgPool) -> sqlx::Result<()> {
+    let tenant_id = tenant(GROUP_TENANT);
+
+    let root = create_folder(&pool, tenant_id, Some(person(RINA)), "Reports", None)
+        .await
+        .unwrap();
+    assert_eq!(root.name, "Reports");
+    assert_eq!(root.parent_id, None, "it sits at the root");
+    assert_eq!(root.tenant_id, tenant_id);
+    assert_eq!(root.owner_id, Some(person(RINA)));
+    assert!(
+        !root.is_personal,
+        "an ordinary folder is not a personal space"
+    );
+
+    let child = create_folder(
+        &pool,
+        tenant_id,
+        Some(person(RINA)),
+        "Weekly",
+        Some(root.id),
+    )
+    .await
+    .unwrap();
+    assert_eq!(child.name, "Weekly");
+    assert_eq!(child.parent_id, Some(root.id), "it sits under its parent");
+    Ok(())
+}
+
+/// A name is 1 to 100 characters: a blank one and one that is too long
+/// are refused, and exactly a hundred is accepted.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_folder_name_must_have_between_one_and_a_hundred_characters(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_id = tenant(GROUP_TENANT);
+
+    let blank = create_folder(&pool, tenant_id, None, "   ", None).await;
+    assert!(
+        matches!(blank, Err(FolderError::InvalidName)),
+        "a name of only whitespace is refused"
+    );
+
+    let too_long = create_folder(&pool, tenant_id, None, &"x".repeat(101), None).await;
+    assert!(
+        matches!(too_long, Err(FolderError::InvalidName)),
+        "a name of 101 characters is refused"
+    );
+
+    let exact = create_folder(&pool, tenant_id, None, &"x".repeat(100), None)
+        .await
+        .unwrap();
+    assert_eq!(exact.name.chars().count(), 100);
+    Ok(())
+}
+
+/// A sibling's name is unique, compared case-insensitively: "Reports" and
+/// "reports" are the same name.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_sibling_name_is_refused_case_insensitively(pool: PgPool) -> sqlx::Result<()> {
+    let tenant_id = tenant(GROUP_TENANT);
+    create_folder(&pool, tenant_id, None, "Reports", None)
+        .await
+        .unwrap();
+
+    let shouted = create_folder(&pool, tenant_id, None, "reports", None).await;
+    assert!(
+        matches!(shouted, Err(FolderError::DuplicateName)),
+        "the same name in another case is the same name"
+    );
+    Ok(())
+}
+
+/// A name that is free among the siblings is accepted, even when a
+/// folder with that name sits somewhere else in the tree.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_name_free_among_the_siblings_is_accepted_even_when_it_exists_elsewhere(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_id = tenant(GROUP_TENANT);
+    create_folder(&pool, tenant_id, None, "Reports", None)
+        .await
+        .unwrap();
+    let other = create_folder(&pool, tenant_id, None, "Other", None)
+        .await
+        .unwrap();
+
+    let elsewhere = create_folder(&pool, tenant_id, None, "Reports", Some(other.id))
+        .await
+        .unwrap();
+    assert_eq!(
+        elsewhere.parent_id,
+        Some(other.id),
+        "the same name under another parent is another name"
+    );
+    Ok(())
+}
+
+/// A personal space carries a name the system wrote, and it blocks
+/// nobody: an ordinary folder may carry the same name.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_personal_space_does_not_block_the_name_of_an_ordinary_folder(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_id = tenant(GROUP_TENANT);
+    ensure_personal_space(&pool, tenant_id, person(RINA), "Rina Wijaya")
+        .await
+        .unwrap();
+
+    let ordinary = create_folder(
+        &pool,
+        tenant_id,
+        None,
+        "Personal space of Rina Wijaya",
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(ordinary.name, "Personal space of Rina Wijaya");
+    Ok(())
+}
+
+/// A personal space is one person's own space: it is not renamed, not
+/// moved and not deleted.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_personal_space_is_not_renamed_not_moved_and_not_deleted(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_id = tenant(GROUP_TENANT);
+    let space = ensure_personal_space(&pool, tenant_id, person(RINA), "Rina Wijaya")
+        .await
+        .unwrap();
+    assert!(space.is_personal);
+
+    let renamed = rename_folder(&pool, space.id, "Mine").await;
+    assert!(
+        matches!(renamed, Err(FolderError::PersonalSpace)),
+        "a personal space is not renamed"
+    );
+
+    let moved = move_folder(&pool, space.id, None).await;
+    assert!(
+        matches!(moved, Err(FolderError::PersonalSpace)),
+        "a personal space is not moved"
+    );
+
+    let deleted = delete_folder(&pool, space.id).await;
+    assert!(
+        matches!(deleted, Err(FolderError::PersonalSpace)),
+        "a personal space is not deleted"
+    );
+
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM saved_query_folder WHERE id = $1")
+        .bind(space.id)
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(left, 1, "the personal space is still there");
+    Ok(())
+}
+
+/// A folder may not move into itself or into one of its own descendants.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_folder_may_not_move_into_its_own_descendant(pool: PgPool) -> sqlx::Result<()> {
+    let tenant_id = tenant(GROUP_TENANT);
+    let parent = create_folder(&pool, tenant_id, None, "Parent", None)
+        .await
+        .unwrap();
+    let child = create_folder(&pool, tenant_id, None, "Child", Some(parent.id))
+        .await
+        .unwrap();
+    let grandchild = create_folder(&pool, tenant_id, None, "Grandchild", Some(child.id))
+        .await
+        .unwrap();
+
+    let into_itself = move_folder(&pool, parent.id, Some(parent.id)).await;
+    assert!(
+        matches!(into_itself, Err(FolderError::Cycle)),
+        "a folder is not its own parent"
+    );
+
+    let into_a_descendant = move_folder(&pool, parent.id, Some(grandchild.id)).await;
+    assert!(
+        matches!(into_a_descendant, Err(FolderError::Cycle)),
+        "a folder is not moved under its own descendant"
+    );
+    Ok(())
+}
+
+/// The tree is at most four levels deep: a folder that would make it five
+/// is refused, and a move that keeps it at four is allowed.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_move_that_would_make_the_tree_five_deep_is_refused(pool: PgPool) -> sqlx::Result<()> {
+    let tenant_id = tenant(GROUP_TENANT);
+    let one = create_folder(&pool, tenant_id, None, "One", None)
+        .await
+        .unwrap();
+    let two = create_folder(&pool, tenant_id, None, "Two", Some(one.id))
+        .await
+        .unwrap();
+    let three = create_folder(&pool, tenant_id, None, "Three", Some(two.id))
+        .await
+        .unwrap();
+    let four = create_folder(&pool, tenant_id, None, "Four", Some(three.id))
+        .await
+        .unwrap();
+
+    let five = create_folder(&pool, tenant_id, None, "Five", Some(four.id)).await;
+    assert!(
+        matches!(five, Err(FolderError::TooDeep)),
+        "the tree is at most four levels deep"
+    );
+
+    // A subtree of two levels: it may not land under the fourth level
+    // (it would reach the sixth), and it may land under the second.
+    let branch = create_folder(&pool, tenant_id, None, "Branch", None)
+        .await
+        .unwrap();
+    create_folder(&pool, tenant_id, None, "Leaf", Some(branch.id))
+        .await
+        .unwrap();
+
+    let too_deep = move_folder(&pool, branch.id, Some(four.id)).await;
+    assert!(
+        matches!(too_deep, Err(FolderError::TooDeep)),
+        "the subtree would reach past the limit"
+    );
+
+    let allowed = move_folder(&pool, branch.id, Some(two.id)).await.unwrap();
+    assert_eq!(allowed.parent_id, Some(two.id));
+    Ok(())
+}
+
+/// A folder is deleted only when it holds nothing: not a live query, not
+/// a trashed one and not a sub-folder.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_folder_is_deleted_only_when_it_holds_nothing(pool: PgPool) -> sqlx::Result<()> {
+    let tenant_id = tenant(GROUP_TENANT);
+    let caller = viewer(Some(person(RINA)), Some(tenant_id));
+
+    let with_live = create_folder(&pool, tenant_id, None, "Live", None)
+        .await
+        .unwrap();
+    let live = create_saved_query(
+        &pool,
+        &caller,
+        "Live one",
+        "SELECT 1",
+        "Rina Wijaya",
+        &[],
+        Some(with_live.id),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        live.folder_id,
+        Some(with_live.id.to_string()),
+        "the query sits in the folder that holds it"
+    );
+    let refused = delete_folder(&pool, with_live.id).await;
+    assert!(
+        matches!(refused, Err(FolderError::HoldsQueries)),
+        "a live query holds the folder"
+    );
+
+    let with_trash = create_folder(&pool, tenant_id, None, "Trash", None)
+        .await
+        .unwrap();
+    let trashed = create_saved_query(
+        &pool,
+        &caller,
+        "Trashed one",
+        "SELECT 2",
+        "Rina Wijaya",
+        &[],
+        Some(with_trash.id),
+    )
+    .await
+    .unwrap();
+    trash_saved_query(&pool, &caller, &trashed.id)
+        .await
+        .unwrap();
+    let refused = delete_folder(&pool, with_trash.id).await;
+    assert!(
+        matches!(refused, Err(FolderError::HoldsTrashedQueries)),
+        "a query in the trash holds the folder too"
+    );
+
+    let with_child = create_folder(&pool, tenant_id, None, "Parent", None)
+        .await
+        .unwrap();
+    create_folder(&pool, tenant_id, None, "Child", Some(with_child.id))
+        .await
+        .unwrap();
+    let refused = delete_folder(&pool, with_child.id).await;
+    assert!(
+        matches!(refused, Err(FolderError::HoldsFolders)),
+        "a sub-folder holds the folder"
+    );
+
+    let empty = create_folder(&pool, tenant_id, None, "Empty", None)
+        .await
+        .unwrap();
+    delete_folder(&pool, empty.id).await.unwrap();
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM saved_query_folder WHERE id = $1")
+        .bind(empty.id)
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(left, 0, "the empty folder is gone");
+    Ok(())
+}
+
+/// Another tenant's folder is not reachable: it cannot be the parent of
+/// a folder and it cannot be the place a folder moves into.
+#[sqlx::test(migrations = "../../migrations")]
+async fn another_tenants_folder_is_not_reachable(pool: PgPool) -> sqlx::Result<()> {
+    let group = tenant(GROUP_TENANT);
+    let retail = tenant(RETAIL_TENANT);
+    let theirs = create_folder(&pool, retail, None, "Theirs", None)
+        .await
+        .unwrap();
+
+    let under_theirs = create_folder(&pool, group, None, "Mine", Some(theirs.id)).await;
+    assert!(
+        matches!(under_theirs, Err(FolderError::NotFound)),
+        "the parent of another tenant is not found"
+    );
+
+    let mine = create_folder(&pool, group, None, "Mine", None)
+        .await
+        .unwrap();
+    let into_theirs = move_folder(&pool, mine.id, Some(theirs.id)).await;
+    assert!(
+        matches!(into_theirs, Err(FolderError::NotFound)),
+        "another tenant's folder is not a place to move into"
+    );
+    Ok(())
+}
+
+/// The grantee search finds a person by their name and by their email.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_grantee_search_finds_a_person_by_name_and_by_email(pool: PgPool) -> sqlx::Result<()> {
+    let group = tenant(GROUP_TENANT);
+
+    let by_name = search_grantees(&pool, Some(group), "Rina", 20)
+        .await
+        .unwrap();
+    assert!(
+        by_name.people.iter().any(|grantee| {
+            grantee.name == "Rina Wijaya" && grantee.email == "rina@meridian.example"
+        }),
+        "the person is found by their name"
+    );
+
+    let by_email = search_grantees(&pool, Some(group), "rina@meridian.example", 20)
+        .await
+        .unwrap();
+    assert!(
+        by_email
+            .people
+            .iter()
+            .any(|grantee| grantee.id == person(RINA)),
+        "the person is found by their email"
+    );
+    Ok(())
+}
+
+/// The grantee search finds a role by its name: a role belongs to the
+/// deployment, so every role is a possible grantee.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_grantee_search_finds_a_role_by_name(pool: PgPool) -> sqlx::Result<()> {
+    let group = tenant(GROUP_TENANT);
+
+    let matches = search_grantees(&pool, Some(group), "Analyst", 20)
+        .await
+        .unwrap();
+    assert!(
+        matches.roles.iter().any(|role| role.name == "Analyst"),
+        "the role is found"
+    );
+    assert!(
+        matches.roles.iter().all(|role| !role.name.is_empty()),
+        "a role carries its name"
+    );
+    Ok(())
+}
+
+/// The wildcards of the match are literals: a `%` is a percent sign and
+/// an `_` is an underscore, never "anything".
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_grantee_search_treats_the_wildcards_literally(pool: PgPool) -> sqlx::Result<()> {
+    let group = tenant(GROUP_TENANT);
+    let person_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO app_user (id, name, email) VALUES ($1, 'Fifty % Off', $2)")
+        .bind(person_id)
+        .bind("fifty@meridian.example")
+        .execute(&pool)
+        .await?;
+    sqlx::query("INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2)")
+        .bind(person_id)
+        .bind(group)
+        .execute(&pool)
+        .await?;
+
+    let percent = search_grantees(&pool, Some(group), "%", 20).await.unwrap();
+    assert!(
+        percent
+            .people
+            .iter()
+            .all(|grantee| grantee.name.contains('%')),
+        "a percent matches a percent and nothing else"
+    );
+    assert!(
+        percent.people.iter().any(|grantee| grantee.id == person_id),
+        "the person whose name holds the percent is found"
+    );
+
+    let underscore = search_grantees(&pool, Some(group), "_", 20).await.unwrap();
+    assert!(
+        underscore.people.is_empty(),
+        "an underscore is a literal underscore"
+    );
+    Ok(())
+}
+
+/// The grantee search answers with the people of the tenant and nobody
+/// else: another tenant's people are not grantees, and an inactive
+/// person is nobody.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_grantee_search_answers_with_the_tenants_people_only(pool: PgPool) -> sqlx::Result<()> {
+    let group = tenant(GROUP_TENANT);
+    let inactive = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO app_user (id, name, email, status) VALUES ($1, 'Sleepy Person', $2, 'inactive')",
+    )
+    .bind(inactive)
+    .bind("sleepy@meridian.example")
+    .execute(&pool)
+    .await?;
+    sqlx::query("INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2)")
+        .bind(inactive)
+        .bind(group)
+        .execute(&pool)
+        .await?;
+
+    let matches = search_grantees(&pool, Some(group), "", 20).await.unwrap();
+    assert!(
+        matches
+            .people
+            .iter()
+            .any(|grantee| grantee.id == person(RINA)),
+        "a member of the tenant is there"
+    );
+    assert!(
+        !matches
+            .people
+            .iter()
+            .any(|grantee| grantee.id == person(SARI)),
+        "a member of another tenant is not"
+    );
+    assert!(
+        !matches.people.iter().any(|grantee| grantee.id == inactive),
+        "an inactive person is nobody"
+    );
+
+    let every_person = search_grantees(&pool, None, "", 20).await.unwrap();
+    assert!(
+        every_person
+            .people
+            .iter()
+            .any(|grantee| grantee.id == person(SARI)),
+        "without a tenant every person of the deployment is there"
+    );
+
+    let none = search_grantees(&pool, Some(group), "", 0).await.unwrap();
+    assert!(none.people.is_empty(), "a limit of zero asks for no rows");
     Ok(())
 }

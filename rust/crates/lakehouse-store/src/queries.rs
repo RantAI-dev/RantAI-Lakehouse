@@ -28,7 +28,7 @@ use uuid::Uuid;
 pub use crate::saved_query_access::SavedQueryViewer;
 use crate::saved_query_access::{
     AccessGrant, AccessTarget, FolderMap, FolderNode, Level, ensure_personal_space,
-    grants_for_viewer, list_folders, resolve_level,
+    escape_like_pattern, grants_for_viewer, list_folders, resolve_level,
 };
 use crate::{PgPool, StoreError};
 
@@ -257,10 +257,10 @@ pub async fn list_saved(
 /// The saved queries the scope allows whose title or SQL holds `needle`,
 /// newest first.
 ///
-/// `%`, `_` and `\` in `needle` are literals, not wildcards: the three
-/// `replace`s escape the escape character first, then the two wildcards,
-/// and `ILIKE` does the case-insensitive contains-match over the visible
-/// rows only.
+/// `%`, `_` and `\` in `needle` are literals, not wildcards: the shared
+/// `escape_like_pattern` helper escapes the escape character first, then
+/// the two wildcards, and `ILIKE` does the case-insensitive contains-match
+/// over the visible rows only.
 ///
 /// # Errors
 ///
@@ -275,13 +275,7 @@ pub async fn list_saved_matching(
         // empty, and the database is never asked.
         return Ok(Vec::new());
     };
-    let pattern = needle.map(|needle| {
-        let escaped = needle
-            .replace('\\', "\\\\")
-            .replace('%', "\\%")
-            .replace('_', "\\_");
-        format!("%{escaped}%")
-    });
+    let pattern = needle.map(escape_like_pattern);
     let rows: Vec<SavedQueryRow> = sqlx::query_as(
         "SELECT id, title, sql, owner, updated_at, tags, folder_id, owner_id, tenant_id, deleted_at \
          FROM saved_query \
@@ -393,16 +387,7 @@ pub async fn history_mentioning(
         return Ok(Vec::new());
     }
     // `%`, `_` and `\` in a table name are literals, not wildcards.
-    let patterns: Vec<String> = needles
-        .iter()
-        .map(|n| {
-            let escaped = n
-                .replace('\\', "\\\\")
-                .replace('%', "\\%")
-                .replace('_', "\\_");
-            format!("%{escaped}%")
-        })
-        .collect();
+    let patterns: Vec<String> = needles.iter().map(|n| escape_like_pattern(n)).collect();
     let rows: Vec<HistoryMention> = sqlx::query_as(
         "SELECT q.id, q.sql, q.user_name, q.owner_id, \
                 to_char(q.at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS at, \
@@ -1167,10 +1152,10 @@ const HISTORY_PAGE_LIMIT: i64 = 50;
 ///
 /// # The `table` match (decision 7)
 ///
-/// `%` and `_` in the caller's text are matched literally: the three
-/// `replace`s escape the escape character first, then the two wildcards,
-/// and `ILIKE` does the case-insensitive contains-match against every
-/// element of `tables_read`.
+/// `%` and `_` in the caller's text are matched literally: the shared
+/// `escape_like_pattern` helper escapes the escape character first, then
+/// the two wildcards, and `ILIKE` does the case-insensitive contains-match
+/// against every element of `tables_read`.
 ///
 /// # `auditEventId` resolution (WS1 task 1.14, judge finding J12)
 ///

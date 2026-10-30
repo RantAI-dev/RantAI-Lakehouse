@@ -37,10 +37,29 @@
 //! of its own descendants, the tree is at most [`MAX_FOLDER_DEPTH`]
 //! levels deep, and a sibling's name is unique (compared
 //! case-insensitively).
+//!
+//! # The writes
+//!
+//! [`create_folder`], [`rename_folder`], [`move_folder`] and
+//! [`delete_folder`] are the four writes the tree needs. They all check
+//! the placement with [`check_placement`] and answer with
+//! [`FolderError`]: a typed answer, so the route layer can tell "the
+//! folder still holds queries" from "the name is taken" and say two
+//! different fixed sentences. The store says *what* was wrong; the route
+//! says *what to tell the caller*, and the database's own text never
+//! reaches a response.
+//!
+//! # The grantee search
+//!
+//! [`search_grantees`] answers the two lists the sharing route shows:
+//! the people of the tenant and the roles of the deployment. A role
+//! belongs to the deployment rather than to a tenant — the `role` table
+//! has no tenant column — so every role is a possible grantee.
 
 use std::collections::HashSet;
 
 use sqlx::FromRow;
+use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{PgPool, StoreError};
@@ -297,6 +316,79 @@ pub enum FolderRule {
     TooDeep,
 }
 
+/// Why a folder write was refused.
+///
+/// The store says *what* was wrong; the route layer says *what to tell
+/// the caller*. Every variant therefore names exactly one thing, so the
+/// route can answer with its own fixed sentence — and the text of this
+/// error never reaches a response, the same rule the rest of the crate
+/// follows for the database's own errors (principle 4 of `AGENTS.md`).
+#[derive(Debug, Error)]
+pub enum FolderError {
+    /// The folder does not exist, or it belongs to another tenant.
+    #[error("the folder does not exist")]
+    NotFound,
+    /// The folder still holds queries that are not in the trash.
+    #[error("the folder still holds queries")]
+    HoldsQueries,
+    /// The folder still holds queries that wait in the trash.
+    #[error("the folder still holds queries in the trash")]
+    HoldsTrashedQueries,
+    /// The folder still holds sub-folders.
+    #[error("the folder still holds sub-folders")]
+    HoldsFolders,
+    /// A sibling already carries that name.
+    #[error("a sibling folder already carries that name")]
+    DuplicateName,
+    /// The name is empty, or longer than [`MAX_FOLDER_NAME_CHARS`].
+    #[error("the name is empty or too long")]
+    InvalidName,
+    /// The tree would be deeper than [`MAX_FOLDER_DEPTH`].
+    #[error("the tree would be deeper than {MAX_FOLDER_DEPTH} levels")]
+    TooDeep,
+    /// The move would make the folder its own ancestor.
+    #[error("the folder would become its own ancestor")]
+    Cycle,
+    /// A `Personal space` may not be renamed, moved or deleted.
+    #[error("a personal space is not renamed, moved or deleted")]
+    PersonalSpace,
+    /// The database refused or failed the write.
+    #[error("database error")]
+    Database(#[source] StoreError),
+}
+
+impl From<FolderRule> for FolderError {
+    /// The pure rule and the store's answer say the same thing: the
+    /// rule that was broken is the answer the caller gets.
+    fn from(rule: FolderRule) -> Self {
+        match rule {
+            FolderRule::NameRequired | FolderRule::NameTooLong => Self::InvalidName,
+            FolderRule::DuplicateName => Self::DuplicateName,
+            FolderRule::ParentNotFound => Self::NotFound,
+            FolderRule::Cycle => Self::Cycle,
+            FolderRule::TooDeep => Self::TooDeep,
+        }
+    }
+}
+
+impl From<StoreError> for FolderError {
+    /// The database's own failure keeps its text behind the error, so it
+    /// can be logged; the answer the caller sees stays the generic
+    /// "database error".
+    fn from(err: StoreError) -> Self {
+        Self::Database(err)
+    }
+}
+
+impl From<sqlx::Error> for FolderError {
+    /// A failed query is the database's own failure: it keeps its
+    /// classification inside the [`StoreError`] and the caller still
+    /// sees nothing but "database error".
+    fn from(err: sqlx::Error) -> Self {
+        Self::Database(StoreError::from(err))
+    }
+}
+
 /// The depth of a folder: 1 at the root, `None` for an unknown id. A
 /// corrupt cycle already in storage stops the walk instead of looping.
 #[must_use]
@@ -373,7 +465,9 @@ pub fn is_personal_space(folders: &[FolderNode], id: Uuid) -> bool {
 /// The first broken rule is the one returned, in this order: the name is
 /// required, the name is too long, the parent exists, the move makes no
 /// cycle, the result is not too deep, and no sibling carries the same
-/// name (compared case-insensitively).
+/// name (compared case-insensitively). A `Personal space` does not count
+/// as a sibling for the name: its name was written by the system, and
+/// nobody is blocked by it.
 ///
 /// # Errors
 ///
@@ -412,6 +506,10 @@ pub fn check_placement(
     let clash = folders.iter().any(|folder| {
         folder.parent_id == parent
             && Some(folder.id) != moving
+            // A `Personal space` carries a name the system wrote ("Personal
+            // space of Rina Wijaya") and it belongs to one person, so
+            // nobody may be blocked from an ordinary folder by it.
+            && !folder.is_personal
             && folder.name.to_lowercase() == lower
     });
     if clash {
@@ -665,6 +763,305 @@ pub async fn replace_grants(
     }
     tx.commit().await?;
     Ok(())
+}
+
+// ── The writes the routes need ──────────────────────────────────────────
+
+/// One folder, by id, in whichever tenant it sits.
+///
+/// The tenant is read from the row itself, so a write never has to be
+/// told which tenant it acts for — and the folder's own tenant is the
+/// one the rest of the write is checked against.
+async fn load_folder(pool: &PgPool, id: Uuid) -> Result<Option<FolderNode>, FolderError> {
+    let row: Option<FolderRow> = sqlx::query_as(
+        "SELECT id, parent_id, is_personal, owner_id, tenant_id, name \
+         FROM saved_query_folder WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(FolderNode::from))
+}
+
+/// Make a folder under `parent_id` (`None` for the root) of `tenant_id`.
+///
+/// The name is trimmed, and it must be 1 to [`MAX_FOLDER_NAME_CHARS`]
+/// characters. The parent must be a folder of the same tenant: a folder
+/// of another tenant is not found at all, so a caller cannot reach
+/// across the tenant boundary by naming one. The name must be free among
+/// the siblings (compared case-insensitively), and the folder may not
+/// make the tree deeper than [`MAX_FOLDER_DEPTH`] levels.
+///
+/// `owner_id` is the creator of the folder; it is `None` for a folder
+/// nobody owns beyond the tenant.
+///
+/// # Errors
+///
+/// Returns [`FolderError::InvalidName`] for a blank name or one that is
+/// too long, [`FolderError::NotFound`] when the parent does not exist,
+/// [`FolderError::DuplicateName`] when a sibling carries the name,
+/// [`FolderError::TooDeep`] when the tree would grow past the depth
+/// limit, and [`FolderError::Database`] if a query fails.
+pub async fn create_folder(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    owner_id: Option<Uuid>,
+    name: &str,
+    parent_id: Option<Uuid>,
+) -> Result<FolderNode, FolderError> {
+    // Only the tenant's own folders are in the tree, so a parent of
+    // another tenant is not found by the placement rule.
+    let folders = list_folders(pool, Some(tenant_id)).await?;
+    let name = check_placement(&folders, None, name, parent_id).map_err(FolderError::from)?;
+    let row: FolderRow = sqlx::query_as(
+        "INSERT INTO saved_query_folder (tenant_id, parent_id, name, owner_id) \
+         VALUES ($1, $2, $3, $4) \
+         RETURNING id, parent_id, is_personal, owner_id, tenant_id, name",
+    )
+    .bind(tenant_id)
+    .bind(parent_id)
+    .bind(&name)
+    .bind(owner_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(FolderNode::from(row))
+}
+
+/// Give the folder another name.
+///
+/// The name is trimmed, and it must be 1 to [`MAX_FOLDER_NAME_CHARS`]
+/// characters and free among the siblings (compared case-insensitively).
+/// The folder keeps its place in the tree.
+///
+/// # Errors
+///
+/// Returns [`FolderError::NotFound`] when the folder does not exist,
+/// [`FolderError::PersonalSpace`] when it is a `Personal space`,
+/// [`FolderError::InvalidName`] for a blank name or one that is too
+/// long, [`FolderError::DuplicateName`] when a sibling carries the name,
+/// and [`FolderError::Database`] if a query fails.
+pub async fn rename_folder(pool: &PgPool, id: Uuid, name: &str) -> Result<FolderNode, FolderError> {
+    let Some(folder) = load_folder(pool, id).await? else {
+        return Err(FolderError::NotFound);
+    };
+    if folder.is_personal {
+        return Err(FolderError::PersonalSpace);
+    }
+    let folders = list_folders(pool, Some(folder.tenant_id)).await?;
+    let name =
+        check_placement(&folders, Some(id), name, folder.parent_id).map_err(FolderError::from)?;
+    let row: FolderRow = sqlx::query_as(
+        "UPDATE saved_query_folder SET name = $2, updated_at = now() WHERE id = $1 \
+         RETURNING id, parent_id, is_personal, owner_id, tenant_id, name",
+    )
+    .bind(id)
+    .bind(&name)
+    .fetch_one(pool)
+    .await?;
+    Ok(FolderNode::from(row))
+}
+
+/// Move the folder under `new_parent` (`None` for the root).
+///
+/// The whole subtree that moves has to fit in [`MAX_FOLDER_DEPTH`]
+/// levels: the depth of the new parent plus the height of the subtree
+/// may not pass the limit. The folder may not become its own ancestor,
+/// and the new parent must be a folder of the same tenant — a folder of
+/// another tenant is not found at all. The name stays, and it stays
+/// free among the new siblings.
+///
+/// # Errors
+///
+/// Returns [`FolderError::NotFound`] when the folder or the new parent
+/// does not exist, [`FolderError::PersonalSpace`] when the folder is a
+/// `Personal space`, [`FolderError::Cycle`] when the move would make
+/// the folder its own ancestor, [`FolderError::TooDeep`] when the
+/// subtree would grow past the depth limit,
+/// [`FolderError::DuplicateName`] when a new sibling carries the name,
+/// and [`FolderError::Database`] if a query fails.
+pub async fn move_folder(
+    pool: &PgPool,
+    id: Uuid,
+    new_parent: Option<Uuid>,
+) -> Result<FolderNode, FolderError> {
+    let Some(folder) = load_folder(pool, id).await? else {
+        return Err(FolderError::NotFound);
+    };
+    if folder.is_personal {
+        return Err(FolderError::PersonalSpace);
+    }
+    let folders = list_folders(pool, Some(folder.tenant_id)).await?;
+    // The name does not change, but the sibling rule still holds: the
+    // folder may not land beside a sibling that carries the same name.
+    check_placement(&folders, Some(id), &folder.name, new_parent).map_err(FolderError::from)?;
+    let row: FolderRow = sqlx::query_as(
+        "UPDATE saved_query_folder SET parent_id = $2, updated_at = now() WHERE id = $1 \
+         RETURNING id, parent_id, is_personal, owner_id, tenant_id, name",
+    )
+    .bind(id)
+    .bind(new_parent)
+    .fetch_one(pool)
+    .await?;
+    Ok(FolderNode::from(row))
+}
+
+/// Delete the folder.
+///
+/// A folder is deleted only when it holds nothing: no live query, no
+/// query in the trash and no sub-folder. The `saved_query` rows point at
+/// their folder under `ON DELETE RESTRICT`, so the database refuses the
+/// delete as well — the explicit check is here so the answer is the
+/// route's fixed sentence and not a database error.
+///
+/// The route layer answers [`FolderError::HoldsQueries`] and
+/// [`FolderError::HoldsTrashedQueries`] with the one sentence the plan
+/// names ("This folder still holds queries, some of them in the trash.
+/// Move or restore them first."), and
+/// [`FolderError::HoldsFolders`] with a second sentence of its own.
+///
+/// # Errors
+///
+/// Returns [`FolderError::NotFound`] when the folder does not exist,
+/// [`FolderError::PersonalSpace`] when it is a `Personal space`,
+/// [`FolderError::HoldsQueries`] or [`FolderError::HoldsTrashedQueries`]
+/// when it still holds queries, [`FolderError::HoldsFolders`] when it
+/// still holds sub-folders, and [`FolderError::Database`] if a query
+/// fails.
+pub async fn delete_folder(pool: &PgPool, id: Uuid) -> Result<(), FolderError> {
+    let Some(folder) = load_folder(pool, id).await? else {
+        return Err(FolderError::NotFound);
+    };
+    if folder.is_personal {
+        return Err(FolderError::PersonalSpace);
+    }
+    let live: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM saved_query WHERE folder_id = $1 AND deleted_at IS NULL",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await?;
+    if live > 0 {
+        return Err(FolderError::HoldsQueries);
+    }
+    let trashed: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM saved_query WHERE folder_id = $1 AND deleted_at IS NOT NULL",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await?;
+    if trashed > 0 {
+        return Err(FolderError::HoldsTrashedQueries);
+    }
+    let children: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM saved_query_folder WHERE parent_id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await?;
+    if children > 0 {
+        return Err(FolderError::HoldsFolders);
+    }
+    sqlx::query("DELETE FROM saved_query_folder WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+// ── The grantee search ───────────────────────────────────────────────────
+
+/// One person a saved query may be shared with.
+#[derive(Debug, Clone, PartialEq, Eq, FromRow)]
+pub struct GranteePerson {
+    /// The person's id.
+    pub id: Uuid,
+    /// The person's display name.
+    pub name: String,
+    /// The person's email address.
+    pub email: String,
+}
+
+/// One role a saved query may be shared with.
+#[derive(Debug, Clone, PartialEq, Eq, FromRow)]
+pub struct GranteeRole {
+    /// The role's id.
+    pub id: Uuid,
+    /// The role's name.
+    pub name: String,
+}
+
+/// The people and the roles a saved query may be shared with.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GranteeMatches {
+    /// The people of the tenant, or of the deployment when the search
+    /// names no tenant.
+    pub people: Vec<GranteePerson>,
+    /// The roles of the deployment.
+    pub roles: Vec<GranteeRole>,
+}
+
+/// The `ILIKE` pattern that matches `needle` as a literal substring.
+///
+/// `%`, `_` and `\` are the wildcards of `ILIKE`; the escape character
+/// comes first, so a literal `\` survives the pass that escapes the two
+/// wildcards and never turns into one. An empty needle gives the
+/// pattern `%`, which matches every row: an empty search box shows the
+/// first people rather than nothing.
+pub(crate) fn escape_like_pattern(needle: &str) -> String {
+    let escaped = needle
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    format!("%{escaped}%")
+}
+
+/// The people and the roles a saved query may be shared with.
+///
+/// The people are the members of `tenant_id` (through `app_user_tenant`)
+/// whose name or email holds `needle`, and only the active ones: an
+/// inactive person is nobody to share with. With no tenant the search
+/// covers every person of the deployment.
+///
+/// The roles are the roles whose name holds `needle`. The `role` table
+/// has no tenant column — a person's tenants live in `app_user_tenant` —
+/// so a role is a property of the deployment and every role of it is a
+/// possible grantee.
+///
+/// `%`, `_` and `\` in `needle` are literals, not wildcards.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if a query fails.
+pub async fn search_grantees(
+    pool: &PgPool,
+    tenant_id: Option<Uuid>,
+    needle: &str,
+    limit: i64,
+) -> Result<GranteeMatches, StoreError> {
+    // A limit of zero asks for no rows, and Postgres refuses a negative
+    // one, so the caller's number is clamped here.
+    let limit = limit.max(0);
+    let pattern = escape_like_pattern(needle.trim());
+    let people: Vec<GranteePerson> = sqlx::query_as(
+        "SELECT u.id, u.name, u.email FROM app_user u \
+         WHERE u.status = 'active' \
+           AND ($1::uuid IS NULL OR EXISTS ( \
+                SELECT 1 FROM app_user_tenant t \
+                 WHERE t.user_id = u.id AND t.tenant_id = $1)) \
+           AND (u.name ILIKE $2 OR u.email ILIKE $2) \
+         ORDER BY u.name, u.email LIMIT $3",
+    )
+    .bind(tenant_id)
+    .bind(&pattern)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    let roles: Vec<GranteeRole> =
+        sqlx::query_as("SELECT id, name FROM role WHERE name ILIKE $1 ORDER BY name LIMIT $2")
+            .bind(&pattern)
+            .bind(limit)
+            .fetch_all(pool)
+            .await?;
+    Ok(GranteeMatches { people, roles })
 }
 
 #[cfg(test)]
@@ -1118,5 +1515,59 @@ mod tests {
         assert!(is_personal_space(&tree, personal.id));
         assert!(!is_personal_space(&tree, ordinary.id));
         assert!(!is_personal_space(&tree, Uuid::from_u128(999)));
+    }
+
+    /// A personal space carries a name the system wrote, and it blocks
+    /// nobody: an ordinary folder may carry the same name.
+    #[test]
+    fn a_personal_space_blocks_no_name() {
+        let personal = folder(Uuid::from_u128(200), None, true, Some(PERSON));
+        let tree = vec![personal.clone()];
+        assert_eq!(
+            check_placement(&tree, None, &personal.name, None),
+            Ok(personal.name.clone()),
+            "the personal space's name is free for an ordinary folder"
+        );
+    }
+
+    /// Every rule the placement breaks has its own answer, so the route
+    /// layer can tell "the name is taken" from "the name is invalid".
+    #[test]
+    fn every_broken_rule_has_its_own_answer() {
+        assert!(matches!(
+            FolderError::from(FolderRule::NameRequired),
+            FolderError::InvalidName
+        ));
+        assert!(matches!(
+            FolderError::from(FolderRule::NameTooLong),
+            FolderError::InvalidName
+        ));
+        assert!(matches!(
+            FolderError::from(FolderRule::DuplicateName),
+            FolderError::DuplicateName
+        ));
+        assert!(matches!(
+            FolderError::from(FolderRule::ParentNotFound),
+            FolderError::NotFound
+        ));
+        assert!(matches!(
+            FolderError::from(FolderRule::Cycle),
+            FolderError::Cycle
+        ));
+        assert!(matches!(
+            FolderError::from(FolderRule::TooDeep),
+            FolderError::TooDeep
+        ));
+    }
+
+    /// The wildcards of the match are literals: the escape character is
+    /// escaped first, so a literal `\` is not turned into a wildcard by
+    /// the pass that escapes the two others.
+    #[test]
+    fn the_wildcards_of_the_match_are_escaped() {
+        assert_eq!(escape_like_pattern("plain"), "%plain%");
+        assert_eq!(escape_like_pattern("50%"), "%50\\%%");
+        assert_eq!(escape_like_pattern("a_b"), "%a\\_b%");
+        assert_eq!(escape_like_pattern("a\\b"), "%a\\\\b%");
     }
 }
