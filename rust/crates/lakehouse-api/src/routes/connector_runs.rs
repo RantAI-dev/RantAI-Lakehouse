@@ -306,6 +306,10 @@ pub struct ChangeCaptureResponse {
     /// absent when not supported. Never a fabricated `running`.
     #[serde(skip_serializing_if = "Option::is_none")]
     state: Option<&'static str>,
+    /// Each selected table's lag, the worst one, the lag limit and whether its
+    /// alert is open (`SRC-4` slice 4); absent when not supported.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lag: Option<super::capture_lag::LagReadout>,
 }
 
 /// Shown for a connector that does not capture changes.
@@ -330,24 +334,35 @@ pub async fn change_capture(
             supported: false,
             reason: Some(NOT_CHANGE_CAPTURE),
             state: None,
+            lag: None,
         }));
     }
-    let state_word = match crate::cdc_lifecycle::capture_state(&state, &id).await? {
+    let found = crate::cdc_lifecycle::capture_state(&state, &id).await?;
+    let state_word = match &found {
         CaptureState::NotConfigured => {
             return Ok(ApiJson(ChangeCaptureResponse {
                 supported: false,
                 reason: Some(crate::kafka_connect::NOT_CONFIGURED),
                 state: None,
+                lag: None,
             }));
         }
         CaptureState::NotCreated => "not_created",
         CaptureState::Unreachable => "unreachable",
         CaptureState::State(found) => found.word(),
     };
+    // Up to date needs the capture to be running, not only an empty topic
+    // (`crate::capture_lag`).
+    let running = matches!(
+        found,
+        CaptureState::State(crate::kafka_connect::ConnectState::Running)
+    );
+    let lag = super::capture_lag::read_lag(&state, &id, running, OffsetDateTime::now_utc()).await?;
     Ok(ApiJson(ChangeCaptureResponse {
         supported: true,
         reason: None,
         state: Some(state_word),
+        lag: Some(lag),
     }))
 }
 

@@ -840,4 +840,69 @@ mod tests {
         let (status, _) = call(&h, &stranger, "PUT", &uri, Some(json!({ "minutes": 5 }))).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
+
+    /// The change-capture read gives each table's lag in fixed words: a table
+    /// nobody reported is "not known yet", an empty topic with the capture
+    /// running is "up to date", changes waiting is "behind" with the seconds, the
+    /// worst table is named, and a person's pause shows no number.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_change_capture_read_words_each_tables_lag_and_never_invents_one(
+        pool: sqlx::PgPool,
+    ) {
+        let h = harness(&pool, true).await;
+        let id = cdc_connector(&h, "lag seven").await;
+        let me = user(&[h.tenant]);
+        let uri = format!("/api/connectors/{id}/change-capture");
+        let (_, answer) = call(&h, &me, "GET", &uri, None).await;
+        assert_eq!(answer["state"], "running", "{answer}");
+        assert_eq!(answer["lag"]["limitMinutes"], 15);
+        assert_eq!(answer["lag"]["alertOpen"], false);
+        let statuses: Vec<&str> = answer["lag"]["tables"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["status"].as_str().unwrap())
+            .collect();
+        assert_eq!(statuses, ["not_known_yet", "not_known_yet"]);
+        assert!(answer["lag"].get("worst").is_none());
+
+        post(
+            &h,
+            &id,
+            json!({ "tables": [
+                { "table": "public.orders", "backlog": 9, "lastSourceTsMs": now_ms() - 90_000 },
+                { "table": "public.items", "backlog": 0 },
+            ]}),
+        )
+        .await;
+        let (_, answer) = call(&h, &me, "GET", &uri, None).await;
+        let tables = answer["lag"]["tables"].as_array().unwrap();
+        let by_name = |name: &str| tables.iter().find(|t| t["table"] == name).unwrap().clone();
+        assert_eq!(by_name("public.items")["status"], "up_to_date");
+        let orders = by_name("public.orders");
+        assert_eq!(orders["status"], "behind");
+        let seconds = orders["seconds"].as_i64().unwrap();
+        assert!((90..=100).contains(&seconds), "{seconds}");
+        assert_eq!(answer["lag"]["worst"]["table"], "public.orders");
+
+        // Seen long ago: not known since, with the time, not a stale number.
+        sqlx::query(
+            "UPDATE connector_capture_table SET observed_at = now() - interval '10 minutes' \
+             WHERE connector_id = $1",
+        )
+        .bind(&id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let (_, answer) = call(&h, &me, "GET", &uri, None).await;
+        let first = &answer["lag"]["tables"][0];
+        assert_eq!(first["status"], "not_known_since", "{answer}");
+        assert!(first["since"].is_string());
+        assert!(first.get("seconds").is_none());
+
+        connectors::pause_connector(&pool, &id).await.unwrap();
+        let (_, answer) = call(&h, &me, "GET", &uri, None).await;
+        assert_eq!(answer["lag"]["tables"][0]["status"], "paused");
+        assert!(answer["lag"]["tables"][0].get("seconds").is_none());
+    }
 }
