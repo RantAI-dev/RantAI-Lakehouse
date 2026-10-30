@@ -213,4 +213,169 @@ handoff.
 
 ## 8. Handoff (developer appends below)
 
+### Handoff (slice 1)
+
+Developer: a non-Opus coding agent. Branch `fix/sec-50-tenant-gate`. The
+plan's base (`main` at `9540552c`) is an ancestor of HEAD; the branch's
+merge-base with the current `origin/main` is `4ce58470`, and the 7 commits
+above it are the ones listed below. Everything below was run in the
+foreground on bluefin through `/home/shiro/rantai/bin/cargo-locked`; no
+`cargo clean`, no background job.
+
+#### Commits
+
+| Commit | What |
+| --- | --- |
+| `8180ce10` | `docs(plan): SEC-50, every statement passes the tenant gate` — the plan itself. |
+| `8343ccf6` | `feat(queries): one tenant gate entry point for every caller (SEC-50 T1)` — `GateActor` (`Caller` / `AsTenant` / `CatalogTenant`) and `gate_statement`, lifted out of the query path so every site asks the same gate. |
+| `42c29fdd` | `feat(pipelines): the tenant gate on the authored-pipeline rewrite (SEC-50 T2)` — `enforce_pipeline_sql` gates the statement as the pipeline's own tenant, before the policy rewrite. |
+| `e0436ab1` | `feat(gold): the tenant gate on the Gold export (SEC-50 T3)` — the export gates as the catalog's tenant, before the first read of the mart; the fingerprint read is gated too. |
+| `04cced98` | `feat(startup): the boot warning names every path that needs the catalog tenant (SEC-50 T4)` — `warn_if_catalog_tenant_unconfigured` names the new paths. |
+| `96b5b4af` | `docs(sec-50): what the tenant gate covers, and what an operator must set (SEC-50 T5)` — the feature page and `docs/OPERATIONS.md`. |
+| `abda61c4` | `test(pipelines): the lineage fixture gives its pipeline a tenant (SEC-50)` — the one fix this slice needed; see "The one failure SEC-50 caused" below. |
+
+#### Commands run, with their counts
+
+All from `rust/`, through `/home/shiro/rantai/bin/cargo-locked`:
+
+```text
+cargo fmt --check
+  exit 0
+
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+  exit 0
+
+cargo test --workspace          # > /tmp/sec50-test-full.log
+  exit 0 — 159 binaries, 8576 passed, 0 failed, 51 ignored
+```
+
+From the repo root:
+
+```text
+POSTGRES_PASSWORD=d RUSTFS_ACCESS_KEY=d RUSTFS_SECRET_KEY=d \
+LAKEKEEPER_ENCRYPTION_KEY=d CONNECTOR_SECRETS_KEY=d \
+  docker compose --profile '*' config --quiet
+  -> compose-ok
+
+git status
+  -> nothing to commit, working tree clean
+```
+
+Scoped, while fixing the one failure (per `AGENTS.md`, "Keep build time down"):
+
+```text
+cargo test -p lakehouse-api --test column_lineage_pipeline
+  -> 7 passed; 0 failed
+cargo fmt --check && cargo clippy -p lakehouse-api --all-targets --all-features -- -D warnings
+  -> exit 0
+```
+
+#### The one failure SEC-50 caused, and what was done about it
+
+The first full workspace run stopped at the first failing binary (cargo is
+fail-fast by default) and reported **19 binaries, 5914 passed, 4 failed, 37
+ignored**, exit 101. The four failures were all in
+`rust/crates/lakehouse-api/tests/column_lineage_pipeline.rs`, and all four
+were SEC-50's gate:
+
+```text
+---- the_enforce_call_keeps_the_submitted_sql_in_postgres stdout ----
+thread '...' panicked at crates/lakehouse-api/tests/column_lineage_pipeline.rs:206:5:
+assertion `left == right` failed: {"error":"Table not found or not available to your organisation: bronze.orders"}
+  left: 404
+ right: 200
+```
+
+**This is a mismatch between the plan's D5 and an existing fixture, not a
+bug in the code.** T2's accept list says "a pipeline with NULL `tenant_id` →
+refused" (which is D5, and which the new
+`tests/pipeline_enforce.rs::a_pipeline_with_no_tenant_is_refused` asserts),
+while the same section also says "the existing tests still pass".
+`tests/column_lineage_pipeline.rs` seeded a tenant-NULL pipeline and expected
+the enforce call to answer `200`, so under D5 it is now a refusal. The two
+lines of the plan cannot both hold for that fixture.
+
+What was done: the **fixture** was changed, not the assertion. Every pipeline
+in that file now carries a tenant — Meridian Group
+(`11111111-1111-4111-8111-000000000001`), the tenant the seeded identity
+migration gives `yoga`, the author there — and the deployment names that
+tenant in `CATALOG_TENANT_ID`. The statement those tests read
+(`bronze.orders`) is a table no upload claimed, so only the catalog's own
+tenant may read it, which is what a pipeline that can run at all looks like
+now. The seven tests assert the same statuses and the same lineage mappings
+they asserted before; no assertion was weakened, removed or relaxed
+(`AGENTS.md` rule 2). `abda61c4` carries the reasoning.
+
+#### Mutation checks (section 5)
+
+Done by the previous session; the mutations were reverted and `git diff` was
+empty when this handoff started. Quoted from the logs:
+
+```text
+/tmp/sec50-mut-t2.log
+  thread 'a_pipeline_cannot_read_an_upload_table_another_tenant_claimed' panicked at
+    crates/lakehouse-api/tests/pipeline_enforce.rs:672:5:
+  assertion `left == right` failed: {"sql":"SELECT * FROM bronze.group_orders"}
+    left: 200
+   right: 404
+  test a_pipeline_cannot_read_an_upload_table_another_tenant_claimed ... FAILED
+  test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 16 filtered out; finished in 0.97s
+
+/tmp/sec50-mut-t3.log
+  thread 'a_job_with_no_catalog_tenant_is_refused_before_anything_reaches_the_engine' panicked at
+    crates/lakehouse-api/tests/gold_export_auth.rs:204:5:
+  assertion `left == right` failed: {"error":"Lakekeeper gold-export token is unavailable (check LAKEKEEPER_GOLD_EXPORT_TOKEN_FILE; see ADR 0011)"}
+    left: 503
+   right: 422
+  test a_job_with_no_catalog_tenant_is_refused_before_anything_reaches_the_engine ... FAILED
+  test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.98s
+```
+
+Both gates hold: with the gate removed, the cross-tenant pipeline reads the
+other tenant's upload table, and the job with no catalog tenant reaches the
+token file instead of being refused with D6's sentence.
+
+#### Did the AI gold tool need a change? (T3)
+
+**No, not one of its own.** The AI tool `export_gold_mart`
+(`rust/crates/lakehouse-api/src/routes/ai/tools/gold.rs:105`) calls
+`crate::gold_export::export_mart(...)` directly, and the gate lives inside
+`export_mart` (`rust/crates/lakehouse-api/src/gold_export.rs:670`), before
+the first read of the mart. So the copilot's tool goes through the gated path
+by construction, and there is no second copy of the gate to keep in step.
+
+The only line that changed in that file is mechanical: `export_mart` now
+takes `state` (it carries the deployment's tenant count and
+`CATALOG_TENANT_ID`), so the call site passes it. The other gated read, the
+export's content fingerprint, is gated in
+`rust/crates/lakehouse-api/src/routes/gold.rs:285` (`gated_source_table`),
+which is the route's own path.
+
+#### Not verified, with the reason
+
+- `bun run typecheck && bun run lint && bun run test` — **not run.** The slice
+  changes no TypeScript file: the branch touches 15 files, all Rust or
+  Markdown. Per `AGENTS.md` ("Only build what changed") and the plan's
+  section 6, which lists only the Rust and compose lines.
+- `python3 ops/lint/check_intra_package_imports.py &&
+  python3 ops/lint/check_bare_iceberg_count.py` and
+  `(cd dagster && python -m pytest dispar_orchestrate -q)` — **not run**, for
+  the same reason: no Python and no Dagster file changed.
+- `docker compose up` on a profile — **not run.** The slice changes no
+  compose file; section 6 asks for `config --quiet`, which passed. (`AGENTS.md`
+  rule 8 asks for a real `up` only for a compose edit.)
+- The `ops/g8` harnesses — **not run.** They need a live deployment. The
+  plan states they put the analyst in the catalog's tenant already, so they
+  should stay green; that is an expectation, not a measurement, and the
+  reviewer should run them.
+- Slice 2's mutation checks — out of this slice.
+- The reviewer's own re-run of the block above — the reviewer's job, per
+  `AGENTS.md` step 4.
+
+#### Not done, by rule
+
+- `docs/core/BACKLOG.md` was not touched (the reviewer sets the status, the
+  PR and the shipped date at merge).
+- No pull request was opened or merged (the developer never does).
+
 ## 9. Review (planner appends below)
