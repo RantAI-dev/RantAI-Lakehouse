@@ -22,7 +22,9 @@
 //!   change's source time and the last moment the table was up to date. The
 //!   later of the two keeps a table that was quiet for a day, then got one
 //!   change, from reading a day behind: it was up to date until that change
-//!   was made. The number is never larger than the true lag.
+//!   was made. The number is an upper bound, never smaller than the true lag
+//!   (caught up at 1000, a change made at 1020 not yet applied, now 1030: the
+//!   number is 30 s, the true lag 10 s). Slice 4 review SHOULD-FIX 1.
 
 use lakehouse_store::capture_lag::CaptureTable;
 use time::{Duration, OffsetDateTime};
