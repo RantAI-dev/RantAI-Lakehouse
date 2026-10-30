@@ -789,6 +789,11 @@ pub fn render_mongodb_connect_config(
         ("topic.prefix", format!("cdc.{connector_id}")),
         ("collection.include.list", include.join(",")),
         ("capture.mode", "change_streams_update_full".to_owned()),
+        // The default scope is the whole deployment, which needs the right to read every
+        // database; the database scope needs only the dial's own (`SRC-4` S5-h, Debezium's
+        // "Required permissions").
+        ("capture.scope", "database".to_owned()),
+        ("capture.target", dial.database.clone()),
         ("snapshot.mode", "initial".to_owned()),
         (
             "key.converter",
@@ -1311,6 +1316,8 @@ mod tests {
             ("topic.prefix", "cdc.conn-m1"),
             ("collection.include.list", "shop.orders,shop.items"),
             ("capture.mode", "change_streams_update_full"),
+            ("capture.scope", "database"),
+            ("capture.target", "shop"),
             ("snapshot.mode", "initial"),
             (
                 "key.converter",
