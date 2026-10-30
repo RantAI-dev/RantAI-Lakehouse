@@ -52,14 +52,29 @@ export function ConnectorChangeCapturePanel({
     return () => clearInterval(timer)
   }, [reload])
 
+  // Slice 4 review SHOULD-FIX 5: Pause and Resume need no state read (the routes do not), so a
+  // paused connector keeps its Resume when the read fails or says unsupported.
+  const controls = (
+    <CaptureState connectorId={connectorId} state={undefined} pausedReason={pausedReason} onChanged={() => onChanged?.()} />
+  )
   if (capture.status === "loading") return <LoadingSkeleton rows={3} />
-  if (capture.status === "error") return <ErrorState error={capture.error} onRetry={capture.reload} />
+  if (capture.status === "error") {
+    return (
+      <div className="flex flex-col gap-4">
+        <ErrorState error={capture.error} onRetry={capture.reload} />
+        {controls}
+      </div>
+    )
+  }
   const data = capture.data
   if (!data.supported) {
     return (
-      <p className="rounded-md border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
-        {data.reason ?? "Change capture is not available for this connector."}
-      </p>
+      <div className="flex flex-col gap-4">
+        <p className="rounded-md border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+          {data.reason ?? "Change capture is not available for this connector."}
+        </p>
+        {controls}
+      </div>
     )
   }
   return (

@@ -102,4 +102,18 @@ describe("ConnectorChangeCapturePanel", () => {
     )
     expect(calls.find((c) => c.method === "PUT")?.body).toEqual({ minutes: 30 })
   })
+
+  it("keeps Resume for a paused connector when the state cannot be read (Slice 4 review SHOULD-FIX 5)", async () => {
+    const calls: Call[] = []
+    global.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input).replace(/^https?:\/\/[^/]+/, "")
+      calls.push({ url, method: init?.method ?? "GET", body: undefined })
+      if (url.endsWith("/change-capture")) return json({ error: "the store is unavailable" }, 503)
+      if (url.endsWith("/resume")) return json({ resumed: true })
+      throw new Error(`unexpected fetch: ${url}`)
+    }) as unknown as typeof fetch
+    render(<ConnectorChangeCapturePanel connectorId="conn-a" pausedReason="Paused by a person" />)
+    fireEvent.click(await screen.findByRole("button", { name: "Resume" }))
+    await waitFor(() => expect(calls.some((c) => c.method === "POST" && c.url.endsWith("/resume"))).toBe(true))
+  })
 })
