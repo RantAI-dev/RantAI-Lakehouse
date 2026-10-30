@@ -494,6 +494,9 @@ async fn probe_dial(
     let target = match &parsed {
         Dial::Sql(dial) => DialTarget::from(dial),
         Dial::Cdc(dial) => DialTarget::from(dial),
+        // `SRC-4` slice 5: the API has no `MongoDB` client; like a batch `MongoDB`
+        // connector, only the orchestrator dials it.
+        Dial::CdcMongo(_) => return Outcome::not_testable_here("MongoDB"),
         Dial::Files(_)
         | Dial::Rest(_)
         | Dial::Sheets(_)

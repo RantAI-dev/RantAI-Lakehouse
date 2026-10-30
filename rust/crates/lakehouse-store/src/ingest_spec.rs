@@ -161,6 +161,48 @@ impl CdcSslMode {
     }
 }
 
+/// The only driver value a [`CdcMongoDial`] carries. A one-variant enum rather
+/// than a free string, so a typo fails at parse time like every other driver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CdcMongoDriver {
+    /// `MongoDB`.
+    Mongodb,
+}
+
+/// The connection shape for a `MongoDB` change-capture connector (`SRC-4`
+/// slice 5, decision S5-a): a `cdc` dial whose `driver` is `mongodb`.
+///
+/// It is its own shape and not a fifth [`SqlDriver`]: `MongoDB` is not SQL, and
+/// [`SqlDriver`] also feeds the batch `sql` adapter. [`Dial::parse`] reads
+/// `driver` first and parses this shape for `mongodb`, [`CdcDial`] for every
+/// other value.
+///
+/// `hosts` is the explicit seed list, each `host:port` checked by
+/// [`validate_hostname`] and, at save time, by the API's SSRF check, **every**
+/// entry (decision S5-b). There is no `mongodb+srv` and no free-form
+/// connection string: `deny_unknown_fields` refuses an `srvUri` or a `uri`.
+/// `replicaSet` is required because change streams need a replica set.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct CdcMongoDial {
+    /// Always `mongodb`.
+    pub driver: CdcMongoDriver,
+    /// The explicit `host:port` seeds of the replica set.
+    pub hosts: Vec<String>,
+    /// The database to capture; also the authentication database.
+    pub database: String,
+    /// A literal username, never a `secretRef`-shaped indirection (see
+    /// [`SqlDial::user`]).
+    pub user: String,
+    /// The name of the replica set (`rs.status().set`): required.
+    pub replica_set: String,
+    /// How the change-capture worker secures its connection to the source;
+    /// absent means [`CdcSslMode::Require`] (as for [`CdcDial`]).
+    #[serde(default)]
+    pub ssl_mode: CdcSslMode,
+}
+
 /// A closed set of object-storage protocols a `files` adapter's `dial`
 /// may name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -571,6 +613,9 @@ pub enum Dial {
     Sql(SqlDial),
     /// A change-data-capture `cdc` adapter's dial.
     Cdc(CdcDial),
+    /// A `MongoDB` change-capture dial: a `cdc` adapter whose `driver` is
+    /// `mongodb` (`SRC-4` slice 5).
+    CdcMongo(CdcMongoDial),
     /// A `mongodb` adapter's dial.
     Mongo(MongoDial),
     /// A `kafka` adapter's dial.
@@ -614,6 +659,15 @@ impl Dial {
                 check_hostname(adapter, "host", &dial.host)?;
                 validate_sql_dial_post_parse(adapter, &dial)?;
                 Ok(Dial::Sql(dial))
+            }
+            // `SRC-4` slice 5 (S5-a): `driver` decides the shape, as the
+            // adapter decides it one level up. Only the exact word `mongodb`
+            // takes the `MongoDB` shape; every other value, a typo included,
+            // is parsed (and refused) by `CdcDial`.
+            "cdc" if raw.get("driver").and_then(serde_json::Value::as_str) == Some("mongodb") => {
+                let dial: CdcMongoDial = parse_dial(adapter, raw)?;
+                validate_cdc_mongo_dial_post_parse(adapter, &dial)?;
+                Ok(Dial::CdcMongo(dial))
             }
             "cdc" => {
                 let dial: CdcDial = parse_dial(adapter, raw)?;
@@ -667,6 +721,16 @@ impl Dial {
     pub fn as_cdc(&self) -> Option<&CdcDial> {
         match self {
             Dial::Cdc(dial) => Some(dial),
+            _ => None,
+        }
+    }
+
+    /// A typed accessor for the `MongoDB` change-capture variant, the
+    /// counterpart of [`Dial::as_cdc`].
+    #[must_use]
+    pub fn as_cdc_mongo(&self) -> Option<&CdcMongoDial> {
+        match self {
+            Dial::CdcMongo(dial) => Some(dial),
             _ => None,
         }
     }
@@ -750,6 +814,7 @@ impl Dial {
     /// | Adapter | Compared |
     /// | --- | --- |
     /// | `sql`, `cdc` | `driver`, `host`, `port`, `database` |
+    /// | `cdc` with `driver` `mongodb` | `hosts` (as a set), `database`, `replicaSet` |
     /// | `files` | `protocol`, `endpoint`, `bucket` |
     /// | `rest` | scheme, host and port of `baseUrl` |
     /// | `mongodb` | `hosts` (as a set), `database` |
@@ -795,6 +860,18 @@ impl Dial {
                     ("host", host_key(&cdc.host)),
                     ("port", cdc.port.to_string()),
                     ("database", cdc.database.clone()),
+                ],
+            ),
+            // `SRC-4` S5-a: the hosts as a set, the database and the replica
+            // set. A different replica set is a different cluster, so the
+            // stored credential must be supplied again.
+            Dial::CdcMongo(mongo) => TargetIdentity::new(
+                "cdc",
+                vec![
+                    ("driver", "mongodb".to_owned()),
+                    ("hosts", host_port_set_key(&mongo.hosts)),
+                    ("database", mongo.database.clone()),
+                    ("replicaSet", mongo.replica_set.clone()),
                 ],
             ),
             Dial::Files(files) => TargetIdentity::new(
@@ -1134,6 +1211,57 @@ fn validate_cdc_dial_post_parse(adapter: &str, dial: &CdcDial) -> Result<(), Ing
         // Oracle change capture is slice 6; until then its dial is parsed as
         // before, with none of the three.
         SqlDriver::Oracle => {}
+    }
+    Ok(())
+}
+
+/// The rule for a `MongoDB` change-capture dial's fields that serde cannot
+/// check (`SRC-4` decision S5-a). Every refusal is one fixed sentence naming
+/// the field, never a value. `database` and `replicaSet` are written into the
+/// connector's connection string and `collection.include.list`, so they are
+/// restricted to plain characters (no `,`, `.`, `/`, `?`, `&`, `=`, `@`).
+///
+/// # Errors
+///
+/// Returns [`IngestSpecError::InvalidDial`] for no host, a host that is not
+/// `host:port` with a port from 1 to 65535 or whose host [`validate_hostname`]
+/// rejects, an empty or implausible `database`, `replicaSet` or `user`.
+fn validate_cdc_mongo_dial_post_parse(
+    adapter: &str,
+    dial: &CdcMongoDial,
+) -> Result<(), IngestSpecError> {
+    let refuse = |message: &'static str| IngestSpecError::InvalidDial {
+        adapter: adapter.to_owned(),
+        source: serde::de::Error::custom(message),
+    };
+    if dial.hosts.is_empty() {
+        return Err(refuse("hosts needs at least one host:port"));
+    }
+    for host_port in &dial.hosts {
+        let (host, port) = split_host_port(adapter, "hosts", host_port)?;
+        check_hostname(adapter, "hosts", host)?;
+        if !matches!(port.parse::<u16>(), Ok(1..=u16::MAX)) {
+            return Err(refuse("hosts entries need a port from 1 to 65535"));
+        }
+    }
+    let plain = |value: &str, extra: &[u8], max: usize| {
+        (1..=max).contains(&value.len())
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || extra.contains(&b))
+    };
+    if !plain(&dial.database, b"_-", 63) {
+        return Err(refuse(
+            "database must be 1 to 63 letters, digits, underscores or hyphens",
+        ));
+    }
+    if !plain(&dial.replica_set, b"_-.", 128) {
+        return Err(refuse(
+            "replicaSet must be 1 to 128 letters, digits, underscores, hyphens or dots:              the name in the server's replica set configuration",
+        ));
+    }
+    if dial.user.is_empty() {
+        return Err(refuse("user must not be empty"));
     }
     Ok(())
 }
@@ -3441,6 +3569,125 @@ mod target_identity_tests {
         );
         // MySQL's server id is not part of the target.
         assert!(same("cdc", &mysql, "serverId", json!(8)));
+    }
+
+    fn cdc_mongo() -> Value {
+        json!({
+            "driver": "mongodb",
+            "hosts": ["mongo-a.internal:27017", "mongo-b.internal:27017"],
+            "database": "shop", "user": "reader", "replicaSet": "rs0"
+        })
+    }
+
+    /// `SRC-4` S5-a: the hosts as a set, the database and the replica set are the target;
+    /// the user, the TLS mode, and the order or case of the hosts are not.
+    #[test]
+    fn a_mongodb_cdc_dial_is_re_pointed_by_hosts_database_or_replica_set() {
+        let base = cdc_mongo();
+        assert!(!same(
+            "cdc",
+            &base,
+            "hosts",
+            json!(["mongo-a.internal:27017"])
+        ));
+        assert!(!same(
+            "cdc",
+            &base,
+            "hosts",
+            json!(["mongo-a.internal:27018", "mongo-b.internal:27017"])
+        ));
+        assert!(!same("cdc", &base, "database", json!("billing")));
+        assert!(!same("cdc", &base, "replicaSet", json!("rs1")));
+        assert!(same("cdc", &base, "user", json!("someone_else")));
+        assert!(same("cdc", &base, "sslMode", json!("disable")));
+        assert!(same(
+            "cdc",
+            &base,
+            "hosts",
+            json!(["MONGO-B.internal:27017", "mongo-a.internal:27017"])
+        ));
+        // A MongoDB target is never equal to a SQL one.
+        let postgres = json!({
+            "driver": "postgres", "host": "mongo-a.internal", "port": 27017,
+            "database": "shop", "user": "reader",
+            "slotName": "s", "publicationName": "p"
+        });
+        assert_ne!(
+            parse("cdc", &base).target_identity(),
+            parse("cdc", &postgres).target_identity()
+        );
+    }
+
+    #[test]
+    fn a_mongodb_cdc_dial_parses_to_its_own_variant_and_a_sql_one_does_not() {
+        assert!(matches!(
+            parse("cdc", &cdc_mongo()),
+            Dial::CdcMongo(ref dial) if dial.replica_set == "rs0" && dial.hosts.len() == 2
+        ));
+        assert!(parse("cdc", &cdc_mongo()).as_cdc().is_none());
+        assert!(parse("cdc", &cdc_mongo()).as_cdc_mongo().is_some());
+        let postgres = json!({
+            "driver": "postgres", "host": "db.internal", "port": 5432,
+            "database": "orders", "user": "reader",
+            "slotName": "s", "publicationName": "p"
+        });
+        assert!(parse("cdc", &postgres).as_cdc_mongo().is_none());
+    }
+
+    #[test]
+    fn a_mongodb_cdc_dial_refuses_what_it_does_not_know_or_cannot_dial_safely() {
+        let refused = |field: &str, value: Value| {
+            let mut dial = cdc_mongo();
+            dial[field] = value;
+            Dial::parse("cdc", &dial).is_err()
+        };
+        // The replica set is required, and plain characters only.
+        let mut without = cdc_mongo();
+        without.as_object_mut().unwrap().remove("replicaSet");
+        assert!(Dial::parse("cdc", &without).is_err());
+        assert!(refused("replicaSet", json!("")));
+        assert!(refused("replicaSet", json!("rs0&authSource=admin")));
+        // No connection string of the person's own, no SRV, no PostgreSQL fields.
+        for (field, value) in [
+            ("uri", json!("mongodb://x")),
+            ("srvUri", json!("mongodb+srv://x")),
+            ("slotName", json!("s")),
+            ("serverId", json!(7)),
+            ("host", json!("h")),
+        ] {
+            assert!(refused(field, value), "{field} must be refused");
+        }
+        // Hosts: at least one, each host:port with a valid host and port.
+        assert!(refused("hosts", json!([])));
+        assert!(refused("hosts", json!(["mongo-a.internal"])));
+        assert!(refused("hosts", json!(["mongo-a.internal:0"])));
+        assert!(refused("hosts", json!(["mongo-a.internal:70000"])));
+        assert!(refused("hosts", json!(["mongo{a}.internal:27017"])));
+        assert!(refused(
+            "hosts",
+            json!(["mongo-a.internal:27017", "bad;host:27017"])
+        ));
+        // Database and user.
+        assert!(refused("database", json!("")));
+        assert!(refused("database", json!("shop.orders")));
+        assert!(refused("database", json!("shop,other")));
+        assert!(refused("user", json!("")));
+        assert!(refused("sslMode", json!("prefer")));
+        // The driver word is exact: a different spelling is the SQL shape and fails there.
+        assert!(refused("driver", json!("Mongodb")));
+    }
+
+    #[test]
+    fn a_mongodb_cdc_dial_defaults_to_require_and_reads_every_mode() {
+        let Dial::CdcMongo(dial) = parse("cdc", &cdc_mongo()) else {
+            panic!("a MongoDB CDC dial");
+        };
+        assert_eq!(dial.ssl_mode, super::CdcSslMode::Require);
+        for mode in ["disable", "require", "verify-ca", "verify-full"] {
+            let mut json = cdc_mongo();
+            json["sslMode"] = json!(mode);
+            assert!(Dial::parse("cdc", &json).is_ok(), "{mode}");
+        }
     }
 
     #[test]

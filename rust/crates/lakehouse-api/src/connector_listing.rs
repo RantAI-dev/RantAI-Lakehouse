@@ -1163,6 +1163,7 @@ pub async fn dispatch(
         // by the vendor's own module in the orchestrator, never by the API.
         Dial::Sql(_)
         | Dial::Cdc(_)
+        | Dial::CdcMongo(_)
         | Dial::Rest(_)
         | Dial::Mongo(_)
         | Dial::Kafka(_)

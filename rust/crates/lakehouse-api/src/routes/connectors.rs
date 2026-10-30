@@ -2501,6 +2501,13 @@ async fn deprovision_postgres_connector(
                      parse as a CDC dial; see the server log for the parse error"
                 ))
             })?;
+            // `SRC-4` slice 5: a `MongoDB` change stream keeps no server-side object
+            // for this connector (the resume token lives in `Kafka Connect`'s offsets),
+            // so there is nothing to drop; the worker's connector and the password file
+            // are removed by the delete route, as for every change-capture connector.
+            if dial.as_cdc_mongo().is_some() {
+                return Ok(None);
+            }
             let Some(cdc) = dial.as_cdc() else {
                 // Unreachable in practice (`Dial::parse("cdc", ..)` only
                 // ever returns `Dial::Cdc`), but matched honestly rather
@@ -3084,8 +3091,32 @@ async fn check_dial_ssrf(
         // already has (its dial names a spreadsheet id, not a
         // caller-chosen host). The authoritative check for these
         // adapters stays in Dagster, not here.
-        Dial::Sheets(_) | Dial::Mongo(_) | Dial::Kafka(_) | Dial::Sftp(_) | Dial::Saas(_) => None,
+        // `SRC-4` S5-b: a `MongoDB` change-capture dial has several hosts, all checked
+        // below, so it has no single `host_port`.
+        Dial::Sheets(_)
+        | Dial::Mongo(_)
+        | Dial::CdcMongo(_)
+        | Dial::Kafka(_)
+        | Dial::Sftp(_)
+        | Dial::Saas(_) => None,
     };
+    // `SRC-4` S5-b: Kafka Connect dials every seed the connection string names, so every
+    // entry of `hosts` is checked, not only the first. (`Dial::parse` has already refused
+    // an entry that is not `host:port` with a numeric port, so `filter_map` drops nothing.)
+    if let Dial::CdcMongo(mongo) = dial {
+        for seed in &mongo.hosts {
+            let Some((host, port)) = seed
+                .rsplit_once(':')
+                .and_then(|(host, port)| Some((host, port.parse::<u16>().ok()?)))
+            else {
+                continue;
+            };
+            connector_probe::resolve_checked(host, port, internal_hosts)
+                .await
+                .map(|_approved| ())
+                .map_err(ApiError::BadRequest)?;
+        }
+    }
     for url in &saas_urls {
         if let Some((host, port)) = connector_probe::parse_endpoint_host_port(url) {
             connector_probe::resolve_checked(host, port, internal_hosts)
