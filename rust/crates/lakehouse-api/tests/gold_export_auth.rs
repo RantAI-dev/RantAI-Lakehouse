@@ -27,13 +27,28 @@ mod common;
 
 use std::collections::HashMap;
 
-use axum::body::Body;
+use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use lakehouse_auth::Secret;
+use serde_json::Value;
 use tower::ServiceExt;
 use uuid::Uuid;
+use wiremock::matchers::method;
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use common::{TestApp, spin_up_with_env};
+
+/// The token the scheduler sends in these tests.
+const TOKEN: &str = "gold-export-scheduler-fixture-token";
+
+/// `SEC-50` D6: the one sentence a job with no user is refused with when
+/// the deployment holds several tenants and no tenant owns the shared
+/// catalog.
+const JOB_NEEDS_CATALOG_TENANT: &str = "This job reads the shared catalog, and no tenant owns it here. Set CATALOG_TENANT_ID to the tenant that owns this deployment's shared catalog.";
+
+/// The tenant that owns the shared catalog — Meridian Group, the first
+/// tenant `0002_seed_identity.sql` seeds.
+const CATALOG_TENANT: &str = "11111111-1111-4111-8111-000000000001";
 
 /// Seeds the `gold-export-scheduler` identity + credential exactly the way
 /// `main::bootstrap_gold_export_service` does — same production
@@ -132,5 +147,150 @@ async fn scheduler_headers_clear_auth_gate_and_check_export_token_once_the_ident
         !text.contains("gold export is not configured"),
         "check_export_token treated the export as unconfigured despite the \
          configured token: {text}"
+    );
+}
+
+/// A `ClickHouse` stand-in that answers every statement with an empty
+/// result: the export's first read is the mart's fingerprint, and the
+/// test is about what did NOT reach it.
+async fn mount_engine() -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "meta": [], "data": [], "rows": 0,
+        })))
+        .mount(&server)
+        .await;
+    server
+}
+
+/// The error body of a refused export, as the caller reads it.
+async fn error_body(resp: axum::http::Response<Body>) -> (StatusCode, Value) {
+    let status = resp.status();
+    let bytes = to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("read response body");
+    let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, body)
+}
+
+/// The deployment the seeded identity migration creates: four tenants, so
+/// the deployment holds more than one.
+fn seeded_tenant_ids() -> [&'static str; 4] {
+    [
+        "11111111-1111-4111-8111-000000000001",
+        "11111111-1111-4111-8111-000000000002",
+        "11111111-1111-4111-8111-000000000003",
+        "11111111-1111-4111-8111-000000000004",
+    ]
+}
+
+/// `SEC-50`: the Gold export reads the SHARED catalog and no person is
+/// behind it, so it acts as the catalog's own tenant. A deployment that
+/// holds several tenants and names no catalog tenant has no tenant whose
+/// reach covers the shared catalog, so the export is refused — before
+/// anything reaches the engine.
+#[tokio::test]
+async fn a_job_with_no_catalog_tenant_is_refused_before_anything_reaches_the_engine() {
+    let engine = mount_engine().await;
+    let mut overrides = HashMap::new();
+    overrides.insert("GOLD_EXPORT_RUN_TOKEN".to_owned(), TOKEN.to_owned());
+    overrides.insert("CH_URL".to_owned(), engine.uri());
+    let TestApp { router, pool } = spin_up_with_env(&overrides).await;
+    seed_gold_export_service_credential(&pool, TOKEN).await;
+
+    let (status, body) = error_body(post_export_with_scheduler_headers(&router, TOKEN).await).await;
+
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(
+        body["error"].as_str(),
+        Some(JOB_NEEDS_CATALOG_TENANT),
+        "{body}"
+    );
+    let requests = engine
+        .received_requests()
+        .await
+        .expect("the mock engine records requests");
+    assert!(
+        requests.is_empty(),
+        "the refusal precedes the engine: nothing may be asked: {requests:?}"
+    );
+}
+
+/// The same deployment WITH a catalog tenant: the export behaves as it
+/// did before the gate — it reaches the engine.
+#[tokio::test]
+async fn a_job_with_a_catalog_tenant_reaches_the_engine_as_before() {
+    let engine = mount_engine().await;
+    let mut overrides = HashMap::new();
+    overrides.insert("GOLD_EXPORT_RUN_TOKEN".to_owned(), TOKEN.to_owned());
+    overrides.insert("CH_URL".to_owned(), engine.uri());
+    overrides.insert("CATALOG_TENANT_ID".to_owned(), CATALOG_TENANT.to_owned());
+    let TestApp { router, pool } = spin_up_with_env(&overrides).await;
+    seed_gold_export_service_credential(&pool, TOKEN).await;
+
+    let (status, body) = error_body(post_export_with_scheduler_headers(&router, TOKEN).await).await;
+
+    assert_ne!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "the gate refused an export the catalog's own tenant may run: {body}"
+    );
+    assert_ne!(
+        body["error"].as_str(),
+        Some(JOB_NEEDS_CATALOG_TENANT),
+        "the gate refused an export the catalog's own tenant may run: {body}"
+    );
+    let requests = engine
+        .received_requests()
+        .await
+        .expect("the mock engine records requests");
+    assert!(
+        !requests.is_empty(),
+        "the export reads the mart, so the engine must have been asked"
+    );
+}
+
+/// A deployment with ONE tenant holds no other tenant's table to reach,
+/// so the gate changes nothing there: the export behaves as it did
+/// before.
+#[tokio::test]
+async fn a_deployment_with_one_tenant_reaches_the_engine_as_before() {
+    let engine = mount_engine().await;
+    let mut overrides = HashMap::new();
+    overrides.insert("GOLD_EXPORT_RUN_TOKEN".to_owned(), TOKEN.to_owned());
+    overrides.insert("CH_URL".to_owned(), engine.uri());
+    let TestApp { router, pool } = spin_up_with_env(&overrides).await;
+    seed_gold_export_service_credential(&pool, TOKEN).await;
+    // Every tenant but the first goes, with its memberships: the
+    // deployment holds one tenant now.
+    for tenant in seeded_tenant_ids().iter().skip(1) {
+        let tenant_id: Uuid = tenant.parse().expect("a seeded tenant id");
+        sqlx::query("DELETE FROM app_user_tenant WHERE tenant_id = $1")
+            .bind(tenant_id)
+            .execute(&pool)
+            .await
+            .expect("drop the memberships of the tenant that goes");
+        sqlx::query("DELETE FROM tenant WHERE id = $1")
+            .bind(tenant_id)
+            .execute(&pool)
+            .await
+            .expect("drop the tenant");
+    }
+
+    let (status, body) = error_body(post_export_with_scheduler_headers(&router, TOKEN).await).await;
+
+    assert_ne!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "a one-tenant deployment is never refused: {body}"
+    );
+    let requests = engine
+        .received_requests()
+        .await
+        .expect("the mock engine records requests");
+    assert!(
+        !requests.is_empty(),
+        "the export reads the mart, so the engine must have been asked"
     );
 }

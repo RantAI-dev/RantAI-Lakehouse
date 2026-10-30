@@ -87,6 +87,15 @@ async fn spin_up_with_clickhouse() -> (TestApp, ChClient) {
     let (ch_url, _container) = shared_clickhouse().await;
     let mut overrides = HashMap::new();
     overrides.insert("CH_URL".to_owned(), ch_url.clone());
+    // `SEC-50`: the export reads the SHARED catalog and no person is
+    // behind it, so it acts as the catalog's own tenant — and a
+    // deployment that holds several tenants (the four the seeded
+    // identity migration creates) and names no catalog tenant refuses
+    // the export outright.
+    overrides.insert(
+        "CATALOG_TENANT_ID".to_owned(),
+        "11111111-1111-4111-8111-000000000001".to_owned(),
+    );
     let app = spin_up_with_env(&overrides).await;
     let ch = ChClient::new(ch_url.clone(), "default".to_owned(), String::new());
     (app, ch)

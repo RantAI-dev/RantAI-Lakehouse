@@ -95,6 +95,10 @@ impl From<GoldExportError> for ApiError {
             // own fixed, non-leaking text (`export_batch_sql` never wraps
             // the raw Postgres/sqlparser error), matching AGENTS.md rule 4.
             | GoldExportError::PolicyRefused(_) => Self::Unprocessable(err.to_string()),
+            // SEC-50: the tenant gate's own error travels as it is, so
+            // the caller sees the status the gate would have answered
+            // (its fixed sentence, never an upstream text).
+            GoldExportError::TenantGateRefused(gate) => gate,
             // SEC-11: the Iceberg writer's text (catalog URLs, object keys)
             // goes to the log under a reference, not into the body.
             GoldExportError::Iceberg(e) => {
@@ -260,6 +264,36 @@ pub(crate) async fn read_catalog_token(path: &str) -> Result<SecretValue, ApiErr
     .await
 }
 
+/// `SEC-50`: the name the export reads the mart under, and the tenant
+/// gate on it.
+///
+/// The export reads the SHARED catalog and no person is behind it, so it
+/// acts as the catalog's own tenant. A deployment that holds several
+/// tenants and names no catalog tenant has no tenant whose reach covers
+/// the shared catalog, and the export is refused — before the
+/// fingerprint, which is the export's first read.
+///
+/// `export_mart` asks the same gate for the rows it reads, so a caller
+/// that reaches the export through another path (the copilot's tool) is
+/// gated there too.
+///
+/// # Errors
+///
+/// The gate's own errors: 422 with the fixed sentence of
+/// [`crate::routes::query::JOB_NEEDS_CATALOG_TENANT`] for a deployment
+/// with several tenants and no catalog tenant.
+async fn gated_source_table(state: &AppState, mart: &str) -> Result<String, ApiError> {
+    let source_table = format!("{}.`{}`", state.config.gold_source_schema, mart);
+    crate::routes::query::gate_statement(
+        state,
+        &gold_export::mart_count_sql(&source_table),
+        &sqlparser::dialect::ClickHouseDialect {},
+        crate::routes::query::GateActor::CatalogTenant,
+    )
+    .await?;
+    Ok(source_table)
+}
+
 /// `POST /api/gold/export/{mart}` — run the export.
 ///
 /// # Skip: `?ifChanged=true` (DATA-1 task 4, DATA-10)
@@ -293,7 +327,9 @@ pub(crate) async fn read_catalog_token(path: &str) -> Result<SecretValue, ApiErr
 /// # Errors
 ///
 /// Returns 401/503 from [`check_export_token`], `409` if an export of the
-/// SAME mart is already in flight, 503 if the Lakekeeper token cannot be
+/// SAME mart is already in flight, 422 with the tenant gate's fixed
+/// sentence when the deployment holds several tenants and names no
+/// catalog tenant (`SEC-50`), 503 if the Lakekeeper token cannot be
 /// read, 422 for an unsupported source column, a source mart over
 /// `GOLD_EXPORT_MAX_ROWS`, or a bad `ClickHouse` query, or 500 for an
 /// Iceberg catalog/write failure.
@@ -314,6 +350,14 @@ pub async fn export(
 
     let mart_ident =
         Ident::new(&mart).map_err(|e| ApiError::BadRequest(format!("invalid mart: {e}")))?;
+
+    // SEC-50: the export reads the SHARED catalog and no person is
+    // behind it, so it acts as the catalog's own tenant. The gate runs
+    // BEFORE the first read of the mart — the fingerprint below is that
+    // read — so a deployment that holds several tenants and names no
+    // catalog tenant refuses the export before anything reaches
+    // `ClickHouse`.
+    let source_table = gated_source_table(&state, mart_ident.as_str()).await?;
 
     // DATA-10 review SHOULD-FIX 1 / DATA-10 D2: The fingerprint is computed before
     // the export reads rows, and written on the history row of that export.
@@ -356,12 +400,6 @@ pub async fn export(
             ))
         })?;
 
-    let source_table = format!(
-        "{}.`{}`",
-        state.config.gold_source_schema,
-        mart_ident.as_str()
-    );
-
     let token = read_catalog_token(&state.config.lakekeeper_gold_export_token_file).await?;
     let iceberg_config = gold_export::iceberg_config(
         state.config.lakekeeper_catalog_uri.clone(),
@@ -396,6 +434,7 @@ pub async fn export(
 
     let started_at = time::OffsetDateTime::now_utc();
     let export_result = gold_export::export_mart(
+        &state,
         &state.clickhouse,
         &iceberg_config,
         &source_table,

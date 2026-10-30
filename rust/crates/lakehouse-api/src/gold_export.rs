@@ -75,12 +75,15 @@ use arrow_array::{
 };
 use iceberg::spec::{NestedField, PrimitiveType, Type};
 use lakehouse_clickhouse::{ChClient, ChColumn, ChError};
+use lakehouse_core::ApiError;
 use lakehouse_core::secret::SecretValue;
 use lakehouse_iceberg::{GoldTable, IcebergClient, IcebergClientConfig, IcebergError, gold};
 use serde_json::{Map, Value};
 use thiserror::Error;
 use time::Date;
 use time::format_description::well_known::Iso8601;
+
+use crate::state::AppState;
 
 /// Errors exporting a Gold mart to Iceberg.
 #[derive(Debug, Error)]
@@ -134,6 +137,12 @@ pub enum GoldExportError {
     /// any data is written to Iceberg at all.
     #[error("Gold export refused by the policy engine: {0}")]
     PolicyRefused(String),
+    /// `SEC-50`: the tenant gate refused the export before it read
+    /// anything. The gate's own error travels as it is, so the caller
+    /// sees the status the gate would have answered — a fixed sentence,
+    /// never an upstream text (`AGENTS.md` rule 4).
+    #[error("{0}")]
+    TenantGateRefused(#[from] ApiError),
 }
 
 /// One column's resolved Iceberg + Arrow shape, plus enough to parse a
@@ -441,6 +450,21 @@ fn order_by_clause(columns: &[ChColumn]) -> String {
         .join(", ")
 }
 
+/// The statement the export's row cap reads: `SELECT count() AS c FROM
+/// <mart>`.
+///
+/// It is also the statement the `SEC-50` gate checks, because it names
+/// the mart the export reads — one statement, one name, one gate, and
+/// the gate and the read can never drift apart.
+///
+/// `source_table` is the fully-qualified name the caller built (the
+/// schema, a dot, and the mart in backticks), so the statement names
+/// the same table the export reads.
+#[must_use]
+pub(crate) fn mart_count_sql(source_table: &str) -> String {
+    format!("SELECT count() AS c FROM {source_table}")
+}
+
 /// WS7 item D2: builds the exact same `SELECT`/`ORDER BY`/`LIMIT`/
 /// `OFFSET` batch query [`export_mart`]'s loop always built inline
 /// (unmasked — [`select_projection`]'s `DateTime`-cast-only behavior is
@@ -600,16 +624,20 @@ pub struct GoldExportResult {
 /// the first means earlier, already-masked/filtered batches were already
 /// appended to Iceberg (see [`export_batch_sql`]'s own doc comment on why
 /// this is re-checked per batch rather than assumed stable for the whole
-/// export).
+/// export); and [`GoldExportError::TenantGateRefused`] (`SEC-50`) is
+/// returned when the tenant gate refuses the export — before any row is
+/// read.
 #[allow(
     clippy::too_many_arguments,
     reason = "WS7 item D2 added roles/placeholders/obligations to the existing six \
               ch/iceberg_config/source_table/mart_name/max_rows/batch_size parameters; \
-              grouping them into a struct would only move the same nine facts one \
-              level of indirection away from every call site, not reduce what a \
-              caller must supply"
+              SEC-50 added the state, which carries the gate's own answers \
+              (the deployment's tenants and CATALOG_TENANT_ID); grouping them into a \
+              struct would only move the same ten facts one level of indirection away \
+              from every call site, not reduce what a caller must supply"
 )]
 pub async fn export_mart(
+    state: &AppState,
     ch: &ChClient,
     iceberg_config: &IcebergClientConfig,
     source_table: &str,
@@ -630,14 +658,29 @@ pub async fn export_mart(
     // knob" posture `Config::gold_export_batch_size` documents.
     let batch_size = batch_size.max(1);
 
+    // SEC-50: the export reads the SHARED catalog (`serving.*`, Silver,
+    // Gold) and no person is behind it, so it acts as the catalog's own
+    // tenant. The gate runs BEFORE the first read of the mart — the row
+    // count below — so a deployment that holds several tenants and names
+    // no catalog tenant refuses the export before anything reaches
+    // `ClickHouse`. It is the ONE gate every statement passes
+    // (`routes::query::gate_statement`), never a second copy of the
+    // reach logic (`AGENTS.md` rule 4).
+    let count_sql = mart_count_sql(source_table);
+    crate::routes::query::gate_statement(
+        state,
+        &count_sql,
+        &sqlparser::dialect::ClickHouseDialect {},
+        crate::routes::query::GateActor::CatalogTenant,
+    )
+    .await?;
+
     // Fix (1/3): the row cap is checked BEFORE any row data is read — a
     // mart already over the cap must never start streaming batches only
     // to be cut off midway (which would look, from the caller's
     // perspective, exactly like the silent truncation this cap exists to
     // prevent).
-    let count_result = ch
-        .query(&format!("SELECT count() AS c FROM {source_table}"), None)
-        .await?;
+    let count_result = ch.query(&count_sql, None).await?;
     let total_rows = match count_result.data.first() {
         Some(row) => cell_as_u64(row, "c")?,
         None => 0,

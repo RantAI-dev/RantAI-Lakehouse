@@ -103,6 +103,7 @@ pub(super) async fn export_gold_mart(
     };
     let obligations = crate::policy_engine::PolicyEngineObligations::from_state(state);
     match crate::gold_export::export_mart(
+        state,
         &state.clickhouse,
         &iceberg_config,
         &source_table,

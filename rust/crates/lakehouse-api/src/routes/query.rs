@@ -222,22 +222,6 @@ async fn rewrite_sql_for_principal_inner(
 /// first, and the actor says whose reach the statement is measured
 /// against. Nobody writes a second copy of the reach logic
 /// (`AGENTS.md` rule 4).
-///
-/// # Why the variants are `#[allow(dead_code)]`
-///
-/// `SEC-50` lands in slices: this task adds the shared entry point, and
-/// the tasks that follow wire the actors in (the authored pipelines
-/// construct `AsTenant`, the Gold export constructs `CatalogTenant`).
-/// Until those land, only this module's own tests construct them — and
-/// a variant nothing constructs yet is a `dead_code` warning, not a
-/// finding. The allow is removed when the last actor has a caller.
-#[allow(
-    dead_code,
-    reason = "SEC-50 T1 adds the shared gate entry point; the `AsTenant` and \
-              `CatalogTenant` actors are constructed by the tasks that wire them \
-              in (the authored pipelines and the Gold export), so until those land \
-              only this module's own tests construct them"
-)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum GateActor<'a> {
     /// The signed-in caller, with the request's headers: the tenant is
