@@ -29,8 +29,7 @@ use lakehouse_store::queries::{
 };
 use lakehouse_store::saved_query_access::{
     FolderError, Level, NewGrant, create_folder, delete_folder, ensure_personal_space,
-    grants_for_item, grants_for_viewer, move_folder, rename_folder, replace_grants,
-    search_grantees,
+    grants_for_viewer, move_folder, rename_folder, replace_grants, rules_for_item, search_grantees,
 };
 use sqlx::PgPool;
 use time::OffsetDateTime;
@@ -1876,7 +1875,7 @@ async fn the_rules_of_a_person_and_of_a_role_are_read_for_the_viewer(
     );
     assert_eq!(through_role[0].level, Level::Manage);
 
-    let on_item = grants_for_item(&pool, Some(query_id), None).await.unwrap();
+    let on_item = rules_for_item(&pool, Some(query_id), None).await.unwrap();
     assert_eq!(on_item.len(), 2, "the item carries both of its rules");
     Ok(())
 }

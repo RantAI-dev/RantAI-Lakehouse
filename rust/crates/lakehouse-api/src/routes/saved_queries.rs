@@ -26,10 +26,25 @@
 //! module says *what to tell the caller*. No upstream text ever reaches a
 //! response (`AGENTS.md` principle 4), and no sentence here names a row
 //! that the caller may not see.
+//!
+//! # The access lists
+//!
+//! The last surface here is the sharing one: who has what on a saved query
+//! or on a folder (`QS-3`). The list is read with **manage**, because
+//! managing an item includes sharing it: a person who may only see a query
+//! has no business seeing who else sees it. The list answers with the
+//! item's own rules and the rules it inherits from the folders above it,
+//! and the grantee search answers with the people and the roles of the
+//! caller's organisation — the two halves of one question, "who may I
+//! share this with?". A grantee that is not of the caller's organisation
+//! is refused before anything is written, so a refused change leaves the
+//! old rules exactly as they were.
+
+use std::collections::HashSet;
 
 use axum::Extension;
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use lakehouse_auth::Principal;
 use lakehouse_core::ApiError;
@@ -39,9 +54,13 @@ use lakehouse_store::queries::{
     self, FolderMove, SavedQuery, SavedQueryFolder, SavedQueryPatch, SavedQueryPlacement,
     SavedQueryTrashEntry, SavedQueryVersion,
 };
-use lakehouse_store::saved_query_access::{self, FolderError, FolderNode, Level};
+use lakehouse_store::saved_query_access::{
+    self, FolderError, FolderMap, FolderNode, GranteePerson, GranteeRole, ItemRule, Level, NewGrant,
+};
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 
 use crate::error::ApiResult;
@@ -115,6 +134,26 @@ pub(crate) const NOT_READ_ONLY: &str =
 /// The sentence a saved query without a title or without a statement is
 /// refused with.
 pub(crate) const TITLE_AND_SQL_REQUIRED: &str = "title and sql are required";
+
+/// The sentence a body of another shape is refused with.
+pub(crate) const ACCESS_BODY_SHAPE: &str =
+    "Body must be JSON {rules: [{userId?, roleId?, level}]}.";
+
+/// The sentence a rule that names two grantees or none, or a level outside
+/// the set, is refused with.
+pub(crate) const ACCESS_RULE_SHAPE: &str =
+    "Each rule must name one person or one role, and one of the levels view, edit or manage.";
+
+/// The sentence a grantee that is listed twice is refused with.
+pub(crate) const ACCESS_GRANTEE_TWICE: &str = "The same person or role is listed twice.";
+
+/// The sentence a grantee that does not exist, or a person of another
+/// organisation, is refused with.
+pub(crate) const ACCESS_GRANTEE_OUTSIDE: &str =
+    "A saved query can only be shared with a person or a role of your organisation.";
+
+/// How many people and how many roles the grantee search lists at most.
+pub(crate) const GRANTEE_LIMIT: i64 = 20;
 
 // ── The shared shapes ────────────────────────────────────────────────────
 
@@ -257,6 +296,183 @@ impl FolderNodeWire {
     }
 }
 
+/// One rule of an item's own access list, as the console sees it.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccessRuleWire {
+    /// The rule's own id.
+    pub id: String,
+    /// The person the rule names; `None` when the rule names a role.
+    pub user_id: Option<String>,
+    /// The role the rule names; `None` when the rule names a person.
+    pub role_id: Option<String>,
+    /// What the rule gives: "view", "edit" or "manage".
+    pub level: String,
+    /// Who wrote the rule; `None` when nobody is recorded.
+    pub granted_by: Option<String>,
+    /// When the rule was written.
+    pub granted_at: String,
+}
+
+impl AccessRuleWire {
+    /// The wire shape of a stored rule.
+    fn of(rule: &ItemRule) -> Self {
+        Self {
+            id: rule.id.to_string(),
+            user_id: rule.user_id.map(|id| id.to_string()),
+            role_id: rule.role_id.map(|id| id.to_string()),
+            level: rule.level.as_str().to_owned(),
+            granted_by: rule.granted_by.map(|id| id.to_string()),
+            granted_at: granted_at_of(rule.granted_at),
+        }
+    }
+}
+
+/// One rule an item inherits from a folder above it.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InheritedRuleWire {
+    /// The folder the rule sits on.
+    pub folder_id: String,
+    /// The folder's name.
+    pub folder_name: String,
+    /// The person the rule names; `None` when the rule names a role.
+    pub user_id: Option<String>,
+    /// The role the rule names; `None` when the rule names a person.
+    pub role_id: Option<String>,
+    /// What the rule gives: "view", "edit" or "manage".
+    pub level: String,
+}
+
+impl InheritedRuleWire {
+    /// The wire shape of a rule inherited from the folder `folder_id`.
+    ///
+    /// The folder's name is read from the same map the chain came from,
+    /// so the list names the folder the way the tree does.
+    fn of(rule: &ItemRule, folder_id: Uuid, map: &FolderMap) -> Self {
+        Self {
+            folder_id: folder_id.to_string(),
+            folder_name: map
+                .get(folder_id)
+                .map_or_else(String::new, |folder| folder.name.clone()),
+            user_id: rule.user_id.map(|id| id.to_string()),
+            role_id: rule.role_id.map(|id| id.to_string()),
+            level: rule.level.as_str().to_owned(),
+        }
+    }
+}
+
+/// The access list of one item: its own rules, the rules it inherits from
+/// the folders above it, and the level the caller holds on it.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccessListWire {
+    /// The kind of item: "query" or "folder".
+    pub item_type: String,
+    /// The item's id.
+    pub item_id: String,
+    /// The level the caller holds on the item: "view", "edit" or "manage".
+    pub your_level: String,
+    /// The item's own rules.
+    pub rules: Vec<AccessRuleWire>,
+    /// The rules of the folders above the item, the nearest folder first.
+    pub inherited: Vec<InheritedRuleWire>,
+}
+
+/// One person a saved query may be shared with.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GranteePersonWire {
+    /// The person's id.
+    pub id: String,
+    /// The person's display name.
+    pub name: String,
+    /// The person's email address.
+    pub email: String,
+}
+
+impl GranteePersonWire {
+    /// The wire shape of a person the caller may share with.
+    fn of(person: &GranteePerson) -> Self {
+        Self {
+            id: person.id.to_string(),
+            name: person.name.clone(),
+            email: person.email.clone(),
+        }
+    }
+}
+
+/// One role a saved query may be shared with.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GranteeRoleWire {
+    /// The role's id.
+    pub id: String,
+    /// The role's name.
+    pub name: String,
+}
+
+impl GranteeRoleWire {
+    /// The wire shape of a role the caller may share with.
+    fn of(role: &GranteeRole) -> Self {
+        Self {
+            id: role.id.to_string(),
+            name: role.name.clone(),
+        }
+    }
+}
+
+/// The people and the roles a saved query may be shared with.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GranteeListWire {
+    /// The people of the caller's organisation.
+    pub people: Vec<GranteePersonWire>,
+    /// The roles of the deployment.
+    pub roles: Vec<GranteeRoleWire>,
+}
+
+/// One rule of a `PUT …/access` body.
+///
+/// The grantees are ids, and an id that is not a uuid is a body of
+/// another shape rather than a rule of another shape: the sentence that
+/// says so names the shape of the body, and the sentence for a rule
+/// names the rule.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AccessRuleInput {
+    /// The person the rule names.
+    #[serde(default)]
+    pub user_id: Option<Uuid>,
+    /// The role the rule names.
+    #[serde(default)]
+    pub role_id: Option<Uuid>,
+    /// What the rule gives: "view", "edit" or "manage".
+    #[serde(default)]
+    pub level: String,
+}
+
+/// The `PUT …/access` body.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PutAccessBody {
+    /// The rules the item shall carry.
+    pub rules: Vec<AccessRuleInput>,
+}
+
+/// The `GET /api/query/grantees` query string.
+///
+/// The search text stays a raw string on purpose: the store matches it as
+/// a literal substring, so an empty search box shows the first people
+/// rather than nothing.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GranteeQuery {
+    /// The text typed in the search box: it matches a name or an email.
+    #[serde(default)]
+    pub q: Option<String>,
+}
+
 // ── The shared rules ─────────────────────────────────────────────────────
 
 /// The level the caller holds on a saved query.
@@ -385,6 +601,220 @@ fn query_id_of(raw: &str) -> Result<Uuid, ApiError> {
 /// 404 with the fixed sentence of [`FOLDER_NOT_FOUND`].
 fn folder_id_of(raw: &str) -> Result<Uuid, ApiError> {
     Uuid::parse_str(raw).map_err(|_err| ApiError::NotFound(FOLDER_NOT_FOUND.to_owned()))
+}
+
+/// The moment a rule was written, as the wire carries it: ISO 8601 in
+/// UTC, to the second.
+///
+/// The second is the resolution the list shows: a rule is written once,
+/// and the console shows how long ago that was.
+fn granted_at_of(granted_at: OffsetDateTime) -> String {
+    granted_at
+        .replace_nanosecond(0)
+        .unwrap_or(granted_at)
+        .format(&Rfc3339)
+        .unwrap_or_default()
+}
+
+/// The item an access list belongs to: one saved query or one folder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AccessItem {
+    /// One saved query.
+    Query {
+        /// The query's id.
+        id: Uuid,
+        /// The folder the query sits in; `None` for the shared space.
+        folder_id: Option<Uuid>,
+    },
+    /// One folder.
+    Folder {
+        /// The folder's id.
+        id: Uuid,
+    },
+}
+
+impl AccessItem {
+    /// The item's id.
+    fn id(self) -> Uuid {
+        match self {
+            Self::Query { id, .. } | Self::Folder { id } => id,
+        }
+    }
+
+    /// The kind of item, as the wire names it.
+    fn item_type(self) -> &'static str {
+        match self {
+            Self::Query { .. } => "query",
+            Self::Folder { .. } => "folder",
+        }
+    }
+
+    /// The query the rules sit on, when the item is a query.
+    fn query_id(self) -> Option<Uuid> {
+        match self {
+            Self::Query { id, .. } => Some(id),
+            Self::Folder { .. } => None,
+        }
+    }
+
+    /// The folder the rules sit on, when the item is a folder.
+    fn folder_id(self) -> Option<Uuid> {
+        match self {
+            Self::Query { .. } => None,
+            Self::Folder { id } => Some(id),
+        }
+    }
+}
+
+/// The folders above the item, nearest first: the chain the item
+/// inherits its rules from.
+///
+/// A query inherits from the folder it sits in and from that folder's
+/// parents; a folder inherits from its parents only, because its own
+/// rules are its own and sit in the list beside them.
+///
+/// A chain that cannot be built is corrupt data, and corrupt data
+/// inherits nothing.
+fn chain_of(map: &FolderMap, item: AccessItem) -> Vec<Uuid> {
+    let folder_id = match item {
+        AccessItem::Query { folder_id, .. } => folder_id,
+        AccessItem::Folder { id } => Some(id),
+    };
+    let Some(folder_id) = folder_id else {
+        // A query in the shared space sits at the root: it inherits
+        // nothing.
+        return Vec::new();
+    };
+    let Some(chain) = map.chain(folder_id) else {
+        return Vec::new();
+    };
+    let chain: Vec<Uuid> = chain.iter().map(|folder| folder.id).collect();
+    match item {
+        // The folder's own rules are its own: only its parents are
+        // inherited.
+        AccessItem::Folder { .. } => chain.into_iter().skip(1).collect(),
+        AccessItem::Query { .. } => chain,
+    }
+}
+
+/// The access list of one item: its own rules, the rules it inherits
+/// from the folders above it, and the level the caller holds on it.
+///
+/// The folders are read with the viewer's own tenant, so the chain is the
+/// chain the resolver used to decide the level: the list cannot name a
+/// folder the level did not come from.
+async fn access_list(
+    pool: &PgPool,
+    viewer: &queries::SavedQueryViewer,
+    item: AccessItem,
+    your_level: Level,
+) -> Result<AccessListWire, ApiError> {
+    let folders = saved_query_access::list_folders(pool, viewer.tenant_id).await?;
+    let map = FolderMap::new(folders);
+    let chain = chain_of(&map, item);
+    let own = saved_query_access::rules_for_item(pool, item.query_id(), item.folder_id()).await?;
+    let inherited = saved_query_access::rules_for_folders(pool, &chain).await?;
+    Ok(AccessListWire {
+        item_type: item.item_type().to_owned(),
+        item_id: item.id().to_string(),
+        your_level: your_level.as_str().to_owned(),
+        rules: own.iter().map(AccessRuleWire::of).collect(),
+        inherited: inherited
+            .iter()
+            .filter_map(|rule| {
+                rule.folder_id
+                    .map(|folder_id| InheritedRuleWire::of(rule, folder_id, &map))
+            })
+            .collect(),
+    })
+}
+
+/// The rules as they will be stored: exactly one grantee each, a level
+/// of the set, and nobody named twice.
+///
+/// The grantee is keyed by its kind as well as by its id: a person and a
+/// role are two different grantees, even when they carry the same id.
+fn checked_rules(input: &[AccessRuleInput]) -> Result<Vec<NewGrant>, ApiError> {
+    let mut seen: HashSet<(bool, Uuid)> = HashSet::new();
+    let mut rules = Vec::with_capacity(input.len());
+    for rule in input {
+        let level = Level::parse(rule.level.trim())
+            .ok_or_else(|| ApiError::BadRequest(ACCESS_RULE_SHAPE.to_owned()))?;
+        let key = match (rule.user_id, rule.role_id) {
+            (Some(user_id), None) => (true, user_id),
+            (None, Some(role_id)) => (false, role_id),
+            _ => return Err(ApiError::BadRequest(ACCESS_RULE_SHAPE.to_owned())),
+        };
+        if !seen.insert(key) {
+            return Err(ApiError::BadRequest(ACCESS_GRANTEE_TWICE.to_owned()));
+        }
+        rules.push(NewGrant {
+            user_id: rule.user_id,
+            role_id: rule.role_id,
+            level,
+        });
+    }
+    Ok(rules)
+}
+
+/// The grantees of the rules, checked against the caller's organisation.
+///
+/// The check happens before anything is written, so a rule that names
+/// somebody outside the organisation leaves the old rules exactly as
+/// they were.
+async fn check_grantees(
+    pool: &PgPool,
+    viewer: &queries::SavedQueryViewer,
+    rules: &[NewGrant],
+) -> Result<(), ApiError> {
+    let wanted_people: Vec<Uuid> = rules.iter().filter_map(|rule| rule.user_id).collect();
+    let wanted_roles: Vec<Uuid> = rules.iter().filter_map(|rule| rule.role_id).collect();
+    if wanted_people.is_empty() && wanted_roles.is_empty() {
+        return Ok(());
+    }
+    let found_people =
+        saved_query_access::tenant_user_ids(pool, viewer.tenant_id, &wanted_people).await?;
+    let found_roles = saved_query_access::existing_role_ids(pool, &wanted_roles).await?;
+    if wanted_people.iter().any(|id| !found_people.contains(id))
+        || wanted_roles.iter().any(|id| !found_roles.contains(id))
+    {
+        return Err(ApiError::BadRequest(ACCESS_GRANTEE_OUTSIDE.to_owned()));
+    }
+    Ok(())
+}
+
+/// The route's own answer to a write of the rules the store refused.
+///
+/// The store says *what* was wrong; this says *what to tell the caller*.
+/// The database's own text never reaches a response (`AGENTS.md`
+/// principle 4).
+fn access_failure(failure: StoreError) -> ApiError {
+    match failure {
+        // A rule that names a person or a role the database does not
+        // hold is the organisation's own refusal.
+        StoreError::ForeignKeyViolation => ApiError::BadRequest(ACCESS_GRANTEE_OUTSIDE.to_owned()),
+        // A rule that names two grantees or none: the shape of a rule.
+        StoreError::Validation(_message) => ApiError::BadRequest(ACCESS_RULE_SHAPE.to_owned()),
+        other => ApiError::from(other),
+    }
+}
+
+/// The folder a saved query sits in, when the row names one.
+///
+/// A row that names a folder the database cannot hold is corrupt data,
+/// and corrupt data is not found: the same 404 as a query that does not
+/// exist.
+///
+/// # Errors
+///
+/// 404 with the fixed sentence of [`QUERY_NOT_FOUND`].
+fn saved_folder_id(saved: &SavedQuery) -> Result<Option<Uuid>, ApiError> {
+    match saved.folder_id.as_deref() {
+        Some(raw) => Uuid::parse_str(raw)
+            .map(Some)
+            .map_err(|_err| ApiError::NotFound(QUERY_NOT_FOUND.to_owned())),
+        None => Ok(None),
+    }
 }
 
 // ── The saved-query routes ───────────────────────────────────────────────
@@ -954,4 +1384,248 @@ pub async fn delete_folder(
         .await
         .map_err(folder_failure)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ── The access routes ────────────────────────────────────────────────────
+//
+// The sharing surface: who has what on a saved query or on a folder, and
+// who may be given a rule at all. Every route here needs **manage** on
+// the item, and every route reads the item first — a 404 for what the
+// caller may not see, a 403 for what it may see but not manage, and only
+// then the body.
+
+/// `GET /api/query/saved/{id}/access` — who has what on one saved query.
+///
+/// The list needs **manage**: managing a query includes sharing it, and a
+/// person who may only see a query has no business seeing who else sees
+/// it.
+///
+/// # Errors
+///
+/// 404 with the fixed sentence of [`QUERY_NOT_FOUND`] for a query the
+/// caller may not see; 403 with the fixed sentence of [`QUERY_FORBIDDEN`]
+/// for a query the caller may see but not manage; 500 on a database
+/// failure.
+pub async fn get_query_access(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<ApiJson<AccessListWire>> {
+    let scope = saved_query_scope(&state, &principal, &headers).await?;
+    let Some(viewer) = scope.effective_viewer() else {
+        // A caller that acts for no organisation owns no saved query.
+        return Err(ApiError::NotFound(QUERY_NOT_FOUND.to_owned()).into());
+    };
+    let saved = queries::get_saved(pool(&state)?, &id, &scope)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(QUERY_NOT_FOUND.to_owned()))?;
+    let level = level_of(&saved.level);
+    if level < Level::Manage {
+        return Err(ApiError::PermissionDenied(QUERY_FORBIDDEN.to_owned()).into());
+    }
+    let item = AccessItem::Query {
+        id: query_id_of(&saved.id)?,
+        folder_id: saved_folder_id(&saved)?,
+    };
+    Ok(ApiJson(
+        access_list(pool(&state)?, &viewer, item, level).await?,
+    ))
+}
+
+/// `PUT /api/query/saved/{id}/access` — replace the rules on one saved
+/// query.
+///
+/// The answer is the list as it is after the write, so the console can
+/// draw it again without a second call. The level it carries is the
+/// level the change was authorised with — the one the caller holds
+/// before the write — because a rule the caller writes for somebody
+/// else cannot change the caller's own level.
+///
+/// # Errors
+///
+/// 404 with the fixed sentence of [`QUERY_NOT_FOUND`] for a query the
+/// caller may not see; 403 with the fixed sentence of [`QUERY_FORBIDDEN`]
+/// for a query the caller may see but not manage; 400 for a body of
+/// another shape, for a rule that names two grantees or none, for a
+/// grantee that is listed twice and for a grantee that is not of the
+/// caller's organisation; 500 on a database failure.
+pub async fn put_query_access(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<ApiJson<AccessListWire>> {
+    let scope = saved_query_scope(&state, &principal, &headers).await?;
+    let Some(viewer) = scope.effective_viewer() else {
+        return Err(ApiError::NotFound(QUERY_NOT_FOUND.to_owned()).into());
+    };
+    let saved = queries::get_saved(pool(&state)?, &id, &scope)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(QUERY_NOT_FOUND.to_owned()))?;
+    let level = level_of(&saved.level);
+    if level < Level::Manage {
+        return Err(ApiError::PermissionDenied(QUERY_FORBIDDEN.to_owned()).into());
+    }
+    // The body is read only now: a query the caller may not see is a 404
+    // and a query it may not manage is a 403, whatever the body holds.
+    let body: PutAccessBody = serde_json::from_slice(&body)
+        .map_err(|_err| ApiError::BadRequest(ACCESS_BODY_SHAPE.to_owned()))?;
+    let rules = checked_rules(&body.rules)?;
+    let item = AccessItem::Query {
+        id: query_id_of(&saved.id)?,
+        folder_id: saved_folder_id(&saved)?,
+    };
+    // Every grantee is checked before anything is written, so a refused
+    // change leaves the old rules exactly as they were.
+    check_grantees(pool(&state)?, &viewer, &rules).await?;
+    saved_query_access::replace_grants(
+        pool(&state)?,
+        item.query_id(),
+        item.folder_id(),
+        &rules,
+        viewer.id,
+    )
+    .await
+    .map_err(access_failure)?;
+    Ok(ApiJson(
+        access_list(pool(&state)?, &viewer, item, level).await?,
+    ))
+}
+
+/// `GET /api/query/folders/{id}/access` — who has what on one folder.
+///
+/// A rule on a folder covers everything inside it, so the list of a
+/// folder is the list of the space it holds.
+///
+/// # Errors
+///
+/// 404 with the fixed sentence of [`FOLDER_NOT_FOUND`] for a folder the
+/// caller may not see; 403 with the fixed sentence of [`FOLDER_FORBIDDEN`]
+/// for a folder the caller may see but not manage; 500 on a database
+/// failure.
+pub async fn get_folder_access(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<ApiJson<AccessListWire>> {
+    let scope = saved_query_scope(&state, &principal, &headers).await?;
+    let Some(viewer) = scope.effective_viewer() else {
+        // A caller that acts for no organisation owns no folder.
+        return Err(ApiError::NotFound(FOLDER_NOT_FOUND.to_owned()).into());
+    };
+    let folder_id = folder_id_of(&id)?;
+    let level = folder_level(pool(&state)?, &viewer, folder_id).await?;
+    if level < Level::Manage {
+        return Err(ApiError::PermissionDenied(FOLDER_FORBIDDEN.to_owned()).into());
+    }
+    let item = AccessItem::Folder { id: folder_id };
+    Ok(ApiJson(
+        access_list(pool(&state)?, &viewer, item, level).await?,
+    ))
+}
+
+/// `PUT /api/query/folders/{id}/access` — replace the rules on one
+/// folder.
+///
+/// The answer is the list as it is after the write, so the console can
+/// draw it again without a second call. The level it carries is the
+/// level the change was authorised with — the one the caller holds
+/// before the write.
+///
+/// # Errors
+///
+/// 404 with the fixed sentence of [`FOLDER_NOT_FOUND`] for a folder the
+/// caller may not see; 403 with the fixed sentence of [`FOLDER_FORBIDDEN`]
+/// for a folder the caller may see but not manage; 400 for a body of
+/// another shape, for a rule that names two grantees or none, for a
+/// grantee that is listed twice and for a grantee that is not of the
+/// caller's organisation; 500 on a database failure.
+pub async fn put_folder_access(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<ApiJson<AccessListWire>> {
+    let scope = saved_query_scope(&state, &principal, &headers).await?;
+    let Some(viewer) = scope.effective_viewer() else {
+        return Err(ApiError::NotFound(FOLDER_NOT_FOUND.to_owned()).into());
+    };
+    let folder_id = folder_id_of(&id)?;
+    let level = folder_level(pool(&state)?, &viewer, folder_id).await?;
+    if level < Level::Manage {
+        return Err(ApiError::PermissionDenied(FOLDER_FORBIDDEN.to_owned()).into());
+    }
+    // The body is read only now: a folder the caller may not see is a
+    // 404 and a folder it may not manage is a 403, whatever the body
+    // holds.
+    let body: PutAccessBody = serde_json::from_slice(&body)
+        .map_err(|_err| ApiError::BadRequest(ACCESS_BODY_SHAPE.to_owned()))?;
+    let rules = checked_rules(&body.rules)?;
+    let item = AccessItem::Folder { id: folder_id };
+    // Every grantee is checked before anything is written, so a refused
+    // change leaves the old rules exactly as they were.
+    check_grantees(pool(&state)?, &viewer, &rules).await?;
+    saved_query_access::replace_grants(
+        pool(&state)?,
+        item.query_id(),
+        item.folder_id(),
+        &rules,
+        viewer.id,
+    )
+    .await
+    .map_err(access_failure)?;
+    Ok(ApiJson(
+        access_list(pool(&state)?, &viewer, item, level).await?,
+    ))
+}
+
+/// `GET /api/query/grantees?q=` — the people and the roles the caller
+/// may share with.
+///
+/// The people are the members of the caller's organisation, and the roles
+/// are the roles of the deployment: a role belongs to the deployment
+/// rather than to an organisation, so every role of it is a possible
+/// grantee. A caller that acts for no organisation has nobody to share
+/// with, and the answer is empty rather than everybody's.
+///
+/// # Errors
+///
+/// 400 for a query string the route cannot read; 500 on a database
+/// failure.
+pub async fn search_grantees(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
+    query: Result<Query<GranteeQuery>, axum::extract::rejection::QueryRejection>,
+) -> ApiResult<ApiJson<GranteeListWire>> {
+    let scope = saved_query_scope(&state, &principal, &headers).await?;
+    let Some(viewer) = scope.effective_viewer() else {
+        // A caller that acts for no organisation has nobody to share
+        // with.
+        return Ok(ApiJson(GranteeListWire {
+            people: Vec::new(),
+            roles: Vec::new(),
+        }));
+    };
+    // A query string the extractor cannot read — a parameter sent twice,
+    // for instance — is refused with this surface's own sentence. The
+    // rejection's own text is serde's, and it stays in the log: a
+    // response never carries a library's rendering of the caller's
+    // request.
+    let Query(raw) = query.map_err(|rejection| {
+        tracing::warn!(%rejection, "a grantee query string could not be read");
+        ApiError::BadRequest(QUERY_STRING_UNREADABLE.to_owned())
+    })?;
+    let needle = raw.q.as_deref().unwrap_or_default();
+    let found =
+        saved_query_access::search_grantees(pool(&state)?, viewer.tenant_id, needle, GRANTEE_LIMIT)
+            .await?;
+    Ok(ApiJson(GranteeListWire {
+        people: found.people.iter().map(GranteePersonWire::of).collect(),
+        roles: found.roles.iter().map(GranteeRoleWire::of).collect(),
+    }))
 }

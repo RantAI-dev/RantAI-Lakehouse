@@ -55,11 +55,24 @@
 //! the people of the tenant and the roles of the deployment. A role
 //! belongs to the deployment rather than to a tenant — the `role` table
 //! has no tenant column — so every role is a possible grantee.
+//!
+//! # The access list
+//!
+//! [`rules_for_item`] and [`rules_for_folders`] answer what the sharing
+//! route shows: the rules of one item, and the rules of the folders
+//! above it. They answer with [`ItemRule`] — the row's own record, with
+//! the id, the writer and the moment — and never with a decision: the
+//! level the viewer holds on an item comes from [`resolve_level`], so a
+//! read path cannot answer "visible" without also answering "at what
+//! level". [`tenant_user_ids`] and [`existing_role_ids`] answer the other
+//! half of the sharing question: which of the people and the roles a
+//! caller names are of the organisation the caller acts for.
 
 use std::collections::HashSet;
 
 use sqlx::FromRow;
 use thiserror::Error;
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::{PgPool, StoreError};
@@ -141,6 +154,34 @@ pub struct AccessGrant {
     pub role_id: Option<Uuid>,
     /// What the rule gives.
     pub level: Level,
+}
+
+/// One stored rule, as the access list shows it.
+///
+/// The rule itself names one item (a query or a folder) and one grantee
+/// (a person or a role); this shape adds what the access list shows about
+/// it: the rule's own id, who wrote it and when. It is the row's own
+/// record, not the decision the resolver makes of it — the level the
+/// viewer holds comes from [`resolve_level`], never from here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ItemRule {
+    /// The rule's own id.
+    pub id: Uuid,
+    /// The query the rule is on, when it is on a query.
+    pub query_id: Option<Uuid>,
+    /// The folder the rule is on, when it is on a folder. A rule on a
+    /// folder covers everything inside it.
+    pub folder_id: Option<Uuid>,
+    /// The person the rule names.
+    pub user_id: Option<Uuid>,
+    /// The role the rule names.
+    pub role_id: Option<Uuid>,
+    /// What the rule gives.
+    pub level: Level,
+    /// Who wrote the rule; `None` when nobody is recorded.
+    pub granted_by: Option<Uuid>,
+    /// When the rule was written.
+    pub granted_at: OffsetDateTime,
 }
 
 /// The item the resolver is asked about.
@@ -566,6 +607,38 @@ impl GrantRow {
     }
 }
 
+/// One rule, as the database holds it, with everything the access list
+/// shows about it.
+#[derive(Debug, FromRow)]
+struct ItemRuleRow {
+    id: Uuid,
+    query_id: Option<Uuid>,
+    folder_id: Option<Uuid>,
+    user_id: Option<Uuid>,
+    role_id: Option<Uuid>,
+    level: String,
+    granted_by: Option<Uuid>,
+    granted_at: OffsetDateTime,
+}
+
+impl ItemRuleRow {
+    /// The rule, or `None` when its level is a word outside the set: a
+    /// rule that says something else grants nothing, and an access list
+    /// does not show a rule that grants nothing.
+    fn into_rule(self) -> Option<ItemRule> {
+        Some(ItemRule {
+            id: self.id,
+            query_id: self.query_id,
+            folder_id: self.folder_id,
+            user_id: self.user_id,
+            role_id: self.role_id,
+            level: Level::parse(&self.level)?,
+            granted_by: self.granted_by,
+            granted_at: self.granted_at,
+        })
+    }
+}
+
 /// A rule to write.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewGrant {
@@ -722,16 +795,22 @@ pub async fn grants_for_viewer(
 
 /// The rules on one item: the query's own, or the folder's.
 ///
+/// The answer carries what the access list shows about each rule — its
+/// own id, who wrote it and when — and nothing else: the level the
+/// viewer holds on the item comes from [`resolve_level`], never from
+/// here.
+///
 /// # Errors
 ///
 /// Returns [`StoreError::Database`] if the query fails.
-pub async fn grants_for_item(
+pub async fn rules_for_item(
     pool: &PgPool,
     query_id: Option<Uuid>,
     folder_id: Option<Uuid>,
-) -> Result<Vec<AccessGrant>, StoreError> {
-    let rows: Vec<GrantRow> = sqlx::query_as(
-        "SELECT query_id, folder_id, user_id, role_id, level FROM saved_query_access_rule \
+) -> Result<Vec<ItemRule>, StoreError> {
+    let rows: Vec<ItemRuleRow> = sqlx::query_as(
+        "SELECT id, query_id, folder_id, user_id, role_id, level, granted_by, granted_at \
+         FROM saved_query_access_rule \
          WHERE ($1::uuid IS NOT NULL AND query_id = $1) \
             OR ($2::uuid IS NOT NULL AND folder_id = $2) \
          ORDER BY granted_at, id",
@@ -740,7 +819,93 @@ pub async fn grants_for_item(
     .bind(folder_id)
     .fetch_all(pool)
     .await?;
-    Ok(rows.into_iter().filter_map(GrantRow::into_grant).collect())
+    Ok(rows
+        .into_iter()
+        .filter_map(ItemRuleRow::into_rule)
+        .collect())
+}
+
+/// The rules of several folders at once.
+///
+/// The answer follows the order of `folder_ids`: the first folder of the
+/// list comes first in the answer, so the caller can show the nearest
+/// folder's rules first without sorting them itself.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the query fails.
+pub async fn rules_for_folders(
+    pool: &PgPool,
+    folder_ids: &[Uuid],
+) -> Result<Vec<ItemRule>, StoreError> {
+    if folder_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows: Vec<ItemRuleRow> = sqlx::query_as(
+        "SELECT id, query_id, folder_id, user_id, role_id, level, granted_by, granted_at \
+         FROM saved_query_access_rule \
+         WHERE folder_id = ANY($1::uuid[]) \
+         ORDER BY array_position($1::uuid[], folder_id), granted_at, id",
+    )
+    .bind(folder_ids.to_vec())
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(ItemRuleRow::into_rule)
+        .collect())
+}
+
+/// The people that exist and are members of the tenant.
+///
+/// A person belongs to a tenant through `app_user_tenant`, and a rule
+/// may only name a person of the organisation whose row is being read:
+/// the answer is the ids that both exist and are members. With no tenant
+/// every existing person is a member of it.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the query fails.
+pub async fn tenant_user_ids(
+    pool: &PgPool,
+    tenant_id: Option<Uuid>,
+    ids: &[Uuid],
+) -> Result<Vec<Uuid>, StoreError> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let found: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT u.id FROM app_user u \
+         WHERE u.id = ANY($1::uuid[]) \
+           AND ($2::uuid IS NULL OR EXISTS ( \
+                SELECT 1 FROM app_user_tenant t \
+                 WHERE t.user_id = u.id AND t.tenant_id = $2))",
+    )
+    .bind(ids.to_vec())
+    .bind(tenant_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(found)
+}
+
+/// The roles that exist.
+///
+/// A role belongs to the deployment rather than to a tenant — the `role`
+/// table has no tenant column — so every role that exists is a possible
+/// grantee.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the query fails.
+pub async fn existing_role_ids(pool: &PgPool, ids: &[Uuid]) -> Result<Vec<Uuid>, StoreError> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let found: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM role WHERE id = ANY($1::uuid[])")
+        .bind(ids.to_vec())
+        .fetch_all(pool)
+        .await?;
+    Ok(found)
 }
 
 /// Replace the rules on one item with `rules`.

@@ -1225,6 +1225,19 @@ pub fn router(state: AppState) -> Router {
             "/api/query/folders/{id}",
             axum::routing::patch(saved_queries::patch_folder).delete(saved_queries::delete_folder),
         )
+        // QS-3: the sharing surface. The access lists need `manage` on the
+        // item -- reading who else has access is part of sharing -- and
+        // the grantee search answers with the people and the roles of the
+        // caller's organisation.
+        .route(
+            "/api/query/saved/{id}/access",
+            get(saved_queries::get_query_access).put(saved_queries::put_query_access),
+        )
+        .route(
+            "/api/query/folders/{id}/access",
+            get(saved_queries::get_folder_access).put(saved_queries::put_folder_access),
+        )
+        .route("/api/query/grantees", get(saved_queries::search_grantees))
         .route("/api/query/history", get(query::list_history))
         .route("/api/query/run/{id}/download", get(query::download))
         .route("/api/query/scheduling", get(query::scheduling))

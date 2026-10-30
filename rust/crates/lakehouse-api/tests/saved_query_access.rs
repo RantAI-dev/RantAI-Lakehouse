@@ -71,6 +71,22 @@ const QUERY_STRING_UNREADABLE: &str = "The query string could not be read.";
 /// refused with.
 const FOLDER_ID_INVALID: &str = "A folder must be an id or \"root\".";
 
+/// The sentence a body of another shape is refused with.
+const ACCESS_BODY_SHAPE: &str = "Body must be JSON {rules: [{userId?, roleId?, level}]}.";
+
+/// The sentence a rule that names two grantees or none, or a level
+/// outside the set, is refused with.
+const ACCESS_RULE_SHAPE: &str =
+    "Each rule must name one person or one role, and one of the levels view, edit or manage.";
+
+/// The sentence a grantee that is listed twice is refused with.
+const ACCESS_GRANTEE_TWICE: &str = "The same person or role is listed twice.";
+
+/// The sentence a grantee that does not exist, or a person outside the
+/// organisation, is refused with.
+const ACCESS_GRANTEE_OUTSIDE: &str =
+    "A saved query can only be shared with a person or a role of your organisation.";
+
 /// One request against the router, with `cookie` as the session.
 ///
 /// The answer is the status and the JSON body (a 204 has no body, so it
@@ -121,6 +137,43 @@ fn error(body: &Value) -> &str {
     body.get("error")
         .and_then(Value::as_str)
         .unwrap_or_default()
+}
+
+/// One request against the router with a body that is not JSON at all.
+///
+/// The shape of the body is the route's own business, so a body that is
+/// not JSON has to be answered with the route's own sentence rather than
+/// with the reader's own text.
+async fn call_with_raw_body(
+    app: &axum::Router,
+    method: &str,
+    path: &str,
+    cookie: &str,
+    body: &'static str,
+) -> (StatusCode, Value) {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(path)
+                .header("cookie", cookie)
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .expect("build request"),
+        )
+        .await
+        .expect("router never fails a request outright");
+    let status = resp.status();
+    let bytes = to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("read the response body");
+    let value = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+    };
+    (status, value)
 }
 
 /// The id of a seeded user.
@@ -437,6 +490,23 @@ async fn the_saved_query_routes_need_the_query_read_permission() {
             "DELETE",
             "/api/query/folders/11111111-1111-4111-8111-000000000009",
         ),
+        (
+            "GET",
+            "/api/query/saved/11111111-1111-4111-8111-000000000009/access",
+        ),
+        (
+            "PUT",
+            "/api/query/saved/11111111-1111-4111-8111-000000000009/access",
+        ),
+        (
+            "GET",
+            "/api/query/folders/11111111-1111-4111-8111-000000000009/access",
+        ),
+        (
+            "PUT",
+            "/api/query/folders/11111111-1111-4111-8111-000000000009/access",
+        ),
+        ("GET", "/api/query/grantees"),
     ] {
         let (status, body) = call(&router, method, path, &cookie, None).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{method} {path}: {body}");
@@ -1307,4 +1377,708 @@ async fn a_new_query_and_a_duplicate_land_in_the_callers_own_space() {
         "the copy lands in the caller's own personal space: {copy}"
     );
     assert_ne!(copy["id"], shared_id, "it is a new query");
+}
+
+// ── The access lists and the grantee search ─────────────────────────────
+
+/// A rule opens a saved query to another person, at the level it names.
+///
+/// A query saved without a folder lands in the author's personal space,
+/// which is a wall: nobody else sees it at all until a rule says so.
+#[tokio::test]
+async fn a_rule_opens_a_saved_query_to_another_person_at_the_level_it_names() {
+    let TestApp { router, pool } = spin_up().await;
+    let rina = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+    let reza = session_cookie_for_seeded_user(&pool, "reza@meridian.example").await;
+    let reza_id = user_id(&pool, "reza@meridian.example").await;
+
+    let (status, saved) = call(
+        &router,
+        "POST",
+        "/api/query/saved",
+        &rina,
+        Some(json!({"title": "Private", "sql": "SELECT 1"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{saved}");
+    let id = saved["id"]
+        .as_str()
+        .expect("the saved query has an id")
+        .to_owned();
+
+    let (status, body) = call(
+        &router,
+        "GET",
+        &format!("/api/query/saved/{id}"),
+        &reza,
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "the personal space is a wall: {body}"
+    );
+
+    let (status, list) = call(
+        &router,
+        "PUT",
+        &format!("/api/query/saved/{id}/access"),
+        &rina,
+        Some(json!({"rules": [{"userId": reza_id.to_string(), "level": "edit"}]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    assert_eq!(list["itemType"], "query");
+    assert_eq!(list["itemId"], id);
+    assert_eq!(list["yourLevel"], "manage");
+    let rules = list["rules"].as_array().expect("the rules are an array");
+    assert_eq!(rules.len(), 1, "the list holds the one rule: {list}");
+    assert_eq!(rules[0]["userId"], reza_id.to_string());
+    assert_eq!(rules[0]["roleId"], Value::Null);
+    assert_eq!(rules[0]["level"], "edit");
+    assert!(
+        rules[0]["grantedAt"]
+            .as_str()
+            .expect("the rule carries the moment it was written")
+            .ends_with('Z'),
+        "the rule carries the moment it was written: {list}"
+    );
+    assert!(
+        list["inherited"]
+            .as_array()
+            .expect("the inherited list is an array")
+            .is_empty(),
+        "the personal space carries no rule of its own: {list}"
+    );
+
+    let (status, seen) = call(
+        &router,
+        "GET",
+        &format!("/api/query/saved/{id}"),
+        &reza,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{seen}");
+    assert_eq!(seen["level"], "edit", "the rule names the level: {seen}");
+}
+
+/// A rule on a folder covers everything inside it, and the access list of
+/// a query names the folder it inherits from.
+#[tokio::test]
+async fn a_rule_on_a_folder_covers_the_query_inside_it() {
+    let TestApp { router, pool } = spin_up().await;
+    let rina = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+    let reza = session_cookie_for_seeded_user(&pool, "reza@meridian.example").await;
+    let reza_id = user_id(&pool, "reza@meridian.example").await;
+    let yoga = user_id(&pool, "yoga@meridian.example").await;
+
+    let (status, folder) = call(
+        &router,
+        "POST",
+        "/api/query/folders",
+        &rina,
+        Some(json!({"name": "Reports"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{folder}");
+    let folder_id = folder["id"]
+        .as_str()
+        .expect("the folder has an id")
+        .to_owned();
+
+    let (status, saved) = call(
+        &router,
+        "POST",
+        "/api/query/saved",
+        &rina,
+        Some(json!({"title": "Weekly", "sql": "SELECT 1", "folderId": folder_id})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{saved}");
+    let id = saved["id"]
+        .as_str()
+        .expect("the saved query has an id")
+        .to_owned();
+
+    let (status, list) = call(
+        &router,
+        "PUT",
+        &format!("/api/query/folders/{folder_id}/access"),
+        &rina,
+        Some(json!({"rules": [{"userId": reza_id.to_string(), "level": "edit"}]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    assert_eq!(list["itemType"], "folder");
+    assert_eq!(list["itemId"], folder_id);
+    assert_eq!(list["yourLevel"], "manage");
+    // The rule on a folder is the folder's own: it sits in `rules`, not in
+    // `inherited`, and a folder at the root inherits nothing.
+    let rules = list["rules"].as_array().expect("the rules are an array");
+    assert_eq!(rules.len(), 1, "the folder's own rule: {list}");
+    assert_eq!(rules[0]["userId"], reza_id.to_string());
+    assert_eq!(rules[0]["level"], "edit");
+    assert!(
+        list["inherited"]
+            .as_array()
+            .expect("the inherited list is an array")
+            .is_empty(),
+        "a folder at the root inherits nothing: {list}"
+    );
+
+    let (status, seen) = call(
+        &router,
+        "GET",
+        &format!("/api/query/saved/{id}"),
+        &reza,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{seen}");
+    assert_eq!(
+        seen["level"], "edit",
+        "the folder's rule covers the query inside it: {seen}"
+    );
+
+    // The query's own rule is its own; the folder's rule is inherited, and
+    // the inherited entry names the folder it sits on.
+    let (status, list) = call(
+        &router,
+        "PUT",
+        &format!("/api/query/saved/{id}/access"),
+        &rina,
+        Some(json!({"rules": [{"userId": yoga.to_string(), "level": "view"}]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    let rules = list["rules"].as_array().expect("the rules are an array");
+    assert_eq!(rules.len(), 1, "the query's own rule: {list}");
+    assert_eq!(rules[0]["userId"], yoga.to_string());
+    let inherited = list["inherited"]
+        .as_array()
+        .expect("the inherited list is an array");
+    assert_eq!(inherited.len(), 1, "the folder's rule is inherited: {list}");
+    assert_eq!(inherited[0]["folderId"], folder_id);
+    assert_eq!(inherited[0]["folderName"], "Reports");
+    assert_eq!(inherited[0]["userId"], reza_id.to_string());
+    assert_eq!(inherited[0]["roleId"], Value::Null);
+    assert_eq!(inherited[0]["level"], "edit");
+}
+
+/// A saved query inside a folder inside a folder.
+///
+/// The ids come back as the chain reads them: the query first, then the
+/// folder it sits in, then the folder above that one.
+async fn a_query_two_folders_deep(router: &axum::Router, cookie: &str) -> (String, String, String) {
+    let (status, folder) = call(
+        router,
+        "POST",
+        "/api/query/folders",
+        cookie,
+        Some(json!({"name": "Reports"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{folder}");
+    let reports = folder["id"]
+        .as_str()
+        .expect("the folder has an id")
+        .to_owned();
+
+    let (status, folder) = call(
+        router,
+        "POST",
+        "/api/query/folders",
+        cookie,
+        Some(json!({"name": "Weekly", "parentId": reports})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{folder}");
+    let weekly = folder["id"]
+        .as_str()
+        .expect("the folder has an id")
+        .to_owned();
+
+    let (status, saved) = call(
+        router,
+        "POST",
+        "/api/query/saved",
+        cookie,
+        Some(json!({"title": "Numbers", "sql": "SELECT 1", "folderId": weekly})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{saved}");
+    let query = saved["id"]
+        .as_str()
+        .expect("the saved query has an id")
+        .to_owned();
+    (query, weekly, reports)
+}
+
+/// The inherited list names every folder of the chain above the item, the
+/// nearest folder first.
+#[tokio::test]
+async fn the_inherited_list_names_the_whole_chain_nearest_folder_first() {
+    let TestApp { router, pool } = spin_up().await;
+    let rina = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+    let reza_id = user_id(&pool, "reza@meridian.example").await;
+    let yoga = user_id(&pool, "yoga@meridian.example").await;
+    let (id, weekly, reports) = a_query_two_folders_deep(&router, &rina).await;
+
+    // A rule on the folder nearest the query, and one on the folder above
+    // it.
+    for (folder_id, person, level) in [(&reports, &reza_id, "edit"), (&weekly, &yoga, "view")] {
+        let (status, list) = call(
+            &router,
+            "PUT",
+            &format!("/api/query/folders/{folder_id}/access"),
+            &rina,
+            Some(json!({"rules": [{"userId": person.to_string(), "level": level}]})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{list}");
+    }
+
+    // The query inherits from the folder it sits in and from that folder's
+    // parent: the nearest folder first.
+    let (status, list) = call(
+        &router,
+        "GET",
+        &format!("/api/query/saved/{id}/access"),
+        &rina,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    assert!(
+        list["rules"]
+            .as_array()
+            .expect("the rules are an array")
+            .is_empty(),
+        "the query carries no rule of its own: {list}"
+    );
+    let inherited = list["inherited"]
+        .as_array()
+        .expect("the inherited list is an array");
+    assert_eq!(inherited.len(), 2, "the whole chain is inherited: {list}");
+    assert_eq!(inherited[0]["folderId"], weekly);
+    assert_eq!(inherited[0]["folderName"], "Weekly");
+    assert_eq!(inherited[0]["userId"], yoga.to_string());
+    assert_eq!(inherited[0]["level"], "view");
+    assert_eq!(inherited[1]["folderId"], reports);
+    assert_eq!(inherited[1]["folderName"], "Reports");
+    assert_eq!(inherited[1]["userId"], reza_id.to_string());
+    assert_eq!(inherited[1]["level"], "edit");
+}
+
+/// A folder carries its own rule in its own list, and inherits the rules
+/// of its parents.
+#[tokio::test]
+async fn a_folder_carries_its_own_rule_and_inherits_its_parents() {
+    let TestApp { router, pool } = spin_up().await;
+    let rina = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+    let reza_id = user_id(&pool, "reza@meridian.example").await;
+    let yoga = user_id(&pool, "yoga@meridian.example").await;
+    let (_id, weekly, reports) = a_query_two_folders_deep(&router, &rina).await;
+
+    for (folder_id, person, level) in [(&reports, &reza_id, "edit"), (&weekly, &yoga, "view")] {
+        let (status, list) = call(
+            &router,
+            "PUT",
+            &format!("/api/query/folders/{folder_id}/access"),
+            &rina,
+            Some(json!({"rules": [{"userId": person.to_string(), "level": level}]})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{list}");
+    }
+
+    let (status, list) = call(
+        &router,
+        "GET",
+        &format!("/api/query/folders/{weekly}/access"),
+        &rina,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    let rules = list["rules"].as_array().expect("the rules are an array");
+    assert_eq!(rules.len(), 1, "the folder's own rule: {list}");
+    assert_eq!(rules[0]["userId"], yoga.to_string());
+    let inherited = list["inherited"]
+        .as_array()
+        .expect("the inherited list is an array");
+    assert_eq!(inherited.len(), 1, "only the parent is inherited: {list}");
+    assert_eq!(inherited[0]["folderId"], reports);
+    assert_eq!(inherited[0]["userId"], reza_id.to_string());
+}
+
+/// The access list needs manage, for reading it as well as for changing
+/// it: a person who may only see a query may not see who else has it.
+#[tokio::test]
+async fn the_access_list_needs_manage_to_be_read_or_changed() {
+    let TestApp { router, pool } = spin_up().await;
+    let rina = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+    let reza = session_cookie_for_seeded_user(&pool, "reza@meridian.example").await;
+
+    // A query in the shared space: every member of the organisation may
+    // see it, and nobody but the author may manage it.
+    let (status, saved) = call(
+        &router,
+        "POST",
+        "/api/query/saved",
+        &rina,
+        Some(json!({"title": "Shared", "sql": "SELECT 1", "folderId": null})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{saved}");
+    let id = saved["id"]
+        .as_str()
+        .expect("the saved query has an id")
+        .to_owned();
+
+    let (status, folder) = call(
+        &router,
+        "POST",
+        "/api/query/folders",
+        &rina,
+        Some(json!({"name": "Reports"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{folder}");
+    let folder_id = folder["id"]
+        .as_str()
+        .expect("the folder has an id")
+        .to_owned();
+
+    for (method, path, body, sentence) in [
+        (
+            "GET",
+            format!("/api/query/saved/{id}/access"),
+            None,
+            QUERY_FORBIDDEN,
+        ),
+        (
+            "PUT",
+            format!("/api/query/saved/{id}/access"),
+            Some(json!({"rules": []})),
+            QUERY_FORBIDDEN,
+        ),
+        (
+            "GET",
+            format!("/api/query/folders/{folder_id}/access"),
+            None,
+            FOLDER_FORBIDDEN,
+        ),
+        (
+            "PUT",
+            format!("/api/query/folders/{folder_id}/access"),
+            Some(json!({"rules": []})),
+            FOLDER_FORBIDDEN,
+        ),
+    ] {
+        let (status, answer) = call(&router, method, &path, &reza, body).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {path}: {answer}");
+        assert_eq!(
+            error(&answer),
+            format!("permission_denied: {sentence}"),
+            "{method} {path}"
+        );
+    }
+
+    // The body is read only after the level: a caller that may see the
+    // item but not manage it is refused with the level, whatever the body
+    // holds.
+    let (status, answer) = call(
+        &router,
+        "PUT",
+        &format!("/api/query/saved/{id}/access"),
+        &reza,
+        Some(json!({"nope": true})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{answer}");
+    assert_eq!(
+        error(&answer),
+        format!("permission_denied: {QUERY_FORBIDDEN}"),
+        "the level is checked before the body"
+    );
+}
+
+/// An item the caller may not see is a 404 on both access routes, never a
+/// 403: the answer never says which it was.
+#[tokio::test]
+async fn an_item_the_caller_may_not_see_is_not_found_on_both_access_routes() {
+    let TestApp { router, pool } = spin_up().await;
+    let rina = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+    let reza = session_cookie_for_seeded_user(&pool, "reza@meridian.example").await;
+
+    // A query in the author's personal space, and an id nothing answers
+    // to.
+    let (status, saved) = call(
+        &router,
+        "POST",
+        "/api/query/saved",
+        &rina,
+        Some(json!({"title": "Private", "sql": "SELECT 1"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{saved}");
+    let id = saved["id"]
+        .as_str()
+        .expect("the saved query has an id")
+        .to_owned();
+    let unseen = Uuid::new_v4().to_string();
+
+    for (method, path, body, sentence) in [
+        (
+            "GET",
+            format!("/api/query/saved/{id}/access"),
+            None,
+            QUERY_NOT_FOUND,
+        ),
+        (
+            "PUT",
+            format!("/api/query/saved/{id}/access"),
+            Some(json!({"rules": []})),
+            QUERY_NOT_FOUND,
+        ),
+        (
+            "GET",
+            format!("/api/query/saved/{unseen}/access"),
+            None,
+            QUERY_NOT_FOUND,
+        ),
+        (
+            "PUT",
+            format!("/api/query/saved/{unseen}/access"),
+            Some(json!({"rules": []})),
+            QUERY_NOT_FOUND,
+        ),
+        (
+            "GET",
+            format!("/api/query/folders/{unseen}/access"),
+            None,
+            FOLDER_NOT_FOUND,
+        ),
+        (
+            "PUT",
+            format!("/api/query/folders/{unseen}/access"),
+            Some(json!({"rules": []})),
+            FOLDER_NOT_FOUND,
+        ),
+    ] {
+        let (status, answer) = call(&router, method, &path, &reza, body).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{method} {path}: {answer}");
+        assert_eq!(error(&answer), sentence, "{method} {path}");
+    }
+
+    // The body is read only after the item: a caller that may not see the
+    // item is refused with the 404, whatever the body holds.
+    let (status, answer) = call(
+        &router,
+        "PUT",
+        &format!("/api/query/saved/{id}/access"),
+        &reza,
+        Some(json!({"nope": true})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{answer}");
+    assert_eq!(
+        error(&answer),
+        QUERY_NOT_FOUND,
+        "the item is read before the body"
+    );
+}
+
+/// A body of another shape is refused with the fixed sentence, and a rule
+/// that names two grantees or none, or a level outside the set, with its
+/// own.
+#[tokio::test]
+async fn a_body_or_a_rule_of_another_shape_is_refused() {
+    let TestApp { router, pool } = spin_up().await;
+    let rina = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+    let yoga = user_id(&pool, "yoga@meridian.example").await;
+
+    let (status, saved) = call(
+        &router,
+        "POST",
+        "/api/query/saved",
+        &rina,
+        Some(json!({"title": "Shared", "sql": "SELECT 1", "folderId": null})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{saved}");
+    let id = saved["id"]
+        .as_str()
+        .expect("the saved query has an id")
+        .to_owned();
+    let path = format!("/api/query/saved/{id}/access");
+
+    for body in [
+        json!({"nope": true}),
+        json!([1, 2]),
+        json!({"rules": "none"}),
+        json!({"rules": [{"userId": yoga.to_string(), "level": "view"}], "extra": 1}),
+    ] {
+        let (status, answer) = call(&router, "PUT", &path, &rina, Some(body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{answer}");
+        assert_eq!(error(&answer), ACCESS_BODY_SHAPE);
+    }
+
+    // A body that is not JSON at all is refused the same way.
+    let (status, answer) = call_with_raw_body(&router, "PUT", &path, &rina, "not json").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{answer}");
+    assert_eq!(error(&answer), ACCESS_BODY_SHAPE);
+
+    for body in [
+        json!({"rules": [{"userId": yoga.to_string(), "roleId": yoga.to_string(), "level": "view"}]}),
+        json!({"rules": [{"level": "view"}]}),
+        json!({"rules": [{"userId": yoga.to_string(), "level": "owner"}]}),
+    ] {
+        let (status, answer) = call(&router, "PUT", &path, &rina, Some(body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{answer}");
+        assert_eq!(error(&answer), ACCESS_RULE_SHAPE);
+    }
+}
+
+/// The same grantee twice is refused with its own sentence.
+#[tokio::test]
+async fn the_same_grantee_listed_twice_is_refused() {
+    let TestApp { router, pool } = spin_up().await;
+    let rina = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+    let yoga = user_id(&pool, "yoga@meridian.example").await;
+
+    let (status, saved) = call(
+        &router,
+        "POST",
+        "/api/query/saved",
+        &rina,
+        Some(json!({"title": "Shared", "sql": "SELECT 1", "folderId": null})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{saved}");
+    let id = saved["id"]
+        .as_str()
+        .expect("the saved query has an id")
+        .to_owned();
+
+    let (status, answer) = call(
+        &router,
+        "PUT",
+        &format!("/api/query/saved/{id}/access"),
+        &rina,
+        Some(json!({"rules": [
+            {"userId": yoga.to_string(), "level": "view"},
+            {"userId": yoga.to_string(), "level": "edit"}
+        ]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{answer}");
+    assert_eq!(error(&answer), ACCESS_GRANTEE_TWICE);
+}
+
+/// A grantee that does not exist, or a person of another organisation, is
+/// refused — and the rules that were there stay exactly as they were.
+#[tokio::test]
+async fn a_grantee_outside_the_organisation_is_refused_and_the_old_rules_stay() {
+    let TestApp { router, pool } = spin_up().await;
+    let rina = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+    let yoga = user_id(&pool, "yoga@meridian.example").await;
+    // Andi is a member of Meridian Retail, not of Meridian Group: he is
+    // not a person of Rina's organisation.
+    let andi = user_id(&pool, "andi@meridian.example").await;
+
+    let (status, saved) = call(
+        &router,
+        "POST",
+        "/api/query/saved",
+        &rina,
+        Some(json!({"title": "Shared", "sql": "SELECT 1", "folderId": null})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{saved}");
+    let id = saved["id"]
+        .as_str()
+        .expect("the saved query has an id")
+        .to_owned();
+    let path = format!("/api/query/saved/{id}/access");
+
+    let (status, list) = call(
+        &router,
+        "PUT",
+        &path,
+        &rina,
+        Some(json!({"rules": [{"userId": yoga.to_string(), "level": "view"}]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+
+    for grantee in [andi.to_string(), Uuid::new_v4().to_string()] {
+        let (status, answer) = call(
+            &router,
+            "PUT",
+            &path,
+            &rina,
+            Some(json!({"rules": [{"userId": grantee, "level": "view"}]})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{answer}");
+        assert_eq!(error(&answer), ACCESS_GRANTEE_OUTSIDE);
+    }
+
+    // The refused changes left the old rules exactly as they were.
+    let (status, list) = call(&router, "GET", &path, &rina, None).await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    let rules = list["rules"].as_array().expect("the rules are an array");
+    assert_eq!(rules.len(), 1, "the old rule is still there: {list}");
+    assert_eq!(rules[0]["userId"], yoga.to_string());
+}
+
+/// The grantee search lists the people of the caller's organisation and
+/// the roles of the deployment, and nobody else.
+#[tokio::test]
+async fn the_grantee_search_lists_the_people_of_the_callers_organisation() {
+    let TestApp { router, pool } = spin_up().await;
+    let rina = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+
+    let (status, found) = call(&router, "GET", "/api/query/grantees?q=", &rina, None).await;
+    assert_eq!(status, StatusCode::OK, "{found}");
+    let people = found["people"].as_array().expect("the people are an array");
+    assert!(
+        people
+            .iter()
+            .any(|person| person["email"] == "reza@meridian.example"),
+        "a member of the organisation is there: {found}"
+    );
+    assert!(
+        !people
+            .iter()
+            .any(|person| person["email"] == "andi@meridian.example"),
+        "a person of another organisation is not: {found}"
+    );
+    let roles = found["roles"].as_array().expect("the roles are an array");
+    assert!(
+        roles.iter().any(|role| role["name"] == "Analyst"),
+        "the roles of the deployment are there: {found}"
+    );
+
+    // The search narrows by name.
+    let (status, found) = call(&router, "GET", "/api/query/grantees?q=Reza", &rina, None).await;
+    assert_eq!(status, StatusCode::OK, "{found}");
+    let people = found["people"].as_array().expect("the people are an array");
+    assert_eq!(people.len(), 1, "one person holds the name: {found}");
+    assert_eq!(people[0]["email"], "reza@meridian.example");
+
+    // A person of another organisation is not there to be found.
+    let (status, found) = call(&router, "GET", "/api/query/grantees?q=Andi", &rina, None).await;
+    assert_eq!(status, StatusCode::OK, "{found}");
+    assert!(
+        found["people"]
+            .as_array()
+            .expect("the people are an array")
+            .is_empty(),
+        "he is not of her organisation: {found}"
+    );
 }

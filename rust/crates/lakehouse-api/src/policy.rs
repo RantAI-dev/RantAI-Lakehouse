@@ -469,6 +469,21 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("PATCH",  "/api/query/folders/{id}",                  Policy::RequiresPermission("query:read")),
     ("DELETE", "/api/query/folders/{id}",                  Policy::RequiresPermission("query:read")),
 
+    // ── Query: the sharing surface (`QS-3`). ───────────────────────────
+    //
+    // The gate is `query:read` for every route, as it is for the rest
+    // of the saved-query surface: the level the caller holds on the item
+    // (view, edit or manage) is the handler's business, because it is
+    // decided by the one resolver in the store and not by the permission
+    // set. The access lists need `manage` — reading the list is part of
+    // sharing — and a grantee that is not of the caller's organisation is
+    // refused before anything is written.
+    ("GET",    "/api/query/saved/{id}/access",             Policy::RequiresPermission("query:read")),
+    ("PUT",    "/api/query/saved/{id}/access",             Policy::RequiresPermission("query:read")),
+    ("GET",    "/api/query/folders/{id}/access",           Policy::RequiresPermission("query:read")),
+    ("PUT",    "/api/query/folders/{id}/access",           Policy::RequiresPermission("query:read")),
+    ("GET",    "/api/query/grantees",                      Policy::RequiresPermission("query:read")),
+
     // ── Pipelines: seeded Data Engineer permission `pipeline:*`. ─────────
     ("GET",  "/api/pipelines",                        Policy::RequiresPermission("pipeline:read")),
     ("POST", "/api/pipelines",                        Policy::RequiresPermission("pipeline:write")),
