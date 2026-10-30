@@ -604,6 +604,163 @@ relaxed or removed in either:
 - Slice 2's mutation checks and the two fingerprint reads of S8 -- out of this
   slice.
 
+### Handoff (review round 2)
+
+Developer: a non-Opus coding agent. Branch `fix/sec-50-tenant-gate`, on top of the
+review commit `ba554bbb`. Every finding of review round 2 is answered below, in the order
+the review lists them. Everything was run in the foreground on bluefin through
+`/home/shiro/rantai/bin/cargo-locked`; no `cargo clean`, no background job, no
+`~/.cargo/config.toml` change, and no container that this work did not start was removed.
+
+#### Commits
+
+| Commit | What |
+| --- | --- |
+| `bcf2d3b5` | `Merge remote-tracking branch 'origin/main' into fix/sec-50-tenant-gate` -- BLOCKER 2: the branch was behind `main` and protection requires it to be up to date. A merge, not a rebase, as the review says. |
+| `1bfad2df` | `fix(g7): the BLD-1 gate authors as the tenant that owns the shared catalog (PR #281 review round 2 B1)` -- BLOCKER 1: the G3a job's CI-only `.env` names `CATALOG_TENANT_ID`, and `ops/g7/bld1_pipeline_author_test.py` reads the SAME setting, picks an author of that tenant and scopes the pipeline to it. Not one masking assertion changed. |
+| `307c82e9` | `docs(sec-50): the assistant's Gold tool is a person's call, not a job with no user (PR #281 review round 2 S1)` -- SHOULD-FIX 1: `docs/OPERATIONS.md` and the round 1 handoff sentence now say that the assistant's own tool is gated as the SIGNED-IN PERSON, and that a signed-in person of another tenant gets the gate's own 404 rather than the 422. |
+| `15edcb13` | `test(sec-50): the assistant's Gold tool is gated as the signed-in person (PR #281 review round 2 S2)` -- SHOULD-FIX 2: a new test calls the copilot's tool as a person of another tenant (holding `gold:export`, with a catalog tenant set) and is refused with the gate's own 404, with nothing reaching the engine. The mutation check is below. |
+| `0550608d` | `ci(gold-export): say truthfully why this job names the catalog's tenant (PR #281 review round 2 NIT)` -- the `gold-export` job's comment no longer claims the export there "is a job with no user": that job's harness signs in as the `*:*` bootstrap admin, so its export passes as a `Caller` (`All`). The setting stays, with the reason that is true. |
+| `4ab0b4bf` | `docs(ops): an unassigned pipeline is invisible to a tenant, not to a tenantless admin (PR #281 review round 2 NIT)` -- `docs/OPERATIONS.md` states the exception (a Platform Admin who belongs to no tenant of their own sees every authored pipeline) and says that `PUT /api/pipelines/{id}/tenant` needs `identity:write`. |
+| `7de0801c` | `docs(gold): the export route's `# Errors` lists the 404 a person of another tenant gets (PR #281 review round 2 NIT)` -- `routes/gold.rs`'s `export` lists the gate's 404 beside the 422 it already listed. |
+| `02b7053c` | `test(pipelines): the unrestricted-author test's doc says what the test checks (PR #281 review round 2 NIT)` -- `tests/pipeline_enforce.rs`: the doc no longer claims a second case the test does not check, nor a G7 shape that the harness does not produce. No assertion changed. |
+| `95299d76` | `fix(sec-50): no pool means "could not verify tenant count", not "set CATALOG_TENANT_ID" (PR #281 review round 2 NIT)` -- R5, amended: the job-with-no-user actor in a deployment with no pool refuses with `SEC-20`'s own sentence (a 503), not D6's 422, and the sentence is ONE constant now. |
+
+#### Commands run, with their counts
+
+Everything below was run in the foreground, from `rust/`, through
+`/home/shiro/rantai/bin/cargo-locked`, on the final commit `95299d76`:
+
+```text
+cargo fmt --check
+  exit 0
+
+cargo clippy -p lakehouse-api --all-targets -- -D warnings
+  exit 0
+
+cargo test -p lakehouse-api routes::ai::tools::gold   -> 4 passed; 0 failed
+cargo test -p lakehouse-api sec50_gate_tests           -> 10 passed; 0 failed
+cargo test -p lakehouse-api routes::gold               -> 16 passed; 0 failed
+cargo test -p lakehouse-api routes::catalog            -> 211 passed; 0 failed
+cargo test -p lakehouse-api --test pipeline_enforce    -> 18 passed; 0 failed
+cargo test -p lakehouse-api --test gold_export_auth    -> 7 passed; 0 failed
+cargo test -p lakehouse-api --test sec11_guard         -> 4 passed; 0 failed
+```
+
+The Python and compose lines, from the repo root (the B1 commit changed the G7 harness and
+`docker-compose.yml`, so these are its own checks):
+
+```text
+python3 -m py_compile ops/g7/bld1_pipeline_author_test.py
+  -> OK (no output)
+
+python3 ops/lint/check_intra_package_imports.py   -> OK: all intra-package dispar_orchestrate imports resolve; exit 0
+python3 ops/lint/check_bare_iceberg_count.py      -> R11 guard: no bare count() against a Bronze Iceberg table found; exit 0
+python3 ops/lint/check_compose_init_readiness.py  -> exit 0
+python3 ops/lint/check_connector_gate_coverage.py -> OK: every supported type is covered or explicitly waived (0 waived); exit 0
+python3 -m unittest discover -s ops/lint -p 'test_*.py'   -> Ran 23 tests; OK
+python3 -m unittest discover -s ops/gates -p 'test_*.py' -> Ran 29 tests; OK
+
+POSTGRES_PASSWORD=d RUSTFS_ACCESS_KEY=d RUSTFS_SECRET_KEY=d \
+  LAKEKEEPER_ENCRYPTION_KEY=d CONNECTOR_SECRETS_KEY=d \
+    docker compose --profile '*' config --quiet
+  -> exit 0
+
+git status
+  -> nothing to commit, working tree clean
+```
+
+#### The mutation check
+
+S2 asked for one: swap the actor the copilot's tool is gated as, and watch the named test
+FAIL. The mutation was `crate::routes::gold::gold_export_gate_actor(Some(principal), &headers)`
+-> `crate::routes::query::GateActor::CatalogTenant`, in
+`rust/crates/lakehouse-api/src/routes/ai/tools/gold.rs`. It was reverted afterwards; the
+verification above ran on the restored tree, and the committed code gates as the signed-in
+person.
+
+```text
+test routes::ai::tools::gold::tests::the_tool_gates_the_export_as_the_signed_in_person ... FAILED
+  panicked at crates/lakehouse-api/src/routes/ai/tools/gold.rs:357:9:
+  assertion `left == right` failed: the tool must gate the export as the signed-in person:
+    {"namespace":"gold","table":"gold_export_smoke","formatVersion":2,"rowsExported":0,
+     "note":"Append-only: menjalankan ulang menambah baris baru, bukan menggantikan."}
+    left: None
+   right: Some("Table not found or not available to your organisation: serving.gold_export_smoke")
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2834 filtered out
+```
+
+That is the leak the review named: with the catalog's tenant as the actor, a person of another
+tenant exports the shared catalog through the assistant, and every other test in the file still
+passes.
+
+#### What each finding became, and where
+
+- **BLOCKER 1 (the red G3a job).** `.github/workflows/ci.yml`'s `g3a-dagster` job's CI-only
+  `.env` names `CATALOG_TENANT_ID`, with the reason; `ops/g7/bld1_pipeline_author_test.py`
+  reads the SAME setting (the way it reads its other settings) and picks an author who
+  belongs to that tenant, scoping the pipeline to it (`_user_by_role`, `_tenant_shared_with`).
+  A holder of the role outside that tenant is refused with a clear message instead of being
+  picked and refused by the API later; with the setting unset the harness keeps the behaviour
+  it had. `docker-compose.yml`'s `bld1-test-runner` service passes the setting into the
+  container. Not one masking assertion changed.
+- **BLOCKER 2 (the branch state).** `main` is merged in (`bcf2d3b5`), not rebased.
+- **SHOULD-FIX 1.** `docs/OPERATIONS.md`'s "What the setting is for now (`SEC-50`)" says the
+  assistant's own tool is a SIGNED-IN PERSON's call, gated as that person, and that a
+  signed-in person of another tenant is refused with the gate's own 404 -- not with the 422,
+  which is the job-with-no-user refusal. The round 1 handoff's "NIT 2" paragraph says the
+  same, and is corrected.
+- **SHOULD-FIX 2.** `rust/crates/lakehouse-api/src/routes/ai/tools/gold.rs`'s new test
+  `the_tool_gates_the_export_as_the_signed_in_person`: a real per-test Postgres (the four
+  seeded tenants), a `CATALOG_TENANT_ID` set, a bare `wiremock` engine, and a person of
+  "Meridian Retail" (`sari@meridian.example`, who is not of the catalog's tenant) holding
+  `gold:export`. The tool refuses with the gate's own 404 sentence, and the engine is asked
+  nothing.
+- **NIT 1 (the B2 comment).** `.github/workflows/ci.yml`'s `gold-export` job. The comment now
+  says what is true: the shared catalog belongs to a tenant and every multi-tenant deployment
+  must name it; THIS job's harness signs in as the `*:*` bootstrap admin
+  (`ops/gold_export/gold_export_test.py`'s `step_login`), so its own export passes as a
+  `Caller` with every table in reach and does not lean on the setting -- but an exporter that
+  is not an unrestricted admin does, and the setting belongs there either way.
+- **NIT 2 (`OPERATIONS.md`).** The exception to "invisible" is stated, and
+  `PUT /api/pipelines/{id}/tenant`'s `identity:write` permission is named. Both checked
+  against the code: `routes::pipelines::list`'s `all_tenants` and
+  `lakehouse_store::pipelines::list_pipelines`'s `WHERE ($2 OR ...)`, and `POLICY_TABLE`'s
+  `("PUT", "/api/pipelines/{id}/tenant", Policy::RequiresPermission("identity:write"))`.
+- **NIT 3 (`routes/gold.rs`).** `export`'s `# Errors` lists the gate's 404 beside the 422.
+- **NIT 4 (`tests/pipeline_enforce.rs`).** The doc of
+  `a_pipeline_authored_by_an_unrestricted_principal_is_not_refused_for_its_tenant` now states
+  the case the test checks (a pipeline with no tenant of its own), names the case it does not
+  check (a pipeline in a tenant the author is not a member of), and drops the "this is the
+  shape the G7 harness creates" claim: the G7 gate joins its account to `meridian-group`
+  BEFORE `POST /api/pipelines`, and the create route stores the creator's active tenant, so
+  its pipeline is stored WITH a tenant.
+- **R5, amended.** `routes/query.rs`'s `catalog_tenant_reach` refuses with
+  `ApiError::Unavailable(COULD_NOT_VERIFY_TENANT_COUNT)` -- a 503, "could not verify tenant
+  count" -- when the count is `None`, not with D6's 422 that tells the operator to set a
+  setting which may already be set. The sentence is one constant
+  (`routes::catalog::COULD_NOT_VERIFY_TENANT_COUNT`) shared by the three sites that refuse in
+  this state. The 422 with D6's sentence is unchanged for the case it is for: a deployment
+  that CAN count its tenants, holds several, and names no catalog tenant.
+
+#### Not verified, with the reason
+
+- **The full workspace test and the G-gates were NOT run locally.** Under the owner's rule of
+  2026-10-30, CI is the final check: the run on the pushed head `95299d76` (workflow run
+  `41072004930`) is what confirms the G3a job (`Rust · G3a Dagster + dlt Bronze ingest`) and
+  the full workspace (`Rust · test (stable)`). What IS verified here is every crate this
+  round touched: `lakehouse-api`'s fmt, clippy and the tests listed above.
+- **`docker compose up` on the affected profile was NOT run.** `docker-compose.yml` changed in
+  B1 (one environment variable on the `bld1-test-runner` service), and `config --quiet`
+  passes. The profile proof is the G3a job on the PR.
+- `bun run typecheck && bun run lint && bun run test` -- **not run.** The branch touches no
+  TypeScript file.
+- `(cd dagster && python -m pytest dispar_orchestrate -q)` -- **not run.** No Dagster file
+  changed; the CI job `Dagster · unit tests` is green on this head.
+- `docs/core/BACKLOG.md` -- **not touched** (the reviewer sets the status, the PR and the
+  shipped date at merge).
+- Slice 2's mutation checks and the two fingerprint reads of S8 -- out of this slice.
+
 ## 9. Review (planner appends below)
 
 ### Review round 1 (planner, 2026-10-30, at `1f15d91f`)
