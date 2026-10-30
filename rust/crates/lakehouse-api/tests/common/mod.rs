@@ -106,6 +106,21 @@ pub async fn spin_up_state(overrides: &HashMap<String, String>) -> (AppState, Pg
     build_state_and_pool(overrides).await
 }
 
+/// Same as [`spin_up_with_env`], but the [`AppState`] the router was built
+/// from is returned as well, and `prepare` may change it before the router
+/// is built: a test that counts what the API did — the child runs of
+/// `SEC-22` — needs the handle, and a test that points the runner at
+/// another child needs to do it before the router takes the state.
+pub async fn spin_up_with_state(
+    overrides: &HashMap<String, String>,
+    prepare: impl FnOnce(&mut AppState),
+) -> (TestApp, AppState) {
+    let (mut state, pool) = build_state_and_pool(overrides).await;
+    prepare(&mut state);
+    let router = lakehouse_api::routes::router(state.clone());
+    (TestApp { router, pool }, state)
+}
+
 /// Same as [`spin_up_with_env`], but replaces
 /// [`AppState::connector_secret_resolver`] with `resolver` before the
 /// router is built.
@@ -258,7 +273,16 @@ async fn build_state_and_pool(overrides: &HashMap<String, String>) -> (AppState,
     // these tests never rely on the cookie flowing over plaintext HTTP,
     // since `tower::ServiceExt::oneshot` never touches a real socket.
     let config = Config::from_map(&env).expect("a valid test Config");
-    let state = AppState::new(config);
+    let mut state = AppState::new(config);
+    // `SEC-22` D3: the child that reads an uploaded workbook or a Parquet
+    // file is the binary Cargo built for these tests — the test binary
+    // itself would run the test suite again, so the runner is pointed at
+    // the real child.
+    state.conversion_runner = state
+        .conversion_runner
+        .with_binary(std::path::PathBuf::from(env!(
+            "CARGO_BIN_EXE_lakehouse-api"
+        )));
     // OPS-4: the harness applied the migrations to this database before
     // building the state, which is what `main::bring_database_up` confirms
     // in production — so `GET /health` reports the database as usable here

@@ -106,6 +106,16 @@ is `DATA-19`
     moved out, the three folders are deleted (204) and are gone from the list. The files
     are deleted; the table stays.
 
+11. A workbook that asks for more memory than the machine has (`SEC-22`): it
+    uploads `ops/fixtures/uploads/hostile/huge_shared_strings.xlsx`, whose
+    shared strings declare two billion strings, so the file asks for 48 GB
+    before a single cell is read. The upload is refused with the one
+    sentence of `SEC-22` D4 ("This file needs more memory or time to read
+    than an upload is allowed. Save it as CSV and upload that instead."),
+    because the read happens in a child process that runs under a memory
+    limit and the CHILD is the one that ends. The API is still there: the
+    list of the uploads answers 200.
+
 Exit code 0 and `[g9] PASS` when every step holds; otherwise `[g9] FAILED:
 <reason>` on stderr and exit code 1.
 
@@ -559,6 +569,13 @@ def step_delete_keeps_the_table(api, upload_id: str, table: str, table_rows: int
 # SEC-17: the sentence for the column cap, as `routes/uploads.rs` words it
 # (`JOB_TOO_MANY_COLUMNS`) and `file_ingest.py` records it (`TOO_MANY_COLUMNS`).
 TOO_MANY_COLUMNS = "The file has more than 1,000 columns."
+# The one sentence of `SEC-22` D4 for a file that needed more memory or more
+# time than a read is allowed: a child that was killed, ran out of time or ran
+# out of memory looks the same from here.
+NEEDS_MORE_MEMORY = (
+    "This file needs more memory or time to read than an upload is allowed. "
+    "Save it as CSV and upload that instead."
+)
 
 
 def step_column_cap(api) -> None:
@@ -729,6 +746,46 @@ def step_parquet(api, base_table: str, state: dict) -> None:
     state["deleted"] = True
     _expect(api.get(f"{API_URL}/api/uploads/{upload_id}", timeout=30), 404, "GET of the deleted Parquet upload")
     print("[g9] parquet: PASS (the upload is gone, the table stays)")
+
+
+def step_hostile_workbook(api, state: dict) -> None:
+    """A workbook that asks for more memory than the machine has must not end
+    the API (`SEC-22`).
+
+    The fixture is a real workbook whose shared strings declare two billion
+    strings: the reader reserves room for all of them before it reads one, so
+    the file asks for 48 GB. The read happens in a child process that runs
+    under a memory limit, so the CHILD is the one that ends, and the answer is
+    the one sentence of `SEC-22` D4. The upload itself is refused, so there is
+    no upload to preview: the API reads the workbook to list its sheets when it
+    arrives.
+
+    The API is still there afterwards: the list of the uploads answers 200.
+    """
+    path = FIXTURES / "hostile" / "huge_shared_strings.xlsx"
+    if not path.is_file():
+        raise G9Failure(f"fixture missing: {path} (this gate reads ops/fixtures/uploads/ beside it)")
+    resp = api.post(
+        f"{API_URL}/api/uploads",
+        files={
+            "file": (
+                "hostile.xlsx",
+                path.read_bytes(),
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        },
+        timeout=120,
+    )
+    if resp.status_code != 400:
+        raise G9Failure(
+            f"the hostile workbook should be refused with 400, it answered {resp.status_code}: {resp.text[:200]}"
+        )
+    if resp.json().get("error") != NEEDS_MORE_MEMORY:
+        raise G9Failure(
+            f"the refusal should say {NEEDS_MORE_MEMORY!r}, it said {resp.text[:200]}"
+        )
+    _expect(api.get(f"{API_URL}/api/uploads", timeout=30), 200, "GET /api/uploads after the hostile workbook")
+    print("[g9] hostile workbook: refused with the one sentence, the API is still there")
 
 
 def _dagster_lists_job(requests, job_name: str) -> bool:
@@ -1564,6 +1621,7 @@ def main() -> int:
         step_column_cap(api)
         step_workbook(api, table, state)
         step_parquet(api, table, state)
+        step_hostile_workbook(api, state)
         step_typed_columns(api, table, state)
         step_new_formats(api, table, state)
         step_several_files(api, table, state)
