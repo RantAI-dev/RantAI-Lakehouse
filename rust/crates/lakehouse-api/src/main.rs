@@ -25,7 +25,13 @@ mod connector_probe;
 mod connector_secret_store;
 mod crypto_provider;
 mod csv_export;
-mod csv_safe;
+// `csv_safe` is not compiled into the binary. It rewrites CSV bytes as a
+// whole, and the only caller it had was the download route, which now
+// writes its files cell by cell through `export.rs` — where the formula
+// guard every file goes through is `csv_export::neutralise`. Nothing in
+// this binary uses the byte-level rule, so compiling it here would only
+// leave dead code behind. The library target keeps the module (it is
+// declared `pub` there), so its own tests still run.
 mod error;
 mod export;
 mod gold_export;

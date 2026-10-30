@@ -22,7 +22,7 @@ See, filter and download full results; stop a query that runs too long.
 
 | Capability | Today | Target |
 | --- | --- | --- |
-| Rows shown | 2,000, computed in full | Up to 64,000 rows or 10 MB, whichever comes first (Databricks); the limit is applied in the engine |
+| Rows shown | 2,000, computed in full | Up to 64,000 rows or 10 MB, whichever comes first (Databricks); the row limit is applied in the engine, and the 10 MB cap is counted on the server after the row cut, before the result is sent |
 | Grid | Sort only | Sort, filter per column, column statistics (nulls, distinct, min/max, histogram), cell inspector for long and JSON values, copy cells |
 | Download | Browser CSV of 2,000 rows; server route has no button | Server-side download of the full result as CSV, TSV, Excel (1,048,576-row sheet limit) and Parquet, up to 5 GB (Databricks), with masking re-applied (SEC-21) |
 | Stop | Browser only | Cancels the query on the engine within 5 seconds *(proposed)* |

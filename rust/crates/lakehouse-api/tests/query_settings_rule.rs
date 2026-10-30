@@ -71,8 +71,10 @@ async fn mount_engine(ch: &MockServer) {
         .mount(ch)
         .await;
     Mock::given(method("POST"))
-        .and(body_string_contains("FORMAT CSV"))
-        .respond_with(ResponseTemplate::new(200).set_body_string("n\n1\n"))
+        .and(body_string_contains(
+            "FORMAT JSONCompactEachRowWithNamesAndTypes",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_string("[\"n\"]\n[\"Int64\"]\n[1]\n"))
         .mount(ch)
         .await;
     Mock::given(method("POST"))
@@ -253,8 +255,11 @@ async fn a_download_of_a_row_with_another_setting_is_refused_and_the_engine_is_s
     assert!(sent.is_empty(), "the rule precedes the re-run: {sent:?}");
 }
 
+/// The download asks the engine for the whole result: it adds no row cap of
+/// its own to the statement (`QS-2`), so the file's own bound is the byte cap
+/// the writer applies and not a `SETTINGS` clause in the statement.
 #[tokio::test]
-async fn a_download_keeps_its_own_cap_after_the_check() {
+async fn a_download_adds_no_cap_of_its_own_to_the_statement_after_the_check() {
     let ch = MockServer::start().await;
     mount_engine(&ch).await;
     let TestApp { router, pool } = spin_up_with_clickhouse(&ch.uri()).await;
@@ -268,8 +273,8 @@ async fn a_download_keeps_its_own_cap_after_the_check() {
     assert_eq!(sent.len(), 1, "{sent:?}");
     assert!(sent[0].contains("iceberg_snapshot_id = 1"), "{}", sent[0]);
     assert!(
-        sent[0].contains("SETTINGS max_result_rows =") && sent[0].contains("result_overflow_mode"),
-        "the download's own SETTINGS is added after the check: {}",
+        !sent[0].contains("max_result_rows") && !sent[0].contains("result_overflow_mode"),
+        "the download adds no row cap to the statement: {}",
         sent[0]
     );
 }

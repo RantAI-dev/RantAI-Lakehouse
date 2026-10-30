@@ -46,8 +46,9 @@ async fn spin_up_with_clickhouse(ch_uri: &str) -> TestApp {
 }
 
 /// Answers, in this order: the column lookup the rewrite makes, a download
-/// (its statement ends in `FORMAT CSV`) with a small CSV, and any other
-/// statement (a run) with a `FORMAT JSON` result.
+/// (its statement ends in `FORMAT JSONCompactEachRowWithNamesAndTypes`, the
+/// row format the download streams) with one row, and any other statement (a
+/// run) with a `FORMAT JSON` result.
 async fn mount_columns_csv_and_json(ch: &MockServer) {
     Mock::given(method("POST"))
         .and(body_string_contains("system.columns"))
@@ -67,8 +68,12 @@ async fn mount_columns_csv_and_json(ch: &MockServer) {
         .mount(ch)
         .await;
     Mock::given(method("POST"))
-        .and(body_string_contains("FORMAT CSV"))
-        .respond_with(ResponseTemplate::new(200).set_body_string("email\n***\n"))
+        .and(body_string_contains(
+            "FORMAT JSONCompactEachRowWithNamesAndTypes",
+        ))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string("[\"email\"]\n[\"String\"]\n[\"***\"]\n"),
+        )
         .mount(ch)
         .await;
     Mock::given(method("POST"))
@@ -247,7 +252,12 @@ async fn a_download_of_a_run_applies_the_policy_once() {
     let sent = sent_statements(&ch).await;
     assert_eq!(sent.len(), 2, "the run, then the download: {sent:?}");
     let downloaded = &sent[1];
-    assert!(downloaded.contains("FORMAT CSV"), "{downloaded}");
+    // The download streams the rows and writes the file itself, so the
+    // engine is asked for the row format, not for a `FORMAT CSV` file.
+    assert!(
+        downloaded.contains("FORMAT JSONCompactEachRowWithNamesAndTypes"),
+        "{downloaded}"
+    );
     assert_eq!(
         downloaded.matches(MASK_EXPRESSION).count(),
         1,

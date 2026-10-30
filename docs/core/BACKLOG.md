@@ -192,9 +192,9 @@ estimate (S, M, L), which the base has no field for.
 | `DATA-19` | Feature | Uploaded tables can feed pipelines and so reach dashboards. | Data | P2 | Released | #165 | `reference/competitive-comparison.md` (Data matrix) |
 | `DATA-35` | Feature | Folders for uploaded files on Sources: a grouping only (a file's table keeps its name), chosen while uploading or moved later, folders inside folders, empty folders allowed and deletable, a folder with files cannot be deleted. Uploaded files only, for now. Feature page `features/upload-folders.md` | Data | P2 | In Acceptance | [#259](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/259) | Product owner, 2026-10-26; [spec](specs/data-35.md) |
 | `QS-1` | Feature | Query Studio editor basics: column autocomplete, schema browser, several statements, tabs, formatting rules | Query Studio | P2 | In Acceptance | #237 | `reference/competitive-comparison.md` (Query Studio matrix) |
-| `QS-2` | Feature | Query Studio results: up to 64,000 rows or 10 MB shown, grid filters and column stats, full server downloads up to 5 GB (Databricks' limits), server-side Stop, configurable timeouts. | Query Studio | P2 | Planned |  | `reference/competitive-comparison.md` (Query Studio matrix) |
+| `QS-2` | Feature | Query Studio results: up to 64,000 rows or 10 MB shown, grid filters and column stats, full server downloads up to 5 GB (Databricks' limits), server-side Stop, configurable timeouts. | Query Studio | P2 | In Acceptance | #275 | `reference/competitive-comparison.md` (Query Studio matrix) |
 | `QS-3` | Feature | Saved queries done properly: edit, delete, folders, sharing levels, version history. **Blocked by `SEC-20`** | Query Studio | P2 | Planned |  | `reference/competitive-comparison.md` (Query Studio matrix) |
-| `QS-4` | Feature | Query history page with filters, and a query profile | Query Studio | P2 | Building | #254 | `reference/competitive-comparison.md` (Query Studio matrix) |
+| `QS-4` | Feature | Query history page with filters, and a query profile | Query Studio | P2 | In Acceptance | #254, #263 | `reference/competitive-comparison.md` (Query Studio matrix) |
 | `QS-5` | Feature | The bridge to BI: parameters that become dashboard filters, snippets, charts from results, reuse a saved query in SQL, alerts on a query. | Query Studio | P2 | Planned |  | `reference/competitive-comparison.md` (Query Studio matrix) |
 | `AI-16` | Task | Hand-off to the AI team: AI features for the Data module. Remaining: plain-language table search, AI classification, AI quality suggestions and incident help, AI connector building. The AI team plans these | AI Copilot | P2 | In Progress | #79, #95, #96, #109, #110, #111, #112, #118 | `docs/core/features/semantic-layer.md` |
 | `AI-17` | Feature | The chat asks once, with options, which reading of an unclear word the person means, remembers the clicked answer per user, and writes in full only the tables a question names. **Staging QA, 2026-10-18, after #208:** in 8 late-ask runs the reply never apologised, kept the user's language and named the reading it used; it still mentioned the refusal in 4, asked in text in 2 and offered another reading in 4. A server check of the reply is the owner's call. Checklist rows 5 and 9 to 12 not run | AI Copilot | P2 | Building | #81, #84, #125, #208 | `features/chat-ask-back.md` |
@@ -293,8 +293,8 @@ estimate (S, M, L), which the base has no field for.
 | `BI-36` | Task | The PDF print view (`render-view.tsx`, `BI-1`) still reads an uploaded map's boundary through the signed-in loader, so a map tile in a server-made PDF can redirect to sign-in instead of drawing; the public and embed views got their own token routes in #246 (`PR #246 review BLOCKER 1`), the print view needs the same | Dashboards | P2 | Todo |  | #246 developer handoff |
 | `OPS-11` | Task | Next.js 16.4 (on `main`) blocks the dev server's own resources for any origin but `localhost`, so a console dev server opened by a LAN address never finishes loading. Read the allowed dev origins from an environment variable (`allowedDevOrigins`), empty by default, and document it in `.env.example`. Found at the phase 3 QA, 2026-10-17 | Operations | P3 | Done | #229 | phase 3 QA |
 | `OPS-12` | Task | The `Rust · test (stable)` CI job runs out of disk on the runner: PR #186 (DATA-17 uploads) and its stacked branch died with "No space left on device" in the `cargo test --workspace --locked` step (run 40268340415), and commit 820484ba (QS-4) hit the same wall and worked around it by merging two test binaries instead of fixing the cause. Every one of the 68 lakehouse-api integration test binaries links the whole crate with full debug info. Free the runner's disk (delete the toolchains the job never uses) and build this job's test binaries with line tables only | Operations | P1 | Done | [#260](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/260) | PR #186 CI run 40268340415 |
-| `OPS-13` | Task | The reused test Postgres (`lakehouse-test-support`, one labelled testcontainers container shared by every test process) never drops the per-test databases `sqlx::test` leaves behind, so its volume grew to 177.7 GB in three days and filled the dev VM's disk on 2026-10-26 (the T3 server died with it). Drop leftover test databases when the container is reused, or cap it, so a long-lived container cannot fill the disk. The sweep drops the leftovers of every test process; dropping each `lakehouse_api_test_*` database at the end of its own test waits for #192. The sweep can also take a database a paused test still needs: it drops a database that had no backend at two passes in a row, which is 30 to 60 seconds after its last query, and sqlx's pool closes an idle connection after one second, so a test that pauses for more than about a second between its queries can lose its database | Operations | P1 | In Progress |  | dev VM disk full, 2026-10-26 |
-| `OPS-14` | Task | `Coverage & SBOM` fails on `main` on every push since `a873d6ea` (19 runs as of 2026-10-28: 18 failed in the `cargo llvm-cov` step (10 with a recorded step failure, 8 with the job lost at the runner level), 1 cancelled): the `cargo llvm-cov (lcov)` job runs out of disk on the GitHub runner ("No space left on device", run 40667618517; the first red run since `a873d6ea` is 40265593360). The `SBOM (CycloneDX)` job succeeds in every one of those runs. The last two green runs, before the disk failure started, took 27m30s and 29m03s, so 30 minutes is the next wall. Free the runner's disk the way the test job does, build with line tables only, and raise the job's timeout to 90 minutes. `ci.yml`'s 40-minute test budget was the next wall: its three last green runs on `main` took 39m18s, 30m07s and 36m12s and the longest took 39m27s, and the job was cancelled at the 40-minute budget in three runs on 2026-10-28, so the job now gets 60 minutes | Operations | P1 | In Progress |  | CI run 40667618517; CI run 40265593360 |
+| `OPS-13` | Task | The reused test Postgres (`lakehouse-test-support`, one labelled testcontainers container shared by every test process) never drops the per-test databases `sqlx::test` leaves behind, so its volume grew to 177.7 GB in three days and filled the dev VM's disk on 2026-10-26 (the T3 server died with it). Drop leftover test databases when the container is reused, or cap it, so a long-lived container cannot fill the disk. The sweep drops the leftovers of every test process; dropping each `lakehouse_api_test_*` database at the end of its own test waits for #192. The sweep can also take a database a paused test still needs: it drops a database that had no backend at two passes in a row, which is 30 to 60 seconds after its last query, and sqlx's pool closes an idle connection after one second, so a test that pauses for more than about a second between its queries can lose its database | Operations | P1 | Done | [#269](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/269) | dev VM disk full, 2026-10-26 |
+| `OPS-14` | Task | `Coverage & SBOM` fails on `main` on every push since `a873d6ea` (19 runs as of 2026-10-28: 18 failed in the `cargo llvm-cov` step (10 with a recorded step failure, 8 with the job lost at the runner level), 1 cancelled): the `cargo llvm-cov (lcov)` job runs out of disk on the GitHub runner ("No space left on device", run 40667618517; the first red run since `a873d6ea` is 40265593360). The `SBOM (CycloneDX)` job succeeds in every one of those runs. The last two green runs, before the disk failure started, took 27m30s and 29m03s, so 30 minutes is the next wall. Free the runner's disk the way the test job does, build with line tables only, and raise the job's timeout to 90 minutes. `ci.yml`'s 40-minute test budget was the next wall: its three last green runs on `main` took 39m18s, 30m07s and 36m12s and the longest took 39m27s, and the job was cancelled at the 40-minute budget in three runs on 2026-10-28, so the job now gets 60 minutes | Operations | P1 | Done | [#269](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/269) | CI run 40667618517; CI run 40265593360 |
 | `OPS-4` | Task | Fail loudly when the application database is unreachable | Platform | P3 | Done | [#234](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/234) | `docs/OPERATIONS.md` |
 | `OPS-6` | Feature | Log and trace viewer | Operations | P3 | Idea |  | `docs/archive/FEATURE_COVERAGE.md` |
 | `BIZ-1` | Feature | Enterprise edition | Business | P3 | Idea |  | PRODUCT §1 |
@@ -315,7 +315,7 @@ parity), built after it.
 
 | Item | Status | Blocked by | Blocks |
 | --- | --- | --- | --- |
-| `BI-18` | Building | — | `AI-2`, `AI-9` (templates part), `QS-5` (the dashboard date filter) |
+| `BI-18` | Building | — | `AI-2`, `AI-9` (templates part) |
 | `BI-14` | Planned | — | `AI-13` |
 | `BI-16` | Building | — | `AI-5` (per chart type as it lands) |
 | `BI-17` | Building | — | `AI-8` |
@@ -323,7 +323,7 @@ parity), built after it.
 | `BLD-1` | Building | — | `REL-6` |
 | `DATA-4` | Planned | — | `DATA-3` |
 | `DEC-8` | Decided | — | `AI-11` |
-| `QS-5` | Planned | `BI-18` (the dashboard date filter) | `AI-12` (variables part) |
+| `QS-5` | Planned | — | `AI-12` (variables part) |
 | `SEC-20` | In Progress | — | `QS-3` |
 | `AI-11` | Planned | `BI-19`, `DEC-8` | — |
 | `AI-12` | Building | `QS-5` (variables part) | — |
@@ -338,7 +338,7 @@ parity), built after it.
 
 **Ready to start** (Todo, Planned or Idea, nothing open blocks it; Idea items still need a spec):
 
-`ADM-1`, `ADM-2`, `AI-10`, `AI-21`, `AI-22`, `BI-14`, `BI-20`, `BI-27`, `BI-28`, `BI-29`, `BI-3`, `BI-30`, `BI-31`, `BI-32`, `BI-33`, `BI-34`, `BI-35`, `BI-36`, `BIZ-1`, `BIZ-2`, `BLD-10`, `BLD-6`, `DATA-20`, `DATA-21`, `DATA-22`, `DATA-23`, `DATA-24`, `DATA-25`, `DATA-26`, `DATA-27`, `DATA-28`, `DATA-29`, `DATA-30`, `DATA-31`, `DATA-32`, `DATA-33`, `DATA-34`, `DATA-36`, `DATA-4`, `DATA-5`, `DATA-6`, `DATA-8`, `DOC-2`, `GOV-1`, `GOV-3`, `GOV-5`, `INT-2`, `OPS-2`, `OPS-3`, `OPS-6`, `OPS-8`, `QA-1`, `QRY-1`, `QS-2`, `REL-1`, `REL-2`, `REL-4`, `REL-7`, `SEC-34`, `SEC-4`, `SEC-40`, `SEC-50`, `SEC-54`, `SEC-55`, `SEC-7`, `SRC-15`, `SRC-18`, `SRC-2`, `SRC-22`, `SRC-23`, `SRC-24`, `SRC-25`, `SRC-26`, `SRC-27`, `SRC-28`, `SRC-30`, `SRC-31`, `SRC-33`, `SRC-34`, `SRC-4`, `SRC-5`, `VER-1`
+`ADM-1`, `ADM-2`, `AI-10`, `AI-21`, `AI-22`, `BI-14`, `BI-20`, `BI-27`, `BI-28`, `BI-29`, `BI-3`, `BI-30`, `BI-31`, `BI-32`, `BI-33`, `BI-34`, `BI-35`, `BI-36`, `BIZ-1`, `BIZ-2`, `BLD-10`, `BLD-6`, `DATA-20`, `DATA-21`, `DATA-22`, `DATA-23`, `DATA-24`, `DATA-25`, `DATA-26`, `DATA-27`, `DATA-28`, `DATA-29`, `DATA-30`, `DATA-31`, `DATA-32`, `DATA-33`, `DATA-34`, `DATA-36`, `DATA-4`, `DATA-5`, `DATA-6`, `DATA-8`, `DOC-2`, `GOV-1`, `GOV-3`, `GOV-5`, `INT-2`, `OPS-2`, `OPS-3`, `OPS-6`, `OPS-8`, `QA-1`, `QRY-1`, `QS-5`, `REL-1`, `REL-2`, `REL-4`, `REL-7`, `SEC-34`, `SEC-4`, `SEC-40`, `SEC-50`, `SEC-54`, `SEC-55`, `SEC-7`, `SRC-15`, `SRC-18`, `SRC-2`, `SRC-22`, `SRC-23`, `SRC-24`, `SRC-25`, `SRC-26`, `SRC-27`, `SRC-28`, `SRC-30`, `SRC-31`, `SRC-33`, `SRC-34`, `SRC-4`, `SRC-5`, `VER-1`
 
 ## Dates
 
@@ -349,8 +349,9 @@ set by the product owner and are left empty until they are.
 | ID | Started | Shipped | Due |
 | --- | --- | --- | --- |
 | `SRC-4` | 2026-10-29 | | |
+| `QS-2` | 2026-10-28 | 2026-10-30 | |
 | `SEC-20` | 2026-10-24 | | |
-| `QS-4` | 2026-10-24 | | |
+| `QS-4` | 2026-10-24 | 2026-10-27 | |
 | `DATA-1` | 2026-10-02 | 2026-10-03 | |
 | `SEC-2` | 2026-10-02 | 2026-10-03 | |
 | `SEC-5` | 2026-10-02 | 2026-10-03 | |
@@ -400,8 +401,8 @@ set by the product owner and are left empty until they are.
 | `SEC-46` | 2026-10-21 | 2026-10-21 | |
 | `OPS-11` | 2026-10-23 | 2026-10-23 | |
 | `OPS-12` | 2026-10-26 | 2026-10-26 | |
-| `OPS-13` | 2026-10-28 | | |
-| `OPS-14` | 2026-10-28 | | |
+| `OPS-13` | 2026-10-28 | 2026-10-28 | |
+| `OPS-14` | 2026-10-28 | 2026-10-28 | |
 | `SEC-48` | 2026-10-23 | 2026-10-23 | |
 | `OPS-10` | 2026-10-23 | 2026-10-23 | |
 | `QS-1` | 2026-10-23 | 2026-10-23 | |
