@@ -910,6 +910,82 @@ Stop and report (do not improvise):
 If the gate cannot pass, the planner proposes splitting Oracle change
 capture into its own backlog item, and the other four sources ship (D13).
 
+**Amendment 10 (2026-10-30, slice 6 developer's stop report, decided by the
+product owner).** `python-oracledb` thin mode (2.5.1 pinned, and 26.1.0) has
+no native network encryption, so the orchestrator cannot test an Oracle
+change-capture dial with the encryption the connector uses (S6-c). The
+product owner chose, on 2026-10-30, **to test through Kafka Connect**, and
+signed the change to decision 9 for Oracle below. This replaces S6-f and
+S6-g, and changes S6-e's table listing.
+
+- **S10-a Connection test.** For an Oracle change-capture dial, `/test`
+  asks Kafka Connect to validate the rendered config, with the same
+  renderer, Java driver and S6-c keys the connector uses:
+  `PUT /connector-plugins/<class>/config/validate`. Kafka Connect stays the
+  API's only path to Kafka Connect (ADR 0016):
+  - Add a `validate_config` method in `kafka_connect.rs`, with the same
+    class allowlist check as `put_config`.
+  - Run the host check (`resolve_checked`) exactly as the create path does
+    before anything dials.
+  - Write the secret file the way the create path does, and reference it as
+    `${dir:…}`. If Kafka Connect's validate does not resolve config
+    providers, stop and report; never put the password in the request.
+  - Classify the answer into the existing fixed `Outcome` sentences, never
+    passing on the text: wrong login (`ORA-01017`), unreachable or no such
+    service (`ORA-12541`, `ORA-12514`, connect timeout), the server refusing
+    encryption (`ORA-12660`, a new fixed sentence), anything else "the
+    connection test failed". Log the classified kind with `tracing`, never
+    the text.
+  - Kafka Connect not configured gives the honest "change capture is off
+    in this deployment" answer the other drivers give.
+  - The orchestrator routing for an Oracle `cdc` dial in `connector_probe.rs`
+    (T6.1, local commit `8f68a5cf`) is reverted.
+- **S10-b Setup checks for Oracle (decision 9 amended for Oracle, signed
+  2026-10-30).**
+  - **In the connection test:** Oracle's three settings are listed as
+    `unchecked`, with the fixed message "Checked when change capture
+    starts: see the Change capture tab." The settings are `ARCHIVELOG`,
+    supplemental logging, and the LogMiner grants.
+  - **When the connector or a task is FAILED:** the API turns the task trace
+    into a closed set of `SetupCheck`s, by matching Debezium 3.7.0's own
+    messages in Rust:
+    - `ARCHIVELOG` off;
+    - minimal supplemental logging off for the database;
+    - all-column logging missing for a named table, where the table name
+      must be one of the connector's selected tables or it is not used;
+    - a missing LogMiner privilege.
+  - The checks show on the Change capture tab, with the S6-g commands
+    (identifiers quoted, `"` doubled).
+  - Cite each matched message with its file and line in the Debezium 3.7.0
+    source.
+  - A trace that matches nothing keeps today's fixed failure sentence. No
+    trace text is shown (principle 4).
+  - No orchestrator facts are involved, so **T6.5 no longer waits for slice
+    5**. It reuses `SetupCheck` and `cdc_setup_check.rs` from slice 4.
+- **S10-c Tables.** Listing tables in the orchestrator would dial
+  unencrypted too, so an Oracle change-capture connector's tables are
+  entered by hand as `SCHEMA.TABLE`:
+  - Each name is checked as two Oracle identifiers, in Oracle's spelling.
+  - The wizard says plainly that the names are not checked against the
+    source until capture starts.
+  - A name that does not exist captures nothing and its lag reads "not
+    known yet". The feature page's "Limits" says so.
+  - Use the wizard's existing manual entry if there is one; otherwise add one
+    for this type only.
+- **S10-d Gate (`g4-oracle`, replaces the S6-h setup-check lines).**
+  - The test step passes; a wrong password gives the classified sentence.
+  - The encryption banner, as S6-c.
+  - A second connector that selects the table without all-column logging:
+    its failed state lists exactly that table's missing logging, with the
+    command. If Debezium 3.7.0 does not fail for it, or its message carries
+    no table name, stop and report.
+  - `ARCHIVELOG` and the grants are covered by unit tests on the message
+    patterns, since the gate's source has them set.
+- **T6.2** shrinks to the orchestrator's Bronze naming and `topic_of`'s doc
+  (S6-e). **T6.5** is S10-b. The other tasks and the stop-and-report list
+  stand, plus: validate does not resolve config providers (S10-a), and the
+  Debezium failure message names no table (S10-d).
+
 ## Handoff
 
 ### Slice 1, Oracle batch (developer, Sonnet, 2026-10-29)
