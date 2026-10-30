@@ -745,13 +745,16 @@ async fn a_pipeline_with_no_tenant_is_refused() {
 
 /// `SEC-50` R1 (review round 1, BLOCKER 1): an author holding the
 /// unrestricted (`*:*`) grant reaches everything, so a pipeline of such an
-/// author is not refused for a tenant it never had — neither for a
-/// pipeline with no tenant of its own, nor for one in a tenant the author
-/// is not a member of.
+/// author is not refused for a tenant it never had — here, a pipeline with
+/// no tenant of its own, the state an operator meets on a pipeline created
+/// before `0042_tenant_provisioning.sql` backfilled nothing.
 ///
-/// This is the shape the G7 harness creates: the bootstrap admin holds
-/// `*:*`, belongs to no tenant, and creates its Bronze pipelines with no
-/// `X-Tenant` header, so the pipeline is stored with no tenant.
+/// Only that shape is checked here. A pipeline in a tenant the author is
+/// not a member of is the same rule (`routes::query` checks the
+/// unrestricted grant before it looks at the tenant at all), but this test
+/// does not state it, and no CI harness produces it either: the G7 gate
+/// joins its account to `meridian-group` before `POST /api/pipelines`, so
+/// its pipeline is stored WITH that tenant (PR #281 review round 2 NIT).
 #[tokio::test]
 async fn a_pipeline_authored_by_an_unrestricted_principal_is_not_refused_for_its_tenant() {
     let (router, pool, cookie, _engine) = app_with_engine().await;
