@@ -300,19 +300,24 @@ impl KafkaConnectClient {
     /// that is not a validation; otherwise the class of the failure.
     pub async fn validate_config(
         &self,
+        name: &str,
         config: &BTreeMap<String, String>,
     ) -> Result<ConfigValidation, ConnectError> {
         let class = config.get("connector.class").map(String::as_str);
         let Some(class) = class.filter(|c| ALLOWED_CONNECTOR_CLASSES.contains(c)) else {
             return Err(ConnectError::ClassNotAllowed);
         };
+        // The validation endpoint wants the connector's `name` inside the body (a create takes it from
+        // the URL); without it the answer is "Missing required configuration \"name\"" (seen in CI).
+        let mut body = config.clone();
+        body.insert("name".to_owned(), name.to_owned());
         let request = self
             .http
             .put(format!(
                 "{}/connector-plugins/{class}/config/validate",
                 self.base
             ))
-            .json(config);
+            .json(&body);
         let body = self.send(request).await?;
         let answer: Value = serde_json::from_slice(&body).map_err(|_| ConnectError::Unavailable)?;
         ConfigValidation::from_answer(&answer).ok_or(ConnectError::Unavailable)
@@ -554,7 +559,7 @@ mod tests {
             .await;
         let client = KafkaConnectClient::new(&server.uri()).unwrap();
         let validation = client
-            .validate_config(&config(ORACLE_CONNECTOR_CLASS))
+            .validate_config("lakehouse-a", &config(ORACLE_CONNECTOR_CLASS))
             .await
             .unwrap();
         assert!(!validation.is_valid());
@@ -570,7 +575,7 @@ mod tests {
         let client = KafkaConnectClient::new(&server.uri()).unwrap();
         assert!(matches!(
             client
-                .validate_config(&config("org.example.EvilConnector"))
+                .validate_config("lakehouse-a", &config("org.example.EvilConnector"))
                 .await,
             Err(ConnectError::ClassNotAllowed)
         ));
@@ -581,7 +586,7 @@ mod tests {
             .await;
         assert!(matches!(
             client
-                .validate_config(&config(ORACLE_CONNECTOR_CLASS))
+                .validate_config("lakehouse-a", &config(ORACLE_CONNECTOR_CLASS))
                 .await,
             Err(ConnectError::Unavailable)
         ));

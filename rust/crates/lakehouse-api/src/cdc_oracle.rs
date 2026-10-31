@@ -29,7 +29,7 @@
 
 use std::time::Instant;
 
-use lakehouse_store::cdc::render_connect_config;
+use lakehouse_store::cdc::{connect_connector_name, render_connect_config};
 use lakehouse_store::connectors::ConnectorDialInfo;
 use lakehouse_store::ingest_spec::{Dial, SqlDriver};
 
@@ -191,7 +191,10 @@ pub async fn test(
         ));
     }
     let started = Instant::now();
-    let validated = client.validate_config(&config).await;
+    let validated = match connect_connector_name(id) {
+        Ok(name) => client.validate_config(&name, &config).await,
+        Err(_) => Err(ConnectError::Rejected),
+    };
     let elapsed_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
     Some(match validated {
         Ok(validation) if validation.is_valid() => outcome(
