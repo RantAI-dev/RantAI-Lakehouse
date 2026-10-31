@@ -247,9 +247,10 @@ What `Oracle CDC` needs and what it does not do. Proven by the `g4-oracle` gate 
   (`SRC-4` Amendment 10). Debezium 3.7.0 answers "Unable to connect (primary): Failed
   to resolve Oracle database version" for a refused login, an unreachable server or service and a refused
   encryption alike (the Oracle code is only in the cause, which the answer does not carry), so the test says
-  one fixed sentence for all of them: the connection or the login was refused, check the address, the service
-  name, the login and the encryption setting. A validation timeout has its own sentence.
-- **Setup checks are read over an unencrypted connection (owner-signed exception to `SEC-14`, 2026-10-31).**
+  one fixed sentence for all of them: the connection or the login was refused, check the host, the port, the
+  service name or PDB name, the login and its password, and that the server allows Oracle native network
+  encryption (or set the TLS mode to Disable). A validation timeout has its own sentence.
+- **Setup checks are read over unencrypted connections (owner-signed exception to `SEC-14`, 2026-10-31).**
   `SEC-14` says a stored credential is not dialled in plain text unless the person chose "Disable". After the
   Kafka Connect test passes, the orchestrator reads Oracle's settings with thin mode, **not encrypted**:
   `ARCHIVELOG`, minimal and all-column supplemental logging, whether each selected table exists and has
@@ -279,8 +280,11 @@ What `Oracle CDC` needs and what it does not do. Proven by the `g4-oracle` gate 
 - **Debezium leaves a table behind.** Its `LOG_MINING_FLUSH` table stays in the login's schema after the
   connector is deleted; drop it by hand if you do not want it.
 - **`source.ts_ms` is the change time of the redo row**, not the commit time, so the lag stays an upper bound.
-- **A new column** is captured when Debezium's default `online_catalog` mining sees it; the gate's last step
-  shows it (see the result below).
+- **Oracle NUMBER columns, keys included, arrive in Bronze as text, so that no digits are lost; cast them in Silver.**
+- **A new column** is mined with Debezium's `hybrid` strategy (`log.mining.strategy=hybrid`, `SRC-4` Amendment 12);
+  the default `online_catalog` fails the connector's task at the first change that mentions the new column
+  (observed in `g4-oracle`, run 41235139798). What `hybrid` does and does not cover is written below from the gate's
+  result.
 
 ## Acceptance checklist
 

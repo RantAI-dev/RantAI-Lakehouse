@@ -1909,6 +1909,12 @@ so I did not decide it. Until `main` is merged in, no CI runs on #264 at all.
   `toInt64(id)`). Stated in the feature page as the limit it is? **Not yet**: planner, please add "Oracle NUMBER columns, keys
   included, are text in Bronze" to the Limits.
 
+**Not verified / flaky (S12-f).** `dagster/dispar_orchestrate/test_discover.py::test_an_unclassified_failure_is_logged_at_warning_with_its_type_name_and_never_its_text`
+failed in 2 of about 10 local runs of the file (a `caplog` test: it reads the WARNING record of `discover.logger`, and it failed on the run right after I edited
+`discover.py`, with `Odd` in the warning line, and once again in the run that followed my PDB-session change), and passed in every other run, with the same
+code and no change to it. It failed in no CI run I read (`Dagster · unit tests` is green in run `41235139798`) and the last three `CI` runs on `main`
+(`41234484650`, `41230399578`, `41227352293`) are green; whether it can fail on `main` was *not* tried locally. Not changed in this PR. Cause not found.
+
 **Commands run locally (rule 7).**
 
 - `cargo fmt --check` (rust/): clean on the final tree.
