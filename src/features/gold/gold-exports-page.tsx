@@ -14,10 +14,17 @@ import {
 } from "@/components/ui/table"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { formatCompactNumber, formatDateTime } from "@/lib/format"
+import { consumerState, consumerTooltip } from "@/lib/gold-consumers"
 import { publicationLabel } from "@/lib/gold-freshness"
 import { fmtMeasured } from "@/lib/measured"
 import { goldService } from "@/services"
-import type { GoldExportRun, GoldMart, GoldPublication, GoldReadBack } from "@/services/contracts/gold"
+import type {
+  GoldConsumers,
+  GoldExportRun,
+  GoldMart,
+  GoldPublication,
+  GoldReadBack,
+} from "@/services/contracts/gold"
 
 function MartPublication({ mart }: { mart: { name: string } }) {
   const state = useService<GoldPublication>(
@@ -31,6 +38,41 @@ function MartPublication({ mart }: { mart: { name: string } }) {
       {publicationLabel(state.data)}
     </span>
   )
+}
+
+/**
+ * The "Consumers (7d)" cell: how many outside tools read the published
+ * mart in the last 7 days, with one tooltip line per tool — its name,
+ * its reads and its last read (DATA-5 D10).
+ *
+ * Three states, never a fourth: the number of tools that read it,
+ * "No reads in 7 days" for a measured zero, and "Not measured" with
+ * the route's reason when outside reading is not set up. The last one
+ * must never read as a zero.
+ */
+function ConsumersCell({ data }: { data: GoldConsumers }) {
+  const state = consumerState(data)
+  if (state.kind === "not_measured") {
+    return (
+      <span className="text-muted-foreground" title={state.reason}>
+        Not measured
+      </span>
+    )
+  }
+  if (state.kind === "unknown") {
+    return (
+      <span
+        className="text-muted-foreground"
+        title="Outside reading is set up, but the route sent no reader list."
+      >
+        —
+      </span>
+    )
+  }
+  if (state.kind === "no_reads") {
+    return <span className="text-muted-foreground">No reads in 7 days</span>
+  }
+  return <span title={consumerTooltip(state.readers)}>{state.readers.length}</span>
 }
 
 /**
@@ -53,7 +95,7 @@ function MartRow({ mart }: { mart: GoldMart }) {
     (signal) => goldService.listExportRuns(mart.name, signal),
     [mart.name]
   )
-  const consumers = useService(
+  const consumers = useService<GoldConsumers>(
     (signal) => goldService.getConsumers(mart.name, signal),
     [mart.name]
   )
@@ -94,15 +136,8 @@ function MartRow({ mart }: { mart: GoldMart }) {
           <span className="text-muted-foreground">…</span>
         ) : consumers.status === "error" ? (
           <span className="text-destructive">—</span>
-        ) : consumers.data.supported ? (
-          String(consumers.data.consumers?.length ?? 0)
         ) : (
-          <span
-            className="text-muted-foreground"
-            title={consumers.data.reason ?? "Not measured"}
-          >
-            Not measured
-          </span>
+          <ConsumersCell data={consumers.data} />
         )}
       </TableCell>
       <TableCell>
@@ -138,7 +173,8 @@ function MartRow({ mart }: { mart: GoldMart }) {
  * Gold Exports console page (WS6 item 10) — every `serving.*` mart
  * (`GET /api/dashboard/fields`), each with its last export (read back
  * from Iceberg, independent of what the export claimed), export history
- * count, best-effort consumer count, and a manual "Export now" action.
+ * count, the count of outside tools that read it (DATA-5), and a manual
+ * "Export now" action.
  */
 export function GoldExportsPage() {
   const marts = useService<GoldMart[]>((signal) => goldService.listMarts(signal), [])
