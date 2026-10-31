@@ -20,7 +20,7 @@ import pytest
 from dispar_orchestrate.adapters import sink as sink_module
 from dispar_orchestrate.adapters.sink import SinkResult, _stamp_ingested_at
 from dispar_orchestrate.file_ingest import BAD_VALUES, COLUMNS_NOT_PREVIEWED, LOAD_FAILED, LoadFailure
-from dispar_orchestrate.test_file_ingest import KEY, _Harness, _fails_with, _params
+from dispar_orchestrate.test_file_ingest import KEY, TENANT, _Harness, _fails_with, _params
 from dispar_orchestrate.upload_types import ColumnSpec
 
 
@@ -35,6 +35,14 @@ COLUMNS = (
     spec("note", "text", source="Note"),
     spec("price", "decimal", source="Price"),
 )
+
+# A workbook's load reads the converted sheet the API wrote, beside the
+# original (`DATA-31`): the report belongs beside the original, where the API
+# reads it.
+ORIGINAL_KEY = f"uploads/{TENANT}/u-1.xlsx"
+CONVERTED_KEY = f"{ORIGINAL_KEY}.converted.0.csv"
+# The converted text of an upload made before `SEC-22`, without a position.
+LEGACY_CONVERTED_KEY = f"{ORIGINAL_KEY}.converted.csv"
 
 
 def test_a_typed_load_hands_the_sink_cast_batches_under_the_chosen_names_and_the_types_it_was_told():
@@ -83,6 +91,37 @@ def test_a_clean_typed_load_removes_an_earlier_report_and_an_untyped_load_touche
     untyped.run(_params())
     assert untyped.reports == []
     assert untyped.loads[0]["column_types"] == {"qty": "string", "due": "string", "note": "string", "price": "string"}
+
+
+def test_a_typed_load_of_a_converted_sheet_keeps_its_report_beside_the_original():
+    # `DATA-31`: the job reads the converted sheet the API wrote, but the API
+    # reads the report beside the ORIGINAL.
+    harness = _Harness(raw=CSV)
+    harness.run(_params(storage_keys=(CONVERTED_KEY,), columns=COLUMNS, on_bad_value="null"))
+    [(key, payload)] = harness.reports
+    assert key == ORIGINAL_KEY, "the report belongs beside the original, where the API reads it"
+    assert json.loads(payload)["count"] == 3
+
+
+def test_a_typed_load_of_a_legacy_converted_sheet_keeps_its_report_beside_the_original():
+    # The converted text of an upload made before `SEC-22` has no position.
+    harness = _Harness(raw=CSV)
+    harness.run(_params(storage_keys=(LEGACY_CONVERTED_KEY,), columns=COLUMNS, on_bad_value="null"))
+    [(key, payload)] = harness.reports
+    assert key == ORIGINAL_KEY
+    assert json.loads(payload)["count"] == 3
+
+
+def test_a_clean_typed_load_of_a_converted_sheet_removes_the_report_beside_the_original():
+    clean = _Harness(raw=b"Qty\n1\n2\n")
+    clean.run(
+        _params(
+            storage_keys=(CONVERTED_KEY,),
+            columns=(spec("qty", "integer", source="Qty"),),
+            on_bad_value="stop",
+        )
+    )
+    assert clean.reports == [(ORIGINAL_KEY, None)], "None removes the stale object"
 
 
 def test_the_report_that_cannot_be_written_never_changes_how_the_load_ended():

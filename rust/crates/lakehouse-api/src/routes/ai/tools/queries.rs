@@ -109,6 +109,12 @@ pub(super) async fn list_saved_queries(state: &AppState, principal: Option<&Prin
     }
 }
 
+/// Runs the saved query the caller named, through the same route the
+/// console uses.
+///
+/// `DATA-29`: the answer is the route's own, so a `NULL` cell reaches the
+/// model as `null` and an empty cell as `""` — this tool hands the answer
+/// on as it came and does not flatten the two.
 pub(super) async fn run_saved_query(
     state: &AppState,
     principal: Option<&Principal>,
