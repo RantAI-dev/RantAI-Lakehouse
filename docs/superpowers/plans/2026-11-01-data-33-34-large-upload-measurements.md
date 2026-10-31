@@ -90,3 +90,20 @@ three tasks, so it wrote no handoff. The commits are:
   fastavro): **29 passed**.
 
 **Open: no BLOCKER, no SHOULD-FIX.** Next is D4: the planner runs the measurements on this branch.
+
+### Results and the D5 decision (planner, 2026-10-31)
+
+- **The runs:**
+  - 41239217843, 41239223375 and 41239229020: CSV 2 GiB × 2, × 4 and × 16;
+  - 41243053447: Avro, zip and one-group Parquet at 2,000 MiB;
+  - 41239234540: the first try at the formats. Its Avro file came out at 2,049 MiB and the API
+    refused it, as it should.
+- **The numbers** are in `docs/plans/DATA-17-RESULT.md`. In short:
+  - 2 at once cost +6.3 GiB, and 4 at once +8.7 GiB;
+  - the per-user limit refused 12 of 16;
+  - the one-group Parquet cost +4.9 GiB;
+  - nothing was OOM-killed.
+- **D5:**
+  - a line in the upload limits now (`upload-file.md`);
+  - follow-up `DATA-37`, an installation-wide limit on large loads (proposed 4 over 512 MiB),
+    whose number the product owner confirms.

@@ -103,32 +103,64 @@ within these measurements: a 2 GiB load needs about 2.3 GiB more for the job
 than an idle one. Not measured, and so not claimed: two such loads at the same
 time.
 
-## Not yet measured, to run
+## Several loads at once, and the files not yet covered (`DATA-33`, `DATA-34`, 2026-10-31)
 
-`DATA-33` (what several loads at once cost) and `DATA-34` (the formats and the
-files that the runs above did not cover) are measured with the same harness
-(`ops/g9/large_upload.py`), the same workflow (`g9-upload-large`) and the same
-16 GB GitHub-hosted runner, so that their figures are comparable with the ones
-above. Two runs are planned (decision D4 of
-`docs/superpowers/plans/2026-11-01-data-33-34-large-upload-measurements.md`):
+The same harness (`ops/g9/large_upload.py`, with `--concurrent` and the new writers from branch
+`measure/data-33-34-large-uploads`), the same workflow (`g9-upload-large`) and the same 16 GB
+GitHub-hosted runner. The caps are as on `main`: none was raised. The planner ran the
+measurements; the plan is `docs/superpowers/plans/2026-11-01-data-33-34-large-upload-measurements.md`.
 
-1. **A CSV of 2048 MiB, N loads at once.** The file goes through the chunked
-   transport N times and every load starts together, each into its own table:
-   `csv_mb=2048` with `jsonl_mb=0`, `parquet_mb=0` and `gzip_mb=0`, and
-   `concurrent` at 2, 4 and 16 (three runs). Read from each run: the growth of
-   the job's memory over the phase, every load's time and every load's result.
-2. **The formats and the file that the runs above did not cover.** One run with
-   `avro_mb=2048`, `zip_mb=2048` and `parquet_one_group_mb=2048` (the other
-   formats at 0). Read from it: the same figures for the Avro container, for
-   the zip of CSVs (the unpacked size is what the cap counts) and for the
-   Parquet file of one row group (the reader decodes a row group whole, so the
-   row group is what the job holds in memory).
+### `DATA-33`: N loads of a 2 GiB CSV at once
 
-The caps stay as they are on `main` (the session cap and the unpacked cap are
-both 2 GiB). A run that needs a cap raised runs on a throwaway branch only,
-never merged, as the run of 2026-10-23 did: the limit of loads per user of
-`SEC-17` is four by default, so a run of 16 loads at once is above it, and the
-harness records a load the API refuses as a result of that load.
+Each run sends the same 2,048 MiB CSV N times, then starts every load together, each into its own
+table. The "growth" column is the Dagster code location's memory during the phase: the max
+sampled once a second, minus the base just before.
 
-**The numbers of these runs are not in this document yet.** The planner writes
-them here when the runs are done.
+| Loads at once | Run | Loads that held every row | Job growth | Each load took | Phase took | OOM-killed |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 (for comparison, above) | 39916318666 | 1/1 | +1,982 MiB | 106.8 s | 106.8 s | none |
+| 2 | 41239217843 | 2/2 | **+6,423 MiB** | 116.4–116.6 s | 136.4 s | none |
+| 4 | 41239223375 | 4/4 | **+8,921 MiB** | 215.6–221.5 s | 262.9 s | none |
+| 16 | 41239229020 | 4/16 | +7,861 MiB | about 201 s | 386.6 s | none |
+
+- **16 at once was refused by design.** 12 of the 16 loads were refused at once with `429 Too
+  many uploads are in progress. Try again in a moment.`, because one user may run 4 loads at
+  once (`UPLOAD_MAX_CONCURRENT_PER_USER`, default 4, `SEC-17`). The 4 that ran held every row.
+  So the run measured the per-user limit working, not 16 loads.
+- **What the measurement shows:**
+  - Each load runs in its own Dagster subprocess. Two loads cost +6.3 GiB and four cost
+    +8.7 GiB: about **2.2 GiB per 2 GiB load** once several run together.
+  - The API stayed flat: growth +112 to +156 MiB.
+- **Not measured: 16 loads at once from four users.** The installation cap
+  (`UPLOAD_MAX_CONCURRENT`, default 16) allows it, and nothing in Dagster queues runs
+  (`dagster/dagster.yaml` sets no run coordinator). By the measured slope, 16 large loads would
+  need roughly 35 GiB, which is more than a 16 GB host has. That is an **estimate**, not a
+  measurement. It is why the decision below caps large loads.
+
+### `DATA-34`: the files the first runs did not cover
+
+Run 41243053447. A first try (41239234540) generated an Avro file of 2,049 MiB, which the API
+correctly refused as over the 2 GB limit, so the run was repeated at 2,000 MiB.
+
+| File | Size | Rows | Job growth | Load took | OOM-killed |
+| --- | --- | --- | --- | --- | --- |
+| Avro | 2,001 MiB | 1,887,621 | +3,102 MiB | 55.3 s | none |
+| Zip of CSVs | 17 MiB sent; 2,000 MiB unpacked | 1,906,501 | +1,135 MiB | 55.5 s | none |
+| Parquet, one row group | 1,997 MiB | 1,852,174 | +5,032 MiB | 50.3 s | none |
+
+- **A Parquet file of one 2 GiB row group loads.** The reader decodes the group whole, and it costs
+  +4.9 GiB, against +2.2 GiB for ten ordinary files of the same size. It fits on a 16 GB host,
+  but two such files at once would not leave much room.
+- **The zip's CSVs repeat their cells, so it compresses to 17 MiB.** The unpacked size is what
+  the cap counts and what the job reads. A zip of real data would be larger on the wire, with the
+  same load.
+
+### Decision (planner, `DATA-33` D5)
+
+- **The limits say it now.** The upload limits name the measured cost (about 2.2 GiB of job
+  memory per 2 GiB load, +4.9 GiB for a one-group Parquet), and say that the installation
+  allows 16 loads at once, which can run out of memory on a 16 GB host with large files.
+- **Follow-up `DATA-37`:** a separate installation-wide limit on **large** loads at once.
+  - Proposed: 4 loads of over 512 MiB at once, the level measured as safe on 16 GB.
+  - It is configurable, and the next large load is refused with a message, as the other caps do.
+  - The product owner confirms the number.
