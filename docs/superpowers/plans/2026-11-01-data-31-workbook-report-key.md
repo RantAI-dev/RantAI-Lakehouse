@@ -99,3 +99,17 @@ the gap (`DATA-31`) in "Limits to tell a customer" and in the "Bad values" row o
 targets; the `BACKLOG.md` row for `DATA-31` is still `Todo`.
 
 ## Review (planner appends below)
+
+### Review round 1 (planner, 2026-11-01, at `cee78e6a`)
+
+- **D1.** `_report_key` strips `.converted.<n>.csv`, and the legacy `.converted.csv`, so the
+  report sits beside the original, where the API reads it. The run config is unchanged.
+- **D2.** Delete removes `<storage_key>.bad-values.json`. The key helper now lives in one place,
+  and the reader uses it (rule 4).
+- **Tests:** three Dagster cases (converted, legacy and clean), a typed **workbook** load carrying
+  the report, and delete removing it.
+- **The developer's counts:** Dagster 228 pass and 1 skip; the `upload_routes` typed and delete
+  tests 2 and 6 pass; fmt and clippy are clean.
+- **The planner** removed the gap from `docs/core/features/upload-column-types.md` in this commit.
+
+**Open: no BLOCKER, no SHOULD-FIX.**
