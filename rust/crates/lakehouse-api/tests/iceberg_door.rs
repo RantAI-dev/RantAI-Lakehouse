@@ -330,6 +330,51 @@ async fn the_iceberg_door_refuses_a_namespace_other_than_gold() {
     );
 }
 
+/// The query the tool sent reaches the catalog as the tool sent it: a
+/// percent-encoded paging token is encoded ONCE (DATA-5 S1 review
+/// SHOULD-FIX 1).
+///
+/// The door used to split the raw query without decoding it and let
+/// `RequestBuilder::query` encode it again, so `pageToken=a%3D`
+/// arrived as `pageToken=a%253D` and paging through a long table list
+/// broke.
+#[tokio::test]
+async fn the_iceberg_door_forwards_the_query_encoded_once() {
+    let server = catalog().await;
+    // The tables list, which is where the paging token rides.
+    Mock::given(method("GET"))
+        .and(path(format!("/v1/{PREFIX}/namespaces/gold/tables")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "identifiers": [],
+        })))
+        .mount(&server)
+        .await;
+    let token_file = outside_token_file();
+    let TestApp { router, pool } = door_over(&server, &token_file).await;
+    let (_tool_id, tool_token) = outside_tool(&pool).await;
+
+    let (status, body) = send(
+        &router,
+        get(
+            &format!("/api/iceberg/v1/{PREFIX}/namespaces/gold/tables?pageToken=a%3D"),
+            &tool_token,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    let requests = server.received_requests().await.expect("read the requests");
+    let forwarded = requests
+        .iter()
+        .find(|request| request.url.path().ends_with("/tables"))
+        .expect("the tables list reached the catalog");
+    assert_eq!(
+        forwarded.url.query(),
+        Some("pageToken=a%3D"),
+        "the paging token is encoded once, not twice"
+    );
+}
+
 /// A table name that walks out of the `gold` namespace is refused
 /// before anything is forwarded (DATA-5 S1 review BLOCKER 1).
 ///

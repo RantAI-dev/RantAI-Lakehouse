@@ -396,12 +396,15 @@ struct CatalogAnswer {
 fn query_for(state: &AppState, raw: Option<&str>, with_warehouse: bool) -> Vec<(String, String)> {
     let mut pairs: Vec<(String, String)> = raw
         .map(|raw| {
-            raw.split('&')
-                .filter(|part| !part.is_empty())
-                .map(|part| match part.split_once('=') {
-                    Some((key, value)) => (key.to_owned(), value.to_owned()),
-                    None => (part.to_owned(), String::new()),
-                })
+            // DATA-5 S1 review SHOULD-FIX 1: the pairs are DECODED here
+            // and encoded once, by `RequestBuilder::query`. Splitting the
+            // raw query without decoding it left the encoding to happen
+            // twice, so a `pageToken=a%3D` reached the catalog as
+            // `pageToken=a%253D` and paging through a long table list
+            // broke. Decoding also means the `warehouse` this door
+            // replaces below is recognised however the tool spelled it.
+            url::form_urlencoded::parse(raw.as_bytes())
+                .map(|(key, value)| (key.into_owned(), value.into_owned()))
                 .collect()
         })
         .unwrap_or_default();
