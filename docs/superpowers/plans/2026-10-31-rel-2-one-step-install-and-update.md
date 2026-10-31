@@ -234,4 +234,160 @@ unattended updates, reversible migrations, and arm64 (D12).
 
 ## 6. Handoff (developers append below, one entry per slice)
 
+### Handoff S1 (developer, 2026-10-31)
+
+**Commits** (branch `feat/rel-2-s1-prerequisites`, base `main` at `677845db`), one per task, in
+plan order:
+
+| Commit | Task | What |
+| --- | --- | --- |
+| `999d79cc` | S1-T1 | `feat(api)`: a readiness route and the build's version (D7) |
+| `f324ced0` | S1-T2 | `feat(compose)`: the console runs in the stack |
+| `0ff64e87` | S1-T3 | `feat(compose)`: every third-party image is pinned by digest |
+| `5442428c` | S1-T4 | `feat(backup)`: a complete backup on the local disk (D8) |
+| `64506418` | S1-T5 | `feat(console)`: the console shows its version |
+
+**Commands, with their results.** Every cargo command went through `bin/cargo-locked`, in the
+foreground, on the shared `CARGO_TARGET_DIR`; no `cargo clean`.
+
+S1-T1:
+
+- `cargo fmt --check` — clean.
+- `cargo clippy -p lakehouse-api -p lakehouse-store --all-targets -- -D warnings` — clean.
+  (`lakehouse-store` is in the command because the schema-version helpers live there: it owns
+  the migration set, so it answers both "what does this build expect" and "what does the
+  database have".)
+- `cargo test -p lakehouse-api health` — 32 passed (lib target), 1 passed (bin target), 0 failed.
+- `cargo test -p lakehouse-api policy` — 69 passed (lib), 69 passed (bin), 0 failed.
+- `cargo test -p lakehouse-api --test sec11_guard` — 4 passed, 0 failed (the new route carries
+  no upstream text, and the guard says so).
+
+S1-T2:
+
+- `docker compose --profile '*' config --quiet` — clean.
+- `docker compose -p rel2 up -d --build` from a clean project — the stack came up;
+  `rel2-lakehouse-api-1 Healthy`, `rel2-console-1 Started`.
+- `curl -s -o /dev/null -w '%{http_code}' http://localhost:3000/` → `200`.
+- `curl -X POST http://localhost:3000/api/auth/login` (the bootstrap admin) → `200` with
+  `{"id":"…","name":"Bootstrap Admin","mustChangePassword":true}` — the console signs in
+  through its own port.
+- `docker inspect rel2-console-1 --format '{{.State.Health.Status}}'` → `healthy`.
+
+S1-T3:
+
+- `python3 ops/lint/check_image_digests.py` — "46 third-party image(s) pinned by digest, 8
+  locally built image(s) exempt", exit 0.
+- `python3 -m unittest discover -s ops/lint -p 'test_*.py'` — 33 tests, OK.
+- `docker compose --profile '*' config --quiet` — clean.
+- `docker compose -p rel2 down -v` then `docker compose -p rel2 up -d --build` — the stack came
+  up healthy, `GET /health/ready` answered `200` with all three checks `"ok"`, and the console
+  signed in on `:3000`.
+
+S1-T4 (the drill, on a clean `-p rel2` project):
+
+- Seeded a connector with a stored credential (`POST /api/connectors`, `credential.source:
+  "managed"`), and saw the sealed file in the volume:
+  `connector_managed_conn_backup_drill_connector_mvwmoq7x_password`.
+- `COMPOSE_PROJECT=rel2 ops/backups/backup-local.sh /tmp/opencode/rel2-backups` → 19 parts,
+  439,710 bytes, `manifest.json` with every part's size and SHA-256; the tar holds the sealed
+  credential.
+- `docker compose -p rel2 down -v` — every volume gone.
+- `COMPOSE_PROJECT=rel2 scripts/restore-from-backup.sh --local <backup-dir>` → 32 s in total
+  (Postgres 8 s, ClickHouse 7 s, the connector secrets 1 s, the configuration 0 s, the stack
+  16 s). The manifest's checksums were checked before anything was written.
+- The credential still decrypts: `docker compose -p rel2 exec -T lakehouse-api
+  lakehouse-api rotate-secrets-key` → "0 resealed, 0 sealed from plain, 1 already under the
+  current key, 0 failed" — the API's own key rotation opened the restored sealed file with the
+  restored key. The connector's row is back too (`SELECT id, name, tenant, secret_ref FROM
+  connector` → `conn-backup-drill-connector-mvwmoq7x`).
+- `bash -n` on `ops/backups/backup-local.sh` and `scripts/restore-from-backup.sh` — clean.
+
+S1-T5:
+
+- `bun install --frozen-lockfile` — 739 packages.
+- `bun run typecheck` — clean.
+- `bun run lint` — 0 errors, 10 warnings, all pre-existing (none in a touched file).
+- `bun test src/features/version src/components/app-shell/app-navbar.test.tsx` — 6 pass, 0 fail.
+- `bun test src/components` — 40 pass, 0 fail (the app shell, which the account menu lives in).
+- Live on the `-p rel2` stack: `GET http://localhost:3000/api/health` →
+  `{"status":"ok","database":"ok","version":"0.1.0"}`, and the console's own `/health` page
+  still answered `200` (the new rewrite does not shadow it).
+
+**The S1 verification block, on the final commit:**
+
+- `cargo fmt --check` — clean.
+- `cargo clippy -p lakehouse-api -p lakehouse-store --all-targets -- -D warnings` — clean.
+- `cargo test -p lakehouse-api health` — 33 passed (lib), 31 passed (bin), 1 passed, 0 failed.
+- `cargo test -p lakehouse-api policy` — 69 passed (lib), 69 passed (bin), 0 failed.
+- `bun run typecheck` — clean. `bun run lint` — 0 errors, 10 pre-existing warnings.
+- `docker compose --profile '*' config --quiet` — clean.
+- `python3 ops/lint/check_image_digests.py` — 46 pinned, 8 exempt.
+- `python3 ops/lint/check_intra_package_imports.py` — OK.
+- `python3 ops/lint/check_bare_iceberg_count.py` — no violation.
+- `python3 ops/lint/check_compose_init_readiness.py` — OK.
+- `python3 ops/lint/check_connector_gate_coverage.py` — OK (19 types covered, 0 waived).
+- The default profile's `up` from a clean project (`-p rel2`): every service healthy,
+  `GET /health/ready` → `200` with all three checks `"ok"`, the console answered `200` on
+  `:3000` and signed in.
+- `git status` — clean (nothing generated staged).
+
+**Not verified, with the reason:**
+
+- The full workspace run (`cargo clippy --workspace --all-targets --all-features` and
+  `cargo test --workspace`): not run here — this slice's machine rules say CI runs the
+  workspace and only the scoped commands are run locally. The two crates this slice touches
+  (`lakehouse-api`, `lakehouse-store`) were clipped and tested, with `--all-targets`.
+- `(cd dagster && python -m pytest dispar_orchestrate -q)`: not run — this slice changes no
+  Python in the code location (`dagster/dispar_orchestrate/` is untouched). The repo lints that
+  scan Python did run.
+- The images that only the optional profiles use (`mysql`, `mcr.microsoft.com/mssql/server`,
+  `mongo`, `apache/kafka`, `chrislusf/seaweedfs`, `trinodb/trino`, `rust`, `alpine/socat`,
+  `alpine`, `amazon/aws-cli`, `curlimages/curl`, `openfga`, `gotenberg`,
+  `quay.io/lakekeeper/catalog`, `rustfs`): their digests were read from the registry with
+  `docker buildx imagetools inspect`, and one of them (`alpine/socat:1.8.1.3`) was pulled to
+  prove the pinned reference resolves. The profiles that use the others were not started, so
+  those digests are not proven by a run here.
+- The account menu and the version banner: proved by their unit tests and by the live
+  `/api/health` answer. No browser was driven in this slice, so no screenshot shows the menu.
+
+**Where the plan left room, and what was decided** (for the reviewer):
+
+- The readiness probe's `lakekeeper` check asks for `{catalog}/v1/config?warehouse=…`:
+  `Lakekeeper` answers `400` ("No warehouse specified") without the warehouse parameter —
+  measured against the running v0.13.3. A probe without it would call a working catalog
+  unhealthy.
+- The three readiness checks are bounded by the same 3 s as the service probes
+  (`crate::health::PROBE_TIMEOUT`, now `pub(crate)` and shared).
+- The console's own version is read by importing `package.json` (the bundler inlines it at
+  build time), not by a build argument a deployment would have to keep in step.
+- The API's compose healthcheck asks `/health` (liveness), not `/health/ready`: the API serves
+  its Phase 1 routes with Postgres down, so "the process answers" is the honest question for
+  compose, and the console should come up and show what is broken. The readiness route is what
+  an installer or an updater waits on.
+- The local backup is a host-side script (`ops/backups/backup-local.sh`), not a new service in
+  the `backups` profile: it needs no new image and no new service in the default stack, and it
+  runs the same steps S4's `lakehousectl backup` will call. The compose `backups` profile keeps
+  its S3 job, unchanged.
+- The `ClickHouse` local backup disk is configured in `ops/backups/clickhouse/backups.xml`
+  (mounted into the `clickhouse` service) and its files live in a named volume the script
+  copies out of — and the restore copies back into.
+- The repository root now carries a tracked `.dockerignore`: the console image's build context
+  IS the repository root, and without that file the image carried the deployment's `.env`
+  (generated credentials) and the git history.
+- The console reaches the API's health route through a new `/api/health` rewrite (the API's
+  route is at `/health`, not under `/api/`). The console's own `/health` page is a filesystem
+  route and is served before any rewrite, so the two cannot collide — checked live.
+
+**Known gaps in this slice** (not fixed here; the reviewer decides):
+
+- The S3 restore path in `scripts/restore-from-backup.sh` still waits for Postgres and
+  ClickHouse without failing when they do not come up. The local path added for this slice fails
+  closed. The S3 path's behaviour is unchanged, on purpose ("the S3 target stays as an option").
+- The gate harnesses' own compose override files still carry unpinned images; the new lint reads
+  `docker-compose.yml` only, and says so.
+- The backup carries no `release.json` and no `state.json` yet — they do not exist until S2 and
+  S4. The script says so in its output rather than pretending.
+- `CONSOLE_INTERNAL_URL` (the console as the PDF renderer reaches it) is still empty by default,
+  so the PDF export stays off until it is set to `http://console:3000`.
+
 ## 7. Review (planner appends below)
