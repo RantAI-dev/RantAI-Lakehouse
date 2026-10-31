@@ -71,6 +71,13 @@ Branch `fix/data-23-catalog-namespace-links`, base `main` at `a33e3d81`, the pla
   312 files (94.1 s).
 - `git status` — clean; nothing generated staged.
 
+The plan's own block (`bun run typecheck && bun run lint && bun test src/features/catalog src/lib`,
+then `git status`) was **re-run on the branch head `fc203994`**, which adds only this plan file:
+typecheck clean, lint 0 errors / 10 warnings (the same ones), **1431 pass, 1 skip, 0 fail**,
+2405 `expect()` calls, 132 files (15.2 s), `git status` clean. The same tests and the same
+results as above; the `expect()` count differs by one between the two runs and no test file
+changed.
+
 **The new tests fail without the fix.** With the two source files stashed (`git stash push
 src/features/catalog/catalog-page.tsx src/features/catalog/catalog-namespace-columns.tsx`) and only
 the new test files in place, all 6 new tests fail (0 pass, 6 fail); with the fix they pass. The
