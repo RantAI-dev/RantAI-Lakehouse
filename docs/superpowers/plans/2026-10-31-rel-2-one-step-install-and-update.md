@@ -886,3 +886,41 @@ and the release policy (`docs/core/reference/release-policy.md`) is where the an
 - No cargo command and no Dagster command ran: this round changes no Rust, no code location and no
   Compose file.
 
+
+### Review S2 round 2 (planner, 2026-11-01, at `fe94c79a`)
+
+- **BLOCKER 1 is fixed** (`f1d72644`). The release job sets `COSIGN_PRIVATE_KEY` from the
+  secret. The dry run puts its throwaway key into the same variable and signs with
+  `env://COSIGN_PRIVATE_KEY`, so it now proves the real wiring.
+- **BLOCKER 2 is fixed** (`8a04449e`).
+  - Both secrets are in the `env:` of the three signing steps only.
+  - All eight third-party actions are pinned to commit SHAs, with a version comment.
+  - `test_release_workflow.py` enforces both rules.
+- **The developer's finding is accepted.** The pinned installer brings cosign v3, which
+  ignores `--output-signature`, so `sign-blob` fails. The plan decides the format:
+
+**D3a (planner, 2026-11-01): the manifest's signature is a Sigstore bundle.**
+- The file is `release.json.sigstore.json`, written by
+  `cosign sign-blob --key env://COSIGN_PRIVATE_KEY --bundle release.json.sigstore.json release.json`.
+  It replaces `release.json.sig` everywhere: the workflow, the bundle (D11), `SHA256SUMS`, the
+  release assets, `docs/CI.md` and this plan's D5 and D11.
+- **No transparency-log upload.** Neither run may upload to the public Rekor log:
+  - offline verification must not depend on it;
+  - a dry run must not publish throwaway entries.
+
+  Use cosign v3's supported way to sign with a key and no transparency log (`--tlog-upload=false`
+  if it exists in v3, otherwise a signing config without a tlog), and say in the workflow which
+  one it is. If v3 cannot sign a blob with no tlog upload, **stop and report**.
+- **Verification:**
+  - In CI, right after signing: `cosign verify-blob --key <public key> --bundle
+    release.json.sigstore.json --offline` (or the v3 equivalent that skips the tlog).
+  - **For S3:** `lakehousectl` reads the bundle's `messageSignature.signature` (base64 DER
+    ECDSA P-256 over SHA-256 of `release.json`) and checks it against the built-in key. It
+    ignores every tlog field, and it also checks that `messageSignature.messageDigest` equals the
+    SHA-256 of the `release.json` beside it.
+- **Test:** add a pytest that, given a bundle file produced by the dry-run steps (or a checked-in
+  fixture made with a throwaway key), extracts the signature and verifies it with Python's
+  `cryptography` against the matching public key. This proves the S3 verification recipe before
+  S3 exists.
+
+**Open: D3a to implement.**
