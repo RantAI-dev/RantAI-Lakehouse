@@ -72,4 +72,41 @@ T1 can be built on its own. T2 and T3 follow on the same branch.
 
 ## 3. Handoff (developers append below)
 
+### Handoff T1 (developer, 2026-11-01)
+
+Commit `3c643ceb` — "fix(data): keep the Owner and Tags filters at a narrow window (DATA-24 T1)" — on `fix/data-24-catalog-search-follow-ups`, on top of `d7745735` (the plan commit). One commit, console only.
+
+What it does:
+
+- The Data Explorer no longer drops the columns that do not fit the window from the table's column list. They are hidden through the table's visibility instead, so their filters keep working in the toolbar's filter menu at every width (decision D1). The thresholds are unchanged (`1760`, `1500`, `1280`, `1100`, `950`, `860`).
+- The hide covers **every** column the window is too narrow for — Tags, Owner, Size, Freshness, Type, Layer — not only the two the report named. D1 is "hide, do not remove", and the note under the table now says "The filters still work", which is only true if every hidden column keeps its filters. Narrowing it to Owner and Tags is a one-line change in `data-explorer-page.tsx` if the reviewer wants that; the mechanism is the same either way.
+- `useDataTable` takes `hiddenColumns` (`src/hooks/use-data-table.ts`). The page's hides ride on top of the stored layout instead of replacing it, and `keepStoredVisibility` leaves the user's stored choice for those columns alone when the layout is written — so a resize cannot overwrite it, and a wider window brings back what the user had.
+- The settings menu leaves a page-hidden column out of its "View" list: it is not the user's to toggle, it comes back with the width.
+- The "columns hidden" note now ends with "The filters still work."
+
+Checks run in the foreground on the final commit (`3c643ceb`):
+
+| Command | Result |
+| --- | --- |
+| `bun run typecheck` | clean, no output |
+| `bun run lint` | 0 errors, 10 warnings — the same 10 as on `d7745735` (checked by re-running the lint with the change taken out) |
+| `bun test src/features/catalog` | 341 pass, 0 fail, 1095 expect() calls, 16 files |
+| `bun run test` (the whole console suite) | 3063 pass, 1 skip, 0 fail, 8336 expect() calls, 313 files |
+
+New test file `src/features/catalog/data-explorer-page.test.tsx` (5 tests):
+
+- at 1280px the Owner and Tags columns are not on screen;
+- at 1280px the filter picker still offers the Owner and Tags filters;
+- at 1800px the Owner and Tags columns are on screen;
+- the note says the filters still work;
+- the window's hide is not written into the saved layout — hiding a column the user can see stores that choice and leaves `owner`/`tags` out of `app:table-layout:/data`.
+
+Checked that the tests bite: against the pre-change code (`d7745735`) 2 of the 5 fail — "offers the Owner and Tags filters at 1280px all the same" and "says the filters still work when it hides a column". The saved-layout test fails too when `keepStoredVisibility` is taken out (1 of 5), so the guard is pinned.
+
+Not verified, and why:
+
+- **Rust, Python and compose checks were not run.** T1 touches the console only; per AGENTS.md a commit runs the checks for the languages it touched. T2 (Rust, SQL) and T3 (workflow, bench) are untouched by this commit.
+- **The widths themselves are not verified.** The thresholds are the estimates already in the file (derived from the column caps, not measured); this change does not move them, and the plan does not ask for a measurement.
+- **One consequence to be aware of.** The sort/filter whitelist in `useDataTable` is built from the table's column ids, which now always include the columns the window hides. A hand-written `?sort=tags` (the UI never offers sorting by tags — the column has `enableSorting: false`, and the server refuses to sort by a list) is therefore forwarded to the server at every width and answered with a 400, where before a narrow window dropped it silently. At a wide window this was already the case, so the behaviour is now the same at every width instead of different. Not changed here: the whitelist is shared by every table and is out of T1's scope.
+
 ## 4. Review and results (planner appends below)
