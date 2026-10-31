@@ -249,7 +249,7 @@ What `Oracle CDC` needs and what it does not do. Proven by the `g4-oracle` gate 
   encryption alike (the Oracle code is only in the cause, which the answer does not carry), so the test says
   one fixed sentence for all of them: the connection or the login was refused, check the host, the port, the
   service name or PDB name, the login and its password, and that the server allows Oracle native network
-  encryption (or set the TLS mode to Disable). A validation timeout has its own sentence.
+  encryption (ask the database administrator if it does not). A validation timeout has its own sentence.
 - **Setup checks are read over unencrypted connections (owner-signed exception to `SEC-14`, 2026-10-31).**
   `SEC-14` says a stored credential is not dialled in plain text unless the person chose "Disable". After the
   Kafka Connect test passes, the orchestrator reads Oracle's settings with thin mode, **not encrypted**:

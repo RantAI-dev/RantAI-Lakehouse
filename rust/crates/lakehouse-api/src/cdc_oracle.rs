@@ -72,12 +72,13 @@ pub enum OracleTestFailure {
     /// (`:55-65`), and `OracleConnection.resolveOracleDatabaseVersion` (`:166-171`) wraps the driver's
     /// error, so the Oracle code is in the cause and never in the answer. Splitting it further would
     /// be a guess (principle 2). The sentence names every likely cause in fixed text and carries
-    /// none of the upstream text (principle 4).
+    /// none of the upstream text (principle 4). It never tells the user to turn encryption off
+    /// (`Slice 6 review round 1 SHOULD-FIX 1`).
     #[error(
         "Oracle connection failed: the connection or the login was refused. Kafka Connect does not \
          say which: check the host, the port, the service name or PDB name, the login and its \
-         password, and that the server allows Oracle native network encryption (or set the TLS \
-         mode to Disable)."
+         password, and that the server allows Oracle native network encryption (ask the database \
+         administrator if it does not)."
     )]
     ConnectionRefused,
     /// `Debezium`'s "Connection validation timed out after N ms".
@@ -329,6 +330,9 @@ mod tests {
         ] {
             assert!(said.contains(cause), "{cause}");
         }
+        // Slice 6 review round 1 SHOULD-FIX 1: the sentence never advises switching encryption off.
+        assert!(!said.contains("Disable") && !said.to_lowercase().contains("tls mode"));
+        assert!(said.ends_with("(ask the database administrator if it does not)."));
         assert!(UNENCRYPTED_SETUP_READ.contains("sessions are not encrypted"));
     }
 
