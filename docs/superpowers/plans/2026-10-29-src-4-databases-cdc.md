@@ -1787,9 +1787,11 @@ because of it. After slice 6 fixes it, one more merge of the phase head clears t
 
 ### Slice 6, Oracle change capture (developer, Sonnet, 2026-10-31)
 
-**Status: built and pushed, NOT proven by CI.** Pull request #264 is `CONFLICTING` with `main` (see "Blocker for CI"
-below), so the `pull_request` workflow does not start. Nothing of slice 6 has run in CI, and the gate `g4-oracle` has
-never run. Every Rust, Python-gate and compose claim below is *not verified* beyond the local commands listed.
+**Status: built, pushed, and the `g4-oracle` gate runs; it STOPS at the new-column step (Amendment 9's stop condition,
+waiting for the planner).** Run `41235139798` on `67931f6c` (later commits are docs only): `Rust · clippy`, `Images`,
+`g4-cdc`-family gates pass or were still running when read; `Rust · G4 Oracle change capture into Bronze` **failed at the last
+step but one**, with everything before it passing. See "Gate lines" below. The Rust test job and a few others were still running
+when this was written; I did not read them.
 
 **Commits** (branch `feat/data-phase-4-src-4`), in order:
 
@@ -1847,6 +1849,47 @@ so I did not decide it. Until `main` is merged in, no CI runs on #264 at all.
 - *The new principle-3 spots:* the gate's wrong-login step dials as a user that does not exist (`c##g4nosuch`), so it can never lock
   the real user.
 
+**Gate lines (`g4-oracle`, run `41235139798`, from the job log).**
+
+- `connect` pass (172 ms, through Kafka Connect's validation with native encryption required, so `${dir:...}` is resolved by
+  `config/validate`: Amendment 10's stop condition did not fire); `discover` refused-as-expected; `load` pass (20,000 + 20,000
+  rows); `lag` pass (both tables `up_to_date`).
+- Setup checks pass: the gate source reads `ARCHIVELOG=ok; Supplemental logging=ok; All-column logging on G4SRC.ORDERS=ok;
+  All-column logging on G4SRC.ORDERS_HISTORY=ok; LogMiner privileges=ok`; the second connector has exactly `All-column logging on
+  G4SRC.ORDERS_PLAIN` (with the quoted `ALTER TABLE ... ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;`) and `...G4SRC.NO_SUCH_TABLE`
+  (no command) missing.
+- Wrong password pass, with the sentence "Oracle connection failed: the connection or the login was refused. Kafka Connect does
+  not say which: ..." (see the deviation below). Encryption banner pass: 2 sessions of `C##DBZUSER`, each with `AES256 encryption
+  service adapter` and `SHA256 crypto-checksumming service adapter`.
+- `reload` pass, every kind of change within 120 s in both modes: insert/current 15 s, insert/history 19 s, update/current 31 s,
+  update/history 36 s, delete/current 25 s, delete/history 29 s (D5's budget 120 s).
+- Pause with 20,000 changes per table and resume: Bronze equals the source after 40.1 s. Restart of `kafka-connect` during a
+  stream of changes: Bronze equals the source after 35.0 s.
+- **New column: FAILED, the stop condition of Amendment 9 / S6-h.** With the default `log.mining.strategy=online_catalog`, an
+  `ALTER TABLE G4SRC.ORDERS ADD (note VARCHAR2(100))` followed by an `UPDATE ... SET note = ...` makes the connector's task FAIL, not
+  just skip the column: the worker log has `DmlParserException: Failed to parse update DML: update "G4SRC"."ORDERS" set "NOTE" =
+  'schema_note' where "ID" = '2' ...` caused by `DebeziumException: No column 'NOTE' found in table 'FREEPDB1.G4SRC.ORDERS'`, then
+  `LogMiner session stopped due to an error`, `Producer failure` and `Task threw an uncaught and unrecoverable exception. Task is being
+  killed and will not recover until manually restarted`. The gate then waited its 600 s for the column and failed. Not reached: the
+  last two steps (`DELETE`, the final table). The planner decides between `log.mining.strategy=hybrid` (DDL tracked in the redo
+  log) and a "Limits" line (a new column needs the connector restarted; until then its task is FAILED).
+
+**Deviations found in CI (all in the commits above).**
+
+- *Amendment 10's three test sentences cannot be produced.* Debezium 3.7.0.Final answers `Unable to connect (primary): Failed to
+  resolve Oracle database version` for a refused login, an unreachable server and a refused encryption alike (`OracleConnector.java:
+  91-100`, `OracleConnection.java:166-171`: the Oracle code is only in the cause, which the validation answer does not carry; the
+  worker log shows `ORA-01017` in a `Caused by`). The test therefore says one fixed sentence for a refused connection and one for a
+  timeout, and still honours an Oracle code when one appears. Wrong login, unreachable and ORA-12660 stay told apart only in unit tests of the
+  matcher, not against a real server.
+- *Kafka Connect's validation wants `name` in the body*, and *refuses to create* a connector whose login fails (422 on the ingest
+  spec save), so the gate changes the stored password after creating the connector.
+- *A common user sees only the root in `CDB_*` / `v$containers`* unless `CONTAINER_DATA` is widened, which Debezium's documented grants
+  do not do; the table facts are read in a second unencrypted session on the PDB's own service (`all_log_groups`, `all_tables`).
+- *Debezium sends every Oracle NUMBER as text* under `decimal.handling.mode=string`, so `id` is a String in Bronze (the gate reads
+  `toInt64(id)`). Stated in the feature page as the limit it is? **Not yet**: planner, please add "Oracle NUMBER columns, keys
+  included, are text in Bronze" to the Limits.
+
 **Commands run locally (rule 7).**
 
 - `cargo fmt --check` (rust/): clean on the final tree.
@@ -1860,9 +1903,7 @@ so I did not decide it. Until `main` is merged in, no CI runs on #264 at all.
 - *Not run locally:* cargo build, clippy and test (machine limits), the compose `up`, the gate. Everything Rust in this slice, including
   its new unit tests, is therefore *not verified*.
 
-**CI.** Run `41033040481` (on `dfe21ca3`, before the main merge conflict appeared) failed clippy and Repo lints, both addressed above. No
-run exists for any later commit: #264 is `CONFLICTING`. **The gate's own lines (timings against 120 s, setup checks, the encryption
-banner, the new-column outcome) do not exist yet.**
+**CI.** Main was merged in twice (a migration clash and docker-compose.yml, both resolved; see above), after which #264 is MERGEABLE and CI runs. Runs read: `41218510528` (clippy: `Answer::tested` by value), `41221154536` (gate: Bronze `id` is text), `41223258549` (clippy, tests lints; gate: connect test needed `name`), `41227154822` (gate: table facts empty for a common user), `41230236666` (gate: setup passed; wrong-password connector refused at create), `41232567954` (gate: the Debezium message carries no ORA code), `41235139798` (gate passes to the new-column step).
 
 
 ## Review
