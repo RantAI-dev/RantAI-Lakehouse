@@ -1956,6 +1956,8 @@ unit 2,196 passed (1 skipped); loader 306 passed; frontend 3,100 pass / 0 fail (
 **CI.** Main was merged in twice (a migration clash and docker-compose.yml, both resolved; see above), after which #264 is MERGEABLE and CI runs. Runs read: `41218510528` (clippy: `Answer::tested` by value), `41221154536` (gate: Bronze `id` is text), `41223258549` (clippy, tests lints; gate: connect test needed `name`), `41227154822` (gate: table facts empty for a common user), `41230236666` (gate: setup passed; wrong-password connector refused at create), `41232567954` (gate: the Debezium message carries no ORA code), `41235139798` (gate passes to the new-column step).
 
 
+**Slice 6 review round 1 fixes (developer, Sonnet, 2026-10-31).** SHOULD-FIX 1: the refused-connection sentence ends "(ask the database administrator if it does not)." and no longer advises the TLS mode Disable (unit test, gate assertion that the message has no "Disable", feature page). SHOULD-FIX 2: `_online_catalog_probe`, its call and its `ORDERS_OC` table are removed from `g4_oracle_test.py`; its result stays recorded above (run `41244187205`); hybrid stays. Commit `ee3c6e38`. CI run `41247888991` on it: **38 of 38 jobs success**; `g4-oracle` PASS through DELETE, the new column reaches Bronze after 20.4 s, reload within 120 s in both modes (insert/current 15 s, insert/history 20 s, update/current 32 s, update/history 37 s). Local: `cargo fmt --check`, `ast.parse` of the gate; the Rust unit test ran only in CI (green).
+
 ## Review
 
 (The planner writes findings here, tagged `BLOCKER` or `SHOULD-FIX`.)
