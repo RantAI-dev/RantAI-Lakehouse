@@ -1,0 +1,46 @@
+<clickhouse>
+    <!--
+        REL-2 S1-T4 (decision D8): the LOCAL backup disk.
+
+        A backup that needs an S3-compatible bucket cannot be taken on an
+        air-gapped host, and a host that has one must still keep the backup
+        somewhere the operators control. `ClickHouse`'s `BACKUP DATABASE ...
+        TO Disk('backups', ...)` writes into a disk the server already
+        knows, so this file defines that disk: a plain directory inside the
+        server's own data volume.
+
+        `docker-compose.yml`'s `clickhouse` service mounts this file into
+        `/etc/clickhouse-server/config.d/` (ClickHouse reads every file in
+        that directory) and mounts the volume `lakehouse_clickhouse_backups`
+        at the path below, so the directory the server writes into is the
+        same one the backup script reads the files out of, and the restore
+        writes them back into.
+
+        `keep_free_space` reserves a gigabyte so a backup cannot fill the
+        disk the server's own data lives on. It is a reservation, not a
+        quota: a backup that does not fit is refused by ClickHouse, and
+        the operator sees that in the backup script's output.
+    -->
+    <storage_configuration>
+        <disks>
+            <backups>
+                <type>local</type>
+                <!-- The trailing slash is required: ClickHouse refuses a
+                     disk whose path does not end with one ("Disk path must
+                     end with /"). -->
+                <path>/var/lib/clickhouse/backups/</path>
+                <keep_free_space>1073741824</keep_free_space>
+            </backups>
+        </disks>
+    </storage_configuration>
+    <!--
+        Which disk a `BACKUP ... TO Disk(...)` may write to. ClickHouse
+        refuses the statement without it ("The 'backups.allowed_disk'
+        configuration parameter is not set, cannot use 'Disk' backup
+        engine"), so the disk above and this name are two halves of one
+        decision.
+    -->
+    <backups>
+        <allowed_disk>backups</allowed_disk>
+    </backups>
+</clickhouse>
