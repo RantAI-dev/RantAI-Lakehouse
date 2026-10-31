@@ -100,6 +100,7 @@ class OracleSource(cdc_gate.Source):
     ping_timeout_seconds = 900
     discover_refused = True
     own_setup_checks = True
+    bronze_id = "toInt64(id)"
 
     def __init__(self) -> None:
         # The common user's and the schema owner's password: a throwaway of this gate's stack.

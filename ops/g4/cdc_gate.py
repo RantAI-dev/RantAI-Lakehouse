@@ -179,6 +179,10 @@ class Source:
     now = "now()"
     needs_schema_history = False  # `MySQL` and `SQL Server` keep their history in a Kafka topic
     password = ""  # the source password the connector's credential file holds
+    # The key column as ClickHouse reads it in Bronze. Debezium's Oracle connector sends every NUMBER as text
+    # under `decimal.handling.mode=string` (seen in CI, run 41218510528: `id` was a String), so Oracle reads
+    # `toInt64(id)`; every other source sends an integer.
+    bronze_id = "id"
     # How long `step_wait_for_services` waits for `ping` (Oracle Free restarts once to enter ARCHIVELOG).
     ping_timeout_seconds = 120
     # `SRC-4` Amendment 10 (S10-c): a source whose tables are typed by hand answers the discovery routes
@@ -679,7 +683,7 @@ def _current_diff() -> str | None:
     amount, status), else what differs. A bare `count()` is never used (see the module doc)."""
     table = src().qualified(TABLES["current"])
     source = [_norm(r) for r in src().rows(f"SELECT id, customer, amount, status FROM {table} ORDER BY id")]
-    found = [_norm(r) for r in ch_rows(f"SELECT id, customer, amount, status FROM {bronze('current')} WHERE id > 0 ORDER BY id")]
+    found = [_norm(r) for r in ch_rows(f"SELECT {src().bronze_id}, customer, amount, status FROM {bronze('current')} WHERE {src().bronze_id} > 0 ORDER BY {src().bronze_id}")]
     found_ids = [r[0] for r in found]
     duplicated = len(found_ids) - len(set(found_ids))
     source_ids = {r[0] for r in source}
@@ -697,7 +701,7 @@ def _current_diff() -> str | None:
 def _history_diff() -> str | None:
     """None when the history table holds exactly the events the gate caused, as a multiset."""
     found: collections.Counter = collections.Counter()
-    for row in ch_rows(f"SELECT id, `_op`, coalesce(customer, '') FROM {bronze('history')} WHERE id > 0"):
+    for row in ch_rows(f"SELECT {src().bronze_id}, `_op`, coalesce(customer, '') FROM {bronze('history')} WHERE {src().bronze_id} > 0"):
         found[(int(row[0]), row[1], row[2])] += 1
     missing = EXPECTED_HISTORY - found
     extra = found - EXPECTED_HISTORY
@@ -731,7 +735,7 @@ def step_first_copy_reached_bronze() -> None:
         for mode in MODES:
             extra = " AND `_op` = 'r'" if mode == "history" else ""
             text = ch_query(
-                f"SELECT count() FROM {bronze(mode)} WHERE id > 0{extra} SETTINGS allow_database_iceberg=1 FORMAT TabSeparated"
+                f"SELECT count() FROM {bronze(mode)} WHERE {src().bronze_id} > 0{extra} SETTINGS allow_database_iceberg=1 FORMAT TabSeparated"
             ).strip()
             counts[mode] = int(text) if text.isdigit() else -1
         if any(c != SEED_ROWS for c in counts.values()):
@@ -1006,11 +1010,11 @@ def _apply(sql_by_table, history_events=None) -> None:
 
 def _visible(mode: str, kind: str, row_id: int, marker: str) -> bool:
     if mode == "current":
-        rows = ch_rows(f"SELECT customer FROM {bronze('current')} WHERE id = {row_id}")
+        rows = ch_rows(f"SELECT customer FROM {bronze('current')} WHERE {src().bronze_id} = {row_id}")
         return (not rows) if kind == "delete" else any(r[0] == marker for r in rows)
     op = {"insert": "c", "update": "u", "delete": "d"}[kind]
     extra = "" if kind == "delete" else f" AND customer = '{marker}'"
-    n = ch_rows(f"SELECT count() FROM {bronze('history')} WHERE id = {row_id} AND `_op` = '{op}'{extra}")
+    n = ch_rows(f"SELECT count() FROM {bronze('history')} WHERE {src().bronze_id} = {row_id} AND `_op` = '{op}'{extra}")
     return int(n[0][0]) > 0
 
 
@@ -1130,7 +1134,7 @@ def step_schema_change_is_observed(connector_id: str) -> None:
     src().add_column_and_observe()
 
     def column_arrived():
-        rows = ch_rows(f"SELECT note FROM {bronze('current')} WHERE id = 2")
+        rows = ch_rows(f"SELECT note FROM {bronze('current')} WHERE {src().bronze_id} = 2")
         return True if rows and rows[0][0] == "schema_note" else None
 
     _wait_for("the new column reaches the current-mode Bronze table", column_arrived, CATCH_UP_TIMEOUT_SECONDS, interval_s=10)

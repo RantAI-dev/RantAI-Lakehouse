@@ -165,6 +165,7 @@ pub fn classify_status(status: &Value) -> ConnectState {
 pub struct ConfigValidation {
     error_count: u64,
     messages: Vec<String>,
+    fields: Vec<String>,
 }
 
 impl ConfigValidation {
@@ -184,9 +185,25 @@ impl ConfigValidation {
             .filter_map(Value::as_str)
             .map(str::to_owned)
             .collect();
+        // The names of the settings with an error: configuration keys this build sent, safe to log.
+        let fields = answer
+            .get("configs")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|config| {
+                config
+                    .pointer("/value/errors")
+                    .and_then(Value::as_array)
+                    .is_some_and(|errors| !errors.is_empty())
+            })
+            .filter_map(|config| config.pointer("/value/name").and_then(Value::as_str))
+            .map(str::to_owned)
+            .collect();
         Some(Self {
             error_count,
             messages,
+            fields,
         })
     }
 
@@ -194,6 +211,13 @@ impl ConfigValidation {
     #[must_use]
     pub const fn is_valid(&self) -> bool {
         self.error_count == 0
+    }
+
+    /// The names of the settings `Kafka Connect` found wrong: configuration keys, never values, so
+    /// they can be logged to tell a wrong login from a wrong setting.
+    #[must_use]
+    pub fn failed_fields(&self) -> &[String] {
+        &self.fields
     }
 
     /// The error texts, for matching against fixed patterns only.

@@ -202,7 +202,12 @@ pub async fn test(
         ),
         Ok(validation) => {
             let failure = classify(&validation);
-            tracing::info!(connector_id = %id, ?failure, "the Oracle change-capture test failed");
+            tracing::info!(
+                connector_id = %id,
+                ?failure,
+                fields = ?validation.failed_fields(),
+                "the Oracle change-capture test failed"
+            );
             outcome(false, true, Some(elapsed_ms), &failure.to_string())
         }
         Err(ConnectError::ClassNotAllowed | ConnectError::Rejected) => outcome(
