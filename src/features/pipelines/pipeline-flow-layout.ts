@@ -179,6 +179,10 @@ export function authoredFlow(
     column: transforms.length > 0 ? 2 : 1,
     kind: "sink",
     label: `${def.targetZone}.${def.targetTable}`,
+    // BLD-10 D3: a pipeline with no transform copies its source as is.
+    // The chart says so, rather than leaving a reader to guess what an
+    // empty middle column means.
+    sublabel: transforms.length > 0 ? undefined : "plain copy of the source",
   }
   const chain = [source, ...transforms, target]
   const edges = chain.slice(1).map((n, i) => ({ from: chain[i].id, to: n.id }))
