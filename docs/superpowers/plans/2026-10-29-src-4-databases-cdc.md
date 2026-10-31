@@ -986,6 +986,65 @@ S6-g, and changes S6-e's table listing.
   stand, plus: validate does not resolve config providers (S10-a), and the
   Debezium failure message names no table (S10-d).
 
+**Amendment 11 (2026-10-31, slice 6 developer's second stop report, decided
+by the product owner).** Verified by the planner in Debezium 3.7.0.Final:
+`AbstractLogMinerStreamingChangeEventSource.java:1846-1862` throws only for
+missing minimal supplemental logging; a table without `(ALL) COLUMNS`
+logging gets a `LOGGER.warn` and the connector keeps running, so updates
+reach Bronze with unchanged columns missing. Kafka Connect exposes no such
+warning. S10-d's second connector cannot be built.
+
+The product owner chose, on 2026-10-31, **to read Oracle's setup facts over
+an unencrypted connection**: an owner-signed exception to `SEC-14`'s rule
+(a stored credential is never dialed in plain text unless the person chose
+`disable`), limited as follows.
+
+- **S11-a Two steps in one test.** `/test` for an Oracle change-capture dial:
+  1. The S10-a validate through Kafka Connect, encrypted. Its classified
+     sentence is the test's outcome.
+  2. Only if step 1 passed, the API launches the orchestrator test
+     (Amendment 2, kind `test`) for the setup facts alone.
+- **S11-b The orchestrator's read.**
+  - `python-oracledb` thin mode, no encryption, as the change-capture user,
+    to the container database.
+  - Only the fixed statements of S6-g: log mode, minimal and all-column
+    supplemental logging at the database level
+    (`supplemental_log_data_min`, `supplemental_log_data_all`), the
+    all-column log groups, session privileges and roles. Never a table
+    row.
+  - Values are compared in Python and never placed in SQL.
+  - It returns the closed `oracle_setup` facts beside slice 5's
+    `mongo_setup` (S8-c, S8-d): `outcome_of` accepts them for a test only,
+    and the poll route fills `setupChecks` from the dial.
+  - Per selected table, the facts are one of: exists with all-column
+    logging, exists without it, or not found. "Not found" catches a
+    mistyped hand-entered name, which narrows S10-c's limit.
+  - Database-level all-column logging makes every table ok.
+- **S11-c Saying so.**
+  - Put a comment at the dial site citing this amendment and `SEC-14`.
+  - The test result shows the fixed line "Setup checks are read over an
+    unencrypted connection; the password is not sent in clear text, the
+    session is not encrypted."
+  - A server that refuses an unencrypted session (`ORA-12660`) gives every
+    Oracle check `unchecked`, with "The server requires encryption, which
+    the setup check cannot use: check these settings by hand."
+  - The feature page's "Limits" and decision 9's wording record the
+    exception and its date.
+- **S11-d** S10-b's trace matching stays for the two messages Debezium
+  throws (`ARCHIVELOG` off at `OracleConnectorTask.java:316`, minimal
+  logging off at `AbstractLogMinerStreamingChangeEventSource.java:1850`),
+  so a connector that fails for those shows why. Its "all-column logging
+  for a named table" case is dropped. The `unchecked` placeholders in the
+  test (S10-b, first part) are replaced by S11-b's facts.
+- **S11-e Gate `g4-oracle`** (replaces S10-d's second connector):
+  - the test lists the gate source's exact setting names as ok;
+  - the third table (without all-column logging) is `missing` alone, with
+    its command;
+  - a mistyped table name is "not found";
+  - the test result carries the S11-c line.
+- **T6.5** waits for slice 5's merge again; it is about to land (session
+  lakehouse-35, review round 3 closed at `655abb34`).
+
 ## Handoff
 
 ### Slice 1, Oracle batch (developer, Sonnet, 2026-10-29)
