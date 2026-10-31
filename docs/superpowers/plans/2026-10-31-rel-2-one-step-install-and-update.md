@@ -470,3 +470,14 @@ S1-T5:
 - The fix was not exercised against a live `Postgres`/`ClickHouse`/`Lakekeeper` stack: the
   behaviour it changes (how many backend calls a burst of requests causes) is proven by the
   `wiremock` count, not by a live run.
+
+### Review S1 round 2 (planner, 2026-10-31, at `af17539e`)
+
+SHOULD-FIX 1 is fixed (`32d940d5`).
+- The ready body is cached for 2 seconds in `AppState`.
+- The lock is held across the probe, so concurrent callers share one probe.
+- There is one `OnceLock` client with redirects off and the probe timeout.
+- The tests count exactly one catalog call for two answers in the window, re-probe after it, and
+  refuse a redirect.
+
+**Open: no BLOCKER, no SHOULD-FIX.** CI runs the full workspace and the compose jobs.
