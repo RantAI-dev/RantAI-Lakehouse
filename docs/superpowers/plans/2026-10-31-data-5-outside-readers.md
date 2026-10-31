@@ -230,4 +230,180 @@ The two run in parallel. S1 merges first. S2 is then rebased on `main` and merge
 
 ## 5. Handoff (developers append below, one entry per slice)
 
+### Handoff S1 (developer, 2026-10-31)
+
+Branch `feat/data-5-outside-readers-api`, base `main` at `776f133b`. Seven
+commits, one per task, in plan order:
+
+| Task | Commit | What |
+| --- | --- | --- |
+| S1-T1 | `6ffad161` | compose + `oidc-mock`: the `outside-readers` catalog principal (D5) |
+| S1-T2 | `b787f767` | migration `0117_outside_table_read_day.sql` + the store's counter (D6) |
+| S1-T3 | `b5e1fb9c` | the door: the seven routes and the catch-all (D1–D4, D6, D8) |
+| S1-T4 | `c25323d9` | the namespace-scoped `select` grant for `outside-readers` (D5) |
+| S1-T5 | `7399baf9` | the consumers route (D7) |
+| S1-T6 | `6c658ded` | the acceptance test: the outside reader (D7) |
+| S1-T7 | `1190ae0e` | `docs/OPERATIONS.md` + the feature page pointer (D11) |
+
+**Checks on the final commit (`1190ae0e`), every one run in the foreground:**
+
+| Command | Result |
+| --- | --- |
+| `cargo fmt --check` (workspace) | exit 0 |
+| `cargo clippy -p lakehouse-api -p lakehouse-store -p lakehouse-auth --all-targets -- -D warnings` | exit 0 |
+| `cargo test -p lakehouse-store` | 836 passed, 0 failed |
+| `cargo test -p lakehouse-auth` | 143 passed, 0 failed |
+| `cargo test -p lakehouse-api --test iceberg_door` | 13 passed, 0 failed |
+| `cargo test -p lakehouse-api --test route_auth` | 66 passed, 0 failed |
+| `cargo test -p lakehouse-api --test sec11_guard` | 4 passed, 0 failed |
+| `cargo test -p lakehouse-api gold` | 134 passed, 0 failed (90 test binaries) |
+| `docker compose --profile '*' config --quiet` | exit 0 |
+| `python3 -m py_compile ops/gold_export/gold_export_test.py` | exit 0 |
+| `python3 ops/lint/check_intra_package_imports.py` | "OK: all intra-package dispar_orchestrate imports resolve" |
+| `python3 ops/lint/check_bare_iceberg_count.py` | "R11 guard: no bare count() against a Bronze Iceberg table found." |
+| `git status` | clean (nothing generated staged) |
+
+**The acceptance test, run locally (S1-T6's accept).** A fresh project
+(`docker compose -p data5 --profile '*' down -v`, then `up -d` with the
+dagster profile), the API image rebuilt from this branch, and:
+
+```
+docker compose -p data5 --profile dagster run --rm gold-export-test-runner
+```
+
+exits 0 and prints `[gold-export] PASSED`. The DATA-5 lines of that run:
+
+```
+[gold-export] outside tool gold-export-outside-tool-4e1d48f5 (900160e1-…) has its key (iceberg:read)
+[gold-export] the outside tool read 7 rows of gold.gold_export_smoke through the door
+[gold-export] the door refused a write: ForbiddenException: Outside readers may only read published Gold tables.
+[gold-export] the door refused another namespace: ForbiddenException: Outside readers may only read published Gold tables.
+[gold-export] the consumers route lists the outside tool: {'identityId': '900160e1-…', 'name': 'gold-export-outside-tool-4e1d48f5', 'reads': 1, 'lastReadAt': '2026-10-31T12:28:10.853Z'}
+```
+
+The seven seeded rows are the seeded rows, the write and the other
+namespace are refused 403 with the Iceberg error shape, and the consumers
+route lists the tool with exactly one read.
+
+**Per task, what was checked when.**
+
+- **S1-T1** (`6ffad161`): *not re-verified in this session* beyond the
+  final block above — the commit message records what it ran:
+  `docker compose --profile '*' config --quiet` (exit 0),
+  `docker compose -p data5 up -d` (exit 0),
+  `data5-lakekeeper-authz-init-1` exit code 0, `/tokens/outside-readers.jwt`
+  present in `lakehouse-api`, and Lakekeeper's own assignments endpoint
+  listing `{"type":"describe","user":"oidc~outside-readers"}`. The stack
+  used by S1-T6's run was built from this compose file, and the door's
+  forwarded table load answered 200 under the `outside-readers` token —
+  so the principal was registered by the same init container and holds
+  what the door needs.
+- **S1-T2** (`b787f767`): the commit message records `cargo fmt --check`,
+  `cargo clippy -p lakehouse-store --all-targets -- -D warnings`,
+  `cargo test -p lakehouse-store --test outside_reads` (4 passed) and
+  `cargo test -p lakehouse-store` (all green). *Re-run in this session*:
+  `cargo test -p lakehouse-store` — 836 passed, 0 failed.
+- **S1-T3** (`b5e1fb9c`): the commit message records `cargo fmt --check`,
+  `cargo clippy -p lakehouse-api --all-targets -- -D warnings`,
+  `cargo test -p lakehouse-api iceberg_door` (9 unit + 9 integration),
+  `cargo test -p lakehouse-api --test route_auth` (66 passed) and the
+  whole crate (91 test binaries, all ok). *Re-run in this session*: the
+  same targets on the final commit — `iceberg_door` 13 passed,
+  `route_auth` 66 passed, `sec11_guard` 4 passed, `gold` filter 134 passed.
+- **S1-T4** (`c25323d9`): the commit message records `cargo fmt --check`,
+  `cargo clippy -p lakehouse-auth -p lakehouse-api --all-targets -- -D warnings`,
+  `cargo test -p lakehouse-auth --test openfga` (15 passed),
+  `cargo test -p lakehouse-auth` and `cargo test -p lakehouse-api` (91 test
+  binaries, all ok). *Re-run in this session*: `cargo test -p lakehouse-auth`
+  — 143 passed, 0 failed. The real grant was measured against the
+  compose stack's Lakekeeper 0.13.3 by that session (204 granted, the
+  assignments listing then showing `select` on the `gold` namespace); this
+  session's stack shows the same assignment:
+  `{"assignments":[{"type":"ownership","user":"oidc~gold-export"},{"type":"select","user":"oidc~outside-readers"}]}`.
+- **S1-T5** (`7399baf9`): `cargo fmt --check` (exit 0),
+  `cargo clippy -p lakehouse-api --all-targets -- -D warnings` (exit 0),
+  `cargo test -p lakehouse-api gold` (134 passed),
+  `cargo test -p lakehouse-api --test iceberg_door` (13 passed),
+  `cargo test -p lakehouse-api --test route_auth` (66 passed),
+  `cargo test -p lakehouse-api --test sec11_guard` (4 passed).
+- **S1-T6** (`6c658ded`): `python3 -m py_compile` (exit 0),
+  `docker compose --profile '*' config --quiet` (exit 0), and the compose
+  test itself, run from a clean project: exit 0, "[gold-export] PASSED".
+- **S1-T7** (`1190ae0e`): docs only; no check in this repo runs on
+  Markdown. The content was checked against the running stack — the API's
+  own answers, plus the two client examples (see below).
+
+**Three judgment calls a reviewer should look at.**
+
+1. **S1-T5 changed the door's error type.** `iceberg_door::setup()` now
+   answers with a `NotSetUp` value instead of an `ApiError`, so the
+   sentence the door's 503 carries and the sentence the console repeats
+   are the same string, built once. The alternative — the console
+   stringifying the door's error — is a route line that puts an error's
+   own text into a response, which `tests/sec11_guard.rs` fails on (it
+   failed, with `src/routes/gold.rs:713: "reason": err.to_string(),`
+   before the change). `lakekeeper_token::token_unavailable_message` is
+   now the shared text for an unreadable token file, so that sentence is
+   written once too. The door's answers are unchanged: same status, same
+   bodies.
+2. **S1-T6 pins `pyiceberg[pyarrow]==0.9.0`**, not the latest. The
+   `s3fs` extra was dropped: 0.9.0's default file IO is pyarrow's own
+   `S3FileSystem`, and `s3fs` pulls `aiobotocore`, whose `botocore` pin
+   conflicts with the unpinned `boto3` this runner already installs
+   (`ResolutionImpossible`). 0.9.0's `RestCatalog` was read before the
+   pin: it takes the warehouse's prefix from the config response, sends
+   the token as a bearer, and raises `ForbiddenError` on a 403 — all
+   three are what the test asserts.
+3. **S1-T6 changed the CI job's own `.env`** (`OUTSIDE_S3_ENDPOINT=http://rustfs:9000`).
+   The runner is INSIDE the compose network, so the published address an
+   outside reader can reach from there is the in-network one. The
+   endpoint REWRITE itself is covered by the Rust unit test
+   (`routes::iceberg_door`'s `rewrite_endpoint`). The job's `.env`
+   already carried `CATALOG_TENANT_ID`, `GOLD_EXPORT_RUN_TOKEN` and
+   `GOLD_ORPHAN_MIN_AGE_SECONDS=0`, which the local run needed too.
+
+**Not verified, and why.**
+
+- **The whole `cargo test -p lakehouse-api` crate suite (91 test binaries)
+  was not run in this session for S1-T5/T6/T7**: the machine's rule for
+  this slice is not to spend 20+ minutes on it (CI runs it), and the
+  scoped targets above are the ones the plan names. T3's and T4's commit
+  messages record that suite green on those commits.
+- **The full workspace run** (`cargo clippy --workspace --all-targets
+  --all-features -- -D warnings` and `cargo test --workspace`) was not
+  run: the plan's §3 scopes S1 to `lakehouse-api` and `lakehouse-store`
+  (plus `lakehouse-auth`, which S1-T4 touched). CI runs the workspace.
+- **`bun run typecheck` / `bun run lint` / `bun run test`** were not run:
+  S1 touches no TypeScript (the console is S2's slice).
+- **`(cd dagster && python -m pytest dispar_orchestrate -q)`** was not
+  run: S1 touches no Python package (only `ops/gold_export/`, the
+  acceptance script, whose `py_compile` passed).
+- **`cargo test -p lakehouse-iceberg --test g1_lakekeeper -- --ignored`**
+  was not run: it needs a live Lakekeeper stack and is not in this
+  plan's accept list.
+- **The DuckDB example in `docs/OPERATIONS.md`** was run by hand against
+  this stack (`ATTACH … (TYPE iceberg, URI '…/api/iceberg',
+  AUTHORIZATION_TYPE 'OAUTH2', TOKEN '<the key>')`, then
+  `SELECT count(*) FROM cat.gold.gold_export_smoke`), not by the
+  acceptance test. The pyiceberg example IS the acceptance test.
+
+**One local-environment note for whoever runs the acceptance test again.**
+This machine's `.env` is host-facing, so the local run needed these
+exported for the WHOLE cycle (a different value for a variable compose
+interpolates into a running container makes compose recreate that
+container mid-test): `LAKEKEEPER_BASE_URI=http://lakekeeper:8181`,
+`DAGSTER_URL=http://dagster-webserver:3000/graphql`,
+`GOLD_EXPORT_RUN_TOKEN`, `CATALOG_TENANT_ID`,
+`CONNECTOR_S3_ACCESS_KEY`/`CONNECTOR_S3_SECRET_KEY` (the RustFS keys) and
+`GOLD_ORPHAN_MIN_AGE_SECONDS=0`. CI's job `.env` already sets every one
+of them, so CI needs none of this. The API image was rebuilt from this
+branch (`docker compose -p data5 build lakehouse-api`, 7m10s) before the
+run.
+
+**The stack is torn down**: `docker compose -p data5 --profile '*' down -v`
+removed the project's containers and volumes, and the testcontainers the
+cargo tests started were removed
+(`docker ps -q --filter label=org.testcontainers.managed-by=testcontainers | xargs -r docker rm -f`).
+No container is left running.
+
 ## 6. Review (planner appends below)
