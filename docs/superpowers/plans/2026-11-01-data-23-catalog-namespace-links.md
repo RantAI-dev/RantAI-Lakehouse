@@ -110,3 +110,16 @@ saw it.
   `render={<Link … />}`), so the tests find it by role `button` and read its `href`.
 
 ## Review (planner appends below)
+
+### Review round 1 (planner, 2026-11-01, at `0eccab65`)
+
+- **D1.** The drawer's preview filter, both drawer buttons and the row menu's link use `.id`.
+- **D2.** The row menu's "Copy namespace" copies the id.
+- **Accepted as is:** the namespace column's own copy icon (`catalog-namespace-columns.tsx:43`)
+  copies the text it sits beside, the display name. A copy icon next to a value copies that value.
+- **Tests:** the six new tests fail on the old code and pass on the new.
+- **I re-ran:**
+  - `bun run typecheck`: clean;
+  - `bun test src/features/catalog`: 336 pass, 0 fail.
+
+**Open: no BLOCKER, no SHOULD-FIX.**
