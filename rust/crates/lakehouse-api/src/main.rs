@@ -216,6 +216,9 @@ async fn run() -> anyhow::Result<()> {
     // SRC-11 D5/D6: the daily removal of run log lines and attempts older
     // than 30 days.
     spawn_run_log_cleanup(&state);
+    // QS-3: the saved queries that waited in the trash for more than 30
+    // days are removed for good, at start and every hour.
+    routes::spawn_saved_query_trash_sweep(&state);
     // RPT-1 D3: the scheduled-report runner (a tick every minute, a daily
     // 90-day cleanup of deliveries).
     routes::report_runner::spawn(&state);

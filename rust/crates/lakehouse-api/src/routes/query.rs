@@ -16,6 +16,7 @@ use lakehouse_auth::{Principal, PrincipalId};
 use lakehouse_clickhouse::ChClient;
 use lakehouse_core::ApiError;
 use lakehouse_store::PgPool;
+use lakehouse_store::StoreError;
 use lakehouse_store::audit::NewAuditEvent;
 use lakehouse_store::queries::{
     self, HistoryFilter, QueryHistoryItem, RecordHistoryInput, SavedQuery,
@@ -2925,6 +2926,143 @@ fn scheduling_capability_body() -> Value {
 /// This handler never fails — it reports a fixed, static capability.
 pub async fn scheduling(State(_state): State<AppState>) -> ApiResult<ApiJson<Value>> {
     Ok(ApiJson(scheduling_capability_body()))
+}
+
+// ── The trash sweep (QS-3) ───────────────────────────────────────────────
+
+/// Remove the saved queries that waited in the trash longer than
+/// [`TRASH_RETENTION_DAYS`](lakehouse_store::queries::TRASH_RETENTION_DAYS)
+/// days, and answer how many went.
+///
+/// The cutoff is the store's own constant, the same one the trash list
+/// counts its days from: the number the console shows and the number this
+/// pass acts on are one number.
+///
+/// # Errors
+///
+/// Returns [`StoreError`] when the delete fails. Nothing is deleted when
+/// it does.
+pub(crate) async fn purge_expired_saved_queries(pool: &PgPool) -> Result<u64, StoreError> {
+    let cutoff =
+        OffsetDateTime::now_utc() - time::Duration::days(i64::from(queries::TRASH_RETENTION_DAYS));
+    queries::purge_trashed_before(pool, cutoff).await
+}
+
+/// Spawn the sweep that removes the saved queries that waited in the trash
+/// longer than
+/// [`TRASH_RETENTION_DAYS`](lakehouse_store::queries::TRASH_RETENTION_DAYS)
+/// days.
+///
+/// It runs once at start (the first tick is immediate) and then every
+/// hour, missed ticks skipped. An error is logged at `warn` and never
+/// takes the process down; the next pass removes what this one missed.
+/// Without a Postgres pool, it logs once and spawns nothing.
+///
+/// `pub` and not `pub(crate)`: `routes/mod.rs` re-exports it, because the
+/// binary's `main` is its only caller and the library target would
+/// otherwise call it dead code — and a re-export of a `pub(crate)` item
+/// is refused by the compiler.
+pub fn spawn_saved_query_trash_sweep(state: &AppState) {
+    let Some(pool) = state.pg.clone() else {
+        tracing::warn!("no Postgres pool configured; the saved-query trash sweep will not run");
+        return;
+    };
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_hours(1));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            match purge_expired_saved_queries(&pool).await {
+                Ok(removed) if removed > 0 => {
+                    tracing::info!(removed, "saved-query trash sweep removed expired queries");
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::warn!(%err, "saved-query trash sweep failed; nothing was deleted");
+                }
+            }
+        }
+    });
+}
+
+/// The trash sweep (`QS-3`): a saved query that waited in the trash for
+/// more than 30 days is gone for good, and one that waited a day is
+/// still there.
+///
+/// The test calls the pass itself and not the hourly loop: a test that
+/// waits an hour proves nothing, and the loop is the same one the
+/// run-log cleanup uses.
+#[cfg(test)]
+mod trash_sweep_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use lakehouse_store::PgPool;
+    // Force-links `lakehouse-test-support` so its `#[ctor]` Postgres
+    // testcontainer bootstrap runs for this test binary, the same reason
+    // `tests`'s own `source_marks` module does it.
+    use lakehouse_test_support as _;
+    use time::Duration;
+    use time::OffsetDateTime;
+    use uuid::Uuid;
+
+    use super::purge_expired_saved_queries;
+
+    /// A saved query that went to the trash `days` days ago, and the id
+    /// it got.
+    async fn trashed_query(pool: &PgPool, title: &str, days: i64) -> Uuid {
+        let id = Uuid::new_v4();
+        let deleted_at = OffsetDateTime::now_utc() - Duration::days(days);
+        sqlx::query(
+            "INSERT INTO saved_query (id, title, sql, owner, deleted_at) \
+             VALUES ($1, $2, 'SELECT 1', 'Rina Wijaya', $3)",
+        )
+        .bind(id)
+        .bind(title)
+        .bind(deleted_at)
+        .execute(pool)
+        .await
+        .expect("the trashed query is written");
+        id
+    }
+
+    /// Whether the saved query with this id is still in the table.
+    async fn is_there(pool: &PgPool, id: Uuid) -> bool {
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM saved_query WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .expect("the saved queries are counted");
+        count > 0
+    }
+
+    /// The sweep takes the query that waited in the trash for more than 30
+    /// days and leaves the one that waited a day alone, and it says how
+    /// many it took.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_sweep_removes_only_the_queries_trashed_more_than_thirty_days_ago(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let old = trashed_query(&pool, "In the trash for 31 days", 31).await;
+        let fresh = trashed_query(&pool, "In the trash for a day", 1).await;
+
+        let removed = purge_expired_saved_queries(&pool)
+            .await
+            .expect("the sweep runs");
+
+        assert!(
+            !is_there(&pool, old).await,
+            "the query trashed 31 days ago is gone for good"
+        );
+        assert!(
+            is_there(&pool, fresh).await,
+            "the query trashed a day ago is still in the trash"
+        );
+        assert_eq!(
+            removed, 1,
+            "the sweep answers how many queries it took: the one that waited 31 days"
+        );
+        Ok(())
+    }
 }
 
 /// The SEC-21 settings rule, tested on its own. A separate module from

@@ -71,6 +71,10 @@ mod query_limits;
 // logic in a second place is exactly the drift the one definition exists
 // to prevent (`AGENTS.md` rule 4).
 pub(crate) mod query;
+// The trash sweep is started by the binary's `main`, and the library
+// target has no caller of its own: the re-export is what keeps the
+// function reachable there, so no build calls it dead code.
+pub use query::spawn_saved_query_trash_sweep;
 mod saved_queries;
 mod schema_changes;
 pub(crate) mod schema_versions;
