@@ -67,3 +67,26 @@ disagrees, stop and report it.
 ## 3. Handoff (developer appends below)
 
 ## 4. Review and results (planner appends below)
+
+### Handoff (written by the planner from the developer's commits)
+
+The developer's session ended on the MiniMax usage limit (error 2056) after it had pushed all
+three tasks, so it wrote no handoff. The commits are:
+- `ad4cd9de`: T1, the harness (`--concurrent`, the OOM check, the Avro, zip and one-group Parquet
+  writers);
+- `80be1c24`: T2, the workflow inputs;
+- `187a1642`: T3, the RESULT section.
+
+### Review round 1 (planner, 2026-11-01, at `187a1642`)
+
+- **D1.**
+  - `--concurrent N` sends N copies, then starts every load together (a thread pool) and waits
+    for all of them.
+  - `docker inspect .State.OOMKilled` is read, and an OOM is recorded as a result.
+- **D2.** `write_avro` (fastavro), `write_csv_zip` (deflated, about the size unpacked) and
+  `write_parquet_one_group` (`row_group_size = rows`).
+- **D3.** The workflow passes the new inputs through.
+- **I ran:** `pytest ops/g9/test_large_upload.py` in a fresh venv (pytest 8.3.4, pyarrow 25.0.1,
+  fastavro): **29 passed**.
+
+**Open: no BLOCKER, no SHOULD-FIX.** Next is D4: the planner runs the measurements on this branch.
