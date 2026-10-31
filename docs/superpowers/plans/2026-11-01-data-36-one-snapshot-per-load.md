@@ -144,3 +144,33 @@ says so), so the one snapshot carries the empty set, and `history.write_versions
 does carry `rantai.author`) is untouched.
 
 ## Review (planner appends below)
+
+### Review round 1 (planner, 2026-11-01, at `c17b7cef`)
+
+- **D1.** `adapters/iceberg_snapshot.write_one_snapshot` writes every group through **one**
+  producer:
+  - an append is a single `fast_append`;
+  - a replace is a single `overwrite`, which deletes the current files and adds the load's own.
+
+  Memory stays bounded per group: the memory guard measured +68 to +119 MiB against the 250 bound.
+- **D2.** The snapshot properties are unchanged.
+- **D3.** `sink._replace_changing_types` uses the same helper.
+- **The developer's deviations, all accepted:**
+  1. **One `itertools.count` for the whole load.** My recipe called `_dataframe_to_data_files` per
+     group, and pyiceberg would then name every group's file the same (`00000-{task}-{uuid}`), so
+     each group would overwrite the last. That is **silent data loss**, measured on 0.12.0. The
+     planner's recipe was wrong, and the developer was right to fix it rather than copy it.
+     `test_an_append_of_several_groups_leaves_one_snapshot` now asserts both groups' rows are in
+     the table.
+  2. **`_check_pyarrow_schema_compatible` is kept**, so a column the table lacks is refused, not
+     silently dropped. `test_a_group_that_does_not_fit_the_table_is_refused` covers it.
+  3. **A new module**, to avoid an import cycle.
+- **Tests:**
+  - one snapshot for a multi-group append, a multi-group replace, and a zero-row append and
+    replace;
+  - the properties are carried;
+  - a pin test fails if the private API moves.
+- **The developer's counts:** Dagster **2396 pass, 1 skip**; the memory guard 4 pass; the lints
+  are OK.
+
+**Open: no BLOCKER, no SHOULD-FIX.**
