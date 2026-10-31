@@ -106,7 +106,7 @@ pub struct Request {
 #[derive(Debug)]
 pub enum Dispatch {
     /// The API answered (or refused) itself.
-    Done(Answer),
+    Done(Box<Answer>),
     /// The orchestrator must read the source (D1): launch `discover_job`.
     Orchestrator,
 }
@@ -871,6 +871,9 @@ async fn sql_answer(
             };
             SqlOp::Columns { schema, table }
         }
+        // `SRC-4` T1.1: a connection test is launched by `POST .../test`, never
+        // answered by a listing; `dispatch` refuses it before it gets here.
+        Kind::Test => return Answer::failed(kind, ErrorClass::NotSupported),
     };
     match run_sql(target, &info.secret_ref, &op, resolver, internal_hosts, ca).await {
         Ok(SqlOut::Names { names, truncated }) => {
@@ -1065,6 +1068,8 @@ async fn files_answer(
             Kind::Preview => preview_s3(&client, dial.format, &request.object)
                 .await
                 .map(|preview| Answer::preview(&request.object, preview)),
+            // See `sql_answer`: `dispatch` refuses a test before this.
+            Kind::Test => Ok(Answer::failed(kind, ErrorClass::NotSupported)),
         }
     })
     .await;
@@ -1108,12 +1113,17 @@ pub async fn dispatch(
     internal_hosts: &InternalHosts,
     ca: Option<&Path>,
 ) -> Dispatch {
+    if kind == Kind::Test {
+        // `SRC-4` T1.1: a connection test is not a listing; it has its own
+        // route (`POST /api/connectors/{id}/test`).
+        return Dispatch::Done(Box::new(Answer::failed(kind, ErrorClass::NotSupported)));
+    }
     let Some(adapter) = info.adapter.as_deref() else {
         // No ingest spec yet: there is no dial to read.
-        return Dispatch::Done(Answer::failed(kind, ErrorClass::NotSupported));
+        return Dispatch::Done(Box::new(Answer::failed(kind, ErrorClass::NotSupported)));
     };
     let Ok(dial) = Dial::parse(adapter, &info.dial) else {
-        return Dispatch::Done(Answer::failed(kind, ErrorClass::Failed));
+        return Dispatch::Done(Box::new(Answer::failed(kind, ErrorClass::Failed)));
     };
     let answer = match &dial {
         Dial::Sql(sql) if sql.driver != SqlDriver::Oracle => {
@@ -1148,18 +1158,25 @@ pub async fn dispatch(
             Answer::listing("", rest_listing(&paths, request))
         }
         Dial::Sheets(_) => Answer::failed(kind, ErrorClass::NotSupported),
-        // Oracle, MongoDB, Kafka, SFTP, and the column preview of REST.
+        // `SRC-4` slice 6 (S10-c): listing would dial Oracle without the native
+        // encryption the connector requires, so an Oracle change-capture
+        // connector's tables are typed by hand and nothing is listed.
+        Dial::Cdc(cdc) if cdc.driver == SqlDriver::Oracle => {
+            Answer::failed(kind, ErrorClass::NotSupported)
+        }
+        // Oracle (batch), MongoDB, Kafka, SFTP, and the column preview of REST.
         // `SRC-3` T1.6: a `saas` connector's objects and columns are listed
         // by the vendor's own module in the orchestrator, never by the API.
         Dial::Sql(_)
         | Dial::Cdc(_)
+        | Dial::CdcMongo(_)
         | Dial::Rest(_)
         | Dial::Mongo(_)
         | Dial::Kafka(_)
         | Dial::Sftp(_)
         | Dial::Saas(_) => return Dispatch::Orchestrator,
     };
-    Dispatch::Done(answer)
+    Dispatch::Done(Box::new(answer))
 }
 
 #[cfg(test)]
@@ -1374,8 +1391,45 @@ mod tests {
         else {
             panic!("the API answers a PostgreSQL source itself");
         };
+        let answer = *answer;
         assert_eq!(answer.error_class, Some(ErrorClass::AddressRefused));
         assert_eq!(answer.reason, Some(ErrorClass::AddressRefused.reason()));
+    }
+
+    /// `SRC-4` slice 6 (S10-c): an Oracle change-capture connector lists nothing, in the API,
+    /// without a launch.
+    #[tokio::test]
+    async fn an_oracle_change_capture_listing_is_answered_here_as_not_supported() {
+        let resolver =
+            lakehouse_core::secret::EnvSecretResolver::with_map(std::collections::HashMap::new());
+        let oracle_cdc = ConnectorDialInfo {
+            kind: "x".to_owned(),
+            host: "x".to_owned(),
+            secret_ref: "env:UNUSED".to_owned(),
+            secret_ref_secondary: None,
+            adapter: Some("cdc".to_owned()),
+            dial: serde_json::json!({"driver": "oracle", "host": "o.example", "port": 1521,
+                "database": "FREE", "user": "u"}),
+        };
+        let request = Request {
+            limit: 10,
+            ..Request::default()
+        };
+        for kind in [Kind::List, Kind::Preview] {
+            let Dispatch::Done(answer) = dispatch(
+                kind,
+                &oracle_cdc,
+                &request,
+                &resolver,
+                &InternalHosts::NONE,
+                None,
+            )
+            .await
+            else {
+                panic!("an Oracle change-capture listing is answered here");
+            };
+            assert_eq!(answer.error_class, Some(ErrorClass::NotSupported));
+        }
     }
 
     /// `SRC-13` D1: the types the orchestrator reads are handed over, and a
@@ -1459,6 +1513,7 @@ mod tests {
         else {
             panic!("the API lists REST endpoints itself");
         };
+        let answer = *answer;
         let names: Vec<&str> = answer
             .objects
             .as_ref()
@@ -1517,6 +1572,7 @@ mod tests {
             else {
                 panic!("answered by the API");
             };
+            let answer = *answer;
             assert_eq!(answer.error_class, Some(ErrorClass::NotSupported));
             assert!(
                 !answer.reason.unwrap().contains("unknown adapter"),

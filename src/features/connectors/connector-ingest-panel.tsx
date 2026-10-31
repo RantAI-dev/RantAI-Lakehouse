@@ -139,6 +139,9 @@ type Selection = Selected[]
 /** What a table gets when it is ticked: one copy of the source per run. */
 const DEFAULT_LOAD_MODE: LoadMode = "replace"
 
+/** `SRC-4` decision S2-g: a change-capture table keeps the current row per key unless history is chosen. */
+const defaultLoadMode = (adapter: string): LoadMode => (adapter === "cdc" ? "incremental_dedup" : DEFAULT_LOAD_MODE)
+
 const LOAD_MODE_LABEL: Record<LoadMode, string> = {
   replace: "Replace all rows",
   incremental: "Add only new rows",
@@ -146,6 +149,23 @@ const LOAD_MODE_LABEL: Record<LoadMode, string> = {
   replace_dedup: "Replace all rows, one per key",
   incremental_dedup: "Add only new rows, one per key",
   history: "Keep history",
+}
+
+/** `SRC-4` decision S2-g: the two modes change capture offers, in the words the product owner signed. */
+const CHANGE_CAPTURE_LABEL: Partial<Record<LoadMode, string>> = {
+  incremental_dedup: "Current row per key",
+  history: "Keep history",
+}
+
+const modeLabel = (mode: LoadMode, changeCapture: boolean): string =>
+  (changeCapture ? CHANGE_CAPTURE_LABEL[mode] : undefined) ?? LOAD_MODE_LABEL[mode]
+
+/** What a mode does for change capture, in one line under the choice. */
+function changeCaptureHint(mode: LoadMode): string {
+  if (mode === "history") {
+    return "Every change is kept as a row, with its operation (_op), the time it happened at the source (_source_ts_ms), whether it deleted the row (_deleted) and its position (_offset)."
+  }
+  return "The table holds the current row of each key: a change updates the row and a delete removes it. A first copy of the source is taken when capture starts."
 }
 
 /** What a mode does on each run, in one line under the choice, including what happens to the rows already there. */
@@ -176,6 +196,8 @@ function loadModeHint(mode: LoadMode, cursor: string): string {
  * no other adapter runs them (SRC-10 decision 2).
  */
 function loadModesFor(adapter: string): LoadMode[] {
+  // SRC-4 decision S2-g: change capture keeps the current row per key (the default) or every change.
+  if (adapter === "cdc") return ["incremental_dedup", "history"]
   // SRC-3 AD6: a business-app object loads incrementally by the cursor its vendor declares (the finder shows
   // which objects have one). PR #216 final review BLOCKER 18: plain `incremental` appends a changed record as
   // a second row, so `saas` offers only the mode that merges on the vendor's key.
@@ -186,7 +208,8 @@ function loadModesFor(adapter: string): LoadMode[] {
 }
 
 /** Why a source cannot offer the incremental modes, or `null` when it can. */
-function missingModesNote(modes: LoadMode[]): string | null {
+function missingModesNote(modes: LoadMode[], changeCapture = false): string | null {
+  if (changeCapture) return null
   return modes.includes("incremental") || modes.includes("incremental_dedup")
     ? null
     : "Adding only new rows, with or without one row per key, is offered for SQL sources and business apps only: they can ask the source for just the new rows."
@@ -221,28 +244,37 @@ export function loadModeProblem(selected: {
     return "A business app can only add new rows one per key: choose “Add only new rows, one per key”."
   }
   if (
+    selected.adapter !== "cdc" &&
     (selected.loadMode === "incremental" || selected.loadMode === "incremental_dedup") &&
     !(selected.incrementalKey ?? "").trim()
   ) {
     return "Pick the column that marks new rows, such as an id or an updated-at time."
   }
   if (needsKey(selected.loadMode) && (selected.primaryKey ?? []).length === 0) {
+    if (selected.adapter === "cdc") {
+      return "Name the column, or the columns together, that identify one row. Change capture cannot follow a table without a key."
+    }
     return "Name the column, or the columns together, that identify one row. A mode with one row per key cannot be saved without a key."
   }
   return null
 }
 
+/** Said under the box an Oracle change-capture connector's tables are typed in (`SRC-4` Amendment 10, S10-c). */
+export const ORACLE_BY_HAND_NOTE =
+  "Type each table as SCHEMA.TABLE, as Oracle names it (upper case). The names are not checked against the source until you test the connection: a name that does not exist captures nothing."
+
 /**
  * `SRC-11` decision 9: the sources whose columns the product lists before loading, so a column can be left
- * out: `sql` connectors on the PostgreSQL, MySQL (MariaDB uses it) or SQL Server driver. Oracle is listed by
- * `SRC-13` but the API refuses `excludedColumns` for it (`validate_excluded_columns`), so it is not offered here;
- * files, REST, MongoDB, Kafka and SFTP have no declared column list to choose from. Business apps (`saas`, `SRC-3`
+ * out: `sql` connectors on the PostgreSQL, MySQL (MariaDB uses it), SQL Server or Oracle driver (Oracle since
+ * `SRC-4` T1.2: `SRC-13` lists its columns and the orchestrator maps their spelling to the reflected one, as
+ * `supports_column_choice` in `ingest_spec.rs` says); files, REST, MongoDB, Kafka and SFTP have no declared column
+ * list to choose from. Business apps (`saas`, `SRC-3`
  * AD6) are offered it too: a vendor that describes its fields lists them. The columns come from the
  * preview route (`useColumnPreviews`), also for a table saved in an earlier visit.
  */
 export function supportsColumnChoice(adapter: string, dial: Dial | null | undefined): boolean {
   const driver = typeof dial?.driver === "string" ? dial.driver : ""
-  return adapter === "saas" || (adapter === "sql" && (driver === "postgres" || driver === "mysql" || driver === "mssql"))
+  return adapter === "saas" || (adapter === "sql" && (driver === "postgres" || driver === "mysql" || driver === "mssql" || driver === "oracle"))
 }
 
 /**
@@ -277,25 +309,25 @@ function fromSpec(spec: IngestSpec): Selection {
   return spec.sourceObjects.map((o) => ({
     name: o.name,
     target: o.target,
-    // Saved before load modes existed: the ingest job replaces.
-    loadMode: o.loadMode ?? DEFAULT_LOAD_MODE,
+    // Saved before load modes existed: the ingest job replaces; change capture keeps the current row per key.
+    loadMode: o.loadMode ?? defaultLoadMode(spec.adapter ?? ""),
     incrementalKey: o.incrementalKey,
     primaryKey: o.primaryKey,
     excludedColumns: o.excludedColumns,
   }))
 }
 
-/** `withModes: false` for CDC, whose tables stream and are never loaded by a run. */
-function toSourceObjects(selection: Selection, withModes: boolean): SourceObject[] {
+/** `withCursor: false` for change capture, whose tables follow the source's changes and read no cursor column. */
+function toSourceObjects(selection: Selection, withCursor: boolean): SourceObject[] {
   return selection.map((s) => ({
     name: s.name,
     target: s.target,
-    ...(withModes ? { loadMode: s.loadMode } : {}),
-    ...(withModes && (s.loadMode === "incremental" || s.loadMode === "incremental_dedup") && s.incrementalKey?.trim()
+    loadMode: s.loadMode,
+    ...(withCursor && (s.loadMode === "incremental" || s.loadMode === "incremental_dedup") && s.incrementalKey?.trim()
       ? { incrementalKey: s.incrementalKey.trim() }
       : {}),
-    ...(withModes && s.primaryKey && s.primaryKey.length > 0 ? { primaryKey: s.primaryKey } : {}),
-    ...(withModes && effectiveExcluded(s).length > 0 ? { excludedColumns: effectiveExcluded(s) } : {}),
+    ...(s.primaryKey && s.primaryKey.length > 0 ? { primaryKey: s.primaryKey } : {}),
+    ...(effectiveExcluded(s).length > 0 ? { excludedColumns: effectiveExcluded(s) } : {}),
   }))
 }
 
@@ -437,6 +469,9 @@ function IngestEditor({
   const cron = cronChoice === "custom" ? customCron.trim() : cronChoice
 
   const [manualName, setManualName] = React.useState("")
+  // `SRC-4` Amendment 10 (S10-c): an Oracle change-capture connector lists nothing; each table is typed as
+  // SCHEMA.TABLE, in the upper case Oracle stores it in, and is not checked against the source until capture starts.
+  const oracleByHand = isCdc && spec.dial.driver === "oracle"
   const save = useServiceAction(
     withNotify({ success: "Tables and schedule saved", error: "Could not save tables" }, (signal) =>
       connectorService.setIngestSpec(
@@ -460,7 +495,7 @@ function IngestEditor({
       selection.filter((_, j) => j !== i).map((o) => o.target)
     )
   )
-  const modeProblems = selection.map((s) => (isCdc ? null : loadModeProblem({ ...s, adapter })))
+  const modeProblems = selection.map((s) => loadModeProblem({ ...s, adapter }))
   const scheduleProblem = !isCdc && cronChoice === "custom" ? cronProblem(customCron) : null
   const dirty =
     JSON.stringify(toSourceObjects(selection, !isCdc)) !== JSON.stringify(toSourceObjects(saved, !isCdc)) ||
@@ -517,7 +552,7 @@ function IngestEditor({
     return {
       name,
       target: label ? labelTarget(connectorName, label) : defaultTarget(connectorName, name),
-      loadMode: DEFAULT_LOAD_MODE,
+      loadMode: defaultLoadMode(adapter),
       ...(detected ? { primaryKey: detected } : {}),
     }
   }
@@ -561,7 +596,9 @@ function IngestEditor({
   }
 
   function addManual() {
-    const name = manualName.trim()
+    const typed = manualName.trim()
+    // Oracle stores unquoted names in upper case and the API requires that spelling (S10-c).
+    const name = oracleByHand ? typed.toUpperCase() : typed
     if (!name || selectedNames.has(name)) return
     setSelection((current) => [...current, newTable(name)])
     setManualName("")
@@ -590,7 +627,9 @@ function IngestEditor({
   const page = layout === "page"
   const tablesIntro = isStream
     ? "A Kafka connector reads its topic; each run takes one micro-batch."
-    : "Each table here lands in its own Bronze table. A run replaces its rows, or adds to them, as chosen per table. Nothing is ingested until at least one table is saved."
+    : isCdc
+      ? "Each table here lands in its own Bronze table, kept in step with the source by following its changes. Nothing is captured until at least one table is saved."
+      : "Each table here lands in its own Bronze table. A run replaces its rows, or adds to them, as chosen per table. Nothing is ingested until at least one table is saved."
 
   const cdcNotes = (
     <>
@@ -599,7 +638,6 @@ function IngestEditor({
           {backfillTriggerMessage(typeof spec.dial.driver === "string" ? spec.dial.driver : "cdc")}
         </p>
       ) : null}
-      {isCdc && saved[0] ? <DebeziumPanel connectorId={connectorId} table={saved[0].name} /> : null}
     </>
   )
 
@@ -668,17 +706,16 @@ function IngestEditor({
                   />
                 </div>
                 {problems[i] ? <p className="text-xs text-destructive">{problems[i]}</p> : null}
-                {!isCdc ? (
-                  <LoadModeFields
-                    selected={s}
-                    modes={loadModesFor(adapter)}
-                    savedMode={saved.find((t) => t.name === s.name)?.loadMode ?? null}
-                    columns={columnsOf.get(s.name) ?? null}
-                    detectedKey={keysOf.get(s.name) ?? null}
-                    problem={modeProblems[i]}
-                    onChange={(patch) => change(s.name, patch)}
-                  />
-                ) : null}
+                <LoadModeFields
+                  selected={s}
+                  modes={loadModesFor(adapter)}
+                  savedMode={saved.find((t) => t.name === s.name)?.loadMode ?? null}
+                  columns={columnsOf.get(s.name) ?? null}
+                  detectedKey={keysOf.get(s.name) ?? null}
+                  problem={modeProblems[i]}
+                  changeCapture={isCdc}
+                  onChange={(patch) => change(s.name, patch)}
+                />
                 {columnChoice ? (
                   <ColumnChoice
                     selected={s}
@@ -740,7 +777,9 @@ function IngestEditor({
                 }
               }}
               placeholder={
-                adapter === "sftp" || adapter === "files"
+                oracleByHand
+                  ? "SCHEMA.TABLE"
+                  : adapter === "sftp" || adapter === "files"
                   ? "orders.csv"
                   : finder === "oracle"
                     ? "SCHEMA.TABLE"
@@ -757,7 +796,9 @@ function IngestEditor({
             </Button>
           </div>
           <p className="text-xs text-muted-foreground">
-            {finder === null
+            {oracleByHand
+              ? ORACLE_BY_HAND_NOTE
+              : finder === null
               ? "This connector type cannot list its objects, so type each one as the source names it."
               : finder === "oracle"
                 ? "Or type SCHEMA.TABLE as Oracle names it, for a table the list does not show."
@@ -887,6 +928,7 @@ function IngestEditor({
       state={runState}
       pausedReason={pausedReason}
       onResumed={onResumed}
+      resumeOnCaptureTab={isCdc}
       blockedReason={
         pausedReason
           ? `Paused: ${pausedReason}`
@@ -962,6 +1004,7 @@ function LoadModeFields({
   columns,
   detectedKey,
   problem,
+  changeCapture,
   onChange,
 }: {
   selected: Selected
@@ -972,6 +1015,8 @@ function LoadModeFields({
   /** The key the source declares for this table, when it was found and declares one. */
   detectedKey: string[] | null
   problem: string | null
+  /** `SRC-4`: a change-capture table reads no cursor column and has its own words for the two modes. */
+  changeCapture: boolean
   onChange: (patch: Partial<Selected>) => void
 }) {
   const cursor = selected.incrementalKey ?? ""
@@ -979,11 +1024,11 @@ function LoadModeFields({
   // silently reading as another one.
   const offered = modes.includes(selected.loadMode) ? modes : [...modes, selected.loadMode]
   const fieldClass = "h-7 rounded-lg border border-input bg-transparent px-2 text-xs"
-  const note = missingModesNote(modes)
+  const note = missingModesNote(modes, changeCapture)
   return (
     <div className="space-y-1">
       <div className="flex flex-wrap items-center gap-1.5">
-        <span className="shrink-0 text-xs text-muted-foreground">Each run</span>
+        <span className="shrink-0 text-xs text-muted-foreground">{changeCapture ? "Keep" : "Each run"}</span>
         <select
           aria-label={`Load mode for ${selected.name}`}
           className={fieldClass}
@@ -992,11 +1037,11 @@ function LoadModeFields({
         >
           {offered.map((mode) => (
             <option key={mode} value={mode}>
-              {LOAD_MODE_LABEL[mode]}
+              {modeLabel(mode, changeCapture)}
             </option>
           ))}
         </select>
-        {selected.loadMode === "incremental" || selected.loadMode === "incremental_dedup" ? (
+        {!changeCapture && (selected.loadMode === "incremental" || selected.loadMode === "incremental_dedup") ? (
           <>
             <span className="shrink-0 text-xs text-muted-foreground">by</span>
             {columns && columns.length > 0 ? (
@@ -1040,9 +1085,9 @@ function LoadModeFields({
         />
       ) : null}
       <p className={problem ? "text-xs text-destructive" : "text-xs text-muted-foreground"}>
-        {problem ?? loadModeHint(selected.loadMode, cursor.trim())}
+        {problem ?? (changeCapture ? changeCaptureHint(selected.loadMode) : loadModeHint(selected.loadMode, cursor.trim()))}
       </p>
-      {crossesHistoryBoundary(savedMode, selected.loadMode) ? (
+      {!changeCapture && crossesHistoryBoundary(savedMode, selected.loadMode) ? (
         <p className="text-xs text-muted-foreground">{HISTORY_BOUNDARY_NOTE}</p>
       ) : null}
     </div>
@@ -1389,6 +1434,13 @@ export function isAutoDisablePause(reason: string | null | undefined): boolean {
   return /^Paused after \d+ failed runs in a row$/.test(reason ?? "")
 }
 
+/** The reason a person's own pause carries (`PERSON_PAUSE_REASON` in `connectors.rs`, `SRC-4`); Resume lifts it too. */
+export const PERSON_PAUSE_REASON = "Paused by a person"
+
+/** A pause Resume can lift: repeated failures set it, or a person did. */
+export const isLiftablePause = (reason: string | null | undefined): boolean =>
+  isAutoDisablePause(reason) || reason === PERSON_PAUSE_REASON
+
 /**
  * The connector's runs from the product's own record (newest 50), each opening
  * to its log, and a Run now that stays disabled while a run is going: Bronze is
@@ -1403,6 +1455,7 @@ function IngestRuns({
   blockedReason,
   pausedReason,
   onResumed,
+  resumeOnCaptureTab = false,
 }: {
   layout: "page" | "embedded"
   connectorId: string
@@ -1410,6 +1463,8 @@ function IngestRuns({
   blockedReason: string | null
   pausedReason: string | null
   onResumed?: () => void
+  /** A change-capture connector is paused and resumed on the Change capture tab (`SRC-4` S4-g), not here. */
+  resumeOnCaptureTab?: boolean
 }) {
   const { list, runs, activeRun, awaitingLaunch, launchedRunId, watching, refreshRuns } = state
   const runNow = useServiceAction((signal, id: string) => connectorService.runIngest(id, signal))
@@ -1434,7 +1489,12 @@ function IngestRuns({
   const body = (
     <>
       {pausedReason ? (
-        <PausedNote connectorId={connectorId} reason={pausedReason} onResumed={onResumed} />
+        <PausedNote
+          connectorId={connectorId}
+          reason={pausedReason}
+          onResumed={onResumed}
+          resumeOnCaptureTab={resumeOnCaptureTab}
+        />
       ) : blockedReason && !watching ? (
         <p className="text-xs text-muted-foreground">{blockedReason}</p>
       ) : null}
@@ -1504,10 +1564,12 @@ function PausedNote({
   connectorId,
   reason,
   onResumed,
+  resumeOnCaptureTab = false,
 }: {
   connectorId: string
   reason: string
   onResumed?: () => void
+  resumeOnCaptureTab?: boolean
 }) {
   const resume = useServiceAction(async (signal) => {
     const result = await connectorService.resumeConnector(connectorId, signal)
@@ -1517,10 +1579,14 @@ function PausedNote({
   return (
     <div className="space-y-1.5 rounded-md border border-border bg-muted/30 px-3 py-2">
       <p className="text-xs">Paused: {reason}</p>
-      {isAutoDisablePause(reason) ? (
+      {isLiftablePause(reason) && resumeOnCaptureTab ? (
+        <p className="text-xs text-muted-foreground">Resume it on the Change capture tab.</p>
+      ) : isLiftablePause(reason) ? (
         <>
           <p className="text-xs text-muted-foreground">
-            Fix the cause, then resume. The count of failed runs starts again from zero.
+            {isAutoDisablePause(reason)
+              ? "Fix the cause, then resume. The count of failed runs starts again from zero."
+              : "Resume when you want it to run again."}
           </p>
           <Button
             type="button"
@@ -1726,32 +1792,6 @@ function RunLog({ connectorId, runId }: { connectorId: string; runId: string }) 
           ) : null}
         </>
       )}
-    </div>
-  )
-}
-
-/**
- * Read-only `Debezium` `.properties` rendering for a `cdc` adapter's
- * captured table. `properties` holds ONLY `${ENV_VAR_NAME}` references —
- * labeled explicitly as such, never resolved here or anywhere in the
- * console.
- */
-function DebeziumPanel({ connectorId, table }: { connectorId: string; table: string }) {
-  const props = useService(
-    (signal) => connectorService.getDebeziumProperties(connectorId, table, signal),
-    [connectorId, table]
-  )
-
-  if (props.status === "loading") return <LoadingSkeleton rows={2} />
-  if (props.status === "error") return <ErrorState error={props.error} onRetry={props.reload} />
-
-  return (
-    <div>
-      <p className="text-xs font-medium text-muted-foreground">Debezium properties · {props.data.table}</p>
-      <p className="mt-0.5 text-xs text-muted-foreground">{props.data.note}</p>
-      <pre className="mt-1.5 overflow-x-auto rounded-md border bg-muted p-2 font-mono text-xs">
-        {props.data.properties}
-      </pre>
     </div>
   )
 }

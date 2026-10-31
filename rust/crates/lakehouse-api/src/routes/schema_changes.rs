@@ -386,6 +386,11 @@ pub async fn observe(
         })
         .await?;
     tx.commit().await?;
+    // `SRC-4` slice 2: a pause the policy just set stops the worker's connector
+    // too (best effort, see `cdc_lifecycle`).
+    if decision.pause_connector {
+        crate::cdc_lifecycle::sync_pause_state(&state, &id).await;
+    }
 
     announce(
         &state,
@@ -693,6 +698,9 @@ pub async fn approve(
             return Err(ApiError::Conflict(KEY_COLUMN_REMOVED.to_owned()).into());
         }
     };
+    if approval.pause_lifted {
+        crate::cdc_lifecycle::sync_pause_state(&state, &id).await;
+    }
     // Counts and the table name only: never a column value, never source data.
     let event = connector_audit_event(
         &principal,

@@ -360,6 +360,201 @@ def test_mongodb_hands_the_adapters_own_connection_code_the_checked_dial() -> No
     assert calls == [(["m.example:27017"], backends.resolve_checked)]
 
 
+# --- MongoDB change capture (SRC-4 slice 5, decision S5-f) ---------------------------------
+
+
+_CDC_MONGO = {
+    "id": "conn-1",
+    "adapter": "cdc",
+    "dial": {
+        "driver": "mongodb",
+        "hosts": ["m1.example:27017", "m2.example:27017"],
+        "database": "shop",
+        "user": "reader",
+        "replicaSet": "rs0",
+        "sslMode": "disable",
+    },
+    "secretRef": "env:CONNECTOR_MONGO_PASSWORD",
+}
+
+
+class _Admin:
+    """`ping` answers; `hello` and `connectionStatus` answer what the test set (`answers`), or raise
+    what it set in `raises`. `fail` makes every command raise (a refused login)."""
+
+    def __init__(self, fail: Exception | None = None, answers: dict | None = None, raises: dict | None = None) -> None:
+        self.commands: list[str] = []
+        self.fail = fail
+        self.answers = answers or {}
+        self.raises = raises or {}
+
+    def command(self, name: str, **kwargs):
+        self.commands.append(name)
+        if self.fail:
+            raise self.fail
+        if name in self.raises:
+            raise self.raises[name]
+        return self.answers.get(name, {"ok": 1})
+
+
+class _PingClient(_MongoClient):
+    def __init__(self, collections, fail: Exception | None = None, answers: dict | None = None, raises: dict | None = None):
+        super().__init__(collections)
+        self.admin = _Admin(fail, answers, raises)
+
+
+def test_a_mongodb_cdc_connector_lists_its_databases_collections_through_the_batch_code() -> None:
+    client = _MongoClient({"orders": [], "system.views": [], "items": []})
+    seen = {}
+
+    def connect(dial, secrets, **kw):
+        seen.update(dial)
+        seen["password"] = secrets["password"]
+        return client, []
+
+    result = discover.discover(_CDC_MONGO, _request("list"), backends=_backends(mongo_connect=connect))
+    assert [o["name"] for o in result["objects"]] == ["items", "orders"]
+    assert client.closed is True
+    # The change-capture dial is handed over as the batch dial: one host, direct, the user as username.
+    assert seen["hosts"] == ["m1.example:27017"]
+    assert (seen["username"], seen["database"], seen["directConnection"]) == ("reader", "shop", True)
+    assert seen["password"] == SECRET_TEXT
+
+
+def test_a_mongodb_cdc_preview_names_id_as_the_key() -> None:
+    client = _MongoClient({"orders": [{"_id": "a1", "qty": 3}]})
+    result = discover.discover(
+        _CDC_MONGO, _request("preview", object="orders"), backends=_backends(mongo_connect=lambda d, s, **kw: (client, []))
+    )
+    assert [c["name"] for c in result["columns"]] == ["_id", "qty"]
+    assert result["primaryKey"] == ["_id"]
+    # An empty collection has nothing to infer: no key is invented for it.
+    empty = discover.discover(
+        _CDC_MONGO,
+        _request("preview", object="orders"),
+        backends=_backends(mongo_connect=lambda d, s, **kw: (_MongoClient({"orders": []}), [])),
+    )
+    assert empty == {"columns": []}
+
+
+def test_the_ssl_mode_of_a_mongodb_cdc_dial_becomes_the_clients_tls_options() -> None:
+    assert discover._cdc_mongo_client_options("disable") == {}
+    assert discover._cdc_mongo_client_options("require") == {"tls": True, "tlsAllowInvalidHostnames": True}
+    for mode in ("verify-ca", "verify-full"):
+        assert discover._cdc_mongo_client_options(mode) == {"tls": True, "tlsAllowInvalidHostnames": False}
+    seen = {}
+
+    def connect(dial, secrets, **kw):
+        seen.update(dial)
+        return _MongoClient({}), []
+
+    secure = {**_CDC_MONGO, "dial": {**_CDC_MONGO["dial"], "sslMode": "verify-full"}}
+    discover.discover(secure, _request("list"), backends=_backends(mongo_connect=connect))
+    assert seen["clientOptions"] == {"tls": True, "tlsAllowInvalidHostnames": False}
+    # A dial that does not name a mode is `require`, the default the API parses it with.
+    bare = {**_CDC_MONGO, "dial": {k: v for k, v in _CDC_MONGO["dial"].items() if k != "sslMode"}}
+    discover.discover(bare, _request("list"), backends=_backends(mongo_connect=connect))
+    assert seen["clientOptions"]["tls"] is True
+
+
+def test_a_mongodb_cdc_connection_test_connects_pings_and_reports_only_the_time() -> None:
+    client = _PingClient({})
+    result = discover.discover(
+        _CDC_MONGO, _request("test"), backends=_backends(mongo_connect=lambda d, s, **kw: (client, []))
+    )
+    # A server that answers `hello` with no set name and `connectionStatus` with no privileges list: the
+    # facts that could be read are posted (`none`), the one that could not (no `authInfo`) is left out.
+    assert set(result) == {"latencyMs", "mongoSetup"}
+    assert result["mongoSetup"] == {"replicaSet": "none"}
+    assert isinstance(result["latencyMs"], int) and result["latencyMs"] >= 0
+    assert client.admin.commands == ["ping", "hello", "connectionStatus"]
+    assert client.closed is True
+    body = discover.result_body(_request("test"), result=result, error_class=None)
+    assert body == {
+        "requestId": "req-1", "kind": "test", "state": "done", "latencyMs": result["latencyMs"],
+        "mongoSetup": {"replicaSet": "none"},
+    }
+
+
+def _status(*privileges: tuple[dict, list[str]]) -> dict:
+    return {"authInfo": {"authenticatedUserPrivileges": [{"resource": r, "actions": a} for r, a in privileges]}}
+
+
+_READ_SHOP = ({"db": "shop", "collection": ""}, ["find", "changeStream", "listCollections"])
+_DIAL_SHOP = {**_CDC_MONGO["dial"], "database": "shop", "replicaSet": "rs0"}
+_SHOP = {**_CDC_MONGO, "dial": _DIAL_SHOP}
+
+
+def _facts(**answers) -> dict:
+    client = _PingClient({}, answers=answers.get("answers"), raises=answers.get("raises"))
+    result = discover.discover(_SHOP, _request("test"), backends=_backends(mongo_connect=lambda d, s, **kw: (client, [])))
+    return result.get("mongoSetup", {})
+
+
+def test_the_setup_facts_are_closed_words_read_from_hello_and_connection_status() -> None:
+    good = {"hello": {"setName": "rs0", "isWritablePrimary": True}, "connectionStatus": _status(_READ_SHOP)}
+    assert _facts(answers=good) == {"replicaSet": "matches", "primary": True, "changeStream": "granted"}
+    differs = {"hello": {"setName": "other", "isWritablePrimary": False}, "connectionStatus": _status(_READ_SHOP)}
+    assert _facts(answers=differs) == {"replicaSet": "differs", "primary": False, "changeStream": "granted"}
+    standalone = {"hello": {"isWritablePrimary": True}, "connectionStatus": _status()}
+    assert _facts(answers=standalone) == {"replicaSet": "none", "primary": True, "changeStream": "missing"}
+
+
+def test_change_stream_is_granted_only_by_privileges_that_cover_the_database_and_hold_both_actions() -> None:
+    def fact(*privileges):
+        answers = {"hello": {"setName": "rs0", "isWritablePrimary": True}, "connectionStatus": _status(*privileges)}
+        return _facts(answers=answers)["changeStream"]
+
+    both = ["find", "changeStream"]
+    assert fact(({"db": "shop", "collection": ""}, both)) == "granted"
+    assert fact(({"db": "", "collection": ""}, both)) == "granted"  # every database
+    assert fact(({"anyResource": True}, both)) == "granted"
+    # Union of the covering privileges: the two actions may come from two grants.
+    assert fact(({"db": "shop", "collection": ""}, ["find"]), ({"db": "", "collection": ""}, ["changeStream"])) == "granted"
+    # Another database, one collection only, or one action only does not count.
+    assert fact(({"db": "other", "collection": ""}, both)) == "missing"
+    assert fact(({"db": "shop", "collection": "orders"}, both)) == "missing"
+    assert fact(({"db": "shop", "collection": ""}, ["find"])) == "missing"
+    assert fact(({"cluster": True}, both)) == "missing"
+
+
+def test_a_fact_whose_command_raised_is_not_posted_and_no_error_text_is_kept() -> None:
+    boom = RuntimeError(f"not authorized {SECRET_TEXT}")
+    hello = {"setName": "rs0", "isWritablePrimary": True}
+    only_status = _facts(answers={"connectionStatus": _status(_READ_SHOP)}, raises={"hello": boom})
+    assert only_status == {"changeStream": "granted"}
+    only_hello = _facts(answers={"hello": hello}, raises={"connectionStatus": boom})
+    assert only_hello == {"replicaSet": "matches", "primary": True}
+    client = _PingClient({}, raises={"hello": boom, "connectionStatus": boom})
+    result = discover.discover(_SHOP, _request("test"), backends=_backends(mongo_connect=lambda d, s, **kw: (client, [])))
+    assert "mongoSetup" not in result  # no key at all when nothing was read
+    assert SECRET_TEXT not in json.dumps(result)
+
+
+def test_a_mongodb_cdc_test_failure_is_posted_as_its_class_and_never_its_text() -> None:
+    refused = _driver_error("pymongo", "OperationFailure", code=18)(f"Authentication failed {SECRET_TEXT}")
+    for exc, expected in [(refused, "sign_in_refused"), (_driver_error("pymongo", "ServerSelectionTimeoutError")("x"), "failed")]:
+        client = _PingClient({}, fail=exc)
+        posted: list[dict] = []
+        error_class = discover.run_request(
+            _request("test"),
+            connector_loader=lambda cid: _CDC_MONGO,
+            poster=posted.append,
+            backends=_backends(mongo_connect=lambda d, s, _c=client, **kw: (_c, [])),
+        )
+        assert error_class == expected
+        assert posted == [{"requestId": "req-1", "kind": "test", "state": "failed", "errorClass": expected}]
+        assert SECRET_TEXT not in json.dumps(posted)
+        assert client.closed is True
+
+
+def test_a_sql_cdc_connector_is_still_not_read_by_the_orchestrator() -> None:
+    sql_cdc = {**_CDC_MONGO, "dial": {"driver": "postgres", "host": "h", "port": 5432, "database": "d", "user": "u"}}
+    for kind in ("list", "test"):
+        posted: list[dict] = []
+        assert discover.run_request(_request(kind), connector_loader=lambda cid: sql_cdc, poster=posted.append) == "not_supported"
+
+
 # --- Kafka -----------------------------------------------------------------------------
 
 
@@ -711,6 +906,59 @@ def test_oracle_previews_declared_columns_and_the_primary_key_in_key_order() -> 
     assert engine.disposed is True
     with pytest.raises(ValueError):
         discover.discover(_ORACLE, _request("preview", object="ORDERS"), backends=_oracle_backends(_Engine({})))
+
+
+# --- the connection test (SRC-4 T1.1) -----------------------------------------------------------
+
+
+def test_an_oracle_connection_test_connects_runs_one_statement_and_reports_only_the_time() -> None:
+    engine = _Engine({"SELECT 1 FROM DUAL": [(1,)]})
+    result = discover.discover(_ORACLE, _request("test"), backends=_oracle_backends(engine))
+    assert list(result) == ["latencyMs"]
+    assert isinstance(result["latencyMs"], int) and result["latencyMs"] >= 0
+    assert [sql for sql, _ in engine.connection.statements] == ["SELECT 1 FROM DUAL"]
+    assert engine.disposed is True
+
+    body = discover.result_body(_request("test"), result=result, error_class=None)
+    assert body == {"requestId": "req-1", "kind": "test", "state": "done", "latencyMs": result["latencyMs"]}
+
+
+def test_a_refused_login_is_posted_as_sign_in_refused_and_an_unreachable_host_as_unreachable() -> None:
+    import sqlalchemy.exc
+
+    def refused(code: str):
+        arg = SimpleNamespace(full_code=code)
+        return sqlalchemy.exc.DatabaseError("connect", {}, _driver_error("oracledb", "DatabaseError")(arg))
+
+    for exc, expected in [(refused("ORA-01017"), "sign_in_refused"), (ConnectionRefusedError(), "unreachable")]:
+
+        def engine_that_fails(spec, secrets, *, resolve_checked, _exc=exc):
+            raise _exc
+
+        posted: list[dict] = []
+        error_class = discover.run_request(
+            _request("test"),
+            connector_loader=lambda cid: _ORACLE,
+            poster=posted.append,
+            backends=_backends(oracle_engine=engine_that_fails),
+        )
+        assert error_class == expected
+        assert posted == [{"requestId": "req-1", "kind": "test", "state": "failed", "errorClass": expected}]
+        assert SECRET_TEXT not in json.dumps(posted)
+
+
+def test_only_oracle_is_tested_by_the_orchestrator() -> None:
+    posted: list[dict] = []
+    error_class = discover.run_request(
+        _request("test"), connector_loader=lambda cid: _MONGO, poster=posted.append
+    )
+    assert error_class == "not_supported"
+    assert posted[0]["kind"] == "test" and posted[0]["state"] == "failed"
+    assert discover.DiscoverRequest.from_op_config(
+        {"connector_id": "c", "request_id": "r", "kind": "test"}
+    ).kind == "test"
+    with pytest.raises(ValueError):
+        discover.DiscoverRequest.from_op_config({"connector_id": "c", "request_id": "r", "kind": "tests"})
 
 
 # --- REST (the column preview) -------------------------------------------------------------
@@ -1087,3 +1335,180 @@ def test_a_saas_object_the_vendor_cannot_describe_has_no_preview() -> None:
     module.describe = lambda session, parts, dial, name: None  # type: ignore[method-assign]
     with pytest.raises(discover.NotSupported):
         discover.discover(_SAAS, _request("preview", object="tickets"), backends=_saas_backends(module))
+
+
+# --- Oracle change capture: the setup facts (SRC-4 Amendment 11) -------------------------------------
+
+
+class _DictConnection:
+    """A connection that answers the constant statements of `oracle_setup_facts` by their text and
+    records every statement, so the tests can show that no value was put into one."""
+
+    def __init__(self, answers: dict[str, object]):
+        self._answers = answers
+        self.statements: list[str] = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def execute(self, statement, params=None):
+        sql = str(statement)
+        self.statements.append(sql)
+        for needle, rows in self._answers.items():
+            if sql.strip() == needle:
+                if isinstance(rows, Exception):
+                    raise rows
+                return rows
+        raise AssertionError(f"unexpected statement: {sql}")
+
+
+class _CdcEngine:
+    def __init__(self, connection=None, error=None):
+        self.connection = connection
+        self.error = error
+        self.disposed = False
+        self.spec = None
+
+    def connect(self):
+        if self.error is not None:
+            raise self.error
+        return self.connection
+
+    def dispose(self):
+        self.disposed = True
+
+
+_CDC_ORACLE = {
+    "id": "conn-1",
+    "adapter": "cdc",
+    "dial": {
+        "driver": "oracle", "host": "o.example", "port": 1521, "database": "FREE", "pdbName": "FREEPDB1",
+        "user": "c##dbzuser", "sslMode": "require",
+    },
+    "secretRef": "env:X",
+    "sourceObjects": [{"name": "SHOP.ORDERS"}, {"name": "SHOP.PLAIN"}, {"name": "SHOP.TYPO"}],
+}
+
+_ALL_PRIVILEGES = [(p,) for p in (*discover._CDC_ORACLE_REQUIRED, *discover._CDC_ORACLE_EITHER_PER_TABLE)]
+
+
+def _good_answers(**changes) -> dict[str, object]:
+    answers: dict[str, object] = {
+        "SELECT 1 FROM DUAL": [(1,)],
+        discover._CDC_ORACLE_LOG_MODE: [("ARCHIVELOG",)],
+        discover._CDC_ORACLE_SUPPLEMENTAL: [("YES", "NO")],
+        discover._CDC_ORACLE_PRIVILEGES: _ALL_PRIVILEGES,
+        discover._CDC_ORACLE_ROLES: [],
+        discover._CDC_ORACLE_CONTAINERS: [(1, "CDB$ROOT"), (3, "FREEPDB1")],
+        discover._CDC_ORACLE_LOG_GROUPS_CDB: [(3, "SHOP", "ORDERS"), (1, "SHOP", "PLAIN")],
+        discover._CDC_ORACLE_TABLES_CDB: [(3, "SHOP", "ORDERS"), (3, "SHOP", "PLAIN"), (3, "OTHER", "T")],
+    }
+    answers.update(changes)
+    return answers
+
+
+def _cdc_facts(answers: dict[str, object]) -> tuple[dict, _CdcEngine]:
+    engine = _CdcEngine(_DictConnection(answers))
+    seen = {}
+
+    def make(spec, secrets, *, resolve_checked):
+        seen.update(spec)
+        return engine
+
+    result = discover.discover(_CDC_ORACLE, _request("test"), backends=_backends(oracle_engine=make))
+    engine.spec = seen
+    return result, engine
+
+
+def test_an_oracle_change_capture_test_reads_closed_facts_per_table_without_any_value_in_sql() -> None:
+    result, engine = _cdc_facts(_good_answers())
+    assert set(result) == {"latencyMs", "oracleSetup"}
+    assert result["oracleSetup"] == {
+        "logMode": "archivelog",
+        "supplementalMin": "yes",
+        "supplementalAll": False,
+        "missingPrivileges": [],
+        # The PDB's own con_id (3) picks the rows: the root's row for SHOP.PLAIN does not count.
+        "tables": {"SHOP.ORDERS": "allColumns", "SHOP.PLAIN": "withoutAllColumns", "SHOP.TYPO": "notFound"},
+    }
+    joined = "\n".join(engine.connection.statements)
+    for value in ("SHOP", "ORDERS", "FREEPDB1", "c##dbzuser", "PLAIN"):
+        assert value not in joined, "values are compared in Python, never put into a statement"
+    assert engine.spec["sslMode"] == "disable", "the SEC-14 exception: the read is unencrypted"
+    assert engine.disposed is True
+
+
+def test_a_missing_setting_is_a_closed_word_and_an_unreadable_one_is_left_out() -> None:
+    answers = _good_answers(
+        **{
+            discover._CDC_ORACLE_LOG_MODE: [("NOARCHIVELOG",)],
+            discover._CDC_ORACLE_SUPPLEMENTAL: [("NO", "NO")],
+            discover._CDC_ORACLE_PRIVILEGES: [("CREATE SESSION",)],
+            discover._CDC_ORACLE_ROLES: [("SELECT_CATALOG_ROLE",)],
+            discover._CDC_ORACLE_LOG_GROUPS_CDB: RuntimeError("ORA-00942 secret text"),
+        }
+    )
+    result, _engine = _cdc_facts(answers)
+    facts = result["oracleSetup"]
+    assert facts["logMode"] == "noarchivelog" and facts["supplementalMin"] == "no"
+    assert "LOGMINING" in facts["missingPrivileges"] and "CREATE SESSION" not in facts["missingPrivileges"]
+    assert "SELECT_CATALOG_ROLE" not in facts["missingPrivileges"]
+    assert "tables" not in facts, "a statement that raised leaves its fact out"
+    assert "secret text" not in json.dumps(result)
+
+
+def test_database_level_all_column_logging_is_posted_as_a_fact() -> None:
+    result, _engine = _cdc_facts(_good_answers(**{discover._CDC_ORACLE_SUPPLEMENTAL: [("IMPLICIT", "YES")]}))
+    assert result["oracleSetup"]["supplementalMin"] == "implicit"
+    assert result["oracleSetup"]["supplementalAll"] is True
+
+
+def test_a_server_that_requires_encryption_is_posted_as_that_fact_and_nothing_else() -> None:
+    engine = _CdcEngine(error=RuntimeError("DPY-4011: ORA-12660: Encryption or crypto-checksumming parameters incompatible"))
+    result = discover.discover(
+        _CDC_ORACLE, _request("test"), backends=_backends(oracle_engine=lambda spec, secrets, *, resolve_checked: engine)
+    )
+    assert result["oracleSetup"] == {"encryptionRequired": True}
+    assert engine.disposed is True
+
+
+def test_another_connect_failure_is_classified_not_turned_into_a_fact() -> None:
+    engine = _CdcEngine(error=ConnectionRefusedError())
+    posted: list[dict] = []
+    error_class = discover.run_request(
+        _request("test"),
+        connector_loader=lambda cid: _CDC_ORACLE,
+        poster=posted.append,
+        backends=_backends(oracle_engine=lambda spec, secrets, *, resolve_checked: engine),
+    )
+    assert error_class == "unreachable"
+    assert posted == [{"requestId": "req-1", "kind": "test", "state": "failed", "errorClass": "unreachable"}]
+
+
+def test_an_oracle_change_capture_connector_lists_and_previews_nothing_here() -> None:
+    for kind in ("list", "preview"):
+        posted: list[dict] = []
+        error_class = discover.run_request(
+            _request(kind, object="SHOP.ORDERS"), connector_loader=lambda cid: _CDC_ORACLE, poster=posted.append
+        )
+        assert error_class == "not_supported"
+
+
+def test_without_a_pdb_the_non_container_views_are_read() -> None:
+    connector = {**_CDC_ORACLE, "dial": {k: v for k, v in _CDC_ORACLE["dial"].items() if k != "pdbName"}}
+    answers = _good_answers(
+        **{
+            discover._CDC_ORACLE_LOG_GROUPS: [("SHOP", "ORDERS")],
+            discover._CDC_ORACLE_TABLES: [("SHOP", "ORDERS"), ("SHOP", "PLAIN")],
+        }
+    )
+    engine = _CdcEngine(_DictConnection(answers))
+    result = discover.discover(
+        connector, _request("test"), backends=_backends(oracle_engine=lambda spec, secrets, *, resolve_checked: engine)
+    )
+    assert result["oracleSetup"]["tables"] == {
+        "SHOP.ORDERS": "allColumns", "SHOP.PLAIN": "withoutAllColumns", "SHOP.TYPO": "notFound",
+    }

@@ -462,6 +462,7 @@ def _classify_one(exc: BaseException) -> str | None:
             UnknownAdapter,
             SecretRefRejected,
             oracle_adapter.OracleTlsConfigError,
+            oracle_adapter.OracleServiceNameError,
             ssrf_guard_sftp_module.HostKeyMismatch,
             ssrf_guard_mongo_module.MongoConfigRejected,
             saas_adapter.SaasSetupRefused,

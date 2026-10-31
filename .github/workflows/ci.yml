@@ -914,11 +914,14 @@ jobs:
         if: always()
         run: docker compose -p g3ci down -v
 
-  # ── P5 (G4) acceptance (docs/plans/LAKEHOUSE-FOUNDATION-PLAN.md §3,
-  # docs/plans/P5-RESULT.md) — Debezium Server + debezium-server-iceberg
-  # captures a real Postgres table via logical replication; INSERT/UPDATE/
-  # DELETE are all visible in ClickHouse within the agreed latency, and
-  # replication-slot cleanup on connector delete is verified. WS5 item C3:
+  # ── G4 acceptance (SRC-4 slice 2, ADR 0016; docs/plans/P5-RESULT.md for the
+  # history) — PostgreSQL change capture on Kafka Connect: the connector is
+  # created through the API, INSERT/UPDATE/DELETE are all visible in ClickHouse
+  # within the agreed latency in both load modes, a pause and a restart of
+  # kafka-connect lose nothing, and the slot, publication and password file
+  # are gone after DELETE. The job restarts the kafka-connect container when
+  # the gate asks (the runner has no Docker access; see ops/g4/g4_test.py).
+  # WS5 item C3:
   # this job ALSO now needs the Dagster webserver/daemon and
   # lakehouse-api -- g4_test.py's step_wal_breach_produces_a_
   # silenceable_alert_instance (WS5 acceptance) logs into lakehouse-api,
@@ -929,7 +932,7 @@ jobs:
   # dagster-daemon set g3a-dagster/g3-maintenance already use, for the
   # same reason. See ops/g4/g4_test.py. ──
   g4-cdc:
-    name: Rust · G4 Debezium CDC into Bronze
+    name: Rust · G4 change capture into Bronze
     needs: [changes, images]
     if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
     runs-on: ubuntu-latest
@@ -989,34 +992,77 @@ jobs:
           OIDC_REDIRECT_URI=http://lakehouse-api:8080/api/auth/oidc/callback
           OIDC_JIT_PROVISIONING=true
           OIDC_ROLE_MAP=lakehouse-analysts=Analyst
+          # SRC-4: the change-capture applier's sensor reads the connector list
+          # as the ingest service identity (unset, it skips) and posts run
+          # reports as the pipeline-run identity; CI-ONLY throwaway values.
+          INGEST_SERVICE_TOKEN=ci-ingest-service-token-not-real-123
+          PIPELINE_RUN_TOKEN=ci-pipeline-run-token-not-real-123
           EOF
           # SEC-36: generated per run; no key-shaped literal in the repository.
           echo "CONNECTOR_SECRETS_KEY=$(openssl rand -base64 32)" >> .env
 
       # Fixture image, built here rather than shared; see `g3a-dagster`.
       - name: Build the oidc-mock fixture image
-        run: docker compose -p g4ci -f docker-compose.yml -f ops/g4/docker-compose.g4.override.yml --profile dagster build oidc-mock
+        run: docker compose -p g4ci -f docker-compose.yml -f ops/g4/docker-compose.g4.override.yml --profile dagster --profile cdc build oidc-mock
 
-      - name: Bring up Postgres/ClickHouse/RustFS/Lakekeeper, the demo CDC source, Debezium Server, and Dagster
+      - name: Bring up Postgres/ClickHouse/RustFS/Lakekeeper, Kafka, Kafka Connect, and Dagster
         # SRC-9 task 6: the `-f` pair on every compose call of this job (the
         # override adds the `file:` credential store and the internal-host
         # flag the connect and discover steps of the gate need).
         run: >
           docker compose -p g4ci -f docker-compose.yml -f ops/g4/docker-compose.g4.override.yml
-          --profile dagster up -d --no-build
+          --profile dagster --profile cdc up -d --no-build
           postgres clickhouse rustfs rustfs-bucket-init
           lakekeeper-db-init lakekeeper-migrate lakekeeper lakekeeper-warehouse-init
-          g4-source-init debezium-server
+          kafka kafka-connect
           lakehouse-api dagster-code-location dagster-webserver dagster-daemon
 
       - name: Run the G4 acceptance test inside the compose network
-        # `tee` and `-T`: the gate prints its connector table between two
-        # marker lines and the next step copies it to the job summary (same
-        # as g6-ingest). `shell: bash` for pipefail.
+        # The gate asks for one container restart (kafka-connect, during a
+        # stream of changes) by printing a marker line; the runner has no Docker
+        # access, so this step watches its log, restarts the container, and
+        # tells the runner with a file. `-T`: no TTY. `shell: bash` for
+        # pipefail. The log is streamed with `tail -f` and printed whole by
+        # the summary step after.
         shell: bash
         run: |
-          docker compose -p g4ci -f docker-compose.yml -f ops/g4/docker-compose.g4.override.yml \
-            --profile dagster run --rm -T g4-test-runner 2>&1 | tee "$RUNNER_TEMP/g4-run.log"
+          set -u
+          compose() {
+            docker compose -p g4ci -f docker-compose.yml -f ops/g4/docker-compose.g4.override.yml --profile dagster --profile cdc "$@"
+          }
+          log="$RUNNER_TEMP/g4-run.log"
+          : > "$log"
+          compose run --rm -T --name g4-runner g4-test-runner > "$log" 2>&1 &
+          run_pid=$!
+          tail -n +1 -f "$log" &
+          tail_pid=$!
+          restarted=0
+          stopped=0
+          started=0
+          while kill -0 "$run_pid" 2>/dev/null; do
+            if [ "$restarted" = 0 ] && grep -q '^G4-RESTART-KAFKA-CONNECT$' "$log"; then
+              compose restart kafka-connect
+              docker exec g4-runner touch /tmp/g4-kafka-connect-restarted
+              restarted=1
+            fi
+            # The lag alert step (SRC-4 S4-h, AC7): stop kafka-connect, and later start it again.
+            if [ "$stopped" = 0 ] && grep -q '^G4-STOP-KAFKA-CONNECT$' "$log"; then
+              compose stop kafka-connect
+              docker exec g4-runner touch /tmp/g4-kafka-connect-stopped
+              stopped=1
+            fi
+            if [ "$started" = 0 ] && grep -q '^G4-START-KAFKA-CONNECT$' "$log"; then
+              compose start kafka-connect
+              docker exec g4-runner touch /tmp/g4-kafka-connect-started
+              started=1
+            fi
+            sleep 2
+          done
+          status=0
+          wait "$run_pid" || status=$?
+          sleep 1
+          kill "$tail_pid" 2>/dev/null || true
+          exit "$status"
 
       - name: Add the connector gate table to the job summary
         if: always()
@@ -1029,11 +1075,608 @@ jobs:
 
       - name: Compose logs (on failure)
         if: failure()
-        run: docker compose -p g4ci -f docker-compose.yml -f ops/g4/docker-compose.g4.override.yml --profile dagster logs
+        run: docker compose -p g4ci -f docker-compose.yml -f ops/g4/docker-compose.g4.override.yml --profile dagster --profile cdc logs
 
       - name: Tear down
         if: always()
-        run: docker compose -p g4ci -f docker-compose.yml -f ops/g4/docker-compose.g4.override.yml --profile dagster down -v
+        run: docker compose -p g4ci -f docker-compose.yml -f ops/g4/docker-compose.g4.override.yml --profile dagster --profile cdc down -v
+
+  # ── G4 for MySQL (SRC-4 slice 3, plan T3.7): the `g4-cdc` job's shape with the `mysql-g6`
+  # fixture and the layered override files; see ops/g4/g4_mysql_test.py. ──
+  g4-mysql:
+    name: Rust · G4 MySQL change capture into Bronze
+    needs: [changes, images]
+    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      LAKEHOUSE_API_IMAGE: rantai-lakehouse-api:ci
+      LAKEHOUSE_DAGSTER_IMAGE: rantai-lakehouse-dagster:ci
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # Images from the `images` job; see `g3a-dagster`'s download step.
+      - name: Download image artifacts (lakehouse-api + dagster)
+        uses: actions/download-artifact@v8
+        with:
+          pattern: image-lakehouse-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/images
+
+      - name: Load images
+        run: |
+          for f in "$RUNNER_TEMP"/images/*.tar.zst; do
+            zstd -dc "$f" | docker load
+          done
+
+      - name: Write CI-only .env
+        run: |
+          cat > .env <<'EOF'
+          AUTH_BOOTSTRAP_EMAIL=ci@example.com
+          AUTH_BOOTSTRAP_PASSWORD=ci-password-not-real-123
+          # SEC-18: docker-compose.yml has no default credentials. CI-ONLY
+          # throwaway values for this job's own throwaway stack; they protect
+          # nothing and are never used outside it.
+          POSTGRES_PASSWORD=ci-only-pg-password-0001
+          RUSTFS_ACCESS_KEY=ci-only-rustfs-access
+          RUSTFS_SECRET_KEY=ci-only-rustfs-secret-0001
+          LAKEKEEPER_ENCRYPTION_KEY=ci-only-lakekeeper-key-0001
+          LAKEKEEPER_BASE_URI=http://lakekeeper:8181
+          DAGSTER_URL=http://dagster-webserver:3000/graphql
+          # WS5 item C3: step_wal_breach_produces_a_silenceable_alert_instance
+          # calls POST /api/alerts/run with a bootstrap-admin (human)
+          # session, never a service-identity principal. With
+          # ALERTS_RUN_TOKEN unset, routes::alerts::check_run_token
+          # (D4, fail-closed) refuses anything but a service principal,
+          # so the gate needs a shared token here -- an obviously-fake
+          # CI value, same style as AUTH_BOOTSTRAP_PASSWORD above.
+          ALERTS_RUN_TOKEN=ci-alerts-run-token-not-real-123
+          # The OIDC authorization-code round trip (g4_test.py's last
+          # step) needs lakehouse-api pointed at oidc-mock; unset, the
+          # /api/auth/oidc/* routes answer 503 "not configured". The
+          # client id is oidc-mock's configured token audience.
+          OIDC_ISSUER=http://oidc-mock:8090
+          OIDC_CLIENT_ID=lakekeeper
+          OIDC_JWKS_URL=http://oidc-mock:8090/jwks.json
+          OIDC_AUTHORIZE_URL=http://oidc-mock:8090/authorize
+          OIDC_TOKEN_URL=http://oidc-mock:8090/token
+          OIDC_REDIRECT_URI=http://lakehouse-api:8080/api/auth/oidc/callback
+          OIDC_JIT_PROVISIONING=true
+          OIDC_ROLE_MAP=lakehouse-analysts=Analyst
+          # SRC-4: the change-capture applier's sensor reads the connector list
+          # as the ingest service identity (unset, it skips) and posts run
+          # reports as the pipeline-run identity; CI-ONLY throwaway values.
+          INGEST_SERVICE_TOKEN=ci-ingest-service-token-not-real-123
+          PIPELINE_RUN_TOKEN=ci-pipeline-run-token-not-real-123
+          # The g6 override this job layers under its own (the file credential store, the
+          # internal-host switches) interpolates the whole fixture set with `${VAR:?}`:
+          # CI-ONLY throwaway values, as in `g6-ingest`; this gate uses only the MySQL ones.
+          MYSQL_ROOT_PASSWORD=ci-mysql-not-real-123
+          CONNECTOR_MYSQL_PASSWORD=ci-mysql-connector-not-real-123
+          MSSQL_SA_PASSWORD=Ci-Mssql-Not-Real-123!
+          MARIADB_G6_ROOT_PASSWORD=ci-mariadb-not-real-123
+          CONNECTOR_MARIADB_PASSWORD=ci-mariadb-connector-not-real-123
+          SFTP_G6_PASSWORD=ci-sftp-not-real-123
+          MONGO_G6_ROOT_USER=ci-mongo-root-not-real
+          MONGO_G6_ROOT_PASSWORD=ci-mongo-not-real-123
+          EOF
+          # SEC-36: generated per run; no key-shaped literal in the repository.
+          echo "CONNECTOR_SECRETS_KEY=$(openssl rand -base64 32)" >> .env
+
+      # Fixture image, built here rather than shared; see `g3a-dagster`.
+      - name: Build the oidc-mock fixture image
+        run: docker compose -p g4myci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml -f ops/g4/docker-compose.g4-mysql.override.yml --profile g6-sql --profile dagster --profile cdc --profile g4-mysql build oidc-mock
+
+      - name: Bring up Postgres/ClickHouse/RustFS/Lakekeeper, Kafka, Kafka Connect, and Dagster
+        # SRC-9 task 6: the `-f` pair on every compose call of this job (the
+        # override adds the `file:` credential store and the internal-host
+        # flag the connect and discover steps of the gate need).
+        run: >
+          docker compose -p g4myci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml -f ops/g4/docker-compose.g4-mysql.override.yml
+          --profile g6-sql --profile dagster --profile cdc --profile g4-mysql up -d --no-build
+          postgres clickhouse rustfs rustfs-bucket-init
+          lakekeeper-db-init lakekeeper-migrate lakekeeper lakekeeper-warehouse-init
+          kafka kafka-connect mysql-g6
+          lakehouse-api dagster-code-location dagster-webserver dagster-daemon
+
+      - name: Run the G4 acceptance test inside the compose network
+        # The gate asks for one container restart (kafka-connect, during a
+        # stream of changes) by printing a marker line; the runner has no Docker
+        # access, so this step watches its log, restarts the container, and
+        # tells the runner with a file. `-T`: no TTY. `shell: bash` for
+        # pipefail. The log is streamed with `tail -f` and printed whole by
+        # the summary step after.
+        shell: bash
+        run: |
+          set -u
+          compose() {
+            docker compose -p g4myci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml -f ops/g4/docker-compose.g4-mysql.override.yml --profile g6-sql --profile dagster --profile cdc --profile g4-mysql "$@"
+          }
+          log="$RUNNER_TEMP/g4-run.log"
+          : > "$log"
+          compose run --rm -T --name g4-runner g4-mysql-test-runner > "$log" 2>&1 &
+          run_pid=$!
+          tail -n +1 -f "$log" &
+          tail_pid=$!
+          restarted=0
+          while kill -0 "$run_pid" 2>/dev/null; do
+            if [ "$restarted" = 0 ] && grep -q '^G4-RESTART-KAFKA-CONNECT$' "$log"; then
+              compose restart kafka-connect
+              docker exec g4-runner touch /tmp/g4-kafka-connect-restarted
+              restarted=1
+            fi
+            sleep 2
+          done
+          status=0
+          wait "$run_pid" || status=$?
+          sleep 1
+          kill "$tail_pid" 2>/dev/null || true
+          exit "$status"
+
+      - name: Add the connector gate table to the job summary
+        if: always()
+        shell: bash
+        run: |
+          if [ -f "$RUNNER_TEMP/g4-run.log" ]; then
+            awk '/^GATE-SUMMARY-BEGIN$/{inside=1; next} /^GATE-SUMMARY-END$/{inside=0} inside' \
+              "$RUNNER_TEMP/g4-run.log" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Compose logs (on failure)
+        if: failure()
+        run: docker compose -p g4myci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml -f ops/g4/docker-compose.g4-mysql.override.yml --profile g6-sql --profile dagster --profile cdc --profile g4-mysql logs
+
+      - name: Tear down
+        if: always()
+        run: docker compose -p g4myci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml -f ops/g4/docker-compose.g4-mysql.override.yml --profile g6-sql --profile dagster --profile cdc --profile g4-mysql down -v
+
+  # ── G4 for MongoDB (SRC-4 slice 5, plan T5.7): the `g4-mysql` job's shape with its own one-member
+  # replica-set fixture (`mongo-cdc-g4`) and the layered override files; see ops/g4/g4_mongo_test.py. ──
+  g4-mongo:
+    name: Rust · G4 MongoDB change capture into Bronze
+    needs: [changes, images]
+    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      LAKEHOUSE_API_IMAGE: rantai-lakehouse-api:ci
+      LAKEHOUSE_DAGSTER_IMAGE: rantai-lakehouse-dagster:ci
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # Images from the `images` job; see `g3a-dagster`'s download step.
+      - name: Download image artifacts (lakehouse-api + dagster)
+        uses: actions/download-artifact@v8
+        with:
+          pattern: image-lakehouse-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/images
+
+      - name: Load images
+        run: |
+          for f in "$RUNNER_TEMP"/images/*.tar.zst; do
+            zstd -dc "$f" | docker load
+          done
+
+      - name: Write CI-only .env
+        run: |
+          cat > .env <<'EOF'
+          AUTH_BOOTSTRAP_EMAIL=ci@example.com
+          AUTH_BOOTSTRAP_PASSWORD=ci-password-not-real-123
+          # SEC-18: docker-compose.yml has no default credentials. CI-ONLY
+          # throwaway values for this job's own throwaway stack; they protect
+          # nothing and are never used outside it.
+          POSTGRES_PASSWORD=ci-only-pg-password-0001
+          RUSTFS_ACCESS_KEY=ci-only-rustfs-access
+          RUSTFS_SECRET_KEY=ci-only-rustfs-secret-0001
+          LAKEKEEPER_ENCRYPTION_KEY=ci-only-lakekeeper-key-0001
+          LAKEKEEPER_BASE_URI=http://lakekeeper:8181
+          DAGSTER_URL=http://dagster-webserver:3000/graphql
+          # WS5 item C3: step_wal_breach_produces_a_silenceable_alert_instance
+          # calls POST /api/alerts/run with a bootstrap-admin (human)
+          # session, never a service-identity principal. With
+          # ALERTS_RUN_TOKEN unset, routes::alerts::check_run_token
+          # (D4, fail-closed) refuses anything but a service principal,
+          # so the gate needs a shared token here -- an obviously-fake
+          # CI value, same style as AUTH_BOOTSTRAP_PASSWORD above.
+          ALERTS_RUN_TOKEN=ci-alerts-run-token-not-real-123
+          # The OIDC authorization-code round trip (g4_test.py's last
+          # step) needs lakehouse-api pointed at oidc-mock; unset, the
+          # /api/auth/oidc/* routes answer 503 "not configured". The
+          # client id is oidc-mock's configured token audience.
+          OIDC_ISSUER=http://oidc-mock:8090
+          OIDC_CLIENT_ID=lakekeeper
+          OIDC_JWKS_URL=http://oidc-mock:8090/jwks.json
+          OIDC_AUTHORIZE_URL=http://oidc-mock:8090/authorize
+          OIDC_TOKEN_URL=http://oidc-mock:8090/token
+          OIDC_REDIRECT_URI=http://lakehouse-api:8080/api/auth/oidc/callback
+          OIDC_JIT_PROVISIONING=true
+          OIDC_ROLE_MAP=lakehouse-analysts=Analyst
+          # SRC-4: the change-capture applier's sensor reads the connector list
+          # as the ingest service identity (unset, it skips) and posts run
+          # reports as the pipeline-run identity; CI-ONLY throwaway values.
+          INGEST_SERVICE_TOKEN=ci-ingest-service-token-not-real-123
+          PIPELINE_RUN_TOKEN=ci-pipeline-run-token-not-real-123
+          # The g6 override this job layers under its own (the file credential store, the
+          # internal-host switches) interpolates the whole fixture set with `${VAR:?}`:
+          # CI-ONLY throwaway values, as in `g6-ingest`; this gate uses only the MONGO_CDC_G4_ ones.
+          MYSQL_ROOT_PASSWORD=ci-mysql-not-real-123
+          CONNECTOR_MYSQL_PASSWORD=ci-mysql-connector-not-real-123
+          MSSQL_SA_PASSWORD=Ci-Mssql-Not-Real-123!
+          MARIADB_G6_ROOT_PASSWORD=ci-mariadb-not-real-123
+          CONNECTOR_MARIADB_PASSWORD=ci-mariadb-connector-not-real-123
+          SFTP_G6_PASSWORD=ci-sftp-not-real-123
+          MONGO_G6_ROOT_USER=ci-mongo-root-not-real
+          MONGO_G6_ROOT_PASSWORD=ci-mongo-not-real-123
+          MONGO_CDC_G4_ROOT_USER=ci-mongocdc-root-not-real
+          MONGO_CDC_G4_ROOT_PASSWORD=ci-mongocdc-not-real-123
+          CONNECTOR_MONGO_CDC_PASSWORD=ci-mongocdc-connector-not-real-123
+          EOF
+          # SEC-36: generated per run; no key-shaped literal in the repository.
+          echo "CONNECTOR_SECRETS_KEY=$(openssl rand -base64 32)" >> .env
+
+      # Fixture image, built here rather than shared; see `g3a-dagster`.
+      - name: Build the oidc-mock fixture image
+        run: docker compose -p g4mgci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml -f ops/g4/docker-compose.g4-mongo.override.yml --profile dagster --profile cdc --profile g4-mongo build oidc-mock
+
+      - name: Bring up Postgres/ClickHouse/RustFS/Lakekeeper, Kafka, Kafka Connect, and Dagster
+        # SRC-9 task 6: the `-f` pair on every compose call of this job (the
+        # override adds the `file:` credential store and the internal-host
+        # flag the connect and discover steps of the gate need).
+        run: >
+          docker compose -p g4mgci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml -f ops/g4/docker-compose.g4-mongo.override.yml
+          --profile dagster --profile cdc --profile g4-mongo up -d --no-build
+          postgres clickhouse rustfs rustfs-bucket-init
+          lakekeeper-db-init lakekeeper-migrate lakekeeper lakekeeper-warehouse-init
+          kafka kafka-connect mongo-cdc-g4 mongo-cdc-g4-init
+          lakehouse-api dagster-code-location dagster-webserver dagster-daemon
+
+      - name: Run the G4 acceptance test inside the compose network
+        # The gate asks for one container restart (kafka-connect, during a
+        # stream of changes) by printing a marker line; the runner has no Docker
+        # access, so this step watches its log, restarts the container, and
+        # tells the runner with a file. `-T`: no TTY. `shell: bash` for
+        # pipefail. The log is streamed with `tail -f` and printed whole by
+        # the summary step after.
+        shell: bash
+        run: |
+          set -u
+          compose() {
+            docker compose -p g4mgci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml -f ops/g4/docker-compose.g4-mongo.override.yml --profile dagster --profile cdc --profile g4-mongo "$@"
+          }
+          log="$RUNNER_TEMP/g4-run.log"
+          : > "$log"
+          compose run --rm -T --name g4-runner g4-mongo-test-runner > "$log" 2>&1 &
+          run_pid=$!
+          tail -n +1 -f "$log" &
+          tail_pid=$!
+          restarted=0
+          while kill -0 "$run_pid" 2>/dev/null; do
+            if [ "$restarted" = 0 ] && grep -q '^G4-RESTART-KAFKA-CONNECT$' "$log"; then
+              compose restart kafka-connect
+              docker exec g4-runner touch /tmp/g4-kafka-connect-restarted
+              restarted=1
+            fi
+            sleep 2
+          done
+          status=0
+          wait "$run_pid" || status=$?
+          sleep 1
+          kill "$tail_pid" 2>/dev/null || true
+          exit "$status"
+
+      - name: Add the connector gate table to the job summary
+        if: always()
+        shell: bash
+        run: |
+          if [ -f "$RUNNER_TEMP/g4-run.log" ]; then
+            awk '/^GATE-SUMMARY-BEGIN$/{inside=1; next} /^GATE-SUMMARY-END$/{inside=0} inside' \
+              "$RUNNER_TEMP/g4-run.log" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Compose logs (on failure)
+        if: failure()
+        run: docker compose -p g4mgci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml -f ops/g4/docker-compose.g4-mongo.override.yml --profile dagster --profile cdc --profile g4-mongo logs
+
+      - name: Tear down
+        if: always()
+        run: docker compose -p g4mgci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml -f ops/g4/docker-compose.g4-mongo.override.yml --profile dagster --profile cdc --profile g4-mongo down -v
+
+  g4-oracle:
+    name: Rust · G4 Oracle change capture into Bronze
+    needs: [changes, images]
+    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      LAKEHOUSE_API_IMAGE: rantai-lakehouse-api:ci
+      LAKEHOUSE_DAGSTER_IMAGE: rantai-lakehouse-dagster:ci
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # Images from the `images` job; see `g3a-dagster`'s download step.
+      - name: Download image artifacts (lakehouse-api + dagster)
+        uses: actions/download-artifact@v8
+        with:
+          pattern: image-lakehouse-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/images
+
+      - name: Load images
+        run: |
+          for f in "$RUNNER_TEMP"/images/*.tar.zst; do
+            zstd -dc "$f" | docker load
+          done
+
+      - name: Write CI-only .env
+        run: |
+          cat > .env <<'EOF'
+          AUTH_BOOTSTRAP_EMAIL=ci@example.com
+          AUTH_BOOTSTRAP_PASSWORD=ci-password-not-real-123
+          # SEC-18: docker-compose.yml has no default credentials. CI-ONLY
+          # throwaway values for this job's own throwaway stack; they protect
+          # nothing and are never used outside it.
+          POSTGRES_PASSWORD=ci-only-pg-password-0001
+          RUSTFS_ACCESS_KEY=ci-only-rustfs-access
+          RUSTFS_SECRET_KEY=ci-only-rustfs-secret-0001
+          LAKEKEEPER_ENCRYPTION_KEY=ci-only-lakekeeper-key-0001
+          LAKEKEEPER_BASE_URI=http://lakekeeper:8181
+          DAGSTER_URL=http://dagster-webserver:3000/graphql
+          # WS5 item C3: step_wal_breach_produces_a_silenceable_alert_instance
+          # calls POST /api/alerts/run with a bootstrap-admin (human)
+          # session, never a service-identity principal. With
+          # ALERTS_RUN_TOKEN unset, routes::alerts::check_run_token
+          # (D4, fail-closed) refuses anything but a service principal,
+          # so the gate needs a shared token here -- an obviously-fake
+          # CI value, same style as AUTH_BOOTSTRAP_PASSWORD above.
+          ALERTS_RUN_TOKEN=ci-alerts-run-token-not-real-123
+          # The OIDC authorization-code round trip (g4_test.py's last
+          # step) needs lakehouse-api pointed at oidc-mock; unset, the
+          # /api/auth/oidc/* routes answer 503 "not configured". The
+          # client id is oidc-mock's configured token audience.
+          OIDC_ISSUER=http://oidc-mock:8090
+          OIDC_CLIENT_ID=lakekeeper
+          OIDC_JWKS_URL=http://oidc-mock:8090/jwks.json
+          OIDC_AUTHORIZE_URL=http://oidc-mock:8090/authorize
+          OIDC_TOKEN_URL=http://oidc-mock:8090/token
+          OIDC_REDIRECT_URI=http://lakehouse-api:8080/api/auth/oidc/callback
+          OIDC_JIT_PROVISIONING=true
+          OIDC_ROLE_MAP=lakehouse-analysts=Analyst
+          # SRC-4: the change-capture applier's sensor reads the connector list
+          # as the ingest service identity (unset, it skips) and posts run
+          # reports as the pipeline-run identity; CI-ONLY throwaway values.
+          INGEST_SERVICE_TOKEN=ci-ingest-service-token-not-real-123
+          PIPELINE_RUN_TOKEN=ci-pipeline-run-token-not-real-123
+          # The Oracle fixture (ops/g6/docker-compose.g6-oracle.override.yml): alphanumeric on
+          # purpose, the gate puts them in quoted DDL. CI-ONLY throwaway values for this stack.
+          ORACLE_G6_PASSWORD=CiOracleSysNotReal123
+          CONNECTOR_ORACLE_PASSWORD=CiOracleConnectorNotReal123
+          G4_ORACLE_CDC_PASSWORD=CiG4OracleCdcNotReal123
+          EOF
+          # SEC-36: generated per run; no key-shaped literal in the repository.
+          echo "CONNECTOR_SECRETS_KEY=$(openssl rand -base64 32)" >> .env
+
+      # Fixture image, built here rather than shared; see `g3a-dagster`.
+      - name: Build the oidc-mock fixture image
+        run: docker compose -p g4oraci -f docker-compose.yml -f ops/g6/docker-compose.g6-oracle.override.yml -f ops/g4/docker-compose.g4-oracle.override.yml --profile g6-oracle --profile dagster --profile cdc --profile g4-oracle build oidc-mock
+
+      - name: Bring up Postgres/ClickHouse/RustFS/Lakekeeper, Kafka, Kafka Connect, and Dagster
+        # SRC-9 task 6: the `-f` pair on every compose call of this job (the
+        # override adds the `file:` credential store and the internal-host
+        # flag the connect and discover steps of the gate need).
+        run: >
+          docker compose -p g4oraci -f docker-compose.yml -f ops/g6/docker-compose.g6-oracle.override.yml -f ops/g4/docker-compose.g4-oracle.override.yml
+          --profile g6-oracle --profile dagster --profile cdc --profile g4-oracle up -d --no-build
+          postgres clickhouse rustfs rustfs-bucket-init
+          lakekeeper-db-init lakekeeper-migrate lakekeeper lakekeeper-warehouse-init
+          kafka kafka-connect oracle-g6
+          lakehouse-api dagster-code-location dagster-webserver dagster-daemon
+
+      - name: Run the G4 acceptance test inside the compose network
+        # The gate asks for one container restart (kafka-connect, during a
+        # stream of changes) by printing a marker line; the runner has no Docker
+        # access, so this step watches its log, restarts the container, and
+        # tells the runner with a file. `-T`: no TTY. `shell: bash` for
+        # pipefail. The log is streamed with `tail -f` and printed whole by
+        # the summary step after.
+        shell: bash
+        run: |
+          set -u
+          compose() {
+            docker compose -p g4oraci -f docker-compose.yml -f ops/g6/docker-compose.g6-oracle.override.yml -f ops/g4/docker-compose.g4-oracle.override.yml --profile g6-oracle --profile dagster --profile cdc --profile g4-oracle "$@"
+          }
+          log="$RUNNER_TEMP/g4-run.log"
+          : > "$log"
+          compose run --rm -T --name g4-runner g4-oracle-test-runner > "$log" 2>&1 &
+          run_pid=$!
+          tail -n +1 -f "$log" &
+          tail_pid=$!
+          restarted=0
+          while kill -0 "$run_pid" 2>/dev/null; do
+            if [ "$restarted" = 0 ] && grep -q '^G4-RESTART-KAFKA-CONNECT$' "$log"; then
+              compose restart kafka-connect
+              docker exec g4-runner touch /tmp/g4-kafka-connect-restarted
+              restarted=1
+            fi
+            sleep 2
+          done
+          status=0
+          wait "$run_pid" || status=$?
+          sleep 1
+          kill "$tail_pid" 2>/dev/null || true
+          exit "$status"
+
+      - name: Add the connector gate table to the job summary
+        if: always()
+        shell: bash
+        run: |
+          if [ -f "$RUNNER_TEMP/g4-run.log" ]; then
+            awk '/^GATE-SUMMARY-BEGIN$/{inside=1; next} /^GATE-SUMMARY-END$/{inside=0} inside' \
+              "$RUNNER_TEMP/g4-run.log" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Compose logs (on failure)
+        if: failure()
+        run: docker compose -p g4oraci -f docker-compose.yml -f ops/g6/docker-compose.g6-oracle.override.yml -f ops/g4/docker-compose.g4-oracle.override.yml --profile g6-oracle --profile dagster --profile cdc --profile g4-oracle logs
+
+      - name: Tear down
+        if: always()
+        run: docker compose -p g4oraci -f docker-compose.yml -f ops/g6/docker-compose.g6-oracle.override.yml -f ops/g4/docker-compose.g4-oracle.override.yml --profile g6-oracle --profile dagster --profile cdc --profile g4-oracle down -v
+
+  # ── G4 for SQL Server (SRC-4 slice 3, plan T3.8): the `g4-cdc` job's shape with the `mssql-g6` (SQL Server Agent on)
+  # fixture and the layered override files; see ops/g4/g4_mssql_test.py. ──
+  g4-mssql:
+    name: Rust · G4 SQL Server change capture into Bronze
+    needs: [changes, images]
+    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      LAKEHOUSE_API_IMAGE: rantai-lakehouse-api:ci
+      LAKEHOUSE_DAGSTER_IMAGE: rantai-lakehouse-dagster:ci
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # Images from the `images` job; see `g3a-dagster`'s download step.
+      - name: Download image artifacts (lakehouse-api + dagster)
+        uses: actions/download-artifact@v8
+        with:
+          pattern: image-lakehouse-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/images
+
+      - name: Load images
+        run: |
+          for f in "$RUNNER_TEMP"/images/*.tar.zst; do
+            zstd -dc "$f" | docker load
+          done
+
+      - name: Write CI-only .env
+        run: |
+          cat > .env <<'EOF'
+          AUTH_BOOTSTRAP_EMAIL=ci@example.com
+          AUTH_BOOTSTRAP_PASSWORD=ci-password-not-real-123
+          # SEC-18: docker-compose.yml has no default credentials. CI-ONLY
+          # throwaway values for this job's own throwaway stack; they protect
+          # nothing and are never used outside it.
+          POSTGRES_PASSWORD=ci-only-pg-password-0001
+          RUSTFS_ACCESS_KEY=ci-only-rustfs-access
+          RUSTFS_SECRET_KEY=ci-only-rustfs-secret-0001
+          LAKEKEEPER_ENCRYPTION_KEY=ci-only-lakekeeper-key-0001
+          LAKEKEEPER_BASE_URI=http://lakekeeper:8181
+          DAGSTER_URL=http://dagster-webserver:3000/graphql
+          # WS5 item C3: step_wal_breach_produces_a_silenceable_alert_instance
+          # calls POST /api/alerts/run with a bootstrap-admin (human)
+          # session, never a service-identity principal. With
+          # ALERTS_RUN_TOKEN unset, routes::alerts::check_run_token
+          # (D4, fail-closed) refuses anything but a service principal,
+          # so the gate needs a shared token here -- an obviously-fake
+          # CI value, same style as AUTH_BOOTSTRAP_PASSWORD above.
+          ALERTS_RUN_TOKEN=ci-alerts-run-token-not-real-123
+          # The OIDC authorization-code round trip (g4_test.py's last
+          # step) needs lakehouse-api pointed at oidc-mock; unset, the
+          # /api/auth/oidc/* routes answer 503 "not configured". The
+          # client id is oidc-mock's configured token audience.
+          OIDC_ISSUER=http://oidc-mock:8090
+          OIDC_CLIENT_ID=lakekeeper
+          OIDC_JWKS_URL=http://oidc-mock:8090/jwks.json
+          OIDC_AUTHORIZE_URL=http://oidc-mock:8090/authorize
+          OIDC_TOKEN_URL=http://oidc-mock:8090/token
+          OIDC_REDIRECT_URI=http://lakehouse-api:8080/api/auth/oidc/callback
+          OIDC_JIT_PROVISIONING=true
+          OIDC_ROLE_MAP=lakehouse-analysts=Analyst
+          # SRC-4: the change-capture applier's sensor reads the connector list
+          # as the ingest service identity (unset, it skips) and posts run
+          # reports as the pipeline-run identity; CI-ONLY throwaway values.
+          INGEST_SERVICE_TOKEN=ci-ingest-service-token-not-real-123
+          PIPELINE_RUN_TOKEN=ci-pipeline-run-token-not-real-123
+          # The g6 override this job layers under its own (the file credential store, the
+          # internal-host switches) interpolates the whole fixture set with `${VAR:?}`:
+          # CI-ONLY throwaway values, as in `g6-ingest`; this gate uses only the SQL Server ones.
+          MYSQL_ROOT_PASSWORD=ci-mysql-not-real-123
+          CONNECTOR_MYSQL_PASSWORD=ci-mysql-connector-not-real-123
+          MSSQL_SA_PASSWORD=Ci-Mssql-Not-Real-123!
+          MARIADB_G6_ROOT_PASSWORD=ci-mariadb-not-real-123
+          CONNECTOR_MARIADB_PASSWORD=ci-mariadb-connector-not-real-123
+          SFTP_G6_PASSWORD=ci-sftp-not-real-123
+          MONGO_G6_ROOT_USER=ci-mongo-root-not-real
+          MONGO_G6_ROOT_PASSWORD=ci-mongo-not-real-123
+          # The least-privilege SQL Server login of this gate (it meets the complexity rule).
+          G4_MSSQL_CDC_PASSWORD=Ci-G4-Cdc-Not-Real-123!
+          EOF
+          # SEC-36: generated per run; no key-shaped literal in the repository.
+          echo "CONNECTOR_SECRETS_KEY=$(openssl rand -base64 32)" >> .env
+
+      # Fixture image, built here rather than shared; see `g3a-dagster`.
+      - name: Build the oidc-mock fixture image
+        run: docker compose -p g4msci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml -f ops/g4/docker-compose.g4-mssql.override.yml --profile g6-sql --profile dagster --profile cdc --profile g4-mssql build oidc-mock
+
+      - name: Bring up Postgres/ClickHouse/RustFS/Lakekeeper, Kafka, Kafka Connect, and Dagster
+        # SRC-9 task 6: the `-f` pair on every compose call of this job (the
+        # override adds the `file:` credential store and the internal-host
+        # flag the connect and discover steps of the gate need).
+        run: >
+          docker compose -p g4msci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml -f ops/g4/docker-compose.g4-mssql.override.yml
+          --profile g6-sql --profile dagster --profile cdc --profile g4-mssql up -d --no-build
+          postgres clickhouse rustfs rustfs-bucket-init
+          lakekeeper-db-init lakekeeper-migrate lakekeeper lakekeeper-warehouse-init
+          kafka kafka-connect mssql-g6
+          lakehouse-api dagster-code-location dagster-webserver dagster-daemon
+
+      - name: Run the G4 acceptance test inside the compose network
+        # The gate asks for one container restart (kafka-connect, during a
+        # stream of changes) by printing a marker line; the runner has no Docker
+        # access, so this step watches its log, restarts the container, and
+        # tells the runner with a file. `-T`: no TTY. `shell: bash` for
+        # pipefail. The log is streamed with `tail -f` and printed whole by
+        # the summary step after.
+        shell: bash
+        run: |
+          set -u
+          compose() {
+            docker compose -p g4msci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml -f ops/g4/docker-compose.g4-mssql.override.yml --profile g6-sql --profile dagster --profile cdc --profile g4-mssql "$@"
+          }
+          log="$RUNNER_TEMP/g4-run.log"
+          : > "$log"
+          compose run --rm -T --name g4-runner g4-mssql-test-runner > "$log" 2>&1 &
+          run_pid=$!
+          tail -n +1 -f "$log" &
+          tail_pid=$!
+          restarted=0
+          while kill -0 "$run_pid" 2>/dev/null; do
+            if [ "$restarted" = 0 ] && grep -q '^G4-RESTART-KAFKA-CONNECT$' "$log"; then
+              compose restart kafka-connect
+              docker exec g4-runner touch /tmp/g4-kafka-connect-restarted
+              restarted=1
+            fi
+            sleep 2
+          done
+          status=0
+          wait "$run_pid" || status=$?
+          sleep 1
+          kill "$tail_pid" 2>/dev/null || true
+          exit "$status"
+
+      - name: Add the connector gate table to the job summary
+        if: always()
+        shell: bash
+        run: |
+          if [ -f "$RUNNER_TEMP/g4-run.log" ]; then
+            awk '/^GATE-SUMMARY-BEGIN$/{inside=1; next} /^GATE-SUMMARY-END$/{inside=0} inside' \
+              "$RUNNER_TEMP/g4-run.log" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Compose logs (on failure)
+        if: failure()
+        run: docker compose -p g4msci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml -f ops/g4/docker-compose.g4-mssql.override.yml --profile g6-sql --profile dagster --profile cdc --profile g4-mssql logs
+
+      - name: Tear down
+        if: always()
+        run: docker compose -p g4msci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml -f ops/g4/docker-compose.g4-mssql.override.yml --profile g6-sql --profile dagster --profile cdc --profile g4-mssql down -v
 
   # ── G10 (SEC-3) acceptance — a real sign-in through a real OIDC provider:
   # Keycloak answers the discovery document, the console's authorization-code
@@ -1215,15 +1858,12 @@ jobs:
         # profiles: this project also activates "dagster" (for
         # dagster-webserver/-daemon, which g6_ingest_matrix_test.py polls
         # while a triggered connector run executes), and that profile
-        # also contains `debezium-server`, pinned to a Debezium image
-        # digest no longer resolvable upstream (g4-cdc's own known,
-        # unrepinned gap — a human decision, out of this job's scope). A
-        # bare `up` with no service names starts every service in an
-        # active profile, including that one, and fails the whole step;
-        # naming exactly what the SQL half of
+        # also holds other gates' runners and source fixtures (`SRC-4` slice 2
+        # removed `debezium-server`, which used to be the one that failed a
+        # bare `up`). A bare `up` with no service names starts every service
+        # in an active profile; naming exactly what the SQL half of
         # `ops/g6/g6_ingest_matrix_test.py` needs starts only those
-        # services' own dependency closures, which does not reach
-        # `debezium-server`. `--profile g6-sql`, not `g6`: the runner's
+        # services' own dependency closures. `--profile g6-sql`, not `g6`: the runner's
         # `depends_on` then skips the fixtures of the other half.
         run: >
           docker compose -p g6ci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml
@@ -1289,7 +1929,7 @@ jobs:
 
   # ── SRC-9 decision 9: the second half of the G6 gate (G6_GROUP=other),
   # in a job of its own so each half stays under 20 minutes: object storage,
-  # REST, MongoDB, Kafka and SFTP, the MongoDB Debezium-template check, and
+  # REST, MongoDB, Kafka and SFTP, and
   # the SEPARATE, override-free link-local project (it needs a Kafka
   # fixture). It brings up only the fixtures these need (profile `g6-other`,
   # no MySQL, MariaDB, SQL Server or `g3a-source-init`). Same script, same
@@ -1366,7 +2006,7 @@ jobs:
 
       - name: Bring up the g6 files, APIs and streams matrix (gate-only INGEST_ALLOW_INTERNAL_HOSTS override)
         # Explicit service list, as `g6-ingest` explains (the dagster profile
-        # also holds debezium-server). `--profile g6-other`: the runner's
+        # also holds other gates' services). `--profile g6-other`: the runner's
         # `depends_on` skips the SQL fixtures.
         run: >
           docker compose -p g6otherci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml
@@ -1424,9 +2064,8 @@ jobs:
         # see its own header — and is required: without it, neither
         # `dagster-code-location` nor `g6-test-runner-linklocal` has the
         # `g6_linklocal_secrets` mount the REST connector's credential
-        # write needs. Explicit service list, same "debezium-server is
-        # profile dagster too" reason as the g6 matrix `up` step above —
-        # a bare `up` here would try to start it and fail. `dagster-
+        # write needs. Explicit service list, same reason as the g6
+        # matrix `up` step above (a bare `up` starts all of profile dagster). `dagster-
         # webserver`/`dagster-daemon` are both needed too, same as the g6
         # matrix half above: `POST /api/connectors/{id}/ingest/run`
         # launches the run through `lakehouse-api`'s own `DAGSTER_URL`
@@ -1523,12 +2162,12 @@ jobs:
 
       - name: Bring up the Oracle gate stack (gate-only INGEST_ALLOW_INTERNAL_HOSTS override)
         # Explicit service list, as g6-ingest explains (the dagster profile
-        # also holds debezium-server). No mysql/mssql/mongo/kafka/mariadb/sftp
+        # also holds other gates' services). No mysql/mssql/mongo/kafka/mariadb/sftp
         # fixtures and no g3a-source-init: this gate loads no other connector.
         run: >
           docker compose -p g6oracleci -f docker-compose.yml -f ops/g6/docker-compose.g6-oracle.override.yml
           --profile g6-oracle --profile dagster up -d --no-build
-          lakehouse-api dagster-code-location dagster-webserver dagster-daemon oracle-g6
+          lakehouse-api dagster-code-location dagster-webserver dagster-daemon oracle-g6 oracle-tls-g6
 
       - name: Run the G6 Oracle gate inside the compose network
         # `shell: bash` for pipefail, `-T` for no pseudo-terminal: the same
@@ -1635,7 +2274,7 @@ jobs:
 
       - name: Bring up lakehouse-api, Dagster and the API's Iceberg query database
         # Explicit service list, as g6-ingest explains: a bare `up` on the
-        # dagster profile would also start debezium-server. clickhouse-
+        # dagster profile would also start every gate's services. clickhouse-
         # iceberg-init is named because nothing but the gate depends on it.
         run: >
           docker compose -p g9ci --profile dagster up -d --no-build
@@ -1746,7 +2385,7 @@ jobs:
 
       - name: Bring up the alert delivery stack (gate-only INGEST_ALLOW_INTERNAL_HOSTS override)
         # Explicit service list, as g6-ingest explains (the dagster profile
-        # also holds debezium-server). `--profile g6-sql` makes `mysql-g6`
+        # also holds other gates' services). `--profile g6-sql` makes `mysql-g6`
         # a valid dependency of the runner; only the services named here start.
         run: >
           docker compose -p g6alertsci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml
@@ -3012,6 +3651,10 @@ jobs:
       - g3a-dagster
       - g3-maintenance
       - g4-cdc
+      - g4-mysql
+      - g4-mongo
+      - g4-oracle
+      - g4-mssql
       - g10-sso
       - g6-ingest
       - g6-ingest-other
@@ -3062,6 +3705,10 @@ jobs:
           G3A_DAGSTER_RESULT: ${{ needs.g3a-dagster.result }}
           G3_MAINTENANCE_RESULT: ${{ needs.g3-maintenance.result }}
           G4_CDC_RESULT: ${{ needs.g4-cdc.result }}
+          G4_MYSQL_RESULT: ${{ needs.g4-mysql.result }}
+          G4_MONGO_RESULT: ${{ needs.g4-mongo.result }}
+          G4_ORACLE_RESULT: ${{ needs.g4-oracle.result }}
+          G4_MSSQL_RESULT: ${{ needs.g4-mssql.result }}
           G10_SSO_RESULT: ${{ needs.g10-sso.result }}
           G6_INGEST_RESULT: ${{ needs.g6-ingest.result }}
           G6_INGEST_OTHER_RESULT: ${{ needs.g6-ingest-other.result }}

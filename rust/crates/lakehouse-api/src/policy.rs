@@ -782,7 +782,6 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // The tenant gate is the route layer.
     ("POST", "/api/connectors/{id}/discovery/{kind}", Policy::RequiresPermission("connector:manage")),
     ("GET",  "/api/connectors/{id}/discovery/{kind}", Policy::RequiresPermission("connector:manage")),
-    ("GET",  "/api/connectors/{id}/debezium-properties", Policy::RequiresPermission("connector:manage")),
     // `ingest-spec` GET/PUT deliberately carry DIFFERENT permissions, unlike
     // every other connector route above: `connector:manage` is a broad
     // write-capable grant, and a read-only caller (Phase G's ingest
@@ -823,6 +822,17 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("GET",  "/api/connectors/{id}/runs", Policy::RequiresPermission("connector:manage")),
     ("GET",  "/api/connectors/{id}/runs/{runId}/log", Policy::RequiresPermission("connector:manage")),
     ("POST", "/api/connectors/{id}/resume", Policy::RequiresPermission("connector:manage")),
+    // `SRC-4` slice 2: a person's pause (resume above lifts it), and a change-capture
+    // connector's state in Kafka Connect; same permission and tenant gate.
+    ("POST", "/api/connectors/{id}/pause", Policy::RequiresPermission("connector:manage")),
+    ("GET",  "/api/connectors/{id}/change-capture", Policy::RequiresPermission("connector:manage")),
+    // `SRC-4` slice 4: a person sets the lag a change-capture connector may have
+    // before it alerts; the orchestrator posts each table's backlog and last
+    // applied change. `ingest:read` is the one permission its service identity
+    // holds and a user can hold it too (Data Engineer), so the handler adds
+    // `schema_changes::require_orchestrator`, as the run reports do.
+    ("PUT",  "/api/connectors/{id}/lag-limit", Policy::RequiresPermission("connector:manage")),
+    ("POST", "/api/connectors/{id}/capture/observations", Policy::RequiresPermission("ingest:read")),
     // `SRC-11`: the orchestrator reports a run's start, each attempt, a line of
     // the closed log list, and the run's end. `ingest:read`, the one
     // permission its service identity holds; a user can hold it too (Data

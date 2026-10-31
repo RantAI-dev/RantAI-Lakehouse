@@ -85,13 +85,15 @@ pub struct SqlDial {
 
 /// The connection shape for a change-data-capture `cdc` adapter's `dial`.
 ///
-/// `slot_name`/`publication_name` are **required**, not `Option`: a `cdc`
-/// connector's replication slot/publication come from `dial` with no
-/// fallback, so a `cdc` dial missing either is a construction-time (400)
-/// error, not a later runtime surprise — see
-/// `docs/adr/0013-registry-driven-ingestion.md`'s "the same connection
-/// fields as `sql`, plus `slotName` and `publicationName` as **required**"
-/// decision.
+/// Which of `slot_name`, `publication_name` and `server_id` a dial carries
+/// depends on the driver (`SRC-4` slice 3, decision S3-a), checked by
+/// [`Dial::parse`] (`validate_cdc_dial_post_parse`), not by serde: `PostgreSQL`
+/// requires `slotName` and `publicationName` and refuses `serverId`; `MySQL`
+/// requires `serverId` and refuses the other two; `SQL Server` and `Oracle`
+/// refuse all three. `pdbName` is `Oracle`'s alone (slice 6, S6-b), and
+/// `Oracle` takes only the `disable` and `require` TLS modes (S6-c). A `cdc` dial that breaks this is a construction-time (400) error, not
+/// a later runtime surprise. ADR 0013's "required" is "required for
+/// `PostgreSQL`" (dated note there).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct CdcDial {
@@ -108,13 +110,104 @@ pub struct CdcDial {
     /// A literal username, never a `secretRef`-shaped indirection — see
     /// [`SqlDial::user`].
     pub user: String,
-    /// The replication slot name, required with no fallback.
-    pub slot_name: String,
-    /// The publication name, required with no fallback.
-    pub publication_name: String,
-    /// An optional numeric server id, used by drivers (e.g. `MySQL`
-    /// binlog replication) that need one.
+    /// The replication slot name: required for `PostgreSQL` with no fallback,
+    /// refused for the other drivers.
+    #[serde(default)]
+    pub slot_name: Option<String>,
+    /// The publication name: required for `PostgreSQL` with no fallback,
+    /// refused for the other drivers.
+    #[serde(default)]
+    pub publication_name: Option<String>,
+    /// The `MySQL` binlog client's server id (1 to 4294967295): required for
+    /// `MySQL`, refused for the other drivers.
+    #[serde(default)]
     pub server_id: Option<u32>,
+    /// The pluggable database the Oracle change-capture connector reads
+    /// (`database.pdb.name`; `SRC-4` decision S6-b): `database` then names the
+    /// container database. Absent for a non-container Oracle database;
+    /// refused for the other drivers.
+    #[serde(default)]
+    pub pdb_name: Option<String>,
+    /// How the change-capture worker secures its connection to the source
+    /// (`SRC-4` decision S2-d). Absent means [`CdcSslMode::Require`]: a
+    /// stored credential is never dialed in plain text unless the person
+    /// chose `disable`, which the console shows as such (`SEC-14`'s rule).
+    #[serde(default)]
+    pub ssl_mode: CdcSslMode,
+}
+
+/// The TLS modes a change-capture `dial` may name: the four a person can
+/// choose, a closed set so a typo fails at parse time. Not `prefer` or
+/// `allow` (attempt TLS, fall back to plain text): those would dial a stored
+/// credential in the clear without anyone having said so.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CdcSslMode {
+    /// No TLS. Only when the person chose it.
+    Disable,
+    /// Encrypt and take the server certificate as presented.
+    #[default]
+    Require,
+    /// Encrypt and verify the certificate chain.
+    VerifyCa,
+    /// Encrypt, verify the chain and that the certificate names the host.
+    VerifyFull,
+}
+
+impl CdcSslMode {
+    /// The value `Debezium`'s `database.sslmode` takes for this mode (the
+    /// same four words, `PostgreSQL` JDBC's own spelling).
+    #[must_use]
+    pub const fn as_debezium(self) -> &'static str {
+        match self {
+            Self::Disable => "disable",
+            Self::Require => "require",
+            Self::VerifyCa => "verify-ca",
+            Self::VerifyFull => "verify-full",
+        }
+    }
+}
+
+/// The only driver value a [`CdcMongoDial`] carries. A one-variant enum rather
+/// than a free string, so a typo fails at parse time like every other driver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CdcMongoDriver {
+    /// `MongoDB`.
+    Mongodb,
+}
+
+/// The connection shape for a `MongoDB` change-capture connector (`SRC-4`
+/// slice 5, decision S5-a): a `cdc` dial whose `driver` is `mongodb`.
+///
+/// It is its own shape and not a fifth [`SqlDriver`]: `MongoDB` is not SQL, and
+/// [`SqlDriver`] also feeds the batch `sql` adapter. [`Dial::parse`] reads
+/// `driver` first and parses this shape for `mongodb`, [`CdcDial`] for every
+/// other value.
+///
+/// `hosts` is the explicit seed list, each `host:port` checked by
+/// [`validate_hostname`] and, at save time, by the API's SSRF check, **every**
+/// entry (decision S5-b). There is no `mongodb+srv` and no free-form
+/// connection string: `deny_unknown_fields` refuses an `srvUri` or a `uri`.
+/// `replicaSet` is required because change streams need a replica set.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct CdcMongoDial {
+    /// Always `mongodb`.
+    pub driver: CdcMongoDriver,
+    /// The explicit `host:port` seeds of the replica set.
+    pub hosts: Vec<String>,
+    /// The database to capture; also the authentication database.
+    pub database: String,
+    /// A literal username, never a `secretRef`-shaped indirection (see
+    /// [`SqlDial::user`]).
+    pub user: String,
+    /// The name of the replica set (`rs.status().set`): required.
+    pub replica_set: String,
+    /// How the change-capture worker secures its connection to the source;
+    /// absent means [`CdcSslMode::Require`] (as for [`CdcDial`]).
+    #[serde(default)]
+    pub ssl_mode: CdcSslMode,
 }
 
 /// A closed set of object-storage protocols a `files` adapter's `dial`
@@ -527,6 +620,9 @@ pub enum Dial {
     Sql(SqlDial),
     /// A change-data-capture `cdc` adapter's dial.
     Cdc(CdcDial),
+    /// A `MongoDB` change-capture dial: a `cdc` adapter whose `driver` is
+    /// `mongodb` (`SRC-4` slice 5).
+    CdcMongo(CdcMongoDial),
     /// A `mongodb` adapter's dial.
     Mongo(MongoDial),
     /// A `kafka` adapter's dial.
@@ -571,9 +667,19 @@ impl Dial {
                 validate_sql_dial_post_parse(adapter, &dial)?;
                 Ok(Dial::Sql(dial))
             }
+            // `SRC-4` slice 5 (S5-a): `driver` decides the shape, as the
+            // adapter decides it one level up. Only the exact word `mongodb`
+            // takes the `MongoDB` shape; every other value, a typo included,
+            // is parsed (and refused) by `CdcDial`.
+            "cdc" if raw.get("driver").and_then(serde_json::Value::as_str) == Some("mongodb") => {
+                let dial: CdcMongoDial = parse_dial(adapter, raw)?;
+                validate_cdc_mongo_dial_post_parse(adapter, &dial)?;
+                Ok(Dial::CdcMongo(dial))
+            }
             "cdc" => {
                 let dial: CdcDial = parse_dial(adapter, raw)?;
                 check_hostname(adapter, "host", &dial.host)?;
+                validate_cdc_dial_post_parse(adapter, &dial)?;
                 Ok(Dial::Cdc(dial))
             }
             "mongodb" => {
@@ -622,6 +728,16 @@ impl Dial {
     pub fn as_cdc(&self) -> Option<&CdcDial> {
         match self {
             Dial::Cdc(dial) => Some(dial),
+            _ => None,
+        }
+    }
+
+    /// A typed accessor for the `MongoDB` change-capture variant, the
+    /// counterpart of [`Dial::as_cdc`].
+    #[must_use]
+    pub fn as_cdc_mongo(&self) -> Option<&CdcMongoDial> {
+        match self {
+            Dial::CdcMongo(dial) => Some(dial),
             _ => None,
         }
     }
@@ -705,6 +821,7 @@ impl Dial {
     /// | Adapter | Compared |
     /// | --- | --- |
     /// | `sql`, `cdc` | `driver`, `host`, `port`, `database` |
+    /// | `cdc` with `driver` `mongodb` | `hosts` (as a set), `database`, `replicaSet` |
     /// | `files` | `protocol`, `endpoint`, `bucket` |
     /// | `rest` | scheme, host and port of `baseUrl` |
     /// | `mongodb` | `hosts` (as a set), `database` |
@@ -752,6 +869,7 @@ impl Dial {
                     ("database", cdc.database.clone()),
                 ],
             ),
+            Dial::CdcMongo(mongo) => cdc_mongo_target_identity(mongo),
             Dial::Files(files) => TargetIdentity::new(
                 "files",
                 vec![
@@ -858,6 +976,21 @@ impl TargetIdentity {
     pub fn adapter(&self) -> &'static str {
         self.adapter
     }
+}
+
+/// The re-point identity of a `MongoDB` change-capture dial (`SRC-4` S5-a): the
+/// hosts as a set, the database and the replica set. A different replica set is a
+/// different cluster, so the stored credential must be supplied again.
+fn cdc_mongo_target_identity(mongo: &CdcMongoDial) -> TargetIdentity {
+    TargetIdentity::new(
+        "cdc",
+        vec![
+            ("driver", "mongodb".to_owned()),
+            ("hosts", host_port_set_key(&mongo.hosts)),
+            ("database", mongo.database.clone()),
+            ("replicaSet", mongo.replica_set.clone()),
+        ],
+    )
 }
 
 /// The target identity of a `saas` dial. `SRC-3` AD2: every address of a
@@ -1015,6 +1148,162 @@ fn parse_dial<T: for<'de> Deserialize<'de>>(
         adapter: adapter.to_owned(),
         source,
     })
+}
+
+/// The per-driver rule for a `cdc` dial's `slotName`, `publicationName` and
+/// `serverId` (`SRC-4` decision S3-a). Every refusal is one fixed sentence
+/// naming the field and the driver, never a value.
+///
+/// # Errors
+///
+/// Returns [`IngestSpecError::InvalidDial`] when a field the driver needs is
+/// missing, a field it does not use is present, or `serverId` is 0.
+fn validate_cdc_dial_post_parse(adapter: &str, dial: &CdcDial) -> Result<(), IngestSpecError> {
+    match cdc_dial_refusal(dial) {
+        None => Ok(()),
+        Some(message) => Err(IngestSpecError::InvalidDial {
+            adapter: adapter.to_owned(),
+            source: serde::de::Error::custom(message),
+        }),
+    }
+}
+
+const ONLY_POSTGRES_SLOT: &str = "slotName is only for a PostgreSQL change-capture connector";
+const ONLY_POSTGRES_PUBLICATION: &str =
+    "publicationName is only for a PostgreSQL change-capture connector";
+const ONLY_MYSQL_SERVER_ID: &str = "serverId is only for a MySQL change-capture connector";
+
+/// The first fixed sentence that refuses `dial`, or `None` (see
+/// [`validate_cdc_dial_post_parse`]). Split by driver so each rule stays short.
+fn cdc_dial_refusal(dial: &CdcDial) -> Option<&'static str> {
+    if dial.pdb_name.is_some() && dial.driver != SqlDriver::Oracle {
+        return Some("pdbName is only for an Oracle change-capture connector");
+    }
+    match dial.driver {
+        SqlDriver::Postgres => postgres_dial_refusal(dial),
+        SqlDriver::Mysql => mysql_dial_refusal(dial),
+        SqlDriver::Mssql => no_replication_names_refusal(dial),
+        SqlDriver::Oracle => {
+            no_replication_names_refusal(dial).or_else(|| oracle_dial_refusal(dial))
+        }
+    }
+}
+
+fn postgres_dial_refusal(dial: &CdcDial) -> Option<&'static str> {
+    if dial.slot_name.is_none() {
+        return Some("slotName is required for a PostgreSQL change-capture connector");
+    }
+    if dial.publication_name.is_none() {
+        return Some("publicationName is required for a PostgreSQL change-capture connector");
+    }
+    dial.server_id.is_some().then_some(ONLY_MYSQL_SERVER_ID)
+}
+
+fn mysql_dial_refusal(dial: &CdcDial) -> Option<&'static str> {
+    match dial.server_id {
+        None => return Some("serverId is required for a MySQL change-capture connector"),
+        Some(0) => return Some("serverId must be between 1 and 4294967295"),
+        Some(_) => {}
+    }
+    if dial.slot_name.is_some() {
+        return Some(ONLY_POSTGRES_SLOT);
+    }
+    dial.publication_name
+        .is_some()
+        .then_some(ONLY_POSTGRES_PUBLICATION)
+}
+
+/// `SQL Server` and `Oracle` use none of `slotName`, `publicationName`, `serverId`.
+fn no_replication_names_refusal(dial: &CdcDial) -> Option<&'static str> {
+    if dial.slot_name.is_some() {
+        return Some(ONLY_POSTGRES_SLOT);
+    }
+    if dial.publication_name.is_some() {
+        return Some(ONLY_POSTGRES_PUBLICATION);
+    }
+    dial.server_id.is_some().then_some(ONLY_MYSQL_SERVER_ID)
+}
+
+/// `Oracle`'s own rules (`SRC-4` decisions S6-b, S6-c).
+fn oracle_dial_refusal(dial: &CdcDial) -> Option<&'static str> {
+    if !is_oracle_service_name(&dial.database) {
+        return Some("database must be an Oracle name of letters, digits, '_', '.' or '-'");
+    }
+    if dial
+        .pdb_name
+        .as_deref()
+        .is_some_and(|pdb| !is_oracle_service_name(pdb))
+    {
+        return Some("pdbName must be an Oracle name of letters, digits, '_', '.' or '-'");
+    }
+    // S6-c: Oracle's JDBC driver does TLS only over TCPS with a Java trust store,
+    // which this build cannot set up (SRC-37), so a mode that promises certificate
+    // checking is refused, not approximated.
+    matches!(dial.ssl_mode, CdcSslMode::VerifyCa | CdcSslMode::VerifyFull).then_some(
+        "sslMode verify-ca and verify-full are not supported for an Oracle change-capture connector: use require (encrypted, server not authenticated) or disable",
+    )
+}
+
+/// The fixed refusal of a `MongoDB` change-capture dial with other than one host
+/// (`SRC-4` slice 5 review BLOCKER 1); the renderer refuses the same.
+pub const CDC_MONGO_ONE_HOST: &str =
+    "hosts must hold exactly one host:port: a MongoDB change-capture connector takes one host";
+
+/// The fixed refusal of a bad `replicaSet` (`SRC-4` slice 5 review SHOULD-FIX 1: one sentence,
+/// single spaces, tested by its exact text).
+pub const CDC_MONGO_REPLICA_SET: &str = "replicaSet must be 1 to 128 letters, digits, underscores, hyphens or dots: the name in the server's replica set configuration";
+
+/// The rule for a `MongoDB` change-capture dial's fields that serde cannot
+/// check (`SRC-4` decision S5-a). Every refusal is one fixed sentence naming
+/// the field, never a value. `database` and `replicaSet` are written into the
+/// connector's connection string and `collection.include.list`, so they are
+/// restricted to plain characters (no `,`, `.`, `/`, `?`, `&`, `=`, `@`).
+///
+/// # Errors
+///
+/// Returns [`IngestSpecError::InvalidDial`] for no host, a host that is not
+/// `host:port` with a port from 1 to 65535 or whose host [`validate_hostname`]
+/// rejects, an empty or implausible `database`, `replicaSet` or `user`.
+fn validate_cdc_mongo_dial_post_parse(
+    adapter: &str,
+    dial: &CdcMongoDial,
+) -> Result<(), IngestSpecError> {
+    let refuse = |message: &'static str| IngestSpecError::InvalidDial {
+        adapter: adapter.to_owned(),
+        source: serde::de::Error::custom(message),
+    };
+    // `SRC-4` slice 5 review BLOCKER 1 (S5-b): exactly one host. With several seeds the worker
+    // dials the member addresses the replica set reports, which nothing checks against the
+    // installation's address rules (not fail closed, AGENTS.md principle 3). The contract keeps
+    // `hosts` as a list so the shape can grow with a bounded check later.
+    if dial.hosts.len() != 1 {
+        return Err(refuse(CDC_MONGO_ONE_HOST));
+    }
+    for host_port in &dial.hosts {
+        let (host, port) = split_host_port(adapter, "hosts", host_port)?;
+        check_hostname(adapter, "hosts", host)?;
+        if !matches!(port.parse::<u16>(), Ok(1..=u16::MAX)) {
+            return Err(refuse("hosts entries need a port from 1 to 65535"));
+        }
+    }
+    let plain = |value: &str, extra: &[u8], max: usize| {
+        (1..=max).contains(&value.len())
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || extra.contains(&b))
+    };
+    if !plain(&dial.database, b"_-", 63) {
+        return Err(refuse(
+            "database must be 1 to 63 letters, digits, underscores or hyphens",
+        ));
+    }
+    if !plain(&dial.replica_set, b"_-.", 128) {
+        return Err(refuse(CDC_MONGO_REPLICA_SET));
+    }
+    if dial.user.is_empty() {
+        return Err(refuse("user must not be empty"));
+    }
+    Ok(())
 }
 
 /// Check `host` via [`validate_hostname`], wrapping a rejection as
@@ -1266,6 +1555,20 @@ fn validate_sql_dial_post_parse(adapter: &str, dial: &SqlDial) -> Result<(), Ing
     }
 
     if dial.driver == SqlDriver::Oracle {
+        // SRC-4 slice 1 review SHOULD-FIX 3: the Oracle `database` is a service name, and a
+        // service name is an identifier. Letters, digits, `_`, `.` and `-` (the characters a
+        // domain-qualified service name such as `FREEPDB1` or `sales.example.com` uses) in
+        // 1 to 128 characters; the same rule is in `adapters/oracle.py`. The sentence is fixed
+        // and does not repeat the value.
+        if !is_oracle_service_name(&dial.database) {
+            return Err(IngestSpecError::InvalidDial {
+                adapter: adapter.to_owned(),
+                source: serde::de::Error::custom(
+                    "database must be an Oracle service name: 1 to 128 letters, digits, \
+                     underscores, dots or hyphens",
+                ),
+            });
+        }
         let tls_required = dial
             .ssl_mode
             .as_deref()
@@ -1283,6 +1586,15 @@ fn validate_sql_dial_post_parse(adapter: &str, dial: &SqlDial) -> Result<(), Ing
     }
 
     Ok(())
+}
+
+/// Whether `name` is an identifier fit to be an Oracle service name
+/// (`^[A-Za-z0-9_.-]{1,128}$`; SRC-4 slice 1 review SHOULD-FIX 3).
+fn is_oracle_service_name(name: &str) -> bool {
+    (1..=128).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
 }
 
 /// A `dial` failed to parse or validate.
@@ -1453,6 +1765,17 @@ pub enum InvalidLoadMode {
         /// The source object's name.
         name: String,
     },
+    /// A load mode a change-capture connector does not run (`SRC-4` decision
+    /// S2-g): it keeps the current row per key (`incremental_dedup`, the
+    /// default) or every version (`history`), nothing else.
+    #[error(
+        "source object {name:?} has a loadMode that change capture does not run; use \
+         incremental_dedup (the current row per key) or history (every version)"
+    )]
+    NotForChangeCapture {
+        /// The source object's name.
+        name: String,
+    },
     /// `replace_dedup` or `incremental_dedup` without a key (`SRC-10`).
     #[error(
         "source object {name:?} asks for a deduplicating loadMode, which needs primaryKey: the \
@@ -1514,6 +1837,66 @@ fn key_is_usable(columns: &[serde_json::Value]) -> bool {
     })
 }
 
+/// An Oracle change-capture table that is not `SCHEMA.TABLE` of two Oracle
+/// identifiers in Oracle's own spelling (`SRC-4` slice 6, decision S10-c).
+/// Fixed text; it names the object the request itself sent.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "source object {name:?} is not an Oracle table: write it as SCHEMA.TABLE in upper case, \
+     letters, digits, '_' and '$'"
+)]
+pub struct InvalidOracleTable {
+    /// The offending source object's name.
+    pub name: String,
+}
+
+/// Whether `part` is an unquoted Oracle identifier as the data dictionary
+/// spells it: upper-case, starting with a letter, at most 128 characters.
+fn is_oracle_dictionary_name(part: &str) -> bool {
+    (1..=128).contains(&part.len())
+        && part.bytes().next().is_some_and(|b| b.is_ascii_uppercase())
+        && part
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || matches!(b, b'_' | b'$'))
+}
+
+/// An Oracle change-capture connector's tables are entered by hand (the
+/// orchestrator cannot list them with the connector's native encryption, S10-c),
+/// so each name is checked here as two identifiers in the spelling Debezium
+/// matches: Oracle stores unquoted names in upper case. Other sources are not
+/// checked here.
+///
+/// # Errors
+///
+/// [`InvalidOracleTable`] for the first object of an Oracle `cdc` dial whose
+/// name is not `SCHEMA.TABLE` of two such identifiers.
+pub fn validate_oracle_change_capture_tables(
+    dial: &Dial,
+    source_objects: &serde_json::Value,
+) -> Result<(), InvalidOracleTable> {
+    let Dial::Cdc(cdc) = dial else {
+        return Ok(());
+    };
+    if cdc.driver != SqlDriver::Oracle {
+        return Ok(());
+    }
+    for object in source_objects.as_array().into_iter().flatten() {
+        let name = object
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let valid = name.split_once('.').is_some_and(|(schema, table)| {
+            is_oracle_dictionary_name(schema) && is_oracle_dictionary_name(table)
+        });
+        if !valid {
+            return Err(InvalidOracleTable {
+                name: name.to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Check each source object's load mode, the one part of `sourceObjects`
 /// checked at save time: a mode the ingest job cannot run would otherwise
 /// surface only as a rejected run. Everything else in an object is left
@@ -1526,7 +1909,9 @@ fn key_is_usable(columns: &[serde_json::Value]) -> bool {
 /// cursor column that is a plain name of sensible length, with plain `incremental` on a `saas`
 /// object (it appends; a business-app record must merge on its key, final review BLOCKER 18),
 /// with a deduplicating mode and no `primaryKey`, or with a `primaryKey` that is
-/// not a usable key.
+/// not a usable key. For `cdc` (`SRC-4` decision S2-g) only `incremental_dedup` (the
+/// default when no mode is given) and `history` are accepted, both with a key, and
+/// no cursor is asked for: [`InvalidLoadMode::NotForChangeCapture`] otherwise.
 pub fn validate_load_modes(
     adapter: &str,
     source_objects: &serde_json::Value,
@@ -1550,7 +1935,11 @@ pub fn validate_load_modes(
             Some(serde_json::Value::Array(columns)) if key_is_usable(columns) => true,
             Some(_) => return Err(InvalidLoadMode::BadKey { name }),
         };
+        // `SRC-4` decision S2-g: a change-capture object with no mode is the
+        // default, the current row per key, and so needs a key like any other.
+        let change_capture = adapter == "cdc";
         let mode = match object.get("loadMode") {
+            None | Some(serde_json::Value::Null) if change_capture => LoadMode::IncrementalDedup,
             None | Some(serde_json::Value::Null) => continue,
             Some(value) => match LoadMode::deserialize(value) {
                 Ok(mode) => mode,
@@ -1564,6 +1953,9 @@ pub fn validate_load_modes(
                 }
             },
         };
+        if change_capture && !matches!(mode, LoadMode::IncrementalDedup | LoadMode::History) {
+            return Err(InvalidLoadMode::NotForChangeCapture { name });
+        }
         if mode.needs_key() && !has_key {
             return Err(InvalidLoadMode::NoKey { name });
         }
@@ -1589,7 +1981,9 @@ pub fn validate_load_modes(
                 return Err(InvalidLoadMode::ReservedKeyColumn { name });
             }
         }
-        if !mode.is_incremental() {
+        // A change-capture `incremental_dedup` reads no cursor: the changes
+        // arrive in order, and the key merges them.
+        if !mode.is_incremental() || change_capture {
             continue;
         }
         // PR #216 final review BLOCKER 18: `incremental` appends, so every changed vendor record
@@ -1681,7 +2075,7 @@ pub const fn supports_column_choice(dial: &Dial) -> bool {
     matches!(
         dial,
         Dial::Sql(SqlDial {
-            driver: SqlDriver::Postgres | SqlDriver::Mysql | SqlDriver::Mssql,
+            driver: SqlDriver::Postgres | SqlDriver::Mysql | SqlDriver::Mssql | SqlDriver::Oracle,
             ..
         }) | Dial::Saas(_)
     )
@@ -2218,13 +2612,188 @@ mod tests {
     }
 
     #[test]
-    fn cdc_dial_requires_slot_and_publication_name() {
-        let json = serde_json::json!({
+    fn cdc_dial_fields_follow_the_driver() {
+        let base = |driver: &str| {
+            serde_json::json!({
+                "driver": driver, "host": "db.internal", "port": 5432,
+                "database": "orders", "user": "app_reader"
+            })
+        };
+        let refusal = |json: serde_json::Value| Dial::parse("cdc", &json).unwrap_err().to_string();
+        // PostgreSQL: both names required, no server id; stored rows parse unchanged.
+        assert!(refusal(base("postgres")).contains("slotName is required"));
+        let mut pg = base("postgres");
+        pg["slotName"] = serde_json::json!("s");
+        assert!(refusal(pg.clone()).contains("publicationName is required"));
+        pg["publicationName"] = serde_json::json!("p");
+        assert!(Dial::parse("cdc", &pg).is_ok());
+        pg["serverId"] = serde_json::json!(5);
+        assert!(refusal(pg).contains("serverId is only for a MySQL"));
+        // MySQL: a server id in 1..=4294967295, neither name.
+        assert!(refusal(base("mysql")).contains("serverId is required"));
+        let mut my = base("mysql");
+        my["serverId"] = serde_json::json!(0);
+        assert!(refusal(my.clone()).contains("between 1 and 4294967295"));
+        my["serverId"] = serde_json::json!(4_294_967_295_u64);
+        assert!(Dial::parse("cdc", &my).is_ok());
+        my["serverId"] = serde_json::json!(4_294_967_296_u64);
+        assert!(Dial::parse("cdc", &my).is_err());
+        my["serverId"] = serde_json::json!(7);
+        my["slotName"] = serde_json::json!("s");
+        assert!(refusal(my.clone()).contains("slotName is only for a PostgreSQL"));
+        my.as_object_mut().unwrap().remove("slotName");
+        my["publicationName"] = serde_json::json!("p");
+        assert!(refusal(my).contains("publicationName is only for a PostgreSQL"));
+        // SQL Server: none of the three.
+        assert!(Dial::parse("cdc", &base("mssql")).is_ok());
+        for (field, value) in [
+            ("slotName", serde_json::json!("s")),
+            ("publicationName", serde_json::json!("p")),
+            ("serverId", serde_json::json!(1)),
+        ] {
+            let mut ms = base("mssql");
+            ms[field] = value;
+            assert!(
+                Dial::parse("cdc", &ms).is_err(),
+                "{field} must be refused for SQL Server"
+            );
+        }
+    }
+
+    #[test]
+    fn cdc_dial_oracle_takes_a_pdb_name_and_only_two_tls_modes() {
+        let base = || {
+            serde_json::json!({
+                "driver": "oracle", "host": "db.internal", "port": 1521,
+                "database": "FREE", "user": "c##dbzuser"
+            })
+        };
+        let refusal = |json: serde_json::Value| Dial::parse("cdc", &json).unwrap_err().to_string();
+        // A non-container database: no pdbName.
+        assert!(Dial::parse("cdc", &base()).is_ok());
+        let mut with_pdb = base();
+        with_pdb["pdbName"] = serde_json::json!("FREEPDB1");
+        assert!(Dial::parse("cdc", &with_pdb).is_ok());
+        with_pdb["pdbName"] = serde_json::json!("FREE PDB; DROP");
+        assert!(refusal(with_pdb).contains("pdbName must be an Oracle name"));
+        let mut bad_db = base();
+        bad_db["database"] = serde_json::json!("FREE'");
+        assert!(refusal(bad_db).contains("database must be an Oracle name"));
+        // Oracle uses none of the three names.
+        for (field, value, text) in [
+            ("slotName", serde_json::json!("s"), "slotName is only for"),
+            (
+                "publicationName",
+                serde_json::json!("p"),
+                "publicationName is only for",
+            ),
+            ("serverId", serde_json::json!(1), "serverId is only for"),
+        ] {
+            let mut o = base();
+            o[field] = value;
+            assert!(refusal(o).contains(text), "{field}");
+        }
+        // pdbName is Oracle's alone.
+        for driver in ["postgres", "mysql", "mssql"] {
+            let mut d = base();
+            d["driver"] = serde_json::json!(driver);
+            d["pdbName"] = serde_json::json!("FREEPDB1");
+            if driver == "postgres" {
+                d["slotName"] = serde_json::json!("s");
+                d["publicationName"] = serde_json::json!("p");
+            }
+            if driver == "mysql" {
+                d["serverId"] = serde_json::json!(7);
+            }
+            assert!(
+                refusal(d).contains("pdbName is only for an Oracle"),
+                "{driver}"
+            );
+        }
+        // S6-c: require and disable only.
+        for word in ["disable", "require"] {
+            let mut o = base();
+            o["sslMode"] = serde_json::json!(word);
+            assert!(Dial::parse("cdc", &o).is_ok(), "{word}");
+        }
+        for word in ["verify-ca", "verify-full"] {
+            let mut o = base();
+            o["sslMode"] = serde_json::json!(word);
+            assert!(refusal(o).contains("not supported for an Oracle"), "{word}");
+        }
+    }
+
+    #[test]
+    fn oracle_change_capture_tables_are_two_upper_case_identifiers() {
+        let oracle = Dial::parse(
+            "cdc",
+            &serde_json::json!({
+                "driver": "oracle", "host": "db.internal", "port": 1521,
+                "database": "FREE", "user": "u"
+            }),
+        )
+        .unwrap();
+        let objects = |names: &[&str]| {
+            serde_json::Value::Array(
+                names
+                    .iter()
+                    .map(|n| serde_json::json!({"name": n, "target": "t"}))
+                    .collect(),
+            )
+        };
+        assert!(
+            validate_oracle_change_capture_tables(&oracle, &objects(&["SHOP.ORDERS", "A1.B_2$"]))
+                .is_ok()
+        );
+        for bad in [
+            "shop.orders",
+            "SHOP",
+            "SHOP.",
+            ".ORDERS",
+            "A.B.C",
+            "1A.B",
+            "SHOP.OR DERS",
+            "SHOP.ORD,ERS",
+            "SHOP.\"ORDERS\"",
+        ] {
+            let err = validate_oracle_change_capture_tables(&oracle, &objects(&["OK.OK", bad]))
+                .unwrap_err();
+            assert_eq!(err.name, bad);
+        }
+        // Other sources are not subject to the rule.
+        let pg = Dial::parse(
+            "cdc",
+            &serde_json::json!({
+                "driver": "postgres", "host": "db.internal", "port": 5432,
+                "database": "d", "user": "u", "slotName": "s", "publicationName": "p"
+            }),
+        )
+        .unwrap();
+        assert!(validate_oracle_change_capture_tables(&pg, &objects(&["public.orders"])).is_ok());
+    }
+
+    #[test]
+    fn cdc_dial_ssl_mode_defaults_to_require_and_names_a_closed_set() {
+        let mut json = serde_json::json!({
             "driver": "postgres", "host": "db.internal", "port": 5432,
-            "database": "orders", "user": "app_reader"
+            "database": "orders", "user": "app_reader",
+            "slotName": "orders_slot", "publicationName": "orders_pub"
         });
-        let err = serde_json::from_value::<CdcDial>(json).unwrap_err();
-        assert!(err.to_string().contains("missing field"));
+        let dial = serde_json::from_value::<CdcDial>(json.clone()).unwrap();
+        assert_eq!(dial.ssl_mode, CdcSslMode::Require);
+        for (word, mode) in [
+            ("disable", CdcSslMode::Disable),
+            ("require", CdcSslMode::Require),
+            ("verify-ca", CdcSslMode::VerifyCa),
+            ("verify-full", CdcSslMode::VerifyFull),
+        ] {
+            json["sslMode"] = serde_json::json!(word);
+            let dial = serde_json::from_value::<CdcDial>(json.clone()).unwrap();
+            assert_eq!(dial.ssl_mode, mode);
+            assert_eq!(dial.ssl_mode.as_debezium(), word);
+        }
+        json["sslMode"] = serde_json::json!("prefer");
+        assert!(serde_json::from_value::<CdcDial>(json).is_err());
     }
 
     #[test]
@@ -2318,7 +2887,7 @@ mod tests {
         });
         let dial = Dial::parse("cdc", &json).expect("valid cdc dial");
         assert_eq!(
-            dial.as_cdc().map(|cdc| cdc.slot_name.as_str()),
+            dial.as_cdc().and_then(|cdc| cdc.slot_name.as_deref()),
             Some("orders_slot")
         );
     }
@@ -2490,6 +3059,56 @@ mod tests {
             ),
             Err(InvalidLoadMode::NoKey { .. })
         ));
+    }
+
+    /// `SRC-4` decision S2-g: change capture runs the current row per key (the
+    /// default) and history, both need a key, neither asks for a cursor.
+    #[test]
+    fn validate_load_modes_for_change_capture_accepts_two_modes_with_a_key() {
+        let check =
+            |object: serde_json::Value| validate_load_modes("cdc", &serde_json::json!([object]));
+        for object in [
+            serde_json::json!({ "name": "a", "target": "a", "primaryKey": ["id"] }),
+            serde_json::json!({ "name": "a", "target": "a", "loadMode": "incremental_dedup",
+                "primaryKey": ["id"] }),
+            serde_json::json!({ "name": "a", "target": "a", "loadMode": "history",
+                "primaryKey": ["id"] }),
+        ] {
+            assert_eq!(check(object.clone()), Ok(()), "{object}");
+        }
+        for mode in ["replace", "append", "incremental", "replace_dedup"] {
+            assert!(
+                matches!(
+                    check(
+                        serde_json::json!({ "name": "a", "target": "a", "loadMode": mode,
+                        "incrementalKey": "u", "primaryKey": ["id"] })
+                    ),
+                    Err(InvalidLoadMode::NotForChangeCapture { .. })
+                ),
+                "{mode}"
+            );
+        }
+        // No key, with or without a stated mode, is refused.
+        for object in [
+            serde_json::json!({ "name": "a", "target": "a" }),
+            serde_json::json!({ "name": "a", "target": "a", "loadMode": "history" }),
+            serde_json::json!({ "name": "a", "target": "a", "loadMode": "incremental_dedup" }),
+        ] {
+            assert!(
+                matches!(check(object.clone()), Err(InvalidLoadMode::NoKey { .. })),
+                "{object}"
+            );
+        }
+        // History still takes no cursor.
+        assert!(matches!(
+            check(
+                serde_json::json!({ "name": "a", "target": "a", "loadMode": "history",
+                "incrementalKey": "u", "primaryKey": ["id"] })
+            ),
+            Err(InvalidLoadMode::HistoryHasCursor { .. })
+        ));
+        // An empty list of objects (nothing chosen yet) is still saved.
+        assert_eq!(validate_load_modes("cdc", &serde_json::json!([])), Ok(()));
     }
 
     #[test]
@@ -2886,6 +3505,36 @@ mod tests {
     }
 
     #[test]
+    fn dial_parse_accepts_an_oracle_service_name_that_is_an_identifier() {
+        // SRC-4 slice 1 review SHOULD-FIX 3.
+        for name in ["FREEPDB1", "ORCLPDB1", "sales.example.com", "g6_ingest-2"] {
+            let json = serde_json::json!({
+                "driver": "oracle", "host": "oracle.internal", "port": 1521,
+                "database": name, "user": "reader"
+            });
+            assert!(Dial::parse("sql", &json).is_ok(), "{name} must be accepted");
+        }
+    }
+
+    #[test]
+    fn dial_parse_refuses_an_oracle_service_name_that_is_not_an_identifier() {
+        // SRC-4 slice 1 review SHOULD-FIX 3: a fixed sentence, never the value.
+        let too_long = "A".repeat(129);
+        for name in ["a)(b", "a=b", "a b", "(a", "", too_long.as_str()] {
+            let json = serde_json::json!({
+                "driver": "oracle", "host": "oracle.internal", "port": 1521,
+                "database": name, "user": "reader"
+            });
+            let msg = Dial::parse("sql", &json).unwrap_err().to_string();
+            assert!(msg.contains("Oracle service name"), "{name:?}: {msg}");
+            assert!(
+                name.is_empty() || !msg.contains(name),
+                "the message must not repeat the value: {msg}"
+            );
+        }
+    }
+
+    #[test]
     fn dial_parse_refuses_oracle_tls_with_no_ssl_server_cert_dn() {
         let json = serde_json::json!({
             "driver": "oracle",
@@ -3103,6 +3752,11 @@ mod target_identity_tests {
         assert!(Dial::parse("sql", &missing).is_err());
     }
 
+    /// The target identity of a `cdc` dial is its driver, host, port and database, and nothing
+    /// else. `SRC-4` slice 3 (decision S3-a) makes `slotName`/`publicationName` PostgreSQL-only and
+    /// `serverId` MySQL-only, so this test's old fixture (a PostgreSQL dial given a `serverId` and
+    /// switched to `mysql` with slot names) is no longer a dial `Dial::parse` accepts. The intent is
+    /// unchanged: each field below is varied on a dial that is valid for its driver.
     #[test]
     fn a_cdc_dial_is_re_pointed_by_driver_host_port_or_database_only() {
         let base = json!({
@@ -3110,14 +3764,157 @@ mod target_identity_tests {
             "database": "orders", "user": "reader",
             "slotName": "slot_a", "publicationName": "pub_a"
         });
-        assert!(!same("cdc", &base, "driver", json!("mysql")));
         assert!(!same("cdc", &base, "host", json!("other.internal")));
         assert!(!same("cdc", &base, "port", json!(5433)));
         assert!(!same("cdc", &base, "database", json!("billing")));
         assert!(same("cdc", &base, "user", json!("someone_else")));
         assert!(same("cdc", &base, "slotName", json!("slot_b")));
         assert!(same("cdc", &base, "publicationName", json!("pub_b")));
-        assert!(same("cdc", &base, "serverId", json!(7)));
+        // The driver: the same host, port and database under another driver is another target.
+        let mysql = json!({
+            "driver": "mysql", "host": "db.internal", "port": 5432,
+            "database": "orders", "user": "reader", "serverId": 7
+        });
+        assert_ne!(
+            parse("cdc", &base).target_identity(),
+            parse("cdc", &mysql).target_identity()
+        );
+        // MySQL's server id is not part of the target.
+        assert!(same("cdc", &mysql, "serverId", json!(8)));
+    }
+
+    fn cdc_mongo() -> Value {
+        json!({
+            "driver": "mongodb",
+            "hosts": ["mongo-a.internal:27017"],
+            "database": "shop", "user": "reader", "replicaSet": "rs0"
+        })
+    }
+
+    /// `SRC-4` S5-a: the host, the database and the replica set are the target; the user, the TLS
+    /// mode and the case of the host are not.
+    #[test]
+    fn a_mongodb_cdc_dial_is_re_pointed_by_hosts_database_or_replica_set() {
+        let base = cdc_mongo();
+        assert!(!same(
+            "cdc",
+            &base,
+            "hosts",
+            json!(["mongo-a.internal:27018"])
+        ));
+        assert!(!same(
+            "cdc",
+            &base,
+            "hosts",
+            json!(["mongo-b.internal:27017"])
+        ));
+        assert!(!same("cdc", &base, "database", json!("billing")));
+        assert!(!same("cdc", &base, "replicaSet", json!("rs1")));
+        assert!(same("cdc", &base, "user", json!("someone_else")));
+        assert!(same("cdc", &base, "sslMode", json!("disable")));
+        assert!(same(
+            "cdc",
+            &base,
+            "hosts",
+            json!(["MONGO-A.internal:27017"])
+        ));
+        // A MongoDB target is never equal to a SQL one.
+        let postgres = json!({
+            "driver": "postgres", "host": "mongo-a.internal", "port": 27017,
+            "database": "shop", "user": "reader",
+            "slotName": "s", "publicationName": "p"
+        });
+        assert_ne!(
+            parse("cdc", &base).target_identity(),
+            parse("cdc", &postgres).target_identity()
+        );
+    }
+
+    #[test]
+    fn a_mongodb_cdc_dial_parses_to_its_own_variant_and_a_sql_one_does_not() {
+        assert!(matches!(
+            parse("cdc", &cdc_mongo()),
+            Dial::CdcMongo(ref dial) if dial.replica_set == "rs0" && dial.hosts.len() == 1
+        ));
+        assert!(parse("cdc", &cdc_mongo()).as_cdc().is_none());
+        assert!(parse("cdc", &cdc_mongo()).as_cdc_mongo().is_some());
+        let postgres = json!({
+            "driver": "postgres", "host": "db.internal", "port": 5432,
+            "database": "orders", "user": "reader",
+            "slotName": "s", "publicationName": "p"
+        });
+        assert!(parse("cdc", &postgres).as_cdc_mongo().is_none());
+    }
+
+    #[test]
+    fn a_mongodb_cdc_dial_refuses_what_it_does_not_know_or_cannot_dial_safely() {
+        let refused = |field: &str, value: Value| {
+            let mut dial = cdc_mongo();
+            dial[field] = value;
+            Dial::parse("cdc", &dial).is_err()
+        };
+        // The replica set is required, and plain characters only.
+        let mut without = cdc_mongo();
+        without.as_object_mut().unwrap().remove("replicaSet");
+        assert!(Dial::parse("cdc", &without).is_err());
+        assert!(refused("replicaSet", json!("")));
+        assert!(refused("replicaSet", json!("rs0&authSource=admin")));
+        // No connection string of the person's own, no SRV, no PostgreSQL fields.
+        for (field, value) in [
+            ("uri", json!("mongodb://x")),
+            ("srvUri", json!("mongodb+srv://x")),
+            ("slotName", json!("s")),
+            ("serverId", json!(7)),
+            ("host", json!("h")),
+        ] {
+            assert!(refused(field, value), "{field} must be refused");
+        }
+        // Hosts: at least one, each host:port with a valid host and port.
+        assert!(refused("hosts", json!([])));
+        assert!(refused("hosts", json!(["mongo-a.internal"])));
+        // SRC-4 slice 5 review BLOCKER 1: more than one host is refused, with the fixed sentence.
+        let two = json!(["mongo-a.internal:27017", "mongo-b.internal:27017"]);
+        assert!(refused("hosts", two.clone()));
+        let mut dial = cdc_mongo();
+        dial["hosts"] = two;
+        assert!(
+            Dial::parse("cdc", &dial)
+                .unwrap_err()
+                .to_string()
+                .contains(super::CDC_MONGO_ONE_HOST)
+        );
+        // SHOULD-FIX 1: the replicaSet sentence is one line with single spaces, exactly this text.
+        let mut dial = cdc_mongo();
+        dial["replicaSet"] = json!("rs0&x");
+        assert!(Dial::parse("cdc", &dial).unwrap_err().to_string().contains(
+            "replicaSet must be 1 to 128 letters, digits, underscores, hyphens or dots: the name in the server's replica set configuration"
+        ));
+        assert!(!super::CDC_MONGO_REPLICA_SET.contains("  "));
+        assert!(refused("hosts", json!(["mongo-a.internal:0"])));
+        assert!(refused("hosts", json!(["mongo-a.internal:70000"])));
+        assert!(refused("hosts", json!(["mongo{a}.internal:27017"])));
+        assert!(refused("hosts", json!(["bad;host:27017"])));
+        // Database and user.
+        assert!(refused("database", json!("")));
+        assert!(refused("database", json!("shop.orders")));
+        assert!(refused("database", json!("shop,other")));
+        assert!(refused("user", json!("")));
+        assert!(refused("sslMode", json!("prefer")));
+        // The driver word is exact: a different spelling is the SQL shape and fails there.
+        assert!(refused("driver", json!("Mongodb")));
+    }
+
+    #[test]
+    fn a_mongodb_cdc_dial_defaults_to_require_and_reads_every_mode() {
+        let Dial::CdcMongo(dial) = parse("cdc", &cdc_mongo()) else {
+            panic!("a MongoDB CDC dial");
+        };
+        assert_eq!(dial.ssl_mode, super::CdcSslMode::Require);
+        for mode in ["disable", "require", "verify-ca", "verify-full"] {
+            let mut json = cdc_mongo();
+            json["sslMode"] = json!(mode);
+            assert!(Dial::parse("cdc", &json).is_ok(), "{mode}");
+        }
     }
 
     #[test]
@@ -3487,14 +4284,15 @@ mod target_identity_tests {
         .expect("valid sql dial")
     }
 
-    /// `SRC-11` D9: column choice for the four sources that list columns
-    /// before loading; a refusal for Oracle, change capture and the rest.
+    /// `SRC-11` D9 and `SRC-4` T1.2: column choice for the four SQL drivers
+    /// that list columns before loading (Oracle since `SRC-4`); a refusal for
+    /// change capture and the rest.
     #[test]
     fn excluded_columns_are_accepted_only_for_sources_that_list_their_columns() {
         let objects = serde_json::json!([
             { "name": "public.orders", "target": "orders", "excludedColumns": ["note"] }
         ]);
-        for driver in ["postgres", "mysql", "mssql"] {
+        for driver in ["postgres", "mysql", "mssql", "oracle"] {
             assert_eq!(
                 validate_excluded_columns(&sql_dial_of(driver), &objects),
                 Ok(()),
@@ -3504,10 +4302,6 @@ mod target_identity_tests {
         let refused = Err(InvalidExcludedColumns::NotForSource {
             name: "public.orders".to_owned(),
         });
-        assert_eq!(
-            validate_excluded_columns(&sql_dial_of("oracle"), &objects),
-            refused
-        );
         let cdc = Dial::parse(
             "cdc",
             &serde_json::json!({
@@ -3519,6 +4313,7 @@ mod target_identity_tests {
         .expect("valid cdc dial");
         assert_eq!(validate_excluded_columns(&cdc, &objects), refused);
         assert!(supports_column_choice(&sql_dial_of("postgres")));
+        assert!(supports_column_choice(&sql_dial_of("oracle")));
         assert!(!supports_column_choice(&cdc));
     }
 

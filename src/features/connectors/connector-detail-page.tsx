@@ -11,6 +11,7 @@ import {
   InfoIcon,
   LayoutGridIcon,
   PlugZapIcon,
+  RadioIcon,
   type LucideIcon,
 } from "lucide-react"
 import { keepStripInView, LineTabsList, type LineTab } from "@/components/patterns/line-tabs"
@@ -22,26 +23,33 @@ import { Button } from "@/components/ui/button"
 import { Tabs, TabsContent } from "@/components/ui/tabs"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { SECRET_MANAGER_LABEL, type SecretManager } from "@/lib/connectors/secret-reference"
+import { runConnectionTest } from "@/lib/connectors/run-connection-test"
 import { TEST_OUTCOME_TOAST, testOutcome, type TestOutcome } from "@/lib/connectors/test-result"
 import { formatDateTime, formatRelativeTime } from "@/lib/format"
 import { notifyError, notifyFailure, notifyInfo, notifySuccess } from "@/lib/notify"
 import { cn } from "@/lib/utils"
 import { connectorService } from "@/services"
 import type { ConnectorDetail, ConnectorTestResult } from "@/services/contracts/connectors"
+import { ConnectorChangeCapturePanel } from "./connector-change-capture-panel"
 import { ConnectorDeleteDialog } from "./connector-delete-dialog"
 import { ConnectorIngestPanel } from "./connector-ingest-panel"
 import { ConnectorOAuthPanel, oauthSignIn } from "./connector-oauth-panel"
 import { ConnectorOverview } from "./connector-overview"
 import { ConnectorProbeHistoryPanel } from "./connector-probe-history-panel"
 import { ConnectorSchemaChangesPanel } from "./connector-schema-changes-panel"
+import { ConnectorSetupChecks } from "./connector-setup-checks"
 import { DIRECTION_LABEL } from "./connectors-columns"
 
-type ConnectorTab = "overview" | "ingest" | "schema" | "tests"
+type ConnectorTab = "overview" | "ingest" | "capture" | "schema" | "tests"
 
-/** The four tabs, in order. `?tab=` names any but the first. */
+/**
+ * The tabs, in order. `?tab=` names any but the first. "Change capture" is only for a connector that captures
+ * changes (`SRC-4` decision S4-g); `parseTab` and the strip leave it out for every other.
+ */
 const TABS: { value: ConnectorTab; label: string; icon: LucideIcon }[] = [
   { value: "overview", label: "Overview", icon: LayoutGridIcon },
   { value: "ingest", label: "Ingest", icon: DatabaseIcon },
+  { value: "capture", label: "Change capture", icon: RadioIcon },
   { value: "schema", label: "Schema changes", icon: GitCompareArrowsIcon },
   { value: "tests", label: "Connection tests", icon: PlugZapIcon },
 ]
@@ -130,15 +138,18 @@ function TestNotice({ result }: { result: ConnectorTestResult }) {
   const { label, icon: Icon, box, accent } = NOTICE[outcome]
   const latency = outcome !== "unsupported" && result.latencyMs !== null ? ` · ${result.latencyMs} ms` : ""
   return (
-    <div role="status" className={cn("flex items-start gap-2 rounded-lg border px-3 py-2", box)}>
-      <Icon className={cn("mt-0.5 size-4 shrink-0", accent)} aria-hidden />
-      <p className="min-w-0 text-sm">
-        <span className={cn("font-medium", accent)}>{label}</span>
-        <span className="ml-2 break-words text-foreground">
-          {result.message}
-          {latency}
-        </span>
-      </p>
+    <div className="flex flex-col gap-2">
+      <div role="status" className={cn("flex items-start gap-2 rounded-lg border px-3 py-2", box)}>
+        <Icon className={cn("mt-0.5 size-4 shrink-0", accent)} aria-hidden />
+        <p className="min-w-0 text-sm">
+          <span className={cn("font-medium", accent)}>{label}</span>
+          <span className="ml-2 break-words text-foreground">
+            {result.message}
+            {latency}
+          </span>
+        </p>
+      </div>
+      {result.setupChecks && result.setupChecks.length > 0 ? <ConnectorSetupChecks checks={result.setupChecks} /> : null}
     </div>
   )
 }
@@ -203,7 +214,7 @@ export function ConnectorDetailPage({ connectorId: id }: { connectorId: string }
   }
   const testAction = useServiceAction(async (signal, connectorId: string) => {
     try {
-      const result = await connectorService.testConnection(connectorId, signal)
+      const result = await runConnectionTest(connectorService, connectorId, signal)
       // A cancelled request is not an answer; announce nothing for it.
       if (!signal.aborted) announceTest(result)
       return result
@@ -225,6 +236,10 @@ export function ConnectorDetailPage({ connectorId: id }: { connectorId: string }
   // (`SRC-12` part C); its ingest spec says which one that is.
   const ingestSpec = useService((s) => connectorService.getIngestSpec(id, s), [id])
   const oauth = ingestSpec.status === "success" ? oauthSignIn(ingestSpec.data) : null
+  // The Change capture tab is only for a connector that captures changes (`SRC-4` S4-g). A link to it for any
+  // other connector lands on the overview once the spec has said so.
+  const capturesChanges = ingestSpec.status === "success" && ingestSpec.data.adapter === "cdc"
+  const shownTab: ConnectorTab = tab === "capture" && ingestSpec.status === "success" && !capturesChanges ? "overview" : tab
   const latestProbe = useService((s) => connectorService.listProbeHistory(id, 1, s), [id], {
     keepDataOnReload: true,
   })
@@ -285,10 +300,14 @@ export function ConnectorDetailPage({ connectorId: id }: { connectorId: string }
   const counts: Record<ConnectorTab, LineTab["count"]> = {
     overview: null,
     ingest: savedTables === null ? null : { count: savedTables },
+    capture: null,
     schema: waiting.groups > 0 ? { count: waiting.groups, tone: "warning" } : null,
     tests: latest && !latest.ok ? { count: 1, tone: "danger" } : null,
   }
-  const stripTabs: LineTab[] = TABS.map((t) => ({ ...t, count: counts[t.value] }))
+  const stripTabs: LineTab[] = TABS.filter((t) => t.value !== "capture" || capturesChanges).map((t) => ({
+    ...t,
+    count: counts[t.value],
+  }))
 
   return (
     <div className="flex flex-col gap-3">
@@ -368,8 +387,8 @@ export function ConnectorDetailPage({ connectorId: id }: { connectorId: string }
       {oauth ? <ConnectorOAuthPanel connectorId={id} onChanged={state.reload} /> : null}
       {testAction.data ? <TestNotice result={testAction.data} /> : null}
       <div ref={tabsRootRef}>
-        <Tabs value={tab} onValueChange={(v) => selectTab(v as ConnectorTab)} className="gap-3">
-          <LineTabsList tabs={stripTabs} active={tab} />
+        <Tabs value={shownTab} onValueChange={(v) => selectTab(v as ConnectorTab)} className="gap-3">
+          <LineTabsList tabs={stripTabs} active={shownTab} />
           <TabsContent value="overview">
             {/* Remounted on every visit (and after a test), so it never
                 shows a schedule or a run from before a change elsewhere. */}
@@ -386,6 +405,11 @@ export function ConnectorDetailPage({ connectorId: id }: { connectorId: string }
               onResumed={state.reload}
             />
           </TabsContent>
+          {capturesChanges ? (
+            <TabsContent value="capture">
+              <ConnectorChangeCapturePanel connectorId={id} pausedReason={c.pausedReason} onChanged={state.reload} />
+            </TabsContent>
+          ) : null}
           <TabsContent value="schema" keepMounted>
             <ConnectorSchemaChangesPanel
               connectorId={id}

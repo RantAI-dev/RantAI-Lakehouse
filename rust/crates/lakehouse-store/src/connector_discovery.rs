@@ -3,16 +3,23 @@
 //! `connector_discovery`, migration `0075_connector_discovery.sql` -- read its
 //! header for the shape of the row).
 //!
-//! # Two requests, one answer shape
+//! # Three requests, one answer shape
 //!
-//! A person asks one of two things of a connector's source:
+//! A person asks one of three things of a connector's source (the third,
+//! `test`, is `SRC-4` T1.1, migration `0115`):
 //!
 //! - a **list** ([`Kind::List`]): the names of what exists there (schemas or
 //!   tables, files, endpoints, topics, collections), names first and no
 //!   columns (D9);
 //! - a **preview** ([`Kind::Preview`]): the columns of ONE listed object, with
 //!   a type each and whether the type was declared by the source or
-//!   inferred from a sample (D6).
+//!   inferred from a sample (D6);
+//! - a **test** ([`Kind::Test`]): whether the connector can connect at all,
+//!   for the types whose driver only the orchestrator has (Oracle). It is not
+//!   asked on a discovery route: `POST /api/connectors/{id}/test` launches it
+//!   and the result route records it as a connection test (stored health,
+//!   audit, probe history). A done answer holds only the time the connection
+//!   took (`latencyMs`).
 //!
 //! The API answers either from its own drivers (SQL, object storage, REST) in
 //! the same request, or launches the orchestrator's `discover_job` and answers
@@ -32,6 +39,7 @@
 //! { "kind": "list", "state": "failed", "errorClass": "unreachable",
 //!   "reason": "The source could not be reached." }
 //! { "kind": "list", "state": "running" }
+//! { "kind": "test", "state": "done", "latencyMs": 212 }
 //! ```
 //!
 //! `size`, `modifiedAt`, `primaryKey`, `scope`, `object` and `reason` are left
@@ -107,6 +115,9 @@ pub enum Kind {
     List,
     /// The columns of one listed object.
     Preview,
+    /// Whether the connector can connect (`SRC-4` T1.1): launched by the
+    /// connection-test route, not by a discovery route.
+    Test,
 }
 
 impl Kind {
@@ -117,6 +128,7 @@ impl Kind {
         match self {
             Self::List => "list",
             Self::Preview => "preview",
+            Self::Test => "test",
         }
     }
 
@@ -126,6 +138,7 @@ impl Kind {
         match text {
             "list" => Some(Self::List),
             "preview" => Some(Self::Preview),
+            "test" => Some(Self::Test),
             _ => None,
         }
     }
@@ -356,6 +369,213 @@ pub struct Preview {
     pub primary_key: Option<Vec<String>>,
 }
 
+/// The longest connection a test may report, in milliseconds: the orchestrator
+/// dials with a bounded timeout, so a figure past an hour is not a measurement.
+pub const MAX_TEST_LATENCY_MS: i64 = 3_600_000;
+
+/// Whether the server's replica set name is the dial's (`SRC-4` Amendment 8, S8-c).
+/// The comparison is made in the orchestrator; only this word is posted, never the name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReplicaSetFact {
+    /// `hello.setName` is the dial's `replicaSet`.
+    Matches,
+    /// It is another name.
+    Differs,
+    /// The server reports no `setName`: it is not a replica set member.
+    None,
+}
+
+/// Whether the login may read change streams on the dial's database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChangeStreamFact {
+    /// `find` and `changeStream` are granted on the database or wider.
+    Granted,
+    /// They are not.
+    Missing,
+}
+
+/// What the orchestrator's `MongoDB` connection test read about the source's setup
+/// (`SRC-4` Amendment 8, S8-c). Every key is optional: an absent key means "not read"
+/// (the command raised), never a guess. A closed word per fact; no server text.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MongoSetupFacts {
+    /// The replica set name against the dial's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replica_set: Option<ReplicaSetFact>,
+    /// `hello.isWritablePrimary`: the one host the connector names is the primary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary: Option<bool>,
+    /// The login's change-stream privilege on the database.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_stream: Option<ChangeStreamFact>,
+}
+
+/// Oracle's `LOG_MODE` (`SRC-4` Amendment 11, S11-b): a closed word, read in the orchestrator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OracleLogMode {
+    /// `ARCHIVELOG`: what `LogMiner` needs.
+    Archivelog,
+    /// `NOARCHIVELOG`.
+    Noarchivelog,
+}
+
+/// Oracle's database-level minimal supplemental logging (`supplemental_log_data_min`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OracleSupplementalMin {
+    /// Switched on.
+    Yes,
+    /// Off.
+    No,
+    /// On because something else implies it (a primary-key or all-column logging).
+    Implicit,
+}
+
+/// What the orchestrator found for one selected table (`SRC-4` Amendment 11, S11-b).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum OracleTableFact {
+    /// The table exists and has `(ALL) COLUMNS` supplemental logging.
+    AllColumns,
+    /// The table exists and has not.
+    WithoutAllColumns,
+    /// The login sees no such table in the pluggable database.
+    NotFound,
+}
+
+/// A system privilege or role of `Debezium`'s documented `LogMiner` list, as the closed set of
+/// names the orchestrator may report missing (a name outside it is refused when the result is
+/// posted, so a result can never carry text of its own).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum OraclePrivilege {
+    /// `CREATE SESSION`.
+    #[serde(rename = "CREATE SESSION")]
+    CreateSession,
+    /// `SET CONTAINER`.
+    #[serde(rename = "SET CONTAINER")]
+    SetContainer,
+    /// `LOGMINING`.
+    #[serde(rename = "LOGMINING")]
+    Logmining,
+    /// `SELECT ANY TRANSACTION`.
+    #[serde(rename = "SELECT ANY TRANSACTION")]
+    SelectAnyTransaction,
+    /// `EXECUTE_CATALOG_ROLE`.
+    #[serde(rename = "EXECUTE_CATALOG_ROLE")]
+    ExecuteCatalogRole,
+    /// `SELECT_CATALOG_ROLE`.
+    #[serde(rename = "SELECT_CATALOG_ROLE")]
+    SelectCatalogRole,
+    /// `CREATE TABLE`.
+    #[serde(rename = "CREATE TABLE")]
+    CreateTable,
+    /// `LOCK ANY TABLE`.
+    #[serde(rename = "LOCK ANY TABLE")]
+    LockAnyTable,
+    /// `CREATE SEQUENCE`.
+    #[serde(rename = "CREATE SEQUENCE")]
+    CreateSequence,
+    /// `FLASHBACK ANY TABLE` (or `FLASHBACK` on each captured table).
+    #[serde(rename = "FLASHBACK ANY TABLE")]
+    FlashbackAnyTable,
+    /// `SELECT ANY TABLE` (or `SELECT` on each captured table).
+    #[serde(rename = "SELECT ANY TABLE")]
+    SelectAnyTable,
+}
+
+/// The most selected tables an Oracle test reports on: the bound of the contract.
+pub const MAX_ORACLE_SETUP_TABLES: usize = 500;
+
+/// What the orchestrator's Oracle change-capture test read about the source's setup (`SRC-4`
+/// Amendment 11, S11-b), over an unencrypted session limited to the data dictionary (the signed
+/// `SEC-14` exception). Every key is optional: an absent key means "not read", never a guess. Closed
+/// words only; the table names are checked against the connector's selected tables by the reader.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OracleSetupFacts {
+    /// `LOG_MODE`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_mode: Option<OracleLogMode>,
+    /// `supplemental_log_data_min`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supplemental_min: Option<OracleSupplementalMin>,
+    /// `supplemental_log_data_all`: all-column logging for the whole database.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supplemental_all: Option<bool>,
+    /// Per selected table (`SCHEMA.TABLE`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tables: Option<std::collections::BTreeMap<String, OracleTableFact>>,
+    /// The documented privileges and roles the login does not hold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub missing_privileges: Option<Vec<OraclePrivilege>>,
+    /// The server refused an unencrypted session (`ORA-12660`): nothing else could be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encryption_required: Option<bool>,
+}
+
+impl OracleSetupFacts {
+    /// Check the bound of the contract.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Validation`] for more than [`MAX_ORACLE_SETUP_TABLES`] tables or a table
+    /// name that is not a plain name.
+    pub fn validate(&self) -> Result<(), StoreError> {
+        if let Some(tables) = &self.tables {
+            if tables.len() > MAX_ORACLE_SETUP_TABLES {
+                return Err(StoreError::Validation(format!(
+                    "oracleSetup names more than {MAX_ORACLE_SETUP_TABLES} tables"
+                )));
+            }
+            for name in tables.keys() {
+                check_name("an oracleSetup table name", name, MAX_NAME_CHARS)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The result of a [`Kind::Test`] request: the connection was made.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Tested {
+    /// How long the connection took, in milliseconds, as the orchestrator
+    /// measured it (never a figure the API made up).
+    pub latency_ms: i64,
+    /// The setup facts a `MongoDB` change-capture test read; absent for every other
+    /// connector, and for a test stored before they existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mongo_setup: Option<MongoSetupFacts>,
+    /// The setup facts an Oracle change-capture test read (`SRC-4` Amendment 11); absent for every
+    /// other connector.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oracle_setup: Option<OracleSetupFacts>,
+}
+
+impl Tested {
+    /// Check the bound of the contract.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Validation`] for a negative latency or one past
+    /// [`MAX_TEST_LATENCY_MS`], or setup facts past their bounds.
+    pub fn validate(&self) -> Result<(), StoreError> {
+        if !(0..=MAX_TEST_LATENCY_MS).contains(&self.latency_ms) {
+            return Err(StoreError::Validation(format!(
+                "latencyMs must be between 0 and {MAX_TEST_LATENCY_MS}"
+            )));
+        }
+        if let Some(facts) = &self.oracle_setup {
+            facts.validate()?;
+        }
+        Ok(())
+    }
+}
+
 /// A name (object, column, key) as accepted: not blank, at most
 /// [`MAX_NAME_CHARS`] characters, no control characters.
 fn check_name(what: &str, value: &str, max: usize) -> Result<(), StoreError> {
@@ -466,6 +686,8 @@ pub enum Outcome {
     Listing(Listing),
     /// Columns, for a [`Kind::Preview`] request.
     Preview(Preview),
+    /// The connection was made, for a [`Kind::Test`] request.
+    Tested(Tested),
     /// The request failed.
     Failed(ErrorClass),
 }
@@ -496,12 +718,19 @@ pub struct Answer {
     /// A finished preview's primary key.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub primary_key: Option<Vec<String>>,
+    /// A finished test's connection time in milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<i64>,
     /// A failed request's class.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_class: Option<ErrorClass>,
     /// The fixed sentence for a failure, or for a cut list.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<&'static str>,
+    /// The setup checks of a finished `MongoDB` change-capture test (`SRC-4` Amendment 8,
+    /// S8-e), filled by the poll route; never part of the stored answer, never `ok`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub setup_checks: Option<Vec<crate::connectors::SetupCheck>>,
     /// When the request started, for an answer read from the store.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub started_at: Option<IsoTime>,
@@ -521,8 +750,10 @@ impl Answer {
             truncated: None,
             columns: None,
             primary_key: None,
+            latency_ms: None,
             error_class: None,
             reason: None,
+            setup_checks: None,
             started_at: None,
             ended_at: None,
         }
@@ -563,6 +794,14 @@ impl Answer {
         answer.primary_key = preview.primary_key;
         answer
     }
+
+    /// A finished connection test.
+    #[must_use]
+    pub fn tested(tested: &Tested) -> Self {
+        let mut answer = Self::bare(Kind::Test, State::Done);
+        answer.latency_ms = Some(tested.latency_ms);
+        answer
+    }
 }
 
 /// A stored request, as read back.
@@ -584,6 +823,8 @@ pub struct Stored {
     pub listing: Option<Listing>,
     /// The columns, when a preview finished.
     pub preview: Option<Preview>,
+    /// The connection time, when a test finished.
+    pub tested: Option<Tested>,
     /// When it started.
     pub started_at: OffsetDateTime,
     /// When it ended.
@@ -606,12 +847,13 @@ impl Stored {
             State::Failed => {
                 Answer::failed(self.kind, self.error_class.unwrap_or(ErrorClass::Failed))
             }
-            State::Done => match (self.kind, self.listing, self.preview) {
-                (Kind::List, Some(listing), _) => Answer::listing(&self.scope, listing),
-                (Kind::Preview, _, Some(preview)) => Answer::preview(&self.object, preview),
+            State::Done => match (self.kind, self.listing, self.preview, self.tested) {
+                (Kind::List, Some(listing), _, _) => Answer::listing(&self.scope, listing),
+                (Kind::Preview, _, Some(preview), _) => Answer::preview(&self.object, preview),
+                (Kind::Test, _, _, Some(tested)) => Answer::tested(&tested),
                 // A done row without its result cannot be written (the
                 // migration's CHECK); said as a failure, not as an empty list.
-                (kind, _, _) => Answer::failed(kind, ErrorClass::Failed),
+                (kind, _, _, _) => Answer::failed(kind, ErrorClass::Failed),
             },
         };
         if self.kind == Kind::Preview && answer.object.is_none() {
@@ -649,7 +891,7 @@ impl TryFrom<Row> for Stored {
     fn try_from(row: Row) -> Result<Self, StoreError> {
         let kind = Kind::parse(&row.kind).ok_or_else(unreadable)?;
         let state = State::parse(&row.state).ok_or_else(unreadable)?;
-        let (mut listing, mut preview) = (None, None);
+        let (mut listing, mut preview, mut tested) = (None, None, None);
         if let Some(value) = row.result {
             match kind {
                 Kind::List => {
@@ -657,6 +899,9 @@ impl TryFrom<Row> for Stored {
                 }
                 Kind::Preview => {
                     preview = Some(serde_json::from_value(value).map_err(|_| unreadable())?);
+                }
+                Kind::Test => {
+                    tested = Some(serde_json::from_value(value).map_err(|_| unreadable())?);
                 }
             }
         }
@@ -669,6 +914,7 @@ impl TryFrom<Row> for Stored {
             error_class: row.error_class.as_deref().and_then(ErrorClass::parse),
             listing,
             preview,
+            tested,
             started_at: row.started_at,
             ended_at: row.ended_at,
         })
@@ -695,8 +941,10 @@ pub async fn begin(
     scope: &str,
     at: OffsetDateTime,
 ) -> Result<(), StoreError> {
-    if kind == Kind::List && !object.is_empty() {
-        return Err(StoreError::Validation("a list names no object".to_owned()));
+    if kind != Kind::Preview && !object.is_empty() {
+        return Err(StoreError::Validation(
+            "only a preview names an object".to_owned(),
+        ));
     }
     for (what, value) in [("object", object), ("scope", scope)] {
         if value.chars().count() > MAX_NAME_CHARS || value.chars().any(char::is_control) {
@@ -732,7 +980,8 @@ pub async fn begin(
 /// # Errors
 ///
 /// [`StoreError::Validation`] when `outcome` is a list for a preview (or the
-/// reverse) or breaks a bound of [`Listing::validate`] / [`Preview::validate`];
+/// reverse, or a test result for another kind) or breaks a bound of
+/// [`Listing::validate`] / [`Preview::validate`] / [`Tested::validate`];
 /// [`StoreError::Database`] otherwise.
 pub async fn finish(
     pool: &PgPool,
@@ -751,6 +1000,10 @@ pub async fn finish(
             (Kind::Preview, Outcome::Preview(preview)) => {
                 preview.validate()?;
                 (State::Done, None, Some(to_json(preview)?))
+            }
+            (Kind::Test, Outcome::Tested(tested)) => {
+                tested.validate()?;
+                (State::Done, None, Some(to_json(tested)?))
             }
             (_, Outcome::Failed(class)) => (State::Failed, Some(*class), None),
             _ => {

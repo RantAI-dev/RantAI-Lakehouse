@@ -1,54 +1,22 @@
 #!/usr/bin/env python3
-"""G4 acceptance test (`docs/plans/LAKEHOUSE-FOUNDATION-PLAN.md` §3, P5):
+"""G4 acceptance test: PostgreSQL change capture on `Kafka Connect` (`SRC-4` slice 2, decision
+S2-j; ADR 0016).
 
-1. INSERT, UPDATE, and DELETE on the Postgres source
-   (`p5_cdc.orders`) are all visible in ClickHouse — reading the Bronze
-   Iceberg table `debezium-server-iceberg` writes through Lakekeeper —
-   within an agreed latency.
-2. Replication slot cleanup is verified on connector delete: after the
-   test, the connector's Debezium Server process is stopped and its
-   Postgres replication slot is dropped
-   (`ops/debezium/deprovision_connector.sh`); the slot must not remain,
-   pinning WAL, afterward.
+Since slice 3 (plan task T3.6) the steps every change-capture gate shares live in `cdc_gate.py`
+(the connector registered through the API, the password kept out of Kafka Connect's config, the
+first copy, the freshness budget, a pause and a worker restart, a schema change, `DELETE`), and
+`g4_mysql_test.py` and `g4_mssql_test.py` use the same module. What stays here is what only
+PostgreSQL has: `PgSource` (psql, a replication slot and a publication, `generate_series`), the
+WAL-breach alert and the OIDC round trip of the original G4 gate. The steps, their order and the
+output of this gate are those of slice 2.
 
-# Chosen latency budget: 20 seconds
+# Source of the two tables
 
-`docs/plans/P5-RESULT.md`'s manual measurement observed each CDC event
-committed to Iceberg roughly 0.2-1.5s after the source transaction (the
-`CommitReport`/`Committed N events` log lines land within that window of
-the `INSERT`/`UPDATE`/`DELETE` statement completing). 20 seconds is a
-10-100x margin over that measured commit latency — generous enough to
-absorb CI scheduling jitter and the debezium-server-iceberg image's own
-per-batch flush interval, while still being tight enough that a real
-regression (e.g. the connector silently not running) fails the gate
-promptly rather than timing out at some much larger number that would
-mask a slow but real problem.
-
-# SRC-9 (plan task 6): the four steps of the connector gates
-
-This gate is also the connector gate of `PostgreSQL CDC` (`ops/gates/
-coverage.json`, gate `g4`), and records its four steps through
-`ops/gates/gate_summary.py`, whose table it prints at the end and the job
-copies into its summary:
-
-- `connect`, `discover`: the demo CDC source is registered in the connector
-  registry as the console would (type `PostgreSQL CDC`, adapter `cdc`, the
-  slot and publication names this stack really has), then `POST .../test`
-  and the discovery routes (`POST .../discovery/{list,preview}`, schema `p5_cdc`) must answer for real,
-  as they do for its SQL twin. A failed one is recorded and the gate goes on.
-- `load`: the first copy. Debezium's initial snapshot reaches Bronze and holds
-  the rows `g4-source-init` seeded.
-- `reload`: the insert, update and delete arriving within the latency budget.
-
-# Why `count() WHERE 1`, never a bare `count()`
-
-`docs/plans/P5-RESULT.md`'s (A) finding: ClickHouse 26.3's bare
-`count()`/`count(*)`/`count(<col>)` over a merge-on-read Iceberg table with
-equality deletes takes a metadata-only fast path that does NOT apply
-delete filtering and overcounts. Every row-count check in this test uses a
-`WHERE` predicate (forcing the correct, row-scanning path) — this is not
-optional stylistic choice, it is the one workaround that measurement
-requires.
+A schema `g4_cdc` of the stack's own `postgres:16` with two identical tables (`orders` in
+"current row per key" mode, `orders_history` in "history" mode), 20,000 seeded rows each,
+`REPLICA IDENTITY FULL` (so a delete event carries the old row), one publication scoped to
+those two tables (never `FOR ALL TABLES`), and a table outside the publication, `wal_noise`,
+that the WAL-breach step writes to.
 """
 
 from __future__ import annotations
@@ -61,59 +29,134 @@ import urllib.parse
 
 import requests
 
-# SRC-9 plan task 6: the coverage registry and the result table, mounted at
-# /opt/gates by `g4-test-runner` in docker-compose.yml (PYTHONPATH).
-import gate_summary
+import cdc_gate
+from cdc_gate import API, API_URL, G4Failure, _wait_for
 
-CH_URL = os.environ.get("CH_URL", "http://clickhouse:8123")
-CH_USER = os.environ.get("CH_USER", "default")
-CH_PASSWORD = os.environ.get("CH_PASSWORD", "")
-LAKEKEEPER_CATALOG_URI = os.environ.get("CH_LAKEKEEPER_CATALOG_URI", "http://lakekeeper:8181/catalog")
-RUSTFS_S3_ENDPOINT = os.environ.get("CH_RUSTFS_S3_ENDPOINT", "http://rustfs:9000")
-LAKEKEEPER_WAREHOUSE = os.environ.get("LAKEKEEPER_WAREHOUSE", "default")
-# R1 (ADR 0011): see `ops/g3a/g3a_test.py`'s identical comment —
-# `catalog_credential` needs the OAuth2 `client_id:client_secret` form,
-# pointed at `ops/oidc-mock`'s `/token` endpoint. Empty on a pre-R1 or
-# authz-disabled stack.
-CH_OAUTH_CLIENT_ID = os.environ.get("CH_OAUTH_CLIENT_ID", "")
-CH_OAUTH_SERVER_URI = os.environ.get("CH_OAUTH_SERVER_URI", "")
-
-# Duplicated from ops/g3a/g3a_test.py's step_login/API session — g4_test.py
-# has no shared package with g3a_test.py to import this from (each g*
-# gate script is a standalone entrypoint), matching this file's existing
-# precedent of duplicating ch_query/_wait_for from the same source.
-API_URL = os.environ.get("API_URL", "http://lakehouse-api:8089")
-# oidc-mock's /authorize + /token endpoints that
-# step_oidc_authorization_code_round_trip drives lakehouse-api's
-# /api/auth/oidc/{start,callback} against. Mirrors this file's existing
-# `API_URL` env-var-with-default pattern, not a new style.
 OIDC_MOCK_URL = os.environ.get("OIDC_MOCK_URL", "http://oidc-mock:8090")
 DAGSTER_URL = os.environ.get("DAGSTER_URL", "http://dagster-webserver:3000/graphql")
-AUTH_EMAIL = os.environ.get("AUTH_BOOTSTRAP_EMAIL", "admin@example.invalid")
-AUTH_PASSWORD = os.environ.get("AUTH_BOOTSTRAP_PASSWORD", "changeme")
 ALERTS_RUN_TOKEN = os.environ.get("ALERTS_RUN_TOKEN", "")
 
-API = requests.Session()
+CDC_SLOT_NAME = "g4_slot"
+CDC_PUBLICATION_NAME = "g4_pub"
+CDC_SCHEMA = "g4_cdc"
 
 
-def step_login() -> None:
-    """Every `/api/*` route this step calls (`/api/alerts`, `/api/overview/
-    alerts`, `/api/overview/alerts/{id}/silence`) is `Policy::RequiresAuth`
-    or stricter (`policy.rs`, confirmed) — log in as the bootstrap admin
-    and let `API` carry the session cookie, exactly as
-    `ops/g3a/g3a_test.py::step_login` already does for the identical
-    reason."""
-    login = API.post(f"{API_URL}/api/auth/login", json={"email": AUTH_EMAIL, "password": AUTH_PASSWORD}, timeout=10)
-    if not login.ok:
-        raise G4Failure(f"login failed: {login.status_code} {login.text}")
-    if login.json().get("mustChangePassword"):
-        rotated = API.post(f"{API_URL}/api/auth/change-password", json={"newPassword": AUTH_PASSWORD}, timeout=10)
-        if not rotated.ok:
-            raise G4Failure(f"forced password rotation failed: {rotated.status_code} {rotated.text}")
-        relogin = API.post(f"{API_URL}/api/auth/login", json={"email": AUTH_EMAIL, "password": AUTH_PASSWORD}, timeout=10)
-        if not relogin.ok:
-            raise G4Failure(f"re-login after rotation failed: {relogin.status_code} {relogin.text}")
-    print("[g4] logged in as bootstrap admin")
+def pg_exec(sql: str) -> str:
+    result = subprocess.run(
+        ["psql", "-v", "ON_ERROR_STOP=1", "-tqA", "-c", sql],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise G4Failure(f"psql failed: {result.stderr}\nSQL: {sql}")
+    return result.stdout.strip()
+
+
+def pg_rows(sql: str) -> list[tuple[str, ...]]:
+    result = subprocess.run(
+        ["psql", "-v", "ON_ERROR_STOP=1", "-tqA", "-F", "\t", "-c", sql],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise G4Failure(f"psql failed: {result.stderr}\nSQL: {sql}")
+    return [tuple(line.split("\t")) for line in result.stdout.splitlines() if line]
+
+
+class PgSource(cdc_gate.Source):
+    cdc_type = "PostgreSQL CDC"
+    gate = "g4"
+    catalog_db = "icecat_g4"
+    schema = CDC_SCHEMA
+    host_for_registry = "postgres:5432"
+    now = "now()"
+    needs_schema_history = False
+    # AC7: this gate also stops `kafka-connect` and watches the lag alert (`cdc_gate`).
+    lag_alert_gate = True
+    expected_settings = ("wal_level", "replication role", "publication", "publication tables")
+
+    def __init__(self) -> None:
+        self.password = os.environ["PGPASSWORD"]
+
+    def missing_case(self) -> cdc_gate.MissingCase:
+        """AC3: a connector that names a publication that does not exist. It selects no table, so
+        nothing is started in Kafka Connect for it, and no slot is created."""
+        dial = {**self.dial(), "slotName": "g4_slot_missing", "publicationName": "g4_pub_missing"}
+        return cdc_gate.MissingCase(
+            dial=dial, source_objects=[], password=self.password,
+            setting="publication", message="The publication named in the connector does not exist.",
+        )
+
+    def ping(self) -> None:
+        pg_exec("SELECT 1;")
+
+    def setup(self) -> None:
+        """The gate's own source (it replaces `g4-source-init`'s fixed seed since slice 2)."""
+        pg_exec(f"DROP SCHEMA IF EXISTS {CDC_SCHEMA} CASCADE; CREATE SCHEMA {CDC_SCHEMA};")
+        for table in cdc_gate.TABLES.values():
+            pg_exec(
+                f"CREATE TABLE {CDC_SCHEMA}.{table} (id bigint PRIMARY KEY, customer text, "
+                "amount numeric(12,2), status text, updated_at timestamptz); "
+                f"ALTER TABLE {CDC_SCHEMA}.{table} REPLICA IDENTITY FULL; "
+                f"INSERT INTO {CDC_SCHEMA}.{table} SELECT g, 'seed_' || g, ((g % 1000) + 0.5)::numeric(12,2), "
+                f"'seed', now() FROM generate_series(1, {cdc_gate.SEED_ROWS}) g;"
+            )
+        pg_exec(
+            f"CREATE TABLE {CDC_SCHEMA}.wal_noise (id int PRIMARY KEY, v int NOT NULL); "
+            f"ALTER TABLE {CDC_SCHEMA}.wal_noise REPLICA IDENTITY FULL; "
+            f"INSERT INTO {CDC_SCHEMA}.wal_noise SELECT g, 0 FROM generate_series(1, 5) g;"
+        )
+        pg_exec(
+            f"DROP PUBLICATION IF EXISTS {CDC_PUBLICATION_NAME}; "
+            f"CREATE PUBLICATION {CDC_PUBLICATION_NAME} FOR TABLE "
+            + ", ".join(f"{CDC_SCHEMA}.{table}" for table in cdc_gate.TABLES.values())
+            + ";"
+        )
+
+    def execute(self, sql: str) -> None:
+        pg_exec(sql)
+
+    def rows(self, sql: str) -> list[tuple[str, ...]]:
+        return pg_rows(sql)
+
+    def qualified(self, table: str) -> str:
+        return f"{CDC_SCHEMA}.{table}"
+
+    def numbers(self, lo: int, hi: int) -> str:
+        return f"SELECT g FROM generate_series({lo}, {hi}) g"
+
+    def dial(self) -> dict:
+        return {
+            "driver": "postgres", "host": os.environ["PGHOST"], "port": int(os.environ["PGPORT"]),
+            "database": os.environ["PGDATABASE"], "user": os.environ["PGUSER"],
+            "slotName": CDC_SLOT_NAME, "publicationName": CDC_PUBLICATION_NAME,
+        }
+
+    def add_column_and_observe(self) -> None:
+        pg_exec(f"ALTER TABLE {self.qualified('orders')} ADD COLUMN note text;")
+        pg_exec(f"UPDATE {self.qualified('orders')} SET note = 'schema_note' WHERE id = 2;")
+
+    def before_delete(self, connector_id: str) -> None:
+        slot_before = pg_exec(f"SELECT count(*) FROM pg_replication_slots WHERE slot_name = '{CDC_SLOT_NAME}';")
+        if slot_before != "1":
+            raise G4Failure(f"expected the {CDC_SLOT_NAME} replication slot to exist before the delete, got count={slot_before}")
+        retained = pg_exec(
+            f"SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) FROM pg_replication_slots WHERE slot_name = '{CDC_SLOT_NAME}';"
+        )
+        print(f"[g4] slot {CDC_SLOT_NAME!r} exists before the delete, wal_retained_bytes={retained}", flush=True)
+
+    def after_delete(self, connector_id: str) -> None:
+        def gone():
+            slots = pg_exec(f"SELECT count(*) FROM pg_replication_slots WHERE slot_name = '{CDC_SLOT_NAME}';")
+            pubs = pg_exec(f"SELECT count(*) FROM pg_publication WHERE pubname = '{CDC_PUBLICATION_NAME}';")
+            if slots == "0" and pubs == "0":
+                return True
+            raise G4Failure(f"after DELETE: slots={slots}, publications={pubs}")
+
+        _wait_for("the replication slot and publication are gone", gone, 90, interval_s=3)
+        print(f"[g4] slot {CDC_SLOT_NAME!r} no longer exists after the delete: WAL is no longer pinned (R5)", flush=True)
 
 
 WAL_ALERT_RULE_ID = "al_g4_p5cdc_wal"
@@ -159,89 +202,6 @@ def step_seed_wal_alert_rule() -> None:
     print("[g4] seeded WAL alert rule (idempotent upsert)")
 
 
-def ch_auth_settings() -> str:
-    if not CH_OAUTH_CLIENT_ID:
-        return ""
-    return (
-        f", catalog_credential = '{CH_OAUTH_CLIENT_ID}:unused', "
-        f"oauth_server_uri = '{CH_OAUTH_SERVER_URI}'"
-    )
-
-CATALOG_DB = "icecat_g4"
-TABLE = "`default.p5cdc_p5_cdc_orders`"
-
-LATENCY_BUDGET_SECONDS = 20.0
-
-
-class G4Failure(Exception):
-    pass
-
-
-# SRC-9 task 6. The registry type this gate stands for, and the recorder the
-# four steps write into (created by `main`).
-CDC_TYPE = "PostgreSQL CDC"
-RECORDER: gate_summary.Recorder | None = None
-
-# The demo source as the registry holds it: the database and role this stack's
-# Postgres really has (`PG*` is what `psql` below uses), and the slot and
-# publication `g4-source-init` and `debezium-server` really use, so the
-# registry row is the true description of the demo connector (it also lets
-# `replication_metrics` attribute `p5cdc_slot` to a connector).
-GATE_SECRETS_DIR = "/gate-secrets"
-FILE_REF_PREFIX = "file:/run/secrets/connector_"
-GATE_TENANT_SLUG = "meridian-group"
-CDC_SLOT_NAME = "p5cdc_slot"
-CDC_PUBLICATION_NAME = "p5cdc_pub"
-CDC_SCHEMA = "p5_cdc"
-# What the discovery of schema `p5_cdc` must list: `g4-source-init`'s table.
-CDC_DISCOVER_TABLE = "p5_cdc.orders"
-CDC_DISCOVER_COLUMNS = {"id", "customer", "amount", "updated_at"}
-# `g4-source-init` seeds this many rows; the snapshot must deliver all of them.
-SEEDED_ROWS = 5
-
-
-def _record(step: str, outcome: str, detail: str = "") -> None:
-    if RECORDER is None:
-        raise G4Failure("internal error: the gate summary recorder was not created")
-    RECORDER.record(CDC_TYPE, step, outcome, detail)
-    print(f"[g4] {CDC_TYPE} {step}: {outcome}{' (' + detail + ')' if detail else ''}")
-
-
-def ch_query(sql: str) -> str:
-    resp = requests.post(CH_URL, auth=(CH_USER, CH_PASSWORD), data=sql.encode("utf-8"), timeout=30)
-    if not resp.ok:
-        raise G4Failure(f"ClickHouse query failed ({resp.status_code}): {resp.text}\nSQL: {sql}")
-    return resp.text
-
-
-def pg_exec(sql: str) -> str:
-    result = subprocess.run(
-        ["psql", "-v", "ON_ERROR_STOP=1", "-tqA", "-c", sql],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        raise G4Failure(f"psql failed: {result.stderr}\nSQL: {sql}")
-    return result.stdout.strip()
-
-
-def _wait_for(name: str, check, timeout_s: float, interval_s: float = 1.0):
-    deadline = time.time() + timeout_s
-    last_err = None
-    while time.time() < deadline:
-        try:
-            value = check()
-            if value is not None:
-                elapsed = timeout_s - (deadline - time.time())
-                print(f"[g4] {name}: visible after {elapsed:.1f}s")
-                return value
-        except Exception as exc:  # noqa: BLE001
-            last_err = exc
-        time.sleep(interval_s)
-    raise G4Failure(f"timed out after {timeout_s}s waiting for {name}: {last_err}")
-
-
 def _dagster_job_loaded(job: str):
     """True once a loaded Dagster repository lists `job`; None otherwise
     (`_wait_for` keeps polling on None)."""
@@ -266,136 +226,6 @@ def _dagster_run_finished(run_id: str):
     return None
 
 
-def step_wait_for_services() -> None:
-    _wait_for(
-        "ClickHouse", lambda: ch_query("SELECT 1 FORMAT TabSeparated").strip() == "1" or True, 60
-    )
-    pg_exec("SELECT 1;")
-    print("[g4] ClickHouse and Postgres are reachable")
-
-
-def step_create_catalog_database() -> None:
-    ch_query(
-        f"CREATE DATABASE IF NOT EXISTS {CATALOG_DB} "
-        f"ENGINE = DataLakeCatalog('{LAKEKEEPER_CATALOG_URI}') "
-        f"SETTINGS catalog_type = 'rest', warehouse = '{LAKEKEEPER_WAREHOUSE}', "
-        f"storage_endpoint = '{RUSTFS_S3_ENDPOINT}'{ch_auth_settings()} "
-        "SETTINGS allow_database_iceberg = 1"
-    )
-
-
-def step_wait_for_table_registered() -> None:
-    def check():
-        text = ch_query(
-            f"SHOW TABLES FROM {CATALOG_DB} SETTINGS allow_database_iceberg=1 FORMAT TabSeparated"
-        )
-        return "default.p5cdc_p5_cdc_orders" if "p5cdc_p5_cdc_orders" in text else None
-
-    _wait_for("Bronze table registered in Lakekeeper (initial snapshot committed)", check, 60)
-
-
-def current_amount(order_id: int):
-    text = ch_query(
-        f"SELECT amount FROM {CATALOG_DB}.{TABLE} WHERE id = {order_id} AND __deleted = 'false' "
-        "SETTINGS allow_database_iceberg=1 FORMAT TabSeparated"
-    ).strip()
-    return text or None
-
-
-def is_deleted(order_id: int):
-    text = ch_query(
-        f"SELECT __deleted FROM {CATALOG_DB}.{TABLE} WHERE id = {order_id} "
-        "SETTINGS allow_database_iceberg=1 FORMAT TabSeparated"
-    ).strip()
-    return text == "true" if text else None
-
-
-def step_insert_visible_within_budget() -> None:
-    new_id = 9001
-    pg_exec(f"DELETE FROM p5_cdc.orders WHERE id = {new_id};")
-    t0 = time.time()
-    pg_exec(f"INSERT INTO p5_cdc.orders (id, customer, amount) VALUES ({new_id}, 'g4_insert', 42.00);")
-
-    def check():
-        val = current_amount(new_id)
-        return val if val == "42" else None
-
-    _wait_for(f"INSERT (id={new_id})", check, LATENCY_BUDGET_SECONDS)
-    print(f"[g4] INSERT latency budget: {LATENCY_BUDGET_SECONDS}s (measured basis: docs/plans/P5-RESULT.md)")
-    return new_id, t0
-
-
-def step_update_visible_within_budget(order_id: int) -> None:
-    pg_exec(f"UPDATE p5_cdc.orders SET amount = 77.77 WHERE id = {order_id};")
-
-    def check():
-        val = current_amount(order_id)
-        return val if val == "77.77" else None
-
-    _wait_for(f"UPDATE (id={order_id})", check, LATENCY_BUDGET_SECONDS)
-
-
-def step_delete_visible_within_budget(order_id: int) -> None:
-    pg_exec(f"DELETE FROM p5_cdc.orders WHERE id = {order_id};")
-
-    def check():
-        return True if is_deleted(order_id) else None
-
-    _wait_for(f"DELETE (id={order_id})", check, LATENCY_BUDGET_SECONDS)
-
-
-def step_row_counts_use_a_where_predicate() -> None:
-    """Documents/asserts the (A) workaround at the point of use: a bare
-    count() is not trustworthy on this table (docs/plans/P5-RESULT.md), so
-    this test never uses one and this step proves the WHERE-qualified form
-    still returns a sane, non-zero count."""
-    count = ch_query(
-        f"SELECT count() FROM {CATALOG_DB}.{TABLE} WHERE id > 0 SETTINGS allow_database_iceberg=1 "
-        "FORMAT TabSeparated"
-    ).strip()
-    if not count.isdigit() or int(count) < 1:
-        raise G4Failure(f"WHERE-qualified count() returned unexpected value: {count!r}")
-    print(f"[g4] WHERE-qualified row count: {count}")
-
-
-def step_verify_slot_cleanup_on_connector_delete() -> None:
-    """G4's second acceptance criterion: a removed connector must not
-    leave a replication slot behind pinning WAL."""
-    slot_before = pg_exec(
-        "SELECT count(*) FROM pg_replication_slots WHERE slot_name = 'p5cdc_slot';"
-    )
-    if slot_before != "1":
-        raise G4Failure(f"expected the p5cdc_slot replication slot to exist before deprovisioning, got count={slot_before}")
-    wal_retained_before = pg_exec(
-        "SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) FROM pg_replication_slots "
-        "WHERE slot_name = 'p5cdc_slot';"
-    )
-    print(f"[g4] slot 'p5cdc_slot' exists before deprovisioning, wal_retained_bytes={wal_retained_before}")
-
-    script = os.environ.get("DEPROVISION_SCRIPT", "/opt/deprovision_connector.sh")
-    # WS3 plan review X4: `deprovision_connector.sh` now takes the slot and
-    # publication names as two explicit arguments instead of deriving both
-    # from one `<connector_slug>` (a slot's real name is registry-owned and
-    # need not resemble its connector's slug — see
-    # `dispar_orchestrate.replication_metrics`'s module doc for why the
-    # same guess was removed there). The demo CDC connector's names are the
-    # `p5cdc_slot`/`p5cdc_pub` pair this file already asserts on above.
-    result = subprocess.run(["sh", script, "p5cdc_slot", "p5cdc_pub"], capture_output=True, text=True, check=False)
-    print(result.stdout)
-    if result.returncode != 0:
-        raise G4Failure(f"deprovision_connector.sh failed: {result.stderr}")
-
-    slot_after = pg_exec(
-        "SELECT count(*) FROM pg_replication_slots WHERE slot_name = 'p5cdc_slot';"
-    )
-    if slot_after != "0":
-        raise G4Failure(
-            f"replication slot 'p5cdc_slot' still exists after deprovisioning (count={slot_after}) "
-            "— it would keep pinning WAL indefinitely (R5)"
-        )
-    print("[g4] slot 'p5cdc_slot' no longer exists after deprovisioning — WAL is no longer pinned")
-
-
 WAL_BREACH_SLOT_NAME = "g4_wal_breach_slot"
 
 
@@ -404,31 +234,27 @@ def step_wal_breach_produces_a_silenceable_alert_instance() -> None:
     produces a real alert_instance row via /api/alerts/run, and that row
     can be silenced through the API.
 
-    C3-F2: the prior revision breached WAL by `docker compose stop
-    debezium-server`, run from inside `g4-test-runner` (`docker-compose.
-    yml`'s `g4-test-runner` block: `image: python:3.12-slim`, no Docker
-    CLI installed, no `/var/run/docker.sock` mount — confirmed this
-    revision). That call could never succeed; the step raised
-    `FileNotFoundError` before growing any WAL, so this half of the gate
-    never actually ran. Mounting the Docker socket into a test container
-    to fix this was considered and rejected deliberately, not overlooked:
-    it would hand this gate root-equivalent control of the host's Docker
-    daemon just to grow a number.
+    C3-F2: the breach cannot be made by stopping the connector's container:
+    `g4-test-runner` (`docker-compose.yml`) is `python:3.12-slim` with no Docker
+    CLI and no `/var/run/docker.sock` mount, and mounting the Docker socket into
+    a test container would hand this gate root-equivalent control of the host's
+    Docker daemon just to grow a number. (The one container restart this gate
+    needs, `kafka-connect`, is done by the CI job, see the module doc.)
 
-    Breach mechanism instead: open a SECOND, deliberately unconsumed
+    Breach mechanism: open a SECOND, deliberately unconsumed
     logical replication slot with `pg_create_logical_replication_slot`,
     using the same `pgoutput` output plugin the real CDC slot uses
-    (`docker-compose.yml`'s `debezium-server` command block:
-    `debezium.source.plugin.name=pgoutput`). A slot with no consumer
+    (`plugin.name=pgoutput` in the connector config `lakehouse-store` renders). A slot with no consumer
     attached is `active = false` in `pg_replication_slots` from the
     moment it is created, and `replication_metrics.py::_status_for`
     treats `not active` as `critical` independently of WAL byte volume
     ("a disconnected [consumer] still pins WAL ... exactly why this
     checks `active` independently of the byte thresholds"). WAL is still
-    grown with the existing ordinary UPDATEs against the five rows the
-    compose seed already inserted (docker-compose.yml, ids 1..5) —
-    REPLICA IDENTITY FULL means each UPDATE writes a full-row WAL image,
-    so no new rows and no primary-key collision — so the slot's
+    grown with ordinary UPDATEs against the five rows of `wal_noise`, a
+    table of this gate's schema that is NOT in the connector's publication
+    (so the connector and the Bronze comparison never see them) —
+    REPLICA IDENTITY FULL means each UPDATE writes a full-row WAL image —
+    so the slot's
     `wal_retained_bytes` is also genuinely non-trivial, not just
     `active = false` on an idle slot.
 
@@ -440,9 +266,9 @@ def step_wal_breach_produces_a_silenceable_alert_instance() -> None:
     slot is unhealthy, only that at least one is. That is fine for what
     this step needs (a real, non-fabricated breach that fires the rule)
     but it means the rule would fire identically if the REAL CDC slot
-    (`p5cdc_slot`) ever went unhealthy for an unrelated reason. This step
-    never touches `p5cdc_slot` or `debezium-server` — the CDC pipeline
-    the rest of this gate exercises keeps running, untouched, throughout.
+    (`g4_slot`) ever went unhealthy for an unrelated reason. This step
+    never touches `g4_slot` or the connector — the CDC pipeline the rest
+    of this gate exercises keeps running, untouched, throughout.
 
     The breach slot is dropped in a `finally`: an unconsumed logical
     slot pins WAL indefinitely (the same R5 risk this whole job exists
@@ -455,7 +281,7 @@ def step_wal_breach_produces_a_silenceable_alert_instance() -> None:
     print(f"[g4] created deliberately unconsumed slot {WAL_BREACH_SLOT_NAME!r} (plugin=pgoutput)")
     try:
         for i in range(2000):
-            pg_exec(f"UPDATE p5_cdc.orders SET amount = amount + 0.01 WHERE id = {(i % 5) + 1};")
+            pg_exec(f"UPDATE {CDC_SCHEMA}.wal_noise SET v = v + 1 WHERE id = {(i % 5) + 1};")
         # The webserver answering is not the code location having loaded:
         # compose can recreate `dagster-code-location` when this runner
         # starts, and a launch in that window fails with
@@ -693,234 +519,12 @@ def step_oidc_authorization_code_round_trip() -> None:
     print("[g4] OIDC authorization-code + PKCE round trip: session minted, Analyst role's query:read confirmed")
 
 
-def _write_credential_file(ref_name: str, value: str) -> None:
-    """Duplicated from `ops/g6/g6_ingest_matrix_test.py` (this repository's
-    gates share no code beyond `gate_summary`): refuse any reference that is
-    not the `file:/run/secrets/connector_*` name the server derived (ADR 0002
-    Addendum 3) before writing `value` under its basename into
-    `/gate-secrets`, the writable half of the volume `lakehouse-api` reads at
-    `/run/secrets` (`ops/g4/docker-compose.g4.override.yml`)."""
-    if not ref_name.startswith(FILE_REF_PREFIX):
-        raise G4Failure(f"refusing to write a credential file for an unexpected ref shape: {ref_name!r}")
-    path = os.path.join(GATE_SECRETS_DIR, ref_name.rsplit("/", 1)[-1])
-    with open(path, "w", encoding="utf-8") as fh:
-        fh.write(value)
-    os.chmod(path, 0o644)
-
-
-def _ensure_gate_tenant() -> str:
-    """Duplicated, shortened, from `ops/g6/g6_ingest_matrix_test.py::
-    step_ensure_tenant` (its docstring has the why): per-connector routes
-    answer only for a connector in one of the caller's tenants, and the
-    bootstrap admin of a fresh database belongs to none, so the account joins
-    the seed tenant first. Returns that tenant's id."""
-    me = API.get(f"{API_URL}/api/auth/me", timeout=10)
-    if not me.ok:
-        raise G4Failure(f"GET /api/auth/me failed: {me.status_code} {me.text[:300]}")
-    me = me.json()
-    listed = API.get(f"{API_URL}/api/identity/tenants", timeout=10)
-    if not listed.ok:
-        raise G4Failure(f"list tenants failed: {listed.status_code} {listed.text[:300]}")
-    tenant = next((t for t in listed.json() if t["slug"] == GATE_TENANT_SLUG), None)
-    if tenant is None:
-        raise G4Failure(f"tenant {GATE_TENANT_SLUG!r} does not exist (0042_tenant_provisioning.sql seeds it)")
-    if tenant["id"] not in [t["id"] for t in me.get("tenants", [])]:
-        added = API.put(f"{API_URL}/api/identity/users/{me['id']}/tenants/{tenant['id']}", timeout=10)
-        if not added.ok:
-            raise G4Failure(f"add the account to tenant {GATE_TENANT_SLUG!r} failed: {added.status_code} {added.text[:300]}")
-    return tenant["id"]
-
-
-def _register_demo_cdc_connector(tenant_id: str) -> str:
-    """Register the demo source the way the console registers a `PostgreSQL
-    CDC` connector: `POST /api/connectors` with a `file:` credential whose
-    value is this stack's Postgres password, then `PUT .../ingest-spec` with
-    the `cdc` adapter and the slot and publication the stack really has.
-    Returns the connector id."""
-    created = API.post(
-        f"{API_URL}/api/connectors",
-        json={
-            "name": "g4-demo-cdc", "type": CDC_TYPE, "direction": "source",
-            "host": "postgres:5432", "credential": {"source": "file", "primary": "password"},
-            "environment": "production", "tenant": "g4", "tenantId": tenant_id, "residency": "", "capabilities": [],
-        },
-        timeout=10,
-    )
-    if not created.ok:
-        raise G4Failure(f"create the CDC connector failed: {created.status_code} {created.text[:300]}")
-    body = created.json()
-    connector_id = body["id"]
-    derived = (body.get("credential") or {}).get("primary")
-    if not derived:
-        raise G4Failure("the create response carries no derived credential name")
-    _write_credential_file(derived, os.environ["PGPASSWORD"])
-    spec = API.put(
-        f"{API_URL}/api/connectors/{connector_id}/ingest-spec",
-        json={
-            "adapter": "cdc", "ingestMode": "cdc", "sourceObjects": [],
-            "dial": {
-                "driver": "postgres", "host": os.environ["PGHOST"], "port": int(os.environ["PGPORT"]),
-                "database": os.environ["PGDATABASE"], "user": os.environ["PGUSER"],
-                "slotName": CDC_SLOT_NAME, "publicationName": CDC_PUBLICATION_NAME,
-            },
-        },
-        timeout=10,
-    )
-    if not spec.ok:
-        raise G4Failure(f"set the CDC connector's ingest-spec failed: {spec.status_code} {spec.text[:300]}")
-    return connector_id
-
-
-def _expects_real(step: str) -> bool:
-    """False after recording a failure when the registry does not say `real`:
-    this gate runs the step for real, so a registry that says otherwise is
-    stale (one list, not two)."""
-    if RECORDER is not None and RECORDER.registry.expectation(CDC_TYPE, step) == "real":
-        return True
-    _record(step, "fail", "ops/gates/coverage.json does not say 'real' for this step but g4 runs it; update the registry")
-    return False
-
-
-def _check_connect(connector_id: str) -> None:
-    """`connect`: `POST .../test` answers `supported: true, ok: true` for the
-    demo source, as it does for its SQL twin (duplicated in miniature from
-    `ops/g6`'s `_check_connect`, whose `real` branch it is)."""
-    if not _expects_real("connect"):
-        return
-    try:
-        resp = API.post(f"{API_URL}/api/connectors/{connector_id}/test", timeout=30)
-        if not resp.ok:
-            _record("connect", "fail", f"POST .../test answered {resp.status_code} {resp.text[:200]}")
-            return
-        body = resp.json()
-    except (requests.RequestException, ValueError) as exc:
-        _record("connect", "fail", f"POST .../test did not answer cleanly ({type(exc).__name__})")
-        return
-    if body.get("supported") is True and body.get("ok") is True:
-        _record("connect", "pass", f"{body.get('latencyMs')} ms")
-    else:
-        _record(
-            "connect", "fail",
-            f"expected supported=true ok=true, got supported={body.get('supported')!r} "
-            f"ok={body.get('ok')!r} message={str(body.get('message'))[:200]!r}",
-        )
-
-
-def _discovery(connector_id: str, kind: str, body: dict) -> dict:
-    """`POST .../discovery/{kind}` (SRC-13). A PostgreSQL CDC source is read by the API itself, so the
-    answer comes in the call (`state` `done` or `failed`), with no polling."""
-    resp = API.post(f"{API_URL}/api/connectors/{connector_id}/discovery/{kind}", json=body, timeout=135)
-    if not resp.ok:
-        raise G4Failure(f"POST .../discovery/{kind} answered {resp.status_code} {resp.text[:200]}")
-    return resp.json()
-
-
-def _check_discover(connector_id: str) -> None:
-    """`discover`: the schemas hold `p5_cdc`, its tables hold `p5_cdc.orders`, and the preview of
-    that table shows its columns (`real` branch of `ops/g6`'s `_check_discover`, SRC-13 routes)."""
-    if not _expects_real("discover"):
-        return
-    try:
-        schemas = _discovery(connector_id, "list", {})
-        names = [o.get("name") for o in schemas.get("objects") or [] if o.get("kind") == "schema"]
-        if schemas.get("state") != "done" or CDC_SCHEMA not in names:
-            _record("discover", "fail", f"expected the schemas to hold {CDC_SCHEMA!r}, got state={schemas.get('state')!r} {names[:20]}")
-            return
-        listing = _discovery(connector_id, "list", {"schema": CDC_SCHEMA})
-        preview = _discovery(connector_id, "preview", {"object": CDC_DISCOVER_TABLE})
-    except (requests.RequestException, ValueError, G4Failure) as exc:
-        _record("discover", "fail", f"the discovery routes did not answer cleanly ({type(exc).__name__}: {str(exc)[:200]})")
-        return
-    listed = [o.get("name") for o in listing.get("objects") or []]
-    if listing.get("state") != "done" or CDC_DISCOVER_TABLE not in listed:
-        _record("discover", "fail", f"expected state=done listing {CDC_DISCOVER_TABLE!r}, got state={listing.get('state')!r} objects={listed[:20]}")
-        return
-    found = {c.get("name") for c in preview.get("columns") or []}
-    if preview.get("state") != "done" or not CDC_DISCOVER_COLUMNS <= found:
-        _record("discover", "fail", f"{CDC_DISCOVER_TABLE!r} preview: state={preview.get('state')!r}, missing columns {sorted(CDC_DISCOVER_COLUMNS - found)}, has {sorted(found)}")
-        return
-    _record("discover", "pass", f"{CDC_DISCOVER_TABLE} with {len(found)} columns")
-
-
-def step_register_demo_connector_and_check_connect_discover() -> None:
-    """SRC-9 task 6, steps `connect` and `discover`. A problem with the
-    registration itself fails both cells, with the reason, and the gate goes
-    on: the Debezium steps below do not depend on the registry."""
-    try:
-        connector_id = _register_demo_cdc_connector(_ensure_gate_tenant())
-    except (G4Failure, requests.RequestException, KeyError, ValueError) as exc:
-        detail = f"could not register the demo CDC connector: {type(exc).__name__}: {exc}"
-        _record("connect", "fail", detail)
-        _record("discover", "fail", detail)
-        return
-    _check_connect(connector_id)
-    _check_discover(connector_id)
-
-
-def step_first_copy_reached_bronze() -> None:
-    """SRC-9 task 6, step `load`: the initial snapshot is the first copy, and
-    it must hold every row `g4-source-init` seeded (the table being
-    registered, `step_wait_for_table_registered`, only says the first commit
-    happened). `WHERE` and `__deleted`, never a bare `count()` (R11)."""
-    def all_seeded_rows():
-        text = ch_query(
-            f"SELECT count() FROM {CATALOG_DB}.{TABLE} WHERE id > 0 AND __deleted = 'false' "
-            "SETTINGS allow_database_iceberg=1 FORMAT TabSeparated"
-        ).strip()
-        return int(text) if text.isdigit() and int(text) == SEEDED_ROWS else None
-
-    try:
-        count = _wait_for(f"initial snapshot holds the {SEEDED_ROWS} seeded rows", all_seeded_rows, 60)
-    except G4Failure as exc:
-        _record("load", "fail", str(exc))
-        raise
-    _record("load", "pass", f"{count} rows in the Bronze table after the initial snapshot")
-
-
 def main() -> int:
-    global RECORDER
-    try:
-        RECORDER = gate_summary.Recorder(gate_summary.Registry.load(), "g4")
-        owner = RECORDER.registry.gate_of(CDC_TYPE)
-        if owner != "g4":
-            raise G4Failure(f"ops/gates/coverage.json gives {CDC_TYPE!r} to gate {owner!r}, but g4 runs it")
-        step_wait_for_services()
-        step_login()
-        step_register_demo_connector_and_check_connect_discover()
-        step_seed_wal_alert_rule()
-        step_create_catalog_database()
-        step_wait_for_table_registered()
-        step_first_copy_reached_bronze()
-        try:
-            order_id, _ = step_insert_visible_within_budget()
-            step_update_visible_within_budget(order_id)
-            step_delete_visible_within_budget(order_id)
-        except G4Failure as exc:
-            _record("reload", "fail", str(exc))
-            raise
-        _record(
-            "reload", "pass",
-            f"an insert, an update and a delete each visible within {LATENCY_BUDGET_SECONDS:.0f}s",
-        )
-        step_row_counts_use_a_where_predicate()
-        step_wal_breach_produces_a_silenceable_alert_instance()
-        step_verify_slot_cleanup_on_connector_delete()
-        step_oidc_authorization_code_round_trip()
-        # SRC-9 task 6: connect and discover record a failure and let the gate
-        # run on; the verdict comes here, once, naming each.
-        failed = RECORDER.failures()
-        if failed:
-            raise G4Failure("connector gate steps failed: " + "; ".join(f"{t} {s}: {d}" for t, s, d in failed))
-    except G4Failure as exc:
-        print(f"[g4] FAILED: {exc}", file=sys.stderr)
-        return 1
-    finally:
-        # The table is printed on every path, so a failed run still says which
-        # step broke and which never ran.
-        if RECORDER is not None:
-            RECORDER.emit()
-    print("[g4] PASS")
-    return 0
+    return cdc_gate.run(
+        PgSource(),
+        before_delete=lambda _connector_id: (step_seed_wal_alert_rule(), step_wal_breach_produces_a_silenceable_alert_instance()),
+        after_delete=step_oidc_authorization_code_round_trip,
+    )
 
 
 if __name__ == "__main__":

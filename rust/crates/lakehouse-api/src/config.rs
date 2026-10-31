@@ -310,19 +310,25 @@ pub struct Config {
     /// provider on a private network without a certificate. Never set it on a
     /// real installation. The address check (`resolve_checked`) applies either way.
     pub connector_oauth_allow_http: bool,
-    /// Whether this deployment says Oracle CDC via `Debezium`'s `LogMiner`
-    /// connector is wanted. Default `false`; `true` only for the exact string
-    /// `"true"`.
-    ///
-    /// It names an extension point, not a working feature: this build ships
-    /// no Oracle `LogMiner` property template, so `GET
-    /// /api/connectors/{id}/debezium-properties` refuses every Oracle-driver
-    /// connector in both states and only its explanation changes. `LogMiner`
-    /// capture also needs `ARCHIVELOG` mode and supplemental logging on the
-    /// source database, which the batch sql adapter (`adapters/oracle.py`,
-    /// read-only `SELECT`) neither assumes nor configures. See
-    /// `docs/adr/0008-initial-snapshot-backfill.md`.
-    pub oracle_cdc_logminer_enabled: bool,
+    /// Where the API reaches `Kafka Connect`'s REST API (`KAFKA_CONNECT_URL`,
+    /// `SRC-4` slice 2, ADR 0016). `None` when unset or blank: a change-capture
+    /// connector then answers `supported: false` with a fixed sentence instead
+    /// of dialing a guessed address (fail closed). Operator-set, never taken
+    /// from a request; the address is internal to the deployment's network.
+    pub kafka_connect_url: Option<String>,
+    /// The broker's address as `Kafka Connect` reaches it (`CDC_KAFKA_BOOTSTRAP`,
+    /// the variable the code location's applier reads too; `SRC-4` slice 3,
+    /// decision S3-b). A `MySQL` or `SQL Server` connector keeps its schema
+    /// history in a topic on this broker and cannot start without it; unset, such
+    /// a connector answers the same fixed "not configured" sentence as an unset
+    /// `KAFKA_CONNECT_URL`. `PostgreSQL` does not need it.
+    pub cdc_kafka_bootstrap: Option<String>,
+    /// The directory the API writes each change-capture connector's source
+    /// password into (`CDC_SECRETS_DIR`, `SRC-4` decision S2-a). Default
+    /// `/run/cdc-secrets`, the `tmpfs` volume `docker-compose.yml` mounts here
+    /// and read-only in `kafka-connect` at the SAME path, because the connector
+    /// JSON names the file by this path. Set it only in a test.
+    pub cdc_secrets_dir: String,
     /// `ClickHouse` HTTP interface URL. Default
     /// `"http://localhost:18123"` (`clickhouse.ts:11`, `??`).
     pub ch_url: String,
@@ -616,7 +622,7 @@ pub struct Config {
     /// minted at compose bring-up by `ops/oidc-mock` onto a shared volume
     /// (`lakehouse_oidc_tokens`) every writer in this stack already reads
     /// directly from disk the same way (`docker-compose.yml`'s
-    /// `g1-test-runner`, `debezium-server`, `trino`, ...) — there is no
+    /// `g1-test-runner`, `trino`, ...; SRC-4 S2 review SHOULD-FIX 2) — there is no
     /// static value to put behind an `env:` `secretRef` ahead of time.
     /// Always set to a default path — `/tokens/gold-export.jwt`, matching
     /// where `docker-compose.yml`'s `lakehouse-api` service mounts the
@@ -1123,10 +1129,9 @@ impl std::fmt::Debug for Config {
                 "connector_oauth_allow_http",
                 &self.connector_oauth_allow_http,
             )
-            .field(
-                "oracle_cdc_logminer_enabled",
-                &self.oracle_cdc_logminer_enabled,
-            )
+            .field("kafka_connect_url", &self.kafka_connect_url)
+            .field("cdc_kafka_bootstrap", &self.cdc_kafka_bootstrap)
+            .field("cdc_secrets_dir", &self.cdc_secrets_dir)
             .field("oidc_clock_skew_seconds", &self.oidc_clock_skew_seconds)
             .field("oidc_authorize_url", &self.oidc_authorize_url)
             .field("oidc_token_url", &self.oidc_token_url)
@@ -1517,9 +1522,13 @@ impl Config {
             connector_oauth_allow_http: env
                 .get("CONNECTOR_OAUTH_ALLOW_HTTP")
                 .is_some_and(|v| v == "true"),
-            oracle_cdc_logminer_enabled: env
-                .get("ORACLE_CDC_LOGMINER_ENABLED")
-                .is_some_and(|v| v == "true"),
+            kafka_connect_url: truthy(env, "KAFKA_CONNECT_URL"),
+            cdc_kafka_bootstrap: truthy(env, "CDC_KAFKA_BOOTSTRAP"),
+            cdc_secrets_dir: or_default(
+                env,
+                "CDC_SECRETS_DIR",
+                lakehouse_store::cdc::CDC_SECRETS_DIR,
+            ),
             oidc_clock_skew_seconds: env
                 .get("OIDC_CLOCK_SKEW_SECONDS")
                 .and_then(|v| v.parse::<u64>().ok())
@@ -1864,8 +1873,6 @@ mod tests {
         assert_eq!(cfg.trino_max_rows, 10_000);
         // Safe-by-default: SSRF blocking is ON unless explicitly disabled.
         assert!(!cfg.connector_probe_allow_internal_hosts);
-        // Oracle CDC via Debezium LogMiner is off by default.
-        assert!(!cfg.oracle_cdc_logminer_enabled);
     }
 
     /// Isolated from `defaults_match_typescript_fallbacks` so `cargo test
@@ -2130,41 +2137,38 @@ mod tests {
         assert!(matches!(err, ConfigError::MalformedWebhookAllowedCidrs(_)));
     }
 
-    /// The `ORACLE_CDC_LOGMINER_ENABLED` flag defaults to `false`: an unset
-    /// variable must never read as a request for a capability this build
-    /// has not validated.
+    /// `KAFKA_CONNECT_URL` is unset by default, and a blank value is unset too:
+    /// the API never dials a guessed address (`SRC-4` decision S2-b).
     #[test]
-    fn oracle_cdc_logminer_enabled_defaults_to_false() {
-        let cfg = Config::from_map(&HashMap::new()).unwrap();
-        assert!(!cfg.oracle_cdc_logminer_enabled);
+    fn kafka_connect_url_is_unset_by_default_and_blank_counts_as_unset() {
+        assert_eq!(
+            Config::from_map(&HashMap::new()).unwrap().kafka_connect_url,
+            None
+        );
+        let cfg = Config::from_map(&map(&[("KAFKA_CONNECT_URL", "")])).unwrap();
+        assert_eq!(cfg.kafka_connect_url, None);
+        let cfg =
+            Config::from_map(&map(&[("KAFKA_CONNECT_URL", "http://kafka-connect:8083")])).unwrap();
+        assert_eq!(
+            cfg.kafka_connect_url.as_deref(),
+            Some("http://kafka-connect:8083")
+        );
     }
 
-    /// The codebase's boolean-parsing rule is exact
-    /// `== "true"`, mirroring `connector_probe_allow_internal_hosts` and
-    /// `oidc_jit_provisioning` — `TRUE`, `1`, `yes`, `on`, and any other
-    /// non-`"true"` string MUST NOT flip the flag on. This is the rule
-    /// AGENTS.md mandates, re-asserted here for the new field so a future
-    /// widening (e.g. `is_some_and` accepting truthy strings) fails this
-    /// test rather than silently extending the gate.
+    /// `CDC_KAFKA_BOOTSTRAP` is unset by default and blank counts as unset: a
+    /// `MySQL` or `SQL Server` connector then answers "not configured".
     #[test]
-    fn oracle_cdc_logminer_enabled_reads_the_true_string_only() {
-        let cfg = Config::from_map(&map(&[("ORACLE_CDC_LOGMINER_ENABLED", "true")])).unwrap();
-        assert!(cfg.oracle_cdc_logminer_enabled);
-
-        for bad in ["TRUE", "True", "1", "yes", "on", "enabled", " "] {
-            let cfg = Config::from_map(&map(&[("ORACLE_CDC_LOGMINER_ENABLED", bad)])).unwrap();
-            assert!(
-                !cfg.oracle_cdc_logminer_enabled,
-                "ORACLE_CDC_LOGMINER_ENABLED={bad:?} must not enable the flag"
-            );
-        }
-
-        // And the unset case (omitted entirely from the env map) also
-        // does not enable the flag — redundant with the `defaults_...`
-        // test, but cheap and reads as a self-contained "the gate stays
-        // closed for every non-`true` value" assertion.
-        let cfg = Config::from_map(&HashMap::new()).unwrap();
-        assert!(!cfg.oracle_cdc_logminer_enabled);
+    fn cdc_kafka_bootstrap_is_unset_by_default_and_blank_counts_as_unset() {
+        assert_eq!(
+            Config::from_map(&HashMap::new())
+                .unwrap()
+                .cdc_kafka_bootstrap,
+            None
+        );
+        let cfg = Config::from_map(&map(&[("CDC_KAFKA_BOOTSTRAP", "")])).unwrap();
+        assert_eq!(cfg.cdc_kafka_bootstrap, None);
+        let cfg = Config::from_map(&map(&[("CDC_KAFKA_BOOTSTRAP", "kafka:9092")])).unwrap();
+        assert_eq!(cfg.cdc_kafka_bootstrap.as_deref(), Some("kafka:9092"));
     }
 
     #[test]

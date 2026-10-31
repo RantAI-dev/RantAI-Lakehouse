@@ -70,9 +70,20 @@ before `SRC-9` and the picker names the field a service name. Limit: a
 database reachable only by SID (a container database with no service
 registered, or a legacy listener) is not supported; it would need a separate
 dial field, for example `sid`, which does not exist.
+
+**Load modes and column choice (`SRC-4` T1.2, T1.3).** `incremental` and
+`incremental_dedup` need nothing Oracle-specific in the sink: `sql_database`
+pushes the cursor into the query like it does for every SQL driver
+(`sink._apply_cursor`). What is Oracle's own is the spelling of column names:
+the console takes them from the preview (`discover.py`), in Oracle's spelling
+(`CREATED_AT`), while the reflected table, the rows and dlt's cursor lookup say
+`created_at`. `in_reflected_spelling` maps `excludedColumns`, `primaryKey` and
+`incrementalKey` the way `build_source` already maps table names, before
+`ingest_factory` builds the plan and the before-load gate.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -86,6 +97,15 @@ class OracleTlsConfigError(Exception):
     """`sslMode` requires TLS but no `sslServerCertDn` was supplied --
     refused, never a silent connection with the server's identity
     unverified."""
+
+
+class OracleServiceNameError(Exception):
+    """The dial's `database` is not an identifier fit to be an Oracle service name."""
+
+
+# SRC-4 slice 1 review SHOULD-FIX 3: the service name is an identifier; the same rule as
+# `is_oracle_service_name` in `ingest_spec.rs`, checked again here before connect args are built.
+_SERVICE_NAME = re.compile(r"[A-Za-z0-9_.-]{1,128}")
 
 
 @dataclass(frozen=True)
@@ -110,9 +130,16 @@ def connection_parts(
 
     # Errors
 
+    `OracleServiceNameError` when `database` is not an identifier;
     `OracleTlsConfigError` when `sslMode` requires TLS and `sslServerCertDn` is
     unset; whatever `resolve_checked` raises for a blocked host.
     """
+    service_name = spec["database"]
+    if not isinstance(service_name, str) or not _SERVICE_NAME.fullmatch(service_name):
+        # Fixed text: the value is not repeated.
+        raise OracleServiceNameError(
+            "database must be an Oracle service name: 1 to 128 letters, digits, underscores, dots or hyphens"
+        )
     resolved = resolve_checked(spec["host"], spec["port"])
 
     tls_required = bool(spec.get("sslMode")) and spec["sslMode"] != "disable"
@@ -125,9 +152,22 @@ def connection_parts(
                 "identity cannot be verified when connecting by IP; set sslServerCertDn to the "
                 "certificate's expected Distinguished Name, or set sslMode to disable"
             )
-        # The operator-supplied DN, passed through EXACTLY as configured
-        # -- never derived from spec["host"].
-        engine_kwargs["connect_args"] = {"ssl_server_cert_dn": cert_dn}
+        # SRC-4 T1.4: `tcps` is a property of the ADDRESS, not of the connect call. Before, only
+        # `ssl_server_cert_dn` was passed, and SQLAlchemy's `makedsn` always writes
+        # `(PROTOCOL=TCP)` into the descriptor, which makes thin mode ignore both `protocol` and
+        # the DN: a dial with `sslMode` set connected in clear text (measured against a TLS
+        # listener: no handshake arrived). So the dial's own address is handed to `oracledb` as
+        # structured keywords, with `dsn` unset (`None` overrides the descriptor SQLAlchemy built
+        # from the URL): `protocol="tcps"`, the checked IP literal, and the OPERATOR-SUPPLIED DN,
+        # passed through EXACTLY as configured -- never derived from spec["host"].
+        engine_kwargs["connect_args"] = {
+            "dsn": None,
+            "host": resolved.ip,  # the CHECKED literal IP -- never spec["host"]
+            "port": spec["port"],
+            "service_name": spec["database"],
+            "protocol": "tcps",
+            "ssl_server_cert_dn": cert_dn,
+        }
 
     # `credentials` is a plain Python dict of STRUCTURED fields handed to SQLAlchemy's
     # `create_engine`, never an interpolated DSN string -- a
@@ -147,6 +187,33 @@ def connection_parts(
         "query": {"service_name": spec["database"]},
     }
     return credentials, engine_kwargs, resolved
+
+
+def in_reflected_spelling(obj: dict) -> dict:
+    """A copy of a source object whose column names (`excludedColumns`,
+    `incrementalKey`, `primaryKey`) are spelled the way `sql_database` reflects
+    them (`SRC-4` T1.2, T1.3).
+
+    The console takes column names from the preview (`discover.py _oracle`),
+    which reads Oracle's own spelling, `CREATED_AT`. SQLAlchemy's Oracle dialect
+    reports an all-upper-case name in lower case, so the reflected table, the
+    rows and the cursor lookup (`table.c[...]`) say `created_at`, and a name left
+    in the preview's spelling would leave nothing out (`ingest_factory.
+    _leave_out_columns` compares exact names) or fail to find its cursor column.
+    The dialect's own `normalize_name` is the same map `build_source` uses for
+    table names, so a name that is already lower case, or a quoted mixed-case
+    one, passes through unchanged.
+    """
+    normalize = OracleDialect_oracledb().normalize_name
+    changed = dict(obj)
+    for field in ("excludedColumns", "primaryKey"):
+        names = obj.get(field)
+        if isinstance(names, (list, tuple)):
+            changed[field] = [normalize(n) if isinstance(n, str) else n for n in names]
+    cursor = obj.get("incrementalKey")
+    if isinstance(cursor, str) and cursor.strip():
+        changed["incrementalKey"] = normalize(cursor.strip())
+    return changed
 
 
 def build_source(

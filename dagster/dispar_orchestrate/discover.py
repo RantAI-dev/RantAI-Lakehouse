@@ -23,6 +23,7 @@ never writes to the source.
     preview, done  {"requestId", "kind": "preview", "state": "done",
                     "columns": [{"name", "typeName", "inferred"}],
                     "primaryKey"?: [name]}
+    test, done     {"requestId", "kind": "test", "state": "done", "latencyMs": int}
     failed         {"requestId", "kind", "state": "failed", "errorClass"}
 
 `errorClass` is one of `ERROR_CLASSES` (decision D10's six words, `unreachable`
@@ -73,6 +74,7 @@ load refuses, `column_gate.py`), `mixed` (values of different types) and `unknow
 from __future__ import annotations
 
 import csv
+import functools
 import io
 import json
 import logging
@@ -137,7 +139,10 @@ ERROR_CLASSES = frozenset(
     {UNREACHABLE, SIGN_IN_REFUSED, ADDRESS_REFUSED, NO_PERMISSION, TIMEOUT, TOO_MANY_OBJECTS, NOT_SUPPORTED, FAILED}
 )
 
-KINDS = ("list", "preview")
+# `test` (SRC-4 T1.1) is not a listing: it is the connection test of a connector whose driver only this
+# code location has (Oracle). `POST /api/connectors/{id}/test` launches it; the result is the time the
+# connection took, or a class, and the API records it as a connection test.
+KINDS = ("list", "preview", "test")
 
 
 class NotSupported(Exception):
@@ -207,11 +212,11 @@ class DiscoverRequest:
 
         # Errors
 
-        `ValueError` for a kind that is not `list`/`preview`.
+        `ValueError` for a kind that is not `list`/`preview`/`test`.
         """
         kind = config["kind"]
         if kind not in KINDS:
-            raise ValueError("kind must be list or preview")
+            raise ValueError("kind must be list, preview or test")
         return cls(
             connector_id=config["connector_id"],
             request_id=config["request_id"],
@@ -549,6 +554,265 @@ def _mongo(dial: dict, secrets: dict, request: DiscoverRequest, b: Backends) -> 
 # --- Kafka (decision D4, D6) -----------------------------------------------------------
 
 
+def _cdc_mongo_client_options(ssl_mode: str) -> dict[str, Any]:
+    """`pymongo` TLS options for a change-capture dial's `sslMode`, the same meaning the Kafka
+    Connect worker gets (`lakehouse_store::cdc::render_mongodb_connect_config`): `disable` is no
+    TLS; `require` is TLS with the host name not checked; `verify-ca` and `verify-full` check the
+    host name as well. The certificate chain is checked against the system trust store in every
+    TLS mode, as the worker checks it against its own."""
+    if ssl_mode == "disable":
+        return {}
+    return {"tls": True, "tlsAllowInvalidHostnames": ssl_mode == "require"}
+
+
+def _mongo_covers(resource: Any, database: str) -> bool:
+    """Whether a privilege's `resource` covers every collection of `database`: that database with
+    an empty collection name, every database (`db` and `collection` empty), or `anyResource`."""
+    if not isinstance(resource, dict):
+        return False
+    if resource.get("anyResource") is True:
+        return True
+    return resource.get("collection", None) == "" and resource.get("db") in (database, "")
+
+
+def mongo_setup_facts(client: Any, dial: dict) -> dict[str, Any]:
+    """The setup facts of a MongoDB change-capture test (`SRC-4` Amendment 8, S8-c): closed words,
+    each read by its own command in its own `try`. An exception leaves that fact OUT (the API then
+    shows `unchecked`); nothing is guessed and no server text is kept.
+
+    - `replicaSet`: `hello.setName` against the dial's `replicaSet` (`matches`, `differs`, `none`);
+    - `primary`: `hello.isWritablePrimary`;
+    - `changeStream`: `connectionStatus` with `showPrivileges`: do the privileges that cover the
+      dial's database grant both `find` and `changeStream` (`granted` or `missing`)?"""
+    facts: dict[str, Any] = {}
+    try:
+        hello = client.admin.command("hello")
+        name = hello.get("setName")
+        if name is None:
+            facts["replicaSet"] = "none"
+        elif isinstance(name, str):
+            facts["replicaSet"] = "matches" if name == dial.get("replicaSet") else "differs"
+        primary = hello.get("isWritablePrimary")
+        if isinstance(primary, bool):
+            facts["primary"] = primary
+    except Exception:  # noqa: BLE001 -- an unread fact is left out, never guessed (and never quoted)
+        facts.pop("replicaSet", None)
+        facts.pop("primary", None)
+    try:
+        status = client.admin.command("connectionStatus", showPrivileges=True)
+        privileges = status["authInfo"]["authenticatedUserPrivileges"]
+        granted: set[str] = set()
+        for privilege in privileges:
+            if _mongo_covers(privilege.get("resource"), dial["database"]):
+                granted.update(a for a in privilege.get("actions", []) if isinstance(a, str))
+        facts["changeStream"] = "granted" if {"find", "changeStream"} <= granted else "missing"
+    except Exception:  # noqa: BLE001
+        pass
+    return facts
+
+
+def _cdc_mongo(dial: dict, secrets: dict, request: DiscoverRequest, b: Backends) -> dict[str, Any]:
+    """A MongoDB change-capture connector (`SRC-4` slice 5, decision S5-f): its collections and a
+    sample of one, read through `_mongo`, and its connection test.
+
+    The change-capture dial (`hosts`, `user`, `replicaSet`, `sslMode`) is turned into the batch
+    adapter's (`hosts`, `username`, `directConnection`), so the read dials exactly as a batch load
+    does: the same hostname check, `resolve_checked`, `checking_resolver`. The dial holds exactly one
+    host (`SRC-4` slice 5 review BLOCKER 1) and it is dialled directly: the batch adapter refuses
+    replica-set discovery, which would reach hosts nothing here has checked. `[:1]` is a second
+    guard for a stored dial that predates the rule.
+
+    The preview names `_id` as the key, so the wizard fills it in (every document has one)."""
+    adapted = {
+        "hosts": dial["hosts"][:1],
+        "username": dial["user"],
+        "database": dial["database"],
+        "directConnection": True,
+        "clientOptions": _cdc_mongo_client_options(dial.get("sslMode", "require")),
+    }
+    if request.kind == "test":
+        # The connection test: connecting authenticates (the driver signs in during the handshake)
+        # and `ping` proves the server answers. What is returned is the elapsed time, measured here
+        # from before the connect, never a driver message.
+        started = time.monotonic()
+        client, _resolved = b.mongo_connect(adapted, secrets, resolve_checked=b.resolve_checked)
+        try:
+            with b.checking_resolver():
+                client.admin.command("ping")
+                latency = max(0, round((time.monotonic() - started) * 1000))
+                # S8-c: what the source must have switched on, read after the ping inside the same
+                # guarded resolver. Closed words only; a command that raises leaves its fact out.
+                facts = mongo_setup_facts(client, dial)
+        finally:
+            client.close()
+        return {"latencyMs": latency, **({"mongoSetup": facts} if facts else {})}
+    result = _mongo(adapted, secrets, request, b)
+    if request.kind == "preview" and any(c["name"] == "_id" for c in result["columns"]):
+        result["primaryKey"] = ["_id"]
+    return result
+
+
+# --- Oracle change capture: the setup facts (SRC-4 Amendment 11) ----------------------------------------
+#
+# Every statement below is a constant of this build. A value to compare (a selected table, the PDB name)
+# is compared in Python against what the statement returned, never put into SQL, and no table row is
+# ever read: the views are the data dictionary's.
+_CDC_ORACLE_LOG_MODE = "SELECT log_mode FROM v$database"
+_CDC_ORACLE_SUPPLEMENTAL = "SELECT supplemental_log_data_min, supplemental_log_data_all FROM v$database"
+_CDC_ORACLE_PRIVILEGES = "SELECT privilege FROM session_privs"
+_CDC_ORACLE_ROLES = "SELECT role FROM session_roles"
+_CDC_ORACLE_CONTAINERS = "SELECT con_id, name FROM v$containers"
+_CDC_ORACLE_LOG_GROUPS_CDB = (
+    "SELECT con_id, owner, table_name FROM cdb_log_groups WHERE log_group_type = 'ALL COLUMN LOGGING'"
+)
+_CDC_ORACLE_TABLES_CDB = (
+    "SELECT t.con_id, t.owner, t.table_name FROM cdb_tables t "
+    "JOIN cdb_users u ON u.con_id = t.con_id AND u.username = t.owner WHERE u.oracle_maintained = 'N'"
+)
+_CDC_ORACLE_LOG_GROUPS = "SELECT owner, table_name FROM all_log_groups WHERE log_group_type = 'ALL COLUMN LOGGING'"
+_CDC_ORACLE_TABLES = "SELECT owner, table_name FROM all_tables"
+
+# What Debezium's documentation says the LogMiner user holds (system privileges and roles; the object
+# grants on the V_$ views are not session privileges). The pair in `_CDC_ORACLE_EITHER_PER_TABLE` can also be
+# granted per table, which a session cannot see from the container database: the API words it so.
+_CDC_ORACLE_REQUIRED = (
+    "CREATE SESSION", "SET CONTAINER", "LOGMINING", "SELECT ANY TRANSACTION", "EXECUTE_CATALOG_ROLE",
+    "SELECT_CATALOG_ROLE", "CREATE TABLE", "LOCK ANY TABLE", "CREATE SEQUENCE",
+)
+_CDC_ORACLE_EITHER_PER_TABLE = ("FLASHBACK ANY TABLE", "SELECT ANY TABLE")
+
+
+def _unread(fact: str, exc: BaseException | None = None) -> None:
+    """Say, in the job log, which setup fact was not read: the fact's name, the exception's type and the
+    Oracle error CODE (`ORA-nnnnn`) when it has one -- never the message (AGENTS.md principle 4)."""
+    code = re.search(r"ORA-\d{5}", str(exc)) if exc is not None else None
+    logger.info(
+        "Oracle setup fact %s was not read (%s%s)",
+        fact,
+        type(exc).__name__ if exc is not None else "no such container",
+        f", {code.group(0)}" if code else "",
+    )
+
+
+def _read_oracle_rows(connection: Any, sql: str) -> list[tuple]:
+    from sqlalchemy import text
+
+    return [tuple(r) for r in connection.execute(text(sql))]
+
+
+def oracle_setup_facts(connection: Any, dial: dict, tables: list[str]) -> dict[str, Any]:
+    """The closed facts of an Oracle change-capture test (`SRC-4` Amendment 11, S11-b). Each is read by
+    its own constant statement in its own `try`: a statement the login may not run leaves that fact OUT
+    (the API then shows `unchecked`); nothing is guessed and no server text is kept."""
+    facts: dict[str, Any] = {}
+    try:
+        mode = _read_oracle_rows(connection, _CDC_ORACLE_LOG_MODE)[0][0]
+        if mode in ("ARCHIVELOG", "NOARCHIVELOG"):
+            facts["logMode"] = mode.lower()
+    except Exception as exc:  # noqa: BLE001 -- an unread fact is left out, never guessed (and never quoted)
+        _unread("logMode", exc)
+    try:
+        minimal, everything = _read_oracle_rows(connection, _CDC_ORACLE_SUPPLEMENTAL)[0]
+        if minimal in ("YES", "NO", "IMPLICIT"):
+            facts["supplementalMin"] = minimal.lower()
+        if everything in ("YES", "NO"):
+            facts["supplementalAll"] = everything == "YES"
+    except Exception as exc:  # noqa: BLE001
+        _unread("supplemental", exc)
+    try:
+        held = {r[0] for r in _read_oracle_rows(connection, _CDC_ORACLE_PRIVILEGES)}
+        held |= {r[0] for r in _read_oracle_rows(connection, _CDC_ORACLE_ROLES)}
+        facts["missingPrivileges"] = [p for p in (*_CDC_ORACLE_REQUIRED, *_CDC_ORACLE_EITHER_PER_TABLE) if p not in held]
+    except Exception as exc:  # noqa: BLE001
+        _unread("missingPrivileges", exc)
+    try:
+        per_table = _oracle_table_facts(connection, dial, tables)
+        if per_table is not None:
+            facts["tables"] = per_table
+        else:
+            _unread("tables")
+    except Exception as exc:  # noqa: BLE001
+        _unread("tables", exc)
+    return facts
+
+
+def _oracle_table_facts(connection: Any, dial: dict, tables: list[str]) -> dict[str, str] | None:
+    """Per selected table: `allColumns`, `withoutAllColumns` or `notFound`. In a container database the
+    dictionary views of every container are read (`cdb_*`) and the container is picked HERE, by the
+    dial's `pdbName` against `v$containers`: no value goes into a statement. Rows are streamed; only
+    the selected tables are kept."""
+    wanted = {name for name in tables if isinstance(name, str)}
+    if not wanted:
+        return {}
+    pdb = dial.get("pdbName")
+    con_id: Any = None
+    if pdb:
+        found = [r[0] for r in _read_oracle_rows(connection, _CDC_ORACLE_CONTAINERS) if str(r[1]).upper() == str(pdb).upper()]
+        if not found:
+            return None
+        con_id = found[0]
+        groups_sql, tables_sql = _CDC_ORACLE_LOG_GROUPS_CDB, _CDC_ORACLE_TABLES_CDB
+    else:
+        groups_sql, tables_sql = _CDC_ORACLE_LOG_GROUPS, _CDC_ORACLE_TABLES
+
+    def named(rows: list[tuple]) -> set[str]:
+        out = set()
+        for row in rows:
+            if pdb and row[0] != con_id:
+                continue
+            owner, table = row[-2], row[-1]
+            if f"{owner}.{table}" in wanted:
+                out.add(f"{owner}.{table}")
+        return out
+
+    with_all = named(_read_oracle_rows(connection, groups_sql))
+    existing = named(_read_oracle_rows(connection, tables_sql))
+    return {
+        name: "allColumns" if name in with_all else ("withoutAllColumns" if name in existing else "notFound")
+        for name in sorted(wanted)
+    }
+
+
+def _cdc_oracle(
+    dial: dict, secrets: dict, request: DiscoverRequest, b: Backends, *, tables: list[str] | None = None
+) -> dict[str, Any]:
+    """An Oracle change-capture connector's setup facts (`SRC-4` Amendment 11). Only a connection test is
+    answered here: the tables of an Oracle change-capture connector are typed by hand (Amendment 10, S10-c).
+
+    # SEC-14 exception (owner-signed 2026-10-31, Amendment 11, S11-a)
+
+    `python-oracledb` thin mode has no native network encryption (2.5.1 and 26.1.0), so this read is made
+    over an UNENCRYPTED session: `sslMode` is forced to `disable` below for the dial that `connection_parts`
+    builds. The connector itself requires encryption and the connection test goes through Kafka Connect with
+    it. The exception is limited to what is read: the data dictionary's views of the fixed statements above,
+    never a table row, and the password is not sent in clear text (Oracle's own logon protocol). A server
+    that refuses an unencrypted session (`ORA-12660`) is posted as the fact `encryptionRequired`."""
+    if request.kind != "test":
+        raise NotSupported("an Oracle change-capture connector's tables are typed by hand")
+    plain = {**dial, "sslMode": "disable"}
+    engine = b.oracle_engine(plain, secrets, resolve_checked=b.resolve_checked)
+    started = time.monotonic()
+    try:
+        with b.checking_resolver():
+            try:
+                connection = engine.connect()
+            except Exception as exc:  # noqa: BLE001
+                # Matched on the code only; the text is not read further, logged or posted.
+                if "ORA-12660" not in str(exc):
+                    raise
+                latency = max(0, round((time.monotonic() - started) * 1000))
+                return {"latencyMs": latency, "oracleSetup": {"encryptionRequired": True}}
+            with connection:
+                rows = _read_oracle_rows(connection, "SELECT 1 FROM DUAL")
+                if rows != [(1,)]:
+                    raise ValueError("the test statement did not answer")
+                latency = max(0, round((time.monotonic() - started) * 1000))
+                facts = oracle_setup_facts(connection, dial, tables or [])
+    finally:
+        engine.dispose()
+    return {"latencyMs": latency, **({"oracleSetup": facts} if facts else {})}
+
+
 def _kafka(dial: dict, secrets: dict, request: DiscoverRequest, b: Backends) -> dict[str, Any]:
     # A group id the connector never uses (module docstring, "Kafka never commits").
     consumer = b.kafka_consumer(dial, secrets, group_id=f"lakehouse-discover-{request.request_id}")
@@ -667,11 +931,19 @@ def _oracle(dial: dict, secrets: dict, request: DiscoverRequest, b: Backends) ->
     from sqlalchemy import text
 
     engine = b.oracle_engine(dial, secrets, resolve_checked=b.resolve_checked)
+    started = time.monotonic()
     try:
         with b.checking_resolver(), engine.connect() as connection:
-
             def rows(sql: str, **params: Any) -> list[tuple]:
                 return [tuple(r) for r in connection.execute(text(sql), params)]
+
+            if request.kind == "test":
+                # SRC-4 T1.1: the connection test. Connecting is the proof (the dial is the load's: the
+                # checked IP literal, tcps with the operator's DN when `sslMode` asks, the service name); one
+                # trivial statement shows the login can use the session. What is returned is the elapsed
+                # time, measured here, from before the connect.
+                rows("SELECT 1 FROM DUAL")
+                return {"latencyMs": max(0, round((time.monotonic() - started) * 1000))}
 
             search = like_escape(request.search) or None
             fetch = request.limit + 1
@@ -762,6 +1034,11 @@ def _reader_for(connector: dict) -> Callable[[dict, dict, DiscoverRequest, Backe
     adapter, dial = connector["adapter"], connector["dial"]
     if adapter == "sql" and dial.get("driver") == "oracle":
         return _oracle
+    if adapter == "cdc" and dial.get("driver") == "mongodb":
+        return _cdc_mongo
+    if adapter == "cdc" and dial.get("driver") == "oracle":
+        selected = [o.get("name") for o in connector.get("sourceObjects") or [] if isinstance(o, dict)]
+        return functools.partial(_cdc_oracle, tables=selected)
     readers = {"mongodb": _mongo, "kafka": _kafka, "sftp": _sftp, "rest": _rest, "saas": _saas}
     reader = readers.get(adapter)
     if reader is None:
@@ -780,6 +1057,10 @@ def discover(connector: dict, request: DiscoverRequest, *, backends: Backends | 
     errors -- for `classify_discovery` to name. Nothing is caught here.
     """
     reader = _reader_for(connector)
+    if request.kind == "test" and getattr(reader, "func", reader) not in (_oracle, _cdc_mongo, _cdc_oracle):
+        # SRC-4 T1.1 and slice 5: only Oracle and a MongoDB change-capture connector are tested here;
+        # the API tests the rest itself or says it cannot.
+        raise NotSupported("the orchestrator tests only Oracle and MongoDB change-capture connections")
     dial = connector["dial"]
     secrets = secret_resolver.resolve_secrets(
         connector["adapter"],
@@ -867,7 +1148,7 @@ def _fetch_connector(connector_id: str) -> dict:
     config_schema={
         "connector_id": Field(str, description="The connector.id to read."),
         "request_id": Field(str, description="The API's id for this request; echoed in the result."),
-        "kind": Field(str, description="list | preview."),
+        "kind": Field(str, description="list | preview | test."),
         "object": Field(str, default_value="", description="The object to preview."),
         "schema": Field(str, default_value="", description="A SQL source's schema."),
         "glob": Field(str, default_value="", description="A file glob (SFTP)."),
