@@ -1122,6 +1122,11 @@ is refused, and the virtualenv carries `pytest==8.3.4` over the system site pack
 cryptography). `actionlint` and `shellcheck` were not installed on this machine; both were
 downloaded to `/tmp/opencode` (actionlint v1.7.7, shellcheck v0.10.0) to run the checks above.
 
+The same two commands were run again, in the foreground, on the final commit `b0abeb27` (this
+section and `docs/CI.md` only): **80 passed, 0 failed**, and `actionlint` clean, exit 0. The
+repository's own Python guards ran too: `python3 ops/lint/check_intra_package_imports.py` → OK,
+`python3 ops/lint/check_bare_iceberg_count.py` → no violation.
+
 **Not verified, with the reason:**
 
 - **The dry run is not verified.** It needs a GitHub runner, and the PR's own dry run is the proof:
