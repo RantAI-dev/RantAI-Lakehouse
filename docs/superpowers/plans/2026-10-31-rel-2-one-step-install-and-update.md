@@ -1157,3 +1157,61 @@ proxy-logged proof stands. Replacing it with a `--signing-config` file is left f
 is removed; add a line to `docs/CI.md` saying so.
 
 **Open: BLOCKER 1 (round 5).**
+
+### Fix for review round 5 (developer, 2026-11-01)
+
+**Commit** `15e5b88f` (branch `feat/rel-2-s2-release-pipeline`), one commit for the finding and
+the two notes that came with it.
+
+**BLOCKER 1 (`15e5b88f`): the SBOM is CycloneDX JSON.** All eight SBOM steps — the four images
+of each of the two jobs — now ask for `format: cyclonedx-json` instead of `format: cyclonedx`.
+`anchore/sbom-action` passes the format straight to syft (`syft scan … -o <format>`), and syft's
+`cyclonedx` name is an ALIAS of `cyclonedx-xml`: its own encoder lists `cyclonedx`, `cyclone` and
+`cdx` among the XML encoder's aliases, while the JSON encoder's name is `cyclonedx-json`. So
+the pipeline wrote CycloneDX **XML** into `sbom/<name>.cdx.json`, and `cosign attest --type
+cyclonedx` — which reads a JSON predicate — answered `invalid character '<' looking for beginning
+of value`. With `cyclonedx-json` the file is JSON, the `.cdx.json` names are true, and the
+predicate cosign reads is the one syft wrote.
+
+The reason is stated at the site, in both jobs, above the SBOM steps: a comment says that the
+format is CycloneDX JSON, that syft writes the plain `cyclonedx` name as XML, and that the XML
+predicate failed with cosign's own words (REL-2 S2 review round 5 BLOCKER 1).
+
+**The check** (`ops/release/test_release_workflow.py`, 2 new cases). `sbom_steps` finds every
+`sbom-action` step of every job; `sbom_formats` names every one whose `format:` is not
+`cyclonedx-json`. The new cases hold both jobs to it — and to having SBOM steps at all, so the
+check cannot pass by the steps going away — and report a synthetic workflow that asks for the
+XML format. The synthetic case was run against the real workflow with the format reverted: the
+check then named all eight steps and the suite went red, so the check can fail.
+
+**The note in `docs/CI.md`**: cosign v3 prints the `--tlog-upload has been deprecated` warning.
+The line says the flag still works, that the pipeline keeps it, and that the switch to a
+`--signing-config` file is left for when the flag is removed (REL-2 S2 review round 5).
+
+**Commands run, in the foreground, on `15e5b88f`:**
+
+| Command | Result |
+| --- | --- |
+| `python3 -m pytest ops/release -q` | **82 passed, 0 failed** (80 before this round, 2 new: the check on both jobs and the synthetic XML workflow) |
+| `actionlint .github/workflows/release.yml` | clean, exit 0 (actionlint v1.7.7, with shellcheck 0.10.0 on the PATH, so the `run:` blocks were checked too) |
+
+The pytest run used the virtualenv's interpreter (`/tmp/opencode/relvenv/bin/python -m pytest
+ops/release -q`): the system Python is externally managed (PEP 668), so `pip install --user
+pytest` is refused, and the virtualenv carries `pytest==8.3.4` over the system site packages
+(PyYAML, cryptography). `actionlint` (v1.7.7) and `shellcheck` (v0.10.0) were already
+downloaded to `/tmp/opencode` by the earlier rounds of this slice; `actionlint` was run from
+`/tmp/opencode/actionlint`, with `/tmp/opencode/bin` on the PATH so it found that `shellcheck`.
+
+The repository's own Python guards ran too: `python3 ops/lint/check_intra_package_imports.py` →
+OK, `python3 ops/lint/check_bare_iceberg_count.py` → no violation.
+
+**Not verified, with the reason:**
+
+- **The dry run is not verified.** It needs a GitHub runner, and the PR's own dry run is the
+  proof: the format is a runner behaviour, and the only evidence here is syft's own encoder
+  names (read from `anchore/syft` at `v1.42.3`, the version `anchore/sbom-action` v0.24.0
+  installs) and cosign's error message from the PR's second run.
+- **The real release is not verified, and cannot be.** It needs a `v*` tag, the owner's approval
+  on the `release` environment, and the release key. REL-2 S5 does that.
+- No cargo command and no bun command ran: this round changes no Rust, no TypeScript, no code
+  location and no Compose file.
