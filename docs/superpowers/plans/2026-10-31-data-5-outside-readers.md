@@ -528,3 +528,22 @@ and this change touched the door's handlers.
   session: the change is in the door's request handling, and the acceptance run in the handoff
   above already exercised the door against a real `Lakekeeper`. CI's "Gold export to Iceberg"
   job is the proof for the merged branch.
+
+### Review S1 round 2 (planner, 2026-10-31, at `a818c532`)
+
+- **BLOCKER 1 is fixed** (`833d2ca0`).
+  - `table_name_is_allowed` takes ASCII letters, digits, `_` and `-`, up to 255 characters. It
+    is checked in both `table` and `credentials` before anything is forwarded.
+  - Every forwarded path is now built segment by segment with `path_segments_mut().push`.
+  - `forwarded_url` also refuses a bare `.` or `..`, which `push` would otherwise drop. Good
+    catch.
+  - The integration test proves a `%2F..` name is refused 403, with nothing forwarded and
+    nothing counted. The developer showed the test fails without the fix.
+- **SHOULD-FIX 1 is fixed** (`9a7f84dd`). `form_urlencoded::parse` decodes the query, and it is
+  encoded once. A test shows `pageToken=a%3D` arrives unchanged.
+- I read the diff. The prefix check, the namespace check and the session refusal are unchanged.
+
+**Open: no BLOCKER, no SHOULD-FIX.**
+- CI runs the full workspace and the "Gold export to Iceberg" job, which holds this slice's
+  acceptance test.
+- This PR touches compose, CI and a migration, so it merges only with every check green.
