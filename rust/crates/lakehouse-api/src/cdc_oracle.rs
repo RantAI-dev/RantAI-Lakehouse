@@ -40,8 +40,9 @@ use crate::state::AppState;
 /// Said in the test result when the orchestrator also reads Oracle's setup facts (`SRC-4` Amendment
 /// 11, S11-c): that read is the owner-signed exception to `SEC-14`'s encryption rule, limited to the
 /// data dictionary. Fixed text, shown as is.
-pub const UNENCRYPTED_SETUP_READ: &str = "Setup checks are read over an unencrypted connection; \
-    the password is not sent in clear text, the session is not encrypted.";
+pub const UNENCRYPTED_SETUP_READ: &str = "Setup checks are read over unencrypted connections (two sessions: the \
+    container database and the pluggable database); the password is not sent in clear text, the sessions are not \
+    encrypted.";
 
 /// A table the test names when the connector selects none yet. The connector
 /// is only validated, never created, so it captures nothing; the renderer needs
@@ -65,13 +66,18 @@ pub enum OracleTestFailure {
          connector's TLS mode to disable."
     )]
     EncryptionRefused,
-    /// `Debezium`'s own wording for a connection that could not be made, whatever the reason
-    /// (`OracleConnection.resolveOracleDatabaseVersion` wraps the driver's error, so the Oracle code
-    /// is in the cause and never in the answer): `Unable to connect (primary): Failed to resolve
-    /// Oracle database version`.
+    /// `Debezium`'s own wording for a connection that could not be made, whatever the reason:
+    /// `Unable to connect (primary): Failed to resolve Oracle database version`. The validation adds
+    /// it at `OracleConnector.java:91-100` from `OracleConnectionFactory.validateConnection`
+    /// (`:55-65`), and `OracleConnection.resolveOracleDatabaseVersion` (`:166-171`) wraps the driver's
+    /// error, so the Oracle code is in the cause and never in the answer. Splitting it further would
+    /// be a guess (principle 2). The sentence names every likely cause in fixed text and carries
+    /// none of the upstream text (principle 4).
     #[error(
         "Oracle connection failed: the connection or the login was refused. Kafka Connect does not \
-         say which: check the address, the service name, the login and the encryption setting."
+         say which: check the host, the port, the service name or PDB name, the login and its \
+         password, and that the server allows Oracle native network encryption (or set the TLS \
+         mode to Disable)."
     )]
     ConnectionRefused,
     /// `Debezium`'s "Connection validation timed out after N ms".
@@ -308,6 +314,22 @@ mod tests {
         }
         let nothing = ConfigValidation::from_answer(&json!({"error_count": 1})).unwrap();
         assert_eq!(classify(&nothing), OracleTestFailure::Failed);
+    }
+
+    #[test]
+    fn the_refused_connection_sentence_names_every_likely_cause_and_the_setup_line_says_sessions() {
+        let said = OracleTestFailure::ConnectionRefused.to_string();
+        for cause in [
+            "host",
+            "port",
+            "service name or PDB name",
+            "login",
+            "password",
+            "native network encryption",
+        ] {
+            assert!(said.contains(cause), "{cause}");
+        }
+        assert!(UNENCRYPTED_SETUP_READ.contains("sessions are not encrypted"));
     }
 
     #[test]

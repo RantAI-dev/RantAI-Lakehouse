@@ -2675,7 +2675,23 @@ mod tests {
         with_pdb["pdbName"] = serde_json::json!("FREEPDB1");
         assert!(Dial::parse("cdc", &with_pdb).is_ok());
         with_pdb["pdbName"] = serde_json::json!("FREE PDB; DROP");
-        assert!(refusal(with_pdb).contains("pdbName must be an Oracle name"));
+        assert!(refusal(with_pdb.clone()).contains("pdbName must be an Oracle name"));
+        // `pdbName` becomes the service name in the connect descriptor (`DESCRIPTION=(...SERVICE_NAME=...)`),
+        // so a descriptor metacharacter must never get that far (Amendment 12, S12-c).
+        for bad in [
+            "FREEPDB1)(HOST=evil",
+            "A=B",
+            "A B",
+            "(X)",
+            "FREE\tPDB",
+            "FREEPDB1)",
+        ] {
+            with_pdb["pdbName"] = serde_json::json!(bad);
+            assert!(
+                refusal(with_pdb.clone()).contains("pdbName must be an Oracle name"),
+                "{bad:?}"
+            );
+        }
         let mut bad_db = base();
         bad_db["database"] = serde_json::json!("FREE'");
         assert!(refusal(bad_db).contains("database must be an Oracle name"));

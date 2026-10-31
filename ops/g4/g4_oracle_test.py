@@ -71,8 +71,8 @@ CHECKSUM_ADAPTER = "SHA256 crypto-checksumming service adapter"
 WRONG_LOGIN_SENTENCE = "Oracle connection failed: the connection or the login was refused."
 # The fixed line of `cdc_oracle::UNENCRYPTED_SETUP_READ` (Amendment 11, S11-c).
 UNENCRYPTED_LINE = (
-    "Setup checks are read over an unencrypted connection; the password is not sent in clear text, "
-    "the session is not encrypted."
+    "Setup checks are read over unencrypted connections (two sessions: the container database and the "
+    "pluggable database); the password is not sent in clear text, the sessions are not encrypted."
 )
 # The settings of `cdc_setup_check::oracle_checks` for the gate's two selected tables.
 EXPECTED_SETTINGS = (
@@ -347,6 +347,11 @@ class OracleSource(cdc_gate.Source):
                 print(f"[g4] cleanup: DELETE of the wrong-password connector answered {deleted.status_code}", flush=True)
 
     def _connection_is_encrypted(self) -> None:
+        """Every session of `C##DBZUSER` now must carry the AES256 and SHA256 adapters. These are the
+        CONNECTOR's sessions. The orchestrator's two setup sessions (the container database and the PDB,
+        unencrypted by Amendment 11) are not counted separately: they are opened and closed inside one
+        discovery job, which ended before this step (`_test_and_wait_for_checks` waits for it), so none is
+        alive to be listed, and one that was would fail this check, which is the behaviour wanted."""
         conn = _connect(CDB)
         try:
             cur = conn.cursor()

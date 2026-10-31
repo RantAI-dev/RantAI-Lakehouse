@@ -657,6 +657,37 @@ mod tests {
         assert!(!format!("{api:?}").contains("secret-user"));
     }
 
+    /// `SRC-4` Amendment 12 (S12-d): Kafka Connect answers 422 when a connector's login fails; a save
+    /// of the ingest spec then answers a fixed sentence, with none of the worker's body.
+    #[tokio::test]
+    async fn a_refused_configuration_reaches_the_console_as_a_fixed_sentence() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(422).set_body_json(json!({
+                "error_code": 422,
+                "message": "Connector configuration is invalid: Unable to connect: ORA-01017 for user c##secret at db.internal"
+            })))
+            .mount(&server)
+            .await;
+        let client = KafkaConnectClient::new(&server.uri()).unwrap();
+        let err = client
+            .put_config("lakehouse-a", &config(ORACLE_CONNECTOR_CLASS))
+            .await
+            .unwrap_err();
+        assert_eq!(err, ConnectError::Rejected);
+        let shown = crate::cdc_lifecycle::after_save(ApiError::from(err));
+        let ApiError::Unprocessable(text) = shown else {
+            panic!("a refused configuration is a 422");
+        };
+        assert_eq!(
+            text,
+            "The settings were saved, but change capture did not start: Kafka Connect refused the connector configuration"
+        );
+        for leaked in ["ORA-01017", "c##secret", "db.internal", "invalid"] {
+            assert!(!text.contains(leaked), "{leaked}");
+        }
+    }
+
     #[tokio::test]
     async fn restart_asks_for_the_tasks_too() {
         let server = MockServer::start().await;
