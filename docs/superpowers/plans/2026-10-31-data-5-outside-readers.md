@@ -650,3 +650,23 @@ and this change touched the door's handlers.
 - CI runs the full workspace and the "Gold export to Iceberg" job, which holds this slice's
   acceptance test.
 - This PR touches compose, CI and a migration, so it merges only with every check green.
+
+### Review S2 round 1 (planner, 2026-10-31, at `d3e4f101`)
+
+- **D9.** The contract matches exactly: `GoldConsumer` and `GoldConsumers`, with `windowDays`
+  optional.
+- **D10.** One shared helper (`src/lib/gold-consumers.ts`) gives both views the same three
+  states.
+  - It adds a fourth, defensive state, `unknown` (`supported: true` with a null list), shown as
+    "—" with a tooltip, never as zero. That is right under principle 2.
+  - The card names five tools, then "and N more".
+  - The service-identities hint is built in a click handler, so the server render never reads
+    `window`.
+- **Changed but not asked for:** the open-format card's `<dl>` now always renders, because the
+  readers row is always there. The other rows keep their conditions. Fine.
+- **I re-ran on `d3e4f101`:**
+  - `bun run typecheck`: clean;
+  - `bun run lint`: 0 errors, 10 warnings, one fewer than `main`;
+  - the gold, catalog and admin features plus the two new test files: 387 pass, 0 fail.
+
+**Open: no BLOCKER, no SHOULD-FIX.** S2 merges after S1, rebased on `main`.
