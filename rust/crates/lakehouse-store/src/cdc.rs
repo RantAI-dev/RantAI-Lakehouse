@@ -695,8 +695,8 @@ fn oracle_encryption_entries(
 
 /// The `Oracle` connector's own keys: class, the container database, the
 /// pluggable database when there is one, native encryption, and the
-/// schema-history topic. `log.mining.strategy` and `snapshot.mode` keep the
-/// connector's defaults (`online_catalog`, `initial`).
+/// schema-history topic. `log.mining.strategy` is `hybrid` (Amendment 12, S12-a); `snapshot.mode` keeps the
+/// connector's default, `initial`.
 fn oracle_entries(
     connector_id: &str,
     dial: &CdcDial,
@@ -705,6 +705,14 @@ fn oracle_entries(
     let mut entries = vec![
         ("connector.class", ORACLE_CONNECTOR_CLASS.to_owned()),
         ("database.dbname", dial.database.clone()),
+        // `SRC-4` Amendment 12 (S12-a): the default `online_catalog` fails the task on the first change
+        // that mentions a column added after the connector started (`g4-oracle`, run 41235139798:
+        // "No column 'NOTE' found in table", task killed). `hybrid` keeps the online dictionary and falls
+        // back to Debezium's own schema metadata when LogMiner cannot rebuild a DML
+        // (`OracleConnectorConfig.java:1545-1554`). Its one config conflict is `lob.enabled=true`
+        // (`:2416-2425`), which this renderer never sets. `redo_log_catalog` is NOT used: it writes the
+        // dictionary into the redo logs and needs the owner's sign-off.
+        ("log.mining.strategy", "hybrid".to_owned()),
     ];
     if let Some(pdb) = &dial.pdb_name {
         reject_control_characters("pdbName", pdb)?;
@@ -1126,9 +1134,11 @@ mod tests {
         ] {
             assert_eq!(config[key], value, "{key}");
         }
-        // The defaults stay defaults, and none of the other drivers' keys.
+        // Amendment 12 (S12-a): hybrid, so a column added mid-stream does not fail the task; LOBs are never switched on.
+        assert_eq!(config["log.mining.strategy"], "hybrid");
+        assert!(!config.contains_key("lob.enabled"));
+        // None of the other drivers' keys.
         for key in [
-            "log.mining.strategy",
             "slot.name",
             "database.server.id",
             "database.include.list",
