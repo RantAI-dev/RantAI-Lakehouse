@@ -65,6 +65,18 @@ pub enum OracleTestFailure {
          connector's TLS mode to disable."
     )]
     EncryptionRefused,
+    /// `Debezium`'s own wording for a connection that could not be made, whatever the reason
+    /// (`OracleConnection.resolveOracleDatabaseVersion` wraps the driver's error, so the Oracle code
+    /// is in the cause and never in the answer): `Unable to connect (primary): Failed to resolve
+    /// Oracle database version`.
+    #[error(
+        "Oracle connection failed: the connection or the login was refused. Kafka Connect does not \
+         say which: check the address, the service name, the login and the encryption setting."
+    )]
+    ConnectionRefused,
+    /// `Debezium`'s "Connection validation timed out after N ms".
+    #[error("Oracle connection timed out")]
+    TimedOut,
     /// Anything else.
     #[error("Oracle connection test failed")]
     Failed,
@@ -82,6 +94,9 @@ pub fn classify(validation: &ConfigValidation) -> OracleTestFailure {
             needles.iter().any(|needle| lower.contains(needle))
         })
     };
+    // Debezium 3.7.0.Final's validation answers (`OracleConnector.java:91-100`,
+    // `OracleConnectionFactory.java:55-65`) carry no Oracle code for a refused connection, only these
+    // fixed phrases; a code is still honoured when one does appear.
     if has(&["ora-12660", "ora-12650", "ora-12649"]) {
         OracleTestFailure::EncryptionRefused
     } else if has(&["ora-01017"]) {
@@ -92,11 +107,17 @@ pub fn classify(validation: &ConfigValidation) -> OracleTestFailure {
         "ora-12505",
         "ora-12170",
         "connection refused",
-        "timed out",
         "unknownhostexception",
         "network adapter could not establish",
     ]) {
         OracleTestFailure::Unreachable
+    } else if has(&[
+        "unable to connect (",
+        "failed to resolve oracle database version",
+    ]) {
+        OracleTestFailure::ConnectionRefused
+    } else if has(&["connection validation timed out"]) {
+        OracleTestFailure::TimedOut
     } else {
         OracleTestFailure::Failed
     }
@@ -271,6 +292,15 @@ mod tests {
             (
                 "IO Error: Connection refused (ORA-12660)",
                 OracleTestFailure::EncryptionRefused,
+            ),
+            // What Debezium 3.7.0.Final really answers for any refused connection (see `classify`).
+            (
+                "Unable to connect (primary): Failed to resolve Oracle database version",
+                OracleTestFailure::ConnectionRefused,
+            ),
+            (
+                "Connection validation timed out after 30000 ms",
+                OracleTestFailure::TimedOut,
             ),
             ("something unexpected", OracleTestFailure::Failed),
         ] {

@@ -29,7 +29,7 @@ of every session of `C##DBZUSER` names the AES256 encryption adapter and the SHA
 
 The connection test goes through Kafka Connect's config validation (Amendment 10, S10-a). A second
 connector is registered with the right password and its stored password is changed afterwards (Kafka Connect
-refuses to create a connector whose login fails); its test must answer the fixed sentence for `ORA-01017`.
+refuses to create a connector whose login fails); its test must answer the fixed sentence for a refused connection (Debezium does not say it was the login).
 
 # Tables
 
@@ -65,7 +65,10 @@ OBJECT_GRANTS = (
 )
 ENCRYPTION_ADAPTER = "AES256 encryption service adapter"
 CHECKSUM_ADAPTER = "SHA256 crypto-checksumming service adapter"
-WRONG_LOGIN_SENTENCE = "Oracle connection failed: authentication failed"
+# Debezium 3.7.0.Final answers "Unable to connect (primary): Failed to resolve Oracle database version" for a refused
+# login, an unreachable server and a refused encryption alike (the Oracle code is only in the cause), so the API cannot
+# say which: the fixed sentence of `cdc_oracle::OracleTestFailure::ConnectionRefused`.
+WRONG_LOGIN_SENTENCE = "Oracle connection failed: the connection or the login was refused."
 # The fixed line of `cdc_oracle::UNENCRYPTED_SETUP_READ` (Amendment 11, S11-c).
 UNENCRYPTED_LINE = (
     "Setup checks are read over an unencrypted connection; the password is not sent in clear text, "
@@ -321,7 +324,7 @@ class OracleSource(cdc_gate.Source):
     def _wrong_password_is_classified(self) -> None:
         """Kafka Connect refuses to CREATE a connector whose login fails, so the connector is registered
         with the right password and the stored one is changed afterwards: the next test dials with the
-        wrong one and must answer the fixed sentence for `ORA-01017`."""
+        wrong one and must answer the fixed sentence for a refused connection (Debezium does not say it was the login)."""
         spec = {
             "adapter": "cdc", "ingestMode": "cdc", "dial": self.dial(),
             "sourceObjects": [
