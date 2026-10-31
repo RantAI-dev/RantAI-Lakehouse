@@ -4,6 +4,7 @@
 //! Ports `src/app/api/query/run/route.ts` and
 //! `src/app/api/query/estimate/route.ts`.
 
+use std::collections::HashMap;
 use std::time::Instant;
 
 use axum::Extension;
@@ -12,7 +13,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use lakehouse_auth::Principal;
-use lakehouse_clickhouse::{ChClient, ChError};
+use lakehouse_clickhouse::ChClient;
 use lakehouse_core::ApiError;
 use lakehouse_store::PgPool;
 use lakehouse_store::audit::NewAuditEvent;
@@ -147,7 +148,7 @@ async fn rewrite_sql_for_principal_inner(
     };
     let obligations_source = crate::policy_engine::PolicyEngineObligations::from_state(state);
 
-    // SEC-20: the tenant gate runs BEFORE the policy rewrite, so a
+    // SEC-20/SEC-50: the tenant gate runs BEFORE the policy rewrite, so a
     // statement that reads a table the caller may not read is refused
     // before the policy's own prefetch asks the engine about that table,
     // and before the statement reaches the engine at all.
@@ -158,13 +159,11 @@ async fn rewrite_sql_for_principal_inner(
     // lists objects without naming one. A statement that does not parse
     // has no targets at all: the policy rewrite refuses it with a 422 of
     // its own, so there is nothing here to gate.
-    let gate_dialect: &dyn sqlparser::dialect::Dialect = if is_trino_engine(engine) {
-        &sqlparser::dialect::GenericDialect {}
+    let actor = GateActor::Caller { principal, headers };
+    if is_trino_engine(engine) {
+        gate_statement(state, sql, &sqlparser::dialect::GenericDialect {}, actor).await?;
     } else {
-        &sqlparser::dialect::ClickHouseDialect {}
-    };
-    if let Some(targets) = crate::sql_rewrite::gate_targets(sql, gate_dialect) {
-        refuse_unreachable_tables(state, principal, headers, &targets).await?;
+        gate_statement(state, sql, &sqlparser::dialect::ClickHouseDialect {}, actor).await?;
     }
 
     // WS7 item D1/D2: the actual referenced-tables/prefetch/enforce
@@ -215,6 +214,212 @@ async fn rewrite_sql_for_principal_inner(
         ApiError::Unprocessable(crate::policy_engine::enforcement_error_message(&err).to_owned())
     })
 }
+
+/// `SEC-50`: who a gated statement acts as.
+///
+/// The gate is ONE rule with three actors, not three rules: every site
+/// that runs a statement through the policy rewrite asks this gate
+/// first, and the actor says whose reach the statement is measured
+/// against. Nobody writes a second copy of the reach logic
+/// (`AGENTS.md` rule 4).
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum GateActor<'a> {
+    /// The signed-in caller, with the request's headers: the tenant is
+    /// the `X-Tenant` header when the caller sent one, else the
+    /// caller's first tenant. `SEC-20`'s rule, unchanged.
+    Caller {
+        principal: &'a Principal,
+        headers: &'a HeaderMap,
+    },
+    /// A named tenant, resolved as if it had been sent in `X-Tenant`:
+    /// the site acts as that tenant, and a principal that does not
+    /// belong to it is refused with the same 404 an `X-Tenant` header
+    /// naming a foreign tenant gets. `None` means the site has no
+    /// tenant at all, and reaches nothing.
+    ///
+    /// `SEC-50` R1: a principal holding the unrestricted (`"*:*"`) grant
+    /// passes this actor TOO, in both cases — with a tenant and without
+    /// one, whether or not the principal belongs to that tenant. That is
+    /// `SEC-20`'s own signed rule ("a principal holding `*:*` passes"),
+    /// and it is safe here for the same reason it is safe in Query
+    /// Studio: an unrestricted principal already reads everything there,
+    /// so a statement running as that principal reaches no more than the
+    /// principal itself reaches.
+    AsTenant {
+        principal: &'a Principal,
+        tenant_id: Option<Uuid>,
+    },
+    /// The deployment's own catalog tenant: a job with no user (an
+    /// alert, the scheduled Gold export, an embed token).
+    CatalogTenant,
+}
+
+/// `SEC-50`: the ONE gate every statement passes before it is rewritten.
+///
+/// `SEC-20` put the tenant gate inside the query path; this is that
+/// gate, lifted out of it so that every site which runs a statement
+/// through [`crate::policy_engine::rewrite_sql_for_roles`] asks it
+/// first — the query path, the authored pipelines, the Gold export, and
+/// (from slice 2) the dashboards, the embeds, the public links and the
+/// alerts. The gate is the same code for all of them; only the actor
+/// differs, and the actor says whose reach the statement is measured
+/// against.
+///
+/// The targets come from ONE parse, with the dialect of the engine the
+/// statement names (the same choice the policy rewrite makes): the
+/// tables the statement names, or the fact that it lists objects
+/// without naming one. A statement that does not parse has no targets
+/// at all: the policy rewrite refuses it with a 422 of its own, so
+/// there is nothing here to gate.
+///
+/// # Errors
+///
+/// 404 with the fixed sentence of [`table_not_available`] for a table
+/// the actor may not read; 422 with the fixed sentence of
+/// [`LISTING_NOT_AVAILABLE`] for a statement that lists objects and the
+/// actor may not list them; 404 for a tenant the actor may not act as;
+/// 422 with the fixed sentence of [`JOB_NEEDS_CATALOG_TENANT`] for a
+/// job with no user in a deployment that holds several tenants and no
+/// `CATALOG_TENANT_ID`; 503 when the deployment's own answers cannot be
+/// read.
+pub(crate) async fn gate_statement<D>(
+    state: &AppState,
+    sql: &str,
+    dialect: &D,
+    actor: GateActor<'_>,
+) -> Result<(), ApiError>
+where
+    D: sqlparser::dialect::Dialect + Sync,
+{
+    let Some(targets) = crate::sql_rewrite::gate_targets(sql, dialect) else {
+        // A statement that does not parse has no targets: the policy
+        // rewrite refuses it with a 422 of its own, so there is nothing
+        // here to gate.
+        return Ok(());
+    };
+    refuse_unreachable_tables(state, actor, &targets).await
+}
+
+/// `SEC-50`: the reach of an actor — whose tables the statement may
+/// read.
+///
+/// Each actor answers the same question with the answers the service
+/// already has (the shared catalog's own gate, the acting tenant, the
+/// deployment's tenant count, and the setting that names the catalog's
+/// tenant), never with a rule of its own.
+///
+/// # Errors
+///
+/// 404 for a tenant the actor may not act as; 422 with the fixed
+/// sentence of [`JOB_NEEDS_CATALOG_TENANT`] for a job with no user in a
+/// deployment that holds several tenants and no `CATALOG_TENANT_ID`;
+/// 503 when the deployment's own answers cannot be read.
+async fn reach_for_actor(state: &AppState, actor: GateActor<'_>) -> Result<TenantReach, ApiError> {
+    match actor {
+        GateActor::Caller { principal, headers } => resolve_reach(state, principal, headers).await,
+        GateActor::AsTenant {
+            principal,
+            tenant_id,
+        } => {
+            // `SEC-50` R1 (review round 1, BLOCKER 1): the unrestricted
+            // grant is checked FIRST, before the tenant is looked at at
+            // all. `SEC-20`'s own rule is that a principal holding
+            // `*:*` passes, and it is the same rule here: an
+            // unrestricted principal reads every table in Query Studio
+            // already, so a statement that runs as that principal
+            // reaches no more than the principal itself reaches.
+            //
+            // Checked first, this also answers the case of a site with
+            // NO tenant of its own (a pipeline whose `tenant_id` is
+            // NULL): an unrestricted author reads everything, so the
+            // pipeline is not refused for the tenant it never had.
+            // Without this, the G7 harness's bootstrap-admin pipelines
+            // (created by a `*:*` admin that belongs to no tenant) would
+            // be refused for a tenant they never had.
+            if crate::routes::catalog::is_unrestricted(principal) {
+                return Ok(TenantReach::All);
+            }
+            match tenant_id {
+                // D5: the site has no tenant at all (a pipeline whose own
+                // `tenant_id` is NULL). It reaches nothing — the
+                // migration's own fail-closed rule.
+                None => Ok(TenantReach::NoTenant),
+                // D5: the tenant is checked and resolved exactly as an
+                // `X-Tenant` header is, so the reach is the one the
+                // principal would have with that header — one rule, not
+                // two.
+                Some(tenant_id) => {
+                    let headers = crate::tenant_scope::headers_for_tenant(tenant_id)?;
+                    resolve_reach(state, principal, &headers).await
+                }
+            }
+        }
+        GateActor::CatalogTenant => {
+            let tenant_count = deployment_tenant_count(state).await?;
+            catalog_tenant_reach(tenant_count, state.config.catalog_tenant_id)
+        }
+    }
+}
+
+/// `SEC-50` D3: the reach of a job with no user, as a pure function of
+/// the two answers it needs.
+///
+/// The job reads the SHARED catalog (`serving.*`, Silver, Gold), so the
+/// only tenant whose reach can cover it is the tenant that owns that
+/// catalog — which is why the job acts as the catalog's tenant and not
+/// as any person.
+///
+/// The reach is `All` when the deployment holds a single tenant (there is
+/// no other tenant's table to reach), the catalog's own tenant when
+/// `CATALOG_TENANT_ID` names it, and a refusal otherwise: a deployment
+/// with several tenants and no catalog tenant has no tenant whose reach
+/// covers the shared catalog, and failing closed is the only honest
+/// answer (D6).
+///
+/// `SEC-50` R5 (amended, PR #281 review round 2 NIT): a deployment that
+/// cannot COUNT its tenants refuses too — and with `SEC-20`'s OWN sentence
+/// for that state,
+/// [`crate::routes::catalog::COULD_NOT_VERIFY_TENANT_COUNT`] ("could not
+/// verify tenant count"), not D6's. D6 names a setting to set, and that is
+/// the wrong instruction here: the setting may ALREADY be set (naming a
+/// catalog tenant in a deployment that cannot count its tenants is a claim
+/// nobody can check), and what is missing is the deployment's own answer,
+/// not the setting.
+///
+/// `None` means there is no database to count in, so the deployment cannot
+/// say that it holds a single tenant — and it cannot say that it holds
+/// several either. "Cannot verify it is safe" is the same answer as
+/// "verified unsafe", which is `SEC-20`'s own rule: the shared catalog's
+/// own gate refuses every principal without the unrestricted grant when
+/// there is no pool (`routes::catalog::catalog_tenant_refusal`).
+fn catalog_tenant_reach(
+    tenant_count: Option<i64>,
+    catalog_tenant_id: Option<Uuid>,
+) -> Result<TenantReach, ApiError> {
+    let Some(tenant_count) = tenant_count else {
+        return Err(ApiError::Unavailable(
+            crate::routes::catalog::COULD_NOT_VERIFY_TENANT_COUNT.to_owned(),
+        ));
+    };
+    if tenant_count <= 1 {
+        return Ok(TenantReach::All);
+    }
+    match catalog_tenant_id {
+        Some(tenant_id) => Ok(TenantReach::Tenant {
+            tenant_id,
+            owns_catalog: true,
+        }),
+        None => Err(ApiError::Unprocessable(JOB_NEEDS_CATALOG_TENANT.to_owned())),
+    }
+}
+
+/// `SEC-50` D6: the one sentence a job with no user is refused with when
+/// the deployment holds several tenants and no tenant owns the shared
+/// catalog.
+///
+/// It names the setting and what to do with it, and says nothing about
+/// the deployment's data (`AGENTS.md` principle 4).
+pub(crate) const JOB_NEEDS_CATALOG_TENANT: &str = "This job reads the shared catalog, and no tenant owns it here. Set CATALOG_TENANT_ID to the tenant that owns this deployment's shared catalog.";
 
 /// `SEC-20`: how far the caller's reach extends over the tables a
 /// statement reads.
@@ -522,7 +727,7 @@ async fn claim_on(state: &AppState, tenant_id: Uuid, table: &str) -> Result<Tabl
         })
 }
 
-/// `SEC-20`: refuse a statement the caller's tenant may not run.
+/// `SEC-20`/`SEC-50`: refuse a statement the actor's tenant may not run.
 ///
 /// The targets are what the statement means to the gate: the tables it
 /// names — canonicalised the way the policy rewrite canonicalises them
@@ -535,17 +740,22 @@ async fn claim_on(state: &AppState, tenant_id: Uuid, table: &str) -> Result<Tabl
 /// tenant (and for a deployment with one tenant) and is refused
 /// otherwise.
 ///
+/// The actor's reach is resolved only when there is something to check:
+/// a statement that names no table reads nothing, so it is let through
+/// without asking the deployment anything (`SEC-20`'s behaviour, kept).
+///
 /// # Errors
 ///
 /// 404 with the fixed sentence of [`table_not_available`] for a table the
-/// caller may not read; 422 with the fixed sentence of
+/// actor may not read; 422 with the fixed sentence of
 /// [`LISTING_NOT_AVAILABLE`] for a statement that lists objects and the
-/// caller may not list them; 404 for an `X-Tenant` header the caller does
-/// not belong to; 503 when a claim cannot be read.
+/// actor may not list them; the errors of [`reach_for_actor`] — 404 for a
+/// tenant the actor may not act as, 422 for a job with no user in a
+/// deployment with several tenants and no `CATALOG_TENANT_ID`; 503 when
+/// a claim cannot be read.
 async fn refuse_unreachable_tables(
     state: &AppState,
-    principal: &Principal,
-    headers: &HeaderMap,
+    actor: GateActor<'_>,
     targets: &crate::sql_rewrite::GateTargets,
 ) -> Result<(), ApiError> {
     match targets {
@@ -553,7 +763,7 @@ async fn refuse_unreachable_tables(
             if tables.is_empty() {
                 return Ok(());
             }
-            let reach = resolve_reach(state, principal, headers).await?;
+            let reach = reach_for_actor(state, actor).await?;
             let tenant_id = match reach {
                 TenantReach::All => return Ok(()),
                 TenantReach::NoTenant => return Err(table_not_available(&tables[0])),
@@ -572,7 +782,7 @@ async fn refuse_unreachable_tables(
             // The reach is resolved FIRST: a header naming a tenant the
             // caller does not belong to is a 404 everywhere else, and it
             // must not be answered with the listing's own 422.
-            let reach = resolve_reach(state, principal, headers).await?;
+            let reach = reach_for_actor(state, actor).await?;
             match reach {
                 // Every permission, or a deployment with one tenant: there
                 // is no other tenant's listing to keep. The catalog's own
@@ -889,7 +1099,8 @@ pub(crate) async fn check_statement_would_run(
 }
 
 // The most rows one run hands back to the browser is the administrator's
-// Query Studio row limit (`TileLimits::studio_rows`, default 2,000; `BI-5`).
+// Query Studio row limit (`TileLimits::studio_rows`, default 64,000;
+// `BI-5`, `QS-2`).
 //
 // The console renders every row it receives, so an unbounded `SELECT *`
 // used to be enough to freeze the tab. The response says when the cap
@@ -901,6 +1112,16 @@ pub(crate) async fn check_statement_would_run(
 // boundary, so up to one block (`max_block_size`, about 65,000 rows by
 // default) beyond the cap can still arrive; the route keeps `studio_rows` of
 // them. `Trino`'s client bounds its own result.
+
+// The most bytes one result may carry to the browser: 10 MB (10 * 1024 * 1024 bytes)
+// of cell text.
+//
+// The row limit bounds how many rows arrive; this bounds how much they
+// weigh. A result of few, wide rows passes the row limit and still fills
+// the browser's memory, so the bytes are capped too (`QS-2`). The cap
+// is applied after the row cut and cuts at the last whole row that fits, so
+// a result is never half a row.
+const RESULT_BYTE_CAP: usize = 10 * 1024 * 1024;
 
 /// `POST /api/query/run` — execute a read-only `SQL` statement against
 /// `ClickHouse` (`engine` absent or `"clickhouse"`) or `Trino`
@@ -1107,11 +1328,28 @@ pub async fn run(
     // `Trino` in its client); this keeps exactly `row_limit` of what
     // arrived, and the response says when it did.
     let total_rows = rows.len();
-    let truncated = total_rows > row_limit;
+    let cut_by_rows = total_rows > row_limit;
     rows.truncate(row_limit);
 
+    // `QS-2`: the byte cap, after the row cut. The row limit bounds how
+    // many rows arrive; a result of few, wide rows passes it and still
+    // weighs more than the browser should take, so the bytes are capped as
+    // well. The cap cuts at the last whole row that fits and never empties a
+    // result.
+    let (rows, cut_by_bytes) = cut_rows_by_bytes(rows, RESULT_BYTE_CAP);
+    // The byte cap is applied last, so it is the limit that decided how many
+    // rows the browser got; when it cut, it is the one the response names.
+    // The row limit is named when only it cut.
+    let cut_by = if cut_by_bytes {
+        Some("bytes")
+    } else if cut_by_rows {
+        Some("rows")
+    } else {
+        None
+    };
+
     let cost_units = std::cmp::max(1, bytes_to_cost_units(scanned_bytes));
-    let id = format!("q-{started_epoch_ms}");
+    let id = history_id(started_epoch_ms);
 
     // Record a real audit_event for this run — best-effort, the same
     // non-fatal posture as the history write just below: the query already
@@ -1170,7 +1408,8 @@ pub async fn run(
         &id,
         &json!(columns),
         &json!(rows),
-        (total_rows, truncated, row_limit),
+        (total_rows, row_limit),
+        cut_by,
         duration_ms,
         scanned_bytes,
         cost_units,
@@ -1215,7 +1454,7 @@ async fn record_uncompleted_run(
         return;
     };
     let user_id = principal.id.uuid().to_string();
-    let id = format!("q-{}", epoch_ms());
+    let id = history_id(epoch_ms());
     let input = RecordHistoryInput {
         id: &id,
         sql: statement,
@@ -1347,6 +1586,51 @@ fn map_trino_error(err: TrinoError) -> ApiError {
     }
 }
 
+/// The byte cost of one cell: the length of its text — a JSON string's own
+/// bytes without the quotes, any other value's compact JSON text — plus one
+/// byte for the separator (`QS-2`).
+fn cell_byte_cost(cell: &Value) -> usize {
+    let text = match cell {
+        Value::String(text) => text.len(),
+        other => other.to_string().len(),
+    };
+    text + 1
+}
+
+/// The byte cost of one row: the sum of its cells' costs.
+///
+/// The run path builds object rows (one field per column, see
+/// [`execute_query_against_engine`]); an array row (one element per column)
+/// is counted the same way, so the rule does not depend on the row shape.
+fn row_byte_cost(row: &Value) -> usize {
+    match row {
+        Value::Object(cells) => cells.values().map(cell_byte_cost).sum(),
+        Value::Array(cells) => cells.iter().map(cell_byte_cost).sum(),
+        other => cell_byte_cost(other),
+    }
+}
+
+/// Cut `rows` to the last whole row that fits in `cap` bytes.
+///
+/// Returns the rows to keep and whether the cap cut anything. A first row
+/// that does not fit is kept anyway: the byte cap never empties a result
+/// (`QS-2`) — one enormous row is still an answer.
+fn cut_rows_by_bytes(rows: Vec<Value>, cap: usize) -> (Vec<Value>, bool) {
+    let mut kept: Vec<Value> = Vec::with_capacity(rows.len());
+    let mut total = 0usize;
+    let mut cut = false;
+    for row in rows {
+        let cost = row_byte_cost(&row);
+        if !kept.is_empty() && total.saturating_add(cost) > cap {
+            cut = true;
+            break;
+        }
+        total = total.saturating_add(cost);
+        kept.push(row);
+    }
+    (kept, cut)
+}
+
 /// Build the `/api/query/run` response body from already-computed values.
 ///
 /// Extracted from [`run`] so the transparency-panel contract — which fields
@@ -1358,6 +1642,11 @@ fn map_trino_error(err: TrinoError) -> ApiError {
 /// `metrics.engine`, which stays the fixed string `"hot-store"` describing
 /// `ClickHouse`'s storage tier regardless of which top-level engine ran.
 /// Neither renames nor removes the other.
+///
+/// `cut_by` names the limit that cut the result (`"rows"` for the Query
+/// Studio row limit, `"bytes"` for the 10 MB cap) and is absent when
+/// nothing was cut: the key is then not in the JSON at all, not `null`.
+/// `truncated` is derived from it, so the two can never disagree.
 #[allow(
     clippy::too_many_arguments,
     reason = "one flat result row, no natural grouping"
@@ -1366,19 +1655,20 @@ fn run_result_json(
     id: &str,
     columns: &Value,
     rows: &Value,
-    (total_rows, truncated, row_limit): (usize, bool, usize),
+    (total_rows, row_limit): (usize, usize),
+    cut_by: Option<&str>,
     duration_ms: u64,
     scanned_bytes: u64,
     cost_units: u64,
     engine: &str,
 ) -> Value {
-    json!({
+    let mut body = json!({
         "id": id,
         "engine": engine,
         "columns": columns,
         "rows": rows,
         "rowCount": total_rows,
-        "truncated": truncated,
+        "truncated": cut_by.is_some(),
         "rowLimit": row_limit,
         "metrics": {
             "durationMs": duration_ms,
@@ -1400,7 +1690,15 @@ fn run_result_json(
         // regardless of what `ClickHouse` actually did. Null until a real
         // plan is computed.
         "plan": Value::Null,
-    })
+    });
+    // The body is the object the macro above built, so this always finds
+    // it; the `let` keeps the `unwrap` out of the code (AGENTS.md, Rust).
+    if let Some(cut_by) = cut_by
+        && let Some(object) = body.as_object_mut()
+    {
+        object.insert("cutBy".to_owned(), json!(cut_by));
+    }
+    body
 }
 
 /// Current time as Unix milliseconds, matching JavaScript's `Date.now()`
@@ -1414,6 +1712,21 @@ fn epoch_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as i64)
+}
+
+/// The id a recorded run carries: `q-<epoch_ms>-<uuid simple>`.
+///
+/// The epoch milliseconds keep the id readable and roughly ordered; the
+/// uuid's simple form — 32 lowercase hex characters — makes it unique.
+/// The store inserts the history row with `ON CONFLICT (id) DO NOTHING`, so
+/// two runs whose ids collided would leave one of the two rows out of the
+/// history, and the epoch milliseconds alone collide whenever two runs
+/// land in the same millisecond.
+///
+/// One place mints this id, so the two callers cannot drift apart: the
+/// answered run and the refused or failed one.
+fn history_id(epoch_ms: i64) -> String {
+    format!("q-{epoch_ms}-{}", Uuid::new_v4().simple())
 }
 
 /// Wall-clock duration since `started`, in milliseconds — the fallback
@@ -1760,10 +2073,11 @@ pub async fn list_saved(
 
 /// The `GET /api/query/history` query string (`QS-4`, decision 5). Every
 /// field stays a raw string on purpose: this struct parses whatever the
-/// caller sends, so the extractor itself can never reject, and
-/// [`parse_history_query`] is the one place a bad value becomes a 400
-/// with this route's own fixed message — never `serde_urlencoded`'s
-/// rendering of a serde error.
+/// caller sends, so a bad *value* becomes a 400 with this route's own
+/// fixed message in [`parse_history_query`] — never `serde_urlencoded`'s
+/// rendering of a serde error. A query string the extractor itself cannot
+/// read (a parameter sent twice) never reaches this struct: it is refused
+/// with the fixed sentence of [`HISTORY_QUERY_UNREADABLE`].
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HistoryQueryRaw {
@@ -1784,6 +2098,14 @@ const HISTORY_STATUSES: [&str; 4] = ["completed", "failed", "cancelled", "blocke
 
 /// The engines [`run`] records.
 const HISTORY_ENGINES: [&str; 2] = ["clickhouse", "trino"];
+
+/// What a query string the route cannot read is told.
+///
+/// The twin of this sentence lives in `routes/uploads.rs`
+/// (`QUERY_UNREADABLE`). The two cannot be one constant yet: the place
+/// both could share is `routes/mod.rs`, and that file is held by another
+/// open pull request.
+const HISTORY_QUERY_UNREADABLE: &str = "The query string could not be read.";
 
 /// Parse the history query string into a [`HistoryFilter`], refusing a
 /// bad value with a fixed 400 before the store sees it.
@@ -1861,14 +2183,24 @@ fn history_time(field: &str, raw: Option<&str>) -> Result<Option<OffsetDateTime>
 ///
 /// 401 when nobody is signed in — history belongs to a person, so there is
 /// no sensible answer for "everyone's". 400 for a bad filter value, with a
-/// fixed message naming the field. 503 if no pool is configured; 500 on a
+/// fixed message naming the field, and for a query string the route cannot
+/// read (a parameter sent twice), with the fixed sentence of
+/// [`HISTORY_QUERY_UNREADABLE`]. 503 if no pool is configured; 500 on a
 /// database failure.
 pub async fn list_history(
     State(state): State<AppState>,
     principal: Option<Extension<Principal>>,
-    Query(raw): Query<HistoryQueryRaw>,
+    query: Result<Query<HistoryQueryRaw>, axum::extract::rejection::QueryRejection>,
 ) -> ApiResult<ApiJson<Vec<QueryHistoryItem>>> {
     let owner = caller_id(principal.as_ref())?;
+    // A query string the extractor cannot read — a parameter sent twice, for
+    // instance — is refused with this route's own sentence. The rejection's
+    // own text is serde's, and it stays in the log: a response never
+    // carries a library's rendering of the caller's request.
+    let Query(raw) = query.map_err(|err| {
+        tracing::warn!(%err, "a query history query string could not be read");
+        ApiError::BadRequest(HISTORY_QUERY_UNREADABLE.to_owned())
+    })?;
     let filter = parse_history_query(&raw)?;
     Ok(ApiJson(
         queries::list_history(pool(&state)?, owner, &filter).await?,
@@ -1953,32 +2285,182 @@ pub async fn create_saved(
     Ok((StatusCode::CREATED, ApiJson(saved)))
 }
 
-// ── GET /api/query/run/{id}/download (WS2 §13, WS2 plan review W9) ─────
+// ── GET /api/query/run/{id}/download (QS-2) ─────────────────────────────
 
-/// `?format=csv|parquet` on [`download`].
+/// What the console may ask a download for.
 #[derive(Debug, Deserialize)]
 pub(crate) struct DownloadQuery {
+    /// The file kind: `csv`, `tsv`, `xlsx` or `parquet`.
     format: String,
+    /// The run the download belongs to. Stop ends the queries of one run by
+    /// their name (`<caller uuid>:<runId>:%`), so the download names its
+    /// own query the same way and Stop reaches it.
+    #[serde(rename = "runId")]
+    run_id: Option<String>,
 }
 
-/// The most rows a download re-run is allowed to return — this is a
-/// bounded RE-EXECUTION against current data, not a replay of the
-/// original result, so the cap protects both the response size and the
-/// re-run's own cost. Applied twice, belt and braces: as a `LIMIT` in the
-/// wrapped statement itself (see [`build_capped_statement`]) and as a
-/// `max_result_rows` `SETTINGS` override with `result_overflow_mode =
-/// 'break'`, so `ClickHouse` truncates rather than erroring if the outer
-/// `LIMIT` is somehow not honored.
-const DOWNLOAD_ROW_CAP: u32 = 10_000;
+/// The file kinds a Query Studio download can be (`QS-2`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DownloadFormat {
+    /// UTF-8 text with a byte-order mark, its fields separated by a comma.
+    Csv,
+    /// UTF-8 text with a byte-order mark, its fields separated by a tab.
+    Tsv,
+    /// An Excel workbook, one sheet.
+    Xlsx,
+    /// The file the engine writes itself.
+    Parquet,
+}
 
-/// `query_history.id` shape: `q-<epoch_ms>`, digits only after the
-/// prefix. Validated before `id` is ever interpolated into the
+impl DownloadFormat {
+    /// The parameter value (`csv`, `tsv`, `xlsx`, `parquet`).
+    fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "csv" => Some(Self::Csv),
+            "tsv" => Some(Self::Tsv),
+            "xlsx" => Some(Self::Xlsx),
+            "parquet" => Some(Self::Parquet),
+            _ => None,
+        }
+    }
+
+    /// The file name's extension.
+    const fn extension(self) -> &'static str {
+        match self {
+            Self::Csv => "csv",
+            Self::Tsv => "tsv",
+            Self::Xlsx => "xlsx",
+            Self::Parquet => "parquet",
+        }
+    }
+
+    /// The response's `Content-Type`.
+    fn content_type(self) -> axum::http::HeaderValue {
+        match self {
+            Self::Csv => axum::http::HeaderValue::from_static("text/csv; charset=utf-8"),
+            Self::Tsv => {
+                axum::http::HeaderValue::from_static("text/tab-separated-values; charset=utf-8")
+            }
+            Self::Xlsx => axum::http::HeaderValue::from_static(
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            ),
+            Self::Parquet => axum::http::HeaderValue::from_static("application/octet-stream"),
+        }
+    }
+
+    /// The writer of this format when this service writes it: the three
+    /// formats built from rows. `None` for the file the engine writes.
+    fn row_format(self) -> Option<crate::export::FileFormat> {
+        match self {
+            Self::Csv => Some(crate::export::FileFormat::Csv),
+            Self::Tsv => Some(crate::export::FileFormat::Tsv),
+            Self::Xlsx => Some(crate::export::FileFormat::Xlsx),
+            Self::Parquet => None,
+        }
+    }
+
+    /// The most rows the file may hold: the workbook's own sheet limit, and
+    /// no limit for the delimited files.
+    fn row_cap(self) -> usize {
+        match self {
+            Self::Xlsx => crate::export::xlsx_row_cap(usize::MAX),
+            _ => usize::MAX,
+        }
+    }
+}
+
+/// Which limit cut a file short.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CutBy {
+    /// The file holds as many rows as the format allows.
+    Rows,
+    /// The file holds as many bytes as the cap allows.
+    Bytes,
+}
+
+impl CutBy {
+    /// The header's value.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Rows => "rows",
+            Self::Bytes => "bytes",
+        }
+    }
+}
+
+/// Which limit cut a file that was cut short: the rows the format allows, or
+/// the bytes the cap allows.
+///
+/// A file that holds as many rows as its format could ever hold was cut by
+/// the row limit; anything else was cut by the byte cap.
+fn cut_by(format: DownloadFormat, rows: usize) -> CutBy {
+    if rows == format.row_cap() {
+        CutBy::Rows
+    } else {
+        CutBy::Bytes
+    }
+}
+
+/// The most bytes a download may hold: 5 GB (`QS-2`).
+const DOWNLOAD_BYTE_CAP: u64 = 5 * 1024 * 1024 * 1024;
+
+/// What a result over the cap is told (`QS-2`). The file is not sent, not
+/// even half of it, so this sentence is the whole answer: nothing of the
+/// engine's own text is in it.
+const DOWNLOAD_TOO_LARGE: &str =
+    "This result is larger than 5 GB. Add a filter or download it as CSV.";
+
+/// What a query string the download route cannot read is told.
+///
+/// The twin of this sentence lives in `routes/uploads.rs`
+/// (`QUERY_UNREADABLE`), and this file's history route has its own copy of
+/// it (`HISTORY_QUERY_UNREADABLE`). The three cannot be one constant yet:
+/// the place they could share is `routes/mod.rs`, and that file is held by
+/// another open pull request.
+const DOWNLOAD_QUERY_UNREADABLE: &str = "The query string could not be read.";
+
+/// The name the download's query carries on the engine: the caller's own id,
+/// the run, and what the query is. Stop's pattern
+/// (`<caller uuid>:<runId>:%`) finds it, so Stop reaches the download's
+/// query on the engine (`QS-2`).
+fn download_query_id(caller: Uuid, run_id: Uuid) -> String {
+    format!("{caller}:{run_id}:download")
+}
+
+/// The file's name: the run's id, and how many rows it holds when it was cut
+/// short.
+fn download_file_name(id: &str, format: DownloadFormat, cut_rows: Option<usize>) -> String {
+    match cut_rows {
+        Some(rows) => format!("{id}-first-{rows}-rows.{}", format.extension()),
+        None => format!("{}.{}", id, format.extension()),
+    }
+}
+
+/// `query_history.id` shape: the old `q-<epoch_ms>`, which every row
+/// recorded so far carries, and the new `q-<epoch_ms>-<32 lowercase hex>`.
+/// Validated before `id` is ever interpolated into the
 /// `Content-Disposition` header (WS2 plan review W9) — this is a
 /// header-injection guard, not a lookup optimization; the database lookup
 /// itself already binds `id` as a parameter and needs no such check.
 fn is_valid_history_id(id: &str) -> bool {
-    id.strip_prefix("q-")
-        .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+    let Some(rest) = id.strip_prefix("q-") else {
+        return false;
+    };
+    // The old shape: the epoch milliseconds and nothing else.
+    if !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()) {
+        return true;
+    }
+    // The new shape: the epoch milliseconds, a `-`, and the uuid's simple
+    // form — 32 lowercase hex characters, and nothing else.
+    let Some((epoch, suffix)) = rest.rsplit_once('-') else {
+        return false;
+    };
+    !epoch.is_empty()
+        && epoch.bytes().all(|b| b.is_ascii_digit())
+        && suffix.len() == 32
+        && suffix
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// Only these `query_history.engine` values may be re-run through this
@@ -1992,73 +2474,172 @@ fn is_downloadable_engine(engine: &str) -> bool {
     engine == "clickhouse" || engine == "hot-store"
 }
 
-/// Wrap `sql` (a `query_history` row's stored statement) in an outer
-/// `SELECT * FROM (...)  LIMIT <cap> ...` rather than appending `LIMIT
-/// <cap>` to it directly.
+/// The statement the download runs: the caller's own statement, wrapped in a
+/// subquery.
 ///
-/// Appending would be invalid `SQL` whenever the stored statement already
-/// ends in its own `LIMIT` clause, and worse: a trailing `-- comment` in
-/// the stored `SQL` would comment out an appended `LIMIT`, uncapping the
-/// download entirely. Wrapping keeps the stored statement — comment and
-/// all — fully enclosed in its own subquery, so nothing in it can reach
-/// outside the parentheses to interfere with the outer `LIMIT`/`SETTINGS`
-/// clause (WS2 §13, WS2 plan review W9).
-///
-/// Only a single trailing `;` (and any whitespace around it) is stripped
-/// first — the same `strip_trailing_semicolon` shape
-/// `lakehouse-clickhouse` already uses for its own `FORMAT` appending, so
-/// a genuinely empty statement or one with internal semicolons is left
-/// otherwise untouched.
-fn build_capped_statement(sql: &str, format_clause: &str) -> String {
-    let trimmed = sql.trim_end();
-    let trimmed = trimmed.strip_suffix(';').unwrap_or(trimmed).trim_end();
-    format!(
-        "SELECT * FROM (\n{trimmed}\n) LIMIT {DOWNLOAD_ROW_CAP} SETTINGS \
-         max_result_rows = {DOWNLOAD_ROW_CAP}, result_overflow_mode = 'break' \
-         FORMAT {format_clause}"
-    )
+/// The wrapper keeps the statement — comment and all — fully enclosed, so a
+/// trailing `-- comment` cannot reach the `FORMAT` clause this route
+/// appends and turn the file into the engine's default format. It is the
+/// same reason the route wrapped the statement when it appended a `LIMIT`.
+fn download_statement(sql: &str) -> String {
+    let trimmed = lakehouse_clickhouse::strip_trailing_semicolon(sql.trim_end());
+    format!("SELECT * FROM (\n{trimmed}\n)")
 }
 
-/// Map a [`ChError`] from the re-run `ClickHouse` call performed by
-/// [`download`] to a fixed [`ApiError`] — never `?`, and never the
-/// upstream message.
+/// Write the rows of a download as the file `format` says.
 ///
-/// `POST /api/query/run`'s `ChError -> ApiError` conversion
-/// (`lakehouse_clickhouse::ChError`'s own `From` impl, tested by
-/// `error.rs`'s `ch_error_converts_through_question_mark_to_422_rejection`)
-/// forwards `ClickHouse`'s message verbatim — a narrow, deliberate
-/// exception because the caller reading it is the same principal whose
-/// own `SQL` produced it, at the moment they submitted it. This route
-/// re-runs a PAST query, possibly minutes or days later, so the caller is
-/// no longer necessarily in a position to make sense of a raw `ClickHouse`
-/// diagnostic; more importantly, per this repository's "upstream error
-/// text never reaches a response" rule, this route does not reuse that
-/// narrow precedent (WS2 plan review W9). `ChError::Server` becomes a
-/// fixed 422; every other variant is treated as the service being
-/// unavailable and becomes 503. The real detail is logged server-side
-/// either way.
-fn map_download_ch_error(err: &ChError) -> ApiError {
-    match err {
-        ChError::Server(_) => {
-            tracing::warn!(%err, "stored query failed to re-run for download");
-            ApiError::Unprocessable("stored query failed to re-run".to_owned())
-        }
-        ChError::Transport(_) | ChError::Cancelled => {
-            tracing::warn!(%err, "clickhouse unreachable while re-running a query for download");
-            ApiError::Unavailable("clickhouse unavailable while re-running the query".to_owned())
-        }
+/// The rows come from the engine as they arrive and are written to a file on
+/// disk, so a big result never sits in memory. The byte cap cuts the file at
+/// the last whole row that fits: a row that would pass the cap is not
+/// written, not half written.
+///
+/// # Errors
+///
+/// [`crate::export::ExportError`]: the engine failed, the disk failed, or
+/// the workbook writer refused a cell.
+async fn write_download_rows<S: crate::export::RowSource>(
+    source: &mut S,
+    format: crate::export::FileFormat,
+    locale: &str,
+    byte_cap: u64,
+) -> Result<crate::export::Written, crate::export::ExportError> {
+    // A Query Studio result has no chart, so a column has no label of its own
+    // and no value format: the header holds the column names and a number is
+    // the number the engine sent.
+    let labels: HashMap<String, String> = HashMap::new();
+    let formats: HashMap<String, lakehouse_bi::style::ValueFormat> = HashMap::new();
+    let options = crate::export::ExportOptions {
+        format,
+        values: crate::export::Values::Raw,
+        // No row cap of this route's own: the download holds the whole
+        // result. The workbook's own sheet limit still applies (the writer
+        // applies it).
+        cap: usize::MAX,
+        locale,
+        labels: &labels,
+        formats: &formats,
+    };
+    crate::export::write_export_with_byte_cap(source, &options, Some(byte_cap)).await
+}
+
+/// The file the engine wrote itself, or the refusal when it passes the byte
+/// cap.
+///
+/// The file cannot be cut at a row the way a file of rows can, so a result
+/// over the cap is refused whole: half a table is not a file anyone can use.
+/// The cap is a parameter so the refusal is provable without five gigabytes
+/// of data; the route passes the cap the signed limits name.
+///
+/// # Errors
+///
+/// 422 [`ApiError::Unprocessable`] with the fixed sentence of
+/// [`DOWNLOAD_TOO_LARGE`] when the file passes the cap — this code base's own
+/// message, so it carries no reference — and the file's own failure,
+/// reported under a reference.
+async fn download_engine_file<S: crate::export::ByteSource>(
+    source: &mut S,
+    byte_cap: u64,
+) -> Result<crate::export::ByteFile, ApiError> {
+    match crate::export::write_bytes_file(source, Some(byte_cap)).await {
+        Ok(Some(file)) => Ok(file),
+        Ok(None) => Err(ApiError::Unprocessable(DOWNLOAD_TOO_LARGE.to_owned())),
+        Err(err) => Err(download_failure(&err)),
     }
 }
 
-/// `GET /api/query/run/{id}/download?format=csv|parquet` — re-run a past
-/// `query_history` row's `SQL` against current data and return the result
-/// as a file download (WS2 §13, WS2 plan review W9).
+/// A failure of the file itself, reported under a reference with a fixed
+/// sentence (`SEC-11`).
+///
+/// The dashboard's own export has the same mapping in
+/// `routes::dashboard::export_failure`, which is private to that module.
+fn download_failure(err: &crate::export::ExportError) -> ApiError {
+    match err {
+        crate::export::ExportError::Source(ch) => {
+            upstream_error::ch_error(&upstream_error::DATABASE, ch)
+        }
+        other => upstream_error::internal_error(&upstream_error::SERVICE, other),
+    }
+}
+
+/// A header value from text this code wrote.
+///
+/// The values are a file name of digits, a count and a format — printable
+/// ASCII this code wrote — so a value the header cannot hold is a bug here,
+/// not something the caller sent.
+fn download_header(text: &str) -> Result<axum::http::HeaderValue, ApiError> {
+    axum::http::HeaderValue::from_str(text)
+        .map_err(|_| ApiError::Internal("a download header could not be built".to_owned()))
+}
+
+/// The download's response: the file streamed from disk, with the counts the
+/// console tells the person (`X-Export-Rows`, `X-Export-Cut`,
+/// `X-Export-Cut-By`).
+///
+/// The body is a file, not a JSON value, so it bypasses `ApiJson`.
+fn download_response(
+    file: tokio::fs::File,
+    len: u64,
+    file_name: &str,
+    format: DownloadFormat,
+    rows: Option<usize>,
+    cut: bool,
+    cut_by: Option<CutBy>,
+) -> Result<Response, ApiError> {
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CONTENT_TYPE, format.content_type());
+    headers.insert(
+        header::CONTENT_DISPOSITION,
+        download_header(&format!("attachment; filename=\"{file_name}\""))?,
+    );
+    headers.insert(header::CONTENT_LENGTH, download_header(&len.to_string())?);
+    headers.insert(
+        header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    headers.insert(
+        axum::http::HeaderName::from_static("x-export-cut"),
+        axum::http::HeaderValue::from_static(if cut { "true" } else { "false" }),
+    );
+    // The row count is the row path's own: the file the engine writes was
+    // never seen row by row here, so no count is claimed for it.
+    if let Some(rows) = rows {
+        headers.insert(
+            axum::http::HeaderName::from_static("x-export-rows"),
+            download_header(&rows.to_string())?,
+        );
+    }
+    // A file that was not cut names no limit.
+    if let Some(cut_by) = cut_by {
+        headers.insert(
+            axum::http::HeaderName::from_static("x-export-cut-by"),
+            download_header(cut_by.as_str())?,
+        );
+    }
+    let body = axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(file));
+    Ok((headers, body).into_response())
+}
+
+/// `GET /api/query/run/{id}/download?format=csv|tsv|xlsx|parquet` — re-run a
+/// past `query_history` row's `SQL` against current data and return the
+/// result as a file download (`QS-2`).
 ///
 /// This is NOT the original result the caller once saw: it re-executes
-/// the stored statement against whatever `ClickHouse` holds right now,
-/// capped at [`DOWNLOAD_ROW_CAP`] rows. Data ingested or deleted since the
-/// original run changes what comes back. The statement is rewritten for the
-/// caller's current roles first, exactly as the run route does.
+/// the stored statement against whatever `ClickHouse` holds right now.
+/// Data ingested or deleted since the original run changes what comes back.
+/// The statement is rewritten for the caller's current roles first, exactly
+/// as the run route does.
+///
+/// The result is the whole one: the row cap of ten thousand rows this route
+/// used to apply is gone (`QS-2`). What bounds a download now is the byte cap
+/// ([`DOWNLOAD_BYTE_CAP`], 5 GB) and, for the workbook, the sheet's own
+/// 1,048,575 data rows. A file that passes the byte cap is cut at the last
+/// whole row that fits and says so (`X-Export-Cut`, `X-Export-Cut-By`); the
+/// file the engine writes itself (`Parquet`) cannot be cut at a row, so a
+/// result over the cap is refused whole ([`DOWNLOAD_TOO_LARGE`]).
+///
+/// The download runs under the caller's own time limit, and its query is
+/// named after the caller and the run (`<caller uuid>:<runId>:download`), so
+/// Stop's pattern (`<caller uuid>:<runId>:%`) reaches it on the engine.
 ///
 /// The stored statement is the one the user wrote ([`run`] records it, not
 /// the rewritten form), so today's policy is applied to it once. A row
@@ -2079,36 +2660,58 @@ fn map_download_ch_error(err: &ChError) -> ApiError {
 /// through this route. That is a deliberate, fail-closed consequence of
 /// scoping by identity, not an oversight to be worked around.
 ///
+/// A role that is switched off from downloading may not download here either
+/// (`BI-1` D7), and nothing is read from the engine for them.
+///
 /// # Errors
 ///
-/// - 400 [`ApiError::BadRequest`] when `format` is neither `csv` nor
-///   `parquet`, or when `id` does not match the `query_history.id` shape
-///   (`q-<digits>`).
+/// - 400 [`ApiError::BadRequest`] when `format` is none of `csv`, `tsv`,
+///   `xlsx` and `parquet`, when `runId` is not a UUID, when `id` does not
+///   match the `query_history.id` shape (`q-<digits>` or
+///   `q-<digits>-<32 lowercase hex>`), or when the query string cannot be
+///   read at all — a repeated parameter, or no `format` — with the fixed
+///   sentence of [`DOWNLOAD_QUERY_UNREADABLE`].
+/// - 403 [`ApiError::PermissionDenied`] when every role of the caller is
+///   switched off from downloading.
 /// - 404 [`ApiError::NotFound`] when no history row matches `id`, or when
 ///   one does but its recorded owner is not the calling principal
 ///   (including every legacy `"anonymous"` row — see this doc comment).
 /// - 422 [`ApiError::Unprocessable`] when the policy rewrite refuses the
 ///   statement (the run route's fixed message), when the statement names a
-///   setting other than `iceberg_snapshot_id` (`SEC-21`; the cap this route
-///   appends afterwards is not subject to that rule), when the row's `engine` is not
-///   downloadable, when its stored `SQL` fails [`is_read_only`] (defense
-///   in depth: `routes::query::run` already gated this at insert time),
-///   or when `ClickHouse` rejects the re-run.
+///   setting other than `iceberg_snapshot_id` (`SEC-21`), when the row's
+///   `engine` is not downloadable, when its stored `SQL` fails [`is_read_only`]
+///   (defense in depth: `routes::query::run` already gated this at insert
+///   time), when the engine rejects the re-run, or when the result is over
+///   the byte cap.
 /// - 503 [`ApiError::Unavailable`] when the query store or `ClickHouse`
 ///   itself is unreachable.
 pub async fn download(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    Query(query): Query<DownloadQuery>,
+    query: Result<Query<DownloadQuery>, axum::extract::rejection::QueryRejection>,
     principal: Option<Extension<Principal>>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
-    let (format_clause, content_type, extension) = match query.format.as_str() {
-        "csv" => ("CSV", "text/csv", "csv"),
-        "parquet" => ("Parquet", "application/octet-stream", "parquet"),
-        _ => {
-            return Err(ApiError::BadRequest("format must be csv or parquet".to_owned()).into());
-        }
+    // A query string the extractor cannot read — a repeated parameter, or no
+    // `format` at all — is refused with this route's own sentence. The
+    // rejection's own text is serde's, and it stays in the log: a response
+    // never carries a library's rendering of the caller's request.
+    let Query(query) = query.map_err(|err| {
+        tracing::warn!(%err, "a download query string could not be read");
+        ApiError::BadRequest(DOWNLOAD_QUERY_UNREADABLE.to_owned())
+    })?;
+    let Some(format) = DownloadFormat::parse(&query.format) else {
+        return Err(
+            ApiError::BadRequest("format must be csv, tsv, xlsx or parquet".to_owned()).into(),
+        );
+    };
+    // The run the download belongs to. Stop names the queries of one run by
+    // their name, so the download's own query must carry the same run id;
+    // a caller that names none gets a run of its own.
+    let run_id = match query.run_id.as_deref() {
+        Some(raw) => Uuid::parse_str(raw.trim())
+            .map_err(|_| ApiError::BadRequest("runId must be a UUID".to_owned()))?,
+        None => Uuid::new_v4(),
     };
     if !is_valid_history_id(&id) {
         return Err(ApiError::BadRequest("id must look like a query run id".to_owned()).into());
@@ -2152,41 +2755,72 @@ pub async fn download(
     let Some(Extension(caller)) = principal.as_ref() else {
         return Err(ApiError::NotFound("query run not found".to_owned()).into());
     };
+    // The role's own download switch (`BI-1` D7): a role switched off from
+    // downloading may not download here either, and nothing is read from the
+    // engine for them.
+    crate::routes::settings::require_download(&state, caller).await?;
     let rewritten =
         rewrite_sql_for_principal_with_headers(&state, &item.sql, &item.engine, caller, &headers)
             .await?;
     // SEC-21: the stored statement may carry a setting recorded before the
-    // rule. The cap added below is appended after this check and stays.
+    // rule. The statement this route sends afterwards is not subject to it.
     refuse_unlisted_settings(&rewritten)?;
-    let capped_sql = build_capped_statement(&rewritten, format_clause);
-    let bytes = state
-        .clickhouse
-        .raw_bytes(&capped_sql, None)
-        .await
-        .map_err(|err| map_download_ch_error(&err))?;
-    // `SEC-17`: a cell that starts `=`, `+`, `-` or `@` would run as a
-    // formula in the spreadsheet that opens the file, so each such cell gets
-    // a leading apostrophe. Parquet has typed columns and runs no formula,
-    // so it is returned as `ClickHouse` wrote it.
-    let bytes = if format_clause == "CSV" {
-        crate::csv_safe::neutralize_csv(&bytes)
-    } else {
-        bytes
+
+    // The caller's own time limit, and the name Stop finds this query by.
+    let limits = crate::query_limits::QueryRun::current_or_detached()
+        .limits()
+        .await?;
+    let options = lakehouse_clickhouse::QueryOptions {
+        max_execution_time: Some(limits.timeout),
+        // No row cap: the download holds the whole result.
+        max_result_rows: None,
+        query_id: Some(download_query_id(caller.id.uuid(), run_id)),
+    };
+    let statement = download_statement(&rewritten);
+
+    let Some(row_format) = format.row_format() else {
+        // The file the engine writes itself. Its bytes are counted as they
+        // arrive, and a result over the cap is refused whole: a file that
+        // holds half of a table is not a file anyone can use.
+        let sql = format!("{statement}\nFORMAT Parquet");
+        let mut bytes = state
+            .clickhouse
+            .byte_stream(&sql, &options)
+            .await
+            .map_err(|err| upstream_error::ch_error(&upstream_error::DATABASE, &err))?;
+        let file = download_engine_file(&mut bytes, DOWNLOAD_BYTE_CAP).await?;
+        let file_name = download_file_name(&id, format, None);
+        return download_response(file.file, file.len, &file_name, format, None, false, None)
+            .map_err(Into::into);
     };
 
-    let content_disposition = format!("attachment; filename=\"{id}.{extension}\"");
-    // Bypasses the `ApiJson` choke point deliberately: the response body
-    // here is a raw file (CSV/Parquet bytes), not a JSON value — there is
-    // nothing for `ApiJson` to serialize (AGENTS.md requires a comment at
-    // any choke-point bypass explaining why).
-    Ok((
-        [
-            (header::CONTENT_TYPE, content_type.to_owned()),
-            (header::CONTENT_DISPOSITION, content_disposition),
-        ],
-        bytes,
+    // The row path: the rows arrive one at a time and are written to a file
+    // on disk, so a big result never sits in memory.
+    let locale = crate::routes::settings::format_settings(&state)
+        .await?
+        .number_locale;
+    let mut rows = state
+        .clickhouse
+        .query_stream_with_options(&statement, limits.timeout, &options)
+        .await
+        .map_err(|err| upstream_error::ch_error(&upstream_error::DATABASE, &err))?;
+    let written = write_download_rows(&mut rows, row_format, &locale, DOWNLOAD_BYTE_CAP)
+        .await
+        .map_err(|err| download_failure(&err))?;
+    // Which limit cut the file: the rows the format allows, or the bytes the
+    // cap allows. A file that was not cut names no limit.
+    let cut_by = written.cut.then(|| cut_by(format, written.rows));
+    let file_name = download_file_name(&id, format, written.cut.then_some(written.rows));
+    download_response(
+        written.file,
+        written.len,
+        &file_name,
+        format,
+        Some(written.rows),
+        written.cut,
+        cut_by,
     )
-        .into_response())
+    .map_err(Into::into)
 }
 
 // ── GET /api/query/scheduling (WS2 §13, WS2 plan review W10, round 2, item 1) ──
@@ -2682,7 +3316,8 @@ mod tests {
             "q-1",
             &json!([]),
             &json!([]),
-            (0, false, 2_000),
+            (0, 2_000),
+            None,
             12,
             34,
             1,
@@ -2715,6 +3350,105 @@ mod tests {
         // concepts and must not collapse into one value.
         assert_eq!(v["engine"], json!("clickhouse"));
         assert_eq!(v["metrics"]["engine"], json!("hot-store"));
+    }
+
+    // ── The server-side byte cap (`QS-2`) ────────────────────────────────
+
+    #[test]
+    fn a_cell_costs_its_text_plus_one_byte_for_the_separator() {
+        // A JSON string's own bytes, without the quotes.
+        assert_eq!(cell_byte_cost(&json!("abc")), 4);
+        // Any other value's compact JSON text.
+        assert_eq!(cell_byte_cost(&json!(5)), 2);
+        assert_eq!(cell_byte_cost(&json!(true)), 5);
+        assert_eq!(cell_byte_cost(&json!(null)), 5);
+    }
+
+    #[test]
+    fn a_row_costs_the_sum_of_its_cells() {
+        assert_eq!(row_byte_cost(&json!({"a": "xx", "b": "yyy"})), 3 + 4);
+        assert_eq!(row_byte_cost(&json!(["xx", "yyy"])), 3 + 4);
+    }
+
+    #[test]
+    fn a_result_under_the_byte_cap_is_kept_whole() {
+        let (kept, cut) = cut_rows_by_bytes(vec![json!({"a": "xxx"}), json!({"a": "yyy"})], 1_000);
+        assert!(!cut, "nothing was cut");
+        assert_eq!(kept.len(), 2);
+    }
+
+    #[test]
+    fn the_byte_cap_cuts_at_the_last_whole_row_that_fits() {
+        // Three rows of four bytes each; the cap holds two of them.
+        let rows = vec![
+            json!({"a": "xxx"}),
+            json!({"a": "yyy"}),
+            json!({"a": "zzz"}),
+        ];
+        let (kept, cut) = cut_rows_by_bytes(rows, 8);
+        assert!(cut, "the third row did not fit");
+        assert_eq!(kept, vec![json!({"a": "xxx"}), json!({"a": "yyy"})]);
+    }
+
+    #[test]
+    fn a_first_row_over_the_byte_cap_is_kept_anyway() {
+        // The byte cap never empties a result: one enormous row is still an
+        // answer.
+        let rows = vec![json!({"a": "x".repeat(100)}), json!({"a": "y"})];
+        let (kept, cut) = cut_rows_by_bytes(rows, 10);
+        assert!(cut, "the second row did not fit");
+        assert_eq!(kept.len(), 1);
+    }
+
+    #[test]
+    fn a_run_result_without_a_cut_carries_no_cut_by_key() {
+        let v = run_result_json(
+            "q-1",
+            &json!([]),
+            &json!([]),
+            (0, 2_000),
+            None,
+            12,
+            34,
+            1,
+            "clickhouse",
+        );
+        // The key is absent when nothing was cut — not `null`, which would
+        // claim a cut that did not happen.
+        assert!(v.get("cutBy").is_none(), "no cut, no key: {v}");
+        assert_eq!(v["truncated"], json!(false));
+    }
+
+    #[test]
+    fn a_run_result_names_the_limit_that_cut_it() {
+        let rows = json!([{"a": "x"}]);
+        let by_rows = run_result_json(
+            "q-2",
+            &json!([]),
+            &rows,
+            (2, 1),
+            Some("rows"),
+            12,
+            34,
+            1,
+            "clickhouse",
+        );
+        assert_eq!(by_rows["cutBy"], json!("rows"));
+        assert_eq!(by_rows["truncated"], json!(true));
+
+        let by_bytes = run_result_json(
+            "q-3",
+            &json!([]),
+            &rows,
+            (2, 1),
+            Some("bytes"),
+            12,
+            34,
+            1,
+            "clickhouse",
+        );
+        assert_eq!(by_bytes["cutBy"], json!("bytes"));
+        assert_eq!(by_bytes["truncated"], json!(true));
     }
 
     #[test]
@@ -3288,54 +4022,286 @@ mod tests {
         }
     }
 
-    // ── GET /api/query/run/{id}/download (WS2 §13, WS2 plan review W9) ──
+    // ── GET /api/query/run/{id}/download (QS-2) ─────────────────────────
 
     mod download_pure {
+        //! The parts of the download that decide, without an engine and
+        //! without a database: the formats it offers, the name it gives the
+        //! engine's query, the file's name, the statement it runs, and the
+        //! two caps.
+        //!
+        //! The caps are parameters of the helpers that apply them, so the
+        //! cases that need more data than a test may hold — a comma file over
+        //! the byte cap, a file the engine wrote over the byte cap — are
+        //! proven here, with a cap small enough to write out.
+
+        use tokio::io::AsyncReadExt;
+
+        use lakehouse_clickhouse::ChError;
+
         use super::*;
 
+        /// Rows made on demand, so a test never holds the result it writes.
+        struct GeneratedRows {
+            names: Vec<String>,
+            types: Vec<String>,
+            rows: Vec<Vec<Value>>,
+            next: usize,
+        }
+
+        impl crate::export::RowSource for GeneratedRows {
+            fn names(&self) -> &[String] {
+                &self.names
+            }
+            fn types(&self) -> &[String] {
+                &self.types
+            }
+            fn next_row(
+                &mut self,
+            ) -> impl std::future::Future<Output = Result<Option<Vec<Value>>, ChError>> + Send
+            {
+                let row = self.rows.get(self.next).cloned();
+                self.next += 1;
+                std::future::ready(Ok(row))
+            }
+        }
+
+        /// One column of whole numbers, the shape the engine sends them in.
+        fn numbers(count: usize) -> GeneratedRows {
+            GeneratedRows {
+                names: vec!["n".to_owned()],
+                types: vec!["Int64".to_owned()],
+                rows: (1..=count)
+                    .map(|n| vec![Value::String(n.to_string())])
+                    .collect(),
+                next: 0,
+            }
+        }
+
+        /// Bytes made on demand, so a test never holds the file it counts.
+        struct GeneratedBytes {
+            chunks: Vec<Vec<u8>>,
+            next: usize,
+        }
+
+        impl crate::export::ByteSource for GeneratedBytes {
+            fn next_chunk(
+                &mut self,
+            ) -> impl std::future::Future<Output = Result<Option<Vec<u8>>, ChError>> + Send
+            {
+                let chunk = self.chunks.get(self.next).cloned();
+                self.next += 1;
+                std::future::ready(Ok(chunk))
+            }
+        }
+
+        fn bytes(chunks: &[&[u8]]) -> GeneratedBytes {
+            GeneratedBytes {
+                chunks: chunks.iter().map(|c| c.to_vec()).collect(),
+                next: 0,
+            }
+        }
+
         #[test]
-        fn wraps_sql_that_already_has_its_own_limit_clause() {
-            let capped = build_capped_statement("SELECT * FROM t LIMIT 5", "CSV");
+        fn the_four_formats_are_offered_and_nothing_else_is() {
+            assert_eq!(DownloadFormat::parse("csv"), Some(DownloadFormat::Csv));
+            assert_eq!(DownloadFormat::parse("tsv"), Some(DownloadFormat::Tsv));
+            assert_eq!(DownloadFormat::parse("xlsx"), Some(DownloadFormat::Xlsx));
             assert_eq!(
-                capped,
-                "SELECT * FROM (\nSELECT * FROM t LIMIT 5\n) LIMIT 10000 SETTINGS \
-                 max_result_rows = 10000, result_overflow_mode = 'break' FORMAT CSV"
+                DownloadFormat::parse("parquet"),
+                Some(DownloadFormat::Parquet)
+            );
+            for refused in ["", "CSV", "pdf", "csv ", "xls", "parquet2"] {
+                assert_eq!(DownloadFormat::parse(refused), None, "{refused:?}");
+            }
+        }
+
+        #[test]
+        fn every_format_names_its_own_file_and_its_own_kind() {
+            assert_eq!(DownloadFormat::Csv.extension(), "csv");
+            assert_eq!(DownloadFormat::Tsv.extension(), "tsv");
+            assert_eq!(DownloadFormat::Xlsx.extension(), "xlsx");
+            assert_eq!(DownloadFormat::Parquet.extension(), "parquet");
+            assert_eq!(
+                DownloadFormat::Csv.content_type(),
+                "text/csv; charset=utf-8"
+            );
+            assert_eq!(
+                DownloadFormat::Tsv.content_type(),
+                "text/tab-separated-values; charset=utf-8"
             );
         }
 
         #[test]
-        fn wraps_sql_ending_in_a_trailing_comment_without_letting_it_uncap_the_limit() {
-            // A naive `format!("{sql} LIMIT {cap}")` would have this trailing
-            // `--` comment out the appended LIMIT, uncapping the download —
-            // wrapping the whole statement in its own subquery keeps the
-            // comment fully enclosed, unable to reach the outer LIMIT.
-            let capped = build_capped_statement("SELECT * FROM t -- trailing comment", "CSV");
+        fn the_engine_writes_the_parquet_file_and_this_service_writes_the_other_three() {
             assert_eq!(
-                capped,
-                "SELECT * FROM (\nSELECT * FROM t -- trailing comment\n) LIMIT 10000 \
-                 SETTINGS max_result_rows = 10000, result_overflow_mode = 'break' FORMAT CSV"
+                DownloadFormat::Csv.row_format(),
+                Some(crate::export::FileFormat::Csv)
+            );
+            assert_eq!(
+                DownloadFormat::Tsv.row_format(),
+                Some(crate::export::FileFormat::Tsv)
+            );
+            assert_eq!(
+                DownloadFormat::Xlsx.row_format(),
+                Some(crate::export::FileFormat::Xlsx)
+            );
+            assert_eq!(DownloadFormat::Parquet.row_format(), None);
+        }
+
+        #[test]
+        fn the_workbook_has_a_row_limit_of_its_own_and_the_delimited_files_have_none() {
+            assert_eq!(DownloadFormat::Xlsx.row_cap(), 1_048_575);
+            assert_eq!(DownloadFormat::Csv.row_cap(), usize::MAX);
+            assert_eq!(DownloadFormat::Tsv.row_cap(), usize::MAX);
+        }
+
+        #[test]
+        fn the_query_is_named_after_the_caller_and_the_run_so_stop_finds_it() {
+            let caller = Uuid::nil();
+            let run = Uuid::from_u128(0x2222_2222_2222_2222_2222_2222_2222_2222);
+            let name = download_query_id(caller, run);
+            assert_eq!(name, format!("{caller}:{run}:download"));
+            // The pattern the Stop route kills by.
+            assert!(
+                name.starts_with(&format!("{caller}:{run}:")),
+                "{name} is not found by the stop pattern"
             );
         }
 
         #[test]
-        fn wraps_a_with_query() {
-            let capped = build_capped_statement("WITH x AS (SELECT 1) SELECT * FROM x", "Parquet");
+        fn a_file_that_was_not_cut_keeps_the_runs_own_name_and_a_cut_one_names_its_rows() {
             assert_eq!(
-                capped,
-                "SELECT * FROM (\nWITH x AS (SELECT 1) SELECT * FROM x\n) LIMIT 10000 \
-                 SETTINGS max_result_rows = 10000, result_overflow_mode = 'break' \
-                 FORMAT Parquet"
+                download_file_name("q-1", DownloadFormat::Csv, None),
+                "q-1.csv"
+            );
+            assert_eq!(
+                download_file_name("q-1", DownloadFormat::Parquet, None),
+                "q-1.parquet"
+            );
+            assert_eq!(
+                download_file_name("q-1", DownloadFormat::Xlsx, Some(12)),
+                "q-1-first-12-rows.xlsx"
             );
         }
 
         #[test]
-        fn strips_exactly_one_trailing_semicolon_and_its_surrounding_whitespace() {
-            let capped = build_capped_statement("SELECT 1;   ", "CSV");
+        fn the_statement_is_wrapped_so_a_trailing_comment_cannot_reach_the_format_clause() {
+            // A naive `format!("{sql} FORMAT Parquet")` would have this
+            // trailing `--` comment out the appended clause, and the file
+            // would come back in the engine's default format. Wrapping the
+            // whole statement in its own subquery keeps the comment
+            // enclosed, unable to reach the clause.
             assert_eq!(
-                capped,
-                "SELECT * FROM (\nSELECT 1\n) LIMIT 10000 SETTINGS max_result_rows = 10000, \
-                 result_overflow_mode = 'break' FORMAT CSV"
+                download_statement("SELECT * FROM t -- trailing comment"),
+                "SELECT * FROM (\nSELECT * FROM t -- trailing comment\n)"
             );
+        }
+
+        #[test]
+        fn the_statement_keeps_its_own_limit_clause_inside_the_wrapper() {
+            assert_eq!(
+                download_statement("SELECT * FROM t LIMIT 5"),
+                "SELECT * FROM (\nSELECT * FROM t LIMIT 5\n)"
+            );
+        }
+
+        #[test]
+        fn the_statement_drops_one_trailing_semicolon_and_its_whitespace() {
+            assert_eq!(
+                download_statement("SELECT 1;   "),
+                "SELECT * FROM (\nSELECT 1\n)"
+            );
+            assert_eq!(
+                download_statement("SELECT 1"),
+                "SELECT * FROM (\nSELECT 1\n)"
+            );
+        }
+
+        #[test]
+        fn a_file_that_holds_as_many_rows_as_its_format_allows_was_cut_by_the_rows() {
+            assert_eq!(cut_by(DownloadFormat::Xlsx, 1_048_575), CutBy::Rows);
+            assert_eq!(cut_by(DownloadFormat::Xlsx, 10), CutBy::Bytes);
+            assert_eq!(cut_by(DownloadFormat::Csv, 10), CutBy::Bytes);
+        }
+
+        /// `QS-2`: the byte cap cuts a comma file at the last whole row that
+        /// fits — a row that would pass the cap is not written, not half
+        /// written. The cap is a parameter, so the case is proven here with a
+        /// cap small enough to count: the header and three rows are fifteen
+        /// bytes, the fourth would pass sixteen.
+        #[tokio::test]
+        async fn a_comma_file_over_the_byte_cap_is_cut_at_the_last_whole_row_that_fits() {
+            let mut source = numbers(4);
+            let mut written =
+                write_download_rows(&mut source, crate::export::FileFormat::Csv, "en-US", 16)
+                    .await
+                    .unwrap();
+            assert!(written.cut, "the fourth row does not fit in sixteen bytes");
+            assert_eq!(written.rows, 3);
+            let mut out = Vec::new();
+            written.file.read_to_end(&mut out).await.unwrap();
+            assert_eq!(out, "\u{feff}n\r\n1\r\n2\r\n3\r\n".as_bytes());
+        }
+
+        #[tokio::test]
+        async fn a_comma_file_that_fits_the_byte_cap_is_not_cut() {
+            let mut source = numbers(3);
+            let written =
+                write_download_rows(&mut source, crate::export::FileFormat::Csv, "en-US", 16)
+                    .await
+                    .unwrap();
+            assert!(!written.cut);
+            assert_eq!(written.rows, 3);
+        }
+
+        /// `QS-2`: the file the engine wrote cannot be cut at a row, so a
+        /// result over the cap is refused whole. The refusal is this code
+        /// base's own sentence, so it carries no reference.
+        #[tokio::test]
+        async fn a_file_the_engine_wrote_over_the_byte_cap_is_refused_whole() {
+            let mut source = bytes(&[b"PAR1", b"\x00\x00\x00\x00", b"PAR1"]);
+            let Err(err) = download_engine_file(&mut source, 8).await else {
+                panic!("twelve bytes do not fit in a cap of eight");
+            };
+            assert_eq!(err.status(), 422);
+            // The sentence is written out here, not read from the constant it
+            // comes from: a test that compares a message with the message's
+            // own source proves nothing.
+            assert_eq!(
+                err.to_string(),
+                "This result is larger than 5 GB. Add a filter or download it as CSV."
+            );
+            assert!(!err.to_string().contains("Reference:"));
+        }
+
+        #[tokio::test]
+        async fn a_file_the_engine_wrote_that_fits_the_byte_cap_is_kept_whole() {
+            let mut source = bytes(&[b"PAR1", b"\x00\x00\x00\x00"]);
+            let file = download_engine_file(&mut source, 8).await.unwrap();
+            assert_eq!(file.len, 8);
+        }
+
+        /// `SEC-11`: the engine's own text never reaches a response — the
+        /// caller gets a fixed sentence and a reference id.
+        #[test]
+        fn an_engine_failure_answers_a_fixed_sentence_with_a_reference() {
+            let err = download_failure(&crate::export::ExportError::Source(ChError::Server(
+                "Code: 47. Unknown identifier: nope".to_owned(),
+            )));
+            assert_eq!(err.status(), 422);
+            let text = err.to_string();
+            assert!(
+                text.starts_with("The database request failed. Reference: "),
+                "{text}"
+            );
+            assert!(!text.contains("Unknown identifier"), "{text}");
+        }
+
+        #[test]
+        fn an_unreachable_engine_answers_503() {
+            let err = download_failure(&crate::export::ExportError::Source(ChError::Cancelled));
+            assert_eq!(err.status(), 503);
         }
 
         #[test]
@@ -3350,14 +4316,20 @@ mod tests {
             assert!(!is_downloadable_engine("something-else"));
         }
 
+        /// The id shape the download accepts: the old one, which every row
+        /// recorded so far carries, and the new one. Both, because a row
+        /// recorded before the change must stay downloadable.
         #[test]
-        fn valid_history_ids_are_the_q_dash_digits_shape() {
+        fn valid_history_ids_are_the_old_and_the_new_shape() {
             assert!(is_valid_history_id("q-1"));
             assert!(is_valid_history_id("q-1736200000000"));
+            assert!(is_valid_history_id(
+                "q-1736200000000-0123456789abcdef0123456789abcdef"
+            ));
         }
 
         #[test]
-        fn ids_without_the_q_dash_digits_shape_are_rejected() {
+        fn ids_outside_the_two_shapes_are_rejected() {
             for id in [
                 "",
                 "q-",
@@ -3366,25 +4338,21 @@ mod tests {
                 "q-1;DROP TABLE t",
                 "../q-1",
                 "q-1\r\nSet-Cookie: x=y",
+                // The new shape, but not exactly: no epoch, an epoch that is
+                // not digits, a suffix that is not 32 characters, an
+                // uppercase hex digit, a character that is not hex at all,
+                // and an empty part.
+                "q--0123456789abcdef0123456789abcdef",
+                "q-abc-0123456789abcdef0123456789abcdef",
+                "q-1736200000000-0123456789abcdef0123456789abcde",
+                "q-1736200000000-0123456789abcdef0123456789abcdef0",
+                "q-1736200000000-0123456789ABCDEF0123456789ABCDEF",
+                "q-1736200000000-0123456789abcdef0123456789abcdeg",
+                "q-1736200000000-",
+                "q-1736200000000--0123456789abcdef0123456789abcdef",
             ] {
                 assert!(!is_valid_history_id(id), "expected rejected: {id:?}");
             }
-        }
-
-        #[test]
-        fn ch_server_error_maps_to_422_with_a_fixed_message_never_the_upstream_text() {
-            let err = map_download_ch_error(&ChError::Server(
-                "Code: 47. Unknown identifier: nope".to_owned(),
-            ));
-            assert_eq!(err.status(), 422);
-            assert_eq!(err.to_string(), "stored query failed to re-run");
-            assert!(!err.to_string().contains("Unknown identifier"));
-        }
-
-        #[test]
-        fn ch_transport_error_maps_to_503() {
-            let err = map_download_ch_error(&ChError::Cancelled);
-            assert_eq!(err.status(), 503);
         }
     }
 
@@ -4028,6 +4996,304 @@ mod tenant_scope_tests {
                 owns_catalog: false,
             }
         );
+    }
+}
+
+/// `SEC-50`: the shared tenant gate's actors, on their own — which reach
+/// each actor gets, and what the gate refuses.
+#[cfg(test)]
+mod sec50_gate_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::collections::HashMap;
+
+    use axum::http::HeaderMap;
+    use lakehouse_auth::{PermissionSet, Principal, PrincipalId};
+    use lakehouse_store::PgPool;
+    use lakehouse_store::uploads::claim_table;
+    use uuid::Uuid;
+
+    use super::{
+        GateActor, JOB_NEEDS_CATALOG_TENANT, TenantReach, catalog_tenant_reach, gate_statement,
+        reach_for_actor,
+    };
+    use crate::config::Config;
+    use crate::state::AppState;
+
+    /// The tenant that owns the shared catalog in these tests.
+    const CATALOG_TENANT: Uuid = uuid::uuid!("11111111-1111-4111-8111-000000000001");
+    /// Another tenant of the same deployment.
+    const OTHER_TENANT: Uuid = uuid::uuid!("11111111-1111-4111-8111-000000000002");
+    /// The upload table the claims below are about.
+    const CLAIMED_TABLE: &str = "group_orders";
+    /// The statement that reads it.
+    const STATEMENT: &str = "SELECT * FROM bronze.group_orders";
+    /// The refusal of that statement, byte for byte.
+    const REFUSAL: &str =
+        "Table not found or not available to your organisation: bronze.group_orders";
+
+    /// A principal that belongs to exactly one tenant.
+    fn principal_in(tenant_id: Uuid) -> Principal {
+        Principal {
+            id: PrincipalId::User(Uuid::from_u128(1)),
+            tenant_ids: vec![tenant_id],
+            display_name: "Rina Wijaya".to_owned(),
+            permissions: PermissionSet::parse("query:read"),
+            provider: "session".to_owned(),
+            must_change_password: false,
+            role_names: Vec::new(),
+        }
+    }
+
+    /// `SEC-50` R1: a principal holding the unrestricted (`"*:*"`) grant.
+    /// It belongs to no tenant at all, exactly like the bootstrap admin
+    /// the G7 harness creates its pipelines as.
+    fn unrestricted_principal() -> Principal {
+        Principal {
+            id: PrincipalId::User(Uuid::from_u128(2)),
+            tenant_ids: Vec::new(),
+            display_name: "Bootstrap Admin".to_owned(),
+            permissions: PermissionSet::parse("*:*"),
+            provider: "session".to_owned(),
+            must_change_password: false,
+            role_names: Vec::new(),
+        }
+    }
+
+    /// A state with no pool at all: the deployment's own answers are
+    /// missing, so the gate must fail closed rather than guess.
+    fn state_without_a_database() -> AppState {
+        AppState::new(Config::from_map(&HashMap::new()).expect("a config with no pool"))
+    }
+
+    /// The pool's own URL, for a state that reads it.
+    fn database_url_for(pool: &PgPool) -> String {
+        let options = pool.connect_options();
+        format!(
+            "postgres://{}:postgres@{}:{}/{}",
+            options.get_username(),
+            options.get_host(),
+            options.get_port(),
+            options
+                .get_database()
+                .expect("#[sqlx::test] always targets a named database"),
+        )
+    }
+
+    #[test]
+    fn a_job_with_no_user_reaches_everything_in_a_one_tenant_deployment() {
+        assert_eq!(
+            catalog_tenant_reach(Some(1), None).expect("a deployment with one tenant"),
+            TenantReach::All
+        );
+    }
+
+    #[test]
+    fn a_job_with_no_user_acts_as_the_tenant_that_owns_the_shared_catalog() {
+        assert_eq!(
+            catalog_tenant_reach(Some(4), Some(CATALOG_TENANT)).expect("the catalog's own tenant"),
+            TenantReach::Tenant {
+                tenant_id: CATALOG_TENANT,
+                owns_catalog: true,
+            }
+        );
+    }
+
+    #[test]
+    fn a_job_with_no_user_is_refused_when_no_tenant_owns_the_shared_catalog() {
+        let err = catalog_tenant_reach(Some(4), None)
+            .expect_err("several tenants and no tenant that owns the shared catalog");
+        assert_eq!(err.status(), 422);
+        assert_eq!(err.to_string(), JOB_NEEDS_CATALOG_TENANT);
+        // The sentence names the setting and what to do with it, and
+        // nothing about the deployment's data.
+        assert_eq!(
+            JOB_NEEDS_CATALOG_TENANT,
+            "This job reads the shared catalog, and no tenant owns it here. Set CATALOG_TENANT_ID to the tenant that owns this deployment's shared catalog."
+        );
+    }
+
+    /// `SEC-50` R5 (amended, PR #281 review round 2 NIT): a deployment
+    /// that cannot COUNT its tenants refuses the job, even with the setting
+    /// named. "Cannot verify it is safe" is the same answer as "verified
+    /// unsafe" — `SEC-20`'s own rule, the one the shared catalog's own gate
+    /// already follows with no pool.
+    ///
+    /// The sentence is `SEC-20`'s own for that state ("could not verify
+    /// tenant count", a 503), NOT D6's: D6 tells the operator to set a
+    /// setting that may already be set, and the thing that is missing here
+    /// is the deployment's own answer, not the setting.
+    #[test]
+    fn a_job_with_no_user_is_refused_in_a_deployment_that_cannot_count_its_tenants() {
+        let err = catalog_tenant_reach(None, Some(CATALOG_TENANT))
+            .expect_err("a deployment that cannot say how many tenants it holds");
+        assert_eq!(err.status(), 503);
+        assert_eq!(
+            err.to_string(),
+            crate::routes::catalog::COULD_NOT_VERIFY_TENANT_COUNT
+        );
+        assert_eq!(
+            err.to_string(),
+            "could not verify tenant count",
+            "the sentence names the count, not a setting to set"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_site_that_acts_as_no_tenant_reaches_nothing() {
+        let state = state_without_a_database();
+        let principal = principal_in(CATALOG_TENANT);
+        let reach = reach_for_actor(
+            &state,
+            GateActor::AsTenant {
+                principal: &principal,
+                tenant_id: None,
+            },
+        )
+        .await
+        .expect("the reach of a site with no tenant at all");
+        assert_eq!(reach, TenantReach::NoTenant);
+    }
+
+    /// `SEC-50` R1 (review round 1, BLOCKER 1): a principal holding the
+    /// unrestricted grant reaches everything, even through a site that
+    /// acts as no tenant at all. `SEC-20`'s own rule is that such a
+    /// principal passes, and it reads every table in Query Studio
+    /// already.
+    #[tokio::test]
+    async fn an_unrestricted_principal_reaches_everything_even_as_a_site_with_no_tenant() {
+        let state = state_without_a_database();
+        let principal = unrestricted_principal();
+        let reach = reach_for_actor(
+            &state,
+            GateActor::AsTenant {
+                principal: &principal,
+                tenant_id: None,
+            },
+        )
+        .await
+        .expect("the reach of an unrestricted principal");
+        assert_eq!(reach, TenantReach::All);
+    }
+
+    /// `SEC-50` R1: the same rule for a site that acts as a NAMED tenant
+    /// the principal does not belong to — the unrestricted grant is
+    /// checked before the tenant, so the principal is not refused for a
+    /// tenant it never had.
+    #[tokio::test]
+    async fn an_unrestricted_principal_reaches_everything_even_as_a_tenant_it_is_not_in() {
+        let state = state_without_a_database();
+        let principal = unrestricted_principal();
+        let reach = reach_for_actor(
+            &state,
+            GateActor::AsTenant {
+                principal: &principal,
+                tenant_id: Some(OTHER_TENANT),
+            },
+        )
+        .await
+        .expect("the reach of an unrestricted principal");
+        assert_eq!(reach, TenantReach::All);
+    }
+
+    #[tokio::test]
+    async fn a_site_that_acts_as_a_tenant_it_may_not_act_as_is_refused() {
+        let state = state_without_a_database();
+        let principal = principal_in(CATALOG_TENANT);
+        let err = reach_for_actor(
+            &state,
+            GateActor::AsTenant {
+                principal: &principal,
+                tenant_id: Some(OTHER_TENANT),
+            },
+        )
+        .await
+        .expect_err("a principal that is not a member of that tenant");
+        // The same 404 an `X-Tenant` header naming a foreign tenant
+        // gets — never a 403, which would confirm the tenant exists.
+        assert_eq!(err.status(), 404);
+        assert_eq!(err.to_string(), "tenant not found");
+    }
+
+    /// `SEC-50` R5 (amended, PR #281 review round 2 NIT): a deployment
+    /// with no database at all cannot say who owns the shared catalog, so
+    /// the job-with-no-user actor is refused with `SEC-20`'s own sentence
+    /// for that state (a 503) — not D6's, which names a setting to set.
+    #[tokio::test]
+    async fn a_job_with_no_user_in_a_deployment_that_cannot_say_who_owns_the_catalog_is_refused() {
+        let state = state_without_a_database();
+        let err = reach_for_actor(&state, GateActor::CatalogTenant)
+            .await
+            .expect_err("a deployment that cannot say who owns the shared catalog");
+        assert_eq!(err.status(), 503);
+        assert_eq!(
+            err.to_string(),
+            crate::routes::catalog::COULD_NOT_VERIFY_TENANT_COUNT
+        );
+    }
+
+    /// The gate itself, over a real deployment: the upload table another
+    /// tenant claimed is out of reach for every actor that does not own
+    /// it, and in reach for the tenant that does.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_gate_refuses_another_tenants_upload_table_for_every_actor(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let mut env = HashMap::new();
+        env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
+        env.insert("CH_URL".to_owned(), "http://127.0.0.1:1".to_owned());
+        env.insert("CATALOG_TENANT_ID".to_owned(), CATALOG_TENANT.to_string());
+        let state = AppState::new(Config::from_map(&env).expect("valid config from a map"));
+
+        let claimed = claim_table(&pool, OTHER_TENANT, CLAIMED_TABLE, "upload-other")
+            .await
+            .expect("claim the upload table for the other tenant");
+        assert!(claimed, "the other tenant must hold the claim");
+
+        let catalog_principal = principal_in(CATALOG_TENANT);
+        let other_principal = principal_in(OTHER_TENANT);
+
+        // The caller in the catalog's own tenant may not read the other
+        // tenant's upload.
+        let refused = gate_statement(
+            &state,
+            STATEMENT,
+            &sqlparser::dialect::ClickHouseDialect {},
+            GateActor::Caller {
+                principal: &catalog_principal,
+                headers: &HeaderMap::new(),
+            },
+        )
+        .await
+        .expect_err("another tenant's upload table");
+        assert_eq!(refused.to_string(), REFUSAL);
+
+        // A job with no user acts as the catalog's tenant, so the other
+        // tenant's upload is out of ITS reach too.
+        let refused = gate_statement(
+            &state,
+            STATEMENT,
+            &sqlparser::dialect::ClickHouseDialect {},
+            GateActor::CatalogTenant,
+        )
+        .await
+        .expect_err("another tenant's upload table");
+        assert_eq!(refused.to_string(), REFUSAL);
+
+        // The tenant that holds the table reads it — as a caller acting
+        // as itself, and as a site acting as that tenant.
+        let allowed = gate_statement(
+            &state,
+            STATEMENT,
+            &sqlparser::dialect::ClickHouseDialect {},
+            GateActor::AsTenant {
+                principal: &other_principal,
+                tenant_id: Some(OTHER_TENANT),
+            },
+        )
+        .await;
+        assert!(allowed.is_ok(), "the owning tenant reads its own upload");
+        Ok(())
     }
 }
 

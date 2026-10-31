@@ -96,6 +96,26 @@ is `DATA-19`
    with `loadedWith` naming the first, and lineage says "<first file> and 2 more".
    The four uploads are deleted at the end; the table stays.
 
+10. Folders for uploaded files (`DATA-35`,
+    `docs/superpowers/plans/2026-10-26-data-35-upload-folders.md`, decisions 2, 3 and 8):
+    it makes folders two levels deep and a third, and a fourth level is refused (400) with
+    the limit named. It loads a file into a new table choosing the inner folder; the upload
+    is in it. Deleting the inner folder (it holds a file) and its parent (it holds a folder)
+    is refused (409). A second file is moved to another folder and out again. A re-upload
+    into the same table, naming no folder, joins the table's folder. Then every file is
+    moved out, the three folders are deleted (204) and are gone from the list. The files
+    are deleted; the table stays.
+
+11. A workbook that asks for more memory than the machine has (`SEC-22`): it
+    uploads `ops/fixtures/uploads/hostile/huge_shared_strings.xlsx`, whose
+    shared strings declare two billion strings, so the file asks for 48 GB
+    before a single cell is read. The upload is refused with the one
+    sentence of `SEC-22` D4 ("This file needs more memory or time to read
+    than an upload is allowed. Save it as CSV and upload that instead."),
+    because the read happens in a child process that runs under a memory
+    limit and the CHILD is the one that ends. The API is still there: the
+    list of the uploads answers 200.
+
 Exit code 0 and `[g9] PASS` when every step holds; otherwise `[g9] FAILED:
 <reason>` on stderr and exit code 1.
 
@@ -549,6 +569,13 @@ def step_delete_keeps_the_table(api, upload_id: str, table: str, table_rows: int
 # SEC-17: the sentence for the column cap, as `routes/uploads.rs` words it
 # (`JOB_TOO_MANY_COLUMNS`) and `file_ingest.py` records it (`TOO_MANY_COLUMNS`).
 TOO_MANY_COLUMNS = "The file has more than 1,000 columns."
+# The one sentence of `SEC-22` D4 for a file that needed more memory or more
+# time than a read is allowed: a child that was killed, ran out of time or ran
+# out of memory looks the same from here.
+NEEDS_MORE_MEMORY = (
+    "This file needs more memory or time to read than an upload is allowed. "
+    "Save it as CSV and upload that instead."
+)
 
 
 def step_column_cap(api) -> None:
@@ -719,6 +746,46 @@ def step_parquet(api, base_table: str, state: dict) -> None:
     state["deleted"] = True
     _expect(api.get(f"{API_URL}/api/uploads/{upload_id}", timeout=30), 404, "GET of the deleted Parquet upload")
     print("[g9] parquet: PASS (the upload is gone, the table stays)")
+
+
+def step_hostile_workbook(api, state: dict) -> None:
+    """A workbook that asks for more memory than the machine has must not end
+    the API (`SEC-22`).
+
+    The fixture is a real workbook whose shared strings declare two billion
+    strings: the reader reserves room for all of them before it reads one, so
+    the file asks for 48 GB. The read happens in a child process that runs
+    under a memory limit, so the CHILD is the one that ends, and the answer is
+    the one sentence of `SEC-22` D4. The upload itself is refused, so there is
+    no upload to preview: the API reads the workbook to list its sheets when it
+    arrives.
+
+    The API is still there afterwards: the list of the uploads answers 200.
+    """
+    path = FIXTURES / "hostile" / "huge_shared_strings.xlsx"
+    if not path.is_file():
+        raise G9Failure(f"fixture missing: {path} (this gate reads ops/fixtures/uploads/ beside it)")
+    resp = api.post(
+        f"{API_URL}/api/uploads",
+        files={
+            "file": (
+                "hostile.xlsx",
+                path.read_bytes(),
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        },
+        timeout=120,
+    )
+    if resp.status_code != 400:
+        raise G9Failure(
+            f"the hostile workbook should be refused with 400, it answered {resp.status_code}: {resp.text[:200]}"
+        )
+    if resp.json().get("error") != NEEDS_MORE_MEMORY:
+        raise G9Failure(
+            f"the refusal should say {NEEDS_MORE_MEMORY!r}, it said {resp.text[:200]}"
+        )
+    _expect(api.get(f"{API_URL}/api/uploads", timeout=30), 200, "GET /api/uploads after the hostile workbook")
+    print("[g9] hostile workbook: refused with the one sentence, the API is still there")
 
 
 def _dagster_lists_job(requests, job_name: str) -> bool:
@@ -1434,6 +1501,99 @@ def step_feeds_a_pipeline(
     print("[g9] pipeline: PASS (uploaded table -> pipeline, re-upload re-ran it, another upload did not)")
 
 
+# DATA-35: folders for uploaded files.
+FOLDER_TOO_DEEP = "Folders can be nested at most 3 levels deep."
+FOLDER_NOT_EMPTY = "This folder still holds files or folders. Move them out and delete its folders first."
+
+
+def _make_folder(api, name: str, parent: str | None, state: dict) -> str:
+    body: dict = {"name": name}
+    if parent is not None:
+        body["parentId"] = parent
+    made = _expect(api.post(f"{API_URL}/api/uploads/folders", json=body, timeout=30), 201, f"POST /api/uploads/folders ({name})").json()
+    state.setdefault("folders", []).append(made["id"])
+    return made["id"]
+
+
+def _folder_of(api, upload_id: str) -> str | None:
+    current = _expect(api.get(f"{API_URL}/api/uploads/{upload_id}", timeout=30), 200, "GET an upload").json()
+    return current.get("folderId")
+
+
+def _ids_in(api, query: str) -> list[str]:
+    listed = _expect(api.get(f"{API_URL}/api/uploads{query}", timeout=30), 200, f"GET /api/uploads{query}").json()
+    return [u["id"] for u in listed]
+
+
+def step_folders(api, base_table: str, state: dict) -> None:
+    """Folders two levels deep and a third; a fourth is refused with the limit; a file loaded with
+    the inner folder chosen is in it; a folder that holds a file or a folder cannot be deleted; files
+    move in and out; a re-upload into the table joins its folder; once everything is out the folders
+    are deleted (DATA-35 AC1 to AC4, AC7)."""
+    table = f"{base_table}_fold"
+    outer = _make_folder(api, "g9 outer", None, state)
+    middle = _make_folder(api, "g9 middle", outer, state)
+    inner = _make_folder(api, "g9 inner", middle, state)
+    too_deep = _expect(
+        api.post(f"{API_URL}/api/uploads/folders", json={"name": "g9 fourth", "parentId": inner}, timeout=30),
+        400,
+        "POST /api/uploads/folders (a fourth level)",
+    ).json()
+    if too_deep.get("error") != FOLDER_TOO_DEEP:
+        raise G9Failure(f"a fourth level should be refused with {FOLDER_TOO_DEEP!r}, got {too_deep}")
+
+    first = _upload_one(api, SEVERAL_FILES[0][0], SEVERAL_FILES[0][1], state)
+    spare = _upload_one(api, "g9_spare.csv", "id,name,qty\n9,rod,90\n", state)
+    body = {"bronzeTable": table, "mode": "replace", "encoding": "utf-8", "delimiter": ",", "headerRow": 0}
+    _expect(api.post(f"{API_URL}/api/uploads/{first}/ingest", json={**body, "folderId": inner}, timeout=60), 200, "POST .../ingest into a folder")
+    settled = _settle(api, first, "a load into a folder")
+    if settled.get("status") != "ingested":
+        raise G9Failure(f"the load into a folder failed: {settled.get('error')!r}")
+    if settled.get("folderId") != inner:
+        raise G9Failure(f"the upload should sit in the inner folder {inner}, it sits in {settled.get('folderId')!r}")
+    if first not in _ids_in(api, f"?folderId={inner}"):
+        raise G9Failure("the inner folder's list should hold the upload")
+
+    # A folder that holds a file, and one that holds a folder, cannot be deleted.
+    for held in (inner, middle):
+        refused = _expect(api.delete(f"{API_URL}/api/uploads/folders/{held}", timeout=30), 409, f"DELETE a folder that holds something ({held})").json()
+        if refused.get("error") != FOLDER_NOT_EMPTY:
+            raise G9Failure(f"deleting a folder that holds something should say {FOLDER_NOT_EMPTY!r}, got {refused}")
+
+    # A file moves into a folder and out again; the search finds it with its folder.
+    moved = _expect(api.post(f"{API_URL}/api/uploads/move", json={"uploadIds": [spare], "folderId": middle}, timeout=30), 200, "POST /api/uploads/move").json()
+    if moved.get("moved") != 1 or _folder_of(api, spare) != middle:
+        raise G9Failure(f"the spare file should have moved into {middle}, got {moved} and {_folder_of(api, spare)!r}")
+    found = [u for u in _expect(api.get(f"{API_URL}/api/uploads", params={"q": "g9_spare"}, timeout=30), 200, "GET /api/uploads?q").json()]
+    if [(u["id"], u.get("folderId")) for u in found] != [(spare, middle)]:
+        raise G9Failure(f"the search should find the spare file in its folder, got {found}")
+    _expect(api.post(f"{API_URL}/api/uploads/move", json={"uploadIds": [spare], "folderId": None}, timeout=30), 200, "POST /api/uploads/move (out)")
+    if _folder_of(api, spare) is not None:
+        raise G9Failure("the spare file should be out of every folder")
+
+    # A re-upload into the table, naming no folder, joins the table's folder (decision 2).
+    again = _upload_one(api, SEVERAL_FILES[2][0], SEVERAL_FILES[2][1], state)
+    _expect(api.post(f"{API_URL}/api/uploads/{again}/ingest", json={**body, "mode": "append"}, timeout=60), 200, "POST .../ingest (re-upload)")
+    if _settle(api, again, "a re-upload into the table").get("status") != "ingested":
+        raise G9Failure("the re-upload should have loaded")
+    if _folder_of(api, again) != inner:
+        raise G9Failure(f"the re-upload should join the table's folder {inner}, it sits in {_folder_of(api, again)!r}")
+
+    # Everything out, then the folders go, innermost first.
+    _expect(api.post(f"{API_URL}/api/uploads/move", json={"uploadIds": [first, again], "folderId": None}, timeout=30), 200, "POST /api/uploads/move (all out)")
+    for folder_id in (inner, middle, outer):
+        _expect(api.delete(f"{API_URL}/api/uploads/folders/{folder_id}", timeout=30), 204, f"DELETE an empty folder ({folder_id})")
+    state["folders"] = []
+    left = {f["id"] for f in _expect(api.get(f"{API_URL}/api/uploads/folders", timeout=30), 200, "GET /api/uploads/folders").json()}
+    if left & {inner, middle, outer}:
+        raise G9Failure(f"the deleted folders should be gone from the list, found {left & {inner, middle, outer}}")
+    print(f"[g9] folders: a fourth level was refused, {table} loaded into a folder, a re-upload joined it, the folders were deleted once empty")
+
+    for upload_id in (first, spare, again):
+        _expect(api.delete(f"{API_URL}/api/uploads/{upload_id}", timeout=30), 204, "DELETE an upload of the folder step")
+    state["others"] = []
+
+
 def main() -> int:
     argparse.ArgumentParser(
         description=__doc__,
@@ -1461,9 +1621,11 @@ def main() -> int:
         step_column_cap(api)
         step_workbook(api, table, state)
         step_parquet(api, table, state)
+        step_hostile_workbook(api, state)
         step_typed_columns(api, table, state)
         step_new_formats(api, table, state)
         step_several_files(api, table, state)
+        step_folders(api, table, state)
         step_feeds_a_pipeline(api, requests, table, upload_id, using, expected, state)
     except (G9Failure, requests.RequestException) as exc:
         reason = str(exc) if isinstance(exc, G9Failure) else f"{type(exc).__name__}: {exc}"
@@ -1487,6 +1649,13 @@ def _clean_up_upload(api, state: dict) -> None:
             print(f"[g9] cleanup: DELETE upload {upload_id} answered {resp.status_code}", file=sys.stderr)
         except Exception as exc:  # noqa: BLE001 -- the failure that matters is the one already reported
             print(f"[g9] cleanup: upload {upload_id} was not deleted ({type(exc).__name__})", file=sys.stderr)
+    # DATA-35: the folders of a failed step, innermost first (a folder that still holds a file stays).
+    for folder_id in reversed(list(state.get("folders", []))):
+        try:
+            resp = api.delete(f"{API_URL}/api/uploads/folders/{folder_id}", timeout=30)
+            print(f"[g9] cleanup: DELETE folder {folder_id} answered {resp.status_code}", file=sys.stderr)
+        except Exception as exc:  # noqa: BLE001 -- the failure that matters is the one already reported
+            print(f"[g9] cleanup: folder {folder_id} was not deleted ({type(exc).__name__})", file=sys.stderr)
 
 
 if __name__ == "__main__":

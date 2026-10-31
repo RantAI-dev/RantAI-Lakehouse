@@ -90,6 +90,7 @@ function stubFetch(connectors: unknown[] = []): string[] {
     urls.push(target)
     if (target === "/api/connectors") return json(connectors)
     if (target === "/api/uploads") return json([])
+    if (target === "/api/uploads/folders") return json([])
     throw new Error(`unexpected fetch: ${target}`)
   }) as unknown as typeof fetch
   return urls

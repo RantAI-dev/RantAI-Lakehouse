@@ -8,8 +8,10 @@
 //! `host` shape `<endpoint>|<bucket>` is read only for a row with no
 //! adapter):
 //!
-//! - **`PostgreSQL`** (`sqlx`, already a `lakehouse-api` dependency for
-//!   `lakehouse-store`) — opens a real connection and runs `SELECT 1`.
+//! - **`PostgreSQL`** ([`crate::pg_probe`], `SEC-14` part B) — a minimal
+//!   TLS-first client that authenticates only with `SCRAM-SHA-256` and runs
+//!   `SELECT 1`; `sqlx` still backs discovery, listing and deprovisioning,
+//!   never the connection test.
 //! - **S3-compatible object storage** (`object_store`, already a workspace
 //!   dependency via `lakehouse-iceberg`) — does an authenticated
 //!   `list_with_delimiter` (a cheap, bounded listing call; no data read or
@@ -130,6 +132,7 @@
 //! 60s outer bound. No retries: one attempt, one measured result.
 
 use std::net::IpAddr;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use lakehouse_core::secret::{DynSecretResolver, SecretValue};
@@ -141,7 +144,7 @@ use object_store::ObjectStore;
 use object_store::aws::AmazonS3Builder;
 use sqlx::Connection;
 use sqlx::mysql::{MySqlConnectOptions, MySqlConnection, MySqlSslMode};
-use sqlx::postgres::{PgConnectOptions, PgConnection, PgSslMode};
+use sqlx::postgres::{PgConnectOptions, PgSslMode};
 use tokio_util::compat::TokioAsyncWriteCompatExt;
 
 use crate::connector_oauth::{self, OAuthSettings, TokenFailure};
@@ -279,26 +282,35 @@ fn elapsed_millis(elapsed: Duration) -> i64 {
 /// deprovision step already uses (WS3 plan review X4).
 ///
 /// [`Config::connector_probe_allow_internal_hosts`]: crate::config::Config::connector_probe_allow_internal_hosts
+///
+/// `ca` is the CA every TLS-able dial verifies the database server against
+/// (`SEC-14` part B, [`crate::config::Config::connector_tls_ca`]); `None` is
+/// D5's `require` posture. No `OAuth2` settings: the deployment-aware call is
+/// [`probe_with`], which the routes use.
 pub async fn probe(
     info: &ConnectorDialInfo,
     resolver: &dyn DynSecretResolver,
     internal_hosts: &InternalHosts,
+    ca: Option<&Path>,
 ) -> Outcome {
-    probe_with(info, resolver, internal_hosts, OAuthSettings::default()).await
+    probe_with(info, resolver, internal_hosts, OAuthSettings::default(), ca).await
 }
 
 /// [`probe`] with the installation's `OAuth2` settings (`SRC-12` part C): the
 /// routes call this one, so a gate that admits an `http` provider is honoured
-/// by the connection test as well as by the sign-in.
+/// by the connection test as well as by the sign-in. `ca` is the CA every
+/// TLS-able dial verifies the database server against (`SEC-14` part B,
+/// [`crate::config::Config::connector_tls_ca`]); `None` is D5's `require`.
 pub async fn probe_with(
     info: &ConnectorDialInfo,
     resolver: &dyn DynSecretResolver,
     internal_hosts: &InternalHosts,
     oauth: OAuthSettings,
+    ca: Option<&Path>,
 ) -> Outcome {
     match info.adapter.as_deref() {
         Some(adapter @ ("sql" | "cdc")) => {
-            Box::pin(probe_dial(adapter, info, resolver, internal_hosts)).await
+            Box::pin(probe_dial(adapter, info, resolver, internal_hosts, ca)).await
         }
         Some("rest") => probe_rest_info(info, resolver, internal_hosts, oauth).await,
         Some("sheets") => probe_sheets(),
@@ -315,7 +327,7 @@ pub async fn probe_with(
         // in its `dial`, the settings the load itself uses. `info.host` is a
         // display value for it (the wizard stores the bucket name there).
         Some("files") => probe_files(info, resolver, internal_hosts).await,
-        _ => probe_by_kind(info, resolver, internal_hosts).await,
+        _ => probe_by_kind(info, resolver, internal_hosts, ca).await,
     }
 }
 
@@ -325,10 +337,11 @@ async fn probe_by_kind(
     info: &ConnectorDialInfo,
     resolver: &dyn DynSecretResolver,
     internal_hosts: &InternalHosts,
+    ca: Option<&Path>,
 ) -> Outcome {
     let kind = info.kind.to_lowercase();
     if kind.contains("postgres") {
-        probe_postgres(info, resolver, internal_hosts).await
+        probe_postgres(info, resolver, internal_hosts, ca).await
     } else if kind.contains("object storage") || kind.contains("s3") {
         probe_s3(info, resolver, internal_hosts).await
     } else {
@@ -398,6 +411,7 @@ async fn probe_dial(
     info: &ConnectorDialInfo,
     resolver: &dyn DynSecretResolver,
     internal_hosts: &InternalHosts,
+    ca: Option<&Path>,
 ) -> Outcome {
     let parsed = match Dial::parse(adapter, &info.dial) {
         Ok(dial) => dial,
@@ -426,7 +440,7 @@ async fn probe_dial(
                 port: target.port,
                 database: target.database,
             };
-            dial_postgres(&target, &info.secret_ref, resolver, internal_hosts).await
+            dial_postgres(&target, &info.secret_ref, resolver, internal_hosts, ca).await
         }
         SqlDriver::Mysql => probe_mysql(&target, &info.secret_ref, resolver, internal_hosts).await,
         SqlDriver::Mssql => {
@@ -435,6 +449,7 @@ async fn probe_dial(
                 &info.secret_ref,
                 resolver,
                 internal_hosts,
+                ca,
             ))
             .await
         }
@@ -532,11 +547,15 @@ pub(crate) fn classify_tiberius_error(err: &tiberius::error::Error) -> &'static 
 /// before `secret_ref` is resolved or a `TcpStream` is even opened — see
 /// `probe_mssql_blocks_an_internal_host_before_dialing`, which mirrors
 /// `probe_mysql`'s own SSRF test with a panicking resolver.
+///
+/// `SEC-14` part B (D5/E3): the session always requests encryption
+/// ([`apply_mssql_tls`]) and, with a CA, verifies the chain against it.
 async fn probe_mssql(
     target: &DialTarget<'_>,
     secret_ref: &str,
     resolver: &dyn DynSecretResolver,
     internal_hosts: &InternalHosts,
+    ca: Option<&Path>,
 ) -> Outcome {
     let approved = match resolve_checked(target.host, target.port, internal_hosts).await {
         Ok(approved) => approved,
@@ -559,12 +578,7 @@ async fn probe_mssql(
         target.user,
         password.expose_secret(),
     ));
-    // Tier 1 has no cert-pinning story for an arbitrary operator-supplied
-    // SQL Server host -- same "state the TLS posture explicitly" reasoning
-    // as probe_postgres's PgSslMode::Prefer, applied to tiberius's own
-    // "accept the presented certificate without verifying its chain"
-    // knob.
-    config.trust_cert();
+    apply_mssql_tls(&mut config, ca);
     // SEC-15: the socket goes to the approved address; `config.host` keeps
     // the configured name for the TDS handshake, which is what `SEC-14`
     // needs for certificate verification.
@@ -1111,15 +1125,16 @@ impl Approved {
 /// `SEC-15`: `PostgreSQL` connect options that dial the [`Approved`] address
 /// (host and port), never the name. The TLS posture is pinned explicitly
 /// rather than left to `sqlx`'s default so it is a decision this module
-/// states: `Prefer` (attempt TLS, fall back to plaintext) matches this
-/// deployment's compose-network Postgres, which does not terminate TLS.
-/// `SEC-14` owns changing it, and must keep the name for certificate
-/// verification when it does.
+/// states; `SEC-14` part B changed it from `Prefer` (attempt TLS, fall back
+/// to plaintext, which is what this deployment's compose-network Postgres
+/// needed while it did not terminate TLS) to `Require`/`VerifyCa` -- see
+/// [`pg_options_for_address`], the one place that decision is written down.
 pub(crate) fn pg_connect_options(
     approved: &Approved,
     user: &str,
     password: &str,
     database: &str,
+    ca: Option<&Path>,
 ) -> PgConnectOptions {
     pg_options_for_address(
         &approved.primary_host(),
@@ -1127,32 +1142,89 @@ pub(crate) fn pg_connect_options(
         user,
         password,
         database,
+        ca,
     )
 }
 
 /// The one place the `PostgreSQL` TLS mode is set for connector dials
-/// (`SEC-15 review fix (SHOULD-FIX 2)`; `SEC-14` part B changes it here).
+/// (`SEC-15 review fix (SHOULD-FIX 2)`; `SEC-14` part B changed it here).
 /// `host` must already be an approved IP text, not a name:
 /// [`pg_connect_options`] passes [`Approved::primary_host`], and
 /// `connector_deprovision::PgTarget` carries the same text and port.
-pub(crate) fn pg_options_for_address(
+///
+/// `SEC-14` part B (D5/E1), the posture stated rather than inherited: with no
+/// `ca` it is [`PgSslMode::Require`] -- encrypt, and take the server
+/// certificate as-is; with one it is [`PgSslMode::VerifyCa`] against that CA.
+/// Never [`PgSslMode::Prefer`] (attempt TLS, fall back to plaintext) and
+/// never [`PgSslMode::Disable`].
+///
+/// Because these options dial the approved ADDRESS rather than the
+/// configured NAME (`SEC-15`), `VerifyCa` can prove only the chain: a name
+/// check would compare the certificate against an IP literal and fail every
+/// dial. `verify-ca` is therefore the strongest mode this helper can use,
+/// and the connection test is what checks the name -- it dials the approved
+/// address with a client of its own (`pg_probe`, D5/E2).
+// PR #192 review BLOCKER 10: pub for integration tests.
+#[must_use]
+pub fn pg_options_for_address(
     host: &str,
     port: u16,
     user: &str,
     password: &str,
     database: &str,
+    ca: Option<&Path>,
 ) -> PgConnectOptions {
-    PgConnectOptions::new()
+    let options = PgConnectOptions::new()
         .host(host)
         .port(port)
         .username(user)
         .password(password)
-        .database(database)
-        .ssl_mode(PgSslMode::Prefer)
+        .database(database);
+    match ca {
+        Some(path) => options.ssl_mode(PgSslMode::VerifyCa).ssl_root_cert(path),
+        None => options.ssl_mode(PgSslMode::Require),
+    }
+}
+
+/// `SEC-14` part B (D5/E3): the ONE place a SQL Server dial's TLS posture
+/// is set, shared by the connection test ([`probe_mssql`]), schema discovery
+/// and listing so no dial can drift from another.
+///
+/// Stated rather than inherited: `tiberius`'s own default already requires
+/// encryption with its `rustls` feature, but a default that changes with a
+/// feature flag is not a decision this module makes, and the previous
+/// comment here said only "Tier 1 has no cert-pinning story".
+///
+/// * No CA (D5's `require`): the session is encrypted and the presented
+///   certificate is accepted without a chain check — the same posture
+///   [`pg_options_for_address`] takes with no CA.
+/// * With a CA: [`tiberius::Config::trust_cert_ca`] verifies the chain
+///   against it. Tiberius adds the configured CA to native system roots, so
+///   SQL Server accepts either the configured CA or any public root, unlike
+///   the PostgreSQL connection test (`pg_probe`), which trusts only the
+///   configured CA bundle (SEC-14B review round 1, SHOULD-FIX 7). The `sqlx`
+///   PostgreSQL dials are in between: `sqlx` adds the public webpki roots to
+///   the bundle it is given. tiberius checks the certificate's names against
+///   `config.host`, which is the CONFIGURED name (see the `SEC-15` socket note
+///   at each call site), so this is verify-full for SQL Server, not verify-ca.
+///
+/// The two arms are mutually exclusive on purpose: `trust_cert_ca` panics
+/// when it is called after `trust_cert`, so one `match` keeps them apart.
+pub(crate) fn apply_mssql_tls(config: &mut tiberius::Config, ca: Option<&Path>) {
+    config.encryption(tiberius::EncryptionLevel::Required);
+    match ca {
+        Some(path) => config.trust_cert_ca(path.to_string_lossy().into_owned()),
+        None => config.trust_cert(),
+    }
 }
 
 /// `SEC-15`: `MySQL`/`MariaDB` connect options that dial the [`Approved`]
-/// address. Same TLS note as [`pg_connect_options`] (`Preferred`).
+/// address. `SEC-14` part B leaves `MySQL` alone (D9): it keeps `Preferred`,
+/// the one posture here that still falls back to plaintext, and says so
+/// rather than reading as an oversight. The password is not sent over that
+/// plaintext fallback: `SEC-41` decision 4 keeps `sqlx`'s `mysql-rsa` feature
+/// off, so a server that asks for the password without TLS is refused with
+/// `MYSQL_PLAINTEXT_PASSWORD_REFUSED` rather than handed it.
 pub(crate) fn mysql_connect_options(
     approved: &Approved,
     user: &str,
@@ -1384,6 +1456,7 @@ async fn probe_postgres(
     info: &ConnectorDialInfo,
     resolver: &dyn DynSecretResolver,
     internal_hosts: &InternalHosts,
+    ca: Option<&Path>,
 ) -> Outcome {
     let Some(target) = parse_postgres_host(&info.host) else {
         return Outcome::misconfigured(
@@ -1391,18 +1464,26 @@ async fn probe_postgres(
              \"<user>@<host>:<port>/<database>\"",
         );
     };
-    dial_postgres(&target, &info.secret_ref, resolver, internal_hosts).await
+    dial_postgres(&target, &info.secret_ref, resolver, internal_hosts, ca).await
 }
 
 /// The one real Postgres dial, shared by [`probe_postgres`] (a pre-WS3 row's
 /// legacy `host` string) and [`probe_dial`] (a `sql`/`cdc` adapter's
 /// `dial`). `resolve_checked` runs FIRST, before `secret_ref` is resolved —
 /// the same SSRF ordering every other probe here keeps.
+///
+/// Since `SEC-14` part B (E2/D8) this dial is [`crate::pg_probe`], not
+/// `sqlx`: the test must refuse a server that asks for a cleartext or MD5
+/// password rather than answer it, which `sqlx` offers no way to do, and it
+/// upgrades to TLS before the startup packet, so no credential can leave
+/// over a plaintext channel. `sqlx` still backs the other Postgres dials
+/// (discovery, listing, deprovisioning), which now require TLS too.
 async fn dial_postgres(
     target: &PgDialTarget<'_>,
     secret_ref: &str,
     resolver: &dyn DynSecretResolver,
     internal_hosts: &InternalHosts,
+    ca: Option<&Path>,
 ) -> Outcome {
     let approved = match resolve_checked(target.host, target.port, internal_hosts).await {
         Ok(approved) => approved,
@@ -1416,31 +1497,23 @@ async fn dial_postgres(
             ));
         }
     };
-    let options = pg_connect_options(
-        &approved,
-        target.user,
-        password.expose_secret(),
-        target.database,
-    );
-
     let started = Instant::now();
-    let attempt = tokio::time::timeout(DIAL_TIMEOUT, async {
-        let mut conn = PgConnection::connect_with(&options).await?;
-        sqlx::query("SELECT 1").execute(&mut conn).await?;
-        conn.close().await
-    })
+    // `pg_probe` speaks the protocol itself so it can refuse every
+    // authentication method but SCRAM-SHA-256, and it requires TLS before
+    // the startup packet (D5/D8). The credential stays a `SecretValue` and
+    // is exposed only inside the SCRAM computation.
+    let attempt = tokio::time::timeout(
+        DIAL_TIMEOUT,
+        crate::pg_probe::connect_and_select(target, &approved, &password, ca),
+    )
     .await;
     let elapsed = started.elapsed();
 
     match attempt {
         Ok(Ok(())) => Outcome::success(elapsed, "Connected via PostgreSQL and ran SELECT 1."),
-        Ok(Err(err)) => Outcome::failure(
-            elapsed,
-            format!(
-                "PostgreSQL connection failed: {}",
-                classify_sqlx_error(&err)
-            ),
-        ),
+        // `PgProbeError`'s Display is one fixed class per failure kind, never
+        // upstream text (`SEC-11`).
+        Ok(Err(err)) => Outcome::failure(elapsed, format!("PostgreSQL connection failed: {err}")),
         Err(_) => Outcome::failure(
             elapsed,
             format!(
@@ -1738,6 +1811,7 @@ mod tests {
                 &info(kind, "h", "env:X", None),
                 &resolver,
                 &InternalHosts::NONE,
+                None,
             )
             .await;
             assert!(!outcome.supported, "{kind} must be unsupported");
@@ -1761,6 +1835,7 @@ mod tests {
             &info("PostgreSQL", "not-a-valid-host-shape", "env:X", None),
             &resolver,
             &InternalHosts::NONE,
+            None,
         )
         .await;
         assert!(outcome.supported);
@@ -1788,6 +1863,7 @@ mod tests {
             ),
             &resolver,
             &InternalHosts::ALL,
+            None,
         )
         .await;
         assert!(outcome.supported);
@@ -1812,6 +1888,7 @@ mod tests {
             ),
             &resolver,
             &InternalHosts::NONE,
+            None,
         )
         .await;
         assert!(outcome.supported);
@@ -1842,6 +1919,7 @@ mod tests {
             ),
             &resolver,
             &InternalHosts::NONE,
+            None,
         )
         .await;
         assert!(!outcome.ok);
@@ -1866,6 +1944,7 @@ mod tests {
             ),
             &resolver,
             &InternalHosts::ALL,
+            None,
         )
         .await;
         assert!(outcome.supported);
@@ -1900,7 +1979,7 @@ mod tests {
             let mut row = info(kind, "h", "env:X", None);
             row.adapter = Some(adapter.to_owned());
             row.dial = dial;
-            let outcome = probe(&row, &resolver, &InternalHosts::NONE).await;
+            let outcome = probe(&row, &resolver, &InternalHosts::NONE, None).await;
             assert!(!outcome.supported, "{kind} must be unsupported");
             assert!(!outcome.ok, "{kind} must never report ok=true");
             assert!(outcome.latency_ms.is_none(), "{kind} has no latency");
@@ -1930,6 +2009,7 @@ mod tests {
             &info("MQTT", "h", "env:X", None),
             &resolver,
             &InternalHosts::NONE,
+            None,
         )
         .await;
         assert!(!outcome.supported);
@@ -1944,6 +2024,7 @@ mod tests {
             &info("Object storage", "http://127.0.0.1:1|bucket", "env:X", None),
             &resolver,
             &InternalHosts::ALL,
+            None,
         )
         .await;
         assert!(outcome.supported);
@@ -1966,6 +2047,7 @@ mod tests {
             ),
             &resolver,
             &InternalHosts::ALL,
+            None,
         )
         .await;
         assert!(outcome.supported);
@@ -1990,6 +2072,7 @@ mod tests {
             ),
             &resolver,
             &InternalHosts::NONE,
+            None,
         )
         .await;
         assert!(outcome.supported);
@@ -2015,6 +2098,7 @@ mod tests {
             ),
             &resolver,
             &InternalHosts::NONE,
+            None,
         )
         .await;
         assert!(!outcome.ok);
@@ -2055,6 +2139,7 @@ mod tests {
             ),
             &s3_keys(),
             &InternalHosts::ALL,
+            None,
         )
         .await;
         assert!(outcome.supported);
@@ -2078,6 +2163,7 @@ mod tests {
             ),
             &s3_keys(),
             &InternalHosts::ALL,
+            None,
         )
         .await;
         // The old host would have been refused with no latency; the dial's
@@ -2099,6 +2185,7 @@ mod tests {
             ),
             &s3_keys(),
             &InternalHosts::NONE,
+            None,
         )
         .await;
         assert!(!outcome.ok);
@@ -2115,6 +2202,7 @@ mod tests {
             ),
             &s3_keys(),
             &InternalHosts::ALL,
+            None,
         )
         .await;
         assert!(!outcome.supported);
@@ -2135,6 +2223,7 @@ mod tests {
             ),
             &s3_keys(),
             &InternalHosts::ALL,
+            None,
         )
         .await;
         assert!(!outcome.supported);
@@ -2149,6 +2238,7 @@ mod tests {
             &files_info("my-bucket", serde_json::json!({})),
             &s3_keys(),
             &InternalHosts::ALL,
+            None,
         )
         .await;
         assert!(outcome.supported);
@@ -2390,12 +2480,95 @@ mod tests {
     #[test]
     fn sql_connect_options_dial_the_approved_address_not_the_name() {
         let approved = approved_for(sock_with_port("192.0.2.9", 6543), "db.example.com");
-        let pg = pg_connect_options(&approved, "u", "p", "d");
+        let pg = pg_connect_options(&approved, "u", "p", "d", None);
         assert_eq!(pg.get_host(), "192.0.2.9");
         assert_eq!(pg.get_port(), 6543);
         let mysql = mysql_connect_options(&approved, "u", "p", "d");
         assert_eq!(mysql.get_host(), "192.0.2.9");
         assert_eq!(mysql.get_port(), 6543);
+    }
+
+    /// `SEC-14` part B (E3, D5): a SQL Server dial always requires
+    /// encryption, and verifies the CA when one is configured. tiberius
+    /// exposes no getter for either (`Config`'s fields are crate-private),
+    /// so both are read through its `Debug` -- `encryption: Required`,
+    /// `bypass: true` for the accept-anything posture, and the
+    /// `File("<path>")` an extra CA is recorded as.
+    #[test]
+    fn mssql_tls_requires_encryption_and_uses_the_ca_when_set() {
+        let mut without_ca = tiberius::Config::new();
+        apply_mssql_tls(&mut without_ca, None);
+        let without_ca = format!("{without_ca:?}");
+        assert!(
+            without_ca.contains("encryption: Required"),
+            "encryption must be required, never optional: {without_ca}"
+        );
+        assert!(
+            without_ca.contains("bypass: true"),
+            "with no CA the certificate is taken as-is (D5's require): {without_ca}"
+        );
+        assert!(
+            !without_ca.contains("VerifyCa") && !without_ca.contains("VerifyFull"),
+            "the bypass posture must not claim to verify: {without_ca}"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let ca = dir.path().join("ca.pem");
+        std::fs::write(&ca, b"-----BEGIN CERTIFICATE-----\n").unwrap();
+        let mut with_ca = tiberius::Config::new();
+        apply_mssql_tls(&mut with_ca, Some(ca.as_path()));
+        let with_ca = format!("{with_ca:?}");
+        assert!(
+            with_ca.contains("encryption: Required"),
+            "a CA must not change the encryption level: {with_ca}"
+        );
+        assert!(
+            with_ca.contains(&format!("File({:?})", ca.to_str().unwrap())),
+            "the CA file must be attached to the config: {with_ca}"
+        );
+        assert!(
+            !with_ca.contains("bypass: true"),
+            "with a CA the chain is verified, not bypassed: {with_ca}"
+        );
+    }
+
+    /// `SEC-14` part B (E1, D5): the sqlx `PostgreSQL` TLS mode is `Require`
+    /// with no CA -- never `Prefer`, which falls back to plaintext, and never
+    /// `Disable` -- and `VerifyCa` with that CA attached when
+    /// `CONNECTOR_TLS_CA_FILE` is set.
+    ///
+    /// sqlx 0.8's `PgSslMode` is `Copy + Debug` but not `PartialEq`, and
+    /// `ssl_root_cert` has no getter, so both are read through the options'
+    /// `Debug`: the variant names and the `File("<path>")` it prints.
+    #[test]
+    fn pg_tls_mode_is_require_without_a_ca_and_verify_ca_with_one() {
+        let approved = approved_for(sock_with_port("192.0.2.9", 5432), "db.example.com");
+
+        let without = format!("{:?}", pg_connect_options(&approved, "u", "p", "d", None));
+        assert!(
+            without.contains("Require"),
+            "with no CA a dial must still require TLS: {without}"
+        );
+        assert!(
+            !without.contains("Prefer") && !without.contains("Disable"),
+            "the mode must never be one that falls back to plaintext: {without}"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let ca = dir.path().join("ca.pem");
+        std::fs::write(&ca, b"-----BEGIN CERTIFICATE-----\n").unwrap();
+        let with = format!(
+            "{:?}",
+            pg_connect_options(&approved, "u", "p", "d", Some(ca.as_path()))
+        );
+        assert!(
+            with.contains("VerifyCa"),
+            "with a CA a dial must verify the chain: {with}"
+        );
+        assert!(
+            with.contains(ca.to_str().unwrap()),
+            "the CA file must be attached to the options: {with}"
+        );
     }
 
     /// SEC-15 (K2): the `tiberius` socket goes to the approved address. The
@@ -2668,6 +2841,7 @@ mod tests {
             &wizard_postgres_info("127.0.0.1", 1, "env:PG_TEST_PASSWORD"),
             &resolver,
             &InternalHosts::ALL,
+            None,
         )
         .await;
         assert!(outcome.supported);
@@ -2697,6 +2871,7 @@ mod tests {
             &wizard_postgres_info("127.0.0.1", 5432, "env:UNUSED"),
             &PanicIfCalledResolver,
             &InternalHosts::NONE,
+            None,
         )
         .await;
         assert!(outcome.supported);
@@ -2721,6 +2896,7 @@ mod tests {
             "env:UNUSED",
             &PanicIfCalledResolver,
             &InternalHosts::NONE,
+            None,
         )
         .await;
         assert!(!outcome.ok);

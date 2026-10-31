@@ -1,7 +1,13 @@
-import { readableErrorMessage } from "@/lib/notify-message";
 import { normalizeFilters } from "@/lib/dashboard-filter-state";
 import type { FilterDef } from "@/services/clients/bi-store";
 import { apiFetch } from "@/services/http";
+import { fileNameOf, refusalOf, saveBlob } from "@/lib/browser-file";
+
+// The three helpers every download shares now live in `@/lib/browser-file`,
+// because a service client needs them too and a client may not import from
+// `src/features`. They are re-exported here, so the dashboard's own
+// downloads keep reading them from this module.
+export { fileNameOf, refusalOf, saveBlob };
 
 /** What the server says about the file it sent (`X-Export-*`), so a cut is never silent. */
 export type TableExportResult = { rows: number; cut: boolean; cap: number; fileName: string };
@@ -17,34 +23,6 @@ export function tableExportQuery(chart: string, filters: readonly FilterDef[], s
     q.set("sortDir", sort.dir);
   }
   return q;
-}
-
-/** `Visits.csv` from `attachment; filename="Visits.csv"`. */
-export function fileNameOf(disposition: string | null): string {
-  return /filename="([^"]+)"/.exec(disposition ?? "")?.[1] ?? "table.csv";
-}
-
-/** Save `blob` under `fileName` through a temporary link (the one place a download is handed to the browser). */
-export function saveBlob(blob: Blob, fileName: string): void {
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = fileName;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  URL.revokeObjectURL(url);
-}
-
-/**
- * The sentence for a refused download, or `fallback`. A body that starts with an
- * API error code (`permission_denied: ...`) reads as that code's hint, not as
- * the code (`readableErrorMessage`, BI-18 part C review fix (SHOULD-FIX) R20,
- * applied to BI-1's routes by the phase 3 merge).
- */
-export async function refusalOf(res: Response, fallback: string): Promise<string> {
-  const json = (await res.json().catch(() => null)) as { error?: unknown } | null;
-  return typeof json?.error === "string" ? readableErrorMessage(json.error) : fallback;
 }
 
 /**

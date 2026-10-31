@@ -61,15 +61,25 @@ mod quality_anomaly;
 mod quality_incidents;
 mod quality_load;
 mod quality_schedules;
-mod query;
 mod query_cancel;
 mod query_limits;
+// `pub(crate)`, not private: `SEC-50`'s shared tenant gate
+// (`query::gate_statement` and `query::GateActor`) is asked by every site
+// that runs a statement through the policy rewrite — the query path, the
+// authored pipelines, the Gold export, and (from slice 2) the dashboards,
+// the embeds, the public links and the alerts. A second copy of the reach
+// logic in a second place is exactly the drift the one definition exists
+// to prevent (`AGENTS.md` rule 4).
+pub(crate) mod query;
 mod schema_changes;
 pub(crate) mod schema_versions;
 mod settings;
 mod storage;
 pub(crate) mod support;
-mod uploads;
+// `pub(crate)`, because `crate::upload_convert` (the child process's
+// protocol) needs this module's own sentences: a file that is too large is
+// refused with the same words wherever it is noticed (`SEC-22` D4).
+pub(crate) mod uploads;
 
 use std::time::Duration;
 
@@ -953,6 +963,22 @@ fn uploads_router(state: &AppState) -> Router<AppState> {
         .route(
             "/api/uploads/sessions",
             axum::routing::post(uploads::sessions::create_session),
+        )
+        // DATA-35: folders for uploaded files. Static paths next to `{id}` (the
+        // router prefers a static segment, and an upload id is `up-<uuid>`), outside
+        // the per-upload layer because they name no upload: each folder is checked
+        // against the caller's tenant by the store (`uploads::folders`).
+        .route(
+            "/api/uploads/folders",
+            get(uploads::folders::list).post(uploads::folders::create),
+        )
+        .route(
+            "/api/uploads/folders/{id}",
+            axum::routing::patch(uploads::folders::update).delete(uploads::folders::delete),
+        )
+        .route(
+            "/api/uploads/move",
+            axum::routing::post(uploads::folders::move_uploads),
         )
         .merge(per_upload)
 }

@@ -36,9 +36,11 @@ table (`routes/catalog_governance.rs:206`).
 
 ## Not included
 
-- Dashboards, gold export, alerts and authored pipelines. They call the role rewrite directly
-  (`dashboard.rs:331-388`, `gold_export.rs:483`, `alerts.rs:644`, `authored_pipelines.rs:1405`), not the query
-  path, and `dashboard.rs` is held by open PR #204. A new backlog row covers them.
+- The dashboards, the embeds, the public links and the alerts. They call the role rewrite directly
+  (`dashboard.rs:331-388`, `embed.rs`, `alerts.rs:644`), not the query path. `SEC-50` gates them in its second
+  slice; its first slice already gates the authored pipelines and the Gold export. Of those two, only the authored
+  pipeline can name a `bronze.*` table — the Gold export reads the shared catalog's `serving.*` marts — so the
+  authored pipeline is the one path in this service where another tenant's upload can be reached.
 - Tenants on Silver and Gold tables. Nothing maps them to a tenant today; they stay shared catalog tables under the
   catalog's gate (decision 1).
 - Query history. It is already per user (`lakehouse-store/src/queries.rs:367-384`).
@@ -66,7 +68,15 @@ chat's saved-query tools know who asks (owner's exception, 2026-10-23 for the on
 
 ## Limits to tell a customer
 
-- Dashboards, scheduled exports and alerts are not yet scoped this way; see the follow-up backlog row.
+- An authored pipeline is scoped now (`SEC-50`, its first slice): it acts as its own tenant, so a pipeline of one
+  tenant cannot read another tenant's uploaded table. A pipeline that belongs to no tenant is refused with a 409
+  until an administrator assigns one with `PUT /api/pipelines/{id}/tenant`.
+- The Gold export is scoped now. A signed-in person who triggers it acts as themselves, so their own tenant must own
+  the shared catalog; a job with no user (the scheduled export, a manual trigger done as a service) acts as the tenant
+  that owns the shared catalog. On a deployment with several tenants and no `CATALOG_TENANT_ID`, the export is refused
+  outright until an operator sets it.
+- The dashboards, the embeds, the public links and the alerts are not yet scoped this way; they follow in the second
+  slice of `SEC-50`.
 - Silver and Gold tables belong to the shared catalog, not to a tenant. With more than one tenant, only the
   tenant that owns the catalog can query them.
 - A refused table reads "not found or not available to your organisation", whether it exists or not.

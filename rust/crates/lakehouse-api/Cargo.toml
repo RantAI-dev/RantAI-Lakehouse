@@ -74,11 +74,14 @@ axum = { workspace = true }
 # (`tokio::sync::Mutex`/`OwnedMutexGuard`) and its tests
 # (`tokio::sync::Barrier`) need it directly, and this crate should compile
 # correctly on its own, not only as part of the whole-workspace build.
+# `process`: the child that reads an uploaded workbook or a Parquet file
+# (`upload_convert`, `SEC-22`) is a process of this binary, started with
+# `tokio::process::Command`.
 # `time`: `crate::bounded::run_with_budget` (WS2 §4) needs
 # `tokio::time::{timeout_at, Instant, sleep}` to bound per-table/per-namespace
 # Lakekeeper calls. `io-util`: `tokio::io::duplex` backs `routes::ai::stream_chat`'s
 # NDJSON progress pipe for `POST /api/ai/chat` (`stream: true`).
-tokio = { workspace = true, features = ["sync", "time", "io-util"] }
+tokio = { workspace = true, features = ["sync", "time", "io-util", "process"] }
 tower = { workspace = true }
 tower-http = { workspace = true }
 reqwest = { workspace = true }
@@ -115,7 +118,7 @@ jiff = { workspace = true }
 # lockfile, each MIT or Apache-2.0, all in `deny.toml`'s allow list. No
 # features: dates are rendered from its date components, so its `chrono`
 # feature is not needed.
-calamine = "0.36"
+calamine = "0.37"
 uuid = { workspace = true }
 sqlx = { workspace = true }
 # `connector_probe`'s real S3-compatible connectivity test — same crate,
@@ -151,6 +154,16 @@ zip = { version = "8.6", default-features = false, features = ["deflate"] }
 # rustls-webpki 0.101.7 (RUSTSEC-2026-0098/0099/0104, no fixed 0.101.x);
 # the 0.13 line is on rustls 0.23 -> webpki 0.103.15, all three fixed.
 tiberius = { version = "0.13", default-features = false, features = ["tds73", "rustls", "chrono"] }
+# SEC-14 part B (`pg_probe`): the Postgres connection test speaks the wire
+# protocol itself, so it can refuse every authentication method but
+# SCRAM-SHA-256, and always upgrades to TLS before the startup packet. See
+# the workspace `Cargo.toml` entries for what each crate is and why it is
+# here.
+postgres-protocol = { workspace = true }
+fallible-iterator = { workspace = true }
+bytes = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
 # `tiberius::Client::connect` takes a Tokio-`AsyncRead`/`AsyncWrite`
 # stream wrapped for the `futures`-crate traits tiberius itself uses
 # (tiberius's own doc comment, `src/lib.rs`'s "Connecting with Tokio"
@@ -170,6 +183,13 @@ reqwest013 = { package = "reqwest", version = "0.13", default-features = false, 
 # `futures` 0.3 is already in `Cargo.lock` (`lakehouse-iceberg` depends on it),
 # so this adds no package; only this crate's dependency list in the lockfile.
 futures = "0.3"
+# `SEC-22`: the child process that reads an uploaded workbook or a Parquet
+# file (`upload_convert`) sets its own `RLIMIT_DATA` and `RLIMIT_CPU` with
+# `nix`, so the memory a crafted file can ask for is the child's and never
+# the API's. The crate was already in `Cargo.lock` (0.31.3) through other
+# crates, so the lockfile gains no package; only the `resource` feature and
+# this dependency list change. MIT.
+nix = { workspace = true }
 # `BI-1` D6: the .xlsx writer. Pinned exactly (a download format must not change
 # under a routine update); `constant_memory` mode keeps a million-row export off
 # the heap. MIT OR Apache-2.0; `cargo deny check` and `cargo audit` pass with it
@@ -225,7 +245,12 @@ testcontainers-modules = { version = "0.15", features = ["clickhouse"] }
 # `secret_manager::gcp`'s tests also generate a service-account key with it.
 rsa = "0.9"
 
-tempfile = { workspace = true }
+# `SEC-14` part B (dev-only): the TLS-terminating proxy in front of the
+# shared test `Postgres` (`src/tls_proxy.rs`) needs a server certificate,
+# and a test can only get one by generating it -- no certificate is
+# committed to this repository (gitleaks reads a committed private key as a
+# leak). `ring` and no `crypto` defaults, matching the workspace's one
+# rustls provider story (the workspace `rustls` entry); MIT OR Apache-2.0.
 # `SEC-41` decision 7 / AC1: `tests/sec41_verify_ca.rs` puts a TLS
 # terminator in front of the shared test Postgres (answer `SSLRequest` with
 # `S`, then rustls, then forward bytes) and needs a certificate chain per
@@ -233,9 +258,15 @@ tempfile = { workspace = true }
 # history (SEC-36) reads a committed private key as a leak, so the chain is
 # minted at test time. `rcgen` with `ring` and no `crypto`/`pem` defaults,
 # matching this workspace's one rustls provider story (the `rustls` feature
-# `sqlx-core` turns on); MIT OR Apache-2.0. Its `yasna` dependency is the
-# only package it adds to `Cargo.lock`.
-rcgen = { version = "0.13", default-features = false, features = ["ring"] }
+# `sqlx-core` turns on); MIT OR Apache-2.0. 0.14 compiles no crate the lock
+# did not already carry -- `ring`, `time` and `rustls-pki-types` are in it,
+# and `yasna` moves 0.5.2 -> 0.6.0 -- but it does add entries for the
+# optional `x509-parser` 0.18.1 (with its tree) and `bit-vec` 0.9.1, plus a
+# second `nom` (7.1.3 beside 8.0.0). None of those is built: `rcgen` and
+# `yasna` only name them weakly (`x509-parser?/verify`, `bit-vec?/std`).
+rcgen = { version = "0.14", default-features = false, features = ["ring"] }
+
+tempfile = { workspace = true }
 # The terminator's own TLS server side, and the provider named explicitly so
 # it does not depend on which rustls consumer set the process default first.
 # Both are already in `Cargo.lock` (through `reqwest`/`object_store`/

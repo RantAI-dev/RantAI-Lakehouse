@@ -64,17 +64,18 @@ estimate (S, M, L), which the base has no field for.
 | ID | Kind | Item | Module | Priority | Status | PR | Source |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `AI-18` | Feature | Copilot Chat: ask a question or give an instruction in plain language, and the assistant answers or acts with the console's own tools; risky actions wait for approval. Built before this backlog tracked PRs; never accepted | AI Copilot | P1 | In Acceptance | #169 | `PRODUCT.md` §2 (Home, History) |
-| `SEC-22` | Task | Converting an uploaded workbook can exhaust the API's memory and stop the API for every user; the conversion must not be able to end the API process. Also: the Parquet reader trusts sizes from the file's footer the same way (by reading, not run); no limit on conversions running at once; no byte cap on workbook text; each preview converts the whole file again; the limits doc in `upload_workbook.rs` says the opposite of the code | Administration & Security | P0 | Todo |  | PR #76 review, BLOCKER 1 (merged without the fix); `superpowers/plans/2026-10-12-delivery-review.md` |
+| `SEC-22` | Task | Converting an uploaded workbook can exhaust the API's memory and stop the API for every user; the conversion must not be able to end the API process. Also: the Parquet reader trusts sizes from the file's footer the same way (by reading, not run); no limit on conversions running at once; no byte cap on workbook text; each preview converts the whole file again; the limits doc in `upload_workbook.rs` says the opposite of the code | Administration & Security | P0 | Done | #187 | PR #76 review, BLOCKER 1 (merged without the fix); `superpowers/plans/2026-10-12-delivery-review.md` |
+| `SEC-55` | Task | Previewing a Parquet file in an S3 files connector reads it in the API process (`connector_listing.rs`, `upload_parquet::inspect` on up to 64 MiB), so a crafted footer can end the API for every tenant, as `SEC-22` found for uploads: `parquet` reserves list space from counts the footer declares before any check runs. Fix: send it to the `SEC-22` child with its tail only. **Waits for `SEC-22`** | Administration & Security | P1 | Todo |  | PR #187 review round 1, P3 (`superpowers/plans/2026-10-16-sec-22-upload-conversion-memory.md`) |
 | `SEC-23` | Task | Adding a quality, classification or residency rule asked only for a login, while changing one asks for `governance:write`; adding now asks for it too, in the API, the assistant's tools and the console | Administration & Security | P1 | Done | #97 | `features/governance-rule-create.md` |
 | `DATA-1` | Feature | Gold tables publish to open format automatically, as an option per table | Build | P1 | In Acceptance | #60, #63, #64 | `features/gold-publish-per-mart.md` |
-| `QA-1` | Task | Accept each built feature with a checklist, starting with what a demo shows | Delivery | P1 | Todo |  | PRODUCT §4 blocker 1 |
+| `QA-1` | Task | Accept each built feature with a checklist, starting with what a demo shows. Started 2026-10-30 (product owner) | Delivery | P1 | In Progress |  | PRODUCT §4 blocker 1 |
 | `SEC-1` | Task | Confirm the leaked key is rotated; decide on rewriting git history. Decided 2026-10-14: no rewrite; the key and the staging values are rotated (product owner) and their history findings are baselined by exact fingerprint in `.gitleaksignore` | Administration & Security | P1 | Done | #153 | `SECURITY.md` |
-| `REL-1` | Task | Protect the main branch | Delivery | P1 | Todo |  | `docs/CI.md` |
+| `REL-1` | Task | Protect the main branch. The repository is public, so GitHub's free plan allows it. Applied 2026-10-30: five required checks, branch up to date, no force-push or deletion (`docs/CI.md`) | Delivery | P1 | Done | #279 | `docs/CI.md` |
 | `DOC-1` | Task | Archive or rewrite the old product documents that contradict the build | Docs | P1 | Done | #171 | PRODUCT §6 |
 | `GOV-2` | Decision | Decide which role may publish a table in open format | Governance | P1 | Open |  | PRODUCT §6 |
 | `SEC-10` | Task | Alert webhooks can be pointed at internal addresses; use the allowlisted resolver. The `SRC-17` gate (`ops/g6/src17_alert_delivery_test.py`) receives webhooks on its own network: this item gives that gate its documented opt-in | Administration & Security | P1 | Done | #105 | `lakehouse-notify` |
 | `SEC-11` | Task | Dashboard tiles and public/embed links return raw database error text. Same rule as `SEC-6` | Administration & Security | P1 | Done | #105 | `routes/support.rs` |
-| `SEC-14` | Feature | A stored connector password can be stolen by re-pointing the connector: a host change keeps the secret and the next test sends it to the new server. Part B (#192): **Blocked by `SEC-41`** | Administration & Security | P0 | Building | #85 | `routes/connectors.rs`, `connector_probe.rs` |
+| `SEC-14` | Feature | A stored connector password can be stolen by re-pointing the connector: a host change keeps the secret and the next test sends it to the new server. Part B (#192): TLS for every connector dial, and the password test refuses anything but SCRAM | Administration & Security | P0 | In Acceptance | #85, #192 | `routes/connectors.rs`, `connector_probe.rs` |
 | `SEC-15` | Feature | Connection tests can reach internal addresses: the block is off by default in compose, the REST test follows redirects, no address pinning, CDC delete skips the check | Administration & Security | P0 | Released | #82 | `docker-compose.yml`, `connector_probe.rs` |
 | `SEC-13` | Task | Check `.env.staging`, pushed straight to `main` in `7ec3a81`, for real credentials or hostnames; rotate anything real | Administration & Security | P1 | Done | #130 | commit `7ec3a81` |
 | `SEC-24` | Task | The assistant's system prompt gives any signed-in user the DATA MAP (tables, row counts, sample values) without `catalog:read`; a Dashboard Viewer sees samples Query Studio would refuse it. Give the map only with `catalog:read`, and sample values only with `query:read` | Administration & Security | P1 | Done | #202 | `superpowers/plans/2026-10-12-delivery-review.md` (`SEC-9` gap) |
@@ -113,7 +114,7 @@ estimate (S, M, L), which the base has no field for.
 | `BI-11` | Feature | Parameters, usable in charts, SQL and dashboards. **Blocked by `QS-5` (parameters in SQL)** | Dashboards | P2 | In Acceptance | [#160](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/160) | `reference/competitive-comparison.md` (BI matrix) |
 | `BI-13` | Feature | Combine two sources on one chart | Dashboards | P2 | In Acceptance | [#160](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/160) | `reference/competitive-comparison.md` (BI matrix) |
 | `BI-14` | Feature | Lineage from a chart to its sources, reachable from the dashboard. **Blocked by `DATA-13` (column part)** | Dashboards | P2 | Planned |  | `reference/competitive-comparison.md` (BI matrix) |
-| `BI-16` | Feature | Every chart type Tableau and Metabase have that we lack: progress bar, histogram, Gantt, bullet graph, KPI with comparison and sparkline, raw-row table, pivot table with totals, record detail, world maps and uploaded boundaries, image and web-page cards, spatial analysis, custom chart plugins. Part A (tables and KPI) in #104; parts B and C left. **Blocked by `BI-10` (histogram bins)** | Dashboards | P2 | Building | #104, #199, [#246](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/246) | `reference/competitive-comparison.md` (BI matrix) |
+| `BI-16` | Feature | Every chart type Tableau and Metabase have that we lack: progress bar, histogram, Gantt, bullet graph, KPI with comparison and sparkline, raw-row table, pivot table with totals, record detail, world maps and uploaded boundaries, image and web-page cards, spatial analysis, custom chart plugins. Part A (tables and KPI) in #104; parts B and C left. **Blocked by `BI-10` (histogram bins)** | Dashboards | P2 | Building | #104, #199, [#246](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/246), [#265](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/265) | `reference/competitive-comparison.md` (BI matrix) |
 | `BI-17` | Feature | Chart formatting at both competitors' level: number formats, colours, axes, data labels, conditional formatting, goal and reference lines, trend lines, forecasting, clustering, annotations, custom tooltips, themes and fonts Part A (formats, palettes, axes, data labels, reference and trend lines, notes, tooltips, conditional colours, themes and fonts) in #199. | Dashboards | P2 | Building | #199, [#246](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/246) | `reference/competitive-comparison.md` (BI matrix) |
 | `BI-18` | Feature | Dashboards at both competitors' level: tabs; phone and tablet layouts; date-range, relative-date, number, text and linked filters; filter defaults that do not change silently; drill-down for every chart; click to another dashboard or URL; show and hide; saved auto-refresh; stories; templates; favourites; version history; trash; personal space. Parts A (filters) and B (click-through) in #104; part C (tabs, phone layout, sections, stories, templates, favourites, versions, trash, personal space, duplicate) left Part C (tabs, sections, phone layout, version history, trash, personal space, favourites, recent, search) in #199; reports and templates remain. | Dashboards | P2 | Building | #104, #199 | `reference/competitive-comparison.md` (BI matrix) |
 | `AI-1` | Feature | The assistant manages the dashboards that exist today: rename boards, delete them (with approval), arrange and resize tiles, move charts between boards. The six board tools shipped in #188 and #190; #199 refuses an unknown target board | AI Copilot | P2 | Building | #188, #190, #199, #222 | `AGENTS.md` (assistant parity) |
@@ -143,15 +144,15 @@ estimate (S, M, L), which the base has no field for.
 | `SEC-40` | Task | Sign in once through Microsoft Entra ID and once through Google with a test app registration and test user each, following `docs/OPERATIONS.md` (single sign-on), and record the date, settings (no secrets) and outcome in `docs/plans/SEC-3-RESULT.md` (`SEC-3-AC2`, `SEC-3-AC3`). Product owner's test, later | Administration & Security | P3 | Todo |  | `SEC-3` (#181) |
 | `SEC-38` | Task | Single sign-on reads the signing keys' location (`jwks_uri`) from the provider's discovery document, so `OIDC_JWKS_URL` no longer has to be set by hand: today the API assumes `{OIDC_ISSUER}/.well-known/jwks.json`, which Entra ID and Google do not serve | Administration & Security | P3 | Done | [#241](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/241) | `SEC-3` review, `docs/plans/SEC-3-RESULT.md` |
 | `SEC-39` | Task | An Entra ID user in more groups than the token can carry gets a group overage marker instead of `groups`; the console then applies no mapped role, silently. At least log it and say so on the user's sign-in; following the Microsoft Graph link is the full fix. The remaining part after `SEC-39` is the Graph call that applies the mapped role | Administration & Security | P3 | Done | [#241](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/241) | `SEC-3` review, `docs/OPERATIONS.md` |
-| `SEC-7` | Task | A monitored security contact address | Administration & Security | P2 | Todo |  | `SECURITY.md` |
-| `REL-2` | Task | Adopt a version and release policy; cut a release from the unreleased work | Delivery | P2 | Todo |  | `reference/release-policy.md` |
+| `SEC-7` | Task | A monitored security contact address: `evan@rantai.dev` (product owner, 2026-10-30), in `SECURITY.md` | Administration & Security | P2 | Done | #279 | `SECURITY.md` |
+| `REL-2` | Task | Adopt a version and release policy; cut a release from the unreleased work. Widened by the product owner (2026-10-30): installing and updating must be one step, or close to it, like T3 Code's installer and updater, and must work on an air-gapped server too (a signed offline bundle; a backup before an update and a way back). Needs a spec in `specs/` first | Delivery | P1 | Todo |  | `reference/release-policy.md` |
 | `GOV-1` | Feature | Audit trail covers every console change | Governance | P2 | Idea |  | PRODUCT §3 |
 | `OPS-1` | Task | Trim old versions of raw tables | Operations | P2 | Done | #178 | `README.md` |
 | `OPS-9` | Task | The per-table maintenance route (`GET /api/lakehouse/tables/{ns}/{table}/maintenance`) never shows a Bronze table's last run: the job records the qualified name (`bronze.<table>`) while `routes/lakehouse.rs` `maintenance_verb_run_query` and `routes/governance.rs` `maintenance_run_query` filter on the bare name from the URL. The aggregate Governance view is right | Operations | P2 | Done | [#234](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/234) | `docs/plans/OPS-1-RESULT.md` |
 | `DATA-2` | Task | Keep the last copies of a published Gold table, remove the rest. | Build | P2 | Done | #164 | `features/gold-publish-per-mart.md`; [spec](specs/data-2.md) |
 | `DATA-10` | Task | A merge-proof "has this mart changed" signal for publishing, so background merges do not trigger extra copies | Build | P2 | Done | #156 | Slice B review, gold-publish plan |
 | `DATA-6` | Feature | A "latest copy only" table for outside readers of published tables. | Build | P2 | Planned |  | `features/gold-publish-per-mart.md`; [spec](specs/data-6.md) |
-| `SEC-4` | Task | Human security review | Administration & Security | P2 | Todo |  | PRODUCT §4 blocker 3 |
+| `SEC-4` | Task | Human security review. Cancelled 2026-10-30: the product owner decided it is not needed | Administration & Security | P2 | Cancelled |  | PRODUCT §4 blocker 3 |
 | `SUP-1` | Decision | Decide a support commitment | Business | P2 | Open |  | PRODUCT §4 blocker 5 |
 | `OPS-7` | Task | Test and time a restore from backup | Operations | P2 | Done | #185 | PRODUCT §2 |
 | `SEC-5` | Feature | Clean up old sessions and tokens | Administration & Security | P2 | In Acceptance | #67 | `features/login-protection-and-session-cleanup.md` |
@@ -189,19 +190,20 @@ estimate (S, M, L), which the base has no field for.
 | `DATA-17` | Feature | Upload more formats (Excel, JSON, Parquet, Avro), up to 10 files at once in parallel, up to 2 GB per upload once measured (Databricks' limits) | Data | P2 | In Acceptance | [#76](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/76), [#186](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/186) | `reference/competitive-comparison.md` (Data matrix) |
 | `DATA-18` | Feature | Column types on upload, with names and types editable before loading | Data | P2 | In Acceptance | [#186](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/186) | `reference/competitive-comparison.md` (Data matrix) |
 | `DATA-19` | Feature | Uploaded tables can feed pipelines and so reach dashboards. | Data | P2 | Released | #165 | `reference/competitive-comparison.md` (Data matrix) |
+| `DATA-35` | Feature | Folders for uploaded files on Sources: a grouping only (a file's table keeps its name), chosen while uploading or moved later, folders inside folders, empty folders allowed and deletable, a folder with files cannot be deleted. Uploaded files only, for now. Feature page `features/upload-folders.md` | Data | P2 | In Acceptance | [#259](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/259) | Product owner, 2026-10-26; [spec](specs/data-35.md) |
 | `QS-1` | Feature | Query Studio editor basics: column autocomplete, schema browser, several statements, tabs, formatting rules | Query Studio | P2 | In Acceptance | #237 | `reference/competitive-comparison.md` (Query Studio matrix) |
-| `QS-2` | Feature | Query Studio results: up to 64,000 rows or 10 MB shown, grid filters and column stats, full server downloads up to 5 GB (Databricks' limits), server-side Stop, configurable timeouts. | Query Studio | P2 | Planned |  | `reference/competitive-comparison.md` (Query Studio matrix) |
+| `QS-2` | Feature | Query Studio results: up to 64,000 rows or 10 MB shown, grid filters and column stats, full server downloads up to 5 GB (Databricks' limits), server-side Stop, configurable timeouts. | Query Studio | P2 | In Acceptance | #275 | `reference/competitive-comparison.md` (Query Studio matrix) |
 | `QS-3` | Feature | Saved queries done properly: edit, delete, folders, sharing levels, version history. **Blocked by `SEC-20`** | Query Studio | P2 | Planned |  | `reference/competitive-comparison.md` (Query Studio matrix) |
-| `QS-4` | Feature | Query history page with filters, and a query profile | Query Studio | P2 | Building | #254 | `reference/competitive-comparison.md` (Query Studio matrix) |
+| `QS-4` | Feature | Query history page with filters, and a query profile | Query Studio | P2 | In Acceptance | #254, #263 | `reference/competitive-comparison.md` (Query Studio matrix) |
 | `QS-5` | Feature | The bridge to BI: parameters that become dashboard filters, snippets, charts from results, reuse a saved query in SQL, alerts on a query. | Query Studio | P2 | Planned |  | `reference/competitive-comparison.md` (Query Studio matrix) |
 | `AI-16` | Task | Hand-off to the AI team: AI features for the Data module. Remaining: plain-language table search, AI classification, AI quality suggestions and incident help, AI connector building. The AI team plans these | AI Copilot | P2 | In Progress | #79, #95, #96, #109, #110, #111, #112, #118 | `docs/core/features/semantic-layer.md` |
 | `AI-17` | Feature | The chat asks once, with options, which reading of an unclear word the person means, remembers the clicked answer per user, and writes in full only the tables a question names. **Staging QA, 2026-10-18, after #208:** in 8 late-ask runs the reply never apologised, kept the user's language and named the reading it used; it still mentioned the refusal in 4, asked in text in 2 and offered another reading in 4. A server check of the reply is the owner's call. Checklist rows 5 and 9 to 12 not run | AI Copilot | P2 | Building | #81, #84, #125, #208 | `features/chat-ask-back.md` |
 | `WEB-1` | Feature | Landing page at `/landing`: a 3D night lake with the logo's creature, and a scroll story through sources, the Bronze/Silver/Gold layers, the assistant, dashboards, governance and open source. Copy limited to what is built | Business | P2 | In Acceptance | #107 | `superpowers/plans/2026-10-11-landing-page.md` |
 | `REL-3` | Task | `package-lock.json` is stale: it lacks packages `package.json` lists (`@dnd-kit/core` and others). Delete it (bun is the package manager; CI and the Dockerfile read `bun.lock`) or regenerate it, in a PR of its own | Delivery | P3 | Done | TBD | WEB-1 review round 1 |
-| `REL-4` | Task | Move the console to TypeScript 7 (the new compiler); dependabot #136 fails typecheck and build. Dependabot ignores TypeScript majors until this is planned. **Blocked by** an outside release: TypeScript 7.0 ships no JavaScript API, so typescript-eslint and `next build` cannot run on it; typescript-eslint waits for 7.1's new API (checked 2026-10-16) | Delivery | P3 | Todo |  | `superpowers/plans/2026-10-14-deps-triage.md` |
+| `REL-4` | Task | Move the console to TypeScript 7 (the new compiler); dependabot #136 fails typecheck and build. Dependabot ignores TypeScript majors until this is planned. **Blocked by** an outside release: TypeScript 7.0 ships no JavaScript API, so typescript-eslint and `next build` cannot run on it; typescript-eslint waits for 7.1's new API (checked 2026-10-16). Checked 2026-10-30: still blocked (TypeScript 7.1 is in beta; typescript-eslint 8.72 supports TypeScript below 6.1) | Delivery | P3 | Blocked |  | `superpowers/plans/2026-10-14-deps-triage.md` |
 | `REL-5` | Task | Move to eslint 10 and its flat-config changes; dependabot #143 fails lint. Dependabot ignores eslint majors until this is planned | Delivery | P3 | Done | #179 | `superpowers/plans/2026-10-14-deps-triage.md` |
-| `REL-6` | Task | Move the data grids to TanStack Table 9; dependabot #133 fails typecheck. Dependabot ignores its majors until this is planned. **Blocked by `BLD-1`, `BLD-2`**: v9 changes the column type generics, so every column file changes, `src/features/pipelines/pipeline-columns.tsx` among them, which the pipelines lane holds until those merge | Delivery | P3 | Todo |  | `superpowers/plans/2026-10-14-deps-triage.md` |
-| `REL-7` | Task | arrow and parquet 60 with a newer `iceberg` crate: `iceberg = "=0.10.1"` still uses arrow 58, so #139, #140 and #142 fail to compile. **Blocked by** an `iceberg` release on arrow 60 (outside the repo); dependabot now groups the three. aes-gcm 0.11 waits for the same release: iceberg brings 0.10.3, and 0.11 alone would put a second AEAD stack in the graph (#213 closed 2026-10-23; dependabot ignores its minor and major updates until then) | Delivery | P3 | Todo |  | `superpowers/plans/2026-10-14-deps-triage.md` |
+| `REL-6` | Task | Move the data grids to TanStack Table 9; dependabot #133 fails typecheck. Dependabot ignores its majors until this is planned. **Blocked by `BLD-1`, `BLD-2`**: v9 changes the column type generics, so every column file changes, `src/features/pipelines/pipeline-columns.tsx` among them, which the pipelines lane holds until those merge. Checked 2026-10-30: still blocked (`BLD-1` is still building, and open PRs #250, #264 and #277 change column files) | Delivery | P3 | Blocked |  | `superpowers/plans/2026-10-14-deps-triage.md` |
+| `REL-7` | Task | arrow and parquet 60 with a newer `iceberg` crate: `iceberg = "=0.10.1"` still uses arrow 58, so #139, #140 and #142 fail to compile. **Blocked by** an `iceberg` release on arrow 60 (outside the repo); dependabot now groups the three. aes-gcm 0.11 waits for the same release: iceberg brings 0.10.3, and 0.11 alone would put a second AEAD stack in the graph (#213 closed 2026-10-23; dependabot ignores its minor and major updates until then). Checked 2026-10-30: still blocked (`iceberg` 0.10.1 is the newest release, on arrow 58) | Delivery | P3 | Blocked |  | `superpowers/plans/2026-10-14-deps-triage.md` |
 | `REL-8` | Task | `next` and `eslint-config-next` 16.1.6 → 16.4.0: CI's `bun run build` fails with "Failed to load external module next/dist/compiled/next-server/app-page-turbo.runtime.prod.js: TypeError: Expected CommonJS module to have a function wrapper ... this is a bug in Bun"; the same lockfile builds locally on Bun 1.3.12 and 1.3.14. Try a newer Bun in CI, or report it to Bun | Delivery | P3 | Done | #170 | dependabot #131; `superpowers/plans/2026-10-14-deps-triage.md` |
 | `SEC-6` | Task | Stop older API handlers from returning internal error text. Closed by `SEC-11`'s change: no handler builds a response from an error's text, and `tests/sec11_guard.rs` fails the build if one does | Administration & Security | P2 | Done | #105 | `AGENTS.md` |
 | `SEC-16` | Task | Cross-tenant leaks in the Data module: the ingestible-connectors route, one shared upload namespace, a message naming another tenant's upload table, annotation edits without the tenant gate | Administration & Security | P2 | Done | #87 | Data module code audit |
@@ -210,7 +212,7 @@ estimate (S, M, L), which the base has no field for.
 | `SEC-37` | Task | Default credentials left in code after `SEC-18`: `rustfsadmin` fallbacks in `ops/g3/g3_loadgen.py`, `ops/g6/g6_ingest_matrix_test.py` and `dagster/dispar_orchestrate/dlt_pipeline.py`, and `postgres://lakehouse:lakehouse@localhost` as `DATABASE_URL`'s default in `lakehouse-api` `config.rs`. Compose always sets them now, so none is reached in a compose start | Administration & Security | P2 | Done | [#238](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/238) | PR #83 review |
 | `SEC-19` | Task | The query cost estimate runs raw SQL without the read-only check or table-function block, and returns database error text. The error-text half is met by `SEC-11`'s query-author exception. The author sees the engine's diagnosis with the version and addresses trimmed, and other routes still answer the fixed message | Administration & Security | P2 | Done | #203 | `routes/query.rs` |
 | `SEC-20` | Task | Queries are not scoped to the tenant: no tenant gate on query runs; saved queries listed for everyone | Administration & Security | P2 | In Progress | #244, #263 | `routes/query.rs` |
-| `SEC-50` | Task | Dashboards, gold export, alerts and authored pipelines are not scoped to the tenant: they call the role rewrite directly, not the query path that `SEC-20` gates | Administration & Security | P2 | Todo |  | `routes/dashboard.rs` |
+| `SEC-50` | Task | Dashboards, gold export, alerts and authored pipelines are not scoped to the tenant: they call the role rewrite directly, not the query path that `SEC-20` gates | Administration & Security | P2 | In Progress | #281 (slice 1: pipelines and Gold export) | `routes/dashboard.rs` |
 | `SEC-54` | Task | The `SEC-20` review follow-ups that wait for open PRs: "used by" on a table is resolved against the first tenant, not `X-Tenant` (`catalog_governance.rs`, held by an open PR); the operator docs say an unset `CATALOG_TENANT_ID` refuses only the catalog and the job list, although with the four seeded tenants it refuses every Silver and Gold query for anyone without `*:*` (`.env.example`, `README.md`, `docker-compose.yml`, `docs/OPERATIONS.md`); a save without a tenant stores `tenant_id NULL`, which the catalog's tenant then sees, and `ON DELETE SET NULL` does the same for a deleted tenant's rows (needs the owner's decision) | Administration & Security | P2 | Todo |  | PR #244 review |
 | `SEC-21` | Task | Downloads re-run SQL rewritten for an older policy; whole results buffered before the 2,000-row cut | Administration & Security | P2 | Done | #203 | `routes/query.rs` |
 | `SEC-12` | Feature | Embed tokens: require an expiry, allow revocation, keep the signing secret out of plain text, set a frame-ancestors policy | Administration & Security | P2 | In Acceptance | #105, #201 | `lakehouse-embed` |
@@ -233,7 +235,7 @@ estimate (S, M, L), which the base has no field for.
 | `SEC-43` | Task | The row-filter validator checked only a function's arguments, an operator's sides and a column's last name part; every other part of a call, any operator and any qualifier now must match a fixed shape | Administration & Security | P2 | Done | #205 | `SEC-32` follow-up, batch review 2026-10-17 |
 | `SEC-44` | Task | A checked row filter could print differently from how it was checked: two signs in a row printed as a `--` comment, a text could span lines, and `LIKE ANY` was not checked | Administration & Security | P2 | Done | #207 | PR #205 review |
 | `SEC-45` | Task | Approving an access request does not check that the approver holds the permission they approve (`decide_access_request`), the gap `#106` closed for direct grants | Administration & Security | P1 | Done | [#238](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/238) | `#106` review round 1 (BLOCKER 4 note) |
-| `SEC-34` | Task | Calculated-field names read back from storage enter the SQL as a plain alias, not re-validated (`fields.rs` `row_to_field`, `builder.rs`). Not reachable through the API; wrap the name in `Ident` on read | Administration & Security | P2 | Todo |  | PR #104 review SHOULD-FIX 2 |
+| `SEC-34` | Task | A calculated-field name read back from storage entered the statement as a plain alias, without the check the save does, and the table can be written directly. The read checks the name again and leaves a row whose name is not an identifier, or is longer than 64 characters, out of every read | Administration & Security | P2 | Done | #285 | PR #104 review SHOULD-FIX 2 |
 | `BI-27` | Task | Whole-result export holds up to three copies of 100,001 rows and mart exports have no time or byte limit (`dashboard.rs`). Take the rows instead of cloning, add a byte cap and a timeout, or stream | Dashboards | P2 | Todo |  | PR #104 review SHOULD-FIX 3 |
 | `BI-28` | Task | Export honesty: negative `Int64` values are written `'-5` (decide number columns from `result.meta`); a file can include rows a tile skipped with nothing saying so (`RecordsSql.skipped` dropped); a raw table with a calculated column cannot be exported (400) | Dashboards | P2 | Todo |  | PR #104 review SHOULD-FIX 4 |
 | `BI-29` | Task | Dashboard feature code imports `@/services/clients/*` directly in 25 files (was 11): `records.ts`, `table-export.ts`, `filters/use-filter-values.ts` (hand-rolled effect, not `useService`), `click-setting.tsx`. Route them through `@/services` | Dashboards | P2 | Todo |  | PR #104 review SHOULD-FIX 6 |
@@ -254,9 +256,9 @@ estimate (S, M, L), which the base has no field for.
 | `BLD-4` | Task | A pipeline that names `ingest_job` in its upstreams runs after every connector's load, not only after the load of its own source table: its sensor counts any `ingest_job` success. Filter by the run's connector and target table, as `DATA-19` does for `file_ingest_job`. | Build | P3 | Done | #189 | `DATA-19` plan, section 5 |
 | `BLD-2` | Feature | Tables that refresh themselves within a target lag set per pipeline, and the same through the assistant. | Build | P3 | In Acceptance | #194 | PRODUCT §2; [spec](specs/bld-2.md) |
 | `BLD-5` | Task | `BLD-2` follow-ups from its last review (round 6 of `docs/superpowers/plans/2026-10-15-bld-2-target-lag.md`): five stale or mis-tagged comments and one copied test helper, no behaviour; and `downstream_without_readers` still runs one query per downstream candidate. | Build | P3 | Done | [#234](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/234) | `BLD-2` plan, round 6 |
-| `BLD-6` | Task | `lag_pipelines_without_readers` (the batched reader check from `BLD-5`) copies the SQL predicate of `count_lag_pipelines_reading`, and its doc says the two "cannot drift". Share the predicate, or add a store test that runs both on the same fixture, and correct the comment (AGENTS.md rule 1). Found in PR #234 review round 1, SHOULD-FIX 1 | Build | P3 | Todo |  | `rust/crates/lakehouse-store/src/pipelines.rs` |
+| `BLD-6` | Task | `lag_pipelines_without_readers` (the batched reader check from `BLD-5`) copies the SQL predicate of `count_lag_pipelines_reading`, and its doc says the two "cannot drift". Share the predicate, or add a store test that runs both on the same fixture, and correct the comment (AGENTS.md rule 1). Found in PR #234 review round 1, SHOULD-FIX 1 | Build | P3 | Done | #280 | `rust/crates/lakehouse-store/src/pipelines.rs` |
 | `SRC-5` | Feature | Real connection test for MongoDB, Kafka, SFTP, Sheets and Oracle sources | Data | P3 | Idea |  | `connector_probe.rs` |
-| `DOC-2` | Task | Step-by-step user guide checked against a running console | Docs | P3 | Todo |  | `reference/user-guide.md` |
+| `DOC-2` | Task | Step-by-step user guide checked against a running console. The planner writes it, later, and the landing page links to it (product owner, 2026-10-30). The guide (every label read from the source) and the footer link merged 2026-10-31; the walk-through on a running console is left | Docs | P3 | In Progress | #286 | `reference/user-guide.md` |
 | `DATA-3` | Feature | Store Gold in open format first; serve from a fast copy. **Blocked by `DATA-4`** and a new ADR that replaces ADR 0010's direction | Build | P3 | Planned |  | ADR 0010; [spec](specs/data-3.md) |
 | `DATA-4` | Feature | Publish Silver in open format. | Build | P3 | Planned |  | `features/gold-publish-per-mart.md`; [spec](specs/data-4.md) |
 | `DATA-5` | Task | Measure outside readers of published tables | Build | P3 | Todo |  | `routes::gold::consumers` |
@@ -267,7 +269,7 @@ estimate (S, M, L), which the base has no field for.
 | `SRC-2` | Feature | Processing over streams | Data | P3 | Idea |  | PRODUCT §2 |
 | `INT-2` | Feature | Search over documents | AI Copilot | P3 | Idea |  | PRODUCT §2 |
 | `GOV-3` | Feature | Lineage that reaches outside systems | Governance | P3 | Idea |  | PRODUCT §2 |
-| `GOV-5` | Task | The audit page lists a chat draft waiting for Confirm, and a request waiting for approval, as Denied with policy `deny`: `outcome_of` in `routes/governance.rs` maps every gate outcome that is not a success to `denied`, on purpose, so a decision that is still open cannot read as a success. Decide whether the two should read Pending | Governance | P3 | Todo |  | `AI-18` checklist row 11, 2026-10-14 |
+| `GOV-5` | Task | The audit page lists a chat draft waiting for Confirm, and a request waiting for approval, as Denied with policy `deny`: `outcome_of` in `routes/governance.rs` maps every gate outcome that is not a success to `denied`, on purpose, so a decision that is still open cannot read as a success. Decided 2026-10-30 (product owner): both read Pending | Governance | P3 | Done | #282 | `AI-18` checklist row 11, 2026-10-14 |
 | `ADM-1` | Feature | Several organisations in one install | Administration & Security | P3 | Idea |  | PRODUCT §2 |
 | `ADM-2` | Feature | Workspace settings that can be changed | Administration & Security | P3 | Idea |  | `README.md` |
 | `OPS-2` | Feature | Install with no internet access | Platform | P3 | Idea |  | Sales playbook (older; re-check) |
@@ -289,7 +291,8 @@ estimate (S, M, L), which the base has no field for.
 | `BI-36` | Task | The PDF print view (`render-view.tsx`, `BI-1`) still reads an uploaded map's boundary through the signed-in loader, so a map tile in a server-made PDF can redirect to sign-in instead of drawing; the public and embed views got their own token routes in #246 (`PR #246 review BLOCKER 1`), the print view needs the same | Dashboards | P2 | Todo |  | #246 developer handoff |
 | `OPS-11` | Task | Next.js 16.4 (on `main`) blocks the dev server's own resources for any origin but `localhost`, so a console dev server opened by a LAN address never finishes loading. Read the allowed dev origins from an environment variable (`allowedDevOrigins`), empty by default, and document it in `.env.example`. Found at the phase 3 QA, 2026-10-17 | Operations | P3 | Done | #229 | phase 3 QA |
 | `OPS-12` | Task | The `Rust · test (stable)` CI job runs out of disk on the runner: PR #186 (DATA-17 uploads) and its stacked branch died with "No space left on device" in the `cargo test --workspace --locked` step (run 40268340415), and commit 820484ba (QS-4) hit the same wall and worked around it by merging two test binaries instead of fixing the cause. Every one of the 68 lakehouse-api integration test binaries links the whole crate with full debug info. Free the runner's disk (delete the toolchains the job never uses) and build this job's test binaries with line tables only | Operations | P1 | Done | [#260](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/260) | PR #186 CI run 40268340415 |
-| `OPS-13` | Task | The reused test Postgres (`lakehouse-test-support`, one labelled testcontainers container shared by every test process) never drops the per-test databases `sqlx::test` leaves behind, so its volume grew to 177.7 GB in three days and filled the dev VM's disk on 2026-10-26 (the T3 server died with it). Drop leftover test databases when the container is reused, or cap it, so a long-lived container cannot fill the disk | Operations | P1 | Todo |  | dev VM disk full, 2026-10-26 |
+| `OPS-13` | Task | The reused test Postgres (`lakehouse-test-support`, one labelled testcontainers container shared by every test process) never drops the per-test databases `sqlx::test` leaves behind, so its volume grew to 177.7 GB in three days and filled the dev VM's disk on 2026-10-26 (the T3 server died with it). Drop leftover test databases when the container is reused, or cap it, so a long-lived container cannot fill the disk. The sweep drops the leftovers of every test process; dropping each `lakehouse_api_test_*` database at the end of its own test waits for #192. The sweep can also take a database a paused test still needs: it drops a database that had no backend at two passes in a row, which is 30 to 60 seconds after its last query, and sqlx's pool closes an idle connection after one second, so a test that pauses for more than about a second between its queries can lose its database | Operations | P1 | Done | [#269](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/269) | dev VM disk full, 2026-10-26 |
+| `OPS-14` | Task | `Coverage & SBOM` fails on `main` on every push since `a873d6ea` (19 runs as of 2026-10-28: 18 failed in the `cargo llvm-cov` step (10 with a recorded step failure, 8 with the job lost at the runner level), 1 cancelled): the `cargo llvm-cov (lcov)` job runs out of disk on the GitHub runner ("No space left on device", run 40667618517; the first red run since `a873d6ea` is 40265593360). The `SBOM (CycloneDX)` job succeeds in every one of those runs. The last two green runs, before the disk failure started, took 27m30s and 29m03s, so 30 minutes is the next wall. Free the runner's disk the way the test job does, build with line tables only, and raise the job's timeout to 90 minutes. `ci.yml`'s 40-minute test budget was the next wall: its three last green runs on `main` took 39m18s, 30m07s and 36m12s and the longest took 39m27s, and the job was cancelled at the 40-minute budget in three runs on 2026-10-28, so the job now gets 60 minutes | Operations | P1 | Done | [#269](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/269) | CI run 40667618517; CI run 40265593360 |
 | `OPS-4` | Task | Fail loudly when the application database is unreachable | Platform | P3 | Done | [#234](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/234) | `docs/OPERATIONS.md` |
 | `OPS-6` | Feature | Log and trace viewer | Operations | P3 | Idea |  | `docs/archive/FEATURE_COVERAGE.md` |
 | `BIZ-1` | Feature | Enterprise edition | Business | P3 | Idea |  | PRODUCT §1 |
@@ -310,7 +313,7 @@ parity), built after it.
 
 | Item | Status | Blocked by | Blocks |
 | --- | --- | --- | --- |
-| `BI-18` | Building | — | `AI-2`, `AI-9` (templates part), `QS-5` (the dashboard date filter) |
+| `BI-18` | Building | — | `AI-2`, `AI-9` (templates part) |
 | `BI-14` | Planned | — | `AI-13` |
 | `BI-16` | Building | — | `AI-5` (per chart type as it lands) |
 | `BI-17` | Building | — | `AI-8` |
@@ -318,8 +321,8 @@ parity), built after it.
 | `BLD-1` | Building | — | `REL-6` |
 | `DATA-4` | Planned | — | `DATA-3` |
 | `DEC-8` | Decided | — | `AI-11` |
-| `QS-5` | Planned | `BI-18` (the dashboard date filter) | `AI-12` (variables part) |
-| `SEC-14` | Building | — | `SRC-4` (credentials) |
+| `QS-5` | Planned | — | `AI-12` (variables part) |
+| `SEC-20` | In Progress | — | `QS-3` |
 | `AI-11` | Planned | `BI-19`, `DEC-8` | — |
 | `AI-12` | Building | `QS-5` (variables part) | — |
 | `AI-13` | Planned | `BI-14` | — |
@@ -328,12 +331,12 @@ parity), built after it.
 | `AI-8` | Building | `BI-17` | — |
 | `AI-9` | Building | `BI-18` (templates part) | — |
 | `DATA-3` | Planned | `DATA-4` | — |
-| `REL-6` | Todo | `BLD-1` | — |
-| `SRC-4` | Planned | `SEC-14` (credentials) | — |
+| `QS-3` | Planned | `SEC-20` | — |
+| `REL-6` | Blocked | `BLD-1` | — |
 
 **Ready to start** (Todo, Planned or Idea, nothing open blocks it; Idea items still need a spec):
 
-`ADM-1`, `ADM-2`, `AI-10`, `AI-21`, `AI-22`, `BI-14`, `BI-20`, `BI-27`, `BI-28`, `BI-29`, `BI-3`, `BI-30`, `BI-31`, `BI-32`, `BI-33`, `BI-34`, `BI-35`, `BI-36`, `BIZ-1`, `BIZ-2`, `BLD-10`, `BLD-6`, `DATA-20`, `DATA-21`, `DATA-22`, `DATA-23`, `DATA-24`, `DATA-25`, `DATA-26`, `DATA-27`, `DATA-28`, `DATA-29`, `DATA-30`, `DATA-31`, `DATA-32`, `DATA-33`, `DATA-34`, `DATA-36`, `DATA-4`, `DATA-5`, `DATA-6`, `DATA-8`, `DOC-2`, `GOV-1`, `GOV-3`, `GOV-5`, `INT-2`, `OPS-13`, `OPS-2`, `OPS-3`, `OPS-6`, `OPS-8`, `QA-1`, `QRY-1`, `QS-2`, `QS-3`, `REL-1`, `REL-2`, `REL-4`, `REL-7`, `SEC-22`, `SEC-34`, `SEC-4`, `SEC-40`, `SEC-50`, `SEC-7`, `SRC-15`, `SRC-18`, `SRC-2`, `SRC-22`, `SRC-23`, `SRC-24`, `SRC-25`, `SRC-26`, `SRC-27`, `SRC-28`, `SRC-30`, `SRC-31`, `SRC-33`, `SRC-34`, `SRC-5`, `VER-1`
+`ADM-1`, `ADM-2`, `AI-10`, `AI-21`, `AI-22`, `BI-14`, `BI-20`, `BI-27`, `BI-28`, `BI-29`, `BI-3`, `BI-30`, `BI-31`, `BI-32`, `BI-33`, `BI-34`, `BI-35`, `BI-36`, `BIZ-1`, `BIZ-2`, `BLD-10`, `DATA-20`, `DATA-21`, `DATA-22`, `DATA-23`, `DATA-24`, `DATA-25`, `DATA-26`, `DATA-27`, `DATA-28`, `DATA-29`, `DATA-30`, `DATA-31`, `DATA-32`, `DATA-33`, `DATA-34`, `DATA-36`, `DATA-4`, `DATA-5`, `DATA-6`, `DATA-8`, `GOV-1`, `GOV-3`, `INT-2`, `OPS-2`, `OPS-3`, `OPS-6`, `OPS-8`, `QRY-1`, `QS-5`, `REL-2`, `SEC-34`, `SEC-40`, `SEC-54`, `SEC-55`, `SRC-15`, `SRC-18`, `SRC-2`, `SRC-22`, `SRC-23`, `SRC-24`, `SRC-25`, `SRC-26`, `SRC-27`, `SRC-28`, `SRC-30`, `SRC-31`, `SRC-33`, `SRC-34`, `SRC-4`, `SRC-5`, `VER-1`
 
 ## Dates
 
@@ -343,8 +346,9 @@ set by the product owner and are left empty until they are.
 
 | ID | Started | Shipped | Due |
 | --- | --- | --- | --- |
+| `QS-2` | 2026-10-28 | 2026-10-30 | |
 | `SEC-20` | 2026-10-24 | | |
-| `QS-4` | 2026-10-24 | | |
+| `QS-4` | 2026-10-24 | 2026-10-27 | |
 | `DATA-1` | 2026-10-02 | 2026-10-03 | |
 | `SEC-2` | 2026-10-02 | 2026-10-03 | |
 | `SEC-5` | 2026-10-02 | 2026-10-03 | |
@@ -355,7 +359,8 @@ set by the product owner and are left empty until they are.
 | `AI-17` | | 2026-10-08; late-ask wording 2026-10-18 (#208) | |
 | `AI-15` | | first run 2026-10-15 | |
 | `BLD-4` | 2026-10-15 | 2026-10-16 | |
-| `SEC-14` | 2026-10-08 | first PR, 2026-10-08 | |
+| `SEC-14` | 2026-10-08 | first PR, 2026-10-08; part B, 2026-10-28 (#192) | |
+| `SEC-22` | 2026-10-16 | 2026-10-30 (#187) | |
 | `SEC-15` | 2026-10-08 | 2026-10-08 | |
 | `DATA-11` | 2026-10-09 | 2026-10-09 | |
 | `DATA-12` | 2026-10-09 | 2026-10-21 | |
@@ -393,13 +398,16 @@ set by the product owner and are left empty until they are.
 | `SEC-46` | 2026-10-21 | 2026-10-21 | |
 | `OPS-11` | 2026-10-23 | 2026-10-23 | |
 | `OPS-12` | 2026-10-26 | 2026-10-26 | |
+| `OPS-13` | 2026-10-28 | 2026-10-28 | |
+| `OPS-14` | 2026-10-28 | 2026-10-28 | |
 | `SEC-48` | 2026-10-23 | 2026-10-23 | |
 | `OPS-10` | 2026-10-23 | 2026-10-23 | |
 | `QS-1` | 2026-10-23 | 2026-10-23 | |
 | `OPS-9` | 2026-10-23 | 2026-10-23 | |
 | `OPS-4` | 2026-10-23 | 2026-10-23 | |
 | `BLD-5` | 2026-10-23 | 2026-10-23 | |
-| `BLD-6` | | | |
+| `BLD-6` | 2026-10-30 | 2026-10-30 (#280) | |
+| `GOV-5` | 2026-10-30 | 2026-10-30 (#282) | |
 | `SEC-45` | 2026-10-23 | 2026-10-24 | |
 | `SEC-37` | 2026-10-23 | 2026-10-24 | |
 | `SEC-25` | 2026-10-23 | 2026-10-24 | |
@@ -466,6 +474,8 @@ set by the product owner and are left empty until they are.
 | `SEC-49` | 2026-10-25 | 2026-10-26 | |
 | `BI-4` | 2026-10-24 | 2026-10-26 | |
 | `BI-5` | 2026-10-24 | 2026-10-26 | |
+| `SEC-53` | 2026-10-26 | 2026-10-26 | |
+| `DATA-35` | 2026-10-26 | 2026-10-28 | |
 | `SEC-54` | 2026-10-26 | 2026-10-26 | |
 | `SEC-52` | 2026-10-24 | 2026-10-24 | |
 | `BI-1` | 2026-10-17 | 2026-10-26 | |
@@ -609,6 +619,7 @@ builds it (`AGENTS.md`).
 | [`DATA-17`](specs/data-17.md) | More formats, more files, bigger files | Next | M |
 | [`DATA-18`](specs/data-18.md) | Column types on upload | Next | M |
 | [`DATA-19`](specs/data-19.md) | Uploaded tables feed pipelines and dashboards | Next | M |
+| [`DATA-35`](specs/data-35.md) | Folders for uploaded files | Next | S |
 | [`SRC-4`](specs/src-4.md) | More databases, with live change capture | Next | L |
 | [`SRC-3`](specs/src-3.md) | Connectors for business apps | Later | L |
 

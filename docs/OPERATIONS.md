@@ -723,6 +723,55 @@ API refuses to dial an internal address unless the operator allows it:
 The CI gates that save ingest specs aimed at compose-network fixtures set the
 variable themselves, in their own override (`ops/g6/`), marked gate-only.
 
+### Connector TLS and certificate verification (`SEC-14` part B)
+
+Connector connection tests (`POST /api/connectors/{id}/test`), table discovery
+(`POST /api/connectors/{id}/discover`), and CDC clean-up require TLS for
+PostgreSQL and SQL Server dials:
+
+- **PostgreSQL connection test (`pg_probe`):** Connection tests send an
+  `SSLRequest` before the PostgreSQL startup packet. If the server declines TLS
+  (responds `N`), the probe fails immediately without sending credentials. The
+  probe only negotiates `SCRAM-SHA-256`; if the server requests clear-text
+  (`AuthenticationCleartextPassword`) or MD5 (`AuthenticationMD5Password`)
+  authentication, the probe refuses and terminates the connection without
+  transmitting the password. Plain `SCRAM-SHA-256` without channel binding
+  is used (`channel_binding=disable`); without a CA certificate configured,
+  a relaying server performing a man-in-the-middle attack cannot be detected.
+- **Certificate verification (`CONNECTOR_TLS_CA_FILE`):**
+  - Unset or empty: PostgreSQL and SQL Server dials require encryption
+    (`Require` / `EncryptionLevel::Required`) without checking the server
+    certificate against a custom root CA.
+  - Set to a PEM file path: the PostgreSQL connection test (`pg_probe`) verifies
+    the server certificate and the host name (`verify-full`) against that bundle
+    alone. The `sqlx` dials (table discovery, table listing, CDC clean-up)
+    verify the chain only (`VerifyCa`): they dial the approved address rather
+    than the name, so a name check could never pass; they trust the bundle
+    plus the public webpki roots `sqlx` ships with. SQL Server dials verify the
+    server certificate against that CA bundle via Tiberius's `trust_cert_ca`,
+    which adds the CA to the native system roots (so SQL Server accepts either
+    the configured CA or any public root, unlike the PostgreSQL connection
+    test, which trusts only the configured CA bundle).
+  - If `CONNECTOR_TLS_CA_FILE` is set to an unreadable or non-existent path,
+    or contains no valid PEM certificates, `lakehouse-api` fails fast at startup
+    with an error naming the variable.
+- **Docker Compose:** The default `docker-compose.yml` includes a one-shot
+  `postgres-cert-init` service that generates a local CA and server certificate
+  (SAN `DNS:postgres`) into the named volume `lakehouse_postgres_tls`. The
+  bundled `postgres` container runs with `ssl=on`. `lakehouse-api` mounts this
+  CA at `/run/certs/postgres/ca.crt` and defaults
+  `CONNECTOR_TLS_CA_FILE=/run/certs/postgres/ca.crt`, allowing the seeded
+  `conn-pg-lakehouse` connector test to pass over `verify-full`.
+- **Operators with external databases:**
+  - Because `docker-compose.yml` defaults `CONNECTOR_TLS_CA_FILE` to
+    `/run/certs/postgres/ca.crt` if unset or empty via `${CONNECTOR_TLS_CA_FILE:-/run/certs/postgres/ca.crt}`,
+    it cannot be cleared to empty in `.env`.
+  - To connect to external databases using custom internal CAs or public system
+    roots alongside the bundled PostgreSQL, create a combined CA bundle containing
+    the bundled CA (`/run/certs/postgres/ca.crt`) plus your corporate internal CA
+    or system root certificates. Mount the combined bundle into the `lakehouse-api`
+    container and set `CONNECTOR_TLS_CA_FILE` to its mounted path.
+
 ### Connector credentials at rest (`SRC-12`, ADR 0002 addendum 5)
 
 A credential typed in the console is stored on the `connector_secrets`
@@ -1519,6 +1568,94 @@ present.
 
 A malformed value fails startup rather than quietly disabling the check. With
 the setting unset, the API logs one warning at boot naming it.
+
+### Where the setting is described
+
+`CATALOG_TENANT_ID` is one environment variable of the API service. It is
+declared in `docker-compose.yml` with an empty default — an unset value
+degrades to the documented refusal, not a boot failure — and listed in
+`.env.example` with a comment that says the same thing as this section
+and this page's "What the setting is for now" below. The API reads it
+at startup (`Config::catalog_tenant_id`), and every route that answers
+"may this caller read the shared catalog" asks the same question of it —
+there is no second setting and no second rule.
+
+### What the setting is for now (`SEC-50`)
+
+The setting is no longer about two lists. Every statement that reads
+the shared catalog passes one tenant gate, and the deployment's shared
+catalog belongs to the tenant this setting names:
+
+- **the authored pipelines** act as their own tenant
+  (`pipeline_definition.tenant_id`), so a pipeline of tenant B can no
+  longer read a `bronze.*` upload table that tenant A claimed;
+- **the Gold export** is gated by whoever asked for it: a signed-in
+  person acts as themselves, so their own tenant must own the shared
+  catalog, while a service identity or the shared run token — the
+  scheduled export, a manual trigger done as a service — has no user
+  behind it and acts as the tenant that owns the shared catalog. The
+  assistant's own tool is a **signed-in person's** call, so it is gated as
+  that person, not as the catalog's tenant. A deployment with several
+  tenants and no `CATALOG_TENANT_ID` **refuses the job-with-no-user
+  export outright**, with a 422 that names this setting; a signed-in
+  person of another tenant is refused too, but with the gate's own 404
+  (the mart reads "not available to your organisation");
+- the **dashboards, the embeds, the public links and the alerts** read the
+  same shared catalog and follow in the second slice of `SEC-50`. They are
+  **not** gated yet, so they still serve what they served before.
+
+**What this means for an operator.** On a deployment with more than one
+tenant, this setting is **required** for the gated paths to work at all:
+without it there is no catalog tenant in the first place, so a job with
+no user (the Gold export) is refused with the 422 that names this
+setting, and through the paths the tenant gate covers (Query Studio, the
+authored pipelines) a member reads only the uploads their own tenant
+claimed. The dashboards, the embeds, the public links and the alerts are
+not gated yet, so a member of another tenant still sees what those paths
+show today. With the setting set, the members of that tenant read the
+shared catalog as before, and the other tenants read only their own
+uploads. A **single-tenant** deployment is unaffected either way.
+
+### Authored pipelines with no tenant (`SEC-50`)
+
+Migration `0042_tenant_provisioning.sql` added `tenant_id` to
+`pipeline_definition` and **backfilled nothing**: every pipeline created
+before that migration has a NULL tenant, and so has every pipeline an
+operator created without a tenant. `SEC-50` refuses such a pipeline — its
+enforce call (`POST /api/pipelines/runnable/{id}/enforce`, the one the
+orchestrator makes) answers **409** with:
+
+```
+This pipeline belongs to no tenant. An administrator assigns one with PUT /api/pipelines/{id}/tenant.
+```
+
+A pipeline whose **author** holds the unrestricted (`*:*`) grant is
+exempt: such an author reads every table anyway, so its pipeline is not
+refused for a tenant it never had.
+
+**How to find them.** `GET /api/pipelines` is scoped to the caller's own
+tenant, so an unassigned pipeline is invisible there — that is the point
+of the scoping, and it is also why the database is the place to look:
+
+```sql
+SELECT id, name, run_as FROM pipeline_definition WHERE tenant_id IS NULL;
+```
+
+One exception, so the sentence above is not read as "nobody can see them":
+a Platform Admin (`*:*`) who belongs to no tenant of their own sees every
+authored pipeline on that list, unassigned ones included (PR #281 review
+round 2 NIT).
+
+**How to assign one.** `PUT /api/pipelines/{id}/tenant` with the tenant's
+id — the route requires the `identity:write` permission (PR #281 review
+round 2 NIT):
+
+```json
+{ "tenantId": "11111111-1111-4111-8111-000000000001" }
+```
+
+The route answers 404 for an unknown pipeline id or an unknown tenant id
+(the same status for both), and 204 on success.
 
 ## Gold export: growth and background merges
 

@@ -2025,6 +2025,7 @@ async fn run_probe(
         resolver,
         &state.config.connector_internal_hosts(),
         state.config.oauth_settings(),
+        state.config.connector_tls_ca(),
     )
     .await
 }
@@ -2335,6 +2336,7 @@ pub async fn discover(
         query.schema.as_deref(),
         state.connector_secret_resolver.as_ref(),
         &state.config.connector_internal_hosts(),
+        state.config.connector_tls_ca(),
     )
     .await?;
     Ok(ApiJson(result))
@@ -2991,19 +2993,24 @@ async fn deprovision_with_names(
         password,
         database: target.database.clone(),
     };
-    connector_deprovision::drop_slot_and_publication(&pg_target, slot_name, publication_name)
-        .await
-        .map_err(|err| {
-            // SEC-15: `sqlx`'s own text stays in the log; the response gets
-            // `DeprovisionError::summary`.
-            tracing::warn!(connector_id = %id, error = %err, "CDC deprovisioning failed");
-            ApiError::Internal(deprovision_error_message(
-                id,
-                slot_name,
-                publication_name,
-                &err,
-            ))
-        })
+    connector_deprovision::drop_slot_and_publication(
+        &pg_target,
+        slot_name,
+        publication_name,
+        state.config.connector_tls_ca(),
+    )
+    .await
+    .map_err(|err| {
+        // SEC-15: `sqlx`'s own text stays in the log; the response gets
+        // `DeprovisionError::summary`.
+        tracing::warn!(connector_id = %id, error = %err, "CDC deprovisioning failed");
+        ApiError::Internal(deprovision_error_message(
+            id,
+            slot_name,
+            publication_name,
+            &err,
+        ))
+    })
 }
 
 /// Render a [`DeprovisionError`] into text safe to put in a 409/500 body or
@@ -3791,10 +3798,14 @@ async fn save_with_credentials(
     // the secret manager.
     resolve_references(state, &mut changes, "the change was NOT saved").await?;
     let resolver = candidate_resolver(state, &changes);
+    // `probe`, not `probe_with`: this save-time test has always run with the
+    // default `OAuth2` settings, and this change is about the TLS CA only.
+    // (`SEC-14` part B, D5.)
     let outcome = crate::connector_probe::probe(
         &candidate,
         &resolver,
         &state.config.connector_internal_hosts(),
+        state.config.connector_tls_ca(),
     )
     .await;
     if outcome.supported && !outcome.ok {
