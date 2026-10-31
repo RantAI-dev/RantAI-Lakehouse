@@ -34,11 +34,14 @@ describe("GoldExportsPage", () => {
         })
       }
       if (url.includes("/consumers")) {
+        // Outside reading is off until an operator publishes storage at
+        // OUTSIDE_S3_ENDPOINT (DATA-5 D4/D7): the route answers
+        // `supported: false` with the reason and a null list.
         return jsonResponse({
           mart: "sales",
-          consumers: null,
           supported: false,
-          reason: "Trino query-history correlation for Gold marts is not implemented",
+          consumers: null,
+          reason: "Outside reading is not set up: OUTSIDE_S3_ENDPOINT is not set.",
         })
       }
       if (url.includes("/api/gold/exports")) {
