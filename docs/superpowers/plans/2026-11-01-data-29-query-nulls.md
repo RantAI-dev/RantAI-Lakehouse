@@ -142,3 +142,25 @@ read before use)
   (`query-grid-tools.ts:34`).
 
 ## Review (planner appends below)
+
+### Review round 1 (planner, 2026-11-01, at `1c79e948`)
+
+- **D1.** `cell_value` returns `Value::Null` for `None` and `Null`, and the same text as before
+  for everything else. It is used for both engines.
+- **D2.** `cell_byte_cost` already charged 5 for null, so it was kept, and now says why.
+- **D3.** The assistant tools pass null through, and `citations.rs` already skipped it. The tool
+  schemas are unchanged.
+- **D4.** Downloads are untouched.
+- **D5.** The g9 comment is corrected, and its text read handles null. Its `isNull` checks are
+  unchanged.
+- **Tests:**
+  - a ClickHouse route test (`tests/query_history.rs`);
+  - a Trino route test (`query.rs`, through `test_state_with_trino`);
+  - unit tests for null versus empty, and the byte cost;
+  - an assistant tool test.
+- The developer also ran the ClickHouse test by name, because the `query` filter would miss it.
+  Good catch.
+- **The developer's counts:** `query` 517 pass, `ai::` 880 pass, console queries 138 pass. Fmt
+  and clippy are clean.
+
+**Open: no BLOCKER, no SHOULD-FIX.** CI runs the workspace.
