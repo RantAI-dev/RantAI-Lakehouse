@@ -1540,8 +1540,13 @@ struct HealthBody {
 /// This is a different question from [`health`], which stays a liveness
 /// probe: an installer or an updater waits on THIS route, and the ops
 /// gates keep polling `/health`.
+///
+/// The answer is reused for two seconds (REL-2 S1 review SHOULD-FIX 1):
+/// this route is public, so a loop of anonymous requests must not turn
+/// into a Postgres query, a `ClickHouse` query and a Lakekeeper call
+/// each.
 async fn ready(State(state): State<AppState>) -> Response {
-    let body = crate::readiness::ReadyBody::new(crate::readiness::probe(&state).await);
+    let body = crate::readiness::ready_body(&state).await;
     let status = if body.ready {
         StatusCode::OK
     } else {

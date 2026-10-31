@@ -34,6 +34,30 @@
 //! is in the log, under the same line the probe wrote, not in the response:
 //! a readiness route is public, so its body is read by anything that can
 //! reach the port.
+//!
+//! # The answer is reused for two seconds
+//!
+//! This route is PUBLIC (no token, see `crate::policy`'s table), and every
+//! call it made fanned out into a Postgres query, a `ClickHouse` query and
+//! a `Lakekeeper` HTTP call that reads a token file. A loop of anonymous
+//! requests therefore turned into three times as much backend load, so the
+//! computed answer is reused for [`CACHE_WINDOW`] and callers that arrive
+//! together share ONE probe (REL-2 S1 review SHOULD-FIX 1).
+//!
+//! The window is short on purpose: an updater waits on this route for a
+//! NEW version (REL-2 slice S4), so the answer must never report a
+//! dependency that broke more than two seconds ago.
+//!
+//! # One HTTP client, and no redirects
+//!
+//! The catalog probe used to build a `reqwest::Client` per call — and
+//! every client owns a connection pool — with redirects ON. There is now
+//! ONE shared client, and it does not follow redirects: the probe answers
+//! with the catalog's reader token, so a redirect must not carry that
+//! token to another host (REL-2 S1 review SHOULD-FIX 1).
+
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
@@ -53,7 +77,15 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// route is polled (by `docker compose`'s health check, by an updater
 /// waiting for a new version), so a dead dependency must never make the
 /// answer wait on a socket timeout.
-const PROBE_TIMEOUT: std::time::Duration = crate::health::PROBE_TIMEOUT;
+const PROBE_TIMEOUT: Duration = crate::health::PROBE_TIMEOUT;
+
+/// How long a computed readiness answer is reused before a read
+/// re-probes (REL-2 S1 review SHOULD-FIX 1).
+///
+/// Two seconds: long enough that a poll loop does not turn into one
+/// probe per request, short enough that the route never reports a
+/// dependency that broke more than a moment ago.
+const CACHE_WINDOW: Duration = Duration::from_secs(2);
 
 /// The purpose and env var [`read_token_file`] names when the reader token
 /// cannot be read — the same pair `routes::lakehouse` uses for the same
@@ -129,16 +161,100 @@ impl ReadyBody {
     }
 }
 
+/// The readiness cache: the last computed [`ReadyBody`] and the moment it
+/// was computed (REL-2 S1 review SHOULD-FIX 1).
+///
+/// One entry, not a map: this process answers for ONE deployment, so
+/// there is one readiness answer to cache. The lock is held ACROSS the
+/// probe, so callers that arrive together share one probe instead of
+/// each running their own.
+///
+/// It lives in [`crate::state::AppState`] (the same shape as
+/// `crate::health`'s `HealthCache`), so the cache belongs to the
+/// deployment it answers for and not to the process.
+pub type ReadyCache = Arc<tokio::sync::Mutex<Option<(ReadyBody, Instant)>>>;
+
+/// The one HTTP client the catalog probe uses.
+///
+/// `None` when the client could not be built at all (the TLS backend or
+/// the connector refused) — the catalog check then fails closed, with the
+/// reason in the log.
+static HTTP_CLIENT: OnceLock<Option<reqwest::Client>> = OnceLock::new();
+
+/// The shared client, built once.
+///
+/// Redirects are OFF: the probe sends the catalog's reader token, and a
+/// redirect must not carry that token to another host. The client's own
+/// timeout is the probe timeout, so a hung catalog cannot outlast the
+/// probe's own bound (REL-2 S1 review SHOULD-FIX 1).
+fn http_client() -> Option<&'static reqwest::Client> {
+    HTTP_CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(PROBE_TIMEOUT)
+                .build()
+                .inspect_err(|err| {
+                    tracing::warn!(
+                        error = ?err,
+                        "the readiness probe could not build its HTTP client"
+                    );
+                })
+                .ok()
+        })
+        .as_ref()
+}
+
+/// The body of `GET /health/ready`, reused for [`CACHE_WINDOW`].
+///
+/// The public route calls this, so a loop of anonymous requests runs ONE
+/// probe per window instead of one per request (REL-2 S1 review
+/// SHOULD-FIX 1). Callers that arrive together share that probe: the
+/// cache lock is held while the probe runs.
+pub async fn ready_body(state: &AppState) -> ReadyBody {
+    cached_ready_with(&state.readiness_cache, Instant::now, || probe_body(state)).await
+}
+
+/// The body for a fresh set of checks.
+async fn probe_body(state: &AppState) -> ReadyBody {
+    ReadyBody::new(probe(state).await)
+}
+
+/// The core cache logic with an injected clock and probe function, so the
+/// window is tested without sleeping and without a real clock — the same
+/// shape [`crate::health`]'s own cache uses.
+async fn cached_ready_with<F, Fut>(
+    cache: &ReadyCache,
+    now: impl Fn() -> Instant,
+    probe: F,
+) -> ReadyBody
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = ReadyBody>,
+{
+    let mut guard = cache.lock().await;
+    let current = now();
+    if let Some((cached, computed_at)) = guard.as_ref()
+        && current.saturating_duration_since(*computed_at) < CACHE_WINDOW
+    {
+        return cached.clone();
+    }
+    let fresh = probe().await;
+    // The window is measured from the END of the probe, so the answer is
+    // never older than the window says it is.
+    *guard = Some((fresh.clone(), now()));
+    fresh
+}
+
 /// Probe the three dependencies, concurrently.
 ///
 /// Each probe is bounded by [`PROBE_TIMEOUT`], so the whole answer takes
 /// about as long as the slowest dependency, not the sum.
-pub async fn probe(state: &AppState) -> Checks {
-    let http = reqwest::Client::new();
+async fn probe(state: &AppState) -> Checks {
     let (postgres, clickhouse, lakekeeper) = tokio::join!(
         probe_postgres(state),
         probe_clickhouse(state),
-        probe_lakekeeper(&http, state),
+        probe_lakekeeper(state),
     );
     Checks {
         postgres,
@@ -228,7 +344,15 @@ async fn probe_clickhouse(state: &AppState) -> Check {
 /// The reader bearer token is the one the catalog routes use; without it
 /// the catalog refuses (`401`), so a missing token file means "not ready"
 /// — honestly, because the service cannot read the catalog without it.
-async fn probe_lakekeeper(http: &reqwest::Client, state: &AppState) -> Check {
+///
+/// The request goes through the ONE shared client ([`http_client`]), which
+/// does not follow redirects: the reader token must not travel to another
+/// host (REL-2 S1 review SHOULD-FIX 1).
+async fn probe_lakekeeper(state: &AppState) -> Check {
+    let Some(http) = http_client() else {
+        tracing::warn!("the readiness probe has no HTTP client; the catalog check cannot run");
+        return Check::Failed;
+    };
     let token = match read_token_file(
         &state.config.lakekeeper_read_token_file,
         READER_PURPOSE,
@@ -475,5 +599,149 @@ mod tests {
                 StatusCode::SERVICE_UNAVAILABLE
             }
         );
+    }
+
+    /// A state pointed at a `wiremock` catalog, with a throwaway reader
+    /// token file.
+    ///
+    /// The `TempDir` comes back with the state: the token file must
+    /// outlive the probe, and the directory deletes itself on drop.
+    ///
+    /// No `DATABASE_URL` (so the Postgres check fails without dialing
+    /// anything) and a `ClickHouse` URL nothing listens on (so that check
+    /// fails without dialing anything either). The catalog check is the
+    /// one this test measures.
+    fn state_at_catalog(server: &wiremock::MockServer) -> (AppState, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let token = dir.path().join("lakehouse-api-reader.jwt");
+        std::fs::write(&token, "test-reader-token\n").unwrap();
+        let env = std::collections::HashMap::from([
+            ("LAKEKEEPER_CATALOG_URI".to_owned(), server.uri()),
+            (
+                "LAKEKEEPER_READ_TOKEN_FILE".to_owned(),
+                token.to_string_lossy().into_owned(),
+            ),
+            ("CH_URL".to_owned(), "http://127.0.0.1:1".to_owned()),
+        ]);
+        let config = crate::config::Config::from_map(&env).unwrap();
+        (AppState::new(config), dir)
+    }
+
+    /// Two readiness answers inside the window share ONE probe
+    /// (REL-2 S1 review SHOULD-FIX 1): the route is public, so a loop of
+    /// anonymous requests must not turn into a Postgres query, a
+    /// `ClickHouse` query and a Lakekeeper call each.
+    ///
+    /// The catalog mock counts the probes: one call to
+    /// `/v1/config` means the second answer came from the cache.
+    #[tokio::test]
+    async fn two_readiness_answers_within_the_window_probe_once() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/config"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"defaults":{}}"#))
+            .mount(&server)
+            .await;
+        let (state, _token_dir) = state_at_catalog(&server);
+
+        let first = ready_body(&state).await;
+        let second = ready_body(&state).await;
+
+        assert_eq!(first.checks.lakekeeper, Check::Ok);
+        assert_eq!(second.checks.lakekeeper, Check::Ok);
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            1,
+            "the second answer inside the window must reuse the first probe"
+        );
+    }
+
+    /// A read PAST the window re-probes: the cached answer is never older
+    /// than the window says it is (REL-2 S1 review SHOULD-FIX 1).
+    ///
+    /// The clock is the test's own, so this proves the window without
+    /// sleeping for it.
+    #[tokio::test]
+    async fn a_read_past_the_window_re_probes() {
+        let cache: ReadyCache = Arc::new(tokio::sync::Mutex::new(None));
+        let mut clock = FixedClock::new();
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let probe = || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async {
+                ReadyBody::new(Checks {
+                    postgres: Check::Ok,
+                    clickhouse: Check::Ok,
+                    lakekeeper: Check::Ok,
+                })
+            }
+        };
+
+        let _ = cached_ready_with(&cache, || clock.now(), probe).await;
+        clock.advance(3);
+        let _ = cached_ready_with(&cache, || clock.now(), probe).await;
+
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "a read past the 2s window must re-probe"
+        );
+    }
+
+    /// The catalog probe does not follow a redirect (REL-2 S1 review
+    /// SHOULD-FIX 1): it answers with the catalog's reader token, so a
+    /// redirect must not carry that token to another host.
+    #[tokio::test]
+    async fn the_catalog_probe_does_not_follow_a_redirect() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/config"))
+            .respond_with(ResponseTemplate::new(302).insert_header("location", "/somewhere-else"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/somewhere-else"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"defaults":{}}"#))
+            .mount(&server)
+            .await;
+        let (state, _token_dir) = state_at_catalog(&server);
+
+        let body = ready_body(&state).await;
+
+        assert_eq!(body.checks.lakekeeper, Check::Failed);
+        let seen = server.received_requests().await.unwrap();
+        assert!(
+            seen.iter()
+                .all(|request| request.url.path() == "/v1/config"),
+            "the probe followed a redirect: {:?}",
+            seen.iter()
+                .map(|request| request.url.path().to_owned())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// A clock the test moves by hand, so the cache window is tested
+    /// without sleeping (the same shape `crate::health`'s own test
+    /// clock uses).
+    struct FixedClock(Instant);
+
+    impl FixedClock {
+        fn new() -> Self {
+            Self(Instant::now())
+        }
+
+        fn now(&self) -> Instant {
+            self.0
+        }
+
+        fn advance(&mut self, seconds: u64) {
+            self.0 += Duration::from_secs(seconds);
+        }
     }
 }
