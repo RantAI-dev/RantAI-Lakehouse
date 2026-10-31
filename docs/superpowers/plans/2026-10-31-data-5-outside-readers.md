@@ -405,6 +405,109 @@ removed the project's containers and volumes, and the testcontainers the
 cargo tests started were removed
 (`docker ps -q --filter label=org.testcontainers.managed-by=testcontainers | xargs -r docker rm -f`).
 No container is left running.
+### Handoff S2 (developer, 2026-10-31)
+
+Slice S2 (console only, TypeScript). Branch `feat/data-5-outside-readers-console`, based on
+`5b102e9d` (the plan's own commit on `main`).
+
+#### Commits
+
+| Commit | Task | What |
+| --- | --- | --- |
+| `3408c813` | S2-T1 | `feat(console): DATA-5 S2-T1 outside-reader contract and client` |
+| `45717f9a` | S2-T2 | `feat(console): DATA-5 S2-T2 show who read a published Gold mart` |
+| `1e69c604` | S2-T3 | `feat(console): DATA-5 S2-T3 say what iceberg:read opens` |
+
+Files touched:
+
+- `src/services/contracts/gold.ts` — D9's `GoldConsumer` and `GoldConsumers`.
+- `src/services/clients/gold.ts` — the doc comment on `getConsumers` (the implementation was
+  already a pass-through of the route's JSON).
+- `src/services/clients/gold.test.ts` — new: the route URL, the counted shape, the refusal
+  shape, and that a non-OK answer becomes a `ServiceError` rather than a fake count.
+- `src/lib/gold-consumers.ts`, `src/lib/gold-consumers.test.ts` — new: the three states and the
+  per-tool line, in one place, shared by the two pages.
+- `src/features/gold/gold-exports-page.tsx`, `.test.tsx` — the "Consumers (7d)" cell.
+- `src/features/catalog/open-format-card.tsx`, `.test.tsx` — the "Readers (7 days)" row.
+- `src/features/admin/service-identities-page.tsx`, `.test.tsx` — the hint under the scopes
+  field.
+
+One follow-up commit lands after the handoff commit: it rewords the mart row's doc comment in
+`gold-exports-page.tsx` ("best-effort consumer count" → "the count of outside tools that read
+it"), a leftover of the WS6 wording that DATA-5 made stale. Nothing else changed in it.
+
+#### Commands run (all in the foreground, on the final commit)
+
+| Command | Result |
+| --- | --- |
+| `bun install --frozen-lockfile` | 739 packages installed (node_modules was missing) |
+| `bun run typecheck` | clean (no output) — run after each of the three commits |
+| `bun run lint` | 0 errors, 10 warnings — all pre-existing (`react-hooks/exhaustive-deps`, `no-unused-vars`, `no-location-assign`). The count went 11 → 10 because the refactor of the open-format-card mocks removed the `_init` unused-argument warning in that file. |
+| `bun test src/services/clients/gold.test.ts src/features/gold/gold-exports-page.test.tsx` (after S2-T1) | 4 pass, 0 fail, 15 expect() calls, 2 files |
+| `bun test src/lib/gold-consumers.test.ts src/features/gold/gold-exports-page.test.tsx src/features/catalog/open-format-card.test.tsx src/services/clients/gold.test.ts` (after S2-T2) | 29 pass, 0 fail, 61 expect() calls, 4 files |
+| `bun test src/features/admin/service-identities-page.test.tsx` (after S2-T3) | 6 pass, 0 fail, 17 expect() calls |
+
+Before the handoff, the whole console suite, one folder under `src/` at a time, each wrapped in
+`flock /home/shiro/rantai/.heavy.lock`:
+
+| Folder | Result |
+| --- | --- |
+| `src/app` | no test files |
+| `src/components` | 39 pass, 0 fail, 95 expect() calls, 7 files |
+| `src/config` | no test files |
+| `src/features` | 1758 pass, 0 fail, 6412 expect() calls, 165 files |
+| `src/hooks` | no test files |
+| `src/lib` | 1095 pass, 1 skip, 0 fail, 1320 expect() calls, 117 files |
+| `src/services` | 152 pass, 0 fail, 461 expect() calls, 17 files |
+| `src/types` | no test files |
+| `src/proxy.test.ts` (the only test file at `src/`'s root) | 2 pass, 0 fail, 12 expect() calls |
+
+**Total: 3046 pass, 1 skip, 0 fail.** The one skip is pre-existing and unrelated:
+`src/lib/connectors/brand-marks.test.ts` skips its SVG byte-for-byte check when the downloaded
+fixture directory is absent (`it.skipIf(!dir)`).
+
+#### What the console shows, per D10
+
+- Gold Exports page, "Consumers (7d)": the number of tools that read the mart, with one tooltip
+  line per tool (`name: N reads, last <relative time>`); "No reads in 7 days" for a measured
+  zero; "Not measured" with the route's reason when outside reading is not set up.
+- Open-format card, a "Readers (7 days)" row: the same three states, naming up to five tools
+  (`name: N reads, last <relative time>`) and then "and N more".
+- Service identities page, under the scopes field: "`iceberg:read` lets an outside tool read
+  published Gold tables at `<this console's address>`/api/iceberg. Use Rotate to get its key."
+
+#### Notes for the reviewer (choices inside D10, not changes to it)
+
+1. **`consumers: null` under `supported: true`** is a shape the API does not emit. The console
+   renders it as "—" with a tooltip, never as "No reads in 7 days": a broken contract must not
+   read as "no readers" (principle 2).
+2. **The tooltip line keeps the plan's literal wording**, "N reads", not pluralised ("1 read").
+3. **The card names each tool's last read as well** its reads, because the feature page
+   (`docs/core/features/outside-readers.md`, "What the user can do" item 4) asks for "each tool,
+   its number of reads and its last read". D10 names only "name and reads" for the card; the
+   last read is a superset, and it is the same line the Gold Exports tooltip shows.
+4. **The card's `<dl>` is no longer conditional** on "a publish exists or a trim ran": the
+   readers row is always there, so a mart that was never published still says "No reads in 7
+   days" (or "Not measured" with the reason).
+5. **The card's publication status line got `data-testid="publication-status"`**: the readers row
+   can also read "Not measured", and the freshness tests must not read the wrong one. The
+   open-format-card fetch mocks were folded into one `mockApi` helper so the new `/consumers`
+   request is answered instead of hitting the mocks' "unexpected fetch" throw.
+
+#### Not verified
+
+- **The console against a running API.** S1 is being built in parallel, so the console was built
+  against fixtures that follow D9 exactly; no live call was made. The counts the console shows
+  are therefore as honest as the route's answer, and no more.
+- **Rust, Python and compose checks.** This slice is console only (the plan's slicing table), so
+  no cargo command was run and no Python or compose file was touched.
+- **The acceptance rows `DATA-5-AC1` to `DATA-5-AC5`.** They need a real tool reading a real
+  published table; they are S1's acceptance test and the product owner's checklist. The
+  console's part of them — the three states — is covered here.
+- **A browser rendering.** No dev server was started; the three states are covered by component
+  tests, not by a manual look.
+- **`bun run test` as one command over `src`.** It was run folder by folder under `src/`, as
+  instructed; the counts above add up to the same suite.
 
 ## 6. Review (planner appends below)
 
@@ -547,3 +650,23 @@ and this change touched the door's handlers.
 - CI runs the full workspace and the "Gold export to Iceberg" job, which holds this slice's
   acceptance test.
 - This PR touches compose, CI and a migration, so it merges only with every check green.
+
+### Review S2 round 1 (planner, 2026-10-31, at `d3e4f101`)
+
+- **D9.** The contract matches exactly: `GoldConsumer` and `GoldConsumers`, with `windowDays`
+  optional.
+- **D10.** One shared helper (`src/lib/gold-consumers.ts`) gives both views the same three
+  states.
+  - It adds a fourth, defensive state, `unknown` (`supported: true` with a null list), shown as
+    "—" with a tooltip, never as zero. That is right under principle 2.
+  - The card names five tools, then "and N more".
+  - The service-identities hint is built in a click handler, so the server render never reads
+    `window`.
+- **Changed but not asked for:** the open-format card's `<dl>` now always renders, because the
+  readers row is always there. The other rows keep their conditions. Fine.
+- **I re-ran on `d3e4f101`:**
+  - `bun run typecheck`: clean;
+  - `bun run lint`: 0 errors, 10 warnings, one fewer than `main`;
+  - the gold, catalog and admin features plus the two new test files: 387 pass, 0 fail.
+
+**Open: no BLOCKER, no SHOULD-FIX.** S2 merges after S1, rebased on `main`.

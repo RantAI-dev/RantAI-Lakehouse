@@ -67,6 +67,12 @@ export const goldService: GoldService = {
       )
     ).runs
   },
+  /**
+   * The outside-reader count for a published mart (DATA-5 D7). The route
+   * answers `supported: true` with the tool list when the door is set
+   * up, and `supported: false` with a `reason` when it is not — the
+   * console must show the reason, never a fabricated zero.
+   */
   async getConsumers(mart, signal) {
     return getJson<GoldConsumers>(`/api/gold/export/${encodeURIComponent(mart)}/consumers`, { signal })
   },
