@@ -265,8 +265,14 @@ export function AuthoredFlow({ pipeline }: { pipeline: PipelineDetail }) {
           <dl className="mt-1 grid grid-cols-2 gap-x-4 gap-y-2 border-t border-border pt-3 text-xs">
             <dt className="text-muted-foreground">Load</dt>
             <dd>{def.incrementalColumn ? `Incremental on ${def.incrementalColumn}` : "Full reload each run"}</dd>
-            <dt className="text-muted-foreground">Change capture (FBIC)</dt>
-            <dd>{def.fbicEnabled ? "On" : "Off"}</dd>
+            {/* BLD-10 D3: the same name the form uses, and the same truth.
+                FBIC does nothing in this version, so the row says that --
+                and says what is stored, so a pipeline stored with it on is
+                not mistaken for one that would use it. */}
+            <dt className="text-muted-foreground">FBIC enrichment</dt>
+            <dd>
+              {def.fbicEnabled ? "Not available (stored as on; nothing runs it)" : "Not available"}
+            </dd>
             <dt className="text-muted-foreground">Connector</dt>
             <dd className="font-mono">{def.connectorId ?? "—"}</dd>
           </dl>
