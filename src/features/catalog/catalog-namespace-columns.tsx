@@ -181,9 +181,12 @@ export function getCatalogNamespaceColumns({
                   <Eye className="size-4" />
                   <span>View details</span>
                 </DropdownMenuItem>
+                {/* DATA-23: the link filters the explorer's namespace column
+                    by the namespace **id**, the value the assets carry — the
+                    display name matched nothing for a labelled namespace. */}
                 <DropdownMenuItem asChild>
                   <Link
-                    href={namespaceAssetsHref(item.name)}
+                    href={namespaceAssetsHref(item.id)}
                     onClick={(e) => e.stopPropagation()}
                   >
                     <Search className="size-4" />
@@ -194,7 +197,9 @@ export function getCatalogNamespaceColumns({
                 <DropdownMenuItem
                   onClick={(e) => {
                     e.stopPropagation()
-                    void navigator.clipboard.writeText(item.name)
+                    // DATA-23: the id, not the display name — it is what a
+                    // query or a filter needs. The name stays on screen.
+                    void navigator.clipboard.writeText(item.id)
                   }}
                 >
                   <Boxes className="size-4" />
