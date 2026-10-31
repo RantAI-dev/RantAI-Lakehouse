@@ -81,7 +81,10 @@ jobs:
       # An empty password, so cosign asks for nothing: it encrypts the
       # throwaway key with that empty password — which the signing steps
       # hand it again — and never prompts. The key is thrown away with
-      # the job, so there is nothing to protect.
+      # the job, so there is nothing to protect. It stays in the job's
+      # environment because it is empty: the KEY itself is in the `env:`
+      # of the three signing steps and of no other step (REL-2 S2 review
+      # round 4 SHOULD-FIX 1).
       COSIGN_PASSWORD: ""
     services:
       registry:
@@ -241,21 +244,39 @@ jobs:
       # manifest, and it is verified against its own public key below —
       # the same shape as the real run, with a key that costs nothing.
       - name: Generate a throwaway signing key
+        id: throwaway-key
         run: |
           set -euo pipefail
           cosign generate-key-pair
           cosign public-key --key cosign.key > cosign.pub
-          # The private key goes into the environment as the PEM it is,
-          # so the steps below sign with `env://COSIGN_PRIVATE_KEY` —
-          # the same path the real job takes with the release key
-          # (REL-2 S2 review BLOCKER 1). The key is generated here and
-          # thrown away with the job: it is never the release key and it
-          # never leaves the runner.
+          # The PEM is masked in the log, line by line, so the dry run's
+          # log looks like the real job's, where the release key is
+          # `***`: a private key should not be readable in a log.
+          while IFS= read -r line; do
+            if [ -n "$line" ]; then
+              echo "::add-mask::$line"
+            fi
+          done < cosign.key
+          # The private key goes into this step's OUTPUT, and not into the
+          # environment of the job: a variable written to `$GITHUB_ENV` is
+          # in the environment of EVERY later step of the job — the runner
+          # prints it in each step's environment block, and the SBOM
+          # step's log showed the PEM (REL-2 S2 review round 4
+          # SHOULD-FIX 1). An output is read only by the steps that name
+          # it, so the three signing steps below take the key from here,
+          # into their own `env:`, the way the real job takes the release
+          # key from its secrets (REL-2 S2 review BLOCKER 1).
+          #
+          # The key is generated here and thrown away with the job: it is
+          # never the release key and it never leaves the runner.
           {
-            echo 'COSIGN_PRIVATE_KEY<<COSIGN_PRIVATE_KEY_EOF'
+            echo 'private_key<<COSIGN_PRIVATE_KEY_EOF'
             cat cosign.key
             echo 'COSIGN_PRIVATE_KEY_EOF'
-          } >> "$GITHUB_ENV"
+          } >> "$GITHUB_OUTPUT"
+          # The key file leaves the workspace with this step: the PEM
+          # travels in the output now, and nowhere else.
+          rm -f cosign.key
 
       # Sign each image (decision D3). The images are signed for the
       # operators who pull them by hand; the manifest is what
@@ -275,6 +296,13 @@ jobs:
       # connection at all, while the default v3 command posts to
       # rekor.sigstore.dev and gets "Forbidden".
       - name: Sign each image
+        # The throwaway key, for THIS step only (REL-2 S2 review round 4
+        # SHOULD-FIX 1): the same shape as the real job's signing steps,
+        # which take the release key from the `release` environment's
+        # secrets. The job's environment holds no key, so no other step
+        # of this job — a third-party action included — can read it.
+        env:
+          COSIGN_PRIVATE_KEY: ${{ steps.throwaway-key.outputs.private_key }}
         run: |
           set -euo pipefail
           for name in rantai-lakehouse-api rantai-lakehouse-dagster rantai-lakehouse-oidc-mock rantai-lakehouse-console; do
@@ -328,6 +356,10 @@ jobs:
           upload-artifact: false
 
       - name: Attest each SBOM to its image
+        # The throwaway key, for THIS step only (REL-2 S2 review round 4
+        # SHOULD-FIX 1): see the "Sign each image" step.
+        env:
+          COSIGN_PRIVATE_KEY: ${{ steps.throwaway-key.outputs.private_key }}
         run: |
           set -euo pipefail
           for name in rantai-lakehouse-api rantai-lakehouse-dagster rantai-lakehouse-oidc-mock rantai-lakehouse-console; do
@@ -376,6 +408,10 @@ jobs:
       # bundle carries the signature and the key's hint, so nothing
       # else is needed.
       - name: Sign the manifest and verify the signature
+        # The throwaway key, for THIS step only (REL-2 S2 review round 4
+        # SHOULD-FIX 1): see the "Sign each image" step.
+        env:
+          COSIGN_PRIVATE_KEY: ${{ steps.throwaway-key.outputs.private_key }}
         run: |
           set -euo pipefail
           cosign sign-blob --key "$COSIGN_KEY" \

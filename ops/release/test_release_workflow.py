@@ -19,6 +19,12 @@ of the pipeline that only a release would otherwise prove:
     job: the dry run would publish throwaway entries, and the manifest's
     signature must verify on an air-gapped host.
 
+And two more since REL-2 S2 review round 4, from the PR's own dry run:
+
+  - the SBOM folder is created before the SBOM action writes into it;
+  - the signing key is not written to `$GITHUB_ENV`, which would put it in
+    the environment of every later step of the job.
+
 The workflow is parsed with PyYAML (`pyyaml==6.0.3`, installed by the jobs
 that run these tests). The checks are run against synthetic workflows too,
 so a check that cannot fail is itself a failure. No network, no repository:
@@ -113,6 +119,24 @@ jobs:
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
           output-file: sbom/rantai-lakehouse-api.cdx.json
+"""
+
+# A workflow that puts the signing key into the environment of every
+# later step of the job.
+SYNTHETIC_KEY_IN_THE_GITHUB_ENV = """
+name: Synthetic
+on: workflow_dispatch
+jobs:
+  dry-run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate a throwaway signing key
+        run: |
+          {
+            echo 'COSIGN_PRIVATE_KEY<<COSIGN_PRIVATE_KEY_EOF'
+            cat cosign.key
+            echo 'COSIGN_PRIVATE_KEY_EOF'
+          } >> "$GITHUB_ENV"
 """
 
 
@@ -223,8 +247,35 @@ def creates_the_sbom_folder(document: dict[str, Any], job_name: str) -> bool:
     return any("mkdir -p sbom" in str(step.get("run") or "") for step in steps[:first])
 
 
+def shell_commands(run: str) -> str:
+    """A `run:` block without its comment lines.
+
+    A comment is not a command: the workflow explains itself in them,
+    and the checks below are about what the steps DO.
+    """
+    return "\n".join(
+        line for line in run.splitlines() if not line.strip().startswith("#")
+    )
+
+
+def steps_writing_the_key_to_the_github_env(document: dict[str, Any]) -> list[str]:
+    """Every step that writes the signing key into `$GITHUB_ENV`.
+
+    A variable written to `$GITHUB_ENV` is in the environment of EVERY
+    later step of the job, and the runner prints it in each step's
+    environment block (REL-2 S2 review round 4 SHOULD-FIX 1).
+    """
+    found: list[str] = []
+    for job_name, job in (document.get("jobs") or {}).items():
+        for step in job.get("steps") or []:
+            commands = shell_commands(str(step.get("run") or ""))
+            if "$GITHUB_ENV" in commands and "COSIGN_PRIVATE_KEY" in commands:
+                found.append(f"{job_name}: {step.get('name')}")
+    return found
+
+
 class ReleaseWorkflowTest(unittest.TestCase):
-    """The release workflow's own two properties."""
+    """The release workflow's own properties."""
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -280,11 +331,44 @@ class ReleaseWorkflowTest(unittest.TestCase):
             step = step_named(self.document, "dry-run", name)
             self.assertIn('--key "$COSIGN_KEY"', str(step.get("run")), name)
 
-    def test_the_dry_run_puts_its_throwaway_key_in_the_environment(self) -> None:
+    def test_the_dry_run_publishes_its_throwaway_key_as_a_step_output(self) -> None:
+        """The key travels as an output, not as the job's environment.
+
+        The real job's signing steps take the key from the `release`
+        environment's secrets; the dry run's take it from the step that
+        generated it (REL-2 S2 review round 4 SHOULD-FIX 1).
+        """
         step = step_named(self.document, "dry-run", "Generate a throwaway signing key")
         run = str(step.get("run"))
-        self.assertIn("COSIGN_PRIVATE_KEY<<", run)
-        self.assertIn("$GITHUB_ENV", run)
+        commands = shell_commands(run)
+        self.assertIn("$GITHUB_OUTPUT", commands)
+        self.assertNotIn("$GITHUB_ENV", commands)
+        self.assertTrue(step.get("id"), "the step needs an id: its output carries the key")
+
+    def test_no_step_writes_the_signing_key_into_the_github_environment(self) -> None:
+        """REL-2 S2 review round 4 SHOULD-FIX 1: the key is not for every step.
+
+        A variable written to `$GITHUB_ENV` is in the environment of every
+        later step of the job, and the runner prints it in each step's
+        environment block — the SBOM step's log showed the throwaway key.
+        """
+        self.assertEqual(steps_writing_the_key_to_the_github_env(self.document), [])
+
+    def test_the_dry_run_hands_its_throwaway_key_to_the_three_signing_steps(self) -> None:
+        """The dry run takes the same path as the real job.
+
+        The key is in the `env:` of the three signing steps and of no
+        other step: it comes from the step that generated it.
+        """
+        for name in SIGNING_STEPS:
+            step = step_named(self.document, "dry-run", name)
+            env = step.get("env") or {}
+            self.assertIn("COSIGN_PRIVATE_KEY", env, name)
+
+    def test_the_dry_run_job_environment_holds_no_key(self) -> None:
+        """The job's environment holds the reference, not the key."""
+        env = self.document["jobs"]["dry-run"].get("env") or {}
+        self.assertNotIn("COSIGN_PRIVATE_KEY", env)
 
     def test_the_sbom_folder_is_created_before_the_first_sbom_step(self) -> None:
         """REL-2 S2 review round 4 BLOCKER 1: the action does not create it.
@@ -367,6 +451,13 @@ class ReleaseWorkflowTest(unittest.TestCase):
     def test_an_action_pinned_to_a_moving_tag_is_reported(self) -> None:
         document = yaml.safe_load(SYNTHETIC_MOVING_TAG)
         self.assertEqual(unpinned_actions(document), ["anchore/sbom-action@v0"])
+
+    def test_a_key_in_the_github_environment_is_reported(self) -> None:
+        document = yaml.safe_load(SYNTHETIC_KEY_IN_THE_GITHUB_ENV)
+        self.assertEqual(
+            steps_writing_the_key_to_the_github_env(document),
+            ["dry-run: Generate a throwaway signing key"],
+        )
 
 
 if __name__ == "__main__":
