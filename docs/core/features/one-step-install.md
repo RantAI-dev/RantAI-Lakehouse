@@ -6,14 +6,14 @@
 | Backlog | `REL-2` |
 | Kind | Task |
 | Spec | `docs/core/specs/rel-2.md` (four decisions and the *(proposed)* numbers await the product owner) |
-| Status | Planned |
+| Status | Building (slice 1 of 5 merged) |
 | Priority | P1 |
 | Owner | In the base. |
 | Acceptor | In the base. |
 | Plan | `docs/superpowers/plans/2026-10-31-rel-2-one-step-install-and-update.md` |
 | Started | 2026-10-31 |
 | Shipped | |
-| Evidence | |
+| Evidence | #295 (slice 1) |
 
 ## Problem
 
