@@ -240,6 +240,11 @@ in `README.md` ("Status / Known limitations").
   that table; it is off by default. A published table holds every past
   copy; outside readers must pick the latest. Tables over 5,000,000 rows
   are refused. A background merge in the engine can cause one extra copy.
+- Outside tools read published Gold tables only through the API
+  (`/api/iceberg`), with a service identity that has `iceberg:read`, and
+  each table read is counted per tool (`DATA-5`). An operator must first
+  publish storage at `OUTSIDE_S3_ENDPOINT`; until then the console says
+  "Not measured". Tenant warehouses and Silver tables are not served yet.
 - Raw table history is never trimmed.
 - A plain row count on a change-captured table can overcount on some engine
   versions. The product's own queries avoid this; a hand-written one may not.
