@@ -1926,6 +1926,20 @@ pause with 20,000 changes per table then resume equal after 40.1 s; restart of `
 Dagster loader 306 passed, frontend 3,100 pass / 0 fail (316 files), clippy, fmt, MSRV, build, image smoke, Repo lints (29 tests), G1, G2, G3, G3a, G4 (PostgreSQL, MySQL,
 SQL Server, MongoDB), G6 (three), G8 (two), G9, G10, Gold export, SRC-3 A and B, SRC-11, SRC-12 (three), SRC-13, SRC-17. `ci-required` fails only because `g4-oracle` does.
 
+**Why the new column failed, and the fix (planner's follow-up to the second stop).** Cause found in the source, not in what we render: Debezium
+skips DDL run by the users in `log.mining.schema_changes.username.exclude.list`, default `SYS,SYSTEM`
+(`AbstractLogMinerStreamingChangeEventSource.java:1406-1412`, `OracleConnectorConfig.java:636-642`), and the gate ran the `ALTER` as `SYS`
+(`_run` connected as SYS), which is why the worker log had no line about it and the first DML with the column failed the task under both strategies.
+Items 2 and 3 of the planner's list were not needed (the table include list and the history topic were not read). Gate fix, not a weaker test: the `ALTER` and the
+`UPDATE` now run as the table owner `G4SRC` (a real source does so). Run `41244187205` on `a4886f32`: **all 38 jobs green**, `g4-oracle` PASS through DELETE:
+the new column reaches the current-mode Bronze table after 50.7 s and is listed as a schema change; reload insert/current 41 s, insert/history 45 s, update/current 28 s,
+update/history 32 s, delete/current 30 s, delete/history 34 s; pause + 20,000 changes per table + resume equal after 42.1 s; kafka-connect restart mid-stream
+equal after 26.5 s; the connector and its password file are gone after DELETE. **Was hybrid needed?** An informational probe (second connector, same stored config
+with `log.mining.strategy=online_catalog`, table `ORDERS_OC`, the owner adds a column, inserts and updates a row using it) left both its connector and task `RUNNING`
+120 s later. It reads task state, not data, so it shows `online_catalog` does not fail the task for an ordinary user's DDL; it does not show the column arrives. hybrid stays
+in the renderer (the step passes under it); reverting to the default is the planner's call. Counts of that run: cargo test 8,866 passed / 0 failed / 51 ignored; Dagster
+unit 2,196 passed (1 skipped); loader 306 passed; frontend 3,100 pass / 0 fail (316 files).
+
 **Commands run locally (rule 7).**
 
 - `cargo fmt --check` (rust/): clean on the final tree.

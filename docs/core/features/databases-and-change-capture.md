@@ -286,10 +286,12 @@ What `Oracle CDC` needs and what it does not do. Proven by the `g4-oracle` gate 
   (`AbstractLogMinerStreamingChangeEventSource.java:1406-1412`, `OracleConnectorConfig.java:636-642`); the first change
   that then uses the new column fails the task (observed in `g4-oracle`, runs 41235139798 and 41238887534, where the
   gate ran the `ALTER` as `SYS`). Change a captured table as its owner or another ordinary user.
-- **A new column** is mined with Debezium's `hybrid` strategy (`log.mining.strategy=hybrid`, `SRC-4` Amendment 12);
-  the default `online_catalog` fails the connector's task at the first change that mentions the new column
-  (observed in `g4-oracle`, run 41235139798). What `hybrid` does and does not cover is written below from the gate's
-  result.
+- **A new column** added to a captured table by an ordinary user (its owner) while the connector runs reaches Bronze
+  and is listed as a schema change; the connector keeps running. Observed in `g4-oracle` (run 41244187205) with
+  `log.mining.strategy=hybrid`: the column was in Bronze 50.7 s after the change. The same change on a second
+  connector with Oracle's default `online_catalog` also left its task `RUNNING` 120 s later (the probe reads the task's
+  state, not the column). Not tested: a dropped or renamed column, a changed column type, a renamed table. The
+  Debezium source does not say which of these `hybrid` follows.
 
 ## Acceptance checklist
 
