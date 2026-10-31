@@ -145,7 +145,7 @@ pub enum Policy {
 /// this table never needs to know about path-parameter values.
 #[rustfmt::skip]
 pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
-    // ── Public: the ONLY thirteen routes in the whole service. (Was "six" —
+    // ── Public: the ONLY fourteen routes in the whole service. (Was "six" —
     // corrected when the seventh was added, since Task A5's
     // `/api/auth/oidc/callback` had already made the old count stale; the
     // eighth is `POST /api/embed/frame`, SEC-12; the ninth is
@@ -153,8 +153,15 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // `POST /api/embed/values` (BI-26) and
     // `POST /api/public/dashboard/{token}/unlock` (BI-19 part A); the twelfth
     // and the thirteenth are the public link's and the embed's map boundary
-    // route, `PR #246 review BLOCKER 1`.) ──────────────────────────────────
+    // route, `PR #246 review BLOCKER 1`; the fourteenth is the readiness
+    // probe, REL-2 decision D7.) ───────────────────────────────────────────
     ("GET",  "/health",                          Policy::Public),
+    // REL-2 (D7): the readiness probe an installer or an updater waits on.
+    // Public because it answers only whether this stack is ready — three
+    // words ("ok"/"failed") and this build's version — and grants nothing.
+    // It never carries upstream text (AGENTS.md rule 4), so there is
+    // nothing in it to authenticate.
+    ("GET",  "/health/ready",                    Policy::Public),
     ("POST", "/api/embed/data",                   Policy::Public),
     // BI-1 (D3): the PDF's print view has no session; its data route is
     // authenticated by the signed render token in the body, and reads as the
@@ -1273,7 +1280,7 @@ mod tests {
     }
 
     #[test]
-    fn exactly_thirteen_public_entries_exist() {
+    fn exactly_fourteen_public_entries_exist() {
         // Pre-existing drift found while landing the `/api/auth/providers`
         // route: this assertion was still pinned at 4 even though the two
         // earlier OIDC public routes (`/api/auth/oidc/start`,
@@ -1296,7 +1303,9 @@ mod tests {
         // editable embed filter, authenticated by the signed token: 10 -> 11.
         // PR #246 review BLOCKER 1 added the public link's and the embed's
         // map boundary route, each authenticated by its own token: 11 -> 13.
-        assert_eq!(public_count, 13);
+        // REL-2 decision D7 added `GET /health/ready`, the readiness probe an
+        // installer or an updater waits on: 13 -> 14.
+        assert_eq!(public_count, 14);
     }
 
     /// SEC-23 (F1): adding a governance rule needs `governance:write`, the

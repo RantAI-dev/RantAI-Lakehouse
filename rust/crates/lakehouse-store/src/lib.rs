@@ -108,6 +108,16 @@ pub fn connect_lazy(database_url: &str) -> Result<PgPool, StoreError> {
         .map_err(StoreError::from)
 }
 
+/// The migration set this binary carries — the one [`migrate`] applies.
+///
+/// A `static`, not a call: `sqlx::migrate!` expands to the whole set
+/// (every `.sql` file's text, embedded at compile time), and expanding it
+/// a second time would embed every migration's SQL twice in the binary.
+/// One owner, one copy: [`embedded_schema_version`] reads the same set
+/// [`migrate`] applies, so the two can never disagree about what this
+/// build expects the schema to be.
+static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
+
 /// Apply every migration in `rust/migrations/` that hasn't already been
 /// applied to `pool`, in order. Safe to call on every boot: `sqlx::migrate!`
 /// tracks applied versions in a `_sqlx_migrations` table and is a no-op once
@@ -122,10 +132,54 @@ pub fn connect_lazy(database_url: &str) -> Result<PgPool, StoreError> {
 /// [`StoreError::Migration`] if a migration file fails to apply (e.g. it
 /// was edited after being applied, or the SQL itself is invalid).
 pub async fn migrate(pool: &PgPool) -> Result<(), StoreError> {
-    sqlx::migrate!("../../migrations")
-        .run(pool)
-        .await
-        .map_err(StoreError::from)
+    MIGRATOR.run(pool).await.map_err(StoreError::from)
+}
+
+/// The highest migration version EMBEDDED in this binary — what this build
+/// expects the database's schema to be.
+///
+/// The counterpart of [`applied_schema_version`]: this crate owns the
+/// migration set, so it is the only place that can answer both questions.
+/// `lakehouse-api`'s readiness route (`GET /health/ready`, REL-2 decision
+/// D7) compares the two to answer "is the database at this build's schema
+/// version?".
+///
+/// Never fails: an empty migration set is a build mistake, and `0` is the
+/// honest answer for it (no migration has ever been applied to anything).
+#[must_use]
+pub fn embedded_schema_version() -> i64 {
+    MIGRATOR
+        .iter()
+        .map(|migration| migration.version)
+        .max()
+        .unwrap_or_default()
+}
+
+/// The highest migration version APPLIED to `pool` — what the database's
+/// schema actually is.
+///
+/// Reads sqlx's own bookkeeping table (`_sqlx_migrations`), so the answer
+/// comes from the same records [`migrate`] writes. Only rows with
+/// `success = true` count: sqlx keeps a failed migration's row as a
+/// "dirty" marker, and a dirty database is not at any version.
+///
+/// A database that has never been migrated has no such table at all; the
+/// query then fails and the caller sees [`StoreError::Database`] — which
+/// is the honest answer ("this database is not at this build's schema
+/// version") rather than a `0` that could be mistaken for "version 0 is
+/// fine".
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if `pool` cannot be reached or the
+/// bookkeeping table cannot be read.
+pub async fn applied_schema_version(pool: &PgPool) -> Result<i64, StoreError> {
+    let version: Option<i64> =
+        sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations WHERE success = true")
+            .fetch_one(pool)
+            .await
+            .map_err(StoreError::from)?;
+    Ok(version.unwrap_or_default())
 }
 
 #[cfg(test)]

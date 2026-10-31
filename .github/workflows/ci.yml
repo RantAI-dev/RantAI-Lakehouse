@@ -118,6 +118,17 @@ jobs:
       - name: Check connector gate coverage (SRC-9)
         run: python3 ops/lint/check_connector_gate_coverage.py
 
+      # REL-2 S1-T3: a tag is a name, and a name moves — `postgres:16` is
+      # "whatever the 16 series points at today". Every third-party image
+      # in the deployment template is pinned by digest, so the same image
+      # runs on every host, in every registry mirror, forever. The images
+      # this repository builds are exempt (they are named
+      # `${…_IMAGE:-…:local}` until the release pipeline publishes them).
+      # See ops/lint/check_image_digests.py for exactly what this does and
+      # does not cover.
+      - name: Check every compose image is pinned by digest (REL-2)
+        run: python3 ops/lint/check_image_digests.py
+
       # The unit tests of that check and of the gates' registry and result
       # table module (no network, no containers; seconds).
       - name: Unit-test the connector gate coverage tooling (SRC-9)

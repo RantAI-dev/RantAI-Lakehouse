@@ -1787,7 +1787,11 @@ fn every_registered_route_has_a_policy_entry() {
             break;
         };
         let pattern = &rest[open + 1..open + 1 + close];
-        if !pattern.starts_with("/api/") && pattern != "/health" {
+        // Only the routes this file cares about: the `/api/*` surface and
+        // the two health routes (`/health` and, since REL-2 decision D7,
+        // `/health/ready` — the readiness probe is public too, so it must
+        // be classified like every other route).
+        if !pattern.starts_with("/api/") && pattern != "/health" && pattern != "/health/ready" {
             continue;
         }
         // Method handlers appear between the pattern and the closing paren of

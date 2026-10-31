@@ -62,6 +62,7 @@ pub mod pipeline_source;
 pub mod policy;
 pub mod policy_engine;
 pub mod query_limits;
+pub mod readiness;
 pub mod result_cache;
 pub mod routes;
 pub mod rustfs_client;
