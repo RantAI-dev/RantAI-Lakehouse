@@ -140,7 +140,8 @@ jobs:
       # Compose renderer, the manifest). Its own tests are pytest cases;
       # `setup-python` pins the interpreter because the version check
       # reads the crate's manifest with `tomllib`, which is in the
-      # standard library from 3.11.
+      # standard library from 3.11. `pyyaml` is here for the release
+      # WORKFLOW's own tests, which parse `.github/workflows/release.yml`.
       - name: Setup Python
         uses: actions/setup-python@v7
         with:
@@ -149,7 +150,7 @@ jobs:
       - name: Unit-test the release tooling (REL-2 S2)
         run: |
           python -m pip install --upgrade pip
-          pip install pytest==8.3.4
+          pip install pytest==8.3.4 pyyaml==6.0.3
           python -m pytest ops/release -q
 
       # REL-2 S2-T2: the release's Compose file is RENDERED from the
