@@ -1043,3 +1043,27 @@ private half is not in the repository.
 - The PR's own CI dry run is the last proof: it builds the four images, signs them with a
   throwaway key, and builds the bundle.
 - The real release is S5.
+
+### Review S2 round 4 (planner, 2026-11-01): the PR's dry run, at `dc0b095`
+
+The dry run built and pushed all four images and signed them through `env://COSIGN_PRIVATE_KEY`.
+It then failed at the first SBOM step.
+
+**BLOCKER 1 (round 4): the SBOM folder is never created.**
+- `anchore/sbom-action` scanned the image and then failed with
+  `ENOENT: no such file or directory, open 'sbom/rantai-lakehouse-api.cdx.json'`. Nothing creates
+  `sbom/` first.
+- The real `release` job has the same step, so it would fail the same way.
+- **Fix:** add a `mkdir -p sbom` step before the first SBOM step, in **both** jobs.
+
+**SHOULD-FIX 1 (round 4): the dry run's key is in the environment of every later step.**
+- The dry run writes its throwaway key to `$GITHUB_ENV`, so the runner prints the
+  (encrypted, empty-password) PEM in every later step's environment block. The SBOM step's log
+  shows it.
+- It is not a secret, because it is generated per run, but the dry run is meant to copy the real
+  job's shape: the key visible to the signing steps only.
+- **Fix:** keep the PEM in a step output, or a file under `$RUNNER_TEMP`, and set
+  `COSIGN_PRIVATE_KEY` in the `env:` of the three signing steps only, as the real job does.
+- Extend `test_release_workflow.py`: `COSIGN_PRIVATE_KEY` must not be written to `$GITHUB_ENV`.
+
+**Open: BLOCKER 1 and SHOULD-FIX 1 (round 4).**
