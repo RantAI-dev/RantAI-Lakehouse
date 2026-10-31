@@ -32,6 +32,7 @@
 #   G4_MYSQL_RESULT       result of `g4-mysql` job (SRC-4 slice 3)
 #   G4_MSSQL_RESULT       result of `g4-mssql` job (SRC-4 slice 3)
 #   G4_MONGO_RESULT       result of `g4-mongo` job (SRC-4 slice 5)
+#   G4_ORACLE_RESULT      result of `g4-oracle` job (SRC-4 slice 6)
 #   G10_SSO_RESULT        result of `g10-sso` job (SEC-3 Keycloak sign-in)
 #   G6_INGEST_RESULT      result of `g6-ingest` job
 #   G6_INGEST_OTHER_RESULT result of `g6-ingest-other` job
@@ -153,6 +154,7 @@ run_gate() {
   check_job "g4-mysql" "${G4_MYSQL_RESULT:-skipped}" "$req_acceptance"
   check_job "g4-mssql" "${G4_MSSQL_RESULT:-skipped}" "$req_acceptance"
   check_job "g4-mongo" "${G4_MONGO_RESULT:-skipped}" "$req_acceptance"
+  check_job "g4-oracle" "${G4_ORACLE_RESULT:-skipped}" "$req_acceptance"
   check_job "g10-sso" "${G10_SSO_RESULT:-skipped}" "$req_acceptance"
   check_job "g6-ingest" "${G6_INGEST_RESULT:-skipped}" "$req_acceptance"
   check_job "g6-ingest-other" "${G6_INGEST_OTHER_RESULT:-skipped}" "$req_acceptance"

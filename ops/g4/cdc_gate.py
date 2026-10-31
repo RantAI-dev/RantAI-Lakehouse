@@ -179,6 +179,23 @@ class Source:
     now = "now()"
     needs_schema_history = False  # `MySQL` and `SQL Server` keep their history in a Kafka topic
     password = ""  # the source password the connector's credential file holds
+    # How long `step_wait_for_services` waits for `ping` (Oracle Free restarts once to enter ARCHIVELOG).
+    ping_timeout_seconds = 120
+    # `SRC-4` Amendment 10 (S10-c): a source whose tables are typed by hand answers the discovery routes
+    # "not supported"; its `discover` cell is `refused` in `ops/gates/coverage.json` and the gate proves
+    # the refusal instead of a listing.
+    discover_refused = False
+    # A source with its own setup-check step (Oracle: the facts are read by the orchestrator after the
+    # Kafka Connect validation, Amendment 11) sets this and implements `setup_checks_step`.
+    own_setup_checks = False
+
+    def setup_checks_step(self, connector_id: str) -> None:
+        """The source's own setup-check assertions (used when `own_setup_checks`)."""
+        raise NotImplementedError
+
+    def extra_steps(self, connector_id: str) -> None:
+        """Source-specific steps after the setup checks (Oracle: the wrong password and the
+        encryption banner). Fail with `G4Failure`."""
 
     def ping(self) -> None:
         """Raise if the source cannot be reached."""
@@ -321,7 +338,7 @@ def step_login() -> None:
 
 def step_wait_for_services() -> None:
     _wait_for("ClickHouse", lambda: ch_query("SELECT 1 FORMAT TabSeparated").strip() == "1" or None, 60)
-    _wait_for("the source", lambda: (src().ping() or True), 120, interval_s=3)
+    _wait_for("the source", lambda: (src().ping() or True), src().ping_timeout_seconds, interval_s=3)
 
     def connect_up():
         resp = requests.get(f"{CONNECT_URL}/", timeout=5)
@@ -478,9 +495,31 @@ def _discovery(connector_id: str, kind: str, body: dict) -> dict:
     return answer
 
 
+def _check_discover_refused(connector_id: str) -> None:
+    """`discover` for a source whose tables are typed by hand (`SRC-4` Amendment 10, S10-c): the
+    registry says `refused`, and the routes must answer a finished `failed` request of class
+    `not_supported`, for a list and for a preview."""
+    if RECORDER is None or RECORDER.registry.expectation(src().cdc_type, "discover") != "refused":
+        _record("discover", "fail", "ops/gates/coverage.json does not say 'refused' for this step but the source refuses it; update the registry")
+        return
+    try:
+        for kind, body in (("list", {}), ("preview", {"object": src().discover_table})):
+            answer = _discovery(connector_id, kind, body)
+            if answer.get("state") != "failed" or answer.get("errorClass") != "not_supported":
+                _record("discover", "fail", f"{kind}: expected state=failed errorClass=not_supported, got state={answer.get('state')!r} errorClass={answer.get('errorClass')!r}")
+                return
+    except (requests.RequestException, ValueError, G4Failure) as exc:
+        _record("discover", "fail", f"the discovery routes did not answer cleanly ({type(exc).__name__}: {str(exc)[:200]})")
+        return
+    _record("discover", "refused-as-expected", "tables are typed by hand: list and preview answer not_supported")
+
+
 def _check_discover(connector_id: str) -> None:
     """`discover`: the schemas hold the source's schema, its tables hold the current-mode table,
     and the preview of that table shows its columns (SRC-13 routes)."""
+    if src().discover_refused:
+        _check_discover_refused(connector_id)
+        return
     if not _expects_real("discover"):
         return
     table = src().discover_table
@@ -771,6 +810,24 @@ def _test_setup_checks(connector_id: str) -> list[dict]:
     return checks
 
 
+def say(step: str, outcome: str, detail: str = "") -> None:
+    """`_say` for a source's own steps (Oracle's wrong password and encryption banner)."""
+    _say(step, outcome, detail)
+
+
+def register_connector(suffix: str, spec: dict, password: str) -> str:
+    """Register another connector for a source's own step, in the gate tenant; returns its id."""
+    return _register_demo_cdc_connector(_ensure_gate_tenant(), suffix=suffix, spec=spec, password=password)
+
+
+def test_connector(connector_id: str) -> dict:
+    """`POST .../test` and its JSON body, for a source's own setup-check step."""
+    resp = API.post(f"{API_URL}/api/connectors/{connector_id}/test", timeout=60)
+    if not resp.ok:
+        raise G4Failure(f"POST .../test answered {resp.status_code} {resp.text[:200]}")
+    return resp.json()
+
+
 def _describe(checks: list[dict]) -> str:
     return "; ".join(f"{c['setting']}={c['status']}" for c in checks)
 
@@ -791,6 +848,13 @@ def step_setup_checks(connector_id: str) -> None:
     them; a second connector whose source lacks ONE setting gets that check `missing` with the
     fixed sentence and a command, and the rest `ok` (or `unchecked` where the documented login
     cannot read the setting)."""
+    if src().own_setup_checks:
+        try:
+            src().setup_checks_step(connector_id)
+        except G4Failure as exc:
+            _say("setup checks", "fail", str(exc))
+            raise
+        return
     try:
         good = _test_setup_checks(connector_id)
         # Slice 4 review SHOULD-FIX 10c: the settings listed are exactly this source's, so a
@@ -995,7 +1059,7 @@ def _bulk_changes() -> None:
         lambda: _history_events(range(10_001, 15_001), "d", lambda i: f"seed_{i}"),
     )
     _apply(
-        lambda t: f"INSERT INTO {t} (id, customer, amount, status, updated_at) SELECT g, 'bulk_i', 5.00, 'bulk', {now} FROM ({src().numbers(100_001, 105_000)}) AS n",
+        lambda t: f"INSERT INTO {t} (id, customer, amount, status, updated_at) SELECT g, 'bulk_i', 5.00, 'bulk', {now} FROM ({src().numbers(100_001, 105_000)}) n",
         lambda: _history_events(range(100_001, 105_001), "c", "bulk_i"),
     )
 
@@ -1127,6 +1191,7 @@ def run(source: Source, before_delete=None, after_delete=None) -> int:
         step_first_copy_reached_bronze()
         step_lag_is_up_to_date_after_the_first_copy(connector_id)
         step_setup_checks(connector_id)
+        source.extra_steps(connector_id)
         step_changes_visible_within_budget()
         step_pause_and_resume_lose_nothing(connector_id)
         step_restart_kafka_connect_during_changes(connector_id)
