@@ -264,7 +264,9 @@ layer. Pipelines need the orchestrator, which your operator runs.
    the table**, and, for an uploaded table, **Run again after this table
    is re-uploaded**.
 3. **Transform:** choose a **Verb** (dedupe, filter, rename, cast or
-   select), fill it in, and click **Add transform**. Repeat as needed.
+   select), fill it in, and click **Add transform**. Repeat as needed. A
+   pipeline with no transform is a plain copy of its source, and is
+   allowed only with **Copy the source as is** switched on.
 4. **Target:** choose the **Target zone** and **Target table**.
 5. **Schedule:** choose **On demand only**, **Every 15 minutes**,
    **Hourly**, **Daily at 02:00**, **Weekly, Monday 02:00** or **Custom
