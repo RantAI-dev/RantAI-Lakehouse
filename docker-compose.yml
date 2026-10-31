@@ -1655,7 +1655,15 @@ services:
       AUTH_BOOTSTRAP_PASSWORD: ${AUTH_BOOTSTRAP_PASSWORD:-}
     entrypoint: ["/bin/sh", "-c"]
     command:
-      - "pip install -q requests boto3 && python gold_export_test.py"
+      # DATA-5 (ADR 0016): `pyiceberg` is the OUTSIDE reader's client —
+      # the acceptance test reads the published table through the API's
+      # door with a real Iceberg REST client, so the door is proven
+      # against the client it exists for. Pinned, because an unpinned
+      # client would make this gate depend on whatever PyPI serves that
+      # day. The `pyarrow` extra is what reads the table's parquet files
+      # (the row count) and reaches the S3-compatible store the catalog
+      # vends.
+      - "pip install -q requests boto3 'pyiceberg[pyarrow]==0.9.0' && python gold_export_test.py"
     restart: "no"
 
   # P2 (G2) — SeaweedFS: a second S3-compatible store used to prove the

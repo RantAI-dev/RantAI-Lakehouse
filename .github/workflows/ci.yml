@@ -2725,6 +2725,14 @@ jobs:
           # DATA-2 review BLOCKER 2: credentials in CI-only .env matching the RustFS keys
           CONNECTOR_S3_ACCESS_KEY=ci-only-rustfs-access
           CONNECTOR_S3_SECRET_KEY=ci-only-rustfs-secret-0001
+          # DATA-5 (ADR 0016): the storage address PUBLISHED for outside
+          # readers. The acceptance test reads the published table
+          # through the API's door (/api/iceberg) from INSIDE this
+          # stack, so the published address is the in-network one. Left
+          # unset, outside reading is off and the door answers 503
+          # naming the setting (an honest "not measured", never a count
+          # of zero).
+          OUTSIDE_S3_ENDPOINT=http://rustfs:9000
           # DATA-2 review BLOCKER 1: CI runs with age 0 to allow immediate orphan cleanup in gate test (no other writer runs here)
           GOLD_ORPHAN_MIN_AGE_SECONDS=0
           EOF

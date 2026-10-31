@@ -15,10 +15,27 @@
      (`GET /api/gold/export/{mart}`) and assert its row count matches what
      was seeded — proving the whole ClickHouse -> Rust -> Lakekeeper ->
      Iceberg -> Rust round trip, with matching counts.
+  5. DATA-5 / ADR 0016 — the OUTSIDE reader: create a service identity
+     with the `iceberg:read` scope, rotate it once for its key, and read
+     the published table through the API's door (`/api/iceberg`) with
+     `pyiceberg` — a real Iceberg REST client, not a hand-rolled request.
+     The row count must match what was seeded, a write must be refused
+     403, another namespace must be refused 403, and the consumers route
+     must list the tool with one read.
 
 Same `g1-test-runner`/`g3a-test-runner` shape: run inside the compose
 network (`gold-export-test-runner` in `docker-compose.yml`), plain
-`requests`, no dependency on the Rust/Python application code it verifies.
+`requests` over the API's own HTTP surface — plus `pyiceberg` for the
+outside reader, a THIRD-PARTY Iceberg client the API knows nothing
+about, which is the point: the door is proven against the client it
+exists for. No dependency on the Rust/Python application code it
+verifies.
+
+The outside-reading steps need `OUTSIDE_S3_ENDPOINT` on `lakehouse-api`
+(the published storage address). The runner is INSIDE the compose
+network, so the published address is the in-network one
+(`http://rustfs:9000`); the endpoint REWRITE itself is covered by the
+Rust unit test (`routes::iceberg_door`'s `rewrite_endpoint`).
 """
 
 from __future__ import annotations
@@ -27,9 +44,13 @@ import os
 import random
 import sys
 import time
+import uuid
 
 import requests
 import boto3
+import pyarrow as pa
+from pyiceberg.catalog import load_catalog
+from pyiceberg.exceptions import ForbiddenError
 
 CH_URL = os.environ.get("CH_URL", "http://clickhouse:8123")
 CH_USER = os.environ.get("CH_USER", "default")
@@ -56,6 +77,12 @@ GOLD_SOURCE_SCHEMA = os.environ.get("GOLD_SOURCE_SCHEMA", "serving")
 GOLD_EXPORT_RUN_TOKEN = os.environ.get("GOLD_EXPORT_RUN_TOKEN", "")
 MART_NAME = os.environ.get("GOLD_MART_NAME", "gold_export_smoke")
 ROW_COUNT = int(os.environ.get("GOLD_EXPORT_ROW_COUNT", "7"))
+# DATA-5 (ADR 0016): the outside tool's service identity. The name
+# carries a random suffix because this test may run more than once
+# against the same deployment (a service identity's name is its natural
+# key, and a taken name is a 409), and the id — not the name — is what
+# the consumers route is checked against.
+OUTSIDE_TOOL_NAME = f"gold-export-outside-tool-{uuid.uuid4().hex[:8]}"
 AUTH_EMAIL = os.environ.get("AUTH_BOOTSTRAP_EMAIL", "").strip()
 AUTH_PASSWORD = os.environ.get("AUTH_BOOTSTRAP_PASSWORD", "").strip()
 if not AUTH_EMAIL or not AUTH_PASSWORD:
@@ -318,19 +345,148 @@ def step_history_lists_this_run() -> None:
     print(f"[gold-export] history shows {len(runs)} run(s), latest: {latest}")
 
 
-def step_consumers_route_is_honest_about_being_unsupported() -> None:
-    """WS6: no code exists yet that correlates a Gold mart against
-    `Trino`'s query history (`routes::gold::consumers`'s own doc comment)
-    — this must be a clear `supported: false`, never a guessed count."""
+def step_create_outside_tool() -> tuple[str, str]:
+    """DATA-5 (ADR 0016): an outside tool is a service identity with the
+    `iceberg:read` scope. Creating it issues no credential (the contract
+    has no field for a secret), so the test ROTATES it once and keeps the
+    raw key — the one and only time the API hands it out."""
+    created = API.post(
+        f"{API_URL}/api/identity/service-identities",
+        json={
+            "name": OUTSIDE_TOOL_NAME,
+            "scopes": ["iceberg:read"],
+            "environment": "production",
+        },
+        timeout=30,
+    )
+    if created.status_code != 201:
+        raise GoldExportFailure(
+            f"creating the outside tool's service identity failed: "
+            f"{created.status_code} {created.text}"
+        )
+    identity_id = created.json().get("id")
+    if not identity_id:
+        raise GoldExportFailure(
+            f"the created service identity carries no id: {created.json()}"
+        )
+
+    rotated = API.post(
+        f"{API_URL}/api/identity/service-identities/{identity_id}/rotate",
+        timeout=30,
+    )
+    if not rotated.ok:
+        raise GoldExportFailure(
+            f"rotating the outside tool's credential failed: "
+            f"{rotated.status_code} {rotated.text}"
+        )
+    key = rotated.json().get("secret")
+    if not key:
+        raise GoldExportFailure(
+            f"the rotation returned no key: {rotated.json()}"
+        )
+    print(
+        f"[gold-export] outside tool {OUTSIDE_TOOL_NAME} ({identity_id}) "
+        "has its key (iceberg:read)"
+    )
+    return identity_id, key
+
+
+def _outside_catalog(key: str):
+    """The outside tool's view of the catalog: the API's DOOR
+    (`/api/iceberg`), never Lakekeeper's own port.
+
+    `pyiceberg`'s REST catalog is a real Iceberg client, so this step
+    proves that a standard client can read a published Gold table through
+    the API — the thing ADR 0016 exists for. The warehouse is passed by
+    NAME; the door answers the client's config call with the warehouse's
+    own prefix (its id), which the client then uses in every path.
+    """
+    return load_catalog(
+        "rest",
+        uri=f"{API_URL}/api/iceberg",
+        token=key,
+        warehouse=LAKEKEEPER_WAREHOUSE,
+    )
+
+
+def step_outside_tool_reads_the_published_table(key: str) -> None:
+    """The outside tool reads the published table through the door and
+    sees exactly the rows that were seeded — the whole point of DATA-5:
+    outside reading works, and the rows are the same ones the console
+    exports."""
+    catalog = _outside_catalog(key)
+    table = catalog.load_table(("gold", MART_NAME))
+    rows = table.scan().to_arrow().num_rows
+    if rows != ROW_COUNT:
+        raise GoldExportFailure(
+            f"the outside tool read {rows} rows through the door, "
+            f"expected {ROW_COUNT}"
+        )
+    print(
+        f"[gold-export] the outside tool read {rows} rows of gold.{MART_NAME} "
+        "through the door"
+    )
+
+
+def step_the_door_refuses_a_write_and_another_namespace(key: str) -> None:
+    """The door reads: a write is refused 403, and a table in another
+    namespace is refused 403 (ADR 0016 point 2). Neither reaches the
+    catalog."""
+    catalog = _outside_catalog(key)
+    schema = pa.schema([pa.field("region", pa.string(), nullable=False)])
+
+    try:
+        catalog.create_table(("gold", f"{MART_NAME}_written_by_a_tool"), schema)
+    except ForbiddenError as exc:
+        print(f"[gold-export] the door refused a write: {exc}")
+    else:
+        raise GoldExportFailure(
+            "the door accepted a create_table in gold: a write must be refused"
+        )
+
+    try:
+        catalog.load_table(("bronze", MART_NAME))
+    except ForbiddenError as exc:
+        print(f"[gold-export] the door refused another namespace: {exc}")
+    else:
+        raise GoldExportFailure(
+            "the door served a table outside gold: only the gold namespace is served"
+        )
+
+
+def step_consumers_route_lists_the_outside_tool(identity_id: str) -> None:
+    """DATA-5: the count is the API's own. The consumers route lists the
+    tool that read the published table, with its reads and its last read.
+
+    The not-set-up case ("Not measured", never a count of zero) is
+    covered by the Rust integration test
+    (`tests/iceberg_door.rs`'s
+    `the_gold_consumers_route_reports_not_measured_when_outside_reading_is_off`):
+    this stack has outside reading ON, which is the only state in which
+    there is a count to list."""
     resp = API.get(f"{API_URL}/api/gold/export/{MART_NAME}/consumers", timeout=30)
     if not resp.ok:
         raise GoldExportFailure(f"GET .../consumers failed: {resp.status_code} {resp.text}")
     body = resp.json()
-    if body.get("supported") is not False:
-        raise GoldExportFailure(f"expected supported: false (no Trino client yet), got {body}")
-    if body.get("consumers") is not None:
-        raise GoldExportFailure(f"expected consumers: null when unsupported, got {body}")
-    print(f"[gold-export] consumers route honestly reports unsupported: {body.get('reason')}")
+    if body.get("supported") is not True:
+        raise GoldExportFailure(f"expected supported: true, got {body}")
+    if body.get("windowDays") != 7:
+        raise GoldExportFailure(f"expected windowDays: 7, got {body}")
+    consumers = body.get("consumers") or []
+    mine = [c for c in consumers if c.get("identityId") == identity_id]
+    if len(mine) != 1:
+        raise GoldExportFailure(
+            f"expected exactly one entry for the outside tool {identity_id}, "
+            f"got {consumers}"
+        )
+    entry = mine[0]
+    if entry.get("reads") != 1:
+        raise GoldExportFailure(f"expected reads == 1, got {entry}")
+    if not entry.get("name"):
+        raise GoldExportFailure(f"expected the tool's name, got {entry}")
+    if not entry.get("lastReadAt"):
+        raise GoldExportFailure(f"expected the tool's last read, got {entry}")
+    print(f"[gold-export] the consumers route lists the outside tool: {entry}")
 
 
 def step_optimize_final_with_if_changed_skips() -> None:
@@ -544,7 +700,13 @@ def main() -> int:
         step_read_back_via_api()
         step_read_back_reports_snapshot_fields()
         step_history_lists_this_run()
-        step_consumers_route_is_honest_about_being_unsupported()
+        # DATA-5 (ADR 0016): the outside reader. Before the DATA-10
+        # steps, so the published table still holds exactly the seeded
+        # rows and the read count is exactly one.
+        tool_id, tool_key = step_create_outside_tool()
+        step_outside_tool_reads_the_published_table(tool_key)
+        step_the_door_refuses_a_write_and_another_namespace(tool_key)
+        step_consumers_route_lists_the_outside_tool(tool_id)
         step_optimize_final_with_if_changed_skips()
         step_exchange_tables_same_rows_with_if_changed_skips()
         step_insert_row_with_if_changed_exports()
