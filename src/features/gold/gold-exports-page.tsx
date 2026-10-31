@@ -77,11 +77,11 @@ function ConsumersCell({ data }: { data: GoldConsumers }) {
 
 /**
  * One mart's row: publish state, last export (read straight back from
- * Iceberg), export history count, best-effort consumer count, and an
- * "Export now" trigger. Each sub-fetch is independent — `getLastExport`
- * 404/500s for a mart that has never been exported (`read_back` has no
- * table to read yet), and that is rendered as "Never exported" here, not
- * as a page-level error.
+ * Iceberg), export history count, the count of outside tools that read
+ * it, and an "Export now" trigger. Each sub-fetch is independent —
+ * `getLastExport` 404/500s for a mart that has never been exported
+ * (`read_back` has no table to read yet), and that is rendered as "Never
+ * exported" here, not as a page-level error.
  */
 function MartRow({ mart }: { mart: GoldMart }) {
   const lastExport = useService<GoldReadBack | null>(async (signal) => {

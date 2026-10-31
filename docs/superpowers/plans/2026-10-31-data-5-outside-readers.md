@@ -432,6 +432,10 @@ Files touched:
 - `src/features/admin/service-identities-page.tsx`, `.test.tsx` — the hint under the scopes
   field.
 
+One follow-up commit lands after the handoff commit: it rewords the mart row's doc comment in
+`gold-exports-page.tsx` ("best-effort consumer count" → "the count of outside tools that read
+it"), a leftover of the WS6 wording that DATA-5 made stale. Nothing else changed in it.
+
 #### Commands run (all in the foreground, on the final commit)
 
 | Command | Result |
