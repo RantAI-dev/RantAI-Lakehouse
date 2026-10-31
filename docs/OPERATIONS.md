@@ -293,8 +293,17 @@ them with `--profile cdc` and set in `.env`:
 - `CDC_KAFKA_BOOTSTRAP=kafka:9092` (the Dagster applier reads the topics and
   writes Bronze).
 
-`MySQL` and `SQL Server` connectors also keep a schema-history topic on the
+`MySQL`, `SQL Server` and `Oracle` connectors also keep a schema-history topic on the
 broker, so the API needs `CDC_KAFKA_BOOTSTRAP` too (compose passes it to both).
+An `Oracle CDC` source needs `ARCHIVELOG` (a restart of the database), minimal
+supplemental logging and a common user with Debezium's documented LogMiner grants;
+the connection test lists what is missing, with the commands. Archived redo logs must
+be kept as long as a stopped connector may need to catch up. Oracle's JDBC driver is
+in the pinned `kafka-connect` image: nothing is downloaded. The Oracle setup checks
+are read by the orchestrator over an **unencrypted** session limited to the data
+dictionary (an owner-signed exception to `SEC-14`, 2026-10-31); the connector itself
+requires Oracle native network encryption unless its TLS mode is "Disable". The
+old `ORACLE_CDC_LOGMINER_ENABLED` setting is gone: nothing read it since slice 2.
 Both unset means change capture is off: a change-capture connector answers
 `supported: false` and nothing is started. The source password never appears in
 a connector's JSON: `lakehouse-api` writes it to `/run/cdc-secrets/<connector id>`

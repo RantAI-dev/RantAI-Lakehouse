@@ -89,9 +89,8 @@ Live change capture:
     CI), so the broker's 7-day retention does not apply to it and a connector can
     restart after any time. It is never deleted with the connector (Kafka
     Connect has no topic API); it is a few kilobytes.
-- **Oracle and MongoDB capture are added by their own slices.** Oracle CDC is
-  refused by the API. MongoDB CDC has no type; the MongoDB test database is a
-  single server, and change streams need a replica set.
+- **Oracle and MongoDB capture are added by their own slices.** (Written before slices 5 and 6: MongoDB CDC
+  and Oracle CDC are types now, see their sections below.)
 - **No lag in time is measured.** A job measures the PostgreSQL slot's
   retained bytes, for the deployment's own database only; `health.rs` says
   plainly that bytes cannot be turned into seconds honestly.
@@ -105,9 +104,10 @@ Checked outside the repo on 2026-10-27:
   Teradata's hosted trial (ClearScape), an outside service. A GitHub runner
   can run neither as an ordinary service container.
 - **Debezium's Oracle connector does not ship Oracle's JDBC driver**
-  (licence); the image has to add it. A reported issue (DBZ-9681) has the
-  connector failing to read the version of the `gvenzl/oracle-free` image
-  our gate uses; to be checked in the first Oracle slice.
+  (licence); the image has to add it. *Corrected 2026-10-30 (slice 6):* the pinned image already
+  holds it. A reported issue (DBZ-9681) has the connector failing to read the version of the
+  `gvenzl/oracle-free` image our gate uses; it is fixed in Debezium 3.2.7, 3.3.3 and 3.4.0 and the
+  image holds 3.7.0.Final, and the `g4-oracle` gate is what proves it.
 - **Debezium's MongoDB connector needs a replica set** (change streams).
 
 ## What the user can do when this is done
@@ -147,8 +147,8 @@ to the AI team in `AI-16`.
 | 5 | How fresh | Changes are applied in small batches; target: a change visible in Bronze **within 2 minutes** at the source's normal rate *(proposed; the spec has no number; today's single pipeline does it within 20 s, but it writes straight to Iceberg and skips the load modes)*. Measured in the first slice and written into a result file | 2026-10-29 |
 | 6 | What lag means | Per table: now minus the source commit time of the last change applied to Bronze, in seconds; while a table has no new changes, its lag is "up to date" rather than a growing number (Kafka's backlog for that table is checked) | 2026-10-29 |
 | 7 | Lag alert | Per connector, default **15 minutes** (the spec's proposal), changeable on the connector; sent through the `SRC-7` alert channels as a new kind `connector_lag`, once when crossed and once when back under | 2026-10-29 |
-| 8 | Oracle batch | Add a connection test, column choice, incremental loads and an encrypted dial (native network encryption or TLS, as the source offers), each in the `g6-oracle` gate. The Oracle JDBC driver is fetched into the image at build time, never committed | 2026-10-29 |
-| 9 | Setup checks in the connection test | Per database, fixed sentences: PostgreSQL `wal_level=logical`, replication permission, publication; MySQL `binlog_format=ROW`, `binlog_row_image=FULL`, replication grants, binlog retention; SQL Server CDC enabled on the database and the table, SQL Server Agent running; Oracle `ARCHIVELOG`, supplemental logging, LogMiner grants; MongoDB replica set and change-stream permission. A failed check names the setting and the command that sets it; the connector can still be saved | 2026-10-29 |
+| 8 | Oracle batch | Add a connection test, column choice, incremental loads and an encrypted dial (native network encryption or TLS, as the source offers), each in the `g6-oracle` gate. Correction 2026-10-31 (slice 6): the Oracle JDBC driver already ships in the pinned Kafka Connect image (`ojdbc11` with `orai18n`, shipped with the connector since DBZ-7364), so nothing is fetched at build time and nothing is committed | 2026-10-29 |
+| 9 | Setup checks in the connection test | Per database, fixed sentences: PostgreSQL `wal_level=logical`, replication permission, publication; MySQL `binlog_format=ROW`, `binlog_row_image=FULL`, replication grants, binlog retention; SQL Server CDC enabled on the database and the table, SQL Server Agent running; Oracle `ARCHIVELOG`, supplemental logging, all-column logging on each selected table, LogMiner grants (read over an unencrypted, dictionary-only session: the exception signed on 2026-10-31, see Limits); MongoDB replica set and change-stream permission. A failed check names the setting and the command that sets it; the connector can still be saved | 2026-10-29 |
 | 10 | Building on `SEC-14` part B (#192, merged 2026-10-28) | The connection test and the setup checks build on what #192 left: PostgreSQL is tested by the console's own minimal client (`pg_probe.rs`: TLS required, `SCRAM-SHA-256` only, one fixed `SELECT 1`), so its setup checks extend that client with a few more fixed statements rather than going back to `sqlx`; SQL Server keeps encryption required; MySQL keeps `Preferred` (#192's D9). The Oracle connection test needs an Oracle client in the API, or runs in the orchestrator as discovery does today: decided in the plan | 2026-10-29 |
 | 11 | ADR | A new ADR replaces ADR 0007's "no per-connector provisioning" with decision 1, written before the first code slice | 2026-10-29 |
 | 12 | Gates | One CI job per change-capture source (each needs its own database and Kafka Connect, and the slowest connector job must stay under 20 minutes, `SRC-9` decision 1). Today's `g4-cdc` moves to the new runtime. Each gate proves: first copy, insert, update, delete, a one-hour-equivalent stop and catch-up without gaps or duplicates, lag shown, setup check failing on a missing setting | 2026-10-29 |
@@ -191,7 +191,7 @@ promise it keeps better than it says:
   not have, so that check always reads "Not checked" with that reason; the login is not
   widened. A SQL Server table the login cannot see is reported as missing CDC.
 - **Not in this slice.** MongoDB's setup check comes with MongoDB (slice 5); Oracle's with its
-  change capture (slice 6).
+  change capture (slice 6, below).
 
 ### MongoDB change capture (slice 5)
 
@@ -230,6 +230,53 @@ What `MongoDB CDC` needs and what it does not do. Proven by the `g4-mongo` gate 
   database (with the command that grants the `read` role). The orchestrator reads three facts from the server
   after the test; one it cannot read is shown as "Not checked", never as passing. The checks never change
   whether the test passed.
+
+### Oracle change capture (slice 6)
+
+What `Oracle CDC` needs and what it does not do. Proven by the `g4-oracle` gate unless a line says otherwise.
+
+- **Native network encryption, not TLS.** Oracle's JDBC driver does TLS only over TCPS with a Java trust
+  store, and the fixture could not bring Oracle Free's own TCPS listener up (`ORA-28759`, slice 1). So
+  "Require" means Oracle's native network encryption is *required* (AES256 with a SHA256 checksum): the
+  session is encrypted, the server is **not** authenticated. "Disable" sends none of it. "Verify CA" and
+  "Verify CA and host name" are refused (`SRC-37`, certificate checking over TCPS, is on the backlog). The
+  gate reads the server's own session banner to prove the encryption is on.
+- **The connection test goes through Kafka Connect.** `python-oracledb` thin mode (2.5.1, and 26.1.0) has no
+  native network encryption, so a test from the orchestrator would not use the encryption the connector
+  uses. The API asks Kafka Connect to validate the connector's configuration with the connector's own driver
+  (`SRC-4` Amendment 10). A wrong login, an unreachable server or service, and a server that refuses the
+  encryption (`ORA-12660`) each get a fixed sentence.
+- **Setup checks are read over an unencrypted connection (owner-signed exception to `SEC-14`, 2026-10-31).**
+  `SEC-14` says a stored credential is not dialled in plain text unless the person chose "Disable". After the
+  Kafka Connect test passes, the orchestrator reads Oracle's settings with thin mode, **not encrypted**:
+  `ARCHIVELOG`, minimal and all-column supplemental logging, whether each selected table exists and has
+  all-column logging, and the session's privileges and roles. Fixed statements over the data dictionary only,
+  never a table row; every value is compared in Python and none is put in a statement. The password is not sent
+  in clear text (Oracle's own logon protocol), but the session is not encrypted, and the test result says so
+  in a fixed line. A server that refuses an unencrypted session (`ORA-12660`) makes every check "Not checked"
+  with "The server requires encryption, which the setup check cannot use: check these settings by hand."
+- **Tables are typed by hand.** Listing them would need the same unencrypted session, so an Oracle
+  change-capture connector lists nothing: type each table as `SCHEMA.TABLE` in Oracle's own spelling (upper
+  case; the console upper-cases what you type, the API refuses anything else). The test tells a name that does
+  not exist ("not found"), and a table that exists without all-column logging, with the command.
+- **ARCHIVELOG needs a restart.** There is no one-line command for it; the check names the steps. Archived logs
+  must be kept for as long as a stopped connector may need to catch up: if they are deleted first, the connector
+  cannot resume where it stopped.
+- **All-column logging.** Without `ALTER TABLE ... ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS` Debezium 3.7.0
+  only logs a warning and keeps running: an update then reaches Bronze with its unchanged columns missing, and a
+  delete carries the key only. A *failed* connector can say why only for the two settings Debezium throws for
+  (`ARCHIVELOG` off, minimal supplemental logging off); the table case is visible in the test, not in a failure.
+- **The documented grants.** The connector's login is a common user (`c##...`) with Debezium's documented
+  LogMiner grants, no `DBA`: `CREATE SESSION`, `SET CONTAINER`, `LOGMINING`, `SELECT ANY TRANSACTION`,
+  `FLASHBACK ANY TABLE` (or `FLASHBACK` on each table), `SELECT ANY TABLE` (or `SELECT` on each table),
+  `EXECUTE_CATALOG_ROLE`, `SELECT_CATALOG_ROLE`, `CREATE TABLE`, `LOCK ANY TABLE`, `CREATE SEQUENCE`, and the
+  object grants on the `V_$` views the gate script lists, each `CONTAINER=ALL`. A per-table `SELECT` or
+  `FLASHBACK` cannot be seen by the test: it reads "Not checked".
+- **Debezium leaves a table behind.** Its `LOG_MINING_FLUSH` table stays in the login's schema after the
+  connector is deleted; drop it by hand if you do not want it.
+- **`source.ts_ms` is the change time of the redo row**, not the commit time, so the lag stays an upper bound.
+- **A new column** is captured when Debezium's default `online_catalog` mining sees it; the gate's last step
+  shows it (see the result below).
 
 ## Acceptance checklist
 

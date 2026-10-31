@@ -23,7 +23,7 @@ Three earlier runs on the same branch are not results; each stopped on a defect
 of the prototype or the harness, which the commit after it names: `40808162436`
 (the harness read the connector's status before it existed), `40808958427` (the
 applier named its columns `__source_ts_ms` where `dlt` writes `_source_ts_ms`, so
-every batch after the first copy was refused), `40813284847` (Debezium 3.8 ignores
+every batch after the first copy was refused), `40813284847` (Debezium 3.7.0 (the image's real version; the tag `3.8` is not a 3.8 release, corrected 2026-10-30) ignores
 the plan's delete option, see below; inserts and updates were already within
 target there).
 
@@ -117,7 +117,7 @@ was set for cost.
 
 | Service | Image |
 |---|---|
-| Kafka Connect | `quay.io/debezium/connect:3.8@sha256:d67d678c726d1659f458e057e4a3a50a3b14c3e85a3be7f31de9db53dfb46668` (tag `3.8`, the newest 3.x tag; it has no `3.8.x.Final` sibling yet; its Kafka Connect runtime reports 4.3.1) |
+| Kafka Connect | `quay.io/debezium/connect:3.8@sha256:d67d678c726d1659f458e057e4a3a50a3b14c3e85a3be7f31de9db53dfb46668` (tag `3.8`, the newest 3.x tag; **its config says `DEBEZIUM_VERSION=3.7.0.Final`**, so every "Debezium 3.8" in this file means 3.7.0, corrected 2026-10-30; its Kafka Connect runtime reports 4.3.1) |
 | Broker | `apache/kafka:3.8.0@sha256:c89f315cff967322c5d2021434b32271393cb193aa7ec1d43e97341924e57069` |
 | Source | `postgres:16` at `sha256:1beaa3084eee2676f20a9cd9928f0bf2c5bf674f8e49f81017912183d377c61c` |
 | Reader | `clickhouse/clickhouse-server:26.8` at `sha256:d426d2f612e1e189c90f9a3f8dcd85a03c6851273833817a296bb327e63aa7a7` |
@@ -131,7 +131,7 @@ was set for cost.
    batch (unit-tested) and a replayed batch (unit-tested on a local catalog;
    the crash itself was not provoked in CI).
 2. **The connector option.** The plan names `delete.handling.mode=rewrite` and
-   `drop.tombstones`. Debezium 3.8 ignores that pair: the worker's log showed the
+   `drop.tombstones`. Debezium 3.7.0 ignores that pair: the worker's log showed the
    effective `delete.tombstone.handling.mode = tombstone`, so every delete reached
    the topic with no value and none reached Bronze (run `40813284847`). The
    3.8 spelling is `transforms.unwrap.delete.tombstone.handling.mode=rewrite`.

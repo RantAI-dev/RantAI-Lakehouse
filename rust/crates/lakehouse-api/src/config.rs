@@ -310,20 +310,6 @@ pub struct Config {
     /// provider on a private network without a certificate. Never set it on a
     /// real installation. The address check (`resolve_checked`) applies either way.
     pub connector_oauth_allow_http: bool,
-    /// Whether this deployment says Oracle CDC via `Debezium`'s `LogMiner`
-    /// connector is wanted. Default `false`; `true` only for the exact string
-    /// `"true"`.
-    ///
-    /// It names an extension point, not a working feature: change capture runs
-    /// on `Kafka Connect` now (`SRC-4`), and this build has no Oracle
-    /// `LogMiner` connector class on its allowlist, so the flag changes
-    /// nothing today (the `debezium-properties` route that used to read it was
-    /// removed in `SRC-4` slice 2, decision S2-h). `LogMiner`
-    /// capture also needs `ARCHIVELOG` mode and supplemental logging on the
-    /// source database, which the batch sql adapter (`adapters/oracle.py`,
-    /// read-only `SELECT`) neither assumes nor configures. See
-    /// `docs/adr/0008-initial-snapshot-backfill.md`.
-    pub oracle_cdc_logminer_enabled: bool,
     /// Where the API reaches `Kafka Connect`'s REST API (`KAFKA_CONNECT_URL`,
     /// `SRC-4` slice 2, ADR 0016). `None` when unset or blank: a change-capture
     /// connector then answers `supported: false` with a fixed sentence instead
@@ -1112,10 +1098,6 @@ impl std::fmt::Debug for Config {
                 "connector_oauth_allow_http",
                 &self.connector_oauth_allow_http,
             )
-            .field(
-                "oracle_cdc_logminer_enabled",
-                &self.oracle_cdc_logminer_enabled,
-            )
             .field("kafka_connect_url", &self.kafka_connect_url)
             .field("cdc_kafka_bootstrap", &self.cdc_kafka_bootstrap)
             .field("cdc_secrets_dir", &self.cdc_secrets_dir)
@@ -1509,9 +1491,6 @@ impl Config {
             connector_oauth_allow_http: env
                 .get("CONNECTOR_OAUTH_ALLOW_HTTP")
                 .is_some_and(|v| v == "true"),
-            oracle_cdc_logminer_enabled: env
-                .get("ORACLE_CDC_LOGMINER_ENABLED")
-                .is_some_and(|v| v == "true"),
             kafka_connect_url: truthy(env, "KAFKA_CONNECT_URL"),
             cdc_kafka_bootstrap: truthy(env, "CDC_KAFKA_BOOTSTRAP"),
             cdc_secrets_dir: or_default(
@@ -1857,8 +1836,6 @@ mod tests {
         assert_eq!(cfg.trino_max_rows, 10_000);
         // Safe-by-default: SSRF blocking is ON unless explicitly disabled.
         assert!(!cfg.connector_probe_allow_internal_hosts);
-        // Oracle CDC via Debezium LogMiner is off by default.
-        assert!(!cfg.oracle_cdc_logminer_enabled);
     }
 
     /// Isolated from `defaults_match_typescript_fallbacks` so `cargo test
@@ -2123,15 +2100,6 @@ mod tests {
         assert!(matches!(err, ConfigError::MalformedWebhookAllowedCidrs(_)));
     }
 
-    /// The `ORACLE_CDC_LOGMINER_ENABLED` flag defaults to `false`: an unset
-    /// variable must never read as a request for a capability this build
-    /// has not validated.
-    #[test]
-    fn oracle_cdc_logminer_enabled_defaults_to_false() {
-        let cfg = Config::from_map(&HashMap::new()).unwrap();
-        assert!(!cfg.oracle_cdc_logminer_enabled);
-    }
-
     /// `KAFKA_CONNECT_URL` is unset by default, and a blank value is unset too:
     /// the API never dials a guessed address (`SRC-4` decision S2-b).
     #[test]
@@ -2164,34 +2132,6 @@ mod tests {
         assert_eq!(cfg.cdc_kafka_bootstrap, None);
         let cfg = Config::from_map(&map(&[("CDC_KAFKA_BOOTSTRAP", "kafka:9092")])).unwrap();
         assert_eq!(cfg.cdc_kafka_bootstrap.as_deref(), Some("kafka:9092"));
-    }
-
-    /// The codebase's boolean-parsing rule is exact
-    /// `== "true"`, mirroring `connector_probe_allow_internal_hosts` and
-    /// `oidc_jit_provisioning` — `TRUE`, `1`, `yes`, `on`, and any other
-    /// non-`"true"` string MUST NOT flip the flag on. This is the rule
-    /// AGENTS.md mandates, re-asserted here for the new field so a future
-    /// widening (e.g. `is_some_and` accepting truthy strings) fails this
-    /// test rather than silently extending the gate.
-    #[test]
-    fn oracle_cdc_logminer_enabled_reads_the_true_string_only() {
-        let cfg = Config::from_map(&map(&[("ORACLE_CDC_LOGMINER_ENABLED", "true")])).unwrap();
-        assert!(cfg.oracle_cdc_logminer_enabled);
-
-        for bad in ["TRUE", "True", "1", "yes", "on", "enabled", " "] {
-            let cfg = Config::from_map(&map(&[("ORACLE_CDC_LOGMINER_ENABLED", bad)])).unwrap();
-            assert!(
-                !cfg.oracle_cdc_logminer_enabled,
-                "ORACLE_CDC_LOGMINER_ENABLED={bad:?} must not enable the flag"
-            );
-        }
-
-        // And the unset case (omitted entirely from the env map) also
-        // does not enable the flag — redundant with the `defaults_...`
-        // test, but cheap and reads as a self-contained "the gate stays
-        // closed for every non-`true` value" assertion.
-        let cfg = Config::from_map(&HashMap::new()).unwrap();
-        assert!(!cfg.oracle_cdc_logminer_enabled);
     }
 
     #[test]
