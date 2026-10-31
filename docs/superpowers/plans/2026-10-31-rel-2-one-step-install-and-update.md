@@ -733,3 +733,46 @@ SHOULD-FIX 1 is fixed (`32d940d5`).
   refuse a redirect.
 
 **Open: no BLOCKER, no SHOULD-FIX.** CI runs the full workspace and the compose jobs.
+
+### Review S2 round 1 (planner, 2026-10-31, at `14ced118`)
+
+**What holds.**
+- The real job runs only on a `v*` tag push, in the `release` environment. The dry run never
+  needs a secret, and there is no `pull_request_target`.
+- The default `permissions` is `contents: read`.
+- `check_version.py`, the renderer (which reuses the digest parser), the manifest and the bundle
+  are covered by 52 tests.
+- The one-image bundle check proved a loaded image id equals the manifest's digest.
+- **Accepted:** the renderer keeps `g4-source-init`, because `debezium-server` waits for it.
+- **Carried to the S3 plan check:** on a classic Docker image store, the offline path cannot
+  compare a loaded image with its registry digest.
+
+**BLOCKER 1: the real release cannot sign.**
+- The `release` job sets `COSIGN_KEY: env://COSIGN_PRIVATE_KEY`, but nothing sets
+  `COSIGN_PRIVATE_KEY`. `grep` finds no `secrets.COSIGN_PRIVATE_KEY` anywhere, so the first real
+  tag fails at "Sign each image".
+- The dry run uses a key file, so it cannot catch this.
+- The comment also says the secret is "the base64 of the encrypted private key". It is the PEM
+  that `cosign generate-key-pair` writes, which `env://` reads as is.
+- **Fix:**
+  - Set `COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}`, as in BLOCKER 2.
+  - Make the dry run take the **same path**: export its throwaway private key's PEM into
+    `COSIGN_PRIVATE_KEY` and sign with `env://COSIGN_PRIVATE_KEY`, so the dry run proves the
+    real job's wiring.
+  - Correct the comment.
+
+**BLOCKER 2: the signing key is visible to every step of the release job.**
+- `COSIGN_PASSWORD`, and after BLOCKER 1 the key, sit in the job-level `env:`. So every step
+  sees them, including third-party actions pinned only by movable tags (`anchore/sbom-action@v0`,
+  `sigstore/cosign-installer@v4.1.2`, the `docker/*` actions).
+- **Fix:**
+  - Move both secrets into the `env:` of only the three steps that use them: "Sign each image",
+    the attest step and the `sign-blob` step.
+  - In both jobs, pin every third-party action to a full commit SHA, with the version in a
+    trailing comment (`uses: owner/action@<40-hex> # v4.1.2`).
+  - Add a test or lint step, `ops/release/test_release_workflow.py` (it parses the YAML), that
+    fails if:
+    - a `secrets.COSIGN_*` appears in a job-level `env:`;
+    - a `uses:` in `release.yml` is not pinned to a 40-hex SHA.
+
+**Open: BLOCKER 1, BLOCKER 2.**
