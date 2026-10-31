@@ -2382,7 +2382,7 @@ Accepted deviations:
 No open `BLOCKER`. Left: T5.11 merges the newer phase head (slice 6), then
 the merge into the phase branch.
 
-## Slice 6, review round 1 (planner, 2026-10-31)
+### Slice 6, review round 1 (planner, 2026-10-31)
 
 Reviewed: first-parent non-merge commits `e81abb92..a4886f32` against
 Amendments 9–12. Verified myself:
@@ -2448,7 +2448,7 @@ Open at slice close, for the planner:
 
 No open `BLOCKER`.
 
-## Slice 6, review round 2 (planner, 2026-10-31): closed
+### Slice 6, review round 2 (planner, 2026-10-31): closed
 
 Verified myself:
 - CI run 41247888991 on ee3c6e38: `success`, 38 of 38 jobs.
