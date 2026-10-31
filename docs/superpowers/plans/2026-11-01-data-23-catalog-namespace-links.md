@@ -55,7 +55,8 @@ Branch `fix/data-23-catalog-namespace-links`, base `main` at `a33e3d81`, the pla
   already sends both `id` and `name` (`rust/crates/lakehouse-api/src/routes/catalog.rs:1381-1413`,
   read, not touched).
   Tests: `catalog-page.test.tsx` (new) and `catalog-namespace-columns.test.tsx` (new), 6 tests.
-- A last commit adds this handoff to the plan file and nothing else; its hash is the branch head.
+- Two commits add this handoff to the plan file and nothing else: `fc203994` and `b0f04d25`.
+  The last one is the branch head.
 
 **Commands run, with counts** (all in the foreground)
 
