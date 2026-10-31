@@ -7,6 +7,15 @@
 # file whatever profiles are active, so a variable used only by an optional
 # profile (SEAWEEDFS_ACCESS_KEY / SEAWEEDFS_SECRET_KEY) defaults to empty
 # and `seaweedfs-iam-init` refuses to run while it is empty.
+#
+# REL-2 S1-T3 -- every third-party image below is pinned by digest
+# (`name:tag@sha256:…`). A tag is a name and a name moves; a digest is
+# the image's own identity, so the same bits run on every host and in
+# every registry mirror. The images this repository BUILDS are the
+# exception: they are named `${…_IMAGE:-…:local}` until the release
+# pipeline publishes them by digest (REL-2 S2).
+# `ops/lint/check_image_digests.py` fails the build on an unpinned image,
+# and CI runs it.
 services:
   # Phase 2 OLTP store (mutation state that ClickHouse — analytics-only, no
   # transactions — is a poor fit for). ClickHouse remains the analytics
@@ -24,7 +33,7 @@ services:
   # (uid 999) and mode 0600. Idempotent: does nothing if the certificate files
   # already exist in the volume.
   postgres-cert-init:
-    image: postgres:16
+    image: postgres:16.15@sha256:1beaa3084eee2676f20a9cd9928f0bf2c5bf674f8e49f81017912183d377c61c
     restart: "no"
     volumes:
       - lakehouse_postgres_tls:/tls
@@ -55,7 +64,7 @@ services:
         chmod 0644 /ca/ca.crt
 
   postgres:
-    image: postgres:16
+    image: postgres:16.15@sha256:1beaa3084eee2676f20a9cd9928f0bf2c5bf674f8e49f81017912183d377c61c
     # SEC-14 part B (D7/E4): ssl=on with cert and key from lakehouse_postgres_tls.
     # `wal_level=logical` (+ enough slots/senders for a handful of CDC
     # connectors): P5 needs Postgres logical replication for
@@ -109,7 +118,7 @@ services:
   # `expire_snapshots` is refused) is a 26.8 fact, so a branch running 26.3
   # with 26.8-shaped verbs fails its own gate.
   clickhouse:
-    image: clickhouse/clickhouse-server:26.8
+    image: clickhouse/clickhouse-server:26.8@sha256:d426d2f612e1e189c90f9a3f8dcd85a03c6851273833817a296bb327e63aa7a7
     environment:
       CLICKHOUSE_USER: ${CH_USER:-default}
       CLICKHOUSE_PASSWORD: ${CH_PASSWORD:-}
@@ -122,6 +131,16 @@ services:
       - "${CH_NATIVE_HOST_PORT:-9000}:9000"
     volumes:
       - lakehouse_clickhouse_data:/var/lib/clickhouse
+      # REL-2 S1-T4 (D8): the local backup disk. `BACKUP DATABASE ... TO
+      # Disk('backups', ...)` writes here; `ops/backups/backup-local.sh`
+      # copies the files out to the host, and the restore copies them back
+      # in. A named volume (not a path in the data volume) so the backup
+      # files can be moved without the server's own data, and so the
+      # restore can put them back with one mount.
+      - lakehouse_clickhouse_backups:/var/lib/clickhouse/backups
+      # The disk's definition — ClickHouse reads every file in
+      # `config.d/`. Read-only: the server only ever reads it.
+      - ./ops/backups/clickhouse/backups.xml:/etc/clickhouse-server/config.d/rel2-backups.xml:ro
     healthcheck:
       test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1"]
       interval: 5s
@@ -147,12 +166,11 @@ services:
       # WS4 item C2 — the source tree `GET /api/pipelines/{id}/source`
       # serves from, baked into the image via a SECOND, independent build
       # context rather than widening `context` above to the repository
-      # root (judge review V8: the untracked, developer-owned
-      # `.dockerignore` excludes `rust`/`docs`/`*.md` and would break
-      # every `COPY rust/...` a `context: .` change would require; a
-      # clean checkout with NO `.dockerignore` at all would instead send
-      # the ENTIRE repository — `.git`, `node_modules`, every
-      # workstream's checkout — as build context, unbounded). Neither
+      # root (judge review V8: the repository root's `.dockerignore`
+      # excludes `rust`/`docs`/`*.md`, so a `context: .` change would
+      # break every `COPY rust/...` this file needs; that ignore file is
+      # read only by a build whose context IS the root, so it does not
+      # apply to this one — but it would apply to that change). Neither
       # `context` nor `dockerfile` above changes at all.
       additional_contexts:
         pipeline_src: ./dagster/dispar_orchestrate
@@ -732,9 +750,86 @@ services:
       - lakehouse_connector_secrets:/run/secrets
       # SEC-14 part B (D5/D7): CA certificate for connector dials. Read-only.
       - lakehouse_postgres_ca:/run/certs/postgres:ro
+    # REL-2 S1-T2: the API's own healthcheck, so the `console` service below
+    # can wait for it (`depends_on: condition: service_healthy`) instead of
+    # starting next to a process that is still applying migrations.
+    #
+    # `/health` (liveness), NOT `/health/ready` (REL-2 D7): this process
+    # serves its Phase 1 routes even when Postgres is unreachable, so
+    # "the process answers" is the honest question for a compose health
+    # check — the console starts and shows what is broken instead of not
+    # starting at all. The readiness route is what an installer or an
+    # updater waits on.
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS -o /dev/null http://127.0.0.1:8080/health || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
     restart: unless-stopped
 
-  # P1 — S3-compatible object store, the default self-hosted implementation
+  # REL-2 S1-T2 — the console, in Compose.
+  #
+  # The Next.js console, built from `Dockerfile.frontend`: the SAME image
+  # the staging deploy builds (`deploy-staging.yml`, "Build frontend
+  # image") and runs by hand (`docker run --network
+  # rantai-lakehouse_default -p 3000:3000 -e
+  # RUST_API_URL=http://lakehouse-api:8080 --restart unless-stopped`).
+  # Compose runs it the same way, so a local stack and a deployment
+  # behave the same — before this, an operator had to start the console
+  # on the host with `bun next dev` (README's developer path), which is
+  # not something a server without Bun can do.
+  #
+  # The image name follows the same shape as the API's (a stable name, so
+  # the release pipeline can publish it by digest later — REL-2 S2) and
+  # the locally built one keeps the `:local` tag.
+  console:
+    image: ${CONSOLE_IMAGE:-rantai-lakehouse-console:local}
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+      # `next.config.ts`'s `rewrites()` read `RUST_API_URL` WHEN `next
+      # build` RUNS, and Next serialises the result into the standalone
+      # server — a runtime env var does NOT move the `/api` proxy (see
+      # `Dockerfile.frontend`'s own comment, and the staging deploy's
+      # build). So this build arg is the one that decides where `/api`
+      # goes; the runtime value below is only read by code that reads
+      # `process.env` directly.
+      args:
+        RUST_API_URL: ${CONSOLE_API_URL:-http://lakehouse-api:8080}
+    ports:
+      # The `dagster` profile's webserver wants 3000 as well
+      # (`DAGSTER_WEBSERVER_HOST_PORT`); set `CONSOLE_HOST_PORT` to
+      # another port when that profile is on.
+      - "${CONSOLE_HOST_PORT:-3000}:3000"
+    depends_on:
+      # The console is nothing without the API, and the API is nothing
+      # without Postgres and ClickHouse: waiting for the API to report
+      # healthy means the console starts after the stack can serve, not
+      # next to a process that is still applying migrations.
+      lakehouse-api:
+        condition: service_healthy
+    environment:
+      RUST_API_URL: ${CONSOLE_API_URL:-http://lakehouse-api:8080}
+      # Next.js's standalone server binds to `process.env.HOSTNAME`, and
+      # Docker sets that to the container's own name — so the server
+      # would listen on the container's address only, and nothing could
+      # reach it at `127.0.0.1` (the healthcheck below) — `0.0.0.0` is
+      # what a published port needs.
+      HOSTNAME: 0.0.0.0
+    healthcheck:
+      # The console's own port. `node:22-alpine` carries busybox's
+      # `wget`, which is what the ClickHouse service's healthcheck uses
+      # too — but it resolves `localhost` to IPv6 first and gives up
+      # there, while the standalone server listens on IPv4 only: ask for
+      # `127.0.0.1` by name.
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://127.0.0.1:3000/ || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+    restart: unless-stopped
+
   # for the lakehouse warehouse. RustFS, not MinIO (locked decision: MinIO
   # is not a supported target). All access — including bucket bootstrap
   # below — goes through the plain S3 API, never a proprietary admin call.
@@ -745,7 +840,7 @@ services:
   # calls, not as a `lakehouse-api` boot failure — nothing in this phase
   # wires RustFS into the API's own startup path.
   rustfs:
-    image: rustfs/rustfs:1.0.0-rc.4
+    image: rustfs/rustfs:1.0.0-rc.4@sha256:a9fbb5e5bfce09ccd0869ac9a7b0e39191c6868d75ec4c5d08ebbd5475db5d6b
     environment:
       RUSTFS_VOLUMES: /data
       RUSTFS_ADDRESS: 0.0.0.0:9000
@@ -773,7 +868,7 @@ services:
   # (aws-cli `s3api create-bucket`) — never RustFS's admin API. Idempotent:
   # re-running against an already-created bucket is a no-op success.
   rustfs-bucket-init:
-    image: amazon/aws-cli:2.36.34
+    image: amazon/aws-cli:2.36.34@sha256:cf1f5e5741c33f3fee383296ba8045b96b9eb93c3de017be6688fb00356352d7
     depends_on:
       rustfs:
         condition: service_healthy
@@ -817,7 +912,7 @@ services:
   # schema mixed into the `lakehouse` application database's `console`
   # schema — Lakekeeper owns and migrates its own schema independently.
   lakekeeper-db-init:
-    image: postgres:16
+    image: postgres:16.15@sha256:1beaa3084eee2676f20a9cd9928f0bf2c5bf674f8e49f81017912183d377c61c
     depends_on:
       postgres:
         condition: service_healthy
@@ -849,7 +944,7 @@ services:
   # itself — see that service's comment on why (distroless image, no
   # `healthcheck:` possible).
   lakekeeper-migrate:
-    image: quay.io/lakekeeper/catalog:v0.13.3
+    image: quay.io/lakekeeper/catalog:v0.13.3@sha256:db2ba6168eb107f22242fb7f2edc4016fa35e57bdcc606894e809c418e32e8dc
     depends_on:
       lakekeeper-db-init:
         condition: service_completed_successfully
@@ -869,7 +964,7 @@ services:
   # service. Mirrors `lakekeeper-db-init` exactly: a dedicated database, not
   # a schema mixed into another service's database.
   openfga-db-init:
-    image: postgres:16
+    image: postgres:16.15@sha256:1beaa3084eee2676f20a9cd9928f0bf2c5bf674f8e49f81017912183d377c61c
     depends_on:
       postgres:
         condition: service_healthy
@@ -902,7 +997,7 @@ services:
   # hand-written DDL), mirroring `lakekeeper-migrate`. Must complete before
   # `openfga` (run) starts.
   openfga-migrate:
-    image: openfga/openfga:v1.8
+    image: openfga/openfga:v1.8@sha256:1e84deddc7c84de8344f3eb0d443c5439666198b68ac37c24fd76fd2e8c1f629
     depends_on:
       openfga-db-init:
         condition: service_completed_successfully
@@ -926,7 +1021,7 @@ services:
   # developer console; the Management API + `docs/adr/0011` are the
   # interface operators use.
   openfga:
-    image: openfga/openfga:v1.8
+    image: openfga/openfga:v1.8@sha256:1e84deddc7c84de8344f3eb0d443c5439666198b68ac37c24fd76fd2e8c1f629
     depends_on:
       openfga-migrate:
         condition: service_completed_successfully
@@ -957,7 +1052,7 @@ services:
   # OpenFGA actually reachable (`lakekeeper`) depends on THIS completing,
   # not on `openfga` itself reporting healthy.
   openfga-ready:
-    image: curlimages/curl:8.10.1
+    image: curlimages/curl:8.10.1@sha256:d9b4541e214bcd85196d6e92e2753ac6d0ea699f0af5741f8c6cccbfcf00ef4b
     depends_on:
       openfga:
         condition: service_started
@@ -999,7 +1094,7 @@ services:
   # (`PDF_AT_ONCE`) fits; a bigger dashboard fails with a fixed sentence
   # instead of taking the host down.
   gotenberg:
-    image: gotenberg/gotenberg:8.37.0
+    image: gotenberg/gotenberg:8.37.0@sha256:f29984bd1e226bf1b93ba90af06000afa8b315853e99d27b9aaa41b93f15c769
     command:
       - gotenberg
       - --api-timeout=70s
@@ -1070,7 +1165,7 @@ services:
   # enforcement opt-in was exactly how `allow-all` shipped as this stack's
   # default for five phases; the shipped default must be the secure one.
   lakekeeper:
-    image: quay.io/lakekeeper/catalog:v0.13.3
+    image: quay.io/lakekeeper/catalog:v0.13.3@sha256:db2ba6168eb107f22242fb7f2edc4016fa35e57bdcc606894e809c418e32e8dc
     # Empty search domain: on hosts whose own /etc/resolv.conf carries a
     # search suffix (VPN/corporate DNS, Tailscale MagicDNS, ...), that
     # suffix leaks into the container's resolv.conf too. Lakekeeper's
@@ -1145,7 +1240,7 @@ services:
   # no separate self-registration call is needed for `admin` here (unlike
   # the other principals, see `lakekeeper-authz-init` below).
   lakekeeper-warehouse-init:
-    image: alpine:3.20
+    image: alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
     depends_on:
       lakekeeper:
         condition: service_healthy
@@ -1307,7 +1402,7 @@ services:
   #   - `unauthorized-test`: registered (Lakekeeper knows who it is) but
   #     NEVER granted anything — the negative-test principal.
   lakekeeper-authz-init:
-    image: alpine:3.20
+    image: alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
     depends_on:
       lakekeeper-warehouse-init:
         condition: service_completed_successfully
@@ -1509,7 +1604,7 @@ services:
   # none of those jobs, so the API never reads through another job's
   # database. `IF NOT EXISTS`: safe to re-run on every `up`.
   clickhouse-iceberg-init:
-    image: clickhouse/clickhouse-server:26.8
+    image: clickhouse/clickhouse-server:26.8@sha256:d426d2f612e1e189c90f9a3f8dcd85a03c6851273833817a296bb327e63aa7a7
     depends_on:
       clickhouse:
         condition: service_healthy
@@ -1539,7 +1634,7 @@ services:
     # Same pin as `rust/rust-toolchain.toml` (`channel = "1.99.1"`),
     # `rust/Dockerfile`, and CI's `stable`-job resolution through that
     # file, so acceptance and CI compile with one compiler.
-    image: rust:1.99.1-slim
+    image: rust:1.99.1-slim@sha256:b8e062b1c3a80183df83d9ba187cadd2b5ab84bc78d453dbfeb2fccd5f982247
     working_dir: /workspace
     volumes:
       - ./rust:/workspace
@@ -1608,7 +1703,7 @@ services:
   #   docker compose -p <project> --profile test run --rm gold-export-test-runner
   gold-export-test-runner:
     profiles: ["dagster"]
-    image: python:3.12-slim
+    image: python:3.12-slim@sha256:aa943ce411423c7582288f18707ff66eddcbaeb510502d747a72aeb34f30d159
     working_dir: /work
     volumes:
       - ./ops/gold_export:/work
@@ -1695,7 +1790,7 @@ services:
   # more than one container needs to agree on the same key.
   seaweedfs-iam-init:
     profiles: ["seaweedfs"]
-    image: alpine:3.20
+    image: alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
     environment:
       # SEC-18: no repository-written default. Compose interpolates the
       # whole file whatever profiles are active, so `${VAR:?}` here would
@@ -1755,7 +1850,7 @@ services:
   # makes that render happen before this container ever reads the file.
   seaweedfs:
     profiles: ["seaweedfs"]
-    image: chrislusf/seaweedfs:4.44
+    image: chrislusf/seaweedfs:4.44@sha256:e67e8c385484120b78bff47ba5f4debbca47fbd27ed1a39f016f47e8baea615b
     depends_on:
       seaweedfs-iam-init:
         condition: service_completed_successfully
@@ -1790,7 +1885,7 @@ services:
   # the plain S3 API only. Opt-in with `seaweedfs`.
   seaweedfs-bucket-init:
     profiles: ["seaweedfs"]
-    image: amazon/aws-cli:2.36.34
+    image: amazon/aws-cli:2.36.34@sha256:cf1f5e5741c33f3fee383296ba8045b96b9eb93c3de017be6688fb00356352d7
     depends_on:
       seaweedfs:
         condition: service_healthy
@@ -1849,7 +1944,7 @@ services:
   # and warehouse name baked into the JSON body.
   lakekeeper-warehouse-init-seaweedfs:
     profiles: ["seaweedfs"]
-    image: alpine:3.20
+    image: alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
     depends_on:
       lakekeeper:
         condition: service_healthy
@@ -1934,7 +2029,7 @@ services:
   # per-warehouse); this job only grants.
   lakekeeper-authz-init-seaweedfs:
     profiles: ["seaweedfs"]
-    image: alpine:3.20
+    image: alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
     depends_on:
       lakekeeper-warehouse-init-seaweedfs:
         condition: service_completed_successfully
@@ -2003,7 +2098,7 @@ services:
   # docs/adr/0005-dagster-code-location-ownership-and-packaging.md.
   dagster-db-init:
     profiles: ["dagster"]
-    image: postgres:16
+    image: postgres:16.15@sha256:1beaa3084eee2676f20a9cd9928f0bf2c5bf674f8e49f81017912183d377c61c
     depends_on:
       postgres:
         condition: service_healthy
@@ -2487,7 +2582,7 @@ services:
     # dependency anywhere under the `test` profile. This was caught during
     # P3 verification precisely because that regression check was run.
     profiles: ["dagster"]
-    image: postgres:16
+    image: postgres:16.15@sha256:1beaa3084eee2676f20a9cd9928f0bf2c5bf674f8e49f81017912183d377c61c
     depends_on:
       postgres:
         condition: service_healthy
@@ -2549,7 +2644,7 @@ services:
   #   docker compose -p <project> --profile dagster run --rm g3a-test-runner
   g3a-test-runner:
     profiles: ["dagster"]
-    image: python:3.12-slim
+    image: python:3.12-slim@sha256:aa943ce411423c7582288f18707ff66eddcbaeb510502d747a72aeb34f30d159
     working_dir: /work
     volumes:
       - ./ops/g3a:/work
@@ -2711,7 +2806,7 @@ services:
   #   docker compose -p <project> --profile dagster run --rm bld1-test-runner
   bld1-test-runner:
     profiles: ["dagster"]
-    image: python:3.12-slim
+    image: python:3.12-slim@sha256:aa943ce411423c7582288f18707ff66eddcbaeb510502d747a72aeb34f30d159
     working_dir: /work
     volumes:
       - ./ops/g7:/work:ro
@@ -2789,7 +2884,7 @@ services:
   #   docker compose -p <project> --profile dagster run --rm g9-test-runner
   g9-test-runner:
     profiles: ["dagster"]
-    image: python:3.12-slim
+    image: python:3.12-slim@sha256:aa943ce411423c7582288f18707ff66eddcbaeb510502d747a72aeb34f30d159
     working_dir: /work
     volumes:
       - ./ops/g9:/work/g9:ro
@@ -2823,7 +2918,7 @@ services:
   # itself `dagster`-gated.
   g3-maintenance-test-runner:
     profiles: ["dagster"]
-    image: python:3.12-slim
+    image: python:3.12-slim@sha256:aa943ce411423c7582288f18707ff66eddcbaeb510502d747a72aeb34f30d159
     working_dir: /work
     volumes:
       - ./ops/g3:/work
@@ -2911,7 +3006,7 @@ services:
   # publish is split into its own opt-in-profiled sidecar instead).
   trino:
     profiles: ["trino"]
-    image: trinodb/trino:483
+    image: trinodb/trino:483@sha256:db58cc93e593a2706553745f276bb119c9810e69918be56ecde088ba7ccb0534
     depends_on:
       lakekeeper-authz-init:
         condition: service_completed_successfully
@@ -3139,7 +3234,7 @@ services:
   # on a host you trust every network-adjacent actor on.
   trino-host-port:
     profiles: ["${TRINO_PUBLISH_HOST_PORT:-trino-host-port-disabled}"]
-    image: alpine:3.20
+    image: alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
     network_mode: "service:trino"
     depends_on:
       trino:
@@ -3161,7 +3256,7 @@ services:
   # role of its own.
   trino-maintenance-cron:
     profiles: ["trino"]
-    image: trinodb/trino:483
+    image: trinodb/trino:483@sha256:db58cc93e593a2706553745f276bb119c9810e69918be56ecde088ba7ccb0534
     depends_on:
       trino:
         condition: service_healthy
@@ -3182,7 +3277,7 @@ services:
   # sits behind `debezium-server`, which is itself `dagster`-gated below).
   g4-source-init:
     profiles: ["dagster"]
-    image: postgres:16
+    image: postgres:16.15@sha256:1beaa3084eee2676f20a9cd9928f0bf2c5bf674f8e49f81017912183d377c61c
     depends_on:
       postgres:
         condition: service_healthy
@@ -3253,7 +3348,7 @@ services:
   # debezium container's own localhost.
   debezium-localhost-proxy:
     profiles: ["dagster"]
-    image: alpine/socat:latest
+    image: alpine/socat:1.8.1.3@sha256:466c8a0383e16463fabdb7df01008292fb78d07da60224a46cb5d3142ce122ed
     command: tcp-listen:8181,fork,reuseaddr tcp:lakekeeper:8181
     depends_on:
       lakekeeper:
@@ -3367,7 +3462,7 @@ services:
   #   docker compose -p <project> --profile dagster run --rm g4-test-runner
   g4-test-runner:
     profiles: ["dagster"]
-    image: python:3.12-slim
+    image: python:3.12-slim@sha256:aa943ce411423c7582288f18707ff66eddcbaeb510502d747a72aeb34f30d159
     working_dir: /work
     volumes:
       - ./ops/g4:/work
@@ -3493,7 +3588,7 @@ services:
   #   docker compose -p <project> --profile test run --rm g2-test-runner
   g2-test-runner:
     profiles: ["test"]
-    image: python:3.12-slim
+    image: python:3.12-slim@sha256:aa943ce411423c7582288f18707ff66eddcbaeb510502d747a72aeb34f30d159
     working_dir: /work
     volumes:
       - ./ops/g2:/work
@@ -3535,7 +3630,7 @@ services:
   #   docker compose -p <project> --profile test run --rm g8-test-runner
   g8-test-runner:
     profiles: ["test"]
-    image: python:3.12-slim
+    image: python:3.12-slim@sha256:aa943ce411423c7582288f18707ff66eddcbaeb510502d747a72aeb34f30d159
     working_dir: /work
     volumes:
       - ./ops/g8:/work
@@ -3583,7 +3678,7 @@ services:
   #     g8-time-travel-test-runner
   g8-time-travel-test-runner:
     profiles: ["dagster"]
-    image: python:3.12-slim
+    image: python:3.12-slim@sha256:aa943ce411423c7582288f18707ff66eddcbaeb510502d747a72aeb34f30d159
     working_dir: /work
     volumes:
       - ./ops/g8:/work
@@ -3640,7 +3735,7 @@ services:
   # invocation adds with `-f`; they stay `${VAR:?}` there too, so the gate
   # still fails closed without real values.
   mysql-g6:
-    image: mysql:8
+    image: mysql:8.4.13@sha256:a0225d1ea6631c8bc2385dc4c2faba17bbf1834ecf369e1659a9a382bd8d5dd7
     profiles: ["g6", "g6-sql"]
     restart: "no"
     environment:
@@ -3664,7 +3759,7 @@ services:
   # dial in this gate connects by) so the real, unrelaxed verification
   # path is what gets exercised end-to-end, not a weakened one.
   mssql-g6-cert-init:
-    image: alpine:3.20
+    image: alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
     profiles: ["g6", "g6-sql"]
     restart: "no"
     volumes:
@@ -3709,7 +3804,7 @@ services:
         chmod 644 /out/ca.crt /out/mssql-g6.key /out/mssql-g6.pem; }
 
   mssql-g6:
-    image: mcr.microsoft.com/mssql/server:2022-latest
+    image: mcr.microsoft.com/mssql/server:2022-CU27-GDR1-ubuntu-22.04@sha256:cf8f0ab2ebe61feec2eed2629061a07d247f791c2a8ddda74a4ac9f06a291718
     profiles: ["g6", "g6-sql"]
     restart: "no"
     depends_on:
@@ -3768,7 +3863,7 @@ services:
   # configured either) — neither is reachable outside this compose
   # network regardless.
   mongo-g6:
-    image: mongo:7
+    image: mongo:7.0.45@sha256:8bb4442761a63a8dda452744082cdac9644b429807eb977b42324a63cef59ca4
     profiles: ["g6", "g6-other"]
     restart: "no"
     environment:
@@ -3793,7 +3888,7 @@ services:
   # is given, which is fine for a `restart: "no"` fixture that is never
   # expected to survive a restart with existing data.
   kafka-g6:
-    image: apache/kafka:3.8.0
+    image: apache/kafka:3.8.0@sha256:c89f315cff967322c5d2021434b32271393cb193aa7ec1d43e97341924e57069
     profiles: ["g6", "g6-other"]
     restart: "no"
     environment:
@@ -3826,7 +3921,7 @@ services:
   # additional trick is needed to land the address in a private range:
   # every compose-network container already is one.
   kafka-g6-spoofed:
-    image: apache/kafka:3.8.0
+    image: apache/kafka:3.8.0@sha256:c89f315cff967322c5d2021434b32271393cb193aa7ec1d43e97341924e57069
     # Its own profile, "g6-linklocal", shared only with
     # `g6-test-runner-linklocal` (whose `depends_on` names it: compose
     # validates every depends_on target against the active profile set).
@@ -3950,7 +4045,7 @@ services:
   # `--profile g6-linklocal --profile dagster`.
   g6-test-runner-linklocal:
     profiles: ["g6-linklocal"]
-    image: python:3.12-slim
+    image: python:3.12-slim@sha256:aa943ce411423c7582288f18707ff66eddcbaeb510502d747a72aeb34f30d159
     working_dir: /work
     volumes:
       - ./ops/g6:/work
@@ -3996,6 +4091,11 @@ volumes:
   # will have no credential until one is saved again.
   lakehouse_connector_secrets:
   lakehouse_clickhouse_data:
+  # REL-2 S1-T4 (D8): the local backup disk `ClickHouse` writes its
+  # `BACKUP DATABASE ... TO Disk('backups', ...)` output into. It holds
+  # BACKUP files, not the server's data — the server's data stays in
+  # `lakehouse_clickhouse_data`.
+  lakehouse_clickhouse_backups:
   lakehouse_rustfs_data:
   lakehouse_seaweedfs_data:
   lakehouse_seaweedfs_iam:

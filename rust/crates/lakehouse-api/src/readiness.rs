@@ -1,0 +1,747 @@
+//! `GET /health/ready` — the readiness probe a deployment waits on
+//! (REL-2 decision D7).
+//!
+//! # Why this is not `GET /health`
+//!
+//! `GET /health` is a liveness probe: it answers `200` whenever the process
+//! can answer at all, because a deployment with no usable `Postgres` still
+//! serves every Phase 1 route, and the ops gates (`ops/g*/`) poll it for a
+//! `200` to decide the API is up. It says nothing about whether the stack
+//! is ready to serve traffic.
+//!
+//! This route answers the other question, and it is the one an installer or
+//! an updater waits on: `200` when the dependencies this service needs are
+//! there and usable, `503` when they are not. `lakehousectl update` (REL-2
+//! slice S4) waits for this route to report the NEW version before it
+//! calls an update successful.
+//!
+//! # The three checks, and what each one proves
+//!
+//! - `postgres`: the database answers AND its schema is at this build's
+//!   version — the highest applied migration equals the highest migration
+//!   embedded in this binary. A database that is one migration behind is
+//!   not ready for this build, and one that is ahead of it is not either
+//!   (an old binary must not serve a newer schema).
+//! - `clickhouse`: `ClickHouse` answers `SELECT 1`.
+//! - `lakekeeper`: the Iceberg REST catalog answers its own config request
+//!   (`GET {catalog}/v1/config?warehouse=…`), the same call the catalog
+//!   client makes when it connects.
+//!
+//! # The body carries no upstream text
+//!
+//! Every check is `"ok"` or `"failed"` and nothing else (AGENTS.md rule 4:
+//! upstream error text never reaches a response). The reason a check failed
+//! is in the log, under the same line the probe wrote, not in the response:
+//! a readiness route is public, so its body is read by anything that can
+//! reach the port.
+//!
+//! # The answer is reused for two seconds
+//!
+//! This route is PUBLIC (no token, see `crate::policy`'s table), and every
+//! call it made fanned out into a Postgres query, a `ClickHouse` query and
+//! a `Lakekeeper` HTTP call that reads a token file. A loop of anonymous
+//! requests therefore turned into three times as much backend load, so the
+//! computed answer is reused for [`CACHE_WINDOW`] and callers that arrive
+//! together share ONE probe (REL-2 S1 review SHOULD-FIX 1).
+//!
+//! The window is short on purpose: an updater waits on this route for a
+//! NEW version (REL-2 slice S4), so the answer must never report a
+//! dependency that broke more than two seconds ago.
+//!
+//! # One HTTP client, and no redirects
+//!
+//! The catalog probe used to build a `reqwest::Client` per call — and
+//! every client owns a connection pool — with redirects ON. There is now
+//! ONE shared client, and it does not follow redirects: the probe answers
+//! with the catalog's reader token, so a redirect must not carry that
+//! token to another host (REL-2 S1 review SHOULD-FIX 1).
+
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
+
+use serde::Serialize;
+
+use crate::lakekeeper_token::read_token_file;
+use crate::state::AppState;
+
+/// The version this build reports on `/health` and `/health/ready`.
+///
+/// `CARGO_PKG_VERSION` of this crate — the same string the release
+/// pipeline will publish (REL-2 slice S2), so a console can compare what
+/// it was built against with what the server runs.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// How long one readiness check may take before it counts as failed.
+///
+/// The same bound [`crate::health`]'s service probes use: a readiness
+/// route is polled (by `docker compose`'s health check, by an updater
+/// waiting for a new version), so a dead dependency must never make the
+/// answer wait on a socket timeout.
+const PROBE_TIMEOUT: Duration = crate::health::PROBE_TIMEOUT;
+
+/// How long a computed readiness answer is reused before a read
+/// re-probes (REL-2 S1 review SHOULD-FIX 1).
+///
+/// Two seconds: long enough that a poll loop does not turn into one
+/// probe per request, short enough that the route never reports a
+/// dependency that broke more than a moment ago.
+const CACHE_WINDOW: Duration = Duration::from_secs(2);
+
+/// The purpose and env var [`read_token_file`] names when the reader token
+/// cannot be read — the same pair `routes::lakehouse` uses for the same
+/// file, so the operator sees one name for one thing (AGENTS.md rule 4).
+const READER_PURPOSE: &str = "lakehouse-api-reader";
+const READER_TOKEN_ENV_VAR: &str = "LAKEKEEPER_READ_TOKEN_FILE";
+
+/// One check's outcome.
+///
+/// Only two values, and neither carries a reason: `"ok"` or `"failed"`.
+/// The reason is in the log (AGENTS.md rule 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Check {
+    /// The check ran and the dependency answered.
+    Ok,
+    /// The check failed, timed out, or could not run at all.
+    Failed,
+}
+
+impl Check {
+    /// Whether this check passed.
+    #[must_use]
+    pub fn is_ok(self) -> bool {
+        matches!(self, Self::Ok)
+    }
+}
+
+/// The three dependencies this service needs to be ready.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Checks {
+    /// The application database, at this build's schema version.
+    pub postgres: Check,
+    /// The analytical store.
+    pub clickhouse: Check,
+    /// The Iceberg REST catalog.
+    pub lakekeeper: Check,
+}
+
+impl Checks {
+    /// Whether every check passed — the whole answer of this route.
+    #[must_use]
+    pub fn all_ok(self) -> bool {
+        self.postgres.is_ok() && self.clickhouse.is_ok() && self.lakekeeper.is_ok()
+    }
+}
+
+/// The body of `GET /health/ready`.
+///
+/// The same shape for `200` and `503`: a caller that gets `503` still
+/// learns which dependency is not ready, without any upstream text.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadyBody {
+    /// `true` when every check passed.
+    pub ready: bool,
+    /// This build's version (see [`VERSION`]).
+    pub version: &'static str,
+    /// The three checks, one per dependency.
+    pub checks: Checks,
+}
+
+impl ReadyBody {
+    /// The body for a finished set of checks.
+    #[must_use]
+    pub fn new(checks: Checks) -> Self {
+        Self {
+            ready: checks.all_ok(),
+            version: VERSION,
+            checks,
+        }
+    }
+}
+
+/// The readiness cache: the last computed [`ReadyBody`] and the moment it
+/// was computed (REL-2 S1 review SHOULD-FIX 1).
+///
+/// One entry, not a map: this process answers for ONE deployment, so
+/// there is one readiness answer to cache. The lock is held ACROSS the
+/// probe, so callers that arrive together share one probe instead of
+/// each running their own.
+///
+/// It lives in [`crate::state::AppState`] (the same shape as
+/// `crate::health`'s `HealthCache`), so the cache belongs to the
+/// deployment it answers for and not to the process.
+pub type ReadyCache = Arc<tokio::sync::Mutex<Option<(ReadyBody, Instant)>>>;
+
+/// The one HTTP client the catalog probe uses.
+///
+/// `None` when the client could not be built at all (the TLS backend or
+/// the connector refused) — the catalog check then fails closed, with the
+/// reason in the log.
+static HTTP_CLIENT: OnceLock<Option<reqwest::Client>> = OnceLock::new();
+
+/// The shared client, built once.
+///
+/// Redirects are OFF: the probe sends the catalog's reader token, and a
+/// redirect must not carry that token to another host. The client's own
+/// timeout is the probe timeout, so a hung catalog cannot outlast the
+/// probe's own bound (REL-2 S1 review SHOULD-FIX 1).
+fn http_client() -> Option<&'static reqwest::Client> {
+    HTTP_CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(PROBE_TIMEOUT)
+                .build()
+                .inspect_err(|err| {
+                    tracing::warn!(
+                        error = ?err,
+                        "the readiness probe could not build its HTTP client"
+                    );
+                })
+                .ok()
+        })
+        .as_ref()
+}
+
+/// The body of `GET /health/ready`, reused for [`CACHE_WINDOW`].
+///
+/// The public route calls this, so a loop of anonymous requests runs ONE
+/// probe per window instead of one per request (REL-2 S1 review
+/// SHOULD-FIX 1). Callers that arrive together share that probe: the
+/// cache lock is held while the probe runs.
+pub async fn ready_body(state: &AppState) -> ReadyBody {
+    cached_ready_with(&state.readiness_cache, Instant::now, || probe_body(state)).await
+}
+
+/// The body for a fresh set of checks.
+async fn probe_body(state: &AppState) -> ReadyBody {
+    ReadyBody::new(probe(state).await)
+}
+
+/// The core cache logic with an injected clock and probe function, so the
+/// window is tested without sleeping and without a real clock — the same
+/// shape [`crate::health`]'s own cache uses.
+async fn cached_ready_with<F, Fut>(
+    cache: &ReadyCache,
+    now: impl Fn() -> Instant,
+    probe: F,
+) -> ReadyBody
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = ReadyBody>,
+{
+    let mut guard = cache.lock().await;
+    let current = now();
+    if let Some((cached, computed_at)) = guard.as_ref()
+        && current.saturating_duration_since(*computed_at) < CACHE_WINDOW
+    {
+        return cached.clone();
+    }
+    let fresh = probe().await;
+    // The window is measured from the END of the probe, so the answer is
+    // never older than the window says it is.
+    *guard = Some((fresh.clone(), now()));
+    fresh
+}
+
+/// Probe the three dependencies, concurrently.
+///
+/// Each probe is bounded by [`PROBE_TIMEOUT`], so the whole answer takes
+/// about as long as the slowest dependency, not the sum.
+async fn probe(state: &AppState) -> Checks {
+    let (postgres, clickhouse, lakekeeper) = tokio::join!(
+        probe_postgres(state),
+        probe_clickhouse(state),
+        probe_lakekeeper(state),
+    );
+    Checks {
+        postgres,
+        clickhouse,
+        lakekeeper,
+    }
+}
+
+/// Is the database's schema version this build's schema version?
+///
+/// Exactly equal, on purpose: a database one migration BEHIND this build
+/// cannot serve this build's routes, and a database one migration AHEAD of
+/// it was written by a newer build than this one — an old binary must not
+/// claim to be ready for it either.
+#[must_use]
+pub fn schema_is_current(applied: i64, embedded: i64) -> bool {
+    applied == embedded
+}
+
+/// Is the database reachable AND at this build's schema version?
+///
+/// The two are one check because they answer one question: "can this build
+/// work against this database?". A database that is behind is not ready
+/// for this build, and neither is one that is ahead of it.
+///
+/// The version comparison is the honest one: this build's expectation comes
+/// from the migration set embedded in the binary
+/// ([`lakehouse_store::embedded_schema_version`]), and the database's
+/// state comes from `sqlx`'s own bookkeeping table
+/// ([`lakehouse_store::applied_schema_version`]). Neither side is guessed.
+async fn probe_postgres(state: &AppState) -> Check {
+    let Some(pool) = state.pg.as_deref() else {
+        tracing::warn!("the readiness probe found no Postgres pool: DATABASE_URL did not parse");
+        return Check::Failed;
+    };
+    let embedded = lakehouse_store::embedded_schema_version();
+    match tokio::time::timeout(PROBE_TIMEOUT, lakehouse_store::applied_schema_version(pool)).await {
+        Ok(Ok(applied)) if schema_is_current(applied, embedded) => Check::Ok,
+        Ok(Ok(applied)) => {
+            tracing::warn!(
+                applied,
+                embedded,
+                "the readiness probe found the database at another schema version than this build's"
+            );
+            Check::Failed
+        }
+        Ok(Err(err)) => {
+            tracing::warn!(
+                error = ?err,
+                "the readiness probe could not read the applied schema version"
+            );
+            Check::Failed
+        }
+        Err(_) => {
+            tracing::warn!("the readiness probe timed out reading the applied schema version");
+            Check::Failed
+        }
+    }
+}
+
+/// Does `ClickHouse` answer `SELECT 1`?
+async fn probe_clickhouse(state: &AppState) -> Check {
+    match tokio::time::timeout(PROBE_TIMEOUT, state.clickhouse.rows("SELECT 1", None)).await {
+        Ok(Ok(_)) => Check::Ok,
+        Ok(Err(err)) => {
+            tracing::warn!(error = ?err, "the readiness probe could not query ClickHouse");
+            Check::Failed
+        }
+        Err(_) => {
+            tracing::warn!("the readiness probe timed out querying ClickHouse");
+            Check::Failed
+        }
+    }
+}
+
+/// Does the Iceberg REST catalog answer its config request?
+///
+/// `GET {catalog_uri}/v1/config?warehouse={warehouse}` is the call the
+/// catalog client makes when it connects (`lakehouse_iceberg::
+/// IcebergClient::connect`), so this proves the catalog is reachable AND
+/// usable by this service — the same question, asked the same way.
+///
+/// The `warehouse` parameter is not optional: `Lakekeeper` answers `400`
+/// ("No warehouse specified") without it, so a probe that left it out
+/// would call a working catalog unhealthy.
+///
+/// The reader bearer token is the one the catalog routes use; without it
+/// the catalog refuses (`401`), so a missing token file means "not ready"
+/// — honestly, because the service cannot read the catalog without it.
+///
+/// The request goes through the ONE shared client ([`http_client`]), which
+/// does not follow redirects: the reader token must not travel to another
+/// host (REL-2 S1 review SHOULD-FIX 1).
+async fn probe_lakekeeper(state: &AppState) -> Check {
+    let Some(http) = http_client() else {
+        tracing::warn!("the readiness probe has no HTTP client; the catalog check cannot run");
+        return Check::Failed;
+    };
+    let token = match read_token_file(
+        &state.config.lakekeeper_read_token_file,
+        READER_PURPOSE,
+        READER_TOKEN_ENV_VAR,
+    )
+    .await
+    {
+        Ok(token) => token,
+        Err(err) => {
+            tracing::warn!(error = ?err, "the readiness probe could not read the catalog token");
+            return Check::Failed;
+        }
+    };
+    let Some(url) = catalog_config_url(state) else {
+        tracing::warn!(
+            catalog_uri = %state.config.lakekeeper_catalog_uri,
+            "the readiness probe could not build the catalog's config URL"
+        );
+        return Check::Failed;
+    };
+    match tokio::time::timeout(
+        PROBE_TIMEOUT,
+        http.get(url).bearer_auth(token.expose_secret()).send(),
+    )
+    .await
+    {
+        Ok(Ok(resp)) if resp.status().is_success() => Check::Ok,
+        Ok(Ok(resp)) => {
+            tracing::warn!(
+                status = resp.status().as_u16(),
+                "the readiness probe got a non-success answer from the catalog"
+            );
+            Check::Failed
+        }
+        Ok(Err(err)) => {
+            tracing::warn!(error = ?err, "the readiness probe could not reach the catalog");
+            Check::Failed
+        }
+        Err(_) => {
+            tracing::warn!("the readiness probe timed out reaching the catalog");
+            Check::Failed
+        }
+    }
+}
+
+/// The catalog's config URL, with the warehouse this deployment reads.
+///
+/// Built with [`url::Url`]'s query-pair encoder rather than by formatting
+/// a query string, so a warehouse name can never break the URL's
+/// structure — the same rule `routes::auth::oidc_start` follows for the
+/// `IdP`'s redirect URL.
+///
+/// `None` when the configured catalog URI is not a URL at all: there is
+/// nothing to ask then.
+fn catalog_config_url(state: &AppState) -> Option<url::Url> {
+    let base = format!(
+        "{}/v1/config",
+        state.config.lakekeeper_catalog_uri.trim_end_matches('/')
+    );
+    let mut url = url::Url::parse(&base).ok()?;
+    url.query_pairs_mut()
+        .append_pair("warehouse", &state.config.lakekeeper_warehouse);
+    Some(url)
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    /// The whole point of the route: three checks that passed mean the
+    /// stack is ready, and the body says which version is ready.
+    #[test]
+    fn health_is_ready_when_every_check_passes() {
+        let checks = Checks {
+            postgres: Check::Ok,
+            clickhouse: Check::Ok,
+            lakekeeper: Check::Ok,
+        };
+        let body = ReadyBody::new(checks);
+        assert!(body.ready);
+        assert_eq!(body.version, VERSION);
+        assert_eq!(
+            serde_json::to_value(&body).unwrap(),
+            serde_json::json!({
+                "ready": true,
+                "version": VERSION,
+                "checks": {
+                    "postgres": "ok",
+                    "clickhouse": "ok",
+                    "lakekeeper": "ok",
+                },
+            })
+        );
+    }
+
+    /// One failed check is enough: the route answers `503` and says which
+    /// dependency is not ready.
+    #[test]
+    fn health_is_not_ready_when_one_check_fails() {
+        let body = ReadyBody::new(Checks {
+            postgres: Check::Ok,
+            clickhouse: Check::Failed,
+            lakekeeper: Check::Ok,
+        });
+        assert!(!body.ready);
+        assert_eq!(body.checks.clickhouse, Check::Failed);
+        assert_eq!(body.checks.postgres, Check::Ok);
+    }
+
+    /// The body carries no upstream text (AGENTS.md rule 4): the only
+    /// strings in it are the version and the two check words.
+    #[test]
+    fn health_carries_no_upstream_text() {
+        let body = ReadyBody::new(Checks {
+            postgres: Check::Failed,
+            clickhouse: Check::Failed,
+            lakekeeper: Check::Failed,
+        });
+        let text = serde_json::to_string(&body).unwrap();
+        assert!(text.contains("\"failed\""));
+        assert!(!text.contains("error"));
+        assert!(!text.contains("password"));
+        assert!(!text.contains("psql"));
+        // The whole body is the three fields D7 names — no more.
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let object = value.as_object().unwrap();
+        assert_eq!(object.len(), 3);
+        assert!(object.contains_key("ready"));
+        assert!(object.contains_key("version"));
+        assert!(object.contains_key("checks"));
+    }
+
+    /// The check words are exactly `"ok"` and `"failed"` — nothing else
+    /// can ever reach the body.
+    #[test]
+    fn health_check_words_are_ok_and_failed() {
+        assert_eq!(serde_json::to_value(Check::Ok).unwrap(), "ok");
+        assert_eq!(serde_json::to_value(Check::Failed).unwrap(), "failed");
+    }
+
+    /// A database that is not at this build's schema version is not ready:
+    /// one migration behind (the case that matters — the build needs a
+    /// table this database does not have) and one migration ahead (a newer
+    /// build wrote it; this binary must not claim to be ready for it).
+    #[test]
+    fn health_is_not_ready_when_the_database_is_behind() {
+        let embedded = lakehouse_store::embedded_schema_version();
+        assert!(embedded > 0, "this build embeds at least one migration");
+        assert!(schema_is_current(embedded, embedded));
+        assert!(
+            !schema_is_current(embedded - 1, embedded),
+            "a database one migration behind is not at this build's schema version"
+        );
+        assert!(
+            !schema_is_current(embedded + 1, embedded),
+            "a database ahead of this build is not at this build's schema version"
+        );
+    }
+
+    /// A state whose dependencies are all unreachable: a lazy pool at a
+    /// throwaway address this test never dials (the same shape
+    /// `routes`'s own route test builds), and no `ClickHouse` and no
+    /// catalog token.
+    fn test_state() -> AppState {
+        let env = std::collections::HashMap::from([(
+            "DATABASE_URL".to_owned(),
+            "postgres://test:test@127.0.0.1:5432/test".to_owned(),
+        )]);
+        let config = crate::config::Config::from_map(&env).unwrap();
+        AppState::new(config)
+    }
+
+    /// The catalog's config request carries the warehouse: `Lakekeeper`
+    /// answers `400` ("No warehouse specified") without it, so a probe
+    /// that left it out would call a working catalog unhealthy. Measured
+    /// against a running `Lakekeeper` v0.13.3 (REL-2 S1-T2's stack).
+    ///
+    /// `#[tokio::test]`, not plain `#[test]`: the state this reads the
+    /// configuration from builds a `sqlx` pool, and `sqlx` registers its
+    /// idle-connection reaper against the ambient Tokio runtime.
+    #[tokio::test]
+    async fn health_asks_the_catalog_for_its_config_with_the_warehouse() {
+        let url = catalog_config_url(&test_state()).unwrap();
+        assert_eq!(url.path(), "/catalog/v1/config");
+        assert_eq!(
+            url.query_pairs()
+                .find(|(key, _)| key == "warehouse")
+                .map(|(_, value)| value.into_owned()),
+            Some("default".to_owned())
+        );
+    }
+
+    /// The route itself: it answers with the D7 body shape, and the status
+    /// follows the body — `503` when a check is not `"ok"`, `200` when
+    /// every one is. Which dependency fails depends on what else runs on
+    /// this machine, so the assertion is on the shape and on the
+    /// agreement between the status and the body, not on which check
+    /// failed.
+    #[tokio::test]
+    async fn health_ready_answers_with_the_d7_shape_and_the_matching_status() {
+        use axum::body::{Body, to_bytes};
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let response = crate::routes::router(test_state())
+            .oneshot(
+                Request::builder()
+                    .uri("/health/ready")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        // The body is exactly the three fields D7 names.
+        let object = value.as_object().unwrap();
+        assert_eq!(object.len(), 3, "unexpected body: {value}");
+        assert_eq!(value["version"], serde_json::json!(VERSION));
+
+        // Every check is one of the two words, and `ready` is exactly
+        // "every check passed" — the status follows it.
+        let checks = value["checks"].as_object().unwrap();
+        assert_eq!(checks.len(), 3, "unexpected checks: {value}");
+        let mut all_ok = true;
+        for (name, check) in checks {
+            let word = check.as_str().unwrap();
+            assert!(
+                word == "ok" || word == "failed",
+                "{name} carries {word}, not a check word"
+            );
+            all_ok &= word == "ok";
+        }
+        assert_eq!(value["ready"], serde_json::json!(all_ok));
+        assert_eq!(
+            status,
+            if all_ok {
+                StatusCode::OK
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
+        );
+    }
+
+    /// A state pointed at a `wiremock` catalog, with a throwaway reader
+    /// token file.
+    ///
+    /// The `TempDir` comes back with the state: the token file must
+    /// outlive the probe, and the directory deletes itself on drop.
+    ///
+    /// No `DATABASE_URL` (so the Postgres check fails without dialing
+    /// anything) and a `ClickHouse` URL nothing listens on (so that check
+    /// fails without dialing anything either). The catalog check is the
+    /// one this test measures.
+    fn state_at_catalog(server: &wiremock::MockServer) -> (AppState, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let token = dir.path().join("lakehouse-api-reader.jwt");
+        std::fs::write(&token, "test-reader-token\n").unwrap();
+        let env = std::collections::HashMap::from([
+            ("LAKEKEEPER_CATALOG_URI".to_owned(), server.uri()),
+            (
+                "LAKEKEEPER_READ_TOKEN_FILE".to_owned(),
+                token.to_string_lossy().into_owned(),
+            ),
+            ("CH_URL".to_owned(), "http://127.0.0.1:1".to_owned()),
+        ]);
+        let config = crate::config::Config::from_map(&env).unwrap();
+        (AppState::new(config), dir)
+    }
+
+    /// Two readiness answers inside the window share ONE probe
+    /// (REL-2 S1 review SHOULD-FIX 1): the route is public, so a loop of
+    /// anonymous requests must not turn into a Postgres query, a
+    /// `ClickHouse` query and a Lakekeeper call each.
+    ///
+    /// The catalog mock counts the probes: one call to
+    /// `/v1/config` means the second answer came from the cache.
+    #[tokio::test]
+    async fn two_readiness_answers_within_the_window_probe_once() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/config"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"defaults":{}}"#))
+            .mount(&server)
+            .await;
+        let (state, _token_dir) = state_at_catalog(&server);
+
+        let first = ready_body(&state).await;
+        let second = ready_body(&state).await;
+
+        assert_eq!(first.checks.lakekeeper, Check::Ok);
+        assert_eq!(second.checks.lakekeeper, Check::Ok);
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            1,
+            "the second answer inside the window must reuse the first probe"
+        );
+    }
+
+    /// A read PAST the window re-probes: the cached answer is never older
+    /// than the window says it is (REL-2 S1 review SHOULD-FIX 1).
+    ///
+    /// The clock is the test's own, so this proves the window without
+    /// sleeping for it.
+    #[tokio::test]
+    async fn a_read_past_the_window_re_probes() {
+        let cache: ReadyCache = Arc::new(tokio::sync::Mutex::new(None));
+        let mut clock = FixedClock::new();
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let probe = || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async {
+                ReadyBody::new(Checks {
+                    postgres: Check::Ok,
+                    clickhouse: Check::Ok,
+                    lakekeeper: Check::Ok,
+                })
+            }
+        };
+
+        let _ = cached_ready_with(&cache, || clock.now(), probe).await;
+        clock.advance(3);
+        let _ = cached_ready_with(&cache, || clock.now(), probe).await;
+
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "a read past the 2s window must re-probe"
+        );
+    }
+
+    /// The catalog probe does not follow a redirect (REL-2 S1 review
+    /// SHOULD-FIX 1): it answers with the catalog's reader token, so a
+    /// redirect must not carry that token to another host.
+    #[tokio::test]
+    async fn the_catalog_probe_does_not_follow_a_redirect() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/config"))
+            .respond_with(ResponseTemplate::new(302).insert_header("location", "/somewhere-else"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/somewhere-else"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"defaults":{}}"#))
+            .mount(&server)
+            .await;
+        let (state, _token_dir) = state_at_catalog(&server);
+
+        let body = ready_body(&state).await;
+
+        assert_eq!(body.checks.lakekeeper, Check::Failed);
+        let seen = server.received_requests().await.unwrap();
+        assert!(
+            seen.iter()
+                .all(|request| request.url.path() == "/v1/config"),
+            "the probe followed a redirect: {:?}",
+            seen.iter()
+                .map(|request| request.url.path().to_owned())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// A clock the test moves by hand, so the cache window is tested
+    /// without sleeping (the same shape `crate::health`'s own test
+    /// clock uses).
+    struct FixedClock(Instant);
+
+    impl FixedClock {
+        fn new() -> Self {
+            Self(Instant::now())
+        }
+
+        fn now(&self) -> Instant {
+            self.0
+        }
+
+        fn advance(&mut self, seconds: u64) {
+            self.0 += Duration::from_secs(seconds);
+        }
+    }
+}

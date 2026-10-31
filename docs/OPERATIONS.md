@@ -45,6 +45,7 @@ The stack:
 | `postgres` | `postgres:16` | OLTP store (identity, governance, pipelines, connectors, alerts, ...) |
 | `clickhouse` | `clickhouse/clickhouse-server:26.8` | Analytics store (catalog, overview, governance, dashboards, ...); also the Iceberg query engine once `DataLakeCatalog` is wired up in P1b |
 | `lakehouse-api` | built from `rust/Dockerfile` | the axum API, port 8080 |
+| `console` | built from `Dockerfile.frontend` | the Next.js console, port 3000 (REL-2 S1-T2) — waits for `lakehouse-api` to report healthy, and proxies `/api/*` to it |
 | `rustfs` | `rustfs/rustfs:1.0.0-rc.4` | S3-compatible object store for the lakehouse warehouse (P1 infrastructure; not yet wired into `lakehouse-api`) |
 | `rustfs-bucket-init` | `amazon/aws-cli:2.36.34` | One-shot: creates the warehouse bucket via the plain S3 API (`s3api create-bucket`) — never RustFS's admin API |
 | `lakekeeper-db-init` | `postgres:16` | One-shot: creates Lakekeeper's own database on the existing `postgres` service |
@@ -63,6 +64,15 @@ Postgres) get a real chance to run instead of racing container startup.
 This is a start-order convenience, not a hard runtime dependency — see
 "Postgres: unreachable is loud, a mismatched schema refuses to start,"
 below.
+
+`lakehouse-api` carries a healthcheck of its own (`/health`, liveness), and
+the `console` waits for it — so the console starts after the API can
+answer, not while the API is still applying migrations. The console's
+`/api/*` proxy target is baked into its image at build time
+(`RUST_API_URL`, the `lakehouse-api` service's address on the compose
+network); `CONSOLE_INTERNAL_URL` is the address the OTHER way round (the
+console as the PDF renderer reaches it), and it is empty by default — set
+it to `http://console:3000` to switch the PDF export on in this stack.
 
 `rustfs`, `lakekeeper`, and their bootstrap jobs are **still not called
 from any `lakehouse-api` route as of P6** — see the module map in
@@ -991,14 +1001,18 @@ turn each one on.
 ## Healthcheck: what `GET /health` actually checks
 
 `GET /health` answers `200` with a JSON body — `{"status": "ok",
-"database": "ok" | "unavailable"}` — and it is still a **liveness plus
-application-database check**, not a full readiness probe
+"database": "ok" | "unavailable", "version": "0.1.0"}` — and it is still a
+**liveness plus application-database check**, not a full readiness probe
 (`rust/crates/lakehouse-api/src/routes/mod.rs`, `async fn health`). It
 does not dial ClickHouse, Dagster, Lakekeeper or the LLM: the status code
 stays `200` whenever the process can answer at all, because a deployment
 with no usable Postgres still serves every Phase 1 route (catalog,
 overview, query, storage), and the ops gates (`ops/g*/`) and
 `ops/ai_eval` poll this endpoint for a `200` to decide the API is up.
+
+`version` is this build's version (`CARGO_PKG_VERSION`), added with the
+readiness route below (REL-2 decision D7): the console compares it with
+its own version and says so when the two differ.
 
 `database` is what `OPS-4` added:
 
@@ -1017,10 +1031,38 @@ the gates, so a probe that waits out a dead database's 30 s acquire
 timeout would stall them. An operator diagnosing "the database died" has
 to read the log (below), not only this endpoint.
 
-**There is no `GET /health/ready`.** This section used to propose adding
-one; `OPS-4` instead extended the one health route with the
-application-database state, which is the dependency that actually
-changes what the console can do.
+## Readiness: `GET /health/ready`
+
+`GET /health/ready` answers the other question — "can this stack serve
+traffic?" — and it is the route an installer or an updater waits on (REL-2
+decision D7). It answers `200` with
+
+```json
+{"ready": true, "version": "0.1.0",
+ "checks": {"postgres": "ok", "clickhouse": "ok", "lakekeeper": "ok"}}
+```
+
+when all three hold, and `503` with **the same body shape** otherwise, so
+a caller still learns which dependency is not ready:
+
+- `postgres` — the database answers AND its schema is at this build's
+  version: the highest applied migration equals the highest migration
+  embedded in the binary. A database one migration behind (or ahead) is
+  not ready for this build.
+- `clickhouse` — `ClickHouse` answers `SELECT 1`.
+- `lakekeeper` — the Iceberg REST catalog answers its config request
+  (`GET {catalog}/v1/config`), the same call the catalog client makes
+  when it connects.
+
+Every check is only `"ok"` or `"failed"`. The reason a check failed is in
+the log, never in the body: the route is public, so it must not carry
+upstream text (AGENTS.md rule 4). Each check is bounded by 3 s, so the
+answer does not wait on a dead dependency.
+
+This section used to say there was no such route; `OPS-4` had extended
+the one health route with the application-database state instead. REL-2
+decision D7 adds the readiness probe next to it, and leaves `/health` as
+the liveness probe the gates poll.
 
 ## Bootstrap admin: there is no default credential
 
@@ -1530,6 +1572,78 @@ duration across all 4 Postgres databases, 9 Iceberg objects, and ClickHouse
 state was **82 seconds** (94 seconds total to full API readiness). See
 [docs/plans/OPS-7-RESULT.md](plans/OPS-7-RESULT.md) for the complete drill
 report and component timing table.
+
+## Local-disk backup (REL-2 S1-T4)
+
+The bucket job above needs an S3-compatible bucket. An air-gapped host has
+none, so there is a second target: the local disk. One command, no bucket,
+no network.
+
+### What one backup is
+
+A directory `backups/<UTC timestamp>-<version>/` (the version is the
+API's own, read from `GET /health`):
+
+| Part | What it is |
+| --- | --- |
+| `postgres.dump` | `pg_dumpall` of the whole Postgres instance: the application database, Lakekeeper's, OpenFGA's, Dagster's, and the roles. |
+| `clickhouse/<timestamp>/<db>/` | `ClickHouse`'s own `BACKUP DATABASE ... TO Disk('backups', ...)` output, per database. The disk is configured in `ops/backups/clickhouse/backups.xml` and mounted into the `clickhouse` service. |
+| `connector-secrets.tar.gz` | The `lakehouse_connector_secrets` volume — every stored connector credential, **sealed**. Without it, a restored deployment has no working connector credential. |
+| `env` | A copy of the deployment's `.env` — the generated secrets, including the key those credentials are sealed with. |
+| `manifest.json` | Each part's size and SHA-256. |
+
+The restore checks those checksums **before** it restores anything: a
+backup that was cut short is refused, not restored as if it were whole.
+
+**What it does not carry yet:** `release.json` and `state.json` (the
+release manifest and the installed-version state) are part of the same
+backup set in the plan, but they do not exist yet — REL-2 S2 publishes the
+release manifest and S4 writes the state file. The backup script says so
+in its output rather than pretending.
+
+### Run
+
+```bash
+# One backup into ./backups/<timestamp>-<version>/
+ops/backups/backup-local.sh
+
+# Into another directory
+ops/backups/backup-local.sh /mnt/backups
+
+# A stack that is not named after its directory
+COMPOSE_PROJECT=my-stack ops/backups/backup-local.sh
+```
+
+It needs Docker, `docker compose`, `curl`, `jq` and `sha256sum` on the
+host — the PostgreSQL and ClickHouse clients are the ones in the running
+containers, so the host needs no database client of its own.
+
+### Restore
+
+```bash
+# The backup's checksums are checked first; nothing is written before they pass.
+scripts/restore-from-backup.sh --local backups/20261031T090000Z-0.1.0
+
+# Force it on top of volumes that are not empty
+scripts/restore-from-backup.sh --force --local backups/20261031T090000Z-0.1.0
+```
+
+The order is: the empty-volume safety check (the same one the bucket
+restore has), the manifest's checksums, Postgres, ClickHouse, the
+connector secrets, the `.env` (the previous one is kept beside it as
+`.env.before-restore-<timestamp>`), and the stack bring-up.
+
+**The connector credentials only decrypt with the `.env` they were sealed
+with.** A restore whose `.env` is not the one the backup carries leaves
+every connector unreadable — which is why the `.env` is part of the backup
+and why the restore puts it back.
+
+**Measured** (REL-2 S1-T4's own drill, on a clean `-p rel2` project):
+Postgres 8 s, ClickHouse 7 s, the connector secrets 1 s, the stack
+bring-up 16 s — **32 s** in total, and the restored connector's credential
+still decrypted: the API's own key-rotation command opened the restored
+sealed file with the restored key and reported `1 already under the
+current key, 0 failed`.
 
 ## Upgrade note: set `CATALOG_TENANT_ID` before deploying multi-tenant admin support
 
