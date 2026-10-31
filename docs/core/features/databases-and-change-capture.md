@@ -250,7 +250,8 @@ What `Oracle CDC` needs and what it does not do. Proven by the `g4-oracle` gate 
   `SEC-14` says a stored credential is not dialled in plain text unless the person chose "Disable". After the
   Kafka Connect test passes, the orchestrator reads Oracle's settings with thin mode, **not encrypted**:
   `ARCHIVELOG`, minimal and all-column supplemental logging, whether each selected table exists and has
-  all-column logging, and the session's privileges and roles. Fixed statements over the data dictionary only,
+  all-column logging (read in a second session on the pluggable database's own service, because a common user sees only
+  the root in the container-wide views unless `CONTAINER_DATA` is widened), and the session's privileges and roles. Fixed statements over the data dictionary only,
   never a table row; every value is compared in Python and none is put in a statement. The password is not sent
   in clear text (Oracle's own logon protocol), but the session is not encrypted, and the test result says so
   in a fixed line. A server that refuses an unencrypted session (`ORA-12660`) makes every check "Not checked"

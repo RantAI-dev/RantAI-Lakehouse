@@ -661,14 +661,6 @@ _CDC_ORACLE_LOG_MODE = "SELECT log_mode FROM v$database"
 _CDC_ORACLE_SUPPLEMENTAL = "SELECT supplemental_log_data_min, supplemental_log_data_all FROM v$database"
 _CDC_ORACLE_PRIVILEGES = "SELECT privilege FROM session_privs"
 _CDC_ORACLE_ROLES = "SELECT role FROM session_roles"
-_CDC_ORACLE_CONTAINERS = "SELECT con_id, name FROM v$containers"
-_CDC_ORACLE_LOG_GROUPS_CDB = (
-    "SELECT con_id, owner, table_name FROM cdb_log_groups WHERE log_group_type = 'ALL COLUMN LOGGING'"
-)
-_CDC_ORACLE_TABLES_CDB = (
-    "SELECT t.con_id, t.owner, t.table_name FROM cdb_tables t "
-    "JOIN cdb_users u ON u.con_id = t.con_id AND u.username = t.owner WHERE u.oracle_maintained = 'N'"
-)
 _CDC_ORACLE_LOG_GROUPS = "SELECT owner, table_name FROM all_log_groups WHERE log_group_type = 'ALL COLUMN LOGGING'"
 _CDC_ORACLE_TABLES = "SELECT owner, table_name FROM all_tables"
 
@@ -700,7 +692,7 @@ def _read_oracle_rows(connection: Any, sql: str) -> list[tuple]:
     return [tuple(r) for r in connection.execute(text(sql))]
 
 
-def oracle_setup_facts(connection: Any, dial: dict, tables: list[str]) -> dict[str, Any]:
+def oracle_setup_facts(connection: Any, tables_connection: Any, tables: list[str]) -> dict[str, Any]:
     """The closed facts of an Oracle change-capture test (`SRC-4` Amendment 11, S11-b). Each is read by
     its own constant statement in its own `try`: a statement the login may not run leaves that fact OUT
     (the API then shows `unchecked`); nothing is guessed and no server text is kept."""
@@ -726,7 +718,7 @@ def oracle_setup_facts(connection: Any, dial: dict, tables: list[str]) -> dict[s
     except Exception as exc:  # noqa: BLE001
         _unread("missingPrivileges", exc)
     try:
-        per_table = _oracle_table_facts(connection, dial, tables)
+        per_table = _oracle_table_facts(tables_connection, tables)
         if per_table is not None:
             facts["tables"] = per_table
         else:
@@ -736,41 +728,32 @@ def oracle_setup_facts(connection: Any, dial: dict, tables: list[str]) -> dict[s
     return facts
 
 
-def _oracle_table_facts(connection: Any, dial: dict, tables: list[str]) -> dict[str, str] | None:
-    """Per selected table: `allColumns`, `withoutAllColumns` or `notFound`. In a container database the
-    dictionary views of every container are read (`cdb_*`) and the container is picked HERE, by the
-    dial's `pdbName` against `v$containers`: no value goes into a statement. Rows are streamed; only
-    the selected tables are kept."""
+def _oracle_table_facts(connection: Any, tables: list[str]) -> dict[str, str] | None:
+    """Per selected table: `allColumns`, `withoutAllColumns` or `notFound`, read through `connection`, a
+    session in the container the tables live in (the pluggable database's own service, see `_cdc_oracle`).
+    The two views list what the login can access; the selected names are matched HERE, in Python, and no
+    value goes into a statement."""
     wanted = {name for name in tables if isinstance(name, str)}
     if not wanted:
         return {}
-    pdb = dial.get("pdbName")
-    con_id: Any = None
-    if pdb:
-        found = [r[0] for r in _read_oracle_rows(connection, _CDC_ORACLE_CONTAINERS) if str(r[1]).upper() == str(pdb).upper()]
-        if not found:
-            return None
-        con_id = found[0]
-        groups_sql, tables_sql = _CDC_ORACLE_LOG_GROUPS_CDB, _CDC_ORACLE_TABLES_CDB
-    else:
-        groups_sql, tables_sql = _CDC_ORACLE_LOG_GROUPS, _CDC_ORACLE_TABLES
 
     def named(rows: list[tuple]) -> set[str]:
-        out = set()
-        for row in rows:
-            if pdb and row[0] != con_id:
-                continue
-            owner, table = row[-2], row[-1]
-            if f"{owner}.{table}" in wanted:
-                out.add(f"{owner}.{table}")
-        return out
+        return {f"{owner}.{table}" for owner, table in rows if f"{owner}.{table}" in wanted}
 
-    with_all = named(_read_oracle_rows(connection, groups_sql))
-    existing = named(_read_oracle_rows(connection, tables_sql))
+    with_all = named(_read_oracle_rows(connection, _CDC_ORACLE_LOG_GROUPS))
+    existing = named(_read_oracle_rows(connection, _CDC_ORACLE_TABLES))
     return {
         name: "allColumns" if name in with_all else ("withoutAllColumns" if name in existing else "notFound")
         for name in sorted(wanted)
     }
+
+
+class _NoSession:
+    """Stands in for the PDB session that could not be opened: reading a fact through it raises, so
+    that fact is left out like any other unread one."""
+
+    def execute(self, *args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("no session on the pluggable database")
 
 
 def _cdc_oracle(
@@ -791,6 +774,11 @@ def _cdc_oracle(
         raise NotSupported("an Oracle change-capture connector's tables are typed by hand")
     plain = {**dial, "sslMode": "disable"}
     engine = b.oracle_engine(plain, secrets, resolve_checked=b.resolve_checked)
+    # The tables live in the pluggable database. A common user sees only the root in the container-wide
+    # views (`CDB_*`, `V$CONTAINERS`) unless an administrator widens `CONTAINER_DATA`, which the documented
+    # grants do not do; so the table facts are read in a session on the PDB's OWN service (the connection's
+    # service name is the dial's `pdbName`, an identifier `Dial::parse` checked; no value goes into SQL).
+    pdb_engine = None
     started = time.monotonic()
     try:
         with b.checking_resolver():
@@ -807,9 +795,22 @@ def _cdc_oracle(
                 if rows != [(1,)]:
                     raise ValueError("the test statement did not answer")
                 latency = max(0, round((time.monotonic() - started) * 1000))
-                facts = oracle_setup_facts(connection, dial, tables or [])
+                if not dial.get("pdbName"):
+                    facts = oracle_setup_facts(connection, connection, tables or [])
+                else:
+                    try:
+                        pdb_engine = b.oracle_engine(
+                            {**plain, "database": dial["pdbName"]}, secrets, resolve_checked=b.resolve_checked
+                        )
+                        with pdb_engine.connect() as pdb_connection:
+                            facts = oracle_setup_facts(connection, pdb_connection, tables or [])
+                    except Exception as exc:  # noqa: BLE001 -- the PDB session could not be opened: only the table facts go
+                        _unread("tables", exc)
+                        facts = oracle_setup_facts(connection, _NoSession(), tables or [])
     finally:
         engine.dispose()
+        if pdb_engine is not None:
+            pdb_engine.dispose()
     return {"latencyMs": latency, **({"oracleSetup": facts} if facts else {})}
 
 

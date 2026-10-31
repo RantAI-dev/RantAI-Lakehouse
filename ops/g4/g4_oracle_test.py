@@ -251,15 +251,11 @@ class OracleSource(cdc_gate.Source):
         import oracledb
 
         statements = {
-            "v$containers": "SELECT con_id, name FROM v$containers",
-            "cdb_log_groups": "SELECT con_id, owner, table_name FROM cdb_log_groups WHERE log_group_type = 'ALL COLUMN LOGGING'",
-            "cdb_tables": (
-                "SELECT t.con_id, t.owner, t.table_name FROM cdb_tables t JOIN cdb_users u ON u.con_id = t.con_id "
-                "AND u.username = t.owner WHERE u.oracle_maintained = 'N'"
-            ),
+            "all_log_groups": "SELECT owner, table_name FROM all_log_groups WHERE log_group_type = 'ALL COLUMN LOGGING'",
+            "all_tables": "SELECT owner, table_name FROM all_tables",
         }
         try:
-            conn = oracledb.connect(user=CDC_USER, password=self.password, dsn=f"{HOST}:{PORT}/{CDB}")
+            conn = oracledb.connect(user=CDC_USER, password=self.password, dsn=f"{HOST}:{PORT}/{PDB}")
         except Exception as exc:  # noqa: BLE001
             print(f"[g4] diagnostic: could not sign in as {CDC_USER}: {str(exc)[:200]}", flush=True)
             return
