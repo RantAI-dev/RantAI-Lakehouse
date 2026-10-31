@@ -797,7 +797,7 @@ impl Answer {
 
     /// A finished connection test.
     #[must_use]
-    pub fn tested(tested: Tested) -> Self {
+    pub fn tested(tested: &Tested) -> Self {
         let mut answer = Self::bare(Kind::Test, State::Done);
         answer.latency_ms = Some(tested.latency_ms);
         answer
@@ -850,7 +850,7 @@ impl Stored {
             State::Done => match (self.kind, self.listing, self.preview, self.tested) {
                 (Kind::List, Some(listing), _, _) => Answer::listing(&self.scope, listing),
                 (Kind::Preview, _, Some(preview), _) => Answer::preview(&self.object, preview),
-                (Kind::Test, _, _, Some(tested)) => Answer::tested(tested),
+                (Kind::Test, _, _, Some(tested)) => Answer::tested(&tested),
                 // A done row without its result cannot be written (the
                 // migration's CHECK); said as a failure, not as an empty list.
                 (kind, _, _, _) => Answer::failed(kind, ErrorClass::Failed),
