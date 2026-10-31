@@ -392,3 +392,73 @@ async fn a_refused_undrop_is_rejected_and_a_warehouse_is_found_by_name() {
     );
     assert!(client.find_warehouse_id("other").await.unwrap().is_none());
 }
+
+/// DATA-5 / ADR 0016 point 3: the namespace-scoped grant. The
+/// `outside-readers` principal must be able to `select` in the `gold`
+/// namespace — and only there.
+///
+/// The assertion is on the exact request `Lakekeeper` receives (method,
+/// path, body), not merely that the call returned `Ok`: a grant that
+/// reached the catalog with the wrong relation, the wrong principal, or
+/// the warehouse-scoped path would leave the door unable to read
+/// anything, and only the request's shape proves that does not happen.
+#[tokio::test]
+async fn grant_namespace_select_sends_the_select_relation_for_that_namespace_only() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/management/v1/permissions/namespace/ns-1/assignments",
+        ))
+        .and(body_json(json!({
+            "writes": [{ "type": "select", "user": "oidc~outside-readers" }]
+        })))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = LakekeeperAdminClient::new(server.uri(), Secret::new("admin-token"));
+    client
+        .grant_namespace_select("ns-1", "outside-readers")
+        .await
+        .unwrap();
+}
+
+/// The grant is idempotent: `409` (an identical tuple already exists) is
+/// success, the same shape `grant_machine_principals` treats as one.
+#[tokio::test]
+async fn grant_namespace_select_treats_409_as_success() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/management/v1/permissions/namespace/ns-1/assignments",
+        ))
+        .respond_with(ResponseTemplate::new(409))
+        .mount(&server)
+        .await;
+    let client = LakekeeperAdminClient::new(server.uri(), Secret::new("admin-token"));
+    client
+        .grant_namespace_select("ns-1", "outside-readers")
+        .await
+        .unwrap();
+}
+
+/// A refused grant is classified: a `4xx` is `Rejected` (our request was
+/// refused — an unknown namespace, a principal the catalog does not
+/// know), a `5xx` is `Server`. Neither is swallowed.
+#[tokio::test]
+async fn a_refused_namespace_grant_is_classified_and_not_swallowed() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/management/v1/permissions/namespace/ns-1/assignments",
+        ))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    let client = LakekeeperAdminClient::new(server.uri(), Secret::new("admin-token"));
+    let err = client
+        .grant_namespace_select("ns-1", "outside-readers")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, OpenfgaError::Rejected), "{err:?}");
+}

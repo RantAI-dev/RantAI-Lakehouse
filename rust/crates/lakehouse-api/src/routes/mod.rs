@@ -46,8 +46,10 @@ mod home;
 mod identity;
 // DATA-5 / ADR 0016: the door outside tools read published Gold tables
 // through. Its own router, because its routes answer in the Iceberg
-// error shape rather than the console's.
-mod iceberg_door;
+// error shape rather than the console's. `pub(crate)`, because
+// `crate::gold_export` names the principal it grants the `gold`
+// namespace to (ADR 0016 point 3).
+pub(crate) mod iceberg_door;
 mod knowledge;
 mod lakehouse;
 pub(crate) mod layers;

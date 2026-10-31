@@ -97,6 +97,16 @@ use crate::upstream_error::{self, Class, FailedAs};
 /// The one namespace the door serves (ADR 0016 point 2).
 pub const GOLD_NAMESPACE: &str = "gold";
 
+/// The catalog principal the door forwards an outside tool's call under
+/// (ADR 0016 point 3).
+///
+/// The tool's own key never reaches the catalog. This is the principal
+/// `ops/oidc-mock` mints a token for, `docker-compose.yml`'s
+/// `lakekeeper-authz-init` registers and grants `describe` on, and the
+/// Gold export grants `select` on the `gold` namespace to
+/// (`crate::gold_export::grant_outside_readers_select`).
+pub const OUTSIDE_READERS_PRINCIPAL: &str = "outside-readers";
+
 /// The refusal every "that is not yours to read" answer carries
 /// (ADR 0016 point 2).
 const REFUSED_MESSAGE: &str = "Outside readers may only read published Gold tables.";
