@@ -1019,3 +1019,27 @@ private half is not in the repository.
   `release` environment.
 - No cargo command and no Dagster command ran: this round changes no Rust, no code location
   and no Compose file.
+
+### Review S2 round 3 (planner, 2026-11-01, at `72240311`)
+
+- **D3a is implemented.**
+  - `release.json.sigstore.json` replaces `.sig` everywhere.
+  - Every signing command (sign, attest, sign-blob, in both jobs; 11 flag sites) carries
+    `--use-signing-config=false --tlog-upload=false`.
+  - Offline `verify-blob` follows each signing.
+- **The evidence is strong.** Through a logging proxy, v3's default posted to the public Rekor
+  log and to the timestamp authority. With the flags, the command opened no connection at all.
+  `verify-blob --offline --insecure-ignore-tlog` passed in a network namespace with no route.
+- **The S3 recipe is proven** by `test_sigstore_bundle.py`:
+  - the signature verifies with `cryptography`;
+  - the digest matches the manifest;
+  - a tampered manifest is refused;
+  - the bundle holds no tlog entry.
+
+  The fixture's private key is not in the repository.
+- **Checks:** 74 tests pass, and `actionlint` and `shellcheck` are clean.
+
+**Open: no BLOCKER, no SHOULD-FIX.**
+- The PR's own CI dry run is the last proof: it builds the four images, signs them with a
+  throwaway key, and builds the bundle.
+- The real release is S5.
