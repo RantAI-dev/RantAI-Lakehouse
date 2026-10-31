@@ -450,3 +450,81 @@ No container is left running.
   once. Add a test that a `%`-encoded `pageToken` reaches `wiremock` unchanged.
 
 **Open: BLOCKER 1, SHOULD-FIX 1.**
+
+### Fixes for review round 1 (developer, 2026-10-31)
+
+Branch `feat/data-5-outside-readers-api`, on top of `ae43bd58` (the review commit). Two
+commits, one per finding, in the order the review lists them.
+
+**BLOCKER 1 — `833d2ca0`, "a table name may not walk out of the gold namespace".**
+
+- The `{table}` path value is checked before anything is forwarded: ASCII letters, digits, `_`
+  and `-`, at most 255 characters (`routes::iceberg_door::table_name_is_allowed`). Anything
+  else is refused with the Iceberg 403 the door already uses (`refused()`), so the answer is
+  the one a client already reads for "that is not yours to read". The `table` route and the
+  `credentials` route both take a table name; both check it. The check sits after the `gold`
+  namespace check and BEFORE the warehouse check, so a refused name costs no catalog round
+  trip.
+- The names the Gold export writes pass: `lakehouse_iceberg::gold::sanitize_mart_name` writes
+  a mart name in lower case, digits and underscores (`orders`, `gold_export_smoke`).
+- The forwarded path is now built one segment at a time — the `url` crate's
+  `path_segments_mut().push` — instead of by pasting a value into a string
+  (`routes::iceberg_door::forwarded_url`). `push` percent-encodes `/` and `%`, so a segment can
+  never become a separator or an escape, whatever it holds. `call_catalog` takes its path as
+  `&[&str]` now, and every call site passes its segments.
+- One thing the review did not name, found while doing it: `push` DROPS a segment that is
+  exactly `.` or `..` instead of encoding it, so such a segment would change the path's shape
+  rather than stay inside it. `forwarded_url` refuses those two as well. The only other
+  variable segment is the warehouse prefix the catalog itself advertised, so that guard is
+  about a misconfigured catalog, and its answer is the catalog's own fixed "unavailable" text.
+- The module doc gained the rule, the place it lives, and the order of the checks (the table
+  name is check 5, the warehouse check 6).
+- Tests: `tests/iceberg_door.rs` — a `%2F..` table name is refused 403, the catalog is never
+  asked for a table load, and no read is counted. The catalog is mocked for the namespace the
+  walk WOULD land in, so a door that forwards the walk answers 200 and the test fails.
+  Measured: with the name check removed the test fails (502 instead of 403). Unit tests: the
+  names that are and are not forwarded, the encoded path, the catalog's own base path kept, a
+  dot segment refused, an unparseable catalog address answered with the catalog's fixed text.
+
+**SHOULD-FIX 1 — `9a7f84dd`, "the door's query is encoded once, not twice".**
+
+- `query_for` parses the raw query with `url::form_urlencoded::parse` (decoded pairs) and
+  leaves the one encoding to `RequestBuilder::query`. A side effect worth naming: the
+  `warehouse` the door replaces with the deployment's own is now recognised however the tool
+  spelled it.
+- Test: `tests/iceberg_door.rs` — the tables list is asked for with `?pageToken=a%3D` and the
+  query is read back off the request the catalog received: `pageToken=a%3D`, encoded once.
+  Measured: with the old split the test fails (`pageToken=a%253D`).
+
+**Checks, on the final commit (`9a7f84dd`), each run in the foreground, `cargo` through
+`bin/cargo-locked`:**
+
+| Command | Result |
+| --- | --- |
+| `cargo fmt --check` | exit 0 |
+| `cargo clippy -p lakehouse-api --all-targets -- -D warnings` | exit 0 |
+| `cargo test -p lakehouse-api --test iceberg_door` | 15 passed, 0 failed |
+| `cargo test -p lakehouse-api iceberg_door` | 15 passed, 0 failed (the unit tests) |
+| `cargo test -p lakehouse-api --test route_auth` | 66 passed, 0 failed |
+| `cargo test -p lakehouse-api --test sec11_guard` | 4 passed, 0 failed |
+
+The last two are not in the review's list; they were re-run because the door's routes are in
+`POLICY_TABLE` and because `sec11_guard` is what catches an error's own text in a response,
+and this change touched the door's handlers.
+
+**Not verified, and why.**
+
+- The whole `cargo test -p lakehouse-api` crate suite was not run in this session: the machine's
+  rule for this slice is not to spend 20+ minutes on it (CI runs it).
+- The full workspace run (`cargo clippy --workspace --all-targets --all-features -- -D
+  warnings`, `cargo test --workspace`) was not run: the plan's §3 scopes S1 to `lakehouse-api`
+  and `lakehouse-store` (plus `lakehouse-auth`, which S1-T4 touched), and this change touches
+  `lakehouse-api` only. CI runs the workspace.
+- `bun run typecheck` / `bun run lint` / `bun run test` were not run: S1 touches no
+  TypeScript (the console is S2's slice).
+- `(cd dagster && python -m pytest dispar_orchestrate -q)` was not run: S1 touches no Python
+  package.
+- The acceptance test (`ops/gold_export/gold_export_test.py`) was not run again in this
+  session: the change is in the door's request handling, and the acceptance run in the handoff
+  above already exercised the door against a real `Lakekeeper`. CI's "Gold export to Iceberg"
+  job is the proof for the merged branch.
