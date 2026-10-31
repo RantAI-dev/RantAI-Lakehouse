@@ -15,6 +15,7 @@
 //! | --- | --- |
 //! | Only a service identity may use the door (D1) | [`refuse`] |
 //! | Only the `gold` namespace, and only reads (D2) | [`namespace_is_gold`], [`method_is_served`] |
+//! | A table name this door may forward (DATA-5 S1 review BLOCKER 1) | [`table_name_is_allowed`] |
 //! | Forwarded under `outside-readers`, never the tool's key (D3) | [`call_catalog`] |
 //! | The published storage address, or an honest "not set up" (D4) | [`setup`], [`rewrite_endpoint`] |
 //! | A load that cannot be counted is refused (D6) | [`record_read`] |
@@ -36,10 +37,20 @@
 //! Every route answers in this order: (1) is outside reading set up on
 //! this deployment at all, (2) is the caller a service identity, (3) is
 //! the method one this route serves, (4) is the namespace `gold`, (5) is
-//! the warehouse this deployment's. The deployment's own state comes
-//! first because a deployment that has not published its storage address
-//! has no door to answer with — every request, from every caller, gets
-//! the same 503 naming the setting that is missing (D4).
+//! the table name one this door may forward, (6) is the warehouse this
+//! deployment's. The deployment's own state comes first because a
+//! deployment that has not published its storage address has no door to
+//! answer with — every request, from every caller, gets the same 503
+//! naming the setting that is missing (D4).
+//!
+//! # How the forwarded path is built
+//!
+//! The path is built one segment at a time — the `url` crate's
+//! `path_segments_mut().push` — never by pasting a caller's value into a
+//! string. `push` percent-encodes `/` and `%`, so a segment can never
+//! become a separator or an escape, whatever it holds (DATA-5 S1 review
+//! BLOCKER 1). The caller's own table name is checked before anything is
+//! forwarded as well — see [`table_name_is_allowed`].
 //!
 //! # Two rewrites the door makes on the way out
 //!
@@ -305,6 +316,35 @@ fn namespace_is_gold(namespace: &str) -> bool {
     namespace == GOLD_NAMESPACE
 }
 
+/// The longest table name the door forwards.
+///
+/// A name longer than this is not a table the Gold export wrote: the
+/// export's own names are a mart name in lower case, digits and
+/// underscores (`lakehouse_iceberg::gold::sanitize_mart_name`), so the
+/// longest real name is far shorter than this.
+const MAX_TABLE_NAME_LEN: usize = 255;
+
+/// Whether `table` is a table name this door may forward.
+///
+/// DATA-5 S1 review BLOCKER 1: `axum` percent-decodes the `{table}` path
+/// value, so `%2F..%2F..` arrives as `../..`. A name pasted into a
+/// forwarded URL with `format!` then walks out of the `gold` namespace
+/// (`.../namespaces/gold/tables/../../../silver/tables/x`), and the URL
+/// parser resolves the `..` — the call leaves the namespace the door
+/// promised, and a made-up table name would be counted as a read.
+///
+/// Only a name of ASCII letters, digits, `_` and `-` is accepted: no dot,
+/// no slash, no percent, so nothing in it can be a path separator or an
+/// escape. Every name the Gold export writes (`orders`,
+/// `gold_export_smoke`) passes.
+fn table_name_is_allowed(table: &str) -> bool {
+    !table.is_empty()
+        && table.len() <= MAX_TABLE_NAME_LEN
+        && table
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+}
+
 /// The HTTP client used to reach `Lakekeeper`.
 ///
 /// A plain `reqwest` client, with redirects off and a bounded timeout.
@@ -375,6 +415,49 @@ fn query_for(state: &AppState, raw: Option<&str>, with_warehouse: bool) -> Vec<(
     pairs
 }
 
+/// The URL a forwarded call goes to: the catalog's own address with the
+/// call's path segments appended, each one percent-encoded.
+///
+/// DATA-5 S1 review BLOCKER 1: the path is built segment by segment (the
+/// `url` crate's `path_segments_mut().push`), never by pasting a value
+/// into a string. `push` percent-encodes `/` and `%`, so a segment can
+/// never become a separator or an escape, whatever it holds.
+///
+/// `push` DROPS a segment that is exactly `.` or `..` instead of
+/// encoding it, so such a segment would change the path's shape rather
+/// than stay inside it. The table name check
+/// ([`table_name_is_allowed`]) refuses those long before this point; the
+/// only other variable segment is the warehouse prefix the catalog itself
+/// advertised, so this guard is about a misconfigured catalog.
+///
+/// # Errors
+///
+/// The configured catalog URI does not parse, or it cannot carry a path
+/// (`path_segments_mut` refuses such a URL). Both mean this deployment
+/// cannot reach the catalog at all, so the answer is the catalog's own
+/// fixed "unavailable" text — never the URI, never the parser's text.
+fn forwarded_url(base: &str, segments: &[&str]) -> Result<url::Url, ApiError> {
+    let mut url = url::Url::parse(base.trim())
+        .map_err(|_| ApiError::Unavailable(upstream_error::CATALOG.unavailable.to_owned()))?;
+    {
+        let mut path = url
+            .path_segments_mut()
+            .map_err(|()| ApiError::Unavailable(upstream_error::CATALOG.unavailable.to_owned()))?;
+        // The base address may end in a slash; without this the first
+        // segment would land behind a doubled separator.
+        path.pop_if_empty();
+        for segment in segments {
+            if matches!(*segment, "." | "..") {
+                return Err(ApiError::Unavailable(
+                    upstream_error::CATALOG.unavailable.to_owned(),
+                ));
+            }
+            path.push(segment);
+        }
+    }
+    Ok(url)
+}
+
 /// Forward one call to `Lakekeeper` and read its answer.
 ///
 /// The tool's own credential is never forwarded: the request carries the
@@ -393,7 +476,7 @@ fn query_for(state: &AppState, raw: Option<&str>, with_warehouse: bool) -> Vec<(
 async fn call_catalog(
     state: &AppState,
     method: &Method,
-    tail: &str,
+    segments: &[&str],
     query: &[(String, String)],
     setup: &Setup,
     headers: &HeaderMap,
@@ -403,14 +486,14 @@ async fn call_catalog(
             upstream_error::CATALOG.unavailable.to_owned(),
         ));
     };
-    let url = format!("{}{}", state.config.lakekeeper_catalog_uri, tail);
+    let url = forwarded_url(&state.config.lakekeeper_catalog_uri, segments)?;
     let delegation = headers
         .get(DELEGATION_HEADER)
         .and_then(|value| value.to_str().ok())
         .filter(|value| !value.is_empty())
         .unwrap_or(VENDED_CREDENTIALS);
     let mut request = client
-        .request(method.clone(), &url)
+        .request(method.clone(), url)
         .bearer_auth(setup.token.expose_secret())
         .header(DELEGATION_HEADER, delegation);
     if !query.is_empty() {
@@ -472,7 +555,7 @@ async fn expected_prefix(
     let answer = call_catalog(
         state,
         &Method::GET,
-        "/v1/config",
+        &["v1", "config"],
         &query_for(state, None, true),
         setup,
         headers,
@@ -704,7 +787,7 @@ pub async fn config(
     let answer = call_catalog(
         &state,
         &Method::GET,
-        "/v1/config",
+        &["v1", "config"],
         &query_for(&state, query.0.as_deref(), true),
         &setup,
         &headers,
@@ -739,7 +822,7 @@ pub async fn namespaces(
     let answer = call_catalog(
         &state,
         &Method::GET,
-        &format!("/v1/{prefix}/namespaces"),
+        &["v1", prefix.as_str(), "namespaces"],
         &query_for(&state, query.0.as_deref(), false),
         &setup,
         &headers,
@@ -777,7 +860,7 @@ pub async fn namespace(
     let answer = call_catalog(
         &state,
         &method,
-        &format!("/v1/{prefix}/namespaces/{namespace}"),
+        &["v1", prefix.as_str(), "namespaces", namespace.as_str()],
         &query_for(&state, query.0.as_deref(), false),
         &setup,
         &headers,
@@ -813,7 +896,13 @@ pub async fn tables(
     let answer = call_catalog(
         &state,
         &Method::GET,
-        &format!("/v1/{prefix}/namespaces/{namespace}/tables"),
+        &[
+            "v1",
+            prefix.as_str(),
+            "namespaces",
+            namespace.as_str(),
+            "tables",
+        ],
         &query_for(&state, query.0.as_deref(), false),
         &setup,
         &headers,
@@ -843,6 +932,12 @@ pub async fn table(
     if !namespace_is_gold(&namespace) {
         return Ok(refused());
     }
+    // The table name is checked before anything is forwarded
+    // (DATA-5 S1 review BLOCKER 1): a name that carries a path
+    // separator would walk out of the `gold` namespace.
+    if !table_name_is_allowed(&table) {
+        return Ok(refused());
+    }
     let expected = expected_prefix(&state, &setup, &headers).await?;
     if prefix != expected {
         return Ok(wrong_warehouse());
@@ -851,7 +946,14 @@ pub async fn table(
     let answer = call_catalog(
         &state,
         &method,
-        &format!("/v1/{prefix}/namespaces/{namespace}/tables/{table}"),
+        &[
+            "v1",
+            prefix.as_str(),
+            "namespaces",
+            namespace.as_str(),
+            "tables",
+            table.as_str(),
+        ],
         &query_for(&state, query.0.as_deref(), false),
         &setup,
         &headers,
@@ -888,6 +990,13 @@ pub async fn credentials(
     if !namespace_is_gold(&namespace) {
         return Ok(refused());
     }
+    // The table name is checked before anything is forwarded
+    // (DATA-5 S1 review BLOCKER 1), for the same reason the table load
+    // checks it: a name that carries a path separator would walk out of
+    // the `gold` namespace.
+    if !table_name_is_allowed(&table) {
+        return Ok(refused());
+    }
     let expected = expected_prefix(&state, &setup, &headers).await?;
     if prefix != expected {
         return Ok(wrong_warehouse());
@@ -895,7 +1004,15 @@ pub async fn credentials(
     let answer = call_catalog(
         &state,
         &Method::GET,
-        &format!("/v1/{prefix}/namespaces/{namespace}/tables/{table}/credentials"),
+        &[
+            "v1",
+            prefix.as_str(),
+            "namespaces",
+            namespace.as_str(),
+            "tables",
+            table.as_str(),
+            "credentials",
+        ],
         &query_for(&state, query.0.as_deref(), false),
         &setup,
         &headers,
@@ -1104,6 +1221,97 @@ mod tests {
         assert_eq!(body["error"]["message"], json!(REFUSED_MESSAGE));
         assert_eq!(body["error"]["type"], json!("ForbiddenException"));
         assert_eq!(body["error"]["code"], json!(403));
+    }
+
+    /// The table names the door forwards are the ones the Gold export
+    /// writes; a name that could change the path's shape is refused
+    /// (DATA-5 S1 review BLOCKER 1).
+    #[test]
+    fn only_a_plain_table_name_is_forwarded() {
+        for allowed in ["orders", "gold_export_smoke", "orders-2026", "v2", "A1"] {
+            assert!(table_name_is_allowed(allowed), "{allowed} is a real name");
+        }
+        for refused in [
+            "",
+            "..",
+            ".",
+            "../../silver/tables/x",
+            "orders/../../silver",
+            "orders%2F..%2F..",
+            "orders%2F",
+            "gold.orders",
+            "gold orders",
+            "orders;drop",
+            "orders\n",
+        ] {
+            assert!(!table_name_is_allowed(refused), "{refused} must be refused");
+        }
+        // A name longer than the cap is not a name the export wrote.
+        assert!(!table_name_is_allowed(&"a".repeat(MAX_TABLE_NAME_LEN + 1)));
+        assert!(table_name_is_allowed(&"a".repeat(MAX_TABLE_NAME_LEN)));
+    }
+
+    /// The forwarded path is built segment by segment, so a segment can
+    /// never become a separator or an escape (DATA-5 S1 review BLOCKER 1).
+    #[test]
+    fn the_forwarded_path_encodes_each_segment() {
+        let url = forwarded_url(
+            "http://lakekeeper:8181/catalog",
+            &["v1", "gold", "tables", "../../silver/tables/x"],
+        )
+        .expect("the url is built");
+        assert_eq!(
+            url.path(),
+            "/catalog/v1/gold/tables/..%2F..%2Fsilver%2Ftables%2Fx",
+            "the segment is one segment: {url}"
+        );
+        assert!(
+            !url.path().contains("/silver/"),
+            "the path still holds no unencoded separator: {url}"
+        );
+    }
+
+    /// The base address is the catalog's own, path and all: the door
+    /// forwards under `/v1/...` after it.
+    #[test]
+    fn the_forwarded_path_keeps_the_catalogs_own_base_path() {
+        let url = forwarded_url("http://lakekeeper:8181/catalog", &["v1", "config"])
+            .expect("the url is built");
+        assert_eq!(url.as_str(), "http://lakekeeper:8181/catalog/v1/config");
+
+        // A base address with no path of its own.
+        let url =
+            forwarded_url("http://lakekeeper:8181", &["v1", "config"]).expect("the url is built");
+        assert_eq!(url.as_str(), "http://lakekeeper:8181/v1/config");
+
+        // A base address that ends in a slash does not get a doubled one.
+        let url =
+            forwarded_url("http://lakekeeper:8181/", &["v1", "config"]).expect("the url is built");
+        assert_eq!(url.as_str(), "http://lakekeeper:8181/v1/config");
+    }
+
+    /// The `url` crate drops a segment that is exactly `.` or `..`, so
+    /// the door refuses one rather than forward a path of another shape.
+    #[test]
+    fn a_dot_segment_is_never_forwarded() {
+        for segment in [".", ".."] {
+            let err = forwarded_url("http://lakekeeper:8181/catalog", &["v1", segment])
+                .expect_err("a dot segment is refused");
+            assert_eq!(err.status(), 503);
+            assert!(
+                !err.to_string().contains("lakekeeper"),
+                "the answer never carries the catalog's own address: {err}"
+            );
+        }
+    }
+
+    /// A catalog address that is not a URL at all is the catalog's
+    /// "unavailable" — not the parser's text.
+    #[test]
+    fn an_unparseable_catalog_address_is_the_catalogs_own_text() {
+        let err = forwarded_url("not a url", &["v1", "config"]).expect_err("refused");
+        assert_eq!(err.status(), 503);
+        assert_eq!(err.to_string(), upstream_error::CATALOG.unavailable);
     }
 
     /// A session — even one holding everything — is refused: the count is

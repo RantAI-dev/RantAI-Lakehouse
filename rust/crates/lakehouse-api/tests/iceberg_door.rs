@@ -330,6 +330,73 @@ async fn the_iceberg_door_refuses_a_namespace_other_than_gold() {
     );
 }
 
+/// A table name that walks out of the `gold` namespace is refused
+/// before anything is forwarded (DATA-5 S1 review BLOCKER 1).
+///
+/// `axum` percent-decodes the `{table}` path value, so `%2F..%2F..`
+/// arrives as `../..`: pasted into a forwarded URL it resolves to
+/// another namespace. The catalog is mocked for THAT namespace, so a
+/// door that forwards the walk answers 200 instead of refusing it —
+/// this test fails then, and passes only when the walk is refused.
+#[tokio::test]
+async fn the_iceberg_door_refuses_a_table_name_that_walks_out_of_the_gold_namespace() {
+    let server = catalog().await;
+    // The namespace the walk would land in. A table load there answers
+    // 200, so the door's own answer says whether it forwarded.
+    Mock::given(method("GET"))
+        .and(path(format!("/v1/{PREFIX}/namespaces/silver/tables/x")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "metadata": {"format-version": 2},
+        })))
+        .mount(&server)
+        .await;
+    let token_file = outside_token_file();
+    let TestApp { router, pool } = door_over(&server, &token_file).await;
+    let (tool_id, tool_token) = outside_tool(&pool).await;
+
+    let (status, body) = send(
+        &router,
+        get(
+            &format!(
+                "/api/iceberg/v1/{PREFIX}/namespaces/gold/tables/..%2F..%2F..%2Fsilver%2Ftables%2Fx"
+            ),
+            &tool_token,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "body: {body}");
+    assert_eq!(
+        body["error"]["message"],
+        json!("Outside readers may only read published Gold tables.")
+    );
+
+    // The catalog was never asked for the walk. The name is refused
+    // before the door even asks the catalog for the warehouse prefix, so
+    // the list of requests is empty today; the two assertions below hold
+    // either way, and a forwarded walk is what would break them.
+    let requests = server.received_requests().await.expect("read the requests");
+    for request in &requests {
+        let path = request.url.path();
+        assert!(
+            !path.contains("silver"),
+            "the walk out of the namespace never reached the catalog: {path}"
+        );
+        assert!(
+            !path.contains("/tables/"),
+            "no table load was forwarded: {path}"
+        );
+    }
+
+    // And nothing was counted under the made-up name.
+    let counted: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM outside_table_read_day WHERE identity_id = $1")
+            .bind(tool_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read the counter");
+    assert_eq!(counted, 0, "a refused load is not counted");
+}
+
 /// A warehouse prefix that is not this deployment's is a 404, not a
 /// forwarded call (D2, D8).
 #[tokio::test]
