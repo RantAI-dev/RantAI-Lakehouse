@@ -776,3 +776,113 @@ SHOULD-FIX 1 is fixed (`32d940d5`).
     - a `uses:` in `release.yml` is not pinned to a 40-hex SHA.
 
 **Open: BLOCKER 1, BLOCKER 2.**
+
+### Fixes for review round 1 (developer, 2026-11-01)
+
+**Commits** (branch `feat/rel-2-s2-release-pipeline`, base `cc9f7645`), one per blocker:
+
+| Commit | Finding | What |
+| --- | --- | --- |
+| `f1d72644` | REL-2 S2 review BLOCKER 1 | the real release signs with the key it is given |
+| `8a04449e` | REL-2 S2 review BLOCKER 2 | the signing key is visible to three steps only |
+
+**BLOCKER 1 (`f1d72644`).** The release job now sets
+`COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}`, so `env://COSIGN_PRIVATE_KEY` resolves; the
+dry run takes the SAME path — the throwaway key's PEM goes into the environment through
+`$GITHUB_ENV` and every signing step signs with `env://COSIGN_PRIVATE_KEY` — so the dry run proves
+the real job's wiring. The comment that called the secret "the base64 of the encrypted private
+key" is corrected (`env://` reads the PEM as it is); `docs/CI.md`'s secret table says the same now.
+The dry run's empty-password comment is corrected too: cosign DOES encrypt the throwaway key with
+that empty password — it asks for nothing — which the verified run below shows.
+
+**BLOCKER 2 (`8a04449e`).** The two secrets are in the `env:` of the three steps that sign ("Sign
+each image", "Attest each SBOM to its image", "Sign the manifest and verify the signature") and of
+no other step; the job-level `env:` keeps only the `env://COSIGN_PRIVATE_KEY` reference, which is a
+name and not the key. Every third-party action is pinned to a full commit SHA in BOTH jobs, the
+release in a trailing comment. Each SHA was resolved from the tag the file used, with
+`gh api repos/<owner>/<action>/git/ref/tags/<tag>`; all eight resolved to a commit object, so no
+annotated tag had to be dereferenced:
+
+| Action (the tag the file used) | SHA | The release that SHA is |
+| --- | --- | --- |
+| `actions/checkout@v7` | `3d3c42e5aac5ba805825da76410c181273ba90b1` | `v7.0.1` |
+| `actions/setup-python@v7` | `6d4fd22b20465ccc0f7354476588e8df7c9ca0e0` | `v7.1.0` |
+| `actions/upload-artifact@v7` | `cf430e030ddbb5b0abf93d22962f4752f3646cd9` | `v7.0.2` |
+| `docker/setup-buildx-action@v4` | `f87e5991a6d7451dcb8d9637bfbc97413f497069` | `v4.4.1` |
+| `docker/build-push-action@v7` | `c3c9e263c25d99ce0380d002d59b67737d91b0dc` | `v7.4.0` |
+| `docker/login-action@v4` | `81c6f93d4bc991e510b342a00b419b3bb4efc5c6` | `v4.7.0` |
+| `sigstore/cosign-installer@v4.1.2` | `6f9f17788090df1f26f669e9d70d6ae9567deba6` | `v4.1.2` |
+| `anchore/sbom-action@v0` | `e22c389904149dbc22b58101806040fa8d37a610` | `v0.24.0` |
+
+The comment is the release the SHA is: the tag the SHA was resolved from points at it (`v0` of the
+SBOM action is `v0.24.0`). `ops/release/test_release_workflow.py` (new, 12 cases) parses the
+workflow and fails when a `secrets.COSIGN_*` sits in a job-level `env:`, when a `uses:` is not pinned
+to a 40-hex SHA, and when a pin does not name its release in a trailing comment. It holds the three
+signing steps to carrying the secrets, and it runs the checks against synthetic workflows, so a
+check that cannot fail is itself a failure. It parses with PyYAML, so the two pipeline jobs and
+`ci.yml`'s "Unit-test the release tooling" job install `pyyaml==6.0.3` beside `pytest`.
+
+**Commands run, in the foreground, on `8a04449e`:**
+
+| Command | Result |
+| --- | --- |
+| `python -m pytest ops/release -q` | **64 passed, 0 failed** (52 before this round, 12 new) |
+| `python3 -m unittest discover -s ops/release -p 'test_*.py'` | **64 tests, OK** |
+| `actionlint .github/workflows/release.yml` | clean, exit 0 (shellcheck 0.10.0 on the PATH, so the `run:` blocks were checked too) |
+| `bash -n ops/release/make_bundle.sh` | clean, exit 0 |
+| `shellcheck ops/release/make_bundle.sh` | clean, exit 0 |
+| `python3 ops/lint/check_intra_package_imports.py` | OK |
+| `python3 ops/lint/check_bare_iceberg_count.py` | no violation |
+| `actionlint .github/workflows/ci.yml` | the same three PRE-EXISTING shellcheck warnings as before this round (SC1007, SC2034, SC2155), now at lines 2071 and 2930 because this round added one comment line to that file; no new finding |
+
+**The signing path, verified locally with the cosign the pipeline installs.** The pinned
+`sigstore/cosign-installer@v4.1.2` installs **cosign v3.0.6** (its `cosign-release` default), so the
+wiring was checked against that binary, against a throwaway `registry:2` on `localhost:5000`:
+
+- `COSIGN_PASSWORD="" cosign generate-key-pair` -> an ENCRYPTED key (`-----BEGIN ENCRYPTED SIGSTORE
+  PRIVATE KEY-----`), no prompt;
+- `cosign sign --key env://COSIGN_PRIVATE_KEY <ref>` -> exit 0;
+- `cosign attest --key env://COSIGN_PRIVATE_KEY --type cyclonedx --predicate <sbom> <ref>` -> exit 0.
+
+So BLOCKER 1's fix is exercised on the real binary, not only reasoned about.
+
+**A NEW finding, NOT fixed here — the planner's decision, not the developer's.** While verifying the
+above, the manifest-signing step was found to FAIL with the cosign the pipeline installs:
+
+- `cosign sign-blob --key "$COSIGN_KEY" --output-signature release.json.sig release.json` (the
+  workflow's command) with cosign v3.0.6 prints "Flag --output-signature has been deprecated, please
+  use --bundle to provide the output bundle location" and then errors: "signing release.json: create
+  bundle file: open : no such file or directory". v3 ignores `--output-signature`, and
+  `--new-bundle-format=false` is refused ("must provide --new-bundle-format or --bundle").
+- The v3 form works: `cosign sign-blob --key env://COSIGN_PRIVATE_KEY --bundle release.json.bundle
+  release.json` writes the bundle, and `cosign verify-blob --key cosign.pub --bundle
+  release.json.bundle release.json` answers "Verified OK".
+- With cosign **v2.6.1** (downloaded to check the other way) the same command is no better: every
+  keyed call asks to upload to the PUBLIC transparency log first ("Are you sure you would like to
+  continue? [y/N]") and fails in a runner, which has no terminal, with "user declined the prompt" —
+  `cosign sign`, `cosign attest` and `cosign sign-blob` alike. cosign v3.0.6 does NOT ask (that is
+  why the two image-signing steps above pass).
+
+So the dry run reaches "Sign the manifest and verify the signature" and fails there, and the real
+release would fail at the same step. It is NOT fixed in this round, because the choice is the
+plan's: the artifact the plan names (`release.json.sig`, a detached signature that `lakehousectl`
+verifies with the committed public key) either becomes a cosign **bundle** (v3's form; the file name
+can stay, but `lakehousectl` must verify it with `--bundle`), or the installer is pinned to a v2
+release and the transparency-log prompt is answered (`--tlog-upload=false`, and
+`--insecure-ignore-tlog` on the verification). The first is the smaller change and the one the
+local run proves; the second keeps the detached-signature artifact. This is the reviewer's call,
+and the release policy (`docs/core/reference/release-policy.md`) is where the answer belongs.
+
+**Not verified, with the reason:**
+
+- **The dry run is not verified.** It needs a GitHub runner: the four images, the throwaway
+  registry, `syft` and the bundle are all CI-side. The PR's own dry run is the proof, and it will
+  fail at the manifest-signing step above until that finding is decided.
+- **The real release is not verified, and cannot be.** It needs a `v*` tag, the owner's approval on
+  the `release` environment, and the release key. REL-2 S5 does that.
+- **The secrets' scoping is checked by parsing the workflow, not by running it:** the test proves
+  that no `secrets.COSIGN_*` sits in a job-level `env:` and that the three signing steps carry
+  them. What a runner does with a step-level `env:` is GitHub's behaviour, not this repository's.
+- No cargo command and no Dagster command ran: this round changes no Rust, no code location and no
+  Compose file.
+
