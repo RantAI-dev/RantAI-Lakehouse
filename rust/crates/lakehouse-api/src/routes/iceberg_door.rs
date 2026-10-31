@@ -90,7 +90,7 @@ use serde_json::{Value, json};
 use crate::auth::AuthenticatedPrincipal;
 use crate::error::ApiResult;
 use crate::json::ApiJson;
-use crate::lakekeeper_token::read_token_file;
+use crate::lakekeeper_token::{read_token_file, token_unavailable_message};
 use crate::state::AppState;
 use crate::upstream_error::{self, Class, FailedAs};
 
@@ -125,6 +125,10 @@ const OUTSIDE_READ_PURPOSE: &str = "outside-readers";
 
 /// The env var `read_token_file` names in its fixed 503 text.
 const OUTSIDE_READ_TOKEN_ENV_VAR: &str = "LAKEKEEPER_OUTSIDE_READ_TOKEN_FILE";
+
+/// The env var that publishes the storage address an outside tool can
+/// reach. Unset (or empty) means outside reading is OFF.
+const OUTSIDE_S3_ENDPOINT_ENV_VAR: &str = "OUTSIDE_S3_ENDPOINT";
 
 /// The header that asks `Lakekeeper` to vend short-lived storage
 /// credentials — the same header `lakehouse-iceberg` sets on every call
@@ -194,14 +198,55 @@ fn wrong_warehouse() -> DoorResponse {
 
 /// The 503 for a deployment where outside reading is not set up
 /// (ADR 0016 point 4, plan D4).
-fn not_set_up(setting: &str) -> ApiError {
-    ApiError::Unavailable(format!(
-        "Outside reading is not set up: {setting} is not set."
-    ))
+fn not_set_up(problem: NotSetUp) -> ApiError {
+    ApiError::Unavailable(problem.reason())
+}
+
+/// Why outside reading is not set up on this deployment (ADR 0016 point
+/// 4, plan D4).
+///
+/// A small type rather than an [`ApiError`], because the console's
+/// consumers route (`routes::gold::consumers`) asks the same question
+/// (plan D7) and must answer with the SAME sentence the door's own 503
+/// carries. The sentence is therefore built here, once, from this value
+/// — and no route ever puts an error's own text into a response
+/// (SEC-11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NotSetUp {
+    /// The published storage address (`OUTSIDE_S3_ENDPOINT`) is unset:
+    /// an outside tool cannot reach the storage the catalog vends.
+    Endpoint,
+    /// The `outside-readers` token file is unset: the door has no
+    /// catalog principal to forward under.
+    TokenFile,
+    /// The `outside-readers` token file is set but cannot be read: the
+    /// door has no credential to forward with.
+    TokenUnreadable,
+}
+
+impl NotSetUp {
+    /// The sentence that says outside reading is not set up, naming what
+    /// is missing (ADR 0016 point 4, plan D4/D7).
+    ///
+    /// The door's 503 and the console's "Not measured" carry this same
+    /// sentence: one sentence, two callers.
+    pub(crate) fn reason(self) -> String {
+        match self {
+            Self::Endpoint => {
+                format!("Outside reading is not set up: {OUTSIDE_S3_ENDPOINT_ENV_VAR} is not set.")
+            }
+            Self::TokenFile => {
+                format!("Outside reading is not set up: {OUTSIDE_READ_TOKEN_ENV_VAR} is not set.")
+            }
+            Self::TokenUnreadable => {
+                token_unavailable_message(OUTSIDE_READ_PURPOSE, OUTSIDE_READ_TOKEN_ENV_VAR)
+            }
+        }
+    }
 }
 
 /// The outside-reading settings this deployment has.
-struct Setup {
+pub(crate) struct Setup {
     /// The storage address an operator published (`OUTSIDE_S3_ENDPOINT`).
     endpoint: String,
     /// The `outside-readers` principal's bearer token — the identity the
@@ -209,28 +254,33 @@ struct Setup {
     token: SecretValue,
 }
 
-/// Read the outside-reading settings, or answer 503 naming the one that
-/// is missing (D4). The check runs before anything is forwarded: a
-/// deployment that has not published its storage address must not answer
-/// a read at all.
-async fn setup(state: &AppState) -> Result<Setup, ApiError> {
+/// Read the outside-reading settings, or say which one is missing (D4).
+/// The check runs before anything is forwarded: a deployment that has
+/// not published its storage address must not answer a read at all.
+///
+/// `pub(crate)`, because `routes::gold::consumers` asks the same
+/// question — "is outside reading set up on this deployment?" — and must
+/// answer with the SAME sentence the door's own 503 carries (D7). One
+/// check, one sentence, two callers.
+///
+/// # Errors
+///
+/// Returns the [`NotSetUp`] that says what is missing: the published
+/// storage address, the token file, or the token file's unreadability.
+pub(crate) async fn setup(state: &AppState) -> Result<Setup, NotSetUp> {
     let Some(endpoint) = state.config.outside_s3_endpoint.clone() else {
-        return Err(not_set_up("OUTSIDE_S3_ENDPOINT"));
+        return Err(NotSetUp::Endpoint);
     };
-    if state
-        .config
-        .lakekeeper_outside_read_token_file
-        .trim()
-        .is_empty()
-    {
-        return Err(not_set_up(OUTSIDE_READ_TOKEN_ENV_VAR));
+    let token_path = state.config.lakekeeper_outside_read_token_file.trim();
+    if token_path.is_empty() {
+        return Err(NotSetUp::TokenFile);
     }
-    let token = read_token_file(
-        &state.config.lakekeeper_outside_read_token_file,
-        OUTSIDE_READ_PURPOSE,
-        OUTSIDE_READ_TOKEN_ENV_VAR,
-    )
-    .await?;
+    // The helper logs the io error and answers with its own fixed
+    // sentence; the reason it could not read the file is the same one
+    // the door's 503 carries (ADR 0011, AGENTS.md rule 4).
+    let token = read_token_file(token_path, OUTSIDE_READ_PURPOSE, OUTSIDE_READ_TOKEN_ENV_VAR)
+        .await
+        .map_err(|_| NotSetUp::TokenUnreadable)?;
     Ok(Setup { endpoint, token })
 }
 
@@ -647,7 +697,7 @@ pub async fn config(
     headers: HeaderMap,
     query: RawQuery,
 ) -> ApiResult<DoorResponse> {
-    let setup = setup(&state).await?;
+    let setup = setup(&state).await.map_err(not_set_up)?;
     if let Some(response) = refuse(&principal, Route::Config, &method) {
         return Ok(response);
     }
@@ -678,7 +728,7 @@ pub async fn namespaces(
     headers: HeaderMap,
     query: RawQuery,
 ) -> ApiResult<DoorResponse> {
-    let setup = setup(&state).await?;
+    let setup = setup(&state).await.map_err(not_set_up)?;
     if let Some(response) = refuse(&principal, Route::Namespaces, &method) {
         return Ok(response);
     }
@@ -713,7 +763,7 @@ pub async fn namespace(
     headers: HeaderMap,
     query: RawQuery,
 ) -> ApiResult<DoorResponse> {
-    let setup = setup(&state).await?;
+    let setup = setup(&state).await.map_err(not_set_up)?;
     if let Some(response) = refuse(&principal, Route::Namespace, &method) {
         return Ok(response);
     }
@@ -749,7 +799,7 @@ pub async fn tables(
     headers: HeaderMap,
     query: RawQuery,
 ) -> ApiResult<DoorResponse> {
-    let setup = setup(&state).await?;
+    let setup = setup(&state).await.map_err(not_set_up)?;
     if let Some(response) = refuse(&principal, Route::Tables, &method) {
         return Ok(response);
     }
@@ -786,7 +836,7 @@ pub async fn table(
     headers: HeaderMap,
     query: RawQuery,
 ) -> ApiResult<DoorResponse> {
-    let setup = setup(&state).await?;
+    let setup = setup(&state).await.map_err(not_set_up)?;
     if let Some(response) = refuse(&principal, Route::Table, &method) {
         return Ok(response);
     }
@@ -831,7 +881,7 @@ pub async fn credentials(
     headers: HeaderMap,
     query: RawQuery,
 ) -> ApiResult<DoorResponse> {
-    let setup = setup(&state).await?;
+    let setup = setup(&state).await.map_err(not_set_up)?;
     if let Some(response) = refuse(&principal, Route::Credentials, &method) {
         return Ok(response);
     }
@@ -869,7 +919,7 @@ pub async fn catch_all(
     // The deployment's own state is checked first, for the same reason
     // every other door route checks it: a deployment that has not
     // published its storage address has no door to answer with.
-    let _ = setup(&state).await?;
+    let _ = setup(&state).await.map_err(not_set_up)?;
     // The caller is checked for the same reason, and then the answer is
     // the same one either way: the Iceberg refusal.
     if matches!(principal.id, PrincipalId::Service(_)) {
@@ -1012,10 +1062,38 @@ mod tests {
     /// says so in the fixed shape ADR 0016 point 4 asks for.
     #[test]
     fn the_not_set_up_refusal_names_the_missing_setting() {
-        let err = not_set_up("OUTSIDE_S3_ENDPOINT");
+        let err = not_set_up(NotSetUp::Endpoint);
         assert_eq!(err.status(), 503);
         assert!(err.to_string().contains("OUTSIDE_S3_ENDPOINT"));
         assert!(err.to_string().contains("not set up"));
+    }
+
+    /// Every reason the door can be "not set up" names what is missing —
+    /// and the console's consumers route answers with the SAME sentence
+    /// (plan D7), so the console and a tool are told the same thing.
+    #[test]
+    fn every_not_set_up_reason_names_what_is_missing() {
+        assert!(NotSetUp::Endpoint.reason().contains("OUTSIDE_S3_ENDPOINT"));
+        assert!(
+            NotSetUp::TokenFile
+                .reason()
+                .contains("LAKEKEEPER_OUTSIDE_READ_TOKEN_FILE")
+        );
+        assert!(
+            NotSetUp::TokenUnreadable
+                .reason()
+                .contains("LAKEKEEPER_OUTSIDE_READ_TOKEN_FILE")
+        );
+        for reason in [
+            NotSetUp::Endpoint.reason(),
+            NotSetUp::TokenFile.reason(),
+            NotSetUp::TokenUnreadable.reason(),
+        ] {
+            assert!(
+                reason.starts_with("Lakekeeper ") || reason.contains("not set up"),
+                "the reason says what is wrong, in the fixed shape: {reason}"
+            );
+        }
     }
 
     /// The Iceberg error shape the door answers in: the spec's

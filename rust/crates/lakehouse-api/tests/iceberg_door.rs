@@ -470,3 +470,165 @@ async fn the_iceberg_door_serves_only_the_gold_namespace() {
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(body["namespaces"], json!([["gold"]]));
 }
+
+/// The consumers route reads the count back: the tool that loaded the
+/// published table through the door is listed, with its reads and its
+/// last read (DATA-5, plan D7).
+#[tokio::test]
+async fn the_gold_consumers_route_lists_the_tool_that_read_the_published_table() {
+    let server = catalog().await;
+    let token_file = outside_token_file();
+    let TestApp { router, pool } = door_over(&server, &token_file).await;
+    let (tool_id, tool_token) = outside_tool(&pool).await;
+
+    // One read through the door.
+    let (status, body) = send(
+        &router,
+        get(
+            &format!("/api/iceberg/v1/{PREFIX}/namespaces/gold/tables/orders"),
+            &tool_token,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    // The consumers route is a CONSOLE route: it needs a session, not
+    // the tool's key.
+    let cookie = common::session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/gold/export/orders/consumers")
+                .header("cookie", cookie)
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("router never fails a request outright");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("read the body");
+    let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+
+    assert_eq!(body["mart"], json!("orders"));
+    assert_eq!(body["supported"], json!(true));
+    assert_eq!(body["windowDays"], json!(7));
+    let consumers = body["consumers"].as_array().expect("an array of readers");
+    assert_eq!(consumers.len(), 1, "one tool read the table: {body}");
+    assert_eq!(consumers[0]["identityId"], json!(tool_id.to_string()));
+    assert_eq!(consumers[0]["reads"], json!(1));
+    assert!(
+        !consumers[0]["lastReadAt"]
+            .as_str()
+            .unwrap_or_default()
+            .is_empty(),
+        "the last read is reported, not a guess"
+    );
+    assert!(
+        consumers[0]["name"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("outside-tool-"),
+        "the tool is listed under the name it had: {body}"
+    );
+}
+
+/// Where outside reading is off, the consumers route says "not measured"
+/// with the door's own reason — never a count of zero (principle 2).
+#[tokio::test]
+async fn the_gold_consumers_route_reports_not_measured_when_outside_reading_is_off() {
+    let server = catalog().await;
+    let token_file = outside_token_file();
+    let mut overrides = HashMap::new();
+    overrides.insert("LAKEKEEPER_CATALOG_URI".to_owned(), server.uri());
+    overrides.insert(
+        "LAKEKEEPER_OUTSIDE_READ_TOKEN_FILE".to_owned(),
+        token_file.display().to_string(),
+    );
+    let TestApp { router, pool } = spin_up_with_env(&overrides).await;
+    let cookie = common::session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/gold/export/orders/consumers")
+                .header("cookie", cookie)
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("router never fails a request outright");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("read the body");
+    let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+
+    assert_eq!(body["supported"], json!(false));
+    assert!(
+        body["consumers"].is_null(),
+        "an unmeasured count is null, never an empty list that reads as zero: {body}"
+    );
+    let reason = body["reason"].as_str().unwrap_or_default();
+    assert_eq!(
+        reason, "Outside reading is not set up: OUTSIDE_S3_ENDPOINT is not set.",
+        "the console says exactly what the door's own 503 says (plan D7)"
+    );
+}
+
+/// A token file that cannot be read means the door cannot work either,
+/// so the count is not measured — and the reason says so (ADR 0016 point
+/// 4: the check runs before anything is forwarded).
+#[tokio::test]
+async fn the_gold_consumers_route_reports_not_measured_when_the_token_file_cannot_be_read() {
+    let server = catalog().await;
+    let mut overrides = HashMap::new();
+    overrides.insert("LAKEKEEPER_CATALOG_URI".to_owned(), server.uri());
+    overrides.insert(
+        "OUTSIDE_S3_ENDPOINT".to_owned(),
+        PUBLISHED_ENDPOINT.to_owned(),
+    );
+    // A path that is not there: the deployment has no `outside-readers`
+    // credential to forward under.
+    overrides.insert(
+        "LAKEKEEPER_OUTSIDE_READ_TOKEN_FILE".to_owned(),
+        "/nonexistent/outside-readers.jwt".to_owned(),
+    );
+    let TestApp { router, pool } = spin_up_with_env(&overrides).await;
+    let cookie = common::session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/gold/export/orders/consumers")
+                .header("cookie", cookie)
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("router never fails a request outright");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("read the body");
+    let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+
+    assert_eq!(body["supported"], json!(false));
+    assert!(body["consumers"].is_null(), "not measured: {body}");
+    let reason = body["reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains("LAKEKEEPER_OUTSIDE_READ_TOKEN_FILE"),
+        "the reason names the setting that is missing: {reason}"
+    );
+    assert!(
+        !reason.contains("/nonexistent"),
+        "the reason never carries the token file's path: {reason}"
+    );
+}
