@@ -91,7 +91,7 @@ A step not performed is never Pass. Steps needing a terminal are marked
 | 2 | Type a column name that is in no table name | Every table with that column is listed, each saying "column <name>" | Pass 2026-10-09 |
 | 3 | Type a tag that is in no table name | The tagged tables are listed, each saying "tag <name>" | Pass 2026-10-09 |
 | 4 | Type two words of a table's description in the opposite order | The table is listed | Pass 2026-10-09 |
-| 5 | Type `revnue` where a table or column is named `revenue` | It is found, and the result shows it is an approximate match | Pass 2026-10-09 |
+| 5 | Type `revnue` where a table, a column or a tag is named `revenue` | It is found, and the result shows it is an approximate match — also when only the table's name matched (`DATA-32`) | Pass 2026-10-09 (a column or a tag); Fail 2026-10-23 (the name only), fixed in code by `DATA-32` 2026-11-01, not re-run |
 | 6 | Type the same words in the Data Explorer search box | The same tables, in the same order | Pass 2026-10-09 |
 | 7 | In the ⌘K box, choose "See all results" | The Data Explorer opens with the words filled in | Pass 2026-10-09 |
 | 8 | In the Data Explorer, filter by owner, then by tag, then by layer | Each filter narrows the list; together they combine | Pass 2026-10-09 |
@@ -113,11 +113,14 @@ marked Pass on that date.
 
 Exceptions, each with an owner and a date:
 
-- Row 5, a typo that matches only a table's name: the result gets no
-  "approximate match" label, while a column or tag typo does. Cause, by
-  reading: `matchedOn` is null when the name is the best field
-  (`rust/crates/lakehouse-api/src/routes/catalog_search.rs`). Owner: product
-  owner. Date: 2026-10-23. Follow-up: `DATA-32`.
+- Row 5, a typo that matches only a table's name: the result got no
+  "approximate match" label, while a column or tag typo did. Cause, by
+  reading: `matchedOn` was null when the name was the best field
+  (`rust/crates/lakehouse-api/src/routes/catalog_search.rs`). Fixed in code
+  by `DATA-32` (2026-11-01): the server reports `matchedOn.field: "name"`
+  with `approximate: true`, and the console says "approximate match".
+  Owner: product owner, to re-run row 5 and close the exception. Date:
+  2026-10-23. Follow-up: `DATA-32`.
 - Row 14, the speed measurement on 10,000 tables: `docs/plans/DATA-11-RESULT.md`
   does not exist. Owner: product owner. Date: 2026-10-23. Follow-up:
   `DATA-24`.
