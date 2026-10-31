@@ -25,13 +25,16 @@ import type { Dial, DiscoveryAnswer, DiscoveryObject, DiscoveryRequest } from "@
  */
 export type FinderKind = "sql" | "oracle" | "files" | "sftp" | "rest" | "mongodb" | "kafka" | "saas"
 
-/** The finder a connector type gets, or `null` for a type that cannot list (Google Sheets). */
+/** The finder a connector type gets, or `null` for a type that cannot list (Google Sheets, and an Oracle
+ * change-capture connector, whose tables are typed by hand: listing them would need an unencrypted session,
+ * `SRC-4` Amendment 10, S10-c). */
 export function finderKind(adapter: string, dial: Dial | null | undefined): FinderKind | null {
   switch (adapter) {
     case "sql":
     case "cdc":
       // A MongoDB change-capture connector lists collections, like a batch MongoDB one (`SRC-4` slice 5).
       if (dial?.driver === "mongodb") return "mongodb"
+      if (adapter === "cdc" && dial?.driver === "oracle") return null
       return dial?.driver === "oracle" ? "oracle" : "sql"
     case "files":
     case "sftp":

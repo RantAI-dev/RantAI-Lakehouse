@@ -14,6 +14,11 @@ type TestService = Pick<ConnectorService, "testConnection" | "getDiscovery" | "l
  * latency is the one the orchestrator measured. A test whose job never reported is a `timeout` the API words
  * itself (it is not recorded as a probe); that is shown as its `reason`, a failed test with no latency.
  *
+ * A pending answer that is already `ok` is a test that PASSED and only waits for its setup checks (an Oracle
+ * change-capture connector: Kafka Connect validated the connection, then the orchestrator reads the source's
+ * setup, `SRC-4` Amendment 11). That one is not replaced by a recorded probe: its own message is the answer,
+ * and the checks of the orchestrator's read are added to it when they arrive.
+ *
  * # Errors
  *
  * Rejects with whatever the service rejects with, and with an `AbortError` when `signal` aborts.
@@ -26,6 +31,7 @@ export async function runConnectionTest(
 ): Promise<ConnectorTestResult> {
   const first = await service.testConnection(id, signal)
   if (!first.pending) return first
+  if (first.ok) return withSetupChecks(service, id, first, signal, pollMs)
   const answer = await runDiscovery({
     kind: "test",
     // The launch is the call above; what runs from here is the wait.
@@ -55,5 +61,29 @@ export async function runConnectionTest(
     latencyMs: null,
     message: answer.reason ?? "The connection test did not finish.",
     testedAt: null,
+  }
+}
+
+/** The passed answer `first`, with the setup checks of the orchestrator's read once it ends. A read that
+ * cannot be waited for leaves the passed answer as it is, without checks: they are advice, never the verdict. */
+async function withSetupChecks(
+  service: TestService,
+  id: string,
+  first: ConnectorTestResult,
+  signal?: AbortSignal,
+  pollMs?: number
+): Promise<ConnectorTestResult> {
+  try {
+    const answer = await runDiscovery({
+      kind: "test",
+      start: async () => ({ kind: "test", state: "running" }),
+      get: () => service.getDiscovery(id, "test", signal),
+      signal,
+      pollMs,
+    })
+    return { ...first, pending: false, ...(answer.setupChecks && answer.setupChecks.length > 0 ? { setupChecks: answer.setupChecks } : {}) }
+  } catch (error) {
+    if (signal?.aborted) throw error
+    return { ...first, pending: false }
   }
 }

@@ -1430,6 +1430,28 @@ describe("ConnectorIngestPanel table discovery", () => {
     ])
   })
 
+  it("an Oracle change-capture connector lists nothing: its tables are typed by hand, in upper case (SRC-4 Amendment 10)", async () => {
+    const calls = stubFetch({
+      ...SPEC,
+      adapter: "cdc",
+      ingestMode: "cdc",
+      dial: { driver: "oracle", host: "h", port: 1521, database: "FREE", pdbName: "FREEPDB1", user: "c##dbzuser", sslMode: "require" } as unknown as typeof SPEC.dial,
+      sourceObjects: [],
+    })
+    render(<ConnectorIngestPanel connectorId="conn-ora-cdc" connectorName="erp" />)
+    fireEvent.change(await screen.findByLabelText("Add by name"), { target: { value: "shop.orders" } })
+    expect(screen.queryByRole("button", { name: "Find tables" })).toBeNull()
+    expect(screen.getByText(/not checked against the source until you test the connection/)).toBeDefined()
+    fireEvent.click(screen.getByRole("button", { name: "Add" }))
+    expect(screen.getByLabelText("Bronze table for SHOP.ORDERS")).toBeDefined()
+    fireEvent.change(screen.getByLabelText("Key columns for SHOP.ORDERS"), { target: { value: "ID" } })
+    fireEvent.click(screen.getByRole("button", { name: "Save tables and schedule" }))
+    await waitFor(() => expect(calls.some((c) => c.method === "PUT")).toBe(true))
+    expect((calls.find((c) => c.method === "PUT")?.body as { sourceObjects: { name: string }[] }).sourceObjects[0].name).toBe(
+      "SHOP.ORDERS"
+    )
+  })
+
   it("gives a SQL source no add-by-name field, since its list is the whole source", async () => {
     stubFetch()
     render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)

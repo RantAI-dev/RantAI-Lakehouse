@@ -85,6 +85,8 @@ describe("finderKind", () => {
       expect(finderKind(adapter, {})).toBe(adapter as never)
     }
     expect(finderKind("sheets", {})).toBeNull()
+    // Oracle change capture lists nothing (Amendment 10, S10-c): its tables are typed by hand.
+    expect(finderKind("cdc", { driver: "oracle" })).toBeNull()
   })
 })
 

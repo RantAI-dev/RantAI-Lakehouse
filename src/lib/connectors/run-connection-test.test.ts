@@ -38,6 +38,39 @@ describe("runConnectionTest (SRC-4 T1.1)", () => {
     expect(s.calls).toEqual(["test"])
   })
 
+  it("a passed answer that waits for its setup checks keeps its own message and gets the checks (Oracle change capture)", async () => {
+    const passed: ConnectorTestResult = {
+      ok: true,
+      supported: true,
+      latencyMs: 90,
+      message: "Connected through Kafka Connect. Setup checks are read over an unencrypted connection.",
+      testedAt: "2026-10-31T10:00:00Z",
+      pending: true,
+    }
+    const checks = [{ setting: "ARCHIVELOG", status: "ok", message: "The database runs in ARCHIVELOG mode." }]
+    const s = service(
+      passed,
+      [
+        { kind: "test", state: "running" },
+        { kind: "test", state: "done", setupChecks: checks },
+      ],
+      { results: [] }
+    )
+    const result = await runConnectionTest(s, "c", undefined, 1)
+    // The probe history is not read: the passed answer is the verdict, the checks are advice.
+    expect(s.calls).toEqual(["test", "poll test", "poll test"])
+    expect(result).toEqual({ ...passed, pending: false, setupChecks: checks })
+  })
+
+  it("a passed answer whose setup read cannot be waited for stays passed, without checks", async () => {
+    const passed: ConnectorTestResult = { ok: true, supported: true, latencyMs: 90, message: "Connected.", testedAt: "t", pending: true }
+    const s = service(passed, [], { results: [] })
+    s.getDiscovery = async () => {
+      throw new Error("down")
+    }
+    expect(await runConnectionTest(s, "c", undefined, 1)).toEqual({ ...passed, pending: false })
+  })
+
   it("waits on the test row, then returns the probe the API recorded for this test", async () => {
     const s = service(
       PENDING,

@@ -54,6 +54,25 @@ describe("ConnectorChangeCapturePanel", () => {
     expect(screen.getByText(/An alert is open/)).toBeDefined()
   })
 
+  it("shows why a failed Oracle connector failed, with the command that fixes it (Amendment 11, S11-d)", async () => {
+    stub({
+      supported: true,
+      state: "failed",
+      lag: LAG,
+      setupChecks: [
+        {
+          setting: "Supplemental logging",
+          status: "missing",
+          message: "Minimal supplemental logging must be on for the database.",
+          command: "ALTER DATABASE ADD SUPPLEMENTAL LOG DATA;",
+        },
+      ],
+    })
+    render(<ConnectorChangeCapturePanel connectorId="conn-a" pausedReason={null} />)
+    expect(await screen.findByText("Supplemental logging")).toBeDefined()
+    expect(screen.getByText("ALTER DATABASE ADD SUPPLEMENTAL LOG DATA;")).toBeDefined()
+  })
+
   it("says so, and shows no lag, when the deployment cannot capture changes", async () => {
     stub({ supported: false, reason: "Change capture is not set up on this deployment." })
     render(<ConnectorChangeCapturePanel connectorId="conn-a" pausedReason={null} />)

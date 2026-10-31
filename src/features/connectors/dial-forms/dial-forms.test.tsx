@@ -90,6 +90,51 @@ describe("dial forms", () => {
     fireEvent.change(screen.getByLabelText("TLS mode"), { target: { value: "disable" } })
     expect(onChange.mock.calls[1][0]).toMatchObject({ sslMode: "disable" })
   })
+  it("CdcDialForm for Oracle asks for the container database and a PDB, offers two TLS modes, and sends only pdbName of the extras (SRC-4 slice 6)", () => {
+    const onChange = mock()
+    render(<CdcDialForm value={null} onChange={onChange} driver="oracle" />)
+    expect((screen.getByLabelText("Port") as HTMLInputElement).value).toBe("1521")
+    expect(screen.getByLabelText("Container database (service name)")).toBeDefined()
+    for (const label of ["Replication slot name", "Publication name", "Server id"]) {
+      expect(screen.queryByLabelText(label)).toBeNull()
+    }
+    // Only the two modes Oracle's driver can honour: no certificate checking (SRC-37).
+    const modes = Array.from((screen.getByLabelText("TLS mode") as HTMLSelectElement).options).map((o) => o.value)
+    expect(modes).toEqual(["require", "disable"])
+    expect(screen.getByRole("option", { name: "Disable (not encrypted)" })).toBeDefined()
+    expect(screen.getByText(/cannot check the server's certificate/)).toBeDefined()
+    fireEvent.change(screen.getByLabelText("Host"), { target: { value: "h" } })
+    const bare = onChange.mock.calls[0][0] as Record<string, unknown>
+    expect("pdbName" in bare).toBe(false)
+    expect(bare.sslMode).toBe("require")
+    fireEvent.change(screen.getByLabelText("PDB name"), { target: { value: "FREEPDB1" } })
+    expect(onChange.mock.calls[1][0]).toMatchObject({ driver: "oracle", pdbName: "FREEPDB1" })
+  })
+  it("CdcDialForm drops a PDB name for every other driver", () => {
+    const onChange = mock()
+    render(
+      <CdcDialForm
+        value={{ driver: "mssql", host: "h", port: 1433, database: "d", user: "u", pdbName: "X" }}
+        onChange={onChange}
+        driver="mssql"
+      />
+    )
+    expect(screen.queryByLabelText("PDB name")).toBeNull()
+    fireEvent.change(screen.getByLabelText("Host"), { target: { value: "h2" } })
+    expect("pdbName" in (onChange.mock.calls[0][0] as Record<string, unknown>)).toBe(false)
+  })
+  it("the review of an Oracle change-capture dial says what the encryption is and is not", () => {
+    const dial = { driver: "oracle", host: "h", port: 1521, database: "FREE", pdbName: "FREEPDB1", user: "u", sslMode: "require" }
+    const items = connectionReviewItems("cdc", dial)
+    expect(items.find((i) => i.label === "PDB")?.value).toBe("FREEPDB1")
+    expect(items.find((i) => i.label === "Encryption")?.value).toMatch(/server is not authenticated/)
+    expect(connectionReviewItems("cdc", { ...dial, sslMode: "disable" }).find((i) => i.label === "Encryption")?.value).toBe(
+      "Not encrypted"
+    )
+  })
+  it("Oracle change capture lists nothing: its tables are typed by hand", () => {
+    expect(finderKind("cdc", { driver: "oracle" })).toBeNull()
+  })
   it("CdcDialForm shows nothing of the three for SQL Server", () => {
     const onChange = mock()
     render(<CdcDialForm value={null} onChange={onChange} driver="mssql" />)
@@ -180,6 +225,7 @@ describe("dial forms", () => {
     expect(driverForType("MariaDB")).toBe("mysql")
     expect(driverForType("SQL Server CDC")).toBe("mssql")
     expect(driverForType("Oracle")).toBeUndefined()
+    expect(driverForType("Oracle CDC")).toBe("oracle")
   })
   it("credentialSlotsFor mirrors secret_field_names: one slot per field the adapter reads", () => {
     const slots = (adapter: string, auth?: string) => {

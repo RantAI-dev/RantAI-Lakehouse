@@ -259,6 +259,10 @@ export function loadModeProblem(selected: {
   return null
 }
 
+/** Said under the box an Oracle change-capture connector's tables are typed in (`SRC-4` Amendment 10, S10-c). */
+export const ORACLE_BY_HAND_NOTE =
+  "Type each table as SCHEMA.TABLE, as Oracle names it (upper case). The names are not checked against the source until you test the connection: a name that does not exist captures nothing."
+
 /**
  * `SRC-11` decision 9: the sources whose columns the product lists before loading, so a column can be left
  * out: `sql` connectors on the PostgreSQL, MySQL (MariaDB uses it), SQL Server or Oracle driver (Oracle since
@@ -465,6 +469,9 @@ function IngestEditor({
   const cron = cronChoice === "custom" ? customCron.trim() : cronChoice
 
   const [manualName, setManualName] = React.useState("")
+  // `SRC-4` Amendment 10 (S10-c): an Oracle change-capture connector lists nothing; each table is typed as
+  // SCHEMA.TABLE, in the upper case Oracle stores it in, and is not checked against the source until capture starts.
+  const oracleByHand = isCdc && spec.dial.driver === "oracle"
   const save = useServiceAction(
     withNotify({ success: "Tables and schedule saved", error: "Could not save tables" }, (signal) =>
       connectorService.setIngestSpec(
@@ -589,7 +596,9 @@ function IngestEditor({
   }
 
   function addManual() {
-    const name = manualName.trim()
+    const typed = manualName.trim()
+    // Oracle stores unquoted names in upper case and the API requires that spelling (S10-c).
+    const name = oracleByHand ? typed.toUpperCase() : typed
     if (!name || selectedNames.has(name)) return
     setSelection((current) => [...current, newTable(name)])
     setManualName("")
@@ -768,7 +777,9 @@ function IngestEditor({
                 }
               }}
               placeholder={
-                adapter === "sftp" || adapter === "files"
+                oracleByHand
+                  ? "SCHEMA.TABLE"
+                  : adapter === "sftp" || adapter === "files"
                   ? "orders.csv"
                   : finder === "oracle"
                     ? "SCHEMA.TABLE"
@@ -785,7 +796,9 @@ function IngestEditor({
             </Button>
           </div>
           <p className="text-xs text-muted-foreground">
-            {finder === null
+            {oracleByHand
+              ? ORACLE_BY_HAND_NOTE
+              : finder === null
               ? "This connector type cannot list its objects, so type each one as the source names it."
               : finder === "oracle"
                 ? "Or type SCHEMA.TABLE as Oracle names it, for a table the list does not show."

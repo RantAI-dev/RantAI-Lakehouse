@@ -11,6 +11,7 @@ import { isValidLagLimit, lagTone, lagWords } from "@/lib/connectors/capture-lag
 import { notifySuccess } from "@/lib/notify"
 import { connectorService } from "@/services"
 import type { CaptureTableLag, ChangeCaptureLag } from "@/services/contracts/connectors"
+import { ConnectorSetupChecks } from "./connector-setup-checks"
 import { isLiftablePause } from "./connector-ingest-panel"
 
 /** How often the tab asks again: the orchestrator reports every 30 seconds, so this is about every second report. */
@@ -88,6 +89,9 @@ export function ConnectorChangeCapturePanel({
           capture.reload()
         }}
       />
+      {data.setupChecks && data.setupChecks.length > 0 ? (
+        <ConnectorSetupChecks checks={data.setupChecks} />
+      ) : null}
       {data.lag ? (
         <>
           <LagTable lag={data.lag} />

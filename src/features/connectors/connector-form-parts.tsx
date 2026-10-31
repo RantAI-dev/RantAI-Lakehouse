@@ -246,6 +246,8 @@ export function normalizedCredential(slot: CredentialSlot, value: string): strin
  * names no single driver.
  */
 export function driverForType(typeName: string | null): SqlDriver | undefined {
+  // Oracle change capture only: the batch Oracle type has its own form (`DialFormFor`), so "Oracle" alone names no driver here.
+  if (typeName === "Oracle CDC") return "oracle"
   switch (typeName?.replace(/ CDC$/, "")) {
     case "PostgreSQL":
       return "postgres"

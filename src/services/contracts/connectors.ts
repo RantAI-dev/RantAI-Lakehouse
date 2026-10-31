@@ -520,6 +520,10 @@ export type CdcDial = {
   slotName?: string
   publicationName?: string
   serverId?: number | null
+  /** The pluggable database an Oracle connector reads (`database.pdb.name`, `SRC-4` slice 6, S6-b); then `database`
+   * is the container database. Omitted for a non-container Oracle database and for every other driver (the server
+   * refuses a present one). */
+  pdbName?: string
   /** How the change-capture worker secures its connection to the source
    * (`SRC-4` S2-d). Absent means `require`: encrypted, certificate taken as
    * presented. `disable` is not encrypted. `verify-ca` and `verify-full` use the
@@ -1091,6 +1095,9 @@ export type ChangeCaptureState = {
   supported: boolean
   reason?: string
   state?: "running" | "paused" | "failed" | "starting" | "not_created" | "unreachable" | string
+  /** Why a failed Oracle connector failed, when its trace carries one of the two messages Debezium throws for a
+   * source that is not set up (`ARCHIVELOG` off, minimal supplemental logging off; `SRC-4` Amendment 11, S11-d). */
+  setupChecks?: SetupCheck[]
   /** How far behind the source each table is, the limit and whether its alert is open (`SRC-4` slice 4). */
   lag?: ChangeCaptureLag
 }

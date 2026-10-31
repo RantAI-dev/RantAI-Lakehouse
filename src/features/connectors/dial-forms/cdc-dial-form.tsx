@@ -9,7 +9,7 @@ import { DEFAULT_SQL_PORT } from "./sql-dial-form"
 /**
  * `dial` for the `cdc` adapter — `SqlDialForm`'s fields plus the setting of
  * the driver (`SRC-4` decision S3-a): `slotName` and `publicationName` for
- * PostgreSQL only, `serverId` for MySQL only, nothing for SQL Server. A field
+ * PostgreSQL only, `serverId` for MySQL only, `pdbName` for Oracle only, nothing for SQL Server. A field
  * the driver does not use is not in the dial at all (the server refuses a
  * present one). This form does not add a client-side required-field rule:
  * `Dial::parse` already rejects a missing value with its own fixed sentence
@@ -29,12 +29,24 @@ const CDC_SSL_MODES: { value: string; label: string }[] = [
   { value: "disable", label: "Disable (not encrypted)" },
 ]
 
+/** Oracle takes two modes (`SRC-4` slice 6, S6-c): its JDBC driver does TLS only over TCPS with a Java trust store
+ * (`SRC-37`), so `require` is Oracle's native network encryption (AES256, SHA256 checksum: encrypted, the server
+ * not authenticated) and the verify modes are not offered. */
+const ORACLE_SSL_MODES: { value: string; label: string }[] = [
+  { value: "require", label: "Require (native network encryption, server not authenticated)" },
+  { value: "disable", label: "Disable (not encrypted)" },
+]
+
 /** The dial as the driver wants it: only its own setting, PostgreSQL's two names
- * kept as typed (empty until typed), MySQL's server id only when a number was given. */
+ * kept as typed (empty until typed), MySQL's server id only when a number was given, Oracle's
+ * pluggable database only when one was typed. */
 export function shapeCdcDial(dial: CdcDial): CdcDial {
-  const { slotName, publicationName, serverId, sslMode, ...rest } = dial
+  const { slotName, publicationName, serverId, pdbName, sslMode, ...rest } = dial
   // The TLS mode is always sent, `require` unless a person chose another (`SRC-4 S3 review SHOULD-FIX 1`).
   const common = { ...rest, sslMode: sslMode || DEFAULT_CDC_SSL_MODE }
+  if (dial.driver === "oracle") {
+    return pdbName ? { ...common, pdbName } : common
+  }
   if (dial.driver === "postgres") {
     return { ...common, slotName: slotName ?? "", publicationName: publicationName ?? "" }
   }
@@ -64,6 +76,8 @@ export function CdcDialForm({
     ...(initialDriver === "postgres" ? { slotName: "", publicationName: "" } : {}),
   }
   const askDriver = !driver || dial.driver !== driver
+  const isOracle = dial.driver === "oracle"
+  const sslModes = isOracle ? ORACLE_SSL_MODES : CDC_SSL_MODES
   function set<K extends keyof CdcDial>(key: K, v: CdcDial[K]) {
     onChange(shapeCdcDial({ ...dial, [key]: v }))
   }
@@ -81,6 +95,7 @@ export function CdcDialForm({
             <option value="postgres">PostgreSQL</option>
             <option value="mysql">MySQL</option>
             <option value="mssql">SQL Server</option>
+            <option value="oracle">Oracle</option>
           </select>
         </div>
       ) : null}
@@ -107,12 +122,12 @@ export function CdcDialForm({
         </div>
       </div>
       <div className="space-y-1.5">
-        <Label htmlFor="cdc-dial-database">Database</Label>
+        <Label htmlFor="cdc-dial-database">{isOracle ? "Container database (service name)" : "Database"}</Label>
         <Input
           id="cdc-dial-database"
           value={dial.database}
           onChange={(e) => set("database", e.target.value)}
-          placeholder="sales"
+          placeholder={isOracle ? "FREE" : "sales"}
           autoComplete="off"
         />
       </div>
@@ -134,20 +149,37 @@ export function CdcDialForm({
           value={dial.sslMode || DEFAULT_CDC_SSL_MODE}
           onChange={(e) => set("sslMode", e.target.value)}
         >
-          {CDC_SSL_MODES.map((m) => (
+          {sslModes.map((m) => (
             <option key={m.value} value={m.value}>
               {m.label}
             </option>
           ))}
-          {dial.sslMode && !CDC_SSL_MODES.some((m) => m.value === dial.sslMode) ? (
+          {dial.sslMode && !sslModes.some((m) => m.value === dial.sslMode) ? (
             <option value={dial.sslMode}>{dial.sslMode}</option>
           ) : null}
         </select>
         <p className="text-xs text-muted-foreground">
-          Verify modes use the Kafka Connect worker&apos;s own trust store.
+          {isOracle
+            ? "Oracle's driver cannot check the server's certificate, so there are only two modes: the connection is encrypted with Oracle's own network encryption, or it is not."
+            : "Verify modes use the Kafka Connect worker's own trust store."}
           {dial.driver === "mssql" ? " For SQL Server, Verify CA also checks the host name." : ""}
         </p>
       </div>
+      {isOracle ? (
+        <div className="space-y-1.5 sm:col-span-2">
+          <Label htmlFor="cdc-dial-pdb-name">PDB name</Label>
+          <Input
+            id="cdc-dial-pdb-name"
+            value={dial.pdbName ?? ""}
+            onChange={(e) => set("pdbName", e.target.value)}
+            placeholder="FREEPDB1"
+            autoComplete="off"
+          />
+          <p className="text-xs text-muted-foreground">
+            The pluggable database to read. Leave it empty for a database that is not a container database.
+          </p>
+        </div>
+      ) : null}
       {dial.driver === "postgres" ? (
         <>
           <div className="space-y-1.5">

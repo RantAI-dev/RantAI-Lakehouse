@@ -59,6 +59,22 @@ export function connectionReviewItems(adapter: string | null, dial: Record<strin
           { label: "User", value: text(d.user) },
         ]
       }
+      if (d.driver === "oracle") {
+        // `SRC-4` slice 6 (S6-c): Oracle's two modes, said in words; the server's certificate is never checked.
+        return [
+          { label: "Server", value: hostPort(d) },
+          { label: "Container database", value: text(d.database) },
+          ...(text(d.pdbName) ? [{ label: "PDB", value: text(d.pdbName) }] : []),
+          { label: "User", value: text(d.user) },
+          {
+            label: "Encryption",
+            value:
+              text(d.sslMode) === "disable"
+                ? "Not encrypted"
+                : "Encrypted (Oracle native network encryption); the server is not authenticated",
+          },
+        ]
+      }
       return [
         { label: "Server", value: hostPort(d) },
         { label: "Database", value: text(d.database) },
