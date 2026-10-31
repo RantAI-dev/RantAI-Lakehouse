@@ -54,6 +54,7 @@ pub mod identity;
 pub mod ingest_spec;
 pub mod knowledge;
 pub mod maintenance_policy;
+pub mod outside_reads;
 pub mod overview;
 pub mod pipelines;
 pub mod public_links;

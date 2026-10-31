@@ -1679,3 +1679,150 @@ A mart over the row cap (`GOLD_EXPORT_MAX_ROWS`, default 5,000,000) is
 refused outright — the export names the mart and the cap in its error,
 never silently truncating. Raise the cap only when you have measured the
 memory pressure of a true full re-copy at the new size.
+
+## Outside tools read published tables (DATA-5, ADR 0016)
+
+A published Gold mart lives in the catalog's `gold` namespace, and until
+DATA-5 nobody outside this deployment could read it: the catalog vends the
+storage address `http://rustfs:9000`, which resolves only inside the
+deployment. This section is how an OUTSIDE tool — a BI tool, a notebook,
+DuckDB — reads a published mart, and how the console counts who does.
+
+**The API is the only door.** The tool talks to the console's own
+`/api/iceberg` — the read side of the Iceberg REST catalog — and the API
+forwards each allowed call to the catalog under one read-only principal of
+its own. The tool's own key never reaches the catalog, so a tool cannot
+widen its own reach, and every read through the door is counted.
+
+### 1. Publish the storage address
+
+`OUTSIDE_S3_ENDPOINT` is the address an outside tool can REACH: the
+RustFS (or S3) host and port, behind TLS, on the public side of the
+deployment. It is empty by default, and empty means outside reading is
+OFF — every door route answers 503 naming that setting, and the API
+reports the read count as not measured, with the same reason. Never a
+count of zero.
+
+```bash
+# .env, or the deployment's own configuration
+OUTSIDE_S3_ENDPOINT=https://storage.example.com
+```
+
+Restart `lakehouse-api` afterwards. The API swaps the vended `s3.endpoint`
+for this one in a table-load and a credentials response; the vended KEYS
+stay the catalog's own short-lived, table-scoped ones.
+
+Two addresses, two situations:
+
+- A tool running OUTSIDE the deployment needs the published address
+  (`https://storage.example.com`).
+- A tool running INSIDE the deployment's network — the acceptance test is
+  one — needs the in-network name. In the local compose stack that is
+  `http://rustfs:9000` (or `http://localhost:9010`, the host port
+  RustFS publishes, for a tool on the same machine as the browser).
+
+### 2. Create the identity and get its key
+
+An outside tool is a service identity with the `iceberg:read` scope. On
+the console's **Administration → Service Identities** page: create one,
+name it after the tool (`Finance DuckDB`), add the scope `iceberg:read`,
+then press **Rotate**. The key is shown ONCE — copy it then. Rotating
+again issues a fresh key and kills the old one immediately; deleting the
+identity stops the tool as well, and its past reads stay listed under the
+name it had.
+
+The same two calls over HTTP (what the acceptance test does):
+
+```bash
+# Create the identity. Needs the `identity:write` permission.
+curl -X POST "$CONSOLE/api/identity/service-identities" \
+  -H "Content-Type: application/json" \
+  -b cookies.txt \
+  -d '{"name":"Finance DuckDB","scopes":["iceberg:read"],"environment":"production"}'
+
+# Rotate it for the key. The key is in `secret`, and is never served again.
+curl -X POST "$CONSOLE/api/identity/service-identities/<id>/rotate" -b cookies.txt
+```
+
+### 3. Point the tool at the door
+
+**pyiceberg.** `load_catalog("rest", …)` builds pyiceberg's
+`RestCatalog`:
+
+```python
+from pyiceberg.catalog import load_catalog
+
+catalog = load_catalog(
+    "rest",
+    uri="https://console.example.com/api/iceberg",  # the DOOR, not the catalog
+    token="<the key>",
+    warehouse="default",                            # the warehouse's name
+)
+table = catalog.load_table(("gold", "gold_export_smoke"))
+print(table.scan().to_arrow().num_rows)
+```
+
+**DuckDB.** The `iceberg` extension attaches the REST catalog as a
+database:
+
+```sql
+INSTALL iceberg;
+LOAD iceberg;
+
+ATTACH 'lakehouse' AS cat (
+    TYPE iceberg,
+    URI 'https://console.example.com/api/iceberg',
+    AUTHORIZATION_TYPE 'OAUTH2',
+    TOKEN '<the key>'
+);
+
+SELECT count(*) FROM cat.gold.gold_export_smoke;
+```
+
+Both examples were run against this stack: pyiceberg read the published
+table and was refused 403 on a write and on another namespace; DuckDB
+read the published table.
+
+Two things worth knowing about the door, because they surprise clients:
+
+- The **warehouse** in the request is the deployment's own
+  (`LAKEKEEPER_WAREHOUSE`, `default` in this stack). The door serves that
+  one warehouse and replaces whatever the client asked for, so a client
+  cannot reach another one by naming it.
+- The door answers the client's config call with the warehouse's own
+  prefix, which the client then uses in every path. That is why the
+  client needs no Lakekeeper knowledge at all.
+
+### 4. What the tool may read
+
+- Only the `gold` namespace. Every other namespace, and every write, is
+  refused 403 with the Iceberg error shape.
+- Only a service identity may use the door. A browser session is refused:
+  the count is per tool, and a session is not a tool.
+
+### 5. The count
+
+The count shows up in the console on a published table as "Readers (7
+days)": each tool, its reads and its last read. A table nobody read says
+"No reads in 7 days"; a deployment with outside reading off says "Not
+measured" with the reason. The API behind it is
+`GET /api/gold/export/{mart}/consumers`, which answers the same three
+states: the list, an empty list with `supported: true` (measured, and
+nobody read it), or `supported: false` with the reason.
+
+The count is the API's own: one read per table load through the door. A
+read that skips the door — internal storage keys, or the catalog's own
+published port — is NOT counted. Those credentials are for internal
+services only.
+
+### Limits
+
+- Only the catalog tenant's warehouse is served. Tenant warehouses are not.
+- Tools pass the key as a bearer token. The OAuth2 client-credentials
+  exchange is not offered.
+- A tool that skips the door is not counted.
+- Each publish of a changed mart appends a full copy, so a tool must
+  select the latest export time (`_exported_at`) or it sees every past
+  copy — see "Gold export: growth and background merges" above.
+- The read history is kept for 90 days; the page shows 7.
+
