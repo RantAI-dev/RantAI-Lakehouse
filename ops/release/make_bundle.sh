@@ -10,9 +10,11 @@
 #   release.json              the release manifest: the version, every
 #                             image's digest, every file's checksum, the
 #                             upgrade path
-#   release.json.sig          the manifest's signature (cosign, the
-#                             release key). `lakehousectl` verifies the
-#                             manifest through it and trusts nothing else.
+#   release.json.sigstore.json  the manifest's Sigstore bundle (cosign v3,
+#                             the release key): the signature and the
+#                             manifest's digest in one JSON file.
+#                             `lakehousectl` verifies the manifest through
+#                             it and trusts nothing else.
 #   images/<name>.tar         one `docker save` per image, BY DIGEST
 #                             REFERENCE, so the host needs no registry:
 #                             `docker load` reads the file and the loaded
@@ -37,15 +39,16 @@
 #
 #   ops/release/make_bundle.sh --manifest <release.json> \
 #                              --compose <docker-compose.yml> \
-#                              --signature <release.json.sig> \
+#                              --sigstore-bundle <release.json.sigstore.json> \
 #                              --sbom-dir <dir> \
 #                              --out <dir>
 #
-#   manifest   the release manifest the pipeline wrote
-#   compose    the rendered Compose file the release ships
-#   signature  the manifest's signature
-#   sbom-dir   the directory holding `<image name>.cdx.json` per image
-#   out        the directory the bundle is written to
+#   manifest         the release manifest the pipeline wrote
+#   compose          the rendered Compose file the release ships
+#   sigstore-bundle  the manifest's Sigstore bundle: the file cosign
+#                    wrote, with the signature and the digest
+#   sbom-dir         the directory holding `<image name>.cdx.json` per image
+#   out              the directory the bundle is written to
 #
 # # What it needs
 #
@@ -55,7 +58,8 @@ set -euo pipefail
 usage() {
     cat >&2 <<'EOF'
 usage: make_bundle.sh --manifest <release.json> --compose <docker-compose.yml> \
-                       --signature <release.json.sig> --sbom-dir <dir> --out <dir>
+                       --sigstore-bundle <release.json.sigstore.json> \
+                       --sbom-dir <dir> --out <dir>
 EOF
 }
 
@@ -82,7 +86,7 @@ image_name() {
 
 manifest=""
 compose=""
-signature=""
+sigstore_bundle=""
 sbom_dir=""
 out_dir=""
 
@@ -90,7 +94,7 @@ while [ "$#" -gt 0 ]; do
     case "$1" in
         --manifest) manifest="${2:-}"; shift 2 ;;
         --compose) compose="${2:-}"; shift 2 ;;
-        --signature) signature="${2:-}"; shift 2 ;;
+        --sigstore-bundle) sigstore_bundle="${2:-}"; shift 2 ;;
         --sbom-dir) sbom_dir="${2:-}"; shift 2 ;;
         --out) out_dir="${2:-}"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
@@ -100,13 +104,13 @@ done
 
 [ -n "$manifest" ] || { usage; fail "--manifest is needed."; }
 [ -n "$compose" ] || { usage; fail "--compose is needed."; }
-[ -n "$signature" ] || { usage; fail "--signature is needed."; }
+[ -n "$sigstore_bundle" ] || { usage; fail "--sigstore-bundle is needed."; }
 [ -n "$sbom_dir" ] || { usage; fail "--sbom-dir is needed."; }
 [ -n "$out_dir" ] || { usage; fail "--out is needed."; }
 
 [ -f "$manifest" ] || fail "the manifest $manifest does not exist."
 [ -f "$compose" ] || fail "the Compose file $compose does not exist."
-[ -f "$signature" ] || fail "the signature $signature does not exist."
+[ -f "$sigstore_bundle" ] || fail "the Sigstore bundle $sigstore_bundle does not exist."
 [ -d "$sbom_dir" ] || fail "the SBOM directory $sbom_dir does not exist."
 
 require_command docker
@@ -134,7 +138,7 @@ trap 'rm -rf "$stage"' EXIT
 mkdir -p "$stage/images" "$stage/sbom"
 cp "$compose" "$stage/docker-compose.yml"
 cp "$manifest" "$stage/release.json"
-cp "$signature" "$stage/release.json.sig"
+cp "$sigstore_bundle" "$stage/release.json.sigstore.json"
 
 # One `docker save` per image, by digest reference: the host that loads
 # the bundle gets the exact image the manifest names, with no registry to
@@ -156,13 +160,13 @@ done < <(jq -er '.images | to_entries | map(.value) | unique | .[]' "$manifest")
 # bundle was extracted into.
 (
     cd "$stage"
-    sha256sum docker-compose.yml release.json release.json.sig \
+    sha256sum docker-compose.yml release.json release.json.sigstore.json \
         images/*.tar sbom/*.cdx.json > SHA256SUMS
 )
 
 bundle="rantai-lakehouse-${version}-linux-x86_64.tar.zst"
 mkdir -p "$out_dir"
-tar -C "$stage" -cf - docker-compose.yml release.json release.json.sig \
+tar -C "$stage" -cf - docker-compose.yml release.json release.json.sigstore.json \
     images sbom SHA256SUMS | zstd -19 -T0 -o "$out_dir/$bundle"
 
 size="$(wc -c < "$out_dir/$bundle")"

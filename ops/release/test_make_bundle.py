@@ -72,8 +72,8 @@ class BundleTest(unittest.TestCase):
             json.dumps({"bomFormat": "CycloneDX"}), encoding="utf-8"
         )
 
-        self.signature = self.root / "release.json.sig"
-        self.signature.write_text("a signature\n", encoding="utf-8")
+        self.sigstore_bundle = self.root / "release.json.sigstore.json"
+        self.sigstore_bundle.write_text('{"mediaType": "application/vnd.dev.sigstore.bundle.v0.3+json"}\n', encoding="utf-8")
 
         self.manifest = self.root / "release.json"
         self.manifest.write_text(
@@ -120,8 +120,8 @@ class BundleTest(unittest.TestCase):
                 str(self.manifest),
                 "--compose",
                 str(self.compose),
-                "--signature",
-                str(self.signature),
+                "--sigstore-bundle",
+                str(self.sigstore_bundle),
                 "--sbom-dir",
                 str(self.sbom_dir),
                 "--out",
@@ -156,7 +156,7 @@ class BundleTest(unittest.TestCase):
         for name in (
             "docker-compose.yml",
             "release.json",
-            "release.json.sig",
+            "release.json.sigstore.json",
             "SHA256SUMS",
         ):
             self.assertTrue((extracted / name).exists(), name)
@@ -189,11 +189,11 @@ class BundleTest(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("SBOM", result.stderr)
 
-    def test_a_missing_signature_is_refused(self) -> None:
-        self.signature.unlink()
+    def test_a_missing_sigstore_bundle_is_refused(self) -> None:
+        self.sigstore_bundle.unlink()
         result = self.run_bundle()
         self.assertEqual(result.returncode, 1)
-        self.assertIn("signature", result.stderr)
+        self.assertIn("Sigstore bundle", result.stderr)
 
 
 @unittest.skipUnless(shutil.which("zstd"), "zstd is needed to build a bundle")

@@ -285,7 +285,9 @@ image, with the same build arguments, and then does the rest.
 
 `release.yml` builds, signs and packages a release (REL-2 S2). One file holds the whole
 release, and everything else is checked through it: `release.json`, the release manifest,
-signed with the release key.
+signed with the release key. The signature is a **Sigstore bundle**,
+`release.json.sigstore.json`: cosign v3 writes the signature and the manifest's digest into
+one JSON file, and that is what `lakehousectl` reads (REL-2 S2 D3a).
 
 | Trigger | What runs |
 |---|---|
@@ -306,8 +308,8 @@ can be proved before it can cut a release:
 - its key is generated in the job, in the runner's working directory, and thrown away
   with the job. It is never the release key and it never leaves the runner.
 
-Nothing is published. The bundle, the manifest, the signature, the rendered Compose file
-and the SBOMs are uploaded as a workflow artifact (`release-dry-run`), and the run's
+Nothing is published. The bundle, the manifest, its Sigstore bundle, the rendered Compose
+file and the SBOMs are uploaded as a workflow artifact (`release-dry-run`), and the run's
 summary prints the bundle's size — the number the release notes quote.
 
 ### The real release
@@ -330,6 +332,24 @@ The public key is committed at `ops/release/release.pub`, and it is the one
 host with nothing but the key and the manifest. The pipeline verifies every signature it
 makes before it publishes anything: each image with `cosign sign`, the manifest with
 `cosign sign-blob` and then `cosign verify-blob` against the committed public key.
+
+**Nothing is uploaded to the public transparency log (Rekor), in either job** (REL-2 S2
+D3a). The dry run would publish throwaway entries signed with a key that is thrown away
+with the job, and the manifest's signature has to verify on an air-gapped host, where no log
+is reachable. The mechanism is cosign v3's `--tlog-upload=false`, which v3 accepts only
+together with `--use-signing-config=false`: on its own, v3 refuses the flag, because the
+signing config it would otherwise use names the public log service ("`--tlog-upload=false`
+is not supported with --signing-config or --use-signing-config`"). With both flags cosign
+signs from the key alone, contacts no log and no timestamp service, and writes a bundle
+that carries the signature and the digest and nothing else. The verification right after
+signing therefore skips the log check (`--insecure-ignore-tlog`) and runs offline
+(`--offline`).
+
+The images carry the same consequence: their signatures are in the registry, with no log
+entry, so an operator verifying one by hand passes `--insecure-ignore-tlog` too —
+`cosign verify --key ops/release/release.pub --insecure-ignore-tlog <image>@<digest>`. The
+key is what the check is about; the log was never the identity here, because the images are
+signed with the release key and not with a keyless identity.
 
 The release is created as a **draft**. The product owner publishes it.
 
@@ -360,7 +380,8 @@ Until that is done, `docker pull ghcr.io/rantai-dev/rantai-lakehouse-api:<versio
    published image at its digest, and the gate and test services are gone;
 5. `ops/release/make_manifest.py` writes `release.json` — the version, every image's
    digest, the Compose file's checksum, and the upgrade path;
-6. the manifest is signed and the signature verified at once;
+6. the manifest is signed into `release.json.sigstore.json` and the bundle verified at once,
+   offline;
 7. `ops/release/make_bundle.sh` writes the offline bundle and prints its size;
 8. the release is created as a draft (the real run only).
 

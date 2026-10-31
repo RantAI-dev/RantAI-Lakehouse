@@ -24,6 +24,13 @@ name: Release
 # release is built and signed by the code that was reviewed. The pins are
 # checked by `ops/release/test_release_workflow.py`, which runs in both
 # jobs below (REL-2 S2 review BLOCKER 2).
+#
+# Nothing in this pipeline uploads to the public transparency log (Rekor),
+# in either job (REL-2 S2 D3a): the dry run would publish throwaway
+# entries, and the manifest's signature must verify on an air-gapped host
+# with nothing but the committed public key. The mechanism is cosign v3's
+# `--tlog-upload=false`, which v3 accepts only together with
+# `--use-signing-config=false` — see the signing steps below.
 
 on:
   push:
@@ -95,11 +102,13 @@ jobs:
       # this workflow's own (`ops/release/test_release_workflow.py`: no
       # signing secret in a job-level `env:`, every action pinned to a
       # commit SHA), so a change that only the pipeline would suffer from
-      # is caught here.
+      # is caught here. `cryptography` is here for the Sigstore bundle's
+      # test (REL-2 S2 D3a), which verifies the manifest's signature the
+      # way `lakehousectl` will.
       - name: The release tooling's own tests
         run: |
           python -m pip install --upgrade pip
-          pip install pytest==8.3.4 pyyaml==6.0.3
+          pip install pytest==8.3.4 pyyaml==6.0.3 cryptography==50.0.2
           python -m pytest ops/release -q
 
       # The version, the package, the crate and the changelog must agree
@@ -253,13 +262,26 @@ jobs:
       # `lakehousectl` verifies. The key is read from the environment
       # (`env://COSIGN_PRIVATE_KEY`), the same way the real job reads
       # the release key (REL-2 S2 review BLOCKER 1).
+      #
+      # `--use-signing-config=false --tlog-upload=false` is cosign v3's
+      # way to sign with a key and NO transparency log (REL-2 S2 D3a).
+      # Both flags are needed: v3 refuses `--tlog-upload=false` on its
+      # own, because the signing config it would otherwise use names the
+      # public log service ("--tlog-upload=false is not supported with
+      # --signing-config or --use-signing-config"). With them, cosign
+      # signs from the key alone, contacts no log and no timestamp
+      # service, and uploads nothing to Rekor — measured: the same
+      # commands against a proxy that refuses rekor.sigstore.dev make no
+      # connection at all, while the default v3 command posts to
+      # rekor.sigstore.dev and gets "Forbidden".
       - name: Sign each image
         run: |
           set -euo pipefail
           for name in rantai-lakehouse-api rantai-lakehouse-dagster rantai-lakehouse-oidc-mock rantai-lakehouse-console; do
             ref="$(jq -r --arg name "$name" '.[$name]' digests.json)"
             echo "signing $ref"
-            cosign sign --key "$COSIGN_KEY" "$ref"
+            cosign sign --key "$COSIGN_KEY" \
+              --use-signing-config=false --tlog-upload=false "$ref"
           done
 
       # A CycloneDX SBOM per image, and the attestation that binds it to
@@ -303,7 +325,8 @@ jobs:
             ref="$(jq -r --arg name "$name" '.[$name]' digests.json)"
             echo "attesting $name"
             cosign attest --key "$COSIGN_KEY" --type cyclonedx \
-              --predicate "sbom/$name.cdx.json" "$ref"
+              --predicate "sbom/$name.cdx.json" \
+              --use-signing-config=false --tlog-upload=false "$ref"
           done
 
       # The release's Compose file: the template, rendered, with every
@@ -328,15 +351,33 @@ jobs:
 
       # Sign the manifest, and verify it at once: a signature that does
       # not verify is a release that cannot be installed.
+      #
+      # The signature is a Sigstore bundle, `release.json.sigstore.json`
+      # (REL-2 S2 D3a): cosign v3 writes the signature and the digest of
+      # the manifest into one JSON file, and that is what
+      # `lakehousectl` reads in REL-2 S3. v3 ignores `--output-signature`
+      # (it is deprecated, and the v3 form writes the bundle instead), so
+      # the bundle is what `--bundle` names.
+      #
+      # No transparency log, in either job (REL-2 S2 D3a): the same two
+      # flags as the image signing above, so nothing is uploaded to
+      # Rekor and the dry run publishes no throwaway entry. The
+      # verification below therefore skips the log check
+      # (`--insecure-ignore-tlog`) and runs offline (`--offline`): the
+      # bundle carries the signature and the key's hint, so nothing
+      # else is needed.
       - name: Sign the manifest and verify the signature
         run: |
           set -euo pipefail
-          cosign sign-blob --key "$COSIGN_KEY" --output-signature release.json.sig release.json
+          cosign sign-blob --key "$COSIGN_KEY" \
+            --bundle release.json.sigstore.json \
+            --use-signing-config=false --tlog-upload=false release.json
           cosign verify-blob --key "$COSIGN_PUBLIC_KEY" \
-            --signature release.json.sig release.json
+            --bundle release.json.sigstore.json \
+            --offline --insecure-ignore-tlog release.json
 
       # The bundle (decision D11): the Compose file, the manifest, its
-      # signature, one `docker save` per image, the SBOMs and the
+      # Sigstore bundle, one `docker save` per image, the SBOMs and the
       # checksums.
       - name: Build the offline bundle
         run: |
@@ -344,7 +385,7 @@ jobs:
           ops/release/make_bundle.sh \
             --manifest release.json \
             --compose docker-compose.release.yml \
-            --signature release.json.sig \
+            --sigstore-bundle release.json.sigstore.json \
             --sbom-dir sbom \
             --out dist
 
@@ -401,7 +442,7 @@ jobs:
             dist/*.tar.zst
             dist/*.sha256
             release.json
-            release.json.sig
+            release.json.sigstore.json
             docker-compose.release.yml
             sbom/*.cdx.json
           retention-days: 7
@@ -442,11 +483,12 @@ jobs:
 
       # The pipeline's own tests, here too: the release job signs with
       # the real key, so it is the last place a mistake in the tooling
-      # can be caught before it publishes something.
+      # can be caught before it publishes something. `cryptography` is
+      # here for the Sigstore bundle's test (REL-2 S2 D3a).
       - name: The release tooling's own tests
         run: |
           python -m pip install --upgrade pip
-          pip install pytest==8.3.4 pyyaml==6.0.3
+          pip install pytest==8.3.4 pyyaml==6.0.3 cryptography==50.0.2
           python -m pytest ops/release -q
 
       # The tag names the version, and the version must be the same in
@@ -572,6 +614,11 @@ jobs:
         # holds the private key PEM — the text `cosign generate-key-pair`
         # writes — which `env://` reads as it is, NOT base64 of it.
         # `COSIGN_PASSWORD` opens it if the key is encrypted.
+        #
+        # `--use-signing-config=false --tlog-upload=false` is cosign v3's
+        # way to sign with a key and NO transparency log (REL-2 S2 D3a);
+        # see the dry run's "Sign each image" step for why both flags are
+        # needed. Nothing is uploaded to Rekor.
         env:
           COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
           COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
@@ -580,7 +627,8 @@ jobs:
           for name in rantai-lakehouse-api rantai-lakehouse-dagster rantai-lakehouse-oidc-mock rantai-lakehouse-console; do
             ref="$(jq -r --arg name "$name" '.[$name]' digests.json)"
             echo "signing $ref"
-            cosign sign --key "$COSIGN_KEY" "$ref"
+            cosign sign --key "$COSIGN_KEY" \
+              --use-signing-config=false --tlog-upload=false "$ref"
           done
 
       - name: The SBOM of the API image
@@ -627,7 +675,8 @@ jobs:
             ref="$(jq -r --arg name "$name" '.[$name]' digests.json)"
             echo "attesting $name"
             cosign attest --key "$COSIGN_KEY" --type cyclonedx \
-              --predicate "sbom/$name.cdx.json" "$ref"
+              --predicate "sbom/$name.cdx.json" \
+              --use-signing-config=false --tlog-upload=false "$ref"
           done
 
       - name: Render the release's Compose file
@@ -649,6 +698,11 @@ jobs:
       # Sign the manifest with the RELEASE key, and verify it with the
       # committed public key — the one `lakehousectl` holds. A signature
       # that does not verify against the committed key is not a release.
+      #
+      # The signature is a Sigstore bundle, `release.json.sigstore.json`
+      # (REL-2 S2 D3a), and nothing is uploaded to the transparency log:
+      # see the dry run's "Sign the manifest and verify the signature"
+      # step for the flags and why both are needed.
       - name: Sign the manifest and verify the signature
         # The release key, for THIS step only (REL-2 S2 review BLOCKER 2):
         # see the "Sign each image" step.
@@ -657,9 +711,12 @@ jobs:
           COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
         run: |
           set -euo pipefail
-          cosign sign-blob --key "$COSIGN_KEY" --output-signature release.json.sig release.json
+          cosign sign-blob --key "$COSIGN_KEY" \
+            --bundle release.json.sigstore.json \
+            --use-signing-config=false --tlog-upload=false release.json
           cosign verify-blob --key "$COSIGN_PUBLIC_KEY" \
-            --signature release.json.sig release.json
+            --bundle release.json.sigstore.json \
+            --offline --insecure-ignore-tlog release.json
 
       - name: Build the offline bundle
         run: |
@@ -667,7 +724,7 @@ jobs:
           ops/release/make_bundle.sh \
             --manifest release.json \
             --compose docker-compose.release.yml \
-            --signature release.json.sig \
+            --sigstore-bundle release.json.sigstore.json \
             --sbom-dir sbom \
             --out dist
 
@@ -681,7 +738,7 @@ jobs:
           cp "dist/rantai-lakehouse-$version-linux-x86_64.tar.zst" release-assets/
           cp "dist/rantai-lakehouse-$version-linux-x86_64.tar.zst.sha256" release-assets/
           cp release.json release-assets/
-          cp release.json.sig release-assets/
+          cp release.json.sigstore.json release-assets/
           cp sbom/*.cdx.json release-assets/
           # `install.sh` joins the release in REL-2 S3, when it exists.
           if [ -f ops/release/install.sh ]; then
@@ -689,7 +746,7 @@ jobs:
           fi
           (
             cd release-assets
-            sha256sum ./*.tar.zst ./release.json ./release.json.sig ./*.cdx.json > SHA256SUMS
+            sha256sum ./*.tar.zst ./release.json ./release.json.sigstore.json ./*.cdx.json > SHA256SUMS
           )
 
       # The release is a DRAFT: the product owner publishes it, after
@@ -705,7 +762,7 @@ jobs:
             echo "RantAI Lakehouse v$version."
             echo ""
             echo "Attached: the offline bundle and its checksum, the release manifest"
-            echo "and its signature, and the CycloneDX SBOM of each image. The upgrade"
+            echo "and its Sigstore bundle, and the CycloneDX SBOM of each image. The upgrade"
             echo "notes are written in REL-2 S5 (docs/core/reference/release-policy.md)."
             echo ""
             echo "This release is a draft. The product owner publishes it."

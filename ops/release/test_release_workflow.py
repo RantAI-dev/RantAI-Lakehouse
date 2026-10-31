@@ -10,6 +10,15 @@ not only when a release is cut:
   - every third-party action is pinned to a commit SHA, because a tag can
     move under the pipeline's feet and a commit cannot.
 
+Two more are checked since REL-2 S2 D3a, for the same reason — a property
+of the pipeline that only a release would otherwise prove:
+
+  - the manifest's signature is a Sigstore bundle
+    (`release.json.sigstore.json`), not a detached signature;
+  - nothing is uploaded to the public transparency log (Rekor), in either
+    job: the dry run would publish throwaway entries, and the manifest's
+    signature must verify on an air-gapped host.
+
 The workflow is parsed with PyYAML (`pyyaml==6.0.3`, installed by the jobs
 that run these tests). The checks are run against synthetic workflows too,
 so a check that cannot fail is itself a failure. No network, no repository:
@@ -39,6 +48,14 @@ SIGNING_STEPS = (
     "Sign the manifest and verify the signature",
 )
 SECRET_NAMES = ("COSIGN_PRIVATE_KEY", "COSIGN_PASSWORD")
+
+# The manifest's signature, as REL-2 S2 D3a decided it: a Sigstore bundle.
+SIGSTORE_BUNDLE = "release.json.sigstore.json"
+
+# cosign v3's way to sign with a key and NO transparency log. Both flags
+# are needed: v3 refuses `--tlog-upload=false` while the signing config
+# is in effect, and that config names the public log service.
+NO_TLOG_FLAGS = ("--use-signing-config=false", "--tlog-upload=false")
 
 # A workflow with a signing secret in a job-level `env:`.
 SYNTHETIC_JOB_SECRET = """
@@ -234,6 +251,57 @@ class ReleaseWorkflowTest(unittest.TestCase):
         run = str(step.get("run"))
         self.assertIn("COSIGN_PRIVATE_KEY<<", run)
         self.assertIn("$GITHUB_ENV", run)
+
+    def test_the_manifest_is_signed_into_a_sigstore_bundle_in_both_jobs(self) -> None:
+        """REL-2 S2 D3a: the signature is a bundle, not a detached file.
+
+        cosign v3 ignores `--output-signature` (it is deprecated), so a
+        workflow that still used it would write no signature at all.
+        """
+        for job in ("dry-run", "release"):
+            step = step_named(self.document, job, "Sign the manifest and verify the signature")
+            run = str(step.get("run"))
+            self.assertIn(f"--bundle {SIGSTORE_BUNDLE}", run, job)
+            self.assertNotIn("--output-signature", run, job)
+
+    def test_the_bundle_is_verified_offline_in_both_jobs(self) -> None:
+        """The verification right after signing must not need a log.
+
+        The bundle carries no transparency-log entry (nothing is uploaded
+        to Rekor), so the verification skips the log check and runs
+        offline.
+        """
+        for job in ("dry-run", "release"):
+            step = step_named(self.document, job, "Sign the manifest and verify the signature")
+            run = str(step.get("run"))
+            self.assertIn("cosign verify-blob", run, job)
+            self.assertIn("--insecure-ignore-tlog", run, job)
+            self.assertIn("--offline", run, job)
+
+    def test_no_step_of_either_job_uploads_to_the_transparency_log(self) -> None:
+        """REL-2 S2 D3a: nothing is uploaded to the public Rekor log.
+
+        Every cosign command that SIGNS something carries both flags, so
+        neither job can publish an entry — the dry run's throwaway key
+        least of all. The commands that only make or read a key
+        (`generate-key-pair`, `public-key`) upload nothing and are not
+        checked.
+        """
+        signing = re.compile(r"cosign (sign|sign-blob|attest)\b")
+        for job in ("dry-run", "release"):
+            for step in steps_of(self.document, job):
+                run = str(step.get("run") or "")
+                if not signing.search(run):
+                    continue
+                for flag in NO_TLOG_FLAGS:
+                    self.assertIn(flag, run, f"{job}: {step.get('name')}: {flag}")
+
+    def test_the_bundle_script_is_given_the_sigstore_bundle(self) -> None:
+        """The bundle carries the bundle, under its own name."""
+        for job in ("dry-run", "release"):
+            step = step_named(self.document, job, "Build the offline bundle")
+            run = str(step.get("run"))
+            self.assertIn(f"--sigstore-bundle {SIGSTORE_BUNDLE}", run, job)
 
     def test_a_job_level_secret_is_reported(self) -> None:
         document = yaml.safe_load(SYNTHETIC_JOB_SECRET)

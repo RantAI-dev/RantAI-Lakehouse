@@ -60,7 +60,7 @@ S1 starts now. S2 to S4 are written here so the whole design is reviewable, and 
   - Everything lives in one directory, `/opt/rantai-lakehouse` by default (`--dir` to change it):
     - `docker-compose.yml`, the release's file with digests pinned;
     - `.env`, mode 0600;
-    - `release.json` and `release.json.sig`;
+    - `release.json` and `release.json.sigstore.json`;
     - `backups/`;
     - `state.json`, which holds the current and previous versions and the last backup.
   - The Compose project name is `rantai-lakehouse`. The operator never edits the Compose file.
@@ -110,7 +110,7 @@ S1 starts now. S2 to S4 are written here so the whole design is reviewable, and 
   `rollback`.
 - **D11. Bundle.** One file, `rantai-lakehouse-<version>-linux-x86_64.tar.zst`, holding:
   - `lakehousectl`;
-  - `release.json` and `release.json.sig`;
+  - `release.json` and `release.json.sigstore.json`;
   - `docker-compose.yml`;
   - `images/<name>.tar` (`docker save` per image, so `docker load` needs no registry);
   - `sbom/<name>.cdx.json`;
@@ -286,11 +286,12 @@ signed decisions and `ops/release/release.pub`. One commit per task.
     3. for each, `cosign sign --key env://COSIGN_PRIVATE_KEY <ref>@<digest>`, then attach a
        CycloneDX SBOM (`anchore/sbom-action`, then `cosign attest --type cyclonedx`);
     4. render the Compose file and write the manifest;
-    5. `cosign sign-blob` the manifest to `release.json.sig`, then verify it at once with
-       `ops/release/release.pub`;
+    5. `cosign sign-blob` the manifest into `release.json.sigstore.json` (D3a), then verify it
+       at once with `ops/release/release.pub`;
     6. build the bundle;
     7. `gh release create` as a **draft**, with the bundle, its `.sha256`, `release.json`, the
-       `.sig`, the SBOMs, `SHA256SUMS` and the Compose file. The owner publishes the draft.
+       `.sigstore.json`, the SBOMs, `SHA256SUMS` and the Compose file. The owner publishes the
+       draft.
 
     Signing steps run in a job bound to `environment: release`, so the owner's approval gates
     the key.
