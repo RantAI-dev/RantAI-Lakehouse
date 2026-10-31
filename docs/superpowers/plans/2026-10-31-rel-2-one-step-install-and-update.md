@@ -391,3 +391,34 @@ S1-T5:
   so the PDF export stays off until it is set to `http://console:3000`.
 
 ## 7. Review (planner appends below)
+
+### Review S1 round 1 (planner, 2026-10-31, at `f79d4235`)
+
+**What holds.**
+- **T1.** `/health/ready` reports only `ok` or `failed` per check, never upstream text, and is
+  ready only when the schema matches the binary. `/health` carries the version. The public count
+  is 14.
+- **T2.** The console service has no default secret. It depends on the API being healthy. The
+  new root `.dockerignore` keeps `.env`, `.git` and `ops` out of the console image.
+- **T3.** 46 images are pinned by digest, and the lint is in CI.
+- **T4.** The backup directory is `0700`, and parts are checksummed. The drill proved a stored
+  connector credential decrypts after restore.
+- **T5.** The version banner follows T3 Code's pattern.
+- **Two choices the plan left open, accepted:**
+  - the readiness probe passes `warehouse=`, because Lakekeeper answers 400 without it;
+  - the local backup is a host-side script, not a new service.
+
+**SHOULD-FIX 1: the public readiness route fans out with no cap.**
+- Every unauthenticated `GET /health/ready` runs a Postgres query, a ClickHouse query and a
+  Lakekeeper HTTP call, which includes a token file read. A loop of anonymous requests turns into
+  three times as much backend load.
+- `probe_lakekeeper` also builds a new `reqwest::Client` each time, with redirects on.
+- **Fix:**
+  - Cache the computed `ReadyBody` for 2 seconds. Concurrent callers share one probe:
+    `tokio::sync::Mutex` plus a stored `Instant`, or a `OnceCell` per window.
+  - Use one shared client (`OnceLock`) with `redirect::Policy::none()` and the probe timeout.
+  - Add a test: two calls within the window run the probe once (count with a test hook or a
+    `wiremock` for Lakekeeper).
+  - Cite `REL-2 S1 review SHOULD-FIX 1`.
+
+**Open: SHOULD-FIX 1.**
