@@ -281,6 +281,11 @@ What `Oracle CDC` needs and what it does not do. Proven by the `g4-oracle` gate 
   connector is deleted; drop it by hand if you do not want it.
 - **`source.ts_ms` is the change time of the redo row**, not the commit time, so the lag stays an upper bound.
 - **Oracle NUMBER columns, keys included, arrive in Bronze as text, so that no digits are lost; cast them in Silver.**
+- **A schema change made by `SYS` or `SYSTEM` is never seen.** Debezium skips DDL run by the users in
+  `log.mining.schema_changes.username.exclude.list`, whose default is `SYS,SYSTEM`
+  (`AbstractLogMinerStreamingChangeEventSource.java:1406-1412`, `OracleConnectorConfig.java:636-642`); the first change
+  that then uses the new column fails the task (observed in `g4-oracle`, runs 41235139798 and 41238887534, where the
+  gate ran the `ALTER` as `SYS`). Change a captured table as its owner or another ordinary user.
 - **A new column** is mined with Debezium's `hybrid` strategy (`log.mining.strategy=hybrid`, `SRC-4` Amendment 12);
   the default `online_catalog` fails the connector's task at the first change that mentions the new column
   (observed in `g4-oracle`, run 41235139798). What `hybrid` does and does not cover is written below from the gate's

@@ -194,16 +194,21 @@ class OracleSource(cdc_gate.Source):
             except Exception:  # noqa: BLE001 -- it does not exist on a first run
                 pass
             cur.execute(f'CREATE USER {SCHEMA} IDENTIFIED BY "{self.password}" QUOTA UNLIMITED ON users')
+            # The table owner issues the schema change in the gate, as a real source does: Debezium skips DDL
+            # run by SYS and SYSTEM (`log.mining.schema_changes.username.exclude.list`, default `SYS,SYSTEM`).
+            cur.execute(f"GRANT CREATE SESSION TO {SCHEMA}")
             cur.execute(f"CREATE TABLE {SCHEMA}.g4_numbers (g NUMBER(18) PRIMARY KEY)")
             cur.execute(f"INSERT INTO {SCHEMA}.g4_numbers SELECT LEVEL FROM dual CONNECT BY LEVEL <= 110000")
-            for table in (*cdc_gate.TABLES.values(), "orders_plain"):
+            for table in (*cdc_gate.TABLES.values(), "orders_plain", "orders_oc"):
                 # NUMBER(18) keeps the key a 64-bit integer in Debezium's events (a wider NUMBER would
                 # arrive as text under decimal.handling.mode=string).
                 cur.execute(
                     f"CREATE TABLE {SCHEMA}.{table} (id NUMBER(18) PRIMARY KEY, customer VARCHAR2(100), "
                     "amount NUMBER(12,2), status VARCHAR2(50), updated_at TIMESTAMP(6))"
                 )
-                if table != "orders_plain":
+                if table == "orders_oc":
+                    cur.execute(f"ALTER TABLE {SCHEMA}.{table} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS")
+                if table not in ("orders_plain", "orders_oc"):
                     cur.execute(
                         f"INSERT INTO {SCHEMA}.{table} SELECT g, 'seed_' || g, MOD(g, 1000) + 0.5, 'seed', SYSTIMESTAMP "
                         f"FROM {SCHEMA}.g4_numbers WHERE g BETWEEN 1 AND {cdc_gate.SEED_ROWS}"
@@ -213,11 +218,75 @@ class OracleSource(cdc_gate.Source):
         finally:
             conn.close()
 
+    def _as_owner(self, statements: list[str]) -> None:
+        """Run statements as the table's OWNER, `G4SRC`. A schema change run by `SYS` or `SYSTEM` is never
+        seen by Debezium: `AbstractLogMinerStreamingChangeEventSource.java:1406-1412` skips DDL of the users
+        in `log.mining.schema_changes.username.exclude.list`, default `SYS,SYSTEM`
+        (`OracleConnectorConfig.java:636-642`). The gate used `SYS` first and the new column never arrived
+        (runs 41235139798, 41238887534); a real source changes its tables as their owner."""
+        import oracledb
+
+        conn = oracledb.connect(user=SCHEMA, password=self.password, dsn=f"{HOST}:{PORT}/{PDB}")
+        try:
+            cur = conn.cursor()
+            for statement in statements:
+                cur.execute(statement)
+            conn.commit()
+        finally:
+            conn.close()
+
     def add_column_and_observe(self) -> None:
-        """A new column. Debezium's default `log.mining.strategy` is `online_catalog`; whether it
-        captures the column is what this step shows (Amendment 9: if it does not, stop and report)."""
-        self._run([f"ALTER TABLE {SCHEMA}.orders ADD (note VARCHAR2(100))"])
-        self.execute(f"UPDATE {SCHEMA}.orders SET note = 'schema_note' WHERE id = 2")
+        """A new column, added by the table owner while the connector runs, then a change that sets it."""
+        self._as_owner([f"ALTER TABLE {SCHEMA}.orders ADD (note VARCHAR2(100))"])
+        self._as_owner([f"UPDATE {SCHEMA}.orders SET note = 'schema_note' WHERE id = 2"])
+
+    def _online_catalog_probe(self, connector_id: str) -> None:
+        """Informational (Amendment 12 follow-up): does the DEFAULT `online_catalog` strategy survive the same
+        change when the owner makes it? A second connector, copied from the first one's stored config with
+        `log.mining.strategy=online_catalog` and its own prefix and history topic, captures `ORDERS_OC`
+        only; the gate adds a column there and reports the task's state. Asserts nothing."""
+        import time
+
+        name = cdc_gate._connect_name(connector_id)
+        probe = f"{name}-oc"
+        base = cdc_gate.CONNECT_URL
+        cfg = cdc_gate.requests.get(f"{base}/connectors/{name}/config", timeout=15).json()
+        cfg = {k: v for k, v in cfg.items() if k != "name"}
+        cfg.update(
+            {
+                "topic.prefix": f"cdc.{connector_id}oc",
+                "schema.history.internal.kafka.topic": f"cdc.{connector_id}oc.schema-history",
+                "table.include.list": f"{SCHEMA}.ORDERS_OC",
+                "log.mining.strategy": "online_catalog",
+            }
+        )
+        put = cdc_gate.requests.put(f"{base}/connectors/{probe}/config", json=cfg, timeout=30)
+        if not put.ok:
+            print(f"[g4] online_catalog probe: Kafka Connect refused the probe connector ({put.status_code})", flush=True)
+            return
+
+        def states() -> list[str]:
+            st = cdc_gate.requests.get(f"{base}/connectors/{probe}/status", timeout=10).json()
+            return [st.get("connector", {}).get("state", "")] + [t.get("state", "") for t in st.get("tasks", [])]
+
+        try:
+            deadline = time.time() + 180
+            while time.time() < deadline and not (len(states()) > 1 and set(states()) == {"RUNNING"}):
+                time.sleep(3)
+            before = states()
+            self._as_owner([f"ALTER TABLE {SCHEMA}.orders_oc ADD (note VARCHAR2(100))"])
+            self._as_owner([f"INSERT INTO {SCHEMA}.orders_oc (id, customer, note) VALUES (1, 'oc', 'schema_note')"])
+            self._as_owner([f"UPDATE {SCHEMA}.orders_oc SET note = 'changed' WHERE id = 1"])
+            after = []
+            deadline = time.time() + 120
+            while time.time() < deadline:
+                after = states()
+                if "FAILED" in after:
+                    break
+                time.sleep(5)
+            print(f"[g4] online_catalog probe (owner's DDL): task states before {before}, 120 s after the column {after}", flush=True)
+        finally:
+            cdc_gate.requests.delete(f"{base}/connectors/{probe}", timeout=30)
 
     # ── The setup checks (Amendment 11) ─────────────────────────────────────
 
@@ -320,6 +389,7 @@ class OracleSource(cdc_gate.Source):
     def extra_steps(self, connector_id: str) -> None:
         self._wrong_password_is_classified()
         self._connection_is_encrypted()
+        self._online_catalog_probe(connector_id)
 
     def _wrong_password_is_classified(self) -> None:
         """Kafka Connect refuses to CREATE a connector whose login fails, so the connector is registered
