@@ -1396,6 +1396,42 @@ mod tests {
         assert_eq!(answer.reason, Some(ErrorClass::AddressRefused.reason()));
     }
 
+    /// `SRC-4` slice 6 (S10-c): an Oracle change-capture connector lists nothing, in the API,
+    /// without a launch.
+    #[tokio::test]
+    async fn an_oracle_change_capture_listing_is_answered_here_as_not_supported() {
+        let resolver =
+            lakehouse_core::secret::EnvSecretResolver::with_map(std::collections::HashMap::new());
+        let oracle_cdc = ConnectorDialInfo {
+            kind: "x".to_owned(),
+            host: "x".to_owned(),
+            secret_ref: "env:UNUSED".to_owned(),
+            secret_ref_secondary: None,
+            adapter: Some("cdc".to_owned()),
+            dial: serde_json::json!({"driver": "oracle", "host": "o.example", "port": 1521,
+                "database": "FREE", "user": "u"}),
+        };
+        let request = Request {
+            limit: 10,
+            ..Request::default()
+        };
+        for kind in [Kind::List, Kind::Preview] {
+            let Dispatch::Done(answer) = dispatch(
+                kind,
+                &oracle_cdc,
+                &request,
+                &resolver,
+                &InternalHosts::NONE,
+                None,
+            )
+            .await
+            else {
+                panic!("an Oracle change-capture listing is answered here");
+            };
+            assert_eq!(answer.error_class, Some(ErrorClass::NotSupported));
+        }
+    }
+
     /// `SRC-13` D1: the types the orchestrator reads are handed over, and a
     /// REST connector's list is its declared endpoints, searchable, with no
     /// network.
@@ -1451,29 +1487,6 @@ mod tests {
             )
             .await;
             assert!(matches!(out, Dispatch::Orchestrator));
-        }
-
-        // `SRC-4` slice 6 (S10-c): an Oracle change-capture connector lists nothing, in
-        // the API, without a launch.
-        let oracle_cdc = info(
-            "cdc",
-            serde_json::json!({"driver": "oracle", "host": "o.example", "port": 1521,
-                "database": "FREE", "user": "u"}),
-        );
-        for kind in [Kind::List, Kind::Preview] {
-            let Dispatch::Done(answer) = dispatch(
-                kind,
-                &oracle_cdc,
-                &request,
-                &resolver,
-                &InternalHosts::NONE,
-                None,
-            )
-            .await
-            else {
-                panic!("an Oracle change-capture listing is answered here");
-            };
-            assert_eq!(answer.error_class, Some(ErrorClass::NotSupported));
         }
 
         let rest = info(

@@ -1423,7 +1423,10 @@ mod tests {
         let both = oracle_trace_checks(&format!("{archive}\n{supplemental}"));
         assert_eq!(both.len(), 2);
         // Anything else explains nothing, and none of its text is carried.
-        assert!(oracle_trace_checks("ORA-01017: invalid username/password SECRET_USER").is_empty());
+        assert_eq!(
+            oracle_trace_checks("ORA-01017: invalid username/password SECRET_USER").len(),
+            0
+        );
     }
 
     #[test]
