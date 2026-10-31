@@ -68,3 +68,18 @@ a decision below. If the code disagrees with the plan, stop and report it.
   `target="_blank"` (`landing-footer.tsx`), unchanged by this task.
 
 ## 5. Review (planner appends below)
+
+### Review round 1 (planner, 2026-10-31, at `ef7b5fb8`)
+
+- T1 matches D2 and D3:
+  - `LINKS.guide` points at the guide on `main`, with a `DOC-2` comment;
+  - "User guide" sits first in `FOOTER.connect`;
+  - `NAV_LINKS` and `landing-footer.tsx` are unchanged.
+- No test asserts the footer links, so adding none is right.
+- I re-ran the checks on `ef7b5fb8`, in the foreground:
+  - `bun run typecheck`: clean;
+  - `bun run lint`: 0 errors, 11 warnings, all pre-existing;
+  - `bun test src/features/landing`: 19 pass, 0 fail.
+
+**Open: no BLOCKER, no SHOULD-FIX.** `DOC-2` stays In Progress until the guide is walked through on
+a running console.
