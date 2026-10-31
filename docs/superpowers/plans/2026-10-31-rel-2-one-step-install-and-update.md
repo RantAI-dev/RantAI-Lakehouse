@@ -479,6 +479,169 @@ S1-T5:
 - `CONSOLE_INTERNAL_URL` (the console as the PDF renderer reaches it) is still empty by default,
   so the PDF export stays off until it is set to `http://console:3000`.
 
+### Handoff S2 (developer, 2026-11-01)
+
+**Commits** (branch `feat/rel-2-s2-release-pipeline`, base `main` at `f9dffa86`), one per task, in
+plan order:
+
+| Commit | Task | What |
+| --- | --- | --- |
+| `729f1a84` | S2-T1 | `ops/release/check_version.py`: the tag, the package, the crate and the changelog must agree |
+| `a7abea01` | S2-T2 | `ops/release/render_compose.py`: the release's Compose file, rendered from the template |
+| `d2759368` | S2-T3 | `ops/release/make_manifest.py` and `ops/release/make_bundle.sh`: the manifest and the offline bundle |
+| `184b95d5` | (S2-T3) | the bundle script lost an unused variable `shellcheck` flagged |
+| `36065cf4` | S2-T4 | `.github/workflows/release.yml` (replaces `docker.yml`) |
+| `8d91e514` | S2-T5 | the docs: `docs/CI.md`, `docs/OPERATIONS.md`, `CHANGELOG.md` |
+
+**Commands, with their results.** Everything ran in the foreground on this machine.
+
+The tooling's own tests:
+
+- `python -m pytest ops/release -q` (pytest 9.2.0 in a throwaway venv) — **52 passed, 0 failed**.
+- `python3 -m unittest discover -s ops/release -p 'test_*.py'` — **52 tests, OK** (the same
+  files are `unittest.TestCase` classes, so they run under either runner).
+- `python3 ops/release/check_version.py v0.1.0` — exit 0 ("the tag, package.json, the API
+  crate and the changelog all name 0.1.0"); `… v0.2.0` — exit 1 with all three differences
+  printed (the tag names 0.2.0, the package and the crate name 0.1.0, the changelog has no
+  `## [0.2.0]` heading).
+
+The scripts and the workflow:
+
+- `bash -n ops/release/make_bundle.sh` — clean.
+- `shellcheck ops/release/make_bundle.sh` (shellcheck 0.10.0, downloaded to `/tmp`; it is
+  **not** installed on this machine) — **clean**. It found one thing on the first run
+  (`SC2034`: `SCRIPT_DIR` unused) and that is what commit `184b95d5` removes.
+- `actionlint .github/workflows/release.yml .github/workflows/ci.yml` (actionlint 1.7.12,
+  installed with `pip install actionlint-py` into the throwaway venv; it is **not** installed
+  on this machine) — **`release.yml` is clean**; `ci.yml` reports three shellcheck warnings
+  (SC1007 at line 2070, SC2034 and SC2155 at line 2929). They are **pre-existing**: the same
+  warnings are on `main` (lines 2024 and 2883 there), in jobs this slice does not touch, and
+  `ci.yml` does not run `actionlint`. Not fixed here — fixing another job's shell would
+  widen this slice's diff, and it needs a backlog item.
+
+The repo's lints and the Compose files:
+
+- `python3 ops/lint/check_image_digests.py` — "46 third-party image(s) pinned by digest, 8
+  locally built image(s) exempt", exit 0.
+- `python3 ops/lint/check_intra_package_imports.py` — OK.
+- `python3 ops/lint/check_bare_iceberg_count.py` — no violation.
+- `python3 ops/lint/check_compose_init_readiness.py` — OK.
+- `python3 ops/lint/check_connector_gate_coverage.py` — OK (19 types covered, 0 waived).
+- `python3 -m unittest discover -s ops/lint -p 'test_*.py'` — 33 tests, OK.
+- `python3 -m unittest discover -s ops/gates -p 'test_*.py'` — 29 tests, OK.
+- `docker compose --profile '*' config --quiet` — clean (the template, with the local `.env`).
+- `docker compose --env-file <throwaway> -f <rendered> --profile '*' config --quiet` —
+  **clean**, twice: once with the placeholder digests CI uses, and once against the
+  rendered file the pipeline writes. The rendered file is 2,863 lines and holds 35 services
+  (the 57 of the template, less the 22 that are gate or test harnesses).
+
+**The bundle, end to end, with a real image** (the one local image build this slice was
+allowed):
+
+- `docker compose -p rel2s2 build lakehouse-api` — the API image, built (mostly cached).
+- A throwaway `registry:2` on `localhost:5000`; the image pushed to it, so it had a REAL
+  digest (`sha256:b48a99a6…`).
+- `ops/release/render_compose.py`, `ops/release/make_manifest.py` and
+  `ops/release/make_bundle.sh` ran over it: the bundle is
+  `rantai-lakehouse-0.2.0-linux-x86_64.tar.zst`, **76,508,621 bytes (72 MiB)**.
+- The bundle holds `docker-compose.yml`, `release.json`, `release.json.sig`,
+  `images/rantai-lakehouse-api.tar`, `sbom/rantai-lakehouse-api.cdx.json` and
+  `SHA256SUMS`; `sha256sum -c SHA256SUMS` says **OK for all five files**.
+- `docker load` of the bundle's image tar restored an image whose ID is **exactly the digest
+  the manifest names** (`sha256:b48a99a6…`) — which is the comparison REL-2 S3's installer
+  will make.
+- Cleanup: the registry container, the pushed image, the compose project and the scratch
+  directory are gone. The API image itself stays in the local store (it is a build
+  artifact, not tracked by git).
+
+**Not verified, with the reason:**
+
+- **The dry run is not verified.** It needs a GitHub runner: the four images, the throwaway
+  registry, cosign, `syft` and the bundle are all CI-side. The PR's own dry run is the
+  proof, and its summary is where the bundle's size appears. Nothing in this slice ran a
+  `cosign` command: `cosign` is not installed on this machine, so the signing, the
+  attestation and the `sign-blob`/`verify-blob` pair are unexercised here. The dry run
+  generates its key in the job and verifies against its own public key, so it cannot touch
+  the release key; the real run signs with `env://COSIGN_PRIVATE_KEY` from the `release`
+  environment.
+- **The real release is not verified, and cannot be.** It needs a `v*` tag, the owner's
+  approval on the `release` environment, and the release key. REL-2 S5 does that.
+- `docker save` was exercised with one real image (the API's). The other three images were
+  not built locally — the PR's dry run builds all four.
+- `(cd dagster && python -m pytest dispar_orchestrate -q)`: not run — this slice changes no
+  Python in the code location (`dagster/dispar_orchestrate/` is untouched) and no Dagster
+  file. The repo lints that scan Python did run.
+- No cargo command ran: this slice changes no Rust. The API crate's version was READ
+  (`rust/crates/lakehouse-api/Cargo.toml`) by `check_version.py`, not changed.
+- The rendered Compose file was checked with `docker compose config`, never STARTED: no
+  release image exists yet, so there is nothing to start. Its contents are proved by the
+  tests and by `config`; that it boots is REL-2 S3's job (it installs a release).
+
+**Where the plan left room, and what was decided** (for the reviewer):
+
+- **Which services the release drops.** The plan says "every service whose profiles are
+  only gate or test profiles (`test`, `g*`) is dropped". That rule alone keeps the gate
+  runners that live in the `dagster` profile (`g3a-test-runner`, `g4-test-runner`,
+  `gold-export-test-runner`, the G7 runner …), and the G7 runner is built from `ops/g7` —
+  a build the plan says is NOT released ("the gate-only builds (g7 runner, g6 stubs) are not
+  released"). So the renderer recognises a harness by its PROFILE **or** by its NAME
+  (`g<digit>…` or `…-test-runner`), and drops both.
+- **The one harness that stays.** `debezium-server` waits for `g4-source-init` (the demo
+  table `p5_cdc.orders` and its publication `p5cdc_pub`) with
+  `condition: service_completed_successfully`. Dropping it would leave the CDC service
+  waiting for something that never runs, and the Debezium server would fail on a missing
+  publication. The renderer therefore keeps a harness that a KEPT service waits for — the
+  exception is computed from the `depends_on` graph, not from a list of names. Everything
+  else that is a harness is dropped (22 services).
+- **The service → image mapping lives in one checked-in file.**
+  `ops/release/release-images.json` says which published image each service runs. The
+  pipeline and the CI check both read it, so they cannot drift; a test holds it to the
+  template (every service the template builds appears in it, and vice versa).
+- **The release Compose file keeps the template's comments.** A comment that talks about
+  building an image, or about a local `:local` tag, describes the TEMPLATE, not the
+  rendered file. The rendered file says so in its own header, in the first lines, rather
+  than dropping the comments an operator reads for the "why" of each setting.
+- **`minFrom`'s default.** Two minor versions back: `0.2.0` → `0.0.0`, `0.3.0` → `0.1.0`.
+  Below `0.2.0` there is no such version and the floor is `0.0.0`. A stop is named in
+  `ops/release/upgrade-path.json`, which ships with no entries (no release has named one).
+- **`install.sh` is attached when it exists.** The plan lists it among the release's
+  assets; it is written in REL-2 S3. The workflow copies it from `ops/release/install.sh`
+  when that file is there and says nothing when it is not, so the release is never
+  published with a missing asset.
+- **The release's own `SHA256SUMS`.** The bundle carries one over its contents; the
+  release carries one over its assets (the bundle, the manifest, the signature, the
+  SBOMs), so an operator who downloads them can check them against the release page.
+- **The buildx builder in the dry run** runs with `driver-opts: network=host`, because a
+  builder runs in a container of its own and `localhost:5000` inside it is the builder, not
+  the runner. The real run needs no such thing: it pushes to `ghcr.io`.
+
+**Known gaps in this slice** (not fixed here; the reviewer decides):
+
+- **The offline path cannot compare a loaded image with the manifest's digest yet.** The
+  manifest records the REGISTRY digest of each image (`repo@sha256:…`), which is what
+  `docker pull` resolves. `docker load` of a bundle's tar restores the image's ID (its
+  config digest) and, on a daemon with the classic image store, NOT its `RepoDigests` — so
+  an installer cannot compare the loaded image against the manifest's digest as the plan
+  words it ("compare the loaded image ids against the manifest"). On this machine the
+  daemon has the containerd store and the loaded image DID keep its `RepoDigests`, so the
+  comparison worked here; on a classic daemon it would not. REL-2 S3 has to settle this:
+  either the manifest also carries each image's config digest, or the installer checks the
+  bundle's own `SHA256SUMS` chain instead. **Nothing in S2's output blocks either choice**,
+  but the choice is S3's.
+- The dry run's build has no `cache-to`: it only READS the `api-image` and `dagster-image`
+  caches `ci.yml` writes from `main`, so a dry run never evicts them.
+- The images are signed with a key that lives in the `release` environment; there is no
+  key rotation procedure yet, and no record of which key signed which release beyond the
+  signature itself.
+- `cosign attest` pushes the SBOM attestation to the registry as a referrer (or, on a
+  registry without the referrers API, as a tag). The dry run's `registry:2` and GHCR both
+  accept it, but the dry run is the only place this is exercised — by the PR's CI.
+- The `release` environment's secrets (`COSIGN_PRIVATE_KEY`, `COSIGN_PASSWORD`) are
+  assumed to hold the base64 of the encrypted private key and its password, which is what
+  cosign's `env://` provider expects. The plan does not state the encoding; the workflow
+  says so in a comment. The FIRST real release is where that assumption is proven, and it
+  fails loudly (cosign cannot decrypt) if it is wrong.
+
 ## 7. Review (planner appends below)
 
 ### Review S1 round 1 (planner, 2026-10-31, at `f79d4235`)
