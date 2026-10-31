@@ -25,6 +25,12 @@ And two more since REL-2 S2 review round 4, from the PR's own dry run:
   - the signing key is not written to `$GITHUB_ENV`, which would put it in
     the environment of every later step of the job.
 
+And one more since REL-2 S2 review round 5, from the PR's second dry run:
+
+  - every SBOM is written as CycloneDX **JSON**, because `cosign attest
+    --type cyclonedx` reads a JSON predicate and the action's plain
+    `cyclonedx` format is XML.
+
 The workflow is parsed with PyYAML (`pyyaml==6.0.3`, installed by the jobs
 that run these tests). The checks are run against synthetic workflows too,
 so a check that cannot fail is itself a failure. No network, no repository:
@@ -57,6 +63,13 @@ SECRET_NAMES = ("COSIGN_PRIVATE_KEY", "COSIGN_PASSWORD")
 
 # The manifest's signature, as REL-2 S2 D3a decided it: a Sigstore bundle.
 SIGSTORE_BUNDLE = "release.json.sigstore.json"
+
+# The SBOM format every SBOM step must ask for: CycloneDX **JSON**.
+# `anchore/sbom-action` takes syft's format names, and syft writes the
+# plain `cyclonedx` name as XML — `cosign attest --type cyclonedx` reads a
+# JSON predicate, so the XML answer is "invalid character '<' looking for
+# beginning of value" (REL-2 S2 review round 5 BLOCKER 1).
+SBOM_FORMAT = "cyclonedx-json"
 
 # cosign v3's way to sign with a key and NO transparency log. Both flags
 # are needed: v3 refuses `--tlog-upload=false` while the signing config
@@ -137,6 +150,21 @@ jobs:
             cat cosign.key
             echo 'COSIGN_PRIVATE_KEY_EOF'
           } >> "$GITHUB_ENV"
+"""
+
+# A workflow whose SBOM is CycloneDX XML, which `cosign attest` cannot
+# read as a predicate (REL-2 S2 review round 5 BLOCKER 1).
+SYNTHETIC_XML_SBOM = """
+name: Synthetic
+on: workflow_dispatch
+jobs:
+  dry-run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: The SBOM of the API image
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          format: cyclonedx
 """
 
 
@@ -256,6 +284,31 @@ def shell_commands(run: str) -> str:
     return "\n".join(
         line for line in run.splitlines() if not line.strip().startswith("#")
     )
+
+
+def sbom_steps(document: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    """Every SBOM step of every job, with the job it is in."""
+    found: list[tuple[str, dict[str, Any]]] = []
+    for job_name, job in (document.get("jobs") or {}).items():
+        for step in job.get("steps") or []:
+            if "sbom-action" in str(step.get("uses") or ""):
+                found.append((job_name, step))
+    return found
+
+
+def sbom_formats(document: dict[str, Any]) -> list[str]:
+    """Every SBOM step whose format is not CycloneDX JSON.
+
+    `cosign attest --type cyclonedx` reads a JSON predicate, and the
+    action's plain `cyclonedx` format is XML (REL-2 S2 review round 5
+    BLOCKER 1).
+    """
+    found: list[str] = []
+    for job_name, step in sbom_steps(document):
+        with_ = step.get("with") or {}
+        if str(with_.get("format")) != SBOM_FORMAT:
+            found.append(f"{job_name}: {step.get('name')}")
+    return found
 
 
 def steps_writing_the_key_to_the_github_env(document: dict[str, Any]) -> list[str]:
@@ -385,6 +438,23 @@ class ReleaseWorkflowTest(unittest.TestCase):
     def test_a_workflow_without_the_sbom_folder_is_reported(self) -> None:
         document = yaml.safe_load(SYNTHETIC_NO_SBOM_FOLDER)
         self.assertFalse(creates_the_sbom_folder(document, "dry-run"))
+
+    def test_every_sbom_is_written_as_cyclonedx_json(self) -> None:
+        """REL-2 S2 review round 5 BLOCKER 1: the predicate must be JSON.
+
+        `anchore/sbom-action` takes syft's format names, and syft writes
+        the plain `cyclonedx` name as XML. `cosign attest --type cyclonedx`
+        reads a JSON predicate, so with the XML the attestation failed with
+        "invalid character '<' looking for beginning of value".
+        """
+        for job in ("dry-run", "release"):
+            steps = [step for name, step in sbom_steps(self.document) if name == job]
+            self.assertTrue(steps, f"{job}: no SBOM step to check")
+        self.assertEqual(sbom_formats(self.document), [])
+
+    def test_a_workflow_with_an_xml_sbom_is_reported(self) -> None:
+        document = yaml.safe_load(SYNTHETIC_XML_SBOM)
+        self.assertEqual(sbom_formats(document), ["dry-run: The SBOM of the API image"])
 
     def test_the_manifest_is_signed_into_a_sigstore_bundle_in_both_jobs(self) -> None:
         """REL-2 S2 D3a: the signature is a bundle, not a detached file.

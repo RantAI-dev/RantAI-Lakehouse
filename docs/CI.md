@@ -355,6 +355,11 @@ entry, so an operator verifying one by hand passes `--insecure-ignore-tlog` too 
 key is what the check is about; the log was never the identity here, because the images are
 signed with the release key and not with a keyless identity.
 
+cosign v3 prints `--tlog-upload has been deprecated, prefer using a signing-config file with
+no transparency log services`. The flag still works, so the pipeline keeps it and the
+proxy-logged proof stands; replacing it with a `--signing-config` file is left for when the
+flag is removed (REL-2 S2 review round 5).
+
 The release is created as a **draft**. The product owner publishes it.
 
 ### The one manual step after the first real release

@@ -315,6 +315,13 @@ jobs:
       # A CycloneDX SBOM per image, and the attestation that binds it to
       # the image's digest.
       #
+      # The format is CycloneDX **JSON** (`cyclonedx-json`): syft writes the
+      # action's plain `cyclonedx` format as XML, and `cosign attest --type
+      # cyclonedx` reads a JSON predicate — with the XML the attestation
+      # failed with "invalid character '<' looking for beginning of value"
+      # (REL-2 S2 review round 5 BLOCKER 1). The `.cdx.json` names are
+      # therefore true.
+      #
       # The folder comes first: the SBOM action writes into `sbom/` and
       # does not create it, so without this step it fails with ENOENT
       # (REL-2 S2 review round 4 BLOCKER 1).
@@ -327,7 +334,7 @@ jobs:
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
           image: ${{ steps.images.outputs.api }}
-          format: cyclonedx
+          format: cyclonedx-json
           output-file: sbom/rantai-lakehouse-api.cdx.json
           upload-artifact: false
 
@@ -335,7 +342,7 @@ jobs:
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
           image: ${{ steps.images.outputs.dagster }}
-          format: cyclonedx
+          format: cyclonedx-json
           output-file: sbom/rantai-lakehouse-dagster.cdx.json
           upload-artifact: false
 
@@ -343,7 +350,7 @@ jobs:
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
           image: ${{ steps.images.outputs.oidc }}
-          format: cyclonedx
+          format: cyclonedx-json
           output-file: sbom/rantai-lakehouse-oidc-mock.cdx.json
           upload-artifact: false
 
@@ -351,7 +358,7 @@ jobs:
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
           image: ${{ steps.images.outputs.console }}
-          format: cyclonedx
+          format: cyclonedx-json
           output-file: sbom/rantai-lakehouse-console.cdx.json
           upload-artifact: false
 
@@ -678,6 +685,13 @@ jobs:
 
       # The SBOM folder, before the action that writes into it: the
       # action does not create it (REL-2 S2 review round 4 BLOCKER 1).
+      #
+      # The format is CycloneDX **JSON** (`cyclonedx-json`): syft writes the
+      # action's plain `cyclonedx` format as XML, and `cosign attest --type
+      # cyclonedx` reads a JSON predicate — with the XML the attestation
+      # failed with "invalid character '<' looking for beginning of value"
+      # (REL-2 S2 review round 5 BLOCKER 1). The `.cdx.json` names are
+      # therefore true.
       - name: The SBOM folder
         run: |
           set -euo pipefail
@@ -687,7 +701,7 @@ jobs:
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
           image: ${{ steps.images.outputs.api }}
-          format: cyclonedx
+          format: cyclonedx-json
           output-file: sbom/rantai-lakehouse-api.cdx.json
           upload-artifact: false
 
@@ -695,7 +709,7 @@ jobs:
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
           image: ${{ steps.images.outputs.dagster }}
-          format: cyclonedx
+          format: cyclonedx-json
           output-file: sbom/rantai-lakehouse-dagster.cdx.json
           upload-artifact: false
 
@@ -703,7 +717,7 @@ jobs:
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
           image: ${{ steps.images.outputs.oidc }}
-          format: cyclonedx
+          format: cyclonedx-json
           output-file: sbom/rantai-lakehouse-oidc-mock.cdx.json
           upload-artifact: false
 
@@ -711,7 +725,7 @@ jobs:
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
           image: ${{ steps.images.outputs.console }}
-          format: cyclonedx
+          format: cyclonedx-json
           output-file: sbom/rantai-lakehouse-console.cdx.json
           upload-artifact: false
 
