@@ -804,6 +804,43 @@ mod recording {
         );
     }
 
+    /// `DATA-29`: a `NULL` cell and an empty cell in the same row are told
+    /// apart in the answer — the `NULL` is `null` and the empty cell stays
+    /// `""`.
+    ///
+    /// The engine's own answer decides it: the mock reports one column as
+    /// `null` and the other as an empty string, and the route passes both
+    /// on as they came. Before this change the `NULL` arrived as `""` and
+    /// the two were the same answer.
+    #[tokio::test]
+    async fn a_null_cell_is_null_and_an_empty_cell_is_an_empty_string() {
+        let ch = MockServer::start().await;
+        mount_prefetch_ok(&ch).await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "meta": [
+                    {"name": "maybe", "type": "Nullable(String)"},
+                    {"name": "text", "type": "String"},
+                ],
+                "data": [{"maybe": null, "text": ""}],
+                "rows": 1,
+            })))
+            .mount(&ch)
+            .await;
+        let TestApp { router, pool } = spin_up_with_clickhouse(&ch.uri()).await;
+        claim_table_for(&pool, OWNER_TENANT).await;
+        let cookie = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+
+        let (status, body) = post_sql(&router, &cookie, OWNED_STATEMENT).await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["rows"],
+            json!([{"maybe": null, "text": ""}]),
+            "a NULL cell must be null and an empty cell must stay an empty string"
+        );
+    }
+
     /// Two runs are both recorded, and their ids cannot collide.
     ///
     /// The store inserts the history row with `ON CONFLICT (id) DO NOTHING`,

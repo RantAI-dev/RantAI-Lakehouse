@@ -209,6 +209,12 @@ fn numeric_leaves(value: &Value) -> Vec<f64> {
 /// The counts and totals `value`'s arrays imply (see [`Evidence`]): each
 /// array's length and, for an array of row objects, the number of rows
 /// per distinct text value of each key and the sum of each numeric key.
+///
+/// `DATA-29`: a `null` cell holds no number and no text, so it is left
+/// out of both the counts and the sums — the same as any other cell that
+/// is neither a number nor a plain number in text. A `null` cell used to
+/// arrive as the empty string, which this rule skipped as well, so the
+/// evidence a conversation carries does not change.
 #[allow(
     clippy::cast_precision_loss,
     reason = "row counts are far below 2^52, where f64 stops being exact"
