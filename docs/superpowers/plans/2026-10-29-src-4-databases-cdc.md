@@ -2379,3 +2379,69 @@ Accepted deviations:
 
 No open `BLOCKER`. Left: T5.11 merges the newer phase head (slice 6), then
 the merge into the phase branch.
+
+## Slice 6, review round 1 (planner, 2026-10-31)
+
+Reviewed: first-parent non-merge commits `e81abb92..a4886f32` against
+Amendments 9–12. Verified myself:
+- CI run 41244187205 on a4886f32: `success`, 38 of 38 jobs.
+- The `G4 Oracle change capture into Bronze` job log:
+  - connect pass in 258 ms;
+  - load 20000 + 20000;
+  - setup checks as specified;
+  - the wrong-password sentence;
+  - 2 sessions with AES256 and SHA256;
+  - reload within 120 s (28–45 s);
+  - the new column in Bronze after 50.7 s, listed as a schema change;
+  - the connector and its password file gone after DELETE;
+  - `[g4] PASS`.
+
+What holds:
+- The setup read is launched only when the Kafka Connect validation passed
+  (`routes/connectors.rs`, `is_oracle_cdc && outcome.ok`). That is S11-a.
+- The orchestrator uses constant statements only, and matches names in
+  Python.
+- An unread fact is left out, and its log line names only the error's type
+  and its `ORA-` code. That is principle 4.
+- `pdbName` is pattern-checked before it reaches the descriptor, and the
+  metacharacter test is there (S12-c).
+- The 422 is mapped to a fixed sentence, with a test (S12-d).
+- `hybrid` is rendered, with its restrictions written down (S12-a).
+- The gate's switch from SYS to the table owner fixes the gate; it does not
+  weaken it. Debezium's `log.mining.schema_changes.username.exclude.list`
+  defaults to `SYS,SYSTEM`, and the Limits line says so.
+
+**SHOULD-FIX 1: the refused-connection sentence tells the user to turn
+encryption off.**
+- Where: `cdc_oracle.rs`, `OracleTestFailure::ConnectionRefused`.
+- What: the sentence ends "(or set the TLS mode to Disable)".
+- Why it matters: a failed test is the moment a person grabs any lever that
+  makes the error go away. An error message must not point at the one lever
+  that drops encryption. That is fail-closed, principle 3. `disable` stays a
+  choice in the dial; the error just does not suggest it.
+- Fix: end the sentence with "...and that the server allows Oracle native
+  network encryption (ask the database administrator if it does not)."
+- Update the unit test and the gate's assertion to match. Grep the feature
+  page and the CHANGELOG for the old wording.
+
+**SHOULD-FIX 2: remove the `online_catalog` probe from the gate.**
+- Where: `g4_oracle_test.py`, `_online_catalog_probe`.
+- What: it answered the question it was written for. Its answer is recorded
+  above, in the Handoff of run 41244187205.
+- Why remove it:
+  - it asserts nothing;
+  - it adds about 2 minutes to every run;
+  - it writes to Kafka Connect directly, around the API, so around the
+    class allowlist and the secret handling;
+  - and if online_catalog ever fails there, the gate still passes, which is
+    a check that cannot fail.
+- Decision: keep `hybrid`. It is the strategy that passed end to end, and
+  online_catalog was never shown to carry the column.
+
+**NIT:** push the local docs commit e6867cf9 together with these fixes.
+
+Open at slice close, for the planner:
+- add `SRC-37` to the backlog;
+- the owner's confirmation of the MySQL 7-day binlog minimum.
+
+No open `BLOCKER`.
