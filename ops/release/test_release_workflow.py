@@ -101,6 +101,20 @@ jobs:
         run: syft packages
 """
 
+# A workflow whose SBOM action writes into a folder nobody creates.
+SYNTHETIC_NO_SBOM_FOLDER = """
+name: Synthetic
+on: workflow_dispatch
+jobs:
+  dry-run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: The SBOM of the API image
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          output-file: sbom/rantai-lakehouse-api.cdx.json
+"""
+
 
 def load_workflow(path: Path = WORKFLOW_PATH) -> dict[str, Any]:
     """The workflow, parsed."""
@@ -189,6 +203,26 @@ def step_named(document: dict[str, Any], job_name: str, name: str) -> dict[str, 
     raise AssertionError(f"no step named {name!r} in the job {job_name!r}")
 
 
+def creates_the_sbom_folder(document: dict[str, Any], job_name: str) -> bool:
+    """Whether the job creates `sbom/` before its first SBOM step.
+
+    The SBOM action writes into `sbom/` and does not create the folder,
+    so a job that does not create it first fails with ENOENT.
+    """
+    steps = steps_of(document, job_name)
+    first = next(
+        (
+            index
+            for index, step in enumerate(steps)
+            if "sbom-action" in str(step.get("uses") or "")
+        ),
+        None,
+    )
+    if first is None:
+        return False
+    return any("mkdir -p sbom" in str(step.get("run") or "") for step in steps[:first])
+
+
 class ReleaseWorkflowTest(unittest.TestCase):
     """The release workflow's own two properties."""
 
@@ -251,6 +285,22 @@ class ReleaseWorkflowTest(unittest.TestCase):
         run = str(step.get("run"))
         self.assertIn("COSIGN_PRIVATE_KEY<<", run)
         self.assertIn("$GITHUB_ENV", run)
+
+    def test_the_sbom_folder_is_created_before_the_first_sbom_step(self) -> None:
+        """REL-2 S2 review round 4 BLOCKER 1: the action does not create it.
+
+        `anchore/sbom-action` writes into `sbom/` and fails with ENOENT
+        when the folder is not there, so both jobs create it first.
+        """
+        for job in ("dry-run", "release"):
+            self.assertTrue(
+                creates_the_sbom_folder(self.document, job),
+                f"{job}: sbom/ is not created before the first SBOM step",
+            )
+
+    def test_a_workflow_without_the_sbom_folder_is_reported(self) -> None:
+        document = yaml.safe_load(SYNTHETIC_NO_SBOM_FOLDER)
+        self.assertFalse(creates_the_sbom_folder(document, "dry-run"))
 
     def test_the_manifest_is_signed_into_a_sigstore_bundle_in_both_jobs(self) -> None:
         """REL-2 S2 D3a: the signature is a bundle, not a detached file.

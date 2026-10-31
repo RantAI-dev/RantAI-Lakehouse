@@ -286,6 +286,15 @@ jobs:
 
       # A CycloneDX SBOM per image, and the attestation that binds it to
       # the image's digest.
+      #
+      # The folder comes first: the SBOM action writes into `sbom/` and
+      # does not create it, so without this step it fails with ENOENT
+      # (REL-2 S2 review round 4 BLOCKER 1).
+      - name: The SBOM folder
+        run: |
+          set -euo pipefail
+          mkdir -p sbom
+
       - name: The SBOM of the API image
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
@@ -630,6 +639,13 @@ jobs:
             cosign sign --key "$COSIGN_KEY" \
               --use-signing-config=false --tlog-upload=false "$ref"
           done
+
+      # The SBOM folder, before the action that writes into it: the
+      # action does not create it (REL-2 S2 review round 4 BLOCKER 1).
+      - name: The SBOM folder
+        run: |
+          set -euo pipefail
+          mkdir -p sbom
 
       - name: The SBOM of the API image
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
