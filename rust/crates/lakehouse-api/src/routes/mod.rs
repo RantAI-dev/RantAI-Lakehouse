@@ -44,6 +44,10 @@ mod governance;
 mod hierarchies;
 mod home;
 mod identity;
+// DATA-5 / ADR 0016: the door outside tools read published Gold tables
+// through. Its own router, because its routes answer in the Iceberg
+// error shape rather than the console's.
+mod iceberg_door;
 mod knowledge;
 mod lakehouse;
 pub(crate) mod layers;
@@ -1165,6 +1169,11 @@ pub fn router(state: AppState) -> Router {
         )
         .merge(storage_router())
         .merge(lakehouse_router())
+        // DATA-5 / ADR 0016: the door for outside readers. Merged LAST
+        // among the domain routers because it owns a catch-all under
+        // `/api/iceberg`, and a catch-all is only unambiguous while no
+        // other router claims a path under that prefix.
+        .merge(iceberg_door::router())
         .route(
             "/api/alerts",
             get(alerts::list)
@@ -1767,7 +1776,7 @@ mod route_policy_tests {
     use tower::ServiceExt;
 
     use crate::config::Config;
-    use crate::policy::{POLICY_TABLE, Policy};
+    use crate::policy::{ANY_METHOD, POLICY_TABLE, Policy};
     use crate::state::AppState;
 
     /// A router whose state can AUTHENTICATE, with nothing to connect to.
@@ -1842,8 +1851,17 @@ mod route_policy_tests {
     async fn every_policy_table_entry_is_mounted_and_gated_as_declared() {
         let mut failures = Vec::new();
         for (method, pattern, policy) in POLICY_TABLE {
+            // A `*` method entry (DATA-5's door, see `policy::ANY_METHOD`)
+            // is probed with a method the route does NOT serve, so the
+            // probe exercises the wildcard entry itself rather than the
+            // exact entry beside it.
+            let probe = if *method == ANY_METHOD {
+                "POST"
+            } else {
+                *method
+            };
             let path = concretize(pattern);
-            let resp = request(test_router(), method, &path).await;
+            let resp = request(test_router(), probe, &path).await;
             let status = resp.status();
             if status == StatusCode::NOT_FOUND {
                 failures.push(format!(
