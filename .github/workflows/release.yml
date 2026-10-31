@@ -57,13 +57,17 @@ jobs:
       # The throwaway registry: a service container of this job, so the
       # digests the pipeline records are real digests of a real registry.
       RELEASE_REGISTRY: localhost:5000
-      # The throwaway key: generated in this job, in this runner's
-      # temporary directory, and gone with the job. It is never the
-      # release key and it never leaves the runner.
-      COSIGN_KEY: cosign.key
+      # The signer reads the key from the environment, by this
+      # reference — the same reference the real job uses, so the dry
+      # run proves the real job's wiring.
+      COSIGN_KEY: env://COSIGN_PRIVATE_KEY
+      # The public key of the throwaway key: written by the step that
+      # generates it. The real job's public key is committed.
       COSIGN_PUBLIC_KEY: cosign.pub
-      # An empty password, so cosign neither prompts nor encrypts: the
-      # key is thrown away, so there is nothing to protect.
+      # An empty password, so cosign asks for nothing: it encrypts the
+      # throwaway key with that empty password — which the signing steps
+      # hand it again — and never prompts. The key is thrown away with
+      # the job, so there is nothing to protect.
       COSIGN_PASSWORD: ""
     services:
       registry:
@@ -221,10 +225,23 @@ jobs:
           set -euo pipefail
           cosign generate-key-pair
           cosign public-key --key cosign.key > cosign.pub
+          # The private key goes into the environment as the PEM it is,
+          # so the steps below sign with `env://COSIGN_PRIVATE_KEY` —
+          # the same path the real job takes with the release key
+          # (REL-2 S2 review BLOCKER 1). The key is generated here and
+          # thrown away with the job: it is never the release key and it
+          # never leaves the runner.
+          {
+            echo 'COSIGN_PRIVATE_KEY<<COSIGN_PRIVATE_KEY_EOF'
+            cat cosign.key
+            echo 'COSIGN_PRIVATE_KEY_EOF'
+          } >> "$GITHUB_ENV"
 
       # Sign each image (decision D3). The images are signed for the
       # operators who pull them by hand; the manifest is what
-      # `lakehousectl` verifies.
+      # `lakehousectl` verifies. The key is read from the environment
+      # (`env://COSIGN_PRIVATE_KEY`), the same way the real job reads
+      # the release key (REL-2 S2 review BLOCKER 1).
       - name: Sign each image
         run: |
           set -euo pipefail
@@ -395,14 +412,19 @@ jobs:
       packages: write
     env:
       RELEASE_REGISTRY: ghcr.io/rantai-dev
-      # The release key: a secret of the `release` environment. It is
-      # the base64 of the encrypted private key; `COSIGN_PASSWORD` is
-      # the password that opens it. Neither is readable by any other
-      # job, and neither is readable by a pull request.
+      # The signer reads the key from the environment, by this
+      # reference.
       COSIGN_KEY: env://COSIGN_PRIVATE_KEY
       # The public key, committed: the same one `lakehousectl` compiles
       # in, so a signature made here verifies on an air-gapped host.
       COSIGN_PUBLIC_KEY: ops/release/release.pub
+      # The release key: a secret of the `release` environment. It holds
+      # the private key PEM — the text `cosign generate-key-pair`
+      # writes — which `env://` reads as it is, NOT base64 of it.
+      # `COSIGN_PASSWORD` opens it if the key is encrypted. Neither
+      # secret is readable by any other job, and neither is readable by
+      # a pull request (REL-2 S2 review BLOCKER 1).
+      COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
       COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
     steps:
       - name: Checkout

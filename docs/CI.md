@@ -318,8 +318,12 @@ secret of that environment and of no other:
 
 | Secret | What it is |
 |---|---|
-| `COSIGN_PRIVATE_KEY` | the base64 of the encrypted cosign private key (ECDSA P-256) |
-| `COSIGN_PASSWORD` | the password that opens it |
+| `COSIGN_PRIVATE_KEY` | the cosign private key PEM (ECDSA P-256) |
+| `COSIGN_PASSWORD` | the password that opens it, if the key is encrypted |
+
+The secret holds the private key as the PEM text — what `cosign generate-key-pair`
+writes — and `env://` reads it as it is: not base64 of it, and not a path to a file
+(REL-2 S2 review BLOCKER 1).
 
 The public key is committed at `ops/release/release.pub`, and it is the one
 `lakehousectl` compiles in — so a signature made in this pipeline verifies on an air-gapped
