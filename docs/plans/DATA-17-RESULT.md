@@ -102,3 +102,33 @@ write in 32 MiB groups in one transaction; Parquet read without
 within these measurements: a 2 GiB load needs about 2.3 GiB more for the job
 than an idle one. Not measured, and so not claimed: two such loads at the same
 time.
+
+## Not yet measured, to run
+
+`DATA-33` (what several loads at once cost) and `DATA-34` (the formats and the
+files that the runs above did not cover) are measured with the same harness
+(`ops/g9/large_upload.py`), the same workflow (`g9-upload-large`) and the same
+16 GB GitHub-hosted runner, so that their figures are comparable with the ones
+above. Two runs are planned (decision D4 of
+`docs/superpowers/plans/2026-11-01-data-33-34-large-upload-measurements.md`):
+
+1. **A CSV of 2048 MiB, N loads at once.** The file goes through the chunked
+   transport N times and every load starts together, each into its own table:
+   `csv_mb=2048` with `jsonl_mb=0`, `parquet_mb=0` and `gzip_mb=0`, and
+   `concurrent` at 2, 4 and 16 (three runs). Read from each run: the growth of
+   the job's memory over the phase, every load's time and every load's result.
+2. **The formats and the file that the runs above did not cover.** One run with
+   `avro_mb=2048`, `zip_mb=2048` and `parquet_one_group_mb=2048` (the other
+   formats at 0). Read from it: the same figures for the Avro container, for
+   the zip of CSVs (the unpacked size is what the cap counts) and for the
+   Parquet file of one row group (the reader decodes a row group whole, so the
+   row group is what the job holds in memory).
+
+The caps stay as they are on `main` (the session cap and the unpacked cap are
+both 2 GiB). A run that needs a cap raised runs on a throwaway branch only,
+never merged, as the run of 2026-10-23 did: the limit of loads per user of
+`SEC-17` is four by default, so a run of 16 loads at once is above it, and the
+harness records a load the API refuses as a result of that load.
+
+**The numbers of these runs are not in this document yet.** The planner writes
+them here when the runs are done.
