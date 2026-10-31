@@ -67,6 +67,10 @@ so the set does not depend on what the stack happens to hold and does not
 leave anything behind. A run that could not finish is a failed case, not a
 crash, and a delete that fails is a problem of that case.
 
+A case that changes something the deletes cannot undo (a certification mark
+on an asset) names the call that undoes it in `cleanup`; those calls run
+after the deletes, on every exit of the run.
+
 Exit code 0 when the set passes, 1 when it fails, 2 when the run could not
 start (no stack, no login, a port already in use).
 
@@ -194,6 +198,15 @@ INDONESIAN_MARKERS = (
 )
 
 RAW_ERROR_PATTERNS = (r"DB::Exception", r"Code: \d+", r"\bstack trace\b", r"SQLSTATE")
+
+# The text a continuation is sent as: the steps the request still has, sent
+# back to the model once the draft is confirmed. The console sends the same
+# text, so the runner measures the product and not a variant of it.
+CONTINUATION_PREFIX = "Confirmed. Continue: "
+
+# How many continuation messages may follow one scripted turn. The console
+# has the same cap.
+MAX_CONTINUATIONS = 3
 
 MULTIPLIERS = {
     "million": 1e6,
@@ -689,6 +702,42 @@ def send_confirm(
     return body
 
 
+def confirm_pending(
+    cfg: Config,
+    session: requests.Session,
+    body: dict[str, Any],
+    mode: str,
+    confirms: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Confirm every draft of the body that waits for the person.
+
+    The confirms of this turn are returned as well as recorded: the request
+    only goes on when every one of them succeeded, which is what the console
+    does.
+    """
+    made: list[dict[str, Any]] = []
+    for step in body.get("toolTrace", []):
+        result = step.get("result") or {}
+        if isinstance(result, dict) and result.get("needs_confirmation"):
+            response = send_confirm(cfg, session, step, mode, body.get("sessionId"))
+            entry = {"tool": pending_of(step)["tool"], "result": response}
+            made.append(entry)
+            confirms.append(entry)
+    return made
+
+
+def confirm_succeeded(confirm: dict[str, Any]) -> bool:
+    """Whether a confirm came back `executed`, without an error."""
+    reply = confirm.get("result")
+    if not isinstance(reply, dict):
+        return False
+    return (
+        reply.get("_status") == 200
+        and reply.get("outcome") == "executed"
+        and "error" not in reply
+    )
+
+
 def confirm_problems(confirms: list[dict[str, Any]]) -> list[str]:
     """A confirm that did not come back `executed` with HTTP 200 is a problem of
     the case: HTTP 400 and up, an `error` in the reply, or any other `outcome`.
@@ -799,6 +848,34 @@ def run_cleanup(cfg: Config, session: requests.Session, created: list[dict[str, 
             continue
         if resp.status_code >= 400:
             problems.append(f"cleanup {obj['kind']} {obj['id']}: HTTP {resp.status_code}")
+    return problems
+
+
+def run_teardown(
+    cfg: Config,
+    session: requests.Session,
+    calls: list[dict[str, Any]],
+    names: dict[str, str],
+) -> list[str]:
+    """Undo what the case changed that deleting objects cannot undo: a mark it
+    put on an asset. Each call is made the way a setup call is, so a case
+    names it the same way; a call that fails is a problem of the run, not a
+    crash."""
+    problems: list[str] = []
+    for call in calls:
+        path = call.get("path", "?")
+        try:
+            resp = session.request(
+                call["method"],
+                f"{cfg.api_url}{fill_names(path, names)}",
+                json=fill_value(call.get("body"), names),
+                timeout=60,
+            )
+        except requests.RequestException as err:
+            problems.append(f"teardown {path}: {type(err).__name__}")
+            continue
+        if resp.status_code >= 400:
+            problems.append(f"teardown {path}: HTTP {resp.status_code}")
     return problems
 
 
@@ -943,13 +1020,29 @@ def run_case(cfg: Config, session: requests.Session, case: dict[str, Any]) -> di
             messages.append({"role": "user", "content": fill_names(turn, names)})
             body = ask(cfg, session, mode, messages, context=context)
             bodies.append(body)
-            if case.get("confirm"):
-                for step in body.get("toolTrace", []):
-                    result = step.get("result") or {}
-                    if isinstance(result, dict) and result.get("needs_confirmation"):
-                        response = send_confirm(cfg, session, step, mode, body.get("sessionId"))
-                        confirms.append({"tool": pending_of(step)["tool"], "result": response})
+            turn_confirms = (
+                confirm_pending(cfg, session, body, mode, confirms) if case.get("confirm") else []
+            )
             messages.append({"role": "assistant", "content": plain_text(body.get("answer", ""))})
+            # The request had steps left: the console sends them back once
+            # the draft is confirmed, and the runner measures the product,
+            # so it does the same, with the same cap.
+            continuations = 0
+            while continuations < MAX_CONTINUATIONS and body.get("nextStep"):
+                if not turn_confirms or not all(confirm_succeeded(c) for c in turn_confirms):
+                    break
+                messages.append(
+                    {"role": "user", "content": CONTINUATION_PREFIX + str(body["nextStep"])}
+                )
+                body = ask(cfg, session, mode, messages, context=context)
+                bodies.append(body)
+                turn_confirms = (
+                    confirm_pending(cfg, session, body, mode, confirms)
+                    if case.get("confirm")
+                    else []
+                )
+                messages.append({"role": "assistant", "content": plain_text(body.get("answer", ""))})
+                continuations += 1
         scored = score_case(cfg, session, case, bodies, names)
         scored["confirms"] = confirms
         scored["problems"].extend(confirm_problems(confirms))
@@ -980,6 +1073,7 @@ def run_case(cfg: Config, session: requests.Session, case: dict[str, Any]) -> di
         # result; a run that raised becomes a failed result with the same problems,
         # so a failed cleanup is never only on stderr.
         cleanup_problems = _cleanup(cfg, session, setup_created, bodies, confirms)
+        cleanup_problems.extend(run_teardown(cfg, session, case.get("cleanup", []), names))
         if scored is None:
             scored = _failed_run(case, _raised_run, cleanup_problems)
         else:
