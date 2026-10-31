@@ -244,6 +244,38 @@ class OracleSource(cdc_gate.Source):
             raise cdc_gate.G4Failure(f"the setup read did not end with checks: {str(answer)[:300]}")
         return checks
 
+    def _diagnose_setup_reads(self) -> None:
+        """When a setup check came back `unchecked`, run the orchestrator's dictionary statements as the
+        connector's own login from here and print each outcome (row count, or the Oracle error code), so
+        the CI log says which statement the login may not run. Diagnostic only: it asserts nothing."""
+        import oracledb
+
+        statements = {
+            "v$containers": "SELECT con_id, name FROM v$containers",
+            "cdb_log_groups": "SELECT con_id, owner, table_name FROM cdb_log_groups WHERE log_group_type = 'ALL COLUMN LOGGING'",
+            "cdb_tables": (
+                "SELECT t.con_id, t.owner, t.table_name FROM cdb_tables t JOIN cdb_users u ON u.con_id = t.con_id "
+                "AND u.username = t.owner WHERE u.oracle_maintained = 'N'"
+            ),
+        }
+        try:
+            conn = oracledb.connect(user=CDC_USER, password=self.password, dsn=f"{HOST}:{PORT}/{CDB}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[g4] diagnostic: could not sign in as {CDC_USER}: {str(exc)[:200]}", flush=True)
+            return
+        try:
+            for name, sql in statements.items():
+                try:
+                    cur = conn.cursor()
+                    cur.execute(sql)
+                    rows = cur.fetchall()
+                    mine = [r for r in rows if "G4SRC" in [str(c) for c in r]]
+                    print(f"[g4] diagnostic: {name}: {len(rows)} rows, {len(mine)} for G4SRC, first {rows[:2]}", flush=True)
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[g4] diagnostic: {name}: {str(exc)[:200]}", flush=True)
+        finally:
+            conn.close()
+
     def setup_checks_step(self, connector_id: str) -> None:
         """S11-e: the gate source's exact settings are `ok`; a second connector selecting the table
         without all-column logging and a mistyped name has exactly those two `missing`."""
@@ -254,6 +286,7 @@ class OracleSource(cdc_gate.Source):
             raise cdc_gate.G4Failure(f"the setup checks list {listed}, expected {expected}")
         not_ok = [c for c in good if c["status"] != "ok"]
         if not_ok:
+            self._diagnose_setup_reads()
             raise cdc_gate.G4Failure(f"the gate source should pass every setup check: {cdc_gate._describe(good)}")
         spec = {
             "adapter": "cdc", "ingestMode": "cdc", "dial": self.dial(),
