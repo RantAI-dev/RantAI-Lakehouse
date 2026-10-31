@@ -1915,6 +1915,17 @@ failed in 2 of about 10 local runs of the file (a `caplog` test: it reads the WA
 code and no change to it. It failed in no CI run I read (`Dagster · unit tests` is green in run `41235139798`) and the last three `CI` runs on `main`
 (`41234484650`, `41230399578`, `41227352293`) are green; whether it can fail on `main` was *not* tried locally. Not changed in this PR. Cause not found.
 
+**Amendment 12, S12-a result: `hybrid` ALSO fails the new-column step** (run `41238887534` on `fe6bef97`; the worker config shows `log.mining.strategy = hybrid`).
+Same log as `online_catalog`, same time: `Oracle LogMiner is unable to re-construct the SQL for 'UPDATE' event with SCN 2279949`, `DmlParserException: Failed to
+parse update DML: update "G4SRC"."ORDERS" set "NOTE" = 'schema_note' where "ID" = '2' ...`, `Caused by: DebeziumException: No column 'NOTE' found in table
+'FREEPDB1.G4SRC.ORDERS'`, `LogMiner session stopped due to an error`, `Producer failure`, `Task threw an uncaught and unrecoverable exception. Task is being killed
+and will not recover until manually restarted`. The connect log has no line about the `ALTER TABLE` itself (no DDL event was seen before the DML). Every other step of
+`g4-oracle` passed in that run: reload insert/current 43 s, insert/history 47 s, update/current 30 s, update/history 35 s, delete/current 22 s, delete/history 28 s;
+pause with 20,000 changes per table then resume equal after 40.1 s; restart of `kafka-connect` mid-stream equal after 26.7 s. Stopped and reported (S12-a), not tried:
+`redo_log_catalog` (owner's sign-off). Every other job of that run is green: cargo test 8,855 passed / 0 failed / 51 ignored, Dagster unit 2,196 passed (1 skipped),
+Dagster loader 306 passed, frontend 3,100 pass / 0 fail (316 files), clippy, fmt, MSRV, build, image smoke, Repo lints (29 tests), G1, G2, G3, G3a, G4 (PostgreSQL, MySQL,
+SQL Server, MongoDB), G6 (three), G8 (two), G9, G10, Gold export, SRC-3 A and B, SRC-11, SRC-12 (three), SRC-13, SRC-17. `ci-required` fails only because `g4-oracle` does.
+
 **Commands run locally (rule 7).**
 
 - `cargo fmt --check` (rust/): clean on the final tree.
