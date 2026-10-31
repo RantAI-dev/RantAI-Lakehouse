@@ -618,7 +618,7 @@ def topic_config_value(answer: dict, topic: str, key: str) -> str | None:
     return None if entry is None else entry.get("value")
 
 
-# What Debezium 3.8 really sets (seen in CI, run 40997876457): `KafkaSchemaHistory` creates the topic
+# What Debezium 3.7.0 really sets (seen in CI, run 40997876457): `KafkaSchemaHistory` creates the topic
 # with `retention.ms` = Java's `Long.MAX_VALUE`, not -1. It is Debezium's own spelling of "keep
 # forever" (about 292 million years); only a value that expires is a failure. The broker default,
 # 7 days = 604800000 ms, is what the topic would inherit if Debezium had not set it.

@@ -1810,7 +1810,9 @@ never run. Every Rust, Python-gate and compose claim below is *not verified* bey
 - `cfb7c559` T6.4: the console.
 - `8dfd715d` T6.6: docs and `ORACLE_CDC_LOGMINER_ENABLED` removed.
 
-**Blocker for CI (needs the planner).** `origin/main` has moved and conflicts with this branch in two places:
+**Migration renumber (decided 2026-10-31, done).** Main took `0117` (DATA-5), so this branch's four migrations moved: `0117_connector_type_cdc_supported` to `0121`, `0118_connector_capture_lag` to `0122`, `0119_connector_type_mongodb_cdc` to `0123`, `0120_connector_type_oracle_cdc` to `0124` (`git mv`, content unchanged; free on every remote branch when committed). **A database that ran this branch before the renumber must delete its `_sqlx_migrations` rows for versions 117-120 that came from this branch before migrating;** all four statements are idempotent (`IF NOT EXISTS`, `ON CONFLICT`, targeted `UPDATE`), so they run again under the new numbers and change nothing. The older entries of this plan keep the old numbers (they record what was true then). Main was merged in one hunk of `docker-compose.yml`, as described next.
+
+**Blocker for CI (resolved by the above; kept as written).** `origin/main` has moved and conflicts with this branch in two places:
 (1) `docker-compose.yml`, one hunk (the principals loop of `lakekeeper-warehouse-init`: ours drops `debezium`, main adds
 `outside-readers`); I resolved it in a trial merge as `rust-iceberg dlt clickhouse-reader trino gold-export
 lakehouse-api-reader outside-readers unauthorized-test` and aborted the trial; (2) **a duplicate migration number**: main's

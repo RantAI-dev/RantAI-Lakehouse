@@ -11,7 +11,7 @@ gate's override (`MSSQL_AGENT_ENABLED`: CDC's capture job runs in the Agent; wit
 captured). A database `g4_cdc` of its own, CDC enabled on it (`sys.sp_cdc_enable_db`) and on each
 of the two identical tables (`sys.sp_cdc_enable_table`) by `sa`, an administrator, as the
 documentation says. The connector dials as a LEAST-PRIVILEGE login, not `sa` (decision S3-e):
-`SELECT` on the two tables and on the `cdc` schema, plus `VIEW DATABASE STATE`. If Debezium 3.8
+`SELECT` on the two tables and on the `cdc` schema, plus `VIEW DATABASE STATE`. If Debezium 3.7.0
 turns out to need more, the gate fails and the plan says: stop and report what and why.
 
 # A schema change needs a second capture instance
