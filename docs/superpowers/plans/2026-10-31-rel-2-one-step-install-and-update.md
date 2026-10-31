@@ -925,3 +925,97 @@ and the release policy (`docs/core/reference/release-policy.md`) is where the an
   S3 exists.
 
 **Open: D3a to implement.**
+
+### D3a (developer, 2026-11-01)
+
+**Commit** `6bdc7e4d`, branch `feat/rel-2-s2-release-pipeline`, base `6f0d2596`: the manifest's
+signature is a Sigstore bundle, and nothing is uploaded to the transparency log.
+
+**What changed, and where:**
+
+- `.github/workflows/release.yml`: `release.json.sig` becomes `release.json.sigstore.json`
+  everywhere (the signing step, the bundle step, the dry run's artifact list, the release
+  assets, `SHA256SUMS`); the manifest is signed with `cosign sign-blob --bundle` and verified
+  with `cosign verify-blob --bundle --offline --insecure-ignore-tlog`; every cosign command
+  that signs — the images, the SBOM attestations, the manifest, in BOTH jobs — carries
+  `--use-signing-config=false --tlog-upload=false`; the bundle script is given
+  `--sigstore-bundle release.json.sigstore.json`.
+- `ops/release/make_bundle.sh`: the option `--signature` is `--sigstore-bundle`, the file it
+  carries into the bundle is `release.json.sigstore.json`, and `SHA256SUMS` names it.
+- `ops/release/test_sigstore_bundle.py` (new) and `ops/release/fixtures/sigstore/` (new): the
+  S3 verification recipe, proved now.
+- `ops/release/test_release_workflow.py`: the pipeline's new properties are checked on every
+  commit (the bundle, the offline verification, the no-tlog flags, the bundle script's
+  argument).
+- `ops/release/test_make_bundle.py`: the new option and file name.
+- `.github/workflows/ci.yml` and both jobs of `release.yml`: `cryptography==50.0.2` is pinned
+  where the release tooling's tests are installed — the same pin `dagster/pyproject.toml`
+  already uses.
+- `docs/CI.md`, `CHANGELOG.md`, this plan's D5 and D11 and its S2-T4 outline: the new file
+  name, and the no-Rekor property with its operator consequence.
+
+**The mechanism, and that v3 CAN sign a blob with no tlog upload** (measured with cosign
+**v3.0.6**, the version the pinned `sigstore/cosign-installer` provides, a throwaway key with
+an empty password, and a CONNECT proxy that logs every host it is asked for):
+
+- The default v3 `cosign sign-blob` posts to `https://rekor.sigstore.dev/api/v1/log/entries`
+  and to `https://timestamp.sigstore.dev/api/v1/timestamp` — both seen in the proxy log, the
+  Rekor post refused with "Forbidden". So v3's default DOES publish to the public log, which
+  is what D3a forbids.
+- `--tlog-upload=false` alone is REFUSED by v3: "--tlog-upload=false is not supported with
+  --signing-config or --use-signing-config". The flag needs `--use-signing-config=false`
+  beside it, and then it works: the same command makes NO connection at all (the proxy log is
+  empty), and the bundle it writes carries the signature, the digest and the key's hint — and
+  no tlog entry.
+- `cosign sign` and `cosign attest` with the two flags: no connection either; and
+  `cosign verify --key … --insecure-ignore-tlog` then verifies the signature and the
+  attestation against the key.
+- `cosign verify-blob --bundle … --offline --insecure-ignore-tlog` inside a network namespace
+  with no route at all: "Verified OK" — the verification needs no network.
+- The alternative v3 mechanism (a `--signing-config` file with no transparency-log service)
+  also works and was tried, but it needs the signing config to name a TSA-free, log-free
+  service list; the two flags are shorter and need no extra file in the repository.
+
+**Commands, with their results** (all in the foreground, on the final commit):
+
+| Command | Result |
+| --- | --- |
+| `pytest ops/release -q` | **74 passed** |
+| `python3 -m unittest discover -s ops/release -p 'test_*.py'` | **74 tests, OK** |
+| `actionlint .github/workflows/release.yml` | clean, exit 0 |
+| `actionlint .github/workflows/ci.yml` | clean, exit 0 |
+| `bash -n ops/release/make_bundle.sh` | clean, exit 0 |
+| `shellcheck ops/release/make_bundle.sh` (0.10.0) | clean, exit 0 |
+| `python3 ops/lint/check_intra_package_imports.py` | OK |
+| `python3 ops/lint/check_bare_iceberg_count.py` | no violation |
+
+**The bundle, end to end**, over a manifest written by
+`ops/release/make_manifest.py` and signed by cosign v3 with a throwaway key:
+
+- `ops/release/make_bundle.sh` wrote the bundle; it holds `docker-compose.yml`,
+  `release.json`, `release.json.sigstore.json`, `images/…tar`, `sbom/…cdx.json` and
+  `SHA256SUMS`; `sha256sum -c SHA256SUMS` says **OK for all five files**.
+- `cosign verify-blob --key <throwaway> --bundle
+  release.json.sigstore.json --offline --insecure-ignore-tlog release.json` → "Verified OK",
+  on the file as it came out of the bundle.
+
+**The S3 recipe, proved now** (`ops/release/test_sigstore_bundle.py`): the bundle's
+`messageSignature.signature` (base64 DER, ECDSA P-256 over the SHA-256 of the manifest)
+verifies against the matching public key with `cryptography`; `messageSignature.messageDigest`
+is the SHA-256 of the manifest beside it; a tampered manifest is refused; and the bundle
+carries no transparency-log entry. The fixture is a bundle made with a throwaway key; its
+private half is not in the repository.
+
+**Not verified, with the reason:**
+
+- **The pipeline's own dry run is not verified.** It needs a GitHub runner: the four images,
+  the throwaway registry, cosign, `syft` and the bundle are all CI-side. The PR's dry run is
+  the proof, and its summary is where the bundle's size appears.
+- **The real release is not verified, and cannot be.** It needs a `v*` tag, the owner's
+  approval on the `release` environment, and the release key. REL-2 S5 does that.
+- **The release key's own signature is not verified.** The commands were proved with a
+  throwaway key; the release key is the same kind of key (ECDSA P-256) in the same
+  `env://COSIGN_PRIVATE_KEY` form the real job uses, but the real key never left the
+  `release` environment.
+- No cargo command and no Dagster command ran: this round changes no Rust, no code location
+  and no Compose file.
