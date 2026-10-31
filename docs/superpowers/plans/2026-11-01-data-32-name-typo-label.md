@@ -72,3 +72,19 @@ Not verified:
 - The test run started no container. A leftover testcontainers Postgres (`elated_ramanujan`, three hours old, no test running) was removed afterwards.
 
 ## Review (planner appends below)
+
+### Review round 1 (planner, 2026-11-01)
+
+- **D1.** A name-only approximate hit now emits `{field:"name", value:"", approximate:true}`
+  through a `Reason::NameTypo` fallback. A field reason still wins, and an exact name match still
+  emits nothing; the kept tests are untouched, and a new test pins it.
+- **The `Reason` enum** in place of a bare `Option<Hit>` is accepted. Clippy's `type_complexity`
+  forced it, and the behaviour is D1's.
+- **D2.** The console label and the contract comment are updated.
+- **D3.** The feature page's row 5 records the fix as not yet re-run. That is honest (principle 2).
+- **The developer's counts:**
+  - `catalog_search`: 32 pass;
+  - console: 1443 pass, 1 skip;
+  - fmt, clippy and typecheck are clean.
+
+**Open: no BLOCKER, no SHOULD-FIX.**
