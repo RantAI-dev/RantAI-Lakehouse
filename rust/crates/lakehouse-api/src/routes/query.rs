@@ -1021,7 +1021,7 @@ async fn execute_query_against_engine(
                 let mut out = Map::new();
                 for c in &columns {
                     let v = row.get(c);
-                    out.insert(c.clone(), Value::String(stringify_cell(v)));
+                    out.insert(c.clone(), cell_value(v));
                 }
                 Value::Object(out)
             })
@@ -1525,15 +1525,24 @@ fn query_run_audit_event(principal: &Principal, query_id: &str, sql: &str) -> Ne
     }
 }
 
-/// Coerce one cell to the string-everything shape both `run_result_json`
-/// row shapes use, matching the `TypeScript`'s implicit stringification.
-fn stringify_cell(v: Option<&Value>) -> String {
+/// One cell of a result row, in the shape the run result carries it.
+///
+/// `DATA-29`: a `NULL` cell is JSON `null`, not an empty string — a
+/// missing value and an empty text are told apart, which is what the
+/// console's `QueryCell` contract (`string | number | boolean | null`)
+/// already expects. Every other value keeps the text it had before this
+/// change (decision D1), so a non-null cell does not change.
+///
+/// A cell the engine left out entirely is a `NULL` as well (`None` and
+/// `Some(Value::Null)` answer the same): the engine said nothing, so
+/// there is no value to report.
+fn cell_value(v: Option<&Value>) -> Value {
     match v {
-        None | Some(Value::Null) => String::new(),
-        Some(Value::String(s)) => s.clone(),
-        Some(Value::Bool(b)) => b.to_string(),
-        Some(Value::Number(n)) => n.to_string(),
-        Some(other) => other.to_string(),
+        None | Some(Value::Null) => Value::Null,
+        Some(Value::String(s)) => Value::String(s.clone()),
+        Some(Value::Bool(b)) => Value::String(b.to_string()),
+        Some(Value::Number(n)) => Value::String(n.to_string()),
+        Some(other) => Value::String(other.to_string()),
     }
 }
 
@@ -1548,7 +1557,7 @@ fn trino_result_to_rows(result: &TrinoResult) -> (Vec<String>, Vec<Value>) {
         .map(|row| {
             let mut out = Map::new();
             for (i, c) in columns.iter().enumerate() {
-                out.insert(c.clone(), Value::String(stringify_cell(row.get(i))));
+                out.insert(c.clone(), cell_value(row.get(i)));
             }
             Value::Object(out)
         })
@@ -1589,6 +1598,12 @@ fn map_trino_error(err: TrinoError) -> ApiError {
 /// The byte cost of one cell: the length of its text — a JSON string's own
 /// bytes without the quotes, any other value's compact JSON text — plus one
 /// byte for the separator (`QS-2`).
+///
+/// `DATA-29` (decision D2): a `null` cell is charged its compact JSON text
+/// (`null`, four bytes) and the separator, so five bytes a cell. The rule
+/// already said that; what this change changed is that a `NULL` cell is
+/// sent as `null` and no longer as the empty string, so the cap now counts
+/// the bytes the answer really carries.
 fn cell_byte_cost(cell: &Value) -> usize {
     let text = match cell {
         Value::String(text) => text.len(),
@@ -3352,6 +3367,31 @@ mod tests {
         assert_eq!(v["metrics"]["engine"], json!("hot-store"));
     }
 
+    // ── `DATA-29`: a NULL cell is `null`, not an empty string ───────────
+
+    #[test]
+    fn a_null_cell_is_null_and_every_other_cell_keeps_its_text() {
+        // The two halves of the rule: a cell the engine left out and a cell
+        // it reported as NULL are both `null`, and a cell with a value
+        // keeps the text it had before this change (decision D1).
+        assert_eq!(cell_value(None), Value::Null);
+        assert_eq!(cell_value(Some(&Value::Null)), Value::Null);
+        assert_eq!(cell_value(Some(&json!(""))), json!(""));
+        assert_eq!(cell_value(Some(&json!("abc"))), json!("abc"));
+        assert_eq!(cell_value(Some(&json!(5))), json!("5"));
+        assert_eq!(cell_value(Some(&json!(true))), json!("true"));
+        // A value the engines never send (an object, an array) keeps the
+        // compact JSON text it had before as well.
+        assert_eq!(cell_value(Some(&json!({"a": 1}))), json!(r#"{"a":1}"#));
+    }
+
+    #[test]
+    fn a_null_cell_and_an_empty_cell_are_told_apart() {
+        // The point of the change: a missing value and an empty text are
+        // two different answers, not one empty string.
+        assert_ne!(cell_value(Some(&Value::Null)), cell_value(Some(&json!(""))));
+    }
+
     // ── The server-side byte cap (`QS-2`) ────────────────────────────────
 
     #[test]
@@ -3361,13 +3401,28 @@ mod tests {
         // Any other value's compact JSON text.
         assert_eq!(cell_byte_cost(&json!(5)), 2);
         assert_eq!(cell_byte_cost(&json!(true)), 5);
+        // A null cell costs its compact JSON text (`null`, four bytes) and
+        // the separator (`DATA-29`, decision D2): the rule already said
+        // that, and a NULL cell is now sent as `null` and not as the empty
+        // string, so the cap counts the bytes the answer carries.
         assert_eq!(cell_byte_cost(&json!(null)), 5);
+    }
+
+    #[test]
+    fn a_null_cell_costs_more_than_an_empty_one() {
+        // The empty string is one byte (its own text plus the separator);
+        // a null cell is five. A result of null cells is therefore bigger
+        // than the same result of empty strings — as it is on the wire.
+        assert_eq!(cell_byte_cost(&json!(null)), 5);
+        assert_eq!(cell_byte_cost(&json!("")), 1);
     }
 
     #[test]
     fn a_row_costs_the_sum_of_its_cells() {
         assert_eq!(row_byte_cost(&json!({"a": "xx", "b": "yyy"})), 3 + 4);
         assert_eq!(row_byte_cost(&json!(["xx", "yyy"])), 3 + 4);
+        // A row with a null cell costs the null's five bytes (`DATA-29`).
+        assert_eq!(row_byte_cost(&json!({"a": null})), 5);
     }
 
     #[test]
@@ -3894,6 +3949,43 @@ mod tests {
 
             assert_eq!(value["engine"], json!("trino"));
             assert_eq!(value["rows"], json!([{"n": "1"}]));
+        }
+
+        /// `DATA-29`: the Trino branch answers a `NULL` cell as JSON `null`
+        /// and an empty text as `""`, so the two are told apart in the very
+        /// same row — the answer says "no value" and "an empty value", not
+        /// two empty values.
+        #[tokio::test]
+        async fn a_null_cell_is_null_and_an_empty_cell_is_an_empty_string() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/statement"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "id": "q1",
+                    "columns": [
+                        {"name": "maybe", "type": "varchar"},
+                        {"name": "text", "type": "varchar"},
+                    ],
+                    "data": [[null, ""]],
+                })))
+                .mount(&server)
+                .await;
+
+            let state = test_state_with_trino(&server.uri());
+            let ApiJson(value) = run(
+                State(state),
+                Some(principal_with_display_name("alice")),
+                HeaderMap::new(),
+                trino_body("SELECT 1"),
+            )
+            .await
+            .expect("ok");
+
+            assert_eq!(
+                value["rows"],
+                json!([{"maybe": null, "text": ""}]),
+                "a NULL cell must be null and an empty cell must stay an empty string"
+            );
         }
 
         #[tokio::test]
