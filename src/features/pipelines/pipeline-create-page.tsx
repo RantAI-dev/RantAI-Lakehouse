@@ -138,7 +138,19 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
   )
   const [pendingVerb, setPendingVerb] = React.useState<TransformDraft["verb"]>("dedupe")
   const [pendingDraft, setPendingDraft] = React.useState<TransformDraft>(emptyDraftFor("dedupe"))
-  const [fbicEnabled, setFbicEnabled] = React.useState(def?.fbicEnabled ?? false)
+  // BLD-10 D1: FBIC does nothing in this version -- the job logs
+  // `FBIC_UNSUPPORTED_REASON` and writes its output anyway
+  // (`dagster/dispar_orchestrate/authored_factory.py`). So nothing here
+  // can change it: a new pipeline sends it off, and an edit sends the
+  // stored value back unchanged.
+  const fbicEnabled = def?.fbicEnabled ?? false
+  // BLD-10 D2: a plain copy -- no transform at all -- is legitimate, but it
+  // has to be chosen and not fall out of adding a transform. A stored
+  // pipeline with no transforms IS a plain copy, so its switch starts on;
+  // a new one starts off.
+  const [plainCopy, setPlainCopy] = React.useState(
+    () => Boolean(existing) && (def?.transforms.length ?? 0) === 0
+  )
   const [targetZone, setTargetZone] = React.useState(def?.targetZone ?? "silver")
   const [targetTable, setTargetTable] = React.useState(def?.targetTable ?? "")
   // A cron by default: the free-text default used to be "Every hour",
@@ -290,7 +302,9 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
         name.trim() && sourceZoneShown.trim() && sourceTableShown.trim() && incrementalColumn.trim()
       )
     }
-    if (step === 1) return transformDrafts.length > 0 || fbicEnabled
+    // BLD-10 D1 + D2: a transform, or a plain copy chosen on purpose.
+    // FBIC no longer counts -- it does nothing in this version.
+    if (step === 1) return transformDrafts.length > 0 || plainCopy
     if (step === 2) return Boolean(targetZone.trim() && targetTable.trim())
     if (step === 3) return Boolean(schedule.trim()) && isSchedulable(schedule)
     return true
@@ -301,7 +315,7 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
     sourceTableShown,
     incrementalColumn,
     transformDrafts,
-    fbicEnabled,
+    plainCopy,
     targetZone,
     targetTable,
     schedule,
@@ -311,6 +325,9 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
     if (!draftIsComplete(pendingDraft)) return
     setTransformDrafts((prev) => [...prev, pendingDraft])
     setPendingDraft(emptyDraftFor(pendingVerb))
+    // BLD-10 D2: adding a transform switches the plain copy off, so a
+    // pipeline that has a transform is never also a plain copy.
+    setPlainCopy(false)
   }
 
   function removeTransformDraft(index: number) {
@@ -758,14 +775,37 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
                 </Button>
               </div>
             </div>
+            {/* BLD-10 D1: FBIC does nothing in this version -- the job
+                logs `FBIC_UNSUPPORTED_REASON` and writes its output anyway
+                (`dagster/dispar_orchestrate/authored_factory.py`). The row
+                stays visible, but it says so and the switch is disabled:
+                offering it as working would promise a run that never comes. */}
             <div className="flex items-center justify-between rounded-lg border border-border px-3 py-2">
               <div>
                 <p className="text-sm font-medium">FBIC enrichment</p>
                 <p className="text-xs text-muted-foreground">
-                  Enable feature-based incremental compute.
+                  Not available yet: nothing runs it in this version.
                 </p>
               </div>
-              <Switch checked={fbicEnabled} onCheckedChange={setFbicEnabled} />
+              <Switch checked={fbicEnabled} disabled aria-label="FBIC enrichment" />
+            </div>
+            {/* BLD-10 D2: copying the source as is is legitimate (Bronze to
+                Silver with no change), but it must be a choice and not a
+                side effect of adding no transform. The switch is off and
+                disabled while a transform is in the list. */}
+            <div className="flex items-center justify-between rounded-lg border border-border px-3 py-2">
+              <div>
+                <p className="text-sm font-medium">Copy the source as is</p>
+                <p className="text-xs text-muted-foreground">
+                  No transform: each run copies the source table unchanged.
+                </p>
+              </div>
+              <Switch
+                checked={plainCopy}
+                onCheckedChange={setPlainCopy}
+                disabled={transformDrafts.length > 0}
+                aria-label="Copy the source as is"
+              />
             </div>
           </div>
         ) : null}
@@ -828,9 +868,12 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
                     label: "Transforms",
                     value: transformDrafts.length
                       ? transformDrafts.map(renderTransformDraft).join(", ")
-                      : "—",
+                      // BLD-10 D2: an empty transform list is a plain copy,
+                      // and the review says so instead of showing a dash.
+                      : "None: a plain copy of the source",
                   },
-                  { label: "FBIC", value: fbicEnabled ? "Enabled" : "Off" },
+                  // BLD-10 D1: FBIC is not available in this version.
+                  { label: "FBIC", value: "Not available" },
                 ],
               },
               {

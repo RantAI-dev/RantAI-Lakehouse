@@ -75,6 +75,15 @@ that changes who can read the data.
 - Automatic publishing needs the operator to set the export run token.
   Without it, only "Publish now" works.
 
+## How an outside tool reads a published table
+
+The console's own API is the door: an outside tool reads a published table
+through `<console>/api/iceberg` with a service identity's key, and the
+console counts who read what. The operator steps — publishing the storage
+address, creating the identity, the `pyiceberg` and DuckDB examples — are
+in [`docs/OPERATIONS.md`](../../OPERATIONS.md), "Outside tools read
+published tables (DATA-5, ADR 0016)".
+
 ## Acceptance checklist
 
 Screen labels are as specified in the plan. If the built screen differs,

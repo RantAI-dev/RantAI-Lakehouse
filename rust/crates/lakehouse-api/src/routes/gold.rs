@@ -95,6 +95,10 @@ impl From<GoldExportError> for ApiError {
             // own fixed, non-leaking text (`export_batch_sql` never wraps
             // the raw Postgres/sqlparser error), matching AGENTS.md rule 4.
             | GoldExportError::PolicyRefused(_) => Self::Unprocessable(err.to_string()),
+            // SEC-50: the tenant gate's own error travels as it is, so
+            // the caller sees the status the gate would have answered
+            // (its fixed sentence, never an upstream text).
+            GoldExportError::TenantGateRefused(gate) => gate,
             // SEC-11: the Iceberg writer's text (catalog URLs, object keys)
             // goes to the log under a reference, not into the body.
             GoldExportError::Iceberg(e) => {
@@ -260,6 +264,71 @@ pub(crate) async fn read_catalog_token(path: &str) -> Result<SecretValue, ApiErr
     .await
 }
 
+/// `SEC-50` R4: whose reach the Gold export is measured against.
+///
+/// A signed-in PERSON reads the shared catalog as themselves: their own
+/// tenant must own it, exactly as in Query Studio. A service identity and
+/// the shared run token are jobs with no user, and they act as the tenant
+/// that owns the shared catalog (`SEC-50` D3).
+///
+/// One place, so the route and the copilot's tool pick the same actor
+/// (`AGENTS.md` rule 4).
+pub(crate) fn gold_export_gate_actor<'a>(
+    principal: Option<&'a Principal>,
+    headers: &'a HeaderMap,
+) -> crate::routes::query::GateActor<'a> {
+    match principal {
+        // A job with no user: the scheduled export, the run token.
+        None => crate::routes::query::GateActor::CatalogTenant,
+        // A service identity: a job with no user either.
+        Some(principal) if matches!(principal.id, PrincipalId::Service(_)) => {
+            crate::routes::query::GateActor::CatalogTenant
+        }
+        // A signed-in person: their own tenant, the `X-Tenant` header
+        // narrowing it exactly as it does everywhere else.
+        Some(principal) => crate::routes::query::GateActor::Caller { principal, headers },
+    }
+}
+
+/// `SEC-50`: the name the export reads the mart under, and the tenant
+/// gate on it.
+///
+/// The export reads the SHARED catalog, so the gate asks whose reach
+/// covers it: a signed-in person's own tenant, or the catalog's own
+/// tenant for a job with no user (`SEC-50` R4, D3). A deployment that
+/// holds several tenants and names no catalog tenant has no tenant whose
+/// reach covers the shared catalog, and the export is refused — before the
+/// fingerprint, which is the export's first read.
+///
+/// `export_mart` asks the same gate for the rows it reads, so a caller
+/// that reaches the export through another path (the copilot's tool) is
+/// gated there too.
+///
+/// # Errors
+///
+/// The gate's own errors: 422 with the fixed sentence of
+/// [`crate::routes::query::JOB_NEEDS_CATALOG_TENANT`] for a deployment
+/// with several tenants and no catalog tenant; 404 with the gate's table
+/// sentence for a person whose tenant does not own the shared catalog; 503
+/// with the shared catalog's own sentence for a deployment that cannot say
+/// how many tenants it holds (`SEC-50` R5, amended: a job with no user in
+/// a deployment with no database to count in).
+async fn gated_source_table(
+    state: &AppState,
+    mart: &str,
+    actor: crate::routes::query::GateActor<'_>,
+) -> Result<String, ApiError> {
+    let source_table = format!("{}.`{}`", state.config.gold_source_schema, mart);
+    crate::routes::query::gate_statement(
+        state,
+        &gold_export::mart_count_sql(&source_table),
+        &sqlparser::dialect::ClickHouseDialect {},
+        actor,
+    )
+    .await?;
+    Ok(source_table)
+}
+
 /// `POST /api/gold/export/{mart}` — run the export.
 ///
 /// # Skip: `?ifChanged=true` (DATA-1 task 4, DATA-10)
@@ -293,10 +362,14 @@ pub(crate) async fn read_catalog_token(path: &str) -> Result<SecretValue, ApiErr
 /// # Errors
 ///
 /// Returns 401/503 from [`check_export_token`], `409` if an export of the
-/// SAME mart is already in flight, 503 if the Lakekeeper token cannot be
-/// read, 422 for an unsupported source column, a source mart over
-/// `GOLD_EXPORT_MAX_ROWS`, or a bad `ClickHouse` query, or 500 for an
-/// Iceberg catalog/write failure.
+/// SAME mart is already in flight, 422 with the tenant gate's fixed
+/// sentence when the deployment holds several tenants and names no
+/// catalog tenant (`SEC-50`), 404 with the gate's own table sentence for
+/// a signed-in person whose tenant does not own the shared catalog
+/// (`SEC-50`; PR #281 review round 2 NIT), 503 if the Lakekeeper token
+/// cannot be read, 422 for an unsupported source column, a source mart
+/// over `GOLD_EXPORT_MAX_ROWS`, or a bad `ClickHouse` query, or 500 for
+/// an Iceberg catalog/write failure.
 pub async fn export(
     State(state): State<AppState>,
     Path(mart): Path<String>,
@@ -314,6 +387,16 @@ pub async fn export(
 
     let mart_ident =
         Ident::new(&mart).map_err(|e| ApiError::BadRequest(format!("invalid mart: {e}")))?;
+
+    // SEC-50: the export reads the SHARED catalog, so the gate asks
+    // whose reach covers it — a signed-in person's own tenant, or the
+    // catalog's own tenant for a job with no user (R4, D3). The gate runs
+    // BEFORE the first read of the mart — the fingerprint below is that
+    // read — so a deployment that holds several tenants and names no
+    // catalog tenant refuses the export before anything reaches
+    // `ClickHouse`.
+    let actor = gold_export_gate_actor(principal.as_ref().map(|Extension(p)| p), &headers);
+    let source_table = gated_source_table(&state, mart_ident.as_str(), actor).await?;
 
     // DATA-10 review SHOULD-FIX 1 / DATA-10 D2: The fingerprint is computed before
     // the export reads rows, and written on the history row of that export.
@@ -356,12 +439,6 @@ pub async fn export(
             ))
         })?;
 
-    let source_table = format!(
-        "{}.`{}`",
-        state.config.gold_source_schema,
-        mart_ident.as_str()
-    );
-
     let token = read_catalog_token(&state.config.lakekeeper_gold_export_token_file).await?;
     let iceberg_config = gold_export::iceberg_config(
         state.config.lakekeeper_catalog_uri.clone(),
@@ -396,6 +473,8 @@ pub async fn export(
 
     let started_at = time::OffsetDateTime::now_utc();
     let export_result = gold_export::export_mart(
+        &state,
+        actor,
         &state.clickhouse,
         &iceberg_config,
         &source_table,
@@ -590,41 +669,80 @@ pub async fn exports(
     ))
 }
 
-/// `GET /api/gold/export/{mart}/consumers` — WS6 ships this as an honest
-/// stub. Correlating a Gold mart's exported Iceberg table against
-/// `Trino`'s `system.runtime.queries` needs code that runs a query
-/// through a `Trino` client and matches its result against the mart's
-/// table name — **no such code exists in this build**. This is NOT
-/// because the `lakehouse-trino` crate is unavailable: it already exists
-/// on this branch and `AppState::trino` already wires a live
-/// [`lakehouse_trino::TrinoClient`] for `routes::query::run`'s
-/// `engine: "trino"` path. `lakehouse-trino`'s own crate doc comment
-/// says its surface was kept deliberately small "so a future 'consumers'
-/// route can depend on it" — this route is that future route, not yet
-/// written; the crate being present is exactly what makes writing it a
-/// small follow-up rather than a new dependency. Until that correlation
-/// logic exists, this route unconditionally reports `supported: false`
-/// rather than guessing — never a silently-empty list, which would read
-/// as "this mart has zero consumers" (a different, false claim).
+/// `GET /api/gold/export/{mart}/consumers` — who read this mart's
+/// published table, and how often (DATA-5, ADR 0016, plan D7).
+///
+/// The count is the API's own: every table load through the door
+/// (`routes::iceberg_door`) is counted, and this route reads those
+/// counts back. It answers:
+///
+/// - when outside reading is set up on this deployment:
+///   `{ mart, supported: true, windowDays: 7, consumers: [{ identityId,
+///   name, reads, lastReadAt }] }`, with the reads summed over the last
+///   seven calendar days and the list ordered by reads descending;
+/// - when it is not: `{ mart, supported: false, consumers: null, reason:
+///   <the door's own reason> }` — the SAME sentence the door's own 503
+///   carries, so the console says exactly what a tool would be told.
+///   Never a count of zero: "not measured" and "measured, and nobody
+///   read it" are different answers (principle 2).
+///
+/// The mart is looked up under the name the EXPORT gave its table in the
+/// `gold` namespace (`lakehouse_iceberg::gold::sanitize_mart_name`), so
+/// the count is found under exactly that name.
 ///
 /// # Errors
 ///
-/// Returns 400 if `mart` is not a valid identifier; otherwise always
-/// `200` with `supported: false` — this route never calls `Trino`, so it
-/// never fails on the `Trino` side.
-pub async fn consumers(Path(mart): Path<String>) -> ApiResult<ApiJson<Value>> {
+/// Returns 400 if `mart` is not a valid identifier; 503 when this
+/// deployment has no Postgres pool; 500 when the count cannot be read.
+pub async fn consumers(
+    State(state): State<AppState>,
+    Path(mart): Path<String>,
+) -> ApiResult<ApiJson<Value>> {
     let mart_ident =
         Ident::new(&mart).map_err(|e| ApiError::BadRequest(format!("invalid mart: {e}")))?;
+    let mart_name = mart_ident.as_str();
+
+    // The door's own readiness decides whether the count is measured at
+    // all (D4, D7). Its refusal text is the door's own, so the console
+    // and a tool are told the same thing.
+    if let Err(problem) = crate::routes::iceberg_door::setup(&state).await {
+        return Ok(ApiJson(json!({
+            "mart": mart_name,
+            "supported": false,
+            "consumers": Value::Null,
+            "reason": problem.reason(),
+        })));
+    }
+
+    // The published table's name in the `gold` namespace — the export
+    // names it this way (`gold::sanitize_mart_name`), so the count is
+    // looked up under exactly that name.
+    let table = lakehouse_iceberg::gold::sanitize_mart_name(mart_name)
+        .map_err(|e| ApiError::BadRequest(format!("invalid mart: {e}")))?;
+
+    let pool = pool(&state)?;
+    // Seven calendar days, today included: the window the page shows.
+    let since = time::OffsetDateTime::now_utc().date() - time::Duration::days(WINDOW_DAYS - 1);
+    let consumers = lakehouse_store::outside_reads::outside_readers_of(
+        pool,
+        crate::routes::iceberg_door::GOLD_NAMESPACE,
+        &table,
+        since,
+    )
+    .await
+    .map_err(ApiError::from)?;
+
     Ok(ApiJson(json!({
-        "mart": mart_ident.as_str(),
-        "consumers": Value::Null,
-        "supported": false,
-        "reason": "Trino query-history correlation for Gold marts is not implemented: this \
-                   route has no code that queries system.runtime.queries or matches it \
-                   against a mart's exported table, even though the lakehouse-trino client \
-                   crate already exists and is wired into this build for other routes",
+        "mart": mart_name,
+        "supported": true,
+        "windowDays": WINDOW_DAYS,
+        "consumers": consumers,
     })))
 }
+
+/// How many days of reads the consumers route reports (DATA-5's spec:
+/// "the page shows the last 7 days"; the history itself is kept for 90).
+const WINDOW_DAYS: i64 = 7;
 
 // ── Per-mart publication switches (DATA-1) ──────────────────────────────
 //
@@ -986,8 +1104,14 @@ mod tests {
         AppState::new(Config::from_map(&env).unwrap())
     }
 
+    /// The consumers route is registered and policy-gated: with no
+    /// credential the auth gate answers before the handler body, so this
+    /// proves routing + policy wiring (never a 404, which would mean the
+    /// route was not registered). What it answers for an AUTHENTICATED
+    /// caller needs a Postgres pool, so it is proven in
+    /// `tests/iceberg_door.rs` instead.
     #[tokio::test]
-    async fn consumers_route_reports_unsupported_without_a_trino_client() {
+    async fn the_gold_consumers_route_is_registered_and_gated() {
         let app = crate::routes::router(state_without_pool());
         let response = app
             .oneshot(

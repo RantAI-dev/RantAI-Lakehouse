@@ -150,7 +150,7 @@ hands-on testing.
 
 | Capability | Ours | Competitors | Gap |
 | --- | --- | --- | --- |
-| Query tenancy | **Partial.** A query and a saved query are scoped to the caller's tenant — another tenant's uploaded table is refused with the same 404 as a missing table, and the shared catalog belongs to the tenant named in `CATALOG_TENANT_ID` (`SEC-20`). Dashboards, scheduled exports, alerts and authored pipelines are not scoped this way yet | Yes | `SEC-50` |
+| Query tenancy | **Partial.** A query and a saved query are scoped to the caller's tenant — another tenant's uploaded table is refused with the same 404 as a missing table, and the shared catalog belongs to the tenant named in `CATALOG_TENANT_ID` (`SEC-20`). Authored pipelines and the Gold export are scoped too (`SEC-50` slice 1, #281, 2026-10-30): a pipeline reads as its own tenant, and a job with no user acts as the catalog's tenant. Dashboards, embeds, public links and alerts are not yet (slice 2) | Yes | `SEC-50` |
 | Roles and permissions | **Have** | Yes | — |
 | Classify and mask sensitive columns | **Have.** Proven end to end (gate `ops/g8`) | Yes | — |
 | Row-level rules | **Partial.** The policy engine applies row filters and masks on read; masking is proven end to end (gate `ops/g8`), row filters are not gate-tested | Yes | Prove row filters |
@@ -240,6 +240,11 @@ in `README.md` ("Status / Known limitations").
   that table; it is off by default. A published table holds every past
   copy; outside readers must pick the latest. Tables over 5,000,000 rows
   are refused. A background merge in the engine can cause one extra copy.
+- Outside tools read published Gold tables only through the API
+  (`/api/iceberg`), with a service identity that has `iceberg:read`, and
+  each table read is counted per tool (`DATA-5`). An operator must first
+  publish storage at `OUTSIDE_S3_ENDPOINT`; until then the console says
+  "Not measured". Tenant warehouses and Silver tables are not served yet.
 - Raw table history is never trimmed.
 - A plain row count on a change-captured table can overcount on some engine
   versions. The product's own queries avoid this; a hand-written one may not.

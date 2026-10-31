@@ -666,6 +666,32 @@ pub struct Config {
     /// with an empty-string token that would only surface as a confusing
     /// 401 from Lakekeeper later.
     pub lakekeeper_admin_token_file: String,
+    /// DATA-5 / ADR 0016 point 4 — the storage address an operator
+    /// PUBLISHES for outside readers.
+    ///
+    /// `Lakekeeper` vends the deployment's own internal name
+    /// (`http://rustfs:9000`), which resolves only inside the deployment,
+    /// so the API's door (`routes::iceberg_door`) swaps it for this one in
+    /// a table-load and a credentials response. `None` when unset, and
+    /// unset means OUTSIDE READING IS OFF: every door route answers 503
+    /// naming this setting, and the console says "Not measured" with that
+    /// reason — never a count of zero, and never a vended address an
+    /// outside tool cannot reach.
+    ///
+    /// Not a secret: it is an address, not a credential.
+    pub outside_s3_endpoint: Option<String>,
+    /// DATA-5 / ADR 0016 point 3 — path to a file holding the
+    /// `outside-readers` Lakekeeper principal's pre-minted static bearer
+    /// token: the identity the door forwards an outside tool's catalog
+    /// call under (the tool's own key never reaches `Lakekeeper`).
+    ///
+    /// Same "always a default path, never `None`-when-unset" shape, and
+    /// the same shared reader, as
+    /// [`Self::lakekeeper_gold_export_token_file`] and
+    /// [`Self::lakekeeper_read_token_file`] (AGENTS rule 4: no second
+    /// reader). An empty value means the setting is unset, which the door
+    /// reports as "not set up" (503) rather than trying to read it.
+    pub lakekeeper_outside_read_token_file: String,
     /// S3-compatible endpoint `POST /api/identity/tenants` creates tenant
     /// Lakekeeper warehouses against. `None` when unset.
     ///
@@ -1021,6 +1047,11 @@ impl std::fmt::Debug for Config {
             .field("smtp_from", &self.smtp_from)
             .field("lakekeeper_catalog_uri", &self.lakekeeper_catalog_uri)
             .field("lakekeeper_warehouse", &self.lakekeeper_warehouse)
+            .field("outside_s3_endpoint", &self.outside_s3_endpoint)
+            .field(
+                "lakekeeper_outside_read_token_file",
+                &self.lakekeeper_outside_read_token_file,
+            )
             .field("iceberg_query_db", &self.iceberg_query_db)
             .field("lakekeeper_base_url", &self.lakekeeper_base_url)
             .field(
@@ -1538,6 +1569,12 @@ impl Config {
                 env,
                 "LAKEKEEPER_ADMIN_TOKEN_FILE",
                 "/tokens/admin.jwt",
+            ),
+            outside_s3_endpoint: truthy(env, "OUTSIDE_S3_ENDPOINT"),
+            lakekeeper_outside_read_token_file: or_default(
+                env,
+                "LAKEKEEPER_OUTSIDE_READ_TOKEN_FILE",
+                "/tokens/outside-readers.jwt",
             ),
             tenant_warehouse_s3_endpoint: truthy(env, "TENANT_WAREHOUSE_S3_ENDPOINT"),
             tenant_warehouse_s3_bucket: or_default(

@@ -283,12 +283,14 @@ export const ACTOR_KIND_LABEL: Record<ActorKind, string> = {
 }
 
 /** Outcome of an audited action after policy evaluation. */
-export type AuditOutcome = "success" | "denied" | "error"
+export type AuditOutcome = "success" | "denied" | "error" | "pending"
 
 export const AUDIT_OUTCOME_LABEL: Record<AuditOutcome, string> = {
   success: "Success",
   denied: "Denied",
   error: "Error",
+  // A decision still waiting on a person: open, not refused (GOV-5).
+  pending: "Pending",
 }
 
 /** Alert triage lifecycle shared by alerts and incidents. */

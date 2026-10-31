@@ -565,6 +565,21 @@ services:
       # access for the upcoming `/api/lakehouse/*` catalog routes. See
       # ADR 0011 Decision 4 for the measured relation grant.
       LAKEKEEPER_READ_TOKEN_FILE: /tokens/lakehouse-api-reader.jwt
+      # DATA-5 / ADR 0016 — the `outside-readers` principal: the catalog
+      # identity the API forwards an outside tool's Iceberg REST call with
+      # (the tool's own key never reaches Lakekeeper — see ADR 0016 point
+      # 3). Read with the shared `lakekeeper_token::read_token_file`
+      # helper, the same shape as the two token files above.
+      LAKEKEEPER_OUTSIDE_READ_TOKEN_FILE: /tokens/outside-readers.jwt
+      # DATA-5 / ADR 0016 point 4 — the storage address an operator
+      # PUBLISHES for outside readers. Lakekeeper vends the deployment's
+      # own internal name (`http://rustfs:9000`), which resolves only
+      # inside the network, so the API swaps it for this one in a
+      # table-load and a credentials response. EMPTY (the default) means
+      # outside reading is off, and the door answers 503 saying which
+      # setting is missing — never a silent zero, never a vended address
+      # that cannot be reached from outside.
+      OUTSIDE_S3_ENDPOINT: ${OUTSIDE_S3_ENDPOINT:-}
       # `routes::identity::create_tenant`'s provisioning path (`AppState::
       # lakekeeper_admin`) needs an ADMIN-scoped token, not `gold-export`'s
       # or `lakehouse-api-reader`'s narrower ones — same mount path
@@ -696,6 +711,16 @@ services:
         target: /tokens/lakehouse-api-reader.jwt
         volume:
           subpath: lakehouse-api-reader.jwt
+        read_only: true
+      # DATA-5 / ADR 0016 — same single-file subpath shape, for the
+      # read-only `outside-readers` principal
+      # (LAKEKEEPER_OUTSIDE_READ_TOKEN_FILE above), the identity the API
+      # forwards an outside tool's catalog call with.
+      - type: volume
+        source: lakehouse_oidc_tokens
+        target: /tokens/outside-readers.jwt
+        volume:
+          subpath: outside-readers.jwt
         read_only: true
       # Same single-file subpath shape, for the ADMIN-scoped principal
       # `LAKEKEEPER_ADMIN_TOKEN_FILE` above names — the same volume subpath
@@ -1279,6 +1304,16 @@ services:
   #     WS2 reads is table DATA, only catalog metadata, and `describe` is
   #     the narrower of the two relations that worked. No `create`/
   #     `modify`: this principal never writes.
+  #   - `outside-readers` (DATA-5 / ADR 0016: the API's door for outside
+  #     tools): `describe` on the warehouse — the same read-only metadata
+  #     relation as `lakehouse-api-reader`. Its `select` on the `gold`
+  #     namespace is granted by the API itself, as `admin`, right after the
+  #     first Gold export creates that namespace: the namespace does not
+  #     exist before then, and a namespace-scoped grant is the whole point
+  #     of ADR 0016 point 3 (the catalog itself refuses anything outside
+  #     `gold`, even if the API had a bug). It is the FIRST namespace-scoped
+  #     grant in this stack; if Lakekeeper 0.13 refuses it, that is
+  #     reported, never widened into a warehouse-wide `select`.
   #   - `unauthorized-test`: registered (Lakekeeper knows who it is) but
   #     NEVER granted anything — the negative-test principal.
   lakekeeper-authz-init:
@@ -1337,6 +1372,16 @@ services:
         volume:
           subpath: lakehouse-api-reader.jwt
         read_only: true
+      # DATA-5 / ADR 0016 — the `outside-readers` principal: the identity
+      # the API forwards an outside tool's Iceberg REST call with. This
+      # job self-registers it (like every other principal here) so
+      # Lakekeeper knows who it is before it is granted anything.
+      - type: volume
+        source: lakehouse_oidc_tokens
+        target: /tokens/outside-readers.jwt
+        volume:
+          subpath: outside-readers.jwt
+        read_only: true
       - type: volume
         source: lakehouse_oidc_tokens
         target: /tokens/unauthorized-test.jwt
@@ -1352,7 +1397,7 @@ services:
         admin_token="$$(cat /tokens/admin.jwt)"
         admin_auth="Authorization: Bearer $$admin_token"
 
-        for principal in rust-iceberg dlt clickhouse-reader trino gold-export lakehouse-api-reader unauthorized-test; do
+        for principal in rust-iceberg dlt clickhouse-reader trino gold-export lakehouse-api-reader outside-readers unauthorized-test; do
           ptoken="$$(cat /tokens/$$principal.jwt)"
           code=$$(curl -s -o /dev/null -w '%{http_code}' -X POST \
             -H "Authorization: Bearer $$ptoken" -H 'Content-Type: application/json' \
@@ -1413,6 +1458,18 @@ services:
         # `select`/`create`/`modify`: this principal never reads table
         # data or writes.
         grant lakehouse-api-reader describe
+        # DATA-5 / ADR 0016 — `outside-readers`: `describe` on the
+        # warehouse, the same read-only metadata relation
+        # `lakehouse-api-reader` holds. The `select` on the `gold`
+        # namespace is NOT granted here: the namespace does not exist
+        # until the first Gold export creates it, so that grant is made
+        # by the API itself, as `admin`, right after the namespace is
+        # ensured (`routes::iceberg_door`'s sibling in
+        # `lakehouse-iceberg`'s Gold path — see ADR 0016 point 3). It is
+        # the first namespace-scoped grant in this stack; if Lakekeeper
+        # 0.13 refuses it, that is reported, never widened into a
+        # warehouse-wide `select`.
+        grant outside-readers describe
         # unauthorized-test: deliberately no grant call.
     restart: "no"
 
@@ -1601,7 +1658,15 @@ services:
       AUTH_BOOTSTRAP_PASSWORD: ${AUTH_BOOTSTRAP_PASSWORD:-}
     entrypoint: ["/bin/sh", "-c"]
     command:
-      - "pip install -q requests boto3 && python gold_export_test.py"
+      # DATA-5 (ADR 0016): `pyiceberg` is the OUTSIDE reader's client —
+      # the acceptance test reads the published table through the API's
+      # door with a real Iceberg REST client, so the door is proven
+      # against the client it exists for. Pinned, because an unpinned
+      # client would make this gate depend on whatever PyPI serves that
+      # day. The `pyarrow` extra is what reads the table's parquet files
+      # (the row count) and reaches the S3-compatible store the catalog
+      # vends.
+      - "pip install -q requests boto3 'pyiceberg[pyarrow]==0.9.0' && python gold_export_test.py"
     restart: "no"
 
   # P2 (G2) — SeaweedFS: a second S3-compatible store used to prove the
@@ -1926,6 +1991,12 @@ services:
         }
         grant rust-iceberg create modify select
         grant clickhouse-reader select modify
+        # DATA-5 / ADR 0016 — the same `describe` the `default`/RustFS
+        # warehouse grants `outside-readers`, so the API's door works
+        # against this second warehouse too. Its `select` on the `gold`
+        # namespace is granted by the API itself once the namespace
+        # exists (same as on the default warehouse).
+        grant outside-readers describe
     restart: "no"
 
   # P3 (G3a) — Dagster's own run/event-log/schedule storage, on the
@@ -2675,6 +2746,15 @@ services:
       CH_OAUTH_SERVER_URI: http://oidc-mock:8090/token
       BLD1_NO_AUTHOR_PIPELINE_ID: ${BLD1_NO_AUTHOR_PIPELINE_ID:-}
       BLD1_NO_AUTHOR_FIXTURE: ${BLD1_NO_AUTHOR_FIXTURE:-}
+      # SEC-50 (PR #281 review round 2 B1): the shared Bronze table this
+      # gate's pipelines read is gated as the tenant that owns the shared
+      # catalog, so the harness has to know WHICH tenant that is -- it
+      # picks an author of that tenant and scopes their pipeline to it.
+      # The same value the API service reads (`lakehouse-api`'s own block
+      # above), passed through from the operator's `.env` the same way
+      # `BRONZE_TABLE_NAME` is. Empty default: a deployment that names no
+      # catalog tenant keeps the behaviour it had before the gate.
+      CATALOG_TENANT_ID: ${CATALOG_TENANT_ID:-}
       PYTHONDONTWRITEBYTECODE: "1"
     entrypoint: ["/bin/sh", "-c"]
     command:
