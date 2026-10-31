@@ -244,8 +244,11 @@ What `Oracle CDC` needs and what it does not do. Proven by the `g4-oracle` gate 
 - **The connection test goes through Kafka Connect.** `python-oracledb` thin mode (2.5.1, and 26.1.0) has no
   native network encryption, so a test from the orchestrator would not use the encryption the connector
   uses. The API asks Kafka Connect to validate the connector's configuration with the connector's own driver
-  (`SRC-4` Amendment 10). A wrong login, an unreachable server or service, and a server that refuses the
-  encryption (`ORA-12660`) each get a fixed sentence.
+  (`SRC-4` Amendment 10). Debezium 3.7.0 answers "Unable to connect (primary): Failed
+  to resolve Oracle database version" for a refused login, an unreachable server or service and a refused
+  encryption alike (the Oracle code is only in the cause, which the answer does not carry), so the test says
+  one fixed sentence for all of them: the connection or the login was refused, check the address, the service
+  name, the login and the encryption setting. A validation timeout has its own sentence.
 - **Setup checks are read over an unencrypted connection (owner-signed exception to `SEC-14`, 2026-10-31).**
   `SEC-14` says a stored credential is not dialled in plain text unless the person chose "Disable". After the
   Kafka Connect test passes, the orchestrator reads Oracle's settings with thin mode, **not encrypted**:
