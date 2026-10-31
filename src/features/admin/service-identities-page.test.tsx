@@ -288,3 +288,44 @@ describe("ServiceIdentitiesPage rotate (new secret shown once, never persisted)"
     expect(getCallsAfter).toBe(getCallsBefore)
   })
 })
+
+// DATA-5 D10: the scopes field says what `iceberg:read` opens, where the
+// door is, and that the key comes from Rotate. An admin who does not
+// know the address cannot connect a tool at all.
+describe("ServiceIdentitiesPage outside-reader hint", () => {
+  it("names the scope, this console's door address, and Rotate under the scopes field", async () => {
+    // happy-dom's default location is `about:blank`, whose origin is
+    // the string "null". Give the page a real console address, the way
+    // a browser would.
+    const originalLocation = window.location
+    Object.defineProperty(window, "location", {
+      configurable: true,
+      writable: true,
+      value: {
+        origin: "https://console.example.com",
+        pathname: "/admin/service-identities",
+        search: "",
+        assign: () => {},
+      },
+    })
+    try {
+      setupFetch({})
+      renderPage()
+      await waitFor(() => expect(screen.getByText("ingestion-worker")).toBeDefined())
+      fireEvent.click(
+        screen.getByRole("button", { name: /create service identity/i }),
+      )
+
+      const address = await screen.findByTestId("outside-reader-address")
+      expect(address.textContent).toBe("https://console.example.com/api/iceberg")
+      expect(screen.getByText("iceberg:read")).toBeDefined()
+      expect(screen.getByText(/Use Rotate to get its key/)).toBeDefined()
+    } finally {
+      Object.defineProperty(window, "location", {
+        configurable: true,
+        writable: true,
+        value: originalLocation,
+      })
+    }
+  })
+})
