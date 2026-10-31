@@ -45,6 +45,7 @@ The stack:
 | `postgres` | `postgres:16` | OLTP store (identity, governance, pipelines, connectors, alerts, ...) |
 | `clickhouse` | `clickhouse/clickhouse-server:26.8` | Analytics store (catalog, overview, governance, dashboards, ...); also the Iceberg query engine once `DataLakeCatalog` is wired up in P1b |
 | `lakehouse-api` | built from `rust/Dockerfile` | the axum API, port 8080 |
+| `console` | built from `Dockerfile.frontend` | the Next.js console, port 3000 (REL-2 S1-T2) — waits for `lakehouse-api` to report healthy, and proxies `/api/*` to it |
 | `rustfs` | `rustfs/rustfs:1.0.0-rc.4` | S3-compatible object store for the lakehouse warehouse (P1 infrastructure; not yet wired into `lakehouse-api`) |
 | `rustfs-bucket-init` | `amazon/aws-cli:2.36.34` | One-shot: creates the warehouse bucket via the plain S3 API (`s3api create-bucket`) — never RustFS's admin API |
 | `lakekeeper-db-init` | `postgres:16` | One-shot: creates Lakekeeper's own database on the existing `postgres` service |
@@ -63,6 +64,15 @@ Postgres) get a real chance to run instead of racing container startup.
 This is a start-order convenience, not a hard runtime dependency — see
 "Postgres: unreachable is loud, a mismatched schema refuses to start,"
 below.
+
+`lakehouse-api` carries a healthcheck of its own (`/health`, liveness), and
+the `console` waits for it — so the console starts after the API can
+answer, not while the API is still applying migrations. The console's
+`/api/*` proxy target is baked into its image at build time
+(`RUST_API_URL`, the `lakehouse-api` service's address on the compose
+network); `CONSOLE_INTERNAL_URL` is the address the OTHER way round (the
+console as the PDF renderer reaches it), and it is empty by default — set
+it to `http://console:3000` to switch the PDF export on in this stack.
 
 `rustfs`, `lakekeeper`, and their bootstrap jobs are **still not called
 from any `lakehouse-api` route as of P6** — see the module map in

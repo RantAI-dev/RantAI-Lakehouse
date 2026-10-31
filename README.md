@@ -88,19 +88,14 @@ fixes).
 
 ## Quickstart
 
-Assumes you have **Docker** and **Bun** (`>= 1.3.0`) installed and nothing
-else.
+Assumes you have **Docker** installed and nothing else.
 
 ```bash
-# 1. Install Bun, if you don't have it
-curl -fsSL https://bun.sh/install | bash
-
-# 2. Clone and install frontend dependencies
+# 1. Clone
 git clone https://github.com/RantAI-dev/RantAI-Lakehouse.git
 cd RantAI-Lakehouse
-bun install
 
-# 3. Configure the backend stack. Copy the example env file and set (at
+# 2. Configure the stack. Copy the example env file and set (at
 #    minimum) AUTH_BOOTSTRAP_EMAIL / AUTH_BOOTSTRAP_PASSWORD — without
 #    those there is deliberately no way to log in. SEC-18: there are NO
 #    default credentials. docker-compose.yml refuses to start while
@@ -115,17 +110,16 @@ sh ops/init-env.sh
 $EDITOR .env    # set AUTH_BOOTSTRAP_EMAIL; see .env.example and the
                 # Configuration table below
 
-# 4. Bring up Postgres, ClickHouse, and the Rust API (built from
-#    rust/Dockerfile). Dagster and a real LLM are NOT part of this stack —
-#    see docs/OPERATIONS.md for what that means and how to add them.
+# 3. Bring up Postgres, ClickHouse, the Rust API (built from
+#    rust/Dockerfile) and the console (built from Dockerfile.frontend).
+#    Dagster and a real LLM are NOT part of this stack — see
+#    docs/OPERATIONS.md for what that means and how to add them.
 #    scripts/compose.sh is `docker compose` with GIT_SHA set from this
 #    checkout, which the pipeline page's source view needs (see the script).
 scripts/compose.sh up --build
 # lakehouse-api listens on :8080 once postgres and clickhouse report
-# healthy. Check with: curl -sf localhost:8080/health
-
-# 5. In a separate terminal, point the frontend at the backend and run it
-RUST_API_URL=http://localhost:8080 bun --bun next dev
+# healthy (check with: curl -sf localhost:8080/health), and the console
+# listens on :3000 once the API reports healthy.
 ```
 
 Open [http://localhost:3000](http://localhost:3000). Sign in with the
@@ -139,13 +133,20 @@ compose stack, what `/health` actually checks, the Lakehouse backup and restore
 procedure, and the biggest operational trap in this codebase (Postgres
 being down fails quietly, not loudly).
 
-Prefer running the Rust API directly instead of in a container (e.g. for
-faster iteration)? The old path still works:
+### Developing: the console and the API on the host
+
+Prefer running the console and the API on the host (e.g. for faster
+iteration)? The old path still works — it needs **Bun** (`>= 1.3.0`) and
+Node 20.9 or newer for the build, which the operator path above does not:
 
 ```bash
 # Bring up just the data stores from compose, then run the API on the host
 docker compose up postgres clickhouse
 cd rust && cargo run -p lakehouse-api
+
+# And the console, in another terminal
+bun install
+RUST_API_URL=http://localhost:8080 bun --bun next dev
 ```
 
 ### Runtime: Bun

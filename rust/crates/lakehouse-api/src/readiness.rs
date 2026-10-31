@@ -24,8 +24,8 @@
 //!   (an old binary must not serve a newer schema).
 //! - `clickhouse`: `ClickHouse` answers `SELECT 1`.
 //! - `lakekeeper`: the Iceberg REST catalog answers its own config request
-//!   (`GET {catalog}/v1/config`), the same call the catalog client makes
-//!   when it connects.
+//!   (`GET {catalog}/v1/config?warehouse=…`), the same call the catalog
+//!   client makes when it connects.
 //!
 //! # The body carries no upstream text
 //!
@@ -216,12 +216,18 @@ async fn probe_clickhouse(state: &AppState) -> Check {
 
 /// Does the Iceberg REST catalog answer its config request?
 ///
-/// `GET {catalog_uri}/v1/config` is the call the catalog client makes when
-/// it connects (`lakehouse_iceberg::IcebergClient::connect`), so this
-/// proves the catalog is reachable AND usable by this service. The reader
-/// bearer token is the one the catalog routes use; without it the catalog
-/// would refuse, so a missing token file means "not ready" — honestly,
-/// because the service cannot read the catalog without it.
+/// `GET {catalog_uri}/v1/config?warehouse={warehouse}` is the call the
+/// catalog client makes when it connects (`lakehouse_iceberg::
+/// IcebergClient::connect`), so this proves the catalog is reachable AND
+/// usable by this service — the same question, asked the same way.
+///
+/// The `warehouse` parameter is not optional: `Lakekeeper` answers `400`
+/// ("No warehouse specified") without it, so a probe that left it out
+/// would call a working catalog unhealthy.
+///
+/// The reader bearer token is the one the catalog routes use; without it
+/// the catalog refuses (`401`), so a missing token file means "not ready"
+/// — honestly, because the service cannot read the catalog without it.
 async fn probe_lakekeeper(http: &reqwest::Client, state: &AppState) -> Check {
     let token = match read_token_file(
         &state.config.lakekeeper_read_token_file,
@@ -236,10 +242,13 @@ async fn probe_lakekeeper(http: &reqwest::Client, state: &AppState) -> Check {
             return Check::Failed;
         }
     };
-    let url = format!(
-        "{}/v1/config",
-        state.config.lakekeeper_catalog_uri.trim_end_matches('/')
-    );
+    let Some(url) = catalog_config_url(state) else {
+        tracing::warn!(
+            catalog_uri = %state.config.lakekeeper_catalog_uri,
+            "the readiness probe could not build the catalog's config URL"
+        );
+        return Check::Failed;
+    };
     match tokio::time::timeout(
         PROBE_TIMEOUT,
         http.get(url).bearer_auth(token.expose_secret()).send(),
@@ -263,6 +272,26 @@ async fn probe_lakekeeper(http: &reqwest::Client, state: &AppState) -> Check {
             Check::Failed
         }
     }
+}
+
+/// The catalog's config URL, with the warehouse this deployment reads.
+///
+/// Built with [`url::Url`]'s query-pair encoder rather than by formatting
+/// a query string, so a warehouse name can never break the URL's
+/// structure — the same rule `routes::auth::oidc_start` follows for the
+/// `IdP`'s redirect URL.
+///
+/// `None` when the configured catalog URI is not a URL at all: there is
+/// nothing to ask then.
+fn catalog_config_url(state: &AppState) -> Option<url::Url> {
+    let base = format!(
+        "{}/v1/config",
+        state.config.lakekeeper_catalog_uri.trim_end_matches('/')
+    );
+    let mut url = url::Url::parse(&base).ok()?;
+    url.query_pairs_mut()
+        .append_pair("warehouse", &state.config.lakekeeper_warehouse);
+    Some(url)
 }
 
 #[cfg(test)]
@@ -372,6 +401,26 @@ mod tests {
         )]);
         let config = crate::config::Config::from_map(&env).unwrap();
         AppState::new(config)
+    }
+
+    /// The catalog's config request carries the warehouse: `Lakekeeper`
+    /// answers `400` ("No warehouse specified") without it, so a probe
+    /// that left it out would call a working catalog unhealthy. Measured
+    /// against a running `Lakekeeper` v0.13.3 (REL-2 S1-T2's stack).
+    ///
+    /// `#[tokio::test]`, not plain `#[test]`: the state this reads the
+    /// configuration from builds a `sqlx` pool, and `sqlx` registers its
+    /// idle-connection reaper against the ambient Tokio runtime.
+    #[tokio::test]
+    async fn health_asks_the_catalog_for_its_config_with_the_warehouse() {
+        let url = catalog_config_url(&test_state()).unwrap();
+        assert_eq!(url.path(), "/catalog/v1/config");
+        assert_eq!(
+            url.query_pairs()
+                .find(|(key, _)| key == "warehouse")
+                .map(|(_, value)| value.into_owned()),
+            Some("default".to_owned())
+        );
     }
 
     /// The route itself: it answers with the D7 body shape, and the status

@@ -147,12 +147,11 @@ services:
       # WS4 item C2 — the source tree `GET /api/pipelines/{id}/source`
       # serves from, baked into the image via a SECOND, independent build
       # context rather than widening `context` above to the repository
-      # root (judge review V8: the untracked, developer-owned
-      # `.dockerignore` excludes `rust`/`docs`/`*.md` and would break
-      # every `COPY rust/...` a `context: .` change would require; a
-      # clean checkout with NO `.dockerignore` at all would instead send
-      # the ENTIRE repository — `.git`, `node_modules`, every
-      # workstream's checkout — as build context, unbounded). Neither
+      # root (judge review V8: the repository root's `.dockerignore`
+      # excludes `rust`/`docs`/`*.md`, so a `context: .` change would
+      # break every `COPY rust/...` this file needs; that ignore file is
+      # read only by a build whose context IS the root, so it does not
+      # apply to this one — but it would apply to that change). Neither
       # `context` nor `dockerfile` above changes at all.
       additional_contexts:
         pipeline_src: ./dagster/dispar_orchestrate
@@ -732,9 +731,86 @@ services:
       - lakehouse_connector_secrets:/run/secrets
       # SEC-14 part B (D5/D7): CA certificate for connector dials. Read-only.
       - lakehouse_postgres_ca:/run/certs/postgres:ro
+    # REL-2 S1-T2: the API's own healthcheck, so the `console` service below
+    # can wait for it (`depends_on: condition: service_healthy`) instead of
+    # starting next to a process that is still applying migrations.
+    #
+    # `/health` (liveness), NOT `/health/ready` (REL-2 D7): this process
+    # serves its Phase 1 routes even when Postgres is unreachable, so
+    # "the process answers" is the honest question for a compose health
+    # check — the console starts and shows what is broken instead of not
+    # starting at all. The readiness route is what an installer or an
+    # updater waits on.
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS -o /dev/null http://127.0.0.1:8080/health || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
     restart: unless-stopped
 
-  # P1 — S3-compatible object store, the default self-hosted implementation
+  # REL-2 S1-T2 — the console, in Compose.
+  #
+  # The Next.js console, built from `Dockerfile.frontend`: the SAME image
+  # the staging deploy builds (`deploy-staging.yml`, "Build frontend
+  # image") and runs by hand (`docker run --network
+  # rantai-lakehouse_default -p 3000:3000 -e
+  # RUST_API_URL=http://lakehouse-api:8080 --restart unless-stopped`).
+  # Compose runs it the same way, so a local stack and a deployment
+  # behave the same — before this, an operator had to start the console
+  # on the host with `bun next dev` (README's developer path), which is
+  # not something a server without Bun can do.
+  #
+  # The image name follows the same shape as the API's (a stable name, so
+  # the release pipeline can publish it by digest later — REL-2 S2) and
+  # the locally built one keeps the `:local` tag.
+  console:
+    image: ${CONSOLE_IMAGE:-rantai-lakehouse-console:local}
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+      # `next.config.ts`'s `rewrites()` read `RUST_API_URL` WHEN `next
+      # build` RUNS, and Next serialises the result into the standalone
+      # server — a runtime env var does NOT move the `/api` proxy (see
+      # `Dockerfile.frontend`'s own comment, and the staging deploy's
+      # build). So this build arg is the one that decides where `/api`
+      # goes; the runtime value below is only read by code that reads
+      # `process.env` directly.
+      args:
+        RUST_API_URL: ${CONSOLE_API_URL:-http://lakehouse-api:8080}
+    ports:
+      # The `dagster` profile's webserver wants 3000 as well
+      # (`DAGSTER_WEBSERVER_HOST_PORT`); set `CONSOLE_HOST_PORT` to
+      # another port when that profile is on.
+      - "${CONSOLE_HOST_PORT:-3000}:3000"
+    depends_on:
+      # The console is nothing without the API, and the API is nothing
+      # without Postgres and ClickHouse: waiting for the API to report
+      # healthy means the console starts after the stack can serve, not
+      # next to a process that is still applying migrations.
+      lakehouse-api:
+        condition: service_healthy
+    environment:
+      RUST_API_URL: ${CONSOLE_API_URL:-http://lakehouse-api:8080}
+      # Next.js's standalone server binds to `process.env.HOSTNAME`, and
+      # Docker sets that to the container's own name — so the server
+      # would listen on the container's address only, and nothing could
+      # reach it at `127.0.0.1` (the healthcheck below) — `0.0.0.0` is
+      # what a published port needs.
+      HOSTNAME: 0.0.0.0
+    healthcheck:
+      # The console's own port. `node:22-alpine` carries busybox's
+      # `wget`, which is what the ClickHouse service's healthcheck uses
+      # too — but it resolves `localhost` to IPv6 first and gives up
+      # there, while the standalone server listens on IPv4 only: ask for
+      # `127.0.0.1` by name.
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://127.0.0.1:3000/ || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+    restart: unless-stopped
+
   # for the lakehouse warehouse. RustFS, not MinIO (locked decision: MinIO
   # is not a supported target). All access — including bucket bootstrap
   # below — goes through the plain S3 API, never a proprietary admin call.
