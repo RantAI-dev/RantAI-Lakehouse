@@ -25,8 +25,8 @@ use sqlx::PgPool;
 /// `0035` seeds sixteen connector types: ten `supported = true` rows with a
 /// named `adapter`, and six `supported = false` roadmap rows. `0095` (`SRC-3`
 /// T1.1) adds the ten business-app types, so there are twenty-six; `0096`
-/// (T7.1) flips eight of them and adds none; `0119` (`SRC-4` slice 5) adds
-/// `MongoDB CDC` and `0120` (slice 6) `Oracle CDC`, so there are twenty-eight.
+/// (T7.1) flips eight of them and adds none; `0123` (`SRC-4` slice 5) adds
+/// `MongoDB CDC` and `0124` (slice 6) `Oracle CDC`, so there are twenty-eight.
 #[sqlx::test(migrations = "../../migrations")]
 async fn seeds_sixteen_connector_types(pool: PgPool) -> sqlx::Result<()> {
     let types = list_connector_types(&pool)
@@ -67,7 +67,7 @@ const SAAS_STILL_UNSUPPORTED: [&str; 2] = ["Workday Reports", "NetSuite"];
 /// The unsupported types that carry a reason and keep an adapter: Google Sheets
 /// and the two `saas` types above. The other eight `saas` types are supported
 /// after `0096` and carry no reason; `MySQL CDC` and `SQL Server CDC` are
-/// supported again after `0117` (`SRC-4` slice 3) and carry none either.
+/// supported again after `0121` (`SRC-4` slice 3) and carry none either.
 const TYPES_WITH_REASON_AND_ADAPTER: [&str; 3] = ["Google Sheets", "Workday Reports", "NetSuite"];
 
 /// Every `supported = false` row other than the three that keep an adapter
@@ -134,10 +134,10 @@ async fn google_sheets_is_listed_as_unsupported_with_a_reason(pool: PgPool) -> s
     Ok(())
 }
 
-/// `0117` (`SRC-4` slice 3): `MySQL` CDC and `SQL Server` CDC are supported
+/// `0121` (`SRC-4` slice 3): `MySQL` CDC and `SQL Server` CDC are supported
 /// again, keep their `cdc` adapter and carry no reason.
 #[sqlx::test(migrations = "../../migrations")]
-async fn mysql_and_sql_server_cdc_are_supported_again_after_0117(pool: PgPool) -> sqlx::Result<()> {
+async fn mysql_and_sql_server_cdc_are_supported_again_after_0121(pool: PgPool) -> sqlx::Result<()> {
     let types = list_connector_types(&pool)
         .await
         .expect("list_connector_types should succeed");
@@ -153,7 +153,7 @@ async fn mysql_and_sql_server_cdc_are_supported_again_after_0117(pool: PgPool) -
     Ok(())
 }
 
-/// `0119` (`SRC-4` slice 5): `MongoDB CDC` is a supported `cdc` type of its own, beside
+/// `0123` (`SRC-4` slice 5): `MongoDB CDC` is a supported `cdc` type of its own, beside
 /// the batch `MongoDB` type, which keeps its `mongodb` adapter.
 #[sqlx::test(migrations = "../../migrations")]
 async fn mongodb_cdc_is_a_supported_cdc_type_beside_the_batch_mongodb_type(
@@ -177,10 +177,10 @@ async fn mongodb_cdc_is_a_supported_cdc_type_beside_the_batch_mongodb_type(
     Ok(())
 }
 
-/// `0120` (`SRC-4` slice 6): `Oracle CDC` is a supported `cdc` type of its own, beside
+/// `0124` (`SRC-4` slice 6): `Oracle CDC` is a supported `cdc` type of its own, beside
 /// the batch `Oracle` type, which keeps its `sql` adapter.
 #[sqlx::test(migrations = "../../migrations")]
-async fn oracle_cdc_is_its_own_supported_cdc_type_after_0120(pool: PgPool) -> sqlx::Result<()> {
+async fn oracle_cdc_is_its_own_supported_cdc_type_after_0124(pool: PgPool) -> sqlx::Result<()> {
     let types = list_connector_types(&pool)
         .await
         .expect("list_connector_types should succeed");

@@ -50,7 +50,7 @@ Live change capture:
   (Debezium's temporal types) and their Bronze column is an integer.
 - **MySQL and SQL Server change capture run the same way** (`SRC-4` slice 3):
   the same worker, the same applier, the same two load modes, and the types
-  "MySQL CDC" and "SQL Server CDC" are supported again (migration `0117`). Each
+  "MySQL CDC" and "SQL Server CDC" are supported again (migration `0121`). Each
   has its own gate in CI (`g4-mysql`, `g4-mssql`), which creates the connector
   through the API and reads the result back. What each source needs, all proven
   by the gates with a user that is not `root` or `sa`:

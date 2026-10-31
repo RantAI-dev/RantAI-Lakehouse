@@ -1,6 +1,6 @@
 //! What the orchestrator last saw of each table of a change-capture connector,
 //! and the connector's lag limit (`SRC-4` slice 4, decisions S4-b, S4-d and
-//! S4-e; migration `0118_connector_capture_lag.sql` -- read its header).
+//! S4-e; migration `0122_connector_capture_lag.sql` -- read its header).
 //!
 //! This module stores facts and the alert's open flag. It does not decide what
 //! a lag is: `lakehouse-api::capture_lag` does, from these rows and a `now` it

@@ -1,5 +1,5 @@
 //! Integration tests for `lakehouse_store::capture_lag` against a real Postgres
-//! (`SRC-4` slice 4, migration `0118`; same setup as `tests/connector_run.rs`).
+//! (`SRC-4` slice 4, migration `0122`; same setup as `tests/connector_run.rs`).
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 

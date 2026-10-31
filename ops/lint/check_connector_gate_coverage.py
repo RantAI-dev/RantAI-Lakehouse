@@ -69,7 +69,7 @@ class TypeState:
     adapter: str | None
     supported: bool
     # The `unsupported_reason` text, tracked so a later UPDATE may name the exact
-    # text it replaces (`WHERE unsupported_reason = '...'`, `SRC-4` slice 3, `0117`).
+    # text it replaces (`WHERE unsupported_reason = '...'`, `SRC-4` slice 3, `0121`).
     reason: str | None = None
 
 

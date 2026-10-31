@@ -58,8 +58,8 @@ class SupportedTypesTests(unittest.TestCase):
     def test_the_real_migrations_list_twenty_three_supported_types_and_not_google_sheets(self) -> None:
         names = check.supported_types(REPO_ROOT / "rust" / "migrations")
         # 13 before SRC-9 decision 8 (0066); 11 after it; +8 saas types in 0096 (SRC-3 T7.1);
-        # +2 in 0117 (SRC-4 slice 3: MySQL CDC and SQL Server CDC are supported again).
-        # +1 in 0119 (SRC-4 slice 5: MongoDB CDC is a new supported type), +1 in 0120 (slice 6: Oracle CDC).
+        # +2 in 0121 (SRC-4 slice 3: MySQL CDC and SQL Server CDC are supported again).
+        # +1 in 0123 (SRC-4 slice 5: MongoDB CDC is a new supported type), +1 in 0124 (slice 6: Oracle CDC).
         self.assertEqual(len(names), 23)
         self.assertIn("MongoDB CDC", names)
         self.assertIn("Oracle CDC", names)
