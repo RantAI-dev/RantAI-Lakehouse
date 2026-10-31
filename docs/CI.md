@@ -306,7 +306,11 @@ can be proved before it can cut a release:
 - its images go to a `registry:2` service container of the job, so the digests it records
   are real digests of a real registry;
 - its key is generated in the job, in the runner's working directory, and thrown away
-  with the job. It is never the release key and it never leaves the runner.
+  with the job: the file leaves the working directory with the step that generated it,
+  and the PEM travels on as that step's output. It reaches the three steps that sign,
+  and no other step — the same shape as the real job, where the release key comes
+  from the `release` environment's secrets (REL-2 S2 review round 4 SHOULD-FIX 1).
+  It is never the release key and it never leaves the runner.
 
 Nothing is published. The bundle, the manifest, its Sigstore bundle, the rendered Compose
 file and the SBOMs are uploaded as a workflow artifact (`release-dry-run`), and the run's

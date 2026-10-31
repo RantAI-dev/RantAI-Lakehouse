@@ -1067,3 +1067,68 @@ It then failed at the first SBOM step.
 - Extend `test_release_workflow.py`: `COSIGN_PRIVATE_KEY` must not be written to `$GITHUB_ENV`.
 
 **Open: BLOCKER 1 and SHOULD-FIX 1 (round 4).**
+
+### Fixes for review round 4 (developer, 2026-11-01)
+
+**Commits** (branch `feat/rel-2-s2-release-pipeline`, base `7be6cc90`), one per finding:
+
+| Commit | Finding | What |
+| --- | --- | --- |
+| `64120d52` | REL-2 S2 review round 4 BLOCKER 1 | the SBOM folder is created before the SBOM action writes into it |
+| `23a28f7e` | REL-2 S2 review round 4 SHOULD-FIX 1 | the dry run's throwaway key reaches the three signing steps only |
+
+**BLOCKER 1 (`64120d52`).** Both jobs create `sbom/` in a step of their own, before the first
+SBOM step: `anchore/sbom-action` writes into the folder and does not create it, so the first SBOM
+step failed with ENOENT. `ops/release/make_bundle.sh` wants the folder too — it refuses to run
+when `--sbom-dir` is not a directory — so without this step the bundle step would have failed as
+well. `ops/release/test_release_workflow.py` holds both jobs to it, and a synthetic workflow that
+does not create the folder is reported.
+
+**SHOULD-FIX 1 (`23a28f7e`).** The dry run's throwaway key travels as the OUTPUT of the step that
+generates it, and the three signing steps take it from there into their own `env:` — the same shape
+as the real job, which takes the release key from the `release` environment's secrets into the
+`env:` of the same three steps. Nothing writes the key to `$GITHUB_ENV` any more, so no later step
+of the dry run can read it, and the SBOM step's environment block is clean. The signing path is
+unchanged: `env://COSIGN_PRIVATE_KEY` resolves in both jobs, so the dry run still proves the real
+wiring (REL-2 S2 review BLOCKER 1).
+
+Two details, both stated at the site in the workflow:
+
+- The PEM is masked in the log, line by line (`::add-mask::`), so the dry run's log looks like the
+  real job's, where the release key is `***`: a private key should not be readable in a log.
+- The key file leaves the workspace with the step that generated it (`rm -f cosign.key`): the PEM
+  travels in the output now, and nowhere else.
+
+The empty `COSIGN_PASSWORD` stays in the dry run's job environment: it is empty, so there is nothing
+to hide — the KEY is what is scoped. `docs/CI.md`'s dry-run paragraph says the same.
+
+**The test extension** (`ops/release/test_release_workflow.py`, 4 new cases): no step writes
+`COSIGN_PRIVATE_KEY` to `$GITHUB_ENV` (a synthetic workflow that does is reported), the key is in
+the `env:` of the dry run's three signing steps, the dry run's job environment holds no key, and
+the step that generates the key publishes it as an output (the old case, which required
+`$GITHUB_ENV`, is replaced by this one). The checks read the `run:` blocks without their comment
+lines: a comment is not a command, and the workflow explains itself in them.
+
+**Commands run, in the foreground, on `23a28f7e`:**
+
+| Command | Result |
+| --- | --- |
+| `python3 -m pytest ops/release -q` | **80 passed, 0 failed** (74 before this round, 6 new: 2 for BLOCKER 1, 4 for SHOULD-FIX 1) |
+| `actionlint .github/workflows/release.yml` | clean, exit 0 (actionlint v1.7.7, with shellcheck 0.10.0 on the PATH, so the `run:` blocks were checked too) |
+
+The pytest run used a virtualenv's interpreter (`/tmp/opencode/relvenv/bin/python -m pytest
+ops/release -q`): the system Python is externally managed (PEP 668), so `pip install --user pytest`
+is refused, and the virtualenv carries `pytest==8.3.4` over the system site packages (PyYAML,
+cryptography). `actionlint` and `shellcheck` were not installed on this machine; both were
+downloaded to `/tmp/opencode` (actionlint v1.7.7, shellcheck v0.10.0) to run the checks above.
+
+**Not verified, with the reason:**
+
+- **The dry run is not verified.** It needs a GitHub runner, and the PR's own dry run is the proof:
+  both findings are runner behaviour (the SBOM action's write, the runner's environment block).
+- **The masking of the PEM is not verified.** `::add-mask::` is the runner's own command; it is
+  checked here only by the shape of the step (one command per line of the PEM).
+- The real release is not verified, and cannot be. It needs a `v*` tag, the owner's approval on the
+  `release` environment, and the release key. REL-2 S5 does that.
+- No cargo command and no bun command ran: this round changes no Rust, no TypeScript, no code
+  location and no Compose file.
