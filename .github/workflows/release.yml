@@ -1,0 +1,669 @@
+name: Release
+
+# REL-2 S2-T4: the release pipeline.
+#
+# Three ways in:
+#
+#   - a `v*` tag push: the REAL release. The job runs in the `release`
+#     environment, so the owner's approval gates the signing key, and the
+#     release it creates is a DRAFT the owner publishes.
+#   - `workflow_dispatch`: a dry run, on demand.
+#   - a pull request that touches the pipeline: a dry run, so a change to
+#     the release pipeline is proved before it can cut a release.
+#
+# The dry run never publishes: its images go to a registry that dies with
+# the job, its key is generated in the job and thrown away with it, and
+# what it builds is uploaded as a workflow artifact.
+#
+# The real job never runs for a pull request — it is gated on a tag push,
+# and it holds the only secrets in this repository.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/release.yml"
+      - "ops/release/**"
+      - "Dockerfile.frontend"
+      - "rust/Dockerfile"
+      - "dagster/Dockerfile"
+      - "ops/oidc-mock/**"
+
+# Least privilege. Nothing may write to the repository or to a package
+# unless the job that does it says so; the dry run may not write at all.
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  # A release is not cancelled half-way: the signing key is in use and the
+  # bundle is being written.
+  cancel-in-progress: false
+
+jobs:
+  # ── The dry run ────────────────────────────────────────────────────
+  dry-run:
+    name: Release · dry run
+    # Never for a tag push: that is the real release, and it must not be
+    # preceded by a second full build of the same four images.
+    if: github.event_name != 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      # The throwaway registry: a service container of this job, so the
+      # digests the pipeline records are real digests of a real registry.
+      RELEASE_REGISTRY: localhost:5000
+      # The throwaway key: generated in this job, in this runner's
+      # temporary directory, and gone with the job. It is never the
+      # release key and it never leaves the runner.
+      COSIGN_KEY: cosign.key
+      COSIGN_PUBLIC_KEY: cosign.pub
+      # An empty password, so cosign neither prompts nor encrypts: the
+      # key is thrown away, so there is nothing to protect.
+      COSIGN_PASSWORD: ""
+    services:
+      registry:
+        image: registry:2
+        ports:
+          - "5000:5000"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      # The pipeline's own tests first: a change to the pipeline that
+      # breaks the tooling must not reach the image builds.
+      - name: The release tooling's own tests
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest==8.3.4
+          python -m pytest ops/release -q
+
+      # The version, the package, the crate and the changelog must agree
+      # (S2-T1). The dry run has no tag, so it uses the repository's own
+      # version — the one the next release will be cut from.
+      - name: The version, the package, the crate and the changelog must agree
+        id: version
+        run: |
+          set -euo pipefail
+          tag="v$(jq -r .version package.json)"
+          python3 ops/release/check_version.py "$tag"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
+      # `network=host` so the builder can reach the registry the job
+      # started: a buildx builder runs in a container of its own, and
+      # `localhost` inside it is the builder, not the runner. With the
+      # host's network namespace, `localhost:5000` is the registry
+      # service's published port.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+        with:
+          driver-opts: network=host
+
+      # The four images a release publishes. `GIT_SHA` is the commit the
+      # release is built from: the API serves an op's source only when
+      # the op's stamped commit is its own, and without the arg both
+      # stamp "unknown" and the console's source view answers 409 (see
+      # docker-compose.yml's `dagster-code-location` build block). The
+      # `ARG GIT_SHA` sits near the END of rust/Dockerfile, so the
+      # expensive cargo layers still come from the cache `ci.yml` wrote.
+      - name: Build and push the API image
+        id: image-api
+        uses: docker/build-push-action@v7
+        with:
+          context: rust
+          file: rust/Dockerfile
+          build-contexts: |
+            pipeline_src=dagster/dispar_orchestrate
+          build-args: |
+            CARGO_TARGET_DIR=/build/target-layer
+            GIT_SHA=${{ github.sha }}
+            PIPELINE_PACKAGE=dispar_orchestrate
+          tags: ${{ env.RELEASE_REGISTRY }}/rantai-lakehouse-api:${{ steps.version.outputs.version }}
+          push: true
+          cache-from: type=gha,scope=api-image
+
+      - name: Build and push the Dagster image
+        id: image-dagster
+        uses: docker/build-push-action@v7
+        with:
+          context: dagster
+          file: dagster/Dockerfile
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+          tags: ${{ env.RELEASE_REGISTRY }}/rantai-lakehouse-dagster:${{ steps.version.outputs.version }}
+          push: true
+          cache-from: type=gha,scope=dagster-image
+
+      - name: Build and push the oidc-mock image
+        id: image-oidc
+        uses: docker/build-push-action@v7
+        with:
+          context: ops/oidc-mock
+          file: ops/oidc-mock/Dockerfile
+          tags: ${{ env.RELEASE_REGISTRY }}/rantai-lakehouse-oidc-mock:${{ steps.version.outputs.version }}
+          push: true
+
+      - name: Build and push the console image
+        id: image-console
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile.frontend
+          build-args: |
+            RUST_API_URL=http://lakehouse-api:8080
+          tags: ${{ env.RELEASE_REGISTRY }}/rantai-lakehouse-console:${{ steps.version.outputs.version }}
+          push: true
+
+      # The digests the release is pinned to. The builder runs in a
+      # container, so the pushed images are NOT in the runner's image
+      # store: they are pulled back here, by digest, which is also the
+      # proof that the digest is pullable.
+      - name: The published images, by digest
+        id: images
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          for name in rantai-lakehouse-api rantai-lakehouse-dagster rantai-lakehouse-oidc-mock rantai-lakehouse-console; do
+            case "$name" in
+              rantai-lakehouse-api) digest="${{ steps.image-api.outputs.digest }}" ;;
+              rantai-lakehouse-dagster) digest="${{ steps.image-dagster.outputs.digest }}" ;;
+              rantai-lakehouse-oidc-mock) digest="${{ steps.image-oidc.outputs.digest }}" ;;
+              rantai-lakehouse-console) digest="${{ steps.image-console.outputs.digest }}" ;;
+            esac
+            echo "::group::$name"
+            echo "digest: $digest"
+            docker pull "${{ env.RELEASE_REGISTRY }}/$name:$version@$digest"
+            echo "::endgroup::"
+          done
+          {
+            echo "api=${{ env.RELEASE_REGISTRY }}/rantai-lakehouse-api:${{ steps.version.outputs.version }}@${{ steps.image-api.outputs.digest }}"
+            echo "dagster=${{ env.RELEASE_REGISTRY }}/rantai-lakehouse-dagster:${{ steps.version.outputs.version }}@${{ steps.image-dagster.outputs.digest }}"
+            echo "oidc=${{ env.RELEASE_REGISTRY }}/rantai-lakehouse-oidc-mock:${{ steps.version.outputs.version }}@${{ steps.image-oidc.outputs.digest }}"
+            echo "console=${{ env.RELEASE_REGISTRY }}/rantai-lakehouse-console:${{ steps.version.outputs.version }}@${{ steps.image-console.outputs.digest }}"
+          } >> "$GITHUB_OUTPUT"
+
+      # The digests, and the services that run them: the mapping is the
+      # checked-in one, so the pipeline and the CI check cannot drift.
+      - name: The images the services run
+        run: |
+          set -euo pipefail
+          jq -n \
+            --arg api "${{ steps.images.outputs.api }}" \
+            --arg dagster "${{ steps.images.outputs.dagster }}" \
+            --arg oidc "${{ steps.images.outputs.oidc }}" \
+            --arg console "${{ steps.images.outputs.console }}" \
+            '{"rantai-lakehouse-api": $api, "rantai-lakehouse-dagster": $dagster,
+              "rantai-lakehouse-oidc-mock": $oidc, "rantai-lakehouse-console": $console}' > digests.json
+          jq -n --argjson digests "$(cat digests.json)" \
+            --slurpfile map ops/release/release-images.json '
+              reduce ($map[0] | to_entries[]) as $entry
+                ({}; reduce ($entry.value[]) as $service (.; .[$service] = $digests[$entry.key]))' > images.json
+
+      # The signer. Pinned to an exact version, not a moving tag: the
+      # signer of a release must not change under the release's feet.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v4.1.2
+
+      # The throwaway key. It signs this job's images and this job's
+      # manifest, and it is verified against its own public key below —
+      # the same shape as the real run, with a key that costs nothing.
+      - name: Generate a throwaway signing key
+        run: |
+          set -euo pipefail
+          cosign generate-key-pair
+          cosign public-key --key cosign.key > cosign.pub
+
+      # Sign each image (decision D3). The images are signed for the
+      # operators who pull them by hand; the manifest is what
+      # `lakehousectl` verifies.
+      - name: Sign each image
+        run: |
+          set -euo pipefail
+          for name in rantai-lakehouse-api rantai-lakehouse-dagster rantai-lakehouse-oidc-mock rantai-lakehouse-console; do
+            ref="$(jq -r --arg name "$name" '.[$name]' digests.json)"
+            echo "signing $ref"
+            cosign sign --key "$COSIGN_KEY" "$ref"
+          done
+
+      # A CycloneDX SBOM per image, and the attestation that binds it to
+      # the image's digest.
+      - name: The SBOM of the API image
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ steps.images.outputs.api }}
+          format: cyclonedx
+          output-file: sbom/rantai-lakehouse-api.cdx.json
+          upload-artifact: false
+
+      - name: The SBOM of the Dagster image
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ steps.images.outputs.dagster }}
+          format: cyclonedx
+          output-file: sbom/rantai-lakehouse-dagster.cdx.json
+          upload-artifact: false
+
+      - name: The SBOM of the oidc-mock image
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ steps.images.outputs.oidc }}
+          format: cyclonedx
+          output-file: sbom/rantai-lakehouse-oidc-mock.cdx.json
+          upload-artifact: false
+
+      - name: The SBOM of the console image
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ steps.images.outputs.console }}
+          format: cyclonedx
+          output-file: sbom/rantai-lakehouse-console.cdx.json
+          upload-artifact: false
+
+      - name: Attest each SBOM to its image
+        run: |
+          set -euo pipefail
+          for name in rantai-lakehouse-api rantai-lakehouse-dagster rantai-lakehouse-oidc-mock rantai-lakehouse-console; do
+            ref="$(jq -r --arg name "$name" '.[$name]' digests.json)"
+            echo "attesting $name"
+            cosign attest --key "$COSIGN_KEY" --type cyclonedx \
+              --predicate "sbom/$name.cdx.json" "$ref"
+          done
+
+      # The release's Compose file: the template, rendered, with every
+      # image pinned by digest (S2-T2).
+      - name: Render the release's Compose file
+        run: |
+          set -euo pipefail
+          python3 ops/release/render_compose.py \
+            --images "$(cat images.json)" -o docker-compose.release.yml
+
+      # The manifest, and the checksum of the Compose file it ships
+      # (S2-T3).
+      - name: Write the release manifest
+        run: |
+          set -euo pipefail
+          python3 ops/release/make_manifest.py \
+            --version "${{ steps.version.outputs.version }}" \
+            --git-sha "$GITHUB_SHA" \
+            --images "$(cat images.json)" \
+            --compose docker-compose.release.yml \
+            --out release.json
+
+      # Sign the manifest, and verify it at once: a signature that does
+      # not verify is a release that cannot be installed.
+      - name: Sign the manifest and verify the signature
+        run: |
+          set -euo pipefail
+          cosign sign-blob --key "$COSIGN_KEY" --output-signature release.json.sig release.json
+          cosign verify-blob --key "$COSIGN_PUBLIC_KEY" \
+            --signature release.json.sig release.json
+
+      # The bundle (decision D11): the Compose file, the manifest, its
+      # signature, one `docker save` per image, the SBOMs and the
+      # checksums.
+      - name: Build the offline bundle
+        run: |
+          set -euo pipefail
+          ops/release/make_bundle.sh \
+            --manifest release.json \
+            --compose docker-compose.release.yml \
+            --signature release.json.sig \
+            --sbom-dir sbom \
+            --out dist
+
+      # The rendered Compose file must be a file compose accepts: the
+      # env values are throwaway, because the template has no default
+      # credentials (SEC-18) and compose refuses to interpolate a missing
+      # `${VAR:?}` before it will parse the file at all.
+      - name: The rendered Compose file must be a valid one
+        env:
+          POSTGRES_PASSWORD: ci-only-pg-password-0001
+          RUSTFS_ACCESS_KEY: ci-only-rustfs-access-0001
+          RUSTFS_SECRET_KEY: ci-only-rustfs-secret-0001
+          LAKEKEEPER_ENCRYPTION_KEY: ci-only-lakekeeper-key-0001
+          CONNECTOR_SECRETS_KEY: ci-only-connector-secrets-key-0001
+        run: |
+          set -euo pipefail
+          env_file="$RUNNER_TEMP/release-check.env"
+          {
+            echo "POSTGRES_PASSWORD=$POSTGRES_PASSWORD"
+            echo "RUSTFS_ACCESS_KEY=$RUSTFS_ACCESS_KEY"
+            echo "RUSTFS_SECRET_KEY=$RUSTFS_SECRET_KEY"
+            echo "LAKEKEEPER_ENCRYPTION_KEY=$LAKEKEEPER_ENCRYPTION_KEY"
+            echo "CONNECTOR_SECRETS_KEY=$CONNECTOR_SECRETS_KEY"
+          } > "$env_file"
+          docker compose --env-file "$env_file" \
+            -f docker-compose.release.yml --profile '*' config --quiet
+
+      # The bundle's size, in the run's summary: it is the number the
+      # release notes quote.
+      - name: The bundle's size
+        run: |
+          set -euo pipefail
+          bundle="dist/rantai-lakehouse-${{ steps.version.outputs.version }}-linux-x86_64.tar.zst"
+          size="$(wc -c < "$bundle")"
+          {
+            echo "## Release pipeline · dry run"
+            echo ""
+            echo "- version: ${{ steps.version.outputs.version }}"
+            echo "- bundle: \`$(basename "$bundle")\`"
+            echo "- size: $size bytes ($((size / 1024 / 1024)) MiB)"
+            echo "- images: $(jq 'length' digests.json) published, each signed and attested"
+            echo ""
+            echo "Nothing was published: the images went to a throwaway registry and the"
+            echo "key was generated in this job."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # The bundle and the manifest, as artifacts: this is what the
+      # dry run produces.
+      - name: Upload the bundle and the manifest
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-dry-run
+          path: |
+            dist/*.tar.zst
+            dist/*.sha256
+            release.json
+            release.json.sig
+            docker-compose.release.yml
+            sbom/*.cdx.json
+          retention-days: 7
+          if-no-files-found: error
+
+  # ── The real release ───────────────────────────────────────────────
+  release:
+    name: Release · draft
+    # The real release, and only the real release: a tag push, never a
+    # pull request. The `release` environment's protection rules (a
+    # required reviewer) are what stand between a tag and a signed
+    # release.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    environment: release
+    permissions:
+      contents: write
+      packages: write
+    env:
+      RELEASE_REGISTRY: ghcr.io/rantai-dev
+      # The release key: a secret of the `release` environment. It is
+      # the base64 of the encrypted private key; `COSIGN_PASSWORD` is
+      # the password that opens it. Neither is readable by any other
+      # job, and neither is readable by a pull request.
+      COSIGN_KEY: env://COSIGN_PRIVATE_KEY
+      # The public key, committed: the same one `lakehousectl` compiles
+      # in, so a signature made here verifies on an air-gapped host.
+      COSIGN_PUBLIC_KEY: ops/release/release.pub
+      COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      # The pipeline's own tests, here too: the release job signs with
+      # the real key, so it is the last place a mistake in the tooling
+      # can be caught before it publishes something.
+      - name: The release tooling's own tests
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest==8.3.4
+          python -m pytest ops/release -q
+
+      # The tag names the version, and the version must be the same in
+      # the package, the crate and the changelog (S2-T1).
+      - name: The version, the package, the crate and the changelog must agree
+        id: version
+        run: |
+          set -euo pipefail
+          python3 ops/release/check_version.py "$GITHUB_REF_NAME"
+          echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      # The same four images as the dry run, with the same arguments;
+      # see the dry run for why each one is what it is.
+      - name: Build and push the API image
+        id: image-api
+        uses: docker/build-push-action@v7
+        with:
+          context: rust
+          file: rust/Dockerfile
+          build-contexts: |
+            pipeline_src=dagster/dispar_orchestrate
+          build-args: |
+            CARGO_TARGET_DIR=/build/target-layer
+            GIT_SHA=${{ github.sha }}
+            PIPELINE_PACKAGE=dispar_orchestrate
+          tags: ${{ env.RELEASE_REGISTRY }}/rantai-lakehouse-api:${{ steps.version.outputs.version }}
+          push: true
+          cache-from: type=gha,scope=api-image
+
+      - name: Build and push the Dagster image
+        id: image-dagster
+        uses: docker/build-push-action@v7
+        with:
+          context: dagster
+          file: dagster/Dockerfile
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+          tags: ${{ env.RELEASE_REGISTRY }}/rantai-lakehouse-dagster:${{ steps.version.outputs.version }}
+          push: true
+          cache-from: type=gha,scope=dagster-image
+
+      - name: Build and push the oidc-mock image
+        id: image-oidc
+        uses: docker/build-push-action@v7
+        with:
+          context: ops/oidc-mock
+          file: ops/oidc-mock/Dockerfile
+          tags: ${{ env.RELEASE_REGISTRY }}/rantai-lakehouse-oidc-mock:${{ steps.version.outputs.version }}
+          push: true
+
+      - name: Build and push the console image
+        id: image-console
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile.frontend
+          build-args: |
+            RUST_API_URL=http://lakehouse-api:8080
+          tags: ${{ env.RELEASE_REGISTRY }}/rantai-lakehouse-console:${{ steps.version.outputs.version }}
+          push: true
+
+      # Pull the pushed images back by digest: the builder runs in a
+      # container, so they are not in the runner's image store, and
+      # `docker save` needs them there.
+      - name: The published images, by digest
+        id: images
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          for name in rantai-lakehouse-api rantai-lakehouse-dagster rantai-lakehouse-oidc-mock rantai-lakehouse-console; do
+            case "$name" in
+              rantai-lakehouse-api) digest="${{ steps.image-api.outputs.digest }}" ;;
+              rantai-lakehouse-dagster) digest="${{ steps.image-dagster.outputs.digest }}" ;;
+              rantai-lakehouse-oidc-mock) digest="${{ steps.image-oidc.outputs.digest }}" ;;
+              rantai-lakehouse-console) digest="${{ steps.image-console.outputs.digest }}" ;;
+            esac
+            echo "::group::$name"
+            echo "digest: $digest"
+            docker pull "${{ env.RELEASE_REGISTRY }}/$name:$version@$digest"
+            echo "::endgroup::"
+          done
+          {
+            echo "api=${{ env.RELEASE_REGISTRY }}/rantai-lakehouse-api:${{ steps.version.outputs.version }}@${{ steps.image-api.outputs.digest }}"
+            echo "dagster=${{ env.RELEASE_REGISTRY }}/rantai-lakehouse-dagster:${{ steps.version.outputs.version }}@${{ steps.image-dagster.outputs.digest }}"
+            echo "oidc=${{ env.RELEASE_REGISTRY }}/rantai-lakehouse-oidc-mock:${{ steps.version.outputs.version }}@${{ steps.image-oidc.outputs.digest }}"
+            echo "console=${{ env.RELEASE_REGISTRY }}/rantai-lakehouse-console:${{ steps.version.outputs.version }}@${{ steps.image-console.outputs.digest }}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: The images the services run
+        run: |
+          set -euo pipefail
+          jq -n \
+            --arg api "${{ steps.images.outputs.api }}" \
+            --arg dagster "${{ steps.images.outputs.dagster }}" \
+            --arg oidc "${{ steps.images.outputs.oidc }}" \
+            --arg console "${{ steps.images.outputs.console }}" \
+            '{"rantai-lakehouse-api": $api, "rantai-lakehouse-dagster": $dagster,
+              "rantai-lakehouse-oidc-mock": $oidc, "rantai-lakehouse-console": $console}' > digests.json
+          jq -n --argjson digests "$(cat digests.json)" \
+            --slurpfile map ops/release/release-images.json '
+              reduce ($map[0] | to_entries[]) as $entry
+                ({}; reduce ($entry.value[]) as $service (.; .[$service] = $digests[$entry.key]))' > images.json
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v4.1.2
+
+      - name: Sign each image
+        run: |
+          set -euo pipefail
+          for name in rantai-lakehouse-api rantai-lakehouse-dagster rantai-lakehouse-oidc-mock rantai-lakehouse-console; do
+            ref="$(jq -r --arg name "$name" '.[$name]' digests.json)"
+            echo "signing $ref"
+            cosign sign --key "$COSIGN_KEY" "$ref"
+          done
+
+      - name: The SBOM of the API image
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ steps.images.outputs.api }}
+          format: cyclonedx
+          output-file: sbom/rantai-lakehouse-api.cdx.json
+          upload-artifact: false
+
+      - name: The SBOM of the Dagster image
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ steps.images.outputs.dagster }}
+          format: cyclonedx
+          output-file: sbom/rantai-lakehouse-dagster.cdx.json
+          upload-artifact: false
+
+      - name: The SBOM of the oidc-mock image
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ steps.images.outputs.oidc }}
+          format: cyclonedx
+          output-file: sbom/rantai-lakehouse-oidc-mock.cdx.json
+          upload-artifact: false
+
+      - name: The SBOM of the console image
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ steps.images.outputs.console }}
+          format: cyclonedx
+          output-file: sbom/rantai-lakehouse-console.cdx.json
+          upload-artifact: false
+
+      - name: Attest each SBOM to its image
+        run: |
+          set -euo pipefail
+          for name in rantai-lakehouse-api rantai-lakehouse-dagster rantai-lakehouse-oidc-mock rantai-lakehouse-console; do
+            ref="$(jq -r --arg name "$name" '.[$name]' digests.json)"
+            echo "attesting $name"
+            cosign attest --key "$COSIGN_KEY" --type cyclonedx \
+              --predicate "sbom/$name.cdx.json" "$ref"
+          done
+
+      - name: Render the release's Compose file
+        run: |
+          set -euo pipefail
+          python3 ops/release/render_compose.py \
+            --images "$(cat images.json)" -o docker-compose.release.yml
+
+      - name: Write the release manifest
+        run: |
+          set -euo pipefail
+          python3 ops/release/make_manifest.py \
+            --version "${{ steps.version.outputs.version }}" \
+            --git-sha "$GITHUB_SHA" \
+            --images "$(cat images.json)" \
+            --compose docker-compose.release.yml \
+            --out release.json
+
+      # Sign the manifest with the RELEASE key, and verify it with the
+      # committed public key — the one `lakehousectl` holds. A signature
+      # that does not verify against the committed key is not a release.
+      - name: Sign the manifest and verify the signature
+        run: |
+          set -euo pipefail
+          cosign sign-blob --key "$COSIGN_KEY" --output-signature release.json.sig release.json
+          cosign verify-blob --key "$COSIGN_PUBLIC_KEY" \
+            --signature release.json.sig release.json
+
+      - name: Build the offline bundle
+        run: |
+          set -euo pipefail
+          ops/release/make_bundle.sh \
+            --manifest release.json \
+            --compose docker-compose.release.yml \
+            --signature release.json.sig \
+            --sbom-dir sbom \
+            --out dist
+
+      # The release's own assets, and their checksums: the operator who
+      # downloads them can check them against the release page.
+      - name: The release's assets
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          mkdir -p release-assets
+          cp "dist/rantai-lakehouse-$version-linux-x86_64.tar.zst" release-assets/
+          cp "dist/rantai-lakehouse-$version-linux-x86_64.tar.zst.sha256" release-assets/
+          cp release.json release-assets/
+          cp release.json.sig release-assets/
+          cp sbom/*.cdx.json release-assets/
+          # `install.sh` joins the release in REL-2 S3, when it exists.
+          if [ -f ops/release/install.sh ]; then
+            cp ops/release/install.sh release-assets/
+          fi
+          (
+            cd release-assets
+            sha256sum ./*.tar.zst ./release.json ./release.json.sig ./*.cdx.json > SHA256SUMS
+          )
+
+      # The release is a DRAFT: the product owner publishes it, after
+      # checking that the bundle, the manifest and the images are what
+      # the release should be. Nothing is public until then.
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          {
+            echo "RantAI Lakehouse v$version."
+            echo ""
+            echo "Attached: the offline bundle and its checksum, the release manifest"
+            echo "and its signature, and the CycloneDX SBOM of each image. The upgrade"
+            echo "notes are written in REL-2 S5 (docs/core/reference/release-policy.md)."
+            echo ""
+            echo "This release is a draft. The product owner publishes it."
+          } > release-notes.md
+          gh release create "v$version" \
+            --draft \
+            --title "RantAI Lakehouse v$version" \
+            --notes-file release-notes.md \
+            release-assets/*
