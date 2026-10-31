@@ -682,6 +682,18 @@ _CDC_ORACLE_REQUIRED = (
 _CDC_ORACLE_EITHER_PER_TABLE = ("FLASHBACK ANY TABLE", "SELECT ANY TABLE")
 
 
+def _unread(fact: str, exc: BaseException | None = None) -> None:
+    """Say, in the job log, which setup fact was not read: the fact's name, the exception's type and the
+    Oracle error CODE (`ORA-nnnnn`) when it has one -- never the message (AGENTS.md principle 4)."""
+    code = re.search(r"ORA-\d{5}", str(exc)) if exc is not None else None
+    logger.info(
+        "Oracle setup fact %s was not read (%s%s)",
+        fact,
+        type(exc).__name__ if exc is not None else "no such container",
+        f", {code.group(0)}" if code else "",
+    )
+
+
 def _read_oracle_rows(connection: Any, sql: str) -> list[tuple]:
     from sqlalchemy import text
 
@@ -697,28 +709,30 @@ def oracle_setup_facts(connection: Any, dial: dict, tables: list[str]) -> dict[s
         mode = _read_oracle_rows(connection, _CDC_ORACLE_LOG_MODE)[0][0]
         if mode in ("ARCHIVELOG", "NOARCHIVELOG"):
             facts["logMode"] = mode.lower()
-    except Exception:  # noqa: BLE001 -- an unread fact is left out, never guessed (and never quoted)
-        pass
+    except Exception as exc:  # noqa: BLE001 -- an unread fact is left out, never guessed (and never quoted)
+        _unread("logMode", exc)
     try:
         minimal, everything = _read_oracle_rows(connection, _CDC_ORACLE_SUPPLEMENTAL)[0]
         if minimal in ("YES", "NO", "IMPLICIT"):
             facts["supplementalMin"] = minimal.lower()
         if everything in ("YES", "NO"):
             facts["supplementalAll"] = everything == "YES"
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as exc:  # noqa: BLE001
+        _unread("supplemental", exc)
     try:
         held = {r[0] for r in _read_oracle_rows(connection, _CDC_ORACLE_PRIVILEGES)}
         held |= {r[0] for r in _read_oracle_rows(connection, _CDC_ORACLE_ROLES)}
         facts["missingPrivileges"] = [p for p in (*_CDC_ORACLE_REQUIRED, *_CDC_ORACLE_EITHER_PER_TABLE) if p not in held]
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as exc:  # noqa: BLE001
+        _unread("missingPrivileges", exc)
     try:
         per_table = _oracle_table_facts(connection, dial, tables)
         if per_table is not None:
             facts["tables"] = per_table
-    except Exception:  # noqa: BLE001
-        pass
+        else:
+            _unread("tables")
+    except Exception as exc:  # noqa: BLE001
+        _unread("tables", exc)
     return facts
 
 
