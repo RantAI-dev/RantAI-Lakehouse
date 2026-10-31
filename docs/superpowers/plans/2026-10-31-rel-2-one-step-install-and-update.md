@@ -1137,3 +1137,23 @@ repository's own Python guards ran too: `python3 ops/lint/check_intra_package_im
   `release` environment, and the release key. REL-2 S5 does that.
 - No cargo command and no bun command ran: this round changes no Rust, no TypeScript, no code
   location and no Compose file.
+
+### Review S2 round 5 (planner, 2026-11-01): the PR's second dry run, at `0cef322`
+
+The SBOM step now works, and the key is masked (`***`) and visible to the signing steps only. The
+run then failed at "Attest each SBOM to its image": `cosign attest --type cyclonedx` answered
+`invalid character '<' looking for beginning of value`.
+
+**BLOCKER 1 (round 5): the SBOM is XML.**
+- `anchore/sbom-action` was given the format `cyclonedx`, which syft writes as CycloneDX **XML**.
+  `cosign attest --type cyclonedx` reads a **JSON** predicate.
+- **Fix:** use `format: cyclonedx-json` in every SBOM step of both jobs. The `.cdx.json` file names
+  are then true.
+- Add a check to `test_release_workflow.py`: every sbom-action step uses `cyclonedx-json`.
+
+**Noted, not a finding:** cosign v3 prints `--tlog-upload has been deprecated, prefer using a
+--signing-config file with no transparency log services`. The flag still works, and the
+proxy-logged proof stands. Replacing it with a `--signing-config` file is left for when the flag
+is removed; add a line to `docs/CI.md` saying so.
+
+**Open: BLOCKER 1 (round 5).**
