@@ -1218,3 +1218,40 @@ file and the fix only): **82 passed, 0 failed**, and `actionlint` clean, exit 0.
   on the `release` environment, and the release key. REL-2 S5 does that.
 - No cargo command and no bun command ran: this round changes no Rust, no TypeScript, no code
   location and no Compose file.
+
+### Review S2 round 6 (planner, 2026-11-01): the dry run is green, at `0b89767`
+
+The PR's dry run passed end to end:
+- four images built, pushed by digest and signed;
+- the CycloneDX JSON SBOMs attested;
+- the manifest signed, and "Verified OK" offline;
+- the bundle built, **401 MiB** compressed (1.61 GiB unpacked).
+
+**BLOCKER 1 (round 6): the offline bundle holds only our four images.**
+- `make_manifest.py` writes `images` from the published images alone (`release-images.json`).
+  `make_bundle.sh` saves only what `images` names.
+- Every third-party image the rendered Compose file runs is missing from both: Postgres,
+  ClickHouse, Lakekeeper, OpenFGA, RustFS, Gotenberg, the init images, and the `trino`,
+  `seaweedfs` and `backups` profiles.
+- An air-gapped host could not start the stack. Section 0 of this plan says the manifest holds
+  "every image's digest", so this misses the plan.
+- **Fix:**
+  - `images` in `release.json` maps **every service of the rendered Compose file** to its
+    `ref@sha256:…`. Ours come from the published digests, and the third-party ones from the
+    rendered file, which is already pinned by digest (the S1 lint).
+  - `make_bundle.sh` saves every **unique** reference. That takes a `docker pull` by digest first
+    for the third-party ones; ours are already local or are pulled.
+  - **SBOMs:**
+    - every image in the bundle carries one: run `syft <ref> -o cyclonedx-json` for each
+      third-party image, in a loop step pinned to the same syft version the sbom-action uses;
+    - only our four images are signed and attested, because we cannot sign other people's
+      images in their registries. Their integrity comes from the digest in the signed manifest.
+  - Keep the "every image has an SBOM" check.
+  - **Runner disk:** the dry run must free disk first, as `g9-upload-large.yml` does. Print
+    `df -h` before and after the bundle.
+  - Tests in `test_make_manifest.py`: the manifest names every service of a rendered fixture,
+    and a third-party image without a digest is refused.
+- The bundle will be several GiB. Print its size in the summary, as now. The release notes report
+  it (spec: "measured, never assumed").
+
+**Open: BLOCKER 1 (round 6).**
