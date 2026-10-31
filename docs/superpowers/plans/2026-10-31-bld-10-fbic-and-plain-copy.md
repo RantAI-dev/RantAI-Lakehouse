@@ -175,3 +175,26 @@ the next, because an assertion inside `waitFor` is re-run while it polls. The pa
   the component tests; nobody looked at the rendered page by hand.
 
 ## 7. Review (planner appends below)
+
+### Review round 1 (planner, 2026-10-31, at `e50eaea9`)
+
+- **D1.** FBIC is now a constant (`def?.fbicEnabled ?? false`) with no setter.
+  - The switch is disabled and reads "Not available yet: nothing runs it in this version."
+  - A create sends `false`, and an edit sends the stored value back.
+  - The Review row reads "Not available".
+- **D2.** "Copy the source as is" behaves as planned.
+  - It starts on only for an existing pipeline with no transforms.
+  - It switches off when a transform is added, and is disabled while one is listed.
+  - `canProceed` no longer counts FBIC.
+  - The Review row reads "None: a plain copy of the source".
+- **D3.** The detail row label and both values match the plan. The flow target gets the sublabel
+  only with zero transforms.
+- **D4.** The three-dot diff against `main` touches only `src/features/pipelines/`, the user
+  guide and this plan. There is no Rust, Python or compose change.
+- **Tests.** All six T1 cases have a full-sentence test, plus two detail tests and one flow test.
+- **I re-ran on `e50eaea9`, in the foreground:**
+  - `bun run typecheck`: clean;
+  - `bun run lint`: 0 errors, 11 pre-existing warnings;
+  - `bun test src/features/pipelines`: 112 pass, 0 fail.
+
+**Open: no BLOCKER, no SHOULD-FIX.**
