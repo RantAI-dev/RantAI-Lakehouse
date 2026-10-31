@@ -503,7 +503,8 @@ fn style_properties() -> Value {
             "description": "table, pivot and kpi only: colour a cell or the value by a rule, for example below 1,000 in red" },
         "clusters": { "type": ["object", "null"], "properties": {
             "k": { "oneOf": [ { "type": "string", "enum": ["auto"] }, { "type": "integer", "minimum": 2, "maximum": 10 } ], "description": "\"auto\" (the console picks from 2 to 10) or a number of groups" } }, "required": ["k"],
-            "description": "scatter and bubble only: colour the points by cluster (k-means over the points on screen)" }
+            "description": "scatter and bubble only: colour the points by cluster (k-means over the points on screen)" },
+        "todayLine": { "type": "boolean", "description": "Gantt only: a line at today's date" }
     })
 }
 
@@ -526,7 +527,13 @@ fn format_chart_schema() -> Value {
         "chart".to_owned(),
         json!({ "type": "string", "description": "the id of the chart (list_charts)" }),
     );
-    if let Value::Object(style) = style_properties() {
+    if let Value::Object(mut style) = style_properties() {
+        // `todayLine` (a Gantt chart's line at today) is a field of the
+        // chart, not of the formatting tool: `format_chart` may change only
+        // the fields its own list names, and that list does not name it, so
+        // the schema does not offer it. `create_chart` and `update_chart`
+        // take it.
+        style.remove("todayLine");
         properties.extend(style);
     }
     properties.insert("referenceLines".to_owned(), reference_lines_schema());
@@ -556,8 +563,121 @@ fn set_cache_rule_schema() -> Value {
             "required": ["rule"] } } })
 }
 
+/// The descriptions `create_chart` keeps: the fields whose meaning the build
+/// suffix does not state (`AI-15`).
+///
+/// The build suffix (the build mode's system prompt) tells the model what
+/// the chart kinds, the pivot fields, the Gantt fields, the map fields and
+/// the reference lines mean, and `format_chart` documents the formatting
+/// fields in its own schema. Repeating those rules in `create_chart` costs
+/// the same tokens on every build turn and does not fit a 32k context next
+/// to the rest of the tool list, so the descriptions the suffix states are
+/// dropped here and the rule stays in the one place that is shared between
+/// turns.
+///
+/// The pointers are JSON Pointers into the chart schema's properties.
+const KEPT_CHART_DESCRIPTIONS: &[(&str, &str)] = &[
+    (
+        "/function/parameters/properties/grain",
+        "how to group a date or timestamp `dimension` (describe_mart gives the column's kind); a calendar chart takes day only",
+    ),
+    (
+        "/function/parameters/properties/measures",
+        "the columns to aggregate (numbers): a column name, {column, aggregate} for a column with its own aggregate (its result is named <aggregate>_<column>), or {metric: name}",
+    ),
+    (
+        "/function/parameters/properties/measures/items/oneOf/1",
+        "a measure with its own aggregate; not for kpi, gauge, boxplot, maps, pivot or a table in rows mode",
+    ),
+    (
+        "/function/parameters/properties/sort",
+        "the order of the groups, in place of the default; with `limit` it keeps the first N in that order (top N: desc by a measure; bottom N: asc)",
+    ),
+    (
+        "/function/parameters/properties/sort/properties/by",
+        "the dimension, a grouping of a table, or a measure's result name",
+    ),
+    (
+        "/function/parameters/properties/other",
+        "with `limit` and `sort`: gather every group past the limit into one group called Other",
+    ),
+    (
+        "/function/parameters/properties/steps",
+        "up to two steps on the grouped result, in order: {filter: {column, value}} or {summarise: {by, measures}}; not for kpi, gauge, pivot, a raw table, maps, a time grain, a breakdown or 'Other'",
+    ),
+    (
+        "/function/parameters/properties/filters",
+        "the chart's own filters (at most 20), always applied: {op: in, not_in, between, contains, starts_with, ends_with, relative, values, min, max, text} or {segment: name}",
+    ),
+    (
+        "/function/parameters/properties/groupings",
+        "table only: the columns a grouped table is grouped by (1 to 5), instead of `dimension`",
+    ),
+    (
+        "/function/parameters/properties/columnSettings",
+        "table and pivot: per column name, {label, format (auto, number, percent, currency, date, link, image), decimals 0 to 6, width 60 to 800, wrap, hidden}",
+    ),
+    (
+        "/function/parameters/properties/click",
+        "what a click on the chart does instead of the drill menu: {kind: dashboard, board, column}, {kind: query, id} or {kind: url, url}",
+    ),
+    (
+        "/function/parameters/properties/limit",
+        "the number of groups to show; with `sort` it keeps the first N in that order",
+    ),
+];
+
+/// Drops every `description` under a schema's properties, at every depth.
+///
+/// The tool's own description (what the tool is for) is left alone: only
+/// the field descriptions go.
+fn without_property_descriptions(mut schema: Value) -> Value {
+    if let Some(properties) = schema
+        .pointer_mut("/function/parameters/properties")
+        .and_then(Value::as_object_mut)
+    {
+        for property in properties.values_mut() {
+            strip_descriptions(property);
+        }
+    }
+    schema
+}
+
+/// Removes the `description` of a schema node and of everything under it.
+fn strip_descriptions(node: &mut Value) {
+    match node {
+        Value::Object(map) => {
+            map.remove("description");
+            for value in map.values_mut() {
+                strip_descriptions(value);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                strip_descriptions(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Puts back the descriptions of the fields named in `kept`, each at its
+/// JSON Pointer. A pointer that names nothing is a mistake in the table
+/// above, so the field is left without a description rather than the whole
+/// schema quietly wrong.
+fn with_kept_descriptions(mut schema: Value, kept: &[(&str, &str)]) -> Value {
+    for (pointer, description) in kept {
+        if let Some(node) = schema.pointer_mut(pointer)
+            && let Some(map) = node.as_object_mut()
+        {
+            map.insert("description".to_owned(), json!(description));
+        }
+    }
+    schema
+}
+
 fn create_chart_schema() -> Value {
-    with_type_properties(with_style_properties(with_shape_properties(
+    let schema = with_type_properties(with_style_properties(with_shape_properties(
         with_table_properties(
             json!({ "type": "function", "function": { "name": "create_chart",
         "description": "Create a chart card on a dashboard (/dashboards) from a Gold mart OR a saved SQL source (sqlSource, for data that combines several marts). The server writes the SQL from the columns you pick; you do not write SQL. Call describe_mart (or list_sql_sources) first to use columns that exist.",
@@ -579,33 +699,41 @@ fn create_chart_schema() -> Value {
             "board": { "type": "string" } },
             "required": ["title", "kind"] } } }),
         ),
-    )))
+    )));
+    // The field descriptions the build suffix states are dropped, and the
+    // ones it does not state are kept: the suffix is the one place that
+    // carries the rules between turns.
+    with_kept_descriptions(
+        without_property_descriptions(schema),
+        KEPT_CHART_DESCRIPTIONS,
+    )
 }
 
+/// The schema of `update_chart`: the fields of `create_chart` and the chart's
+/// id, and nothing else (`AI-15`).
+///
+/// The two tools are always offered in the same turn, so the model reads
+/// the full schema once: `update_chart` names the fields and points at
+/// `create_chart` for their meanings, which keeps the offered list small
+/// enough for a 32k context.
+///
+/// `title` and `kind` stay required, as they were: the server replaces the
+/// chart's whole definition, so a call without them would empty the chart.
 fn update_chart_schema() -> Value {
-    with_type_properties(with_style_properties(with_shape_properties(
-        with_table_properties(
-            json!({ "type": "function", "function": { "name": "update_chart",
-        "description": "Change a saved chart (by id), keeping its id. Send every field, as for create_chart, with the new values. list_charts gives the ids.",
-        "parameters": { "type": "object", "properties": {
-            "id": { "type": "string" }, "title": { "type": "string" }, "subtitle": { "type": "string" },
-            "mart": { "type": "string" }, "kind": { "type": "string", "enum": chart_kind_enum() },
-            "sqlSource": { "type": "string", "description": "SQL source id (s_…) from list_sql_sources, instead of mart for a chart that combines several marts; set mart OR sqlSource, not both" },
-            "dimension": { "type": "string" },
-            "measures": measures_schema(),
-            "breakdown": { "type": "string" }, "caption": { "type": "string" },
-            "map": { "type": "string", "description": "map kinds only (geomap, pointmap, geoheat): id of a bundled map, one of dki-jakarta, id-provinces, id-regencies" },
-            "lat": { "type": "string", "description": "pointmap and geoheat only (required): the latitude column" },
-            "lon": { "type": "string", "description": "pointmap and geoheat only (required): the longitude column" },
-            "target": { "type": "number" },
-            "aggregate": { "type": "string", "enum": ["sum", "avg", "max", "min", "count"] },
-            "limit": { "type": "number" }, "span": { "type": "number", "enum": [1, 2] },
-            "click": { "type": "object", "description": "what a click on the chart does instead of the drill menu (not for text): {\"kind\":\"dashboard\",\"board\":<dashboard id>,\"column\":<column of that dashboard the clicked value filters>}, {\"kind\":\"query\",\"id\":<saved query id>}, or {\"kind\":\"url\",\"url\":<https://… or a /path; {value} is replaced by the clicked value>}" },
-            "grain": { "type": "string", "enum": grain_enum(), "description": GRAIN_DESCRIPTION },
-            "board": { "type": "string" } },
-            "required": ["id", "title", "kind"] } } }),
-        ),
-    )))
+    let mut properties = serde_json::Map::new();
+    properties.insert("id".to_owned(), json!({ "type": "string" }));
+    if let Some(create) = create_chart_schema()
+        .pointer("/function/parameters/properties")
+        .and_then(Value::as_object)
+    {
+        for name in create.keys() {
+            properties.insert(name.clone(), json!({}));
+        }
+    }
+    json!({ "type": "function", "function": { "name": "update_chart",
+        "description": "Change a saved chart (by id), keeping its id. Send every field, as for create_chart, with the new values: the fields, their meanings and their rules are those of create_chart, which this same turn offers. list_charts gives the ids.",
+        "parameters": { "type": "object", "properties": properties,
+            "required": ["id", "title", "kind"] } } })
 }
 
 fn create_board_schema() -> Value {
@@ -2558,21 +2686,19 @@ mod tests {
             assert_eq!(spec.risk, risk, "{name}");
             assert_eq!(spec.permission, permission, "{name}");
         }
-        // A measure may be a metric, and a filter a segment, on both chart tools.
-        for tool in ["create_chart", "update_chart"] {
-            let schema = (find(tool).expect("registered tool").schema)();
-            let properties = &schema["function"]["parameters"]["properties"];
-            assert_eq!(
-                properties["measures"]["items"]["oneOf"][3]["required"],
-                json!(["metric"]),
-                "{tool}"
-            );
-            assert_eq!(
-                properties["filters"]["items"]["oneOf"][0]["required"],
-                json!(["segment"]),
-                "{tool}"
-            );
-        }
+        // A measure may be a metric, and a filter a segment, on the chart
+        // tool that carries the fields (`AI-15`: `update_chart` names the
+        // fields of `create_chart` and points at it for their shapes).
+        let schema = (find("create_chart").expect("registered tool").schema)();
+        let properties = &schema["function"]["parameters"]["properties"];
+        assert_eq!(
+            properties["measures"]["items"]["oneOf"][3]["required"],
+            json!(["metric"])
+        );
+        assert_eq!(
+            properties["filters"]["items"]["oneOf"][0]["required"],
+            json!(["segment"])
+        );
     }
 
     /// `BI-18` part C (with `AI-9`): the tab tools need `dashboard:write`, the
@@ -2625,24 +2751,56 @@ mod tests {
     /// `BI-11` (with `AI-6`): the chart tools take a parameter for the limit
     /// and the column slots, and reference lines.
     #[test]
-    fn the_formatting_fields_are_the_same_on_the_three_chart_tools() {
-        // BI-17 part A / AI-8: written once (`style_properties`), so create_chart, update_chart
-        // and format_chart cannot drift, and every field is a field of `lakehouse_bi::style`.
+    fn the_formatting_fields_are_the_same_on_the_chart_tools() {
+        // BI-17 part A / AI-8: written once (`style_properties`), so the chart
+        // tools cannot drift, and every field is a field of `lakehouse_bi::style`.
         let style = style_properties();
         let style = style.as_object().expect("an object");
-        assert_eq!(style.len(), 10);
-        for tool in ["create_chart", "update_chart", "format_chart"] {
-            let schema = (find(tool).expect("registered tool").schema)();
-            let properties = &schema["function"]["parameters"]["properties"];
-            for (field, definition) in style {
-                assert_eq!(&properties[field], definition, "{tool} {field}");
-            }
-            assert_eq!(
-                properties["referenceLines"],
-                reference_lines_schema(),
-                "{tool}"
-            );
+        assert_eq!(style.len(), 11);
+        // `create_chart` takes every style field. Its descriptions are the
+        // ones the build suffix does not state (`AI-15`), so the shape of
+        // each field is what is compared here.
+        let schema = (find("create_chart").expect("registered tool").schema)();
+        let properties = &schema["function"]["parameters"]["properties"];
+        for (field, definition) in style {
+            let mut shape = definition.clone();
+            strip_descriptions(&mut shape);
+            assert_eq!(&properties[field], &shape, "create_chart {field}");
         }
+        // `referenceLines` too: the build suffix states the reference-line
+        // rules, so its descriptions are dropped here as well.
+        let mut reference_lines = reference_lines_schema();
+        strip_descriptions(&mut reference_lines);
+        assert_eq!(
+            properties["referenceLines"], reference_lines,
+            "create_chart"
+        );
+        // `update_chart` names the same fields (`AI-15`).
+        let schema = (find("update_chart").expect("registered tool").schema)();
+        let properties = &schema["function"]["parameters"]["properties"];
+        for field in style.keys() {
+            assert!(properties.get(field).is_some(), "update_chart {field}");
+        }
+        // `format_chart` changes the formatting only: it carries the style
+        // fields with their descriptions, and the chart's own fields
+        // (`todayLine`) are not among them.
+        let schema = (find("format_chart").expect("registered tool").schema)();
+        let properties = &schema["function"]["parameters"]["properties"];
+        for (field, definition) in style {
+            if *field == "todayLine" {
+                assert!(
+                    properties.get(field).is_none(),
+                    "format_chart offers {field}, which it may not change"
+                );
+                continue;
+            }
+            assert_eq!(&properties[field], definition, "format_chart {field}");
+        }
+        assert_eq!(
+            properties["referenceLines"],
+            reference_lines_schema(),
+            "format_chart"
+        );
     }
 
     #[test]
@@ -2679,22 +2837,34 @@ mod tests {
 
     #[test]
     fn the_chart_tools_take_parameters_and_reference_lines() {
-        for tool in ["create_chart", "update_chart"] {
-            let schema = (find(tool).expect("registered tool").schema)();
-            let properties = &schema["function"]["parameters"]["properties"];
-            assert!(properties.get("referenceLines").is_some(), "{tool}");
-            for slot in ["limit", "dimension", "breakdown"] {
-                assert_eq!(
-                    properties[slot]["oneOf"][1]["required"],
-                    json!(["param"]),
-                    "{tool} {slot}"
-                );
-            }
+        // The tool that carries the fields (`AI-15`: `update_chart` names the
+        // fields of `create_chart` and points at it for their shapes).
+        let schema = (find("create_chart").expect("registered tool").schema)();
+        let properties = &schema["function"]["parameters"]["properties"];
+        assert!(properties.get("referenceLines").is_some());
+        for slot in ["limit", "dimension", "breakdown"] {
             assert_eq!(
-                properties["measures"]["items"]["oneOf"][2]["required"],
-                json!(["column"]),
-                "{tool}"
+                properties[slot]["oneOf"][1]["required"],
+                json!(["param"]),
+                "create_chart {slot}"
             );
+        }
+        assert_eq!(
+            properties["measures"]["items"]["oneOf"][2]["required"],
+            json!(["column"]),
+            "create_chart"
+        );
+        // `update_chart` names the same fields.
+        let schema = (find("update_chart").expect("registered tool").schema)();
+        let properties = &schema["function"]["parameters"]["properties"];
+        for field in [
+            "referenceLines",
+            "limit",
+            "dimension",
+            "breakdown",
+            "measures",
+        ] {
+            assert!(properties.get(field).is_some(), "update_chart {field}");
         }
     }
 
@@ -2702,29 +2872,30 @@ mod tests {
     /// own series is drawn.
     #[test]
     fn the_chart_tools_take_layers_draw_and_axis() {
-        for tool in ["create_chart", "update_chart"] {
-            let schema = (find(tool).expect("registered tool").schema)();
-            let properties = &schema["function"]["parameters"]["properties"];
-            assert_eq!(properties["layers"]["maxItems"], 4, "{tool}");
+        // The tool that carries the fields (`AI-15`: `update_chart` names the
+        // fields of `create_chart` and points at it for their shapes).
+        let schema = (find("create_chart").expect("registered tool").schema)();
+        let properties = &schema["function"]["parameters"]["properties"];
+        assert_eq!(properties["layers"]["maxItems"], 4);
+        assert_eq!(
+            properties["layers"]["items"]["required"],
+            json!(["dimension", "measures", "draw", "axis"])
+        );
+        assert_eq!(properties["draw"]["enum"], json!(["bar", "line"]));
+        assert_eq!(properties["axis"]["enum"], json!(["left", "right"]));
+        // A layer takes the same filters and joins a chart takes.
+        for field in ["filters", "joins"] {
             assert_eq!(
-                properties["layers"]["items"]["required"],
-                json!(["dimension", "measures", "draw", "axis"]),
-                "{tool}"
+                properties["layers"]["items"]["properties"][field]["items"],
+                properties[field]["items"],
+                "create_chart {field}"
             );
-            assert_eq!(properties["draw"]["enum"], json!(["bar", "line"]), "{tool}");
-            assert_eq!(
-                properties["axis"]["enum"],
-                json!(["left", "right"]),
-                "{tool}"
-            );
-            // A layer takes the same filters and joins a chart takes.
-            for field in ["filters", "joins"] {
-                assert_eq!(
-                    properties["layers"]["items"]["properties"][field]["items"],
-                    properties[field]["items"],
-                    "{tool} {field}"
-                );
-            }
+        }
+        // `update_chart` names the same fields.
+        let schema = (find("update_chart").expect("registered tool").schema)();
+        let properties = &schema["function"]["parameters"]["properties"];
+        for field in ["layers", "draw", "axis"] {
+            assert!(properties.get(field).is_some(), "update_chart {field}");
         }
     }
 
@@ -2772,41 +2943,142 @@ mod tests {
     /// `measures` accepts a column with its own aggregate beside a plain name.
     #[test]
     fn create_chart_and_update_chart_take_the_chart_builder_fields() {
-        for tool in ["create_chart", "update_chart"] {
-            let schema = (find(tool).expect("registered tool").schema)();
-            let properties = &schema["function"]["parameters"]["properties"];
-            for field in [
-                "filters",
-                "sort",
-                "other",
-                "groupings",
-                "steps",
-                "joins",
-                "bin",
-                "breakdownBin",
-                "grid",
-            ] {
-                assert!(properties.get(field).is_some(), "{tool} lacks {field}");
-            }
-            // BI-10: a bin is {mode, count?, width?}; a grouping may carry one.
-            assert_eq!(properties["bin"]["required"], json!(["mode"]), "{tool}");
+        // The tool that carries the fields (`AI-15`: `update_chart` names the
+        // fields of `create_chart` and points at it for their shapes).
+        let schema = (find("create_chart").expect("registered tool").schema)();
+        let properties = &schema["function"]["parameters"]["properties"];
+        for field in [
+            "filters",
+            "sort",
+            "other",
+            "groupings",
+            "steps",
+            "joins",
+            "bin",
+            "breakdownBin",
+            "grid",
+        ] {
             assert!(
-                properties["groupings"]["items"]["properties"]
-                    .get("bin")
-                    .is_some(),
-                "{tool}"
+                properties.get(field).is_some(),
+                "create_chart lacks {field}"
             );
-            let item = &properties["measures"]["items"]["oneOf"];
-            assert_eq!(item[0]["type"], "string", "{tool}");
-            assert_eq!(
-                item[1]["required"],
-                json!(["column", "aggregate"]),
-                "{tool}"
+        }
+        // BI-10: a bin is {mode, count?, width?}; a grouping may carry one.
+        assert_eq!(properties["bin"]["required"], json!(["mode"]));
+        assert!(
+            properties["groupings"]["items"]["properties"]
+                .get("bin")
+                .is_some()
+        );
+        let item = &properties["measures"]["items"]["oneOf"];
+        assert_eq!(item[0]["type"], "string");
+        assert_eq!(item[1]["required"], json!(["column", "aggregate"]));
+        assert_eq!(properties["sort"]["required"], json!(["by", "dir"]));
+        // `update_chart` names the same fields.
+        let schema = (find("update_chart").expect("registered tool").schema)();
+        let properties = &schema["function"]["parameters"]["properties"];
+        for field in [
+            "filters",
+            "sort",
+            "other",
+            "groupings",
+            "steps",
+            "joins",
+            "bin",
+            "breakdownBin",
+            "grid",
+        ] {
+            assert!(
+                properties.get(field).is_some(),
+                "update_chart lacks {field}"
             );
-            assert_eq!(
-                properties["sort"]["required"],
-                json!(["by", "dir"]),
-                "{tool}"
+        }
+    }
+
+    /// `AI-15`: `update_chart` names the fields of `create_chart` and its own
+    /// id, and points at `create_chart` for their meanings, so a turn that
+    /// offers both carries one full chart schema instead of two.
+    #[test]
+    fn update_chart_names_the_fields_of_create_chart_and_its_id() {
+        let create = (find("create_chart").expect("registered tool").schema)();
+        let update = (find("update_chart").expect("registered tool").schema)();
+        let create_properties = create["function"]["parameters"]["properties"]
+            .as_object()
+            .expect("an object");
+        let update_properties = update["function"]["parameters"]["properties"]
+            .as_object()
+            .expect("an object");
+        let mut names: Vec<&str> = update_properties.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        let mut expected: Vec<&str> = create_properties.keys().map(String::as_str).collect();
+        expected.push("id");
+        expected.sort_unstable();
+        assert_eq!(names, expected);
+        // The fields are named, not described: their meanings are the ones of
+        // `create_chart`, which the same turn offers.
+        for (name, property) in update_properties {
+            if name == "id" {
+                continue;
+            }
+            assert_eq!(property, &json!({}), "update_chart {name}");
+        }
+        // `title` and `kind` stay required: the server replaces the chart's
+        // whole definition, so a call without them would empty the chart.
+        assert_eq!(
+            update["function"]["parameters"]["required"],
+            json!(["id", "title", "kind"])
+        );
+        assert!(
+            update["function"]["description"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("those of create_chart"),
+            "update_chart does not point at create_chart: {update}"
+        );
+    }
+
+    /// `AI-15`: `create_chart` keeps the description of the fields the build
+    /// suffix does not state, and drops the ones it does: the suffix is the
+    /// one place that carries the rules between turns.
+    #[test]
+    fn create_chart_keeps_the_descriptions_the_build_suffix_does_not_state() {
+        let schema = (find("create_chart").expect("registered tool").schema)();
+        for (pointer, description) in KEPT_CHART_DESCRIPTIONS {
+            let node = schema
+                .pointer(pointer)
+                .expect("a field of the chart schema");
+            assert_eq!(node["description"], json!(description), "{pointer}");
+        }
+        let properties = &schema["function"]["parameters"]["properties"];
+        for field in [
+            "joins",
+            "layers",
+            "bin",
+            "goal",
+            "url",
+            "referenceLines",
+            "format",
+            "colors",
+        ] {
+            assert!(
+                properties[field].get("description").is_none(),
+                "{field} still describes itself"
+            );
+        }
+        // The suffix states the rules of those fields.
+        for rule in [
+            "`joins`",
+            "`layers`",
+            "`bin`",
+            "`goal`",
+            "`url`",
+            "`referenceLines`",
+            "`todayLine`",
+            "`clusters`",
+        ] {
+            assert!(
+                super::super::prompt::SYSTEM_BUILD_SUFFIX.contains(rule),
+                "the build suffix no longer states {rule}"
             );
         }
     }
@@ -2815,37 +3087,60 @@ mod tests {
     /// fields, and the tool count does not change (no new tool).
     #[test]
     fn the_chart_tools_take_the_progress_histogram_bullet_image_and_web_fields() {
-        for tool in ["create_chart", "update_chart"] {
-            let schema = (find(tool).expect("registered tool").schema)();
-            let properties = &schema["function"]["parameters"]["properties"];
-            let kinds = properties["kind"]["enum"].as_array().unwrap();
-            for kind in ["progress", "histogram", "bullet", "image", "web", "gantt"] {
-                assert!(kinds.iter().any(|k| k == kind), "{tool} lacks kind {kind}");
-            }
-            for field in [
-                "goal",
-                "bands",
-                "histogram",
-                "url",
-                "alt",
-                "start",
-                "end",
-                "progress",
-            ] {
-                assert!(properties.get(field).is_some(), "{tool} lacks {field}");
-            }
-            assert_eq!(
-                properties["histogram"]["properties"]["count"]["maximum"],
-                json!(100)
-            );
-            assert_eq!(properties["bands"]["maxItems"], json!(3));
-            assert_eq!(properties["alt"]["maxLength"], json!(200));
-            // The tool says where an address may come from, as the console does.
+        // The tool that carries the fields (`AI-15`: `update_chart` names the
+        // fields of `create_chart` and points at it for their shapes).
+        let schema = (find("create_chart").expect("registered tool").schema)();
+        let properties = &schema["function"]["parameters"]["properties"];
+        let kinds = properties["kind"]["enum"].as_array().unwrap();
+        for kind in ["progress", "histogram", "bullet", "image", "web", "gantt"] {
             assert!(
-                properties["url"]["description"]
-                    .as_str()
-                    .unwrap()
-                    .contains("Admin > Settings")
+                kinds.iter().any(|k| k == kind),
+                "create_chart lacks kind {kind}"
+            );
+        }
+        for field in [
+            "goal",
+            "bands",
+            "histogram",
+            "url",
+            "alt",
+            "start",
+            "end",
+            "progress",
+        ] {
+            assert!(
+                properties.get(field).is_some(),
+                "create_chart lacks {field}"
+            );
+        }
+        assert_eq!(
+            properties["histogram"]["properties"]["count"]["maximum"],
+            json!(100)
+        );
+        assert_eq!(properties["bands"]["maxItems"], json!(3));
+        assert_eq!(properties["alt"]["maxLength"], json!(200));
+        // Where an address may come from is stated by the build suffix now,
+        // as the console does (`AI-15`: the schema no longer repeats it).
+        assert!(
+            super::super::prompt::SYSTEM_BUILD_SUFFIX.contains("Admin > Settings"),
+            "the build suffix no longer says where an address may come from"
+        );
+        // `update_chart` names the same fields.
+        let schema = (find("update_chart").expect("registered tool").schema)();
+        let properties = &schema["function"]["parameters"]["properties"];
+        for field in [
+            "goal",
+            "bands",
+            "histogram",
+            "url",
+            "alt",
+            "start",
+            "end",
+            "progress",
+        ] {
+            assert!(
+                properties.get(field).is_some(),
+                "update_chart lacks {field}"
             );
         }
         // `format_chart` changes only the look: it takes none of them.
