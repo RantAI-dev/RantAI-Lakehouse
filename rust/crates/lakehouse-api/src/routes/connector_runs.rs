@@ -310,6 +310,11 @@ pub struct ChangeCaptureResponse {
     /// alert is open (`SRC-4` slice 4); absent when not supported.
     #[serde(skip_serializing_if = "Option::is_none")]
     lag: Option<super::capture_lag::LagReadout>,
+    /// Setup checks a failed connector's trace explains (`SRC-4` Amendment 11, S11-d): for an
+    /// Oracle connector that failed because `ARCHIVELOG` or minimal supplemental logging is off.
+    /// Absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    setup_checks: Option<Vec<connectors::SetupCheck>>,
 }
 
 /// Shown for a connector that does not capture changes.
@@ -335,6 +340,7 @@ pub async fn change_capture(
             reason: Some(NOT_CHANGE_CAPTURE),
             state: None,
             lag: None,
+            setup_checks: None,
         }));
     }
     let found = crate::cdc_lifecycle::capture_state(&state, &id).await?;
@@ -345,6 +351,7 @@ pub async fn change_capture(
                 reason: Some(crate::kafka_connect::NOT_CONFIGURED),
                 state: None,
                 lag: None,
+                setup_checks: None,
             }));
         }
         CaptureState::NotCreated => "not_created",
@@ -358,12 +365,40 @@ pub async fn change_capture(
         CaptureState::State(crate::kafka_connect::ConnectState::Running)
     );
     let lag = super::capture_lag::read_lag(&state, &id, running, OffsetDateTime::now_utc()).await?;
+    // S11-d: a failed Oracle connector says why, when its trace carries one of the two messages
+    // `Debezium` throws for a source that is not set up. The trace itself is never shown.
+    let failed = matches!(
+        found,
+        CaptureState::State(crate::kafka_connect::ConnectState::Failed)
+    );
+    let setup_checks = if failed && oracle_connector(&state, &id).await {
+        let checks = crate::cdc_lifecycle::failure_trace(&state, &id)
+            .await
+            .map(|trace| crate::cdc_setup_check::oracle_trace_checks(&trace))
+            .unwrap_or_default();
+        (!checks.is_empty()).then_some(checks)
+    } else {
+        None
+    };
     Ok(ApiJson(ChangeCaptureResponse {
         supported: true,
         reason: None,
         state: Some(state_word),
         lag: Some(lag),
+        setup_checks,
     }))
+}
+
+/// Whether connector `id` is an Oracle change-capture connector; a store error is "no" (the
+/// checks are advice, and the state answer must not fail for them).
+async fn oracle_connector(state: &AppState, id: &str) -> bool {
+    let Ok(pool) = pool(state) else {
+        return false;
+    };
+    matches!(
+        connectors::get_connector_dial_info(pool, id).await,
+        Ok(Some(info)) if crate::cdc_oracle::is_oracle_cdc(&info)
+    )
 }
 
 // ── The orchestrator's reports ─────────────────────────────────────────────

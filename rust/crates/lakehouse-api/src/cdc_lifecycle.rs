@@ -320,6 +320,15 @@ pub async fn capture_state(state: &AppState, id: &str) -> Result<CaptureState, A
     })
 }
 
+/// The failure trace of connector `id` in `Kafka Connect`, for matching against fixed patterns
+/// only (never shown). `None` when `Kafka Connect` is not configured, cannot be asked, or nothing
+/// failed.
+pub async fn failure_trace(state: &AppState, id: &str) -> Option<String> {
+    let client = KafkaConnectClient::from_config(&state.config)?;
+    let name = connect_connector_name(id).ok()?;
+    client.failure_trace(&name).await.ok().flatten()
+}
+
 /// At start: for every change-capture connector, write its password file
 /// again (`tmpfs` empties on a restart) and, if a file was missing or
 /// different, restart its connector so the tasks read it. Then bring each

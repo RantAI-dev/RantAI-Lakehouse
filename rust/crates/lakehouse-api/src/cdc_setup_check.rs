@@ -742,6 +742,42 @@ fn oracle_privileges(facts: &OracleSetupFacts, user: &str) -> SetupCheck {
     }
 }
 
+/// The two messages `Debezium` 3.7.0.Final throws for a source that is not set up, matched in a
+/// failed Oracle connector's trace (`SRC-4` Amendment 11, S11-d). Each is cited with its place in
+/// the `debezium-connector-oracle` module of the `v3.7.0.Final` tag; a trace that carries neither
+/// is not explained, and its text is never shown (principle 4).
+///
+/// - `OracleConnectorTask.java:316-319` (`validateRedoLogConfiguration`): "... Change the Oracle
+///   configuration to use a `LOG_MODE=ARCHIVELOG` and restart the connector."
+/// - `logminer/AbstractLogMinerStreamingChangeEventSource.java:1850-1851`
+///   (`checkDatabaseAndTableState`): "Supplemental logging not properly configured. Use: ALTER
+///   DATABASE ADD SUPPLEMENTAL LOG DATA".
+///
+/// A table without all-column logging is NOT among them: Debezium only logs a warning for it
+/// (same file, lines 1859-1862) and keeps running, so a failure never shows it.
+const TRACE_ARCHIVELOG: &str = "LOG_MODE=ARCHIVELOG and restart the connector";
+const TRACE_SUPPLEMENTAL: &str = "Supplemental logging not properly configured";
+
+/// The setup checks a failed Oracle connector's `trace` explains: `missing` for each of the two
+/// settings above whose message it carries. Empty for any other trace. Pure.
+#[must_use]
+pub fn oracle_trace_checks(trace: &str) -> Vec<SetupCheck> {
+    let mut checks = Vec::new();
+    if trace.contains(TRACE_ARCHIVELOG) {
+        checks.push(oracle_archivelog(&OracleSetupFacts {
+            log_mode: Some(OracleLogMode::Noarchivelog),
+            ..OracleSetupFacts::default()
+        }));
+    }
+    if trace.contains(TRACE_SUPPLEMENTAL) {
+        checks.push(oracle_supplemental(&OracleSetupFacts {
+            supplemental_min: Some(OracleSupplementalMin::No),
+            ..OracleSetupFacts::default()
+        }));
+    }
+    checks
+}
+
 const fn oracle_privilege_name(privilege: OraclePrivilege) -> &'static str {
     match privilege {
         OraclePrivilege::CreateSession => "CREATE SESSION",
@@ -1364,6 +1400,30 @@ mod tests {
                 .all(|c| c.status == SetupStatus::Unchecked
                     && c.message == ORACLE_ENCRYPTION_REQUIRED)
         );
+    }
+
+    #[test]
+    fn oracle_a_failed_connectors_trace_explains_only_the_two_messages_debezium_throws() {
+        let archive = "org.apache.kafka.connect.errors.ConnectException: io.debezium.DebeziumException: \
+            The Oracle server is not configured to use a archive log LOG_MODE, which is required for this \
+            connector to work properly. Change the Oracle configuration to use a LOG_MODE=ARCHIVELOG and \
+            restart the connector.";
+        let checks = oracle_trace_checks(archive);
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].setting, "ARCHIVELOG");
+        assert_eq!(checks[0].status, SetupStatus::Missing);
+        let supplemental = "io.debezium.DebeziumException: Supplemental logging not properly configured. \
+            Use: ALTER DATABASE ADD SUPPLEMENTAL LOG DATA";
+        let checks = oracle_trace_checks(supplemental);
+        assert_eq!(checks.len(), 1);
+        assert_eq!(
+            checks[0].command.as_deref(),
+            Some("ALTER DATABASE ADD SUPPLEMENTAL LOG DATA;")
+        );
+        let both = oracle_trace_checks(&format!("{archive}\n{supplemental}"));
+        assert_eq!(both.len(), 2);
+        // Anything else explains nothing, and none of its text is carried.
+        assert!(oracle_trace_checks("ORA-01017: invalid username/password SECRET_USER").is_empty());
     }
 
     #[test]
