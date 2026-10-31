@@ -41,10 +41,16 @@ export function CatalogPage() {
   // its own says very little — "8 assets" is a number, not an answer — so
   // the drawer shows what is actually in there before the user commits to
   // navigating away. Nothing is fetched until a row is opened.
-  const selectedName = selected?.name ?? null
+  //
+  // DATA-23: the preview filters on the namespace **id**, not on its
+  // display name. Assets carry the raw id (`catalog.rs`), and the
+  // explorer's namespace column compares to that, so a name that differs
+  // from the id ("Silver Layer" vs `silver`) matched nothing and the
+  // drawer said "No assets in this namespace yet."
+  const selectedId = selected?.id ?? null
   const preview = useService<Asset[]>(
     async (signal) => {
-      if (!selectedName) return []
+      if (!selectedId) return []
       const page = await assetService.listAssetsPage(
         {
           page: 1,
@@ -52,7 +58,7 @@ export function CatalogPage() {
           filters: filterParam([
             {
               id: "namespace",
-              value: selectedName,
+              value: selectedId,
               variant: "text",
               operator: "eq",
             },
@@ -64,7 +70,7 @@ export function CatalogPage() {
       )
       return page.items
     },
-    [selectedName]
+    [selectedId]
   )
 
   const filteredData = useMemo(() => {
@@ -189,12 +195,14 @@ export function CatalogPage() {
                 the name as a search term: free text also matches names,
                 descriptions and owners, so a namespace like `lake.bronze`
                 used to return rows from other namespaces that merely
-                mention it. */}
+                mention it. DATA-23: the filter carries the namespace **id**,
+                because that is the value the assets carry and the one the
+                explorer's namespace column compares to. */}
             <Button
               variant="outline"
               size="sm"
               className="self-start"
-              render={<Link href={namespaceAssetsHref(selected.name)} />}
+              render={<Link href={namespaceAssetsHref(selected.id)} />}
             >
               {selected.assetCount > PREVIEW_SIZE
                 ? `Browse all ${selected.assetCount} assets`
