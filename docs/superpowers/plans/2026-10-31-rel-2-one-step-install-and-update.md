@@ -422,3 +422,51 @@ S1-T5:
   - Cite `REL-2 S1 review SHOULD-FIX 1`.
 
 **Open: SHOULD-FIX 1.**
+
+### Fix for review round 1 (developer, 2026-11-01)
+
+**SHOULD-FIX 1 — fixed in `32d940d5`** (branch `feat/rel-2-s1-prerequisites`).
+
+- **The 2 s cache.** `readiness::ready_body` (the route's new entry point) reuses the computed
+  `ReadyBody` for `CACHE_WINDOW = 2 s`. The cache is `readiness::ReadyCache` — a
+  `tokio::sync::Mutex` over one `(ReadyBody, Instant)` entry — and the lock is held ACROSS the
+  probe, so callers that arrive together share ONE probe instead of each running their own. The
+  window is measured from the END of the probe, so a cached answer is never older than the window
+  says it is.
+- **Where the cache lives.** In `AppState` (`readiness_cache`), the same shape as
+  `health::HealthCache`: the cache belongs to the deployment it answers for, not to the process,
+  so a test's own state has its own cache and no test can see another's answer.
+- **One HTTP client.** `readiness::http_client` is a `OnceLock` holding the ONE shared
+  `reqwest::Client`, built with `redirect::Policy::none()` and `PROBE_TIMEOUT` as its own
+  timeout. Redirects are off because the probe answers with the catalog's reader token: a
+  redirect must not carry that token to another host. A client that cannot be built at all fails
+  the catalog check closed (`"failed"`), with the reason in the log — never a panic.
+- **Tests** (`readiness::tests`):
+  - `two_readiness_answers_within_the_window_probe_once` — a `wiremock` catalog counts the
+    probes: two answers inside the window produce exactly ONE request to `/v1/config`.
+  - `a_read_past_the_window_re_probes` — the test's own clock, no sleeping: a read past the
+    window re-probes.
+  - `the_catalog_probe_does_not_follow_a_redirect` — a `302` from the catalog leaves the check
+    `"failed"` and the redirect target is never requested.
+- **Cited at the fix site** as `REL-2 S1 review SHOULD-FIX 1` (the module doc, the cache
+  constant, the client, the probe, the route's doc comment, `AppState`'s field and the three
+  tests), and in the commit body.
+
+**Commands run, in the foreground, through `bin/cargo-locked`** (all on `32d940d5`):
+
+| Command | Result |
+| --- | --- |
+| `cargo fmt --check` | clean, no diff |
+| `cargo clippy -p lakehouse-api --all-targets -- -D warnings` | clean, no warning and no error |
+| `cargo test -p lakehouse-api readiness` | **10 passed, 0 failed**, 2854 filtered out (the lib and the bin binary each run the 10 unit tests) |
+| `cargo test -p lakehouse-api health` | **33 passed, 0 failed**, 2869 filtered out (the lib and the bin binary each run the 33 unit tests) |
+
+**Not verified, with the reason:**
+
+- The full crate suite (`cargo test -p lakehouse-api` over every target) and the full workspace
+  run: not run here — this slice's machine rules say CI runs them; the scoped commands above are
+  what runs locally. The crate was, however, clipped with `--all-targets`, so every test target
+  compiles.
+- The fix was not exercised against a live `Postgres`/`ClickHouse`/`Lakekeeper` stack: the
+  behaviour it changes (how many backend calls a burst of requests causes) is proven by the
+  `wiremock` count, not by a live run.
