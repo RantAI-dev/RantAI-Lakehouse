@@ -52,8 +52,6 @@
 # Docker (for `docker save`), `jq`, `zstd`, `tar` and `sha256sum`.
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
 usage() {
     cat >&2 <<'EOF'
 usage: make_bundle.sh --manifest <release.json> --compose <docker-compose.yml> \
