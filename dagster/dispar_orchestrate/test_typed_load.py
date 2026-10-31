@@ -383,7 +383,9 @@ def test_phase_3_slice_3_review_blocker_1_a_type_changing_replace_is_one_commit_
         if bookkeeping in full.schema.names:
             assert all(full.column(bookkeeping).to_pylist())
     assert full.column("_ingested_at").null_count == 0
-    assert len(snapshots) - len(snapshots_before) <= 2, "one overwrite: a delete and an append at most"
+    # `DATA-36`: ONE snapshot, not a delete and an append per group. Every snapshot of a
+    # table is a state a reader can pick (the time-travel picker).
+    assert len(snapshots) - len(snapshots_before) == 1, "one snapshot: the load leaves one state behind"
 
 
 @loader
