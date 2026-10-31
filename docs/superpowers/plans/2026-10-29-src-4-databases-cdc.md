@@ -1785,6 +1785,84 @@ tests say 23). Oracle change capture is `Dial::Cdc` with `SqlDriver::Oracle`, no
 caused by the merge, and I did not edit it (it would conflict with slice 6's own fix). `ci-required` fails
 because of it. After slice 6 fixes it, one more merge of the phase head clears this branch.
 
+### Slice 6, Oracle change capture (developer, Sonnet, 2026-10-31)
+
+**Status: built and pushed, NOT proven by CI.** Pull request #264 is `CONFLICTING` with `main` (see "Blocker for CI"
+below), so the `pull_request` workflow does not start. Nothing of slice 6 has run in CI, and the gate `g4-oracle` has
+never run. Every Rust, Python-gate and compose claim below is *not verified* beyond the local commands listed.
+
+**Commits** (branch `feat/data-phase-4-src-4`), in order:
+
+- `8f68a5cf` T6.1: `CdcDial.pdbName`, Oracle's refusals, `oracle_entries`, the class allowlist, migration `0120`, the
+  `coverage.json` row, the type count.
+- `61e33a48` T6.1 (Amendment 10, S10-a): `/test` of an Oracle `cdc` dial through Kafka Connect's `config/validate`
+  (`cdc_oracle.rs`, `KafkaConnectClient::validate_config`, `failure_trace`); the orchestrator routing of `8f68a5cf` reverted.
+- `dfe21ca3` T6.2 (S10-c): tables typed by hand and validated (`validate_oracle_change_capture_tables`), listing answers
+  `not_supported` without a launch, `topic_of` documented, Bronze spelling test.
+- `887e0510` CI fix for run `41033040481`: `validate_cdc_dial_post_parse` split per driver (clippy `too_many_lines`, no
+  `#[allow]`). The other failure of that run (`test_the_real_migrations_list_...`, 22 against 21) was already fixed by slice 5's
+  merge (the test reads 23 after `e81abb92`, and `connector_type.rs` reads 28): I checked both, no change needed.
+- `02b2e5ca` T6.3: the gate `g4-oracle` (`ops/g4/g4_oracle_test.py`, override, `oracle-startdb.d/01_archivelog.sh`), the
+  shared `cdc_gate.py` hooks, the CI job and `ci-required` wiring.
+- `af57e25e` T6.5 (Amendment 11): the orchestrator's Oracle facts (`discover.py`), `OracleSetupFacts` beside
+  `MongoSetupFacts`, `oracle_checks`, the poll route, `/test` launching the read after the validation.
+- `613495b3` T6.5 (S11-d): a failed Oracle connector's trace explains `ARCHIVELOG` or minimal logging off.
+- `cfb7c559` T6.4: the console.
+- `8dfd715d` T6.6: docs and `ORACLE_CDC_LOGMINER_ENABLED` removed.
+
+**Blocker for CI (needs the planner).** `origin/main` has moved and conflicts with this branch in two places:
+(1) `docker-compose.yml`, one hunk (the principals loop of `lakekeeper-warehouse-init`: ours drops `debezium`, main adds
+`outside-readers`); I resolved it in a trial merge as `rust-iceberg dlt clickhouse-reader trino gold-export
+lakehouse-api-reader outside-readers unauthorized-test` and aborted the trial; (2) **a duplicate migration number**: main's
+`0117_outside_table_read_day.sql` (DATA-5) and this branch's `0117_connector_type_cdc_supported.sql` (slice 3). `sqlx` refuses
+two migrations with one version, and renaming slice 3's file breaks any database where it was already applied (checksum),
+so I did not decide it. Until `main` is merged in, no CI runs on #264 at all.
+
+**Plan deviations and findings.**
+
+- *Stop 1 (Amendment 10):* `python-oracledb` thin mode has no native network encryption (2.5.1 and 26.1.0: no negotiation code in the
+  binary, `use_eztls` only). *Stop 2 (Amendment 11):* Debezium 3.7.0.Final only warns for a table without `(ALL) COLUMNS` logging
+  (`AbstractLogMinerStreamingChangeEventSource.java:1859-1862`); the two messages it throws are `OracleConnectorTask.java:316-319`
+  (`ARCHIVELOG`) and `...:1850-1851` (minimal logging). Both decided in Amendments 10 and 11.
+- *Amendment 10 says run `resolve_checked` "exactly as the create path does".* The create path (`cdc_lifecycle::provision`) does not
+  call it. I run it in the Oracle test only, before the credential is touched; the planner accepted this (2026-10-31). The worker
+  resolves the host again itself.
+- *`Tested` is no longer `Copy`* (its Oracle facts hold a map); the poll route and the three test sites were adapted.
+- *The three facts that need a judgement:* `SELECT ANY TABLE` and `FLASHBACK ANY TABLE` can be granted per table, which a session in
+  the container database cannot see: the check reads "Not checked" (not "missing") when only those two are absent, and says why.
+  A table-existence read streams `cdb_tables` joined to non-Oracle-maintained users and keeps only the selected names; on a database
+  with very many tables this scans them all (fixed statement, no value in SQL).
+- *The passed test answer is `pending: true` with `ok: true`* when the setup read was launched: the console waits for the checks and
+  keeps the passed message (`runConnectionTest`); `report_result` records nothing for an Oracle `cdc` test (the Kafka Connect
+  validation is the recorded probe).
+- *Unverified assumptions the gate would have shown:* that Kafka Connect's `config/validate` resolves `${dir:...}` (S10-a's stop
+  condition: I believe `AbstractHerder` runs the config transformer, but did not see it run); that `USERS` exists in the CDB and the PDB
+  of `gvenzl/oracle-free:23.26.2-slim-faststart`; that the startdb.d script runs after the entrypoint opens the PDB; that a new column is
+  captured under `online_catalog` (S9: stop and report if not); that `c##dbzuser` may read `cdb_log_groups` and `cdb_tables`.
+- *Debezium 3.8 corrections (principle 5):* `cdc.rs`, `cdc_apply.py` (comments), `docs/plans/SRC-4-RESULT.md` (lines 26, 120, 134), the
+  feature page. The earlier amendments of this plan that say "Debezium 3.8" (Amendments 3 to 7) are not edited: read them as 3.7.0.
+  `ops/g4/g4_mssql_test.py:14` and `ops/g4/cdc_gate.py:621` still say 3.8 in comments (not mine to change, noted).
+- *The new principle-3 spots:* the gate's wrong-login step dials as a user that does not exist (`c##g4nosuch`), so it can never lock
+  the real user.
+
+**Commands run locally (rule 7).**
+
+- `cargo fmt --check` (rust/): clean on the final tree.
+- `python3 ops/lint/check_connector_gate_coverage.py`: OK (23 types covered, 0 waived).
+- `python3 -m unittest ops.lint.test_check_connector_gate_coverage`: 24 tests OK. `bash scripts/ci/tests/test_required_gate.sh`: 56 passed.
+- `cd ops/g4 && PYTHONPATH=../gates python3 -m unittest test_cdc_gate`: 10 tests OK (the ops/gates tests import `gate_summary` and need the path).
+- `python3 -c "import yaml; yaml.safe_load(open('.github/workflows/ci.yml'))"`: parses. `docker compose ... --profile g6-oracle
+  --profile dagster --profile cdc --profile g4-oracle config --quiet` with dummy secrets: no output (valid).
+- `cd dagster && python -m pytest dispar_orchestrate/test_discover.py -q`: 81 passed (7 new). `test_cdc_apply.py`: 58 passed.
+- `bun --bun tsc --noEmit`: clean. `bun --bun eslint src/features/connectors src/lib/connectors`: clean. `bun test src/features/connectors`: 437 pass.
+- *Not run locally:* cargo build, clippy and test (machine limits), the compose `up`, the gate. Everything Rust in this slice, including
+  its new unit tests, is therefore *not verified*.
+
+**CI.** Run `41033040481` (on `dfe21ca3`, before the main merge conflict appeared) failed clippy and Repo lints, both addressed above. No
+run exists for any later commit: #264 is `CONFLICTING`. **The gate's own lines (timings against 120 s, setup checks, the encryption
+banner, the new-column outcome) do not exist yet.**
+
+
 ## Review
 
 (The planner writes findings here, tagged `BLOCKER` or `SHOULD-FIX`.)
