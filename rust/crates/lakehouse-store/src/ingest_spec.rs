@@ -1159,112 +1159,89 @@ fn parse_dial<T: for<'de> Deserialize<'de>>(
 /// Returns [`IngestSpecError::InvalidDial`] when a field the driver needs is
 /// missing, a field it does not use is present, or `serverId` is 0.
 fn validate_cdc_dial_post_parse(adapter: &str, dial: &CdcDial) -> Result<(), IngestSpecError> {
-    let refuse = |message: &'static str| IngestSpecError::InvalidDial {
-        adapter: adapter.to_owned(),
-        source: serde::de::Error::custom(message),
-    };
+    match cdc_dial_refusal(dial) {
+        None => Ok(()),
+        Some(message) => Err(IngestSpecError::InvalidDial {
+            adapter: adapter.to_owned(),
+            source: serde::de::Error::custom(message),
+        }),
+    }
+}
+
+const ONLY_POSTGRES_SLOT: &str = "slotName is only for a PostgreSQL change-capture connector";
+const ONLY_POSTGRES_PUBLICATION: &str =
+    "publicationName is only for a PostgreSQL change-capture connector";
+const ONLY_MYSQL_SERVER_ID: &str = "serverId is only for a MySQL change-capture connector";
+
+/// The first fixed sentence that refuses `dial`, or `None` (see
+/// [`validate_cdc_dial_post_parse`]). Split by driver so each rule stays short.
+fn cdc_dial_refusal(dial: &CdcDial) -> Option<&'static str> {
     if dial.pdb_name.is_some() && dial.driver != SqlDriver::Oracle {
-        return Err(refuse(
-            "pdbName is only for an Oracle change-capture connector",
-        ));
+        return Some("pdbName is only for an Oracle change-capture connector");
     }
     match dial.driver {
-        SqlDriver::Postgres => {
-            if dial.slot_name.is_none() {
-                return Err(refuse(
-                    "slotName is required for a PostgreSQL change-capture connector",
-                ));
-            }
-            if dial.publication_name.is_none() {
-                return Err(refuse(
-                    "publicationName is required for a PostgreSQL change-capture connector",
-                ));
-            }
-            if dial.server_id.is_some() {
-                return Err(refuse(
-                    "serverId is only for a MySQL change-capture connector",
-                ));
-            }
-        }
-        SqlDriver::Mysql => {
-            match dial.server_id {
-                None => {
-                    return Err(refuse(
-                        "serverId is required for a MySQL change-capture connector",
-                    ));
-                }
-                Some(0) => return Err(refuse("serverId must be between 1 and 4294967295")),
-                Some(_) => {}
-            }
-            if dial.slot_name.is_some() {
-                return Err(refuse(
-                    "slotName is only for a PostgreSQL change-capture connector",
-                ));
-            }
-            if dial.publication_name.is_some() {
-                return Err(refuse(
-                    "publicationName is only for a PostgreSQL change-capture connector",
-                ));
-            }
-        }
-        SqlDriver::Mssql => {
-            if dial.slot_name.is_some() {
-                return Err(refuse(
-                    "slotName is only for a PostgreSQL change-capture connector",
-                ));
-            }
-            if dial.publication_name.is_some() {
-                return Err(refuse(
-                    "publicationName is only for a PostgreSQL change-capture connector",
-                ));
-            }
-            if dial.server_id.is_some() {
-                return Err(refuse(
-                    "serverId is only for a MySQL change-capture connector",
-                ));
-            }
-        }
+        SqlDriver::Postgres => postgres_dial_refusal(dial),
+        SqlDriver::Mysql => mysql_dial_refusal(dial),
+        SqlDriver::Mssql => no_replication_names_refusal(dial),
         SqlDriver::Oracle => {
-            if dial.slot_name.is_some() {
-                return Err(refuse(
-                    "slotName is only for a PostgreSQL change-capture connector",
-                ));
-            }
-            if dial.publication_name.is_some() {
-                return Err(refuse(
-                    "publicationName is only for a PostgreSQL change-capture connector",
-                ));
-            }
-            if dial.server_id.is_some() {
-                return Err(refuse(
-                    "serverId is only for a MySQL change-capture connector",
-                ));
-            }
-            if !is_oracle_service_name(&dial.database) {
-                return Err(refuse(
-                    "database must be an Oracle name of letters, digits, '_', '.' or '-'",
-                ));
-            }
-            if dial
-                .pdb_name
-                .as_deref()
-                .is_some_and(|pdb| !is_oracle_service_name(pdb))
-            {
-                return Err(refuse(
-                    "pdbName must be an Oracle name of letters, digits, '_', '.' or '-'",
-                ));
-            }
-            // S6-c: Oracle's JDBC driver does TLS only over TCPS with a Java
-            // trust store, which this build cannot set up (SRC-37), so a mode
-            // that promises certificate checking is refused, not approximated.
-            if matches!(dial.ssl_mode, CdcSslMode::VerifyCa | CdcSslMode::VerifyFull) {
-                return Err(refuse(
-                    "sslMode verify-ca and verify-full are not supported for an Oracle change-capture connector: use require (encrypted, server not authenticated) or disable",
-                ));
-            }
+            no_replication_names_refusal(dial).or_else(|| oracle_dial_refusal(dial))
         }
     }
-    Ok(())
+}
+
+fn postgres_dial_refusal(dial: &CdcDial) -> Option<&'static str> {
+    if dial.slot_name.is_none() {
+        return Some("slotName is required for a PostgreSQL change-capture connector");
+    }
+    if dial.publication_name.is_none() {
+        return Some("publicationName is required for a PostgreSQL change-capture connector");
+    }
+    dial.server_id.is_some().then_some(ONLY_MYSQL_SERVER_ID)
+}
+
+fn mysql_dial_refusal(dial: &CdcDial) -> Option<&'static str> {
+    match dial.server_id {
+        None => return Some("serverId is required for a MySQL change-capture connector"),
+        Some(0) => return Some("serverId must be between 1 and 4294967295"),
+        Some(_) => {}
+    }
+    if dial.slot_name.is_some() {
+        return Some(ONLY_POSTGRES_SLOT);
+    }
+    dial.publication_name
+        .is_some()
+        .then_some(ONLY_POSTGRES_PUBLICATION)
+}
+
+/// `SQL Server` and `Oracle` use none of `slotName`, `publicationName`, `serverId`.
+fn no_replication_names_refusal(dial: &CdcDial) -> Option<&'static str> {
+    if dial.slot_name.is_some() {
+        return Some(ONLY_POSTGRES_SLOT);
+    }
+    if dial.publication_name.is_some() {
+        return Some(ONLY_POSTGRES_PUBLICATION);
+    }
+    dial.server_id.is_some().then_some(ONLY_MYSQL_SERVER_ID)
+}
+
+/// `Oracle`'s own rules (`SRC-4` decisions S6-b, S6-c).
+fn oracle_dial_refusal(dial: &CdcDial) -> Option<&'static str> {
+    if !is_oracle_service_name(&dial.database) {
+        return Some("database must be an Oracle name of letters, digits, '_', '.' or '-'");
+    }
+    if dial
+        .pdb_name
+        .as_deref()
+        .is_some_and(|pdb| !is_oracle_service_name(pdb))
+    {
+        return Some("pdbName must be an Oracle name of letters, digits, '_', '.' or '-'");
+    }
+    // S6-c: Oracle's JDBC driver does TLS only over TCPS with a Java trust store,
+    // which this build cannot set up (SRC-37), so a mode that promises certificate
+    // checking is refused, not approximated.
+    matches!(dial.ssl_mode, CdcSslMode::VerifyCa | CdcSslMode::VerifyFull).then_some(
+        "sslMode verify-ca and verify-full are not supported for an Oracle change-capture connector: use require (encrypted, server not authenticated) or disable",
+    )
 }
 
 /// The fixed refusal of a `MongoDB` change-capture dial with other than one host
