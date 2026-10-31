@@ -41,19 +41,21 @@ One idea carries the design: **sign one file, verify everything through it.**
 S1 starts now. S2 to S4 are written here so the whole design is reviewable, and each gets a
 "Plan check" by the planner before it starts, against the code of that day.
 
-## 2. Decisions (made by the planner; the owner's four are marked OWNER)
+## 2. Decisions (the owner's four, marked OWNER, signed on 2026-10-31)
 
-- **D1 (OWNER #1).** The tool is `lakehousectl` (proposed).
+- **D1 (OWNER #1).** The tool is `lakehousectl`.
 - **D2 (OWNER #2).** Releases live on GitHub Releases. `install.sh` is served from the release
-  and from a short rantai.dev address (proposed).
-- **D3 (OWNER #3).** A cosign ECDSA P-256 key pair (proposed).
-  - The private key is a GitHub Actions secret in a `release` environment with a required
-    reviewer, available to tag builds only.
+  and from `https://get.rantai.dev/lakehouse`, a Cloudflare redirect to
+  `https://github.com/RantAI-dev/RantAI-Lakehouse/releases/latest/download/install.sh`.
+- **D3 (OWNER #3).** A cosign ECDSA P-256 key pair. The planner created it on 2026-10-31.
+  - The encrypted private key and its password are the `COSIGN_PRIVATE_KEY` and
+    `COSIGN_PASSWORD` secrets of the `release` environment. Its required reviewer is the product
+    owner, and it deploys from `v*` tags only. No other copy exists.
   - The public key is committed at `ops/release/release.pub` and compiled into `lakehousectl`
     with `include_bytes!`.
   - CI dry runs use a throwaway key generated in the job. They never touch the real key.
 - **D4 (OWNER #4).** SemVer as in `reference/release-policy.md`. The first release through the
-  pipeline is 0.2.0 (proposed).
+  pipeline is 0.2.0.
 - **D5. Install layout.**
   - Everything lives in one directory, `/opt/rantai-lakehouse` by default (`--dir` to change it):
     - `docker-compose.yml`, the release's file with digests pinned;
@@ -226,6 +228,93 @@ A CI job, "upgrade test", proves it on each release:
 - Sign the release policy (D4) and write the upgrade notes.
 - Cut 0.2.0 through the pipeline.
 - Measure install time and bundle size into `docs/plans/REL-2-RESULT.md`.
+
+## 4a. S2 plan check (planner, 2026-10-31, at `main` `f9dffa86`) — the release pipeline
+
+Read today:
+- **`.github/workflows/docker.yml`** builds only the API, on `v*` tags, with `push: false`.
+  Its `push-ghcr` job is an inert `echo`. **S2 replaces this file.**
+- **Locally built images:** `lakehouse-api` (context `rust`, extra build context
+  `pipeline_src=dagster/dispar_orchestrate`), the Dagster image (context `dagster`), `oidc-mock`
+  (context `ops/oidc-mock`) and `console` (context `.`, `Dockerfile.frontend`). The gate-only
+  builds (g7 runner, g6 stubs) are not released.
+- **Versions live in four places:**
+  - the tag;
+  - `package.json` `version`;
+  - `rust/crates/lakehouse-api/Cargo.toml` `version` (what `CARGO_PKG_VERSION` and
+    `/health/ready` report);
+  - the `CHANGELOG.md` `## [x.y.z]` heading.
+- **The signing secrets** are in the `release` environment (D3), and the public key is
+  `ops/release/release.pub`.
+
+Branch `feat/rel-2-s2-release-pipeline` off `main`. It already holds this plan update, the
+signed decisions and `ops/release/release.pub`. One commit per task.
+
+- **S2-T1. `ops/release/check_version.py <tag>`.**
+  - It fails unless the tag, `package.json`, the API's `Cargo.toml` and a
+    `## [x.y.z] - YYYY-MM-DD` heading in `CHANGELOG.md` all name the same version.
+  - Add pytest cases for: pass; each one of the four differing; a missing changelog heading.
+- **S2-T2. `ops/release/render_compose.py --images <json> -o <file>`.**
+  - It writes the release's Compose file from `docker-compose.yml`.
+  - Each locally built service loses `build:` and gets `image: <published ref>@sha256:…`.
+  - Every service whose profiles are only gate or test profiles (`test`, `g*`) is dropped. The
+    default, `dagster`, `trino`, `seaweedfs` and `backups` services are kept.
+  - It fails if any image left has no digest. Reuse `check_image_digests.py`'s parser, do not
+    copy it (rule 4).
+  - Tests: no `build:` remains; every `image:` has a digest; no gate service remains;
+    `docker compose -f <out> config --quiet` passes in CI.
+- **S2-T3. `ops/release/make_manifest.py` and `ops/release/make_bundle.sh`.**
+  - `release.json` holds `schemaVersion: 1`, `version`, `gitSha`, `createdAt`, `minFrom`,
+    `stops: []`, `images` (`service → ref@sha256`) and `files` (`name → sha256`; the Compose
+    file now, `lakehousectl` from S3).
+  - `minFrom` defaults to two minor versions back, per the spec, and can be overridden from a
+    checked-in `ops/release/upgrade-path.json`. That file is the one place a release names a
+    required stop.
+  - The bundle is D11 without `lakehousectl` until S3. Images are saved with `docker save` by
+    digest reference, and it carries `SHA256SUMS`. Compression is `zstd -19 -T0`. It prints its
+    size.
+  - Tests for the manifest's shape, and for the checksums matching the files.
+- **S2-T4. `.github/workflows/release.yml`** (replaces `docker.yml`).
+  - **Triggers:** `push` of `v*` tags (real), `workflow_dispatch`, and `pull_request` on paths
+    `.github/workflows/release.yml`, `ops/release/**`, `Dockerfile.frontend`,
+    `rust/Dockerfile`, `dagster/Dockerfile` and `ops/oidc-mock/**`. The last two triggers are
+    dry runs.
+  - **Real run:**
+    1. `check_version.py`;
+    2. build the four images and push them to `ghcr.io/rantai-dev/rantai-lakehouse-<name>`
+       tagged with the version, recording each digest;
+    3. for each, `cosign sign --key env://COSIGN_PRIVATE_KEY <ref>@<digest>`, then attach a
+       CycloneDX SBOM (`anchore/sbom-action`, then `cosign attest --type cyclonedx`);
+    4. render the Compose file and write the manifest;
+    5. `cosign sign-blob` the manifest to `release.json.sig`, then verify it at once with
+       `ops/release/release.pub`;
+    6. build the bundle;
+    7. `gh release create` as a **draft**, with the bundle, its `.sha256`, `release.json`, the
+       `.sig`, the SBOMs, `SHA256SUMS` and the Compose file. The owner publishes the draft.
+
+    Signing steps run in a job bound to `environment: release`, so the owner's approval gates
+    the key.
+  - **Dry run:** the same steps, except:
+    - images go to a job-local `registry:2` service, so the digests are real;
+    - the key is generated in the job and verified against its own public key;
+    - nothing is published;
+    - the bundle and manifest are uploaded as workflow artifacts. The step summary prints the
+      bundle size.
+  - **Least privilege:** `permissions:` is `contents: read` by default, `packages: write` and
+    `contents: write` only in the real job, and no `pull_request_target`. The real job never runs
+    for a PR.
+- **S2-T5. Docs.**
+  - `docs/CI.md` gains "Release pipeline": what runs, the dry run, the key, the draft, and the
+    one manual step after the first real release, making the GHCR packages public.
+  - `docs/OPERATIONS.md` gains a pointer.
+  - `CHANGELOG.md` gets a REL-2 line under Unreleased.
+- **S2 accept:**
+  - the pytest files pass;
+  - `bash -n` and `shellcheck` (if present) pass on the bundle script;
+  - `actionlint` (if present) passes on the workflow;
+  - **the PR's own dry run is green**, and its summary shows the bundle size. Quote it in the
+    handoff.
+  - The developer cannot run the real release; the planner and the owner do that in S5.
 
 ## 5. Out of scope
 
