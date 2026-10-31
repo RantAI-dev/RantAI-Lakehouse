@@ -413,8 +413,134 @@ pub struct MongoSetupFacts {
     pub change_stream: Option<ChangeStreamFact>,
 }
 
-/// The result of a [`Kind::Test`] request: the connection was made.
+/// Oracle's `LOG_MODE` (`SRC-4` Amendment 11, S11-b): a closed word, read in the orchestrator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OracleLogMode {
+    /// `ARCHIVELOG`: what `LogMiner` needs.
+    Archivelog,
+    /// `NOARCHIVELOG`.
+    Noarchivelog,
+}
+
+/// Oracle's database-level minimal supplemental logging (`supplemental_log_data_min`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OracleSupplementalMin {
+    /// Switched on.
+    Yes,
+    /// Off.
+    No,
+    /// On because something else implies it (a primary-key or all-column logging).
+    Implicit,
+}
+
+/// What the orchestrator found for one selected table (`SRC-4` Amendment 11, S11-b).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum OracleTableFact {
+    /// The table exists and has `(ALL) COLUMNS` supplemental logging.
+    AllColumns,
+    /// The table exists and has not.
+    WithoutAllColumns,
+    /// The login sees no such table in the pluggable database.
+    NotFound,
+}
+
+/// A system privilege or role of `Debezium`'s documented `LogMiner` list, as the closed set of
+/// names the orchestrator may report missing (a name outside it is refused when the result is
+/// posted, so a result can never carry text of its own).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum OraclePrivilege {
+    /// `CREATE SESSION`.
+    #[serde(rename = "CREATE SESSION")]
+    CreateSession,
+    /// `SET CONTAINER`.
+    #[serde(rename = "SET CONTAINER")]
+    SetContainer,
+    /// `LOGMINING`.
+    #[serde(rename = "LOGMINING")]
+    Logmining,
+    /// `SELECT ANY TRANSACTION`.
+    #[serde(rename = "SELECT ANY TRANSACTION")]
+    SelectAnyTransaction,
+    /// `EXECUTE_CATALOG_ROLE`.
+    #[serde(rename = "EXECUTE_CATALOG_ROLE")]
+    ExecuteCatalogRole,
+    /// `SELECT_CATALOG_ROLE`.
+    #[serde(rename = "SELECT_CATALOG_ROLE")]
+    SelectCatalogRole,
+    /// `CREATE TABLE`.
+    #[serde(rename = "CREATE TABLE")]
+    CreateTable,
+    /// `LOCK ANY TABLE`.
+    #[serde(rename = "LOCK ANY TABLE")]
+    LockAnyTable,
+    /// `CREATE SEQUENCE`.
+    #[serde(rename = "CREATE SEQUENCE")]
+    CreateSequence,
+    /// `FLASHBACK ANY TABLE` (or `FLASHBACK` on each captured table).
+    #[serde(rename = "FLASHBACK ANY TABLE")]
+    FlashbackAnyTable,
+    /// `SELECT ANY TABLE` (or `SELECT` on each captured table).
+    #[serde(rename = "SELECT ANY TABLE")]
+    SelectAnyTable,
+}
+
+/// The most selected tables an Oracle test reports on: the bound of the contract.
+pub const MAX_ORACLE_SETUP_TABLES: usize = 500;
+
+/// What the orchestrator's Oracle change-capture test read about the source's setup (`SRC-4`
+/// Amendment 11, S11-b), over an unencrypted session limited to the data dictionary (the signed
+/// `SEC-14` exception). Every key is optional: an absent key means "not read", never a guess. Closed
+/// words only; the table names are checked against the connector's selected tables by the reader.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OracleSetupFacts {
+    /// `LOG_MODE`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_mode: Option<OracleLogMode>,
+    /// `supplemental_log_data_min`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supplemental_min: Option<OracleSupplementalMin>,
+    /// `supplemental_log_data_all`: all-column logging for the whole database.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supplemental_all: Option<bool>,
+    /// Per selected table (`SCHEMA.TABLE`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tables: Option<std::collections::BTreeMap<String, OracleTableFact>>,
+    /// The documented privileges and roles the login does not hold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub missing_privileges: Option<Vec<OraclePrivilege>>,
+    /// The server refused an unencrypted session (`ORA-12660`): nothing else could be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encryption_required: Option<bool>,
+}
+
+impl OracleSetupFacts {
+    /// Check the bound of the contract.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Validation`] for more than [`MAX_ORACLE_SETUP_TABLES`] tables or a table
+    /// name that is not a plain name.
+    pub fn validate(&self) -> Result<(), StoreError> {
+        if let Some(tables) = &self.tables {
+            if tables.len() > MAX_ORACLE_SETUP_TABLES {
+                return Err(StoreError::Validation(format!(
+                    "oracleSetup names more than {MAX_ORACLE_SETUP_TABLES} tables"
+                )));
+            }
+            for name in tables.keys() {
+                check_name("an oracleSetup table name", name, MAX_NAME_CHARS)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The result of a [`Kind::Test`] request: the connection was made.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Tested {
     /// How long the connection took, in milliseconds, as the orchestrator
@@ -424,6 +550,10 @@ pub struct Tested {
     /// connector, and for a test stored before they existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mongo_setup: Option<MongoSetupFacts>,
+    /// The setup facts an Oracle change-capture test read (`SRC-4` Amendment 11); absent for every
+    /// other connector.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oracle_setup: Option<OracleSetupFacts>,
 }
 
 impl Tested {
@@ -432,12 +562,15 @@ impl Tested {
     /// # Errors
     ///
     /// [`StoreError::Validation`] for a negative latency or one past
-    /// [`MAX_TEST_LATENCY_MS`].
-    pub fn validate(self) -> Result<(), StoreError> {
+    /// [`MAX_TEST_LATENCY_MS`], or setup facts past their bounds.
+    pub fn validate(&self) -> Result<(), StoreError> {
         if !(0..=MAX_TEST_LATENCY_MS).contains(&self.latency_ms) {
             return Err(StoreError::Validation(format!(
                 "latencyMs must be between 0 and {MAX_TEST_LATENCY_MS}"
             )));
+        }
+        if let Some(facts) = &self.oracle_setup {
+            facts.validate()?;
         }
         Ok(())
     }

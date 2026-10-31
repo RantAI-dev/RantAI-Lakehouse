@@ -1335,3 +1335,180 @@ def test_a_saas_object_the_vendor_cannot_describe_has_no_preview() -> None:
     module.describe = lambda session, parts, dial, name: None  # type: ignore[method-assign]
     with pytest.raises(discover.NotSupported):
         discover.discover(_SAAS, _request("preview", object="tickets"), backends=_saas_backends(module))
+
+
+# --- Oracle change capture: the setup facts (SRC-4 Amendment 11) -------------------------------------
+
+
+class _DictConnection:
+    """A connection that answers the constant statements of `oracle_setup_facts` by their text and
+    records every statement, so the tests can show that no value was put into one."""
+
+    def __init__(self, answers: dict[str, object]):
+        self._answers = answers
+        self.statements: list[str] = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def execute(self, statement, params=None):
+        sql = str(statement)
+        self.statements.append(sql)
+        for needle, rows in self._answers.items():
+            if sql.strip() == needle:
+                if isinstance(rows, Exception):
+                    raise rows
+                return rows
+        raise AssertionError(f"unexpected statement: {sql}")
+
+
+class _CdcEngine:
+    def __init__(self, connection=None, error=None):
+        self.connection = connection
+        self.error = error
+        self.disposed = False
+        self.spec = None
+
+    def connect(self):
+        if self.error is not None:
+            raise self.error
+        return self.connection
+
+    def dispose(self):
+        self.disposed = True
+
+
+_CDC_ORACLE = {
+    "id": "conn-1",
+    "adapter": "cdc",
+    "dial": {
+        "driver": "oracle", "host": "o.example", "port": 1521, "database": "FREE", "pdbName": "FREEPDB1",
+        "user": "c##dbzuser", "sslMode": "require",
+    },
+    "secretRef": "env:X",
+    "sourceObjects": [{"name": "SHOP.ORDERS"}, {"name": "SHOP.PLAIN"}, {"name": "SHOP.TYPO"}],
+}
+
+_ALL_PRIVILEGES = [(p,) for p in (*discover._CDC_ORACLE_REQUIRED, *discover._CDC_ORACLE_EITHER_PER_TABLE)]
+
+
+def _good_answers(**changes) -> dict[str, object]:
+    answers: dict[str, object] = {
+        "SELECT 1 FROM DUAL": [(1,)],
+        discover._CDC_ORACLE_LOG_MODE: [("ARCHIVELOG",)],
+        discover._CDC_ORACLE_SUPPLEMENTAL: [("YES", "NO")],
+        discover._CDC_ORACLE_PRIVILEGES: _ALL_PRIVILEGES,
+        discover._CDC_ORACLE_ROLES: [],
+        discover._CDC_ORACLE_CONTAINERS: [(1, "CDB$ROOT"), (3, "FREEPDB1")],
+        discover._CDC_ORACLE_LOG_GROUPS_CDB: [(3, "SHOP", "ORDERS"), (1, "SHOP", "PLAIN")],
+        discover._CDC_ORACLE_TABLES_CDB: [(3, "SHOP", "ORDERS"), (3, "SHOP", "PLAIN"), (3, "OTHER", "T")],
+    }
+    answers.update(changes)
+    return answers
+
+
+def _cdc_facts(answers: dict[str, object]) -> tuple[dict, _CdcEngine]:
+    engine = _CdcEngine(_DictConnection(answers))
+    seen = {}
+
+    def make(spec, secrets, *, resolve_checked):
+        seen.update(spec)
+        return engine
+
+    result = discover.discover(_CDC_ORACLE, _request("test"), backends=_backends(oracle_engine=make))
+    engine.spec = seen
+    return result, engine
+
+
+def test_an_oracle_change_capture_test_reads_closed_facts_per_table_without_any_value_in_sql() -> None:
+    result, engine = _cdc_facts(_good_answers())
+    assert set(result) == {"latencyMs", "oracleSetup"}
+    assert result["oracleSetup"] == {
+        "logMode": "archivelog",
+        "supplementalMin": "yes",
+        "supplementalAll": False,
+        "missingPrivileges": [],
+        # The PDB's own con_id (3) picks the rows: the root's row for SHOP.PLAIN does not count.
+        "tables": {"SHOP.ORDERS": "allColumns", "SHOP.PLAIN": "withoutAllColumns", "SHOP.TYPO": "notFound"},
+    }
+    joined = "\n".join(engine.connection.statements)
+    for value in ("SHOP", "ORDERS", "FREEPDB1", "c##dbzuser", "PLAIN"):
+        assert value not in joined, "values are compared in Python, never put into a statement"
+    assert engine.spec["sslMode"] == "disable", "the SEC-14 exception: the read is unencrypted"
+    assert engine.disposed is True
+
+
+def test_a_missing_setting_is_a_closed_word_and_an_unreadable_one_is_left_out() -> None:
+    answers = _good_answers(
+        **{
+            discover._CDC_ORACLE_LOG_MODE: [("NOARCHIVELOG",)],
+            discover._CDC_ORACLE_SUPPLEMENTAL: [("NO", "NO")],
+            discover._CDC_ORACLE_PRIVILEGES: [("CREATE SESSION",)],
+            discover._CDC_ORACLE_ROLES: [("SELECT_CATALOG_ROLE",)],
+            discover._CDC_ORACLE_LOG_GROUPS_CDB: RuntimeError("ORA-00942 secret text"),
+        }
+    )
+    result, _engine = _cdc_facts(answers)
+    facts = result["oracleSetup"]
+    assert facts["logMode"] == "noarchivelog" and facts["supplementalMin"] == "no"
+    assert "LOGMINING" in facts["missingPrivileges"] and "CREATE SESSION" not in facts["missingPrivileges"]
+    assert "SELECT_CATALOG_ROLE" not in facts["missingPrivileges"]
+    assert "tables" not in facts, "a statement that raised leaves its fact out"
+    assert "secret text" not in json.dumps(result)
+
+
+def test_database_level_all_column_logging_is_posted_as_a_fact() -> None:
+    result, _engine = _cdc_facts(_good_answers(**{discover._CDC_ORACLE_SUPPLEMENTAL: [("IMPLICIT", "YES")]}))
+    assert result["oracleSetup"]["supplementalMin"] == "implicit"
+    assert result["oracleSetup"]["supplementalAll"] is True
+
+
+def test_a_server_that_requires_encryption_is_posted_as_that_fact_and_nothing_else() -> None:
+    engine = _CdcEngine(error=RuntimeError("DPY-4011: ORA-12660: Encryption or crypto-checksumming parameters incompatible"))
+    result = discover.discover(
+        _CDC_ORACLE, _request("test"), backends=_backends(oracle_engine=lambda spec, secrets, *, resolve_checked: engine)
+    )
+    assert result["oracleSetup"] == {"encryptionRequired": True}
+    assert engine.disposed is True
+
+
+def test_another_connect_failure_is_classified_not_turned_into_a_fact() -> None:
+    engine = _CdcEngine(error=ConnectionRefusedError())
+    posted: list[dict] = []
+    error_class = discover.run_request(
+        _request("test"),
+        connector_loader=lambda cid: _CDC_ORACLE,
+        poster=posted.append,
+        backends=_backends(oracle_engine=lambda spec, secrets, *, resolve_checked: engine),
+    )
+    assert error_class == "unreachable"
+    assert posted == [{"requestId": "req-1", "kind": "test", "state": "failed", "errorClass": "unreachable"}]
+
+
+def test_an_oracle_change_capture_connector_lists_and_previews_nothing_here() -> None:
+    for kind in ("list", "preview"):
+        posted: list[dict] = []
+        error_class = discover.run_request(
+            _request(kind, object="SHOP.ORDERS"), connector_loader=lambda cid: _CDC_ORACLE, poster=posted.append
+        )
+        assert error_class == "not_supported"
+
+
+def test_without_a_pdb_the_non_container_views_are_read() -> None:
+    connector = {**_CDC_ORACLE, "dial": {k: v for k, v in _CDC_ORACLE["dial"].items() if k != "pdbName"}}
+    answers = _good_answers(
+        **{
+            discover._CDC_ORACLE_LOG_GROUPS: [("SHOP", "ORDERS")],
+            discover._CDC_ORACLE_TABLES: [("SHOP", "ORDERS"), ("SHOP", "PLAIN")],
+        }
+    )
+    engine = _CdcEngine(_DictConnection(answers))
+    result = discover.discover(
+        connector, _request("test"), backends=_backends(oracle_engine=lambda spec, secrets, *, resolve_checked: engine)
+    )
+    assert result["oracleSetup"]["tables"] == {
+        "SHOP.ORDERS": "allColumns", "SHOP.PLAIN": "withoutAllColumns", "SHOP.TYPO": "notFound",
+    }

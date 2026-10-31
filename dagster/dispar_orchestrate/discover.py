@@ -74,6 +74,7 @@ load refuses, `column_gate.py`), `mixed` (values of different types) and `unknow
 from __future__ import annotations
 
 import csv
+import functools
 import io
 import json
 import logging
@@ -651,6 +652,153 @@ def _cdc_mongo(dial: dict, secrets: dict, request: DiscoverRequest, b: Backends)
     return result
 
 
+# --- Oracle change capture: the setup facts (SRC-4 Amendment 11) ----------------------------------------
+#
+# Every statement below is a constant of this build. A value to compare (a selected table, the PDB name)
+# is compared in Python against what the statement returned, never put into SQL, and no table row is
+# ever read: the views are the data dictionary's.
+_CDC_ORACLE_LOG_MODE = "SELECT log_mode FROM v$database"
+_CDC_ORACLE_SUPPLEMENTAL = "SELECT supplemental_log_data_min, supplemental_log_data_all FROM v$database"
+_CDC_ORACLE_PRIVILEGES = "SELECT privilege FROM session_privs"
+_CDC_ORACLE_ROLES = "SELECT role FROM session_roles"
+_CDC_ORACLE_CONTAINERS = "SELECT con_id, name FROM v$containers"
+_CDC_ORACLE_LOG_GROUPS_CDB = (
+    "SELECT con_id, owner, table_name FROM cdb_log_groups WHERE log_group_type = 'ALL COLUMN LOGGING'"
+)
+_CDC_ORACLE_TABLES_CDB = (
+    "SELECT t.con_id, t.owner, t.table_name FROM cdb_tables t "
+    "JOIN cdb_users u ON u.con_id = t.con_id AND u.username = t.owner WHERE u.oracle_maintained = 'N'"
+)
+_CDC_ORACLE_LOG_GROUPS = "SELECT owner, table_name FROM all_log_groups WHERE log_group_type = 'ALL COLUMN LOGGING'"
+_CDC_ORACLE_TABLES = "SELECT owner, table_name FROM all_tables"
+
+# What Debezium's documentation says the LogMiner user holds (system privileges and roles; the object
+# grants on the V_$ views are not session privileges). The pair in `_CDC_ORACLE_EITHER_PER_TABLE` can also be
+# granted per table, which a session cannot see from the container database: the API words it so.
+_CDC_ORACLE_REQUIRED = (
+    "CREATE SESSION", "SET CONTAINER", "LOGMINING", "SELECT ANY TRANSACTION", "EXECUTE_CATALOG_ROLE",
+    "SELECT_CATALOG_ROLE", "CREATE TABLE", "LOCK ANY TABLE", "CREATE SEQUENCE",
+)
+_CDC_ORACLE_EITHER_PER_TABLE = ("FLASHBACK ANY TABLE", "SELECT ANY TABLE")
+
+
+def _read_oracle_rows(connection: Any, sql: str) -> list[tuple]:
+    from sqlalchemy import text
+
+    return [tuple(r) for r in connection.execute(text(sql))]
+
+
+def oracle_setup_facts(connection: Any, dial: dict, tables: list[str]) -> dict[str, Any]:
+    """The closed facts of an Oracle change-capture test (`SRC-4` Amendment 11, S11-b). Each is read by
+    its own constant statement in its own `try`: a statement the login may not run leaves that fact OUT
+    (the API then shows `unchecked`); nothing is guessed and no server text is kept."""
+    facts: dict[str, Any] = {}
+    try:
+        mode = _read_oracle_rows(connection, _CDC_ORACLE_LOG_MODE)[0][0]
+        if mode in ("ARCHIVELOG", "NOARCHIVELOG"):
+            facts["logMode"] = mode.lower()
+    except Exception:  # noqa: BLE001 -- an unread fact is left out, never guessed (and never quoted)
+        pass
+    try:
+        minimal, everything = _read_oracle_rows(connection, _CDC_ORACLE_SUPPLEMENTAL)[0]
+        if minimal in ("YES", "NO", "IMPLICIT"):
+            facts["supplementalMin"] = minimal.lower()
+        if everything in ("YES", "NO"):
+            facts["supplementalAll"] = everything == "YES"
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        held = {r[0] for r in _read_oracle_rows(connection, _CDC_ORACLE_PRIVILEGES)}
+        held |= {r[0] for r in _read_oracle_rows(connection, _CDC_ORACLE_ROLES)}
+        facts["missingPrivileges"] = [p for p in (*_CDC_ORACLE_REQUIRED, *_CDC_ORACLE_EITHER_PER_TABLE) if p not in held]
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        per_table = _oracle_table_facts(connection, dial, tables)
+        if per_table is not None:
+            facts["tables"] = per_table
+    except Exception:  # noqa: BLE001
+        pass
+    return facts
+
+
+def _oracle_table_facts(connection: Any, dial: dict, tables: list[str]) -> dict[str, str] | None:
+    """Per selected table: `allColumns`, `withoutAllColumns` or `notFound`. In a container database the
+    dictionary views of every container are read (`cdb_*`) and the container is picked HERE, by the
+    dial's `pdbName` against `v$containers`: no value goes into a statement. Rows are streamed; only
+    the selected tables are kept."""
+    wanted = {name for name in tables if isinstance(name, str)}
+    if not wanted:
+        return {}
+    pdb = dial.get("pdbName")
+    con_id: Any = None
+    if pdb:
+        found = [r[0] for r in _read_oracle_rows(connection, _CDC_ORACLE_CONTAINERS) if str(r[1]).upper() == str(pdb).upper()]
+        if not found:
+            return None
+        con_id = found[0]
+        groups_sql, tables_sql = _CDC_ORACLE_LOG_GROUPS_CDB, _CDC_ORACLE_TABLES_CDB
+    else:
+        groups_sql, tables_sql = _CDC_ORACLE_LOG_GROUPS, _CDC_ORACLE_TABLES
+
+    def named(rows: list[tuple]) -> set[str]:
+        out = set()
+        for row in rows:
+            if pdb and row[0] != con_id:
+                continue
+            owner, table = row[-2], row[-1]
+            if f"{owner}.{table}" in wanted:
+                out.add(f"{owner}.{table}")
+        return out
+
+    with_all = named(_read_oracle_rows(connection, groups_sql))
+    existing = named(_read_oracle_rows(connection, tables_sql))
+    return {
+        name: "allColumns" if name in with_all else ("withoutAllColumns" if name in existing else "notFound")
+        for name in sorted(wanted)
+    }
+
+
+def _cdc_oracle(
+    dial: dict, secrets: dict, request: DiscoverRequest, b: Backends, *, tables: list[str] | None = None
+) -> dict[str, Any]:
+    """An Oracle change-capture connector's setup facts (`SRC-4` Amendment 11). Only a connection test is
+    answered here: the tables of an Oracle change-capture connector are typed by hand (Amendment 10, S10-c).
+
+    # SEC-14 exception (owner-signed 2026-10-31, Amendment 11, S11-a)
+
+    `python-oracledb` thin mode has no native network encryption (2.5.1 and 26.1.0), so this read is made
+    over an UNENCRYPTED session: `sslMode` is forced to `disable` below for the dial that `connection_parts`
+    builds. The connector itself requires encryption and the connection test goes through Kafka Connect with
+    it. The exception is limited to what is read: the data dictionary's views of the fixed statements above,
+    never a table row, and the password is not sent in clear text (Oracle's own logon protocol). A server
+    that refuses an unencrypted session (`ORA-12660`) is posted as the fact `encryptionRequired`."""
+    if request.kind != "test":
+        raise NotSupported("an Oracle change-capture connector's tables are typed by hand")
+    plain = {**dial, "sslMode": "disable"}
+    engine = b.oracle_engine(plain, secrets, resolve_checked=b.resolve_checked)
+    started = time.monotonic()
+    try:
+        with b.checking_resolver():
+            try:
+                connection = engine.connect()
+            except Exception as exc:  # noqa: BLE001
+                # Matched on the code only; the text is not read further, logged or posted.
+                if "ORA-12660" not in str(exc):
+                    raise
+                latency = max(0, round((time.monotonic() - started) * 1000))
+                return {"latencyMs": latency, "oracleSetup": {"encryptionRequired": True}}
+            with connection:
+                rows = _read_oracle_rows(connection, "SELECT 1 FROM DUAL")
+                if rows != [(1,)]:
+                    raise ValueError("the test statement did not answer")
+                latency = max(0, round((time.monotonic() - started) * 1000))
+                facts = oracle_setup_facts(connection, dial, tables or [])
+    finally:
+        engine.dispose()
+    return {"latencyMs": latency, **({"oracleSetup": facts} if facts else {})}
+
+
 def _kafka(dial: dict, secrets: dict, request: DiscoverRequest, b: Backends) -> dict[str, Any]:
     # A group id the connector never uses (module docstring, "Kafka never commits").
     consumer = b.kafka_consumer(dial, secrets, group_id=f"lakehouse-discover-{request.request_id}")
@@ -874,6 +1022,9 @@ def _reader_for(connector: dict) -> Callable[[dict, dict, DiscoverRequest, Backe
         return _oracle
     if adapter == "cdc" and dial.get("driver") == "mongodb":
         return _cdc_mongo
+    if adapter == "cdc" and dial.get("driver") == "oracle":
+        selected = [o.get("name") for o in connector.get("sourceObjects") or [] if isinstance(o, dict)]
+        return functools.partial(_cdc_oracle, tables=selected)
     readers = {"mongodb": _mongo, "kafka": _kafka, "sftp": _sftp, "rest": _rest, "saas": _saas}
     reader = readers.get(adapter)
     if reader is None:
@@ -892,7 +1043,7 @@ def discover(connector: dict, request: DiscoverRequest, *, backends: Backends | 
     errors -- for `classify_discovery` to name. Nothing is caught here.
     """
     reader = _reader_for(connector)
-    if request.kind == "test" and reader not in (_oracle, _cdc_mongo):
+    if request.kind == "test" and getattr(reader, "func", reader) not in (_oracle, _cdc_mongo, _cdc_oracle):
         # SRC-4 T1.1 and slice 5: only Oracle and a MongoDB change-capture connector are tested here;
         # the API tests the rest itself or says it cannot.
         raise NotSupported("the orchestrator tests only Oracle and MongoDB change-capture connections")

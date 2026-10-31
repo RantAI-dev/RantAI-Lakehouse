@@ -1074,7 +1074,8 @@ pub async fn test_connection(
     }
     // `SRC-4` slice 6 (S10-a): an Oracle change-capture connector is tested by
     // `Kafka Connect`, with the driver and encryption the connector uses.
-    let oracle_tables = if crate::cdc_oracle::is_oracle_cdc(&dial_info) {
+    let is_oracle_cdc = crate::cdc_oracle::is_oracle_cdc(&dial_info);
+    let oracle_tables = if is_oracle_cdc {
         // The checks never decide a test: a store error leaves the placeholder table.
         super::capture_lag::selected_tables(pool(&state)?, &id)
             .await
@@ -1101,6 +1102,26 @@ pub async fn test_connection(
         )
         .await?;
     }
+    // `SRC-4` Amendment 11 (S11-a): once Kafka Connect's validation passed, the
+    // orchestrator reads Oracle's setup facts (a second, unencrypted, dictionary-only
+    // session: the owner-signed `SEC-14` exception). The answer says so and is
+    // `pending`: the checks arrive by `GET .../discovery/test`, and the console waits for
+    // them. A launch that fails leaves the test as it was, with no checks.
+    let mut setup_pending = false;
+    if is_oracle_cdc && outcome.ok {
+        match super::connector_discovery::launch_test(&state, &id).await {
+            Ok(()) => {
+                outcome.message.push(' ');
+                outcome
+                    .message
+                    .push_str(crate::cdc_oracle::UNENCRYPTED_SETUP_READ);
+                setup_pending = true;
+            }
+            Err(err) => {
+                tracing::warn!(?err, connector_id = %id, "the Oracle setup read was not launched");
+            }
+        }
+    }
     // `SRC-4` slice 4 (S4-f): a change-capture source is also asked what it must
     // have switched on. Only after the test passed (there is nothing to read from
     // a source that cannot be reached), and never part of `ok`.
@@ -1111,6 +1132,8 @@ pub async fn test_connection(
     };
     let mut result = record_test_outcome(&state, &principal, &id, &outcome).await?;
     result.setup_checks = setup_checks;
+    // A passed answer that still waits for its setup checks (see above): `pending` with `ok`.
+    result.pending = setup_pending;
     Ok(ApiJson(result))
 }
 

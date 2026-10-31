@@ -69,7 +69,8 @@ use lakehouse_auth::Principal;
 use lakehouse_core::ApiError;
 use lakehouse_store::connector_discovery::{
     self, Answer, ErrorClass, Kind, ListedColumn, ListedObject, Listing, MAX_NAME_CHARS,
-    MAX_OBJECTS, MongoSetupFacts, Outcome, Preview, State as RequestState, Tested,
+    MAX_OBJECTS, MongoSetupFacts, OracleSetupFacts, Outcome, Preview, State as RequestState,
+    Tested,
 };
 use lakehouse_store::connectors;
 use serde::{Deserialize, Serialize};
@@ -315,19 +316,43 @@ pub async fn poll(
     // `SRC-4` Amendment 8 (S8-e): a finished `MongoDB` change-capture test also lists what the
     // source must have switched on. The facts are the stored ones, the dial is the connector's as
     // it is now, and the checks are ours (`cdc_setup_check::mongo_checks`); they never change `ok`.
-    let facts = stored.tested.and_then(|tested| tested.mongo_setup);
+    let mongo_facts = stored.tested.as_ref().and_then(|tested| tested.mongo_setup);
+    let oracle_facts = stored
+        .tested
+        .as_ref()
+        .and_then(|tested| tested.oracle_setup.clone());
     let finished_test = kind == Kind::Test && stored.state == RequestState::Done;
+    // `SRC-4` Amendment 11: an Oracle test whose facts job failed still lists its checks, all
+    // `unchecked` ("could not be read"), so the person is never left with nothing.
+    let ended_test = kind == Kind::Test && stored.state != RequestState::Running;
     let mut answer = stored.into_answer(OffsetDateTime::now_utc());
-    if finished_test {
+    if ended_test {
         let info = connectors::get_connector_dial_info(pool(&state)?, &id).await?;
         let dial = info
             .filter(|info| info.adapter.as_deref() == Some("cdc"))
             .and_then(|info| lakehouse_store::ingest_spec::Dial::parse("cdc", &info.dial).ok());
-        if let Some(mongo) = dial
+        let mongo = dial
             .as_ref()
             .and_then(lakehouse_store::ingest_spec::Dial::as_cdc_mongo)
+            .filter(|_| finished_test);
+        if let Some(mongo) = mongo {
+            answer.setup_checks = Some(crate::cdc_setup_check::mongo_checks(
+                mongo_facts.as_ref(),
+                mongo,
+            ));
+        } else if let Some(oracle) = dial
+            .as_ref()
+            .and_then(lakehouse_store::ingest_spec::Dial::as_cdc)
+            .filter(|cdc| cdc.driver == lakehouse_store::ingest_spec::SqlDriver::Oracle)
         {
-            answer.setup_checks = Some(crate::cdc_setup_check::mongo_checks(facts.as_ref(), mongo));
+            // The checks are about the tables the connector selects NOW, not about the ones
+            // the orchestrator was asked about when the test started.
+            let tables = super::capture_lag::selected_tables(pool(&state)?, &id).await?;
+            answer.setup_checks = Some(crate::cdc_setup_check::oracle_checks(
+                oracle_facts.as_ref(),
+                &tables,
+                &oracle.user,
+            ));
         }
     }
     Ok(ApiJson(answer))
@@ -359,6 +384,10 @@ pub struct ResultBody {
     /// Amendment 8, S8-c): closed words only, for a finished `test` and nothing else.
     #[serde(default)]
     mongo_setup: Option<MongoSetupFacts>,
+    /// What an Oracle change-capture test read about the source's setup (`SRC-4` Amendment 11,
+    /// S11-b): closed words only, for a finished `test` and nothing else.
+    #[serde(default)]
+    oracle_setup: Option<OracleSetupFacts>,
 }
 
 /// What the result route answers: whether this call stored the answer (`false`
@@ -385,6 +414,7 @@ fn outcome_of(body: ResultBody) -> Result<Outcome, ApiError> {
                 || body.primary_key.is_some()
                 || body.latency_ms.is_some()
                 || body.mongo_setup.is_some()
+                || body.oracle_setup.is_some()
             {
                 return Err(bad("a failure carries no result"));
             }
@@ -397,6 +427,9 @@ fn outcome_of(body: ResultBody) -> Result<Outcome, ApiError> {
             // S8-c: the setup facts belong to a finished test only.
             if body.mongo_setup.is_some() && body.kind != Kind::Test {
                 return Err(bad("only a test carries mongoSetup"));
+            }
+            if body.oracle_setup.is_some() && body.kind != Kind::Test {
+                return Err(bad("only a test carries oracleSetup"));
             }
             match body.kind {
                 Kind::List => {
@@ -443,6 +476,7 @@ fn outcome_of(body: ResultBody) -> Result<Outcome, ApiError> {
                     Ok(Outcome::Tested(Tested {
                         latency_ms,
                         mongo_setup: body.mongo_setup,
+                        oracle_setup: body.oracle_setup,
                     }))
                 }
             }
@@ -638,7 +672,8 @@ mod tests {
             done,
             Outcome::Tested(Tested {
                 latency_ms: 212,
-                mongo_setup: None
+                mongo_setup: None,
+                oracle_setup: None,
             })
         );
         let failed = result(json!({
@@ -663,6 +698,63 @@ mod tests {
 
     /// `SRC-4` Amendment 8 (S8-c): the setup facts are closed words, for a finished test only.
     #[test]
+    fn oracle_setup_facts_are_closed_words_and_belong_to_a_finished_test_only() {
+        use lakehouse_store::connector_discovery::{
+            OracleLogMode, OraclePrivilege, OracleTableFact,
+        };
+
+        let done = result(json!({
+            "requestId": "r", "kind": "test", "state": "done", "latencyMs": 5,
+            "oracleSetup": {
+                "logMode": "noarchivelog", "supplementalMin": "no", "supplementalAll": false,
+                "tables": {"SHOP.ORDERS": "allColumns", "SHOP.X": "notFound"},
+                "missingPrivileges": ["LOGMINING", "SELECT ANY TABLE"],
+            },
+        }))
+        .unwrap();
+        let Outcome::Tested(tested) = done else {
+            panic!("a test");
+        };
+        let facts = tested.oracle_setup.unwrap();
+        assert_eq!(facts.log_mode, Some(OracleLogMode::Noarchivelog));
+        assert_eq!(
+            facts.missing_privileges,
+            Some(vec![
+                OraclePrivilege::Logmining,
+                OraclePrivilege::SelectAnyTable
+            ])
+        );
+        assert_eq!(
+            facts.tables.unwrap().get("SHOP.X"),
+            Some(&OracleTableFact::NotFound)
+        );
+        // Does not even parse: a word outside the set, free text, an unknown key.
+        for body in [
+            json!({"requestId": "r", "kind": "test", "state": "done", "latencyMs": 5,
+                   "oracleSetup": {"logMode": "ORA-00942 table or view does not exist"}}),
+            json!({"requestId": "r", "kind": "test", "state": "done", "latencyMs": 5,
+                   "oracleSetup": {"missingPrivileges": ["DROP ANY TABLE"]}}),
+            json!({"requestId": "r", "kind": "test", "state": "done", "latencyMs": 5,
+                   "oracleSetup": {"tables": {"A.B": "the table is locked"}}}),
+            json!({"requestId": "r", "kind": "test", "state": "done", "latencyMs": 5,
+                   "oracleSetup": {"message": "x"}}),
+        ] {
+            assert!(
+                serde_json::from_value::<ResultBody>(body.clone()).is_err(),
+                "{body}"
+            );
+        }
+        for body in [
+            json!({"requestId": "r", "kind": "list", "state": "done", "objects": [],
+                   "oracleSetup": {"logMode": "archivelog"}}),
+            json!({"requestId": "r", "kind": "test", "state": "failed", "errorClass": "failed",
+                   "oracleSetup": {"logMode": "archivelog"}}),
+        ] {
+            assert!(result(body.clone()).is_err(), "{body}");
+        }
+    }
+
+    #[test]
     fn mongo_setup_facts_are_closed_words_and_belong_to_a_finished_test_only() {
         use lakehouse_store::connector_discovery::{
             ChangeStreamFact, MongoSetupFacts, ReplicaSetFact,
@@ -682,6 +774,7 @@ mod tests {
                     primary: Some(false),
                     change_stream: Some(ChangeStreamFact::Missing),
                 }),
+                oracle_setup: None,
             })
         );
         // A key that was not read is absent, and an empty object is still no fact.

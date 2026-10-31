@@ -3514,6 +3514,7 @@ mod tests {
             &Reported::Tested(Tested {
                 latency_ms: 212,
                 mongo_setup: None,
+                oracle_setup: None,
             }),
             OrchestratorTested::Oracle,
         );
@@ -3574,6 +3575,7 @@ mod tests {
             &Reported::Tested(Tested {
                 latency_ms: 9,
                 mongo_setup: None,
+                oracle_setup: None,
             }),
             OrchestratorTested::MongoDb,
         );

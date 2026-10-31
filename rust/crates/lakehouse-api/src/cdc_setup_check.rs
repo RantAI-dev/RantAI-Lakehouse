@@ -23,7 +23,10 @@
 //! A fact that could not be read (a statement the login may not run, a
 //! connection that ended) gives `unchecked` with a fixed sentence, never `ok`.
 
-use lakehouse_store::connector_discovery::{ChangeStreamFact, MongoSetupFacts, ReplicaSetFact};
+use lakehouse_store::connector_discovery::{
+    ChangeStreamFact, MongoSetupFacts, OracleLogMode, OraclePrivilege, OracleSetupFacts,
+    OracleSupplementalMin, OracleTableFact, ReplicaSetFact,
+};
 use lakehouse_store::connectors::{SetupCheck, SetupStatus};
 use lakehouse_store::ingest_spec::CdcMongoDial;
 
@@ -584,6 +587,177 @@ fn mongo_change_stream(fact: Option<ChangeStreamFact>, dial: &CdcMongoDial) -> S
     }
 }
 
+// ── Oracle ─────────────────────────────────────────────────────────────────
+
+/// What every Oracle check says when the server refused an unencrypted session (`SRC-4`
+/// Amendment 11, S11-c): the read is made over one, so nothing could be read.
+pub const ORACLE_ENCRYPTION_REQUIRED: &str = "The server requires encryption, which the setup check \
+    cannot use: check these settings by hand.";
+
+/// `"name"` with embedded quotes doubled, in Oracle's spelling (upper case): a name typed or
+/// created without quotes is stored upper case, and the person pastes this into `SQL*Plus`.
+fn oracle_ident(name: &str) -> String {
+    format!("\"{}\"", name.to_uppercase().replace('"', "\"\""))
+}
+
+/// `"SCHEMA"."TABLE"` for `SCHEMA.TABLE`.
+fn oracle_table(qualified: &str) -> String {
+    match qualified.split_once('.') {
+        Some((schema, table)) => format!("{}.{}", oracle_ident(schema), oracle_ident(table)),
+        None => oracle_ident(qualified),
+    }
+}
+
+/// The Oracle checks (`SRC-4` Amendment 11, S11-b): `ARCHIVELOG`, minimal supplemental logging,
+/// all-column logging for each selected table, and the documented `LogMiner` privileges. Pure:
+/// `facts` are what the orchestrator's Oracle test posted (closed words, no server text); a fact
+/// it did not read, or no facts at all, is `unchecked`, never `ok`, and a server that required
+/// encryption makes every check `unchecked` with [`ORACLE_ENCRYPTION_REQUIRED`]. Database-level
+/// all-column logging makes every table `ok`. `tables` are the connector's selected tables and
+/// `user` the dial's login, shown in the commands only.
+#[must_use]
+pub fn oracle_checks(
+    facts: Option<&OracleSetupFacts>,
+    tables: &[String],
+    user: &str,
+) -> Vec<SetupCheck> {
+    let mut settings = vec!["ARCHIVELOG".to_owned(), "Supplemental logging".to_owned()];
+    settings.extend(tables.iter().map(|t| format!("All-column logging on {t}")));
+    settings.push("LogMiner privileges".to_owned());
+    if facts.is_some_and(|f| f.encryption_required == Some(true)) {
+        return settings
+            .iter()
+            .map(|setting| unchecked(setting, ORACLE_ENCRYPTION_REQUIRED))
+            .collect();
+    }
+    let default = OracleSetupFacts::default();
+    let facts = facts.unwrap_or(&default);
+    let mut checks = vec![oracle_archivelog(facts), oracle_supplemental(facts)];
+    checks.extend(tables.iter().map(|table| oracle_table_check(facts, table)));
+    checks.push(oracle_privileges(facts, user));
+    checks
+}
+
+fn oracle_archivelog(facts: &OracleSetupFacts) -> SetupCheck {
+    const SETTING: &str = "ARCHIVELOG";
+    match facts.log_mode {
+        None => unchecked(SETTING, UNREAD),
+        Some(OracleLogMode::Archivelog) => ok(SETTING, "The database runs in ARCHIVELOG mode."),
+        // No one-line command: it needs a restart, so the message names the steps (S6-g).
+        Some(OracleLogMode::Noarchivelog) => missing_without_command(
+            SETTING,
+            "The database must run in ARCHIVELOG mode. It needs a restart: as SYSDBA run \
+             SHUTDOWN IMMEDIATE, STARTUP MOUNT, ALTER DATABASE ARCHIVELOG, ALTER DATABASE OPEN.",
+        ),
+    }
+}
+
+fn oracle_supplemental(facts: &OracleSetupFacts) -> SetupCheck {
+    const SETTING: &str = "Supplemental logging";
+    match facts.supplemental_min {
+        None => unchecked(SETTING, UNREAD),
+        Some(OracleSupplementalMin::Yes | OracleSupplementalMin::Implicit) => ok(
+            SETTING,
+            "Minimal supplemental logging is on for the database.",
+        ),
+        Some(OracleSupplementalMin::No) => missing(
+            SETTING,
+            "Minimal supplemental logging must be on for the database.",
+            "ALTER DATABASE ADD SUPPLEMENTAL LOG DATA;".to_owned(),
+        ),
+    }
+}
+
+fn oracle_table_check(facts: &OracleSetupFacts, table: &str) -> SetupCheck {
+    let setting = format!("All-column logging on {table}");
+    if facts.supplemental_all == Some(true) {
+        return ok(&setting, "All-column logging is on for the whole database.");
+    }
+    let Some(found) = facts.tables.as_ref().map(|t| t.get(table)) else {
+        return unchecked(&setting, UNREAD);
+    };
+    match found {
+        // The orchestrator was asked about the tables the connector selected when the test
+        // started; one chosen since is not in its answer.
+        None => unchecked(&setting, UNREAD),
+        Some(OracleTableFact::AllColumns) => {
+            ok(&setting, "All-column logging is on for the table.")
+        }
+        Some(OracleTableFact::WithoutAllColumns) => missing(
+            &setting,
+            "All-column logging must be on for the table. Without it an update arrives with its \
+             unchanged columns missing.",
+            format!(
+                "ALTER TABLE {} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;",
+                oracle_table(table)
+            ),
+        ),
+        Some(OracleTableFact::NotFound) => missing_without_command(
+            &setting,
+            "No table with this name was found in the database. Check the spelling: Oracle \
+             names are upper case. Nothing is captured from a table that does not exist.",
+        ),
+    }
+}
+
+fn oracle_privileges(facts: &OracleSetupFacts, user: &str) -> SetupCheck {
+    const SETTING: &str = "LogMiner privileges";
+    let Some(absent) = facts.missing_privileges.as_ref() else {
+        return unchecked(SETTING, UNREAD);
+    };
+    let mut required: Vec<OraclePrivilege> = absent
+        .iter()
+        .copied()
+        .filter(|p| {
+            !matches!(
+                p,
+                OraclePrivilege::FlashbackAnyTable | OraclePrivilege::SelectAnyTable
+            )
+        })
+        .collect();
+    required.sort();
+    required.dedup();
+    if !required.is_empty() {
+        let names: Vec<&str> = required.iter().map(|p| oracle_privilege_name(*p)).collect();
+        return missing(
+            SETTING,
+            "The login lacks privileges the connector needs.",
+            format!(
+                "GRANT {} TO {} CONTAINER=ALL;",
+                names.join(", "),
+                oracle_ident(user)
+            ),
+        );
+    }
+    // SELECT ANY TABLE and FLASHBACK ANY TABLE can be granted per table instead, which a
+    // session in the container database cannot see: not a failure, not a pass.
+    if absent.is_empty() {
+        ok(SETTING, "The login holds the documented privileges.")
+    } else {
+        unchecked(
+            SETTING,
+            "SELECT ANY TABLE or FLASHBACK ANY TABLE is not granted. That is fine if SELECT and \
+             FLASHBACK are granted on each captured table instead: check it by hand.",
+        )
+    }
+}
+
+const fn oracle_privilege_name(privilege: OraclePrivilege) -> &'static str {
+    match privilege {
+        OraclePrivilege::CreateSession => "CREATE SESSION",
+        OraclePrivilege::SetContainer => "SET CONTAINER",
+        OraclePrivilege::Logmining => "LOGMINING",
+        OraclePrivilege::SelectAnyTransaction => "SELECT ANY TRANSACTION",
+        OraclePrivilege::ExecuteCatalogRole => "EXECUTE_CATALOG_ROLE",
+        OraclePrivilege::SelectCatalogRole => "SELECT_CATALOG_ROLE",
+        OraclePrivilege::CreateTable => "CREATE TABLE",
+        OraclePrivilege::LockAnyTable => "LOCK ANY TABLE",
+        OraclePrivilege::CreateSequence => "CREATE SEQUENCE",
+        OraclePrivilege::FlashbackAnyTable => "FLASHBACK ANY TABLE",
+        OraclePrivilege::SelectAnyTable => "SELECT ANY TABLE",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -1052,5 +1226,154 @@ mod tests {
             SetupStatus::Unchecked
         );
         assert_eq!(by_setting(&checks, "replicaSet").status, SetupStatus::Ok);
+    }
+
+    // ── Oracle ──
+
+    fn oracle_ready() -> OracleSetupFacts {
+        OracleSetupFacts {
+            log_mode: Some(OracleLogMode::Archivelog),
+            supplemental_min: Some(OracleSupplementalMin::Yes),
+            supplemental_all: Some(false),
+            tables: Some(
+                [("SHOP.ORDERS".to_owned(), OracleTableFact::AllColumns)]
+                    .into_iter()
+                    .collect(),
+            ),
+            missing_privileges: Some(Vec::new()),
+            encryption_required: None,
+        }
+    }
+
+    fn oracle_tables() -> Vec<String> {
+        vec!["SHOP.ORDERS".to_owned()]
+    }
+
+    #[test]
+    fn oracle_checks_are_all_ok_when_every_fact_is_good() {
+        let checks = oracle_checks(Some(&oracle_ready()), &oracle_tables(), "c##dbzuser");
+        let settings: Vec<&str> = checks.iter().map(|c| c.setting.as_str()).collect();
+        assert_eq!(
+            settings,
+            [
+                "ARCHIVELOG",
+                "Supplemental logging",
+                "All-column logging on SHOP.ORDERS",
+                "LogMiner privileges"
+            ]
+        );
+        assert!(
+            checks
+                .iter()
+                .all(|c| c.status == SetupStatus::Ok && c.command.is_none())
+        );
+    }
+
+    #[test]
+    fn oracle_missing_settings_say_so_with_quoted_commands() {
+        let facts = OracleSetupFacts {
+            log_mode: Some(OracleLogMode::Noarchivelog),
+            supplemental_min: Some(OracleSupplementalMin::No),
+            tables: Some(
+                [
+                    ("SHOP.PLAIN".to_owned(), OracleTableFact::WithoutAllColumns),
+                    ("SHOP.TYPO".to_owned(), OracleTableFact::NotFound),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            missing_privileges: Some(vec![
+                OraclePrivilege::Logmining,
+                OraclePrivilege::CreateSession,
+            ]),
+            ..OracleSetupFacts::default()
+        };
+        let tables = vec!["SHOP.PLAIN".to_owned(), "SHOP.TYPO".to_owned()];
+        let checks = oracle_checks(Some(&facts), &tables, "c##db\"z");
+        assert_eq!(checks[0].status, SetupStatus::Missing);
+        assert_eq!(
+            checks[0].command, None,
+            "ARCHIVELOG has no one-line command"
+        );
+        assert!(checks[0].message.contains("STARTUP MOUNT"));
+        assert_eq!(
+            checks[1].command.as_deref(),
+            Some("ALTER DATABASE ADD SUPPLEMENTAL LOG DATA;")
+        );
+        assert_eq!(
+            checks[2].command.as_deref(),
+            Some("ALTER TABLE \"SHOP\".\"PLAIN\" ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;")
+        );
+        assert_eq!(checks[3].status, SetupStatus::Missing);
+        assert_eq!(
+            checks[3].command, None,
+            "a name nobody found has no command"
+        );
+        // The user is upper-cased and its quotes are doubled; the list is in a fixed order.
+        assert_eq!(
+            checks[4].command.as_deref(),
+            Some("GRANT CREATE SESSION, LOGMINING TO \"C##DB\"\"Z\" CONTAINER=ALL;")
+        );
+    }
+
+    #[test]
+    fn oracle_database_level_all_column_logging_makes_every_table_ok() {
+        let facts = OracleSetupFacts {
+            supplemental_all: Some(true),
+            tables: Some(
+                [("SHOP.PLAIN".to_owned(), OracleTableFact::WithoutAllColumns)]
+                    .into_iter()
+                    .collect(),
+            ),
+            ..oracle_ready()
+        };
+        let checks = oracle_checks(Some(&facts), &["SHOP.PLAIN".to_owned()], "u");
+        assert_eq!(checks[2].status, SetupStatus::Ok);
+    }
+
+    #[test]
+    fn oracle_unread_facts_and_an_unlisted_table_are_unchecked_never_ok() {
+        for facts in [None, Some(&OracleSetupFacts::default())] {
+            let checks = oracle_checks(facts, &oracle_tables(), "u");
+            assert!(
+                checks.iter().all(|c| c.status == SetupStatus::Unchecked),
+                "{checks:?}"
+            );
+        }
+        // A table chosen after the test started is not in the posted map.
+        let checks = oracle_checks(
+            Some(&oracle_ready()),
+            &["SHOP.ORDERS".to_owned(), "SHOP.NEW".to_owned()],
+            "u",
+        );
+        assert_eq!(checks[2].status, SetupStatus::Ok);
+        assert_eq!(checks[3].status, SetupStatus::Unchecked);
+    }
+
+    #[test]
+    fn oracle_a_server_that_requires_encryption_makes_every_check_unchecked_with_the_fixed_line() {
+        let facts = OracleSetupFacts {
+            encryption_required: Some(true),
+            ..OracleSetupFacts::default()
+        };
+        let checks = oracle_checks(Some(&facts), &oracle_tables(), "u");
+        assert_eq!(checks.len(), 4);
+        assert!(
+            checks
+                .iter()
+                .all(|c| c.status == SetupStatus::Unchecked
+                    && c.message == ORACLE_ENCRYPTION_REQUIRED)
+        );
+    }
+
+    #[test]
+    fn oracle_a_per_table_grant_alternative_is_unchecked_not_missing() {
+        let facts = OracleSetupFacts {
+            missing_privileges: Some(vec![OraclePrivilege::SelectAnyTable]),
+            ..oracle_ready()
+        };
+        let checks = oracle_checks(Some(&facts), &oracle_tables(), "u");
+        assert_eq!(checks[3].status, SetupStatus::Unchecked);
+        assert!(checks[3].command.is_none());
     }
 }

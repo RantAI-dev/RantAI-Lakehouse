@@ -37,6 +37,12 @@ use crate::connector_probe::{Outcome, resolve_checked};
 use crate::kafka_connect::{ConfigValidation, ConnectError, KafkaConnectClient, NOT_CONFIGURED};
 use crate::state::AppState;
 
+/// Said in the test result when the orchestrator also reads Oracle's setup facts (`SRC-4` Amendment
+/// 11, S11-c): that read is the owner-signed exception to `SEC-14`'s encryption rule, limited to the
+/// data dictionary. Fixed text, shown as is.
+pub const UNENCRYPTED_SETUP_READ: &str = "Setup checks are read over an unencrypted connection; \
+    the password is not sent in clear text, the session is not encrypted.";
+
 /// A table the test names when the connector selects none yet. The connector
 /// is only validated, never created, so it captures nothing; the renderer needs
 /// one name, and `Debezium`'s validation does not look for the table.

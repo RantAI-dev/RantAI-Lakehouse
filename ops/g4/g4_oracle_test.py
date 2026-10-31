@@ -67,6 +67,16 @@ OBJECT_GRANTS = (
 ENCRYPTION_ADAPTER = "AES256 Encryption service adapter"
 CHECKSUM_ADAPTER = "SHA256 Crypto-checksumming service adapter"
 WRONG_LOGIN_SENTENCE = "Oracle connection failed: authentication failed"
+# The fixed line of `cdc_oracle::UNENCRYPTED_SETUP_READ` (Amendment 11, S11-c).
+UNENCRYPTED_LINE = (
+    "Setup checks are read over an unencrypted connection; the password is not sent in clear text, "
+    "the session is not encrypted."
+)
+# The settings of `cdc_setup_check::oracle_checks` for the gate's two selected tables.
+EXPECTED_SETTINGS = (
+    "ARCHIVELOG", "Supplemental logging", f"All-column logging on {SCHEMA}.ORDERS",
+    f"All-column logging on {SCHEMA}.ORDERS_HISTORY", "LogMiner privileges",
+)
 
 
 def _connect(service: str):
@@ -208,11 +218,70 @@ class OracleSource(cdc_gate.Source):
 
     # ── The setup checks (Amendment 11) ─────────────────────────────────────
 
-    def setup_checks_step(self, connector_id: str) -> None:
+    def _test_and_wait_for_checks(self, connector_id: str) -> list[dict]:
+        """`POST .../test`: Kafka Connect's validation answers at once, passed and `pending` (the
+        setup facts are still being read, Amendment 11, S11-a), with the S11-c line in the message;
+        then `GET .../discovery/test` until the orchestrator's read ends, and its `setupChecks`."""
         body = cdc_gate.test_connector(connector_id)
         if body.get("supported") is not True or body.get("ok") is not True:
-            raise cdc_gate.G4Failure(f"the connection test did not pass: {str(body)[:300]}")
-        print(f"[g4] Oracle CDC test: {body.get('message')!r}", flush=True)
+            raise cdc_gate.G4Failure(f"the connection test did not pass, so no setup check was read: {str(body)[:300]}")
+        if body.get("pending") is not True:
+            raise cdc_gate.G4Failure(f"a passed test should wait for its setup checks (pending): {str(body)[:300]}")
+        if UNENCRYPTED_LINE not in str(body.get("message")):
+            raise cdc_gate.G4Failure(f"the test result lacks the unencrypted-read line: {body.get('message')!r}")
+
+        def done():
+            polled = cdc_gate.API.get(f"{cdc_gate.API_URL}/api/connectors/{connector_id}/discovery/test", timeout=30)
+            if not polled.ok:
+                raise cdc_gate.G4Failure(f"GET .../discovery/test answered {polled.status_code} {polled.text[:200]}")
+            answer = polled.json()
+            return answer if answer.get("state") != "running" else None
+
+        answer = cdc_gate._wait_for("the orchestrator's setup read", done, 180, interval_s=3)
+        checks = answer.get("setupChecks")
+        if answer.get("state") != "done" or not isinstance(checks, list) or not checks:
+            raise cdc_gate.G4Failure(f"the setup read did not end with checks: {str(answer)[:300]}")
+        return checks
+
+    def setup_checks_step(self, connector_id: str) -> None:
+        """S11-e: the gate source's exact settings are `ok`; a second connector selecting the table
+        without all-column logging and a mistyped name has exactly those two `missing`."""
+        good = self._test_and_wait_for_checks(connector_id)
+        listed = sorted(c["setting"] for c in good)
+        expected = sorted(EXPECTED_SETTINGS)
+        if listed != expected:
+            raise cdc_gate.G4Failure(f"the setup checks list {listed}, expected {expected}")
+        not_ok = [c for c in good if c["status"] != "ok"]
+        if not_ok:
+            raise cdc_gate.G4Failure(f"the gate source should pass every setup check: {cdc_gate._describe(good)}")
+        spec = {
+            "adapter": "cdc", "ingestMode": "cdc", "dial": self.dial(),
+            "sourceObjects": [
+                {"name": f"{SCHEMA}.ORDERS_PLAIN", "target": "g4_orders_plain", "loadMode": "incremental_dedup", "primaryKey": ["id"]},
+                {"name": f"{SCHEMA}.NO_SUCH_TABLE", "target": "g4_no_such_table", "loadMode": "incremental_dedup", "primaryKey": ["id"]},
+            ],
+        }
+        other = cdc_gate.register_connector("-missing", spec, self.password)
+        try:
+            checks = self._test_and_wait_for_checks(other)
+            missing = {c["setting"]: c for c in checks if c["status"] == "missing"}
+            plain = f"All-column logging on {SCHEMA}.ORDERS_PLAIN"
+            typo = f"All-column logging on {SCHEMA}.NO_SUCH_TABLE"
+            if set(missing) != {plain, typo}:
+                raise cdc_gate.G4Failure(f"expected exactly {plain!r} and {typo!r} to be missing, got {cdc_gate._describe(checks)}")
+            command = missing[plain].get("command") or ""
+            if command != f'ALTER TABLE "{SCHEMA}"."ORDERS_PLAIN" ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;':
+                raise cdc_gate.G4Failure(f"the command for the plain table is {command!r}")
+            if missing[typo].get("command") or "No table with this name was found" not in str(missing[typo].get("message")):
+                raise cdc_gate.G4Failure(f"the mistyped table should read 'not found' with no command: {missing[typo]}")
+            others = [c for c in checks if c["setting"] not in missing and c["status"] != "ok"]
+            if others:
+                raise cdc_gate.G4Failure(f"the other checks should be ok: {cdc_gate._describe(checks)}")
+        finally:
+            deleted = cdc_gate.API.delete(f"{cdc_gate.API_URL}/api/connectors/{other}", timeout=120)
+            if not deleted.ok:
+                print(f"[g4] cleanup: DELETE of the setup-check connector answered {deleted.status_code}", flush=True)
+        cdc_gate.say("setup checks", "pass", f"gate source: {cdc_gate._describe(good)}; other connector: {plain!r} and {typo!r} missing alone")
 
     # ── Wrong password and the encryption banner ────────────────────────────
 
