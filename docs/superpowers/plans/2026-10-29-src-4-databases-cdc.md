@@ -2447,3 +2447,17 @@ Open at slice close, for the planner:
 - the owner's confirmation of the MySQL 7-day binlog minimum.
 
 No open `BLOCKER`.
+
+## Slice 6, review round 2 (planner, 2026-10-31): closed
+
+Verified myself:
+- CI run 41247888991 on ee3c6e38: `success`, 38 of 38 jobs.
+- `cdc_oracle.rs`: the test pins the new ending "(ask the database
+  administrator if it does not)." and checks that "Disable" and "TLS mode"
+  are absent (SHOULD-FIX 1).
+- `_online_catalog_probe` is gone from `g4_oracle_test.py` (SHOULD-FIX 2).
+
+Both SHOULD-FIX are fixed. No open `BLOCKER`. Slice 6 is closed on code
+ee3c6e38. `SRC-37` (Oracle over TCPS with certificate checking) is now on the
+backlog. Still open with the owner: the MySQL 7-day binlog minimum, and AC7
+QA with a real webhook.
