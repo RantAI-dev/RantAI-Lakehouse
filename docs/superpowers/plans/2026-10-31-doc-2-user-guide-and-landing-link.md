@@ -34,4 +34,37 @@ a decision below. If the code disagrees with the plan, stop and report it.
 
 ## 4. Handoff (developer appends below)
 
+### Handoff (developer, 2026-10-31)
+
+**Commits**
+
+- `6ef93d3b` — `feat(landing): link the user guide from the footer (DOC-2 T1)`. Touches
+  `src/features/landing/landing-copy.ts` only: `LINKS.guide` added (DOC-2 comment at the
+  site) and `{ label: "User guide", href: LINKS.guide }` added to `FOOTER.connect` before
+  the GitHub entry. No test file changed: nothing under `src/` asserts the footer links
+  (grepped `FOOTER`, `LINKS`, `landing-copy`, `LandingFooter`, `footer` across `*.test.ts*`),
+  and `src/features/landing` holds only `scramble.test.ts` and `scroll-timeline.test.ts`.
+
+**Checks run (foreground, on `6ef93d3b`)**
+
+- `bun run typecheck` — exit 0, no output.
+- `bun run lint` — exit 0: 0 errors, 11 warnings, all pre-existing and in unrelated files
+  (`src/components/ui/sidebar.tsx`, `src/features/alerts/alerts-page.tsx`,
+  `src/features/auth/login-page.tsx`, `src/features/catalog/open-format-card.test.tsx`,
+  `src/features/copilot/use-copilot.ts`, `src/hooks/use-data-table.ts`,
+  `src/lib/dashboard-specs.ts`, `src/lib/uploads.test.ts`, `src/services/http.ts`). Nothing
+  in `src/features/landing/`.
+- `bun test src/features/landing` — 19 pass, 0 fail, 2 files.
+
+**Not verified**
+
+- The rest of the verification block in `AGENTS.md` was not run: this change touches no
+  Rust, Python, Dagster or compose file, and `AGENTS.md` ("Keep build time down") scopes
+  each commit to the languages it touched.
+- The worktree had no `node_modules`, so `bun install --frozen-lockfile` (739 packages) ran
+  once before the checks. No lockfile change: `git status` was clean apart from
+  `landing-copy.ts`.
+- The link was not opened in a browser; the footer renders `http` links with
+  `target="_blank"` (`landing-footer.tsx`), unchanged by this task.
+
 ## 5. Review (planner appends below)
