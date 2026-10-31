@@ -6,14 +6,14 @@
 | Backlog | `DATA-5` |
 | Kind | Task |
 | Spec | `docs/core/specs/data-5.md` (every target signed by the product owner, 2026-10-31) |
-| Status | Planned |
+| Status | In Acceptance (merged; the acceptance checklist is not run yet) |
 | Priority | P3 |
 | Owner | In the base. |
 | Acceptor | In the base. |
 | Plan | `docs/superpowers/plans/2026-10-31-data-5-outside-readers.md` |
 | Started | 2026-10-31 |
-| Shipped | |
-| Evidence | |
+| Shipped | 2026-10-31 |
+| Evidence | #292 (the API side), #293 (the console) |
 
 ## Problem
 
