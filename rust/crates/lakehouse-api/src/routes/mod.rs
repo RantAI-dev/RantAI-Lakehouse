@@ -1127,6 +1127,7 @@ fn agents_router() -> Router<AppState> {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/health/ready", get(ready))
         .route("/api/catalog", get(catalog::list))
         // Registered before `/{id}`: axum prefers static segments over
         // params, but keeping them adjacent in this order makes it obvious
@@ -1500,6 +1501,9 @@ pub fn router(state: AppState) -> Router {
 /// down while most of it answers. The body carries the database's state
 /// instead, so "up but degraded" is visible rather than a green check over
 /// a schema the code cannot use.
+///
+/// `version` is this build's version (REL-2 decision D7): a console
+/// compares it with its own version to say whether the two match.
 async fn health(State(state): State<AppState>) -> ApiJson<HealthBody> {
     ApiJson(HealthBody {
         status: "ok",
@@ -1508,6 +1512,7 @@ async fn health(State(state): State<AppState>) -> ApiJson<HealthBody> {
         } else {
             "unavailable"
         },
+        version: crate::readiness::VERSION,
     })
 }
 
@@ -1520,6 +1525,29 @@ async fn health(State(state): State<AppState>) -> ApiJson<HealthBody> {
 struct HealthBody {
     status: &'static str,
     database: &'static str,
+    version: &'static str,
+}
+
+/// `GET /health/ready` — the readiness probe (REL-2 decision D7).
+///
+/// `200` when `Postgres` is at this build's schema version, `ClickHouse`
+/// answers `SELECT 1` and the Iceberg REST catalog answers its config
+/// request; `503` otherwise, with the SAME body shape so a caller learns
+/// which dependency is not ready. Each check is only `"ok"` or
+/// `"failed"` — no upstream text ever reaches this public route (AGENTS.md
+/// rule 4).
+///
+/// This is a different question from [`health`], which stays a liveness
+/// probe: an installer or an updater waits on THIS route, and the ops
+/// gates keep polling `/health`.
+async fn ready(State(state): State<AppState>) -> Response {
+    let body = crate::readiness::ReadyBody::new(crate::readiness::probe(&state).await);
+    let status = if body.ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (status, ApiJson(body)).into_response()
 }
 
 /// The JSON body shape a request-timeout response takes — same

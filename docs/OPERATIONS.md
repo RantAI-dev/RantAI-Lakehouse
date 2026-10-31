@@ -991,14 +991,18 @@ turn each one on.
 ## Healthcheck: what `GET /health` actually checks
 
 `GET /health` answers `200` with a JSON body — `{"status": "ok",
-"database": "ok" | "unavailable"}` — and it is still a **liveness plus
-application-database check**, not a full readiness probe
+"database": "ok" | "unavailable", "version": "0.1.0"}` — and it is still a
+**liveness plus application-database check**, not a full readiness probe
 (`rust/crates/lakehouse-api/src/routes/mod.rs`, `async fn health`). It
 does not dial ClickHouse, Dagster, Lakekeeper or the LLM: the status code
 stays `200` whenever the process can answer at all, because a deployment
 with no usable Postgres still serves every Phase 1 route (catalog,
 overview, query, storage), and the ops gates (`ops/g*/`) and
 `ops/ai_eval` poll this endpoint for a `200` to decide the API is up.
+
+`version` is this build's version (`CARGO_PKG_VERSION`), added with the
+readiness route below (REL-2 decision D7): the console compares it with
+its own version and says so when the two differ.
 
 `database` is what `OPS-4` added:
 
@@ -1017,10 +1021,38 @@ the gates, so a probe that waits out a dead database's 30 s acquire
 timeout would stall them. An operator diagnosing "the database died" has
 to read the log (below), not only this endpoint.
 
-**There is no `GET /health/ready`.** This section used to propose adding
-one; `OPS-4` instead extended the one health route with the
-application-database state, which is the dependency that actually
-changes what the console can do.
+## Readiness: `GET /health/ready`
+
+`GET /health/ready` answers the other question — "can this stack serve
+traffic?" — and it is the route an installer or an updater waits on (REL-2
+decision D7). It answers `200` with
+
+```json
+{"ready": true, "version": "0.1.0",
+ "checks": {"postgres": "ok", "clickhouse": "ok", "lakekeeper": "ok"}}
+```
+
+when all three hold, and `503` with **the same body shape** otherwise, so
+a caller still learns which dependency is not ready:
+
+- `postgres` — the database answers AND its schema is at this build's
+  version: the highest applied migration equals the highest migration
+  embedded in the binary. A database one migration behind (or ahead) is
+  not ready for this build.
+- `clickhouse` — `ClickHouse` answers `SELECT 1`.
+- `lakekeeper` — the Iceberg REST catalog answers its config request
+  (`GET {catalog}/v1/config`), the same call the catalog client makes
+  when it connects.
+
+Every check is only `"ok"` or `"failed"`. The reason a check failed is in
+the log, never in the body: the route is public, so it must not carry
+upstream text (AGENTS.md rule 4). Each check is bounded by 3 s, so the
+answer does not wait on a dead dependency.
+
+This section used to say there was no such route; `OPS-4` had extended
+the one health route with the application-database state instead. REL-2
+decision D7 adds the readiness probe next to it, and leaves `/health` as
+the liveness probe the gates poll.
 
 ## Bootstrap admin: there is no default credential
 
