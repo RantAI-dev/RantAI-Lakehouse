@@ -131,6 +131,16 @@ services:
       - "${CH_NATIVE_HOST_PORT:-9000}:9000"
     volumes:
       - lakehouse_clickhouse_data:/var/lib/clickhouse
+      # REL-2 S1-T4 (D8): the local backup disk. `BACKUP DATABASE ... TO
+      # Disk('backups', ...)` writes here; `ops/backups/backup-local.sh`
+      # copies the files out to the host, and the restore copies them back
+      # in. A named volume (not a path in the data volume) so the backup
+      # files can be moved without the server's own data, and so the
+      # restore can put them back with one mount.
+      - lakehouse_clickhouse_backups:/var/lib/clickhouse/backups
+      # The disk's definition — ClickHouse reads every file in
+      # `config.d/`. Read-only: the server only ever reads it.
+      - ./ops/backups/clickhouse/backups.xml:/etc/clickhouse-server/config.d/rel2-backups.xml:ro
     healthcheck:
       test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1"]
       interval: 5s
@@ -4081,6 +4091,11 @@ volumes:
   # will have no credential until one is saved again.
   lakehouse_connector_secrets:
   lakehouse_clickhouse_data:
+  # REL-2 S1-T4 (D8): the local backup disk `ClickHouse` writes its
+  # `BACKUP DATABASE ... TO Disk('backups', ...)` output into. It holds
+  # BACKUP files, not the server's data — the server's data stays in
+  # `lakehouse_clickhouse_data`.
+  lakehouse_clickhouse_backups:
   lakehouse_rustfs_data:
   lakehouse_seaweedfs_data:
   lakehouse_seaweedfs_iam:

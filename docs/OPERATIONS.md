@@ -1573,6 +1573,78 @@ state was **82 seconds** (94 seconds total to full API readiness). See
 [docs/plans/OPS-7-RESULT.md](plans/OPS-7-RESULT.md) for the complete drill
 report and component timing table.
 
+## Local-disk backup (REL-2 S1-T4)
+
+The bucket job above needs an S3-compatible bucket. An air-gapped host has
+none, so there is a second target: the local disk. One command, no bucket,
+no network.
+
+### What one backup is
+
+A directory `backups/<UTC timestamp>-<version>/` (the version is the
+API's own, read from `GET /health`):
+
+| Part | What it is |
+| --- | --- |
+| `postgres.dump` | `pg_dumpall` of the whole Postgres instance: the application database, Lakekeeper's, OpenFGA's, Dagster's, and the roles. |
+| `clickhouse/<timestamp>/<db>/` | `ClickHouse`'s own `BACKUP DATABASE ... TO Disk('backups', ...)` output, per database. The disk is configured in `ops/backups/clickhouse/backups.xml` and mounted into the `clickhouse` service. |
+| `connector-secrets.tar.gz` | The `lakehouse_connector_secrets` volume — every stored connector credential, **sealed**. Without it, a restored deployment has no working connector credential. |
+| `env` | A copy of the deployment's `.env` — the generated secrets, including the key those credentials are sealed with. |
+| `manifest.json` | Each part's size and SHA-256. |
+
+The restore checks those checksums **before** it restores anything: a
+backup that was cut short is refused, not restored as if it were whole.
+
+**What it does not carry yet:** `release.json` and `state.json` (the
+release manifest and the installed-version state) are part of the same
+backup set in the plan, but they do not exist yet — REL-2 S2 publishes the
+release manifest and S4 writes the state file. The backup script says so
+in its output rather than pretending.
+
+### Run
+
+```bash
+# One backup into ./backups/<timestamp>-<version>/
+ops/backups/backup-local.sh
+
+# Into another directory
+ops/backups/backup-local.sh /mnt/backups
+
+# A stack that is not named after its directory
+COMPOSE_PROJECT=my-stack ops/backups/backup-local.sh
+```
+
+It needs Docker, `docker compose`, `curl`, `jq` and `sha256sum` on the
+host — the PostgreSQL and ClickHouse clients are the ones in the running
+containers, so the host needs no database client of its own.
+
+### Restore
+
+```bash
+# The backup's checksums are checked first; nothing is written before they pass.
+scripts/restore-from-backup.sh --local backups/20261031T090000Z-0.1.0
+
+# Force it on top of volumes that are not empty
+scripts/restore-from-backup.sh --force --local backups/20261031T090000Z-0.1.0
+```
+
+The order is: the empty-volume safety check (the same one the bucket
+restore has), the manifest's checksums, Postgres, ClickHouse, the
+connector secrets, the `.env` (the previous one is kept beside it as
+`.env.before-restore-<timestamp>`), and the stack bring-up.
+
+**The connector credentials only decrypt with the `.env` they were sealed
+with.** A restore whose `.env` is not the one the backup carries leaves
+every connector unreadable — which is why the `.env` is part of the backup
+and why the restore puts it back.
+
+**Measured** (REL-2 S1-T4's own drill, on a clean `-p rel2` project):
+Postgres 8 s, ClickHouse 7 s, the connector secrets 1 s, the stack
+bring-up 16 s — **32 s** in total, and the restored connector's credential
+still decrypted: the API's own key-rotation command opened the restored
+sealed file with the restored key and reported `1 already under the
+current key, 0 failed`.
+
 ## Upgrade note: set `CATALOG_TENANT_ID` before deploying multi-tenant admin support
 
 Migration `0042_tenant_provisioning.sql` and its route-level tenant scoping
