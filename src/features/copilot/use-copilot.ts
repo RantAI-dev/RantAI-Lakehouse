@@ -25,6 +25,8 @@ export type Msg = {
   tools?: ToolStep[];
   buildRunId?: string;
   chartCreated?: boolean;
+  /** The steps the request still has, sent back after the draft is confirmed (`AI-15`). */
+  nextStep?: string;
   /** Wall time from send to answer, measured in this browser. */
   elapsedMs?: number;
   /** When the message was sent or the answer arrived (ISO). Older saved messages have none. */
@@ -76,10 +78,24 @@ type ChatResult = {
   toolTrace?: ToolStep[];
   buildRunId?: string;
   chartCreated?: boolean;
+  /** The steps the request still has, sent back after the draft is confirmed (`AI-15`). */
+  nextStep?: string;
 };
 
 /** How many recent sessions the header history menus list. */
 const RECENT_SESSIONS = 20;
+
+/**
+ * The text a continuation is sent as (`AI-15`): the steps the request still
+ * has, sent back to the model once the person confirmed the draft.
+ */
+export const CONTINUATION_PREFIX = "Confirmed. Continue: ";
+
+/**
+ * How many continuation messages may follow one message the person typed
+ * (`AI-15`). The cap keeps a request that never finishes from looping.
+ */
+export const MAX_CONTINUATIONS = 3;
 
 /**
  * The AI Copilot brain, SHARED (via context) by the global chat dock, the
@@ -106,6 +122,23 @@ function replaceToolStep(
   return copy;
 }
 
+/**
+ * Whether every step of the message at `index` is dealt with: none waits
+ * for a Confirm any more, and none failed or was cancelled (`AI-15`). A
+ * request whose step was refused stops there, so nothing follows it.
+ */
+function stepsSettled(messages: Msg[], index: number): boolean {
+  const steps = messages[index]?.tools ?? [];
+  if (steps.length === 0) return false;
+  return steps.every((step) => {
+    if (step.ok === false) return false;
+    const result = (step.result ?? {}) as { needs_confirmation?: unknown; cancelled?: unknown };
+    if (result.cancelled) return false;
+    if (result.needs_confirmation) return false;
+    return true;
+  });
+}
+
 function useCopilotState() {
   const [mode, setMode] = React.useState<Mode>("ask");
   const [messages, setMessages] = React.useState<Msg[]>([]);
@@ -114,6 +147,12 @@ function useCopilotState() {
   const messagesRef = React.useRef(messages);
   // R29: the results that already reloaded the open board, by message and step.
   const notifiedRef = React.useRef(new Set<string>());
+  /**
+   * How many continuation messages followed the last message the person
+   * typed (`AI-15`). A typed message starts a new chain; a continuation
+   * belongs to the chain it continues.
+   */
+  const continuationsRef = React.useRef(0);
   messagesRef.current = messages;
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
@@ -229,9 +268,12 @@ function useCopilotState() {
    * Sends `text` after `history` (default: the current conversation) and
    * streams Copilot's progress until the answer arrives.
    */
-  const send = React.useCallback(async (text: string, history?: Msg[]) => {
+  const send = React.useCallback(async (text: string, history?: Msg[], options?: { continuation?: boolean }) => {
     const q = text.trim();
     if (!q || busy) return;
+    // A typed message starts a new chain; a continuation belongs to the
+    // chain of the message the person typed (`AI-15`).
+    continuationsRef.current = options?.continuation ? continuationsRef.current + 1 : 0;
     setError(null);
     setAskNotice(null);
     const next: Msg[] = [
@@ -315,6 +357,7 @@ function useCopilotState() {
           tools,
           buildRunId: result.buildRunId,
           chartCreated,
+          ...(result.nextStep ? { nextStep: result.nextStep } : {}),
           elapsedMs: Date.now() - startedAt,
           at: new Date().toISOString(),
           ...(reasoning.trim()
@@ -423,12 +466,27 @@ function useCopilotState() {
       if (created || (toolOk && !json.result?.error && !json.error && takeNewBoardChanges(key, [{ tool: toolName, ok: true, result: json.result ?? json }], notifiedRef.current))) {
         notifyDashboardsChanged();
       }
+      // The request had steps left: the model wrote them down, and the
+      // console sends them back once the draft is confirmed (`AI-15`).
+      // The step is read from `updated`, which is built from the newest
+      // messages, so it is the message the person confirmed and not a
+      // render older than the one the click came from.
+      const nextStep = updated?.[messageIndex]?.nextStep;
+      if (
+        updated &&
+        nextStep &&
+        toolOk &&
+        stepsSettled(updated, messageIndex) &&
+        continuationsRef.current < MAX_CONTINUATIONS
+      ) {
+        void send(`${CONTINUATION_PREFIX}${nextStep}`, updated, { continuation: true });
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setConfirmingKey((k) => (k === key ? null : k));
     }
-  }, [messages, mode, sessionId, persist]);
+  }, [messages, mode, sessionId, persist, send]);
 
   const cancelTool = React.useCallback((messageIndex: number, stepIndex: number) => {
     const updated = replaceToolStep(messagesRef.current, messageIndex, stepIndex, (_msg, step) => ({
