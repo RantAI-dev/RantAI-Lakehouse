@@ -418,6 +418,19 @@ def _ingest_spec_body() -> dict:
     }
 
 
+# The `file:` credential name of the connector `_register_demo_cdc_connector` registered last, so a source's
+# own step can change the stored password afterwards (`set_last_credential`).
+LAST_CREDENTIAL_REF: str | None = None
+
+
+def set_last_credential(value: str) -> None:
+    """Overwrite the password file of the connector registered last (a wrong login for a test that must
+    fail without Kafka Connect ever accepting the connector with it)."""
+    if LAST_CREDENTIAL_REF is None:
+        raise G4Failure("internal error: no connector was registered yet")
+    _write_credential_file(LAST_CREDENTIAL_REF, value)
+
+
 def _register_demo_cdc_connector(tenant_id: str, *, suffix: str = "", spec: dict | None = None, password: str | None = None) -> str:
     """Register the source the way the console registers a change-capture connector: `POST
     /api/connectors` with a `file:` credential whose value is the source user's password, then
@@ -440,6 +453,8 @@ def _register_demo_cdc_connector(tenant_id: str, *, suffix: str = "", spec: dict
     derived = (body.get("credential") or {}).get("primary")
     if not derived:
         raise G4Failure("the create response carries no derived credential name")
+    global LAST_CREDENTIAL_REF
+    LAST_CREDENTIAL_REF = derived
     _write_credential_file(derived, password if password is not None else src().password)
     answer = API.put(
         f"{API_URL}/api/connectors/{connector_id}/ingest-spec", json=spec if spec is not None else _ingest_spec_body(), timeout=60

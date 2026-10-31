@@ -28,8 +28,8 @@ of every session of `C##DBZUSER` names the AES256 encryption adapter and the SHA
 # A wrong password
 
 The connection test goes through Kafka Connect's config validation (Amendment 10, S10-a). A second
-connector dials as a user that does not exist (`c##g4nosuch`), so a wrong login never locks the real
-user; its test must answer the fixed sentence for `ORA-01017`.
+connector is registered with the right password and its stored password is changed afterwards (Kafka Connect
+refuses to create a connector whose login fails); its test must answer the fixed sentence for `ORA-01017`.
 
 # Tables
 
@@ -49,7 +49,6 @@ PORT = 1521
 CDB = "FREE"
 PDB = "FREEPDB1"
 CDC_USER = "c##dbzuser"
-NO_SUCH_USER = "c##g4nosuch"
 SCHEMA = "G4SRC"
 # Debezium's documented LogMiner grants for a common user in a container database
 # (https://debezium.io/documentation/reference/stable/connectors/oracle.html#creating-users-for-the-connector).
@@ -64,8 +63,8 @@ OBJECT_GRANTS = (
     "SELECT ON V_$LOGMNR_PARAMETERS", "SELECT ON V_$LOGFILE", "SELECT ON V_$ARCHIVED_LOG",
     "SELECT ON V_$ARCHIVE_DEST_STATUS", "SELECT ON V_$TRANSACTION",
 )
-ENCRYPTION_ADAPTER = "AES256 Encryption service adapter"
-CHECKSUM_ADAPTER = "SHA256 Crypto-checksumming service adapter"
+ENCRYPTION_ADAPTER = "AES256 encryption service adapter"
+CHECKSUM_ADAPTER = "SHA256 crypto-checksumming service adapter"
 WRONG_LOGIN_SENTENCE = "Oracle connection failed: authentication failed"
 # The fixed line of `cdc_oracle::UNENCRYPTED_SETUP_READ` (Amendment 11, S11-c).
 UNENCRYPTED_LINE = (
@@ -320,15 +319,18 @@ class OracleSource(cdc_gate.Source):
         self._connection_is_encrypted()
 
     def _wrong_password_is_classified(self) -> None:
-        dial = {**self.dial(), "user": NO_SUCH_USER}
+        """Kafka Connect refuses to CREATE a connector whose login fails, so the connector is registered
+        with the right password and the stored one is changed afterwards: the next test dials with the
+        wrong one and must answer the fixed sentence for `ORA-01017`."""
         spec = {
-            "adapter": "cdc", "ingestMode": "cdc", "dial": dial,
+            "adapter": "cdc", "ingestMode": "cdc", "dial": self.dial(),
             "sourceObjects": [
                 {"name": f"{SCHEMA}.ORDERS", "target": "g4_orders_wrong", "loadMode": "incremental_dedup", "primaryKey": ["id"]}
             ],
         }
-        other = cdc_gate.register_connector("-wrong", spec, "not_the_password_1")
+        other = cdc_gate.register_connector("-wrong", spec, self.password)
         try:
+            cdc_gate.set_last_credential("not_the_password_1")
             resp = cdc_gate.API.post(f"{cdc_gate.API_URL}/api/connectors/{other}/test", timeout=60)
             if not resp.ok:
                 raise cdc_gate.G4Failure(f"POST .../test answered {resp.status_code} {resp.text[:200]}")
@@ -358,8 +360,10 @@ class OracleSource(cdc_gate.Source):
         if not banners:
             raise cdc_gate.G4Failure("no session of C##DBZUSER: the connector is not connected")
         for sid, lines in banners.items():
-            joined = "\n".join(lines)
-            if ENCRYPTION_ADAPTER not in joined or CHECKSUM_ADAPTER not in joined:
+            # Oracle words the banner "Oracle Advanced Security: AES256 encryption service adapter for Linux ..."
+            # (lower-case "encryption"): compare without case.
+            joined = "\n".join(lines).lower()
+            if ENCRYPTION_ADAPTER.lower() not in joined or CHECKSUM_ADAPTER.lower() not in joined:
                 raise cdc_gate.G4Failure(f"session {sid} of C##DBZUSER is not AES256-encrypted with a SHA256 checksum: {lines}")
         cdc_gate.say("encryption", "pass", f"{len(banners)} session(s) of C##DBZUSER, each with {ENCRYPTION_ADAPTER!r} and {CHECKSUM_ADAPTER!r}")
 
