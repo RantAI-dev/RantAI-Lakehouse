@@ -1205,6 +1205,9 @@ downloaded to `/tmp/opencode` by the earlier rounds of this slice; `actionlint` 
 The repository's own Python guards ran too: `python3 ops/lint/check_intra_package_imports.py` →
 OK, `python3 ops/lint/check_bare_iceberg_count.py` → no violation.
 
+The same two commands were run again, in the foreground, on the final commit of this section (this
+file and the fix only): **82 passed, 0 failed**, and `actionlint` clean, exit 0.
+
 **Not verified, with the reason:**
 
 - **The dry run is not verified.** It needs a GitHub runner, and the PR's own dry run is the
