@@ -407,3 +407,46 @@ cargo tests started were removed
 No container is left running.
 
 ## 6. Review (planner appends below)
+
+### Review S1 round 1 (planner, 2026-10-31, at `38d04fe4`)
+
+**What holds.**
+- A session principal is refused (D1).
+- The tool's key is never forwarded: the bearer is the `outside-readers` token (D3).
+- Lakekeeper's error bodies are replaced with fixed text (principle 4).
+- The read is recorded before the body is returned, and a failed record answers 503 (D6).
+- `s3.endpoint` is rewritten in both places (D4).
+- The prefix must equal Lakekeeper's own (D2).
+- The namespace grant is namespace-scoped, with no warehouse-wide fallback (D5).
+- **Two good deviations, accepted:**
+  - `strip_uri_override` removes Lakekeeper's `uri` override, so a client cannot leave the door.
+  - The migration drops the plan's `console.` prefix, because `console` is a ClickHouse
+    database, not a Postgres schema. The header says why.
+- No default credentials in compose. `OUTSIDE_S3_ENDPOINT` defaults to empty, which means off.
+
+**BLOCKER 1: the table name can walk out of the door.**
+- `table` and `credentials` take `{table}` from the path. axum decodes `%2F` to `/`, and the
+  value is then pasted into the forwarded URL with `format!`.
+  - Example: a request for `…/namespaces/gold/tables/..%2F..%2F..%2Fsilver%2Ftables%2Fx`
+    becomes `…/v1/{prefix}/namespaces/gold/tables/../../../silver/tables/x`.
+  - reqwest's URL parsing resolves the `..`, so the call goes to another Lakekeeper path.
+- The `gold`-only check in the API is bypassed. The namespace grant still refuses `select`
+  outside `gold`, but that is the second layer, not the first.
+- Any GET that answers 200 would also be counted as a "read" under a made-up table name.
+- **Fix:**
+  - Accept `{table}` only if it matches `^[A-Za-z0-9_-]{1,255}$`. No dot, no slash, no
+    percent; check what names the Gold export writes and make sure they pass. Anything else is
+    refused (the Iceberg 403, `refused()`) before any forwarding.
+  - Also build the forwarded path with each segment percent-encoded (the `url` crate's
+    `path_segments_mut().push(...)`), so a later change cannot reopen this.
+  - Test in `tests/iceberg_door.rs`: a `%2F..` table name is refused, `wiremock` receives no
+    call, and no read is recorded. Cite `DATA-5 S1 review BLOCKER 1` at the site.
+
+**SHOULD-FIX 1: the query is encoded twice.**
+- `query_for` splits the raw query without decoding it, then `reqwest::RequestBuilder::query`
+  encodes it again. So `pageToken=a%3D` reaches Lakekeeper as `a%253D`, and paging through a
+  long table list breaks.
+- **Fix:** parse with `url::form_urlencoded::parse` (decoded pairs), then let `query()` encode
+  once. Add a test that a `%`-encoded `pageToken` reaches `wiremock` unchanged.
+
+**Open: BLOCKER 1, SHOULD-FIX 1.**
