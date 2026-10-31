@@ -2082,3 +2082,267 @@ async fn the_grantee_search_lists_the_people_of_the_callers_organisation() {
         "he is not of her organisation: {found}"
     );
 }
+
+// ── The assistant's own reads and writes ─────────────────────────────────
+//
+// The assistant reaches the saved queries through three tools
+// (`routes/ai/registry.rs`): `save_query` writes one,
+// `list_saved_queries` reads the list, and `run_saved_query` runs one by
+// its id. They go through the same resolver as the console's own routes,
+// so a personal space is a wall for the assistant too — and the answer
+// the assistant gives about a query it may not see is the same answer it
+// gives about a query that does not exist.
+
+/// One assistant tool call over HTTP: `POST /api/ai/tool`.
+///
+/// The body is the console's own — `{"tool", "args", "mode"}` — and the
+/// answer is the tool's own result, not the envelope around it. A read
+/// tool needs `"mode": "ask"`; a write tool needs `"mode": "build"` and
+/// `"confirmed": true` in its arguments, which is the console's Confirm
+/// button and nothing else.
+async fn call_tool(app: &axum::Router, cookie: &str, tool: &str, args: Value, mode: &str) -> Value {
+    let (status, body) = call(
+        app,
+        "POST",
+        "/api/ai/tool",
+        cookie,
+        Some(json!({ "tool": tool, "args": args, "mode": mode })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{tool}: {body}");
+    body["result"].clone()
+}
+
+/// A saved query in the **shared space** of the group tenant: no folder,
+/// the tenant's own row.
+///
+/// Written here, the way a row that was shared before the assistant
+/// existed would be. The assistant's own save always lands in the
+/// caller's personal space, so the shared space needs a row of its own
+/// for the controls below.
+async fn write_a_query_in_the_shared_space(pool: &PgPool, owner: Uuid, title: &str) -> String {
+    let id: Uuid = sqlx::query_scalar(
+        "INSERT INTO saved_query (title, sql, owner, owner_id, tenant_id) \
+         VALUES ($1, 'SELECT 1', 'Rina Wijaya', $2, $3) \
+         RETURNING id",
+    )
+    .bind(title)
+    .bind(owner)
+    .bind(Uuid::parse_str(GROUP_TENANT).expect("the group tenant id"))
+    .fetch_one(pool)
+    .await
+    .expect("insert the query");
+    id.to_string()
+}
+
+/// The id of the personal space of one person.
+async fn personal_space_id(pool: &PgPool, owner: Uuid) -> String {
+    let id: Uuid =
+        sqlx::query_scalar("SELECT id FROM saved_query_folder WHERE is_personal AND owner_id = $1")
+            .bind(owner)
+            .fetch_one(pool)
+            .await
+            .expect("the person has a personal space");
+    id.to_string()
+}
+
+/// The assistant's list does not name another person's personal query.
+///
+/// The two people act for the same organisation and the same tenant, so
+/// what hides one person's query from the other is the personal space
+/// and nothing else. CONTROL: the same author's query in the shared
+/// space IS in the list, so the test cannot pass by an empty list.
+#[tokio::test]
+async fn the_assistants_list_does_not_name_another_persons_personal_query() {
+    let TestApp { router, pool } = spin_up().await;
+    let rina = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+    let reza = session_cookie_for_seeded_user(&pool, "reza@meridian.example").await;
+    let rina_id = user_id(&pool, "rina@meridian.example").await;
+
+    // She saves a query with the assistant: it lands in her own personal
+    // space.
+    let saved = call_tool(
+        &router,
+        &rina,
+        "save_query",
+        json!({
+            "title": "Rina's own",
+            "sql": "SELECT 1",
+            "owner": "Rina Wijaya",
+            "confirmed": true,
+        }),
+        "build",
+    )
+    .await;
+    assert_eq!(saved["ok"], true, "{saved}");
+    let private_id = saved["query"]["id"]
+        .as_str()
+        .expect("the saved query has an id")
+        .to_owned();
+
+    // CONTROL: the same author's query in the shared space, of the same
+    // tenant. Only the space differs.
+    let shared_id = write_a_query_in_the_shared_space(&pool, rina_id, "Everybody's").await;
+
+    let listed = call_tool(&router, &reza, "list_saved_queries", json!({}), "ask").await;
+    let listed = listed["queries"]
+        .as_array()
+        .expect("the list is an array")
+        .clone();
+    assert!(
+        !listed.iter().any(|query| query["id"] == private_id),
+        "another person's personal query is not in the list: {listed:?}"
+    );
+    assert!(
+        listed.iter().any(|query| query["id"] == shared_id),
+        "CONTROL: the shared space is in the list: {listed:?}"
+    );
+}
+
+/// The assistant answers another person's personal query exactly as it
+/// answers an id that does not exist.
+///
+/// The answer is the chat's own "not found" sentence: a refusal that
+/// named the query would tell the caller it exists.
+#[tokio::test]
+async fn the_assistant_answers_another_persons_personal_query_as_an_unknown_id() {
+    let TestApp { router, pool } = spin_up().await;
+    let rina = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+    let reza = session_cookie_for_seeded_user(&pool, "reza@meridian.example").await;
+
+    let saved = call_tool(
+        &router,
+        &rina,
+        "save_query",
+        json!({
+            "title": "Rina's own",
+            "sql": "SELECT 1",
+            "owner": "Rina Wijaya",
+            "confirmed": true,
+        }),
+        "build",
+    )
+    .await;
+    assert_eq!(saved["ok"], true, "{saved}");
+    let private_id = saved["query"]["id"]
+        .as_str()
+        .expect("the saved query has an id")
+        .to_owned();
+
+    let theirs = call_tool(
+        &router,
+        &reza,
+        "run_saved_query",
+        json!({ "id": private_id }),
+        "ask",
+    )
+    .await;
+    let unknown = call_tool(
+        &router,
+        &reza,
+        "run_saved_query",
+        json!({ "id": Uuid::new_v4().to_string() }),
+        "ask",
+    )
+    .await;
+    assert_eq!(
+        theirs,
+        json!({ "error": "saved query tidak ditemukan" }),
+        "another person's personal query is not found"
+    );
+    assert_eq!(
+        theirs, unknown,
+        "the answer is the same as for an id that does not exist"
+    );
+
+    // CONTROL: a query of the shared space IS found, so the "not found"
+    // above is about the personal space and not about a tool that finds
+    // nothing at all.
+    let rina_id = user_id(&pool, "rina@meridian.example").await;
+    let shared_id = write_a_query_in_the_shared_space(&pool, rina_id, "Everybody's").await;
+    let shared = call_tool(
+        &router,
+        &reza,
+        "run_saved_query",
+        json!({ "id": shared_id }),
+        "ask",
+    )
+    .await;
+    assert_ne!(
+        shared, theirs,
+        "a query of the shared space is found, not reported as missing: {shared}"
+    );
+}
+
+/// The assistant's save puts the query in the caller's own personal space.
+///
+/// CONTROL: the same call by the other person lands in that person's own
+/// personal space, not in the first one's.
+#[tokio::test]
+async fn the_assistants_save_puts_the_query_in_the_callers_own_personal_space() {
+    let TestApp { router, pool } = spin_up().await;
+    let rina = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+    let reza = session_cookie_for_seeded_user(&pool, "reza@meridian.example").await;
+    let rina_id = user_id(&pool, "rina@meridian.example").await;
+    let reza_id = user_id(&pool, "reza@meridian.example").await;
+
+    let saved = call_tool(
+        &router,
+        &rina,
+        "save_query",
+        json!({
+            "title": "Rina's own",
+            "sql": "SELECT 1",
+            "owner": "Rina Wijaya",
+            "confirmed": true,
+        }),
+        "build",
+    )
+    .await;
+    assert_eq!(saved["ok"], true, "{saved}");
+    let id = saved["query"]["id"]
+        .as_str()
+        .expect("the saved query has an id")
+        .to_owned();
+    let folder_id = saved["query"]["folderId"]
+        .as_str()
+        .expect("the query sits in a folder")
+        .to_owned();
+    assert_eq!(
+        folder_id,
+        personal_space_id(&pool, rina_id).await,
+        "the query sits in her own personal space"
+    );
+    let owner: Option<Uuid> = sqlx::query_scalar("SELECT owner_id FROM saved_query WHERE id = $1")
+        .bind(Uuid::parse_str(&id).expect("the query id"))
+        .fetch_one(&pool)
+        .await
+        .expect("the query row");
+    assert_eq!(owner, Some(rina_id), "she is the author of the query");
+
+    // CONTROL: the same call by the other person lands in that person's
+    // own personal space.
+    let saved = call_tool(
+        &router,
+        &reza,
+        "save_query",
+        json!({
+            "title": "Reza's own",
+            "sql": "SELECT 2",
+            "owner": "Reza Hakim",
+            "confirmed": true,
+        }),
+        "build",
+    )
+    .await;
+    assert_eq!(saved["ok"], true, "{saved}");
+    let folder_id = saved["query"]["folderId"]
+        .as_str()
+        .expect("the query sits in a folder")
+        .to_owned();
+    assert_eq!(
+        folder_id,
+        personal_space_id(&pool, reza_id).await,
+        "the query sits in his own personal space"
+    );
+}

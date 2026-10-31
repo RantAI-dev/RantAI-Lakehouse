@@ -146,8 +146,8 @@ pub(super) async fn run_saved_query(
                        triggered by a schedule, which has no user to run it as",
         });
     };
-    // `SEC-20`: the lookup is the caller's tenant's list, so a saved
-    // query of another tenant is not found at all — the chat's own
+    // `SEC-20`: the lookup is one of the caller's tenant's own rows, so a
+    // saved query of another tenant is not found at all — the chat's own
     // "not found" answer, not a refusal that would confirm it exists.
     let scope = match crate::routes::query::saved_query_scope(
         state,
@@ -162,8 +162,8 @@ pub(super) async fn run_saved_query(
             queries::SavedQueryScope::None
         }
     };
-    let saved = match queries::list_saved(pool, scope).await {
-        Ok(all) => all.into_iter().find(|q| q.id == id),
+    let saved = match queries::get_saved(pool, &id, &scope).await {
+        Ok(found) => found,
         Err(err) => return upstream_error::store(&upstream_error::STORE, &err).to_json(),
     };
     let Some(saved) = saved else {

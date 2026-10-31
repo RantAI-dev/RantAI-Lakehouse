@@ -1629,3 +1629,150 @@ pub async fn search_grantees(
         roles: found.roles.iter().map(GranteeRoleWire::of).collect(),
     }))
 }
+
+// ── The catalog's "used by" ──────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    //! The catalog's "used by" list is a reader of the saved queries like
+    //! any other, so the personal space has to be a wall for it too: a
+    //! personal query of one person is never in the answer about another.
+    //!
+    //! The test lives HERE, and not in `routes/catalog_governance.rs`,
+    //! because that file is held by an open pull request and this step
+    //! does not touch it. `dependents` is `pub(crate)`, so a unit test in
+    //! this crate can call it directly — and the catalog's own detail
+    //! route needs `ClickHouse`, which this test does not.
+
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::collections::HashMap;
+
+    use lakehouse_auth::{PermissionSet, Principal, PrincipalId};
+    use lakehouse_store::PgPool;
+    use lakehouse_store::queries::{
+        SavedQueryPlacement, SavedQueryViewer, create_saved_query, create_saved_query_at,
+    };
+    use uuid::Uuid;
+
+    use crate::config::Config;
+    use crate::state::AppState;
+
+    // Force-links `lakehouse-test-support` so its `#[ctor]` Postgres
+    // testcontainer bootstrap runs for this `--lib` test binary, the same
+    // reason `routes/ai/tools/queries`'s test module does it.
+    use lakehouse_test_support as _;
+
+    /// The table the two queries of the fixture read.
+    const TABLE: &str = "silver.orders";
+
+    /// A `DATABASE_URL` string dialing the SAME per-test Postgres database
+    /// `#[sqlx::test]` handed us: `AppState::new` takes
+    /// `Config::database_url`, not a pre-built pool.
+    fn database_url_for(pool: &PgPool) -> String {
+        let options = pool.connect_options();
+        format!(
+            "postgres://{}:postgres@{}:{}/{}",
+            options.get_username(),
+            options.get_host(),
+            options.get_port(),
+            options
+                .get_database()
+                .expect("#[sqlx::test] always targets a named database"),
+        )
+    }
+
+    /// The author of the two queries: the seeded Analyst of Meridian
+    /// Group.
+    fn rina() -> Uuid {
+        Uuid::parse_str("33333333-3333-4333-8333-000000000001").expect("the seeded user id")
+    }
+
+    /// The other person of the same organisation: the seeded Data
+    /// Scientist, who acts for the same tenant.
+    fn reza() -> Uuid {
+        Uuid::parse_str("33333333-3333-4333-8333-000000000008").expect("the seeded user id")
+    }
+
+    /// Meridian Group, the tenant both of them act for.
+    fn group_tenant() -> Uuid {
+        Uuid::parse_str("11111111-1111-4111-8111-000000000001").expect("the group tenant id")
+    }
+
+    /// One query in the author's personal space and one in the shared
+    /// space, both reading the same table: the pair every control needs.
+    async fn two_queries_reading_one_table(pool: &PgPool) -> (String, String) {
+        let viewer = SavedQueryViewer {
+            id: Some(rina()),
+            role_names: Vec::new(),
+            tenant_id: Some(group_tenant()),
+            all: false,
+        };
+        let personal = create_saved_query(
+            pool,
+            &viewer,
+            "Rina's own",
+            "SELECT * FROM silver.orders",
+            "Rina Wijaya",
+            &[],
+            None,
+        )
+        .await
+        .expect("the personal query is written");
+        let shared = create_saved_query_at(
+            pool,
+            &viewer,
+            "Everybody's",
+            "SELECT * FROM silver.orders",
+            "Rina Wijaya",
+            &[],
+            SavedQueryPlacement::SharedSpace,
+        )
+        .await
+        .expect("the shared query is written");
+        (personal.id, shared.id)
+    }
+
+    /// The catalog's "used by" list does not name another person's
+    /// personal query.
+    ///
+    /// CONTROL: the shared space IS in the answer, so the test cannot pass
+    /// by an empty list.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_catalogs_used_by_does_not_name_another_persons_personal_query(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let (personal_id, shared_id) = two_queries_reading_one_table(&pool).await;
+
+        let mut env = HashMap::new();
+        env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
+        // The catalog's dashboards are not read here: the principal holds
+        // no `dashboard:read`, so the answer is the saved queries only.
+        env.insert("CH_URL".to_owned(), "http://127.0.0.1:1".to_owned());
+        let state = AppState::new(Config::from_map(&env).expect("a valid test Config"));
+
+        let principal = Principal {
+            id: PrincipalId::User(reza()),
+            tenant_ids: vec![group_tenant()],
+            display_name: "Reza Hakim".to_owned(),
+            permissions: PermissionSet::parse("query:read"),
+            provider: "session".to_owned(),
+            must_change_password: false,
+            role_names: Vec::new(),
+        };
+
+        let listed =
+            crate::routes::catalog_governance::dependents(&state, &principal, &[TABLE.to_owned()])
+                .await;
+
+        assert!(
+            !listed.iter().any(|entry| entry["id"] == personal_id),
+            "another person's personal query is not a dependent: {listed:?}"
+        );
+        assert!(
+            listed.iter().any(|entry| entry["id"] == shared_id),
+            "CONTROL: the shared space is a dependent: {listed:?}"
+        );
+        Ok(())
+    }
+}
