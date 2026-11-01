@@ -181,8 +181,12 @@ also says that a phase whose file is under the threshold (a Parquet file of
 
 **Docker.** The store's `sqlx::test` runs use the shared Postgres testcontainer
 of `lakehouse-test-support` (`org.rantai.lakehouse-test-support=
-postgres-16-shm1g`, started with `ReuseDirective::Always`); it is meant to
-outlive the test binary and was left running. No container was started by this
-work that was not already the shared one.
+postgres-16-shm1g`, started with `ReuseDirective::Always`). This work started
+that container (there was none running when the session began) and removed it
+again at the end, so nothing of this work is left running; the next test run
+starts its own. The ClickHouse containers still up on this host are not this
+work's: nothing in this repository's test suite starts one (the API's tests
+point at a dead ClickHouse on port 1), and one of them, `data40-ch`, publishes
+the API's default port 18123.
 
 ## 6. Review (planner appends below)
