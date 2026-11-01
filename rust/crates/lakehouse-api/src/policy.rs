@@ -145,7 +145,7 @@ pub enum Policy {
 /// this table never needs to know about path-parameter values.
 #[rustfmt::skip]
 pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
-    // ── Public: the ONLY thirteen routes in the whole service. (Was "six" —
+    // ── Public: the ONLY fourteen routes in the whole service. (Was "six" —
     // corrected when the seventh was added, since Task A5's
     // `/api/auth/oidc/callback` had already made the old count stale; the
     // eighth is `POST /api/embed/frame`, SEC-12; the ninth is
@@ -153,8 +153,15 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // `POST /api/embed/values` (BI-26) and
     // `POST /api/public/dashboard/{token}/unlock` (BI-19 part A); the twelfth
     // and the thirteenth are the public link's and the embed's map boundary
-    // route, `PR #246 review BLOCKER 1`.) ──────────────────────────────────
+    // route, `PR #246 review BLOCKER 1`; the fourteenth is the readiness
+    // probe, REL-2 decision D7.) ───────────────────────────────────────────
     ("GET",  "/health",                          Policy::Public),
+    // REL-2 (D7): the readiness probe an installer or an updater waits on.
+    // Public because it answers only whether this stack is ready — three
+    // words ("ok"/"failed") and this build's version — and grants nothing.
+    // It never carries upstream text (AGENTS.md rule 4), so there is
+    // nothing in it to authenticate.
+    ("GET",  "/health/ready",                    Policy::Public),
     ("POST", "/api/embed/data",                   Policy::Public),
     // BI-1 (D3): the PDF's print view has no session; its data route is
     // authenticated by the signed render token in the body, and reads as the
@@ -1007,16 +1014,82 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("GET",  "/api/agents/runs/{id}",                Policy::RequiresAuth),
     ("GET",  "/api/agents/approvals",                Policy::RequiresPermission("agent:approve")),
     ("POST", "/api/agents/approvals/{id}/decide",    Policy::RequiresPermission("agent:approve")),
+
+    // ── The door for outside readers (DATA-5, ADR 0016) ──────────────────
+    // The API serves the read side of the Iceberg REST catalog under
+    // `/api/iceberg/v1`, for a service identity holding `iceberg:read`
+    // (D1). The scope is a plain `resource:action` token, parsed exactly
+    // like a role's permissions (`lakehouse_auth::service_token`), so no
+    // new permission mechanism was needed.
+    //
+    // The exact `(method, path)` entries below name the method each
+    // route SERVES (the plan's route table, D2). The `*` entries beside
+    // them classify the SAME path for every other method, which is what
+    // lets a write be refused by the door itself — with the Iceberg error
+    // shape, 403 — instead of by this table's deny-by-default 500. The
+    // door answers a refused method in the Iceberg shape on purpose: a
+    // 405 is not a shape the Iceberg clients this door exists for read.
+    //
+    // `*` is the ONLY wildcard in this table, and it names only the door's
+    // own paths. Every other route must name its method exactly, because
+    // an unclassified `(method, path)` pair is a hard 500
+    // (`route_policy_unclassified`) and that deny-by-default is the point
+    // of this file — see [`policy_for`].
+    ("GET",  "/api/iceberg/v1/config",                                            Policy::RequiresPermission("iceberg:read")),
+    ("GET",  "/api/iceberg/v1/{prefix}/namespaces",                               Policy::RequiresPermission("iceberg:read")),
+    ("GET",  "/api/iceberg/v1/{prefix}/namespaces/{namespace}",                    Policy::RequiresPermission("iceberg:read")),
+    ("HEAD", "/api/iceberg/v1/{prefix}/namespaces/{namespace}",                    Policy::RequiresPermission("iceberg:read")),
+    ("GET",  "/api/iceberg/v1/{prefix}/namespaces/{namespace}/tables",             Policy::RequiresPermission("iceberg:read")),
+    ("GET",  "/api/iceberg/v1/{prefix}/namespaces/{namespace}/tables/{table}",     Policy::RequiresPermission("iceberg:read")),
+    ("HEAD", "/api/iceberg/v1/{prefix}/namespaces/{namespace}/tables/{table}",     Policy::RequiresPermission("iceberg:read")),
+    ("GET",  "/api/iceberg/v1/{prefix}/namespaces/{namespace}/tables/{table}/credentials", Policy::RequiresPermission("iceberg:read")),
+    // The catch-all: every other method or path under `/api/iceberg` is
+    // refused by the door with the Iceberg error shape (D2), so a write
+    // never reaches Lakekeeper.
+    ("GET",  "/api/iceberg/{*rest}",                                              Policy::RequiresPermission("iceberg:read")),
+    ("*",    "/api/iceberg/v1/config",                                            Policy::RequiresPermission("iceberg:read")),
+    ("*",    "/api/iceberg/v1/{prefix}/namespaces",                               Policy::RequiresPermission("iceberg:read")),
+    ("*",    "/api/iceberg/v1/{prefix}/namespaces/{namespace}",                    Policy::RequiresPermission("iceberg:read")),
+    ("*",    "/api/iceberg/v1/{prefix}/namespaces/{namespace}/tables",             Policy::RequiresPermission("iceberg:read")),
+    ("*",    "/api/iceberg/v1/{prefix}/namespaces/{namespace}/tables/{table}",     Policy::RequiresPermission("iceberg:read")),
+    ("*",    "/api/iceberg/v1/{prefix}/namespaces/{namespace}/tables/{table}/credentials", Policy::RequiresPermission("iceberg:read")),
+    ("*",    "/api/iceberg/{*rest}",                                              Policy::RequiresPermission("iceberg:read")),
 ];
+
+/// The method column's wildcard: an entry that classifies a path for
+/// EVERY method.
+///
+/// DATA-5 (ADR 0016): the API's door for outside readers serves the read
+/// side of the Iceberg REST catalog and refuses every other method or
+/// path ITSELF, with the Iceberg error shape (403) — a write must never
+/// reach the catalog, and a 405 is not a shape an Iceberg client reads.
+/// The door's policy therefore does not depend on the method, and a
+/// `*` entry says so in one line instead of nine.
+///
+/// This is deliberately the only wildcard in [`POLICY_TABLE`], and it
+/// names only the door's own paths. Every other route must name its
+/// method exactly, because an unclassified `(method, path)` pair is a
+/// hard 500 (`route_policy_unclassified`) — that deny-by-default is the
+/// point of this file.
+pub const ANY_METHOD: &str = "*";
 
 /// Look up `(method, path)`'s policy. `None` means "not classified" — see
 /// the module doc comment for why [`auth_gate`] treats that as deny, not
 /// allow.
+///
+/// The exact `(method, path)` pair wins; a path that has an [`ANY_METHOD`]
+/// entry and no exact entry for this method falls back to it (see
+/// [`ANY_METHOD`] for why the door needs one).
 #[must_use]
 pub fn policy_for(method: &str, path: &str) -> Option<Policy> {
     POLICY_TABLE
         .iter()
         .find(|(m, p, _)| *m == method && *p == path)
+        .or_else(|| {
+            POLICY_TABLE
+                .iter()
+                .find(|(m, p, _)| *m == ANY_METHOD && *p == path)
+        })
         .map(|(_, _, policy)| *policy)
 }
 
@@ -1262,7 +1335,7 @@ mod tests {
     }
 
     #[test]
-    fn exactly_thirteen_public_entries_exist() {
+    fn exactly_fourteen_public_entries_exist() {
         // Pre-existing drift found while landing the `/api/auth/providers`
         // route: this assertion was still pinned at 4 even though the two
         // earlier OIDC public routes (`/api/auth/oidc/start`,
@@ -1285,7 +1358,9 @@ mod tests {
         // editable embed filter, authenticated by the signed token: 10 -> 11.
         // PR #246 review BLOCKER 1 added the public link's and the embed's
         // map boundary route, each authenticated by its own token: 11 -> 13.
-        assert_eq!(public_count, 13);
+        // REL-2 decision D7 added `GET /health/ready`, the readiness probe an
+        // installer or an updater waits on: 13 -> 14.
+        assert_eq!(public_count, 14);
     }
 
     /// SEC-23 (F1): adding a governance rule needs `governance:write`, the

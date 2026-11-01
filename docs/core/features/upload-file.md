@@ -191,6 +191,11 @@ rows and shows 20.
   and can be sent again; nothing waits. A load that has shown as running for
   more than 6 hours no longer counts (`SEC-17`, `UPLOAD_MAX_CONCURRENT_PER_USER`
   and `UPLOAD_MAX_CONCURRENT`; `docs/core/features/upload-limits-and-safe-csv.md`).
+- Each large load runs in its own process: about 2.2 GiB of memory per 2 GB file when several run
+  together, and about 4.9 GiB for a 2 GB Parquet file that is a single row group
+  (`docs/plans/DATA-17-RESULT.md`, `DATA-33`, `DATA-34`). The installation allows 16 loads at
+  once, so 16 large files at once can run out of memory on a 16 GB server. A separate limit for
+  large loads is `DATA-37`.
 - A load that sends no column list stores every column as text. The Upload
   file page guesses types and lets the person change them (`DATA-18`, #186,
   not merged; `upload-column-types.md`).

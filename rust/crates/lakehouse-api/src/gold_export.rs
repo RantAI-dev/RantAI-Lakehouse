@@ -743,6 +743,11 @@ pub(crate) async fn export_mart(
     let mut table = client
         .create_or_load_gold_table(mart_name, domain_fields)
         .await?;
+    // ADR 0016 point 3: the `outside-readers` principal must be able to
+    // `select` in the `gold` namespace — and only there. The namespace
+    // exists now (the export just created or loaded its table in it),
+    // so the grant can be made.
+    grant_outside_readers_select(state, &client).await;
 
     let arrow_schema = Arc::new(
         iceberg::arrow::schema_to_arrow_schema(table.schema())
@@ -816,6 +821,77 @@ pub(crate) async fn export_mart(
         snapshot_id: table.current_snapshot_id(),
         exported_at_ms: table.current_snapshot_timestamp_ms(),
     })
+}
+
+/// ADR 0016 point 3: grant the `outside-readers` principal the `select`
+/// relation on the `gold` namespace — and only there.
+///
+/// The door (`routes::iceberg_door`) forwards an outside tool's catalog
+/// call under this principal, so without the grant the catalog itself
+/// refuses the read, even though the API's own path guard allowed it.
+/// The grant is NAMESPACE-scoped, which is the point: the catalog refuses
+/// anything outside `gold` even if the API had a bug (ADR 0016 point 3).
+/// It is the first namespace-scoped grant in this stack; every other
+/// grant here is warehouse-scoped.
+///
+/// # Why this does NOT fail the export
+///
+/// The export's own work — publishing the mart — is done by the time this
+/// runs. Failing the export because a DIFFERENT feature's setup did not
+/// work would report a failure that did not happen (the mart IS
+/// published), and it would break Gold export on every deployment that
+/// has no admin token and never wants outside reading. So a failure here
+/// is logged with its reason, and the next export tries again: the grant
+/// is idempotent, so a repaired deployment heals on its next export.
+///
+/// The tool's own read then fails honestly at the catalog if the grant
+/// never landed, which is the truthful answer for a door that was not
+/// set up.
+async fn grant_outside_readers_select(state: &AppState, client: &IcebergClient) {
+    let Some(admin) = state.lakekeeper_admin.as_deref() else {
+        tracing::warn!(
+            "no Lakekeeper admin token on this deployment: the outside-readers principal \
+             cannot be granted the gold namespace, so outside reading stays off"
+        );
+        return;
+    };
+    let namespace = match gold::gold_namespace() {
+        Ok(namespace) => namespace,
+        Err(err) => {
+            tracing::warn!(%err, "the gold namespace's name could not be built");
+            return;
+        }
+    };
+    // The catalog's own namespace load answers with the namespace's UUID
+    // in its properties — the id the namespace assignments endpoint
+    // wants (the namespace's NAME is not an id there).
+    let namespace = match client.as_catalog().get_namespace(&namespace).await {
+        Ok(namespace) => namespace,
+        Err(err) => {
+            tracing::warn!(%err, "the gold namespace could not be read from the catalog");
+            return;
+        }
+    };
+    let Some(namespace_id) = namespace.properties().get("namespace_id") else {
+        tracing::warn!(
+            "the catalog's gold namespace carries no namespace_id: the outside-readers \
+             principal cannot be granted the namespace, so outside reading stays off"
+        );
+        return;
+    };
+    if let Err(err) = admin
+        .grant_namespace_select(
+            namespace_id,
+            crate::routes::iceberg_door::OUTSIDE_READERS_PRINCIPAL,
+        )
+        .await
+    {
+        tracing::warn!(
+            %err,
+            "the outside-readers principal could not be granted select on the gold namespace; \
+             outside reading stays off until a later export grants it"
+        );
+    }
 }
 
 /// The result of reading a Gold table back through `iceberg-rust`,

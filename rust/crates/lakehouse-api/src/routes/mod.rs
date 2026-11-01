@@ -50,6 +50,12 @@ mod governance;
 mod hierarchies;
 mod home;
 mod identity;
+// DATA-5 / ADR 0016: the door outside tools read published Gold tables
+// through. Its own router, because its routes answer in the Iceberg
+// error shape rather than the console's. `pub(crate)`, because
+// `crate::gold_export` names the principal it grants the `gold`
+// namespace to (ADR 0016 point 3).
+pub(crate) mod iceberg_door;
 mod knowledge;
 mod lakehouse;
 pub(crate) mod layers;
@@ -1131,6 +1137,7 @@ fn agents_router() -> Router<AppState> {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/health/ready", get(ready))
         .route("/api/catalog", get(catalog::list))
         // Registered before `/{id}`: axum prefers static segments over
         // params, but keeping them adjacent in this order makes it obvious
@@ -1175,6 +1182,11 @@ pub fn router(state: AppState) -> Router {
         )
         .merge(storage_router())
         .merge(lakehouse_router())
+        // DATA-5 / ADR 0016: the door for outside readers. Merged LAST
+        // among the domain routers because it owns a catch-all under
+        // `/api/iceberg`, and a catch-all is only unambiguous while no
+        // other router claims a path under that prefix.
+        .merge(iceberg_door::router())
         .route(
             "/api/alerts",
             get(alerts::list)
@@ -1535,6 +1547,9 @@ pub fn router(state: AppState) -> Router {
 /// down while most of it answers. The body carries the database's state
 /// instead, so "up but degraded" is visible rather than a green check over
 /// a schema the code cannot use.
+///
+/// `version` is this build's version (REL-2 decision D7): a console
+/// compares it with its own version to say whether the two match.
 async fn health(State(state): State<AppState>) -> ApiJson<HealthBody> {
     ApiJson(HealthBody {
         status: "ok",
@@ -1543,6 +1558,7 @@ async fn health(State(state): State<AppState>) -> ApiJson<HealthBody> {
         } else {
             "unavailable"
         },
+        version: crate::readiness::VERSION,
     })
 }
 
@@ -1555,6 +1571,34 @@ async fn health(State(state): State<AppState>) -> ApiJson<HealthBody> {
 struct HealthBody {
     status: &'static str,
     database: &'static str,
+    version: &'static str,
+}
+
+/// `GET /health/ready` — the readiness probe (REL-2 decision D7).
+///
+/// `200` when `Postgres` is at this build's schema version, `ClickHouse`
+/// answers `SELECT 1` and the Iceberg REST catalog answers its config
+/// request; `503` otherwise, with the SAME body shape so a caller learns
+/// which dependency is not ready. Each check is only `"ok"` or
+/// `"failed"` — no upstream text ever reaches this public route (AGENTS.md
+/// rule 4).
+///
+/// This is a different question from [`health`], which stays a liveness
+/// probe: an installer or an updater waits on THIS route, and the ops
+/// gates keep polling `/health`.
+///
+/// The answer is reused for two seconds (REL-2 S1 review SHOULD-FIX 1):
+/// this route is public, so a loop of anonymous requests must not turn
+/// into a Postgres query, a `ClickHouse` query and a Lakekeeper call
+/// each.
+async fn ready(State(state): State<AppState>) -> Response {
+    let body = crate::readiness::ready_body(&state).await;
+    let status = if body.ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (status, ApiJson(body)).into_response()
 }
 
 /// The JSON body shape a request-timeout response takes — same
@@ -1823,7 +1867,7 @@ mod route_policy_tests {
     use tower::ServiceExt;
 
     use crate::config::Config;
-    use crate::policy::{POLICY_TABLE, Policy};
+    use crate::policy::{ANY_METHOD, POLICY_TABLE, Policy};
     use crate::state::AppState;
 
     /// A router whose state can AUTHENTICATE, with nothing to connect to.
@@ -1898,8 +1942,17 @@ mod route_policy_tests {
     async fn every_policy_table_entry_is_mounted_and_gated_as_declared() {
         let mut failures = Vec::new();
         for (method, pattern, policy) in POLICY_TABLE {
+            // A `*` method entry (DATA-5's door, see `policy::ANY_METHOD`)
+            // is probed with a method the route does NOT serve, so the
+            // probe exercises the wildcard entry itself rather than the
+            // exact entry beside it.
+            let probe = if *method == ANY_METHOD {
+                "POST"
+            } else {
+                *method
+            };
             let path = concretize(pattern);
-            let resp = request(test_router(), method, &path).await;
+            let resp = request(test_router(), probe, &path).await;
             let status = resp.status();
             if status == StatusCode::NOT_FOUND {
                 failures.push(format!(

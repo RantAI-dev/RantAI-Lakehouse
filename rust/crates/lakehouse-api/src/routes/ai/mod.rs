@@ -541,12 +541,12 @@ async fn prepare_chat(
         .filter(|m| m.role == "user")
         .map(|m| m.content.as_str())
         .collect();
-    let relevant = prompt::select_tools(&recent_user);
+    let relevant = prompt::select_tools(&recent_user, is_build);
     let allow: Option<std::collections::HashSet<String>> = parsed
         .tools
         .filter(|t| !t.is_empty())
         .map(|t| t.into_iter().collect());
-    let tools: Vec<Value> = registry::tool_schemas_for(perms)
+    let mut tools: Vec<Value> = registry::tool_schemas_for(perms)
         .into_iter()
         .filter(|t| {
             let name = t["function"]["name"].as_str().unwrap_or("");
@@ -566,14 +566,38 @@ async fn prepare_chat(
                 return false;
             }
             if let Some(allow) = &allow {
-                // An explicit allowlist from the console's Tools menu is
-                // the user's own choice and wins over the per-turn
-                // selection.
-                return allow.contains(name);
+                // The console's Tools menu is an UPPER BOUND, not a
+                // replacement (`AI-15`): the tools the person allowed are
+                // the ones that may be offered, and the per-turn selection
+                // still decides which of them this turn needs. The
+                // console's list holds nearly every tool, so offering it
+                // whole is larger than a 32k context. A tool outside the
+                // list is never offered, so the person's choice keeps its
+                // meaning.
+                if !allow.contains(name) {
+                    return false;
+                }
+                // `propose_sql` is the SQL-help tool of Query Studio: it is
+                // in no domain and not in `ALWAYS`, so the bound above
+                // would leave it unreachable and the SQL-help flow
+                // (`AI-12`) would break. It stays reachable when the client
+                // names it, as before; the `AI_SQL_HELP` switch above
+                // still decides whether it is offered at all.
+                if name == registry::PROPOSE_SQL {
+                    return true;
+                }
+                return relevant.contains(name);
             }
             relevant.contains(name)
         })
         .collect();
+    // The offered list is ordered (`AI-15`): the tools every turn has,
+    // then the chart tools every build turn has, then the rest, each group
+    // in the registry's own order. The sort is stable, so the order inside
+    // a group is the registry's. Two build turns from the same principal
+    // and page therefore share the whole list up to the first extra tool,
+    // and with it the model's cached prompt.
+    tools.sort_by_key(|t| prompt::group_of(t["function"]["name"].as_str().unwrap_or("")));
     // The rules for asking are written only for a chat that can ask: one
     // whose tool list holds `ask_user`. The SQL help rules follow the same
     // rule for `propose_sql`.
@@ -1389,6 +1413,7 @@ fn chat_response_body(
     chart_created: bool,
     note: Option<&str>,
 ) -> Value {
+    let (answer, next_step) = take_next_step(answer, tool_trace);
     let mut body = Map::new();
     body.insert("answer".to_owned(), json!(answer));
     body.insert("toolTrace".to_owned(), json!(tool_trace));
@@ -1399,7 +1424,44 @@ fn chat_response_body(
     if let Some(note) = note {
         body.insert("note".to_owned(), json!(note));
     }
+    if let Some(step) = next_step {
+        body.insert("nextStep".to_owned(), json!(step));
+    }
     Value::Object(body)
+}
+
+/// The `NEXT:` line the model ends a turn with when the request still has
+/// steps left (`AI-15`). The console sends the step back as a message
+/// ("Confirmed. Continue: ...") once the person has confirmed the draft, so
+/// a request that needs two dependent writes finishes in one conversation
+/// instead of stopping at the first draft.
+///
+/// Only the last non-empty line counts, and only when the turn really has a
+/// pending confirmation: a `NEXT:` line in the middle of an answer is the
+/// model's own text and stays where it is.
+fn take_next_step(answer: &str, tool_trace: &[Value]) -> (String, Option<String>) {
+    let pending = tool_trace
+        .iter()
+        .any(|step| step["result"]["needs_confirmation"].as_bool() == Some(true));
+    if !pending {
+        return (answer.to_owned(), None);
+    }
+    let Some(last) = answer.lines().rfind(|l| !l.trim().is_empty()) else {
+        return (answer.to_owned(), None);
+    };
+    let Some(step) = last.trim().strip_prefix("NEXT:") else {
+        return (answer.to_owned(), None);
+    };
+    let step = step.trim();
+    if step.is_empty() {
+        return (answer.to_owned(), None);
+    }
+    // The answer keeps everything before the line, without the blank line
+    // the line left behind.
+    let Some(at) = answer.rfind(last) else {
+        return (answer.to_owned(), None);
+    };
+    (answer[..at].trim_end().to_owned(), Some(step.to_owned()))
 }
 
 fn llm_unavailable(err: &lakehouse_llm::LlmError) -> Response {

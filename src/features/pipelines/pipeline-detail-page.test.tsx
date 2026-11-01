@@ -10,12 +10,14 @@
 // poll timer was re-armed on every one-second clock tick, so it never fired
 // again. It uses real timers on purpose (one poll interval of waiting), so
 // it exercises the same `setTimeout` the page relies on.
+/** The query string `useSearchParams` answers with; each test sets it. */
+let search = "tab=runs"
 mock.module("next/navigation", () => ({
   usePathname: () => "/pipelines/pl-connector-1",
   useParams: () => ({ pipelineId: "pl-connector-1" }),
   // An authored pipeline opens on its Definition tab; the run state and
   // the failure reason under test live on the Runs tab.
-  useSearchParams: () => new URLSearchParams("tab=runs"),
+  useSearchParams: () => new URLSearchParams(search),
   useRouter: () => ({
     push: () => {},
     replace: () => {},
@@ -42,6 +44,7 @@ afterEach(() => {
   // file's own `spyOn` would see this file's calls (`PR #247 CI`:
   // `column-lineage.test.tsx` counted 26 fetch calls it never made).
   global.fetch = originalFetch
+  search = "tab=runs"
   cleanup()
 })
 
@@ -111,6 +114,8 @@ type Stub = {
   status: () => PipelineRun["status"]
   /** The run's error lines, as `GET .../runs/{runId}/logs` answers them. */
   logLines?: { ts: number; level: string; stepKey: string | null; message: string }[]
+  /** The pipeline the detail read answers; the test swaps its definition. */
+  pipeline?: PipelineDetail
 }
 
 function stubApi(stub: Stub) {
@@ -119,7 +124,7 @@ function stubApi(stub: Stub) {
     if (path.includes("/api/auth/me")) {
       return json({ id: "u1", name: "Operator", email: null, roles: [], permissions: ["pipeline:read"], tenants: [] })
     }
-    if (path.endsWith("/api/pipelines/pl-connector-1")) return json(PIPELINE)
+    if (path.endsWith("/api/pipelines/pl-connector-1")) return json(stub.pipeline ?? PIPELINE)
     if (path.endsWith("/api/pipelines/pl-connector-1/runs")) return json({ runs: [run(stub.status())], unavailable: null })
     if (path.includes("/runs/run-0001/logs")) {
       return json({ lines: stub.logLines ?? [], cursor: "0", truncated: false })
@@ -211,4 +216,34 @@ describe("the pipeline page's run state (BLD-8)", () => {
     expect(callout.textContent).not.toContain("Code: 60")
     expect(screen.getByRole("button", { name: /show errors in the log/i })).toBeTruthy()
   }, 20_000)
+})
+
+// BLD-10 D3: the definition page says the same as the form -- FBIC is not
+// available, and a pipeline with no transform copies its source as is.
+describe("the pipeline page's Definition tab (BLD-10)", () => {
+  /** The stored pipeline with FBIC on or off, as the detail read answers it. */
+  function withFbic(fbicEnabled: boolean): PipelineDetail {
+    return { ...PIPELINE, definition: { ...PIPELINE.definition!, fbicEnabled } }
+  }
+
+  it("says FBIC is not available, and that a pipeline with no transform is a plain copy", async () => {
+    search = "tab=definition"
+    stubApi({ status: () => "completed", pipeline: withFbic(false) })
+    renderPage()
+
+    // The form's own name for it, not a third one.
+    expect(await screen.findByText("FBIC enrichment")).toBeTruthy()
+    expect(screen.getByText("Not available")).toBeTruthy()
+    // The fixture has no transforms, so the target is a plain copy and the
+    // chart says so.
+    expect(screen.getByText("plain copy of the source")).toBeTruthy()
+  })
+
+  it("says a stored-on FBIC is not available either, and what is stored", async () => {
+    search = "tab=definition"
+    stubApi({ status: () => "completed", pipeline: withFbic(true) })
+    renderPage()
+
+    expect(await screen.findByText("Not available (stored as on; nothing runs it)")).toBeTruthy()
+  })
 })

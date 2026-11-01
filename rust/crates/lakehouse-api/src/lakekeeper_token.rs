@@ -23,6 +23,22 @@
 use lakehouse_core::ApiError;
 use lakehouse_core::secret::SecretValue;
 
+/// The fixed sentence [`read_token_file`] answers with when the token
+/// file cannot be read (ADR 0011).
+///
+/// Exposed so a caller that must answer with the SAME sentence — the
+/// door (`routes::iceberg_door`) tells the console's consumers route
+/// that outside reading is not set up (DATA-5, plan D7) — reuses THIS
+/// text instead of writing its own (AGENTS.md rule 4: no second copy of
+/// a message).
+///
+/// The sentence names the purpose and the env var and never the path:
+/// the path is for the log, not for a caller.
+#[must_use]
+pub fn token_unavailable_message(purpose: &'static str, env_var: &'static str) -> String {
+    format!("Lakekeeper {purpose} token is unavailable (check {env_var}; see ADR 0011)")
+}
+
 /// Read and trim a pre-minted Lakekeeper bearer token from `path`.
 ///
 /// `purpose` and `env_var` name the caller's use case (for example
@@ -52,9 +68,7 @@ pub async fn read_token_file(
             env_var,
             "failed to read Lakekeeper bearer token file"
         );
-        ApiError::Unavailable(format!(
-            "Lakekeeper {purpose} token is unavailable (check {env_var}; see ADR 0011)"
-        ))
+        ApiError::Unavailable(token_unavailable_message(purpose, env_var))
     })?;
     Ok(SecretValue::new(raw.trim().to_owned()))
 }

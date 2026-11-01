@@ -28,6 +28,7 @@ import { mapService as mapClientService } from "./clients/maps"
 import { chatTermService as chatTermClientService } from "./clients/chat-terms"
 import { semanticService as semanticClientService } from "./clients/semantic"
 import { tagKeysService as tagKeysClientService } from "./clients/tag-keys"
+import { httpVersionService } from "./clients/version"
 import * as authClient from "./clients/auth"
 
 // Overview is now fully real — summary/activity from ClickHouse+Dagster,
@@ -137,6 +138,16 @@ export const semanticService = semanticClientService
 // The governed tag keys and their allowed values (`/api/governance/tag-keys`,
 // `DATA-12` part 2). Free tags are not part of this.
 export const tagKeysService = tagKeysClientService
+// The server's own health answer (`/api/health` — the API's `/health`,
+// exposed through the console's rewrite), read for the version it runs so
+// the console can say when it and the server are not the same build
+// (REL-2 S1-T5). No mock ever existed for this domain.
+export const versionService = httpVersionService
+/**
+ * The server's health answer. The contract owns the shape, and it is
+ * exported here so a feature imports it from `@/services`.
+ */
+export type { ServerHealth } from "./contracts/version"
 // SSO admin page reads the live OIDC configuration
 // off the API process. Sessions page lists and revokes
 // live browser sessions via `GET /api/auth/sessions` and

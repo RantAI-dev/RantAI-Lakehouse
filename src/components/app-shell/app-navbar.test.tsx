@@ -19,7 +19,8 @@ import { AuthProvider } from "@/features/auth/auth-provider"
 import { CopilotProvider } from "@/features/copilot/use-copilot"
 import { SidebarProvider } from "@/components/ui/sidebar"
 import { notificationsService } from "@/services"
-import { AppNavbar } from "./app-navbar"
+import { AppNavbar, UserMenu } from "./app-navbar"
+import { CONSOLE_VERSION } from "@/features/version/console-version"
 
 afterEach(() => {
   cleanup()
@@ -76,5 +77,20 @@ describe("AppNavbar notification panel (BI-19 QA-2)", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Mark all as read" }))
     await waitFor(() => expect(markRead).toHaveBeenCalledTimes(1))
+  })
+})
+
+/**
+ * The account menu says which build the console is (REL-2 S1-T5): a
+ * person reporting a problem, or an operator checking what a host runs,
+ * needs the number without opening a console page.
+ */
+describe("the account menu", () => {
+  afterEach(() => cleanup())
+
+  it("shows the console's version", () => {
+    render(<UserMenu userName="Ada" userEmail="ada@example.com" onLogout={() => {}} />)
+    fireEvent.click(screen.getByRole("button", { name: /Account menu/ }))
+    expect(screen.getByText(`Version ${CONSOLE_VERSION}`)).toBeTruthy()
   })
 })

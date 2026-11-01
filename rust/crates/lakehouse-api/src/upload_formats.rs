@@ -1066,7 +1066,13 @@ fn file_indices<R: Read + Seek>(archive: &mut zip::ZipArchive<R>) -> Result<Vec<
         let file = archive
             .by_index_raw(index)
             .map_err(|_err| Refusal::NotZip)?;
-        if file.is_dir() || file.name().starts_with("__MACOSX/") {
+        // zip 9 decodes a member name (UTF-8, else CP437), so reading it can
+        // fail. A name it cannot decode is refused as a file that is not a
+        // zip, and the zip error text never reaches the response
+        // (`AGENTS.md` principle 4). Plan D2:
+        // `docs/superpowers/plans/2026-10-31-deps-zip-9.md`.
+        let name = file.name().map_err(|_err| Refusal::NotZip)?;
+        if file.is_dir() || name.starts_with("__MACOSX/") {
             continue;
         }
         found.push(index);
@@ -1100,15 +1106,16 @@ pub fn zip_listing<R: Read + Seek>(mut reader: R) -> Result<ZipListing, Refusal>
         if file.encrypted() {
             return Err(Refusal::ZipEncrypted);
         }
-        if archive_name(file.name()) {
+        let name = file.name().map_err(|_err| Refusal::NotZip)?;
+        if archive_name(&name) {
             return Err(Refusal::ZipNested);
         }
-        let this = Format::of_extension(&extension(file.name())).ok_or(Refusal::ZipMixed)?;
+        let this = Format::of_extension(&extension(&name)).ok_or(Refusal::ZipMixed)?;
         if *format.get_or_insert(this) != this {
             return Err(Refusal::ZipMixed);
         }
         files.push(ZipFileInfo {
-            name: file.name().to_owned(),
+            name: name.into_owned(),
             size: file.size(),
         });
     }

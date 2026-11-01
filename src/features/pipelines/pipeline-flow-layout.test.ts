@@ -71,6 +71,31 @@ describe("authoredFlow", () => {
     ])
     expect(edges.map((e) => `${e.from}>${e.to}`)).toEqual(["source>t0", "t0>t1", "t1>target"])
   })
+
+  // BLD-10 D3: a pipeline with no transform copies its source as is. The
+  // target moves into column 1 and says so, so an empty middle is not a
+  // puzzle for the reader.
+  test("a pipeline with no transform copies its source, and the target says so", () => {
+    const { nodes, edges } = authoredFlow(
+      {
+        sourceZone: "bronze",
+        sourceTable: "orders_raw",
+        incrementalColumn: null,
+        transforms: [],
+        fbicEnabled: false,
+        targetZone: "silver",
+        targetTable: "orders",
+        connectorId: null,
+      },
+      describeTransform
+    )
+    expect(nodes.map((n) => [n.id, n.column])).toEqual([
+      ["source", 0],
+      ["target", 1],
+    ])
+    expect(nodes.find((n) => n.id === "target")?.sublabel).toBe("plain copy of the source")
+    expect(edges.map((e) => `${e.from}>${e.to}`)).toEqual(["source>target"])
+  })
 })
 
 describe("layoutFlow", () => {

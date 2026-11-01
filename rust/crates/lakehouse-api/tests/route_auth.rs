@@ -1793,7 +1793,11 @@ fn every_registered_route_has_a_policy_entry() {
             break;
         };
         let pattern = &rest[open + 1..open + 1 + close];
-        if !pattern.starts_with("/api/") && pattern != "/health" {
+        // Only the routes this file cares about: the `/api/*` surface and
+        // the two health routes (`/health` and, since REL-2 decision D7,
+        // `/health/ready` — the readiness probe is public too, so it must
+        // be classified like every other route).
+        if !pattern.starts_with("/api/") && pattern != "/health" && pattern != "/health/ready" {
             continue;
         }
         // Method handlers appear between the pattern and the closing paren of
@@ -3417,6 +3421,93 @@ async fn the_public_map_boundary_routes_are_not_refused_by_the_auth_gate() {
             resp.status(),
             StatusCode::FORBIDDEN,
             "{method} {path}: a public route must not answer 403 with no credentials"
+        );
+    }
+}
+
+/// # DATA-5 / ADR 0016: the door for outside readers
+///
+/// The door (`/api/iceberg/*`) is gated by `iceberg:read`, a scope a
+/// service identity holds (D1). This asserts both directions the plan
+/// names: a caller WITHOUT the scope is refused with 403, and a service
+/// identity WITH it is not refused by the auth gate.
+///
+/// What the door answers afterwards is not asserted here: with no
+/// `OUTSIDE_S3_ENDPOINT` in `spin_up`, every door route answers 503
+/// ("Outside reading is not set up: `OUTSIDE_S3_ENDPOINT` is not set.") —
+/// which is a deployment answer, not an authorization one.
+/// `tests/iceberg_door.rs` covers the rest.
+#[tokio::test]
+async fn the_door_needs_the_iceberg_read_scope_and_a_service_identity() {
+    /// A service identity holding `scopes`, and a live bearer token for it.
+    async fn service_identity_with_scopes(pool: &PgPool, scopes: &[&str]) -> String {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO service_identity (id, name, scopes, environment, expires_at) \
+             VALUES ($1, $2, $3, 'production', now() + interval '1 day')",
+        )
+        .bind(id)
+        .bind(format!("route-auth-tool-{id}"))
+        .bind(scopes)
+        .execute(pool)
+        .await
+        .expect("create the service identity");
+        let token = lakehouse_auth::service_token::create_service_credential(pool, id)
+            .await
+            .expect("mint the service identity's credential");
+        token.expose().to_owned()
+    }
+
+    async fn request_with_bearer(
+        app: &axum::Router,
+        method: &str,
+        path: &str,
+        token: &str,
+    ) -> axum::http::Response<Body> {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("router never fails a request outright")
+    }
+
+    let TestApp { router, pool } = spin_up().await;
+    let with_scope = service_identity_with_scopes(&pool, &["iceberg:read"]).await;
+    let without_scope = service_identity_with_scopes(&pool, &["catalog:read"]).await;
+
+    for (method, path) in [
+        ("GET", "/api/iceberg/v1/config"),
+        ("GET", "/api/iceberg/v1/x/namespaces"),
+        ("GET", "/api/iceberg/v1/x/namespaces/gold"),
+        ("GET", "/api/iceberg/v1/x/namespaces/gold/tables"),
+        ("GET", "/api/iceberg/v1/x/namespaces/gold/tables/orders"),
+        (
+            "GET",
+            "/api/iceberg/v1/x/namespaces/gold/tables/orders/credentials",
+        ),
+        ("GET", "/api/iceberg/x"),
+    ] {
+        let resp = request_with_bearer(&router, method, path, &without_scope).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "{method} {path}: a service identity without the iceberg:read scope must be refused"
+        );
+
+        let resp = request_with_bearer(&router, method, path, &with_scope).await;
+        assert!(
+            !matches!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+            ),
+            "{method} {path}: a service identity holding iceberg:read must pass the gate, got {}",
+            resp.status()
         );
     }
 }

@@ -1,16 +1,32 @@
 #!/usr/bin/env bash
-# Restore Lakehouse data from a backup created by the `backup-job` service:
-# 1. Postgres databases (application, Lakekeeper, OpenFGA, Dagster)
-# 2. Warehouse S3 bucket (Iceberg data and metadata files)
-# 3. ClickHouse non-catalog databases (ingest state, offsets, bronze_meta)
-# 4. Bring up the remaining stack services
+# Restore Lakehouse data from a backup.
+#
+# Two targets, one script:
+#
+# 1. The `backups` compose profile's S3 bucket (the default):
+#    1. Postgres databases (application, Lakekeeper, OpenFGA, Dagster)
+#    2. Warehouse S3 bucket (Iceberg data and metadata files)
+#    3. ClickHouse non-catalog databases (ingest state, offsets, bronze_meta)
+#    4. Bring up the remaining stack services
+#
+# 2. A LOCAL-disk backup directory (REL-2 S1-T4, decision D8) — what an
+#    air-gapped host has, and what `ops/backups/backup-local.sh` writes:
+#    1. The manifest's checksums are checked FIRST: a backup that was cut
+#       short is refused, not restored as if it were whole.
+#    2. Postgres (`pg_dumpall` of the whole instance)
+#    3. ClickHouse (`BACKUP DATABASE ... TO Disk('backups', ...)` output)
+#    4. The connector-secrets volume — every stored connector credential
+#    5. The deployment's `.env` (the key the credentials are sealed with)
+#    6. Bring up the remaining stack services
 #
 # Usage:
 #   scripts/restore-from-backup.sh [--force] [--skip-stack-up] <backup-timestamp>
+#   scripts/restore-from-backup.sh [--force] [--skip-stack-up] --local <backup-dir>
 #
 # Example:
 #   scripts/restore-from-backup.sh 20261016T090000Z
 #   scripts/restore-from-backup.sh --force 20261016T090000Z
+#   scripts/restore-from-backup.sh --local backups/20261031T090000Z-0.1.0
 #
 # Environment variables:
 #   COMPOSE_PROJECT          compose project name (pass -p or set here)
@@ -34,6 +50,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
+# The alpine image the helper containers run — the same pinned image the
+# stack itself uses (REL-2 S1-T3 pinned every image by digest).
+HELPER_IMAGE="alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc"
+
 # Load .env if present and not already exported
 if [[ -f "${REPO_ROOT}/.env" ]]; then
   set -a
@@ -45,6 +65,7 @@ fi
 FORCE=false
 SKIP_STACK_UP=false
 TIMESTAMP=""
+LOCAL_DIR=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -56,8 +77,17 @@ while [[ $# -gt 0 ]]; do
       SKIP_STACK_UP=true
       shift
       ;;
+    --local)
+      LOCAL_DIR="${2:-}"
+      if [[ -z "${LOCAL_DIR}" ]]; then
+        echo "Error: --local needs the backup directory." >&2
+        exit 1
+      fi
+      shift 2
+      ;;
     --help|-h)
       echo "Usage: $0 [--force] [--skip-stack-up] <backup-timestamp>"
+      echo "       $0 [--force] [--skip-stack-up] --local <backup-dir>"
       exit 0
       ;;
     -*)
@@ -76,8 +106,9 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ -z "${TIMESTAMP}" ]]; then
+if [[ -z "${LOCAL_DIR}" && -z "${TIMESTAMP}" ]]; then
   echo "Usage: $0 [--force] [--skip-stack-up] <backup-timestamp>" >&2
+  echo "       $0 [--force] [--skip-stack-up] --local <backup-dir>" >&2
   exit 1
 fi
 
@@ -116,8 +147,9 @@ LAKEKEEPER_PG_DB="${LAKEKEEPER_PG_DB:-lakekeeper}"
 OPENFGA_PG_DB="${OPENFGA_PG_DB:-openfga}"
 DAGSTER_PG_DB="${DAGSTER_PG_DB:-dagster}"
 
-if [[ -z "${BACKUP_S3_ACCESS_KEY}" || -z "${BACKUP_S3_SECRET_KEY}" ]]; then
+if [[ -z "${LOCAL_DIR}" && ( -z "${BACKUP_S3_ACCESS_KEY}" || -z "${BACKUP_S3_SECRET_KEY}" ) ]]; then
   echo "Error: BACKUP_S3_ACCESS_KEY and BACKUP_S3_SECRET_KEY must be set." >&2
+  echo "       (A local-disk restore needs no bucket: use --local <backup-dir>.)" >&2
   exit 1
 fi
 
@@ -128,19 +160,27 @@ cleanup() {
 trap cleanup EXIT
 
 TOTAL_START=$(date +%s)
-echo "================================================================="
-echo "Starting Lakehouse restore from backup timestamp: ${TIMESTAMP}"
-echo "================================================================="
+if [[ -n "${LOCAL_DIR}" ]]; then
+  echo "================================================================="
+  echo "Starting Lakehouse restore from local backup: ${LOCAL_DIR}"
+  echo "================================================================="
+else
+  echo "================================================================="
+  echo "Starting Lakehouse restore from backup timestamp: ${TIMESTAMP}"
+  echo "================================================================="
+fi
 
 # Detect compose project network
 NETWORK_NAME="${COMPOSE_PROJECT:-$(basename "${REPO_ROOT}")}_default"
+PROJECT_ID="${COMPOSE_PROJECT:-$(basename "${REPO_ROOT}")}"
+CONNECTOR_SECRETS_VOLUME="${PROJECT_ID}_lakehouse_connector_secrets"
+CLICKHOUSE_BACKUPS_VOLUME="${PROJECT_ID}_lakehouse_clickhouse_backups"
 
 # -------------------------------------------------------------------
 # 0. Check empty volumes (E4: refuse to run on non-empty unless --force)
 # -------------------------------------------------------------------
 if [[ "${FORCE}" != "true" ]]; then
   echo "==> Verifying volumes / databases are empty..."
-  PROJECT_ID="${COMPOSE_PROJECT:-$(basename "${REPO_ROOT}")}"
   VOLUMES=$(docker volume ls -q --filter "name=^${PROJECT_ID}_" 2>/dev/null || true)
   for vol in ${VOLUMES}; do
     # Check if data volume has existing files
@@ -154,6 +194,193 @@ if [[ "${FORCE}" != "true" ]]; then
       fi
     fi
   done
+fi
+
+# -------------------------------------------------------------------
+# 0b. A LOCAL backup: check the manifest's checksums FIRST
+# -------------------------------------------------------------------
+# A backup that was cut short must not be restored as if it were whole.
+# Every part's size and SHA-256 are checked before anything is written.
+if [[ -n "${LOCAL_DIR}" ]]; then
+  MANIFEST="${LOCAL_DIR}/manifest.json"
+  if [[ ! -f "${MANIFEST}" ]]; then
+    echo "Error: ${MANIFEST} is missing — this is not a local backup directory." >&2
+    exit 1
+  fi
+  echo "==> Verifying the manifest's checksums..."
+  CHECK_FAILURES=0
+  while IFS=$'\t' read -r part part_size part_sum; do
+    [[ -z "${part}" ]] && continue
+    if [[ ! -f "${LOCAL_DIR}/${part}" ]]; then
+      echo "Error: the part '${part}' is missing from the backup." >&2
+      CHECK_FAILURES=$((CHECK_FAILURES + 1))
+      continue
+    fi
+    actual_size="$(stat -c%s "${LOCAL_DIR}/${part}")"
+    actual_sum="$(sha256sum "${LOCAL_DIR}/${part}" | cut -d' ' -f1)"
+    if [[ "${actual_size}" != "${part_size}" ]]; then
+      echo "Error: the part '${part}' is ${actual_size} bytes, the manifest says ${part_size}." >&2
+      CHECK_FAILURES=$((CHECK_FAILURES + 1))
+      continue
+    fi
+    if [[ "${actual_sum}" != "${part_sum}" ]]; then
+      echo "Error: the part '${part}' does not match its SHA-256 (the backup is damaged)." >&2
+      CHECK_FAILURES=$((CHECK_FAILURES + 1))
+      continue
+    fi
+    echo "    ok: ${part} (${part_size} bytes)"
+  done < <(jq -r '.parts[] | [.name, (.sizeBytes | tostring), .sha256] | @tsv' "${MANIFEST}")
+  if [[ "${CHECK_FAILURES}" -gt 0 ]]; then
+    echo "Error: ${CHECK_FAILURES} part(s) of this backup do not match the manifest." >&2
+    echo "       Nothing was restored. A backup that does not match its manifest is" >&2
+    echo "       not a backup — take a new one, or restore the damaged part by hand." >&2
+    exit 1
+  fi
+  LOCAL_STAMP="$(jq -r '.createdAt' "${MANIFEST}")"
+  LOCAL_VERSION="$(jq -r '.version' "${MANIFEST}")"
+  echo "==> The backup is whole: version ${LOCAL_VERSION}, created ${LOCAL_STAMP}"
+fi
+
+# -------------------------------------------------------------------
+# 0c. A LOCAL backup: restore it (and only it)
+# -------------------------------------------------------------------
+# The S3 path below is untouched: the bucket is still a target, this is
+# another one. What differs is where the parts come from, and that this
+# set carries two the bucket job never wrote — the connector secrets and
+# the deployment's `.env`.
+if [[ -n "${LOCAL_DIR}" ]]; then
+  LOCAL_PG_START=$(date +%s)
+  echo "==> [Step 1/5] Starting Postgres..."
+  "${COMPOSE[@]}" up -d postgres
+  echo "==> Waiting for Postgres to be healthy..."
+  local_ready=false
+  for _ in $(seq 1 60); do
+    if "${COMPOSE[@]}" exec -T postgres pg_isready -U "${POSTGRES_USER}" >/dev/null 2>&1; then
+      local_ready=true
+      break
+    fi
+    sleep 1
+  done
+  if [[ "${local_ready}" != "true" ]]; then
+    echo "Error: Postgres did not become ready within 60 s — nothing was restored." >&2
+    exit 1
+  fi
+
+  echo "--> Restoring the whole instance from pg_dumpall..."
+  # `pg_dumpall` restores into the `postgres` database: the dump carries
+  # its own CREATE DATABASE and \connect statements. A role the dump
+  # creates that already exists in the fresh instance is reported by psql
+  # as an error and the restore carries on — expected, not a failure.
+  "${COMPOSE[@]}" exec -T postgres psql -U "${POSTGRES_USER}" -d postgres \
+    < "${LOCAL_DIR}/postgres.dump"
+  LOCAL_PG_DURATION=$(( $(date +%s) - LOCAL_PG_START ))
+
+  LOCAL_CH_START=$(date +%s)
+  echo "==> [Step 2/5] Starting ClickHouse..."
+  "${COMPOSE[@]}" up -d clickhouse
+  echo "==> Waiting for ClickHouse to be healthy..."
+  local_ready=false
+  for _ in $(seq 1 60); do
+    if "${COMPOSE[@]}" exec -T clickhouse clickhouse-client -q "SELECT 1" >/dev/null 2>&1; then
+      local_ready=true
+      break
+    fi
+    sleep 1
+  done
+  if [[ "${local_ready}" != "true" ]]; then
+    echo "Error: ClickHouse did not become ready within 60 s — nothing was restored." >&2
+    exit 1
+  fi
+
+  echo "--> Copying the ClickHouse backup back into ${CLICKHOUSE_BACKUPS_VOLUME}..."
+  # The files belong to the ClickHouse server's own user (uid 101 in the
+  # pinned image), which is who has to read them back.
+  docker run --rm \
+    -e STAMP="${LOCAL_STAMP}" \
+    -v "${CLICKHOUSE_BACKUPS_VOLUME}:/dst" \
+    -v "${LOCAL_DIR}:/src:ro" \
+    "${HELPER_IMAGE}" \
+    sh -c 'mkdir -p "/dst/clickhouse/${STAMP}" &&
+           cp -a "/src/clickhouse/${STAMP}/." "/dst/clickhouse/${STAMP}/" &&
+           chown -R 101:101 "/dst/clickhouse/${STAMP}"'
+
+  for db_dir in "${LOCAL_DIR}/clickhouse/${LOCAL_STAMP}"/*; do
+    [[ -d "${db_dir}" ]] || continue
+    db="$(basename "${db_dir}")"
+    quoted="${db//\`/\`\`}"
+    echo "--> Restoring ClickHouse database '${db}'..."
+    # A server that has just started answers a query before it opens the
+    # listeners its own RESTORE machinery connects back through, so the
+    # statement is retried for a while before it is called a failure.
+    local_restored=false
+    for attempt in 1 2 3 4 5 6; do
+      if "${COMPOSE[@]}" exec -T clickhouse clickhouse-client -q \
+        "RESTORE DATABASE \`${quoted}\` FROM Disk('backups', 'clickhouse/${LOCAL_STAMP}/${quoted}')"; then
+        local_restored=true
+        break
+      fi
+      echo "    attempt ${attempt} failed; waiting 5 s and trying again"
+      sleep 5
+    done
+    if [[ "${local_restored}" != "true" ]]; then
+      echo "Error: the ClickHouse database '${db}' could not be restored." >&2
+      exit 1
+    fi
+  done
+  LOCAL_CH_DURATION=$(( $(date +%s) - LOCAL_CH_START ))
+
+  LOCAL_SECRETS_START=$(date +%s)
+  if [[ -f "${LOCAL_DIR}/connector-secrets.tar.gz" ]]; then
+    echo "==> [Step 3/5] Restoring the connector secrets into ${CONNECTOR_SECRETS_VOLUME}..."
+    docker run --rm \
+      -v "${CONNECTOR_SECRETS_VOLUME}:/secrets" \
+      -v "${LOCAL_DIR}:/src:ro" \
+      "${HELPER_IMAGE}" \
+      tar xzf /src/connector-secrets.tar.gz -C /secrets
+  else
+    echo "==> [Step 3/5] This backup holds no connector secrets — skipping."
+  fi
+  LOCAL_SECRETS_DURATION=$(( $(date +%s) - LOCAL_SECRETS_START ))
+
+  LOCAL_ENV_START=$(date +%s)
+  if [[ -f "${LOCAL_DIR}/env" ]]; then
+    echo "==> [Step 4/5] Restoring the deployment's .env..."
+    # The connector credentials are sealed with the key in this file: a
+    # restore whose `.env` is not the one they were sealed with leaves
+    # every connector unreadable. The current `.env` is kept beside the
+    # new one, so a restore never destroys the only copy.
+    if [[ -f "${REPO_ROOT}/.env" ]] && ! cmp -s "${LOCAL_DIR}/env" "${REPO_ROOT}/.env"; then
+      cp -p "${REPO_ROOT}/.env" "${REPO_ROOT}/.env.before-restore-${LOCAL_STAMP}"
+      echo "    the previous .env was kept as .env.before-restore-${LOCAL_STAMP}"
+    fi
+    cp -p "${LOCAL_DIR}/env" "${REPO_ROOT}/.env"
+  else
+    echo "==> [Step 4/5] This backup holds no .env — skipping."
+  fi
+  LOCAL_ENV_DURATION=$(( $(date +%s) - LOCAL_ENV_START ))
+
+  LOCAL_STACK_DURATION=0
+  if [[ "${SKIP_STACK_UP}" != "true" ]]; then
+    echo "==> [Step 5/5] Starting the remaining services in the stack..."
+    LOCAL_STACK_START=$(date +%s)
+    "${COMPOSE[@]}" up -d
+    LOCAL_STACK_DURATION=$(( $(date +%s) - LOCAL_STACK_START ))
+  else
+    echo "==> [Step 5/5] Skipping full stack up (--skip-stack-up passed)"
+  fi
+
+  TOTAL_DURATION=$(( $(date +%s) - TOTAL_START ))
+  echo "================================================================="
+  echo "Restore complete from the local backup ${LOCAL_DIR}"
+  echo "Timing summary:"
+  echo "  Postgres restore:        ${LOCAL_PG_DURATION}s"
+  echo "  ClickHouse restore:      ${LOCAL_CH_DURATION}s"
+  echo "  Connector secrets:       ${LOCAL_SECRETS_DURATION}s"
+  echo "  Configuration:           ${LOCAL_ENV_DURATION}s"
+  echo "  Stack bring-up:          ${LOCAL_STACK_DURATION}s"
+  echo "  Total restore time:      ${TOTAL_DURATION}s"
+  echo "================================================================="
+  exit 0
 fi
 
 # -------------------------------------------------------------------
