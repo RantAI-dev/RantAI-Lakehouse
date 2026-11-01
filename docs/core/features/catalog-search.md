@@ -121,9 +121,10 @@ Exceptions, each with an owner and a date:
   with `approximate: true`, and the console says "approximate match".
   Owner: product owner, to re-run row 5 and close the exception. Date:
   2026-10-23. Follow-up: `DATA-32`.
-- Row 14, the speed measurement on 10,000 tables: `docs/plans/DATA-11-RESULT.md`
-  does not exist. Owner: product owner. Date: 2026-10-23. Follow-up:
-  `DATA-24`.
+- Row 14, the speed measurement on 10,000 tables: measured on 2026-11-01
+  (`docs/plans/DATA-11-RESULT.md`, run 41267430494). The median meets 500 ms;
+  p95 (about 755 ms) and the first search after the copy expires (about 7.2 s)
+  do not. Owner: product owner. Date: 2026-10-23. Follow-up: `DATA-38`.
 
 ## After acceptance
 
