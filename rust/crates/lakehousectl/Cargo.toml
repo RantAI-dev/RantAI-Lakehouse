@@ -36,6 +36,10 @@ p256 = "0.14"
 ecdsa = "0.17"
 # The errors this tool reports.
 thiserror = { workspace = true }
+# The secrets of a fresh install: 24 random bytes as hexadecimal, and
+# 32 as base64 for the connector key. `rand` is already a workspace
+# dependency, so the lockfile gains no package.
+rand = { workspace = true }
 # The free disk under the install directory: `statvfs`, without unsafe
 # in this crate. `nix` is already a workspace dependency (SEC-41), so
 # this adds no package to the lockfile.
@@ -43,6 +47,10 @@ nix = { workspace = true }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+# The tests write a `.env` in a temporary directory.
+tempfile = { workspace = true }
 
 [features]
 default = []

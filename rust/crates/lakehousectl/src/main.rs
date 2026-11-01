@@ -29,8 +29,13 @@
 //!   (see `verify`).
 
 mod cli;
+mod docker;
 mod error;
+mod http;
+mod install;
+mod manifest;
 mod preflight;
+mod secrets;
 mod sys;
 mod verify;
 
@@ -62,5 +67,6 @@ fn run(cli: Cli) -> Result<(), error::ToolError> {
     match cli.command {
         Command::Verify(args) => verify::command(&args),
         Command::Preflight(args) => preflight::command(&args),
+        Command::Install(args) => install::command(&args),
     }
 }

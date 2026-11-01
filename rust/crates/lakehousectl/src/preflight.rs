@@ -356,9 +356,25 @@ pub fn collect(compose_text: &str, dir: &Path) -> Facts {
         compose_version: sys::output("docker", &["compose", "version", "--short"]).ok(),
         cpus: std::thread::available_parallelism().map_or(0, std::num::NonZeroUsize::get),
         memory_bytes: memory_bytes(),
-        disk_free_bytes: sys::free_bytes(dir).ok(),
+        disk_free_bytes: sys::free_bytes(&nearest_existing(dir)).ok(),
         published_ports,
     }
+}
+
+/// The nearest directory that exists.
+///
+/// The install directory is usually not there yet — that is what an
+/// install does — and the free disk is the free disk of the
+/// filesystem that will hold it.
+fn nearest_existing(path: &Path) -> std::path::PathBuf {
+    let mut candidate = path;
+    while !candidate.exists() {
+        match candidate.parent() {
+            Some(parent) => candidate = parent,
+            None => break,
+        }
+    }
+    candidate.to_path_buf()
 }
 
 /// The machine's memory in bytes, from `/proc/meminfo`.

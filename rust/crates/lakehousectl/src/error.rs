@@ -26,6 +26,9 @@ pub enum ToolError {
     /// The host does not meet the release's minimums.
     #[error("this host does not meet the release's minimums ({0} check(s) failed)")]
     Preflight(usize),
+    /// The install could not go on.
+    #[error("{0}")]
+    Failed(String),
     /// The command's arguments do not make sense together.
     #[error("{0}")]
     Usage(String),

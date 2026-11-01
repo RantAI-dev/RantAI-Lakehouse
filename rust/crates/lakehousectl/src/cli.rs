@@ -29,6 +29,8 @@ pub enum Command {
     Verify(VerifyArgs),
     /// Check this host against the release's minimums.
     Preflight(PreflightArgs),
+    /// Install the whole stack, online or from an offline bundle.
+    Install(InstallArgs),
 }
 
 /// The arguments of `lakehousectl verify`.
@@ -52,6 +54,25 @@ pub struct PreflightArgs {
     pub dir: PathBuf,
     /// Skip one check, by name. The check is not run and the skip is
     /// said out loud.
+    #[arg(long = "ignore-preflight", value_name = "CHECK")]
+    pub ignore_preflight: Vec<String>,
+}
+
+/// The arguments of `lakehousectl install`.
+#[derive(Debug, Args)]
+pub struct InstallArgs {
+    /// The offline bundle's directory. Without it, the release is
+    /// fetched from GitHub.
+    #[arg(long)]
+    pub bundle: Option<PathBuf>,
+    /// Where the install lives: everything is in this one directory.
+    #[arg(long, default_value = "/opt/rantai-lakehouse")]
+    pub dir: PathBuf,
+    /// The release to install. Without it, the newest one.
+    #[arg(long)]
+    pub version: Option<String>,
+    /// Skip one pre-flight check, by name. The check is not run and the
+    /// skip is said out loud.
     #[arg(long = "ignore-preflight", value_name = "CHECK")]
     pub ignore_preflight: Vec<String>,
 }
