@@ -1545,6 +1545,232 @@ no `cargo clean`; no workspace build.
 - **`cargo deny check`** was not run: no dependency changed (the crate's `Cargo.toml` is
   untouched).
 
+### Handoff S4a (developer, 2026-11-01)
+
+**Commits** (branch `feat/rel-2-s4-lakehousectl-update`), one per task, each pushed:
+
+| Commit | Task | What |
+| --- | --- | --- |
+| `fd25c005` | S4-T1 (D14) | the release ships every file its Compose file mounts |
+| `5d659f66` | S4-T2 (D15) | one backup and one restore, shipped as tools |
+| `ff9c334b` | S4-T3 (D16) | `MAINTENANCE_PAUSED` stops the jobs that delete files |
+
+**S4-T1 (`fd25c005`, D14).** A relative bind-mount source
+(`./ops/backups/clickhouse/backups.xml`) is a file the deployment needs NEXT TO its Compose file:
+on a host that does not have it, Docker creates an empty DIRECTORY in its place — the service
+starts, and it runs against nothing. The release now ships every relative mount of a service a
+release runs, and the signed manifest names the checksum of each of them.
+
+The rule lives in ONE place: `render_compose.relative_mount_sources` answers "which relative
+mounts does this Compose file have", with the SAME `services_to_drop` the renderer drops the
+acceptance harnesses by — so the answer is the same whether it is read from the template or from
+the rendered file (rule 4). `make_manifest.py` asks that module for the answer instead of parsing
+the file a second way, hashes each mounted file, and REFUSES a release that mounts a file it does
+not carry. That refusal is the release-tooling check D14 asks for: the tooling fails when the
+rendered Compose file mounts a relative source that `files` does not list. Two shipped files with
+the same name are refused too, and so is a shipped file named after a release asset of its own
+(the online install fetches a shipped file by its own name).
+
+The install writes them. `files.rs` fetches every shipped file (from the bundle offline, from the
+release's assets online), checks it against the SIGNED manifest, and writes it at the relative
+path the release ships it at — the path the Compose file mounts it at. The bundle carries them
+too: `make_bundle.sh` asks the manifest's own script for the list, checks each file against the
+signed manifest, and puts it in the bundle at the path the install writes it at. The release job
+publishes each of them as an asset of its own.
+
+**S4-T2 (`5d659f66`, D15).** `lakehousectl backup` and `lakehousectl restore <dir>` run the two
+scripts the release ships, under `tools/`. There is no Rust port of the steps: they have ONE
+source. The two scripts gain `LAKEHOUSE_DIR` — the deployment's own directory, the one holding
+`docker-compose.yml` and `.env`. It defaults to the repository's root, so a developer's behaviour
+is unchanged; the scripts run `docker compose -p <project> -f "$LAKEHOUSE_DIR/docker-compose.yml"
+--env-file "$LAKEHOUSE_DIR/.env"`, plus `override.yml` when there is one. The `.env` is named
+only when it is there: a repository without one is a normal thing, and compose refuses to start on
+a file that is not there.
+
+The backup set gets `release.json` and `state.json` (D15): a restore that brings the data back
+brings the release it was taken from back with it. The restore puts them back and keeps the ones
+it replaces beside the new ones, so a restore never destroys the only copy. `lakehousectl backup`
+records the backup it took in the install's state (`state.json`'s `lastBackup`) — the rollback of
+an update reads that pointer (D18). The state's shape has ONE owner now (`state.rs`): the
+install and the backup both read and write it there.
+
+**S4-T3 (`ff9c334b`, D16).** The three Dagster services of the `dagster` profile get
+`MAINTENANCE_PAUSED: ${MAINTENANCE_PAUSED:-}`. The jobs run in the code location, so that is the
+service that reads the value; the daemon and the webserver carry it too, because `lakehousectl`
+sets it in the install's `.env` and the services that read it are recreated by `up -d`.
+
+While `MAINTENANCE_PAUSED=true` is set, the two verbs that DELETE files — the snapshot expiry and
+the orphan-file removal — skip, the reason is recorded in `skipped_verbs`, and the run does not
+fail. The value is read as `== "true"`: anything else, and an unset variable, is not a pause. The
+Gold export's trim deletes files too, so it reads the same variable and records its own skip
+(`console.gold_trim_run`, status `skipped`, reason `maintenance_paused`).
+
+**The real run (S4-T2), on bluefin.** Docker 29.9.2, Compose v5.6.1, the host's own containerd
+store (`io.containerd.snapshotter.v1`). `lakehousectl` was built with `--features test-key` (a
+native debug build) and pointed at a THROWAWAY cosign key: cosign v3.1.4 generated the key and
+signed the manifest into a Sigstore bundle (`--use-signing-config=false --tlog-upload=false`, no
+transparency log), and the binary read the throwaway public key through
+`LAKEHOUSECTL_PUBLIC_KEY_FILE`.
+
+The bundle was made by the NEW `make_bundle.sh`, from a small Compose file of its own — Postgres
+and ClickHouse, and nothing else — with the manifest written by `ops/release/make_manifest.py`
+and the image ids read the way the pipeline reads them (the config digest out of the image's own
+saved tar, because the containerd store reports the index digest as the image's id). The bundle
+is 437 640 170 bytes (417 MiB) and it holds what D14 says it must: the mounted file
+(`ops/backups/clickhouse/backups.xml`) and the two tools (`tools/backup-local.sh`,
+`tools/restore-from-backup.sh`), each with its SHA-256 in the bundle's own `SHA256SUMS`.
+
+Then, in this order:
+
+1. `lakehousectl install --bundle bundle --dir install --ignore-preflight disk
+   --ignore-preflight memory`. It wrote the layout, and the layout held the shipped files:
+
+   ```
+   install/docker-compose.yml
+   install/.env
+   install/ops/backups/clickhouse/backups.xml
+   install/release.json
+   install/release.json.sigstore.json
+   install/state.json
+   install/tools/backup-local.sh
+   install/tools/restore-from-backup.sh
+   ```
+
+   Both images loaded and their ids matched the SIGNED manifest. The stack started, and
+   `docker compose -p rantai-lakehouse ps` showed both services `Up (healthy)`. The install then
+   waited for `/health/ready`, which this small stack cannot answer — there is no API in it — and
+   the run was stopped at that wait (the same place the D13 measurement stopped). The tool's own
+   "did not become ready within 10 minutes" message was NOT seen here.
+2. The markers, one row in each database: `the postgres marker` in Postgres, `the clickhouse
+   marker` in ClickHouse.
+3. `lakehousectl backup --dir install` ran the SHIPPED script, and it said:
+
+   ```
+   ==> Backing up compose project 'rantai-lakehouse' to .../install/backups/20261101T192513Z-unknown
+   --> Postgres: pg_dumpall
+   --> ClickHouse: BACKUP DATABASE ... TO Disk('backups', ...)
+       default
+   --> ClickHouse: copying the backup files out of rantai-lakehouse_lakehouse_clickhouse_backups
+   --> Configuration: .env
+   --> Release: release.json
+   --> State: state.json
+   --> Manifest: manifest.json
+
+   ==> Backup complete: .../install/backups/20261101T192513Z-unknown
+       parts:     18
+       size:      64631 bytes
+   lakehousectl: the backup is recorded in the install's state.
+   ```
+
+   The ClickHouse `BACKUP DATABASE ... TO Disk('backups', ...)` worked BECAUSE the release
+   shipped `ops/backups/clickhouse/backups.xml` and the install wrote it next to the Compose
+   file: without D14 the disk does not exist and the backup cannot run at all. The install's
+   `state.json` held `"lastBackup": ".../backups/20261101T192513Z-unknown"` afterwards.
+4. The volumes were destroyed: `docker compose -p rantai-lakehouse down -v` removed the three
+   volumes and the network, and `docker volume ls --filter "name=^rantai-lakehouse_"` was empty.
+5. `lakehousectl restore .../backups/20261101T192513Z-unknown --dir install` ran the SHIPPED
+   restore script: the checksums were checked first, Postgres was restored with `pg_dumpall`,
+   ClickHouse was restored with `RESTORE DATABASE ... FROM Disk('backups', ...)` (it needed a
+   second attempt, which the script retries), the `.env`, `release.json` and `state.json` were put
+   back, and the stack came up again. It reported `Total restore time: 12s`.
+6. **The markers are back in both databases:**
+
+   ```
+   $ docker compose -p rantai-lakehouse ... exec -T postgres psql -U lakehouse -d lakehouse \
+       -tAc "SELECT id, note FROM s4_marker;"
+   1|the postgres marker
+   $ docker compose -p rantai-lakehouse ... exec -T clickhouse clickhouse-client \
+       -q "SELECT id, note FROM s4_marker"
+   1	the clickhouse marker
+   ```
+
+**Everything created was removed afterwards.** The compose project, its containers, its network
+and its three volumes (`docker compose -p rantai-lakehouse down -v`); the `postgres:16.15` TAG
+the bundle's `docker tag` added (the image itself was already on the machine, as `postgres:16`,
+and the tag was removed — `docker rmi postgres:16.15` untagged it and the image stayed); the
+temporary directories and the 417 MiB bundle. The ClickHouse image was LEFT on the machine: a
+container that predates this measurement (`charming_yonath`, `intelligent_easley`) uses it, and
+removing an image a stopped container holds would break that container's ability to start. The
+throwaway cosign key went with the temporary directory.
+
+**Commands run, in the foreground, on the final commit `ff9c334b`:**
+
+| Command | Result |
+| --- | --- |
+| `/home/shiro/rantai/bin/cargo-locked fmt --check` (the whole workspace) | clean, no diff, exit 0 |
+| `/home/shiro/rantai/bin/cargo-locked clippy --workspace --all-targets --all-features -- -D warnings` | clean, no warning and no error, exit 0 |
+| `/home/shiro/rantai/bin/cargo-locked test --workspace` | **8848 passed, 0 failed**, 51 ignored, in 164 test binaries |
+| `/home/shiro/rantai/bin/cargo-locked clippy -p lakehousectl --all-targets -- -D warnings` | clean, exit 0 |
+| `/home/shiro/rantai/bin/cargo-locked test -p lakehousectl` | **89 passed, 0 failed** (65 before this slice, 24 new) |
+| `python3 -m pytest ops/release -q` | **177 passed** (158 before this slice, 19 new) |
+| `(cd dagster && python -m pytest dispar_orchestrate -q -k "maintenance or expiry or orphan")` | **60 passed**, 2349 deselected, 7 subtests passed (9 new) |
+| `(cd dagster && python -m pytest dispar_orchestrate/test_gold_export.py -q)` | **45 passed** |
+| `(cd dagster && python -m pytest dispar_orchestrate -q)` (the whole code location) | **2408 passed, 1 skipped**, 40 subtests passed, in 18m30s |
+| `actionlint .github/workflows/release.yml` | no findings, exit 0 |
+| `shellcheck ops/release/*.sh ops/backups/backup-local.sh scripts/restore-from-backup.sh` (0.10.0) | clean, exit 0 |
+| `python3 ops/lint/check_intra_package_imports.py` | `OK: all intra-package dispar_orchestrate imports resolve` |
+| `python3 ops/lint/check_bare_iceberg_count.py` | `R11 guard: no bare count() against a Bronze Iceberg table found.` |
+| `docker compose --profile '*' config --quiet` (throwaway env values) | clean, exit 0 |
+| `git status` | clean (nothing generated staged) |
+
+Every cargo command went through `/home/shiro/rantai/bin/cargo-locked` (the `bin/cargo-locked` of
+the earlier rounds is not in the repository), in the foreground, on the shared
+`CARGO_TARGET_DIR`; no `cargo clean`. The pytest run used the system interpreter
+(`python3 -m pytest ops/release -q`); the Dagster runs used the repository's own virtualenv
+(`dagster/.venv/bin/python`, pytest 9.2.0). `shellcheck` (0.10.0) is not installed on this
+machine; the copy in `/tmp/opencode/bin/shellcheck` was used.
+
+(The `cargo test -p lakehousectl` count in the S4-T1 commit message says "66 before this commit,
+10 new"; the real counts are 65 before the slice and 76 after S4-T1 — the message is off by one.
+The table above is the count.)
+
+**One thing in the plan is wrong against the code, and it is reported rather than improvised.**
+D14's list of "today's" relative mounts names TWO files —
+`ops/backups/clickhouse/backups.xml` and `ops/trino/optimize_bronze.sh` — and the "Gap found by
+this check" says "The other relative mounts are test runners in test profiles". That is not what
+the code says: the release's Compose file mounts a THIRD relative source, and it is not a test
+runner:
+
+```
+ops/seaweedfs/iam.template.json   (the `seaweedfs-iam-init` service, profile `seaweedfs`)
+```
+
+`seaweedfs-iam-init` renders `ops/seaweedfs/iam.template.json` into the `lakehouse_seaweedfs_iam`
+volume, so on a host without the file Docker creates an empty directory in its place and the
+service renders nothing. D14's RULE — "each relative bind-mount source used by a service that a
+release runs (no test-runner profile)" — covers it, so the release ships all THREE and the new
+tooling test asserts exactly that set. The plan's enumeration should be corrected by the planner;
+the decision itself was not changed.
+
+**Not verified, with the reason:**
+
+- **The PR's dry run and the `install-proof` job.** They need a GitHub runner: the images, the
+  throwaway registry, cosign, syft, a multi-GiB bundle and the whole stack. The workflow's own
+  checks, and the checks run against the OLD workflow, are what stands in for them here.
+- **The ONLINE path of the shipped files.** The measurement installed from a BUNDLE (the offline
+  path). The online path — the release publishing one asset per shipped file and the install
+  fetching it by its own name — is covered by a Rust test with a fake fetch, not by a real
+  download from a GitHub release: the release does not exist yet.
+- **The static musl build** was not verified here: the `x86_64-unknown-linux-musl` target is not
+  installed on this machine. The measurement used the native debug build — the same source, the
+  same features.
+- **The readiness probe was not allowed to finish**: the measurement's stack holds no API, so
+  `/health/ready` cannot answer. The stack start, the backup and the restore are what was
+  measured.
+- **The release build's own images** (`ghcr.io/rantai-dev/…`) were not in the measurement: the
+  bundle's path does not care which registry an image comes from, and the release key is in the
+  `release` environment's secrets. The measurement used third-party images and a throwaway key,
+  as the task allowed.
+- **The SBOMs in the measurement bundle were stand-ins** (a minimal CycloneDX JSON per image),
+  not syft's: the bundle only copies them, and the measurement is about the files and the
+  backup/restore.
+- **No bun command ran**: this slice changes no TypeScript.
+- **`lakehousectl update` and `lakehousectl rollback`** are NOT in this slice (S4-T4, D17 and
+  D18). With them comes the third bullet of D16 — `lakehousectl` setting the pause in the
+  install's `.env` before the backup of an update and clearing it after a success or a rollback
+  — because there is no `update` to set it for yet.
+- **`cargo deny check`** was not run: no dependency changed (no crate's `Cargo.toml` is touched).
+
 ## 7. Review (planner appends below)
 
 ### Review S1 round 1 (planner, 2026-10-31, at `f79d4235`)
