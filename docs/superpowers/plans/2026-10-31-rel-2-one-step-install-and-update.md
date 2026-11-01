@@ -1771,6 +1771,112 @@ the decision itself was not changed.
   — because there is no `update` to set it for yet.
 - **`cargo deny check`** was not run: no dependency changed (no crate's `Cargo.toml` is touched).
 
+### Fixes for review S4a round 1 (developer, 2026-11-01)
+
+The reviewer's three SHOULD-FIX findings, one commit each, in the order the review names them. Every
+commit is on `feat/rel-2-s4-lakehousectl-update` — the review commit `f34f28e0` is the base — and was
+pushed as it was made.
+
+| Commit | Finding | What |
+| --- | --- | --- |
+| `e11abbf6` | SHOULD-FIX 1 | a shipped file's path may not escape the install's own directory |
+| `4b6ca96c` | SHOULD-FIX 2 | two files of the same name are not published as two assets |
+| `4e61a122` | SHOULD-FIX 3 | the repository's own compose command is the one it always was |
+
+**SHOULD-FIX 1 (`e11abbf6`).** `files::write` joins the install's own directory with the manifest's
+key. The manifest is signed, but a key that is absolute, or that holds a `..` component, would
+write OUTSIDE the directory the install owns — and a Compose file can really mount such a path:
+`render_compose.relative_mount_sources` accepts a `../` source and hands it over as it is.
+
+Both sides now refuse it, with the SAME rule: the path must be relative and must hold normal
+components only — no leading `/`, no `.`, no `..`, no empty component.
+
+- `make_manifest.py`: `check_install_path` refuses such a path. `shipped_files` calls it for every
+  mount and every tool, and `build_manifest` calls it for every path the manifest names.
+- `lakehousectl`'s `files.rs`: `check_install_path` refuses it BEFORE the file is read from the
+  bundle or downloaded, and before it is written. A path that escapes is neither fetched nor
+  written.
+
+**SHOULD-FIX 2 (`4b6ca96c`).** The release publishes one asset per file, and the asset's name is
+the file's own name — its LAST path component (`files::asset_name`). Two files whose last component
+is the same are two assets with the same name, and the online install fetches a shipped file by that
+name: it could not tell them apart. `make_manifest.py` now owns the rule in ONE place:
+`check_file_names` refuses two paths whose last component is the same; `check_shipped_names` (the
+rule for the shipped files) calls it, and `build_manifest` calls it over the WHOLE `files` mapping
+of the manifest, so the manifest's own entries are part of the same rule.
+
+**SHOULD-FIX 3 (`4e61a122`).** Before S4, both scripts ran `docker compose -p <project>` in the
+repository root, and compose found the Compose file — and a developer's own
+`docker-compose.override.yml` — by itself. S4 made them always pass `-f docker-compose.yml`, which
+stopped that. Both scripts now name the Compose file, the `.env` and `override.yml` ONLY when
+`LAKEHOUSE_DIR` is set — that is, when the deployment is somewhere else than the repository. When it
+is not set, the command is exactly the old one. `lakehousectl backup` and `lakehousectl restore`
+both set `LAKEHOUSE_DIR` (`backup.rs`), so an installed host is unaffected. The scripts read the
+deployment's own directory from `DEPLOYMENT_DIR`, which is `LAKEHOUSE_DIR` when it is set and the
+repository's root when it is not.
+
+**Commands run, in the foreground, on the final commit `4e61a122`:**
+
+| Command | Result |
+| --- | --- |
+| `cargo fmt --check` (the whole workspace) | clean, no diff, exit 0 |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | clean, no warning and no error, exit 0 |
+| `cargo test --workspace` | **8854 passed, 0 failed**, 51 ignored, in 164 test binaries (8848 before these fixes, 6 new) |
+| `cargo clippy -p lakehousectl --all-targets -- -D warnings` | clean, exit 0 |
+| `cargo test -p lakehousectl` | **95 passed, 0 failed** (89 before these fixes, 6 new) |
+| `python3 -m pytest ops/release -q` | **187 passed** (177 at the review commit `f34f28e0`, 10 new) |
+| `shellcheck ops/backups/backup-local.sh scripts/restore-from-backup.sh` (0.10.0) | clean, exit 0 |
+| `python3 ops/lint/check_intra_package_imports.py` | `OK: all intra-package dispar_orchestrate imports resolve` |
+| `python3 ops/lint/check_bare_iceberg_count.py` | `R11 guard: no bare count() against a Bronze Iceberg table found.` |
+| `(cd dagster && .venv/bin/python -m pytest dispar_orchestrate -q)` | **2408 passed, 1 skipped**, 40 subtests passed, in 17m54s |
+| `bun run typecheck` | clean, exit 0 |
+| `bun run test` | **3082 pass, 1 skip, 0 fail**, 8372 expect() calls, in 313 files, 73.8s |
+| `bun run lint` | **12356 problems (649 errors, 11707 warnings)** — red on `main` already, and this branch changes no TypeScript (see below) |
+| `docker compose --profile '*' config --quiet` (throwaway env values) | clean, exit 0 |
+| `git status` | clean (nothing generated staged) |
+
+Every cargo command ran in the foreground on the shared `CARGO_TARGET_DIR`
+(`/home/shiro/rantai/cargo-target`); no `cargo clean`. The pytest run used the system interpreter
+(`python3 -m pytest ops/release -q`); the Dagster run used the repository's own virtualenv
+(`dagster/.venv/bin/python`). `shellcheck` (0.10.0) is not installed on this machine under that
+name; the copy in `/tmp/opencode/tools/shellcheck-v0.10.0/shellcheck` was used, as in the S4a
+handoff. There is no `bin/cargo-locked` in the repository, so plain `cargo` was used.
+
+**`main` was merged into this branch while the fixes were in.** `699798ed` ("Merge branch 'main'
+into feat/rel-2-s4-lakehousectl-update") was pushed to the branch after the three fix commits, and
+this handoff sits on top of it. The merge touches NONE of the files these fixes touch
+(`ops/release/make_manifest.py`, `ops/release/test_release_files.py`,
+`ops/release/test_backup_scripts.py`, `ops/backups/backup-local.sh`, `scripts/restore-from-backup.sh`,
+`rust/crates/lakehousectl/src/files.rs`), and the checks for what was touched were re-run on the
+merged tree: `cargo fmt --check` clean, `cargo clippy -p lakehousectl --all-targets -- -D warnings`
+clean, `cargo test -p lakehousectl` **95 passed**, `python3 -m pytest ops/release -q` **187 passed**,
+`shellcheck` on both scripts clean, and the two `ops/lint` scripts OK. The whole-workspace run in
+the table above was measured on `4e61a122`, BEFORE that merge — main's own code came with it, and
+the reviewer runs the full block on the PR head anyway.
+
+**The tests of the developer's path are real.** The three tests of the repository's own command (the
+backup, the backup with an override of its own, and the restore) were run against the PRE-FIX
+scripts — the two scripts were stashed, and the three tests failed — and pass against the fixed
+ones.
+
+**`bun run lint` is red on `main`, and this branch does not cause it.** This branch changes no
+TypeScript: `git diff origin/main --stat -- src/ design-system/ design-kit/ components.json
+package.json bun.lock` is empty, so the lint's count is the count on `main`. It is named here for
+the reviewer (AGENTS.md, step 6).
+
+**Not verified, with the reason:**
+
+- **No PR is opened**: the developer never opens or merges one (AGENTS.md, step 6).
+- **The real run on bluefin was not repeated.** The three fixes are two refusals and one shell
+  command: the refusals are covered by the tests above, and the command by the two scripts' own
+  tests with `docker` and `curl` as stand-ins. A real stack run would show what the S4a
+  measurement already showed, and the release a real install needs does not exist yet.
+- **The ONLINE path of the shipped files** is still covered by a Rust test with a fake fetch, not by
+  a real download from a GitHub release (as in the S4a handoff).
+- **The static musl build** was not verified here (as in the S4a handoff): the
+  `x86_64-unknown-linux-musl` target is not installed on this machine.
+- **`cargo deny check`** was not run: no dependency changed (no crate's `Cargo.toml` is touched).
+
 ## 7. Review (planner appends below)
 
 ### Review S1 round 1 (planner, 2026-10-31, at `f79d4235`)
