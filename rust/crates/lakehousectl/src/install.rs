@@ -309,10 +309,18 @@ fn fetch_images(manifest: &Manifest, bundle_dir: Option<&Path>) -> Result<(), To
             )));
         };
         let found = docker::image_id(&reference).map_err(ToolError::Failed)?;
-        if found != *expected {
+        // Docker's two image stores identify an image differently: the
+        // classic store reports the CONFIG digest, the containerd store
+        // the image INDEX digest. Both are named in the SIGNED
+        // manifest — the config digest in `imageIds`, the registry
+        // digest in `images` — so the loaded image is accepted when its
+        // ID is one of them, and refused when it is neither.
+        let registry_digest = Manifest::digest_of(&reference).unwrap_or_default();
+        if found != *expected && found != registry_digest {
             return Err(ToolError::Failed(format!(
-                "the image {reference} has the id {found}, and the manifest names {expected}. The \
-                 image is not the one the release published, so the install stops here."
+                "the image {reference} has the id {found}, and the manifest names {expected} and \
+                 {registry_digest}. The image is not the one the release published, so the \
+                 install stops here."
             )));
         }
     }

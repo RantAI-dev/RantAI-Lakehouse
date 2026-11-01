@@ -486,6 +486,19 @@ jobs:
           while read -r reference; do
             [ -n "$reference" ] || continue
             id="$(docker image inspect --format '{{.Id}}' "$reference")"
+            digest="${reference##*@}"
+            if [ "$id" = "$digest" ]; then
+              # The containerd image store reports the image INDEX digest
+              # as the image's ID; the classic store reports the CONFIG
+              # digest. An air-gapped host compares the ID of the image
+              # it LOADED, and that is the config digest on both stores
+              # — so the manifest names the config digest, read from the
+              # image's own saved tar (REL-2 S3-T0).
+              id="$(docker save "$reference" \
+                | tar -xO manifest.json \
+                | jq -r '.[0].Config' \
+                | sed 's|^blobs/sha256/|sha256:|')"
+            fi
             echo "$reference -> $id"
             jq --arg reference "$reference" --arg id "$id" \
               '. + {($reference): $id}' image-ids.json > image-ids.json.next
@@ -969,6 +982,19 @@ jobs:
           while read -r reference; do
             [ -n "$reference" ] || continue
             id="$(docker image inspect --format '{{.Id}}' "$reference")"
+            digest="${reference##*@}"
+            if [ "$id" = "$digest" ]; then
+              # The containerd image store reports the image INDEX digest
+              # as the image's ID; the classic store reports the CONFIG
+              # digest. An air-gapped host compares the ID of the image
+              # it LOADED, and that is the config digest on both stores
+              # — so the manifest names the config digest, read from the
+              # image's own saved tar (REL-2 S3-T0).
+              id="$(docker save "$reference" \
+                | tar -xO manifest.json \
+                | jq -r '.[0].Config' \
+                | sed 's|^blobs/sha256/|sha256:|')"
+            fi
             echo "$reference -> $id"
             jq --arg reference "$reference" --arg id "$id" \
               '. + {($reference): $id}' image-ids.json > image-ids.json.next

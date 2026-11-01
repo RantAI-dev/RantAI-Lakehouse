@@ -737,6 +737,23 @@ class ReleaseWorkflowTest(unittest.TestCase):
         job = self.document["jobs"]["install-proof"]
         self.assertEqual(job["needs"], "dry-run")
 
+    def test_the_image_ids_are_the_config_digests_on_every_docker_store(self) -> None:
+        """The two Docker stores identify an image differently.
+
+        The classic store reports the CONFIG digest as the image's ID;
+        the containerd store reports the image INDEX digest. The
+        manifest names the config digest — the identity a LOADED image
+        carries on both stores — so the pipeline corrects the ID when
+        the store reports the index digest, and reads the config digest
+        from the image's own saved tar.
+        """
+        for job in ("dry-run", "release"):
+            step = step_named(self.document, job, "The image ids")
+            run = str(step.get("run"))
+            self.assertIn("docker image inspect --format '{{.Id}}'", run, job)
+            self.assertIn("docker save", run, job)
+            self.assertIn("manifest.json", run, job)
+
     def test_a_job_level_secret_is_reported(self) -> None:
         document = yaml.safe_load(SYNTHETIC_JOB_SECRET)
         self.assertEqual(

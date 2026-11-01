@@ -40,6 +40,15 @@ impl Manifest {
         references.dedup();
         references
     }
+
+    /// The registry digest of an image reference.
+    ///
+    /// A reference is `name:tag@sha256:…`, and the digest is what
+    /// follows the `@`.
+    #[must_use]
+    pub fn digest_of(reference: &str) -> Option<&str> {
+        reference.split_once('@').map(|(_, digest)| digest)
+    }
 }
 
 /// The name one image's files carry in the release bundle.
@@ -74,6 +83,15 @@ mod tests {
             "catalog"
         );
         assert_eq!(image_name("alpine:3.20"), "alpine");
+    }
+
+    #[test]
+    fn the_registry_digest_of_a_reference_is_what_follows_the_at_sign() {
+        assert_eq!(
+            Manifest::digest_of("postgres:16.15@sha256:abc"),
+            Some("sha256:abc")
+        );
+        assert_eq!(Manifest::digest_of("postgres:16.15"), None);
     }
 
     #[test]
