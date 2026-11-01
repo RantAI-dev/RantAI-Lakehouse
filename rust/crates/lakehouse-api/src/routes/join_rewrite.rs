@@ -26,7 +26,7 @@ use lakehouse_bi::store::{ChartInput, ChartSpec, StoredChartSpec};
 use sqlparser::dialect::ClickHouseDialect;
 
 use crate::sql_rewrite::{
-    NoViews, ObligationsSource, PlaceholderValues, TableObligations, enforce,
+    Engine, NoViews, ObligationsSource, PlaceholderValues, TableObligations, enforce,
 };
 
 const VISITS: &str = "serving.mart_demo_map_points";
@@ -236,6 +236,7 @@ fn rewritten(
     let out = enforce(
         &sql,
         &ClickHouseDialect {},
+        Engine::ClickHouse,
         &["analyst".to_owned()],
         &PlaceholderValues::none(),
         policy,
