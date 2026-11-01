@@ -57,9 +57,13 @@ pub const MAX_STALE: Duration = Duration::from_mins(5);
 /// The assembled catalog as search needs it. Built once per rebuild.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CatalogSearchSnapshot {
-    /// The asset rows after the same enrichment steps `GET /api/catalog`
-    /// runs.
-    pub assets: Vec<Value>,
+    /// The prepared search index (`DATA-41` D2): the asset rows after the
+    /// same enrichment steps `GET /api/catalog` runs, and per asset the
+    /// texts a word can match, already lower-cased and tokenised.
+    ///
+    /// The index is built with the copy, so a search reads it and allocates
+    /// nothing per candidate.
+    pub index: crate::routes::catalog_search::SearchIndex,
     /// The namespace summaries of the same build.
     pub namespaces: Value,
     /// Column names and descriptions per asset id.
@@ -69,6 +73,14 @@ pub struct CatalogSearchSnapshot {
     /// True when a column query hit its row limit: column search covers
     /// only part of the catalog.
     pub column_search_partial: bool,
+}
+
+impl CatalogSearchSnapshot {
+    /// The asset rows of this copy, in the order the copy holds them.
+    #[must_use]
+    pub fn assets(&self) -> &[Value] {
+        self.index.assets()
+    }
 }
 
 struct Entry {
@@ -238,7 +250,10 @@ mod tests {
 
     fn snapshot(tag: &str) -> CatalogSearchSnapshot {
         CatalogSearchSnapshot {
-            assets: vec![json!({ "id": tag })],
+            index: crate::routes::catalog_search::SearchIndex::build(
+                vec![json!({ "id": tag })],
+                &crate::routes::catalog_search::ColumnIndex::new(),
+            ),
             namespaces: json!([]),
             columns: HashMap::new(),
             usage: HashMap::new(),
@@ -309,7 +324,7 @@ mod tests {
         let builds = Arc::new(AtomicU32::new(0));
         let first = get(&cache, Instant::now(), &builds).await;
         assert_eq!(builds.load(Ordering::SeqCst), 1);
-        assert_eq!(first.assets[0]["id"], "build-0");
+        assert_eq!(first.assets()[0]["id"], "build-0");
     }
 
     #[tokio::test]
@@ -369,7 +384,7 @@ mod tests {
         // The rebuild landed: the next read serves the new copy, and the
         // new copy is young enough that it starts no rebuild of its own.
         let third = get(&cache, t0 + TTL + Duration::from_secs(1), &builds).await;
-        assert_eq!(third.assets[0]["id"], "build-1");
+        assert_eq!(third.assets()[0]["id"], "build-1");
         assert_eq!(
             builds.load(Ordering::SeqCst),
             2,
@@ -416,7 +431,7 @@ mod tests {
         // the read builds a new one and waits for it.
         let later = get(&cache, t0 + MAX_STALE, &builds).await;
         assert_eq!(builds.load(Ordering::SeqCst), 2);
-        assert_eq!(later.assets[0]["id"], "build-1");
+        assert_eq!(later.assets()[0]["id"], "build-1");
     }
 
     #[tokio::test]
@@ -428,7 +443,7 @@ mod tests {
         cache.invalidate().await;
         let after = get(&cache, t0, &builds).await;
         assert_eq!(builds.load(Ordering::SeqCst), 2);
-        assert_eq!(after.assets[0]["id"], "build-1");
+        assert_eq!(after.assets()[0]["id"], "build-1");
     }
 
     #[tokio::test]

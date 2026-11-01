@@ -246,12 +246,7 @@ pub async fn list(
     if let Some(term) = params.q.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
         return match search_snapshot(&state).await {
             Ok(snapshot) => {
-                let assets = catalog_search::search(
-                    &snapshot.assets,
-                    &snapshot.columns,
-                    &snapshot.usage,
-                    term,
-                );
+                let assets = catalog_search::search(&snapshot.index, &snapshot.usage, term);
                 let mut body = json!({ "assets": assets, "namespaces": snapshot.namespaces });
                 if snapshot.column_search_partial {
                     body["columnSearch"] = json!("partial");
@@ -408,7 +403,7 @@ pub async fn query(
     let (searched, column_search_partial) = if let Some(term) = term {
         match search_snapshot(&state).await {
             Ok(snapshot) => (
-                catalog_search::search(&snapshot.assets, &snapshot.columns, &snapshot.usage, term),
+                catalog_search::search(&snapshot.index, &snapshot.usage, term),
                 snapshot.column_search_partial,
             ),
             Err(err) => return unavailable(err),
@@ -733,8 +728,11 @@ async fn build_search_snapshot(
         .filter_map(|a| a.get("id").and_then(Value::as_str).map(str::to_owned))
         .collect();
     let usage = catalog_governance::use_by_asset(state, &ids, &bronze_pairs).await;
+    // `DATA-41` D2: the index is prepared here, with the copy, so a search
+    // reads it and allocates nothing per candidate.
+    let index = catalog_search::SearchIndex::build(assets, &columns);
     Ok(crate::catalog_search_cache::CatalogSearchSnapshot {
-        assets,
+        index,
         namespaces: body.get("namespaces").cloned().unwrap_or(Value::Null),
         columns,
         usage,
@@ -1791,7 +1789,7 @@ async fn mark_annotation_and_history(
         // the name absent; it never fails the page.
         let replacement_name = match annotation.replacement_asset_id.as_deref().map(str::trim) {
             Some(replacement) if !replacement.is_empty() => match search_snapshot(state).await {
-                Ok(snapshot) => asset_name_in(&snapshot.assets, replacement).map(str::to_owned),
+                Ok(snapshot) => asset_name_in(snapshot.assets(), replacement).map(str::to_owned),
                 Err(err) => {
                     tracing::warn!(%err, "catalog read failed; the deprecation notice shows the replacement id");
                     None
@@ -3341,7 +3339,7 @@ pub async fn put_certification(
             )
         })?;
         let exists = snapshot
-            .assets
+            .assets()
             .iter()
             .any(|a| a.get("id").and_then(Value::as_str) == Some(replacement));
         if !exists {
@@ -5076,8 +5074,10 @@ mod tests {
         /// Puts a search copy in the cache that lists `ids` as assets, so a
         /// replacement can be checked without a catalog behind the mock.
         async fn prime_search_copy_with(state: &AppState, ids: &[&str]) {
+            let assets: Vec<Value> = ids.iter().map(|id| json!({ "id": id })).collect();
             let mut copy = empty_copy();
-            copy.assets = ids.iter().map(|id| json!({ "id": id })).collect();
+            copy.index =
+                catalog_search::SearchIndex::build(assets, &catalog_search::ColumnIndex::new());
             state
                 .catalog_search_cache
                 .get_or_build(Instant::now(), SEARCH_SNAPSHOT_TTL, move || async move {
@@ -5477,7 +5477,10 @@ mod tests {
 
         fn empty_copy() -> crate::catalog_search_cache::CatalogSearchSnapshot {
             crate::catalog_search_cache::CatalogSearchSnapshot {
-                assets: Vec::new(),
+                index: catalog_search::SearchIndex::build(
+                    Vec::new(),
+                    &catalog_search::ColumnIndex::new(),
+                ),
                 namespaces: Value::Null,
                 columns: std::collections::HashMap::new(),
                 usage: std::collections::HashMap::new(),
