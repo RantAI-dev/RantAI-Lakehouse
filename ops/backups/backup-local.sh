@@ -25,13 +25,14 @@
 #   env                      a copy of the deployment's `.env` (the
 #                            generated secrets, including the key the
 #                            connector credentials are sealed with).
+#   release.json             a copy of the release manifest — the signed
+#                            file that says which release this
+#                            deployment runs.
+#   state.json               a copy of the install's state: the release
+#                            that is installed, the one before it and the
+#                            last backup.
 #   manifest.json            each part's size and SHA-256. The restore
 #                            checks them BEFORE it restores anything.
-#
-# `release.json` and `state.json` (the release manifest and the installed
-# version) are part of the same backup set in the plan (D8), but they do
-# not exist yet: REL-2 S2 publishes the release manifest and S4 writes the
-# state file. This script says so in its output rather than pretending.
 #
 # # Usage
 #
@@ -41,6 +42,14 @@
 #
 # # Environment
 #
+#   LAKEHOUSE_DIR  the deployment's own directory: the one holding
+#                  `docker-compose.yml` and `.env` (REL-2 S4 decision
+#                  D15). It defaults to this repository's root, so a
+#                  developer's behaviour is unchanged. The script runs
+#                  `docker compose -p <project> -f
+#                  "$LAKEHOUSE_DIR/docker-compose.yml" --env-file
+#                  "$LAKEHOUSE_DIR/.env"`, plus `override.yml` when
+#                  there is one.
 #   COMPOSE_PROJECT   the compose project (default: this checkout's
 #                     directory name — the same default compose uses)
 #   API_HOST_PORT     the API's host port, read for the version
@@ -63,15 +72,33 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 # stack itself uses (REL-2 S1-T3 pinned every image by digest).
 HELPER_IMAGE="alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc"
 
-BACKUP_ROOT="${1:-${BACKUP_ROOT:-${REPO_ROOT}/backups}}"
-PROJECT="${COMPOSE_PROJECT:-$(basename "${REPO_ROOT}")}"
+# The deployment's own directory (REL-2 S4 decision D15). It defaults to
+# this repository's root: a developer who runs the script here gets the
+# same behaviour as before, and an installed host points it at the
+# install's directory.
+LAKEHOUSE_DIR="${LAKEHOUSE_DIR:-${REPO_ROOT}}"
+
+BACKUP_ROOT="${1:-${BACKUP_ROOT:-${LAKEHOUSE_DIR}/backups}}"
+PROJECT="${COMPOSE_PROJECT:-$(basename "${LAKEHOUSE_DIR}")}"
 POSTGRES_USER="${POSTGRES_USER:-lakehouse}"
 API_HOST_PORT="${API_HOST_PORT:-8080}"
 CH_USER="${CH_USER:-default}"
 CH_PASSWORD="${CH_PASSWORD:-}"
 
-cd "${REPO_ROOT}"
-COMPOSE=(docker compose -p "${PROJECT}")
+cd "${LAKEHOUSE_DIR}"
+# The Compose file of the deployment, named explicitly: the script runs
+# from the deployment's own directory, not from this repository's.
+COMPOSE=(docker compose -p "${PROJECT}" -f "${LAKEHOUSE_DIR}/docker-compose.yml")
+# The `.env` is read from the deployment's own directory. It is named
+# only when it is there: a repository without a `.env` is a normal
+# thing, and compose would refuse to start on a file that is not there.
+if [ -f "${LAKEHOUSE_DIR}/.env" ]; then
+    COMPOSE+=(--env-file "${LAKEHOUSE_DIR}/.env")
+fi
+# The operator's own override, when there is one (REL-2 decision D5).
+if [ -f "${LAKEHOUSE_DIR}/override.yml" ]; then
+    COMPOSE+=(-f "${LAKEHOUSE_DIR}/override.yml")
+fi
 
 CONNECTOR_SECRETS_VOLUME="${PROJECT}_lakehouse_connector_secrets"
 CLICKHOUSE_BACKUPS_VOLUME="${PROJECT}_lakehouse_clickhouse_backups"
@@ -89,8 +116,11 @@ fi
 stamp="$(date -u +%Y%m%dT%H%M%SZ)"
 backup_dir="${BACKUP_ROOT}/${stamp}-${version}"
 # Mode 0700: this directory holds the deployment's generated secrets (the
-# `.env` copy) and every stored connector credential.
-mkdir -p -m 0700 "${backup_dir}"
+# `.env` copy) and every stored connector credential. The mode is set
+# after the directory is made, so it is this directory's mode and not
+# the mode of the parents `mkdir -p` creates.
+mkdir -p "${backup_dir}"
+chmod 0700 "${backup_dir}"
 
 # The helper containers run as root, so what they write is owned by root
 # and unreadable by the operator. They hand it back: the host user's own
@@ -174,12 +204,31 @@ else
 fi
 
 # ── The configuration ──────────────────────────────────────────────────────
-if [[ -f "${REPO_ROOT}/.env" ]]; then
+if [[ -f "${LAKEHOUSE_DIR}/.env" ]]; then
   echo "--> Configuration: .env"
-  cp -p "${REPO_ROOT}/.env" "${backup_dir}/env"
+  cp -p "${LAKEHOUSE_DIR}/.env" "${backup_dir}/env"
 else
-  echo "Warning: there is no .env in ${REPO_ROOT} — the deployment's generated" >&2
+  echo "Warning: there is no .env in ${LAKEHOUSE_DIR} — the deployment's generated" >&2
   echo "         secrets are NOT in this backup." >&2
+fi
+
+# ── The release and the state ─────────────────────────────────────────────
+# The release manifest and the install's state are part of the set
+# (REL-2 S4 decision D15): a restore that brings the data back brings
+# the release it was taken from back with it.
+if [[ -f "${LAKEHOUSE_DIR}/release.json" ]]; then
+  echo "--> Release: release.json"
+  cp -p "${LAKEHOUSE_DIR}/release.json" "${backup_dir}/release.json"
+else
+  echo "Warning: there is no release.json in ${LAKEHOUSE_DIR} — the release" >&2
+  echo "         manifest is NOT in this backup." >&2
+fi
+if [[ -f "${LAKEHOUSE_DIR}/state.json" ]]; then
+  echo "--> State: state.json"
+  cp -p "${LAKEHOUSE_DIR}/state.json" "${backup_dir}/state.json"
+else
+  echo "Warning: there is no state.json in ${LAKEHOUSE_DIR} — the installed" >&2
+  echo "         version is NOT in this backup." >&2
 fi
 
 # ── The manifest ───────────────────────────────────────────────────────────
@@ -216,8 +265,5 @@ echo "    version:   ${version}"
 echo "    created:   ${stamp}"
 echo "    parts:     $(jq '.parts | length' "${backup_dir}/manifest.json")"
 echo "    size:      ${total_bytes} bytes"
-echo "    restore:   scripts/restore-from-backup.sh --local ${backup_dir}"
+echo "    restore:   lakehousectl restore ${backup_dir}"
 echo
-echo "Note: this backup holds no release.json and no state.json — the release"
-echo "      manifest and the installed-version state do not exist yet (REL-2 S2"
-echo "      and S4). The same backup set will carry them."

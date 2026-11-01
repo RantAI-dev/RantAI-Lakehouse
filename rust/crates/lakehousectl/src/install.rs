@@ -42,6 +42,7 @@ use crate::manifest::{Manifest, image_name};
 use crate::preflight;
 use crate::release;
 use crate::secrets;
+use crate::state;
 use crate::sys;
 use crate::verify;
 
@@ -272,7 +273,7 @@ fn write_layout(
     // release may be installed again, and any other release is refused
     // — that is what `lakehousectl update` is for (REL-2 S3 review
     // round 1 SHOULD-FIX 3).
-    check_state(dir, &manifest.version)?;
+    state::check_installed(dir, &manifest.version)?;
 
     std::fs::create_dir_all(dir).map_err(|source| ToolError::Io {
         context: format!("{} could not be created", dir.display()),
@@ -303,51 +304,12 @@ fn write_layout(
     // The state of the FIRST install is kept: it names the release that
     // is installed, the one before it, and the last backup. A
     // re-install of the same release changes nothing of it.
-    if !dir.join("state.json").exists() {
-        let state = serde_json::json!({
-            "schemaVersion": 1,
-            "currentVersion": manifest.version,
-            "previousVersion": Value::Null,
-            "lastBackup": Value::Null,
-        });
-        write(&dir.join("state.json"), format!("{state}\n").as_bytes())?;
-    }
+    state::write_initial(dir, &manifest.version)?;
 
     secrets::write_env(&dir.join(".env")).map_err(|source| ToolError::Io {
         context: format!("{} could not be written", dir.join(".env").display()),
         source,
     })
-}
-
-/// Refuse an install that would replace the release of another one.
-///
-/// The directory holds the state of the install that is there, and the
-/// state names the release that is installed. The SAME release may be
-/// installed again — a re-run of the same install — and its state is
-/// kept as it is. Any OTHER release is refused, and the refusal says
-/// which command does that work (REL-2 S3 review round 1 SHOULD-FIX 3).
-fn check_state(dir: &Path, version: &str) -> Result<(), ToolError> {
-    let path = dir.join("state.json");
-    if !path.exists() {
-        return Ok(());
-    }
-    let text = read_to_string(&path)?;
-    let installed = serde_json::from_str::<Value>(&text)
-        .ok()
-        .and_then(|document| document["currentVersion"].as_str().map(str::to_string));
-    match installed {
-        Some(installed) if installed == version => Ok(()),
-        Some(installed) => Err(ToolError::Failed(format!(
-            "{} already holds the release {installed}, and the release {version} would replace it. \
-             `lakehousectl update` is the command that installs another release.",
-            dir.display()
-        ))),
-        None => Err(ToolError::Failed(format!(
-            "{} holds a state.json that names no release, so the tool cannot tell which one is \
-             installed. It is refused rather than overwritten.",
-            dir.display()
-        ))),
-    }
 }
 
 /// Fetch every image the release runs.

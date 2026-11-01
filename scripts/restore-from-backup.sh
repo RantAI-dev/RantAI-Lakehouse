@@ -17,7 +17,9 @@
 #    3. ClickHouse (`BACKUP DATABASE ... TO Disk('backups', ...)` output)
 #    4. The connector-secrets volume — every stored connector credential
 #    5. The deployment's `.env` (the key the credentials are sealed with)
-#    6. Bring up the remaining stack services
+#    6. The release manifest and the install's state — the release the
+#       data was taken from (REL-2 S4 decision D15)
+#    7. Bring up the remaining stack services
 #
 # Usage:
 #   scripts/restore-from-backup.sh [--force] [--skip-stack-up] <backup-timestamp>
@@ -29,13 +31,22 @@
 #   scripts/restore-from-backup.sh --local backups/20261031T090000Z-0.1.0
 #
 # Environment variables:
+#   LAKEHOUSE_DIR          the deployment's own directory: the one
+#                          holding `docker-compose.yml` and `.env`
+#                          (REL-2 S4 decision D15). It defaults to this
+#                          repository's root, so a developer's behaviour
+#                          is unchanged. The script runs `docker compose
+#                          -p <project> -f
+#                          "$LAKEHOUSE_DIR/docker-compose.yml"
+#                          --env-file "$LAKEHOUSE_DIR/.env"`, plus
+#                          `override.yml` when there is one.
 #   COMPOSE_PROJECT          compose project name (pass -p or set here)
 #   BACKUP_S3_ENDPOINT       backup S3 endpoint (e.g. http://rustfs:9000)
 #   BACKUP_S3_BUCKET         backup bucket name (e.g. lakehouse-backups)
 #   BACKUP_S3_ACCESS_KEY     backup S3 access key
 #   BACKUP_S3_SECRET_KEY     backup S3 secret key
 #   BACKUP_WAREHOUSE_ENDPOINT warehouse S3 endpoint (default: BACKUP_S3_ENDPOINT)
-#   BACKUP_WAREHOUSE_BUCKET  warehouse S3 bucket (default: lakehouse-warehouse)
+#   BACKUP_WAREHOUSE_BUCKET  warehouse bucket name (default: lakehouse-warehouse)
 #   POSTGRES_USER            (default: lakehouse)
 #   POSTGRES_PASSWORD        (default: from env)
 #   APP_PG_DB                (default: lakehouse)
@@ -50,15 +61,21 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
+# The deployment's own directory (REL-2 S4 decision D15). It defaults to
+# this repository's root: a developer who runs the script here gets the
+# same behaviour as before, and an installed host points it at the
+# install's directory.
+LAKEHOUSE_DIR="${LAKEHOUSE_DIR:-${REPO_ROOT}}"
+
 # The alpine image the helper containers run — the same pinned image the
 # stack itself uses (REL-2 S1-T3 pinned every image by digest).
 HELPER_IMAGE="alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc"
 
 # Load .env if present and not already exported
-if [[ -f "${REPO_ROOT}/.env" ]]; then
+if [[ -f "${LAKEHOUSE_DIR}/.env" ]]; then
   set -a
   # shellcheck source=/dev/null
-  . "${REPO_ROOT}/.env"
+  . "${LAKEHOUSE_DIR}/.env"
   set +a
 fi
 
@@ -116,6 +133,19 @@ COMPOSE=(docker compose)
 if [[ -n "${COMPOSE_PROJECT:-}" ]]; then
   COMPOSE=(docker compose -p "${COMPOSE_PROJECT}")
 fi
+# The Compose file of the deployment, named explicitly (REL-2 S4
+# decision D15): the script runs from the deployment's own directory,
+# not from this repository's. The `.env` is named only when it is
+# there — a repository without one is a normal thing, and compose would
+# refuse to start on a file that is not there.
+COMPOSE+=(-f "${LAKEHOUSE_DIR}/docker-compose.yml")
+if [[ -f "${LAKEHOUSE_DIR}/.env" ]]; then
+  COMPOSE+=(--env-file "${LAKEHOUSE_DIR}/.env")
+fi
+# The operator's own override, when there is one (REL-2 decision D5).
+if [[ -f "${LAKEHOUSE_DIR}/override.yml" ]]; then
+  COMPOSE+=(-f "${LAKEHOUSE_DIR}/override.yml")
+fi
 
 resolve_ref() {
   local ref="${1:-}"
@@ -171,8 +201,8 @@ else
 fi
 
 # Detect compose project network
-NETWORK_NAME="${COMPOSE_PROJECT:-$(basename "${REPO_ROOT}")}_default"
-PROJECT_ID="${COMPOSE_PROJECT:-$(basename "${REPO_ROOT}")}"
+NETWORK_NAME="${COMPOSE_PROJECT:-$(basename "${LAKEHOUSE_DIR}")}_default"
+PROJECT_ID="${COMPOSE_PROJECT:-$(basename "${LAKEHOUSE_DIR}")}"
 CONNECTOR_SECRETS_VOLUME="${PROJECT_ID}_lakehouse_connector_secrets"
 CLICKHOUSE_BACKUPS_VOLUME="${PROJECT_ID}_lakehouse_clickhouse_backups"
 
@@ -349,15 +379,34 @@ if [[ -n "${LOCAL_DIR}" ]]; then
     # restore whose `.env` is not the one they were sealed with leaves
     # every connector unreadable. The current `.env` is kept beside the
     # new one, so a restore never destroys the only copy.
-    if [[ -f "${REPO_ROOT}/.env" ]] && ! cmp -s "${LOCAL_DIR}/env" "${REPO_ROOT}/.env"; then
-      cp -p "${REPO_ROOT}/.env" "${REPO_ROOT}/.env.before-restore-${LOCAL_STAMP}"
+    if [[ -f "${LAKEHOUSE_DIR}/.env" ]] && ! cmp -s "${LOCAL_DIR}/env" "${LAKEHOUSE_DIR}/.env"; then
+      cp -p "${LAKEHOUSE_DIR}/.env" "${LAKEHOUSE_DIR}/.env.before-restore-${LOCAL_STAMP}"
       echo "    the previous .env was kept as .env.before-restore-${LOCAL_STAMP}"
     fi
-    cp -p "${LOCAL_DIR}/env" "${REPO_ROOT}/.env"
+    cp -p "${LOCAL_DIR}/env" "${LAKEHOUSE_DIR}/.env"
   else
     echo "==> [Step 4/5] This backup holds no .env — skipping."
   fi
   LOCAL_ENV_DURATION=$(( $(date +%s) - LOCAL_ENV_START ))
+
+  # The release manifest and the install's state: they are part of the
+  # backup set (REL-2 S4 decision D15), so the restore puts back the
+  # release the data came from. The current ones are kept beside the
+  # new ones, so a restore never destroys the only copy.
+  for release_file in release.json state.json; do
+    if [[ -f "${LOCAL_DIR}/${release_file}" ]]; then
+      echo "--> Restoring ${release_file}..."
+      if [[ -f "${LAKEHOUSE_DIR}/${release_file}" ]] \
+         && ! cmp -s "${LOCAL_DIR}/${release_file}" "${LAKEHOUSE_DIR}/${release_file}"; then
+        cp -p "${LAKEHOUSE_DIR}/${release_file}" \
+          "${LAKEHOUSE_DIR}/${release_file}.before-restore-${LOCAL_STAMP}"
+        echo "    the previous ${release_file} was kept as ${release_file}.before-restore-${LOCAL_STAMP}"
+      fi
+      cp -p "${LOCAL_DIR}/${release_file}" "${LAKEHOUSE_DIR}/${release_file}"
+    else
+      echo "--> This backup holds no ${release_file} — skipping."
+    fi
+  done
 
   LOCAL_STACK_DURATION=0
   if [[ "${SKIP_STACK_UP}" != "true" ]]; then
