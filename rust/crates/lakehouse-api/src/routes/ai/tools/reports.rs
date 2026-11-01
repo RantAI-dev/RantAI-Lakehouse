@@ -38,7 +38,6 @@ use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
 use super::arg_str;
-use crate::routes::dashboard_organise::viewer_of;
 use crate::routes::reports::{self, SubscriptionInput, schedule_json, validate_input};
 use crate::state::AppState;
 
@@ -96,7 +95,12 @@ pub(super) async fn run(
     if owner.id != caller.id
         && let Some(board) = board_of(state, name, args).await
     {
-        let seen = store::get_board(&state.clickhouse, &board, &viewer_of(caller)).await;
+        // BI-19 B1 review R1: the approver's resolved viewer, not the baseline.
+        let viewer = match super::viewer_for(state, Some(caller)).await {
+            Ok(viewer) => viewer,
+            Err(error) => return error,
+        };
+        let seen = store::get_board(&state.clickhouse, &board, &viewer).await;
         if !matches!(&seen, Ok(Some(_))) && board != store::DEFAULT_BOARD_ID {
             return json!({ "error": "You cannot see that dashboard, so you cannot approve a report of it." });
         }

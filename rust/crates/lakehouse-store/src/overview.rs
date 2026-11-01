@@ -328,6 +328,39 @@ pub async fn insert_from_fired_rule_with_delivery(
     Ok(Some(row.into()))
 }
 
+/// A delivery of a rule's crossing that is tried again after a failure
+/// (`BI-19` C review SF-2): when `rule_id` already has an open instance whose
+/// delivery failed, `delivery` is recorded on it and `true` is returned, so the
+/// caller adds no second instance for the same crossing. `false` when there is
+/// no such instance.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] on any query failure.
+pub async fn retry_open_undelivered(
+    pool: &PgPool,
+    rule_id: &str,
+    delivery: DeliveryRecord<'_>,
+) -> Result<bool, StoreError> {
+    let (status, reason) = match delivery {
+        DeliveryRecord::Delivered => (DELIVERED, None),
+        DeliveryRecord::NotDelivered(reason) => (NOT_DELIVERED, Some(reason)),
+    };
+    let done = sqlx::query(
+        "UPDATE alert_instance SET delivery_status = $2, delivery_reason = $3 \
+         WHERE id = (SELECT id FROM alert_instance \
+                     WHERE rule_id = $1 AND status = 'open' AND delivery_status = $4 \
+                     ORDER BY fired_at DESC LIMIT 1)",
+    )
+    .bind(rule_id)
+    .bind(status)
+    .bind(reason)
+    .bind(NOT_DELIVERED)
+    .execute(pool)
+    .await?;
+    Ok(done.rows_affected() > 0)
+}
+
 /// `POST /api/overview/alerts/{id}/silence` — sets `silenced_until` and
 /// marks the row `acknowledged` so it stops appearing as `open` without
 /// resolving it (a silence is temporary, a resolve is terminal).

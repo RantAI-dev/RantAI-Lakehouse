@@ -16,7 +16,7 @@ import {
   MAX_FOLDER_DEPTH, buildFolderTree, flattenFolders, folderPath, type FolderLike,
 } from "@/lib/folder-tree";
 import { folderOptionText } from "@/lib/dashboard-organise";
-import { dashboardService } from "@/services";
+import { dashboardService, type MoveEffect } from "@/services";
 import { FolderOptions } from "./folder-options";
 
 /** Select value for "no folder" (base-ui needs a non-empty value). */
@@ -178,6 +178,22 @@ export function MoveBoardDialog({
 
   React.useEffect(() => { if (open) setTarget(currentFolderId || ROOT); }, [open, currentFolderId]);
 
+  // BI-19 part B1 (feature B7): moving changes who sees the dashboard, so the
+  // dialog says who gains and who loses access before the move is confirmed.
+  // If it cannot be worked out nothing is claimed; the move itself is allowed.
+  const destination = target === ROOT ? "" : target;
+  const [effect, setEffect] = React.useState<MoveEffect | null>(null);
+  React.useEffect(() => {
+    setEffect(null);
+    if (!open || destination === currentFolderId) return;
+    const ctl = new AbortController();
+    dashboardService
+      .previewMove(boardId, destination, ctl.signal)
+      .then(setEffect)
+      .catch(() => setEffect(null));
+    return () => ctl.abort();
+  }, [open, boardId, destination, currentFolderId]);
+
   async function move() {
     const done = await moveAct.run(target === ROOT ? "" : target);
     if (done) { onOpenChange(false); onMoved(); }
@@ -198,6 +214,7 @@ export function MoveBoardDialog({
         {flat.length === 0 ? (
           <p className="text-xs text-muted-foreground">No folders yet. Create one with Folders on the dashboard list.</p>
         ) : null}
+        {effect ? <MoveEffectNote effect={effect} /> : null}
         {moveAct.error ? <p className="text-sm text-destructive">{moveAct.error.message}</p> : null}
         <DialogFooter>
           <DialogClose render={<Button variant="ghost" size="sm" />}>Cancel</DialogClose>
@@ -207,5 +224,24 @@ export function MoveBoardDialog({
         </DialogFooter>
       </DialogContent>
     </Dialog>
+  );
+}
+
+/** Who gains and who loses sight of a dashboard when it moves (feature B7). */
+export function MoveEffectNote({ effect }: { readonly effect: MoveEffect }) {
+  const names = (list: MoveEffect["gains"]) => list.map((g) => (g.kind === "role" ? `${g.name} (role)` : g.name)).join(", ");
+  const nothing = effect.gains.length === 0 && effect.loses.length === 0 && !effect.startingPointGains && !effect.startingPointLoses;
+  return (
+    <div role="status" className="space-y-1 rounded-md border border-border bg-muted/20 p-2 text-xs">
+      {nothing ? <p className="text-muted-foreground">Nobody gains or loses access.</p> : null}
+      {effect.gains.length > 0 ? <p>Will gain access: {names(effect.gains)}.</p> : null}
+      {effect.loses.length > 0 ? <p>Will lose access: {names(effect.loses)}.</p> : null}
+      {effect.startingPointLoses ? (
+        <p>This folder shows only the people listed. Everyone who sees dashboards through their role and is not listed will lose access.</p>
+      ) : null}
+      {effect.startingPointGains ? (
+        <p>This dashboard leaves a folder that shows only the people listed. Everyone who sees dashboards through their role will gain access.</p>
+      ) : null}
+    </div>
   );
 }

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, mock } from "bun:test"
-import { chartExportQuery, downloadChartData, downloadDashboardPdf, downloadMenuKind, pdfExportQuery } from "./chart-download"
+import { chartExportQuery, downloadChartData, downloadChartPng, downloadDashboardFile, downloadDashboardPdf, downloadMenuKind, pdfExportQuery } from "./chart-download"
 
 const originalFetch = global.fetch
 afterEach(() => { global.fetch = originalFetch })
@@ -59,5 +59,21 @@ describe("the tile menu's download", () => {
     expect(downloadMenuKind({ own: true, hasRows: false }, true)).toBeNull()
     expect(downloadMenuKind({ own: true, hasRows: true }, false)).toBeNull()
     expect(downloadMenuKind({ own: false, hasRows: true }, false)).toBeNull()
+  })
+})
+
+describe("the picture and the file (BI-19 part D)", () => {
+  it("asks for a chart's PNG with the reads on screen and keeps the server's sentence on a refusal", async () => {
+    const urls = serve(new Response("png", { status: 200, headers: { "content-disposition": 'attachment; filename="Visits-2031-02-03.png"' } }))
+    expect(await downloadChartPng("c1", { filters, params: null, grain: "month" })).toBe("Visits-2031-02-03.png")
+    expect(urls[0]).toBe(`/api/dashboard/chart-export?chart=c1&format=png&filters=${encodeURIComponent(JSON.stringify(filters))}&grain=month`)
+    serve(new Response(JSON.stringify({ error: "Images are not set up on this deployment." }), { status: 503 }))
+    await expect(downloadChartPng("c1", { filters: [] })).rejects.toThrow("Images are not set up on this deployment.")
+  })
+
+  it("asks for one dashboard's file by id", async () => {
+    const urls = serve(new Response("{}", { status: 200, headers: { "content-disposition": 'attachment; filename="Sales.rantai-dashboard.json"' } }))
+    expect(await downloadDashboardFile("b1")).toBe("Sales.rantai-dashboard.json")
+    expect(urls[0]).toBe("/api/dashboard/export?format=file&board=b1")
   })
 })

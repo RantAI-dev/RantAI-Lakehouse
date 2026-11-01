@@ -209,6 +209,7 @@ fn render_token(user: Uuid, board: &str, age: f64, lifetime: f64) -> String {
         &RenderClaims {
             aud: "render".to_owned(),
             board: board.to_owned(),
+            chart: None,
             principal: user.to_string(),
             filters: Some(r#"[{"column":"region","values":["north"]}]"#.to_owned()),
             params: None,
@@ -340,11 +341,10 @@ async fn a_personal_board_prints_for_its_owner_only() {
         None,
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{theirs}");
-    assert!(
-        theirs["charts"].as_array().unwrap().is_empty(),
-        "another person's personal board has no tiles for them: {theirs}"
-    );
+    // BI-19 B1 (PR #250 CI): another person's personal board reads as a board
+    // that does not exist (the same 404 as `GET /api/dashboard`), where it once
+    // printed an empty page. The product is right; the old expectation was not.
+    assert_eq!(status, StatusCode::NOT_FOUND, "{theirs}");
 }
 
 #[tokio::test]
@@ -436,6 +436,7 @@ async fn a_render_token_signed_with_the_embed_secret_is_refused() {
     let claims = lakehouse_embed::RenderClaims {
         aud: "render".to_owned(),
         board: PUBLIC_BOARD.to_owned(),
+        chart: None,
         principal: f.owner.to_string(),
         filters: None,
         params: None,
@@ -491,4 +492,76 @@ async fn a_revoked_permission_or_a_download_switch_inside_the_tokens_life_stops_
         StatusCode::UNAUTHORIZED,
         "dashboard:read taken away"
     );
+}
+
+/// A token for one chart of a board.
+fn chart_token(user: Uuid, board: &str, chart: &str) -> String {
+    let iat = unix_now().floor();
+    sign_render(
+        &RenderClaims {
+            aud: "render".to_owned(),
+            board: board.to_owned(),
+            chart: Some(chart.to_owned()),
+            principal: user.to_string(),
+            filters: None,
+            params: None,
+            grain: None,
+            paper: "image".to_owned(),
+            orientation: "none".to_owned(),
+            exp: iat + 120.0,
+            iat,
+            jti: Uuid::new_v4().to_string(),
+        },
+        SECRET,
+    )
+}
+
+/// BI-19 part D (plan D13): a chart token answers with that chart and nothing
+/// else of the board: the other tile's spec, rows and place are not in it.
+#[tokio::test]
+async fn a_chart_token_gets_that_chart_only() {
+    let f = fixture(Some(SECRET)).await;
+    let (status, body) = post(
+        &f.app,
+        &json!({ "token": chart_token(f.owner, PUBLIC_BOARD, "c_two") }),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let ids: Vec<&str> = body["charts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["c_two"]);
+    assert!(body["results"]["c_two"].is_object(), "{body}");
+    assert!(body["results"].get("c_one").is_none(), "{body}");
+    assert!(body["layout"].get("c_one").is_none(), "{body}");
+    assert_eq!(body["render"]["chart"], "c_two");
+}
+
+/// BI-19 part D: a token that names a chart the board does not hold (another
+/// board's, or none) is refused with the one sentence, and so is a chart on a
+/// personal board of somebody else.
+#[tokio::test]
+async fn a_chart_token_for_another_chart_or_another_persons_board_is_refused() {
+    let f = fixture(Some(SECRET)).await;
+    for token in [
+        chart_token(f.owner, PUBLIC_BOARD, "c_mine"),
+        chart_token(f.owner, PUBLIC_BOARD, "c_nope"),
+        chart_token(f.other, PRIVATE_BOARD, "c_mine"),
+    ] {
+        let (status, body) = post(&f.app, &json!({ "token": token }), None).await;
+        assert_ne!(status, StatusCode::OK, "{body}");
+        assert!(body.get("charts").is_none(), "{body}");
+    }
+    let (status, body) = post(
+        &f.app,
+        &json!({ "token": chart_token(f.owner, PUBLIC_BOARD, "c_mine") }),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(body["error"], "render token is invalid or expired");
 }

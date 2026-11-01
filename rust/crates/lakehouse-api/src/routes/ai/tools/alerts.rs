@@ -39,7 +39,18 @@ use crate::upstream_error;
 /// the JSON body `routes::alerts::create`/`update` parse — [`save_rule`]
 /// itself does the real validation.
 fn parse_input(args: &Map<String, Value>) -> AlertRuleInput {
-    serde_json::from_value(Value::Object(args.clone())).unwrap_or_default()
+    let mut input: AlertRuleInput =
+        serde_json::from_value(Value::Object(args.clone())).unwrap_or_default();
+    // BI-19 part C (planner decision 4, 2026-10-26): chart alerts are not an
+    // assistant tool yet (`AI-11`). This path saves through `save_rule` without
+    // the console route's C3 checks (who may view the chart, the self-only
+    // target, restricted dashboards), so the chart fields are dropped here
+    // rather than honoured; the rule then fails as a plain threshold alert.
+    input.chart = None;
+    input.series = None;
+    input.filters = None;
+    input.condition = None;
+    input
 }
 
 pub(super) async fn list_alert_rules(state: &AppState, principal: Option<&Principal>) -> Value {
@@ -64,14 +75,9 @@ pub(super) async fn create_alert_rule(
     // `SRC-7` D7: the copilot saves through `save_rule` directly, so it must
     // pass the same scope check the HTTP route does; otherwise it would be a
     // way around it.
-    if let Err(err) = crate::routes::alerts::authorise_rule_scope(
-        state,
-        principal,
-        input.kind.as_deref(),
-        input.connector.as_deref(),
-    )
-    .await
-    {
+    // BI-19 B1 review R6 (assistant path): the same create guard, which now also
+    // refuses a digest of a board the caller cannot see or that is restricted.
+    if let Err(err) = crate::routes::alerts::authorise_rule_create(state, principal, &input).await {
         return json!({ "error": err.to_string() });
     }
     // SEC-10: `save_rule` checks the webhook target with the same sender and
@@ -122,7 +128,11 @@ pub(super) async fn delete_alert_rule(
         return json!({ "error": err.to_string() });
     }
     match lakehouse_alerts::delete_rule(&state.clickhouse, &id).await {
-        Ok(()) => json!({ "ok": true }),
+        Ok(()) => {
+            // BI-19 C review SF-7: the same state clean-up as `DELETE /api/alerts`.
+            crate::routes::alerts::forget_state(state, &id).await;
+            json!({ "ok": true })
+        }
         Err(err) => upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json(),
     }
 }
@@ -152,6 +162,10 @@ pub(super) async fn run_alert_rule(state: &AppState, args: &Map<String, Value>) 
         .pg
         .as_deref()
         .map(|pg| crate::routes::alerts::ApiSilenceSource { pg });
+    let state_source = state
+        .pg
+        .as_deref()
+        .map(|pg| crate::routes::alerts::ApiStateSource { pg });
     match lakehouse_alerts::run_rules(
         &state.clickhouse,
         &http,
@@ -163,6 +177,9 @@ pub(super) async fn run_alert_rule(state: &AppState, args: &Map<String, Value>) 
         silence_source
             .as_ref()
             .map(|s| s as &dyn lakehouse_alerts::SilenceSource),
+        state_source
+            .as_ref()
+            .map(|s| s as &dyn lakehouse_alerts::StateSource),
         &crate::routes::alerts::ApiSqlGate {
             pg: state.pg.as_deref(),
             ch: &state.clickhouse,

@@ -38,6 +38,7 @@ use serde_json::{Value, json};
 
 use crate::error::ApiResult;
 use crate::json::ApiJson;
+use crate::routes::dashboard_access::require_entitled;
 use crate::state::AppState;
 use crate::upstream_error;
 
@@ -144,6 +145,29 @@ pub(crate) async fn resolve(
     }
 }
 
+/// [`resolve`] for a source the *caller* names (a body or query field), as the
+/// viewer they read as: a SQL source filed in a folder they cannot see is the
+/// same 404 as an unknown one (`BI-19` B2 re-review S4-b; the SQL text is what a
+/// restricted folder keeps back). A mart has no folder, so it is unchanged. A
+/// field already saved on a source is resolved by the same helper: the caller
+/// still has to see the source to change or remove its fields.
+///
+/// # Errors
+///
+/// As [`resolve`], and 404 for a source the viewer cannot see.
+pub(crate) async fn resolve_visible(
+    state: &AppState,
+    principal: Option<&Extension<Principal>>,
+    mart: Option<&str>,
+    source: Option<&str>,
+) -> Result<Resolved, ApiError> {
+    if let Some(id) = source.map(str::trim).filter(|s| !s.is_empty()) {
+        let viewer = crate::routes::dashboard_access::usage_viewer(state, principal).await?;
+        crate::routes::dashboard_sources::visible_source(&state.clickhouse, &viewer, id).await?;
+    }
+    resolve(&state.clickhouse, mart, source).await
+}
+
 /// The `{ message, position, length }` object a formula mistake is sent as.
 fn problem_json(problem: &FormulaError) -> Value {
     json!({
@@ -153,19 +177,22 @@ fn problem_json(problem: &FormulaError) -> Value {
     })
 }
 
-/// Who is asking, for the personal space: the signed-in caller, or nobody in
-/// particular when no principal is attached.
-pub(crate) fn viewer_or_anonymous(
-    principal: Option<&Extension<Principal>>,
-) -> lakehouse_bi::access::Viewer {
-    // Fail closed: with nobody attached the caller sees no personal space.
-    principal.map_or_else(lakehouse_bi::access::Viewer::anonymous, |Extension(p)| {
-        crate::routes::dashboard_organise::viewer_of(p)
-    })
-}
-
 pub(crate) fn author_name(principal: Option<&Extension<Principal>>) -> String {
     principal.map_or_else(String::new, |Extension(p)| p.display_name.clone())
+}
+
+/// The route's handler: [`list`] behind the entry check of `BI-19` part B1
+/// (plan D8). The router floor is "signed in"; this refuses somebody who holds
+/// neither `dashboard:read` nor a rule naming them or one of their roles. Kept
+/// apart from [`list`] because the assistant calls that one directly, after
+/// its own gate.
+pub async fn list_guarded(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    query: Query<ListQuery>,
+) -> ApiResult<ApiJson<Value>> {
+    require_entitled(&state, &principal).await?;
+    list(State(state), Some(Extension(principal)), query).await
 }
 
 /// `GET /api/dashboard/calc-fields?mart=|source=` — the fields of one source.
@@ -176,6 +203,7 @@ pub(crate) fn author_name(principal: Option<&Extension<Principal>>) -> String {
 /// SQL source, a fixed 422/503 for a database failure.
 pub async fn list(
     State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
     Query(q): Query<ListQuery>,
 ) -> ApiResult<ApiJson<Value>> {
     let ch = &state.clickhouse;
@@ -189,7 +217,14 @@ pub async fn list(
                 .unwrap_or(m.trim())
                 .to_owned(),
         ),
-        (None, Some(s)) if !s.trim().is_empty() => (SourceKind::SqlSource, s.trim().to_owned()),
+        (None, Some(s)) if !s.trim().is_empty() => {
+            // BI-19 B2 re-review S4-b: the id is the caller's, so it is the
+            // unknown-source 404 for a source in a folder they cannot see.
+            let viewer =
+                crate::routes::dashboard_access::usage_viewer(&state, principal.as_ref()).await?;
+            crate::routes::dashboard_sources::visible_source(ch, &viewer, s.trim()).await?;
+            (SourceKind::SqlSource, s.trim().to_owned())
+        }
         _ => {
             return Err(
                 ApiError::BadRequest("choose either a mart or a SQL source.".to_owned()).into(),
@@ -224,10 +259,20 @@ pub async fn functions() -> ApiJson<Value> {
 ///
 /// 400 for a bad body or source; a mistake in the formula itself is a normal
 /// `200` with `ok: false`, because finding it is the route's job.
-pub async fn validate(State(state): State<AppState>, body: Bytes) -> ApiResult<ApiJson<Value>> {
+pub async fn validate(
+    State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
+    body: Bytes,
+) -> ApiResult<ApiJson<Value>> {
     let parsed = parse_body(&body)?;
     let ch = &state.clickhouse;
-    let source = resolve(ch, parsed.mart.as_deref(), parsed.source.as_deref()).await?;
+    let source = resolve_visible(
+        &state,
+        principal.as_ref(),
+        parsed.mart.as_deref(),
+        parsed.source.as_deref(),
+    )
+    .await?;
     if let Some(group) = &parsed.group {
         return Ok(ApiJson(match group.validate(&source.cols) {
             Ok(()) => json!({ "ok": true, "level": groups::LEVEL, "type": "text" }),
@@ -283,7 +328,13 @@ pub async fn create(
 ) -> ApiResult<ApiJson<Value>> {
     let parsed = parse_body(&body)?;
     let ch = &state.clickhouse;
-    let source = resolve(ch, parsed.mart.as_deref(), parsed.source.as_deref()).await?;
+    let source = resolve_visible(
+        &state,
+        principal.as_ref(),
+        parsed.mart.as_deref(),
+        parsed.source.as_deref(),
+    )
+    .await?;
     let time = crate::routes::settings::time_context(&state).await?;
     let time = crate::routes::params::with_defaults(&state.clickhouse, time).await;
     let name = parsed.name.trim().to_owned();
@@ -396,7 +447,8 @@ pub async fn update(
 ) -> ApiResult<ApiJson<Value>> {
     let parsed = parse_body(&body)?;
     let ch = &state.clickhouse;
-    let viewer = viewer_or_anonymous(principal.as_ref());
+    // BI-19 B1 review R3: the resolved viewer, not the baseline.
+    let viewer = crate::routes::dashboard_access::usage_viewer(&state, principal.as_ref()).await?;
     let id = parsed
         .id
         .as_deref()
@@ -409,7 +461,9 @@ pub async fn update(
         .ok_or_else(|| ApiError::NotFound(format!("field '{id}' not found.")))?;
     let source = match current.source_kind {
         SourceKind::Mart => resolve(ch, Some(&current.source_id), None).await?,
-        SourceKind::SqlSource => resolve(ch, None, Some(&current.source_id)).await?,
+        SourceKind::SqlSource => {
+            resolve_visible(&state, principal.as_ref(), None, Some(&current.source_id)).await?
+        }
     };
     let time = crate::routes::settings::time_context(&state).await?;
     let time = crate::routes::params::with_defaults(&state.clickhouse, time).await;
@@ -490,7 +544,8 @@ pub async fn delete(
     Query(q): Query<IdQuery>,
 ) -> ApiResult<ApiJson<Value>> {
     let ch = &state.clickhouse;
-    let viewer = viewer_or_anonymous(principal.as_ref());
+    // BI-19 B1 review R3: the resolved viewer, not the baseline.
+    let viewer = crate::routes::dashboard_access::usage_viewer(&state, principal.as_ref()).await?;
     let id =
         q.id.as_deref()
             .map(str::trim)
@@ -500,6 +555,17 @@ pub async fn delete(
         .await
         .map_err(|failure| classify_ch(&failure))?
         .ok_or_else(|| ApiError::NotFound(format!("field '{id}' not found.")))?;
+    // BI-19 B2 re-review S4-b: a field on a source in a folder the caller cannot
+    // see reads as an unknown field. The fallback below is for a source that was
+    // deleted, which must not swallow this refusal.
+    if current.source_kind == SourceKind::SqlSource
+        && let Some(found) = lakehouse_bi::sources::get_source(ch, &current.source_id)
+            .await
+            .map_err(|failure| classify_ch(&failure))?
+        && !crate::routes::dashboard_sources::source_visible(&viewer, &found)
+    {
+        return Err(ApiError::NotFound(format!("field '{id}' not found.")).into());
+    }
     let source = match current.source_kind {
         SourceKind::Mart => resolve(ch, Some(&current.source_id), None).await,
         SourceKind::SqlSource => resolve(ch, None, Some(&current.source_id)).await,

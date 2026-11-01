@@ -22,6 +22,7 @@ import {
   DropdownMenuRadioItem,
 } from "@/components/ui/dropdown-menu"
 import { cn } from "@/lib/utils"
+import { formatRelativeTime } from "@/lib/format"
 import { pageTitleFor } from "./nav-config"
 import { openCommandPalette } from "@/components/command-palette"
 import { useAuth } from "@/features/auth/auth-provider"
@@ -51,7 +52,22 @@ export function AppNavbar() {
   const hasNotifications =
     notifications.status === "success" &&
     notifications.data.supported &&
-    (notifications.data.openAlerts.length > 0 || notifications.data.pendingApprovals.length > 0)
+    (notifications.data.openAlerts.length > 0 ||
+      notifications.data.pendingApprovals.length > 0 ||
+      notifications.data.unreadMentions.length > 0)
+  // BI-19 part E: unread @mentions in dashboard comments, each a real line the
+  // reader can open. Empty when none, or when the deployment cannot say.
+  const mentions =
+    notifications.status === "success" && notifications.data.supported
+      ? notifications.data.unreadMentions
+      : []
+  const sortedMentions = [...mentions].sort((a, b) => Date.parse(b.at) - Date.parse(a.at))
+  // BI-19 E review E-6b: when the mentions could not be read, say so; an empty
+  // bell would read as "no mentions".
+  const mentionsNote =
+    notifications.status === "success" && notifications.data.supported
+      ? notifications.data.unreadMentionsUnavailable
+      : null
 
   return (
     <header
@@ -134,20 +150,80 @@ export function AppNavbar() {
               <Sparkles className="size-4" />
             </Button>
           )}
-          <Button
-            variant="ghost"
-            size="icon"
-            className="relative size-9 rounded-lg text-muted-foreground hover:bg-muted hover:text-foreground"
-            aria-label="Notifications"
-            render={
-              <Link href="/alerts">
+          {mentions.length > 0 || mentionsNote ? (
+            <DropdownMenu>
+              <DropdownMenuTrigger
+                render={
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="relative size-9 rounded-lg text-muted-foreground hover:bg-muted hover:text-foreground"
+                    aria-label="Notifications"
+                  />
+                }
+              >
                 <Bell className="size-4" />
                 {hasNotifications ? (
                   <span className="absolute right-2 top-2 size-1.5 rounded-full bg-primary ring-2 ring-background" />
                 ) : null}
-              </Link>
-            }
-          />
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="w-80">
+                {/* BI-19 owner QA 2026-10-28, QA-2: a small notification panel, not a bare menu. */}
+                <div className="flex items-center justify-between gap-2 px-2 py-1">
+                  <span className="text-sm font-medium">Notifications</span>
+                  {mentions.length > 0 ? (
+                    <Button
+                      variant="ghost"
+                      size="xs"
+                      className="text-muted-foreground"
+                      onClick={() => {
+                        void notificationsService.markMentionsRead().then(() => notifications.reload()).catch(() => undefined)
+                      }}
+                    >
+                      Mark all as read
+                    </Button>
+                  ) : null}
+                </div>
+                <DropdownMenuSeparator />
+                {sortedMentions.map((m) => (
+                  // QA-3: `?comments=1` opens the Comments dialog on the board.
+                  <DropdownMenuItem
+                    key={m.id}
+                    className="items-start gap-2"
+                    render={<Link href={`/dashboards/${encodeURIComponent(m.board)}?comments=1`} />}
+                  >
+                    <span aria-hidden className="mt-1.5 size-1.5 shrink-0 rounded-full bg-primary" />
+                    <span className="flex min-w-0 flex-col">
+                      <span className="text-sm">{m.title}</span>
+                      <span className="text-xs text-muted-foreground">{formatRelativeTime(m.at)}</span>
+                    </span>
+                  </DropdownMenuItem>
+                ))}
+                {mentionsNote ? (
+                  <p role="status" className="px-2 py-1.5 text-xs text-muted-foreground">
+                    {mentionsNote}
+                  </p>
+                ) : null}
+                <DropdownMenuSeparator />
+                <DropdownMenuItem render={<Link href="/alerts" />}>Alerts and approvals</DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          ) : (
+            <Button
+              variant="ghost"
+              size="icon"
+              className="relative size-9 rounded-lg text-muted-foreground hover:bg-muted hover:text-foreground"
+              aria-label="Notifications"
+              render={
+                <Link href="/alerts">
+                  <Bell className="size-4" />
+                  {hasNotifications ? (
+                    <span className="absolute right-2 top-2 size-1.5 rounded-full bg-primary ring-2 ring-background" />
+                  ) : null}
+                </Link>
+              }
+            />
+          )}
           <UserMenu userName={user?.name} userEmail={user?.email} onLogout={logout} />
         </div>
       </div>

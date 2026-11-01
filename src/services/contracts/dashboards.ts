@@ -145,6 +145,31 @@ export type DashboardService = {
   /** End the link at once. */
   endPublicLink(board: string, signal?: AbortSignal): Promise<void>
   /**
+   * `BI-19` part E: comments on a dashboard. Needs view on it; a dashboard the
+   * caller cannot see answers like one that does not exist. Refusals arrive as
+   * the server's sentence.
+   */
+  listComments(board: string, signal?: AbortSignal): Promise<CommentList>
+  postComment(input: CommentInput, signal?: AbortSignal): Promise<DashboardComment>
+  /** Author only. `mentions` omitted keeps the people already mentioned. */
+  editComment(id: string, body: string, mentions?: string[], signal?: AbortSignal): Promise<DashboardComment>
+  /** Author, or somebody who manages the dashboard. */
+  deleteComment(id: string, signal?: AbortSignal): Promise<void>
+  /** The @ picker: people who can see the dashboard (no addresses). */
+  commentPeople(board: string, query: string, signal?: AbortSignal): Promise<CommentPerson[]>
+  /**
+   * `BI-19` part B: who has what on a dashboard or folder. Needs manage on the
+   * item; anything else arrives as the server's sentence (403 for one the
+   * caller can see and does not manage, 404 for one they cannot see).
+   */
+  getAccess(kind: AccessKind, id: string, signal?: AbortSignal): Promise<ItemAccess>
+  /** Replace the item's rules and its "only the people listed" mark. */
+  saveAccess(input: ItemAccessInput, signal?: AbortSignal): Promise<ItemAccess>
+  /** People and roles for the picker; at most 20 people. */
+  findGrantees(query: string, signal?: AbortSignal): Promise<GranteeMatches>
+  /** Who gains and who loses sight of a dashboard when it moves to `folderId` (`""` = root). */
+  previewMove(board: string, folderId: string, signal?: AbortSignal): Promise<MoveEffect>
+  /**
    * Replace the sites allowed to frame the board's embed pages. The server
    * validates and normalises them; a refusal arrives as `invalid_request`
    * carrying its message. Resolves to the list that was stored. Needs
@@ -330,6 +355,58 @@ export type PublicLinkInput = {
   newLink?: boolean
 }
 
+/** What a person may do with a dashboard or folder (`BI-19` part B, decision B1). */
+export type AccessLevel = "view" | "edit" | "manage"
+export type AccessKind = "board" | "folder"
+
+/** One rule: a level for a person or a role. `email` is only on a person. */
+export type AccessGrantee = {
+  kind: "user" | "role"
+  id: string
+  name: string
+  email?: string
+  /** `| string` widening: a level this console does not know is shown, not dropped. */
+  level: AccessLevel | string
+}
+
+/** A rule that reaches the item from a folder above it. */
+export type InheritedGrantee = AccessGrantee & { folderId: string; folderName: string }
+
+/** `GET /api/dashboard/access`. */
+export type ItemAccess = {
+  kind: AccessKind
+  id: string
+  yourLevel: AccessLevel | string
+  /** Marked "only the people listed" (feature B3). */
+  restricted: boolean
+  rules: AccessGrantee[]
+  inherited: InheritedGrantee[]
+  /** Folders above that are marked: the item is restricted by them. */
+  restrictedAbove: { folderId: string; folderName: string }[]
+}
+
+export type ItemAccessInput = {
+  kind: AccessKind
+  id: string
+  restricted: boolean
+  rules: { userId?: string; roleId?: string; level: AccessLevel }[]
+}
+
+export type GranteeMatches = {
+  people: { id: string; name: string; email: string }[]
+  roles: { id: string; name: string }[]
+}
+
+/** `GET /api/dashboard/access-preview` (feature B7). */
+export type MoveEffect = {
+  gains: { kind: "user" | "role"; id: string; name: string }[]
+  loses: { kind: "user" | "role"; id: string; name: string }[]
+  /** Everyone whose role gives them the dashboard stops seeing it (the destination is restricted). */
+  startingPointLoses: boolean
+  /** Everyone whose role gives them the dashboard starts seeing it (it leaves a restricted folder). */
+  startingPointGains: boolean
+}
+
 export type CreateBoardInput = {
   name: string
   description?: string
@@ -475,3 +552,34 @@ export type ChartLineage = {
   coverage: string[]
   supported: boolean
 }
+
+/** A comment as the server returns it (`BI-19` part E). `body` is plain text. */
+export type DashboardComment = {
+  id: string
+  board: string
+  /** `null` once the author's account is gone. */
+  author: { id: string; name: string } | null
+  body: string
+  createdAt: string
+  editedAt: string | null
+  mentions: { id: string; name: string }[]
+  /** Only the author edits. */
+  canEdit: boolean
+  /** The author, or somebody who manages the dashboard. */
+  canDelete: boolean
+}
+
+/**
+ * The newest comments of a dashboard, oldest first. `truncated` is true when
+ * older ones exist that are not returned (`BI-19` E review E-6c).
+ */
+export type CommentList = { comments: DashboardComment[]; truncated: boolean }
+
+export type CommentInput = {
+  board: string
+  body: string
+  /** User ids; each must be able to see the dashboard or the server refuses. */
+  mentions: string[]
+}
+
+export type CommentPerson = { id: string; name: string }

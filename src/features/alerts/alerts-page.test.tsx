@@ -10,7 +10,7 @@ import {
   isMetricRule,
   seesEveryTenant,
 } from "./alerts-page"
-import { ruleKindLabel, ruleScope } from "./rules-columns"
+import { getRuleColumns, ruleKindLabel, ruleScope } from "./rules-columns"
 
 afterEach(cleanup)
 
@@ -289,5 +289,36 @@ describe("RunAlertsNotice", () => {
       </>
     )
     expect(container.textContent).toBe("")
+  })
+})
+
+// BI-19 owner QA 2026-10-28, QA-9: a chart alert read as "Threshold alert ·
+// sum() on > 1" because the column treated it as a mart rule.
+describe("a chart alert in the rules list (BI-19 QA-9)", () => {
+  const base = {
+    id: "r1", name: "Alert: Pengunjung per bulan", type: "alert", agg: "", op: ">", threshold: 1,
+    channel: "email", target: "a@b.c", enabled: true, chart: "ch1", series: "visitors", condition: "above",
+  } as unknown as AlertRule
+  const cols = getRuleColumns({
+    onEdit: () => {}, onToggle: () => {}, onRun: () => {}, onDelete: () => {}, busy: false, boards: [], connectors: [],
+  })
+  const cell = (id: string, rule: AlertRule) => {
+    const col = cols.find((c) => c.id === id)
+    const render_ = col?.cell as (ctx: unknown) => React.ReactNode
+    return render_({ row: { original: rule } })
+  }
+
+  it("shows the Chart alert badge and the series and condition in words", () => {
+    render(<div>{cell("type", base)}{cell("condition", base)}</div>)
+    expect(screen.getByText("Chart alert")).toBeTruthy()
+    expect(screen.getByText("Dashboard chart · visitors goes above 1")).toBeTruthy()
+  })
+
+  it("words the below and any-rows conditions", () => {
+    render(<div>{cell("condition", { ...base, condition: "below", threshold: 5 })}</div>)
+    expect(screen.getByText("Dashboard chart · visitors goes below 5")).toBeTruthy()
+    cleanup()
+    render(<div>{cell("condition", { ...base, condition: "any_rows", series: undefined })}</div>)
+    expect(screen.getByText("Dashboard chart · returns any rows")).toBeTruthy()
   })
 })

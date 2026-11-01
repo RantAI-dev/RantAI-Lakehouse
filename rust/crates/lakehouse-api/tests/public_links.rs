@@ -56,10 +56,15 @@ impl Respond for FakeCh {
         let boards = self.boards.lock().unwrap().clone();
         let owner_ok = |b: &Value| {
             let owner = b["owner_id"].as_str().unwrap_or_default();
-            // An owner clause names the viewer ("owner_id = ''" for nobody).
+            // An owner clause names the viewer ("owner_id = ''" for nobody). BI-19
+            // B2 (PR #250 CI): a read as the system viewer (the access check
+            // loads the board before judging the caller's level) has no such
+            // clause and sees every board, so the stand-in must not hide the
+            // caller's own personal board from it; the select list names
+            // `owner_id` too, so the test is for the clause, not the column.
             owner.is_empty()
                 || sql.contains(&format!("owner_id = '{owner}'"))
-                || !sql.contains("owner_id")
+                || !sql.contains("owner_id = ''")
         };
         if sql.starts_with("SELECT is_deleted, owner_id FROM console.bi_board") {
             return rows(

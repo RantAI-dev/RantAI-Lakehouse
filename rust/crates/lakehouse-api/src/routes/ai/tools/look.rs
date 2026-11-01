@@ -39,7 +39,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use super::{api_result_to_value, arg_str};
 use crate::routes::dashboard;
-use crate::routes::dashboard_organise::{require_editable_chart, snapshot_as, viewer_of};
+use crate::routes::dashboard_organise::{require_editable_chart, snapshot_as};
 use crate::state::AppState;
 use crate::upstream_error;
 
@@ -322,12 +322,17 @@ fn draws_key(def: &ChartInput, drawn: &[String], key: &str, colour: &str) -> boo
 ///
 /// The tool's answer: a sentence, or the classified database error.
 async fn load_chart_for_edit(
-    ch: &lakehouse_clickhouse::ChClient,
+    state: &AppState,
+    principal: Option<&Principal>,
     id: &str,
-    viewer: &Viewer,
 ) -> Result<store::StoredChartSpec, Value> {
-    match require_editable_chart(ch, id, viewer).await {
-        Ok(_) => {}
+    let ch = &state.clickhouse;
+    // BI-19 B1 review R1: the resolved viewer, not the baseline; B2 review B2-1:
+    // and `edit` on the chart's dashboard.
+    let scope = super::scope_for_write(state, principal).await?;
+    let viewer: Viewer = scope.viewer.clone();
+    match require_editable_chart(ch, id, &viewer).await {
+        Ok(board) => super::require_edit_on(state, &scope, &board).await?,
         Err(crate::routes::dashboard_organise::Gate::Missing(sentence)) => {
             return Err(json!({ "error": sentence }));
         }
@@ -335,7 +340,7 @@ async fn load_chart_for_edit(
             return Err(upstream_error::report_ch(&upstream_error::DATABASE, &cause).to_json());
         }
     }
-    let stored = match store::list_stored_charts(ch, viewer).await {
+    let stored = match store::list_stored_charts(ch, &viewer).await {
         Ok(all) => all.into_iter().find(|c| c.spec.id == id),
         Err(err) => {
             return Err(upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json());
@@ -390,8 +395,9 @@ async fn format_chart(
     if id.is_empty() {
         return json!({ "error": "chart is required (an id from list_charts)." });
     }
-    let viewer: Viewer = principal.map_or_else(Viewer::anonymous, viewer_of);
-    let stored = match load_chart_for_edit(&state.clickhouse, &id, &viewer).await {
+    // BI-19 B1 review R1 and B2 review B2-1: the resolved viewer and `edit` on the
+    // chart's dashboard, in `load_chart_for_edit`.
+    let stored = match load_chart_for_edit(state, principal, &id).await {
         Ok(stored) => stored,
         Err(answer) => return answer,
     };
@@ -446,8 +452,7 @@ async fn set_cache_rule(
         Err(sentence) => return json!({ "error": sentence }),
     };
     if !chart.is_empty() {
-        let viewer = viewer_of(principal);
-        let stored = match load_chart_for_edit(&state.clickhouse, &chart, &viewer).await {
+        let stored = match load_chart_for_edit(state, Some(principal), &chart).await {
             Ok(stored) => stored,
             Err(answer) => return answer,
         };
@@ -531,6 +536,20 @@ mod tests {
 
     use super::*;
     use crate::config::Config;
+
+    /// A signed-in writer: `format_chart` changes a chart as somebody
+    /// (`BI-19` B2 review B2-1), and with nobody attached it changes nothing.
+    fn writer() -> Principal {
+        Principal {
+            id: lakehouse_auth::PrincipalId::User(uuid::Uuid::from_u128(3)),
+            tenant_ids: Vec::new(),
+            display_name: "Rina".to_owned(),
+            permissions: lakehouse_auth::PermissionSet::parse("dashboard:read, dashboard:write"),
+            provider: "session".to_owned(),
+            must_change_password: false,
+            role_names: Vec::new(),
+        }
+    }
 
     /// The state the tool reads through: no Postgres, so the reporting
     /// settings read as their defaults.
@@ -832,8 +851,10 @@ mod tests {
         let purged = engine(vec![json!({ "is_deleted": 1, "board": "b1" })]).await;
         let unknown = engine(Vec::new()).await;
         let call = args(json!({ "chart": "c1", "colors": { "palette": "muted" } }));
-        let purged_reply = Box::pin(format_chart(&state_for(&purged), None, &call)).await;
-        let unknown_reply = Box::pin(format_chart(&state_for(&unknown), None, &call)).await;
+        let purged_reply =
+            Box::pin(format_chart(&state_for(&purged), Some(&writer()), &call)).await;
+        let unknown_reply =
+            Box::pin(format_chart(&state_for(&unknown), Some(&writer()), &call)).await;
         assert_eq!(
             purged_reply, unknown_reply,
             "a purged chart and a chart that never existed answer the same"
@@ -1046,7 +1067,7 @@ mod tests {
         )])
         .await;
         let call = args(json!({ "chart": "c1", "colors": { "series": { "Total": "#00aa00" } } }));
-        let reply = Box::pin(format_chart(&state_for(&server), None, &call)).await;
+        let reply = Box::pin(format_chart(&state_for(&server), Some(&writer()), &call)).await;
         assert_eq!(
             reply["error"],
             json!(
