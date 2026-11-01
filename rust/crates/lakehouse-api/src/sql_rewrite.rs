@@ -877,7 +877,7 @@ use std::collections::HashMap;
 use sqlparser::ast::{
     BinaryOperator, CastKind, DataType, Expr, Function, FunctionArg, FunctionArgExpr,
     FunctionArgumentList, FunctionArguments, Ident as SqlIdent, ObjectName, ObjectNamePart,
-    SelectItem, SetExpr, Statement, TableAlias, UnaryOperator, Value, ValueWithSpan,
+    SelectItem, SetExpr, Statement, TableAlias, TableVersion, UnaryOperator, Value, ValueWithSpan,
 };
 
 /// The engine a statement is written for.
@@ -917,6 +917,340 @@ impl Engine {
             Self::ClickHouse
         }
     }
+}
+
+/// `Trino`'s SQL dialect: `GenericDialect` with table versioning on.
+///
+/// `DATA-21` D2: `sqlparser` reads a table version (`VERSION AS OF 12`)
+/// only in a dialect whose `supports_table_versioning()` is true, and
+/// `GenericDialect`'s is not — so `Trino`'s own past-version clause
+/// could not be parsed at all. This newtype is `GenericDialect` in
+/// every other respect: every method it does not override below is the
+/// one `GenericDialect` uses, and [`Dialect::dialect`] answers
+/// `GenericDialect`'s own type id, so `sqlparser`'s own
+/// `dialect_of!(.. is GenericDialect)` checks keep answering what they
+/// answer today.
+///
+/// The one other override is the identifier quote: `Trino` quotes an
+/// identifier with `"`, and `GenericDialect` names none.
+///
+/// The delegation below is mechanical, and it is complete for
+/// `sqlparser` 0.63: a later `sqlparser` that gives `GenericDialect` a
+/// new override needs that name added here, or this dialect keeps the
+/// trait's default for it — the one thing a reader of this file has to
+/// check when the crate is upgraded.
+#[allow(
+    dead_code,
+    reason = "only the module's own tests read it until DATA-21 S1-T3 wires the \
+              route to it; the library target keeps it reachable"
+)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TrinoDialect {
+    inner: sqlparser::dialect::GenericDialect,
+}
+
+/// Writes the [`Dialect`] methods that only answer `true` or `false`
+/// and delegate to the wrapped [`sqlparser::dialect::GenericDialect`].
+macro_rules! delegate_to_generic {
+    ($($method:ident),* $(,)?) => {
+        $(
+            fn $method(&self) -> bool {
+                self.inner.$method()
+            }
+        )*
+    };
+}
+
+/// The same, for the methods that take the character they are asked
+/// about.
+macro_rules! delegate_char_to_generic {
+    ($($method:ident),* $(,)?) => {
+        $(
+            fn $method(&self, ch: char) -> bool {
+                self.inner.$method(ch)
+            }
+        )*
+    };
+}
+
+impl Dialect for TrinoDialect {
+    /// `GenericDialect`'s own type id, so `sqlparser`'s dialect checks
+    /// (`dialect_of!(.. is GenericDialect)`) answer exactly what they
+    /// answer for a `GenericDialect`.
+    fn dialect(&self) -> std::any::TypeId {
+        std::any::TypeId::of::<sqlparser::dialect::GenericDialect>()
+    }
+
+    /// The one thing `DATA-21` D2 needs: a table version is read.
+    fn supports_table_versioning(&self) -> bool {
+        true
+    }
+
+    /// `Trino` quotes an identifier with `"`.
+    fn identifier_quote_style(&self, _identifier: &str) -> Option<char> {
+        Some('"')
+    }
+
+    delegate_char_to_generic!(
+        is_delimited_identifier_start,
+        is_identifier_start,
+        is_identifier_part,
+    );
+
+    delegate_to_generic!(
+        supports_unicode_string_literal,
+        supports_partition_by_after_order_by,
+        supports_array_join_syntax,
+        supports_group_by_expr,
+        supports_group_by_with_modifier,
+        supports_left_associative_joins_without_parens,
+        supports_connect_by,
+        supports_match_recognize,
+        supports_pipe_operator,
+        supports_start_transaction_modifier,
+        supports_window_function_null_treatment_arg,
+        supports_dictionary_syntax,
+        supports_window_clause_named_window_reference,
+        supports_parenthesized_set_variables,
+        supports_select_wildcard_except,
+        support_map_literal_syntax,
+        allow_extract_custom,
+        allow_extract_single_quotes,
+        supports_extract_comma_syntax,
+        supports_create_view_comment_syntax,
+        supports_parens_around_table_factor,
+        supports_values_as_table_factor,
+        supports_create_index_with_clause,
+        supports_explain_with_utility_options,
+        supports_exclude_constraint,
+        supports_limit_comma,
+        supports_update_order_by,
+        supports_from_first_select,
+        supports_projection_trailing_commas,
+        supports_asc_desc_in_column_definition,
+        supports_try_convert,
+        supports_bitwise_shift_operators,
+        supports_comment_on,
+        supports_load_extension,
+        supports_named_fn_args_with_assignment_operator,
+        supports_struct_literal,
+        supports_empty_projections,
+        supports_nested_comments,
+        supports_multiline_comment_hints,
+        supports_user_host_grantee,
+        supports_string_escape_constant,
+        supports_array_typedef_with_brackets,
+        supports_match_against,
+        supports_set_names,
+        supports_comma_separated_set_assignments,
+        supports_filter_during_aggregation,
+        supports_select_wildcard_exclude,
+        supports_data_type_signed_suffix,
+        supports_interval_options,
+        supports_quote_delimited_string,
+        supports_select_wildcard_replace,
+        supports_select_wildcard_ilike,
+        supports_select_wildcard_rename,
+        supports_optimize_table,
+        supports_install,
+        supports_detach,
+        supports_prewhere,
+        supports_with_fill,
+        supports_limit_by,
+        supports_interpolate,
+        supports_settings,
+        supports_select_format,
+        supports_comment_optimizer_hint,
+        supports_constraint_keyword_without_name,
+        supports_key_column_option,
+        supports_comma_separated_trim,
+        supports_cte_without_as,
+        supports_select_item_multi_column_alias,
+        supports_xml_expressions,
+        supports_aliased_function_args,
+    );
+}
+
+/// One past-version clause found in a statement.
+struct PastVersionClause {
+    /// The byte range of the `FOR` word in front of the clause, when
+    /// the statement wrote `Trino`'s own form.
+    for_range: Option<(usize, usize)>,
+    /// The byte offset where the clause's `VERSION` word starts.
+    version_start: usize,
+    /// The clause's own text — the version id.
+    id: String,
+}
+
+impl PastVersionClause {
+    /// Whether the clause names a version id — a plain integer, the only
+    /// thing `DATA-21` D2 accepts.
+    fn is_version_id(&self) -> bool {
+        !self.id.is_empty() && self.id.chars().all(|c| c.is_ascii_digit())
+    }
+}
+
+/// The statement as `sqlparser` reads it: `Trino`'s `FOR VERSION AS OF
+/// <id>` becomes the `VERSION AS OF <id>` form `sqlparser` parses
+/// (`DATA-21` D2).
+///
+/// The pass is a TOKEN pass, not a text search: the same words inside a
+/// string literal, a quoted identifier or a comment are not a clause.
+/// Only an integer version id is accepted — a clause that names
+/// anything else is refused here, before the statement is parsed.
+///
+/// # Errors
+/// [`RewriteError::InvalidPastVersion`] when a past-version clause does
+/// not name a version id.
+#[allow(
+    dead_code,
+    reason = "only the module's own tests read it until DATA-21 S1-T3 wires the \
+              route to it; the library target keeps it reachable"
+)]
+pub fn normalize_past_version_clause(sql: &str) -> Result<String, RewriteError> {
+    let clauses = past_version_clauses(sql);
+    if clauses.is_empty() {
+        return Ok(sql.to_owned());
+    }
+    if clauses.iter().any(|clause| !clause.is_version_id()) {
+        return Err(RewriteError::InvalidPastVersion);
+    }
+    let mut out = sql.to_owned();
+    // The clauses are removed from the last one backwards, so the
+    // offsets of the ones before it stay valid.
+    for clause in clauses.iter().rev() {
+        if let Some((for_start, _)) = clause.for_range {
+            // The `FOR` word and the space after it: what is left is
+            // the `VERSION AS OF <id>` the parser reads.
+            out.replace_range(for_start..clause.version_start, "");
+        }
+    }
+    Ok(out)
+}
+
+/// The statement as `Trino` reads it: the `VERSION AS OF <id>` form
+/// `sqlparser` prints becomes `FOR VERSION AS OF <id>` again
+/// (`DATA-21` D2).
+///
+/// A clause that does not name a version id is left alone — it never
+/// came from a version this module accepted, and `Trino` will say so.
+#[must_use]
+#[allow(
+    dead_code,
+    reason = "only the module's own tests read it until DATA-21 S1-T3 wires the \
+              route to it; the library target keeps it reachable"
+)]
+pub fn denormalize_past_version_clause(sql: &str) -> String {
+    let clauses = past_version_clauses(sql);
+    if clauses.is_empty() {
+        return sql.to_owned();
+    }
+    let mut out = sql.to_owned();
+    // The clauses are rewritten from the last one backwards, so the
+    // offsets of the ones before it stay valid.
+    for clause in clauses.iter().rev() {
+        if clause.for_range.is_none() && clause.is_version_id() {
+            out.insert_str(clause.version_start, "FOR ");
+        }
+    }
+    out
+}
+
+/// Every `VERSION AS OF <id>` run in `sql`, with the `FOR` word in front
+/// of it when the statement wrote `Trino`'s own form.
+///
+/// A tokenizer failure answers with no clause at all: the statement then
+/// does not parse either, and is refused further up — never guessed at.
+fn past_version_clauses(sql: &str) -> Vec<PastVersionClause> {
+    use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer};
+
+    let Ok(tokens) =
+        Tokenizer::new(&sqlparser::dialect::GenericDialect {}, sql).tokenize_with_location()
+    else {
+        return Vec::new();
+    };
+    // Whitespace carries no meaning between the words; every other
+    // token (a comment, a comma) breaks a run of keywords.
+    let significant: Vec<&TokenWithSpan> = tokens
+        .iter()
+        .filter(|token| !matches!(token.token, Token::Whitespace(_)))
+        .collect();
+    let mut out = Vec::new();
+    for (index, token) in significant.iter().enumerate() {
+        if keyword_word(token).as_deref() != Some("VERSION") {
+            continue;
+        }
+        let Some(as_token) = significant.get(index + 1) else {
+            continue;
+        };
+        if keyword_word(as_token).as_deref() != Some("AS") {
+            continue;
+        }
+        let Some(of_token) = significant.get(index + 2) else {
+            continue;
+        };
+        if keyword_word(of_token).as_deref() != Some("OF") {
+            continue;
+        }
+        let Some(id_token) = significant.get(index + 3) else {
+            continue;
+        };
+        let Token::Number(id, _) = &id_token.token else {
+            continue;
+        };
+        let Some(version_start) = byte_offset_of(sql, &token.span.start) else {
+            continue;
+        };
+        let for_range = index.checked_sub(1).and_then(|before| {
+            let word = keyword_word(significant[before])?;
+            if word != "FOR" {
+                return None;
+            }
+            let start = byte_offset_of(sql, &significant[before].span.start)?;
+            let end = byte_offset_of(sql, &significant[before].span.end)?;
+            Some((start, end))
+        });
+        out.push(PastVersionClause {
+            for_range,
+            version_start,
+            id: id.clone(),
+        });
+    }
+    out
+}
+
+/// The upper-cased text of a keyword token — `None` for anything that
+/// is not an unquoted word, so a quoted identifier never reads as a
+/// keyword.
+fn keyword_word(token: &sqlparser::tokenizer::TokenWithSpan) -> Option<String> {
+    match &token.token {
+        sqlparser::tokenizer::Token::Word(word) if word.quote_style.is_none() => {
+            Some(word.value.to_ascii_uppercase())
+        }
+        _ => None,
+    }
+}
+
+/// The byte offset of a `sqlparser` [`sqlparser::tokenizer::Location`] —
+/// a line and a column, the column counted in characters from the line's
+/// start — in `sql`. `None` when the location is not in `sql` at all.
+fn byte_offset_of(sql: &str, location: &sqlparser::tokenizer::Location) -> Option<usize> {
+    let mut line_start = 0usize;
+    for _ in 1..location.line {
+        let newline = sql.get(line_start..)?.find('\n')?;
+        line_start += newline + 1;
+    }
+    let line = sql.get(line_start..)?;
+    let line = &line[..line.find('\n').unwrap_or(line.len())];
+    let column = usize::try_from(location.column.checked_sub(1)?).ok()?;
+    let mut offset = line_start;
+    for (index, ch) in line.chars().enumerate() {
+        if index == column {
+            return Some(offset);
+        }
+        offset += ch.len_utf8();
+    }
+    (column == line.chars().count()).then_some(offset)
 }
 
 /// Reasons this module refuses to rewrite a statement. Every variant is
@@ -981,6 +1315,12 @@ pub enum RewriteError {
         /// The view's own canonical `"schema.table"` name.
         view: String,
     },
+    /// A past-version clause that does not name a version id —
+    /// `DATA-21` D2: only an integer snapshot id is accepted. `Trino`'s
+    /// own `FOR TIMESTAMP AS OF` names no id at all, and no engine has a
+    /// timestamp form.
+    #[error("a past version is selected by its version id")]
+    InvalidPastVersion,
 }
 
 /// Real column list + obligations for one governed table.
@@ -1578,7 +1918,11 @@ fn substitute_table_factor(
 ) -> Result<(), RewriteError> {
     match factor {
         TableFactor::Table {
-            name, alias, args, ..
+            name,
+            alias,
+            args,
+            version,
+            ..
         } if args.is_none() => {
             let parts: Vec<String> = name
                 .0
@@ -1588,6 +1932,15 @@ fn substitute_table_factor(
                 .collect();
             let canonical = canonicalize(&parts);
             let Some(obl) = obligations.get(&canonical) else {
+                // `DATA-21` D3: a table that is NOT governed keeps its
+                // own version, but `sqlparser` prints a version AFTER
+                // the alias and `Trino` reads it BEFORE — so a table
+                // that carries both becomes a derived table.
+                if engine == Engine::Trino
+                    && let (Some(alias), Some(version)) = (alias.clone(), version.clone())
+                {
+                    *factor = table_with_version_as_derived(name, &version, alias)?;
+                }
                 return Ok(());
             };
             let real_columns =
@@ -1603,6 +1956,7 @@ fn substitute_table_factor(
                 obl.row_filter.as_deref(),
                 placeholders,
                 engine,
+                version.as_ref(),
             )?;
             let derived_stmts = Parser::parse_sql(dialect, &derived_sql).map_err(|_| {
                 RewriteError::UnprovableSubstitution {
@@ -1709,6 +2063,12 @@ fn substitute_table_factor(
 /// the identifiers are double-quoted and a masked column becomes
 /// `CASE WHEN "c" IS NULL THEN NULL ELSE '***' END AS "c"` — the same
 /// meaning as `ClickHouse`'s form, where `toString(NULL)` stays `NULL`.
+///
+/// `version` is the table's own past-version clause (`DATA-21` D3): it
+/// stays on the derived table's `FROM`, so the derived table reads the
+/// version the caller asked for. `ClickHouse` never has one — its
+/// dialect reads no table version, and its past version is a query-wide
+/// setting instead.
 fn build_masked_filtered_select(
     name: &ObjectName,
     real_columns: &[String],
@@ -1716,7 +2076,12 @@ fn build_masked_filtered_select(
     filter: Option<&str>,
     placeholders: &PlaceholderValues,
     engine: Engine,
+    version: Option<&TableVersion>,
 ) -> Result<String, RewriteError> {
+    let version_clause = match version {
+        Some(version) => format!(" {}", past_version_clause(version)?),
+        None => String::new(),
+    };
     let mut projections = Vec::with_capacity(real_columns.len());
     for col in real_columns {
         let safe = lakehouse_core::ident::Ident::new(col).map_err(|_| {
@@ -1759,9 +2124,75 @@ fn build_masked_filtered_select(
         None => String::new(),
     };
     Ok(format!(
-        "SELECT {} FROM {name}{where_clause}",
+        "SELECT {} FROM {name}{version_clause}{where_clause}",
         projections.join(", ")
     ))
+}
+
+/// The past-version clause of a table factor, in the form `sqlparser`
+/// parses it (`DATA-21` D2/D3): `VERSION AS OF <id>`.
+///
+/// Only a version id — a plain integer — is accepted. `Trino`'s own
+/// `FOR TIMESTAMP AS OF` names no id at all, and no engine has a
+/// timestamp form, so it is refused rather than passed on.
+///
+/// # Errors
+/// [`RewriteError::InvalidPastVersion`] when the clause does not name a
+/// version id.
+fn past_version_clause(version: &TableVersion) -> Result<String, RewriteError> {
+    let TableVersion::VersionAsOf(expr) = version else {
+        return Err(RewriteError::InvalidPastVersion);
+    };
+    let Expr::Value(ValueWithSpan {
+        value: Value::Number(id, false),
+        ..
+    }) = expr
+    else {
+        return Err(RewriteError::InvalidPastVersion);
+    };
+    if id.is_empty() || !id.chars().all(|c| c.is_ascii_digit()) {
+        return Err(RewriteError::InvalidPastVersion);
+    }
+    Ok(format!("VERSION AS OF {id}"))
+}
+
+/// A table that carries BOTH a past version and an alias, as a derived
+/// table: `(SELECT * FROM t VERSION AS OF 5) AS x`.
+///
+/// `DATA-21` D2/D3: `sqlparser` prints a table's version AFTER its
+/// alias (`FROM t AS x VERSION AS OF 5`), and `Trino` reads the version
+/// BEFORE the alias — so a table with both is printed as a derived
+/// table, which puts the version where `Trino` reads it. A governed
+/// table needs no such care: its own derived table carries the version
+/// and the alias separately.
+///
+/// # Errors
+/// [`RewriteError::UnprovableSubstitution`] when the derived table does
+/// not parse, and [`RewriteError::InvalidPastVersion`] when the version
+/// does not name a version id.
+fn table_with_version_as_derived(
+    name: &ObjectName,
+    version: &TableVersion,
+    alias: TableAlias,
+) -> Result<TableFactor, RewriteError> {
+    let clause = past_version_clause(version)?;
+    let sql = format!("SELECT * FROM {name} {clause}");
+    let statements = Parser::parse_sql(&TrinoDialect::default(), &sql).map_err(|_| {
+        RewriteError::UnprovableSubstitution {
+            table: name.to_string(),
+        }
+    })?;
+    let Some(Statement::Query(query)) = statements.into_iter().next() else {
+        return Err(RewriteError::UnprovableSubstitution {
+            table: name.to_string(),
+        });
+    };
+    Ok(TableFactor::Derived {
+        lateral: false,
+        subquery: query,
+        alias: Some(alias),
+        sample: None,
+    })
 }
 
 /// Parses `raw` as a standalone `Expr` (via `GenericDialect`, wrapping
@@ -2789,6 +3220,139 @@ mod table_substitution {
     }
 }
 
+/// `DATA-21` D2/D3: `Trino`'s own past-version clause, and the version a
+/// governed read keeps.
+#[cfg(test)]
+mod trino_past_version {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::collections::HashMap;
+
+    use super::{
+        Engine, PlaceholderValues, RewriteError, TableObligations, TrinoDialect,
+        denormalize_past_version_clause, normalize_past_version_clause, substitute_governed_tables,
+    };
+
+    fn obligations() -> HashMap<String, TableObligations> {
+        HashMap::from([(
+            "silver.customers".to_owned(),
+            TableObligations {
+                mask: vec!["email".to_owned()],
+                row_filter: Some("tenant_id = 'tenant-a'".to_owned()),
+                real_columns: Some(vec![
+                    "id".to_owned(),
+                    "email".to_owned(),
+                    "tenant_id".to_owned(),
+                ]),
+            },
+        )])
+    }
+
+    #[test]
+    fn a_past_version_clause_round_trips() {
+        let sql = "SELECT * FROM iceberg.bronze.orders FOR VERSION AS OF 123";
+        let parsed = normalize_past_version_clause(sql).expect("a version id is accepted");
+        assert_eq!(
+            parsed,
+            "SELECT * FROM iceberg.bronze.orders VERSION AS OF 123"
+        );
+        assert_eq!(denormalize_past_version_clause(&parsed), sql);
+    }
+
+    /// `FOR TIMESTAMP AS OF` is refused on `Trino` — no engine has a
+    /// timestamp form — so the pass leaves it alone and the statement
+    /// does not parse.
+    #[test]
+    fn a_timestamp_past_version_clause_is_left_alone() {
+        let sql = "SELECT * FROM t FOR TIMESTAMP AS OF TIMESTAMP '2020-01-01 00:00:00 UTC'";
+        assert_eq!(
+            normalize_past_version_clause(sql).expect("no version id, no refusal"),
+            sql
+        );
+        assert_eq!(denormalize_past_version_clause(sql), sql);
+    }
+
+    #[test]
+    fn the_words_of_a_clause_inside_a_literal_are_not_a_clause() {
+        let sql = "SELECT 'FOR VERSION AS OF 1' AS s FROM t";
+        assert_eq!(
+            normalize_past_version_clause(sql).expect("no clause, no change"),
+            sql
+        );
+    }
+
+    /// Only an integer version id is accepted (`DATA-21` D2).
+    #[test]
+    fn a_version_that_is_not_an_id_is_refused() {
+        let err = normalize_past_version_clause("SELECT * FROM t FOR VERSION AS OF 1.5")
+            .expect_err("a version id is an integer");
+        assert!(matches!(err, RewriteError::InvalidPastVersion));
+    }
+
+    /// `DATA-21` D6: the policy still holds at a past version — the
+    /// derived table keeps the version AND the mask and the row filter.
+    #[test]
+    fn a_masked_table_at_a_past_version_keeps_both_the_version_and_the_mask() {
+        let out = substitute_governed_tables(
+            &normalize_past_version_clause("SELECT * FROM silver.customers FOR VERSION AS OF 5")
+                .expect("a version id is accepted"),
+            &TrinoDialect::default(),
+            Engine::Trino,
+            &obligations(),
+            &PlaceholderValues::none(),
+        )
+        .unwrap();
+        assert!(out.contains("VERSION AS OF 5"), "{out}");
+        assert!(
+            out.contains("CASE WHEN \"email\" IS NULL THEN NULL ELSE '***' END AS \"email\""),
+            "{out}"
+        );
+        assert!(out.contains("WHERE tenant_id = 'tenant-a'"), "{out}");
+        // The engine reads `Trino`'s own form again.
+        assert!(
+            denormalize_past_version_clause(&out).contains("FOR VERSION AS OF 5"),
+            "{out}"
+        );
+    }
+
+    /// A table that is not governed keeps its own version — and, with an
+    /// alias, becomes a derived table, because `sqlparser` prints a
+    /// version after the alias and `Trino` reads it before.
+    #[test]
+    fn an_ungoverned_table_at_a_past_version_keeps_its_version() {
+        let out = substitute_governed_tables(
+            &normalize_past_version_clause("SELECT * FROM silver.plain FOR VERSION AS OF 5")
+                .expect("a version id is accepted"),
+            &TrinoDialect::default(),
+            Engine::Trino,
+            &obligations(),
+            &PlaceholderValues::none(),
+        )
+        .unwrap();
+        assert!(out.contains("VERSION AS OF 5"), "{out}");
+        assert!(!out.contains("silver.plain AS"), "{out}");
+    }
+
+    #[test]
+    fn a_table_with_a_version_and_an_alias_becomes_a_derived_table() {
+        let out = substitute_governed_tables(
+            &normalize_past_version_clause(
+                "SELECT c.id FROM silver.plain FOR VERSION AS OF 5 AS c",
+            )
+            .expect("a version id is accepted"),
+            &TrinoDialect::default(),
+            Engine::Trino,
+            &obligations(),
+            &PlaceholderValues::none(),
+        )
+        .unwrap();
+        assert!(
+            out.contains("(SELECT * FROM silver.plain VERSION AS OF 5) AS c"),
+            "{out}"
+        );
+    }
+}
+
 /// `DATA-21` D1: the same obligations, written in `Trino`'s SQL.
 ///
 /// Every test here is the TWIN of a test in
@@ -3143,6 +3707,7 @@ mod row_filter {
             Some(raw),
             &PlaceholderValues::none(),
             Engine::ClickHouse,
+            None,
         );
         assert!(matches!(built, Err(RewriteError::InvalidRowFilter { .. })));
     }
@@ -3198,6 +3763,7 @@ mod row_filter {
             Some(raw),
             &PlaceholderValues::none(),
             Engine::ClickHouse,
+            None,
         );
         assert!(matches!(built, Err(RewriteError::InvalidRowFilter { .. })));
     }
@@ -3310,6 +3876,7 @@ mod row_filter {
             None,
             &PlaceholderValues::none(),
             Engine::ClickHouse,
+            None,
         )
         .unwrap();
         assert_eq!(sql, "SELECT `x`, `y` FROM t");
@@ -3485,6 +4052,7 @@ mod row_filter {
                 Some(raw),
                 &PlaceholderValues::none(),
                 Engine::ClickHouse,
+                None,
             );
             assert!(
                 matches!(built, Err(RewriteError::InvalidRowFilter { .. })),

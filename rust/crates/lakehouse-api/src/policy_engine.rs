@@ -179,6 +179,9 @@ pub fn refusal_message(err: &sql_rewrite::RewriteError) -> &'static str {
         sql_rewrite::RewriteError::ViewOverGovernedTable { .. } => {
             "Query membaca view yang menyingkap tabel yang diatur kebijakan; tidak didukung."
         }
+        sql_rewrite::RewriteError::InvalidPastVersion => {
+            "Versi lampau dipilih dengan id versinya, bukan dengan timestamp."
+        }
     }
 }
 
