@@ -138,6 +138,17 @@ pub fn compose_args(dir: &Path, env_file: &Path) -> Vec<String> {
     args
 }
 
+/// Every profile of the deployment.
+///
+/// A service of a profile the deployment does not run is not named by
+/// `compose config --services` — and `compose stop` refuses a service
+/// it does not know ("no such service"). The Dagster services are in
+/// the `dagster` profile, so the writers of that profile are asked
+/// for BY NAME and compose has to know them (REL-2 S4 decision D17).
+fn all_profiles() -> Vec<String> {
+    vec!["--profile".to_string(), "*".to_string()]
+}
+
 /// The services the install's Compose file names.
 ///
 /// Every profile is asked for: the writers of the `dagster` profile are
@@ -149,8 +160,7 @@ pub fn compose_args(dir: &Path, env_file: &Path) -> Vec<String> {
 /// Returns the message that says what to fix when Compose fails.
 pub fn compose_services(dir: &Path, env_file: &Path) -> Result<Vec<String>, String> {
     let mut args = compose_args(dir, env_file);
-    args.push("--profile".to_string());
-    args.push("*".to_string());
+    args.extend(all_profiles());
     args.push("config".to_string());
     args.push("--services".to_string());
     let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -178,6 +188,7 @@ pub fn compose_stop(dir: &Path, env_file: &Path, services: &[String]) -> Result<
         return Ok(());
     }
     let mut args = compose_args(dir, env_file);
+    args.extend(all_profiles());
     args.push("stop".to_string());
     for service in services {
         args.push(service.clone());
@@ -199,6 +210,7 @@ pub fn compose_stop(dir: &Path, env_file: &Path, services: &[String]) -> Result<
 /// Returns the message that says what to fix when Compose fails.
 pub fn compose_stop_all(dir: &Path, env_file: &Path) -> Result<(), String> {
     let mut args = compose_args(dir, env_file);
+    args.extend(all_profiles());
     args.push("stop".to_string());
     let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
     sys::output_or_stderr("docker", &borrowed)

@@ -99,6 +99,8 @@ pub struct Facts {
 /// Returns the error that stopped the update. A failure from step 6 on
 /// is reported WITH what the rollback did (REL-2 S4 decision D17).
 pub fn command(args: &UpdateArgs) -> Result<(), ToolError> {
+    preflight::validate_ignored(&args.ignore_preflight).map_err(ToolError::Usage)?;
+
     // Step 1 — the release is obtained and verified, as the install does.
     let release = release::obtain(
         args.bundle.as_deref(),
@@ -227,8 +229,12 @@ fn preflight_failures(args: &UpdateArgs, compose: &str) -> Vec<preflight::Failur
         "lakehousectl: the ports check was skipped: the stack is running, and it holds its own \
          ports."
     );
+    let mut ignored = vec!["ports".to_string()];
+    for skipped in &args.ignore_preflight {
+        println!("lakehousectl: the {skipped} check was skipped, as asked.");
+        ignored.push(skipped.clone());
+    }
     let facts = preflight::collect(compose, &args.dir);
-    let ignored = vec!["ports".to_string()];
     preflight::run(&facts, &ignored, args.bundle.is_some())
 }
 

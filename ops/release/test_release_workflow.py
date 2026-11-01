@@ -79,6 +79,7 @@ from __future__ import annotations
 
 import fnmatch
 import re
+import sys
 import unittest
 from pathlib import Path
 from typing import Any
@@ -87,6 +88,13 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "release.yml"
+
+# The rules of the update proof live in a module of their own, so they
+# can be tested with no Docker and no network (REL-2 S4 decision D21).
+RELEASE_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(RELEASE_DIR))
+
+import update_proof  # noqa: E402  (the path is set above)
 
 # The toolchain pin: `rustup` reads it from inside `rust/`.
 TOOLCHAIN_PATH = REPO_ROOT / "rust" / "rust-toolchain.toml"
@@ -1418,6 +1426,262 @@ class ReleaseWorkflowTest(unittest.TestCase):
         """The registry the job starts is the registry the job pushes to."""
         env = self.document["jobs"]["dry-run"].get("env") or {}
         self.assertEqual(env.get("RELEASE_REGISTRY"), DRY_RUN_REGISTRY)
+
+
+
+class UpdateProofTest(unittest.TestCase):
+    """The update proof: the job, and the rules it runs on.
+
+    REL-2 S4 decision D21. The proof installs the dry run's bundle A,
+    seeds three markers, updates to a bundle B whose API image is
+    REBUILT with a bumped version, and updates to a bundle C whose API
+    image never becomes ready: that update must fail and roll itself
+    back, and every marker must still be there.
+    """
+
+    def setUp(self) -> None:
+        self.document = load_workflow()
+
+    # ── The job ───────────────────────────────────────────────────────
+
+    def test_the_update_proof_needs_the_dry_run(self) -> None:
+        """The proof installs what the dry run built."""
+        self.assertEqual(self.document["jobs"]["update-proof"]["needs"], "dry-run")
+
+    def test_the_update_proof_installs_the_dry_runs_bundle(self) -> None:
+        """Step 1 of D21: bundle A is the dry run's bundle."""
+        install = step_named(self.document, "update-proof", "Install bundle A")
+        run = str(install.get("run"))
+        self.assertIn("--bundle bundle-a", run)
+        self.assertIn("lakehousectl install", run)
+        self.assertIn(
+            "dry-run/cosign.pub",
+            str(install.get("env")),
+            "bundle A is signed by the dry run's key, and the tool must trust that key",
+        )
+
+    def test_the_update_proof_builds_with_the_test_key_feature(self) -> None:
+        """The proof signs its own bundles with its own key."""
+        step = step_named(self.document, "update-proof", "Build lakehousectl (the proof's key)")
+        self.assertIn("--features test-key", str(step.get("run")))
+
+    def test_the_update_proof_builds_its_images_before_the_runner_is_cut_off(self) -> None:
+        """The builder pulls its base images from the registries, so
+        the image builds run BEFORE the cut — the runner is cut off
+        before the INSTALL, which is where the air-gap matters."""
+        cut = step_index(self.document, "update-proof", "Cut the runner off from the registries")
+        for step in (
+            "Build and push the API image of bundle B",
+            "Build and push the API image of bundle C",
+        ):
+            self.assertLess(
+                step_index(self.document, "update-proof", step),
+                cut,
+                f"{step} runs after the cut",
+            )
+
+    def test_the_update_skips_the_checks_the_runner_cannot_meet(self) -> None:
+        """The runner is below the release's minimums, so the two
+        checks are skipped — and the tool says which checks it
+        skipped."""
+        run = str(
+            step_named(self.document, "update-proof", "The update to bundle B succeeds").get("run")
+        )
+        self.assertIn("--ignore-preflight disk", run)
+        self.assertIn("--ignore-preflight memory", run)
+
+    def test_the_update_proof_cuts_the_runner_off_before_the_install(self) -> None:
+        """The proof is air-gapped, as `install-proof` is."""
+        self.assertLess(
+            step_index(self.document, "update-proof", "Cut the runner off from the registries"),
+            step_index(self.document, "update-proof", "Install bundle A"),
+            "the install runs before the runner is cut off",
+        )
+
+    def test_the_update_proof_seeds_the_three_markers(self) -> None:
+        """Step 2 of D21: a row in the application database, a row in
+        ClickHouse, and a stored connector credential through the API."""
+        run = str(step_named(self.document, "update-proof", "Seed the markers").get("run"))
+        self.assertIn("s4_update_marker", run)
+        self.assertIn("postgres", run)
+        self.assertIn("clickhouse", run)
+        self.assertIn("/api/connectors", run)
+        self.assertIn("credential", run)
+
+    def test_the_update_proof_builds_bundle_b_with_the_api_image_rebuilt(self) -> None:
+        """Step 3 of D21: the API image is rebuilt with a bumped
+        version, and every other image is reused from A."""
+        run = str(
+            step_named(self.document, "update-proof", "The API's version is bumped for bundle B").get(
+                "run"
+            )
+        )
+        self.assertIn("lakehouse-api/Cargo.toml", run)
+        self.assertIn("Cargo.lock", run)
+        assembled = str(
+            step_named(self.document, "update-proof", "The bundle B is assembled and signed").get(
+                "run"
+            )
+        )
+        self.assertIn("update_proof.py bundle", assembled)
+        self.assertIn("--from bundle-a --to bundle-b", assembled)
+        self.assertIn(
+            "images/rantai-lakehouse-api.tar",
+            assembled,
+            "the rebuilt image's archive replaces the old one's",
+        )
+
+    def test_the_update_proof_signs_its_own_bundles(self) -> None:
+        """The bundles the proof builds are signed with the proof's
+        key, and the tool is pointed at that key for the updates."""
+        step = step_named(self.document, "update-proof", "The bundle B is assembled and signed")
+        self.assertIn("cosign sign-blob", str(step.get("run")))
+        update = step_named(self.document, "update-proof", "The update to bundle B succeeds")
+        self.assertIn(
+            "proof.pub",
+            str(update.get("env")),
+            "the update must verify against the proof's key",
+        )
+
+    def test_the_update_to_bundle_b_must_succeed(self) -> None:
+        """The update to bundle B reports the new version as ready."""
+        run = str(step_named(self.document, "update-proof", "The update to bundle B succeeds").get("run"))
+        self.assertIn("lakehousectl update --bundle bundle-b", run)
+        self.assertIn("/health/ready", run)
+
+    def test_the_update_to_bundle_c_must_fail_and_roll_back(self) -> None:
+        """Step 4 of D21: the update to the bundle that never becomes
+        ready exits non-zero, and the rollback is reported."""
+        run = str(
+            step_named(self.document, "update-proof", "The update to bundle C fails and rolls back").get(
+                "run"
+            )
+        )
+        self.assertIn("lakehousectl update --bundle bundle-c", run)
+        self.assertIn("--ready-timeout 180", run)
+        self.assertIn("rolled back", run)
+
+    def test_the_update_proof_checks_the_markers_after_the_update(self) -> None:
+        """A marker that is gone after the update is data the update
+        lost."""
+        run = str(
+            step_named(
+                self.document,
+                "update-proof",
+                "The markers are still there after the update to bundle B",
+            ).get("run")
+        )
+        self.assertIn("the postgres marker", run)
+        self.assertIn("the clickhouse marker", run)
+        self.assertIn("credentialManaged", run)
+
+    def test_the_update_proof_checks_the_markers_after_the_rollback(self) -> None:
+        """The same three markers, after the rollback of bundle C."""
+        run = str(
+            step_named(
+                self.document,
+                "update-proof",
+                "The stack runs bundle B again, and the markers are still there",
+            ).get("run")
+        )
+        self.assertIn("the postgres marker", run)
+        self.assertIn("the clickhouse marker", run)
+        self.assertIn("credentialManaged", run)
+
+    def test_the_update_proof_says_why_the_real_previous_release_test_is_not_here(self) -> None:
+        """The real "previous release" test joins this job once 0.2.0
+        exists (REL-2 S5), and the reason is written in the job."""
+        text = WORKFLOW_PATH.read_text(encoding="utf-8")
+        self.assertIn("joins this job once 0.2.0 exists", text)
+
+    # ── The rules the job runs on ────────────────────────────────────
+
+    def test_the_version_of_a_proof_bundle_is_the_release_and_the_step(self) -> None:
+        """D21: bundle B is `V-update-proof.1` and bundle C is
+        `V-update-proof.2`."""
+        self.assertEqual(
+            update_proof.proof_version("0.1.0", 1), "0.1.0-update-proof.1"
+        )
+        self.assertEqual(
+            update_proof.proof_version("0.1.0", 2), "0.1.0-update-proof.2"
+        )
+
+    def test_a_proof_bundle_reuses_every_image_but_the_api(self) -> None:
+        """D21: "every other image reused from A"."""
+        manifest = {
+            "images": {
+                "lakehouse-api": "localhost:5000/rantai-lakehouse-api:0.1.0@sha256:aaa",
+                "console": "localhost:5000/rantai-lakehouse-console:0.1.0@sha256:bbb",
+                "dagster": "localhost:5000/rantai-lakehouse-dagster:0.1.0@sha256:ccc",
+            }
+        }
+        self.assertEqual(
+            update_proof.reused_images(manifest),
+            {
+                "console": "localhost:5000/rantai-lakehouse-console:0.1.0@sha256:bbb",
+                "dagster": "localhost:5000/rantai-lakehouse-dagster:0.1.0@sha256:ccc",
+            },
+        )
+        self.assertEqual(
+            update_proof.api_reference(manifest),
+            "localhost:5000/rantai-lakehouse-api:0.1.0@sha256:aaa",
+        )
+
+    def test_the_compose_file_of_a_proof_bundle_names_the_new_image(self) -> None:
+        """The reference is pinned by digest, and the rebuilt image has
+        another digest."""
+        old = "localhost:5000/rantai-lakehouse-api:0.1.0@sha256:aaa"
+        new = "localhost:5000/rantai-lakehouse-api:0.1.0-update-proof.1@sha256:bbb"
+        compose = f"services:\n  lakehouse-api:\n    image: {old}\n"
+        self.assertEqual(
+            update_proof.compose_with(compose, old, new),
+            f"services:\n  lakehouse-api:\n    image: {new}\n",
+        )
+
+    def test_a_compose_file_that_does_not_name_the_old_image_is_refused(self) -> None:
+        """A file that does not name the old reference would run the
+        old image."""
+        with self.assertRaises(update_proof.ProofError):
+            update_proof.compose_with("services: {}\n", "one", "two")
+
+    def test_the_manifest_of_a_proof_bundle_names_the_new_version_and_the_new_image(self) -> None:
+        """Everything else is the manifest of bundle A: the other
+        images, and the other files."""
+        old = "localhost:5000/rantai-lakehouse-api:0.1.0@sha256:aaa"
+        new = "localhost:5000/rantai-lakehouse-api:0.1.0-update-proof.1@sha256:bbb"
+        manifest = {
+            "schemaVersion": 1,
+            "version": "0.1.0",
+            "gitSha": "a" * 40,
+            "createdAt": "2026-11-02T00:00:00Z",
+            "minFrom": "0.0.0",
+            "stops": [],
+            "images": {"lakehouse-api": old, "console": "console@sha256:ccc"},
+            "imageIds": {old: "sha256:111", "console@sha256:ccc": "sha256:222"},
+            "files": {"docker-compose.yml": "sha256:old", "lakehousectl": "sha256:tool"},
+        }
+        new_manifest = update_proof.manifest_for(
+            manifest,
+            version="0.1.0-update-proof.1",
+            compose_sha256="sha256:new",
+            api_reference_new=new,
+            api_image_id="sha256:333",
+            created_at="2026-11-02T01:00:00Z",
+        )
+        self.assertEqual(new_manifest["version"], "0.1.0-update-proof.1")
+        self.assertEqual(new_manifest["images"]["lakehouse-api"], new)
+        self.assertEqual(new_manifest["images"]["console"], "console@sha256:ccc")
+        self.assertEqual(new_manifest["imageIds"][new], "sha256:333")
+        self.assertNotIn(old, new_manifest["imageIds"])
+        self.assertEqual(new_manifest["files"]["docker-compose.yml"], "sha256:new")
+        self.assertEqual(new_manifest["files"]["lakehousectl"], "sha256:tool")
+
+    def test_a_manifest_that_names_no_api_image_is_refused(self) -> None:
+        """A bundle with no API image is not a bundle the proof can
+        rebuild."""
+        with self.assertRaises(update_proof.ProofError):
+            update_proof.api_reference({"images": {"console": "console@sha256:ccc"}})
+
 
 
 if __name__ == "__main__":

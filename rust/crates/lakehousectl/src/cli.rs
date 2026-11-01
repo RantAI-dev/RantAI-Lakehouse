@@ -135,6 +135,10 @@ pub struct UpdateArgs {
     /// (REL-2 S4 decision D9).
     #[arg(long, default_value_t = 600)]
     pub ready_timeout: u64,
+    /// Skip one pre-flight check, by name. The check is not run and
+    /// the skip is said out loud.
+    #[arg(long = "ignore-preflight", value_name = "CHECK")]
+    pub ignore_preflight: Vec<String>,
 }
 
 /// The arguments of `lakehousectl rollback`.
