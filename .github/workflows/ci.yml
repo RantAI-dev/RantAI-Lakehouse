@@ -131,10 +131,15 @@ jobs:
 
       # The unit tests of that check and of the gates' registry and result
       # table module (no network, no containers; seconds).
+      #
+      # `ops/bench` too (DATA-24 T2): the catalog-search bench's own tests
+      # — the command line it takes and the JSON it prints — belong with
+      # the rest of the tooling's tests, not only in a manual run.
       - name: Unit-test the connector gate coverage tooling (SRC-9)
         run: |
           python3 -m unittest discover -s ops/lint -p 'test_*.py'
           python3 -m unittest discover -s ops/gates -p 'test_*.py'
+          python3 -m unittest discover -s ops/bench -p 'test_*.py'
 
       # REL-2 S2-T1 … S2-T3: the release tooling (the version check, the
       # Compose renderer, the manifest). Its own tests are pytest cases;
