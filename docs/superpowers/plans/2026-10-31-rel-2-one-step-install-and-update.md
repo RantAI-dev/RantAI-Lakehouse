@@ -1103,6 +1103,198 @@ there with `dry-run/rantai-lakehouse-*.tar.zst`, and passes against the fixed fi
 the fix is proved here by the workflow's own checks, by the test that fails against the old file
 and by the artifact's own central directory. **No cargo ran**: this commit touches no Rust.
 
+### Fixes for review S3 round 3, D13 (developer, 2026-11-01)
+
+**Commits** (branch `feat/rel-2-s3-lakehousectl-install`), one per item, each pushed:
+
+| Commit | Item | What |
+| --- | --- | --- |
+| `7c2b171f` | 1 — `ops/release/make_bundle.sh` | the bundle is built on the containerd image store, from tags |
+| `4737eabc` | 2 — `.github/workflows/release.yml` | the containerd image store in three jobs, and an air-gapped install proof |
+| `0c181076` | 3 — `rust/crates/lakehousectl` | the `image-store` pre-flight check, and `docker compose up --pull never` |
+
+**Item 1 (`7c2b171f`).** `make_bundle.sh` refuses to run unless Docker's containerd image store
+is on: `docker info --format '{{json .DriverStatus}}'` must name `io.containerd.snapshotter.v1`.
+The refusal says how to switch (`{"features": {"containerd-snapshotter": true}}` in
+`/etc/docker/daemon.json`, then a restart of Docker) and that the classic store's images are
+hidden while the containerd store is on. For each image the script now pulls the digest
+reference, TAGS it (`docker tag <ref@digest> <ref-without-digest>`) and saves the TAG — never
+`--platform`, and never the digest reference. The header says why, and the site's comment says
+why.
+
+The three new tests in `ops/release/test_make_bundle.py` use the fake `docker` (no network): the
+bundle saves each image by its tag and not by the digest reference, it never passes `--platform`,
+and it is refused on a classic store with the daemon.json snippet in the message.
+
+**Item 2 (`4737eabc`).** Three jobs, one step each, named "Turn on the containerd image store":
+the daemon's own `daemon.json` is MERGED with `jq` (not replaced), Docker is restarted with
+`systemctl restart docker`, and the store is ASSERTED with `docker info` — the step fails the
+job when the store is not on. The step sits before the job's first image pull or build: the dry
+run's step 3 (its first build is step 8), the release job's step 3 (its first build is step 9).
+buildx builds in a builder container of its own, so the images it pushes come back through the
+registry: the pull that has to happen on the containerd store is the "The published images, by
+digest" step, and the step's comment says so.
+
+`install-proof` gains the same step (before the install) and a second one, "Cut the runner off
+from the registries": `/etc/hosts` sends `registry-1.docker.io`, `auth.docker.io`,
+`index.docker.io`, `ghcr.io`, `quay.io` and `production.cloudflare.docker.com` to `0.0.0.0`, and
+`docker pull alpine:3.20` must FAIL before the install runs. The proof is air-gapped in fact: a
+runner that can still pull would let Compose fetch the images the bundle should have loaded.
+
+The six new tests in `ops/release/test_release_workflow.py` check the ORDER (the store is on
+before the first pull or build, in each of the three jobs; the store is on before the install;
+the cut is before the install) and the air-gap step itself (the six hosts, `/etc/hosts`, and the
+proof of the cut). Two synthetic workflows make the checks fail: one pulls an image with no
+containerd step, the other installs before the cut. The checks were also run against the OLD
+`release.yml` (the file at `7c2b171f`): they report `dry-run`, `release` and "the proof has no
+air-gap step" there, and nothing against the fixed file.
+
+**Item 3 (`0c181076`).** A new pre-flight check, `image-store`, is a function of the injected
+facts like the others; the facts come from `docker info --format '{{json .DriverStatus}}'`. It
+runs for a BUNDLE install only (`preflight::run(facts, ignored, bundle)`), because an online
+install pulls every image by its digest and a pull registers the digest on either store. On the
+classic store it refuses, with the D13 text: the daemon.json snippet, the restart of Docker, and
+the warning that the classic store's images are hidden while the containerd store is on. A host
+whose store could not be read is refused too — an air-gapped install does not guess.
+`lakehousectl preflight --bundle` runs the check on its own.
+
+`docker compose up` is now `docker compose up -d --pull never`, online and offline: a missing
+image is an error, never a silent fetch. The arguments are built apart from the call
+(`compose_up_args`), so a test can read them.
+
+Eight new Rust tests: the containerd store passes the check, the classic store is refused with
+the fix text, an unreadable store is refused, the check does not run for an online install, it
+runs for a bundle install, it can be skipped by name, and the Compose arguments end with
+`--pull never`.
+
+**Commands run, in the foreground, on the final commit `0c181076`:**
+
+| Command | Result |
+| --- | --- |
+| `/home/shiro/rantai/bin/cargo-locked fmt --check` (the whole workspace) | clean, no diff, exit 0 |
+| `/home/shiro/rantai/bin/cargo-locked clippy -p lakehousectl --all-targets -- -D warnings` | clean, no warning and no error, exit 0 |
+| `/home/shiro/rantai/bin/cargo-locked test -p lakehousectl` | **61 passed, 0 failed** (53 before this round, 8 new) |
+| `actionlint .github/workflows/release.yml` | no findings, exit 0 |
+| `shellcheck ops/release/*.sh` (0.10.0) | clean, exit 0 |
+| `python -m pytest ops/release -q` | **148 passed** (139 before this round, 9 new) |
+| `python3 ops/lint/check_intra_package_imports.py` | `OK: all intra-package dispar_orchestrate imports resolve` |
+| `python3 ops/lint/check_bare_iceberg_count.py` | `R11 guard: no bare count() against a Bronze Iceberg table found.` |
+| `docker compose --profile '*' config --quiet` (throwaway env values) | clean, exit 0 |
+| `git status` | clean (nothing generated staged) |
+
+Every cargo command went through `/home/shiro/rantai/bin/cargo-locked` (the `bin/cargo-locked` of
+the earlier rounds is not in the repository), in the foreground, on the shared
+`CARGO_TARGET_DIR`; no `cargo clean`; no workspace build. The pytest run used the virtualenv's
+interpreter (`/tmp/opencode/relvenv/bin/python -m pytest ops/release -q`, pytest 8.3.4 over the
+system site packages). `shellcheck` (0.10.0) is not installed on this machine; it was downloaded
+to `/tmp/opencode/d13/shellcheck` for this round.
+
+**The measurement (item 4), on bluefin.** Docker 29.9.2, Compose v5.6.1, the host's own
+containerd store (`io.containerd.snapshotter.v1`). `lakehousectl` was built with
+`--features test-key` (a native debug build) and pointed at a THROWAWAY cosign key: cosign
+v3.1.4 generated the key, signed the manifest into a Sigstore bundle
+(`--use-signing-config=false --tlog-upload=false`, no transparency log), and the binary read the
+throwaway public key through `LAKEHOUSECTL_PUBLIC_KEY_FILE`. The S2 fixture was NOT reused: its
+private half is not in the repository, and the manifest of a real install has to name real images
+and their IDs.
+
+The bundle was made by the NEW `make_bundle.sh`, from a two-service Compose file
+(`alpine/socat:1.8.1.3@sha256:466c8a03…` and `alpine:3.20@sha256:d9e853e8…`, both pinned by
+digest), with the manifest written by `ops/release/make_manifest.py` and the image IDs read the
+way the pipeline reads them (the config digest out of the image's own saved tar, because the
+containerd store reports the index digest as the image's ID). The bundle is 9 823 287 bytes
+(9 MiB). Its archives carry what D13 says they must: `index.json` names
+`io.containerd.image.name: docker.io/alpine/socat:1.8.1.3` (and
+`docker.io/library/alpine:3.20`) with the registry digest beside it, and `manifest.json` carries
+the tag and the config digest the signed manifest names.
+
+Then, in this order:
+
+1. `docker rmi alpine/socat:1.8.1.3 alpine:3.20` — and both digest-pinned references stopped
+   resolving (`No such image`), which is the state PR #313's install proof was in.
+2. **The air gap, in fact.** `/etc/hosts` was given the six registry entries pointing at
+   `0.0.0.0` (the same entries the proof job now writes), and the cut was PROVED:
+   `docker pull alpine:3.20` failed with `dial tcp 0.0.0.0:443: connect: connection refused`,
+   and `curl https://registry-1.docker.io/v2/` failed too.
+3. `lakehousectl install --bundle unpacked --dir install --ignore-preflight disk
+   --ignore-preflight memory` (the memory and disk checks are skipped because this host has
+   13 GiB of RAM and `/tmp` is a 5 GB tmpfs — the same two skips the CI proof uses). It printed:
+
+   ```
+   lakehousectl: the manifest of release 0.2.0 verifies against the release key.
+   lakehousectl: the disk check was skipped, as asked.
+   lakehousectl: the memory check was skipped, as asked.
+   lakehousectl: loading unpacked/images/socat.tar
+   lakehousectl: loading unpacked/images/alpine.tar
+   lakehousectl: starting the stack.
+   ```
+
+   The `image-store` check ran and passed (the containerd store is on). Both images loaded, and
+   their IDs matched the SIGNED manifest — the tool would have stopped otherwise. The stack
+   started: `docker compose -p rantai-lakehouse ps` showed
+   `rantai-lakehouse-alpine-1  alpine:3.20@sha256:d9e853e8…  Up` and
+   `rantai-lakehouse-socat-1  alpine/socat:1.8.1.3@sha256:466c8a03…  Restarting (1)` — socat
+   exits because the port it connects to refuses, and the restart policy brings it back. The
+   digest-pinned references RESOLVED after the load, and the loaded images' IDs are the registry
+   digests the manifest pins (`sha256:466c8a03…`, `sha256:d9e853e8…`).
+4. **How far it got:** through the signature, the pre-flight, the layout, both loads, the image
+   ID check and the stack start — and it stopped at the READINESS PROBE, which cannot answer:
+   neither socat nor alpine serves `/health/ready`. The tool waits 10 minutes for it; the run
+   above was stopped by a 200-second timeout at that wait, so the tool's own "did not become
+   ready within 10 minutes" message was NOT seen here.
+
+**The buildx question (the order against the job).** Measured too, because the pipeline builds
+with buildx and pulls the images back by digest: a tiny image (`FROM alpine:3.20`) was built by
+`docker buildx build` in a builder container of its own and pushed to a local registry
+(`localhost:5000/d13-probe:0.1.0@sha256:07295677…`); the runner pulled it back by digest (the
+pipeline's "The published images, by digest" step), tagged it and saved the tag (the bundle's
+path); after `docker rmi` and `docker load` the digest-pinned reference RESOLVED and the image's
+ID was the pushed digest. So the images buildx pushes can still be pulled, tagged, saved and
+loaded afterwards.
+
+**The counterfactual.** The same image, saved from the DIGEST reference (what `make_bundle.sh`
+did before this round): the archive's `index.json` carries NO `io.containerd.image.name`, and
+after `docker rmi` + `docker load` the digest-pinned reference does NOT resolve
+(`No such image`) — the image lands as a dangling `<none>`. That is the BLOCKER, reproduced and
+then fixed.
+
+**Everything created was removed afterwards.** The compose project, its containers and its
+network (`docker compose -p rantai-lakehouse down -v`); the images this round pulled
+(`alpine/socat:1.8.1.3`, `registry:2`, `moby/buildkit`, the probe image); the registry container
+and the buildx builder; the temporary directories. `/etc/hosts` was restored from its backup and
+the two files hash the same (`34237b3f095501aac5a64024e4ad4b7c`). `alpine:3.20` and
+`localhost:5000/probe` were on the machine before the measurement and were left as they were.
+
+**Not verified, with the reason:**
+
+- **The PR's dry run and the `install-proof` job.** They need a GitHub runner: the four images,
+  the throwaway registry, cosign, syft, a multi-GiB bundle and the whole stack. The workflow's
+  own checks, and the checks run against the OLD workflow, are what stands in for them here.
+- **The release build's own images** (`ghcr.io/rantai-dev/…`) were not in the measurement: the
+  bundle's path does not care which registry an image comes from, and the release key is in the
+  `release` environment's secrets. The measurement used third-party images and a throwaway key,
+  as the task allowed.
+- **The static musl build** was not verified here: the `x86_64-unknown-linux-musl` target is not
+  installed on this machine. The measurement used the native debug build — the same source, the
+  same features.
+- **The readiness probe was not allowed to finish** (see item 4, step 4): the measurement's
+  images do not serve `/health/ready`, so the run was stopped at the wait. The stack start is
+  what was measured.
+- **The SBOMs in the measurement bundle were stand-ins** (a minimal CycloneDX JSON per image),
+  not syft's: the bundle only copies them, and the measurement is about the images and the
+  install.
+- **The full workspace run** (`cargo clippy --workspace --all-targets --all-features` and
+  `cargo test --workspace`): not run here — this round changes one crate, and the crate's rules
+  say the scoped run is what a commit runs. CI runs the full one on the PR.
+- **No bun command and no Dagster command ran**: this round changes no TypeScript and no code
+  location.
+- **`cargo deny check`** was not run: no dependency changed (the crate's `Cargo.toml` is
+  untouched).
+- **An observation, not fixed:** `sys::output` captures a command's standard error and drops it,
+  so `docker compose`'s own output never reaches the operator — and `compose_up`'s message says
+  "The output above says why" while nothing is printed above. It is pre-existing and outside
+  D13's decision; the review may want it as a separate finding.
+
 ## 7. Review (planner appends below)
 
 ### Review S1 round 1 (planner, 2026-10-31, at `f79d4235`)
