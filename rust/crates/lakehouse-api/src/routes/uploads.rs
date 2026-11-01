@@ -143,8 +143,8 @@ use lakehouse_store::audit::{self as store_audit, NewAuditEvent};
 use lakehouse_store::connectors;
 use lakehouse_store::upload_folders;
 use lakehouse_store::uploads::{
-    self, ClaimFolder, FolderFilter, ListFilter, LoadClaim, LoadLimits, LoadMode, MarkOutcome,
-    NewUpload, TableClaim, Upload,
+    self, ClaimFolder, FolderFilter, LimitOutcome, ListFilter, LoadClaim, LoadLimits, LoadMode,
+    MarkOutcome, NewUpload, TableClaim, Upload,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -2736,6 +2736,10 @@ fn load_limits(state: &AppState) -> LoadLimits {
     LoadLimits {
         per_user: i64::from(state.config.upload_max_concurrent_per_user),
         total: i64::from(state.config.upload_max_concurrent),
+        // `DATA-37` T1: the store has the large limit (decision D3) and the
+        // setting for it (`UPLOAD_MAX_CONCURRENT_LARGE`) arrives with the API
+        // task (T2); until then no load is refused by it.
+        large: i64::MAX,
     }
 }
 
@@ -2760,8 +2764,13 @@ async fn check_within_limits_and_column_cap(
     layout: Option<Layout>,
 ) -> ApiResult<LoadLimits> {
     let limits = load_limits(state);
-    if !uploads::loads_under_limits(pool, &row.id, limits).await? {
-        return Err(too_many_uploads().into());
+    match uploads::loads_under_limits(pool, &row.id, &request.also_uploads, limits).await? {
+        LimitOutcome::Under => {}
+        // `DATA-37` T2: the large refusal gets a sentence of its own (decision
+        // D4); until then both refusals are the general one.
+        LimitOutcome::LimitReached | LimitOutcome::LargeLimitReached => {
+            return Err(too_many_uploads().into());
+        }
     }
     let store = UploadStore::connect(&state.config).await?;
     if let Some(layout) = layout {
@@ -2996,7 +3005,11 @@ async fn claim_load(
     .await?;
     Ok(match outcome {
         MarkOutcome::Marked(claimed) => *claimed,
-        MarkOutcome::LimitReached => return Err(too_many_uploads().into()),
+        // `DATA-37` T2: the large refusal gets a sentence of its own (decision
+        // D4); until then both refusals are the general one.
+        MarkOutcome::LimitReached | MarkOutcome::LargeLimitReached => {
+            return Err(too_many_uploads().into());
+        }
         MarkOutcome::GroupNotMarked => {
             // One of the other files was taken, or went away, since the checks.
             return Err(ApiError::Conflict(OTHER_BUSY.to_owned()).into());
