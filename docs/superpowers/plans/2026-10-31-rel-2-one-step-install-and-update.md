@@ -730,6 +730,156 @@ allowed):
   says so in a comment. The FIRST real release is where that assumption is proven, and it
   fails loudly (cosign cannot decrypt) if it is wrong.
 
+### Handoff S3 (developer, 2026-11-01)
+
+**Commits** (branch `feat/rel-2-s3-lakehousectl-install`, base `main` at `2c110ebc`), one per
+task, in plan order:
+
+| Commit | Task | What |
+| --- | --- | --- |
+| `87f2c13b` | S3-T0 | `release.json` carries each image's id |
+| `4ccdc14b` | S3-T1 | the crate, and the verification of a release |
+| `b5c3932b` | S3-T2 | the pre-flight checks |
+| `6c2efe98` | S3-T3 | `lakehousectl install` |
+| `6d7ed009` | S3-T4 | the installer in the release, and `install.sh` |
+| `aa6b5e7a` | S3-T5 | the CI proof that the bundle installs |
+| `3fe050ab` | (fix) | the image id is the config digest on every Docker store |
+
+**Commands, with their results.** Every cargo command went through `bin/cargo-locked`, in the
+foreground, on the shared `CARGO_TARGET_DIR`; no `cargo clean`; no workspace build.
+
+The crate:
+
+- `cargo fmt --check` — clean (the whole workspace, and `-p lakehousectl`).
+- `cargo clippy -p lakehousectl --all-targets -- -D warnings` — clean, no warning and no error.
+- `cargo test -p lakehousectl` — **43 passed, 0 failed**.
+- `cargo deny check all` — **advisories ok, bans ok, licenses ok, sources ok**.
+
+The release tooling:
+
+- `pytest ops/release -q` — **130 passed, 0 failed** (107 before this slice, 23 new).
+- `actionlint .github/workflows/release.yml` — clean, exit 0 (actionlint v1.7.7, with
+  shellcheck 0.10.0 on the PATH, so the `run:` blocks were checked too).
+- `bash -n` and `shellcheck` (0.10.0) on `ops/release/make_bundle.sh`,
+  `ops/release/image_name.sh` and `ops/release/install.sh` — clean, exit 0.
+- `python3 ops/lint/check_intra_package_imports.py` — OK.
+- `python3 ops/lint/check_bare_iceberg_count.py` — no violation.
+
+**The tool, run.** The binary was built and run here (the native build; the static musl build
+is CI-side, see below):
+
+- `lakehousectl verify --dir ops/release/fixtures/sigstore`, with the `test-key` build and
+  `LAKEHOUSECTL_PUBLIC_KEY_FILE=ops/release/fixtures/sigstore/throwaway.pub` → "the manifest
+  in ops/release/fixtures/sigstore verifies against the release key", exit 0.
+- The same binary on a **tampered** manifest → "the signature is over a different file: the
+  bundle names the digest 1d4e1a9e…, the manifest beside it hashes to 555308cb…", exit 1.
+- A **release** build (no `test-key`) with the same variable set → "LAKEHOUSECTL_PUBLIC_KEY_FILE
+  is set and ignored: this build verifies against the release key compiled into it." and "the
+  release key did not sign this manifest", exit 1. That is the "a release build never accepts
+  another key" property, proved on the binary.
+- `lakehousectl install --bundle <a bundle whose manifest was tampered with>` → refused with
+  the digest mismatch, and **nothing was written**: the install directory did not exist
+  afterwards. The manifest is verified before anything is written.
+- `lakehousectl preflight --compose docker-compose.yml --dir /tmp` → "memory: this host has
+  13 GiB of memory, and the release needs 16 GiB or more" and "disk: there are 5 GiB free
+  under the install directory, and the release needs 50 GiB or more" — **this machine is below
+  the spec's minimums**, so both checks fired. The ports check read the repository's own
+  Compose file and found the console's 3000, the API's 8080 and Postgres' 5432 (a unit test
+  holds that against the real file).
+
+**A finding, and the fix (`3fe050ab`).** The plan's recipe for the image id —
+`docker image inspect --format '{{.Id}}'` — is the **config digest** on Docker's classic
+image store and the **image index digest** on the containerd store. Measured here (Docker
+29.9.2, the containerd store): the image's `.Id` is `sha256:d9e853e8…` (the index digest)
+while its config digest is `sha256:bf8527eb…` — the blob the saved tar names as `Config`.
+A manifest built on one store and loaded on the other would compare two different identities,
+and the install would refuse a good bundle. So:
+
+- the pipeline names the **config digest** in `imageIds` (the identity a LOADED image carries
+  on both stores): when the store reports the index digest — it equals the reference's
+  registry digest — the config digest is read from the image's own saved tar;
+- the installer accepts the loaded image's ID when it is **either** the config digest
+  (`imageIds`) **or** the registry digest (`images`). Both are covered by the release key, and
+  they are the two identities Docker's stores give the same image.
+
+**Not verified, with the reason:**
+
+- **The dry run and the proof job are not verified.** They need a GitHub runner: the four
+  images, the throwaway registry, cosign, syft, a ~3 GiB bundle, and the whole stack started
+  on it. The PR's own CI is the proof, and its summary is where the bundle's size appears.
+- **The static musl build is not verified here.** The `x86_64-unknown-linux-musl` target and
+  `musl-tools` are not installed on this machine, and the pipeline installs both. The binary
+  was built and run natively — the same source, the same features, the same dependencies.
+- **The whole install was not run end to end here.** It needs a manifest signed with the
+  release key, and that key is in the `release` environment's secrets. The proof job does it
+  with the dry run's throwaway key, which is the only key this slice may touch.
+- **The full workspace run** (`cargo clippy --workspace --all-targets --all-features` and
+  `cargo test --workspace`): not run here — this slice's machine rules say CI runs them; the
+  crate was clipped with `--all-targets` and tested, and `cargo deny check all` covered the
+  whole dependency graph.
+- **No bun command and no Dagster command ran**: this slice changes no TypeScript and no code
+  location. `docker compose --profile '*' config --quiet` was not run either: this slice
+  changes no Compose file (the release's Compose file is RENDERED by the pipeline from the
+  unchanged template).
+- The `install.sh` script was tested against a fake `curl` and a fake `uname`, not against
+  GitHub: the script's own logic (the refusal, the checksum check, the hand-over) is what
+  those tests cover.
+
+**Where the plan left room, and what was decided** (for the reviewer):
+
+- **The command surface.** The plan gives the crate a `verify` module and the pre-flight
+  checks, but no command for them. They became `lakehousectl verify` and
+  `lakehousectl preflight` — the modules' own CLI surface, so each module is reachable and
+  testable on its own, and the install runs the same checks.
+- **The pre-flight's ports** come from the release's own Compose file, not from a list in the
+  tool: the release publishes more than the console and the API, and the operator's `.env`
+  may move any of them. The `.env` is read for the values it sets.
+- **The install's HTTP client is written here** (a plain GET on the loopback), so the binary
+  carries no TLS stack: the offline path needs no network at all, and the online path
+  downloads the release's assets with `curl`, the tool `install.sh` already uses. A static
+  musl binary with a TLS stack would need a C toolchain in the pipeline.
+- **The secrets are the Rust port of `ops/init-env.sh`** (D6): the repository's
+  `.env.example` is the list of keys, COMPILED INTO the binary (the installer has to work on
+  a host that has never seen this repository), the values are generated only when they are
+  missing, an existing `.env` is never overwritten, and a second run changes nothing. The
+  first administrator's password is printed once — on a re-install the tool says where the
+  password is instead of printing it again.
+- **`state.json`** (D5) carries `schemaVersion`, `currentVersion`, `previousVersion` and
+  `lastBackup`. `previousVersion` and `lastBackup` are null until REL-2 S4 fills them.
+- **The bundle carries the installer** as `lakehousectl`, and the signed manifest names its
+  checksum in `files` — so the bundle's copy is the file the release published, checked
+  against the signature and not only against the bundle's own `SHA256SUMS`.
+- **`install.sh` is a bash script** (`set -euo pipefail`, as the plan asks), so the documented
+  command is `curl -fsSL https://get.rantai.dev/lakehouse | bash`. The spec's example says
+  `| sh`, which dash cannot run (`pipefail` is bash). The reviewer may want the spec's
+  wording changed, or the script rewritten in POSIX sh.
+- **The CI proof skips two pre-flight checks** (`disk` and `memory`): a GitHub runner has
+  neither the 50 GiB of free disk nor the 16 GiB of memory the release asks for. The skips are
+  said out loud by the tool, and the minimums themselves are proved by the operator's
+  acceptance checklist (REL-2-AC3), not by a runner.
+
+**Known gaps in this slice** (not fixed here; the reviewer decides):
+
+- **The bundle's images are verified against the manifest by ID, and the ID is checked
+  against the tar's own content only through that.** The bundle's `SHA256SUMS` covers the
+  image tars, and the signed manifest names the images' digests and ids — but the tar's
+  config blob is not hashed against the manifest's `imageIds` by the installer itself. An
+  air-gapped install would be stronger if the installer read the config digest out of each
+  tar (the tar's `manifest.json` names it) and compared it with the signed manifest, which
+  needs a tar reader in the tool. The plan's own check (the loaded image's ID) is what is
+  implemented.
+- **The offline path trusts the bundle's `SHA256SUMS`, which is not signed.** The signed
+  manifest names the images' digests and ids, so the two chains meet at the image's ID; a
+  bundle whose tars were rewritten would need the manifest's ids to match too.
+- **The online path downloads the release's assets with `curl`**, so the online install needs
+  `curl` on the host. The pre-flight does not check for it (the plan's list does not name
+  it); the offline path needs nothing but Docker.
+- **The install does not roll back.** REL-2 S4 adds `update` with the automatic rollback
+  (D9); this slice only installs.
+- **The proof job starts the whole stack on a runner** (35 services in the rendered Compose
+  file, default profile). Whether a GitHub runner has the memory and the disk for it is a
+  runner fact, and the PR's own CI answers it.
+
 ## 7. Review (planner appends below)
 
 ### Review S1 round 1 (planner, 2026-10-31, at `f79d4235`)
