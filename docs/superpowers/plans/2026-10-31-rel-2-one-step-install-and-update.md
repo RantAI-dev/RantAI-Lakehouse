@@ -1643,3 +1643,45 @@ VERSION` for both paths, with `src/SyftVersion.ts` = `v1.42.3`.
 
 **Open: no BLOCKER, no SHOULD-FIX.** The real release (S5) needs a `v*` tag and the owner's
 approval in the `release` environment.
+
+### Review S3 round 1 (planner, 2026-11-01, at `04dbae2f`)
+
+Read: the whole `lakehousectl` crate, the `release.yml` diff, `install.sh`, `make_bundle.sh` and
+`make_manifest.py`. The verification of the manifest (`verify.rs`) is right: the digest is
+checked before the signature, the key is the compiled-in one unless the `test-key` feature is
+on, and a release build says when it ignores `LAKEHOUSECTL_PUBLIC_KEY_FILE`. The `p256` 0.14 /
+`ecdsa` 0.17 pin and its reason check out (`RUSTSEC-2026-0387` is in the advisory database, and
+the lock has `crypto-bigint` 0.7.10). The finding on the two Docker image stores is good work.
+
+- **BLOCKER 1. The online install downloads into a predictable shared directory.**
+  `install.rs` `obtain()` writes to `std::env::temp_dir().join("lakehousectl-release-<version>")`
+  with `create_dir_all` and `curl --output`. The installer runs as root. Any local user can
+  create that directory first and put a symlink at `release.json`, and root's `curl` then writes
+  through it into any file on the host. A directory left by an earlier run is also reused.
+  *Fix:* read the three assets into memory (curl to stdout; they are small text files), or
+  create a fresh private directory (`nix::unistd::mkdtemp`, mode 0700) and remove it at the
+  end. Add a test that the download path is not a fixed name.
+- **SHOULD-FIX 2. `SHA256SUMS` is checked for the name only.** `checksums_cover()` asks whether
+  a line names the tar, and never hashes the tar. The plan says "check `SHA256SUMS`". *Fix:*
+  hash each `images/<name>.tar` and compare it with its `SHA256SUMS` line before
+  `docker load`, so a damaged copy fails with a clear message. Say in the comment that
+  `SHA256SUMS` is not signed, so the image-id check against the signed manifest stays the
+  trust check, and this one catches damage.
+- **SHOULD-FIX 3. A second install overwrites the state of the first.** `write_layout()`
+  always rewrites `state.json` (`previousVersion: null`), `docker-compose.yml` and
+  `release.json`. *Fix:* when `--dir` already holds a `state.json`, install the same version
+  again only (keep `state.json` as it is), and refuse any other version, pointing to
+  `lakehousectl update` (S4). Test both.
+- **SHOULD-FIX 4. With an existing `.env`, the email shown is the template's.**
+  `secrets::write_env()` reads `AUTH_BOOTSTRAP_EMAIL` from `ENV_EXAMPLE` when the `.env`
+  exists. *Fix:* read it from the existing file. Test it.
+- **SHOULD-FIX 5. `install.sh` leaves the binary behind.** `exec` replaces the shell, so the
+  `EXIT` trap never removes `$work`. *Fix:* run `"$work/$BINARY" install "$@"` without
+  `exec`, and exit with its status.
+
+**Proven by the PR's dry run, not by reading:** after `docker load` of a tar that
+`docker save` wrote from a digest reference, both `docker image inspect <ref@digest>` and
+`docker compose up` must find the image with no registry. The `install-proof` job is that test.
+It must be green before merge.
+
+**Open: BLOCKER 1, SHOULD-FIX 2–5.**
