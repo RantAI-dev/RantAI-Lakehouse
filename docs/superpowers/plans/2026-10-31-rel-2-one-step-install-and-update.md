@@ -1952,3 +1952,47 @@ lakehousectl: the image alpine/socat:1.8.1.3@sha256:466c8a03… is not in the lo
   never`. The planner then writes the decision here (S3 D-amend) before any code changes.
 
 **Open: BLOCKER 1.**
+
+### S3 D-amend (planner, 2026-11-01): how an air-gapped host finds a loaded image
+
+The measurement is on bluefin: Docker 29.9.2, with each image store tried. The containerd
+store is the host's own, and the classic store was run in `docker:29-dind` with
+`containerd-snapshotter=false`. The image was `alpine/socat:1.8.1.3@sha256:466c8a03…`.
+
+- **Classic store:** no `docker load` of any archive form registers a repo digest. This
+  includes an archive whose `manifest.json` carries `RepoDigests`. So a digest-pinned reference
+  never resolves offline there. With a network, `docker compose up -d` silently pulls the image
+  from the registry instead, which would hide the bug on a CI runner.
+- **Containerd store:**
+  - An archive saved from the TAG (`docker save name:tag`) carries `io.containerd.image.name` in
+    `index.json`. After `docker load`, `name:tag@sha256:<list digest>` resolves, and
+    `docker compose up --pull never` starts from it with no network. The image's `Id` is then
+    the list digest the manifest pins.
+  - An archive saved from the digest reference (what `make_bundle.sh` does today) loads as a
+    dangling `<none>` image.
+  - `docker save --platform` rewrites the archive's digest to the per-platform manifest, so it
+    must never be used.
+
+**Decision D13 (planner):**
+1. **An air-gapped install requires Docker's containerd image store.** A new pre-flight check,
+   `image-store`, runs only for `--bundle`. It refuses a classic-store host and says how to
+   switch: `"features": {"containerd-snapshotter": true}` in `/etc/docker/daemon.json`, then a
+   restart of Docker. It also says that images held by the classic store are hidden while the
+   containerd store is on. An online install works on either store, because `docker pull` by
+   digest registers the digest.
+2. **The bundle is made on the containerd store, from tags.** Every job that builds a bundle
+   (the dry run and the release) turns the containerd store on before its first pull or build,
+   and asserts it is on. `make_bundle.sh` refuses to run on another store. For each image it
+   pulls by digest, tags `name:tag`, and saves the TAG, never with `--platform`.
+3. **Compose never pulls.** `lakehousectl` starts the stack with `docker compose … up -d --pull
+   never`. A missing image is then an error, never a silent fetch.
+4. **The image check after `docker load` stays.** On the containerd store, the loaded `Id` is
+   the registry digest the signed manifest pins (`install.rs`'s existing comparison).
+5. **`install-proof` turns the containerd store on before it installs.** It also gains a step
+   that cuts the runner off from the registries (no `docker pull` possible) before
+   `lakehousectl install --bundle`, so the proof is air-gapped in fact, not just in name.
+6. **Air-gapped install on the classic store is not supported, and says so.** The pre-flight
+   check is the honest refusal. If a customer needs it, it becomes a backlog item: a
+   tag-pinned Compose file with the digests verified by the installer.
+
+**Open: BLOCKER 1, to be fixed per D13.**
