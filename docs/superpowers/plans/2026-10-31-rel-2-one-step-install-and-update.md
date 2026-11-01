@@ -1389,3 +1389,20 @@ VERSION` for both paths, with `src/SyftVersion.ts` = `v1.42.3`.
   bundle in both jobs, so the next dry run's log answers it.
 - No cargo command, no bun command and no Dagster command ran: this round changes no Rust,
   no TypeScript, no code location and no Compose file.
+
+### Review S2 round 7 (planner, 2026-11-01): the dry run with every image is green
+
+- **Run 41266974262, all 41 checks green.** The dry run built and signed our four images and
+  pulled every third-party image by digest. Every image got a CycloneDX JSON SBOM. The manifest
+  was signed and "Verified OK" offline.
+- **The bundle holds 17 images:** socat, alpine, aws-cli, seaweedfs, clickhouse-server, curl,
+  debezium-server-iceberg, gotenberg, our api, console, dagster and oidc-mock, openfga,
+  postgres, the Lakekeeper catalog, rustfs and trino.
+- **Measured size: 3,118,474,714 bytes (2,974 MiB) compressed.** The spec says "measured, never
+  assumed". This is the number for 0.1.0's images, and each release prints its own.
+- **Runner disk:** 86 GB free before, and 91 GB after the bundle step, once the build cache was
+  freed. That leaves room to spare.
+- **BLOCKER 1 (round 6) is fixed.** The fix commits are `525c73c6` and `f9d0290b`.
+
+**Open: no BLOCKER, no SHOULD-FIX.** The real release (S5) needs a `v*` tag and the owner's
+approval in the `release` environment.
