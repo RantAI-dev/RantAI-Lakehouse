@@ -99,4 +99,83 @@ disagrees, stop and report it.
 
 ## 5. Handoff (developer appends below)
 
+### Handoff S1 (developer, 2026-11-01)
+
+**Commits** (one per task, in plan order, each pushed on its own):
+
+| Task | Commit | What |
+| --- | --- | --- |
+| S1-T1 | `dc9390dd` | `feat(policy): the rewrite is engine-aware, so a masked table reads on Trino (DATA-21 S1-T1)` |
+| S1-T2 | `24c5b1ec` | `feat(policy): a Trino dialect that reads a table version, and the past version it keeps (DATA-21 S1-T2)` |
+| S1-T3 | `ebfae103` | `feat(query): a past version and a mask work on Trino (DATA-21 S1-T3)` |
+| S1-T4 | `abc93146` | `feat(web): the version picker offers Trino's own past version (DATA-21 S1-T4)` |
+
+**Commands run** — all in the foreground, on the final commit `abc93146`, every
+cargo command through `bin/cargo-locked`:
+
+| Command | Result |
+| --- | --- |
+| `cargo fmt --check` | clean (exit 0) |
+| `cargo clippy -p lakehouse-api --all-targets -- -D warnings` | clean (exit 0) |
+| `cargo test -p lakehouse-api sql_rewrite` | 144 passed, 0 failed (the lib target; the bin target runs the same filter, so 288 across the two) |
+| `cargo test -p lakehouse-api query` | 513 passed, 0 failed, 6 ignored (across the crate's test binaries; the lib and the bin targets each run the filter, so the counts are counted twice) |
+| `cargo test -p lakehouse-api --test query_history` | 16 passed, 0 failed |
+| `bun run typecheck` | clean (exit 0) |
+| `bun run lint` | **fails — pre-existing, not this work.** 649 errors, every one of them in `dagster/.venv/lib/python3.12/site-packages/**` (the local Python virtualenv's bundled JavaScript, which `eslint` scans; the config ignores only `.next`, `out`, `build`, `next-env.d.ts`). 0 errors in the repo's own sources: `bun --bun eslint src` → 0 errors, 10 warnings (all pre-existing). The same failure happens with this branch's changes stashed. |
+| `bun test src/lib src/features/queries` | 1244 pass, 1 skip, 0 fail (1245 tests across 133 files) |
+
+**Not verified** — and why:
+
+- The full workspace block (`cargo clippy --workspace --all-targets
+  --all-features -- -D warnings`, `cargo test --workspace`): **not run.** The
+  machine rules for this session say to run only the scoped commands the plan
+  lists, and no workspace run. The reviewer re-runs it before the merge.
+- `python3 ops/lint/check_intra_package_imports.py`,
+  `python3 ops/lint/check_bare_iceberg_count.py` and
+  `(cd dagster && python -m pytest dispar_orchestrate -q)`: **not run.** No
+  Python or Dagster file changed, and the same machine rule limits this
+  session to the plan's scoped commands.
+- `docker compose --profile '*' config --quiet`: **not run.** No compose file
+  changed.
+- The `g8-governance` and `g8-time-travel` gates with a Trino run: slice S2.
+
+**Where the code and the plan differ, and what was done about it** (all in
+this slice's favour of the plan's intent; each is a reviewer's call):
+
+1. **D1's row-filter casts print in upper case.** `sqlparser` prints a data
+   type in upper case, so the output is `CAST(x AS VARCHAR)` and
+   `CAST(x AS DATE)`, not the plan's lower case. Trino reads both spellings
+   the same way; the AST nodes are `DataType::Varchar` and `DataType::Date`,
+   not a hand-written string.
+2. **D2's "the existing message" kept its text.** `PAST_VERSION_TRINO_MESSAGE`
+   still reads "Querying a past version of a table is available on the
+   ClickHouse engine only.", and it is now used only for a past version by
+   TIMESTAMP. Its text names the ClickHouse engine, and the ClickHouse side
+   has no timestamp form either (the plan's own reason) — a reviewer may want
+   it reworded.
+3. **D4's "records `ok`" is the store's `completed`.** The history store's
+   vocabulary is `completed | failed | cancelled | blocked`; there is no `ok`
+   status, so the changed test asserts `completed`.
+4. **The plan's task split needed the route's half of S1-T2 in S1-T3.** S1-T2
+   is the module (the dialect, the token passes, the version on the derived
+   `FROM`), S1-T3 is the route that uses it. To keep every commit green, the
+   route's use of the new pieces is in S1-T3, and the three new public items
+   carry a `dead_code` allow in S1-T2 whose reason says the route wires them
+   in S1-T3 (the same pattern `sql_rewrite::REFUSED_UNPARSEABLE` uses).
+5. **A table with both a version and an alias becomes a derived table.**
+   `sqlparser` prints a version AFTER an alias (`FROM t AS x VERSION AS OF
+   5`) and Trino reads it before, so such a table is rewritten as
+   `(SELECT * FROM t VERSION AS OF 5) AS x`. Without this the statement
+   Trino receives would not parse. A governed table needs no such care: its
+   own derived table carries the version and the alias separately.
+6. **The console's Trino pin matches the table reference textually**, so a
+   statement that does not read the table the user picked is not pinned and
+   the picker writes nothing. A ClickHouse-style quoted name
+   (`icecat_api.`bronze.orders``) is not a table the Trino engine reads, so
+   it is not pinned either.
+7. **The feature page's acceptance rows `DATA-16-AC5` and `DATA-16-AC6` are
+   the owner's rows and were not rewritten**; a note under the table says
+   they describe the state before `DATA-21` and that the Trino rows are
+   asked again in `DATA-21`'s own acceptance.
+
 ## 6. Review (planner appends below)
