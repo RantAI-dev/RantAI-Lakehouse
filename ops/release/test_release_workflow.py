@@ -38,6 +38,14 @@ And one more since the PR #313 dry run, from the build that failed:
     toolchain; and the pin itself does not ask for the musl target, so no
     developer downloads it.
 
+And one more since the PR #313 install-proof, from the install that failed:
+
+  - every file the proof job reads out of the dry run's artifact is on
+    that artifact's upload list, under the SAME relative path — the
+    artifact keeps every file at its path relative to the repository
+    root, so a file the dry run wrote into `dist/` is read back from
+    `dry-run/dist/`, not from `dry-run/`.
+
 The workflow is parsed with PyYAML (`pyyaml==6.0.3`, installed by the jobs
 that run these tests). The checks are run against synthetic workflows too,
 so a check that cannot fail is itself a failure. No network, no repository:
@@ -46,6 +54,7 @@ the tests read two files and write nothing.
 
 from __future__ import annotations
 
+import fnmatch
 import re
 import unittest
 from pathlib import Path
@@ -97,6 +106,15 @@ NO_TLOG_FLAGS = ("--use-signing-config=false", "--tlog-upload=false")
 
 # The musl target the static installer is built for.
 MUSL_TARGET = "x86_64-unknown-linux-musl"
+
+# The dry run's artifact, and the folder the proof job unpacks it into.
+DRY_RUN_ARTIFACT = "release-dry-run"
+DRY_RUN_FOLDER = "dry-run"
+
+# The step of the dry run that uploads the artifact, and the step of the
+# proof job that downloads it.
+UPLOAD_STEP = "Upload the bundle and the manifest"
+DOWNLOAD_STEP = "Download the dry run's bundle"
 
 # A workflow with a signing secret in a job-level `env:`.
 SYNTHETIC_JOB_SECRET = """
@@ -219,6 +237,38 @@ jobs:
           rustup target add x86_64-unknown-linux-musl
           cd rust
           cargo build --release --target x86_64-unknown-linux-musl -p lakehousectl
+"""
+
+# A workflow whose proof job reads the bundle from the artifact's ROOT,
+# although the dry run uploaded it from `dist/` — so the file is not
+# there (PR #313 install-proof).
+SYNTHETIC_PROOF_READS_FROM_THE_ROOT = """
+name: Synthetic
+on: workflow_dispatch
+jobs:
+  dry-run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Upload the bundle and the manifest
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-dry-run
+          path: |
+            dist/*.tar.zst
+            cosign.pub
+  install-proof:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download the dry run's bundle
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-dry-run
+          path: dry-run
+      - name: Install the bundle
+        env:
+          LAKEHOUSECTL_PUBLIC_KEY_FILE: ${{ github.workspace }}/dry-run/cosign.pub
+        run: |
+          tar --zstd -xf dry-run/rantai-lakehouse-*.tar.zst -C bundle
 """
 
 
@@ -450,6 +500,74 @@ def adds_the_musl_target_inside_rust(step: dict[str, Any]) -> bool:
         and added is not None
         and changed_to_rust < added
     )
+
+
+def upload_entries(document: dict[str, Any]) -> list[str]:
+    """Every path the dry run uploads, as the upload step lists them.
+
+    The upload step's `path:` is a block of lines, one glob per line.
+    A line that starts with `#` is a comment about the list and names
+    no file, so it is not an entry.
+    """
+    step = step_named(document, "dry-run", UPLOAD_STEP)
+    raw = str((step.get("with") or {}).get("path") or "")
+    return [
+        line.strip()
+        for line in raw.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+
+
+def dry_run_reads(document: dict[str, Any]) -> list[str]:
+    """Every path the proof job reads out of the dry run's artifact.
+
+    A path is a read when a step's command or a step's environment
+    names a file under the folder the artifact was unpacked into. The
+    commands are read WITHOUT their comment lines: a comment explains
+    the step, it does not read a file.
+    """
+    found: list[str] = []
+    pattern = re.compile(rf"{DRY_RUN_FOLDER}/([A-Za-z0-9._*/-]+)")
+    for step in steps_of(document, "install-proof"):
+        texts = [shell_commands(str(step.get("run") or ""))]
+        texts.extend(str(value) for value in (step.get("env") or {}).values())
+        for text in texts:
+            found.extend(
+                f"{DRY_RUN_FOLDER}/{match}" for match in pattern.findall(text)
+            )
+    return found
+
+
+def entry_covers(entry: str, path: str) -> bool:
+    """Whether an upload entry holds a file at that same relative path.
+
+    The artifact keeps every file at its path relative to the ROOT of
+    the upload list, so the file's FOLDER has to be the entry's folder
+    and the file's name has to match the entry's glob. A glob that
+    spans folders (`*` matches `/` here) is not enough: it would let
+    `dist/*.tar.zst` stand for a file read from the artifact's root.
+    """
+    entry_folder, _, entry_name = entry.rpartition("/")
+    path_folder, _, path_name = path.rpartition("/")
+    if entry_folder != path_folder:
+        return False
+    return fnmatch.fnmatchcase(path_name, entry_name)
+
+
+def reads_without_an_uploaded_file(document: dict[str, Any]) -> list[str]:
+    """Every path the proof job reads that the upload list does not hold.
+
+    The path is the one the job uses, under the folder the artifact was
+    unpacked into — so a file the dry run wrote into `dist/` and that
+    the proof reads from `dry-run/` is reported.
+    """
+    entries = upload_entries(document)
+    missing: list[str] = []
+    for path in dry_run_reads(document):
+        relative = path[len(DRY_RUN_FOLDER) + 1 :]
+        if not any(entry_covers(entry, relative) for entry in entries):
+            missing.append(path)
+    return missing
 
 
 class ReleaseWorkflowTest(unittest.TestCase):
@@ -887,6 +1005,59 @@ class ReleaseWorkflowTest(unittest.TestCase):
         """
         text = TOOLCHAIN_PATH.read_text(encoding="utf-8")
         self.assertNotIn(MUSL_TARGET, text)
+
+    def test_every_file_the_proof_reads_is_on_the_upload_list(self) -> None:
+        """PR #313 install-proof: the artifact keeps the relative paths.
+
+        `upload-artifact` stores every file at its path relative to
+        the root of the upload list — the repository root, because that
+        list names files from `dist/`, from `sbom/` and from the root
+        itself. So the bundle the dry run wrote into `dist/` is read
+        back from `dry-run/dist/`, and the proof reading it from
+        `dry-run/` failed with "tar (child):
+        dry-run/rantai-lakehouse-*.tar.zst: Cannot open: No such file or
+        directory".
+        """
+        self.assertTrue(upload_entries(self.document), "no upload list to check")
+        self.assertTrue(dry_run_reads(self.document), "the proof reads no file")
+        self.assertEqual(reads_without_an_uploaded_file(self.document), [])
+
+    def test_a_proof_reading_a_file_the_dry_run_does_not_upload_is_reported(
+        self,
+    ) -> None:
+        """The check above must be able to fail.
+
+        The synthetic workflow reads the bundle from the artifact's
+        root, although the dry run uploaded it from `dist/`.
+        """
+        document = yaml.safe_load(SYNTHETIC_PROOF_READS_FROM_THE_ROOT)
+        self.assertEqual(
+            reads_without_an_uploaded_file(document),
+            ["dry-run/rantai-lakehouse-*.tar.zst"],
+        )
+
+    def test_the_proof_downloads_the_artifact_the_dry_run_uploaded(self) -> None:
+        """The two jobs must name the SAME artifact.
+
+        The upload step writes the artifact under one name and the
+        download step fetches it under another: the download finds
+        nothing, and the proof fails before it reads a file.
+        """
+        upload = step_named(self.document, "dry-run", UPLOAD_STEP)
+        download = step_named(self.document, "install-proof", DOWNLOAD_STEP)
+        self.assertEqual(
+            str((upload.get("with") or {}).get("name")),
+            str((download.get("with") or {}).get("name")),
+        )
+
+    def test_the_proof_unpacks_the_artifact_where_it_reads_it(self) -> None:
+        """The folder the proof reads from is the folder it unpacked into.
+
+        A read from a folder the artifact was not unpacked into is a
+        read of a file that is not there.
+        """
+        download = step_named(self.document, "install-proof", DOWNLOAD_STEP)
+        self.assertEqual(str((download.get("with") or {}).get("path")), DRY_RUN_FOLDER)
 
 
 if __name__ == "__main__":

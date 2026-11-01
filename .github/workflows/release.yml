@@ -1206,11 +1206,24 @@ jobs:
           # The PUBLIC half of the throwaway key the dry run signed the
           # manifest with. The private half was thrown away with the
           # dry run's job.
+          #
+          # `cosign.pub` is at the ROOT of the artifact, so this path is
+          # right: the artifact keeps every file at its path relative
+          # to the repository root (see the step below).
           LAKEHOUSECTL_PUBLIC_KEY_FILE: ${{ github.workspace }}/dry-run/cosign.pub
         run: |
           set -euo pipefail
           mkdir -p bundle install
-          tar --zstd -xf dry-run/rantai-lakehouse-*.tar.zst -C bundle
+          # The bundle is at `dry-run/dist/`, NOT at `dry-run/`:
+          # `upload-artifact` stores every file at its path relative to
+          # the least common ancestor of the upload list — the
+          # repository root, because that list names files from `dist/`,
+          # from `sbom/` and from the root itself — and the dry run
+          # wrote the bundle into `dist/`. Reading it from the root of
+          # the download failed with "tar (child):
+          # dry-run/rantai-lakehouse-*.tar.zst: Cannot open: No such
+          # file or directory" (PR #313 install-proof).
+          tar --zstd -xf dry-run/dist/rantai-lakehouse-*.tar.zst -C bundle
           # The runner's disk and memory are below the release's
           # minimums, so the two checks are skipped — and the install
           # says which checks it skipped. The minimums themselves are
