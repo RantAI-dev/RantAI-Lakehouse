@@ -147,7 +147,7 @@ parquet = "58"
 # its default features are off here because codecs are not ours to choose (the preview
 # accepts the `null` and `deflate` codecs the job's `fastavro` reads without extras);
 # `zip` has `deflate` as `calamine` already enables it; `flate2` reads the gzip prefix.
-apache-avro = { version = "0.21", default-features = false }
+apache-avro = { version = "0.22", default-features = false }
 flate2 = "1.1"
 zip = { version = "9.1", default-features = false, features = ["deflate"] }
 # 0.13, not 0.12: SEC-8 — tiberius 0.12 pulls rustls 0.21 ->
