@@ -107,7 +107,7 @@ export function CommandPalette() {
     const controller = new AbortController();
     const timer = setTimeout(() => {
       assetService
-        // `DATA-41` D3`: the server is asked for what the box shows, so a
+        // `DATA-41` D3: the server is asked for what the box shows, so a
         // catalog of ten thousand tables is not sent to throw all but
         // eight away. `capPaletteAssetResults` stays as the second guard.
         .listAssets({ search: term, limit: PALETTE_ASSET_RESULT_LIMIT }, controller.signal)

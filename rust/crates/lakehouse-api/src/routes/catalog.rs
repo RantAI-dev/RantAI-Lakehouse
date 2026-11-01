@@ -780,6 +780,47 @@ async fn search_snapshot(
         .await
 }
 
+/// Builds the search copy once at start-up, in the background.
+///
+/// `DATA-41` D4: on a catalog of 10,000 tables the copy takes about five
+/// seconds to build, and the first person to search should not pay for
+/// it. The API builds it once the application database is up, so a search
+/// that arrives later is answered from the copy at once.
+///
+/// A search that arrives before this task runs builds the copy inline,
+/// single-flight, as before: the two share the one build.
+///
+/// The builder owns a clone of the state, so the copy can be moved into
+/// the task (`DATA-38` D3). The task's handle is returned so a caller can
+/// wait for it; the API drops it, and the task runs on.
+///
+/// A build that fails is logged and the first search builds the copy
+/// instead — a copy that cannot be built is no worse than no copy at all.
+#[allow(
+    dead_code,
+    reason = "the binary starts the copy at start-up (`main.rs`); the library \
+              target compiles this module too and has no start-up path of its own"
+)]
+pub fn spawn_startup_search_copy(state: &AppState) -> tokio::task::JoinHandle<()> {
+    let owner = Arc::new(state.clone());
+    tokio::spawn(async move {
+        let owner_for_build = Arc::clone(&owner);
+        let result = owner
+            .catalog_search_cache
+            .warm(Instant::now(), SEARCH_SNAPSHOT_TTL, move || {
+                let owner = Arc::clone(&owner_for_build);
+                async move { build_search_snapshot(&owner).await }
+            })
+            .await;
+        if let Err(err) = result {
+            tracing::warn!(
+                %err,
+                "the start-up build of the catalog search copy failed; the first search builds it instead"
+            );
+        }
+    })
+}
+
 /// The rebuild behind [`search_snapshot`]: [`assemble_catalog`], exactly
 /// what `list` serves, then the columns and the use counts.
 async fn build_search_snapshot(
@@ -7214,6 +7255,36 @@ mod tests {
             assert_eq!(requested_limit(Some(200)).unwrap(), Some(200));
             assert!(requested_limit(Some(0)).is_err());
             assert!(requested_limit(Some(201)).is_err());
+        }
+
+        /// `DATA-41` D4: the copy is built at start-up, in the background,
+        /// and the first search is served from it: the search reads no
+        /// catalog of its own.
+        #[tokio::test]
+        async fn the_start_up_build_leaves_a_copy_the_first_search_is_served_from() {
+            let ch = mock_catalog().await;
+            let state = catalog_state(&ch.uri());
+
+            // The start-up build, waited for so the assertion below is
+            // about the copy and not about a race.
+            spawn_startup_search_copy(&state).await.unwrap();
+            let before = ch
+                .received_requests()
+                .await
+                .map_or(0, |requests| requests.len());
+
+            let (status, body) = search_with(&state, Some("revenue"), None).await;
+            assert_eq!(status, StatusCode::OK);
+            let assets = body["assets"].as_array().expect("the answer has assets");
+            assert_eq!(assets.len(), 3, "the copy's assets are the answer");
+            let after = ch
+                .received_requests()
+                .await
+                .map_or(0, |requests| requests.len());
+            assert_eq!(
+                after, before,
+                "the search was served from the copy: it read no catalog"
+            );
         }
     }
 }
