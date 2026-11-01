@@ -2188,3 +2188,24 @@ store is the host's own, and the classic store was run in `docker:29-dind` with
    tag-pinned Compose file with the digests verified by the installer.
 
 **Open: BLOCKER 1, to be fixed per D13.**
+
+### Review S3 round 4 (planner, 2026-11-01, at `02048fac`): D13
+
+D13 is implemented as decided. On bluefin, with an actual air gap, `make_bundle.sh` saves
+each image by its tag, the installer's `image-store` check passes, both images load and are
+found by their pinned digest, and the stack starts with `--pull never`. The counterfactual (the
+old save from the digest reference) reproduced the blocker, so the measurement proves the fix.
+
+- **BLOCKER 1. The dry run's registry does not survive the store switch.** `dry-run` runs its
+  registry as a `services:` container. GitHub starts service containers before the first step,
+  and "Turn on the containerd image store" then restarts Docker and hides the classic store's
+  images. The registry the image builds push to is then gone. The bluefin measurement ran no
+  service container, so it could not see this. *Fix:* start the registry as a step after the
+  switch, and test the order.
+- **SHOULD-FIX 2. The errors promise output the tool hides.** `sys::output` keeps stderr to
+  itself, so a failed `docker compose up`, `docker load` or `docker pull` reaches the operator
+  without its reason. Yet `compose_up` says "The output above says why". The developer reported
+  this; it predates D13. *Fix:* carry the last lines of stderr into the error, and word the
+  message to match.
+
+**Open: BLOCKER 1, SHOULD-FIX 2.**
