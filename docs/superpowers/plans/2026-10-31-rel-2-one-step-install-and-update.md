@@ -1255,3 +1255,137 @@ The PR's dry run passed end to end:
   it (spec: "measured, never assumed").
 
 **Open: BLOCKER 1 (round 6).**
+
+### Fix for review round 6 (developer, 2026-11-01)
+
+**Commit** `525c73c6` (branch `feat/rel-2-s2-release-pipeline`), one commit for the finding.
+
+**BLOCKER 1 (`525c73c6`): the offline bundle holds every image the release runs.**
+
+**The manifest.** `release.json`'s `images` maps EVERY service of the rendered Compose file to
+its `ref@sha256:…`: ours from the published digests the pipeline read back from the registry,
+the third-party ones from the rendered file, which the S1 lint already pinned by digest. A
+third-party image without a digest is refused, and so is a published one without a digest. The
+input flag is now `--published-images` (it was `--images`): the flag said "the images", and
+the flag now says "the published ones" — the third-party ones come from the Compose file.
+
+On this repository's own template the rendered file has **35 services and 17 unique images**,
+of which **13 are third-party**. The manifest names all 35 services; the bundle holds 17 tars
+and 17 SBOMs. Measured by running `render_compose.py` and `make_manifest.py` on the real
+template (a throwaway published map, since the digests of a real release do not exist yet):
+`make_manifest: wrote … for version 0.2.0 (35 image(s), minFrom 0.0.0)`, and the 13
+third-party references the pipeline pulls are exactly the 13 the rendered file names.
+
+**One owner for the rule.** `ops/release/compose_images.py` (new) answers "which image does
+this service run, and is it ours" for the manifest builder AND for the release pipeline, so
+the two cannot drift apart (rule 4). Its parser is the repository's own lint's parser
+(`ops/lint/check_image_digests.py`), so the release and the S1 digest lint cannot disagree
+about what an image is. `ops/release/image_name.sh` (new) is the one owner of the name a
+bundle file carries (the repository name without the tag): `make_bundle.sh` and the
+pipeline's SBOM loop ask the same file, so the bundle can never look for an SBOM nobody
+wrote.
+
+**The bundle.** `make_bundle.sh` saves every UNIQUE reference the manifest names, and pulls
+the ones that are not in the local store yet, by their digest reference. The "every image
+has an SBOM" check stays. Two references that would land on the same file name are REFUSED
+rather than letting one overwrite the other's tar: `image_name.sh` drops the registry and
+the tag, so `postgres:16.15@sha256:…` and `example.com/postgres:16.15@sha256:…` share a
+name. On this repository's own images the 17 names are all different (checked with
+`image_name.sh` over the rendered file's 17 references).
+
+**The pipeline, both jobs.** Each job now:
+
+- frees the runner's disk first, the way `g9-upload-large.yml` does (`df -h /`, the same
+  `rm -rf` of the toolchains this job never uses, `docker image prune --all --force`,
+  `df -h /`), and prints `df -h /` before and after the bundle;
+- pulls the third-party images of the rendered file by digest (`ops/release/compose_images.py
+  --compose docker-compose.release.yml --published-images images.json`, then `docker pull` in
+  a loop);
+- writes a CycloneDX **JSON** SBOM for each of them, with the syft the SBOM action installs:
+  the action's own `download-syft` sub-action, at the SAME commit
+  (`anchore/sbom-action/download-syft@e22c3899…`, v0.24.0), whose `cmd` output is the syft
+  binary. The version is the same one the action installs — `src/SyftVersion.ts` at that
+  commit is `v1.42.3`, and `src/github/SyftGithubAction.ts` reads it for both paths — so the
+  third-party SBOMs and ours come from one scanner;
+- reports the bundle's measured size in the summary (`images: 35 in the manifest, 4 of them
+  ours, each signed and attested`) and in the release notes.
+
+Only our four images are signed and attested: we cannot sign another project's image in its
+own registry. The third-party images' integrity comes from the digest in the SIGNED
+manifest, and the bundle holds the image that digest names.
+
+**One deviation, stated.** The job's `timeout-minutes` goes from **90 to 150** in both jobs.
+The bundle now holds every image the release runs, so the job pulls thirteen third-party
+images, describes each of them, saves each of them and compresses the lot; 90 minutes was
+the budget for four images and a 401 MiB bundle. The reason is written at the site.
+
+**The check on the pin pattern.** `ops/release/test_release_workflow.py`'s pin pattern now
+allows a SUB-ACTION (`owner/repo/path@<sha>`): the syft install is the SBOM action's own
+sub-action at the same commit, and a pattern that could not name it would have reported the
+pipeline's own syft install as unpinned. The action is still pinned to a commit SHA, and the
+release in the trailing comment is still named.
+
+**Commands run, in the foreground, on `525c73c6`:**
+
+| Command | Result |
+| --- | --- |
+| `python3 -m pytest ops/release -q` | **107 passed, 0 failed** (82 before this round, 25 new: 12 in the new `test_compose_images.py`, 2 in `test_make_manifest.py`, 3 in `test_make_bundle.py`, 8 in `test_release_workflow.py`) |
+| `actionlint .github/workflows/release.yml` | clean, exit 0 (actionlint v1.7.7, with shellcheck 0.10.0 on the PATH, so the `run:` blocks were checked too) |
+| `bash -n ops/release/make_bundle.sh ops/release/image_name.sh` | clean, exit 0 |
+| `shellcheck ops/release/make_bundle.sh ops/release/image_name.sh` | clean, exit 0 |
+| `python3 ops/lint/check_intra_package_imports.py` | OK |
+| `python3 ops/lint/check_bare_iceberg_count.py` | no violation |
+| `python3 ops/lint/check_image_digests.py` | 46 third-party image(s) pinned by digest, 8 locally built image(s) exempt |
+
+The pytest run used the virtualenv's interpreter (`/tmp/opencode/relvenv/bin/python -m pytest
+ops/release -q`): the system Python is externally managed (PEP 668), and the virtualenv
+carries `pytest==8.3.4` over the system site packages (PyYAML, cryptography). `actionlint`
+(v1.7.7) and `shellcheck` (v0.10.0) were already downloaded to `/tmp/opencode` by the
+earlier rounds of this slice.
+
+**The bundle script, exercised against a real Docker daemon.** With ONE small third-party
+image — the pinned `alpine:3.20` of `docker-compose.yml` — and a tiny local image built
+`FROM scratch`:
+
+- the alpine image was removed from the local store first, so the script had to PULL it: the
+  log shows `make_bundle: pulling alpine:3.20@sha256:d9e853e8…` and then
+  `make_bundle: saving alpine`;
+- the bundle held `images/alpine.tar`, `images/local-tiny.tar`, `sbom/alpine.cdx.json`,
+  `sbom/local-tiny.cdx.json`, `docker-compose.yml`, `release.json`,
+  `release.json.sigstore.json` and `SHA256SUMS`, and `sha256sum -c SHA256SUMS` answered `OK`
+  for all seven files;
+- `docker load -i images/alpine.tar` answered `Loaded image ID: sha256:d9e853e8…`, and the
+  digest still resolved afterwards. The saved tar's `manifest.json` carries `"RepoTags":
+  null` — the image is found by its DIGEST after the load, not by its tag. That is the same
+  as for our four images before this round, and it is a note for REL-2 S3 (`lakehousectl`
+  loads by digest), not a change here;
+- the SBOMs were written by the same syft the pipeline installs (v1.42.3, downloaded to
+  `/tmp/opencode/syftbin/syft` and checksum-verified) with the exact command the workflow
+  runs: `syft scan "docker:alpine:3.20@sha256:d9e853e8…" -o "cyclonedx-json=…"` — it wrote
+  a CycloneDX JSON document (`"bomFormat":"CycloneDX"`).
+
+The test's images and its working directory were removed afterwards; the machine's own image
+store is as it was.
+
+**The syft the pipeline installs, checked at the pinned commit.** `download-syft/action.yml`
+at `e22c3899…` exposes the input `run` (default `download-syft`) and the output `cmd`;
+`src/index.ts` routes `run: download-syft` to `getSyftCommand()` and sets that output; and
+`src/github/SyftGithubAction.ts` reads `SYFT_VERSION = core.getInput("syft-version") ||
+VERSION` for both paths, with `src/SyftVersion.ts` = `v1.42.3`.
+
+**Not verified, with the reason:**
+
+- **The dry run is not verified.** It needs a GitHub runner, and the PR's own dry run is the
+  proof: pulling thirteen third-party images, the size of the bundle and the runner's free
+  disk are runner facts. What was checked here is the wiring, the syft version at the pinned
+  commit, and the bundle script against a real daemon with one real image.
+- **The bundle's real size is not verified.** It will be several GiB (the review says so);
+  the summary and the release notes print the measured size, and the release notes now carry
+  it, so the number the notes quote is the number the job measured. The 3 MiB measured here
+  is the two-image test bundle, not a release.
+- **The real release is not verified, and cannot be.** It needs a `v*` tag, the owner's
+  approval on the `release` environment, and the release key. REL-2 S5 does that.
+- **The runner's free disk is not measured.** `df -h` is printed before and after the
+  bundle in both jobs, so the next dry run's log answers it.
+- No cargo command, no bun command and no Dagster command ran: this round changes no Rust,
+  no TypeScript, no code location and no Compose file.
