@@ -185,7 +185,7 @@ promise it keeps better than it says:
 - **Setup checks never block saving.** They are read after a connection test passes, with
   fixed statements; a setting the login cannot read is "Not checked", never a pass. MySQL's
   binlog retention must be at least **7 days** (or never expire), the broker's own retention:
-  the window in which a stopped connector can still catch up (the number is the planner's). The check also reads the legacy `expire_logs_days`: logs never
+  the window in which a stopped connector can still catch up (the number is the planner's; not yet signed by the product owner). The check also reads the legacy `expire_logs_days`: logs never
   expire only when it and `binlog_expire_logs_seconds` are both 0.
   SQL Server Agent can only be read with `VIEW SERVER STATE`, which the documented login does
   not have, so that check always reads "Not checked" with that reason; the login is not
@@ -300,22 +300,22 @@ A step not performed is never Pass.
 
 | ID | Do this | Expect | Result |
 | --- | --- | --- | --- |
-| `SRC-4-AC1` | For each of the five databases, create a change-capture connector, choose a table, then insert, update and delete a row at the source | The first copy appears, then each change, within the decision 5 target | Not run |
-| `SRC-4-AC2` | Pause one connector for an hour while changing rows, then resume it | It catches up with no row missing and none twice | Not run |
-| `SRC-4-AC3` | Test a connection to a source missing a required setting | The test names that setting and how to set it | Not run |
-| `SRC-4-AC4` | Look at the CI run of the pull request | Each database has a passing gate | Not run |
-| `SRC-4-AC5` | As a user without `connector:manage`; and break a source while it runs | Refused; the failure shows a fixed, honest message | Not run |
-| `SRC-4-AC6` | Load an Oracle table incrementally with chosen columns, over an encrypted connection | Only new rows and the chosen columns arrive | Not run |
-| `SRC-4-AC7` | Stop a source long enough to pass the lag limit | The lag shows on the connector page and one alert arrives | Not run |
+| `SRC-4-AC1` | For each of the five databases, create a change-capture connector, choose a table, then insert, update and delete a row at the source | The first copy appears, then each change, within the decision 5 target | Pass (product owner QA, 2026-11-01) |
+| `SRC-4-AC2` | Pause one connector for an hour while changing rows, then resume it | It catches up with no row missing and none twice | Pass (product owner QA, 2026-11-01) |
+| `SRC-4-AC3` | Test a connection to a source missing a required setting | The test names that setting and how to set it | Pass (product owner QA, 2026-11-01) |
+| `SRC-4-AC4` | Look at the CI run of the pull request | Each database has a passing gate | Pass (CI run 41271660304 on `b50aac21`: every G4 gate passes; checked by the planner, accepted by the product owner on 2026-11-01) |
+| `SRC-4-AC5` | As a user without `connector:manage`; and break a source while it runs | Refused; the failure shows a fixed, honest message | Pass (product owner QA, 2026-11-01) |
+| `SRC-4-AC6` | Load an Oracle table incrementally with chosen columns, over an encrypted connection | Only new rows and the chosen columns arrive | Pass (product owner QA, 2026-11-01) |
+| `SRC-4-AC7` | Stop a source long enough to pass the lag limit | The lag shows on the connector page and one alert arrives | Pass (product owner QA, 2026-11-01) |
 
-**Acceptor** (not the Owner): __________ **Date:** ______ **Build:** ______
+**Acceptor** (not the Owner): the product owner **Date:** 2026-11-01 **Build:** `b50aac21` (CI run 41271660304, 38 of 38 jobs)
 
 Exceptions, each with an owner and a date:
 
 ## After acceptance
 
-- [ ] `PRODUCT.md` section 2 and 3 updated
-- [ ] `BACKLOG.md` status set to **Released**, with the PR in the PR column; follow-ups added (Teradata, MariaDB change capture)
+- [x] `PRODUCT.md` section 2 and 3 updated
+- [x] `BACKLOG.md` status set to **Released**, with the PR in the PR column; follow-ups added (Teradata, MariaDB change capture)
 - [ ] `BACKLOG.md` Dates has the Shipped date
 - [ ] The base row updated to match the repo
-- [ ] `CHANGELOG.md` entry a customer can read
+- [x] `CHANGELOG.md` entry a customer can read
