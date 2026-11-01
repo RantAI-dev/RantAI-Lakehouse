@@ -74,10 +74,11 @@ export function assetQueryStudioHref(a: Target & Pick<AssetDetail, "schema">) {
  * read from its Iceberg table (a `silver.*` read has no snapshots to go
  * back to), or when the id is not the plain number Iceberg issues.
  *
- * Only ClickHouse can be pinned (`pinSnapshot`, the one function that
- * writes the pin). A Trino target gives `null` until Trino time travel is
- * supported: the API cannot parse the clause it would need, so offering a
- * link would offer a query that is refused (`DATA-16` F6, `DATA-21`).
+ * This link is the ClickHouse one (`pinSnapshot`, the one function that
+ * writes the pin): it names the `DataLakeCatalog` table the ClickHouse
+ * engine reads. A Trino asset's version is opened in Query Studio's own
+ * picker instead — the pin belongs to the table it is written on, and
+ * that is the Trino table, not this one (`DATA-21` D5).
  */
 export function assetSnapshotQueryHref(
   a: Target & Pick<AssetDetail, "schema">,
