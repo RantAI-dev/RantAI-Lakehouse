@@ -669,57 +669,9 @@ async fn list_body(
         );
     }
 
-    let total_of = |slug: &str| -> i64 {
-        sync_rows
-            .iter()
-            .find(|s| str_col(s, "slug") == slug)
-            .map_or(0, |s| num_or_zero(Some(s), "total"))
-    };
-    let author_of = |slug: &str| -> String {
-        sync_rows
-            .iter()
-            .find(|s| str_col(s, "slug") == slug)
-            .map(|s| str_col(s, "author").to_owned())
-            .unwrap_or_default()
-    };
-    let col_of = |slug: &str| -> i64 {
-        col_rows
-            .iter()
-            .find(|c| str_col(c, "slug") == slug)
-            .map_or(0, |c| num_or_zero(Some(c), "n"))
-    };
-    let frequency_of = |slug: &str| -> Option<i64> {
-        sync_rows
-            .iter()
-            .find(|s| str_col(s, "slug") == slug)
-            .and_then(|s| catalog_governance::frequency_target_seconds(str_col(s, "frekuensi")))
-    };
-
-    let mut assets: Vec<Value> = cat
-        .iter()
-        .map(|c| {
-            let slug = str_col(c, "slug");
-            let rows = total_of(slug);
-            let sekunder = str_col(c, "tier") == "sekunder";
-            let owner = author_of(slug);
-            let description = str_col(c, "description");
-            let updated_at = str_col(c, "updated_at");
-            let mut row = bronze_catalog_row(
-                slug,
-                str_col(c, "title"),
-                sekunder,
-                owner.as_str(),
-                description,
-                rows,
-                col_of(slug),
-                updated_at,
-            );
-            if let Some(seconds) = frequency_of(slug) {
-                set_freshness_target(&mut row, seconds, "frequency");
-            }
-            row
-        })
-        .collect();
+    // `DATA-41` D1: the registry reads are indexed by slug, once per
+    // assembly, and the assets are read out of the index.
+    let mut assets: Vec<Value> = assemble_bronze_rows(&cat, &sync_rows, &col_rows);
 
     let bronze_table_names: HashSet<&str> = cat.iter().map(|c| str_col(c, "table_name")).collect();
     // Handed back to `list` for `enrich_bronze_assets` — taken from `cat`
@@ -803,6 +755,121 @@ async fn list_body(
         json!({ "assets": assets, "namespaces": namespaces }),
         bronze_pairs,
     ))
+}
+
+/// The Bronze registry's rows, keyed by slug.
+///
+/// `DATA-41` D1: the four registry lookups used to scan every row of
+/// every read, once per asset. On a catalog of 10,000 tables that is
+/// quadratic — the copy build took about 9.2 seconds, and the no-term
+/// list paid it on every request. One map per read, built once per
+/// assembly, is linear.
+///
+/// A slug with several rows answers with the FIRST row in read order:
+/// that is what the `.find()` this replaces returned, and the assembled
+/// rows must not change because the lookup got faster.
+struct BronzeRegistry<'a> {
+    /// The sync rows — `total`, `author` and `frekuensi` — by slug.
+    sync: HashMap<&'a str, &'a Map<String, Value>>,
+    /// The column-count rows by slug.
+    columns: HashMap<&'a str, &'a Map<String, Value>>,
+}
+
+impl<'a> BronzeRegistry<'a> {
+    /// Indexes the two reads, keyed by slug.
+    ///
+    /// `or_insert`, not `insert`: a slug with several rows keeps the
+    /// first one in read order, which is what the `.find()` this
+    /// replaces returned.
+    fn new(sync_rows: &'a [Map<String, Value>], col_rows: &'a [Map<String, Value>]) -> Self {
+        /// One read, keyed by slug, keeping the first row of a slug.
+        fn by_slug<'a>(rows: &'a [Map<String, Value>]) -> HashMap<&'a str, &'a Map<String, Value>> {
+            let mut map: HashMap<&'a str, &'a Map<String, Value>> =
+                HashMap::with_capacity(rows.len());
+            for row in rows {
+                map.entry(str_col(row, "slug")).or_insert(row);
+            }
+            map
+        }
+        Self {
+            sync: by_slug(sync_rows),
+            columns: by_slug(col_rows),
+        }
+    }
+
+    /// The row count the sync row reports; `0` when it has none.
+    fn total_of(&self, slug: &str) -> i64 {
+        match self.sync.get(slug).copied() {
+            Some(s) => num_or_zero(Some(s), "total"),
+            None => 0,
+        }
+    }
+
+    /// The author the sync row names; `""` when it names none.
+    fn author_of(&self, slug: &str) -> &'a str {
+        match self.sync.get(slug).copied() {
+            Some(s) => str_col(s, "author"),
+            None => "",
+        }
+    }
+
+    /// The number of columns the column read counts for the slug; `0`
+    /// when it counts none.
+    fn column_count_of(&self, slug: &str) -> i64 {
+        match self.columns.get(slug).copied() {
+            Some(c) => num_or_zero(Some(c), "n"),
+            None => 0,
+        }
+    }
+
+    /// The freshness target the sync row's frequency names; `None` when
+    /// it names none.
+    fn frequency_of(&self, slug: &str) -> Option<i64> {
+        self.sync
+            .get(slug)
+            .copied()
+            .and_then(|s| catalog_governance::frequency_target_seconds(str_col(s, "frekuensi")))
+    }
+}
+
+/// The Bronze assets the catalog rows and the registry reads assemble
+/// into.
+///
+/// `DATA-41` D1: the registry's sync and column rows are looked up by
+/// key (see [`BronzeRegistry`]), not by scanning every row per asset.
+/// The rows are the same rows the scan produced: a slug with no sync row
+/// reads as zero rows and no author, and a slug with no column row
+/// reads as no columns.
+fn assemble_bronze_rows(
+    cat: &[Map<String, Value>],
+    sync_rows: &[Map<String, Value>],
+    col_rows: &[Map<String, Value>],
+) -> Vec<Value> {
+    let registry = BronzeRegistry::new(sync_rows, col_rows);
+    cat.iter()
+        .map(|c| {
+            let slug = str_col(c, "slug");
+            let rows = registry.total_of(slug);
+            let sekunder = str_col(c, "tier") == "sekunder";
+            let owner = registry.author_of(slug);
+            let description = str_col(c, "description");
+            let updated_at = str_col(c, "updated_at");
+            let mut row = bronze_catalog_row(
+                slug,
+                str_col(c, "title"),
+                sekunder,
+                owner,
+                description,
+                rows,
+                registry.column_count_of(slug),
+                updated_at,
+            );
+            if let Some(seconds) = registry.frequency_of(slug) {
+                set_freshness_target(&mut row, seconds, "frequency");
+            }
+            row
+        })
+        .collect()
 }
 
 /// How long the search copy is trusted before one request rebuilds it
@@ -7972,6 +8039,276 @@ mod tests {
                 after, before,
                 "the search was served from the copy: it read no catalog"
             );
+        }
+    }
+
+    // ── `DATA-41` D1: the registry reads are looked up by key. ───────────
+    //
+    // The old code scanned every row of every read once per asset, which
+    // is quadratic in the size of the catalog: on 10,000 tables the copy
+    // build took about 9.2 seconds, and the no-term list paid it on
+    // every request. The keyed lookup must assemble the SAME rows the
+    // scan did, so the scan is kept here as the reference and the two
+    // are compared over a fixture of several hundred assets with
+    // duplicate slugs and with slugs whose sync or column row is
+    // missing.
+    mod keyed_lookup {
+        #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+        use super::*;
+
+        /// How many assets the fixture holds: several hundred, so the
+        /// comparison is over a catalog big enough for the quadratic
+        /// scan to be worth replacing.
+        const ASSETS: usize = 400;
+
+        /// One read's row: the columns the read named, as the engine
+        /// rendered them.
+        fn map_of(pairs: Vec<(&str, Value)>) -> Map<String, Value> {
+            pairs.into_iter().map(|(k, v)| (k.to_owned(), v)).collect()
+        }
+
+        /// The three reads of the fixture: the catalog rows, the sync
+        /// rows and the column rows.
+        struct Fixture {
+            cat: Vec<Map<String, Value>>,
+            sync: Vec<Map<String, Value>>,
+            columns: Vec<Map<String, Value>>,
+        }
+
+        /// The fixture: `ASSETS` catalog rows, and the sync and column
+        /// reads that go with them.
+        ///
+        /// The awkward rows are in it on purpose:
+        /// - a slug with NO sync row (`index % 10 == 3`): no rows
+        ///   counted and no author,
+        /// - a slug with TWO sync rows (`index % 10 == 7`): the first
+        ///   one in read order is the one that answers,
+        /// - a slug with NO column row (`index % 7 == 2`): no columns
+        ///   counted,
+        /// - a slug with TWO column rows (`index % 7 == 4`): the first
+        ///   one in read order is the one that answers,
+        /// - a slug whose row count is not a number (`index % 13 == 1`):
+        ///   it reads as zero, because a value that is not a number is
+        ///   not a number,
+        /// - a sync row for a slug no catalog row holds: it changes
+        ///   nothing.
+        fn fixture() -> Fixture {
+            let mut cat = Vec::with_capacity(ASSETS);
+            let mut sync = Vec::with_capacity(ASSETS);
+            let mut columns = Vec::with_capacity(ASSETS);
+
+            for index in 0..ASSETS {
+                let slug = format!("asset_{index:04}");
+                cat.push(map_of(vec![
+                    ("slug", json!(slug)),
+                    ("title", json!(format!("Asset {index}"))),
+                    ("description", json!(format!("the asset {index}"))),
+                    (
+                        "tier",
+                        json!(if index % 3 == 0 { "sekunder" } else { "primer" }),
+                    ),
+                    ("updated_at", json!("2026-11-01T00:00:00Z")),
+                    ("table_name", json!(format!("asset_{index:04}_raw"))),
+                ]));
+
+                if index % 10 != 3 {
+                    let total = if index % 13 == 1 {
+                        "not-a-number".to_owned()
+                    } else {
+                        (index * 7).to_string()
+                    };
+                    sync.push(map_of(vec![
+                        ("slug", json!(slug)),
+                        ("total", json!(total)),
+                        ("author", json!(format!("team_{index}"))),
+                        (
+                            "frekuensi",
+                            json!(if index % 3 == 0 { "harian" } else { "bulanan" }),
+                        ),
+                    ]));
+                }
+                if index % 10 == 7 {
+                    // A SECOND sync row for the same slug, later in read
+                    // order than the first one.
+                    sync.push(map_of(vec![
+                        ("slug", json!(slug)),
+                        ("total", json!("999999")),
+                        ("author", json!("the later team")),
+                        ("frekuensi", json!("mingguan")),
+                    ]));
+                }
+
+                if index % 7 != 2 {
+                    columns.push(map_of(vec![
+                        ("slug", json!(slug)),
+                        ("n", json!((index % 5).to_string())),
+                    ]));
+                }
+                if index % 7 == 4 {
+                    // A SECOND column row for the same slug, later in
+                    // read order than the first one.
+                    columns.push(map_of(vec![("slug", json!(slug)), ("n", json!("4242"))]));
+                }
+            }
+
+            // A sync row for a slug no catalog row holds.
+            sync.push(map_of(vec![
+                ("slug", json!("asset_not_in_the_catalog")),
+                ("total", json!("1")),
+                ("author", json!("nobody")),
+                ("frekuensi", json!("harian")),
+            ]));
+
+            Fixture { cat, sync, columns }
+        }
+
+        /// The assembly as it was before `DATA-41` D1: the four
+        /// `.find()` scans. Kept here as the reference the keyed
+        /// lookup is compared with.
+        fn scanned_rows(
+            cat: &[Map<String, Value>],
+            sync_rows: &[Map<String, Value>],
+            col_rows: &[Map<String, Value>],
+        ) -> Vec<Value> {
+            let total_of = |slug: &str| -> i64 {
+                sync_rows
+                    .iter()
+                    .find(|s| str_col(s, "slug") == slug)
+                    .map_or(0, |s| num_or_zero(Some(s), "total"))
+            };
+            let author_of = |slug: &str| -> String {
+                sync_rows
+                    .iter()
+                    .find(|s| str_col(s, "slug") == slug)
+                    .map(|s| str_col(s, "author").to_owned())
+                    .unwrap_or_default()
+            };
+            let col_of = |slug: &str| -> i64 {
+                col_rows
+                    .iter()
+                    .find(|c| str_col(c, "slug") == slug)
+                    .map_or(0, |c| num_or_zero(Some(c), "n"))
+            };
+            let frequency_of = |slug: &str| -> Option<i64> {
+                sync_rows
+                    .iter()
+                    .find(|s| str_col(s, "slug") == slug)
+                    .and_then(|s| {
+                        catalog_governance::frequency_target_seconds(str_col(s, "frekuensi"))
+                    })
+            };
+
+            cat.iter()
+                .map(|c| {
+                    let slug = str_col(c, "slug");
+                    let rows = total_of(slug);
+                    let sekunder = str_col(c, "tier") == "sekunder";
+                    let owner = author_of(slug);
+                    let description = str_col(c, "description");
+                    let updated_at = str_col(c, "updated_at");
+                    let mut row = bronze_catalog_row(
+                        slug,
+                        str_col(c, "title"),
+                        sekunder,
+                        owner.as_str(),
+                        description,
+                        rows,
+                        col_of(slug),
+                        updated_at,
+                    );
+                    if let Some(seconds) = frequency_of(slug) {
+                        set_freshness_target(&mut row, seconds, "frequency");
+                    }
+                    row
+                })
+                .collect()
+        }
+
+        /// The keyed lookup assembles the rows the scan assembled.
+        #[test]
+        fn the_keyed_lookup_assembles_the_rows_the_scan_assembled() {
+            let fixture = fixture();
+            let scanned = scanned_rows(&fixture.cat, &fixture.sync, &fixture.columns);
+            let keyed = assemble_bronze_rows(&fixture.cat, &fixture.sync, &fixture.columns);
+
+            assert_eq!(
+                keyed.len(),
+                ASSETS,
+                "every catalog row is one asset, in both"
+            );
+            assert_eq!(
+                keyed, scanned,
+                "the keyed lookup assembles exactly the rows the scan did"
+            );
+        }
+
+        /// A slug with several rows answers with the FIRST one in read
+        /// order — what the `.find()` the keyed lookup replaced
+        /// returned.
+        #[test]
+        fn a_slug_with_several_rows_answers_with_the_first_one_in_read_order() {
+            let fixture = fixture();
+            let rows = assemble_bronze_rows(&fixture.cat, &fixture.sync, &fixture.columns);
+
+            // `asset_0007` has two sync rows and one column row.
+            let seven = rows
+                .iter()
+                .find(|r| r["id"] == json!("asset_0007"))
+                .expect("the asset is listed");
+            assert_eq!(seven["rows"], json!(49), "the FIRST sync row's count");
+            assert_eq!(
+                seven["owner"],
+                json!("team_7"),
+                "the FIRST sync row's author"
+            );
+            assert_eq!(
+                seven["freshnessTargetSeconds"],
+                json!(31 * 86_400 * 3 / 2),
+                "the FIRST sync row's frequency"
+            );
+
+            // `asset_0018` has one sync row and two column rows.
+            let eighteen = rows
+                .iter()
+                .find(|r| r["id"] == json!("asset_0018"))
+                .expect("the asset is listed");
+            assert_eq!(
+                eighteen["columnCount"],
+                json!(3),
+                "the FIRST column row's count"
+            );
+        }
+
+        /// A slug the registry has no row for reads as nothing: no rows,
+        /// no author, no columns, and no freshness target.
+        #[test]
+        fn a_slug_with_no_registry_row_reads_as_nothing() {
+            let fixture = fixture();
+            let rows = assemble_bronze_rows(&fixture.cat, &fixture.sync, &fixture.columns);
+
+            // `asset_0003` has no sync row and one column row.
+            let three = rows
+                .iter()
+                .find(|r| r["id"] == json!("asset_0003"))
+                .expect("the asset is listed");
+            assert_eq!(three["rows"], json!(0), "no sync row, no rows");
+            assert_eq!(
+                three["owner"],
+                json!(*TENANT_OWNER),
+                "no sync row, so the tenant's own owner"
+            );
+            assert!(
+                three.get("freshnessTargetSeconds").is_none(),
+                "no sync row, so no freshness target: {three:?}"
+            );
+
+            // `asset_0002` has one sync row and no column row.
+            let two = rows
+                .iter()
+                .find(|r| r["id"] == json!("asset_0002"))
+                .expect("the asset is listed");
+            assert_eq!(two["columnCount"], json!(0), "no column row, no columns");
         }
     }
 }
