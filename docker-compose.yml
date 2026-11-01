@@ -2248,6 +2248,17 @@ services:
       DAGSTER_PG_USER: ${POSTGRES_USER:-lakehouse}
       DAGSTER_PG_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}
       DAGSTER_PG_DB: ${DAGSTER_PG_DB:-dagster}
+      # REL-2 S4 decision D16: the pause. `true` stops the jobs that
+      # DELETE files — the snapshot expiry and the orphan-file removal —
+      # from running: they skip and say why, and they do not fail. The
+      # jobs run HERE, in the code location, so this is the service
+      # that reads the value. `lakehousectl` sets it before the backup
+      # of an update and clears it after the update succeeds or is
+      # rolled back, because a restore brings the catalogs back to the
+      # moment of the backup and a job that deleted a file the restored
+      # catalog still names would break the table. The value is read as
+      # `== "true"`.
+      MAINTENANCE_PAUSED: ${MAINTENANCE_PAUSED:-}
       # CREDENTIAL HYGIENE (review finding): this used to be a single
       # `BRONZE_SOURCE_DATABASE_URL` env var carrying a full
       # `postgresql://user:password@host/db` DSN — a plaintext password
@@ -2525,6 +2536,15 @@ services:
       DAGSTER_PG_USER: ${POSTGRES_USER:-lakehouse}
       DAGSTER_PG_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}
       DAGSTER_PG_DB: ${DAGSTER_PG_DB:-dagster}
+      # REL-2 S4 decision D16: the pause. `true` stops the jobs that
+      # DELETE files — the snapshot expiry and the orphan-file removal —
+      # from running: they skip and say why, and they do not fail.
+      # `lakehousectl` sets it before the backup of an update and clears
+      # it after the update succeeds or is rolled back, because a
+      # restore brings the catalogs back to the moment of the backup
+      # and a job that deleted a file the restored catalog still names
+      # would break the table. The value is read as `== "true"`.
+      MAINTENANCE_PAUSED: ${MAINTENANCE_PAUSED:-}
     command: ["dagster-webserver", "-h", "0.0.0.0", "-p", "3000", "-w", "/opt/dagster/app/workspace.yaml"]
     ports:
       - "${DAGSTER_WEBSERVER_HOST_PORT:-3000}:3000"
@@ -2566,6 +2586,15 @@ services:
       DAGSTER_PG_USER: ${POSTGRES_USER:-lakehouse}
       DAGSTER_PG_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}
       DAGSTER_PG_DB: ${DAGSTER_PG_DB:-dagster}
+      # REL-2 S4 decision D16: the pause. `true` stops the jobs that
+      # DELETE files — the snapshot expiry and the orphan-file removal —
+      # from running: they skip and say why, and they do not fail.
+      # `lakehousectl` sets it before the backup of an update and clears
+      # it after the update succeeds or is rolled back, because a
+      # restore brings the catalogs back to the moment of the backup
+      # and a job that deleted a file the restored catalog still names
+      # would break the table. The value is read as `== "true"`.
+      MAINTENANCE_PAUSED: ${MAINTENANCE_PAUSED:-}
     command: ["dagster-daemon", "run", "-w", "/opt/dagster/app/workspace.yaml"]
     restart: unless-stopped
 
