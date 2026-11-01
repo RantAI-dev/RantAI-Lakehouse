@@ -3,6 +3,14 @@
 //! The tool does not talk to the Docker socket: it runs the `docker`
 //! command, which is what an operator runs, and whose output the
 //! operator can read in their own terminal.
+//!
+//! The commands here run with `sys::output_or_stderr`, so the error
+//! the operator reads carries what Docker said on its error stream
+//! (REL-2 S3 review round 4 SHOULD-FIX 2). That output carries NO
+//! SECRET: the arguments name images, image files and the Compose
+//! file, and Docker's own error output names the same things back. The
+//! signing key and the secrets of the stack are never in a `docker`
+//! command's arguments, and Docker never prints them.
 
 use std::path::Path;
 
@@ -15,12 +23,13 @@ pub const PROJECT: &str = "rantai-lakehouse";
 ///
 /// # Errors
 ///
-/// Returns the message that says what to fix when the pull fails.
+/// Returns the message that says what to fix when the pull fails, with
+/// what Docker said about it.
 pub fn pull(reference: &str) -> Result<(), String> {
-    sys::output("docker", &["pull", reference])
+    sys::output_or_stderr("docker", &["pull", reference])
         .map(|_| ())
         .map_err(|error| {
-            format!("the image {reference} could not be pulled: {error}. Is this host online?")
+            format!("the image {reference} could not be pulled. Is this host online? {error}")
         })
 }
 
@@ -28,14 +37,15 @@ pub fn pull(reference: &str) -> Result<(), String> {
 ///
 /// # Errors
 ///
-/// Returns the message that says what to fix when the load fails.
+/// Returns the message that says what to fix when the load fails, with
+/// what Docker said about it.
 pub fn load(tar: &Path) -> Result<(), String> {
     let path = tar.to_string_lossy().to_string();
-    sys::output("docker", &["load", "-i", &path])
+    sys::output_or_stderr("docker", &["load", "-i", &path])
         .map(|_| ())
         .map_err(|error| {
             format!(
-                "the image file {} could not be loaded: {error}",
+                "the image file {} could not be loaded. {error}",
                 tar.display()
             )
         })
@@ -46,13 +56,13 @@ pub fn load(tar: &Path) -> Result<(), String> {
 /// # Errors
 ///
 /// Returns the message that says what to fix when the image is not in
-/// the store.
+/// the store, with what Docker said about it.
 pub fn image_id(reference: &str) -> Result<String, String> {
-    sys::output(
+    sys::output_or_stderr(
         "docker",
         &["image", "inspect", "--format", "{{.Id}}", reference],
     )
-    .map_err(|error| format!("the image {reference} is not in the local store: {error}"))
+    .map_err(|error| format!("the image {reference} is not in the local store. {error}"))
 }
 
 /// Start the stack.
@@ -63,13 +73,25 @@ pub fn image_id(reference: &str) -> Result<String, String> {
 ///
 /// # Errors
 ///
-/// Returns the message that says what to fix when Compose fails.
+/// Returns the message that says what to fix when Compose fails, with
+/// what Compose and Docker said about it: the error is the whole
+/// answer, so the message does not point at an output that is not
+/// printed (REL-2 S3 review round 4 SHOULD-FIX 2).
 pub fn compose_up(dir: &Path, env_file: &Path) -> Result<(), String> {
     let args = compose_up_args(dir, env_file);
     let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
-    sys::output("docker", &borrowed)
+    sys::output_or_stderr("docker", &borrowed)
         .map(|_| ())
-        .map_err(|error| format!("the stack did not start: {error}. The output above says why."))
+        .map_err(|error| stack_error(&error))
+}
+
+/// The message of a failed stack start.
+///
+/// The error carries Docker's own error output, so the message is the
+/// whole answer: it must not point at an output that nothing prints
+/// (REL-2 S3 review round 4 SHOULD-FIX 2).
+fn stack_error(error: &std::io::Error) -> String {
+    format!("the stack did not start: {error}")
 }
 
 /// The `docker compose` arguments that start the stack.
@@ -144,6 +166,21 @@ mod tests {
         assert!(
             args.contains(&"-d".to_string()),
             "the arguments are {args:?}"
+        );
+    }
+
+    #[test]
+    fn the_stack_error_is_the_whole_answer() {
+        // REL-2 S3 review round 4 SHOULD-FIX 2: the error carries what
+        // Docker said, so the message must not point at an output above
+        // that nothing prints.
+        let error = std::io::Error::other("docker exited with exit status: 1\nthe reason");
+        let message = stack_error(&error);
+        assert!(message.contains("the stack did not start:"), "{message}");
+        assert!(message.contains("the reason"), "{message}");
+        assert!(
+            !message.contains("output above"),
+            "the message points at an output that is not printed: {message}"
         );
     }
 }

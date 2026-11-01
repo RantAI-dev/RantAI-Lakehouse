@@ -7,7 +7,13 @@
 //! those can be tested with facts injected instead of a machine.
 
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Output};
+
+/// How many lines of a failed command's error output the error carries.
+///
+/// Twenty is enough for Docker to say what went wrong, and short enough
+/// for a terminal to show (REL-2 S3 review round 4 SHOULD-FIX 2).
+pub const STDERR_LINES: usize = 20;
 
 /// Run a command and return its standard output.
 ///
@@ -35,14 +41,66 @@ pub fn output(program: &str, args: &[&str]) -> Result<String, std::io::Error> {
 /// Returns the error the operating system gave when the command could
 /// not be run at all, or when it exited with a failure.
 pub fn output_bytes(program: &str, args: &[&str]) -> Result<Vec<u8>, std::io::Error> {
-    let result = Command::new(program).args(args).output()?;
+    let result = capture(program, args)?;
     if !result.status.success() {
-        return Err(std::io::Error::other(format!(
-            "{program} exited with {}",
-            result.status
-        )));
+        return Err(failed(program, &result));
     }
     Ok(result.stdout)
+}
+
+/// Run a command and return its standard output, and its error output
+/// when it fails.
+///
+/// The error message carries the LAST [`STDERR_LINES`] lines of what
+/// the command said on its error stream. `docker compose up`, `docker
+/// load` and `docker pull` say WHY they failed there, and a message
+/// that names only the exit status leaves the operator with nothing to
+/// act on (REL-2 S3 review round 4 SHOULD-FIX 2).
+///
+/// # Errors
+///
+/// Returns the error the operating system gave when the command could
+/// not be run at all, or when it exited with a failure — with the
+/// command's own error output in the message.
+pub fn output_or_stderr(program: &str, args: &[&str]) -> Result<String, std::io::Error> {
+    let result = capture(program, args)?;
+    if !result.status.success() {
+        return Err(failed_with_stderr(program, &result));
+    }
+    Ok(String::from_utf8_lossy(&result.stdout).trim().to_string())
+}
+
+/// Run a command and keep both of its streams.
+fn capture(program: &str, args: &[&str]) -> Result<Output, std::io::Error> {
+    Command::new(program).args(args).output()
+}
+
+/// The error of a command that failed: its exit status, and nothing else.
+fn failed(program: &str, result: &Output) -> std::io::Error {
+    std::io::Error::other(format!("{program} exited with {}", result.status))
+}
+
+/// The error of a command that failed: its exit status, and the last
+/// lines of what it said on its error stream.
+///
+/// The error output is on its OWN lines, under the status: a reader
+/// sees what the command said, and the status stays a status.
+fn failed_with_stderr(program: &str, result: &Output) -> std::io::Error {
+    let mut message = format!("{program} exited with {}", result.status);
+    let lines = last_lines(&result.stderr, STDERR_LINES);
+    if !lines.is_empty() {
+        message.push('\n');
+        message.push_str(&lines);
+    }
+    std::io::Error::other(message)
+}
+
+/// The last `count` lines of a command's error output.
+fn last_lines(stderr: &[u8], count: usize) -> String {
+    let text = String::from_utf8_lossy(stderr);
+    let lines: Vec<&str> = text.trim_end().lines().collect();
+    let start = lines.len().saturating_sub(count);
+    lines[start..].join("\n")
 }
 
 /// The free space on the filesystem that holds `path`, in bytes.
@@ -102,6 +160,43 @@ mod tests {
     #[test]
     fn a_command_that_fails_is_an_error() {
         assert!(output("false", &[]).is_err());
+    }
+
+    #[test]
+    fn the_error_output_of_a_failed_command_is_in_the_error() {
+        // REL-2 S3 review round 4 SHOULD-FIX 2: the operator has to read
+        // WHY the command failed, not only that it did.
+        let error = output_or_stderr("sh", &["-c", "echo 'the reason' >&2; exit 3"])
+            .expect_err("the command fails");
+        let message = error.to_string();
+        assert!(message.contains("the reason"), "the message is {message}");
+        assert!(message.contains("exited with"), "the message is {message}");
+    }
+
+    #[test]
+    fn the_error_output_of_a_failed_command_is_capped_at_twenty_lines() {
+        // The cap is what keeps the message readable: a command that
+        // says a hundred lines must not bury the exit status.
+        let script =
+            "i=1; while [ $i -le 40 ]; do echo \"line $i\" >&2; i=$((i + 1)); done; exit 1";
+        let error = output_or_stderr("sh", &["-c", script]).expect_err("the command fails");
+        let message = error.to_string();
+        let lines: Vec<&str> = message
+            .lines()
+            .filter(|line| line.starts_with("line "))
+            .collect();
+        assert_eq!(lines.len(), STDERR_LINES, "the message is {message}");
+        assert_eq!(lines[0], "line 21", "the message is {message}");
+        assert_eq!(lines.last().copied(), Some("line 40"), "{message}");
+    }
+
+    #[test]
+    fn a_command_that_says_nothing_on_its_error_stream_is_an_error() {
+        // The message still says what happened: there is nothing to add.
+        let error = output_or_stderr("false", &[]).expect_err("the command fails");
+        let message = error.to_string();
+        assert!(message.contains("exited with"), "the message is {message}");
+        assert_eq!(message.lines().count(), 1, "the message is {message}");
     }
 
     #[test]
