@@ -120,6 +120,11 @@ class ScriptTestCase(unittest.TestCase):
             return []
         return self.docker_log.read_text(encoding="utf-8").splitlines()
 
+    def clear_docker_log(self) -> None:
+        """The calls recorded so far are forgotten."""
+        if self.docker_log.exists():
+            self.docker_log.unlink()
+
 
 class BackupScriptTest(ScriptTestCase):
     """`ops/backups/backup-local.sh`."""
@@ -139,17 +144,40 @@ class BackupScriptTest(ScriptTestCase):
 
     def test_the_developers_behaviour_is_unchanged_when_the_variable_is_unset(self) -> None:
         """Without `LAKEHOUSE_DIR`, the script works on the repository
-        it lives in — the same Compose file, the same `.env`, the same
-        project."""
+        it lives in — and it runs the command it always ran:
+        `docker compose -p <project>` there.
+
+        Naming a Compose file would stop compose from finding the
+        developer's own `docker-compose.override.yml` by itself
+        (REL-2 S4 review round 1 SHOULD-FIX 3).
+        """
         result = self.run_backup(self.root / "backups")
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.docker_calls()
         compose = [call for call in calls if "compose" in call]
         self.assertTrue(compose, f"the script never ran compose: {calls}")
         first = compose[0]
-        self.assertIn(f"-f {self.root}/docker-compose.yml", first)
-        self.assertIn(f"--env-file {self.root}/.env", first)
-        self.assertIn(f"-p {self.root.name}", first)
+        self.assertTrue(
+            first.startswith(f"docker compose -p {self.root.name} "),
+            f"the command is not the one the repository always ran: {first}",
+        )
+        self.assertNotIn("-f ", first)
+        self.assertNotIn("--env-file", first)
+        self.assertNotIn("override.yml", first)
+
+    def test_the_developers_own_override_is_left_to_compose_in_the_repository(self) -> None:
+        """In the repository, compose finds `docker-compose.override.yml`
+        by itself. A command that names a Compose file would stop it
+        from doing so (REL-2 S4 review round 1 SHOULD-FIX 3)."""
+        (self.root / "docker-compose.override.yml").write_text(
+            "services:\n  postgres:\n    image: postgres:16.15\n", encoding="utf-8"
+        )
+        result = self.run_backup(self.root / "backups")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        compose = [call for call in self.docker_calls() if "compose" in call]
+        self.assertTrue(compose, f"the script never ran compose: {self.docker_calls()}")
+        self.assertNotIn("-f ", compose[0])
+        self.assertNotIn("override.yml", compose[0])
 
     def test_the_script_works_on_the_deployment_its_own_directory(self) -> None:
         """REL-2 S4 decision D15: `LAKEHOUSE_DIR` is the directory
@@ -229,6 +257,24 @@ class RestoreScriptTest(ScriptTestCase):
         self.assertTrue(compose, f"the script never ran compose: {self.docker_calls()}")
         self.assertIn(f"-f {self.deployment}/docker-compose.yml", compose[0])
         self.assertIn(f"--env-file {self.deployment}/.env", compose[0])
+
+    def test_the_developers_path_names_no_compose_file(self) -> None:
+        """Without `LAKEHOUSE_DIR`, the restore runs the command it
+        always ran: compose finds the Compose file — and a developer's
+        own `docker-compose.override.yml` — by itself.
+
+        Naming a Compose file would stop it from doing so (REL-2 S4
+        review round 1 SHOULD-FIX 3).
+        """
+        backup = self.make_backup()
+        self.clear_docker_log()
+        result = self.run_restore(backup)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        compose = [call for call in self.docker_calls() if "compose" in call]
+        self.assertTrue(compose, f"the script never ran compose: {self.docker_calls()}")
+        self.assertNotIn("-f ", compose[0])
+        self.assertNotIn("--env-file", compose[0])
+        self.assertNotIn("override.yml", compose[0])
 
     def test_the_restore_puts_the_release_and_the_state_back(self) -> None:
         backup = self.make_backup()

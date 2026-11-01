@@ -33,13 +33,19 @@
 # Environment variables:
 #   LAKEHOUSE_DIR          the deployment's own directory: the one
 #                          holding `docker-compose.yml` and `.env`
-#                          (REL-2 S4 decision D15). It defaults to this
-#                          repository's root, so a developer's behaviour
-#                          is unchanged. The script runs `docker compose
-#                          -p <project> -f
+#                          (REL-2 S4 decision D15). An installed host
+#                          sets it to the install's own directory, and
+#                          the script then runs `docker compose -p
+#                          <project> -f
 #                          "$LAKEHOUSE_DIR/docker-compose.yml"
 #                          --env-file "$LAKEHOUSE_DIR/.env"`, plus
-#                          `override.yml` when there is one.
+#                          `override.yml` when there is one. When it is
+#                          NOT set, the script works on the repository
+#                          it lives in and runs the command it always
+#                          ran: `docker compose -p <project>` there,
+#                          which also loads a developer's own
+#                          `docker-compose.override.yml` (REL-2 S4
+#                          review round 1 SHOULD-FIX 3).
 #   COMPOSE_PROJECT          compose project name (pass -p or set here)
 #   BACKUP_S3_ENDPOINT       backup S3 endpoint (e.g. http://rustfs:9000)
 #   BACKUP_S3_BUCKET         backup bucket name (e.g. lakehouse-backups)
@@ -61,21 +67,26 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-# The deployment's own directory (REL-2 S4 decision D15). It defaults to
-# this repository's root: a developer who runs the script here gets the
-# same behaviour as before, and an installed host points it at the
-# install's directory.
-LAKEHOUSE_DIR="${LAKEHOUSE_DIR:-${REPO_ROOT}}"
+# The deployment's own directory (REL-2 S4 decision D15). It is
+# `LAKEHOUSE_DIR` when the variable is set — an installed host points
+# it at the install's directory — and this repository's root when it is
+# not: a developer who runs the script here gets the same behaviour as
+# before (REL-2 S4 review round 1 SHOULD-FIX 3).
+if [[ -n "${LAKEHOUSE_DIR:-}" ]]; then
+  DEPLOYMENT_DIR="${LAKEHOUSE_DIR}"
+else
+  DEPLOYMENT_DIR="${REPO_ROOT}"
+fi
 
 # The alpine image the helper containers run — the same pinned image the
 # stack itself uses (REL-2 S1-T3 pinned every image by digest).
 HELPER_IMAGE="alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc"
 
 # Load .env if present and not already exported
-if [[ -f "${LAKEHOUSE_DIR}/.env" ]]; then
+if [[ -f "${DEPLOYMENT_DIR}/.env" ]]; then
   set -a
   # shellcheck source=/dev/null
-  . "${LAKEHOUSE_DIR}/.env"
+  . "${DEPLOYMENT_DIR}/.env"
   set +a
 fi
 
@@ -133,18 +144,23 @@ COMPOSE=(docker compose)
 if [[ -n "${COMPOSE_PROJECT:-}" ]]; then
   COMPOSE=(docker compose -p "${COMPOSE_PROJECT}")
 fi
-# The Compose file of the deployment, named explicitly (REL-2 S4
-# decision D15): the script runs from the deployment's own directory,
-# not from this repository's. The `.env` is named only when it is
-# there — a repository without one is a normal thing, and compose would
-# refuse to start on a file that is not there.
-COMPOSE+=(-f "${LAKEHOUSE_DIR}/docker-compose.yml")
-if [[ -f "${LAKEHOUSE_DIR}/.env" ]]; then
-  COMPOSE+=(--env-file "${LAKEHOUSE_DIR}/.env")
-fi
-# The operator's own override, when there is one (REL-2 decision D5).
-if [[ -f "${LAKEHOUSE_DIR}/override.yml" ]]; then
-  COMPOSE+=(-f "${LAKEHOUSE_DIR}/override.yml")
+# The Compose file of the deployment is named explicitly ONLY when the
+# deployment is somewhere else: in this repository, compose finds the
+# Compose file — and the developer's own `docker-compose.override.yml`
+# — by itself, which is what it did before (REL-2 S4 review round 1
+# SHOULD-FIX 3).
+if [[ -n "${LAKEHOUSE_DIR:-}" ]]; then
+  COMPOSE+=(-f "${DEPLOYMENT_DIR}/docker-compose.yml")
+  # The `.env` is named only when it is there — a repository without one
+  # is a normal thing, and compose would refuse to start on a file that
+  # is not there.
+  if [[ -f "${DEPLOYMENT_DIR}/.env" ]]; then
+    COMPOSE+=(--env-file "${DEPLOYMENT_DIR}/.env")
+  fi
+  # The operator's own override, when there is one (REL-2 decision D5).
+  if [[ -f "${DEPLOYMENT_DIR}/override.yml" ]]; then
+    COMPOSE+=(-f "${DEPLOYMENT_DIR}/override.yml")
+  fi
 fi
 
 resolve_ref() {
@@ -201,8 +217,8 @@ else
 fi
 
 # Detect compose project network
-NETWORK_NAME="${COMPOSE_PROJECT:-$(basename "${LAKEHOUSE_DIR}")}_default"
-PROJECT_ID="${COMPOSE_PROJECT:-$(basename "${LAKEHOUSE_DIR}")}"
+NETWORK_NAME="${COMPOSE_PROJECT:-$(basename "${DEPLOYMENT_DIR}")}_default"
+PROJECT_ID="${COMPOSE_PROJECT:-$(basename "${DEPLOYMENT_DIR}")}"
 CONNECTOR_SECRETS_VOLUME="${PROJECT_ID}_lakehouse_connector_secrets"
 CLICKHOUSE_BACKUPS_VOLUME="${PROJECT_ID}_lakehouse_clickhouse_backups"
 
@@ -379,11 +395,11 @@ if [[ -n "${LOCAL_DIR}" ]]; then
     # restore whose `.env` is not the one they were sealed with leaves
     # every connector unreadable. The current `.env` is kept beside the
     # new one, so a restore never destroys the only copy.
-    if [[ -f "${LAKEHOUSE_DIR}/.env" ]] && ! cmp -s "${LOCAL_DIR}/env" "${LAKEHOUSE_DIR}/.env"; then
-      cp -p "${LAKEHOUSE_DIR}/.env" "${LAKEHOUSE_DIR}/.env.before-restore-${LOCAL_STAMP}"
+    if [[ -f "${DEPLOYMENT_DIR}/.env" ]] && ! cmp -s "${LOCAL_DIR}/env" "${DEPLOYMENT_DIR}/.env"; then
+      cp -p "${DEPLOYMENT_DIR}/.env" "${DEPLOYMENT_DIR}/.env.before-restore-${LOCAL_STAMP}"
       echo "    the previous .env was kept as .env.before-restore-${LOCAL_STAMP}"
     fi
-    cp -p "${LOCAL_DIR}/env" "${LAKEHOUSE_DIR}/.env"
+    cp -p "${LOCAL_DIR}/env" "${DEPLOYMENT_DIR}/.env"
   else
     echo "==> [Step 4/5] This backup holds no .env — skipping."
   fi
@@ -396,13 +412,13 @@ if [[ -n "${LOCAL_DIR}" ]]; then
   for release_file in release.json state.json; do
     if [[ -f "${LOCAL_DIR}/${release_file}" ]]; then
       echo "--> Restoring ${release_file}..."
-      if [[ -f "${LAKEHOUSE_DIR}/${release_file}" ]] \
-         && ! cmp -s "${LOCAL_DIR}/${release_file}" "${LAKEHOUSE_DIR}/${release_file}"; then
-        cp -p "${LAKEHOUSE_DIR}/${release_file}" \
-          "${LAKEHOUSE_DIR}/${release_file}.before-restore-${LOCAL_STAMP}"
+      if [[ -f "${DEPLOYMENT_DIR}/${release_file}" ]] \
+         && ! cmp -s "${LOCAL_DIR}/${release_file}" "${DEPLOYMENT_DIR}/${release_file}"; then
+        cp -p "${DEPLOYMENT_DIR}/${release_file}" \
+          "${DEPLOYMENT_DIR}/${release_file}.before-restore-${LOCAL_STAMP}"
         echo "    the previous ${release_file} was kept as ${release_file}.before-restore-${LOCAL_STAMP}"
       fi
-      cp -p "${LOCAL_DIR}/${release_file}" "${LAKEHOUSE_DIR}/${release_file}"
+      cp -p "${LOCAL_DIR}/${release_file}" "${DEPLOYMENT_DIR}/${release_file}"
     else
       echo "--> This backup holds no ${release_file} — skipping."
     fi

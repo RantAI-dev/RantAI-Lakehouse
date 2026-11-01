@@ -44,12 +44,17 @@
 #
 #   LAKEHOUSE_DIR  the deployment's own directory: the one holding
 #                  `docker-compose.yml` and `.env` (REL-2 S4 decision
-#                  D15). It defaults to this repository's root, so a
-#                  developer's behaviour is unchanged. The script runs
-#                  `docker compose -p <project> -f
+#                  D15). An installed host sets it to the install's own
+#                  directory, and the script then runs `docker compose
+#                  -p <project> -f
 #                  "$LAKEHOUSE_DIR/docker-compose.yml" --env-file
 #                  "$LAKEHOUSE_DIR/.env"`, plus `override.yml` when
-#                  there is one.
+#                  there is one. When it is NOT set, the script works
+#                  on the repository it lives in and runs the command
+#                  it always ran: `docker compose -p <project>` there,
+#                  which also loads a developer's own
+#                  `docker-compose.override.yml` (REL-2 S4 review round
+#                  1 SHOULD-FIX 3).
 #   COMPOSE_PROJECT   the compose project (default: this checkout's
 #                     directory name — the same default compose uses)
 #   API_HOST_PORT     the API's host port, read for the version
@@ -72,32 +77,44 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 # stack itself uses (REL-2 S1-T3 pinned every image by digest).
 HELPER_IMAGE="alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc"
 
-# The deployment's own directory (REL-2 S4 decision D15). It defaults to
-# this repository's root: a developer who runs the script here gets the
-# same behaviour as before, and an installed host points it at the
-# install's directory.
-LAKEHOUSE_DIR="${LAKEHOUSE_DIR:-${REPO_ROOT}}"
+# The deployment's own directory (REL-2 S4 decision D15). It is
+# `LAKEHOUSE_DIR` when the variable is set — an installed host points
+# it at the install's directory — and this repository's root when it is
+# not: a developer who runs the script here gets the same behaviour as
+# before (REL-2 S4 review round 1 SHOULD-FIX 3).
+if [[ -n "${LAKEHOUSE_DIR:-}" ]]; then
+  DEPLOYMENT_DIR="${LAKEHOUSE_DIR}"
+else
+  DEPLOYMENT_DIR="${REPO_ROOT}"
+fi
 
-BACKUP_ROOT="${1:-${BACKUP_ROOT:-${LAKEHOUSE_DIR}/backups}}"
-PROJECT="${COMPOSE_PROJECT:-$(basename "${LAKEHOUSE_DIR}")}"
+BACKUP_ROOT="${1:-${BACKUP_ROOT:-${DEPLOYMENT_DIR}/backups}}"
+PROJECT="${COMPOSE_PROJECT:-$(basename "${DEPLOYMENT_DIR}")}"
 POSTGRES_USER="${POSTGRES_USER:-lakehouse}"
 API_HOST_PORT="${API_HOST_PORT:-8080}"
 CH_USER="${CH_USER:-default}"
 CH_PASSWORD="${CH_PASSWORD:-}"
 
-cd "${LAKEHOUSE_DIR}"
-# The Compose file of the deployment, named explicitly: the script runs
-# from the deployment's own directory, not from this repository's.
-COMPOSE=(docker compose -p "${PROJECT}" -f "${LAKEHOUSE_DIR}/docker-compose.yml")
-# The `.env` is read from the deployment's own directory. It is named
-# only when it is there: a repository without a `.env` is a normal
-# thing, and compose would refuse to start on a file that is not there.
-if [ -f "${LAKEHOUSE_DIR}/.env" ]; then
-    COMPOSE+=(--env-file "${LAKEHOUSE_DIR}/.env")
-fi
-# The operator's own override, when there is one (REL-2 decision D5).
-if [ -f "${LAKEHOUSE_DIR}/override.yml" ]; then
-    COMPOSE+=(-f "${LAKEHOUSE_DIR}/override.yml")
+cd "${DEPLOYMENT_DIR}"
+# The Compose file of the deployment is named explicitly ONLY when the
+# deployment is somewhere else: in this repository, compose finds the
+# Compose file — and the developer's own `docker-compose.override.yml`
+# — by itself, which is what it did before (REL-2 S4 review round 1
+# SHOULD-FIX 3).
+if [[ -n "${LAKEHOUSE_DIR:-}" ]]; then
+  COMPOSE=(docker compose -p "${PROJECT}" -f "${DEPLOYMENT_DIR}/docker-compose.yml")
+  # The `.env` is read from the deployment's own directory. It is named
+  # only when it is there: a repository without a `.env` is a normal
+  # thing, and compose would refuse to start on a file that is not there.
+  if [ -f "${DEPLOYMENT_DIR}/.env" ]; then
+    COMPOSE+=(--env-file "${DEPLOYMENT_DIR}/.env")
+  fi
+  # The operator's own override, when there is one (REL-2 decision D5).
+  if [ -f "${DEPLOYMENT_DIR}/override.yml" ]; then
+    COMPOSE+=(-f "${DEPLOYMENT_DIR}/override.yml")
+  fi
+else
+  COMPOSE=(docker compose -p "${PROJECT}")
 fi
 
 CONNECTOR_SECRETS_VOLUME="${PROJECT}_lakehouse_connector_secrets"
@@ -204,11 +221,11 @@ else
 fi
 
 # ── The configuration ──────────────────────────────────────────────────────
-if [[ -f "${LAKEHOUSE_DIR}/.env" ]]; then
+if [[ -f "${DEPLOYMENT_DIR}/.env" ]]; then
   echo "--> Configuration: .env"
-  cp -p "${LAKEHOUSE_DIR}/.env" "${backup_dir}/env"
+  cp -p "${DEPLOYMENT_DIR}/.env" "${backup_dir}/env"
 else
-  echo "Warning: there is no .env in ${LAKEHOUSE_DIR} — the deployment's generated" >&2
+  echo "Warning: there is no .env in ${DEPLOYMENT_DIR} — the deployment's generated" >&2
   echo "         secrets are NOT in this backup." >&2
 fi
 
@@ -216,18 +233,18 @@ fi
 # The release manifest and the install's state are part of the set
 # (REL-2 S4 decision D15): a restore that brings the data back brings
 # the release it was taken from back with it.
-if [[ -f "${LAKEHOUSE_DIR}/release.json" ]]; then
+if [[ -f "${DEPLOYMENT_DIR}/release.json" ]]; then
   echo "--> Release: release.json"
-  cp -p "${LAKEHOUSE_DIR}/release.json" "${backup_dir}/release.json"
+  cp -p "${DEPLOYMENT_DIR}/release.json" "${backup_dir}/release.json"
 else
-  echo "Warning: there is no release.json in ${LAKEHOUSE_DIR} — the release" >&2
+  echo "Warning: there is no release.json in ${DEPLOYMENT_DIR} — the release" >&2
   echo "         manifest is NOT in this backup." >&2
 fi
-if [[ -f "${LAKEHOUSE_DIR}/state.json" ]]; then
+if [[ -f "${DEPLOYMENT_DIR}/state.json" ]]; then
   echo "--> State: state.json"
-  cp -p "${LAKEHOUSE_DIR}/state.json" "${backup_dir}/state.json"
+  cp -p "${DEPLOYMENT_DIR}/state.json" "${backup_dir}/state.json"
 else
-  echo "Warning: there is no state.json in ${LAKEHOUSE_DIR} — the installed" >&2
+  echo "Warning: there is no state.json in ${DEPLOYMENT_DIR} — the installed" >&2
   echo "         version is NOT in this backup." >&2
 fi
 
