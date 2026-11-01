@@ -9,6 +9,11 @@ the numbers in it.
 Since REL-2 S2 review round 6 BLOCKER 1, the manifest names EVERY image
 the release runs — the third-party ones included. A manifest that named
 only our four would leave an air-gapped host without Postgres.
+
+Since REL-2 S3-T0, the manifest also carries `imageIds`: the config
+digest of every image. `docker save` drops the registry digest, so after
+`docker load` the host knows only the image ID — and the installer
+compares that ID with the one the signed manifest names.
 """
 
 from __future__ import annotations
@@ -26,9 +31,16 @@ import make_manifest  # noqa: E402
 
 DIGEST = "sha256:" + "a" * 64
 THIRD_PARTY_DIGEST = "sha256:" + "b" * 64
+IMAGE_ID = "sha256:" + "1" * 64
+THIRD_PARTY_IMAGE_ID = "sha256:" + "2" * 64
 IMAGES = {
     "lakehouse-api": f"ghcr.io/rantai-dev/rantai-lakehouse-api:0.2.0@{DIGEST}",
     "console": f"ghcr.io/rantai-dev/rantai-lakehouse-console:0.2.0@{DIGEST}",
+}
+IMAGE_IDS = {
+    IMAGES["lakehouse-api"]: IMAGE_ID,
+    IMAGES["console"]: IMAGE_ID,
+    f"postgres:16.15@{THIRD_PARTY_DIGEST}": THIRD_PARTY_IMAGE_ID,
 }
 
 # A rendered Compose file, the way `render_compose.py` writes one: our
@@ -64,6 +76,7 @@ class ManifestTest(unittest.TestCase):
             "version": "0.2.0",
             "git_sha": "0123456789abcdef0123456789abcdef01234567",
             "published_images": IMAGES,
+            "image_ids": IMAGE_IDS,
             "compose_path": self.compose,
             "created_at": "2026-11-01T12:00:00Z",
             "upgrade_path": self.upgrade_path,
@@ -83,6 +96,7 @@ class ManifestTest(unittest.TestCase):
                 "minFrom",
                 "stops",
                 "images",
+                "imageIds",
                 "files",
             ],
         )
@@ -90,6 +104,34 @@ class ManifestTest(unittest.TestCase):
         self.assertEqual(manifest["version"], "0.2.0")
         self.assertEqual(manifest["createdAt"], "2026-11-01T12:00:00Z")
         self.assertEqual(manifest["stops"], [])
+
+    def test_the_manifest_holds_the_id_of_every_image(self) -> None:
+        """REL-2 S3-T0: the id of every image the release runs.
+
+        The installer compares the id of the image it loaded with the
+        one the signed manifest names, so an image without an id is an
+        image nobody can check.
+        """
+        manifest = self.build()
+        self.assertEqual(manifest["imageIds"], IMAGE_IDS)
+
+    def test_an_image_without_an_id_is_refused(self) -> None:
+        ids = dict(IMAGE_IDS)
+        del ids[f"postgres:16.15@{THIRD_PARTY_DIGEST}"]
+        with self.assertRaises(make_manifest.ManifestError):
+            self.build(image_ids=ids)
+
+    def test_an_id_that_is_not_an_image_id_is_refused(self) -> None:
+        ids = dict(IMAGE_IDS)
+        ids[f"postgres:16.15@{THIRD_PARTY_DIGEST}"] = "not-an-id"
+        with self.assertRaises(make_manifest.ManifestError):
+            self.build(image_ids=ids)
+
+    def test_an_id_for_an_image_the_release_does_not_run_is_refused(self) -> None:
+        ids = dict(IMAGE_IDS)
+        ids["postgres:16.15@sha256:" + "c" * 64] = "sha256:" + "3" * 64
+        with self.assertRaises(make_manifest.ManifestError):
+            self.build(image_ids=ids)
 
     def test_the_manifest_names_every_published_image(self) -> None:
         manifest = self.build()

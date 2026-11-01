@@ -446,6 +446,29 @@ jobs:
             "$SYFT" scan "docker:$reference" -o "cyclonedx-json=sbom/$name.cdx.json"
           done < third-party-images.txt
 
+      # The image IDs: the config digest of every image the release
+      # runs.
+      #
+      # `docker save` of a pulled image DROPS its registry manifest
+      # digest: after `docker load` the host knows only the image ID,
+      # which is the config digest. So the signed manifest has to carry
+      # it, and an air-gapped install compares the loaded image's ID
+      # with the manifest's (REL-2 S3-T0).
+      - name: The image ids
+        run: |
+          set -euo pipefail
+          python3 ops/release/compose_images.py \
+            --compose docker-compose.release.yml > all-images.txt
+          echo '{}' > image-ids.json
+          while read -r reference; do
+            [ -n "$reference" ] || continue
+            id="$(docker image inspect --format '{{.Id}}' "$reference")"
+            echo "$reference -> $id"
+            jq --arg reference "$reference" --arg id "$id" \
+              '. + {($reference): $id}' image-ids.json > image-ids.json.next
+            mv image-ids.json.next image-ids.json
+          done < all-images.txt
+
       # The manifest, and the checksum of the Compose file it ships
       # (S2-T3).
       - name: Write the release manifest
@@ -455,6 +478,7 @@ jobs:
             --version "${{ steps.version.outputs.version }}" \
             --git-sha "$GITHUB_SHA" \
             --published-images "$(cat images.json)" \
+            --image-ids image-ids.json \
             --compose docker-compose.release.yml \
             --out release.json
 
@@ -879,6 +903,23 @@ jobs:
             "$SYFT" scan "docker:$reference" -o "cyclonedx-json=sbom/$name.cdx.json"
           done < third-party-images.txt
 
+      # The image IDs: the config digest of every image the release
+      # runs. See the dry run's step of the same name (REL-2 S3-T0).
+      - name: The image ids
+        run: |
+          set -euo pipefail
+          python3 ops/release/compose_images.py \
+            --compose docker-compose.release.yml > all-images.txt
+          echo '{}' > image-ids.json
+          while read -r reference; do
+            [ -n "$reference" ] || continue
+            id="$(docker image inspect --format '{{.Id}}' "$reference")"
+            echo "$reference -> $id"
+            jq --arg reference "$reference" --arg id "$id" \
+              '. + {($reference): $id}' image-ids.json > image-ids.json.next
+            mv image-ids.json.next image-ids.json
+          done < all-images.txt
+
       - name: Write the release manifest
         run: |
           set -euo pipefail
@@ -886,6 +927,7 @@ jobs:
             --version "${{ steps.version.outputs.version }}" \
             --git-sha "$GITHUB_SHA" \
             --published-images "$(cat images.json)" \
+            --image-ids image-ids.json \
             --compose docker-compose.release.yml \
             --out release.json
 
