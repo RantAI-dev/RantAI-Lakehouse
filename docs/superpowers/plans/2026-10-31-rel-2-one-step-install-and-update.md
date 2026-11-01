@@ -1295,6 +1295,94 @@ the two files hash the same (`34237b3f095501aac5a64024e4ad4b7c`). `alpine:3.20` 
   "The output above says why" while nothing is printed above. It is pre-existing and outside
   D13's decision; the review may want it as a separate finding.
 
+### Fixes for review S3 round 4 (developer, 2026-11-01)
+
+**Commits** (branch `feat/rel-2-s3-lakehousectl-install`), one per finding, each pushed:
+
+| Commit | Finding | What |
+| --- | --- | --- |
+| `d92af2e2` | BLOCKER 1 — `.github/workflows/release.yml` | the dry run starts its throwaway registry itself, after the store switch |
+| `19ac61cf` | SHOULD-FIX 2 — `rust/crates/lakehousectl` | a failed docker command carries Docker's own error output into the error |
+
+**BLOCKER 1 (`d92af2e2`).** The dry run's registry was a `services:` container. GitHub starts a
+service container before the job's first step, and the "Turn on the containerd image store" step
+restarts Docker and switches the image store: the restart stops the registry container, and the
+switch hides the image it ran from — the classic store's images are not in the containerd one. The
+image builds that push to `localhost:5000` had no registry to push to.
+
+The `services:` block is gone. The dry run starts the registry itself, in a step AFTER the switch:
+`docker run -d --name release-registry --restart always -p 5000:5000 registry:2@sha256:a3d8…`, and
+the step waits until `curl -fsS http://localhost:5000/v2/` answers — in a bounded loop (30 attempts,
+2 seconds apart), so a registry that never answers fails the job instead of hanging it.
+
+The image is PINNED by digest: `sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373`
+is the `docker-content-digest` the registry answered for the tag `registry:2` on 2026-11-01
+(measured, not assumed). The job's `RELEASE_REGISTRY` is unchanged (`localhost:5000`), and the
+buildx builder still runs with `network=host`, so it reaches the registry's published port.
+
+No other job of the workflow holds a service container: the `release` job and the `install-proof`
+job have none, and the check below says so.
+
+Six new tests in `ops/release/test_release_workflow.py`: no job that restarts Docker holds a
+service container (a service that a step starts AFTER the switch is not reported), the dry run's
+registry is started after the switch, is pinned by digest, is waited for with a bounded loop, and
+is the registry the job pushes to. Two synthetic workflows make the check fail and pass: one with
+a service container across the restart (reported), one that starts its service after the switch
+(not reported). The check was also run against the OLD `release.yml` (the file at `02048fac`): it
+reports `dry-run: registry` there, and nothing against the fixed file.
+
+**SHOULD-FIX 2 (`19ac61cf`).** This is the observation the round-3 handoff left open. A new
+`sys::output_or_stderr` carries the LAST 20 lines of what a command said on its error stream into
+the error, on their own lines under the exit status. `sys::output` is unchanged: the `curl` calls
+of `install.rs` and the pre-flight facts keep their own messages.
+
+The docker calls use it: `pull`, `load`, `image_id` and `compose_up`. The messages are worded to
+match what is printed: the advice ("Is this host online?") comes BEFORE the reason, and
+`compose_up` no longer says "The output above says why" — the error IS the answer now.
+
+No secret reaches that error output, and the module says so: the docker commands name images,
+image files and the Compose file, and Docker's own error output names the same things back. The
+signing key and the stack's secrets are never in a docker command's arguments, and Docker never
+prints them.
+
+Four new Rust tests: a failing command's error output is in the error; the error output is capped
+at 20 lines — the LAST twenty of forty, not the first; a command that says nothing on its error
+stream is an error of one line; and the stack error is the whole answer (it does not point at an
+output that nothing prints).
+
+**Commands run, in the foreground, on the final commit `19ac61cf`:**
+
+| Command | Result |
+| --- | --- |
+| `/home/shiro/rantai/bin/cargo-locked fmt --check` (the whole workspace) | clean, no diff, exit 0 |
+| `/home/shiro/rantai/bin/cargo-locked clippy -p lakehousectl --all-targets -- -D warnings` | clean, no warning and no error, exit 0 |
+| `/home/shiro/rantai/bin/cargo-locked test -p lakehousectl` | **65 passed, 0 failed** (61 before this round, 4 new) |
+| `actionlint .github/workflows/release.yml` | no findings, exit 0 |
+| `python3 -m pytest ops/release -q` | **154 passed** (148 before this round, 6 new) |
+| `git status` | clean (nothing generated staged) |
+
+Every cargo command went through `/home/shiro/rantai/bin/cargo-locked` (the `bin/cargo-locked` of
+the earlier rounds is not in the repository), in the foreground, on the shared `CARGO_TARGET_DIR`;
+no `cargo clean`; no workspace build.
+
+**Not verified, with the reason:**
+
+- **The PR's dry run.** It needs a GitHub runner: the four images, the throwaway registry, cosign,
+  syft, a multi-GiB bundle and the whole stack. The workflow's own checks, and the check run
+  against the OLD workflow, are what stands in for it here.
+- **The registry container itself** was not started on this machine: the step needs a runner whose
+  Docker has the containerd store on, and the digest of the image was read from the registry's own
+  header rather than from a pull.
+- **The `curl` calls of `install.rs`** keep their own messages: the finding named the docker
+  calls, and `curl --show-error` already says why it failed next to the exit status.
+- **The full workspace run** (`cargo clippy --workspace --all-targets --all-features` and
+  `cargo test --workspace`): not run here — this round changes one crate, and the crate's rules
+  say the scoped run is what a commit runs. CI runs the full one on the PR.
+- **No bun command, no Dagster command and no compose command ran**: this round changes no
+  TypeScript, no code location and no compose file.
+- **`cargo deny check`** was not run: no dependency changed (the crate's `Cargo.toml` is
+  untouched).
+
 ## 7. Review (planner appends below)
 
 ### Review S1 round 1 (planner, 2026-10-31, at `f79d4235`)
