@@ -1,0 +1,54 @@
+[package]
+name = "lakehousectl"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Install and update the RantAI Lakehouse, online or air-gapped."
+
+[[bin]]
+name = "lakehousectl"
+path = "src/main.rs"
+
+[dependencies]
+# The command line, with the derive API (REL-2 S3-T1). `clap` is a
+# build-time-only cost for the binary's size: the tool has four
+# subcommands at most.
+clap = { version = "4.6", features = ["derive"] }
+# The manifest and the Sigstore bundle are JSON (REL-2 S3-T1).
+serde = { workspace = true }
+serde_json = { workspace = true }
+# The digest the manifest's signature covers: SHA-256, and the hex form
+# of an image ID.
+sha2 = { workspace = true }
+hex = "0.4"
+# The signature and the digest are base64 in the bundle (REL-2 S2 D3a).
+base64 = { workspace = true }
+# The signature is base64 DER, ECDSA P-256 (REL-2 S2 D3a). `p256` brings
+# the curve and the key parsing; `ecdsa` is the signature scheme, and
+# its `signature` re-export is the `Verifier` trait the check uses.
+#
+# The minors are PINNED (REL-2 S3-T1): `p256` 0.14 and `ecdsa` 0.17 are
+# the pair that use `crypto-bigint` 0.7 — the patched line. The 0.5 line
+# is `RUSTSEC-2026-0387` (timing variability in modular reduction), and
+# `crypto-bigint` 0.6 and 0.7 are the fixes.
+p256 = "0.14"
+ecdsa = "0.17"
+# The errors this tool reports.
+thiserror = { workspace = true }
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# A TEST-ONLY override of the key the manifest is verified against.
+#
+# The release key is compiled in, and a release build verifies against
+# it and against nothing else. The CI dry run signs its bundle with a
+# throwaway key it generates in the job (REL-2 S3-T5), so the proof
+# needs a build that can be pointed at that key. The release pipeline
+# builds WITHOUT this feature, and `ops/release/test_release_workflow.py`
+# holds it to that: a release build that accepted another key would be
+# a release that installs what its operator's host says to install.
+test-key = []
