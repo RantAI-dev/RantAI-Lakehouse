@@ -1811,3 +1811,21 @@ the lock has `crypto-bigint` 0.7.10). The finding on the two Docker image stores
 It must be green before merge.
 
 **Open: BLOCKER 1, SHOULD-FIX 2–5.**
+
+### Review S3 round 2 (planner, 2026-11-01, at `55173176`)
+
+- **BLOCKER 1 is fixed** (`a5f49eca`). The three assets are read into memory with `curl` to
+  stdout, and nothing is written under the temporary directory. `obtain_with` takes the fetch as
+  a parameter, so the test proves it without a network.
+- **SHOULD-FIX 2 is fixed** (`f34f19e2`). Each tar is hashed in 64 KiB reads and compared with
+  its `SHA256SUMS` line before `docker load`. A missing line and a damaged file are both refused
+  and tested, and the comment says what this check is for.
+- **SHOULD-FIX 3 is fixed** (`5757949d`). The same version installs again and keeps
+  `state.json`. Another version is refused and pointed at `lakehousectl update`. A `state.json`
+  that names no version is refused rather than overwritten.
+- **SHOULD-FIX 4 is fixed** (`bf0f7c43`). **SHOULD-FIX 5 is fixed** (`38ccc6f4`), and its test
+  fails against the old script.
+
+**Open: no BLOCKER, no SHOULD-FIX.** Merge waits for the PR's CI on this head: the required
+checks, the workspace cargo run, `Release · dry run`, and the `install-proof` job that installs
+the bundle on a fresh runner.
