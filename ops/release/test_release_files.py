@@ -273,6 +273,84 @@ class ShippedFilesTest(unittest.TestCase):
         self.assertIn("tools/backup-local.sh", by_path)
 
 
+class ShippedPathTest(unittest.TestCase):
+    """The path a shipped file is written at (REL-2 S4 review round 1
+    SHOULD-FIX 1).
+
+    The install writes every shipped file under its own directory, at
+    the path the manifest names. A path that is absolute, or that holds
+    a `..` component, would write OUTSIDE that directory — the manifest
+    is signed, but a signed path still escapes.
+    """
+
+    def test_a_plain_relative_path_is_accepted(self) -> None:
+        make_manifest.check_install_path("ops/backups/clickhouse/backups.xml")
+        make_manifest.check_install_path("tools/backup-local.sh")
+
+    def test_an_absolute_path_is_refused(self) -> None:
+        with self.assertRaises(make_manifest.ManifestError) as caught:
+            make_manifest.check_install_path("/etc/passwd")
+        message = str(caught.exception)
+        self.assertIn("/etc/passwd", message)
+        self.assertIn("absolute", message)
+
+    def test_a_path_that_holds_a_parent_component_is_refused(self) -> None:
+        with self.assertRaises(make_manifest.ManifestError) as caught:
+            make_manifest.check_install_path("../outside/secret.txt")
+        message = str(caught.exception)
+        self.assertIn("../outside/secret.txt", message)
+        self.assertIn("..", message)
+
+    def test_a_path_that_holds_a_component_that_is_not_a_normal_one_is_refused(self) -> None:
+        for path in ("", "a//b", "a/", "./a", "."):
+            with self.assertRaises(make_manifest.ManifestError):
+                make_manifest.check_install_path(path)
+
+
+class MountOutsideTheComposeDirectoryTest(unittest.TestCase):
+    """A Compose file that mounts a file OUTSIDE its own directory.
+
+    The path is a path the release tooling really meets: a Compose
+    file may mount `../shared/secret.txt`, and the install would write
+    it outside the install's own directory.
+    """
+
+    def setUp(self) -> None:
+        self._directory = tempfile.TemporaryDirectory()
+        self.root = Path(self._directory.name)
+        (self.root / "deploy").mkdir()
+        (self.root / "shared").mkdir()
+        (self.root / "shared" / "secret.txt").write_text("the secret\n", encoding="utf-8")
+        self.compose = self.root / "deploy" / "docker-compose.yml"
+        self.compose.write_text(
+            "services:\n"
+            "  postgres:\n"
+            "    image: postgres:16.15@sha256:"
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n"
+            "    volumes:\n"
+            "      - ../shared/secret.txt:/etc/secret.txt:ro\n",
+            encoding="utf-8",
+        )
+
+    def tearDown(self) -> None:
+        self._directory.cleanup()
+
+    def test_a_mount_outside_the_compose_directory_is_refused(self) -> None:
+        with self.assertRaises(make_manifest.ManifestError) as caught:
+            make_manifest.build_manifest(
+                version="0.2.0",
+                git_sha="0123456789abcdef0123456789abcdef01234567",
+                published_images={},
+                image_ids={THIRD_PARTY_IMAGE: "sha256:" + "2" * 64},
+                compose_path=self.compose,
+                created_at="2026-11-01T12:00:00Z",
+                upgrade_path=self.root / "upgrade-path.json",
+            )
+        message = str(caught.exception)
+        self.assertIn("../shared/secret.txt", message)
+        self.assertIn("..", message)
+
+
 class BundleWithShippedFilesTest(unittest.TestCase):
     """The bundle carries the files the release ships."""
 

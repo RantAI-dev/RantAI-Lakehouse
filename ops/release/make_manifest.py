@@ -55,9 +55,19 @@ decision D14):
 
 The rule that says which files those are lives in `render_compose.py`,
 which owns the parsing of a Compose file, and in the `TOOL_FILES` table
-above. A mount whose file does not exist, and two shipped files whose
-names are the same, are REFUSALS: a release that cannot be installed is
-not written.
+above. A mount whose file does not exist, two shipped files whose names
+are the same, and a path that is not a plain relative path are
+REFUSALS: a release that cannot be installed is not written.
+
+The path rule
+-------------
+The install writes every shipped file at the path the manifest names,
+UNDER the install's own directory. A path that is absolute, or that
+holds a `..` component, would write OUTSIDE that directory. The
+manifest is signed, but a signed path still escapes the directory it
+is written in — so a path that is not relative, or that holds a
+component that is not a normal one, is refused here (REL-2 S4 review
+round 1 SHOULD-FIX 1).
 
 The image IDs
 -------------
@@ -251,6 +261,39 @@ def absolute(path: Path) -> Path:
     return Path(os.path.abspath(path))
 
 
+def check_install_path(install_path: str) -> None:
+    """Refuse a shipped file's path that is not a plain relative path.
+
+    The install writes every shipped file at the path the manifest
+    names, UNDER the install's own directory. A path that is absolute,
+    or that holds a `..` component, would write OUTSIDE that directory
+    — the manifest is signed, but a signed path still escapes the
+    directory it is written in (REL-2 S4 review round 1 SHOULD-FIX 1).
+
+    So the path must be relative and must hold normal components only:
+    no leading `/`, no `.`, no `..` and no empty component. A Compose
+    file can mount `../shared/secret.txt`, so this is a path the
+    release tooling really meets.
+    """
+    if not install_path:
+        raise ManifestError(
+            "the release ships a file with an empty path. A shipped file is written under "
+            "the install's own directory, so its path must name a file."
+        )
+    if install_path.startswith("/"):
+        raise ManifestError(
+            f"the release ships {install_path}, whose path is absolute. A shipped file is "
+            "written under the install's own directory, so its path must be relative."
+        )
+    for component in install_path.split("/"):
+        if component in ("", ".", ".."):
+            raise ManifestError(
+                f"the release ships {install_path}, whose path holds the component "
+                f"{component!r}, which is not a normal one. A shipped file is written under "
+                "the install's own directory, so its path must hold normal components only."
+            )
+
+
 def check_shipped_names(files: list[ShippedFile]) -> None:
     """Refuse two shipped files an ONLINE install could not tell apart.
 
@@ -297,6 +340,7 @@ def shipped_files(compose_path: Path) -> list[ShippedFile]:
     root = compose_path.parent
     files: list[ShippedFile] = []
     for install_path in render_compose.relative_mount_sources(compose_text):
+        check_install_path(install_path)
         source = absolute(root / install_path)
         if not source.is_file():
             raise ManifestError(
@@ -305,6 +349,7 @@ def shipped_files(compose_path: Path) -> list[ShippedFile]:
             )
         files.append(ShippedFile(install_path, source, sha256_of(source)))
     for install_path, repo_path in TOOL_FILES.items():
+        check_install_path(install_path)
         source = absolute(REPO_ROOT / repo_path)
         if not source.is_file():
             raise ManifestError(
@@ -484,6 +529,11 @@ def build_manifest(
     # covers.
     for shipped in shipped_files(compose_path):
         files[shipped.install_path] = shipped.sha256
+    # Every path the manifest names is a plain relative path: the
+    # install writes them under its own directory, and a path that
+    # escapes it is refused (REL-2 S4 review round 1 SHOULD-FIX 1).
+    for install_path in files:
+        check_install_path(install_path)
     check_files_cover_the_mounts(files, compose_path)
 
     return {

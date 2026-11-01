@@ -31,6 +31,16 @@
 //! Either way the bytes are checked against the manifest's checksum
 //! before they are written, and a file that does not match is a
 //! REFUSAL: the install stops there, and nothing is written.
+//!
+//! # The paths
+//!
+//! Every shipped file is written at the path the manifest names, UNDER
+//! the install's own directory. A path that is absolute, or that holds
+//! a `..` component, would write outside that directory. The manifest
+//! is signed, but a signed path still escapes the directory it is
+//! written in — so a path that is not relative, or that holds a
+//! component that is not a normal one, is refused (REL-2 S4 review
+//! round 1 SHOULD-FIX 1).
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -91,6 +101,7 @@ where
 {
     let mut files: ShippedFiles = BTreeMap::new();
     for (name, expected) in installable(manifest) {
+        check_install_path(name)?;
         let bytes = if let Some(directory) = bundle_dir {
             read(&directory.join(name))?
         } else {
@@ -101,6 +112,46 @@ where
         files.insert(name.to_string(), bytes);
     }
     Ok(files)
+}
+
+/// Check that a shipped file's path is a plain relative path.
+///
+/// The install writes every shipped file at the path the manifest
+/// names, UNDER the install's own directory. A path that is absolute,
+/// or that holds a `..` component, would write outside that directory
+/// — the manifest is signed, but a signed path still escapes the
+/// directory it is written in (REL-2 S4 review round 1 SHOULD-FIX 1).
+///
+/// So the path must be relative and must hold normal components only:
+/// no leading `/`, no `.`, no `..` and no empty component.
+///
+/// # Errors
+///
+/// Returns the error that says which path was refused, and why.
+pub fn check_install_path(name: &str) -> Result<(), ToolError> {
+    if name.is_empty() {
+        return Err(ToolError::Failed(
+            "the manifest names a file with an empty path. A shipped file is written under the \
+             install's own directory, so its path must name a file."
+                .to_string(),
+        ));
+    }
+    if Path::new(name).is_absolute() {
+        return Err(ToolError::Failed(format!(
+            "the manifest names the file {name}, whose path is absolute. A shipped file is \
+             written under the install's own directory, so its path must be relative."
+        )));
+    }
+    for component in name.split('/') {
+        if component.is_empty() || component == "." || component == ".." {
+            return Err(ToolError::Failed(format!(
+                "the manifest names the file {name}, whose path holds the component \
+                 {component:?}, which is not a normal one. A shipped file is written under the \
+                 install's own directory, so its path must hold normal components only."
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// The name the release publishes a shipped file under.
@@ -138,10 +189,12 @@ pub fn check(name: &str, expected: &str, bytes: &[u8]) -> Result<(), ToolError> 
 ///
 /// # Errors
 ///
-/// Returns the error that stopped the writing: a directory that could
-/// not be created, or a file that could not be written.
+/// Returns the error that stopped the writing: a path that would
+/// escape the install's own directory, a directory that could not be
+/// created, or a file that could not be written.
 pub fn write(dir: &Path, files: &ShippedFiles) -> Result<(), ToolError> {
     for (name, bytes) in files {
+        check_install_path(name)?;
         let path = dir.join(name);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|source| ToolError::Io {
@@ -392,5 +445,92 @@ mod tests {
             "backups.xml"
         );
         assert_eq!(asset_name("tools/backup-local.sh"), "backup-local.sh");
+    }
+
+    #[test]
+    fn a_plain_relative_path_is_accepted() {
+        check_install_path("ops/backups/clickhouse/backups.xml")
+            .expect("a plain relative path is accepted");
+        check_install_path("tools/backup-local.sh").expect("a plain relative path is accepted");
+    }
+
+    #[test]
+    fn a_shipped_file_whose_path_is_absolute_is_refused() {
+        let error = check_install_path("/etc/passwd").expect_err("an absolute path is refused");
+        let message = error.to_string();
+        assert!(
+            message.contains("/etc/passwd"),
+            "the error names the file: {message}"
+        );
+        assert!(
+            message.contains("absolute"),
+            "the error says what failed: {message}"
+        );
+    }
+
+    #[test]
+    fn a_shipped_file_whose_path_holds_a_parent_component_is_refused() {
+        let error = check_install_path("../outside/secret.txt")
+            .expect_err("a path that escapes the directory is refused");
+        let message = error.to_string();
+        assert!(
+            message.contains("../outside/secret.txt"),
+            "the error names the file: {message}"
+        );
+        assert!(
+            message.contains(".."),
+            "the error says what failed: {message}"
+        );
+    }
+
+    #[test]
+    fn a_shipped_file_whose_path_holds_a_component_that_is_not_a_normal_one_is_refused() {
+        for name in ["", "a//b", "a/", "./a", "."] {
+            assert!(
+                check_install_path(name).is_err(),
+                "{name:?} was not refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_file_whose_path_would_escape_the_install_directory_is_not_written() {
+        let root = tempfile::tempdir().expect("a temporary directory");
+        let install = root.path().join("install");
+        std::fs::create_dir_all(&install).expect("the install directory");
+        let mut files: ShippedFiles = BTreeMap::new();
+        files.insert("../escaped.txt".to_string(), b"the bytes".to_vec());
+
+        let error = write(&install, &files).expect_err("a path that escapes is refused");
+
+        assert!(
+            error.to_string().contains(".."),
+            "the error says what failed: {error}"
+        );
+        assert!(
+            !root.path().join("escaped.txt").exists(),
+            "the file was written outside the install's own directory"
+        );
+    }
+
+    #[test]
+    fn a_file_whose_path_would_escape_the_install_directory_is_not_read() {
+        let bundle = tempfile::tempdir().expect("a temporary directory");
+        let manifest = Manifest {
+            version: "0.2.0".to_string(),
+            images: BTreeMap::new(),
+            image_ids: BTreeMap::new(),
+            files: BTreeMap::from([("../escaped.txt".to_string(), "the checksum".to_string())]),
+        };
+
+        let error = fetch(&manifest, Some(bundle.path()), &mut |_url| {
+            panic!("a bundle install downloads nothing")
+        })
+        .expect_err("a path that escapes is refused");
+
+        assert!(
+            error.to_string().contains(".."),
+            "the error says what failed: {error}"
+        );
     }
 }
