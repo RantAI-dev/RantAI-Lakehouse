@@ -3654,6 +3654,20 @@ services:
       PGUSER: ${POSTGRES_USER:-lakehouse}
       PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}
       PGDATABASE: ${POSTGRES_DB:-lakehouse}
+      # DATA-21 S2 review BLOCKER 1: the `trino` leg waits for the
+      # coordinator to be ready before its first query, and it needs the
+      # coordinator's IN-NETWORK address to do it. `G8_TRINO_URL` is the
+      # gate's own name for that address, deliberately not the
+      # deployment's `TRINO_URL`: that one may hold a host-facing
+      # address (the `trino-host-port` opt-in publishes Trino on the
+      # host), which a gate inside this network must not dial.
+      G8_TRINO_URL: ${G8_TRINO_URL:-http://trino:8080}
+      # `./ops/g8` is bound read-write as root (see `g8-time-travel-test-
+      # runner`): keep a root-owned `__pycache__/` from ever landing in
+      # the checkout. The gate now IMPORTS a sibling module
+      # (`trino_ready.py`), which is what makes Python write bytecode
+      # there.
+      PYTHONDONTWRITEBYTECODE: "1"
     entrypoint: ["/bin/sh", "-c"]
     command:
       - "apt-get update -qq && apt-get install -y -qq --no-install-recommends postgresql-client >/dev/null && pip install -q requests argon2-cffi && python g8_governance_test.py"
@@ -3703,6 +3717,14 @@ services:
       PGUSER: ${POSTGRES_USER:-lakehouse}
       PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}
       PGDATABASE: ${POSTGRES_DB:-lakehouse}
+      # DATA-21 S2 review BLOCKER 1: the `trino` leg waits for the
+      # coordinator to be ready before its first query, and it needs the
+      # coordinator's IN-NETWORK address to do it. `G8_TRINO_URL` is the
+      # gate's own name for that address, deliberately not the
+      # deployment's `TRINO_URL`: that one may hold a host-facing
+      # address (the `trino-host-port` opt-in publishes Trino on the
+      # host), which a gate inside this network must not dial.
+      G8_TRINO_URL: ${G8_TRINO_URL:-http://trino:8080}
       # `./ops/g8` is bound read-write as root (see `g3a-test-runner`):
       # keep a root-owned `__pycache__/` from ever landing in the checkout.
       PYTHONDONTWRITEBYTECODE: "1"
