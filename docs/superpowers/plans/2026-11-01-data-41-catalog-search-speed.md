@@ -143,6 +143,7 @@ Scoped to the crate, per the task's rules — no full-workspace cargo run.
 | `python3 -m py_compile ops/bench/catalog_search_bench.py` (T5) | clean |
 | `python3 -m unittest discover -s ops/bench -p 'test_*.py'` (T5) | 18 tests, OK |
 | `actionlint .github/workflows/catalog-search-bench.yml` (T5) | clean, no output |
+| `cargo test -p lakehouse-api` (the whole crate, extra) | 91 test binaries, 6823 passed, 0 failed, 42 ignored |
 
 #### The bench on bluefin (2026-11-02, this branch, throwaway compose project `data41bench`)
 
@@ -200,7 +201,9 @@ search after it is 150–270 ms.
 
 - **The full-workspace cargo run** (`cargo clippy --workspace --all-targets
   --all-features` and `cargo test --workspace`): not run. The task scoped
-  the checks to the crate this branch touches.
+  the checks to the crate this branch touches. The whole `lakehouse-api`
+  crate was run instead: `cargo test -p lakehouse-api` — 91 test binaries,
+  6823 passed, 0 failed, 42 ignored.
 - **T1** — blocked on `DATA-40` (see the top of this entry).
 - The bench numbers above are from **this branch on bluefin**, not from the
   GitHub workflow. The planner's measurement (on `main`, after the merge)
