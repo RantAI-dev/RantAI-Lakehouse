@@ -1926,3 +1926,29 @@ It must be green before merge.
 **Open: no BLOCKER, no SHOULD-FIX.** Merge waits for the PR's CI on this head: the required
 checks, the workspace cargo run, `Release · dry run`, and the `install-proof` job that installs
 the bundle on a fresh runner.
+
+### Review S3 round 3 (planner, 2026-11-01): the PR's install proof, at `9339179`
+
+The dry run is green, and `install-proof` now runs the installer: it unpacks the bundle,
+verifies the manifest against the dry run's key, logs the skipped pre-flight checks and loads
+the first image. Then it stops:
+
+```
+lakehousectl: loading bundle/images/socat.tar
+lakehousectl: the image alpine/socat:1.8.1.3@sha256:466c8a03… is not in the local store
+```
+
+- **BLOCKER 1 (planner's miss in 4b). After `docker load`, nothing resolves a digest-pinned
+  reference.** `docker save` of a pulled image does not carry its registry digest on Docker's
+  classic image store. After `docker load` the host has the image, but not under
+  `name:tag@sha256:<registry digest>`. Both the installer's check (`docker image inspect
+  <ref@digest>`) and the release's Compose file pin images that way. So an air-gapped install
+  cannot start even when the right image is loaded. Section 4b's T0 gave the installer a way to
+  CHECK a loaded image (`imageIds`), but no way for Compose to FIND it. Round 1 named this as
+  the one thing only the dry run could prove, and the dry run has disproved it.
+- **Next.** The fix is a design choice, so it waits for a measurement on bluefin. On both image
+  stores, it covers which `docker save` form, if any, lets a digest-pinned reference resolve
+  offline after `docker load`, for `docker image inspect` and for `docker compose up --pull
+  never`. The planner then writes the decision here (S3 D-amend) before any code changes.
+
+**Open: BLOCKER 1.**
