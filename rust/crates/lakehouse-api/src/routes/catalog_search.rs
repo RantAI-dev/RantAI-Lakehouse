@@ -35,6 +35,13 @@
 //! its column `customer_id`, and the first word alone (the name) would leave
 //! the reader with no reason. When every word's best field is the name there
 //! is no `matchedOn`: the name is already on screen.
+//!
+//! `DATA-32` D1 is the one exception to that last rule. When no field
+//! explains the hit and a word matched the name only approximately (`revnue`
+//! for `Revenue`), the name is the reason, with `approximate: true`: a
+//! reader who typed a typo must be told that a typo was forgiven, or the
+//! result looks like a false positive. An exact name match still carries no
+//! reason.
 
 use std::collections::HashMap;
 
@@ -99,8 +106,10 @@ impl Field {
         }
     }
 
-    /// The `matchedOn.field` spelling; `None` for the name, which is never
-    /// reported because the name is already on screen.
+    /// The `matchedOn.field` spelling; `None` for the name, which is not
+    /// reported as a reason of its own because the name is already on
+    /// screen. A name that forgave a typo is reported by the search itself,
+    /// as `"name"` (`DATA-32` D1).
     const fn reported(self) -> Option<&'static str> {
         match self {
             Self::Name => None,
@@ -130,6 +139,17 @@ struct Hit {
     field: Field,
     shown: String,
     approximate: bool,
+}
+
+/// Why an asset matched, as the caller is told.
+enum Reason {
+    /// A field that explains the hit (`DATA-11`): the reader sees which
+    /// field matched and whether a typo was forgiven.
+    Field(Hit),
+    /// The name forgave a typo and no field explains the hit (`DATA-32` D1):
+    /// the name is on screen already, so the reader is told only that the
+    /// match was approximate.
+    NameTypo,
 }
 
 /// The `(key, value)` pairs of an asset's `governedTags` object
@@ -316,6 +336,9 @@ fn best_hit(word: &str, candidates: &[Candidate]) -> Option<Hit> {
 /// order, whose best field is not the name (omitted when every word's best
 /// field is the name; `DATA-11` review `SHOULD-FIX 8`). `usage` is
 /// `DATA-11` D4.
+///
+/// `DATA-32` D1: when no field explains the hit and a word matched the name
+/// only approximately, `matchedOn` is the name with `approximate: true`.
 pub fn search(
     assets: &[Value],
     columns: &ColumnIndex,
@@ -328,11 +351,12 @@ pub fn search(
         return assets.to_vec();
     }
 
-    let mut ranked: Vec<(u32, u32, &Value, Option<Hit>)> = Vec::new();
+    let mut ranked: Vec<(u32, u32, &Value, Option<Reason>)> = Vec::new();
     for asset in assets {
         let cands = candidates(asset, columns);
         let mut total = 0_u32;
         let mut reason = None;
+        let mut name_typo = false;
         let mut all = true;
         for word in &words {
             let Some(hit) = best_hit(word, &cands) else {
@@ -343,11 +367,20 @@ pub fn search(
             // `DATA-11` review `SHOULD-FIX 8`: not the first word as such but
             // the first one the name does not already explain.
             if reason.is_none() && hit.field.reported().is_some() {
-                reason = Some(hit);
+                reason = Some(Reason::Field(hit));
+            } else if !name_typo && hit.field == Field::Name && hit.approximate {
+                // `DATA-32` D1: the name forgave a typo. It is the reason
+                // only when no field explains the hit, so it is kept aside;
+                // the name has no reported field, so the branch above never
+                // takes it.
+                name_typo = true;
             }
         }
         if all {
             let used = usage.get(text_of(asset, "id")).copied().unwrap_or(0);
+            // `DATA-32` D1: a field that explains the hit wins; the name that
+            // forgave a typo is the reason only when there is none.
+            let reason = reason.or(name_typo.then_some(Reason::NameTypo));
             ranked.push((total, used, asset, reason));
         }
     }
@@ -358,10 +391,17 @@ pub fn search(
     });
     ranked
         .into_iter()
-        .map(|(_, _, asset, hit)| {
+        .map(|(_, _, asset, reason)| {
             let mut asset = asset.clone();
-            let reported =
-                hit.and_then(|h| h.field.reported().map(|f| (f, h.shown, h.approximate)));
+            let reported = reason.and_then(|r| match r {
+                Reason::Field(hit) => hit
+                    .field
+                    .reported()
+                    .map(|f| (f, hit.shown, hit.approximate)),
+                // `DATA-32` D1: the name forgave a typo and nothing else
+                // explains the hit, so the name is the reason.
+                Reason::NameTypo => Some(("name", String::new(), true)),
+            });
             if let (Some((field, value, approximate)), Some(o)) = (reported, asset.as_object_mut())
             {
                 o.insert(
@@ -787,6 +827,29 @@ mod tests {
         })];
         let hits = find(&assets, "northwind customer");
         assert_eq!(hits.len(), 1);
+        assert!(hits[0].get("matchedOn").is_none());
+    }
+
+    // `DATA-32` D1: the name forgave the typo and nothing else explains the
+    // hit, so the name is the reason and it says the match was approximate.
+    #[test]
+    fn a_typo_that_only_the_name_forgives_is_reported_as_an_approximate_name_match() {
+        let assets = vec![json!({ "id": "silver.revenue", "name": "Revenue" })];
+        let hits = find(&assets, "revnue");
+        assert_eq!(ids(&hits), vec!["silver.revenue"]);
+        assert_eq!(
+            hits[0]["matchedOn"],
+            json!({ "field": "name", "value": "", "approximate": true })
+        );
+    }
+
+    // `DATA-32` D1: an exact name match is still no reason; the name is on
+    // screen already.
+    #[test]
+    fn an_exact_name_match_still_has_no_reason() {
+        let assets = vec![json!({ "id": "silver.revenue", "name": "Revenue" })];
+        let hits = find(&assets, "revenue");
+        assert_eq!(ids(&hits), vec!["silver.revenue"]);
         assert!(hits[0].get("matchedOn").is_none());
     }
 
