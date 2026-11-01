@@ -404,6 +404,168 @@ Branch `feat/rel-2-s3-lakehousectl-install` off `main`. One commit per task.
 **S3 verification:** the scoped cargo commands, `pytest ops/release`, `shellcheck`, `actionlint`.
 The PR's dry run is the end-to-end proof.
 
+## 4c. S4 plan check (planner, 2026-11-01, at `main` `5661a043`): update, backup, rollback
+
+Read today:
+- **The CLI** (`rust/crates/lakehousectl/src/cli.rs`) has `verify`, `preflight` and `install`.
+  `install` writes the D5 layout, including `state.json` with `currentVersion`,
+  `previousVersion: null` and `lastBackup: null` (`install.rs`, `write_layout`).
+- **Backup and restore exist as repo scripts**: `ops/backups/backup-local.sh` (D8: Postgres
+  `pg_dumpall`, ClickHouse `BACKUP … TO Disk('backups')`, the connector-secrets volume, `.env`,
+  and a `manifest.json` of checksums) and `scripts/restore-from-backup.sh --local` (checks the
+  checksums first).
+  - Both `cd` to the repository root and run `docker compose -p <project>` there
+    (`backup-local.sh:60-75`).
+  - An installed host has neither script.
+- **Gap found by this check: the release's Compose file bind-mounts files the install does not
+  write.**
+  - `clickhouse` mounts `./ops/backups/clickhouse/backups.xml` (`docker-compose.yml:143`), which
+    is the backup disk `Disk('backups')` needs.
+  - `trino-maintenance-cron` (profile `trino`) mounts `./ops/trino/optimize_bronze.sh` (`:3266`).
+  - On an installed host Docker creates an empty directory in their place. ClickHouse still
+    starts, which is why the install proof passed, but a backup cannot run.
+  - The other relative mounts are test runners in test profiles, which a release does not run.
+- **`MAINTENANCE_PAUSED` (D9) is not implemented anywhere.** `git grep` finds it only in this
+  plan.
+- **The local backup does not hold the warehouse files** (`RustFS`). D8 never said it did. A
+  restore therefore returns the catalogs, Postgres with Lakekeeper's tables and ClickHouse, to
+  the moment of the backup, while data files written after it stay as orphans. That is safe
+  only while no expiry or orphan-file job deletes files that the restored catalog still names.
+  This is why D9 pauses them.
+- **No earlier release exists to update from.** 0.2.0 is the first (D4). So the S4 proof cannot
+  install "the previous release". It builds a second candidate in the job instead (D21).
+
+**Decisions (planner):**
+- **D14. The release ships every file its Compose file mounts.**
+  - The pipeline adds each relative bind-mount source used by a service that a release runs
+    (no test-runner profile) to the bundle and to the manifest's `files`, with its SHA-256.
+    Today that is `ops/backups/clickhouse/backups.xml` and `ops/trino/optimize_bronze.sh`.
+  - `install` and `update` write them into `--dir` at the same relative path, after checking
+    each against the signed manifest.
+  - A release-tooling test fails when the rendered Compose file mounts a relative source that
+    `files` does not list.
+- **D15. One backup and one restore, shipped as tools.**
+  - `backup-local.sh` and `restore-from-backup.sh` gain `LAKEHOUSE_DIR`: the directory holding
+    `docker-compose.yml` and `.env`, defaulting to the repository root, so a developer's
+    behaviour is unchanged. With it they run `docker compose -p <project> -f
+    "$LAKEHOUSE_DIR/docker-compose.yml" --env-file "$LAKEHOUSE_DIR/.env"`, plus `override.yml`
+    when it exists.
+  - The two scripts ship as release files (D14 mechanism) under `tools/`.
+  - `lakehousectl backup` and `lakehousectl restore <dir>` run them with `LAKEHOUSE_DIR=--dir`
+    and `COMPOSE_PROJECT=rantai-lakehouse`. There is no Rust port, so the steps have one
+    source.
+  - The backup set also gets `release.json` and `state.json`, which now exist. That closes the
+    gap `backup-local.sh`'s header admits.
+  - `lakehousectl backup` writes `state.json`'s `lastBackup`.
+- **D16. `MAINTENANCE_PAUSED`.**
+  - The Dagster services get `MAINTENANCE_PAUSED: ${MAINTENANCE_PAUSED:-}`.
+  - The snapshot-expiry and orphan-file jobs read it with `== "true"`. When it is set, they skip
+    and record the reason in `skipped_verbs`; they do not fail.
+  - `lakehousectl` sets it in `.env` before the backup of an update, and clears it after a
+    success or after a rollback. The services that read it are recreated by `up -d`.
+- **D17. `lakehousectl update [--bundle <dir>] [--version <v>] [--ready-timeout <secs>]`.**
+  The steps run in this order, and nothing running is touched before step 4:
+  1. Obtain and verify the new release, as `install` does.
+  2. Compute the path (D10) from `state.json`'s `currentVersion`:
+     - the same version: nothing to do;
+     - older: refused, pointing to `rollback`;
+     - below `minFrom`, or with a `stops` entry between: online, each hop runs in turn; offline,
+       it is refused, naming the bundles of the stops.
+  3. Run the pre-flight checks (including `image-store` for a bundle), write the D14 files to a
+     staging directory, and pull or load every image of the new release. A failure here leaves
+     the running stack as it was.
+  4. Set `MAINTENANCE_PAUSED=true`. Stop the writers: `lakehouse-api`, `console`, and
+     `dagster-daemon`, `dagster-code-location` and `dagster-webserver` when they run. Postgres,
+     ClickHouse, RustFS and Lakekeeper keep running.
+  5. Take a backup (D15) to `backups/<stamp>-<old version>/`, and record it in `state.json`.
+  6. Keep the old `docker-compose.yml` and `release.json` as `*.previous`. Put the new ones and
+     the D14 files in place, then `up -d --pull never`.
+  7. Wait up to `--ready-timeout` (default 600 s, D9) for `/health/ready` to report the new
+     version as ready, and for the console.
+  8. On success: clear the pause, and set `state.json`'s `currentVersion` to the new version and
+     `previousVersion` to the old one.
+  9. On a timeout or a failure from step 6 on, roll back by itself (D18), and exit non-zero.
+     It reports both what failed and what the rollback did.
+- **D18. `lakehousectl rollback [--yes]`**, and the automatic rollback:
+  - stop the stack;
+  - `restore` the update's backup (`state.json`'s `lastBackup`);
+  - put the `*.previous` files back, and `up -d --pull never`;
+  - wait for ready on the old version;
+  - clear the pause, and set `state.json` back.
+  - By hand it first says that data written since the update is lost, and it needs `--yes` or an
+    interactive "yes".
+  - It refuses when there is no previous release or no backup.
+- **D19. `lakehousectl status`.** It shows:
+  - the installed version (`state.json`);
+  - each service's state (`docker compose ps --format json`);
+  - the API's `/health/ready`;
+  - the backups (newest first, with size);
+  - online, whether a newer release exists. Offline it says that it did not check.
+- **D20. `lakehousectl self-update`** (online).
+  1. Read the newest release's `release.json` and its signature, and verify them with the
+     compiled-in key.
+  2. Download `lakehousectl-linux-x86_64`, and check it against that manifest's
+     `files["lakehousectl"]`.
+  3. Replace the running binary atomically (a write to a temporary file, then a rename), and
+     say which version it now is.
+  - Offline, the bundle's own `lakehousectl` is the new tool, and the help text says so.
+- **D21. The proof, `update-proof`, a new job in the dry run, after `install-proof`.** On a fresh
+  runner, air-gapped as `install-proof` is:
+  1. Install the dry run's bundle A, version `V`.
+  2. Seed markers: a row in a marker table in the application database, a row in a ClickHouse
+     marker table, and a stored connector credential through the API.
+  3. Build bundle B: the API image rebuilt with its version set to `V-update-proof.1`, every
+     other image reused from A, and the manifest signed with the job's throwaway key.
+     `lakehousectl update --bundle B` must report B ready, and every marker must still be
+     there.
+  4. Build bundle C, version `V-update-proof.2`, whose API image never becomes ready (it sleeps).
+     `lakehousectl update --bundle C --ready-timeout 180` must exit non-zero and report the
+     rollback. Afterwards `/health/ready` must say B and ready, and every marker must still be
+     there.
+  - The real "previous release" test, installing 0.2.0 and then updating, joins this job once
+    0.2.0 exists (S5), with the reason written in the job.
+
+**PR slicing:**
+- **S4a** (one PR): T1–T3 (D14, D15, D16) and `backup` and `restore`.
+- **S4b** (one PR, after S4a merges): T4–T7 (D17–D21).
+
+Branch `feat/rel-2-s4-lakehousectl-update` off `main`, one commit per task.
+
+- **S4-T1 (D14). The release ships its mounted files.**
+  - Change `render_compose.py` or `make_manifest.py` (whichever owns `files`), `make_bundle.sh`
+    and `release.yml`'s assets, and the new release-tooling test.
+  - `install` writes and checks the files, with a Rust test.
+  - *Accept:* `pytest ops/release -q`, `actionlint`, `cargo test -p lakehousectl`.
+- **S4-T2 (D15). The scripts take `LAKEHOUSE_DIR`, ship as tools, and gain `release.json` and
+  `state.json` in the set.** Add `lakehousectl backup` and `restore <dir>`, with tests that a
+  backup and a restore call the shipped scripts with the right environment, using fakes.
+  - *Accept:* `shellcheck` on both scripts, `pytest ops/release -q`, `cargo test -p
+    lakehousectl`.
+  - Then one real run on bluefin: install a small bundle, `lakehousectl backup`, destroy the
+    volumes, `lakehousectl restore`, and the data is back. Quote it.
+- **S4-T3 (D16). `MAINTENANCE_PAUSED`.** Change the compose environment of the Dagster services,
+  and the two jobs' skip.
+  - Python tests with full-sentence names, and no network.
+  - *Accept:* `(cd dagster && python -m pytest dispar_orchestrate -q -k "maintenance or
+    expiry or orphan")`, `docker compose --profile '*' config --quiet`.
+- **S4-T4 (D17, D18).** `update` and `rollback`, with every step a function that takes
+  injected facts and a fake docker runner, as `preflight` is.
+  - Unit tests:
+    - the path rules;
+    - the order of the steps;
+    - a failure at step 3 touches nothing;
+    - a failure at step 7 rolls back;
+    - `rollback` refuses when there is no backup.
+  - *Accept:* `cargo test -p lakehousectl`, clippy.
+- **S4-T5 (D19). `status`**, with tests.
+- **S4-T6 (D20). `self-update`**, with tests using a fake download, including a refusal on a
+  wrong checksum.
+- **S4-T7 (D21). `update-proof`**, with workflow tests in `test_release_workflow.py`. The PR's dry
+  run is its proof.
+
+**Out of scope for S4:** a `lakehousectl` backup to S3 (the `backups` profile remains the S3
+path, and `status` names it), a backup of the warehouse files, and zero-downtime updates.
+
 ## 5. Out of scope
 
 Kubernetes or Helm, multi-host, zero-downtime updates, Windows and macOS hosts, automatic
