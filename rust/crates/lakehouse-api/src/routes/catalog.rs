@@ -3921,6 +3921,20 @@ mod tests {
             .collect()
     }
 
+    /// The table a statement READS: the first registry table its
+    /// `FROM` clause names (the name ends at the next backtick).
+    ///
+    /// DATA-40 D3's filter names the primary catalog table inside every
+    /// secondary branch, so a read of the sync or the column registry
+    /// mentions `dataset_catalog` as well — the table a statement READS
+    /// is what decides what the engine answers.
+    fn table_read(sql: &str) -> &str {
+        sql.find("FROM lake.`")
+            .map(|at| &sql[at + "FROM lake.`".len()..])
+            .and_then(|rest| rest.split('`').next())
+            .unwrap_or_default()
+    }
+
     // DATA-11 R2: the three id shapes the row builders give.
     #[test]
     fn collect_columns_keys_bronze_by_slug_and_silver_and_gold_by_database() {
@@ -7003,20 +7017,6 @@ mod tests {
                 .collect()
         }
 
-        /// The table a statement reads: the first registry table its
-        /// `FROM` clause names (the name ends at the next backtick).
-        ///
-        /// DATA-40 D3's filter names the primary catalog table inside every
-        /// secondary branch, so a read of the sync or the column registry
-        /// mentions `dataset_catalog` as well — the table a statement
-        /// READS is what decides what the engine answers.
-        fn table_read(sql: &str) -> &str {
-            sql.find("FROM lake.`")
-                .map(|at| &sql[at + "FROM lake.`".len()..])
-                .and_then(|rest| rest.split('`').next())
-                .unwrap_or_default()
-        }
-
         /// The engine the two reads talk to.
         struct RegistryEngine;
 
@@ -7719,8 +7719,8 @@ mod tests {
 
         use lakehouse_auth::{PermissionSet, PrincipalId};
         use uuid::Uuid;
-        use wiremock::matchers::{body_string_contains, method};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
         use super::*;
         use crate::config::Config;
@@ -7750,60 +7750,79 @@ mod tests {
             ]
         }
 
+        /// The engine the catalog's reads talk to.
+        ///
+        /// The table a statement READS decides what it answers — not
+        /// every table it mentions: DATA-40 D3's filter names the
+        /// primary catalog table inside every secondary branch, so a read
+        /// of the sync or the column registry mentions `dataset_catalog`
+        /// too.
+        struct CatalogEngine;
+
+        impl Respond for CatalogEngine {
+            fn respond(&self, request: &Request) -> ResponseTemplate {
+                let sql = String::from_utf8_lossy(&request.body).into_owned();
+                let answer = |data: Vec<Value>| {
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "meta": [],
+                        "data": data,
+                        "rows": data.len(),
+                    }))
+                };
+                // DATA-40 D5's clash read: this fixture holds no slug in
+                // both registries.
+                if sql.contains("INTERSECT") {
+                    return answer(vec![json!({"n": "0", "slugs": []})]);
+                }
+                let table = table_read(&sql);
+                if table.ends_with("dataset_catalog") {
+                    return answer(catalog_rows());
+                }
+                if table.ends_with("dataset_sync") {
+                    return answer(
+                        catalog_rows()
+                            .iter()
+                            .map(|row| {
+                                json!({
+                                    "slug": row["slug"], "total": "10",
+                                    "author": "bench", "frekuensi": "daily",
+                                })
+                            })
+                            .collect(),
+                    );
+                }
+                if table.ends_with("dataset_column") {
+                    // The two shapes the reads ask for: the count per
+                    // slug, and the rows of the index. One answer holds
+                    // both, and each read picks the columns it named.
+                    return answer(vec![
+                        json!({
+                            "slug": "bronze.one", "n": "20",
+                            "key_asli": "revenue_amount", "deskripsi": "the amount",
+                        }),
+                        json!({
+                            "slug": "bronze.two", "n": "20",
+                            "key_asli": "total", "deskripsi": "the total",
+                        }),
+                        json!({
+                            "slug": "bronze.three", "n": "20",
+                            "key_asli": "revenue_amount", "deskripsi": "the amount",
+                        }),
+                    ]);
+                }
+                // `system.tables`, `system.columns` and `system.parts`:
+                // this fixture is about the Bronze registry.
+                answer(Vec::new())
+            }
+        }
+
         /// A `ClickHouse` that answers the catalog's own queries: the
         /// registry rows above, one column each, and no Silver or Gold
         /// table.
         async fn mock_catalog() -> MockServer {
             let server = MockServer::start().await;
-            let answer = |data: Vec<Value>| {
-                ResponseTemplate::new(200).set_body_json(json!({
-                    "meta": [],
-                    "data": data,
-                    "rows": data.len(),
-                }))
-            };
             Mock::given(method("POST"))
-                .and(body_string_contains("dataset_catalog"))
-                .respond_with(answer(catalog_rows()))
-                .mount(&server)
-                .await;
-            Mock::given(method("POST"))
-                .and(body_string_contains("dataset_sync"))
-                .respond_with(answer(
-                    catalog_rows()
-                        .iter()
-                        .map(|row| {
-                            json!({
-                                "slug": row["slug"], "total": "10",
-                                "author": "bench", "frekuensi": "daily",
-                            })
-                        })
-                        .collect(),
-                ))
-                .mount(&server)
-                .await;
-            Mock::given(method("POST"))
-                .and(body_string_contains("dataset_column"))
-                .respond_with(answer(vec![
-                    json!({
-                        "slug": "bronze.one", "n": "20",
-                        "key_asli": "revenue_amount", "deskripsi": "the amount",
-                    }),
-                    json!({
-                        "slug": "bronze.two", "n": "20",
-                        "key_asli": "total", "deskripsi": "the total",
-                    }),
-                    json!({
-                        "slug": "bronze.three", "n": "20",
-                        "key_asli": "revenue_amount", "deskripsi": "the amount",
-                    }),
-                ]))
-                .mount(&server)
-                .await;
-            // Everything else (the Silver and Gold tables, the parts) is
-            // empty: this fixture is about the Bronze registry.
-            Mock::given(method("POST"))
-                .respond_with(answer(Vec::new()))
+                .respond_with(CatalogEngine)
                 .mount(&server)
                 .await;
             server
