@@ -5,8 +5,9 @@ filter, and that the version pin actually reads the past.
 
 `POST /api/query/run` on ClickHouse accepts `SETTINGS iceberg_snapshot_id =
 <id>` and reads an Iceberg table as it stood after an earlier load
-(`DATA-16` F1, run by hand against a live stack). Nothing proved that the
-policy rewrite (`sql_rewrite.rs`) still applies when that setting is
+(`DATA-16` F1, run by hand against a live stack); on Trino the same pin
+is `FOR VERSION AS OF <id>` on the table (`DATA-21`). Nothing proved that
+the policy rewrite (`sql_rewrite.rs`) still applies when that setting is
 present, so a past version could be a way around a mask. This gate is that
 proof. It sits beside `g8_governance_test.py` (which proves masking on a
 `MergeTree` table at its current state only) and stands alone, like every
@@ -31,37 +32,68 @@ gate script in this repo: it imports nothing from that file or from
 4. Seeds an Analyst login and authors, through `POST /api/governance/
    policies`, a ready policy for role Analyst on `bronze.<table>` that
    masks `customer` and filters rows with `id <= 1000`.
-5. Through `POST /api/query/run` on ClickHouse with the older version
-   pinned, asserts that the admin gets clear text and every row of the
-   older version; that the Analyst gets `***` in `customer`, only the rows
-   the filter allows (fewer than the admin's, and exactly the admin's
-   `id <= 1000` count), and the same `amount` values the admin sees.
+5. Through `POST /api/query/run` with the older version pinned, asserts
+   that the admin gets clear text and every row of the older version; that
+   the Analyst gets `***` in `customer`, only the rows the filter allows
+   (fewer than the admin's, and exactly the admin's `id <= 1000` count),
+   and the same `amount` values the admin sees.
 6. Asserts the same for the Analyst with the pin written inside a subquery
    and inside a CTE: each is masked or refused (`422`), never clear text.
 7. Asserts the admin's count at the older version is below the current
    version's count and equals the snapshot's own recorded total, so the pin
    is shown to have read the past and not the present.
 
+# The engine this run proves (DATA-21 S2)
+
+This gate takes an ENGINE argument and proves the same past-version
+assertions on that engine: `--engine trino` (or `G8_ENGINE=trino`) proves
+them on `Trino`, and the default — no argument at all — proves them on
+`ClickHouse`, which is exactly what this gate always did.
+
+The two engines read the SAME Bronze table and are held by the SAME
+policy — `Trino` reads it through Lakekeeper's Iceberg REST catalog
+(`iceberg.bronze.<table>`) where `ClickHouse` reads it through the
+`DataLakeCatalog` database (`icecat_api.`bronze.<table>``), and the
+policy engine matches a rewritten statement's table by its CANONICAL
+name (`bronze.<table>` — the catalog is not part of it). So one authored
+policy governs the table on both engines.
+
+They disagree on how the gate's own SQL is spelled, and each difference
+was measured against the engine itself rather than guessed:
+
+- the version pin: `ClickHouse` pins the WHOLE statement with
+  `SETTINGS iceberg_snapshot_id = <id>` at its end, while `Trino` pins
+  the TABLE with `FOR VERSION AS OF <id>` right after the table
+  reference — `Trino` reads that clause in no other position (measured
+  against `trinodb/trino:483`: `FROM t WHERE ... FOR VERSION AS OF 1`
+  does not parse);
+- the count: `ClickHouse` writes `count()`, `Trino` writes `count(*)`;
+- the truth value: `Trino` has no integer truth value, so `WHERE 1` (the
+  predicate that selects every row) is `WHERE true` there;
+- the `ORDER BY`: `Trino` may only order by a column the outer select
+  list carries, so the `Trino` shapes select the ordering column beside
+  the masked one.
+
 # What this gate cannot prove
 
-- It observes `lakehouse-api`'s HTTP responses only, not the SQL ClickHouse
-  ran or the policy engine's decision. A rewrite that hardcoded `***` for a
-  column called `customer` would pass; steps 5 and 7 narrow that by asking
-  the same questions of the admin, who must get clear text.
+- It observes `lakehouse-api`'s HTTP responses only, not the SQL the
+  engine ran or the policy engine's decision. A rewrite that hardcoded
+  `***` for a column called `customer` would pass; steps 5 and 7 narrow
+  that by asking the same questions of the admin, who must get clear text.
 - A `422` from the subquery and CTE shapes is accepted as "refused", the
   way `g8_governance_test.py` accepts it. It cannot tell the policy
-  engine's refusal from ClickHouse rejecting a `SETTINGS` clause in that
+  engine's refusal from the engine rejecting the version clause in that
   position; both are safe, neither leaks.
 - One version applies to every Iceberg table in a query (`DATA-16` F7), so
   this gate reads one table at one version. Two tables at two versions are
   out of scope.
-- Trino is out of scope (`DATA-21`): it has no version pin the API can read.
 - It has never been run on this machine (no containers are started while
   writing it); the first real run is CI's `g8-time-travel` job.
 """
 
 from __future__ import annotations
 
+import argparse
 import os
 import subprocess
 import sys
@@ -102,12 +134,121 @@ FILTER_LIMIT = 1000  # the policy's row filter is `id <= FILTER_LIMIT`
 LATE_ROWS = 10  # rows added to the source between the two loads
 LATE_CUSTOMER = "g8tt_late"
 
-TABLE = f"{ICEBERG_DB}.`bronze.{BRONZE_TABLE_NAME}`"
+# The engines this gate knows how to prove.
+ENGINE_CLICKHOUSE = "clickhouse"
+ENGINE_TRINO = "trino"
+
+# The table the gate reads, on each engine. `ClickHouse` reads the
+# Bronze table through the `DataLakeCatalog` database
+# `clickhouse-iceberg-init` creates (`ICEBERG_QUERY_DB`); `Trino` has no
+# `ClickHouse` connector and reads the SAME table through Lakekeeper's
+# Iceberg REST catalog. The policy engine matches both on the table's
+# canonical name, `bronze.<table>`.
+ICEBERG_TABLE = f"{ICEBERG_DB}.`bronze.{BRONZE_TABLE_NAME}`"
+TRINO_TABLE = f"iceberg.bronze.{BRONZE_TABLE_NAME}"
+
+# The predicate that selects every row, per engine: `Trino` has no
+# integer truth value (`WHERE 1` does not parse there), so it takes a
+# boolean.
+ALL_ROWS_PREDICATE = {ENGINE_CLICKHOUSE: "1", ENGINE_TRINO: "true"}
 
 
 class G8TimeTravelFailure(Exception):
     """Raised for any acceptance-criterion violation or infrastructure
     failure this gate cannot proceed past."""
+
+
+def parse_engine(argv: list[str]) -> str:
+    """The engine this run proves.
+
+    `--engine` on the command line beats the `G8_ENGINE` environment
+    variable, which beats the `clickhouse` default — so a run with no
+    argument at all is exactly the ClickHouse leg this gate always was.
+    The environment variable is what CI uses (`docker compose run -e
+    G8_ENGINE=trino ...`), because the compose runner's own command line
+    is fixed.
+
+    # Errors
+
+    Raises [`G8TimeTravelFailure`] for an engine this gate cannot prove.
+    """
+    parser = argparse.ArgumentParser(description="G8 time-travel acceptance test")
+    parser.add_argument(
+        "--engine",
+        choices=[ENGINE_CLICKHOUSE, ENGINE_TRINO],
+        default=None,
+        help="the engine to prove (default: $G8_ENGINE, else clickhouse)",
+    )
+    args, _unknown = parser.parse_known_args(argv)
+    engine = (args.engine or os.environ.get("G8_ENGINE") or ENGINE_CLICKHOUSE).strip().lower()
+    if engine not in (ENGINE_CLICKHOUSE, ENGINE_TRINO):
+        raise G8TimeTravelFailure(
+            f"unknown engine {engine!r}: this gate proves {ENGINE_CLICKHOUSE} or {ENGINE_TRINO}"
+        )
+    return engine
+
+
+def table_ref(engine: str) -> str:
+    """The table the gate reads, on the engine it names."""
+    return TRINO_TABLE if engine == ENGINE_TRINO else ICEBERG_TABLE
+
+
+def count_sql(engine: str, where: str, pin: str | None) -> str:
+    """A row count, always with a WHERE (R11: a bare Iceberg count can
+    overcount on delete files, `docs/plans/P5-RESULT.md`).
+
+    `ClickHouse` writes `count()` and pins the whole statement with a
+    `SETTINGS` clause at its end; `Trino` writes `count(*)` and pins the
+    TABLE, so its version clause goes right after the table reference and
+    before the `WHERE`.
+    """
+    table = table_ref(engine)
+    if engine == ENGINE_TRINO:
+        pin_clause = f" FOR VERSION AS OF {pin}" if pin else ""
+        return f"SELECT count(*) AS n FROM {table}{pin_clause} WHERE {where}"
+    settings = f" SETTINGS iceberg_snapshot_id = {pin}" if pin else ""
+    return f"SELECT count() AS n FROM {table} WHERE {where}{settings}"
+
+
+def rows_sql(engine: str, columns: str, where: str, pin: str | None) -> str:
+    """The gate's own row read, with the version pinned.
+
+    `ClickHouse` pins the whole statement with a `SETTINGS` clause at its
+    end; `Trino` pins the table, so its version clause goes right after
+    the table reference and before the `WHERE`.
+    """
+    table = table_ref(engine)
+    if engine == ENGINE_TRINO:
+        pin_clause = f" FOR VERSION AS OF {pin}" if pin else ""
+        return f"SELECT {columns} FROM {table}{pin_clause} WHERE {where} ORDER BY id LIMIT 5"
+    tail = "ORDER BY id LIMIT 5"
+    if pin:
+        tail += f" SETTINGS iceberg_snapshot_id = {pin}"
+    return f"SELECT {columns} FROM {table} WHERE {where} {tail}"
+
+
+def nested_pin_shapes(engine: str, pin: str) -> dict[str, str]:
+    """The two shapes that hide the version pin inside a subquery and
+    inside a CTE. Each must come back masked or refused, never clear
+    text.
+
+    `Trino` reads the version clause right after the table reference, and
+    may only order by a column the OUTER select list carries — so the
+    `Trino` shapes select the ordering column beside the masked one,
+    which the `ClickHouse` shapes do not need.
+    """
+    table = table_ref(engine)
+    if engine == ENGINE_TRINO:
+        inner = f"SELECT id, {MASKED_COLUMN} FROM {table} FOR VERSION AS OF {pin}"
+        return {
+            "subquery": f"SELECT id, {MASKED_COLUMN} FROM ({inner}) AS s ORDER BY id LIMIT 5",
+            "cte": f"WITH x AS ({inner}) SELECT id, {MASKED_COLUMN} FROM x ORDER BY id LIMIT 5",
+        }
+    inner = f"SELECT id, {MASKED_COLUMN} FROM {table} SETTINGS iceberg_snapshot_id = {pin}"
+    return {
+        "subquery": f"SELECT {MASKED_COLUMN} FROM ({inner}) AS s ORDER BY id LIMIT 5",
+        "cte": f"WITH x AS ({inner}) SELECT {MASKED_COLUMN} FROM x ORDER BY id LIMIT 5",
+    }
 
 
 def _wait_for(name: str, check, timeout_s: int, interval_s: float = 2.0) -> None:
@@ -306,33 +447,41 @@ def step_author_policy(admin: requests.Session) -> None:
     print(f"[g8-tt] authored policy {POLICY_NAME!r}")
 
 
-def run_query(session: requests.Session, sql: str) -> requests.Response:
+def run_query(session: requests.Session, sql: str, engine: str) -> requests.Response:
+    """The gate's own query, on the engine this run proves. `Trino` is
+    named in the request body because `POST /api/query/run` reads the
+    engine from there; `Trino`'s own timeout is generous, because its
+    first query pays for the Iceberg connector's metadata round trip to
+    Lakekeeper."""
+    timeout = 60 if engine == ENGINE_CLICKHOUSE else 180
     return session.post(
-        f"{API_URL}/api/query/run", json={"sql": sql, "engine": "clickhouse"}, timeout=60
+        f"{API_URL}/api/query/run", json={"sql": sql, "engine": engine}, timeout=timeout
     )
 
 
-def rows_of(session: requests.Session, sql: str, who: str) -> list[dict]:
-    resp = run_query(session, sql)
+def rows_of(session: requests.Session, sql: str, who: str, engine: str) -> list[dict]:
+    resp = run_query(session, sql, engine)
     if not resp.ok:
         raise G8TimeTravelFailure(f"{who} query failed: {resp.status_code} {resp.text}\nSQL: {sql}")
     return resp.json().get("rows", [])
 
 
-def count_of(session: requests.Session, where: str, pin: str | None, who: str) -> int:
+def count_of(session: requests.Session, where: str, pin: str | None, who: str, engine: str) -> int:
     """A row count, always with a WHERE (R11: a bare Iceberg count can
     overcount on delete files, `docs/plans/P5-RESULT.md`)."""
-    settings = f" SETTINGS iceberg_snapshot_id = {pin}" if pin else ""
-    rows = rows_of(session, f"SELECT count() AS n FROM {TABLE} WHERE {where}{settings}", who)
+    rows = rows_of(session, count_sql(engine, where, pin), who, engine)
     if len(rows) != 1:
         raise G8TimeTravelFailure(f"{who} count returned {len(rows)} rows")
     return int(rows[0]["n"])
 
 
-def step_assert_pinned_reads(admin: requests.Session, analyst: requests.Session, older: dict) -> None:
+def step_assert_pinned_reads(
+    admin: requests.Session, analyst: requests.Session, older: dict, engine: str
+) -> None:
     pin = older["id"]
-    older_total = count_of(admin, "1", pin, "admin")
-    current_total = count_of(admin, "1", None, "admin")
+    all_rows = ALL_ROWS_PREDICATE[engine]
+    older_total = count_of(admin, all_rows, pin, "admin", engine)
+    current_total = count_of(admin, all_rows, None, "admin", engine)
     recorded = (older.get("summary") or {}).get("totalRecords")
     if recorded is not None and older_total != recorded:
         raise G8TimeTravelFailure(
@@ -344,8 +493,8 @@ def step_assert_pinned_reads(admin: requests.Session, analyst: requests.Session,
         )
     print(f"[g8-tt] admin: older version {older_total} rows, current {current_total} rows")
 
-    allowed = count_of(admin, f"id <= {FILTER_LIMIT}", pin, "admin")
-    analyst_total = count_of(analyst, "1", pin, "analyst")
+    allowed = count_of(admin, f"id <= {FILTER_LIMIT}", pin, "admin", engine)
+    analyst_total = count_of(analyst, all_rows, pin, "analyst", engine)
     if analyst_total >= older_total:
         raise G8TimeTravelFailure(
             f"the row filter did not apply at the older version: analyst {analyst_total} of {older_total}"
@@ -357,9 +506,15 @@ def step_assert_pinned_reads(admin: requests.Session, analyst: requests.Session,
     print(f"[g8-tt] analyst: {analyst_total} of {older_total} rows at the older version")
 
     columns = f"id, {MASKED_COLUMN}, amount"
-    tail = f"ORDER BY id LIMIT 5 SETTINGS iceberg_snapshot_id = {pin}"
-    admin_rows = rows_of(admin, f"SELECT {columns} FROM {TABLE} WHERE id <= {FILTER_LIMIT} {tail}", "admin")
-    analyst_rows = rows_of(analyst, f"SELECT {columns} FROM {TABLE} WHERE 1 {tail}", "analyst")
+    admin_rows = rows_of(
+        admin,
+        rows_sql(engine, columns, f"id <= {FILTER_LIMIT}", pin),
+        "admin",
+        engine,
+    )
+    analyst_rows = rows_of(
+        analyst, rows_sql(engine, columns, all_rows, pin), "analyst", engine
+    )
     if not admin_rows or len(admin_rows) != len(analyst_rows):
         raise G8TimeTravelFailure(
             f"cannot compare: admin {len(admin_rows)} rows, analyst {len(analyst_rows)} rows"
@@ -376,18 +531,16 @@ def step_assert_pinned_reads(admin: requests.Session, analyst: requests.Session,
     print("[g8-tt] analyst: masked column is ***, unmasked columns are clear and equal to the admin's")
 
 
-def step_assert_nested_pins_not_clear(analyst: requests.Session, older: dict) -> None:
+def step_assert_nested_pins_not_clear(
+    analyst: requests.Session, older: dict, engine: str
+) -> None:
     """The pin written inside a subquery and inside a CTE: each must be
     masked or refused with 422, never clear text. A 401/403 is never an
     acceptable refusal (that would be the session losing authentication)."""
     pin = older["id"]
-    inner = f"SELECT id, {MASKED_COLUMN} FROM {TABLE} SETTINGS iceberg_snapshot_id = {pin}"
-    shapes = {
-        "subquery": f"SELECT {MASKED_COLUMN} FROM ({inner}) AS s ORDER BY id LIMIT 5",
-        "cte": f"WITH x AS ({inner}) SELECT {MASKED_COLUMN} FROM x ORDER BY id LIMIT 5",
-    }
+    shapes = nested_pin_shapes(engine, pin)
     for name, sql in shapes.items():
-        resp = run_query(analyst, sql)
+        resp = run_query(analyst, sql, engine)
         if resp.status_code in (401, 403):
             raise G8TimeTravelFailure(f"{name}: the check itself failed to authenticate: {resp.status_code}")
         if resp.status_code == 422:
@@ -405,14 +558,16 @@ def step_assert_nested_pins_not_clear(analyst: requests.Session, older: dict) ->
 
 def main() -> int:
     try:
+        engine = parse_engine(sys.argv[1:])
+        print(f"[g8-tt] proving time travel on the {engine} engine")
         step_wait_for_services()
         admin = login(AUTH_EMAIL, AUTH_PASSWORD, "bootstrap admin")
         step_seed_analyst_login()
         older, _current = step_load_twice(admin)
         step_author_policy(admin)
         analyst = login(ANALYST_EMAIL, ANALYST_PASSWORD, "analyst")
-        step_assert_pinned_reads(admin, analyst, older)
-        step_assert_nested_pins_not_clear(analyst, older)
+        step_assert_pinned_reads(admin, analyst, older, engine)
+        step_assert_nested_pins_not_clear(analyst, older, engine)
     except G8TimeTravelFailure as exc:
         print(f"[g8-tt] FAILED: {exc}", file=sys.stderr)
         return 1
