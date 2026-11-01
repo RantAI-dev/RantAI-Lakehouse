@@ -58,13 +58,20 @@ All eight defaults signed by the product owner on 2026-10-09 ("run as proposed")
 | # | Decision | Default | Signed |
 | --- | --- | --- | --- |
 | 1 | Speed target *(proposed)*. No competitor publishes a number. | Results within 500 ms for a catalog of 10,000 tables, measured and written to `docs/plans/DATA-11-RESULT.md`. If the measurement misses it, that is reported, not hidden. | 2026-10-09 |
-| 2 | How fresh search is. Searching 10,000 tables and their columns from scratch on every keystroke cannot meet Decision 1, so search reads a copy of the catalog that is refreshed on a timer. | The copy is at most 30 seconds old. A table created by a load can take up to 30 seconds to appear in search. An edit made in the console (description, tags, owner) shows at once. The Data Explorer list with an empty search box stays live, as today. | 2026-10-09 |
+| 2 | How fresh search is. Searching 10,000 tables and their columns from scratch on every keystroke cannot meet Decision 1, so search reads a copy of the catalog that is refreshed on a timer. | The copy is at most 30 seconds old. A table created by a load can take up to 30 seconds to appear in search. An edit made in the console (description, tags, owner) shows at once. The Data Explorer list with an empty search box stays live, as today. Since `DATA-38` (2026-11-01): when the copy is older than 30 seconds, the search is answered from it at once and the copy is rebuilt in the background, so nobody waits for the rebuild. A copy that cannot be rebuilt is not served for longer than five minutes. | 2026-10-09; `DATA-38` changed the mechanism on 2026-11-01 |
 | 3 | How forgiving a typo is. | One wrong, missing, extra or swapped letter, in a word of four letters or more. Shorter words must match exactly. | 2026-10-09 |
 | 4 | What "ranked by use" means. | Relevance decides the order. Between two equally good matches, the table read by more queries in the last 7 days comes first. This is the count the asset page already shows; it covers Query Studio and assistant queries, not dashboard reads. | 2026-10-09 |
 | 5 | The spec says "only assets the user may see appear". The product has no per-table visibility: whoever may open the catalog sees every table in it. | Search shows exactly what the Data Explorer list shows to the same user, never more. Hiding single tables from single users is not built here; it becomes a backlog item of its own. | 2026-10-09 |
 | 6 | The certification filter and tag keys and values. | Both wait for `DATA-12`. | 2026-10-09 |
 | 7 | How many tables the ⌘K box lists. | Eight, as today, with a row "See all results" that opens the Data Explorer with the same words. | 2026-10-09 |
 | 8 | Phones. The search box in the top bar is hidden on narrow screens and ⌘K needs a keyboard. | Left as it is. On a phone, search from the Data Explorer page. | 2026-10-09 |
+
+`DATA-38` (2026-11-01) changed how decision 2 keeps the 30 seconds, not
+what it promises: the copy is still rebuilt every 30 seconds, and a search
+still answers from a copy that is at most that old. What changed is that the
+rebuild runs in the background instead of under the person who is searching,
+and that a copy which cannot be rebuilt is dropped after five minutes rather
+than served.
 
 ## Limits to tell a customer
 
@@ -73,6 +80,9 @@ All eight defaults signed by the product owner on 2026-10-09 ("run as proposed")
   tables.
 - A table loaded for the first time can take up to 30 seconds to appear in
   search.
+- A search is never delayed by the copy's rebuild: the copy is refreshed in
+  the background, and the search that finds it too old is answered from it
+  at once (`DATA-38`).
 - A typo is forgiven only in words of four letters or more, one letter per
   word.
 - Everyone who may open the catalog finds every table in it. Search does not
