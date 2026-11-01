@@ -134,3 +134,23 @@ same (nobody waits for a rebuild), and D1 was implemented as decided.
 afterwards.**
 
 ## 4. Review (planner appends below)
+
+## Review round 1 (planner, 2026-11-01, at `99ff66a2`)
+
+Read: `catalog_search_cache.rs`, the route, and the feature page. The diff matches D1–D4.
+
+- The table in D1 is implemented as written. One background rebuild runs at a time, using the
+  `rebuilding` flag under the slot lock.
+- A rebuild that finishes after an `invalidate` or after an inline rebuild is dropped, because
+  of the `generation` counter. An edit therefore never brings back a copy read before it (D2).
+- A failed background rebuild keeps the old copy and logs the error, and the next read after
+  the TTL tries again. After `MAX_STALE` the read builds inline, and a failure caches nothing.
+- The builder owns a clone of `AppState` (D3). Every field of `AppState` is an `Arc` or a
+  `Copy` value (`state.rs`), so cloning it on each search costs a few reference counts.
+- If a background build panics, `rebuilding` stays `true`. Reads then serve the copy until
+  `MAX_STALE`, after which an inline build replaces it. This degrades to the old behaviour
+  without hanging, so it is not a finding.
+- The ten tests cover each rule in the plan, and the clock is a parameter, so no test sleeps.
+
+**Open: no BLOCKER, no SHOULD-FIX.** Merge waits for the PR's CI (#314). T2 (the benchmark)
+runs on `main` after the merge.
