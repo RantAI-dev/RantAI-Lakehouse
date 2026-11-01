@@ -1828,7 +1828,7 @@ repository's root when it is not.
 | `shellcheck ops/backups/backup-local.sh scripts/restore-from-backup.sh` (0.10.0) | clean, exit 0 |
 | `python3 ops/lint/check_intra_package_imports.py` | `OK: all intra-package dispar_orchestrate imports resolve` |
 | `python3 ops/lint/check_bare_iceberg_count.py` | `R11 guard: no bare count() against a Bronze Iceberg table found.` |
-| `(cd dagster && .venv/bin/python -m pytest dispar_orchestrate -q)` | **2408 passed, 1 skipped**, 40 subtests passed, in 17m54s |
+| `(cd dagster && .venv/bin/python -m pytest dispar_orchestrate -q)` | **2411 passed, 1 skipped**, 40 subtests passed, in 18m13s (on the merged tree; 2408 before `main` came in) |
 | `bun run typecheck` | clean, exit 0 |
 | `bun run test` | **3082 pass, 1 skip, 0 fail**, 8372 expect() calls, in 313 files, 73.8s |
 | `bun run lint` | **12356 problems (649 errors, 11707 warnings)** — red on `main` already, and this branch changes no TypeScript (see below) |
@@ -1850,9 +1850,10 @@ this handoff sits on top of it. The merge touches NONE of the files these fixes 
 `rust/crates/lakehousectl/src/files.rs`), and the checks for what was touched were re-run on the
 merged tree: `cargo fmt --check` clean, `cargo clippy -p lakehousectl --all-targets -- -D warnings`
 clean, `cargo test -p lakehousectl` **95 passed**, `python3 -m pytest ops/release -q` **187 passed**,
-`shellcheck` on both scripts clean, and the two `ops/lint` scripts OK. The whole-workspace run in
-the table above was measured on `4e61a122`, BEFORE that merge — main's own code came with it, and
-the reviewer runs the full block on the PR head anyway.
+`shellcheck` on both scripts clean, the two `ops/lint` scripts OK, and the Dagster code location
+**2411 passed, 1 skipped** (main's own code came with the merge — it is not this slice's). The
+whole-workspace run in the table above was measured on `4e61a122`, BEFORE that merge, and the
+reviewer runs the full block on the PR head anyway.
 
 **The tests of the developer's path are real.** The three tests of the repository's own command (the
 backup, the backup with an override of its own, and the restore) were run against the PRE-FIX
