@@ -174,6 +174,22 @@ class ManifestTest(unittest.TestCase):
         expected = hashlib.sha256(self.compose.read_bytes()).hexdigest()
         self.assertEqual(manifest["files"], {"docker-compose.yml": expected})
 
+    def test_the_manifest_holds_the_installers_checksum(self) -> None:
+        """REL-2 S3-T4: the installer is a file the release ships.
+
+        The signed manifest names every file the release carries, so
+        the bundle's copy of the installer is checked against it.
+        """
+        installer = self.root / "lakehousectl"
+        installer.write_bytes(b"a stand-in for the installer\n")
+        manifest = self.build(lakehousectl_path=installer)
+        expected = hashlib.sha256(installer.read_bytes()).hexdigest()
+        self.assertEqual(manifest["files"]["lakehousectl"], expected)
+
+    def test_a_release_without_an_installer_names_only_the_compose_file(self) -> None:
+        manifest = self.build()
+        self.assertEqual(list(manifest["files"]), ["docker-compose.yml"])
+
     def test_the_default_min_from_is_two_minor_versions_back(self) -> None:
         self.assertEqual(self.build()["minFrom"], "0.0.0")
         self.assertEqual(self.build(version="0.3.0")["minFrom"], "0.1.0")

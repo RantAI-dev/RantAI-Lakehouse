@@ -119,6 +119,12 @@ class BundleTest(unittest.TestCase):
         )
         self.write_manifest_with_the_compose_checksum()
 
+        # The installer the release ships (REL-2 S3-T4), and the
+        # checksum the signed manifest names for it.
+        self.installer = self.root / "lakehousectl"
+        self.installer.write_bytes(b"a stand-in for the installer\n")
+        self.write_manifest_with_the_installer_checksum()
+
         self.out = self.root / "out"
         self.docker_log = self.root / "docker.log"
 
@@ -259,6 +265,79 @@ class BundleTest(unittest.TestCase):
         result = self.run_bundle()
         self.assertEqual(result.returncode, 1)
         self.assertIn("Sigstore bundle", result.stderr)
+
+    def test_the_bundle_carries_the_installer_when_it_is_given_one(self) -> None:
+        """REL-2 S3-T4: the bundle holds `lakehousectl`.
+
+        An air-gapped host installs the stack with the binary in the
+        bundle, so the bundle has to carry it.
+        """
+        self.assertEqual(self.run_bundle_with_the_installer().returncode, 0)
+        extracted = self.extract()
+        self.assertTrue((extracted / "lakehousectl").exists())
+
+    def test_the_installers_checksum_is_covered_by_the_bundles_checksums(self) -> None:
+        self.assertEqual(self.run_bundle_with_the_installer().returncode, 0)
+        extracted = self.extract()
+        result = subprocess.run(
+            ["sha256sum", "-c", "SHA256SUMS"],
+            cwd=extracted,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("lakehousectl", result.stdout)
+
+    def test_an_installer_that_is_not_the_one_the_manifest_names_is_refused(self) -> None:
+        """The signed manifest names the installer's checksum.
+
+        A bundle that carried another file would install something the
+        release did not publish.
+        """
+        self.installer.write_bytes(b"a different installer\n")
+        result = self.run_bundle_with_the_installer()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("checksum", result.stderr)
+        self.assertFalse((self.out / "rantai-lakehouse-0.2.0-linux-x86_64.tar.zst").exists())
+
+    def write_manifest_with_the_installer_checksum(self) -> None:
+        """The manifest, with the installer's real checksum in it."""
+        import hashlib
+
+        data = json.loads(self.manifest.read_text(encoding="utf-8"))
+        data["files"]["lakehousectl"] = hashlib.sha256(
+            self.installer.read_bytes()
+        ).hexdigest()
+        self.manifest.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+    def run_bundle_with_the_installer(self) -> subprocess.CompletedProcess[str]:
+        """The bundle script, with the installer the manifest names."""
+        environment = dict(os.environ)
+        environment["PATH"] = f"{self.bin}{os.pathsep}{environment['PATH']}"
+        environment["FAKE_DOCKER_LOG"] = str(self.docker_log)
+        return subprocess.run(
+            [
+                "bash",
+                str(BUNDLE_SCRIPT),
+                "--manifest",
+                str(self.manifest),
+                "--compose",
+                str(self.compose),
+                "--sigstore-bundle",
+                str(self.sigstore_bundle),
+                "--sbom-dir",
+                str(self.sbom_dir),
+                "--lakehousectl",
+                str(self.installer),
+                "--out",
+                str(self.out),
+            ],
+            capture_output=True,
+            text=True,
+            env=environment,
+            check=False,
+        )
 
 
 @unittest.skipUnless(shutil.which("zstd"), "zstd is needed to build a bundle")

@@ -641,6 +641,58 @@ class ReleaseWorkflowTest(unittest.TestCase):
             self.assertIn("--published-images", run, job)
             self.assertIn("--compose docker-compose.release.yml", run, job)
 
+    def test_both_jobs_build_the_installer(self) -> None:
+        """REL-2 S3-T4: the release ships the installer.
+
+        The bundle holds `lakehousectl`, so an air-gapped host can
+        install the stack with it, and the release assets hold it too,
+        so `install.sh` can download it.
+        """
+        for job in ("dry-run", "release"):
+            step = step_named(self.document, job, "Build lakehousectl (static, musl)")
+            run = str(step.get("run"))
+            self.assertIn("x86_64-unknown-linux-musl", run, job)
+            self.assertIn("-p lakehousectl", run, job)
+            self.assertIn("lakehousectl-linux-x86_64", run, job)
+
+    def test_the_release_build_never_accepts_another_key(self) -> None:
+        """A release build verifies against the compiled-in key.
+
+        The `test-key` feature points a build at another key, and it
+        exists for the CI dry run only: a release that accepted another
+        key would install what its operator's host said to install.
+        """
+        for job in ("dry-run", "release"):
+            step = step_named(self.document, job, "Build lakehousectl (static, musl)")
+            run = str(step.get("run"))
+            self.assertNotIn("test-key", run, job)
+            self.assertNotIn("--features", run, job)
+
+    def test_the_manifest_and_the_bundle_carry_the_installer(self) -> None:
+        """The signed manifest names the installer's checksum, and the
+        bundle carries the file the manifest names."""
+        for job in ("dry-run", "release"):
+            manifest = step_named(self.document, job, "Write the release manifest")
+            self.assertIn(
+                "--lakehousectl lakehousectl-linux-x86_64",
+                str(manifest.get("run")),
+                job,
+            )
+            bundle = step_named(self.document, job, "Build the offline bundle")
+            self.assertIn(
+                "--lakehousectl lakehousectl-linux-x86_64",
+                str(bundle.get("run")),
+                job,
+            )
+
+    def test_the_installer_is_built_before_the_manifest_is_written(self) -> None:
+        for job in ("dry-run", "release"):
+            self.assertLess(
+                step_index(self.document, job, "Build lakehousectl (static, musl)"),
+                step_index(self.document, job, "Write the release manifest"),
+                job,
+            )
+
     def test_a_job_level_secret_is_reported(self) -> None:
         document = yaml.safe_load(SYNTHETIC_JOB_SECRET)
         self.assertEqual(

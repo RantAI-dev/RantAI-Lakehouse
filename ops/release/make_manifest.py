@@ -82,8 +82,7 @@ What it deliberately does NOT do
   file, not made by a script.
 - It does not hash anything but the Compose file and the installer yet.
   `lakehousectl` joins the manifest's `files` map in REL-2 S3-T4, when
-  the binary exists.
-- It does not read a Docker daemon. The image IDs come from the
+  the binary exists.- It does not read a Docker daemon. The image IDs come from the
   pipeline, which read them with `docker image inspect`.
 """
 
@@ -282,6 +281,7 @@ def build_manifest(
     compose_path: Path,
     created_at: str,
     upgrade_path: Path = UPGRADE_PATH,
+    lakehousectl_path: Path | None = None,
 ) -> dict[str, object]:
     """The manifest, as the dictionary that is written out."""
     parse_version(version)
@@ -314,6 +314,11 @@ def build_manifest(
         )
 
     files = {"docker-compose.yml": sha256_of(compose_path)}
+    if lakehousectl_path is not None:
+        # The installer is a file the release ships, so the signed
+        # manifest names its checksum too (REL-2 S3-T4): the bundle's
+        # copy is checked against it.
+        files["lakehousectl"] = sha256_of(lakehousectl_path)
 
     return {
         "schemaVersion": SCHEMA_VERSION,
@@ -385,6 +390,14 @@ def main(argv: list[str] | None = None) -> int:
         default=UPGRADE_PATH,
         help="the checked-in upgrade path (default: ops/release/upgrade-path.json)",
     )
+    parser.add_argument(
+        "--lakehousectl",
+        type=Path,
+        default=None,
+        help="the installer binary the release ships. Its checksum joins "
+        "the manifest's `files`, so the signed manifest names every file "
+        "the release carries.",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -398,6 +411,7 @@ def main(argv: list[str] | None = None) -> int:
             compose_path=args.compose,
             created_at=args.created_at or now_utc(),
             upgrade_path=args.upgrade_path,
+            lakehousectl_path=args.lakehousectl,
         )
     except (ManifestError, compose_images.ComposeImagesError, OSError) as error:
         print(f"make_manifest failed: {error}", file=sys.stderr)

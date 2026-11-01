@@ -446,6 +446,29 @@ jobs:
             "$SYFT" scan "docker:$reference" -o "cyclonedx-json=sbom/$name.cdx.json"
           done < third-party-images.txt
 
+      # The installer (REL-2 S3-T4): a STATIC binary, so it runs on a
+      # host that has nothing but a Linux kernel — the air-gapped host
+      # installs the stack with it.
+      #
+      # The build is WITHOUT the `test-key` feature: a release build
+      # verifies against the release key compiled into it and against no
+      # other (REL-2 S3-T1). The dry run's own proof builds its own
+      # binary with the feature, because the dry run signs its bundle
+      # with a throwaway key.
+      - name: Build lakehousectl (static, musl)
+        run: |
+          set -euo pipefail
+          rustup target add x86_64-unknown-linux-musl
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+          cd rust
+          cargo build --release --target x86_64-unknown-linux-musl -p lakehousectl
+          cp "target/x86_64-unknown-linux-musl/release/lakehousectl" \
+            ../lakehousectl-linux-x86_64
+          cd ..
+          file lakehousectl-linux-x86_64 || true
+          ls -la lakehousectl-linux-x86_64
+
       # The image IDs: the config digest of every image the release
       # runs.
       #
@@ -480,6 +503,7 @@ jobs:
             --published-images "$(cat images.json)" \
             --image-ids image-ids.json \
             --compose docker-compose.release.yml \
+            --lakehousectl lakehousectl-linux-x86_64 \
             --out release.json
 
       # Sign the manifest, and verify it at once: a signature that does
@@ -529,6 +553,7 @@ jobs:
             --compose docker-compose.release.yml \
             --sigstore-bundle release.json.sigstore.json \
             --sbom-dir sbom \
+            --lakehousectl lakehousectl-linux-x86_64 \
             --out dist
           df -h /
 
@@ -587,6 +612,7 @@ jobs:
             release.json
             release.json.sigstore.json
             docker-compose.release.yml
+            lakehousectl-linux-x86_64
             sbom/*.cdx.json
           retention-days: 7
           if-no-files-found: error
@@ -903,6 +929,29 @@ jobs:
             "$SYFT" scan "docker:$reference" -o "cyclonedx-json=sbom/$name.cdx.json"
           done < third-party-images.txt
 
+      # The installer (REL-2 S3-T4): a STATIC binary, so it runs on a
+      # host that has nothing but a Linux kernel — the air-gapped host
+      # installs the stack with it.
+      #
+      # The build is WITHOUT the `test-key` feature: a release build
+      # verifies against the release key compiled into it and against no
+      # other (REL-2 S3-T1). The CI dry run's own proof builds its own
+      # binary with the feature, because the dry run signs its bundle
+      # with a throwaway key.
+      - name: Build lakehousectl (static, musl)
+        run: |
+          set -euo pipefail
+          rustup target add x86_64-unknown-linux-musl
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+          cd rust
+          cargo build --release --target x86_64-unknown-linux-musl -p lakehousectl
+          cp "target/x86_64-unknown-linux-musl/release/lakehousectl" \
+            ../lakehousectl-linux-x86_64
+          cd ..
+          file lakehousectl-linux-x86_64 || true
+          ls -la lakehousectl-linux-x86_64
+
       # The image IDs: the config digest of every image the release
       # runs. See the dry run's step of the same name (REL-2 S3-T0).
       - name: The image ids
@@ -929,6 +978,7 @@ jobs:
             --published-images "$(cat images.json)" \
             --image-ids image-ids.json \
             --compose docker-compose.release.yml \
+            --lakehousectl lakehousectl-linux-x86_64 \
             --out release.json
 
       # Sign the manifest with the RELEASE key, and verify it with the
@@ -963,6 +1013,7 @@ jobs:
             --compose docker-compose.release.yml \
             --sigstore-bundle release.json.sigstore.json \
             --sbom-dir sbom \
+            --lakehousectl lakehousectl-linux-x86_64 \
             --out dist
           df -h /
 
@@ -978,13 +1029,17 @@ jobs:
           cp release.json release-assets/
           cp release.json.sigstore.json release-assets/
           cp sbom/*.cdx.json release-assets/
+          # The installer, as the release asset `install.sh` downloads
+          # (REL-2 S3-T4).
+          cp lakehousectl-linux-x86_64 release-assets/
           # `install.sh` joins the release in REL-2 S3, when it exists.
           if [ -f ops/release/install.sh ]; then
             cp ops/release/install.sh release-assets/
           fi
           (
             cd release-assets
-            sha256sum ./*.tar.zst ./release.json ./release.json.sigstore.json ./*.cdx.json > SHA256SUMS
+            sha256sum ./*.tar.zst ./release.json ./release.json.sigstore.json ./*.cdx.json \
+              ./lakehousectl-linux-x86_64 > SHA256SUMS
           )
 
       # The release is a DRAFT: the product owner publishes it, after
