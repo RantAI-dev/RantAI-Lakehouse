@@ -49,13 +49,39 @@ pub fn command(args: &BackupArgs) -> Result<(), ToolError> {
     let dir = &args.dir;
     let script = backup_script(dir);
     require_script(&script)?;
-    let root = dir.join("backups");
-    let output = run(&script, &[root.to_string_lossy().to_string()], dir)?;
 
-    let backup = backup_dir_of(&output)?;
+    // The version the backup belongs to: the release that is installed,
+    // as the state names it. It is passed to the script so the backup
+    // is named after the release even when the API cannot be asked.
+    let version = state::read(dir)
+        .ok()
+        .and_then(|state| state.current_version)
+        .filter(|version| !version.is_empty());
+
+    let backup = take(dir, version.as_deref())?;
     state::set_last_backup(dir, &backup)?;
     println!("lakehousectl: the backup is recorded in the install's state.");
     Ok(())
+}
+
+/// Take a backup of the stack, and say which backup it is.
+///
+/// The version the backup belongs to is passed to the shipped script:
+/// an update STOPS the API before the backup (REL-2 S4 decision D17),
+/// so the script cannot read the version from the API, and D17 names
+/// the backup after the release it is replacing. Without a version the
+/// script reads the API, exactly as it always did.
+///
+/// # Errors
+///
+/// Returns the error that stopped the backup: a script the release does
+/// not ship, a script that failed, or a summary that names no backup.
+pub fn take(dir: &Path, version: Option<&str>) -> Result<PathBuf, ToolError> {
+    let script = backup_script(dir);
+    require_script(&script)?;
+    let root = dir.join("backups");
+    let output = run(&script, &[root.to_string_lossy().to_string()], dir, version)?;
+    backup_dir_of(&output)
 }
 
 /// Run `lakehousectl restore`.
@@ -66,10 +92,20 @@ pub fn command(args: &BackupArgs) -> Result<(), ToolError> {
 /// does not ship, or a script that failed.
 pub fn command_restore(args: &RestoreArgs) -> Result<(), ToolError> {
     let dir = &args.dir;
+    restore(dir, &args.backup)
+}
+
+/// Restore a backup of the stack.
+///
+/// # Errors
+///
+/// Returns the error that stopped the restore: a script the release
+/// does not ship, or a script that failed.
+pub fn restore(dir: &Path, backup: &Path) -> Result<(), ToolError> {
     let script = restore_script(dir);
     require_script(&script)?;
-    let backup = args.backup.to_string_lossy().to_string();
-    run(&script, &["--local".to_string(), backup], dir)?;
+    let backup = backup.to_string_lossy().to_string();
+    run(&script, &["--local".to_string(), backup], dir, None)?;
     Ok(())
 }
 
@@ -102,17 +138,23 @@ fn require_script(script: &Path) -> Result<(), ToolError> {
 /// The script's own output goes to the operator: it says what it does,
 /// step by step, and a backup that is silent is a backup nobody can
 /// trust.
-fn run(script: &Path, args: &[String], dir: &Path) -> Result<String, ToolError> {
+fn run(
+    script: &Path,
+    args: &[String],
+    dir: &Path,
+    version: Option<&str>,
+) -> Result<String, ToolError> {
     let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
-    let output = sys::output_or_stderr_with_env(
-        &script.to_string_lossy(),
-        &borrowed,
-        &[
-            ("LAKEHOUSE_DIR", &dir.to_string_lossy()),
-            ("COMPOSE_PROJECT", docker::PROJECT),
-        ],
-    )
-    .map_err(|error| ToolError::Failed(format!("the backup tool failed: {error}")))?;
+    let deployment = dir.to_string_lossy();
+    let mut environment: Vec<(&str, &str)> = vec![
+        ("LAKEHOUSE_DIR", &deployment),
+        ("COMPOSE_PROJECT", docker::PROJECT),
+    ];
+    if let Some(version) = version {
+        environment.push(("BACKUP_VERSION", version));
+    }
+    let output = sys::output_or_stderr_with_env(&script.to_string_lossy(), &borrowed, &environment)
+        .map_err(|error| ToolError::Failed(format!("the backup tool failed: {error}")))?;
     println!("{output}");
     Ok(output)
 }
@@ -168,6 +210,7 @@ record="$(dirname "$0")/../record.txt"
 {
   echo "LAKEHOUSE_DIR=$LAKEHOUSE_DIR"
   echo "COMPOSE_PROJECT=$COMPOSE_PROJECT"
+  echo "BACKUP_VERSION=$BACKUP_VERSION"
   echo "ARGS=$*"
 } >> "$record"
 echo "==> Backup complete: $LAKEHOUSE_DIR/backups/20261101T000000Z-0.2.0"
@@ -212,6 +255,31 @@ echo "the restore is done"
                 directory.path().join("backups").to_string_lossy()
             )),
             "the tool was not given the backup root: {written}"
+        );
+    }
+
+    #[test]
+    fn the_backup_is_told_which_version_it_belongs_to() {
+        // REL-2 S4 decision D17: the update stops the API before it
+        // backs up, so the script cannot ask the API which version the
+        // backup belongs to. The tool knows, and says so.
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        fake_tool(directory.path(), "backup-local.sh", FAKE_BACKUP);
+        state::write_initial(directory.path(), "0.1.0").expect("the state is written");
+
+        let backup = take(directory.path(), Some("0.1.0")).expect("the backup runs");
+
+        assert_eq!(
+            backup
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string()),
+            Some("20261101T000000Z-0.2.0".to_string()),
+            "the fake tool named another backup"
+        );
+        let written = record(directory.path());
+        assert!(
+            written.contains("BACKUP_VERSION=0.1.0"),
+            "the tool was not told the version: {written}"
         );
     }
 

@@ -27,23 +27,22 @@
 //!    first sign-in.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 
 use crate::cli::InstallArgs;
 use crate::docker;
 use crate::error::ToolError;
 use crate::files;
 use crate::http;
-use crate::manifest::{Manifest, image_name};
+use crate::images;
+use crate::manifest::Manifest;
 use crate::preflight;
 use crate::release;
 use crate::secrets;
 use crate::state;
-use crate::sys;
 use crate::verify;
 
 /// How long the stack may take to become ready.
@@ -56,20 +55,6 @@ const PROBE_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_API_PORT: u16 = 8080;
 /// The console's port when the `.env` does not say.
 const DEFAULT_CONSOLE_PORT: u16 = 3000;
-/// How much of a file is hashed at a time.
-const HASH_BUFFER_BYTES: usize = 64 * 1024;
-
-/// The release the install is about.
-struct Release {
-    /// The manifest's bytes.
-    manifest: Vec<u8>,
-    /// The manifest's Sigstore bundle.
-    bundle: Vec<u8>,
-    /// The release's Compose file.
-    compose: String,
-    /// The bundle's directory, when the install is offline.
-    bundle_dir: Option<PathBuf>,
-}
 
 /// Run `lakehousectl install`.
 ///
@@ -80,18 +65,22 @@ struct Release {
 pub fn command(args: &InstallArgs) -> Result<(), ToolError> {
     preflight::validate_ignored(&args.ignore_preflight).map_err(ToolError::Usage)?;
 
-    let release = obtain(args)?;
+    let release = release::obtain(
+        args.bundle.as_deref(),
+        args.version.as_deref(),
+        &mut release::download,
+    )?;
     let key = verify::public_key()?;
     verify::verify_manifest(&release.manifest, &release.bundle, &key)?;
     println!(
         "lakehousectl: the manifest of release {} verifies against the release key.",
-        version_of(&release.manifest)?
+        release::version_of(&release.manifest)?
     );
 
     let manifest: Manifest = serde_json::from_slice(&release.manifest)
         .map_err(|error| ToolError::Failed(format!("the manifest could not be read: {error}")))?;
 
-    check_compose(&manifest, &release.compose)?;
+    files::check_compose(&manifest, &release.compose)?;
 
     // The files the release ships (REL-2 S4 decision D14): the relative
     // bind-mount sources of the release's Compose file, and the two
@@ -100,146 +89,18 @@ pub fn command(args: &InstallArgs) -> Result<(), ToolError> {
     // is written — a file that does not match is a refusal, not a
     // warning.
     let shipped = files::fetch(&manifest, release.bundle_dir.as_deref(), &mut |url| {
-        download(url)
+        release::download(url)
     })?;
 
     check_preflight(args, &release.compose)?;
 
     let secrets = write_layout(&args.dir, &release, &manifest, &shipped)?;
-    let env = read_env(&args.dir.join(".env"));
+    let env = crate::env::read(&args.dir.join(".env"));
 
-    fetch_images(&manifest, release.bundle_dir.as_deref())?;
+    images::fetch(&manifest, release.bundle_dir.as_deref())?;
     start(&args.dir, &manifest, &env)?;
 
     print_sign_in(&args.dir, &secrets, &env);
-    Ok(())
-}
-
-/// The version the manifest names.
-fn version_of(manifest: &[u8]) -> Result<String, ToolError> {
-    let document: Value = serde_json::from_slice(manifest)
-        .map_err(|error| ToolError::Failed(format!("the manifest could not be read: {error}")))?;
-    document["version"]
-        .as_str()
-        .map(str::to_string)
-        .ok_or_else(|| ToolError::Failed("the manifest names no version".to_string()))
-}
-
-/// The release, from the bundle or from GitHub.
-fn obtain(args: &InstallArgs) -> Result<Release, ToolError> {
-    obtain_with(args, &mut download)
-}
-
-/// The release, with the download injected.
-///
-/// The injection is what lets a test drive the online path with no
-/// network: what the test holds to is the SHAPE of that path — which
-/// assets are asked for, and that nothing lands on the disk.
-fn obtain_with<F>(args: &InstallArgs, fetch: &mut F) -> Result<Release, ToolError>
-where
-    F: FnMut(&str) -> Result<Vec<u8>, ToolError>,
-{
-    if let Some(directory) = &args.bundle {
-        let manifest = read(&directory.join("release.json"))?;
-        let bundle = read(&directory.join("release.json.sigstore.json"))?;
-        let compose = read_to_string(&directory.join("docker-compose.yml"))?;
-        return Ok(Release {
-            manifest,
-            bundle,
-            compose,
-            bundle_dir: Some(directory.clone()),
-        });
-    }
-
-    let version = match &args.version {
-        Some(version) => version.trim_start_matches('v').to_string(),
-        None => latest_version()?,
-    };
-    let manifest = fetch(&asset_url(&version, "release.json"))?;
-    let bundle = fetch(&asset_url(&version, "release.json.sigstore.json"))?;
-    let compose =
-        String::from_utf8(fetch(&asset_url(&version, "docker-compose.yml"))?).map_err(|error| {
-            ToolError::Failed(format!("the release's Compose file is not text: {error}"))
-        })?;
-    Ok(Release {
-        manifest,
-        bundle,
-        compose,
-        bundle_dir: None,
-    })
-}
-
-/// The URL of one asset of a release.
-fn asset_url(version: &str, name: &str) -> String {
-    release::asset_url(version, name)
-}
-
-/// The version of the newest release.
-fn latest_version() -> Result<String, ToolError> {
-    let body = sys::output(
-        "curl",
-        &[
-            "--fail",
-            "--silent",
-            "--show-error",
-            "--location",
-            release::LATEST_URL,
-        ],
-    )
-    .map_err(|error| {
-        ToolError::Failed(format!(
-            "the newest release could not be read from {}: {error}. Is this host \
-             online, and is `curl` installed?",
-            release::LATEST_URL
-        ))
-    })?;
-    let document: Value = serde_json::from_str(&body).map_err(|error| {
-        ToolError::Failed(format!("the newest release could not be read: {error}"))
-    })?;
-    let tag = document["tag_name"]
-        .as_str()
-        .ok_or_else(|| ToolError::Failed("the newest release names no tag".to_string()))?;
-    Ok(tag.trim_start_matches('v').to_string())
-}
-
-/// Download one file of a release, into memory.
-///
-/// The bytes never touch the disk. The release's assets are small text
-/// files, and a file in a shared directory is a file another local
-/// user could own: the installer runs as root, so a symlink left where
-/// the tool writes would let a local user have root write anywhere on
-/// the host. The path this used was
-/// `temp_dir()/lakehousectl-release-<version>` — a name anybody could
-/// guess, and a directory an earlier run left behind (REL-2 S3 review
-/// round 1 BLOCKER 1).
-fn download(url: &str) -> Result<Vec<u8>, ToolError> {
-    sys::output_bytes(
-        "curl",
-        &["--fail", "--silent", "--show-error", "--location", url],
-    )
-    .map_err(|error| {
-        ToolError::Failed(format!(
-            "{url} could not be downloaded: {error}. Is this host online, and is `curl` installed?"
-        ))
-    })
-}
-
-/// Check the Compose file against the checksum the signed manifest carries.
-fn check_compose(manifest: &Manifest, compose: &str) -> Result<(), ToolError> {
-    let Some(expected) = manifest.files.get("docker-compose.yml") else {
-        return Err(ToolError::Failed(
-            "the manifest names no checksum for the Compose file. A release that does not say \
-             which Compose file it ships is a release that cannot be installed."
-                .to_string(),
-        ));
-    };
-    let found = hex::encode(Sha256::digest(compose.as_bytes()));
-    if found != *expected {
-        return Err(ToolError::Failed(format!(
-            "the Compose file does not match the manifest's checksum: the manifest names \
-             {expected}, this one hashes to {found}."
-        )));
-    }
     Ok(())
 }
 
@@ -265,7 +126,7 @@ fn check_preflight(args: &InstallArgs, compose: &str) -> Result<(), ToolError> {
 /// Write the install's layout (REL-2 decision D5).
 fn write_layout(
     dir: &Path,
-    release: &Release,
+    release: &release::Release,
     manifest: &Manifest,
     shipped: &files::ShippedFiles,
 ) -> Result<secrets::Secrets, ToolError> {
@@ -312,127 +173,13 @@ fn write_layout(
     })
 }
 
-/// Fetch every image the release runs.
-fn fetch_images(manifest: &Manifest, bundle_dir: Option<&Path>) -> Result<(), ToolError> {
-    let Some(directory) = bundle_dir else {
-        for reference in manifest.references() {
-            println!("lakehousectl: pulling {reference}");
-            docker::pull(&reference).map_err(ToolError::Failed)?;
-        }
-        return Ok(());
-    };
-
-    let checksums = read_to_string(&directory.join("SHA256SUMS"))?;
-    for reference in manifest.references() {
-        let tar = directory
-            .join("images")
-            .join(format!("{}.tar", image_name(&reference)));
-        // The file is hashed BEFORE it is loaded: a copy that was
-        // damaged on its way to the host fails here, with a message
-        // that says so, and not as a `docker load` that fails halfway
-        // (REL-2 S3 review round 1 SHOULD-FIX 2).
-        verify_checksum(&checksums, &tar, directory)?;
-        println!("lakehousectl: loading {}", tar.display());
-        docker::load(&tar).map_err(ToolError::Failed)?;
-
-        let Some(expected) = manifest.image_ids.get(&reference) else {
-            return Err(ToolError::Failed(format!(
-                "the manifest names no id for {reference}, so the loaded image cannot be checked \
-                 against it."
-            )));
-        };
-        let found = docker::image_id(&reference).map_err(ToolError::Failed)?;
-        // Docker's two image stores identify an image differently: the
-        // classic store reports the CONFIG digest, the containerd store
-        // the image INDEX digest. Both are named in the SIGNED
-        // manifest — the config digest in `imageIds`, the registry
-        // digest in `images` — so the loaded image is accepted when its
-        // ID is one of them, and refused when it is neither.
-        let registry_digest = Manifest::digest_of(&reference).unwrap_or_default();
-        if found != *expected && found != registry_digest {
-            return Err(ToolError::Failed(format!(
-                "the image {reference} has the id {found}, and the manifest names {expected} and \
-                 {registry_digest}. The image is not the one the release published, so the \
-                 install stops here."
-            )));
-        }
-    }
-    Ok(())
-}
-
-/// Check one file of the bundle against the bundle's checksums.
-///
-/// The bundle's `SHA256SUMS` is NOT signed: it catches a file that was
-/// damaged or truncated on its way to the host, and nothing else. The
-/// TRUST check is the image's ID, compared with the SIGNED manifest's
-/// `imageIds` after the load (REL-2 S3 review round 1 SHOULD-FIX 2).
-fn verify_checksum(checksums: &str, path: &Path, root: &Path) -> Result<(), ToolError> {
-    let Some(expected) = checksum_of(checksums, path, root) else {
-        return Err(ToolError::Failed(format!(
-            "{} is not in the bundle's SHA256SUMS, so nothing says it is the file the release \
-             published.",
-            path.display()
-        )));
-    };
-    let found = sha256_of(path)?;
-    if found != expected {
-        return Err(ToolError::Failed(format!(
-            "{} does not match the bundle's SHA256SUMS: the list names {expected}, this one hashes \
-             to {found}. The file was damaged on its way here.",
-            path.display()
-        )));
-    }
-    Ok(())
-}
-
-/// The checksum the bundle's list names for a file.
-///
-/// The list holds one line per file: the checksum, then the name, with
-/// the path relative to the bundle's root.
-fn checksum_of(checksums: &str, path: &Path, root: &Path) -> Option<String> {
-    let relative = path.strip_prefix(root).ok()?;
-    let relative = relative.to_string_lossy();
-    checksums.lines().find_map(|line| {
-        let mut fields = line.split_whitespace();
-        let digest = fields.next()?;
-        let name = fields.next()?;
-        (name.trim_start_matches('*') == relative).then(|| digest.to_string())
-    })
-}
-
-/// The SHA-256 of a file, as hexadecimal.
-///
-/// The file is read in pieces: an image tar is hundreds of megabytes,
-/// and the installer has no reason to hold one in memory.
-fn sha256_of(path: &Path) -> Result<String, ToolError> {
-    let file = std::fs::File::open(path).map_err(|source| ToolError::Io {
-        context: format!("{} could not be read", path.display()),
-        source,
-    })?;
-    let mut reader = std::io::BufReader::new(file);
-    let mut hasher = Sha256::new();
-    let mut buffer = vec![0u8; HASH_BUFFER_BYTES];
-    loop {
-        let read =
-            std::io::Read::read(&mut reader, &mut buffer).map_err(|source| ToolError::Io {
-                context: format!("{} could not be read", path.display()),
-                source,
-            })?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Ok(hex::encode(hasher.finalize()))
-}
-
 /// Start the stack and wait for it.
 fn start(dir: &Path, manifest: &Manifest, env: &BTreeMap<String, String>) -> Result<(), ToolError> {
     println!("lakehousectl: starting the stack.");
     docker::compose_up(dir, &dir.join(".env")).map_err(ToolError::Failed)?;
 
-    let api_port = port(env, "API_HOST_PORT", DEFAULT_API_PORT);
-    let console_port = port(env, "CONSOLE_HOST_PORT", DEFAULT_CONSOLE_PORT);
+    let api_port = crate::env::port(env, "API_HOST_PORT", DEFAULT_API_PORT);
+    let console_port = crate::env::port(env, "CONSOLE_HOST_PORT", DEFAULT_CONSOLE_PORT);
 
     wait_for_ready(api_port, &manifest.version)?;
     wait_for_console(console_port)?;
@@ -497,7 +244,7 @@ fn wait_for_console(port: u16) -> Result<(), ToolError> {
 
 /// Print where the console is, and the first administrator's sign-in.
 fn print_sign_in(dir: &Path, secrets: &secrets::Secrets, env: &BTreeMap<String, String>) {
-    let console_port = port(env, "CONSOLE_HOST_PORT", DEFAULT_CONSOLE_PORT);
+    let console_port = crate::env::port(env, "CONSOLE_HOST_PORT", DEFAULT_CONSOLE_PORT);
     println!();
     println!("lakehousectl: the console is at http://<this host>:{console_port}");
     println!(
@@ -525,54 +272,6 @@ fn print_sign_in(dir: &Path, secrets: &secrets::Secrets, env: &BTreeMap<String, 
     );
 }
 
-/// The value the `.env` sets for a port.
-fn port(env: &BTreeMap<String, String>, name: &str, fallback: u16) -> u16 {
-    env.get(name)
-        .and_then(|value| value.trim().parse().ok())
-        .unwrap_or(fallback)
-}
-
-/// The settings the install's `.env` holds.
-fn read_env(path: &Path) -> BTreeMap<String, String> {
-    let mut settings = BTreeMap::new();
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return settings;
-    };
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if let Some((name, value)) = line.split_once('=') {
-            settings.insert(
-                name.trim().to_string(),
-                value
-                    .trim()
-                    .trim_matches('"')
-                    .trim_matches('\'')
-                    .to_string(),
-            );
-        }
-    }
-    settings
-}
-
-/// Read a file.
-fn read(path: &Path) -> Result<Vec<u8>, ToolError> {
-    std::fs::read(path).map_err(|source| ToolError::Io {
-        context: format!("{} could not be read", path.display()),
-        source,
-    })
-}
-
-/// Read a file as text.
-fn read_to_string(path: &Path) -> Result<String, ToolError> {
-    std::fs::read_to_string(path).map_err(|source| ToolError::Io {
-        context: format!("{} could not be read", path.display()),
-        source,
-    })
-}
-
 /// Write a file.
 fn write(path: &Path, bytes: &[u8]) -> Result<(), ToolError> {
     std::fs::write(path, bytes).map_err(|source| ToolError::Io {
@@ -596,128 +295,11 @@ fn set_mode(path: &Path, mode: u32) -> Result<(), ToolError> {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-    use std::collections::BTreeSet;
-
     use super::*;
 
-    /// The names the temporary directory holds that begin with the
-    /// tool's own prefix.
-    ///
-    /// Only the tool's own names are looked at: the other tests of the
-    /// workspace write in the same directory, and what matters here is
-    /// that the INSTALLER leaves nothing of its own behind.
-    fn tool_entries() -> BTreeSet<String> {
-        let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
-            return BTreeSet::new();
-        };
-        entries
-            .filter_map(std::result::Result::ok)
-            .map(|entry| entry.file_name().to_string_lossy().to_string())
-            .filter(|name| name.starts_with("lakehousectl"))
-            .collect()
-    }
-
-    #[test]
-    fn the_online_install_reads_the_release_into_memory_and_writes_no_file() {
-        // The installer runs as root: a file it writes in a directory
-        // of a name anybody can guess is a file another local user can
-        // own, and a symlink there would let that user have root write
-        // anywhere on the host (REL-2 S3 review round 1 BLOCKER 1).
-        let mut asked: Vec<String> = Vec::new();
-        let args = InstallArgs {
-            bundle: None,
-            dir: PathBuf::from("/nonexistent/lakehousectl-install"),
-            version: Some("0.2.0".to_string()),
-            ignore_preflight: Vec::new(),
-        };
-        let before = tool_entries();
-        let release = obtain_with(&args, &mut |url| {
-            asked.push(url.to_string());
-            Ok(b"{}".to_vec())
-        })
-        .expect("the release is obtained");
-        let after = tool_entries();
-
-        assert_eq!(
-            asked,
-            vec![
-                asset_url("0.2.0", "release.json"),
-                asset_url("0.2.0", "release.json.sigstore.json"),
-                asset_url("0.2.0", "docker-compose.yml"),
-            ],
-            "the install asked for the wrong assets"
-        );
-        assert_eq!(
-            release.manifest, b"{}",
-            "the bytes were not the fetched ones"
-        );
-        assert_eq!(
-            before, after,
-            "the install left something of its own in the temporary directory"
-        );
-        assert!(
-            !std::env::temp_dir()
-                .join("lakehousectl-release-0.2.0")
-                .exists(),
-            "the install used the shared directory of an earlier release"
-        );
-    }
-
-    /// A bundle with one image tar and the list of checksums.
-    fn bundle_with_one_image() -> (tempfile::TempDir, PathBuf, String) {
-        let directory = tempfile::tempdir().expect("a temporary directory");
-        let images = directory.path().join("images");
-        std::fs::create_dir_all(&images).expect("the images directory is created");
-        let tar = images.join("alpine.tar");
-        std::fs::write(&tar, b"the image").expect("the tar is written");
-        let digest = hex::encode(Sha256::digest(b"the image"));
-        let checksums = format!("{digest}  images/alpine.tar\n");
-        (directory, tar, checksums)
-    }
-
-    #[test]
-    fn a_bundle_file_that_matches_its_checksum_is_accepted() {
-        let (directory, tar, checksums) = bundle_with_one_image();
-        verify_checksum(&checksums, &tar, directory.path()).expect("the file matches its checksum");
-    }
-
-    #[test]
-    fn a_damaged_bundle_file_is_refused() {
-        // The copy was damaged on its way to the host: the checksum
-        // says so before `docker load` reads a broken tar.
-        let (directory, tar, checksums) = bundle_with_one_image();
-        std::fs::write(&tar, b"the imag3").expect("the tar is written again");
-
-        let error = verify_checksum(&checksums, &tar, directory.path())
-            .expect_err("a damaged file is refused");
-        let message = error.to_string();
-        assert!(
-            message.contains("SHA256SUMS"),
-            "the error says what failed: {message}"
-        );
-        assert!(
-            message.contains("images/alpine.tar"),
-            "the error names the file: {message}"
-        );
-    }
-
-    #[test]
-    fn a_bundle_file_the_list_does_not_name_is_refused() {
-        let (directory, _tar, _checksums) = bundle_with_one_image();
-        let other = directory.path().join("images").join("other.tar");
-        std::fs::write(&other, b"another image").expect("the tar is written");
-
-        let error = verify_checksum("", &other, directory.path())
-            .expect_err("a file the list does not name is refused");
-        assert!(
-            error.to_string().contains("SHA256SUMS"),
-            "the error says what failed: {error}"
-        );
-    }
-
     /// A release of a version, as the install sees it.
-    fn release_of(version: &str) -> Release {
-        Release {
+    fn release_of(version: &str) -> release::Release {
+        release::Release {
             manifest: format!("{{\"version\":\"{version}\"}}").into_bytes(),
             bundle: b"{}".to_vec(),
             compose: "services: {}\n".to_string(),
@@ -729,6 +311,8 @@ mod tests {
     fn manifest_of(version: &str) -> Manifest {
         Manifest {
             version: version.to_string(),
+            min_from: None,
+            stops: Vec::new(),
             images: BTreeMap::new(),
             image_ids: BTreeMap::new(),
             files: BTreeMap::new(),

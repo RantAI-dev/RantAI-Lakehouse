@@ -10,15 +10,31 @@ use serde::Deserialize;
 
 /// The release manifest, `release.json`.
 ///
-/// The model carries what the INSTALL needs: the version, the images
-/// and the file checksums. The fields the update command reads
-/// (`minFrom`, `stops`) arrive with REL-2 S4; the fields this model
-/// does not name are ignored when the manifest is read.
+/// The model carries what the INSTALL and the UPDATE need: the
+/// version, every image's digest, every image's ID, the checksum of
+/// every file the release ships, and the upgrade path — the lowest
+/// version that may update to this one directly (`minFrom`) and the
+/// versions an update to this one must pass through (`stops`). The
+/// fields this model does not name are ignored when the manifest is
+/// read.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Manifest {
     /// The release's version.
     pub version: String,
+    /// The lowest version that may update to this one directly.
+    ///
+    /// The release policy's promise is a direct update from the
+    /// previous two minor releases, so the release tooling writes the
+    /// default and a release may lower it (REL-2 decision D10).
+    #[serde(default)]
+    pub min_from: Option<String>,
+    /// The versions an update to this one must pass through.
+    ///
+    /// Empty for a release that may be updated to from any release its
+    /// `minFrom` allows (REL-2 decision D10).
+    #[serde(default)]
+    pub stops: Vec<String>,
     /// Every image the release runs, service by service.
     pub images: BTreeMap<String, String>,
     /// The ID of every image, by reference.
@@ -98,6 +114,8 @@ mod tests {
     fn a_manifest_names_every_image_once() {
         let manifest = Manifest {
             version: "0.2.0".to_string(),
+            min_from: None,
+            stops: Vec::new(),
             images: BTreeMap::from([
                 ("a".to_string(), "one@sha256:1".to_string()),
                 ("b".to_string(), "one@sha256:1".to_string()),

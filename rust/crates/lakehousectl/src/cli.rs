@@ -35,6 +35,10 @@ pub enum Command {
     Backup(BackupArgs),
     /// Restore a backup of the stack, on the local disk.
     Restore(RestoreArgs),
+    /// Move the stack to another release.
+    Update(UpdateArgs),
+    /// Move the stack back to the release it came from.
+    Rollback(RollbackArgs),
 }
 
 /// The arguments of `lakehousectl verify`.
@@ -103,4 +107,36 @@ pub struct RestoreArgs {
     /// Where the install lives: everything is in this one directory.
     #[arg(long, default_value = "/opt/rantai-lakehouse")]
     pub dir: PathBuf,
+}
+
+/// The arguments of `lakehousectl update`.
+#[derive(Debug, Args)]
+pub struct UpdateArgs {
+    /// The offline bundle's directory. Without it, the release is
+    /// fetched from GitHub.
+    #[arg(long)]
+    pub bundle: Option<PathBuf>,
+    /// Where the install lives: everything is in this one directory.
+    #[arg(long, default_value = "/opt/rantai-lakehouse")]
+    pub dir: PathBuf,
+    /// The release to update to. Without it, the newest one.
+    #[arg(long)]
+    pub version: Option<String>,
+    /// How long the stack may take to become ready, in seconds.
+    ///
+    /// The update rolls back when the stack is not ready in time
+    /// (REL-2 S4 decision D9).
+    #[arg(long, default_value_t = 600)]
+    pub ready_timeout: u64,
+}
+
+/// The arguments of `lakehousectl rollback`.
+#[derive(Debug, Args)]
+pub struct RollbackArgs {
+    /// Where the install lives: everything is in this one directory.
+    #[arg(long, default_value = "/opt/rantai-lakehouse")]
+    pub dir: PathBuf,
+    /// Do not ask. The data written since the update is lost.
+    #[arg(long)]
+    pub yes: bool,
 }

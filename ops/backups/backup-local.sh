@@ -125,9 +125,19 @@ CLICKHOUSE_BACKUPS_VOLUME="${PROJECT}_lakehouse_clickhouse_backups"
 # whose API is down cannot be asked, and a backup without a version is
 # still a backup — the directory is then named `…-unknown` rather than
 # carrying a version that was never read.
-version="unknown"
-if health_json="$(curl -fsS --max-time 5 "http://127.0.0.1:${API_HOST_PORT}/health" 2>/dev/null)"; then
-  version="$(printf '%s' "${health_json}" | jq -r '.version // "unknown"')"
+#
+# `BACKUP_VERSION` says which version the backup belongs to when the
+# caller KNOWS it. An update stops the API before it backs up
+# (REL-2 S4 decision D17), so the script cannot ask the API then, and
+# the backup belongs to the release the update is replacing — D17 names
+# it `backups/<stamp>-<old version>/`. Without the variable the script
+# reads the API, exactly as it always did.
+version="${BACKUP_VERSION:-}"
+if [ -z "${version}" ]; then
+  version="unknown"
+  if health_json="$(curl -fsS --max-time 5 "http://127.0.0.1:${API_HOST_PORT}/health" 2>/dev/null)"; then
+    version="$(printf '%s' "${health_json}" | jq -r '.version // "unknown"')"
+  fi
 fi
 
 stamp="$(date -u +%Y%m%dT%H%M%SZ)"

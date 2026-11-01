@@ -165,6 +165,91 @@ pub fn set_last_backup(dir: &Path, backup: &Path) -> Result<(), ToolError> {
     write(dir, &state)
 }
 
+/// The path of the state the install held BEFORE the last update.
+///
+/// The update keeps it beside the state, the way it keeps the old
+/// Compose file and the old manifest as `*.previous` (REL-2 S4
+/// decisions D17 and D18). The rollback puts it back, so the state
+/// after a rollback is the state before the update — the release that
+/// is installed, the one before it, and the backup that was taken
+/// before THAT one.
+#[must_use]
+pub fn previous_path(dir: &Path) -> std::path::PathBuf {
+    dir.join("state.json.previous")
+}
+
+/// Keep the state of the install before an update.
+///
+/// # Errors
+///
+/// Returns the error that says what could not be written.
+pub fn keep_previous(dir: &Path, state: &State) -> Result<(), ToolError> {
+    let text = serde_json::to_string_pretty(state).map_err(|error| {
+        ToolError::Failed(format!(
+            "the state of the install could not be written: {error}"
+        ))
+    })?;
+    std::fs::write(previous_path(dir), format!("{text}\n")).map_err(|source| ToolError::Io {
+        context: format!("{} could not be written", previous_path(dir).display()),
+        source,
+    })
+}
+
+/// The state the install held before the last update.
+///
+/// # Errors
+///
+/// Returns the error that says what could not be read.
+pub fn read_previous(dir: &Path) -> Result<State, ToolError> {
+    let path = previous_path(dir);
+    let text = std::fs::read_to_string(&path).map_err(|source| ToolError::Io {
+        context: format!("{} could not be read", path.display()),
+        source,
+    })?;
+    serde_json::from_str(&text).map_err(|error| {
+        ToolError::Failed(format!(
+            "{} is not a state this tool understands: {error}",
+            path.display()
+        ))
+    })
+}
+
+/// Set the release that is installed, and the one before it.
+///
+/// # Errors
+///
+/// Returns the error that says what could not be read or written.
+pub fn set_versions(dir: &Path, current: &str, previous: Option<&str>) -> Result<(), ToolError> {
+    let mut state = read(dir)?;
+    state.current_version = Some(current.to_string());
+    state.previous_version = previous.map(str::to_string);
+    write(dir, &state)
+}
+
+/// Put the state of the install back to the one it held before the
+/// update.
+///
+/// The state the update kept is the one to put back. An install that
+/// has no such state — one that was updated by an older tool — gets
+/// the release it returns to, and no release before it.
+///
+/// # Errors
+///
+/// Returns the error that says what could not be read or written.
+pub fn restore_previous(dir: &Path, current: &str, backup: Option<&Path>) -> Result<(), ToolError> {
+    if previous_path(dir).exists() {
+        let state = read_previous(dir)?;
+        return write(dir, &state);
+    }
+    let mut state = read(dir)?;
+    state.current_version = Some(current.to_string());
+    state.previous_version = None;
+    if let Some(backup) = backup {
+        state.last_backup = Some(backup.to_string_lossy().to_string());
+    }
+    write(dir, &state)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]

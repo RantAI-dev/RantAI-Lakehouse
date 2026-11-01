@@ -103,6 +103,23 @@ fn stack_error(error: &std::io::Error) -> String {
 /// impossible or, worse, a different image than the signed manifest
 /// names (REL-2 S3 D13).
 fn compose_up_args(dir: &Path, env_file: &Path) -> Vec<String> {
+    let mut args = compose_args(dir, env_file);
+    args.push("up".to_string());
+    args.push("-d".to_string());
+    args.push("--pull".to_string());
+    args.push("never".to_string());
+    args
+}
+
+/// The `docker compose` arguments that read this install.
+///
+/// Every `docker compose` the tool runs starts here: the project, the
+/// `.env` and the Compose file of the install's own directory, and the
+/// operator's `override.yml` when there is one (REL-2 decision D5).
+/// One place builds them, so the update, the rollback and the status
+/// cannot disagree about which deployment they act on (rule 4).
+#[must_use]
+pub fn compose_args(dir: &Path, env_file: &Path) -> Vec<String> {
     let compose = dir.join("docker-compose.yml");
     let override_file = dir.join("override.yml");
     let mut args: Vec<String> = vec![
@@ -118,11 +135,75 @@ fn compose_up_args(dir: &Path, env_file: &Path) -> Vec<String> {
         args.push("-f".to_string());
         args.push(override_file.to_string_lossy().to_string());
     }
-    args.push("up".to_string());
-    args.push("-d".to_string());
-    args.push("--pull".to_string());
-    args.push("never".to_string());
     args
+}
+
+/// The services the install's Compose file names.
+///
+/// Every profile is asked for: the writers of the `dagster` profile are
+/// stopped for an update (REL-2 S4 decision D17), and a profile that
+/// is not asked for names no service at all.
+///
+/// # Errors
+///
+/// Returns the message that says what to fix when Compose fails.
+pub fn compose_services(dir: &Path, env_file: &Path) -> Result<Vec<String>, String> {
+    let mut args = compose_args(dir, env_file);
+    args.push("--profile".to_string());
+    args.push("*".to_string());
+    args.push("config".to_string());
+    args.push("--services".to_string());
+    let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+    let output = sys::output_or_stderr("docker", &borrowed)
+        .map_err(|error| format!("the services of the deployment could not be read: {error}"))?;
+    Ok(output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// Stop the named services of the deployment.
+///
+/// An empty list stops nothing: the caller asks for the services it
+/// wants stopped, and a deployment with no writers is a deployment
+/// with nothing to stop.
+///
+/// # Errors
+///
+/// Returns the message that says what to fix when Compose fails.
+pub fn compose_stop(dir: &Path, env_file: &Path, services: &[String]) -> Result<(), String> {
+    if services.is_empty() {
+        return Ok(());
+    }
+    let mut args = compose_args(dir, env_file);
+    args.push("stop".to_string());
+    for service in services {
+        args.push(service.clone());
+    }
+    let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+    sys::output_or_stderr("docker", &borrowed)
+        .map(|_| ())
+        .map_err(|error| format!("the services could not be stopped: {error}"))
+}
+
+/// Stop EVERY service of the deployment.
+///
+/// The rollback stops the whole stack before it restores the backup
+/// (REL-2 S4 decision D18): a database that is still running while its
+/// data is being written back is not a database that is restored.
+///
+/// # Errors
+///
+/// Returns the message that says what to fix when Compose fails.
+pub fn compose_stop_all(dir: &Path, env_file: &Path) -> Result<(), String> {
+    let mut args = compose_args(dir, env_file);
+    args.push("stop".to_string());
+    let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+    sys::output_or_stderr("docker", &borrowed)
+        .map(|_| ())
+        .map_err(|error| format!("the stack could not be stopped: {error}"))
 }
 
 #[cfg(test)]
