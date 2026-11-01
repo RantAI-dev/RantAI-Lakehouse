@@ -234,3 +234,25 @@ developer from changing Rust, so nothing was changed here.
   copies stayed in separate parts. The probes were made on throwaway
   containers that have since been removed; the seeded state was left
   untouched.
+
+## Review round 1 (planner, 2026-11-01, at `7b0bc07e`)
+
+- **T1 matches D1.** The four tables are now `ReplacingMergeTree` with their existing
+  `ORDER BY slug`. This is what `bronze_catalog.py:117-118` and `:133-134` declare, with no
+  version column. The handoff's two runs on a fresh 26.8 container, the `SHOW CREATE TABLE`
+  lines and the owner's own R10 guard passing on the seeded stack are the proof.
+- **D2 is respected.** No Rust, TypeScript or Dagster changed.
+- **Fixed by the planner, at review: the new comment was in Indonesian** and replaced an English
+  one (`AGENTS.md`: comments are in English). It is rewritten in English with the same content.
+  Only comments changed, so the acceptance run still holds. The rest of the file's older
+  Indonesian header is out of scope here.
+- **D3: the column count is still wrong for a slug in both registries.** The handoff measured
+  it, and the reading is right. `col_of` (`routes/catalog.rs:554-559`) takes the first of two
+  per-registry counts from a `UNION ALL`, so the list page shows one registry's count, not
+  their sum. Which one varies between runs, and it disagrees with the detail page
+  (`:2456`, which counts both). The catalog and sync reads (`:507-525`) have no `FINAL`, so the
+  list can also show such a slug twice. This becomes a new backlog item, `DATA-40` (Data, P3).
+  Its first question is whether one slug in both `bronze_meta` and `bronze_meta_sec` is a state
+  the product allows, before it decides between summing and refusing.
+
+**Open: no BLOCKER, no SHOULD-FIX.**

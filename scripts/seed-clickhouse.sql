@@ -140,23 +140,22 @@ ORDER BY tahun;
 -- tampil di UI (`sdi-primer` vs `sekunder`).
 -- ---------------------------------------------------------------------------
 
--- `DATA-39` (D1) dan `DATA-24 T2` (D2): keenam tabel registry di bawah
--- memakai PERSIS engine dan `ORDER BY` yang dideklarasikan SATU owner-nya —
+-- `DATA-39` (D1) and `DATA-24 T2` (D2): the six registry tables below use
+-- EXACTLY the engine and `ORDER BY` their one owner declares,
 -- `dagster/dispar_orchestrate/bronze_catalog.py`'s `_registry_schemas`:
--- `ReplacingMergeTree ORDER BY slug` untuk `dataset_catalog`/`dataset_sync`,
--- `ReplacingMergeTree ORDER BY (slug, key_asli)` untuk `dataset_column`
--- (untuk `bronze_meta` maupun `bronze_meta_sec`).
+-- `ReplacingMergeTree ORDER BY slug` for `dataset_catalog` and
+-- `dataset_sync`, and `ReplacingMergeTree ORDER BY (slug, key_asli)` for
+-- `dataset_column`, in both `bronze_meta` and `bronze_meta_sec`.
 --
--- Setiap run sebuah konektor menulis lagi baris-baris dataset yang sama,
--- jadi registry menyimpan satu salinan per run sampai `ClickHouse`
--- menggabungkannya di latar belakang; pembacaan meminta salinan yang
--- sudah digabung (`FINAL`,
--- `rust/crates/lakehouse-api/src/routes/catalog.rs`), dan tabel yang
--- `MergeTree` polos tidak punya salinan gabungan untuk diminta.
+-- Every connector run writes the same dataset rows again, so a registry
+-- holds one copy per run until `ClickHouse` merges them in the background.
+-- The reads ask for the merged copy (`FINAL`,
+-- `rust/crates/lakehouse-api/src/routes/catalog.rs`), and a plain
+-- `MergeTree` table has no merged copy to ask for.
 --
--- CATATAN: `CREATE TABLE IF NOT EXISTS` tidak pernah mengubah tabel yang
--- sudah ada. Stack yang sudah ter-seed sebelum perubahan ini tetap
--- `MergeTree` sampai tabelnya dihapus dan dibuat ulang.
+-- NOTE: `CREATE TABLE IF NOT EXISTS` never changes a table that already
+-- exists. A stack seeded before this change keeps `MergeTree` until its
+-- tables are dropped and created again.
 CREATE TABLE IF NOT EXISTS lake.`bronze_meta.dataset_catalog`
 (
     slug        String,
@@ -169,7 +168,7 @@ CREATE TABLE IF NOT EXISTS lake.`bronze_meta.dataset_catalog`
 ENGINE = ReplacingMergeTree
 ORDER BY slug;
 
--- `DATA-39` (D1): `ReplacingMergeTree`, engine yang dideklarasikan owner di atas.
+-- `DATA-39` (D1): `ReplacingMergeTree`, the engine the owner above declares.
 CREATE TABLE IF NOT EXISTS lake.`bronze_meta.dataset_sync`
 (
     slug        String,
@@ -197,7 +196,7 @@ CREATE TABLE IF NOT EXISTS lake.`bronze_meta.dataset_column`
 ENGINE = ReplacingMergeTree
 ORDER BY (slug, key_asli);
 
--- `DATA-39` (D1): `ReplacingMergeTree`, engine yang dideklarasikan owner di atas.
+-- `DATA-39` (D1): `ReplacingMergeTree`, the engine the owner above declares.
 CREATE TABLE IF NOT EXISTS lake.`bronze_meta_sec.dataset_catalog`
 (
     slug        String,
@@ -210,7 +209,7 @@ CREATE TABLE IF NOT EXISTS lake.`bronze_meta_sec.dataset_catalog`
 ENGINE = ReplacingMergeTree
 ORDER BY slug;
 
--- `DATA-39` (D1): `ReplacingMergeTree`, engine yang dideklarasikan owner di atas.
+-- `DATA-39` (D1): `ReplacingMergeTree`, the engine the owner above declares.
 CREATE TABLE IF NOT EXISTS lake.`bronze_meta_sec.dataset_sync`
 (
     slug        String,
