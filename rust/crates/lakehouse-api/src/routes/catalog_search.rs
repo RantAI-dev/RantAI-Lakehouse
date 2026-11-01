@@ -470,7 +470,21 @@ fn best_hit(word: &Word, candidates: &[Candidate]) -> Option<Hit> {
     best
 }
 
-/// Rank `assets` for `term`; see the module doc for how the term is read.
+/// What a search found: the assets that matched, and how many matched.
+///
+/// `DATA-41` D3: the assets are the best matches, and the count says how
+/// many matched in all, so a caller that asked for a few of them still
+/// knows how many there are.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchOutcome {
+    /// The matching assets, in rank order. At most the limit the caller
+    /// asked for.
+    pub assets: Vec<Value>,
+    /// How many assets matched, including the ones the limit cut off.
+    pub total: usize,
+}
+
+/// Rank the assets that match `term`.
 ///
 /// An empty or all-whitespace term returns every asset in input order with
 /// no `matchedOn`. Otherwise only assets matching every word are returned,
@@ -485,7 +499,16 @@ fn best_hit(word: &Word, candidates: &[Candidate]) -> Option<Hit> {
 ///
 /// `DATA-41` D2: the index is the prepared one, so a search allocates
 /// nothing per candidate.
-pub fn search(index: &SearchIndex, usage: &UsageIndex, term: &str) -> Vec<Value> {
+///
+/// `DATA-41` D3: `limit` caps how many assets are returned. The cap is
+/// applied AFTER the ranking, so the assets that are returned are the best
+/// ones, and `total` says how many matched in all.
+pub fn search(
+    index: &SearchIndex,
+    usage: &UsageIndex,
+    term: &str,
+    limit: Option<usize>,
+) -> SearchOutcome {
     let lowered = term.to_lowercase();
     let words: Vec<Word> = lowered
         .split_whitespace()
@@ -493,7 +516,12 @@ pub fn search(index: &SearchIndex, usage: &UsageIndex, term: &str) -> Vec<Value>
         .map(Word::new)
         .collect();
     if words.is_empty() {
-        return index.assets.clone();
+        let total = index.assets.len();
+        let assets = match limit {
+            Some(cap) => index.assets.iter().take(cap).cloned().collect(),
+            None => index.assets.clone(),
+        };
+        return SearchOutcome { assets, total };
     }
 
     // `(score, use, id, position in the index, reason)`: the id is the
@@ -531,8 +559,10 @@ pub fn search(index: &SearchIndex, usage: &UsageIndex, term: &str) -> Vec<Value>
         }
     }
     ranked.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)).then_with(|| a.2.cmp(b.2)));
-    ranked
+    let total = ranked.len();
+    let assets = ranked
         .into_iter()
+        .take(limit.unwrap_or(usize::MAX))
         .map(|(_, _, _, position, reason)| {
             let mut asset = index.assets[position].clone();
             let reported = reason.and_then(|r| match r {
@@ -553,7 +583,8 @@ pub fn search(index: &SearchIndex, usage: &UsageIndex, term: &str) -> Vec<Value>
             }
             asset
         })
-        .collect()
+        .collect();
+    SearchOutcome { assets, total }
 }
 
 #[cfg(test)]
@@ -577,7 +608,9 @@ mod tests {
             &index(assets, &ColumnIndex::new()),
             &UsageIndex::new(),
             term,
+            None,
         )
+        .assets
     }
 
     fn orders_and_users() -> Vec<Value> {
@@ -781,7 +814,13 @@ mod tests {
             vec![("customer_id".to_owned(), String::new())],
         )]
         .into();
-        let hit = search(&index(&assets, &columns), &UsageIndex::new(), "custmer_id");
+        let hit = search(
+            &index(&assets, &columns),
+            &UsageIndex::new(),
+            "custmer_id",
+            None,
+        )
+        .assets;
         assert_eq!(ids(&hit), ["silver.other"]);
         assert_eq!(
             hit[0]["matchedOn"],
@@ -790,7 +829,13 @@ mod tests {
         assert_eq!(find(&assets, "silver.ordrs").len(), 1);
         // `xx` is under 4 characters and is not in the column: no match.
         assert_eq!(
-            search(&index(&assets, &columns), &UsageIndex::new(), "custmer_xx"),
+            search(
+                &index(&assets, &columns),
+                &UsageIndex::new(),
+                "custmer_xx",
+                None,
+            )
+            .assets,
             [] as [serde_json::Value; 0]
         );
         // No letter or digit: nothing to match.
@@ -818,14 +863,26 @@ mod tests {
             ),
         ]
         .into();
-        let hits = search(&index(&assets, &columns), &UsageIndex::new(), "id_customer");
+        let hits = search(
+            &index(&assets, &columns),
+            &UsageIndex::new(),
+            "id_customer",
+            None,
+        )
+        .assets;
         assert_eq!(ids(&hits), ["silver.exact", "silver.swapped"]);
         assert_eq!(
             hits[1]["matchedOn"],
             json!({ "field": "column", "value": "customer_id", "approximate": false })
         );
         // A real typo is still flagged.
-        let typo = search(&index(&assets, &columns), &UsageIndex::new(), "custmer_id");
+        let typo = search(
+            &index(&assets, &columns),
+            &UsageIndex::new(),
+            "custmer_id",
+            None,
+        )
+        .assets;
         assert!(
             typo.iter()
                 .all(|h| h["matchedOn"]["approximate"] == json!(true))
@@ -847,7 +904,9 @@ mod tests {
             &index(&assets, &columns),
             &UsageIndex::new(),
             "revenue_amount",
-        );
+            None,
+        )
+        .assets;
         assert_eq!(ids(&hits), vec!["silver.sales"]);
         assert_eq!(
             hits[0]["matchedOn"],
@@ -866,7 +925,8 @@ mod tests {
             "c.three".to_owned(),
             vec![("c1".to_owned(), "Amount invoiced".to_owned())],
         )]);
-        let by = |term: &str| search(&index(&assets, &columns), &UsageIndex::new(), term);
+        let by =
+            |term: &str| search(&index(&assets, &columns), &UsageIndex::new(), term, None).assets;
         let owner = by("finance");
         assert_eq!(ids(&owner), vec!["a.one"]);
         assert_eq!(owner[0]["matchedOn"]["field"], "owner");
@@ -891,7 +951,7 @@ mod tests {
         ];
         let columns: ColumnIndex =
             HashMap::from([("c".to_owned(), vec![("sales".to_owned(), String::new())])]);
-        let hits = search(&index(&assets, &columns), &UsageIndex::new(), "sales");
+        let hits = search(&index(&assets, &columns), &UsageIndex::new(), "sales", None).assets;
         assert_eq!(ids(&hits), vec!["n", "t", "c", "d"]);
         // The name is on screen already, so it is never given as the reason.
         assert!(hits[0].get("matchedOn").is_none());
@@ -924,7 +984,7 @@ mod tests {
             json!({ "id": "x.c", "name": "C", "tags": ["sales"] }),
         ];
         let usage: UsageIndex = HashMap::from([("x.c".to_owned(), 9), ("x.b".to_owned(), 2)]);
-        let hits = search(&index(&assets, &ColumnIndex::new()), &usage, "sales");
+        let hits = search(&index(&assets, &ColumnIndex::new()), &usage, "sales", None).assets;
         assert_eq!(ids(&hits), vec!["x.c", "x.b", "x.a"]);
     }
 
@@ -972,7 +1032,9 @@ mod tests {
             &index(&assets, &columns),
             &UsageIndex::new(),
             "northwind customer",
-        );
+            None,
+        )
+        .assets;
         assert_eq!(
             hits[0]["matchedOn"],
             json!({ "field": "column", "value": "customer_id", "approximate": false })
@@ -1069,11 +1131,56 @@ mod tests {
             &index(&assets, &columns),
             &UsageIndex::new(),
             "revenue_amount",
-        );
+            None,
+        )
+        .assets;
         assert_eq!(ids(&hits), vec!["silver.mart_wisman"]);
         assert_eq!(
             hits[0]["matchedOn"],
             json!({ "field": "column", "value": "revenue_amount", "approximate": false })
         );
+    }
+
+    // `DATA-41` D3: the limit is applied AFTER the ranking, so the assets
+    // that come back are the best ones, and the count says how many
+    // matched in all.
+    #[test]
+    fn a_limit_takes_the_best_matches_and_the_count_says_how_many_matched() {
+        let assets = vec![
+            json!({ "id": "a", "name": "Revenue" }),
+            json!({ "id": "b", "name": "Ledger", "description": "revenue by month" }),
+            json!({ "id": "c", "name": "Orders", "description": "revenue by month" }),
+        ];
+        let outcome = search(
+            &index(&assets, &ColumnIndex::new()),
+            &UsageIndex::new(),
+            "revenue",
+            Some(2),
+        );
+        // The name that IS the word comes first; the two descriptions tie
+        // and are ordered by id.
+        assert_eq!(ids(&outcome.assets), vec!["a", "b"]);
+        assert_eq!(
+            outcome.total, 3,
+            "every match is counted, not only the ones returned"
+        );
+    }
+
+    // `DATA-41` D3: without a limit the answer is every match, in the same
+    // order, and the count is the number of them.
+    #[test]
+    fn without_a_limit_every_match_is_returned() {
+        let assets = vec![
+            json!({ "id": "a", "name": "Revenue" }),
+            json!({ "id": "b", "name": "Ledger", "description": "revenue by month" }),
+        ];
+        let outcome = search(
+            &index(&assets, &ColumnIndex::new()),
+            &UsageIndex::new(),
+            "revenue",
+            None,
+        );
+        assert_eq!(ids(&outcome.assets), vec!["a", "b"]);
+        assert_eq!(outcome.total, 2);
     }
 }

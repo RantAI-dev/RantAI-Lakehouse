@@ -73,10 +73,39 @@ use crate::tenant::{
 /// search term the command palette sends (WS2 §13) — moved here from
 /// `src/services/clients/assets.ts`'s browser-side filter so there is one
 /// implementation of the term match, not two (`AGENTS.md` rule 4).
+///
+/// `limit` is how many assets the caller wants (`DATA-41` D3): the
+/// command palette shows eight, so it asks for eight instead of being
+/// sent a catalog of ten thousand tables to throw away all but eight.
 #[derive(Debug, Deserialize)]
 pub struct ListQuery {
     #[serde(default)]
     q: Option<String>,
+    /// At most how many assets the answer carries. `None` is every match,
+    /// as before `DATA-41` D3.
+    #[serde(default)]
+    limit: Option<u32>,
+}
+
+/// The `limit` a caller asked for, and whether this route serves it.
+///
+/// `DATA-41` D3: the limit is 1 to 200 — the Data Explorer's own page size
+/// ([`MAX_PAGE_SIZE`]) — and anything else is a 400 with a plain message.
+/// A limit the server does not serve is the caller's mistake, and rounding
+/// it silently would answer a different question than the one that was
+/// asked.
+///
+/// # Errors
+///
+/// [`ApiError::BadRequest`] when the limit is outside 1..=[`MAX_PAGE_SIZE`].
+fn requested_limit(limit: Option<u32>) -> Result<Option<usize>, ApiError> {
+    match limit {
+        None => Ok(None),
+        Some(value) if (1..=MAX_PAGE_SIZE).contains(&value) => Ok(Some(value as usize)),
+        Some(_) => Err(ApiError::BadRequest(format!(
+            "`limit` must be between 1 and {MAX_PAGE_SIZE}"
+        ))),
+    }
 }
 
 // ── CATALOG_TENANT_ID: this deployment's single shared, no-tenant-column
@@ -214,6 +243,13 @@ pub(crate) async fn catalog_tenant_refusal(
 /// `"columnSearch": "partial"`. Without a term nothing changes: the
 /// registry is assembled live.
 ///
+/// # `limit` (`DATA-41` D3)
+///
+/// With `?limit=N` the answer carries at most `N` assets and says how many
+/// matched in all (`total`). The limit is applied AFTER the ranking, so the
+/// assets that come back are the best ones. Without a limit the answer is
+/// as it was: every match, and no `total`.
+///
 /// # Tenant scoping
 ///
 /// [`catalog_tenant_refusal`] runs first — see its doc comment and the
@@ -243,11 +279,24 @@ pub async fn list(
         Ok(None) => {}
         Err(err) => return ApiRejection(err).into_response(),
     }
+    // `DATA-41` D3: a limit outside 1..=200 is a 400 with a plain message.
+    let limit = match requested_limit(params.limit) {
+        Ok(limit) => limit,
+        Err(err) => return ApiRejection(err).into_response(),
+    };
     if let Some(term) = params.q.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
         return match search_snapshot(&state).await {
             Ok(snapshot) => {
-                let assets = catalog_search::search(&snapshot.index, &snapshot.usage, term);
-                let mut body = json!({ "assets": assets, "namespaces": snapshot.namespaces });
+                let outcome = catalog_search::search(&snapshot.index, &snapshot.usage, term, limit);
+                let mut body = json!({
+                    "assets": outcome.assets,
+                    "namespaces": snapshot.namespaces,
+                });
+                // `DATA-41` D3: the count of every match, so a caller that
+                // asked for a few of them still knows how many there are.
+                if limit.is_some() {
+                    body["total"] = json!(outcome.total);
+                }
                 if snapshot.column_search_partial {
                     body["columnSearch"] = json!("partial");
                 }
@@ -257,7 +306,21 @@ pub async fn list(
         };
     }
     match assemble_catalog(&state).await {
-        Ok((body, _bronze_pairs)) => (StatusCode::OK, ApiJson(body)).into_response(),
+        Ok((mut body, _bronze_pairs)) => {
+            // `DATA-41` D3: the same limit on the live registry, and the
+            // same count of what it held.
+            if let Some(limit) = limit {
+                let total = body
+                    .get("assets")
+                    .and_then(Value::as_array)
+                    .map_or(0, Vec::len);
+                if let Some(assets) = body.get_mut("assets").and_then(Value::as_array_mut) {
+                    assets.truncate(limit);
+                }
+                body["total"] = json!(total);
+            }
+            (StatusCode::OK, ApiJson(body)).into_response()
+        }
         Err(err) => list_unavailable(err),
     }
 }
@@ -403,7 +466,7 @@ pub async fn query(
     let (mut filtered, column_search_partial) = if let Some(term) = term {
         match search_snapshot(&state).await {
             Ok(snapshot) => (
-                catalog_search::search(&snapshot.index, &snapshot.usage, term),
+                catalog_search::search(&snapshot.index, &snapshot.usage, term, None).assets,
                 snapshot.column_search_partial,
             ),
             Err(err) => return unavailable(err),
@@ -4775,7 +4838,10 @@ mod tests {
                 State(state),
                 Extension(member),
                 HeaderMap::new(),
-                Query(ListQuery { q: None }),
+                Query(ListQuery {
+                    q: None,
+                    limit: None,
+                }),
             )
             .await;
             let (status, body) = response_json(resp).await;
@@ -4799,7 +4865,10 @@ mod tests {
                 State(state),
                 Extension(outsider),
                 HeaderMap::new(),
-                Query(ListQuery { q: None }),
+                Query(ListQuery {
+                    q: None,
+                    limit: None,
+                }),
             )
             .await;
             let (status, body) = response_json(resp).await;
@@ -4830,6 +4899,7 @@ mod tests {
                 HeaderMap::new(),
                 Query(ListQuery {
                     q: Some("revenue".to_owned()),
+                    limit: None,
                 }),
             )
             .await;
@@ -4879,7 +4949,10 @@ mod tests {
                 State(state),
                 Extension(analyst),
                 HeaderMap::new(),
-                Query(ListQuery { q: None }),
+                Query(ListQuery {
+                    q: None,
+                    limit: None,
+                }),
             )
             .await;
             let (status, body) = response_json(resp).await;
@@ -4927,7 +5000,10 @@ mod tests {
                 State(state),
                 Extension(analyst),
                 HeaderMap::new(),
-                Query(ListQuery { q: None }),
+                Query(ListQuery {
+                    q: None,
+                    limit: None,
+                }),
             )
             .await;
             let (status, body) = response_json(resp).await;
@@ -4950,7 +5026,10 @@ mod tests {
                 State(state),
                 Extension(admin),
                 HeaderMap::new(),
-                Query(ListQuery { q: None }),
+                Query(ListQuery {
+                    q: None,
+                    limit: None,
+                }),
             )
             .await;
             let (status, body) = response_json(resp).await;
@@ -6916,6 +6995,225 @@ mod tests {
                 json!(2),
                 "two columns, not one per run: {orders:?}"
             );
+        }
+    }
+
+    // ── `GET /api/catalog?limit=` (`DATA-41` D3) ────────────────────
+    //
+    // The command palette shows eight results and used to be served the
+    // whole catalog — ten thousand tables, 6.6 MB — to throw all but eight
+    // away. These are the route's own tests: the limit is applied AFTER
+    // the ranking, the count says how many matched in all, and a limit
+    // outside 1..=200 is a 400 with a plain message.
+    mod search_limit {
+        #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+        use lakehouse_auth::{PermissionSet, PrincipalId};
+        use uuid::Uuid;
+        use wiremock::matchers::{body_string_contains, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        use super::*;
+        use crate::config::Config;
+
+        /// The three tables the mock catalog holds, each with the word
+        /// `revenue` in a different place, so the ranking has an order:
+        ///
+        /// | table | where the word is | score |
+        /// | --- | --- | --- |
+        /// | `bronze.one` | the name | 120 |
+        /// | `bronze.three` | a column name | 60 |
+        /// | `bronze.two` | the description | 30 |
+        fn catalog_rows() -> Vec<Value> {
+            vec![
+                json!({
+                    "slug": "bronze.one", "title": "Revenue", "description": "the ledger",
+                    "tier": "public", "updated_at": "2026-01-01T00:00:00Z", "table_name": "",
+                }),
+                json!({
+                    "slug": "bronze.two", "title": "Ledger", "description": "revenue by month",
+                    "tier": "public", "updated_at": "2026-01-01T00:00:00Z", "table_name": "",
+                }),
+                json!({
+                    "slug": "bronze.three", "title": "Orders", "description": "orders by day",
+                    "tier": "public", "updated_at": "2026-01-01T00:00:00Z", "table_name": "",
+                }),
+            ]
+        }
+
+        /// A `ClickHouse` that answers the catalog's own queries: the
+        /// registry rows above, one column each, and no Silver or Gold
+        /// table.
+        async fn mock_catalog() -> MockServer {
+            let server = MockServer::start().await;
+            let answer = |data: Vec<Value>| {
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "meta": [],
+                    "data": data,
+                    "rows": data.len(),
+                }))
+            };
+            Mock::given(method("POST"))
+                .and(body_string_contains("dataset_catalog"))
+                .respond_with(answer(catalog_rows()))
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(body_string_contains("dataset_sync"))
+                .respond_with(answer(
+                    catalog_rows()
+                        .iter()
+                        .map(|row| {
+                            json!({
+                                "slug": row["slug"], "total": "10",
+                                "author": "bench", "frekuensi": "daily",
+                            })
+                        })
+                        .collect(),
+                ))
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(body_string_contains("dataset_column"))
+                .respond_with(answer(vec![
+                    json!({
+                        "slug": "bronze.one", "n": "20",
+                        "key_asli": "revenue_amount", "deskripsi": "the amount",
+                    }),
+                    json!({
+                        "slug": "bronze.two", "n": "20",
+                        "key_asli": "total", "deskripsi": "the total",
+                    }),
+                    json!({
+                        "slug": "bronze.three", "n": "20",
+                        "key_asli": "revenue_amount", "deskripsi": "the amount",
+                    }),
+                ]))
+                .mount(&server)
+                .await;
+            // Everything else (the Silver and Gold tables, the parts) is
+            // empty: this fixture is about the Bronze registry.
+            Mock::given(method("POST"))
+                .respond_with(answer(Vec::new()))
+                .mount(&server)
+                .await;
+            server
+        }
+
+        /// An `AppState` with no Postgres: the caller below is
+        /// unrestricted, so the tenant gate lets it through without
+        /// counting tenants, and the enrichment steps that read Postgres
+        /// have nothing to read.
+        fn catalog_state(ch_url: &str) -> AppState {
+            let mut env = HashMap::new();
+            env.insert("CH_URL".to_owned(), ch_url.to_owned());
+            let config = Config::from_map(&env).expect("a valid test Config");
+            AppState::new(config)
+        }
+
+        /// A principal that holds everything (`"*:*"`), so the tenant gate
+        /// lets it through without a database.
+        fn admin() -> Principal {
+            Principal {
+                id: PrincipalId::User(Uuid::new_v4()),
+                tenant_ids: Vec::new(),
+                display_name: "Platform Admin".to_owned(),
+                permissions: PermissionSet::parse("*:*"),
+                provider: "session".to_owned(),
+                must_change_password: false,
+                role_names: Vec::new(),
+            }
+        }
+
+        async fn body_of(resp: Response) -> (StatusCode, Value) {
+            let status = resp.status();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (status, serde_json::from_slice(&bytes).unwrap_or_default())
+        }
+
+        async fn search_with(
+            state: &AppState,
+            q: Option<&str>,
+            limit: Option<u32>,
+        ) -> (StatusCode, Value) {
+            let resp = list(
+                State(state.clone()),
+                Extension(admin()),
+                HeaderMap::new(),
+                Query(ListQuery {
+                    q: q.map(str::to_owned),
+                    limit,
+                }),
+            )
+            .await;
+            body_of(resp).await
+        }
+
+        /// `DATA-41` D3: the limit is applied after the ranking, so the
+        /// assets that come back are the best ones, and `total` says how
+        /// many matched in all.
+        #[tokio::test]
+        async fn a_limit_takes_the_best_matches_and_the_count_says_how_many_matched() {
+            let ch = mock_catalog().await;
+            let state = catalog_state(&ch.uri());
+
+            let (status, body) = search_with(&state, Some("revenue"), Some(2)).await;
+            assert_eq!(status, StatusCode::OK);
+            let assets = body["assets"].as_array().expect("the answer has assets");
+            assert_eq!(assets.len(), 2, "the limit is what the caller asked for");
+            assert_eq!(assets[0]["id"], "bronze.one", "the name that is the word");
+            assert_eq!(assets[1]["id"], "bronze.three", "the column name");
+            assert_eq!(body["total"], json!(3), "every match is counted");
+        }
+
+        /// `DATA-41` D3: without a limit the answer is every match, in the
+        /// same order, and there is no count — the answer is as it was.
+        #[tokio::test]
+        async fn without_a_limit_the_answer_is_every_match_and_no_count() {
+            let ch = mock_catalog().await;
+            let state = catalog_state(&ch.uri());
+
+            let (status, body) = search_with(&state, Some("revenue"), None).await;
+            assert_eq!(status, StatusCode::OK);
+            let assets = body["assets"].as_array().expect("the answer has assets");
+            assert_eq!(assets.len(), 3);
+            assert_eq!(assets[0]["id"], "bronze.one");
+            assert!(
+                body.get("total").is_none(),
+                "without a limit the answer is as it was: {body}"
+            );
+        }
+
+        /// `DATA-41` D3: a limit outside 1..=200 is a 400 with a plain
+        /// message — the caller's mistake, not something to round
+        /// silently.
+        #[tokio::test]
+        async fn a_limit_outside_the_range_is_a_bad_request() {
+            let ch = mock_catalog().await;
+            let state = catalog_state(&ch.uri());
+
+            for limit in [0, 201] {
+                let (status, body) = search_with(&state, Some("revenue"), Some(limit)).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "limit {limit}");
+                let message = body["error"].as_str().unwrap_or_default();
+                assert!(
+                    message.contains("limit"),
+                    "the message names the limit: {body}"
+                );
+            }
+        }
+
+        /// `DATA-41` D3: the limit is a number the route serves, and the
+        /// boundary itself is served.
+        #[test]
+        fn the_served_limits_are_one_to_two_hundred() {
+            assert!(requested_limit(None).unwrap().is_none());
+            assert_eq!(requested_limit(Some(1)).unwrap(), Some(1));
+            assert_eq!(requested_limit(Some(200)).unwrap(), Some(200));
+            assert!(requested_limit(Some(0)).is_err());
+            assert!(requested_limit(Some(201)).is_err());
         }
     }
 }
