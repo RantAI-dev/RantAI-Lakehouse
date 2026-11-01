@@ -26,6 +26,23 @@ catalog of 10,000 tables. It is measured here, and a miss is reported, not hidde
 | `GET /api/catalog?q=` (command palette) | 7,153.9 ms | **489.4 ms** | **751.0 ms** | 791.4 ms |
 | `GET /api/catalog/query?search=` (Data Explorer) | 7,292.9 ms | **325.8 ms** | **760.3 ms** | 771.1 ms |
 
+**Re-run after `DATA-24` T2** (#308, the column rows read with `FINAL`): run **41282255663**,
+`main` at `d8635457`, 2026-11-01, same workflow and runner type.
+
+| Route | First search | p50 | p95 | Max |
+| --- | --- | --- | --- | --- |
+| `GET /api/catalog?q=` | 4,766.1 ms | **369.1 ms** | **525.5 ms** | 539.2 ms |
+| `GET /api/catalog/query?search=` | 426.1 ms | **252.4 ms** | **530.4 ms** | 5,156.7 ms |
+
+- `FINAL` did not make search slower. The second run is faster on every figure, but one run per
+  build on a shared runner cannot tell a code effect from runner noise, so no gain is claimed.
+- p95 is now just over 500 ms on both routes.
+- The rebuild of the search copy still costs about 5 s:
+  - on the first route it was the first search;
+  - on the second route it fell on a later search (the max of 5,156.7 ms), because the copy
+    expired mid-run.
+- That is still `DATA-38`.
+
 ## Against the target
 
 - **The typical search meets 500 ms.** The median is 489 ms and 326 ms.
