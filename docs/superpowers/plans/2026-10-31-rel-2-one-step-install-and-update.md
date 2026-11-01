@@ -2297,3 +2297,15 @@ old save from the digest reference) reproduced the blocker, so the measurement p
   message to match.
 
 **Open: BLOCKER 1, SHOULD-FIX 2.**
+
+### Review S3 round 5 (planner, 2026-11-01, at `d0a64a7b`)
+
+- **BLOCKER 1 is fixed** (`d92af2e2`). The registry is a step after the store switch, pinned
+  by digest, and waited for with a bounded loop that prints its logs on failure. The service
+  container is gone, and the tests check the order in every job that restarts Docker.
+- **SHOULD-FIX 2 is fixed** (`19ac61cf`). A failed docker call now carries the last 20 lines of
+  its stderr into the error, and `compose_up` no longer promises output it does not print.
+
+**Open: no BLOCKER, no SHOULD-FIX.** Merge waits for this head's CI: the required checks, the
+workspace cargo run, `Release · dry run`, and `install-proof`, which is now air-gapped and on
+the containerd store.
