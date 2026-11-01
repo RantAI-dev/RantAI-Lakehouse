@@ -194,7 +194,7 @@ nix = { workspace = true }
 # under a routine update); `constant_memory` mode keeps a million-row export off
 # the heap. MIT OR Apache-2.0; `cargo deny check` and `cargo audit` pass with it
 # (plan 2026-10-17-bi-1-export.md, section 5).
-rust_xlsxwriter = { version = "=0.99.1", features = ["constant_memory"] }
+rust_xlsxwriter = { version = "=0.102.0", features = ["constant_memory"] }
 
 [dev-dependencies]
 # `BI-1` T2: the export tests open the .xlsx they wrote to read its cells and
