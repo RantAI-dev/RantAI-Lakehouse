@@ -339,3 +339,22 @@ container, volume or testcontainers image is left behind.
 
 **Open: no BLOCKER, no SHOULD-FIX for S1.** S2 (Trino in the G8 gates) follows on this branch,
 after this PR merges.
+
+### Review S2 round 1 (planner, 2026-11-01, at `b5644d7d`)
+
+- **The gates.** `g8-governance` and `g8-time-travel` are now matrices over
+  `engine: [clickhouse, trino]`, each leg on its own runner with fresh volumes.
+  - The ClickHouse leg's stack and SQL are unchanged.
+  - `ci-required` still reads each job's single `result`, which a matrix job reports as the
+    aggregate of its legs.
+- **The developer's decisions, all accepted:**
+  - a matrix rather than a second step;
+  - the governance Trino leg governs its own Gold Iceberg table, published by the Gold export,
+    because Trino has no ClickHouse connector;
+  - `LAKEKEEPER_BASE_URI` is set on the Trino leg, the value the `gold-export` job already uses.
+    The local run found that gap before CI would have.
+- **The developer's local proof:** both gates pass on both engines, with the Trino legs checking
+  the mask, the bypass shapes, a pinned past version, and masking inside a subquery and a CTE.
+- **The open question:** no matrix leg has run on GitHub yet. This PR's CI is that proof.
+
+**Open: no BLOCKER, no SHOULD-FIX.** The PR opens once #309 merges and `main` is merged in.
