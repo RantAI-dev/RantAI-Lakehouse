@@ -317,6 +317,93 @@ signed decisions and `ops/release/release.pub`. One commit per task.
     handoff.
   - The developer cannot run the real release; the planner and the owner do that in S5.
 
+## 4b. S3 plan check (planner, 2026-11-01, at `main` `2c110ebc`): `lakehousectl install`
+
+Read today:
+- **`release.json`** (`ops/release/make_manifest.py`) holds `schemaVersion`, `version`, `gitSha`,
+  `createdAt`, `minFrom`, `stops`, `images` (service → `ref@sha256:<manifest digest>`, every
+  service of the rendered Compose file) and `files`. `files` covers only `docker-compose.yml`
+  today.
+- **Signature:** `release.json.sigstore.json`, a Sigstore bundle with no tlog. The recipe that
+  verifies it is proven in `ops/release/test_sigstore_bundle.py`: `messageSignature.signature` is
+  an ECDSA P-256 DER signature over SHA-256 of `release.json`, and `messageDigest` is that
+  SHA-256. The fixture is `ops/release/fixtures/sigstore/` (bundle, manifest, throwaway public
+  key).
+- **The bundle** (`make_bundle.sh`) holds `docker-compose.yml`, `release.json`,
+  `release.json.sigstore.json`, `images/<name>.tar` (`docker save` by reference), `sbom/` and
+  `SHA256SUMS`, as a `.tar.zst`.
+- **Secrets:** `ops/init-env.sh:64-90` lists what a fresh `.env` needs, and `.env.example` is the
+  list of keys.
+- **The release key:** `ops/release/release.pub`.
+- **Workspace:** `rust/Cargo.toml` members `crates/*`.
+
+**The gap S3 must close first (T0).** `docker save` of a pulled image drops its registry manifest
+digest. After `docker load`, the host knows only the image **ID**, which is the config digest. So
+an air-gapped install cannot compare a loaded image against `images` (manifest digests). The
+manifest must also carry each image's ID.
+
+Branch `feat/rel-2-s3-lakehousectl-install` off `main`. One commit per task.
+
+- **S3-T0. The manifest carries image IDs.**
+  - `make_manifest.py` gains `imageIds`: unique image reference → `sha256:<config digest>`. The
+    pipeline fills it after pulling or building each image (`docker image inspect --format
+    '{{.Id}}' <ref>`), in both jobs of `release.yml`.
+  - `files` gains `SHA256SUMS`'s own entries? No: keep `files` as it is. The bundle's
+    `SHA256SUMS` is checked against the tar contents, and the signed manifest is the root of
+    trust.
+  - Tests in `test_make_manifest.py`.
+  - *Accept:* `pytest ops/release -q`, and `actionlint`.
+- **S3-T1. The crate.** `rust/crates/lakehousectl`, a binary, built with `clap` (derive).
+  - `verify` module: parse the Sigstore bundle, then check
+    `messageDigest == sha256(release.json)` and the ECDSA P-256 signature against the key built
+    in with `include_bytes!("../../../../ops/release/release.pub")`. Use the `p256` and `ecdsa`
+    crates (pin minors, and pass `cargo deny`).
+  - Test against the S2 fixture (throwaway key, injected in tests) and against a tampered
+    manifest.
+  - *Accept:* `cargo fmt --check`; `cargo clippy -p lakehousectl --all-targets -- -D warnings`;
+    `cargo test -p lakehousectl`; `cargo deny check`.
+- **S3-T2. Pre-flight** (spec minimums). Each check is its own function, testable with injected
+  facts:
+  - Linux on x86_64;
+  - Docker 24 or newer, and Compose 2.24 or newer (from `docker version` and
+    `docker compose version`);
+  - 4 or more CPUs, and 16 GiB or more of memory (`/proc/meminfo`);
+  - 50 GiB or more free under `--dir`;
+  - the published ports free: `CONSOLE_HOST_PORT` (3000), `API_HOST_PORT` (8080) and the
+    others the rendered Compose file publishes.
+
+  `--ignore-preflight <name>` skips one check and logs it. Every failure says what to fix.
+- **S3-T3. `lakehousectl install [--bundle <dir>] [--dir /opt/rantai-lakehouse]`** (D5, D6):
+  - **verify** the manifest;
+  - **online:** read the release assets from GitHub Releases (latest, or `--version`), then
+    `docker pull` each `images` reference by digest;
+  - **offline:** check `SHA256SUMS`, run `docker load` on each `images/*.tar`, and check every
+    loaded image ID against `imageIds`, refusing any mismatch;
+  - **write the layout** of D5, with `.env` mode 0600;
+  - **generate secrets** following D6, only when missing; port `init-env.sh`'s list into Rust,
+    and test that a second run changes nothing;
+  - **start the stack** with `docker compose -p rantai-lakehouse up -d`, then wait for
+    `/health/ready` (`ready: true`, version = the manifest's) and for the console, both with
+    bounded waits;
+  - **print** the console address and the first administrator's email and password (generated,
+    shown once, must be changed at first sign-in).
+- **S3-T4. `install.sh`** (`ops/release/install.sh`):
+  - detect the architecture (x86_64 only, with a clear refusal otherwise);
+  - download `lakehousectl-linux-x86_64` and `SHA256SUMS` from the release, check the checksum,
+    and run `lakehousectl install "$@"`;
+  - use `set -euo pipefail` and pass shellcheck.
+
+  The release pipeline builds `lakehousectl` (static musl) and adds it to the bundle, the
+  release assets, `files` in the manifest and `install.sh`.
+- **S3-T5. The CI proof.** The dry run gains a job that, on a fresh runner:
+  1. downloads the dry run's bundle artifact;
+  2. runs `lakehousectl install --bundle` with the throwaway key, which a test-only build flag or
+     environment variable may point to, **never in a release build**;
+  3. asserts that `/health/ready` reports ready and the console answers.
+
+**S3 verification:** the scoped cargo commands, `pytest ops/release`, `shellcheck`, `actionlint`.
+The PR's dry run is the end-to-end proof.
+
 ## 5. Out of scope
 
 Kubernetes or Helm, multi-host, zero-downtime updates, Windows and macOS hosts, automatic
