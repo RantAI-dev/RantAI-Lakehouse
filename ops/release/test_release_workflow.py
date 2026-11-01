@@ -46,6 +46,20 @@ And one more since the PR #313 install-proof, from the install that failed:
     root, so a file the dry run wrote into `dist/` is read back from
     `dry-run/dist/`, not from `dry-run/`.
 
+And three more since REL-2 S3 D13, from the review round 3 BLOCKER 1
+(after `docker load`, nothing resolved a digest-pinned reference):
+
+  - every job that builds or saves a bundle turns Docker's CONTAINERD
+    image store on before its first image pull or build, and asserts
+    that the store is on — on the classic store no `docker load`
+    registers a repo digest, so a bundle built there cannot be
+    installed on an air-gapped host;
+  - the proof job turns the containerd store on before it installs;
+  - the proof job cuts the runner off from the registries BEFORE it
+    installs, and proves the cut — a runner that can still pull would
+    hide the bug the proof exists for, because Compose pulls silently
+    when it may.
+
 The workflow is parsed with PyYAML (`pyyaml==6.0.3`, installed by the jobs
 that run these tests). The checks are run against synthetic workflows too,
 so a check that cannot fail is itself a failure. No network, no repository:
@@ -115,6 +129,24 @@ DRY_RUN_FOLDER = "dry-run"
 # proof job that downloads it.
 UPLOAD_STEP = "Upload the bundle and the manifest"
 DOWNLOAD_STEP = "Download the dry run's bundle"
+
+# The step that turns Docker's containerd image store on (REL-2 S3 D13).
+CONTAINERD_STEP = "Turn on the containerd image store"
+
+# The step that cuts the proof runner off from the registries.
+AIR_GAP_STEP = "Cut the runner off from the registries"
+
+# The registries the proof cuts the runner off from: Docker Hub's
+# registry, its authentication and its index, GHCR, Quay, and the CDN
+# the Docker Hub layers come from.
+REGISTRIES = (
+    "registry-1.docker.io",
+    "auth.docker.io",
+    "index.docker.io",
+    "ghcr.io",
+    "quay.io",
+    "production.cloudflare.docker.com",
+)
 
 # A workflow with a signing secret in a job-level `env:`.
 SYNTHETIC_JOB_SECRET = """
@@ -269,6 +301,37 @@ jobs:
           LAKEHOUSECTL_PUBLIC_KEY_FILE: ${{ github.workspace }}/dry-run/cosign.pub
         run: |
           tar --zstd -xf dry-run/rantai-lakehouse-*.tar.zst -C bundle
+"""
+
+
+# A workflow that pulls an image before the containerd image store is
+# turned on: the image lands in the classic store, and the bundle built
+# from it cannot be installed on an air-gapped host (REL-2 S3 D13).
+SYNTHETIC_PULL_BEFORE_THE_STORE = """
+name: Synthetic
+on: workflow_dispatch
+jobs:
+  dry-run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: The published images, by digest
+        run: docker pull "$ref"
+"""
+
+# A workflow whose proof installs BEFORE the runner is cut off from the
+# registries, so the install is not air-gapped in fact.
+SYNTHETIC_INSTALL_BEFORE_THE_CUT = """
+name: Synthetic
+on: workflow_dispatch
+jobs:
+  install-proof:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install the bundle
+        run: ./lakehousectl install --bundle bundle
+      - name: Cut the runner off from the registries
+        run: |
+          echo "0.0.0.0 ghcr.io" | sudo tee -a /etc/hosts
 """
 
 
@@ -568,6 +631,90 @@ def reads_without_an_uploaded_file(document: dict[str, Any]) -> list[str]:
         if not any(entry_covers(entry, relative) for entry in entries):
             missing.append(path)
     return missing
+
+
+def step_index_or_none(document: dict[str, Any], job_name: str, name: str) -> int | None:
+    """Where a step sits in a job, or None when the job has no such step."""
+    for index, step in enumerate(steps_of(document, job_name)):
+        if str(step.get("name")) == name:
+            return index
+    return None
+
+
+def first_image_step(document: dict[str, Any], job_name: str) -> int | None:
+    """Where the job's first image pull or build sits.
+
+    A build is a `docker/build-push-action` step, a pull is a step whose
+    command pulls an image. Both put an image into the daemon's store,
+    and that store has to be the containerd one before either of them
+    runs (REL-2 S3 D13).
+    """
+    for index, step in enumerate(steps_of(document, job_name)):
+        if str(step.get("uses") or "").startswith("docker/build-push-action@"):
+            return index
+        if "docker pull" in str(step.get("run") or ""):
+            return index
+    return None
+
+
+def containerd_too_late(document: dict[str, Any], job_name: str) -> list[str]:
+    """Every job whose containerd step is missing, or after its first image.
+
+    A job that pulls or builds an image before the containerd store is
+    on puts that image in the classic store, and the bundle built from
+    it is a bundle no air-gapped host can install.
+    """
+    first = first_image_step(document, job_name)
+    if first is None:
+        return []
+    store = step_index_or_none(document, job_name, CONTAINERD_STEP)
+    if store is None or store >= first:
+        return [job_name]
+    return []
+
+
+def containerd_step_problems(document: dict[str, Any], job_name: str) -> list[str]:
+    """Every way the job's containerd step can be wrong."""
+    problems: list[str] = []
+    if step_index_or_none(document, job_name, CONTAINERD_STEP) is None:
+        return [f"{job_name}: the job never turns the containerd store on"]
+    run = str(step_named(document, job_name, CONTAINERD_STEP).get("run") or "")
+    for needle, what in (
+        ("daemon.json", "it does not touch /etc/docker/daemon.json"),
+        ("containerd-snapshotter", "it does not turn the feature on"),
+        ("jq", "it does not merge the daemon's own configuration"),
+        ("systemctl restart docker", "it does not restart Docker"),
+        ("io.containerd.snapshotter.v1", "it does not assert that the store is on"),
+    ):
+        if needle not in run:
+            problems.append(f"{job_name}: {what}")
+    return problems
+
+
+def air_gap_problems(document: dict[str, Any]) -> list[str]:
+    """Every way the proof's air gap can be missing.
+
+    The proof has to be air-gapped IN FACT: a runner that can still
+    pull would let Compose fetch the images the bundle should have
+    loaded, and the bug the proof exists for would stay hidden.
+    """
+    problems: list[str] = []
+    names = [str(step.get("name")) for step in steps_of(document, "install-proof")]
+    if AIR_GAP_STEP not in names:
+        return ["the proof has no air-gap step"]
+    if "Install the bundle" in names and names.index(AIR_GAP_STEP) > names.index(
+        "Install the bundle"
+    ):
+        problems.append("the proof installs before the runner is cut off")
+    run = str(step_named(document, "install-proof", AIR_GAP_STEP).get("run") or "")
+    if "/etc/hosts" not in run:
+        problems.append("the air-gap step does not touch /etc/hosts")
+    for host in REGISTRIES:
+        if host not in run:
+            problems.append(f"the air-gap step does not cut {host} off")
+    if "docker pull" not in run or "exit 1" not in run:
+        problems.append("the air-gap step does not prove that the cut holds")
+    return problems
 
 
 class ReleaseWorkflowTest(unittest.TestCase):
@@ -1058,6 +1205,54 @@ class ReleaseWorkflowTest(unittest.TestCase):
         """
         download = step_named(self.document, "install-proof", DOWNLOAD_STEP)
         self.assertEqual(str((download.get("with") or {}).get("path")), DRY_RUN_FOLDER)
+
+    def test_the_containerd_image_store_is_on_before_the_first_pull_or_build(self) -> None:
+        """REL-2 S3 D13: the bundle is saved from the containerd store.
+
+        The store has to be on before the job pulls or builds anything:
+        an image that lands in the classic store is an image whose
+        archive carries no digest an air-gapped host could resolve.
+        """
+        for job in ("dry-run", "release"):
+            self.assertEqual(containerd_too_late(self.document, job), [], job)
+
+    def test_a_job_that_pulls_before_the_store_is_on_is_reported(self) -> None:
+        """The check above must be able to fail."""
+        document = yaml.safe_load(SYNTHETIC_PULL_BEFORE_THE_STORE)
+        self.assertEqual(containerd_too_late(document, "dry-run"), ["dry-run"])
+
+    def test_every_job_turns_the_store_on_merges_the_configuration_and_asserts_it(self) -> None:
+        """The step does the whole job: merge, restart, assert.
+
+        The daemon's own configuration is merged rather than replaced,
+        Docker is restarted for the setting to take, and the store is
+        asserted — a step that turned the feature on and hoped is a
+        step that can build a bundle nobody can install.
+        """
+        for job in ("dry-run", "release", "install-proof"):
+            self.assertEqual(containerd_step_problems(self.document, job), [], job)
+
+    def test_the_proof_turns_the_containerd_image_store_on_before_the_install(self) -> None:
+        """The proof installs a bundle, so the store has to be on first."""
+        store = step_index_or_none(self.document, "install-proof", CONTAINERD_STEP)
+        self.assertIsNotNone(store, "the proof never turns the containerd store on")
+        install = step_index(self.document, "install-proof", "Install the bundle")
+        self.assertLess(store, install)
+
+    def test_the_proof_cuts_the_runner_off_from_the_registries_before_the_install(self) -> None:
+        """REL-2 S3 D13: the proof is air-gapped IN FACT.
+
+        Compose pulls silently when it may, so a runner with a path to
+        the registries would fetch the images the bundle should have
+        loaded — and the bug would stay hidden.
+        """
+        self.assertEqual(air_gap_problems(self.document), [])
+
+    def test_a_proof_that_installs_before_the_cut_is_reported(self) -> None:
+        """The check above must be able to fail."""
+        document = yaml.safe_load(SYNTHETIC_INSTALL_BEFORE_THE_CUT)
+        problems = air_gap_problems(document)
+        self.assertIn("the proof installs before the runner is cut off", problems)
 
 
 if __name__ == "__main__":

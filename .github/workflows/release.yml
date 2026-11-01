@@ -111,6 +111,45 @@ jobs:
           sudo docker image prune --all --force
           df -h /
 
+      # The containerd image store, and nothing else (REL-2 S3 D13).
+      #
+      # The bundle holds `docker save` archives, and the air-gapped host
+      # finds its images by the DIGEST the signed manifest pins: on
+      # Docker's classic store no `docker load` registers a repo digest,
+      # so the pinned reference never resolves there. The store is turned
+      # on BEFORE this job's first pull or build, so the images the job
+      # pulls back by digest land in the store the bundle is saved from.
+      #
+      # buildx builds in a builder container of its own, so the images it
+      # pushes are not in the runner's store: the job pulls them back by
+      # digest, and THAT pull is the one that has to happen on the
+      # containerd store.
+      #
+      # The daemon's own configuration is MERGED, not replaced: the
+      # runner's file may hold settings of its own.
+      - name: Turn on the containerd image store
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /etc/docker
+          if [ -f /etc/docker/daemon.json ]; then
+            sudo jq '.features = ((.features // {}) + {"containerd-snapshotter": true})' \
+              /etc/docker/daemon.json > "$RUNNER_TEMP/daemon.json"
+          else
+            echo '{"features": {"containerd-snapshotter": true}}' > "$RUNNER_TEMP/daemon.json"
+          fi
+          sudo cp "$RUNNER_TEMP/daemon.json" /etc/docker/daemon.json
+          sudo systemctl restart docker
+          # The store is ASSERTED, not assumed: a bundle built on the
+          # classic store cannot be installed on an air-gapped host.
+          store="$(docker info --format '{{json .DriverStatus}}')"
+          case "$store" in
+            *io.containerd.snapshotter.v1*) echo "the containerd image store is on: $store" ;;
+            *)
+              echo "::error::the containerd image store is not on: $store"
+              exit 1
+              ;;
+          esac
+
       - name: Setup Python
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
@@ -691,6 +730,33 @@ jobs:
           sudo docker image prune --all --force
           df -h /
 
+      # The containerd image store, and nothing else (REL-2 S3 D13).
+      # See the dry run's step of the same name for why: the bundle is
+      # made of `docker save` archives, and only the containerd store
+      # registers the digest an air-gapped host looks the image up by.
+      - name: Turn on the containerd image store
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /etc/docker
+          if [ -f /etc/docker/daemon.json ]; then
+            sudo jq '.features = ((.features // {}) + {"containerd-snapshotter": true})' \
+              /etc/docker/daemon.json > "$RUNNER_TEMP/daemon.json"
+          else
+            echo '{"features": {"containerd-snapshotter": true}}' > "$RUNNER_TEMP/daemon.json"
+          fi
+          sudo cp "$RUNNER_TEMP/daemon.json" /etc/docker/daemon.json
+          sudo systemctl restart docker
+          # The store is ASSERTED, not assumed: a bundle built on the
+          # classic store cannot be installed on an air-gapped host.
+          store="$(docker info --format '{{json .DriverStatus}}')"
+          case "$store" in
+            *io.containerd.snapshotter.v1*) echo "the containerd image store is on: $store" ;;
+            *)
+              echo "::error::the containerd image store is not on: $store"
+              exit 1
+              ;;
+          esac
+
       - name: Setup Python
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
@@ -1200,6 +1266,63 @@ jobs:
           cp "target/x86_64-unknown-linux-musl/release/lakehousectl" ../lakehousectl
           cd ..
           ./lakehousectl --version
+
+      # The containerd image store, and nothing else (REL-2 S3 D13).
+      #
+      # The bundle's images are loaded from `docker save` archives, and on
+      # Docker's classic store a loaded image registers no repo digest:
+      # the release's pinned references would not resolve, and the
+      # install would stop with "the image ... is not in the local
+      # store". The store is turned on BEFORE the install.
+      - name: Turn on the containerd image store
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /etc/docker
+          if [ -f /etc/docker/daemon.json ]; then
+            sudo jq '.features = ((.features // {}) + {"containerd-snapshotter": true})' \
+              /etc/docker/daemon.json > "$RUNNER_TEMP/daemon.json"
+          else
+            echo '{"features": {"containerd-snapshotter": true}}' > "$RUNNER_TEMP/daemon.json"
+          fi
+          sudo cp "$RUNNER_TEMP/daemon.json" /etc/docker/daemon.json
+          sudo systemctl restart docker
+          # The store is ASSERTED, not assumed: the installer refuses a
+          # classic store for a bundle install, and the proof has to
+          # prove the install, not the refusal.
+          store="$(docker info --format '{{json .DriverStatus}}')"
+          case "$store" in
+            *io.containerd.snapshotter.v1*) echo "the containerd image store is on: $store" ;;
+            *)
+              echo "::error::the containerd image store is not on: $store"
+              exit 1
+              ;;
+          esac
+
+      # The proof is AIR-GAPPED IN FACT (REL-2 S3 D13).
+      #
+      # A runner that can still reach the registries would hide the bug
+      # this proof exists for: Compose pulls silently when it may, so
+      # the install would pass with a FETCHED image instead of the
+      # LOADED one, and the air-gapped host would still be broken. The
+      # registries are cut off here, and the cut is PROVED before the
+      # install runs — a pull that still works means the runner has a
+      # way to the registries, and the proof is not air-gapped.
+      #
+      # The hosts are the ones the registries answer on: Docker Hub's
+      # registry, its authentication and its index, GHCR, Quay, and the
+      # CDN the Docker Hub layers come from.
+      - name: Cut the runner off from the registries
+        run: |
+          set -euo pipefail
+          for host in registry-1.docker.io auth.docker.io index.docker.io \
+            ghcr.io quay.io production.cloudflare.docker.com; do
+            echo "0.0.0.0 $host" | sudo tee -a /etc/hosts
+          done
+          if docker pull alpine:3.20; then
+            echo "::error::the runner can still pull from a registry: the proof is not air-gapped"
+            exit 1
+          fi
+          echo "the runner cannot pull from a registry any more."
 
       - name: Install the bundle
         env:
