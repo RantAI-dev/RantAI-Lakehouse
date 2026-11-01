@@ -679,6 +679,13 @@ async fn list_body(
 /// count may lag in a search result; the list a person opens without a
 /// term is still live. A console annotation edit does not wait for it
 /// (`put_annotation` drops the copy).
+///
+/// `DATA-38` D1: a copy older than this is no longer rebuilt under the
+/// person who is searching. It is served at once, and the rebuild runs
+/// behind it, so nobody waits for the five seconds the rebuild takes on a
+/// catalog of 10,000 tables. A copy older than
+/// [`crate::catalog_search_cache::MAX_STALE`] is not served at all: that
+/// read builds a new one and waits for it.
 const SEARCH_SNAPSHOT_TTL: Duration = Duration::from_secs(30);
 
 /// The search copy: what `list` assembles for a request, plus the columns
@@ -689,6 +696,9 @@ const SEARCH_SNAPSHOT_TTL: Duration = Duration::from_secs(30);
 /// shared [`AppState`] and no `Principal`, and the tenant check runs per
 /// request before this is called.
 ///
+/// `DATA-38` D3: the builder owns a clone of the state, so the cache can
+/// move it into the background task that rebuilds the copy.
+///
 /// # Errors
 ///
 /// Returns the [`ChError`] of the catalog read, like [`list_body`]; the
@@ -696,10 +706,12 @@ const SEARCH_SNAPSHOT_TTL: Duration = Duration::from_secs(30);
 async fn search_snapshot(
     state: &AppState,
 ) -> Result<Arc<crate::catalog_search_cache::CatalogSearchSnapshot>, ChError> {
+    let owner = Arc::new(state.clone());
     state
         .catalog_search_cache
-        .get_or_build(Instant::now(), SEARCH_SNAPSHOT_TTL, || {
-            build_search_snapshot(state)
+        .get_or_build(Instant::now(), SEARCH_SNAPSHOT_TTL, move || {
+            let owner = Arc::clone(&owner);
+            async move { build_search_snapshot(&owner).await }
         })
         .await
 }
@@ -5068,7 +5080,7 @@ mod tests {
             copy.assets = ids.iter().map(|id| json!({ "id": id })).collect();
             state
                 .catalog_search_cache
-                .get_or_build(Instant::now(), SEARCH_SNAPSHOT_TTL, || async {
+                .get_or_build(Instant::now(), SEARCH_SNAPSHOT_TTL, move || async move {
                     Ok::<_, String>(copy)
                 })
                 .await
@@ -5486,16 +5498,29 @@ mod tests {
         }
 
         /// Whether the next read of the copy runs its build.
+        ///
+        /// `DATA-38` D1: a read of an expired copy runs the build in the
+        /// background, so the helper waits for the build to report itself
+        /// before it reads the flag.
         async fn next_read_rebuilds(state: &AppState) -> bool {
-            let rebuilt = std::sync::atomic::AtomicBool::new(false);
+            let (built, build_ran) = tokio::sync::oneshot::channel::<()>();
+            let rebuilt = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let builder_flag = Arc::clone(&rebuilt);
             state
                 .catalog_search_cache
-                .get_or_build(Instant::now(), SEARCH_SNAPSHOT_TTL, || async {
-                    rebuilt.store(true, std::sync::atomic::Ordering::SeqCst);
-                    Ok::<_, String>(empty_copy())
+                .get_or_build(Instant::now(), SEARCH_SNAPSHOT_TTL, move || {
+                    let builder_flag = Arc::clone(&builder_flag);
+                    async move {
+                        builder_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                        let _ = built.send(());
+                        Ok::<_, String>(empty_copy())
+                    }
                 })
                 .await
                 .unwrap();
+            // A dropped sender means the build never ran; a send means it
+            // did. Either way the flag is read after that.
+            let _build_ran = tokio::time::timeout(Duration::from_secs(1), build_ran).await;
             rebuilt.load(std::sync::atomic::Ordering::SeqCst)
         }
 
