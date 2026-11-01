@@ -693,6 +693,50 @@ class ReleaseWorkflowTest(unittest.TestCase):
                 job,
             )
 
+    def test_the_dry_run_uploads_the_throwaway_public_key(self) -> None:
+        """The proof job verifies the manifest against the dry run's key.
+
+        The dry run signs its manifest with a throwaway key, so the
+        proof needs the PUBLIC half of it: the private half was thrown
+        away with the job.
+        """
+        step = step_named(self.document, "dry-run", "Upload the bundle and the manifest")
+        self.assertIn("cosign.pub", str(step.get("with", {}).get("path")))
+
+    def test_the_proof_job_installs_the_dry_runs_bundle(self) -> None:
+        """REL-2 S3-T5: the end-to-end proof.
+
+        The job takes the dry run's bundle — the bytes an air-gapped
+        host would be handed — and installs it on a clean runner.
+        """
+        steps = steps_of(self.document, "install-proof")
+        names = [str(step.get("name")) for step in steps]
+        self.assertIn("Download the dry run's bundle", names)
+        self.assertIn("Install the bundle", names)
+        self.assertIn("The stack is ready and the console answers", names)
+
+        install = step_named(self.document, "install-proof", "Install the bundle")
+        run = str(install.get("run"))
+        self.assertIn("--bundle", run)
+        self.assertIn("lakehousectl install", run)
+        self.assertIn("LAKEHOUSECTL_PUBLIC_KEY_FILE", str(install.get("env")))
+
+    def test_the_proof_job_builds_with_the_test_key_feature(self) -> None:
+        """The proof's bundle is signed with the throwaway key.
+
+        So the proof's binary is built with the feature that points a
+        build at another key — and the RELEASE job's build is not
+        (checked above).
+        """
+        step = step_named(self.document, "install-proof", "Build lakehousectl (the dry run's key)")
+        run = str(step.get("run"))
+        self.assertIn("--features test-key", run)
+
+    def test_the_proof_job_needs_the_dry_run(self) -> None:
+        """The proof installs what the dry run built."""
+        job = self.document["jobs"]["install-proof"]
+        self.assertEqual(job["needs"], "dry-run")
+
     def test_a_job_level_secret_is_reported(self) -> None:
         document = yaml.safe_load(SYNTHETIC_JOB_SECRET)
         self.assertEqual(

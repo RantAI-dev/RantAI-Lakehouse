@@ -600,8 +600,8 @@ jobs:
             echo "key was generated in this job."
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # The bundle and the manifest, as artifacts: this is what the
-      # dry run produces.
+          # The bundle and the manifest, as artifacts: this is what the
+          # dry run produces.
       - name: Upload the bundle and the manifest
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -614,6 +614,12 @@ jobs:
             docker-compose.release.yml
             lakehousectl-linux-x86_64
             sbom/*.cdx.json
+            # The PUBLIC half of the throwaway key: the proof job
+            # verifies the manifest against it, because the dry run
+            # signed the manifest with the key that generated it
+            # (REL-2 S3-T5). The private half was thrown away with the
+            # job.
+            cosign.pub
           retention-days: 7
           if-no-files-found: error
 
@@ -1075,3 +1081,94 @@ jobs:
             --title "RantAI Lakehouse v$version" \
             --notes-file release-notes.md \
             release-assets/*
+
+  # ── The proof: the bundle installs ──────────────────────────────────
+  install-proof:
+    name: Proof · the bundle installs on a fresh host
+    # REL-2 S3-T5: the end-to-end proof that what the pipeline builds
+    # can be installed.
+    #
+    # The job takes the dry run's bundle — the same bytes an air-gapped
+    # host would be handed — and installs it on a clean runner. It is
+    # the only place the whole path is exercised: the manifest's
+    # signature, the images' IDs, the secrets, the layout and the
+    # readiness of the stack.
+    #
+    # It never runs for a tag push: the dry run does not run then, and
+    # a job that needs it is skipped with it.
+    needs: dry-run
+    runs-on: ubuntu-latest
+    # 90 minutes: the bundle is unpacked, every image is loaded, and
+    # the stack is started and waited for.
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Free disk first: the runner image carries toolchains this job
+      # never uses, and the job unpacks the bundle and loads every image
+      # in it.
+      - name: Free runner disk
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost /usr/local/share/powershell /usr/local/share/chromium /usr/local/share/pip /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          df -h /
+
+      - name: Download the dry run's bundle
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-dry-run
+          path: dry-run
+
+      # The installer, built WITH the `test-key` feature: the dry run
+      # signed its manifest with the throwaway key the job generated, so
+      # the proof has to verify against THAT key. A release build never
+      # has the feature — the release job's own build is checked for
+      # that by `ops/release/test_release_workflow.py` — so a release
+      # can never accept another key (REL-2 S3-T1).
+      - name: Build lakehousectl (the dry run's key)
+        run: |
+          set -euo pipefail
+          rustup target add x86_64-unknown-linux-musl
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+          cd rust
+          cargo build --release --target x86_64-unknown-linux-musl \
+            -p lakehousectl --features test-key
+          cp "target/x86_64-unknown-linux-musl/release/lakehousectl" ../lakehousectl
+          cd ..
+          ./lakehousectl --version
+
+      - name: Install the bundle
+        env:
+          # The PUBLIC half of the throwaway key the dry run signed the
+          # manifest with. The private half was thrown away with the
+          # dry run's job.
+          LAKEHOUSECTL_PUBLIC_KEY_FILE: ${{ github.workspace }}/dry-run/cosign.pub
+        run: |
+          set -euo pipefail
+          mkdir -p bundle install
+          tar --zstd -xf dry-run/rantai-lakehouse-*.tar.zst -C bundle
+          # The runner's disk and memory are below the release's
+          # minimums, so the two checks are skipped — and the install
+          # says which checks it skipped. The minimums themselves are
+          # proved by the operator's acceptance checklist (REL-2-AC3),
+          # not by a runner.
+          ./lakehousectl install --bundle bundle --dir install \
+            --ignore-preflight disk --ignore-preflight memory
+
+      - name: The stack is ready and the console answers
+        run: |
+          set -euo pipefail
+          echo "the readiness route:"
+          curl -fsS http://127.0.0.1:8080/health/ready | jq .
+          echo "the console:"
+          curl -fsS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:3000/
+
+      - name: The stack's state
+        if: always()
+        run: |
+          docker compose -p rantai-lakehouse ps || true
