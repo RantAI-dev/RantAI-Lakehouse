@@ -318,3 +318,28 @@ left.
 
 Kept in the planner's thread. Its numbers are quoted in section 0, and its `file:line` anchors
 were checked against `5661a043` when this plan was written.
+
+### Review round 1 (planner, 2026-11-01, at `07311a25`)
+
+- **T2 (D2).** `SearchIndex` is built once with the copy, and `search()` takes it. Every
+  earlier `catalog_search` test passes unchanged, which is the proof the matching rules did not
+  move.
+- **T3 (D6).** `apply_filters` works in place on the owned matches. The route sorts before it
+  filters, which gives the same order and makes no copy. This is a reported deviation from "by
+  reference", and an acceptable one.
+- **T4 (D3).** `limit` is 1..200, with a 400 outside that range. It applies after ranking, and
+  `total` is the full count. With no `limit` the answer is the same as before. The palette asks
+  for 8. The order is contract, client, then feature.
+- **T5 (D4, D5).** The copy is built at start-up in the background (`spawn_startup_search_copy`),
+  and a failure is logged. The bench gains `--after-expiry`, and the workflow passes it.
+- **T1 (D1).** `BronzeRegistry` keys the sync rows and the column counts by slug, once per
+  assembly. `or_insert` keeps the first row, as `.find()` did. The test compares against the
+  old scan over 400 assets, and two deliberate breakages of the new code make it fail.
+- **The merge with DATA-40.** It was resolved hunk by hunk. One clash git could not see, the
+  `search_limit` mock answering every statement that names `dataset_catalog`, is fixed in its
+  own commit (`0a70e87e`).
+- The developer's bluefin bench, before T1: p95 270.8 ms and 151.7 ms, with `afterExpiryMs`
+  149.5 ms.
+
+**Open: no BLOCKER, no SHOULD-FIX.** DATA-41 is Done only after the planner's bench on `main`
+shows p95 under 500 ms on both routes (section 2).
