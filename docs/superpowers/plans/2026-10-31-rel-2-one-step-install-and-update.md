@@ -880,6 +880,132 @@ and the install would refuse a good bundle. So:
   file, default profile). Whether a GitHub runner has the memory and the disk for it is a
   runner fact, and the PR's own CI answers it.
 
+### Fixes for review S3 round 1 (developer, 2026-11-01)
+
+**Commits** (branch `feat/rel-2-s3-lakehousectl-install`, base `b0855ae8`), one per finding:
+
+| Commit | Finding | What |
+| --- | --- | --- |
+| `a5f49eca` | REL-2 S3 review round 1 BLOCKER 1 | the online install reads the release into memory |
+| `f34f19e2` | REL-2 S3 review round 1 SHOULD-FIX 2 | the bundle's image tars are hashed, not just named |
+| `5757949d` | REL-2 S3 review round 1 SHOULD-FIX 3 | a second install does not overwrite the first one's state |
+| `bf0f7c43` | REL-2 S3 review round 1 SHOULD-FIX 4 | the administrator's email is the one the `.env` holds |
+| `38ccc6f4` | REL-2 S3 review round 1 SHOULD-FIX 5 | the installer script leaves nothing behind |
+
+**BLOCKER 1 (`a5f49eca`).** The online install wrote the release's three assets into
+`temp_dir()/lakehousectl-release-<version>`, with `create_dir_all` and `curl --output`. The
+installer runs as root, and that name is a name anybody can guess: a local user who creates the
+directory first, with a symlink at `release.json`, has root write the file it points at, and a
+directory an earlier run left behind was reused as it was.
+
+The assets are small text files, so they are read into memory and nothing is written at all:
+
+- `sys::output_bytes` runs a command and returns its standard output byte for byte — not trimmed,
+  because the manifest's signature is over its exact bytes (`sys::output` is now that plus the
+  trimming it always did, and its doc says what it always did);
+- `install::download` reads one asset with `curl` to its standard output, and `install::asset_url`
+  names the three URLs;
+- the temporary directory is not touched any more: there is no path of the tool's own for another
+  local user to own.
+
+The download is injected (`obtain_with`), so a test drives the online path with no network: it
+holds the three assets that are asked for, and that the temporary directory holds nothing of the
+tool's own before and after. A second test holds `sys::output_bytes` to the exact bytes (a
+trailing newline is part of the answer).
+
+**SHOULD-FIX 2 (`f34f19e2`).** `checksums_cover()` asked whether a line of the bundle's
+`SHA256SUMS` named the tar, and never hashed it: a copy damaged on its way to the host was loaded
+as it was, and `docker load` was the first thing that noticed. Each `images/<name>.tar` is now
+hashed with SHA-256 and compared with its own line BEFORE the load:
+
+- `checksum_of` reads the digest the list names for a file (the paths are relative to the bundle's
+  root, as `sha256sum` writes them);
+- `sha256_of` hashes the file in pieces — an image tar is hundreds of megabytes, and the installer
+  has no reason to hold one in memory;
+- `verify_checksum` refuses a file the list does not name, and a file whose digest differs, with
+  the message that says what does not match.
+
+The bundle's `SHA256SUMS` is not signed, and the code says so: this check catches damage, and the
+TRUST check stays the image's ID against the SIGNED manifest's `imageIds`. Three tests: a file
+that matches its checksum is accepted, a damaged one is refused with the file named, and a file
+the list does not name is refused.
+
+**SHOULD-FIX 3 (`5757949d`).** `write_layout()` always rewrote `state.json` — `previousVersion:
+null`, `lastBackup: null` — so a second install over the first one's directory threw away the
+state of the install that was there, for ANY release and with nothing said. The install now reads
+the state before it writes anything:
+
+- the SAME release may be installed again, and `state.json` is kept as it is: the previous version
+  and the last backup of the first install survive a re-run;
+- any OTHER release is refused, and the refusal names the release that is there and points at
+  `lakehousectl update`, the command that installs another release (REL-2 S4);
+- a `state.json` that names no release is refused rather than overwritten: the tool cannot tell
+  what is installed, and it fails closed.
+
+The release's own files — the Compose file, the manifest and its signature — are written again:
+they are the bytes of the release, checked against the signed manifest, so a re-install of the
+same release writes the same bytes. Three tests: the state survives a re-install of the same
+release, another release is refused with the update named, and a state that names no release is
+refused and left alone.
+
+**SHOULD-FIX 4 (`bf0f7c43`).** With an existing `.env`, `secrets::write_env()` read
+`AUTH_BOOTSTRAP_EMAIL` from the compiled-in template, so a re-install printed
+`admin@example.com` while the stack was configured with the address the operator had put in the
+file. The email is now read from the `.env` that is there. Two tests: a fresh `.env` takes the
+email from the template, and an existing `.env` gives back the email it holds.
+
+**SHOULD-FIX 5 (`38ccc6f4`).** `install.sh` ended with `exec "$work/$BINARY" install "$@"`.
+`exec` replaces the shell, so the `EXIT` trap that removes `$work` never ran, and the downloaded
+binary stayed on the host after every install. The installer is run instead of exec'd, and the
+script exits with the installer's own status. Two tests: the files the script downloaded are gone
+when it ends, and the script's status is the installer's status. The first was checked against the
+OLD script, where it fails with "the binary was left behind".
+
+**Commands run, in the foreground, on the final commit `38ccc6f4`:**
+
+| Command | Result |
+| --- | --- |
+| `cargo fmt --check` (the whole workspace, through `bin/cargo-locked`) | clean, no diff |
+| `cargo clippy -p lakehousectl --all-targets -- -D warnings` | clean, no warning and no error |
+| `cargo test -p lakehousectl` | **53 passed, 0 failed** (43 before this round, 10 new) |
+| `bash -n ops/release/install.sh` | clean, exit 0 |
+| `shellcheck ops/release/install.sh` (0.10.0) | clean, exit 0 |
+| `python -m pytest ops/release -q` | **132 passed, 0 failed** (130 before this round, 2 new) |
+| `python3 -m unittest discover -s ops/release -p 'test_*.py'` | **132 tests, OK** |
+| `python3 ops/lint/check_intra_package_imports.py` | OK |
+| `python3 ops/lint/check_bare_iceberg_count.py` | no violation |
+| `git status` | clean (nothing generated staged) |
+
+Every cargo command went through `/home/shiro/rantai/bin/cargo-locked` (the `bin/cargo-locked` of
+the earlier rounds is not in the repository), in the foreground, on the shared
+`CARGO_TARGET_DIR`; no `cargo clean`; no workspace build. The pytest run used a virtualenv's
+interpreter (`/tmp/opencode/relvenv/bin/python -m pytest ops/release -q`): the system Python is
+externally managed (PEP 668), so `pip install --user pytest` is refused, and the virtualenv
+carries `pytest==8.3.4` over the system site packages (PyYAML, cryptography). `shellcheck`
+(0.10.0) is not installed on this machine; it was already downloaded to `/tmp/opencode/bin` by
+the earlier rounds of this slice.
+
+**Not verified, with the reason:**
+
+- **The PR's dry run and the `install-proof` job are not verified.** They need a GitHub runner:
+  the four images, the throwaway registry, cosign, syft, a multi-GiB bundle, and the whole stack
+  started on it. The PR's own CI is the proof.
+- **The online download was not exercised against GitHub.** The test drives the online path with
+  an injected fetch, and the `curl` call is the same one `install.sh` uses, but no real release
+  was downloaded here: the release key and the releases are not on this machine.
+- **The whole install was not run end to end.** It needs a manifest signed with the release key,
+  and that key is in the `release` environment's secrets.
+- **The static musl build is not verified here.** The `x86_64-unknown-linux-musl` target and
+  `musl-tools` are not installed on this machine, and the pipeline installs both. The binary was
+  built and tested natively — the same source, the same features, the same dependencies.
+- **The full workspace run** (`cargo clippy --workspace --all-targets --all-features` and
+  `cargo test --workspace`): not run here — this slice's machine rules say CI runs them; the crate
+  was clipped with `--all-targets` and tested.
+- **No bun command, no Dagster command and no Compose command ran**: this round changes no
+  TypeScript, no code location and no Compose file.
+- **`cargo deny check all` was not run** in this round: no dependency changed (the crate's
+  `Cargo.toml` is untouched), and the earlier round of this slice ran it green.
+
 ## 7. Review (planner appends below)
 
 ### Review S1 round 1 (planner, 2026-10-31, at `f79d4235`)
