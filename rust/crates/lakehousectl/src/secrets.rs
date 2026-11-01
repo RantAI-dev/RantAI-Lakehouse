@@ -84,8 +84,13 @@ pub fn write_env(path: &Path) -> Result<Secrets, std::io::Error> {
         // Never overwritten. The mode is still set: a `.env` an
         // operator copied around must not be readable by anyone else.
         set_owner_only(path)?;
+        // The administrator's email is the one the file HOLDS, not the
+        // template's: the operator may have changed it, and the
+        // address the tool prints is the one the stack will use (REL-2
+        // S3 review round 1 SHOULD-FIX 4).
+        let text = std::fs::read_to_string(path)?;
         return Ok(Secrets {
-            admin_email: read_value(ENV_EXAMPLE, "AUTH_BOOTSTRAP_EMAIL").unwrap_or_default(),
+            admin_email: read_value(&text, "AUTH_BOOTSTRAP_EMAIL").unwrap_or_default(),
             admin_password: None,
         });
     }
@@ -324,6 +329,36 @@ mod tests {
             "the first run generated a password"
         );
         assert_eq!(second.admin_password, None, "the password is shown once");
+    }
+
+    #[test]
+    fn a_fresh_env_takes_the_administrators_email_from_the_template() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join(".env");
+        let secrets = write_env(&path).expect("the .env is written");
+        assert_eq!(
+            secrets.admin_email,
+            read_value(ENV_EXAMPLE, "AUTH_BOOTSTRAP_EMAIL").unwrap_or_default(),
+            "the email of a fresh install is the template's"
+        );
+    }
+
+    #[test]
+    fn the_administrators_email_is_the_one_the_env_holds() {
+        // The operator changed it: the address the tool prints is the
+        // one the stack will use, not the template's (REL-2 S3 review
+        // round 1 SHOULD-FIX 4).
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join(".env");
+        std::fs::write(&path, "AUTH_BOOTSTRAP_EMAIL=operator@example.org\n")
+            .expect("the .env is written");
+
+        let secrets = write_env(&path).expect("the .env is read");
+        assert_eq!(
+            secrets.admin_email, "operator@example.org",
+            "the email of the template was shown instead of the one the .env holds"
+        );
+        assert_eq!(secrets.admin_password, None, "the password is shown once");
     }
 
     #[test]
