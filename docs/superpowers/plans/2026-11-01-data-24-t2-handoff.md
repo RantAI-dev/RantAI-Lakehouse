@@ -134,3 +134,25 @@ There is no `bin/cargo-locked` in this checkout, so plain cargo with `-j 1`.
    the two registries, a slug present in both is counted by the first branch only. That is
    pre-existing behaviour and was not changed here; the fake puts `orders` in one registry and
    `returns` in the other, so the tests do not pin that behaviour either way.
+
+## Review (planner, 2026-11-01, at `0697469c`)
+
+- **D2.**
+  - Both `dataset_column` reads in `search_column_index`, and the per-slug column count, read
+    with `FINAL`, as the asset-detail query does.
+  - The seed declares both tables `ReplacingMergeTree ORDER BY (slug, key_asli)`, matching
+    `bronze_catalog.py`.
+- **The two `wiremock` tests** model the engine's answer with and without `FINAL`, and both fail
+  with it removed. The developer also checked the seed and the `FINAL` behaviour on a real
+  ClickHouse 26.8.
+- **The bench's tests** are wired into `ci.yml`, as the review of T1 and T3 asked.
+- **The developer's counts:** fmt and clippy are clean, and `cargo test -p lakehouse-api
+  catalog` gives 550 pass.
+- **The developer's three findings** become backlog item `DATA-39`, in the planner's docs PR:
+  - two more reads of the registry without `FINAL`, in the assistant's code (`ai/data_map.rs`,
+    `ai/tools/data.rs`);
+  - the seed's other two registry tables are still `MergeTree`;
+  - `list_body`'s column count takes the first row.
+
+**Open: no BLOCKER, no SHOULD-FIX.** After this merges, the planner re-runs the bench and adds a
+row to `DATA-11-RESULT.md`.
