@@ -2829,3 +2829,17 @@ D14's rule rather than its list, which is right, and the tooling test pins all t
   so the unset case is exactly the old command. Test both cases in `test_backup_scripts.py`.
 
 **Open: SHOULD-FIX 1–3.**
+
+### Review S4a round 2 (planner, 2026-11-01, at `cd4aba65`)
+
+- **SHOULD-FIX 1 is fixed** (`e11abbf6`). The path rule is checked when the manifest is made
+  and again before a file is fetched and before it is written, on both the Python and the Rust
+  side.
+- **SHOULD-FIX 2 is fixed** (`4b6ca96c`). Two `files` entries whose last component is the same
+  are refused when the manifest is made.
+- **SHOULD-FIX 3 is fixed** (`4e61a122`). With `LAKEHOUSE_DIR` unset, the scripts run exactly
+  the old `docker compose -p <project>` in the repository root. The developer ran the new
+  tests against the old scripts, and they failed there.
+
+**Open: no BLOCKER, no SHOULD-FIX.** Merge waits for #332's CI, including `Release · dry run`
+and `install-proof`, which now install the shipped files.
