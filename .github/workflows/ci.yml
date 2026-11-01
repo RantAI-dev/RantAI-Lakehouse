@@ -136,6 +136,57 @@ jobs:
           python3 -m unittest discover -s ops/lint -p 'test_*.py'
           python3 -m unittest discover -s ops/gates -p 'test_*.py'
 
+      # REL-2 S2-T1 … S2-T3: the release tooling (the version check, the
+      # Compose renderer, the manifest). Its own tests are pytest cases;
+      # `setup-python` pins the interpreter because the version check
+      # reads the crate's manifest with `tomllib`, which is in the
+      # standard library from 3.11. `pyyaml` is here for the release
+      # WORKFLOW's own tests, which parse `.github/workflows/release.yml`.
+      # `cryptography` is here for the Sigstore bundle's test, which
+      # verifies the manifest's signature the way `lakehousectl` will
+      # (REL-2 S2 D3a); the pin is the one `dagster/pyproject.toml`
+      # already uses.
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Unit-test the release tooling (REL-2 S2)
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest==8.3.4 pyyaml==6.0.3 cryptography==50.0.2
+          python -m pytest ops/release -q
+
+      # REL-2 S2-T2: the release's Compose file is RENDERED from the
+      # template, and the rendered file is what an operator deploys — so
+      # the render is proved here, on every PR, not only when a release
+      # is cut. The digests are placeholders: the real ones come from the
+      # registry when the pipeline pushes the images, and `compose config`
+      # does not look at them.
+      #
+      # The env values are throwaway: the template has no default
+      # credentials (SEC-18), so compose refuses to interpolate a missing
+      # `${VAR:?}` before it will even parse the file.
+      - name: Check the release Compose file renders (REL-2 S2)
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/release-check.env" <<'EOF'
+          POSTGRES_PASSWORD=ci-only-pg-password-0001
+          RUSTFS_ACCESS_KEY=ci-only-rustfs-access-0001
+          RUSTFS_SECRET_KEY=ci-only-rustfs-secret-0001
+          LAKEKEEPER_ENCRYPTION_KEY=ci-only-lakekeeper-key-0001
+          CONNECTOR_SECRETS_KEY=ci-only-connector-secrets-key-0001
+          EOF
+          digests=$(jq -n --slurpfile map ops/release/release-images.json '
+            reduce ($map[0] | keys[]) as $name
+              ({}; .[$name] = ("ghcr.io/rantai-dev/" + $name + ":0.0.0@sha256:" + ("0" * 64)))')
+          images=$(jq -n --argjson digests "$digests" --slurpfile map ops/release/release-images.json '
+            reduce ($map[0] | to_entries[]) as $entry
+              ({}; reduce ($entry.value[]) as $service (.; .[$service] = $digests[$entry.key]))')
+          python3 ops/release/render_compose.py --images "$images" -o "$RUNNER_TEMP/release-compose.yml"
+          docker compose --env-file "$RUNNER_TEMP/release-check.env" \
+            -f "$RUNNER_TEMP/release-compose.yml" --profile '*' config --quiet
+
   # ── Frontend ────────────────────────────────────────────────────────
   verify:
     name: Frontend · Lint · Typecheck · Test · Build
