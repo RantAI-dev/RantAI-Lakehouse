@@ -387,12 +387,20 @@ Until that is done, `docker pull ghcr.io/rantai-dev/rantai-lakehouse-api:<versio
 4. the release's Compose file is RENDERED from the template
    (`ops/release/render_compose.py`): every image the repository builds names the
    published image at its digest, and the gate and test services are gone;
-5. `ops/release/make_manifest.py` writes `release.json` — the version, every image's
-   digest, the Compose file's checksum, and the upgrade path;
-6. the manifest is signed into `release.json.sigstore.json` and the bundle verified at once,
+5. the THIRD-PARTY images the rendered file runs (Postgres, ClickHouse, Lakekeeper,
+   OpenFGA, RustFS, Gotenberg, the init images, and the `trino`, `seaweedfs` and
+   `backups` profiles) are pulled by digest, and a CycloneDX SBOM is written for each of
+   them with the same syft the SBOM action installs. They are **not** signed: we cannot
+   sign another project's image in its own registry, so their integrity comes from the
+   digest in the signed manifest (`ops/release/compose_images.py` says which images are
+   whose);
+6. `ops/release/make_manifest.py` writes `release.json` — the version, every image's
+   digest (ours from the published digests, the third-party ones from the rendered
+   Compose file), the Compose file's checksum, and the upgrade path;
+7. the manifest is signed into `release.json.sigstore.json` and the bundle verified at once,
    offline;
-7. `ops/release/make_bundle.sh` writes the offline bundle and prints its size;
-8. the release is created as a draft (the real run only).
+8. `ops/release/make_bundle.sh` writes the offline bundle and prints its size;
+9. the release is created as a draft (the real run only).
 
 The tooling is under `ops/release/`, and its own tests run in the `Repo lints` job of
 `ci.yml` (`python -m pytest ops/release`) and at the start of both pipeline jobs.

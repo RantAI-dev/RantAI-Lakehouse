@@ -24,6 +24,19 @@ What it does
 `make_manifest.py` reads the published images (service -> `ref@sha256:…`),
 the rendered Compose file and the upgrade path, and writes the manifest.
 
+The manifest names EVERY image the release runs, keyed by the service that
+runs it:
+
+- ours come from the published digests, which the pipeline read back from
+  the registry;
+- the third-party ones come from the rendered Compose file, which the S1
+  lint already pinned by digest.
+
+A third-party image without a digest is refused. The bundle holds one
+`docker save` per image the manifest names (REL-2 S2 review round 6
+BLOCKER 1), so an image the manifest does not name is an image the
+air-gapped host cannot run.
+
 The upgrade path
 ----------------
 `minFrom` DEFAULTS to two minor versions back: the spec says "a direct
@@ -68,6 +81,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+RELEASE_DIR = Path(__file__).resolve().parent
 UPGRADE_PATH = REPO_ROOT / "ops" / "release" / "upgrade-path.json"
 
 SCHEMA_VERSION = 1
@@ -83,6 +97,15 @@ if str(LINT_DIR) not in sys.path:
     sys.path.insert(0, str(LINT_DIR))
 
 import check_image_digests  # noqa: E402  (path set just above)
+
+# The rule "which image does this service run", and which of them are
+# ours: the same file the release pipeline asks for the third-party
+# images (rule 4 — one rule, one place, or the bundle and the manifest
+# drift apart).
+if str(RELEASE_DIR) not in sys.path:
+    sys.path.insert(0, str(RELEASE_DIR))
+
+import compose_images  # noqa: E402  (path set just above)
 
 
 class ManifestError(RuntimeError):
@@ -148,11 +171,50 @@ def read_upgrade_path(path: Path) -> dict[str, dict[str, object]]:
     return releases
 
 
+def manifest_images(
+    compose_text: str, published_images: dict[str, str]
+) -> dict[str, str]:
+    """Every image the release runs, service by service.
+
+    OURS come from the published digests: the pipeline built them,
+    pushed them and read their digests back from the registry. THEIRS
+    come from the rendered Compose file, which the S1 lint already
+    pinned by digest.
+
+    A third-party image without a digest is refused. The manifest is
+    what the operator's signature covers, and a tag is a name and a name
+    moves: a manifest that names a tag promises bytes it cannot name.
+    """
+    images: dict[str, str] = {}
+    for service, reference in compose_images.compose_images(compose_text).items():
+        published = published_images.get(service)
+        if published is not None:
+            if not check_image_digests.check_image(published):
+                raise ManifestError(
+                    f"the published image of service `{service}` carries no "
+                    f"digest: {published}. A tag is a name and a name moves; "
+                    f"the manifest must name a digest."
+                )
+            images[service] = published
+            continue
+        if not check_image_digests.check_image(reference):
+            raise ManifestError(
+                f"the image of service `{service}` carries no digest: "
+                f"{reference}. A tag is a name and a name moves; the manifest "
+                f"must name a digest."
+            )
+        images[service] = reference
+
+    if not images:
+        raise ManifestError("the manifest needs at least one image")
+    return images
+
+
 def build_manifest(
     *,
     version: str,
     git_sha: str,
-    images: dict[str, str],
+    published_images: dict[str, str],
     compose_path: Path,
     created_at: str,
     upgrade_path: Path = UPGRADE_PATH,
@@ -165,16 +227,8 @@ def build_manifest(
             f"the git sha {git_sha!r} is not a hexadecimal commit sha"
         )
 
-    if not images:
-        raise ManifestError("the manifest needs at least one image")
-
-    for service, reference in sorted(images.items()):
-        if not check_image_digests.check_image(reference):
-            raise ManifestError(
-                f"the image of service `{service}` carries no digest: "
-                f"{reference}. A tag is a name and a name moves; the manifest "
-                f"must name a digest."
-            )
+    compose_text = compose_path.read_text(encoding="utf-8")
+    images = manifest_images(compose_text, published_images)
 
     requirements = read_upgrade_path(upgrade_path).get(version, {})
     if not isinstance(requirements, dict):
@@ -219,29 +273,6 @@ def write_manifest(manifest: dict[str, object], path: Path) -> None:
     )
 
 
-def load_images(value: str) -> dict[str, str]:
-    """The published images, from an inline JSON document or a file."""
-    text = value.strip()
-    if text.startswith("{"):
-        document = text
-    else:
-        document = Path(value).read_text(encoding="utf-8")
-    try:
-        data = json.loads(document)
-    except ValueError as error:
-        raise ManifestError(f"the --images document is not JSON: {error}") from error
-    if not isinstance(data, dict):
-        raise ManifestError("the --images document must be a JSON object")
-    images: dict[str, str] = {}
-    for name, reference in data.items():
-        if not isinstance(name, str) or not isinstance(reference, str):
-            raise ManifestError(
-                "the --images document must map a service name to an image reference"
-            )
-        images[name] = reference
-    return images
-
-
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Write the release manifest, release.json.",
@@ -249,10 +280,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--version", required=True, help="the release version")
     parser.add_argument("--git-sha", required=True, help="the commit the release is built from")
     parser.add_argument(
-        "--images",
+        "--published-images",
         required=True,
         help="the published images, as JSON: service -> ref@sha256:… "
-        "(inline JSON or a path to a .json file)",
+        "(inline JSON or a path to a .json file). The third-party images "
+        "come from the rendered Compose file.",
     )
     parser.add_argument(
         "--compose",
@@ -280,16 +312,16 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     try:
-        images = load_images(args.images)
+        published_images = compose_images.load_published(args.published_images)
         manifest = build_manifest(
             version=args.version,
             git_sha=args.git_sha,
-            images=images,
+            published_images=published_images,
             compose_path=args.compose,
             created_at=args.created_at or now_utc(),
             upgrade_path=args.upgrade_path,
         )
-    except (ManifestError, OSError) as error:
+    except (ManifestError, compose_images.ComposeImagesError, OSError) as error:
         print(f"make_manifest failed: {error}", file=sys.stderr)
         return 1
 

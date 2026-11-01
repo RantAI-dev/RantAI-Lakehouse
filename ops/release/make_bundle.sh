@@ -19,6 +19,11 @@
 #                             REFERENCE, so the host needs no registry:
 #                             `docker load` reads the file and the loaded
 #                             image is the one the manifest names.
+#                             EVERY image the release runs is here, the
+#                             third-party ones included: the manifest
+#                             names them all, and an image the manifest
+#                             does not name is an image the air-gapped
+#                             host cannot run.
 #   sbom/<name>.cdx.json      the CycloneDX SBOM of each image
 #   SHA256SUMS                every file's checksum, so an operator can
 #                             check the bundle before installing it
@@ -72,17 +77,14 @@ require_command() {
     command -v "$1" > /dev/null 2>&1 || fail "$1 is needed and is not installed."
 }
 
-# The name a bundle file carries: the reference's repository name without
-# its tag. `ghcr.io/rantai-dev/rantai-lakehouse-api:0.2.0@sha256:…` is
-# `rantai-lakehouse-api`, and the SBOM of that image is expected to be
-# `sbom/rantai-lakehouse-api.cdx.json` — the same rule the pipeline uses
-# when it writes the SBOMs.
-image_name() {
-    local reference="$1"
-    local without_digest="${reference%%@*}"
-    local last="${without_digest##*/}"
-    printf '%s\n' "${last%%:*}"
-}
+# The name one image's files carry in the bundle: the reference's
+# repository name without its tag. The rule lives in its own file, so
+# the bundle and the pipeline that writes the SBOMs agree on the names
+# (rule 4: one rule, one place, or the bundle looks for a file nobody
+# wrote).
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=ops/release/image_name.sh
+source "$script_dir/image_name.sh"
 
 manifest=""
 compose=""
@@ -143,10 +145,29 @@ cp "$sigstore_bundle" "$stage/release.json.sigstore.json"
 # One `docker save` per image, by digest reference: the host that loads
 # the bundle gets the exact image the manifest names, with no registry to
 # ask. `unique` because several services run the same image.
+#
+# The image must be in the local store: ours are (the pipeline pulled
+# them back by digest after it pushed them), and the third-party ones
+# are pulled here if they are not. The manifest names every image the
+# release runs, so a missing one is a bundle an operator cannot install
+# — the pull is what makes it installable.
+names="$stage/.names"
+: > "$names"
 while read -r reference; do
     [ -n "$reference" ] || continue
     name="$(image_name "$reference")"
     [ -n "$name" ] || fail "the image reference $reference names no image."
+    # One name is one file in the bundle: two references with the same
+    # name would overwrite each other's tar, and the bundle would hold
+    # one of them under the other's name.
+    if grep -Fq -- "${name}"$'\t' "$names"; then
+        fail "two images of the bundle share the name \`$name\`. One name is one file."
+    fi
+    printf '%s\t%s\n' "$name" "$reference" >> "$names"
+    if ! docker image inspect "$reference" > /dev/null 2>&1; then
+        echo "make_bundle: pulling $reference"
+        docker pull "$reference"
+    fi
     echo "make_bundle: saving $name"
     docker save -o "$stage/images/$name.tar" "$reference"
     if [ ! -f "$sbom_dir/$name.cdx.json" ]; then

@@ -6,12 +6,13 @@ carries are the only thing that says "these are the bytes the release
 published". These tests build a bundle and check that every checksum in
 it matches the file it names.
 
-`docker save` is stood in for: the test puts a script named `docker` on
-the PATH that writes a file instead of saving an image. The bundle's own
-logic — what it collects, what it hashes, what it names — is what is
-under test here; that a real image can be saved and loaded is proven by
-the release pipeline's own dry run, which saves the four published
-images into a real bundle.
+`docker` is stood in for: the test puts a script named `docker` on the
+PATH that writes a file instead of saving an image, and that records
+what it was asked to do. The bundle's own logic — what it collects, what
+it hashes, what it names, what it pulls — is what is under test here;
+that a real image can be saved and loaded is proven by the release
+pipeline's own dry run, which saves every image the release runs into a
+real bundle.
 """
 
 from __future__ import annotations
@@ -29,26 +30,44 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 BUNDLE_SCRIPT = Path(__file__).resolve().parent / "make_bundle.sh"
 
 DIGEST = "sha256:" + "a" * 64
+THIRD_PARTY_DIGEST = "sha256:" + "b" * 64
 IMAGE = f"ghcr.io/rantai-dev/rantai-lakehouse-api:0.2.0@{DIGEST}"
+THIRD_PARTY_IMAGE = f"postgres:16.15@{THIRD_PARTY_DIGEST}"
 
 FAKE_DOCKER = """#!/usr/bin/env bash
-# A stand-in for `docker save`: it writes a file that stands for the
-# image, so the bundle's logic can be tested without a daemon.
+# A stand-in for the docker commands the bundle script runs: it writes
+# a file that stands for the image, so the bundle's logic can be tested
+# without a daemon. It records what it was asked to do in
+# $FAKE_DOCKER_LOG, so a test can see what the bundle pulled.
 set -euo pipefail
-if [ "${1:-}" != "save" ]; then
-    echo "fake docker: only `save` is implemented" >&2
-    exit 1
-fi
-shift
-output=""
-reference=""
-while [ "$#" -gt 0 ]; do
-    case "$1" in
-        -o|--output) output="$2"; shift 2 ;;
-        *) reference="$1"; shift ;;
-    esac
-done
-printf 'a stand-in for the image tar of %s\\n' "$reference" > "$output"
+command="${1:-}"
+shift || true
+case "$command" in
+    save)
+        output=""
+        reference=""
+        while [ "$#" -gt 0 ]; do
+            case "$1" in
+                -o|--output) output="$2"; shift 2 ;;
+                *) reference="$1"; shift ;;
+            esac
+        done
+        printf 'a stand-in for the image tar of %s\\n' "$reference" > "$output"
+        ;;
+    pull)
+        echo "pull $*" >> "${FAKE_DOCKER_LOG:-/dev/null}"
+        ;;
+    image)
+        # `docker image inspect <ref>`: the stand-in says the image is
+        # NOT in the store, so the bundle script pulls it first.
+        echo "inspect $*" >> "${FAKE_DOCKER_LOG:-/dev/null}"
+        exit 1
+        ;;
+    *)
+        echo "fake docker: only 'save', 'pull' and 'image inspect' are implemented" >&2
+        exit 1
+        ;;
+esac
 """
 
 
@@ -71,6 +90,9 @@ class BundleTest(unittest.TestCase):
         (self.sbom_dir / "rantai-lakehouse-api.cdx.json").write_text(
             json.dumps({"bomFormat": "CycloneDX"}), encoding="utf-8"
         )
+        (self.sbom_dir / "postgres.cdx.json").write_text(
+            json.dumps({"bomFormat": "CycloneDX"}), encoding="utf-8"
+        )
 
         self.sigstore_bundle = self.root / "release.json.sigstore.json"
         self.sigstore_bundle.write_text('{"mediaType": "application/vnd.dev.sigstore.bundle.v0.3+json"}\n', encoding="utf-8")
@@ -85,7 +107,10 @@ class BundleTest(unittest.TestCase):
                     "createdAt": "2026-11-01T12:00:00Z",
                     "minFrom": "0.0.0",
                     "stops": [],
-                    "images": {"lakehouse-api": IMAGE},
+                    "images": {
+                        "lakehouse-api": IMAGE,
+                        "postgres": THIRD_PARTY_IMAGE,
+                    },
                     "files": {"docker-compose.yml": ""},
                 },
                 indent=2,
@@ -95,6 +120,7 @@ class BundleTest(unittest.TestCase):
         self.write_manifest_with_the_compose_checksum()
 
         self.out = self.root / "out"
+        self.docker_log = self.root / "docker.log"
 
     def tearDown(self) -> None:
         self._directory.cleanup()
@@ -112,6 +138,7 @@ class BundleTest(unittest.TestCase):
     def run_bundle(self) -> subprocess.CompletedProcess[str]:
         environment = dict(os.environ)
         environment["PATH"] = f"{self.bin}{os.pathsep}{environment['PATH']}"
+        environment["FAKE_DOCKER_LOG"] = str(self.docker_log)
         return subprocess.run(
             [
                 "bash",
@@ -162,6 +189,44 @@ class BundleTest(unittest.TestCase):
             self.assertTrue((extracted / name).exists(), name)
         self.assertTrue((extracted / "images" / "rantai-lakehouse-api.tar").exists())
         self.assertTrue((extracted / "sbom" / "rantai-lakehouse-api.cdx.json").exists())
+
+    def test_the_bundle_holds_the_third_party_images_too(self) -> None:
+        """REL-2 S2 review round 6 BLOCKER 1: EVERY image the release runs.
+
+        The manifest names the third-party images too, so the bundle
+        holds them: an air-gapped host has no registry to pull them
+        from.
+        """
+        self.assertEqual(self.run_bundle().returncode, 0)
+        extracted = self.extract()
+        self.assertTrue((extracted / "images" / "postgres.tar").exists())
+        self.assertTrue((extracted / "sbom" / "postgres.cdx.json").exists())
+
+    def test_an_image_that_is_not_local_is_pulled_by_digest(self) -> None:
+        """The third-party images are not in the runner's store yet.
+
+        `docker save` needs the image there, so the bundle pulls it by
+        its digest reference — the reference the manifest names.
+        """
+        self.assertEqual(self.run_bundle().returncode, 0)
+        log = self.docker_log.read_text(encoding="utf-8")
+        self.assertIn(f"pull {THIRD_PARTY_IMAGE}", log)
+        self.assertIn(f"pull {IMAGE}", log)
+
+    def test_two_images_with_the_same_name_are_refused(self) -> None:
+        """One name is one file in the bundle.
+
+        `image_name.sh` drops the registry and the tag, so two
+        references can land on the same name. The bundle refuses rather
+        than letting one image overwrite the other's tar.
+        """
+        data = json.loads(self.manifest.read_text(encoding="utf-8"))
+        data["images"]["other-postgres"] = f"example.com/postgres:16.15@{THIRD_PARTY_DIGEST}"
+        self.manifest.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        self.write_manifest_with_the_compose_checksum()
+        result = self.run_bundle()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("share the name", result.stderr)
 
     def test_every_checksum_in_the_bundle_matches_the_file_it_names(self) -> None:
         self.assertEqual(self.run_bundle().returncode, 0)

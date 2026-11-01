@@ -50,7 +50,16 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "release.yml"
 
 # A third-party action, pinned: `owner/repo` and a 40-hex commit SHA.
-PINNED_ACTION = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[0-9a-f]{40}$")
+# A SUB-ACTION (`owner/repo/path@<sha>`) is pinned the same way: it is
+# the same repository, at the same commit, and the pipeline uses it to
+# install the SBOM action's own syft (REL-2 S2 review round 6 BLOCKER 1).
+PINNED_ACTION = re.compile(
+    r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*@[0-9a-f]{40}$"
+)
+
+# The SBOM action, and the one step that is NOT it: the action's own
+# `download-syft` sub-action installs syft, it does not write an SBOM.
+SBOM_ACTION = re.compile(r"^anchore/sbom-action@")
 
 # The three steps that need the signing key, and the two secrets of the
 # `release` environment.
@@ -167,6 +176,20 @@ jobs:
           format: cyclonedx
 """
 
+# A workflow that never pulls the third-party images, so its bundle
+# would hold only the four images this repository publishes
+# (REL-2 S2 review round 6 BLOCKER 1).
+SYNTHETIC_NO_THIRD_PARTY_PULL = """
+name: Synthetic
+on: workflow_dispatch
+jobs:
+  dry-run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Build the offline bundle
+        run: ops/release/make_bundle.sh --manifest release.json
+"""
+
 
 def load_workflow(path: Path = WORKFLOW_PATH) -> dict[str, Any]:
     """The workflow, parsed."""
@@ -255,6 +278,35 @@ def step_named(document: dict[str, Any], job_name: str, name: str) -> dict[str, 
     raise AssertionError(f"no step named {name!r} in the job {job_name!r}")
 
 
+def step_index(document: dict[str, Any], job_name: str, name: str) -> int:
+    """Where a step sits in its job."""
+    for index, step in enumerate(steps_of(document, job_name)):
+        if step.get("name") == name:
+            return index
+    raise AssertionError(f"no step named {name!r} in the job {job_name!r}")
+
+
+def third_party_pull_steps(document: dict[str, Any]) -> list[str]:
+    """Every job that pulls the third-party images, by digest."""
+    found: list[str] = []
+    for job_name, job in (document.get("jobs") or {}).items():
+        for step in job.get("steps") or []:
+            run = str(step.get("run") or "")
+            if "compose_images.py" in run and "docker pull" in run:
+                found.append(job_name)
+                break
+    return found
+
+
+def is_sbom_step(step: dict[str, Any]) -> bool:
+    """Whether a step writes an SBOM with the SBOM action.
+
+    The action's `download-syft` SUB-action is not one: it installs
+    syft, and the loop below runs it.
+    """
+    return SBOM_ACTION.match(str(step.get("uses") or "")) is not None
+
+
 def creates_the_sbom_folder(document: dict[str, Any], job_name: str) -> bool:
     """Whether the job creates `sbom/` before its first SBOM step.
 
@@ -266,7 +318,7 @@ def creates_the_sbom_folder(document: dict[str, Any], job_name: str) -> bool:
         (
             index
             for index, step in enumerate(steps)
-            if "sbom-action" in str(step.get("uses") or "")
+            if is_sbom_step(step)
         ),
         None,
     )
@@ -291,7 +343,7 @@ def sbom_steps(document: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
     found: list[tuple[str, dict[str, Any]]] = []
     for job_name, job in (document.get("jobs") or {}).items():
         for step in job.get("steps") or []:
-            if "sbom-action" in str(step.get("uses") or ""):
+            if is_sbom_step(step):
                 found.append((job_name, step))
     return found
 
@@ -506,6 +558,88 @@ class ReleaseWorkflowTest(unittest.TestCase):
             step = step_named(self.document, job, "Build the offline bundle")
             run = str(step.get("run"))
             self.assertIn(f"--sigstore-bundle {SIGSTORE_BUNDLE}", run, job)
+
+    def test_both_jobs_pull_the_third_party_images_by_digest(self) -> None:
+        """REL-2 S2 review round 6 BLOCKER 1: the bundle holds EVERY image.
+
+        The third-party images are the ones the bundle was missing: the
+        manifest names them, so the pipeline pulls them by digest and
+        the bundle saves them.
+        """
+        for job in ("dry-run", "release"):
+            step = step_named(self.document, job, "The third-party images, by digest")
+            run = str(step.get("run"))
+            self.assertIn("compose_images.py", run, job)
+            self.assertIn("--published-images images.json", run, job)
+            self.assertIn("docker pull", run, job)
+
+    def test_a_workflow_without_the_third_party_pull_is_reported(self) -> None:
+        document = yaml.safe_load(SYNTHETIC_NO_THIRD_PARTY_PULL)
+        self.assertEqual(third_party_pull_steps(document), [])
+
+    def test_the_third_party_images_are_pulled_before_the_bundle_is_built(self) -> None:
+        for job in ("dry-run", "release"):
+            self.assertLess(
+                step_index(self.document, job, "The third-party images, by digest"),
+                step_index(self.document, job, "Build the offline bundle"),
+                job,
+            )
+
+    def test_both_jobs_write_an_sbom_for_every_third_party_image(self) -> None:
+        """Every image in a release carries an SBOM — the third-party
+        ones included. The bundle refuses an image that has none."""
+        for job in ("dry-run", "release"):
+            step = step_named(self.document, job, "The SBOM of each third-party image")
+            run = str(step.get("run"))
+            self.assertIn("cyclonedx-json", run, job)
+            self.assertIn("image_name.sh", run, job)
+            self.assertIn("third-party-images.txt", run, job)
+
+    def test_the_syft_the_pipeline_uses_is_the_sbom_action_own(self) -> None:
+        """The same scanner, at the same commit, as the SBOM action.
+
+        The action's own `download-syft` sub-action installs the syft
+        the action itself uses (v1.42.3), so the SBOMs of the
+        third-party images and the SBOMs of ours come from one scanner.
+        """
+        for job in ("dry-run", "release"):
+            step = step_named(self.document, job, "Install syft")
+            uses = str(step.get("uses"))
+            self.assertIn("anchore/sbom-action/download-syft@", uses, job)
+            self.assertTrue(step.get("id"), "the step needs an id: its output carries syft")
+            scan = step_named(self.document, job, "The SBOM of each third-party image")
+            self.assertIn("steps.syft.outputs.cmd", str(scan.get("env")), job)
+
+    def test_both_jobs_free_the_runner_disk_before_the_images_are_pulled(self) -> None:
+        """The bundle holds every image now: the runner needs the room."""
+        for job in ("dry-run", "release"):
+            step = step_named(self.document, job, "Free runner disk")
+            run = str(step.get("run"))
+            self.assertIn("docker image prune", run, job)
+            self.assertIn("df -h /", run, job)
+            self.assertLess(
+                step_index(self.document, job, "Free runner disk"),
+                step_index(self.document, job, "The third-party images, by digest"),
+                job,
+            )
+
+    def test_the_bundle_step_prints_the_disk_before_and_after(self) -> None:
+        for job in ("dry-run", "release"):
+            step = step_named(self.document, job, "Build the offline bundle")
+            run = str(step.get("run"))
+            self.assertEqual(run.count("df -h /"), 2, job)
+
+    def test_the_manifest_is_written_from_the_published_images_and_the_compose_file(self) -> None:
+        """The manifest names every image the release runs.
+
+        Ours come from the published digests, the third-party ones from
+        the rendered Compose file — so the flag says "published".
+        """
+        for job in ("dry-run", "release"):
+            step = step_named(self.document, job, "Write the release manifest")
+            run = str(step.get("run"))
+            self.assertIn("--published-images", run, job)
+            self.assertIn("--compose docker-compose.release.yml", run, job)
 
     def test_a_job_level_secret_is_reported(self) -> None:
         document = yaml.safe_load(SYNTHETIC_JOB_SECRET)

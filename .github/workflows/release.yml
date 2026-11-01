@@ -64,7 +64,11 @@ jobs:
     # preceded by a second full build of the same four images.
     if: github.event_name != 'push'
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    # 150 minutes: the bundle now holds EVERY image the release runs
+    # (REL-2 S2 review round 6 BLOCKER 1), so the job pulls the
+    # third-party images, describes each of them, saves each of them and
+    # compresses the lot.
+    timeout-minutes: 150
     permissions:
       contents: read
     env:
@@ -94,6 +98,18 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Free disk first: the runner image carries toolchains this job
+      # never uses, and the bundle holds EVERY image the release runs
+      # (REL-2 S2 review round 6 BLOCKER 1) — the images themselves,
+      # their `docker save` tars and the compressed bundle. The step is
+      # the one `g9-upload-large.yml` uses.
+      - name: Free runner disk
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          df -h /
 
       - name: Setup Python
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
@@ -385,6 +401,51 @@ jobs:
           python3 ops/release/render_compose.py \
             --images "$(cat images.json)" -o docker-compose.release.yml
 
+      # The THIRD-PARTY images the rendered Compose file runs: Postgres,
+      # ClickHouse, Lakekeeper, OpenFGA, RustFS, Gotenberg, the init
+      # images, and the `trino`, `seaweedfs` and `backups` profiles.
+      #
+      # They are NOT signed and NOT attested: we cannot sign another
+      # project's image in its own registry. Their integrity comes from
+      # the digest in the SIGNED manifest, and the bundle holds the
+      # image that digest names (REL-2 S2 review round 6 BLOCKER 1).
+      - name: The third-party images, by digest
+        run: |
+          set -euo pipefail
+          python3 ops/release/compose_images.py \
+            --compose docker-compose.release.yml \
+            --published-images images.json > third-party-images.txt
+          while read -r reference; do
+            [ -n "$reference" ] || continue
+            echo "pulling $reference"
+            docker pull "$reference"
+          done < third-party-images.txt
+
+      # syft, the version the SBOM action installs: the action's own
+      # `download-syft` mode, at the SAME commit, so the SBOMs of the
+      # third-party images come from the same scanner as the SBOMs of
+      # ours (v1.42.3).
+      - name: Install syft
+        id: syft
+        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          run: download-syft
+
+      # One CycloneDX JSON SBOM per third-party image, under the name the
+      # bundle looks for (`ops/release/image_name.sh`): the bundle
+      # refuses an image that has none.
+      - name: The SBOM of each third-party image
+        env:
+          SYFT: ${{ steps.syft.outputs.cmd }}
+        run: |
+          set -euo pipefail
+          while read -r reference; do
+            [ -n "$reference" ] || continue
+            name="$(ops/release/image_name.sh "$reference")"
+            echo "scanning $reference"
+            "$SYFT" scan "docker:$reference" -o "cyclonedx-json=sbom/$name.cdx.json"
+          done < third-party-images.txt
+
       # The manifest, and the checksum of the Compose file it ships
       # (S2-T3).
       - name: Write the release manifest
@@ -393,7 +454,7 @@ jobs:
           python3 ops/release/make_manifest.py \
             --version "${{ steps.version.outputs.version }}" \
             --git-sha "$GITHUB_SHA" \
-            --images "$(cat images.json)" \
+            --published-images "$(cat images.json)" \
             --compose docker-compose.release.yml \
             --out release.json
 
@@ -431,15 +492,21 @@ jobs:
       # The bundle (decision D11): the Compose file, the manifest, its
       # Sigstore bundle, one `docker save` per image, the SBOMs and the
       # checksums.
+      #
+      # `df -h` before and after: the bundle holds every image the
+      # release runs now (REL-2 S2 review round 6 BLOCKER 1), so the
+      # runner's disk is part of the release's facts.
       - name: Build the offline bundle
         run: |
           set -euo pipefail
+          df -h /
           ops/release/make_bundle.sh \
             --manifest release.json \
             --compose docker-compose.release.yml \
             --sigstore-bundle release.json.sigstore.json \
             --sbom-dir sbom \
             --out dist
+          df -h /
 
       # The rendered Compose file must be a file compose accepts: the
       # env values are throwaway, because the template has no default
@@ -478,7 +545,7 @@ jobs:
             echo "- version: ${{ steps.version.outputs.version }}"
             echo "- bundle: \`$(basename "$bundle")\`"
             echo "- size: $size bytes ($((size / 1024 / 1024)) MiB)"
-            echo "- images: $(jq 'length' digests.json) published, each signed and attested"
+            echo "- images: $(jq '.images | length' release.json) in the manifest, $(jq 'length' digests.json) of them ours, each signed and attested"
             echo ""
             echo "Nothing was published: the images went to a throwaway registry and the"
             echo "key was generated in this job."
@@ -509,7 +576,11 @@ jobs:
     # release.
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    # 150 minutes: the bundle now holds EVERY image the release runs
+    # (REL-2 S2 review round 6 BLOCKER 1), so the job pulls the
+    # third-party images, describes each of them, saves each of them and
+    # compresses the lot.
+    timeout-minutes: 150
     environment: release
     permissions:
       contents: write
@@ -527,6 +598,18 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Free disk first: the runner image carries toolchains this job
+      # never uses, and the bundle holds EVERY image the release runs
+      # (REL-2 S2 review round 6 BLOCKER 1) — the images themselves,
+      # their `docker save` tars and the compressed bundle. The step is
+      # the one `g9-upload-large.yml` uses.
+      - name: Free runner disk
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          df -h /
 
       - name: Setup Python
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
@@ -751,13 +834,58 @@ jobs:
           python3 ops/release/render_compose.py \
             --images "$(cat images.json)" -o docker-compose.release.yml
 
+      # The THIRD-PARTY images the rendered Compose file runs: Postgres,
+      # ClickHouse, Lakekeeper, OpenFGA, RustFS, Gotenberg, the init
+      # images, and the `trino`, `seaweedfs` and `backups` profiles.
+      #
+      # They are NOT signed and NOT attested: we cannot sign another
+      # project's image in its own registry. Their integrity comes from
+      # the digest in the SIGNED manifest, and the bundle holds the
+      # image that digest names (REL-2 S2 review round 6 BLOCKER 1).
+      - name: The third-party images, by digest
+        run: |
+          set -euo pipefail
+          python3 ops/release/compose_images.py \
+            --compose docker-compose.release.yml \
+            --published-images images.json > third-party-images.txt
+          while read -r reference; do
+            [ -n "$reference" ] || continue
+            echo "pulling $reference"
+            docker pull "$reference"
+          done < third-party-images.txt
+
+      # syft, the version the SBOM action installs: the action's own
+      # `download-syft` mode, at the SAME commit, so the SBOMs of the
+      # third-party images come from the same scanner as the SBOMs of
+      # ours (v1.42.3).
+      - name: Install syft
+        id: syft
+        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          run: download-syft
+
+      # One CycloneDX JSON SBOM per third-party image, under the name the
+      # bundle looks for (`ops/release/image_name.sh`): the bundle
+      # refuses an image that has none.
+      - name: The SBOM of each third-party image
+        env:
+          SYFT: ${{ steps.syft.outputs.cmd }}
+        run: |
+          set -euo pipefail
+          while read -r reference; do
+            [ -n "$reference" ] || continue
+            name="$(ops/release/image_name.sh "$reference")"
+            echo "scanning $reference"
+            "$SYFT" scan "docker:$reference" -o "cyclonedx-json=sbom/$name.cdx.json"
+          done < third-party-images.txt
+
       - name: Write the release manifest
         run: |
           set -euo pipefail
           python3 ops/release/make_manifest.py \
             --version "${{ steps.version.outputs.version }}" \
             --git-sha "$GITHUB_SHA" \
-            --images "$(cat images.json)" \
+            --published-images "$(cat images.json)" \
             --compose docker-compose.release.yml \
             --out release.json
 
@@ -787,12 +915,14 @@ jobs:
       - name: Build the offline bundle
         run: |
           set -euo pipefail
+          df -h /
           ops/release/make_bundle.sh \
             --manifest release.json \
             --compose docker-compose.release.yml \
             --sigstore-bundle release.json.sigstore.json \
             --sbom-dir sbom \
             --out dist
+          df -h /
 
       # The release's own assets, and their checksums: the operator who
       # downloads them can check them against the release page.
@@ -824,12 +954,22 @@ jobs:
         run: |
           set -euo pipefail
           version="${{ steps.version.outputs.version }}"
+          bundle="dist/rantai-lakehouse-$version-linux-x86_64.tar.zst"
+          # The bundle's measured size, in the notes: the spec says
+          # "measured, never assumed", and the size grew when the bundle
+          # began to hold every image the release runs (REL-2 S2 review
+          # round 6 BLOCKER 1).
+          size="$(wc -c < "$bundle")"
           {
             echo "RantAI Lakehouse v$version."
             echo ""
             echo "Attached: the offline bundle and its checksum, the release manifest"
             echo "and its Sigstore bundle, and the CycloneDX SBOM of each image. The upgrade"
             echo "notes are written in REL-2 S5 (docs/core/reference/release-policy.md)."
+            echo ""
+            echo "The offline bundle is $size bytes ($((size / 1024 / 1024)) MiB) compressed."
+            echo "It holds every image the release runs — the four published ones and the"
+            echo "third-party ones, each by digest."
             echo ""
             echo "This release is a draft. The product owner publishes it."
           } > release-notes.md
