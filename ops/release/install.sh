@@ -106,4 +106,11 @@ fi
 say "the checksum matches."
 
 chmod +x "$work/$BINARY"
-exec "$work/$BINARY" install "$@"
+
+# The installer is RUN, not `exec`d: `exec` replaces this shell, and
+# the trap that removes the work directory would never run — the
+# downloaded binary would stay on the host (REL-2 S3 review round 1
+# SHOULD-FIX 5). The script exits with the installer's own status.
+status=0
+"$work/$BINARY" install "$@" || status=$?
+exit "$status"

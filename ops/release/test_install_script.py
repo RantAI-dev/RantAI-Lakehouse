@@ -43,14 +43,8 @@ class InstallScriptTest(unittest.TestCase):
         self.served = self.root / "served"
         self.served.mkdir()
         self.binary = self.served / BINARY
-        self.binary.write_text(
-            "#!/bin/sh\necho \"lakehousectl $@\" > \"$RECORD\"\n", encoding="utf-8"
-        )
         self.checksums = self.served / "SHA256SUMS"
-        self.checksums.write_text(
-            f"{hashlib.sha256(self.binary.read_bytes()).hexdigest()}  {BINARY}\n",
-            encoding="utf-8",
-        )
+        self.serve_binary("#!/bin/sh\necho \"lakehousectl $@\" > \"$RECORD\"\n")
         self.latest = self.served / "latest.json"
         self.latest.write_text(json.dumps({"tag_name": "v0.2.0"}), encoding="utf-8")
 
@@ -63,6 +57,25 @@ class InstallScriptTest(unittest.TestCase):
 
     def tearDown(self) -> None:
         self._directory.cleanup()
+
+    def serve_binary(self, body: str) -> None:
+        """Serve a binary, and the checksum that matches it."""
+        self.binary.write_text(body, encoding="utf-8")
+        self.checksums.write_text(
+            f"{hashlib.sha256(self.binary.read_bytes()).hexdigest()}  {BINARY}\n",
+            encoding="utf-8",
+        )
+
+    def downloaded_paths(self) -> list[str]:
+        """The files the script wrote, as the fake `curl` recorded them."""
+        log = self.root / "curl.log"
+        if not log.exists():
+            return []
+        return [
+            line[len("output ") :]
+            for line in log.read_text(encoding="utf-8").splitlines()
+            if line.startswith("output ")
+        ]
 
     def write_tool(self, name: str, body: str) -> None:
         path = self.bin / name
@@ -82,6 +95,9 @@ for argument in "$@"; do
     previous="$argument"
 done
 echo "curl $url" >> "${CURL_LOG:-/dev/null}"
+if [ -n "$output" ]; then
+    echo "output $output" >> "${CURL_LOG:-/dev/null}"
+fi
 case "$url" in
     *latest*) cat "${SERVED}/latest.json" ;;
     *SHA256SUMS*) cat "${SERVED}/SHA256SUMS" ;;
@@ -154,6 +170,26 @@ esac
         self.assertEqual(result.returncode, 1)
         self.assertIn("checksum", result.stderr)
         self.assertFalse(self.record.exists(), "the installer was run anyway")
+
+    def test_the_downloaded_binary_is_removed_when_the_script_ends(self) -> None:
+        """Nothing is left on the host.
+
+        `exec` replaces the shell, and the trap that removes the work
+        directory would never run: the downloaded binary stayed behind
+        (REL-2 S3 review round 1 SHOULD-FIX 5).
+        """
+        result = self.run_script()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        downloaded = self.downloaded_paths()
+        self.assertTrue(downloaded, "the script downloaded nothing")
+        for path in downloaded:
+            self.assertFalse(Path(path).exists(), f"{path} was left behind")
+
+    def test_the_script_exits_with_the_installers_status(self) -> None:
+        """The status of the installer is the status of the script."""
+        self.serve_binary("#!/bin/sh\nexit 3\n")
+        result = self.run_script()
+        self.assertEqual(result.returncode, 3)
 
 
 if __name__ == "__main__":
