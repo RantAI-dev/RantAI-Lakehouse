@@ -12,7 +12,12 @@ present, so a past version could be a way around a mask. This gate is that
 proof. It sits beside `g8_governance_test.py` (which proves masking on a
 `MergeTree` table at its current state only) and stands alone, like every
 gate script in this repo: it imports nothing from that file or from
-`ops/g3a/g3a_test.py`, so a bug shared with them cannot hide here.
+`ops/g3a/g3a_test.py`, so a bug shared with them cannot hide here. The
+one thing it DOES share is the `Trino` readiness wait
+(`ops/g8/trino_ready.py`, DATA-21 S2 review BLOCKER 1), and that helper
+carries no assertion — it only waits, before the first query, for the
+coordinator to be able to answer — so the independence claimed above is
+unchanged.
 
 # What it does
 
@@ -101,6 +106,12 @@ import time
 
 import requests
 from argon2 import PasswordHasher  # argon2-cffi, installed by the runner's command
+
+# The one readiness wait for `Trino`, shared with the other G8 gate
+# (`ops/g8/trino_ready.py`) — DATA-21 S2 review BLOCKER 1. It lives in
+# its own module on purpose: this gate's ASSERTIONS stay independent of
+# the governance gate's, and only the wait is shared.
+import trino_ready
 
 API_URL = os.environ.get("LAKEHOUSE_API_URL", "http://lakehouse-api:8080")
 DAGSTER_URL = os.environ.get("DAGSTER_URL", "http://dagster-webserver:3000/graphql")
@@ -459,6 +470,25 @@ def run_query(session: requests.Session, sql: str, engine: str) -> requests.Resp
     )
 
 
+def step_wait_for_trino() -> None:
+    """Waits until `Trino` can answer, before this leg's first query.
+
+    DATA-21 S2 review BLOCKER 1: the coordinator answers HTTP while it
+    is still starting, so a statement sent in that window comes back as
+    a 422 ("The server is still starting up"). This gate's Trino leg
+    passed its first CI run by the same luck the governance gate's
+    failed run exposed — a gate that passes by timing is a flaky gate.
+
+    The wait itself is ONE shared helper (`ops/g8/trino_ready.py`), used
+    by both G8 gates, so this leg and the governance leg cannot drift
+    apart (`AGENTS.md` rule 4: a duplicated guard is a finding).
+    """
+    try:
+        trino_ready.wait_for_trino()
+    except trino_ready.TrinoNotReady as exc:
+        raise G8TimeTravelFailure(f"Trino never became ready: {exc}") from exc
+
+
 def rows_of(session: requests.Session, sql: str, who: str, engine: str) -> list[dict]:
     resp = run_query(session, sql, engine)
     if not resp.ok:
@@ -566,6 +596,12 @@ def main() -> int:
         older, _current = step_load_twice(admin)
         step_author_policy(admin)
         analyst = login(ANALYST_EMAIL, ANALYST_PASSWORD, "analyst")
+        if engine == ENGINE_TRINO:
+            # DATA-21 S2 review BLOCKER 1: the coordinator must be ready
+            # before this leg's FIRST query on it. Everything above is
+            # engine-independent (the two loads, the policy), so it runs
+            # while the coordinator boots.
+            step_wait_for_trino()
         step_assert_pinned_reads(admin, analyst, older, engine)
         step_assert_nested_pins_not_clear(analyst, older, engine)
     except G8TimeTravelFailure as exc:

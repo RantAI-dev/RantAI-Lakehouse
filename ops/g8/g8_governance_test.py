@@ -102,6 +102,12 @@ from dataclasses import dataclass
 import requests
 from argon2 import PasswordHasher  # argon2-cffi — gate-only dependency, installed by g8-test-runner's command (WS7 item H2)
 
+# The one readiness wait for `Trino`, shared with the other G8 gate
+# (`ops/g8/trino_ready.py`) — DATA-21 S2 review BLOCKER 1. It lives in
+# its own module on purpose: this gate's ASSERTIONS stay independent of
+# the time-travel gate's, and only the wait is shared.
+import trino_ready
+
 API_URL = os.environ.get("LAKEHOUSE_API_URL", "http://lakehouse-api:8080")
 CH_URL = os.environ.get("CH_URL", "http://clickhouse:8123")
 CH_USER = os.environ.get("CH_USER", "default")
@@ -439,6 +445,26 @@ def step_publish_gate_table_to_iceberg(admin_session: requests.Session) -> None:
     print(f"[g8] published {GATE_TABLE} to Iceberg as {TRINO_POLICY_TABLE}")
 
 
+def step_wait_for_trino() -> None:
+    """Waits until `Trino` can answer, before this leg's first query.
+
+    DATA-21 S2 review BLOCKER 1: the coordinator answers HTTP while it
+    is still starting, so a statement sent in that window comes back as
+    a 422 ("The server is still starting up"). This gate sent its first
+    analyst query in that window and CI caught it (run 41285813391), after
+    an earlier run had passed by luck — a gate that passes by timing is a
+    flaky gate.
+
+    The wait itself is ONE shared helper (`ops/g8/trino_ready.py`), used
+    by both G8 gates, so this leg and the time-travel leg cannot drift
+    apart (`AGENTS.md` rule 4: a duplicated guard is a finding).
+    """
+    try:
+        trino_ready.wait_for_trino()
+    except trino_ready.TrinoNotReady as exc:
+        raise G8Failure(f"Trino never became ready: {exc}") from exc
+
+
 def _run_query(session: requests.Session, sql: str, engine: str) -> requests.Response:
     """The gate's own query, on the engine this run proves.
 
@@ -554,6 +580,12 @@ def main() -> int:
             step_publish_gate_table_to_iceberg(admin)
         step_author_masking_policy(admin, target)
         analyst = step_login_as_analyst()
+        if engine == ENGINE_TRINO:
+            # DATA-21 S2 review BLOCKER 1: the coordinator must be ready
+            # before this leg's FIRST query on it. Everything above is
+            # engine-independent (seeding, the Gold export, the policy),
+            # so it runs while the coordinator boots.
+            step_wait_for_trino()
         step_analyst_sees_masked_column(analyst, target)
         step_admin_sees_clear_text(admin, target)
         step_bypass_attempts_still_masked(analyst, target)

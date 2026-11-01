@@ -386,3 +386,125 @@ after this PR merges.
 - Prove it locally: run each Trino gate twice on a clean `-p data21g` project.
 
 **Open: BLOCKER 1 (S2 round 2).**
+
+### Fix for review round 2 (developer, 2026-11-01)
+
+**BLOCKER 1 is fixed:** both Trino legs now wait for the coordinator
+before their first query on it.
+
+**Commit** — ONE commit on `fix/data-21-s2-trino-gates`:
+`fix(gates): the Trino legs wait for Trino to be ready (DATA-21 S2 review BLOCKER 1)`.
+It carries this section, so its SHA is the branch's HEAD (`git log -1
+--oneline`); the code it carries is listed below, file by file.
+
+**What the fix is.** One new helper, `ops/g8/trino_ready.py`, used by
+BOTH gates (`AGENTS.md` rule 4: a duplicated guard is a finding). It
+waits until both of the review's conditions hold:
+
+- `GET /v1/info` reports `"starting": false` — the coordinator's own
+  readiness flag. The compose `trino` service's healthcheck proves only
+  that the endpoint ANSWERS, which it does while the server is still
+  starting, so that healthcheck is not a readiness signal and could not
+  be the gate's;
+- a `SELECT 1` through `Trino` succeeds — posted to `/v1/statement`
+  with an UNPRIVILEGED `X-Trino-User` (`g8-readiness`, never
+  `trino-maintenance`, the one name the access-control rules grant write
+  access to), following the coordinator's own `nextUri` pages.
+
+The wait is **bounded**: five minutes, polling every 2 s, printing a line
+every 30 s so a CI log does not look hung. When the budget runs out the
+helper raises `TrinoNotReady` and the gate fails with
+`Trino never became ready: <which condition was still untrue>`.
+
+The `SELECT 1` goes to `Trino` **directly**, not through
+`POST /api/query/run`: the wait is about the ENGINE, and the console's
+own path to it (the policy rewrite, the tenant check, the audit trail)
+is proved by the gates' own assertions instead. A fault in one of those
+would make the wait report the wrong problem.
+
+Each leg waits **before its first query on the Trino engine** — after the
+engine-independent work (seeding, the Gold export, the policy, the two
+Dagster loads), so that work runs while the coordinator boots. The
+ClickHouse legs never call the wait.
+
+**Files changed**
+
+| File | What |
+| --- | --- |
+| `ops/g8/trino_ready.py` | NEW — the one wait both gates use |
+| `ops/g8/g8_governance_test.py` | imports it; waits before the analyst's first query on the Trino leg |
+| `ops/g8/g8_time_travel_test.py` | imports it; waits before the first pinned read on the Trino leg; its module docstring's "imports nothing from that file" claim is amended to say exactly what IS shared (the wait, which carries no assertion) |
+| `docker-compose.yml` | both G8 runner services pass `G8_TRINO_URL`; the governance runner also sets `PYTHONDONTWRITEBYTECODE` (it now IMPORTS a sibling module, which is what makes Python write bytecode into the bind-mounted checkout) |
+| `.env.example` | documents `G8_TRINO_URL` |
+
+`G8_TRINO_URL` is the gate's OWN name for the coordinator's address, and
+deliberately not the deployment's `TRINO_URL`: that one may hold a
+host-facing address (the `trino-host-port` opt-in publishes Trino on the
+host), while a gate inside the compose network must always dial the
+in-network name.
+
+**Commands run** — foreground, on this branch, on the final code:
+
+| Command | Result |
+| --- | --- |
+| `python3 -m py_compile ops/g8/trino_ready.py ops/g8/g8_governance_test.py ops/g8/g8_time_travel_test.py` | clean (exit 0) |
+| `python3 ops/lint/check_intra_package_imports.py` | "OK: all intra-package dispar_orchestrate imports resolve" (exit 0) |
+| `python3 ops/lint/check_bare_iceberg_count.py` | "R11 guard: no bare count() against a Bronze Iceberg table found." (exit 0) |
+| `docker compose --profile '*' config --quiet` | clean (exit 0) |
+| `docker compose -p data21g --profile trino up -d --no-build …` | the real `up` (below), not `config` (AGENTS.md §8.8) |
+
+**Gate runs** — the real proof, on this machine, on the compose project
+`data21g` (the `trino` profile, plus `dagster` for the time-travel
+stack). **Each Trino gate was run TWICE**, as the review asked.
+
+| Gate | Engine | Run | Result |
+| --- | --- | --- | --- |
+| `g8_governance_test.py` | `trino` | 1 | **PASS** — the Gold export published `serving.g8_gate_subjects` as `gold.g8_gate_subjects`, the policy `g8-mask-email-trino` was authored, the analyst's `email` came back `***` with `region` in clear text, the admin's came back in clear text, and both bypass shapes (`SELECT *`, `SELECT *` in a CTE) came back masked |
+| `g8_governance_test.py` | `trino` | 2 | **PASS** — the same assertions, on the same stack, with the policy already authored |
+| `g8_time_travel_test.py` | `trino` | 1 | **PASS** — two loads, older version 2000 rows / current 4010 rows, the analyst 1000 of 2000 at the older version, `customer` masked to `***` with the other columns clear and equal to the admin's, and the pin inside a subquery and inside a CTE both masked |
+| `g8_time_travel_test.py` | `trino` | 2 | **PASS** — two more loads, older version 6020 rows / current 8040 rows, the analyst 3000 of 6020, the same masking and the same two nested-pin shapes |
+
+The two `clickhouse` legs (the legs this fix must not touch) were run
+once each on the same stack and both **PASS**: the governance gate masked
+`email` for the analyst on `serving.g8_gate_subjects`, and the
+time-travel gate read 5000 of 10060 rows at the older version with
+`customer` masked to `***`.
+
+**The wait itself, measured against the real coordinator.** The CI
+failure was a query sent while the coordinator was still starting, so
+that is the case the fix has to cover:
+
+- `docker compose -p data21g restart trino`, then polling
+  `GET /v1/info` once a second: `starting=true` for ~13 s, then
+  `starting=false` at t+13 s.
+- The helper run against that restarting coordinator (the same module,
+  the same function, the real container): it **blocked for 12.9 s over 6
+  attempts** and then reported
+  `[g8-trino] Trino is ready at http://172.18.0.9:8080 after 6 attempt(s): SELECT 1 answered`.
+  That is the window CI failed in, now waited out instead of raced.
+- The bounded failure path: `wait_for_trino(url="http://127.0.0.1:9",
+  timeout_s=6)` raised
+  `TrinoNotReady: Trino at http://127.0.0.1:9 was still not ready after
+  6s (3 attempt(s)): GET /v1/info failed: … Connection refused` — bounded,
+  and it says what was untrue.
+
+**Tear-down** — `docker compose -p data21g down -v`: no container, no
+volume and no image of that project is left behind (`docker ps -a`,
+`docker volume ls` and `docker images` are empty of it). No
+testcontainers were created by this run, and none are left.
+
+**Not verified** — and why:
+
+- The CI jobs themselves have **not run**. The developer never opens a
+  pull request, so the matrix legs have not been exercised by GitHub
+  Actions; the reviewer runs them.
+- The full workspace block (`cargo clippy --workspace --all-targets
+  --all-features -- -D warnings`, `cargo test --workspace`): **not run.**
+  No Rust file changed.
+- `bun run typecheck`, `bun run lint`, `bun run test`: **not run.** No
+  TypeScript file changed.
+- `python3 -m pytest dispar_orchestrate -q`: **not run.** No Dagster file
+  changed.
+- `actionlint`: **not run.** `ci.yml` was not changed by this fix — the
+  wait belongs in the gate, not in the workflow, so that every caller of
+  the gate (CI and a local run) is protected by it.
