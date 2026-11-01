@@ -1,5 +1,6 @@
 """Unit tests for `dagster/dispar_orchestrate/bronze_catalog.py`'s
-`record_ingest_run` (WS3 plan review Z9).
+`record_ingest_run` (WS3 plan review Z9) and its `register_bronze_table`
+slug guard (DATA-40 D2).
 
 Mirrors `test_capacity_snapshot.py::test_record_capacity_snapshot_writes_one_row`'s
 monkeypatch shape: `record_ingest_run` is defined IN `bronze_catalog`, so
@@ -12,12 +13,16 @@ Run with:
 
 from __future__ import annotations
 
+import pytest
+
 from dispar_orchestrate import bronze_catalog
 from dispar_orchestrate.bronze_catalog import (
     ClickHouseTarget,
+    SlugConflictError,
     last_committed_offset,
     record_ingest_offset,
     record_ingest_run,
+    register_bronze_table,
 )
 
 
@@ -128,3 +133,97 @@ def test_last_committed_offset_returns_the_real_committed_value(monkeypatch):
         ClickHouseTarget(url="http://ch", user="default", password=""), "conn-kafka", "orders", 0
     )
     assert result == 11
+
+
+# ── DATA-40 D2: the slug guard on the write side ─────────────────────────
+#
+# The catalog reads two registries (`lake.bronze_meta.*` and
+# `lake.bronze_meta_sec.*`); one slug must name one dataset (D1). The
+# writer therefore refuses a slug the SECONDARY registry holds, and it
+# refuses it BEFORE the first insert (D2), so a refused write leaves the
+# primary registry untouched.
+#
+# The fake below is the module's own fake-ClickHouse shape: the registry
+# tables do not exist yet (the R10 schema bootstrap creates them, which is
+# why `_ch_query_json` answers the `system.tables` read with no rows), and
+# the secondary registry holds exactly the slugs the test gives it.
+
+
+def _fake_clickhouse(monkeypatch, *, secondary_slugs):
+    """A fake ClickHouse whose secondary registry holds `secondary_slugs`.
+
+    Returns the statements that were executed and the statements that were
+    read, so a test can assert both what was written and what was asked.
+    """
+    executed: list[str] = []
+    queries: list[str] = []
+
+    def _query_json(target, stmt):
+        queries.append(stmt)
+        if "FROM lake.`bronze_meta_sec.dataset_catalog`" not in stmt:
+            # The R10 schema bootstrap's `system.tables` read: the registry
+            # tables do not exist yet, so they are created.
+            return []
+        return [{"slug": slug} for slug in secondary_slugs if f"'{slug}'" in stmt]
+
+    monkeypatch.setattr(bronze_catalog, "_ch_query_json", _query_json)
+    monkeypatch.setattr(bronze_catalog, "_ch_exec", lambda target, stmt: executed.append(stmt))
+    return executed, queries
+
+
+def test_register_bronze_table_refuses_a_slug_the_secondary_registry_holds(monkeypatch):
+    executed, _queries = _fake_clickhouse(monkeypatch, secondary_slugs=["orders"])
+
+    with pytest.raises(SlugConflictError) as err:
+        register_bronze_table(
+            slug="orders",
+            title="Orders",
+            description="The orders",
+            bronze_table_name="orders_raw",
+            row_count=10,
+            target=ClickHouseTarget(url="http://ch", user="default", password=""),
+        )
+
+    assert "orders" in str(err.value)
+    assert not [s for s in executed if "INSERT INTO" in s], (
+        "a refused slug inserts nothing: " + repr(executed)
+    )
+
+
+def test_register_bronze_table_registers_a_free_slug_as_before(monkeypatch):
+    executed, _queries = _fake_clickhouse(monkeypatch, secondary_slugs=["returns"])
+
+    register_bronze_table(
+        slug="orders",
+        title="Orders",
+        description="The orders",
+        bronze_table_name="orders_raw",
+        row_count=10,
+        columns=[("id", "UInt64", "The id")],
+        target=ClickHouseTarget(url="http://ch", user="default", password=""),
+    )
+
+    inserts = [s for s in executed if "INSERT INTO" in s]
+    assert len(inserts) == 3, f"catalog, sync and column rows are written: {executed!r}"
+    assert all("'orders'" in s for s in inserts), inserts
+    assert any("lake.`bronze_meta.dataset_catalog`" in s for s in inserts), inserts
+
+
+def test_the_slug_in_the_conflict_check_is_a_bound_literal(monkeypatch):
+    # A slug with a quote in it: interpolated raw it would break the
+    # statement, so it has to go through `_sql_string_literal`.
+    _executed, queries = _fake_clickhouse(monkeypatch, secondary_slugs=[])
+
+    register_bronze_table(
+        slug="or'ders",
+        title="Orders",
+        description="The orders",
+        bronze_table_name="orders_raw",
+        row_count=10,
+        target=ClickHouseTarget(url="http://ch", user="default", password=""),
+    )
+
+    check = next(q for q in queries if "FROM lake.`bronze_meta_sec.dataset_catalog`" in q)
+    assert "FINAL" in check, check
+    assert "WHERE slug = 'or\\'ders'" in check, check
+    assert "or'ders" not in check.replace("or\\'ders", ""), check
