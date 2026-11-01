@@ -55,9 +55,9 @@ decision D14):
 
 The rule that says which files those are lives in `render_compose.py`,
 which owns the parsing of a Compose file, and in the `TOOL_FILES` table
-above. A mount whose file does not exist, two shipped files whose names
-are the same, and a path that is not a plain relative path are
-REFUSALS: a release that cannot be installed is not written.
+above. A mount whose file does not exist, two files whose names are the
+same, and a path that is not a plain relative path are REFUSALS: a
+release that cannot be installed is not written.
 
 The path rule
 -------------
@@ -68,6 +68,16 @@ manifest is signed, but a signed path still escapes the directory it
 is written in — so a path that is not relative, or that holds a
 component that is not a normal one, is refused here (REL-2 S4 review
 round 1 SHOULD-FIX 1).
+
+The name rule
+-------------
+The release publishes ONE asset per file, and the asset's name is the
+file's own name — its LAST path component (`files::asset_name` in
+`lakehousectl`). Two files whose last component is the same are two
+assets with the same name, and the online install fetches a shipped
+file by that name: it could not tell them apart. So two `files`
+entries whose last component is the same are refused (REL-2 S4 review
+round 1 SHOULD-FIX 2).
 
 The image IDs
 -------------
@@ -126,7 +136,8 @@ import re
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+from typing import Iterable
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RELEASE_DIR = Path(__file__).resolve().parent
@@ -294,6 +305,31 @@ def check_install_path(install_path: str) -> None:
             )
 
 
+def check_file_names(paths: Iterable[str]) -> None:
+    """Refuse two files whose LAST component is the same.
+
+    The release publishes one asset per file, and the asset's name is
+    the file's own name — its last path component (`files::asset_name`
+    in `lakehousectl`). Two files whose last component is the same are
+    two assets with the same name, and the online install fetches a
+    shipped file by that name: it would fetch one of them twice, and
+    the checksum would catch it. A release that cannot be installed is
+    refused rather than published (REL-2 S4 review round 1 SHOULD-FIX
+    2).
+    """
+    seen: dict[str, str] = {}
+    for path in paths:
+        name = PurePosixPath(path).name
+        other = seen.get(name)
+        if other is not None:
+            raise ManifestError(
+                f"the release ships {path} and {other}, and both are named {name}. The release "
+                "publishes one asset per file, and the asset's name is the file's own name, so "
+                "the online install could not tell them apart; the release is refused."
+            )
+        seen[name] = path
+
+
 def check_shipped_names(files: list[ShippedFile]) -> None:
     """Refuse two shipped files an ONLINE install could not tell apart.
 
@@ -303,24 +339,19 @@ def check_shipped_names(files: list[ShippedFile]) -> None:
     with the same name, and the install would fetch one of them twice
     — the checksum would catch it, but a release that cannot be
     installed is refused rather than published (REL-2 S4 decision D14).
+
+    A shipped file named after a release asset of its own is refused
+    for the same reason: the release publishes that asset too.
     """
-    seen: dict[str, str] = {}
     for shipped in files:
-        name = Path(shipped.install_path).name
+        name = PurePosixPath(shipped.install_path).name
         if name in RESOURCE_ASSET_NAMES:
             raise ManifestError(
                 f"the release ships {shipped.install_path}, whose name is the name of a release "
                 f"asset of its own ({name}). Two assets would carry the same name, so the "
                 "release is refused."
             )
-        other = seen.get(name)
-        if other is not None:
-            raise ManifestError(
-                f"the release ships {shipped.install_path} and {other}, and both are named "
-                f"{name}. The online install fetches a shipped file by its name, so it could "
-                "not tell them apart; the release is refused."
-            )
-        seen[name] = shipped.install_path
+    check_file_names(shipped.install_path for shipped in files)
 
 
 def shipped_files(compose_path: Path) -> list[ShippedFile]:
@@ -534,6 +565,11 @@ def build_manifest(
     # escapes it is refused (REL-2 S4 review round 1 SHOULD-FIX 1).
     for install_path in files:
         check_install_path(install_path)
+    # The release publishes one asset per file, and the asset's name is
+    # the file's own name: two `files` entries whose last component is
+    # the same are two assets with the same name (REL-2 S4 review round
+    # 1 SHOULD-FIX 2).
+    check_file_names(files)
     check_files_cover_the_mounts(files, compose_path)
 
     return {

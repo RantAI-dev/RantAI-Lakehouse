@@ -351,6 +351,87 @@ class MountOutsideTheComposeDirectoryTest(unittest.TestCase):
         self.assertIn("..", message)
 
 
+class FileNameTest(unittest.TestCase):
+    """The names the release publishes its files under (REL-2 S4 review
+    round 1 SHOULD-FIX 2).
+
+    The release publishes one asset per file, and the asset's name is
+    the file's own name — its LAST path component (`files::asset_name`
+    in `lakehousectl`). Two files whose last component is the same are
+    two assets with the same name, and the online install fetches a
+    shipped file by that name.
+    """
+
+    def test_two_files_with_the_same_last_component_are_refused(self) -> None:
+        files = {
+            "ops/one/backups.xml": "a checksum",
+            "ops/two/backups.xml": "another checksum",
+        }
+        with self.assertRaises(make_manifest.ManifestError) as caught:
+            make_manifest.check_file_names(files)
+        message = str(caught.exception)
+        self.assertIn("ops/one/backups.xml", message)
+        self.assertIn("ops/two/backups.xml", message)
+        self.assertIn("backups.xml", message)
+
+    def test_files_with_different_names_are_accepted(self) -> None:
+        make_manifest.check_file_names(
+            {
+                "docker-compose.yml": "a checksum",
+                "lakehousectl": "a checksum",
+                "ops/backups/clickhouse/backups.xml": "a checksum",
+                "tools/backup-local.sh": "a checksum",
+            }
+        )
+
+
+class TwoFilesWithTheSameNameTest(unittest.TestCase):
+    """A Compose file that mounts two files with the same name.
+
+    The release would publish two assets with the same name, and the
+    online install fetches a shipped file by its name — so it could
+    not tell them apart.
+    """
+
+    def setUp(self) -> None:
+        self._directory = tempfile.TemporaryDirectory()
+        self.root = Path(self._directory.name)
+        for folder in ("one", "two"):
+            (self.root / "ops" / folder).mkdir(parents=True)
+            (self.root / "ops" / folder / "backups.xml").write_text(
+                "<clickhouse/>\n", encoding="utf-8"
+            )
+        self.compose = self.root / "docker-compose.yml"
+        self.compose.write_text(
+            "services:\n"
+            "  postgres:\n"
+            "    image: postgres:16.15@sha256:"
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n"
+            "    volumes:\n"
+            "      - ./ops/one/backups.xml:/etc/one.xml:ro\n"
+            "      - ./ops/two/backups.xml:/etc/two.xml:ro\n",
+            encoding="utf-8",
+        )
+
+    def tearDown(self) -> None:
+        self._directory.cleanup()
+
+    def test_the_release_is_refused(self) -> None:
+        with self.assertRaises(make_manifest.ManifestError) as caught:
+            make_manifest.build_manifest(
+                version="0.2.0",
+                git_sha="0123456789abcdef0123456789abcdef01234567",
+                published_images={},
+                image_ids={THIRD_PARTY_IMAGE: "sha256:" + "2" * 64},
+                compose_path=self.compose,
+                created_at="2026-11-01T12:00:00Z",
+                upgrade_path=self.root / "upgrade-path.json",
+            )
+        message = str(caught.exception)
+        self.assertIn("ops/one/backups.xml", message)
+        self.assertIn("ops/two/backups.xml", message)
+
+
 class BundleWithShippedFilesTest(unittest.TestCase):
     """The bundle carries the files the release ships."""
 
