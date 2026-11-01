@@ -167,6 +167,17 @@ CREATE TABLE IF NOT EXISTS lake.`bronze_meta.dataset_sync`
 ENGINE = MergeTree
 ORDER BY slug;
 
+-- `DATA-24 T2` (D2): `ReplacingMergeTree`, the engine the registry's ONE
+-- owner declares (`dagster/dispar_orchestrate/bronze_catalog.py`'s
+-- `_registry_schemas`, `ORDER BY (slug, key_asli)`). Every run of a
+-- connector writes the columns of a table again, so the registry holds one
+-- copy per run until `ClickHouse` merges them; the reads ask for the
+-- merged copy (`FINAL`, `rust/crates/lakehouse-api/src/routes/catalog.rs`),
+-- and a table that is a plain `MergeTree` has no merged copy to ask for.
+--
+-- CATATAN: `CREATE TABLE IF NOT EXISTS` tidak pernah mengubah tabel yang
+-- sudah ada. Stack yang sudah ter-seed sebelum perubahan ini tetap
+-- `MergeTree` sampai tabelnya dihapus dan dibuat ulang.
 CREATE TABLE IF NOT EXISTS lake.`bronze_meta.dataset_column`
 (
     slug      String,
@@ -174,7 +185,7 @@ CREATE TABLE IF NOT EXISTS lake.`bronze_meta.dataset_column`
     tipe      String,
     deskripsi String
 )
-ENGINE = MergeTree
+ENGINE = ReplacingMergeTree
 ORDER BY (slug, key_asli);
 
 CREATE TABLE IF NOT EXISTS lake.`bronze_meta_sec.dataset_catalog`
@@ -204,6 +215,8 @@ CREATE TABLE IF NOT EXISTS lake.`bronze_meta_sec.dataset_sync`
 ENGINE = MergeTree
 ORDER BY slug;
 
+-- `DATA-24 T2` (D2): `ReplacingMergeTree`, the engine the registry's ONE
+-- owner declares — see the note on `bronze_meta.dataset_column` above.
 CREATE TABLE IF NOT EXISTS lake.`bronze_meta_sec.dataset_column`
 (
     slug      String,
@@ -211,7 +224,7 @@ CREATE TABLE IF NOT EXISTS lake.`bronze_meta_sec.dataset_column`
     tipe      String,
     deskripsi String
 )
-ENGINE = MergeTree
+ENGINE = ReplacingMergeTree
 ORDER BY (slug, key_asli);
 
 -- ===========================================================================

@@ -199,10 +199,45 @@ INDONESIAN_MARKERS = (
 
 RAW_ERROR_PATTERNS = (r"DB::Exception", r"Code: \d+", r"\bstack trace\b", r"SQLSTATE")
 
-# The text a continuation is sent as: the steps the request still has, sent
-# back to the model once the draft is confirmed. The console sends the same
-# text, so the runner measures the product and not a variant of it.
-CONTINUATION_PREFIX = "Confirmed. Continue: "
+def continuation_text(turn_confirms: list[dict[str, Any]], next_step: str) -> str:
+    """The text a continuation is sent as (`AI-15`): the objects the person
+    confirmed and that were saved, then the step the request still has.
+
+    The model reads only the text of the chat, so the saved objects have to
+    be named in it — without them it drafts them again. One item per
+    confirmed step that succeeded, in the order of the confirms. The console
+    builds the same text from its stored steps, so the runner measures the
+    product and not a variant of it.
+    """
+    items = [item for confirm in turn_confirms if (item := saved_item(confirm)) is not None]
+    return f"Confirmed and saved: {'; '.join(items)}. Do not draft these again. Continue: {next_step}"
+
+
+def saved_item(confirm: dict[str, Any]) -> str | None:
+    """The item that names one saved object, or None when the confirm saved
+    nothing: one that did not come back `executed` with HTTP 200.
+
+    The id is `result.id`, or `result.field.id` for a calculated field; the
+    title is `result.title`, else `result.name`, else `result.field.name`.
+    A part the result does not carry is left out, never invented, so the
+    item is the tool name alone when there is neither an id nor a title.
+    """
+    if not confirm_succeeded(confirm):
+        return None
+    result = confirmed_result(confirm)
+    field = result.get("field")
+    if not isinstance(field, dict):
+        field = {}
+    ident = _text_of(result.get("id")) or _text_of(field.get("id"))
+    title = _text_of(result.get("title")) or _text_of(result.get("name")) or _text_of(field.get("name"))
+    tool = str(confirm.get("tool") or "")
+    return tool + (f" {ident}" if ident else "") + (f' "{title}"' if title else "")
+
+
+def _text_of(value: Any) -> str | None:
+    """The text a result carries, or None when it carries none."""
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
 
 # How many continuation messages may follow one scripted turn. The console
 # has the same cap.
@@ -1032,7 +1067,10 @@ def run_case(cfg: Config, session: requests.Session, case: dict[str, Any]) -> di
                 if not turn_confirms or not all(confirm_succeeded(c) for c in turn_confirms):
                     break
                 messages.append(
-                    {"role": "user", "content": CONTINUATION_PREFIX + str(body["nextStep"])}
+                    {
+                        "role": "user",
+                        "content": continuation_text(turn_confirms, str(body["nextStep"])),
+                    }
                 )
                 body = ask(cfg, session, mode, messages, context=context)
                 bodies.append(body)

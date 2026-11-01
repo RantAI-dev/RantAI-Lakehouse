@@ -59,7 +59,11 @@ class FakeResponse:
 
 
 class FakeSession:
-    """Records every call; answers from a script keyed by (method, path)."""
+    """Records every call; answers from a script keyed by (method, path).
+
+    A list of replies answers in order and stays on its last reply, the
+    way a single scripted reply repeats.
+    """
 
     def __init__(self, replies: dict[tuple[str, str], Any] | None = None) -> None:
         self.replies = replies or {}
@@ -70,6 +74,8 @@ class FakeSession:
         key = (method, path)
         self.calls.append((method, url, body))
         reply = self.replies.get(key)
+        if isinstance(reply, list):
+            reply = reply.pop(0) if len(reply) > 1 else (reply[0] if reply else None)
         if isinstance(reply, FakeResponse):
             return reply
         return FakeResponse(200, reply if reply is not None else {"ok": True})
@@ -284,22 +290,27 @@ class ContinuationTests(unittest.TestCase):
 
         return fake_ask, sent
 
-    def body_with_next_step(self, next_step: str | None = "add two charts") -> dict[str, Any]:
-        """A turn that drafted a chart (waiting for a Confirm) and, when it
-        says so, the steps the request still has."""
+    def body_with_next_step(
+        self, next_step: str | None = "add two charts", tools: list[str] | None = None
+    ) -> dict[str, Any]:
+        """A turn that drafted a tool call (waiting for a Confirm) and, when
+        it says so, the steps the request still has. `tools` names every
+        draft of the turn when there is more than one."""
+        drafts = tools or ["create_chart"]
         body: dict[str, Any] = {
             "answer": "The chart draft is ready.",
             "_status": 200,
             "toolTrace": [
                 {
-                    "tool": "create_chart",
+                    "tool": tool,
                     "args": {"caption": "C"},
                     "result": {
                         "needs_confirmation": True,
-                        "tool": "create_chart",
+                        "tool": tool,
                         "args": {"caption": "C"},
                     },
                 }
+                for tool in drafts
             ],
         }
         if next_step:
@@ -307,13 +318,17 @@ class ContinuationTests(unittest.TestCase):
         return body
 
     def run_with(
-        self, bodies: list[dict[str, Any]], confirm: dict[str, Any] | None = None
+        self,
+        bodies: list[dict[str, Any]],
+        confirm: dict[str, Any] | list[dict[str, Any]] | None = None,
     ) -> tuple[dict[str, Any], list[list[dict[str, str]]]]:
+        """Run one case against the bodies; `confirm` scripts the replies the
+        confirms get, one per drafted tool when it is a list."""
+        if confirm is None:
+            confirm = confirm_reply("create_chart", {"created": True, "id": "c1", "title": "Visitors"})
+        replies = confirm if isinstance(confirm, list) else [confirm]
         cfg = make_cfg()
-        session = FakeSession({
-            ("POST", "/api/ai/tool"): confirm
-            or confirm_reply("create_chart", {"created": True, "id": "c1"}),
-        })
+        session = FakeSession({("POST", "/api/ai/tool"): replies})
         fake_ask, sent = self.scripted_ask(bodies)
         case = {"id": "continues", "mode": "build", "confirm": True, "turns": ["Draw it."]}
         with mock.patch.object(m, "ask", side_effect=fake_ask):
@@ -327,7 +342,68 @@ class ContinuationTests(unittest.TestCase):
         self.assertEqual(len(sent), 2)
         self.assertEqual(
             sent[1][-1],
-            {"role": "user", "content": "Confirmed. Continue: add two charts"},
+            {
+                "role": "user",
+                "content": 'Confirmed and saved: create_chart c1 "Visitors". Do not draft these again. Continue: add two charts',
+            },
+        )
+
+    def test_two_confirmed_drafts_are_listed_in_one_continuation(self) -> None:
+        # Both drafts the person confirmed are named, in the order of the
+        # steps, so the model sees what exists and drafts nothing again.
+        result, sent = self.run_with(
+            [
+                self.body_with_next_step(tools=["create_board", "update_chart"]),
+                self.body_with_next_step(None),
+            ],
+            confirm=[
+                confirm_reply("create_board", {"created": True, "id": "b1", "name": "Overview"}),
+                confirm_reply("update_chart", {"updated": True, "id": "c1", "title": "Visitors"}),
+            ],
+        )
+
+        self.assertEqual(result["problems"], [])
+        self.assertEqual(
+            sent[1][-1],
+            {
+                "role": "user",
+                "content": 'Confirmed and saved: create_board b1 "Overview"; update_chart c1 "Visitors". Do not draft these again. Continue: add two charts',
+            },
+        )
+
+    def test_a_result_without_an_id_or_a_title_names_only_the_tool(self) -> None:
+        _result, sent = self.run_with(
+            [self.body_with_next_step(), self.body_with_next_step(None)],
+            confirm=confirm_reply("create_chart", {"created": True}),
+        )
+
+        self.assertEqual(
+            sent[1][-1],
+            {
+                "role": "user",
+                "content": "Confirmed and saved: create_chart. Do not draft these again. Continue: add two charts",
+            },
+        )
+
+    def test_a_calculated_field_is_named_through_its_field(self) -> None:
+        # A calculated field carries its name in `field`, not at the top of
+        # the result; the item still names it.
+        _result, sent = self.run_with(
+            [
+                self.body_with_next_step(tools=["create_calculated_field"]),
+                self.body_with_next_step(None),
+            ],
+            confirm=confirm_reply(
+                "create_calculated_field", {"ok": True, "id": "f1", "field": {"id": "f1", "name": "Roas"}}
+            ),
+        )
+
+        self.assertEqual(
+            sent[1][-1],
+            {
+                "role": "user",
+                "content": 'Confirmed and saved: create_calculated_field f1 "Roas". Do not draft these again. Continue: add two charts',
+            },
         )
 
     def test_a_body_without_a_next_step_adds_no_turn(self) -> None:

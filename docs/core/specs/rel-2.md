@@ -6,7 +6,7 @@
 | Module | Delivery |
 | Size | L (planner's estimate: S = days, M = one to two weeks, L = several weeks), in four slices |
 | Priority and status | In [BACKLOG.md](../BACKLOG.md), the one place they are kept |
-| Blocked by | Nothing open. Four decisions below need the product owner |
+| Blocked by | Nothing open. The product owner signed every decision and number on 2026-10-31 |
 
 ## Why
 
@@ -102,33 +102,33 @@ lakehousectl update --bundle .    # air-gapped
 **The console** shows its version, and says when the server it talks to has a different one, as
 T3 Code does.
 
-## Decisions the product owner makes
+## Decisions (product owner, 2026-10-31: "ok to all")
 
-| # | Question | Planner's proposal |
+| # | Question | Decision |
 | --- | --- | --- |
 | 1 | The tool's name | `lakehousectl` |
-| 2 | Where `install.sh` and online releases live | GitHub Releases on the public repo, plus a short address on rantai.dev that redirects there (for example `get.rantai.dev/lakehouse`) |
+| 2 | Where `install.sh` and online releases live | GitHub Releases on the public repo, plus `https://get.rantai.dev/lakehouse`, a Cloudflare redirect to the latest release's `install.sh` |
 | 3 | Who holds the signing key | A cosign key pair. The private key lives in a GitHub Actions environment secret, released only to tag builds, with a required reviewer; the public key is built into `lakehousectl` and published. Keyless (Sigstore) is rejected: its offline verification is less simple. |
 | 4 | The version policy | Sign `reference/release-policy.md` as proposed (SemVer, minor for any operator action), and cut **0.2.0** as the first release through the new pipeline |
 
 ## Target specs
 
-Numbers marked *(proposed)* need the product owner's sign-off.
+Every number below was signed by the product owner on 2026-10-31.
 
 | Capability | Today | Target |
 | --- | --- | --- |
-| Install steps | About 10, from source | **One command**, with no question asked *(proposed)* |
-| Time to a ready console | Not measured (source build) | **15 minutes or less** on a 4-core, 16 GB host, excluding download *(proposed; measured per release)* |
+| Install steps | About 10, from source | **One command**, with no question asked |
+| Time to a ready console | Not measured (source build) | **15 minutes or less** on a 4-core, 16 GB host, excluding download *(measured per release)* |
 | Hand-edited settings | A 911-line `.env` | **None required**. Optional settings are passed as flags or edited later. |
 | Images | Built on site | Published, pinned by digest, signed, each with an SBOM |
 | Offline install | Not supported | One signed file, verified with no network |
-| Pre-flight | None | OS and architecture, Docker 24 or newer, Compose 2.24 or newer, 4 or more CPUs, 16 GB or more RAM, 50 GB or more free disk, free ports *(proposed minimums)* |
+| Pre-flight | None | OS and architecture, Docker 24 or newer, Compose 2.24 or newer, 4 or more CPUs, 16 GB or more RAM, 50 GB or more free disk, free ports |
 | Update | Rebuild by hand | **One command** |
 | Backup before update | By hand, needs S3 | **Automatic, to local disk**, covering the connector secrets too |
 | Failed update | Manual restore | **Automatic rollback** to the previous release and its data |
-| Upgrade path | Undefined | A release may name required stops, and the tool takes them. A direct update from the previous two minor releases always works *(proposed)* |
+| Upgrade path | Undefined | A release may name required stops, and the tool takes them. A direct update from the previous two minor releases always works |
 | Proof | None | CI installs the previous release, updates to the new one, and passes. It also forces a failed update and proves the rollback, on every release. |
-| Hosts | Any (source build) | Linux x86_64 first; arm64 later *(proposed)* |
+| Hosts | Any (source build) | Linux x86_64 first; arm64 later |
 | Bundle size | n/a | Measured and published with each release, never assumed |
 
 ## Acceptance checklist
@@ -164,6 +164,6 @@ No. This is an operator tool.
 
 ## Before anyone builds it
 
-The four decisions and the *(proposed)* numbers need the product owner's sign-off. The plan is
+The four decisions and the numbers need the product owner's sign-off. The plan is
 `docs/superpowers/plans/2026-10-31-rel-2-one-step-install-and-update.md`, and its first slice
 does not depend on the decisions.

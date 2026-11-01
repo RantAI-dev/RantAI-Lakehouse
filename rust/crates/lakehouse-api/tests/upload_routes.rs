@@ -1004,6 +1004,35 @@ impl Stack {
         age: &str,
     ) {
         self.seed(tenant, id, b"id,name\n1,a\n").await;
+        self.mark_loading(tenant, id, table, run_id, age).await;
+    }
+
+    /// Put a workbook upload in the state a launched load leaves it in, claimed
+    /// `age` ago: as [`Self::seed_loading`], for an upload the API converted
+    /// before the load.
+    async fn seed_loading_workbook(
+        &self,
+        tenant: &str,
+        id: &str,
+        table: &str,
+        run_id: Option<&str>,
+        age: &str,
+    ) {
+        self.seed_workbook(tenant, id, &workbook("stock.xlsx"))
+            .await;
+        self.mark_loading(tenant, id, table, run_id, age).await;
+    }
+
+    /// The state a launched load leaves an upload in: claimed `age` ago, with
+    /// the table claimed for its tenant and the run attached.
+    async fn mark_loading(
+        &self,
+        tenant: &str,
+        id: &str,
+        table: &str,
+        run_id: Option<&str>,
+        age: &str,
+    ) {
         self.claim(tenant, table, id).await;
         let options = json!({ "encoding": "utf-8", "delimiter": ",", "headerRow": 0 });
         uploads::mark_ingesting(&self.app.pool, id, &options, table, LoadMode::Replace, None)
@@ -4017,6 +4046,40 @@ async fn a_delete_removes_the_object_and_the_row() {
     assert_eq!(event.3, json!({ "fileName": "a.csv", "sizeBytes": 8 }));
 }
 
+/// The report of values that did not fit belongs to the upload: it is beside
+/// the original (`DATA-31`), and a delete takes it with it. It is removed for
+/// every format, not only for a workbook's.
+#[tokio::test]
+async fn a_delete_removes_the_report_of_values_that_did_not_fit() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    let id = "up-report-1";
+    stack
+        .seed_workbook(GROUP, id, &workbook("stock.xlsx"))
+        .await;
+    let key = format!("uploads/{GROUP}/{id}.xlsx");
+    stack
+        .bucket
+        .put(&format!("{key}.bad-values.json"), &report_bytes(2));
+
+    let delete = stack
+        .send(
+            &bayu,
+            "DELETE",
+            &format!("/api/uploads/{id}"),
+            Payload::None,
+        )
+        .await;
+
+    assert_eq!(delete.status, StatusCode::NO_CONTENT, "{}", delete.text);
+    let keys = stack.bucket.keys();
+    assert!(
+        !keys.contains(&format!("{key}.bad-values.json")),
+        "the report is gone: {keys:?}"
+    );
+    assert!(!keys.contains(&key), "the upload itself is gone: {keys:?}");
+}
+
 #[tokio::test]
 async fn deleting_an_upload_that_loaded_a_table_records_the_table_and_leaves_the_claim() {
     let stack = Stack::start().await;
@@ -6243,6 +6306,12 @@ async fn seed_typed_loading(stack: &Stack, id: &str) {
     stack
         .seed_loading(GROUP, id, "stock_raw", Some("run-1"), "1 hour")
         .await;
+    set_column_spec(stack, id).await;
+}
+
+/// Give the upload a column list, so the report of values that did not fit is
+/// read when it is settled.
+async fn set_column_spec(stack: &Stack, id: &str) {
     sqlx::query("UPDATE file_upload SET column_spec = $2, on_bad_value = 'null' WHERE id = $1")
         .bind(id)
         .bind(sqlx::types::Json(
@@ -6305,6 +6374,34 @@ async fn a_settled_typed_load_carries_the_report_of_values_that_did_not_fit() {
     assert_eq!(failed.json["status"], "failed");
     assert_eq!(failed.json["error"], BAD_VALUES_REASON);
     assert_eq!(failed.json["badValues"]["count"], 5);
+
+    // A workbook: the job reads the converted sheet, but the report is beside
+    // the ORIGINAL, where the API reads it (`DATA-31`).
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    mount_run_status(&stack.dagster, "SUCCESS").await;
+    stack
+        .seed_loading_workbook(GROUP, "up-3", "stock_raw", Some("run-1"), "1 hour")
+        .await;
+    set_column_spec(&stack, "up-3").await;
+    stack.bucket.put(
+        &format!("uploads/{GROUP}/up-3.xlsx.bad-values.json"),
+        &report_bytes(2),
+    );
+    mount_results(
+        &stack.ch,
+        &json!([result_row("up-3", "succeeded", Some(3), "", 30)]),
+    )
+    .await;
+
+    let workbook = stack.get(&bayu, "/api/uploads/up-3").await;
+    assert_eq!(workbook.status, StatusCode::OK, "{}", workbook.text);
+    assert_eq!(workbook.json["status"], "ingested");
+    assert_eq!(
+        workbook.json["badValues"]["count"], 2,
+        "the report of a typed workbook load is read: {}",
+        workbook.text
+    );
 }
 
 /// No report, a report that is not the job's shape, and a report of an upload

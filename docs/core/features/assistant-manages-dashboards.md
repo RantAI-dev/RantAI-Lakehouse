@@ -148,11 +148,16 @@ the same page share the model's prompt.
 A write that the rest of the request needs cannot be finished in one
 turn: the draft waits for the Confirm button, and the chart that needs
 the board does not exist yet. The assistant therefore names the draft it
-made and, when steps are left, the steps that are left; the console sends
-those steps back as "Confirmed. Continue: ..." in the same session once
-the draft is confirmed and succeeded. A cancelled or failed draft sends
-nothing, so a refused step stops the request there. At most three such
-continuations follow one typed message.
+made and, when steps are left, the steps that are left; once the draft is
+confirmed and succeeded, the console sends a message that begins
+"Confirmed and saved: ..." in the same session. The message names each
+object the Confirm saved (its tool, id and title, the parts the result
+carries; a part the result does not carry is left out) and says not to
+draft those objects again, then "Continue:" with the steps that are left;
+it names what was saved, it does not re-send the tool results. A
+cancelled or failed draft sends nothing, so a refused step stops the
+request there. At most three such continuations follow one typed
+message.
 
 ## Decisions
 

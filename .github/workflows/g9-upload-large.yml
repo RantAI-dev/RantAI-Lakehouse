@@ -9,6 +9,12 @@
 # 2,147,483,648 bytes, which the API accepts; a size above it is refused by design. The
 # figures of these runs are docs/plans/DATA-17-RESULT.md.
 #
+# CONCURRENT LOADS AND THE FORMATS NOT YET MEASURED (DATA-33, DATA-34): `concurrent`
+# (1 by default) is how many loads of the same file run at once; `avro_mb`, `zip_mb`
+# and `parquet_one_group_mb` (0 by default, which skips them) add the Avro file, the
+# zip of CSVs and the Parquet file of one row group. Their figures are read into
+# docs/plans/DATA-17-RESULT.md as well.
+#
 # A workflow of its own, started only with "Run workflow", for three reasons:
 #
 # - It is a MEASUREMENT, not an acceptance gate. It takes a long time at full size
@@ -50,6 +56,22 @@ on:
       gzip_mb:
         description: "MiB a generated gzipped CSV unpacks to (0 skips it). The 2 GiB cap counts the unpacked size; 2048 is the full T6.1 size, opt-in."
         default: "200"
+        type: string
+      concurrent:
+        description: "How many loads of the same file run at once (DATA-33). 1 is one load at a time; the loads start together, each into its own table."
+        default: "1"
+        type: string
+      avro_mb:
+        description: "Size of the generated Avro file in MiB (0 skips it). DATA-34: the null codec and string fields only."
+        default: "0"
+        type: string
+      zip_mb:
+        description: "MiB the CSVs of one generated zip unpack to (0 skips it). DATA-34: the unpacked size is what the 2 GiB cap counts."
+        default: "0"
+        type: string
+      parquet_one_group_mb:
+        description: "MiB of the generated Parquet file that holds exactly one row group (0 skips it). DATA-34: the reader decodes a row group whole."
+        default: "0"
         type: string
 
 permissions:
@@ -131,13 +153,17 @@ jobs:
           # status and a failed harness reports a green job (g9-upload-large
           # run 39795803595).
           set -o pipefail
-          python3 -m pip install --quiet requests pyarrow
+          python3 -m pip install --quiet requests pyarrow fastavro
           python3 ops/g9/large_upload.py \
             --csv-mb "${{ inputs.csv_mb }}" \
             --parquet-mb "${{ inputs.parquet_mb }}" \
             --parquet-files "${{ inputs.parquet_files }}" \
             --jsonl-mb "${{ inputs.jsonl_mb }}" \
             --gzip-mb "${{ inputs.gzip_mb }}" \
+            --concurrent "${{ inputs.concurrent }}" \
+            --avro-mb "${{ inputs.avro_mb }}" \
+            --zip-mb "${{ inputs.zip_mb }}" \
+            --parquet-one-group-mb "${{ inputs.parquet_one_group_mb }}" \
             --scratch "$RUNNER_TEMP/large" \
             --containers "api=g9large-lakehouse-api-1,dagster=g9large-dagster-code-location-1" \
             | tee "$RUNNER_TEMP/large-upload.txt"
