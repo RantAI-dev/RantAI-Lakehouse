@@ -111,6 +111,15 @@
 //! load limits count a load once ([`loads_under_limits`] skips rows with
 //! `loaded_with`). A later claim of any of the files lets go of the files it led, and
 //! deleting a primary leaves the others with no pointer (`ON DELETE SET NULL`).
+//!
+//! # A separate limit on large loads (`DATA-37`)
+//!
+//! A load whose files total more than [`LARGE_LOAD_BYTES`] is a large load: the
+//! primary upload's `size_bytes` plus that of every upload it carries. How many
+//! large loads may run at once is a limit of its own ([`LoadLimits::large`]),
+//! checked with the other two in the same place and under the same lock, so two
+//! starts at the same moment cannot both take the last large place. A load that is
+//! not large never counts against it and is never refused by it.
 
 use serde::Serialize;
 use serde_json::Value;
@@ -821,6 +830,18 @@ pub async fn mark_ingesting(
 /// the row itself is not changed here, it is only not counted.
 const LOAD_COUNTS_FOR_HOURS: i32 = 6;
 
+/// A load whose files total more than this is a **large load** (`DATA-37`
+/// decision D1): the primary upload's `size_bytes` plus that of every
+/// upload it carries (`loaded_with`).
+///
+/// 512 MiB. `DATA-33` measured about 2.2 GiB of job memory for a 2 GiB
+/// load (`plans/DATA-17-RESULT.md`), so the sixteen loads the installation
+/// limit allows would ask for about 35 GiB on a host whose minimum is
+/// 16 GiB. The threshold is a constant and not a setting: it says what a
+/// large load IS. How many of them may run at once is the setting
+/// (`DATA-37` decision D2, `UPLOAD_MAX_CONCURRENT_LARGE`).
+pub const LARGE_LOAD_BYTES: i64 = 512 * 1024 * 1024;
+
 /// How many loads may run at once (`SEC-17`): per `uploaded_by` and in
 /// total. Both are at least 1; the API reads them from its configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -829,6 +850,25 @@ pub struct LoadLimits {
     pub per_user: i64,
     /// Loads any `uploaded_by` may have at once, together.
     pub total: i64,
+    /// Large loads that may run at once in the whole installation
+    /// (`DATA-37` decision D2). A load that is not large never counts
+    /// against it and is never refused by it (decision D3).
+    pub large: i64,
+}
+
+/// What the load limits said about a load that wants to start (`DATA-37`
+/// decision D3: the large limit is checked with the other two, in the same
+/// place and under the same lock).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LimitOutcome {
+    /// Under every limit: the load may start.
+    Under,
+    /// The per-user or the installation-wide limit is reached.
+    LimitReached,
+    /// The large-load limit is reached (`DATA-37` decision D4: the refusal
+    /// has a sentence of its own, so the person can tell it from the
+    /// per-user one).
+    LargeLimitReached,
 }
 
 /// What [`mark_ingesting_within_limits`] did.
@@ -841,16 +881,20 @@ pub enum MarkOutcome {
     NotMarked,
     /// A limit was reached; nothing was changed.
     LimitReached,
+    /// The installation already runs the maximum number of large loads
+    /// (`DATA-37` decision D3); nothing was changed.
+    LargeLimitReached,
     /// A load of several files: one of the other files could not be taken (it is
     /// loading, being received, gone or another tenant's), so nothing was changed.
     /// Only [`mark_group_within_limits`] answers it.
     GroupNotMarked,
 }
 
-/// Whether `uploaded_by` (the person recorded on upload `id`) and the
-/// installation are both under `limits`, counting `ingesting` rows. A read:
-/// the route asks it before it claims a table name so that a refusal leaves
-/// no claim behind; [`mark_ingesting_within_limits`] is what decides.
+/// Whether the load of `id`, with the other files of `also`, may start: the
+/// person who uploaded it and the installation are both under `limits`, and
+/// the installation is under the large-load limit when this load is large. A
+/// read: the route asks it before it claims a table name so that a refusal
+/// leaves no claim behind; [`mark_ingesting_within_limits`] is what decides.
 ///
 /// The person is the one the upload records, not whoever pressed Load
 /// (`SEC-17`, decision D6).
@@ -861,19 +905,27 @@ pub enum MarkOutcome {
 pub async fn loads_under_limits(
     pool: &PgPool,
     id: &str,
+    also: &[String],
     limits: LoadLimits,
-) -> Result<bool, StoreError> {
+) -> Result<LimitOutcome, StoreError> {
     let mut conn = pool.acquire().await?;
-    Ok(under_limits(&mut conn, id, limits).await?)
+    Ok(under_limits(&mut conn, id, also, limits).await?)
 }
 
-/// The two counts and the comparison, on a connection that may already hold
+/// The counts and the comparison, on a connection that may already hold
 /// the lock of [`mark_ingesting_within_limits`].
+///
+/// `DATA-37` decision D3: the large limit is checked here, with the other
+/// two, under the same lock, so two starts at the same moment cannot both
+/// take the last large place. The per-user and the installation-wide limits
+/// are read first, so a load that is over one of them keeps the refusal it
+/// has always had; the large limit speaks only for a load that is large.
 async fn under_limits(
     conn: &mut sqlx::PgConnection,
     id: &str,
+    also: &[String],
     limits: LoadLimits,
-) -> Result<bool, sqlx::Error> {
+) -> Result<LimitOutcome, sqlx::Error> {
     let (mine, all): (i64, i64) = sqlx::query_as(
         "SELECT \
            count(*) FILTER (WHERE uploaded_by = \
@@ -884,9 +936,46 @@ async fn under_limits(
     )
     .bind(id)
     .bind(LOAD_COUNTS_FOR_HOURS)
-    .fetch_one(conn)
+    .fetch_one(&mut *conn)
     .await?;
-    Ok(mine < limits.per_user && all < limits.total)
+    if !(mine < limits.per_user && all < limits.total) {
+        return Ok(LimitOutcome::LimitReached);
+    }
+    // `DATA-37` decision D1: the size of the load that wants to start is the
+    // primary's own plus that of the files it carries. A row that is not
+    // there counts as nothing: the caller has already settled the files.
+    let size: i64 = sqlx::query_scalar(
+        "SELECT COALESCE((SELECT size_bytes FROM file_upload WHERE id = $1), 0) \
+           + COALESCE((SELECT sum(size_bytes) FROM file_upload WHERE id = ANY($2)), 0)::bigint",
+    )
+    .bind(id)
+    .bind(also)
+    .fetch_one(&mut *conn)
+    .await?;
+    if size <= LARGE_LOAD_BYTES {
+        // A load that is not large never counts against the large limit and
+        // is never refused by it (`DATA-37` decision D3).
+        return Ok(LimitOutcome::Under);
+    }
+    // The loads that are running and are large: a leading `ingesting` row
+    // whose own size plus that of the files it carries is over the
+    // threshold, counted in the same window as the counts above.
+    let large: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM file_upload AS leader \
+          WHERE leader.status = 'ingesting' AND leader.loaded_with IS NULL \
+            AND leader.updated_at > now() - make_interval(hours => $1) \
+            AND leader.size_bytes + COALESCE((SELECT sum(f.size_bytes) FROM file_upload f \
+                 WHERE f.loaded_with = leader.id), 0)::bigint > $2",
+    )
+    .bind(LOAD_COUNTS_FOR_HOURS)
+    .bind(LARGE_LOAD_BYTES)
+    .fetch_one(&mut *conn)
+    .await?;
+    if large < limits.large {
+        Ok(LimitOutcome::Under)
+    } else {
+        Ok(LimitOutcome::LargeLimitReached)
+    }
 }
 
 /// The folder a load puts its files in (`DATA-35` decision 2): three states, so
@@ -1007,6 +1096,12 @@ pub async fn mark_ingesting_within_limits(
 ///   ([`MarkOutcome::GroupNotMarked`]). The caller has already settled and
 ///   checked them: this is the answer when one of them changed in between.
 ///
+/// The size of the load is the primary's own plus that of the files it
+/// carries (`DATA-37` decision D1), so a load of several small files can be
+/// a large load. The large limit is checked with the other two, under the
+/// same lock (decision D3); a load that is over it is refused with
+/// [`MarkOutcome::LargeLimitReached`] and nothing is changed.
+///
 /// # Errors
 ///
 /// Returns [`StoreError::Database`] on a database failure.
@@ -1023,9 +1118,19 @@ pub async fn mark_group_within_limits(
     sqlx::query("SELECT pg_advisory_xact_lock(hashtext('file_upload:ingest_limit'))")
         .execute(&mut *tx)
         .await?;
-    if !under_limits(&mut tx, id, limits).await? {
-        tx.rollback().await?;
-        return Ok(MarkOutcome::LimitReached);
+    // `DATA-37` decision D3: the large limit is checked here, with the other
+    // two, under the same lock, so two starts at the same moment cannot both
+    // take the last large place.
+    match under_limits(&mut tx, id, also, limits).await? {
+        LimitOutcome::Under => {}
+        LimitOutcome::LimitReached => {
+            tx.rollback().await?;
+            return Ok(MarkOutcome::LimitReached);
+        }
+        LimitOutcome::LargeLimitReached => {
+            tx.rollback().await?;
+            return Ok(MarkOutcome::LargeLimitReached);
+        }
     }
     let mut taking: Vec<String> = Vec::with_capacity(also.len() + 1);
     taking.push(id.to_owned());
