@@ -151,7 +151,7 @@ import json
 import logging
 import os
 import warnings
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Protocol
@@ -170,7 +170,7 @@ from pydantic import TypeAdapter
 from pyiceberg.expressions import AlwaysTrue
 from pyiceberg.types import IcebergType
 
-from dispar_orchestrate.adapters import dedup, history, iceberg_stream
+from dispar_orchestrate.adapters import dedup, history, iceberg_snapshot, iceberg_stream
 
 logger = logging.getLogger(__name__)
 
@@ -930,6 +930,11 @@ def _replace_changing_types(
     written leaves their data files in the bucket, unreferenced by the table (the orphan
     clean-up of `maintenance.py` owns those).
 
+    `DATA-36`: the groups are written into ONE snapshot producer, so the load leaves ONE
+    snapshot: a replace that changed a column's type used to leave a DELETE snapshot and
+    an APPEND snapshot per group behind, and every one of them was a state the table could
+    be read at (`adapters/iceberg_snapshot.py`).
+
     The table's `dlt` schema (in the bucket) keeps the old types of the changed columns
     until the next `dlt` load of the table, which always declares its column types, and
     those declarations win (section 8 item 5: no variant column).
@@ -940,20 +945,11 @@ def _replace_changing_types(
     rows = 0
     pending: list[pa.Table] = []
     pending_bytes = 0
-    first = True
-    with table.transaction() as transaction:
-        _retype_in(transaction, table, changed, column_types)
-        target = transaction.table_metadata.schema().as_arrow()
 
-        def flush() -> None:
-            nonlocal first, pending, pending_bytes
-            if not pending and not first:
-                return
-            chunk = pa.concat_tables(pending) if pending else target.empty_table()
-            # The first group replaces what the table holds; later groups add to it.
-            (transaction.overwrite if first else transaction.append)(chunk)
-            first, pending, pending_bytes = False, [], 0
-
+    def groups(target: pa.Schema) -> Iterator[pa.Table]:
+        """The load's groups, one at a time: the batches of `source` laid out as the
+        table's new schema, gathered up to `RETYPE_FLUSH_BYTES`."""
+        nonlocal rows, pending, pending_bytes
         for item in _items_of(source):
             fitted = _fit_batch(
                 pa.Table.from_batches([item]) if isinstance(item, pa.RecordBatch) else item, target, load_id
@@ -962,8 +958,18 @@ def _replace_changing_types(
             pending.append(fitted)
             pending_bytes += fitted.nbytes
             if pending_bytes >= RETYPE_FLUSH_BYTES:
-                flush()
-        flush()
+                chunk = pa.concat_tables(pending)
+                pending, pending_bytes = [], 0
+                yield chunk
+        if pending:
+            yield pa.concat_tables(pending)
+
+    with table.transaction() as transaction:
+        _retype_in(transaction, table, changed, column_types)
+        target = transaction.table_metadata.schema().as_arrow()
+        # A replace: the table's own rows are deleted and the load's rows are added, in ONE
+        # snapshot. A load of no rows at all empties the table, as it did before.
+        iceberg_snapshot.write_one_snapshot(table, transaction, groups(target), replace=True)
     return rows
 
 

@@ -611,6 +611,17 @@ fn converted_answer_key(storage_key: &str, position: usize) -> String {
     format!("{storage_key}.converted.{position}.json")
 }
 
+/// The suffix of the object the job writes its report of values that did not fit
+/// to (`file_ingest.REPORT_SUFFIX`, plan AD6).
+const REPORT_SUFFIX: &str = ".bad-values.json";
+
+/// The key the job's report of values that did not fit is stored under, beside
+/// the ORIGINAL of the upload: the API reads it there (`DATA-31`), and the job
+/// writes it there too, whatever object it read.
+fn report_key(storage_key: &str) -> String {
+    format!("{storage_key}{REPORT_SUFFIX}")
+}
+
 /// The answer a conversion failure gets.
 ///
 /// Each failure is one answer (`SEC-22` D4): the installation is busy (429),
@@ -3337,8 +3348,9 @@ async fn finish_launch_and_audit(
 // ── Delete ───────────────────────────────────────────────────────────────
 
 /// `DELETE /api/uploads/{id}` — remove the object (and the converted text of a
-/// workbook or Parquet file), then the row. 204. For an upload still being
-/// received (`DATA-17`) it aborts the multipart upload first. The
+/// workbook or Parquet file, and the report of values that did not fit), then
+/// the row. 204. For an upload still being received (`DATA-17`) it aborts the
+/// multipart upload first. The
 /// table the upload became is not touched, and neither is the claim on its
 /// name: that is a record of its own ([`uploads::claim_table`]) and is never
 /// released, so a later upload of the tenant can still load into the table and
@@ -3409,6 +3421,10 @@ pub async fn delete(
         store.delete(&converted_key(&row.storage_key)).await?;
     }
     store.delete(&row.storage_key).await?;
+    // The report of values that did not fit belongs to the upload: it is
+    // beside the original (`DATA-31`), and a delete takes it with it. A
+    // missing object is a no-op, as for the others.
+    store.delete(&report_key(&row.storage_key)).await?;
     if !uploads::delete(pool, &row.id).await? {
         // Refused because a load was claimed after the check above, or the
         // row was deleted by another request meanwhile.

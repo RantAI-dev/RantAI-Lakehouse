@@ -7,6 +7,9 @@ Plan: `docs/superpowers/plans/2026-10-09-data-11-catalog-search.md`, task T4.
 The planner writes `docs/plans/DATA-11-RESULT.md` from this script's output;
 this file measures, it states no verdict.
 
+The manual workflow that runs it end to end on a throwaway stack is
+`.github/workflows/catalog-search-bench.yml` (DATA-24 T3, decision D3).
+
 # Never point this at a shared stack
 
 `seed` WRITES synthetic rows into the two Bronze registries
@@ -28,15 +31,22 @@ command: the stack is the cleanup.
   HTTP interface into the Iceberg registries; that this INSERT is accepted on
   every deployment was NOT verified when the script was written -- a refusal
   surfaces as the HTTP error and nothing is retried or faked.
-- `run [--rounds 50]`: signs in, then sends `--rounds` searches (default 50) to
-  `GET /api/catalog?q=` and as many to `GET /api/catalog/query?search=`,
-  rotating over four kinds: a table name, a column name, a one-letter typo and
-  two words in reverse order. For each route it prints the first search's time
-  (it builds the search copy, so `run` first waits `--cold-wait` seconds, 35
-  by default, for any copy to pass its 30-second age; the wait is printed)
-  and the p50 / p95 / max of the rest. Each time includes reading the whole
-  response body. Output is one JSON object on stdout so the raw numbers go
-  into the result document unedited; progress goes to stderr.
+  The registry tables are created first, by their ONE owner
+  (`dagster/dispar_orchestrate/bronze_catalog.py`): a stack that never
+  applied the demo SQL has no `lake` database at all, and a table that
+  already exists with a different shape is a loud refusal, never a silent
+  tolerance (R10). This file carries no copy of that DDL.
+- `run [--rounds 50]`: signs in (rotating the bootstrap credential first when
+  the account says a rotation is pending -- see `_login` below), then sends
+  `--rounds` searches (default 50) to `GET /api/catalog?q=` and as many to
+  `GET /api/catalog/query?search=`, rotating over four kinds: a table name, a
+  column name, a one-letter typo and two words in reverse order. For each
+  route it prints the first search's time (it builds the search copy, so `run`
+  first waits `--cold-wait` seconds, 35 by default, for any copy to pass its
+  30-second age; the wait is printed) and the p50 / p95 / max of the rest. Each
+  time includes reading the whole response body. Output is one JSON object on
+  stdout so the raw numbers go into the result document unedited; progress
+  goes to stderr.
 
 # Settings (environment)
 
@@ -63,6 +73,7 @@ import statistics
 import sys
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 import requests
 
@@ -109,6 +120,62 @@ def column_name(j: int) -> str:
     return f"bench_col_{j:02d}_{WORDS[j % len(WORDS)]}"
 
 
+def _registry_owner():
+    """The registry schema's one owner: `dagster/dispar_orchestrate/bronze_catalog.py`.
+
+    Loaded by path, not as a package import: the bench lives in `ops/bench/`
+    and the owner in the Dagster code location, and neither imports the
+    other. The owner file needs nothing but `requests` (its package's
+    `__init__.py` is empty), so loading it here pulls in no Dagster
+    dependency -- the runner that runs the bench installs `requests` and
+    nothing else. The bench therefore carries no copy of the registry DDL
+    (R10: the schema has exactly one owner).
+    """
+    import importlib.util
+
+    owner_path = (
+        Path(__file__).resolve().parents[2] / "dagster" / "dispar_orchestrate" / "bronze_catalog.py"
+    )
+    spec = importlib.util.spec_from_file_location("bench_bronze_catalog_owner", owner_path)
+    if spec is None or spec.loader is None:
+        raise BenchFailure(f"the registry owner is not loadable: {owner_path}")
+    module = importlib.util.module_from_spec(spec)
+    # The module goes into `sys.modules` BEFORE it is executed: `dataclass`
+    # resolves the annotations of a field by looking its own module up in
+    # `sys.modules` (`dataclasses._is_type`), and a module that is not
+    # there yet makes every dataclass in it fail at import time.
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def ensure_registry_schema(settings: Settings) -> None:
+    """Create the `lake` database and the six registry tables when they are
+    missing, and refuse to go on when one of them exists with another shape.
+
+    The owner does the work -- `_assert_or_create_all`, the same call the
+    Dagster job that registers a Bronze table makes
+    (`dagster/dispar_orchestrate/bronze_catalog.py`'s `register_bronze_table`),
+    and the one whose per-table check (`_assert_or_create_schema`) the G3
+    gate exercises against a deliberately mismatched table
+    (`ops/g3/g3_test.py`): this bench writes INTO those tables, and a table
+    with another engine or another set of columns would measure a catalog
+    the product does not have. A drift is a refusal, not a warning.
+    """
+    if not settings.clickhouse_url:
+        raise BenchFailure("BENCH_CLICKHOUSE_URL is not set")
+    owner = _registry_owner()
+    target = owner.ClickHouseTarget(
+        url=settings.clickhouse_url,
+        user=settings.clickhouse_user,
+        password=settings.clickhouse_password,
+    )
+    try:
+        owner._assert_or_create_all(target, owner.EXPECTED_SCHEMAS)
+    except owner.SchemaDriftError as err:
+        raise BenchFailure(f"the registry schema is not the one its owner expects: {err}") from err
+
+
 def _insert(settings: Settings, session: requests.Session, table: str, columns: str, rows: list[dict]) -> None:
     """One `INSERT ... FORMAT JSONEachRow`. `table` and `columns` are constants
     of this file, never input; the values travel in the body as JSON."""
@@ -134,6 +201,7 @@ def seed(settings: Settings, datasets: int, columns: int) -> None:
         )
     if not settings.clickhouse_url:
         raise BenchFailure("BENCH_CLICKHOUSE_URL is not set")
+    ensure_registry_schema(settings)
     session = requests.Session()
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     for index, registry in enumerate(REGISTRIES):
@@ -209,12 +277,20 @@ def _summary(first_ms: float, rest_ms: list[float]) -> dict:
     }
 
 
-def run(settings: Settings, rounds: int, datasets: int, cold_wait: float) -> dict:
-    if not (settings.api_url and settings.email and settings.password):
-        raise BenchFailure("LAKEHOUSE_API_URL, AUTH_BOOTSTRAP_EMAIL and AUTH_BOOTSTRAP_PASSWORD must be set")
-    if rounds < 2:
-        raise BenchFailure("--rounds must be at least 2 (one first search and one more)")
-    api = requests.Session()
+def _login(settings: Settings, api: requests.Session) -> None:
+    """Sign in, and rotate the credential first when the account says a
+    rotation is pending.
+
+    The bootstrap admin is seeded with `must_change_password = true`
+    (`lakehouse-api`'s `main.rs`, `bootstrap_admin`), and the API refuses
+    EVERY route except `POST /api/auth/change-password`,
+    `POST /api/auth/logout` and `GET /api/auth/me` for such a session
+    (`policy.rs`, `allowed_while_must_change_password`) -- a search would be
+    answered 403, not measured. The rotation revokes every session of the
+    account, the one used to make the call included, so the sign-in is
+    repeated afterwards. The same two steps the G3 gate does
+    (`ops/g3/g3_test.py`, `step_login`).
+    """
     login = api.post(
         f"{settings.api_url}/api/auth/login",
         json={"email": settings.email, "password": settings.password},
@@ -222,6 +298,35 @@ def run(settings: Settings, rounds: int, datasets: int, cold_wait: float) -> dic
     )
     if not login.ok:
         raise BenchFailure(f"login failed: {login.status_code}")
+    try:
+        must_rotate = bool(login.json().get("mustChangePassword"))
+    except ValueError as err:
+        raise BenchFailure(f"the login answer was not JSON: {err}") from err
+    if not must_rotate:
+        return
+    rotated = api.post(
+        f"{settings.api_url}/api/auth/change-password",
+        json={"newPassword": settings.password},
+        timeout=10,
+    )
+    if not rotated.ok:
+        raise BenchFailure(f"password rotation failed: {rotated.status_code}")
+    relogin = api.post(
+        f"{settings.api_url}/api/auth/login",
+        json={"email": settings.email, "password": settings.password},
+        timeout=10,
+    )
+    if not relogin.ok:
+        raise BenchFailure(f"re-login failed: {relogin.status_code}")
+
+
+def run(settings: Settings, rounds: int, datasets: int, cold_wait: float) -> dict:
+    if not (settings.api_url and settings.email and settings.password):
+        raise BenchFailure("LAKEHOUSE_API_URL, AUTH_BOOTSTRAP_EMAIL and AUTH_BOOTSTRAP_PASSWORD must be set")
+    if rounds < 2:
+        raise BenchFailure("--rounds must be at least 2 (one first search and one more)")
+    api = requests.Session()
+    _login(settings, api)
     if settings.tenant_id:
         api.headers["X-Tenant"] = settings.tenant_id
 
@@ -244,7 +349,9 @@ def run(settings: Settings, rounds: int, datasets: int, cold_wait: float) -> dic
     return result
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """The command line, in one place, so it can be read (and tested)
+    without running a benchmark."""
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = parser.add_subparsers(dest="command", required=True)
     p_seed = sub.add_parser("seed", help="write synthetic datasets into a THROWAWAY catalog")
@@ -254,7 +361,11 @@ def main() -> int:
     p_run.add_argument("--rounds", type=int, default=50)
     p_run.add_argument("--datasets", type=int, default=10_000, help="how many were seeded; only picks table numbers")
     p_run.add_argument("--cold-wait", type=float, default=35.0)
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
     settings = Settings.from_env()
     try:
         if args.command == "seed":
