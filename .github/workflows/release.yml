@@ -72,8 +72,12 @@ jobs:
     permissions:
       contents: read
     env:
-      # The throwaway registry: a service container of this job, so the
-      # digests the pipeline records are real digests of a real registry.
+      # The throwaway registry: a container of this job, so the digests
+      # the pipeline records are real digests of a real registry. It is
+      # STARTED by a step below, and not declared as a service container:
+      # a service container is started before the first step, and the
+      # step that turns the containerd store on restarts Docker, which
+      # stops it (REL-2 S3 review round 4 BLOCKER 1).
       RELEASE_REGISTRY: localhost:5000
       # The signer reads the key from the environment, by this
       # reference — the same reference the real job uses, so the dry
@@ -90,11 +94,6 @@ jobs:
       # of the three signing steps and of no other step (REL-2 S2 review
       # round 4 SHOULD-FIX 1).
       COSIGN_PASSWORD: ""
-    services:
-      registry:
-        image: registry:2
-        ports:
-          - "5000:5000"
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -110,6 +109,82 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
           sudo docker image prune --all --force
           df -h /
+
+      # The containerd image store, and nothing else (REL-2 S3 D13).
+      #
+      # The bundle holds `docker save` archives, and the air-gapped host
+      # finds its images by the DIGEST the signed manifest pins: on
+      # Docker's classic store no `docker load` registers a repo digest,
+      # so the pinned reference never resolves there. The store is turned
+      # on BEFORE this job's first pull or build, so the images the job
+      # pulls back by digest land in the store the bundle is saved from.
+      #
+      # buildx builds in a builder container of its own, so the images it
+      # pushes are not in the runner's store: the job pulls them back by
+      # digest, and THAT pull is the one that has to happen on the
+      # containerd store.
+      #
+      # The daemon's own configuration is MERGED, not replaced: the
+      # runner's file may hold settings of its own.
+      - name: Turn on the containerd image store
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /etc/docker
+          if [ -f /etc/docker/daemon.json ]; then
+            sudo jq '.features = ((.features // {}) + {"containerd-snapshotter": true})' \
+              /etc/docker/daemon.json > "$RUNNER_TEMP/daemon.json"
+          else
+            echo '{"features": {"containerd-snapshotter": true}}' > "$RUNNER_TEMP/daemon.json"
+          fi
+          sudo cp "$RUNNER_TEMP/daemon.json" /etc/docker/daemon.json
+          sudo systemctl restart docker
+          # The store is ASSERTED, not assumed: a bundle built on the
+          # classic store cannot be installed on an air-gapped host.
+          store="$(docker info --format '{{json .DriverStatus}}')"
+          case "$store" in
+            *io.containerd.snapshotter.v1*) echo "the containerd image store is on: $store" ;;
+            *)
+              echo "::error::the containerd image store is not on: $store"
+              exit 1
+              ;;
+          esac
+
+      # The throwaway registry, started HERE and not declared as a
+      # service container (REL-2 S3 review round 4 BLOCKER 1).
+      #
+      # A service container is started before the FIRST step, and the
+      # step above restarts Docker to turn the containerd store on: that
+      # restart stops the service container, and the store switch hides
+      # the image it ran from — the classic store's images are not in the
+      # containerd one. The image builds that push to `localhost:5000`
+      # would then have no registry to push to, and the dry run would
+      # fail on its first build.
+      #
+      # So the registry is a container of this job, started on the store
+      # the job uses. Its image is PINNED by digest, the way every other
+      # image in this repository is pinned: the digest was read from the
+      # registry's own `docker-content-digest` header for the tag
+      # `registry:2` on 2026-11-01.
+      - name: Start the throwaway registry
+        run: |
+          set -euo pipefail
+          docker run -d --name release-registry --restart always \
+            -p 5000:5000 \
+            registry:2@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
+          # The registry is WAITED FOR: the first build may start before
+          # the registry answers, and a push to a registry that is not up
+          # yet fails. The loop is bounded: a registry that never
+          # answers fails the job instead of hanging it.
+          for attempt in $(seq 1 30); do
+            if curl -fsS http://localhost:5000/v2/ >/dev/null; then
+              echo "the throwaway registry is up (attempt $attempt)"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::the throwaway registry did not answer on http://localhost:5000/v2/"
+          docker logs release-registry || true
+          exit 1
 
       - name: Setup Python
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
@@ -145,7 +220,7 @@ jobs:
       # started: a buildx builder runs in a container of its own, and
       # `localhost` inside it is the builder, not the runner. With the
       # host's network namespace, `localhost:5000` is the registry
-      # service's published port.
+      # container's published port.
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
         with:
@@ -446,6 +521,76 @@ jobs:
             "$SYFT" scan "docker:$reference" -o "cyclonedx-json=sbom/$name.cdx.json"
           done < third-party-images.txt
 
+      # The installer (REL-2 S3-T4): a STATIC binary, so it runs on a
+      # host that has nothing but a Linux kernel — the air-gapped host
+      # installs the stack with it.
+      #
+      # The build is WITHOUT the `test-key` feature: a release build
+      # verifies against the release key compiled into it and against no
+      # other (REL-2 S3-T1). The dry run's own proof builds its own
+      # binary with the feature, because the dry run signs its bundle
+      # with a throwaway key.
+      - name: Build lakehousectl (static, musl)
+        run: |
+          set -euo pipefail
+          # The musl target goes on the PINNED toolchain, so `rustup` has
+          # to run where the pin is: inside `rust/`, next to
+          # `rust-toolchain.toml` (1.99.1). At the repository root it
+          # installed the target for the runner's DEFAULT toolchain, and
+          # the build — which runs on the pinned toolchain — failed with
+          # "can't find crate for core ... the x86_64-unknown-linux-musl
+          # target may not be installed" (PR #313 dry run).
+          #
+          # The target is NOT added to `rust-toolchain.toml`: every
+          # developer reads that file, and a target in it is a download
+          # every developer pays for a build they do not make.
+          cd rust
+          rustup target add x86_64-unknown-linux-musl
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+          cargo build --release --target x86_64-unknown-linux-musl -p lakehousectl
+          cp "target/x86_64-unknown-linux-musl/release/lakehousectl" \
+            ../lakehousectl-linux-x86_64
+          cd ..
+          file lakehousectl-linux-x86_64 || true
+          ls -la lakehousectl-linux-x86_64
+
+      # The image IDs: the config digest of every image the release
+      # runs.
+      #
+      # `docker save` of a pulled image DROPS its registry manifest
+      # digest: after `docker load` the host knows only the image ID,
+      # which is the config digest. So the signed manifest has to carry
+      # it, and an air-gapped install compares the loaded image's ID
+      # with the manifest's (REL-2 S3-T0).
+      - name: The image ids
+        run: |
+          set -euo pipefail
+          python3 ops/release/compose_images.py \
+            --compose docker-compose.release.yml > all-images.txt
+          echo '{}' > image-ids.json
+          while read -r reference; do
+            [ -n "$reference" ] || continue
+            id="$(docker image inspect --format '{{.Id}}' "$reference")"
+            digest="${reference##*@}"
+            if [ "$id" = "$digest" ]; then
+              # The containerd image store reports the image INDEX digest
+              # as the image's ID; the classic store reports the CONFIG
+              # digest. An air-gapped host compares the ID of the image
+              # it LOADED, and that is the config digest on both stores
+              # — so the manifest names the config digest, read from the
+              # image's own saved tar (REL-2 S3-T0).
+              id="$(docker save "$reference" \
+                | tar -xO manifest.json \
+                | jq -r '.[0].Config' \
+                | sed 's|^blobs/sha256/|sha256:|')"
+            fi
+            echo "$reference -> $id"
+            jq --arg reference "$reference" --arg id "$id" \
+              '. + {($reference): $id}' image-ids.json > image-ids.json.next
+            mv image-ids.json.next image-ids.json
+          done < all-images.txt
+
       # The manifest, and the checksum of the Compose file it ships
       # (S2-T3).
       - name: Write the release manifest
@@ -455,7 +600,9 @@ jobs:
             --version "${{ steps.version.outputs.version }}" \
             --git-sha "$GITHUB_SHA" \
             --published-images "$(cat images.json)" \
+            --image-ids image-ids.json \
             --compose docker-compose.release.yml \
+            --lakehousectl lakehousectl-linux-x86_64 \
             --out release.json
 
       # Sign the manifest, and verify it at once: a signature that does
@@ -505,6 +652,7 @@ jobs:
             --compose docker-compose.release.yml \
             --sigstore-bundle release.json.sigstore.json \
             --sbom-dir sbom \
+            --lakehousectl lakehousectl-linux-x86_64 \
             --out dist
           df -h /
 
@@ -551,8 +699,8 @@ jobs:
             echo "key was generated in this job."
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # The bundle and the manifest, as artifacts: this is what the
-      # dry run produces.
+          # The bundle and the manifest, as artifacts: this is what the
+          # dry run produces.
       - name: Upload the bundle and the manifest
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -563,7 +711,14 @@ jobs:
             release.json
             release.json.sigstore.json
             docker-compose.release.yml
+            lakehousectl-linux-x86_64
             sbom/*.cdx.json
+            # The PUBLIC half of the throwaway key: the proof job
+            # verifies the manifest against it, because the dry run
+            # signed the manifest with the key that generated it
+            # (REL-2 S3-T5). The private half was thrown away with the
+            # job.
+            cosign.pub
           retention-days: 7
           if-no-files-found: error
 
@@ -610,6 +765,33 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
           sudo docker image prune --all --force
           df -h /
+
+      # The containerd image store, and nothing else (REL-2 S3 D13).
+      # See the dry run's step of the same name for why: the bundle is
+      # made of `docker save` archives, and only the containerd store
+      # registers the digest an air-gapped host looks the image up by.
+      - name: Turn on the containerd image store
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /etc/docker
+          if [ -f /etc/docker/daemon.json ]; then
+            sudo jq '.features = ((.features // {}) + {"containerd-snapshotter": true})' \
+              /etc/docker/daemon.json > "$RUNNER_TEMP/daemon.json"
+          else
+            echo '{"features": {"containerd-snapshotter": true}}' > "$RUNNER_TEMP/daemon.json"
+          fi
+          sudo cp "$RUNNER_TEMP/daemon.json" /etc/docker/daemon.json
+          sudo systemctl restart docker
+          # The store is ASSERTED, not assumed: a bundle built on the
+          # classic store cannot be installed on an air-gapped host.
+          store="$(docker info --format '{{json .DriverStatus}}')"
+          case "$store" in
+            *io.containerd.snapshotter.v1*) echo "the containerd image store is on: $store" ;;
+            *)
+              echo "::error::the containerd image store is not on: $store"
+              exit 1
+              ;;
+          esac
 
       - name: Setup Python
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
@@ -879,6 +1061,70 @@ jobs:
             "$SYFT" scan "docker:$reference" -o "cyclonedx-json=sbom/$name.cdx.json"
           done < third-party-images.txt
 
+      # The installer (REL-2 S3-T4): a STATIC binary, so it runs on a
+      # host that has nothing but a Linux kernel — the air-gapped host
+      # installs the stack with it.
+      #
+      # The build is WITHOUT the `test-key` feature: a release build
+      # verifies against the release key compiled into it and against no
+      # other (REL-2 S3-T1). The CI dry run's own proof builds its own
+      # binary with the feature, because the dry run signs its bundle
+      # with a throwaway key.
+      - name: Build lakehousectl (static, musl)
+        run: |
+          set -euo pipefail
+          # The musl target goes on the PINNED toolchain, so `rustup` has
+          # to run where the pin is: inside `rust/`, next to
+          # `rust-toolchain.toml` (1.99.1). At the repository root it
+          # installed the target for the runner's DEFAULT toolchain, and
+          # the build — which runs on the pinned toolchain — failed with
+          # "can't find crate for core ... the x86_64-unknown-linux-musl
+          # target may not be installed" (PR #313 dry run).
+          #
+          # The target is NOT added to `rust-toolchain.toml`: every
+          # developer reads that file, and a target in it is a download
+          # every developer pays for a build they do not make.
+          cd rust
+          rustup target add x86_64-unknown-linux-musl
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+          cargo build --release --target x86_64-unknown-linux-musl -p lakehousectl
+          cp "target/x86_64-unknown-linux-musl/release/lakehousectl" \
+            ../lakehousectl-linux-x86_64
+          cd ..
+          file lakehousectl-linux-x86_64 || true
+          ls -la lakehousectl-linux-x86_64
+
+      # The image IDs: the config digest of every image the release
+      # runs. See the dry run's step of the same name (REL-2 S3-T0).
+      - name: The image ids
+        run: |
+          set -euo pipefail
+          python3 ops/release/compose_images.py \
+            --compose docker-compose.release.yml > all-images.txt
+          echo '{}' > image-ids.json
+          while read -r reference; do
+            [ -n "$reference" ] || continue
+            id="$(docker image inspect --format '{{.Id}}' "$reference")"
+            digest="${reference##*@}"
+            if [ "$id" = "$digest" ]; then
+              # The containerd image store reports the image INDEX digest
+              # as the image's ID; the classic store reports the CONFIG
+              # digest. An air-gapped host compares the ID of the image
+              # it LOADED, and that is the config digest on both stores
+              # — so the manifest names the config digest, read from the
+              # image's own saved tar (REL-2 S3-T0).
+              id="$(docker save "$reference" \
+                | tar -xO manifest.json \
+                | jq -r '.[0].Config' \
+                | sed 's|^blobs/sha256/|sha256:|')"
+            fi
+            echo "$reference -> $id"
+            jq --arg reference "$reference" --arg id "$id" \
+              '. + {($reference): $id}' image-ids.json > image-ids.json.next
+            mv image-ids.json.next image-ids.json
+          done < all-images.txt
+
       - name: Write the release manifest
         run: |
           set -euo pipefail
@@ -886,7 +1132,9 @@ jobs:
             --version "${{ steps.version.outputs.version }}" \
             --git-sha "$GITHUB_SHA" \
             --published-images "$(cat images.json)" \
+            --image-ids image-ids.json \
             --compose docker-compose.release.yml \
+            --lakehousectl lakehousectl-linux-x86_64 \
             --out release.json
 
       # Sign the manifest with the RELEASE key, and verify it with the
@@ -921,6 +1169,7 @@ jobs:
             --compose docker-compose.release.yml \
             --sigstore-bundle release.json.sigstore.json \
             --sbom-dir sbom \
+            --lakehousectl lakehousectl-linux-x86_64 \
             --out dist
           df -h /
 
@@ -936,13 +1185,17 @@ jobs:
           cp release.json release-assets/
           cp release.json.sigstore.json release-assets/
           cp sbom/*.cdx.json release-assets/
+          # The installer, as the release asset `install.sh` downloads
+          # (REL-2 S3-T4).
+          cp lakehousectl-linux-x86_64 release-assets/
           # `install.sh` joins the release in REL-2 S3, when it exists.
           if [ -f ops/release/install.sh ]; then
             cp ops/release/install.sh release-assets/
           fi
           (
             cd release-assets
-            sha256sum ./*.tar.zst ./release.json ./release.json.sigstore.json ./*.cdx.json > SHA256SUMS
+            sha256sum ./*.tar.zst ./release.json ./release.json.sigstore.json ./*.cdx.json \
+              ./lakehousectl-linux-x86_64 > SHA256SUMS
           )
 
       # The release is a DRAFT: the product owner publishes it, after
@@ -978,3 +1231,175 @@ jobs:
             --title "RantAI Lakehouse v$version" \
             --notes-file release-notes.md \
             release-assets/*
+
+  # ── The proof: the bundle installs ──────────────────────────────────
+  install-proof:
+    name: Proof · the bundle installs on a fresh host
+    # REL-2 S3-T5: the end-to-end proof that what the pipeline builds
+    # can be installed.
+    #
+    # The job takes the dry run's bundle — the same bytes an air-gapped
+    # host would be handed — and installs it on a clean runner. It is
+    # the only place the whole path is exercised: the manifest's
+    # signature, the images' IDs, the secrets, the layout and the
+    # readiness of the stack.
+    #
+    # It never runs for a tag push: the dry run does not run then, and
+    # a job that needs it is skipped with it.
+    needs: dry-run
+    runs-on: ubuntu-latest
+    # 90 minutes: the bundle is unpacked, every image is loaded, and
+    # the stack is started and waited for.
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Free disk first: the runner image carries toolchains this job
+      # never uses, and the job unpacks the bundle and loads every image
+      # in it.
+      - name: Free runner disk
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost /usr/local/share/powershell /usr/local/share/chromium /usr/local/share/pip /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          df -h /
+
+      - name: Download the dry run's bundle
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-dry-run
+          path: dry-run
+
+      # The installer, built WITH the `test-key` feature: the dry run
+      # signed its manifest with the throwaway key the job generated, so
+      # the proof has to verify against THAT key. A release build never
+      # has the feature — the release job's own build is checked for
+      # that by `ops/release/test_release_workflow.py` — so a release
+      # can never accept another key (REL-2 S3-T1).
+      - name: Build lakehousectl (the dry run's key)
+        run: |
+          set -euo pipefail
+          # The musl target goes on the PINNED toolchain, so `rustup` has
+          # to run where the pin is: inside `rust/`, next to
+          # `rust-toolchain.toml` (1.99.1). At the repository root it
+          # installed the target for the runner's DEFAULT toolchain, and
+          # the build — which runs on the pinned toolchain — failed with
+          # "can't find crate for core ... the x86_64-unknown-linux-musl
+          # target may not be installed" (PR #313 dry run).
+          #
+          # The target is NOT added to `rust-toolchain.toml`: every
+          # developer reads that file, and a target in it is a download
+          # every developer pays for a build they do not make.
+          cd rust
+          rustup target add x86_64-unknown-linux-musl
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+          cargo build --release --target x86_64-unknown-linux-musl \
+            -p lakehousectl --features test-key
+          cp "target/x86_64-unknown-linux-musl/release/lakehousectl" ../lakehousectl
+          cd ..
+          ./lakehousectl --version
+
+      # The containerd image store, and nothing else (REL-2 S3 D13).
+      #
+      # The bundle's images are loaded from `docker save` archives, and on
+      # Docker's classic store a loaded image registers no repo digest:
+      # the release's pinned references would not resolve, and the
+      # install would stop with "the image ... is not in the local
+      # store". The store is turned on BEFORE the install.
+      - name: Turn on the containerd image store
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /etc/docker
+          if [ -f /etc/docker/daemon.json ]; then
+            sudo jq '.features = ((.features // {}) + {"containerd-snapshotter": true})' \
+              /etc/docker/daemon.json > "$RUNNER_TEMP/daemon.json"
+          else
+            echo '{"features": {"containerd-snapshotter": true}}' > "$RUNNER_TEMP/daemon.json"
+          fi
+          sudo cp "$RUNNER_TEMP/daemon.json" /etc/docker/daemon.json
+          sudo systemctl restart docker
+          # The store is ASSERTED, not assumed: the installer refuses a
+          # classic store for a bundle install, and the proof has to
+          # prove the install, not the refusal.
+          store="$(docker info --format '{{json .DriverStatus}}')"
+          case "$store" in
+            *io.containerd.snapshotter.v1*) echo "the containerd image store is on: $store" ;;
+            *)
+              echo "::error::the containerd image store is not on: $store"
+              exit 1
+              ;;
+          esac
+
+      # The proof is AIR-GAPPED IN FACT (REL-2 S3 D13).
+      #
+      # A runner that can still reach the registries would hide the bug
+      # this proof exists for: Compose pulls silently when it may, so
+      # the install would pass with a FETCHED image instead of the
+      # LOADED one, and the air-gapped host would still be broken. The
+      # registries are cut off here, and the cut is PROVED before the
+      # install runs — a pull that still works means the runner has a
+      # way to the registries, and the proof is not air-gapped.
+      #
+      # The hosts are the ones the registries answer on: Docker Hub's
+      # registry, its authentication and its index, GHCR, Quay, and the
+      # CDN the Docker Hub layers come from.
+      - name: Cut the runner off from the registries
+        run: |
+          set -euo pipefail
+          for host in registry-1.docker.io auth.docker.io index.docker.io \
+            ghcr.io quay.io production.cloudflare.docker.com; do
+            echo "0.0.0.0 $host" | sudo tee -a /etc/hosts
+          done
+          if docker pull alpine:3.20; then
+            echo "::error::the runner can still pull from a registry: the proof is not air-gapped"
+            exit 1
+          fi
+          echo "the runner cannot pull from a registry any more."
+
+      - name: Install the bundle
+        env:
+          # The PUBLIC half of the throwaway key the dry run signed the
+          # manifest with. The private half was thrown away with the
+          # dry run's job.
+          #
+          # `cosign.pub` is at the ROOT of the artifact, so this path is
+          # right: the artifact keeps every file at its path relative
+          # to the repository root (see the step below).
+          LAKEHOUSECTL_PUBLIC_KEY_FILE: ${{ github.workspace }}/dry-run/cosign.pub
+        run: |
+          set -euo pipefail
+          mkdir -p bundle install
+          # The bundle is at `dry-run/dist/`, NOT at `dry-run/`:
+          # `upload-artifact` stores every file at its path relative to
+          # the least common ancestor of the upload list — the
+          # repository root, because that list names files from `dist/`,
+          # from `sbom/` and from the root itself — and the dry run
+          # wrote the bundle into `dist/`. Reading it from the root of
+          # the download failed with "tar (child):
+          # dry-run/rantai-lakehouse-*.tar.zst: Cannot open: No such
+          # file or directory" (PR #313 install-proof).
+          tar --zstd -xf dry-run/dist/rantai-lakehouse-*.tar.zst -C bundle
+          # The runner's disk and memory are below the release's
+          # minimums, so the two checks are skipped — and the install
+          # says which checks it skipped. The minimums themselves are
+          # proved by the operator's acceptance checklist (REL-2-AC3),
+          # not by a runner.
+          ./lakehousectl install --bundle bundle --dir install \
+            --ignore-preflight disk --ignore-preflight memory
+
+      - name: The stack is ready and the console answers
+        run: |
+          set -euo pipefail
+          echo "the readiness route:"
+          curl -fsS http://127.0.0.1:8080/health/ready | jq .
+          echo "the console:"
+          curl -fsS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:3000/
+
+      - name: The stack's state
+        if: always()
+        run: |
+          docker compose -p rantai-lakehouse ps || true

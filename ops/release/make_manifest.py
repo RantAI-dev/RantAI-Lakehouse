@@ -37,6 +37,20 @@ A third-party image without a digest is refused. The bundle holds one
 BLOCKER 1), so an image the manifest does not name is an image the
 air-gapped host cannot run.
 
+The image IDs
+-------------
+`images` names every image by its REGISTRY digest — the digest the
+registry answers with. An air-gapped host cannot ask a registry, and
+`docker save` of a pulled image DROPS that digest: after `docker load`
+the host knows only the image ID, which is the CONFIG digest
+(`docker image inspect --format '{{.Id}}'`).
+
+So the manifest carries `imageIds` as well: the unique image reference
+mapped to its config digest. The installer compares the ID of every
+image it loads with the one the signed manifest names, and refuses any
+mismatch (REL-2 S3-T0). Without it there is nothing to compare, so an
+image without an ID is refused here rather than at the install.
+
 The upgrade path
 ----------------
 `minFrom` DEFAULTS to two minor versions back: the spec says "a direct
@@ -66,8 +80,10 @@ What it deliberately does NOT do
 - It does not decide the upgrade path itself. `minFrom`'s default is the
   spec's promise; a stop is a policy decision, recorded in the checked-in
   file, not made by a script.
-- It does not hash anything but the Compose file yet. `lakehousectl`
-  joins the manifest's `files` map in REL-2 S3, when the binary exists.
+- It does not hash anything but the Compose file and the installer yet.
+  `lakehousectl` joins the manifest's `files` map in REL-2 S3-T4, when
+  the binary exists.- It does not read a Docker daemon. The image IDs come from the
+  pipeline, which read them with `docker image inspect`.
 """
 
 from __future__ import annotations
@@ -88,6 +104,9 @@ SCHEMA_VERSION = 1
 
 VERSION_RE = re.compile(r"^(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)$")
 GIT_SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
+# A Docker image ID is `sha256:` and 64 hex characters — the config
+# digest `docker image inspect --format '{{.Id}}'` prints.
+IMAGE_ID_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 # The image parser of the repo's lint, reused rather than copied (rule 4):
 # the manifest's references must satisfy the same digest rule the Compose
@@ -210,14 +229,59 @@ def manifest_images(
     return images
 
 
+def manifest_image_ids(
+    images: dict[str, str], image_ids: dict[str, str]
+) -> dict[str, str]:
+    """The config digest of every image the release runs.
+
+    The manifest's `images` names each image by its REGISTRY digest; the
+    `imageIds` map names the same images by their CONFIG digest — the
+    image ID. An air-gapped host gets the images from `docker load`, and
+    a loaded image has no registry digest: it has an ID. So the ID is
+    what the installer compares (REL-2 S3-T0).
+
+    Two rules, both refusals:
+
+    - an image the manifest names must have an ID, or the installer has
+      nothing to compare it with;
+    - an ID may only be given for an image the manifest names, or the
+      manifest carries bytes for an image the release does not run.
+    """
+    references = set(images.values())
+    ids: dict[str, str] = {}
+    for reference, image_id in image_ids.items():
+        if reference not in references:
+            raise ManifestError(
+                f"the image id {image_id} is given for {reference}, which the "
+                f"manifest does not name as an image of the release."
+            )
+        if not IMAGE_ID_RE.match(image_id):
+            raise ManifestError(
+                f"the image id of {reference} is {image_id!r}, which is not "
+                f"`sha256:` and 64 hexadecimal characters."
+            )
+        ids[reference] = image_id
+    missing = sorted(references - set(ids))
+    if missing:
+        raise ManifestError(
+            "the manifest names an image with no id: "
+            + ", ".join(missing)
+            + ". An air-gapped install compares the loaded image's id with "
+            "the manifest's, so every image needs one."
+        )
+    return dict(sorted(ids.items()))
+
+
 def build_manifest(
     *,
     version: str,
     git_sha: str,
     published_images: dict[str, str],
+    image_ids: dict[str, str],
     compose_path: Path,
     created_at: str,
     upgrade_path: Path = UPGRADE_PATH,
+    lakehousectl_path: Path | None = None,
 ) -> dict[str, object]:
     """The manifest, as the dictionary that is written out."""
     parse_version(version)
@@ -229,6 +293,7 @@ def build_manifest(
 
     compose_text = compose_path.read_text(encoding="utf-8")
     images = manifest_images(compose_text, published_images)
+    ids = manifest_image_ids(images, image_ids)
 
     requirements = read_upgrade_path(upgrade_path).get(version, {})
     if not isinstance(requirements, dict):
@@ -248,6 +313,13 @@ def build_manifest(
             f"the upgrade path's `stops` for {version} must be a list of versions"
         )
 
+    files = {"docker-compose.yml": sha256_of(compose_path)}
+    if lakehousectl_path is not None:
+        # The installer is a file the release ships, so the signed
+        # manifest names its checksum too (REL-2 S3-T4): the bundle's
+        # copy is checked against it.
+        files["lakehousectl"] = sha256_of(lakehousectl_path)
+
     return {
         "schemaVersion": SCHEMA_VERSION,
         "version": version,
@@ -256,7 +328,8 @@ def build_manifest(
         "minFrom": min_from,
         "stops": list(stops),
         "images": dict(sorted(images.items())),
-        "files": {"docker-compose.yml": sha256_of(compose_path)},
+        "imageIds": ids,
+        "files": files,
     }
 
 
@@ -287,6 +360,14 @@ def main(argv: list[str] | None = None) -> int:
         "come from the rendered Compose file.",
     )
     parser.add_argument(
+        "--image-ids",
+        required=True,
+        help="the image ids, as JSON: image reference -> sha256:<config "
+        "digest> (inline JSON or a path to a .json file). The pipeline "
+        "reads them with `docker image inspect --format '{{.Id}}'`. An "
+        "air-gapped install compares the loaded image's id with these.",
+    )
+    parser.add_argument(
         "--compose",
         type=Path,
         required=True,
@@ -309,17 +390,28 @@ def main(argv: list[str] | None = None) -> int:
         default=UPGRADE_PATH,
         help="the checked-in upgrade path (default: ops/release/upgrade-path.json)",
     )
+    parser.add_argument(
+        "--lakehousectl",
+        type=Path,
+        default=None,
+        help="the installer binary the release ships. Its checksum joins "
+        "the manifest's `files`, so the signed manifest names every file "
+        "the release carries.",
+    )
     args = parser.parse_args(argv)
 
     try:
         published_images = compose_images.load_published(args.published_images)
+        image_ids = compose_images.load_string_map(args.image_ids, "image-ids")
         manifest = build_manifest(
             version=args.version,
             git_sha=args.git_sha,
             published_images=published_images,
+            image_ids=image_ids,
             compose_path=args.compose,
             created_at=args.created_at or now_utc(),
             upgrade_path=args.upgrade_path,
+            lakehousectl_path=args.lakehousectl,
         )
     except (ManifestError, compose_images.ComposeImagesError, OSError) as error:
         print(f"make_manifest failed: {error}", file=sys.stderr)

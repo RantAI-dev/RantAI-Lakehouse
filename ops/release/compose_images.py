@@ -110,11 +110,13 @@ def third_party(images: dict[str, str], published: dict[str, str]) -> dict[str, 
     }
 
 
-def load_published(value: str) -> dict[str, str]:
-    """The published images, from an inline JSON document or a file.
+def load_string_map(value: str, what: str) -> dict[str, str]:
+    """A JSON document that maps strings to strings.
 
-    A value that opens a JSON document is the document; anything else is
-    the path of a file holding it.
+    The value is the document itself when it opens with a brace or a
+    bracket, and the path of a file holding it otherwise. `what` names
+    the document in the error message, so a reader knows which map was
+    wrong.
     """
     text = value.strip()
     if text.startswith("{") or text.startswith("["):
@@ -125,21 +127,29 @@ def load_published(value: str) -> dict[str, str]:
         data = json.loads(document)
     except ValueError as error:
         raise ComposeImagesError(
-            f"the published-images document is not JSON: {error}"
+            f"the {what} document is not JSON: {error}"
         ) from error
     if not isinstance(data, dict):
         raise ComposeImagesError(
-            "the published-images document must be a JSON object"
+            f"the {what} document must be a JSON object"
         )
-    published: dict[str, str] = {}
+    mapping: dict[str, str] = {}
     for name, reference in data.items():
         if not isinstance(name, str) or not isinstance(reference, str):
             raise ComposeImagesError(
-                "the published-images document must map a service name to an "
-                "image reference"
+                f"the {what} document must map a name to a string"
             )
-        published[name] = reference
-    return published
+        mapping[name] = reference
+    return mapping
+
+
+def load_published(value: str) -> dict[str, str]:
+    """The published images, from an inline JSON document or a file.
+
+    A value that opens a JSON document is the document; anything else is
+    the path of a file holding it.
+    """
+    return load_string_map(value, "published-images")
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -31,14 +31,53 @@ And one more since REL-2 S2 review round 5, from the PR's second dry run:
     --type cyclonedx` reads a JSON predicate and the action's plain
     `cyclonedx` format is XML.
 
+And one more since the PR #313 dry run, from the build that failed:
+
+  - every `rustup target add` of the musl target runs from inside `rust/`,
+    where the toolchain pin is, so the target lands on the PINNED
+    toolchain; and the pin itself does not ask for the musl target, so no
+    developer downloads it.
+
+And one more since the PR #313 install-proof, from the install that failed:
+
+  - every file the proof job reads out of the dry run's artifact is on
+    that artifact's upload list, under the SAME relative path — the
+    artifact keeps every file at its path relative to the repository
+    root, so a file the dry run wrote into `dist/` is read back from
+    `dry-run/dist/`, not from `dry-run/`.
+
+And three more since REL-2 S3 D13, from the review round 3 BLOCKER 1
+(after `docker load`, nothing resolved a digest-pinned reference):
+
+  - every job that builds or saves a bundle turns Docker's CONTAINERD
+    image store on before its first image pull or build, and asserts
+    that the store is on — on the classic store no `docker load`
+    registers a repo digest, so a bundle built there cannot be
+    installed on an air-gapped host;
+  - the proof job turns the containerd store on before it installs;
+  - the proof job cuts the runner off from the registries BEFORE it
+    installs, and proves the cut — a runner that can still pull would
+    hide the bug the proof exists for, because Compose pulls silently
+    when it may.
+
+And two more since REL-2 S3 review round 4 BLOCKER 1, from the dry run
+that lost its registry:
+
+  - no job that restarts Docker holds a SERVICE container: a service
+    container is started before the job's first step, and the restart
+    stops it — so the dry run starts its throwaway registry itself,
+    after the store switch;
+  - the dry run's registry is pinned by digest and is waited for.
+
 The workflow is parsed with PyYAML (`pyyaml==6.0.3`, installed by the jobs
 that run these tests). The checks are run against synthetic workflows too,
 so a check that cannot fail is itself a failure. No network, no repository:
-the tests read one file and write nothing.
+the tests read two files and write nothing.
 """
 
 from __future__ import annotations
 
+import fnmatch
 import re
 import unittest
 from pathlib import Path
@@ -48,6 +87,9 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "release.yml"
+
+# The toolchain pin: `rustup` reads it from inside `rust/`.
+TOOLCHAIN_PATH = REPO_ROOT / "rust" / "rust-toolchain.toml"
 
 # A third-party action, pinned: `owner/repo` and a 40-hex commit SHA.
 # A SUB-ACTION (`owner/repo/path@<sha>`) is pinned the same way: it is
@@ -84,6 +126,44 @@ SBOM_FORMAT = "cyclonedx-json"
 # are needed: v3 refuses `--tlog-upload=false` while the signing config
 # is in effect, and that config names the public log service.
 NO_TLOG_FLAGS = ("--use-signing-config=false", "--tlog-upload=false")
+
+# The musl target the static installer is built for.
+MUSL_TARGET = "x86_64-unknown-linux-musl"
+
+# The dry run's artifact, and the folder the proof job unpacks it into.
+DRY_RUN_ARTIFACT = "release-dry-run"
+DRY_RUN_FOLDER = "dry-run"
+
+# The step of the dry run that uploads the artifact, and the step of the
+# proof job that downloads it.
+UPLOAD_STEP = "Upload the bundle and the manifest"
+DOWNLOAD_STEP = "Download the dry run's bundle"
+
+# The step that turns Docker's containerd image store on (REL-2 S3 D13).
+CONTAINERD_STEP = "Turn on the containerd image store"
+
+# The step of the dry run that starts its throwaway registry
+# (REL-2 S3 review round 4 BLOCKER 1).
+REGISTRY_STEP = "Start the throwaway registry"
+
+# The registry the dry run pushes to, and the URL it answers on.
+DRY_RUN_REGISTRY = "localhost:5000"
+REGISTRY_API = "http://localhost:5000/v2/"
+
+# The step that cuts the proof runner off from the registries.
+AIR_GAP_STEP = "Cut the runner off from the registries"
+
+# The registries the proof cuts the runner off from: Docker Hub's
+# registry, its authentication and its index, GHCR, Quay, and the CDN
+# the Docker Hub layers come from.
+REGISTRIES = (
+    "registry-1.docker.io",
+    "auth.docker.io",
+    "index.docker.io",
+    "ghcr.io",
+    "quay.io",
+    "production.cloudflare.docker.com",
+)
 
 # A workflow with a signing secret in a job-level `env:`.
 SYNTHETIC_JOB_SECRET = """
@@ -188,6 +268,125 @@ jobs:
     steps:
       - name: Build the offline bundle
         run: ops/release/make_bundle.sh --manifest release.json
+"""
+
+# A workflow that adds the musl target at the repository root, so the
+# target goes to the runner's default toolchain and not to the pin the
+# build runs on (PR #313 dry run).
+SYNTHETIC_MUSL_TARGET_OUTSIDE_RUST = """
+name: Synthetic
+on: workflow_dispatch
+jobs:
+  dry-run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Build lakehousectl (static, musl)
+        run: |
+          set -euo pipefail
+          rustup target add x86_64-unknown-linux-musl
+          cd rust
+          cargo build --release --target x86_64-unknown-linux-musl -p lakehousectl
+"""
+
+# A workflow whose proof job reads the bundle from the artifact's ROOT,
+# although the dry run uploaded it from `dist/` — so the file is not
+# there (PR #313 install-proof).
+SYNTHETIC_PROOF_READS_FROM_THE_ROOT = """
+name: Synthetic
+on: workflow_dispatch
+jobs:
+  dry-run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Upload the bundle and the manifest
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-dry-run
+          path: |
+            dist/*.tar.zst
+            cosign.pub
+  install-proof:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download the dry run's bundle
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-dry-run
+          path: dry-run
+      - name: Install the bundle
+        env:
+          LAKEHOUSECTL_PUBLIC_KEY_FILE: ${{ github.workspace }}/dry-run/cosign.pub
+        run: |
+          tar --zstd -xf dry-run/rantai-lakehouse-*.tar.zst -C bundle
+"""
+
+
+# A workflow that pulls an image before the containerd image store is
+# turned on: the image lands in the classic store, and the bundle built
+# from it cannot be installed on an air-gapped host (REL-2 S3 D13).
+SYNTHETIC_PULL_BEFORE_THE_STORE = """
+name: Synthetic
+on: workflow_dispatch
+jobs:
+  dry-run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: The published images, by digest
+        run: docker pull "$ref"
+"""
+
+# A workflow whose proof installs BEFORE the runner is cut off from the
+# registries, so the install is not air-gapped in fact.
+SYNTHETIC_INSTALL_BEFORE_THE_CUT = """
+name: Synthetic
+on: workflow_dispatch
+jobs:
+  install-proof:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install the bundle
+        run: ./lakehousectl install --bundle bundle
+      - name: Cut the runner off from the registries
+        run: |
+          echo "0.0.0.0 ghcr.io" | sudo tee -a /etc/hosts
+"""
+
+# A workflow with a SERVICE container in a job that restarts Docker: the
+# service is started before the job's first step, so the restart stops it
+# and the store switch hides the image it ran from (REL-2 S3 review round
+# 4 BLOCKER 1).
+SYNTHETIC_SERVICE_ACROSS_THE_RESTART = """
+name: Synthetic
+on: workflow_dispatch
+jobs:
+  dry-run:
+    runs-on: ubuntu-latest
+    services:
+      registry:
+        image: registry:2
+        ports:
+          - "5000:5000"
+    steps:
+      - name: Turn on the containerd image store
+        run: sudo systemctl restart docker
+"""
+
+# A workflow whose service container is started by a step AFTER the store
+# switch: it is not lost, so it is not reported.
+SYNTHETIC_SERVICE_STARTED_AFTER_THE_SWITCH = """
+name: Synthetic
+on: workflow_dispatch
+jobs:
+  dry-run:
+    runs-on: ubuntu-latest
+    services:
+      registry:
+        image: registry:2
+    steps:
+      - name: Turn on the containerd image store
+        run: sudo systemctl restart docker
+      - name: Start the registry
+        run: docker run -d --name registry -p 5000:5000 registry:2
 """
 
 
@@ -377,6 +576,226 @@ def steps_writing_the_key_to_the_github_env(document: dict[str, Any]) -> list[st
             if "$GITHUB_ENV" in commands and "COSIGN_PRIVATE_KEY" in commands:
                 found.append(f"{job_name}: {step.get('name')}")
     return found
+
+
+def musl_target_steps(document: dict[str, Any]) -> list[tuple[str, str]]:
+    """Every step that adds the musl target, with the job it is in."""
+    found: list[tuple[str, str]] = []
+    for job_name, job in (document.get("jobs") or {}).items():
+        for step in job.get("steps") or []:
+            run = str(step.get("run") or "")
+            if "rustup target add" in run and MUSL_TARGET in run:
+                found.append((job_name, str(step.get("name"))))
+    return found
+
+
+def adds_the_musl_target_inside_rust(step: dict[str, Any]) -> bool:
+    """Whether the step adds the musl target AFTER it changed to `rust/`.
+
+    `rustup` picks its toolchain from the `rust-toolchain.toml` it finds
+    in the current directory or above it. The pin lives in
+    `rust/rust-toolchain.toml`, so a `rustup target add` at the
+    repository root installs the target for the runner's DEFAULT
+    toolchain — and the build, which runs on the PINNED toolchain, finds
+    no musl target (PR #313 dry run).
+    """
+    lines = [
+        line
+        for line in str(step.get("run") or "").splitlines()
+        if not line.strip().startswith("#")
+    ]
+    changed_to_rust: int | None = None
+    added: int | None = None
+    for index, line in enumerate(lines):
+        if changed_to_rust is None and re.match(
+            r"cd\s+rust(?:\s|$)", line.strip()
+        ):
+            changed_to_rust = index
+        if added is None and "rustup target add" in line and MUSL_TARGET in line:
+            added = index
+    return (
+        changed_to_rust is not None
+        and added is not None
+        and changed_to_rust < added
+    )
+
+
+def upload_entries(document: dict[str, Any]) -> list[str]:
+    """Every path the dry run uploads, as the upload step lists them.
+
+    The upload step's `path:` is a block of lines, one glob per line.
+    A line that starts with `#` is a comment about the list and names
+    no file, so it is not an entry.
+    """
+    step = step_named(document, "dry-run", UPLOAD_STEP)
+    raw = str((step.get("with") or {}).get("path") or "")
+    return [
+        line.strip()
+        for line in raw.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+
+
+def dry_run_reads(document: dict[str, Any]) -> list[str]:
+    """Every path the proof job reads out of the dry run's artifact.
+
+    A path is a read when a step's command or a step's environment
+    names a file under the folder the artifact was unpacked into. The
+    commands are read WITHOUT their comment lines: a comment explains
+    the step, it does not read a file.
+    """
+    found: list[str] = []
+    pattern = re.compile(rf"{DRY_RUN_FOLDER}/([A-Za-z0-9._*/-]+)")
+    for step in steps_of(document, "install-proof"):
+        texts = [shell_commands(str(step.get("run") or ""))]
+        texts.extend(str(value) for value in (step.get("env") or {}).values())
+        for text in texts:
+            found.extend(
+                f"{DRY_RUN_FOLDER}/{match}" for match in pattern.findall(text)
+            )
+    return found
+
+
+def entry_covers(entry: str, path: str) -> bool:
+    """Whether an upload entry holds a file at that same relative path.
+
+    The artifact keeps every file at its path relative to the ROOT of
+    the upload list, so the file's FOLDER has to be the entry's folder
+    and the file's name has to match the entry's glob. A glob that
+    spans folders (`*` matches `/` here) is not enough: it would let
+    `dist/*.tar.zst` stand for a file read from the artifact's root.
+    """
+    entry_folder, _, entry_name = entry.rpartition("/")
+    path_folder, _, path_name = path.rpartition("/")
+    if entry_folder != path_folder:
+        return False
+    return fnmatch.fnmatchcase(path_name, entry_name)
+
+
+def reads_without_an_uploaded_file(document: dict[str, Any]) -> list[str]:
+    """Every path the proof job reads that the upload list does not hold.
+
+    The path is the one the job uses, under the folder the artifact was
+    unpacked into — so a file the dry run wrote into `dist/` and that
+    the proof reads from `dry-run/` is reported.
+    """
+    entries = upload_entries(document)
+    missing: list[str] = []
+    for path in dry_run_reads(document):
+        relative = path[len(DRY_RUN_FOLDER) + 1 :]
+        if not any(entry_covers(entry, relative) for entry in entries):
+            missing.append(path)
+    return missing
+
+
+def step_index_or_none(document: dict[str, Any], job_name: str, name: str) -> int | None:
+    """Where a step sits in a job, or None when the job has no such step."""
+    for index, step in enumerate(steps_of(document, job_name)):
+        if str(step.get("name")) == name:
+            return index
+    return None
+
+
+def first_image_step(document: dict[str, Any], job_name: str) -> int | None:
+    """Where the job's first image pull or build sits.
+
+    A build is a `docker/build-push-action` step, a pull is a step whose
+    command pulls an image. Both put an image into the daemon's store,
+    and that store has to be the containerd one before either of them
+    runs (REL-2 S3 D13).
+    """
+    for index, step in enumerate(steps_of(document, job_name)):
+        if str(step.get("uses") or "").startswith("docker/build-push-action@"):
+            return index
+        if "docker pull" in str(step.get("run") or ""):
+            return index
+    return None
+
+
+def containerd_too_late(document: dict[str, Any], job_name: str) -> list[str]:
+    """Every job whose containerd step is missing, or after its first image.
+
+    A job that pulls or builds an image before the containerd store is
+    on puts that image in the classic store, and the bundle built from
+    it is a bundle no air-gapped host can install.
+    """
+    first = first_image_step(document, job_name)
+    if first is None:
+        return []
+    store = step_index_or_none(document, job_name, CONTAINERD_STEP)
+    if store is None or store >= first:
+        return [job_name]
+    return []
+
+
+def containerd_step_problems(document: dict[str, Any], job_name: str) -> list[str]:
+    """Every way the job's containerd step can be wrong."""
+    problems: list[str] = []
+    if step_index_or_none(document, job_name, CONTAINERD_STEP) is None:
+        return [f"{job_name}: the job never turns the containerd store on"]
+    run = str(step_named(document, job_name, CONTAINERD_STEP).get("run") or "")
+    for needle, what in (
+        ("daemon.json", "it does not touch /etc/docker/daemon.json"),
+        ("containerd-snapshotter", "it does not turn the feature on"),
+        ("jq", "it does not merge the daemon's own configuration"),
+        ("systemctl restart docker", "it does not restart Docker"),
+        ("io.containerd.snapshotter.v1", "it does not assert that the store is on"),
+    ):
+        if needle not in run:
+            problems.append(f"{job_name}: {what}")
+    return problems
+
+
+def services_killed_by_the_store_switch(document: dict[str, Any], job_name: str) -> list[str]:
+    """Every service container the job loses when the store comes on.
+
+    A service container is started BEFORE the job's first step, and the
+    containerd step RESTARTS Docker: the restart stops the service
+    container, and the store switch hides the image it ran from — the
+    classic store's images are not in the containerd one. A service that
+    a step of the job starts AFTER the switch is not lost, and is not
+    reported (REL-2 S3 review round 4 BLOCKER 1).
+    """
+    job = (document.get("jobs") or {}).get(job_name) or {}
+    services = job.get("services") or {}
+    if not services:
+        return []
+    store = step_index_or_none(document, job_name, CONTAINERD_STEP)
+    if store is None:
+        return []
+    started_after: set[str] = set()
+    for step in steps_of(document, job_name)[store + 1 :]:
+        commands = shell_commands(str(step.get("run") or ""))
+        for name in services:
+            if f"--name {name}" in commands or f"--name={name}" in commands:
+                started_after.add(str(name))
+    return [str(name) for name in services if str(name) not in started_after]
+
+
+def air_gap_problems(document: dict[str, Any]) -> list[str]:
+    """Every way the proof's air gap can be missing.
+
+    The proof has to be air-gapped IN FACT: a runner that can still
+    pull would let Compose fetch the images the bundle should have
+    loaded, and the bug the proof exists for would stay hidden.
+    """
+    problems: list[str] = []
+    names = [str(step.get("name")) for step in steps_of(document, "install-proof")]
+    if AIR_GAP_STEP not in names:
+        return ["the proof has no air-gap step"]
+    if "Install the bundle" in names and names.index(AIR_GAP_STEP) > names.index(
+        "Install the bundle"
+    ):
+        problems.append("the proof installs before the runner is cut off")
+    run = str(step_named(document, "install-proof", AIR_GAP_STEP).get("run") or "")
+    if "/etc/hosts" not in run:
+        problems.append("the air-gap step does not touch /etc/hosts")
+    for host in REGISTRIES:
+        if host not in run:
+            problems.append(f"the air-gap step does not cut {host} off")
+    if "docker pull" not in run or "exit 1" not in run:
+        problems.append("the air-gap step does not prove that the cut holds")
+    return problems
 
 
 class ReleaseWorkflowTest(unittest.TestCase):
@@ -641,6 +1060,119 @@ class ReleaseWorkflowTest(unittest.TestCase):
             self.assertIn("--published-images", run, job)
             self.assertIn("--compose docker-compose.release.yml", run, job)
 
+    def test_both_jobs_build_the_installer(self) -> None:
+        """REL-2 S3-T4: the release ships the installer.
+
+        The bundle holds `lakehousectl`, so an air-gapped host can
+        install the stack with it, and the release assets hold it too,
+        so `install.sh` can download it.
+        """
+        for job in ("dry-run", "release"):
+            step = step_named(self.document, job, "Build lakehousectl (static, musl)")
+            run = str(step.get("run"))
+            self.assertIn("x86_64-unknown-linux-musl", run, job)
+            self.assertIn("-p lakehousectl", run, job)
+            self.assertIn("lakehousectl-linux-x86_64", run, job)
+
+    def test_the_release_build_never_accepts_another_key(self) -> None:
+        """A release build verifies against the compiled-in key.
+
+        The `test-key` feature points a build at another key, and it
+        exists for the CI dry run only: a release that accepted another
+        key would install what its operator's host said to install.
+        """
+        for job in ("dry-run", "release"):
+            step = step_named(self.document, job, "Build lakehousectl (static, musl)")
+            run = str(step.get("run"))
+            self.assertNotIn("test-key", run, job)
+            self.assertNotIn("--features", run, job)
+
+    def test_the_manifest_and_the_bundle_carry_the_installer(self) -> None:
+        """The signed manifest names the installer's checksum, and the
+        bundle carries the file the manifest names."""
+        for job in ("dry-run", "release"):
+            manifest = step_named(self.document, job, "Write the release manifest")
+            self.assertIn(
+                "--lakehousectl lakehousectl-linux-x86_64",
+                str(manifest.get("run")),
+                job,
+            )
+            bundle = step_named(self.document, job, "Build the offline bundle")
+            self.assertIn(
+                "--lakehousectl lakehousectl-linux-x86_64",
+                str(bundle.get("run")),
+                job,
+            )
+
+    def test_the_installer_is_built_before_the_manifest_is_written(self) -> None:
+        for job in ("dry-run", "release"):
+            self.assertLess(
+                step_index(self.document, job, "Build lakehousectl (static, musl)"),
+                step_index(self.document, job, "Write the release manifest"),
+                job,
+            )
+
+    def test_the_dry_run_uploads_the_throwaway_public_key(self) -> None:
+        """The proof job verifies the manifest against the dry run's key.
+
+        The dry run signs its manifest with a throwaway key, so the
+        proof needs the PUBLIC half of it: the private half was thrown
+        away with the job.
+        """
+        step = step_named(self.document, "dry-run", "Upload the bundle and the manifest")
+        self.assertIn("cosign.pub", str(step.get("with", {}).get("path")))
+
+    def test_the_proof_job_installs_the_dry_runs_bundle(self) -> None:
+        """REL-2 S3-T5: the end-to-end proof.
+
+        The job takes the dry run's bundle — the bytes an air-gapped
+        host would be handed — and installs it on a clean runner.
+        """
+        steps = steps_of(self.document, "install-proof")
+        names = [str(step.get("name")) for step in steps]
+        self.assertIn("Download the dry run's bundle", names)
+        self.assertIn("Install the bundle", names)
+        self.assertIn("The stack is ready and the console answers", names)
+
+        install = step_named(self.document, "install-proof", "Install the bundle")
+        run = str(install.get("run"))
+        self.assertIn("--bundle", run)
+        self.assertIn("lakehousectl install", run)
+        self.assertIn("LAKEHOUSECTL_PUBLIC_KEY_FILE", str(install.get("env")))
+
+    def test_the_proof_job_builds_with_the_test_key_feature(self) -> None:
+        """The proof's bundle is signed with the throwaway key.
+
+        So the proof's binary is built with the feature that points a
+        build at another key — and the RELEASE job's build is not
+        (checked above).
+        """
+        step = step_named(self.document, "install-proof", "Build lakehousectl (the dry run's key)")
+        run = str(step.get("run"))
+        self.assertIn("--features test-key", run)
+
+    def test_the_proof_job_needs_the_dry_run(self) -> None:
+        """The proof installs what the dry run built."""
+        job = self.document["jobs"]["install-proof"]
+        self.assertEqual(job["needs"], "dry-run")
+
+    def test_the_image_ids_are_the_config_digests_on_every_docker_store(self) -> None:
+        """The two Docker stores identify an image differently.
+
+        The classic store reports the CONFIG digest as the image's ID;
+        the containerd store reports the image INDEX digest. The
+        manifest names the config digest — the identity a LOADED image
+        carries on both stores — so the pipeline corrects the ID when
+        the store reports the index digest, and reads the config digest
+        from the image's own saved tar.
+        """
+        for job in ("dry-run", "release"):
+            step = step_named(self.document, job, "The image ids")
+            run = str(step.get("run"))
+            self.assertIn("docker image inspect --format '{{.Id}}'", run, job)
+            self.assertIn("docker save", run, job)
+            self.assertIn("manifest.json", run, job)
+
     def test_a_job_level_secret_is_reported(self) -> None:
         document = yaml.safe_load(SYNTHETIC_JOB_SECRET)
         self.assertEqual(
@@ -662,6 +1194,203 @@ class ReleaseWorkflowTest(unittest.TestCase):
             steps_writing_the_key_to_the_github_env(document),
             ["dry-run: Generate a throwaway signing key"],
         )
+
+    def test_every_musl_target_is_added_on_the_pinned_toolchain(self) -> None:
+        """PR #313 dry run: the target must land on the PINNED toolchain.
+
+        `rustup` reads the pin from the `rust-toolchain.toml` in the
+        current directory or above it, so the target has to be added
+        from inside `rust/`. Added at the repository root it went to the
+        runner's default toolchain, and the build on the pinned
+        toolchain (1.99.1) failed with "can't find crate for core ...
+        the x86_64-unknown-linux-musl target may not be installed".
+        """
+        steps = musl_target_steps(self.document)
+        self.assertTrue(steps, "no step adds the musl target")
+        for job_name, step_name in steps:
+            step = step_named(self.document, job_name, step_name)
+            self.assertTrue(
+                adds_the_musl_target_inside_rust(step),
+                f"{job_name}: {step_name}: the musl target is added before `cd rust`",
+            )
+
+    def test_a_musl_target_added_outside_rust_is_reported(self) -> None:
+        document = yaml.safe_load(SYNTHETIC_MUSL_TARGET_OUTSIDE_RUST)
+        for job_name, step_name in musl_target_steps(document):
+            step = step_named(document, job_name, step_name)
+            self.assertFalse(
+                adds_the_musl_target_inside_rust(step),
+                f"{job_name}: {step_name}: the musl target is added before `cd rust`",
+            )
+
+    def test_the_toolchain_pin_does_not_ask_for_the_musl_target(self) -> None:
+        """The musl target is a release build's need, not every dev's.
+
+        A target in `rust-toolchain.toml` is downloaded by every
+        developer and by every CI job that touches Rust — for a build
+        they do not make. The release workflow adds the target itself,
+        on the pinned toolchain (PR #313 dry run).
+        """
+        text = TOOLCHAIN_PATH.read_text(encoding="utf-8")
+        self.assertNotIn(MUSL_TARGET, text)
+
+    def test_every_file_the_proof_reads_is_on_the_upload_list(self) -> None:
+        """PR #313 install-proof: the artifact keeps the relative paths.
+
+        `upload-artifact` stores every file at its path relative to
+        the root of the upload list — the repository root, because that
+        list names files from `dist/`, from `sbom/` and from the root
+        itself. So the bundle the dry run wrote into `dist/` is read
+        back from `dry-run/dist/`, and the proof reading it from
+        `dry-run/` failed with "tar (child):
+        dry-run/rantai-lakehouse-*.tar.zst: Cannot open: No such file or
+        directory".
+        """
+        self.assertTrue(upload_entries(self.document), "no upload list to check")
+        self.assertTrue(dry_run_reads(self.document), "the proof reads no file")
+        self.assertEqual(reads_without_an_uploaded_file(self.document), [])
+
+    def test_a_proof_reading_a_file_the_dry_run_does_not_upload_is_reported(
+        self,
+    ) -> None:
+        """The check above must be able to fail.
+
+        The synthetic workflow reads the bundle from the artifact's
+        root, although the dry run uploaded it from `dist/`.
+        """
+        document = yaml.safe_load(SYNTHETIC_PROOF_READS_FROM_THE_ROOT)
+        self.assertEqual(
+            reads_without_an_uploaded_file(document),
+            ["dry-run/rantai-lakehouse-*.tar.zst"],
+        )
+
+    def test_the_proof_downloads_the_artifact_the_dry_run_uploaded(self) -> None:
+        """The two jobs must name the SAME artifact.
+
+        The upload step writes the artifact under one name and the
+        download step fetches it under another: the download finds
+        nothing, and the proof fails before it reads a file.
+        """
+        upload = step_named(self.document, "dry-run", UPLOAD_STEP)
+        download = step_named(self.document, "install-proof", DOWNLOAD_STEP)
+        self.assertEqual(
+            str((upload.get("with") or {}).get("name")),
+            str((download.get("with") or {}).get("name")),
+        )
+
+    def test_the_proof_unpacks_the_artifact_where_it_reads_it(self) -> None:
+        """The folder the proof reads from is the folder it unpacked into.
+
+        A read from a folder the artifact was not unpacked into is a
+        read of a file that is not there.
+        """
+        download = step_named(self.document, "install-proof", DOWNLOAD_STEP)
+        self.assertEqual(str((download.get("with") or {}).get("path")), DRY_RUN_FOLDER)
+
+    def test_the_containerd_image_store_is_on_before_the_first_pull_or_build(self) -> None:
+        """REL-2 S3 D13: the bundle is saved from the containerd store.
+
+        The store has to be on before the job pulls or builds anything:
+        an image that lands in the classic store is an image whose
+        archive carries no digest an air-gapped host could resolve.
+        """
+        for job in ("dry-run", "release"):
+            self.assertEqual(containerd_too_late(self.document, job), [], job)
+
+    def test_a_job_that_pulls_before_the_store_is_on_is_reported(self) -> None:
+        """The check above must be able to fail."""
+        document = yaml.safe_load(SYNTHETIC_PULL_BEFORE_THE_STORE)
+        self.assertEqual(containerd_too_late(document, "dry-run"), ["dry-run"])
+
+    def test_every_job_turns_the_store_on_merges_the_configuration_and_asserts_it(self) -> None:
+        """The step does the whole job: merge, restart, assert.
+
+        The daemon's own configuration is merged rather than replaced,
+        Docker is restarted for the setting to take, and the store is
+        asserted — a step that turned the feature on and hoped is a
+        step that can build a bundle nobody can install.
+        """
+        for job in ("dry-run", "release", "install-proof"):
+            self.assertEqual(containerd_step_problems(self.document, job), [], job)
+
+    def test_the_proof_turns_the_containerd_image_store_on_before_the_install(self) -> None:
+        """The proof installs a bundle, so the store has to be on first."""
+        store = step_index_or_none(self.document, "install-proof", CONTAINERD_STEP)
+        self.assertIsNotNone(store, "the proof never turns the containerd store on")
+        install = step_index(self.document, "install-proof", "Install the bundle")
+        self.assertLess(store, install)
+
+    def test_the_proof_cuts_the_runner_off_from_the_registries_before_the_install(self) -> None:
+        """REL-2 S3 D13: the proof is air-gapped IN FACT.
+
+        Compose pulls silently when it may, so a runner with a path to
+        the registries would fetch the images the bundle should have
+        loaded — and the bug would stay hidden.
+        """
+        self.assertEqual(air_gap_problems(self.document), [])
+
+    def test_a_proof_that_installs_before_the_cut_is_reported(self) -> None:
+        """The check above must be able to fail."""
+        document = yaml.safe_load(SYNTHETIC_INSTALL_BEFORE_THE_CUT)
+        problems = air_gap_problems(document)
+        self.assertIn("the proof installs before the runner is cut off", problems)
+
+    def test_no_job_loses_a_service_container_to_the_store_switch(self) -> None:
+        """REL-2 S3 review round 4 BLOCKER 1: the dry run lost its registry.
+
+        A service container is started before the job's first step, and
+        the containerd step restarts Docker — which stops the service
+        container and hides the image it ran from. The dry run's
+        registry was such a service, so the image builds that push to
+        `localhost:5000` had no registry to push to.
+        """
+        for job in ("dry-run", "release", "install-proof"):
+            self.assertEqual(
+                services_killed_by_the_store_switch(self.document, job), [], job
+            )
+
+    def test_a_service_container_across_the_restart_is_reported(self) -> None:
+        """The check above must be able to fail."""
+        document = yaml.safe_load(SYNTHETIC_SERVICE_ACROSS_THE_RESTART)
+        self.assertEqual(
+            services_killed_by_the_store_switch(document, "dry-run"),
+            ["registry"],
+        )
+
+    def test_a_service_started_after_the_switch_is_not_reported(self) -> None:
+        """A service a step starts AFTER the switch is not lost."""
+        document = yaml.safe_load(SYNTHETIC_SERVICE_STARTED_AFTER_THE_SWITCH)
+        self.assertEqual(
+            services_killed_by_the_store_switch(document, "dry-run"), []
+        )
+
+    def test_the_dry_run_starts_its_registry_after_the_store_switch(self) -> None:
+        """The registry is a container of the job, not a service.
+
+        The job starts it itself, after the store switch, and waits for
+        it to answer: the first build may start before the registry is
+        up, and a push to a registry that is not up yet fails.
+        """
+        step = step_named(self.document, "dry-run", REGISTRY_STEP)
+        run = str(step.get("run"))
+        self.assertLess(
+            step_index(self.document, "dry-run", CONTAINERD_STEP),
+            step_index(self.document, "dry-run", REGISTRY_STEP),
+            "the registry is started before the store switch",
+        )
+        self.assertIn("docker run -d --name release-registry", run)
+        self.assertIn(REGISTRY_API, run)
+        self.assertIn("exit 1", run, "the wait for the registry is not bounded")
+
+    def test_the_dry_runs_registry_is_pinned_by_digest(self) -> None:
+        """A tag can move under the pipeline's feet; a digest cannot."""
+        run = str(step_named(self.document, "dry-run", REGISTRY_STEP).get("run"))
+        self.assertIn("registry:2@sha256:", run)
+
+    def test_the_dry_run_pushes_to_the_registry_it_started(self) -> None:
+        """The registry the job starts is the registry the job pushes to."""
+        env = self.document["jobs"]["dry-run"].get("env") or {}
+        self.assertEqual(env.get("RELEASE_REGISTRY"), DRY_RUN_REGISTRY)
 
 
 if __name__ == "__main__":

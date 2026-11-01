@@ -64,7 +64,10 @@ ipnet = "2"
 # other way). Already in `Cargo.lock` (0.31.3) through other crates, so the
 # lockfile gains no package; only the `resource` feature and the
 # `lakehouse-api` dependency list change. MIT.
-nix = { version = "0.31", default-features = false, features = ["resource"] }
+# The `fs` feature is here for `lakehousectl` (REL-2 S3-T2): the
+# pre-flight check reads the free disk with `statvfs`, and `nix` does
+# that without `unsafe` in the crate.
+nix = { version = "0.31", default-features = false, features = ["resource", "fs"] }
 time = { version = "0.3", features = ["formatting", "parsing", "serde"] }
 # `RPT-1` (`lakehouse-store::report_schedule`): zone-aware schedule maths needs a
 # time zone database in Rust, and the workspace had none (the zone list lives
