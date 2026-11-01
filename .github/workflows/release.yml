@@ -458,10 +458,21 @@ jobs:
       - name: Build lakehousectl (static, musl)
         run: |
           set -euo pipefail
+          # The musl target goes on the PINNED toolchain, so `rustup` has
+          # to run where the pin is: inside `rust/`, next to
+          # `rust-toolchain.toml` (1.99.1). At the repository root it
+          # installed the target for the runner's DEFAULT toolchain, and
+          # the build — which runs on the pinned toolchain — failed with
+          # "can't find crate for core ... the x86_64-unknown-linux-musl
+          # target may not be installed" (PR #313 dry run).
+          #
+          # The target is NOT added to `rust-toolchain.toml`: every
+          # developer reads that file, and a target in it is a download
+          # every developer pays for a build they do not make.
+          cd rust
           rustup target add x86_64-unknown-linux-musl
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends musl-tools
-          cd rust
           cargo build --release --target x86_64-unknown-linux-musl -p lakehousectl
           cp "target/x86_64-unknown-linux-musl/release/lakehousectl" \
             ../lakehousectl-linux-x86_64
@@ -960,10 +971,21 @@ jobs:
       - name: Build lakehousectl (static, musl)
         run: |
           set -euo pipefail
+          # The musl target goes on the PINNED toolchain, so `rustup` has
+          # to run where the pin is: inside `rust/`, next to
+          # `rust-toolchain.toml` (1.99.1). At the repository root it
+          # installed the target for the runner's DEFAULT toolchain, and
+          # the build — which runs on the pinned toolchain — failed with
+          # "can't find crate for core ... the x86_64-unknown-linux-musl
+          # target may not be installed" (PR #313 dry run).
+          #
+          # The target is NOT added to `rust-toolchain.toml`: every
+          # developer reads that file, and a target in it is a download
+          # every developer pays for a build they do not make.
+          cd rust
           rustup target add x86_64-unknown-linux-musl
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends musl-tools
-          cd rust
           cargo build --release --target x86_64-unknown-linux-musl -p lakehousectl
           cp "target/x86_64-unknown-linux-musl/release/lakehousectl" \
             ../lakehousectl-linux-x86_64
@@ -1158,10 +1180,21 @@ jobs:
       - name: Build lakehousectl (the dry run's key)
         run: |
           set -euo pipefail
+          # The musl target goes on the PINNED toolchain, so `rustup` has
+          # to run where the pin is: inside `rust/`, next to
+          # `rust-toolchain.toml` (1.99.1). At the repository root it
+          # installed the target for the runner's DEFAULT toolchain, and
+          # the build — which runs on the pinned toolchain — failed with
+          # "can't find crate for core ... the x86_64-unknown-linux-musl
+          # target may not be installed" (PR #313 dry run).
+          #
+          # The target is NOT added to `rust-toolchain.toml`: every
+          # developer reads that file, and a target in it is a download
+          # every developer pays for a build they do not make.
+          cd rust
           rustup target add x86_64-unknown-linux-musl
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends musl-tools
-          cd rust
           cargo build --release --target x86_64-unknown-linux-musl \
             -p lakehousectl --features test-key
           cp "target/x86_64-unknown-linux-musl/release/lakehousectl" ../lakehousectl

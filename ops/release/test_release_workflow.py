@@ -31,10 +31,17 @@ And one more since REL-2 S2 review round 5, from the PR's second dry run:
     --type cyclonedx` reads a JSON predicate and the action's plain
     `cyclonedx` format is XML.
 
+And one more since the PR #313 dry run, from the build that failed:
+
+  - every `rustup target add` of the musl target runs from inside `rust/`,
+    where the toolchain pin is, so the target lands on the PINNED
+    toolchain; and the pin itself does not ask for the musl target, so no
+    developer downloads it.
+
 The workflow is parsed with PyYAML (`pyyaml==6.0.3`, installed by the jobs
 that run these tests). The checks are run against synthetic workflows too,
 so a check that cannot fail is itself a failure. No network, no repository:
-the tests read one file and write nothing.
+the tests read two files and write nothing.
 """
 
 from __future__ import annotations
@@ -48,6 +55,9 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "release.yml"
+
+# The toolchain pin: `rustup` reads it from inside `rust/`.
+TOOLCHAIN_PATH = REPO_ROOT / "rust" / "rust-toolchain.toml"
 
 # A third-party action, pinned: `owner/repo` and a 40-hex commit SHA.
 # A SUB-ACTION (`owner/repo/path@<sha>`) is pinned the same way: it is
@@ -84,6 +94,9 @@ SBOM_FORMAT = "cyclonedx-json"
 # are needed: v3 refuses `--tlog-upload=false` while the signing config
 # is in effect, and that config names the public log service.
 NO_TLOG_FLAGS = ("--use-signing-config=false", "--tlog-upload=false")
+
+# The musl target the static installer is built for.
+MUSL_TARGET = "x86_64-unknown-linux-musl"
 
 # A workflow with a signing secret in a job-level `env:`.
 SYNTHETIC_JOB_SECRET = """
@@ -188,6 +201,24 @@ jobs:
     steps:
       - name: Build the offline bundle
         run: ops/release/make_bundle.sh --manifest release.json
+"""
+
+# A workflow that adds the musl target at the repository root, so the
+# target goes to the runner's default toolchain and not to the pin the
+# build runs on (PR #313 dry run).
+SYNTHETIC_MUSL_TARGET_OUTSIDE_RUST = """
+name: Synthetic
+on: workflow_dispatch
+jobs:
+  dry-run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Build lakehousectl (static, musl)
+        run: |
+          set -euo pipefail
+          rustup target add x86_64-unknown-linux-musl
+          cd rust
+          cargo build --release --target x86_64-unknown-linux-musl -p lakehousectl
 """
 
 
@@ -377,6 +408,48 @@ def steps_writing_the_key_to_the_github_env(document: dict[str, Any]) -> list[st
             if "$GITHUB_ENV" in commands and "COSIGN_PRIVATE_KEY" in commands:
                 found.append(f"{job_name}: {step.get('name')}")
     return found
+
+
+def musl_target_steps(document: dict[str, Any]) -> list[tuple[str, str]]:
+    """Every step that adds the musl target, with the job it is in."""
+    found: list[tuple[str, str]] = []
+    for job_name, job in (document.get("jobs") or {}).items():
+        for step in job.get("steps") or []:
+            run = str(step.get("run") or "")
+            if "rustup target add" in run and MUSL_TARGET in run:
+                found.append((job_name, str(step.get("name"))))
+    return found
+
+
+def adds_the_musl_target_inside_rust(step: dict[str, Any]) -> bool:
+    """Whether the step adds the musl target AFTER it changed to `rust/`.
+
+    `rustup` picks its toolchain from the `rust-toolchain.toml` it finds
+    in the current directory or above it. The pin lives in
+    `rust/rust-toolchain.toml`, so a `rustup target add` at the
+    repository root installs the target for the runner's DEFAULT
+    toolchain — and the build, which runs on the PINNED toolchain, finds
+    no musl target (PR #313 dry run).
+    """
+    lines = [
+        line
+        for line in str(step.get("run") or "").splitlines()
+        if not line.strip().startswith("#")
+    ]
+    changed_to_rust: int | None = None
+    added: int | None = None
+    for index, line in enumerate(lines):
+        if changed_to_rust is None and re.match(
+            r"cd\s+rust(?:\s|$)", line.strip()
+        ):
+            changed_to_rust = index
+        if added is None and "rustup target add" in line and MUSL_TARGET in line:
+            added = index
+    return (
+        changed_to_rust is not None
+        and added is not None
+        and changed_to_rust < added
+    )
 
 
 class ReleaseWorkflowTest(unittest.TestCase):
@@ -775,6 +848,45 @@ class ReleaseWorkflowTest(unittest.TestCase):
             steps_writing_the_key_to_the_github_env(document),
             ["dry-run: Generate a throwaway signing key"],
         )
+
+    def test_every_musl_target_is_added_on_the_pinned_toolchain(self) -> None:
+        """PR #313 dry run: the target must land on the PINNED toolchain.
+
+        `rustup` reads the pin from the `rust-toolchain.toml` in the
+        current directory or above it, so the target has to be added
+        from inside `rust/`. Added at the repository root it went to the
+        runner's default toolchain, and the build on the pinned
+        toolchain (1.99.1) failed with "can't find crate for core ...
+        the x86_64-unknown-linux-musl target may not be installed".
+        """
+        steps = musl_target_steps(self.document)
+        self.assertTrue(steps, "no step adds the musl target")
+        for job_name, step_name in steps:
+            step = step_named(self.document, job_name, step_name)
+            self.assertTrue(
+                adds_the_musl_target_inside_rust(step),
+                f"{job_name}: {step_name}: the musl target is added before `cd rust`",
+            )
+
+    def test_a_musl_target_added_outside_rust_is_reported(self) -> None:
+        document = yaml.safe_load(SYNTHETIC_MUSL_TARGET_OUTSIDE_RUST)
+        for job_name, step_name in musl_target_steps(document):
+            step = step_named(document, job_name, step_name)
+            self.assertFalse(
+                adds_the_musl_target_inside_rust(step),
+                f"{job_name}: {step_name}: the musl target is added before `cd rust`",
+            )
+
+    def test_the_toolchain_pin_does_not_ask_for_the_musl_target(self) -> None:
+        """The musl target is a release build's need, not every dev's.
+
+        A target in `rust-toolchain.toml` is downloaded by every
+        developer and by every CI job that touches Rust — for a build
+        they do not make. The release workflow adds the target itself,
+        on the pinned toolchain (PR #313 dry run).
+        """
+        text = TOOLCHAIN_PATH.read_text(encoding="utf-8")
+        self.assertNotIn(MUSL_TARGET, text)
 
 
 if __name__ == "__main__":
