@@ -45,6 +45,7 @@ mod rollback;
 mod runner;
 mod secrets;
 mod state;
+mod status;
 mod sys;
 mod update;
 mod verify;
@@ -83,5 +84,6 @@ fn run(cli: Cli) -> Result<(), error::ToolError> {
         Command::Restore(args) => backup::command_restore(&args),
         Command::Update(args) => update::command(&args),
         Command::Rollback(args) => rollback::command(&args),
+        Command::Status(args) => status::command(&args),
     }
 }

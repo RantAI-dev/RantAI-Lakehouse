@@ -206,6 +206,24 @@ pub fn compose_stop_all(dir: &Path, env_file: &Path) -> Result<(), String> {
         .map_err(|error| format!("the stack could not be stopped: {error}"))
 }
 
+/// The state of the deployment's services.
+///
+/// The output is Compose's own JSON, one object per service. The
+/// caller reads it (REL-2 S4 decision D19).
+///
+/// # Errors
+///
+/// Returns the message that says what to fix when Compose fails.
+pub fn compose_ps(dir: &Path, env_file: &Path) -> Result<String, String> {
+    let mut args = compose_args(dir, env_file);
+    args.push("ps".to_string());
+    args.push("--format".to_string());
+    args.push("json".to_string());
+    let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+    sys::output_or_stderr("docker", &borrowed)
+        .map_err(|error| format!("the state of the stack could not be read: {error}"))
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]

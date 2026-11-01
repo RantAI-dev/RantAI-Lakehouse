@@ -26,7 +26,7 @@ use crate::error::ToolError;
 pub const SCHEMA_VERSION: u64 = 1;
 
 /// The state of an install.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct State {
     /// The version of the state's own shape.

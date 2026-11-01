@@ -39,6 +39,8 @@ pub enum Command {
     Update(UpdateArgs),
     /// Move the stack back to the release it came from.
     Rollback(RollbackArgs),
+    /// Show what the install is doing right now.
+    Status(StatusArgs),
 }
 
 /// The arguments of `lakehousectl verify`.
@@ -139,4 +141,12 @@ pub struct RollbackArgs {
     /// Do not ask. The data written since the update is lost.
     #[arg(long)]
     pub yes: bool,
+}
+
+/// The arguments of `lakehousectl status`.
+#[derive(Debug, Args)]
+pub struct StatusArgs {
+    /// Where the install lives: everything is in this one directory.
+    #[arg(long, default_value = "/opt/rantai-lakehouse")]
+    pub dir: PathBuf,
 }
