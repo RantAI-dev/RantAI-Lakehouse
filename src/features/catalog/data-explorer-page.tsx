@@ -161,18 +161,18 @@ export function DataExplorerPage() {
   // are on the detail page) → Size (nice to know) → Freshness (also shown on the detail page) → Type (largely implied by
   // Layer). Name, Namespace, Tier and the actions menu always stay.
   //
-  // These are removed from the column list rather than toggled through
-  // `columnVisibility`, because that state is persisted per user by
-  // `useTableLayout` — driving it from the window size would overwrite
-  // someone's saved choices every time they resized.
+  // The columns are hidden, not removed (DATA-24): they stay in the column
+  // list, so their filters keep working in the toolbar's filter menu at
+  // every width. They used to be dropped from the column list, which took
+  // their filters with them — the Owner and Tags filters vanished on a
+  // laptop.
   const width = useWindowWidth()
   const hiddenByWidth = useMemo(() => {
     // Before the first measurement, assume there is room: showing the full
     // table and then trimming reads better than the reverse.
     if (width === null) return []
     const hidden: string[] = []
-    // Tags and Owner (DATA-11) are the widest new columns and go first;
-    // they stay filterable only while shown, like Type and Layer below.
+    // Tags and Owner (DATA-11) are the widest new columns and go first.
     //
     // DATA-11 review SHOULD-FIX 7: derived like the figures above, from the
     // window minus the open sidebar (~296px of content lost, 900 -> 604).
@@ -220,15 +220,23 @@ export function DataExplorerPage() {
 
   // Memoised: a new array each render would make TanStack Table rebuild
   // its column model, losing in-flight state like a column being dragged.
-  const columns = useMemo(() => {
-    const all = getDataExplorerColumns({ onOpen: openAsset })
-    if (hiddenByWidth.length === 0) return all
-    return all.filter((column) => !hiddenByWidth.includes(column.id ?? ""))
-  }, [openAsset, hiddenByWidth])
+  //
+  // Every column stays in the list — the ones the window is too narrow for
+  // are hidden through the table's visibility, not dropped from it, so their
+  // filters keep working (DATA-24).
+  const columns = useMemo(
+    () => getDataExplorerColumns({ onOpen: openAsset }),
+    [openAsset]
+  )
 
   const { table } = useDataTable({
     data: rows,
     columns,
+    // The columns the window is too narrow for. Hidden through the table's
+    // visibility, never removed from the column list, so the Owner and Tags
+    // filters are still offered (DATA-24). The user's saved column layout
+    // is left alone: the hide is the page's, not theirs.
+    hiddenColumns: hiddenByWidth,
     // -1 because the server never counts the pages for an infinite table;
     // `hasNextPage` is what ends the scroll.
     pageCount: -1,
@@ -286,7 +294,7 @@ export function DataExplorerPage() {
         <EmptyState title="Catalog unavailable" description={unsupportedReason ?? undefined} />
       ) : isLoading ? (
         <DataTableSkeleton
-          columnCount={columns.length}
+          columnCount={columns.length - hiddenByWidth.length}
           rowCount={8}
           filterCount={2}
         />
@@ -360,12 +368,13 @@ export function DataExplorerPage() {
             {hiddenLabels.length > 0 ? (
               // Said out loud rather than left as a mystery: columns vanish
               // as the window narrows, and without this the table simply
-              // looks like it lost data.
+              // looks like it lost data. The filters are still there
+              // (DATA-24), so it says so.
               <p className="text-xs text-muted-foreground">
                 {hiddenLabels.join(", ")}{" "}
                 {hiddenLabels.length === 1 ? "is" : "are"} hidden at this
                 window width — widen the window, or open an asset to see
-                everything.
+                everything. The filters still work.
               </p>
             ) : null}
           </div>

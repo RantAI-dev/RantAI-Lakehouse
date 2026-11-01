@@ -100,7 +100,7 @@ A step not performed is never Pass. Steps needing a terminal are marked
 | 11 | On a deployment with two tenants and `CATALOG_TENANT_ID` set, search as a member of the other tenant | No tables are listed, and the Data Explorer shows the reason | Pass 2026-10-23 (product owner) |
 | 12 | Type words that match nothing | "No results", not an error and not every table | Pass 2026-10-09 |
 | 13 | (operator) Stop ClickHouse; search | A plain "catalog unavailable" message, with no server text in it | Pass 2026-10-23 (product owner) |
-| 14 | (operator) Read `docs/plans/DATA-11-RESULT.md` | It gives the measured time for 10,000 tables, the command that produced it, and whether 500 ms was met | Fail 2026-10-23 (pre-check); accepted as an exception by the product owner |
+| 14 | (operator) Read `docs/plans/DATA-11-RESULT.md` | It gives the measured time for 10,000 tables, the command that produced it, and whether 500 ms was met | Measured 2026-11-01 (`DATA-11-RESULT.md`, run 41267430494): median 489/326 ms meets 500 ms; p95 about 755 ms and the first search after the copy expires (about 7.2 s) do not. Follow-up `DATA-38` |
 
 **Accepted by:** product owner (held in the base) **Date:** 2026-10-23 **Build:** main 0e5498d2
 
@@ -121,9 +121,10 @@ Exceptions, each with an owner and a date:
   with `approximate: true`, and the console says "approximate match".
   Owner: product owner, to re-run row 5 and close the exception. Date:
   2026-10-23. Follow-up: `DATA-32`.
-- Row 14, the speed measurement on 10,000 tables: `docs/plans/DATA-11-RESULT.md`
-  does not exist. Owner: product owner. Date: 2026-10-23. Follow-up:
-  `DATA-24`.
+- Row 14, the speed measurement on 10,000 tables: measured on 2026-11-01
+  (`docs/plans/DATA-11-RESULT.md`, run 41267430494). The median meets 500 ms;
+  p95 (about 755 ms) and the first search after the copy expires (about 7.2 s)
+  do not. Owner: product owner. Date: 2026-10-23. Follow-up: `DATA-38`.
 
 ## After acceptance
 
