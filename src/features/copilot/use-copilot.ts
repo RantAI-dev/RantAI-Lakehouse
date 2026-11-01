@@ -86,10 +86,50 @@ type ChatResult = {
 const RECENT_SESSIONS = 20;
 
 /**
- * The text a continuation is sent as (`AI-15`): the steps the request still
- * has, sent back to the model once the person confirmed the draft.
+ * The text a continuation is sent as (`AI-15`): the objects the person
+ * confirmed and that were saved, then the step the request still has.
+ * The model reads only the text of the chat, so the saved objects have
+ * to be named in it — without them it drafts them again.
+ *
+ * One item per confirmed step that succeeded, in the order of the steps:
+ * `<tool> <id> "<title>"`. The id is `result.id`, or `result.field.id`
+ * for a calculated field; the title is `result.title`, else
+ * `result.name`, else `result.field.name`. A part the result does not
+ * carry is left out, so the item is the tool name alone when there is
+ * neither an id nor a title.
  */
-export const CONTINUATION_PREFIX = "Confirmed. Continue: ";
+export function continuationText(messages: Msg[], index: number, nextStep: string): string {
+  const items = (messages[index]?.tools ?? [])
+    .map((step) => savedItem(step))
+    .filter((item): item is string => item !== null);
+  return `Confirmed and saved: ${items.join("; ")}. Do not draft these again. Continue: ${nextStep}`;
+}
+
+/**
+ * The item that names one saved object, or null when the step is not one:
+ * a step that failed, or one that still waits for the person to confirm
+ * it, has saved nothing.
+ */
+function savedItem(step: ToolStep): string | null {
+  if (step.ok !== true) return null;
+  const result = (step.result ?? {}) as {
+    id?: unknown;
+    title?: unknown;
+    name?: unknown;
+    field?: unknown;
+    needs_confirmation?: unknown;
+  };
+  if (result.needs_confirmation) return null;
+  const field = (result.field ?? {}) as { id?: unknown; name?: unknown };
+  const id = textOf(result.id) ?? textOf(field.id);
+  const title = textOf(result.title) ?? textOf(result.name) ?? textOf(field.name);
+  return `${step.tool}${id ? ` ${id}` : ""}${title ? ` "${title}"` : ""}`;
+}
+
+/** The text a result carries, or null when it carries none. */
+function textOf(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
 
 /**
  * How many continuation messages may follow one message the person typed
@@ -479,7 +519,7 @@ function useCopilotState() {
         stepsSettled(updated, messageIndex) &&
         continuationsRef.current < MAX_CONTINUATIONS
       ) {
-        void send(`${CONTINUATION_PREFIX}${nextStep}`, updated, { continuation: true });
+        void send(continuationText(updated, messageIndex, nextStep), updated, { continuation: true });
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
