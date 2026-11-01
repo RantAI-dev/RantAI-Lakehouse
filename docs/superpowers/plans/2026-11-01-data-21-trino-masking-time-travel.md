@@ -178,6 +178,130 @@ this slice's favour of the plan's intent; each is a reviewer's call):
    they describe the state before `DATA-21` and that the Trino rows are
    asked again in `DATA-21`'s own acceptance.
 
+### Handoff S2 (developer, 2026-11-01)
+
+**Commits** (one per concern, in plan order, each pushed on its own):
+
+| Commit | What |
+| --- | --- |
+| `504d562d` | `feat(gates): the G8 gates prove masking and past versions on Trino (DATA-21 S2)` — the two gate scripts |
+| `95e32ea7` | `ci(g8): the G8 gates run on Trino as well as ClickHouse (DATA-21 S2)` — the two CI jobs |
+| `c9be3d10` | `ci(g8): the Trino leg of the G8 governance gate reads Lakekeeper in-network (DATA-21 S2)` — the gap the local run found |
+
+**Commands run** — all in the foreground, on the final commit `c9be3d10`:
+
+| Command | Result |
+| --- | --- |
+| `python3 -m py_compile ops/g8/g8_governance_test.py ops/g8/g8_time_travel_test.py` | clean (exit 0) |
+| `python3 ops/lint/check_bare_iceberg_count.py` | "R11 guard: no bare count() against a Bronze Iceberg table found." (exit 0) |
+| `python3 ops/lint/check_intra_package_imports.py` | "OK: all intra-package dispar_orchestrate imports resolve" (exit 0) |
+| `docker compose --profile '*' config --quiet` | clean (exit 0) |
+| `actionlint .github/workflows/ci.yml` | clean (exit 0) |
+| `python3 -c "import yaml; yaml.safe_load(...)"` over `ci.yml` | parses; both jobs carry the expected matrix |
+
+`actionlint` was **not installed** on this machine, so 1.7.7 was fetched from its
+release page into a scratch directory outside the repository. `actionlint` is not
+part of this repo's own verification block, so this is a bonus check, not one of
+the block's commands.
+
+**Local gate runs** — the real proof, on this machine, on the compose project
+`data21g` (the `trino` profile, plus `dagster` for the time-travel stack). The
+`lakehouse-api` image was rebuilt from this branch's source first
+(`docker compose build lakehouse-api`, `rantai-lakehouse-api:local`, 2026-11-01
+12:11; the image on the machine was built before slice S1's commits, so a run
+against it would have proved nothing about this branch).
+
+| Gate | Engine | Result |
+| --- | --- | --- |
+| `g8_governance_test.py` | `trino` | **PASS** — the Gold export published `serving.g8_gate_subjects` as `gold.g8_gate_subjects`, the policy `g8-mask-email-trino` was authored, the analyst's `email` came back `***` with `region` in clear text, the admin's came back in clear text, and both bypass shapes (`SELECT *`, `SELECT *` in a CTE) came back masked |
+| `g8_governance_test.py` | `clickhouse` | **PASS** — the leg the gate always was |
+| `g8_time_travel_test.py` | `trino` | **PASS** — two loads, older version 2000 rows / current 4010 rows, the analyst 1000 of 2000 at the older version, `customer` masked to `***` with the other columns clear and equal to the admin's, and the pin inside a subquery and inside a CTE both masked |
+| `g8_time_travel_test.py` | `clickhouse` | **PASS** — the leg the gate always was |
+
+The two `clickhouse` runs are a bonus: the brief asked for one real run of each
+changed gate on Trino, and they are here to show the `clickhouse` leg is not
+broken by the change.
+
+The stack was torn down afterwards: `docker compose -p data21g down -v`. No
+container, volume or testcontainers image is left behind.
+
+**Not verified** — and why:
+
+- The CI jobs themselves have **not run**. No pull request was opened (the
+  developer never opens one), so the matrix legs have not been exercised by
+  GitHub Actions. The reviewer runs them.
+- The full workspace block (`cargo clippy --workspace --all-targets
+  --all-features -- -D warnings`, `cargo test --workspace`): **not run.** No
+  Rust file changed in this slice, and the machine rules for this session say
+  to run only the checks for what the commit touched.
+- `bun run typecheck`, `bun run lint`, `bun run test`: **not run.** No
+  TypeScript file changed.
+- `python3 -m pytest dispar_orchestrate -q`: **not run.** No Dagster file
+  changed.
+- The gate scripts have **no unit tests** — they are acceptance gates, run in
+  CI — so `py_compile` and the two Python lints are all the static checking
+  there is.
+
+**Decisions the plan left open, and what was done** (each is a reviewer's call):
+
+1. **The plan says the gates "take an engine argument and run every masking
+   and past-version check on both engines".** Read as: the script takes the
+   engine, and CI runs it once per engine. `--engine <name>` beats the
+   `G8_ENGINE` environment variable, which beats the `clickhouse` default, so a
+   run with no argument at all is byte-for-byte the ClickHouse leg the gates
+   always were — the ClickHouse leg's SQL is unchanged, down to `count()` and
+   `SETTINGS iceberg_snapshot_id = <id>`.
+2. **The CI shape is a matrix** over `engine: [clickhouse, trino]`, not a
+   second step in one job. The plan allowed either ("matrix or second step"),
+   but a matrix gives each leg its own runner, its own compose project and its
+   own fresh volumes — so neither leg's stack, fixtures, loads or snapshots
+   touch the other's — and it leaves the `clickhouse` leg's stack exactly as it
+   was. The plan's own wording ("start the stack with the `trino` profile") is
+   singular, so this is a deliberate reading against that sentence; a second
+   step in one job would also have worked, at the price of the time-travel
+   gate loading the Bronze table twice in one stack.
+3. **The governance gate's Trino leg reads an Iceberg table, and the gate
+   publishes one itself.** `Trino` has no ClickHouse connector in this stack
+   and its only catalog is Lakekeeper's Iceberg REST catalog, so the gate's own
+   `MergeTree` table is invisible to it. The Trino leg publishes the gate's
+   own seeded rows through the Gold export
+   (`POST /api/gold/export/g8_gate_subjects`, the only write path to that
+   catalog), which carries the mart's own `email` and `region` columns across,
+   and then governs and reads `iceberg.gold.g8_gate_subjects`. The masked
+   column and its unmasked sibling are the same two columns the ClickHouse
+   leg proves. The two legs govern two different tables, so they carry two
+   different policy names (`g8-mask-email`, `g8-mask-email-trino`) — a
+   policy's name is unique.
+4. **The time-travel gate needed no policy change at all.** Both engines read
+   the same Bronze table (`iceberg.bronze.<table>` through Lakekeeper's
+   catalog on Trino, `icecat_api.\`bronze.<table>\`` through the
+   `DataLakeCatalog` database on ClickHouse), and the policy engine matches a
+   rewritten statement's table by its canonical name — `bronze.<table>`, the
+   catalog dropped — so ONE policy governs the table on both engines.
+5. **The Trino SQL differs from the ClickHouse SQL in four places**, each
+   measured against `trinodb/trino:483` itself rather than guessed: the
+   version pin is `FOR VERSION AS OF <id>` on the TABLE, right after the table
+   reference (`FROM t WHERE ... FOR VERSION AS OF 1` does not parse); the count
+   is `count(*)`; the "every row" predicate is `WHERE true` (`WHERE 1` is not a
+   boolean in Trino); and the `ORDER BY` may only name a column the outer
+   select list carries, so the Trino shapes select `id` beside the masked
+   column.
+6. **The `g8-governance` job's `.env` now sets `LAKEKEEPER_BASE_URI` for the
+   `trino` leg only.** The local run found it: the Gold export failed with
+   "The catalog request failed" because the API's Iceberg catalog client
+   dialed `http://localhost:8181/catalog` from inside the compose network.
+   `lakekeeper` advertises its own base URI and the REST catalog client
+   follows the advertised one, so the advertised address must be the in-network
+   name — the same value, for the same reason, as the `gold-export` job's
+   `.env` has always set. The `clickhouse` leg does not run Lakekeeper at all,
+   so its environment is untouched.
+7. **Both job timeouts are raised** (15 -> 25 and 25 -> 35 minutes): the
+   `trino` leg's stack carries the Trino coordinator and the Lakekeeper chain
+   behind it, which take a few minutes to become healthy before the gate can
+   run. A timeout is a ceiling, not a behaviour.
+8. **The `ci-required` gate needs no change**: `needs.g8-governance.result` is
+   the matrix job's aggregate result.
+
 ## 6. Review (planner appends below)
 
 ### Review S1 round 1 (planner, 2026-11-01, at `2a374c09`)
