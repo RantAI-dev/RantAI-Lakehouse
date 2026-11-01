@@ -508,3 +508,18 @@ testcontainers were created by this run, and none are left.
 - `actionlint`: **not run.** `ci.yml` was not changed by this fix — the
   wait belongs in the gate, not in the workflow, so that every caller of
   the gate (CI and a local run) is protected by it.
+
+### Review S2 round 3 (planner, 2026-11-01, at `c4bf2959`)
+
+- **BLOCKER 1 (round 2) is fixed.**
+  - One helper, `ops/g8/trino_ready.py`, used by both gates (rule 4).
+  - It waits for `/v1/info` to report `starting:false` **and** for a `SELECT 1` to succeed. The
+    wait is bounded at 5 minutes, polling every 2 s, and a timeout says which condition was untrue.
+  - Each Trino leg waits before its first Trino query. The ClickHouse legs never call it.
+- **The proof:**
+  - each Trino gate ran twice on a clean project, and all four runs passed;
+  - against a coordinator restarted mid-run, the wait held for 12.9 s and then passed.
+- **The G9 failure** on `a3130f5` (run 41288093621) touched no file this PR changes, and `main`
+  is green on G9. If it fails again on this PR, it gets its own look.
+
+**Open: no BLOCKER, no SHOULD-FIX.**
