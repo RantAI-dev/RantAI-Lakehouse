@@ -106,6 +106,106 @@ DATA-41 is Done only if p95 is under 500 ms on both routes. Otherwise the gap is
 
 ## 4. Handoff (developer appends below)
 
+### Handoff (developer, 2026-11-01)
+
+T2, T3, T4 and T5 are done, in the plan's order, one commit each. **T1 is
+not done**: `DATA-40` (`fix/data-40-one-name-one-dataset`) is not in `main`
+yet, and the plan puts T1 last, after `DATA-40` has merged. The branch is
+merged with `origin/main` (`git merge origin/main` → "Already up to date";
+`main` is at `5661a043`). The check was
+`git merge-base --is-ancestor origin/fix/data-40-one-name-one-dataset
+origin/main`, which fails.
+
+#### Commits (branch `perf/data-41-catalog-search-speed`, pushed after each)
+
+| Commit | Task | Decision | What it does |
+| --- | --- | --- | --- |
+| `45dd7745` | T2 | D2 | `SearchIndex`: the candidates are lower-cased and tokenised once, with the copy; `search()` reads the index and allocates nothing per candidate. |
+| `29171a7f` | T3 | D6 | `apply_filters` filters in place; a search that filters nothing copies nothing. |
+| `f63a32e2` | T4 | D3 | `GET /api/catalog?limit=` (1..200) and `total`; the palette asks for eight. |
+| `f3c68cd6` | T5 | D4, D5 | The copy is built at start-up, in the background; the bench's `--after-expiry` measures the search that finds the copy too old. |
+
+#### Checks run (and their counts)
+
+Scoped to the crate, per the task's rules — no full-workspace cargo run.
+
+| Command | Result |
+| --- | --- |
+| `cargo fmt --check` (in `rust/`) | clean, no output |
+| `cargo clippy -p lakehouse-api --all-targets -- -D warnings` | clean, no warnings |
+| `cargo test -p lakehouse-api --lib catalog_search` (T2) | 39 passed, 0 failed |
+| `cargo test -p lakehouse-api --lib catalog_query` (T3) | 39 passed, 0 failed |
+| `cargo test -p lakehouse-api --lib catalog` | 282 passed, 0 failed |
+| `cargo test -p lakehouse-api catalog` (T4) | 279 + 281 passed, 0 failed (the lib and the bin target) |
+| `cargo test -p lakehouse-api --lib catalog_search_cache` (T5) | 12 passed, 0 failed |
+| `bun run typecheck` (T4) | clean, no output |
+| `bun run test` (T4) | 3083 pass, 1 skip, 0 fail (313 files) |
+| `python3 -m py_compile ops/bench/catalog_search_bench.py` (T5) | clean |
+| `python3 -m unittest discover -s ops/bench -p 'test_*.py'` (T5) | 18 tests, OK |
+| `actionlint .github/workflows/catalog-search-bench.yml` (T5) | clean, no output |
+
+#### The bench on bluefin (2026-11-02, this branch, throwaway compose project `data41bench`)
+
+The same throwaway setup the investigation used: `docker compose -p
+data41bench up -d --build lakehouse-api`, the bench's own `seed` (10,000
+tables × 20 columns, half in each registry), then `run --rounds 50
+--datasets 10000 --after-expiry`. The stack was torn down afterwards
+(`docker compose -p data41bench down -v`).
+
+| Route | p50 | p95 | max | first | afterExpiryMs |
+| --- | --- | --- | --- | --- | --- |
+| `GET /api/catalog?q=` | 199.7 ms | **270.8 ms** | 293.3 ms | 12223.0 ms | 149.5 ms |
+| `GET /api/catalog/query?search=` | 98.1 ms | **151.7 ms** | 167.0 ms | 149.0 ms | 159.4 ms |
+
+Both routes are under the 500 ms target at p95 on this branch (the
+investigation measured 678–739 ms at p95 on `main`, on this machine, with
+the same setup).
+
+The 12223 ms `firstMs` of the first route is the copy being rebuilt
+inline: the bench ran about seven minutes after the stack came up, and a
+copy older than `MAX_STALE` (five minutes) is not served — it is rebuilt
+and the caller waits. It is the cost of the copy, not of a search; every
+search after it is 150–270 ms.
+
+#### Notes for the reviewer
+
+- **T3's shape differs from the plan's wording, on purpose.** The plan says
+  `apply_filters` should pass the matches through "by reference, or by an
+  index list". It filters the rows **in place** instead: with no filters it
+  touches no row at all, and with filters the rows that do not match are
+  dropped. That is the same goal (no copy) with a smaller diff, and it
+  avoids a `Cow` whose `DerefMut` panics on a borrowed value. The route
+  therefore sorts the rows it holds **before** it filters them, which
+  leaves the survivors in the same order as filtering first and sorting
+  after would (`apply_sort` is a total order, `id` included).
+- **The index shares one prepared text per distinct lower-cased text.** A
+  column name is on thousands of tables, so preparing it per asset would
+  cost memory in proportion to the catalog's assets rather than its
+  distinct texts. `the_index_prepares_each_text_once_and_shares_it` pins
+  it.
+- **`routes::catalog_search` is `pub(crate)` now** (the cache module holds
+  the index, so the type has to be nameable from outside the module).
+  `routes::catalog` is `pub(crate)` for the same reason (`main.rs` starts
+  the start-up build).
+- `spawn_startup_search_copy` carries `#[allow(dead_code, reason = ...)]`:
+  the binary starts the copy, and the library target compiles the same
+  module without a start-up path of its own.
+- `bun run lint` is **red on `main` too**: 12356 problems, 649 errors, all
+  of them inside the local `dagster/.venv` (a gitignored virtualenv with
+  bundled JS). The four files this branch touches are lint-clean
+  (`bun --bun eslint <the four files>` → no output). Not caused by this
+  branch, and not fixed by it.
+
+#### Not verified
+
+- **The full-workspace cargo run** (`cargo clippy --workspace --all-targets
+  --all-features` and `cargo test --workspace`): not run. The task scoped
+  the checks to the crate this branch touches.
+- **T1** — blocked on `DATA-40` (see the top of this entry).
+- The bench numbers above are from **this branch on bluefin**, not from the
+  GitHub workflow. The planner's measurement (on `main`, after the merge)
+  is the one that decides whether `DATA-41` is Done.
+
 ## 5. Review (planner appends below)
 
 ## 6. The investigation report (bluefin, 2026-11-01)
