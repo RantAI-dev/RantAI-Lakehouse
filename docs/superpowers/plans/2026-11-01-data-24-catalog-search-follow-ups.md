@@ -154,3 +154,27 @@ Not verified, and why:
 - **A local-machine fact, not a workflow fact**: on this host something outside Docker holds port 8080, so the local run published the API on 18080 (`API_HOST_PORT`). The workflow uses the compose default (8080), which is free on a GitHub runner.
 
 ## 4. Review and results (planner appends below)
+
+### Review of T1 and T3 (planner, 2026-11-01)
+
+- **T1 (D1)** is accepted, with both of the developer's choices:
+  - every width-hidden column is now hidden rather than removed, which is what makes "filters
+    still work" true;
+  - the shared sort whitelist is unchanged.
+- **T3 (D3)** is accepted:
+  - the workflow is `workflow_dispatch` only, with `contents: read` and CI-only credentials (the
+    pattern `g9-upload-large.yml` uses);
+  - the bench now loads the registry DDL from its one owner (`bronze_catalog`), which follows
+    rule 4, and rotates the bootstrap password before searching;
+  - the developer's local smoke run found both of those bugs, and its numbers are **not** the
+    measurement.
+- **I re-ran:**
+  - the bench's tests: 16 pass;
+  - `bun run typecheck`: clean;
+  - `bun test src/features/catalog`: 341 pass.
+- **Slicing change:** GitHub runs a `workflow_dispatch` workflow only once its file is on the
+  default branch. So T1 and T3 merge now, the planner then runs the bench, and **T2 (the Rust
+  `FINAL`) follows as its own PR**, on branch `fix/data-24-t2-final`.
+- **Wiring the bench's tests into `ci.yml`** (the developer's note) goes in with T2.
+
+**Open: no BLOCKER, no SHOULD-FIX** for T1 and T3.
