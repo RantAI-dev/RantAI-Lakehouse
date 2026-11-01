@@ -1049,6 +1049,60 @@ the fix is proved here by the workflow's own checks and by the test that fails a
 file, and the dry run is what proves it end to end. **No cargo ran**: this commit touches no
 Rust.
 
+### Fix for the PR #313 install-proof (developer, 2026-11-01)
+
+**Commit `f9d00a2b`** (branch `feat/rel-2-s3-lakehousectl-install`): the proof reads the bundle from
+`dry-run/dist/`, the folder the artifact actually keeps it in.
+
+The dry run failed in "Install the bundle" with `tar (child): dry-run/rantai-lakehouse-*.tar.zst:
+Cannot open: No such file or directory`.
+
+`actions/upload-artifact` stores every file at its path relative to the ROOT of the upload list —
+the least common ancestor of the search paths. That list names files from `dist/`, from `sbom/`
+and from the repository root itself, so the root is the repository root and the folders survive.
+The proof's `download-artifact` step unpacks the artifact into `dry-run/`, so the bundle is at
+`dry-run/dist/rantai-lakehouse-*.tar.zst` and `cosign.pub` is at `dry-run/cosign.pub`. The
+`cosign.pub` path was right; the bundle's path was not.
+
+The layout was not guessed: the central directory of the artifact of the failed run (PR #313,
+run `41300418587`, artifact `release-dry-run`) was read over HTTP range requests, and it holds
+24 entries — `dist/rantai-lakehouse-0.1.0-linux-x86_64.tar.zst`,
+`dist/rantai-lakehouse-0.1.0-linux-x86_64.tar.zst.sha256`, `release.json`,
+`release.json.sigstore.json`, `docker-compose.release.yml`, `lakehousectl-linux-x86_64`,
+`cosign.pub` and the 16 `sbom/*.cdx.json` files. Every file the proof reads is now on that list
+under the same relative path.
+
+**Commands run** (from the repository root, on the commit above):
+
+- `actionlint .github/workflows/release.yml` — no findings, exit 0.
+- `python3 -m pytest ops/release -q` — **139 passed**, 1 warning (the system pytest's `anyio`
+  plugin `PytestRemovedIn10Warning`; it is there before this commit too, at 135 passed).
+- `python3 ops/lint/check_intra_package_imports.py` — `OK: all intra-package dispar_orchestrate
+  imports resolve`.
+- `python3 ops/lint/check_bare_iceberg_count.py` — `R11 guard: no bare count() against a Bronze
+  Iceberg table found.`
+
+The four new tests in `ops/release/test_release_workflow.py`:
+
+- `test_every_file_the_proof_reads_is_on_the_upload_list` — every path the proof job reads under
+  `dry-run/` is on the dry run's upload list, under the SAME relative path (the folder is
+  compared, not just the glob, so `dist/*.tar.zst` cannot stand for a file read from the
+  artifact's root);
+- `test_a_proof_reading_a_file_the_dry_run_does_not_upload_is_reported` — the check above was run
+  against a synthetic workflow whose proof reads the bundle from the artifact's root, and it
+  fails there with `dry-run/rantai-lakehouse-*.tar.zst`;
+- `test_the_proof_downloads_the_artifact_the_dry_run_uploaded` — the upload step and the
+  download step name the SAME artifact;
+- `test_the_proof_unpacks_the_artifact_where_it_reads_it` — the proof reads from the folder it
+  unpacked the artifact into.
+
+The first check was also run against the OLD `release.yml` (the file at `ab70ff2f`): it fails
+there with `dry-run/rantai-lakehouse-*.tar.zst`, and passes against the fixed file.
+
+**Not verified:** the dry run itself — it needs the `release` environment's key and a runner, so
+the fix is proved here by the workflow's own checks, by the test that fails against the old file
+and by the artifact's own central directory. **No cargo ran**: this commit touches no Rust.
+
 ## 7. Review (planner appends below)
 
 ### Review S1 round 1 (planner, 2026-10-31, at `f79d4235`)
