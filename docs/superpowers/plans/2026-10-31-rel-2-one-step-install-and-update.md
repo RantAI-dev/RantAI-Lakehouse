@@ -2697,3 +2697,28 @@ old save from the digest reference) reproduced the blocker, so the measurement p
 **Open: no BLOCKER, no SHOULD-FIX.** Merge waits for this head's CI: the required checks, the
 workspace cargo run, `Release · dry run`, and `install-proof`, which is now air-gapped and on
 the containerd store.
+
+### Review S4a round 1 (planner, 2026-11-01, at `ba9115a3`)
+
+S4-T1 to T3 match D14–D16. The real run on bluefin is the proof that matters: the shipped
+`backups.xml` made `BACKUP … TO Disk('backups')` work, and a backup, a `down -v` and a restore
+brought both markers back. D14's list was the planner's miss, since
+`ops/seaweedfs/iam.template.json` (profile `seaweedfs`) is a third mount. The developer followed
+D14's rule rather than its list, which is right, and the tooling test pins all three.
+
+- **SHOULD-FIX 1. A shipped file's path is written as the manifest names it.**
+  `files::write` joins `dir` with the manifest's key. The manifest is signed, but a key that is
+  absolute or holds a `..` component would write outside `--dir`. *Fix:* `make_manifest.py` and
+  `files.rs` both refuse a name that is absolute or has a `..` component, or anything but
+  normal components, with tests.
+- **SHOULD-FIX 2. Release assets are named by the file's last component**
+  (`files::asset_name`). Two shipped files with the same file name in different folders would
+  collide on GitHub Releases. *Fix:* `make_manifest.py` refuses two `files` entries with the
+  same last component, with a test.
+- **SHOULD-FIX 3. The developer path of the backup scripts changed.** Before, they ran
+  `docker compose -p <project>` in the repository root, which also loads a developer's
+  `docker-compose.override.yml`. They now always pass `-f docker-compose.yml`, which stops
+  that. *Fix:* pass `-f` (and `--env-file`, `override.yml`) only when `LAKEHOUSE_DIR` is set,
+  so the unset case is exactly the old command. Test both cases in `test_backup_scripts.py`.
+
+**Open: SHOULD-FIX 1–3.**
