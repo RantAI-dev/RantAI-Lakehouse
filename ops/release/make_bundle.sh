@@ -15,10 +15,10 @@
 #                             manifest's digest in one JSON file.
 #                             `lakehousectl` verifies the manifest through
 #                             it and trusts nothing else.
-#   images/<name>.tar         one `docker save` per image, BY DIGEST
-#                             REFERENCE, so the host needs no registry:
-#                             `docker load` reads the file and the loaded
-#                             image is the one the manifest names.
+#   images/<name>.tar         one `docker save` per image, BY TAG, so
+#                             the host needs no registry: `docker load`
+#                             reads the file and the loaded image is the
+#                             one the manifest names.
 #                             EVERY image the release runs is here, the
 #                             third-party ones included: the manifest
 #                             names them all, and an image the manifest
@@ -66,6 +66,19 @@
 # # What it needs
 #
 # Docker (for `docker save`), `jq`, `zstd`, `tar` and `sha256sum`.
+#
+# # The image store it needs
+#
+# Docker's CONTAINERD image store, and nothing else (REL-2 S3 D13). The
+# bundle is a set of `docker save` archives, and the air-gapped host
+# finds its images by the DIGEST the signed manifest pins: `docker load`
+# of an archive saved from a digest reference leaves a dangling
+# `<none>` image, and an archive saved from a TAG carries the
+# repository and the tag, so the loaded image resolves under the
+# digest-pinned reference the manifest names — but only on the
+# containerd store. On the classic store no `docker load` registers a
+# repo digest at all, so a bundle built there is a bundle no air-gapped
+# host can install. The script refuses rather than build one.
 set -euo pipefail
 
 usage() {
@@ -134,6 +147,18 @@ require_command zstd
 require_command tar
 require_command sha256sum
 
+# The image store the daemon runs. `docker info` prints the store as
+# `Driver Status`; the containerd one names `io.containerd.snapshotter.v1`
+# and the classic one does not. The check is a REFUSAL, not a warning:
+# a bundle built on the classic store cannot be installed on an
+# air-gapped host (REL-2 S3 D13).
+image_store="$(docker info --format '{{json .DriverStatus}}' 2>/dev/null || true)"
+if ! printf '%s' "$image_store" | grep -q 'io.containerd.snapshotter.v1'; then
+    fail "this host's Docker does not run the containerd image store, and a bundle cannot be built on it: after \`docker load\` the classic store registers no repo digest, so the air-gapped host cannot resolve the digest-pinned references the manifest names.
+Turn the containerd image store on — in /etc/docker/daemon.json put {\"features\": {\"containerd-snapshotter\": true}}, then restart Docker (\`systemctl restart docker\`).
+The images the classic store holds are hidden while the containerd store is on."
+fi
+
 version="$(jq -er '.version' "$manifest")" || fail "the manifest has no version."
 jq -e '.images | length > 0' "$manifest" > /dev/null \
     || fail "the manifest names no image."
@@ -172,9 +197,9 @@ if [ -n "$lakehousectl" ]; then
     chmod +x "$stage/lakehousectl"
 fi
 
-# One `docker save` per image, by digest reference: the host that loads
-# the bundle gets the exact image the manifest names, with no registry to
-# ask. `unique` because several services run the same image.
+# One `docker save` per image, BY TAG (REL-2 S3 D13). The host that
+# loads the bundle gets the exact image the manifest names, with no
+# registry to ask. `unique` because several services run the same image.
 #
 # The image must be in the local store: ours are (the pipeline pulled
 # them back by digest after it pushed them), and the third-party ones
@@ -198,8 +223,21 @@ while read -r reference; do
         echo "make_bundle: pulling $reference"
         docker pull "$reference"
     fi
+    # The archive is saved from the TAG, never from the digest
+    # reference: an archive saved from a digest reference loads as a
+    # dangling `<none>` image, and the air-gapped host would then not
+    # resolve the digest-pinned reference the manifest names. The tag
+    # carries the repository and the tag, so the loaded image resolves
+    # under that reference (REL-2 S3 D13).
+    #
+    # `--platform` is never used: it rewrites the archive's digest to
+    # the per-platform manifest, and the loaded image would no longer
+    # be the one the manifest pins.
+    tag="${reference%%@*}"
+    echo "make_bundle: tagging $tag"
+    docker tag "$reference" "$tag"
     echo "make_bundle: saving $name"
-    docker save -o "$stage/images/$name.tar" "$reference"
+    docker save -o "$stage/images/$name.tar" "$tag"
     if [ ! -f "$sbom_dir/$name.cdx.json" ]; then
         fail "no SBOM for $name: $sbom_dir/$name.cdx.json does not exist. Every image in a release carries one."
     fi

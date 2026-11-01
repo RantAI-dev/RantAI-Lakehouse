@@ -38,11 +38,26 @@ FAKE_DOCKER = """#!/usr/bin/env bash
 # A stand-in for the docker commands the bundle script runs: it writes
 # a file that stands for the image, so the bundle's logic can be tested
 # without a daemon. It records what it was asked to do in
-# $FAKE_DOCKER_LOG, so a test can see what the bundle pulled.
+# $FAKE_DOCKER_LOG, so a test can see what the bundle pulled, tagged
+# and saved.
+#
+# The image store it reports is the CONTAINERD one — the only store an
+# air-gapped install works on (REL-2 S3 D13). $FAKE_DOCKER_STORE names
+# another one, and a test uses it to see the refusal.
 set -euo pipefail
 command="${1:-}"
 shift || true
 case "$command" in
+    info)
+        # `docker info --format '{{json .DriverStatus}}'`: the store the
+        # daemon runs.
+        echo "info $*" >> "${FAKE_DOCKER_LOG:-/dev/null}"
+        if [ "${FAKE_DOCKER_STORE:-containerd}" = "containerd" ]; then
+            echo '[["driver-type","io.containerd.snapshotter.v1"]]'
+        else
+            echo '[["driver-type","overlayfs"]]'
+        fi
+        ;;
     save)
         output=""
         reference=""
@@ -52,10 +67,14 @@ case "$command" in
                 *) reference="$1"; shift ;;
             esac
         done
+        echo "save $reference" >> "${FAKE_DOCKER_LOG:-/dev/null}"
         printf 'a stand-in for the image tar of %s\\n' "$reference" > "$output"
         ;;
     pull)
         echo "pull $*" >> "${FAKE_DOCKER_LOG:-/dev/null}"
+        ;;
+    tag)
+        echo "tag $*" >> "${FAKE_DOCKER_LOG:-/dev/null}"
         ;;
     image)
         # `docker image inspect <ref>`: the stand-in says the image is
@@ -64,7 +83,7 @@ case "$command" in
         exit 1
         ;;
     *)
-        echo "fake docker: only 'save', 'pull' and 'image inspect' are implemented" >&2
+        echo "fake docker: only 'info', 'save', 'pull', 'tag' and 'image inspect' are implemented" >&2
         exit 1
         ;;
 esac
@@ -142,9 +161,14 @@ class BundleTest(unittest.TestCase):
         self.manifest.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
     def run_bundle(self) -> subprocess.CompletedProcess[str]:
+        return self.run_bundle_on("containerd")
+
+    def run_bundle_on(self, store: str) -> subprocess.CompletedProcess[str]:
+        """The bundle script, on a daemon with the named image store."""
         environment = dict(os.environ)
         environment["PATH"] = f"{self.bin}{os.pathsep}{environment['PATH']}"
         environment["FAKE_DOCKER_LOG"] = str(self.docker_log)
+        environment["FAKE_DOCKER_STORE"] = store
         return subprocess.run(
             [
                 "bash",
@@ -218,6 +242,49 @@ class BundleTest(unittest.TestCase):
         log = self.docker_log.read_text(encoding="utf-8")
         self.assertIn(f"pull {THIRD_PARTY_IMAGE}", log)
         self.assertIn(f"pull {IMAGE}", log)
+
+    def test_the_bundle_saves_each_image_by_its_tag(self) -> None:
+        """REL-2 S3 D13: the archive is saved from the TAG.
+
+        An archive saved from a digest reference loads as a dangling
+        `<none>` image, and the air-gapped host then cannot resolve the
+        digest-pinned reference the manifest names. The bundle tags the
+        image — the tag carries the repository and the tag — and saves
+        the tag.
+        """
+        self.assertEqual(self.run_bundle().returncode, 0)
+        log = self.docker_log.read_text(encoding="utf-8")
+        for reference in (IMAGE, THIRD_PARTY_IMAGE):
+            tag = reference.split("@", 1)[0]
+            self.assertIn(f"tag {reference} {tag}", log)
+            self.assertIn(f"save {tag}", log)
+            self.assertNotIn(f"save {reference}", log)
+
+    def test_the_bundle_never_saves_with_platform(self) -> None:
+        """`docker save --platform` rewrites the archive's digest.
+
+        The loaded image would then carry the per-platform manifest's
+        digest, and not the one the signed manifest pins.
+        """
+        self.assertEqual(self.run_bundle().returncode, 0)
+        log = self.docker_log.read_text(encoding="utf-8")
+        self.assertNotIn("--platform", log)
+
+    def test_the_bundle_is_refused_on_the_classic_image_store(self) -> None:
+        """REL-2 S3 D13: a bundle needs the containerd image store.
+
+        On the classic store no `docker load` registers a repo digest,
+        so the air-gapped host cannot resolve the digest-pinned
+        references the manifest names: a bundle built there is a bundle
+        no air-gapped host can install. The bundle is refused, and the
+        message says how to switch.
+        """
+        result = self.run_bundle_on("classic")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("containerd-snapshotter", result.stderr)
+        self.assertIn("/etc/docker/daemon.json", result.stderr)
+        self.assertIn("restart Docker", result.stderr)
+        self.assertFalse((self.out / "rantai-lakehouse-0.2.0-linux-x86_64.tar.zst").exists())
 
     def test_two_images_with_the_same_name_are_refused(self) -> None:
         """One name is one file in the bundle.
