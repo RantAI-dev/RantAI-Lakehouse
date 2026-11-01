@@ -400,7 +400,7 @@ pub async fn query(
         )
             .into_response())
     };
-    let (searched, column_search_partial) = if let Some(term) = term {
+    let (mut filtered, column_search_partial) = if let Some(term) = term {
         match search_snapshot(&state).await {
             Ok(snapshot) => (
                 catalog_search::search(&snapshot.index, &snapshot.usage, term),
@@ -421,8 +421,14 @@ pub async fn query(
         (assets, false)
     };
 
-    let mut filtered = catalog_query::apply_filters(&searched, &filters, join);
+    // The sort runs over the rows the route holds, before the filters:
+    // sorting the whole set and keeping the matches leaves them in the
+    // same order as keeping the matches and sorting them would
+    // (`apply_sort` is a total order, `id` included), and it lets the
+    // filters run over the rows the route already owns.
     order_results(&mut filtered, term.is_some(), &sort);
+    // `DATA-41` D6: with no filters the rows are not copied at all.
+    catalog_query::apply_filters(&mut filtered, &filters, join);
 
     let (ordered, summaries) = match group_by.as_deref() {
         Some(field) => catalog_query::apply_grouping(&filtered, field),
