@@ -172,7 +172,7 @@ class ManifestTest(unittest.TestCase):
     def test_the_manifest_holds_the_compose_file_checksum(self) -> None:
         manifest = self.build()
         expected = hashlib.sha256(self.compose.read_bytes()).hexdigest()
-        self.assertEqual(manifest["files"], {"docker-compose.yml": expected})
+        self.assertEqual(manifest["files"]["docker-compose.yml"], expected)
 
     def test_the_manifest_holds_the_installers_checksum(self) -> None:
         """REL-2 S3-T4: the installer is a file the release ships.
@@ -186,9 +186,22 @@ class ManifestTest(unittest.TestCase):
         expected = hashlib.sha256(installer.read_bytes()).hexdigest()
         self.assertEqual(manifest["files"]["lakehousectl"], expected)
 
-    def test_a_release_without_an_installer_names_only_the_compose_file(self) -> None:
+    def test_a_release_without_an_installer_names_the_compose_file_and_the_tools(self) -> None:
+        """REL-2 S4 decision D15: the two tools ship as release files.
+
+        The installer is optional in the manifest's `files` (a release
+        that carries no binary names no `lakehousectl`); the two tools
+        are always there.
+        """
         manifest = self.build()
-        self.assertEqual(list(manifest["files"]), ["docker-compose.yml"])
+        self.assertEqual(
+            list(manifest["files"]),
+            [
+                "docker-compose.yml",
+                "tools/backup-local.sh",
+                "tools/restore-from-backup.sh",
+            ],
+        )
 
     def test_the_default_min_from_is_two_minor_versions_back(self) -> None:
         self.assertEqual(self.build()["minFrom"], "0.0.0")

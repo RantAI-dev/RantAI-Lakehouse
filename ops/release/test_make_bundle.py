@@ -29,6 +29,10 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 BUNDLE_SCRIPT = Path(__file__).resolve().parent / "make_bundle.sh"
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import make_manifest  # noqa: E402
+
 DIGEST = "sha256:" + "a" * 64
 THIRD_PARTY_DIGEST = "sha256:" + "b" * 64
 IMAGE = f"ghcr.io/rantai-dev/rantai-lakehouse-api:0.2.0@{DIGEST}"
@@ -138,6 +142,12 @@ class BundleTest(unittest.TestCase):
         )
         self.write_manifest_with_the_compose_checksum()
 
+        # The files the release ships (REL-2 S4 decision D14): the
+        # Compose file's relative mounts and the two tools. The manifest
+        # names the checksum of each of them, and the bundle copies the
+        # bytes the manifest names.
+        self.write_manifest_with_the_shipped_files_checksums()
+
         # The installer the release ships (REL-2 S3-T4), and the
         # checksum the signed manifest names for it.
         self.installer = self.root / "lakehousectl"
@@ -158,6 +168,18 @@ class BundleTest(unittest.TestCase):
         data["files"]["docker-compose.yml"] = hashlib.sha256(
             self.compose.read_bytes()
         ).hexdigest()
+        self.manifest.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+    def write_manifest_with_the_shipped_files_checksums(self) -> None:
+        """The manifest, with the checksum of every file the release ships.
+
+        REL-2 S4 decision D14: the signed manifest names every file the
+        release carries, and the bundle copies the bytes the manifest
+        names.
+        """
+        data = json.loads(self.manifest.read_text(encoding="utf-8"))
+        for shipped in make_manifest.shipped_files(self.compose):
+            data["files"][shipped.install_path] = shipped.sha256
         self.manifest.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
     def run_bundle(self) -> subprocess.CompletedProcess[str]:

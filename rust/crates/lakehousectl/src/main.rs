@@ -31,10 +31,12 @@
 mod cli;
 mod docker;
 mod error;
+mod files;
 mod http;
 mod install;
 mod manifest;
 mod preflight;
+mod release;
 mod secrets;
 mod sys;
 mod verify;
