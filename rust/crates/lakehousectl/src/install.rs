@@ -112,6 +112,18 @@ fn version_of(manifest: &[u8]) -> Result<String, ToolError> {
 
 /// The release, from the bundle or from GitHub.
 fn obtain(args: &InstallArgs) -> Result<Release, ToolError> {
+    obtain_with(args, &mut download)
+}
+
+/// The release, with the download injected.
+///
+/// The injection is what lets a test drive the online path with no
+/// network: what the test holds to is the SHAPE of that path — which
+/// assets are asked for, and that nothing lands on the disk.
+fn obtain_with<F>(args: &InstallArgs, fetch: &mut F) -> Result<Release, ToolError>
+where
+    F: FnMut(&str) -> Result<Vec<u8>, ToolError>,
+{
     if let Some(directory) = &args.bundle {
         let manifest = read(&directory.join("release.json"))?;
         let bundle = read(&directory.join("release.json.sigstore.json"))?;
@@ -128,32 +140,23 @@ fn obtain(args: &InstallArgs) -> Result<Release, ToolError> {
         Some(version) => version.trim_start_matches('v').to_string(),
         None => latest_version()?,
     };
-    let directory = std::env::temp_dir().join(format!("lakehousectl-release-{version}"));
-    std::fs::create_dir_all(&directory).map_err(|source| ToolError::Io {
-        context: format!("{} could not be created", directory.display()),
-        source,
-    })?;
-    let manifest = download(
-        &format!("{RELEASES_URL}/v{version}/release.json"),
-        &directory.join("release.json"),
-    )?;
-    let bundle = download(
-        &format!("{RELEASES_URL}/v{version}/release.json.sigstore.json"),
-        &directory.join("release.json.sigstore.json"),
-    )?;
-    let compose = String::from_utf8(download(
-        &format!("{RELEASES_URL}/v{version}/docker-compose.yml"),
-        &directory.join("docker-compose.yml"),
-    )?)
-    .map_err(|error| {
-        ToolError::Failed(format!("the release's Compose file is not text: {error}"))
-    })?;
+    let manifest = fetch(&asset_url(&version, "release.json"))?;
+    let bundle = fetch(&asset_url(&version, "release.json.sigstore.json"))?;
+    let compose =
+        String::from_utf8(fetch(&asset_url(&version, "docker-compose.yml"))?).map_err(|error| {
+            ToolError::Failed(format!("the release's Compose file is not text: {error}"))
+        })?;
     Ok(Release {
         manifest,
         bundle,
         compose,
         bundle_dir: None,
     })
+}
+
+/// The URL of one asset of a release.
+fn asset_url(version: &str, name: &str) -> String {
+    format!("{RELEASES_URL}/v{version}/{name}")
 }
 
 /// The version of the newest release.
@@ -183,27 +186,26 @@ fn latest_version() -> Result<String, ToolError> {
     Ok(tag.trim_start_matches('v').to_string())
 }
 
-/// Download one file of a release.
-fn download(url: &str, path: &Path) -> Result<Vec<u8>, ToolError> {
-    let target = path.to_string_lossy().to_string();
-    sys::output(
+/// Download one file of a release, into memory.
+///
+/// The bytes never touch the disk. The release's assets are small text
+/// files, and a file in a shared directory is a file another local
+/// user could own: the installer runs as root, so a symlink left where
+/// the tool writes would let a local user have root write anywhere on
+/// the host. The path this used was
+/// `temp_dir()/lakehousectl-release-<version>` — a name anybody could
+/// guess, and a directory an earlier run left behind (REL-2 S3 review
+/// round 1 BLOCKER 1).
+fn download(url: &str) -> Result<Vec<u8>, ToolError> {
+    sys::output_bytes(
         "curl",
-        &[
-            "--fail",
-            "--silent",
-            "--show-error",
-            "--location",
-            "--output",
-            &target,
-            url,
-        ],
+        &["--fail", "--silent", "--show-error", "--location", url],
     )
     .map_err(|error| {
         ToolError::Failed(format!(
             "{url} could not be downloaded: {error}. Is this host online, and is `curl` installed?"
         ))
-    })?;
-    read(path)
+    })
 }
 
 /// Check the Compose file against the checksum the signed manifest carries.
@@ -504,4 +506,76 @@ fn set_mode(path: &Path, mode: u32) -> Result<(), ToolError> {
             source,
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::collections::BTreeSet;
+
+    use super::*;
+
+    /// The names the temporary directory holds that begin with the
+    /// tool's own prefix.
+    ///
+    /// Only the tool's own names are looked at: the other tests of the
+    /// workspace write in the same directory, and what matters here is
+    /// that the INSTALLER leaves nothing of its own behind.
+    fn tool_entries() -> BTreeSet<String> {
+        let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+            return BTreeSet::new();
+        };
+        entries
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| name.starts_with("lakehousectl"))
+            .collect()
+    }
+
+    #[test]
+    fn the_online_install_reads_the_release_into_memory_and_writes_no_file() {
+        // The installer runs as root: a file it writes in a directory
+        // of a name anybody can guess is a file another local user can
+        // own, and a symlink there would let that user have root write
+        // anywhere on the host (REL-2 S3 review round 1 BLOCKER 1).
+        let mut asked: Vec<String> = Vec::new();
+        let args = InstallArgs {
+            bundle: None,
+            dir: PathBuf::from("/nonexistent/lakehousectl-install"),
+            version: Some("0.2.0".to_string()),
+            ignore_preflight: Vec::new(),
+        };
+        let before = tool_entries();
+        let release = obtain_with(&args, &mut |url| {
+            asked.push(url.to_string());
+            Ok(b"{}".to_vec())
+        })
+        .expect("the release is obtained");
+        let after = tool_entries();
+
+        assert_eq!(
+            asked,
+            vec![
+                asset_url("0.2.0", "release.json"),
+                asset_url("0.2.0", "release.json.sigstore.json"),
+                asset_url("0.2.0", "docker-compose.yml"),
+            ],
+            "the install asked for the wrong assets"
+        );
+        assert_eq!(
+            release.manifest, b"{}",
+            "the bytes were not the fetched ones"
+        );
+        assert_eq!(
+            before, after,
+            "the install left something of its own in the temporary directory"
+        );
+        assert!(
+            !std::env::temp_dir()
+                .join("lakehousectl-release-0.2.0")
+                .exists(),
+            "the install used the shared directory of an earlier release"
+        );
+    }
 }

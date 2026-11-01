@@ -11,15 +11,30 @@ use std::process::Command;
 
 /// Run a command and return its standard output.
 ///
-/// The command's own error output is NOT returned: it goes to the
-/// operator's terminal, where it belongs, and the caller gets the
-/// exit status instead.
+/// The command's own error output is NOT returned: the caller gets
+/// the exit status instead, and the message it builds says what to do
+/// about it.
 ///
 /// # Errors
 ///
 /// Returns the error the operating system gave when the command could
 /// not be run at all, or when it exited with a failure.
 pub fn output(program: &str, args: &[&str]) -> Result<String, std::io::Error> {
+    let bytes = output_bytes(program, args)?;
+    Ok(String::from_utf8_lossy(&bytes).trim().to_string())
+}
+
+/// Run a command and return its standard output, byte for byte.
+///
+/// The bytes are NOT trimmed and NOT converted into text: the release
+/// manifest's signature is over its exact bytes, so a trailing newline
+/// is part of the answer and may not be dropped.
+///
+/// # Errors
+///
+/// Returns the error the operating system gave when the command could
+/// not be run at all, or when it exited with a failure.
+pub fn output_bytes(program: &str, args: &[&str]) -> Result<Vec<u8>, std::io::Error> {
     let result = Command::new(program).args(args).output()?;
     if !result.status.success() {
         return Err(std::io::Error::other(format!(
@@ -27,7 +42,7 @@ pub fn output(program: &str, args: &[&str]) -> Result<String, std::io::Error> {
             result.status
         )));
     }
-    Ok(String::from_utf8_lossy(&result.stdout).trim().to_string())
+    Ok(result.stdout)
 }
 
 /// The free space on the filesystem that holds `path`, in bytes.
@@ -92,6 +107,18 @@ mod tests {
     #[test]
     fn a_command_that_does_not_exist_is_an_error() {
         assert!(output("lakehousectl-no-such-command", &[]).is_err());
+    }
+
+    #[test]
+    fn the_bytes_of_a_command_are_returned_as_they_are() {
+        // The manifest's signature is over its exact bytes: a trimmed
+        // answer would not verify.
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join("bytes");
+        std::fs::write(&path, b"a\nb\n").expect("the file is written");
+        let name = path.to_string_lossy().to_string();
+        let bytes = output_bytes("cat", &[&name]).expect("cat works");
+        assert_eq!(bytes, b"a\nb\n", "the bytes were changed");
     }
 
     #[test]
