@@ -44,6 +44,7 @@ mod release;
 mod rollback;
 mod runner;
 mod secrets;
+mod self_update;
 mod state;
 mod status;
 mod sys;
@@ -85,5 +86,6 @@ fn run(cli: Cli) -> Result<(), error::ToolError> {
         Command::Update(args) => update::command(&args),
         Command::Rollback(args) => rollback::command(&args),
         Command::Status(args) => status::command(&args),
+        Command::SelfUpdate => self_update::command(),
     }
 }

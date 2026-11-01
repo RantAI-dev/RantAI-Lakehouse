@@ -14,7 +14,10 @@ use clap::{Args, Parser, Subcommand};
     name = "lakehousectl",
     version,
     about = "Install and update the `RantAI` Lakehouse, online or air-gapped.",
-    long_about = None
+    long_about = "Install and update the `RantAI` Lakehouse, online or air-gapped.\n\n\
+                  An air-gapped host updates the TOOL with the copy in its bundle: the bundle \
+                  carries `lakehousectl-linux-x86_64`, and that is the new tool. \
+                  `lakehousectl self-update` needs the network."
 )]
 pub struct Cli {
     /// The command to run.
@@ -41,6 +44,8 @@ pub enum Command {
     Rollback(RollbackArgs),
     /// Show what the install is doing right now.
     Status(StatusArgs),
+    /// Update the tool itself.
+    SelfUpdate,
 }
 
 /// The arguments of `lakehousectl verify`.
