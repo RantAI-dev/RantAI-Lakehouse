@@ -23,4 +23,10 @@ pub enum ToolError {
     /// The release did not verify against the release key.
     #[error("{0}")]
     Verify(#[from] VerifyError),
+    /// The host does not meet the release's minimums.
+    #[error("this host does not meet the release's minimums ({0} check(s) failed)")]
+    Preflight(usize),
+    /// The command's arguments do not make sense together.
+    #[error("{0}")]
+    Usage(String),
 }

@@ -3001,6 +3001,7 @@ dependencies = [
  "clap",
  "ecdsa",
  "hex",
+ "nix",
  "p256",
  "serde",
  "serde_json",

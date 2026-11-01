@@ -30,6 +30,8 @@
 
 mod cli;
 mod error;
+mod preflight;
+mod sys;
 mod verify;
 
 use clap::Parser;
@@ -59,5 +61,6 @@ fn main() -> std::process::ExitCode {
 fn run(cli: Cli) -> Result<(), error::ToolError> {
     match cli.command {
         Command::Verify(args) => verify::command(&args),
+        Command::Preflight(args) => preflight::command(&args),
     }
 }

@@ -27,6 +27,8 @@ pub struct Cli {
 pub enum Command {
     /// Check a release bundle against the release key.
     Verify(VerifyArgs),
+    /// Check this host against the release's minimums.
+    Preflight(PreflightArgs),
 }
 
 /// The arguments of `lakehousectl verify`.
@@ -36,4 +38,20 @@ pub struct VerifyArgs {
     /// `release.json.sigstore.json` beside each other.
     #[arg(long, default_value = ".")]
     pub dir: PathBuf,
+}
+
+/// The arguments of `lakehousectl preflight`.
+#[derive(Debug, Args)]
+pub struct PreflightArgs {
+    /// The release's Compose file: the ports it publishes are read
+    /// from it.
+    #[arg(long)]
+    pub compose: PathBuf,
+    /// Where the install would live: the free disk is read under it.
+    #[arg(long, default_value = "/opt/rantai-lakehouse")]
+    pub dir: PathBuf,
+    /// Skip one check, by name. The check is not run and the skip is
+    /// said out loud.
+    #[arg(long = "ignore-preflight", value_name = "CHECK")]
+    pub ignore_preflight: Vec<String>,
 }
