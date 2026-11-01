@@ -72,8 +72,12 @@ jobs:
     permissions:
       contents: read
     env:
-      # The throwaway registry: a service container of this job, so the
-      # digests the pipeline records are real digests of a real registry.
+      # The throwaway registry: a container of this job, so the digests
+      # the pipeline records are real digests of a real registry. It is
+      # STARTED by a step below, and not declared as a service container:
+      # a service container is started before the first step, and the
+      # step that turns the containerd store on restarts Docker, which
+      # stops it (REL-2 S3 review round 4 BLOCKER 1).
       RELEASE_REGISTRY: localhost:5000
       # The signer reads the key from the environment, by this
       # reference — the same reference the real job uses, so the dry
@@ -90,11 +94,6 @@ jobs:
       # of the three signing steps and of no other step (REL-2 S2 review
       # round 4 SHOULD-FIX 1).
       COSIGN_PASSWORD: ""
-    services:
-      registry:
-        image: registry:2
-        ports:
-          - "5000:5000"
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -150,6 +149,43 @@ jobs:
               ;;
           esac
 
+      # The throwaway registry, started HERE and not declared as a
+      # service container (REL-2 S3 review round 4 BLOCKER 1).
+      #
+      # A service container is started before the FIRST step, and the
+      # step above restarts Docker to turn the containerd store on: that
+      # restart stops the service container, and the store switch hides
+      # the image it ran from — the classic store's images are not in the
+      # containerd one. The image builds that push to `localhost:5000`
+      # would then have no registry to push to, and the dry run would
+      # fail on its first build.
+      #
+      # So the registry is a container of this job, started on the store
+      # the job uses. Its image is PINNED by digest, the way every other
+      # image in this repository is pinned: the digest was read from the
+      # registry's own `docker-content-digest` header for the tag
+      # `registry:2` on 2026-11-01.
+      - name: Start the throwaway registry
+        run: |
+          set -euo pipefail
+          docker run -d --name release-registry --restart always \
+            -p 5000:5000 \
+            registry:2@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
+          # The registry is WAITED FOR: the first build may start before
+          # the registry answers, and a push to a registry that is not up
+          # yet fails. The loop is bounded: a registry that never
+          # answers fails the job instead of hanging it.
+          for attempt in $(seq 1 30); do
+            if curl -fsS http://localhost:5000/v2/ >/dev/null; then
+              echo "the throwaway registry is up (attempt $attempt)"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::the throwaway registry did not answer on http://localhost:5000/v2/"
+          docker logs release-registry || true
+          exit 1
+
       - name: Setup Python
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
@@ -184,7 +220,7 @@ jobs:
       # started: a buildx builder runs in a container of its own, and
       # `localhost` inside it is the builder, not the runner. With the
       # host's network namespace, `localhost:5000` is the registry
-      # service's published port.
+      # container's published port.
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
         with:

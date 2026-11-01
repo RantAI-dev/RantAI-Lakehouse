@@ -60,6 +60,15 @@ And three more since REL-2 S3 D13, from the review round 3 BLOCKER 1
     hide the bug the proof exists for, because Compose pulls silently
     when it may.
 
+And two more since REL-2 S3 review round 4 BLOCKER 1, from the dry run
+that lost its registry:
+
+  - no job that restarts Docker holds a SERVICE container: a service
+    container is started before the job's first step, and the restart
+    stops it — so the dry run starts its throwaway registry itself,
+    after the store switch;
+  - the dry run's registry is pinned by digest and is waited for.
+
 The workflow is parsed with PyYAML (`pyyaml==6.0.3`, installed by the jobs
 that run these tests). The checks are run against synthetic workflows too,
 so a check that cannot fail is itself a failure. No network, no repository:
@@ -132,6 +141,14 @@ DOWNLOAD_STEP = "Download the dry run's bundle"
 
 # The step that turns Docker's containerd image store on (REL-2 S3 D13).
 CONTAINERD_STEP = "Turn on the containerd image store"
+
+# The step of the dry run that starts its throwaway registry
+# (REL-2 S3 review round 4 BLOCKER 1).
+REGISTRY_STEP = "Start the throwaway registry"
+
+# The registry the dry run pushes to, and the URL it answers on.
+DRY_RUN_REGISTRY = "localhost:5000"
+REGISTRY_API = "http://localhost:5000/v2/"
 
 # The step that cuts the proof runner off from the registries.
 AIR_GAP_STEP = "Cut the runner off from the registries"
@@ -332,6 +349,44 @@ jobs:
       - name: Cut the runner off from the registries
         run: |
           echo "0.0.0.0 ghcr.io" | sudo tee -a /etc/hosts
+"""
+
+# A workflow with a SERVICE container in a job that restarts Docker: the
+# service is started before the job's first step, so the restart stops it
+# and the store switch hides the image it ran from (REL-2 S3 review round
+# 4 BLOCKER 1).
+SYNTHETIC_SERVICE_ACROSS_THE_RESTART = """
+name: Synthetic
+on: workflow_dispatch
+jobs:
+  dry-run:
+    runs-on: ubuntu-latest
+    services:
+      registry:
+        image: registry:2
+        ports:
+          - "5000:5000"
+    steps:
+      - name: Turn on the containerd image store
+        run: sudo systemctl restart docker
+"""
+
+# A workflow whose service container is started by a step AFTER the store
+# switch: it is not lost, so it is not reported.
+SYNTHETIC_SERVICE_STARTED_AFTER_THE_SWITCH = """
+name: Synthetic
+on: workflow_dispatch
+jobs:
+  dry-run:
+    runs-on: ubuntu-latest
+    services:
+      registry:
+        image: registry:2
+    steps:
+      - name: Turn on the containerd image store
+        run: sudo systemctl restart docker
+      - name: Start the registry
+        run: docker run -d --name registry -p 5000:5000 registry:2
 """
 
 
@@ -689,6 +744,32 @@ def containerd_step_problems(document: dict[str, Any], job_name: str) -> list[st
         if needle not in run:
             problems.append(f"{job_name}: {what}")
     return problems
+
+
+def services_killed_by_the_store_switch(document: dict[str, Any], job_name: str) -> list[str]:
+    """Every service container the job loses when the store comes on.
+
+    A service container is started BEFORE the job's first step, and the
+    containerd step RESTARTS Docker: the restart stops the service
+    container, and the store switch hides the image it ran from — the
+    classic store's images are not in the containerd one. A service that
+    a step of the job starts AFTER the switch is not lost, and is not
+    reported (REL-2 S3 review round 4 BLOCKER 1).
+    """
+    job = (document.get("jobs") or {}).get(job_name) or {}
+    services = job.get("services") or {}
+    if not services:
+        return []
+    store = step_index_or_none(document, job_name, CONTAINERD_STEP)
+    if store is None:
+        return []
+    started_after: set[str] = set()
+    for step in steps_of(document, job_name)[store + 1 :]:
+        commands = shell_commands(str(step.get("run") or ""))
+        for name in services:
+            if f"--name {name}" in commands or f"--name={name}" in commands:
+                started_after.add(str(name))
+    return [str(name) for name in services if str(name) not in started_after]
 
 
 def air_gap_problems(document: dict[str, Any]) -> list[str]:
@@ -1253,6 +1334,63 @@ class ReleaseWorkflowTest(unittest.TestCase):
         document = yaml.safe_load(SYNTHETIC_INSTALL_BEFORE_THE_CUT)
         problems = air_gap_problems(document)
         self.assertIn("the proof installs before the runner is cut off", problems)
+
+    def test_no_job_loses_a_service_container_to_the_store_switch(self) -> None:
+        """REL-2 S3 review round 4 BLOCKER 1: the dry run lost its registry.
+
+        A service container is started before the job's first step, and
+        the containerd step restarts Docker — which stops the service
+        container and hides the image it ran from. The dry run's
+        registry was such a service, so the image builds that push to
+        `localhost:5000` had no registry to push to.
+        """
+        for job in ("dry-run", "release", "install-proof"):
+            self.assertEqual(
+                services_killed_by_the_store_switch(self.document, job), [], job
+            )
+
+    def test_a_service_container_across_the_restart_is_reported(self) -> None:
+        """The check above must be able to fail."""
+        document = yaml.safe_load(SYNTHETIC_SERVICE_ACROSS_THE_RESTART)
+        self.assertEqual(
+            services_killed_by_the_store_switch(document, "dry-run"),
+            ["registry"],
+        )
+
+    def test_a_service_started_after_the_switch_is_not_reported(self) -> None:
+        """A service a step starts AFTER the switch is not lost."""
+        document = yaml.safe_load(SYNTHETIC_SERVICE_STARTED_AFTER_THE_SWITCH)
+        self.assertEqual(
+            services_killed_by_the_store_switch(document, "dry-run"), []
+        )
+
+    def test_the_dry_run_starts_its_registry_after_the_store_switch(self) -> None:
+        """The registry is a container of the job, not a service.
+
+        The job starts it itself, after the store switch, and waits for
+        it to answer: the first build may start before the registry is
+        up, and a push to a registry that is not up yet fails.
+        """
+        step = step_named(self.document, "dry-run", REGISTRY_STEP)
+        run = str(step.get("run"))
+        self.assertLess(
+            step_index(self.document, "dry-run", CONTAINERD_STEP),
+            step_index(self.document, "dry-run", REGISTRY_STEP),
+            "the registry is started before the store switch",
+        )
+        self.assertIn("docker run -d --name release-registry", run)
+        self.assertIn(REGISTRY_API, run)
+        self.assertIn("exit 1", run, "the wait for the registry is not bounded")
+
+    def test_the_dry_runs_registry_is_pinned_by_digest(self) -> None:
+        """A tag can move under the pipeline's feet; a digest cannot."""
+        run = str(step_named(self.document, "dry-run", REGISTRY_STEP).get("run"))
+        self.assertIn("registry:2@sha256:", run)
+
+    def test_the_dry_run_pushes_to_the_registry_it_started(self) -> None:
+        """The registry the job starts is the registry the job pushes to."""
+        env = self.document["jobs"]["dry-run"].get("env") or {}
+        self.assertEqual(env.get("RELEASE_REGISTRY"), DRY_RUN_REGISTRY)
 
 
 if __name__ == "__main__":
