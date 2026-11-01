@@ -116,6 +116,9 @@ merged with `origin/main` (`git merge origin/main` → "Already up to date";
 `git merge-base --is-ancestor origin/fix/data-40-one-name-one-dataset
 origin/main`, which fails.
 
+> **T1 is now done** — see "Handoff T1 (developer, 2026-11-01)" below.
+> `DATA-40` merged into `main` as PR #320 after this entry was written.
+
 #### Commits (branch `perf/data-41-catalog-search-speed`, pushed after each)
 
 | Commit | Task | Decision | What it does |
@@ -204,10 +207,110 @@ search after it is 150–270 ms.
   the checks to the crate this branch touches. The whole `lakehouse-api`
   crate was run instead: `cargo test -p lakehouse-api` — 91 test binaries,
   6823 passed, 0 failed, 42 ignored.
-- **T1** — blocked on `DATA-40` (see the top of this entry).
+- **T1** — blocked on `DATA-40` (see the top of this entry). **Done now**:
+  see "Handoff T1 (developer, 2026-11-01)" below.
 - The bench numbers above are from **this branch on bluefin**, not from the
   GitHub workflow. The planner's measurement (on `main`, after the merge)
   is the one that decides whether `DATA-41` is Done.
+
+### Handoff T1 (developer, 2026-11-01)
+
+`DATA-40` (`fix/data-40-one-name-one-dataset`, PR #320) is in `main` now,
+so T1 (D1) is done: three commits on `perf/data-41-catalog-search-speed`,
+each pushed.
+
+#### Commits (branch `perf/data-41-catalog-search-speed`, pushed after each)
+
+| Commit | What it does |
+| --- | --- |
+| `9722e86c` | The merge of `origin/main` into the branch (T1's precondition). |
+| `0a70e87e` | The merge fallout: `search_limit`'s mock routes by the table a statement READS. |
+| `b82d8640` | **T1 (D1).** `list_body` reads the registry by key: one `HashMap` per registry read, keyed by slug, built once per assembly. |
+
+#### The merge, and the conflicts it caused
+
+`git fetch origin && git checkout -B perf/data-41-catalog-search-speed
+origin/perf/data-41-catalog-search-speed && git merge --no-edit
+origin/main` → one conflict, in
+`rust/crates/lakehouse-api/src/routes/catalog.rs`: both branches appended
+a test module at the end of `mod tests`, so git could not place them.
+Resolved hunk by hunk (rule 9): DATA-40's `mod registry_clash` (its
+`FINAL` / `NOT_IN_PRIMARY` reads, against a real `ClickHouse`) and
+DATA-41's `mod search_limit` (the `?limit=` route tests) are both kept,
+each whole. Neither side's production code changed in the merge:
+DATA-40's `NOT_IN_PRIMARY` / `FINAL` reads and DATA-41's `limit`,
+`total`, `SearchIndex` and in-place `apply_filters` are all present.
+
+**A second conflict, semantic, that git did not see.** The merged tree
+was RED: three of `search_limit`'s tests failed on the merge commit
+alone (checked by stashing T1 and running the tests at `9722e86c`).
+DATA-40 D3's filter names the primary catalog table
+(`bronze_meta.dataset_catalog`) inside EVERY secondary branch, so the
+sync read and the column read now mention `dataset_catalog` too.
+`search_limit`'s mock matched on
+`body_string_contains("dataset_catalog")`, so it answered the sync and
+column reads with catalog rows: the row counts came back as 0, the
+authors as empty, the column counts as none, and the search copy came
+back with two assets instead of three.
+
+The fix is the one DATA-40 already used in `registry_final`: the table a
+statement READS decides what the engine answers, not every table it
+mentions. `table_read` moved up to the `tests` module so both mocks
+share it, and `search_limit`'s mock became a `Respond` that routes on
+it. This is `0a70e87e`, its own commit — not part of T1.
+
+#### T1 (D1) — what changed
+
+`list_body` read the registry four ways per asset: `total_of`,
+`author_of`, `col_of` and `frequency_of` each `.find()` across every row
+of every read. That is quadratic in the size of the catalog, and
+`GET /api/catalog` with no term paid it on every request.
+
+The reads are now indexed by slug, once per assembly:
+`BronzeRegistry::new` builds one `HashMap` per registry read, and the
+four lookups read out of it. The build is linear.
+
+**The rows are the rows the scan produced.** A slug with several rows
+answers with the FIRST one in read order — `or_insert`, not `insert` —
+because that is what the `.find()` it replaces returned. That is said
+in a comment at the site (`BronzeRegistry`'s doc comment and its `new`).
+
+The test (`mod keyed_lookup`) keeps the old scan in it as the reference
+and compares the two over a fixture of **400 assets** with duplicate
+slugs, slugs whose sync or column row is missing, a row count that is
+not a number, and a sync row for a slug no catalog row holds. Two
+mutations were run to prove the test bites: making the map keep the
+LAST row of a slug, and making the author lookup ignore its row — both
+fail it.
+
+#### Checks run (and their counts)
+
+Scoped to the crate, per the task's rules — no full-workspace cargo run.
+
+| Command | Result |
+| --- | --- |
+| `cargo fmt --check` (in `rust/`) | clean, no output |
+| `cargo clippy -p lakehouse-api --all-targets -- -D warnings` | clean, no warnings |
+| `cargo test -p lakehouse-api catalog` | 290 + 292 passed, 0 failed (the lib and the bin target) |
+| `cargo test -p lakehouse-api --lib keyed_lookup` | 3 passed, 0 failed |
+| `cargo test -p lakehouse-api` (the whole crate, extra) | 91 test binaries, 6846 passed, 0 failed, 42 ignored |
+
+The two `ClickHouse` containers the `registry_clash` tests leave behind
+were removed afterwards (`docker rm -f`); `docker ps -a` shows none
+left.
+
+#### Not verified
+
+- **The full-workspace cargo run** (`cargo clippy --workspace --all-targets
+  --all-features` and `cargo test --workspace`): not run. The task scoped
+  the checks to the crate this branch touches. The whole `lakehouse-api`
+  crate was run instead (see the table above).
+- **The bench.** T1 changes the build's cost, not the search's, and the
+  plan's measurement is the planner's, on `main`, after the merge. No
+  bench was run for this handoff, so **the p95 for the no-term
+  `GET /api/catalog` after this change is not measured here**. The
+  quadratic build is gone from the code path (four scans per asset are
+  four map lookups), but the number is the planner's to take.
 
 ## 5. Review (planner appends below)
 
