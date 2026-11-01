@@ -251,6 +251,12 @@ fn write_layout(
     release: &Release,
     manifest: &Manifest,
 ) -> Result<secrets::Secrets, ToolError> {
+    // The state of an earlier install is not overwritten: the same
+    // release may be installed again, and any other release is refused
+    // — that is what `lakehousectl update` is for (REL-2 S3 review
+    // round 1 SHOULD-FIX 3).
+    check_state(dir, &manifest.version)?;
+
     std::fs::create_dir_all(dir).map_err(|source| ToolError::Io {
         context: format!("{} could not be created", dir.display()),
         source,
@@ -263,22 +269,61 @@ fn write_layout(
     })?;
     set_mode(&backups, 0o700)?;
 
+    // The release's own files are written again: they are the bytes of
+    // the release, checked against the signed manifest, so a re-install
+    // of the same release writes the same bytes.
     write(&dir.join("docker-compose.yml"), release.compose.as_bytes())?;
     write(&dir.join("release.json"), &release.manifest)?;
     write(&dir.join("release.json.sigstore.json"), &release.bundle)?;
 
-    let state = serde_json::json!({
-        "schemaVersion": 1,
-        "currentVersion": manifest.version,
-        "previousVersion": Value::Null,
-        "lastBackup": Value::Null,
-    });
-    write(&dir.join("state.json"), format!("{state}\n").as_bytes())?;
+    // The state of the FIRST install is kept: it names the release that
+    // is installed, the one before it, and the last backup. A
+    // re-install of the same release changes nothing of it.
+    if !dir.join("state.json").exists() {
+        let state = serde_json::json!({
+            "schemaVersion": 1,
+            "currentVersion": manifest.version,
+            "previousVersion": Value::Null,
+            "lastBackup": Value::Null,
+        });
+        write(&dir.join("state.json"), format!("{state}\n").as_bytes())?;
+    }
 
     secrets::write_env(&dir.join(".env")).map_err(|source| ToolError::Io {
         context: format!("{} could not be written", dir.join(".env").display()),
         source,
     })
+}
+
+/// Refuse an install that would replace the release of another one.
+///
+/// The directory holds the state of the install that is there, and the
+/// state names the release that is installed. The SAME release may be
+/// installed again — a re-run of the same install — and its state is
+/// kept as it is. Any OTHER release is refused, and the refusal says
+/// which command does that work (REL-2 S3 review round 1 SHOULD-FIX 3).
+fn check_state(dir: &Path, version: &str) -> Result<(), ToolError> {
+    let path = dir.join("state.json");
+    if !path.exists() {
+        return Ok(());
+    }
+    let text = read_to_string(&path)?;
+    let installed = serde_json::from_str::<Value>(&text)
+        .ok()
+        .and_then(|document| document["currentVersion"].as_str().map(str::to_string));
+    match installed {
+        Some(installed) if installed == version => Ok(()),
+        Some(installed) => Err(ToolError::Failed(format!(
+            "{} already holds the release {installed}, and the release {version} would replace it. \
+             `lakehousectl update` is the command that installs another release.",
+            dir.display()
+        ))),
+        None => Err(ToolError::Failed(format!(
+            "{} holds a state.json that names no release, so the tool cannot tell which one is \
+             installed. It is refused rather than overwritten.",
+            dir.display()
+        ))),
+    }
 }
 
 /// Fetch every image the release runs.
@@ -681,6 +726,98 @@ mod tests {
         assert!(
             error.to_string().contains("SHA256SUMS"),
             "the error says what failed: {error}"
+        );
+    }
+
+    /// A release of a version, as the install sees it.
+    fn release_of(version: &str) -> Release {
+        Release {
+            manifest: format!("{{\"version\":\"{version}\"}}").into_bytes(),
+            bundle: b"{}".to_vec(),
+            compose: "services: {}\n".to_string(),
+            bundle_dir: None,
+        }
+    }
+
+    /// A manifest of a version.
+    fn manifest_of(version: &str) -> Manifest {
+        Manifest {
+            version: version.to_string(),
+            images: BTreeMap::new(),
+            image_ids: BTreeMap::new(),
+            files: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn a_second_install_of_the_same_release_keeps_the_state_of_the_first() {
+        // The state names the release before this one and the last
+        // backup: a re-install of the same release changes nothing of
+        // it (REL-2 S3 review round 1 SHOULD-FIX 3).
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let state = "{\n  \"schemaVersion\": 1,\n  \"currentVersion\": \"0.2.0\",\n  \
+                     \"previousVersion\": \"0.1.0\",\n  \"lastBackup\": \"/backups/one\"\n}\n";
+        std::fs::write(directory.path().join("state.json"), state).expect("the state is written");
+
+        write_layout(
+            directory.path(),
+            &release_of("0.2.0"),
+            &manifest_of("0.2.0"),
+        )
+        .expect("the same release installs again");
+
+        let after = std::fs::read_to_string(directory.path().join("state.json"))
+            .expect("the state is readable");
+        assert_eq!(after, state, "the state of the first install was rewritten");
+    }
+
+    #[test]
+    fn an_install_of_another_release_is_refused_and_points_at_the_update() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        std::fs::write(
+            directory.path().join("state.json"),
+            "{\"schemaVersion\": 1, \"currentVersion\": \"0.1.0\"}\n",
+        )
+        .expect("the state is written");
+
+        let error = write_layout(
+            directory.path(),
+            &release_of("0.2.0"),
+            &manifest_of("0.2.0"),
+        )
+        .expect_err("another release is refused");
+        let message = error.to_string();
+        assert!(
+            message.contains("lakehousectl update"),
+            "the error says what to do: {message}"
+        );
+        assert!(
+            message.contains("0.1.0"),
+            "the error names the release that is there: {message}"
+        );
+    }
+
+    #[test]
+    fn a_state_that_names_no_release_is_refused_rather_than_overwritten() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        std::fs::write(directory.path().join("state.json"), "not json\n")
+            .expect("the state is written");
+
+        let error = write_layout(
+            directory.path(),
+            &release_of("0.2.0"),
+            &manifest_of("0.2.0"),
+        )
+        .expect_err("a state that names no release is refused");
+        assert!(
+            error.to_string().contains("state.json"),
+            "the error says what failed: {error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("state.json"))
+                .expect("the state is read"),
+            "not json\n",
+            "the state was overwritten"
         );
     }
 }
