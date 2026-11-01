@@ -1006,6 +1006,49 @@ the earlier rounds of this slice.
 - **`cargo deny check all` was not run** in this round: no dependency changed (the crate's
   `Cargo.toml` is untouched), and the earlier round of this slice ran it green.
 
+### Fix for the PR #313 dry run (developer, 2026-11-01)
+
+**Commit `3a004234`** (branch `feat/rel-2-s3-lakehousectl-install`): the musl target goes on the
+PINNED toolchain.
+
+The dry run failed in "Build lakehousectl (static, musl)" with `error[E0463]: can't find crate
+for core ... the x86_64-unknown-linux-musl target may not be installed`. `rustup target add` ran
+at the repository root, so it installed the target for the runner's DEFAULT toolchain, and the
+build that followed ran inside `rust/`, on the toolchain pinned by `rust/rust-toolchain.toml`
+(1.99.1) — which has no musl target.
+
+All THREE steps that build `lakehousectl` for musl (the dry run, the release job and the install
+proof) now change to `rust/` BEFORE `rustup target add`, so `rustup` reads the pin and adds the
+target to it. The target is NOT added to `rust-toolchain.toml`: every developer reads that file,
+and a target in it is a download every developer pays for a build they do not make.
+
+**Commands run** (from the repository root, on `3a004234`):
+
+- `actionlint .github/workflows/release.yml` — no findings, exit 0.
+- `python3 -m pytest ops/release -q` — **135 passed**, 1 warning (the system pytest's `anyio`
+  plugin `PytestRemovedIn10Warning`; it is there before this commit too, at 132 passed).
+- `python3 ops/lint/check_intra_package_imports.py` — `OK: all intra-package dispar_orchestrate
+  imports resolve`.
+- `python3 ops/lint/check_bare_iceberg_count.py` — `R11 guard: no bare count() against a Bronze
+  Iceberg table found.`
+
+The three new tests in `ops/release/test_release_workflow.py`:
+
+- `test_every_musl_target_is_added_on_the_pinned_toolchain` — every step that adds the musl
+  target adds it AFTER `cd rust`, in the same step;
+- `test_a_musl_target_added_outside_rust_is_reported` — the check was run against a synthetic
+  workflow with the old order, and it fails there;
+- `test_the_toolchain_pin_does_not_ask_for_the_musl_target` — `rust/rust-toolchain.toml` does
+  not name the musl target.
+
+The first check was also run against the OLD `release.yml` (the file at `3e24eeca`): it fails
+there with "the musl target is added before `cd rust`".
+
+**Not verified:** the dry run itself — it needs the `release` environment's key and a runner, so
+the fix is proved here by the workflow's own checks and by the test that fails against the old
+file, and the dry run is what proves it end to end. **No cargo ran**: this commit touches no
+Rust.
+
 ## 7. Review (planner appends below)
 
 ### Review S1 round 1 (planner, 2026-10-31, at `f79d4235`)
