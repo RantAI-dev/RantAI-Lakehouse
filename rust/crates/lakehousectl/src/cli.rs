@@ -52,6 +52,11 @@ pub struct PreflightArgs {
     /// Where the install would live: the free disk is read under it.
     #[arg(long, default_value = "/opt/rantai-lakehouse")]
     pub dir: PathBuf,
+    /// The install will be offline, from a bundle. The image-store
+    /// check runs then: an air-gapped install needs Docker's containerd
+    /// image store, and an online one does not (REL-2 S3 D13).
+    #[arg(long)]
+    pub bundle: bool,
     /// Skip one check, by name. The check is not run and the skip is
     /// said out loud.
     #[arg(long = "ignore-preflight", value_name = "CHECK")]

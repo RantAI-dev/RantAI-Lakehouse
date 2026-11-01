@@ -17,6 +17,17 @@
 //! facts injected: a test says "a host with two CPUs is refused" without
 //! needing a host with two CPUs.
 //!
+//! # The image store
+//!
+//! One check is not a number: Docker's CONTAINERD image store (REL-2
+//! S3 D13). It runs for a BUNDLE install only, because it is the store
+//! that decides whether an air-gapped install finds the images the
+//! bundle loaded: on Docker's classic store no `docker load` registers
+//! a repo digest, so the digest-pinned references the signed manifest
+//! names never resolve. An online install pulls every image by its
+//! digest, and a pull registers the digest on either store.
+//!
+//! # The names of the checks
 //! The names of the checks are what `--ignore-preflight` takes. An
 //! operator may skip ONE check, and the skip is said out loud: a check
 //! that was skipped is a check that did not happen, and the operator
@@ -30,7 +41,16 @@ use crate::error::ToolError;
 use crate::sys;
 
 /// The names of the checks, in the order they run.
-pub const CHECKS: [&str; 7] = ["os", "docker", "compose", "cpu", "memory", "disk", "ports"];
+pub const CHECKS: [&str; 8] = [
+    "os",
+    "docker",
+    "compose",
+    "cpu",
+    "memory",
+    "disk",
+    "ports",
+    "image-store",
+];
 
 /// Docker 24 or newer.
 const MIN_DOCKER: (u32, u32) = (24, 0);
@@ -79,6 +99,13 @@ pub struct Facts {
     pub disk_free_bytes: Option<u64>,
     /// The ports the release's Compose file publishes on the host.
     pub published_ports: Vec<PublishedPort>,
+    /// Whether Docker runs the CONTAINERD image store, if `docker info`
+    /// answered.
+    ///
+    /// `None` means the question could not be asked, and the check
+    /// refuses: an air-gapped install cannot be sure of the store it
+    /// runs on (REL-2 S3 D13).
+    pub containerd_image_store: Option<bool>,
 }
 
 /// One pre-flight check: a function of the facts that either passes or
@@ -254,6 +281,43 @@ pub fn check_ports(facts: &Facts) -> Result<(), String> {
     ))
 }
 
+/// Docker's image store.
+///
+/// An air-gapped install needs Docker's CONTAINERD image store: on the
+/// classic store no `docker load` registers a repo digest, so the
+/// digest-pinned references the signed manifest names never resolve,
+/// and the stack cannot start (REL-2 S3 D13).
+///
+/// The check runs for a BUNDLE install only. An online install pulls
+/// every image by its digest, and a pull registers the digest on
+/// either store, so the store does not matter there.
+///
+/// # Errors
+///
+/// Returns the message that says what to fix.
+pub fn check_image_store(facts: &Facts) -> Result<(), String> {
+    match facts.containerd_image_store {
+        Some(true) => Ok(()),
+        Some(false) => Err(
+            "this host's Docker uses the classic image store, and an air-gapped install needs \
+             Docker's containerd image store: after `docker load` the classic store registers no \
+             repo digest, so the release's pinned images cannot be found. Turn the containerd \
+             image store on — in /etc/docker/daemon.json put {\"features\": \
+             {\"containerd-snapshotter\": true}}, then restart Docker (`systemctl restart \
+             docker`). The images the classic store holds are hidden while the containerd store \
+             is on, so pull them again after the restart."
+                .to_string(),
+        ),
+        None => Err(
+            "Docker's image store could not be read (`docker info` did not answer), and an \
+             air-gapped install needs Docker's containerd image store. Check that Docker is \
+             running, that this user may talk to it, and that `docker info` names \
+             `io.containerd.snapshotter.v1`."
+                .to_string(),
+        ),
+    }
+}
+
 /// Check that every name the operator passed names a check.
 ///
 /// # Errors
@@ -274,12 +338,16 @@ pub fn validate_ignored(ignored: &[String]) -> Result<(), String> {
 
 /// Run the checks, except the ones the operator asked to skip.
 ///
+/// `bundle` says whether the install is OFFLINE, from a bundle: the
+/// image-store check runs then, and not for an online install (REL-2
+/// S3 D13).
+///
 /// # Errors
 ///
 /// Never: the failures are returned, not raised, so the operator sees
 /// every one of them at once.
-pub fn run(facts: &Facts, ignored: &[String]) -> Vec<Failure> {
-    let checks: [(&str, Check); 7] = [
+pub fn run(facts: &Facts, ignored: &[String], bundle: bool) -> Vec<Failure> {
+    let checks: [(&str, Check); 8] = [
         ("os", check_os),
         ("docker", check_docker),
         ("compose", check_compose),
@@ -287,10 +355,17 @@ pub fn run(facts: &Facts, ignored: &[String]) -> Vec<Failure> {
         ("memory", check_memory),
         ("disk", check_disk),
         ("ports", check_ports),
+        ("image-store", check_image_store),
     ];
     let mut failures = Vec::new();
     for (name, check) in checks {
         if ignored.iter().any(|skipped| skipped == name) {
+            continue;
+        }
+        // The image store matters for a bundle install only: an online
+        // install pulls every image by its digest, and a pull registers
+        // the digest on either store (REL-2 S3 D13).
+        if name == "image-store" && !bundle {
             continue;
         }
         if let Err(message) = check(facts) {
@@ -325,7 +400,7 @@ pub fn command(args: &PreflightArgs) -> Result<(), ToolError> {
     for skipped in &args.ignore_preflight {
         println!("lakehousectl: the {skipped} check was skipped, as asked.");
     }
-    let failures = run(&facts, &args.ignore_preflight);
+    let failures = run(&facts, &args.ignore_preflight, args.bundle);
     if failures.is_empty() {
         println!("lakehousectl: this host meets the release's minimums.");
         return Ok(());
@@ -358,7 +433,20 @@ pub fn collect(compose_text: &str, dir: &Path) -> Facts {
         memory_bytes: memory_bytes(),
         disk_free_bytes: sys::free_bytes(&nearest_existing(dir)).ok(),
         published_ports,
+        containerd_image_store: containerd_image_store(),
     }
+}
+
+/// Whether Docker runs the containerd image store.
+///
+/// `docker info` prints the store as `Driver Status`: the containerd
+/// one names `io.containerd.snapshotter.v1`, the classic one does not.
+/// The answer is `None` when `docker info` did not answer at all — the
+/// check then refuses, because an air-gapped install cannot guess the
+/// store it runs on (REL-2 S3 D13).
+fn containerd_image_store() -> Option<bool> {
+    let status = sys::output("docker", &["info", "--format", "{{json .DriverStatus}}"]).ok()?;
+    Some(status.contains("io.containerd.snapshotter.v1"))
 }
 
 /// The nearest directory that exists.
@@ -564,12 +652,13 @@ mod tests {
             memory_bytes: Some(16 * GIB),
             disk_free_bytes: Some(50 * GIB),
             published_ports: Vec::new(),
+            containerd_image_store: Some(true),
         }
     }
 
     #[test]
     fn a_host_that_meets_every_minimum_passes_every_check() {
-        let failures = run(&facts(), &[]);
+        let failures = run(&facts(), &[], true);
         assert!(failures.is_empty(), "unexpected failures: {failures:?}");
     }
 
@@ -684,7 +773,7 @@ mod tests {
     fn an_ignored_check_does_not_run() {
         let mut facts = facts();
         facts.cpus = 1;
-        let failures = run(&facts, &["cpu".to_string()]);
+        let failures = run(&facts, &["cpu".to_string()], true);
         assert!(failures.is_empty(), "unexpected failures: {failures:?}");
     }
 
@@ -778,6 +867,83 @@ services:
         assert!(
             numbers.contains(&5432),
             "Postgres' port is not among the published ports: {numbers:?}"
+        );
+    }
+
+    #[test]
+    fn a_host_with_the_containerd_image_store_passes_the_image_store_check() {
+        let facts = facts();
+        assert!(check_image_store(&facts).is_ok());
+    }
+
+    #[test]
+    fn a_host_with_the_classic_image_store_is_refused_for_a_bundle_install() {
+        // REL-2 S3 D13: on the classic store no `docker load` registers
+        // a repo digest, so the digest-pinned references the signed
+        // manifest names never resolve, and the stack cannot start.
+        let mut facts = facts();
+        facts.containerd_image_store = Some(false);
+        let failure = check_image_store(&facts).expect_err("the classic store is refused");
+        assert!(
+            failure.contains("containerd-snapshotter"),
+            "the message says how to switch: {failure}"
+        );
+        assert!(
+            failure.contains("/etc/docker/daemon.json"),
+            "the message names the file: {failure}"
+        );
+        assert!(
+            failure.contains("restart Docker"),
+            "the message says to restart Docker: {failure}"
+        );
+        assert!(
+            failure.contains("hidden"),
+            "the message warns about the classic store's images: {failure}"
+        );
+    }
+
+    #[test]
+    fn a_host_whose_image_store_could_not_be_read_is_refused_for_a_bundle_install() {
+        // The check does not guess: an air-gapped install cannot be
+        // sure of the store it runs on.
+        let mut facts = facts();
+        facts.containerd_image_store = None;
+        let failure = check_image_store(&facts).expect_err("an unknown store is refused");
+        assert!(
+            failure.contains("docker info"),
+            "the message says what to check: {failure}"
+        );
+    }
+
+    #[test]
+    fn the_image_store_check_does_not_run_for_an_online_install() {
+        // An online install pulls every image by its digest, and a pull
+        // registers the digest on either store.
+        let mut facts = facts();
+        facts.containerd_image_store = Some(false);
+        let failures = run(&facts, &[], false);
+        assert!(failures.is_empty(), "unexpected failures: {failures:?}");
+    }
+
+    #[test]
+    fn the_image_store_check_runs_for_a_bundle_install() {
+        let mut facts = facts();
+        facts.containerd_image_store = Some(false);
+        let failures = run(&facts, &[], true);
+        assert_eq!(failures.len(), 1, "unexpected failures: {failures:?}");
+        assert_eq!(failures[0].check, "image-store");
+    }
+
+    #[test]
+    fn the_image_store_check_is_a_check_an_operator_may_skip() {
+        let mut facts = facts();
+        facts.containerd_image_store = Some(false);
+        let failures = run(&facts, &["image-store".to_string()], true);
+        assert!(failures.is_empty(), "unexpected failures: {failures:?}");
+        assert!(CHECKS.contains(&"image-store"), "the checks are {CHECKS:?}");
+        assert!(
+            validate_ignored(&["image-store".to_string()]).is_ok(),
+            "the name is a check's name"
         );
     }
 }

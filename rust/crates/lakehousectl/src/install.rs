@@ -235,7 +235,10 @@ fn check_preflight(args: &InstallArgs, compose: &str) -> Result<(), ToolError> {
         println!("lakehousectl: the {skipped} check was skipped, as asked.");
     }
     let facts = preflight::collect(compose, &args.dir);
-    let failures = preflight::run(&facts, &args.ignore_preflight);
+    // The image-store check runs for a BUNDLE install only: an online
+    // install pulls every image by its digest, and a pull registers the
+    // digest on either store (REL-2 S3 D13).
+    let failures = preflight::run(&facts, &args.ignore_preflight, args.bundle.is_some());
     if failures.is_empty() {
         return Ok(());
     }
