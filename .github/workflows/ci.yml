@@ -2844,6 +2844,19 @@ jobs:
           EOF
           # SEC-36: generated per run; no key-shaped literal in the repository.
           echo "CONNECTOR_SECRETS_KEY=$(openssl rand -base64 32)" >> .env
+          # DATA-21 S2: only the `trino` leg reads Lakekeeper (the Trino leg
+          # publishes the gate's own mart into the `gold` Iceberg namespace
+          # and then reads it through Trino). Two addresses have to agree on
+          # the IN-NETWORK name, and the default is the HOST-facing one:
+          # `lakekeeper` advertises its own base URI (`LAKEKEEPER__BASE_URI`
+          # — the same var name), and the Iceberg REST catalog client
+          # follows the URI the server advertises, so the API's catalog
+          # client would otherwise dial `localhost` from inside the network.
+          # The same value the `gold-export` job's .env sets, for the same
+          # reason.
+          if [ "${{ matrix.engine }}" = "trino" ]; then
+            echo 'LAKEKEEPER_BASE_URI=http://lakekeeper:8181' >> .env
+          fi
 
       # Fixture image, built here rather than shared; see `g3a-dagster`.
       - name: Build the oidc-mock fixture image
