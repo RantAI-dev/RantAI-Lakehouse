@@ -116,6 +116,22 @@ the catalog knew about, `gold.*` included. See
 `dagster/dispar_orchestrate/test_maintenance.py` for the regression test
 proving a `gold.*` table is excluded.
 
+# The pause: `MAINTENANCE_PAUSED`
+
+The two verbs here that DELETE files — the snapshot expiry and the
+orphan-file removal — do not run while `MAINTENANCE_PAUSED=true` is
+set: they skip, the reason is recorded in `skipped_verbs`, and the run
+does not fail (REL-2 S4 decision D16).
+
+Why: the local backup does NOT hold the warehouse files. A restore
+brings the catalogs, Postgres and ClickHouse back to the moment of the
+backup, while the files written after it stay as orphans — and a job
+that deletes a file the RESTORED catalog still names breaks the table
+it names. So `lakehousectl` sets the pause before the backup of an
+update and clears it after the update succeeds or is rolled back. The
+Gold export's trim deletes files too, so it reads the same variable
+(`gold_export.py`).
+
 # Per-table policy + Trino verbs
 
 The verbs above are the job's fixed, unconditional behavior. Operators
@@ -216,6 +232,32 @@ from dispar_orchestrate.bronze_catalog import (
 from dispar_orchestrate.op_metadata import DEFAULT_RETRY_POLICY, source_metadata
 
 CATALOG_DB = "icecat_maintenance"
+
+# The environment variable that pauses the maintenance jobs (REL-2 S4
+# decision D16).
+MAINTENANCE_PAUSED_VARIABLE = "MAINTENANCE_PAUSED"
+
+
+def maintenance_paused() -> bool:
+    """Whether the jobs that delete files are paused.
+
+    `MAINTENANCE_PAUSED=true` pauses the two verbs that DELETE files:
+    the snapshot expiry and the orphan-file removal. While it is set
+    they skip, the reason is recorded in `skipped_verbs`, and the run
+    does not fail.
+
+    Why it exists: the local backup does NOT hold the warehouse files.
+    A restore brings the catalogs, Postgres and ClickHouse back to the
+    moment of the backup, while the files written after it stay as
+    orphans — and a job that deletes a file the RESTORED catalog still
+    names breaks the table it names. So `lakehousectl` sets the pause
+    before the backup of an update and clears it after the update
+    succeeds or is rolled back (REL-2 S4 decision D16).
+
+    The value is read as `== "true"`: anything else is not a pause, and
+    an unset variable is not a pause.
+    """
+    return os.environ.get(MAINTENANCE_PAUSED_VARIABLE, "").strip() == "true"
 
 
 def _env(name: str, default: str) -> str:
@@ -559,6 +601,36 @@ def _run_maintenance_for_table(
     in-line loop body: probe, dry-run + applied orphan removal,
     growth measurement, policy-driven `expire_snapshots`/`optimize`,
     `record_maintenance_run` + `record_maintenance_verb_run`."""
+    skipped_verbs: list[str] = []
+
+    if maintenance_paused():
+        # The pause (REL-2 S4 decision D16): nothing that deletes a
+        # file runs, the reason is recorded, and the run is still
+        # recorded — so the operator sees that the maintenance did
+        # nothing and why. The growth measurement is skipped with it:
+        # it is a measurement of the same tables, and a paused
+        # maintenance does not read them either.
+        reason = (
+            "maintenance paused: MAINTENANCE_PAUSED=true, so no snapshot was expired and no "
+            "orphan file was removed"
+        )
+        skipped_verbs.append(reason)
+        record_maintenance_run(
+            table_name=table_name,
+            dry_run_metrics={},
+            applied_metrics={},
+            skipped_verbs=skipped_verbs,
+            snapshot_growth=None,
+            target=cfg.ch,
+        )
+        return {
+            "table_name": table_name,
+            "dry_run": {},
+            "applied": {},
+            "skipped_verbs": skipped_verbs,
+            "snapshot_growth": {},
+        }
+
     expire_skip_reason = probe_expire_snapshots_skip(cfg, table_name)
     dry = run_remove_orphan_files(cfg, table_name, dry_run=True)
     real = run_remove_orphan_files(cfg, table_name, dry_run=False)
@@ -566,7 +638,6 @@ def _run_maintenance_for_table(
     namespace, name = _table_namespace_and_name(table_name)
     now = datetime.now(timezone.utc)
 
-    skipped_verbs: list[str] = []
     verb_runs: list[dict[str, str]] = []
 
     if policy_fetch_error is not None:

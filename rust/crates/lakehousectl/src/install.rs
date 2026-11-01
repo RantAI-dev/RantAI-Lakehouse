@@ -13,7 +13,10 @@
 //! 5. **The layout is written** (REL-2 decision D5): the Compose file,
 //!    the `.env` (mode 0600), the manifest, its signature, `backups/`
 //!    and `state.json` — one directory, `/opt/rantai-lakehouse` by
-//!    default.
+//!    default. Every OTHER file the release ships is written next to
+//!    them, at the relative path the release ships it at (REL-2 S4
+//!    decision D14): the relative bind-mount sources of the Compose
+//!    file, and the two tools under `tools/`.
 //! 6. **The images are fetched.** Online, by digest; offline, from the
 //!    bundle's `docker save` files, each one's checksum checked against
 //!    the bundle's list and its ID against the signed manifest.
@@ -33,17 +36,16 @@ use sha2::{Digest, Sha256};
 use crate::cli::InstallArgs;
 use crate::docker;
 use crate::error::ToolError;
+use crate::files;
 use crate::http;
 use crate::manifest::{Manifest, image_name};
 use crate::preflight;
+use crate::release;
 use crate::secrets;
+use crate::state;
 use crate::sys;
 use crate::verify;
 
-/// Where a release's assets live.
-const RELEASES_URL: &str = "https://github.com/RantAI-dev/RantAI-Lakehouse/releases/download";
-/// Where the newest release is named.
-const LATEST_URL: &str = "https://api.github.com/repos/RantAI-dev/RantAI-Lakehouse/releases/latest";
 /// How long the stack may take to become ready.
 const READY_TIMEOUT: Duration = Duration::from_secs(600);
 /// How long the console may take to answer.
@@ -90,9 +92,20 @@ pub fn command(args: &InstallArgs) -> Result<(), ToolError> {
         .map_err(|error| ToolError::Failed(format!("the manifest could not be read: {error}")))?;
 
     check_compose(&manifest, &release.compose)?;
+
+    // The files the release ships (REL-2 S4 decision D14): the relative
+    // bind-mount sources of the release's Compose file, and the two
+    // tools under `tools/`. They are fetched (or read from the
+    // bundle) and checked against the SIGNED manifest BEFORE anything
+    // is written — a file that does not match is a refusal, not a
+    // warning.
+    let shipped = files::fetch(&manifest, release.bundle_dir.as_deref(), &mut |url| {
+        download(url)
+    })?;
+
     check_preflight(args, &release.compose)?;
 
-    let secrets = write_layout(&args.dir, &release, &manifest)?;
+    let secrets = write_layout(&args.dir, &release, &manifest, &shipped)?;
     let env = read_env(&args.dir.join(".env"));
 
     fetch_images(&manifest, release.bundle_dir.as_deref())?;
@@ -158,7 +171,7 @@ where
 
 /// The URL of one asset of a release.
 fn asset_url(version: &str, name: &str) -> String {
-    format!("{RELEASES_URL}/v{version}/{name}")
+    release::asset_url(version, name)
 }
 
 /// The version of the newest release.
@@ -170,13 +183,14 @@ fn latest_version() -> Result<String, ToolError> {
             "--silent",
             "--show-error",
             "--location",
-            LATEST_URL,
+            release::LATEST_URL,
         ],
     )
     .map_err(|error| {
         ToolError::Failed(format!(
-            "the newest release could not be read from {LATEST_URL}: {error}. Is this host \
-                 online, and is `curl` installed?"
+            "the newest release could not be read from {}: {error}. Is this host \
+             online, and is `curl` installed?",
+            release::LATEST_URL
         ))
     })?;
     let document: Value = serde_json::from_str(&body).map_err(|error| {
@@ -253,12 +267,13 @@ fn write_layout(
     dir: &Path,
     release: &Release,
     manifest: &Manifest,
+    shipped: &files::ShippedFiles,
 ) -> Result<secrets::Secrets, ToolError> {
     // The state of an earlier install is not overwritten: the same
     // release may be installed again, and any other release is refused
     // — that is what `lakehousectl update` is for (REL-2 S3 review
     // round 1 SHOULD-FIX 3).
-    check_state(dir, &manifest.version)?;
+    state::check_installed(dir, &manifest.version)?;
 
     std::fs::create_dir_all(dir).map_err(|source| ToolError::Io {
         context: format!("{} could not be created", dir.display()),
@@ -279,54 +294,22 @@ fn write_layout(
     write(&dir.join("release.json"), &release.manifest)?;
     write(&dir.join("release.json.sigstore.json"), &release.bundle)?;
 
+    // Every other file the release ships (REL-2 S4 decision D14): the
+    // relative bind-mount sources of the Compose file, and the two
+    // tools under `tools/`. Each is written at the relative path the
+    // release ships it at, so a mount finds its file and
+    // `lakehousectl backup` finds its script.
+    files::write(dir, shipped)?;
+
     // The state of the FIRST install is kept: it names the release that
     // is installed, the one before it, and the last backup. A
     // re-install of the same release changes nothing of it.
-    if !dir.join("state.json").exists() {
-        let state = serde_json::json!({
-            "schemaVersion": 1,
-            "currentVersion": manifest.version,
-            "previousVersion": Value::Null,
-            "lastBackup": Value::Null,
-        });
-        write(&dir.join("state.json"), format!("{state}\n").as_bytes())?;
-    }
+    state::write_initial(dir, &manifest.version)?;
 
     secrets::write_env(&dir.join(".env")).map_err(|source| ToolError::Io {
         context: format!("{} could not be written", dir.join(".env").display()),
         source,
     })
-}
-
-/// Refuse an install that would replace the release of another one.
-///
-/// The directory holds the state of the install that is there, and the
-/// state names the release that is installed. The SAME release may be
-/// installed again — a re-run of the same install — and its state is
-/// kept as it is. Any OTHER release is refused, and the refusal says
-/// which command does that work (REL-2 S3 review round 1 SHOULD-FIX 3).
-fn check_state(dir: &Path, version: &str) -> Result<(), ToolError> {
-    let path = dir.join("state.json");
-    if !path.exists() {
-        return Ok(());
-    }
-    let text = read_to_string(&path)?;
-    let installed = serde_json::from_str::<Value>(&text)
-        .ok()
-        .and_then(|document| document["currentVersion"].as_str().map(str::to_string));
-    match installed {
-        Some(installed) if installed == version => Ok(()),
-        Some(installed) => Err(ToolError::Failed(format!(
-            "{} already holds the release {installed}, and the release {version} would replace it. \
-             `lakehousectl update` is the command that installs another release.",
-            dir.display()
-        ))),
-        None => Err(ToolError::Failed(format!(
-            "{} holds a state.json that names no release, so the tool cannot tell which one is \
-             installed. It is refused rather than overwritten.",
-            dir.display()
-        ))),
-    }
 }
 
 /// Fetch every image the release runs.
@@ -753,6 +736,41 @@ mod tests {
     }
 
     #[test]
+    fn the_install_writes_every_file_the_release_ships() {
+        // REL-2 S4 decision D14: the relative bind-mount sources of the
+        // release's Compose file, and the two tools under `tools/`. Each
+        // is written at the relative path the release ships it at, so a
+        // mount finds its file and `lakehousectl backup` finds its
+        // script.
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let mut shipped: files::ShippedFiles = std::collections::BTreeMap::new();
+        shipped.insert(
+            "ops/backups/clickhouse/backups.xml".to_string(),
+            b"<clickhouse/>".to_vec(),
+        );
+        shipped.insert("tools/backup-local.sh".to_string(), b"#!/bin/sh\n".to_vec());
+
+        write_layout(
+            directory.path(),
+            &release_of("0.2.0"),
+            &manifest_of("0.2.0"),
+            &shipped,
+        )
+        .expect("the install writes the layout");
+
+        assert_eq!(
+            std::fs::read(directory.path().join("ops/backups/clickhouse/backups.xml"))
+                .expect("the mounted file is there"),
+            b"<clickhouse/>".to_vec(),
+            "the mounted file was not written at its own relative path"
+        );
+        assert!(
+            directory.path().join("tools/backup-local.sh").exists(),
+            "the tool was not written under tools/"
+        );
+    }
+
+    #[test]
     fn a_second_install_of_the_same_release_keeps_the_state_of_the_first() {
         // The state names the release before this one and the last
         // backup: a re-install of the same release changes nothing of
@@ -766,6 +784,7 @@ mod tests {
             directory.path(),
             &release_of("0.2.0"),
             &manifest_of("0.2.0"),
+            &files::ShippedFiles::new(),
         )
         .expect("the same release installs again");
 
@@ -787,6 +806,7 @@ mod tests {
             directory.path(),
             &release_of("0.2.0"),
             &manifest_of("0.2.0"),
+            &files::ShippedFiles::new(),
         )
         .expect_err("another release is refused");
         let message = error.to_string();
@@ -810,6 +830,7 @@ mod tests {
             directory.path(),
             &release_of("0.2.0"),
             &manifest_of("0.2.0"),
+            &files::ShippedFiles::new(),
         )
         .expect_err("a state that names no release is refused");
         assert!(

@@ -28,6 +28,14 @@
 #   lakehousectl              the installer: the tool that installs this
 #                             bundle on an air-gapped host, and the file
 #                             the signed manifest names a checksum for
+#   ops/…, tools/…            every other file the release ships: the
+#                             relative bind-mount sources of the release's
+#                             Compose file (REL-2 S4 decision D14) and the
+#                             two tools `lakehousectl backup` and
+#                             `lakehousectl restore` run (D15). They are
+#                             at the SAME relative path the install
+#                             writes them at, so a mount finds its file
+#                             and a tool finds its script.
 #   SHA256SUMS                every file's checksum, so an operator can
 #                             check the bundle before installing it
 #
@@ -42,6 +50,16 @@
 # checksums. If the Compose file in the bundle is not the one the
 # manifest names, the bundle is a different release wearing the same
 # name — so the script refuses to build it.
+#
+# # Which files the release ships
+#
+# The signed manifest names them: `files` holds the checksum of every
+# file the release carries. The list of the files themselves comes from
+# `make_manifest.py --print-shipped-files` — the SAME script that wrote
+# the manifest, so the bundle and the manifest cannot drift apart (rule
+# 4: one rule, one place). The manifest's checksum is what the bundle
+# checks the bytes against: the list is a hint, the signed manifest is
+# the truth.
 #
 # # Usage
 #
@@ -65,7 +83,8 @@
 #
 # # What it needs
 #
-# Docker (for `docker save`), `jq`, `zstd`, `tar` and `sha256sum`.
+# Docker (for `docker save`), `jq`, `zstd`, `tar`, `sha256sum` and
+# `python3` (for the list of the files the release ships).
 #
 # # The image store it needs
 #
@@ -146,6 +165,7 @@ require_command jq
 require_command zstd
 require_command tar
 require_command sha256sum
+require_command python3
 
 # The image store the daemon runs. `docker info` prints the store as
 # `Driver Status`; the containerd one names `io.containerd.snapshotter.v1`
@@ -196,6 +216,43 @@ if [ -n "$lakehousectl" ]; then
     cp "$lakehousectl" "$stage/lakehousectl"
     chmod +x "$stage/lakehousectl"
 fi
+
+# The files the release ships (REL-2 S4 decision D14): the relative
+# bind-mount sources of the release's Compose file, and the two tools
+# under `tools/`. The list comes from the script that wrote the
+# manifest, and the CHECKSUM comes from the signed manifest: the bytes
+# that land in the bundle are the bytes the manifest names, or the
+# bundle is not built.
+#
+# The install writes each of them at the same relative path, so a
+# Compose mount finds its file and `lakehousectl backup` finds its
+# script.
+shipped_list="$stage/.shipped-files"
+shipped_paths="$stage/.shipped-paths"
+: > "$shipped_paths"
+python3 "$script_dir/make_manifest.py" --print-shipped-files --compose "$compose" \
+    > "$shipped_list" \
+    || fail "the files the release ships could not be listed."
+while IFS=$'\t' read -r install_path source_path; do
+    [ -n "$install_path" ] || continue
+    if [ ! -f "$source_path" ]; then
+        fail "the file $source_path, which the release ships as $install_path, does not exist."
+    fi
+    expected_shipped_sha="$(jq -er --arg name "$install_path" '.files[$name]' "$manifest")" \
+        || fail "the manifest names no checksum for $install_path."
+    actual_shipped_sha="$(sha256sum "$source_path" | awk '{print $1}')"
+    if [ "$expected_shipped_sha" != "$actual_shipped_sha" ]; then
+        fail "$install_path does not match the manifest's checksum: expected $expected_shipped_sha, got $actual_shipped_sha."
+    fi
+    mkdir -p "$stage/$(dirname "$install_path")"
+    cp "$source_path" "$stage/$install_path"
+    # A script the install RUNS has to be executable; a file the
+    # Compose file mounts only has to be there.
+    case "$install_path" in
+        *.sh) chmod +x "$stage/$install_path" ;;
+    esac
+    printf '%s\n' "$install_path" >> "$shipped_paths"
+done < "$shipped_list"
 
 # One `docker save` per image, BY TAG (REL-2 S3 D13). The host that
 # loads the bundle gets the exact image the manifest names, with no
@@ -254,6 +311,12 @@ done < <(jq -er '.images | to_entries | map(.value) | unique | .[]' "$manifest")
     if [ -f lakehousectl ]; then
         sha256sum lakehousectl >> SHA256SUMS
     fi
+    if [ -s .shipped-paths ]; then
+        while read -r install_path; do
+            [ -n "$install_path" ] || continue
+            sha256sum "$install_path" >> SHA256SUMS
+        done < .shipped-paths
+    fi
 )
 
 bundle="rantai-lakehouse-${version}-linux-x86_64.tar.zst"
@@ -262,6 +325,11 @@ contents=(docker-compose.yml release.json release.json.sigstore.json images sbom
 if [ -n "$lakehousectl" ]; then
     contents+=(lakehousectl)
 fi
+# The files the release ships, at the path the install writes them at.
+while read -r install_path; do
+    [ -n "$install_path" ] || continue
+    contents+=("$install_path")
+done < "$shipped_paths"
 tar -C "$stage" -cf - "${contents[@]}" | zstd -19 -T0 -o "$out_dir/$bundle"
 
 size="$(wc -c < "$out_dir/$bundle")"
