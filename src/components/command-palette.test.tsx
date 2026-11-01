@@ -94,6 +94,14 @@ describe("CommandPalette catalog search", () => {
     expect(await screen.findByText("description · approximate match")).toBeTruthy()
   })
 
+  it("says an approximate name match is approximate, without naming the name (DATA-32)", async () => {
+    stubCatalog({
+      assets: [asset(1, { matchedOn: { field: "name", value: "", approximate: true } })],
+    })
+    await search("revnue")
+    expect(await screen.findByText("approximate match")).toBeTruthy()
+  })
+
   it("lists at most eight assets", async () => {
     stubCatalog({ assets: Array.from({ length: 12 }, (_, i) => asset(i + 1)) })
     await search("table")

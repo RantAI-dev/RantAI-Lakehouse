@@ -512,7 +512,11 @@ def step_rows_and_types(api, table: str, expected: dict, column_types: dict) -> 
     columns = ["plnt", "material", "description", "qty"]
     body = run_query(api, f"SELECT {', '.join(columns)} FROM {QUERY_DB}.`bronze.{table}` WHERE 1 ORDER BY material, plnt")
     # Compared as text: `plnt` and `qty` are integers now, `material` keeps its leading zeros.
-    got = [[str(row[c]) for c in columns] for row in body["rows"]]
+    # DATA-29: `/api/query/run` answers a NULL cell as JSON `null`, so a cell that holds no
+    # value reads as the empty value here -- this gate compares text, and these columns are
+    # typed plain, so a null cell is not a value the file had. It must not print Python's
+    # `None` as if it were the cell's text.
+    got = [["" if row[c] is None else str(row[c]) for c in columns] for row in body["rows"]]
     want = sorted(expected["rows"], key=lambda r: (r[1], r[0]))
     # The table holds the file twice after the append: compare the distinct rows.
     distinct = [list(r) for r in sorted({tuple(r) for r in got}, key=lambda r: (r[1], r[0]))]
@@ -1023,11 +1027,13 @@ def step_new_formats(api, base_table: str, state: dict) -> None:
         if loaded.get("rows") != len(expected["rows"]) or loaded.get("bronzeTable") != table:
             raise G9Failure(f"{name}: the load settled with rows {loaded.get('rows')!r} in {loaded.get('bronzeTable')!r}, expected {len(expected['rows'])} in {table!r}")
         _wait_for(f"{table} holds its rows", lambda: count_rows(api, table) == len(expected["rows"]), VISIBLE_TIMEOUT_S, retry_failures=True)
-        # PR #186 review BLOCKER 4: `/api/query/run` answers every cell as text and renders a
-        # NULL as "" (`stringify_cell`), so a value read through it cannot tell a missing key
-        # (decision 11: null) from an empty string. Each column is asked `isNull` beside its
-        # value, and a cell is None only where ClickHouse says it is NULL. Nothing is loosened:
-        # a table that held "" where the fixture says null still fails here.
+        # PR #186 review BLOCKER 4: a value read through `/api/query/run` must tell a missing
+        # key (decision 11: null) from an empty string. DATA-29: the route answers a NULL cell
+        # as JSON `null` now, so the cell itself says so. The gate still asks ClickHouse
+        # `isNull` beside each value, so its own answer to "is this cell NULL" does not depend
+        # on the route's shape, and a cell is None only where ClickHouse says it is NULL.
+        # Nothing is loosened: a table that held "" where the fixture says null still fails
+        # here.
         flags = ", ".join(f"isNull({c}) AS is_null_{i}" for i, c in enumerate(names))
         got = run_query(api, f"SELECT {', '.join(names)}, {flags} FROM {QUERY_DB}.`bronze.{table}` WHERE 1")["rows"]
         got_rows = sorted(

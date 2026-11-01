@@ -106,6 +106,9 @@ export type Asset = {
    * `"description"` or `"columnDescription"`; `value` is the tag or column
    * name and `""` for the rest; `approximate` is true when the match
    * forgave a typo.
+   * `"name"` is the one field outside that list (`DATA-32` D1): the server
+   * reports it when the name forgave a typo and no other field explains the
+   * hit, so `value` is `""` and `approximate` is true.
    */
   matchedOn?: { field: string; value: string; approximate: boolean }
 }
