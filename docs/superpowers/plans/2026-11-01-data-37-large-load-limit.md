@@ -93,100 +93,23 @@ of memory.
 
 ## 5. Handoff (developer appends below)
 
-### Handoff (developer, 2026-11-01)
-
-One commit per task, in plan order, each pushed as it was made:
-
-| Commit | Task | What it holds |
-| --- | --- | --- |
-| `d41cebd8` | T1 | The store: `LARGE_LOAD_BYTES` (D1), `LoadLimits::large`, `LimitOutcome`, `MarkOutcome::LargeLimitReached`, the check under the same lock (D3). |
-| `68757f99` | T2 | The API and the configuration: `UPLOAD_MAX_CONCURRENT_LARGE` (D2), the refusal with its own sentence (D4), compose and `.env.example`. |
-| `fb39a253` | T3 | The feature page's decision row and the G9 harness's expectation. |
-| this commit | — | This handoff. |
-
-**Commands run (all from `rust/`, through `/home/shiro/rantai/bin/cargo-locked`; the
-machine is memory-capped and shared, so every cargo command was scoped to the
-crate it touched).**
-
-| Command | Result |
-| --- | --- |
-| `cargo fmt --check` | clean (run again on the final commit) |
-| `cargo clippy -p lakehouse-store --all-targets -- -D warnings` | clean |
-| `cargo clippy -p lakehouse-api --all-targets -- -D warnings` | clean |
-| `cargo test -p lakehouse-store` | 38 test binaries, 840 passed, 0 failed (`--test uploads` alone: 63 passed, of which 4 are the new `DATA-37` ones; `--test upload_folders`: 14 passed) |
-| `cargo test -p lakehouse-api --lib` | 2880 passed, 1 failed (an environmental failure, see below), 18 ignored |
-| `cargo test -p lakehouse-api --lib large_load_limit` | 3 passed (the two config tests and the refusal's sentence) |
-| `cargo test -p lakehouse-api --lib config` | 160 passed (the filter `config` also matches tests of other modules) |
-| `cargo test -p lakehouse-api --test upload_routes` | 175 passed |
-| `cargo test -p lakehouse-api --test upload_folder_routes` | 7 passed |
-| `cargo test -p lakehouse-api --test connector_upload_table` | 7 passed |
-| `cargo test -p lakehouse-api --test hostile_uploads` | 0 passed, 2 ignored (both are ignored on `main` too) |
-| `python3 -m pytest ops/g9 -q` | 29 passed (pytest, requests, pyarrow and fastavro in a throwaway venv at `/tmp/opencode/g9-venv`; the system python has no pytest) |
-| `python3 ops/lint/check_intra_package_imports.py` | OK |
-| `python3 ops/lint/check_bare_iceberg_count.py` | OK |
-| `docker compose --profile '*' config --quiet` | OK (with throwaway values for `POSTGRES_PASSWORD`, `RUSTFS_ACCESS_KEY`, `RUSTFS_SECRET_KEY`, `LAKEKEEPER_ENCRYPTION_KEY` and `CONNECTOR_SECRETS_KEY`; no `.env` was written) |
-
-**What the developer changed in the API for T1, and why.** `LoadLimits` gained a
-field, so the API's `load_limits()` could not compile unchanged. In T1 it passed
-`large: i64::MAX` — "no load is refused by the large limit yet" — with a comment
-that says the setting arrives in T2; T2 replaced it with
-`state.config.upload_max_concurrent_large`. The store's `loads_under_limits`
-now takes the other files of the load (`also`) and answers a `LimitOutcome`
-instead of a `bool`, because D4 wants the refusal to say WHICH limit refused it,
-and the route has to say the same thing at the early read and at the locked
-mark.
-
-**`ops/g9/large_upload.py`: what changed and why.** The harness loads one file
-at a time by default (`--concurrent 1`), but `--concurrent N` starts N loads of
-the same file together, and its CSV and JSON Lines files are 2,048 MiB by
-default, over the 512 MiB of the threshold. With the new limit, the third and
-later loads of such a phase are refused with the large-load sentence. The
-harness's expectation now says so (its docstring, point 4, and the `--concurrent`
-help): the third and later loads are refused with the large-load message, the
-refusal is recorded as a result, and the run ends with a non-zero status. The
-harness's CODE is unchanged: a refused load was already a result to record and
-not an error to retry (that is what it already did for the `SEC-17` limits), and
-the limit was NOT raised to make a run pass (`AGENTS.md` rule 2). The docstring
-also says that a phase whose file is under the threshold (a Parquet file of
-194 MiB by default) is not large and is not refused by this limit.
-
-**Not verified, with the reason.**
-
-- The full-workspace block of `AGENTS.md` (`cargo clippy --workspace
-  --all-targets --all-features` and `cargo test --workspace`) was **not run**:
-  the rules for this machine forbid a full-workspace run (it is memory-capped
-  and another developer is building on it at the same time). The crates this
-  change touches were run in full instead: `lakehouse-store` (all 38 test
-  binaries) and `lakehouse-api` (its lib binary and the four upload test
-  binaries). The other crates of the workspace are untouched by the diff.
-- `bun run typecheck`, `bun run lint` and `bun run test` were **not run**:
-  no TypeScript file changed (the "only build what changed" rule).
-- A real `docker compose up` of the affected profile was **not run**: the plan's
-  accept for T3 is `docker compose --profile '*' config --quiet`, which passed,
-  and the host is shared (another developer's containers are up, one of them
-  publishing the API's default ClickHouse port 18123, so starting a stack here
-  would collide). The compose change is one environment-variable passthrough of
-  the same shape as the two limits above it.
-- The G9 harness was **not run against a live stack** (it needs a running
-  console and a 2 GiB file); only its unit tests were run.
-- `lakehouse-api`'s `routes::gold::tests::unchanged_since_last_export_reason_fails_closed_on_read_error`
-  is **red on this machine for a reason outside this change**: the test sets
-  `CLICKHOUSE_URL`, a name the configuration does not read, and relies on the
-  default `ch_url` (`http://localhost:18123`) being unreachable. Another
-  developer's ClickHouse container publishes exactly that port on this host
-  (`curl 'http://localhost:18123/?query=SELECT%201'` answers `1`), so the
-  engine the test expects to be unreachable is reachable and the query
-  succeeds. The diff touches neither `routes/gold.rs` nor the default of
-  `ch_url`, so this is red on `main` on this host as well.
-
-**Docker.** The store's `sqlx::test` runs use the shared Postgres testcontainer
-of `lakehouse-test-support` (`org.rantai.lakehouse-test-support=
-postgres-16-shm1g`, started with `ReuseDirective::Always`). This work started
-that container (there was none running when the session began) and removed it
-again at the end, so nothing of this work is left running; the next test run
-starts its own. The ClickHouse containers still up on this host are not this
-work's: nothing in this repository's test suite starts one (the API's tests
-point at a dead ClickHouse on port 1), and one of them, `data40-ch`, publishes
-the API's default port 18123.
-
 ## 6. Review (planner appends below)
+
+### Review round 1 (planner, 2026-11-01, at `3b0f137e`)
+
+- **T1 matches D1 and D3.** The large count is a third check inside `under_limits`. It runs on
+  the connection that holds the `file_upload:ingest_limit` lock, so two starts cannot both take
+  the last large place. A load is large by the primary's `size_bytes` plus its `also`, and a
+  running load by its leader plus its followers (`loaded_with`), within the same
+  `LOAD_COUNTS_FOR_HOURS` window. A small load returns before the large count is read, so it is
+  never refused by it.
+- **T2 matches D2 and D4.** `UPLOAD_MAX_CONCURRENT_LARGE` is parsed by `parse_limit`
+  (default 2, and 0 refuses the start). Both the early read and the locked mark answer
+  `too_many_large_loads()`, a 429 with `Retry-After` and its own sentence naming the setting.
+  Compose passes it with `${…:-}`.
+- **T3.** The G9 harness's expectation is corrected, not the limit (rule 2). That is the right
+  call.
+- **One API test failed locally for an environmental reason:** another stack's ClickHouse held
+  the default port. The diff does not touch it, and CI's workspace run is the judge.
+
+**Open: no BLOCKER, no SHOULD-FIX.** Merge waits for the PR's CI.

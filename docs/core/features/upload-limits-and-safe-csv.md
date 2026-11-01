@@ -73,7 +73,6 @@ Signed by the product owner on 2026-10-15: the defaults below, as built.
 | D7 | Which cells get the apostrophe | A cell whose first character is `=`, `+`, `-`, `@`, a tab or a carriage return, unless the whole cell is a plain number | |
 | D8 | Header cells | Treated like any other cell | |
 | D9 | A load that has shown as running for a very long time | After 6 hours *(proposed by the planner)* it no longer counts against either limit, so loads whose job died and whose owner never looks cannot close uploads for everyone | |
-| D10 | Large loads running at once in the whole installation | 2 *(the spec proposed 4; the product owner chose 2)*; `UPLOAD_MAX_CONCURRENT_LARGE`. A load is large when its files total more than 512 MiB; a load that is not large never counts against this limit and is never refused by it (`DATA-37`) | |
 
 ## Limits
 

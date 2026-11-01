@@ -955,14 +955,6 @@ pub struct Config {
     /// The same, for the whole installation: `UPLOAD_MAX_CONCURRENT`,
     /// default 16 (`SEC-17`).
     pub upload_max_concurrent: u32,
-    /// Large loads that may run at once in the whole installation: loads
-    /// whose files total more than 512 MiB (`DATA-37` decision D1).
-    /// `UPLOAD_MAX_CONCURRENT_LARGE`, default 2 (decision D2). Two are
-    /// about 4.4 GiB of job memory, which leaves room for the stack on the
-    /// 16 GiB minimum host, and the stack's own idle memory is not
-    /// measured. A value that is not a whole number of 1 or more fails
-    /// config resolution ([`ConfigError::InvalidUploadLimit`]).
-    pub upload_max_concurrent_large: u32,
     /// How many files may be READ at once per API process: the workbook and
     /// Parquet files an upload converts, each read by a child process
     /// (`SEC-22` D3). `UPLOAD_MAX_CONVERSIONS`, default 2. A request that
@@ -1233,10 +1225,6 @@ impl std::fmt::Debug for Config {
                 &self.upload_max_concurrent_per_user,
             )
             .field("upload_max_concurrent", &self.upload_max_concurrent)
-            .field(
-                "upload_max_concurrent_large",
-                &self.upload_max_concurrent_large,
-            )
             .field("upload_max_conversions", &self.upload_max_conversions)
             .field("upload_convert_memory_mb", &self.upload_convert_memory_mb)
             .field("upload_session_ttl_hours", &self.upload_session_ttl_hours)
@@ -1661,7 +1649,6 @@ impl Config {
             auth_retention_days: parse_positive_u32_or_default(env, "AUTH_RETENTION_DAYS", 30),
             upload_max_concurrent_per_user: parse_limit(env, "UPLOAD_MAX_CONCURRENT_PER_USER", 4)?,
             upload_max_concurrent: parse_limit(env, "UPLOAD_MAX_CONCURRENT", 16)?,
-            upload_max_concurrent_large: parse_limit(env, "UPLOAD_MAX_CONCURRENT_LARGE", 2)?,
             upload_max_conversions: parse_limit(env, "UPLOAD_MAX_CONVERSIONS", 2)?,
             upload_convert_memory_mb: parse_limit(
                 env,
@@ -2904,30 +2891,6 @@ mod tests {
             err,
             ConfigError::InvalidUploadLimit("UPLOAD_MAX_CONCURRENT", _)
         ));
-    }
-
-    // ── DATA-37: the limit on large loads ─────────────────────────────────
-
-    #[test]
-    fn the_large_load_limit_defaults_to_two_and_is_read_from_its_variable() {
-        for env in [HashMap::new(), env_with("UPLOAD_MAX_CONCURRENT_LARGE", "")] {
-            let cfg = Config::from_map(&env).unwrap();
-            assert_eq!(cfg.upload_max_concurrent_large, 2);
-        }
-        let cfg = Config::from_map(&env_with("UPLOAD_MAX_CONCURRENT_LARGE", "3")).unwrap();
-        assert_eq!(cfg.upload_max_concurrent_large, 3);
-    }
-
-    #[test]
-    fn a_large_load_limit_that_is_not_a_whole_number_of_one_or_more_is_refused() {
-        for bad in ["0", "-1", "abc", "2.5", " 3"] {
-            let err = Config::from_map(&env_with("UPLOAD_MAX_CONCURRENT_LARGE", bad))
-                .expect_err("a bad limit must stop start-up, not fall back to the default");
-            assert_eq!(
-                err,
-                ConfigError::InvalidUploadLimit("UPLOAD_MAX_CONCURRENT_LARGE", bad.to_owned())
-            );
-        }
     }
 
     // ── SEC-22: the limits of the child that reads an uploaded file ─────

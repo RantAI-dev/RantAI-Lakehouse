@@ -143,8 +143,8 @@ use lakehouse_store::audit::{self as store_audit, NewAuditEvent};
 use lakehouse_store::connectors;
 use lakehouse_store::upload_folders;
 use lakehouse_store::uploads::{
-    self, ClaimFolder, FolderFilter, LimitOutcome, ListFilter, LoadClaim, LoadLimits, LoadMode,
-    MarkOutcome, NewUpload, TableClaim, Upload,
+    self, ClaimFolder, FolderFilter, ListFilter, LoadClaim, LoadLimits, LoadMode, MarkOutcome,
+    NewUpload, TableClaim, Upload,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -162,7 +162,7 @@ use crate::json::ApiJson;
 use crate::state::AppState;
 use crate::upload_convert::{self, Answer, ConversionError, FileKind, Operation, Source};
 use crate::upload_formats::{self, ByName, Compression, Format, Layout, Refusal};
-use crate::upload_limits::{RETRY_AFTER_SECS, too_many_large_loads, too_many_uploads};
+use crate::upload_limits::{RETRY_AFTER_SECS, too_many_uploads};
 use crate::upload_parquet::{self, ParquetFooter, ParquetInfo};
 use crate::upload_parquet_parts::Part;
 use crate::upload_parquet_range::RangeReader;
@@ -2736,10 +2736,6 @@ fn load_limits(state: &AppState) -> LoadLimits {
     LoadLimits {
         per_user: i64::from(state.config.upload_max_concurrent_per_user),
         total: i64::from(state.config.upload_max_concurrent),
-        // `DATA-37` decision D2: how many large loads may run at once in the
-        // installation. A load that is not large never counts against it and
-        // is never refused by it (decision D3).
-        large: i64::from(state.config.upload_max_concurrent_large),
     }
 }
 
@@ -2753,11 +2749,9 @@ fn load_limits(state: &AppState) -> LoadLimits {
 /// # Errors
 ///
 /// 429 (`Retry-After: 5`) when the `uploaded_by` already has the configured
-/// number of loads running, or the installation has; 429 with the
-/// large-load sentence when the installation already runs the configured
-/// number of large loads and this one is large too (`DATA-37`); 400 when the
-/// header has more than 1,000 columns under the confirmed reading; 503 when
-/// the object store cannot serve the head.
+/// number of loads running, or the installation has; 400 when the header
+/// has more than 1,000 columns under the confirmed reading; 503 when the
+/// object store cannot serve the head.
 async fn check_within_limits_and_column_cap(
     state: &AppState,
     pool: &PgPool,
@@ -2766,13 +2760,8 @@ async fn check_within_limits_and_column_cap(
     layout: Option<Layout>,
 ) -> ApiResult<LoadLimits> {
     let limits = load_limits(state);
-    match uploads::loads_under_limits(pool, &row.id, &request.also_uploads, limits).await? {
-        LimitOutcome::Under => {}
-        LimitOutcome::LimitReached => return Err(too_many_uploads().into()),
-        // `DATA-37` decision D4: the refusal of the large-load limit has a
-        // sentence of its own, so the person can tell it from the per-user
-        // one.
-        LimitOutcome::LargeLimitReached => return Err(too_many_large_loads().into()),
+    if !uploads::loads_under_limits(pool, &row.id, limits).await? {
+        return Err(too_many_uploads().into());
     }
     let store = UploadStore::connect(&state.config).await?;
     if let Some(layout) = layout {
@@ -2965,10 +2954,8 @@ async fn convert_upload(
 ///
 /// # Errors
 ///
-/// 429 when a limit is reached (each with its own sentence: the per-user and
-/// the installation-wide one, and the large-load one of `DATA-37`); 409 when
-/// this upload was claimed by another request, or one of the other files was
-/// taken or went away since the checks; 404 when this upload went away.
+/// 429 when a limit is reached; 409 when this upload was claimed by another request, or one of
+/// the other files was taken or went away since the checks; 404 when this upload went away.
 async fn claim_load(
     pool: &PgPool,
     row: &Upload,
@@ -3010,10 +2997,6 @@ async fn claim_load(
     Ok(match outcome {
         MarkOutcome::Marked(claimed) => *claimed,
         MarkOutcome::LimitReached => return Err(too_many_uploads().into()),
-        // `DATA-37` decision D4: the refusal of the large-load limit has a
-        // sentence of its own. The early read above answers it too, so the
-        // person sees the same sentence whichever check refused the load.
-        MarkOutcome::LargeLimitReached => return Err(too_many_large_loads().into()),
         MarkOutcome::GroupNotMarked => {
             // One of the other files was taken, or went away, since the checks.
             return Err(ApiError::Conflict(OTHER_BUSY.to_owned()).into());
@@ -3194,11 +3177,8 @@ async fn load_keys_of(
 /// # Errors
 ///
 /// 429 (`Retry-After: 5`) when the person who uploaded the file already has
-/// the configured number of loads running, or the installation has
-/// (`SEC-17`); 429 with the large-load sentence when the installation
-/// already runs the configured number of large loads and this one is large
-/// too (`DATA-37`); 400 for a body that is not valid (each field has its own
-/// sentence), for a
+/// the configured number of loads running, or the installation has (`SEC-17`);
+/// 400 for a body that is not valid (each field has its own sentence), for a
 /// workbook or Parquet file that cannot be read, a sheet a workbook does not
 /// have, a sheet or file over the cell limit, an empty sheet or a Parquet
 /// file with no rows, and for a header with more than 1,000 columns under the

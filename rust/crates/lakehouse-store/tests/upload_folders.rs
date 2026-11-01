@@ -458,7 +458,6 @@ async fn a_load_puts_every_file_in_the_folder_and_the_claim_remembers_it(
     let limits = LoadLimits {
         per_user: 10,
         total: 10,
-        large: 2,
     };
     let claim = |folder: ClaimFolder| LoadClaim {
         parse_options: &options,
@@ -531,7 +530,6 @@ async fn a_load_that_names_no_folder_takes_the_files_out_and_forgets_it(
     let limits = LoadLimits {
         per_user: 10,
         total: 10,
-        large: 2,
     };
     let claim = |folder: ClaimFolder| LoadClaim {
         parse_options: &options,

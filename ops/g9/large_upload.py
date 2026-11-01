@@ -47,19 +47,9 @@ is where its numbers are read; nothing here decides a limit.
    status.
    The API refuses a load above the limits of `SEC-17`
    (`UPLOAD_MAX_CONCURRENT_PER_USER`, four by default, and
-   `UPLOAD_MAX_CONCURRENT`, sixteen) and above the limit on large loads
-   (`DATA-37`: `UPLOAD_MAX_CONCURRENT_LARGE`, two by default): a refused load
-   is recorded as a result and not retried, so a run with more loads than the
-   limit allows says so instead of loading them one after another.
-   The files of this harness are large -- the CSV and the JSON Lines file are
-   2,048 MiB by default, over the 512 MiB of the threshold -- so a phase of
-   those with `--concurrent 3` or more has its third and later loads refused
-   with the large-load sentence ("This installation already runs the maximum
-   number of large loads."). That is the expected answer of the limit: the
-   refusal is recorded as a result, the run ends with a non-zero status, and
-   the limit is NOT raised to make the run pass. A phase whose file is under
-   the threshold (a Parquet file of 194 MiB by default) is not large and the
-   large limit does not refuse it.
+   `UPLOAD_MAX_CONCURRENT`, sixteen): a refused load is recorded as a result and
+   not retried, so a run with more loads than the limit allows says so instead of
+   loading them one after another.
 5. While it does all that, samples the memory of the containers named by
    `--containers` (`NAME=container` pairs, e.g. `api=g9large-lakehouse-api-1`,
    `dagster=g9large-dagster-code-location-1`) once a second, by
@@ -882,9 +872,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=1,
         help="how many loads of the same file run at once: the file goes through the chunked transport that many "
-        "times and every load starts together (1 is one load at a time). A file of this harness is often large, so "
-        "above two the third and later loads may be refused by the large-load limit (DATA-37, "
-        "UPLOAD_MAX_CONCURRENT_LARGE, two by default)",
+        "times and every load starts together (1 is one load at a time)",
     )
     parser.add_argument("--avro-mb", type=int, default=0, help="size of the Avro file in MiB (0 skips it)")
     parser.add_argument(

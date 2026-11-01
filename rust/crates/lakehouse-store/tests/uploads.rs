@@ -34,15 +34,15 @@ use std::borrow::Cow;
 use lakehouse_store::StoreError;
 use lakehouse_store::identity::{CreateTenantInput, create_tenant};
 use lakehouse_store::uploads::{
-    ClaimFolder, ClaimedTable, LimitOutcome, LoadClaim, LoadLimits, LoadMode, MarkOutcome,
-    NewReceiving, NewUpload, TableClaim, Upload, UploadPart, attach_run, claim_table, delete,
-    find_by_sha256, get, get_by_run_id, insert, list, list_claims, loads_under_limits,
-    mark_finished, mark_group_within_limits, mark_ingesting, mark_ingesting_within_limits,
-    table_being_loaded, table_claim, table_claimed, upload_in_tenants,
+    ClaimFolder, ClaimedTable, LoadClaim, LoadLimits, LoadMode, MarkOutcome, NewReceiving,
+    NewUpload, TableClaim, Upload, UploadPart, attach_run, claim_table, delete, find_by_sha256,
+    get, get_by_run_id, insert, list, list_claims, loads_under_limits, mark_finished,
+    mark_group_within_limits, mark_ingesting, mark_ingesting_within_limits, table_being_loaded,
+    table_claim, table_claimed, upload_in_tenants,
 };
 use lakehouse_store::uploads::{
-    LARGE_LOAD_BYTES, count_receiving, find_by_parts_digest, finish_receiving, insert_receiving,
-    list_parts, record_bad_values, record_part, stale_receiving,
+    count_receiving, find_by_parts_digest, finish_receiving, insert_receiving, list_parts,
+    record_bad_values, record_part, stale_receiving,
 };
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -1751,7 +1751,6 @@ async fn a_fifth_load_of_one_uploader_is_refused_and_another_uploader_passes(
     let limits = LoadLimits {
         per_user: 4,
         total: 16,
-        large: 2,
     };
     for n in 0..5 {
         add_by(&pool, &format!("up-mine-{n}"), tenant_a, "Ada").await;
@@ -1762,11 +1761,10 @@ async fn a_fifth_load_of_one_uploader_is_refused_and_another_uploader_passes(
         let outcome = start_limited(&pool, &format!("up-mine-{n}"), limits).await;
         assert!(matches!(outcome, MarkOutcome::Marked(_)), "load {n}");
     }
-    assert_eq!(
-        loads_under_limits(&pool, "up-mine-4", &[], limits)
+    assert!(
+        !loads_under_limits(&pool, "up-mine-4", limits)
             .await
-            .unwrap(),
-        LimitOutcome::LimitReached
+            .unwrap()
     );
     let fifth = start_limited(&pool, "up-mine-4", limits).await;
     assert!(matches!(fifth, MarkOutcome::LimitReached));
@@ -1776,11 +1774,10 @@ async fn a_fifth_load_of_one_uploader_is_refused_and_another_uploader_passes(
         "a refused load changes nothing"
     );
 
-    assert_eq!(
-        loads_under_limits(&pool, "up-theirs", &[], limits)
+    assert!(
+        loads_under_limits(&pool, "up-theirs", limits)
             .await
-            .unwrap(),
-        LimitOutcome::Under
+            .unwrap()
     );
     let other = start_limited(&pool, "up-theirs", limits).await;
     assert!(matches!(other, MarkOutcome::Marked(_)));
@@ -1794,7 +1791,6 @@ async fn the_seventeenth_load_in_total_is_refused(pool: PgPool) -> sqlx::Result<
     let limits = LoadLimits {
         per_user: 4,
         total: 16,
-        large: 2,
     };
     for n in 0..17 {
         add_by(
@@ -1821,7 +1817,6 @@ async fn a_load_that_ended_no_longer_counts(pool: PgPool) -> sqlx::Result<()> {
     let limits = LoadLimits {
         per_user: 1,
         total: 16,
-        large: 2,
     };
     add_by(&pool, "up-1", tenant_a, "Ada").await;
     add_by(&pool, "up-2", tenant_a, "Ada").await;
@@ -1851,7 +1846,6 @@ async fn marking_a_loading_or_unknown_upload_changes_no_row(pool: PgPool) -> sql
     let limits = LoadLimits {
         per_user: 4,
         total: 16,
-        large: 2,
     };
     add_by(&pool, "up-1", tenant_a, "Ada").await;
     assert!(matches!(
@@ -1880,7 +1874,6 @@ async fn loads_older_than_six_hours_do_not_count_against_the_limits(
     let limits = LoadLimits {
         per_user: 4,
         total: 16,
-        large: 2,
     };
     for n in 0..16 {
         let id = format!("up-old-{n}");
@@ -1891,12 +1884,7 @@ async fn loads_older_than_six_hours_do_not_count_against_the_limits(
         ));
     }
     add_by(&pool, "up-next", tenant_a, "Newcomer").await;
-    assert_eq!(
-        loads_under_limits(&pool, "up-next", &[], limits)
-            .await
-            .unwrap(),
-        LimitOutcome::LimitReached
-    );
+    assert!(!loads_under_limits(&pool, "up-next", limits).await.unwrap());
 
     // `updated_at` has no trigger (0057): a direct UPDATE sticks.
     sqlx::query(
@@ -1905,12 +1893,7 @@ async fn loads_older_than_six_hours_do_not_count_against_the_limits(
     .execute(&pool)
     .await
     .unwrap();
-    assert_eq!(
-        loads_under_limits(&pool, "up-next", &[], limits)
-            .await
-            .unwrap(),
-        LimitOutcome::Under
-    );
+    assert!(loads_under_limits(&pool, "up-next", limits).await.unwrap());
     assert!(matches!(
         start_limited(&pool, "up-next", limits).await,
         MarkOutcome::Marked(_)
@@ -1924,12 +1907,7 @@ async fn loads_older_than_six_hours_do_not_count_against_the_limits(
     .await
     .unwrap();
     add_by(&pool, "up-last", tenant_a, "Another").await;
-    assert_eq!(
-        loads_under_limits(&pool, "up-last", &[], limits)
-            .await
-            .unwrap(),
-        LimitOutcome::LimitReached
-    );
+    assert!(!loads_under_limits(&pool, "up-last", limits).await.unwrap());
     Ok(())
 }
 
@@ -2395,7 +2373,6 @@ async fn a_column_list_belongs_to_the_load_that_was_told_it_and_the_next_claim_c
     let limits = LoadLimits {
         per_user: 5,
         total: 5,
-        large: 2,
     };
 
     let MarkOutcome::Marked(loading) = mark_ingesting_within_limits(
@@ -2493,7 +2470,6 @@ async fn start_group(pool: &PgPool, id: &str, also: &[&str], table: &str) -> Mar
         LoadLimits {
             per_user: 5,
             total: 5,
-            large: 2,
         },
     )
     .await
@@ -2610,15 +2586,13 @@ async fn a_group_counts_as_one_load_against_the_limits(pool: PgPool) -> sqlx::Re
     let one = LoadLimits {
         per_user: 2,
         total: 2,
-        large: 2,
     };
     assert!(matches!(
         start_group_within(&pool, "up-1", &["up-2", "up-3"], "stock_raw", one).await,
         MarkOutcome::Marked(_)
     ));
-    assert_eq!(
-        loads_under_limits(&pool, "up-4", &[], one).await.unwrap(),
-        LimitOutcome::Under,
+    assert!(
+        loads_under_limits(&pool, "up-4", one).await.unwrap(),
         "three files are one load, not three"
     );
     assert!(matches!(
@@ -2631,9 +2605,8 @@ async fn a_group_counts_as_one_load_against_the_limits(pool: PgPool) -> sqlx::Re
     .fetch_one(&pool)
     .await?;
     assert_eq!(all, 2);
-    assert_eq!(
-        loads_under_limits(&pool, "up-4", &[], one).await.unwrap(),
-        LimitOutcome::LimitReached,
+    assert!(
+        !loads_under_limits(&pool, "up-4", one).await.unwrap(),
         "two loads are the limit"
     );
     Ok(())
@@ -2861,206 +2834,5 @@ async fn list_claims_counts_the_files_that_loaded_with_the_claiming_upload(
         counts(list_claims(&pool, Some(tenant_a)).await.unwrap()),
         vec![("solo_raw".to_owned(), 0), ("stock_raw".to_owned(), 2)]
     );
-    Ok(())
-}
-
-// ── DATA-37: the limit on large loads ─────────────────────────────────────
-
-/// An upload of `size_bytes`, recorded as uploaded by `uploaded_by`.
-async fn add_sized(
-    pool: &PgPool,
-    id: &str,
-    tenant_id: Uuid,
-    uploaded_by: &str,
-    size_bytes: i64,
-) -> Upload {
-    let key = format!("uploads/{tenant_id}/{id}.csv");
-    insert(
-        pool,
-        &NewUpload {
-            id,
-            original_filename: "stock.csv",
-            storage_key: &key,
-            content_type: "text/csv",
-            size_bytes,
-            sha256: "",
-            uploaded_by,
-            tenant_id,
-        },
-    )
-    .await
-    .unwrap()
-}
-
-/// The size of a file that is one byte over the threshold of a large load
-/// (`DATA-37` decision D1): the threshold itself is not a large load.
-fn over_the_threshold() -> i64 {
-    LARGE_LOAD_BYTES + 1
-}
-
-/// `DATA-37` decisions D2 and D3: two large loads run at once and the third
-/// is refused with the large limit's own answer, and the refused load
-/// changes nothing.
-#[sqlx::test(migrations = "../../migrations")]
-async fn a_third_large_load_is_refused_with_the_large_limit_and_changes_nothing(
-    pool: PgPool,
-) -> sqlx::Result<()> {
-    let tenant_a = tenant(&pool, "uploads-large-third").await;
-    let limits = LoadLimits {
-        per_user: 4,
-        total: 16,
-        large: 2,
-    };
-    for id in ["up-big-1", "up-big-2", "up-big-3"] {
-        add_sized(&pool, id, tenant_a, "Ada", over_the_threshold()).await;
-    }
-    for id in ["up-big-1", "up-big-2"] {
-        assert!(
-            matches!(
-                start_limited(&pool, id, limits).await,
-                MarkOutcome::Marked(_)
-            ),
-            "{id}"
-        );
-    }
-    assert_eq!(
-        loads_under_limits(&pool, "up-big-3", &[], limits)
-            .await
-            .unwrap(),
-        LimitOutcome::LargeLimitReached
-    );
-    let third = start_limited(&pool, "up-big-3", limits).await;
-    assert!(
-        matches!(&third, MarkOutcome::LargeLimitReached),
-        "{third:?}"
-    );
-    assert_eq!(
-        get(&pool, "up-big-3").await.unwrap().unwrap().status,
-        "uploaded",
-        "a refused load changes nothing"
-    );
-    Ok(())
-}
-
-/// `DATA-37` decision D3: a load that is not large never counts against the
-/// large limit and is never refused by it, whatever large loads run.
-#[sqlx::test(migrations = "../../migrations")]
-async fn a_small_load_is_not_refused_while_two_large_loads_run(pool: PgPool) -> sqlx::Result<()> {
-    let tenant_a = tenant(&pool, "uploads-large-small").await;
-    let limits = LoadLimits {
-        per_user: 4,
-        total: 16,
-        large: 2,
-    };
-    for id in ["up-big-1", "up-big-2"] {
-        add_sized(&pool, id, tenant_a, "Ada", over_the_threshold()).await;
-    }
-    add_sized(&pool, "up-small", tenant_a, "Ada", 1024).await;
-    for id in ["up-big-1", "up-big-2"] {
-        assert!(
-            matches!(
-                start_limited(&pool, id, limits).await,
-                MarkOutcome::Marked(_)
-            ),
-            "{id}"
-        );
-    }
-    assert_eq!(
-        loads_under_limits(&pool, "up-small", &[], limits)
-            .await
-            .unwrap(),
-        LimitOutcome::Under
-    );
-    assert!(matches!(
-        start_limited(&pool, "up-small", limits).await,
-        MarkOutcome::Marked(_)
-    ));
-    Ok(())
-}
-
-/// `DATA-37` decision D1: the size of a load is the primary's own plus that
-/// of the files it carries, so two files under the threshold are a large load
-/// together. Each group is one large load, not two.
-#[sqlx::test(migrations = "../../migrations")]
-async fn a_load_of_several_files_is_large_by_its_total(pool: PgPool) -> sqlx::Result<()> {
-    let tenant_a = tenant(&pool, "uploads-large-group").await;
-    let limits = LoadLimits {
-        per_user: 4,
-        total: 16,
-        large: 2,
-    };
-    let half = LARGE_LOAD_BYTES / 2 + 1;
-    for id in ["up-1", "up-2", "up-3", "up-4", "up-5", "up-6"] {
-        add_sized(&pool, id, tenant_a, "Ada", half).await;
-    }
-    // Two groups of two files: each is one large load.
-    for (primary, other) in [("up-1", "up-2"), ("up-3", "up-4")] {
-        assert!(
-            matches!(
-                start_group_within(&pool, primary, &[other], "large_raw", limits).await,
-                MarkOutcome::Marked(_)
-            ),
-            "{primary}"
-        );
-    }
-    // A single file is not large, so it starts even now.
-    assert!(matches!(
-        start_limited(&pool, "up-5", limits).await,
-        MarkOutcome::Marked(_)
-    ));
-    // A third group is large by its total and is refused.
-    let refused = start_group_within(&pool, "up-6", &["up-1"], "other_raw", limits).await;
-    assert!(
-        matches!(&refused, MarkOutcome::LargeLimitReached),
-        "{refused:?}"
-    );
-    Ok(())
-}
-
-/// `DATA-37`: the large loads are counted in the same window as the other
-/// loads, so a load that has been running for more than six hours does not
-/// keep a large place taken.
-#[sqlx::test(migrations = "../../migrations")]
-async fn a_large_load_older_than_the_window_does_not_count(pool: PgPool) -> sqlx::Result<()> {
-    let tenant_a = tenant(&pool, "uploads-large-stale").await;
-    let limits = LoadLimits {
-        per_user: 4,
-        total: 16,
-        large: 2,
-    };
-    for id in ["up-big-1", "up-big-2", "up-big-3"] {
-        add_sized(&pool, id, tenant_a, "Ada", over_the_threshold()).await;
-    }
-    for id in ["up-big-1", "up-big-2"] {
-        assert!(
-            matches!(
-                start_limited(&pool, id, limits).await,
-                MarkOutcome::Marked(_)
-            ),
-            "{id}"
-        );
-    }
-    assert!(matches!(
-        start_limited(&pool, "up-big-3", limits).await,
-        MarkOutcome::LargeLimitReached
-    ));
-
-    // `updated_at` has no trigger (0057): a direct UPDATE sticks.
-    sqlx::query(
-        "UPDATE file_upload SET updated_at = now() - interval '7 hours' WHERE id = 'up-big-1'",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
-    assert_eq!(
-        loads_under_limits(&pool, "up-big-3", &[], limits)
-            .await
-            .unwrap(),
-        LimitOutcome::Under
-    );
-    assert!(matches!(
-        start_limited(&pool, "up-big-3", limits).await,
-        MarkOutcome::Marked(_)
-    ));
     Ok(())
 }
