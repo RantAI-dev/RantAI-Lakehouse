@@ -19,10 +19,14 @@ still reads together. The Delta job streams (`RecordBatchReader`); the Iceberg o
 `write_iceberg_table` that `dlt` calls (looked up at call time) is replaced by one that
 writes a `_Streamed` as ONE `pyiceberg` transaction, in groups of up to `FLUSH_BYTES` read
 from the files in batches. Anything that is not a marker, and every `merge` load, goes the way
-`dlt` went. The result is the table `dlt` made: the first group of a `replace` overwrites
-what the table held and later groups add to it, inside one commit, so a load that fails part
-way commits nothing (its data files stay in the bucket, unreferenced, for `maintenance.py`'s
-orphan clean-up, as with `sink._replace_changing_types`).
+`dlt` went. The result is the table `dlt` made: a `replace` overwrites what the table held
+and the groups add to it, inside ONE commit, so a load that fails part way commits nothing
+(its data files stay in the bucket, unreferenced, for `maintenance.py`'s orphan clean-up,
+as with `sink._replace_changing_types`).
+
+`DATA-36`: that one commit is ONE snapshot, not one per group (`adapters/iceberg_snapshot.py`).
+The groups used to be committed one by one, so a load of N groups left N snapshots behind and
+the time-travel picker offered the half-loaded table to whoever picked one of them.
 
 `install()` is idempotent and is called by `sink.py` before a pipeline is built. If a `dlt`
 upgrade changes the job, the marker is not produced, the load goes back to the old path, and
@@ -47,6 +51,8 @@ from typing import Any
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+
+from dispar_orchestrate.adapters import iceberg_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -156,7 +162,6 @@ def _write(table: Any, data: Any, write_disposition: str, original: Any) -> None
     )
 
     schema = unified_schema(data.dataset)
-    first = True
     with table.transaction() as transaction:
         # The table must carry every column the load writes: the files of one load do not
         # all have the same columns (`PR #186 review SHOULD-FIX 2`), and the unified schema
@@ -170,20 +175,18 @@ def _write(table: Any, data: Any, write_disposition: str, original: Any) -> None
         if missing.names:
             with transaction.update_schema() as update:
                 update.union_by_name(ensure_iceberg_compatible_arrow_schema(missing))
-        for group in groups(data.dataset, schema):
-            fitted = ensure_iceberg_compatible_arrow_data(group)
-            if write_disposition == "replace" and first:
-                transaction.overwrite(fitted)
-            else:
-                transaction.append(fitted)
-            first = False
-        if first:
-            # No row at all. `dlt` wrote the empty table anyway, and that is a commit that
-            # callers rely on: it is the snapshot that carries a schema the load just evolved
-            # (`history.ensure_columns` adds a column with a zero-row load, and a scan reads the
-            # schema of the table's CURRENT SNAPSHOT, so without it the column is not seen).
-            empty = ensure_iceberg_compatible_arrow_data(schema.empty_table())
-            (transaction.overwrite if write_disposition == "replace" else transaction.append)(empty)
+        # `DATA-36`: the groups are written into ONE snapshot producer, so the load leaves
+        # ONE snapshot and no half-loaded state of the table can be read (the time-travel
+        # picker lists every snapshot). A load of no rows at all commits that one empty
+        # snapshot too: it is the snapshot that carries a schema the load just evolved
+        # (`history.ensure_columns` adds a column with a zero-row load, and a scan reads the
+        # schema of the table's CURRENT SNAPSHOT, so without it the column is not seen).
+        iceberg_snapshot.write_one_snapshot(
+            table,
+            transaction,
+            (ensure_iceberg_compatible_arrow_data(group) for group in groups(data.dataset, schema)),
+            replace=write_disposition == "replace",
+        )
 
 
 _installed = False
