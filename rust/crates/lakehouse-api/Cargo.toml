@@ -139,7 +139,7 @@ arrow-schema = "58"
 # `lakehouse-iceberg` already uses (so the lockfile gains no crate and no
 # licence); declared here because the upload's reader is the API's own, not
 # routed through the Iceberg crate.
-parquet = "58"
+parquet = "59"
 # `DATA-17` slice 4 (plan AD8): the preview reads the Avro, gzip and zip files an upload may
 # be (`upload_formats`). All three are already in `Cargo.lock` through other crates, at
 # the versions below and with the features the build already unifies, so the lockfile
