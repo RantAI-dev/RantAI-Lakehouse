@@ -84,97 +84,27 @@ secondary registry is filled only by an older bootstrap or by hand.
 
 ## 4. Handoff (developer appends below)
 
-### Handoff (developer, 2026-11-01)
-
-**Commits** — branch `fix/data-40-one-name-one-dataset`, base `60527153` (the plan commit):
-
-- `0005ab8f` `fix(bronze-catalog): one slug names one dataset, on the write side (DATA-40 T1)` — T1, D2.
-- `4cc2517b` `fix(catalog): one slug names one dataset, on the read side (DATA-40 T2)` — T2, D3/D4/D5.
-- this commit — T3, the D6 list below (no code).
-
-**Where the change sits**
-
-- T1 (D2): `dagster/dispar_orchestrate/bronze_catalog.py:63` (`SlugConflictError`), `:302`
-  (`_assert_slug_is_free`), `:365` (the call, after the R10 schema bootstrap and before the
-  first insert); tests in `dagster/dispar_orchestrate/test_bronze_catalog.py:174`, `:193`, `:212`.
-- T2 (D3): `rust/crates/lakehouse-api/src/routes/catalog.rs:502` (`NOT_IN_PRIMARY`), the
-  list's catalog/sync/column-count reads at `:555`/`:565`/`:577`, the search copy's column
-  index at `:847`, the detail page's header read at `:2418` and column read at `:2441`,
-  `registered_slug` at `:2715`.
-- T2 (D4): `FINAL` on the list's catalog and sync reads (`:555`, `:565`) and on the
-  secondary branch of every union through `NOT_IN_PRIMARY`.
-- T2 (D5): `CLASH_SQL` at `:511` and the one `tracing::warn!` at `:589` — the number of
-  slugs both registries hold and the first few of them; nothing is added to the response.
-- T2 (tests): `rust/crates/lakehouse-api/src/routes/catalog.rs:7050` (`mod registry_clash`),
-  plus the fake engine's `table_read` at `:6870`.
-
-**Commands run** (every cargo command through `/home/shiro/rantai/bin/cargo-locked`, from
-`rust/`, with the shared `CARGO_TARGET_DIR`; the Python run from `dagster/`):
-
-| command | result |
-| --- | --- |
-| `python -m pytest dispar_orchestrate -q -k bronze_catalog` | **10 passed**, 2393 deselected (7 pre-existing + the 3 new) |
-| `python3 ops/lint/check_intra_package_imports.py` | `OK: all intra-package dispar_orchestrate imports resolve` (exit 0) |
-| `python3 ops/lint/check_bare_iceberg_count.py` | `R11 guard: no bare count() against a Bronze Iceberg table found.` (exit 0) |
-| `cargo fmt --check` | exit 0, no output |
-| `cargo clippy -p lakehouse-api --all-targets -- -D warnings` | finished, no warnings |
-| `cargo test -p lakehouse-api catalog` | **568 passed, 0 failed** |
-
-The 568 are: the crate's lib test binary 274, its bin test binary 276, and the integration
-binaries the filter matches 18 (`ai_sql_help` 2, `catalog_grants` 1, `gold_export_auth` 3,
-`iceberg_door` 2, `query_tenant_scope` 4, `route_auth` 5, `semantic_api` 1).
-
-**The new tests fail without the fix** (measured, not assumed): with the production change
-reverted, all four fail — the list shows the clashing slug twice, the detail page counts 5
-columns (both registries) instead of 2, `registered_slug` answers the secondary's row, and
-the twice-written slug is listed twice. The tests run against a REAL `ClickHouse` 26.8 in a
-`testcontainers` container, one container per TEST (a local, so it is dropped — and
-removed — when the test ends; a container in a `static` is never dropped, because the test
-harness exits the process). `docker ps` after the run: no container left behind.
-
-**D6 — the other readers that union the two registries** (all untouched; `routes/ai/*` is
-the AI team's and is not listed, per D6). "A clash" below means one slug in both registries:
-
-| reader | file:line | does a clash change what it shows? |
-| --- | --- | --- |
-| `sql_rewrite` (not a read) | `rust/crates/lakehouse-api/src/sql_rewrite.rs:5746` | **No.** The string is a constant in `CLICKHOUSE_SHAPES` — a SQL *shape* the table substitution must accept (copied from the AI team's catalog view). Nothing is executed and nothing is counted. |
-| `governance::classification` | `rust/crates/lakehouse-api/src/routes/governance.rs:437` | **Yes.** The classification list gets two rows with the same id `c-<slug>` (the primary's and the secondary's title/tier), and the duplicate takes one of the 500 `LIMIT` slots. |
-| `overview` (assets, stale) | `rust/crates/lakehouse-api/src/routes/overview.rs:67` and `:69` | **Yes.** The slug is counted twice in `assets`, and the joined sync row twice in `stale`. |
-| `overview` (warm assets) | `rust/crates/lakehouse-api/src/routes/overview.rs:85` | **Yes.** The clashing dataset's `total` is counted twice. |
-| `catalog_governance::use_by_asset` | `rust/crates/lakehouse-api/src/routes/catalog_governance.rs:616` | **No, for the slug.** Both rows map to the same slug, so the slug shown is the same; what changes is that the secondary's table name becomes a second key pointing at it. |
-| `storage` (warm rows, assets) | `rust/crates/lakehouse-api/src/routes/storage.rs:80` | **Yes.** The clashing dataset's row count is summed twice and the asset count is one too high. |
-| `catalog_profile::bronze_table_name` | `rust/crates/lakehouse-api/src/routes/catalog_profile.rs:280` | **Not today.** The primary's row comes first in the union, so the primary's table name is the answer — but nothing pins it (`LIMIT 1`, no order). The same rule is now pinned for `registered_slug` in `routes/catalog.rs`. |
-| `lineage` (publishers) | `rust/crates/lakehouse-api/src/routes/lineage.rs:250` | **Yes.** One publisher edge per registry, so two publishers for one dataset when the two registries name different authors. |
-
-**Not verified, with the reason**
-
-- The full workspace run (`cargo clippy --workspace --all-targets --all-features -- -D
-  warnings`, `cargo test --workspace`) was **not** run: this machine's rule scopes cargo to
-  `lakehouse-api`, and CI runs the workspace.
-- `bun run typecheck && bun run lint && bun run test` and `docker compose --profile '*'
-  config --quiet` were **not** run: this change touches no TypeScript and no compose file.
-- The whole-directory Python suite (`python -m pytest dispar_orchestrate -q`, without
-  `-k`) was **not** run: the venv this worktree used
-  (`/home/shiro/rantai/venv-pr186/bin/python`) runs it, but the shared
-  `~/.cache/rantai-dagster-venv` has no `fastavro`, so seven test modules fail at
-  collection there — a pre-existing gap in that venv, not a change of this branch. Only the
-  `-k bronze_catalog` selection and the two lints above were run for the Python side.
-- The detail page's **header** read still has no `FINAL`: a slug the PRIMARY registry holds
-  twice (a re-run before `ClickHouse` merges the parts) can still give two header rows
-  there, and `LIMIT 1` picks one. D4 scoped `FINAL` to "the list's catalog and sync reads",
-  so I did not add it to the detail read — the planner decides.
-- `registered_slug` now answers "not registered" for the SECONDARY registry's table name of
-  a clashing slug (D3's rule: the primary wins, so the secondary's row is not read).
-  `routes/uploads` asks this function whether a table name is taken, so a name the
-  secondary registry holds for a clashing slug reads as free. That is what D3 prescribes;
-  the planner decides whether the follow-up should say so.
-- The clash read (D5) is one more query per list build. It runs inside the same
-  `tokio::try_join!` as the three registry reads, so it costs no extra round trip, and it
-  does not run at all when no list is built.
-- The seeded deployment has no clash: `scripts/seed-clickhouse.sql`'s slugs are disjoint
-  across the two registries (`wisman-bulanan`, `kunjungan-dtw`, `event-pariwisata`,
-  `gci-readiness` in the primary; `usaha-kuliner`, `atlas-poi` in the secondary), so D5's
-  warning stays quiet there. Not run against a seeded stack — only the statements were
-  checked against a real `ClickHouse` 26.8.
-
 ## 5. Review (planner appends below)
+
+### Review round 1 (planner, 2026-11-01, at `0799551b`)
+
+- **T1 matches D2.** The guard reads `bronze_meta_sec.dataset_catalog` with `FINAL`, binds the
+  slug through `_sql_string_literal`, raises `SlugConflictError` before any insert, and is tested
+  without a network.
+- **T2 matches D3–D5.**
+  - Every secondary branch in `routes/catalog.rs` is filtered by `NOT_IN_PRIMARY`.
+  - The list's catalog and sync reads take `FINAL`.
+  - The clash warning is one `INTERSECT` query, run with the other three by `try_join!`, and
+    it logs a count and at most five slugs.
+  - The four new tests ran against the old code and failed there.
+- **D6 list.** Four other readers do change what they show on a clash: `governance`
+  classification, `overview`, `storage` and `lineage`. That becomes a follow-up backlog item,
+  `DATA-42`.
+- **SHOULD-FIX 1. The detail page's header read has no `FINAL`.** `bronze_asset_detail_body`
+  reads `dataset_sync` LEFT JOIN `dataset_catalog` with `LIMIT 1` and no order. A re-run writes
+  the slug's sync row again, so before `ClickHouse` merges, the page can show the older
+  `total`. D4 named only the list's reads, which was the planner's miss. *Fix:* `FINAL` on both
+  tables of both branches of that read, with a test of a twice-written slug's detail header
+  showing the newer total.
+
+**Open: SHOULD-FIX 1.**
