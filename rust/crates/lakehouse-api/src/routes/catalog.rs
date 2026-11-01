@@ -523,10 +523,17 @@ async fn list_body(
             None,
         )
         .await?;
+    // `DATA-24 T2` (D2): `FINAL`, for the reason the asset-detail query
+    // gives (`bronze_asset_detail_body`): the registry is a
+    // `ReplacingMergeTree ORDER BY (slug, key_asli)` that every run of a
+    // connector writes again (`register_bronze_table`), and `ClickHouse`
+    // merges the copies only in the background. Without it a column a
+    // second run registered was counted twice, and `columnCount` said twice
+    // the columns the table has.
     let col_rows = ch
         .rows(
-            "SELECT slug, toString(count()) n FROM lake.`bronze_meta.dataset_column` GROUP BY slug
-       UNION ALL SELECT slug, toString(count()) n FROM lake.`bronze_meta_sec.dataset_column` GROUP BY slug",
+            "SELECT slug, toString(count()) n FROM lake.`bronze_meta.dataset_column` FINAL GROUP BY slug
+       UNION ALL SELECT slug, toString(count()) n FROM lake.`bronze_meta_sec.dataset_column` FINAL GROUP BY slug",
             None,
         )
         .await?;
@@ -746,11 +753,19 @@ async fn search_column_index(
     ch: &ChClient,
 ) -> Result<(crate::routes::catalog_search::ColumnIndex, bool), ChError> {
     // `SEARCH_COLUMN_ROWS_MAX` is a constant integer, not caller input.
+    //
+    // `DATA-24 T2` (D2): `FINAL`, for the reason the asset-detail query
+    // gives (`bronze_asset_detail_body`): the registry is a
+    // `ReplacingMergeTree ORDER BY (slug, key_asli)` that every run of a
+    // connector writes again (`register_bronze_table`), and `ClickHouse`
+    // merges the copies only in the background. Without it a column a
+    // second run registered was in the index twice, and every search that
+    // matched its name matched it twice.
     let bronze_sql = format!(
         "SELECT slug, key_asli, deskripsi FROM (
-           SELECT slug, key_asli, deskripsi FROM lake.`bronze_meta.dataset_column`
+           SELECT slug, key_asli, deskripsi FROM lake.`bronze_meta.dataset_column` FINAL
            UNION ALL
-           SELECT slug, key_asli, deskripsi FROM lake.`bronze_meta_sec.dataset_column`
+           SELECT slug, key_asli, deskripsi FROM lake.`bronze_meta_sec.dataset_column` FINAL
          ) LIMIT {SEARCH_COLUMN_ROWS_MAX}"
     );
     let system_sql = format!(
@@ -6640,6 +6655,233 @@ mod tests {
             mark_inactive_columns(&state, "orders_raw", &mut schema).await;
 
             assert!(schema.iter().all(|c| c["inactiveSince"].is_null()));
+        }
+    }
+
+    // ── DATA-24 T2 (D2): the Bronze column registry is read with `FINAL`.
+    //
+    // The registry is a `ReplacingMergeTree ORDER BY (slug, key_asli)` that
+    // every run of a connector writes again, so the engine holds one copy
+    // of a column per run until it merges the parts in the background. The
+    // two reads below (`search_column_index`'s index and `list_body`'s
+    // per-slug count) must ask for the merged copy.
+    //
+    // The fake below is the engine for those two reads only: it holds the
+    // registry as two runs of a connector left it, and it answers the way
+    // `ClickHouse` answers — every copy when the read does not ask for the
+    // merged one, one row per `ORDER BY` key when it does. So a read that
+    // dropped `FINAL` sees the copies and the assertions below fail.
+    mod registry_final {
+        #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+        use super::*;
+        use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+        /// The registry as two runs of a connector left it: `bronze_meta`
+        /// holds the slug `orders`, whose column `total` the second run
+        /// registered again, and `bronze_meta_sec` holds the slug
+        /// `returns`. The rows are `(registry, slug, column, description)`.
+        const REGISTRY_ROWS: [(&str, &str, &str, &str); 4] = [
+            ("bronze_meta", "orders", "total", "Order total"),
+            ("bronze_meta", "orders", "buyer", "The buyer"),
+            ("bronze_meta", "orders", "total", "Order total"),
+            ("bronze_meta_sec", "returns", "total", "Return total"),
+        ];
+
+        /// The two registries the reads name.
+        const REGISTRIES: [&str; 2] = ["bronze_meta", "bronze_meta_sec"];
+
+        /// A `ClickHouse` answer in the `FORMAT JSON` shape the client
+        /// parses.
+        fn answer(meta: &[(&str, &str)], data: &[Value]) -> ResponseTemplate {
+            let rows = data.len();
+            let meta: Vec<Value> = meta
+                .iter()
+                .map(|(name, ty)| json!({"name": name, "type": ty}))
+                .collect();
+            ResponseTemplate::new(200).set_body_json(json!({
+                "meta": meta,
+                "data": data,
+                "rows": rows,
+            }))
+        }
+
+        /// The rows the engine returns for one registry: every copy when
+        /// the read does not ask for the merged copy, one row per
+        /// `(slug, key_asli)` — the last one written — when it does.
+        fn registry_rows(registry: &str, merged: bool) -> Vec<Value> {
+            let rows: Vec<Value> = REGISTRY_ROWS
+                .iter()
+                .filter(|(r, ..)| *r == registry)
+                .map(|(_, slug, key, description)| {
+                    json!({"slug": slug, "key_asli": key, "deskripsi": description})
+                })
+                .collect();
+            if !merged {
+                return rows;
+            }
+            let mut seen: HashSet<(String, String)> = HashSet::new();
+            rows.into_iter()
+                .filter(|row| {
+                    seen.insert((
+                        row["slug"].as_str().unwrap_or_default().to_owned(),
+                        row["key_asli"].as_str().unwrap_or_default().to_owned(),
+                    ))
+                })
+                .collect()
+        }
+
+        /// The per-slug counts the engine returns for one registry.
+        fn registry_counts(registry: &str, merged: bool) -> Vec<Value> {
+            let mut counts: Vec<(String, usize)> = Vec::new();
+            for row in registry_rows(registry, merged) {
+                let slug = row["slug"].as_str().unwrap_or_default().to_owned();
+                match counts.iter_mut().find(|(s, _)| *s == slug) {
+                    Some((_, n)) => *n += 1,
+                    None => counts.push((slug, 1)),
+                }
+            }
+            counts
+                .into_iter()
+                .map(|(slug, n)| json!({"slug": slug, "n": n.to_string()}))
+                .collect()
+        }
+
+        /// The engine the two reads talk to.
+        struct RegistryEngine;
+
+        impl Respond for RegistryEngine {
+            fn respond(&self, request: &Request) -> ResponseTemplate {
+                let sql = String::from_utf8_lossy(&request.body).into_owned();
+                // `FINAL` is the merged copy; without it the engine answers
+                // with the copies the runs wrote.
+                let merged = sql.contains("FINAL");
+                if sql.contains("dataset_catalog") {
+                    return answer(
+                        &[
+                            ("slug", "String"),
+                            ("title", "String"),
+                            ("description", "String"),
+                            ("tier", "String"),
+                            ("updated_at", "String"),
+                            ("table_name", "String"),
+                            ("lag", "String"),
+                        ],
+                        &[
+                            json!({
+                                "slug": "orders", "title": "Orders",
+                                "description": "The orders", "tier": "primer",
+                                "updated_at": "2026-10-01T00:00:00Z",
+                                "table_name": "orders", "lag": "0",
+                            }),
+                            json!({
+                                "slug": "returns", "title": "Returns",
+                                "description": "The returns", "tier": "sekunder",
+                                "updated_at": "2026-10-01T00:00:00Z",
+                                "table_name": "returns", "lag": "0",
+                            }),
+                        ],
+                    );
+                }
+                if sql.contains("dataset_sync") {
+                    return answer(
+                        &[
+                            ("slug", "String"),
+                            ("total", "String"),
+                            ("author", "String"),
+                            ("frekuensi", "String"),
+                        ],
+                        &[
+                            json!({
+                                "slug": "orders", "total": "10",
+                                "author": "team", "frekuensi": "daily",
+                            }),
+                            json!({
+                                "slug": "returns", "total": "5",
+                                "author": "team", "frekuensi": "daily",
+                            }),
+                        ],
+                    );
+                }
+                if sql.contains("dataset_column") {
+                    // The two shapes the reads ask for: the rows of the
+                    // index, and the count per slug.
+                    let aggregate = sql.contains("count()");
+                    let mut data = Vec::new();
+                    for registry in REGISTRIES {
+                        if !sql.contains(&format!("lake.`{registry}.dataset_column`")) {
+                            continue;
+                        }
+                        if aggregate {
+                            data.extend(registry_counts(registry, merged));
+                        } else {
+                            data.extend(registry_rows(registry, merged));
+                        }
+                    }
+                    let meta: &[(&str, &str)] = if aggregate {
+                        &[("slug", "String"), ("n", "String")]
+                    } else {
+                        &[
+                            ("slug", "String"),
+                            ("key_asli", "String"),
+                            ("deskripsi", "String"),
+                        ]
+                    };
+                    return answer(meta, &data);
+                }
+                // `system.tables`, `system.columns` and `system.parts`: this
+                // fixture has no Silver and no Gold table.
+                answer(&[], &[])
+            }
+        }
+
+        async fn engine() -> MockServer {
+            let server = MockServer::start().await;
+            Mock::given(wiremock::matchers::method("POST"))
+                .respond_with(RegistryEngine)
+                .mount(&server)
+                .await;
+            server
+        }
+
+        fn client(server: &MockServer) -> ChClient {
+            ChClient::new(server.uri(), "default".to_owned(), String::new())
+        }
+
+        /// The search copy's column index holds the column a second run
+        /// registered once, not once per run.
+        #[tokio::test]
+        async fn the_search_column_index_counts_a_re_registered_column_once() {
+            let server = engine().await;
+            let (index, partial) = search_column_index(&client(&server)).await.unwrap();
+            assert!(!partial, "the fixture is far below the row limit");
+
+            let orders = index.get("orders").expect("the Bronze slug is indexed");
+            assert_eq!(
+                orders.iter().filter(|(name, _)| name == "total").count(),
+                1,
+                "the column a second run registered is one column: {orders:?}"
+            );
+            assert_eq!(orders.len(), 2, "the two columns of the table: {orders:?}");
+        }
+
+        /// The list's `columnCount` is the number of columns the table has,
+        /// not the number of copies the runs wrote.
+        #[tokio::test]
+        async fn the_column_count_of_a_slug_is_not_inflated_by_a_second_run() {
+            let server = engine().await;
+            let (body, _) = list_body(&client(&server), false).await.unwrap();
+
+            let assets = body["assets"].as_array().expect("the list has assets");
+            let orders = assets
+                .iter()
+                .find(|asset| asset["id"] == json!("orders"))
+                .expect("the Bronze slug is listed");
+            assert_eq!(
+                orders["columnCount"],
+                json!(2),
+                "two columns, not one per run: {orders:?}"
+            );
         }
     }
 }
