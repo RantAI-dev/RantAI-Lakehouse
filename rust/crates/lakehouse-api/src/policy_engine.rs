@@ -179,6 +179,9 @@ pub fn refusal_message(err: &sql_rewrite::RewriteError) -> &'static str {
         sql_rewrite::RewriteError::ViewOverGovernedTable { .. } => {
             "Query membaca view yang menyingkap tabel yang diatur kebijakan; tidak didukung."
         }
+        sql_rewrite::RewriteError::InvalidPastVersion => {
+            "Versi lampau dipilih dengan id versinya, bukan dengan timestamp."
+        }
     }
 }
 
@@ -230,6 +233,12 @@ pub fn enforcement_error_message(err: &EnforcementError) -> &'static str {
 /// by constructing two separate `&dyn Dialect` locals, one on each side
 /// of the `.await`, before this shared function existed).
 ///
+/// `engine` says which engine's SQL the rewrite is written in
+/// (`DATA-21` D1): the same obligations, the engine's own identifiers and
+/// functions. Every `ClickHouse` caller passes
+/// [`sql_rewrite::Engine::ClickHouse`] and gets the text it got before
+/// the argument existed.
+///
 /// # Errors
 /// [`EnforcementError::Engine`] if obligations cannot be resolved;
 /// [`EnforcementError::Rewrite`] if `sql` fails classification or
@@ -237,6 +246,7 @@ pub fn enforcement_error_message(err: &EnforcementError) -> &'static str {
 pub async fn rewrite_sql_for_roles<D: Dialect + Sync>(
     sql: &str,
     dialect: &D,
+    engine: sql_rewrite::Engine,
     roles: &[String],
     placeholders: &sql_rewrite::PlaceholderValues,
     obligations_source: &PolicyEngineObligations<'_>,
@@ -249,6 +259,7 @@ pub async fn rewrite_sql_for_roles<D: Dialect + Sync>(
     Ok(sql_rewrite::enforce(
         sql,
         dialect,
+        engine,
         roles,
         placeholders,
         &obligations,
@@ -923,6 +934,7 @@ mod tests {
             let sql = rewrite_sql_for_roles(
                 "SELECT * FROM icecat_api.`bronze.orders`",
                 &sqlparser::dialect::ClickHouseDialect {},
+                sql_rewrite::Engine::ClickHouse,
                 &["Analyst".to_owned()],
                 &sql_rewrite::PlaceholderValues::none(),
                 &source,
