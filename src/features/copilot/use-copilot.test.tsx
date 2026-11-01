@@ -297,6 +297,36 @@ describe("the Copilot goes on after the draft is confirmed (AI-15)", () => {
     );
   });
 
+  it("names a draft saved through the chart builder as well", async () => {
+    extraDraft = {
+      tool: "create_chart",
+      args: { title: "Visitors", kind: "bar" },
+      summary: "Creates the chart Visitors.",
+    };
+    toolResults = {
+      create_chart: { outcome: "ok", result: { created: true, id: "c1", title: "Visitors" } },
+    };
+    renderCopilot();
+
+    await act(async () => {
+      await copilot!.send("Build me a dashboard about events.");
+    });
+    // The chart was saved through the chart builder, so no Confirm ran for
+    // it; the board still waits for its own Confirm.
+    await act(async () => {
+      copilot!.completeToolStep(1, 1, { created: true, id: "c1", title: "Visitors" });
+    });
+
+    await act(async () => {
+      await copilot!.confirmTool(1, 0);
+    });
+
+    expect(chatRequests.length).toBe(2);
+    expect(sentMessages(1).at(-1)?.content).toBe(
+      'Confirmed and saved: create_board b1 "Overview"; create_chart c1 "Visitors". Do not draft these again. Continue: add two charts',
+    );
+  });
+
   it("leaves out the id and the title the result does not carry", async () => {
     toolResult = { outcome: "ok", result: { created: true } };
     renderCopilot();
