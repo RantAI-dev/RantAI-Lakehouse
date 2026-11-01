@@ -127,8 +127,12 @@ pub(crate) async fn rewrite_sql_for_principal_with_headers(
 /// `sql_rewrite`'s own `generic_dialect_parses_a_representative_trino_shape`
 /// test); every other engine value (including the `"clickhouse"` default)
 /// uses `ClickHouseDialect`, matching `run`'s own engine dispatch.
+///
+/// The ONE place that decides which engine a request names — the same
+/// decision `sql_rewrite::Engine::from_name` makes, so the rewrite and the
+/// dispatch can never disagree about the engine (`DATA-21` D1).
 fn is_trino_engine(engine: &str) -> bool {
-    engine == "trino"
+    crate::sql_rewrite::Engine::from_name(engine) == crate::sql_rewrite::Engine::Trino
 }
 
 async fn rewrite_sql_for_principal_inner(
@@ -178,6 +182,7 @@ async fn rewrite_sql_for_principal_inner(
         crate::policy_engine::rewrite_sql_for_roles(
             sql,
             &sqlparser::dialect::GenericDialect {},
+            crate::sql_rewrite::Engine::Trino,
             &principal.role_names,
             &placeholders,
             &obligations_source,
@@ -187,6 +192,7 @@ async fn rewrite_sql_for_principal_inner(
         crate::policy_engine::rewrite_sql_for_roles(
             sql,
             &sqlparser::dialect::ClickHouseDialect {},
+            crate::sql_rewrite::Engine::ClickHouse,
             &principal.role_names,
             &placeholders,
             &obligations_source,
