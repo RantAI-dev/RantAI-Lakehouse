@@ -179,3 +179,39 @@ this slice's favour of the plan's intent; each is a reviewer's call):
    asked again in `DATA-21`'s own acceptance.
 
 ## 6. Review (planner appends below)
+
+### Review S1 round 1 (planner, 2026-11-01, at `2a374c09`)
+
+- **D1.**
+  - The engine argument runs from `query.rs` down to `build_masked_filtered_select`.
+  - On Trino a masked column is `CASE WHEN "c" IS NULL THEN NULL ELSE '***' END AS "c"`.
+  - Identifiers pass through `lakehouse_core::ident::Ident::new` before they are quoted, so no
+    column name can carry a quote into the SQL.
+  - In row filters, `toString` and `toDate` become `CAST`, and any other function is refused
+    with its name.
+  - The ClickHouse output is unchanged, and its existing string tests still pass.
+- **D2 and D3.**
+  - `TrinoDialect` reads table versions.
+  - `FOR VERSION AS OF <integer>` is normalised before the policy gate and restored after the
+    rewrite.
+  - The version stays on the derived `FROM`. A table that has both a version and an alias becomes
+    a derived table, because sqlparser prints the version after the alias. That is a correct
+    deviation, and the handoff says why.
+- **D4.** The refusal now covers only `FOR TIMESTAMP AS OF`. The history test now records a
+  Trino past version as `completed`.
+- **D5.** The console pins the Trino form, and the picker is offered on Trino. The feature page is
+  updated.
+- **D6.** A masked table at a past version keeps both the mask and the version, and the unit
+  tests cover it.
+- **The seven deviations** are listed in the handoff, and all are accepted.
+- **The developer's counts:**
+  - `sql_rewrite`: 144;
+  - `query`: 513;
+  - `query_history`: 16;
+  - console: 1244.
+- **`bun run lint` failed on bluefin only because of a local `dagster/.venv`** (bundled JS
+  files). There are 0 errors in `src/`. That is not a finding, but remove that venv when the
+  checkout is next free.
+
+**Open: no BLOCKER, no SHOULD-FIX for S1.** S2 (Trino in the G8 gates) follows on this branch,
+after this PR merges.
