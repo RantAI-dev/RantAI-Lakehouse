@@ -358,3 +358,31 @@ after this PR merges.
 - **The open question:** no matrix leg has run on GitHub yet. This PR's CI is that proof.
 
 **Open: no BLOCKER, no SHOULD-FIX.** The PR opens once #309 merges and `main` is merged in.
+
+### Review S2 round 2 (planner, 2026-11-01): the PR's CI
+
+- **The first CI run passed all four G8 legs.** That run (on base `2ca345e1`) had
+  `Rust · G8 governance masking (trino)` and `Rust · G8 time travel keeps the policy (trino)`
+  both green.
+- **After updating the branch from `main`, the Trino governance leg failed** (run
+  41285813391):
+  - the gate printed `[g8] FAILED: Analyst query failed: 422 {"error":"Trino server is still
+    initializing …"}`;
+  - Trino's own log: `FAILED (SERVER_STARTING_UP) :: elapsed 0ms`.
+  - The gate sent its first analyst query before the coordinator had finished starting. The first
+    run was lucky. A gate that passes by timing is a flaky gate.
+
+**BLOCKER 1 (S2 round 2): the Trino legs do not wait for Trino to be ready.**
+- **Fix:** before its first query on the Trino engine, each Trino leg waits until Trino can answer:
+  - `GET /v1/info` reports `"starting": false`, **and**
+  - a `SELECT 1` through Trino succeeds,
+
+  with a bounded wait (for example 5 minutes, polling every 2 s) and a clear failure message
+  when the time runs out.
+- Put it in **one** helper both gate scripts use, or in the workflow step before the gate runs.
+  Do not copy it twice (rule 4).
+- Do the same for `g8_time_travel_test.py`'s Trino leg: it passed by the same luck.
+- Cite `DATA-21 S2 review BLOCKER 1`.
+- Prove it locally: run each Trino gate twice on a clean `-p data21g` project.
+
+**Open: BLOCKER 1 (S2 round 2).**
