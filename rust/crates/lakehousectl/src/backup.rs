@@ -77,10 +77,16 @@ pub fn command(args: &BackupArgs) -> Result<(), ToolError> {
 /// Returns the error that stopped the backup: a script the release does
 /// not ship, a script that failed, or a summary that names no backup.
 pub fn take(dir: &Path, version: Option<&str>) -> Result<PathBuf, ToolError> {
-    let script = backup_script(dir);
+    let dir = absolute(dir)?;
+    let script = backup_script(&dir);
     require_script(&script)?;
     let root = dir.join("backups");
-    let output = run(&script, &[root.to_string_lossy().to_string()], dir, version)?;
+    let output = run(
+        &script,
+        &[root.to_string_lossy().to_string()],
+        &dir,
+        version,
+    )?;
     backup_dir_of(&output)
 }
 
@@ -102,11 +108,35 @@ pub fn command_restore(args: &RestoreArgs) -> Result<(), ToolError> {
 /// Returns the error that stopped the restore: a script the release
 /// does not ship, or a script that failed.
 pub fn restore(dir: &Path, backup: &Path) -> Result<(), ToolError> {
-    let script = restore_script(dir);
+    let dir = absolute(dir)?;
+    let script = restore_script(&dir);
     require_script(&script)?;
     let backup = backup.to_string_lossy().to_string();
-    run(&script, &["--local".to_string(), backup], dir, None)?;
+    run(&script, &["--local".to_string(), backup], &dir, None)?;
     Ok(())
+}
+
+/// The install's own directory, as an ABSOLUTE path.
+///
+/// The shipped scripts `cd` into the deployment's directory, and they
+/// hand their paths to `docker run -v` — and docker reads a RELATIVE
+/// path there as a volume NAME, and refuses it ("invalid characters
+/// for a local volume name"). So the tool hands the scripts an
+/// absolute directory: the same directory, and a path docker reads as
+/// a path.
+///
+/// # Errors
+///
+/// Returns the error that says what could not be read.
+fn absolute(dir: &Path) -> Result<PathBuf, ToolError> {
+    if dir.is_absolute() {
+        return Ok(dir.to_path_buf());
+    }
+    let current = std::env::current_dir().map_err(|source| ToolError::Io {
+        context: "the current directory could not be read".to_string(),
+        source,
+    })?;
+    Ok(current.join(dir))
 }
 
 /// The script that takes a backup, in the install's own directory.
@@ -225,6 +255,29 @@ record="$(dirname "$0")/../record.txt"
 } >> "$record"
 echo "the restore is done"
 "#;
+
+    #[test]
+    fn the_shipped_script_is_given_an_absolute_directory() {
+        // The shipped scripts `cd` into the deployment's directory and
+        // hand their paths to `docker run -v`, which reads a RELATIVE
+        // path as a volume name and refuses it. The tool hands them an
+        // absolute one.
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        fake_tool(directory.path(), "backup-local.sh", FAKE_BACKUP);
+        state::write_initial(directory.path(), "0.1.0").expect("the state is written");
+
+        let relative = std::path::PathBuf::from("relative-install");
+        let absolute = absolute(&relative).expect("the directory is made absolute");
+
+        assert!(
+            absolute.is_absolute(),
+            "the directory is still relative: {absolute:?}"
+        );
+        assert!(
+            absolute.ends_with("relative-install"),
+            "the directory names something else: {absolute:?}"
+        );
+    }
 
     #[test]
     fn the_backup_runs_the_shipped_script_with_the_deployments_own_directory() {
