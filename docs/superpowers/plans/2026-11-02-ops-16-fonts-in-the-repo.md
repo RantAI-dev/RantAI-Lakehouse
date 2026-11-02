@@ -36,7 +36,7 @@
 
 Changing which fonts are offered, changing the root layout's Geist fonts (they come from the `geist` package, not from Google), and any visual change.
 
-## 4. Handoff (developer appends below)
+## 4. Handoff
 
 ### Developer report
 
@@ -124,6 +124,123 @@ the scope):
 - Not verified: the offline build (T1's acceptance), because of the Geist
   loader above. T2 was not started. No PR was opened, and nothing was
   force-pushed.
+
+### Handoff (T1 part 2 and T2 complete, 2026-11-02)
+
+**Commits** on `fix/ops-16-fonts-in-the-repo`, pushed after each; never
+force-pushed, no PR opened:
+
+- `2e4eeba0` feat(ops-16): commit the console's five fonts and load them
+  locally — unchanged, 14 files (five `woff2`, five `OFL.txt`,
+  `src/app/fonts/README.md`, `src/app/fonts.test.ts`, the two loaders).
+- `560621d5` feat(ops-16): load Geist from committed files (D5) — 8 files:
+  `design-system/fonts/geist/Geist-wght.woff2` and `OFL.txt`,
+  `design-system/fonts/geist-mono/GeistMono-wght.woff2` and `OFL.txt`,
+  `design-system/fonts/fonts.ts`, `design-system/README.md`,
+  `src/app/fonts.test.ts`, `src/app/fonts/README.md`.
+- `b4fca976` docs(changelog): OPS-16, the fonts are committed and load
+  locally (D5) — 1 file, 1 insertion.
+- the commit that carries this handoff — this plan only.
+
+**D5, done.** Geist and Geist Mono are vercel/geist-font release `v1.9.0`
+(`geist-font-v1.9.0.zip`, retrieved with `curl -fL --max-time 120` on
+2026-11-02), byte for byte: `Geist/webfonts/Geist[wght].woff2` and
+`GeistMono/webfonts/GeistMono[wght].woff2`. `file` reports `Web Open Font
+Format (Version 2)` for both. SHA-256 `5c5588…14cae512` (Geist, 69,576
+bytes) and `cf5bf5…45b46b25` (Geist Mono, 71,272 bytes) are in the README.
+Each directory has the release's root `OFL.txt` (SIL OFL 1.1, "Copyright
+2024 The Geist Project Authors").
+
+**Where, and why.** The files are in `design-system/fonts/geist/` and
+`design-system/fonts/geist-mono/`, the exception D5 allows, not D5's
+default `src/app/fonts/geist/`. `design-system/README.md` documents the
+folder as plug-and-play, ready to copy into another Next.js repo; a module
+inside it cannot reach into `src/`, so the fonts that
+`design-system/fonts/fonts.ts` loads must travel with it. Both READMEs say
+so, and `src/app/fonts/README.md` carries the source, version and hashes.
+
+**The loader.** `design-system/fonts/fonts.ts` uses `next/font/local` with
+the same `--font-sans` / `--font-mono` variables, `display: "swap"` and
+`preload: true` as the Google loader had (the five D1 loaders keep their
+`preload: false`). It declares `weight: "100 900"`, `style: "normal"`; the
+Google loader's `subsets: ["latin"]` has no local equivalent and is gone.
+
+**One deviation, stated.** D5 says "latin `woff2` files". The release ships
+one webfont per face covering the full character set (728 `cmap` entries
+for Geist, 889 for Geist Mono) and no latin subset, so the committed files
+are the release's full variable fonts — a superset of the Google `latin`
+subset the old loader downloaded. Sourcing the latin subset from Google
+instead would have broken D5's "from vercel/geist-font's release". The
+README records this.
+
+**The guard (D3, widened).** `src/app/fonts.test.ts` now scans `src/` and
+`design-system/`, and asserts each root exists so a renamed tree cannot
+pass by scanning nothing. A temporary `design-system/__guard_probe.ts`
+holding the banned module id made it fail (0 pass, 1 fail) and was removed;
+no probe file is in any commit.
+
+**Commands and counts** (foreground, on `560621d5`'s content; T2 changes
+only `CHANGELOG.md`, so none of these needed a re-run):
+
+- `bun install --frozen-lockfile` — 739 packages installed, exit 0.
+- `bun run typecheck` — exit 0.
+- `bun run lint` — exit 0, 0 errors, 10 warnings; all 10 are in 9 files this
+  branch does not touch (`data-table.tsx`, `sidebar.tsx`, `alerts-page.tsx`,
+  `login-page.tsx`, `use-copilot.ts`, `use-data-table.ts`,
+  `dashboard-specs.ts`, `uploads.test.ts`, `http.ts`).
+- `bun test src/app src/features/landing` — 20 pass, 0 fail, 3 files.
+- `bun test src/app/fonts.test.ts` — 1 pass, 0 fail.
+- `grep -rn "next/font/google" src design-system` — no match.
+- `file` on both `woff2` files — `Web Open Font Format (Version 2)`.
+- `find design-system -name '*.test.*' -o -name '*.spec.*'` — none, so no
+  design-system test folder to run.
+
+**Offline build (T1's acceptance) — exit 0.** `.next` was removed first,
+`node_modules` was already installed, and the container had no network:
+
+```bash
+rm -rf .next
+docker run --rm --network none --user "$(id -u):$(id -g)" \
+  -e HOME=/tmp -e NEXT_TELEMETRY_DISABLED=1 \
+  -v "$PWD":/app -w /app oven/bun:1 bun --bun next build
+```
+
+Its last lines (`✓ Compiled successfully in 23.7s`):
+
+```text
+├ ƒ /render/dashboard/[token]
+├ ƒ /services
+├ ƒ /tables/[id]
+├ ƒ /tenant-management
+├ ƒ /user-management
+└ ƒ /workloads
+
+
+ƒ Proxy (Middleware)
+
+ƒ  (Dynamic)  server-rendered on demand
+```
+
+`.next` was removed again after the run; nothing generated is staged.
+
+**T2.** One line under `[Unreleased]` → `Fixed` in `CHANGELOG.md`, naming
+the backlog, plan, decisions D1/D4/D5, the three CI failures, the measured
+offline build and the two limits (Geist's full charset, its location).
+`docs/CI.md` is unchanged: it lists no entry for this flake — no
+`fonts.googleapis.com`, no font build failure, none of the three run ids
+(`grep` found no match) — so there was no sentence to add.
+
+**Not verified / not done.**
+
+- The full `bun run test` over all of `src/` was not run; only the plan's
+  `src/app src/features/landing` and the guard above.
+- The plan's other acceptance variant, a `bun run build` with the two
+  Google hosts blocked in `/etc/hosts`, was not run; the `--network none`
+  container is the variant the plan allows and the one measured above.
+- The full verification block was not run: this branch touches no Rust,
+  Python, compose or migration file.
+- Geist is not a `latin` subset, as stated above; that is the one place
+  where D5's wording and the release disagree.
 
 ## 5. Review (planner appends below)
 
