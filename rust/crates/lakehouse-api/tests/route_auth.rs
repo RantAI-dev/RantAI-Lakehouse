@@ -314,6 +314,44 @@ async fn a_seeded_analyst_is_denied_adding_a_user_to_a_tenant() {
     );
 }
 
+/// ADM-3 D2: `POST /api/identity/users/{id}/reset-password` hands out a
+/// new credential, so it is `identity:write` — the same permission every
+/// other write-side identity route uses, and no new token minted for it.
+///
+/// Both directions are named here with a real principal: a seeded Analyst
+/// (no `identity:write`) is refused with 403, a Platform Admin is not
+/// refused by the auth gate at all (the handler then answers 404 for the
+/// unknown id the request names, which is the handler's business, not the
+/// gate's). The two loops over [`POLICY_TABLE`] above walk this entry
+/// too; this one names it.
+#[tokio::test]
+async fn a_seeded_analyst_is_denied_resetting_a_password_and_a_platform_admin_is_not() {
+    let TestApp { router, pool } = spin_up().await;
+    let analyst = session_cookie_for_seeded_user(&pool, "sari@meridian.example").await;
+    let admin = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+    let path = format!(
+        "/api/identity/users/{}/reset-password",
+        Uuid::new_v4().simple()
+    );
+
+    let denied = request_with_cookie(&router, "POST", &path, &analyst).await;
+    assert_eq!(
+        denied.status(),
+        StatusCode::FORBIDDEN,
+        "a seeded Analyst must be denied identity:write"
+    );
+
+    let allowed = request_with_cookie(&router, "POST", &path, &admin).await;
+    assert!(
+        !matches!(
+            allowed.status(),
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+        ),
+        "a Platform Admin must never be refused by the auth gate, got {}",
+        allowed.status()
+    );
+}
+
 /// BLD-1 / D2: `PUT /api/pipelines/{id}/run-as` decides whose permissions
 /// every future run of that pipeline is governed by, so it is
 /// `identity:write` — a governance decision, exactly like

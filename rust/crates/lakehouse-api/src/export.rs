@@ -541,7 +541,15 @@ async fn write_xlsx_file<S: RowSource>(
     let cols = columns(source, options);
     let mut workbook = Workbook::new();
     // Constant-memory mode: each row goes to a temporary file as it is written.
-    let sheet = workbook.add_worksheet_with_constant_memory();
+    // Since `rust_xlsxwriter` 0.100 the sheet is handed back as a `Result`:
+    // the temporary file the rows go into may not be creatable. The refusal
+    // travels through the export's own error type, so the writer's text never
+    // reaches a response (`AGENTS.md` principle 4).
+    // `RUSTSEC-2026-0429` (plan
+    // `docs/superpowers/plans/2026-11-02-deps-rust-xlsxwriter-0102.md` D2).
+    let sheet = workbook
+        .add_worksheet_with_constant_memory()
+        .map_err(|e| xlsx_err(&e))?;
     sheet.set_name("Data").map_err(|e| xlsx_err(&e))?;
     let bold = Format::new().set_bold();
     let number_formats: Vec<Option<Format>> = cols
