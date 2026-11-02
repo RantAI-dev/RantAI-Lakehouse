@@ -14,7 +14,10 @@ use clap::{Args, Parser, Subcommand};
     name = "lakehousectl",
     version,
     about = "Install and update the `RantAI` Lakehouse, online or air-gapped.",
-    long_about = None
+    long_about = "Install and update the `RantAI` Lakehouse, online or air-gapped.\n\n\
+                  An air-gapped host updates the TOOL with the copy in its bundle: the bundle \
+                  carries `lakehousectl-linux-x86_64`, and that is the new tool. \
+                  `lakehousectl self-update` needs the network."
 )]
 pub struct Cli {
     /// The command to run.
@@ -35,6 +38,14 @@ pub enum Command {
     Backup(BackupArgs),
     /// Restore a backup of the stack, on the local disk.
     Restore(RestoreArgs),
+    /// Move the stack to another release.
+    Update(UpdateArgs),
+    /// Move the stack back to the release it came from.
+    Rollback(RollbackArgs),
+    /// Show what the install is doing right now.
+    Status(StatusArgs),
+    /// Update the tool itself.
+    SelfUpdate,
 }
 
 /// The arguments of `lakehousectl verify`.
@@ -100,6 +111,50 @@ pub struct RestoreArgs {
     /// The backup directory to restore: the one `lakehousectl backup`
     /// wrote.
     pub backup: PathBuf,
+    /// Where the install lives: everything is in this one directory.
+    #[arg(long, default_value = "/opt/rantai-lakehouse")]
+    pub dir: PathBuf,
+}
+
+/// The arguments of `lakehousectl update`.
+#[derive(Debug, Args)]
+pub struct UpdateArgs {
+    /// The offline bundle's directory. Without it, the release is
+    /// fetched from GitHub.
+    #[arg(long)]
+    pub bundle: Option<PathBuf>,
+    /// Where the install lives: everything is in this one directory.
+    #[arg(long, default_value = "/opt/rantai-lakehouse")]
+    pub dir: PathBuf,
+    /// The release to update to. Without it, the newest one.
+    #[arg(long)]
+    pub version: Option<String>,
+    /// How long the stack may take to become ready, in seconds.
+    ///
+    /// The update rolls back when the stack is not ready in time
+    /// (REL-2 S4 decision D9).
+    #[arg(long, default_value_t = 600)]
+    pub ready_timeout: u64,
+    /// Skip one pre-flight check, by name. The check is not run and
+    /// the skip is said out loud.
+    #[arg(long = "ignore-preflight", value_name = "CHECK")]
+    pub ignore_preflight: Vec<String>,
+}
+
+/// The arguments of `lakehousectl rollback`.
+#[derive(Debug, Args)]
+pub struct RollbackArgs {
+    /// Where the install lives: everything is in this one directory.
+    #[arg(long, default_value = "/opt/rantai-lakehouse")]
+    pub dir: PathBuf,
+    /// Do not ask. The data written since the update is lost.
+    #[arg(long)]
+    pub yes: bool,
+}
+
+/// The arguments of `lakehousectl status`.
+#[derive(Debug, Args)]
+pub struct StatusArgs {
     /// Where the install lives: everything is in this one directory.
     #[arg(long, default_value = "/opt/rantai-lakehouse")]
     pub dir: PathBuf,
