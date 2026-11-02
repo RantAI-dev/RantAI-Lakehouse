@@ -69,6 +69,11 @@
 # (`pg_dumpall`, `clickhouse-client`), so a host needs no database client
 # of its own.
 set -euo pipefail
+# A command that fails must say what failed: under `set -e` alone, a
+# failure stops the script in silence, and the caller is told nothing
+# but the exit status (REL-2 S4b review round 8 BLOCKER 2).
+set -E
+trap 'echo "Error: ${BASH_SOURCE[0]##*/} line ${LINENO}: \`${BASH_COMMAND}\` exited with $?" >&2' ERR
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"

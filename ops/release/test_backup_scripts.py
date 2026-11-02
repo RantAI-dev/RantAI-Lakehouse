@@ -67,6 +67,10 @@ set -euo pipefail
 echo '{"version": "0.2.0"}'
 """
 
+# The trap the two scripts carry: it says which line failed and what
+# that line ran (REL-2 S4b review round 8 BLOCKER 2).
+ERROR_TRAP = r"""trap 'echo "Error: ${BASH_SOURCE[0]##*/} line ${LINENO}: \`${BASH_COMMAND}\` exited with $?" >&2' ERR"""
+
 
 class ScriptTestCase(unittest.TestCase):
     """A copy of the scripts, in a directory of their own."""
@@ -437,6 +441,97 @@ class RestoreScriptTest(ScriptTestCase):
                 f"RESTORE DATABASE `default` FROM Disk('backups', 'clickhouse/{stamp}/default')"
             ),
             "the database was dropped after it was restored",
+        )
+
+
+class ErrorTrapTest(unittest.TestCase):
+    """The trap that says what failed (REL-2 S4b review round 8
+    BLOCKER 2).
+
+    Under `set -e` alone a failing command stops a script in silence:
+    the rollback of a failed update was told only the exit status, and
+    not one word about what failed. The trap names the line and the
+    command.
+    """
+
+    def test_a_failing_command_says_the_line_and_the_command(self) -> None:
+        """A script with the trap says which line failed and what that
+        line ran, on its error stream."""
+        with tempfile.TemporaryDirectory() as directory:
+            script = Path(directory) / "the-script.sh"
+            script.write_text(
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                "set -E\n"
+                f"{ERROR_TRAP}\n"
+                "false\n",
+                encoding="utf-8",
+            )
+            result = subprocess.run(
+                ["bash", str(script)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+        self.assertNotEqual(result.returncode, 0, "the script was supposed to fail")
+        self.assertIn(
+            "the-script.sh line 5",
+            result.stderr,
+            f"the failure was not named: {result.stderr!r}",
+        )
+        self.assertIn(
+            "`false`",
+            result.stderr,
+            f"the command was not named: {result.stderr!r}",
+        )
+
+    def test_both_scripts_carry_the_trap(self) -> None:
+        """The backup and the restore both say what failed."""
+        for script in (BACKUP_SCRIPT, RESTORE_SCRIPT):
+            text = script.read_text(encoding="utf-8")
+            self.assertIn(
+                "set -E",
+                text,
+                f"{script.name} does not pass the ERR trap on to its functions: {text}",
+            )
+            self.assertIn(
+                ERROR_TRAP,
+                text,
+                f"{script.name} does not carry the trap: {text}",
+            )
+
+    def test_the_trap_sits_beside_the_set_and_the_exit_trap_stays(self) -> None:
+        """The trap is set right after `set -euo pipefail` — with the
+        comment that says why, and nothing else — and the restore keeps
+        its own `EXIT` trap."""
+        for script in (BACKUP_SCRIPT, RESTORE_SCRIPT):
+            lines = script.read_text(encoding="utf-8").splitlines()
+            index = lines.index("set -euo pipefail") + 1
+            # The comment that cites the finding sits between the two.
+            comment = []
+            while lines[index].startswith("#"):
+                comment.append(lines[index].lstrip("#").strip())
+                index += 1
+            self.assertIn(
+                "REL-2 S4b review round 8 BLOCKER 2",
+                " ".join(comment),
+                f"{script.name} does not cite the finding at the trap: {comment}",
+            )
+            self.assertEqual(
+                lines[index],
+                "set -E",
+                f"{script.name} does not set -E right after `set -euo pipefail`",
+            )
+            self.assertEqual(
+                lines[index + 1],
+                ERROR_TRAP,
+                f"{script.name} does not set the trap right after `set -euo pipefail`",
+            )
+        self.assertIn(
+            "trap cleanup EXIT",
+            RESTORE_SCRIPT.read_text(encoding="utf-8"),
+            "the restore lost its EXIT trap",
         )
 
 
