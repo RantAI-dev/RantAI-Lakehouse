@@ -2566,6 +2566,127 @@ lockfile, produced `version = "0.1.0-update-proof.1"0.1.0"` and `cargo metadata 
 - **The pushes**: the commit was pushed to `origin/feat/rel-2-s4b-lakehousectl-update`. No push was
   refused, so no `git pull --no-rebase` and no resolve was needed. No pull request was opened.
 
+### Fix for the PR #335 update-proof, bundle B (developer, 2026-11-02)
+
+**Commits** (branch `feat/rel-2-s4b-lakehousectl-update`, on top of `a9b37380`):
+
+| Commit | Task | What |
+| --- | --- | --- |
+| `0adb1e41` | PR #335 update-proof, bundle B | the proof's bundle B and bundle C steps tag the image they pulled by digest before they save it, and the workflow's own tests hold that to |
+
+**What failed.** PR #335's `update-proof` job failed in "The bundle B is assembled and signed":
+
+```
+docker pull localhost:5000/rantai-lakehouse-api:0.1.0-update-proof.1@sha256:cfa3…   (ok)
+Error response from daemon: No such image: localhost:5000/rantai-lakehouse-api:0.1.0-update-proof.1
+tar: This does not look like a tar archive / manifest.json: Not found in archive
+```
+
+**The cause.** The runner runs Docker's CONTAINERD image store (REL-2 S3 D13), and that store does
+NOT register the TAG when the pull is by digest: the digest reference and the tag are two names for
+one image, and only the digest one is registered. The step pulled the rebuilt image by its digest
+(`docker pull "$reference"`, where `$reference` is `name:tag@digest`) and then saved it BY ITS TAG —
+twice: once to read the image's id, once to write the bundle's archive.
+
+- `id="$(docker save "…/rantai-lakehouse-api:$version" | tar -xO manifest.json | jq -r '.[0].Config' …)"`
+- `docker save -o bundle-b/images/rantai-lakehouse-api.tar "…/rantai-lakehouse-api:$version"`
+
+Both saves ask for a tag the store does not have: the first one failed with "No such image", the pipe
+fed the daemon's error message into `tar` ("This does not look like a tar archive"), and the bundle's
+archive was never written. Bundle C's step had the same shape — pull by digest, then `docker save`
+of the tag — and would have failed the same way.
+
+**The fix.** `docker tag "$reference" "<name:tag>"` right after the pull, in BOTH steps, the way
+`ops/release/make_bundle.sh` does it (`ops/release/make_bundle.sh:295`: `docker tag "$reference"
+"$tag"`, where `tag="${reference%%@*}"` — the tag of the digest reference). The tag is made before
+every save and before every `inspect` of the tag, and the comment at the site says why (REL-2 S3 D13;
+PR #335 update-proof, bundle B).
+
+**The image id: what the bundle's manifest gets, and what the installer compares.**
+
+- **Where the id lands.** `update_proof.py bundle --api-image-id "$id"` sets the manifest's
+  `imageIds[<the new reference>]` to that value (`ops/release/update_proof.py:166`).
+- **What bundle B reads: the CONFIG digest.** `manifest.json`'s `Config` is `blobs/sha256/<hex>` in
+  every archive the containerd store writes, saved by tag or by digest: D13's own measurement archives
+  (`/tmp/opencode/alpine-tag.tar`, `/tmp/opencode/alpine-digestonly.tar`) both carry
+  `"Config":"blobs/sha256/bf8527…"`, and only the tag-saved one carries the name
+  (`"RepoTags":["alpine:3.20"]` and `io.containerd.image.name` in `index.json`). So the read yields
+  `sha256:<the config digest>` — the same value the dry run's manifest names, because the dry run's
+  "The image ids" step normalises to the config digest whenever the store reports the index digest
+  (which it does on the containerd store).
+- **What bundle C reads: the store's own `.Id`**, `docker image inspect --format '{{.Id}}'
+  "$reference"` — on the containerd store that IS the registry digest (the dry run's step says so:
+  "The containerd image store reports the image INDEX digest as the image's ID; the classic store
+  reports the CONFIG digest").
+- **What the installer compares.** `images::fetch` (`rust/crates/lakehousectl/src/images.rs:55-75`)
+  reads the LOADED image's `Id` and accepts the image when that Id is EITHER the manifest's
+  `imageIds[reference]` OR the registry digest of the reference (`Manifest::digest_of`,
+  `rust/crates/lakehousectl/src/manifest.rs:65`). The install calls it
+  (`rust/crates/lakehousectl/src/install.rs:100`) and the update calls it too
+  (`rust/crates/lakehousectl/src/update.rs:314` → `runner.rs:206` → `images::fetch`), so the proof's
+  bundle C update is checked the same way.
+- **The verdict.** On the containerd store the loaded `Id` is the REGISTRY digest (REL-2 S3 D13,
+  point 4). So bundle B's manifest, which names the CONFIG digest, passes through the registry-digest
+  branch — and that value is the one the dry run's manifest names, which the green `install-proof` job
+  proves an air-gapped install accepts. Bundle C's manifest, which names the registry digest, passes
+  through both branches. **Both are values the installer accepts, so the id reads are RIGHT and the
+  missing tag was the whole failure.** Nothing in the reads was changed.
+
+**The tests.** `ops/release/test_release_workflow.py`, in `UpdateProofTest`:
+
+| Test | What it holds |
+| --- | --- |
+| `test_the_update_proof_tags_every_image_it_saves_by_tag` | in the `update-proof` job, every pull by digest that is followed by a save of a TAG has a `docker tag` of that digest reference in between — for EVERY save of a tag, not only the first |
+| `test_a_proof_that_saves_a_tag_without_tagging_it_is_reported` | the check can fail: a synthetic workflow that saves a tag without tagging it is reported, and the same workflow with the tag is not |
+
+The check reads the job's `run:` blocks as shell: the comment lines are dropped (`shell_commands`), a
+line that ends with a backslash is joined with the next one (`logical_lines`), a pull of
+`$reference` or of a literal carrying an `@` is a pull BY DIGEST (`digest_pulls`), and a save whose
+argument is neither a digest reference nor `$reference` is a save BY TAG (`tag_saves`).
+
+**The new test fails on the workflow as it was.** With the workflow of `a9b37380` checked out
+(`git checkout HEAD~1 -- .github/workflows/release.yml`), the new test reports bundle B AND bundle C
+and fails:
+
+```
+FAILED ops/release/test_release_workflow.py::UpdateProofTest::test_the_update_proof_tags_every_image_it_saves_by_tag
+1 failed, 1 passed, 90 deselected
+```
+
+**Commands run, in the foreground, on the final commit:**
+
+| Command | Result |
+| --- | --- |
+| `python3 -m pytest ops/release -q` (the venv `/tmp/opencode/relvenv/bin/python`, pytest 8.3.4, pyyaml 6.0.1) | **226 passed** (224 before this fix, 2 new) |
+| `python3 -m pytest ops/release/test_release_workflow.py -q -k "tags_every_image or saves_a_tag_without"` | **2 passed** |
+| the same command against the workflow of `a9b37380` (`git checkout HEAD~1 -- .github/workflows/release.yml`) | **1 failed, 1 passed** — bundle B and bundle C reported |
+| `python3 -m unittest discover -s ops/release -p 'test_release_workflow.py'` | **Ran 92 tests — OK** |
+| `actionlint .github/workflows/release.yml` | clean, exit 0 |
+| `python3 ops/lint/check_intra_package_imports.py` | `OK: all intra-package dispar_orchestrate imports resolve` |
+| `python3 ops/lint/check_bare_iceberg_count.py` | `R11 guard: no bare count() against a Bronze Iceberg table found.` |
+| `git status` | clean (nothing generated staged) |
+
+**Not verified, with the reason:**
+
+- **The PR's own `update-proof` job was not run.** It needs a GitHub runner: the images, the
+  throwaway registry, cosign, a multi-GiB bundle and the whole stack. What stands in for it here is
+  the workflow's own tests (2 new cases, run against the workflow as it was and against the fixed
+  one) and `actionlint`.
+- **Nothing was run against Docker.** The tag-then-save behaviour was not reproduced on this machine.
+  What stands in for it is D13's measurement — the archives it left (`/tmp/opencode/alpine-tag.tar`
+  carries the name, `/tmp/opencode/alpine-digestonly.tar` does not) and `ops/release/make_bundle.sh`,
+  which does the same tag-then-save and is what the bundle's own format depends on.
+- **The whole-workspace cargo run** (`cargo clippy --workspace --all-targets --all-features -- -D
+  warnings` and `cargo test --workspace`): not run here — this fix touches no Rust source
+  (`git diff HEAD~1 -- rust/crates/` is empty); the Rust it reads was read, not changed.
+- **No bun command ran**: the branch changes no TypeScript.
+- **The Dagster code location** (`(cd dagster && python -m pytest dispar_orchestrate -q)`): not
+  run — the branch changes no Python under `dagster/`. The two repo lints that scan it ran, and
+  both are OK.
+- **`docker compose --profile '*' config --quiet`**: not run — the branch changes no compose file.
+- **The pushes**: the commits were pushed to `origin/feat/rel-2-s4b-lakehousectl-update`. No push was
+  refused, so no `git pull --no-rebase` and no resolve was needed. No pull request was opened.
+
 ## 7. Review (planner appends below)
 
 ### Review S1 round 1 (planner, 2026-10-31, at `f79d4235`)
