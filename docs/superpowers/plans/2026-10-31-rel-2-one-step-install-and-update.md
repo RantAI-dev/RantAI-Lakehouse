@@ -2457,6 +2457,115 @@ Every cargo command went through `/home/shiro/rantai/bin/cargo-locked` (the shar
 - **The pushes**: the commit was pushed to `origin/feat/rel-2-s4b-lakehousectl-update`. No push was
   refused, so no `git pull --no-rebase` and no resolve was needed. No pull request was opened.
 
+### Fix for the PR #335 update-proof (developer, 2026-11-02)
+
+**Commits** (branch `feat/rel-2-s4b-lakehousectl-update`, on top of `a053ad0a`):
+
+| Commit | Task | What |
+| --- | --- | --- |
+| `280af5d1` | PR #335 update-proof | the API's version bump is a script (`ops/release/bump_api_version.py`) with its own tests, and the workflow step calls it |
+
+**What failed.** PR #335's `update-proof` job failed in "Build and push the API image of bundle B":
+`cargo chef prepare` answered `TOML parse error at line 2737 ... version = "0.1.0-update-proof.1"0.1.0"`.
+
+The cause was the step "The API's version is bumped for bundle B", which made TWO edits with inline
+Python in the workflow:
+
+- in `rust/Cargo.lock` it replaced the PREFIX `'name = "lakehouse-api"\nversion = "'` with the new
+  version and left the OLD version text behind — the lockfile said
+  `version = "0.1.0-update-proof.1"0.1.0"`;
+- in `rust/crates/lakehouse-api/Cargo.toml` it replaced `^version = "[^"]+"$`. That regex does
+  nothing when the crate inherits its version (`version.workspace = true`), and then
+  `CARGO_PKG_VERSION` stays unbumped and the update waits for a version that never comes.
+
+**Which form the crate uses.** `rust/crates/lakehouse-api/Cargo.toml` names its version EXPLICITLY
+(`version = "0.1.0"`, line 3); it does not inherit it from the workspace. So the lockfile's broken
+prefix was the fault that stopped the build, and the manifest's regex happened to work for THIS
+crate. The new script handles BOTH forms, and the test says which one this crate uses.
+
+**The fix.** The bump is a script of its own now — `ops/release/bump_api_version.py` — so it can be
+tested, and the workflow step calls it:
+
+- it sets the `lakehouse-api` package version in its `Cargo.toml`: the `version` line it already
+  carries, or, when the crate inherits (`version.workspace = true`), that one line replaced with
+  `version = "<v>"`;
+- it replaces the WHOLE version value of the `lakehouse-api` entry in `Cargo.lock`, with a regex
+  anchored on `name = "lakehouse-api"` — the prefix is never replaced on its own again;
+- it fails loudly (non-zero, with the reason) when either file is not changed EXACTLY once: a bump
+  that changed nothing, or that changed two places, is not a bump;
+- it then reads both files back and parses them with `tomllib`, and the new version has to be in
+  both. Both are checked BEFORE either file is written, so a failed bump leaves the repository as
+  it was;
+- it touches no other crate's version, and not the workspace's own `[workspace.package]` version.
+
+**The tests are real.** `ops/release/test_bump_api_version.py` (7 cases) runs the script on COPIES
+of the repository's own `rust/crates/lakehouse-api/Cargo.toml` and `rust/Cargo.lock` in a temporary
+directory — the real files are never touched — and holds it to:
+
+| Test | What it holds |
+| --- | --- |
+| `test_the_bump_sets_the_version_in_the_manifest_and_the_lock` | the version is the new one in both files, and both parse with `tomllib` |
+| `test_the_bump_leaves_the_rest_of_the_lock_alone` | EXACTLY one line of the lockfile changes, and it is the API crate's version |
+| `test_the_bump_leaves_the_rest_of_the_manifest_alone` | EXACTLY one line of the manifest changes, and it is the crate's version |
+| `test_a_lock_without_the_api_entry_fails` | a lockfile with no `lakehouse-api` entry: non-zero exit, and nothing changed |
+| `test_a_manifest_without_a_version_fails` | a manifest with no version line: non-zero exit, and nothing changed |
+| `test_a_manifest_that_inherits_its_version_is_given_one` | `version.workspace = true` becomes the version itself |
+| `test_the_api_crate_declares_its_version_explicitly` | which form THIS crate uses, recorded |
+
+**The new test catches the old bug, and was run against the old code.** The old step's inline Python
+was reconstructed as a script (`/tmp/opencode/oldbug/old_bump.py`, the same two edits, verbatim) and
+the new test file was pointed at it: **5 failed, 2 passed**. The failures were exactly the bug:
+
+- `test_the_bump_sets_the_version_in_the_manifest_and_the_lock` and
+  `test_the_bump_leaves_the_rest_of_the_lock_alone` failed on the corrupted line
+  `version = "0.1.0-update-proof.1"0.1.0"` and on the `tomllib.TOMLDecodeError` it raises
+  (`Expected newline or end of document after a statement (at line 2737, column 33)`);
+- `test_a_manifest_that_inherits_its_version_is_given_one` failed because the old regex did nothing
+  to `version.workspace = true`;
+- `test_a_lock_without_the_api_entry_fails` and `test_a_manifest_without_a_version_fails` failed
+  because the old code exited 0 and changed nothing.
+
+With the new script: **7 passed**. The same old code, run on a scratch copy of the repository's own
+lockfile, produced `version = "0.1.0-update-proof.1"0.1.0"` and `cargo metadata --offline` answered
+`TOML parse error at line 2737, column 33` — the CI error, reproduced locally.
+
+**Commands run, in the foreground, on the final commit:**
+
+| Command | Result |
+| --- | --- |
+| `python3 -m pytest ops/release -q` (the venv `/tmp/opencode/relvenv/bin/python`, pytest 8.3.4, pyyaml 6.0.1) | **224 passed** (216 before this fix, 8 new: 7 in `test_bump_api_version.py` and 1 in `test_release_workflow.py`) |
+| `python3 -m pytest ops/release/test_bump_api_version.py -q` | **7 passed** |
+| `python3 -m unittest discover -s ops/release -p 'test_bump_api_version.py'` | **Ran 7 tests — OK** (the file runs under pytest and under unittest alike) |
+| the new test against the OLD step's code (the reconstructed script) | **5 failed, 2 passed** — the bug above |
+| `actionlint .github/workflows/release.yml` | clean, exit 0 |
+| `python3 ops/lint/check_intra_package_imports.py` | `OK: all intra-package dispar_orchestrate imports resolve` |
+| `python3 ops/lint/check_bare_iceberg_count.py` | `R11 guard: no bare count() against a Bronze Iceberg table found.` |
+| `cd rust && cargo metadata --offline --format-version 1 --filter-platform x86_64-unknown-linux-gnu >/dev/null` (on a scratch COPY of `rust/`, with the bump applied) | clean, exit 0; the metadata says `lakehouse-api version = 0.1.0-update-proof.1`, and `Cargo.lock` is byte for byte unchanged afterwards (the manifest and the lock agree) |
+| the same command with `--locked` | clean, exit 0 |
+| the same command on the UNMODIFIED copy, for comparison | clean, exit 0 — the `--filter-platform` flag is needed on this machine only because `--offline` alone cannot fetch a Windows-only crate (`anstyle-wincon v3.0.11`) that the local registry cache does not carry; it fails the SAME way on the unmodified copy, so it says nothing about this fix |
+| `git status` | clean (nothing generated staged) |
+
+**Not verified, with the reason:**
+
+- **The PR's own `update-proof` job was not run.** It needs a GitHub runner: the images, the
+  throwaway registry, cosign, syft, a multi-GiB bundle and the whole stack. What stands in for it
+  here is the bump's own tests (7 cases, run against the old code and against the new one) and
+  `actionlint` on the workflow.
+- **The API image was not rebuilt.** `cargo metadata --offline` on the bumped copy is the proof that
+  cargo READS the two files (it names the new version and leaves the lockfile alone); the build
+  itself is `cargo chef prepare` plus the Dockerfile's `--locked` build, which is CI's.
+- **The whole-workspace cargo run** (`cargo clippy --workspace --all-targets --all-features -- -D
+  warnings` and `cargo test --workspace`): not run here — this fix touches no Rust source at all
+  (`git diff origin/main...HEAD -- rust/crates/` is empty), and the machine rules say CI runs the
+  workspace.
+- **No bun command ran**: the branch changes no TypeScript.
+- **The Dagster code location** (`(cd dagster && python -m pytest dispar_orchestrate -q)`): not
+  run — the branch changes no Python under `dagster/`. The two repo lints that scan it ran, and
+  both are OK.
+- **`docker compose --profile '*' config --quiet`**: not run — the branch changes no compose file.
+- **The pushes**: the commit was pushed to `origin/feat/rel-2-s4b-lakehousectl-update`. No push was
+  refused, so no `git pull --no-rebase` and no resolve was needed. No pull request was opened.
+
 ## 7. Review (planner appends below)
 
 ### Review S1 round 1 (planner, 2026-10-31, at `f79d4235`)
