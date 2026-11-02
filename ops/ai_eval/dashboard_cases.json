@@ -424,6 +424,7 @@
       {"name": "board", "method": "POST", "path": "/api/dashboard/boards", "body": {"name": "Eval View Year"}, "id_at": "board.id"},
       {"name": "chart", "method": "POST", "path": "/api/dashboard/specs", "body": {"title": "Eval View Year Chart", "kind": "kpi", "mart": "mart_event", "measures": ["jumlah_event"], "board": "{board}"}, "id_at": "chart.id"}
     ],
+    "context": "The user is viewing the dashboard \"Eval View Year\" (board id: {board}). Time grain: each chart's own. Active filters: none. Tiles and the data they currently show (built-in tiles are not editable):\n- \"Eval View Year Chart\" (kpi, id {chart}; mart_event): not loaded",
     "turns": ["Show me events for last year only."],
     "expect_tool": {"name": "set_board_view_filters", "args_contains": {"board": "{board}", "filters": "tahun"}},
     "expect_state": [
@@ -681,19 +682,22 @@
     "id": "calc_distance_to_bandung",
     "mode": "build",
     "confirm": true,
+    "setup": [
+      {"name": "src", "method": "POST", "path": "/api/dashboard/sources", "body": {"title": "Eval Places With Coordinates", "sql": "SELECT wilayah AS tempat, -6.2088 AS latitude, 106.8456 AS longitude FROM serving.mart_kuliner"}, "id_at": "source.id"}
+    ],
     "turns": [
-      "Add a field called km_from_bandung on mart_demo_map_points with the distance in kilometres from each place to Bandung (latitude -6.9175, longitude 107.6191)."
+      "Add a field called km_from_bandung on the SQL source {src} with the distance in kilometres from each place to Bandung (latitude -6.9175, longitude 107.6191)."
     ],
     "expect_tool": {
       "name": "create_calculated_field",
       "args_contains": {
-        "mart": "mart_demo_map_points",
+        "sqlSource": "{src}",
         "name": "km_from_bandung"
       }
     },
     "expect_state": [
       {
-        "path": "/api/dashboard/calc-fields?mart=mart_demo_map_points",
+        "path": "/api/dashboard/calc-fields?source={src}",
         "list": "fields",
         "where": {
           "name": "km_from_bandung"

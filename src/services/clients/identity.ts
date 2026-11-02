@@ -4,6 +4,8 @@ import type {
   CreateTenantInput,
   IdentityService,
   InviteUserInput,
+  InviteUserResponse,
+  ResetPasswordResponse,
   Role,
   RotateServiceIdentityResponse,
   ServiceIdentity,
@@ -90,8 +92,16 @@ export const postgresIdentityService: IdentityService = {
       "Failed to load service identity list"
     );
   },
+  // ADM-3 D1: the invite comes back as the created user PLUS the
+  // server-generated temporary password, shown once. The password is never
+  // persisted client-side beyond the one-shot dialog that displays it.
   inviteUser(input: InviteUserInput, signal) {
-    return post<User>("/api/identity/users", input, signal, "Failed to invite user");
+    return post<InviteUserResponse>(
+      "/api/identity/users",
+      input,
+      signal,
+      "Failed to invite user"
+    );
   },
   createRole(input: CreateRoleInput, signal) {
     return post<Role>("/api/identity/roles", input, signal, "Failed to create role");
@@ -118,6 +128,18 @@ export const postgresIdentityService: IdentityService = {
       null,
       signal,
       "Failed to rotate service identity"
+    );
+  },
+  // ADM-3 D2: hand an existing user a new temporary password. The server
+  // generates it and returns it exactly once — see the contract type's
+  // doc comment. The route takes no body, so this is an empty-body POST
+  // like `rotateServiceIdentity`.
+  resetPassword(id: string, signal) {
+    return post<ResetPasswordResponse>(
+      `/api/identity/users/${id}/reset-password`,
+      null,
+      signal,
+      "Failed to reset password"
     );
   },
 };
