@@ -19,10 +19,20 @@
 //!
 //! In the install's own `.env`, next to the other settings. The file
 //! holds secrets, so it stays readable by its owner only.
+//!
+//! # How it is cleared
+//!
+//! Clearing the line in the `.env` is not enough on its own: the
+//! services that read the flag read it when they are CREATED, so they
+//! have to be recreated after it is cleared. [`clear_and_recreate`]
+//! does both, and every path that clears the pause comes through it —
+//! the update's success, the rollback and the update's way back (REL-2
+//! S4b review round 2 BLOCKER 2).
 
 use std::path::Path;
 
 use crate::error::ToolError;
+use crate::runner::Runner;
 
 /// The variable the Dagster services read.
 pub const VARIABLE: &str = "MAINTENANCE_PAUSED";
@@ -60,6 +70,42 @@ pub fn clear(dir: &Path) -> Result<(), ToolError> {
     }
     let text = read(&path)?;
     write(&path, &without_variable(&text))
+}
+
+/// Clear the pause, and recreate the services that read it.
+///
+/// # Why the services are recreated
+///
+/// The Dagster services read `MAINTENANCE_PAUSED` when they are
+/// CREATED (D16). Clearing the line in the `.env` changes nothing for
+/// a container that already runs: it keeps the value it was created
+/// with, so the snapshot expiry and the orphan-file removal stay
+/// skipped, and the storage grows with nothing saying so.
+///
+/// So the services are recreated: `up -d --pull never` recreates only
+/// the services whose environment changed, and it pulls nothing (REL-2
+/// S3 D13). Every path that clears the pause — the update's success,
+/// the rollback and the update's way back — comes through here, so
+/// none of them can clear the pause and leave the services running
+/// with it (REL-2 S4b review round 2 BLOCKER 2).
+///
+/// # Errors
+///
+/// Returns the error that says what could not be written, or that the
+/// services could not be recreated.
+pub fn clear_and_recreate(dir: &Path, runner: &mut dyn Runner) -> Result<(), ToolError> {
+    clear(dir).map_err(|error| {
+        ToolError::Failed(format!(
+            "the pause could not be cleared: {error}. The jobs that delete files stay skipped \
+             until the pause is cleared."
+        ))
+    })?;
+    runner.up().map_err(|error| {
+        ToolError::Failed(format!(
+            "the services that read the pause could not be recreated: {error}. The jobs that \
+             delete files stay skipped until they are recreated."
+        ))
+    })
 }
 
 /// The `.env` with the variable set to `value`.

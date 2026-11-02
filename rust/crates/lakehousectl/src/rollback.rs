@@ -12,7 +12,8 @@
 //! 2. the backup the update took is restored;
 //! 3. the `*.previous` files go back, and the stack starts;
 //! 4. the stack is waited for, on the OLD version;
-//! 5. the pause is cleared, and the state goes back.
+//! 5. the pause is cleared, the services that read it are recreated,
+//!    and the state goes back.
 //!
 //! # The two refusals
 //!
@@ -127,9 +128,20 @@ pub fn run(
     // The wait, on the old version.
     runner::wait_for_ready(runner, version, timeout).map_err(ToolError::Failed)?;
 
-    // The pause is cleared, and the state goes back.
-    pause::clear(dir)?;
+    // The state goes back, the pause is cleared, and the services that
+    // read it are recreated.
+    //
+    // The state goes back FIRST: the stack runs the old release now,
+    // and a pause that could not be cleared must not leave the state
+    // naming the new one.
+    //
+    // The services are recreated because they read the pause when they
+    // are CREATED (D16): clearing the line in the `.env` alone would
+    // leave them running with the value they were created with, and
+    // the jobs that delete files would stay skipped (REL-2 S4b review
+    // round 2 BLOCKER 2).
     state::restore_previous(dir, version, Some(&backup))?;
+    pause::clear_and_recreate(dir, runner)?;
     Ok(())
 }
 
@@ -187,6 +199,19 @@ mod tests {
     struct Fake {
         /// The calls, in order.
         calls: Vec<String>,
+        /// Whether the pause was set when each call was made.
+        ///
+        /// The services are created with the value the `.env` holds at
+        /// that moment, so the fake records it: the rollback starts the
+        /// stack with the pause still set, and starts it again without
+        /// it once the pause is cleared.
+        paused: Vec<bool>,
+        /// The install's own directory.
+        dir: PathBuf,
+        /// The steps that fail, when they are set.
+        failing: Vec<String>,
+        /// The number of `up` calls.
+        ups: usize,
         /// The time the fake thinks it is.
         now: Instant,
         /// The version the API reports.
@@ -194,11 +219,22 @@ mod tests {
     }
 
     impl Fake {
-        fn new() -> Self {
+        fn new(dir: &Path) -> Self {
             Self {
                 calls: Vec::new(),
+                paused: Vec::new(),
+                dir: dir.to_path_buf(),
+                failing: Vec::new(),
+                ups: 0,
                 now: Instant::now(),
                 api_version: "0.1.0".to_string(),
+            }
+        }
+
+        fn failing_at(dir: &Path, step: &str) -> Self {
+            Self {
+                failing: vec![step.to_string()],
+                ..Self::new(dir)
             }
         }
 
@@ -209,6 +245,34 @@ mod tests {
                 .filter(|call| !call.contains("api-state"))
                 .cloned()
                 .collect()
+        }
+
+        /// The calls, without the probes, and whether the pause was set
+        /// at each of them.
+        fn steps_with_the_pause(&self) -> Vec<(String, bool)> {
+            self.calls
+                .iter()
+                .zip(self.paused.iter())
+                .filter(|(call, _)| !call.contains("api-state"))
+                .map(|(call, paused)| (String::clone(call), *paused))
+                .collect()
+        }
+
+        /// Record a call, and whether the pause was set when it was
+        /// made.
+        fn record(&mut self, step: &str) {
+            let paused = self.pause_is_set();
+            self.calls.push(step.to_string());
+            self.paused.push(paused);
+        }
+
+        /// Whether the install's `.env` holds the pause right now.
+        fn pause_is_set(&self) -> bool {
+            let Ok(env) = std::fs::read_to_string(self.dir.join(".env")) else {
+                return false;
+            };
+            let prefix = format!("{}=", pause::VARIABLE);
+            env.lines().any(|line| line.trim().starts_with(&prefix))
         }
     }
 
@@ -226,37 +290,47 @@ mod tests {
             _manifest: &crate::manifest::Manifest,
             _bundle: Option<&Path>,
         ) -> Result<(), String> {
-            self.calls.push("fetch-images".to_string());
+            self.record("fetch-images");
             Ok(())
         }
 
         fn stop_writers(&mut self) -> Result<(), String> {
-            self.calls.push("stop-writers".to_string());
+            self.record("stop-writers");
             Ok(())
         }
 
         fn backup(&mut self, _version: &str) -> Result<PathBuf, String> {
-            self.calls.push("backup".to_string());
+            self.record("backup");
             Ok(PathBuf::from("/backups/one"))
         }
 
         fn restore(&mut self, _backup: &Path) -> Result<(), String> {
-            self.calls.push("restore".to_string());
+            self.record("restore");
             Ok(())
         }
 
         fn up(&mut self) -> Result<(), String> {
-            self.calls.push("up".to_string());
+            // The stack is started more than once — with the pause, and
+            // again without it once the pause is cleared — so the fake
+            // tells the starts apart: a test can fail one of them and
+            // not the other (REL-2 S4b review round 2 BLOCKER 2).
+            self.ups += 1;
+            let step = if self.ups == 1 { "up" } else { "up-again" };
+            self.record(step);
+            if let Some(position) = self.failing.iter().position(|failing| failing == step) {
+                self.failing.remove(position);
+                return Err(format!("the {step} failed"));
+            }
             Ok(())
         }
 
         fn down(&mut self) -> Result<(), String> {
-            self.calls.push("down".to_string());
+            self.record("down");
             Ok(())
         }
 
         fn api_state(&mut self) -> Result<ApiState, String> {
-            self.calls.push("api-state".to_string());
+            self.record("api-state");
             Ok(ApiState {
                 ready: true,
                 version: Some(self.api_version.clone()),
@@ -264,7 +338,7 @@ mod tests {
         }
 
         fn console_ready(&mut self) -> Result<bool, String> {
-            self.calls.push("console-ready".to_string());
+            self.record("console-ready");
             Ok(true)
         }
     }
@@ -319,7 +393,7 @@ mod tests {
     #[test]
     fn the_rollback_stops_the_stack_restores_the_backup_and_starts_it_again() {
         let directory = install_with_state("0.2.0", Some("0.1.0"), Some("/backups/one"));
-        let mut runner = Fake::new();
+        let mut runner = Fake::new(directory.path());
 
         run(
             directory.path(),
@@ -336,6 +410,10 @@ mod tests {
                 "restore".to_string(),
                 "up".to_string(),
                 "console-ready".to_string(),
+                // The last start recreates the services that read the
+                // pause, now that it is cleared (REL-2 S4b review
+                // round 2 BLOCKER 2).
+                "up-again".to_string(),
             ],
             "the steps ran in another order"
         );
@@ -358,7 +436,7 @@ mod tests {
             "{\"version\": \"0.1.0\"}\n",
         )
         .expect("the old manifest");
-        let mut runner = Fake::new();
+        let mut runner = Fake::new(path);
 
         run(path, &mut runner, "0.1.0", Duration::from_secs(60)).expect("the rollback runs");
 
@@ -389,7 +467,7 @@ mod tests {
             "POSTGRES_PASSWORD=secret\nMAINTENANCE_PAUSED=true\n",
         )
         .expect("the env file is written");
-        let mut runner = Fake::new();
+        let mut runner = Fake::new(path);
 
         run(path, &mut runner, "0.1.0", Duration::from_secs(60)).expect("the rollback runs");
 
@@ -397,6 +475,79 @@ mod tests {
         assert!(
             !env.contains("MAINTENANCE_PAUSED"),
             "the pause was not cleared: {env}"
+        );
+    }
+
+    #[test]
+    fn the_rollback_recreates_the_services_after_the_pause_is_cleared() {
+        // REL-2 S4b review round 2 BLOCKER 2: the Dagster services read
+        // MAINTENANCE_PAUSED when they are CREATED, so the rollback's
+        // own start creates them WITH the pause. Clearing the line in
+        // the `.env` is not enough: they have to be created again
+        // without it, or the jobs that delete files stay skipped.
+        let directory = install_with_state("0.2.0", Some("0.1.0"), Some("/backups/one"));
+        let path = directory.path();
+        std::fs::write(
+            path.join(".env"),
+            "POSTGRES_PASSWORD=secret\nMAINTENANCE_PAUSED=true\n",
+        )
+        .expect("the env file is written");
+        let mut runner = Fake::new(path);
+
+        run(path, &mut runner, "0.1.0", Duration::from_secs(60)).expect("the rollback runs");
+
+        assert_eq!(
+            runner.steps_with_the_pause(),
+            vec![
+                ("down".to_string(), true),
+                ("restore".to_string(), true),
+                // The stack is created with the pause...
+                ("up".to_string(), true),
+                ("console-ready".to_string(), true),
+                // ...and created again without it, right after the pause
+                // is cleared.
+                ("up-again".to_string(), false),
+            ],
+            "the services were not recreated without the pause"
+        );
+    }
+
+    #[test]
+    fn a_rollback_that_cannot_recreate_the_services_says_so() {
+        // REL-2 S4b review round 2 BLOCKER 2: the second start can
+        // fail, and then the operator has to be told — the jobs that
+        // delete files stay skipped.
+        let directory = install_with_state("0.2.0", Some("0.1.0"), Some("/backups/one"));
+        let path = directory.path();
+        std::fs::write(
+            path.join(".env"),
+            "POSTGRES_PASSWORD=secret\nMAINTENANCE_PAUSED=true\n",
+        )
+        .expect("the env file is written");
+        let mut runner = Fake::failing_at(path, "up-again");
+
+        let error = run(path, &mut runner, "0.1.0", Duration::from_secs(60))
+            .expect_err("the rollback does not hide it");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("the services that read the pause could not be recreated"),
+            "the error says the services were not recreated: {message}"
+        );
+        assert!(
+            message.contains("stay skipped"),
+            "the error says what stays skipped: {message}"
+        );
+        let env = std::fs::read_to_string(path.join(".env")).expect("the env file is readable");
+        assert!(
+            !env.contains("MAINTENANCE_PAUSED"),
+            "the pause was not cleared: {env}"
+        );
+        let state = state::read(path).expect("the state is read");
+        assert_eq!(
+            state.current_version.as_deref(),
+            Some("0.1.0"),
+            "the state does not name the release the stack runs"
         );
     }
 }

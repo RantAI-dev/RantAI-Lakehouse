@@ -18,8 +18,8 @@
 //!    the stack is started.
 //! 7. **The stack is waited for**: the API must report the NEW
 //!    version as ready, and the console must answer.
-//! 8. **On success** the pause is cleared and the state names the new
-//!    release.
+//! 8. **On success** the pause is cleared, the state names the new
+//!    release, and the services that read the pause are recreated.
 //! 9. **On a failure from step 6 on** the update rolls ITSELF back
 //!    (D18) and exits non-zero, saying what failed and what the
 //!    rollback did.
@@ -29,10 +29,19 @@
 //! Nothing has been swapped when the writers cannot be stopped or the
 //! backup cannot be taken, so the install still holds the OLD release's
 //! files. The update starts the stack again on those files, waits for
-//! it on the OLD version, clears the pause and exits non-zero, saying
-//! that it stopped before it changed anything. A stack that does not
-//! come back is reported as it is: the install may need a hand
-//! (REL-2 S4b review round 1 BLOCKER 1).
+//! it on the OLD version, clears the pause, recreates the services
+//! that read it, and exits non-zero, saying that it stopped before it
+//! changed anything. A stack that does not come back is reported as it
+//! is: the install may need a hand (REL-2 S4b review round 1 BLOCKER 1).
+//!
+//! # The pause and the services that read it
+//!
+//! The pause outlives the update unless the services that read it are
+//! recreated: they read `MAINTENANCE_PAUSED` when they are CREATED
+//! (D16), so clearing the line in the `.env` leaves them running with
+//! the value they were created with. Every path that clears the pause
+//! therefore recreates them right after (REL-2 S4b review round 2
+//! BLOCKER 2).
 //!
 //! # The route (D10)
 //!
@@ -364,9 +373,18 @@ pub fn run(dir: &Path, facts: &Facts, runner: &mut dyn Runner) -> Result<(), Too
         ));
     }
 
-    // Step 8 — the pause is cleared, and the state names the new release.
-    pause::clear(dir)?;
+    // Step 8 — the state names the new release, the pause is cleared,
+    // and the services that read it are recreated.
+    //
+    // The state goes FIRST: the stack runs the new release now, and a
+    // pause that could not be cleared must not leave the state naming
+    // the old one.
     state::set_versions(dir, &new_version, Some(&old_version))?;
+    if let Err(error) = pause::clear_and_recreate(dir, runner) {
+        return Err(ToolError::Failed(format!(
+            "the update to {new_version} is done and the stack runs {new_version}, but {error}"
+        )));
+    }
     println!("lakehousectl: the stack runs {new_version}.");
     Ok(())
 }
@@ -377,6 +395,9 @@ pub fn run(dir: &Path, facts: &Facts, runner: &mut dyn Runner) -> Result<(), Too
 /// directory are still the OLD ones. The stack is started again on
 /// those files, it is waited for on the OLD version, and the pause is
 /// cleared: the update restored nothing, so nothing must stay paused.
+/// The services that read the pause are recreated right after it is
+/// cleared, so they do not keep the value they were created with
+/// (REL-2 S4b review round 2 BLOCKER 2).
 ///
 /// The error says that the update stopped before it changed anything,
 /// and what the stack runs now. A stack that does not come back is
@@ -413,9 +434,11 @@ fn stopped_before_the_swap(
 
     // The pause is cleared even when the stack did not come back: the
     // update restored nothing, so the jobs that delete files must not
-    // stay paused.
-    if let Err(error) = pause::clear(dir) {
-        problems.push(format!("the pause could not be cleared: {error}"));
+    // stay paused. The services that read it are recreated right after
+    // it is cleared, so they do not keep the value they were created
+    // with (REL-2 S4b review round 2 BLOCKER 2).
+    if let Err(error) = pause::clear_and_recreate(dir, runner) {
+        problems.push(error.to_string());
     }
 
     if problems.is_empty() {
@@ -677,8 +700,19 @@ mod tests {
     struct Fake {
         /// The calls, in order.
         calls: Vec<String>,
+        /// Whether the pause was set when each call was made.
+        ///
+        /// The services are created with the value the `.env` holds at
+        /// that moment, so the fake records it: the update sets the
+        /// pause BEFORE the backup, the stack is created with it, and
+        /// the stack is created again without it once it is cleared.
+        paused: Vec<bool>,
+        /// The install's own directory.
+        dir: PathBuf,
         /// The steps that fail, when they are set.
         failing: Vec<String>,
+        /// The number of `up` calls.
+        ups: usize,
         /// The time the fake thinks it is.
         now: Instant,
         /// What the API reports after each `up`: the version, and
@@ -695,10 +729,13 @@ mod tests {
     }
 
     impl Fake {
-        fn new() -> Self {
+        fn new(dir: &Path) -> Self {
             Self {
                 calls: Vec::new(),
+                paused: Vec::new(),
+                dir: dir.to_path_buf(),
                 failing: Vec::new(),
+                ups: 0,
                 now: Instant::now(),
                 after_up: vec![("0.2.0".to_string(), true)],
                 api_version: "0.2.0".to_string(),
@@ -706,18 +743,18 @@ mod tests {
             }
         }
 
-        fn failing_at(step: &str) -> Self {
+        fn failing_at(dir: &Path, step: &str) -> Self {
             Self {
                 failing: vec![step.to_string()],
-                ..Self::new()
+                ..Self::new(dir)
             }
         }
 
         /// The fake fails at each of these steps, once each.
-        fn failing_at_steps(steps: &[&str]) -> Self {
+        fn failing_at_steps(dir: &Path, steps: &[&str]) -> Self {
             Self {
                 failing: steps.iter().map(|step| (*step).to_string()).collect(),
-                ..Self::new()
+                ..Self::new(dir)
             }
         }
 
@@ -727,12 +764,29 @@ mod tests {
         /// failure may well succeed — the new release is what was
         /// broken, not the old one.
         fn call(&mut self, step: &str) -> Result<(), String> {
-            self.calls.push(step.to_string());
+            self.record(step);
             if let Some(position) = self.failing.iter().position(|failing| failing == step) {
                 self.failing.remove(position);
                 return Err(format!("the {step} failed"));
             }
             Ok(())
+        }
+
+        /// Record a call, and whether the pause was set when it was
+        /// made.
+        fn record(&mut self, step: &str) {
+            let paused = self.pause_is_set();
+            self.calls.push(step.to_string());
+            self.paused.push(paused);
+        }
+
+        /// Whether the install's `.env` holds the pause right now.
+        fn pause_is_set(&self) -> bool {
+            let Ok(env) = std::fs::read_to_string(self.dir.join(".env")) else {
+                return false;
+            };
+            let prefix = format!("{}=", pause::VARIABLE);
+            env.lines().any(|line| line.trim().starts_with(&prefix))
         }
 
         /// The calls, without the probes.
@@ -741,6 +795,17 @@ mod tests {
                 .iter()
                 .filter(|call| !call.contains("api-state") && *call != "sleep")
                 .cloned()
+                .collect()
+        }
+
+        /// The calls, without the probes, and whether the pause was set
+        /// at each of them.
+        fn steps_with_the_pause(&self) -> Vec<(String, bool)> {
+            self.calls
+                .iter()
+                .zip(self.paused.iter())
+                .filter(|(call, _)| !call.contains("api-state") && *call != "sleep")
+                .map(|(call, paused)| (String::clone(call), *paused))
                 .collect()
         }
     }
@@ -776,7 +841,17 @@ mod tests {
         }
 
         fn up(&mut self) -> Result<(), String> {
-            self.call("up")?;
+            // The stack is started more than once — with the pause, and
+            // again without it once the pause is cleared — so the fake
+            // tells the starts apart: a test can fail one of them and
+            // not the other (REL-2 S4b review round 2 BLOCKER 2).
+            self.ups += 1;
+            let step = if self.ups == 1 { "up" } else { "up-again" };
+            self.record(step);
+            if let Some(position) = self.failing.iter().position(|failing| failing == step) {
+                self.failing.remove(position);
+                return Err(format!("the {step} failed"));
+            }
             if !self.after_up.is_empty() {
                 let (version, ready) = self.after_up.remove(0);
                 self.api_version = version;
@@ -790,7 +865,7 @@ mod tests {
         }
 
         fn api_state(&mut self) -> Result<ApiState, String> {
-            self.calls.push("api-state".to_string());
+            self.record("api-state");
             Ok(ApiState {
                 ready: self.api_ready,
                 version: Some(self.api_version.clone()),
@@ -923,7 +998,7 @@ mod tests {
         let (_directory, path) = install_with_state("0.1.0");
         let manifest = manifest_of("0.2.0", Some("0.0.0"), &[]);
         let facts = facts_of(&path, &manifest);
-        let mut runner = Fake::new();
+        let mut runner = Fake::new(&path);
 
         run(&path, &facts, &mut runner).expect("the update runs");
 
@@ -935,6 +1010,10 @@ mod tests {
                 "backup".to_string(),
                 "up".to_string(),
                 "console-ready".to_string(),
+                // The last start recreates the services that read the
+                // pause, now that it is cleared (REL-2 S4b review
+                // round 2 BLOCKER 2).
+                "up-again".to_string(),
             ],
             "the steps ran in another order"
         );
@@ -946,7 +1025,7 @@ mod tests {
         let (_directory, path) = install_with_state("0.1.0");
         let manifest = manifest_of("0.2.0", Some("0.0.0"), &[]);
         let facts = facts_of(&path, &manifest);
-        let mut runner = Fake::failing_at("fetch-images");
+        let mut runner = Fake::failing_at(&path, "fetch-images");
 
         let error = run(&path, &facts, &mut runner).expect_err("the update fails");
 
@@ -978,7 +1057,7 @@ mod tests {
         let manifest = manifest_of("0.2.0", Some("0.0.0"), &[]);
         let facts = facts_of(&path, &manifest);
         let state_before = std::fs::read(state::path(&path)).expect("the state is readable");
-        let mut runner = Fake::failing_at("stop-writers");
+        let mut runner = Fake::failing_at(&path, "stop-writers");
         // The stack comes back on the old release.
         runner.after_up = vec![("0.1.0".to_string(), true)];
 
@@ -1004,6 +1083,10 @@ mod tests {
                 "stop-writers".to_string(),
                 "up".to_string(),
                 "console-ready".to_string(),
+                // The last start recreates the services that read the
+                // pause, now that it is cleared (REL-2 S4b review
+                // round 2 BLOCKER 2).
+                "up-again".to_string(),
             ],
             "the stack was not put back the way it was: {:?}",
             runner.steps()
@@ -1030,7 +1113,7 @@ mod tests {
         let manifest = manifest_of("0.2.0", Some("0.0.0"), &[]);
         let facts = facts_of(&path, &manifest);
         let state_before = std::fs::read(state::path(&path)).expect("the state is readable");
-        let mut runner = Fake::failing_at("backup");
+        let mut runner = Fake::failing_at(&path, "backup");
         // The stack comes back on the old release.
         runner.after_up = vec![("0.1.0".to_string(), true)];
 
@@ -1057,6 +1140,10 @@ mod tests {
                 "backup".to_string(),
                 "up".to_string(),
                 "console-ready".to_string(),
+                // The last start recreates the services that read the
+                // pause, now that it is cleared (REL-2 S4b review
+                // round 2 BLOCKER 2).
+                "up-again".to_string(),
             ],
             "the stack was not put back the way it was: {:?}",
             runner.steps()
@@ -1081,7 +1168,7 @@ mod tests {
         let (_directory, path) = install_with_state("0.1.0");
         let manifest = manifest_of("0.2.0", Some("0.0.0"), &[]);
         let facts = facts_of(&path, &manifest);
-        let mut runner = Fake::failing_at_steps(&["stop-writers", "up"]);
+        let mut runner = Fake::failing_at_steps(&path, &["stop-writers", "up"]);
         // The stack does not come back at all: the writers cannot be
         // stopped, and the start that follows fails too.
 
@@ -1112,7 +1199,7 @@ mod tests {
         let (_directory, path) = install_with_state("0.1.0");
         let manifest = manifest_of("0.2.0", Some("0.0.0"), &[]);
         let facts = facts_of(&path, &manifest);
-        let mut runner = Fake::failing_at("up");
+        let mut runner = Fake::failing_at(&path, "up");
         // The stack does not come up with the new release, and comes up
         // with the old one when the rollback starts it.
         runner.after_up = vec![("0.1.0".to_string(), true)];
@@ -1143,7 +1230,7 @@ mod tests {
         facts.ready_timeout = 10;
         // The new release never becomes ready; the old one does, so
         // the rollback has something to wait for.
-        let mut runner = Fake::new();
+        let mut runner = Fake::new(&path);
         runner.after_up = vec![("0.2.0".to_string(), false), ("0.1.0".to_string(), true)];
 
         let error = run(&path, &facts, &mut runner).expect_err("the update fails");
@@ -1169,7 +1256,7 @@ mod tests {
         let manifest = manifest_of("0.2.0", Some("0.0.0"), &[]);
         let mut facts = facts_of(&path, &manifest);
         facts.manifest_bytes = b"{\"version\": \"0.2.0\"}".to_vec();
-        let mut runner = Fake::new();
+        let mut runner = Fake::new(&path);
 
         run(&path, &facts, &mut runner).expect("the update runs");
 
@@ -1201,16 +1288,134 @@ mod tests {
         let (_directory, path) = install_with_state("0.1.0");
         let manifest = manifest_of("0.2.0", Some("0.0.0"), &[]);
         let facts = facts_of(&path, &manifest);
-        let mut runner = Fake::new();
+        let mut runner = Fake::new(&path);
 
         run(&path, &facts, &mut runner).expect("the update runs");
 
+        // The pause is set in step 4, before the backup of step 5. The
+        // fake reads the `.env` at every call, so the backup is made
+        // with the pause set.
+        let steps = runner.steps_with_the_pause();
+        let backup = steps
+            .iter()
+            .position(|(call, _)| call == "backup")
+            .expect("the backup ran");
+        assert!(
+            steps[backup].1,
+            "the pause was not set before the backup: {steps:?}"
+        );
         // The pause is cleared at the end, so what the run leaves behind
         // is the pause being set and then cleared: the order is proved
         // by the rollback test below, where the pause is left set when
         // the rollback cannot clear it.
         let env = std::fs::read_to_string(path.join(".env")).expect("the env file is readable");
         assert!(!env.contains("MAINTENANCE_PAUSED"), "{env}");
+    }
+
+    #[test]
+    fn the_services_are_recreated_after_the_pause_is_cleared() {
+        // REL-2 S4b review round 2 BLOCKER 2: the Dagster services read
+        // MAINTENANCE_PAUSED when they are CREATED, so the update's own
+        // start creates them WITH the pause. Clearing the line in the
+        // `.env` is not enough: they have to be created again without
+        // it, or the jobs that delete files stay skipped and the
+        // storage grows with nothing saying so.
+        let (_directory, path) = install_with_state("0.1.0");
+        let manifest = manifest_of("0.2.0", Some("0.0.0"), &[]);
+        let facts = facts_of(&path, &manifest);
+        let mut runner = Fake::new(&path);
+
+        run(&path, &facts, &mut runner).expect("the update runs");
+
+        assert_eq!(
+            runner.steps_with_the_pause(),
+            vec![
+                ("fetch-images".to_string(), false),
+                ("stop-writers".to_string(), true),
+                ("backup".to_string(), true),
+                // The stack is created with the pause...
+                ("up".to_string(), true),
+                ("console-ready".to_string(), true),
+                // ...and created again without it, right after the pause
+                // is cleared.
+                ("up-again".to_string(), false),
+            ],
+            "the services were not recreated without the pause"
+        );
+    }
+
+    #[test]
+    fn the_services_are_recreated_when_the_update_stops_before_the_swap() {
+        // REL-2 S4b review round 2 BLOCKER 2: the way back clears the
+        // pause too, so the services that read it are recreated there
+        // as well — they were created with it.
+        let (_directory, path) = install_with_state("0.1.0");
+        let manifest = manifest_of("0.2.0", Some("0.0.0"), &[]);
+        let facts = facts_of(&path, &manifest);
+        let mut runner = Fake::failing_at(&path, "stop-writers");
+        // The stack comes back on the old release.
+        runner.after_up = vec![("0.1.0".to_string(), true)];
+
+        let error = run(&path, &facts, &mut runner).expect_err("the update fails");
+
+        assert!(
+            error
+                .to_string()
+                .contains("stopped before it changed anything"),
+            "the error says the update changed nothing: {error}"
+        );
+        assert_eq!(
+            runner.steps_with_the_pause(),
+            vec![
+                ("fetch-images".to_string(), false),
+                ("stop-writers".to_string(), true),
+                // The stack is put back with the pause still set...
+                ("up".to_string(), true),
+                ("console-ready".to_string(), true),
+                // ...and created again without it, right after the pause
+                // is cleared.
+                ("up-again".to_string(), false),
+            ],
+            "the services were not recreated without the pause"
+        );
+    }
+
+    #[test]
+    fn a_failed_recreate_after_the_pause_is_cleared_is_reported() {
+        // REL-2 S4b review round 2 BLOCKER 2: the second start can
+        // fail, and then the operator has to be told — the jobs that
+        // delete files stay skipped.
+        let (_directory, path) = install_with_state("0.1.0");
+        let manifest = manifest_of("0.2.0", Some("0.0.0"), &[]);
+        let facts = facts_of(&path, &manifest);
+        let mut runner = Fake::failing_at(&path, "up-again");
+
+        let error = run(&path, &facts, &mut runner).expect_err("the update does not hide it");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("the update to 0.2.0 is done"),
+            "the error says the update itself is done: {message}"
+        );
+        assert!(
+            message.contains("the services that read the pause could not be recreated"),
+            "the error says the services were not recreated: {message}"
+        );
+        assert!(
+            message.contains("stay skipped"),
+            "the error says what stays skipped: {message}"
+        );
+        let env = std::fs::read_to_string(path.join(".env")).expect("the env file is readable");
+        assert!(
+            !env.contains("MAINTENANCE_PAUSED"),
+            "the pause was not cleared: {env}"
+        );
+        let state = state::read(&path).expect("the state is read");
+        assert_eq!(
+            state.current_version.as_deref(),
+            Some("0.2.0"),
+            "the state does not name the release the stack runs"
+        );
     }
 
     #[test]
@@ -1222,7 +1427,7 @@ mod tests {
             "ops/backups/clickhouse/backups.xml".to_string(),
             b"<clickhouse/>".to_vec(),
         );
-        let mut runner = Fake::new();
+        let mut runner = Fake::new(&path);
 
         run(&path, &facts, &mut runner).expect("the update runs");
 
