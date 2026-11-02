@@ -308,7 +308,7 @@ A step not performed is never Pass.
 | `SRC-4-AC6` | Load an Oracle table incrementally with chosen columns, over an encrypted connection | Only new rows and the chosen columns arrive | Pass (product owner QA, 2026-11-01) |
 | `SRC-4-AC7` | Stop a source long enough to pass the lag limit | The lag shows on the connector page and one alert arrives | Pass (product owner QA, 2026-11-01) |
 
-**Acceptor** (not the Owner): the product owner **Date:** 2026-11-01 **Build:** `b50aac21` (CI run 41271660304, 38 of 38 jobs)
+**Acceptor** (not the Owner): the product owner **Date:** 2026-11-01 **Build:** not recorded by the acceptor (the last CI-proven build is `b50aac21`, run 41271660304, 38 of 38 jobs)
 
 Exceptions, each with an owner and a date:
 
