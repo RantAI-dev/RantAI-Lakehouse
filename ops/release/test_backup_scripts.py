@@ -39,6 +39,14 @@ FAKE_DOCKER = """#!/usr/bin/env bash
 # it was asked to do, and it says what the script needs to hear.
 set -euo pipefail
 echo "docker $*" >> "${FAKE_DOCKER_LOG:-/dev/null}"
+# The stack as a whole — `docker compose ... up -d`, with no service
+# name after it — does not start when the environment says so: the
+# release that failed never becomes healthy, and the console depends
+# on it (REL-2 S4b review round 8 BLOCKER 3).
+if [ "${*: -2}" = "up -d" ] && [ "${FAKE_DOCKER_STACK_UP_FAILS:-false}" = "true" ]; then
+    echo "dependency failed to start: container lakehouse-api-1 is unhealthy" >&2
+    exit 1
+fi
 case "$*" in
     *pg_dumpall*)
         echo "-- a stand-in for the dump"
@@ -284,9 +292,14 @@ class RestoreScriptTest(ScriptTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         return sorted((self.deployment / "backups").iterdir())[0]
 
-    def run_restore(self, backup: Path, **environment: str) -> subprocess.CompletedProcess[str]:
+    def run_restore(
+        self, backup: Path, skip_stack_up: bool = True, **environment: str
+    ) -> subprocess.CompletedProcess[str]:
+        args = ["bash", str(self.restore), "--local", str(backup)]
+        if skip_stack_up:
+            args.append("--skip-stack-up")
         return subprocess.run(
-            ["bash", str(self.restore), "--local", str(backup), "--skip-stack-up"],
+            args,
             capture_output=True,
             text=True,
             env=self.environment(**environment),
@@ -390,6 +403,55 @@ class RestoreScriptTest(ScriptTestCase):
             if path.name.startswith("release.json.before-restore-")
         ]
         self.assertEqual(len(kept), 1, f"the files kept are {kept}")
+
+    def test_the_restore_starts_the_stack_when_it_is_not_told_not_to(self) -> None:
+        """Without `--skip-stack-up`, the restore brings the stack up —
+        the last step of the local restore (REL-2 S4b review round 8
+        BLOCKER 3)."""
+        backup = self.make_backup()
+        result = self.run_restore(
+            backup, skip_stack_up=False, LAKEHOUSE_DIR=str(self.deployment)
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "Starting the remaining services in the stack",
+            result.stdout,
+            "the stack was never started",
+        )
+        self.assertTrue(
+            any(" up -d" in call for call in self.docker_calls()),
+            f"the stack was never started: {self.docker_calls()}",
+        )
+
+    def test_a_stack_that_does_not_start_is_not_a_failed_restore(self) -> None:
+        """The data is restored, and the operator is told what did not
+        start (REL-2 S4b review round 8 BLOCKER 3).
+
+        The rollback of a failed update restores onto the stack the
+        failed update left behind, and the release that failed never
+        becomes healthy — the console depends on its API — so the stack
+        bring-up at the end of the restore cannot start. The restore
+        must not fail with it: the rollback starts the stack itself,
+        with the release it goes back to (D18).
+        """
+        backup = self.make_backup()
+        result = self.run_restore(
+            backup,
+            skip_stack_up=False,
+            LAKEHOUSE_DIR=str(self.deployment),
+            FAKE_DOCKER_STACK_UP_FAILS="true",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "the stack did not start",
+            result.stdout,
+            f"the operator was not told: {result.stdout}",
+        )
+        self.assertIn(
+            "dependency failed to start",
+            result.stdout,
+            f"what compose said was not passed on: {result.stdout}",
+        )
 
     def test_the_restore_replaces_the_data_it_restores(self) -> None:
         """A local restore REPLACES the data the backup holds.

@@ -537,10 +537,28 @@ if [[ -n "${LOCAL_DIR}" ]]; then
   done
 
   LOCAL_STACK_DURATION=0
+  local_stack_started=true
   if [[ "${SKIP_STACK_UP}" != "true" ]]; then
     echo "==> [Step 5/5] Starting the remaining services in the stack..."
     LOCAL_STACK_START=$(date +%s)
-    "${COMPOSE[@]}" up -d
+    # The stack is brought up LAST, and a stack that does not start is
+    # NOT a failed restore: the DATA is back, and the caller is told
+    # what did not start. The rollback of a failed update is the case
+    # that matters — the release it goes back to starts the stack
+    # itself, with its own files, right after this restore (D18), and
+    # the release that FAILED never becomes healthy: `docker compose
+    # up -d` waits for the API the console depends on, and it waits
+    # for nothing (REL-2 S4b review round 8 BLOCKER 3).
+    #
+    # What compose says about it is captured and printed: the tool that
+    # runs this script prints its STANDARD output, and the reason the
+    # stack did not start is the one thing the operator needs.
+    if ! stack_output="$("${COMPOSE[@]}" up -d 2>&1)"; then
+      local_stack_started=false
+      echo "Warning: the stack did not start. The data is restored; the services that"
+      echo "         did not start can be started by hand."
+      echo "${stack_output}"
+    fi
     LOCAL_STACK_DURATION=$(( $(date +%s) - LOCAL_STACK_START ))
   else
     echo "==> [Step 5/5] Skipping full stack up (--skip-stack-up passed)"
@@ -554,7 +572,11 @@ if [[ -n "${LOCAL_DIR}" ]]; then
   echo "  ClickHouse restore:      ${LOCAL_CH_DURATION}s"
   echo "  Connector secrets:       ${LOCAL_SECRETS_DURATION}s"
   echo "  Configuration:           ${LOCAL_ENV_DURATION}s"
-  echo "  Stack bring-up:          ${LOCAL_STACK_DURATION}s"
+  if [[ "${local_stack_started}" == "true" ]]; then
+    echo "  Stack bring-up:          ${LOCAL_STACK_DURATION}s"
+  else
+    echo "  Stack bring-up:          the stack did not start"
+  fi
   echo "  Total restore time:      ${TOTAL_DURATION}s"
   echo "================================================================="
   exit 0
