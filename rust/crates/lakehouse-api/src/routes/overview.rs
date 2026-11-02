@@ -19,6 +19,7 @@ use serde_json::{Value, json};
 use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::next_run::next_run_at;
+use crate::routes::catalog::NOT_IN_PRIMARY;
 use crate::routes::support::{num_or_zero, str_col, upstream_message};
 use crate::state::AppState;
 use lakehouse_dagster::{
@@ -54,22 +55,58 @@ pub async fn get(State(state): State<AppState>) -> Response {
     }
 }
 
+/// DATA-42 D7: the assets statement of this route, as a named constant, so
+/// the test runs the statement this route SHIPS rather than a copy of it.
+///
+/// `{not_in_primary}` is where the one clause goes: the primary-wins
+/// predicate every secondary branch carries (DATA-40 D3, in the ONE place
+/// it is defined — [`crate::routes::catalog::NOT_IN_PRIMARY`]). It is a
+/// placeholder and not the clause itself because a `const` cannot hold
+/// another `const`'s value, and the clause must not be re-typed here
+/// (DATA-42 D2).
+///
+/// DATA-42 D1/D3: the primary registry wins (the secondary branch drops
+/// the slugs the primary holds), and every registry table is read with
+/// `FINAL` — the registry is a `ReplacingMergeTree ORDER BY slug` that
+/// every run of a connector writes again, and `ClickHouse` merges the
+/// copies only in the background.
+///
+/// Each union is deduplicated on its own, so the join below meets one
+/// catalog row and one sync row per slug.
+const ASSETS_SQL: &str =
+    "SELECT toString(count()) n, toString(countIf(coalesce(s.total,0)=0)) stale FROM (
+     SELECT slug FROM lake.`bronze_meta.dataset_catalog` FINAL
+     UNION ALL SELECT slug FROM lake.`bronze_meta_sec.dataset_catalog` FINAL
+     WHERE slug {not_in_primary}) c
+   LEFT JOIN (SELECT slug,total FROM lake.`bronze_meta.dataset_sync` FINAL
+              UNION ALL SELECT slug,total FROM lake.`bronze_meta_sec.dataset_sync` FINAL
+              WHERE slug {not_in_primary}) s ON c.slug=s.slug";
+
+/// DATA-42 D7: the warm-tier asset count, as a named constant. See
+/// [`ASSETS_SQL`] for the `{not_in_primary}` placeholder and for the
+/// primary-wins rule it carries (DATA-42 D1/D3).
+const WARM_ASSETS_SQL: &str = "SELECT toString(count()) assets FROM (
+     SELECT total FROM lake.`bronze_meta.dataset_sync` FINAL
+     UNION ALL SELECT total FROM lake.`bronze_meta_sec.dataset_sync` FINAL
+     WHERE slug {not_in_primary})";
+
+/// [`ASSETS_SQL`] with the primary-wins clause spliced in.
+fn assets_sql() -> String {
+    ASSETS_SQL.replace("{not_in_primary}", NOT_IN_PRIMARY)
+}
+
+/// [`WARM_ASSETS_SQL`] with the primary-wins clause spliced in.
+fn warm_assets_sql() -> String {
+    WARM_ASSETS_SQL.replace("{not_in_primary}", NOT_IN_PRIMARY)
+}
+
 async fn get_body(
     ch: &ChClient,
     dagster: &DgClient,
     pg: Option<&PgPool>,
     probes: &[crate::health::ServiceHealth],
 ) -> Result<Value, OverviewError> {
-    let assets_row = ch
-        .rows(
-            "SELECT toString(count()) n, toString(countIf(coalesce(s.total,0)=0)) stale FROM (
-         SELECT slug FROM lake.`bronze_meta.dataset_catalog`
-         UNION ALL SELECT slug FROM lake.`bronze_meta_sec.dataset_catalog`) c
-       LEFT JOIN (SELECT slug,total FROM lake.`bronze_meta.dataset_sync`
-                  UNION ALL SELECT slug,total FROM lake.`bronze_meta_sec.dataset_sync`) s ON c.slug=s.slug",
-            None,
-        )
-        .await?;
+    let assets_row = ch.rows(&assets_sql(), None).await?;
     let hot_row = ch
         .rows(
             "SELECT toString(sum(bytes_on_disk)) bytes, toString(uniqExact(table)) assets FROM system.parts WHERE database='serving' AND active",
@@ -80,12 +117,7 @@ async fn get_body(
     // A `rows` column used to feed `warm.bytes` via an invented
     // rows-times-220-bytes constant; that estimate is gone (see below), so
     // the column that only fed it is gone too.
-    let warm_row = ch
-        .rows(
-            "SELECT toString(count()) assets FROM (SELECT total FROM lake.`bronze_meta.dataset_sync` UNION ALL SELECT total FROM lake.`bronze_meta_sec.dataset_sync`)",
-            None,
-        )
-        .await?;
+    let warm_row = ch.rows(&warm_assets_sql(), None).await?;
     let q_row = ch
         .rows(
             "SELECT toString(count()) vol, toString(round(quantile(0.95)(query_duration_ms))) p95,
@@ -893,5 +925,186 @@ mod tests {
         let result = count_delayed_schedules(&dagster, &jobs, now).await;
 
         assert_eq!(result, Some(1));
+    }
+
+    // ── DATA-42 D1/D3/D7: the primary registry wins. ─────────────────────
+    //
+    // The overview counts the Bronze datasets from BOTH registries: a slug
+    // that is in both was counted TWICE in `assets`, and its sync row
+    // twice in `stale`; the warm tier's dataset count counted it twice as
+    // well.
+    //
+    // These tests run against a REAL `ClickHouse` (the compose file's own
+    // `26.8` tag, through `testcontainers`), and they run the route's OWN
+    // statements -- the named constants of D7 -- so the statement tested
+    // is the statement shipped.
+    mod registry_clash {
+        #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+        use lakehouse_clickhouse::ChClient;
+
+        use super::*;
+        use crate::routes::bronze_registry_fixture::{clickhouse, pinned, seed_catalog, seed_sync};
+
+        /// The row the assets statement answers.
+        async fn assets_row(ch: &ChClient) -> serde_json::Map<String, Value> {
+            let rows = ch.rows(&assets_sql(), None).await.unwrap();
+            rows.into_iter()
+                .next()
+                .expect("the assets statement answers")
+        }
+
+        /// The row the warm-assets statement answers.
+        async fn warm_assets_row(ch: &ChClient) -> serde_json::Map<String, Value> {
+            let rows = ch.rows(&warm_assets_sql(), None).await.unwrap();
+            rows.into_iter()
+                .next()
+                .expect("the warm-assets statement answers")
+        }
+
+        /// A slug the two registries both hold: one dataset, counted once,
+        /// and the PRIMARY's row count is the one that counts.
+        #[tokio::test]
+        async fn a_clashing_dataset_is_counted_once_and_follows_the_primary() {
+            let (url, _container) = clickhouse().await;
+            let ch = ChClient::new(url.clone(), "default".to_owned(), String::new());
+
+            seed_catalog(
+                &ch,
+                "bronze_meta",
+                "clash_overview",
+                "Primary overview",
+                "clash_overview_raw",
+            )
+            .await;
+            // The primary's dataset has no rows yet: it is the stale one.
+            seed_sync(
+                &ch,
+                "bronze_meta",
+                "clash_overview",
+                "Primary overview",
+                "clash_overview_raw",
+                0,
+            )
+            .await;
+            seed_catalog(
+                &ch,
+                "bronze_meta_sec",
+                "clash_overview",
+                "Secondary overview",
+                "clash_overview_sec_raw",
+            )
+            .await;
+            seed_sync(
+                &ch,
+                "bronze_meta_sec",
+                "clash_overview",
+                "Secondary overview",
+                "clash_overview_sec_raw",
+                99,
+            )
+            .await;
+
+            let row = assets_row(&ch).await;
+            assert_eq!(
+                str_col(&row, "n"),
+                "1",
+                "one dataset, counted once: {row:?}"
+            );
+            assert_eq!(
+                str_col(&row, "stale"),
+                "1",
+                "the primary's row count (none) is the stale one, not the \
+                 secondary's: {row:?}"
+            );
+
+            let row = warm_assets_row(&ch).await;
+            assert_eq!(
+                str_col(&row, "assets"),
+                "1",
+                "one dataset in the warm tier: {row:?}"
+            );
+        }
+
+        /// A slug a second run wrote again is counted once, not twice.
+        ///
+        /// DATA-42 D3: without `FINAL` the two copies of the row are two
+        /// rows, so the dataset is counted twice.
+        #[tokio::test]
+        async fn a_slug_written_twice_to_the_primary_is_counted_once() {
+            let (url, _container) = clickhouse().await;
+            // `max_threads=1` pins the engine's read order, so WHICH of
+            // the two copies `FINAL` keeps is one thing and not a coin
+            // toss (a URL setting, so the statement the module sends is
+            // the statement that runs).
+            let ch = ChClient::new(pinned(&url), "default".to_owned(), String::new());
+
+            // The two copies of the rows stay apart: no merge may collapse
+            // them before the statements read them.
+            ch.exec(
+                "SYSTEM STOP MERGES lake.`bronze_meta.dataset_catalog`",
+                None,
+            )
+            .await
+            .expect("stop the merges of the catalog table");
+            ch.exec("SYSTEM STOP MERGES lake.`bronze_meta.dataset_sync`", None)
+                .await
+                .expect("stop the merges of the sync table");
+
+            seed_catalog(
+                &ch,
+                "bronze_meta",
+                "twice_overview",
+                "Twice overview",
+                "twice_overview_raw",
+            )
+            .await;
+            seed_sync(
+                &ch,
+                "bronze_meta",
+                "twice_overview",
+                "Twice overview",
+                "twice_overview_raw",
+                10,
+            )
+            .await;
+            // The same run again, before `ClickHouse` merged the parts.
+            seed_catalog(
+                &ch,
+                "bronze_meta",
+                "twice_overview",
+                "Twice overview again",
+                "twice_overview_raw",
+            )
+            .await;
+            seed_sync(
+                &ch,
+                "bronze_meta",
+                "twice_overview",
+                "Twice overview again",
+                "twice_overview_raw",
+                20,
+            )
+            .await;
+
+            let row = assets_row(&ch).await;
+            assert_eq!(
+                str_col(&row, "n"),
+                "1",
+                "one dataset, counted once: {row:?}"
+            );
+            assert_eq!(
+                str_col(&row, "stale"),
+                "0",
+                "the newer row count (20) is not a stale one: {row:?}"
+            );
+
+            let row = warm_assets_row(&ch).await;
+            assert_eq!(
+                str_col(&row, "assets"),
+                "1",
+                "one dataset in the warm tier: {row:?}"
+            );
+        }
     }
 }
