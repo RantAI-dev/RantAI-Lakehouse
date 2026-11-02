@@ -335,7 +335,21 @@ compose up`. Brings up `dagster-db-init` (one-shot: creates Dagster's own
 `dagster` database on the existing `postgres` service), `dagster-code-location`
 (a gRPC server serving `dispar_orchestrate.definitions`, built from
 `dagster/Dockerfile` — see ADR 0005), `dagster-webserver` (GraphQL API +
-UI, port `3000`), and `dagster-daemon` (schedules/sensors/run queueing).
+UI, container port `3000`), and `dagster-daemon` (schedules/sensors/run
+queueing).
+
+**The Dagster UI is published on the host's loopback only**
+(`127.0.0.1:${DAGSTER_WEBSERVER_HOST_PORT:-3001}:3000`, REL-2 S4b review
+round 4, D23). Its UI has no sign-in: anyone who can reach the port can
+launch runs. Nothing outside the compose network needs it — the API and
+the jobs reach the GraphQL API in-network, at
+`http://dagster-webserver:3000/graphql` — and the default port `3001`
+keeps it clear of the console's `3000`. An operator reaches the UI
+through an SSH tunnel:
+
+```bash
+ssh -L 3001:127.0.0.1:3001 <host>   # then open http://127.0.0.1:3001
+```
 
 Put `DAGSTER_URL` in `.env` — do **not** rely on prefixing it onto a single
 command:
@@ -1143,6 +1157,78 @@ acted and the user affected. Neither carries the password.
   change-password form on the user's own account is for: it asks for the
   old password first. A self-reset is refused with a 400 naming that
   route.
+
+## Changing what a user may do, and switching a user off
+
+`app_user.status` has been in the schema since `0001_init.sql`, but
+until ADM-4 nothing enforced it: an inactive user still signed in with a
+password, kept working sessions, and signed in through single sign-on.
+ADM-4 makes the column mean what it says, and adds the three changes an
+administrator needs after the invite.
+
+**In the console.** Administration → Users → the row's **⋮** menu:
+
+- **Edit roles** replaces the user's **whole local role set**. The ticked
+  roles are the roles the user holds; a role left unticked is a role they
+  no longer hold. Roles mapped from the identity provider's groups
+  (`OIDC_ROLE_MAP`) are not stored and are not touched — they are
+  re-resolved from the provider's claims on every request, so the user
+  keeps the union of the two, exactly as before.
+- **Remove from tenant** takes the user out of one tenant. Their data,
+  dashboards and audit history stay.
+- **Deactivate** / **Reactivate** switches the user off and on again.
+
+**From the API.** The same four calls, with the same permission
+(`identity:write` — Platform Admin holds it):
+
+```bash
+# Replace a user's local role set. The list is the user's COMPLETE set.
+curl -sS -X PUT "$LAKEHOUSE_URL/api/identity/users/<user-id>/roles" \
+  -H 'content-type: application/json' -b cookies.txt \
+  -d '{"roles":["Analyst"]}'
+
+# Take a user out of a tenant.
+curl -sS -X DELETE "$LAKEHOUSE_URL/api/identity/users/<user-id>/tenants/<tenant-id>" \
+  -b cookies.txt
+
+# Switch a user off, and back on again.
+curl -sS -X POST "$LAKEHOUSE_URL/api/identity/users/<user-id>/deactivate" \
+  -H 'content-type: application/json' -b cookies.txt
+curl -sS -X POST "$LAKEHOUSE_URL/api/identity/users/<user-id>/reactivate" \
+  -H 'content-type: application/json' -b cookies.txt
+```
+
+All four writes are audited: one `identity.user.roles.set` row (with the
+old and the new role names), one `identity.user.tenant.remove` row, and
+one `identity.user.deactivate` / `identity.user.reactivate` row, each
+naming the administrator who acted and the user affected.
+
+**Three rules worth knowing before you use them.**
+
+- **They are not an escalation path.** Only an administrator holding the
+  unrestricted `*:*` grant may change the roles of a user who holds
+  `*:*`, grant a role that holds `*:*`, or switch an unrestricted user
+  off or on. Anyone else gets the same "not found" answer as for a user
+  id that does not exist, so the answer never reveals which accounts
+  exist.
+- **The deployment keeps an administrator.** A change that would leave no
+  active user holding `*:*` is refused with a 409, in the same
+  transaction as the change. Nobody may switch themselves off either.
+- **Switching a user off ends every session they hold, at once.** It
+  also refuses the account on every path: the password sign-in answers
+  exactly as a wrong password does, an existing session cookie stops
+  working, and single sign-on refuses them — and does **not** create a
+  new account for them, so the identity provider cannot be used to walk
+  around the deactivation. The user's data is untouched: deactivation is
+  not deletion.
+
+A user with no personal API token owns none to revoke: `service_credential`
+belongs to `service_identity`, and a service identity is a separate
+principal that no user route touches.
+
+The bootstrap admin is **not** re-activated by a restart: it is seeded
+only when an account with that email does not exist yet, so a bootstrap
+admin an administrator deliberately switched off stays off.
 
 ## Postgres: unreachable is loud, a mismatched schema refuses to start
 

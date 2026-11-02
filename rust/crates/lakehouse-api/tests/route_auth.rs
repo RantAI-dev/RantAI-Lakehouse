@@ -3729,3 +3729,50 @@ async fn the_scheduler_run_door_stays_shut_to_a_person_when_the_test_door_is_ope
         tested.status()
     );
 }
+
+/// ADM-4 T1/T2: the four new identity write routes are in `POLICY_TABLE`
+/// as `identity:write`, and the gate agrees both ways: no session is 401,
+/// a principal without `identity:write` is 403, and one holding it gets
+/// past the gate (what follows is the handler's own answer — 400 for the
+/// concretized ids used here — never 401 or 403).
+#[tokio::test]
+async fn the_adm_4_identity_write_routes_are_gated_in_both_directions() {
+    let TestApp { router, pool } = spin_up().await;
+    for (method, path) in [
+        ("PUT", "/api/identity/users/{id}/roles"),
+        ("DELETE", "/api/identity/users/{id}/tenants/{tenant_id}"),
+        ("POST", "/api/identity/users/{id}/deactivate"),
+        ("POST", "/api/identity/users/{id}/reactivate"),
+    ] {
+        assert_eq!(
+            POLICY_TABLE
+                .iter()
+                .find(|(m, p, _)| *m == method && *p == path)
+                .map(|(_, _, policy)| *policy),
+            Some(Policy::RequiresPermission("identity:write")),
+            "{method} {path}"
+        );
+        let concrete = concretize(path);
+        let anonymous = request_with_cookie(&router, method, &concrete, "").await;
+        assert_eq!(
+            anonymous.status(),
+            StatusCode::UNAUTHORIZED,
+            "{method} {path}"
+        );
+        let plain = create_principal_with_permissions(&pool, "query:read").await;
+        let cookie = session_cookie_for_user(&pool, plain).await;
+        let refused = request_with_cookie(&router, method, &concrete, &cookie).await;
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN, "{method} {path}");
+        let writer = create_principal_with_permissions(&pool, "identity:write").await;
+        let cookie = session_cookie_for_user(&pool, writer).await;
+        let allowed = request_with_cookie(&router, method, &concrete, &cookie).await;
+        assert!(
+            !matches!(
+                allowed.status(),
+                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+            ),
+            "{method} {path}: a caller holding identity:write must get past the gate, got {}",
+            allowed.status()
+        );
+    }
+}
