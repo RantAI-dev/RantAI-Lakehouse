@@ -4474,3 +4474,20 @@ no cargo command ran for it. No Docker stack was started, as instructed.
 rolls back` did not run in this session; it runs in the PR's CI. The
 `--skip-stack-up` path of the script was exercised only against the fake
 docker, not on a real host.
+
+### Review S4b round 10 (planner, 2026-11-02, at `827a5246`): BLOCKER 4 fixed
+
+- **`16616811`:** `backup::restore(dir, backup, start_stack)` passes `--skip-stack-up` when `start_stack` is false.
+  - `Runner::restore`, which both the update's `roll_back` and `rollback.rs` use, passes `false`. `command_restore` passes `true`.
+  - The fake-tool test checks the exact argument list on both paths.
+  - The script already accepts `--skip-stack-up` before `--local`.
+- **`f0ba8a58`:** step 5/5 fails again with exit 1 when the stack does not start. The reason and compose's output go to stderr, and the summary stays honest. The round 8 test that expected exit 0 is replaced, and the `ERR` trap is kept.
+- **Counts (the developer's):**
+  - `cargo test -p lakehousectl`: 190 passed;
+  - clippy and fmt: clean;
+  - `pytest ops/release -q`: 245 passed;
+  - `bash -n` and `shellcheck -S warning`: clean.
+
+**Open: no BLOCKER on the code.** The merge waits for:
+- `#345`, which fixes RUSTSEC-2026-0429 and RUSTSEC-2026-0435, so that `cargo audit` and `cargo deny` go green;
+- then an update-branch, and this PR's `Proof · the update moves the stack, and rolls back` on that head.
