@@ -181,6 +181,20 @@ DAGSTER_STEPS = (
 # install runs, and the file the proof's compose call reads.
 INSTALL_ENV = "--env-file install/.env"
 
+# The digest reference the proof's own steps pull, and the commands the
+# check below reads.
+#
+# Docker's CONTAINERD image store does NOT register the TAG when the
+# pull is by digest: the digest reference and the tag are two names for
+# one image, and only the digest one is registered (REL-2 S3 D13). A
+# `docker save` of the tag then fails with "No such image", and the
+# bundle's archive is never written — PR #335's `update-proof` job,
+# bundle B.
+DIGEST_REFERENCE = "$reference"
+PULL = re.compile(r'docker pull\s+"(?P<argument>[^"]*)"')
+SAVE = re.compile(r"docker save\b(?P<argument>.*)$")
+TAG = re.compile(r'docker tag\s+"(?P<argument>[^"]*)"')
+
 # The registries the proof cuts the runner off from: Docker Hub's
 # registry, its authentication and its index, GHCR, Quay, and the CDN
 # the Docker Hub layers come from.
@@ -447,6 +461,48 @@ jobs:
         run: docker run -d --name registry -p 5000:5000 registry:2
 """
 
+# A workflow whose proof pulls an image by its digest and then saves it
+# BY ITS TAG, with no `docker tag` in between: on Docker's containerd
+# image store the pull does not create the tag, so the save fails with
+# "No such image" (REL-2 S3 D13; PR #335 update-proof, bundle B).
+SYNTHETIC_PROOF_SAVES_A_TAG_WITHOUT_TAGGING_IT = """
+name: Synthetic
+on: workflow_dispatch
+jobs:
+  update-proof:
+    runs-on: ubuntu-latest
+    steps:
+      - name: The bundle B is assembled and signed
+        run: |
+          set -euo pipefail
+          digest="sha256:0123"
+          reference="localhost:5000/rantai-lakehouse-api:0.1.0-update-proof.1@$digest"
+          docker pull "$reference"
+          docker save -o bundle-b/images/rantai-lakehouse-api.tar \\
+            "localhost:5000/rantai-lakehouse-api:0.1.0-update-proof.1"
+"""
+
+# The same workflow, with the tag made before the save: the way
+# `ops/release/make_bundle.sh` does it (REL-2 S3 D13).
+SYNTHETIC_PROOF_TAGS_BEFORE_IT_SAVES = """
+name: Synthetic
+on: workflow_dispatch
+jobs:
+  update-proof:
+    runs-on: ubuntu-latest
+    steps:
+      - name: The bundle B is assembled and signed
+        run: |
+          set -euo pipefail
+          digest="sha256:0123"
+          reference="localhost:5000/rantai-lakehouse-api:0.1.0-update-proof.1@$digest"
+          docker pull "$reference"
+          docker tag "$reference" \\
+            "localhost:5000/rantai-lakehouse-api:0.1.0-update-proof.1"
+          docker save -o bundle-b/images/rantai-lakehouse-api.tar \\
+            "localhost:5000/rantai-lakehouse-api:0.1.0-update-proof.1"
+"""
+
 
 def load_workflow(path: Path = WORKFLOW_PATH) -> dict[str, Any]:
     """The workflow, parsed."""
@@ -593,6 +649,104 @@ def shell_commands(run: str) -> str:
     return "\n".join(
         line for line in run.splitlines() if not line.strip().startswith("#")
     )
+
+
+def logical_lines(run: str) -> list[str]:
+    """The run block's logical lines.
+
+    A line that ends with a backslash continues on the next one, so a
+    command split over two lines is ONE command: a `docker save` whose
+    image is named on the next line still saves that image.
+    """
+    lines: list[str] = []
+    buffer = ""
+    for raw in shell_commands(run).splitlines():
+        line = raw.strip()
+        buffer = f"{buffer} {line}" if buffer else line
+        if buffer.endswith("\\"):
+            buffer = buffer[:-1].rstrip()
+            continue
+        lines.append(buffer)
+        buffer = ""
+    if buffer:
+        lines.append(buffer)
+    return lines
+
+
+def digest_pulls(lines: list[str]) -> list[int]:
+    """Where the step pulls an image BY ITS DIGEST.
+
+    A pull of a plain tag (`alpine:3.20`) is not one: the tag is the
+    name that pull creates.
+    """
+    found: list[int] = []
+    for index, line in enumerate(lines):
+        match = PULL.search(line)
+        if match is None:
+            continue
+        argument = match.group("argument")
+        if "@" in argument or argument == DIGEST_REFERENCE:
+            found.append(index)
+    return found
+
+
+def tag_saves(lines: list[str]) -> list[int]:
+    """Where the step saves an image BY ITS TAG.
+
+    A save of a digest reference is not one: the archive it writes
+    loads as a dangling image, and the host that loads it cannot
+    resolve the digest-pinned reference the manifest names (REL-2 S3
+    D13).
+    """
+    found: list[int] = []
+    for index, line in enumerate(lines):
+        match = SAVE.search(line)
+        if match is None:
+            continue
+        argument = match.group("argument")
+        if "@" in argument or DIGEST_REFERENCE in argument:
+            continue
+        found.append(index)
+    return found
+
+
+def tags_the_digest_reference(lines: list[str], start: int, end: int) -> bool:
+    """Whether the lines between two of them tag the digest reference."""
+    for line in lines[start:end]:
+        match = TAG.search(line)
+        if match is None:
+            continue
+        argument = match.group("argument")
+        if argument == DIGEST_REFERENCE or "@" in argument:
+            return True
+    return False
+
+
+def untagged_saves(document: dict[str, Any], job_name: str) -> list[str]:
+    """Every image the job pulls by digest and then saves BY TAG, with
+    no `docker tag` in between.
+
+    Docker's containerd image store does not register the TAG when the
+    pull is by digest, so the save of the tag fails with "No such
+    image" and the bundle's archive is never written (REL-2 S3 D13;
+    PR #335 update-proof, bundle B).
+    """
+    problems: list[str] = []
+    for step in steps_of(document, job_name):
+        name = str(step.get("name"))
+        lines = logical_lines(str(step.get("run") or ""))
+        for pull in digest_pulls(lines):
+            for save in tag_saves(lines):
+                if save <= pull:
+                    continue
+                if tags_the_digest_reference(lines, pull, save):
+                    continue
+                problems.append(
+                    f"{job_name}: {name}: the image is pulled by digest and then saved by tag, "
+                    f"and nothing tags it in between: on Docker's containerd image store a pull by "
+                    f"digest does not create the tag, so the save fails with 'No such image'."
+                )
+    return problems
 
 
 def sbom_steps(document: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
@@ -1704,6 +1858,27 @@ class UpdateProofTest(unittest.TestCase):
         run = str(step_named(self.document, "update-proof", "The update to bundle B succeeds").get("run"))
         self.assertIn("lakehousectl update --bundle bundle-b", run)
         self.assertIn("/health/ready", run)
+
+    def test_the_update_proof_tags_every_image_it_saves_by_tag(self) -> None:
+        """Every image the proof pulls by digest is TAGGED before it is
+        saved.
+
+        Docker's containerd image store does not register the tag when
+        the pull is by digest: the digest reference and the tag are two
+        names for one image, and only the digest one is registered. A
+        `docker save` of the tag then fails with "No such image", and
+        the bundle's archive is never written (PR #335 update-proof,
+        bundle B; REL-2 S3 D13).
+        """
+        problems = untagged_saves(self.document, "update-proof")
+        self.assertEqual(problems, [], "\n".join(problems))
+
+    def test_a_proof_that_saves_a_tag_without_tagging_it_is_reported(self) -> None:
+        """The check above must be able to fail."""
+        document = yaml.safe_load(SYNTHETIC_PROOF_SAVES_A_TAG_WITHOUT_TAGGING_IT)
+        self.assertNotEqual(untagged_saves(document, "update-proof"), [])
+        tagged = yaml.safe_load(SYNTHETIC_PROOF_TAGS_BEFORE_IT_SAVES)
+        self.assertEqual(untagged_saves(tagged, "update-proof"), [])
 
     def test_the_update_to_bundle_c_must_fail_and_roll_back(self) -> None:
         """Step 4 of D21: the update to the bundle that never becomes

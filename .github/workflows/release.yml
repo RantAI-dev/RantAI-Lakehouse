@@ -1720,6 +1720,21 @@ jobs:
           # containerd store.
           docker pull "$reference"
 
+          # The TAG, because Docker's CONTAINERD image store does not
+          # create one for a pull by digest: the digest reference and
+          # the tag are two names for one image, and only the digest
+          # one is registered. Every `docker save` below is BY THE TAG
+          # — the archive has to carry the repository and the tag, or
+          # the host that loads it cannot resolve the digest-pinned
+          # reference the manifest names (REL-2 S3 D13) — so the tag is
+          # made here, the way `ops/release/make_bundle.sh` makes it.
+          #
+          # PR #335 update-proof (bundle B): without this tag the save
+          # failed with "No such image: localhost:5000/rantai-lakehouse-api",
+          # and the bundle's archive was never written.
+          docker tag "$reference" \
+            "${{ env.RELEASE_REGISTRY }}/rantai-lakehouse-api:$version"
+
           # The image's id, the way the pipeline reads it: the config
           # digest out of the image's own saved archive, because the
           # containerd store reports the INDEX digest as the id
@@ -1788,6 +1803,13 @@ jobs:
           reference="${{ env.RELEASE_REGISTRY }}/rantai-lakehouse-api:$version@$digest"
 
           docker pull "$reference"
+
+          # The TAG, for the reason bundle B's step gives: on the
+          # containerd image store a pull by digest does not create one,
+          # and the archive below is saved BY THE TAG (PR #335
+          # update-proof, bundle B).
+          docker tag "$reference" \
+            "${{ env.RELEASE_REGISTRY }}/rantai-lakehouse-api:$version"
           id="$(docker image inspect --format '{{.Id}}' "$reference")"
           echo "the sleeping API image is $reference ($id)"
 
