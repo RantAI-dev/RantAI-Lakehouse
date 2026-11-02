@@ -160,6 +160,121 @@ PR's release dry run (rule 8: proven by a real build and install, not by `config
 
 ## 5. Handoff (developer appends below)
 
+### Handoff (developer, 2026-11-02)
+
+Branch `fix/web-2-no-landing-on-installs`, base `main` at `9c066426` (the plan commit
+`3e9c1f71` on top). An installed Lakehouse does not serve `/landing`, and the release's install
+proof says so.
+
+**Commits** (all pushed, one per task; `git log --oneline origin/fix/web-2-no-landing-on-installs`):
+
+- `ca11943e` — feat(web-2): keep the landing page out of the console image (T1, plan D1–D2).
+  `.dockerignore` gains `src/app/landing` and `src/features/landing` with the reason (the owner
+  decided on 2026-11-02 that the page is a separate product page and an install must not offer
+  it). `src/app/landing/page.tsx` and `src/features/auth/auth-provider.tsx` say, where a reader
+  looks, that the dev server serves the page and an install does not.
+- `e10ae4d4` — feat(web-2): prove on the install that /landing is not served (T2, plan D3).
+  The release workflow's `pull_request.paths` gains `.dockerignore`, so a PR that edits the console
+  image's build context runs the dry run and the proof. The install proof asks the installed
+  console for `/landing`'s status and fails the job unless it is 404. `ops/release/test_release_workflow.py`
+  reads `.dockerignore` and asserts both of the landing page's folders are out of the build
+  context, with Docker's own rule (last match wins, `!` re-includes), and asserts the proof asks
+  for the status, names 404 and fails the job. Each of the three checks also runs against a
+  synthetic case, so a check that cannot fail is itself a failure.
+- `3ac4c72c` — docs(web-2): the pages say where the landing page lives (T3, plan D4–D5).
+  `landing-page.md` gets decision row 6, the limits line, the AC note, and open question 2
+  replaced by D5's question. `BACKLOG.md` gets the `WEB-2` row. `docs/CI.md` names the paths that
+  make the release workflow run, and `.dockerignore` is one of them now (T2), so the table lists
+  it. `git diff --stat` for this commit touches only `docs/`.
+- A last commit adds this handoff to the plan file and nothing else; its hash is the branch head.
+
+**T2's paths list.** The plan asks that a pinned list of `paths` be updated with the reason.
+`ops/release/test_release_workflow.py` does not pin the list: it reads the workflow's own
+`pull_request.paths` and asserts `.dockerignore` is among them, so no list had to be updated
+there. The one place that pins the list in prose is `docs/CI.md`, and the T3 commit updates it —
+the reason is in the workflow's comment next to the new entry: `.dockerignore` decides what the
+console build sees, so a PR that edits it changes the image the dry run builds and the install
+proof checks.
+
+**The T1 outputs the plan asks for** (`docker build -f Dockerfile.frontend -t lakehouse-console:web2 .`
+then the two checks; the build was run from this branch's tree, exit 0, one pre-existing warning
+`UndefinedVar: Usage of undefined variable '$NEXT_PUBLIC_SSO_ENABLED' (line 31)`):
+
+```
+$ docker run --rm --entrypoint sh lakehouse-console:web2 -c 'find .next/server/app -maxdepth 1 -name "landing*"'
+(no output — the route is not in the image)
+```
+
+```
+$ docker run -d --name web2-console-check -p 3112:3000 -e RUST_API_URL=http://127.0.0.1:8080 lakehouse-console:web2
+$ curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3112/landing
+404
+$ curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3112/
+200
+```
+
+`/landingx` and `/landing/anything` also answer 404. The container was removed after the check
+(`docker ps -a` is empty).
+
+The dev build still has the page, and its test stays: `bun run build` from the source tree
+succeeds and `.next/server/app/landing` is in it, and `bun test src/features/landing` is 19 pass
+/ 0 fail.
+
+**The proof's check, exercised.** The install proof's shell was run against a stub server with the
+step's own comparison (`if [ "$landing_status" != "404" ]`): a 404 passes, a 200 prints
+`an install must not serve the landing page (WEB-2): got 200` and exits 1.
+
+**Commands run, with counts**, on the branch head, in the foreground:
+
+- `python3 -m pytest ops/release -q` — 194 passed, 1 warning.
+- `bun run typecheck` — clean.
+- `bun run lint` — 649 errors, 11707 warnings, all of them in `dagster/.venv/`, an untracked local
+  virtualenv that eslint walks because it is not in `.gitignore`'s ignore set for eslint. On the
+  tracked files (`git ls-files '*.ts' '*.tsx' '*.js' '*.mjs' | xargs bun --bun eslint`) it is 10
+  problems, 0 errors, 10 warnings, all pre-existing and none in a file this branch touched.
+  **Not verified**: a green `bun run lint` on this machine — the venv's own files are what fail,
+  and the PR does not touch them. CI, which has no `dagster/.venv`, is the check that matters.
+- `bun test src/features/auth` — 10 pass, 0 fail, 10 `expect()` calls, 3 files.
+- `bun test src` — 3136 pass, 1 skip, 0 fail, 8542 `expect()` calls, 320 files.
+- `bun test src/features/landing` — 19 pass, 0 fail, 2 files.
+- `python3 ops/lint/check_intra_package_imports.py` — `OK: all intra-package dispar_orchestrate
+  imports resolve`.
+- `python3 ops/lint/check_bare_iceberg_count.py` — `R11 guard: no bare count() against a Bronze
+  Iceberg table found.`
+- `(cd dagster && .venv/bin/python -m pytest dispar_orchestrate -q)` — 2411 passed, 1 skipped, 298
+  warnings, 40 subtests passed in 1039.86s. (The `dlt` import needs the venv's interpreter; the
+  system `python3` cannot import it. This branch touches no dagster code.)
+- `docker compose --profile '*' config --quiet` — exit 0, with throwaway
+  `POSTGRES_PASSWORD`/`RUSTFS_ACCESS_KEY`/`RUSTFS_SECRET_KEY`/`LAKEKEEPER_ENCRYPTION_KEY` in the
+  environment (SEC-18: compose has no default credentials).
+- `cd rust && cargo fmt --check` — clean.
+- `cd rust && CARGO_TARGET_DIR=/home/shiro/rantai/cargo-target cargo clippy --workspace --all-targets
+  --all-features -- -D warnings` — **not verified**: it did not finish inside the session on this
+  machine, and this branch touches no Rust code (`git diff origin/main...HEAD -- rust/` is empty),
+  so a Rust change cannot have broken it. The reviewer runs it.
+
+**Not verified**
+
+- The PR's own `Release` dry run and install proof must be green on the PR (the plan's T2 accept).
+  The PR is not open yet, so there are no run ids to quote: the dry run runs once the planner
+  opens the PR, and its run id goes in the review.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` and `cargo test
+  --workspace`, for the reason above.
+- A green `bun run lint` on this machine, for the reason above.
+
+**Notes for the reviewer**
+
+- The `WEB-2` backlog row is `In Progress` with an empty PR column, because the branch is open
+  and not merged; `AGENTS.md` step 6 has the reviewer set the Status and PR after the merge.
+- The `docs/core/PRODUCT.md` section 2 was not touched: it does not mention the landing page
+  (`grep -rn -i landing docs/core/PRODUCT.md` is empty), so there was nothing there to correct.
+- `docs/core/HANDOFF.md` was not touched either, for the same reason.
+- `README.md:174-180` still lists `bun run build` then `bun start` as the production build of the
+  source tree. That build still serves the page — the console image is what an install runs — and
+  the plan puts this fact in the feature page's limits, which the T3 commit does. Whether
+  `README.md` should also say it is the plan's open question, and it is a one-line doc change the
+  planner may want before the merge.
+
 ## 6. Review (planner appends below)
 
 ---
