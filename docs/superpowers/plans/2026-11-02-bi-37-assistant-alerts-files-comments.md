@@ -324,3 +324,24 @@ and Python lines; no compose line (no compose change).
 
 
 **Order (planner, 2026-11-02):** `BI-37` merges first. Then `BI-26 slice 2` rebases and regenerates `tool_schemas.json` and the tool-count pin. `BI-39` also waits for `BI-37`, because of `authorise_save`.
+
+### Review round 1 (planner, 2026-11-02, at `ca84c2f3`)
+
+- **T1–T4.**
+  - One save path for alert rules, which the route and the assistant share (D1).
+  - Chart alerts in the assistant (D2, D3, D5).
+  - The chart as a PNG and the dashboard as a file (D6, D7).
+  - `list_dashboard_comments` (D8) is the only new tool in `tool_schemas.json`. **AI team:** review the fixture diff.
+- **T8/T9, the D9 gate (D10).** It is in this PR, not a second one. That is accepted: the gate change is small, reviewed here, and tested on its own.
+  - `gate::permission_granted` grants a listed tool when the global permission is missing only if `registry::reach_offers` finds the caller's own level on THAT board or chart, which `tools::dashboard_reach` resolves from the tool's argument, and that level is ≥ the one the permission stands for.
+  - Unlisted tools are unchanged, and the handlers still resolve the viewer, so the gate is a second check, not the only one.
+  - `ai_dashboard_reach.rs` (6 tests) covers refused and granted, by board, by chart and anywhere.
+- **T7.** Six AI-15 cases, and the harness (185 tests).
+- **T10.** The feature page sentence the developer drafted goes into the backlog docs PR.
+- **Counts (the developer's):**
+  - `--lib ai::`: 452; `--lib alerts`: 59;
+  - 18 integration targets listed in the handoff, all green, including `route_auth` 73;
+  - copilot console: 87.
+- **Not verified:** the AI-15 model run, because there was no model key.
+
+**Open: no BLOCKER, no SHOULD-FIX.** The merge waits for the PR's CI.
