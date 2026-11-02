@@ -13,12 +13,12 @@
 //! past executions instead of fabricated fixtures — see
 //! [`record_history`]'s doc comment for how that write is made non-fatal.
 //!
-//! `SavedQuery` has no `create`/`update`/`delete` method anywhere in the
-//! `QueryService` contract — [`list_saved`] is genuinely read-only,
-//! backed by seed rows (`0004_queries.sql`) the way `identity`'s
-//! `workspace_settings` is backed by a constant, except here the shape
-//! (rows in a table with `dimension`/`tags`) earns an actual table rather
-//! than a hardcoded response.
+//! The console's saved queries started as mock data, backed by seed rows
+//! (`0004_queries.sql`) the way `identity`'s `workspace_settings` is backed
+//! by a constant. This module now owns their write side too — create,
+//! update, delete, folders, versions and trash (migration
+//! `0121_saved_query_access.sql`) — with the access rules of
+//! `crate::saved_query_access` applied on every read and write.
 
 use serde::Serialize;
 use sqlx::{FromRow, Postgres, Transaction};

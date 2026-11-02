@@ -3836,15 +3836,6 @@ fn export_response(
         .into_response()
 }
 
-/// A failure of the file itself, reported under a reference with a fixed
-/// sentence (SEC-11).
-fn export_failure(err: &crate::export::ExportError) -> ApiError {
-    match err {
-        crate::export::ExportError::Source(ch) => classify_dashboard_ch_error(ch),
-        other => upstream_error::internal_error(&upstream_error::SERVICE, other),
-    }
-}
-
 /// `GET /api/dashboard/chart-export?chart=&format=&values=` — the whole result
 /// of a tile as an Excel or CSV file (`BI-1`, D6).
 ///
@@ -4072,7 +4063,7 @@ pub(crate) async fn build_chart_file(
         },
     )
     .await
-    .map_err(|err| export_failure(&err))?;
+    .map_err(|err| super::export_failure(&DASHBOARD_QUERY, &err))?;
     Ok(ChartFile {
         chart,
         written,
