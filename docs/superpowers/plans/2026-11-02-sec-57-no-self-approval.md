@@ -210,6 +210,103 @@ Full block before handoff: the Rust line and the TypeScript line of `AGENTS.md` 
 
 ## 5. Handoff (developer appends below)
 
+### Handoff (developer, 2026-11-02)
+
+**Commits** (branch `fix/sec-57-no-self-approval`, pushed after each one; no
+force-push, no PR opened by the developer):
+
+| Commit | Task | What it holds |
+| --- | --- | --- |
+| `d4f60f7d` | T1 | The store and the migration `0118_sec57_approval_requester.sql`: `NewApprovalRequest`/`LinkedApprovalRequest` gain `requested_by: Option<Uuid>`, both inserts bind it, the shape CHECK is widened. (Written in the earlier session; re-verified below.) |
+| `e44a677c` | T2 | The API: `Principal::user_id()` (`lakehouse-auth`), the requester recorded by the chat/`POST /api/ai/tool` and by a headless run started by a person, `refuse_own_request` in `routes/agents.rs` called by BOTH decide routes, and the tests. |
+| `b2f04e2c` | T3 | The console: `isOwnRequest`, `selfApprovalTooltip`, both buttons disabled in the drawer and the row menu, the chat-card line, the contract doc. |
+| `9c8a8256` | T4 | The feature page `docs/core/features/copilot-chat.md`: decision row 7, step 8, the limits (D7), the acceptance line `AI-18-AC28`, open question 2 removed and the rest renumbered. |
+| `51b8db72` | extra | `docs/core/reference/user-guide.md` — see "Not in the plan" below. |
+
+**Commands run, with their counts** (final commit `51b8db72`, foreground,
+from the repo root; `cargo` with `-j 4`, scoped to the crates this plan
+touches — the owner's machine-light instruction):
+
+```bash
+cd rust
+cargo fmt --check                                                    # whole workspace, clean
+cargo clippy -p lakehouse-api -p lakehouse-auth -p lakehouse-store \
+    --all-targets -j 4 -- -D warnings                                # clean, 0 warnings
+cargo test -p lakehouse-api --lib -j 4                               # 2928 passed, 0 failed, 18 ignored
+cargo test -p lakehouse-api --test agents_approval -j 4              # 20 passed, 0 failed
+cargo test -p lakehouse-api --test agents_run -j 4                   # 15 passed, 0 failed
+cargo test -p lakehouse-api --test ai_report_tools -j 4              # 12 passed, 0 failed
+cargo test -p lakehouse-api --test route_auth -j 4                   # 72 passed, 0 failed
+cargo test -p lakehouse-api --test sec11_guard -j 4                   # 4 passed, 0 failed
+cargo test -p lakehouse-auth --lib -j 4                              # 59 passed, 0 failed
+cargo test -p lakehouse-store --lib -j 4                             # 260 passed, 0 failed
+cargo test -p lakehouse-store --test agents -j 4                     # 48 passed, 0 failed
+cargo test -p lakehouse-store --test migrations_upgrade -j 4          # 1 passed, 0 failed
+bun run typecheck                                                     # clean
+bun run lint                                                          # 0 errors, 10 warnings (all pre-existing, none in a touched file)
+bun test src/lib/access-requests.test.ts                              # 16 pass, 0 fail
+bun test src/lib src/features/agents src/features/copilot src/services # 1346 pass, 1 skip, 0 fail
+python3 ops/lint/check_intra_package_imports.py                       # OK
+python3 ops/lint/check_bare_iceberg_count.py                         # OK
+git status                                                            # clean
+```
+
+**Not verified** (rule 7):
+
+- The full-workspace run of `AGENTS.md` "Verification" — `cargo clippy
+  --workspace --all-targets --all-features` and `cargo test --workspace`
+  — was NOT run: the owner's instruction for this session was to keep the
+  machine light and to scope cargo to the crates the change touches
+  (`-j 4`, no full-workspace run). The reviewer must run it before merge.
+  `--all-features` was not used either.
+- `cargo test --workspace` therefore did not run for the crates this plan
+  does not touch (`lakehouse-bi`, `lakehouse-core`, `lakehouse-llm`,
+  `lakehouse-embed`, `lakehouse-notify`, `lakehouse-clickhouse`,
+  `lakehouse-iceberg`, `lakehouse-trino`, `lakehouse-alerts`,
+  `lakehouse-dagster`).
+- `(cd dagster && python -m pytest dispar_orchestrate -q)` and
+  `docker compose --profile '*' config --quiet` were NOT run: no Python,
+  Dagster or compose file is touched by this plan.
+- The manual acceptance line `AI-18-AC28` needs a running deployment with
+  two principals who hold the approval permission; it was not run here.
+- The console was not built (`next build`) — the plan's accept for T3 is
+  `typecheck` + `lint` + the unit test, and the touched folders' tests all
+  pass.
+
+**Notes for the reviewer:**
+
+1. **`approval_evidence_is_redacted` (`tests/agents_approval.rs`) was not
+   changed.** The plan's T2 list names `:287` among "every test that
+   decided its own approval", but that test never decides the approval —
+   it creates one and reads its evidence — so the rule ("every test that
+   decided its own approval") does not reach it. It is green unchanged.
+2. **The "chart still exists" assertion.** The harness's `ClickHouse` is a
+   dead upstream, so a chart cannot be read back. The new refusal test
+   asserts what proves it here: the run still carries only its pending step
+   (no execution step) and there is no `executed` audit row for the run —
+   the delete tool never ran, so the chart was never touched.
+3. **A scheduled run needs a session cookie.** The first version of
+   `a_scheduled_runs_approval_has_no_requester_and_any_approver_may_decide_it`
+   sent the `x-run-token` with no cookie and got 401: the route's policy
+   floor is `Policy::RequiresAuth`, so a request with no principal at all
+   is refused before the handler runs. The test now sends sari's session
+   AND the matched token — the token is what makes the run a SCHEDULED one
+   (`RunAuth::Token`, `trigger = "schedule"`, no principal behind it), so
+   the approval still names no requester and anybody with `agent:approve`
+   may decide it. The rule was not changed to fit the test.
+4. **`docs/core/reference/user-guide.md` (the fifth commit) is not in the
+   plan.** It said "You cannot approve your own access request: another
+   Governance Admin must decide it." That was true before `SEC-57` and is
+   false now — the rule covers a tool call too, and the decider is
+   anybody else who holds the permission, not a Governance Admin in
+   particular. Leaving it would tell a reader a rule the product does not
+   have. It is a documentation-only change, on a page the plan does not
+   name; the planner may fold it into T4 or drop it.
+5. **T4's acceptance line was appended as `AI-18-AC28`** rather than
+   inserted after `AI-18-AC12`, so the existing ids keep their numbers.
+   The "Before starting" paragraph now says the line needs a second
+   principal who holds the approval permission.
+
 ## 6. Review (planner appends below)
 
 ---
