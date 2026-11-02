@@ -569,3 +569,223 @@ The handoff says every integration target was green, so either this target was n
 - Make the fixture honest: a principal in the catalog's tenant, using the same helper the other gated tests use (rule 4).
 - Weaken no assertion (rule 2). If a test was relying on the hole the gate closes, change that test only with the reason at the site.
 - Then run `cargo test -p lakehouse-api --test dashboard_export`, and EVERY `--test` target. List them with `ls rust/crates/lakehouse-api/tests/*.rs` and quote each count, so the handoff's "every target green" is literally true.
+
+### Handoff round 2 (developer, 2026-11-02)
+
+Branch `feat/sec-50-slice-2`, pushed after every commit. No PR opened, nothing force-pushed
+(one `git pull --rebase` was needed, and one amended commit was replayed on top of the one it
+replaced; history is linear and every pushed commit is still there).
+
+#### BLOCKER 1: the cause
+
+Reproduced first, on the branch tip before any change: `cargo test -p lakehouse-api --test
+dashboard_export` → **4 passed, 7 failed**, every failure `left: 404, right: 200`.
+
+The 404 is the tenant gate's, not the route's. I read the response body of
+`the_export_writes_every_visible_column_masked_filtered_sorted_and_audited` before touching
+anything:
+
+```
+status=404 Not Found
+body={"error":"Table not found or not available to your organisation: serving.mart_x"}
+```
+
+That is `query::table_not_available`'s fixed `SEC-20` sentence. The path is:
+
+1. `table_export` / `chart_export` build the gate as the caller —
+   `StatementGate::clickhouse(&state, GateActor::Caller { principal, headers })`
+   (`routes/dashboard.rs:3939`, `:3970`);
+2. `GateActor::Caller` → `reach_for_actor` → `resolve_reach` →
+   `catalog::catalog_tenant_refusal` (`routes/query.rs:586`);
+3. `catalog_tenant_refusal` (`routes/catalog.rs:207`) sees **four tenants** in the seeded
+   identity migration (`count > 1`), finds `state.config.catalog_tenant_id == None` because the
+   fixture set no `CATALOG_TENANT_ID`, and answers `Some(CATALOG_TENANT_REFUSAL_UNCONFIGURED)`
+   — a refusal;
+4. `reach_from(refused = true, tenant = None, ..)` is `TenantReach::NoTenant`, and
+   `check_tables_against_reach` refuses the first named table with `table_not_available`
+   → 404.
+
+So the fixture's principal belonged to no tenant and the deployment named no catalog tenant:
+the gate had nothing that could read the shared catalog, which is exactly what it is for. The
+route is right; the fixture was wrong. The comparison that made it obvious: `render_data.rs`
+and `gold_publication.rs` read the same shared catalog and already name `common::CATALOG_TENANT`
+and call `common::in_the_catalog_tenant` — the export target was the one added in this slice
+that never got that treatment.
+
+#### The fix (no assertion weakened)
+
+`tests/dashboard_export.rs`, `app()` only: the app starts with
+`CATALOG_TENANT_ID = common::CATALOG_TENANT`, and the exporter is put in that tenant with
+`common::in_the_catalog_tenant` — the helper the other gated tests use (`AGENTS.md` rule 4).
+No test body changed, no assertion changed, no route changed. The seven tests pass, and the
+four that already passed still pass.
+
+#### Two more reds found by running every target, and fixed
+
+The handoff for round 1 said "every integration target green". That was not true, and CI would
+have hit both as soon as `dashboard_export` stopped failing (`cargo test` stops at the first red
+target, and `dashboard_export` sorts before both). Both are introduced by this slice and red on
+this branch only (neither exists on `origin/main`):
+
+1. **`route_auth` — 71 passed, 1 failed**:
+   `the_alert_routes_are_signed_in_at_the_router_and_the_handler_asks_for_the_right` expected
+   **403** and got **404**, for an Analyst without `alert:write`. Same cause as BLOCKER 1, one
+   step further on: slice 2 M7 put `gate_rule_statement` into `authorise_rule_create`
+   (`routes/alerts.rs:315`), so the gate runs before
+   `chart_alerts::authorise_save` asks for the permission, and the test's mart rule reads
+   `serving.m` in a deployment with no catalog tenant. **Fixed as a fixture, not a route
+   change**: the test now starts the app with `CATALOG_TENANT_ID` and puts both seeded readers
+   (`sari@`, `bayu@`) in that tenant, so the only refusal left is the permission the test is
+   about. No assertion changed. 72 passed.
+2. **`sec11_guard` — 3 passed, 1 failed**: `no_route_builds_a_response_from_an_upstream_errors_text`
+   flagged four slice-2 lines that put the gate's own sentence into a response:
+   `routes/support.rs:243`, `routes/dashboard_sources.rs:538`, `routes/layers.rs:257`
+   (`SpecRunFailure::Gated(err) => json!({ "error": err.to_string() })`) and
+   `routes/query.rs:915` (`GateRefusal`'s `message: err.to_string()`). The guard's own message
+   names the sanctioned answer for text written in this repository: an `ALLOWED` entry with the
+   reason. Added four entries, each citing the same fact — the sentence is `SEC-20`'s 404
+   naming the table or D6's 422 naming the setting, written here, never engine text (the
+   `SpecRunFailure::Gated` doc comment says so). No pattern widened, no test weakened.
+   4 passed.
+
+Both fixes are their own commits with the finding cited. If the planner would rather fix the
+`route_auth` one in `routes/alerts.rs` (permission check before the gate) than in the fixture,
+that is a decision for the review, not for me; the fixture version keeps every documented
+answer (403 for a missing permission) and the gate's order.
+
+#### Commits
+
+| Commit | What |
+| --- | --- |
+| `3ee7ce15` | BLOCKER 1: `tests/dashboard_export.rs` names `CATALOG_TENANT_ID` and puts the exporter in the catalog's tenant. |
+| `7fa02f90` | Clippy `doc_markdown` on the sentence that commit quotes (doc comment only). It sits on top of `3ee7ce15` because that commit was already pushed and this branch is never force-pushed. |
+| `7d297ba3` | `tests/route_auth.rs`: the alert-route case reads `serving.m` as the catalog's tenant, so the 403 it asserts is the permission's. |
+| `08b3c9d1` | `tests/sec11_guard.rs`: four `ALLOWED` entries for the gate's own fixed sentence. |
+
+#### Commands run, with counts (all on `08b3c9d1`, `-j 2`, through `~/rantai/bin/cargo-locked`)
+
+| Command | Result |
+| --- | --- |
+| `cargo test -p lakehouse-api --test dashboard_export` | 11 passed, 0 failed (was 4 passed, 7 failed) |
+| `cargo test -p lakehouse-api --test route_auth` | 72 passed, 0 failed (was 71 passed, 1 failed) |
+| `cargo test -p lakehouse-api --test sec11_guard` | 4 passed, 0 failed (was 3 passed, 1 failed) |
+| `cargo fmt --check` | clean |
+| `cargo clippy -p lakehouse-api --all-targets -- -D warnings` | clean |
+| `cargo test -p lakehouse-api --lib` | 2942 passed, 0 failed, 18 ignored |
+| every `--test` target (95 of them, below) | every line `ok`, 0 failed |
+
+Per-target, `ls rust/crates/lakehouse-api/tests/*.rs` minus `common/` (95 targets; `--test
+<name>` each, one run of the loop the brief gives):
+
+| Target | Passed | Ignored |
+| --- | --- | --- |
+| `agents_approval` | 17 | 0 |
+| `agents_run` | 14 | 0 |
+| `ai_ask_back_turn` | 5 | 0 |
+| `ai_build_tool_list` | 10 | 0 |
+| `ai_cache_rule` | 3 | 0 |
+| `ai_chart_draft` | 9 | 0 |
+| `ai_chat_stream` | 3 | 0 |
+| `ai_citations` | 2 | 0 |
+| `ai_export_tools` | 9 | 0 |
+| `ai_next_step` | 5 | 0 |
+| `ai_report_tools` | 12 | 0 |
+| `ai_sql_help` | 17 | 0 |
+| `ai_terms` | 7 | 0 |
+| `ai_tool` | 25 | 0 |
+| `catalog_grants` | 10 | 0 |
+| `catalog_restore` | 9 | 0 |
+| `chart_alerts` | 12 | 0 |
+| `chart_lineage_routes` | 5 | 0 |
+| `chart_png` | 5 | 0 |
+| `column_lineage_pipeline` | 7 | 0 |
+| `column_lineage_route` | 9 | 0 |
+| `column_lineage_sql_source` | 3 | 0 |
+| `connector_delete_deprovision` | 9 | 0 |
+| `connector_discovery_launch` | 4 | 0 |
+| `connector_discovery_routes` | 7 | 0 |
+| `connector_ingestible_tenant` | 6 | 0 |
+| `connector_not_testable` | 2 | 0 |
+| `connector_oauth_flow` | 22 | 0 |
+| `connector_probe_history_route` | 5 | 0 |
+| `connector_repoint` | 15 | 0 |
+| `connector_secret_reference` | 7 | 0 |
+| `connector_secret_rotate` | 8 | 0 |
+| `connector_tenant_access` | 5 | 0 |
+| `connector_upload_table` | 7 | 0 |
+| `crypto_provider` | 3 | 0 |
+| `dashboard_access_routes` | 36 | 0 |
+| `dashboard_comments_routes` | 12 | 0 |
+| `dashboard_export` | 11 | 0 |
+| `dashboard_import` | 9 | 0 |
+| `dashboard_tenant_scope` | 13 | 0 |
+| `debezium_properties` | 5 | 0 |
+| `embed_tokens` | 47 | 0 |
+| `explain_rewrite` | 7 | 0 |
+| `gold_export_auth` | 7 | 0 |
+| `gold_publication` | 14 | 0 |
+| `home_layout` | 5 | 0 |
+| `hostile_uploads` | 0 | 2 |
+| `iceberg_door` | 15 | 0 |
+| `identity_user_tenants` | 6 | 0 |
+| `ingest_run` | 22 | 0 |
+| `lakehouse_maintenance` | 6 | 0 |
+| `login_throttle` | 8 | 0 |
+| `maps_routes` | 12 | 0 |
+| `parity` | 0 | 2 |
+| `pdf_export` | 9 | 0 |
+| `pdf_real_gotenberg` | 0 | 3 |
+| `pipeline_enforce` | 18 | 0 |
+| `pipeline_lag_check` | 7 | 0 |
+| `pipeline_lag_page` | 6 | 0 |
+| `pipeline_routing` | 2 | 0 |
+| `public_links` | 16 | 0 |
+| `quality_anomalies` | 5 | 0 |
+| `quality_incidents` | 8 | 0 |
+| `quality_on_load` | 16 | 0 |
+| `quality_schedules` | 3 | 0 |
+| `query_author_exception` | 9 | 0 |
+| `query_cancel_route` | 4 | 0 |
+| `query_download` | 24 | 0 |
+| `query_estimate_read_only` | 4 | 0 |
+| `query_history` | 17 | 0 |
+| `query_history_statement` | 4 | 0 |
+| `query_limits_route` | 4 | 0 |
+| `query_result_cap` | 9 | 0 |
+| `query_run_limits` | 2 | 0 |
+| `query_settings_rule` | 7 | 0 |
+| `query_tenant_scope` | 19 | 0 |
+| `render_data` | 13 | 0 |
+| `reporting_settings_route` | 14 | 0 |
+| `report_routes` | 14 | 0 |
+| `report_runner` | 24 | 0 |
+| `route_auth` | 72 | 0 |
+| `sec11_guard` | 4 | 0 |
+| `sec41_verify_ca` | 1 | 0 |
+| `security_regressions` | 11 | 0 |
+| `semantic_api` | 18 | 0 |
+| `tenant_provisioning` | 8 | 0 |
+| `test_connection_route` | 4 | 0 |
+| `tier1_saved_query_guard` | 4 | 0 |
+| `tier1_writehigh_approval` | 5 | 0 |
+| `tier2_governance_drafts` | 4 | 0 |
+| `tier2_writehigh_approval` | 3 | 0 |
+| `upload_folder_routes` | 7 | 0 |
+| `upload_routes` | 175 | 0 |
+| `upstream_errors` | 7 | 0 |
+| `--lib` | 2942 | 18 |
+
+Totals: 2 940 passed across the 95 integration targets, 0 failed; `--lib` 2 942 passed, 18
+ignored, 0 failed. Three targets report `0 passed` because all their cases are `#[ignore]`
+(`hostile_uploads` 2, `parity` 2, `pdf_real_gotenberg` 3 — they need a live stack), which is
+their normal state, not a skip I introduced.
+
+**Not verified, with the reason.** The full workspace (`cargo clippy --workspace --all-targets
+--all-features`, `cargo test --workspace`), the TypeScript, Python and compose blocks, and the
+G-gates: not run here. This round changed three test files in `lakehouse-api` and no product
+code, no `src/`, no `dagster/`, no compose file, so CI's full block is the first full run, as
+the owner's 2026-10-30 rule allows. The M2 wall-clock benchmark and the AI-15 eval remain
+unmeasured for the reasons round 1 gives.
+
+**Worktree:** removed; no container was started by this round (the targets use `sqlx::test`'s
+own per-test databases and `wiremock`).
