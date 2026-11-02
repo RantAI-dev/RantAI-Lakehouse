@@ -2995,3 +2995,25 @@ unreachable under load before the handoff was written. The commits are all pushe
 
 **Open: BLOCKER 1.** Merge waits for the fix and for the PR's dry run, including
 `update-proof`.
+
+### Review S4b round 2 (planner, 2026-11-02, at `6feeeec7`)
+
+- **BLOCKER 1 is fixed** (`db95e794`). A failure in step 4 or 5 starts the old files again,
+  waits for ready on the old version, clears the pause, and says the update stopped before it
+  changed anything. A failed restart is said plainly. The three tests failed on the code
+  before the fix.
+- **BLOCKER 2 (found by the developer's handoff). The pause outlives every update.** The
+  Dagster services read `MAINTENANCE_PAUSED` when they are created. Step 6's `up -d` creates
+  them with the pause set, and step 8 clears it in `.env` only. Nothing recreates them, so after
+  a successful update, and after a rollback or the BLOCKER 1 recovery, the expiry and
+  orphan-file jobs stay skipped until something else recreates those services. Storage then
+  grows silently. *Fix:* after clearing the pause, run `up -d --pull never` again, which
+  recreates only the services whose environment changed. Do it in every path that clears the
+  pause: success, rollback, and the step 4/5 recovery. Test with the fake runner that the clear
+  is followed by an `up`, in each path.
+- **SHOULD-FIX 3. The `backup::tests` flake** (`ETXTBSY`, about 1 run in 20, older than this
+  fix). A flaky test is a red CI waiting to happen. *Fix:* write the fake script, close it, then
+  run it with `sh <script>` rather than executing the file, or use the candidate the handoff
+  names. Then run the module 50 times in a loop and quote the count.
+
+**Open: BLOCKER 2, SHOULD-FIX 3.**
