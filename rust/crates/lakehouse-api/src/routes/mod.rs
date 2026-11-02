@@ -9,6 +9,11 @@ mod agents;
 pub(crate) mod ai;
 mod alerts;
 pub mod auth;
+// `DATA-42` D7: the `ClickHouse` registry fixture the readers' tests share
+// (`governance`, `overview`, `storage`, `lineage`, `catalog_profile`).
+// Test-only, so it is declared `#[cfg(test)]` and never reaches a build.
+#[cfg(test)]
+pub(crate) mod bronze_registry_fixture;
 mod chart_alerts;
 // `pub(crate)`, not private: `crate::pipeline_lag` (BLD-2) reads
 // `authored_pipelines::job_name` to name the job a lag run launches, and
@@ -1046,6 +1051,14 @@ fn identity_router() -> Router<AppState> {
         .route(
             "/api/identity/users/{id}/tenants/{tenant_id}",
             axum::routing::put(identity::add_user_to_tenant),
+        )
+        // ADM-3 D2: hand an existing user a new temporary password. The
+        // password is generated server-side and returned once; `{id}` is
+        // validated inside the handler (400 when malformed, 404 when
+        // unknown or when the caller may not reset that user).
+        .route(
+            "/api/identity/users/{id}/reset-password",
+            axum::routing::post(identity::reset_user_password),
         )
         .route(
             "/api/identity/roles",
