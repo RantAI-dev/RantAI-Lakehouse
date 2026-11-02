@@ -142,6 +142,77 @@ compose; a migration is applied by the API at start, so record that `up` or writ
 
 ## 5. Handoff (developer appends below)
 
+### Handoff (developer, 2026-11-02)
+
+Branch `fix/bi-38-comment-limits`, based on the merge of `origin/main` (`dc9c9ac1`) into the
+plan's branch (`b8b38e64`). Every commit cites `BI-38` and the decision it implements; pushed
+after each.
+
+- `e5104b5e` **T1** — migration `0121_dashboard_comment_author_index.sql`; `insert` locks the
+  author (`dashboard_comment_post:<author>`) after the board's mention lock, counts the window
+  (deleted rows included) and returns `PostOutcome::{Posted, TooMany { retry_after_secs }}`;
+  `mark_mentions_read(pool, user, board: Option<&str>)`; five new store tests; the existing store
+  tests use a `posted` helper for the new return type (D1, D2, D5).
+- `a6043ce7` **T2** — `post` maps `TooMany` to `ApiError::TooManyRequests` (`TOO_MANY_POSTS`,
+  `pub` for the test, as `SERVICE_REFUSED` is) so `error.rs` renders the 429 and `Retry-After`;
+  `mark_read` takes an optional body and resolves a named board through `target_for`; five route
+  tests (D3, D4, D5).
+- `298861a5` **T3** — `markMentionsRead(board?, signal?)`, `src/lib/mention-events.ts`, the
+  panel's once-per-open mark after the list loads, the navbar's reload on the event, and tests
+  for the 429 sentence and kept text (D3, D6).
+- `9af0119f` **T4** — feature page Part E sentence and the CHANGELOG entry.
+
+**Commands run, with counts** (final commit, scoped to the crates and folders touched; every
+cargo line through `~/rantai/bin/cargo-locked` with `-j 2`, no `cargo clean`):
+
+```
+cd rust && ~/rantai/bin/cargo-locked fmt --check                                  # 0 diffs
+~/rantai/bin/cargo-locked clippy -p lakehouse-store -p lakehouse-api --all-targets -j 2 -- -D warnings
+                                                                                  # 0 warnings/errors
+~/rantai/bin/cargo-locked test -p lakehouse-store --test dashboard_comments -j 2  # 13 passed, 0 failed
+~/rantai/bin/cargo-locked test -p lakehouse-api --test dashboard_comments_routes -j 2
+                                                                                  # 17 passed, 0 failed
+~/rantai/bin/cargo-locked test -p lakehouse-api --test route_auth -j 2            # 73 passed, 0 failed
+~/rantai/bin/cargo-locked test -p lakehouse-api --lib dashboard_comments -j 2     # 6 passed, 2940 filtered
+bun run typecheck                                                                 # 0 errors
+bunx eslint <the eight touched src files>                                         # 0 problems
+bun test src/features/dashboards/comments-panel.test.tsx src/components/app-shell src/services/clients
+                                                                                  # 164 passed, 0 failed, 510 expect(), 16 files
+```
+
+`bun run lint` (the whole tree) was **not green on this machine**, and the failure is not in this
+branch: it reports 12,356 problems / 649 errors, every error under
+`dagster/.venv/lib/python3.12/site-packages/...` (a local Python virtualenv, untracked and not
+ignored by `eslint.config.mjs`). `bunx eslint . --ignore-pattern 'dagster/.venv/**'` gives
+0 errors and 10 pre-existing warnings. CI has no `.venv`; not verified there.
+
+**Not verified.**
+
+- The full-workspace block (`cargo clippy --workspace --all-targets --all-features`,
+  `cargo test --workspace`) was **not** run: the developer brief says "No full-workspace run" and
+  scopes every cargo command, which overrides the plan's "full verification block once before
+  handoff". The crates touched are `lakehouse-store` and `lakehouse-api`; both are green above.
+- `docker compose --profile '*' config --quiet` and a real `docker compose up` were not run (no
+  compose change). The migration is proven applied by `sqlx::test`: the 13 store tests and the
+  17 route tests each build a fresh database from `rust/migrations`, `0121` included.
+- The Python lint scripts and the Dagster tests were not run: no Python changed.
+- No browser QA (the console tests run in happy-dom). The bell reload is a `window` event and
+  was exercised by the unit test only.
+
+**Notes for the review.**
+
+- `mark_read` keeps today's no-body behaviour: an empty body is `{}` (mark all). D5 names `{}`
+  and another shape as 400; the route took no body before `BI-38`, so dropping the empty body
+  would have been a regression. The body uses `deny_unknown_fields`, so extra keys are 400;
+  `tests/route_auth.rs` sends a synthetic body with extra keys to every comment route and still
+  passes (it only requires "not 401/403" for a reader).
+- The existing panel test "posts the text with the person picked" now picks the comment POST by
+  endpoint: the panel also sends mark-read, which is a POST to another path.
+- `PostOutcome` is the plan's "outcome the route can tell apart"; the variant set is D1's
+  (`Posted { id, email }`, `TooMany { retry_after_secs }`).
+- The count query binds the window as `make_interval(secs => $2)`; `POST_WINDOW_SECS` is the
+  single place the five minutes live, beside `POST_LIMIT` (D1).
+
 ## 6. Review (planner appends below)
 
 
