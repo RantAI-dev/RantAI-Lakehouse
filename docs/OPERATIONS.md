@@ -1189,13 +1189,67 @@ wired into `depends_on: condition: service_healthy`, so this specific
 failure mode is less likely to bite you locally than in a deployment that
 skips that check.
 
+## Email through an internal relay (SEC-56)
+
+Alerts, digests, chart alerts, scheduled reports, comment mentions and
+pipeline notifications all go out through one sender, and it talks to one
+relay: `SMTP_HOST`, `SMTP_PORT`, `SMTP_SECURE`, `SMTP_USER`, `SMTP_PASS`,
+`SMTP_FROM`. A relay whose certificate chains to a **private** CA (a
+company CA, a service-mesh CA) used to be unreachable: the sender trusted
+the built-in root store only, so the handshake failed and every send said
+"the mail server could not be reached" — the same sentence as a wrong
+host, and no clue about the file that is missing.
+
+**The CA bundle.** `SMTP_CA_FILE` is the path, inside the API container, of
+a PEM file with one or more CA certificates:
+
+```bash
+# the file goes into the host directory the API mounts, read-only
+cp /path/to/your/ca.pem ops/smtp-ca/ca.pem
+# and the API is told where to read it — the path INSIDE the container
+SMTP_CA_FILE=/run/certs/smtp/ca.pem
+```
+
+Under Compose the mount is `${SMTP_CA_DIR:-./ops/smtp-ca}` at
+`/run/certs/smtp`, so the default path above is the one the stack gives
+you. The CAs are **added** to the built-in roots, never put in their
+place: a deployment that trusts a private CA can still reach a public
+relay. The file is read once, at start — replace it and restart the API.
+A path that cannot be read, or that holds no PEM certificate, **stops the
+API at start** with a message naming `SMTP_CA_FILE`; the API never
+starts with a CA bundle it could not read.
+
+**What the relay must look like.**
+
+- The name on the relay's certificate must match `SMTP_HOST`. The
+  hostname check stays on: there is no way to turn it off, and no way to
+  accept a certificate that does not carry the name.
+- Port **587** with `STARTTLS` (the default), or port **465** with
+  `SMTP_SECURE=true` (implicit TLS). A relay **without** TLS is not
+  supported: the connection is never plaintext, so `SMTP_PASS` is never
+  sent in the clear.
+
+**When a send fails.** The failure reasons are a closed set, and a failed
+handshake has its own:
+
+> a secure connection to the mail server could not be made
+
+That is the reason stored on the alert and shown on the Alerts page (the
+report runner says the same thing as "The email was not sent: a secure
+connection to the mail server could not be made."). It means the TLS
+handshake failed: the relay's certificate is not trusted — is
+`SMTP_CA_FILE` the right file, and does it hold the CA that signed that
+certificate? — or the name does not match — is `SMTP_HOST` the name on
+the certificate? "The mail server could not be reached" still means the
+relay could not be dialled at all.
+
 ## Features unavailable in the local stack
 
 | Feature | Needs | Symptom without it | To enable |
 | --- | --- | --- | --- |
 | Pipeline trigger / run status | Dagster | `503` from `/api/pipelines/*` | Bring up the `dagster` compose profile (see "Dagster (opt-in, P3)" above) and point `DAGSTER_URL`/`DAGSTER_REPO`/`DAGSTER_LOCATION` at it |
 | AI chat (Copilot and Query Studio's Natural language box) | LLM API key | `503` from `/api/ai/*` | Set `LLM_URL`/`LLM_MODEL`/`LLM_KEY` (or `MINIMAX_API_KEY`) to a real OpenAI-compatible provider |
-| Alert digests / threshold emails | SMTP | Alerts still evaluate; email delivery silently no-ops | Set `SMTP_HOST` (and friends) to a real SMTP relay |
+| Alert digests / threshold emails | SMTP | Alerts still evaluate; email delivery silently no-ops | Set `SMTP_HOST` (and friends) to a real SMTP relay; for a relay behind a private CA, set `SMTP_CA_FILE` as well (see "Email through an internal relay" above) |
 | Signed dashboard embeds | `EMBED_SECRET` | `POST /api/embed/data` answers `503` "embedding is not configured"; the Share dialog says so | Set `EMBED_SECRET` (see "Signed dashboard embeds (`SEC-12`)") |
 | SSO / OIDC login | An OIDC provider | Local password auth only | Set `OIDC_ISSUER` + `OIDC_CLIENT_ID` (and, for the browser flow, the four URLs); `OIDC_JWKS_URL` is optional — see "Single sign-on (OIDC)" below and `rust/crates/lakehouse-auth/README.md` |
 
