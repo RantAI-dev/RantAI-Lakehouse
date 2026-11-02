@@ -401,3 +401,19 @@ What would close it, for the planner to decide (I did not choose for the plan): 
 equivalent) extracted from `current_value`/`metric_value` and called by both the run and the
 save path — one builder, shared, no second copy — or a plan change that gates the save another
 way. A second inline copy in `routes::alerts` is what the plan forbids, so I did not write one.
+
+### Planner decision on the T7 developer report (2026-11-02, at `0ab03794`)
+
+**Accepted, and the planner chooses the first option. M7 stays in this slice.**
+
+- **D7a.** `lakehouse-alerts` exports the statement builders that the run already uses, extracted and not copied:
+  - `pub fn mart_statement(..) -> Result<String, AlertError>`, from `current_value` (`lib.rs` ~1798);
+  - `pub fn metric_statement(..) -> Result<String, AlertError>`, from `metric_value` (~1861–1877).
+
+  `current_value` and `metric_value` then call them. The run's behaviour is unchanged, and the crate's existing tests must stay green.
+- `routes::alerts` (create and update) and the assistant's `create_alert_rule` / `update_alert_rule` build the rule's statement with these same functions, and send it through the gate as the person saving it, exactly as the run does (D3). A refusal gives the 404 with `SEC-20`'s sentence, and no row is written.
+- **Accept:**
+  - the plan's T7 case: saving a mart rule as a member of `OTHER_TENANT` gets 404, and there is no `INSERT INTO console.alert_rule`;
+  - the same case for a metric rule;
+  - `cargo test -p lakehouse-alerts`, unchanged and green.
+- Rule 4 holds: there is one builder, used by both the run and the save.
