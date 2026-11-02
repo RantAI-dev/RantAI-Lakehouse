@@ -665,3 +665,96 @@ describe("ConnectorDetailPage", () => {
     expect(count("DELETE /api/connectors/conn-a")).toBe(1)
   })
 })
+
+/**
+ * `SRC-4` slice 4 (S4-g): a change-capture connector has a Change capture tab with its state, the lag of each
+ * table and the lag limit; any other connector has none. A connection test of such a connector lists what the
+ * source must have switched on, the missing settings first (S4-f).
+ */
+describe("ConnectorDetailPage change capture", () => {
+  const CDC_SPEC = { ...SPEC, adapter: "cdc", ingestMode: "cdc", sourceObjects: [{ name: "public.orders", target: "orders" }] }
+  const CAPTURE = {
+    supported: true,
+    state: "running",
+    lag: {
+      tables: [
+        { table: "public.orders", status: "behind", seconds: 125 },
+        { table: "public.items", status: "up_to_date" },
+      ],
+      worst: { table: "public.orders", seconds: 125 },
+      limitMinutes: 15,
+      alertOpen: false,
+    },
+  }
+
+  it("has a Change capture tab for a change-capture connector, between Ingest and Schema changes", async () => {
+    stubFetch({
+      "GET /api/connectors/conn-a/ingest-spec": () => json(CDC_SPEC),
+      "GET /api/connectors/conn-a/change-capture": () => json(CAPTURE),
+    })
+    render(<ConnectorDetailPage connectorId="conn-a" />)
+    await settle()
+    await waitFor(() => expect(screen.getAllByRole("tab").map((t) => t.textContent ?? "")[2]).toBe("Change capture"))
+  })
+
+  it("has no Change capture tab for any other connector, and ?tab=capture lands on the Overview", async () => {
+    url.search = "tab=capture"
+    stubFetch()
+    render(<ConnectorDetailPage connectorId="conn-a" />)
+    await settle()
+    expect(screen.queryByRole("tab", { name: "Change capture" })).toBeNull()
+    await waitFor(() => expect(selected("Overview")).toBe("true"))
+  })
+
+  it("opens the tab for ?tab=capture and words each table's lag", async () => {
+    url.search = "tab=capture"
+    stubFetch({
+      "GET /api/connectors/conn-a/ingest-spec": () => json(CDC_SPEC),
+      "GET /api/connectors/conn-a/change-capture": () => json(CAPTURE),
+    })
+    render(<ConnectorDetailPage connectorId="conn-a" />)
+    expect(await screen.findByText("Behind by 2m")).toBeDefined()
+    expect(screen.getByText("Up to date")).toBeDefined()
+    expect(screen.getByText("Running")).toBeDefined()
+    expect((screen.getByLabelText("Alert after (minutes)") as HTMLInputElement).value).toBe("15")
+  })
+
+  it("lists the setup checks after a test, the missing one first with its command", async () => {
+    stubFetch({
+      "GET /api/connectors/conn-a/ingest-spec": () => json(CDC_SPEC),
+      "POST /api/connectors/conn-a/test": () =>
+        json({
+          ok: true,
+          supported: true,
+          latencyMs: 5,
+          message: "Connected via PostgreSQL",
+          testedAt: "2026-10-30T01:00:00.000Z",
+          setupChecks: [
+            { setting: "wal_level", status: "ok", message: "wal_level is logical." },
+            {
+              setting: "publication",
+              status: "missing",
+              message: "The publication named in the connector does not exist.",
+              command: 'CREATE PUBLICATION "orders_pub" FOR TABLE "public"."orders";',
+            },
+          ],
+        }),
+    })
+    render(<ConnectorDetailPage connectorId="conn-a" />)
+    fireEvent.click(await screen.findByRole("button", { name: "Test connection" }))
+    const section = await screen.findByRole("region", { name: "Source setup" })
+    const settings = within(section).getAllByRole("listitem").map((li) => li.textContent ?? "")
+    expect(settings[0]).toContain("publication")
+    expect(settings[1]).toContain("wal_level")
+    expect(within(section).getByText(/CREATE PUBLICATION/)).toBeDefined()
+    expect(within(section).getByText(/1 setting missing/)).toBeDefined()
+  })
+
+  it("shows no setup list for a test that sent none", async () => {
+    stubFetch()
+    render(<ConnectorDetailPage connectorId="conn-a" />)
+    fireEvent.click(await screen.findByRole("button", { name: "Test connection" }))
+    await screen.findByText("Connection test passed")
+    expect(screen.queryByRole("region", { name: "Source setup" })).toBeNull()
+  })
+})

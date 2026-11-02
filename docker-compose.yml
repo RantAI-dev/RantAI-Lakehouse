@@ -68,8 +68,8 @@ services:
     # SEC-14 part B (D7/E4): ssl=on with cert and key from lakehouse_postgres_tls.
     # `wal_level=logical` (+ enough slots/senders for a handful of CDC
     # connectors): P5 needs Postgres logical replication for
-    # `debezium-server` to capture `p5_cdc.orders` at all — `replica`
-    # (the image's own default) cannot create a logical replication slot.
+    # `kafka-connect`'s Debezium connectors (SRC-4) to capture a table at all —
+    # `replica` (the image's own default) cannot create a logical replication slot.
     # This is on by default for every deployment of this stack now, not
     # gated behind the `dagster` profile, because it is a server restart
     # to change later — cheaper to always run with it than to make an
@@ -481,6 +481,15 @@ services:
       # effect when the flag above is not `true`. Never opens loopback,
       # link-local, multicast or `0/8` (`lakehouse-api::internal_hosts`).
       CONNECTOR_PROBE_ALLOWED_CIDRS: ${CONNECTOR_PROBE_ALLOWED_CIDRS:-}
+      # SRC-4 (ADR 0016): where the API reaches Kafka Connect's REST API (the
+      # `cdc` profile's `kafka-connect`, `http://kafka-connect:8083`). Unset on
+      # purpose: a deployment without change capture keeps the default and a
+      # change-capture connector answers `supported: false` (fail closed).
+      KAFKA_CONNECT_URL: ${KAFKA_CONNECT_URL:-}
+      # SRC-4 slice 3: the same broker address the applier reads below. A MySQL
+      # or SQL Server connector keeps its schema history in a topic on it and
+      # cannot start without it (unset: "not configured", fail closed).
+      CDC_KAFKA_BOOTSTRAP: ${CDC_KAFKA_BOOTSTRAP:-}
       # SRC-11 D3: this many failed runs in a row pause a connector and raise
       # `connector_disabled` once. Unset or empty keeps the code's default,
       # 30 (the spec's number); zero, negative or garbage does too. A
@@ -756,6 +765,10 @@ services:
       # (managed or operator-dropped) from the same directory. Mounted
       # read-only into `dagster-code-location`, which only ever reads.
       - lakehouse_connector_secrets:/run/secrets
+      # SRC-4 (ADR 0016 point 4): the source password of each change-capture
+      # connector, written here and read by `kafka-connect` (read-only there).
+      # A tmpfs volume, memory only; mounted in no other service.
+      - lakehouse_cdc_secrets:/run/cdc-secrets
       # SEC-14 part B (D5/D7): CA certificate for connector dials. Read-only.
       - lakehouse_postgres_ca:/run/certs/postgres:ro
     # REL-2 S1-T2: the API's own healthcheck, so the `console` service below
@@ -1338,9 +1351,6 @@ services:
   # the warehouse boundary"):
   #   - `rust-iceberg` (G1: create Bronze tables, append via vended
   #     credentials): create, modify, select.
-  #   - `debezium` (P5 CDC into Bronze via `debezium-server-iceberg`):
-  #     create, modify, select — it creates the table on first snapshot
-  #     write, same as `rust-iceberg`.
   #   - `dlt` (P3 dlt pipeline, Dagster code location): create, modify,
   #     select — same shape, it is also a Bronze table writer.
   #   - `clickhouse-reader` (every gate's ClickHouse read path, PLUS the
@@ -1437,12 +1447,6 @@ services:
         read_only: true
       - type: volume
         source: lakehouse_oidc_tokens
-        target: /tokens/debezium.jwt
-        volume:
-          subpath: debezium.jwt
-        read_only: true
-      - type: volume
-        source: lakehouse_oidc_tokens
         target: /tokens/dlt.jwt
         volume:
           subpath: dlt.jwt
@@ -1496,7 +1500,7 @@ services:
         admin_token="$$(cat /tokens/admin.jwt)"
         admin_auth="Authorization: Bearer $$admin_token"
 
-        for principal in rust-iceberg debezium dlt clickhouse-reader trino gold-export lakehouse-api-reader outside-readers unauthorized-test; do
+        for principal in rust-iceberg dlt clickhouse-reader trino gold-export lakehouse-api-reader outside-readers unauthorized-test; do
           ptoken="$$(cat /tokens/$$principal.jwt)"
           code=$$(curl -s -o /dev/null -w '%{http_code}' -X POST \
             -H "Authorization: Bearer $$ptoken" -H 'Content-Type: application/json' \
@@ -1537,7 +1541,6 @@ services:
           done
         }
         grant rust-iceberg create modify select
-        grant debezium create modify select
         grant dlt create modify select
         grant clickhouse-reader select modify
         grant trino select modify
@@ -2209,6 +2212,10 @@ services:
       # this compose network and the host stay refused. Empty by default
       # (`ssrf_guard.py`'s module docstring).
       INGEST_ALLOWED_CIDRS: ${INGEST_ALLOWED_CIDRS:-}
+      # SRC-4 (ADR 0016): the broker the change-capture applier reads
+      # (`kafka:9092` on the `cdc` profile). Unset: the applier's sensor skips
+      # and a change-capture run fails with a fixed message (fail closed).
+      CDC_KAFKA_BOOTSTRAP: ${CDC_KAFKA_BOOTSTRAP:-}
       # SRC-11 D1: the wait before each retry of a failing table, in seconds,
       # one to three whole numbers. Unset or empty keeps the code's default,
       # `60,300,900` (1, 5 and 15 minutes, the spec's); a malformed value
@@ -3011,7 +3018,7 @@ services:
   # not Iceberg).
   # R1 (ADR 0011): `trino` authenticates to Lakekeeper as its own
   # principal, granted `select`+`modify` on the warehouse by
-  # `lakekeeper-authz-init` — the same shape as `debezium`/`dlt`, since
+  # `lakekeeper-authz-init` — the same shape as `dlt`, since
   # `EXECUTE optimize` reads existing data files and commits a new Iceberg
   # snapshot (a `modify`-shaped operation), not a table/namespace create.
   # `iceberg.rest-catalog.security=OAUTH2` +
@@ -3020,8 +3027,8 @@ services:
   # `IcebergRestCatalogConfig`/`OAuth2SecurityConfig` classes in
   # `trinodb/trino:483`'s `trino-iceberg` plugin jar — `oauth2.token` sends
   # the value as-is, same mechanism `iceberg-catalog-rest`'s `token`
-  # property and pyiceberg's `token` use, no OAuth2 exchange). Mirrors
-  # `debezium-server`'s `LAKEKEEPER_TOKEN="$$(cat /tokens/...)"` pattern —
+  # property and pyiceberg's `token` use, no OAuth2 exchange). Reads the token
+  # with `LAKEKEEPER_TOKEN="$$(cat /tokens/...)"` —
   # this container's `command:` is a shell script, so the token file is
   # read into a shell variable before being interpolated into the
   # properties heredoc.
@@ -3060,7 +3067,7 @@ services:
       # Why static keys at all, given `iceberg.rest-catalog.vended-
       # credentials-enabled=true` two lines below in `command:` — doesn't
       # Lakekeeper hand Trino scoped, per-principal S3 credentials the same
-      # way it hands `rust-iceberg`/`debezium` their catalog tokens? Per
+      # way it hands `rust-iceberg` their catalog tokens? Per
       # Trino's own `trino-iceberg` plugin docs, when vended credentials are
       # enabled the REST catalog's per-request credentials are supposed to
       # supersede these for actual file I/O — but `trinodb/trino#27416`
@@ -3304,224 +3311,132 @@ services:
     entrypoint: ["/bin/sh", "/opt/optimize_bronze.sh"]
     restart: unless-stopped
 
-  # P5 (G4) — one-shot: create the Postgres table the demo CDC connector
-  # captures. Own `p5_cdc` schema, `REPLICA IDENTITY FULL` (Debezium needs
-  # this to emit full before/after images for UPDATE/DELETE, per
-  # `docs/plans/P5-RESULT.md`'s measured connector config), and a
-  # publication scoped to that one table — never `FOR ALL TABLES`, so a
-  # demo connector cannot see product schema. `dagster` profile, not
-  # `test`, mirroring `g3a-source-init`'s reasoning exactly (this service
-  # sits behind `debezium-server`, which is itself `dagster`-gated below).
-  g4-source-init:
-    profiles: ["dagster"]
-    image: postgres:16.15@sha256:1beaa3084eee2676f20a9cd9928f0bf2c5bf674f8e49f81017912183d377c61c
-    depends_on:
-      postgres:
-        condition: service_healthy
-    environment:
-      PGHOST: postgres
-      PGPORT: "5432"
-      PGUSER: ${POSTGRES_USER:-lakehouse}
-      PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}
-      PGDATABASE: ${POSTGRES_DB:-lakehouse}
-    entrypoint: ["/bin/sh", "-c"]
-    command:
-      - >
-        psql -v ON_ERROR_STOP=1 -c "
-        CREATE SCHEMA IF NOT EXISTS p5_cdc;
-        CREATE TABLE IF NOT EXISTS p5_cdc.orders (
-          id bigint PRIMARY KEY,
-          customer text NOT NULL,
-          amount numeric(12,2) NOT NULL,
-          updated_at timestamptz NOT NULL DEFAULT now()
-        );
-        ALTER TABLE p5_cdc.orders REPLICA IDENTITY FULL;
-        INSERT INTO p5_cdc.orders (id, customer, amount)
-        SELECT g, 'customer_' || g, (g % 100)::numeric + 0.5
-        FROM generate_series(1, 5) AS g
-        WHERE NOT EXISTS (SELECT 1 FROM p5_cdc.orders);
-        " &&
-        psql -v ON_ERROR_STOP=1 -tc
-        "SELECT 1 FROM pg_publication WHERE pubname = 'p5cdc_pub'" |
-        grep -q 1 ||
-        psql -v ON_ERROR_STOP=1 -c
-        "CREATE PUBLICATION p5cdc_pub FOR TABLE p5_cdc.orders;"
-    restart: "no"
-
-  # P5 (G4) — Debezium Server + `debezium-server-iceberg` (memiiso), pinned
-  # by tag + digest (R4: community-maintained). The tag names the release
-  # so a future failure is diagnosable, the digest keeps the image
-  # immutable. A bare digest pin dies silently when upstream overwrites
-  # the untagged image — this is the second time: `c49ebd…` on 2026-09-24,
-  # `5281e2bd…` on 2026-09-30. Upstream's 1.1.1.Final release notes say
-  # attestations are disabled so released images stay pullable (upstream
-  # PR #732). Captures
-  # `p5_cdc.orders` via Postgres logical replication (`pgoutput`), upsert
-  # mode, initial snapshot then streaming, straight into Bronze through
-  # the SAME Lakekeeper/RustFS stack every other Bronze writer in this
-  # repo uses. This is a single, statically-configured demo connector
-  # (ADR 0007: "no dynamic per-connector provisioning" this phase) — it
-  # proves the config shape
-  # `lakehouse_store::cdc::render_debezium_properties` designs, not a
-  # production connector-management control plane.
+  # SRC-4 (ADR 0016): change capture. One Kafka broker and ONE Kafka Connect
+  # worker (Debezium's own distribution) serve every change-capture connector;
+  # `lakehouse-api` is the worker's only client (it creates, pauses, resumes and
+  # deletes a connector from the console's request) and the Dagster applier job
+  # reads the topics and writes Bronze. `cdc` profile: a deployment that does not
+  # use change capture does not pay the ~1.2 GiB the two cost (ADR 0016,
+  # "Consequences"). Without it `KAFKA_CONNECT_URL` stays unset and a
+  # change-capture connector answers `supported: false` (fail closed).
   #
-  # `LAKEKEEPER_BASE_URI` MUST be set to the in-network name
-  # (`http://lakekeeper:8181`) or every REST-catalog call this container
-  # makes after the first one fails with "Connection refused:
-  # localhost:8181" — see `docs/plans/P5-RESULT.md`'s measured trap. Put it
-  # in `.env`, not a one-off prefix (same reasoning as `DAGSTER_URL`'s
-  # existing warning elsewhere in this file).
+  # NO published ports on either service, deliberately: Kafka Connect's REST API
+  # can start any connector class on the worker and has no authentication, so it
+  # is reachable only from this compose network (ADR 0016, "Consequences"). The
+  # broker is PLAINTEXT for the same reason; it is internal and holds only change
+  # events the applier consumes.
   #
-  # Re-pinned 2026-09-30: the prior pin was
-  # `ghcr.io/memiiso/debezium-server-iceberg@sha256:5281e2bd…` (the
-  # digest `:latest` had resolved to on 2026-09-24). CI run 36680491360's
-  # `G4` job logs `manifest unknown` for that digest — the registry no
-  # longer has it. P5-RESULT.md's measurements were taken on the earlier
-  # `c49ebd…` image; G4 is what re-proves them on this one.
-  # see the note on `debezium-server`: the pinned upstream image dials its
-  # built-in http://localhost:8181 when a static token is configured, so this
-  # proxy makes that exact address resolve to the real Lakekeeper. Sharing a
-  # netns (`network_mode: service:...`) puts this listener inside the
-  # debezium container's own localhost.
-  debezium-localhost-proxy:
-    profiles: ["dagster"]
-    image: alpine/socat:1.8.1.3@sha256:466c8a0383e16463fabdb7df01008292fb78d07da60224a46cb5d3142ce122ed
-    command: tcp-listen:8181,fork,reuseaddr tcp:lakekeeper:8181
-    depends_on:
-      lakekeeper:
-        condition: service_healthy
+  # The broker: KRaft, one node, the shape of `kafka-g6` below. Replication
+  # factor 1 everywhere (one node). Topics are not deleted with a connector; the
+  # broker's retention (7 days, `KAFKA_LOG_RETENTION_HOURS`) removes them.
+  kafka:
+    profiles: ["cdc"]
+    # Tag and digest (SRC-4 slice 0 measured this image, docs/plans/SRC-4-RESULT.md).
+    image: apache/kafka:3.8.0@sha256:c89f315cff967322c5d2021434b32271393cb193aa7ec1d43e97341924e57069
     restart: unless-stopped
-
-  debezium-server:
-    profiles: ["dagster"]
-    image: ghcr.io/memiiso/debezium-server-iceberg:1.1.1.Final@sha256:2ad14b158914097985e98933e6f541e2f4e34fabd1c5d47d655067b9db0282b8
-    # upstream 1.1.1 bug: when a static `token` is configured, the Iceberg
-    # REST client ignores the rendered `uri` and dials its built-in default
-    # http://localhost:8181 instead (reproduced with a bare `docker run`).
-    # Lakekeeper needs the token, so instead of fighting the property we
-    # share the proxy sidecar's netns: inside THIS container localhost:8181
-    # IS lakekeeper (see debezium-localhost-proxy below).
-    network_mode: "service:debezium-localhost-proxy"
-    depends_on:
-      debezium-localhost-proxy:
-        condition: service_started
-      g4-source-init:
-        condition: service_completed_successfully
-      lakekeeper-authz-init:
-        condition: service_completed_successfully
     environment:
-      LAKEKEEPER_CATALOG_URI: http://lakekeeper:8181/catalog
-      LAKEKEEPER_WAREHOUSE: ${LAKEKEEPER_WAREHOUSE:-default}
-      CH_RUSTFS_S3_ENDPOINT: ${CH_RUSTFS_S3_ENDPOINT:-http://rustfs:9000}
-      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:?RUSTFS_ACCESS_KEY is required (object store access key; run ops/init-env.sh or see docs/OPERATIONS.md)}
-      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:?RUSTFS_SECRET_KEY is required (object store secret key; run ops/init-env.sh or see docs/OPERATIONS.md)}
-      POSTGRES_USER: ${POSTGRES_USER:-lakehouse}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}
-      POSTGRES_DB: ${POSTGRES_DB:-lakehouse}
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      KAFKA_LISTENERS: "PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:9092"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+      KAFKA_NUM_PARTITIONS: "1"
+      # Change topics are kept 7 days (SRC-4 decision S2-i), the window in which
+      # a stopped applier can still catch up.
+      KAFKA_LOG_RETENTION_HOURS: "168"
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
     volumes:
-      - lakehouse_debezium_data:/debezium/data
-      # PR #33 review, should-fix: single-file subpath mount — this
-      # service only reads `debezium.jwt` (interpolated into
-      # debezium.sink.iceberg.token below).
-      - type: volume
-        source: lakehouse_oidc_tokens
-        target: /tokens/debezium.jwt
-        volume:
-          subpath: debezium.jwt
-        read_only: true
-    # Same reason `trino`'s command renders its catalog properties inline:
-    # the base image has no templating tool, so `sh` interpolates this
-    # container's own `environment:` values directly. `$$` stops compose's
-    # OWN `${VAR}` interpolation at parse time so the literal reaches this
-    # container's shell. R1 (ADR 0011): `LAKEKEEPER_TOKEN` is read from the
-    # `debezium` principal's pre-minted token file (mounted read-only
-    # above, same file `lakekeeper-authz-init` granted create/modify/select
-    # to) and rendered into `debezium.sink.iceberg.token` — the standard
-    # Apache Iceberg Java REST catalog client's static-bearer-token
-    # property (same mechanism as `iceberg-catalog-rest`'s `token` and
-    # pyiceberg's `token`, per the Iceberg REST spec).
-    entrypoint: ["/bin/sh", "-c"]
-    command:
-      - |
-        set -eu
-        LAKEKEEPER_TOKEN="$$(cat /tokens/debezium.jwt 2>/dev/null || true)"
-        mkdir -p /debezium/config && cat > /debezium/config/application.properties <<EOF
-        debezium.sink.type=iceberg
-        debezium.sink.iceberg.catalog-name=lakekeeper
-        debezium.sink.iceberg.type=rest
-        debezium.sink.iceberg.uri=$${LAKEKEEPER_CATALOG_URI}
-        debezium.sink.iceberg.warehouse=$${LAKEKEEPER_WAREHOUSE}
-        debezium.sink.iceberg.token=$${LAKEKEEPER_TOKEN}
-        debezium.sink.iceberg.io-impl=org.apache.iceberg.aws.s3.S3FileIO
-        debezium.sink.iceberg.s3.endpoint=$${CH_RUSTFS_S3_ENDPOINT}
-        debezium.sink.iceberg.s3.path-style-access=true
-        debezium.sink.iceberg.s3.access-key-id=$${RUSTFS_ACCESS_KEY}
-        debezium.sink.iceberg.s3.secret-access-key=$${RUSTFS_SECRET_KEY}
-        debezium.sink.iceberg.client.region=us-east-1
-        debezium.sink.iceberg.upsert=true
-        debezium.sink.iceberg.upsert-keep-deletes=true
-        debezium.sink.iceberg.destination-uppercase-table-names=false
-        debezium.sink.iceberg.write.format.default=parquet
-        debezium.source.connector.class=io.debezium.connector.postgresql.PostgresConnector
-        debezium.source.offset.storage=org.apache.kafka.connect.storage.FileOffsetBackingStore
-        debezium.source.offset.storage.file.filename=/debezium/data/p5cdc-offsets.dat
-        debezium.source.offset.flush.interval.ms=0
-        debezium.source.database.hostname=postgres
-        debezium.source.database.port=5432
-        debezium.source.database.user=$${POSTGRES_USER}
-        debezium.source.database.password=$${POSTGRES_PASSWORD}
-        debezium.source.database.dbname=$${POSTGRES_DB}
-        debezium.source.topic.prefix=p5cdc
-        debezium.source.schema.include.list=p5_cdc
-        debezium.source.table.include.list=p5_cdc.orders
-        debezium.source.plugin.name=pgoutput
-        debezium.source.slot.name=p5cdc_slot
-        debezium.source.publication.name=p5cdc_pub
-        debezium.source.publication.autocreate.mode=disabled
-        debezium.source.schema.history.internal=io.debezium.storage.file.history.FileSchemaHistory
-        debezium.source.schema.history.internal.file.filename=/debezium/data/p5cdc-schema-history.dat
-        EOF
-        exec /debezium/run.sh
-    restart: unless-stopped
+      - lakehouse_kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
 
-  # P5 (G4) — end-to-end acceptance test: INSERT/UPDATE/DELETE on the
-  # source are visible in ClickHouse within the agreed latency, AND
-  # replication-slot cleanup on connector removal is verified. Same
-  # `g1-test-runner`/`g3a-test-runner` shape (bind-mounted script, stock
-  # base image, runs inside the compose network). `dagster` profile (not
-  # `test`), for the same reason `g3a-source-init`'s comment gives.
+  # Kafka Connect: Debezium's distribution, pinned by tag AND digest (the tag
+  # `3.8` is a moving minor tag, so the digest is the pin). Config, offsets and
+  # status live in Kafka topics (ADR 0016 point 2), not in files, so a restart of
+  # the worker resumes every connector from its committed offset.
   #
-  # Usage (from a clean stack):
-  #   docker compose -p <project> --profile dagster up -d
+  # The source password never appears in a connector's JSON: the API writes it
+  # to a file on `lakehouse_cdc_secrets` (tmpfs, read-write in `lakehouse-api`,
+  # read-only HERE, mounted nowhere else) and the connector names it with the
+  # built-in `DirectoryConfigProvider` (`${dir:/run/cdc-secrets:<id>}`), enabled
+  # by the two `CONNECT_CONFIG_PROVIDERS*` variables below (SRC-4 decision S2-a,
+  # ADR 0016 point 4). Set `KAFKA_CONNECT_URL=http://kafka-connect:8083` and
+  # `CDC_KAFKA_BOOTSTRAP=kafka:9092` in `.env` to turn change capture on.
+  kafka-connect:
+    profiles: ["cdc"]
+    image: quay.io/debezium/connect:3.8@sha256:d67d678c726d1659f458e057e4a3a50a3b14c3e85a3be7f31de9db53dfb46668
+    restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      BOOTSTRAP_SERVERS: kafka:9092
+      GROUP_ID: lakehouse-connect
+      CONFIG_STORAGE_TOPIC: lakehouse_connect_configs
+      OFFSET_STORAGE_TOPIC: lakehouse_connect_offsets
+      STATUS_STORAGE_TOPIC: lakehouse_connect_status
+      CONFIG_STORAGE_REPLICATION_FACTOR: "1"
+      OFFSET_STORAGE_REPLICATION_FACTOR: "1"
+      STATUS_STORAGE_REPLICATION_FACTOR: "1"
+      CONNECT_CONFIG_PROVIDERS: dir
+      CONNECT_CONFIG_PROVIDERS_DIR_CLASS: org.apache.kafka.common.config.provider.DirectoryConfigProvider
+      HEAP_OPTS: "-Xms256M -Xmx1G"
+    volumes:
+      - type: volume
+        source: lakehouse_cdc_secrets
+        target: /run/cdc-secrets
+        read_only: true
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8083/ >/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+      start_period: 20s
+
+  # G4 (SRC-4 slice 2) — end-to-end acceptance test of PostgreSQL change
+  # capture on the `cdc` profile: the connector is created through the API
+  # (which provisions Kafka Connect), INSERT/UPDATE/DELETE on the source are
+  # visible in ClickHouse within the agreed latency, a pause and a worker
+  # restart lose nothing, and the replication slot and the secret file are
+  # gone after DELETE. Same `g1-test-runner`/`g3a-test-runner` shape
+  # (bind-mounted script, stock base image, runs inside the compose network).
+  # `dagster` profile (not `test`), for the same reason `g3a-source-init`'s
+  # comment gives. It does NOT `depends_on` the `cdc` services: a dependency
+  # on a service of another profile makes `--profile dagster` alone an error
+  # for every other job; the gate's caller starts `kafka` and `kafka-connect`
+  # explicitly (see the `g4-cdc` job in .github/workflows/ci.yml).
+  #
+  # Usage (from a clean stack, with KAFKA_CONNECT_URL and CDC_KAFKA_BOOTSTRAP
+  # set as `ops/g4/docker-compose.g4.override.yml` does):
+  #   docker compose -p <project> --profile dagster --profile cdc up -d
   #     postgres clickhouse rustfs rustfs-bucket-init lakekeeper-db-init
   #     lakekeeper-migrate lakekeeper lakekeeper-warehouse-init
-  #     g4-source-init debezium-server
-  #   docker compose -p <project> --profile dagster run --rm g4-test-runner
+  #     kafka kafka-connect lakehouse-api dagster-code-location
+  #     dagster-webserver dagster-daemon
+  #   docker compose -p <project> --profile dagster --profile cdc run --rm g4-test-runner
   g4-test-runner:
     profiles: ["dagster"]
     image: python:3.12-slim@sha256:aa943ce411423c7582288f18707ff66eddcbaeb510502d747a72aeb34f30d159
     working_dir: /work
     volumes:
       - ./ops/g4:/work
-      # Mounted OUTSIDE `/work` deliberately: `/work` itself is a bind
-      # mount (above) to `./ops/g4` on the host, and a nested bind mount
-      # under an already-bind-mounted directory makes Docker create the
-      # mount point ON THE HOST at that path (an empty
-      # `ops/g4/deprovision_connector.sh` file, observed during P5
-      # verification) — mounting it at `/opt/...` instead avoids leaving
-      # that stray artifact in the repo tree.
-      - ./ops/debezium/deprovision_connector.sh:/opt/deprovision_connector.sh:ro
       # SRC-9 plan task 6: `ops/gates/gate_summary.py` and `coverage.json`, the
-      # registry and result table every connector gate records into. At
-      # /opt/gates for the reason the deprovision script is at /opt: a bind
-      # mount nested under the bind-mounted /work would make Docker create
-      # the mount point on the host. Read-only, no secrets in it.
+      # registry and result table every connector gate records into. Mounted
+      # OUTSIDE `/work` deliberately: `/work` itself is a bind mount to
+      # `./ops/g4` on the host, and a nested bind mount under an
+      # already-bind-mounted directory makes Docker create the mount point ON
+      # THE HOST at that path. Read-only, no secrets in it.
       - ./ops/gates:/opt/gates:ro
     depends_on:
-      debezium-server:
-        condition: service_started
-      g4-source-init:
-        condition: service_completed_successfully
       # WS5 item C3 (C3-F1): step_wal_breach_produces_a_silenceable_
       # alert_instance logs into lakehouse-api and launches
       # replication_metrics_job through the Dagster webserver's GraphQL
@@ -3541,7 +3456,6 @@ services:
       oidc-mock:
         condition: service_healthy
     environment:
-      DEPROVISION_SCRIPT: /opt/deprovision_connector.sh
       # SRC-9 plan task 6: where `import gate_summary` finds the module
       # mounted above; no bytecode, because /work is a read-write bind of
       # `ops/g4` and a root-owned `__pycache__` there breaks the next
@@ -4160,6 +4074,20 @@ volumes:
   lakehouse_seaweedfs_iam:
   lakehouse_g1_cargo_registry:
   lakehouse_g1_target:
-  lakehouse_debezium_data:
+  # SRC-4 (ADR 0016): the broker's log directory. Change topics are kept 7 days.
+  lakehouse_kafka_data:
+  # SRC-4 (ADR 0016 point 4, decision S2-a): the source password of each
+  # change-capture connector, written by `lakehouse-api` and read by
+  # `kafka-connect`. A `tmpfs` volume: memory only, so it never reaches a disk,
+  # a backup or an image layer, and it is empty after a restart (the API
+  # rewrites every file on start and on every provisioning call). `mode=1777`:
+  # the two containers run as different users and the API must be able to create
+  # files in it; the files themselves are `0444`.
+  lakehouse_cdc_secrets:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: "size=1m,mode=1777"
   lakehouse_oidc_data:
   lakehouse_oidc_tokens:

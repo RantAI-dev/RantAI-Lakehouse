@@ -924,9 +924,11 @@ async fn seeded_data_engineer_may_get_and_put_ingest_spec() {
 }
 
 /// `SRC-11` decisions D9 and D11 at the route: leaving columns out is refused
-/// with a 422 for a source type that cannot list its columns (Oracle) and for a
-/// key column of a deduplicating table, and a malformed list is a 400. All
-/// three are refused before the address check or any write, so no connection
+/// with a 422 for the key column of a deduplicating table (on `PostgreSQL`, and
+/// on Oracle since `SRC-4` T1.2 made column choice available for it; the
+/// refusal for a source that cannot list its columns is the unit test
+/// `excluded_columns_are_accepted_only_for_sources_that_list_their_columns`),
+/// and a malformed list is a 400. All three are refused before the address check or any write, so no connection
 /// is made and nothing is stored.
 #[tokio::test]
 async fn ingest_spec_put_refuses_excluded_columns_the_source_cannot_honour() {
@@ -956,7 +958,8 @@ async fn ingest_spec_put_refuses_excluded_columns_the_source_cannot_honour() {
         (
             "oracle",
             serde_json::json!([{
-                "name": "APP.ORDERS", "target": "orders", "excludedColumns": ["NOTE"]
+                "name": "APP.ORDERS", "target": "orders", "loadMode": "replace_dedup",
+                "primaryKey": ["ID"], "excludedColumns": ["ID"]
             }]),
             StatusCode::UNPROCESSABLE_ENTITY,
         ),
@@ -1054,6 +1057,51 @@ async fn run_history_log_and_resume_need_connector_manage_and_run_reports_need_i
             "passed the gate, refused by the handler: {text}"
         );
     }
+}
+
+/// `SRC-4` slice 4: the lag limit is a person's (`connector:manage`); the capture
+/// observations are the orchestrator's (`ingest:read`, then the handler's
+/// service-identity check). Both ways: a `connector:manage`-only principal passes
+/// the gate of the limit route and is refused by the gate on the observations; an
+/// `ingest:read`-only principal is refused by the gate on the limit route and, on
+/// the observations, passes the gate and is refused by the handler (a user, not
+/// the service identity). The table-driven loops above cover the zero-permission
+/// and Platform-Admin directions for both entries.
+#[tokio::test]
+async fn the_lag_limit_needs_connector_manage_and_capture_observations_need_ingest_read() {
+    let TestApp { router, pool } = spin_up().await;
+    let manage = create_principal_with_permissions(&pool, "connector:manage").await;
+    let ingest = create_principal_with_permissions(&pool, "ingest:read").await;
+    let base = "/api/connectors/conn-pg-lakehouse";
+    let limit = ("PUT", format!("{base}/lag-limit"));
+    let observations = ("POST", format!("{base}/capture/observations"));
+
+    let cookie = session_cookie_for_user(&pool, manage).await;
+    let resp = request_with_cookie(&router, limit.0, &limit.1, &cookie).await;
+    assert_ne!(resp.status(), StatusCode::FORBIDDEN, "{}", limit.1);
+    assert_ne!(resp.status(), StatusCode::UNAUTHORIZED, "{}", limit.1);
+    let cookie = session_cookie_for_user(&pool, ingest).await;
+    let resp = request_with_cookie(&router, limit.0, &limit.1, &cookie).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{}", limit.1);
+
+    let cookie = session_cookie_for_user(&pool, manage).await;
+    let resp = request_with_cookie(&router, observations.0, &observations.1, &cookie).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let text = String::from_utf8_lossy(&to_bytes(resp.into_body(), usize::MAX).await.unwrap())
+        .into_owned();
+    assert!(
+        text.contains("ingest:read"),
+        "the gate names the permission: {text}"
+    );
+    let cookie = session_cookie_for_user(&pool, ingest).await;
+    let resp = request_with_cookie(&router, observations.0, &observations.1, &cookie).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let text = String::from_utf8_lossy(&to_bytes(resp.into_body(), usize::MAX).await.unwrap())
+        .into_owned();
+    assert!(
+        text.contains("service identity"),
+        "passed the gate, refused by the handler: {text}"
+    );
 }
 
 /// `SRC-13` (decision D11): the discovery routes are a person's

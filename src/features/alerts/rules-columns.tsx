@@ -44,6 +44,7 @@ export const RULE_KIND_LABEL: Record<string, string> = {
   connector_disabled: "Connector disabled",
   connector_schema_change: "Connector schema changed",
   connector_success: "Connector run succeeded",
+  connector_lag: "Change capture behind its limit",
   upload_failure: "Upload failed",
   quality_incident: "Quality incident opened",
 }

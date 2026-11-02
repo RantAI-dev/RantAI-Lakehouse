@@ -676,6 +676,7 @@ fn fired_source(kind: AlertKind) -> &'static str {
         | AlertKind::ConnectorDisabled
         | AlertKind::ConnectorSchemaChange
         | AlertKind::ConnectorSuccess => "Connector runs",
+        AlertKind::ConnectorLag => "Change capture",
         AlertKind::UploadFailure => "File uploads",
         // `DATA-14`: delivered when an incident opens
         // (`routes::quality_incidents`), which persists its own instance;
@@ -728,6 +729,7 @@ fn fired_detail(rule: &AlertRule, value: Option<f64>) -> String {
         | AlertKind::ConnectorDisabled
         | AlertKind::ConnectorSchemaChange
         | AlertKind::ConnectorSuccess
+        | AlertKind::ConnectorLag
         | AlertKind::UploadFailure => "connector or upload event".to_owned(),
         // `DATA-14`: never reached from `run_rules`; the incident route writes its own.
         AlertKind::QualityIncident => "quality incident".to_owned(),

@@ -1,28 +1,27 @@
-//! Connector registry -> Debezium Server runtime config (ADR 0007), and the
-//! R7 schema-evolution gate ADR 0006 named but deferred to this phase:
+//! Connector registry -> `Kafka Connect` connector config (ADR 0007, ADR 0016),
+//! and the R7 schema-evolution gate ADR 0006 named but deferred to this phase:
 //! nested struct/array/map source columns are rejected here, at connector
 //! registration, not discovered later at read time as an unreadable Bronze
 //! column.
+//!
+//! `SRC-4` slice 2 (decision S2-h) removed the `Debezium Server` properties
+//! renderer this module used to hold; [`render_connect_config`] is the one
+//! renderer now.
 //!
 //! # What this module does NOT do
 //!
 //! It does not call out to a source database to discover its schema, does
 //! not open a network connection anywhere, and does not persist anything.
 //! [`reject_unsupported_column_types`] is a pure function over a
-//! caller-supplied column list (whatever discovers that list — a future
-//! console "test connection + inspect schema" flow — is out of scope here;
-//! `lakehouse-api`'s `connector_probe` module added a real `PostgreSQL`/S3
-//! connectivity *test* in P6, but it does not do schema discovery, which
-//! stays exactly as out of scope as before). [`render_debezium_properties`]
-//! is a pure string-template
-//! function over already-resolved, already-validated inputs; the caller
-//! resolves `secretRef` via [`lakehouse_core::secret::SecretResolver`]
-//! (ADR 0002) before calling it. Actually running a generated config
-//! (creating a new `debezium-server` process/container per connector) is
-//! deployment orchestration, not this crate's job — see ADR 0007's "what
-//! P5 does NOT do" for why that stays out of scope this phase.
+//! caller-supplied column list. [`render_connect_config`] is a pure function
+//! over already-resolved inputs; the password is never an input, only a
+//! reference to a file the API writes (ADR 0016 point 4). Actually creating the
+//! connector on `Kafka Connect` is the API's job (`kafka_connect`,
+//! `cdc_lifecycle`), not this crate's.
 
-use lakehouse_core::secret::SecretValue;
+use std::collections::BTreeMap;
+
+use crate::ingest_spec::{CdcDial, CdcMongoDial, CdcSslMode, SqlDriver};
 
 /// One column of a source table, as a future schema-discovery step would
 /// report it — `type_name` is whatever string the source system names the
@@ -93,9 +92,8 @@ pub fn reject_unsupported_column_types(
     Ok(())
 }
 
-/// Everything that can go wrong building a [`DebeziumSourceSpec`] or
-/// rendering it via [`render_debezium_properties`] — always a construction-
-/// or render-time input problem, never something discovered by talking to
+/// Everything that can go wrong validating a slug, a connector id or the
+/// inputs of [`render_connect_config`] — always an input problem, never something discovered by talking to
 /// a real source database (this module never opens a connection).
 ///
 /// Deliberately carries no credential value in any variant: the whole point
@@ -118,7 +116,7 @@ pub enum CdcSpecError {
         slug: String,
     },
 
-    /// One of the values that gets interpolated into a `.properties` file
+    /// One of the values that gets interpolated into a connector config
     /// contained a control character (most importantly `\n`/`\r`, but any
     /// other ASCII control character is rejected too, for the same reason).
     ///
@@ -139,17 +137,85 @@ pub enum CdcSpecError {
         field: &'static str,
     },
 
-    /// A [`DebeziumEnvRefs`] field was not a valid environment-variable
-    /// identifier. See [`validate_env_var_ref`].
-    #[error("{field} is not a valid environment-variable reference name: {value:?}")]
-    InvalidEnvVarReference {
-        /// Which field of [`DebeziumEnvRefs`] was invalid.
+    /// A connector id that cannot be a Kafka Connect connector name, a topic
+    /// prefix and a file name at once (`SRC-4` T2.1). The id is a registry
+    /// key, never a credential, so it is safe to carry.
+    #[error("connector id {id:?} is invalid: must match ^[A-Za-z0-9][A-Za-z0-9_-]{{0,62}}$")]
+    InvalidConnectorId {
+        /// The rejected id, as given.
+        id: String,
+    },
+
+    /// A source table that is not `schema.table` of plain identifier
+    /// characters. `table.include.list` is a comma-separated list of regular
+    /// expressions, so a comma or a metacharacter in a name would change what
+    /// is captured instead of naming a table.
+    #[error("source table {name:?} is not a schema.table of letters, digits, '_' and '$'")]
+    InvalidTableName {
+        /// The rejected name, as given (a table name is not a credential).
+        name: String,
+    },
+
+    /// The secrets directory cannot be named in a config-provider reference.
+    #[error("the change-capture secrets directory is not an absolute path of plain characters")]
+    InvalidSecretsDir,
+
+    /// No source table to capture.
+    #[error("a change-capture connector needs at least one source table")]
+    NoTables,
+
+    /// A slot or publication name `PostgreSQL` logical replication cannot
+    /// use (`Debezium` takes lowercase letters, digits and `_` only).
+    #[error("{field} must be 1 to 63 lowercase letters, digits or underscores")]
+    InvalidReplicationName {
+        /// Which of the two names it was.
         field: &'static str,
-        /// The rejected value, as given — safe to include: an env var
-        /// reference NAME is never a credential (same reasoning
-        /// [`InvalidConnectorSlug`](CdcSpecError::InvalidConnectorSlug)
-        /// states for a rejected slug).
-        value: String,
+    },
+
+    /// A `MySQL` dial without its `serverId` (`Dial::parse` requires it; a
+    /// hand-built dial is refused here the same way).
+    #[error("a MySQL change-capture connector needs a serverId")]
+    NoServerId,
+
+    /// An `Oracle` dial that asks for certificate checking: the JDBC driver
+    /// does TLS only over TCPS with a Java trust store (`SRC-37`).
+    #[error("Oracle change capture cannot check the server certificate")]
+    OracleCertificateCheckUnsupported,
+
+    /// `MySQL`, `SQL Server` and `Oracle` connectors keep their schema history in
+    /// a Kafka topic and cannot start without the broker's address.
+    #[error(
+        "a MySQL, SQL Server or Oracle change-capture connector needs the schema-history broker"
+    )]
+    NoSchemaHistoryBroker,
+
+    /// The schema-history broker list is not `host:port[,host:port]` of plain
+    /// characters.
+    #[error("the schema-history broker is not a host:port list of plain characters")]
+    InvalidSchemaHistoryBroker,
+
+    /// A `MongoDB` dial whose `hosts` are not `host:port` of plain characters
+    /// (`Dial::parse` checks them; a hand-built dial is refused here the same
+    /// way). The seeds are written into the connection string, so a `/`, `?` or
+    /// `,` inside one would change what the worker dials.
+    #[error("a MongoDB change-capture connector takes exactly one host:port of plain characters")]
+    InvalidMongoHosts,
+
+    /// A `MongoDB` replica-set name outside letters, digits, `_`, `-` and `.`.
+    #[error("a MongoDB replica set name is 1 to 128 letters, digits, '_', '-' and '.'")]
+    InvalidReplicaSet,
+
+    /// A `MongoDB` database name outside letters, digits, `_` and `-`.
+    #[error("a MongoDB database name is 1 to 63 letters, digits, '_' and '-'")]
+    InvalidMongoDatabase,
+
+    /// A `MongoDB` collection that is not one plain name. `collection.include.list`
+    /// is a list of regular expressions and the collection becomes part of a topic
+    /// name, so a dot or a metacharacter would change what is captured.
+    #[error("source collection {name:?} is not a plain name of letters, digits, '_' and '-'")]
+    InvalidCollectionName {
+        /// The rejected name, as given (a collection name is not a credential).
+        name: String,
     },
 }
 
@@ -229,10 +295,9 @@ impl std::fmt::Display for ConnectorSlug {
 }
 
 /// Reject a value containing a `\n`, `\r`, or any other ASCII/Unicode
-/// control character before it is ever interpolated into a `.properties`
-/// file.
+/// control character before it is ever put into a connector config.
 ///
-/// A Java `.properties` file (what `debezium-server` reads its
+/// A Java `.properties` file (what a `Debezium` worker reads its
 /// configuration from) has no quoting mechanism for a value: it is not a
 /// structured format with escape sequences a writer can apply, it is
 /// `key=value` up to the end of the line. So a newline embedded in a value
@@ -241,7 +306,7 @@ impl std::fmt::Display for ConnectorSlug {
 /// single malicious field (a `host`, a `table` name, a resolved credential)
 /// inject arbitrary additional Debezium configuration. Rejecting every
 /// control character at construction, before formatting, means the
-/// template in [`render_debezium_properties`] never needs to escape
+/// renderer ([`render_connect_config`]) never needs to escape
 /// anything: every value it interpolates is already guaranteed
 /// injection-free.
 fn reject_control_characters(field: &'static str, value: &str) -> Result<(), CdcSpecError> {
@@ -251,481 +316,947 @@ fn reject_control_characters(field: &'static str, value: &str) -> Result<(), Cdc
     Ok(())
 }
 
-/// Everything [`render_debezium_properties`] needs to describe the
-/// `Postgres` logical-replication source side of one connector.
-///
-/// Every field other than `connector_slug`/`database_port` is validated by
-/// [`Self::new`] to reject control characters (see
-/// [`reject_control_characters`]) before this type can be constructed at
-/// all — there is no way to obtain a `DebeziumSourceSpec` whose fields
-/// haven't already been checked, which is what makes
-/// [`render_debezium_properties`] safe to format without any further
-/// escaping.
-#[derive(Debug, Clone)]
-pub struct DebeziumSourceSpec {
-    connector_slug: ConnectorSlug,
-    database_hostname: String,
-    database_port: u16,
-    database_name: String,
-    database_user: String,
-    schema_qualified_table: String,
-}
+/// The directory the API writes each change-capture connector's source password
+/// into, and `Kafka Connect`'s `DirectoryConfigProvider` reads it from
+/// (`SRC-4` decision S2-a, ADR 0016 point 4). A memory-only volume, mounted
+/// read-write in `lakehouse-api` and read-only in `kafka-connect`.
+pub const CDC_SECRETS_DIR: &str = "/run/cdc-secrets";
 
-impl DebeziumSourceSpec {
-    /// Build a validated source spec.
-    ///
-    /// `connector_slug` is a short, unique name for this connector's
-    /// `Debezium` topic prefix, replication slot, and publication —
-    /// derived from the `connector.id` slug (ADR 0004's
-    /// `sanitize_table_name` shape), never user-supplied verbatim, so it is
-    /// always a safe identifier once wrapped in [`ConnectorSlug`].
-    /// `database_hostname`/`database_user`/`database_name` are the source
-    /// `Postgres` connection's host/user/dbname (never logged by this
-    /// function's caller per `connectors.rs`'s guarantee 2).
-    /// `schema_qualified_table` is the schema-qualified table to capture,
-    /// e.g. `public.orders`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CdcSpecError::ControlCharacterInField`] if
-    /// `database_hostname`, `database_name`, `database_user`, or
-    /// `schema_qualified_table` contains a newline or other control
-    /// character — see [`reject_control_characters`].
-    pub fn new(
-        connector_slug: ConnectorSlug,
-        database_hostname: impl Into<String>,
-        database_port: u16,
-        database_name: impl Into<String>,
-        database_user: impl Into<String>,
-        schema_qualified_table: impl Into<String>,
-    ) -> Result<Self, CdcSpecError> {
-        let database_hostname = database_hostname.into();
-        let database_name = database_name.into();
-        let database_user = database_user.into();
-        let schema_qualified_table = schema_qualified_table.into();
-        reject_control_characters("database_hostname", &database_hostname)?;
-        reject_control_characters("database_name", &database_name)?;
-        reject_control_characters("database_user", &database_user)?;
-        reject_control_characters("schema_qualified_table", &schema_qualified_table)?;
-        Ok(Self {
-            connector_slug,
-            database_hostname,
-            database_port,
-            database_name,
-            database_user,
-            schema_qualified_table,
-        })
-    }
-}
+/// `Debezium`'s `PostgreSQL` connector class (`SRC-4` slice 2). Each driver's
+/// class is added by its slice, with the allowlist in the API's
+/// `kafka_connect` module.
+pub const POSTGRES_CONNECTOR_CLASS: &str = "io.debezium.connector.postgresql.PostgresConnector";
 
-/// Everything [`render_debezium_properties`] needs to describe the Bronze
-/// Iceberg sink side, shared across every connector in one deployment
-/// (`Lakekeeper` warehouse + `RustFS`/`SeaweedFS` endpoint, per ADR 0003/ADR
-/// 0004) rather than per-connector.
-#[derive(Debug, Clone)]
-pub struct IcebergSinkSpec {
-    /// `Lakekeeper`'s REST catalog URI, e.g. `http://lakekeeper:8181/catalog`.
-    pub catalog_uri: String,
-    /// The tenant's `Lakekeeper` warehouse name (ADR 0003).
-    pub warehouse: String,
-    /// The S3-compatible endpoint backing that warehouse (`RustFS` or
-    /// `SeaweedFS`, per ADR 0004/G2).
-    pub s3_endpoint: String,
-    /// The static bearer token `Lakekeeper`'s REST catalog authenticates
-    /// with (R1/ADR 0011 — the `debezium` principal's pre-minted token,
-    /// mounted read-only into the `debezium-server` container and read
-    /// from disk at startup). `None` for a deployment that runs `Lakekeeper`
-    /// without authorization enabled.
-    pub catalog_token: Option<SecretValue>,
-}
+/// `Debezium`'s `MySQL` connector class (`SRC-4` slice 3).
+pub const MYSQL_CONNECTOR_CLASS: &str = "io.debezium.connector.mysql.MySqlConnector";
 
-/// Render a `debezium-server-iceberg` `application.properties` body for one
-/// connector — the control-plane -> runtime path ADR 0007 designs. Upsert
-/// mode, initial snapshot then streaming, additive-only schema evolution
-/// (`Debezium`/Iceberg's own default — see ADR 0006), file-based offset/
-/// schema-history storage (P5-RESULT.md's measured trap: the
-/// Iceberg-backed alternatives default ON and silently create two more
-/// catalog tables that have nothing to do with Bronze), and
-/// `publication.autocreate.mode=disabled` (matching the checked-in demo
-/// connector: the publication is provisioned out of band, not
-/// autocreated, so a re-run never silently narrows/widens it).
-///
-/// Every secret value is interpolated into the returned `String` — by
-/// construction, since a `Debezium` Server properties file has no
-/// indirection mechanism for secrets. The caller is responsible for never
-/// logging the returned string; this function itself never does (its
-/// return value is not `Debug`-printed anywhere in this crate).
-///
-/// # Callers
-///
-/// As of this commit, nothing in `lakehouse-api`/`lakehouse-store` calls
-/// this function outside its own tests: the compose stack
-/// (`docker-compose.yml`'s `debezium-server` service) ships a
-/// hand-written `application.properties` heredoc for the one demo
-/// connector this phase supports (ADR 0007: "no dynamic per-connector
-/// provisioning" this phase). This function is the mechanism a future
-/// provisioning flow (one that takes a connector registration and turns it
-/// into a running `debezium-server` process) will call instead of that
-/// hand-written file. Until that flow exists,
-/// [`demo_connector_properties_match_the_checked_in_compose_file`] is what
-/// keeps this function honest: it renders a spec built from the SAME
-/// literal values the compose heredoc uses and asserts the two produce the
-/// same set of properties, so the renderer and the actually-deployed
-/// config cannot silently drift apart.
-///
-/// `slot_name` and `publication_name` are supplied by the caller rather
-/// than derived from `source.connector_slug`: a connector's replication
-/// slot and publication are provisioned out of band (see this function's
-/// own doc comment on `publication.autocreate.mode=disabled`, and the
-/// registry's `dial.slotName`/`dial.publicationName` fields), so a name
-/// that does not match what was actually provisioned would silently make
-/// `Debezium` read the wrong (or no) replication stream instead of failing
-/// loudly. Both are still validated as identifiers via [`ConnectorSlug::new`]
-/// before being interpolated — this reuses `ConnectorSlug`'s identifier-
-/// safety check without re-typing either name as a `ConnectorSlug` itself,
-/// since neither is a connector slug.
+/// `Debezium`'s `SQL Server` connector class (`SRC-4` slice 3).
+pub const SQLSERVER_CONNECTOR_CLASS: &str = "io.debezium.connector.sqlserver.SqlServerConnector";
+
+/// `Debezium`'s `MongoDB` connector class (`SRC-4` slice 5).
+pub const MONGODB_CONNECTOR_CLASS: &str = "io.debezium.connector.mongodb.MongoDbConnector";
+
+/// `Debezium`'s unwrap transform for `MongoDB` documents. The relational
+/// `ExtractNewRecordState` does not understand a `MongoDB` change event.
+const MONGODB_UNWRAP_CLASS: &str =
+    "io.debezium.connector.mongodb.transforms.ExtractNewDocumentState";
+
+/// `Debezium`'s `Oracle` connector class, reading the redo log through
+/// `LogMiner` (`SRC-4` slice 6, decision S6-d). Its JDBC driver ships in the
+/// pinned `Kafka Connect` image, so nothing is fetched at build time.
+pub const ORACLE_CONNECTOR_CLASS: &str = "io.debezium.connector.oracle.OracleConnector";
+
+/// The Kafka topic a `MySQL` or `SQL Server` connector keeps its schema history
+/// in (`SRC-4` decision S3-b/S3-d). `Debezium` creates it with unlimited
+/// retention; the broker's 7-day default must never apply to it, because a
+/// connector whose history is gone cannot restart. It is never read by the
+/// applier and never deleted with the connector (Kafka Connect has no topic API).
 ///
 /// # Errors
 ///
-/// Returns [`CdcSpecError::InvalidConnectorSlug`] if `slot_name` or
-/// `publication_name` does not match [`ConnectorSlug`]'s allowed shape —
-/// this covers both a value derived elsewhere in this crate and one read
-/// back from this crate's own `ingest_spec::CdcDial::slot_name`/
-/// `publication_name` fields (`src/ingest_spec.rs`), which is where a
-/// `cdc`-adapter connector's registry-supplied names actually live.
-/// Returns [`CdcSpecError::ControlCharacterInField`] if
-/// `database_password`, `s3_access_key`, `s3_secret_key`, or
-/// `sink.catalog_token` contains a newline or other control character.
-/// `source`'s and `sink`'s own string fields are already validated
-/// ([`DebeziumSourceSpec::new`]); the credential values handed to this call
-/// are the last unvalidated inputs, since they are resolved by the caller
-/// immediately before calling this function (see the module doc comment)
-/// rather than stored in either spec type.
-#[must_use = "this only builds a properties string; the caller must still write/deliver it"]
-pub fn render_debezium_properties(
-    source: &DebeziumSourceSpec,
-    sink: &IcebergSinkSpec,
-    slot_name: &str,
-    publication_name: &str,
-    database_password: &SecretValue,
-    s3_access_key: &SecretValue,
-    s3_secret_key: &SecretValue,
-) -> Result<String, CdcSpecError> {
-    // Validated purely for the identifier-safety side effect: the
-    // resulting `ConnectorSlug` is discarded, since `slot_name` and
-    // `publication_name` are not connector slugs, just values that must be
-    // as safe to embed unescaped as one.
-    ConnectorSlug::new(slot_name)?;
-    ConnectorSlug::new(publication_name)?;
-    reject_control_characters("database_password", database_password.expose_secret())?;
-    reject_control_characters("s3_access_key", s3_access_key.expose_secret())?;
-    reject_control_characters("s3_secret_key", s3_secret_key.expose_secret())?;
-    if let Some(token) = &sink.catalog_token {
-        reject_control_characters("catalog_token", token.expose_secret())?;
-    }
-
-    let slug = source.connector_slug.as_str();
-    let token_line = sink
-        .catalog_token
-        .as_ref()
-        .map(|token| format!("debezium.sink.iceberg.token={}\n", token.expose_secret()))
-        .unwrap_or_default();
-    // `schema.include.list` is derived from `schema_qualified_table` rather
-    // than taking a separate field: the two must always agree (Debezium
-    // rejects captures where the table isn't inside the included schema),
-    // so deriving one from the other removes an entire class of "these two
-    // fields disagree" misconfiguration.
-    let schema = source
-        .schema_qualified_table
-        .split_once('.')
-        .map_or(source.schema_qualified_table.as_str(), |(schema, _)| schema);
-
-    Ok(format!(
-        "debezium.sink.type=iceberg\n\
-         debezium.sink.iceberg.catalog-name=lakekeeper\n\
-         debezium.sink.iceberg.type=rest\n\
-         debezium.sink.iceberg.uri={catalog_uri}\n\
-         debezium.sink.iceberg.warehouse={warehouse}\n\
-         {token_line}\
-         debezium.sink.iceberg.io-impl=org.apache.iceberg.aws.s3.S3FileIO\n\
-         debezium.sink.iceberg.s3.endpoint={s3_endpoint}\n\
-         debezium.sink.iceberg.s3.path-style-access=true\n\
-         debezium.sink.iceberg.s3.access-key-id={s3_access_key}\n\
-         debezium.sink.iceberg.s3.secret-access-key={s3_secret_key}\n\
-         debezium.sink.iceberg.client.region=us-east-1\n\
-         debezium.sink.iceberg.upsert=true\n\
-         debezium.sink.iceberg.upsert-keep-deletes=true\n\
-         debezium.sink.iceberg.destination-uppercase-table-names=false\n\
-         debezium.sink.iceberg.write.format.default=parquet\n\
-         \n\
-         debezium.source.connector.class=io.debezium.connector.postgresql.PostgresConnector\n\
-         debezium.source.offset.storage=org.apache.kafka.connect.storage.FileOffsetBackingStore\n\
-         debezium.source.offset.storage.file.filename=/debezium/data/{slug}-offsets.dat\n\
-         debezium.source.offset.flush.interval.ms=0\n\
-         debezium.source.database.hostname={hostname}\n\
-         debezium.source.database.port={port}\n\
-         debezium.source.database.user={user}\n\
-         debezium.source.database.password={password}\n\
-         debezium.source.database.dbname={dbname}\n\
-         debezium.source.topic.prefix={slug}\n\
-         debezium.source.schema.include.list={schema}\n\
-         debezium.source.table.include.list={table}\n\
-         debezium.source.plugin.name=pgoutput\n\
-         debezium.source.slot.name={slot_name}\n\
-         debezium.source.publication.name={publication_name}\n\
-         debezium.source.publication.autocreate.mode=disabled\n\
-         debezium.source.schema.history.internal=io.debezium.storage.file.history.FileSchemaHistory\n\
-         debezium.source.schema.history.internal.file.filename=/debezium/data/{slug}-schema-history.dat\n",
-        catalog_uri = sink.catalog_uri,
-        warehouse = sink.warehouse,
-        s3_endpoint = sink.s3_endpoint,
-        s3_access_key = s3_access_key.expose_secret(),
-        s3_secret_key = s3_secret_key.expose_secret(),
-        hostname = source.database_hostname,
-        port = source.database_port,
-        user = source.database_user,
-        password = database_password.expose_secret(),
-        dbname = source.database_name,
-        table = source.schema_qualified_table,
-    ))
-}
-
-/// Validate that `value` is a plain environment-variable identifier
-/// (`^[A-Za-z_][A-Za-z0-9_]*$`) before [`render_debezium_properties_template`]
-/// places it inside a `${...}` wrapper.
-///
-/// A bare "no control characters" check (as [`reject_control_characters`]
-/// does for [`render_debezium_properties`]'s resolved secret values) is not
-/// enough here: a literal `}` is not a control character, but it closes the
-/// `${...}` wrapper early; a `$` could start a second, attacker-chosen
-/// expansion; and a `=` makes the reference look like a resolved
-/// `key=value` line rather than a reference name. This stricter,
-/// identifier-only shape is what actually rules those out.
-fn validate_env_var_ref(field: &'static str, value: &str) -> Result<(), CdcSpecError> {
-    let valid = value
-        .chars()
-        .next()
-        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-        && value.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
-    if valid {
-        Ok(())
+/// [`CdcSpecError::InvalidConnectorId`] if `id` is not a plain identifier.
+pub fn schema_history_topic(id: &str) -> Result<String, CdcSpecError> {
+    if is_connector_id(id) {
+        Ok(format!("cdc.{id}.schema-history"))
     } else {
-        Err(CdcSpecError::InvalidEnvVarReference {
-            field,
-            value: value.to_owned(),
-        })
+        Err(CdcSpecError::InvalidConnectorId { id: id.to_owned() })
     }
 }
 
-/// The Iceberg sink's non-secret location fields — everything
-/// [`render_debezium_properties_template`] needs about WHERE the sink
-/// is, as opposed to [`DebeziumEnvRefs`], which says WHICH env vars hold
-/// its credentials. Deliberately a separate, smaller type from
-/// [`IcebergSinkSpec`]: that type carries `catalog_token:
-/// Option<SecretValue>`, a resolved credential this renderer must never
-/// accept even as a type it could construct and ignore.
-#[derive(Debug, Clone, Copy)]
-pub struct IcebergSinkLocation<'a> {
-    /// `Lakekeeper`'s REST catalog URI, e.g. `http://lakekeeper:8181/catalog`.
-    pub catalog_uri: &'a str,
-    /// The `Lakekeeper` warehouse name.
-    pub warehouse: &'a str,
-    /// The S3-compatible endpoint backing that warehouse.
-    pub s3_endpoint: &'a str,
+/// Whether `id` is fit to be a Kafka Connect connector name, a topic prefix
+/// and a file name in [`CDC_SECRETS_DIR`] at once: no path separator, no `:`
+/// (the config provider's own separator), no control character.
+fn is_connector_id(id: &str) -> bool {
+    id.len() <= 63
+        && id.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
 }
 
-/// Environment-variable reference NAMES (never values) for the
-/// credentials [`render_debezium_properties_template`]'s output refers
-/// to — exactly the shape `docker-compose.yml`'s `debezium-server`
-/// heredoc already uses today
-/// (`debezium.source.database.password=$${POSTGRES_PASSWORD}`,
-/// `debezium.sink.iceberg.s3.access-key-id=$${RUSTFS_ACCESS_KEY}`,
-/// `debezium.sink.iceberg.s3.secret-access-key=$${RUSTFS_SECRET_KEY}`,
-/// `debezium.sink.iceberg.token=$${LAKEKEEPER_TOKEN}`) — the deployment's
-/// own shell expands `${NAME}` into the real value when the
-/// `debezium-server` container actually starts; nothing in this crate or
-/// its caller ever resolves it.
-#[derive(Debug, Clone, Copy)]
-#[allow(
-    clippy::struct_field_names,
-    reason = "the shared `_ref` postfix is deliberate, not accidental duplication: it is what \
-              distinguishes every field here from a resolved SecretValue field of the same base \
-              name elsewhere in this module (e.g. IcebergSinkSpec::catalog_token), which is the \
-              exact confusion this type exists to make impossible to introduce by accident"
-)]
-pub struct DebeziumEnvRefs<'a> {
-    /// Env var name holding the source database password, e.g.
-    /// `"CONNECTOR_PG_PASSWORD"` — derived by the caller from the
-    /// connector's own `secretRef` (see `routes::connectors::debezium_properties`),
-    /// not hardcoded, since a real connector's credential need not be
-    /// named the same as the checked-in demo's.
-    pub database_password_ref: &'a str,
-    /// Env var name holding the Iceberg sink's S3 access key, e.g.
-    /// `"RUSTFS_ACCESS_KEY"` — shared across every CDC connector in this
-    /// deployment (the sink is one warehouse), unlike
-    /// `database_password_ref`.
-    pub s3_access_key_ref: &'a str,
-    /// Env var name holding the Iceberg sink's S3 secret key.
-    pub s3_secret_key_ref: &'a str,
-    /// Env var name holding the `Lakekeeper` catalog token, or `None`
-    /// when this deployment's `Lakekeeper` enforces no authorization
-    /// (mirrors [`IcebergSinkSpec::catalog_token`]'s own `None` case).
-    pub catalog_token_ref: Option<&'a str>,
-}
-
-/// Render the `debezium-server` `application.properties` TEMPLATE a CDC
-/// connector would run with — credential fields are `${ENV_VAR_NAME}`
-/// references the deployment's own shell expands at container start,
-/// never a resolved value. This is the function
-/// `routes::connectors::debezium_properties` calls; it is deliberately
-/// NOT [`render_debezium_properties`] (see this module's "Callers"
-/// section) — that function still exists, unchanged, for whatever
-/// eventually renders a REAL running config server-side, with real
-/// resolved [`SecretValue`]s, never over this HTTP route.
-///
-/// `connector_class` names the real, documented `Debezium` connector class
-/// for the source driver — `"io.debezium.connector.postgresql.PostgresConnector"`,
-/// `"io.debezium.connector.mysql.MySqlConnector"`, or
-/// `"io.debezium.connector.sqlserver.SqlServerConnector"` (WS3 item 15:
-/// `Debezium` also supports non-Postgres CDC sources, but the class name
-/// hardcoded here before this parameter existed was always the Postgres
-/// one, which would silently mislabel a `mysql`/`mssql` connector's
-/// rendered template). This function also accepts the `MongoDB` connector
-/// class `"io.debezium.connector.mongodb.MongoDbConnector"`; the
-/// `MongoDB` connector's properties are materially different from the SQL
-/// source's (no replication slot, no publication, no `plugin.name=
-/// pgoutput`, no per-field hostname/port/user/password/dbname — a single
-/// `mongodb.connection.string` instead), so the source-side block below
-/// branches on the value. The caller picks the value; this function only
-/// interpolates it verbatim (it is a static, deployment-chosen string, not
-/// user input, so it gets no `reject_control_characters`/
-/// `validate_env_var_ref`-style validation of its own).
+/// The Kafka Connect connector name for registry connector `id`.
 ///
 /// # Errors
 ///
-/// Returns [`CdcSpecError::InvalidEnvVarReference`] if any of `refs`'s
-/// fields is not a valid environment-variable identifier
-/// (`^[A-Za-z_][A-Za-z0-9_]*$`) — see [`validate_env_var_ref`] for why
-/// this is checked here rather than left to
-/// [`reject_control_characters`]'s weaker guarantee.
-#[must_use = "this only builds a properties template; the caller must still return/deliver it"]
-pub fn render_debezium_properties_template(
-    source: &DebeziumSourceSpec,
-    sink: &IcebergSinkLocation<'_>,
-    refs: &DebeziumEnvRefs<'_>,
-    connector_class: &str,
-) -> Result<String, CdcSpecError> {
-    validate_env_var_ref("database_password_ref", refs.database_password_ref)?;
-    validate_env_var_ref("s3_access_key_ref", refs.s3_access_key_ref)?;
-    validate_env_var_ref("s3_secret_key_ref", refs.s3_secret_key_ref)?;
-    if let Some(catalog_token_ref) = refs.catalog_token_ref {
-        validate_env_var_ref("catalog_token_ref", catalog_token_ref)?;
+/// [`CdcSpecError::InvalidConnectorId`] if `id` is not a plain identifier.
+pub fn connect_connector_name(id: &str) -> Result<String, CdcSpecError> {
+    if is_connector_id(id) {
+        Ok(format!("lakehouse-{id}"))
+    } else {
+        Err(CdcSpecError::InvalidConnectorId { id: id.to_owned() })
+    }
+}
+
+/// The `Kafka Connect` config-provider reference to registry connector
+/// `id`'s password: `${dir:<secrets_dir>:<id>}`, `secrets_dir` being
+/// [`CDC_SECRETS_DIR`] in a deployment. It is the only form of the password the
+/// connector JSON ever holds.
+///
+/// # Errors
+///
+/// [`CdcSpecError::InvalidConnectorId`] if `id` is not a plain identifier;
+/// [`CdcSpecError::InvalidSecretsDir`] if `secrets_dir` is not an absolute path
+/// of plain characters (a `:` or `}` would end the reference early).
+pub fn connect_password_reference(id: &str, secrets_dir: &str) -> Result<String, CdcSpecError> {
+    let plain_dir = secrets_dir.starts_with('/')
+        && secrets_dir
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'_' | b'-' | b'.'));
+    if !plain_dir {
+        return Err(CdcSpecError::InvalidSecretsDir);
+    }
+    if is_connector_id(id) {
+        Ok(format!("${{dir:{secrets_dir}:{id}}}"))
+    } else {
+        Err(CdcSpecError::InvalidConnectorId { id: id.to_owned() })
+    }
+}
+
+/// Whether `name` is a `PostgreSQL` slot or publication name `Debezium`
+/// accepts: 1 to 63 of lowercase letters, digits and `_`.
+fn is_replication_name(name: &str) -> bool {
+    (1..=63).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
+
+/// Whether `name` is `schema.table`, each part plain identifier characters.
+fn split_table_name(name: &str) -> Option<(&str, &str)> {
+    let (schema, table) = name.split_once('.')?;
+    let plain = |part: &str| {
+        !part.is_empty()
+            && part
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'$'))
+    };
+    (plain(schema) && plain(table)).then_some((schema, table))
+}
+
+/// Whether `list` is `host:port[,host:port]...` of plain characters (letters,
+/// digits, `.`, `-`, `_`; a decimal port), as `schema.history.internal.kafka.
+/// bootstrap.servers` takes it.
+fn is_bootstrap_list(list: &str) -> bool {
+    !list.is_empty()
+        && list.split(',').all(|entry| {
+            entry.split_once(':').is_some_and(|(host, port)| {
+                !host.is_empty()
+                    && host
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+                    && !port.is_empty()
+                    && port.bytes().all(|b| b.is_ascii_digit())
+            })
+        })
+}
+
+/// `MySQL` connector's `database.ssl.mode` for a dial's mode: `Debezium` spells
+/// them `disabled`, `required`, `verify_ca` and `verify_identity`.
+const fn mysql_ssl_mode(mode: CdcSslMode) -> &'static str {
+    match mode {
+        CdcSslMode::Disable => "disabled",
+        CdcSslMode::Require => "required",
+        CdcSslMode::VerifyCa => "verify_ca",
+        CdcSslMode::VerifyFull => "verify_identity",
+    }
+}
+
+/// `SQL Server` connector's `(database.encrypt, database.trustServerCertificate)`
+/// for a dial's mode. `require` encrypts and takes the certificate as presented,
+/// the meaning it has for `PostgreSQL`. `verify-ca` and `verify-full` both
+/// encrypt and verify: the `SQL Server` driver cannot check the chain without
+/// also checking the host name, so `verify-ca` is stricter here, never looser.
+const fn mssql_tls(mode: CdcSslMode) -> (&'static str, &'static str) {
+    match mode {
+        CdcSslMode::Disable => ("false", "false"),
+        CdcSslMode::Require => ("true", "true"),
+        CdcSslMode::VerifyCa | CdcSslMode::VerifyFull => ("true", "false"),
+    }
+}
+
+/// Render the `Kafka Connect` connector configuration for a change-capture
+/// connector (`SRC-4` slice 2 decision S2-c, slice 3 decision S3-b): what the
+/// API sends to `PUT /connectors/<name>/config`. It replaces the `Debezium
+/// Server` properties template.
+///
+/// One renderer, four drivers. The keys every driver shares: the password
+/// reference, `topic.prefix=cdc.<id>`, the JSON converters without schemas, the
+/// `unwrap` transform with `delete.tombstone.handling.mode=rewrite` and
+/// `add.fields=op,source.ts_ms`, `snapshot.mode=initial` and
+/// `decimal.handling.mode=string`. `PostgreSQL` adds the dial's own slot and
+/// publication; `MySQL` its `serverId`, the databases of the source objects and
+/// the schema-history topic; `SQL Server` its database name and the
+/// schema-history topic. The password is the config-provider reference of
+/// [`connect_password_reference`], never a value, and every value is a string,
+/// as `Kafka Connect` wants. `delete.tombstone.handling.mode=rewrite`:
+/// `Debezium` 3.7 (the image's version; the tag says 3.8) ignores `delete.handling.mode` and `drop.tombstones`, and
+/// with them every delete reaches the topic as a message with no value
+/// (`docs/plans/SRC-4-RESULT.md`).
+///
+/// With `verify-ca` and `verify-full` the worker uses its own trust store: this
+/// renderer sets no root certificate.
+///
+/// `schema_history_bootstrap` is the broker address `MySQL`, `SQL Server` and
+/// `Oracle` connectors keep their schema history on; `PostgreSQL` ignores it.
+///
+/// # Errors
+///
+/// [`CdcSpecError::InvalidConnectorId`], [`CdcSpecError::InvalidSecretsDir`],
+/// [`CdcSpecError::NoTables`], [`CdcSpecError::InvalidTableName`],
+/// [`CdcSpecError::InvalidReplicationName`] (`PostgreSQL`),
+/// [`CdcSpecError::NoServerId`] (`MySQL`),
+/// [`CdcSpecError::NoSchemaHistoryBroker`] or
+/// [`CdcSpecError::InvalidSchemaHistoryBroker`] (`MySQL`, `SQL Server`), or
+/// [`CdcSpecError::ControlCharacterInField`] for a host, database or user
+/// holding a control character.
+pub fn render_connect_config(
+    connector_id: &str,
+    dial: &CdcDial,
+    tables: &[&str],
+    secrets_dir: &str,
+    schema_history_bootstrap: Option<&str>,
+) -> Result<BTreeMap<String, String>, CdcSpecError> {
+    let password = connect_password_reference(connector_id, secrets_dir)?;
+    if tables.is_empty() {
+        return Err(CdcSpecError::NoTables);
+    }
+    reject_control_characters("host", &dial.host)?;
+    reject_control_characters("database", &dial.database)?;
+    reject_control_characters("user", &dial.user)?;
+
+    // The first part of every table name: a schema (`PostgreSQL`, `SQL Server`)
+    // or a database (`MySQL`).
+    let mut first_parts: Vec<&str> = Vec::new();
+    for name in tables {
+        let (first, _) = split_table_name(name).ok_or_else(|| CdcSpecError::InvalidTableName {
+            name: (*name).to_owned(),
+        })?;
+        if !first_parts.contains(&first) {
+            first_parts.push(first);
+        }
     }
 
-    let slug = source.connector_slug.as_str();
-    let token_line = refs
-        .catalog_token_ref
-        .map(|name| format!("debezium.sink.iceberg.token=${{{name}}}\n"))
-        .unwrap_or_default();
+    let mut entries: Vec<(&str, String)> = vec![
+        ("tasks.max", "1".to_owned()),
+        ("database.hostname", dial.host.clone()),
+        ("database.port", dial.port.to_string()),
+        ("database.user", dial.user.clone()),
+        ("database.password", password),
+        ("topic.prefix", format!("cdc.{connector_id}")),
+        ("table.include.list", tables.join(",")),
+        ("snapshot.mode", "initial".to_owned()),
+        ("decimal.handling.mode", "string".to_owned()),
+        (
+            "key.converter",
+            "org.apache.kafka.connect.json.JsonConverter".to_owned(),
+        ),
+        ("key.converter.schemas.enable", "false".to_owned()),
+        (
+            "value.converter",
+            "org.apache.kafka.connect.json.JsonConverter".to_owned(),
+        ),
+        ("value.converter.schemas.enable", "false".to_owned()),
+        ("transforms", "unwrap".to_owned()),
+        (
+            "transforms.unwrap.type",
+            "io.debezium.transforms.ExtractNewRecordState".to_owned(),
+        ),
+        (
+            "transforms.unwrap.delete.tombstone.handling.mode",
+            "rewrite".to_owned(),
+        ),
+        ("transforms.unwrap.add.fields", "op,source.ts_ms".to_owned()),
+    ];
 
-    // MongoDB has no replication slot, no publication, no `plugin.name=
-    // pgoutput`, and no numeric server id. It IS addressed by a
-    // single connection string the Debezium MongoDB connector parses
-    // itself, with the operator's host and port carried as `${...}`
-    // references the deployment's shell expands at container start —
-    // matching every other credential-shaped field this template already
-    // renders as a reference rather than a resolved value. The two
-    // `CONNECTOR_MONGO_HOST` / `CONNECTOR_MONGO_PORT` literal names are
-    // deployment-chosen env var names (not user input), so they get no
-    // `validate_env_var_ref`-style check of their own.
-    let source_block = if connector_class == MONGO_CONNECTOR_CLASS {
-        format!(
-            "debezium.source.connector.class={connector_class}\n\
-             debezium.source.offset.storage=org.apache.kafka.connect.storage.FileOffsetBackingStore\n\
-             debezium.source.offset.storage.file.filename=/debezium/data/{slug}-offsets.dat\n\
-             debezium.source.offset.flush.interval.ms=0\n\
-             debezium.source.mongodb.connection.string=mongodb://${{CONNECTOR_MONGO_HOST}}:${{CONNECTOR_MONGO_PORT}}/?directConnection=true\n\
-             debezium.source.topic.prefix={slug}\n\
-             debezium.source.schema.history.internal=io.debezium.storage.file.history.FileSchemaHistory\n\
-             debezium.source.schema.history.internal.file.filename=/debezium/data/{slug}-schema-history.dat\n",
-        )
-    } else {
-        let schema = source
-            .schema_qualified_table
-            .split_once('.')
-            .map_or(source.schema_qualified_table.as_str(), |(schema, _)| schema);
-        format!(
-            "debezium.source.connector.class={connector_class}\n\
-             debezium.source.offset.storage=org.apache.kafka.connect.storage.FileOffsetBackingStore\n\
-             debezium.source.offset.storage.file.filename=/debezium/data/{slug}-offsets.dat\n\
-             debezium.source.offset.flush.interval.ms=0\n\
-             debezium.source.database.hostname={hostname}\n\
-             debezium.source.database.port={port}\n\
-             debezium.source.database.user={user}\n\
-             debezium.source.database.password=${{{database_password_ref}}}\n\
-             debezium.source.database.dbname={dbname}\n\
-             debezium.source.topic.prefix={slug}\n\
-             debezium.source.schema.include.list={schema}\n\
-             debezium.source.table.include.list={table}\n\
-             debezium.source.plugin.name=pgoutput\n\
-             debezium.source.slot.name={slug}_slot\n\
-             debezium.source.publication.name={slug}_pub\n\
-             debezium.source.publication.autocreate.mode=disabled\n\
-             debezium.source.schema.history.internal=io.debezium.storage.file.history.FileSchemaHistory\n\
-             debezium.source.schema.history.internal.file.filename=/debezium/data/{slug}-schema-history.dat\n",
-            hostname = source.database_hostname,
-            port = source.database_port,
-            user = source.database_user,
-            database_password_ref = refs.database_password_ref,
-            dbname = source.database_name,
-            schema = schema,
-            table = source.schema_qualified_table,
-        )
+    let driver_entries = match dial.driver {
+        SqlDriver::Postgres => postgres_entries(dial, &first_parts)?,
+        SqlDriver::Mysql => {
+            mysql_entries(connector_id, dial, &first_parts, schema_history_bootstrap)?
+        }
+        SqlDriver::Mssql => mssql_entries(connector_id, dial, schema_history_bootstrap)?,
+        SqlDriver::Oracle => oracle_entries(connector_id, dial, schema_history_bootstrap)?,
+    };
+    entries.extend(driver_entries);
+    Ok(entries
+        .into_iter()
+        .map(|(key, value)| (key.to_owned(), value))
+        .collect())
+}
+
+/// The `PostgreSQL` connector's own keys: class, database, TLS, schemas, and the
+/// dial's slot and publication.
+fn postgres_entries(
+    dial: &CdcDial,
+    schemas: &[&str],
+) -> Result<Vec<(&'static str, String)>, CdcSpecError> {
+    let (Some(slot_name), Some(publication_name)) =
+        (dial.slot_name.as_deref(), dial.publication_name.as_deref())
+    else {
+        // `Dial::parse` requires both for PostgreSQL; a hand-built dial without
+        // them is refused the same way a bad name is.
+        return Err(CdcSpecError::InvalidReplicationName { field: "slotName" });
+    };
+    for (field, value) in [
+        ("slotName", slot_name),
+        ("publicationName", publication_name),
+    ] {
+        if !is_replication_name(value) {
+            return Err(CdcSpecError::InvalidReplicationName { field });
+        }
+    }
+    Ok(vec![
+        ("connector.class", POSTGRES_CONNECTOR_CLASS.to_owned()),
+        ("database.dbname", dial.database.clone()),
+        ("database.sslmode", dial.ssl_mode.as_debezium().to_owned()),
+        ("schema.include.list", schemas.join(",")),
+        ("plugin.name", "pgoutput".to_owned()),
+        ("slot.name", slot_name.to_owned()),
+        ("publication.name", publication_name.to_owned()),
+        ("publication.autocreate.mode", "disabled".to_owned()),
+    ])
+}
+
+/// The `MySQL` connector's own keys: class, server id, databases, TLS, and the
+/// schema-history topic.
+fn mysql_entries(
+    connector_id: &str,
+    dial: &CdcDial,
+    databases: &[&str],
+    bootstrap: Option<&str>,
+) -> Result<Vec<(&'static str, String)>, CdcSpecError> {
+    let server_id = dial.server_id.ok_or(CdcSpecError::NoServerId)?;
+    let mut entries = vec![
+        ("connector.class", MYSQL_CONNECTOR_CLASS.to_owned()),
+        ("database.server.id", server_id.to_string()),
+        ("database.include.list", databases.join(",")),
+        (
+            "database.ssl.mode",
+            mysql_ssl_mode(dial.ssl_mode).to_owned(),
+        ),
+        // No topic named after the prefix alone: the applier reads the table
+        // topics only.
+        ("include.schema.changes", "false".to_owned()),
+    ];
+    entries.extend(schema_history_entries(connector_id, bootstrap)?);
+    Ok(entries)
+}
+
+/// The `SQL Server` connector's own keys: class, database, TLS, and the
+/// schema-history topic.
+fn mssql_entries(
+    connector_id: &str,
+    dial: &CdcDial,
+    bootstrap: Option<&str>,
+) -> Result<Vec<(&'static str, String)>, CdcSpecError> {
+    let (encrypt, trust) = mssql_tls(dial.ssl_mode);
+    let mut entries = vec![
+        ("connector.class", SQLSERVER_CONNECTOR_CLASS.to_owned()),
+        ("database.names", dial.database.clone()),
+        ("database.encrypt", encrypt.to_owned()),
+        ("database.trustServerCertificate", trust.to_owned()),
+    ];
+    entries.extend(schema_history_entries(connector_id, bootstrap)?);
+    Ok(entries)
+}
+
+/// The Oracle JDBC driver's native-network-encryption settings for a dial's
+/// mode (`SRC-4` decision S6-c). `require` makes the driver refuse a session
+/// that is not AES256-encrypted and SHA256-checksummed: encrypted, the server
+/// not authenticated, the same posture `require` has for the other drivers.
+/// `disable` sends none. `Dial::parse` refuses `verify-ca` and `verify-full`
+/// (the driver does TLS only over TCPS with a Java trust store, `SRC-37`);
+/// a hand-built dial that carries one is refused here too, so the config can
+/// never promise a check it does not make.
+fn oracle_encryption_entries(
+    mode: CdcSslMode,
+) -> Result<Vec<(&'static str, String)>, CdcSpecError> {
+    match mode {
+        CdcSslMode::Disable => Ok(Vec::new()),
+        CdcSslMode::Require => Ok(vec![
+            ("driver.oracle.net.encryption_client", "REQUIRED".to_owned()),
+            (
+                "driver.oracle.net.encryption_types_client",
+                "(AES256)".to_owned(),
+            ),
+            (
+                "driver.oracle.net.crypto_checksum_client",
+                "REQUIRED".to_owned(),
+            ),
+            (
+                "driver.oracle.net.crypto_checksum_types_client",
+                "(SHA256)".to_owned(),
+            ),
+        ]),
+        CdcSslMode::VerifyCa | CdcSslMode::VerifyFull => {
+            Err(CdcSpecError::OracleCertificateCheckUnsupported)
+        }
+    }
+}
+
+/// The `Oracle` connector's own keys: class, the container database, the
+/// pluggable database when there is one, native encryption, and the
+/// schema-history topic. `log.mining.strategy` is `hybrid` (Amendment 12, S12-a); `snapshot.mode` keeps the
+/// connector's default, `initial`.
+fn oracle_entries(
+    connector_id: &str,
+    dial: &CdcDial,
+    bootstrap: Option<&str>,
+) -> Result<Vec<(&'static str, String)>, CdcSpecError> {
+    let mut entries = vec![
+        ("connector.class", ORACLE_CONNECTOR_CLASS.to_owned()),
+        ("database.dbname", dial.database.clone()),
+        // `SRC-4` Amendment 12 (S12-a): the default `online_catalog` fails the task on the first change
+        // that mentions a column added after the connector started (`g4-oracle`, run 41235139798:
+        // "No column 'NOTE' found in table", task killed). `hybrid` keeps the online dictionary and falls
+        // back to Debezium's own schema metadata when LogMiner cannot rebuild a DML
+        // (`OracleConnectorConfig.java:1545-1554`). Its one config conflict is `lob.enabled=true`
+        // (`:2416-2425`), which this renderer never sets. `redo_log_catalog` is NOT used: it writes the
+        // dictionary into the redo logs and needs the owner's sign-off.
+        ("log.mining.strategy", "hybrid".to_owned()),
+    ];
+    if let Some(pdb) = &dial.pdb_name {
+        reject_control_characters("pdbName", pdb)?;
+        entries.push(("database.pdb.name", pdb.clone()));
+    }
+    entries.extend(oracle_encryption_entries(dial.ssl_mode)?);
+    entries.extend(schema_history_entries(connector_id, bootstrap)?);
+    Ok(entries)
+}
+
+/// The two schema-history keys of a `MySQL`, `SQL Server` or `Oracle` connector.
+fn schema_history_entries(
+    connector_id: &str,
+    bootstrap: Option<&str>,
+) -> Result<[(&'static str, String); 2], CdcSpecError> {
+    let bootstrap = bootstrap.ok_or(CdcSpecError::NoSchemaHistoryBroker)?;
+    if !is_bootstrap_list(bootstrap) {
+        return Err(CdcSpecError::InvalidSchemaHistoryBroker);
+    }
+    Ok([
+        (
+            "schema.history.internal.kafka.bootstrap.servers",
+            bootstrap.to_owned(),
+        ),
+        (
+            "schema.history.internal.kafka.topic",
+            schema_history_topic(connector_id)?,
+        ),
+    ])
+}
+
+/// Whether `name` is one plain `MongoDB` name (a database or a collection) as
+/// `collection.include.list` and a topic name take it.
+fn is_plain_mongo_name(name: &str, max: usize) -> bool {
+    (1..=max).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+}
+
+/// Render the `Kafka Connect` connector configuration for a `MongoDB`
+/// change-capture connector (`SRC-4` slice 5, decisions S5-b and S5-c).
+///
+/// `collections` are the source objects' names: one plain collection name each,
+/// of the dial's database (discovery lists them that way, as the batch `MongoDB`
+/// adapter reads them). The connector captures `<database>.<collection>` for
+/// each, and `Debezium` writes the topic `cdc.<id>.<database>.<collection>`.
+///
+/// The keys: the `MongoDB` connector class; `mongodb.connection.string` built
+/// from the dial's hosts and replica set and **no credential**; `mongodb.user`
+/// and `mongodb.password`, the password as the config-provider reference of
+/// [`connect_password_reference`], never a value; `mongodb.authsource` is the
+/// dial's database; `capture.mode=change_streams_update_full`, so an update
+/// carries the whole document, which the current-row mode needs; the JSON
+/// converters without schemas; `snapshot.mode=initial`; and `MongoDB`'s own
+/// `ExtractNewDocumentState` with `delete.tombstone.handling.mode=rewrite` and
+/// `add.fields=op,source.ts_ms` (the keys the relational unwrap takes in
+/// [`render_connect_config`], on the class that unwraps documents). These
+/// shared keys are written out here, not drawn from that function, so the
+/// relational renderer stays as slice 3 left it.
+///
+/// The dial holds exactly one host and the connection string always carries
+/// `directConnection=true` (`SRC-4` slice 5 review BLOCKER 1, decision S5-b): the
+/// worker then dials only the written host, never the member addresses a replica
+/// set reports, which nothing checks against the installation's address rules.
+///
+/// TLS: `disable` sets `mongodb.ssl.enabled=false`. The other three set it
+/// `true`; `require` also sets `mongodb.ssl.invalid.hostname.allowed=true`, so
+/// the host name need not match; `verify-ca` and `verify-full` set it `false`.
+/// The certificate chain is checked against the worker's trust store in every
+/// TLS mode: `Debezium` has no setting that takes a `MongoDB` certificate "as
+/// presented", so `require` is weaker than `verify-full` by the host name only.
+/// This renderer sets no root certificate.
+///
+/// # Errors
+///
+/// [`CdcSpecError::InvalidConnectorId`], [`CdcSpecError::InvalidSecretsDir`],
+/// [`CdcSpecError::NoTables`], [`CdcSpecError::InvalidCollectionName`],
+/// [`CdcSpecError::InvalidMongoHosts`], [`CdcSpecError::InvalidReplicaSet`],
+/// [`CdcSpecError::InvalidMongoDatabase`], or
+/// [`CdcSpecError::ControlCharacterInField`] for a user holding a control
+/// character.
+pub fn render_mongodb_connect_config(
+    connector_id: &str,
+    dial: &CdcMongoDial,
+    collections: &[&str],
+    secrets_dir: &str,
+) -> Result<BTreeMap<String, String>, CdcSpecError> {
+    let password = connect_password_reference(connector_id, secrets_dir)?;
+    if collections.is_empty() {
+        return Err(CdcSpecError::NoTables);
+    }
+    reject_control_characters("user", &dial.user)?;
+    if !is_plain_mongo_name(&dial.database, 63) {
+        return Err(CdcSpecError::InvalidMongoDatabase);
+    }
+    // Review BLOCKER 1: one host only, refused here as `Dial::parse` refuses it.
+    if dial.hosts.len() != 1 || !is_bootstrap_list(&dial.hosts.join(",")) {
+        return Err(CdcSpecError::InvalidMongoHosts);
+    }
+    let replica_set_ok = (1..=128).contains(&dial.replica_set.len())
+        && dial
+            .replica_set
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'));
+    if !replica_set_ok {
+        return Err(CdcSpecError::InvalidReplicaSet);
+    }
+    let mut include: Vec<String> = Vec::new();
+    for name in collections {
+        if !is_plain_mongo_name(name, 120) {
+            return Err(CdcSpecError::InvalidCollectionName {
+                name: (*name).to_owned(),
+            });
+        }
+        include.push(format!("{}.{name}", dial.database));
+    }
+
+    let connection_string = format!(
+        "mongodb://{}/?replicaSet={}&directConnection=true",
+        dial.hosts.join(","),
+        dial.replica_set
+    );
+    let (ssl_enabled, hostname_allowed) = match dial.ssl_mode {
+        CdcSslMode::Disable => ("false", None),
+        CdcSslMode::Require => ("true", Some("true")),
+        CdcSslMode::VerifyCa | CdcSslMode::VerifyFull => ("true", Some("false")),
     };
 
-    Ok(format!(
-        "debezium.sink.type=iceberg\n\
-         debezium.sink.iceberg.catalog-name=lakekeeper\n\
-         debezium.sink.iceberg.type=rest\n\
-         debezium.sink.iceberg.uri={catalog_uri}\n\
-         debezium.sink.iceberg.warehouse={warehouse}\n\
-         {token_line}\
-         debezium.sink.iceberg.io-impl=org.apache.iceberg.aws.s3.S3FileIO\n\
-         debezium.sink.iceberg.s3.endpoint={s3_endpoint}\n\
-         debezium.sink.iceberg.s3.path-style-access=true\n\
-         debezium.sink.iceberg.s3.access-key-id=${{{s3_access_key_ref}}}\n\
-         debezium.sink.iceberg.s3.secret-access-key=${{{s3_secret_key_ref}}}\n\
-         debezium.sink.iceberg.client.region=us-east-1\n\
-         debezium.sink.iceberg.upsert=true\n\
-         debezium.sink.iceberg.upsert-keep-deletes=true\n\
-         debezium.sink.iceberg.destination-uppercase-table-names=false\n\
-         debezium.sink.iceberg.write.format.default=parquet\n\
-         \n\
-         {source_block}",
-        catalog_uri = sink.catalog_uri,
-        warehouse = sink.warehouse,
-        s3_endpoint = sink.s3_endpoint,
-        s3_access_key_ref = refs.s3_access_key_ref,
-        s3_secret_key_ref = refs.s3_secret_key_ref,
-    ))
+    let mut entries: Vec<(&str, String)> = vec![
+        ("connector.class", MONGODB_CONNECTOR_CLASS.to_owned()),
+        ("tasks.max", "1".to_owned()),
+        ("mongodb.connection.string", connection_string),
+        ("mongodb.user", dial.user.clone()),
+        ("mongodb.password", password),
+        ("mongodb.authsource", dial.database.clone()),
+        ("mongodb.ssl.enabled", ssl_enabled.to_owned()),
+        ("topic.prefix", format!("cdc.{connector_id}")),
+        ("collection.include.list", include.join(",")),
+        ("capture.mode", "change_streams_update_full".to_owned()),
+        // The default scope is the whole deployment, which needs the right to read every
+        // database; the database scope needs only the dial's own (`SRC-4` S5-h, Debezium's
+        // "Required permissions").
+        ("capture.scope", "database".to_owned()),
+        ("capture.target", dial.database.clone()),
+        ("snapshot.mode", "initial".to_owned()),
+        (
+            "key.converter",
+            "org.apache.kafka.connect.json.JsonConverter".to_owned(),
+        ),
+        ("key.converter.schemas.enable", "false".to_owned()),
+        (
+            "value.converter",
+            "org.apache.kafka.connect.json.JsonConverter".to_owned(),
+        ),
+        ("value.converter.schemas.enable", "false".to_owned()),
+        ("transforms", "unwrap".to_owned()),
+        ("transforms.unwrap.type", MONGODB_UNWRAP_CLASS.to_owned()),
+        (
+            "transforms.unwrap.delete.tombstone.handling.mode",
+            "rewrite".to_owned(),
+        ),
+        ("transforms.unwrap.add.fields", "op,source.ts_ms".to_owned()),
+    ];
+    if let Some(allowed) = hostname_allowed {
+        entries.push(("mongodb.ssl.invalid.hostname.allowed", allowed.to_owned()));
+    }
+    Ok(entries
+        .into_iter()
+        .map(|(key, value)| (key.to_owned(), value))
+        .collect())
 }
-
-/// The Debezium `MongoDB` connector's class name — a single constant
-/// referenced from both [`render_debezium_properties_template`]'s
-/// source-block branch (which renders the mongo-specific properties when
-/// this is the `connector_class`) and from `routes::connectors`'s
-/// adapter-dispatch (`Some("mongodb") => MONGO_CONNECTOR_CLASS`). Two
-/// callers, one literal — matches the shape of the other `connector_class`
-/// values in `routes::connectors::debezium_connector_class`.
-pub const MONGO_CONNECTOR_CLASS: &str = "io.debezium.connector.mongodb.MongoDbConnector";
 
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-    use std::collections::BTreeMap;
-
     use super::*;
+
+    fn pg_dial(ssl_mode: &str) -> CdcDial {
+        serde_json::from_value(serde_json::json!({
+            "driver": "postgres", "host": "db.internal", "port": 5432,
+            "database": "orders", "user": "app_reader",
+            "slotName": "orders_slot", "publicationName": "orders_pub",
+            "sslMode": ssl_mode
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn connect_config_uses_the_dials_own_slot_publication_and_tls_mode() {
+        let config = render_connect_config(
+            "conn-orders-ab12",
+            &pg_dial("verify-full"),
+            &["public.orders", "sales.items"],
+            CDC_SECRETS_DIR,
+            None,
+        )
+        .unwrap();
+        assert_eq!(config["connector.class"], POSTGRES_CONNECTOR_CLASS);
+        assert_eq!(config["slot.name"], "orders_slot");
+        assert_eq!(config["publication.name"], "orders_pub");
+        assert_eq!(config["publication.autocreate.mode"], "disabled");
+        assert_eq!(config["database.sslmode"], "verify-full");
+        assert_eq!(config["database.hostname"], "db.internal");
+        assert_eq!(config["table.include.list"], "public.orders,sales.items");
+        assert_eq!(config["schema.include.list"], "public,sales");
+        assert_eq!(config["topic.prefix"], "cdc.conn-orders-ab12");
+        assert_eq!(config["snapshot.mode"], "initial");
+        // Amendment 3: Debezium 3.7.0 (tag 3.8, DEBEZIUM_VERSION=3.7.0.Final) ignores delete.handling.mode and drop.tombstones.
+        assert_eq!(
+            config["transforms.unwrap.delete.tombstone.handling.mode"],
+            "rewrite"
+        );
+        assert_eq!(config["transforms.unwrap.add.fields"], "op,source.ts_ms");
+        assert!(!config.contains_key("transforms.unwrap.delete.handling.mode"));
+        assert!(!config.contains_key("transforms.unwrap.drop.tombstones"));
+    }
+
+    #[test]
+    fn connect_config_holds_the_password_only_as_a_provider_reference() {
+        let config = render_connect_config(
+            "conn-orders-ab12",
+            &pg_dial("require"),
+            &["public.orders"],
+            CDC_SECRETS_DIR,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            config["database.password"],
+            "${dir:/run/cdc-secrets:conn-orders-ab12}"
+        );
+        assert_eq!(
+            connect_password_reference("conn-a", "/tmp/x:y"),
+            Err(CdcSpecError::InvalidSecretsDir)
+        );
+        assert_eq!(
+            connect_connector_name("conn-orders-ab12").unwrap(),
+            "lakehouse-conn-orders-ab12"
+        );
+    }
+
+    #[test]
+    fn connect_config_refuses_what_could_change_what_is_captured() {
+        let dial = pg_dial("require");
+        for table in [
+            "orders",
+            "public.orders,public.secrets",
+            "public.or ders",
+            "a.b.c",
+            ".x",
+        ] {
+            assert!(
+                matches!(
+                    render_connect_config("conn-a", &dial, &[table], CDC_SECRETS_DIR, None),
+                    Err(CdcSpecError::InvalidTableName { .. })
+                ),
+                "{table}"
+            );
+        }
+        assert_eq!(
+            render_connect_config("conn-a", &dial, &[], CDC_SECRETS_DIR, None),
+            Err(CdcSpecError::NoTables)
+        );
+        for id in ["", "../x", "a:b", "-a", "a/b", "a\nb"] {
+            assert!(
+                matches!(
+                    render_connect_config(id, &dial, &["public.t"], CDC_SECRETS_DIR, None),
+                    Err(CdcSpecError::InvalidConnectorId { .. })
+                ),
+                "{id}"
+            );
+        }
+    }
+
+    #[test]
+    fn connect_config_refuses_a_slot_name_debezium_would_reject_and_other_drivers() {
+        let mut dial = pg_dial("require");
+        dial.slot_name = Some("Orders-Slot".to_owned());
+        assert!(matches!(
+            render_connect_config("conn-a", &dial, &["public.t"], CDC_SECRETS_DIR, None),
+            Err(CdcSpecError::InvalidReplicationName { field: "slotName" })
+        ));
+    }
+
+    const BROKER: &str = "kafka:9092";
+
+    fn other_dial(driver: &str, ssl_mode: &str) -> CdcDial {
+        let mut json = serde_json::json!({
+            "driver": driver, "host": "db.internal", "port": 3306,
+            "database": "orders", "user": "app_reader", "sslMode": ssl_mode
+        });
+        if driver == "mysql" {
+            json["serverId"] = serde_json::json!(5400);
+        }
+        if driver == "oracle" {
+            json["database"] = serde_json::json!("FREE");
+            json["pdbName"] = serde_json::json!("FREEPDB1");
+        }
+        serde_json::from_value(json).unwrap()
+    }
+
+    fn render_other(driver: &str, ssl_mode: &str, tables: &[&str]) -> BTreeMap<String, String> {
+        render_connect_config(
+            "conn-x1",
+            &other_dial(driver, ssl_mode),
+            tables,
+            CDC_SECRETS_DIR,
+            Some(BROKER),
+        )
+        .unwrap()
+    }
+
+    /// The keys every driver shares, so a change to the shared part is seen once.
+    fn assert_shared_keys(config: &BTreeMap<String, String>) {
+        assert_eq!(
+            config["database.password"],
+            "${dir:/run/cdc-secrets:conn-x1}"
+        );
+        assert_eq!(config["topic.prefix"], "cdc.conn-x1");
+        assert_eq!(config["snapshot.mode"], "initial");
+        assert_eq!(config["decimal.handling.mode"], "string");
+        assert_eq!(config["tasks.max"], "1");
+        assert_eq!(
+            config["transforms.unwrap.delete.tombstone.handling.mode"],
+            "rewrite"
+        );
+        assert_eq!(config["transforms.unwrap.add.fields"], "op,source.ts_ms");
+        assert_eq!(config["value.converter.schemas.enable"], "false");
+        assert!(!config.values().any(|v| v.contains("s3cret")));
+    }
+
+    #[test]
+    fn mysql_config_has_exactly_its_keys() {
+        let config = render_other(
+            "mysql",
+            "require",
+            &["shop.orders", "shop.items", "crm.users"],
+        );
+        assert_shared_keys(&config);
+        assert_eq!(config["connector.class"], MYSQL_CONNECTOR_CLASS);
+        assert_eq!(config["database.server.id"], "5400");
+        assert_eq!(config["database.include.list"], "shop,crm");
+        assert_eq!(
+            config["table.include.list"],
+            "shop.orders,shop.items,crm.users"
+        );
+        assert_eq!(config["include.schema.changes"], "false");
+        assert_eq!(
+            config["schema.history.internal.kafka.bootstrap.servers"],
+            BROKER
+        );
+        assert_eq!(
+            config["schema.history.internal.kafka.topic"],
+            "cdc.conn-x1.schema-history"
+        );
+        // None of PostgreSQL's keys.
+        for key in [
+            "slot.name",
+            "publication.name",
+            "plugin.name",
+            "database.sslmode",
+            "database.dbname",
+            "database.names",
+        ] {
+            assert!(!config.contains_key(key), "{key}");
+        }
+    }
+
+    #[test]
+    fn sql_server_config_has_exactly_its_keys() {
+        let config = render_other("mssql", "require", &["dbo.orders", "sales.items"]);
+        assert_shared_keys(&config);
+        assert_eq!(config["connector.class"], SQLSERVER_CONNECTOR_CLASS);
+        assert_eq!(config["database.names"], "orders");
+        assert_eq!(config["table.include.list"], "dbo.orders,sales.items");
+        assert_eq!(
+            config["schema.history.internal.kafka.bootstrap.servers"],
+            BROKER
+        );
+        assert_eq!(
+            config["schema.history.internal.kafka.topic"],
+            "cdc.conn-x1.schema-history"
+        );
+        for key in [
+            "slot.name",
+            "database.server.id",
+            "database.include.list",
+            "database.sslmode",
+            "database.ssl.mode",
+            "include.schema.changes",
+        ] {
+            assert!(!config.contains_key(key), "{key}");
+        }
+    }
+
+    #[test]
+    fn oracle_config_has_exactly_its_keys() {
+        let config = render_other("oracle", "require", &["SHOP.ORDERS", "SHOP.ITEMS"]);
+        assert_shared_keys(&config);
+        assert_eq!(config["connector.class"], ORACLE_CONNECTOR_CLASS);
+        assert_eq!(config["database.dbname"], "FREE");
+        assert_eq!(config["database.pdb.name"], "FREEPDB1");
+        assert_eq!(config["table.include.list"], "SHOP.ORDERS,SHOP.ITEMS");
+        assert_eq!(
+            config["schema.history.internal.kafka.bootstrap.servers"],
+            BROKER
+        );
+        assert_eq!(
+            config["schema.history.internal.kafka.topic"],
+            "cdc.conn-x1.schema-history"
+        );
+        for (key, value) in [
+            ("driver.oracle.net.encryption_client", "REQUIRED"),
+            ("driver.oracle.net.encryption_types_client", "(AES256)"),
+            ("driver.oracle.net.crypto_checksum_client", "REQUIRED"),
+            ("driver.oracle.net.crypto_checksum_types_client", "(SHA256)"),
+        ] {
+            assert_eq!(config[key], value, "{key}");
+        }
+        // Amendment 12 (S12-a): hybrid, so a column added mid-stream does not fail the task; LOBs are never switched on.
+        assert_eq!(config["log.mining.strategy"], "hybrid");
+        assert!(!config.contains_key("lob.enabled"));
+        // None of the other drivers' keys.
+        for key in [
+            "slot.name",
+            "database.server.id",
+            "database.include.list",
+            "database.names",
+            "database.sslmode",
+            "database.ssl.mode",
+            "database.encrypt",
+            "include.schema.changes",
+        ] {
+            assert!(!config.contains_key(key), "{key}");
+        }
+    }
+
+    #[test]
+    fn oracle_config_omits_the_pdb_without_one_and_the_encryption_when_disabled() {
+        let mut dial = other_dial("oracle", "disable");
+        dial.pdb_name = None;
+        let config =
+            render_connect_config("conn-x1", &dial, &["A.B"], CDC_SECRETS_DIR, Some(BROKER))
+                .unwrap();
+        assert!(!config.contains_key("database.pdb.name"));
+        assert!(!config.keys().any(|key| key.starts_with("driver.oracle")));
+        // A hand-built dial that asks for certificate checking is refused.
+        for mode in ["verify-ca", "verify-full"] {
+            let mut dial = other_dial("oracle", "require");
+            dial.ssl_mode = serde_json::from_value(serde_json::json!(mode)).unwrap();
+            assert_eq!(
+                render_connect_config("conn-x1", &dial, &["A.B"], CDC_SECRETS_DIR, Some(BROKER)),
+                Err(CdcSpecError::OracleCertificateCheckUnsupported),
+                "{mode}"
+            );
+        }
+    }
+
+    #[test]
+    fn each_ssl_mode_maps_to_the_right_setting_per_driver() {
+        for (mode, mysql, encrypt, trust) in [
+            ("disable", "disabled", "false", "false"),
+            ("require", "required", "true", "true"),
+            ("verify-ca", "verify_ca", "true", "false"),
+            ("verify-full", "verify_identity", "true", "false"),
+        ] {
+            let config = render_other("mysql", mode, &["shop.orders"]);
+            assert_eq!(config["database.ssl.mode"], mysql, "{mode}");
+            let config = render_other("mssql", mode, &["dbo.orders"]);
+            assert_eq!(config["database.encrypt"], encrypt, "{mode}");
+            assert_eq!(config["database.trustServerCertificate"], trust, "{mode}");
+        }
+    }
+
+    #[test]
+    fn mysql_and_sql_server_refuse_a_bad_table_name_and_a_missing_or_bad_history_broker() {
+        for driver in ["mysql", "mssql", "oracle"] {
+            let dial = other_dial(driver, "require");
+            for table in ["orders", "a.b.c", "x.y,z.w", "x. y"] {
+                assert!(
+                    matches!(
+                        render_connect_config(
+                            "conn-x1",
+                            &dial,
+                            &[table],
+                            CDC_SECRETS_DIR,
+                            Some(BROKER)
+                        ),
+                        Err(CdcSpecError::InvalidTableName { .. })
+                    ),
+                    "{driver} {table}"
+                );
+            }
+            assert_eq!(
+                render_connect_config("conn-x1", &dial, &["a.b"], CDC_SECRETS_DIR, None),
+                Err(CdcSpecError::NoSchemaHistoryBroker)
+            );
+            for bad in [
+                "",
+                "kafka",
+                "kafka:",
+                ":9092",
+                "ka fka:9092",
+                "k:9092,",
+                "k:9092\nx:1",
+            ] {
+                assert_eq!(
+                    render_connect_config("conn-x1", &dial, &["a.b"], CDC_SECRETS_DIR, Some(bad)),
+                    Err(CdcSpecError::InvalidSchemaHistoryBroker),
+                    "{bad:?}"
+                );
+            }
+        }
+        let mut dial = other_dial("mysql", "require");
+        dial.server_id = None;
+        assert_eq!(
+            render_connect_config("conn-x1", &dial, &["a.b"], CDC_SECRETS_DIR, Some(BROKER)),
+            Err(CdcSpecError::NoServerId)
+        );
+    }
+
+    #[test]
+    fn postgres_ignores_the_schema_history_broker() {
+        let with = render_connect_config(
+            "c1",
+            &pg_dial("require"),
+            &["public.t"],
+            CDC_SECRETS_DIR,
+            Some(BROKER),
+        )
+        .unwrap();
+        let without = render_connect_config(
+            "c1",
+            &pg_dial("require"),
+            &["public.t"],
+            CDC_SECRETS_DIR,
+            None,
+        )
+        .unwrap();
+        assert_eq!(with, without);
+        assert!(!with.keys().any(|k| k.starts_with("schema.history")));
+    }
 
     fn col(name: &str, type_name: &str) -> SourceColumn {
         SourceColumn {
@@ -870,574 +1401,193 @@ mod tests {
         assert!(ConnectorSlug::new("-orders").is_err());
     }
 
-    // ---- control-character rejection in the other interpolated fields ----
+    fn mongo_dial(hosts: &[&str], ssl_mode: &str) -> CdcMongoDial {
+        serde_json::from_value(serde_json::json!({
+            "driver": "mongodb", "hosts": hosts, "database": "shop",
+            "user": "app_reader", "replicaSet": "rs0", "sslMode": ssl_mode
+        }))
+        .unwrap()
+    }
 
-    #[test]
-    fn source_spec_rejects_newline_in_hostname() {
-        let err = DebeziumSourceSpec::new(
-            ConnectorSlug::new("orders_pg").unwrap(),
-            "pg.internal\nEXTRA=injected",
-            5432,
-            "oms",
-            "cdc_reader",
-            "public.orders",
+    fn render_mongo(
+        hosts: &[&str],
+        ssl_mode: &str,
+        collections: &[&str],
+    ) -> BTreeMap<String, String> {
+        render_mongodb_connect_config(
+            "conn-m1",
+            &mongo_dial(hosts, ssl_mode),
+            collections,
+            CDC_SECRETS_DIR,
         )
-        .unwrap_err();
-        assert!(matches!(
-            err,
-            CdcSpecError::ControlCharacterInField {
-                field: "database_hostname"
-            }
-        ));
+        .unwrap()
     }
 
     #[test]
-    fn source_spec_rejects_carriage_return_in_user() {
-        let err = DebeziumSourceSpec::new(
-            ConnectorSlug::new("orders_pg").unwrap(),
-            "pg.internal",
-            5432,
-            "oms",
-            "cdc_reader\r",
-            "public.orders",
-        )
-        .unwrap_err();
-        assert!(matches!(
-            err,
-            CdcSpecError::ControlCharacterInField {
-                field: "database_user"
-            }
-        ));
-    }
-
-    #[test]
-    fn source_spec_rejects_newline_in_dbname_and_table() {
-        assert!(
-            DebeziumSourceSpec::new(
-                ConnectorSlug::new("orders_pg").unwrap(),
-                "pg.internal",
-                5432,
-                "oms\ninjected=1",
-                "cdc_reader",
-                "public.orders",
-            )
-            .is_err()
-        );
-        assert!(
-            DebeziumSourceSpec::new(
-                ConnectorSlug::new("orders_pg").unwrap(),
-                "pg.internal",
-                5432,
-                "oms",
-                "cdc_reader",
-                "public.orders\ndebezium.source.table.include.list=.*",
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn source_spec_accepts_clean_fields() {
-        assert!(
-            DebeziumSourceSpec::new(
-                ConnectorSlug::new("orders_pg").unwrap(),
-                "pg.internal",
-                5432,
-                "oms",
-                "cdc_reader",
-                "public.orders",
-            )
-            .is_ok()
-        );
-    }
-
-    #[test]
-    fn render_rejects_newline_in_password_without_leaking_it() {
-        let source = DebeziumSourceSpec::new(
-            ConnectorSlug::new("orders_pg").unwrap(),
-            "pg.internal",
-            5432,
-            "oms",
-            "cdc_reader",
-            "public.orders",
-        )
-        .unwrap();
-        let sink = IcebergSinkSpec {
-            catalog_uri: "http://lakekeeper:8181/catalog".to_owned(),
-            warehouse: "default".to_owned(),
-            s3_endpoint: "http://rustfs:9000".to_owned(),
-            catalog_token: None,
-        };
-        let malicious_password = SecretValue::new("hunter2\ndebezium.source.slot.name=evil_slot");
-        let err = render_debezium_properties(
-            &source,
-            &sink,
-            "orders_pg_slot",
-            "orders_pg_pub",
-            &malicious_password,
-            &SecretValue::new("akid"),
-            &SecretValue::new("secretkey"),
-        )
-        .unwrap_err();
-        assert!(matches!(
-            err,
-            CdcSpecError::ControlCharacterInField {
-                field: "database_password"
-            }
-        ));
-        // The whole point: the error must never contain the password value.
-        assert!(!format!("{err}").contains("hunter2"));
-    }
-
-    #[test]
-    fn rendered_config_never_leaks_secrets_into_the_wrong_field() {
-        let source = DebeziumSourceSpec::new(
-            ConnectorSlug::new("orders_pg").unwrap(),
-            "pg.internal",
-            5432,
-            "oms",
-            "cdc_reader",
-            "public.orders",
-        )
-        .unwrap();
-        let sink = IcebergSinkSpec {
-            catalog_uri: "http://lakekeeper:8181/catalog".to_owned(),
-            warehouse: "default".to_owned(),
-            s3_endpoint: "http://rustfs:9000".to_owned(),
-            catalog_token: None,
-        };
-        let db_password = SecretValue::new("hunter2");
-        let s3_key = SecretValue::new("akid");
-        let s3_secret = SecretValue::new("secretkey");
-        let rendered = render_debezium_properties(
-            &source,
-            &sink,
-            "orders_pg_slot",
-            "orders_pg_pub",
-            &db_password,
-            &s3_key,
-            &s3_secret,
-        )
-        .unwrap();
-
-        assert!(rendered.contains("debezium.source.database.password=hunter2"));
-        assert!(rendered.contains("debezium.sink.iceberg.s3.access-key-id=akid"));
-        assert!(rendered.contains("debezium.sink.iceberg.s3.secret-access-key=secretkey"));
-        assert!(rendered.contains("debezium.source.slot.name=orders_pg_slot"));
-        assert!(rendered.contains("debezium.source.publication.name=orders_pg_pub"));
-        assert!(rendered.contains("debezium.source.table.include.list=public.orders"));
-        assert!(rendered.contains("debezium.source.schema.include.list=public"));
-        // File-based offset/schema-history storage, per P5-RESULT.md's
-        // measured trap — never the Iceberg-backed default.
-        assert!(rendered.contains("org.apache.kafka.connect.storage.FileOffsetBackingStore"));
-        assert!(rendered.contains("io.debezium.storage.file.history.FileSchemaHistory"));
-    }
-
-    /// `render_debezium_properties`'s slot and publication names come from
-    /// whatever the caller passes, not from re-deriving `{slug}_slot`/
-    /// `{slug}_pub` internally — proven by passing names that do NOT match
-    /// the slug-derived shape and asserting
-    /// the slug-derived form never appears in the output.
-    #[test]
-    fn render_uses_the_given_slot_and_publication_names_not_the_slug_derived_ones() {
-        let source = DebeziumSourceSpec::new(
-            ConnectorSlug::new("orders_pg").unwrap(),
-            "pg.internal",
-            5432,
-            "oms",
-            "cdc_reader",
-            "public.orders",
-        )
-        .unwrap();
-        let sink = IcebergSinkSpec {
-            catalog_uri: "http://lakekeeper:8181/catalog".to_owned(),
-            warehouse: "default".to_owned(),
-            s3_endpoint: "http://rustfs:9000".to_owned(),
-            catalog_token: None,
-        };
-        let out = render_debezium_properties(
-            &source,
-            &sink,
-            "custom_slot_v2",
-            "custom_pub_v2",
-            &SecretValue::new("hunter2"),
-            &SecretValue::new("akid"),
-            &SecretValue::new("secretkey"),
-        )
-        .unwrap();
-        assert!(out.contains("debezium.source.slot.name=custom_slot_v2"));
-        assert!(out.contains("debezium.source.publication.name=custom_pub_v2"));
-        assert!(!out.contains("orders_pg_slot"));
-        assert!(!out.contains("orders_pg_pub"));
-    }
-
-    /// Both `slot_name` and `publication_name` are still validated as
-    /// identifiers, via [`ConnectorSlug::new`], even though a valid name is
-    /// no longer required to equal `{slug}_slot`/`{slug}_pub` — a
-    /// registry-supplied name still has to be safe to embed unescaped in a
-    /// Debezium `.properties` file (see [`ConnectorSlug`]'s doc comment for
-    /// why: path traversal, newline injection).
-    #[test]
-    fn render_rejects_an_invalid_slot_name_even_though_it_is_not_a_slug() {
-        let source = DebeziumSourceSpec::new(
-            ConnectorSlug::new("orders_pg").unwrap(),
-            "pg.internal",
-            5432,
-            "oms",
-            "cdc_reader",
-            "public.orders",
-        )
-        .unwrap();
-        let sink = IcebergSinkSpec {
-            catalog_uri: "http://lakekeeper:8181/catalog".to_owned(),
-            warehouse: "default".to_owned(),
-            s3_endpoint: "http://rustfs:9000".to_owned(),
-            catalog_token: None,
-        };
-        let err = render_debezium_properties(
-            &source,
-            &sink,
-            "../escape\nslot",
-            "orders_pg_pub",
-            &SecretValue::new("hunter2"),
-            &SecretValue::new("akid"),
-            &SecretValue::new("secretkey"),
-        )
-        .unwrap_err();
-        assert!(matches!(err, CdcSpecError::InvalidConnectorSlug { .. }));
-    }
-
-    /// Parse a `.properties`-shaped body (`key=value` per line, blank lines
-    /// and `#`-comments ignored) into a map, so the equivalence test below
-    /// compares the PROPERTIES the two sources set rather than incidental
-    /// text (line order, trailing whitespace, ...).
-    fn parse_properties(body: &str) -> BTreeMap<String, String> {
-        body.lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty() && !line.starts_with('#'))
-            .filter_map(|line| line.split_once('='))
-            .map(|(key, value)| (key.to_owned(), value.to_owned()))
-            .collect()
-    }
-
-    /// Extract the demo connector's hand-written `application.properties`
-    /// heredoc body straight out of the checked-in `docker-compose.yml`
-    /// (`debezium-server`'s `command:`), and substitute the same literal
-    /// values this test hands to [`render_debezium_properties`] for every
-    /// `$${ENV_VAR}` the compose entrypoint shell would otherwise expand at
-    /// container-start time — the compose file's own documented defaults
-    /// (see `debezium-server`'s `environment:` block).
-    fn demo_connector_compose_properties() -> String {
-        const COMPOSE: &str = include_str!("../../../../docker-compose.yml");
-        let start_marker = "cat > /debezium/config/application.properties <<EOF\n";
-        let start = COMPOSE.find(start_marker).expect(
-            "docker-compose.yml no longer contains the demo connector's heredoc start \
-                     marker — has the debezium-server service been rewritten?",
-        ) + start_marker.len();
-        let rest = &COMPOSE[start..];
-        let end = rest.find("\n        EOF\n").expect(
-            "docker-compose.yml no longer contains the demo connector's heredoc end \
-                     marker — has the debezium-server service been rewritten?",
-        );
-        rest[..end]
-            .replace(
-                "$${LAKEKEEPER_CATALOG_URI}",
-                "http://lakekeeper:8181/catalog",
-            )
-            .replace("$${LAKEKEEPER_WAREHOUSE}", "default")
-            .replace("$${LAKEKEEPER_TOKEN}", "test-lakekeeper-token")
-            .replace("$${CH_RUSTFS_S3_ENDPOINT}", "http://rustfs:9000")
-            .replace("$${RUSTFS_ACCESS_KEY}", "rustfsadmin")
-            .replace("$${RUSTFS_SECRET_KEY}", "rustfsadmin")
-            .replace("$${POSTGRES_USER}", "lakehouse")
-            .replace("$${POSTGRES_PASSWORD}", "lakehouse")
-            .replace("$${POSTGRES_DB}", "lakehouse")
-    }
-
-    /// The test that makes [`render_debezium_properties`] real (see its
-    /// "Callers" doc section): render a spec built from the exact literal
-    /// values the checked-in compose heredoc uses for the demo `p5cdc`
-    /// connector, and assert the two produce the SAME set of properties.
-    /// If a future change edits one without the other, this fails —
-    /// that's the point.
-    #[test]
-    fn demo_connector_properties_match_the_checked_in_compose_file() {
-        let source = DebeziumSourceSpec::new(
-            ConnectorSlug::new("p5cdc").expect("p5cdc is a valid slug"),
-            "postgres",
-            5432,
-            "lakehouse",
-            "lakehouse",
-            "p5_cdc.orders",
-        )
-        .expect("demo connector's literal fields are all control-character-free");
-        let sink = IcebergSinkSpec {
-            catalog_uri: "http://lakekeeper:8181/catalog".to_owned(),
-            warehouse: "default".to_owned(),
-            s3_endpoint: "http://rustfs:9000".to_owned(),
-            catalog_token: Some(SecretValue::new("test-lakekeeper-token")),
-        };
-        let rendered = render_debezium_properties(
-            &source,
-            &sink,
-            "p5cdc_slot",
-            "p5cdc_pub",
-            &SecretValue::new("lakehouse"),
-            &SecretValue::new("rustfsadmin"),
-            &SecretValue::new("rustfsadmin"),
-        )
-        .expect("the demo connector's literal fields never fail validation");
-
-        let rendered_props = parse_properties(&rendered);
-        // Sanity check that the parser actually found something — an empty
-        // map on either side would make the equality assertion below
-        // vacuously true and defeat the whole point of this test.
-        assert!(!rendered_props.is_empty());
-
-        let compose_body = demo_connector_compose_properties();
-        let compose_props = parse_properties(&compose_body);
-        assert!(!compose_props.is_empty());
-
-        assert_eq!(
-            rendered_props, compose_props,
-            "render_debezium_properties has drifted from the checked-in \
-             docker-compose.yml demo connector config — update whichever \
-             one is now wrong"
-        );
-    }
-
-    // ---- render_debezium_properties_template ----
-
-    #[test]
-    fn template_renders_env_var_references_never_a_resolved_value() {
-        let source = DebeziumSourceSpec::new(
-            ConnectorSlug::new("orders_pg").unwrap(),
-            "pg.internal",
-            5432,
-            "oms",
-            "cdc_reader",
-            "public.orders",
-        )
-        .unwrap();
-        let sink = IcebergSinkLocation {
-            catalog_uri: "http://lakekeeper:8181/catalog",
-            warehouse: "default",
-            s3_endpoint: "http://rustfs:9000",
-        };
-        let refs = DebeziumEnvRefs {
-            database_password_ref: "CONNECTOR_PG_PASSWORD",
-            s3_access_key_ref: "RUSTFS_ACCESS_KEY",
-            s3_secret_key_ref: "RUSTFS_SECRET_KEY",
-            catalog_token_ref: Some("LAKEKEEPER_TOKEN"),
-        };
-        let rendered = render_debezium_properties_template(
-            &source,
-            &sink,
-            &refs,
-            "io.debezium.connector.postgresql.PostgresConnector",
-        )
-        .unwrap();
-
-        assert!(rendered.contains("debezium.source.database.password=${CONNECTOR_PG_PASSWORD}"));
-        assert!(rendered.contains("debezium.sink.iceberg.s3.access-key-id=${RUSTFS_ACCESS_KEY}"));
-        assert!(
-            rendered.contains("debezium.sink.iceberg.s3.secret-access-key=${RUSTFS_SECRET_KEY}")
-        );
-        assert!(rendered.contains("debezium.sink.iceberg.token=${LAKEKEEPER_TOKEN}"));
-        assert!(rendered.contains("debezium.source.slot.name=orders_pg_slot"));
-        assert!(rendered.contains("debezium.source.publication.name=orders_pg_pub"));
-        // The whole point: no `${...}`-wrapped literal ever looks like a
-        // resolved secret, and this function's signature makes it
-        // impossible to pass one in — there is no SecretValue parameter to
-        // misuse.
-        assert!(!rendered.contains("hunter2"));
-    }
-
-    #[test]
-    fn template_rejects_a_reference_name_shaped_like_an_injection_attempt() {
-        let source = DebeziumSourceSpec::new(
-            ConnectorSlug::new("orders_pg").unwrap(),
-            "pg.internal",
-            5432,
-            "oms",
-            "cdc_reader",
-            "public.orders",
-        )
-        .unwrap();
-        let sink = IcebergSinkLocation {
-            catalog_uri: "http://lakekeeper:8181/catalog",
-            warehouse: "default",
-            s3_endpoint: "http://rustfs:9000",
-        };
-        let refs = DebeziumEnvRefs {
-            database_password_ref: "EVIL}\ndebezium.source.slot.name=evil_slot",
-            s3_access_key_ref: "RUSTFS_ACCESS_KEY",
-            s3_secret_key_ref: "RUSTFS_SECRET_KEY",
-            catalog_token_ref: None,
-        };
-        let err = render_debezium_properties_template(
-            &source,
-            &sink,
-            &refs,
-            "io.debezium.connector.postgresql.PostgresConnector",
-        )
-        .unwrap_err();
-        assert!(matches!(err, CdcSpecError::InvalidEnvVarReference { .. }));
-    }
-
-    /// WS3 item 15: `render_debezium_properties_template` must name the
-    /// REAL Debezium connector class for a non-Postgres driver rather than
-    /// always hardcoding the Postgres one — proven here for `mysql`, and
-    /// re-asserting the same no-secret-leak property WS0's own
-    /// `template_renders_env_var_references_never_a_resolved_value` test
-    /// already proves, for a non-Postgres class this time.
-    #[test]
-    fn template_renders_the_mysql_connector_class_for_a_mysql_source() {
-        let source = DebeziumSourceSpec::new(
-            ConnectorSlug::new("orders_mysql").unwrap(),
-            "mysql.internal",
-            3306,
-            "oms",
-            "cdc_reader",
-            "oms.orders",
-        )
-        .unwrap();
-        let sink = IcebergSinkLocation {
-            catalog_uri: "http://lakekeeper:8181/catalog",
-            warehouse: "default",
-            s3_endpoint: "http://rustfs:9000",
-        };
-        let refs = DebeziumEnvRefs {
-            database_password_ref: "CONNECTOR_MYSQL_PASSWORD",
-            s3_access_key_ref: "RUSTFS_ACCESS_KEY",
-            s3_secret_key_ref: "RUSTFS_SECRET_KEY",
-            catalog_token_ref: Some("LAKEKEEPER_TOKEN"),
-        };
-        let rendered = render_debezium_properties_template(
-            &source,
-            &sink,
-            &refs,
-            "io.debezium.connector.mysql.MySqlConnector",
-        )
-        .unwrap();
-
-        assert!(rendered.contains(
-            "debezium.source.connector.class=io.debezium.connector.mysql.MySqlConnector"
-        ));
-        // Same no-secret-leak property, re-asserted for a non-Postgres
-        // class: every credential-shaped field is still ONLY an
-        // `${ENV_VAR_NAME}` reference.
-        assert!(rendered.contains("debezium.source.database.password=${CONNECTOR_MYSQL_PASSWORD}"));
-        assert!(!rendered.contains("hunter2"));
-    }
-
-    /// The `MongoDB` connector class lands the same property-template
-    /// treatment as `mysql`/`mssql`, but with materially different
-    /// source-side fields — the Debezium
-    /// `MongoDB` connector has no replication slot, no publication, no
-    /// `plugin.name=pgoutput`, and no per-field hostname/port/user/
-    /// password/dbname, addressing the source via a single
-    /// `mongodb.connection.string` whose host/port portions are
-    /// `${ENV_VAR_NAME}` references the deployment's shell expands at
-    /// container start (the same no-resolved-secret property the postgres/
-    /// mysql tests above prove, re-asserted here for a non-SQL source).
-    #[test]
-    fn template_renders_the_mongodb_connector_class_and_connection_string_env_ref() {
-        let source = DebeziumSourceSpec::new(
-            ConnectorSlug::new("orders_mongo").unwrap(),
-            "mongo.internal",
-            27017,
-            "oms",
-            "cdc_reader",
-            "oms.orders",
-        )
-        .unwrap();
-        let sink = IcebergSinkLocation {
-            catalog_uri: "http://lakekeeper:8181/catalog",
-            warehouse: "default",
-            s3_endpoint: "http://rustfs:9000",
-        };
-        let refs = DebeziumEnvRefs {
-            database_password_ref: "CONNECTOR_MONGO_PASSWORD",
-            s3_access_key_ref: "RUSTFS_ACCESS_KEY",
-            s3_secret_key_ref: "RUSTFS_SECRET_KEY",
-            catalog_token_ref: Some("LAKEKEEPER_TOKEN"),
-        };
-        let rendered =
-            render_debezium_properties_template(&source, &sink, &refs, MONGO_CONNECTOR_CLASS)
-                .unwrap();
-
-        assert!(rendered.contains(
-            "debezium.source.connector.class=io.debezium.connector.mongodb.MongoDbConnector"
-        ));
-        // The mongo branch's defining property: a single connection
-        // string with the operator's host/port carried as env-var
-        // references — same `${...}` shape every other credential-bearing
-        // field in this template uses.
-        assert!(
-            rendered.contains(
-                "debezium.source.mongodb.connection.string=mongodb://${CONNECTOR_MONGO_HOST}:${CONNECTOR_MONGO_PORT}/?directConnection=true"
+    fn mongodb_config_has_exactly_the_keys_slice_five_decided() {
+        let config = render_mongo(&["mongo-a.internal:27017"], "require", &["orders", "items"]);
+        let expected: BTreeMap<String, String> = [
+            ("connector.class", MONGODB_CONNECTOR_CLASS),
+            ("tasks.max", "1"),
+            (
+                "mongodb.connection.string",
+                "mongodb://mongo-a.internal:27017/?replicaSet=rs0&directConnection=true",
             ),
-            "mongo branch must render the env-var-reference connection string, got: {rendered}"
+            ("mongodb.user", "app_reader"),
+            ("mongodb.password", "${dir:/run/cdc-secrets:conn-m1}"),
+            ("mongodb.authsource", "shop"),
+            ("mongodb.ssl.enabled", "true"),
+            ("mongodb.ssl.invalid.hostname.allowed", "true"),
+            ("topic.prefix", "cdc.conn-m1"),
+            ("collection.include.list", "shop.orders,shop.items"),
+            ("capture.mode", "change_streams_update_full"),
+            ("capture.scope", "database"),
+            ("capture.target", "shop"),
+            ("snapshot.mode", "initial"),
+            (
+                "key.converter",
+                "org.apache.kafka.connect.json.JsonConverter",
+            ),
+            ("key.converter.schemas.enable", "false"),
+            (
+                "value.converter",
+                "org.apache.kafka.connect.json.JsonConverter",
+            ),
+            ("value.converter.schemas.enable", "false"),
+            ("transforms", "unwrap"),
+            (
+                "transforms.unwrap.type",
+                "io.debezium.connector.mongodb.transforms.ExtractNewDocumentState",
+            ),
+            (
+                "transforms.unwrap.delete.tombstone.handling.mode",
+                "rewrite",
+            ),
+            ("transforms.unwrap.add.fields", "op,source.ts_ms"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect();
+        assert_eq!(config, expected);
+        // Amendment 3's lesson holds for the other class: the ignored keys are not written.
+        assert!(!config.contains_key("transforms.unwrap.delete.handling.mode"));
+        assert!(!config.contains_key("transforms.unwrap.drop.tombstones"));
+        // No SQL-only key leaks in.
+        assert!(!config.contains_key("database.hostname"));
+        assert!(!config.contains_key("decimal.handling.mode"));
+    }
+
+    #[test]
+    fn mongodb_config_holds_no_password_value_and_no_credential_in_the_connection_string() {
+        let config = render_mongo(&["mongo-a.internal:27017"], "verify-full", &["orders"]);
+        assert_eq!(
+            config["mongodb.connection.string"],
+            "mongodb://mongo-a.internal:27017/?replicaSet=rs0&directConnection=true"
         );
-        // The properties a Postgres / MySQL / MSSQL connector needs but
-        // MongoDB has no analog of: a replication slot, a publication, a
-        // numeric server id. Their absence here is what makes the
-        // mongo branch honest — a MongoDB source addressing itself by
-        // these would be a category error, not a misconfiguration.
-        assert!(
-            !rendered.contains("debezium.source.slot.name"),
-            "mongo branch must NOT carry slot.name -- mongo has no replication slot"
+        assert!(!config["mongodb.connection.string"].contains('@'));
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains("${dir:/run/cdc-secrets:conn-m1}"));
+        // The only place the password appears is the reference; nothing else carries a secret.
+        assert_eq!(json.matches("conn-m1}").count(), 1);
+    }
+
+    #[test]
+    fn mongodb_config_always_sets_direct_connection_and_refuses_two_hosts() {
+        // SRC-4 slice 5 review BLOCKER 1.
+        let one = render_mongo(&["mongo-a.internal:27017"], "require", &["orders"]);
+        assert!(one["mongodb.connection.string"].ends_with("&directConnection=true"));
+        let two = mongo_dial(
+            &["mongo-a.internal:27017", "mongo-b.internal:27017"],
+            "require",
         );
-        assert!(
-            !rendered.contains("debezium.source.database.server.id"),
-            "mongo branch must NOT carry database.server.id -- mongo has no numeric server id"
-        );
-        assert!(
-            !rendered.contains("debezium.source.plugin.name=pgoutput"),
-            "mongo branch must NOT carry plugin.name=pgoutput -- that is postgres-only"
-        );
-        // Same no-secret-leak property, re-asserted for the mongo branch:
-        // the host/port inside the connection string are
-        // `${ENV_VAR_NAME}` references, NEVER a resolved value.
-        assert!(
-            !rendered.contains("mongo.internal"),
-            "mongo branch must not leak the resolved source hostname"
-        );
-        assert!(
-            !rendered.contains("hunter2"),
-            "mongo branch must not leak a resolved password"
+        assert_eq!(
+            render_mongodb_connect_config("conn-m1", &two, &["orders"], CDC_SECRETS_DIR),
+            Err(CdcSpecError::InvalidMongoHosts)
         );
     }
 
-    /// A direct, pure unit test of `validate_env_var_ref` itself — not
-    /// just the one composite case above — proving it rejects every
-    /// character that could either make a
-    /// value LOOK like a resolved secret rather than a reference name (`=`,
-    /// matching a `key=value` `.properties` line shape) or break out of the
-    /// `${...}` wrapper / inject an extra property line (newline, `$`,
-    /// `}`). This is a pure function test: no HTTP, no process environment,
-    /// nothing to mutate or race on — it proves the type-level guarantee
-    /// directly, which is what actually stops a secret VALUE from ever
-    /// reaching this renderer (there is no `SecretValue` parameter to
-    /// misuse in the first place; this test is about injection into the
-    /// template's own syntax, not about secret leakage, which the
-    /// function's signature already makes impossible).
     #[test]
-    fn validate_env_var_ref_rejects_every_dangerous_character() {
-        for bad in [
-            "PASSWORD=hunter2", // '=' — looks like a resolved key=value line
-            "PASSWORD\nEVIL=1", // newline — property-injection shape
-            "PASSWORD$",        // '$' — could start a second ${...} expansion
-            "PASSWORD}",        // '}' — closes the wrapper early
-        ] {
-            let err = validate_env_var_ref("test_field", bad).unwrap_err();
+    fn mongodb_config_maps_each_ssl_mode() {
+        let setting = |mode: &str| {
+            let config = render_mongo(&["mongo-a.internal:27017"], mode, &["orders"]);
+            (
+                config["mongodb.ssl.enabled"].clone(),
+                config.get("mongodb.ssl.invalid.hostname.allowed").cloned(),
+            )
+        };
+        assert_eq!(setting("disable"), ("false".to_owned(), None));
+        assert_eq!(
+            setting("require"),
+            ("true".to_owned(), Some("true".to_owned()))
+        );
+        assert_eq!(
+            setting("verify-ca"),
+            ("true".to_owned(), Some("false".to_owned()))
+        );
+        assert_eq!(
+            setting("verify-full"),
+            ("true".to_owned(), Some("false".to_owned()))
+        );
+    }
+
+    #[test]
+    fn mongodb_config_refuses_what_could_change_what_is_captured_or_dialed() {
+        let dial = mongo_dial(&["mongo-a.internal:27017"], "require");
+        let render = |dial: &CdcMongoDial, collections: &[&str]| {
+            render_mongodb_connect_config("conn-m1", dial, collections, CDC_SECRETS_DIR)
+        };
+        // A collection is one plain name: not `database.collection`, not a regex, not a list.
+        for name in ["shop.orders", "or ders", "a,b", ".x", "a*", "", "a$b"] {
             assert!(
-                matches!(err, CdcSpecError::InvalidEnvVarReference { .. }),
-                "{bad:?} must be rejected"
+                matches!(
+                    render(&dial, &[name]),
+                    Err(CdcSpecError::InvalidCollectionName { .. })
+                ),
+                "{name:?}"
             );
         }
-        // The positive case: a plain identifier is accepted.
-        assert!(validate_env_var_ref("test_field", "RUSTFS_ACCESS_KEY").is_ok());
+        assert_eq!(render(&dial, &[]), Err(CdcSpecError::NoTables));
+        // Hosts, replica set and database written into the connection string.
+        for hosts in [
+            vec!["mongo-a.internal"],
+            vec!["mongo-a.internal:27017/admin"],
+            vec!["mongo-a.internal:27017?x=y"],
+            vec!["u:p@mongo-a.internal:27017"],
+            vec![],
+        ] {
+            let mut bad = dial.clone();
+            bad.hosts = hosts.iter().map(|h| (*h).to_owned()).collect();
+            assert_eq!(
+                render(&bad, &["orders"]),
+                Err(CdcSpecError::InvalidMongoHosts)
+            );
+        }
+        let mut bad = dial.clone();
+        bad.replica_set = "rs0&authSource=admin".to_owned();
+        assert_eq!(
+            render(&bad, &["orders"]),
+            Err(CdcSpecError::InvalidReplicaSet)
+        );
+        let mut bad = dial.clone();
+        bad.database = "shop,admin".to_owned();
+        assert_eq!(
+            render(&bad, &["orders"]),
+            Err(CdcSpecError::InvalidMongoDatabase)
+        );
+        let mut bad = dial.clone();
+        bad.user = "a\nb".to_owned();
+        assert!(matches!(
+            render(&bad, &["orders"]),
+            Err(CdcSpecError::ControlCharacterInField { field: "user" })
+        ));
+        for id in ["", "../x", "a:b", "-a", "a/b"] {
+            assert!(
+                matches!(
+                    render_mongodb_connect_config(id, &dial, &["orders"], CDC_SECRETS_DIR),
+                    Err(CdcSpecError::InvalidConnectorId { .. })
+                ),
+                "{id}"
+            );
+        }
     }
 }

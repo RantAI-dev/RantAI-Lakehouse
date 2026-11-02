@@ -1,6 +1,6 @@
 //! WS3 item 15: `POST /api/connectors/{id}/test` covers mysql/mssql
 //! adapters at the route level, using the same live-pool harness
-//! `tests/route_auth.rs`/`tests/debezium_properties.rs` already use.
+//! `tests/route_auth.rs` already uses.
 //!
 //! `POST /api/connectors/{id}/test`'s dispatch onto `probe_mysql`/
 //! `probe_mssql` (`rust/crates/lakehouse-api/src/connector_probe.rs`)
@@ -126,59 +126,4 @@ async fn test_connection_route_reports_unsupported_dial_not_unsupported_type_for
         body["ok"], false,
         "port 1 refuses instantly, so the probe must report failure"
     );
-}
-
-/// `GET /api/connectors/{id}/debezium-properties` for a `mysql`-driver
-/// CDC connector (`SRC-9` decision 8): the route used to render the
-/// PostgreSQL-shaped template with the `MySQL` class name, which `Debezium`
-/// rejects. It now refuses with HTTP 409 and a fixed `supported: false`
-/// reason, like the Oracle refusal, and renders no properties at all. This
-/// replaces the old test that asserted the rendered `MySQL` class (that
-/// expectation followed the old behaviour, it is not loosened here).
-#[tokio::test]
-async fn debezium_properties_route_refuses_a_mysql_cdc_connector() {
-    let app = spin_up().await;
-    let cookie = session_cookie_for_seeded_user(&app.pool, "bayu@meridian.example").await;
-
-    sqlx::query(
-        "INSERT INTO connector (id, tenant_id, \
-         name, type, direction, host, secret_ref, environment, tenant, \
-         adapter, ingest_mode, dial) VALUES \
-         ('conn-mysql-cdc-test', '11111111-1111-4111-8111-000000000001', \
-         'mysql cdc test', 'MySQL CDC', 'source', 'unused', \
-         'env:CONNECTOR_MYSQL_CDC_PASSWORD', 'production', 'meridian', 'cdc', 'cdc', \
-         '{\"driver\":\"mysql\",\"host\":\"mysql-src\",\"port\":3306,\"database\":\"oms\",\"user\":\"repl\",\
-         \"slotName\":\"orders_slot\",\"publicationName\":\"orders_pub\"}'::jsonb)",
-    )
-    .execute(&app.pool)
-    .await
-    .expect("seed a mysql-cdc-adapter connector");
-
-    let response = app
-        .router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/api/connectors/conn-mysql-cdc-test/debezium-properties?table=oms.orders")
-                .header("cookie", &cookie)
-                .body(Body::empty())
-                .expect("build request"),
-        )
-        .await
-        .expect("router never fails a request outright");
-
-    assert_eq!(response.status(), StatusCode::CONFLICT);
-    let bytes = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("read body");
-    let body: Value = serde_json::from_slice(&bytes).expect("valid JSON");
-    assert_eq!(body["supported"], false, "{body}");
-    let reason = body["reason"].as_str().expect("reason field");
-    assert!(reason.contains("not built yet"), "{reason}");
-    assert!(reason.contains("database.server.id"), "{reason}");
-    assert!(
-        body.get("properties").is_none(),
-        "a refused connector must get no template: {body}"
-    );
-    assert!(!reason.contains("hunter2"));
 }

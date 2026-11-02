@@ -125,3 +125,5 @@ Oracle-driver connector with `409 { supported: false, reason }` in **both**
 flag states; the flag changes only what the reason explains. Oracle ingestion
 runs through the batch sql adapter until LogMiner support is built — the same
 posture this ADR took for Postgres's incremental-snapshot mode.
+
+*Dated note, 2026-10-31 (`SRC-4` slice 6):* the flag is gone and the `debezium-properties` route with it; Oracle change capture is the connector type `Oracle CDC`, on Kafka Connect (ADR 0016).

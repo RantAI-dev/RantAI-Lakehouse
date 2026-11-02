@@ -1,0 +1,142 @@
+# ops/g4/docker-compose.g4-mongo.override.yml -- SRC-4 slice 5 (plan T5.7), GATE-ONLY.
+#
+# The `g4-mongo` gate (ops/g4/g4_mongo_test.py) creates a MongoDB change-capture connector through the
+# API against its own replica-set fixture. It is layered ON TOP of ops/g6/docker-compose.g6.override.yml,
+# which gives this stack what every connector gate needs (the `file:` credential store, the gate-only
+# internal-host switches for the API and the orchestrator). Used as
+#
+#   docker compose -p g4mgci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml \
+#     -f ops/g4/docker-compose.g4-mongo.override.yml --profile dagster --profile cdc \
+#     --profile g4-mongo up -d --no-build ...
+#
+# What this file adds:
+#
+# 1. `KAFKA_CONNECT_URL` and `CDC_KAFKA_BOOTSTRAP` on the API and the applier, empty in the template (which
+#    keeps change capture off).
+# 2. `mongo-cdc-g4`: `mongo:7` as a ONE-member replica set (change streams need one) WITH authentication, so the
+#    gate's least-privilege user is really checked. A replica set with authentication needs a key file; it is
+#    generated when the container starts (a throwaway of this stack, never in git). It is a service of its own,
+#    NOT a change to `mongo-g6`, so the g6 gates are untouched.
+# 3. `mongo-cdc-g4-init`: runs `rs.initiate` with the service's own host name (the name the connector's driver is
+#    told to dial and the replica set advertises) and polls until the member is primary: Postgres-style readiness,
+#    the server answers `ping` long before it can take a change stream. The service is healthy only when primary.
+# 4. The runner, built from the code-location image (it has `pymongo`, `requests` and `kafka-python`), with
+#    `lakehouse_cdc_secrets` mounted READ-ONLY so the gate can prove that the password file exists with the
+#    connector user's password and is removed on DELETE; production mounts that volume in `lakehouse-api` and
+#    `kafka-connect` only.
+#
+# Credentials are `${X:?}`, set by the CI job for its throwaway stack; no default exists anywhere.
+services:
+  lakehouse-api:
+    environment:
+      KAFKA_CONNECT_URL: http://kafka-connect:8083
+      CDC_KAFKA_BOOTSTRAP: kafka:9092
+
+  dagster-code-location:
+    environment:
+      CDC_KAFKA_BOOTSTRAP: kafka:9092
+
+  mongo-cdc-g4:
+    profiles: ["g4-mongo"]
+    image: mongo:7
+    restart: "no"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_CDC_G4_ROOT_USER:?}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_CDC_G4_ROOT_PASSWORD:?}
+    # The container starts as root so the key file can be owned by `mongodb`; the image's entrypoint then drops
+    # to that user. `--bind_ip_all`: the other containers dial it by name.
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - >-
+        openssl rand -base64 48 > /tmp/mongo-keyfile
+        && chmod 400 /tmp/mongo-keyfile
+        && chown mongodb:mongodb /tmp/mongo-keyfile
+        && exec docker-entrypoint.sh mongod --replSet rs0 --keyFile /tmp/mongo-keyfile --bind_ip_all
+    healthcheck:
+      # `hello` is answered without a login. The image's entrypoint first runs a TEMPORARY server (a standalone,
+      # `isWritablePrimary` true) while it creates the root user, then replaces it: only the replica set's own
+      # name proves this is the real server, and `isWritablePrimary` that the member has been elected.
+      test: ["CMD", "mongosh", "--quiet", "--eval", "const h = db.hello(); if (h.setName !== 'rs0' || !h.isWritablePrimary) quit(1)"]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+
+  mongo-cdc-g4-init:
+    profiles: ["g4-mongo"]
+    image: mongo:7
+    restart: "no"
+    depends_on:
+      mongo-cdc-g4:
+        condition: service_started
+    environment:
+      MONGO_CDC_G4_ROOT_USER: ${MONGO_CDC_G4_ROOT_USER:?}
+      MONGO_CDC_G4_ROOT_PASSWORD: ${MONGO_CDC_G4_ROOT_PASSWORD:?}
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -u
+        # Idempotent: a member that is already initiated is left as it is. The root user is created by the
+        # image's entrypoint while the server restarts once, so a failed login is retried, not fatal.
+        mongo() { mongosh --host mongo-cdc-g4 --quiet -u "$$MONGO_CDC_G4_ROOT_USER" -p "$$MONGO_CDC_G4_ROOT_PASSWORD" --authenticationDatabase admin "$$@"; }
+        for i in $$(seq 1 90); do
+          if mongo --eval 'db.hello().ok' >/dev/null 2>&1; then break; fi
+          sleep 2
+        done
+        mongo --eval 'try { rs.status() } catch (e) { rs.initiate({_id: "rs0", members: [{_id: 0, host: "mongo-cdc-g4:27017"}]}) }'
+        for i in $$(seq 1 90); do
+          if [ "$$(mongo --eval 'db.hello().isWritablePrimary')" = "true" ]; then echo "primary"; exit 0; fi
+          sleep 2
+        done
+        echo "the replica set did not elect a primary" >&2
+        exit 1
+
+  g4-mongo-test-runner:
+    profiles: ["g4-mongo"]
+    image: ${LAKEHOUSE_DAGSTER_IMAGE:-rantai-lakehouse-dagster:local}
+    working_dir: /work
+    depends_on:
+      mongo-cdc-g4:
+        condition: service_healthy
+      mongo-cdc-g4-init:
+        condition: service_completed_successfully
+      lakehouse-api:
+        condition: service_started
+      dagster-webserver:
+        condition: service_healthy
+    volumes:
+      - ./ops/g4:/work
+      # At /opt/gates for the reason `g4-test-runner` gives: a bind mount nested under the
+      # bind-mounted /work would make Docker create the mount point on the host.
+      - ./ops/gates:/opt/gates:ro
+      - type: volume
+        source: g6_secrets
+        target: /gate-secrets
+      - type: volume
+        source: lakehouse_cdc_secrets
+        target: /cdc-secrets
+        read_only: true
+    environment:
+      PYTHONPATH: /opt/gates
+      PYTHONDONTWRITEBYTECODE: "1"
+      # The gate prints a marker line the CI job waits for: no buffering.
+      PYTHONUNBUFFERED: "1"
+      CH_URL: http://clickhouse:8123
+      CH_USER: ${CH_USER:-default}
+      CH_PASSWORD: ${CH_PASSWORD:-}
+      CH_LAKEKEEPER_CATALOG_URI: http://lakekeeper:8181/catalog
+      CH_RUSTFS_S3_ENDPOINT: http://rustfs:9000
+      LAKEKEEPER_WAREHOUSE: ${LAKEKEEPER_WAREHOUSE:-default}
+      CH_OAUTH_CLIENT_ID: clickhouse-reader
+      CH_OAUTH_SERVER_URI: http://oidc-mock:8090/token
+      API_URL: http://lakehouse-api:8080
+      AUTH_BOOTSTRAP_EMAIL: ${AUTH_BOOTSTRAP_EMAIL:-}
+      AUTH_BOOTSTRAP_PASSWORD: ${AUTH_BOOTSTRAP_PASSWORD:-}
+      KAFKA_CONNECT_URL: http://kafka-connect:8083
+      CDC_KAFKA_BOOTSTRAP: kafka:9092
+      MONGO_CDC_G4_ROOT_USER: ${MONGO_CDC_G4_ROOT_USER:?}
+      MONGO_CDC_G4_ROOT_PASSWORD: ${MONGO_CDC_G4_ROOT_PASSWORD:?}
+      # The password of the connector's least-privilege user (a throwaway of this stack).
+      CONNECTOR_MONGO_CDC_PASSWORD: ${CONNECTOR_MONGO_CDC_PASSWORD:?}
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["python g4_mongo_test.py"]
+    restart: "no"

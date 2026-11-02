@@ -24,9 +24,9 @@
       "notes": {
         "all": "SRC-9 plan task 6: ops/g4/g4_test.py records all four steps through gate_summary.",
         "connect": "ops/g4 registers the demo source as a 'PostgreSQL CDC' connector (adapter cdc) and POST .../test must answer supported:true, ok:true, like its SQL twin.",
-        "discover": "ops/g4: the schemas hold p5_cdc, the list of p5_cdc holds p5_cdc.orders, and its preview shows its columns (SRC-13 routes).",
-        "load": "ops/g4: the initial snapshot reaches Bronze and holds the seeded rows (first copy).",
-        "reload": "ops/g4: an insert, an update and a delete arriving within the latency budget."
+        "discover": "ops/g4: the schemas hold g4_cdc, the list of g4_cdc holds g4_cdc.orders, and its preview shows its columns (SRC-13 routes).",
+        "load": "ops/g4: the connector is created through the API (which provisions Kafka Connect) and its first copy reaches Bronze: 20,000 seeded rows in each of the two load modes.",
+        "reload": "ops/g4: an insert, an update and a delete each visible in Bronze within 120 s in both modes (SRC-4 D5); then a pause with 20,000 changes per table, a resume, a restart of kafka-connect during a stream of changes and a source schema change, each ending with Bronze equal to the source."
       }
     },
     "MySQL": {
@@ -92,15 +92,17 @@
     "Oracle": {
       "gate": "g6-oracle",
       "steps": {
-        "connect": "refused",
+        "connect": "real",
         "discover": "real",
         "load": "real",
         "reload": "real"
       },
       "notes": {
-        "all": "SRC-9 plan task 5: ops/g6/g6_oracle_test.py in its own job (g6-oracle), against Oracle Database Free (gvenzl/oracle-free, slim-faststart) in ops/g6/docker-compose.g6-oracle.override.yml. Plaintext dial: the adapter refuses TLS without an operator-typed sslServerCertDn, so TLS to Oracle is not exercised.",
-        "connect": "SRC-5: an Oracle connector cannot be tested from the console (the API has no Oracle client).",
-        "discover": "SRC-13 D12: the orchestrator lists the schemas the login can read (G6_INGEST among them) and that schema's tables (G6_INGEST.ORDERS); the preview shows the declared columns ID and AMOUNT. The load's source object is the listed name."
+        "all": "SRC-9 plan task 5, SRC-4 T1.2 to T1.5: ops/g6/g6_oracle_test.py in its own job (g6-oracle), against Oracle Database Free (gvenzl/oracle-free, slim-faststart) in ops/g6/docker-compose.g6-oracle.override.yml. The connector dials over TLS (tcps, sslServerCertDn, a CA the gate generates) to a TLS front of the listener (nginx stream), so Oracle's own TCPS endpoint and wallet are not exercised.",
+        "connect": "SRC-4 T1.1: the API has no Oracle client, so POST .../test launches the test in the orchestrator (discover_job, kind test) and answers pending; the gate reads the result from GET .../discovery/test and the probe history: a pass with the orchestrator's latency, a wrong password (sign_in_refused) and a closed port (unreachable) with their fixed sentences and an unhealthy connector.",
+        "discover": "SRC-13 D12: the orchestrator lists the schemas the login can read (G6_INGEST among them) and that schema's tables (G6_INGEST.ORDERS); the preview shows the declared columns ID, AMOUNT and NOTE. The load's source object is the listed name.",
+        "load": "SRC-4 T1.2, T1.3: the source object is saved with column choice (NOTE left out, spelled as the preview spells it) and the incremental load mode with the cursor ID; Bronze has id and amount and no note.",
+        "reload": "SRC-4 T1.3: two rows inserted at the source, a second run reads exactly those two (the run record says so) and Bronze holds all five."
       }
     },
     "MongoDB": {
@@ -238,6 +240,70 @@
       },
       "notes": {
         "all": "SRC-3 slice 7: proven in the CI job \"Rust · SRC-3 business-app connectors (B)\" (g6-saas-b), against the mock vendor in ops/g6/saas_stub.py, not a real account. Connect is the API's test route, discover lists the vendor's objects and the preview is honestly not supported (the vendor does not describe its fields), load is a first copy to Bronze, reload is a second run that picks up a changed record (and a delete where the vendor reports one)."
+      }
+    },
+    "MySQL CDC": {
+      "gate": "g4-mysql",
+      "steps": {
+        "connect": "real",
+        "discover": "real",
+        "load": "real",
+        "reload": "real"
+      },
+      "notes": {
+        "all": "SRC-4 slice 3: ops/g4/g4_test.py runs for MySQL as the g4-mysql job and records the four steps through gate_summary.",
+        "connect": "MySQL: POST .../test must answer supported:true, ok:true for the least-privilege gate user.",
+        "discover": "The discovery routes list the source's tables and preview a table's columns (SRC-13 routes).",
+        "load": "The connector is created through the API (which provisions Kafka Connect) and its first copy reaches Bronze: 20,000 seeded rows in each of the two load modes.",
+        "reload": "An insert, an update and a delete each visible in Bronze within 120 s in both modes (SRC-4 D5); then a pause with 20,000 changes per table, a resume, a restart of kafka-connect during a stream of changes and a schema change, each ending with Bronze equal to the source."
+      }
+    },
+    "SQL Server CDC": {
+      "gate": "g4-mssql",
+      "steps": {
+        "connect": "real",
+        "discover": "real",
+        "load": "real",
+        "reload": "real"
+      },
+      "notes": {
+        "all": "SRC-4 slice 3: ops/g4/g4_test.py runs for SQL Server as the g4-mssql job and records the four steps through gate_summary.",
+        "connect": "SQL Server: POST .../test must answer supported:true, ok:true for the least-privilege gate user.",
+        "discover": "The discovery routes list the source's tables and preview a table's columns (SRC-13 routes).",
+        "load": "The connector is created through the API (which provisions Kafka Connect) and its first copy reaches Bronze: 20,000 seeded rows in each of the two load modes.",
+        "reload": "An insert, an update and a delete each visible in Bronze within 120 s in both modes (SRC-4 D5); then a pause with 20,000 changes per table, a resume, a restart of kafka-connect during a stream of changes and a schema change, each ending with Bronze equal to the source."
+      }
+    },
+    "MongoDB CDC": {
+      "gate": "g4-mongo",
+      "steps": {
+        "connect": "real",
+        "discover": "real",
+        "load": "real",
+        "reload": "real"
+      },
+      "notes": {
+        "all": "SRC-4 slice 5: ops/g4/g4_mongo_test.py runs for MongoDB as the g4-mongo job (a one-member replica set) and records the four steps through gate_summary.",
+        "connect": "MongoDB: POST .../test is answered by the orchestrator (the API has no MongoDB client): the gate polls the discovery result of kind test for the least-privilege gate user.",
+        "discover": "The discovery routes list the database's collections and preview a collection's fields (SRC-13 routes); the preview names _id as the key.",
+        "load": "The connector is created through the API (which provisions Kafka Connect) and its first copy reaches Bronze: 20,000 seeded documents in each of the two load modes.",
+        "reload": "An insert, an update and a delete each visible in Bronze within 120 s in both modes (SRC-4 D5); then a pause with 20,000 changes per collection, a resume, a restart of kafka-connect during a stream of changes and a new field in a document, each ending with Bronze equal to the source."
+      }
+    },
+    "Oracle CDC": {
+      "gate": "g4-oracle",
+      "steps": {
+        "connect": "real",
+        "discover": "refused",
+        "load": "real",
+        "reload": "real"
+      },
+      "notes": {
+        "all": "SRC-4 slice 6: ops/g4/g4_oracle_test.py runs for Oracle (Debezium LogMiner) as the g4-oracle job and records the four steps through gate_summary.",
+        "connect": "Oracle: POST .../test must answer supported:true, ok:true for the least-privilege common user c##dbzuser, through Kafka Connect's config validation with native network encryption required (SRC-4 Amendment 10, S10-a); a wrong password answers the fixed sentence.",
+        "discover": "Tables are typed by hand (SRC-4 Amendment 10, S10-c): listing them would need an unencrypted session. The gate proves the list and the preview answer not_supported.",
+        "load": "The connector is created through the API (which provisions Kafka Connect) and its first copy reaches Bronze: 20,000 seeded rows in each of the two load modes.",
+        "reload": "An insert, an update and a delete each visible in Bronze within 120 s in both modes (SRC-4 D5); then a pause with 20,000 changes per table, a resume, a restart of kafka-connect during a stream of changes and a new column, each ending with Bronze equal to the source."
       }
     }
   }

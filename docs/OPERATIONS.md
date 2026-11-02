@@ -289,30 +289,71 @@ refuses `expire_snapshots` on catalog-backed tables. If the `trino` profile is
 down or unconfigured, snapshot expiry logs a warning and skips cleanly, leaving
 snapshots unexpired without failing the maintenance job.
 
-### Debezium Server (opt-in, `dagster` profile — P5, CDC)
+### Change capture: Kafka and Kafka Connect (opt-in, `cdc` profile — `SRC-4`, ADR 0016)
 
-`debezium-server`, pinned by **digest** (not `:latest` — no versioned tag
-is published upstream for `ghcr.io/memiiso/debezium-server-iceberg`, see R4
-in the risk register). Captures Postgres logical-replication changes
-(initial snapshot, then streaming; ADR 0008) and writes them into Bronze
-Iceberg through the same Lakekeeper REST catalog every other writer uses —
-upsert mode with merge-on-read equality deletes. Config is rendered from
-the connector registry (ADR 0007) into
-`ops/debezium/application.properties.tmpl`, mounted at
-`/debezium/config/application.properties` (this is a Quarkus app, not a
-classic Kafka Connect worker — `conf/` is the wrong path and does not exist
-in the image). Needs `postgres` running with `wal_level=logical` (already
-the compose default, unconditionally, not profile-gated) and a replication
-slot on the source (see `g4-source-init`/`ops/debezium/
-deprovision_connector.sh` for provision/deprovision). **Failure mode:** if
-`debezium-server` is down, CDC simply stops flowing — no new rows land in
-the affected Bronze tables — while its Postgres replication slot keeps
-existing and pinning WAL at its last `restart_lsn` regardless (R5); this is
-exactly why slot-lag/WAL-retention are first-class metrics
-(`dagster/dispar_orchestrate/replication_metrics.py`, surfaced via `GET
-/api/governance/replication`, console page Governance → "Ingestion
-(CDC)") rather than something only discovered when the source disk fills
-up. Does not affect `lakehouse-api`'s own boot.
+`kafka` (one KRaft broker) and `kafka-connect` (Debezium's distribution, one
+worker for every change-capture connector), both pinned by tag and digest, with
+no published ports: Kafka Connect's REST API can start any connector class and
+has no authentication, so it is reachable only inside the compose network. Start
+them with `--profile cdc` and set in `.env`:
+
+- `KAFKA_CONNECT_URL=http://kafka-connect:8083` (the API is the worker's only
+  client: it creates, pauses, resumes and deletes a connector when a person
+  saves, pauses, resumes or deletes it in the console);
+- `CDC_KAFKA_BOOTSTRAP=kafka:9092` (the Dagster applier reads the topics and
+  writes Bronze).
+
+`MySQL`, `SQL Server` and `Oracle` connectors also keep a schema-history topic on the
+broker, so the API needs `CDC_KAFKA_BOOTSTRAP` too (compose passes it to both).
+An `Oracle CDC` source needs `ARCHIVELOG` (a restart of the database), minimal
+supplemental logging and a common user with Debezium's documented LogMiner grants;
+the connection test lists what is missing, with the commands. Archived redo logs must
+be kept as long as a stopped connector may need to catch up. Oracle's JDBC driver is
+in the pinned `kafka-connect` image: nothing is downloaded. The Oracle setup checks
+are read by the orchestrator over an **unencrypted** session limited to the data
+dictionary (an owner-signed exception to `SEC-14`, 2026-10-31); the connector itself
+requires Oracle native network encryption unless its TLS mode is "Disable". The
+old `ORACLE_CDC_LOGMINER_ENABLED` setting is gone: nothing read it since slice 2.
+Both unset means change capture is off: a change-capture connector answers
+`supported: false` and nothing is started. The source password never appears in
+a connector's JSON: `lakehouse-api` writes it to `/run/cdc-secrets/<connector id>`
+on the `lakehouse_cdc_secrets` volume (tmpfs, memory only, read-only in
+`kafka-connect`) and the connector names the file. After a restart of the stack
+the volume is empty and the API rewrites every file at start and on every
+provisioning call. Needs `postgres` with `wal_level=logical` (the compose
+default). **Failure modes:** if `kafka-connect` is down, capture stops while the
+source's replication slot keeps pinning WAL at its last `restart_lsn` (R5), which
+is why slot lag and WAL retention are first-class metrics
+(`dagster/dispar_orchestrate/replication_metrics.py`, `GET
+/api/governance/replication`, Governance > "Ingestion (CDC)"); if the applier is
+down, changes wait in the topics, which the broker keeps 7 days
+(`KAFKA_LOG_RETENTION_HOURS`), then are gone, and a connector deleted in the
+console leaves its topics to that retention. The two services use about
+1.2 GiB together (`docs/plans/SRC-4-RESULT.md`). The fixed `debezium-server` demo
+pipeline that this replaces is gone, with `ops/debezium/` and the
+`debezium-properties` route. A deployment upgraded from it keeps the Lakekeeper
+`debezium` principal and its warehouse grant (nothing removes them); once no
+older stack uses them they can be revoked by hand.
+
+**MongoDB change capture (`SRC-4` slice 5).** Needs a MongoDB **replica set** (change streams do not exist on a
+standalone server) and a user with the `read` role on the captured database; sharded clusters are not supported.
+Nothing to add to the stack: the same `kafka-connect` worker runs it (the MongoDB connector ships in its image).
+The connector takes one host, which must be a member of the replica set that change streams can be read from; the
+connection string is built from it and the replica set name, always with `directConnection=true`, and holds no
+password. The worker needs the source's CA in its trust store for `verify-ca`, `verify-full` and also `require`.
+The connection test and the collection list run in the orchestrator (`dagster-code-location` must reach the host).
+
+**Lag and its alert (`SRC-4` slice 4).** The Dagster sensor `cdc_apply_sensor` posts every
+change-capture connector's per-table backlog to the API every 30 seconds (paused and failed
+connectors too), and the applier posts the source time of the last change it applied after each
+batch (`POST /api/connectors/{id}/capture/observations`, the `INGEST_SERVICE_TOKEN` identity). The
+API turns those into the lag the connector's Change capture tab shows and sends the
+`connector_lag` alert (limit per connector, 1 to 1440 minutes, default 15, set with `PUT
+/api/connectors/{id}/lag-limit` or on the tab). Add an alert rule of kind `connector_lag` (Alerts)
+or nobody is told. **Failure mode:** with the orchestrator down nothing posts, so no lag alert
+fires and the tab reads "Not known since <time>" after two minutes; monitor the code location
+itself. A connector a person paused is not evaluated: an alert already open stays open until the
+connector is resumed and its lag is evaluated again.
 
 **DNS gotcha found during verification:** on a host whose own
 `/etc/resolv.conf` carries a DNS search domain (VPN/corporate DNS,

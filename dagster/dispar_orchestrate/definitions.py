@@ -22,6 +22,7 @@ from dispar_orchestrate.capacity_snapshot import (
     capacity_snapshot_job,
     capacity_snapshot_schedule,
 )
+from dispar_orchestrate.cdc_apply import cdc_apply_job, cdc_apply_sensor
 from dispar_orchestrate.discover import discover_job
 from dispar_orchestrate.file_ingest import file_ingest_job
 from dispar_orchestrate.gold_export import (
@@ -107,6 +108,8 @@ defs = Definitions(
         alerts_run_job,
         capacity_snapshot_job,
         ingest_job,
+        # SRC-4 slice 2: writes a change-capture connector's topics to Bronze.
+        cdc_apply_job,
         file_ingest_job,
         discover_job,
         *authored_jobs,
@@ -125,6 +128,8 @@ defs = Definitions(
         # lakehouse-api, so a schedule saved in the console needs no reload --
         # see `ingest_factory.py`'s "Schedules" section.
         ingest_schedule_sensor,
+        # SRC-4 slice 2: starts cdc_apply_job for a connector with changes to apply.
+        cdc_apply_sensor,
         pipeline_run_failed_sensor,
         pipeline_run_finished_sensor,
         gold_export_after_authored_sensor,

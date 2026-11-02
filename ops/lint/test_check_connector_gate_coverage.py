@@ -55,11 +55,16 @@ def entry(gate="g6", steps=None, waiver=None) -> dict:
 
 
 class SupportedTypesTests(unittest.TestCase):
-    def test_the_real_migrations_list_nineteen_supported_types_and_not_google_sheets(self) -> None:
+    def test_the_real_migrations_list_twenty_three_supported_types_and_not_google_sheets(self) -> None:
         names = check.supported_types(REPO_ROOT / "rust" / "migrations")
-        self.assertEqual(len(names), 19)  # 13 before SRC-9 decision 8 (0066); 11 after it; +8 saas types in 0096 (SRC-3 T7.1)
-        self.assertNotIn("MySQL CDC", names)
-        self.assertNotIn("SQL Server CDC", names)
+        # 13 before SRC-9 decision 8 (0066); 11 after it; +8 saas types in 0096 (SRC-3 T7.1);
+        # +2 in 0121 (SRC-4 slice 3: MySQL CDC and SQL Server CDC are supported again).
+        # +1 in 0123 (SRC-4 slice 5: MongoDB CDC is a new supported type), +1 in 0124 (slice 6: Oracle CDC).
+        self.assertEqual(len(names), 23)
+        self.assertIn("MongoDB CDC", names)
+        self.assertIn("Oracle CDC", names)
+        self.assertIn("MySQL CDC", names)
+        self.assertIn("SQL Server CDC", names)
         self.assertNotIn("Google Sheets", names)
         self.assertIn("Oracle", names)
         self.assertIn("Salesforce", names)
@@ -86,6 +91,16 @@ class SupportedTypesTests(unittest.TestCase):
             "UPDATE connector_type SET supported = false WHERE name = 'Alpha' AND adapter = 'files';",
         ))
         self.assertIn("Alpha", names)
+
+    def test_an_update_naming_the_reason_it_replaces_applies_only_when_that_text_is_current(self) -> None:
+        down = "UPDATE connector_type SET supported = false, unsupported_reason = 'not yet' WHERE name = 'Alpha' AND supported = true;"
+        up = (
+            "UPDATE connector_type SET supported = true, unsupported_reason = NULL "
+            "WHERE name = 'Alpha' AND supported = false AND unsupported_reason = '{}';"
+        )
+        self.assertIn("Alpha", check.supported_types(migrations(CREATE + INSERT, down, up.format("not yet"))))
+        # The row was edited since: its reason is no longer the one named, so nothing changes.
+        self.assertNotIn("Alpha", check.supported_types(migrations(CREATE + INSERT, down, up.format("something else"))))
 
     def test_an_update_of_a_row_that_does_not_exist_changes_nothing(self) -> None:
         names = check.supported_types(migrations(CREATE + INSERT, "UPDATE connector_type SET supported = true WHERE name = 'Nope';"))

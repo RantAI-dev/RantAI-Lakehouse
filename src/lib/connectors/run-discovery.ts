@@ -1,4 +1,4 @@
-import type { DiscoveryAnswer, DiscoveryKind } from "@/services/contracts/connectors"
+import type { DiscoveryAnswer, DiscoveryReadKind } from "@/services/contracts/connectors"
 
 /** How often a listing that runs on the orchestrator is asked for its answer. */
 export const DISCOVERY_POLL_MS = 1_500
@@ -55,7 +55,7 @@ export async function runDiscovery({
   onWaiting,
   now = Date.now,
 }: {
-  kind: DiscoveryKind
+  kind: DiscoveryReadKind
   start: () => Promise<DiscoveryAnswer>
   get: () => Promise<DiscoveryAnswer>
   signal?: AbortSignal
