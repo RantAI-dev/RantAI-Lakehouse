@@ -32,10 +32,36 @@ fn body(args: &Map<String, Value>) -> Bytes {
     Bytes::from(serde_json::to_vec(&Value::Object(route_args(args))).unwrap_or_default())
 }
 
+/// The formula functions the assistant reads: one entry per category, in
+/// the order the catalog has them, each function one line of its signature
+/// and its help.
+///
+/// The examples, the arity and the flags are left out: the chat passes at
+/// most 8,000 characters of a tool result to the model
+/// (`src/routes/ai/mod.rs:1067`), and the whole list has to fit under that
+/// cut or the model never reads the end of it.
+fn functions_by_category() -> Vec<Value> {
+    let mut grouped: Vec<(&str, Vec<String>)> = Vec::new();
+    for f in lakehouse_bi::formula::catalog::CATALOG {
+        let line = format!("{}: {}", f.signature, f.help);
+        match grouped
+            .iter()
+            .position(|(category, _)| *category == f.category)
+        {
+            Some(index) => grouped[index].1.push(line),
+            None => grouped.push((f.category, vec![line])),
+        }
+    }
+    grouped
+        .into_iter()
+        .map(|(category, list)| json!({ "category": category, "list": list }))
+        .collect()
+}
+
 pub(super) fn list_formula_functions() -> Value {
     json!({
         "language": "[Column Name] or a bare name for a column or another calculated field of the same source; numbers; 'text' or \"text\"; + - * /; = != < <= > >=; and, or, not; parentheses; the functions below (names are not case sensitive). A formula is either one value per row, for example [revenue] - [cost], or an aggregate, for example Sum([revenue]) / CountDistinct([customer]); the two cannot be mixed in one formula except through an aggregate. Table calculations (RunningTotal, Rank, PercentOfTotal, Offset, MovingAverage) and period comparisons (PreviousPeriod, SamePeriodLastYear) take an aggregate and are computed over the chart's result in its dimension order; they can only be a measure. Fixed([column], aggregate) computes an aggregate at columns the chart groups by.",
-        "functions": lakehouse_bi::formula::catalog::CATALOG,
+        "functions": functions_by_category(),
     })
 }
 
@@ -246,26 +272,111 @@ pub(super) async fn run(
 }
 
 #[cfg(test)]
-mod spatial_tests {
+mod function_list_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use lakehouse_bi::formula::catalog::CATALOG;
+    use serde_json::Value;
+
+    /// The function list the assistant reads: one entry per category, one
+    /// line per function.
+    fn listed_by_category() -> Vec<Value> {
+        let listed = super::list_formula_functions();
+        listed["functions"]
+            .as_array()
+            .expect("the function list")
+            .clone()
+    }
 
     /// `BI-16` part C3 (T10): the function list the assistant reads has both
     /// spatial functions, with their help.
     #[test]
     fn list_formula_functions_lists_distance_and_region_of() {
+        let functions = listed_by_category();
+        let spatial = functions
+            .iter()
+            .find(|entry| entry["category"] == "spatial")
+            .expect("the spatial category");
+        let lines = spatial["list"].as_array().expect("the spatial functions");
+        for name in ["Distance(", "RegionOf("] {
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.as_str().is_some_and(|text| text.starts_with(name))),
+                "{name} is not listed"
+            );
+        }
+    }
+
+    /// The chat passes at most 8,000 characters of a tool result to the
+    /// model (`src/routes/ai/mod.rs:1067`), so the whole list has to fit
+    /// under that cut: a list cut in the middle is a list the model never
+    /// finishes reading.
+    #[test]
+    fn the_function_list_fits_the_tool_result_cut() {
         let listed = super::list_formula_functions();
-        let functions = listed["functions"].as_array().expect("the function list");
-        for name in ["Distance", "RegionOf"] {
+        let serialised = serde_json::to_string(&listed).expect("the list is JSON");
+        let length = serialised.chars().count();
+        // The measured size, so a reader of a failed run knows how far the
+        // list is from the bar.
+        println!("the function list is {length} characters");
+        assert!(
+            length < 8_000,
+            "the function list is {length} characters, the cut is 8,000"
+        );
+    }
+
+    /// Every function of the catalog is listed once, under its own category.
+    #[test]
+    fn every_catalog_function_is_listed_once_under_its_own_category() {
+        let functions = listed_by_category();
+        let mut expected_categories: Vec<&str> = Vec::new();
+        for f in CATALOG {
+            if !expected_categories.contains(&f.category) {
+                expected_categories.push(f.category);
+            }
+        }
+        let categories: Vec<&str> = functions
+            .iter()
+            .map(|entry| entry["category"].as_str().expect("a category name"))
+            .collect();
+        assert_eq!(
+            categories, expected_categories,
+            "the categories are not the catalog's, in its order"
+        );
+
+        let mut lines_total = 0;
+        for entry in &functions {
+            let lines = entry["list"]
+                .as_array()
+                .expect("the functions of a category");
+            assert!(
+                !lines.is_empty(),
+                "the category {} lists no function",
+                entry["category"]
+            );
+            lines_total += lines.len();
+        }
+        assert_eq!(
+            lines_total,
+            CATALOG.len(),
+            "the list has lines the catalog does not"
+        );
+
+        for f in CATALOG {
             let entry = functions
                 .iter()
-                .find(|f| f["name"] == name)
-                .unwrap_or_else(|| panic!("{name} is not listed"));
-            assert_eq!(entry["category"], "spatial");
-            assert!(
-                entry["signature"]
-                    .as_str()
-                    .is_some_and(|s| s.starts_with(name))
-            );
+                .find(|entry| entry["category"] == f.category)
+                .expect("the category of the function");
+            let lines = entry["list"]
+                .as_array()
+                .expect("the functions of a category");
+            let expected = format!("{}: {}", f.signature, f.help);
+            let hits = lines
+                .iter()
+                .filter(|line| line.as_str() == Some(expected.as_str()))
+                .count();
+            assert_eq!(hits, 1, "{} is listed {hits} times", f.name);
         }
     }
 }
