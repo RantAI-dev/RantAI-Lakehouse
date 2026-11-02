@@ -53,7 +53,7 @@ Part D, images and import:
 
 Part E, comments:
 
-13. Comment on a dashboard, and mention a colleague with @. They are told in the console and by email.
+13. Comment on a dashboard, and mention a colleague with @. They are told in the console and by email. You can post ten comments in five minutes (the eleventh is refused with "Try again in a moment"), and opening a dashboard's comments marks that dashboard's mentions read, so the bell drops a conversation you have just opened (`BI-38`).
 
 Part F, digests (after `RPT-1` is merged):
 
