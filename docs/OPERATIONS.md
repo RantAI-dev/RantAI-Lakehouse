@@ -1714,21 +1714,43 @@ catalog belongs to the tenant this setting names:
   export outright**, with a 422 that names this setting; a signed-in
   person of another tenant is refused too, but with the gate's own 404
   (the mart reads "not available to your organisation");
-- the **dashboards, the embeds, the public links and the alerts** read the
-  same shared catalog and follow in the second slice of `SEC-50`. They are
-  **not** gated yet, so they still serve what they served before.
+- **the dashboards** are gated as the person looking (`SEC-50` slice 2):
+  the tiles, the drill-through rows, the downloaded CSV/chart files, the
+  filter values and the SQL sources. A member of another tenant sees the
+  refusal in each tile's own `error` slot — "Table not found or not
+  available to your organisation: `serving.<mart>`" — and the mart is
+  never queried;
+- **the embeds** are read by nobody in particular, so they act as the
+  deployment's catalog tenant: with several tenants and no
+  `CATALOG_TENANT_ID`, every data tile carries the 422 that names this
+  setting (`JOB_NEEDS_CATALOG_TENANT`'s sentence);
+- **the public links** act as the tenant that made the link. A link made
+  by a member of another tenant shows that member's refusals; a link whose
+  creator has been removed from that tenant is refused; a link with no
+  creator (`created_by` NULL, e.g. one copied from before `BI-19`) still
+  works on a **one-tenant** deployment and is refused on a deployment with
+  several;
+- **the alerts and digests** are read as the catalog's tenant when the
+  scheduler runs them, and a person who **saves** a mart or metric rule
+  must be able to read what the rule reads (the save answers `SEC-20`'s
+  404 otherwise, and nothing is written). A **chart alert** reads as the
+  person who set it, and a **report** as its owner;
+- **the PDF and chart-image (`format=png`) exports** act as the person the
+  token names — their **first** tenant, because the token carries no
+  `X-Tenant` — so an export made while working as another tenant can
+  differ from the screen.
 
 **What this means for an operator.** On a deployment with more than one
-tenant, this setting is **required** for the gated paths to work at all:
+tenant, this setting is **required** for every path above to work at all:
 without it there is no catalog tenant in the first place, so a job with
-no user (the Gold export) is refused with the 422 that names this
-setting, and through the paths the tenant gate covers (Query Studio, the
-authored pipelines) a member reads only the uploads their own tenant
-claimed. The dashboards, the embeds, the public links and the alerts are
-not gated yet, so a member of another tenant still sees what those paths
-show today. With the setting set, the members of that tenant read the
-shared catalog as before, and the other tenants read only their own
-uploads. A **single-tenant** deployment is unaffected either way.
+no user (the Gold export, the alert scheduler, an embed) is refused with
+the 422 that names this setting, and a signed-in person reads the shared
+catalog only if their own tenant is the one named here — through the
+tenant gate a member of another tenant reads only the uploads their own
+tenant claimed, and every dashboard, alert or report over `serving.*`
+shows the gate's 404. With the setting set, the members of that tenant
+read the shared catalog as before, and the other tenants read only their
+own uploads. A **single-tenant** deployment is unaffected either way.
 
 ### Authored pipelines with no tenant (`SEC-50`)
 
