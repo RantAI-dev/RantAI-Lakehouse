@@ -2687,6 +2687,138 @@ FAILED ops/release/test_release_workflow.py::UpdateProofTest::test_the_update_pr
 - **The pushes**: the commits were pushed to `origin/feat/rel-2-s4b-lakehousectl-update`. No push was
   refused, so no `git pull --no-rebase` and no resolve was needed. No pull request was opened.
 
+### The real run of the update (developer, 2026-11-02)
+
+**This is the evidence the S4b handoff above says is missing** — it names "No real update run on
+a host", because the machine was lost before the handoff was written. The run below was measured
+on `1f9095c0` (the commit the S4b slice ended with), on this host, and the S4b handoff's claims
+about the update's order, its backup, its file swap and its rollback are the ones it exercises.
+
+**The stack.** A SMALL one: `postgres`, `clickhouse` (with the backup disk D14 ships) and a
+STAND-IN for the API — a tiny `python:3.12-slim` image that answers `/health/ready` with a
+version and `/` for the console. The stand-in is a stand-in, and the handoff says so: the real
+API image is a full Rust build, and the small stack has no Lakekeeper for the real API to be
+ready against. What the run proves is the UPDATE's mechanics, not the real API's readiness.
+
+**The tool.** A `lakehousectl` built with `--features test-key` and pointed at a THROWAWAY cosign
+key (cosign v3.0.6, `--use-signing-config=false --tlog-upload=false`, no transparency log)
+through `LAKEHOUSECTL_PUBLIC_KEY_FILE`. Docker 29.9.2, the host's own containerd store
+(`io.containerd.snapshotter.v1`).
+
+**The three bundles**, built here with `ops/release/make_bundle.sh` and the proof's own helper
+(`ops/release/update_proof.py`):
+
+- bundle A: the stand-in at version `0.1.0`;
+- bundle B: the stand-in REBUILT at `0.1.0-update-proof.1`, every other image reused from A;
+- bundle C: the stand-in REBUILT at `0.1.0-update-proof.2`, and its entrypoint SLEEPS — it never
+  becomes ready.
+
+Then, in this order:
+
+1. `lakehousectl install --bundle bundle-a --dir install --ignore-preflight disk --ignore-preflight
+   memory` — the manifest verified against the throwaway key, the three images loaded, the stack
+   started, and the tool waited for the API to report `0.1.0` and for the console to answer. The
+   install's own state was `{"currentVersion": "0.1.0", "previousVersion": null, "lastBackup":
+   null}`.
+2. `lakehousectl update --bundle bundle-b --dir install --ignore-preflight disk --ignore-preflight
+   memory` — and the tool said, in this order:
+
+   ```
+   lakehousectl: the manifest of release 0.1.0-update-proof.1 verifies against the release key.
+   lakehousectl: the ports check was skipped: the stack is running, and it holds its own ports.
+   lakehousectl: the disk check was skipped, as asked.
+   lakehousectl: the memory check was skipped, as asked.
+   lakehousectl: fetching the images of 0.1.0-update-proof.1.
+   lakehousectl: loading bundle-b/images/clickhouse-server.tar
+   lakehousectl: loading bundle-b/images/fake-api.tar
+   lakehousectl: loading bundle-b/images/postgres.tar
+   lakehousectl: stopping the writers.
+   ==> Backup complete: .../install/backups/20261102T000552Z-0.1.0
+       version:   0.1.0
+       parts:     6
+       size:      61742 bytes
+   lakehousectl: the backup is at .../install/backups/20261102T000552Z-0.1.0
+   lakehousectl: the stack runs 0.1.0-update-proof.1.
+   ```
+
+   The backup is named after the release it replaces (`-0.1.0`) — that is D17's naming rule, and
+   it is the shipped script's new `BACKUP_VERSION` at work (see the note on D16 below). The state
+   afterwards was `{"currentVersion": "0.1.0-update-proof.1", "previousVersion": "0.1.0",
+   "lastBackup": ".../backups/20261102T000552Z-0.1.0"}`, the pause was cleared, and
+   `/health/ready` answered `{"ready": true, "version": "0.1.0-update-proof.1"}`.
+3. `lakehousectl update --bundle bundle-c --dir install --ready-timeout 60 --ignore-preflight disk
+   --ignore-preflight memory` — and it FAILED, with the rollback:
+
+   ```
+   lakehousectl: the update to 0.1.0-update-proof.2 failed: the stack did not become ready within 60 seconds: Connection reset by peer (os error 104)
+   lakehousectl: rolling back to 0.1.0-update-proof.1.
+   ==> Restore complete from the local backup .../install/backups/20261102T000630Z-0.1.0-update-proof.1
+   lakehousectl: the update to 0.1.0-update-proof.2 failed, and the stack was rolled back to 0.1.0-update-proof.1: the stack did not become ready within 60 seconds: Connection reset by peer (os error 104)
+   ```
+
+   The exit status was 1. The state afterwards was `{"currentVersion": "0.1.0-update-proof.1",
+   "previousVersion": "0.1.0", "lastBackup": ".../backups/20261102T000113Z-0.1.0"}`, and
+   `/health/ready` answered `{"ready": true, "version": "0.1.0-update-proof.1"}` — bundle B is
+   running again. The two backups were `20261102T000552Z-0.1.0` and
+   `20261102T000630Z-0.1.0-update-proof.1`, each named after the release it replaced.
+
+**Everything created was removed afterwards**: the compose project, its containers, its network
+and its three volumes; the `rantai-lakehouse_lakehouse_clickhouse_backups` volume the backup
+script created; the three stand-in images (`docker rmi`); the throwaway cosign key; the
+temporary directories and the 458 MiB bundle. `docker volume ls`, `docker ps -a` and
+`docker network ls` hold nothing of the run's, and the `postgres:16` and
+`clickhouse/clickhouse-server:26.8` images were already on the machine and were left there.
+
+**What the run does NOT cover, and the fixes that came after it.** The run walked the success
+path and the step-7 rollback. The review fixes that came after `1f9095c0` touch other paths: the
+BLOCKER 1 fix (a failure in step 4 or step 5 puts the stack back), BLOCKER 2 (the pause does not
+outlive the update — the services that read it are recreated when it is cleared), the review round
+3 fix (a release install runs the Dagster services) and the PR #335 fixes (the proof's own
+scripts). None of them changes the steps this run walked, and none of them is exercised by it.
+
+**Three readings of the plan, reported rather than improvised. All three are in the code.**
+
+- **The `ports` pre-flight check does not apply to an update**: the stack is running, and it
+  holds its own ports. The skip is said out loud, the way every other skipped check is.
+- **A version that carries a suffix (`0.2.0-update-proof.1`) is a LATER BUILD of the release its
+  numbers name**, so it sorts after the bare one. `SemVer` says the opposite, and D17 refuses an
+  older release — so under `SemVer`'s rule the proof's second bundle (D21) could not be installed
+  over the first. The rule is in `version.rs`, with the reason at the site.
+- **D16's third bullet says `lakehousectl` "sets and clears `MAINTENANCE_PAUSED` in `.env`".** It
+  does — but the shipped backup script reads the release's version from the API, and D17 stops the
+  API BEFORE the backup, so the script would have named the backup `…-unknown`. The script takes
+  the version from `BACKUP_VERSION` when the caller knows it, and the update passes it; the
+  script's own behaviour (read the API) is unchanged when the variable is not set. The run above
+  shows the backup named `…-0.1.0` — the release it replaced.
+
+**The whole-workspace cargo run was attempted on this host and did not finish, and the reason is
+the host.** Three attempts, in the foreground and detached:
+
+- at the default parallelism the BUILD was killed by the OOM killer ("sccache: Compile terminated
+  by signal 9") while `lakehouse-api` was compiled — the machine has 13 GiB of RAM and eight
+  rustc processes;
+- at `-j 2` and at `-j 1` the run was terminated by the machine's own session (exit 143,
+  `SIGTERM`) while `lakehouse-api`'s unit tests were running — the last one had got through 55 of
+  the workspace's 164 test binaries with no failure;
+- one earlier run showed failures in `lakehouse-api`'s `tenant_scoping` and `target_lag` tests.
+  They do NOT reproduce: run on their own, `cargo test -p lakehouse-api --lib tenant_scoping` is
+  **29 passed, 0 failed** and `cargo test -p lakehouse-api --lib target_lag` is **14 passed, 0
+  failed**. The shared `CARGO_TARGET_DIR` was contended by another agent's worktree at that
+  moment, which is the hazard `bin/cargo-locked` exists for — its guard is sequential, not
+  concurrent — and `lakehouse-api` does not depend on `lakehousectl` (no crate in the workspace
+  does), so this slice cannot be the cause.
+
+The reviewer runs the whole workspace anyway; this is named here so the run is not mistaken for a
+green one.
+
+**The `backup::tests` flake the S4b handoff reports was measured here too, on the base commit.**
+`cargo test -p lakehousectl` failed 2 times in 10 runs at `c239e3b0` (the base of the branch),
+with "the backup tool failed: Text file busy (os error 26)" in
+`backup::tests::the_backup_runs_the_shipped_script_with_the_deployments_own_directory`. It was
+fixed in review round 2 (`fe77e06c`, the fake tool is a committed file that is symlinked into the
+temporary directory).
+
+
 ## 7. Review (planner appends below)
 
 ### Review S1 round 1 (planner, 2026-10-31, at `f79d4235`)
