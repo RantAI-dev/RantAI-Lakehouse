@@ -2183,6 +2183,24 @@ jobs:
             echo "::error::the marker in ClickHouse is gone: '$clickhouse'"
             exit 1
           fi
+          # The rollback RESTORES the backup onto the data the failed
+          # update left behind, and a restore that MERGES instead of
+          # replacing leaves the marker of both: the row of the backup
+          # and the row the failed update wrote. So each marker table
+          # must hold EXACTLY ONE row (REL-2 S4b review round 6 BLOCKER
+          # 1, decision D24).
+          postgres_rows="$("${compose[@]}" exec -T postgres psql -U lakehouse -d lakehouse \
+            -tAc "SELECT count(*) FROM s4_update_marker;")"
+          if [ "$postgres_rows" != "1" ]; then
+            echo "::error::the marker table in the application database holds $postgres_rows rows, and it must hold exactly one"
+            exit 1
+          fi
+          clickhouse_rows="$("${compose[@]}" exec -T clickhouse clickhouse-client -q \
+            "SELECT count() FROM s4_update_marker")"
+          if [ "$clickhouse_rows" != "1" ]; then
+            echo "::error::the marker table in ClickHouse holds $clickhouse_rows rows, and it must hold exactly one"
+            exit 1
+          fi
           detail="$(PROOF_TENANT="$tenant" ops/release/proof_api.sh get "/api/connectors/$connector")"
           if [ "$(echo "$detail" | jq -r .credentialManaged)" != "true" ]; then
             echo "::error::the stored connector credential is gone: $detail"

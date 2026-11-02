@@ -17,6 +17,7 @@ PATH, and they record what they were asked to do.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -288,6 +289,41 @@ class RestoreScriptTest(ScriptTestCase):
             check=False,
         )
 
+    def make_backup_with_databases(self, stamp: str) -> Path:
+        """A backup set whose dump names two databases — one of them a
+        name that needs quoting — and whose ClickHouse part holds one
+        database."""
+        backup = self.root / "backups" / stamp
+        (backup / "clickhouse" / stamp / "default").mkdir(parents=True)
+        (backup / "postgres.dump").write_text(
+            "CREATE DATABASE lakehouse WITH TEMPLATE = template0;\n"
+            'CREATE DATABASE "other db" WITH TEMPLATE = template0;\n',
+            encoding="utf-8",
+        )
+        parts = []
+        for path in sorted(backup.rglob("*")):
+            if path.is_file():
+                data = path.read_bytes()
+                parts.append(
+                    {
+                        "name": str(path.relative_to(backup)),
+                        "sizeBytes": len(data),
+                        "sha256": hashlib.sha256(data).hexdigest(),
+                    }
+                )
+        (backup / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "version": "0.1.0",
+                    "createdAt": stamp,
+                    "composeProject": "rel2",
+                    "parts": parts,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return backup
+
     def test_the_restore_works_on_the_deployment_its_own_directory(self) -> None:
         """REL-2 S4 decision D15."""
         backup = self.make_backup()
@@ -350,6 +386,58 @@ class RestoreScriptTest(ScriptTestCase):
             if path.name.startswith("release.json.before-restore-")
         ]
         self.assertEqual(len(kept), 1, f"the files kept are {kept}")
+
+    def test_the_restore_replaces_the_data_it_restores(self) -> None:
+        """A local restore REPLACES the data the backup holds.
+
+        The rollback of a failed update restores onto the data the
+        failed update left behind, and a restore that ADDED to that
+        data would bring back a mixture that is in neither the backup
+        nor the instance (REL-2 S4b review round 6 BLOCKER 1, decision
+        D24). So the restore drops every database the dump names,
+        drops and creates the `postgres` database again, and drops the
+        ClickHouse database before it restores it.
+        """
+        stamp = "20261102T090000Z"
+        backup = self.make_backup_with_databases(stamp)
+        result = self.run_restore(backup, LAKEHOUSE_DIR=str(self.deployment))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.docker_calls()
+
+        def index_of(needle: str) -> int:
+            for index, call in enumerate(calls):
+                if needle in call:
+                    return index
+            self.fail(f"the restore never ran {needle!r}: {calls}")
+
+        # Every database the dump names is dropped before the dump runs.
+        restore = index_of("-v ON_ERROR_STOP=0")
+        self.assertLess(
+            index_of('DROP DATABASE IF EXISTS "lakehouse" WITH (FORCE);'),
+            restore,
+            "the database was dropped after the dump was restored",
+        )
+        self.assertLess(
+            index_of('DROP DATABASE IF EXISTS "other db" WITH (FORCE);'),
+            restore,
+            "the database was dropped after the dump was restored",
+        )
+
+        # The `postgres` database is in the dump — `pg_dumpall` dumps
+        # every database — and the dump never carries a CREATE DATABASE
+        # postgres line, so the restore creates it again.
+        index_of('DROP DATABASE IF EXISTS "postgres" WITH (FORCE);')
+        index_of('CREATE DATABASE "postgres" WITH TEMPLATE = template0;')
+
+        # The ClickHouse database is dropped before it is restored:
+        # `RESTORE DATABASE` refuses a table that holds rows.
+        self.assertLess(
+            index_of("DROP DATABASE IF EXISTS `default` SYNC;"),
+            index_of(
+                f"RESTORE DATABASE `default` FROM Disk('backups', 'clickhouse/{stamp}/default')"
+            ),
+            "the database was dropped after it was restored",
+        )
 
 
 if __name__ == "__main__":

@@ -2199,6 +2199,28 @@ class UpdateProofTest(unittest.TestCase):
         self.assertIn("the clickhouse marker", run)
         self.assertIn("credentialManaged", run)
 
+    def test_the_update_proof_counts_the_marker_rows_after_the_rollback(self) -> None:
+        """Each marker table holds EXACTLY ONE row after the rollback.
+
+        The rollback RESTORES the backup onto the data the failed
+        update left behind, and a restore that MERGES instead of
+        replacing leaves the marker of both: the row of the backup and
+        the row the failed update wrote (REL-2 S4b review round 6
+        BLOCKER 1, decision D24). A marker that is still there is not
+        enough — the row count is what says the data was replaced.
+        """
+        run = str(
+            step_named(
+                self.document,
+                "update-proof",
+                "The stack runs bundle B again, and the markers are still there",
+            ).get("run")
+        )
+        self.assertIn("SELECT count(*) FROM s4_update_marker", run)
+        self.assertIn("SELECT count() FROM s4_update_marker", run)
+        self.assertIn('"$postgres_rows" != "1"', run)
+        self.assertIn('"$clickhouse_rows" != "1"', run)
+
     # ── The session the API calls carry ──────────────────────────────
 
     def test_every_api_call_of_the_update_proof_carries_a_session(self) -> None:
