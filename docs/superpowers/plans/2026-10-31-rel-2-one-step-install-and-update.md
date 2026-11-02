@@ -4420,3 +4420,57 @@ Accept:
 - `bash -n` and `shellcheck -S warning` on the script
 - `pytest ops/release -q`
 - the PR's `Proof · the update moves the stack, and rolls back`, green.
+
+### Handoff S4b round 9 (developer, 2026-11-02)
+
+BLOCKER 4 / decision D25, as the review names it. Base: `d70a2883` on
+`feat/rel-2-s4b-lakehousectl-update`.
+
+**Commits.**
+
+- `16616811` — `fix(lakehousectl): the rollback restores without starting
+  the failed stack`
+  - `backup::restore` takes `start_stack: bool`; `false` passes the
+    script's existing `--skip-stack-up`. `command_restore` passes `true`;
+    `Runner::restore` (the update's rollback and `rollback.rs`) passes
+    `false`. The rollback already calls `runner.up()` after
+    `restore_previous`, so the order D18 names is unchanged.
+  - New test `the_rollbacks_restore_does_not_start_the_stack_and_the_operators_does`,
+    on the fake shipped tool: the rollback's restore passes
+    `--skip-stack-up --local <backup>`, the operator's restore passes
+    `--local <backup>` and no `--skip-stack-up`. The existing restore
+    test now also asserts the flag is absent.
+  - The fake runners in `update.rs` and `rollback.rs` implement the
+    trait, whose signature did not change; they needed no edit.
+- `f0ba8a58` — `fix(release): a restore whose stack does not start exits
+  non-zero`
+  - `scripts/restore-from-backup.sh` step 5/5 prints `Error: the data is
+    restored, and the stack did not start.` and compose's captured
+    output to **stderr**, prints the honest summary line (`Stack
+    bring-up: the stack did not start`), and exits 1. The `ERR` trap is
+    kept.
+  - `ops/release/test_backup_scripts.py`: the round 8 test that expected
+    exit 0 is replaced by `test_a_stack_that_does_not_start_makes_the_restore_fail`
+    (non-zero, reason on stderr, compose text not on stdout, honest
+    summary). New `test_the_restore_leaves_the_stack_alone_when_it_is_told_to`
+    pins the rollback's side: `--skip-stack-up` starts no whole stack.
+
+**Checks run, in the foreground, on the final commit of each slice.**
+
+| Command | Result |
+| --- | --- |
+| `cargo fmt --check` (through `bin/cargo-locked`) | clean |
+| `cargo clippy -p lakehousectl --all-targets -j 2 -- -D warnings` | clean |
+| `cargo test -p lakehousectl -j 2` | **190 passed**, 0 failed |
+| `bash -n scripts/restore-from-backup.sh` | clean |
+| `uvx --from shellcheck-py shellcheck -S warning scripts/restore-from-backup.sh` | clean (no output) |
+| `uvx --with pyyaml --with cryptography pytest ops/release -q` | **245 passed** |
+
+The Rust commit touched only `lakehousectl`, so no other crate was built
+and no full-workspace run was made. The script commit touched no Rust, so
+no cargo command ran for it. No Docker stack was started, as instructed.
+
+**NOT verified here.** The PR's `Proof · the update moves the stack, and
+rolls back` did not run in this session; it runs in the PR's CI. The
+`--skip-stack-up` path of the script was exercised only against the fake
+docker, not on a real host.
