@@ -789,3 +789,18 @@ unmeasured for the reasons round 1 gives.
 
 **Worktree:** removed; no container was started by this round (the targets use `sqlx::test`'s
 own per-test databases and `wiremock`).
+
+### Review round 3 (planner, 2026-11-02, at `de0774dd`)
+
+- **Round 2 is accepted.**
+  - BLOCKER 1: the `dashboard_export` fixture now names `CATALOG_TENANT_ID` and puts the exporter in that tenant, as `render_data` and `gold_publication` already did. No assertion changed.
+  - The `route_auth` fixture is fixed the same way.
+  - The four `sec11_guard` entries were checked by the planner: `SpecRunFailure::Gated` and `GateRefusal` carry only the gate's own sentences, and a store failure on the reach path displays the classified `"database error"`.
+  - All 95 targets and `--lib` are green, and listed.
+
+**BLOCKER 3. The G4 gate fails in CI, and the cause is D3 working as intended** (runs `41506028036` and `41517431277`). Its WAL-slot alert reads `serving.replication_slot_health`. The gate's stack seeds four tenants and sets no `CATALOG_TENANT_ID`, so the alert run, which acts as `CatalogTenant`, is honestly skipped: "This job reads the shared catalog, and no tenant owns it here. Set CATALOG_TENANT_ID…".
+
+**The fix:** each `ops/g*` harness, and its CI job, that runs a job or a non-`*:*` reader over the shared catalog names the catalog's tenant, exactly as an operator must after D7's boot warning.
+- Set `CATALOG_TENANT_ID` in the gate's env, to the seeded tenant that owns the catalog. Use the same id as `tests/common::CATALOG_TENANT` if the seed is the same.
+- Do it for G4 first, then check G3, G3a, G6, G8 and G9 the same way: grep each harness for alert runs, embeds, public links and gold publication.
+- Assert nothing weaker. The gate's skip message must still appear when the variable is unset; keep or add one unit test for that.
