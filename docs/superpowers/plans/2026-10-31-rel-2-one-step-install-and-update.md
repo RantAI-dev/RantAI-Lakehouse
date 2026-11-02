@@ -2007,6 +2007,123 @@ it is not changed here: it is named so that the reviewer can decide.
   on since. The reviewer decides when to merge it; the checks above were run on the branch as it
   is.
 
+### Fixes for review S4b round 2 (developer, 2026-11-02)
+
+**Commits** (branch `feat/rel-2-s4b-lakehousectl-update`, on top of the review commit `270293cf`):
+
+| Commit | Task | What |
+| --- | --- | --- |
+| `e1a37beb` | review round 2 BLOCKER 2 | the pause does not outlive the update: every path that clears `MAINTENANCE_PAUSED` recreates the services that read it |
+| `fe77e06c` | review round 2 SHOULD-FIX 3 | the `backup::tests` flake: the fake tool is a committed file, symlinked into the temporary directory |
+
+**BLOCKER 2 (`e1a37beb`).** Three paths clear the pause: the update's success (step 8), the
+rollback (step 5), and the update's way back from a failure in step 4 or step 5. Every one of them
+now recreates the services that read the pause, right after the clear:
+
+- `pause::clear_and_recreate` owns the pair — the clear and the recreate — so no path can clear
+  the pause and leave the services running with it (`pause.rs`);
+- the recreate is the `up -d --pull never` the tool already runs: it recreates only the services
+  whose environment changed, and it pulls nothing (REL-2 S3 D13);
+- a recreate that fails is reported plainly, never hidden: the error says the services that read
+  the pause could not be recreated, and that the jobs that delete files stay skipped until they
+  are. The update's own success says the update is done and the stack runs the new release; the
+  rollback's says what the rollback did;
+- the state names the release the stack runs BEFORE the pause is cleared, in the update and in the
+  rollback: a pause that could not be cleared must not leave the state naming the other release.
+
+**The tests are real.** Five new tests, and the fake runner of `update.rs` and `rollback.rs` now
+reads the install's `.env` at every call — so each test shows the pause being set before the
+backup, the stack being created WITH it, and the stack being created again without it:
+
+| Test | What it holds |
+| --- | --- |
+| `update::tests::the_services_are_recreated_after_the_pause_is_cleared` | the success path: the clear is followed by a start, and that start ran without the pause |
+| `update::tests::the_services_are_recreated_when_the_update_stops_before_the_swap` | the step 4/5 way back: the same, after the stack was put back on the old files |
+| `update::tests::a_failed_recreate_after_the_pause_is_cleared_is_reported` | the second start can fail, and then the error says so |
+| `rollback::tests::the_rollback_recreates_the_services_after_the_pause_is_cleared` | the rollback: the same |
+| `rollback::tests::a_rollback_that_cannot_recreate_the_services_says_so` | and its failure is reported |
+
+The fix was reverted, the tests kept: 9 tests failed (161 passed, 9 failed). With the fix, 170 pass.
+
+**SHOULD-FIX 3 (`fe77e06c`).** The fake tool the `backup::tests` run is now a COMMITTED file
+(`rust/crates/lakehousectl/tests/fixtures/shipped-tool.sh`), SYMLINKED into the install's own
+`tools/` directory. The file the kernel executes is then a file nobody writes, and it has no
+reason to answer `ETXTBSY`. What the fake tool does is read from `fake-tool-mode` in the
+install's own directory — `backup`, `restore`, `silent` or `fail`, the four the tests need.
+
+**The review's first suggestion was not used, and why.** Running the script with `sh <script>`
+would break the shipped scripts: they are BASH (`#!/usr/bin/env bash`, `[[ ]]`, arrays,
+`set -o pipefail`), and `sh` refuses them. The handoff's candidate — the committed fixture,
+symlinked into the temporary directory — is used instead. The handoff's other two candidates (a
+retry on `ETXTBSY` in `sys::output_or_stderr_with_env`, and a single-threaded run of the module)
+are not used either: the first hides a real condition in the production code, and the second
+leaves the flake in place for every other test that runs beside it.
+
+**Commands run, in the foreground, on the final commit `fe77e06c`:**
+
+| Command | Result |
+| --- | --- |
+| `/home/shiro/rantai/bin/cargo-locked fmt --check` | clean, no diff, exit 0 |
+| `/home/shiro/rantai/bin/cargo-locked clippy -p lakehousectl --all-targets -- -D warnings` | clean, no warning and no error, exit 0 |
+| `/home/shiro/rantai/bin/cargo-locked test -p lakehousectl` | **170 passed, 0 failed** (165 at the review commit `270293cf`, 5 new) |
+| `/home/shiro/rantai/bin/cargo-locked test -p lakehousectl`, 50 times in a loop | **50 passed, 0 failed** |
+| `/home/shiro/rantai/bin/cargo-locked test -p lakehousectl backup`, 50 times in a loop | **50 passed, 0 failed** |
+
+The flake, measured on the code BEFORE the fix: `cargo test -p lakehousectl`, 50 times in a loop:
+**49 passed, 1 failed** — run 31, `the_restore_runs_the_shipped_script_with_the_backup_directory`,
+`Failed("the backup tool failed: Text file busy (os error 26)")`. `cargo test -p lakehousectl
+backup`, 50 times in a loop, before the fix: 50 passed, 0 failed — the filter runs fewer tests
+beside it, so the race has fewer chances.
+
+Every cargo command went through `/home/shiro/rantai/bin/cargo-locked` (the shared
+`CARGO_TARGET_DIR`, `/home/shiro/rantai/cargo-target`; no `cargo clean`), in the foreground.
+
+**One thing the reviewer may want to look at: the profiles.** The review's premise is that step
+6's `up -d` creates the Dagster services ("The Dagster services read `MAINTENANCE_PAUSED` when
+they are created. Step 6's `up -d` creates them with the pause set"). In this repository's
+Compose file the Dagster services carry `profiles: ["dagster"]`, and the release keeps that
+profile (`ops/release/render_compose.py`: "the profiles (`dagster`, `trino`, `seaweedfs`,
+`backups`) stay as they are, so an operator still chooses what to start"). `docker::compose_up`
+does not pass `--profile`; only `compose_stop`, `compose_stop_all` and `compose_services` do, and
+they pass `--profile '*'`.
+
+So the tool's `up -d` starts the DEFAULT profile only, and a Dagster service of a deployment that
+runs the `dagster` profile is not recreated by it. The fix is the review's — after the pause is
+cleared, `up -d --pull never` runs again — and it does not change which services the tool starts.
+Two things the reviewer may want to decide:
+
+- whether the recreate (and the update's step 6, and the rollback's start) must name the `dagster`
+  profile, so the services that read the pause are the ones that are recreated;
+- whether `up -d` without `--profile` is what a deployment should get at all: the update STOPS the
+  Dagster services (`compose stop` with `--profile '*'`), and step 6 starts the default profile
+  only, so the Dagster services stay stopped after an update.
+
+This is read from the code and the Compose file; it was NOT run on a host (see below).
+
+**Not verified, with the reason:**
+
+- **No real update run on a host.** There is no install of a release on this machine, and no
+  release is published yet: the update's own path (the writers stopped, the backup taken, the
+  files swapped, the stack waited for, the rollback) is covered by the unit tests with the fake
+  runner. The proof is the `update-proof` job of the dry run, and the reviewer runs it.
+- **The whole-workspace cargo run** (`cargo clippy --workspace --all-targets --all-features -- -D
+  warnings` and `cargo test --workspace`): not run here — this slice's machine rules say CI runs
+  the workspace and the developer runs the scoped commands. The crate the slice touches
+  (`lakehousectl`) was clipped and tested with `--all-targets`.
+- **The Dagster code location** (`(cd dagster && python -m pytest dispar_orchestrate -q)`): not
+  run — the branch changes no Python under `dagster/` (`git diff origin/main...HEAD -- dagster/`
+  is empty). The two repo lints that scan it ran on this branch before these two commits, and
+  both are OK.
+- **No bun command ran**: the branch changes no TypeScript (`git diff origin/main...HEAD -- src/`
+  is empty).
+- **`docker compose --profile '*' config --quiet`**: not run — the branch changes no compose file
+  (`git diff origin/main...HEAD -- docker-compose.yml` is empty).
+- **The branch has not merged `main`**: its base is `c239e3b0`, and `main` has moved on since
+  (`7a49fcbb`). The reviewer decides when to merge it; the checks above were run on the branch as
+  it is.
+- **The pushes**: both commits were pushed to `origin/feat/rel-2-s4b-lakehousectl-update`. No push
+  was refused, so no `git pull --no-rebase` and no resolve was needed.
+
 ## 7. Review (planner appends below)
 
 ### Review S1 round 1 (planner, 2026-10-31, at `f79d4235`)
