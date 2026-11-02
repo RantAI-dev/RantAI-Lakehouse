@@ -1082,6 +1082,97 @@ async fn resolve_recovered(pg: &PgPool, results: &[lakehouse_alerts::RunResult])
     }
 }
 
+/// Run the alert rules once and deliver what fires (`BI-40` D4): the one place
+/// the rule part of a run lives, shared by the scheduler's tick
+/// ([`run`]), a person's test of one rule
+/// (`crate::routes::alerts::test_one`) and the assistant's `run_alert_rule`.
+///
+/// `only` narrows the run to one rule id, as `?id=` does. The wiring is
+/// deliberately the route's whole rule part and nothing of the scheduler's
+/// extra passes (quality, schema versions, semantic drafting, lineage,
+/// pipeline-late): those belong to the tick and are not a test of one rule.
+///
+/// - `run_rules` evaluates the threshold, digest, freshness and pipeline kinds;
+/// - a chart rule is answered `CHART_SKIPPED` there, so
+///   [`crate::routes::chart_alerts::evaluate`] reads it as its owner and its
+///   result replaces the skipped one (`BI-19` D12);
+/// - every fired, non-`Digest` result is saved as an `alert_instance` and every
+///   recovery resolves its open instance (`BI-19` D12), best-effort.
+///
+/// # Errors
+///
+/// 500 [`ApiError::Internal`] on a `ClickHouse` failure while listing or
+/// evaluating rules; the fixed "database error" sentence, never upstream text.
+pub(crate) async fn run_one(
+    state: &AppState,
+    only: Option<&str>,
+) -> Result<Vec<lakehouse_alerts::RunResult>, ApiError> {
+    // SEC-10: the sender checks every webhook target and never follows a redirect.
+    let http = state.webhook_sender();
+    let email = EmailSender::new(smtp_config(&state.config));
+    // `freshness`/`silence` sources are real, Postgres/Iceberg-backed
+    // implementations when both dependencies are configured for this
+    // request; otherwise `None` — every `Freshness` rule then reports
+    // `skipped` and no rule's delivery is ever silence-suppressed, an
+    // honest degrade rather than a placeholder failure. `AppState::iceberg`
+    // is read once, through the lock, with the guard dropped immediately
+    // (never held across an `.await`) — this only uses whatever client is
+    // already cached; it does not itself trigger a connect.
+    let cached_iceberg = state.iceberg.read().await.clone();
+    let freshness_source = match (state.pg.as_deref(), cached_iceberg) {
+        (Some(pg), Some(iceberg)) => Some(ApiFreshnessSource { pg, iceberg }),
+        _ => None,
+    };
+    let silence_source = state.pg.as_deref().map(|pg| ApiSilenceSource { pg });
+    let state_source = state.pg.as_deref().map(|pg| ApiStateSource { pg });
+    let gate = ApiSqlGate {
+        pg: state.pg.as_deref(),
+        ch: &state.clickhouse,
+    };
+
+    let mut results = lakehouse_alerts::run_rules(
+        &state.clickhouse,
+        &http,
+        &email,
+        only,
+        freshness_source.as_ref().map(|s| s as &dyn FreshnessSource),
+        silence_source.as_ref().map(|s| s as &dyn SilenceSource),
+        state_source.as_ref().map(|s| s as &dyn StateSource),
+        &gate,
+    )
+    .await
+    .map_err(|err| {
+        upstream_error::ch_error_as(
+            &upstream_error::DATABASE,
+            &err,
+            upstream_error::FailedAs::Internal,
+        )
+    })?;
+
+    // BI-19 part C (D12): chart rules are read as their owners here; their
+    // `run_rules` entries (skipped, with the reason) are replaced by the result.
+    let state_ref = state_source.as_ref().map(|s| s as &dyn StateSource);
+    let chart_results = crate::routes::chart_alerts::evaluate(
+        state,
+        (&http, &email),
+        silence_source.as_ref().map(|s| s as &dyn SilenceSource),
+        state_ref,
+        only,
+    )
+    .await;
+    results.retain(|r| !chart_results.iter().any(|c| c.id == r.id));
+    results.extend(chart_results);
+
+    // Persist every fired, non-Digest result as an `alert_instance` row,
+    // best-effort (WS5 item C1) — see [`persist_fired_results`]'s doc
+    // comment.
+    if let Some(pg) = state.pg.as_deref() {
+        persist_fired_results(pg, &state.clickhouse, &results).await;
+        resolve_recovered(pg, &results).await;
+    }
+    Ok(results)
+}
+
 /// `GET`/`POST /api/alerts/run` — evaluate rules and deliver alerts/
 /// digests that fire.
 ///
@@ -1136,69 +1227,15 @@ pub async fn run(
         principal.as_ref().map(|Extension(p)| p),
     )?;
 
+    let results = run_one(&state, query.id.as_deref()).await?;
+
+    // The scheduler's passes below need the same senders and silence source the
+    // rule part used; `run_one` keeps its own, so this is a second, cheap build
+    // of the same configuration (`BI-40` D4).
     // SEC-10: the sender checks every webhook target and never follows a redirect.
     let http = state.webhook_sender();
     let email = EmailSender::new(smtp_config(&state.config));
-    // `freshness`/`silence` sources are real, Postgres/Iceberg-backed
-    // implementations when both dependencies are configured for this
-    // request; otherwise `None` — every `Freshness` rule then reports
-    // `skipped` and no rule's delivery is ever silence-suppressed, an
-    // honest degrade rather than a placeholder failure. `AppState::iceberg`
-    // is read once, through the lock, with the guard dropped immediately
-    // (never held across an `.await`) — this route only uses whatever
-    // client is already cached; it does not itself trigger a connect.
-    let cached_iceberg = state.iceberg.read().await.clone();
-    let freshness_source = match (state.pg.as_deref(), cached_iceberg) {
-        (Some(pg), Some(iceberg)) => Some(ApiFreshnessSource { pg, iceberg }),
-        _ => None,
-    };
     let silence_source = state.pg.as_deref().map(|pg| ApiSilenceSource { pg });
-    let state_source = state.pg.as_deref().map(|pg| ApiStateSource { pg });
-    let gate = ApiSqlGate {
-        pg: state.pg.as_deref(),
-        ch: &state.clickhouse,
-    };
-
-    let mut results = lakehouse_alerts::run_rules(
-        &state.clickhouse,
-        &http,
-        &email,
-        query.id.as_deref(),
-        freshness_source.as_ref().map(|s| s as &dyn FreshnessSource),
-        silence_source.as_ref().map(|s| s as &dyn SilenceSource),
-        state_source.as_ref().map(|s| s as &dyn StateSource),
-        &gate,
-    )
-    .await
-    .map_err(|err| {
-        upstream_error::ch_error_as(
-            &upstream_error::DATABASE,
-            &err,
-            upstream_error::FailedAs::Internal,
-        )
-    })?;
-
-    // BI-19 part C (D12): chart rules are read as their owners here; their
-    // `run_rules` entries (skipped, with the reason) are replaced by the result.
-    let state_ref = state_source.as_ref().map(|s| s as &dyn StateSource);
-    let chart_results = crate::routes::chart_alerts::evaluate(
-        &state,
-        (&http, &email),
-        silence_source.as_ref().map(|s| s as &dyn SilenceSource),
-        state_ref,
-        query.id.as_deref(),
-    )
-    .await;
-    results.retain(|r| !chart_results.iter().any(|c| c.id == r.id));
-    results.extend(chart_results);
-
-    // Persist every fired, non-Digest result as an `alert_instance` row,
-    // best-effort (WS5 item C1) — see `persist_fired_results`'s doc
-    // comment.
-    if let Some(pg) = state.pg.as_deref() {
-        persist_fired_results(pg, &state.clickhouse, &results).await;
-        resolve_recovered(pg, &results).await;
-    }
 
     // Plan 1f: `pipeline_late` rules fire from this op, not from the
     // orchestrator event path. A "late" claim depends on the clock at

@@ -5,13 +5,13 @@
 //! Every function here calls straight into the `lakehouse-alerts` crate —
 //! the SAME `list_rules`/`save_rule`/`delete_rule`/`run_rules` functions
 //! `routes::alerts` calls — rather than re-implementing rule storage or
-//! evaluation. `run_alert_rule` also reuses `routes::alerts::smtp_config`
-//! so a fired alert is delivered through the exact same `SmtpConfig` the
-//! console's `/api/alerts/run` builds, and `routes::alerts::ApiFreshnessSource`/
-//! `ApiSilenceSource` (WS5 item C1) so a copilot-triggered run evaluates
-//! `Freshness` rules and suppresses delivery for a silenced rule exactly
-//! like the HTTP route does — a rule silenced from the console must not
-//! page someone again just because the copilot ran it instead.
+//! evaluation. `run_alert_rule` calls `routes::alerts::run_one` (`BI-40`
+//! D4), the one place a rule's run is wired, so a copilot-triggered run
+//! reads a chart rule as its owner, saves a fired result as an
+//! `alert_instance`, resolves a recovery, evaluates a `Freshness` rule and
+//! suppresses delivery for a silenced rule exactly as the HTTP route does —
+//! a rule silenced from the console must not page someone again just because
+//! the copilot ran it instead.
 //!
 //! `run_alert_rule` deliberately does NOT go through
 //! `routes::alerts::run`/`check_run_token`: that guard's whole point (see
@@ -24,7 +24,6 @@
 
 use lakehouse_alerts::AlertRuleInput;
 use lakehouse_auth::Principal;
-use lakehouse_notify::EmailSender;
 use serde_json::{Map, Value, json};
 
 use super::arg_str;
@@ -142,53 +141,13 @@ pub(super) async fn run_alert_rule(state: &AppState, args: &Map<String, Value>) 
     if id.is_empty() {
         return json!({ "error": "id is required" });
     }
-    // SEC-10: the sender checks every webhook target and never follows a redirect.
-    let http = state.webhook_sender();
-    let email = EmailSender::new(crate::routes::alerts::smtp_config(&state.config));
-    // Same real `FreshnessSource`/`SilenceSource` wiring as
-    // `routes::alerts::run` (WS5 item C1) — reused here, not
-    // reimplemented, so a copilot-triggered run also evaluates `Freshness`
-    // rules and never pages someone about an incident they already
-    // silenced. `AppState::iceberg` is read once, through the lock, guard
-    // dropped immediately.
-    let cached_iceberg = state.iceberg.read().await.clone();
-    let freshness_source = match (state.pg.as_deref(), cached_iceberg) {
-        (Some(pg), Some(iceberg)) => {
-            Some(crate::routes::alerts::ApiFreshnessSource { pg, iceberg })
-        }
-        _ => None,
-    };
-    let silence_source = state
-        .pg
-        .as_deref()
-        .map(|pg| crate::routes::alerts::ApiSilenceSource { pg });
-    let state_source = state
-        .pg
-        .as_deref()
-        .map(|pg| crate::routes::alerts::ApiStateSource { pg });
-    match lakehouse_alerts::run_rules(
-        &state.clickhouse,
-        &http,
-        &email,
-        Some(&id),
-        freshness_source
-            .as_ref()
-            .map(|s| s as &dyn lakehouse_alerts::FreshnessSource),
-        silence_source
-            .as_ref()
-            .map(|s| s as &dyn lakehouse_alerts::SilenceSource),
-        state_source
-            .as_ref()
-            .map(|s| s as &dyn lakehouse_alerts::StateSource),
-        &crate::routes::alerts::ApiSqlGate {
-            pg: state.pg.as_deref(),
-            ch: &state.clickhouse,
-        },
-    )
-    .await
-    {
+    // `BI-40` D4: one helper for one rule, shared with `/api/alerts/run` and the
+    // person's test route. The copilot therefore reads a chart rule as its owner
+    // and saves its fired instance as the route does — the two gaps this tool
+    // had when it carried its own copy of the run wiring.
+    match crate::routes::alerts::run_one(state, Some(&id)).await {
         Ok(results) => json!({ "ran": results.len(), "results": results }),
-        Err(err) => upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json(),
+        Err(err) => json!({ "error": err.to_string() }),
     }
 }
 
@@ -273,6 +232,48 @@ mod tests {
         let result = create_alert_rule(&state, None, &Map::new()).await;
         assert!(result["error"].is_string(), "{result}");
         assert!(result.get("errorId").is_none(), "{result}");
+    }
+
+    /// `BI-40` D4: `run_alert_rule` goes through `routes::alerts::run_one`, which
+    /// reads a chart rule as its owner. Before that, the tool carried its own
+    /// copy of the run wiring and answered a chart rule with
+    /// `run_rules`' `CHART_SKIPPED` sentence — the rule was never read.
+    #[tokio::test]
+    async fn running_a_chart_rule_from_the_assistant_does_not_answer_chart_skipped() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, ResponseTemplate};
+        let server = wiremock::MockServer::start().await;
+        let rule = json!({
+            "id": "al_chart", "name": "Visitors in Bali", "type": "alert",
+            "mart": "", "measure": "", "agg": "sum", "op": ">", "threshold": "100",
+            "board": "", "channel": "email", "target": "owner@test.invalid",
+            "enabled": "1", "created_at": "2026-11-02 00:00:00", "severity": "",
+            "pipeline": "", "metric": "", "connector": "", "asset": "", "chart": "c_kpi",
+            "series": "", "condition": "above", "owner_id": "", "filters_json": "[]",
+        });
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "meta": [], "data": [rule], "rows": 1 })),
+            )
+            .mount(&server)
+            .await;
+        let mut state = state();
+        state.clickhouse = std::sync::Arc::new(lakehouse_clickhouse::ChClient::new(
+            server.uri(),
+            "default".to_owned(),
+            String::new(),
+        ));
+        let mut args = Map::new();
+        args.insert("id".to_owned(), json!("al_chart"));
+        let result = run_alert_rule(&state, &args).await;
+        let text = result.to_string();
+        assert!(
+            !text.contains("chart alerts are evaluated by /api/alerts/run"),
+            "a chart rule is read now, not skipped as before: {text}"
+        );
+        assert_eq!(result["ran"], json!(1), "{text}");
+        assert!(result["results"][0]["skipped"].is_string(), "{text}");
     }
 
     #[tokio::test]
