@@ -433,6 +433,59 @@ async fn authorise_digest_board(
     Ok(())
 }
 
+/// The one save path for a rule (`BI-37` D1): `POST`/`PUT /api/alerts` and the
+/// assistant's `create_alert_rule`/`update_alert_rule` all call it, so the scope
+/// checks, the chart-alert save guard, the state reset and the store call
+/// cannot drift apart (rule 4). Before this, the two tools called the guards
+/// and `save_rule` themselves, which is how they skipped
+/// [`crate::routes::chart_alerts::authorise_save`].
+///
+/// `id` is the rule being replaced (`None` for a new one). `input` gains its
+/// owner from the save guard, and its chart fields are the ones the guard
+/// judged.
+///
+/// # Errors
+///
+/// As [`authorise_rule_create`] / [`authorise_rule_update`] and
+/// [`crate::routes::chart_alerts::authorise_save`]; 400 with the store's own
+/// sentence on a validation failure (see `lakehouse_alerts::save_rule`).
+pub(crate) async fn save_rule_with_checks(
+    state: &AppState,
+    principal: Option<&Principal>,
+    id: Option<&str>,
+    input: &mut AlertRuleInput,
+) -> Result<AlertRule, ApiError> {
+    let stored = if let Some(id) = id {
+        authorise_rule_update(state, principal, id, input).await?;
+        crate::routes::chart_alerts::stored_rule(state, id).await?
+    } else {
+        authorise_rule_create(state, principal, input).await?;
+        None
+    };
+    // BI-19 part C (C3): the router's floor is "signed in"; the permission, the
+    // chart and the owner are settled here.
+    crate::routes::chart_alerts::authorise_save(state, principal, id, stored.as_ref(), input)
+        .await?;
+    let rule = lakehouse_alerts::save_rule(&state.clickhouse, &state.webhook_sender(), input, id)
+        .await
+        .map_err(|err| {
+            upstream_error::alert(&upstream_error::DATABASE, &err)
+                .into_api_error(upstream_error::FailedAs::BadRequest)
+        })?;
+    // BI-19 C review SF-3: a rule that now watches something else starts from
+    // `ok`, so it neither announces a "back to normal" for a line it never
+    // crossed nor misses a crossing of the new one. Renaming it or changing its
+    // target keeps the state.
+    if let Some(id) = id
+        && stored
+            .as_ref()
+            .is_some_and(|old| lakehouse_alerts::watches_differ(old, &rule))
+    {
+        forget_state(state, id).await;
+    }
+    Ok(rule)
+}
+
 /// `POST /api/alerts` — create a rule.
 ///
 /// # Errors
@@ -448,17 +501,7 @@ pub async fn create(
 ) -> ApiResult<ApiJson<Value>> {
     let mut input = parse_body(&body)?;
     let caller = principal.as_ref().map(|Extension(p)| p);
-    authorise_rule_create(&state, caller, &input).await?;
-    // BI-19 part C (C3): the router's floor is "signed in"; the permission, the
-    // chart and the owner are settled here.
-    crate::routes::chart_alerts::authorise_save(&state, caller, None, None, &mut input).await?;
-    let rule =
-        lakehouse_alerts::save_rule(&state.clickhouse, &state.webhook_sender(), &input, None)
-            .await
-            .map_err(|err| {
-                upstream_error::alert(&upstream_error::DATABASE, &err)
-                    .into_api_error(upstream_error::FailedAs::BadRequest)
-            })?;
+    let rule = save_rule_with_checks(&state, caller, None, &mut input).await?;
     Ok(ApiJson(json!({ "ok": true, "rule": rule })))
 }
 
@@ -479,37 +522,7 @@ pub async fn update(
         return Err(ApiError::BadRequest("id is required".to_owned()).into());
     };
     let caller = principal.as_ref().map(|Extension(p)| p);
-    authorise_rule_update(&state, caller, &id, &input).await?;
-    let stored = crate::routes::chart_alerts::stored_rule(&state, &id).await?;
-    crate::routes::chart_alerts::authorise_save(
-        &state,
-        caller,
-        Some(&id),
-        stored.as_ref(),
-        &mut input,
-    )
-    .await?;
-    let rule = lakehouse_alerts::save_rule(
-        &state.clickhouse,
-        &state.webhook_sender(),
-        &input,
-        Some(&id),
-    )
-    .await
-    .map_err(|err| {
-        upstream_error::alert(&upstream_error::DATABASE, &err)
-            .into_api_error(upstream_error::FailedAs::BadRequest)
-    })?;
-    // BI-19 C review SF-3: a rule that now watches something else starts from
-    // `ok`, so it neither announces a "back to normal" for a line it never
-    // crossed nor misses a crossing of the new one. Renaming it or changing its
-    // target keeps the state.
-    if stored
-        .as_ref()
-        .is_some_and(|old| lakehouse_alerts::watches_differ(old, &rule))
-    {
-        forget_state(&state, &id).await;
-    }
+    let rule = save_rule_with_checks(&state, caller, Some(&id), &mut input).await?;
     Ok(ApiJson(json!({ "ok": true, "rule": rule })))
 }
 
