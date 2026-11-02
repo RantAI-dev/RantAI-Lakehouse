@@ -1234,7 +1234,7 @@ fn list_alert_rules_schema() -> Value {
 
 fn create_alert_rule_schema() -> Value {
     json!({ "type": "function", "function": { "name": "create_alert_rule",
-        "description": "Create an alert or digest rule. Alert (type=alert): mart, measure, agg, op and threshold; it watches that aggregate. Or give metric (a name from list_metrics) with op and threshold, and the alert watches that metric instead (it is read with the fixed viewer role every alert uses, not with the user's access). Digest (type=digest): board, the dashboard to summarise. Delivered by webhook (target=URL) or email (target=address).",
+        "description": "Create an alert or digest rule. Alert (type=alert): mart, measure, agg, op and threshold; it watches that aggregate. Or give metric (a name from list_metrics) with op and threshold, and the alert watches that metric instead (it is read with the fixed viewer role every alert uses, not with the user's access). Chart alert (BI-37, also type=alert): give chart (a chart id from list_charts or the page context), the condition above, below or any_rows, and the threshold; with `series` when the chart shows more than one number. With no target a chart alert is sent to your own email address. Without the alert permission only a chart alert to your own email address is allowed. Digest (type=digest): board, the dashboard to summarise. Delivered by webhook (target=URL) or email (target=address).",
         "parameters": { "type": "object", "properties": {
             "name": { "type": "string" },
             "type": { "type": "string", "enum": ["alert", "digest"] },
@@ -1244,16 +1244,20 @@ fn create_alert_rule_schema() -> Value {
             "agg": { "type": "string", "enum": alert_agg_enum() },
             "op": { "type": "string", "enum": alert_op_enum() },
             "threshold": { "type": "number" },
+            "chart": { "type": "string", "description": "the chart id (list_charts, or the page context), for a chart alert" },
+            "series": { "type": "string", "description": "the result name to watch when the chart shows more than one number" },
+            "condition": { "type": "string", "enum": ["above", "below", "any_rows"], "description": "for a chart alert: over the threshold, under it, or 'returns any rows'" },
+            "filters": { "type": "array", "items": { "type": "object" }, "description": "for a chart alert: the filters in force on the page, copied from the page context's raw JSON, so the number is the one on screen; leave out when there are none" },
             "board": { "type": "string", "description": "dashboard board id, for type=digest" },
             "channel": { "type": "string", "enum": ["webhook", "email"] },
-            "target": { "type": "string", "description": "webhook URL or email address to deliver to" },
+            "target": { "type": "string", "description": "webhook URL or email address to deliver to; leave out for a chart alert to your own email" },
             "enabled": { "type": "boolean" } },
-            "required": ["name", "type", "channel", "target"] } } })
+            "required": ["name", "type"] } } })
 }
 
 fn update_alert_rule_schema() -> Value {
     json!({ "type": "function", "function": { "name": "update_alert_rule",
-        "description": "Change a saved alert or digest rule (by id). Send every field, as for create_alert_rule, with the new values. list_alert_rules gives the ids.",
+        "description": "Change a saved alert or digest rule (by id). Send every field, as for create_alert_rule, with the new values. list_alert_rules gives the ids. A change to the chart, condition or threshold starts its state over, so it neither announces a recovery for a line it never crossed nor misses a crossing of the new one.",
         "parameters": { "type": "object", "properties": {
             "id": { "type": "string" },
             "name": { "type": "string" },
@@ -1264,6 +1268,10 @@ fn update_alert_rule_schema() -> Value {
             "agg": { "type": "string", "enum": alert_agg_enum() },
             "op": { "type": "string", "enum": alert_op_enum() },
             "threshold": { "type": "number" },
+            "chart": { "type": "string", "description": "the chart id, for a chart alert" },
+            "series": { "type": "string" },
+            "condition": { "type": "string", "enum": ["above", "below", "any_rows"] },
+            "filters": { "type": "array", "items": { "type": "object" } },
             "board": { "type": "string" },
             "channel": { "type": "string", "enum": ["webhook", "email"] },
             "target": { "type": "string" },
@@ -2231,13 +2239,20 @@ pub static TOOLS: &[ToolSpec] = &[
         name: "create_alert_rule",
         schema: create_alert_rule_schema,
         risk: Risk::WriteLow,
-        permission: "alert:write",
+        // BI-37 D2: the console's floor moved first (`policy.rs`'s
+        // `POST /api/alerts` is `RequiresAuth`, BI-19 C3), so the tool's does
+        // too: the save guard (`routes::chart_alerts::authorise_save`) decides
+        // who may save what, and refuses a mart, metric or digest rule, or
+        // another person's target, without `alert:write` with the console's own
+        // sentence. Still `WriteLow`, so Ask mode refuses it.
+        permission: "",
     },
     ToolSpec {
         name: "update_alert_rule",
         schema: update_alert_rule_schema,
         risk: Risk::WriteLow,
-        permission: "alert:write",
+        // BI-37 D2: as `create_alert_rule`.
+        permission: "",
     },
     ToolSpec {
         name: "delete_alert_rule",
@@ -3378,6 +3393,10 @@ mod tests {
                 "get_query_limits".to_owned(),
                 "stop_query".to_owned(),
                 "list_alert_rules".to_owned(),
+                // BI-37 D2: the two save tools declare no permission; their
+                // own save guard refuses what the console refuses.
+                "create_alert_rule".to_owned(),
+                "update_alert_rule".to_owned(),
                 "get_audit_history".to_owned(),
                 "list_classification_rules".to_owned(),
                 "list_quality_rules".to_owned(),
@@ -3399,8 +3418,14 @@ mod tests {
     fn tier1_tools_have_the_documented_risk_and_permission() {
         let expected: &[(&str, Risk, &str)] = &[
             ("list_alert_rules", Risk::Read, ""),
-            ("create_alert_rule", Risk::WriteLow, "alert:write"),
-            ("update_alert_rule", Risk::WriteLow, "alert:write"),
+            // BI-37 D2: the console's floor for `POST`/`PUT /api/alerts` is
+            // "signed in" and the handler decides (BI-19 C3), so the two save
+            // tools declare no permission and their own save guard refuses what
+            // the console refuses. `delete_alert_rule` and `run_alert_rule` keep
+            // `alert:write` (BI-37 D2: a person's own chart alert is deleted from
+            // the console, and `run_alert_rule` does not evaluate chart rules).
+            ("create_alert_rule", Risk::WriteLow, ""),
+            ("update_alert_rule", Risk::WriteLow, ""),
             ("delete_alert_rule", Risk::WriteHigh, "alert:write"),
             ("run_alert_rule", Risk::WriteLow, "alert:write"),
             ("list_connectors", Risk::Read, "connector:manage"),

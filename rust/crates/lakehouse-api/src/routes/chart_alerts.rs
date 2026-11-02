@@ -76,7 +76,10 @@ fn failed(reason: &str) -> Unreadable {
 }
 
 /// The address of `owner`, lower-cased; `None` when it cannot be read.
-async fn address_of(state: &AppState, owner: &str) -> Option<String> {
+/// `pub(crate)` for the assistant's "alert me" (`BI-37` D3), which fills a
+/// chart alert's target from the caller's own account rather than a guessed
+/// string.
+pub(crate) async fn address_of(state: &AppState, owner: &str) -> Option<String> {
     let pg = state.pg.as_deref()?;
     lakehouse_store::identity::get_user(pg, owner)
         .await

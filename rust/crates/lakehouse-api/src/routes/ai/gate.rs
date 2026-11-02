@@ -398,6 +398,58 @@ fn report_summary(name: &str, args: &Map<String, Value>) -> String {
     }
 }
 
+/// The confirmation sentence of the two alert tools (`BI-37` D5): what is
+/// watched — a chart, a metric or a mart aggregate — the condition and the
+/// threshold when there is one, and where the message goes. Before this, both
+/// fell to the generic fallback and a chart alert's card named neither the
+/// chart nor the condition.
+fn alert_summary(name: &str, args: &Map<String, Value>) -> String {
+    let s = |key: &str| args.get(key).and_then(Value::as_str).unwrap_or("");
+    let number = || {
+        args.get("threshold")
+            .and_then(Value::as_f64)
+            .map_or_else(|| "-".to_owned(), |t| t.to_string())
+    };
+    let verb = if name == "create_alert_rule" {
+        "Membuat"
+    } else {
+        "Mengubah"
+    };
+    let watched = if !s("chart").is_empty() {
+        let series = if s("series").is_empty() {
+            String::new()
+        } else {
+            format!(" seri \"{}\"", s("series"))
+        };
+        let rule = match s("condition") {
+            "any_rows" => "bila chart menampilkan baris".to_owned(),
+            "below" => format!("bila nilainya di bawah {}", number()),
+            _ => format!("bila nilainya di atas {}", number()),
+        };
+        format!("chart {}{series}, {rule}", s("chart"))
+    } else if !s("metric").is_empty() {
+        format!("metrik {} ({} {})", s("metric"), s("op"), number())
+    } else if !s("mart").is_empty() {
+        format!("{} {} {} ({})", s("mart"), s("measure"), s("agg"), s("op"))
+    } else {
+        format!("dashboard {}", s("board"))
+    };
+    let channel = if s("channel") == "email" {
+        "email"
+    } else {
+        "webhook"
+    };
+    let target = if s("target").is_empty() {
+        "alamat Anda".to_owned()
+    } else {
+        s("target").to_owned()
+    };
+    format!(
+        "{verb} aturan alert \"{}\" pada {watched}, lewat {channel} ke {target}.",
+        s("name")
+    )
+}
+
 fn summary_for(spec: &ToolSpec, args: &Map<String, Value>) -> String {
     let s = |key: &str| args.get(key).and_then(Value::as_str).unwrap_or("");
     match spec.name {
@@ -454,6 +506,7 @@ fn summary_for(spec: &ToolSpec, args: &Map<String, Value>) -> String {
         "create_report_subscription" | "update_report_subscription" => {
             report_summary(spec.name, args)
         }
+        "create_alert_rule" | "update_alert_rule" => alert_summary(spec.name, args),
         "create_calculated_field" => format!(
             "Membuat kolom hitung \"{}\" = {} (pada {}).",
             s("name"),
