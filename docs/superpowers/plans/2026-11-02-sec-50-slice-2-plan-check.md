@@ -804,3 +804,128 @@ own per-test databases and `wiremock`).
 - Set `CATALOG_TENANT_ID` in the gate's env, to the seeded tenant that owns the catalog. Use the same id as `tests/common::CATALOG_TENANT` if the seed is the same.
 - Do it for G4 first, then check G3, G3a, G6, G8 and G9 the same way: grep each harness for alert runs, embeds, public links and gold publication.
 - Assert nothing weaker. The gate's skip message must still appear when the variable is unset; keep or add one unit test for that.
+### Handoff round 3 (developer, 2026-11-02)
+
+Branch `feat/sec-50-slice-2`, commits `8f3653e5` (the fix) and the commit that
+adds this entry, pushed after each. No PR opened, nothing force-pushed.
+
+#### BLOCKER 3: the cause, at the code
+
+The G4 WAL step
+(`ops/g4/g4_test.py::step_wal_breach_produces_a_silenceable_alert_instance`,
+`:498`) calls `POST /api/alerts/run`. That route is a job with no user: it
+builds its gate as `GateActor::CatalogTenant` (`routes/alerts.rs:1250`), so
+`reach_for_actor` → `catalog_tenant_reach(tenant_count, catalog_tenant_id)`
+(`routes/query.rs:424`, `:493`) asks who owns the shared catalog. The gate's
+stack seeds four tenants (`0002_seed_identity.sql`) and the job's `.env` named
+none of them, so the answer was D6's refusal (`routes/query.rs:510`,
+`JOB_NEEDS_CATALOG_TENANT`); the run recorded it as the rule's `skipped` reason
+— and the step failed on the sentence after it, "expected a fired result",
+which is why the log never named the cause.
+
+#### The fix (no assertion weakened)
+
+1. `.github/workflows/ci.yml`, job `g4-cdc`, the CI-only `.env` (`:1051`): set
+   `CATALOG_TENANT_ID=11111111-1111-4111-8111-000000000001` with the why
+   written above it. That is the same setting, the same seeded value and the
+   same place the two G8 jobs (`:2912`, `:3103`), g3a-dagster's BLD-1 step
+   (`:844`) and gold-export (`:2804`) already use (`AGENTS.md` rule 4), not a
+   new mechanism. `lakehouse-api`'s compose block already forwards it
+   (`docker-compose.yml:702`, `CATALOG_TENANT_ID: ${CATALOG_TENANT_ID:-}`), so
+   neither `docker-compose.yml` nor `ops/g4/docker-compose.g4.override.yml`
+   changed: the override file is for what a gate's stack gets and a real
+   deployment must not (`CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS`), and this is a
+   deployment setting.
+2. `ops/g4/g4_test.py`: a rule the run skipped is reported as itself
+   (`the alert run skipped <id> instead of evaluating it: <skipped>`), so the
+   skip's own sentence — the one that names the setting — reaches the log. The
+   wording claims no cause, because `skipped` also carries other states
+   (`lakehouse-alerts` `RunResult::skipped`).
+
+#### The other gates, checked the same way
+
+Each harness and its CI job were grepped for alert runs, embeds, public links
+and Gold publication, and every `/api/*` read was traced to its session:
+
+| gate | CI job | reads the shared catalog as | verdict |
+| --- | --- | --- | --- |
+| G3 | `g3-maintenance` (`:913`) | bootstrap admin (`ops/g3/g3_test.py:104`) → `GET /api/pipelines` (`:220`), `GET /api/governance/maintenance` (`:276`) | no change; `catalog_tenant_refusal` never refuses `"*:*"` (`routes/catalog.rs:212`), and no job-with-no-user path is called |
+| G3a | `g3a-dagster` (`:723`) | bootstrap admin (`ops/g3a/g3a_test.py:119`) → `GET /api/catalog`, `/api/lakehouse/tables/bronze/…`, `GET /api/pipelines` | no change; the job already sets `CATALOG_TENANT_ID` (`:844`) for the G7 BLD-1 step it also runs |
+| G6 (all seven harnesses) | `g6-ingest` … `g6-saas-b` | bootstrap admin (`ops/g6/g6_ingest_matrix_test.py:243`; src11/src12/src13/src17 and the oracle/saas/linklocal gates reuse it) | no change; connectors, ingest runs and `GET /api/catalog/` only, all in that session |
+| G9 | `g9-upload` (`:1653`) | bootstrap admin (`ops/g9/upload_test.py:321`) → `/api/query/run`, uploads, `POST /api/pipelines` | no change; the authored pipeline it builds runs as its AUTHOR through `GateActor::AsTenant`, and that author is the `"*:*"` admin, which `reach_for_actor` short-circuits to `TenantReach::All` before any tenant is looked at (`routes/query.rs:404`) |
+| G7, G8, gold-export | — | — | already set (`:844`, `:2912`, `:3103`, `:2804`) |
+
+Greps: `/api/embeds` and `/api/public…` — no hits anywhere under `ops/`;
+`/api/alerts/run` — `ops/g4` only; `/api/gold…` — `ops/g8/g8_governance_test.py:440`
+only, posted with the admin session (a person, so `GateActor::Caller`,
+`routes/gold.rs:289`) in a job that sets the setting anyway. No gate other than
+G4 calls a job-with-no-user path.
+
+#### The skip when the variable is unset (kept, not weakened)
+
+Both are existing `#[cfg(test)]` unit tests, unchanged by this round:
+
+- `routes::query::tests::a_job_with_no_user_is_refused_when_no_tenant_owns_the_shared_catalog`
+  (`rust/crates/lakehouse-api/src/routes/query.rs:5589`) — the D6 422 and its
+  exact sentence, including that the sentence names the setting.
+- `routes::alerts::alert_run_tenant_scope::every_mart_rule_is_refused_with_d6_and_the_next_rule_still_runs`
+  (`rust/crates/lakehouse-api/src/routes/alerts.rs:2562`) — the skip this
+  blocker was about: several tenants and no catalog tenant → every mart rule's
+  `result["skipped"]` is `JOB_NEEDS_CATALOG_TENANT`, the run goes on to the next
+  rule, and no `serving.*` statement reaches the engine.
+
+No Rust changed this round (`git diff --stat 7d28a262..HEAD` on the fix commit:
+`.github/workflows/ci.yml`, `ops/g4/g4_test.py`), so neither was re-run here;
+both were green in round 2 and CI runs them on the PR.
+
+#### Checks run
+
+```
+python3 -m py_compile ops/g4/g4_test.py                                        # ok
+docker compose -f docker-compose.yml -f ops/g4/docker-compose.g4.override.yml \
+  --profile dagster config --quiet                                             # ok
+docker compose --profile '*' config --quiet                                    # ok (with ops/init-env.sh's .env)
+python3 -c "import yaml; …"                                                    # g4-cdc's .env carries the setting
+```
+
+The gate itself, locally, the way `g4-cdc` runs it — one gate, its own project
+name, torn down afterwards:
+
+```
+docker compose -p g4ci --profile dagster build lakehouse-api                   # rantai-lakehouse-api:ci, this branch
+docker compose -p g4ci -f docker-compose.yml -f ops/g4/docker-compose.g4.override.yml \
+  --profile dagster build oidc-mock
+docker compose -p g4ci -f docker-compose.yml -f ops/g4/docker-compose.g4.override.yml \
+  --profile dagster up -d --no-build postgres clickhouse rustfs rustfs-bucket-init \
+  lakekeeper-db-init lakekeeper-migrate lakekeeper lakekeeper-warehouse-init \
+  g4-source-init debezium-server lakehouse-api dagster-code-location dagster-webserver dagster-daemon
+docker compose -p g4ci -f docker-compose.yml -f ops/g4/docker-compose.g4.override.yml \
+  --profile dagster run --rm -T g4-test-runner                                 # exit 0
+docker compose -p g4ci -f docker-compose.yml -f ops/g4/docker-compose.g4.override.yml \
+  --profile dagster down -v                                                    # 0 containers, volumes removed
+```
+
+`docker inspect g4ci-lakehouse-api-1` carried
+`CATALOG_TENANT_ID=11111111-1111-4111-8111-000000000001`, and the step that
+failed in CI reported:
+
+```
+[g4] replication_slot_check_job run 824e6a7a-… finished: visible after 10.1s
+[g4] WAL breach produced a fired, silenceable alert_instance row; re-run after silence stayed suppressed
+[g4] slot 'p5cdc_slot' no longer exists after deprovisioning — WAL is no longer pinned
+[g4] OIDC authorization-code + PKCE round trip: session minted, Analyst role's query:read confirmed
+[g4] PASS
+```
+
+The Dagster image was reused (`rantai-lakehouse-dagster:local`, 2026-10-31):
+this slice changes no Dagster code (`git log -1 --
+dagster/dispar_orchestrate/replication_metrics.py` is `24be9133`, 2026-09-30).
+The API image was rebuilt from this branch, not reused.
+
+#### What I did not verify
+
+- CI itself: `g4-cdc` on the PR is the proof; the run above is the same steps
+  on this machine.
+- G3, G3a, G6 and G9 were read, not run. No change was needed in any of them
+  (table above), but that is `not verified` by execution.
+- The two Rust unit tests named above: not re-run (no Rust changed).
