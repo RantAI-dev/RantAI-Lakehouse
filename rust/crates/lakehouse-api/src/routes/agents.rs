@@ -1460,6 +1460,12 @@ async fn run_headless_loop_inner(
                         risk: "High-risk action (WriteHigh): cannot be undone once \
                                executed.",
                         redacted_args: &redacted,
+                        // SEC-57 (T1): the store can now hold the human who
+                        // asked for a tool call. This call site has no
+                        // requester to name yet — the API change that
+                        // follows this one passes the run's principal id
+                        // down here.
+                        requested_by: None,
                     },
                 )
                 .await;

@@ -236,6 +236,11 @@ pub async fn create_write_high_approval(
         reason: &reason,
         risk: WRITE_HIGH_RISK,
         redacted_args,
+        // SEC-57 (T1): the store can now hold the human who asked for a
+        // tool call. This call site has no requester to name yet — the API
+        // change that follows this one passes the signed-in principal's id
+        // down here.
+        requested_by: None,
     };
     match store_agents::create_pending_approval(pool, req).await {
         Ok(created) => json!({
