@@ -543,6 +543,292 @@ fn user_tenant_add_audit_event(
     }
 }
 
+/// `DELETE /api/identity/users/{id}/tenants/{tenant_id}` — take an
+/// existing user out of a tenant. No body. Returns 200 with the updated
+/// [`User`], whose `tenants` no longer lists the tenant; removing a
+/// member who is not a member is the same 200 and changes nothing.
+///
+/// The counterpart of [`add_user_to_tenant`], under the SAME "who may"
+/// rule: the caller must hold the unrestricted `*:*` grant
+/// ([`crate::routes::catalog::is_unrestricted`]) or already be a member
+/// of the tenant. Anyone else gets the same 404 as for a tenant that does
+/// not exist, so the answer says nothing about which tenants exist.
+///
+/// # Errors
+///
+/// 400 on a `{id}` or `{tenant_id}` that is not a UUID; 404 for a tenant
+/// that does not exist or that the caller may not change (one body for
+/// both) and for a user that does not exist; 503 if no pool is
+/// configured; 500 (classified) on a storage failure. One
+/// `identity.user.tenant.remove` audit event is written when a membership
+/// was removed, none when the user was not in the tenant.
+pub async fn remove_user_from_tenant(
+    State(state): State<AppState>,
+    AuthenticatedPrincipal(principal): AuthenticatedPrincipal,
+    Path((id, tenant_id)): Path<(String, String)>,
+) -> ApiResult<ApiJson<User>> {
+    let user_id = Uuid::parse_str(&id)
+        .map_err(|_| ApiError::BadRequest("user id must be a UUID".to_owned()))?;
+    let tenant_id = Uuid::parse_str(&tenant_id)
+        .map_err(|_| ApiError::BadRequest("tenant id must be a UUID".to_owned()))?;
+    let pool = pool(&state)?;
+
+    // The caller's own right to the tenant is checked before anything is
+    // read, and fails with the unknown-tenant answer below.
+    let tenant_not_found = || ApiError::NotFound("tenant not found".to_owned());
+    if !crate::routes::catalog::is_unrestricted(&principal) && !principal.in_tenant(tenant_id) {
+        return Err(tenant_not_found().into());
+    }
+    if !identity::tenant_exists(pool, tenant_id).await? {
+        return Err(tenant_not_found().into());
+    }
+    // `get_user` answers `StoreError::NotFound` (404) for an unknown user.
+    identity::get_user(pool, &user_id.to_string()).await?;
+
+    let mut tx = pool.begin().await.map_err(StoreError::from)?;
+    let removed = identity::remove_user_from_tenant_in_tx(&mut tx, user_id, tenant_id).await?;
+    tx.commit().await.map_err(StoreError::from)?;
+
+    if removed {
+        let audit_event = user_tenant_remove_audit_event(&principal, user_id, tenant_id);
+        if let Err(err) = store_audit::insert(pool, audit_event).await {
+            tracing::warn!(
+                %err,
+                action = "identity.user.tenant.remove",
+                user_id = %user_id,
+                tenant_id = %tenant_id,
+                "failed to record user-tenant-remove audit event"
+            );
+        }
+    }
+
+    Ok(ApiJson(
+        identity::get_user(pool, &user_id.to_string()).await?,
+    ))
+}
+
+/// Build the `NewAuditEvent` for a membership that was removed — the
+/// mirror of [`user_tenant_add_audit_event`].
+fn user_tenant_remove_audit_event(
+    principal: &Principal,
+    user_id: Uuid,
+    tenant_id: Uuid,
+) -> NewAuditEvent {
+    NewAuditEvent {
+        action: "identity.user.tenant.remove".to_owned(),
+        resource_kind: Some("user".to_owned()),
+        resource_id: Some(user_id.to_string()),
+        principal_id: Some(principal.id.uuid().to_string()),
+        principal_kind: Some(principal.kind_for_audit().to_owned()),
+        actor_label: Some(principal.display_name.clone()),
+        outcome: "executed".to_owned(),
+        args: Some(serde_json::json!({ "tenantId": tenant_id.to_string() })),
+        ..Default::default()
+    }
+}
+
+/// The `PUT /api/identity/users/{id}/roles` body: the user's COMPLETE
+/// local role set, by name.
+///
+/// ADM-4 D1: the request carries the whole set, not a delta — what the
+/// user holds after the call is exactly what this names.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetUserRolesBody {
+    /// Role names. An empty list leaves the user with no local role at
+    /// all.
+    #[serde(default)]
+    roles: Vec<String>,
+}
+
+/// `PUT /api/identity/users/{id}/roles` — replace a user's local role
+/// set. Returns 200 with the updated [`User`].
+///
+/// # What it replaces, and what it does not (ADM-4 D1)
+///
+/// The request names the user's COMPLETE local role set, and the user's
+/// local role set after the call is exactly that. Roles mapped from an
+/// identity provider's groups (`OIDC_ROLE_MAP`) are NOT stored and NOT
+/// touched: they are re-resolved on every request from the provider's
+/// claims, so there is nothing here to replace. The user keeps the union
+/// of the two, exactly as before.
+///
+/// # Who may change whose roles (ADM-4 D5)
+///
+/// * Only an unrestricted (`*:*`) caller may change the roles of a user
+///   who holds `*:*`, or grant a role that holds `*:*`. Anyone else gets
+///   the SAME 404 an unknown user gets, body for body, so a probe learns
+///   nothing about which accounts exist or what they hold (ADM-3 D3's
+///   rule).
+/// * A caller may not remove their OWN `*:*` — a 400, because the caller
+///   is the target and the answer is about the request, not about a
+///   missing record.
+/// * A change that would leave NO active user holding `*:*` is refused
+///   with a 409, in the same transaction as the change: a deployment with
+///   no administrator is not a state an administrator can be talked into.
+///
+/// # Errors
+///
+/// 400 on a `{id}` that is not a UUID, on an unknown role name, and on a
+/// caller removing their own `*:*`; 404 for an unknown user and for a
+/// target the caller may not change (one body for both); 409 when the
+/// change would leave no active unrestricted user; 503 if no pool is
+/// configured; 500 (classified) on a storage failure. One
+/// `identity.user.roles.set` audit event is written on success, naming
+/// the old and the new role names.
+pub async fn set_user_roles(
+    State(state): State<AppState>,
+    AuthenticatedPrincipal(principal): AuthenticatedPrincipal,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> ApiResult<ApiJson<User>> {
+    let user_id = Uuid::parse_str(&id)
+        .map_err(|_| ApiError::BadRequest("user id must be a UUID".to_owned()))?;
+    let body: SetUserRolesBody = parse_body(&body)?;
+    let pool = pool(&state)?;
+
+    // The names as they will be stored: trimmed, and without the blanks a
+    // comma-separated list in a browser form leaves behind. Duplicates
+    // collapse — the role set is a set.
+    let mut requested: Vec<String> = Vec::new();
+    for raw in &body.roles {
+        let name = raw.trim();
+        if name.is_empty() {
+            continue;
+        }
+        if !requested.iter().any(|existing| existing == name) {
+            requested.push(name.to_owned());
+        }
+    }
+
+    // ADM-4 D5: only an unrestricted caller may change the roles of an
+    // unrestricted user. The refusal is the SAME 404 an unknown user
+    // gets, body for body, so a probe cannot tell the two apart.
+    //
+    // The answer is asked ONCE and kept: the same fact decides the
+    // self-lockout rule further down, and two reads could disagree (a
+    // concurrent change in between), which would make the two rules
+    // disagree with each other.
+    let target_holds_unrestricted =
+        lakehouse_auth::repository::user_holds_unrestricted(pool, user_id).await?;
+    if target_holds_unrestricted && !crate::routes::catalog::is_unrestricted(&principal) {
+        return Err(ApiError::NotFound("record not found".to_owned()).into());
+    }
+    // An unknown user is the same 404.
+    identity::get_user(pool, &user_id.to_string()).await?;
+
+    let mut tx = pool.begin().await.map_err(StoreError::from)?;
+
+    // The roles the user holds now — the audit's "before" half.
+    let old_roles = identity::user_role_names_in_tx(&mut tx, user_id).await?;
+
+    // The roles the request names, and what they grant.
+    let resolved = identity::resolve_roles_in_tx(&mut tx, &requested).await?;
+    let grants_unrestricted = resolved.iter().any(|role| {
+        lakehouse_auth::PermissionSet::parse(&role.permissions).grants_unrestricted()
+    });
+
+    // ADM-4 D5: only an unrestricted caller may GRANT a role that holds
+    // `*:*`. The refusal is the same 404 as above, and it comes BEFORE
+    // the unknown-name answer below: a caller who may not grant the
+    // unrestricted role learns nothing about which role names exist.
+    if grants_unrestricted && !crate::routes::catalog::is_unrestricted(&principal) {
+        return Err(ApiError::NotFound("record not found".to_owned()).into());
+    }
+
+    // ADM-4 D1: an unknown role name is a 400.
+    if resolved.len() != requested.len() {
+        let unknown = requested
+            .iter()
+            .find(|name| !resolved.iter().any(|role| role.name == name.as_str()))
+            .cloned()
+            .unwrap_or_default();
+        return Err(ApiError::BadRequest(format!(
+            "unknown role name: {}",
+            unknown.chars().take(64).collect::<String>()
+        ))
+        .into());
+    }
+
+    // ADM-4 D5: a caller may not remove their OWN `*:*`. The caller is
+    // the target here, so the answer is a 400 about the request — not a
+    // 404 (the target certainly exists) and not a 403 (the caller holds
+    // `identity:write`).
+    //
+    // The check comes AFTER the "would the deployment lose its
+    // administrator?" one below, because a caller who IS the last
+    // administrator is refused by THAT rule (a 409, naming the deployment
+    // as the reason) rather than by this one: it is the stronger,
+    // deployment-wide answer, and it is the one an operator needs to see.
+    let role_ids: Vec<Uuid> = resolved.iter().map(|role| role.id).collect();
+    identity::set_user_roles_in_tx(&mut tx, user_id, &role_ids).await?;
+
+    // ADM-4 D5: the change and the count that guards it are one unit of
+    // work. The count is read AFTER the change, inside the same
+    // transaction: an empty answer rolls the change back.
+    let administrators =
+        lakehouse_auth::repository::active_unrestricted_user_ids_in_tx(&mut tx).await?;
+    if administrators.is_empty() {
+        return Err(ApiError::Conflict(
+            "the change would leave no active administrator".to_owned(),
+        )
+        .into());
+    }
+
+    if let PrincipalId::User(caller_id) = principal.id
+        && caller_id == user_id
+        && target_holds_unrestricted
+        && !grants_unrestricted
+    {
+        return Err(ApiError::BadRequest(
+            "you may not remove your own unrestricted grant".to_owned(),
+        )
+        .into());
+    }
+
+    tx.commit().await.map_err(StoreError::from)?;
+
+    let user = identity::get_user(pool, &user_id.to_string()).await?;
+
+    // ADM-4 D6: the audit names the old AND the new role names, so an
+    // operator can see what the change took away.
+    let audit_event = user_roles_set_audit_event(&principal, &user, &old_roles, &requested);
+    if let Err(err) = store_audit::insert(pool, audit_event).await {
+        tracing::warn!(
+            %err,
+            action = "identity.user.roles.set",
+            user_id = %user_id,
+            "failed to record user-roles-set audit event"
+        );
+    }
+
+    Ok(ApiJson(user))
+}
+
+/// Build the `NewAuditEvent` for a role change — the actor, the target,
+/// and the role names before and after.
+fn user_roles_set_audit_event(
+    principal: &Principal,
+    user: &User,
+    old_roles: &[String],
+    new_roles: &[String],
+) -> NewAuditEvent {
+    NewAuditEvent {
+        action: "identity.user.roles.set".to_owned(),
+        resource_kind: Some("user".to_owned()),
+        resource_id: Some(user.id.clone()),
+        principal_id: Some(principal.id.uuid().to_string()),
+        principal_kind: Some(principal.kind_for_audit().to_owned()),
+        actor_label: Some(principal.display_name.clone()),
+        outcome: "executed".to_owned(),
+        args: Some(serde_json::json!({
+            "oldRoles": old_roles,
+            "newRoles": new_roles,
+        })),
+        ..Default::default()
+    }
+}
+
 // ── Roles ───────────────────────────────────────────────────────────────
 
 /// `GET /api/identity/roles` — every role, with its derived member count.

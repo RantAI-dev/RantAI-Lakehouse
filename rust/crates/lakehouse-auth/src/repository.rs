@@ -30,6 +30,7 @@ use uuid::Uuid;
 use crate::error::AuthError;
 use crate::permissions::PermissionSet;
 use crate::principal::{Principal, PrincipalId};
+use sqlx::{Postgres, Transaction};
 
 pub use lakehouse_store::PgPool;
 
@@ -94,6 +95,55 @@ pub async fn load_principal_for_user(
         return Err(AuthError::NotFound);
     };
 
+    let (permissions, role_names) = load_user_permissions(pool, user_id).await?;
+
+    // The lowest `tenant_id` first, whatever order the memberships were
+    // written in: a principal's FIRST tenant is who acts when a request
+    // carries no `X-Tenant` header — the chat, the saved-query tools and the
+    // catalog sample and profile fall back to it (SEC-20) — and an unordered
+    // read lets that choice follow the heap instead, so the same user could
+    // act as two different tenants on two requests.
+    let tenant_ids: Vec<(Uuid,)> = sqlx::query_as(
+        "SELECT tenant_id FROM app_user_tenant WHERE user_id = $1 ORDER BY tenant_id",
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(Principal {
+        id: PrincipalId::User(user_id),
+        tenant_ids: tenant_ids.into_iter().map(|(id,)| id).collect(),
+        display_name,
+        permissions,
+        provider,
+        must_change_password,
+        role_names,
+    })
+}
+
+/// The effective permissions of `user_id` — every role it holds, merged
+/// with every live access grant — together with the NAMES of the roles it
+/// holds.
+///
+/// This is the one place that reads a user's grants, and it is shared by
+/// [`load_principal_for_user`] (which turns the permissions into a
+/// [`Principal`]) and [`user_holds_unrestricted`] (which asks the same
+/// question of an account that may not act at all). Two readers of the same
+/// table would be free to disagree about what a user holds — and a
+/// disagreement there is a privilege-escalation hole, not a cosmetic
+/// difference.
+///
+/// The role names are returned separately from the permissions because
+/// they answer a different question: `permissions` is what the user MAY do,
+/// `role_names` is what the user IS (see [`crate::Principal::role_names`]).
+///
+/// # Errors
+///
+/// Returns [`AuthError::Database`] on any storage failure.
+async fn load_user_permissions(
+    pool: &PgPool,
+    user_id: Uuid,
+) -> Result<(PermissionSet, Vec<String>), AuthError> {
     let role_rows: Vec<(String, String)> = sqlx::query_as(
         "SELECT r.name, r.permissions FROM app_user_role ur \
          JOIN role r ON r.id = ur.role_id WHERE ur.user_id = $1",
@@ -123,29 +173,101 @@ pub async fn load_principal_for_user(
             .map(|(_, raw)| PermissionSet::parse(raw))
             .chain(grant_rows.iter().map(|(perm,)| PermissionSet::parse(perm))),
     );
+    Ok((permissions, role_names))
+}
 
-    // The lowest `tenant_id` first, whatever order the memberships were
-    // written in: a principal's FIRST tenant is who acts when a request
-    // carries no `X-Tenant` header — the chat, the saved-query tools and the
-    // catalog sample and profile fall back to it (SEC-20) — and an unordered
-    // read lets that choice follow the heap instead, so the same user could
-    // act as two different tenants on two requests.
-    let tenant_ids: Vec<(Uuid,)> = sqlx::query_as(
-        "SELECT tenant_id FROM app_user_tenant WHERE user_id = $1 ORDER BY tenant_id",
+/// Whether `user_id` holds the unrestricted `"*:*"` grant — the same
+/// computation [`load_principal_for_user`] performs on a principal's
+/// merged permissions, but WITHOUT asking whether the account may act at
+/// all.
+///
+/// ADM-4 D5 needs to ask "does this ACCOUNT hold the unrestricted grant?"
+/// about accounts that are not allowed to act: a deactivated one, for
+/// instance. Whether an account holds a grant is a fact about the
+/// account; whether it may sign in right now is a different question, and
+/// conflating the two would let a caller demote an account it is not
+/// allowed to demote.
+///
+/// # Errors
+///
+/// Returns [`AuthError::Database`] on any storage failure. An id that
+/// names no `app_user` row is not an error here: such an account holds no
+/// grant, which is the answer.
+pub async fn user_holds_unrestricted(pool: &PgPool, user_id: Uuid) -> Result<bool, AuthError> {
+    let (permissions, _role_names) = load_user_permissions(pool, user_id).await?;
+    Ok(permissions.grants_unrestricted())
+}
+
+/// The ids of every ACTIVE user who holds the unrestricted `"*:*"` grant
+/// right now — through a role, or through a live access grant.
+///
+/// ADM-4 D5: a change that would leave the deployment with no active
+/// unrestricted user is refused with a 409. The answer has to be read
+/// INSIDE the same transaction as the change it guards, or two concurrent
+/// changes could each see the other one still holding the grant, both be
+/// allowed, and leave nobody — so this takes the caller's transaction and
+/// the caller reads it AFTER applying the change (an empty answer then
+/// rolls the change back).
+///
+/// "Active" is `app_user.status = 'active'` — a deactivated account holds
+/// whatever it held, but a deactivated administrator is not an
+/// administrator who can sign in, so it does not keep the deployment
+/// administrable.
+///
+/// # Errors
+///
+/// Returns [`AuthError::Database`] on any storage failure.
+pub async fn active_unrestricted_user_ids_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+) -> Result<Vec<Uuid>, AuthError> {
+    // Which roles are unrestricted is a question about the ROLE's own
+    // `role.permissions` text, parsed by the same
+    // [`crate::permissions::PermissionSet`] every other grant is parsed
+    // by — never by a second, SQL-side token matcher that could disagree
+    // about what `*:*` means.
+    let role_rows: Vec<(Uuid, String)> = sqlx::query_as("SELECT id, permissions FROM role")
+        .fetch_all(&mut **tx)
+        .await?;
+    let unrestricted_role_ids: Vec<Uuid> = role_rows
+        .into_iter()
+        .filter(|(_, raw)| PermissionSet::parse(raw).grants_unrestricted())
+        .map(|(id, _)| id)
+        .collect();
+
+    let mut holders: Vec<Uuid> = Vec::new();
+    if !unrestricted_role_ids.is_empty() {
+        let role_holders: Vec<(Uuid,)> = sqlx::query_as(
+            "SELECT DISTINCT u.id FROM app_user u \
+             JOIN app_user_role ur ON ur.user_id = u.id \
+             WHERE u.status = 'active' AND ur.role_id = ANY($1)",
+        )
+        .bind(&unrestricted_role_ids)
+        .fetch_all(&mut **tx)
+        .await?;
+        holders.extend(role_holders.into_iter().map(|(id,)| id));
+    }
+
+    // An access grant is the OTHER way to hold a permission (WS7 item E4),
+    // so it is counted here too — a deployment whose only unrestricted
+    // holder got there through a grant is administrable, and one that does
+    // not is not.
+    let grant_rows: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT g.user_id, g.permission FROM access_grant g \
+         JOIN app_user u ON u.id = g.user_id \
+         WHERE g.revoked_at IS NULL AND g.expires_at > now() AND u.status = 'active'",
     )
-    .bind(user_id)
-    .fetch_all(pool)
+    .fetch_all(&mut **tx)
     .await?;
+    holders.extend(
+        grant_rows
+            .into_iter()
+            .filter(|(_, permission)| PermissionSet::parse(permission).grants_unrestricted())
+            .map(|(user_id, _)| user_id),
+    );
 
-    Ok(Principal {
-        id: PrincipalId::User(user_id),
-        tenant_ids: tenant_ids.into_iter().map(|(id,)| id).collect(),
-        display_name,
-        permissions,
-        provider,
-        must_change_password,
-        role_names,
-    })
+    holders.sort_unstable();
+    holders.dedup();
+    Ok(holders)
 }
 
 /// Merge the permissions of the roles named in `role_names`, exactly the

@@ -1047,6 +1047,19 @@ fn identity_router() -> Router<AppState> {
             "/api/identity/users/{id}/tenants/{tenant_id}",
             axum::routing::put(identity::add_user_to_tenant),
         )
+        // ADM-4 D2: take a user out of a tenant — the counterpart of the
+        // PUT above, under the same "who may" rule. `{id}` and
+        // `{tenant_id}` are validated inside the handler.
+        .route(
+            "/api/identity/users/{id}/tenants/{tenant_id}",
+            axum::routing::delete(identity::remove_user_from_tenant),
+        )
+        // ADM-4 D1: replace a user's local role set. The body names the
+        // user's COMPLETE role set; `{id}` is validated inside the handler.
+        .route(
+            "/api/identity/users/{id}/roles",
+            axum::routing::put(identity::set_user_roles),
+        )
         // ADM-3 D2: hand an existing user a new temporary password. The
         // password is generated server-side and returned once; `{id}` is
         // validated inside the handler (400 when malformed, 404 when
