@@ -173,12 +173,14 @@ const CATALOG_TENANT_REFUSAL_UNCONFIGURED: &str = "per-dataset tenant ownership 
 /// check; the whole point is "does this caller bypass every scope check",
 /// which is exactly what `"*:*"` means today, e.g. Platform Admin's seeded
 /// grant in `0002_seed_identity.sql`).
+///
+/// The answer comes from [`lakehouse_auth::PermissionSet::grants_unrestricted`]
+/// — the ONE definition of "unrestricted" in the workspace, shared with the
+/// rules that ask it of an ACCOUNT rather than of a request (ADM-4 D5). Two
+/// definitions of the same word could disagree about who counts as
+/// unrestricted, and that disagreement is a privilege-escalation hole.
 pub(crate) fn is_unrestricted(principal: &Principal) -> bool {
-    principal
-        .permissions
-        .as_strings()
-        .iter()
-        .any(|p| p == "*:*")
+    principal.permissions.grants_unrestricted()
 }
 
 /// `None` when `principal` may read the shared catalog / `Dagster` job

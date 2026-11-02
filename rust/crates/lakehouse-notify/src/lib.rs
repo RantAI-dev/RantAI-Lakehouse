@@ -11,11 +11,15 @@
 //!   configured; the server never hardcodes a password in code or a
 //!   database.
 
+mod smtp_ca;
+mod smtp_tls;
 mod webhook;
 
 #[cfg(any(test, feature = "test-support"))]
 pub use webhook::MappedResolver;
 pub use webhook::{ResolveFuture, TargetRefusal, TargetResolver, WebhookError, WebhookSender};
+
+pub use smtp_ca::{CaBundleError, SmtpCaBundle};
 
 use std::future::Future;
 use std::pin::Pin;
@@ -53,6 +57,14 @@ pub enum DeliveryFailure {
     MailServerUnreachable,
     /// The mail server answered and refused the message.
     MailServerRefused,
+    /// A secure connection to the mail server could not be made
+    /// (`SEC-56` D7): the handshake failed — an untrusted certificate, or a
+    /// name that is not on the certificate.
+    ///
+    /// This is the reason that tells an operator to look at `SMTP_CA_FILE`
+    /// and `SMTP_HOST`; without it a private-CA relay and a wrong host
+    /// would both say "the mail server could not be reached".
+    MailServerTlsFailed,
     /// The rule names a channel this build does not send to.
     ChannelUnsupported,
 }
@@ -71,6 +83,7 @@ impl DeliveryFailure {
             Self::EmailAddressRefused => "the e-mail address was refused",
             Self::MailServerUnreachable => "the mail server could not be reached",
             Self::MailServerRefused => "the mail server refused the message",
+            Self::MailServerTlsFailed => "a secure connection to the mail server could not be made",
             Self::ChannelUnsupported => "the rule's channel is not supported",
         }
     }
@@ -133,6 +146,14 @@ pub struct SmtpConfig {
     /// `SMTP_FROM` (already resolved with its `??` fallback chain by the
     /// caller).
     pub from: String,
+    /// The CA certificates the relay's own certificate may chain to
+    /// (`SEC-56` D1).
+    ///
+    /// `None` means "no bundle": the transport is built exactly as it was
+    /// before this setting existed (D1) and trusts the built-in roots only.
+    /// A bundle's CAs are ADDED to those roots, never put in their place
+    /// (D2), and the hostname check stays on (D3).
+    pub ca_bundle: Option<SmtpCaBundle>,
 }
 
 /// The `From` mailbox: `from` when it parses, else a syntactically valid
@@ -282,8 +303,9 @@ impl EmailSender {
     ///    anything else.
     /// 2. `to` empty or missing `@` → [`DeliveryFailure::EmailAddressRefused`].
     /// 3. Otherwise, connect and send; a failure is classified into
-    ///    [`DeliveryFailure::MailServerUnreachable`] or
-    ///    [`DeliveryFailure::MailServerRefused`] (`SRC-17` F1: the
+    ///    [`DeliveryFailure::MailServerUnreachable`],
+    ///    [`DeliveryFailure::MailServerRefused`] or
+    ///    [`DeliveryFailure::MailServerTlsFailed`] (`SRC-17` F1: the
     ///    transport's own message is never returned).
     ///
     /// # Errors
@@ -348,6 +370,18 @@ impl EmailSender {
             return DeliverResult::err(DeliveryFailure::MailServerUnreachable);
         };
         let mut builder = builder.port(self.config.port);
+        // `SEC-56` D1: with no bundle the transport is the one built above,
+        // unchanged. With a bundle, the parameters are rebuilt so the
+        // bundle's CAs are trusted ON TOP OF the built-in roots (D2), in
+        // the same TLS mode as before — implicit TLS when `SMTP_SECURE` is
+        // in effect, `STARTTLS` required otherwise, never plaintext and
+        // never opportunistic (D3, D4).
+        if let Some(bundle) = &self.config.ca_bundle {
+            let Ok(parameters) = smtp_tls::parameters(host, bundle) else {
+                return DeliverResult::err(DeliveryFailure::MailServerTlsFailed);
+            };
+            builder = builder.tls(smtp_tls::mode(self.config.secure, parameters));
+        }
         if let Some(user) = &self.config.user {
             builder = builder.credentials(Credentials::new(user.clone(), self.config.pass.clone()));
         }
@@ -355,6 +389,14 @@ impl EmailSender {
 
         match transport.send(message).await {
             Ok(_) => DeliverResult::ok(),
+            // `SEC-56` D7: a failed handshake has its own reason, so an
+            // operator is told to look at `SMTP_CA_FILE` and `SMTP_HOST`
+            // instead of "the mail server could not be reached". Checked
+            // before the reply branch: a TLS failure is neither a
+            // transient nor a permanent reply.
+            Err(err) if smtp_tls::is_failure(&err) => {
+                DeliverResult::err(DeliveryFailure::MailServerTlsFailed)
+            }
             // `SRC-17` F1: an `SMTP` reply (transient or permanent) means
             // the server answered and refused; anything else (connect, TLS,
             // timeout) means it was not reached. The reply text is dropped.
@@ -632,7 +674,24 @@ mod tests {
             user: Some("bot@example.com".to_owned()),
             pass: "hunter2".to_owned(),
             from: "rantai-lake@localhost".to_owned(),
+            ca_bundle: None,
         }
+    }
+
+    /// `SEC-56` D9: the config keeps its `derive(Debug)`, and the bundle
+    /// prints a count — never a PEM.
+    #[test]
+    fn a_config_with_a_ca_bundle_prints_the_count_and_no_pem() {
+        let mut config = cfg(Some("relay.example.com"));
+        config.ca_bundle = Some(
+            SmtpCaBundle::from_pem(
+                crate::smtp_ca::test_support::minted_certificate(&["relay.example.com"]).as_bytes(),
+            )
+            .unwrap(),
+        );
+        let text = format!("{config:?}");
+        assert!(text.contains("certificates: 1"), "{text}");
+        assert!(!text.contains("BEGIN CERTIFICATE"), "{text}");
     }
 
     #[tokio::test]
@@ -804,6 +863,10 @@ mod tests {
             (
                 DeliveryFailure::MailServerRefused,
                 "the mail server refused the message",
+            ),
+            (
+                DeliveryFailure::MailServerTlsFailed,
+                "a secure connection to the mail server could not be made",
             ),
             (
                 DeliveryFailure::ChannelUnsupported,

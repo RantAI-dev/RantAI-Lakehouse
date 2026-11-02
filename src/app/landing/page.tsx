@@ -24,6 +24,12 @@ export const viewport: Viewport = {
  * Public route: `/landing`. Outside the authenticated shell (see `AppFrame`
  * and `PUBLIC_PREFIXES`). The `<noscript>` rule keeps the scroll-reveal
  * sections readable when JavaScript is off.
+ *
+ * The dev server (`bun run dev`) serves this route from the source tree. An
+ * installed Lakehouse does not contain it: the console image excludes
+ * `src/app/landing` and `src/features/landing` (WEB-2, product owner
+ * 2026-11-02), so there `/landing` answers with the console's
+ * page-not-found.
  */
 export default function Page() {
   return (
