@@ -223,17 +223,31 @@ pub fn compose_stop_all(dir: &Path, env_file: &Path) -> Result<(), String> {
 /// The output is Compose's own JSON, one object per service. The
 /// caller reads it (REL-2 S4 decision D19).
 ///
+/// Every profile is asked for: the Dagster services are in the
+/// `dagster` profile, and a status that hid a running service would be
+/// a status that lied (REL-2 S4b review round 3 BLOCKER 3, decision
+/// D22).
+///
 /// # Errors
 ///
 /// Returns the message that says what to fix when Compose fails.
 pub fn compose_ps(dir: &Path, env_file: &Path) -> Result<String, String> {
-    let mut args = compose_args(dir, env_file);
-    args.push("ps".to_string());
-    args.push("--format".to_string());
-    args.push("json".to_string());
+    let args = compose_ps_args(dir, env_file);
     let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
     sys::output_or_stderr("docker", &borrowed)
         .map_err(|error| format!("the state of the stack could not be read: {error}"))
+}
+
+/// The `docker compose` arguments that read the services' state.
+///
+/// The list is built apart from the call, so a test can read it.
+fn compose_ps_args(dir: &Path, env_file: &Path) -> Vec<String> {
+    let mut args = compose_args(dir, env_file);
+    args.extend(all_profiles());
+    args.push("ps".to_string());
+    args.push("--format".to_string());
+    args.push("json".to_string());
+    args
 }
 
 #[cfg(test)]
@@ -276,6 +290,26 @@ mod tests {
         );
         assert!(
             args.contains(&"-d".to_string()),
+            "the arguments are {args:?}"
+        );
+    }
+
+    #[test]
+    fn the_status_asks_for_every_profile() {
+        // REL-2 S4b review round 3 BLOCKER 3, decision D22: the Dagster
+        // services are in the `dagster` profile, and the status must
+        // list them — a status that hid a running service would be a
+        // status that lied.
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let env = directory.path().join(".env");
+        let args = compose_ps_args(directory.path(), &env);
+        let profile = args
+            .iter()
+            .position(|arg| arg == "--profile")
+            .expect("--profile is there");
+        assert_eq!(args.get(profile + 1).map(String::as_str), Some("*"));
+        assert!(
+            args.contains(&"ps".to_string()),
             "the arguments are {args:?}"
         );
     }

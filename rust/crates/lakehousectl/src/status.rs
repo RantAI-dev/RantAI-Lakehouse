@@ -346,6 +346,33 @@ mod tests {
     }
 
     #[test]
+    fn the_report_shows_the_dagster_services() {
+        // REL-2 S4b review round 3 BLOCKER 3, decision D22: the Dagster
+        // services are in the `dagster` profile, and the status must
+        // list them — a status that hid a running service would be a
+        // status that lied.
+        let mut facts = facts_of();
+        facts.services = concat!(
+            "{\"Name\":\"dagster-daemon-1\",\"Service\":\"dagster-daemon\",\"State\":\"running\",\
+             \"Status\":\"Up 3 minutes\",\"Health\":\"healthy\"}\n",
+            "{\"Name\":\"dagster-code-location-1\",\"Service\":\"dagster-code-location\",\
+             \"State\":\"running\",\"Status\":\"Up 3 minutes\",\"Health\":\"healthy\"}\n",
+        )
+        .to_string();
+
+        let report = report(&facts);
+
+        assert!(
+            report.contains("dagster-daemon: running"),
+            "the report does not show the Dagster daemon: {report}"
+        );
+        assert!(
+            report.contains("dagster-code-location: running"),
+            "the report does not show the Dagster code location: {report}"
+        );
+    }
+
+    #[test]
     fn the_report_shows_the_api() {
         let report = report(&facts_of());
         assert!(

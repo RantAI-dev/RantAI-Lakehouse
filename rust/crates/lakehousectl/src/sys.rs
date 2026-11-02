@@ -175,6 +175,15 @@ pub fn port_is_busy(port: u16) -> Result<bool, std::io::Error> {
     }
 }
 
+/// Whether a TCP port on the host is free.
+///
+/// A port that could not be checked counts as free: the check is a
+/// convenience, and the stack's own error says what a taken port does.
+#[must_use]
+pub fn port_is_free(port: u16) -> bool {
+    !port_is_busy(port).unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]

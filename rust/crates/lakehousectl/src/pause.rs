@@ -31,6 +31,7 @@
 
 use std::path::Path;
 
+use crate::env;
 use crate::error::ToolError;
 use crate::runner::Runner;
 
@@ -113,31 +114,14 @@ pub fn clear_and_recreate(dir: &Path, runner: &mut dyn Runner) -> Result<(), Too
 /// A line that sets the variable already is REPLACED, so the file never
 /// holds two of them and the last one is not the one that counts.
 fn with_variable(text: &str, value: &str) -> String {
-    let mut lines: Vec<String> = Vec::new();
-    let mut replaced = false;
-    for line in text.lines() {
-        if name_of(line).is_some_and(|name| name == VARIABLE) {
-            if !replaced {
-                lines.push(format!("{VARIABLE}={value}"));
-                replaced = true;
-            }
-            continue;
-        }
-        lines.push(line.to_string());
-    }
-    if !replaced {
-        lines.push(format!("{VARIABLE}={value}"));
-    }
-    let mut out = lines.join("\n");
-    out.push('\n');
-    out
+    env::with_variable(text, VARIABLE, value)
 }
 
 /// The `.env` with the variable's line removed.
 fn without_variable(text: &str) -> String {
     let mut lines: Vec<String> = Vec::new();
     for line in text.lines() {
-        if name_of(line).is_some_and(|name| name == VARIABLE) {
+        if env::name_of(line).is_some_and(|name| name == VARIABLE) {
             continue;
         }
         lines.push(line.to_string());
@@ -145,19 +129,6 @@ fn without_variable(text: &str) -> String {
     let mut out = lines.join("\n");
     out.push('\n');
     out
-}
-
-/// The name a line sets, when it sets one.
-///
-/// A commented-out line sets nothing, and a line without `=` is not a
-/// setting.
-fn name_of(line: &str) -> Option<&str> {
-    let line = line.trim();
-    if line.is_empty() || line.starts_with('#') {
-        return None;
-    }
-    let (name, _) = line.split_once('=')?;
-    Some(name.trim())
 }
 
 /// Read the `.env`.

@@ -55,6 +55,15 @@
 //!   goes through the stops, one release at a time. That needs the
 //!   network — an air-gapped host is refused, and the refusal names
 //!   the bundles it would need.
+//!
+//! # The profiles (D22)
+//!
+//! The Dagster services carry the `dagster` profile, so a stack that
+//! does not run it runs no pipelines at all: no upload loads, no
+//! connector runs, no maintenance jobs. The install's `.env` names the
+//! profiles, and an older install's `.env` names none — so the update
+//! adds `COMPOSE_PROFILES=dagster` before it starts anything. An
+//! operator's own value is kept (REL-2 S4b review round 3 BLOCKER 3).
 
 use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
@@ -69,7 +78,9 @@ use crate::preflight;
 use crate::release;
 use crate::rollback;
 use crate::runner::{self, Local, Runner};
+use crate::secrets;
 use crate::state;
+use crate::sys;
 use crate::verify;
 use crate::version;
 
@@ -277,6 +288,20 @@ pub fn run(dir: &Path, facts: &Facts, runner: &mut dyn Runner) -> Result<(), Too
     })?;
     let new_version = facts.manifest.version.clone();
 
+    // The profiles, before anything is started (REL-2 S4b review round 3
+    // BLOCKER 3, decision D22).
+    //
+    // The Dagster services carry the `dagster` profile, and a stack
+    // that does not run it runs no pipelines at all. The install's
+    // `.env` names the profiles, and an older install's `.env` names
+    // none — so the update adds it here, BEFORE step 4, while nothing
+    // that is running has been touched. An operator's own value is
+    // kept.
+    //
+    // The failure is the update's: a stack that starts without the
+    // profile would run no pipeline, and say nothing about it.
+    set_profiles(dir)?;
+
     // Step 3 — the pre-flight, the staged files and the images. Nothing
     // that is RUNNING is touched before this step succeeds.
     if !facts.preflight.is_empty() {
@@ -387,6 +412,38 @@ pub fn run(dir: &Path, facts: &Facts, runner: &mut dyn Runner) -> Result<(), Too
     }
     println!("lakehousectl: the stack runs {new_version}.");
     Ok(())
+}
+
+/// Make the install's `.env` name the release's profiles.
+///
+/// The Dagster services carry the `dagster` profile, and a stack that
+/// does not run it runs no pipelines at all: no upload loads, no
+/// connector runs, no maintenance jobs. The install's `.env` names the
+/// profiles, and an older install's `.env` names none — so the update
+/// adds `COMPOSE_PROFILES=dagster` before it starts anything. An
+/// operator's own value is kept (REL-2 S4b review round 3 BLOCKER 3,
+/// decision D22).
+///
+/// # Errors
+///
+/// Returns the error that says the profiles could not be set: a stack
+/// that starts without them would run no pipeline, and say nothing
+/// about it.
+fn set_profiles(dir: &Path) -> Result<(), ToolError> {
+    match secrets::ensure_release_profiles(dir, sys::port_is_free) {
+        Ok(true) => {
+            println!(
+                "lakehousectl: the install now runs the {} profile.",
+                secrets::RELEASE_PROFILES
+            );
+            Ok(())
+        }
+        Ok(false) => Ok(()),
+        Err(error) => Err(ToolError::Failed(format!(
+            "the install's profiles could not be set: {error}. The stack would run without the \
+             Dagster services, so no pipeline would run at all."
+        ))),
+    }
 }
 
 /// The error of an update that stopped before it swapped anything.
@@ -1280,6 +1337,72 @@ mod tests {
         assert!(
             path.join("release.json.previous").exists(),
             "the old manifest was not kept"
+        );
+    }
+
+    #[test]
+    fn the_update_adds_the_dagster_profile_to_an_older_install() {
+        // REL-2 S4b review round 3 BLOCKER 3, decision D22: the Dagster
+        // services carry the `dagster` profile, so a stack that does not
+        // run it runs no pipelines at all. An older install's `.env`
+        // names no profile, so the update adds it.
+        let (_directory, path) = install_with_state("0.1.0");
+        let manifest = manifest_of("0.2.0", Some("0.0.0"), &[]);
+        let facts = facts_of(&path, &manifest);
+        let mut runner = Fake::new(&path);
+
+        run(&path, &facts, &mut runner).expect("the update runs");
+
+        let env = std::fs::read_to_string(path.join(".env")).expect("the env file is readable");
+        assert_eq!(
+            secrets::read_value(&env, secrets::PROFILES_VARIABLE).as_deref(),
+            Some(secrets::RELEASE_PROFILES),
+            "the install names no profile: {env}"
+        );
+    }
+
+    #[test]
+    fn the_update_keeps_the_profiles_an_operator_set() {
+        // D22: the profiles an operator set are theirs, and the update
+        // does not touch them.
+        let (_directory, path) = install_with_state("0.1.0");
+        std::fs::write(path.join(".env"), "COMPOSE_PROFILES=dagster,trino\n")
+            .expect("the env file is written");
+        let manifest = manifest_of("0.2.0", Some("0.0.0"), &[]);
+        let facts = facts_of(&path, &manifest);
+        let mut runner = Fake::new(&path);
+
+        run(&path, &facts, &mut runner).expect("the update runs");
+
+        let env = std::fs::read_to_string(path.join(".env")).expect("the env file is readable");
+        assert_eq!(
+            secrets::read_value(&env, secrets::PROFILES_VARIABLE).as_deref(),
+            Some("dagster,trino"),
+            "the operator's own profiles were replaced: {env}"
+        );
+    }
+
+    #[test]
+    fn the_update_sets_the_profiles_before_it_starts_the_stack() {
+        // The `.env` is read when the services are CREATED, so the
+        // profile has to be in it before the first start — otherwise the
+        // stack runs without the Dagster services (REL-2 S4b review
+        // round 3 BLOCKER 3, decision D22).
+        let (_directory, path) = install_with_state("0.1.0");
+        let manifest = manifest_of("0.2.0", Some("0.0.0"), &[]);
+        let facts = facts_of(&path, &manifest);
+        let mut runner = Fake::new(&path);
+
+        run(&path, &facts, &mut runner).expect("the update runs");
+
+        let env = std::fs::read_to_string(path.join(".env")).expect("the env file is readable");
+        assert!(
+            env.contains(&format!(
+                "{}={}",
+                secrets::PROFILES_VARIABLE,
+                secrets::RELEASE_PROFILES
+            )),
+            "the install names no profile: {env}"
         );
     }
 

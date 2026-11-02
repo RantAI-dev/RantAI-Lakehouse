@@ -23,11 +23,38 @@
 //! - the tenant warehouse pair may equal the `RustFS` pair (ADR 0002
 //!   Addendum 2, "may equal, must never alias"), the way
 //!   `init-env.sh` fills it.
+//!
+//! # The profiles
+//!
+//! The Dagster services carry the `dagster` profile, so a stack that
+//! does not run it runs no pipelines at all: no upload loads, no
+//! connector runs, no maintenance jobs. A release install runs that
+//! profile, and the install's `.env` is where it says so: Compose
+//! reads `COMPOSE_PROFILES` from the file it is given with
+//! `--env-file` (REL-2 S4b review round 3 BLOCKER 3, decision D22).
+//!
+//! So a fresh install writes `COMPOSE_PROFILES=dagster`, and the
+//! update adds it to an older install's `.env` when the file names no
+//! profile. An operator's own value is KEPT — the profiles an
+//! operator set are theirs, and the operator adds `trino` or
+//! `seaweedfs` there.
+//!
+//! # The ports the profile needs
+//!
+//! Turning the profile on needs one more thing: the Dagster webserver
+//! and the console both publish host port 3000 by default, and two
+//! services cannot hold the same host port — `docker compose up` fails
+//! with "port is already allocated" and the stack does not start. So
+//! the webserver is given a port of its own when the tool turns the
+//! profile on: the first free one above the console's.
 
+use std::fmt::Write as _;
 use std::path::Path;
 
 use base64::Engine as _;
 use rand::Rng;
+
+use crate::env;
 
 /// The template the `.env` is written from.
 ///
@@ -61,6 +88,33 @@ const HEX_BYTES: usize = 24;
 /// How many bytes the base64 value holds.
 const BASE64_BYTES: usize = 32;
 
+/// The variable Compose reads the profiles from.
+///
+/// The Dagster services carry the `dagster` profile, and Compose reads
+/// the profiles to run from the file it is given with `--env-file` —
+/// which is the install's own `.env` (REL-2 S4b review round 3
+/// BLOCKER 3, decision D22).
+pub const PROFILES_VARIABLE: &str = "COMPOSE_PROFILES";
+
+/// The profiles a release install runs.
+///
+/// The Dagster services carry the `dagster` profile, and a stack that
+/// does not run it runs no pipelines at all (REL-2 S4b review round 3
+/// BLOCKER 3, decision D22).
+pub const RELEASE_PROFILES: &str = "dagster";
+
+/// The variable the console's host port comes from.
+pub const CONSOLE_PORT_VARIABLE: &str = "CONSOLE_HOST_PORT";
+
+/// The variable the Dagster webserver's host port comes from.
+pub const DAGSTER_WEBSERVER_PORT_VARIABLE: &str = "DAGSTER_WEBSERVER_HOST_PORT";
+
+/// The port the console publishes on when the `.env` does not say.
+const DEFAULT_CONSOLE_PORT: u16 = 3000;
+
+/// How many ports above the console's the tool looks at for a free one.
+const PORT_SEARCH: u16 = 100;
+
 /// What a fresh `.env` carries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Secrets {
@@ -75,11 +129,19 @@ pub struct Secrets {
 
 /// Write the install's `.env`, if it is not there yet.
 ///
+/// The release's profiles are named in the file either way: a fresh
+/// install writes them, and an existing `.env` that names none gets
+/// them (REL-2 S4b review round 3 BLOCKER 3, decision D22). The
+/// operator's own VALUES are never changed.
+///
+/// `is_free` says whether a host port is free: the tool uses it to
+/// give the Dagster webserver a port of its own.
+///
 /// # Errors
 ///
 /// Returns the error the operating system gave when the file could not
 /// be written.
-pub fn write_env(path: &Path) -> Result<Secrets, std::io::Error> {
+pub fn write_env(path: &Path, is_free: impl Fn(u16) -> bool) -> Result<Secrets, std::io::Error> {
     if path.exists() {
         // Never overwritten. The mode is still set: a `.env` an
         // operator copied around must not be readable by anyone else.
@@ -89,8 +151,16 @@ pub fn write_env(path: &Path) -> Result<Secrets, std::io::Error> {
         // address the tool prints is the one the stack will use (REL-2
         // S3 review round 1 SHOULD-FIX 4).
         let text = std::fs::read_to_string(path)?;
+        // The profiles are added when the file names none: the Dagster
+        // services carry the `dagster` profile, and a stack that does
+        // not run it runs no pipelines at all (REL-2 S4b review round 3
+        // BLOCKER 3, decision D22).
+        let with_profiles = with_release_profiles(&text, is_free);
+        if with_profiles != text {
+            write_replacing(path, &with_profiles)?;
+        }
         return Ok(Secrets {
-            admin_email: read_value(&text, "AUTH_BOOTSTRAP_EMAIL").unwrap_or_default(),
+            admin_email: read_value(&with_profiles, "AUTH_BOOTSTRAP_EMAIL").unwrap_or_default(),
             admin_password: None,
         });
     }
@@ -127,15 +197,19 @@ pub fn write_env(path: &Path) -> Result<Secrets, std::io::Error> {
         replace_assignment(&mut text, TENANT_SECRET_KEY, &value);
     }
 
+    // The release runs the `dagster` profile, and the template names no
+    // profile: the key is added, so the stack the install starts runs
+    // the Dagster services (REL-2 S4b review round 3 BLOCKER 3,
+    // decision D22).
+    let text = with_release_profiles(&text, is_free);
+
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     // The file is written through a temporary one, so a half-written
     // `.env` is never left behind, and it is never readable by anyone
     // but its owner.
-    let temporary = path.with_extension("env.new");
-    write_owner_only(&temporary, &text)?;
-    std::fs::rename(&temporary, path)?;
+    write_replacing(path, &text)?;
 
     let admin_password = generated
         .iter()
@@ -145,6 +219,122 @@ pub fn write_env(path: &Path) -> Result<Secrets, std::io::Error> {
         admin_email: read_value(&text, "AUTH_BOOTSTRAP_EMAIL").unwrap_or_default(),
         admin_password,
     })
+}
+
+/// The `.env` with the release's profiles, when it names none.
+///
+/// The tool turns the `dagster` profile ON when the file names no
+/// profile: the Dagster services carry it, and a stack that does not
+/// run it runs no pipelines at all — no upload loads, no connector
+/// runs, no maintenance jobs (REL-2 S4b review round 3 BLOCKER 3,
+/// decision D22).
+///
+/// A file that SETS the variable is left alone: the profiles an
+/// operator set are theirs, and the operator adds `trino` or
+/// `seaweedfs` there. A commented-out line sets nothing, so it does
+/// not count.
+///
+/// Turning the profile on also gives the Dagster webserver a host port
+/// of its own — see [`with_dagster_webserver_port`].
+fn with_release_profiles(text: &str, is_free: impl Fn(u16) -> bool) -> String {
+    let with_profiles = with_the_profiles(text);
+    if with_profiles == text {
+        // The operator's own profiles: the tool changes nothing.
+        return text.to_string();
+    }
+    with_dagster_webserver_port(&with_profiles, is_free)
+}
+
+/// The `.env` with `COMPOSE_PROFILES=dagster`, when it names no
+/// profile.
+fn with_the_profiles(text: &str) -> String {
+    if read_value(text, PROFILES_VARIABLE).is_some() {
+        return text.to_string();
+    }
+    let mut out = text.to_string();
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    let _ = writeln!(out, "{PROFILES_VARIABLE}={RELEASE_PROFILES}");
+    out
+}
+
+/// The `.env` with the Dagster webserver's own host port.
+///
+/// The webserver and the console both publish host port 3000 by
+/// default, and two services cannot hold the same host port: with the
+/// `dagster` profile on, `docker compose up` fails with "Bind for
+/// 0.0.0.0:3000 failed: port is already allocated" and the stack does
+/// not start at all (REL-2 S4b review round 3 BLOCKER 3, decision
+/// D22).
+///
+/// So the webserver is given a port of its own: the first free one
+/// above the console's. A webserver that already has a port of its own
+/// keeps it — the operator's value is theirs.
+fn with_dagster_webserver_port(text: &str, is_free: impl Fn(u16) -> bool) -> String {
+    let console = port_of(text, CONSOLE_PORT_VARIABLE).unwrap_or(DEFAULT_CONSOLE_PORT);
+    if port_of(text, DAGSTER_WEBSERVER_PORT_VARIABLE).is_some_and(|port| port != console) {
+        // It already has a port of its own: the operator's value is
+        // kept.
+        return text.to_string();
+    }
+    let Some(port) = (console.saturating_add(1)..=console.saturating_add(PORT_SEARCH))
+        .find(|port| is_free(*port))
+    else {
+        // No free port was found: the file is left as it is, and the
+        // stack's own error says what a taken port does.
+        return text.to_string();
+    };
+    env::with_variable(text, DAGSTER_WEBSERVER_PORT_VARIABLE, &port.to_string())
+}
+
+/// The port a `.env` sets for a variable.
+///
+/// A value that is not a port is not a port: there is none.
+fn port_of(text: &str, name: &str) -> Option<u16> {
+    read_value(text, name)?.trim().parse().ok()
+}
+
+/// Make the install's `.env` name the release's profiles.
+///
+/// An older install's `.env` names none: the Dagster services carry
+/// the `dagster` profile, and a stack that does not run it runs no
+/// pipelines at all — no upload loads, no connector runs, no
+/// maintenance jobs (REL-2 S4b review round 3 BLOCKER 3, decision
+/// D22). The key is ADDED when the file names no profile, and an
+/// operator's own value is kept.
+///
+/// `is_free` says whether a host port is free: the tool uses it to
+/// give the Dagster webserver a port of its own.
+///
+/// Returns whether the file was changed.
+///
+/// # Errors
+///
+/// Returns the error the operating system gave when the file could not
+/// be read or written.
+pub fn ensure_release_profiles(
+    dir: &Path,
+    is_free: impl Fn(u16) -> bool,
+) -> Result<bool, std::io::Error> {
+    let path = dir.join(".env");
+    let text = std::fs::read_to_string(&path).map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!("{} could not be read: {error}", path.display()),
+        )
+    })?;
+    let with_profiles = with_release_profiles(&text, is_free);
+    if with_profiles == text {
+        return Ok(false);
+    }
+    write_replacing(&path, &with_profiles).map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!("{} could not be written: {error}", path.display()),
+        )
+    })?;
+    Ok(true)
 }
 
 /// The value a `.env` sets for a key.
@@ -224,6 +414,17 @@ fn write_owner_only(path: &Path, text: &str) -> Result<(), std::io::Error> {
     file.sync_all()
 }
 
+/// Write a file through a temporary one, and put it in place.
+///
+/// The file is written through a temporary one, so a half-written
+/// `.env` is never left behind, and it is never readable by anyone but
+/// its owner.
+fn write_replacing(path: &Path, text: &str) -> Result<(), std::io::Error> {
+    let temporary = path.with_extension("env.new");
+    write_owner_only(&temporary, text)?;
+    std::fs::rename(&temporary, path)
+}
+
 /// Make a file readable by its owner alone.
 fn set_owner_only(path: &Path) -> Result<(), std::io::Error> {
     use std::os::unix::fs::PermissionsExt;
@@ -235,6 +436,11 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    /// Every host port is free: the tests do not ask the machine.
+    fn every_port_is_free(_port: u16) -> bool {
+        true
+    }
 
     #[test]
     fn every_key_the_template_leaves_empty_is_filled() {
@@ -291,7 +497,7 @@ mod tests {
     fn a_fresh_env_holds_every_secret_and_the_admin_password() {
         let directory = tempfile::tempdir().expect("a temporary directory");
         let path = directory.path().join(".env");
-        let secrets = write_env(&path).expect("the .env is written");
+        let secrets = write_env(&path, every_port_is_free).expect("the .env is written");
         let text = std::fs::read_to_string(&path).expect("the .env is readable");
 
         for name in FILLED_HEX {
@@ -318,9 +524,9 @@ mod tests {
     fn a_second_run_changes_nothing() {
         let directory = tempfile::tempdir().expect("a temporary directory");
         let path = directory.path().join(".env");
-        let first = write_env(&path).expect("the .env is written");
+        let first = write_env(&path, every_port_is_free).expect("the .env is written");
         let before = std::fs::read_to_string(&path).expect("the .env is readable");
-        let second = write_env(&path).expect("the second run works");
+        let second = write_env(&path, every_port_is_free).expect("the second run works");
         let after = std::fs::read_to_string(&path).expect("the .env is readable");
 
         assert_eq!(before, after, "the second run changed the .env");
@@ -335,7 +541,7 @@ mod tests {
     fn a_fresh_env_takes_the_administrators_email_from_the_template() {
         let directory = tempfile::tempdir().expect("a temporary directory");
         let path = directory.path().join(".env");
-        let secrets = write_env(&path).expect("the .env is written");
+        let secrets = write_env(&path, every_port_is_free).expect("the .env is written");
         assert_eq!(
             secrets.admin_email,
             read_value(ENV_EXAMPLE, "AUTH_BOOTSTRAP_EMAIL").unwrap_or_default(),
@@ -353,7 +559,7 @@ mod tests {
         std::fs::write(&path, "AUTH_BOOTSTRAP_EMAIL=operator@example.org\n")
             .expect("the .env is written");
 
-        let secrets = write_env(&path).expect("the .env is read");
+        let secrets = write_env(&path, every_port_is_free).expect("the .env is read");
         assert_eq!(
             secrets.admin_email, "operator@example.org",
             "the email of the template was shown instead of the one the .env holds"
@@ -366,11 +572,260 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let directory = tempfile::tempdir().expect("a temporary directory");
         let path = directory.path().join(".env");
-        write_env(&path).expect("the .env is written");
+        write_env(&path, every_port_is_free).expect("the .env is written");
         let mode = std::fs::metadata(&path)
             .expect("the .env has metadata")
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600, "the .env is mode {mode:o}");
+    }
+
+    #[test]
+    fn a_fresh_env_runs_the_dagster_profile() {
+        // REL-2 S4b review round 3 BLOCKER 3, decision D22: the Dagster
+        // services carry the `dagster` profile, so a stack that does not
+        // run it runs no pipelines at all.
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join(".env");
+
+        write_env(&path, every_port_is_free).expect("the .env is written");
+
+        let text = std::fs::read_to_string(&path).expect("the .env is readable");
+        assert_eq!(
+            read_value(&text, PROFILES_VARIABLE).as_deref(),
+            Some(RELEASE_PROFILES),
+            "the .env names no profile: {text}"
+        );
+    }
+
+    #[test]
+    fn an_env_that_names_no_profile_gets_the_releases_one() {
+        // An older install's `.env` names no profile: the install adds
+        // it, and the operator's own values are kept (REL-2 S4b review
+        // round 3 BLOCKER 3, decision D22).
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join(".env");
+        std::fs::write(&path, "POSTGRES_PASSWORD=secret\n").expect("the .env is written");
+
+        write_env(&path, every_port_is_free).expect("the .env is read");
+
+        let text = std::fs::read_to_string(&path).expect("the .env is readable");
+        assert_eq!(
+            read_value(&text, PROFILES_VARIABLE).as_deref(),
+            Some(RELEASE_PROFILES),
+            "the .env names no profile: {text}"
+        );
+        assert!(
+            text.contains("POSTGRES_PASSWORD=secret"),
+            "the operator's own values were lost: {text}"
+        );
+    }
+
+    #[test]
+    fn the_profiles_an_operator_set_are_kept() {
+        // REL-2 S4b review round 3 BLOCKER 3, decision D22: "The
+        // operator adds `trino` or `seaweedfs` there."
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join(".env");
+        std::fs::write(&path, "COMPOSE_PROFILES=dagster,trino\n").expect("the .env is written");
+
+        write_env(&path, every_port_is_free).expect("the .env is read");
+
+        let text = std::fs::read_to_string(&path).expect("the .env is readable");
+        assert_eq!(
+            read_value(&text, PROFILES_VARIABLE).as_deref(),
+            Some("dagster,trino"),
+            "the operator's own profiles were replaced: {text}"
+        );
+    }
+
+    #[test]
+    fn a_commented_out_profile_is_not_a_profile() {
+        // A comment sets nothing, so the install adds the key beside it.
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join(".env");
+        std::fs::write(&path, "# COMPOSE_PROFILES=trino\n").expect("the .env is written");
+
+        write_env(&path, every_port_is_free).expect("the .env is read");
+
+        let text = std::fs::read_to_string(&path).expect("the .env is readable");
+        assert_eq!(
+            read_value(&text, PROFILES_VARIABLE).as_deref(),
+            Some(RELEASE_PROFILES),
+            "the .env names no profile: {text}"
+        );
+        assert!(
+            text.contains("# COMPOSE_PROFILES=trino"),
+            "a comment was removed: {text}"
+        );
+    }
+
+    #[test]
+    fn the_update_adds_the_profile_to_an_older_install() {
+        // REL-2 S4b review round 3 BLOCKER 3, decision D22: "the update
+        // adds it when an older install's `.env` has no
+        // `COMPOSE_PROFILES`".
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        std::fs::write(directory.path().join(".env"), "POSTGRES_PASSWORD=secret\n")
+            .expect("the .env is written");
+
+        let changed = ensure_release_profiles(directory.path(), every_port_is_free)
+            .expect("the profiles are set");
+
+        assert!(changed, "the .env was not changed");
+        let text =
+            std::fs::read_to_string(directory.path().join(".env")).expect("the .env is readable");
+        assert_eq!(
+            read_value(&text, PROFILES_VARIABLE).as_deref(),
+            Some(RELEASE_PROFILES),
+            "the .env names no profile: {text}"
+        );
+    }
+
+    #[test]
+    fn the_update_keeps_the_profiles_an_operator_set() {
+        // The operator's own value is kept, and the file is not
+        // touched at all (REL-2 S4b review round 3 BLOCKER 3, decision
+        // D22).
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        std::fs::write(
+            directory.path().join(".env"),
+            "COMPOSE_PROFILES=dagster,seaweedfs\n",
+        )
+        .expect("the .env is written");
+
+        let changed = ensure_release_profiles(directory.path(), every_port_is_free)
+            .expect("the profiles are set");
+
+        assert!(!changed, "the .env was changed");
+        let text =
+            std::fs::read_to_string(directory.path().join(".env")).expect("the .env is readable");
+        assert_eq!(
+            read_value(&text, PROFILES_VARIABLE).as_deref(),
+            Some("dagster,seaweedfs"),
+            "the operator's own profiles were replaced: {text}"
+        );
+    }
+
+    #[test]
+    fn the_dagster_webserver_gets_a_port_of_its_own() {
+        // The webserver and the console both publish 3000 by default,
+        // and two services cannot hold one host port: with the
+        // `dagster` profile on, the stack would not start at all (REL-2
+        // S4b review round 3 BLOCKER 3, decision D22).
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join(".env");
+
+        write_env(&path, every_port_is_free).expect("the .env is written");
+
+        let text = std::fs::read_to_string(&path).expect("the .env is readable");
+        let console = read_value(&text, CONSOLE_PORT_VARIABLE);
+        let webserver = read_value(&text, DAGSTER_WEBSERVER_PORT_VARIABLE);
+        assert_eq!(
+            console.as_deref(),
+            Some("3000"),
+            "the console's port changed: {text}"
+        );
+        assert_ne!(
+            webserver.as_deref(),
+            console.as_deref(),
+            "the webserver and the console still share a port: {text}"
+        );
+    }
+
+    #[test]
+    fn the_dagster_webserver_keeps_a_port_of_its_own() {
+        // An operator who moved the webserver to a port of its own
+        // keeps it: the operator's value is theirs.
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join(".env");
+        std::fs::write(
+            &path,
+            "CONSOLE_HOST_PORT=3000\nDAGSTER_WEBSERVER_HOST_PORT=3100\n",
+        )
+        .expect("the .env is written");
+
+        write_env(&path, every_port_is_free).expect("the .env is read");
+
+        let text = std::fs::read_to_string(&path).expect("the .env is readable");
+        assert_eq!(
+            read_value(&text, DAGSTER_WEBSERVER_PORT_VARIABLE).as_deref(),
+            Some("3100"),
+            "the operator's own port was replaced: {text}"
+        );
+    }
+
+    #[test]
+    fn the_dagster_webserver_takes_the_first_free_port_above_the_consoles() {
+        // The port that is free is the one the tool takes: a port
+        // another service holds would not start the stack.
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join(".env");
+        std::fs::write(&path, "CONSOLE_HOST_PORT=3000\n").expect("the .env is written");
+
+        write_env(&path, |port| port != 3001).expect("the .env is read");
+
+        let text = std::fs::read_to_string(&path).expect("the .env is readable");
+        assert_eq!(
+            read_value(&text, DAGSTER_WEBSERVER_PORT_VARIABLE).as_deref(),
+            Some("3002"),
+            "the webserver did not take the first free port: {text}"
+        );
+    }
+
+    #[test]
+    fn a_webserver_that_shares_the_consoles_port_is_moved_even_by_the_update() {
+        // An older install's `.env` carries the template's ports, and
+        // the update turns the profile on — so the ports have to be
+        // resolved too (REL-2 S4b review round 3 BLOCKER 3, decision
+        // D22).
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        std::fs::write(
+            directory.path().join(".env"),
+            "CONSOLE_HOST_PORT=3000\nDAGSTER_WEBSERVER_HOST_PORT=3000\n",
+        )
+        .expect("the .env is written");
+
+        ensure_release_profiles(directory.path(), every_port_is_free)
+            .expect("the profiles are set");
+
+        let text =
+            std::fs::read_to_string(directory.path().join(".env")).expect("the .env is readable");
+        assert_eq!(
+            read_value(&text, DAGSTER_WEBSERVER_PORT_VARIABLE).as_deref(),
+            Some("3001"),
+            "the webserver still shares the console's port: {text}"
+        );
+    }
+
+    #[test]
+    fn the_profiles_the_update_adds_are_readable_by_the_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        std::fs::write(directory.path().join(".env"), "POSTGRES_PASSWORD=secret\n")
+            .expect("the .env is written");
+
+        ensure_release_profiles(directory.path(), every_port_is_free)
+            .expect("the profiles are set");
+
+        let mode = std::fs::metadata(directory.path().join(".env"))
+            .expect("the .env has metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "the .env is mode {mode:o}");
+    }
+
+    #[test]
+    fn an_install_without_an_env_file_cannot_set_the_profiles() {
+        // The update fails closed: a stack without the Dagster services
+        // runs no pipelines at all, so it must not be started as if it
+        // did (REL-2 S4b review round 3 BLOCKER 3, decision D22).
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let error = ensure_release_profiles(directory.path(), every_port_is_free)
+            .expect_err("an install with no .env file is an error");
+        assert!(
+            error.to_string().contains(".env"),
+            "the error says what failed: {error}"
+        );
     }
 }
