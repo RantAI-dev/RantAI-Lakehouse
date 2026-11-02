@@ -69,6 +69,7 @@ estimate (S, M, L), which the base has no field for.
 | `SEC-23` | Task | Adding a quality, classification or residency rule asked only for a login, while changing one asks for `governance:write`; adding now asks for it too, in the API, the assistant's tools and the console | Administration & Security | P1 | Done | #97 | `features/governance-rule-create.md` |
 | `DATA-1` | Feature | Gold tables publish to open format automatically, as an option per table | Build | P1 | In Acceptance | #60, #63, #64 | `features/gold-publish-per-mart.md` |
 | `QA-1` | Task | Accept each built feature with a checklist, starting with what a demo shows. Started 2026-10-30 (product owner) | Delivery | P1 | In Progress |  | PRODUCT §4 blocker 1 |
+| `ADM-3` | Task | An invited user cannot sign in without SSO: `POST /api/identity/users` created an account with roles and tenants but no credential, so the only local password in the product was the bootstrap admin's, and there was no way to reset a lost password. An invite now creates a `local` credential in one transaction and hands back a server-generated temporary password, shown once; an admin can reset a password, which ends that user's sessions, and only an unrestricted (`*:*`) caller may reset an unrestricted user. Started 2026-11-02 | Administration & Security | P1 | In Progress |  | `superpowers/plans/2026-11-02-adm-3-invite-with-password.md`; `features/invite-users-with-password.md` |
 | `SEC-1` | Task | Confirm the leaked key is rotated; decide on rewriting git history. Decided 2026-10-14: no rewrite; the key and the staging values are rotated (product owner) and their history findings are baselined by exact fingerprint in `.gitleaksignore` | Administration & Security | P1 | Done | #153 | `SECURITY.md` |
 | `REL-1` | Task | Protect the main branch. The repository is public, so GitHub's free plan allows it. Applied 2026-10-30: five required checks, branch up to date, no force-push or deletion (`docs/CI.md`) | Delivery | P1 | Done | #279 | `docs/CI.md` |
 | `DOC-1` | Task | Archive or rewrite the old product documents that contradict the build | Docs | P1 | Done | #171 | PRODUCT §6 |
@@ -358,6 +359,7 @@ set by the product owner and are left empty until they are.
 
 | ID | Started | Shipped | Due |
 | --- | --- | --- | --- |
+| `ADM-3` | 2026-11-02 | | |
 | `QS-2` | 2026-10-28 | 2026-10-30 | |
 | `SEC-20` | 2026-10-24 | | |
 | `QS-4` | 2026-10-24 | 2026-10-27 | |

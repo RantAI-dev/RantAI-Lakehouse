@@ -41,15 +41,29 @@
 //! from the auth gate itself, before any handler's own database logic ever
 //! runs. See `every_database_backed_route_returns_503_without_a_pool` for
 //! the concrete proof, exercised end to end through the real router.
+//!
+//! # ADM-3: an invite carries a password
+//!
+//! `POST /api/identity/users` no longer creates a credential-less
+//! directory row: it creates the user AND a `local` credential, in ONE
+//! transaction, and returns the temporary password ONCE, on that response.
+//! `POST /api/identity/users/{id}/reset-password` does the same for an
+//! existing account. Both passwords are generated SERVER-side from the OS
+//! random source; neither is ever stored in clear, logged, audited, or
+//! listed. See [`create_user`] and [`reset_user_password`].
 
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use lakehouse_auth::Principal;
+use lakehouse_auth::PrincipalId;
 use lakehouse_auth::Secret;
 use lakehouse_auth::openfga::{LakekeeperAdminClient, TenantWarehouseStorage};
+use lakehouse_auth::password;
+use lakehouse_auth::session;
 use lakehouse_core::ApiError;
 use lakehouse_store::PgPool;
+use lakehouse_store::StoreError;
 use lakehouse_store::audit::{self as store_audit, NewAuditEvent};
 use lakehouse_store::identity::{
     self, CreateRoleInput, CreateServiceIdentityInput, CreateTenantInput, InviteUserInput, Role,
@@ -57,6 +71,7 @@ use lakehouse_store::identity::{
     User, UserFilter,
 };
 use serde::Deserialize;
+use serde::Serialize;
 use uuid::Uuid;
 
 use crate::auth::AuthenticatedPrincipal;
@@ -160,8 +175,70 @@ pub struct InviteUserBody {
     tenants: Vec<String>,
 }
 
+/// Serialize a [`Secret`] as the plain string it wraps.
+///
+/// The ONE place a secret leaves the type that keeps it out of log lines:
+/// a [`Secret`]'s own `Debug`/`Display` render a fixed redaction marker,
+/// so a response that must carry the value has to unwrap it explicitly,
+/// here, in one place. Nothing else in this crate serializes a secret.
+fn serialize_secret<S: serde::Serializer>(
+    secret: &Secret,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(secret.expose())
+}
+
+/// The `POST /api/identity/users` 201 body: the created [`User`] plus the
+/// temporary password.
+///
+/// ADM-3 D1: the temporary password is returned **once**, on this response
+/// and nowhere else. It is never stored in clear (the database keeps the
+/// `Argon2id` hash), never logged, never audited, and never listed by
+/// `GET /api/identity/users` — the [`User`] shape has no field for it.
+///
+/// The [`User`] is flattened into this object, so the body is the user
+/// with one extra key rather than a user nested under a key.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InviteUserResponse {
+    /// The created user.
+    #[serde(flatten)]
+    pub user: User,
+    /// The generated temporary password, shown once.
+    #[serde(serialize_with = "serialize_secret")]
+    pub temporary_password: Secret,
+}
+
+/// The `POST /api/identity/users/{id}/reset-password` body: the new
+/// temporary password, and nothing else.
+///
+/// ADM-3 D2: returned exactly once, like the invite's.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResetPasswordResponse {
+    /// The generated temporary password, shown once.
+    #[serde(serialize_with = "serialize_secret")]
+    pub temporary_password: Secret,
+}
+
 /// `POST /api/identity/users` — invite a user. Returns 201 with the created
-/// [`User`].
+/// [`User`] and the temporary password.
+///
+/// # The temporary password (ADM-3 D1)
+///
+/// The user, its memberships and a `local` credential are written in ONE
+/// transaction, so a user can never be left behind without the credential
+/// this response promised. The password itself is generated SERVER-side
+/// from the OS random source ([`password::generate_temporary_password`]),
+/// never taken from the request: a caller cannot choose a weak password
+/// for somebody else, and the server never has to store a plaintext it
+/// was given.
+///
+/// It is returned exactly once, here. It is never written to the database
+/// in clear (only the `Argon2id` hash is), never logged, never audited,
+/// and never listed by `GET /api/identity/users`. The credential is
+/// flagged `must_change_password`, so the invitee signs in and is then
+/// forced through the change-password screen (ADM-3 D4).
 ///
 /// # Security
 ///
@@ -173,8 +250,9 @@ pub struct InviteUserBody {
 /// name; 409 if the email is already registered; 503/500 as above.
 pub async fn create_user(
     State(state): State<AppState>,
+    AuthenticatedPrincipal(principal): AuthenticatedPrincipal,
     body: Bytes,
-) -> ApiResult<(StatusCode, ApiJson<User>)> {
+) -> ApiResult<(StatusCode, ApiJson<InviteUserResponse>)> {
     let body: InviteUserBody = parse_body(&body)?;
     let input = InviteUserInput {
         name: required("name", &body.name)?,
@@ -182,8 +260,197 @@ pub async fn create_user(
         roles: body.roles,
         tenants: body.tenants,
     };
-    let user = identity::create_user(pool(&state)?, &input).await?;
-    Ok((StatusCode::CREATED, ApiJson(user)))
+    let pool = pool(&state)?;
+
+    // ADM-3 D1: the server chooses the password, from the OS random
+    // source. It is wrapped in a `Secret` from here on, so it cannot be
+    // logged by accident.
+    let temporary_password = password::generate_temporary_password();
+
+    // ADM-3 D1: user, memberships and credential in ONE transaction. The
+    // store owns the user tables and `lakehouse-auth` owns the credential
+    // table, so the transaction is opened HERE and handed to both — see
+    // `lakehouse_store::identity::create_user_in_tx` and
+    // `lakehouse_auth::password::create_local_identity_in_tx`.
+    let mut tx = pool.begin().await.map_err(StoreError::from)?;
+    let user_id = identity::create_user_in_tx(&mut tx, &input).await?;
+    password::create_local_identity_in_tx(&mut tx, user_id, &temporary_password, true).await?;
+    tx.commit().await.map_err(StoreError::from)?;
+
+    let user = identity::get_user(pool, &user_id.to_string()).await?;
+
+    // ADM-3 D5: the audit row names the actor and the new user. It never
+    // carries the password — not even its length.
+    let audit_event = user_invite_audit_event(&principal, &user, &input);
+    if let Err(err) = store_audit::insert(pool, audit_event).await {
+        tracing::warn!(
+            %err,
+            action = "identity.user.invite",
+            user_id = %user_id,
+            "failed to record user-invite audit event"
+        );
+    }
+
+    Ok((
+        StatusCode::CREATED,
+        ApiJson(InviteUserResponse {
+            user,
+            temporary_password,
+        }),
+    ))
+}
+
+/// Build the `NewAuditEvent` for an invite — the actor, the new user, and
+/// what it was granted.
+///
+/// ADM-3 D5: `args` carries the email and the role/tenant NAMES the user
+/// was given. It never carries the password, and never a hash of it: the
+/// audit log is a place an operator reads, and a credential does not
+/// belong in it.
+fn user_invite_audit_event(
+    principal: &Principal,
+    user: &User,
+    input: &InviteUserInput,
+) -> NewAuditEvent {
+    NewAuditEvent {
+        action: "identity.user.invite".to_owned(),
+        resource_kind: Some("user".to_owned()),
+        resource_id: Some(user.id.clone()),
+        principal_id: Some(principal.id.uuid().to_string()),
+        principal_kind: Some(principal.kind_for_audit().to_owned()),
+        actor_label: Some(principal.display_name.clone()),
+        outcome: "executed".to_owned(),
+        args: Some(serde_json::json!({
+            "email": user.email,
+            "roles": input.roles,
+            "tenants": input.tenants,
+        })),
+        ..Default::default()
+    }
+}
+
+/// `POST /api/identity/users/{id}/reset-password` — give an existing user
+/// a new temporary password. Returns 200 with the new password.
+///
+/// # What it does (ADM-3 D2)
+///
+/// Sets a NEW server-generated temporary password, flags the credential
+/// `must_change_password`, and **ends every live session of that user** —
+/// a reset that left the old sessions alive would not have locked the
+/// target out of anything. The credential write and the session
+/// revocation are ONE transaction.
+///
+/// The password is returned exactly once, here, and is never stored in
+/// clear, logged, audited, or listed.
+///
+/// # No escalation through a reset (ADM-3 D3)
+///
+/// Only a caller holding the unrestricted `"*:*"` grant may reset the
+/// password of a user who holds `"*:*"` — the same rule
+/// `add_user_to_tenant` follows ([`crate::routes::catalog::is_unrestricted`]).
+/// Anyone else gets the SAME 404 an unknown user gets, so a probe learns
+/// nothing about which accounts exist or what they hold.
+///
+/// A caller may not reset their OWN password here: that is what
+/// `POST /api/auth/change-password` is for, and it verifies the old
+/// password instead of replacing it behind the holder's back.
+///
+/// # Security
+///
+/// Requires `identity:write` — see the module doc comment.
+///
+/// # Errors
+///
+/// 400 on a `{id}` that is not a UUID, or on a self-reset; 404 for an
+/// unknown user and for a target the caller may not reset (one body for
+/// both); 503 if no pool is configured; 500 (classified) on a storage
+/// failure. One `identity.user.password_reset` audit event is written on
+/// success.
+pub async fn reset_user_password(
+    State(state): State<AppState>,
+    AuthenticatedPrincipal(principal): AuthenticatedPrincipal,
+    Path(id): Path<String>,
+) -> ApiResult<ApiJson<ResetPasswordResponse>> {
+    let user_id = Uuid::parse_str(&id)
+        .map_err(|_| ApiError::BadRequest("user id must be a UUID".to_owned()))?;
+    let pool = pool(&state)?;
+
+    // ADM-3 D3: a caller may not reset their own password here. The
+    // caller is the target, so the answer is a 400 pointing at the route
+    // that does belong here — not a 404 (the target certainly exists)
+    // and not a 403 (the caller holds `identity:write`).
+    if let PrincipalId::User(caller_id) = principal.id
+        && caller_id == user_id
+    {
+        return Err(ApiError::BadRequest(
+            "use POST /api/auth/change-password to change your own password".to_owned(),
+        )
+        .into());
+    }
+
+    // The target's EFFECTIVE grants, read through the same repository
+    // function every authenticated request's principal is built from — so
+    // the escalation rule below judges the grants the target really has,
+    // not a re-implementation of them. An unknown user answers
+    // `AuthError::NotFound` -> 404 here, before anything is written.
+    let target = lakehouse_auth::repository::load_principal_for_user(
+        pool,
+        user_id,
+        "local".to_owned(),
+        false,
+    )
+    .await?;
+
+    // ADM-3 D3: only an unrestricted caller may reset an unrestricted
+    // user. The refusal is the SAME 404 an unknown user gets, body for
+    // body, so a probe cannot tell the two apart.
+    if crate::routes::catalog::is_unrestricted(&target)
+        && !crate::routes::catalog::is_unrestricted(&principal)
+    {
+        return Err(ApiError::NotFound("record not found".to_owned()).into());
+    }
+
+    let temporary_password = password::generate_temporary_password();
+
+    // ADM-3 D2: the new credential and the revocation of the target's
+    // sessions are one unit of work.
+    let mut tx = pool.begin().await.map_err(StoreError::from)?;
+    password::set_temporary_password_in_tx(&mut tx, user_id, &temporary_password).await?;
+    session::revoke_all_sessions_for_user_in_tx(&mut tx, user_id).await?;
+    tx.commit().await.map_err(StoreError::from)?;
+
+    // ADM-3 D5: the audit row names the actor and the target user. Never
+    // the password.
+    let audit_event = user_password_reset_audit_event(&principal, user_id);
+    if let Err(err) = store_audit::insert(pool, audit_event).await {
+        tracing::warn!(
+            %err,
+            action = "identity.user.password_reset",
+            user_id = %user_id,
+            "failed to record password-reset audit event"
+        );
+    }
+
+    Ok(ApiJson(ResetPasswordResponse { temporary_password }))
+}
+
+/// Build the `NewAuditEvent` for a password reset — the actor and the
+/// target user, and nothing else.
+///
+/// ADM-3 D5: no password, and no hash of one. `resource_id` names the
+/// user whose credential changed; `principal_id` names who changed it.
+fn user_password_reset_audit_event(principal: &Principal, user_id: Uuid) -> NewAuditEvent {
+    NewAuditEvent {
+        action: "identity.user.password_reset".to_owned(),
+        resource_kind: Some("user".to_owned()),
+        resource_id: Some(user_id.to_string()),
+        principal_id: Some(principal.id.uuid().to_string()),
+        principal_kind: Some(principal.kind_for_audit().to_owned()),
+        actor_label: Some(principal.display_name.clone()),
+        outcome: "executed".to_owned(),
+        args: Some(serde_json::json!({ "targetUserId": user_id.to_string() })),
+        ..Default::default()
+    }
 }
 
 /// `PUT /api/identity/users/{id}/tenants/{tenant_id}` — add an existing
@@ -943,6 +1210,13 @@ mod tests {
             ("/api/identity/service-identities", Method::GET),
             (
                 "/api/identity/service-identities/c4f7a7b2-0000-4000-8000-000000000001/rotate",
+                Method::POST,
+            ),
+            // ADM-3 D2: the reset route is POST-only for the same reason
+            // the rotate route is — a GET would hit axum's method
+            // mismatch and never reach the auth gate.
+            (
+                "/api/identity/users/c4f7a7b2-0000-4000-8000-000000000001/reset-password",
                 Method::POST,
             ),
         ];
