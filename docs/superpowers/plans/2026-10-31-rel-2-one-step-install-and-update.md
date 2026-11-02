@@ -1878,6 +1878,135 @@ the reviewer (AGENTS.md, step 6).
   `x86_64-unknown-linux-musl` target is not installed on this machine.
 - **`cargo deny check`** was not run: no dependency changed (no crate's `Cargo.toml` is touched).
 
+### Handoff S4b (developer, 2026-11-02)
+
+The developer of S4b lost their machine (bluefin) before this handoff was written, and the
+reviewer wrote "Review S4b round 1" instead. This is the handoff the slice was missing: the
+commits that are on the branch, read from the code, the counts of the checks, and what was not
+verified.
+
+**Commits** (branch `feat/rel-2-s4b-lakehousectl-update`, base `main` at `c239e3b0`), in plan
+order:
+
+| Commit | Task | What |
+| --- | --- | --- |
+| `42fa7b6b` | S4-T4 (D17, D18) | `lakehousectl update` and `lakehousectl rollback`: the nine steps of D17 in their order (`update.rs`), the restore of D18 (`rollback.rs`), and every step that touches the machine behind ONE trait, `runner::Runner` (`runner.rs`), so the whole path is driven by a fake |
+| `ac095fc2` | S4-T5 (D19) | `lakehousectl status`: the five things D19 names — the installed release and the one before it, every service's state, the API's own `/health/ready`, the backups newest first with their size, and whether a newer release exists (offline it says it did NOT check) |
+| `11a43698` | S4-T6 (D20) | `lakehousectl self-update`: the newest release's manifest is verified with the compiled-in key, `lakehousectl-linux-x86_64` is checked against the SIGNED manifest's `files["lakehousectl"]`, and the running binary is replaced by a rename — atomically |
+| `d625454a` | S4-T7 (D21) | the `update-proof` job of the dry run: bundles B and C are built out of bundle A, the markers are seeded before the first update, and the job's own rules live in `ops/release/update_proof.py`, so they are tested with no Docker and no network |
+| `1f9095c0` | fix | the shipped scripts are given an ABSOLUTE directory: the script `cd`s into the deployment's directory and hands its paths to `docker run -v`, and Docker reads a relative path there as a volume NAME |
+| `db95e794` | review round 1 BLOCKER 1 | a failure in step 4 or step 5 puts the stack back — this handoff's fix |
+
+**The BLOCKER 1 fix (`db95e794`).** `update::run` set `MAINTENANCE_PAUSED` and stopped the writers
+(step 4), then took the backup (step 5). A failure in either one returned the error with the
+writers STOPPED and the pause STILL SET — and nothing had been swapped, so the install still held
+the OLD release's files. The operator was left with a stack that was down and a pause that had to
+be cleared by hand.
+
+A failure in step 4 or step 5 now puts the install back the way it was:
+
+- the stack is started again on the OLD files (`up -d --pull never` — nothing was swapped, so the
+  Compose file and the manifest in the install's own directory are still the old ones);
+- it is waited for on the OLD version, with the same timeout the update waits with
+  (`--ready-timeout`, default 600 s);
+- the pause is cleared: the update restored nothing, so the jobs that delete files must not stay
+  paused;
+- the error says that the update stopped before it changed anything, what failed, and what the
+  stack runs now.
+
+A stack that does not come back is reported as it is — "the stack could not be started again",
+and "the install may need a hand". The error never claims a stack that is not there.
+
+Three steps can fail before the swap: the pause cannot be set, the writers cannot be stopped, and
+the backup cannot be taken (nor recorded in the state). All three go through the same way back.
+
+**The tests are real.** The three new tests were run against the code BEFORE this commit — the
+fix was reverted, the tests kept — and all three failed (162 passed, 3 failed). With the fix they
+pass. They use the fake runner the module already has: when the backup is what fails, the fake's
+steps are `fetch-images`, `stop-writers`, `backup`, `up`, `console-ready` (when the writers are
+what fail, there is no `backup`) — the stack is put back, and nothing is restored and nothing is
+rolled back, for nothing was swapped. The two tests of the blocker's own words assert that the
+stack runs the old version, that `.env` holds no `MAINTENANCE_PAUSED`, and that `state.json` is
+byte for byte the file it was.
+
+**Commands run, in the foreground, on the final commit `db95e794`:**
+
+| Command | Result |
+| --- | --- |
+| `/home/shiro/rantai/bin/cargo-locked fmt --check` (the whole workspace) | clean, no diff, exit 0 |
+| `/home/shiro/rantai/bin/cargo-locked clippy -p lakehousectl --all-targets -- -D warnings` | clean, no warning and no error, exit 0 |
+| `/home/shiro/rantai/bin/cargo-locked test -p lakehousectl` | **165 passed, 0 failed** (162 at the review commit `20f45a3a`, 3 new) |
+| `python3 -m pytest ops/release -q` | **209 passed** |
+| `actionlint .github/workflows/release.yml` | no findings, exit 0 |
+| `python3 ops/lint/check_intra_package_imports.py` | `OK: all intra-package dispar_orchestrate imports resolve` |
+| `python3 ops/lint/check_bare_iceberg_count.py` | `R11 guard: no bare count() against a Bronze Iceberg table found.` |
+| `git status` | clean (nothing generated staged) |
+
+Every cargo command went through `/home/shiro/rantai/bin/cargo-locked` (the shared
+`CARGO_TARGET_DIR`, `/home/shiro/rantai/cargo-target`; no `cargo clean`), in the foreground. The
+pytest run used the throwaway virtualenv at `/tmp/opencode/relvenv/bin/python` (pytest 9.2.0) —
+the system `python3` on this machine has no pytest. `actionlint` is not installed under that name
+on this machine; the copy at `/tmp/opencode/actionlint` was used.
+
+**A flaky test on this branch, found while running the block above.** `cargo test -p
+lakehousectl` fails about once in twenty runs, in `backup::tests`:
+
+```
+thread 'backup::tests::the_backup_is_told_which_version_it_belongs_to' panicked at crates/lakehousectl/src/backup.rs:323:60:
+the backup runs: Failed("the backup tool failed: Text file busy (os error 26)")
+```
+
+It is NOT from this fix: the failing test is in `backup.rs`, which this fix does not touch, and
+the same failure was reproduced at the review commit `20f45a3a` (162 tests, 1 failed, on run 23
+of 25). `backup.rs` was last changed by `1f9095c0`, which added the `fake_tool` helper: the test
+writes a shell script into a temporary directory and the tool then EXECUTES it. `ETXTBSY` is what
+the kernel says when the file being executed still has an open write descriptor — in a test binary
+with four threads, another thread's `fork` inherits the descriptor of the file the first thread is
+writing, and the inherited descriptor keeps the inode "open for writing" until that child execs
+its own script. Writing the script through a temporary name and renaming it into place does NOT
+avoid it (measured: the failure still came, on run 8 of 40).
+
+**The reviewer decides what to do with it.** The candidates are: a retry on `ETXTBSY` in
+`sys::output_or_stderr_with_env` (production code, and `ETXTBSY` on a script that is being
+rewritten under the tool is a real condition), the fake tool becoming a committed fixture that is
+SYMLINKED into the temporary directory (the inode that is executed is then never opened for
+writing), or a single-threaded run of that module. It is not fixed here: it is outside BLOCKER 1,
+and the fix belongs to whoever owns `backup.rs`.
+
+**One thing the reviewer may want to look at.** The pause is cleared in the install's `.env`
+AFTER the stack has been started (`up -d`) — in the update's step 8, in the rollback, and now in
+the way back this fix adds. Compose reads the `.env` when it starts the services, so the Dagster
+services that read `MAINTENANCE_PAUSED` (D16) keep the value they were started with until the
+next `up -d`. That is the branch's own behaviour, in the success path as much as in this one, and
+it is not changed here: it is named so that the reviewer can decide.
+
+**Not verified, with the reason:**
+
+- **No real update run on a host.** The developer who wrote the S4b commits lost their machine
+  (bluefin) before this handoff was written, and this machine has no install of a release to
+  update: no release is published yet, and the update's own path (the writers stopped, the backup
+  taken, the files swapped, the stack waited for, the rollback) is covered by the unit tests with
+  the fake runner. The proof is the `update-proof` job, below.
+- **The PR's dry run and its `update-proof` job.** They need a GitHub runner: the images, the
+  throwaway registry, cosign, syft, a multi-GiB bundle and the whole stack. What stands in for
+  them here is the job's own logic (`ops/release/update_proof.py`, tested in
+  `ops/release/test_release_workflow.py` — 209 passed with the rest of `ops/release`) and
+  `actionlint` on the workflow. The job ITSELF is proved by the dry run.
+- **The whole-workspace cargo run** (`cargo clippy --workspace --all-targets --all-features -- -D
+  warnings` and `cargo test --workspace`): not run here — this slice's machine rules say CI runs
+  the workspace and the developer runs the scoped commands. The crate the slice touches
+  (`lakehousectl`) was clipped and tested with `--all-targets`.
+- **The Dagster code location** (`(cd dagster && python -m pytest dispar_orchestrate -q)`): not
+  run — the branch changes no Python under `dagster/` (`git diff origin/main...HEAD -- dagster/`
+  is empty). The two repo lints that scan it ran, and both are OK.
+- **No bun command ran**: the branch changes no TypeScript (`git diff origin/main...HEAD -- src/`
+  is empty).
+- **`docker compose --profile '*' config --quiet`**: not run — the branch changes no compose file
+  (`git diff origin/main...HEAD -- docker-compose.yml` is empty).
+- **The branch has not merged `main`**: its base is `c239e3b0`, and `main` has moved 16 commits
+  on since. The reviewer decides when to merge it; the checks above were run on the branch as it
+  is.
+
 ## 7. Review (planner appends below)
 
 ### Review S1 round 1 (planner, 2026-10-31, at `f79d4235`)
