@@ -647,6 +647,19 @@
     ]
   },
   {
+    "id": "dash_new_chart_then_fresh",
+    "mode": "build",
+    "confirm": true,
+    "setup": [
+      {"name": "board", "method": "POST", "path": "/api/dashboard/boards", "body": {"name": "Eval Fresh On New Chart"}, "id_at": "board.id"}
+    ],
+    "turns": ["Add a bar chart of events by year to dashboard {board} and make it always fresh."],
+    "expect_tool": {"name": "set_cache_rule", "args_contains": {"chart": "{created:chart}", "rule": "fresh"}},
+    "expect_state": [
+      {"path": "/api/dashboard/specs", "list": "charts", "where": {"id": "{created:chart}", "def.cache.mode": "fresh"}, "count": 1}
+    ]
+  },
+  {
     "id": "chart_forecast",
     "mode": "build",
     "confirm": true,

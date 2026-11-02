@@ -427,6 +427,50 @@ class ContinuationTests(unittest.TestCase):
 
         self.assertEqual(len(sent), 1)
 
+    def run_after_confirm(self, chart_arg: str) -> dict[str, Any]:
+        """The continuation calls `set_cache_rule` on the chart the confirm
+        made; the case expects `{created:chart}` (`BI-41` T1)."""
+        cfg = make_cfg()
+        session = FakeSession({
+            ("POST", "/api/ai/tool"): confirm_reply(
+                "create_chart", {"created": True, "id": "c1", "title": "Visitors"}
+            ),
+        })
+        drafted = self.body_with_next_step("make it always fresh")
+        fresh = {
+            "answer": "It is always fresh now.",
+            "_status": 200,
+            "toolTrace": [{
+                "tool": "set_cache_rule",
+                "args": {"chart": chart_arg, "rule": "fresh"},
+                "ok": True,
+                "result": {"updated": True},
+            }],
+        }
+        fake_ask, _sent = self.scripted_ask([drafted, fresh])
+        case = {
+            "id": "new-chart-fresh",
+            "mode": "build",
+            "confirm": True,
+            "turns": ["Draw it and make it always fresh."],
+            "expect_tool": {
+                "name": "set_cache_rule",
+                "args_contains": {"chart": "{created:chart}", "rule": "fresh"},
+            },
+        }
+        with mock.patch.object(m, "ask", side_effect=fake_ask):
+            return m.run_case(cfg, session, case)
+
+    def test_the_continuation_s_names_the_created_chart(self) -> None:
+        result = self.run_after_confirm("c1")
+
+        self.assertEqual(result["missing"], [])
+
+    def test_another_chart_id_does_not_stand_in_for_the_created_one(self) -> None:
+        result = self.run_after_confirm("c2")
+
+        self.assertEqual(len(result["missing"]), 1)
+
 
 # ── cleanup ───────────────────────────────────────────────────────────────
 
@@ -1686,6 +1730,23 @@ class DashboardCasesTests(unittest.TestCase):
         cases = json.loads((HERE / "dashboard_cases.json").read_text())
         self.assertGreaterEqual(len(cases), 30)
         self.assertEqual(len({c["id"] for c in cases}), len(cases))
+
+    def test_the_new_chart_fresh_case_checks_the_created_chart(self) -> None:
+        # `BI-41` T1: the request drafts a chart and then changes it, so the
+        # case confirms the draft and expects the rule on the chart the
+        # confirm made (`{created:chart}`), never on the board.
+        case = {c["id"]: c for c in json.loads((HERE / "dashboard_cases.json").read_text())}[
+            "dash_new_chart_then_fresh"
+        ]
+        self.assertIs(case.get("confirm"), True)
+        self.assertEqual(
+            case["expect_tool"],
+            {"name": "set_cache_rule", "args_contains": {"chart": "{created:chart}", "rule": "fresh"}},
+        )
+        where = case["expect_state"][0]["where"]
+        self.assertEqual(where["id"], "{created:chart}")
+        self.assertEqual(where["def.cache.mode"], "fresh")
+        self.assertNotIn("board", json.dumps(case["expect_tool"]))
 
     def test_every_write_case_confirms_and_checks_state_unless_it_tests_a_refusal_or_approval(self) -> None:
         # The plan's rule (step 2): a write case has `confirm` and `expect_state`,

@@ -445,7 +445,7 @@ MODE: BUILD. Besides answering, you can operate the lakehouse:
 - Gold export: export_gold_mart appends a mart to its Iceberg table (running it again appends again); get_gold_export reads it back.
 - These need human approval and do not run immediately: delete_alert_rule, delete_connector, rotate_connector_credential, pause_pipeline, cancel_pipeline_run, delete_chart, delete_tab, delete_board, delete_calculated_field, delete_metric, run_bronze_maintenance, kill_query. Call the tool; the server then creates the approval. Only when a tool result says needs_approval, tell the user the request is waiting in Approvals (/agents/approvals). Never say a request is waiting if you did not call the tool, or if its result did not say needs_approval.
 - needs_confirmation and needs_approval are different. needs_confirmation: the user confirms in this chat, with the Confirm button under your reply; never mention Approvals for it. needs_approval: a human must approve it in Approvals (/agents/approvals).
-- When a tool result says needs_confirmation, call no other tool that needs the drafted object (a chart, a board or a tab that does not exist yet, a calculated field): reply with ONE short sentence that names the draft the result is for (a chart, a board, a tab or a calculated field). Write a last line `NEXT: <the remaining steps, in one sentence>` only when the request needs another object after the draft (a chart on the board being drafted, the charts moved to the tab being drafted); never for confirming, saving or publishing the draft itself, and never when the draft is the whole request. Do not repeat the arguments and do not ask the user to type a confirmation: the console shows the preview with a confirm button. A user message that starts with `Confirmed and saved:` lists the objects that now exist: never draft them again; do only the step after `Continue:`; when nothing is left, answer in one sentence and call no tool.");
+- When a tool result says needs_confirmation, call no other tool that needs the drafted object (a chart, a board or a tab that does not exist yet, a calculated field): reply with ONE short sentence that names the draft the result is for (a chart, a board, a tab or a calculated field). Write a last line `NEXT: <the remaining steps, in one sentence>` only when the request needs another object after the draft, or another change to the drafted object (its cache rule, its format, its tab): for example a chart on the board being drafted, the charts moved to the tab being drafted, or the cache rule of the chart just drafted; never for confirming, saving or publishing the draft itself, and never when the draft is the whole request. Do not repeat the arguments and do not ask the user to type a confirmation: the console shows the preview with a confirm button. A user message that starts with `Confirmed and saved:` lists the objects that now exist: never draft them again; do only the step after `Continue:`; when nothing is left, answer in one sentence and call no tool.");
 
 /// Tools offered on every turn: the data tools, and the read-only listings
 /// a general question about the platform needs.
@@ -1166,10 +1166,11 @@ mod tests {
     /// `AI-15`: a draft that the rest of the request needs ends the turn
     /// with a next step. The rule names the drafted object and the `NEXT:`
     /// line, and the old sentence is gone: every model copied it, even for
-    /// a board or a calculated field. `NEXT:` is written only for another
-    /// object the request still needs, never for the confirm of the draft
-    /// itself; and a continuation message names the objects that were
-    /// saved, so the model does not draft them again.
+    /// a board or a calculated field. `NEXT:` is written for another object
+    /// the request still needs or another change to the drafted object
+    /// (`BI-41` D1: its cache rule, its format, its tab), never for the
+    /// confirm of the draft itself; and a continuation message names the
+    /// objects that were saved, so the model does not draft them again.
     #[test]
     fn the_next_step_rule_names_the_drafted_object_and_the_next_line() {
         let line = SYSTEM_BUILD_SUFFIX
@@ -1187,11 +1188,10 @@ mod tests {
             );
         }
         for clause in [
-            // `NEXT:` is for the next object the request still needs,
-            // never for the confirm of the draft itself.
-            "only when the request needs another object after the draft",
-            "never for confirming, saving or publishing the draft itself",
-            "never when the draft is the whole request",
+            // `NEXT:` is for the next object the request still needs or
+            // another change to the drafted object, never for the confirm
+            // of the draft itself (`BI-41` D1).
+            "only when the request needs another object after the draft, or another change to the drafted object (its cache rule, its format, its tab)",
             // A continuation names what was saved, so it is not drafted
             // again, and the rule reads the message the console sends.
             "`Confirmed and saved:`",
@@ -1203,6 +1203,17 @@ mod tests {
             assert!(
                 line.contains(clause),
                 "the rule must say: {clause} -- got: {line}"
+            );
+        }
+        // D1 widens what `NEXT:` covers; it does not let a model write it
+        // for the confirm itself, or when the draft is the whole request.
+        for never in [
+            "never for confirming, saving or publishing the draft itself",
+            "never when the draft is the whole request",
+        ] {
+            assert!(
+                line.contains(never),
+                "the rule must still say: {never} -- got: {line}"
             );
         }
         assert!(
