@@ -254,3 +254,18 @@ another worktree whose `bun.lock` is byte-identical to this branch's (Bun
 folder-only result).
 
 ## 6. Review (planner appends below)
+
+### Review round 1 (planner, 2026-11-02, at `7ba66e5b`)
+
+- **T1 (D1).** `NEXT:` now also covers a change to the object just drafted. The AI-15 case is `dash_new_chart_then_fresh`, and the harness fills `{created:<kind>}`.
+- **T2 (D2).** "This chart" means a chart, and the assistant asks when it is unclear. The fixture changes in one hunk, the `set_cache_rule` description. There are two AI-15 cases. **AI team:** review that hunk.
+- **T3 (D3).** A stopped answer is sent back to the model as one fixed sentence, so the next answer knows it was cut short.
+- **T4 is correctly not built.** It applies only if the owner answers Q1 with (b), and D3 is the default.
+- **T5 is not verified.** There was no `LLM_KEY` for the model run, and the reason is recorded. The eval harness's own unit tests pass (186).
+- **Counts (the developer's):**
+  - `cargo test -p lakehouse-api`: 7021 passed across 97 suites;
+  - console `bun test src`: 3153;
+  - clippy, fmt, typecheck and the ops lints: clean.
+- **Already on `main`, not caused here:** `bun test src/features/copilot` alone has 3 fails, from the `mock.module("next/navigation")` leak in `use-copilot.test.tsx`. It reproduces without this PR, so it is filed as a backlog item (a test isolation fix).
+
+**Open: no BLOCKER, no SHOULD-FIX.** The merge waits for the PR's CI.
