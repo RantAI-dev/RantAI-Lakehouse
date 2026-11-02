@@ -335,3 +335,18 @@ this task started were removed.
 
 
 **Order (planner, 2026-11-02):** runs AFTER `AI-23` (both touch the assistant chat), on the same machine.
+
+### Review round 1 (planner, 2026-11-02, at `9150c0f4`)
+
+- **T1 (D8).** The chat stream sends `Cache-Control: no-cache, no-transform` and `X-Accel-Buffering: no`, so a reverse proxy does not hold the answer back. `ai_sessions.rs` pins History's rename, delete, reopen and owner rules.
+- **T2–T4.**
+  - A long conversation keeps its steps.
+  - A load error and a dropped result say so instead of showing an empty conversation.
+  - The stream renders smoothly (`smooth-text.ts`), and scrolling follows it.
+- **T5 is measured, not assumed** (principle 5). `docs/plans/AI-24-STREAM-RESULT.md` shows 51 chunks both directly and through the console hop. The largest gap is about 50 ms both ways, so the console does not batch. The real-model and browser half is *not verified*, with the reason given.
+- **Counts (the developer's):**
+  - `lakehouse-api` `--lib`: 2932; `ai_chat_stream`: 4; `ai_sessions`: 6;
+  - console `bun test src`: 3164;
+  - clippy and typecheck: clean.
+
+**Open: no BLOCKER, no SHOULD-FIX.** The merge waits for the PR's CI.
