@@ -42,6 +42,7 @@
 
 use serde::Serialize;
 use sqlx::FromRow;
+use sqlx::{Postgres, Transaction};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -242,12 +243,40 @@ pub struct InviteUserInput {
 /// * [`StoreError::Database`] (500) — anything else.
 pub async fn create_user(pool: &PgPool, input: &InviteUserInput) -> Result<User, StoreError> {
     let mut tx = pool.begin().await?;
+    let id = create_user_in_tx(&mut tx, input).await?;
+    tx.commit().await?;
+    get_user(pool, &id.to_string()).await
+}
 
+/// [`create_user`], inside a transaction the CALLER owns, returning the
+/// new user's id instead of the whole [`User`] row.
+///
+/// ADM-3 D1: an invite writes the user, its memberships AND its
+/// credential as one unit of work. The credential lives in `auth_identity`,
+/// which `lakehouse-auth` owns; the user and its memberships live here.
+/// Neither crate can open a transaction the other joins, so the CALLER
+/// (the API route) opens it and hands it to both — this function is the
+/// store's half of that.
+///
+/// Dropping `tx` without committing rolls the whole thing back (sqlx's
+/// `Transaction` starts a rollback on drop), so an unknown role or tenant
+/// name leaves no user behind.
+///
+/// # Errors
+///
+/// * [`StoreError::Conflict`] (409) — the email is already taken.
+/// * [`StoreError::ForeignKeyViolation`] (400) — a role or tenant name in
+///   `input` does not exist.
+/// * [`StoreError::Database`] (500) — anything else.
+pub async fn create_user_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    input: &InviteUserInput,
+) -> Result<Uuid, StoreError> {
     let (id,): (Uuid,) =
         sqlx::query_as("INSERT INTO app_user (name, email) VALUES ($1, $2) RETURNING id")
             .bind(&input.name)
             .bind(&input.email)
-            .fetch_one(&mut *tx)
+            .fetch_one(&mut **tx)
             .await?;
 
     for role in &input.roles {
@@ -257,7 +286,7 @@ pub async fn create_user(pool: &PgPool, input: &InviteUserInput) -> Result<User,
         )
         .bind(id)
         .bind(role)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?
         .rows_affected();
         if affected == 0 {
@@ -272,7 +301,7 @@ pub async fn create_user(pool: &PgPool, input: &InviteUserInput) -> Result<User,
         )
         .bind(id)
         .bind(tenant)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?
         .rows_affected();
         if affected == 0 {
@@ -280,8 +309,7 @@ pub async fn create_user(pool: &PgPool, input: &InviteUserInput) -> Result<User,
         }
     }
 
-    tx.commit().await?;
-    get_user(pool, &id.to_string()).await
+    Ok(id)
 }
 
 /// Add an existing user to a tenant: one `app_user_tenant` row, the same
