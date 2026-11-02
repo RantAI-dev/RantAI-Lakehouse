@@ -549,6 +549,12 @@ fn email_failure_reason(error: Option<&str>) -> &'static str {
         Some(e) if e == F::MailServerRefused.message() => {
             "The email was not sent: the mail server refused the message."
         }
+        // `SEC-56` D7: a failed handshake has its own sentence, so the
+        // owner is told to look at `SMTP_CA_FILE` and `SMTP_HOST` rather
+        // than at a relay that "could not be reached".
+        Some(e) if e == F::MailServerTlsFailed.message() => {
+            "The email was not sent: a secure connection to the mail server could not be made."
+        }
         _ => "The email was not sent.",
     }
 }
@@ -1759,6 +1765,12 @@ mod tests {
         assert_eq!(
             email_failure_reason(Some(F::MailServerRefused.message())),
             "The email was not sent: the mail server refused the message."
+        );
+        // `SEC-56` D7: the TLS failure has its own sentence, so the owner
+        // is told to look at `SMTP_CA_FILE` and `SMTP_HOST`.
+        assert_eq!(
+            email_failure_reason(Some(F::MailServerTlsFailed.message())),
+            "The email was not sent: a secure connection to the mail server could not be made."
         );
         assert_eq!(
             email_failure_reason(Some(F::EmailNotConfigured.message())),
