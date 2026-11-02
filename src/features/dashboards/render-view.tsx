@@ -75,8 +75,13 @@ function markReady() {
  * browser has painted, or after {@link READY_SAFETY_MS}. A page that cannot load
  * its data shows the sentence and raises an uncaught exception, which fails the
  * conversion (R3); it is marked ready so Gotenberg checks at once.
+ *
+ * `chart` (`BI-19` part D, plan D13): the view behind a chart's PNG, opened at
+ * `/render/chart/<token>`. The data route answers with one chart, so the page
+ * is that chart's title, the applied filters and the chart in a box 1200 px
+ * wide; the box (`data-render-chart`) is what Gotenberg screenshots.
  */
-export function RenderView({ token }: { token: string }) {
+export function RenderView({ token, chart = false }: { token: string; chart?: boolean }) {
   const [data, setData] = React.useState<RenderPayload | null>(null);
   const [state, setState] = React.useState<"loading" | "ok" | "error">("loading");
   const [message, setMessage] = React.useState("");
@@ -137,7 +142,7 @@ export function RenderView({ token }: { token: string }) {
   if (state === "error") {
     return <div role="alert" className="grid h-screen place-content-center px-4 text-center text-sm">{message}</div>;
   }
-  if (!data) return <div className="p-4 text-sm text-muted-foreground">Preparing the PDF…</div>;
+  if (!data) return <div className="p-4 text-sm text-muted-foreground">{chart ? "Preparing the image…" : "Preparing the PDF…"}</div>;
 
   const look = dashboardLook(data, false, data.reporting?.fonts);
   const locale = data.reporting?.numberLocale ?? "en-US";
@@ -155,6 +160,24 @@ export function RenderView({ token }: { token: string }) {
       : <TileBody spec={spec} cell={data.results[spec.id]} dark={look.dark} loading={false} />,
   }));
   const tabs = data.tabs ?? [];
+
+  if (chart) {
+    const only = data.charts[0];
+    return (
+      <ReportingProvider reporting={data.reporting}>
+        <RenderModeProvider value={mode}>
+          <div className={cn("w-[1200px] bg-background p-4 text-foreground", look.className)} style={look.style} data-render-chart>
+            <h1 className="text-xl font-semibold">{only?.title ?? name}</h1>
+            <p className="mt-1 text-xs text-muted-foreground" data-testid="render-filters">
+              {filters.length ? filters.join(" · ") : "No filters applied"}
+              {params.length ? ` · ${params.join(" · ")}` : ""}
+            </p>
+            <div className="mt-3 h-[480px]">{items[0]?.body}</div>
+          </div>
+        </RenderModeProvider>
+      </ReportingProvider>
+    );
+  }
 
   return (
     <ReportingProvider reporting={data.reporting}>

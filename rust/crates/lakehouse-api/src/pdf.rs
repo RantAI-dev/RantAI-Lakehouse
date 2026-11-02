@@ -130,6 +130,8 @@ pub enum PdfError {
     Refused(u16),
     /// The answer was not a PDF.
     NotAPdf,
+    /// The answer was not a PNG (`BI-19` part D).
+    NotAnImage,
 }
 
 impl std::fmt::Display for PdfError {
@@ -139,6 +141,7 @@ impl std::fmt::Display for PdfError {
             Self::Unreachable(e) => write!(f, "Gotenberg is unreachable: {e}"),
             Self::Refused(status) => write!(f, "Gotenberg answered HTTP {status}"),
             Self::NotAPdf => write!(f, "Gotenberg's answer was not a PDF"),
+            Self::NotAnImage => write!(f, "Gotenberg's answer was not a PNG"),
         }
     }
 }
@@ -193,6 +196,43 @@ body{font-size:8px;width:100%;text-align:center;color:#666;margin:0;\
 font-family:sans-serif}</style></head>\
 <body><span class=\"pageNumber\"></span> / <span class=\"totalPages\"></span></body></html>";
 
+/// POST one multipart form to a Gotenberg route and return the body of a
+/// success. The one HTTP path of the PDF and the image: no redirects, no
+/// proxy, the caller's deadline, and the status (never the text) of a refusal.
+async fn post_form(
+    endpoint: &str,
+    (content_type, body): (String, Vec<u8>),
+    deadline: Duration,
+) -> Result<Vec<u8>, PdfError> {
+    let client = reqwest::Client::builder()
+        .timeout(CLIENT_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .build()
+        .map_err(|e| PdfError::Unreachable(e.to_string()))?;
+    let send = client
+        .post(endpoint)
+        .header(reqwest::header::CONTENT_TYPE, content_type)
+        .body(body)
+        .send();
+    let response = match tokio::time::timeout(deadline, send).await {
+        Err(_) => return Err(PdfError::Timeout),
+        Ok(Err(e)) if e.is_timeout() => return Err(PdfError::Timeout),
+        Ok(Err(e)) => return Err(PdfError::Unreachable(e.to_string())),
+        Ok(Ok(response)) => response,
+    };
+    let status = response.status();
+    if !status.is_success() {
+        return Err(PdfError::Refused(status.as_u16()));
+    }
+    match tokio::time::timeout(deadline, response.bytes()).await {
+        Err(_) => Err(PdfError::Timeout),
+        Ok(Err(e)) if e.is_timeout() => Err(PdfError::Timeout),
+        Ok(Err(e)) => Err(PdfError::Unreachable(e.to_string())),
+        Ok(Ok(bytes)) => Ok(bytes.to_vec()),
+    }
+}
+
 /// Print `page_url` as a PDF through the Gotenberg at `gotenberg_url`.
 ///
 /// `deadline` is [`PDF_DEADLINE`] in the service; a test passes a short one.
@@ -237,41 +277,82 @@ pub async fn convert_url(
     form.file("files", "footer.html", "text/html", FOOTER_HTML);
     let (content_type, body) = form.finish();
 
-    let client = reqwest::Client::builder()
-        .timeout(CLIENT_TIMEOUT)
-        .redirect(reqwest::redirect::Policy::none())
-        .no_proxy()
-        .build()
-        .map_err(|e| PdfError::Unreachable(e.to_string()))?;
-    let endpoint = format!(
-        "{}/forms/chromium/convert/url",
-        gotenberg_url.trim_end_matches('/')
-    );
-    let send = client
-        .post(endpoint)
-        .header(reqwest::header::CONTENT_TYPE, content_type)
-        .body(body)
-        .send();
-    let response = match tokio::time::timeout(deadline, send).await {
-        Err(_) => return Err(PdfError::Timeout),
-        Ok(Err(e)) if e.is_timeout() => return Err(PdfError::Timeout),
-        Ok(Err(e)) => return Err(PdfError::Unreachable(e.to_string())),
-        Ok(Ok(response)) => response,
-    };
-    let status = response.status();
-    if !status.is_success() {
-        return Err(PdfError::Refused(status.as_u16()));
-    }
-    let bytes = match tokio::time::timeout(deadline, response.bytes()).await {
-        Err(_) => return Err(PdfError::Timeout),
-        Ok(Err(e)) if e.is_timeout() => return Err(PdfError::Timeout),
-        Ok(Err(e)) => return Err(PdfError::Unreachable(e.to_string())),
-        Ok(Ok(bytes)) => bytes,
-    };
+    let bytes = post_form(
+        &format!(
+            "{}/forms/chromium/convert/url",
+            gotenberg_url.trim_end_matches('/')
+        ),
+        (content_type, body),
+        deadline,
+    )
+    .await?;
     if !bytes.starts_with(b"%PDF") {
         return Err(PdfError::NotAPdf);
     }
-    Ok(bytes.to_vec())
+    Ok(bytes)
+}
+
+/// The width of a chart image in CSS pixels (`BI-19` plan D13).
+pub const PNG_WIDTH: u32 = 1200;
+
+/// The device scale factor of a chart image: 2, so the 1200 px page is a
+/// 2400 px picture (plan D13).
+pub const PNG_SCALE: u32 = 2;
+
+/// What the single-chart print view marks its picture box with; Gotenberg
+/// screenshots that element only, so the picture is the chart, its title and
+/// its applied filters and not the empty page around it.
+pub const PNG_SELECTOR: &str = "[data-render-chart]";
+
+/// The first eight bytes of every PNG file.
+const PNG_SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
+
+/// Screenshot `page_url` as a PNG through the Gotenberg at `gotenberg_url`.
+///
+/// The route and field names are the pinned version's (8.37.0):
+/// `POST /forms/chromium/screenshot/url` with `url`, `format`, `width`,
+/// `height`, `deviceScaleFactor`, `selector`, `waitForExpression` and
+/// `failOnConsoleExceptions`, as `FormDataChromiumScreenshotOptions` reads
+/// them in `pkg/modules/chromium/routes.go` at tag `v8.37.0`
+/// (<https://github.com/gotenberg/gotenberg/blob/v8.37.0/pkg/modules/chromium/routes.go>).
+/// The width is [`PNG_WIDTH`] and the scale [`PNG_SCALE`]. The page address is
+/// built from configuration by the caller, as for [`convert_url`].
+///
+/// # Errors
+///
+/// [`PdfError`]: not ready in time, Gotenberg unreachable or refusing, or an
+/// answer that is not a PNG.
+pub async fn screenshot_url(
+    gotenberg_url: &str,
+    page_url: &str,
+    deadline: Duration,
+) -> Result<Vec<u8>, PdfError> {
+    let mut form = Form::new();
+    form.text("url", page_url);
+    form.text("format", "png");
+    form.text("width", &PNG_WIDTH.to_string());
+    // The viewport is tall enough for the picture box; the element capture is
+    // what sets the picture's own height.
+    form.text("height", "800");
+    form.text("deviceScaleFactor", &PNG_SCALE.to_string());
+    form.text("selector", PNG_SELECTOR);
+    form.text("waitForExpression", READY_EXPRESSION);
+    // As the PDF (BI-1 review fix R3): a view that could not load its data
+    // raises an uncaught exception, which fails the screenshot.
+    form.text("failOnConsoleExceptions", "true");
+    let bytes = post_form(
+        &format!(
+            "{}/forms/chromium/screenshot/url",
+            gotenberg_url.trim_end_matches('/')
+        ),
+        form.finish(),
+        deadline,
+    )
+    .await?;
+    if !bytes.starts_with(PNG_SIGNATURE) {
+        return Err(PdfError::NotAnImage);
+    }
+    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -390,6 +471,54 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, PdfError::NotAPdf));
+    }
+
+    /// `BI-19` part D (plan D13): the screenshot route, the width, the scale
+    /// and the element, and nothing else from the caller.
+    #[tokio::test]
+    async fn the_screenshot_request_names_the_png_route_the_width_the_scale_and_the_box() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/forms/chromium/screenshot/url"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_bytes(b"\x89PNG\r\n\x1a\n fake".to_vec()),
+            )
+            .mount(&server)
+            .await;
+        let png = screenshot_url(
+            &server.uri(),
+            "http://console.test:3000/render/chart/t.o.k",
+            SHORT,
+        )
+        .await
+        .unwrap();
+        assert!(png.starts_with(b"\x89PNG"));
+        let sent = server.received_requests().await.unwrap();
+        let body = String::from_utf8_lossy(&sent[0].body);
+        for expected in [
+            "name=\"url\"\r\n\r\nhttp://console.test:3000/render/chart/t.o.k\r\n",
+            "name=\"format\"\r\n\r\npng\r\n",
+            "name=\"width\"\r\n\r\n1200\r\n",
+            "name=\"deviceScaleFactor\"\r\n\r\n2\r\n",
+            "name=\"selector\"\r\n\r\n[data-render-chart]\r\n",
+            "name=\"failOnConsoleExceptions\"\r\n\r\ntrue\r\n",
+        ] {
+            assert!(body.contains(expected), "missing {expected}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_answer_that_is_not_a_png_is_not_an_image() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/forms/chromium/screenshot/url"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"%PDF-1.7 x".to_vec()))
+            .mount(&server)
+            .await;
+        let err = screenshot_url(&server.uri(), PAGE, SHORT)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PdfError::NotAnImage), "{err}");
     }
 
     #[tokio::test]

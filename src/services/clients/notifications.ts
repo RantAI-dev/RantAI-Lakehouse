@@ -16,4 +16,15 @@ export const notificationsService: NotificationsService = {
     }
     return json as Notifications;
   },
+  async markMentionsRead(signal) {
+    const res = await apiFetch("/api/dashboard/comments/mentions/read", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+      signal,
+    });
+    if (!res.ok) {
+      throw new ServiceError("unavailable", "The mentions could not be marked as read");
+    }
+  },
 };

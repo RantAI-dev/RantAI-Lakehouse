@@ -1369,6 +1369,38 @@ pub async fn board_row_state(ch: &ChClient, id: &str) -> Result<Option<(u8, Stri
     }))
 }
 
+/// Where every dashboard sits, the trash included (removed-for-good rows are
+/// left out): the input [`crate::access::AccessMap::viewer`] needs to turn
+/// rules on folders and dashboards into the ids a [`Viewer`] is limited by.
+/// The built-in board is not in it. Read as the server, never from a request.
+///
+/// # Errors
+///
+/// Returns [`ChError`] on a `ClickHouse` failure.
+pub async fn board_placements(
+    ch: &ChClient,
+) -> Result<Vec<crate::access::BoardPlacement>, ChError> {
+    ensure_bi_table(ch).await?;
+    let rows = ch
+        .rows(
+            &format!(
+                "SELECT id, folder_id, owner_id FROM console.bi_board FINAL \
+                 WHERE is_deleted != 1 AND id != {}",
+                SqlLiteral::from(DEFAULT_BOARD_ID)
+            ),
+            None,
+        )
+        .await?;
+    Ok(rows
+        .iter()
+        .map(|r| crate::access::BoardPlacement {
+            id: row_str(r, "id").to_owned(),
+            folder_id: row_str(r, "folder_id").to_owned(),
+            owner_id: row_str(r, "owner_id").to_owned(),
+        })
+        .collect())
+}
+
 /// The same for a chart id: its latest row's `is_deleted` and the board it is
 /// on. `None` when the id never had a row.
 ///
@@ -2630,10 +2662,13 @@ pub async fn delete_board(ch: &ChClient, id: &str, deleted_by: &str) -> Result<(
 /// charts stays private. The charts go first, like a delete does, so a
 /// failure cannot leave live charts on a board that is gone.
 ///
+/// `pub` since BI-19 part D: a dashboard import that fails after the board was
+/// created takes it back the same way a failed copy does.
+///
 /// # Errors
 ///
 /// Returns [`ChError`] on a `ClickHouse` failure.
-async fn wipe_board(ch: &ChClient, id: &str) -> Result<(), ChError> {
+pub async fn wipe_board(ch: &ChClient, id: &str) -> Result<(), ChError> {
     let charts = format!(
         "INSERT INTO console.bi_chart (id, title, spec_json, board, created_by, is_deleted) \
          SELECT id, '', '{{}}', board, 'system', 1 FROM console.bi_chart FINAL \
@@ -4184,6 +4219,57 @@ fn resolved_from_inline(input: &ChartInput, inline: InlineSql<'_>) -> Result<Res
         fields: Vec::new(),
         joined: std::collections::HashMap::new(),
     })
+}
+
+/// The SQL sources a chart definition reads: its own and its other questions'
+/// (trimmed, non-empty).
+#[must_use]
+pub fn sql_sources_named(input: &ChartInput) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(id) = input.sql_source.as_deref() {
+        out.push(id.trim().to_owned());
+    }
+    for layer in input.shape.layers_list() {
+        if let Some(id) = layer.sql_source.as_deref() {
+            out.push(id.trim().to_owned());
+        }
+    }
+    out.retain(|id| !id.is_empty());
+    out
+}
+
+/// Whether the SQL sources a chart definition names (its own and its other
+/// questions') are ones `viewer` may use, `BI-19` B2 re-review S4-b.
+///
+/// A source filed in a folder the viewer cannot see is the same "not found" as
+/// an unknown id, so a chart cannot be used to read a hidden source's rows or
+/// to learn it exists. `keep` is what the chart already uses (an edit of a tile
+/// that reads a source keeps reading it: the dashboard governs, not the folder
+/// of the source); only a source the definition newly names is checked. Called
+/// by the routes that take a definition from a person (create, update, preview,
+/// the assistant's chart tools), never by rendering or by a duplicate, which
+/// work from stored charts.
+///
+/// # Errors
+///
+/// [`BiError::Validation`] with the unknown-source sentence, or
+/// [`BiError::Clickhouse`] when the source cannot be read.
+pub async fn ensure_sources_visible(
+    ch: &ChClient,
+    input: &ChartInput,
+    viewer: &Viewer,
+    keep: &[String],
+) -> Result<(), BiError> {
+    let named = sql_sources_named(input);
+    for id in named.iter().filter(|id| !keep.contains(id)) {
+        if let Some(found) = crate::sources::get_source(ch, id).await?
+            && !found.folder_id.is_empty()
+            && !viewer.sees_folder(&found.folder_id, "")
+        {
+            return Err(BiError::Validation(format!("SQL source '{id}' not found.")));
+        }
+    }
+    Ok(())
 }
 
 /// Resolve `input.mart` / `input.sql_source` (exactly one) into a

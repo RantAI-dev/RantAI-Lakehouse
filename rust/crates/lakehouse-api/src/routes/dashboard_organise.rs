@@ -37,7 +37,7 @@ use axum::Extension;
 use axum::body::Bytes;
 use axum::extract::{Query, State};
 use lakehouse_auth::Principal;
-use lakehouse_bi::access::Viewer;
+use lakehouse_bi::access::{Level, Viewer};
 use lakehouse_bi::items::{self, Kind, List};
 use lakehouse_bi::specs::ChartSource;
 use lakehouse_bi::store::{self, BiError, ChartInput, StoredChartSpec};
@@ -50,13 +50,14 @@ use serde_json::{Value, json};
 
 use crate::error::ApiResult;
 use crate::json::ApiJson;
+use crate::routes::dashboard_access::viewer_for;
 use crate::routes::dashboard_folders::{classify_bi_error, classify_ch_error};
 use crate::state::AppState;
 use crate::upstream_error;
 
 /// The one sentence for a dashboard the caller may not read or change:
 /// unknown, in the trash, or in somebody else's personal space.
-const BOARD_NOT_FOUND: &str = "dashboard not found.";
+pub(crate) const BOARD_NOT_FOUND: &str = "dashboard not found.";
 
 /// The sentence for a chart the caller may not change.
 const CHART_NOT_FOUND: &str = "this tile does not exist";
@@ -113,7 +114,7 @@ pub(crate) fn author_of(principal: &Principal) -> Author {
 /// [`Gate::Store`] when the store is unreachable.
 pub(crate) async fn require_board(ch: &ChClient, id: &str, viewer: &Viewer) -> Result<(), Gate> {
     match store::board_row_state(ch, id).await.map_err(Gate::Store)? {
-        Some((0, owner)) if viewer.sees(&owner) => Ok(()),
+        Some((0, owner)) if viewer.sees_board(id, &owner) => Ok(()),
         _ => Err(Gate::Missing(BOARD_NOT_FOUND)),
     }
 }
@@ -133,7 +134,13 @@ pub(crate) async fn require_chart_board(
 ) -> Result<(), Gate> {
     let board = board.map(str::trim).unwrap_or_default();
     if board.is_empty() || board == store::DEFAULT_BOARD_ID {
-        return Ok(());
+        // The built-in board belongs to the starting point (BI-19 part B1):
+        // somebody who sees only what they were given has no chart on it.
+        return if viewer.sees_builtin() {
+            Ok(())
+        } else {
+            Err(Gate::Missing(BOARD_NOT_FOUND))
+        };
     }
     match store::board_row_state(ch, board)
         .await
@@ -148,7 +155,9 @@ pub(crate) async fn require_chart_board(
         // in the trash: a chart may not be created on a dashboard that is
         // gone (`PR #199 review O SHOULD-FIX 2`).
         None | Some((1 | 2, _)) => Err(Gate::Missing(BOARD_NOT_FOUND)),
-        Some((_, owner)) if !viewer.sees(&owner) => Err(Gate::Missing(BOARD_NOT_FOUND)),
+        Some((_, owner)) if !viewer.sees_board(board, &owner) => {
+            Err(Gate::Missing(BOARD_NOT_FOUND))
+        }
         _ => Ok(()),
     }
 }
@@ -374,15 +383,24 @@ pub async fn versions_list(
     Extension(principal): Extension<Principal>,
     Query(q): Query<VersionsQuery>,
 ) -> ApiResult<ApiJson<Value>> {
+    // BI-19 part B1 (plan D8): history is read with the dashboard, and the
+    // entry check comes before the request is looked at.
+    let viewer = viewer_for(&state, &principal).await?;
     let id = q.board.as_deref().map(str::trim).unwrap_or_default();
     if id.is_empty() {
         return Err(ApiError::BadRequest("board is required.".to_owned()).into());
     }
     let ch = &state.clickhouse;
     if id == store::DEFAULT_BOARD_ID {
-        return Ok(ApiJson(json!({ "versions": [], "keep": versions::KEEP })));
+        // Kept apart from the rest: the built-in board has no history, and
+        // it belongs to the starting point.
+        return if viewer.sees_builtin() {
+            Ok(ApiJson(json!({ "versions": [], "keep": versions::KEEP })))
+        } else {
+            Err(Gate::Missing(BOARD_NOT_FOUND).into())
+        };
     }
-    require_board(ch, id, &viewer_of(&principal)).await?;
+    require_board(ch, id, &viewer).await?;
     let list = versions::list(ch, id)
         .await
         .map_err(|err| classify_ch_error(&err))?;
@@ -619,6 +637,9 @@ pub async fn revert(
     Extension(principal): Extension<Principal>,
     body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
+    // BI-19 B2 (plan D8): a caller who holds less than `edit` everywhere is
+    // refused first, whatever the request says.
+    crate::routes::dashboard_access::require_can_ever(&state, &principal, Level::Edit).await?;
     let body: RevertBody = parse(&body)?;
     let id = body.board.trim();
     if id.is_empty() || body.version == 0 {
@@ -630,7 +651,11 @@ pub async fn revert(
         );
     }
     let ch = &state.clickhouse;
-    require_board(ch, id, &viewer_of(&principal)).await?;
+    // BI-19 B1 review R5: the resolved viewer, so a restricted dashboard is a 404.
+    let scope = crate::routes::dashboard_access::scope_for_write(&state, &principal).await?;
+    require_board(ch, id, &scope.viewer).await?;
+    // BI-19 B2 (plan D8): going back is an edit.
+    crate::routes::dashboard_access::require_board_level(&state, &scope, id, Level::Edit).await?;
     let Some(stored) = versions::load(ch, id, body.version)
         .await
         .map_err(|err| classify_ch_error(&err))?
@@ -698,7 +723,8 @@ pub async fn trash_list(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
 ) -> ApiResult<ApiJson<Value>> {
-    let items = trash::list_trash(&state.clickhouse, &viewer_of(&principal))
+    let viewer = viewer_for(&state, &principal).await?;
+    let items = trash::list_trash(&state.clickhouse, &viewer)
         .await
         .map_err(|err| classify_ch_error(&err))?;
     Ok(ApiJson(
@@ -727,13 +753,57 @@ pub async fn trash_restore(
     Extension(principal): Extension<Principal>,
     body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
+    // BI-19 B2 (plan D8): a caller who holds less than `edit` everywhere is
+    // refused first, whatever the request says.
+    crate::routes::dashboard_access::require_can_ever(&state, &principal, Level::Edit).await?;
     let body: RestoreBody = parse(&body)?;
     let id = body.id.trim();
     if id.is_empty() {
         return Err(ApiError::BadRequest("id is required.".to_owned()).into());
     }
     let ch = &state.clickhouse;
-    let viewer = viewer_of(&principal);
+    // BI-19 B1 review R5: the resolved viewer, so a restricted dashboard is a 404.
+    let scope = crate::routes::dashboard_access::scope_for_write(&state, &principal).await?;
+    let viewer = scope.viewer.clone();
+    // BI-19 B2 (plan D8): bringing a dashboard back undoes a delete, so it is
+    // `manage`; a chart comes back with `edit` on its dashboard. The trashed
+    // row is not a live dashboard, so the level is read from where it sits;
+    // what the caller cannot see keeps the 404 the restore itself gives.
+    let placements = store::board_placements(ch)
+        .await
+        .map_err(|err| classify_ch_error(&err))?;
+    match Kind::parse(body.kind.trim()) {
+        Some(Kind::Board) => {
+            scope.refuse_below(&placements, id, Level::Manage)?;
+            // BI-19 B2 review B2-2: a dashboard whose folder is gone goes back
+            // to the root (`trash::restore_board`), which is a place the caller
+            // must be allowed to file into, not a way around the folder's rules.
+            if let Some(placement) = placements.iter().find(|p| p.id == id)
+                && !placement.folder_id.is_empty()
+            {
+                let live = lakehouse_bi::folders::list_folders(ch, &Viewer::system())
+                    .await
+                    .map_err(|err| classify_ch_error(&err))?;
+                if !live.iter().any(|f| f.id == placement.folder_id) {
+                    scope.require_root(Level::Edit)?;
+                }
+            }
+        }
+        Some(Kind::Chart) => {
+            if let Some((_, board)) = store::chart_row_state(ch, id)
+                .await
+                .map_err(|err| classify_ch_error(&err))?
+            {
+                if board.is_empty() || board == store::DEFAULT_BOARD_ID {
+                    // On the built-in dashboard: judged at the root.
+                    scope.require_root(Level::Edit)?;
+                } else {
+                    scope.refuse_below(&placements, &board, Level::Edit)?;
+                }
+            }
+        }
+        None => {}
+    }
     let outcome = match Kind::parse(body.kind.trim()) {
         Some(Kind::Board) => trash::restore_board(ch, id, &viewer).await,
         Some(Kind::Chart) => trash::restore_chart(ch, id, &viewer).await,
@@ -782,7 +852,7 @@ pub async fn shortcuts(
     Extension(principal): Extension<Principal>,
 ) -> ApiResult<ApiJson<Value>> {
     let ch = &state.clickhouse;
-    let viewer = viewer_of(&principal);
+    let viewer = viewer_for(&state, &principal).await?;
     let (favourites, recent) = tokio::try_join!(
         items::entries(ch, &viewer, List::Favourite),
         items::entries(ch, &viewer, List::Recent)
@@ -826,11 +896,12 @@ pub async fn favourite_set(
     Extension(principal): Extension<Principal>,
     body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
+    let viewer = viewer_for(&state, &principal).await?;
     let body: ItemBody = parse(&body)?;
     let (kind, id) = item_of(&body)?;
     items::set_favourite(
         &state.clickhouse,
-        &viewer_of(&principal),
+        &viewer,
         kind,
         &id,
         body.on.unwrap_or(true),
@@ -850,9 +921,10 @@ pub async fn recent_touch(
     Extension(principal): Extension<Principal>,
     body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
+    let viewer = viewer_for(&state, &principal).await?;
     let body: ItemBody = parse(&body)?;
     let (kind, id) = item_of(&body)?;
-    items::touch_recent(&state.clickhouse, &viewer_of(&principal), kind, &id)
+    items::touch_recent(&state.clickhouse, &viewer, kind, &id)
         .await
         .map_err(item_error)?;
     Ok(ApiJson(json!({ "ok": true })))
@@ -886,12 +958,9 @@ pub async fn search_names(
     Extension(principal): Extension<Principal>,
     Query(q): Query<SearchQuery>,
 ) -> ApiResult<ApiJson<Value>> {
-    let hits = search::search(
-        &state.clickhouse,
-        &viewer_of(&principal),
-        q.q.as_deref().unwrap_or(""),
-    )
-    .await
-    .map_err(|err| classify_bi_error(&err))?;
+    let viewer = viewer_for(&state, &principal).await?;
+    let hits = search::search(&state.clickhouse, &viewer, q.q.as_deref().unwrap_or(""))
+        .await
+        .map_err(|err| classify_bi_error(&err))?;
     Ok(ApiJson(json!({ "hits": hits })))
 }

@@ -42,7 +42,8 @@ use serde_json::{Value, json};
 use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::policy_engine::PolicyEngineObligations;
-use crate::routes::calc_fields::{Resolved, author_name, resolve};
+use crate::routes::calc_fields::{Resolved, author_name, resolve, resolve_visible};
+use crate::routes::dashboard_access::require_entitled;
 use crate::state::AppState;
 use crate::upstream_error;
 
@@ -141,6 +142,21 @@ async fn resolve_current(ch: &ChClient, kind: SourceKind, id: &str) -> Result<Re
     match kind {
         SourceKind::Mart => resolve(ch, Some(id), None).await,
         SourceKind::SqlSource => resolve(ch, None, Some(id)).await,
+    }
+}
+
+/// [`resolve_current`] for a handler that changes something on the source: a
+/// SQL source in a folder the caller cannot see is the unknown-source 404
+/// (`BI-19` B2 re-review S4-b).
+async fn resolve_current_visible(
+    state: &AppState,
+    principal: Option<&Extension<Principal>>,
+    kind: SourceKind,
+    id: &str,
+) -> Result<Resolved, ApiError> {
+    match kind {
+        SourceKind::Mart => resolve(&state.clickhouse, Some(id), None).await,
+        SourceKind::SqlSource => resolve_visible(state, principal, None, Some(id)).await,
     }
 }
 
@@ -343,6 +359,20 @@ async fn source_reads(ch: &ChClient, shown: &[MetricDef]) -> Vec<SourceRead> {
     read
 }
 
+/// The route's handler: [`list`] behind the entry check of `BI-19` part B1
+/// (plan D8). The router floor is "signed in"; this refuses somebody who holds
+/// neither `dashboard:read` nor a rule naming them or one of their roles. Kept
+/// apart from [`list`] because the assistant calls that one directly, after
+/// its own gate.
+pub async fn list_guarded(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    query: Query<ListQuery>,
+) -> ApiResult<ApiJson<Value>> {
+    require_entitled(&state, &principal).await?;
+    list(State(state), Some(Extension(principal)), query).await
+}
+
 /// `GET /api/dashboard/metrics[?mart=|source=]` — the metrics, each with the
 /// number of charts that use it and its source's title.
 ///
@@ -377,12 +407,13 @@ pub async fn list(
     // The counts and the SQL sources' titles are a courtesy: when they cannot
     // be read the list still answers.
     // The count is of the charts the caller may see (BI-18 part C, part 2).
-    let charts = store::list_stored_charts(
-        ch,
-        &crate::routes::calc_fields::viewer_or_anonymous(principal.as_ref()),
-    )
-    .await
-    .unwrap_or_default();
+    // BI-19 B1 review R3: the resolved viewer; a failure to resolve it counts nothing.
+    let viewer = crate::routes::dashboard_access::usage_viewer(&state, principal.as_ref())
+        .await
+        .unwrap_or_else(|_| lakehouse_bi::access::Viewer::nothing());
+    let charts = store::list_stored_charts(ch, &viewer)
+        .await
+        .unwrap_or_default();
     let titles: std::collections::HashMap<String, String> = lakehouse_bi::sources::list_sources(ch)
         .await
         .unwrap_or_default()
@@ -475,7 +506,15 @@ pub async fn create(
 ) -> ApiResult<ApiJson<Value>> {
     let parsed: MetricBody = parse(&body)?;
     let ch = &state.clickhouse;
-    let source = resolve(ch, parsed.mart.as_deref(), parsed.source.as_deref()).await?;
+    // BI-19 B2 re-review S4-b: a source the caller names is resolved as the
+    // viewer they read as (the unknown-source 404 for a hidden one).
+    let source = resolve_visible(
+        &state,
+        principal.as_ref(),
+        parsed.mart.as_deref(),
+        parsed.source.as_deref(),
+    )
+    .await?;
     let name = parsed.name.trim().to_owned();
     metrics::validate_name(&name, &source.cols).map_err(ApiError::BadRequest)?;
     let existing = metrics::list_metrics(ch)
@@ -521,7 +560,13 @@ pub async fn update(
         .await
         .map_err(|failure| classify_ch(&failure))?
         .ok_or_else(|| ApiError::NotFound(format!("metric '{id}' not found.")))?;
-    let source = resolve_current(ch, current.source_kind, &current.source_id).await?;
+    let source = resolve_current_visible(
+        &state,
+        principal.as_ref(),
+        current.source_kind,
+        &current.source_id,
+    )
+    .await?;
     let def = definition(parsed, &source, current.name.clone(), current.id.clone());
     let (mut def, _ok) = checked(&state, def, &source).await?;
     def.created_by = author_name(principal.as_ref());
@@ -552,7 +597,9 @@ pub async fn delete(
     let used = metric_usage(
         ch,
         &current,
-        &crate::routes::calc_fields::viewer_or_anonymous(principal.as_ref()),
+        // BI-19 B1 review R3: the resolved viewer, so a restricted dashboard
+        // is "a dashboard you cannot see", not its title.
+        &crate::routes::dashboard_access::usage_viewer(&state, principal.as_ref()).await?,
     )
     .await?;
     if !used.is_empty() {
@@ -586,7 +633,9 @@ pub async fn usage(
     let used = metric_usage(
         ch,
         &current,
-        &crate::routes::calc_fields::viewer_or_anonymous(principal.as_ref()),
+        // BI-19 B1 review R3: the resolved viewer, so a restricted dashboard
+        // is "a dashboard you cannot see", not its title.
+        &crate::routes::dashboard_access::usage_viewer(&state, principal.as_ref()).await?,
     )
     .await?;
     Ok(ApiJson(json!({
@@ -613,7 +662,15 @@ pub async fn validate(
     let parsed: MetricBody = parse(&body)?;
     let want_value = parsed.value;
     let ch = &state.clickhouse;
-    let source = resolve(ch, parsed.mart.as_deref(), parsed.source.as_deref()).await?;
+    // BI-19 B2 re-review S4-b: a source the caller names is resolved as the
+    // viewer they read as (the unknown-source 404 for a hidden one).
+    let source = resolve_visible(
+        &state,
+        principal.as_ref(),
+        parsed.mart.as_deref(),
+        parsed.source.as_deref(),
+    )
+    .await?;
     let own = parsed.name.trim().to_owned();
     let name = if lakehouse_core::ident::Ident::new(own.as_str()).is_ok() {
         own
@@ -737,6 +794,20 @@ pub(crate) async fn value_query(
 
 // ── segments ────────────────────────────────────────────────────────────
 
+/// The route's handler: [`list_segments`] behind the entry check of `BI-19` part B1
+/// (plan D8). The router floor is "signed in"; this refuses somebody who holds
+/// neither `dashboard:read` nor a rule naming them or one of their roles. Kept
+/// apart from [`list_segments`] because the assistant calls that one directly, after
+/// its own gate.
+pub async fn list_segments_guarded(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    query: Query<ListQuery>,
+) -> ApiResult<ApiJson<Value>> {
+    require_entitled(&state, &principal).await?;
+    list_segments(State(state), query).await
+}
+
 /// `GET /api/dashboard/segments[?mart=|source=]` — the segments.
 ///
 /// # Errors
@@ -809,7 +880,15 @@ pub async fn create_segment(
 ) -> ApiResult<ApiJson<Value>> {
     let parsed: SegmentBody = parse(&body)?;
     let ch = &state.clickhouse;
-    let source = resolve(ch, parsed.mart.as_deref(), parsed.source.as_deref()).await?;
+    // BI-19 B2 re-review S4-b: a source the caller names is resolved as the
+    // viewer they read as (the unknown-source 404 for a hidden one).
+    let source = resolve_visible(
+        &state,
+        principal.as_ref(),
+        parsed.mart.as_deref(),
+        parsed.source.as_deref(),
+    )
+    .await?;
     let name = parsed.name.trim().to_owned();
     metrics::validate_name(&name, &source.cols).map_err(ApiError::BadRequest)?;
     let existing = metrics::list_segments(ch)
@@ -860,7 +939,13 @@ pub async fn update_segment(
         .await
         .map_err(|failure| classify_ch(&failure))?
         .ok_or_else(|| ApiError::NotFound(format!("segment '{id}' not found.")))?;
-    let source = resolve_current(ch, current.source_kind, &current.source_id).await?;
+    let source = resolve_current_visible(
+        &state,
+        principal.as_ref(),
+        current.source_kind,
+        &current.source_id,
+    )
+    .await?;
     let mut def = segment_definition(parsed, &source, current.name.clone(), current.id.clone());
     check_segment(&state, &def, &source).await?;
     def.created_by = author_name(principal.as_ref());
@@ -891,7 +976,9 @@ pub async fn delete_segment(
     let used = segment_usage(
         ch,
         &current,
-        &crate::routes::calc_fields::viewer_or_anonymous(principal.as_ref()),
+        // BI-19 B1 review R3: the resolved viewer, so a restricted dashboard
+        // is "a dashboard you cannot see", not its title.
+        &crate::routes::dashboard_access::usage_viewer(&state, principal.as_ref()).await?,
     )
     .await?;
     if !used.is_empty() {
@@ -992,6 +1079,59 @@ mod tests {
         let used = usage_of(&ch, pick, Vec::new(), &admin).await.unwrap();
         assert_eq!(used.chart_rows.len(), 2);
         assert!(!used.charts.contains(&HIDDEN_USE.to_owned()));
+    }
+
+    /// `BI-19` B1 review R3 (test owed, B2 review S5): a chart on a dashboard the
+    /// caller's rules leave out (a restriction, not a personal space) blocks the
+    /// delete without being named, listed or counted among the dashboards.
+    #[tokio::test]
+    async fn a_chart_on_a_restricted_dashboard_blocks_a_delete_without_being_named() {
+        use lakehouse_bi::access::{AccessMap, BoardPlacement, ItemKind, Level};
+        let server = MockServer::start().await;
+        answer(
+            &server,
+            &["FROM console.bi_chart FINAL", "NOT IN ('b_secret')"],
+            vec![chart("c_public", "b_public")],
+        )
+        .await;
+        answer(
+            &server,
+            &["FROM console.bi_chart FINAL"],
+            vec![chart("c_public", "b_public"), chart("c_secret", "b_secret")],
+        )
+        .await;
+        answer(&server, &["FROM console.bi_board FINAL"], vec![]).await;
+        let ch =
+            lakehouse_clickhouse::ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let placements = [BoardPlacement {
+            id: "b_secret".to_owned(),
+            folder_id: String::new(),
+            owner_id: String::new(),
+        }];
+        let viewer = AccessMap::new(
+            "u_me",
+            false,
+            Some(Level::View),
+            &[],
+            &[],
+            &[(ItemKind::Board, "b_secret".to_owned())],
+        )
+        .viewer(&placements)
+        .unwrap();
+        let pick = |charts: &[lakehouse_bi::store::StoredChartSpec]| -> Vec<String> {
+            charts.iter().map(|c| c.spec.id.clone()).collect()
+        };
+
+        let used = usage_of(&ch, pick, Vec::new(), &viewer).await.unwrap();
+        assert!(!used.is_empty(), "the delete is still blocked");
+        assert_eq!(used.chart_rows.len(), 1, "only the visible chart is listed");
+        assert!(
+            used.charts.contains(&HIDDEN_USE.to_owned()),
+            "{:?}",
+            used.charts
+        );
+        assert!(!used.sentence().contains("c_secret"), "{}", used.sentence());
+        assert!(!used.sentence().contains("b_secret"), "{}", used.sentence());
     }
 
     /// BI-2 (T3): a metric watched by an alert rule cannot be deleted, and the
