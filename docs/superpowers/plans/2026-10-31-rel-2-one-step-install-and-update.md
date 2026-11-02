@@ -2829,6 +2829,127 @@ with "the backup tool failed: Text file busy (os error 26)" in
 fixed in review round 2 (`fe77e06c`, the fake tool is a committed file that is symlinked into the
 temporary directory).
 
+### Fix for the PR #335 update-proof, marker check (developer, 2026-11-02)
+
+**Commits** (branch `feat/rel-2-s4b-lakehousectl-update`, on top of `364c12a8`), ONE commit, and it
+carries this entry:
+
+| Commit | Task | What |
+| --- | --- | --- |
+| `fix(release): the proof's API calls carry a session (PR #335 update-proof, marker check 401)` | PR #335 update-proof, marker check 401 | one helper, `ops/release/proof_api.sh`, signs in and keeps the session in a cookie jar; every API call of the `update-proof` job goes through it |
+
+**What failed.** PR #335's `update-proof` job got through the REAL update to bundle B: every image
+was loaded, the writers were stopped, the backup was taken, and the stack ran
+`0.1.0-update-proof.1`. The marker in the application database was there, and the marker in
+ClickHouse was there. Then the step "The markers are still there after the update to bundle B"
+failed on the THIRD marker:
+
+```
+detail="$(curl -fsS "http://127.0.0.1:8080/api/connectors/$connector")"
+curl: (22) The requested URL returned error: 401
+```
+
+**The cause.** The third marker is a stored connector credential, and it is read back through the
+API — and `GET /api/connectors/{id}` is AUTHENTICATED: it needs the `connector:manage` permission
+(`rust/crates/lakehouse-api/src/policy.rs:758`). The marker check called the API with a bare `curl`
+and NO session, so the API answered 401. The seeding step DID authenticate — a cookie jar, the
+bootstrap administrator's sign-in, and the first-sign-in password rotation — but that session lived
+in that step's own `cookies.txt`, and the two marker checks never used it. The session was also not
+something to carry across an update: the update restarts the stack, and the rollback restarts it
+again.
+
+**The fix.** One helper, `ops/release/proof_api.sh`, and EVERY API call of the proof goes through
+it, so that no step can forget the sign-in:
+
+- it signs in (`POST /api/auth/login`) and keeps the session in a cookie jar;
+- it makes the call with that jar;
+- it signs in PER CALL, because the update restarts the stack and the rollback restarts it again:
+  no step depends on the session of the step before it.
+
+The password it signs in with is the CURRENT one, and the seeding step keeps the file that holds it
+up to date: the bootstrap password first, and the rotated one after the rotation — the rotation
+replaces the password AND revokes every session
+(`rust/crates/lakehouse-api/src/routes/auth.rs:567`), so the bootstrap password is refused
+afterwards. The sign-in payload is built with `jq -n --arg`, because the password is a secret and
+a secret is never spliced into a string by the shell.
+
+The three steps that call the API now call the helper: "Seed the markers" (the sign-in, the
+rotation, and the connector's creation), "The markers are still there after the update to bundle B",
+and "The stack runs bundle B again, and the markers are still there".
+
+**The tests.** `ops/release/test_release_workflow.py`, in `UpdateProofTest`:
+
+| Test | What it holds |
+| --- | --- |
+| `test_every_api_call_of_the_update_proof_carries_a_session` | in the `update-proof` job, every call to `127.0.0.1:8080/api/` goes through the authenticated helper, or passes the cookie jar or the bearer token |
+| `test_a_proof_that_calls_the_api_without_a_session_is_reported` | the check can fail: a synthetic workflow that calls the API with a bare `curl` is reported, and the same call with the cookie jar is not |
+| `test_the_marker_checks_read_the_credential_through_the_helper` | the two marker checks read the credential through the helper |
+| `test_the_helper_signs_in_and_calls_the_api_with_its_session` | the helper signs in, keeps the session in a cookie jar, and makes the call with the jar |
+| `test_a_helper_that_calls_the_api_without_its_session_is_reported` | the check above can fail |
+
+The check reads the job's `run:` blocks as shell: the comment lines are dropped (`shell_commands`), a
+line that ends with a backslash is joined with the next one (`logical_lines`), and a call that
+names the API's base URL and its `/api/` path must either name the helper or carry the session
+(`-b`, `--cookie`, or an `authorization: bearer` header).
+
+**The new tests fail on the workflow as it was.** With the workflow of `364c12a8` checked out
+(`git show 364c12a8:.github/workflows/release.yml`), the two new checks fail and report the four
+calls that carried no session — the two sign-ins of the seeding step and the two marker checks:
+
+```
+FAIL: test_every_api_call_of_the_update_proof_carries_a_session
+AssertionError: Lists differ: ['update-proof: Seed the markers: the call to the API carries no
+session: curl -fsS -c cookies.txt -X POST http://127.0.0.1:8080/api/auth/login …', …] != []
+FAIL: test_the_marker_checks_read_the_credential_through_the_helper
+AssertionError: 'ops/release/proof_api.sh' not found in '… detail="$(curl -fsS
+"http://127.0.0.1:8080/api/connectors/$connector")" …'
+Ran 97 tests — FAILED (failures=2)
+```
+
+**Commands run, in the foreground, on the final commit:**
+
+| Command | Result |
+| --- | --- |
+| `python3 -m pytest ops/release -q` (the venv `/tmp/opencode/pr335/venv/bin/python`, pytest 9.2.0, pyyaml 6.0.3, cryptography) | **231 passed** (226 before this fix, 5 new) |
+| `python3 -m unittest discover -s ops/release -p 'test_release_workflow.py'` | **Ran 97 tests — OK** (92 before this fix) |
+| the same, against the workflow of `364c12a8` | **FAILED (failures=2)** — the four session-less calls reported |
+| `actionlint .github/workflows/release.yml` (actionlint 1.7.12, installed with `pip install actionlint-py` into the throwaway venv) | no findings, exit 0 |
+| the same, with shellcheck 0.10.0 on the PATH | 5 findings, ALL of them pre-existing and in other steps (the `sudo tee` redirects and one `SC2129`); the same 5 are reported for the workflow of `364c12a8`, and none is in a step this fix touches |
+| `shellcheck ops/release/proof_api.sh` (shellcheck 0.10.0, downloaded to `/tmp`) | clean, exit 0 |
+| `bash -n ops/release/proof_api.sh` | clean, exit 0 |
+| `python3 ops/lint/check_intra_package_imports.py` | `OK: all intra-package dispar_orchestrate imports resolve` |
+| `python3 ops/lint/check_bare_iceberg_count.py` | `R11 guard: no bare count() against a Bronze Iceberg table found.` |
+| `git status` | clean (nothing generated staged) |
+
+**The helper was measured against a stub of the API**, on this host, with a small
+`http.server` that answers `/api/auth/login`, `/api/auth/change-password` and
+`/api/connectors` the way the real API does (the session cookie, and the rotation that revokes
+every session). The sequence the seeding step runs — sign in with the bootstrap password, rotate,
+sign in with the new password, create the connector — answered `the connector is
+conn-s4-update-proof`, and the marker check answered `{"id": "conn-s4-update-proof",
+"credentialManaged": true}`. A stale cookie jar (the session ended) is signed in again and the
+call succeeds; the OLD password after the rotation is refused with "the sign-in was refused"; a
+missing password file and a `.env` with no `AUTH_BOOTSTRAP_EMAIL` each stop with their own
+message. This is a STUB, not the API: the proof against the real API is PR #335's own
+`update-proof` job.
+
+**Not verified, with the reason:**
+
+- **The PR's own `update-proof` job was not run.** It needs a GitHub runner: the images, the
+  throwaway registry, cosign, a multi-GiB bundle and the whole stack. What stands in for it here
+  is the workflow's own tests (5 new cases, run against the workflow as it was and against the
+  fixed one), `actionlint`, and the stub run above.
+- **The whole-workspace cargo run** (`cargo clippy --workspace --all-targets --all-features -D
+  warnings` and `cargo test --workspace`): not run here — this fix touches no Rust source
+  (`git diff HEAD -- rust/crates/` is empty); the Rust it reads was read, not changed.
+- **No bun command ran**: the branch changes no TypeScript.
+- **The Dagster code location** (`(cd dagster && python -m pytest dispar_orchestrate -q)`): not
+  run — the branch changes no Python under `dagster/`. The two repo lints that scan it ran, and
+  both are OK.
+- **`docker compose --profile '*' config --quiet`**: not run — the branch changes no compose file.
+- **The pushes**: the commit was pushed to `origin/feat/rel-2-s4b-lakehousectl-update`. No push was
+  refused, so no `git pull --no-rebase` and no resolve was needed. No pull request was opened.
+
 
 ## 7. Review (planner appends below)
 

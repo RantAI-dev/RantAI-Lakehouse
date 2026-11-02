@@ -1940,26 +1940,31 @@ jobs:
           # bootstrap credential must be rotated before any other route
           # is reachable — so the password is changed FIRST, and the
           # second sign-in is the one that carries the session.
-          email="$(grep -E '^AUTH_BOOTSTRAP_EMAIL=' install/.env | cut -d= -f2- | tr -d '"')"
+          #
+          # EVERY call goes through `ops/release/proof_api.sh`: it signs
+          # in, keeps the session in a cookie jar, and makes the call
+          # with the jar. A call with no session answers 401 — which is
+          # how the marker check failed after the real update to bundle
+          # B (PR #335 update-proof, marker check 401).
           password="$(awk '/^lakehousectl: sign-in:/{getline; print; exit}' install.log | tr -d '[:space:]')"
-          if [ -z "$email" ] || [ -z "$password" ]; then
+          if [ -z "$password" ]; then
             echo "::error::the install's output holds no administrator sign-in"
             exit 1
           fi
-          curl -fsS -c cookies.txt -X POST http://127.0.0.1:8080/api/auth/login \
-            -H 'content-type: application/json' \
-            -d "{\"email\": \"$email\", \"password\": \"$password\"}" > /dev/null
-          curl -fsS -b cookies.txt -X POST http://127.0.0.1:8080/api/auth/change-password \
-            -H 'content-type: application/json' \
-            -d '{"newPassword": "s4-update-proof-password-0001"}' > /dev/null
+          # The helper signs in with the password in this file, and the
+          # file holds the CURRENT one: the bootstrap password first,
+          # and the rotated one after the rotation.
+          printf '%s' "$password" > proof-password.txt
+          ops/release/proof_api.sh login
+          ops/release/proof_api.sh post /api/auth/change-password \
+            '{"newPassword": "s4-update-proof-password-0001"}'
           # The rotation revokes every session, including the one that
-          # made it — so the proof signs in again.
-          curl -fsS -c cookies.txt -X POST http://127.0.0.1:8080/api/auth/login \
-            -H 'content-type: application/json' \
-            -d "{\"email\": \"$email\", \"password\": \"s4-update-proof-password-0001\"}" > /dev/null
-          connector="$(curl -fsS -b cookies.txt -X POST http://127.0.0.1:8080/api/connectors \
-            -H 'content-type: application/json' \
-            -d '{"name": "s4-update-proof", "type": "PostgreSQL", "direction": "source",
+          # made it — so the helper signs in again, with the NEW
+          # password.
+          printf '%s' 's4-update-proof-password-0001' > proof-password.txt
+          ops/release/proof_api.sh login
+          connector="$(ops/release/proof_api.sh post /api/connectors \
+            '{"name": "s4-update-proof", "type": "PostgreSQL", "direction": "source",
                  "host": "marker.internal",
                  "credential": {"source": "managed", "primary": "password",
                                 "values": {"primary": "s4-update-proof-secret"}},
@@ -2014,6 +2019,13 @@ jobs:
 
       # The three markers, read back. The proof runs this after the
       # update to bundle B and after the rollback of bundle C.
+      #
+      # The third marker is read through the API, and that call is
+      # AUTHENTICATED — it goes through `ops/release/proof_api.sh`,
+      # which signs in and keeps the session in a cookie jar. A bare
+      # `curl` answers 401 here, which is how this step failed after
+      # the real update to bundle B (PR #335 update-proof, marker check
+      # 401).
       - name: The markers are still there after the update to bundle B
         run: |
           set -euo pipefail
@@ -2033,7 +2045,7 @@ jobs:
             echo "::error::the marker in ClickHouse is gone: '$clickhouse'"
             exit 1
           fi
-          detail="$(curl -fsS "http://127.0.0.1:8080/api/connectors/$connector")"
+          detail="$(ops/release/proof_api.sh get "/api/connectors/$connector")"
           if [ "$(echo "$detail" | jq -r .credentialManaged)" != "true" ]; then
             echo "::error::the stored connector credential is gone: $detail"
             exit 1
@@ -2066,6 +2078,12 @@ jobs:
 
       # Afterwards the stack runs bundle B again, and every marker is
       # still there.
+      #
+      # The third marker is read through the API, and that call is
+      # AUTHENTICATED — it goes through `ops/release/proof_api.sh`,
+      # which signs in again after the rollback (the rollback restarts
+      # the stack) and keeps the session in a cookie jar. A bare `curl`
+      # answers 401 here (PR #335 update-proof, marker check 401).
       - name: The stack runs bundle B again, and the markers are still there
         run: |
           set -euo pipefail
@@ -2092,7 +2110,7 @@ jobs:
             echo "::error::the marker in ClickHouse is gone: '$clickhouse'"
             exit 1
           fi
-          detail="$(curl -fsS "http://127.0.0.1:8080/api/connectors/$connector")"
+          detail="$(ops/release/proof_api.sh get "/api/connectors/$connector")"
           if [ "$(echo "$detail" | jq -r .credentialManaged)" != "true" ]; then
             echo "::error::the stored connector credential is gone: $detail"
             exit 1

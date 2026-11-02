@@ -60,6 +60,13 @@ And three more since REL-2 S3 D13, from the review round 3 BLOCKER 1
     hide the bug the proof exists for, because Compose pulls silently
     when it may.
 
+And one more since PR #335's `update-proof` job, from the marker check that
+failed after the REAL update to bundle B:
+
+  - every call to the API in the `update-proof` job carries a session: the
+    authenticated helper (`ops/release/proof_api.sh`) signs in and keeps the
+    session in a cookie jar, and a call with no session answers 401.
+
 And two more since REL-2 S3 review round 4 BLOCKER 1, from the dry run
 that lost its registry:
 
@@ -180,6 +187,35 @@ DAGSTER_STEPS = (
 # The install's own `.env`: the file that names the profiles the
 # install runs, and the file the proof's compose call reads.
 INSTALL_ENV = "--env-file install/.env"
+
+# The API the proof talks to, and the part of it that is authenticated.
+#
+# The proof's third marker is a stored connector credential, and it is
+# read back through the API: `GET /api/connectors/{id}` needs the
+# `connector:manage` permission, and a call with NO session answers
+# 401. The marker check that ran after the real update to bundle B
+# failed exactly there — "curl: (22) The requested URL returned error:
+# 401" — because it called the API with no session at all (PR #335
+# update-proof, marker check 401).
+API_BASE_URL = "http://127.0.0.1:8080"
+API_PATH = "/api/"
+
+# The helper that signs in and makes the call: every API call of the
+# proof goes through it, so that no step can forget the sign-in.
+PROOF_API_HELPER = "ops/release/proof_api.sh"
+
+# A call that carries the session ITSELF: the cookie jar of the
+# sign-in, or a bearer token.
+SESSION_CARRYING = re.compile(
+    r"(?:^|\s)(?:-b\b|--cookie\b)|authorization:\s*bearer",
+    re.IGNORECASE,
+)
+
+# The two steps that read the three markers back.
+MARKER_STEPS = (
+    "The markers are still there after the update to bundle B",
+    "The stack runs bundle B again, and the markers are still there",
+)
 
 # The digest reference the proof's own steps pull, and the commands the
 # check below reads.
@@ -504,6 +540,44 @@ jobs:
 """
 
 
+# A workflow whose proof reads the stored connector credential with a
+# bare `curl`: the call carries no session, and the API answers 401
+# (PR #335 update-proof, marker check 401).
+SYNTHETIC_PROOF_CALLS_THE_API_WITHOUT_A_SESSION = """
+name: Synthetic
+on: workflow_dispatch
+jobs:
+  update-proof:
+    runs-on: ubuntu-latest
+    steps:
+      - name: The markers are still there after the update to bundle B
+        run: |
+          detail="$(curl -fsS "http://127.0.0.1:8080/api/connectors/$connector")"
+"""
+
+# The same call with the sign-in's cookie jar: the API answers it.
+SYNTHETIC_PROOF_CALLS_THE_API_WITH_THE_COOKIE_JAR = """
+name: Synthetic
+on: workflow_dispatch
+jobs:
+  update-proof:
+    runs-on: ubuntu-latest
+    steps:
+      - name: The markers are still there after the update to bundle B
+        run: |
+          detail="$(curl -fsS -b cookies.txt "http://127.0.0.1:8080/api/connectors/$connector")"
+"""
+
+# A helper that signs in and then makes the call with NO session: the
+# call it makes is the one the API refuses with 401.
+SYNTHETIC_HELPER_WITHOUT_A_SESSION = """
+#!/usr/bin/env bash
+set -euo pipefail
+curl -fsS -c "$COOKIE_JAR" -X POST "$API_URL/api/auth/login" -d "$payload" > /dev/null
+curl -fsS "$API_URL$path"
+"""
+
+
 def load_workflow(path: Path = WORKFLOW_PATH) -> dict[str, Any]:
     """The workflow, parsed."""
     return yaml.safe_load(path.read_text(encoding="utf-8"))
@@ -746,6 +820,52 @@ def untagged_saves(document: dict[str, Any], job_name: str) -> list[str]:
                     f"and nothing tags it in between: on Docker's containerd image store a pull by "
                     f"digest does not create the tag, so the save fails with 'No such image'."
                 )
+    return problems
+
+
+def api_calls_without_a_session(document: dict[str, Any], job_name: str) -> list[str]:
+    """Every call to the API that carries no session.
+
+    The API's `/api/` routes are authenticated, and a call with no
+    session answers 401 — the marker check that ran after the real
+    update to bundle B failed on exactly that (PR #335 update-proof,
+    marker check 401). A call carries a session either through the
+    authenticated helper — which signs in and keeps the session in a
+    cookie jar — or through the cookie jar or the bearer token itself.
+    """
+    problems: list[str] = []
+    for step in steps_of(document, job_name):
+        name = str(step.get("name"))
+        for line in logical_lines(str(step.get("run") or "")):
+            if API_BASE_URL not in line or API_PATH not in line:
+                continue
+            if PROOF_API_HELPER in line or SESSION_CARRYING.search(line):
+                continue
+            problems.append(
+                f"{job_name}: {name}: the call to the API carries no session: {line}"
+            )
+    return problems
+
+
+def helper_problems(script: str) -> list[str]:
+    """What the helper script is missing.
+
+    The helper is what makes the proof's calls authenticated, so it
+    must sign in, keep the session in a cookie jar, and make the call
+    with the jar.
+    """
+    problems: list[str] = []
+    if "/api/auth/login" not in script:
+        problems.append("the helper never signs in")
+    if "jq -n --arg" not in script:
+        problems.append(
+            "the sign-in payload is not built with jq -n --arg, and a secret is never "
+            "spliced into a string by the shell"
+        )
+    if '-c "$COOKIE_JAR"' not in script:
+        problems.append("the helper does not keep the session in a cookie jar")
+    if '-b "$COOKIE_JAR"' not in script:
+        problems.append("the helper does not make the call with the session")
     return problems
 
 
@@ -1918,6 +2038,53 @@ class UpdateProofTest(unittest.TestCase):
         self.assertIn("the postgres marker", run)
         self.assertIn("the clickhouse marker", run)
         self.assertIn("credentialManaged", run)
+
+    # ── The session the API calls carry ──────────────────────────────
+
+    def test_every_api_call_of_the_update_proof_carries_a_session(self) -> None:
+        """A call to the API with no session answers 401.
+
+        The marker check that ran after the REAL update to bundle B
+        failed on it (PR #335 update-proof, marker check 401): it read
+        the stored connector credential with a bare `curl`, and the API
+        refused the call. Every call of the proof now goes through the
+        authenticated helper, which signs in and keeps the session in a
+        cookie jar.
+        """
+        problems = api_calls_without_a_session(self.document, "update-proof")
+        self.assertEqual(problems, [], "\n".join(problems))
+
+    def test_a_proof_that_calls_the_api_without_a_session_is_reported(self) -> None:
+        """The check above must be able to fail."""
+        document = yaml.safe_load(SYNTHETIC_PROOF_CALLS_THE_API_WITHOUT_A_SESSION)
+        self.assertNotEqual(api_calls_without_a_session(document, "update-proof"), [])
+        with_jar = yaml.safe_load(SYNTHETIC_PROOF_CALLS_THE_API_WITH_THE_COOKIE_JAR)
+        self.assertEqual(api_calls_without_a_session(with_jar, "update-proof"), [])
+
+    def test_the_marker_checks_read_the_credential_through_the_helper(self) -> None:
+        """The two marker checks call the API through the helper.
+
+        The helper signs in per call: the update restarts the stack, and
+        the rollback restarts it again, so no step may depend on the
+        session of the step before it.
+        """
+        for name in MARKER_STEPS:
+            run = str(step_named(self.document, "update-proof", name).get("run"))
+            self.assertIn(PROOF_API_HELPER, run, name)
+
+    def test_the_helper_signs_in_and_calls_the_api_with_its_session(self) -> None:
+        """The helper is what makes the call authenticated.
+
+        It signs in, it keeps the session in a cookie jar, and it makes
+        the call with the jar.
+        """
+        script = (RELEASE_DIR / "proof_api.sh").read_text(encoding="utf-8")
+        problems = helper_problems(script)
+        self.assertEqual(problems, [], "\n".join(problems))
+
+    def test_a_helper_that_calls_the_api_without_its_session_is_reported(self) -> None:
+        """The check above must be able to fail."""
+        self.assertNotEqual(helper_problems(SYNTHETIC_HELPER_WITHOUT_A_SESSION), [])
 
     def test_the_update_proof_says_why_the_real_previous_release_test_is_not_here(self) -> None:
         """The real "previous release" test joins this job once 0.2.0
