@@ -4246,3 +4246,30 @@ Accept: `bash -n scripts/restore-from-backup.sh`, `shellcheck` on the script if 
 - **Handoff:** the developer's session ended before writing the round 6 handoff. The commands above stand in for it.
 
 **Open:** no BLOCKER on the code. The merge waits for the PR's `Release · dry run` and `Proof · the update moves the stack, and rolls back` on this head.
+
+### Review S4b round 8 (planner, 2026-11-02, at `c4d6389d`): the rollback's restore now fails without a word
+
+The PR's update proof failed again, in run `41424695520` (job `125240342643`), at the same step. This time it stopped at a different point:
+
+```
+lakehousectl: the update to 0.1.0-update-proof.2 failed, and the ROLLBACK failed too: … The rollback said:
+the backup tool failed: …/install/tools/restore-from-backup.sh exited with exit status: 1
+```
+
+**The restore printed nothing on its error stream.** `sys::failed_with_stderr` appends the tool's last stderr lines, and here there were none. Round 6 showed the ClickHouse `Code: 608` lines the same way, so this time a command under `set -euo pipefail` stopped the script without saying anything. The proof cannot tell us where.
+
+**BLOCKER 2. A failing restore must say what failed** (principle 2; rule 14: "unsupported, honestly").
+- `scripts/restore-from-backup.sh` (and `ops/backups/backup-local.sh`, for the same reason) gets an `ERR` trap, set right after `set -euo pipefail`:
+  `trap 'echo "Error: ${BASH_SOURCE[0]##*/} line ${LINENO}: \`${BASH_COMMAND}\` exited with $?" >&2' ERR`
+- It sits beside the existing `EXIT` trap, which stays as it is. Comment it with this finding.
+- `test_backup_scripts.py` gains a test: a restore that fails at a silent command prints the line and the command to stderr.
+
+**BLOCKER 3. Find and fix the silent failure.**
+- After BLOCKER 2 is pushed, the PR's own update proof names the line, and the planner adds it here.
+- If the developer can reproduce it first, without bringing up the whole stack, do so and fix it in the same sitting. Likely suspects in the round 6 code:
+  - `pg_dump_databases` under the runner's `awk`, which is `mawk` on Ubuntu, not `gawk`;
+  - the `while … done < <(…)` read;
+  - the `present="$(…)"` check.
+- The fix is cited at its site as round 8 BLOCKER 3.
+
+Accept: `bash -n` on both scripts, `shellcheck -S warning` on both, `python3 -m pytest ops/release -q`, and then the PR's `Proof · the update moves the stack, and rolls back` green.
