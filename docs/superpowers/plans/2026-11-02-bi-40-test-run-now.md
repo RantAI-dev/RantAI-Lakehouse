@@ -165,3 +165,82 @@ Full verification block of `AGENTS.md` once before handoff (Rust, TypeScript, `g
 ## 5. Handoff (developer appends below)
 
 ## 6. Review (planner appends below)
+
+### Handoff (developer, 2026-11-02)
+
+Branch `fix/bi-40-test-run-now`, based on `origin/main` (`a081fea9`; the branch's
+merge commit is `603a3487`). One commit per task, pushed after each.
+
+#### Commits
+
+- `3f59241a` T1 (D4) — `refactor(alerts): one helper runs one rule (BI-40 D4)`.
+  `run_one(state, only)` holds the rule part of `run`; `run` keeps
+  `check_run_token` first and its scheduler passes; `run_alert_rule` calls it
+  and loses its own copy of the sources (so a chart rule is read and an
+  instance is saved).
+- `fad4b847` T2 (D1, D2, D3, D6) — `feat(alerts): a person tests one rule at
+  POST /api/alerts/test`. The route, `authorise_rule_test` (D2's order),
+  `may_delete` → `may_manage`, the `POLICY_TABLE` row, the route mount, the
+  assistant guard (`run_alert_rule` now takes the principal), and the tests.
+- `0d4e654a` T3 (D7) — `feat(ai): run_alert_rule says what a test run does,
+  with an AI-15 case`. The description, the regenerated
+  `tests/fixtures/tool_schemas.json` (one hunk), one `alert_test_run_now` case.
+- `df5a45a4` T4 (D5, D6) — `feat(alerts): the console tests one rule, and says
+  so`. `testRule(id)` replaces `runRules`, "Run all now" and its handler are
+  gone, the 403 sentence and the 404 passthrough, the client and page tests.
+- `1cf742ba` T5 — `docs(alerts): changelog and module doc for the person's
+  test door`. `CHANGELOG.md` under Unreleased/Fixed; the module doc of
+  `routes/alerts.rs` names both doors.
+
+#### Commands run (from this worktree)
+
+- `cargo fmt --check` — clean.
+- `cargo clippy -p lakehouse-api --all-targets -- -D warnings` — clean, on the
+  final commit.
+- `cargo test -p lakehouse-api --test alert_test_route` — 6 passed.
+- `cargo test -p lakehouse-api --test chart_alerts` — 11 passed.
+- `cargo test -p lakehouse-api --test route_auth` — 75 passed.
+- `cargo test -p lakehouse-api --lib policy` — 71 passed (2876 filtered).
+- `cargo test -p lakehouse-api --lib ai::tools::alerts` — 5 passed.
+- `cargo test -p lakehouse-api --lib registry` — 39 passed, 1 ignored (the
+  fixture writer).
+- `cargo test -p lakehouse-api --lib write_tool_schema_fixture -- --ignored` —
+  ran once for the intentional schema change; the fixture diff is the
+  `run_alert_rule` description and nothing else.
+- `bun run typecheck` — clean.
+- `bun run lint` — 0 errors, 10 pre-existing warnings (none in a file this
+  branch touches).
+- `bun test src/features/alerts src/services/clients` — 164 passed.
+- `python3 ops/lint/check_intra_package_imports.py` and
+  `check_bare_iceberg_count.py` — both OK.
+- `(cd ops/ai_eval && python3 -m unittest test_ai_eval)` — 182 passed.
+- `git status` — clean before every commit and at the end; `git diff
+  --cached --stat` read before every commit.
+
+Everything ran through `/home/shiro/rantai/bin/cargo-locked` with `-j 2`.
+`bun install --frozen-lockfile` was needed once because the worktree had no
+`node_modules`; `bun.lock` is unchanged. No test container was created by these
+runs (the shared `lakehouse-test-support` Postgres was already up, 19 h old, and
+was left as found).
+
+#### Not verified
+
+- **The full workspace block of `AGENTS.md` was not run.** This machine's rule
+  scopes every cargo command to the changed crate and forbids a full-workspace
+  run, so the Rust half is `lakehouse-api` only. Nothing else in `rust/` changed.
+- **The AI-15 run itself** (backlog `AI-15`, one model-driven pass over
+  `ops/ai_eval/dashboard_cases.json`) was not run: it needs a model and a
+  running stack. Only the harness's unit tests ran. The new case is unmeasured.
+- **A real delivery was not observed.** No SMTP server or allowed webhook target
+  exists in the tests, so "sends once" is proven as the settled state and the
+  saved `alert_instance`, not as an email leaving the process. With no SMTP, the
+  delivery is a recorded failure and the claim is released so the next check may
+  send again (`BI-19` C SF-1), which is why the once-only case silences the rule.
+- **Compose and Dagster checks were not run**: no compose or Python product file
+  changed (only the eval case JSON).
+- **T5's `git diff --stat` shows docs only** cannot hold literally: the second
+  half of the task is the module doc *inside* `routes/alerts.rs`, so that commit
+  touches one `.rs` file and changes no code.
+- **`POST /api/alerts/test` on a real deployment** (a browser session against a
+  live ClickHouse/SMTP) was not exercised; the integration tests use a wiremock
+  `ClickHouse` and an unconfigured SMTP.
