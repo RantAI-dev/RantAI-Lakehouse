@@ -216,8 +216,9 @@ measurements. The preview decodes at most the first 2,000 rows and shows 20.
 - An Avro file must be uncompressed (the null codec). A compressed container
   is refused, on both sides, with "This Avro file is compressed. Save it with
   no compression."
-- A workbook is stored twice while it is loaded: the original and the
-  converted text, both removed with the upload.
+- A workbook is stored more than once: the original, the list of its sheets,
+  and the converted text of each sheet that was read. They are all removed
+  with the upload.
 - A Parquet file with a binary or nested column is refused: remove the column
   and save the file again. On the chunked path the API does not convert a
   Parquet file; the load job reads it (`DATA-17`, #186). The 5,000,000-cell
@@ -247,9 +248,10 @@ measurements. The preview decodes at most the first 2,000 rows and shows 20.
 - Adding a file to a table that exists keeps that table's names and types.
   Replacing a table may change its types, and a pipeline that reads the table
   fails on its next run and says why.
-- An uploaded table stays in the raw layer. The pipeline builder cannot read
-  raw tables yet, and a dashboard reads Gold tables only. So an uploaded
-  table can be explored and queried, and cannot yet feed a dashboard.
+- An uploaded table stays in the raw layer. A dashboard reads mart tables
+  only, so an uploaded table reaches a dashboard through a pipeline (raw →
+  Silver → Gold), which is built (`DATA-19`, `uploads-feed-pipelines.md`).
+  Until that pipeline exists, the table can be explored and queried.
 - The original file is kept until someone deletes the upload, so storage
   grows with every upload.
 - Adding the same file to a table twice doubles its rows. The console warns
