@@ -28,7 +28,12 @@ test-support = []
 
 [dev-dependencies]
 wiremock = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["net"] }
+# `SEC-56` T2: the relay is a REAL `Mailpit` in a container, started the
+# way `lakehouse-test-support` starts Postgres -- the same `testcontainers`
+# version and features, so the test runs wherever the workspace tests
+# already run.
+testcontainers = { version = "0.27", features = ["reusable-containers"] }
 # `SEC-56` T1/T2: the test CA and the test certificates are minted at run
 # time, never committed -- `.gitleaksignore`'s history (`SEC-36`) reads a
 # committed key as a leak. `rcgen` with EXACTLY the features
