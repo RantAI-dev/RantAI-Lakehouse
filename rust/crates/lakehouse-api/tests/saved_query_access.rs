@@ -2346,3 +2346,162 @@ async fn the_assistants_save_puts_the_query_in_the_callers_own_personal_space() 
         "the query sits in his own personal space"
     );
 }
+
+// ── A deployment with a single tenant ───────────────────────────────────
+
+/// The deployment holds one tenant: every other tenant and its
+/// memberships go, and the caller joins the one that is left.
+///
+/// A deployment with one tenant reaches every row of every table
+/// (`SEC-20`), so the reach of a request no longer names the tenant a
+/// new row belongs to: the tenant the request acts as does.
+async fn leave_one_tenant(pool: &PgPool, caller: Uuid) {
+    for tenant in [
+        "11111111-1111-4111-8111-000000000002",
+        "11111111-1111-4111-8111-000000000003",
+        "11111111-1111-4111-8111-000000000004",
+    ] {
+        let tenant_id: Uuid = tenant.parse().expect("a seeded tenant id");
+        // The membership rows go first: `app_user_tenant.tenant_id`
+        // refuses the deletion of a tenant that still has members.
+        sqlx::query("DELETE FROM app_user_tenant WHERE tenant_id = $1")
+            .bind(tenant_id)
+            .execute(pool)
+            .await
+            .expect("drop the memberships of the tenant that goes");
+        sqlx::query("DELETE FROM tenant WHERE id = $1")
+            .bind(tenant_id)
+            .execute(pool)
+            .await
+            .expect("drop the tenant");
+    }
+    sqlx::query(
+        "INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2) \
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(caller)
+    .bind(Uuid::parse_str(GROUP_TENANT).expect("the group tenant id"))
+    .execute(pool)
+    .await
+    .expect("add the caller to the one tenant that is left");
+}
+
+/// The tenant a row belongs to.
+///
+/// The wire shapes of a saved query and of a folder carry no tenant, so
+/// the tenant of a row is read from the row itself.
+async fn tenant_of_saved_query(pool: &PgPool, id: &str) -> Option<Uuid> {
+    sqlx::query_scalar("SELECT tenant_id FROM saved_query WHERE id = $1")
+        .bind(Uuid::parse_str(id).expect("a saved query id"))
+        .fetch_one(pool)
+        .await
+        .expect("the saved query row")
+}
+
+/// The tenant a folder belongs to.
+///
+/// The wire shape of a folder carries no tenant either.
+async fn tenant_of_folder(pool: &PgPool, id: &str) -> Uuid {
+    sqlx::query_scalar("SELECT tenant_id FROM saved_query_folder WHERE id = $1")
+        .bind(Uuid::parse_str(id).expect("a folder id"))
+        .fetch_one(pool)
+        .await
+        .expect("the folder row")
+}
+
+/// In a deployment with a single tenant, the query a caller saves, the
+/// copy of a query and the folder a caller makes all belong to that
+/// tenant.
+///
+/// A personal space hangs off the tenant of the person it belongs to, so
+/// a row that carries no tenant has no personal space to land in: it
+/// lands in the shared space instead, and the caller's own work is
+/// nobody's private work at all.
+#[tokio::test]
+async fn in_a_single_tenant_deployment_a_query_a_copy_and_a_folder_belong_to_that_tenant() {
+    let TestApp { router, pool } = spin_up().await;
+    let rina = user_id(&pool, "rina@meridian.example").await;
+    leave_one_tenant(&pool, rina).await;
+    let cookie = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+
+    // A query saved without a folder lands in the caller's own personal
+    // space, and the row carries the tenant of the deployment.
+    let (status, saved) = call(
+        &router,
+        "POST",
+        "/api/query/saved",
+        &cookie,
+        Some(json!({"title": "Single tenant", "sql": "SELECT 1"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{saved}");
+    let saved_id = saved["id"]
+        .as_str()
+        .expect("the saved query has an id")
+        .to_owned();
+    let space = personal_space_id(&pool, rina).await;
+    assert_eq!(
+        saved["folderId"].as_str(),
+        Some(space.as_str()),
+        "the query lands in the caller's own personal space: {saved}"
+    );
+    assert_eq!(
+        tenant_of_saved_query(&pool, &saved_id).await,
+        Some(Uuid::parse_str(GROUP_TENANT).expect("the group tenant id")),
+        "the row carries the tenant of the deployment"
+    );
+
+    // The copy of a query is a row of the caller's own, so it lands in
+    // the caller's own personal space as well.
+    let (status, copy) = call(
+        &router,
+        "POST",
+        &format!("/api/query/saved/{saved_id}/duplicate"),
+        &cookie,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{copy}");
+    assert_eq!(
+        copy["folderId"].as_str(),
+        Some(space.as_str()),
+        "the copy lands in the caller's own personal space: {copy}"
+    );
+    let copy_id = copy["id"].as_str().expect("the copy has an id").to_owned();
+    assert_eq!(
+        tenant_of_saved_query(&pool, &copy_id).await,
+        Some(Uuid::parse_str(GROUP_TENANT).expect("the group tenant id")),
+        "the copy carries the tenant of the deployment"
+    );
+
+    // A folder belongs to the tenant the request acts as, and the
+    // console sees it in the list of the caller's folders.
+    let (status, folder) = call(
+        &router,
+        "POST",
+        "/api/query/folders",
+        &cookie,
+        Some(json!({"name": "Single tenant folder"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{folder}");
+    let folder_id = folder["id"]
+        .as_str()
+        .expect("the folder has an id")
+        .to_owned();
+    let (status, folders) = call(&router, "GET", "/api/query/folders", &cookie, None).await;
+    assert_eq!(status, StatusCode::OK, "{folders}");
+    assert!(
+        folders
+            .as_array()
+            .expect("the folders are a list")
+            .iter()
+            .any(|folder| folder["id"] == folder_id.as_str()),
+        "the console sees the folder: {folders}"
+    );
+    assert_eq!(
+        tenant_of_folder(&pool, &folder_id).await,
+        Uuid::parse_str(GROUP_TENANT).expect("the group tenant id"),
+        "the folder belongs to the tenant of the deployment"
+    );
+}

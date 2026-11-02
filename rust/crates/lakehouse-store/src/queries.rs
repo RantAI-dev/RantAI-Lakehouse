@@ -567,8 +567,10 @@ pub async fn create_saved_query_at(
                     .await?
                     .id,
             ),
-            // No person and no tenant: the shared space is the only place
-            // such a row can live.
+            // No tenant, with or without a person: the shared space is
+            // the only place such a row can live. A personal space hangs
+            // off a tenant, so a row that belongs to no tenant has no
+            // personal space to land in.
             _ => None,
         },
     };

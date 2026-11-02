@@ -986,9 +986,9 @@ pub async fn duplicate_saved(
     headers: HeaderMap,
 ) -> ApiResult<(StatusCode, ApiJson<SavedQuery>)> {
     let scope = saved_query_scope(&state, &principal, &headers).await?;
-    let Some(viewer) = scope.effective_viewer() else {
+    if scope.effective_viewer().is_none() {
         return Err(ApiError::NotFound(QUERY_NOT_FOUND.to_owned()).into());
-    };
+    }
     let source = queries::get_saved(pool(&state)?, &id, &scope)
         .await?
         .ok_or_else(|| ApiError::NotFound(QUERY_NOT_FOUND.to_owned()))?;
@@ -996,6 +996,18 @@ pub async fn duplicate_saved(
     if !is_read_only(&source.sql) {
         return Err(ApiError::Unprocessable(NOT_READ_ONLY.to_owned()).into());
     }
+    // The copy is a new row, so it belongs to the tenant the request acts
+    // as — not to the reach the read above used. The reach of a
+    // deployment with a single tenant names no tenant at all, and a row
+    // that carries no tenant has no personal space to land in: it lands
+    // in the shared space, where the caller's own work is nobody's
+    // private work. The tenant the request acts as is the one rule that
+    // says which tenant a request is for (`crate::tenant_scope::resolve`),
+    // the same rule the save of a query and the assistant's save use.
+    let viewer = saved_query_viewer(
+        &principal,
+        crate::tenant_scope::resolve(&principal, &headers)?,
+    );
     let owner = principal.display_name.clone();
     let copy = queries::create_saved_query_at(
         pool(&state)?,
