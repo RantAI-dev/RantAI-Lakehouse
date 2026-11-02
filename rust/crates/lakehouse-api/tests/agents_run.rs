@@ -24,7 +24,10 @@ use tower::ServiceExt;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use common::{TestApp, session_cookie_for_seeded_user, spin_up_with_env};
+use common::{
+    TestApp, create_principal_with_permissions, session_cookie_for_seeded_user,
+    session_cookie_for_user, spin_up_with_env,
+};
 
 /// Insert a digital employee row directly (bypassing `POST
 /// /api/agents/employees`, so a test can set an arbitrary
@@ -136,6 +139,29 @@ async fn json_body(resp: axum::http::Response<Body>) -> Value {
         .await
         .expect("read response body");
     serde_json::from_slice(&bytes).expect("valid JSON body")
+}
+
+/// `POST /api/agents/approvals/{id}/decide` with a session cookie — the
+/// other half of the approval flow, so a test can decide an approval the
+/// headless run created.
+async fn decide_approval(
+    app: &axum::Router,
+    approval_id: &str,
+    cookie: &str,
+    body: Value,
+) -> axum::http::Response<Body> {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/agents/approvals/{approval_id}/decide"))
+                .header("content-type", "application/json")
+                .header("cookie", cookie)
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
 }
 
 /// A valid `x-run-token` runs the employee end to end: the run reaches a
@@ -608,4 +634,76 @@ async fn create_employee_with_invalid_mode_is_bad_request() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+/// SEC-57: a SCHEDULED run's approval names NO requester — the schedule
+/// asked, not a person — so anybody holding `agent:approve` may decide
+/// it, exactly as before the self-approval rule. The run here starts with
+/// the `x-run-token`, which is `RunAuth::Token`: there is no principal
+/// behind it at all.
+#[tokio::test]
+async fn a_scheduled_runs_approval_has_no_requester_and_any_approver_may_decide_it() {
+    let mock = MockServer::start().await;
+    mount_tool_call(&mock, "delete_chart", r#"{"id":"c-999"}"#).await;
+    let app = spin_up_with_llm(&mock.uri(), Some("secret-run-token")).await;
+    insert_employee(
+        &app.pool,
+        "emp-headless-12",
+        "headless-runner-12",
+        "ready",
+        "build",
+        "dashboard:write",
+        Some("Hapus chart lama."),
+    )
+    .await;
+
+    // The route's policy floor is `RequiresAuth`, so a session has to ride
+    // along; the matched `x-run-token` is what makes the run a SCHEDULED
+    // one — `RunAuth::Token`, so the run has no principal behind it and
+    // its audit rows say `trigger = "schedule"`.
+    let cookie = session_cookie_for_seeded_user(&app.pool, "sari@meridian.example").await;
+    let resp = run_employee(
+        &app.router,
+        "emp-headless-12",
+        Some(&cookie),
+        Some("secret-run-token"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["run"]["status"], json!("waiting_approval"));
+    let approvals: Vec<Value> = body["run"]["approvals"].as_array().unwrap().clone();
+    assert_eq!(approvals.len(), 1);
+    let approval_id = approvals[0]["id"].as_str().unwrap().to_owned();
+
+    // No requester recorded — nobody asked in person.
+    let (requester,): (Option<uuid::Uuid>,) =
+        sqlx::query_as("SELECT requested_by_user_id FROM approval_item WHERE id = $1")
+            .bind(&approval_id)
+            .fetch_one(&app.pool)
+            .await
+            .expect("the approval row exists");
+    assert_eq!(
+        requester, None,
+        "SEC-57: a scheduled run names no human requester, so nobody is refused as 'the requester'"
+    );
+
+    // Anybody holding `agent:approve` may decide it.
+    let approver_id = create_principal_with_permissions(
+        &app.pool,
+        "dashboard:write, dashboard:read, agent:approve",
+    )
+    .await;
+    let cookie = session_cookie_for_user(&app.pool, approver_id).await;
+    let decided = decide_approval(
+        &app.router,
+        &approval_id,
+        &cookie,
+        json!({ "decision": "approved" }),
+    )
+    .await;
+    assert_eq!(decided.status(), StatusCode::OK);
+    let decided_body = json_body(decided).await;
+    assert_eq!(decided_body["approval"]["status"], json!("approved"));
 }
