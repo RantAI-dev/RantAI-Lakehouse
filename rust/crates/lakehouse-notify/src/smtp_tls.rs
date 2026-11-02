@@ -14,7 +14,7 @@
 use std::error::Error as _;
 
 use lettre::transport::smtp::Error;
-use lettre::transport::smtp::client::{Tls, TlsParameters};
+use lettre::transport::smtp::client::{Certificate, Tls, TlsParameters};
 
 use crate::smtp_ca::SmtpCaBundle;
 
@@ -30,13 +30,15 @@ use crate::smtp_ca::SmtpCaBundle;
 ///
 /// # Errors
 ///
-/// Returns the transport's own error when the parameters cannot be built
-/// (a malformed bundle). The caller turns that into
+/// Returns the transport's own error when a certificate cannot be turned
+/// into a root, or when the parameters cannot be built (a malformed
+/// bundle). The caller turns that into
 /// [`crate::DeliveryFailure::MailServerTlsFailed`].
 pub(crate) fn parameters(host: &str, bundle: &SmtpCaBundle) -> Result<TlsParameters, Error> {
     let mut builder = TlsParameters::builder(host.to_owned());
-    for certificate in bundle.certificates() {
-        builder = builder.add_root_certificate(certificate.clone());
+    for der in bundle.der() {
+        let certificate = Certificate::from_der(der.clone())?;
+        builder = builder.add_root_certificate(certificate);
     }
     builder.build()
 }

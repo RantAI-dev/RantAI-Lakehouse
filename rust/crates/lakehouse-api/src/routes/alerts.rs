@@ -648,7 +648,7 @@ pub(crate) fn smtp_config(config: &Config) -> SmtpConfig {
         from: config.smtp_from.clone(),
         // `SEC-56` D1/D6: the bundle is read once, at start-up, and handed
         // to the sender as it is.
-        ca_bundle: None,
+        ca_bundle: config.smtp_ca.clone(),
     }
 }
 

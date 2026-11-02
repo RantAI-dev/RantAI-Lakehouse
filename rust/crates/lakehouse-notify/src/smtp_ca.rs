@@ -28,7 +28,6 @@
 
 use std::fmt;
 
-use lettre::transport::smtp::client::Certificate;
 use rustls_pki_types::CertificateDer;
 use rustls_pki_types::pem::PemObject;
 
@@ -72,9 +71,14 @@ impl std::error::Error for CaBundleError {}
 /// One bundle holds one or more certificates: the file an operator points
 /// `SMTP_CA_FILE` at may be a single CA or a chain of them, and every one
 /// of them is added to the transport's root store (D2).
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SmtpCaBundle {
-    certificates: Vec<Certificate>,
+    /// Each certificate's DER, in the order they were read.
+    ///
+    /// The DER and not the transport's own `Certificate`, because that type
+    /// has neither `PartialEq` nor a useful `Debug` (D9): these bytes are
+    /// what the transport is given, and what two bundles are compared by.
+    der: Vec<Vec<u8>>,
 }
 
 impl SmtpCaBundle {
@@ -88,35 +92,33 @@ impl SmtpCaBundle {
     /// - [`CaBundleError::Empty`] when the bytes hold no PEM certificate.
     /// - [`CaBundleError::Invalid`] when a PEM block cannot be decoded.
     pub fn from_pem(pem: &[u8]) -> Result<Self, CaBundleError> {
-        let mut certificates = Vec::new();
+        let mut der = Vec::new();
         for certificate in CertificateDer::pem_slice_iter(pem) {
-            let der = certificate.map_err(|_| CaBundleError::Invalid)?;
-            let certificate =
-                Certificate::from_der(der.as_ref().to_vec()).map_err(|_| CaBundleError::Invalid)?;
-            certificates.push(certificate);
+            let certificate = certificate.map_err(|_| CaBundleError::Invalid)?;
+            der.push(certificate.as_ref().to_vec());
         }
-        if certificates.is_empty() {
+        if der.is_empty() {
             return Err(CaBundleError::Empty);
         }
-        Ok(Self { certificates })
+        Ok(Self { der })
     }
 
     /// How many certificates the bundle holds.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.certificates.len()
+        self.der.len()
     }
 
     /// Whether the bundle holds no certificate. A bundle read by
     /// [`Self::from_pem`] never is: an empty one is an error, not a bundle.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.certificates.is_empty()
+        self.der.is_empty()
     }
 
-    /// The certificates themselves, for the transport's root store.
-    pub(crate) fn certificates(&self) -> &[Certificate] {
-        &self.certificates
+    /// The certificates' DER, for the transport's root store.
+    pub(crate) fn der(&self) -> &[Vec<u8>] {
+        &self.der
     }
 }
 
@@ -126,7 +128,7 @@ impl SmtpCaBundle {
 impl fmt::Debug for SmtpCaBundle {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SmtpCaBundle")
-            .field("certificates", &self.certificates.len())
+            .field("certificates", &self.der.len())
             .finish()
     }
 }
@@ -216,6 +218,23 @@ mod tests {
         pem.push_str(&minted_certificate(&["other.example.com"]));
         let bundle = SmtpCaBundle::from_pem(pem.as_bytes()).unwrap();
         assert_eq!(bundle.len(), 2);
+    }
+
+    /// Two bundles with the same certificates are the same bundle, and two
+    /// bundles with different ones are not: the `Config` that carries the
+    /// bundle compares by these bytes.
+    #[test]
+    fn two_bundles_are_compared_by_their_certificates() {
+        let pem = minted_certificate(&["relay.example.com"]);
+        let other = minted_certificate(&["other.example.com"]);
+        assert_eq!(
+            SmtpCaBundle::from_pem(pem.as_bytes()).unwrap(),
+            SmtpCaBundle::from_pem(pem.as_bytes()).unwrap()
+        );
+        assert_ne!(
+            SmtpCaBundle::from_pem(pem.as_bytes()).unwrap(),
+            SmtpCaBundle::from_pem(other.as_bytes()).unwrap()
+        );
     }
 
     /// `SEC-56` D9: the `Debug` says how many certificates, and prints no
