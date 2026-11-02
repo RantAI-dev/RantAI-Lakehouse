@@ -7,6 +7,7 @@ import {
   Clock,
   Copy,
   Eye,
+  KeyRound as KeyRoundIcon,
   Mail,
   MoreHorizontal,
   Shield,
@@ -56,8 +57,21 @@ export function PillList({ values }: { readonly values: readonly string[] }) {
 
 export function getUserColumns({
   onSelect,
+  canWrite = false,
+  onResetPassword,
 }: {
   onSelect: (user: User) => void
+  /**
+   * Whether the caller may reset a password. ADM-3 D2: the reset route
+   * needs `identity:write`, so the action is disabled without it rather
+   * than offered and refused by the server.
+   */
+  canWrite?: boolean
+  /**
+   * ADM-3 D2: hand this user a new temporary password. Omitted when the
+   * caller may not, which hides the action entirely.
+   */
+  onResetPassword?: (user: User) => void
 }): ColumnDef<User>[] {
   return [
     {
@@ -219,6 +233,20 @@ export function getUserColumns({
                   <UserIcon className="size-4" />
                   <span>Copy user ID</span>
                 </DropdownMenuItem>
+                {onResetPassword ? (
+                  <>
+                    <DropdownMenuSeparator />
+                    <DropdownMenuItem
+                      disabled={!canWrite}
+                      onClick={() => {
+                        onResetPassword(user)
+                      }}
+                    >
+                      <KeyRoundIcon className="size-4" />
+                      <span>Reset password</span>
+                    </DropdownMenuItem>
+                  </>
+                ) : null}
               </DropdownMenuContent>
             </DropdownMenu>
           </div>

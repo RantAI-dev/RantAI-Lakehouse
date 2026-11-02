@@ -12,6 +12,13 @@ import { MetadataList } from "@/components/patterns/metadata-list"
 import { PageHeader } from "@/components/patterns/page-header"
 import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { Button } from "@/components/ui/button"
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { useAuth } from "@/features/auth/auth-provider"
@@ -34,6 +41,13 @@ export function UsersPage() {
   const [email, setEmail] = React.useState("")
   const [roles, setRoles] = React.useState("")
   const [tenants, setTenants] = React.useState("")
+  // ADM-3 D1/D6: the temporary password the server generated, shown in
+  // the dialog below exactly ONCE. It is never persisted to
+  // localStorage, sessionStorage, or any service-layer cache entry — it
+  // is kept as local component state and cleared when the dialog closes,
+  // so a re-render of the table (a filter keystroke, a refetch landing)
+  // cannot leak it through a hook that stores its argument.
+  const [revealedPassword, setRevealedPassword] = React.useState<string | null>(null)
   const tableUrlState = useTableUrlState()
 
   const create = useServiceAction(
@@ -41,9 +55,32 @@ export function UsersPage() {
       identityService.inviteUser(input, signal)
   )
 
+  const reset = useServiceAction(
+    (signal, id: string) => identityService.resetPassword(id, signal)
+  )
+
+  const handleResetPassword = React.useCallback(
+    async (user: User) => {
+      // `useServiceAction.run` resolves to `null` on any thrown error (the
+      // service layer classifies upstream failures into ServiceError; see
+      // use-service.ts:99-105). A failed reset MUST NOT open the dialog —
+      // the `if (result)` guard is the single source of truth for "the
+      // reset actually returned a password".
+      const result = await reset.run(user.id)
+      if (!result) return
+      setRevealedPassword(result.temporaryPassword)
+    },
+    [reset]
+  )
+
   const columns = React.useMemo(
-    () => getUserColumns({ onSelect: setSelected }),
-    []
+    () =>
+      getUserColumns({
+        onSelect: setSelected,
+        canWrite,
+        onResetPassword: (user) => void handleResetPassword(user),
+      }),
+    [canWrite, handleResetPassword]
   )
 
   const filteredData = React.useMemo(() => {
@@ -104,6 +141,10 @@ export function UsersPage() {
     if (result) {
       setCreateOpen(false)
       resetForm()
+      // ADM-3 D1: the server generated a temporary password and returned
+      // it once. Show it, and only here — the server never sends it
+      // again.
+      setRevealedPassword(result.temporaryPassword)
       state.reload()
     }
   }
@@ -215,6 +256,42 @@ export function UsersPage() {
           />
         </div>
       </CreateSheet>
+      {/* ADM-3 D1/D6: the temporary password, shown exactly once. The
+          server keeps only the `Argon2id` hash, so it cannot be shown
+          again — the admin has to hand it over now. */}
+      <Dialog
+        open={revealedPassword !== null}
+        onOpenChange={(open) => {
+          if (!open) setRevealedPassword(null)
+        }}
+      >
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>Temporary password</DialogTitle>
+            <DialogDescription>
+              Shown once. The user must change it at first sign-in.
+            </DialogDescription>
+          </DialogHeader>
+          <code
+            data-testid="revealed-password"
+            className="block break-all rounded bg-muted p-2 text-xs"
+          >
+            {revealedPassword}
+          </code>
+          <div className="flex justify-end">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => {
+                if (revealedPassword === null) return
+                void navigator.clipboard.writeText(revealedPassword)
+              }}
+            >
+              Copy
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }
