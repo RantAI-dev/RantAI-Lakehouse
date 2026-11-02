@@ -160,3 +160,8 @@ The code does not settle these, so they are not decided here.
 - [ ] `PRODUCT.md` section 2 and section 3 updated
 - [ ] `BACKLOG.md`: `WEB-1` moved to Done; follow-ups added
 - [ ] `CHANGELOG.md` entry a customer can read
+
+## QA-1 decisions (product owner, 2026-11-02)
+
+- The landing page is a **separate** product page. It is **not available on an installed Lakehouse**: an install must not serve `/landing`. Until that is built, this page is out of the QA-1 round.
+- When a page states a rule but not its exact message, QA checks that the action is refused (or shown) and that the message names the rule. The wording itself is not tested. Defaults the planner wrote on a page count as decided unless the owner changes them.

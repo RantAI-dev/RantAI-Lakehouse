@@ -375,3 +375,9 @@ Exceptions, each with an owner and a date:
 - [ ] `PRODUCT.md` section 2 ("Upload a file from the console") and section 3 updated
 - [ ] `BACKLOG.md`: `DATA-9` moved to Done; follow-ups added (loading several sheets, larger files, pipelines reading raw tables)
 - [ ] `CHANGELOG.md` entry a customer can read
+
+## QA-1 decisions (product owner, 2026-11-02)
+
+- An empty file is refused with a message that the file is empty, and it is never shown as loaded.
+- Column types are guessed and editable before loading; files go up to 2 GB in pieces; a workbook keeps the 50 MB limit.
+- When a page states a rule but not its exact message, QA checks that the action is refused (or shown) and that the message names the rule. The wording itself is not tested. Defaults the planner wrote on a page count as decided unless the owner changes them.

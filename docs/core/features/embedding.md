@@ -99,3 +99,8 @@ Run by the product owner on a running console. A step not performed is never a p
 - `BI-26-AC6` An editable filter changes the data when the viewer changes it; a hidden filter is not shown; a token that leaves out a locked filter is refused. *(proposed)*
 - `BI-26-AC7` An old token that locks `region` by name still shows only that region. *(proposed)*
 - `AI-11-AC3` "Let example.com embed this dashboard." waits for approval, then switches embedding on with example.com listed. *(proposed)*
+
+## QA-1 decisions (product owner, 2026-11-02)
+
+- The rows marked *(proposed)*: AC5 (theme, logo, background), AC6 (editable, hidden and locked filters), AC7 (old tokens still work) and `AI-11-AC3` (the assistant enables embedding with approval). They **must be built before this feature is accepted**. `BI-26` stays out of the QA-1 round until then.
+- When a page states a rule but not its exact message, QA checks that the action is refused (or shown) and that the message names the rule. The wording itself is not tested. Defaults the planner wrote on a page count as decided unless the owner changes them.

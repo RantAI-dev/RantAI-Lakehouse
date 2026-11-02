@@ -141,3 +141,8 @@ Exceptions, each with an owner and a date:
 - [x] `PRODUCT.md` section 2 and 3 updated
 - [x] `BACKLOG.md` item moved to Done; follow-ups added
 - [ ] `CHANGELOG.md` entry a customer can read
+
+## QA-1 decisions (product owner, 2026-11-02)
+
+- Very long or special-character input never gives an error page, and special characters do not match everything.
+- When a page states a rule but not its exact message, QA checks that the action is refused (or shown) and that the message names the rule. The wording itself is not tested. Defaults the planner wrote on a page count as decided unless the owner changes them.

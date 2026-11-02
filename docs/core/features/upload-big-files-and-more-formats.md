@@ -136,3 +136,9 @@ Exceptions, each with an owner and a date:
 - [ ] `BACKLOG.md` Dates has the Shipped date
 - [ ] The base row updated to match the repo (status, PR, dates, QA-case results); the Acceptor is recorded in the base
 - [ ] `CHANGELOG.md` entry a customer can read
+
+## QA-1 decisions (product owner, 2026-11-02)
+
+- An unfinished upload is removed after **24 hours** (decision 8 confirmed).
+- A small compressed file that unpacks past 2 GiB is refused, before sending or during the load, with a message naming the 2 GB unpacked limit.
+- When a page states a rule but not its exact message, QA checks that the action is refused (or shown) and that the message names the rule. The wording itself is not tested. Defaults the planner wrote on a page count as decided unless the owner changes them.

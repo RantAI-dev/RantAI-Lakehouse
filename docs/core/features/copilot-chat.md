@@ -222,3 +222,10 @@ The code does not settle these, so they are not decided here.
 - [ ] `PRODUCT.md` section 2 (Home, History) and section 3 updated
 - [ ] `BACKLOG.md`: `AI-18` moved to Done; follow-ups added
 - [ ] `CHANGELOG.md` entry a customer can read
+
+## QA-1 decisions (product owner, 2026-11-02)
+
+- An answer counts as correct when it says which table or query it came from. A partly wrong number is a finding ("Pass with findings"), not a failure: the assistant will also run on local models, so QA does not hold it to always being right. It fails only when it breaks something, takes an action it should not, or crosses a permission.
+- History: a past conversation can be reopened and continued, **renamed and deleted**, and replies stream smoothly as they are written. A missing rename or delete is a gap to build.
+- With no model endpoint configured, the console says: "The assistant isn't available, ask your admin." It never shows technical error text.
+- When a page states a rule but not its exact message, QA checks that the action is refused (or shown) and that the message names the rule. The wording itself is not tested. Defaults the planner wrote on a page count as decided unless the owner changes them.
