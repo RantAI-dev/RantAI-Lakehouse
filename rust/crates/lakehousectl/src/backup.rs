@@ -211,23 +211,35 @@ fn backup_dir_of(output: &str) -> Result<PathBuf, ToolError> {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-    use std::os::unix::fs::PermissionsExt;
-
     use super::*;
 
-    /// A fake tool, in the install's own directory, that records what
+    /// The fake tool, in the install's own directory, that records what
     /// it was asked to do.
+    ///
+    /// The tool is a COMMITTED file, symlinked into the install's own
+    /// `tools/` directory: the file the tool EXECUTES is then a file
+    /// nobody writes, so the kernel cannot answer `ETXTBSY` ("Text
+    /// file busy") — what it answers when the file being executed still
+    /// has an open write descriptor.
+    ///
+    /// Writing the fake tool and then executing it was the flake: the
+    /// file the tool ran was the file the test had just written, and a
+    /// test binary with four threads can leave another thread's child
+    /// holding the write descriptor of that file (REL-2 S4b review
+    /// round 2 SHOULD-FIX 3).
     ///
     /// The record is written next to the install's own directory, so the
     /// test can read it without an environment variable the tool would
     /// have to pass.
-    fn fake_tool(dir: &Path, name: &str, body: &str) {
+    ///
+    /// The `mode` says what the fake tool does: `backup`, `restore`,
+    /// `silent` or `fail`.
+    fn fake_tool(dir: &Path, name: &str, mode: &str) {
         let tools = dir.join("tools");
         std::fs::create_dir_all(&tools).expect("the tools directory is created");
         let path = tools.join(name);
-        std::fs::write(&path, body).expect("the tool is written");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-            .expect("the tool is executable");
+        std::os::unix::fs::symlink(FIXTURE, &path).expect("the tool is linked");
+        std::fs::write(dir.join("fake-tool-mode"), mode).expect("the mode is written");
     }
 
     /// The record the fake tool wrote.
@@ -235,26 +247,12 @@ mod tests {
         std::fs::read_to_string(dir.join("record.txt")).expect("the record is readable")
     }
 
-    const FAKE_BACKUP: &str = r#"#!/bin/sh
-record="$(dirname "$0")/../record.txt"
-{
-  echo "LAKEHOUSE_DIR=$LAKEHOUSE_DIR"
-  echo "COMPOSE_PROJECT=$COMPOSE_PROJECT"
-  echo "BACKUP_VERSION=$BACKUP_VERSION"
-  echo "ARGS=$*"
-} >> "$record"
-echo "==> Backup complete: $LAKEHOUSE_DIR/backups/20261101T000000Z-0.2.0"
-"#;
-
-    const FAKE_RESTORE: &str = r#"#!/bin/sh
-record="$(dirname "$0")/../record.txt"
-{
-  echo "LAKEHOUSE_DIR=$LAKEHOUSE_DIR"
-  echo "COMPOSE_PROJECT=$COMPOSE_PROJECT"
-  echo "ARGS=$*"
-} >> "$record"
-echo "the restore is done"
-"#;
+    /// The fake tool the tests run: a committed file, linked into the
+    /// install's own `tools/` directory.
+    const FIXTURE: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/shipped-tool.sh"
+    );
 
     #[test]
     fn the_shipped_script_is_given_an_absolute_directory() {
@@ -263,7 +261,7 @@ echo "the restore is done"
         // path as a volume name and refuses it. The tool hands them an
         // absolute one.
         let directory = tempfile::tempdir().expect("a temporary directory");
-        fake_tool(directory.path(), "backup-local.sh", FAKE_BACKUP);
+        fake_tool(directory.path(), "backup-local.sh", "backup");
         state::write_initial(directory.path(), "0.1.0").expect("the state is written");
 
         let relative = std::path::PathBuf::from("relative-install");
@@ -282,7 +280,7 @@ echo "the restore is done"
     #[test]
     fn the_backup_runs_the_shipped_script_with_the_deployments_own_directory() {
         let directory = tempfile::tempdir().expect("a temporary directory");
-        fake_tool(directory.path(), "backup-local.sh", FAKE_BACKUP);
+        fake_tool(directory.path(), "backup-local.sh", "backup");
         state::write_initial(directory.path(), "0.2.0").expect("the state is written");
 
         let args = BackupArgs {
@@ -317,7 +315,7 @@ echo "the restore is done"
         // backs up, so the script cannot ask the API which version the
         // backup belongs to. The tool knows, and says so.
         let directory = tempfile::tempdir().expect("a temporary directory");
-        fake_tool(directory.path(), "backup-local.sh", FAKE_BACKUP);
+        fake_tool(directory.path(), "backup-local.sh", "backup");
         state::write_initial(directory.path(), "0.1.0").expect("the state is written");
 
         let backup = take(directory.path(), Some("0.1.0")).expect("the backup runs");
@@ -339,7 +337,7 @@ echo "the restore is done"
     #[test]
     fn the_backup_records_where_it_is_in_the_installs_state() {
         let directory = tempfile::tempdir().expect("a temporary directory");
-        fake_tool(directory.path(), "backup-local.sh", FAKE_BACKUP);
+        fake_tool(directory.path(), "backup-local.sh", "backup");
         state::write_initial(directory.path(), "0.2.0").expect("the state is written");
 
         let args = BackupArgs {
@@ -364,7 +362,7 @@ echo "the restore is done"
     #[test]
     fn the_restore_runs_the_shipped_script_with_the_backup_directory() {
         let directory = tempfile::tempdir().expect("a temporary directory");
-        fake_tool(directory.path(), "restore-from-backup.sh", FAKE_RESTORE);
+        fake_tool(directory.path(), "restore-from-backup.sh", "restore");
 
         let args = RestoreArgs {
             backup: PathBuf::from("/backups/one"),
@@ -407,11 +405,7 @@ echo "the restore is done"
     #[test]
     fn a_tool_that_fails_says_what_it_said() {
         let directory = tempfile::tempdir().expect("a temporary directory");
-        fake_tool(
-            directory.path(),
-            "backup-local.sh",
-            "#!/bin/sh\necho 'the volume is not there' >&2\nexit 1\n",
-        );
+        fake_tool(directory.path(), "backup-local.sh", "fail");
 
         let error = command(&BackupArgs {
             dir: directory.path().to_path_buf(),
@@ -429,11 +423,7 @@ echo "the restore is done"
         // The state and the backup have to agree: a `lastBackup` that
         // names nothing is worse than none.
         let directory = tempfile::tempdir().expect("a temporary directory");
-        fake_tool(
-            directory.path(),
-            "backup-local.sh",
-            "#!/bin/sh\necho 'done'\n",
-        );
+        fake_tool(directory.path(), "backup-local.sh", "silent");
         state::write_initial(directory.path(), "0.2.0").expect("the state is written");
 
         let error = command(&BackupArgs {
