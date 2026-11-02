@@ -397,6 +397,10 @@ impl Respond for FakeCh {
         if sql.starts_with("SELECT v FROM (") {
             return rows(vec![json!({ "v": "Bali" }), json!({ "v": "Java" })]);
         }
+        // The mart the board's chart reads.
+        if sql.contains("FROM serving.mart_x") {
+            return rows(vec![json!({ "region": "north", "visitors": 3 })]);
+        }
         ResponseTemplate::new(200).set_body_string(
             "Ok.
 ",
@@ -405,6 +409,22 @@ impl Respond for FakeCh {
 }
 
 async fn app(ch: &MockServer, secret: Option<&str>) -> TestApp {
+    let mut env: HashMap<String, String> = HashMap::from([("CH_URL".to_owned(), ch.uri())]);
+    if let Some(secret) = secret {
+        env.insert("EMBED_SECRET".to_owned(), secret.to_owned());
+    }
+    // `SEC-50` slice 2 M11: an embed is read by nobody in particular, so it
+    // acts as the deployment's catalog tenant — which the deployment names.
+    env.insert(
+        "CATALOG_TENANT_ID".to_owned(),
+        common::CATALOG_TENANT.to_owned(),
+    );
+    spin_up_with_env(&env).await
+}
+
+/// The same app, in a deployment that names no tenant to own the shared
+/// catalog (`SEC-50` slice 2 M11).
+async fn app_without_catalog_tenant(ch: &MockServer, secret: Option<&str>) -> TestApp {
     let mut env: HashMap<String, String> = HashMap::from([("CH_URL".to_owned(), ch.uri())]);
     if let Some(secret) = secret {
         env.insert("EMBED_SECRET".to_owned(), secret.to_owned());
@@ -1881,4 +1901,107 @@ async fn only_a_filter_that_picks_values_can_be_locked_or_editable() {
     )
     .await;
     assert_eq!(info["hiddenOnlyColumns"], json!(["year"]));
+}
+
+// ── SEC-50 slice 2 T5: the embed acts as the deployment's catalog tenant ──
+
+/// `SEC-50` D6: the sentence a job with no user is refused with when the
+/// deployment holds several tenants and no tenant owns the shared catalog.
+const NO_CATALOG_TENANT: &str = "This job reads the shared catalog, and no tenant owns it here. Set CATALOG_TENANT_ID to the tenant that owns this deployment's shared catalog.";
+
+/// `SEC-50` slice 2 D3/D6: an embed is read by nobody in particular, so it
+/// acts as the deployment's catalog tenant. A deployment that names no
+/// tenant to own the shared catalog refuses every tile of it, and nothing is
+/// read.
+#[tokio::test]
+async fn an_embed_in_a_deployment_without_a_catalog_tenant_is_refused() {
+    let fake = modal_board(&json!(null));
+    let ch = fake.serve().await;
+    let app = app_without_catalog_tenant(&ch, Some(SECRET)).await;
+
+    let (status, body) = embed_data(&app, &token_issued(5.0, None)).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["results"]["u_one"]["error"], NO_CATALOG_TENANT,
+        "{body}"
+    );
+    assert!(
+        fake.tile_statements().is_empty(),
+        "nothing is read: {:?}",
+        fake.tile_statements()
+    );
+}
+
+/// `SEC-50` slice 2 D3: the deployment names the tenant that owns the shared
+/// catalog, so the embed reads it.
+#[tokio::test]
+async fn an_embed_in_a_deployment_with_a_catalog_tenant_reads_the_rows() {
+    let fake = modal_board(&json!(null));
+    let ch = fake.serve().await;
+    let app = app(&ch, Some(SECRET)).await;
+
+    let (status, body) = embed_data(&app, &token_issued(5.0, None)).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body["results"]["u_one"].get("error").is_none(),
+        "the tile is read: {body}"
+    );
+    assert_eq!(
+        body["results"]["u_one"]["rows"].as_array().map(Vec::len),
+        Some(1),
+        "{body}"
+    );
+}
+
+/// `SEC-50` slice 2 D2: a deployment with one tenant holds no other
+/// tenant's table to reach, so nothing changes there.
+#[tokio::test]
+async fn an_embed_in_a_deployment_with_one_tenant_reads_the_rows() {
+    let fake = modal_board(&json!(null));
+    let ch = fake.serve().await;
+    let app = app(&ch, Some(SECRET)).await;
+    common::leave_no_seeded_tenants(&app.pool).await;
+
+    let (status, body) = embed_data(&app, &token_issued(5.0, None)).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body["results"]["u_one"].get("error").is_none(),
+        "one tenant in the deployment: nothing changes: {body}"
+    );
+    assert_eq!(
+        body["results"]["u_one"]["rows"].as_array().map(Vec::len),
+        Some(1),
+        "{body}"
+    );
+}
+
+/// `SEC-50` slice 2 T5: the embed's dropdown is read as the deployment's
+/// catalog tenant too.
+#[tokio::test]
+async fn the_embed_values_in_a_deployment_without_a_catalog_tenant_are_refused() {
+    let fake = modal_board(&json!({ "region": "editable" }));
+    let ch = fake.serve().await;
+    let app = app_without_catalog_tenant(&ch, Some(SECRET)).await;
+
+    let (status, body) = embed_values(&app, &token_issued(5.0, None), "region").await;
+
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["error"], NO_CATALOG_TENANT, "{body}");
+}
+
+/// `SEC-50` slice 2 T5: the embed's dropdown is read when the deployment
+/// names the tenant that owns the shared catalog.
+#[tokio::test]
+async fn the_embed_values_in_a_deployment_with_a_catalog_tenant_are_read() {
+    let fake = modal_board(&json!({ "region": "editable" }));
+    let ch = fake.serve().await;
+    let app = app(&ch, Some(SECRET)).await;
+
+    let (status, body) = embed_values(&app, &token_issued(5.0, None), "region").await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["values"], json!(["Bali", "Java"]), "{body}");
 }
