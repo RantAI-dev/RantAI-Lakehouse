@@ -1748,6 +1748,22 @@ class DashboardCasesTests(unittest.TestCase):
         self.assertEqual(where["def.cache.mode"], "fresh")
         self.assertNotIn("board", json.dumps(case["expect_tool"]))
 
+    def test_the_this_chart_cases_carry_the_page_context_they_ask_about(self) -> None:
+        # `BI-41` T2: "this chart" is only ambiguous with the tiles on the
+        # page, so each case sends the dashboard page's context: two tiles
+        # for the one that must ask, one tile for the one that acts.
+        cases = {c["id"]: c for c in json.loads((HERE / "dashboard_cases.json").read_text())}
+        asks = cases["dash_this_chart_fresh_asks"]
+        self.assertEqual(asks["expect_tool"]["name"], "ask_user")
+        self.assertEqual(asks["expect_no_tool"], ["set_cache_rule"])
+        for name in ("{chart_a}", "{chart_b}", "board id: {board}"):
+            self.assertIn(name, asks["context"])
+        one = cases["dash_this_chart_fresh_one_tile"]
+        self.assertIn("{chart_a}", one["context"])
+        self.assertNotIn("{chart_b}", one["context"])
+        self.assertEqual(one["expect_tool"]["args_contains"], {"chart": "{chart_a}", "rule": "fresh"})
+        self.assertNotIn("board", one["expect_tool"]["args_contains"])
+
     def test_every_write_case_confirms_and_checks_state_unless_it_tests_a_refusal_or_approval(self) -> None:
         # The plan's rule (step 2): a write case has `confirm` and `expect_state`,
         # except a case that tests a refusal (`expect_no_tool`, or a no-chart
