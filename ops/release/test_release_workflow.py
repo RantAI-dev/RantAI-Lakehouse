@@ -217,6 +217,35 @@ MARKER_STEPS = (
     "The stack runs bundle B again, and the markers are still there",
 )
 
+# The connector route the proof's third marker is read through, and the
+# tenant every call of the proof acts as.
+#
+# The API's connector routes are TENANT-SCOPED (`SEC-50`, `rust/crates/
+# lakehouse-api/src/tenant_scope.rs`): a connector belongs to a tenant,
+# and `GET /api/connectors/{id}` answers 404 for a caller that does not
+# belong to that tenant. The read of the marker connector answered 404
+# after the real update to bundle B, because the connector had NO tenant
+# at all: the bootstrap administrator belongs to no tenant, so the create
+# fell back to the typed name and the row's `tenant_id` stayed NULL — a
+# row no tenant-scoped read can see (PR #335 update-proof, connector
+# 404).
+#
+# The API reads the tenant from the `X-Tenant` header, and the console
+# sends the active tenant on EVERY request (`src/services/http.ts`
+# attaches it), so the proof's calls carry it too — every one of them
+# naming the SAME tenant.
+CONNECTOR_PATH = "/api/connectors"
+
+# The call that names the tenant, in the helper's own environment
+# variable. The value is the tenant's id; the API reads a UUID there and
+# answers 404 for anything else.
+TENANT_NAMED = re.compile(r'PROOF_TENANT="(?P<tenant>[^"]+)"')
+
+# The file the seeding step writes the tenant's id to, and every step
+# that calls the API reads it back from there: the steps of a job are
+# separate shells, so a variable of one step is not in the next.
+TENANT_FILE = "tenant-id.txt"
+
 # The digest reference the proof's own steps pull, and the commands the
 # check below reads.
 #
@@ -577,6 +606,48 @@ curl -fsS -c "$COOKIE_JAR" -X POST "$API_URL/api/auth/login" -d "$payload" > /de
 curl -fsS "$API_URL$path"
 """
 
+# A proof whose create and whose read act as two DIFFERENT tenants: the
+# read lands in a tenant the connector is not in, and the API answers 404
+# (PR #335 update-proof, connector 404).
+SYNTHETIC_PROOF_CALLS_THE_CONNECTORS_IN_TWO_TENANTS = """
+name: Synthetic
+on: workflow_dispatch
+jobs:
+  update-proof:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Seed the markers
+        run: |
+          connector="$(PROOF_TENANT="$tenant" ops/release/proof_api.sh post /api/connectors '{}')"
+      - name: The markers are still there after the update to bundle B
+        run: |
+          detail="$(PROOF_TENANT="$other" ops/release/proof_api.sh get "/api/connectors/$connector")"
+"""
+
+# A proof whose connector call names no tenant at all: the call then
+# acts as the caller's FIRST tenant, which is not the connector's.
+SYNTHETIC_PROOF_CALLS_THE_CONNECTOR_WITHOUT_A_TENANT = """
+name: Synthetic
+on: workflow_dispatch
+jobs:
+  update-proof:
+    runs-on: ubuntu-latest
+    steps:
+      - name: The markers are still there after the update to bundle B
+        run: |
+          detail="$(ops/release/proof_api.sh get "/api/connectors/$connector")"
+"""
+
+# A helper that signs in and makes the call, but never names the tenant
+# it acts as: the API resolves the caller's first tenant, and the
+# connector of another tenant is a 404.
+SYNTHETIC_HELPER_WITHOUT_A_TENANT = """
+#!/usr/bin/env bash
+set -euo pipefail
+curl -fsS -c "$COOKIE_JAR" -X POST "$API_URL/api/auth/login" -d "$payload" > /dev/null
+curl -fsS -b "$COOKIE_JAR" "$API_URL$path"
+"""
+
 
 def load_workflow(path: Path = WORKFLOW_PATH) -> dict[str, Any]:
     """The workflow, parsed."""
@@ -866,6 +937,95 @@ def helper_problems(script: str) -> list[str]:
         problems.append("the helper does not keep the session in a cookie jar")
     if '-b "$COOKIE_JAR"' not in script:
         problems.append("the helper does not make the call with the session")
+    return problems
+
+
+def connector_calls(document: dict[str, Any], job_name: str) -> list[tuple[str, str]]:
+    """Every call of the job that touches a connector route: the step it
+    is in, and the line it is on."""
+    found: list[tuple[str, str]] = []
+    for step in steps_of(document, job_name):
+        name = str(step.get("name"))
+        for line in logical_lines(str(step.get("run") or "")):
+            if PROOF_API_HELPER in line and CONNECTOR_PATH in line:
+                found.append((name, line))
+    return found
+
+
+def connector_tenant_problems(document: dict[str, Any], job_name: str) -> list[str]:
+    """Every connector call that names no tenant, or a tenant of its own.
+
+    The API's connector routes are tenant-scoped (`SEC-50`): a connector
+    belongs to a tenant, and a call that acts as another tenant sees no
+    connector at all — a 404. The proof's create and its two reads must
+    therefore all act as the SAME tenant, and each of them must NAME it
+    (the `X-Tenant` header the console sends on every request).
+    """
+    problems: list[str] = []
+    tenants: dict[str, list[str]] = {}
+    for name, line in connector_calls(document, job_name):
+        match = TENANT_NAMED.search(line)
+        if match is None:
+            problems.append(
+                f"{job_name}: {name}: the connector call names no tenant: {line}"
+            )
+            continue
+        tenants.setdefault(match.group("tenant"), []).append(f"{job_name}: {name}")
+    if len(tenants) > 1:
+        problems.append(
+            f"{job_name}: the connector calls name {len(tenants)} tenants "
+            f"({', '.join(sorted(tenants))}), and they must all name the same one: "
+            f"a call that acts as another tenant sees no connector at all."
+        )
+    return problems
+
+
+def helper_tenant_problems(script: str) -> list[str]:
+    """What the helper is missing about the tenant.
+
+    The API's tenant-scoped routes read the tenant from the `X-Tenant`
+    header (`tenant_scope::resolve`), and the console sends the active
+    tenant on every request (`src/services/http.ts`): the helper sends
+    it too, when `PROOF_TENANT` names a tenant.
+    """
+    problems: list[str] = []
+    if "PROOF_TENANT" not in script:
+        problems.append("the helper reads no tenant to act as")
+    if "X-Tenant: $PROOF_TENANT" not in script:
+        problems.append("the helper does not send the tenant as the X-Tenant header")
+    return problems
+
+
+def connector_tenant_file_problems(document: dict[str, Any], job_name: str) -> list[str]:
+    """Every connector call that does not act as the tenant the seeding
+    step created.
+
+    The seeding step writes the tenant's id to a file, and every step
+    that calls the API reads it back from there: the steps of a job are
+    separate shells, so a variable of one step is not in the next.
+    """
+    problems: list[str] = []
+    steps = steps_of(document, job_name)
+    if not any(
+        f"> {TENANT_FILE}" in str(step.get("run") or "") for step in steps
+    ):
+        problems.append(
+            f"{job_name}: no step writes the tenant's id to {TENANT_FILE}"
+        )
+    for step in steps:
+        name = str(step.get("name"))
+        run = str(step.get("run") or "")
+        if not any(
+            PROOF_API_HELPER in line and CONNECTOR_PATH in line
+            for line in logical_lines(run)
+        ):
+            continue
+        if f"cat {TENANT_FILE}" not in run:
+            problems.append(
+                f"{job_name}: {name}: the connector call does not read the tenant from "
+                f"{TENANT_FILE}, and so it does not act as the tenant the seeding step "
+                f"created"
+            )
     return problems
 
 
@@ -2085,6 +2245,79 @@ class UpdateProofTest(unittest.TestCase):
     def test_a_helper_that_calls_the_api_without_its_session_is_reported(self) -> None:
         """The check above must be able to fail."""
         self.assertNotEqual(helper_problems(SYNTHETIC_HELPER_WITHOUT_A_SESSION), [])
+
+    # ── The tenant the connector calls act as ─────────────────────────
+
+    def test_every_connector_call_of_the_update_proof_names_the_same_tenant(self) -> None:
+        """The create and the two reads must act as ONE tenant.
+
+        The API's connector routes are tenant-scoped (`SEC-50`,
+        `rust/crates/lakehouse-api/src/tenant_scope.rs`): a connector
+        belongs to a tenant, and `GET /api/connectors/{id}` answers 404
+        for a caller that does not belong to it. The read of the marker
+        connector answered 404 after the real update to bundle B, because
+        the connector had no tenant at all — the bootstrap administrator
+        belongs to no tenant, so the create fell back to the typed name
+        and the row's `tenant_id` stayed NULL (PR #335 update-proof,
+        connector 404).
+
+        Every call therefore NAMES the tenant it acts as, through the
+        `X-Tenant` header the console sends on every request, and they
+        all name the same one.
+        """
+        problems = connector_tenant_problems(self.document, "update-proof")
+        self.assertEqual(problems, [], "\n".join(problems))
+
+    def test_a_proof_whose_connector_calls_name_two_tenants_is_reported(self) -> None:
+        """The check above must be able to fail."""
+        two_tenants = yaml.safe_load(SYNTHETIC_PROOF_CALLS_THE_CONNECTORS_IN_TWO_TENANTS)
+        self.assertNotEqual(connector_tenant_problems(two_tenants, "update-proof"), [])
+        no_tenant = yaml.safe_load(SYNTHETIC_PROOF_CALLS_THE_CONNECTOR_WITHOUT_A_TENANT)
+        self.assertNotEqual(connector_tenant_problems(no_tenant, "update-proof"), [])
+
+    def test_the_connector_calls_act_as_the_tenant_the_seeding_step_created(self) -> None:
+        """The tenant every call names is the one the seed made.
+
+        The steps of a job are separate shells, so the tenant's id is
+        written to a file by the seeding step and read back from there by
+        every step that calls the API.
+        """
+        problems = connector_tenant_file_problems(self.document, "update-proof")
+        self.assertEqual(problems, [], "\n".join(problems))
+
+    def test_the_seeding_step_creates_the_tenant_and_the_membership(self) -> None:
+        """The tenant exists, and the administrator is a member of it.
+
+        A connector in a tenant the caller does not belong to is a 404
+        (`SEC-50`), so the proof needs both: the tenant, and the
+        administrator's membership of it — the console's Identity → Users
+        page does exactly this, through `PUT /api/identity/users/{id}/
+        tenants/{tenant_id}`.
+        """
+        run = str(step_named(self.document, "update-proof", "Seed the markers").get("run"))
+        self.assertIn("INSERT INTO tenant", run)
+        self.assertIn(f"> {TENANT_FILE}", run)
+        self.assertIn("ops/release/proof_api.sh put", run)
+        self.assertIn("/api/identity/users/", run)
+        self.assertIn("/tenants/", run)
+
+    def test_the_helper_sends_the_tenant_the_api_reads(self) -> None:
+        """The helper sends `X-Tenant`, the header the API reads.
+
+        The API's tenant-scoped routes resolve the tenant from the
+        `X-Tenant` header (`tenant_scope::resolve`), and the console
+        sends the active tenant on every request (`src/services/http.ts`).
+        The helper sends it when `PROOF_TENANT` names a tenant — and no
+        header at all when it does not, so a call that names no tenant
+        acts as the caller's first tenant, the way the API resolves it.
+        """
+        script = (RELEASE_DIR / "proof_api.sh").read_text(encoding="utf-8")
+        problems = helper_tenant_problems(script)
+        self.assertEqual(problems, [], "\n".join(problems))
+
+    def test_a_helper_that_names_no_tenant_is_reported(self) -> None:
+        """The check above must be able to fail."""
+        self.assertNotEqual(helper_tenant_problems(SYNTHETIC_HELPER_WITHOUT_A_TENANT), [])
 
     def test_the_update_proof_says_why_the_real_previous_release_test_is_not_here(self) -> None:
         """The real "previous release" test joins this job once 0.2.0

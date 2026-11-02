@@ -2951,6 +2951,159 @@ message. This is a STUB, not the API: the proof against the real API is PR #335'
   refused, so no `git pull --no-rebase` and no resolve was needed. No pull request was opened.
 
 
+### Fix for the PR #335 update-proof, connector tenant (developer, 2026-11-02)
+
+**Commits** (branch `feat/rel-2-s4b-lakehousectl-update`, on top of `244fc1ea`), ONE commit, and it
+carries this entry:
+
+| Commit | Task | What |
+| --- | --- | --- |
+| `fix(release): the proof's connector calls name one tenant (PR #335 update-proof, connector 404)` | PR #335 update-proof, connector 404 | the seeding step creates the tenant the marker connector lives in and adds the administrator to it, and the helper sends that tenant as the `X-Tenant` header every connector call carries |
+
+**What failed.** PR #335's `update-proof` job got past the sign-in this time: the update to bundle B
+succeeded, the stack ran `0.1.0-update-proof.1`, and the markers in the application database and in
+ClickHouse were both there. Then the step "The markers are still there after the update to bundle B"
+failed on the THIRD marker:
+
+```
+proof_api: signed in.
+curl: (22) The requested URL returned error: 404
+proof_api: the API refused the call to /api/connectors/conn-s4-update-proof-mvyyog8o.
+```
+
+**The cause, confirmed in the code.** The connector routes are TENANT-SCOPED, and the connector the
+proof created had NO tenant at all:
+
+1. The bootstrap administrator belongs to NO tenant. `main.rs`'s `bootstrap_admin` seeds it with
+   `tenants: Vec::new()` (`rust/crates/lakehouse-api/src/main.rs:539-544`), so `app_user_tenant` holds
+   no row for it, and `Principal::tenant_ids` — read from `app_user_tenant` on every request
+   (`rust/crates/lakehouse-auth/src/repository.rs:133-141`) — is EMPTY.
+2. The seeding step's create sent `"tenant": "s4-update-proof"` — a tenant NAME, not a `tenantId`.
+   `routes::connectors::resolve_create_tenant` takes the tenant from the caller's ACTIVE tenant
+   (`rust/crates/lakehouse-api/src/routes/connectors.rs:888-899`): with no `tenantId` in the body it
+   calls `tenant_scope::resolve`, and with no `X-Tenant` header that resolve answers `Ok(None)` — a
+   principal with no tenant (`rust/crates/lakehouse-api/src/tenant_scope.rs:75-88`). The typed name
+   was then stored as a display name only, and `create` never called `assign_tenant`
+   (`routes/connectors.rs:821-823`), so the row's `tenant_id` stayed NULL.
+3. The read of that row is refused by `routes::connectors::require_connector_in_tenants`, which asks
+   `connectors::connector_in_tenants(pool, id, &principal.tenant_ids)`
+   (`rust/crates/lakehouse-api/src/routes/connectors.rs:140-153`,
+   `rust/crates/lakehouse-store/src/connectors.rs:392-404`): `tenant_id = ANY('{}')` is never true
+   for a row with no tenant, so the answer is the same 404 an unknown id gets. `*:*` does not open
+   this route — it is a MEMBERSHIP rule, not a permission.
+
+So the read landed outside every tenant, and a connector with no tenant is invisible to every
+tenant-scoped read (`SEC-50`).
+
+**The fix.** The console's own way, in three parts:
+
+1. **The tenant exists.** The seeding step writes the tenant row — `s4-update-proof`, slug
+   `s4-update-proof`, `provisioning_status = 'not_applicable'` — with the same `psql` it already uses
+   for the two other markers, and reads its id back into `tenant-id.txt`. It is NOT created through
+   `POST /api/identity/tenants`, because that route PROVISIONS a tenant: it drives a Lakekeeper
+   warehouse create and a set of grants (`routes::identity::provision_tenant`), and the API container
+   of a release install cannot reach Lakekeeper at all — the install's `.env` names the host-facing
+   `LAKEKEEPER_BASE_URI=http://localhost:8181` (`.env.example`), and `localhost` inside the API
+   container is the API itself (`.env.example`'s own comment says a fully-containerized run must
+   override it to `http://lakekeeper:8181` "for tenant provisioning to reach Lakekeeper at all"). The
+   proof needs the tenant ROW, not a warehouse.
+2. **The administrator is a member of it**, through the API's own membership route
+   `PUT /api/identity/users/{id}/tenants/{tenant_id}` — the console's Identity → Users page does
+   exactly this, and that route's own doc comment names this case: "an account created without a
+   tenant (the bootstrap administrator) could never get one through the API"
+   (`rust/crates/lakehouse-api/src/routes/identity.rs:189-216`). The administrator's id comes from
+   `GET /api/auth/me`, and the membership is read from `app_user_tenant` on every request, so it
+   takes effect for the very next call.
+3. **Every connector call names that tenant.** The helper gained `PROOF_TENANT`: the tenant's id is
+   sent as the `X-Tenant` header on every call, which is the header the API reads
+   (`tenant_scope::resolve`) and the header the console attaches to every request
+   (`src/services/http.ts`). The seeding step's create and the two marker checks therefore all act
+   as the SAME tenant, and the create lands in it (`resolve_create_tenant` resolves the header's
+   tenant, and the stored tenant name then comes from the tenant row, not from what the client
+   typed). The helper also gained `put`, for the membership route.
+
+**The tests.** `ops/release/test_release_workflow.py`, in `UpdateProofTest`:
+
+| Test | What it holds |
+| --- | --- |
+| `test_every_connector_call_of_the_update_proof_names_the_same_tenant` | every connector call of the `update-proof` job names a tenant, and all of them name the SAME one |
+| `test_a_proof_whose_connector_calls_name_two_tenants_is_reported` | the check can fail: a synthetic proof whose create and whose read name two tenants is reported, and so is a connector call that names none |
+| `test_the_connector_calls_act_as_the_tenant_the_seeding_step_created` | the tenant every call names is the one the seeding step wrote to `tenant-id.txt`, and every step that calls the API reads it from there |
+| `test_the_seeding_step_creates_the_tenant_and_the_membership` | the seeding step creates the tenant row and adds the administrator to it through the API's membership route |
+| `test_the_helper_sends_the_tenant_the_api_reads` | the helper reads `PROOF_TENANT` and sends it as the `X-Tenant` header |
+| `test_a_helper_that_names_no_tenant_is_reported` | the check above can fail |
+
+**The new tests fail on the workflow and the helper as they were.** With the files of `244fc1ea`
+checked out (`git show 244fc1ea:.github/workflows/release.yml`, `git show
+244fc1ea:ops/release/proof_api.sh`), three of the new checks fail and report the three connector
+calls that named no tenant, and the helper check reports the two things the old helper is missing:
+
+```
+FAIL: test_every_connector_call_of_the_update_proof_names_the_same_tenant
+AssertionError: Lists differ: ['update-proof: Seed the markers: the connector call names no tenant:
+connector="$(ops/release/proof_api.sh post /api/connectors '{"name": "s4-update-proof", …', …]
+!= []
+FAIL: test_the_connector_calls_act_as_the_tenant_the_seeding_step_created
+AssertionError: Lists differ: ["update-proof: no step writes the tenant's id to tenant-id.txt", …]
+!= []
+FAIL: test_the_seeding_step_creates_the_tenant_and_the_membership
+AssertionError: 'INSERT INTO tenant' not found in 'set -euo pipefail\ncompose=(docker compose …
+Ran 4 tests — FAILED (failures=3)
+the helper check against the OLD helper:
+['the helper reads no tenant to act as', 'the helper does not send the tenant as the X-Tenant header']
+```
+
+**Commands run, in the foreground, on the final commit:**
+
+| Command | Result |
+| --- | --- |
+| `python3 -m pytest ops/release -q` (the venv `/tmp/opencode/pr335/venv/bin/python`, pytest 9.2.0, pyyaml 6.0.3, cryptography) | **237 passed** (231 before this fix, 6 new) |
+| `python3 -m unittest discover -s ops/release -p 'test_release_workflow.py'` | **Ran 103 tests — OK** (97 before this fix) |
+| the four new checks against the workflow and the helper of `244fc1ea` | **FAILED (failures=3)** — the three connector calls that named no tenant reported, plus the helper's two gaps |
+| `actionlint .github/workflows/release.yml` (actionlint 1.7.7) | no findings, exit 0 |
+| `shellcheck ops/release/proof_api.sh` (shellcheck 0.10.0) | clean, exit 0 |
+| `bash -n ops/release/proof_api.sh` | clean, exit 0 |
+| `shellcheck -s bash` on the three steps this fix touches, extracted from the workflow (old and new) | clean, exit 0, on both |
+| `git status` | clean (nothing generated staged) |
+
+**The sequence was measured against a stub of the API**, on this host: a small `http.server` that
+answers `/api/auth/login`, `/api/auth/change-password`, `/api/auth/me`, `PUT
+/api/identity/users/{id}/tenants/{tenant_id}`, `POST /api/connectors` and `GET
+/api/connectors/{id}` the way the real API does — the connector lands in the tenant the `X-Tenant`
+header names, and the read answers 404 unless the header names that same tenant. The sequence the
+seeding step and the marker check run answered `the connector is conn-s4-update-proof` and
+`{"id": "conn-s4-update-proof", "credentialManaged": true, "tenantId": "1111…"}`. The sequence as it
+was BEFORE this fix — the create with no tenant, the read with no tenant — answered exactly what
+PR #335 saw: `curl: (22) The requested URL returned error: 404` and `the API refused the call to
+/api/connectors/conn-s4-update-proof.` This is a STUB, not the API: the proof against the real API
+is PR #335's own `update-proof` job.
+
+**Not verified, with the reason:**
+
+- **The PR's own `update-proof` job was not run.** It needs a GitHub runner: the images, the
+  throwaway registry, cosign, a multi-GiB bundle and the whole stack. What stands in for it here is
+  the workflow's own tests (6 new cases, run against the workflow as it was and against the fixed
+  one), `actionlint`, `shellcheck`, and the stub run above.
+- **The tenant row is written with `psql`, not through `POST /api/identity/tenants`.** The reason is
+  in the workflow's own comment: that route PROVISIONS a tenant (a Lakekeeper warehouse create and
+  grants), and the API container of a release install cannot reach Lakekeeper
+  (`LAKEKEEPER_BASE_URI=http://localhost:8181` in the install's `.env` is the API container itself).
+  The proof needs the row, and a tenant that is not on the provisioning state machine says so
+  (`provisioning_status = 'not_applicable'`). This is the one place where the proof writes the
+  application's tables directly, and it writes them the way the step already writes its two other
+  markers.
+- **The whole-workspace cargo run** (`cargo clippy --workspace --all-targets --all-features -D
+  warnings` and `cargo test --workspace`): not run here — this fix touches no Rust source
+  (`git diff HEAD -- rust/crates/` is empty); the Rust it reads was read, not changed.
+- **No bun command ran**: the branch changes no TypeScript.
+- **The Dagster code location** (`(cd dagster && python -m pytest dispar_orchestrate -q)`): not
+  run — the branch changes no Python under `dagster/`. The two repo lints that scan it ran, and
+  both are OK.
+- **`docker compose --profile '*' config --quiet`**: not run — the branch changes no compose file.
+- **The pushes**: the commit was pushed to `origin/feat/rel-2-s4b-lakehousectl-update`. No push was
+  refused, so no `git pull --no-rebase` and no resolve was needed. No pull request was opened.
+
+
 ## 7. Review (planner appends below)
 
 ### Review S1 round 1 (planner, 2026-10-31, at `f79d4235`)

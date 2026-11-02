@@ -20,10 +20,31 @@
 #   so every call signs in again: one request, and every step is
 #   independent of the one before it.
 #
+# THE TENANT
+#   The API's connector routes are TENANT-SCOPED (`SEC-50`, `rust/crates/
+#   lakehouse-api/src/tenant_scope.rs`): a connector belongs to a tenant,
+#   and `GET /api/connectors/{id}` answers 404 for a caller that does
+#   not belong to that tenant. The API reads the tenant from the
+#   `X-Tenant` header: a call that names a tenant acts as that tenant,
+#   and a call that names none acts as the caller's FIRST tenant.
+#
+#   The console sends the active tenant on EVERY request (`src/services/
+#   http.ts` attaches `X-Tenant`), so the proof does the same:
+#   `PROOF_TENANT` names the tenant, and every call carries it as the
+#   header. The value is the tenant's ID — the API reads a UUID there,
+#   and answers 404 for anything else.
+#
+#   Without it the proof's marker connector had NO tenant at all: the
+#   bootstrap administrator belongs to no tenant, so the create fell
+#   back to the typed name and the row's `tenant_id` stayed NULL — a row
+#   that is invisible to every tenant-scoped read (PR #335 update-proof,
+#   connector 404).
+#
 # USAGE
 #   ops/release/proof_api.sh login
 #   ops/release/proof_api.sh get  /api/connectors/<id>
 #   ops/release/proof_api.sh post /api/connectors '<json>'
+#   ops/release/proof_api.sh put  /api/identity/users/<id>/tenants/<tenant>
 #
 # WHAT IT READS
 #   - `install/.env`: the bootstrap administrator's email
@@ -35,8 +56,8 @@
 #     afterwards.
 #
 # The defaults can be overridden with `PROOF_API_URL`,
-# `PROOF_API_ENV_FILE`, `PROOF_API_PASSWORD_FILE` and
-# `PROOF_API_COOKIE_JAR`.
+# `PROOF_API_ENV_FILE`, `PROOF_API_PASSWORD_FILE`,
+# `PROOF_API_COOKIE_JAR` and `PROOF_TENANT`.
 set -euo pipefail
 
 API_URL="${PROOF_API_URL:-http://127.0.0.1:8080}"
@@ -57,13 +78,30 @@ fail() {
 }
 
 usage() {
-    echo "usage: proof_api.sh login | get <path> | post <path> <json>" >&2
+    echo "usage: proof_api.sh login | get <path> | post <path> <json> | put <path> [<json>]" >&2
     exit 2
 }
 
 require_command() {
     command -v "$1" > /dev/null 2>&1 || fail "$1 is needed and is not installed."
 }
+
+# The header a call carries, when a tenant is named.
+#
+# The API reads the tenant from `X-Tenant` (`tenant_scope::resolve`), and
+# the console sends the active tenant on every request — so every call of
+# the proof carries it too, and the connector's create and its two reads
+# all act as the SAME tenant.
+#
+# The array is EMPTY when no tenant is named: the call then carries no
+# header at all, and the API resolves the caller's first tenant, the way
+# it does for a request with no `X-Tenant`. (The `+` expansion below is
+# the one that is safe under `set -u` on every bash: before 4.4 an empty
+# array counts as an unset variable.)
+tenant_args=()
+if [ -n "${PROOF_TENANT:-}" ]; then
+    tenant_args=(-H "X-Tenant: $PROOF_TENANT")
+fi
 
 # The bootstrap administrator's email, from the install's own `.env`.
 #
@@ -119,7 +157,8 @@ case "$command" in
         [ "$#" -eq 2 ] || usage
         path="$2"
         sign_in
-        curl -fsS -b "$COOKIE_JAR" "$API_URL$path" \
+        curl -fsS -b "$COOKIE_JAR" "${tenant_args[@]+"${tenant_args[@]}"}" \
+            "$API_URL$path" \
             || fail "the API refused the call to $path."
         ;;
     post)
@@ -128,9 +167,29 @@ case "$command" in
         body="$3"
         sign_in
         curl -fsS -b "$COOKIE_JAR" -X POST "$API_URL$path" \
+            "${tenant_args[@]+"${tenant_args[@]}"}" \
             -H 'content-type: application/json' \
             -d "$body" \
             || fail "the API refused the call to $path."
+        ;;
+    put)
+        # A body or none: `PUT /api/identity/users/{id}/tenants/{tenant_id}`
+        # takes no body, and `PUT /api/connectors/{id}/tenant` takes one.
+        [ "$#" -eq 2 ] || [ "$#" -eq 3 ] || usage
+        path="$2"
+        sign_in
+        if [ "$#" -eq 3 ]; then
+            body="$3"
+            curl -fsS -b "$COOKIE_JAR" -X PUT "$API_URL$path" \
+                "${tenant_args[@]+"${tenant_args[@]}"}" \
+                -H 'content-type: application/json' \
+                -d "$body" \
+                || fail "the API refused the call to $path."
+        else
+            curl -fsS -b "$COOKIE_JAR" -X PUT "$API_URL$path" \
+                "${tenant_args[@]+"${tenant_args[@]}"}" \
+                || fail "the API refused the call to $path."
+        fi
         ;;
     *)
         usage

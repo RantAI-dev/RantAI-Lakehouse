@@ -1963,7 +1963,66 @@ jobs:
           # password.
           printf '%s' 's4-update-proof-password-0001' > proof-password.txt
           ops/release/proof_api.sh login
-          connector="$(ops/release/proof_api.sh post /api/connectors \
+
+          # The tenant the connector marker lives in.
+          #
+          # The API's connector routes are TENANT-SCOPED (`SEC-50`, `rust/
+          # crates/lakehouse-api/src/tenant_scope.rs`): a connector belongs
+          # to a tenant, and `GET /api/connectors/{id}` answers 404 for a
+          # caller that does not belong to that tenant. The connector this
+          # proof reads had NO tenant at all: the bootstrap administrator
+          # belongs to no tenant, so the create fell back to the typed
+          # name and the row's `tenant_id` stayed NULL — a row no
+          # tenant-scoped read can see. That is why the read of the marker
+          # connector answered 404 after the update to bundle B (PR #335
+          # update-proof, connector 404).
+          #
+          # The tenant ROW is written here, and not through `POST
+          # /api/identity/tenants`, because that route PROVISIONS a tenant:
+          # it drives a Lakekeeper warehouse create and a set of grants
+          # (`routes::identity::provision_tenant`), and the API container
+          # of a release install cannot reach Lakekeeper at all — the
+          # install's `.env` names the host-facing
+          # `LAKEKEEPER_BASE_URI=http://localhost:8181` (`.env.example`),
+          # and `localhost` inside the API container is the API itself. The
+          # proof needs the tenant ROW, not a warehouse, and a tenant that
+          # is not on the provisioning state machine says so
+          # (`provisioning_status = 'not_applicable'`, the state the seeded
+          # tenants carry).
+          "${compose[@]}" exec -T postgres psql -U lakehouse -d lakehouse \
+            -v ON_ERROR_STOP=1 -c \
+            "INSERT INTO tenant (name, slug, plan, residency, provisioning_status)
+               VALUES ('s4-update-proof', 's4-update-proof', 'Standard', 'Jakarta (ID)', 'not_applicable')
+               ON CONFLICT (slug) DO NOTHING;"
+          "${compose[@]}" exec -T postgres psql -U lakehouse -d lakehouse \
+            -tAc "SELECT id FROM tenant WHERE slug = 's4-update-proof';" > tenant-id.txt
+          if [ ! -s tenant-id.txt ]; then
+            echo "::error::the tenant s4-update-proof was not created"
+            exit 1
+          fi
+          tenant="$(cat tenant-id.txt)"
+          echo "the tenant is $tenant"
+
+          # The administrator is a member of that tenant, through the API's
+          # own membership route (`PUT /api/identity/users/{id}/tenants/
+          # {tenant_id}`) — the console's Identity → Users page does exactly
+          # this, and that route exists for this case: an account created
+          # without a tenant (the bootstrap administrator) could never get
+          # one any other way.
+          admin="$(ops/release/proof_api.sh get /api/auth/me | jq -r .id)"
+          if [ -z "$admin" ] || [ "$admin" = "null" ]; then
+            echo "::error::the administrator's own id could not be read"
+            exit 1
+          fi
+          ops/release/proof_api.sh put "/api/identity/users/$admin/tenants/$tenant"
+          echo "the administrator $admin is a member of the tenant $tenant."
+
+          # The connector, through the API, IN that tenant. Every call of
+          # the proof names the tenant it acts as — the `X-Tenant` header
+          # the console sends on every request (`src/services/http.ts`) —
+          # so this create and the two reads below all act as the SAME
+          # tenant.
+          connector="$(PROOF_TENANT="$tenant" ops/release/proof_api.sh post /api/connectors \
             '{"name": "s4-update-proof", "type": "PostgreSQL", "direction": "source",
                  "host": "marker.internal",
                  "credential": {"source": "managed", "primary": "password",
@@ -2026,12 +2085,19 @@ jobs:
       # `curl` answers 401 here, which is how this step failed after
       # the real update to bundle B (PR #335 update-proof, marker check
       # 401).
+      #
+      # The call also NAMES the tenant it acts as: the connector routes
+      # are tenant-scoped (`SEC-50`), and a connector in a tenant the
+      # caller does not belong to is a 404 (PR #335 update-proof,
+      # connector 404). The tenant is the one the seeding step created,
+      # and it is read from the file that step wrote.
       - name: The markers are still there after the update to bundle B
         run: |
           set -euo pipefail
           compose=(docker compose -p rantai-lakehouse
             -f install/docker-compose.yml --env-file install/.env)
           connector="$(cat connector-id.txt)"
+          tenant="$(cat tenant-id.txt)"
 
           postgres="$("${compose[@]}" exec -T postgres psql -U lakehouse -d lakehouse \
             -tAc "SELECT note FROM s4_update_marker WHERE id = 1;")"
@@ -2045,7 +2111,7 @@ jobs:
             echo "::error::the marker in ClickHouse is gone: '$clickhouse'"
             exit 1
           fi
-          detail="$(ops/release/proof_api.sh get "/api/connectors/$connector")"
+          detail="$(PROOF_TENANT="$tenant" ops/release/proof_api.sh get "/api/connectors/$connector")"
           if [ "$(echo "$detail" | jq -r .credentialManaged)" != "true" ]; then
             echo "::error::the stored connector credential is gone: $detail"
             exit 1
@@ -2084,6 +2150,12 @@ jobs:
       # which signs in again after the rollback (the rollback restarts
       # the stack) and keeps the session in a cookie jar. A bare `curl`
       # answers 401 here (PR #335 update-proof, marker check 401).
+      #
+      # The call also NAMES the tenant it acts as: the connector routes
+      # are tenant-scoped (`SEC-50`), and a connector in a tenant the
+      # caller does not belong to is a 404 (PR #335 update-proof,
+      # connector 404). The tenant is the one the seeding step created,
+      # and it is read from the file that step wrote.
       - name: The stack runs bundle B again, and the markers are still there
         run: |
           set -euo pipefail
@@ -2097,6 +2169,7 @@ jobs:
           compose=(docker compose -p rantai-lakehouse
             -f install/docker-compose.yml --env-file install/.env)
           connector="$(cat connector-id.txt)"
+          tenant="$(cat tenant-id.txt)"
 
           postgres="$("${compose[@]}" exec -T postgres psql -U lakehouse -d lakehouse \
             -tAc "SELECT note FROM s4_update_marker WHERE id = 1;")"
@@ -2110,7 +2183,7 @@ jobs:
             echo "::error::the marker in ClickHouse is gone: '$clickhouse'"
             exit 1
           fi
-          detail="$(ops/release/proof_api.sh get "/api/connectors/$connector")"
+          detail="$(PROOF_TENANT="$tenant" ops/release/proof_api.sh get "/api/connectors/$connector")"
           if [ "$(echo "$detail" | jq -r .credentialManaged)" != "true" ]; then
             echo "::error::the stored connector credential is gone: $detail"
             exit 1
