@@ -337,25 +337,39 @@ pub struct BoardQuery {
     board: Option<String>,
 }
 
-/// `GET /api/dashboard/comments?board=` — the dashboard's comments (the newest
-/// 200, oldest first; `truncated` says older ones are left out).
+/// One dashboard's comments, as the list route answers them (`BI-37` D8).
+pub(crate) struct CommentPage {
+    /// The items, oldest first, each [`comment_json`]'s shape.
+    pub(crate) comments: Vec<Value>,
+    /// Older comments are left out (the route keeps the newest 200).
+    pub(crate) truncated: bool,
+}
+
+/// The body of `GET /api/dashboard/comments?board=` (`BI-37` D8): the one place
+/// the list's view check, its store reads and its sentence live, for the route
+/// and for the assistant's `list_dashboard_comments` (rule 4).
+///
+/// A service identity is refused here: it is not a person, so it can neither
+/// write a comment nor be shown other people's (`BI-19` E review E-5), and the
+/// tool must not be a way around that.
 ///
 /// # Errors
 ///
-/// `400` without a board id, `404 dashboard not found.` for a dashboard the
-/// caller cannot see (unknown, trashed and hidden alike), `403` for a caller
-/// with no access to dashboards at all, `503` without a database.
-pub async fn list(
-    State(state): State<AppState>,
-    Extension(principal): Extension<Principal>,
-    Query(q): Query<BoardQuery>,
-) -> ApiResult<ApiJson<Value>> {
-    let board = q.board.as_deref().map(str::trim).unwrap_or_default();
+/// [`list`]'s: `400` without a board id, `404 dashboard not found.` for a
+/// dashboard the caller cannot see, `403` for a service identity or a caller
+/// with no access to dashboards, `503` without a database.
+pub(crate) async fn page_for(
+    state: &AppState,
+    principal: &Principal,
+    board: &str,
+) -> Result<CommentPage, ApiError> {
+    refuse_service(principal)?;
+    let board = board.trim();
     if board.is_empty() {
-        return Err(ApiError::BadRequest("board is required".to_owned()).into());
+        return Err(ApiError::BadRequest("board is required".to_owned()));
     }
-    let target = target_for(&state, &principal, board).await?;
-    let pool = pool_of(&state)?;
+    let target = target_for(state, principal, board).await?;
+    let pool = pool_of(state)?;
     let (rows, truncated) = comments::list(pool, &target.key)
         .await
         .map_err(|e| store_failure(&e))?;
@@ -374,8 +388,29 @@ pub async fn list(
             comment_json(c, &who, caller, manages)
         })
         .collect();
+    Ok(CommentPage {
+        comments: items,
+        truncated,
+    })
+}
+
+/// `GET /api/dashboard/comments?board=` — the dashboard's comments (the newest
+/// 200, oldest first; `truncated` says older ones are left out).
+///
+/// # Errors
+///
+/// `400` without a board id, `404 dashboard not found.` for a dashboard the
+/// caller cannot see (unknown, trashed and hidden alike), `403` for a caller
+/// with no access to dashboards at all, `503` without a database.
+pub async fn list(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Query(q): Query<BoardQuery>,
+) -> ApiResult<ApiJson<Value>> {
+    let board = q.board.as_deref().map(str::trim).unwrap_or_default();
+    let page = page_for(&state, &principal, board).await?;
     Ok(ApiJson(
-        json!({ "comments": items, "truncated": truncated }),
+        json!({ "comments": page.comments, "truncated": page.truncated }),
     ))
 }
 

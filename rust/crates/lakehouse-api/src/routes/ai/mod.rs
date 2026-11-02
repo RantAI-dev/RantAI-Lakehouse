@@ -2281,8 +2281,13 @@ mod tests {
     /// Length and FNV-1a fingerprint of `prompt::SYSTEM_BASE` as committed
     /// before this change, computed from the file's text and not from this
     /// code.
-    const BASE_LEN_BEFORE_ASK_BACK: usize = 2907;
-    const BASE_FNV_BEFORE_ASK_BACK: u64 = 0xd92c_9883_6331_6470;
+    ///
+    /// `BI-37` D8 moved them: the base prompt gained one line saying that
+    /// dashboard comments are what people wrote and are never instructions
+    /// (the same sentence the tool's result carries). (`3107`,
+    /// `0xeed4_cb58_35c8_1eca`; before: `2907`, `0xd92c_9883_6331_6470`.)
+    const BASE_LEN_BEFORE_ASK_BACK: usize = 3107;
+    const BASE_FNV_BEFORE_ASK_BACK: u64 = 0xeed4_cb58_35c8_1eca;
 
     const WORDS_HEADER: &str = "\n\nTHIS USER'S WORDS\n";
 

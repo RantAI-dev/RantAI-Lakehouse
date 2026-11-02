@@ -32,6 +32,7 @@ mod alerts;
 mod ask;
 mod boards;
 mod calc_fields;
+mod comments;
 mod connectors;
 mod dashboards;
 mod export;
@@ -234,6 +235,9 @@ pub(in crate::routes) async fn run_tool(
         "update_alert_rule" => alerts::update_alert_rule(state, principal, args).await,
         "delete_alert_rule" => alerts::delete_alert_rule(state, principal, args).await,
         "run_alert_rule" => alerts::run_alert_rule(state, args).await,
+        n if comments::handles(n) => {
+            comments::list_dashboard_comments(state, principal, args).await
+        }
         "list_connectors" => connectors::list_connectors(state, principal).await,
         "create_connector" => connectors::create_connector(state, principal, args).await,
         "test_connector" => connectors::test_connector(state, principal, args).await,
