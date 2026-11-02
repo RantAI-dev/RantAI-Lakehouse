@@ -73,10 +73,39 @@ use crate::tenant::{
 /// search term the command palette sends (WS2 §13) — moved here from
 /// `src/services/clients/assets.ts`'s browser-side filter so there is one
 /// implementation of the term match, not two (`AGENTS.md` rule 4).
+///
+/// `limit` is how many assets the caller wants (`DATA-41` D3): the
+/// command palette shows eight, so it asks for eight instead of being
+/// sent a catalog of ten thousand tables to throw away all but eight.
 #[derive(Debug, Deserialize)]
 pub struct ListQuery {
     #[serde(default)]
     q: Option<String>,
+    /// At most how many assets the answer carries. `None` is every match,
+    /// as before `DATA-41` D3.
+    #[serde(default)]
+    limit: Option<u32>,
+}
+
+/// The `limit` a caller asked for, and whether this route serves it.
+///
+/// `DATA-41` D3: the limit is 1 to 200 — the Data Explorer's own page size
+/// ([`MAX_PAGE_SIZE`]) — and anything else is a 400 with a plain message.
+/// A limit the server does not serve is the caller's mistake, and rounding
+/// it silently would answer a different question than the one that was
+/// asked.
+///
+/// # Errors
+///
+/// [`ApiError::BadRequest`] when the limit is outside 1..=[`MAX_PAGE_SIZE`].
+fn requested_limit(limit: Option<u32>) -> Result<Option<usize>, ApiError> {
+    match limit {
+        None => Ok(None),
+        Some(value) if (1..=MAX_PAGE_SIZE).contains(&value) => Ok(Some(value as usize)),
+        Some(_) => Err(ApiError::BadRequest(format!(
+            "`limit` must be between 1 and {MAX_PAGE_SIZE}"
+        ))),
+    }
 }
 
 // ── CATALOG_TENANT_ID: this deployment's single shared, no-tenant-column
@@ -214,6 +243,13 @@ pub(crate) async fn catalog_tenant_refusal(
 /// `"columnSearch": "partial"`. Without a term nothing changes: the
 /// registry is assembled live.
 ///
+/// # `limit` (`DATA-41` D3)
+///
+/// With `?limit=N` the answer carries at most `N` assets and says how many
+/// matched in all (`total`). The limit is applied AFTER the ranking, so the
+/// assets that come back are the best ones. Without a limit the answer is
+/// as it was: every match, and no `total`.
+///
 /// # Tenant scoping
 ///
 /// [`catalog_tenant_refusal`] runs first — see its doc comment and the
@@ -243,16 +279,24 @@ pub async fn list(
         Ok(None) => {}
         Err(err) => return ApiRejection(err).into_response(),
     }
+    // `DATA-41` D3: a limit outside 1..=200 is a 400 with a plain message.
+    let limit = match requested_limit(params.limit) {
+        Ok(limit) => limit,
+        Err(err) => return ApiRejection(err).into_response(),
+    };
     if let Some(term) = params.q.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
         return match search_snapshot(&state).await {
             Ok(snapshot) => {
-                let assets = catalog_search::search(
-                    &snapshot.assets,
-                    &snapshot.columns,
-                    &snapshot.usage,
-                    term,
-                );
-                let mut body = json!({ "assets": assets, "namespaces": snapshot.namespaces });
+                let outcome = catalog_search::search(&snapshot.index, &snapshot.usage, term, limit);
+                let mut body = json!({
+                    "assets": outcome.assets,
+                    "namespaces": snapshot.namespaces,
+                });
+                // `DATA-41` D3: the count of every match, so a caller that
+                // asked for a few of them still knows how many there are.
+                if limit.is_some() {
+                    body["total"] = json!(outcome.total);
+                }
                 if snapshot.column_search_partial {
                     body["columnSearch"] = json!("partial");
                 }
@@ -262,7 +306,21 @@ pub async fn list(
         };
     }
     match assemble_catalog(&state).await {
-        Ok((body, _bronze_pairs)) => (StatusCode::OK, ApiJson(body)).into_response(),
+        Ok((mut body, _bronze_pairs)) => {
+            // `DATA-41` D3: the same limit on the live registry, and the
+            // same count of what it held.
+            if let Some(limit) = limit {
+                let total = body
+                    .get("assets")
+                    .and_then(Value::as_array)
+                    .map_or(0, Vec::len);
+                if let Some(assets) = body.get_mut("assets").and_then(Value::as_array_mut) {
+                    assets.truncate(limit);
+                }
+                body["total"] = json!(total);
+            }
+            (StatusCode::OK, ApiJson(body)).into_response()
+        }
         Err(err) => list_unavailable(err),
     }
 }
@@ -405,10 +463,10 @@ pub async fn query(
         )
             .into_response())
     };
-    let (searched, column_search_partial) = if let Some(term) = term {
+    let (mut filtered, column_search_partial) = if let Some(term) = term {
         match search_snapshot(&state).await {
             Ok(snapshot) => (
-                catalog_search::search(&snapshot.assets, &snapshot.columns, &snapshot.usage, term),
+                catalog_search::search(&snapshot.index, &snapshot.usage, term, None).assets,
                 snapshot.column_search_partial,
             ),
             Err(err) => return unavailable(err),
@@ -426,8 +484,14 @@ pub async fn query(
         (assets, false)
     };
 
-    let mut filtered = catalog_query::apply_filters(&searched, &filters, join);
+    // The sort runs over the rows the route holds, before the filters:
+    // sorting the whole set and keeping the matches leaves them in the
+    // same order as keeping the matches and sorting them would
+    // (`apply_sort` is a total order, `id` included), and it lets the
+    // filters run over the rows the route already owns.
     order_results(&mut filtered, term.is_some(), &sort);
+    // `DATA-41` D6: with no filters the rows are not copied at all.
+    catalog_query::apply_filters(&mut filtered, &filters, join);
 
     let (ordered, summaries) = match group_by.as_deref() {
         Some(field) => catalog_query::apply_grouping(&filtered, field),
@@ -605,57 +669,9 @@ async fn list_body(
         );
     }
 
-    let total_of = |slug: &str| -> i64 {
-        sync_rows
-            .iter()
-            .find(|s| str_col(s, "slug") == slug)
-            .map_or(0, |s| num_or_zero(Some(s), "total"))
-    };
-    let author_of = |slug: &str| -> String {
-        sync_rows
-            .iter()
-            .find(|s| str_col(s, "slug") == slug)
-            .map(|s| str_col(s, "author").to_owned())
-            .unwrap_or_default()
-    };
-    let col_of = |slug: &str| -> i64 {
-        col_rows
-            .iter()
-            .find(|c| str_col(c, "slug") == slug)
-            .map_or(0, |c| num_or_zero(Some(c), "n"))
-    };
-    let frequency_of = |slug: &str| -> Option<i64> {
-        sync_rows
-            .iter()
-            .find(|s| str_col(s, "slug") == slug)
-            .and_then(|s| catalog_governance::frequency_target_seconds(str_col(s, "frekuensi")))
-    };
-
-    let mut assets: Vec<Value> = cat
-        .iter()
-        .map(|c| {
-            let slug = str_col(c, "slug");
-            let rows = total_of(slug);
-            let sekunder = str_col(c, "tier") == "sekunder";
-            let owner = author_of(slug);
-            let description = str_col(c, "description");
-            let updated_at = str_col(c, "updated_at");
-            let mut row = bronze_catalog_row(
-                slug,
-                str_col(c, "title"),
-                sekunder,
-                owner.as_str(),
-                description,
-                rows,
-                col_of(slug),
-                updated_at,
-            );
-            if let Some(seconds) = frequency_of(slug) {
-                set_freshness_target(&mut row, seconds, "frequency");
-            }
-            row
-        })
-        .collect();
+    // `DATA-41` D1: the registry reads are indexed by slug, once per
+    // assembly, and the assets are read out of the index.
+    let mut assets: Vec<Value> = assemble_bronze_rows(&cat, &sync_rows, &col_rows);
 
     let bronze_table_names: HashSet<&str> = cat.iter().map(|c| str_col(c, "table_name")).collect();
     // Handed back to `list` for `enrich_bronze_assets` — taken from `cat`
@@ -741,6 +757,121 @@ async fn list_body(
     ))
 }
 
+/// The Bronze registry's rows, keyed by slug.
+///
+/// `DATA-41` D1: the four registry lookups used to scan every row of
+/// every read, once per asset. On a catalog of 10,000 tables that is
+/// quadratic — the copy build took about 9.2 seconds, and the no-term
+/// list paid it on every request. One map per read, built once per
+/// assembly, is linear.
+///
+/// A slug with several rows answers with the FIRST row in read order:
+/// that is what the `.find()` this replaces returned, and the assembled
+/// rows must not change because the lookup got faster.
+struct BronzeRegistry<'a> {
+    /// The sync rows — `total`, `author` and `frekuensi` — by slug.
+    sync: HashMap<&'a str, &'a Map<String, Value>>,
+    /// The column-count rows by slug.
+    columns: HashMap<&'a str, &'a Map<String, Value>>,
+}
+
+impl<'a> BronzeRegistry<'a> {
+    /// Indexes the two reads, keyed by slug.
+    ///
+    /// `or_insert`, not `insert`: a slug with several rows keeps the
+    /// first one in read order, which is what the `.find()` this
+    /// replaces returned.
+    fn new(sync_rows: &'a [Map<String, Value>], col_rows: &'a [Map<String, Value>]) -> Self {
+        /// One read, keyed by slug, keeping the first row of a slug.
+        fn by_slug<'a>(rows: &'a [Map<String, Value>]) -> HashMap<&'a str, &'a Map<String, Value>> {
+            let mut map: HashMap<&'a str, &'a Map<String, Value>> =
+                HashMap::with_capacity(rows.len());
+            for row in rows {
+                map.entry(str_col(row, "slug")).or_insert(row);
+            }
+            map
+        }
+        Self {
+            sync: by_slug(sync_rows),
+            columns: by_slug(col_rows),
+        }
+    }
+
+    /// The row count the sync row reports; `0` when it has none.
+    fn total_of(&self, slug: &str) -> i64 {
+        match self.sync.get(slug).copied() {
+            Some(s) => num_or_zero(Some(s), "total"),
+            None => 0,
+        }
+    }
+
+    /// The author the sync row names; `""` when it names none.
+    fn author_of(&self, slug: &str) -> &'a str {
+        match self.sync.get(slug).copied() {
+            Some(s) => str_col(s, "author"),
+            None => "",
+        }
+    }
+
+    /// The number of columns the column read counts for the slug; `0`
+    /// when it counts none.
+    fn column_count_of(&self, slug: &str) -> i64 {
+        match self.columns.get(slug).copied() {
+            Some(c) => num_or_zero(Some(c), "n"),
+            None => 0,
+        }
+    }
+
+    /// The freshness target the sync row's frequency names; `None` when
+    /// it names none.
+    fn frequency_of(&self, slug: &str) -> Option<i64> {
+        self.sync
+            .get(slug)
+            .copied()
+            .and_then(|s| catalog_governance::frequency_target_seconds(str_col(s, "frekuensi")))
+    }
+}
+
+/// The Bronze assets the catalog rows and the registry reads assemble
+/// into.
+///
+/// `DATA-41` D1: the registry's sync and column rows are looked up by
+/// key (see [`BronzeRegistry`]), not by scanning every row per asset.
+/// The rows are the same rows the scan produced: a slug with no sync row
+/// reads as zero rows and no author, and a slug with no column row
+/// reads as no columns.
+fn assemble_bronze_rows(
+    cat: &[Map<String, Value>],
+    sync_rows: &[Map<String, Value>],
+    col_rows: &[Map<String, Value>],
+) -> Vec<Value> {
+    let registry = BronzeRegistry::new(sync_rows, col_rows);
+    cat.iter()
+        .map(|c| {
+            let slug = str_col(c, "slug");
+            let rows = registry.total_of(slug);
+            let sekunder = str_col(c, "tier") == "sekunder";
+            let owner = registry.author_of(slug);
+            let description = str_col(c, "description");
+            let updated_at = str_col(c, "updated_at");
+            let mut row = bronze_catalog_row(
+                slug,
+                str_col(c, "title"),
+                sekunder,
+                owner,
+                description,
+                rows,
+                registry.column_count_of(slug),
+                updated_at,
+            );
+            if let Some(seconds) = registry.frequency_of(slug) {
+                set_freshness_target(&mut row, seconds, "frequency");
+            }
+            row
+        })
+        .collect()
+}
+
 /// How long the search copy is trusted before one request rebuilds it
 /// (`DATA-11` D2). Thirty seconds is the age a new table or a fresh row
 /// count may lag in a search result; the list a person opens without a
@@ -783,6 +914,47 @@ async fn search_snapshot(
         .await
 }
 
+/// Builds the search copy once at start-up, in the background.
+///
+/// `DATA-41` D4: on a catalog of 10,000 tables the copy takes about five
+/// seconds to build, and the first person to search should not pay for
+/// it. The API builds it once the application database is up, so a search
+/// that arrives later is answered from the copy at once.
+///
+/// A search that arrives before this task runs builds the copy inline,
+/// single-flight, as before: the two share the one build.
+///
+/// The builder owns a clone of the state, so the copy can be moved into
+/// the task (`DATA-38` D3). The task's handle is returned so a caller can
+/// wait for it; the API drops it, and the task runs on.
+///
+/// A build that fails is logged and the first search builds the copy
+/// instead — a copy that cannot be built is no worse than no copy at all.
+#[allow(
+    dead_code,
+    reason = "the binary starts the copy at start-up (`main.rs`); the library \
+              target compiles this module too and has no start-up path of its own"
+)]
+pub fn spawn_startup_search_copy(state: &AppState) -> tokio::task::JoinHandle<()> {
+    let owner = Arc::new(state.clone());
+    tokio::spawn(async move {
+        let owner_for_build = Arc::clone(&owner);
+        let result = owner
+            .catalog_search_cache
+            .warm(Instant::now(), SEARCH_SNAPSHOT_TTL, move || {
+                let owner = Arc::clone(&owner_for_build);
+                async move { build_search_snapshot(&owner).await }
+            })
+            .await;
+        if let Err(err) = result {
+            tracing::warn!(
+                %err,
+                "the start-up build of the catalog search copy failed; the first search builds it instead"
+            );
+        }
+    })
+}
+
 /// The rebuild behind [`search_snapshot`]: [`assemble_catalog`], exactly
 /// what `list` serves, then the columns and the use counts.
 async fn build_search_snapshot(
@@ -800,8 +972,11 @@ async fn build_search_snapshot(
         .filter_map(|a| a.get("id").and_then(Value::as_str).map(str::to_owned))
         .collect();
     let usage = catalog_governance::use_by_asset(state, &ids, &bronze_pairs).await;
+    // `DATA-41` D2: the index is prepared here, with the copy, so a search
+    // reads it and allocates nothing per candidate.
+    let index = catalog_search::SearchIndex::build(assets, &columns);
     Ok(crate::catalog_search_cache::CatalogSearchSnapshot {
-        assets,
+        index,
         namespaces: body.get("namespaces").cloned().unwrap_or(Value::Null),
         columns,
         usage,
@@ -1863,7 +2038,7 @@ async fn mark_annotation_and_history(
         // the name absent; it never fails the page.
         let replacement_name = match annotation.replacement_asset_id.as_deref().map(str::trim) {
             Some(replacement) if !replacement.is_empty() => match search_snapshot(state).await {
-                Ok(snapshot) => asset_name_in(&snapshot.assets, replacement).map(str::to_owned),
+                Ok(snapshot) => asset_name_in(snapshot.assets(), replacement).map(str::to_owned),
                 Err(err) => {
                     tracing::warn!(%err, "catalog read failed; the deprecation notice shows the replacement id");
                     None
@@ -3443,7 +3618,7 @@ pub async fn put_certification(
             )
         })?;
         let exists = snapshot
-            .assets
+            .assets()
             .iter()
             .any(|a| a.get("id").and_then(Value::as_str) == Some(replacement));
         if !exists {
@@ -3811,6 +3986,20 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_owned(), json!(v)))
             .collect()
+    }
+
+    /// The table a statement READS: the first registry table its
+    /// `FROM` clause names (the name ends at the next backtick).
+    ///
+    /// DATA-40 D3's filter names the primary catalog table inside every
+    /// secondary branch, so a read of the sync or the column registry
+    /// mentions `dataset_catalog` as well — the table a statement READS
+    /// is what decides what the engine answers.
+    fn table_read(sql: &str) -> &str {
+        sql.find("FROM lake.`")
+            .map(|at| &sql[at + "FROM lake.`".len()..])
+            .and_then(|rest| rest.split('`').next())
+            .unwrap_or_default()
     }
 
     // DATA-11 R2: the three id shapes the row builders give.
@@ -4873,7 +5062,10 @@ mod tests {
                 State(state),
                 Extension(member),
                 HeaderMap::new(),
-                Query(ListQuery { q: None }),
+                Query(ListQuery {
+                    q: None,
+                    limit: None,
+                }),
             )
             .await;
             let (status, body) = response_json(resp).await;
@@ -4897,7 +5089,10 @@ mod tests {
                 State(state),
                 Extension(outsider),
                 HeaderMap::new(),
-                Query(ListQuery { q: None }),
+                Query(ListQuery {
+                    q: None,
+                    limit: None,
+                }),
             )
             .await;
             let (status, body) = response_json(resp).await;
@@ -4928,6 +5123,7 @@ mod tests {
                 HeaderMap::new(),
                 Query(ListQuery {
                     q: Some("revenue".to_owned()),
+                    limit: None,
                 }),
             )
             .await;
@@ -4977,7 +5173,10 @@ mod tests {
                 State(state),
                 Extension(analyst),
                 HeaderMap::new(),
-                Query(ListQuery { q: None }),
+                Query(ListQuery {
+                    q: None,
+                    limit: None,
+                }),
             )
             .await;
             let (status, body) = response_json(resp).await;
@@ -5025,7 +5224,10 @@ mod tests {
                 State(state),
                 Extension(analyst),
                 HeaderMap::new(),
-                Query(ListQuery { q: None }),
+                Query(ListQuery {
+                    q: None,
+                    limit: None,
+                }),
             )
             .await;
             let (status, body) = response_json(resp).await;
@@ -5048,7 +5250,10 @@ mod tests {
                 State(state),
                 Extension(admin),
                 HeaderMap::new(),
-                Query(ListQuery { q: None }),
+                Query(ListQuery {
+                    q: None,
+                    limit: None,
+                }),
             )
             .await;
             let (status, body) = response_json(resp).await;
@@ -5178,8 +5383,10 @@ mod tests {
         /// Puts a search copy in the cache that lists `ids` as assets, so a
         /// replacement can be checked without a catalog behind the mock.
         async fn prime_search_copy_with(state: &AppState, ids: &[&str]) {
+            let assets: Vec<Value> = ids.iter().map(|id| json!({ "id": id })).collect();
             let mut copy = empty_copy();
-            copy.assets = ids.iter().map(|id| json!({ "id": id })).collect();
+            copy.index =
+                catalog_search::SearchIndex::build(assets, &catalog_search::ColumnIndex::new());
             state
                 .catalog_search_cache
                 .get_or_build(Instant::now(), SEARCH_SNAPSHOT_TTL, move || async move {
@@ -5579,7 +5786,10 @@ mod tests {
 
         fn empty_copy() -> crate::catalog_search_cache::CatalogSearchSnapshot {
             crate::catalog_search_cache::CatalogSearchSnapshot {
-                assets: Vec::new(),
+                index: catalog_search::SearchIndex::build(
+                    Vec::new(),
+                    &catalog_search::ColumnIndex::new(),
+                ),
                 namespaces: Value::Null,
                 columns: std::collections::HashMap::new(),
                 usage: std::collections::HashMap::new(),
@@ -6874,20 +7084,6 @@ mod tests {
                 .collect()
         }
 
-        /// The table a statement reads: the first registry table its
-        /// `FROM` clause names (the name ends at the next backtick).
-        ///
-        /// DATA-40 D3's filter names the primary catalog table inside every
-        /// secondary branch, so a read of the sync or the column registry
-        /// mentions `dataset_catalog` as well — the table a statement
-        /// READS is what decides what the engine answers.
-        fn table_read(sql: &str) -> &str {
-            sql.find("FROM lake.`")
-                .map(|at| &sql[at + "FROM lake.`".len()..])
-                .and_then(|rest| rest.split('`').next())
-                .unwrap_or_default()
-        }
-
         /// The engine the two reads talk to.
         struct RegistryEngine;
 
@@ -7575,6 +7771,544 @@ mod tests {
                 json!(20),
                 "the newer row count, not the older one: {body:?}"
             );
+        }
+    }
+
+    // ── `GET /api/catalog?limit=` (`DATA-41` D3) ────────────────────
+    //
+    // The command palette shows eight results and used to be served the
+    // whole catalog — ten thousand tables, 6.6 MB — to throw all but eight
+    // away. These are the route's own tests: the limit is applied AFTER
+    // the ranking, the count says how many matched in all, and a limit
+    // outside 1..=200 is a 400 with a plain message.
+    mod search_limit {
+        #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+        use lakehouse_auth::{PermissionSet, PrincipalId};
+        use uuid::Uuid;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+        use super::*;
+        use crate::config::Config;
+
+        /// The three tables the mock catalog holds, each with the word
+        /// `revenue` in a different place, so the ranking has an order:
+        ///
+        /// | table | where the word is | score |
+        /// | --- | --- | --- |
+        /// | `bronze.one` | the name | 120 |
+        /// | `bronze.three` | a column name | 60 |
+        /// | `bronze.two` | the description | 30 |
+        fn catalog_rows() -> Vec<Value> {
+            vec![
+                json!({
+                    "slug": "bronze.one", "title": "Revenue", "description": "the ledger",
+                    "tier": "public", "updated_at": "2026-01-01T00:00:00Z", "table_name": "",
+                }),
+                json!({
+                    "slug": "bronze.two", "title": "Ledger", "description": "revenue by month",
+                    "tier": "public", "updated_at": "2026-01-01T00:00:00Z", "table_name": "",
+                }),
+                json!({
+                    "slug": "bronze.three", "title": "Orders", "description": "orders by day",
+                    "tier": "public", "updated_at": "2026-01-01T00:00:00Z", "table_name": "",
+                }),
+            ]
+        }
+
+        /// The engine the catalog's reads talk to.
+        ///
+        /// The table a statement READS decides what it answers — not
+        /// every table it mentions: DATA-40 D3's filter names the
+        /// primary catalog table inside every secondary branch, so a read
+        /// of the sync or the column registry mentions `dataset_catalog`
+        /// too.
+        struct CatalogEngine;
+
+        impl Respond for CatalogEngine {
+            fn respond(&self, request: &Request) -> ResponseTemplate {
+                let sql = String::from_utf8_lossy(&request.body).into_owned();
+                let answer = |data: Vec<Value>| {
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "meta": [],
+                        "data": data,
+                        "rows": data.len(),
+                    }))
+                };
+                // DATA-40 D5's clash read: this fixture holds no slug in
+                // both registries.
+                if sql.contains("INTERSECT") {
+                    return answer(vec![json!({"n": "0", "slugs": []})]);
+                }
+                let table = table_read(&sql);
+                if table.ends_with("dataset_catalog") {
+                    return answer(catalog_rows());
+                }
+                if table.ends_with("dataset_sync") {
+                    return answer(
+                        catalog_rows()
+                            .iter()
+                            .map(|row| {
+                                json!({
+                                    "slug": row["slug"], "total": "10",
+                                    "author": "bench", "frekuensi": "daily",
+                                })
+                            })
+                            .collect(),
+                    );
+                }
+                if table.ends_with("dataset_column") {
+                    // The two shapes the reads ask for: the count per
+                    // slug, and the rows of the index. One answer holds
+                    // both, and each read picks the columns it named.
+                    return answer(vec![
+                        json!({
+                            "slug": "bronze.one", "n": "20",
+                            "key_asli": "revenue_amount", "deskripsi": "the amount",
+                        }),
+                        json!({
+                            "slug": "bronze.two", "n": "20",
+                            "key_asli": "total", "deskripsi": "the total",
+                        }),
+                        json!({
+                            "slug": "bronze.three", "n": "20",
+                            "key_asli": "revenue_amount", "deskripsi": "the amount",
+                        }),
+                    ]);
+                }
+                // `system.tables`, `system.columns` and `system.parts`:
+                // this fixture is about the Bronze registry.
+                answer(Vec::new())
+            }
+        }
+
+        /// A `ClickHouse` that answers the catalog's own queries: the
+        /// registry rows above, one column each, and no Silver or Gold
+        /// table.
+        async fn mock_catalog() -> MockServer {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(CatalogEngine)
+                .mount(&server)
+                .await;
+            server
+        }
+
+        /// An `AppState` with no Postgres: the caller below is
+        /// unrestricted, so the tenant gate lets it through without
+        /// counting tenants, and the enrichment steps that read Postgres
+        /// have nothing to read.
+        fn catalog_state(ch_url: &str) -> AppState {
+            let mut env = HashMap::new();
+            env.insert("CH_URL".to_owned(), ch_url.to_owned());
+            let config = Config::from_map(&env).expect("a valid test Config");
+            AppState::new(config)
+        }
+
+        /// A principal that holds everything (`"*:*"`), so the tenant gate
+        /// lets it through without a database.
+        fn admin() -> Principal {
+            Principal {
+                id: PrincipalId::User(Uuid::new_v4()),
+                tenant_ids: Vec::new(),
+                display_name: "Platform Admin".to_owned(),
+                permissions: PermissionSet::parse("*:*"),
+                provider: "session".to_owned(),
+                must_change_password: false,
+                role_names: Vec::new(),
+            }
+        }
+
+        async fn body_of(resp: Response) -> (StatusCode, Value) {
+            let status = resp.status();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (status, serde_json::from_slice(&bytes).unwrap_or_default())
+        }
+
+        async fn search_with(
+            state: &AppState,
+            q: Option<&str>,
+            limit: Option<u32>,
+        ) -> (StatusCode, Value) {
+            let resp = list(
+                State(state.clone()),
+                Extension(admin()),
+                HeaderMap::new(),
+                Query(ListQuery {
+                    q: q.map(str::to_owned),
+                    limit,
+                }),
+            )
+            .await;
+            body_of(resp).await
+        }
+
+        /// `DATA-41` D3: the limit is applied after the ranking, so the
+        /// assets that come back are the best ones, and `total` says how
+        /// many matched in all.
+        #[tokio::test]
+        async fn a_limit_takes_the_best_matches_and_the_count_says_how_many_matched() {
+            let ch = mock_catalog().await;
+            let state = catalog_state(&ch.uri());
+
+            let (status, body) = search_with(&state, Some("revenue"), Some(2)).await;
+            assert_eq!(status, StatusCode::OK);
+            let assets = body["assets"].as_array().expect("the answer has assets");
+            assert_eq!(assets.len(), 2, "the limit is what the caller asked for");
+            assert_eq!(assets[0]["id"], "bronze.one", "the name that is the word");
+            assert_eq!(assets[1]["id"], "bronze.three", "the column name");
+            assert_eq!(body["total"], json!(3), "every match is counted");
+        }
+
+        /// `DATA-41` D3: without a limit the answer is every match, in the
+        /// same order, and there is no count — the answer is as it was.
+        #[tokio::test]
+        async fn without_a_limit_the_answer_is_every_match_and_no_count() {
+            let ch = mock_catalog().await;
+            let state = catalog_state(&ch.uri());
+
+            let (status, body) = search_with(&state, Some("revenue"), None).await;
+            assert_eq!(status, StatusCode::OK);
+            let assets = body["assets"].as_array().expect("the answer has assets");
+            assert_eq!(assets.len(), 3);
+            assert_eq!(assets[0]["id"], "bronze.one");
+            assert!(
+                body.get("total").is_none(),
+                "without a limit the answer is as it was: {body}"
+            );
+        }
+
+        /// `DATA-41` D3: a limit outside 1..=200 is a 400 with a plain
+        /// message — the caller's mistake, not something to round
+        /// silently.
+        #[tokio::test]
+        async fn a_limit_outside_the_range_is_a_bad_request() {
+            let ch = mock_catalog().await;
+            let state = catalog_state(&ch.uri());
+
+            for limit in [0, 201] {
+                let (status, body) = search_with(&state, Some("revenue"), Some(limit)).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "limit {limit}");
+                let message = body["error"].as_str().unwrap_or_default();
+                assert!(
+                    message.contains("limit"),
+                    "the message names the limit: {body}"
+                );
+            }
+        }
+
+        /// `DATA-41` D3: the limit is a number the route serves, and the
+        /// boundary itself is served.
+        #[test]
+        fn the_served_limits_are_one_to_two_hundred() {
+            assert!(requested_limit(None).unwrap().is_none());
+            assert_eq!(requested_limit(Some(1)).unwrap(), Some(1));
+            assert_eq!(requested_limit(Some(200)).unwrap(), Some(200));
+            assert!(requested_limit(Some(0)).is_err());
+            assert!(requested_limit(Some(201)).is_err());
+        }
+
+        /// `DATA-41` D4: the copy is built at start-up, in the background,
+        /// and the first search is served from it: the search reads no
+        /// catalog of its own.
+        #[tokio::test]
+        async fn the_start_up_build_leaves_a_copy_the_first_search_is_served_from() {
+            let ch = mock_catalog().await;
+            let state = catalog_state(&ch.uri());
+
+            // The start-up build, waited for so the assertion below is
+            // about the copy and not about a race.
+            spawn_startup_search_copy(&state).await.unwrap();
+            let before = ch
+                .received_requests()
+                .await
+                .map_or(0, |requests| requests.len());
+
+            let (status, body) = search_with(&state, Some("revenue"), None).await;
+            assert_eq!(status, StatusCode::OK);
+            let assets = body["assets"].as_array().expect("the answer has assets");
+            assert_eq!(assets.len(), 3, "the copy's assets are the answer");
+            let after = ch
+                .received_requests()
+                .await
+                .map_or(0, |requests| requests.len());
+            assert_eq!(
+                after, before,
+                "the search was served from the copy: it read no catalog"
+            );
+        }
+    }
+
+    // ── `DATA-41` D1: the registry reads are looked up by key. ───────────
+    //
+    // The old code scanned every row of every read once per asset, which
+    // is quadratic in the size of the catalog: on 10,000 tables the copy
+    // build took about 9.2 seconds, and the no-term list paid it on
+    // every request. The keyed lookup must assemble the SAME rows the
+    // scan did, so the scan is kept here as the reference and the two
+    // are compared over a fixture of several hundred assets with
+    // duplicate slugs and with slugs whose sync or column row is
+    // missing.
+    mod keyed_lookup {
+        #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+        use super::*;
+
+        /// How many assets the fixture holds: several hundred, so the
+        /// comparison is over a catalog big enough for the quadratic
+        /// scan to be worth replacing.
+        const ASSETS: usize = 400;
+
+        /// One read's row: the columns the read named, as the engine
+        /// rendered them.
+        fn map_of(pairs: Vec<(&str, Value)>) -> Map<String, Value> {
+            pairs.into_iter().map(|(k, v)| (k.to_owned(), v)).collect()
+        }
+
+        /// The three reads of the fixture: the catalog rows, the sync
+        /// rows and the column rows.
+        struct Fixture {
+            cat: Vec<Map<String, Value>>,
+            sync: Vec<Map<String, Value>>,
+            columns: Vec<Map<String, Value>>,
+        }
+
+        /// The fixture: `ASSETS` catalog rows, and the sync and column
+        /// reads that go with them.
+        ///
+        /// The awkward rows are in it on purpose:
+        /// - a slug with NO sync row (`index % 10 == 3`): no rows
+        ///   counted and no author,
+        /// - a slug with TWO sync rows (`index % 10 == 7`): the first
+        ///   one in read order is the one that answers,
+        /// - a slug with NO column row (`index % 7 == 2`): no columns
+        ///   counted,
+        /// - a slug with TWO column rows (`index % 7 == 4`): the first
+        ///   one in read order is the one that answers,
+        /// - a slug whose row count is not a number (`index % 13 == 1`):
+        ///   it reads as zero, because a value that is not a number is
+        ///   not a number,
+        /// - a sync row for a slug no catalog row holds: it changes
+        ///   nothing.
+        fn fixture() -> Fixture {
+            let mut cat = Vec::with_capacity(ASSETS);
+            let mut sync = Vec::with_capacity(ASSETS);
+            let mut columns = Vec::with_capacity(ASSETS);
+
+            for index in 0..ASSETS {
+                let slug = format!("asset_{index:04}");
+                cat.push(map_of(vec![
+                    ("slug", json!(slug)),
+                    ("title", json!(format!("Asset {index}"))),
+                    ("description", json!(format!("the asset {index}"))),
+                    (
+                        "tier",
+                        json!(if index % 3 == 0 { "sekunder" } else { "primer" }),
+                    ),
+                    ("updated_at", json!("2026-11-01T00:00:00Z")),
+                    ("table_name", json!(format!("asset_{index:04}_raw"))),
+                ]));
+
+                if index % 10 != 3 {
+                    let total = if index % 13 == 1 {
+                        "not-a-number".to_owned()
+                    } else {
+                        (index * 7).to_string()
+                    };
+                    sync.push(map_of(vec![
+                        ("slug", json!(slug)),
+                        ("total", json!(total)),
+                        ("author", json!(format!("team_{index}"))),
+                        (
+                            "frekuensi",
+                            json!(if index % 3 == 0 { "harian" } else { "bulanan" }),
+                        ),
+                    ]));
+                }
+                if index % 10 == 7 {
+                    // A SECOND sync row for the same slug, later in read
+                    // order than the first one.
+                    sync.push(map_of(vec![
+                        ("slug", json!(slug)),
+                        ("total", json!("999999")),
+                        ("author", json!("the later team")),
+                        ("frekuensi", json!("mingguan")),
+                    ]));
+                }
+
+                if index % 7 != 2 {
+                    columns.push(map_of(vec![
+                        ("slug", json!(slug)),
+                        ("n", json!((index % 5).to_string())),
+                    ]));
+                }
+                if index % 7 == 4 {
+                    // A SECOND column row for the same slug, later in
+                    // read order than the first one.
+                    columns.push(map_of(vec![("slug", json!(slug)), ("n", json!("4242"))]));
+                }
+            }
+
+            // A sync row for a slug no catalog row holds.
+            sync.push(map_of(vec![
+                ("slug", json!("asset_not_in_the_catalog")),
+                ("total", json!("1")),
+                ("author", json!("nobody")),
+                ("frekuensi", json!("harian")),
+            ]));
+
+            Fixture { cat, sync, columns }
+        }
+
+        /// The assembly as it was before `DATA-41` D1: the four
+        /// `.find()` scans. Kept here as the reference the keyed
+        /// lookup is compared with.
+        fn scanned_rows(
+            cat: &[Map<String, Value>],
+            sync_rows: &[Map<String, Value>],
+            col_rows: &[Map<String, Value>],
+        ) -> Vec<Value> {
+            let total_of = |slug: &str| -> i64 {
+                sync_rows
+                    .iter()
+                    .find(|s| str_col(s, "slug") == slug)
+                    .map_or(0, |s| num_or_zero(Some(s), "total"))
+            };
+            let author_of = |slug: &str| -> String {
+                sync_rows
+                    .iter()
+                    .find(|s| str_col(s, "slug") == slug)
+                    .map(|s| str_col(s, "author").to_owned())
+                    .unwrap_or_default()
+            };
+            let col_of = |slug: &str| -> i64 {
+                col_rows
+                    .iter()
+                    .find(|c| str_col(c, "slug") == slug)
+                    .map_or(0, |c| num_or_zero(Some(c), "n"))
+            };
+            let frequency_of = |slug: &str| -> Option<i64> {
+                sync_rows
+                    .iter()
+                    .find(|s| str_col(s, "slug") == slug)
+                    .and_then(|s| {
+                        catalog_governance::frequency_target_seconds(str_col(s, "frekuensi"))
+                    })
+            };
+
+            cat.iter()
+                .map(|c| {
+                    let slug = str_col(c, "slug");
+                    let rows = total_of(slug);
+                    let sekunder = str_col(c, "tier") == "sekunder";
+                    let owner = author_of(slug);
+                    let description = str_col(c, "description");
+                    let updated_at = str_col(c, "updated_at");
+                    let mut row = bronze_catalog_row(
+                        slug,
+                        str_col(c, "title"),
+                        sekunder,
+                        owner.as_str(),
+                        description,
+                        rows,
+                        col_of(slug),
+                        updated_at,
+                    );
+                    if let Some(seconds) = frequency_of(slug) {
+                        set_freshness_target(&mut row, seconds, "frequency");
+                    }
+                    row
+                })
+                .collect()
+        }
+
+        /// The keyed lookup assembles the rows the scan assembled.
+        #[test]
+        fn the_keyed_lookup_assembles_the_rows_the_scan_assembled() {
+            let fixture = fixture();
+            let scanned = scanned_rows(&fixture.cat, &fixture.sync, &fixture.columns);
+            let keyed = assemble_bronze_rows(&fixture.cat, &fixture.sync, &fixture.columns);
+
+            assert_eq!(
+                keyed.len(),
+                ASSETS,
+                "every catalog row is one asset, in both"
+            );
+            assert_eq!(
+                keyed, scanned,
+                "the keyed lookup assembles exactly the rows the scan did"
+            );
+        }
+
+        /// A slug with several rows answers with the FIRST one in read
+        /// order — what the `.find()` the keyed lookup replaced
+        /// returned.
+        #[test]
+        fn a_slug_with_several_rows_answers_with_the_first_one_in_read_order() {
+            let fixture = fixture();
+            let rows = assemble_bronze_rows(&fixture.cat, &fixture.sync, &fixture.columns);
+
+            // `asset_0007` has two sync rows and one column row.
+            let seven = rows
+                .iter()
+                .find(|r| r["id"] == json!("asset_0007"))
+                .expect("the asset is listed");
+            assert_eq!(seven["rows"], json!(49), "the FIRST sync row's count");
+            assert_eq!(
+                seven["owner"],
+                json!("team_7"),
+                "the FIRST sync row's author"
+            );
+            assert_eq!(
+                seven["freshnessTargetSeconds"],
+                json!(31 * 86_400 * 3 / 2),
+                "the FIRST sync row's frequency"
+            );
+
+            // `asset_0018` has one sync row and two column rows.
+            let eighteen = rows
+                .iter()
+                .find(|r| r["id"] == json!("asset_0018"))
+                .expect("the asset is listed");
+            assert_eq!(
+                eighteen["columnCount"],
+                json!(3),
+                "the FIRST column row's count"
+            );
+        }
+
+        /// A slug the registry has no row for reads as nothing: no rows,
+        /// no author, no columns, and no freshness target.
+        #[test]
+        fn a_slug_with_no_registry_row_reads_as_nothing() {
+            let fixture = fixture();
+            let rows = assemble_bronze_rows(&fixture.cat, &fixture.sync, &fixture.columns);
+
+            // `asset_0003` has no sync row and one column row.
+            let three = rows
+                .iter()
+                .find(|r| r["id"] == json!("asset_0003"))
+                .expect("the asset is listed");
+            assert_eq!(three["rows"], json!(0), "no sync row, no rows");
+            assert_eq!(
+                three["owner"],
+                json!(*TENANT_OWNER),
+                "no sync row, so the tenant's own owner"
+            );
+            assert!(
+                three.get("freshnessTargetSeconds").is_none(),
+                "no sync row, so no freshness target: {three:?}"
+            );
+
+            // `asset_0002` has one sync row and no column row.
+            let two = rows
+                .iter()
+                .find(|r| r["id"] == json!("asset_0002"))
+                .expect("the asset is listed");
+            assert_eq!(two["columnCount"], json!(0), "no column row, no columns");
         }
     }
 }

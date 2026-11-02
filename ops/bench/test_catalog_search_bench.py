@@ -114,6 +114,13 @@ class ArgumentParsingTests(unittest.TestCase):
         self.assertEqual(args.rounds, 4)
         self.assertEqual(args.datasets, 2)
         self.assertEqual(args.cold_wait, 0.0)
+        self.assertFalse(args.after_expiry, "the extra measurement is opt-in")
+
+    def test_run_asks_for_the_search_after_the_copy_expired_when_told(self) -> None:
+        """`DATA-41` D5: the run can also time the search that finds the
+        copy older than its age."""
+        args = m.build_parser().parse_args(["run", "--after-expiry"])
+        self.assertTrue(args.after_expiry)
 
     def test_a_command_is_required(self) -> None:
         with self.assertRaises(SystemExit):
@@ -233,6 +240,22 @@ class RunTests(unittest.TestCase):
                 "http://api.test/api/catalog/query",
             ],
         )
+
+    def test_the_run_reports_the_search_after_the_copy_expired_when_asked(self) -> None:
+        """`DATA-41` D5: `--after-expiry` adds one number per route: the
+        time of the search that finds the search copy older than its age."""
+        fake = FakeSession()
+        with mock.patch.object(m.requests, "Session", lambda: fake):
+            result = m.run(settings(), rounds=2, datasets=2, cold_wait=0.0, after_expiry=True)
+        for route in ("catalog", "catalogQuery"):
+            self.assertEqual(
+                set(result[route]),
+                {"firstMs", "searches", "p50Ms", "p95Ms", "maxMs", "afterExpiryMs"},
+            )
+            self.assertIsInstance(result[route]["afterExpiryMs"], float)
+        # One extra search per route, after the wait.
+        searched = [call[1] for call in fake.calls if call[0] == "GET"]
+        self.assertEqual(len(searched), 6)
 
     def test_a_refused_search_is_a_failure_and_not_a_number(self) -> None:
         """A refusal answers `supported: false`; the bench must not read

@@ -57,9 +57,13 @@ pub const MAX_STALE: Duration = Duration::from_mins(5);
 /// The assembled catalog as search needs it. Built once per rebuild.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CatalogSearchSnapshot {
-    /// The asset rows after the same enrichment steps `GET /api/catalog`
-    /// runs.
-    pub assets: Vec<Value>,
+    /// The prepared search index (`DATA-41` D2): the asset rows after the
+    /// same enrichment steps `GET /api/catalog` runs, and per asset the
+    /// texts a word can match, already lower-cased and tokenised.
+    ///
+    /// The index is built with the copy, so a search reads it and allocates
+    /// nothing per candidate.
+    pub index: crate::routes::catalog_search::SearchIndex,
     /// The namespace summaries of the same build.
     pub namespaces: Value,
     /// Column names and descriptions per asset id.
@@ -69,6 +73,14 @@ pub struct CatalogSearchSnapshot {
     /// True when a column query hit its row limit: column search covers
     /// only part of the catalog.
     pub column_search_partial: bool,
+}
+
+impl CatalogSearchSnapshot {
+    /// The asset rows of this copy, in the order the copy holds them.
+    #[must_use]
+    pub fn assets(&self) -> &[Value] {
+        self.index.assets()
+    }
 }
 
 struct Entry {
@@ -209,6 +221,42 @@ impl SearchSnapshotCache {
         }
     }
 
+    /// Build the copy now, so the first search does not have to.
+    ///
+    /// `DATA-41` D4: the API builds the search copy once at start-up, in
+    /// the background. On a catalog of 10,000 tables the build takes about
+    /// five seconds, and the first person to search should not pay for
+    /// it.
+    ///
+    /// A search that arrives first still builds the copy inline,
+    /// single-flight, as before: this and the search share the one build,
+    /// and whichever gets there first does the work. The copy this leaves
+    /// behind is a normal copy — it is served while it is younger than
+    /// the TTL, and rebuilt behind the search that finds it too old
+    /// (`DATA-38` D1).
+    ///
+    /// `build` is moved into the call, so it must own what it needs
+    /// (`'static`): the caller hands it a clone of the state.
+    ///
+    /// # Errors
+    ///
+    /// The build's error, unchanged. The caller logs it and moves on: a
+    /// copy that cannot be built is no worse than no copy at all, because
+    /// the first search builds one instead.
+    pub async fn warm<F, Fut, E>(
+        self: &Arc<Self>,
+        now: Instant,
+        ttl: Duration,
+        build: F,
+    ) -> Result<(), E>
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = Result<CatalogSearchSnapshot, E>> + Send + 'static,
+        E: std::fmt::Display + Send + 'static,
+    {
+        self.get_or_build(now, ttl, build).await.map(|_| ())
+    }
+
     /// Drop the copy, so the next search rebuilds it inline (`DATA-38`
     /// D2).
     ///
@@ -238,7 +286,10 @@ mod tests {
 
     fn snapshot(tag: &str) -> CatalogSearchSnapshot {
         CatalogSearchSnapshot {
-            assets: vec![json!({ "id": tag })],
+            index: crate::routes::catalog_search::SearchIndex::build(
+                vec![json!({ "id": tag })],
+                &crate::routes::catalog_search::ColumnIndex::new(),
+            ),
             namespaces: json!([]),
             columns: HashMap::new(),
             usage: HashMap::new(),
@@ -309,7 +360,7 @@ mod tests {
         let builds = Arc::new(AtomicU32::new(0));
         let first = get(&cache, Instant::now(), &builds).await;
         assert_eq!(builds.load(Ordering::SeqCst), 1);
-        assert_eq!(first.assets[0]["id"], "build-0");
+        assert_eq!(first.assets()[0]["id"], "build-0");
     }
 
     #[tokio::test]
@@ -369,7 +420,7 @@ mod tests {
         // The rebuild landed: the next read serves the new copy, and the
         // new copy is young enough that it starts no rebuild of its own.
         let third = get(&cache, t0 + TTL + Duration::from_secs(1), &builds).await;
-        assert_eq!(third.assets[0]["id"], "build-1");
+        assert_eq!(third.assets()[0]["id"], "build-1");
         assert_eq!(
             builds.load(Ordering::SeqCst),
             2,
@@ -416,7 +467,7 @@ mod tests {
         // the read builds a new one and waits for it.
         let later = get(&cache, t0 + MAX_STALE, &builds).await;
         assert_eq!(builds.load(Ordering::SeqCst), 2);
-        assert_eq!(later.assets[0]["id"], "build-1");
+        assert_eq!(later.assets()[0]["id"], "build-1");
     }
 
     #[tokio::test]
@@ -428,7 +479,66 @@ mod tests {
         cache.invalidate().await;
         let after = get(&cache, t0, &builds).await;
         assert_eq!(builds.load(Ordering::SeqCst), 2);
-        assert_eq!(after.assets[0]["id"], "build-1");
+        assert_eq!(after.assets()[0]["id"], "build-1");
+    }
+
+    /// `DATA-41` D4: the copy is built at start-up, in the background, so
+    /// the first person to search does not wait for the build. The copy
+    /// the start-up leaves behind is the one the first search is served
+    /// from: the search builds nothing.
+    #[tokio::test]
+    async fn the_start_up_build_leaves_a_copy_the_first_search_does_not_build() {
+        let cache = Arc::new(SearchSnapshotCache::new());
+        let builds = Arc::new(AtomicU32::new(0));
+        let t0 = Instant::now();
+        // The start-up build.
+        let builds_for_warm = Arc::clone(&builds);
+        cache
+            .warm(t0, TTL, move || {
+                let builds = Arc::clone(&builds_for_warm);
+                async move {
+                    let n = builds.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, String>(snapshot(&format!("build-{n}")))
+                }
+            })
+            .await
+            .expect("the start-up build succeeds");
+        assert_eq!(builds.load(Ordering::SeqCst), 1, "the copy is built once");
+
+        // The first search is served from it: no second build.
+        let first = get(&cache, t0 + Duration::from_secs(1), &builds).await;
+        assert_eq!(builds.load(Ordering::SeqCst), 1, "the search built nothing");
+        assert_eq!(first.assets()[0]["id"], "build-0");
+    }
+
+    /// `DATA-41` D4: a start-up build that fails is the caller's to log;
+    /// the copy is not there, and the first search builds one instead.
+    #[tokio::test]
+    async fn a_failed_start_up_build_leaves_the_copy_to_the_first_search() {
+        let cache = Arc::new(SearchSnapshotCache::new());
+        let attempts = Arc::new(AtomicU32::new(0));
+        let t0 = Instant::now();
+        let attempts_for_warm = Arc::clone(&attempts);
+        let failed = cache
+            .warm(t0, TTL, move || {
+                let attempts = Arc::clone(&attempts_for_warm);
+                async move {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    Err::<CatalogSearchSnapshot, String>("catalog unreachable".to_owned())
+                }
+            })
+            .await;
+        assert_eq!(failed.unwrap_err(), "catalog unreachable");
+
+        // Nothing was cached, so the first search builds the copy itself.
+        let builds = Arc::new(AtomicU32::new(0));
+        let first = get(&cache, t0, &builds).await;
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            1,
+            "the search built the copy"
+        );
+        assert_eq!(first.assets()[0]["id"], "build-0");
     }
 
     #[tokio::test]

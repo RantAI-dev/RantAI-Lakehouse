@@ -15,13 +15,19 @@ pub mod auth;
 // the drift the one definition exists to prevent.
 pub(crate) mod authored_pipelines;
 mod calc_fields;
-mod catalog;
+// `pub(crate)`, not private: `main.rs` starts the background build of the
+// catalog search copy at start-up (`DATA-41` D4), so it names
+// `catalog::spawn_startup_search_copy`.
+pub(crate) mod catalog;
 mod catalog_governance;
 mod catalog_grants;
 mod catalog_profile;
 mod catalog_query;
 mod catalog_restore;
-mod catalog_search;
+// `pub(crate)`, not private: `crate::catalog_search_cache` holds the
+// prepared search index (`DATA-41` D2), so the type it holds has to be
+// nameable from outside this module.
+pub(crate) mod catalog_search;
 mod catalog_source;
 mod connector_discovery;
 mod connector_oauth;
