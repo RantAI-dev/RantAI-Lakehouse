@@ -133,7 +133,7 @@ estimate (S, M, L), which the base has no field for.
 | `AI-14` | Feature | Ongoing, with every BI item. What the dashboard page sends to the assistant grows with the features: filters, tabs, metrics, formats. Filters and the time grain are sent since #188; a heavy filter list can still push the tile list past the server's 6000-character cut | AI Copilot | P2 | Building | #188, #222 | `AGENTS.md` (assistant parity) |
 | `AI-15` | Task | A standard set of about 30 typical dashboard requests, re-run whenever an assistant tool changes, so the assistant does not silently get worse. The run after #200 and #202 passed 25 of 41 cases (61%) against the spec's 90%. The set holds 57 cases now, among them a forecast line and a deprecated mart with a replacement, and its harness continues a request after a confirmed draft the way the console does | AI Copilot | P2 | In Progress | #175, #198, #200, #223, #240, #306, #317, #337 | `AGENTS.md` (assistant parity) |
 | `BI-26` | Feature | Better embedding, without overdoing it: a single-chart embed that really shows only that chart, light/dark theme and our logo optional, filters passed through the link or token, sizing that fits the host page. Token hardening is `SEC-12`. No embedding SDK and no editing inside embeds. **Blocked by `BI-18` (locking a dashboard filter in an embed)** | Dashboards | P2 | In Acceptance | [#235](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/235) | `reference/competitive-comparison.md` (BI matrix) |
-| `BI-19` | Feature | Sharing and delivery, except Slack, Teams, Office and Google integrations: public link expiry and password; permissions per dashboard and folder; comments; a schedule per digest; alerts with filters that fire once; PNG export; import of exported dashboards. Scheduled reports are `RPT-1`, PDF and Excel export `BI-1`, embedding `BI-26`. **Blocked by `RPT-1` (digest schedules)** | Dashboards | P2 | Building | [#235](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/235) | `reference/competitive-comparison.md` (BI matrix) |
+| `BI-19` | Feature | Sharing and delivery, except Slack, Teams, Office and Google integrations: public link expiry and password; permissions per dashboard and folder; comments; a schedule per digest; alerts with filters that fire once; PNG export; import of exported dashboards. Scheduled reports are `RPT-1`, PDF and Excel export `BI-1`, embedding `BI-26`. **Blocked by `RPT-1` (digest schedules)** | Dashboards | P2 | In Acceptance | [#235](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/235), [#250](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/250) | `reference/competitive-comparison.md` (BI matrix) |
 | `BLD-1` | Feature | Joins, aggregations and a SQL step in the pipeline builder, and the same through the assistant. | Build | P2 | Building | [#173](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/173) (slice 1: a pipeline reads as its author) | PRODUCT §2; [spec](specs/bld-1.md) |
 | `VER-1` | Task | Verify SFTP, Google Sheets and Oracle sources end to end; test row filters. The connector half is now `SRC-9`; row filters stay here | Data | P2 | Todo |  | PRODUCT §2 |
 | `BI-2` | Feature | Metrics users can define once and reuse across dashboards (a semantic layer). **Blocked by `DATA-12` (certified metrics part)** | Dashboards | P2 | In Acceptance | [#160](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/160) | PRODUCT §2; `reference/competitive-comparison.md` (BI matrix) |
@@ -330,28 +330,25 @@ parity), built after it.
 | `BI-14` | Planned | — | `AI-13` |
 | `BI-16` | Building | — | `AI-5` (per chart type as it lands) |
 | `BI-17` | Building | — | `AI-8` |
-| `BI-19` | Building | — | `AI-11`, `BI-37` |
 | `BLD-1` | Building | — | `REL-6` |
 | `DATA-4` | Planned | — | `DATA-3` |
 | `DEC-8` | Decided | — | `AI-11` |
 | `QS-5` | Planned | — | `AI-12` (variables part) |
 | `SEC-20` | In Progress | — | `QS-3` |
-| `AI-11` | Planned | `BI-19`, `DEC-8` | — |
+| `AI-11` | Planned | `DEC-8` | — |
 | `AI-12` | Building | `QS-5` (variables part) | — |
 | `AI-13` | Planned | `BI-14` | — |
 | `AI-2` | Building | `BI-18` | — |
 | `AI-5` | Building | `BI-16` (per chart type as it lands) | — |
 | `AI-8` | Building | `BI-17` | — |
 | `AI-9` | Building | `BI-18` (templates part) | — |
-| `BI-37` | Todo | `BI-19` | — |
 | `DATA-3` | Planned | `DATA-4` | — |
 | `QS-3` | Planned | `SEC-20` | — |
 | `REL-6` | Blocked | `BLD-1` | — |
 
 **Ready to start** (Todo, Planned or Idea, nothing open blocks it; Idea items still need a spec):
 
-`ADM-1`, `ADM-2`, `AI-10`, `AI-21`, `AI-22`, `BI-14`, `BI-20`, `BI-27`, `BI-28`, `BI-29`, `BI-3`, `BI-30`, `BI-31`, `BI-32`, `BI-33`, `BI-34`, `BI-35`, `BI-36`, `BI-38`, `BI-39`, `BI-40`, `BI-41`, `BI-42`, `BIZ-1`, `BIZ-2`, `DATA-20`, `DATA-22`, `DATA-26`, `DATA-27`, `DATA-28`, `DATA-30`, `DATA-37`, `DATA-38`, `DATA-39`, `DATA-4`, `DATA-6`, `DATA-8`, `GOV-1`, `GOV-3`, `INT-2`, `OPS-2`, `OPS-3`, `OPS-6`, `OPS-8`, `QRY-1`, `QS-5`, `SEC-40`, `SEC-54`, `SEC-55`, `SEC-56`, `SRC-15`, `SRC-18`, `SRC-2`, `SRC-22`, `SRC-23`, `SRC-24`, `SRC-25`, `SRC-26`, `SRC-27`, `SRC-28`, `SRC-30`, `SRC-31`, `SRC-33`, `SRC-34`, `SRC-4`, `SRC-5`, `VER-1`
-`ADM-1`, `ADM-2`, `AI-10`, `AI-21`, `AI-22`, `BI-14`, `BI-20`, `BI-27`, `BI-28`, `BI-29`, `BI-3`, `BI-30`, `BI-31`, `BI-32`, `BI-33`, `BI-34`, `BI-35`, `BI-36`, `BIZ-1`, `BIZ-2`, `DATA-20`, `DATA-22`, `DATA-26`, `DATA-27`, `DATA-28`, `DATA-30`, `DATA-4`, `DATA-42`, `DATA-6`, `DATA-8`, `GOV-1`, `GOV-3`, `INT-2`, `OPS-2`, `OPS-3`, `OPS-6`, `OPS-8`, `QRY-1`, `QS-5`, `SEC-40`, `SEC-54`, `SEC-55`, `SRC-15`, `SRC-18`, `SRC-2`, `SRC-22`, `SRC-23`, `SRC-24`, `SRC-25`, `SRC-26`, `SRC-27`, `SRC-28`, `SRC-30`, `SRC-31`, `SRC-33`, `SRC-34`, `SRC-4`, `SRC-5`, `VER-1`
+`ADM-1`, `ADM-2`, `AI-10`, `AI-21`, `AI-22`, `BI-14`, `BI-20`, `BI-27`, `BI-28`, `BI-29`, `BI-3`, `BI-30`, `BI-31`, `BI-32`, `BI-33`, `BI-34`, `BI-35`, `BI-36`, `BI-37`, `BI-38`, `BI-39`, `BI-40`, `BI-41`, `BI-42`, `BIZ-1`, `BIZ-2`, `DATA-20`, `DATA-22`, `DATA-26`, `DATA-27`, `DATA-28`, `DATA-30`, `DATA-4`, `DATA-42`, `DATA-6`, `DATA-8`, `GOV-1`, `GOV-3`, `INT-2`, `OPS-2`, `OPS-3`, `OPS-6`, `OPS-8`, `QRY-1`, `QS-5`, `SEC-40`, `SEC-54`, `SEC-55`, `SEC-56`, `SRC-15`, `SRC-18`, `SRC-2`, `SRC-22`, `SRC-23`, `SRC-24`, `SRC-25`, `SRC-26`, `SRC-27`, `SRC-28`, `SRC-30`, `SRC-31`, `SRC-33`, `SRC-34`, `SRC-4`, `SRC-5`, `VER-1`
 
 ## Dates
 
