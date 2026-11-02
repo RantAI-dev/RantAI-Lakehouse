@@ -31,6 +31,10 @@ pub enum Command {
     Preflight(PreflightArgs),
     /// Install the whole stack, online or from an offline bundle.
     Install(InstallArgs),
+    /// Take a backup of the stack, on the local disk.
+    Backup(BackupArgs),
+    /// Restore a backup of the stack, on the local disk.
+    Restore(RestoreArgs),
 }
 
 /// The arguments of `lakehousectl verify`.
@@ -80,4 +84,23 @@ pub struct InstallArgs {
     /// skip is said out loud.
     #[arg(long = "ignore-preflight", value_name = "CHECK")]
     pub ignore_preflight: Vec<String>,
+}
+
+/// The arguments of `lakehousectl backup`.
+#[derive(Debug, Args)]
+pub struct BackupArgs {
+    /// Where the install lives: everything is in this one directory.
+    #[arg(long, default_value = "/opt/rantai-lakehouse")]
+    pub dir: PathBuf,
+}
+
+/// The arguments of `lakehousectl restore`.
+#[derive(Debug, Args)]
+pub struct RestoreArgs {
+    /// The backup directory to restore: the one `lakehousectl backup`
+    /// wrote.
+    pub backup: PathBuf,
+    /// Where the install lives: everything is in this one directory.
+    #[arg(long, default_value = "/opt/rantai-lakehouse")]
+    pub dir: PathBuf,
 }

@@ -948,6 +948,14 @@ impl Stack {
     /// Put an upload of `tenant` in the store and its bytes in the bucket,
     /// without going through the route.
     async fn seed(&self, tenant: &str, id: &str, bytes: &[u8]) -> Upload {
+        self.seed_of_size(tenant, id, bytes, i64::try_from(bytes.len()).unwrap())
+            .await
+    }
+
+    /// Put an upload of `tenant` in the store whose row says `size_bytes`,
+    /// with `bytes` in the bucket: the load limits read the size the row
+    /// records, so a large load can be seeded without large bytes.
+    async fn seed_of_size(&self, tenant: &str, id: &str, bytes: &[u8], size_bytes: i64) -> Upload {
         let tenant_id: Uuid = tenant.parse().unwrap();
         let key = format!("uploads/{tenant_id}/{id}.csv");
         self.bucket.put(&key, bytes);
@@ -958,7 +966,7 @@ impl Stack {
                 original_filename: "stock.csv",
                 storage_key: &key,
                 content_type: "text/csv",
-                size_bytes: i64::try_from(bytes.len()).unwrap(),
+                size_bytes,
                 sha256: &sha256_hex(bytes),
                 uploaded_by: "Seeded Uploader",
                 tenant_id,
@@ -1005,6 +1013,15 @@ impl Stack {
     ) {
         self.seed(tenant, id, b"id,name\n1,a\n").await;
         self.mark_loading(tenant, id, table, run_id, age).await;
+    }
+
+    /// As [`Self::seed_loading`], for an upload whose row says `size_bytes`:
+    /// a large load, seeded without large bytes (`DATA-37`).
+    async fn seed_loading_of_size(&self, tenant: &str, id: &str, table: &str, size_bytes: i64) {
+        self.seed_of_size(tenant, id, b"id,name\n1,a\n", size_bytes)
+            .await;
+        self.mark_loading(tenant, id, table, None, "10 seconds")
+            .await;
     }
 
     /// Put a workbook upload in the state a launched load leaves it in, claimed
@@ -2164,6 +2181,11 @@ async fn an_ingest_of_1000_columns_is_launched() {
 
 const TOO_MANY_UPLOADS: &str = "Too many uploads are in progress. Try again in a moment.";
 
+/// `DATA-37`: the refusal of the large-load limit has a sentence of its own,
+/// so the person can tell it from the per-user one.
+const TOO_MANY_LARGE_LOADS: &str = "This installation already runs the maximum number of large loads. Start this load again \
+     when one of them finishes. The limit is set by UPLOAD_MAX_CONCURRENT_LARGE.";
+
 /// A `PUT` that takes a second, so requests sent together overlap.
 struct SlowPut(Bucket);
 impl Respond for SlowPut {
@@ -2304,6 +2326,55 @@ async fn loads_of_another_uploader_do_not_count_against_this_one() {
         .await;
 
     assert_eq!(reply.status, StatusCode::OK, "{}", reply.text);
+}
+
+/// `DATA-37`: with two large loads running, a third large load is a 429 with
+/// the large-load sentence and `Retry-After`, the upload stays `uploaded`, no
+/// table is claimed and nothing is launched. A load that is not large is not
+/// refused by the large limit (decision D3).
+#[tokio::test]
+async fn a_third_large_load_is_429_with_the_large_load_sentence() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    mount_free_table(&stack.ch).await;
+    mount_launch(&stack.dagster, "run-1").await;
+    let large = lakehouse_store::uploads::LARGE_LOAD_BYTES + 1;
+    for n in 0..2 {
+        stack
+            .seed_loading_of_size(GROUP, &format!("up-big-{n}"), &format!("big_{n}"), large)
+            .await;
+    }
+    stack
+        .seed_of_size(GROUP, "up-third", b"id,name\n1,a\n", large)
+        .await;
+    stack.seed(GROUP, "up-small", b"id,name\n1,a\n").await;
+    let claims_before = stack.claims().await.len();
+
+    let reply = stack
+        .ingest(&bayu, "up-third", ingest_body("third_raw"))
+        .await;
+
+    assert_eq!(
+        reply.status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "{}",
+        reply.text
+    );
+    assert_eq!(reply.json["error"], TOO_MANY_LARGE_LOADS);
+    assert_eq!(reply.retry_after.as_deref(), Some("5"));
+    let row = stack.status_of("up-third").await;
+    assert_eq!((row.0.as_str(), row.1, row.2), ("uploaded", None, None));
+    assert_eq!(stack.claims().await.len(), claims_before, "no table claim");
+    assert_eq!(
+        count_requests_containing(&stack.dagster, "launchRun").await,
+        0
+    );
+
+    // A load that is not large is not refused by the large limit.
+    let small = stack
+        .ingest(&bayu, "up-small", ingest_body("small_raw"))
+        .await;
+    assert_eq!(small.status, StatusCode::OK, "{}", small.text);
 }
 
 /// Review finding B2: the row is claimed before the launch, so two requests

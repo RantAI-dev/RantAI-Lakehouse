@@ -68,6 +68,27 @@ catalog of 10,000 tables. It is measured here, and a miss is reported, not hidde
   each search on 10,000 tables, which `DATA-38` does not change. The target is not lowered. It
   moves to `DATA-41`.
 
+**Re-run after `DATA-41`** (#333): run **41368230514**, `main` at `2a39b644`, 2026-11-02, same
+workflow and runner type, now with `--after-expiry` (`DATA-41` D5: one search, a wait past the
+copy's 30 s age, then the next search, timed).
+
+| Route | First search | p50 | p95 | Max | After expiry |
+| --- | --- | --- | --- | --- | --- |
+| `GET /api/catalog?q=` | 695.0 ms | **164.9 ms** | **212.7 ms** | 255.8 ms | 77.3 ms |
+| `GET /api/catalog/query?search=` | 186.0 ms | **72.3 ms** | **100.2 ms** | 116.9 ms | 72.6 ms |
+
+- **p95 is under 500 ms on both routes**, at 212.7 and 100.2 ms against 680.5 and 633.9 ms
+  before. The cause was found by measurement on bluefin: ≈190 ms of every search went into
+  rebuilding each asset's candidate text, and ≈146 ms into cloning and serialising all 10,000
+  matches for a palette that shows 8. `DATA-41` T2 and T4 address those two.
+- **The cold start is 695 ms, not 7.2 s.** The catalog assembly looked every dataset up by a
+  linear scan, which made it quadratic (`DATA-41` T1). The same fix brings `GET /api/catalog`
+  with no term, the lineage page and the schema browser, from 8.7–10.7 s per request down to
+  the same order. That route is not in this bench, so its new time is not claimed here.
+- **`DATA-38` is now measured directly:** a search made after the copy expired takes 77.3 and
+  72.6 ms. The expired copy is served at once.
+- One run on one runner, as before.
+
 ## Against the target
 
 - **The typical search meets 500 ms.** The median is 489 ms and 326 ms.
@@ -84,6 +105,8 @@ catalog of 10,000 tables. It is measured here, and a miss is reported, not hidde
 - **After `DATA-38`** (run 41303508678): the median still meets 500 ms (450 and 365 ms), p95
   still does not (680 and 634 ms), and an expired copy no longer costs a search its rebuild.
   The p95 target and the cold start are `DATA-41`.
+- **After `DATA-41`** (run 41368230514): **the target is met.** p95 is 212.7 and 100.2 ms, and
+  the first search on a fresh stack takes 695 ms.
 
 ## What this does not cover
 

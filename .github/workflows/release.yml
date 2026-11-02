@@ -1192,10 +1192,30 @@ jobs:
           if [ -f ops/release/install.sh ]; then
             cp ops/release/install.sh release-assets/
           fi
+          # The files the release ships (REL-2 S4 decision D14): the
+          # relative bind-mount sources of the release's Compose file,
+          # and the two tools under `tools/`. The ONLINE install fetches
+          # each of them by its own name, so each is published as an
+          # asset of its own. The list comes from the script that wrote
+          # the manifest, and the tooling refuses two shipped files with
+          # the same name — so no asset name is ambiguous here.
+          python3 ops/release/make_manifest.py --print-shipped-files \
+            --compose docker-compose.release.yml > shipped-files.txt
+          : > shipped-assets.txt
+          while IFS=$'\t' read -r install_path source_path; do
+            [ -n "$install_path" ] || continue
+            name="$(basename "$install_path")"
+            cp "$source_path" "release-assets/$name"
+            printf '%s\n' "$name" >> shipped-assets.txt
+          done < shipped-files.txt
           (
             cd release-assets
             sha256sum ./*.tar.zst ./release.json ./release.json.sigstore.json ./*.cdx.json \
               ./lakehousectl-linux-x86_64 > SHA256SUMS
+            while read -r name; do
+              [ -n "$name" ] || continue
+              sha256sum "./$name" >> SHA256SUMS
+            done < ../shipped-assets.txt
           )
 
       # The release is a DRAFT: the product owner publishes it, after

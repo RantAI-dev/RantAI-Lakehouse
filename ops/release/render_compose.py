@@ -35,6 +35,14 @@ The digest rule is the lint's rule, not a second one: this script
 imports `ops/lint/check_image_digests.py` and uses ITS parser and ITS
 `check_image`, so the release file cannot pass here and fail there.
 
+It also answers ONE question about a Compose file, which is not a
+transformation: `relative_mount_sources` names the relative bind-mount
+sources of the services a release runs (REL-2 S4 decision D14). The
+release ships every one of them, and the manifest names their
+checksums; the rule lives here because this file owns the parsing of a
+Compose file, and `make_manifest.py` asks this module for the answer
+rather than parsing the file a second way (rule 4).
+
 What it deliberately does NOT do
 --------------------------------
 - It does not touch the template. The template stays the template; the
@@ -85,6 +93,15 @@ TOP_LEVEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*:\s*$")
 
 # A quoted string inside an inline list.
 QUOTED_RE = re.compile(r"\"([^\"]*)\"|'([^']*)'")
+
+# A short-syntax volume mount whose SOURCE is a relative path:
+#
+#     - ./ops/backups/clickhouse/backups.xml:/etc/clickhouse-server/config.d/x.xml:ro
+#
+# The target and the options are not read: what matters here is the
+# source, and a source that is relative is a file the DEPLOYMENT needs
+# next to its Compose file (REL-2 S4 decision D14).
+MOUNT_RE = re.compile(r"^\s*-\s+(?P<source>\.{1,2}/[^\s:]+)(?::[^\s:]*)*\s*$")
 
 # A gate or test PROFILE: `test`, `g1` … `g10`, `g6-sql`, `g6-other`,
 # `g6-saas`, `g6-linklocal`. The acceptance harnesses run behind these;
@@ -323,6 +340,40 @@ def services_to_drop(services: list[Service]) -> set[str]:
                     kept.add(dependency)
                     changed = True
     return candidates - needed
+
+
+def relative_mount_sources(text: str) -> list[str]:
+    """The relative bind-mount sources of the services a RELEASE runs.
+
+    A relative source (`./ops/backups/clickhouse/backups.xml`) is a file
+    the deployment needs NEXT TO its Compose file: Docker creates an
+    empty directory in its place when the file is missing, and the
+    service that mounts it then runs against nothing (REL-2 S4 decision
+    D14). So the release ships every one of them.
+
+    The services of a TEST profile are left out — the acceptance
+    harnesses are CI's, not a deployment's — and the gate services are
+    left out by the SAME rule the renderer drops them by
+    (`services_to_drop`), so the answer is the same whether it is read
+    from the template or from the rendered file.
+
+    The paths are returned WITHOUT the leading `./`: that is the path
+    relative to the directory the Compose file lives in, which is the
+    path the install writes the file at.
+    """
+    _, services, _ = parse_compose(text)
+    dropped = services_to_drop(services)
+    sources: set[str] = set()
+    for service in services:
+        if service.name in dropped:
+            continue
+        for line in service.lines:
+            match = MOUNT_RE.match(line)
+            if match is None:
+                continue
+            source = match.group("source")
+            sources.add(source[2:] if source.startswith("./") else source)
+    return sorted(sources)
 
 
 def published_ref(images: dict[str, str], service: Service) -> str:

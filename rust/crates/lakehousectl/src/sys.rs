@@ -75,6 +75,36 @@ fn capture(program: &str, args: &[&str]) -> Result<Output, std::io::Error> {
     Command::new(program).args(args).output()
 }
 
+/// Run a command with EXTRA environment variables, and return its
+/// standard output, and its error output when it fails.
+///
+/// The command inherits this process's environment, and the variables
+/// named here are added to it — the deployment's own directory and the
+/// compose project are what the shipped scripts need (REL-2 S4 decision
+/// D15).
+///
+/// # Errors
+///
+/// Returns the error the operating system gave when the command could
+/// not be run at all, or when it exited with a failure — with the
+/// command's own error output in the message.
+pub fn output_or_stderr_with_env(
+    program: &str,
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> Result<String, std::io::Error> {
+    let mut command = Command::new(program);
+    command.args(args);
+    for (name, value) in env {
+        command.env(name, value);
+    }
+    let result = command.output()?;
+    if !result.status.success() {
+        return Err(failed_with_stderr(program, &result));
+    }
+    Ok(String::from_utf8_lossy(&result.stdout).trim().to_string())
+}
+
 /// The error of a command that failed: its exit status, and nothing else.
 fn failed(program: &str, result: &Output) -> std::io::Error {
     std::io::Error::other(format!("{program} exited with {}", result.status))

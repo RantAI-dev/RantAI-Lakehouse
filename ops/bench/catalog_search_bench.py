@@ -36,17 +36,26 @@ command: the stack is the cleanup.
   applied the demo SQL has no `lake` database at all, and a table that
   already exists with a different shape is a loud refusal, never a silent
   tolerance (R10). This file carries no copy of that DDL.
-- `run [--rounds 50]`: signs in (rotating the bootstrap credential first when
-  the account says a rotation is pending -- see `_login` below), then sends
-  `--rounds` searches (default 50) to `GET /api/catalog?q=` and as many to
-  `GET /api/catalog/query?search=`, rotating over four kinds: a table name, a
-  column name, a one-letter typo and two words in reverse order. For each
-  route it prints the first search's time (it builds the search copy, so `run`
-  first waits `--cold-wait` seconds, 35 by default, for any copy to pass its
-  30-second age; the wait is printed) and the p50 / p95 / max of the rest. Each
-  time includes reading the whole response body. Output is one JSON object on
-  stdout so the raw numbers go into the result document unedited; progress
-  goes to stderr.
+- `run [--rounds 50] [--after-expiry]`: signs in (rotating the bootstrap
+  credential first when the account says a rotation is pending -- see
+  `_login` below), then sends `--rounds` searches (default 50) to
+  `GET /api/catalog?q=` and as many to `GET /api/catalog/query?search=`,
+  rotating over four kinds: a table name, a column name, a one-letter
+  typo and two words in reverse order. For each route it prints the first
+  search's time (it builds the search copy, so `run` first waits
+  `--cold-wait` seconds, 35 by default, for any copy to pass its
+  30-second age; the wait is printed) and the p50 / p95 / max of the
+  rest. Each time includes reading the whole response body. Output is
+  one JSON object on stdout so the raw numbers go into the result
+  document unedited; progress goes to stderr.
+
+  `--after-expiry` adds one more number per route, `afterExpiryMs`
+  (`DATA-41` D5): the time of the search that finds the search copy
+  older than its 30-second age. The copy is served at once and rebuilt
+  behind it (`DATA-38` D1), so this is the number that says what the
+  rebuild costs the person who is searching. The wait is the same
+  `--cold-wait` seconds the run already waits for, so the copy really is
+  past its age.
 
 # Settings (environment)
 
@@ -320,7 +329,7 @@ def _login(settings: Settings, api: requests.Session) -> None:
         raise BenchFailure(f"re-login failed: {relogin.status_code}")
 
 
-def run(settings: Settings, rounds: int, datasets: int, cold_wait: float) -> dict:
+def run(settings: Settings, rounds: int, datasets: int, cold_wait: float, after_expiry: bool = False) -> dict:
     if not (settings.api_url and settings.email and settings.password):
         raise BenchFailure("LAKEHOUSE_API_URL, AUTH_BOOTSTRAP_EMAIL and AUTH_BOOTSTRAP_PASSWORD must be set")
     if rounds < 2:
@@ -345,6 +354,17 @@ def run(settings: Settings, rounds: int, datasets: int, cold_wait: float) -> dic
     for name, (url, key, extra) in routes.items():
         times = [_timed_get(api, url, {key: term, **extra}) for term in searches]
         result[name] = _summary(times[0], times[1:])
+        if after_expiry:
+            # `DATA-41` D5: the search that finds the copy older than its
+            # age. The copy is served at once and rebuilt behind it
+            # (`DATA-38` D1), so this is what the rebuild costs the person
+            # who is searching.
+            print(
+                f"[bench] {name}: waiting {cold_wait:.0f}s so the search copy is older than its age",
+                file=sys.stderr,
+            )
+            time.sleep(cold_wait)
+            result[name]["afterExpiryMs"] = round(_timed_get(api, url, {key: searches[0], **extra}), 1)
         print(f"[bench] {name}: {result[name]}", file=sys.stderr)
     return result
 
@@ -361,6 +381,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--rounds", type=int, default=50)
     p_run.add_argument("--datasets", type=int, default=10_000, help="how many were seeded; only picks table numbers")
     p_run.add_argument("--cold-wait", type=float, default=35.0)
+    p_run.add_argument(
+        "--after-expiry",
+        action="store_true",
+        help="also time the search that finds the search copy older than its 30-second age",
+    )
     return parser
 
 
@@ -371,7 +396,12 @@ def main() -> int:
         if args.command == "seed":
             seed(settings, args.datasets, args.columns)
         else:
-            print(json.dumps(run(settings, args.rounds, args.datasets, args.cold_wait), indent=2))
+            print(
+                json.dumps(
+                    run(settings, args.rounds, args.datasets, args.cold_wait, args.after_expiry),
+                    indent=2,
+                )
+            )
     except (BenchFailure, requests.RequestException) as err:
         print(f"[bench] FAILED: {err}", file=sys.stderr)
         return 1

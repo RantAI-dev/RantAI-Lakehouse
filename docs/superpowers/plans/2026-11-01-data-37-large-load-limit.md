@@ -113,3 +113,20 @@ of memory.
   the default port. The diff does not touch it, and CI's workspace run is the judge.
 
 **Open: no BLOCKER, no SHOULD-FIX.** Merge waits for the PR's CI.
+
+### Incident: the review commit reverted the code (planner, 2026-11-01)
+
+The planner's review commit `f8cd1db2` carried this plan's review **and the branch's code as it
+stood before T1–T3**. It therefore undid every code change of `d41cebd8`, `68757f99` and
+`fb39a253`, and #319 merged that state: `main` at `c70b9e2d` has the history of DATA-37 but none
+of its code.
+
+Cause: the planner's worktree and the developer's worktree had the same branch checked out, and
+git worktrees share their branch refs. The developer's `git checkout -B` moved the branch under
+the planner's worktree, whose index still held the old files, so the planner's docs-only commit
+recorded them.
+
+Fix (branch `fix/data-37-restore-code`): every non-plan file is checked out from `3b0f137e`, the
+reviewed head, byte for byte (`git diff --cached 3b0f137e -- <files>` is empty). No other commit
+touched these files between the base `5661a043` and `main`. The planner's worktrees are now
+detached, and the planner diffs the staged paths before every commit.

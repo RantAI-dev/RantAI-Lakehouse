@@ -1104,6 +1104,33 @@ class ReleaseWorkflowTest(unittest.TestCase):
                 job,
             )
 
+    def test_the_release_job_publishes_the_files_the_release_ships(self) -> None:
+        """REL-2 S4 decision D14: the release ships every file its
+        Compose file mounts.
+
+        The ONLINE install fetches a shipped file by its own name, so
+        each of them is published as an asset of its own. The list
+        comes from the script that wrote the manifest, so the release
+        and the manifest cannot drift apart.
+        """
+        step = step_named(self.document, "release", "The release's assets")
+        run = str(step.get("run"))
+        self.assertIn("--print-shipped-files", run)
+        self.assertIn("make_manifest.py", run)
+        self.assertIn("release-assets/", run)
+
+    def test_the_bundle_of_both_jobs_carries_the_shipped_files(self) -> None:
+        """The bundle holds every file the release ships, at the path
+        the install writes it at.
+
+        The bundle script asks the manifest's own script for the list,
+        so the bundle and the manifest name the same files.
+        """
+        for job in ("dry-run", "release"):
+            bundle = step_named(self.document, job, "Build the offline bundle")
+            run = str(bundle.get("run"))
+            self.assertIn("ops/release/make_bundle.sh", run, job)
+
     def test_the_installer_is_built_before_the_manifest_is_written(self) -> None:
         for job in ("dry-run", "release"):
             self.assertLess(

@@ -146,6 +146,7 @@ jobs:
           python3 ops/bench/catalog_search_bench.py run \
             --rounds "$BENCH_ROUNDS" \
             --datasets "$BENCH_DATASETS" \
+            --after-expiry \
             | tee "$RUNNER_TEMP/bench.json"
           {
             echo '### Catalog search bench'
@@ -153,7 +154,7 @@ jobs:
             echo 'Command:'
             echo
             echo '```'
-            echo "python3 ops/bench/catalog_search_bench.py run --rounds $BENCH_ROUNDS --datasets $BENCH_DATASETS"
+            echo "python3 ops/bench/catalog_search_bench.py run --rounds $BENCH_ROUNDS --datasets $BENCH_DATASETS --after-expiry"
             echo '```'
             echo
             echo '```json'

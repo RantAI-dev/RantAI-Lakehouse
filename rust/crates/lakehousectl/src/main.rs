@@ -28,14 +28,18 @@
 //!   compiled in, and the only override is a test-only build feature
 //!   (see `verify`).
 
+mod backup;
 mod cli;
 mod docker;
 mod error;
+mod files;
 mod http;
 mod install;
 mod manifest;
 mod preflight;
+mod release;
 mod secrets;
+mod state;
 mod sys;
 mod verify;
 
@@ -68,5 +72,7 @@ fn run(cli: Cli) -> Result<(), error::ToolError> {
         Command::Verify(args) => verify::command(&args),
         Command::Preflight(args) => preflight::command(&args),
         Command::Install(args) => install::command(&args),
+        Command::Backup(args) => backup::command(&args),
+        Command::Restore(args) => backup::command_restore(&args),
     }
 }
