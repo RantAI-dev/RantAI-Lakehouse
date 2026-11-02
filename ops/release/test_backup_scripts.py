@@ -42,7 +42,9 @@ echo "docker $*" >> "${FAKE_DOCKER_LOG:-/dev/null}"
 # The stack as a whole — `docker compose ... up -d`, with no service
 # name after it — does not start when the environment says so: the
 # release that failed never becomes healthy, and the console depends
-# on it (REL-2 S4b review round 8 BLOCKER 3).
+# on it. The restore is asked not to start the stack in that case
+# (REL-2 S4b review round 9 BLOCKER 4, decision D25); this knob is
+# what a standalone restore sees when the stack itself is broken.
 if [ "${*: -2}" = "up -d" ] && [ "${FAKE_DOCKER_STACK_UP_FAILS:-false}" = "true" ]; then
     echo "dependency failed to start: container lakehouse-api-1 is unhealthy" >&2
     exit 1
@@ -423,16 +425,43 @@ class RestoreScriptTest(ScriptTestCase):
             f"the stack was never started: {self.docker_calls()}",
         )
 
-    def test_a_stack_that_does_not_start_is_not_a_failed_restore(self) -> None:
-        """The data is restored, and the operator is told what did not
-        start (REL-2 S4b review round 8 BLOCKER 3).
+    def test_the_restore_leaves_the_stack_alone_when_it_is_told_to(self) -> None:
+        """`--skip-stack-up` is what the rollback passes: it starts the
+        stack itself, with the release it goes back to (REL-2 S4
+        decision D18), so the restore must not start the FAILED
+        release's stack (REL-2 S4b review round 9 BLOCKER 4, decision
+        D25)."""
+        backup = self.make_backup()
+        self.clear_docker_log()
+        result = self.run_restore(backup, LAKEHOUSE_DIR=str(self.deployment))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "Skipping full stack up (--skip-stack-up passed)",
+            result.stdout,
+            "the restore did not say it was leaving the stack alone",
+        )
+        whole_stack_starts = [
+            call for call in self.docker_calls() if call.endswith(" up -d")
+        ]
+        self.assertEqual(
+            whole_stack_starts,
+            [],
+            f"the restore started the whole stack anyway: {whole_stack_starts}",
+        )
 
-        The rollback of a failed update restores onto the stack the
-        failed update left behind, and the release that failed never
-        becomes healthy — the console depends on its API — so the stack
-        bring-up at the end of the restore cannot start. The restore
-        must not fail with it: the rollback starts the stack itself,
-        with the release it goes back to (D18).
+    def test_a_stack_that_does_not_start_makes_the_restore_fail(self) -> None:
+        """A restore that is asked to start the stack, and cannot, exits
+        non-zero with the reason on its error stream (REL-2 S4b review
+        round 9 BLOCKER 4, decision D25).
+
+        The data is restored first, and the script says so: what failed
+        is the stack bring-up, not the restore of the data. The summary
+        line stays honest, and the exit status agrees with it. A silent
+        exit 0 would read as a success that is not one (principle 2).
+
+        The rollback never reaches this step: it asks the restore not to
+        start the stack (`--skip-stack-up`) and starts it itself with the
+        release it goes back to (REL-2 S4 decision D18).
         """
         backup = self.make_backup()
         result = self.run_restore(
@@ -441,16 +470,26 @@ class RestoreScriptTest(ScriptTestCase):
             LAKEHOUSE_DIR=str(self.deployment),
             FAKE_DOCKER_STACK_UP_FAILS="true",
         )
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotEqual(result.returncode, 0, result.stderr)
         self.assertIn(
-            "the stack did not start",
-            result.stdout,
-            f"the operator was not told: {result.stdout}",
+            "Error: the data is restored, and the stack did not start.",
+            result.stderr,
+            f"the operator was not told why the restore failed: {result.stderr}",
         )
         self.assertIn(
             "dependency failed to start",
+            result.stderr,
+            f"what compose said was not passed on: {result.stderr}",
+        )
+        self.assertNotIn(
+            "dependency failed to start",
             result.stdout,
-            f"what compose said was not passed on: {result.stdout}",
+            f"what compose said landed on the tool's standard output: {result.stdout}",
+        )
+        self.assertIn(
+            "Stack bring-up:          the stack did not start",
+            result.stdout,
+            f"the summary does not say the stack did not start: {result.stdout}",
         )
 
     def test_the_restore_replaces_the_data_it_restores(self) -> None:

@@ -541,23 +541,26 @@ if [[ -n "${LOCAL_DIR}" ]]; then
   if [[ "${SKIP_STACK_UP}" != "true" ]]; then
     echo "==> [Step 5/5] Starting the remaining services in the stack..."
     LOCAL_STACK_START=$(date +%s)
-    # The stack is brought up LAST, and a stack that does not start is
-    # NOT a failed restore: the DATA is back, and the caller is told
-    # what did not start. The rollback of a failed update is the case
-    # that matters — the release it goes back to starts the stack
-    # itself, with its own files, right after this restore (D18), and
-    # the release that FAILED never becomes healthy: `docker compose
-    # up -d` waits for the API the console depends on, and it waits
-    # for nothing (REL-2 S4b review round 8 BLOCKER 3).
+    # A stack that does not start is a FAILED restore: the data is
+    # back, but an operator who asked for the stack and is told the
+    # restore succeeded would be told a success that is not one
+    # (REL-2 S4b review round 9 BLOCKER 4, decision D25).
     #
-    # What compose says about it is captured and printed: the tool that
-    # runs this script prints its STANDARD output, and the reason the
-    # stack did not start is the one thing the operator needs.
+    # The rollback of a failed update does not reach this step: it asks
+    # the restore NOT to start the stack (`--skip-stack-up`), puts the
+    # old files back, and starts the stack itself, with the release it
+    # goes back to (REL-2 S4 decision D18). The release that FAILED
+    # never becomes healthy — the console depends on its API — so a
+    # start here would wait on a release that is already gone.
+    #
+    # What compose says about it is captured and printed to the error
+    # stream, after the one line that says the data is back: the tool
+    # that runs this script prints its STANDARD output, and the reason
+    # the stack did not start is the one thing the operator needs.
     if ! stack_output="$("${COMPOSE[@]}" up -d 2>&1)"; then
       local_stack_started=false
-      echo "Warning: the stack did not start. The data is restored; the services that"
-      echo "         did not start can be started by hand."
-      echo "${stack_output}"
+      echo "Error: the data is restored, and the stack did not start." >&2
+      echo "${stack_output}" >&2
     fi
     LOCAL_STACK_DURATION=$(( $(date +%s) - LOCAL_STACK_START ))
   else
@@ -579,6 +582,12 @@ if [[ -n "${LOCAL_DIR}" ]]; then
   fi
   echo "  Total restore time:      ${TOTAL_DURATION}s"
   echo "================================================================="
+  # The summary says the stack did not start; the exit status says the
+  # same thing, so a caller cannot read a failed bring-up as success
+  # (REL-2 S4b review round 9 BLOCKER 4, decision D25).
+  if [[ "${local_stack_started}" != "true" ]]; then
+    exit 1
+  fi
   exit 0
 fi
 
