@@ -21,6 +21,15 @@
 #       data was taken from (REL-2 S4 decision D15)
 #    7. Bring up the remaining stack services
 #
+# A LOCAL restore REPLACES the data it restores: every database the
+# backup holds is dropped and written again, so what comes back is the
+# backup's data and NOT the backup's data PLUS what the instance held.
+# That is true on a fresh instance and on a populated one — the
+# rollback of a failed update restores onto the data the failed update
+# left behind, and a restore that added to that data would bring back
+# a mixture that is in neither the backup nor the instance
+# (REL-2 S4b review round 6 BLOCKER 1, decision D24).
+#
 # Usage:
 #   scripts/restore-from-backup.sh [--force] [--skip-stack-up] <backup-timestamp>
 #   scripts/restore-from-backup.sh [--force] [--skip-stack-up] --local <backup-dir>
@@ -287,6 +296,29 @@ if [[ -n "${LOCAL_DIR}" ]]; then
   echo "==> The backup is whole: version ${LOCAL_VERSION}, created ${LOCAL_STAMP}"
 fi
 
+# The databases a `pg_dumpall` dump creates, one per line.
+#
+# The dump carries a `CREATE DATABASE` line for every database it
+# holds, and the name is a SQL identifier: unquoted when it needs no
+# quoting, and double-quoted when it does. The quotes are not part of
+# the name, and a double quote inside the name is doubled.
+pg_dump_databases() {
+  awk '
+    /^CREATE DATABASE / {
+      rest = $0
+      sub(/^CREATE DATABASE /, "", rest)
+      if (match(rest, /^("([^"]|"")*"|[A-Za-z_][A-Za-z0-9_$]*)/)) {
+        name = substr(rest, 1, RLENGTH)
+        if (name ~ /^".*"$/) {
+          name = substr(name, 2, length(name) - 2)
+          gsub(/""/, "\"", name)
+        }
+        print name
+      }
+    }
+  ' "$1"
+}
+
 # -------------------------------------------------------------------
 # 0c. A LOCAL backup: restore it (and only it)
 # -------------------------------------------------------------------
@@ -312,13 +344,79 @@ if [[ -n "${LOCAL_DIR}" ]]; then
     exit 1
   fi
 
+  # The databases the dump carries. `pg_dumpall` dumps the WHOLE
+  # instance, so the dump carries a `CREATE DATABASE` line for every
+  # database it holds — and the restore has to know the names BEFORE
+  # it runs the dump: the databases are dropped first, so the dump
+  # writes them again instead of adding to what they hold (REL-2 S4b
+  # review round 6 BLOCKER 1, decision D24).
+  #
+  # Measured on Postgres 16.15 and 17.11: the `CREATE DATABASE` lines
+  # name every database but `postgres` and `template1` — the two every
+  # instance already has. The dump carries the `postgres` database's
+  # OWN objects all the same (`\connect postgres` and the objects
+  # after it), so that database is dropped and created again below.
+  LOCAL_PG_DBS=()
+  while IFS= read -r db; do
+    [[ -z "${db}" ]] && continue
+    LOCAL_PG_DBS+=("${db}")
+  done < <(pg_dump_databases "${LOCAL_DIR}/postgres.dump")
+  # `postgres` is in the list whether the dump names it or not: the
+  # restore recreates it, and it is checked afterwards with the rest.
+  LOCAL_PG_DBS+=("postgres")
+
+  for db in "${LOCAL_PG_DBS[@]}"; do
+    case "${db}" in
+      postgres | template0 | template1)
+        # `postgres` is recreated below, and a template database cannot
+        # be dropped at all.
+        continue
+        ;;
+    esac
+    quoted="${db//\"/\"\"}"
+    echo "--> Dropping the database '${db}': the restore replaces it."
+    "${COMPOSE[@]}" exec -T postgres psql -U "${POSTGRES_USER}" -d template1 \
+      -v ON_ERROR_STOP=1 \
+      -c "DROP DATABASE IF EXISTS \"${quoted}\" WITH (FORCE);"
+  done
+
+  # The `postgres` database is in the dump — `pg_dumpall` dumps every
+  # database — but the dump never carries a `CREATE DATABASE postgres`
+  # line, because `postgres` is a database every instance already has.
+  # So the restore drops it and creates it again from `template0`, and
+  # the dump's objects are written into an empty database instead of
+  # into the one the instance holds (REL-2 S4b review round 6 BLOCKER 1,
+  # decision D24).
+  echo "--> Recreating the 'postgres' database: the restore replaces its contents."
+  "${COMPOSE[@]}" exec -T postgres psql -U "${POSTGRES_USER}" -d template1 \
+    -v ON_ERROR_STOP=1 \
+    -c 'DROP DATABASE IF EXISTS "postgres" WITH (FORCE);' \
+    -c 'CREATE DATABASE "postgres" WITH TEMPLATE = template0;'
+
   echo "--> Restoring the whole instance from pg_dumpall..."
   # `pg_dumpall` restores into the `postgres` database: the dump carries
   # its own CREATE DATABASE and \connect statements. A role the dump
-  # creates that already exists in the fresh instance is reported by psql
-  # as an error and the restore carries on — expected, not a failure.
+  # creates that already exists in the instance is reported by psql as
+  # an error and the restore carries on — expected, not a failure. The
+  # databases are the same: they were dropped above, so the dump
+  # creates them again.
   "${COMPOSE[@]}" exec -T postgres psql -U "${POSTGRES_USER}" -d postgres \
+    -v ON_ERROR_STOP=0 \
     < "${LOCAL_DIR}/postgres.dump"
+
+  # Every database the dump names must be there again: a restore that
+  # drops a database and cannot bring it back has failed, and it says
+  # which one (REL-2 S4b review round 6 BLOCKER 1, decision D24).
+  for db in "${LOCAL_PG_DBS[@]}"; do
+    literal="$(printf '%s' "${db}" | sed "s/'/''/g")"
+    present="$("${COMPOSE[@]}" exec -T postgres psql -U "${POSTGRES_USER}" -d postgres \
+      -tAc "SELECT 1 FROM pg_database WHERE datname = '${literal}';")"
+    if [[ "${present}" != "1" ]]; then
+      echo "Error: the database '${db}' was not restored." >&2
+      exit 1
+    fi
+    echo "    ok: the database '${db}' is there"
+  done
   LOCAL_PG_DURATION=$(( $(date +%s) - LOCAL_PG_START ))
 
   LOCAL_CH_START=$(date +%s)
@@ -355,6 +453,14 @@ if [[ -n "${LOCAL_DIR}" ]]; then
     db="$(basename "${db_dir}")"
     quoted="${db//\`/\`\`}"
     echo "--> Restoring ClickHouse database '${db}'..."
+    # The restore REPLACES the database: `RESTORE DATABASE` refuses a
+    # table that holds rows ("Cannot restore the table ... because it
+    # already contains some data"), and the rollback of a failed update
+    # restores onto the data that update left behind. So the database is
+    # dropped first, with `SYNC` so that the drop is done before the
+    # restore runs (REL-2 S4b review round 6 BLOCKER 1, decision D24).
+    "${COMPOSE[@]}" exec -T clickhouse clickhouse-client -q \
+      "DROP DATABASE IF EXISTS \`${quoted}\` SYNC;"
     # A server that has just started answers a query before it opens the
     # listeners its own RESTORE machinery connects back through, so the
     # statement is retried for a while before it is called a failure.

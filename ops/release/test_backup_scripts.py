@@ -45,6 +45,12 @@ case "$*" in
     *"SELECT name FROM system.databases"*)
         echo "lakehouse"
         ;;
+    *"SELECT 1 FROM pg_database WHERE datname"*)
+        # The restore asks whether every database the dump names is
+        # there again (REL-2 S4b review round 6 BLOCKER 1, decision
+        # D24). The stand-in says yes.
+        echo "1"
+        ;;
     *"volume inspect"*)
         # The connector-secrets volume is not there: the script warns
         # and carries on.
