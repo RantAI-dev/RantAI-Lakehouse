@@ -2811,6 +2811,17 @@ the host.** Three attempts, in the foreground and detached:
 The reviewer runs the whole workspace anyway; this is named here so the run is not mistaken for a
 green one.
 
+**The checks on the branch's HEAD (`c49199a2`), in the foreground:**
+
+| Command | Result |
+| --- | --- |
+| `/home/shiro/rantai/bin/cargo-locked fmt --check` (the whole workspace) | clean, no diff, exit 0 |
+| `/home/shiro/rantai/bin/cargo-locked clippy -p lakehousectl --all-targets -- -D warnings` | clean, exit 0 |
+| `/home/shiro/rantai/bin/cargo-locked test -p lakehousectl` | **189 passed, 0 failed** |
+| `python3 -m pytest ops/release -q` | **226 passed** |
+| `actionlint .github/workflows/release.yml` | no findings, exit 0 |
+| `git status` | clean (nothing generated staged) |
+
 **The `backup::tests` flake the S4b handoff reports was measured here too, on the base commit.**
 `cargo test -p lakehousectl` failed 2 times in 10 runs at `c239e3b0` (the base of the branch),
 with "the backup tool failed: Text file busy (os error 26)" in
