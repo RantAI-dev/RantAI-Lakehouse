@@ -22,7 +22,7 @@ import { useDataTable } from "@/hooks/use-data-table"
 import { filterDataClientSide } from "@/lib/data-table"
 import { useTableUrlState } from "@/hooks/use-table-url-state"
 import { useService, useServiceAction } from "@/hooks/use-service"
-import { isOwnAccessRequest } from "@/lib/access-requests"
+import { isOwnRequest, selfApprovalTooltip } from "@/lib/access-requests"
 import { withNotify } from "@/lib/notify"
 import { formatCost, formatRelativeTime } from "@/lib/format"
 import { agentService, assetService } from "@/services"
@@ -61,10 +61,22 @@ function ApprovalDrawerContent({
       <div className="flex flex-wrap items-center gap-2">
         {statusCell(selected, decidedGrants)}
         {selected.status === "pending" && selfApproval ? (
-          <span title="You requested this access; a different Governance Admin must decide it">
+          // SEC-57: the requester may not decide their own request, so
+          // BOTH buttons are disabled — the API refuses an approve and a
+          // reject alike (`routes::agents::refuse_own_request`). The
+          // wrapper carries the reason, because a disabled button does not
+          // show its own tooltip.
+          <span
+            className="flex items-center gap-2"
+            title={selfApprovalTooltip(selected.kind)}
+          >
             <Button size="sm" disabled>
               <CheckIcon data-icon="inline-start" />
               Approve
+            </Button>
+            <Button size="sm" variant="outline" disabled>
+              <XIcon data-icon="inline-start" />
+              Reject
             </Button>
           </span>
         ) : null}
@@ -245,7 +257,7 @@ export function ApprovalsPage() {
   const decideError = decideToolCall.error ?? decideAccess.error
 
   const selfApprovalOf = React.useCallback(
-    (item: ApprovalItem) => user !== null && isOwnAccessRequest(item, user.id),
+    (item: ApprovalItem) => user !== null && isOwnRequest(item, user.id),
     [user]
   )
 

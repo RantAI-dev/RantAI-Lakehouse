@@ -117,14 +117,17 @@ export type ApprovalItem = {
    */
   kind: "tool_call" | "access"
   /**
-   * The human who requested this approval — set only for `kind =
-   * "access"`, `undefined` for `kind = "tool_call"` (a digital employee
-   * acted; no single human requester exists). Used to disable the decide
-   * button for the requester's own pending request — see
-   * `isOwnAccessRequest` in `@/lib/access-requests`. The server-side
-   * refusal (`routes::catalog::decide_access_request`, WS7 item E3) is
-   * what actually enforces self-approval refusal; this is belt-and-
-   * suspenders only.
+   * The human who requested this approval — set for `kind = "access"`
+   * (a catalog access request) AND for a `kind = "tool_call"` a person
+   * asked for (`SEC-57`: the chat and `POST /api/ai/tool` record the
+   * signed-in principal, a headless run started by a person records that
+   * run's principal). `undefined` for a `kind = "tool_call"` nobody asked
+   * for in person — a scheduled run or a service identity.
+   *
+   * Used to disable the decision buttons for the requester's own pending
+   * request — see `isOwnRequest` in `@/lib/access-requests`. The
+   * server-side refusal (`routes::agents::refuse_own_request`, `SEC-57`)
+   * is what actually enforces it; this is belt-and-suspenders only.
    */
   requestedByUserId?: string
 }
