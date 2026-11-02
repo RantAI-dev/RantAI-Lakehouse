@@ -2124,6 +2124,141 @@ This is read from the code and the Compose file; it was NOT run on a host (see b
 - **The pushes**: both commits were pushed to `origin/feat/rel-2-s4b-lakehousectl-update`. No push
   was refused, so no `git pull --no-rebase` and no resolve was needed.
 
+### Fix for review S4b round 3 (developer, 2026-11-02)
+
+**Commits** (branch `feat/rel-2-s4b-lakehousectl-update`, on top of the review commit `61f91653`):
+
+| Commit | Task | What |
+| --- | --- | --- |
+| `12f34f3c` | review round 3 BLOCKER 3 | a release install runs the `dagster` profile: the install writes `COMPOSE_PROFILES=dagster`, the update adds it to an older install's `.env`, and the status lists the Dagster services |
+| `befabf5f` | review round 3 BLOCKER 3 | the two proof jobs assert that `dagster-daemon` and `dagster-code-location` run — after the install, after the update and after the rollback |
+
+**BLOCKER 3, the profile (`12f34f3c`).** D22 is implemented where the plan says it is:
+
+- a fresh install writes `COMPOSE_PROFILES=dagster` into the install's `.env` (`secrets.rs`), and
+  the `update` adds it to an older install's `.env` when the file names no profile
+  (`update.rs`, before step 4 — nothing that is running is touched before then);
+- an operator's own value is KEPT: the profiles an operator set are theirs, and the operator adds
+  `trino` or `seaweedfs` there. `.env.example` is NOT changed, so a developer's default stays the
+  same (`git diff 61f91653..HEAD -- .env.example` is empty);
+- `status` asks Compose for EVERY profile (`docker.rs`), so it lists the Dagster services: a status
+  that hid a running service would be a status that lied;
+- `env.rs` owns the `.env` text now (`name_of`, `with_variable`), so the pause and the profiles set
+  a variable the one way — the pause had its own copy of the same helper (rule 4).
+
+**What the profile needs, and the port collision D22 did not see.** Turning the `dagster` profile
+on needs one more thing, and the review's fix does not mention it: the `dagster-webserver` and the
+`console` both publish host port 3000 by default (`docker-compose.yml`: `${DAGSTER_WEBSERVER_HOST_PORT:-3000}:3000`
+and `${CONSOLE_HOST_PORT:-3000}:3000`), and two services cannot hold one host port. Measured on
+this machine, the release's own rendered Compose file with the `.env` of D22 publishes host port
+3000 twice:
+
+```
+$ docker compose --env-file .env -f docker-compose.yml config
+CONFLICT ('3000', 3000) ['console', 'dagster-webserver']
+```
+
+and a stack with those two mappings does not start — the same two mappings, measured on this
+machine:
+
+```
+$ docker compose -p porttest --env-file .env -f docker-compose.yml up -d
+Error response from daemon: failed to set up container networking: ... Bind for 0.0.0.0:3000 failed:
+port is already allocated
+$ echo $?
+1
+```
+
+So D22 as written would have made EVERY release install fail to start. The tool resolves it: when
+it turns the `dagster` profile on, the Dagster webserver is given a host port of its own — the
+first FREE one above the console's (3001 on a fresh host). A webserver that already has a port of
+its own keeps it, and an operator who set `COMPOSE_PROFILES` themselves keeps their ports: the
+tool only touches what it turned on. With that `.env`, the rendered release Compose file has NO
+port conflict and the Dagster services are in the deployment:
+
+```
+conflicts: {}
+dagster services in the model: ['dagster-code-location', 'dagster-daemon', 'dagster-db-init', 'dagster-webserver']
+```
+
+**This is a decision the reviewer may want to make (a D23).** The rule above is the developer's:
+"the Dagster webserver takes the first free host port above the console's". The other way round —
+the release's Compose file not publishing the webserver on the host at all (a rule of
+`ops/release/render_compose.py`) — is also defensible, and it keeps the operator's `.env` free of
+a port the tool chose. Both were checked against the code; the tool's rule was chosen because it
+changes no deployment shape and no `.env.example` line.
+
+**The proofs (`befabf5f`).** `install-proof` asserts that `dagster-daemon` and
+`dagster-code-location` run after the install; `update-proof` asserts the same after the install,
+after the update to bundle B, and after the rollback of bundle C. Every assertion reads the stack
+with Compose's own JSON (`ps --format json`) and with the install's own `.env`
+(`--env-file install/.env`): that file names the profiles the install runs, and without it the
+Dagster services are not part of the deployment the command reads. An assertion that cannot fail is
+a failure, so the checks run against synthetic workflows too.
+
+**The tests are real.** Twenty new Rust tests and seven new Python ones:
+
+| Test | What it holds |
+| --- | --- |
+| `secrets::tests::a_fresh_env_runs_the_dagster_profile` | a fresh `.env` names the `dagster` profile |
+| `secrets::tests::an_env_that_names_no_profile_gets_the_releases_one` | an older install's `.env` gets it, and the operator's values are kept |
+| `secrets::tests::the_profiles_an_operator_set_are_kept` | an operator's own profiles are not replaced |
+| `secrets::tests::a_commented_out_profile_is_not_a_profile` | a comment sets nothing |
+| `secrets::tests::the_update_adds_the_profile_to_an_older_install` | the update adds it |
+| `secrets::tests::the_update_keeps_the_profiles_an_operator_set` | and keeps an operator's own |
+| `secrets::tests::an_install_without_an_env_file_cannot_set_the_profiles` | the update fails closed without a `.env` |
+| `secrets::tests::the_dagster_webserver_gets_a_port_of_its_own` | the webserver and the console no longer share a port |
+| `secrets::tests::the_dagster_webserver_keeps_a_port_of_its_own` | an operator's own port is kept |
+| `secrets::tests::the_dagster_webserver_takes_the_first_free_port_above_the_consoles` | the first FREE port is the one it takes |
+| `secrets::tests::a_webserver_that_shares_the_consoles_port_is_moved_even_by_the_update` | the update resolves the collision too |
+| `secrets::tests::the_profiles_the_update_adds_are_readable_by_the_owner_only` | the `.env` stays mode 0600 |
+| `env::tests::a_commented_out_line_sets_nothing`, `a_variable_is_set_in_the_env_text`, `a_variable_is_never_set_twice` | the `.env` text helpers |
+| `update::tests::the_update_adds_the_dagster_profile_to_an_older_install` | the update's own path |
+| `update::tests::the_update_keeps_the_profiles_an_operator_set` | and the operator's own value |
+| `update::tests::the_update_sets_the_profiles_before_it_starts_the_stack` | the profile is in the `.env` before the first start |
+| `status::tests::the_report_shows_the_dagster_services` | the status lists the Dagster services |
+| `docker::tests::the_status_asks_for_every_profile` | the status asks Compose for every profile |
+| `test_release_workflow.py`: the seven new checks | the assertions exist in both jobs, they come after the three points, and they read the install's own `.env` |
+
+The fixes were reverted, the tests kept: **10 Rust tests failed** with the profile rule reverted
+(180 passed, 10 failed) and **3 more** with the port rule reverted (187 passed, 3 failed); **5 Python
+tests failed** with the workflow reverted (211 passed, 5 failed — the two synthetic-workflow checks
+pass either way). With the fixes, 190 Rust tests and 216 Python tests pass.
+
+**Commands run, in the foreground, on the final commit `befabf5f`:**
+
+| Command | Result |
+| --- | --- |
+| `/home/shiro/rantai/bin/cargo-locked fmt --check` | clean, no diff, exit 0 |
+| `/home/shiro/rantai/bin/cargo-locked clippy -p lakehousectl --all-targets -- -D warnings` | clean, no warning and no error, exit 0 |
+| `/home/shiro/rantai/bin/cargo-locked test -p lakehousectl` | **190 passed, 0 failed** (170 at the review commit `61f91653`, 20 new) |
+| `python3 -m pytest ops/release -q` (the venv with pytest 8.3.4 and pyyaml 6.0.3) | **216 passed** (209 at the review commit `61f91653`, 7 new) |
+| `actionlint .github/workflows/release.yml` | clean, exit 0 |
+| `python3 ops/lint/check_intra_package_imports.py` | OK |
+| `python3 ops/lint/check_bare_iceberg_count.py` | OK |
+
+Every cargo command went through `/home/shiro/rantai/bin/cargo-locked` (the shared
+`CARGO_TARGET_DIR`, `/home/shiro/rantai/cargo-target`; no `cargo clean`), in the foreground.
+
+**Not verified, with the reason:**
+
+- **No real install of a release on a host.** There is no published release yet, and the release's
+  own images are not on this machine: the install's path (the `.env`, the images, the stack) is
+  covered by the unit tests and by the Compose measurements quoted above. The proof is the
+  `install-proof` job of the dry run, and the reviewer runs it.
+- **The whole-workspace cargo run** (`cargo clippy --workspace --all-targets --all-features -- -D
+  warnings` and `cargo test --workspace`): not run here — this slice's machine rules say CI runs
+  the workspace and the developer runs the scoped commands. The crate the slice touches
+  (`lakehousectl`) was clipped and tested with `--all-targets`.
+- **`docker compose --profile '*' config --quiet`**: not run — the branch changes no compose file
+  (`git diff 61f91653..HEAD -- docker-compose.yml` is empty).
+- **No bun command ran**: the branch changes no TypeScript.
+- **The Dagster code location** (`(cd dagster && python -m pytest dispar_orchestrate -q)`): not
+  run — the branch changes no Python under `dagster/`. The two repo lints that scan it ran on this
+  branch and both are OK.
+- **The pushes**: both commits were pushed to `origin/feat/rel-2-s4b-lakehousectl-update`. No push
+  was refused, so no `git pull --no-rebase` and no resolve was needed.
+
 ## 7. Review (planner appends below)
 
 ### Review S1 round 1 (planner, 2026-10-31, at `f79d4235`)
