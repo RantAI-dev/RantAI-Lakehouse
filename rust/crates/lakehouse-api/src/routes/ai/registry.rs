@@ -713,9 +713,15 @@ fn create_chart_schema() -> Value {
 /// id, and nothing else (`AI-15`).
 ///
 /// The two tools are always offered in the same turn, so the model reads
-/// the full schema once: `update_chart` names the fields and points at
-/// `create_chart` for their meanings, which keeps the offered list small
-/// enough for a 32k context.
+/// the full schema once: `update_chart` names the fields, gives each its
+/// type and list shape, and points at `create_chart` for their meanings and
+/// rules, which keeps the offered list small enough for a 32k context.
+///
+/// The type and the list shape are not optional. With every field as `{}`,
+/// `MiniMax` sent list fields such as `measures` as objects
+/// (`{"item": ...}`) on `update_chart`, and the server refused the call: 14
+/// refused calls in the eval (`AI-15`). `create_chart` has the shape already,
+/// so [`type_shape`] derives it from there and the two cannot drift.
 ///
 /// `title` and `kind` stay required, as they were: the server replaces the
 /// chart's whole definition, so a call without them would empty the chart.
@@ -726,14 +732,39 @@ fn update_chart_schema() -> Value {
         .pointer("/function/parameters/properties")
         .and_then(Value::as_object)
     {
-        for name in create.keys() {
-            properties.insert(name.clone(), json!({}));
+        for (name, property) in create {
+            properties.insert(name.clone(), type_shape(property));
         }
     }
     json!({ "type": "function", "function": { "name": "update_chart",
         "description": "Change a saved chart (by id), keeping its id. Send every field, as for create_chart, with the new values: the fields, their meanings and their rules are those of create_chart, which this same turn offers. list_charts gives the ids.",
         "parameters": { "type": "object", "properties": properties,
             "required": ["id", "title", "kind"] } } })
+}
+
+/// A property reduced to its type and list shape: its `type` verbatim (it
+/// may be a list such as `["array", "null"]`), the same reduction of an
+/// array's `items`, and, for a property with no `type`, a `oneOf` that keeps
+/// only the `type` of each branch. A property with none of these is `{}`.
+/// Descriptions, enums, nested properties and `required` are dropped.
+fn type_shape(property: &Value) -> Value {
+    let mut shape = serde_json::Map::new();
+    if let Some(kind) = property.get("type") {
+        shape.insert("type".to_owned(), kind.clone());
+    } else if let Some(branches) = property.get("oneOf").and_then(Value::as_array) {
+        let kept: Vec<Value> = branches
+            .iter()
+            .map(|branch| match branch.get("type") {
+                Some(kind) => json!({ "type": kind }),
+                None => json!({}),
+            })
+            .collect();
+        shape.insert("oneOf".to_owned(), Value::Array(kept));
+    }
+    if let Some(items) = property.get("items") {
+        shape.insert("items".to_owned(), type_shape(items));
+    }
+    Value::Object(shape)
 }
 
 fn create_board_schema() -> Value {
@@ -3014,14 +3045,10 @@ mod tests {
         expected.push("id");
         expected.sort_unstable();
         assert_eq!(names, expected);
-        // The fields are named, not described: their meanings are the ones of
-        // `create_chart`, which the same turn offers.
-        for (name, property) in update_properties {
-            if name == "id" {
-                continue;
-            }
-            assert_eq!(property, &json!({}), "update_chart {name}");
-        }
+        // The fields carry their type and list shape, not their meanings:
+        // those are the ones of `create_chart`, which the same turn offers
+        // (the shapes are checked in
+        // `update_chart_fields_carry_the_type_of_the_same_fields_in_create_chart`).
         // `title` and `kind` stay required: the server replaces the chart's
         // whole definition, so a call without them would empty the chart.
         assert_eq!(
@@ -3035,6 +3062,48 @@ mod tests {
                 .contains("those of create_chart"),
             "update_chart does not point at create_chart: {update}"
         );
+    }
+
+    /// `AI-15`: `update_chart`'s fields carry the type and list shape of the
+    /// same fields in `create_chart`, so a model that reads only the type
+    /// sends `measures` as a list and not as an object, and the fields carry
+    /// no description or enum, which stay in `create_chart`.
+    #[test]
+    fn update_chart_fields_carry_the_type_of_the_same_fields_in_create_chart() {
+        let create = (find("create_chart").expect("registered tool").schema)();
+        let update = (find("update_chart").expect("registered tool").schema)();
+        let create_properties = create["function"]["parameters"]["properties"]
+            .as_object()
+            .expect("an object");
+        let update_properties = update["function"]["parameters"]["properties"]
+            .as_object()
+            .expect("an object");
+        for (name, property) in create_properties {
+            if let Some(kind) = property.get("type") {
+                assert_eq!(
+                    update_properties[name].get("type"),
+                    Some(kind),
+                    "update_chart {name} lost the type of create_chart"
+                );
+            }
+        }
+        let measures = &update_properties["measures"];
+        assert_eq!(
+            measures["type"], "array",
+            "update_chart measures: {measures}"
+        );
+        assert!(
+            measures["items"]
+                .as_object()
+                .is_some_and(|items| !items.is_empty()),
+            "update_chart measures has no item shape: {measures}"
+        );
+        for (name, property) in update_properties {
+            assert!(
+                property.get("description").is_none() && property.get("enum").is_none(),
+                "update_chart {name} carries a description or an enum: {property}"
+            );
+        }
     }
 
     /// `AI-15`: `create_chart` keeps the description of the fields the build
