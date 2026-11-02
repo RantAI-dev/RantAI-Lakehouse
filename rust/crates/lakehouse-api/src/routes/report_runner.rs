@@ -52,6 +52,7 @@
 
 use std::time::Duration;
 
+use axum::http::HeaderMap;
 use lakehouse_auth::Principal;
 use lakehouse_bi::filters::FilterDef;
 use lakehouse_bi::specs::ChartKind;
@@ -761,7 +762,10 @@ async fn is_empty_report(
     // stayed skipped. The emptiness check always reads fresh.
     let query = DashboardQuery::for_render(&sub.board, values.filters, values.params, values.grain)
         .fresh_all();
-    let payload = payload_for(state, owner, &query)
+    // `SEC-50` slice 2 S6: the report runner acts as the subscription's
+    // owner, so the report shows the owner's own data — their first tenant,
+    // because the runner sends no `X-Tenant` header.
+    let payload = payload_for(state, owner, &query, &HeaderMap::new())
         .await
         .map_err(|_| stop(DASHBOARD_UNREADABLE))?;
     Ok(every_data_chart_is_empty(&payload))

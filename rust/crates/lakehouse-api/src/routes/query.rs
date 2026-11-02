@@ -967,7 +967,7 @@ pub(crate) struct StatementGate<'a> {
 }
 
 impl<'a> StatementGate<'a> {
-    /// A gate that asks as `actor` and reads the statement with `dialect`.
+    /// A gate that asks as `actor`, reading the statement with `dialect`.
     ///
     /// The dialect is the one the engine the statement runs uses — the same
     /// choice the policy rewrite makes for that statement.
@@ -982,6 +982,13 @@ impl<'a> StatementGate<'a> {
             dialect,
             reach: tokio::sync::OnceCell::new(),
         }
+    }
+
+    /// `SEC-50` slice 2 M2: a gate that asks as `actor` and reads the
+    /// statement as `ClickHouse` does — the engine every site of slice 2
+    /// runs.
+    pub(crate) fn clickhouse(state: &'a AppState, actor: GateActor<'a>) -> Self {
+        Self::new(state, actor, &CLICKHOUSE_DIALECT)
     }
 
     /// The gate's answer for `sql`: nothing to refuse, or the refusal.
@@ -5552,7 +5559,7 @@ mod sec50_gate_tests {
     /// A state with no pool at all: the deployment's own answers are
     /// missing, so the gate must fail closed rather than guess.
     fn state_without_a_database() -> AppState {
-        AppState::new(Config::from_map(&HashMap::new()).expect("a config with no pool"))
+        AppState::without_a_database()
     }
 
     /// The pool's own URL, for a state that reads it.

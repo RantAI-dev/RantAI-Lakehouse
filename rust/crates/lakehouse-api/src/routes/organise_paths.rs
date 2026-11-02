@@ -197,8 +197,10 @@ async fn payload_result(
         params: None,
         fresh: None,
     };
+    let state = crate::state::AppState::without_a_database();
     get_body(
         &ch,
+        &crate::routes::query::StatementGate::unrestricted(&state),
         &q,
         None,
         &[],

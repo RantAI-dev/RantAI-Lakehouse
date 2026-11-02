@@ -198,8 +198,9 @@ pub async fn get(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
     Query(q): Query<DashboardQuery>,
+    headers: HeaderMap,
 ) -> Response {
-    match payload_for(&state, &principal, &q).await {
+    match payload_for(&state, &principal, &q, &headers).await {
         Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
         Err(response) => response,
     }
@@ -233,6 +234,7 @@ pub(crate) async fn payload_for(
     state: &AppState,
     principal: &Principal,
     q: &DashboardQuery,
+    headers: &HeaderMap,
 ) -> Result<Value, Response> {
     let placeholders = crate::sql_rewrite::PlaceholderValues {
         principal_id: Some(principal.id.uuid().to_string()),
@@ -278,6 +280,10 @@ pub(crate) async fn payload_for(
         cache_scope,
         get_body(
             &state.clickhouse,
+            &crate::routes::query::StatementGate::clickhouse(
+                state,
+                crate::routes::query::GateActor::Caller { principal, headers },
+            ),
             q,
             param_filters,
             &principal.role_names,
@@ -338,6 +344,7 @@ pub(crate) async fn payload_for(
 )]
 async fn get_body(
     ch: &ChClient,
+    gate: &crate::routes::query::StatementGate<'_>,
     q: &DashboardQuery,
     param_filters: Option<Vec<FilterDef>>,
     roles: &[String],
@@ -497,6 +504,7 @@ async fn get_body(
         crate::routes::layers::layer_sources(ch, stored_for_board.iter().copied()).await;
     let layer_runner = crate::routes::layers::RoleRunner {
         ch,
+        gate,
         roles,
         placeholders,
         obligations,
@@ -534,7 +542,7 @@ async fn get_body(
                 let sql = lakehouse_bi::builder::apply_builtin_year_filter(
                     sql_text, mart, years_ref, cols_ref,
                 );
-                run_spec_sql(ch, id, &sql, roles, placeholders, obligations).await
+                run_spec_sql(ch, gate, id, &sql, roles, placeholders, obligations).await
             }));
         }
     }
@@ -583,6 +591,7 @@ async fn get_body(
                     &filtered.sql,
                     run_spec_sql(
                         ch,
+                        gate,
                         &c.spec.id,
                         &filtered.sql,
                         roles,
@@ -596,6 +605,7 @@ async fn get_body(
                 crate::routes::support::annotate_grain(&mut val, &filtered, c);
                 crate::routes::support::annotate_table(
                     ch,
+                    gate,
                     &mut val,
                     &filtered,
                     (roles, placeholders, obligations),
@@ -1047,6 +1057,7 @@ async fn preview_sources_visible(
 pub async fn specs_preview(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
     // BI-10: a drill request names a saved chart and a level; the server builds
@@ -1091,12 +1102,23 @@ pub async fn specs_preview(
             .collect(),
     };
     let obligations = PolicyEngineObligations::from_state(&state);
+    // `SEC-50` slice 2 M4: the preview is the caller's own read, so it is
+    // gated as the caller — with the request's headers, so an `X-Tenant`
+    // header selects the tenant the preview reads as.
+    let gate = crate::routes::query::StatementGate::clickhouse(
+        &state,
+        crate::routes::query::GateActor::Caller {
+            principal: &principal,
+            headers: &headers,
+        },
+    );
     // BI-5 review B1: the preview reads as many rows as the tile will.
     let (_, mut result) = crate::routes::support::with_tile_rows(
         spec.spec.kind,
         &spec.spec.sql,
         run_spec_sql(
             &state.clickhouse,
+            &gate,
             &spec.spec.id,
             &spec.spec.sql,
             &principal.role_names,
@@ -1124,6 +1146,7 @@ pub async fn specs_preview(
     // BI-13: the chart's other questions, each as the viewer.
     let layer_runner = crate::routes::layers::RoleRunner {
         ch: &state.clickhouse,
+        gate: &gate,
         roles: &principal.role_names,
         placeholders: &placeholders,
         obligations: &obligations,
@@ -1140,6 +1163,7 @@ pub async fn specs_preview(
         crate::routes::support::preview_bin_reads(&state.clickhouse, &spec, &time).await;
     crate::routes::support::annotate_bins(
         &state.clickhouse,
+        &gate,
         &mut result,
         &bin_reads,
         (&principal.role_names, &placeholders, &obligations),
@@ -1148,6 +1172,7 @@ pub async fn specs_preview(
     // BI-6 part 2: the last result's rows for the table beside the chart.
     let rows = crate::routes::support::preview_rows(
         &state.clickhouse,
+        &gate,
         &spec,
         &result,
         (&principal.role_names, &placeholders, &obligations),
@@ -6244,8 +6269,10 @@ mod typed_filters {
             fresh: None,
         };
         let parsed = parse_filters_param(q.filters.as_deref()).expect("valid filters");
+        let state = crate::state::AppState::without_a_database();
         get_body(
             &ch,
+            &crate::routes::query::StatementGate::unrestricted(&state),
             &q,
             parsed,
             &[],
@@ -7517,8 +7544,10 @@ mod time_grain {
             params: None,
             fresh: None,
         };
+        let state = crate::state::AppState::without_a_database();
         get_body(
             &ch,
+            &crate::routes::query::StatementGate::unrestricted(&state),
             &q,
             None,
             &[],
@@ -7638,8 +7667,10 @@ mod time_grain {
             params: None,
             fresh: None,
         };
+        let state = crate::state::AppState::without_a_database();
         let body = get_body(
             &ch,
+            &crate::routes::query::StatementGate::unrestricted(&state),
             &q,
             None,
             &[],
@@ -8030,8 +8061,10 @@ mod table_tiles {
             params: None,
             fresh: None,
         };
+        let state = crate::state::AppState::without_a_database();
         get_body(
             &ch,
+            &crate::routes::query::StatementGate::unrestricted(&state),
             &q,
             None,
             &[],

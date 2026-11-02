@@ -448,6 +448,12 @@ pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
         render_board_payload(
             &state.clickhouse,
             &PolicyEngineObligations::from_state(&state),
+            // `SEC-50` slice 2 D3: an embed is read by nobody in particular,
+            // so it acts as the deployment's catalog tenant.
+            &crate::routes::query::StatementGate::clickhouse(
+                &state,
+                crate::routes::query::GateActor::CatalogTenant,
+            ),
             &board,
             &board_id,
             &filters,
@@ -987,6 +993,13 @@ pub async fn public_dashboard(
         render_board_payload(
             &state.clickhouse,
             &PolicyEngineObligations::from_state(&state),
+            // `SEC-50` slice 2 D3: a public link is read by nobody in
+            // particular, so it acts as the deployment's catalog tenant
+            // until T6 gives it the tenant that made it (D4, M8).
+            &crate::routes::query::StatementGate::clickhouse(
+                &state,
+                crate::routes::query::GateActor::CatalogTenant,
+            ),
             &board,
             &board_id,
             &filters,
@@ -1375,9 +1388,17 @@ struct Narrowing<'a> {
               borrows eleven locals, so a helper would need as many \
               parameters as the body has lines it saves"
 )]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one pipeline (read the board's charts and sources, run every tile \
+              through `tile_pool`, assemble the payload); the gate \
+              (`SEC-50` slice 2) is one argument more than the limit, and a \
+              struct for it alone would hide what the pipeline reads"
+)]
 async fn render_board_payload(
     ch: &ChClient,
     obligations: &PolicyEngineObligations<'_>,
+    gate: &crate::routes::query::StatementGate<'_>,
     board: &Board,
     board_id: &str,
     filters: &[FilterDef],
@@ -1426,6 +1447,7 @@ async fn render_board_payload(
         crate::routes::layers::layer_sources(ch, stored_for_board.iter().copied()).await;
     let layer_runner = crate::routes::layers::RoleRunner {
         ch,
+        gate,
         roles: &roles,
         placeholders: &placeholders,
         obligations,
@@ -1489,6 +1511,7 @@ async fn render_board_payload(
                                 &filtered.sql,
                                 run_spec_sql(
                                     ch,
+                                    gate,
                                     &c.spec.id,
                                     &filtered.sql,
                                     roles_ref,
@@ -1504,6 +1527,7 @@ async fn render_board_payload(
                             // paging.
                             crate::routes::support::annotate_table(
                                 ch,
+                                gate,
                                 &mut val,
                                 &filtered,
                                 (roles_ref, placeholders_ref, obligations),
@@ -1757,9 +1781,11 @@ mod typed_filters {
             embed_access: lakehouse_bi::embed_access::EmbedAccess::default(),
         };
 
+        let state = crate::state::AppState::without_a_database();
         let (body, _) = render_board_payload(
             &ch,
             &PolicyEngineObligations::new(None, &ch),
+            &crate::routes::query::StatementGate::unrestricted(&state),
             &board,
             "b1",
             &filters,
@@ -1909,9 +1935,11 @@ mod typed_filters {
             owner_id: None,
             embed_access: lakehouse_bi::embed_access::EmbedAccess::default(),
         };
+        let state = crate::state::AppState::without_a_database();
         let (body, _) = render_board_payload(
             &ch,
             &PolicyEngineObligations::new(None, &ch),
+            &crate::routes::query::StatementGate::unrestricted(&state),
             &board,
             "b1",
             &filters,
@@ -2022,9 +2050,11 @@ mod typed_filters {
         let locked: Vec<FilterDef> =
             serde_json::from_str(r#"[{"column":"kab","values":["b","c"]}]"#).unwrap();
 
+        let state = crate::state::AppState::without_a_database();
         let (body, _) = render_board_payload(
             &ch,
             &PolicyEngineObligations::new(None, &ch),
+            &crate::routes::query::StatementGate::unrestricted(&state),
             &board,
             "b1",
             &locked,
@@ -2127,9 +2157,11 @@ mod typed_filters {
             lakehouse_bi::grain::WeekStart::Monday,
         )
         .unwrap();
+        let state = crate::state::AppState::without_a_database();
         render_board_payload(
             &ch,
             &PolicyEngineObligations::new(None, &ch),
+            &crate::routes::query::StatementGate::unrestricted(&state),
             &board,
             "b1",
             &[],
