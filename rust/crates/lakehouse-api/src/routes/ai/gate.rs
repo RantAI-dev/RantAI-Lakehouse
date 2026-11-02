@@ -642,7 +642,28 @@ pub fn decide(
     spec: &ToolSpec,
     args: &Map<String, Value>,
 ) -> Option<Value> {
-    decide_with(is_build, perms, spec, args, None)
+    decide_with(is_build, perms, spec, args, None, None)
+}
+
+/// The permission half of [`decide_with`], for `BI-37` D10: the global
+/// permission, or — for a tool on `registry::DASHBOARD_SCOPED` — the caller's
+/// own level `reach` on the dashboard the call acts on. `reach` is a fact the
+/// server worked out before the gate (`tools::dashboard_reach`), never
+/// something the model can set. A tool not on the list keeps the plain check,
+/// so nothing else is widened.
+#[must_use]
+pub fn permission_granted(
+    spec: &ToolSpec,
+    perms: Option<&PermissionSet>,
+    reach: Option<lakehouse_bi::access::Level>,
+) -> bool {
+    if spec.permission.is_empty() {
+        return true;
+    }
+    if perms.is_some_and(|p| p.has(spec.permission)) {
+        return true;
+    }
+    super::registry::reach_offers(spec.name, spec.permission, reach)
 }
 
 /// [`decide`] with a fact the server worked out about the call, which the
@@ -659,6 +680,7 @@ pub fn decide_with(
     spec: &ToolSpec,
     args: &Map<String, Value>,
     audience_needs_approval: Option<bool>,
+    reach: Option<lakehouse_bi::access::Level>,
 ) -> Option<Value> {
     // F2.9 (PR #59 review): the Ask-mode / permission gates check the
     // STATIC risk (a Read tool must never refuse in Ask mode regardless
@@ -672,11 +694,8 @@ pub fn decide_with(
     if !is_build && effective != Risk::Read {
         return Some(ask_mode_refusal(spec.name));
     }
-    if !spec.permission.is_empty() {
-        let granted = perms.is_some_and(|p| p.has(spec.permission));
-        if !granted {
-            return Some(permission_refusal(spec.name, spec.permission));
-        }
+    if !permission_granted(spec, perms, reach) {
+        return Some(permission_refusal(spec.name, spec.permission));
     }
     match effective {
         Risk::Read => None,
@@ -768,9 +787,10 @@ pub fn decide_by_name(
     tool_name: &str,
     args: &Map<String, Value>,
     audience_needs_approval: Option<bool>,
+    reach: Option<lakehouse_bi::access::Level>,
 ) -> Option<Value> {
     let spec = super::registry::find(tool_name)?;
-    decide_with(is_build, perms, spec, args, audience_needs_approval)
+    decide_with(is_build, perms, spec, args, audience_needs_approval, reach)
 }
 
 #[cfg(test)]
@@ -1185,11 +1205,11 @@ mod tests {
     #[test]
     fn unregistered_tool_is_never_refused() {
         assert_eq!(
-            decide_by_name(false, None, "not_a_real_tool", &no_args(), None),
+            decide_by_name(false, None, "not_a_real_tool", &no_args(), None, None),
             None
         );
         assert_eq!(
-            decide_by_name(true, None, "not_a_real_tool", &no_args(), None),
+            decide_by_name(true, None, "not_a_real_tool", &no_args(), None, None),
             None
         );
     }
@@ -1294,7 +1314,7 @@ mod tests {
         ];
         for tool in ["run_sql", "run_saved_query"] {
             for perms in &without {
-                let refused = decide_by_name(true, Some(perms), tool, &no_args(), None)
+                let refused = decide_by_name(true, Some(perms), tool, &no_args(), None, None)
                     .unwrap_or_else(|| panic!("{tool} must be refused without query:read"));
                 assert_eq!(refused["reason"], json!("permission"), "{tool}");
                 assert_eq!(refused["required"], json!("query:read"), "{tool}");
@@ -1305,6 +1325,7 @@ mod tests {
                     Some(&PermissionSet::parse("query:read")),
                     tool,
                     &no_args(),
+                    None,
                     None
                 ),
                 None,
@@ -1400,5 +1421,84 @@ mod tests {
         let pending = decide(true, Some(&perms), spec("delete_chart"), &confirmed_args())
             .expect("must be pending approval");
         assert!(is_write_high_pending(&pending));
+    }
+
+    /// `BI-37` D10: a listed dashboard tool accepts the caller's own level on
+    /// the dashboard in place of `dashboard:read`/`dashboard:write`, and still
+    /// refuses the cheaper level than the tool asks for.
+    #[test]
+    fn a_listed_dashboard_tool_accepts_the_callers_level_on_that_dashboard() {
+        use lakehouse_bi::access::Level;
+        let analyst = PermissionSet::parse("query:read");
+        let read = spec("export_chart");
+        let refused = decide_with(true, Some(&analyst), read, &no_args(), None, None)
+            .expect("must be refused without the permission or a level");
+        assert_eq!(refused["required"], json!("dashboard:read"));
+        assert_eq!(
+            decide_with(
+                true,
+                Some(&analyst),
+                read,
+                &no_args(),
+                None,
+                Some(Level::View)
+            ),
+            None,
+            "view on the dashboard is what reading its chart needs"
+        );
+
+        let write = spec("create_chart");
+        let refused = decide_with(
+            true,
+            Some(&analyst),
+            write,
+            &confirmed_args(),
+            None,
+            Some(Level::View),
+        )
+        .expect("a viewer may not create a chart");
+        assert_eq!(refused["required"], json!("dashboard:write"));
+        assert_eq!(
+            decide_with(
+                true,
+                Some(&analyst),
+                write,
+                &confirmed_args(),
+                None,
+                Some(Level::Edit)
+            ),
+            None,
+            "edit on the dashboard is what changing it needs"
+        );
+    }
+
+    /// `BI-37` D10: a level never widens a tool outside the list, so the gate's
+    /// plain check stays exactly as it was for every other tool.
+    #[test]
+    fn a_level_never_widens_a_tool_outside_the_list() {
+        use lakehouse_bi::access::Level;
+        let analyst = PermissionSet::parse("query:read");
+        for name in [
+            "delete_calculated_field",
+            "create_report_subscription",
+            "list_maps",
+        ] {
+            let refused = decide_with(
+                true,
+                Some(&analyst),
+                spec(name),
+                &confirmed_args(),
+                None,
+                Some(Level::Manage),
+            )
+            .unwrap_or_else(|| panic!("{name} must stay refused"));
+            assert_eq!(refused["reason"], json!("permission"), "{name}");
+        }
+        // A tool that has no dashboard permission at all is untouched too.
+        assert_eq!(
+            decide(true, Some(&analyst), spec("run_sql"), &no_args()),
+            None,
+            "query:read is enough for run_sql, as before"
+        );
     }
 }

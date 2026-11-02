@@ -570,6 +570,77 @@ pub(crate) async fn board_is_restricted(
     )
 }
 
+/// The caller's level on dashboard `id`, worked out once (`BI-37` D10): the
+/// starting point, their rules, the folder inheritance and a restriction. Blank
+/// or `default` is judged at the root, where the built-in dashboard lives. A
+/// dashboard that does not exist, or one their rules leave out, is `None` —
+/// and so is a store failure: the gate that reads this fails closed.
+pub(crate) async fn level_on_board(
+    state: &AppState,
+    principal: &Principal,
+    id: &str,
+) -> Option<Level> {
+    let scope = scope_for_write(state, principal).await.ok()?;
+    level_with(state, &scope, id).await
+}
+
+/// [`level_on_board`] for the dashboard chart `id` is on, found through the
+/// caller's own viewer: a chart in the trash, on a dashboard they cannot see or
+/// not there at all is `None`.
+pub(crate) async fn level_on_chart(
+    state: &AppState,
+    principal: &Principal,
+    id: &str,
+) -> Option<Level> {
+    let id = id.trim();
+    if id.is_empty() {
+        return None;
+    }
+    let scope = scope_for_write(state, principal).await.ok()?;
+    let chart = store::list_stored_charts(&state.clickhouse, &scope.viewer)
+        .await
+        .ok()?
+        .into_iter()
+        .find(|c| c.spec.id == id)?;
+    let board = if chart.board.is_empty() {
+        store::DEFAULT_BOARD_ID
+    } else {
+        chart.board.as_str()
+    };
+    level_with(state, &scope, board).await
+}
+
+/// The highest level the caller holds on any dashboard (`BI-37` D10), which is
+/// what a listing tool with no board argument may be offered to them for. The
+/// logic is [`require_can_ever`]'s, kept in one place: `identity:write` is
+/// everything; otherwise the better of their starting point and their best
+/// rule. A store failure is `None` (fail closed).
+pub(crate) async fn highest_level(state: &AppState, principal: &Principal) -> Option<Level> {
+    if principal.has("identity:write") {
+        return Some(Level::Manage);
+    }
+    let baseline = baseline_of(principal)
+        .or_else(|| principal.has("dashboard:write").then_some(Level::Manage));
+    let (grants, _) = read_rules(state, principal).await.ok()?;
+    grants.iter().map(|g| g.level).chain(baseline).max()
+}
+
+/// [`level_on_board`] on a scope already resolved.
+async fn level_with(state: &AppState, scope: &Scope, id: &str) -> Option<Level> {
+    let id = id.trim();
+    if id.is_empty() || id == store::DEFAULT_BOARD_ID {
+        return scope.root_level();
+    }
+    let board = store::get_board(&state.clickhouse, id, &Viewer::system())
+        .await
+        .ok()??;
+    scope.map.level_for_board(
+        &board.id,
+        &board.folder_id.unwrap_or_default(),
+        &board.owner_id.unwrap_or_default(),
+    )
+}
+
 /// The viewer for the places that only *count or name* what uses something
 /// (metric, field, parameter and source usage, delete conflicts), `BI-19` B1
 /// review R3. A caller who holds neither `dashboard:read` nor a rule (a
