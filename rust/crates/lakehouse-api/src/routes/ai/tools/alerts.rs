@@ -77,7 +77,14 @@ pub(super) async fn create_alert_rule(
     // way around it.
     // BI-19 B1 review R6 (assistant path): the same create guard, which now also
     // refuses a digest of a board the caller cannot see or that is restricted.
-    if let Err(err) = crate::routes::alerts::authorise_rule_create(state, principal, &input).await {
+    // `SEC-50` slice 2 D7a (M7): the same guard as the console route, tenant
+    // gate included. No `X-Tenant` here: a tool call carries the model's
+    // arguments, not the chat's request headers, so the person's first tenant
+    // acts (the same fallback as everywhere else).
+    let headers = axum::http::HeaderMap::new();
+    if let Err(err) =
+        crate::routes::alerts::authorise_rule_create(state, principal, &headers, &input).await
+    {
         return json!({ "error": err.to_string() });
     }
     // SEC-10: `save_rule` checks the webhook target with the same sender and
@@ -100,8 +107,10 @@ pub(super) async fn update_alert_rule(
     }
     let input = parse_input(args);
     // `SRC-7` D7: as in `create_alert_rule`.
+    // `SEC-50` slice 2 D7a (M7): the same guard, tenant gate included.
+    let headers = axum::http::HeaderMap::new();
     if let Err(err) =
-        crate::routes::alerts::authorise_rule_update(state, principal, &id, &input).await
+        crate::routes::alerts::authorise_rule_update(state, principal, &headers, &id, &input).await
     {
         return json!({ "error": err.to_string() });
     }

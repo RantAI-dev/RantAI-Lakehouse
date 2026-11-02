@@ -289,6 +289,7 @@ pub(crate) async fn authorise_rule_scope(
 pub(crate) async fn authorise_rule_update(
     state: &AppState,
     principal: Option<&Principal>,
+    headers: &HeaderMap,
     id: &str,
     input: &AlertRuleInput,
 ) -> Result<(), ApiError> {
@@ -302,7 +303,9 @@ pub(crate) async fn authorise_rule_update(
     authorise_existing_rule(state, principal, id).await?;
     // BI-19 B1 review R6 (assistant path): the one place both the route and the
     // assistant's `update_alert_rule` pass through.
-    authorise_digest_board(state, principal, Some(id), input).await
+    authorise_digest_board(state, principal, Some(id), input).await?;
+    // `SEC-50` slice 2 D7a (M7): the same place, for the tenant gate.
+    gate_rule_statement(state, principal, headers, input).await
 }
 
 /// [`authorise_rule_scope`] plus the digest check for a rule being created:
@@ -315,6 +318,7 @@ pub(crate) async fn authorise_rule_update(
 pub(crate) async fn authorise_rule_create(
     state: &AppState,
     principal: Option<&Principal>,
+    headers: &HeaderMap,
     input: &AlertRuleInput,
 ) -> Result<(), ApiError> {
     authorise_rule_scope(
@@ -324,7 +328,59 @@ pub(crate) async fn authorise_rule_create(
         input.connector.as_deref(),
     )
     .await?;
-    authorise_digest_board(state, principal, None, input).await
+    authorise_digest_board(state, principal, None, input).await?;
+    // `SEC-50` slice 2 D7a (M7): the same place, for the tenant gate.
+    gate_rule_statement(state, principal, headers, input).await
+}
+
+/// `SEC-50` slice 2 D7a (M7): a mart or metric rule's statement is gated as
+/// the person SAVING it, with `SEC-20`'s 404, before the row is written.
+///
+/// Why it matters: the scheduled run acts as the deployment's catalog tenant
+/// (D3), so without this a member of another tenant holding `alert:write`
+/// could save a rule over `serving.*` and be delivered the catalog's number
+/// at the target they chose. The gate is the person's own reach — the same
+/// question Query Studio and every dashboard path already ask.
+///
+/// The statement is built by `lakehouse_alerts::statement_for_input`, which
+/// normalizes with the save's own `normalize_input` and then calls the very
+/// builders the run calls (`mart_statement`/`metric_statement`): one builder,
+/// no second copy (`AGENTS.md` rule 4). A rule that reads no table of its own
+/// (digest, freshness, connector, pipeline, chart) has nothing to gate.
+///
+/// The actor is the one every signed-in site of this slice uses: the person
+/// as themselves, the request's `X-Tenant` honoured — and a job with no user
+/// as the deployment's catalog tenant (`SEC-50` R4). The build's own errors
+/// are classified exactly as `save_rule`'s callers classify them, so a rule
+/// that could not be saved anyway reads the same here as there.
+///
+/// # Errors
+///
+/// The gate's own: 404 with `SEC-20`'s sentence for a table the saving person
+/// may not read; 422 with D6's sentence for a job in a deployment with
+/// several tenants and no catalog tenant; 503 when the deployment cannot
+/// count its tenants. The builder's errors, classified as the save's are.
+async fn gate_rule_statement(
+    state: &AppState,
+    principal: Option<&Principal>,
+    headers: &HeaderMap,
+    input: &AlertRuleInput,
+) -> Result<(), ApiError> {
+    let Some(sql) = lakehouse_alerts::statement_for_input(&state.clickhouse, input)
+        .await
+        .map_err(|err| {
+            upstream_error::alert(&upstream_error::DATABASE, &err)
+                .into_api_error(upstream_error::FailedAs::BadRequest)
+        })?
+    else {
+        return Ok(());
+    };
+    crate::routes::query::StatementGate::clickhouse(
+        state,
+        crate::routes::gold::gold_export_gate_actor(principal, headers),
+    )
+    .check(&sql)
+    .await
 }
 
 /// The check on a stored rule that an update or a delete acts on (`SRC-7`
@@ -443,12 +499,13 @@ async fn authorise_digest_board(
 /// 401, 403 or 404 from [`authorise_rule_scope`].
 pub async fn create(
     State(state): State<AppState>,
+    headers: HeaderMap,
     principal: Option<Extension<Principal>>,
     body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
     let mut input = parse_body(&body)?;
     let caller = principal.as_ref().map(|Extension(p)| p);
-    authorise_rule_create(&state, caller, &input).await?;
+    authorise_rule_create(&state, caller, &headers, &input).await?;
     // BI-19 part C (C3): the router's floor is "signed in"; the permission, the
     // chart and the owner are settled here.
     crate::routes::chart_alerts::authorise_save(&state, caller, None, None, &mut input).await?;
@@ -471,6 +528,7 @@ pub async fn create(
 /// `SRC-7` rule kinds, a 401, 403 or 404 from [`authorise_rule_update`].
 pub async fn update(
     State(state): State<AppState>,
+    headers: HeaderMap,
     principal: Option<Extension<Principal>>,
     body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
@@ -479,7 +537,7 @@ pub async fn update(
         return Err(ApiError::BadRequest("id is required".to_owned()).into());
     };
     let caller = principal.as_ref().map(|Extension(p)| p);
-    authorise_rule_update(&state, caller, &id, &input).await?;
+    authorise_rule_update(&state, caller, &headers, &id, &input).await?;
     let stored = crate::routes::chart_alerts::stored_rule(&state, &id).await?;
     crate::routes::chart_alerts::authorise_save(
         &state,
@@ -1839,10 +1897,29 @@ mod tests {
         use super::super::*;
         use crate::config::Config;
 
-        fn state_for(ch_url: &str) -> AppState {
+        /// A state over `pool` and a `ClickHouse` at `ch_url`, naming the
+        /// catalog's own tenant: the rule these tests save reads
+        /// `serving.mart_wisman`, so the tenant gate has to pass for the
+        /// handler to reach the webhook check this test is about (`SEC-50`
+        /// slice 2 M11 — a fixture change, no assertion weakened).
+        fn state_for(pool: &sqlx::PgPool, ch_url: &str) -> AppState {
+            let options = pool.connect_options();
+            let url = format!(
+                "postgres://{}:postgres@{}:{}/{}",
+                options.get_username(),
+                options.get_host(),
+                options.get_port(),
+                options
+                    .get_database()
+                    .expect("#[sqlx::test] always targets a named database"),
+            );
             let mut env = HashMap::new();
-            env.insert("DATABASE_URL".to_owned(), "not a postgres url".to_owned());
+            env.insert("DATABASE_URL".to_owned(), url);
             env.insert("CH_URL".to_owned(), ch_url.to_owned());
+            env.insert(
+                "CATALOG_TENANT_ID".to_owned(),
+                "11111111-1111-4111-8111-000000000001".to_owned(),
+            );
             AppState::new(Config::from_map(&env).expect("a valid test Config"))
         }
 
@@ -1864,14 +1941,14 @@ mod tests {
             Bytes::from(serde_json::to_vec(&rule).expect("serialisable"))
         }
 
-        #[tokio::test]
-        async fn saving_an_internal_webhook_is_a_400_with_the_fixed_message() {
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn saving_an_internal_webhook_is_a_400_with_the_fixed_message(pool: sqlx::PgPool) {
             let ch = MockServer::start().await;
             Mock::given(method("POST"))
                 .respond_with(ResponseTemplate::new(200).set_body_string(""))
                 .mount(&ch)
                 .await;
-            let state = state_for(&ch.uri());
+            let state = state_for(&pool, &ch.uri());
             for target in [
                 "http://127.0.0.1:8080/x",
                 "http://10.1.2.3/x",
@@ -1883,7 +1960,7 @@ mod tests {
                     let result = if update {
                         update_rule(&state, bytes).await
                     } else {
-                        create(State(state.clone()), None, bytes).await
+                        create(State(state.clone()), HeaderMap::new(), None, bytes).await
                     };
                     let Err(rejection) = result else {
                         panic!("{target} must be refused");
@@ -1909,7 +1986,7 @@ mod tests {
         }
 
         async fn update_rule(state: &AppState, bytes: Bytes) -> ApiResult<ApiJson<Value>> {
-            update(State(state.clone()), None, bytes).await
+            update(State(state.clone()), HeaderMap::new(), None, bytes).await
         }
     }
 
@@ -2553,6 +2630,265 @@ mod alert_run_tenant_scope {
 }
 
 #[cfg(test)]
+mod save_tenant_scope {
+    //! `SEC-50` slice 2 D7a (M7): a mart or metric rule is gated as the
+    //! person saving it.
+    //!
+    //! The scheduled run acts as the deployment's catalog tenant (D3), so
+    //! without this a member of another tenant holding `alert:write` could
+    //! save a rule over `serving.*` and be delivered the catalog's number.
+    //! The save now builds the rule's statement with the very builders the
+    //! run uses and sends it through the gate as the saving person: a
+    //! refusal is `SEC-20`'s 404, and no row is written.
+
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::collections::HashMap;
+
+    use axum::body::Bytes;
+    use axum::extract::{Extension, State};
+    use axum::http::HeaderMap;
+    use sqlx::PgPool;
+    use uuid::Uuid;
+    use wiremock::matchers::{body_string_contains, method};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::*;
+
+    /// The tenant that owns the shared catalog in this deployment.
+    const CATALOG_TENANT: &str = "11111111-1111-4111-8111-000000000001";
+    /// Another tenant of the same deployment.
+    const OTHER_TENANT: &str = "11111111-1111-4111-8111-000000000002";
+    /// `SEC-20`'s refusal of the mart both rules read, byte for byte.
+    const REFUSAL: &str = "Table not found or not available to your organisation: serving.mart_x";
+
+    /// A state over `pool` and a `ClickHouse` at `ch_url`, naming the
+    /// catalog's tenant: the deployment holds several tenants, and the gate
+    /// has to be able to say which one owns the shared catalog.
+    fn state_for(pool: &PgPool, ch_url: &str) -> AppState {
+        let options = pool.connect_options();
+        let url = format!(
+            "postgres://{}:postgres@{}:{}/{}",
+            options.get_username(),
+            options.get_host(),
+            options.get_port(),
+            options
+                .get_database()
+                .expect("#[sqlx::test] always targets a named database"),
+        );
+        let mut env = HashMap::new();
+        env.insert("DATABASE_URL".to_owned(), url);
+        env.insert("CH_URL".to_owned(), ch_url.to_owned());
+        env.insert("CATALOG_TENANT_ID".to_owned(), CATALOG_TENANT.to_owned());
+        AppState::new(Config::from_map(&env).expect("a valid test Config"))
+    }
+
+    /// A person holding `alert:write` and belonging to [`OTHER_TENANT`] only.
+    fn other_tenant_engineer() -> Principal {
+        Principal {
+            id: PrincipalId::User(Uuid::from_u128(21)),
+            tenant_ids: vec![OTHER_TENANT.parse().expect("a seeded tenant id")],
+            display_name: "Other tenant engineer".to_owned(),
+            permissions: lakehouse_auth::PermissionSet::parse("alert:write"),
+            provider: "session".to_owned(),
+            must_change_password: false,
+            role_names: Vec::new(),
+        }
+    }
+
+    /// The engine a metric rule's statement is built from: the metric, its
+    /// mart and its columns; every other statement (the rule read, the
+    /// `INSERT`) answers `200` with no rows.
+    async fn engine() -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("FROM console.bi_metric"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "meta": [],
+                "data": [{
+                    "id": "m_demo", "name": "visits", "label": "Visits",
+                    "description": "", "source_kind": "mart", "source_id": "mart_x",
+                    "formula": "sum(visitors)", "filters_json": "[]",
+                    "time_column": "", "grain": "", "format": "number",
+                    "created_by": "ui", "updated_at": "",
+                }],
+                "rows": 1,
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("FROM system.tables"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "meta": [], "data": [{ "n": "1" }], "rows": 1
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("FROM system.columns"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "meta": [],
+                "data": [{ "name": "visitors", "type": "UInt32" }],
+                "rows": 1,
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// The inserts the engine was sent, if any.
+    async fn alert_rule_inserts(server: &MockServer) -> usize {
+        server
+            .received_requests()
+            .await
+            .expect("mock records requests")
+            .iter()
+            .filter(|r| String::from_utf8_lossy(&r.body).contains("INSERT INTO console.alert_rule"))
+            .count()
+    }
+
+    fn mart_rule_body() -> Bytes {
+        Bytes::from(
+            serde_json::to_vec(&json!({
+                "name": "Mart spike",
+                "type": "alert",
+                "mart": "serving.mart_x",
+                "measure": "visitors",
+                "agg": "sum",
+                "op": ">",
+                "threshold": 10,
+                "channel": "email",
+                "target": "ops@example.com",
+            }))
+            .expect("serialisable"),
+        )
+    }
+
+    fn metric_rule_body() -> Bytes {
+        Bytes::from(
+            serde_json::to_vec(&json!({
+                "name": "Metric spike",
+                "type": "alert",
+                "metric": "visits",
+                "op": ">",
+                "threshold": 10,
+                "channel": "email",
+                "target": "ops@example.com",
+            }))
+            .expect("serialisable"),
+        )
+    }
+
+    /// A person holding `alert:write` and belonging to the catalog's own
+    /// tenant: the same rule they may save.
+    fn catalog_tenant_engineer() -> Principal {
+        Principal {
+            id: PrincipalId::User(Uuid::from_u128(22)),
+            tenant_ids: vec![CATALOG_TENANT.parse().expect("a seeded tenant id")],
+            display_name: "Catalog tenant engineer".to_owned(),
+            permissions: lakehouse_auth::PermissionSet::parse("alert:write"),
+            provider: "session".to_owned(),
+            must_change_password: false,
+            role_names: Vec::new(),
+        }
+    }
+
+    /// The other side of the same rule (`SEC-50` D2): the tenant that owns
+    /// the shared catalog saves the rule, and the write happens — so the two
+    /// refusals above are the gate answering, not a gate that refuses
+    /// everything.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn saving_a_mart_rule_as_the_catalog_tenants_member_reaches_the_write(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let server = engine().await;
+        let state = state_for(&pool, &server.uri());
+
+        let result = create(
+            State(state),
+            HeaderMap::new(),
+            Some(Extension(catalog_tenant_engineer())),
+            mart_rule_body(),
+        )
+        .await;
+
+        // The row is read back from a `ClickHouse` that answers no rows, so
+        // `save_rule`'s own read-back error is the expected one — never the
+        // gate's 404, and never before the `INSERT`.
+        if let Err(rejection) = &result {
+            assert_ne!(rejection.0.status(), axum::http::StatusCode::NOT_FOUND);
+            assert_ne!(rejection.0.to_string(), REFUSAL);
+        }
+        assert_eq!(
+            alert_rule_inserts(&server).await,
+            1,
+            "the catalog's tenant saves the rule: {result:?}"
+        );
+        Ok(())
+    }
+
+    /// `SEC-50` slice 2 D7a (M7): saving a MART rule as a member of another
+    /// tenant is `SEC-20`'s 404, and nothing is written.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn saving_a_mart_rule_as_another_tenants_member_is_a_404(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let server = engine().await;
+        let state = state_for(&pool, &server.uri());
+
+        let result = create(
+            State(state),
+            HeaderMap::new(),
+            Some(Extension(other_tenant_engineer())),
+            mart_rule_body(),
+        )
+        .await;
+
+        let rejection = result.expect_err("the shared catalog is not this tenant's to read");
+        assert_eq!(rejection.0.status(), axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(rejection.0.to_string(), REFUSAL);
+        assert_eq!(
+            alert_rule_inserts(&server).await,
+            0,
+            "a refused rule must not be written"
+        );
+        Ok(())
+    }
+
+    /// `SEC-50` slice 2 D7a (M7): the same for a METRIC rule, whose
+    /// statement the run builds through the metric path — the save builds it
+    /// with the same builder.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn saving_a_metric_rule_as_another_tenants_member_is_a_404(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let server = engine().await;
+        let state = state_for(&pool, &server.uri());
+
+        let result = create(
+            State(state),
+            HeaderMap::new(),
+            Some(Extension(other_tenant_engineer())),
+            metric_rule_body(),
+        )
+        .await;
+
+        let rejection = result.expect_err("the shared catalog is not this tenant's to read");
+        assert_eq!(rejection.0.status(), axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(rejection.0.to_string(), REFUSAL);
+        assert_eq!(
+            alert_rule_inserts(&server).await,
+            0,
+            "a refused rule must not be written"
+        );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
 mod rule_scope_authorisation {
     //! `SRC-7` D7/F7: who may save a rule of the connector and upload kinds.
     //! A real ephemeral Postgres (connector tenants) and a wiremock
@@ -2664,6 +3000,7 @@ mod rule_scope_authorisation {
     ) -> Result<(), ApiError> {
         create(
             State(state.clone()),
+            HeaderMap::new(),
             principal.map(Extension),
             rule_body(kind, connector, None),
         )
@@ -2680,6 +3017,7 @@ mod rule_scope_authorisation {
     ) -> Result<(), ApiError> {
         update(
             State(state.clone()),
+            HeaderMap::new(),
             Some(Extension(principal)),
             rule_body(kind, connector, Some("al_x")),
         )
@@ -2971,6 +3309,7 @@ mod rule_scope_authorisation {
     ) -> Result<(), ApiError> {
         create(
             State(state.clone()),
+            HeaderMap::new(),
             principal.map(Extension),
             quality_body(asset, None),
         )
@@ -3015,6 +3354,7 @@ mod rule_scope_authorisation {
         // An update or a delete of a stored quality rule is refused the same way.
         let err = update(
             State(state.clone()),
+            HeaderMap::new(),
             Some(Extension(engineer())),
             quality_body(Some("silver.orders"), Some("al_x")),
         )
