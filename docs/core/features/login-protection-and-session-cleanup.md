@@ -101,3 +101,8 @@ Exceptions, each with an owner and a date:
 - [ ] `PRODUCT.md` section 2 and 3 updated
 - [ ] `BACKLOG.md`: `SEC-2` and `SEC-5` moved to Done
 - [ ] `CHANGELOG.md` entry a customer can read
+
+## QA-1 decisions (product owner, 2026-11-02)
+
+- A signed-out session's cookie is refused **at once**, and a revoked service token is refused **at once**. The 30-day cleanup only removes the rows; it is not what makes them stop working.
+- When a page states a rule but not its exact message, QA checks that the action is refused (or shown) and that the message names the rule. The wording itself is not tested. Defaults the planner wrote on a page count as decided unless the owner changes them.
