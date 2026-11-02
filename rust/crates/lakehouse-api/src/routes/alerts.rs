@@ -1,8 +1,17 @@
-//! `GET/POST/PUT/DELETE /api/alerts`, `GET/POST /api/alerts/run` — threshold
-//! alerts & scheduled digests.
+//! `GET/POST/PUT/DELETE /api/alerts`, `GET/POST /api/alerts/run` and
+//! `POST /api/alerts/test` — threshold alerts & scheduled digests.
 //!
 //! Ports `src/app/api/alerts/route.ts` and
 //! `src/app/api/alerts/run/route.ts`.
+//!
+//! Two doors run rules, and they answer different callers (`BI-40` D1). The
+//! scheduler's is `GET/POST /api/alerts/run`: [`run`] checks
+//! [`check_run_token`] first, so only the cron's shared token or a service
+//! identity gets through (D4), and it drives the whole tick — rules, then the
+//! quality, schema, semantic, lineage and late-pipeline passes. A person's is
+//! `POST /api/alerts/test?id=`: [`test_one`] asks [`authorise_rule_test`] who
+//! may manage that one rule and runs it through [`run_one`], the one wiring
+//! both doors (and the assistant's `run_alert_rule`) share.
 
 use std::collections::HashMap;
 use std::sync::Arc;
