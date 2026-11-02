@@ -52,6 +52,41 @@ export type InviteUserInput = {
   tenants: string[]
 }
 
+/**
+ * What `POST /api/identity/users` returns (ADM-3 D1).
+ *
+ * The server creates the account AND a `local` credential, and hands back
+ * a temporary password it generated itself — the caller never chooses one.
+ * The password is returned EXACTLY ONCE, on this response: the server
+ * keeps only the `Argon2id` hash, never logs it, never audits it, and no
+ * other route ever serves it.
+ *
+ * `User` is flattened into the response, so the object IS the user plus
+ * this one field.
+ */
+export type InviteUserResponse = User & {
+  /**
+   * The server-generated temporary password. Shown once and never
+   * recoverable: the user must change it at first sign-in.
+   */
+  temporaryPassword: string
+}
+
+/**
+ * What `POST /api/identity/users/{id}/reset-password` returns (ADM-3 D2).
+ *
+ * The same one-shot promise as the invite's temporary password: the reset
+ * hands out a new password, flags it `must_change_password`, and ends every
+ * live session the target holds.
+ */
+export type ResetPasswordResponse = {
+  /**
+   * The server-generated temporary password. Shown once and never
+   * recoverable.
+   */
+  temporaryPassword: string
+}
+
 export type CreateRoleInput = {
   name: string
   permissions: string
@@ -92,7 +127,10 @@ export interface IdentityService {
   listRoles(signal?: AbortSignal): Promise<Role[]>
   listTenants(signal?: AbortSignal): Promise<Tenant[]>
   listServiceIdentities(signal?: AbortSignal): Promise<ServiceIdentity[]>
-  inviteUser(input: InviteUserInput, signal?: AbortSignal): Promise<User>
+  inviteUser(
+    input: InviteUserInput,
+    signal?: AbortSignal
+  ): Promise<InviteUserResponse>
   createRole(input: CreateRoleInput, signal?: AbortSignal): Promise<Role>
   createTenant(input: CreateTenantInput, signal?: AbortSignal): Promise<Tenant>
   createServiceIdentity(
@@ -103,4 +141,13 @@ export interface IdentityService {
     id: string,
     signal?: AbortSignal
   ): Promise<RotateServiceIdentityResponse>
+  /**
+   * Hand an existing user a new temporary password (ADM-3 D2). The server
+   * generates it and returns it once; the reset also ends every live
+   * session the target holds.
+   */
+  resetPassword(
+    id: string,
+    signal?: AbortSignal
+  ): Promise<ResetPasswordResponse>
 }

@@ -98,3 +98,17 @@ f0fe3cd464cc5f115c92cc18d1b629a4681c670e:rust/crates/lakehouse-api/tests/fixture
 # matches no object in the repository (`git cat-file -t` fails), and the
 # next commit (6817e10a) cut it to 12 characters. Planner, 2026-10-15.
 b9c71cb33dd7f90d4bbf071a8ee282478117e8e4:docs/superpowers/plans/2026-10-08-sec-18-no-default-credentials.md:generic-api-key:536
+
+# PR #341 gitleaks: the two fake passwords in `users-page.test.tsx`. The
+# commit that introduced the file used random-looking literals, so the
+# `generic-api-key` rule (the `PASSWORD` keyword plus a high-entropy
+# value) matched them. They were never a credential: the test stub returns
+# them as the server-generated password and the test asserts on that same
+# constant, so the value is not used, stored or sent anywhere. Replaced in
+# commit a85fa55b by obviously fake, low-entropy strings
+# ("test-only-temporary-password", "test-only-reset-password"), which the
+# rule does not match. History is not rewritten (no force-push), so these
+# two exact fingerprints stay baselined; the same literal in a NEW commit
+# still turns the scan red.
+d16d0082c42c84c79128dc186f55dbe3379c46bc:src/features/admin/users-page.test.tsx:generic-api-key:46
+d16d0082c42c84c79128dc186f55dbe3379c46bc:src/features/admin/users-page.test.tsx:generic-api-key:47

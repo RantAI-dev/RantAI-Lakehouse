@@ -56,7 +56,8 @@ nothing recorded that it had.
    high-risk action. The step is marked "pending approval" and links to
    Approvals; nothing happens until a person decides there.
 8. Approve a waiting action on Approvals. The action runs once, and only if
-   the approver holds the permission the action itself needs.
+   the approver holds the permission the action itself needs — and only if
+   the approver is somebody other than the person who asked for it.
 9. Find an old conversation. History lists the signed-in user's
    conversations, newest first and grouped by recency, with a search over
    titles and messages and a filter for Ask or Build.
@@ -112,6 +113,7 @@ refused with the permission it lacks.
 | 4 | A high-risk call runs at most once | The approval is decided under a row lock, so a second decision on the same approval is refused and the tool runs once | ADR 0012 decision 3 |
 | 5 | The approver's own permission is checked again | `agent:approve` is not "may do everything a person may approve": without the permission the action itself needs, the decision is recorded and the action does not run | ADR 0012 decision 3 |
 | 6 | Everything is written to the audit | One immutable row per gate decision and per executed tool call, with secrets in the arguments replaced by `[redacted]` | ADR 0012 decision 4 |
+| 7 | The requester cannot decide their own approval | A person who asked for a high-risk action cannot approve it: the API refuses the decision with 403 and the request waits for somebody else. A catalog access request obeys the same rule | `SEC-57`, product owner 2026-11-02 |
 
 ## Limits to tell a customer
 
@@ -131,6 +133,11 @@ refused with the permission it lacks.
 - A change that only touches the lakehouse waits for the Confirm button in
   the chat. A high-risk change waits in Approvals. There is no path that
   skips both.
+- You cannot approve your own approval. The person whose chat asked for a
+  high-risk action may not approve it, and the same rule covers a catalog
+  access request. On an installation where one person is the only holder of
+  the approval permission, that person's own high-risk requests cannot be
+  approved by anybody: there is no break-glass, and that is deliberate.
 - The assistant may run at most eight rounds of the model for one answer,
   and at most three follow-up messages after the message a person typed.
 - The answer is streamed; the reasoning can be shown as it comes. An answer
@@ -153,9 +160,11 @@ Fail or Not run with the reason. A step not performed is never Pass.
 **Before starting:** the API, the console and the model endpoint are
 running; you have a Platform Admin login and an Analyst login (the seeded
 Analyst holds `query:read`, `catalog:read` and `lineage:read` and nothing
-else). Sign in as the Platform Admin and ask "Which tables are in the
-catalog?" — that works only with a model endpoint, so a refusal here means
-the rest of the list cannot be run.
+else). `AI-18-AC28` needs one more: a second principal who also holds the
+approval permission, because it checks that the requester is refused and
+that somebody else may decide. Sign in as the Platform Admin and ask
+"Which tables are in the catalog?" — that works only with a model endpoint,
+so a refusal here means the rest of the list cannot be run.
 
 | ID | Do this | Expect | Result |
 | --- | --- | --- | --- |
@@ -186,6 +195,7 @@ the rest of the list cannot be run.
 | `AI-18-AC25` | (operator) Unset `LLM_KEY` and restart the API service; ask a question | The question is refused with "AI Copilot is unavailable" and the reference id; the page does not show a made-up answer | |
 | `AI-18-AC26` | Open the Audit page and look for the conversation of `AI-18-AC2` | The list holds an event for every tool call of that conversation, with the action that was run | |
 | `AI-18-AC27` | Ask a question about a table that has a masking policy (the setup of `SEC-9-AC1`) | The answer shows the masked value, not the raw one | |
+| `AI-18-AC28` | As A, ask for a high-risk action; then, as A, open that row on Approvals and try to approve it. Then, as B (a second principal with approval rights), approve the same row | As A the Approve and Reject buttons are disabled and the API refuses the decision (403, "tidak boleh menyetujui permintaan milik sendiri"); the action never runs. As B the action runs once, exactly as in `AI-18-AC12` | |
 
 **Acceptor** (not the Owner): __________ **Date:** ______ **Build:** ______
 
@@ -199,21 +209,16 @@ The code does not settle these, so they are not decided here.
    question is sent?** Today the only sign is the refusal after the question
    was sent (`AI-18-AC25`). A line on Home, or in the status area, would be
    a change to the console and a decision about what it shows.
-2. **May the person who asked for an approval approve it?** A chat that
-   wants a high-risk action creates an approval; the Approvals page refuses a
-   self-approval only for a catalog access request, not for a tool call, and
-   the API does not refuse it either. Whether the requester may decide
-   their own request is a rule the product owner has to set.
-3. **Where should a conversation live in the navigation?** Today the
+2. **Where should a conversation live in the navigation?** Today the
    conversation is at `/copilot` and the navigation entry is "History"
    (`/copilot/history`), and Home is where a conversation starts. Whether
    `/copilot` deserves its own entry is a navigation question.
-4. **Should a chat that was had with a colleague be shareable?** Today a
+3. **Should a chat that was had with a colleague be shareable?** Today a
    conversation belongs to one person and cannot be seen by another. The
    product says the assistant is the way the team works; sharing a
    conversation is not built and its rules (read-only? a copy? who sees the
    tool steps?) are not decided.
-5. **What is the assistant's own name in the interface?** The screens say
+4. **What is the assistant's own name in the interface?** The screens say
    "AI Copilot", "Copilot" and "AI Copilot is unavailable" in three
    different places.
 
