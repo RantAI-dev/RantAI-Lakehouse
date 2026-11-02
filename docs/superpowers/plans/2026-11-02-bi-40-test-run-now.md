@@ -244,3 +244,21 @@ was left as found).
 - **`POST /api/alerts/test` on a real deployment** (a browser session against a
   live ClickHouse/SMTP) was not exercised; the integration tests use a wiremock
   `ClickHouse` and an unconfigured SMTP.
+
+### Review round 1 (planner, 2026-11-02, at `47a4622d`)
+
+- **T1 (D4).** One helper, `run_one`, runs a rule for both the scheduler and the test, and `run_alert_rule` no longer keeps its own copy of the sources.
+- **T2 (D1–D3, D6).**
+  - `POST /api/alerts/test` is `Policy::RequiresAuth`, and the handler decides: 404 for a rule the caller cannot see, 403 without `alert:write` on a rule that is not their own chart alert. That is the same shape as `POST /api/alerts`.
+  - The scheduler's `/api/alerts/run` still sits behind `check_run_token`, so it is not weakened.
+  - `route_auth` asserts the new row (75 tests).
+- **T3 (D7).** The tool schema fixture is regenerated with one hunk (the description only), and the AI-15 case `alert_test_run_now` is added. **AI team:** review that hunk.
+- **T4 (D5).** The console's per-rule "Test", and the 403/404 sentences. The global "Run all now" is removed.
+- **D-default "real run" holds** until the owner answers. A test sends a real delivery, once.
+- **Counts (the developer's):**
+  - `alert_test_route`: 6; `chart_alerts`: 11; `route_auth`: 75;
+  - `--lib` `policy`: 71, `ai::tools::alerts`: 5, `registry`: 39;
+  - console: 164; `ai_eval`: 182.
+- **Not verified:** a real delivery and the AI-15 model run, with the reasons given.
+
+**Open: no BLOCKER, no SHOULD-FIX.** The merge waits for the PR's CI.
