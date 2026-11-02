@@ -126,3 +126,14 @@ the scope):
   force-pushed.
 
 ## 5. Review (planner appends below)
+
+### Planner decision on the developer report (2026-11-02, at `a4e48156`)
+
+**The developer is right.** Section 3's "Geist comes from the `geist` package" was wrong. `design-system/fonts/fonts.ts:22` imports `Geist` and `Geist_Mono` from `next/font/google`, and there is no `geist` dependency. Option 1 is chosen:
+
+- **D5.** Geist and Geist Mono (OFL-1.1, from vercel/geist-font's release) are committed as latin `woff2` files under `src/app/fonts/geist/`, each with its `OFL.txt`. `design-system/fonts/fonts.ts` loads them through `next/font/local`, keeping the same CSS variables (`--font-sans`, `--font-mono`) and the same `preload` and `display`. The README gains their source and version.
+  - The design-system file may import from `src/app/fonts/geist/` by a relative path. If the design system must stay self-contained, put the files in `design-system/fonts/geist/` instead, and say which one you chose and why.
+- **D3 is widened.** The no-`next/font/google` test reads `src/` AND `design-system/`.
+- No new npm dependency (option 2 is rejected: it adds a dependency to remove a download).
+
+The T1 acceptance is unchanged: the offline build, with `--network none`, must exit 0.
