@@ -317,3 +317,16 @@ git status                                                            # clean
 
 
 **Migration number (planner, 2026-11-02):** this plan uses `0118`. `AI-23` runs after it and uses `0119`.
+
+### Review round 1 (planner, 2026-11-02, at `5c4a3db8`)
+
+- **T1.** Migration `0118` has a why-header and only widens `approval_item_kind_shape_check`, so that a `tool_call` row may now carry `requested_by_user_id`. `access` rows keep requiring it.
+- **T2.**
+  - `refuse_own_request` lives in `routes/agents.rs`, and both decide routes call it. The catalog check moved there, so it is not duplicated (rule 4).
+  - It refuses with `PermissionDenied`, keeping the existing catalog refusal's wording.
+  - The requester is recorded by the chat, by `POST /api/ai/tool` and by a run a person started. Scheduled runs and service identities record none, so anyone may decide them (plan default).
+- **T3.** The console disables Approve and Reject on one's own row, and the chat card says someone else must approve.
+- **Tests.** The six existing tests that approved their own approval now use a second approver and keep their assertions. That is a corrected fixture, not a weakened test.
+- The developer ran: api `--lib` 2928, `agents_approval` 20, `route_auth` 72, `sec11_guard` 4 and `migrations_upgrade` 1, all passing, plus console 1346 passing.
+
+**Open: no BLOCKER, no SHOULD-FIX.** Merge waits for the PR's CI.
