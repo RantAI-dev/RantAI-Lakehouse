@@ -254,3 +254,13 @@ offline build and the two limits (Geist's full charset, its location).
 - No new npm dependency (option 2 is rejected: it adds a dependency to remove a download).
 
 The T1 acceptance is unchanged: the offline build, with `--network none`, must exit 0.
+
+### Review round 1 (planner, 2026-11-02, at `39a55019`)
+
+- **D1/D2/D5.** All seven faces (the five dashboard and landing families, plus Geist and Geist Mono) are committed as `woff2`, 22 to 122 KB each. Each has its `OFL.txt` beside it, and the README gives each one's source, version and SHA-256. The CSS variable names are unchanged.
+- **Accepted deviation:** geist-font 1.9.0 ships no latin subset, so the full-charset variable file is used, and it is recorded. Geist lives in `design-system/fonts/`, which D5 allows, so the design-system package stays self-contained.
+- **D3.** `src/app/fonts.test.ts` fails on any `next/font/google` in `src/` or `design-system/`. The developer proved it fails on a probe file.
+- **The point of the item:** the offline build was run with `docker run --network none … next build` after removing `.next`. It exited 0 (`✓ Compiled successfully`).
+- No `docs/CI.md` change, because it lists no entry for this flake.
+
+**Open: no BLOCKER, no SHOULD-FIX.** The merge waits for the PR's CI. The frontend job is the one this fixes.
