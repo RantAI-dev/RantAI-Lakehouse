@@ -21,6 +21,7 @@
 //! anyway (there is no post, edit, delete or mention tool, by the feature
 //! page's decision).
 
+use axum::response::IntoResponse;
 use lakehouse_auth::Principal;
 use serde_json::{Map, Value, json};
 
@@ -87,8 +88,10 @@ pub(super) async fn list_dashboard_comments(
     }
     let page = match crate::routes::dashboard_comments::page_for(state, principal, &board).await {
         Ok(page) => page,
-        // The route's own sentence, classified (SEC-11: no upstream text).
-        Err(err) => return json!({ "error": err.to_string() }),
+        // The route's own status and classified body, never the error's text (SEC-11, BI-37).
+        Err(err) => {
+            return super::response_to_value(crate::error::ApiRejection(err).into_response()).await;
+        }
     };
     let total = page.comments.len();
     // The route lists oldest first, so the newest are the tail.
