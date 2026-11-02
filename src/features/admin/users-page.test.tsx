@@ -43,8 +43,13 @@ type FetchCall = {
 
 let fetchCalls: FetchCall[] = []
 
-const TEMPORARY_PASSWORD = "k7Qm-Zp4xT2vNb9wLs6dRf"
-const RESET_PASSWORD = "h3Yc-Wr8jE5uPa1sZo0mKt"
+// These stand in for the server-generated passwords the API hands out.
+// They are deliberately low-entropy and obviously fake: a random-looking
+// value here reads as a credential to the secret scanner (`generic-api-key`
+// on the `PASSWORD` keyword), and a test fixture must never look like a
+// leaked secret. PR #341 gitleaks.
+const TEMPORARY_PASSWORD = "test-only-temporary-password"
+const RESET_PASSWORD = "test-only-reset-password"
 
 const ROW = {
   id: "11111111-1111-4111-8111-000000000001",
