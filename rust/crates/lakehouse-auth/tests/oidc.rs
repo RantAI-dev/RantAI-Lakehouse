@@ -567,6 +567,97 @@ async fn jit_links_to_an_existing_user_with_the_same_email(pool: PgPool) -> sqlx
     Ok(())
 }
 
+/// ADM-4 D4: a deactivated user cannot sign in through `OIDC`. The
+/// identity provider says WHO the caller is; the ACCOUNT decides whether
+/// they may act, and a deactivated one may not — on this path exactly as
+/// on the password and the session paths.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_deactivated_user_is_refused_at_an_oidc_sign_in(pool: PgPool) -> sqlx::Result<()> {
+    let server = MockServer::start().await;
+    let key = TestKey::generate("kid-1");
+    mount_jwks(&server, &[&key]).await;
+    let auth = authenticator(&server, pool.clone(), Duration::from_secs(300), false);
+
+    // A user an administrator switched off, with an `OIDC` identity
+    // already linked to them.
+    let user_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO app_user (id, name, email, status) \
+         VALUES ($1, 'Switched Off', 'switched-off@meridian.example', 'inactive')",
+    )
+    .bind(user_id)
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO auth_identity (provider, external_subject, app_user_id, password_hash) \
+         VALUES ('oidc:test', 'switched-off-subject', $1, NULL)",
+    )
+    .bind(user_id)
+    .execute(&pool)
+    .await?;
+
+    let token = sign(
+        &Claims::valid("switched-off-subject"),
+        &key,
+        Algorithm::RS256,
+    );
+    let err = auth
+        .authenticate(&Credential::Bearer(Secret::new(token)))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, AuthError::InvalidCredentials));
+    Ok(())
+}
+
+/// ADM-4 D4: a deactivated user is NOT re-provisioned by `JIT`. Signing
+/// in through the identity provider with the email of a deactivated
+/// account must not create a second, ACTIVE account with that email —
+/// that would be a way around the deactivation with nothing but the
+/// identity provider.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_deactivated_user_is_not_re_provisioned_by_jit(pool: PgPool) -> sqlx::Result<()> {
+    let server = MockServer::start().await;
+    let key = TestKey::generate("kid-1");
+    mount_jwks(&server, &[&key]).await;
+    let auth = authenticator(&server, pool.clone(), Duration::from_secs(300), true);
+
+    sqlx::query(
+        "INSERT INTO app_user (id, name, email, status) \
+         VALUES ($1, 'Switched Off', 'switched-off-jit@meridian.example', 'inactive')",
+    )
+    .bind(uuid::Uuid::new_v4())
+    .execute(&pool)
+    .await?;
+
+    let mut claims = Claims::valid("brand-new-subject-for-a-deactivated-account");
+    claims.email = Some("switched-off-jit@meridian.example");
+    let token = sign(&claims, &key, Algorithm::RS256);
+    let err = auth
+        .authenticate(&Credential::Bearer(Secret::new(token)))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, AuthError::InvalidCredentials));
+
+    // No second account was created, and the deactivated one was neither
+    // re-activated nor linked to.
+    let users: Vec<(String, String)> =
+        sqlx::query_as("SELECT email, status FROM app_user WHERE email = $1")
+            .bind("switched-off-jit@meridian.example")
+            .fetch_all(&pool)
+            .await?;
+    assert_eq!(users.len(), 1, "no second account: {users:?}");
+    assert_eq!(users[0].1, "inactive");
+    let identities: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM auth_identity WHERE app_user_id IN \
+         (SELECT id FROM app_user WHERE email = $1)",
+    )
+    .bind("switched-off-jit@meridian.example")
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(identities, 0, "no identity was linked to the account");
+    Ok(())
+}
+
 /// A mapped `IdP` group grants its role's permissions on top of whatever the
 /// user's locally-assigned roles already grant (union, not replacement) —
 /// see `OidcAuthenticator::mapped_permissions`'s doc comment for why.
