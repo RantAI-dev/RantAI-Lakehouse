@@ -41,6 +41,10 @@ on:
       - ".github/workflows/release.yml"
       - "ops/release/**"
       - "Dockerfile.frontend"
+      # The console image's build context: `.dockerignore` decides what the
+      # console build sees, so a PR that edits it changes the image the dry
+      # run builds and the install proof checks (WEB-2).
+      - ".dockerignore"
       - "rust/Dockerfile"
       - "dagster/Dockerfile"
       - "ops/oidc-mock/**"
@@ -1418,6 +1422,19 @@ jobs:
           curl -fsS http://127.0.0.1:8080/health/ready | jq .
           echo "the console:"
           curl -fsS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:3000/
+          # WEB-2: an installed Lakehouse does not serve the landing page.
+          # The product owner decided on 2026-11-02 that the page is a
+          # separate product page and must not be available on an install;
+          # the console image excludes `src/app/landing` and
+          # `src/features/landing`, so the route is not in the image and
+          # the path answers with the console's page-not-found. A 200 here
+          # means the page is back in the install, and the job fails.
+          landing_status="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3000/landing)"
+          echo "the landing page: $landing_status"
+          if [ "$landing_status" != "404" ]; then
+            echo "an install must not serve the landing page (WEB-2): got $landing_status" >&2
+            exit 1
+          fi
 
       # A release install runs the `dagster` profile (REL-2 S4b review
       # round 3 BLOCKER 3, decision D22): the Dagster services carry

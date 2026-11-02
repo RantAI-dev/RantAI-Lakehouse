@@ -76,6 +76,16 @@ that lost its registry:
     after the store switch;
   - the dry run's registry is pinned by digest and is waited for.
 
+And two more since WEB-2, from the product owner's decision of
+2026-11-02 that an installed Lakehouse does not serve the landing
+page:
+
+  - the console image's build context (`.dockerignore`) keeps the
+    landing page's two folders out, so no console image carries the
+    route; and
+  - the install proof asks for `/landing`'s status and fails the job
+    unless it is 404.
+
 The workflow is parsed with PyYAML (`pyyaml==6.0.3`, installed by the jobs
 that run these tests). The checks are run against synthetic workflows too,
 so a check that cannot fail is itself a failure. No network, no repository:
@@ -271,6 +281,25 @@ REGISTRIES = (
     "quay.io",
     "production.cloudflare.docker.com",
 )
+
+# The console image's build context: `.dockerignore` decides what the
+# console build sees, because the console is built from the repository
+# ROOT (WEB-2).
+DOCKERIGNORE_PATH = REPO_ROOT / ".dockerignore"
+
+# The landing page's two folders. The product owner decided on
+# 2026-11-02 that the page is a separate product page and that an
+# installed Lakehouse must not serve it, so no console image carries
+# them (WEB-2).
+LANDING_PATHS = ("src/app/landing", "src/features/landing")
+
+# The step of the proof job that asks the console what it answers.
+CONSOLE_STEP = "The stack is ready and the console answers"
+
+# The path the landing page is served at, and the status it must answer
+# on an install: the console's page-not-found.
+LANDING_PATH = "/landing"
+LANDING_NOT_FOUND = "404"
 
 # A workflow with a signing secret in a job-level `env:`.
 SYNTHETIC_JOB_SECRET = """
@@ -524,6 +553,37 @@ jobs:
         run: sudo systemctl restart docker
       - name: Start the registry
         run: docker run -d --name registry -p 5000:5000 registry:2
+"""
+
+# A workflow whose install proof asks the console what it answers, but
+# never asks about the landing page (WEB-2).
+SYNTHETIC_PROOF_WITHOUT_THE_LANDING_PAGE = """
+name: Synthetic
+on: workflow_dispatch
+jobs:
+  install-proof:
+    runs-on: ubuntu-latest
+    steps:
+      - name: The stack is ready and the console answers
+        run: |
+          set -euo pipefail
+          curl -fsS -o /dev/null -w '%{http_code}\\n' http://127.0.0.1:3000/
+"""
+
+# A workflow whose pull-request trigger does not run for a change to the
+# console image's build context (WEB-2).
+SYNTHETIC_WITHOUT_THE_BUILD_CONTEXT_IN_THE_PATHS = """
+name: Synthetic
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/release.yml"
+jobs:
+  dry-run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Free runner disk
+        run: docker image prune -af
 """
 
 # A workflow whose proof pulls an image by its digest and then saves it
@@ -1290,6 +1350,69 @@ def air_gap_problems(document: dict[str, Any]) -> list[str]:
     return problems
 
 
+def pull_request_paths(document: dict[str, Any]) -> list[str]:
+    """The paths a pull request must touch for the workflow to run.
+
+    PyYAML reads the `on:` key as the boolean `True`, because YAML 1.1
+    spells "on" as a boolean.
+    """
+    triggers = document.get(True) or document.get("on") or {}
+    pull_request = triggers.get("pull_request") or {}
+    return [str(path) for path in (pull_request.get("paths") or [])]
+
+
+def dockerignore_patterns(text: str) -> list[str]:
+    """The patterns of a `.dockerignore`, without its comments."""
+    return [
+        line.strip()
+        for line in text.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+
+
+def dockerignore_excludes(text: str, path: str) -> bool:
+    """Whether a `.dockerignore` keeps a path out of the build context.
+
+    Docker's rule is that the LAST matching pattern wins, and a pattern
+    that starts with `!` re-includes what an earlier one excluded. So a
+    later `!src/app/landing` would undo the exclusion, and this answers
+    the question the build actually asks.
+    """
+    excluded = False
+    for pattern in dockerignore_patterns(text):
+        negated = pattern.startswith("!")
+        if negated:
+            pattern = pattern[1:]
+        pattern = pattern.rstrip("/")
+        if pattern == path or path.startswith(f"{pattern}/"):
+            excluded = not negated
+    return excluded
+
+
+def landing_proof_problems(document: dict[str, Any]) -> list[str]:
+    """Every way the install proof can fail to check the landing page.
+
+    An installed Lakehouse must not serve the landing page (WEB-2): the
+    console image excludes it, so the path answers with the console's
+    page-not-found. A proof that does not ask for the status, or that
+    does not fail the job unless the status is 404, lets the page back
+    into the install unnoticed.
+    """
+    try:
+        step = step_named(document, "install-proof", CONSOLE_STEP)
+    except AssertionError:
+        return ["the proof has no step that asks the console"]
+    commands = shell_commands(str(step.get("run") or ""))
+    problems: list[str] = []
+    if f"127.0.0.1:3000{LANDING_PATH}" not in commands:
+        problems.append("the proof does not ask for the landing page's status")
+    if LANDING_NOT_FOUND not in commands:
+        problems.append("the proof does not name the status the page must answer")
+    if "exit 1" not in commands:
+        problems.append("the proof does not fail the job")
+    return problems
+
+
 def dagster_assertion_problems(
     document: dict[str, Any], job_name: str, step_name: str
 ) -> list[str]:
@@ -1994,6 +2117,63 @@ class ReleaseWorkflowTest(unittest.TestCase):
         """The registry the job starts is the registry the job pushes to."""
         env = self.document["jobs"]["dry-run"].get("env") or {}
         self.assertEqual(env.get("RELEASE_REGISTRY"), DRY_RUN_REGISTRY)
+
+    def test_the_console_image_does_not_carry_the_landing_page(self) -> None:
+        """WEB-2: an installed Lakehouse does not serve `/landing`.
+
+        The product owner decided on 2026-11-02 that the landing page is a
+        separate product page and that an install must not offer it. The
+        console image is built from the repository ROOT, so the two
+        folders that hold the page have to be out of its build context —
+        otherwise every console image (the release's, the staging
+        deploy's, compose's) carries the route.
+        """
+        text = DOCKERIGNORE_PATH.read_text(encoding="utf-8")
+        for path in LANDING_PATHS:
+            self.assertTrue(
+                dockerignore_excludes(text, path),
+                f"the console image would carry {path}",
+            )
+
+    def test_a_build_context_that_carries_the_landing_page_is_reported(self) -> None:
+        """The check above must be able to fail."""
+        text = "node_modules\n.next\n"
+        for path in LANDING_PATHS:
+            self.assertFalse(dockerignore_excludes(text, path), path)
+
+    def test_a_later_negation_would_undo_the_exclusion(self) -> None:
+        """Docker's last match wins, and `!` re-includes."""
+        text = "src/app/landing\n!src/app/landing\n"
+        self.assertFalse(dockerignore_excludes(text, "src/app/landing"))
+
+    def test_a_change_to_the_build_context_runs_the_dry_run(self) -> None:
+        """`.dockerignore` decides what the console image is made of.
+
+        A PR that edits it changes the image the dry run builds and the
+        install proof checks, so the workflow has to run for it (WEB-2).
+        """
+        self.assertIn(".dockerignore", pull_request_paths(self.document))
+
+    def test_a_workflow_without_the_build_context_in_its_paths_is_reported(self) -> None:
+        """The check above must be able to fail."""
+        document = yaml.safe_load(SYNTHETIC_WITHOUT_THE_BUILD_CONTEXT_IN_THE_PATHS)
+        self.assertNotIn(".dockerignore", pull_request_paths(document))
+
+    def test_the_install_proof_checks_that_the_landing_page_is_not_served(self) -> None:
+        """WEB-2: the proof is on an installed bundle, not on a build.
+
+        The page must answer 404 there, and the job fails when it does
+        not: a 200 means the page is back in the install.
+        """
+        self.assertEqual(landing_proof_problems(self.document), [])
+
+    def test_a_proof_that_never_asks_about_the_landing_page_is_reported(self) -> None:
+        """The check above must be able to fail."""
+        document = yaml.safe_load(SYNTHETIC_PROOF_WITHOUT_THE_LANDING_PAGE)
+        self.assertIn(
+            "the proof does not ask for the landing page's status",
+            landing_proof_problems(document),
+        )
 
 
 
