@@ -433,12 +433,12 @@ export function ReportingSettingsForm({
           {canReadDeniedRoles ? (
             <section className="flex flex-col gap-1.5" aria-labelledby="settings-downloads">
               <h2 id="settings-downloads" className="text-sm font-medium">
-                Downloads
+                Block downloads for these roles
               </h2>
               <p className="text-xs text-muted-foreground">
-                Roles that may not download dashboards as PDF or data as Excel or CSV. A
-                person who holds any other role still can, and Platform Admin always can.
-                With none chosen, everyone who can see a dashboard can download it.
+                A checked role cannot download PDF, Excel, CSV, images or dashboard files. A
+                person who also holds an unchecked role still can, and Platform Admin is never
+                blocked. With none checked, everyone who can see a dashboard can download it.
               </p>
               {roleNames.map((name) => (
                 <div key={name} className="flex items-center gap-2">

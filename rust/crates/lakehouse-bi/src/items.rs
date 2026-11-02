@@ -289,9 +289,10 @@ async fn resolve(
         }));
         // The built-in board has no row until its layout is saved, and is
         // always there.
-        if wanted
-            .iter()
-            .any(|(k, id)| *k == Kind::Board && id == DEFAULT_BOARD_ID)
+        if viewer.sees_builtin()
+            && wanted
+                .iter()
+                .any(|(k, id)| *k == Kind::Board && id == DEFAULT_BOARD_ID)
             && !out.iter().any(|e| e.id == DEFAULT_BOARD_ID)
         {
             out.push(Entry {

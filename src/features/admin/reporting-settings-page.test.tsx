@@ -205,7 +205,7 @@ describe("ReportingSettingsForm", () => {
   it("lists the roles that may not download and saves the chosen ones", async () => {
     const calls = mockSettings({ ...DEFAULTS, downloadDeniedRoles: ["Viewer"] })
     render(<ReportingSettingsForm canWrite zoneList={zoneList} />)
-    expect(await screen.findByRole("heading", { name: "Downloads" })).toBeDefined()
+    expect(await screen.findByRole("heading", { name: "Block downloads for these roles" })).toBeDefined()
     const viewer = (await screen.findByRole("checkbox", { name: "Viewer" })) as HTMLElement
     await waitFor(() => expect(viewer.getAttribute("aria-checked")).toBe("true"))
     fireEvent.click(screen.getByRole("checkbox", { name: "Analyst" }))
@@ -221,7 +221,7 @@ describe("ReportingSettingsForm", () => {
     mockSettings(READER_DEFAULTS)
     render(<ReportingSettingsForm canWrite={false} zoneList={zoneList} />)
     await screen.findByLabelText("Report time zone")
-    expect(screen.queryByRole("heading", { name: "Downloads" })).toBeNull()
+    expect(screen.queryByRole("heading", { name: "Block downloads for these roles" })).toBeNull()
     expect(screen.queryByRole("checkbox", { name: "Viewer" })).toBeNull()
   })
 

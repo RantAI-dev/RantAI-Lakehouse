@@ -174,8 +174,16 @@ async fn query_metric(
                 .await
         }
         SourceKind::SqlSource => {
-            crate::routes::calc_fields::resolve(&state.clickhouse, None, Some(&found.source_id))
-                .await
+            // BI-19 B2 re-review S4-b: the metric's source is resolved as the
+            // person asking; one in a folder they cannot see is not available.
+            let who = Extension(principal.clone());
+            crate::routes::calc_fields::resolve_visible(
+                state,
+                Some(&who),
+                None,
+                Some(&found.source_id),
+            )
+            .await
         }
     };
     let source = match source {

@@ -1,9 +1,10 @@
 "use client";
 
 import * as React from "react";
+import Link from "next/link";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { useTheme } from "next-themes";
-import { ArrowRightLeft, ChartColumn, Download, GitFork, Heading, Maximize2, Minus, MousePointerClick, Move, Moon, Pencil, Plus, RefreshCw, Smartphone, SlidersHorizontal, Sparkles, Square, Table2, Trash2, Rows3 } from "lucide-react";
+import { ArrowRightLeft, Bell, MessageSquare, ChartColumn, Download, GitFork, ImageDown, Heading, Maximize2, Minus, MousePointerClick, Move, Moon, Pencil, Plus, RefreshCw, Smartphone, SlidersHorizontal, Sparkles, Square, Table2, Trash2, Rows3 } from "lucide-react";
 import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog";
 import { PageHeader } from "@/components/patterns/page-header";
 import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@rantai/design-system/ui/empty";
@@ -68,16 +69,21 @@ import { DashboardGrid, type GridItem, type TileMenuItem } from "./dashboard-gri
 import { LineDialog } from "./line-dialog";
 import { TabBar } from "./tab-bar";
 import { isSectionKind } from "./tile-card";
+import { ChartAlertDialog, type AlertChart } from "./chart-alert-dialog";
+import { chartHasLatestPoint } from "./chart-alert";
+import { tileMeasureLabels } from "@/lib/chart-shape";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { DashboardTilesSkeleton } from "./dashboard-skeleton";
 import { DrillMenu, NoteDialog, RecordsDialog, type DrillTarget } from "./drill";
 import { DrillTrail, useTileDrills } from "./tile-drills";
 import type { RecordsRequest } from "./records";
 import { forgetLastBoard, rememberLastBoard } from "./last-board";
+import { offerFor } from "./access-level";
 import { ShareDialog } from "./share-dialog";
+import { CommentsDialog } from "./comments-panel";
 import { TileBody } from "./tile-body";
 import { exportNotice } from "./table-export";
-import { downloadChartData, downloadDashboardPdf, downloadMenuKind, type DataChoice, type PdfChoice, type ReadState } from "./chart-download";
+import { downloadChartData, downloadChartPng, downloadDashboardFile, downloadDashboardPdf, downloadMenuKind, type DataChoice, type PdfChoice, type ReadState } from "./chart-download";
 import { DownloadDataDialog, DownloadPdfDialog } from "./download-dialogs";
 import { SubscriptionsDialog } from "./subscriptions-dialog";
 import { TileDataDialog, TileExpandDialog, downloadRowsCsv, hasRows, type Cell } from "./tile-dialogs";
@@ -114,6 +120,8 @@ type Payload = {
   reporting?: ReportingContext;
   /** False when every role of the viewer is switched off from downloading (BI-1); the download items are hidden. Absent from an older server: allowed. */
   canDownload?: boolean;
+  /** What the caller may do with this dashboard (`BI-19` B2); absent from an older server: the global permission decides. */
+  access?: { level: string };
   /** False when the deployment has no PDF renderer (`BI-1`, feature decision 6). Absent from an older server: not offered. */
   pdfSupported?: boolean;
   /** The dashboard's own theme and font (BI-17 part A); absent when it follows the console. */
@@ -235,6 +243,24 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   const foldersState = useService((signal) => dashboardService.listFolders(signal), []);
   const folders = React.useMemo(() => labelledFolders(foldersState.data ?? [], user?.id), [foldersState.data, user?.id]);
   const [shareOpen, setShareOpen] = React.useState(false);
+  const [commentsOpen, setCommentsOpen] = React.useState(false);
+  // BI-19 owner QA 2026-10-28, QA-3: a mention in the bell links to `?comments=1`. The dialog
+  // opens once the board is loaded (also when the reader is already on this board and only the
+  // parameter is new), and closing it removes the parameter, keeping the others.
+  const commentsAsked = searchParams.get("comments") === "1";
+  const boardLoaded = data !== null;
+  React.useEffect(() => {
+    if (commentsAsked && boardLoaded && !isDefault) setCommentsOpen(true);
+  }, [commentsAsked, boardLoaded, isDefault]);
+  const changeCommentsOpen = React.useCallback((open: boolean) => {
+    setCommentsOpen(open);
+    if (open) return;
+    const q = new URLSearchParams(searchParams.toString());
+    if (!q.has("comments")) return;
+    q.delete("comments");
+    const qs = q.toString();
+    router.replace(qs ? `${pathname}?${qs}` : pathname, { scroll: false });
+  }, [router, pathname, searchParams]);
   const [historyOpen, setHistoryOpen] = React.useState(false);
   // BI-18 part C, part 2: favourites, and "recent" noted once per dashboard opened.
   const shortcuts = useService((signal) => dashboardService.shortcuts(signal), []);
@@ -264,6 +290,8 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   // BI-14: the chart whose "Where does this come from" panel is open.
   const [lineageChart, setLineageChart] = React.useState<{ id: string; title: string } | null>(null);
   const [tileDialog, setTileDialog] = React.useState<{ kind: "data" | "expand"; id: string } | null>(null);
+  // BI-19 part C: a chart's ⋯ > "Alert me…".
+  const [alertChart, setAlertChart] = React.useState<AlertChart | null>(null);
   // Only the newest load may write state. Creating a dashboard fires a
   // reload of the board being left and then navigates to the new one; the
   // old board's response (slower: it runs the built-in tiles) used to land
@@ -726,7 +754,9 @@ export function DashboardPage({ boardId }: { boardId: string }) {
     () => placeUnboxed(charts.map((c) => ({ id: c.id, span: c.span, kind: c.kind })), layout, tabs),
     [charts, layout, tabs],
   );
-  const canWrite = hasPermission("dashboard:write");
+  // BI-19 B2: the dashboard's own level decides what is offered; the server
+  // checks every write against the same level.
+  const { canEdit: canWrite, canManage } = offerFor(data?.access?.level, hasPermission("dashboard:write"));
   const selectTab = React.useCallback((id: string) => {
     const qs = withTabParam(window.location.search, tabs, id);
     router.replace(qs ? `${pathname}?${qs}` : pathname, { scroll: false });
@@ -987,6 +1017,24 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   const [pdfOpen, setPdfOpen] = React.useState(false);
   const [subsOpen, setSubsOpen] = React.useState(false);
   const [dataFor, setDataFor] = React.useState<{ id: string; title: string } | null>(null);
+  async function downloadPng(id: string) {
+    try {
+      const fileName = await downloadChartPng(id, readState());
+      notifySuccess("Image downloaded", fileName);
+    } catch (err) {
+      notifyFailure("The image could not be made", err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  async function downloadFile() {
+    try {
+      const fileName = await downloadDashboardFile(board);
+      notifySuccess("Dashboard file downloaded", fileName);
+    } catch (err) {
+      notifyFailure("The dashboard file could not be made", err instanceof Error ? err.message : String(err));
+    }
+  }
+
   async function downloadData(id: string, choice: DataChoice) {
     const done = await downloadChartData(id, choice, readState(), tableSorts.current[id]);
     const note = exportNotice(done);
@@ -1042,6 +1090,9 @@ export function DashboardPage({ boardId }: { boardId: string }) {
         : []),
       // BI-14 (decision 1, Q6): everyone who sees a stored chart gets the item; the panel says what a person without `lineage:read` may do.
       ...(own ? [{ label: "Where does this come from", icon: <GitFork />, onSelect: () => setLineageChart({ id: spec.id, title: spec.title }) }] : []),
+      // BI-19 part C (C3): everyone who can view a stored chart may alert on it
+      // for themselves; the server decides who may send it elsewhere.
+      ...(own && !edit ? [{ label: "Alert me…", icon: <Bell />, onSelect: () => setAlertChart({ id: spec.id, title: spec.title, kind: spec.kind, measures: hasRows(cell) ? cell.columns.filter((c) => c !== spec.def?.dimension) : [], latestPoint: chartHasLatestPoint(spec.def), labels: tileMeasureLabels(spec.def?.measures, spec.y, spec.def?.steps, hasRows(cell) ? cell.metricLabels : undefined, spec.def?.aggregate) }) }] : []),
       // BI-9: a chart grouped by a part of the date (a weekday) has no rows to
       // list or range to filter; the menu says why instead of leaving the click dead.
       ...(hasRows(cell) && isGrain(cell.grain) && !isTruncation(cell.grain)
@@ -1051,7 +1102,13 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       // Excel or CSV, formatted or raw. A built-in tile has no stored definition to
       // read and keeps the rows on screen as CSV.
       ...(downloadKind === "data"
-        ? [{ label: "Download data…", icon: <Download />, onSelect: () => setDataFor({ id: spec.id, title: spec.title }) }]
+        ? [
+            { label: "Download data…", icon: <Download />, onSelect: () => setDataFor({ id: spec.id, title: spec.title }) },
+            // BI-19 part D (plan D13): the chart as a picture, drawn by the same renderer as the PDF, so only where there is one.
+            ...(data?.pdfSupported === true
+              ? [{ label: "Download PNG", icon: <ImageDown />, onSelect: () => void downloadPng(spec.id) }]
+              : []),
+          ]
         : downloadKind === "csv"
           ? [{ label: "Download CSV", icon: <Download />, onSelect: () => hasRows(cell) && downloadRowsCsv(spec.title, cell) }]
           : []),
@@ -1122,6 +1179,18 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   const filterFields = data?.filterFields ?? NO_FIELDS;
   const showFilterBar = filterFields.length > 0 || filters.length > 0;
 
+  // BI-19 owner QA 2026-10-28, QA-1: a board that never loaded (for the caller, "dashboard not
+  // found") shows the error and nothing that acts on the board: no star, menu, comments or
+  // share, and no empty-chart state. A later reload that fails keeps `data`, so it is not this.
+  if (error !== null && data === null) {
+    return (
+      <div className="flex flex-col items-start gap-3">
+        <div role="alert" className="rounded-lg border border-destructive/40 bg-destructive/5 px-4 py-3 text-sm text-destructive">{readableErrorMessage(error)}</div>
+        <Link href="/dashboards/browse" className="text-sm text-primary underline-offset-4 hover:underline">All dashboards</Link>
+      </div>
+    );
+  }
+
   // `dark` on the container themes the dashboard alone (the tokens and the
   // `dark:` variants key off an ancestor with the class); the rest of the
   // console, and anything portalled out of this element, keeps its theme.
@@ -1165,15 +1234,16 @@ export function DashboardPage({ boardId }: { boardId: string }) {
             <DashboardActionsMenu
               isDefault={isDefault}
               canWrite={canWrite}
+              canManage={canManage}
               isPrivate={Boolean(ownerId)}
               onHistory={() => setHistoryOpen(true)}
-              onTheme={hasPermission("dashboard:write") ? () => { setThemeError(null); setThemeOpen(true); } : undefined}
-              onFreshness={hasPermission("dashboard:write") ? () => { setFreshError(null); setFreshOpen(true); } : undefined}
+              onTheme={canWrite ? () => { setThemeError(null); setThemeOpen(true); } : undefined}
+              onFreshness={canWrite ? () => { setFreshError(null); setFreshOpen(true); } : undefined}
               loading={loading}
               fullscreen={fullscreen}
               autoSec={String(autoSec)}
               savedSec={String(savedSec)}
-              canSaveRefresh={refreshIsSaveable({ mayWrite: hasPermission("dashboard:write"), saved: savedSec, effective: autoSec })}
+              canSaveRefresh={refreshIsSaveable({ mayWrite: canWrite, saved: savedSec, effective: autoSec })}
               savingRefresh={savingRefresh}
               onRefresh={() => void load("1")}
               onToggleFullscreen={toggleFullscreen}
@@ -1183,12 +1253,19 @@ export function DashboardPage({ boardId }: { boardId: string }) {
               onShare={() => setShareOpen(true)}
               onExportPdf={exportPdf}
               onDownloadPdf={() => setPdfOpen(true)}
+              onExportFile={() => void downloadFile()}
               onSubscriptions={() => setSubsOpen(true)}
               pdfSupported={data?.pdfSupported === true}
               canDownload={canDownload}
               onDuplicate={() => void duplicateDashboard()}
               onDelete={() => void deleteDashboard()}
             />
+            {/* BI-19 part E: anyone who can see the dashboard can read and write comments; the server checks. */}
+            {!isDefault ? (
+              <Button size="sm" variant="outline" onClick={() => setCommentsOpen(true)}>
+                <MessageSquare className="size-4" /> Comments
+              </Button>
+            ) : null}
             {hasPermission("dashboard:write") ? (
               <Button size="sm" variant="outline" onClick={() => setParamsOpen(true)}>
                 <SlidersHorizontal className="size-4" /> Parameters
@@ -1219,7 +1296,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
             savedFilters={defaultFilters}
             onChange={applyFilters}
             dirty={rowDirty}
-            canSaveDefault={!isDefault && hasPermission("dashboard:write")}
+            canSaveDefault={!isDefault && canWrite}
             tabs={tabs}
             saving={savingDefault}
             onSaveDefault={() => void saveRowDefault()}
@@ -1395,6 +1472,16 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       {tileDialog?.kind === "data" && dialogSpec ? (
         <TileDataDialog title={dialogSpec.title} cell={data?.results[dialogSpec.id]} onClose={() => setTileDialog(null)} canDownload={canDownload} />
       ) : null}
+      {alertChart ? (
+        <ChartAlertDialog
+          open
+          onOpenChange={(open) => { if (!open) setAlertChart(null); }}
+          chart={alertChart}
+          filters={normalizeFilters(filters)}
+          userEmail={user?.email ?? null}
+          canWriteAlerts={hasPermission("alert:write")}
+        />
+      ) : null}
       {tileDialog?.kind === "expand" && dialogSpec ? (
         <TileExpandDialog spec={dialogSpec} cell={data?.results[dialogSpec.id]} dark={dark} onClose={() => setTileDialog(null)} />
       ) : null}
@@ -1402,12 +1489,13 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       {historyOpen ? (
         <VersionHistoryDialog
           boardId={board}
-          canWrite={hasPermission("dashboard:write")}
+          canWrite={canWrite}
           onOpenChange={setHistoryOpen}
           onReverted={() => { notifyDashboardsChanged(); void load(); }}
         />
       ) : null}
-      {!isDefault ? <ShareDialog board={board} dashName={dashName} open={shareOpen} onOpenChange={setShareOpen} /> : null}
+      {!isDefault ? <CommentsDialog board={board} dashName={dashName} open={commentsOpen} onOpenChange={changeCommentsOpen} /> : null}
+      {!isDefault ? <ShareDialog board={board} dashName={dashName} open={shareOpen && canManage} onOpenChange={setShareOpen} /> : null}
       {themeOpen ? (
         <ThemeFontDialog open={themeOpen} onOpenChange={setThemeOpen} theme={data?.theme} font={data?.font}
           allowedFonts={data?.reporting?.fonts ?? SHIPPED_FONT_IDS} saving={savingTheme} error={themeError} onSave={(c) => void saveThemeAndFont(c)} />
