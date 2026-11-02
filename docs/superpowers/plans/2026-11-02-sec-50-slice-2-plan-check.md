@@ -530,3 +530,22 @@ embed and the public-link board make per tile — the gate is built in `embed.rs
 
 **Console (`src/`):** no TypeScript change, as the plan's out-of-scope section says; no
 `bun` command was run because nothing under `src/` moved.
+
+### Review round 1 (planner, 2026-11-02, at `f320f54d`)
+
+- **T1–T6** (`db7a337d` … `c114567c`), built on the desktop before it went offline:
+  - one gate carrier, which the tile runner, the other signed-in sites and the delegated readers all ask;
+  - the embed reads as the deployment's catalog tenant (D3);
+  - a public link reads as the tenant that made it (D4).
+- **Migration `0120`.** It has a why-header. `tenant_id` is nullable with no backfill, so an unknown tenant is never guessed. It uses `ON DELETE SET NULL`, the same rule as `0099`.
+- **T7.** The alert run asks the gate as its actor (D3/M6). **M7 is closed per D7a:** `lakehouse-alerts` exports `mart_statement`, `metric_statement` and `statement_for_input`, both the run and the save use them, and the save is gated as the person saving. There is one builder (rule 4).
+- **T8 (M12).** The publication body gates the fingerprint read as the route's caller. The ungated token helper says why at its site.
+- **T9.** The boot warning names every gated path. `.env.example`, `OPERATIONS.md` and the feature page are updated.
+- **T10, measured.** Removing each site's check makes its tests fail: T2 2, T3 records 1, values 2, downloads 2, sources 2, T5 1, T6 3, T7 run 1 and save 2, T8 1. So the tests test the gate, not the fixture.
+- **Counts (the developer's):**
+  - `lakehouse-api` lib: 2942 passed, and every integration target is green;
+  - store: 528; alerts: 126; `gold_publication` against real ClickHouse: 14.
+  - One sqlx harness pool flake was re-run and reported, not hidden.
+- **Not verified, with the reasons given:** the M2 wall-clock benchmark (covered structurally by the once-per-request test) and the AI-15 eval.
+
+**Open: no BLOCKER, no SHOULD-FIX.** The merge waits for the PR's CI, which runs the full workspace and the G-gates.
