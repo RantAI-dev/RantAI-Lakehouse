@@ -471,7 +471,7 @@ set by the product owner and are left empty until they are.
 | `AI-20` | | 2026-10-16 | |
 | `AI-7` | | 2026-10-16 | |
 | `BI-17` | 2026-10-15 | | |
-| `BI-19` | In Acceptance | [#235](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/235), [#250](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/250) | |
+| `BI-19` | 2026-10-18 | | |
 | `BI-26` | 2026-10-18 | 2026-10-26 | |
 | `AI-8` | 2026-10-15 | | |
 | `AI-9` | 2026-10-14 | | |
