@@ -157,4 +157,47 @@ Full verification block of `AGENTS.md` once before handoff (Rust and TypeScript)
 
 ## 5. Handoff (developer appends below)
 
+### Developer report
+
+**Stopped at T4: the plan's premise does not hold in the code. No task was implemented and no code was changed.**
+
+- Section 0 says the print view mounts `ImageCard` / `WebCard`, and that they
+  then mount an `<img>` / `<iframe>` which the browser refuses by `img-src` /
+  `frame-src` (`src/features/dashboards/content-cards.tsx:22-60`).
+- The print view does not mount them at all.
+  `src/features/dashboards/render-view.tsx:157-160` renders a `<p>` with
+  `NOT_IN_PDF` ("Shown in the console only") for `spec.kind === "image" ||
+  spec.kind === "web"`, and `TileBody` — the only caller of `ImageCard` /
+  `WebCard` (`src/features/dashboards/tile-body.tsx:112-113`) — is never
+  rendered for those tiles. The file is unchanged between the plan's base
+  `9c066426` and this branch (checked with
+  `git show 9c066426:src/features/dashboards/render-view.tsx`).
+- That placeholder is a product decision, not an oversight:
+  `docs/core/features/export-pdf-excel.md` decision 3 says image and web-page
+  cards print as "Shown in the console only", its Limits section tells
+  customers "Image and web-page cards do not appear in the PDF", and
+  `render-view.test.tsx` ("prints an image or web-page card as a placeholder
+  and never mounts it") pins it.
+- T4's acceptance ("a board with a chart and an image card is not ready until
+  the image fires `load`") cannot pass, and D5 is unreachable, without
+  removing that placeholder and rendering the cards under `/render`. The plan
+  never states that product change (section 0 asserts the cards already
+  mount); it would reverse feature decision 3. T1–T3 would also be a pure
+  widening of the print view's `img-src` / `frame-src` with no card that can
+  use it, so they were not built either.
+
+Needed from the planner: either (a) the plan adds the decision to print image
+and web cards in the PDF and PNG (with decision 3 and the limits on the
+feature page updated for the owner), or (b) `BI-42` is re-scoped or withdrawn,
+because the CSP refusal in section 0 does not happen for a card the print view
+never mounts.
+
+No commit exists beyond this report. No `cargo` or `bun` check was run.
+
+### Handoff (developer, 2026-11-02)
+
+Stopped before T1 per the mismatch above. Commits: this report only. Commands
+run: `git status --short`, `git diff --cached --stat`; no build, lint or test
+command. *Not verified*: T1–T6 (not started).
+
 ## 6. Review (planner appends below)
