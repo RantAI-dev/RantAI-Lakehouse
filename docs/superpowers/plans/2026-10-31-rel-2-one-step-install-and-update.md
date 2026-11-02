@@ -2259,6 +2259,204 @@ Every cargo command went through `/home/shiro/rantai/bin/cargo-locked` (the shar
 - **The pushes**: both commits were pushed to `origin/feat/rel-2-s4b-lakehousectl-update`. No push
   was refused, so no `git pull --no-rebase` and no resolve was needed.
 
+### Fix for review S4b round 4, D23 (developer, 2026-11-02)
+
+**Commits** (branch `feat/rel-2-s4b-lakehousectl-update`, on top of the review commit `e30f2843`):
+
+| Commit | Task | What |
+| --- | --- | --- |
+| `e86cf6f2` | review round 4 BLOCKER 4 (D23) | the Dagster webserver is published on the host's loopback only, on port 3001 by default; `lakehousectl` picks no port; every reference to the UI's host port is updated |
+
+**D23 is implemented where the plan says it is.**
+
+- `docker-compose.yml`: `dagster-webserver` publishes
+  `"127.0.0.1:${DAGSTER_WEBSERVER_HOST_PORT:-3001}:3000"`. The comment at the site says why: the UI
+  has no sign-in, so anyone who can reach the port can launch runs; nothing outside the compose
+  network needs it (the API and the jobs reach the GraphQL API in-network, at
+  `http://dagster-webserver:3000/graphql`); the default is 3001, so it no longer clashes with the
+  console's 3000; an operator reaches the UI through an SSH tunnel.
+- `lakehousectl`: the free-port logic is gone, and so are its tests. The tool picks no port: it
+  never touched the console's port, and it no longer touches the webserver's.
+  `write_env(path)` and `ensure_release_profiles(dir)` no longer take an `is_free` closure,
+  `with_dagster_webserver_port` and `port_of` are gone, and `sys::port_is_free` (added in
+  `12f34f3c` for exactly that logic) is gone with them. `sys::port_is_busy` stays: the preflight
+  asks whether the host's published ports are taken.
+- The `.env` the tool writes keeps the template's value: `DAGSTER_WEBSERVER_HOST_PORT=3001` in
+  `.env.example`, and an operator's own value is the operator's.
+
+**Every reference to the Dagster UI's host port.** Changed:
+
+| Where | What it says now |
+| --- | --- |
+| `docker-compose.yml`, `dagster-webserver`'s `ports:` | `127.0.0.1:${DAGSTER_WEBSERVER_HOST_PORT:-3001}:3000`, with the reason at the site |
+| `docker-compose.yml`, `dagster-webserver`'s header comment | the API reaches the GraphQL API in-network; the `ports:` block owns the host's side |
+| `docker-compose.yml`, `console`'s `ports:` comment | the console owns 3000; the webserver is on the loopback at `DAGSTER_WEBSERVER_HOST_PORT` (3001) |
+| `.env.example`, `DAGSTER_WEBSERVER_HOST_PORT` | `3001`, with the comment: loopback only, no sign-in, nothing outside the network needs it, 3001 so it does not clash with the console |
+| `.env.example`, the `CONSOLE_HOST_PORT` comment above it | the console owns host port 3000 |
+| `README.md`, the `DAGSTER_WEBSERVER_HOST_PORT` row | default `3001`, published on the loopback only, reach it through an SSH tunnel |
+| `docs/OPERATIONS.md`, "Dagster (opt-in, P3)" | the webserver's container port is 3000; the UI is published on the loopback only at `127.0.0.1:${DAGSTER_WEBSERVER_HOST_PORT:-3001}:3000`, with the SSH tunnel |
+
+Checked and **not** changed, with the reason:
+
+- **The `ops/` gates reach the webserver IN the compose network, never through the host port**, so
+  nothing had to change and nothing was changed silently. Every one of them uses the service name:
+  `ops/g3/g3_test.py`, `ops/g3a/g3a_test.py`, `ops/g4/g4_test.py`, `ops/g6/g6_ingest_matrix_test.py`,
+  `ops/g6/g6_linklocal_test.py`, `ops/g7/g7_pipeline_test.py`, `ops/g8/g8_time_travel_test.py`,
+  `ops/gold_export/gold_export_test.py`, and the two G6 overrides
+  (`ops/g6/docker-compose.g6.override.yml`, `ops/g6/docker-compose.g6-oracle.override.yml`) —
+  `DAGSTER_URL=http://dagster-webserver:3000/graphql`. No `ops/` file publishes a host port for
+  the webserver: the only `ports:` blocks under `ops/` are a synthetic workflow's `registry:2`
+  service (`ops/release/test_release_workflow.py`) and a synthetic compose snippet in the render
+  test (`ops/release/test_render_compose.py`), and neither names the Dagster webserver. So no gate
+  can reach the webserver from outside the compose network.
+- `.github/workflows/ci.yml`: the same in-network URL; the jobs start the webserver by service name.
+- `.env.staging`: already `DAGSTER_WEBSERVER_HOST_PORT=3001` — the new default agrees with it, and
+  its comment ("Move Dagster off 3000 so the Next.js frontend can own that port") still holds.
+- **ADR 0005** (`docs/adr/0005-dagster-code-location-ownership-and-packaging.md:180`) says an
+  operator may reach the GraphQL API "at `http://dagster-webserver:3000/graphql` (in-network) or
+  `http://localhost:3000/graphql` (host)". The in-network half is still right; the host half is
+  now `http://127.0.0.1:3001/graphql`. **It is not edited here**: `AGENTS.md` gives the planner the
+  ADRs, and `docs/CODE-STANDARD.md` says a revisited ADR gains an `## Addendum (…)` — that is the
+  planner's call, so it is reported here rather than changed quietly.
+- `CHANGELOG.md`: no entry was added. No commit on this branch carries one (the D22 profile change
+  carries none either), and the `[Unreleased]` entry belongs with the release the reviewer cuts.
+
+**The tool's own tests.** The four free-port tests are gone (`the_dagster_webserver_gets_a_port_of_its_own`,
+`the_dagster_webserver_keeps_a_port_of_its_own`, `the_dagster_webserver_takes_the_first_free_port_above_the_consoles`,
+`a_webserver_that_shares_the_consoles_port_is_moved_even_by_the_update`) and three hold the rule D23
+puts in their place:
+
+| Test | What it holds |
+| --- | --- |
+| `secrets::tests::the_tool_picks_no_port_for_the_dagster_webserver` | a fresh `.env` holds the template's `3001` and the console's `3000` |
+| `secrets::tests::the_tool_adds_no_port_for_the_dagster_webserver` | an `.env` that names no webserver port gets none — the tool picks no port |
+| `secrets::tests::the_dagster_webserver_port_an_operator_set_is_kept` | the operator's own port is the operator's |
+
+The fix was reverted and the tests kept: **1 Rust test failed** (`188 passed, 1 failed`) — the one
+that fails is `the_tool_adds_no_port_for_the_dagster_webserver`, with `the tool picked a port:
+CONSOLE_HOST_PORT=3000`. With the fix, **189 Rust tests pass**.
+
+**The proof (rule 8).** This machine had 8 GB of memory available (`free -g`: total 11, available
+8), so the real check was possible and is what follows.
+
+```
+$ docker compose --profile '*' --env-file /tmp/opencode/d23/.env config --quiet
+$ echo $?
+0
+```
+
+The rendered file publishes the two services apart, and only the webserver on the loopback:
+
+```
+$ docker compose --profile '*' --env-file /tmp/opencode/d23/.env config | <the two services>
+console          -> [{'mode': 'ingress', 'target': 3000, 'published': '3000', 'protocol': 'tcp'}]
+dagster-webserver -> [{'mode': 'ingress', 'host_ip': '127.0.0.1', 'target': 3000, 'published': '3001', 'protocol': 'tcp'}]
+lakehouse-api    -> [{'mode': 'ingress', 'target': 8080, 'published': '8080', 'protocol': 'tcp'}]
+```
+
+A real `up` from a clean project, with a throwaway `.env` (generated values, `.env.example` plus
+`openssl rand`, `chmod 600`, outside the repository):
+
+```
+$ docker compose -p d23proof --profile dagster --env-file /tmp/opencode/d23/.env up -d
+... the console image is built from Dockerfile.frontend, the dagster image is the one on this
+    machine, and the stack comes up ...
+$ docker compose -p d23proof --profile dagster --env-file /tmp/opencode/d23/.env ps --format 'table {{.Service}}\t{{.Status}}\t{{.Ports}}'
+SERVICE                    STATUS                        PORTS
+console                    Up About a minute (healthy)   0.0.0.0:3000->3000/tcp, [::]:3000->3000/tcp
+dagster-code-location      Up 3 minutes                  3000/tcp, 4000/tcp
+dagster-daemon             Up 3 minutes                  3000/tcp, 4000/tcp
+dagster-webserver          Up 3 minutes (healthy)        4000/tcp, 127.0.0.1:3001->3000/tcp
+lakehouse-api              Up About a minute (healthy)   0.0.0.0:8080->8080/tcp, [::]:8080->8080/tcp
+postgres                   Up 4 minutes (healthy)        0.0.0.0:5432->5432/tcp, [::]:5432->5432/tcp
+...
+```
+
+The three measurements the decision asks for:
+
+```
+$ curl -fsS 127.0.0.1:3001/server_info
+{"dagster_webserver_version":"1.13.20","dagster_version":"1.13.20","dagster_graphql_version":"1.13.20"}
+$ echo $?
+0
+
+$ curl -fsS -o /dev/null -w 'http_code=%{http_code}\n' http://127.0.0.1:3000/
+http_code=200
+$ curl -fsS http://127.0.0.1:3000/ | head -c 60
+<!DOCTYPE html><html lang="en" class="qJXJUa_variable s5QHqW_variable -Qgr4W_variable
+
+$ ss -ltn | grep -E '3000|3001'
+LISTEN 0      4096                                  0.0.0.0:3000       0.0.0.0:*
+LISTEN 0      4096                                127.0.0.1:3001       0.0.0.0:*
+LISTEN 0      4096                                     [::]:3000          [::]:*
+```
+
+3001 is on `127.0.0.1` only. The same check from the host's own routable address (its address is
+not quoted here — rule 12) refuses the connection on 3001 and answers on 3000:
+
+```
+$ curl -sS -o /dev/null -w 'http_code=%{http_code}\n' http://<the host's own address>:3001/server_info
+curl: (7) Failed to connect to <the host's own address> port 3001 after 0 ms: Couldn't connect to server
+http_code=000
+$ curl -sS -o /dev/null -w 'http_code=%{http_code}\n' http://<the host's own address>:3000/
+http_code=200
+```
+
+The project is gone afterwards:
+
+```
+$ docker compose -p d23proof --profile dagster --env-file /tmp/opencode/d23/.env down -v
+... every volume Removed ...
+$ docker ps -a --filter label=com.docker.compose.project=d23proof --format '{{.Names}}\t{{.Status}}'
+(no output)
+$ docker volume ls --filter label=com.docker.compose.project=d23proof --format '{{.Name}}'
+(no output)
+$ docker network ls --filter label=com.docker.compose.project=d23proof --format '{{.Name}}'
+(no output)
+```
+
+**Commands run, in the foreground, on the final commit `e86cf6f2`:**
+
+| Command | Result |
+| --- | --- |
+| `/home/shiro/rantai/bin/cargo-locked fmt --check` | clean, no diff, exit 0 |
+| `/home/shiro/rantai/bin/cargo-locked clippy -p lakehousectl --all-targets -- -D warnings` | clean, no warning and no error, exit 0 |
+| `/home/shiro/rantai/bin/cargo-locked test -p lakehousectl` | **189 passed, 0 failed** (190 at the review commit `e30f2843`: 4 free-port tests removed, 3 new ones) |
+| `python3 -m pytest ops/release -q` (the venv with pytest 9.1.1 and pyyaml 6.0.3) | **216 passed** |
+| `actionlint .github/workflows/release.yml` | clean, exit 0 |
+| `docker compose --profile '*' config --quiet` | clean, exit 0 (with the throwaway `.env`) |
+
+Every cargo command went through `/home/shiro/rantai/bin/cargo-locked` (the shared
+`CARGO_TARGET_DIR`, `/home/shiro/rantai/cargo-target`; no `cargo clean`), in the foreground.
+
+**Not verified, with the reason:**
+
+- **The API image was not rebuilt from the repository.** The proof ran the API from
+  `rantai-lakehouse-api:ci`, the image CI built on this machine on 2026-10-24, which predates the
+  `curl` that the current `rust/Dockerfile` installs for the compose healthcheck — without it the
+  API's healthcheck can never pass and the console (which waits for `service_healthy`) never starts.
+  A local image (`rantai-lakehouse-api:d23proof`) adds `curl` to that image and nothing else; the
+  repository is untouched by it. Rebuilding the API from source is a full Rust release build of the
+  workspace, which this proof does not need: the claim is about the published ports.
+- **The Dagster image was the one already on this machine** (`rantai-lakehouse-dagster:local`), not
+  a fresh build; the console image WAS built from `Dockerfile.frontend` by this `up`.
+- **The first `up -d` failed** at the console image's `apk add --no-cache nodejs` (exit code 14 —
+  the Alpine mirror failed that once; the same command answers `OK` when run again). The retry
+  built the image and the stack came up.
+- **The gate harnesses the `dagster` profile carries were started by the same `up`** (`g3a`, `g4`,
+  `g7`, `g8`, `g9`, `bld1`, `gold-export`, `g3-maintenance`): they are CI's, they run against a
+  stack whose API image is the one above, and their results were NOT read — this proof is about the
+  published ports, and the gates' own verdicts are CI's.
+- **The whole-workspace cargo run** (`cargo clippy --workspace --all-targets --all-features -- -D
+  warnings` and `cargo test --workspace`): not run here — this slice's machine rules say CI runs the
+  workspace and the developer runs the scoped commands. The crate the slice touches
+  (`lakehousectl`) was clipped and tested with `--all-targets`.
+- **No bun command ran**: the branch changes no TypeScript.
+- **The Dagster code location** (`(cd dagster && python -m pytest dispar_orchestrate -q)`): not
+  run — the branch changes no Python under `dagster/`.
+- **The pushes**: the commit was pushed to `origin/feat/rel-2-s4b-lakehousectl-update`. No push was
+  refused, so no `git pull --no-rebase` and no resolve was needed. No pull request was opened.
+
 ## 7. Review (planner appends below)
 
 ### Review S1 round 1 (planner, 2026-10-31, at `f79d4235`)
