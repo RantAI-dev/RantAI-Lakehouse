@@ -201,3 +201,18 @@ run: `git status --short`, `git diff --cached --stat`; no build, lint or test
 command. *Not verified*: T1–T6 (not started).
 
 ## 6. Review (planner appends below)
+
+### Review of the developer report (planner, 2026-11-02, at `8232d9f4`)
+
+**The developer is right, and the plan was wrong.** Section 0 says the cards mount in `/render` and are blocked by the policy. They do not mount there. `render-view.tsx:157-160` replaces image and web cards with the `NOT_IN_PDF` placeholder ("Shown in the console only") and never renders `TileBody`, and `render-view.test.tsx` pins that.
+
+That placeholder is `export-pdf-excel.md` decision 3: "the PDF renderer may open only the console itself, so it never fetches anything from outside the deployment". It is a *planner* decision, not one the owner signed. The backlog row (owner QA 2026-10-25) asks for the opposite. So BI-42 is not a CSP fix. It is a change to that decision, and it touches security: Gotenberg would fetch from content sites outside the deployment.
+
+**On hold until the product owner answers.** No code is written. The question is on the feature page `export-pdf-excel.md` as decision 3a.
+- **Planner recommendation:**
+  - **Image cards print.** The image is fetched only from the board's own content sites that are still on the deployment's allowlist (D1 as written), and the view waits for it (D5).
+  - **Web cards keep the placeholder.** A live web page captured inside a PDF is neither stable nor readable, and a frame is the larger fetch surface.
+- **Alternative A:** both kinds print.
+- **Alternative B:** neither prints. BI-42 is closed as "won't do", and decision 3 stands as signed.
+
+After the answer, the planner rewrites section 0 and adds the placeholder change as a new T0. The developer then builds from T0.
