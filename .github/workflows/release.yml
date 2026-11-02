@@ -1673,27 +1673,15 @@ jobs:
           set -euo pipefail
           version="${{ steps.versions.outputs.b }}"
           echo "bundle B is the release $version"
-          python3 - "$version" <<'PYTHON'
-          import pathlib
-          import re
-          import sys
-
-          version = sys.argv[1]
-          manifest = pathlib.Path("rust/crates/lakehouse-api/Cargo.toml")
-          text = manifest.read_text(encoding="utf-8")
-          text = re.sub(
-              r'^version = "[^"]+"$', f'version = "{version}"', text, count=1, flags=re.M
-          )
-          manifest.write_text(text, encoding="utf-8")
-          lock = pathlib.Path("rust/Cargo.lock")
-          text = lock.read_text(encoding="utf-8")
-          text = text.replace(
-              'name = "lakehouse-api"\nversion = "',
-              f'name = "lakehouse-api"\nversion = "{version}"',
-              1,
-          )
-          lock.write_text(text, encoding="utf-8")
-          PYTHON
+          # The bump is a script of its own (`ops/release/bump_api_version.py`),
+          # so it can be TESTED: it was inline Python here, and it replaced
+          # the lockfile's version PREFIX and left the old version text
+          # behind, so the lockfile said `version = "0.1.0-update-proof.1"0.1.0"`
+          # and `cargo chef prepare` stopped with a TOML parse error
+          # (PR #335, the `update-proof` job).
+          python3 ops/release/bump_api_version.py "$version" \
+            --manifest rust/crates/lakehouse-api/Cargo.toml \
+            --lock rust/Cargo.lock
           grep -A1 'name = "lakehouse-api"' rust/Cargo.lock
 
       # The API image of bundle B, rebuilt and pushed to the job's own

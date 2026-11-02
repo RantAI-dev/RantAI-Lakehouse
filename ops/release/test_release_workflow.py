@@ -1665,6 +1665,28 @@ class UpdateProofTest(unittest.TestCase):
             "the rebuilt image's archive replaces the old one's",
         )
 
+    def test_the_update_proof_bumps_the_api_version_with_a_tested_script(self) -> None:
+        """The bump is a script of its own, so it can be tested.
+
+        It was inline Python in this step, and it was wrong (PR #335,
+        the `update-proof` job): the lockfile's version was replaced by
+        its PREFIX, so the old version text stayed behind and `cargo
+        chef prepare` stopped with a TOML parse error. The script that
+        replaces it is `ops/release/bump_api_version.py`, and its own
+        tests live in `ops/release/test_bump_api_version.py`.
+        """
+        run = str(
+            step_named(self.document, "update-proof", "The API's version is bumped for bundle B").get(
+                "run"
+            )
+        )
+        self.assertIn("ops/release/bump_api_version.py", run)
+        self.assertNotIn(
+            "python3 - ",
+            run,
+            "the bump must be the tested script, not inline Python",
+        )
+
     def test_the_update_proof_signs_its_own_bundles(self) -> None:
         """The bundles the proof builds are signed with the proof's
         key, and the tool is pointed at that key for the updates."""
