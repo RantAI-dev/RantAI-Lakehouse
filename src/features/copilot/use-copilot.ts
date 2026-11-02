@@ -9,7 +9,8 @@ import { notifyDashboardsChanged } from "@/features/dashboards/dashboard-events"
 import { changedABoard, takeNewBoardChanges } from "./board-change";
 import { readNdjson } from "@/lib/ndjson";
 import { notifyError, notifySuccess } from "@/lib/notify";
-import { chatTermService } from "@/services";
+import { chatSessionService, chatTermService } from "@/services";
+import { isServiceError } from "@/services/errors";
 import { apiFetch } from "@/services/http";
 import { answerAsk, type AskAnswer } from "./answer-ask";
 
@@ -200,6 +201,12 @@ function useCopilotState() {
   /** A line about the last picked answer (not remembered); any later send, new chat or opened chat clears it. */
   const [askNotice, setAskNotice] = React.useState<string | null>(null);
   const [sessionId, setSessionId] = React.useState<string | null>(null);
+  /**
+   * The open conversation's title, from the server — not from `sessions`,
+   * which holds only the newest 20 (`AI-24` D2). A conversation reopened
+   * from History is usually older than those, and still shows its title.
+   */
+  const [sessionTitle, setSessionTitle] = React.useState<string | null>(null);
   const [sessions, setSessions] = React.useState<SessionMeta[]>([]);
   const [confirmingKey, setConfirmingKey] = React.useState<string | null>(null);
   const [enabledCaps, setEnabledCaps] = React.useState<Set<string>>(() => new Set(ALL_CAP_KEYS));
@@ -263,24 +270,20 @@ function useCopilotState() {
 
   const refreshSessions = React.useCallback(async () => {
     try {
-      const res = await apiFetch(`/api/ai/sessions?limit=${RECENT_SESSIONS}`, { cache: "no-store" });
-      const json = await res.json();
-      if (Array.isArray(json.sessions)) setSessions(json.sessions);
-    } catch { /* abaikan */ }
+      const page = await chatSessionService.list({ limit: RECENT_SESSIONS });
+      if (Array.isArray(page.sessions)) setSessions(page.sessions);
+    } catch { /* the menu keeps what it had */ }
   }, []);
 
   React.useEffect(() => { void refreshSessions(); }, [refreshSessions]);
 
   const persist = React.useCallback(async (msgs: Msg[], m: Mode, id: string | null) => {
     try {
-      const res = await apiFetch("/api/ai/sessions", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ id: id ?? undefined, mode: m, messages: msgs }),
-      });
-      const json = await res.json();
-      if (json.id) setSessionId(json.id);
+      const saved = await chatSessionService.save({ id: id ?? undefined, mode: m, messages: msgs });
+      if (saved.id) setSessionId(saved.id);
+      if (saved.title) setSessionTitle(saved.title);
       void refreshSessions();
-    } catch { /* abaikan */ }
+    } catch { /* the next message saves the conversation again */ }
   }, [refreshSessions]);
 
   // Every tool that changes something is gated per call on the server
@@ -561,7 +564,7 @@ function useCopilotState() {
 
   const newChat = React.useCallback(() => {
     discardInFlight();
-    setMessages([]); setSessionId(null); setError(null); setAskNotice(null);
+    setMessages([]); setSessionId(null); setSessionTitle(null); setError(null); setAskNotice(null);
   }, [discardInFlight]);
 
   const loadSession = React.useCallback(async (id: string) => {
@@ -569,21 +572,25 @@ function useCopilotState() {
     setError(null);
     setAskNotice(null);
     try {
-      const res = await apiFetch(`/api/ai/sessions?id=${encodeURIComponent(id)}`, { cache: "no-store" });
-      const json = await res.json();
-      if (!res.ok) throw new Error(json?.error ?? "Failed to load session");
-      setMessages(((json.session.messages ?? []) as Msg[]).map((m) => (m.id ? m : { ...m, id: newMsgId() })));
-      if (json.session.mode === "build" || json.session.mode === "ask") setMode(json.session.mode);
-      setSessionId(json.session.id);
+      const session = await chatSessionService.get(id);
+      setMessages(((session.messages ?? []) as Msg[]).map((m) => (m.id ? m : { ...m, id: newMsgId() })));
+      if (session.mode === "build" || session.mode === "ask") setMode(session.mode);
+      setSessionId(session.id);
+      setSessionTitle(session.title);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      // AI-24 D3: a plain sentence, never the API's own text (its 404 body
+      // says "sesi tidak ditemukan", which is not something to show).
+      setError(
+        isServiceError(e) && e.code === "not_found"
+          ? "This conversation could not be found. It may have been deleted."
+          : "This conversation could not be loaded. Try again.",
+      );
     }
   }, [discardInFlight]);
 
   const removeSession = React.useCallback(async (id: string): Promise<boolean> => {
     try {
-      const res = await apiFetch(`/api/ai/sessions?id=${encodeURIComponent(id)}`, { method: "DELETE" });
-      if (!res.ok) throw new Error((await res.json().catch(() => null))?.error ?? "Failed to delete");
+      await chatSessionService.remove(id);
     } catch (e) {
       notifyError("Couldn't delete conversation", e);
       return false;
@@ -596,11 +603,10 @@ function useCopilotState() {
 
   const renameSession = React.useCallback(async (id: string, title: string): Promise<boolean> => {
     try {
-      const res = await apiFetch("/api/ai/sessions", {
-        method: "PATCH", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ id, title }),
-      });
-      if (!res.ok) throw new Error((await res.json().catch(() => null))?.error ?? "Failed to rename");
+      const renamed = await chatSessionService.rename(id, title);
+      // AI-24 D2: renaming the open conversation changes what the title bar
+      // shows, whether or not it is among the recent 20 the menu lists.
+      if (id === sessionId) setSessionTitle(renamed.title);
     } catch (e) {
       notifyError("Couldn't rename conversation", e);
       return false;
@@ -608,9 +614,10 @@ function useCopilotState() {
     notifySuccess("Conversation renamed");
     void refreshSessions();
     return true;
-  }, [refreshSessions]);
+  }, [sessionId, refreshSessions]);
 
   return {
+    sessionTitle,
     mode, setMode, messages, busy, error, askNotice, sessionId, sessions,
     enabledCaps, toggleCap, pageContext, setPageContext,
     send, newChat, loadSession, removeSession, renameSession, refreshSessions,

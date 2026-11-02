@@ -42,6 +42,25 @@ let readSteps: ReadStep[] = [];
 /** The steps the model says the request still has. */
 let nextStep: string | null = "add two charts";
 
+/** A JSON response, for the session routes. */
+function fakeJson(status: number, json: unknown): Response {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    json: async () => json,
+  } as unknown as Response;
+}
+
+/** What `GET /api/ai/sessions?id=` answers, per id. */
+let sessionOpens: Record<string, { status: number; json: unknown }> = {};
+/** What the list and the writes answer. */
+let sessionList: unknown = { sessions: [], hasMore: false, nextOffset: null, counts: {} };
+let sessionSave: unknown = { ok: true, id: "s1", title: "A saved conversation" };
+let sessionRename: unknown = null;
+let sessionDeleteStatus = 200;
+/** The ids `DELETE /api/ai/sessions?id=` was sent, in order. */
+const deletedSessions: string[] = [];
+
 /** A response the hook can read: the body as one chunk, and a JSON body. */
 function fakeResponse(body: string, json: unknown): Response {
   const encoder = new TextEncoder();
@@ -101,6 +120,12 @@ beforeEach(() => {
   drafts = [defaultDraft];
   readSteps = [];
   nextStep = "add two charts";
+  sessionOpens = {};
+  sessionList = { sessions: [], hasMore: false, nextOffset: null, counts: {} };
+  sessionSave = { ok: true, id: "s1", title: "A saved conversation" };
+  sessionRename = null;
+  sessionDeleteStatus = 200;
+  deletedSessions.length = 0;
   globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = typeof input === "string" ? input : String(input);
     const body = typeof init?.body === "string" ? init.body : "";
@@ -112,7 +137,27 @@ beforeEach(() => {
       const sent = body ? (JSON.parse(body) as { tool?: string }) : {};
       return fakeResponse("{}", toolResults[sent.tool ?? ""] ?? toolResult);
     }
-    if (url.startsWith("/api/ai/sessions")) return fakeResponse("{}", { id: "s1", sessions: [] });
+    if (url.startsWith("/api/ai/sessions")) {
+      const method = init?.method ?? "GET";
+      const id = new URL(url, "http://test.invalid").searchParams.get("id");
+      if (method === "POST") return fakeJson(200, sessionSave);
+      if (method === "PATCH") {
+        const sent = body ? (JSON.parse(body) as { title?: string }) : {};
+        return fakeJson(200, sessionRename ?? { ok: true, id, title: sent.title });
+      }
+      if (method === "DELETE") {
+        if (id) deletedSessions.push(id);
+        return fakeJson(sessionDeleteStatus, { ok: sessionDeleteStatus < 300 });
+      }
+      if (id) {
+        const answer = sessionOpens[id] ?? {
+          status: 200,
+          json: { session: { id, title: "Untitled", mode: "ask", messages: [] } },
+        };
+        return fakeJson(answer.status, answer.json);
+      }
+      return fakeJson(200, sessionList);
+    }
     return fakeResponse("{}", {});
   }) as typeof fetch;
 });
@@ -364,5 +409,93 @@ describe("the Copilot goes on after the draft is confirmed (AI-15)", () => {
     expect(continuationText(messages, 0, "add the chart")).toBe(
       'Confirmed and saved: create_calculated_field f1 "Margin". Do not draft these again. Continue: add the chart',
     );
+  });
+});
+
+describe("the open conversation's title and its load errors (AI-24)", () => {
+  const opened = (id: string, title: string): { status: number; json: unknown } => ({
+    status: 200,
+    json: { session: { id, title, mode: "ask", messages: [{ id: "u1", role: "user", content: "Revenue?" }] } },
+  });
+
+  it("shows the title of a conversation older than the newest 20", async () => {
+    sessionList = {
+      sessions: [{ id: "recent", title: "A recent one", mode: "ask" }],
+      hasMore: true,
+      nextOffset: 20,
+      counts: {},
+    };
+    sessionOpens = { old: opened("old", "Quarterly revenue") };
+    renderCopilot();
+
+    await act(async () => {
+      await copilot!.loadSession("old");
+    });
+
+    expect(copilot!.sessionId).toBe("old");
+    expect(copilot!.sessionTitle).toBe("Quarterly revenue");
+    expect(
+      copilot!.sessions.some((s) => s.id === "old"),
+      "the fixture is a conversation the recent list does not hold",
+    ).toBe(false);
+  });
+
+  it("renames the open conversation without it being in the recent list", async () => {
+    sessionOpens = { old: opened("old", "Quarterly revenue") };
+    renderCopilot();
+    await act(async () => {
+      await copilot!.loadSession("old");
+    });
+
+    let renamed = false;
+    await act(async () => {
+      renamed = await copilot!.renameSession("old", "Board plan");
+    });
+
+    expect(renamed).toBe(true);
+    expect(copilot!.sessionTitle).toBe("Board plan");
+  });
+
+  it("shows a plain sentence for a deleted conversation, never the API's text", async () => {
+    sessionOpens = { gone: { status: 404, json: { error: "sesi tidak ditemukan" } } };
+    renderCopilot();
+
+    await act(async () => {
+      await copilot!.loadSession("gone");
+    });
+
+    expect(copilot!.error).toBe("This conversation could not be found. It may have been deleted.");
+    expect(copilot!.error).not.toContain("sesi");
+  });
+
+  it("shows the other plain sentence when the conversation could not be loaded", async () => {
+    sessionOpens = { broken: { status: 500, json: { error: "database error" } } };
+    renderCopilot();
+
+    await act(async () => {
+      await copilot!.loadSession("broken");
+    });
+
+    expect(copilot!.error).toBe("This conversation could not be loaded. Try again.");
+    expect(copilot!.error).not.toContain("database");
+  });
+
+  it("starts a new chat when the open conversation is deleted", async () => {
+    sessionOpens = { open: opened("open", "Open conversation") };
+    renderCopilot();
+    await act(async () => {
+      await copilot!.loadSession("open");
+    });
+
+    let removed = false;
+    await act(async () => {
+      removed = await copilot!.removeSession("open");
+    });
+
+    expect(removed).toBe(true);
+    expect(deletedSessions).toEqual(["open"]);
+    expect(copilot!.sessionId).toBeNull();
+    expect(copilot!.sessionTitle).toBeNull();
+    expect(copilot!.messages).toEqual([]);
   });
 });

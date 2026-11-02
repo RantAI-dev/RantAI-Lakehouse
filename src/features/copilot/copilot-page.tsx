@@ -107,7 +107,10 @@ export function CopilotPage() {
       // not remembered; the toggle still works for this visit
     }
   };
-  const activeTitle = c.sessions.find((s) => s.id === c.sessionId)?.title || "Conversation";
+  // AI-24 D2: the open conversation's own title, not a lookup in the newest
+  // 20 the history menu lists — a conversation reopened from History is
+  // often older than those. "New conversation" is for no conversation.
+  const activeTitle = c.sessionTitle || (c.sessionId ? "Conversation" : "New conversation");
   const startNew = () => {
     c.newChat();
     router.push("/");

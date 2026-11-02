@@ -26,6 +26,7 @@ import { reportService as reportClientService } from "./clients/reports"
 import { settingsService as settingsClientService } from "./clients/settings"
 import { mapService as mapClientService } from "./clients/maps"
 import { chatTermService as chatTermClientService } from "./clients/chat-terms"
+import { chatSessionService as chatSessionClientService } from "./clients/chat-sessions"
 import { semanticService as semanticClientService } from "./clients/semantic"
 import { tagKeysService as tagKeysClientService } from "./clients/tag-keys"
 import { httpVersionService } from "./clients/version"
@@ -131,6 +132,14 @@ export type { ReportingSettingsInput } from "./contracts/settings"
 // The words a user defined for the chat (`PUT /api/ai/terms`), stored when
 // they pick an answer to a question the chat asked. No mock ever existed.
 export const chatTermService = chatTermClientService
+// The AI Copilot's saved conversations (`/api/ai/sessions`): list, open,
+// save, rename and delete (AI-24). No mock ever existed for this domain.
+export const chatSessionService = chatSessionClientService
+/** The conversation shapes the Copilot feature reads from `@/services`. */
+export type {
+  ChatSession, ChatSessionPage, ChatSessionSaved, ChatSessionService, ChatSessionSummary,
+  ListChatSessionsQuery, SaveChatSessionInput,
+} from "./contracts/chat-sessions"
 // The semantic entries of a table and its columns (`/api/semantic/{asset}`):
 // the drafted meaning and role, and the person's confirmed corrections. No
 // mock ever existed.

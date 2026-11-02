@@ -117,3 +117,32 @@ describe("ToolStepCard export links (BI-1, AI-10)", () => {
     expect(screen.queryByRole("link")).toBeNull()
   })
 })
+
+describe("a step whose result was dropped from a long conversation (AI-24)", () => {
+  const dropped: ToolStep = {
+    tool: "run_sql",
+    args: { sql: "SELECT count() FROM serving.mart_x" },
+    ok: true,
+    resultDropped: true,
+  }
+
+  it("keeps the step's label and its outcome", () => {
+    render(<ToolStepCard step={dropped} />)
+    // The label and the outcome come from the fields the server kept.
+    expect(screen.getByText("SQL")).toBeTruthy()
+    expect(screen.getByRole("button").className).not.toContain("text-destructive")
+  })
+
+  it("opens to the note instead of a result, with no raw view", () => {
+    render(<ToolStepCard step={dropped} />)
+    fireEvent.click(screen.getByRole("button"))
+    expect(screen.getByText(/Details not kept for long conversations/)).toBeTruthy()
+    expect(screen.queryByText("View raw")).toBeNull()
+  })
+
+  it("marks a dropped step that failed as failed", () => {
+    render(<ToolStepCard step={{ ...dropped, ok: false }} />)
+    expect(screen.getByText("SQL")).toBeTruthy()
+    expect(screen.getByRole("button").className).toContain("text-destructive")
+  })
+})
