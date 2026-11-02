@@ -417,3 +417,116 @@ way. A second inline copy in `routes::alerts` is what the plan forbids, so I did
   - the same case for a metric rule;
   - `cargo test -p lakehouse-alerts`, unchanged and green.
 - Rule 4 holds: there is one builder, used by both the run and the save.
+
+### Handoff (developer, 2026-11-02)
+
+Branch `feat/sec-50-slice-2`, pushed after every commit. T1–T6 were already there
+(`db7a337d` … `c114567c`); this machine did T7–T9. No PR was opened. Nothing was
+force-pushed; the two pushes that raced the planner's `24b798c5` used
+`git pull --rebase`.
+
+Commits (this session, in order):
+
+| Commit | What |
+| --- | --- |
+| `ea0e8703` | T7: the alert run asks the gate — `ApiSqlGate` holds the state and an actor, `gate()` checks before the rewrite; `/api/alerts/run` is `CatalogTenant` (D3), the assistant's `run_alert_rule` is the caller (M6/R4). |
+| `0ab03794` | T7's `### Developer report`: M7 could not be implemented — `lakehouse-alerts` exposed no builder. |
+| `f4c7d370` | T8: `publication_body` gates the fingerprint as the route's caller; `clickhouse_fingerprint_token` stays ungated with the reason at the site (M12). |
+| `def8a64f` | T7 (planner's D7a): `mart_statement`, `metric_statement` and `statement_for_input` extracted and exported; `authorise_rule_create`/`authorise_rule_update` gate the rule's statement as the saving person (M7). |
+| `3d8e5e2e` | T9: the boot warning names every gated path (D7); `.env.example`, `docs/OPERATIONS.md`, the feature page. |
+
+**T7's M7 half, second attempt (D7a), for the record.** The report at `0ab03794` said the
+crate did not expose the builders; the planner chose to export them, and the extraction is
+larger than the two functions named, on purpose: `metric_statement(ch, name)` carries the
+metric/source/catalog lookups too (`lib.rs` `metric_value`), because the save path would
+otherwise have copied them, and `statement_for_input` carries the save's own
+`normalize_input` for the same reason (a mart given as `serving.x`, or an omitted `agg`,
+must resolve here exactly as at save and at run). One builder per kind, used by both the run
+and the save; nothing is copied.
+
+**Fixtures changed (`M11`), no assertion weakened:**
+
+1. `routes::alerts::tests::silence_end_to_end::state_for` now names `CATALOG_TENANT_ID`: its
+   rule reads `serving.route_test_mart`, and without the setting D6 refuses it, so the test
+   would have been about the gate instead of the silence.
+2. `routes::alerts::tests::webhook_targets`: the state now has a real pool (the test became
+   `#[sqlx::test]`) and names `CATALOG_TENANT_ID`, because its rule reads
+   `serving.mart_wisman` and the gate now runs before the webhook check it is about. The
+   assertions are unchanged (400, the fixed message, zero inserts).
+
+**API signatures that moved** (all in-crate, both paths updated): `alerts::create`,
+`alerts::update` and `authorise_rule_create`/`authorise_rule_update` take `headers`;
+`run_alert_rule` takes the principal; `publication` and `set_publication` take `HeaderMap`.
+No tool schema changed, so `tests/fixtures/tool_schemas.json` is not regenerated (M13).
+
+**Commands run, with counts (all on the final commit, `-j 2`, through
+`~/rantai/bin/cargo-locked`):**
+
+| Command | Result |
+| --- | --- |
+| `cargo fmt --check` | clean |
+| `cargo clippy -p lakehouse-api --all-targets -- -D warnings` | clean |
+| `cargo clippy -p lakehouse-api -p lakehouse-alerts --all-targets -- -D warnings` | clean |
+| `cargo test -p lakehouse-api routes::alerts` | 35 passed, 0 failed |
+| `cargo test -p lakehouse-api routes::ai` | 446 passed, 1 ignored, 0 failed |
+| `cargo test -p lakehouse-api routes::gold` | 20 passed, 0 failed |
+| `cargo test -p lakehouse-api --test gold_publication` | 14 passed, 0 failed (real `ClickHouse` 26.8 testcontainer; container removed afterwards) |
+| `cargo test -p lakehouse-alerts` | 126 passed, 1 ignored, 0 failed (unchanged) |
+| `cargo test -p lakehouse-api` | 2 942 passed, 0 failed, 18 ignored in the lib target; every integration target green |
+| `cargo test -p lakehouse-store` | 528 passed, 0 failed, across 20 targets |
+| `cargo test -p lakehouse-api --bin lakehouse-api boot_warning` | 3 passed |
+| `docker compose --profile '*' config --quiet` | exit 0, with throwaway `POSTGRES_PASSWORD`, `RUSTFS_ACCESS_KEY`, `RUSTFS_SECRET_KEY`, `LAKEKEEPER_ENCRYPTION_KEY`, `CONNECTOR_SECRETS_KEY` |
+
+**One red seen and re-run, not hidden.** The first full `cargo test -p lakehouse-api` ended
+`2941 passed; 1 failed`: `routes::alerts::alert_run_tenant_scope::every_mart_rule_is_refused_with_d6_and_the_next_rule_still_runs`
+panicked inside `sqlx-core`'s test harness before the test body ran — `failed to connect test
+pool: database "…" does not exist` (`sqlx-core-0.9.0/src/testing/mod.rs:199`), i.e. the
+harness's own per-test database, not an assertion. The test passes alone
+(`cargo test -p lakehouse-api routes::alerts::alert_run_tenant_scope` — 2 passed) and the
+second full run was `2942 passed; 0 failed; 18 ignored`. Reported as a harness flake; no
+test was weakened.
+
+**T10: mutation checks (each `check` call removed, named test run, restored; the tree is
+clean again).**
+
+| Site | Command | Result with the check removed |
+| --- | --- | --- |
+| T2 tile runner (`support.rs` `gate.check`) | `cargo test -p lakehouse-api --test dashboard_tenant_scope` | 2 failed: `another_tenants_member_sees_the_tile_refused_and_the_engine_is_never_asked`, `a_refused_reader_is_not_served_from_the_remembered_tile` |
+| T3 records (`dashboard.rs` `run_records`) | same | 1 failed: `the_records_of_another_tenant_are_refused` |
+| T3 filter values (`values_with_limit`) | same | 2 failed: `the_filter_values_of_another_tenant_are_refused`, `the_filter_values_of_a_board_of_another_tenant_are_refused` |
+| T3 chart and table downloads (`build_chart_file`) | same | 2 failed: `the_chart_download_of_another_tenant_is_refused`, `the_table_download_of_another_tenant_is_refused` |
+| T3 SQL sources (`dashboard_sources.rs` `check_and_rewrite`) | same | 2 failed: `the_sql_source_of_another_tenant_is_refused`, `the_sql_source_preview_of_another_tenant_is_refused` |
+| T5 embed | `cargo test -p lakehouse-api --test embed_tokens` | 1 failed: `an_embed_in_a_deployment_without_a_catalog_tenant_is_refused` |
+| T6 public link view | `cargo test -p lakehouse-api --test public_links` | 3 failed: `a_link_reads_as_the_tenant_that_made_it`, `a_link_whose_creator_left_its_tenant_is_refused`, `a_link_without_a_creator_reads_nothing_in_a_deployment_with_several_tenants` |
+| T7 alert gate (`ApiSqlGate::gate`) | `cargo test -p lakehouse-api alert_run_tenant_scope` | 1 failed: `every_mart_rule_is_refused_with_d6_and_the_next_rule_still_runs` |
+| T7 rule save (`gate_rule_statement`) | `cargo test -p lakehouse-api save_tenant_scope` | 2 failed: the mart and the metric case |
+| T8 publication (`gated_source_table` in `publication_body`) | `cargo test -p lakehouse-api another_tenants_member_cannot_read_a_publication` | 1 failed |
+
+(The T5 and T6 mutations remove the runner's `check` in `support.rs`, which is the call the
+embed and the public-link board make per tile — the gate is built in `embed.rs`/
+`public_links.rs` and spent in the runner.)
+
+**Not verified, with the reason.**
+
+- **M2's wall-clock measurement** (`ops/bench/dashboard_open_bench.py`, before and after,
+  as a member of the catalog tenant): **not measured.** No stack is running on this machine
+  and no API image is built for either commit; measuring needs `docker compose` with the demo
+  data and a build of both revisions, which this machine's rules (shared with another
+  session, no full-workspace build) do not allow. The *structural* claim — one reach per
+  request, not one per tile — is proven by
+  `routes::query::sec50_gate_tests::the_gate_resolves_the_reach_once_for_a_request` and
+  `a_refused_gate_refuses_the_next_statement_the_same_way`. The numbers are the planner's or
+  CI's to take.
+- **Full-workspace `cargo clippy --workspace --all-targets --all-features`**: not run. Local
+  is scoped to the crates this slice touched (`lakehouse-api`, `lakehouse-alerts`,
+  `lakehouse-store`), per the owner's 2026-10-30 rule ("blaze locally, CI is final").
+- **The G-gates** (`g3a-dagster`, `gold-export`, `g8-*`, `g6-alerts`): not run — they need
+  the compose stack. CI's.
+- **The AI-15 eval** (`ops/ai_eval/`): not run — needs a live stack; per M13 it must run
+  with `CATALOG_TENANT_ID` set or as a `*:*` user.
+- **A real `docker compose up`**: not run. No compose file changed in T7–T9; `config
+  --quiet` is the check for the files that did change (`.env.example` is not read by
+  compose).
+
+**Console (`src/`):** no TypeScript change, as the plan's out-of-scope section says; no
+`bun` command was run because nothing under `src/` moved.
