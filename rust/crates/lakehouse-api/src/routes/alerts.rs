@@ -544,7 +544,7 @@ pub async fn delete(
     authorise_existing_rule(&state, caller, &id).await?;
     // BI-19 part C (C3): the router's floor is "signed in"; without the alert
     // permission a person removes only their own chart alert.
-    if !crate::routes::chart_alerts::may_delete(
+    if !crate::routes::chart_alerts::may_manage(
         caller,
         crate::routes::chart_alerts::stored_rule(&state, &id)
             .await?
@@ -1307,6 +1307,120 @@ pub async fn run(
         "qualityPassStarted": quality_started,
         "schemaPassStarted": schema_started,
     })))
+}
+
+/// Query parameters for `POST /api/alerts/test`.
+#[derive(Debug, Deserialize)]
+pub struct TestQuery {
+    /// The rule to run, required.
+    id: Option<String>,
+}
+
+/// The answer of a `pipeline_late` rule asked to test-run (`BI-40` D3, honest:
+/// principle 2). A "late" claim needs the Postgres SLA row and the
+/// orchestrator's last success, so it belongs to the 15-minute tick, not to a
+/// single-rule test.
+const PIPELINE_LATE_TEST: &str =
+    "A late-pipeline alert is checked by the 15-minute pass, not by a test run.";
+
+/// The one refusal an unknown rule and a rule the caller cannot see share, so
+/// the route is not an oracle (`BI-40` D2.1).
+const RULE_NOT_FOUND: &str = "alert rule not found.";
+
+/// The guard of `POST /api/alerts/test` and the assistant's `run_alert_rule`
+/// (`BI-40` D2, D7): who may run this one rule now.
+///
+/// All three must hold, in this order:
+///
+/// 1. the rule is in what the caller's list shows ([`visible_rules`] over the
+///    one rule), else 404 — the same body an unknown id gets, so neither route
+///    is an oracle;
+/// 2. [`authorise_existing_rule`] passes (`SRC-7` D7: connector, upload and
+///    quality rules);
+/// 3. [`crate::routes::chart_alerts::may_manage`]: `alert:write`, or their own
+///    chart rule (C3 lets a person without the permission own one).
+///
+/// # Errors
+///
+/// 401 with no caller; 404 for an unknown rule or one they cannot see; 503 when
+/// the rules cannot be read; 403 `alert:write` when it is not theirs to manage.
+pub(crate) async fn authorise_rule_test(
+    state: &AppState,
+    principal: Option<&Principal>,
+    id: &str,
+) -> Result<(), ApiError> {
+    let Some(caller) = principal else {
+        return Err(ApiError::unauthorized());
+    };
+    let Some(rule) = crate::routes::chart_alerts::stored_rule(state, id).await? else {
+        return Err(ApiError::NotFound(RULE_NOT_FOUND.to_owned()));
+    };
+    // D2.1: the list the caller sees decides, so an id of another tenant's
+    // connector rule answers exactly as an unknown one.
+    if visible_rules(state, Some(caller), vec![rule.clone()])
+        .await?
+        .is_empty()
+    {
+        return Err(ApiError::NotFound(RULE_NOT_FOUND.to_owned()));
+    }
+    // D2.2: the same scope check as an update or a delete (`SRC-7` D7).
+    authorise_existing_rule(state, Some(caller), id).await?;
+    // D2.3: `alert:write`, or their own chart rule.
+    if !crate::routes::chart_alerts::may_manage(Some(caller), Some(&rule)) {
+        return Err(ApiError::PermissionDenied("alert:write".to_owned()));
+    }
+    Ok(())
+}
+
+/// `POST /api/alerts/test?id=` — run one rule now, for a signed-in person
+/// (`BI-40` D1).
+///
+/// This is a person's door, not the scheduler's: `POST /api/alerts/run` and its
+/// [`check_run_token`] guard (D4) are unchanged, and this route never calls
+/// them. The handler decides, as `POST /api/alerts` does (`BI-40` D2), in this
+/// order:
+///
+/// 1. the rule must be in what the caller's list shows ([`visible_rules`] over
+///    the one rule), else 404 — the same body an unknown id gets;
+/// 2. [`authorise_existing_rule`] must pass (`SRC-7` D7: connector, upload and
+///    quality rules);
+/// 3. [`crate::routes::chart_alerts::may_manage`]: `alert:write`, or their own
+///    chart rule (C3 lets a person without the permission own one).
+///
+/// The run is [`run_one`] with this id (`BI-40` D4): a real run, not a dry one
+/// (`BI-40` D3) — if the condition holds the email or webhook is really sent,
+/// the rule's state is settled, a fired result is saved and a recovery
+/// resolves. A `pipeline_late` rule answers [`PIPELINE_LATE_TEST`].
+///
+/// The body is `{ "ran": n, "results": [...] }`, the shape the console's
+/// `testRule` reads.
+///
+/// # Refusals (`BI-40` D6)
+///
+/// 401 only with no session; 403 `alert:write` when the caller may not manage
+/// the rule; 404 when the caller cannot see it. Never a 401 for a signed-in
+/// person, so the console does not read a refusal as a lost session.
+///
+/// # Errors
+///
+/// 400 without an id; 404 as above; 403 as above; 401 with no session; 503 when
+/// the rules cannot be read; 500 on a `ClickHouse` failure during the run.
+pub async fn test_one(
+    State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
+    Query(query): Query<TestQuery>,
+) -> ApiResult<ApiJson<Value>> {
+    let Some(id) = query.id else {
+        return Err(ApiError::BadRequest("id is required".to_owned()).into());
+    };
+    authorise_rule_test(&state, principal.as_ref().map(|Extension(p)| p), &id).await?;
+    let mut results = run_one(&state, Some(&id)).await?;
+    for result in &mut results {
+        if result.kind == AlertKind::PipelineLate {
+            result.skipped = Some(PIPELINE_LATE_TEST.to_owned());
+        }
+    }
+    Ok(ApiJson(json!({ "ran": results.len(), "results": results })))
 }
 
 /// Plan 1f: list every distinct `pipeline_id` referenced by an enabled

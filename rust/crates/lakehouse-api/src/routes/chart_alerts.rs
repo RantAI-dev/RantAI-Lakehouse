@@ -13,7 +13,7 @@
 //!   parameter the dashboard takes. The number is taken from the chart's tile
 //!   (`lakehouse_alerts::chart_number`) and settled with
 //!   [`lakehouse_alerts::settle`], so it fires once and recovers once (D11).
-//! - [`authorise_save`] and [`may_delete`]: who may save or remove such a rule
+//! - [`authorise_save`] and [`may_manage`]: who may save, test or remove such a rule
 //!   (C3), checked in the handler because the router's floor for
 //!   `/api/alerts` is "signed in".
 //!
@@ -279,10 +279,14 @@ pub(crate) async fn visible_to(
         .collect()
 }
 
-/// Whether `principal` may delete `rule` (C3): the alert permission, or their
+/// Whether `principal` may manage `rule` (C3): the alert permission, or their
 /// own chart rule. With no principal it is `false` (`BI-19` C review SF-4,
 /// principle 3: the guard never opens for an unknown caller).
-pub(crate) fn may_delete(principal: Option<&Principal>, rule: Option<&AlertRule>) -> bool {
+///
+/// `BI-40` D2: the same test decides who may remove a rule (`DELETE`) and who
+/// may test-run it (`POST /api/alerts/test`), so it is named for the rule it
+/// guards rather than for one caller.
+pub(crate) fn may_manage(principal: Option<&Principal>, rule: Option<&AlertRule>) -> bool {
     let Some(principal) = principal else {
         return false;
     };
@@ -388,11 +392,11 @@ pub(crate) async fn authorise_save(
 
 #[cfg(test)]
 mod tests {
-    use super::may_delete;
+    use super::may_manage;
 
     /// `BI-19` C review SF-4: with no principal the guard is closed.
     #[test]
     fn a_delete_with_no_principal_is_refused() {
-        assert!(!may_delete(None, None));
+        assert!(!may_manage(None, None));
     }
 }

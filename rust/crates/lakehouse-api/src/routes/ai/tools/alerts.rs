@@ -136,10 +136,21 @@ pub(super) async fn delete_alert_rule(
     }
 }
 
-pub(super) async fn run_alert_rule(state: &AppState, args: &Map<String, Value>) -> Value {
+pub(super) async fn run_alert_rule(
+    state: &AppState,
+    principal: Option<&Principal>,
+    args: &Map<String, Value>,
+) -> Value {
     let id = arg_str(args, "id");
     if id.is_empty() {
         return json!({ "error": "id is required" });
+    }
+    // `BI-40` D2/D7: the assistant runs through the same guard as the person's
+    // test route. The tool's `alert:write` (`registry.rs`) says it may run *an*
+    // alert; this says it may run *this* one — the rule is in what the caller's
+    // list shows, the `SRC-7` D7 scope check passes, and it is theirs to manage.
+    if let Err(err) = crate::routes::alerts::authorise_rule_test(state, principal, &id).await {
+        return json!({ "error": err.to_string() });
     }
     // `BI-40` D4: one helper for one rule, shared with `/api/alerts/run` and the
     // person's test route. The copilot therefore reads a chart rule as its owner
@@ -240,8 +251,21 @@ mod tests {
     /// `run_rules`' `CHART_SKIPPED` sentence — the rule was never read.
     #[tokio::test]
     async fn running_a_chart_rule_from_the_assistant_does_not_answer_chart_skipped() {
+        use lakehouse_auth::{PermissionSet, PrincipalId};
         use wiremock::matchers::method;
         use wiremock::{Mock, ResponseTemplate};
+        // The tool's own gate is `alert:write`; the caller owns the rule, so
+        // D2.1 shows it to them (the same C3 pair the console's guard uses).
+        let owner = uuid::Uuid::new_v4();
+        let caller = Principal {
+            id: PrincipalId::User(owner),
+            tenant_ids: Vec::new(),
+            display_name: "Rina".to_owned(),
+            permissions: PermissionSet::parse("alert:write"),
+            provider: "session".to_owned(),
+            must_change_password: false,
+            role_names: Vec::new(),
+        };
         let server = wiremock::MockServer::start().await;
         let rule = json!({
             "id": "al_chart", "name": "Visitors in Bali", "type": "alert",
@@ -249,7 +273,8 @@ mod tests {
             "board": "", "channel": "email", "target": "owner@test.invalid",
             "enabled": "1", "created_at": "2026-11-02 00:00:00", "severity": "",
             "pipeline": "", "metric": "", "connector": "", "asset": "", "chart": "c_kpi",
-            "series": "", "condition": "above", "owner_id": "", "filters_json": "[]",
+            "series": "", "condition": "above", "owner_id": owner.to_string(),
+            "filters_json": "[]",
         });
         Mock::given(method("POST"))
             .respond_with(
@@ -266,7 +291,7 @@ mod tests {
         ));
         let mut args = Map::new();
         args.insert("id".to_owned(), json!("al_chart"));
-        let result = run_alert_rule(&state, &args).await;
+        let result = run_alert_rule(&state, Some(&caller), &args).await;
         let text = result.to_string();
         assert!(
             !text.contains("chart alerts are evaluated by /api/alerts/run"),
@@ -294,7 +319,7 @@ mod tests {
         );
         let s = state();
         assert_eq!(
-            run_alert_rule(&s, &Map::new()).await,
+            run_alert_rule(&s, None, &Map::new()).await,
             json!({ "error": "id is required" })
         );
     }
