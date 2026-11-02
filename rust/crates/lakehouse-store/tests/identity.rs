@@ -29,7 +29,9 @@ use lakehouse_store::identity::{
     CreateRoleInput, CreateServiceIdentityInput, CreateTenantInput, InviteUserInput,
     ServiceIdentityFilter, TenantFilter, UserFilter, create_role, create_service_identity,
     create_tenant, create_user, delete_user, get_service_identity, get_tenant, get_user,
-    list_roles, list_service_identities, list_tenants, list_users, rotate_service_identity,
+    list_roles, list_service_identities, list_tenants, list_users, remove_user_from_tenant_in_tx,
+    resolve_roles_in_tx, rotate_service_identity, set_user_roles_in_tx, set_user_status_in_tx,
+    user_role_names_in_tx,
 };
 use sqlx::PgPool;
 
@@ -168,6 +170,149 @@ async fn create_user_rejects_an_unknown_role_and_rolls_back(pool: PgPool) -> sql
         !users.iter().any(|u| u.email == "ghost@meridian.example"),
         "the failed invite must be rolled back entirely"
     );
+    Ok(())
+}
+
+/// ADM-4 D1: `set_user_roles_in_tx` REPLACES the user's role set — a role
+/// left out of the new set is a role the user no longer holds — and
+/// `resolve_roles_in_tx` answers with the roles that exist.
+#[sqlx::test(migrations = "../../migrations")]
+async fn setting_the_roles_replaces_the_whole_set(pool: PgPool) -> sqlx::Result<()> {
+    let user = create_user(
+        &pool,
+        &InviteUserInput {
+            name: "Sinta Dewi".to_owned(),
+            email: "sinta@meridian.example".to_owned(),
+            roles: vec!["Analyst".to_owned(), "Approver".to_owned()],
+            tenants: vec!["Meridian Group".to_owned()],
+        },
+    )
+    .await
+    .unwrap();
+
+    let mut tx = pool.begin().await.unwrap();
+    let resolved = resolve_roles_in_tx(
+        &mut tx,
+        &["Approver".to_owned(), "Data Engineer".to_owned()],
+    )
+    .await
+    .unwrap();
+    assert_eq!(resolved.len(), 2, "both roles exist: {resolved:?}");
+    assert_eq!(resolved[0].name, "Approver");
+    assert_eq!(
+        resolved[0].permissions, "agent:approve, policy:review",
+        "the role's own grant travels with it, so the caller can judge it"
+    );
+
+    let role_ids: Vec<uuid::Uuid> = resolved.iter().map(|role| role.id).collect();
+    set_user_roles_in_tx(&mut tx, uuid::Uuid::parse_str(&user.id).unwrap(), &role_ids)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    let refetched = get_user(&pool, &user.id).await.unwrap();
+    assert_eq!(
+        refetched.roles,
+        vec!["Approver", "Data Engineer"],
+        "the set is replaced, not added to"
+    );
+    Ok(())
+}
+
+/// ADM-4 D1: an unknown role name resolves to nothing — the caller
+/// compares what it asked for with what it got back and answers 400 for
+/// the difference.
+#[sqlx::test(migrations = "../../migrations")]
+async fn resolving_an_unknown_role_name_returns_nothing_for_it(pool: PgPool) -> sqlx::Result<()> {
+    let mut tx = pool.begin().await.unwrap();
+    let resolved = resolve_roles_in_tx(&mut tx, &["Analyst".to_owned(), "No Such Role".to_owned()])
+        .await
+        .unwrap();
+    assert_eq!(resolved.len(), 1, "only the role that exists: {resolved:?}");
+    assert_eq!(resolved[0].name, "Analyst");
+    tx.commit().await.unwrap();
+    Ok(())
+}
+
+/// ADM-4 D2: the tenant membership really goes away, and removing a
+/// membership that is not there changes nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn removing_a_user_from_a_tenant_takes_the_membership_away(pool: PgPool) -> sqlx::Result<()> {
+    let user = create_user(
+        &pool,
+        &InviteUserInput {
+            name: "Sinta Dewi".to_owned(),
+            email: "sinta@meridian.example".to_owned(),
+            roles: vec!["Analyst".to_owned()],
+            tenants: vec!["Meridian Group".to_owned(), "Meridian Retail".to_owned()],
+        },
+    )
+    .await
+    .unwrap();
+    let user_id = uuid::Uuid::parse_str(&user.id).unwrap();
+    let retail = get_tenant(&pool, "11111111-1111-4111-8111-000000000002")
+        .await
+        .unwrap();
+
+    let mut tx = pool.begin().await.unwrap();
+    let removed =
+        remove_user_from_tenant_in_tx(&mut tx, user_id, uuid::Uuid::parse_str(&retail.id).unwrap())
+            .await
+            .unwrap();
+    assert!(removed, "a membership was there to remove");
+    let again =
+        remove_user_from_tenant_in_tx(&mut tx, user_id, uuid::Uuid::parse_str(&retail.id).unwrap())
+            .await
+            .unwrap();
+    assert!(!again, "removing it again changes nothing");
+    tx.commit().await.unwrap();
+
+    let refetched = get_user(&pool, &user.id).await.unwrap();
+    assert_eq!(refetched.tenants, vec!["Meridian Group"]);
+    Ok(())
+}
+
+/// ADM-4 D3: the status is switched, and the user's roles and tenants are
+/// untouched by it — a deactivated person is not a deleted one.
+#[sqlx::test(migrations = "../../migrations")]
+async fn setting_the_status_switches_the_user_without_touching_their_memberships(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let user = create_user(
+        &pool,
+        &InviteUserInput {
+            name: "Sinta Dewi".to_owned(),
+            email: "sinta@meridian.example".to_owned(),
+            roles: vec!["Analyst".to_owned()],
+            tenants: vec!["Meridian Group".to_owned()],
+        },
+    )
+    .await
+    .unwrap();
+    let user_id = uuid::Uuid::parse_str(&user.id).unwrap();
+
+    let mut tx = pool.begin().await.unwrap();
+    set_user_status_in_tx(&mut tx, user_id, "inactive")
+        .await
+        .unwrap();
+    assert_eq!(
+        user_role_names_in_tx(&mut tx, user_id).await.unwrap(),
+        vec!["Analyst"],
+        "the roles are still there"
+    );
+    tx.commit().await.unwrap();
+
+    let refetched = get_user(&pool, &user.id).await.unwrap();
+    assert_eq!(refetched.status, "inactive");
+    assert_eq!(refetched.roles, vec!["Analyst"]);
+    assert_eq!(refetched.tenants, vec!["Meridian Group"]);
+
+    let mut tx = pool.begin().await.unwrap();
+    set_user_status_in_tx(&mut tx, user_id, "active")
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(get_user(&pool, &user.id).await.unwrap().status, "active");
     Ok(())
 }
 
