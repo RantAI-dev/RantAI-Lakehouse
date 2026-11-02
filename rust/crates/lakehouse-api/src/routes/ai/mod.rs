@@ -1512,7 +1512,12 @@ fn llm_unavailable_body(err: &lakehouse_llm::LlmError) -> Value {
     };
     let failure = upstream_error::report(&upstream_error::MODEL, class, err);
     json!({
-        "error": "AI Copilot is unavailable",
+        // AI-23 (product owner 2026-11-02): one sentence for an unavailable
+        // assistant. The console renders this field verbatim when the body
+        // carries no `detail` (it prefers `detail`), so it is a complete
+        // sentence with its full stop — the same one a headless run's step
+        // shows.
+        "error": "AI Copilot is unavailable.",
         "errorId": failure.reference(),
         "detail": llm_error_detail(err),
         "hint": "Check LLM_URL, LLM_MODEL and LLM_KEY on the API service.",
