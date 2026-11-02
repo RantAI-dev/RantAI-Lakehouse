@@ -387,7 +387,7 @@ their opt-in compose profiles:
 | `CH_HTTP_HOST_PORT` / `CH_NATIVE_HOST_PORT` | Host ports for ClickHouse's HTTP and native interfaces | `8123` / `9000` | No |
 | `CH_DB` | ClickHouse default database created at first boot | `default` | No |
 | `API_HOST_PORT` | Host port for `lakehouse-api` | `8080` | No |
-| `DAGSTER_WEBSERVER_HOST_PORT` | Host port for the Dagster webserver (`dagster` profile) | `3000` | No |
+| `DAGSTER_WEBSERVER_HOST_PORT` | Host port for the Dagster webserver (`dagster` profile). It is published on the host's loopback only (`127.0.0.1`): Dagster's UI has no sign-in, so anyone who can reach the port can launch runs, and nothing outside the compose network needs it (the API reaches it in-network). Reach the UI through an SSH tunnel | `3001` | No |
 | `SEAWEEDFS_S3_HOST_PORT` | Host port for SeaweedFS's S3 API (`seaweedfs` profile) | `8333` | No |
 | `DAGSTER_PG_DB` | Dagster's own Postgres database, created on the existing `postgres` service | `dagster` | No |
 | `OPENFGA_PG_DB` | OpenFGA's own Postgres database | `openfga` | No |
