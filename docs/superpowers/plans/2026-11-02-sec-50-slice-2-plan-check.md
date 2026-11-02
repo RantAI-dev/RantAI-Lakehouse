@@ -549,3 +549,23 @@ embed and the public-link board make per tile — the gate is built in `embed.rs
 - **Not verified, with the reasons given:** the M2 wall-clock benchmark (covered structurally by the once-per-request test) and the AI-15 eval.
 
 **Open: no BLOCKER, no SHOULD-FIX.** The merge waits for the PR's CI, which runs the full workspace and the G-gates.
+
+### Review round 2 (planner, 2026-11-02, at `84029cb`): CI's `Rust · test (stable)` fails
+
+**BLOCKER 1. `tests/dashboard_export.rs` fails 7 of 11 tests in CI** (run `41497498109`, job `125456516149`). Every one of them gets 404 where 200 is expected:
+- `a_person_whose_every_role_is_switched_off_cannot_export` (`:644`)
+- `the_cap_is_a_million_rows_and_a_smaller_result_is_not_cut` (`:510`)
+- `the_csv_download_is_formatted_or_raw_as_asked` (`:754`)
+- `the_excel_download_is_masked_keeps_numbers_as_numbers_and_is_audited` (`:682`)
+- `the_export_carries_the_tiles_own_filters_and_refuses_one_that_no_longer_applies` (`:339`)
+- `the_export_of_a_joined_table_lists_joined_columns_and_governs_each_table` (`:439`)
+- one more, in the same file.
+
+The handoff says every integration target was green, so either this target was not run, or it passes locally for an environment reason that CI does not share.
+
+**Most likely cause, to verify, not to assume:** T3's download gate (or the tile runner's, from T2) refuses the test's principal. The fixture's principal is probably not a member of the catalog tenant the gate resolves, and the 404 is the gate's SEC-20 answer. These tests export a real dashboard on purpose, so the fixture must set up a principal the gate admits.
+
+**The fix:**
+- Make the fixture honest: a principal in the catalog's tenant, using the same helper the other gated tests use (rule 4).
+- Weaken no assertion (rule 2). If a test was relying on the hole the gate closes, change that test only with the reason at the site.
+- Then run `cargo test -p lakehouse-api --test dashboard_export`, and EVERY `--test` target. List them with `ls rust/crates/lakehouse-api/tests/*.rs` and quote each count, so the handoff's "every target green" is literally true.
