@@ -284,3 +284,11 @@ test, and the scratch `ClickHouse` of the D5 measurement was removed. Nothing wa
 The row exists (`BACKLOG.md:272`, Todo). The proposed text replaces it:
 
 | `DATA-42` | Task | Four readers still count a slug that is in both Bronze registries twice, and none of them reads with `FINAL`: `governance` classification (`routes/governance.rs`), `overview` (`routes/overview.rs`), `storage` (`routes/storage.rs`) and `lineage` publishers (`routes/lineage.rs`). `catalog_profile::bronze_table_name` takes an unordered `LIMIT 1` over both. Apply `DATA-40`'s rule (the primary wins) through the same `NOT_IN_PRIMARY` constant, add `FINAL`, and test each reader on a real `ClickHouse` with one shared fixture. The list is the `DATA-40` handoff's D6 table, with `file:line` | Data | P3 | Todo |  | `superpowers/plans/2026-11-01-data-40-one-name-one-dataset.md` |
+
+### Review round 1 (planner, 2026-11-02, at `713fd6c0`)
+
+- **T1–T4** match D1–D4. Every reader of both Bronze registries reads with `FINAL` and drops the slugs the primary holds, through the one `NOT_IN_PRIMARY` clause (rule 4). The shared registry fixture moved into `bronze_registry_fixture.rs` instead of a copy per module.
+- **The tests fail on the old statement.** This was measured: T4 had 2 failed and 1 passed. The developer recorded that the pinned clash test passes on the old statement too, so the other two tests carry the proof. Accepted.
+- **D5 is a new finding, not fixed here.** The catalog list's `LIMIT 500` binds to the last `SELECT` of the unparenthesized `UNION ALL`, so the primary branch is uncapped (503, 1104 and 607 rows measured). It behaves the same before and after this PR. Filed as a backlog item in the backlog docs PR (`DATA-43`).
+
+**Open: no BLOCKER, no SHOULD-FIX.** Merge waits for the PR's CI, which runs the full workspace.
