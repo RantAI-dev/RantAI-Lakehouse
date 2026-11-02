@@ -1652,68 +1652,313 @@
           "id": {
             "type": "string"
           },
-          "title": {},
-          "subtitle": {},
-          "mart": {},
-          "kind": {},
-          "sqlSource": {},
-          "text": {},
-          "caption": {},
-          "target": {},
-          "dimension": {},
-          "measures": {},
-          "breakdown": {},
-          "map": {},
-          "lat": {},
-          "lon": {},
-          "aggregate": {},
-          "limit": {},
-          "span": {},
-          "click": {},
-          "grain": {},
-          "board": {},
-          "tableMode": {},
-          "columns": {},
-          "rows": {},
-          "values": {},
-          "totals": {},
-          "sortColumn": {},
-          "sortDir": {},
-          "columnSettings": {},
-          "compare": {},
-          "goodDirection": {},
-          "referenceLines": {},
-          "filters": {},
-          "layers": {},
-          "draw": {},
-          "axis": {},
-          "sort": {},
-          "other": {},
-          "steps": {},
-          "joins": {},
-          "groupings": {},
-          "bin": {},
-          "breakdownBin": {},
-          "grid": {},
-          "format": {},
-          "valueFormats": {},
-          "dateFormat": {},
-          "colors": {},
-          "axes": {},
-          "labels": {},
-          "annotations": {},
-          "tooltip": {},
-          "conditional": {},
-          "clusters": {},
-          "todayLine": {},
-          "goal": {},
-          "bands": {},
-          "histogram": {},
-          "url": {},
-          "alt": {},
-          "start": {},
-          "end": {},
-          "progress": {}
+          "title": {
+            "type": "string"
+          },
+          "subtitle": {
+            "type": "string"
+          },
+          "mart": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "sqlSource": {
+            "type": "string"
+          },
+          "text": {
+            "type": "string"
+          },
+          "caption": {
+            "type": "string"
+          },
+          "target": {
+            "type": "number"
+          },
+          "dimension": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "object"
+              }
+            ]
+          },
+          "measures": {
+            "type": "array",
+            "items": {
+              "oneOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "object"
+                },
+                {
+                  "type": "object"
+                },
+                {
+                  "type": "object"
+                }
+              ]
+            }
+          },
+          "breakdown": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "object"
+              }
+            ]
+          },
+          "map": {
+            "type": "string"
+          },
+          "lat": {
+            "type": "string"
+          },
+          "lon": {
+            "type": "string"
+          },
+          "aggregate": {
+            "type": "string"
+          },
+          "limit": {
+            "oneOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "object"
+              }
+            ]
+          },
+          "span": {
+            "type": "number"
+          },
+          "click": {
+            "type": "object"
+          },
+          "grain": {
+            "type": "string"
+          },
+          "board": {
+            "type": "string"
+          },
+          "tableMode": {
+            "type": "string"
+          },
+          "columns": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "rows": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "values": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "totals": {
+            "type": "string"
+          },
+          "sortColumn": {
+            "type": "string"
+          },
+          "sortDir": {
+            "type": "string"
+          },
+          "columnSettings": {
+            "type": "object"
+          },
+          "compare": {
+            "type": "object"
+          },
+          "goodDirection": {
+            "type": "string"
+          },
+          "referenceLines": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "filters": {
+            "type": "array",
+            "items": {
+              "oneOf": [
+                {
+                  "type": "object"
+                },
+                {
+                  "type": "object"
+                }
+              ]
+            }
+          },
+          "layers": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "draw": {
+            "type": "string"
+          },
+          "axis": {
+            "type": "string"
+          },
+          "sort": {
+            "type": "object"
+          },
+          "other": {
+            "type": "boolean"
+          },
+          "steps": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "joins": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "groupings": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "bin": {
+            "type": "object"
+          },
+          "breakdownBin": {
+            "type": "object"
+          },
+          "grid": {
+            "type": "object"
+          },
+          "format": {
+            "oneOf": [
+              {
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "valueFormats": {
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "dateFormat": {
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "colors": {
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "axes": {
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "labels": {
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "annotations": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "object"
+            }
+          },
+          "tooltip": {
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "conditional": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "object"
+            }
+          },
+          "clusters": {
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "todayLine": {
+            "type": "boolean"
+          },
+          "goal": {
+            "oneOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "object"
+              }
+            ]
+          },
+          "bands": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            }
+          },
+          "histogram": {
+            "type": "object"
+          },
+          "url": {
+            "type": "string"
+          },
+          "alt": {
+            "type": "string"
+          },
+          "start": {
+            "type": "string"
+          },
+          "end": {
+            "type": "string"
+          },
+          "progress": {
+            "type": "string"
+          }
         },
         "required": [
           "id",
