@@ -217,3 +217,19 @@ ignored by `eslint.config.mjs`). `bunx eslint . --ignore-pattern 'dagster/.venv/
 
 
 **Migration number (planner, 2026-11-02):** the index migration is `0121`.
+
+### Review round 1 (planner, 2026-11-02, at `543f0dfd`)
+
+- **T1 (D1, D2, D5).**
+  - Migration `0121` has a why-header. Its index is deliberately not partial, because deleted rows count against the limit.
+  - `insert` counts and writes under one advisory key per author, `dashboard_comment_post:<author>`, so two posts sent at once cannot both get in.
+  - `mark_mentions_read` takes an optional board.
+- **T2 (D3, D4).** At the limit the API answers 429 with `Retry-After` and a fixed sentence. Mark-read for one board goes through `target_for`.
+- **T3 (D6).** The panel marks its own board read once per open, and the navbar count follows through the event. The text being typed is kept when a post is refused.
+- **Numbers.** The default of 10 posts in 5 minutes holds until the owner answers.
+- **Counts (the developer's):**
+  - store `dashboard_comments`: 13; routes: 17; `route_auth`: 73; `--lib`: 6;
+  - console: 164;
+  - clippy and fmt: clean.
+
+**Open: no BLOCKER, no SHOULD-FIX.** The merge waits for the PR's CI.
