@@ -43,7 +43,6 @@ use crate::preflight;
 use crate::release;
 use crate::secrets;
 use crate::state;
-use crate::sys;
 use crate::verify;
 
 /// How long the stack may take to become ready.
@@ -168,7 +167,7 @@ fn write_layout(
     // re-install of the same release changes nothing of it.
     state::write_initial(dir, &manifest.version)?;
 
-    secrets::write_env(&dir.join(".env"), sys::port_is_free).map_err(|source| ToolError::Io {
+    secrets::write_env(&dir.join(".env")).map_err(|source| ToolError::Io {
         context: format!("{} could not be written", dir.join(".env").display()),
         source,
     })

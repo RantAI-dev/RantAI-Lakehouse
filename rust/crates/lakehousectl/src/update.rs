@@ -80,7 +80,6 @@ use crate::rollback;
 use crate::runner::{self, Local, Runner};
 use crate::secrets;
 use crate::state;
-use crate::sys;
 use crate::verify;
 use crate::version;
 
@@ -430,7 +429,7 @@ pub fn run(dir: &Path, facts: &Facts, runner: &mut dyn Runner) -> Result<(), Too
 /// that starts without them would run no pipeline, and say nothing
 /// about it.
 fn set_profiles(dir: &Path) -> Result<(), ToolError> {
-    match secrets::ensure_release_profiles(dir, sys::port_is_free) {
+    match secrets::ensure_release_profiles(dir) {
         Ok(true) => {
             println!(
                 "lakehousectl: the install now runs the {} profile.",
