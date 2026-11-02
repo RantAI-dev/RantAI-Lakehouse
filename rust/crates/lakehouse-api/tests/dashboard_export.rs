@@ -196,8 +196,8 @@ async fn get(router: &axum::Router, uri: &str, cookie: &str) -> axum::http::Resp
 /// tenant gate (`StatementGate` as the caller). The seeded identity
 /// migration holds four tenants and this app names no `CATALOG_TENANT_ID`,
 /// so the gate found no tenant that owns the catalog and refused the
-/// statement with `SEC-20`'s 404 ("Table not found or not available to your
-/// organisation: serving.mart_x") — the fixture, not the route, was wrong.
+/// statement with `SEC-20`'s 404 (`Table not found or not available to your
+/// organisation: serving.mart_x`) — the fixture, not the route, was wrong.
 /// The deployment now names the catalog's tenant and the exporter is a
 /// member of it, exactly as the other gated tests do
 /// (`common::in_the_catalog_tenant`).
