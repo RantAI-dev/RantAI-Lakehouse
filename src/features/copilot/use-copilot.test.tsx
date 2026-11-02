@@ -12,7 +12,7 @@ mock.module("next/navigation", () => ({
   usePathname: () => "/dashboards/main-board",
 }));
 
-const { CopilotProvider, useCopilot, continuationText } = await import("./use-copilot");
+const { CopilotProvider, useCopilot, continuationText, chatHistory, STOPPED_ANSWER_TEXT } = await import("./use-copilot");
 
 /** A draft the model made and the person still has to confirm. */
 type Draft = { tool: string; args: Record<string, unknown>; summary: string };
@@ -41,6 +41,8 @@ let drafts: Draft[] = [defaultDraft];
 let readSteps: ReadStep[] = [];
 /** The steps the model says the request still has. */
 let nextStep: string | null = "add two charts";
+/** Whether the chat answer hangs until the person stops it. */
+let slowChat = false;
 
 /** A response the hook can read: the body as one chunk, and a JSON body. */
 function fakeResponse(body: string, json: unknown): Response {
@@ -57,6 +59,25 @@ function fakeResponse(body: string, json: unknown): Response {
           sent = true;
           return { done: false, value: encoder.encode(body) };
         },
+      }),
+    },
+  } as unknown as Response;
+}
+
+/** A chat answer that has sent nothing and rejects when the person stops it. */
+function hangingResponse(signal?: AbortSignal): Response {
+  return {
+    ok: true,
+    status: 200,
+    json: async () => ({}),
+    body: {
+      getReader: () => ({
+        read: () =>
+          new Promise((_resolve, reject) => {
+            signal?.addEventListener("abort", () =>
+              reject(new DOMException("Aborted", "AbortError")),
+            );
+          }),
       }),
     },
   } as unknown as Response;
@@ -101,11 +122,13 @@ beforeEach(() => {
   drafts = [defaultDraft];
   readSteps = [];
   nextStep = "add two charts";
+  slowChat = false;
   globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = typeof input === "string" ? input : String(input);
     const body = typeof init?.body === "string" ? init.body : "";
     if (url.startsWith("/api/ai/chat")) {
       chatRequests.push({ body });
+      if (slowChat) return hangingResponse(init?.signal ?? undefined);
       return fakeResponse(chatBody(), {});
     }
     if (url === "/api/ai/tool") {
@@ -364,5 +387,82 @@ describe("the Copilot goes on after the draft is confirmed (AI-15)", () => {
     expect(continuationText(messages, 0, "add the chart")).toBe(
       'Confirmed and saved: create_calculated_field f1 "Margin". Do not draft these again. Continue: add the chart',
     );
+  });
+});
+
+describe("a stopped answer stays in the history (BI-41 D3)", () => {
+  it("sends the fixed line between the stopped question and the next one", () => {
+    const messages: Msg[] = [
+      { role: "user", content: "How many events are there?" },
+      { role: "assistant", content: "", stopped: true },
+      { role: "user", content: "And how many visitors?" },
+    ];
+
+    expect(chatHistory(messages)).toEqual([
+      { role: "user", content: "How many events are there?" },
+      { role: "assistant", content: STOPPED_ANSWER_TEXT },
+      { role: "user", content: "And how many visitors?" },
+    ]);
+  });
+
+  it("sends a session saved before this change, with no line stored, the same way", () => {
+    // An older saved session stores the stopped answer as empty content and
+    // `stopped: true`, exactly as today; no migration is needed.
+    const saved: Msg[] = [
+      { role: "user", content: "How many events are there?" },
+      { role: "assistant", content: "", stopped: true },
+    ];
+
+    expect(chatHistory(saved).at(-1)).toEqual({ role: "assistant", content: STOPPED_ANSWER_TEXT });
+  });
+
+  it("still drops empty messages that were not stopped", () => {
+    const messages: Msg[] = [
+      { role: "user", content: "Hi." },
+      { role: "assistant", content: "" },
+    ];
+
+    expect(chatHistory(messages)).toEqual([{ role: "user", content: "Hi." }]);
+  });
+
+  it("leaves a continuation's history unchanged", () => {
+    const continuation =
+      'Confirmed and saved: create_board b1 "Overview". Do not draft these again. Continue: add two charts';
+    const messages: Msg[] = [
+      { role: "user", content: "Build me a dashboard about events." },
+      { role: "assistant", content: "The board draft is ready." },
+      { role: "user", content: continuation },
+    ];
+
+    expect(chatHistory(messages)).toEqual([
+      { role: "user", content: "Build me a dashboard about events." },
+      { role: "assistant", content: "The board draft is ready." },
+      { role: "user", content: continuation },
+    ]);
+  });
+
+  it("sends the line in the request after the person stops an answer", async () => {
+    slowChat = true;
+    renderCopilot();
+    act(() => {
+      void copilot!.send("How many events are there?");
+    });
+    await waitFor(() => expect(chatRequests.length).toBe(1));
+    act(() => {
+      copilot!.stop();
+    });
+    await waitFor(() => expect(copilot!.busy).toBe(false));
+    expect(copilot!.messages.at(-1)?.stopped).toBe(true);
+
+    slowChat = false;
+    await act(async () => {
+      await copilot!.send("And how many visitors?");
+    });
+
+    expect(sentMessages(1)).toEqual([
+      { role: "user", content: "How many events are there?" },
+      { role: "assistant", content: STOPPED_ANSWER_TEXT },
+      { role: "user", content: "And how many visitors?" },
+    ]);
   });
 });

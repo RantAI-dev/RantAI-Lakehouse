@@ -86,6 +86,30 @@ type ChatResult = {
 const RECENT_SESSIONS = 20;
 
 /**
+ * The line a stopped answer is sent to the model as (`BI-41` D3). An answer
+ * stopped mid-way is saved as an assistant message with empty content and
+ * `stopped: true`; the request used to drop every empty message, so the
+ * model saw the stopped question as an unanswered user turn directly before
+ * the new one and answered both. The saved message is unchanged, so a
+ * session saved before this line is sent the same way.
+ */
+export const STOPPED_ANSWER_TEXT = "(The person stopped this answer before it finished.)";
+
+/**
+ * The messages a chat request sends (`BI-41` D3): every message with content,
+ * and a stopped answer as [`STOPPED_ANSWER_TEXT`]. Other empty messages are
+ * still dropped: they carry nothing the model can use.
+ */
+export function chatHistory(messages: Msg[]): { role: Msg["role"]; content: string }[] {
+  return messages.flatMap((m) => {
+    if (m.role === "assistant" && m.stopped) {
+      return [{ role: m.role, content: STOPPED_ANSWER_TEXT }];
+    }
+    return m.content ? [{ role: m.role, content: m.content }] : [];
+  });
+}
+
+/**
  * The text a continuation is sent as (`AI-15`): the objects the person
  * confirmed and that were saved, then the step the request still has.
  * The model reads only the text of the chat, so the saved objects have
@@ -339,7 +363,7 @@ function useCopilotState() {
           stream: true,
           tools: toolsFromCaps(enabledCaps, mode),
           context: pageContextRef.current?.system,
-          messages: next.filter((m) => m.content).map((m) => ({ role: m.role, content: m.content })),
+          messages: chatHistory(next),
         }),
       });
       if (!res.ok) throw new Error(chatErrorText(await res.json().catch(() => null)));

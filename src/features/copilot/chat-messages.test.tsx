@@ -70,6 +70,17 @@ describe("ChatMessages (RantAI-Agents layout)", () => {
     expect(view.getByText("Checking the catalog")).toBeDefined()
     expect(view.getByText("Running Search datasets…")).toBeDefined()
   })
+
+  it('shows a stopped answer as "Response stopped.", not the line the model is sent (BI-41 D3)', () => {
+    const stopped: Msg[] = [
+      { id: "u1", role: "user", content: "How many events?" },
+      { id: "a1", role: "assistant", content: "", stopped: true },
+    ]
+    const { container } = render(<ChatMessages messages={stopped} busy={false} />)
+    const view = within(container)
+    expect(view.getByText("Response stopped.")).toBeDefined()
+    expect(container.textContent).not.toContain("The person stopped this answer")
+  })
 })
 
 const ASK_STEP = {
