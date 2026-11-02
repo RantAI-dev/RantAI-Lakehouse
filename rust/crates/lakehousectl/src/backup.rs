@@ -49,13 +49,45 @@ pub fn command(args: &BackupArgs) -> Result<(), ToolError> {
     let dir = &args.dir;
     let script = backup_script(dir);
     require_script(&script)?;
-    let root = dir.join("backups");
-    let output = run(&script, &[root.to_string_lossy().to_string()], dir)?;
 
-    let backup = backup_dir_of(&output)?;
+    // The version the backup belongs to: the release that is installed,
+    // as the state names it. It is passed to the script so the backup
+    // is named after the release even when the API cannot be asked.
+    let version = state::read(dir)
+        .ok()
+        .and_then(|state| state.current_version)
+        .filter(|version| !version.is_empty());
+
+    let backup = take(dir, version.as_deref())?;
     state::set_last_backup(dir, &backup)?;
     println!("lakehousectl: the backup is recorded in the install's state.");
     Ok(())
+}
+
+/// Take a backup of the stack, and say which backup it is.
+///
+/// The version the backup belongs to is passed to the shipped script:
+/// an update STOPS the API before the backup (REL-2 S4 decision D17),
+/// so the script cannot read the version from the API, and D17 names
+/// the backup after the release it is replacing. Without a version the
+/// script reads the API, exactly as it always did.
+///
+/// # Errors
+///
+/// Returns the error that stopped the backup: a script the release does
+/// not ship, a script that failed, or a summary that names no backup.
+pub fn take(dir: &Path, version: Option<&str>) -> Result<PathBuf, ToolError> {
+    let dir = absolute(dir)?;
+    let script = backup_script(&dir);
+    require_script(&script)?;
+    let root = dir.join("backups");
+    let output = run(
+        &script,
+        &[root.to_string_lossy().to_string()],
+        &dir,
+        version,
+    )?;
+    backup_dir_of(&output)
 }
 
 /// Run `lakehousectl restore`.
@@ -66,11 +98,45 @@ pub fn command(args: &BackupArgs) -> Result<(), ToolError> {
 /// does not ship, or a script that failed.
 pub fn command_restore(args: &RestoreArgs) -> Result<(), ToolError> {
     let dir = &args.dir;
-    let script = restore_script(dir);
+    restore(dir, &args.backup)
+}
+
+/// Restore a backup of the stack.
+///
+/// # Errors
+///
+/// Returns the error that stopped the restore: a script the release
+/// does not ship, or a script that failed.
+pub fn restore(dir: &Path, backup: &Path) -> Result<(), ToolError> {
+    let dir = absolute(dir)?;
+    let script = restore_script(&dir);
     require_script(&script)?;
-    let backup = args.backup.to_string_lossy().to_string();
-    run(&script, &["--local".to_string(), backup], dir)?;
+    let backup = backup.to_string_lossy().to_string();
+    run(&script, &["--local".to_string(), backup], &dir, None)?;
     Ok(())
+}
+
+/// The install's own directory, as an ABSOLUTE path.
+///
+/// The shipped scripts `cd` into the deployment's directory, and they
+/// hand their paths to `docker run -v` — and docker reads a RELATIVE
+/// path there as a volume NAME, and refuses it ("invalid characters
+/// for a local volume name"). So the tool hands the scripts an
+/// absolute directory: the same directory, and a path docker reads as
+/// a path.
+///
+/// # Errors
+///
+/// Returns the error that says what could not be read.
+fn absolute(dir: &Path) -> Result<PathBuf, ToolError> {
+    if dir.is_absolute() {
+        return Ok(dir.to_path_buf());
+    }
+    let current = std::env::current_dir().map_err(|source| ToolError::Io {
+        context: "the current directory could not be read".to_string(),
+        source,
+    })?;
+    Ok(current.join(dir))
 }
 
 /// The script that takes a backup, in the install's own directory.
@@ -102,17 +168,23 @@ fn require_script(script: &Path) -> Result<(), ToolError> {
 /// The script's own output goes to the operator: it says what it does,
 /// step by step, and a backup that is silent is a backup nobody can
 /// trust.
-fn run(script: &Path, args: &[String], dir: &Path) -> Result<String, ToolError> {
+fn run(
+    script: &Path,
+    args: &[String],
+    dir: &Path,
+    version: Option<&str>,
+) -> Result<String, ToolError> {
     let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
-    let output = sys::output_or_stderr_with_env(
-        &script.to_string_lossy(),
-        &borrowed,
-        &[
-            ("LAKEHOUSE_DIR", &dir.to_string_lossy()),
-            ("COMPOSE_PROJECT", docker::PROJECT),
-        ],
-    )
-    .map_err(|error| ToolError::Failed(format!("the backup tool failed: {error}")))?;
+    let deployment = dir.to_string_lossy();
+    let mut environment: Vec<(&str, &str)> = vec![
+        ("LAKEHOUSE_DIR", &deployment),
+        ("COMPOSE_PROJECT", docker::PROJECT),
+    ];
+    if let Some(version) = version {
+        environment.push(("BACKUP_VERSION", version));
+    }
+    let output = sys::output_or_stderr_with_env(&script.to_string_lossy(), &borrowed, &environment)
+        .map_err(|error| ToolError::Failed(format!("the backup tool failed: {error}")))?;
     println!("{output}");
     Ok(output)
 }
@@ -139,23 +211,35 @@ fn backup_dir_of(output: &str) -> Result<PathBuf, ToolError> {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-    use std::os::unix::fs::PermissionsExt;
-
     use super::*;
 
-    /// A fake tool, in the install's own directory, that records what
+    /// The fake tool, in the install's own directory, that records what
     /// it was asked to do.
+    ///
+    /// The tool is a COMMITTED file, symlinked into the install's own
+    /// `tools/` directory: the file the tool EXECUTES is then a file
+    /// nobody writes, so the kernel cannot answer `ETXTBSY` ("Text
+    /// file busy") — what it answers when the file being executed still
+    /// has an open write descriptor.
+    ///
+    /// Writing the fake tool and then executing it was the flake: the
+    /// file the tool ran was the file the test had just written, and a
+    /// test binary with four threads can leave another thread's child
+    /// holding the write descriptor of that file (REL-2 S4b review
+    /// round 2 SHOULD-FIX 3).
     ///
     /// The record is written next to the install's own directory, so the
     /// test can read it without an environment variable the tool would
     /// have to pass.
-    fn fake_tool(dir: &Path, name: &str, body: &str) {
+    ///
+    /// The `mode` says what the fake tool does: `backup`, `restore`,
+    /// `silent` or `fail`.
+    fn fake_tool(dir: &Path, name: &str, mode: &str) {
         let tools = dir.join("tools");
         std::fs::create_dir_all(&tools).expect("the tools directory is created");
         let path = tools.join(name);
-        std::fs::write(&path, body).expect("the tool is written");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-            .expect("the tool is executable");
+        std::os::unix::fs::symlink(FIXTURE, &path).expect("the tool is linked");
+        std::fs::write(dir.join("fake-tool-mode"), mode).expect("the mode is written");
     }
 
     /// The record the fake tool wrote.
@@ -163,30 +247,40 @@ mod tests {
         std::fs::read_to_string(dir.join("record.txt")).expect("the record is readable")
     }
 
-    const FAKE_BACKUP: &str = r#"#!/bin/sh
-record="$(dirname "$0")/../record.txt"
-{
-  echo "LAKEHOUSE_DIR=$LAKEHOUSE_DIR"
-  echo "COMPOSE_PROJECT=$COMPOSE_PROJECT"
-  echo "ARGS=$*"
-} >> "$record"
-echo "==> Backup complete: $LAKEHOUSE_DIR/backups/20261101T000000Z-0.2.0"
-"#;
+    /// The fake tool the tests run: a committed file, linked into the
+    /// install's own `tools/` directory.
+    const FIXTURE: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/shipped-tool.sh"
+    );
 
-    const FAKE_RESTORE: &str = r#"#!/bin/sh
-record="$(dirname "$0")/../record.txt"
-{
-  echo "LAKEHOUSE_DIR=$LAKEHOUSE_DIR"
-  echo "COMPOSE_PROJECT=$COMPOSE_PROJECT"
-  echo "ARGS=$*"
-} >> "$record"
-echo "the restore is done"
-"#;
+    #[test]
+    fn the_shipped_script_is_given_an_absolute_directory() {
+        // The shipped scripts `cd` into the deployment's directory and
+        // hand their paths to `docker run -v`, which reads a RELATIVE
+        // path as a volume name and refuses it. The tool hands them an
+        // absolute one.
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        fake_tool(directory.path(), "backup-local.sh", "backup");
+        state::write_initial(directory.path(), "0.1.0").expect("the state is written");
+
+        let relative = std::path::PathBuf::from("relative-install");
+        let absolute = absolute(&relative).expect("the directory is made absolute");
+
+        assert!(
+            absolute.is_absolute(),
+            "the directory is still relative: {absolute:?}"
+        );
+        assert!(
+            absolute.ends_with("relative-install"),
+            "the directory names something else: {absolute:?}"
+        );
+    }
 
     #[test]
     fn the_backup_runs_the_shipped_script_with_the_deployments_own_directory() {
         let directory = tempfile::tempdir().expect("a temporary directory");
-        fake_tool(directory.path(), "backup-local.sh", FAKE_BACKUP);
+        fake_tool(directory.path(), "backup-local.sh", "backup");
         state::write_initial(directory.path(), "0.2.0").expect("the state is written");
 
         let args = BackupArgs {
@@ -216,9 +310,34 @@ echo "the restore is done"
     }
 
     #[test]
+    fn the_backup_is_told_which_version_it_belongs_to() {
+        // REL-2 S4 decision D17: the update stops the API before it
+        // backs up, so the script cannot ask the API which version the
+        // backup belongs to. The tool knows, and says so.
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        fake_tool(directory.path(), "backup-local.sh", "backup");
+        state::write_initial(directory.path(), "0.1.0").expect("the state is written");
+
+        let backup = take(directory.path(), Some("0.1.0")).expect("the backup runs");
+
+        assert_eq!(
+            backup
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string()),
+            Some("20261101T000000Z-0.2.0".to_string()),
+            "the fake tool named another backup"
+        );
+        let written = record(directory.path());
+        assert!(
+            written.contains("BACKUP_VERSION=0.1.0"),
+            "the tool was not told the version: {written}"
+        );
+    }
+
+    #[test]
     fn the_backup_records_where_it_is_in_the_installs_state() {
         let directory = tempfile::tempdir().expect("a temporary directory");
-        fake_tool(directory.path(), "backup-local.sh", FAKE_BACKUP);
+        fake_tool(directory.path(), "backup-local.sh", "backup");
         state::write_initial(directory.path(), "0.2.0").expect("the state is written");
 
         let args = BackupArgs {
@@ -243,7 +362,7 @@ echo "the restore is done"
     #[test]
     fn the_restore_runs_the_shipped_script_with_the_backup_directory() {
         let directory = tempfile::tempdir().expect("a temporary directory");
-        fake_tool(directory.path(), "restore-from-backup.sh", FAKE_RESTORE);
+        fake_tool(directory.path(), "restore-from-backup.sh", "restore");
 
         let args = RestoreArgs {
             backup: PathBuf::from("/backups/one"),
@@ -286,11 +405,7 @@ echo "the restore is done"
     #[test]
     fn a_tool_that_fails_says_what_it_said() {
         let directory = tempfile::tempdir().expect("a temporary directory");
-        fake_tool(
-            directory.path(),
-            "backup-local.sh",
-            "#!/bin/sh\necho 'the volume is not there' >&2\nexit 1\n",
-        );
+        fake_tool(directory.path(), "backup-local.sh", "fail");
 
         let error = command(&BackupArgs {
             dir: directory.path().to_path_buf(),
@@ -308,11 +423,7 @@ echo "the restore is done"
         // The state and the backup have to agree: a `lastBackup` that
         // names nothing is worse than none.
         let directory = tempfile::tempdir().expect("a temporary directory");
-        fake_tool(
-            directory.path(),
-            "backup-local.sh",
-            "#!/bin/sh\necho 'done'\n",
-        );
+        fake_tool(directory.path(), "backup-local.sh", "silent");
         state::write_initial(directory.path(), "0.2.0").expect("the state is written");
 
         let error = command(&BackupArgs {

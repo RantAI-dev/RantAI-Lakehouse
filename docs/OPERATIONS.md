@@ -335,7 +335,21 @@ compose up`. Brings up `dagster-db-init` (one-shot: creates Dagster's own
 `dagster` database on the existing `postgres` service), `dagster-code-location`
 (a gRPC server serving `dispar_orchestrate.definitions`, built from
 `dagster/Dockerfile` — see ADR 0005), `dagster-webserver` (GraphQL API +
-UI, port `3000`), and `dagster-daemon` (schedules/sensors/run queueing).
+UI, container port `3000`), and `dagster-daemon` (schedules/sensors/run
+queueing).
+
+**The Dagster UI is published on the host's loopback only**
+(`127.0.0.1:${DAGSTER_WEBSERVER_HOST_PORT:-3001}:3000`, REL-2 S4b review
+round 4, D23). Its UI has no sign-in: anyone who can reach the port can
+launch runs. Nothing outside the compose network needs it — the API and
+the jobs reach the GraphQL API in-network, at
+`http://dagster-webserver:3000/graphql` — and the default port `3001`
+keeps it clear of the console's `3000`. An operator reaches the UI
+through an SSH tunnel:
+
+```bash
+ssh -L 3001:127.0.0.1:3001 <host>   # then open http://127.0.0.1:3001
+```
 
 Put `DAGSTER_URL` in `.env` — do **not** rely on prefixing it onto a single
 command:

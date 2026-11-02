@@ -1878,6 +1878,585 @@ the reviewer (AGENTS.md, step 6).
   `x86_64-unknown-linux-musl` target is not installed on this machine.
 - **`cargo deny check`** was not run: no dependency changed (no crate's `Cargo.toml` is touched).
 
+### Handoff S4b (developer, 2026-11-02)
+
+The developer of S4b lost their machine (bluefin) before this handoff was written, and the
+reviewer wrote "Review S4b round 1" instead. This is the handoff the slice was missing: the
+commits that are on the branch, read from the code, the counts of the checks, and what was not
+verified.
+
+**Commits** (branch `feat/rel-2-s4b-lakehousectl-update`, base `main` at `c239e3b0`), in plan
+order:
+
+| Commit | Task | What |
+| --- | --- | --- |
+| `42fa7b6b` | S4-T4 (D17, D18) | `lakehousectl update` and `lakehousectl rollback`: the nine steps of D17 in their order (`update.rs`), the restore of D18 (`rollback.rs`), and every step that touches the machine behind ONE trait, `runner::Runner` (`runner.rs`), so the whole path is driven by a fake |
+| `ac095fc2` | S4-T5 (D19) | `lakehousectl status`: the five things D19 names — the installed release and the one before it, every service's state, the API's own `/health/ready`, the backups newest first with their size, and whether a newer release exists (offline it says it did NOT check) |
+| `11a43698` | S4-T6 (D20) | `lakehousectl self-update`: the newest release's manifest is verified with the compiled-in key, `lakehousectl-linux-x86_64` is checked against the SIGNED manifest's `files["lakehousectl"]`, and the running binary is replaced by a rename — atomically |
+| `d625454a` | S4-T7 (D21) | the `update-proof` job of the dry run: bundles B and C are built out of bundle A, the markers are seeded before the first update, and the job's own rules live in `ops/release/update_proof.py`, so they are tested with no Docker and no network |
+| `1f9095c0` | fix | the shipped scripts are given an ABSOLUTE directory: the script `cd`s into the deployment's directory and hands its paths to `docker run -v`, and Docker reads a relative path there as a volume NAME |
+| `db95e794` | review round 1 BLOCKER 1 | a failure in step 4 or step 5 puts the stack back — this handoff's fix |
+
+**The BLOCKER 1 fix (`db95e794`).** `update::run` set `MAINTENANCE_PAUSED` and stopped the writers
+(step 4), then took the backup (step 5). A failure in either one returned the error with the
+writers STOPPED and the pause STILL SET — and nothing had been swapped, so the install still held
+the OLD release's files. The operator was left with a stack that was down and a pause that had to
+be cleared by hand.
+
+A failure in step 4 or step 5 now puts the install back the way it was:
+
+- the stack is started again on the OLD files (`up -d --pull never` — nothing was swapped, so the
+  Compose file and the manifest in the install's own directory are still the old ones);
+- it is waited for on the OLD version, with the same timeout the update waits with
+  (`--ready-timeout`, default 600 s);
+- the pause is cleared: the update restored nothing, so the jobs that delete files must not stay
+  paused;
+- the error says that the update stopped before it changed anything, what failed, and what the
+  stack runs now.
+
+A stack that does not come back is reported as it is — "the stack could not be started again",
+and "the install may need a hand". The error never claims a stack that is not there.
+
+Three steps can fail before the swap: the pause cannot be set, the writers cannot be stopped, and
+the backup cannot be taken (nor recorded in the state). All three go through the same way back.
+
+**The tests are real.** The three new tests were run against the code BEFORE this commit — the
+fix was reverted, the tests kept — and all three failed (162 passed, 3 failed). With the fix they
+pass. They use the fake runner the module already has: when the backup is what fails, the fake's
+steps are `fetch-images`, `stop-writers`, `backup`, `up`, `console-ready` (when the writers are
+what fail, there is no `backup`) — the stack is put back, and nothing is restored and nothing is
+rolled back, for nothing was swapped. The two tests of the blocker's own words assert that the
+stack runs the old version, that `.env` holds no `MAINTENANCE_PAUSED`, and that `state.json` is
+byte for byte the file it was.
+
+**Commands run, in the foreground, on the final commit `db95e794`:**
+
+| Command | Result |
+| --- | --- |
+| `/home/shiro/rantai/bin/cargo-locked fmt --check` (the whole workspace) | clean, no diff, exit 0 |
+| `/home/shiro/rantai/bin/cargo-locked clippy -p lakehousectl --all-targets -- -D warnings` | clean, no warning and no error, exit 0 |
+| `/home/shiro/rantai/bin/cargo-locked test -p lakehousectl` | **165 passed, 0 failed** (162 at the review commit `20f45a3a`, 3 new) |
+| `python3 -m pytest ops/release -q` | **209 passed** |
+| `actionlint .github/workflows/release.yml` | no findings, exit 0 |
+| `python3 ops/lint/check_intra_package_imports.py` | `OK: all intra-package dispar_orchestrate imports resolve` |
+| `python3 ops/lint/check_bare_iceberg_count.py` | `R11 guard: no bare count() against a Bronze Iceberg table found.` |
+| `git status` | clean (nothing generated staged) |
+
+Every cargo command went through `/home/shiro/rantai/bin/cargo-locked` (the shared
+`CARGO_TARGET_DIR`, `/home/shiro/rantai/cargo-target`; no `cargo clean`), in the foreground. The
+pytest run used the throwaway virtualenv at `/tmp/opencode/relvenv/bin/python` (pytest 9.2.0) —
+the system `python3` on this machine has no pytest. `actionlint` is not installed under that name
+on this machine; the copy at `/tmp/opencode/actionlint` was used.
+
+**A flaky test on this branch, found while running the block above.** `cargo test -p
+lakehousectl` fails about once in twenty runs, in `backup::tests`:
+
+```
+thread 'backup::tests::the_backup_is_told_which_version_it_belongs_to' panicked at crates/lakehousectl/src/backup.rs:323:60:
+the backup runs: Failed("the backup tool failed: Text file busy (os error 26)")
+```
+
+It is NOT from this fix: the failing test is in `backup.rs`, which this fix does not touch, and
+the same failure was reproduced at the review commit `20f45a3a` (162 tests, 1 failed, on run 23
+of 25). `backup.rs` was last changed by `1f9095c0`, which added the `fake_tool` helper: the test
+writes a shell script into a temporary directory and the tool then EXECUTES it. `ETXTBSY` is what
+the kernel says when the file being executed still has an open write descriptor — in a test binary
+with four threads, another thread's `fork` inherits the descriptor of the file the first thread is
+writing, and the inherited descriptor keeps the inode "open for writing" until that child execs
+its own script. Writing the script through a temporary name and renaming it into place does NOT
+avoid it (measured: the failure still came, on run 8 of 40).
+
+**The reviewer decides what to do with it.** The candidates are: a retry on `ETXTBSY` in
+`sys::output_or_stderr_with_env` (production code, and `ETXTBSY` on a script that is being
+rewritten under the tool is a real condition), the fake tool becoming a committed fixture that is
+SYMLINKED into the temporary directory (the inode that is executed is then never opened for
+writing), or a single-threaded run of that module. It is not fixed here: it is outside BLOCKER 1,
+and the fix belongs to whoever owns `backup.rs`.
+
+**One thing the reviewer may want to look at.** The pause is cleared in the install's `.env`
+AFTER the stack has been started (`up -d`) — in the update's step 8, in the rollback, and now in
+the way back this fix adds. Compose reads the `.env` when it starts the services, so the Dagster
+services that read `MAINTENANCE_PAUSED` (D16) keep the value they were started with until the
+next `up -d`. That is the branch's own behaviour, in the success path as much as in this one, and
+it is not changed here: it is named so that the reviewer can decide.
+
+**Not verified, with the reason:**
+
+- **No real update run on a host.** The developer who wrote the S4b commits lost their machine
+  (bluefin) before this handoff was written, and this machine has no install of a release to
+  update: no release is published yet, and the update's own path (the writers stopped, the backup
+  taken, the files swapped, the stack waited for, the rollback) is covered by the unit tests with
+  the fake runner. The proof is the `update-proof` job, below.
+- **The PR's dry run and its `update-proof` job.** They need a GitHub runner: the images, the
+  throwaway registry, cosign, syft, a multi-GiB bundle and the whole stack. What stands in for
+  them here is the job's own logic (`ops/release/update_proof.py`, tested in
+  `ops/release/test_release_workflow.py` — 209 passed with the rest of `ops/release`) and
+  `actionlint` on the workflow. The job ITSELF is proved by the dry run.
+- **The whole-workspace cargo run** (`cargo clippy --workspace --all-targets --all-features -- -D
+  warnings` and `cargo test --workspace`): not run here — this slice's machine rules say CI runs
+  the workspace and the developer runs the scoped commands. The crate the slice touches
+  (`lakehousectl`) was clipped and tested with `--all-targets`.
+- **The Dagster code location** (`(cd dagster && python -m pytest dispar_orchestrate -q)`): not
+  run — the branch changes no Python under `dagster/` (`git diff origin/main...HEAD -- dagster/`
+  is empty). The two repo lints that scan it ran, and both are OK.
+- **No bun command ran**: the branch changes no TypeScript (`git diff origin/main...HEAD -- src/`
+  is empty).
+- **`docker compose --profile '*' config --quiet`**: not run — the branch changes no compose file
+  (`git diff origin/main...HEAD -- docker-compose.yml` is empty).
+- **The branch has not merged `main`**: its base is `c239e3b0`, and `main` has moved 16 commits
+  on since. The reviewer decides when to merge it; the checks above were run on the branch as it
+  is.
+
+### Fixes for review S4b round 2 (developer, 2026-11-02)
+
+**Commits** (branch `feat/rel-2-s4b-lakehousectl-update`, on top of the review commit `270293cf`):
+
+| Commit | Task | What |
+| --- | --- | --- |
+| `e1a37beb` | review round 2 BLOCKER 2 | the pause does not outlive the update: every path that clears `MAINTENANCE_PAUSED` recreates the services that read it |
+| `fe77e06c` | review round 2 SHOULD-FIX 3 | the `backup::tests` flake: the fake tool is a committed file, symlinked into the temporary directory |
+
+**BLOCKER 2 (`e1a37beb`).** Three paths clear the pause: the update's success (step 8), the
+rollback (step 5), and the update's way back from a failure in step 4 or step 5. Every one of them
+now recreates the services that read the pause, right after the clear:
+
+- `pause::clear_and_recreate` owns the pair — the clear and the recreate — so no path can clear
+  the pause and leave the services running with it (`pause.rs`);
+- the recreate is the `up -d --pull never` the tool already runs: it recreates only the services
+  whose environment changed, and it pulls nothing (REL-2 S3 D13);
+- a recreate that fails is reported plainly, never hidden: the error says the services that read
+  the pause could not be recreated, and that the jobs that delete files stay skipped until they
+  are. The update's own success says the update is done and the stack runs the new release; the
+  rollback's says what the rollback did;
+- the state names the release the stack runs BEFORE the pause is cleared, in the update and in the
+  rollback: a pause that could not be cleared must not leave the state naming the other release.
+
+**The tests are real.** Five new tests, and the fake runner of `update.rs` and `rollback.rs` now
+reads the install's `.env` at every call — so each test shows the pause being set before the
+backup, the stack being created WITH it, and the stack being created again without it:
+
+| Test | What it holds |
+| --- | --- |
+| `update::tests::the_services_are_recreated_after_the_pause_is_cleared` | the success path: the clear is followed by a start, and that start ran without the pause |
+| `update::tests::the_services_are_recreated_when_the_update_stops_before_the_swap` | the step 4/5 way back: the same, after the stack was put back on the old files |
+| `update::tests::a_failed_recreate_after_the_pause_is_cleared_is_reported` | the second start can fail, and then the error says so |
+| `rollback::tests::the_rollback_recreates_the_services_after_the_pause_is_cleared` | the rollback: the same |
+| `rollback::tests::a_rollback_that_cannot_recreate_the_services_says_so` | and its failure is reported |
+
+The fix was reverted, the tests kept: 9 tests failed (161 passed, 9 failed). With the fix, 170 pass.
+
+**SHOULD-FIX 3 (`fe77e06c`).** The fake tool the `backup::tests` run is now a COMMITTED file
+(`rust/crates/lakehousectl/tests/fixtures/shipped-tool.sh`), SYMLINKED into the install's own
+`tools/` directory. The file the kernel executes is then a file nobody writes, and it has no
+reason to answer `ETXTBSY`. What the fake tool does is read from `fake-tool-mode` in the
+install's own directory — `backup`, `restore`, `silent` or `fail`, the four the tests need.
+
+**The review's first suggestion was not used, and why.** Running the script with `sh <script>`
+would break the shipped scripts: they are BASH (`#!/usr/bin/env bash`, `[[ ]]`, arrays,
+`set -o pipefail`), and `sh` refuses them. The handoff's candidate — the committed fixture,
+symlinked into the temporary directory — is used instead. The handoff's other two candidates (a
+retry on `ETXTBSY` in `sys::output_or_stderr_with_env`, and a single-threaded run of the module)
+are not used either: the first hides a real condition in the production code, and the second
+leaves the flake in place for every other test that runs beside it.
+
+**Commands run, in the foreground, on the final commit `fe77e06c`:**
+
+| Command | Result |
+| --- | --- |
+| `/home/shiro/rantai/bin/cargo-locked fmt --check` | clean, no diff, exit 0 |
+| `/home/shiro/rantai/bin/cargo-locked clippy -p lakehousectl --all-targets -- -D warnings` | clean, no warning and no error, exit 0 |
+| `/home/shiro/rantai/bin/cargo-locked test -p lakehousectl` | **170 passed, 0 failed** (165 at the review commit `270293cf`, 5 new) |
+| `/home/shiro/rantai/bin/cargo-locked test -p lakehousectl`, 50 times in a loop | **50 passed, 0 failed** |
+| `/home/shiro/rantai/bin/cargo-locked test -p lakehousectl backup`, 50 times in a loop | **50 passed, 0 failed** |
+
+The flake, measured on the code BEFORE the fix: `cargo test -p lakehousectl`, 50 times in a loop:
+**49 passed, 1 failed** — run 31, `the_restore_runs_the_shipped_script_with_the_backup_directory`,
+`Failed("the backup tool failed: Text file busy (os error 26)")`. `cargo test -p lakehousectl
+backup`, 50 times in a loop, before the fix: 50 passed, 0 failed — the filter runs fewer tests
+beside it, so the race has fewer chances.
+
+Every cargo command went through `/home/shiro/rantai/bin/cargo-locked` (the shared
+`CARGO_TARGET_DIR`, `/home/shiro/rantai/cargo-target`; no `cargo clean`), in the foreground.
+
+**One thing the reviewer may want to look at: the profiles.** The review's premise is that step
+6's `up -d` creates the Dagster services ("The Dagster services read `MAINTENANCE_PAUSED` when
+they are created. Step 6's `up -d` creates them with the pause set"). In this repository's
+Compose file the Dagster services carry `profiles: ["dagster"]`, and the release keeps that
+profile (`ops/release/render_compose.py`: "the profiles (`dagster`, `trino`, `seaweedfs`,
+`backups`) stay as they are, so an operator still chooses what to start"). `docker::compose_up`
+does not pass `--profile`; only `compose_stop`, `compose_stop_all` and `compose_services` do, and
+they pass `--profile '*'`.
+
+So the tool's `up -d` starts the DEFAULT profile only, and a Dagster service of a deployment that
+runs the `dagster` profile is not recreated by it. The fix is the review's — after the pause is
+cleared, `up -d --pull never` runs again — and it does not change which services the tool starts.
+Two things the reviewer may want to decide:
+
+- whether the recreate (and the update's step 6, and the rollback's start) must name the `dagster`
+  profile, so the services that read the pause are the ones that are recreated;
+- whether `up -d` without `--profile` is what a deployment should get at all: the update STOPS the
+  Dagster services (`compose stop` with `--profile '*'`), and step 6 starts the default profile
+  only, so the Dagster services stay stopped after an update.
+
+This is read from the code and the Compose file; it was NOT run on a host (see below).
+
+**Not verified, with the reason:**
+
+- **No real update run on a host.** There is no install of a release on this machine, and no
+  release is published yet: the update's own path (the writers stopped, the backup taken, the
+  files swapped, the stack waited for, the rollback) is covered by the unit tests with the fake
+  runner. The proof is the `update-proof` job of the dry run, and the reviewer runs it.
+- **The whole-workspace cargo run** (`cargo clippy --workspace --all-targets --all-features -- -D
+  warnings` and `cargo test --workspace`): not run here — this slice's machine rules say CI runs
+  the workspace and the developer runs the scoped commands. The crate the slice touches
+  (`lakehousectl`) was clipped and tested with `--all-targets`.
+- **The Dagster code location** (`(cd dagster && python -m pytest dispar_orchestrate -q)`): not
+  run — the branch changes no Python under `dagster/` (`git diff origin/main...HEAD -- dagster/`
+  is empty). The two repo lints that scan it ran on this branch before these two commits, and
+  both are OK.
+- **No bun command ran**: the branch changes no TypeScript (`git diff origin/main...HEAD -- src/`
+  is empty).
+- **`docker compose --profile '*' config --quiet`**: not run — the branch changes no compose file
+  (`git diff origin/main...HEAD -- docker-compose.yml` is empty).
+- **The branch has not merged `main`**: its base is `c239e3b0`, and `main` has moved on since
+  (`7a49fcbb`). The reviewer decides when to merge it; the checks above were run on the branch as
+  it is.
+- **The pushes**: both commits were pushed to `origin/feat/rel-2-s4b-lakehousectl-update`. No push
+  was refused, so no `git pull --no-rebase` and no resolve was needed.
+
+### Fix for review S4b round 3 (developer, 2026-11-02)
+
+**Commits** (branch `feat/rel-2-s4b-lakehousectl-update`, on top of the review commit `61f91653`):
+
+| Commit | Task | What |
+| --- | --- | --- |
+| `12f34f3c` | review round 3 BLOCKER 3 | a release install runs the `dagster` profile: the install writes `COMPOSE_PROFILES=dagster`, the update adds it to an older install's `.env`, and the status lists the Dagster services |
+| `befabf5f` | review round 3 BLOCKER 3 | the two proof jobs assert that `dagster-daemon` and `dagster-code-location` run — after the install, after the update and after the rollback |
+
+**BLOCKER 3, the profile (`12f34f3c`).** D22 is implemented where the plan says it is:
+
+- a fresh install writes `COMPOSE_PROFILES=dagster` into the install's `.env` (`secrets.rs`), and
+  the `update` adds it to an older install's `.env` when the file names no profile
+  (`update.rs`, before step 4 — nothing that is running is touched before then);
+- an operator's own value is KEPT: the profiles an operator set are theirs, and the operator adds
+  `trino` or `seaweedfs` there. `.env.example` is NOT changed, so a developer's default stays the
+  same (`git diff 61f91653..HEAD -- .env.example` is empty);
+- `status` asks Compose for EVERY profile (`docker.rs`), so it lists the Dagster services: a status
+  that hid a running service would be a status that lied;
+- `env.rs` owns the `.env` text now (`name_of`, `with_variable`), so the pause and the profiles set
+  a variable the one way — the pause had its own copy of the same helper (rule 4).
+
+**What the profile needs, and the port collision D22 did not see.** Turning the `dagster` profile
+on needs one more thing, and the review's fix does not mention it: the `dagster-webserver` and the
+`console` both publish host port 3000 by default (`docker-compose.yml`: `${DAGSTER_WEBSERVER_HOST_PORT:-3000}:3000`
+and `${CONSOLE_HOST_PORT:-3000}:3000`), and two services cannot hold one host port. Measured on
+this machine, the release's own rendered Compose file with the `.env` of D22 publishes host port
+3000 twice:
+
+```
+$ docker compose --env-file .env -f docker-compose.yml config
+CONFLICT ('3000', 3000) ['console', 'dagster-webserver']
+```
+
+and a stack with those two mappings does not start — the same two mappings, measured on this
+machine:
+
+```
+$ docker compose -p porttest --env-file .env -f docker-compose.yml up -d
+Error response from daemon: failed to set up container networking: ... Bind for 0.0.0.0:3000 failed:
+port is already allocated
+$ echo $?
+1
+```
+
+So D22 as written would have made EVERY release install fail to start. The tool resolves it: when
+it turns the `dagster` profile on, the Dagster webserver is given a host port of its own — the
+first FREE one above the console's (3001 on a fresh host). A webserver that already has a port of
+its own keeps it, and an operator who set `COMPOSE_PROFILES` themselves keeps their ports: the
+tool only touches what it turned on. With that `.env`, the rendered release Compose file has NO
+port conflict and the Dagster services are in the deployment:
+
+```
+conflicts: {}
+dagster services in the model: ['dagster-code-location', 'dagster-daemon', 'dagster-db-init', 'dagster-webserver']
+```
+
+**This is a decision the reviewer may want to make (a D23).** The rule above is the developer's:
+"the Dagster webserver takes the first free host port above the console's". The other way round —
+the release's Compose file not publishing the webserver on the host at all (a rule of
+`ops/release/render_compose.py`) — is also defensible, and it keeps the operator's `.env` free of
+a port the tool chose. Both were checked against the code; the tool's rule was chosen because it
+changes no deployment shape and no `.env.example` line.
+
+**The proofs (`befabf5f`).** `install-proof` asserts that `dagster-daemon` and
+`dagster-code-location` run after the install; `update-proof` asserts the same after the install,
+after the update to bundle B, and after the rollback of bundle C. Every assertion reads the stack
+with Compose's own JSON (`ps --format json`) and with the install's own `.env`
+(`--env-file install/.env`): that file names the profiles the install runs, and without it the
+Dagster services are not part of the deployment the command reads. An assertion that cannot fail is
+a failure, so the checks run against synthetic workflows too.
+
+**The tests are real.** Twenty new Rust tests and seven new Python ones:
+
+| Test | What it holds |
+| --- | --- |
+| `secrets::tests::a_fresh_env_runs_the_dagster_profile` | a fresh `.env` names the `dagster` profile |
+| `secrets::tests::an_env_that_names_no_profile_gets_the_releases_one` | an older install's `.env` gets it, and the operator's values are kept |
+| `secrets::tests::the_profiles_an_operator_set_are_kept` | an operator's own profiles are not replaced |
+| `secrets::tests::a_commented_out_profile_is_not_a_profile` | a comment sets nothing |
+| `secrets::tests::the_update_adds_the_profile_to_an_older_install` | the update adds it |
+| `secrets::tests::the_update_keeps_the_profiles_an_operator_set` | and keeps an operator's own |
+| `secrets::tests::an_install_without_an_env_file_cannot_set_the_profiles` | the update fails closed without a `.env` |
+| `secrets::tests::the_dagster_webserver_gets_a_port_of_its_own` | the webserver and the console no longer share a port |
+| `secrets::tests::the_dagster_webserver_keeps_a_port_of_its_own` | an operator's own port is kept |
+| `secrets::tests::the_dagster_webserver_takes_the_first_free_port_above_the_consoles` | the first FREE port is the one it takes |
+| `secrets::tests::a_webserver_that_shares_the_consoles_port_is_moved_even_by_the_update` | the update resolves the collision too |
+| `secrets::tests::the_profiles_the_update_adds_are_readable_by_the_owner_only` | the `.env` stays mode 0600 |
+| `env::tests::a_commented_out_line_sets_nothing`, `a_variable_is_set_in_the_env_text`, `a_variable_is_never_set_twice` | the `.env` text helpers |
+| `update::tests::the_update_adds_the_dagster_profile_to_an_older_install` | the update's own path |
+| `update::tests::the_update_keeps_the_profiles_an_operator_set` | and the operator's own value |
+| `update::tests::the_update_sets_the_profiles_before_it_starts_the_stack` | the profile is in the `.env` before the first start |
+| `status::tests::the_report_shows_the_dagster_services` | the status lists the Dagster services |
+| `docker::tests::the_status_asks_for_every_profile` | the status asks Compose for every profile |
+| `test_release_workflow.py`: the seven new checks | the assertions exist in both jobs, they come after the three points, and they read the install's own `.env` |
+
+The fixes were reverted, the tests kept: **10 Rust tests failed** with the profile rule reverted
+(180 passed, 10 failed) and **3 more** with the port rule reverted (187 passed, 3 failed); **5 Python
+tests failed** with the workflow reverted (211 passed, 5 failed — the two synthetic-workflow checks
+pass either way). With the fixes, 190 Rust tests and 216 Python tests pass.
+
+**Commands run, in the foreground, on the final commit `befabf5f`:**
+
+| Command | Result |
+| --- | --- |
+| `/home/shiro/rantai/bin/cargo-locked fmt --check` | clean, no diff, exit 0 |
+| `/home/shiro/rantai/bin/cargo-locked clippy -p lakehousectl --all-targets -- -D warnings` | clean, no warning and no error, exit 0 |
+| `/home/shiro/rantai/bin/cargo-locked test -p lakehousectl` | **190 passed, 0 failed** (170 at the review commit `61f91653`, 20 new) |
+| `python3 -m pytest ops/release -q` (the venv with pytest 8.3.4 and pyyaml 6.0.3) | **216 passed** (209 at the review commit `61f91653`, 7 new) |
+| `actionlint .github/workflows/release.yml` | clean, exit 0 |
+| `python3 ops/lint/check_intra_package_imports.py` | OK |
+| `python3 ops/lint/check_bare_iceberg_count.py` | OK |
+
+Every cargo command went through `/home/shiro/rantai/bin/cargo-locked` (the shared
+`CARGO_TARGET_DIR`, `/home/shiro/rantai/cargo-target`; no `cargo clean`), in the foreground.
+
+**Not verified, with the reason:**
+
+- **No real install of a release on a host.** There is no published release yet, and the release's
+  own images are not on this machine: the install's path (the `.env`, the images, the stack) is
+  covered by the unit tests and by the Compose measurements quoted above. The proof is the
+  `install-proof` job of the dry run, and the reviewer runs it.
+- **The whole-workspace cargo run** (`cargo clippy --workspace --all-targets --all-features -- -D
+  warnings` and `cargo test --workspace`): not run here — this slice's machine rules say CI runs
+  the workspace and the developer runs the scoped commands. The crate the slice touches
+  (`lakehousectl`) was clipped and tested with `--all-targets`.
+- **`docker compose --profile '*' config --quiet`**: not run — the branch changes no compose file
+  (`git diff 61f91653..HEAD -- docker-compose.yml` is empty).
+- **No bun command ran**: the branch changes no TypeScript.
+- **The Dagster code location** (`(cd dagster && python -m pytest dispar_orchestrate -q)`): not
+  run — the branch changes no Python under `dagster/`. The two repo lints that scan it ran on this
+  branch and both are OK.
+- **The pushes**: both commits were pushed to `origin/feat/rel-2-s4b-lakehousectl-update`. No push
+  was refused, so no `git pull --no-rebase` and no resolve was needed.
+
+### Fix for review S4b round 4, D23 (developer, 2026-11-02)
+
+**Commits** (branch `feat/rel-2-s4b-lakehousectl-update`, on top of the review commit `e30f2843`):
+
+| Commit | Task | What |
+| --- | --- | --- |
+| `e86cf6f2` | review round 4 BLOCKER 4 (D23) | the Dagster webserver is published on the host's loopback only, on port 3001 by default; `lakehousectl` picks no port; every reference to the UI's host port is updated |
+
+**D23 is implemented where the plan says it is.**
+
+- `docker-compose.yml`: `dagster-webserver` publishes
+  `"127.0.0.1:${DAGSTER_WEBSERVER_HOST_PORT:-3001}:3000"`. The comment at the site says why: the UI
+  has no sign-in, so anyone who can reach the port can launch runs; nothing outside the compose
+  network needs it (the API and the jobs reach the GraphQL API in-network, at
+  `http://dagster-webserver:3000/graphql`); the default is 3001, so it no longer clashes with the
+  console's 3000; an operator reaches the UI through an SSH tunnel.
+- `lakehousectl`: the free-port logic is gone, and so are its tests. The tool picks no port: it
+  never touched the console's port, and it no longer touches the webserver's.
+  `write_env(path)` and `ensure_release_profiles(dir)` no longer take an `is_free` closure,
+  `with_dagster_webserver_port` and `port_of` are gone, and `sys::port_is_free` (added in
+  `12f34f3c` for exactly that logic) is gone with them. `sys::port_is_busy` stays: the preflight
+  asks whether the host's published ports are taken.
+- The `.env` the tool writes keeps the template's value: `DAGSTER_WEBSERVER_HOST_PORT=3001` in
+  `.env.example`, and an operator's own value is the operator's.
+
+**Every reference to the Dagster UI's host port.** Changed:
+
+| Where | What it says now |
+| --- | --- |
+| `docker-compose.yml`, `dagster-webserver`'s `ports:` | `127.0.0.1:${DAGSTER_WEBSERVER_HOST_PORT:-3001}:3000`, with the reason at the site |
+| `docker-compose.yml`, `dagster-webserver`'s header comment | the API reaches the GraphQL API in-network; the `ports:` block owns the host's side |
+| `docker-compose.yml`, `console`'s `ports:` comment | the console owns 3000; the webserver is on the loopback at `DAGSTER_WEBSERVER_HOST_PORT` (3001) |
+| `.env.example`, `DAGSTER_WEBSERVER_HOST_PORT` | `3001`, with the comment: loopback only, no sign-in, nothing outside the network needs it, 3001 so it does not clash with the console |
+| `.env.example`, the `CONSOLE_HOST_PORT` comment above it | the console owns host port 3000 |
+| `README.md`, the `DAGSTER_WEBSERVER_HOST_PORT` row | default `3001`, published on the loopback only, reach it through an SSH tunnel |
+| `docs/OPERATIONS.md`, "Dagster (opt-in, P3)" | the webserver's container port is 3000; the UI is published on the loopback only at `127.0.0.1:${DAGSTER_WEBSERVER_HOST_PORT:-3001}:3000`, with the SSH tunnel |
+
+Checked and **not** changed, with the reason:
+
+- **The `ops/` gates reach the webserver IN the compose network, never through the host port**, so
+  nothing had to change and nothing was changed silently. Every one of them uses the service name:
+  `ops/g3/g3_test.py`, `ops/g3a/g3a_test.py`, `ops/g4/g4_test.py`, `ops/g6/g6_ingest_matrix_test.py`,
+  `ops/g6/g6_linklocal_test.py`, `ops/g7/g7_pipeline_test.py`, `ops/g8/g8_time_travel_test.py`,
+  `ops/gold_export/gold_export_test.py`, and the two G6 overrides
+  (`ops/g6/docker-compose.g6.override.yml`, `ops/g6/docker-compose.g6-oracle.override.yml`) —
+  `DAGSTER_URL=http://dagster-webserver:3000/graphql`. No `ops/` file publishes a host port for
+  the webserver: the only `ports:` blocks under `ops/` are a synthetic workflow's `registry:2`
+  service (`ops/release/test_release_workflow.py`) and a synthetic compose snippet in the render
+  test (`ops/release/test_render_compose.py`), and neither names the Dagster webserver. So no gate
+  can reach the webserver from outside the compose network.
+- `.github/workflows/ci.yml`: the same in-network URL; the jobs start the webserver by service name.
+- `.env.staging`: already `DAGSTER_WEBSERVER_HOST_PORT=3001` — the new default agrees with it, and
+  its comment ("Move Dagster off 3000 so the Next.js frontend can own that port") still holds.
+- **ADR 0005** (`docs/adr/0005-dagster-code-location-ownership-and-packaging.md:180`) says an
+  operator may reach the GraphQL API "at `http://dagster-webserver:3000/graphql` (in-network) or
+  `http://localhost:3000/graphql` (host)". The in-network half is still right; the host half is
+  now `http://127.0.0.1:3001/graphql`. **It is not edited here**: `AGENTS.md` gives the planner the
+  ADRs, and `docs/CODE-STANDARD.md` says a revisited ADR gains an `## Addendum (…)` — that is the
+  planner's call, so it is reported here rather than changed quietly.
+- `CHANGELOG.md`: no entry was added. No commit on this branch carries one (the D22 profile change
+  carries none either), and the `[Unreleased]` entry belongs with the release the reviewer cuts.
+
+**The tool's own tests.** The four free-port tests are gone (`the_dagster_webserver_gets_a_port_of_its_own`,
+`the_dagster_webserver_keeps_a_port_of_its_own`, `the_dagster_webserver_takes_the_first_free_port_above_the_consoles`,
+`a_webserver_that_shares_the_consoles_port_is_moved_even_by_the_update`) and three hold the rule D23
+puts in their place:
+
+| Test | What it holds |
+| --- | --- |
+| `secrets::tests::the_tool_picks_no_port_for_the_dagster_webserver` | a fresh `.env` holds the template's `3001` and the console's `3000` |
+| `secrets::tests::the_tool_adds_no_port_for_the_dagster_webserver` | an `.env` that names no webserver port gets none — the tool picks no port |
+| `secrets::tests::the_dagster_webserver_port_an_operator_set_is_kept` | the operator's own port is the operator's |
+
+The fix was reverted and the tests kept: **1 Rust test failed** (`188 passed, 1 failed`) — the one
+that fails is `the_tool_adds_no_port_for_the_dagster_webserver`, with `the tool picked a port:
+CONSOLE_HOST_PORT=3000`. With the fix, **189 Rust tests pass**.
+
+**The proof (rule 8).** This machine had 8 GB of memory available (`free -g`: total 11, available
+8), so the real check was possible and is what follows.
+
+```
+$ docker compose --profile '*' --env-file /tmp/opencode/d23/.env config --quiet
+$ echo $?
+0
+```
+
+The rendered file publishes the two services apart, and only the webserver on the loopback:
+
+```
+$ docker compose --profile '*' --env-file /tmp/opencode/d23/.env config | <the two services>
+console          -> [{'mode': 'ingress', 'target': 3000, 'published': '3000', 'protocol': 'tcp'}]
+dagster-webserver -> [{'mode': 'ingress', 'host_ip': '127.0.0.1', 'target': 3000, 'published': '3001', 'protocol': 'tcp'}]
+lakehouse-api    -> [{'mode': 'ingress', 'target': 8080, 'published': '8080', 'protocol': 'tcp'}]
+```
+
+A real `up` from a clean project, with a throwaway `.env` (generated values, `.env.example` plus
+`openssl rand`, `chmod 600`, outside the repository):
+
+```
+$ docker compose -p d23proof --profile dagster --env-file /tmp/opencode/d23/.env up -d
+... the console image is built from Dockerfile.frontend, the dagster image is the one on this
+    machine, and the stack comes up ...
+$ docker compose -p d23proof --profile dagster --env-file /tmp/opencode/d23/.env ps --format 'table {{.Service}}\t{{.Status}}\t{{.Ports}}'
+SERVICE                    STATUS                        PORTS
+console                    Up About a minute (healthy)   0.0.0.0:3000->3000/tcp, [::]:3000->3000/tcp
+dagster-code-location      Up 3 minutes                  3000/tcp, 4000/tcp
+dagster-daemon             Up 3 minutes                  3000/tcp, 4000/tcp
+dagster-webserver          Up 3 minutes (healthy)        4000/tcp, 127.0.0.1:3001->3000/tcp
+lakehouse-api              Up About a minute (healthy)   0.0.0.0:8080->8080/tcp, [::]:8080->8080/tcp
+postgres                   Up 4 minutes (healthy)        0.0.0.0:5432->5432/tcp, [::]:5432->5432/tcp
+...
+```
+
+The three measurements the decision asks for:
+
+```
+$ curl -fsS 127.0.0.1:3001/server_info
+{"dagster_webserver_version":"1.13.20","dagster_version":"1.13.20","dagster_graphql_version":"1.13.20"}
+$ echo $?
+0
+
+$ curl -fsS -o /dev/null -w 'http_code=%{http_code}\n' http://127.0.0.1:3000/
+http_code=200
+$ curl -fsS http://127.0.0.1:3000/ | head -c 60
+<!DOCTYPE html><html lang="en" class="qJXJUa_variable s5QHqW_variable -Qgr4W_variable
+
+$ ss -ltn | grep -E '3000|3001'
+LISTEN 0      4096                                  0.0.0.0:3000       0.0.0.0:*
+LISTEN 0      4096                                127.0.0.1:3001       0.0.0.0:*
+LISTEN 0      4096                                     [::]:3000          [::]:*
+```
+
+3001 is on `127.0.0.1` only. The same check from the host's own routable address (its address is
+not quoted here — rule 12) refuses the connection on 3001 and answers on 3000:
+
+```
+$ curl -sS -o /dev/null -w 'http_code=%{http_code}\n' http://<the host's own address>:3001/server_info
+curl: (7) Failed to connect to <the host's own address> port 3001 after 0 ms: Couldn't connect to server
+http_code=000
+$ curl -sS -o /dev/null -w 'http_code=%{http_code}\n' http://<the host's own address>:3000/
+http_code=200
+```
+
+The project is gone afterwards:
+
+```
+$ docker compose -p d23proof --profile dagster --env-file /tmp/opencode/d23/.env down -v
+... every volume Removed ...
+$ docker ps -a --filter label=com.docker.compose.project=d23proof --format '{{.Names}}\t{{.Status}}'
+(no output)
+$ docker volume ls --filter label=com.docker.compose.project=d23proof --format '{{.Name}}'
+(no output)
+$ docker network ls --filter label=com.docker.compose.project=d23proof --format '{{.Name}}'
+(no output)
+```
+
+**Commands run, in the foreground, on the final commit `e86cf6f2`:**
+
+| Command | Result |
+| --- | --- |
+| `/home/shiro/rantai/bin/cargo-locked fmt --check` | clean, no diff, exit 0 |
+| `/home/shiro/rantai/bin/cargo-locked clippy -p lakehousectl --all-targets -- -D warnings` | clean, no warning and no error, exit 0 |
+| `/home/shiro/rantai/bin/cargo-locked test -p lakehousectl` | **189 passed, 0 failed** (190 at the review commit `e30f2843`: 4 free-port tests removed, 3 new ones) |
+| `python3 -m pytest ops/release -q` (the venv with pytest 9.1.1 and pyyaml 6.0.3) | **216 passed** |
+| `actionlint .github/workflows/release.yml` | clean, exit 0 |
+| `docker compose --profile '*' config --quiet` | clean, exit 0 (with the throwaway `.env`) |
+
+Every cargo command went through `/home/shiro/rantai/bin/cargo-locked` (the shared
+`CARGO_TARGET_DIR`, `/home/shiro/rantai/cargo-target`; no `cargo clean`), in the foreground.
+
+**Not verified, with the reason:**
+
+- **The API image was not rebuilt from the repository.** The proof ran the API from
+  `rantai-lakehouse-api:ci`, the image CI built on this machine on 2026-10-24, which predates the
+  `curl` that the current `rust/Dockerfile` installs for the compose healthcheck — without it the
+  API's healthcheck can never pass and the console (which waits for `service_healthy`) never starts.
+  A local image (`rantai-lakehouse-api:d23proof`) adds `curl` to that image and nothing else; the
+  repository is untouched by it. Rebuilding the API from source is a full Rust release build of the
+  workspace, which this proof does not need: the claim is about the published ports.
+- **The Dagster image was the one already on this machine** (`rantai-lakehouse-dagster:local`), not
+  a fresh build; the console image WAS built from `Dockerfile.frontend` by this `up`.
+- **The first `up -d` failed** at the console image's `apk add --no-cache nodejs` (exit code 14 —
+  the Alpine mirror failed that once; the same command answers `OK` when run again). The retry
+  built the image and the stack came up.
+- **The gate harnesses the `dagster` profile carries were started by the same `up`** (`g3a`, `g4`,
+  `g7`, `g8`, `g9`, `bld1`, `gold-export`, `g3-maintenance`): they are CI's, they run against a
+  stack whose API image is the one above, and their results were NOT read — this proof is about the
+  published ports, and the gates' own verdicts are CI's.
+- **The whole-workspace cargo run** (`cargo clippy --workspace --all-targets --all-features -- -D
+  warnings` and `cargo test --workspace`): not run here — this slice's machine rules say CI runs the
+  workspace and the developer runs the scoped commands. The crate the slice touches
+  (`lakehousectl`) was clipped and tested with `--all-targets`.
+- **No bun command ran**: the branch changes no TypeScript.
+- **The Dagster code location** (`(cd dagster && python -m pytest dispar_orchestrate -q)`): not
+  run — the branch changes no Python under `dagster/`.
+- **The pushes**: the commit was pushed to `origin/feat/rel-2-s4b-lakehousectl-update`. No push was
+  refused, so no `git pull --no-rebase` and no resolve was needed. No pull request was opened.
+
 ## 7. Review (planner appends below)
 
 ### Review S1 round 1 (planner, 2026-10-31, at `f79d4235`)
@@ -2843,3 +3422,133 @@ D14's rule rather than its list, which is right, and the tooling test pins all t
 
 **Open: no BLOCKER, no SHOULD-FIX.** Merge waits for #332's CI, including `Release · dry run`
 and `install-proof`, which now install the shipped files.
+
+### Review S4b round 1 (planner, 2026-11-02, at `1f9095c0`)
+
+Read: `update.rs`, `rollback.rs`, `runner.rs`, `pause.rs` and `status.rs`, plus the outline of
+`self_update.rs` and the `update-proof` job. The developer's machine (bluefin) went
+unreachable under load before the handoff was written. The commits are all pushed: `42fa7b6b`
+(T4), `ac095fc2` (T5), `11a43698` (T6), `d625454a` (T7) and `1f9095c0` (a fix).
+
+- **BLOCKER 1. A failure in step 4 or step 5 leaves the install stopped and paused.**
+  `update::run` sets `MAINTENANCE_PAUSED` and stops the writers (step 4), then backs up
+  (step 5). If `stop_writers` or `backup` fails, for example on a full disk, it returns the
+  error with the writers still stopped and the pause still set. No file has been swapped yet, so
+  the old release is intact. *Fix:* on a failure in step 4 or 5, start the stack again on the
+  OLD files (`up -d --pull never`), wait for ready on the old version, clear the pause, and
+  report that the update stopped before it changed anything. Add unit tests with the fake
+  runner, one for a failed stop and one for a failed backup: the stack is up on the old
+  version, the pause is cleared, and the error says so. D17 named only "from step 6 on", which
+  was the planner's miss.
+- **Missing: the handoff of S4b.** The fix's developer writes it: the commits, the counts on
+  the final commit, and what was not verified.
+
+**Open: BLOCKER 1.** Merge waits for the fix and for the PR's dry run, including
+`update-proof`.
+
+### Review S4b round 2 (planner, 2026-11-02, at `6feeeec7`)
+
+- **BLOCKER 1 is fixed** (`db95e794`). A failure in step 4 or 5 starts the old files again,
+  waits for ready on the old version, clears the pause, and says the update stopped before it
+  changed anything. A failed restart is said plainly. The three tests failed on the code
+  before the fix.
+- **BLOCKER 2 (found by the developer's handoff). The pause outlives every update.** The
+  Dagster services read `MAINTENANCE_PAUSED` when they are created. Step 6's `up -d` creates
+  them with the pause set, and step 8 clears it in `.env` only. Nothing recreates them, so after
+  a successful update, and after a rollback or the BLOCKER 1 recovery, the expiry and
+  orphan-file jobs stay skipped until something else recreates those services. Storage then
+  grows silently. *Fix:* after clearing the pause, run `up -d --pull never` again, which
+  recreates only the services whose environment changed. Do it in every path that clears the
+  pause: success, rollback, and the step 4/5 recovery. Test with the fake runner that the clear
+  is followed by an `up`, in each path.
+- **SHOULD-FIX 3. The `backup::tests` flake** (`ETXTBSY`, about 1 run in 20, older than this
+  fix). A flaky test is a red CI waiting to happen. *Fix:* write the fake script, close it, then
+  run it with `sh <script>` rather than executing the file, or use the candidate the handoff
+  names. Then run the module 50 times in a loop and quote the count.
+
+**Open: BLOCKER 2, SHOULD-FIX 3.**
+
+### Review S4b round 3 (planner, 2026-11-02, at `0267f79e`)
+
+- **BLOCKER 2 is fixed** (`e1a37beb`). `pause::clear_and_recreate` owns clearing the pause and
+  recreating the services, and all three paths use it. Five tests read `.env` at every call. Nine
+  tests failed with the fix reverted.
+- **SHOULD-FIX 3 is fixed** (`fe77e06c`). The fake tool is a committed executable fixture,
+  linked into the install, so the inode that runs is never written. 50 of 50 runs passed, against
+  49 of 50 before. `sh <script>` was rightly not used, because the shipped scripts are bash.
+- **BLOCKER 3 (found by the developer's handoff). A release install runs no Dagster.**
+  - `docker::compose_up` passes no `--profile`, and nothing sets `COMPOSE_PROFILES`. So an
+    installed stack starts only the default profile, while the 16 Dagster services carry
+    `profiles: ["dagster"]`.
+  - An installed Lakehouse therefore runs no pipelines: no upload loads, no connector runs, and
+    no maintenance jobs.
+  - The S3 install proof checks only `/health/ready` and the console, so it could not see this.
+  - It is a gap in the S3 and S4 plans, not in the code those plans asked for.
+
+  **Decision D22 (planner):**
+  - A release install runs the `dagster` profile.
+  - On a fresh install, `lakehousectl` writes `COMPOSE_PROFILES=dagster` into the install's
+    `.env`, and `update` adds it when an older install's `.env` has no `COMPOSE_PROFILES`.
+    Profiles an operator has set are kept as they are.
+  - The operator adds `trino` or `seaweedfs` there.
+  - `.env.example` is not changed, so a developer's default stays the same.
+
+  *Fix:*
+  - Implement it in `secrets.rs` and `update.rs` (or wherever the `.env` is written), with
+    tests.
+  - `install-proof` and `update-proof` assert that `dagster-daemon` and `dagster-code-location`
+    are running after the install, after the update, and after the rollback.
+  - `status` lists them.
+  - Cite `REL-2 S4b review round 3 BLOCKER 3` and D22.
+
+**Open: BLOCKER 3.**
+
+### Review S4b round 4 (planner, 2026-11-02, at `a8ac63cf`): D22 and the port
+
+- **BLOCKER 3 is fixed as D22 says** (`12f34f3c`, `befabf5f`).
+  - A fresh install writes `COMPOSE_PROFILES=dagster`, and `update` adds it to an older `.env`
+    while keeping an operator's value.
+  - `status` lists every profile's services.
+  - Both proofs assert that `dagster-daemon` and `dagster-code-location` run after the install,
+    after the update, and after the rollback.
+  - The tests fail with the fix reverted.
+- **The port clash the developer measured is real.** With the profile on, `console` and
+  `dagster-webserver` both publish host port 3000, and `up` exits 1. The developer's answer is a
+  free port the tool picks. It is replaced by D23, because the deeper problem is not the number:
+  **`dagster-webserver` publishes `0.0.0.0:3000`, and Dagster's UI has no sign-in**, so anyone
+  who can reach the host can launch runs. Nothing needs that port from outside. The API reaches
+  Dagster on the Compose network (`http://dagster-webserver:3000/graphql`).
+
+**Decision D23 (planner):**
+- `dagster-webserver` is published on the host's loopback only:
+  `"127.0.0.1:${DAGSTER_WEBSERVER_HOST_PORT:-3001}:3000"` in `docker-compose.yml`. That gives
+  every stack the same rule, release or development, and no clash with the console's 3000.
+  An operator reaches it through an SSH tunnel.
+- `lakehousectl` picks no port. Remove the free-port logic added in this round, and its
+  tests.
+- Update every reference to the Dagster UI's host port: `README.md`, `docs/OPERATIONS.md`,
+  the `ops/` gates and the `.env.example` comment. List them in the handoff. Check that no gate
+  reaches the webserver through the host port from outside the Compose network. If one does,
+  say so rather than change it silently.
+- Prove it with `docker compose --profile '*' config --quiet`, a real `up` of the default plus
+  `dagster` profile on a clean project (rule 8), `curl` on `127.0.0.1:3001/server_info`, and
+  the console still on 3000.
+
+**Open: D23 (BLOCKER 4).**
+
+### Review S4b round 5 (planner, 2026-11-02, at `ecd71a15`)
+
+- **D23 is done** (`e86cf6f2`). `dagster-webserver` publishes `127.0.0.1:3001` only, with the
+  reason at the site. The free-port logic is gone. The docs are updated.
+- The proof is a real `up` of the default and `dagster` profiles from a clean project, with these
+  results:
+  - `127.0.0.1:3001/server_info` answered;
+  - the console answered on 3000;
+  - `ss -ltn` showed 3001 bound to loopback only, and the host's own address was refused on it.
+- Every gate reaches the webserver on the Compose network (`dagster-webserver:3000`), so none
+  depended on the host port.
+- ADR 0005's host URL for Dagster still said `localhost:3000`. The planner corrected it in this
+  commit, because an ADR is the planner's document.
+
+**Open: no BLOCKER, no SHOULD-FIX.** Merge waits for #335's CI, including `Release · dry run`,
+`install-proof` and `update-proof`, which now also assert that Dagster runs.

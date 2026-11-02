@@ -17,6 +17,7 @@ PATH, and they record what they were asked to do.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -210,6 +211,39 @@ class BackupScriptTest(ScriptTestCase):
         self.assertTrue((backups[0] / "release.json").is_file())
         self.assertTrue((backups[0] / "state.json").is_file())
         self.assertTrue((backups[0] / "manifest.json").is_file())
+
+    def test_the_backup_is_named_after_the_version_the_caller_knows(self) -> None:
+        """REL-2 S4 decision D17: the update stops the API before it
+        backs up, so the script cannot ask the API which version the
+        backup belongs to - and the update knows.
+
+        The backup is named `backups/<stamp>-<old version>/`, and the
+        manifest of the set says the same version.
+        """
+        result = self.run_backup(
+            LAKEHOUSE_DIR=str(self.deployment), BACKUP_VERSION="0.1.0"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        backups = sorted((self.deployment / "backups").iterdir())
+        self.assertEqual(len(backups), 1, f"the backups are {backups}")
+        self.assertTrue(
+            backups[0].name.endswith("-0.1.0"),
+            f"the backup is not named after the release: {backups[0].name}",
+        )
+        manifest = json.loads((backups[0] / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["version"], "0.1.0")
+
+    def test_the_backup_reads_the_api_when_the_caller_names_no_version(self) -> None:
+        """Without `BACKUP_VERSION` the script reads the API, exactly
+        as it always did."""
+        result = self.run_backup(LAKEHOUSE_DIR=str(self.deployment))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        backups = sorted((self.deployment / "backups").iterdir())
+        self.assertEqual(len(backups), 1, f"the backups are {backups}")
+        self.assertTrue(
+            backups[0].name.endswith("-0.2.0"),
+            f"the backup is not named after the API's version: {backups[0].name}",
+        )
 
     def test_the_manifest_of_the_set_lists_every_part(self) -> None:
         result = self.run_backup(LAKEHOUSE_DIR=str(self.deployment))

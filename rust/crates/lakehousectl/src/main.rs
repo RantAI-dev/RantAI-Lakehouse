@@ -31,17 +31,26 @@
 mod backup;
 mod cli;
 mod docker;
+mod env;
 mod error;
 mod files;
 mod http;
+mod images;
 mod install;
 mod manifest;
+mod pause;
 mod preflight;
 mod release;
+mod rollback;
+mod runner;
 mod secrets;
+mod self_update;
 mod state;
+mod status;
 mod sys;
+mod update;
 mod verify;
+mod version;
 
 use clap::Parser;
 
@@ -74,5 +83,9 @@ fn run(cli: Cli) -> Result<(), error::ToolError> {
         Command::Install(args) => install::command(&args),
         Command::Backup(args) => backup::command(&args),
         Command::Restore(args) => backup::command_restore(&args),
+        Command::Update(args) => update::command(&args),
+        Command::Rollback(args) => rollback::command(&args),
+        Command::Status(args) => status::command(&args),
+        Command::SelfUpdate => self_update::command(),
     }
 }

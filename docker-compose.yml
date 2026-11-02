@@ -806,9 +806,10 @@ services:
       args:
         RUST_API_URL: ${CONSOLE_API_URL:-http://lakehouse-api:8080}
     ports:
-      # The `dagster` profile's webserver wants 3000 as well
-      # (`DAGSTER_WEBSERVER_HOST_PORT`); set `CONSOLE_HOST_PORT` to
-      # another port when that profile is on.
+      # The console owns host port 3000. The `dagster` profile's
+      # webserver is published on the host's loopback only, at
+      # `DAGSTER_WEBSERVER_HOST_PORT` (3001 by default) — REL-2 S4b
+      # review round 4, D23 — so the two do not clash.
       - "${CONSOLE_HOST_PORT:-3000}:3000"
     depends_on:
       # The console is nothing without the API, and the API is nothing
@@ -2510,8 +2511,8 @@ services:
   # P3 (G3a) — webserver (GraphQL API + UI). `DAGSTER_URL` (see
   # `lakehouse-api::config::Config`) points at
   # `http://dagster-webserver:3000/graphql` from inside the compose
-  # network, `http://localhost:${DAGSTER_WEBSERVER_HOST_PORT}/graphql` from
-  # the host.
+  # network — the API and the jobs never leave that network, so nothing
+  # needs the UI published. See the `ports:` below for the host's side.
   dagster-webserver:
     profiles: ["dagster"]
     # Shared image with the other `./dagster` services; see the comment on
@@ -2547,7 +2548,16 @@ services:
       MAINTENANCE_PAUSED: ${MAINTENANCE_PAUSED:-}
     command: ["dagster-webserver", "-h", "0.0.0.0", "-p", "3000", "-w", "/opt/dagster/app/workspace.yaml"]
     ports:
-      - "${DAGSTER_WEBSERVER_HOST_PORT:-3000}:3000"
+      # REL-2 S4b review round 4, D23: the Dagster UI is published on the
+      # host's LOOPBACK only. It has no sign-in — anyone who can reach
+      # the port can launch runs — and nothing outside the compose network
+      # needs it: the API reaches the GraphQL API in-network, at
+      # `http://dagster-webserver:3000/graphql`. An operator reaches the
+      # UI through an SSH tunnel (`ssh -L 3001:127.0.0.1:3001 <host>`).
+      # The default is 3001, so the UI no longer clashes with the
+      # console's 3000 — the two used to publish the same host port and
+      # the stack did not start at all.
+      - "127.0.0.1:${DAGSTER_WEBSERVER_HOST_PORT:-3001}:3000"
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:3000/server_info"]
       interval: 5s
