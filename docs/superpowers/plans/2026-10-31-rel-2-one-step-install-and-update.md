@@ -3134,3 +3134,38 @@ unreachable under load before the handoff was written. The commits are all pushe
   names. Then run the module 50 times in a loop and quote the count.
 
 **Open: BLOCKER 2, SHOULD-FIX 3.**
+
+### Review S4b round 3 (planner, 2026-11-02, at `0267f79e`)
+
+- **BLOCKER 2 is fixed** (`e1a37beb`). `pause::clear_and_recreate` owns clearing the pause and
+  recreating the services, and all three paths use it. Five tests read `.env` at every call. Nine
+  tests failed with the fix reverted.
+- **SHOULD-FIX 3 is fixed** (`fe77e06c`). The fake tool is a committed executable fixture,
+  linked into the install, so the inode that runs is never written. 50 of 50 runs passed, against
+  49 of 50 before. `sh <script>` was rightly not used, because the shipped scripts are bash.
+- **BLOCKER 3 (found by the developer's handoff). A release install runs no Dagster.**
+  - `docker::compose_up` passes no `--profile`, and nothing sets `COMPOSE_PROFILES`. So an
+    installed stack starts only the default profile, while the 16 Dagster services carry
+    `profiles: ["dagster"]`.
+  - An installed Lakehouse therefore runs no pipelines: no upload loads, no connector runs, and
+    no maintenance jobs.
+  - The S3 install proof checks only `/health/ready` and the console, so it could not see this.
+  - It is a gap in the S3 and S4 plans, not in the code those plans asked for.
+
+  **Decision D22 (planner):**
+  - A release install runs the `dagster` profile.
+  - On a fresh install, `lakehousectl` writes `COMPOSE_PROFILES=dagster` into the install's
+    `.env`, and `update` adds it when an older install's `.env` has no `COMPOSE_PROFILES`.
+    Profiles an operator has set are kept as they are.
+  - The operator adds `trino` or `seaweedfs` there.
+  - `.env.example` is not changed, so a developer's default stays the same.
+
+  *Fix:*
+  - Implement it in `secrets.rs` and `update.rs` (or wherever the `.env` is written), with
+    tests.
+  - `install-proof` and `update-proof` assert that `dagster-daemon` and `dagster-code-location`
+    are running after the install, after the update, and after the rollback.
+  - `status` lists them.
+  - Cite `REL-2 S4b review round 3 BLOCKER 3` and D22.
+
+**Open: BLOCKER 3.**
