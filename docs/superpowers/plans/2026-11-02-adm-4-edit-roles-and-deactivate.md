@@ -162,3 +162,21 @@ Console, from the repository root:
   behind: `docker ps` before and after this session lists the same three pre-existing containers.
 
 ## 5. Review (planner appends below)
+
+### Review round 1 (planner, 2026-11-02, at `b08ce232`)
+
+- **D1/D2** (`a090f1b4`): set a user's roles, and take a user out of a tenant.
+- **D3/D4** (`e578347a`): deactivating sets `status` and calls `session::revoke_all_sessions_for_user_in_tx` in the same transaction. An inactive user is refused at local login with the same 401 as a wrong password, at session validation, and at OIDC sign-in, where they are not provisioned again. The principal load reads `status` too.
+  - `identity_deactivate.rs` covers login, an existing session, reactivation, self-deactivation, the last administrator, and the audit rows.
+  - `lakehouse-auth` `oidc` covers the OIDC refusal (28 tests).
+- **D5** (the guards) uses `active_unrestricted_user_ids_in_tx` inside the change's own transaction. A change that would leave no active `*:*` user gets 409.
+- **D6** (audit) and **D7** (console: role editor, tenant remover, a status switch behind a confirmation) are both done.
+- **AC14 note accepted.** Shown-but-disabled is how the existing reset action already behaves.
+- **Counts (the developer's):**
+  - `lakehouse-api` `--lib`: 2928;
+  - `route_auth`: 74, `identity_deactivate`: 9, `identity_roles`: 10, `identity_password`: 8, `identity_user_tenants`: 6, `login_throttle`: 8, `security_regressions`: 11;
+  - `lakehouse-store` `identity`: 25, `lakehouse-auth` `oidc`: 28;
+  - console `src/features/admin`: 56.
+  - The full `lakehouse-api` suite is left to CI.
+
+**Open: no BLOCKER, no SHOULD-FIX.** The `BACKLOG.md` row is the planner's step after the merge. The merge waits for the PR's CI.
