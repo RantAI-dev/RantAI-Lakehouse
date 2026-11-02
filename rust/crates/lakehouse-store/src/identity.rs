@@ -533,6 +533,42 @@ pub async fn remove_user_from_tenant_in_tx(
     Ok(removed > 0)
 }
 
+/// Set `user_id`'s `app_user.status` to `status` (`"active"` or
+/// `"inactive"`), inside the CALLER's transaction.
+///
+/// ADM-4 D3: switching a user off is a status change AND the end of every
+/// session that user holds — ONE unit of work, so a user can never be
+/// deactivated with a live session left behind. The caller therefore owns
+/// the transaction and writes the session revocations into it too
+/// (`lakehouse_auth::session::revoke_all_sessions_for_user_in_tx`).
+///
+/// The user's data, dashboards and audit history are NOT touched: only
+/// the status changes. Deactivation is the answer to "this person has
+/// left"; deleting the account would lose who authored what.
+///
+/// # Errors
+///
+/// Returns [`StoreError::NotFound`] if no such user exists, or
+/// [`StoreError::Database`] on any other failure. A `status` the schema
+/// does not allow is refused by `app_user_status_check` — a database
+/// error, not a silent write.
+pub async fn set_user_status_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    user_id: Uuid,
+    status: &str,
+) -> Result<(), StoreError> {
+    let affected = sqlx::query("UPDATE app_user SET status = $2, updated_at = now() WHERE id = $1")
+        .bind(user_id)
+        .bind(status)
+        .execute(&mut **tx)
+        .await?
+        .rows_affected();
+    if affected == 0 {
+        return Err(StoreError::NotFound);
+    }
+    Ok(())
+}
+
 /// The `app_user.status` of `id` — `"active"` or `"inactive"`, the two
 /// values `app_user_status_check` allows — or `None` when there is no such
 /// user.

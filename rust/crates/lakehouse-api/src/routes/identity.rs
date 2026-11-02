@@ -388,25 +388,31 @@ pub async fn reset_user_password(
         .into());
     }
 
+    // An unknown user is a 404, before anything is written.
+    if !identity::user_exists(pool, user_id).await? {
+        return Err(ApiError::NotFound("record not found".to_owned()).into());
+    }
+
     // The target's EFFECTIVE grants, read through the same repository
     // function every authenticated request's principal is built from — so
     // the escalation rule below judges the grants the target really has,
-    // not a re-implementation of them. An unknown user answers
-    // `AuthError::NotFound` -> 404 here, before anything is written.
-    let target = lakehouse_auth::repository::load_principal_for_user(
-        pool,
-        user_id,
-        "local".to_owned(),
-        false,
-    )
-    .await?;
+    // not a re-implementation of them.
+    //
+    // ADM-4 D4 changed WHICH reader this is: the principal loader now
+    // refuses an INACTIVE account (that is the point of D4 — an inactive
+    // account has no access on any path), and a password reset is not
+    // about access. The status-agnostic reader asks the question this
+    // route actually asks — "does this ACCOUNT hold the unrestricted
+    // grant?" — and answers it for a deactivated target too, so
+    // resetting the password of a deactivated user still works (and
+    // leaves them deactivated).
+    let target_holds_unrestricted =
+        lakehouse_auth::repository::user_holds_unrestricted(pool, user_id).await?;
 
     // ADM-3 D3: only an unrestricted caller may reset an unrestricted
     // user. The refusal is the SAME 404 an unknown user gets, body for
     // body, so a probe cannot tell the two apart.
-    if crate::routes::catalog::is_unrestricted(&target)
-        && !crate::routes::catalog::is_unrestricted(&principal)
-    {
+    if target_holds_unrestricted && !crate::routes::catalog::is_unrestricted(&principal) {
         return Err(ApiError::NotFound("record not found".to_owned()).into());
     }
 
@@ -724,9 +730,9 @@ pub async fn set_user_roles(
 
     // The roles the request names, and what they grant.
     let resolved = identity::resolve_roles_in_tx(&mut tx, &requested).await?;
-    let grants_unrestricted = resolved.iter().any(|role| {
-        lakehouse_auth::PermissionSet::parse(&role.permissions).grants_unrestricted()
-    });
+    let grants_unrestricted = resolved
+        .iter()
+        .any(|role| lakehouse_auth::PermissionSet::parse(&role.permissions).grants_unrestricted());
 
     // ADM-4 D5: only an unrestricted caller may GRANT a role that holds
     // `*:*`. The refusal is the same 404 as above, and it comes BEFORE
@@ -825,6 +831,201 @@ fn user_roles_set_audit_event(
             "oldRoles": old_roles,
             "newRoles": new_roles,
         })),
+        ..Default::default()
+    }
+}
+
+/// `POST /api/identity/users/{id}/deactivate` — switch a user off.
+/// Returns 200 with the updated [`User`], whose `status` is now
+/// `"inactive"`.
+///
+/// # What it does (ADM-4 D3)
+///
+/// Sets `app_user.status = 'inactive'` and ends **every session that
+/// user holds**, in ONE transaction. The user's data, dashboards and
+/// audit history stay exactly where they are: a deactivated person is
+/// not a deleted one.
+///
+/// The user's API tokens are revoked too — there are none: a personal
+/// API token is not a thing in this schema. `service_credential` (the
+/// token store) belongs to `service_identity`, and a service identity is
+/// a separate principal that no user-route touches.
+///
+/// # Who may (ADM-4 D5)
+///
+/// Only an unrestricted (`*:*`) caller may switch an unrestricted user
+/// off; anyone else gets the same 404 an unknown user gets, body for
+/// body. A caller may not switch THEMSELVES off (a 400: the caller is
+/// the target, so the answer is about the request, not about a missing
+/// record). A change that would leave no active user holding `*:*` is
+/// refused with a 409, in the same transaction as the change.
+///
+/// # Errors
+///
+/// 400 on a `{id}` that is not a UUID and on a self-deactivation; 404 for
+/// an unknown user and for a target the caller may not change (one body
+/// for both); 409 when the change would leave no active administrator;
+/// 503 if no pool is configured; 500 (classified) on a storage failure.
+/// One `identity.user.deactivate` audit event is written on success.
+pub async fn deactivate_user(
+    State(state): State<AppState>,
+    AuthenticatedPrincipal(principal): AuthenticatedPrincipal,
+    Path(id): Path<String>,
+) -> ApiResult<ApiJson<User>> {
+    change_user_status(
+        &state,
+        &principal,
+        &id,
+        "identity.user.deactivate",
+        "inactive",
+    )
+    .await
+}
+
+/// `POST /api/identity/users/{id}/reactivate` — switch a user back on.
+/// Returns 200 with the updated [`User`], whose `status` is now
+/// `"active"`.
+///
+/// The mirror of [`deactivate_user`], with the same guards: only an
+/// unrestricted caller may switch an unrestricted user back on (the same
+/// 404 an unknown user gets), and the change may not leave the
+/// deployment without an active administrator — which a reactivation
+/// never can, since it only ever adds one.
+///
+/// # Errors
+///
+/// 400 on a `{id}` that is not a UUID; 404 for an unknown user and for a
+/// target the caller may not change (one body for both); 409 when the
+/// change would leave no active administrator; 503 if no pool is
+/// configured; 500 (classified) on a storage failure. One
+/// `identity.user.reactivate` audit event is written on success.
+pub async fn reactivate_user(
+    State(state): State<AppState>,
+    AuthenticatedPrincipal(principal): AuthenticatedPrincipal,
+    Path(id): Path<String>,
+) -> ApiResult<ApiJson<User>> {
+    change_user_status(
+        &state,
+        &principal,
+        &id,
+        "identity.user.reactivate",
+        "active",
+    )
+    .await
+}
+
+/// Switch a user off (`"inactive"`) or back on (`"active"`): the status
+/// change, the end of the target's live sessions (when switching them
+/// off), the check that the deployment still has an administrator, and
+/// the audit row — one unit of work.
+///
+/// ADM-4 D3: deactivating ends EVERY session the user holds, in the same
+/// transaction as the status change. A deactivation that left the old
+/// sessions alive would not have switched the person off at all.
+///
+/// ADM-4 D5: only an unrestricted caller may switch an unrestricted user
+/// off or on — anyone else gets the same 404 an unknown user gets. A
+/// caller may not switch themselves off. A change that would leave no
+/// active user holding `*:*` is refused with a 409, in the same
+/// transaction as the change.
+async fn change_user_status(
+    state: &AppState,
+    principal: &Principal,
+    id: &str,
+    action: &str,
+    status: &str,
+) -> ApiResult<ApiJson<User>> {
+    let user_id = Uuid::parse_str(id)
+        .map_err(|_| ApiError::BadRequest("user id must be a UUID".to_owned()))?;
+    let pool = pool(state)?;
+
+    // ADM-4 D5: only an unrestricted caller may switch an unrestricted
+    // user off or on. The refusal is the SAME 404 an unknown user gets,
+    // body for body, so a probe cannot tell the two apart.
+    if lakehouse_auth::repository::user_holds_unrestricted(pool, user_id).await?
+        && !crate::routes::catalog::is_unrestricted(principal)
+    {
+        return Err(ApiError::NotFound("record not found".to_owned()).into());
+    }
+    // An unknown user is the same 404.
+    if !identity::user_exists(pool, user_id).await? {
+        return Err(ApiError::NotFound("record not found".to_owned()).into());
+    }
+
+    let deactivating = status == "inactive";
+
+    let mut tx = pool.begin().await.map_err(StoreError::from)?;
+    identity::set_user_status_in_tx(&mut tx, user_id, status).await?;
+    if deactivating {
+        // ADM-4 D3: every session the target holds ends NOW, in the same
+        // transaction as the status change.
+        session::revoke_all_sessions_for_user_in_tx(&mut tx, user_id).await?;
+    }
+
+    // ADM-4 D5: the change and the count that guards it are one unit of
+    // work. The count is read AFTER the change, inside the same
+    // transaction: an empty answer rolls the change back.
+    let administrators =
+        lakehouse_auth::repository::active_unrestricted_user_ids_in_tx(&mut tx).await?;
+    if administrators.is_empty() {
+        return Err(ApiError::Conflict(
+            "the change would leave no active administrator".to_owned(),
+        )
+        .into());
+    }
+
+    // ADM-4 D5: a caller may not deactivate themselves. The caller is
+    // the target here, so the answer is a 400 about the request — not a
+    // 404 (the target certainly exists) and not a 403 (the caller holds
+    // `identity:write`).
+    //
+    // It comes after the "would the deployment lose its administrator?"
+    // check above, because a caller who IS the last administrator is
+    // refused by THAT rule (a 409, naming the deployment as the reason)
+    // rather than by this one.
+    if deactivating
+        && let PrincipalId::User(caller_id) = principal.id
+        && caller_id == user_id
+    {
+        return Err(
+            ApiError::BadRequest("you may not deactivate your own account".to_owned()).into(),
+        );
+    }
+
+    tx.commit().await.map_err(StoreError::from)?;
+
+    let user = identity::get_user(pool, &user_id.to_string()).await?;
+
+    let audit_event = user_status_audit_event(principal, &user, action, status);
+    if let Err(err) = store_audit::insert(pool, audit_event).await {
+        tracing::warn!(
+            %err,
+            action = action,
+            user_id = %user_id,
+            "failed to record user-status audit event"
+        );
+    }
+
+    Ok(ApiJson(user))
+}
+
+/// Build the `NewAuditEvent` for a status change — the actor, the
+/// target, and the status it moved to.
+fn user_status_audit_event(
+    principal: &Principal,
+    user: &User,
+    action: &str,
+    status: &str,
+) -> NewAuditEvent {
+    NewAuditEvent {
+        action: action.to_owned(),
+        resource_kind: Some("user".to_owned()),
+        resource_id: Some(user.id.clone()),
+        principal_id: Some(principal.id.uuid().to_string()),
+        principal_kind: Some(principal.kind_for_audit().to_owned()),
+        actor_label: Some(principal.display_name.clone()),
+        outcome: "executed".to_owned(),
+        args: Some(serde_json::json!({ "status": status })),
         ..Default::default()
     }
 }

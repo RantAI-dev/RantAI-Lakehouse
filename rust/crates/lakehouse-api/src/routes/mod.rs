@@ -1060,6 +1060,16 @@ fn identity_router() -> Router<AppState> {
             "/api/identity/users/{id}/roles",
             axum::routing::put(identity::set_user_roles),
         )
+        // ADM-4 D3: switch a user off, and back on again. Both take no
+        // body; `{id}` is validated inside the handler.
+        .route(
+            "/api/identity/users/{id}/deactivate",
+            axum::routing::post(identity::deactivate_user),
+        )
+        .route(
+            "/api/identity/users/{id}/reactivate",
+            axum::routing::post(identity::reactivate_user),
+        )
         // ADM-3 D2: hand an existing user a new temporary password. The
         // password is generated server-side and returned once; `{id}` is
         // validated inside the handler (400 when malformed, 404 when

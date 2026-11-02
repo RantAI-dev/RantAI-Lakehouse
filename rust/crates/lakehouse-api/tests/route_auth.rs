@@ -3550,10 +3550,10 @@ async fn the_door_needs_the_iceberg_read_scope_and_a_service_identity() {
     }
 }
 
-/// ADM-4 T1: the two new identity write routes are in `POLICY_TABLE` as
-/// `identity:write`, and the gate agrees both ways: no session is 401, a
-/// principal without `identity:write` is 403, and one holding it gets past
-/// the gate (what follows is the handler's own answer — 400 for the
+/// ADM-4 T1/T2: the four new identity write routes are in `POLICY_TABLE`
+/// as `identity:write`, and the gate agrees both ways: no session is 401,
+/// a principal without `identity:write` is 403, and one holding it gets
+/// past the gate (what follows is the handler's own answer — 400 for the
 /// concretized ids used here — never 401 or 403).
 #[tokio::test]
 async fn the_adm_4_identity_write_routes_are_gated_in_both_directions() {
@@ -3561,6 +3561,8 @@ async fn the_adm_4_identity_write_routes_are_gated_in_both_directions() {
     for (method, path) in [
         ("PUT", "/api/identity/users/{id}/roles"),
         ("DELETE", "/api/identity/users/{id}/tenants/{tenant_id}"),
+        ("POST", "/api/identity/users/{id}/deactivate"),
+        ("POST", "/api/identity/users/{id}/reactivate"),
     ] {
         assert_eq!(
             POLICY_TABLE

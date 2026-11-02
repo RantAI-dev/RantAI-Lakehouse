@@ -60,22 +60,26 @@ mod identity {
         let response = app
             .router
             .clone()
-            .oneshot(
-                builder
-                    .body(Body::from(payload))
-                    .expect("build request"),
-            )
+            .oneshot(builder.body(Body::from(payload)).expect("build request"))
             .await
             .expect("router never fails a request outright");
         let status = response.status();
         let bytes = to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("read body");
-        (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
     }
 
     /// `PUT /api/identity/users/{id}/roles` with the given role names.
-    async fn set_roles(app: &TestApp, cookie: &str, user: Uuid, roles: &[&str]) -> (StatusCode, Value) {
+    async fn set_roles(
+        app: &TestApp,
+        cookie: &str,
+        user: Uuid,
+        roles: &[&str],
+    ) -> (StatusCode, Value) {
         request(
             app,
             "PUT",
@@ -298,14 +302,12 @@ mod identity {
         let admin = create_principal_with_permissions(&app.pool, "*:*").await;
         let admin_cookie = session_cookie_for_user(&app.pool, admin).await;
         let target = create_principal_with_permissions(&app.pool, "query:read").await;
-        sqlx::query(
-            "INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2)",
-        )
-        .bind(target)
-        .bind(uuid::Uuid::parse_str(MERIDIAN_GROUP).unwrap())
-        .execute(&app.pool)
-        .await
-        .expect("put the target in a tenant first");
+        sqlx::query("INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2)")
+            .bind(target)
+            .bind(uuid::Uuid::parse_str(MERIDIAN_GROUP).unwrap())
+            .execute(&app.pool)
+            .await
+            .expect("put the target in a tenant first");
 
         let (status, body) = remove_from_tenant(&app, &admin_cookie, target, MERIDIAN_GROUP).await;
         assert_eq!(status, StatusCode::OK, "{body}");
@@ -369,13 +371,7 @@ mod identity {
 
         let (status, body) = set_roles(&app, &admin_cookie, target, &["Analyst"]).await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        let (status, body) = remove_from_tenant(
-            &app,
-            &admin_cookie,
-            target,
-            MERIDIAN_RETAIL,
-        )
-        .await;
+        let (status, body) = remove_from_tenant(&app, &admin_cookie, target, MERIDIAN_RETAIL).await;
         assert_eq!(status, StatusCode::OK, "{body}");
 
         let rows: Vec<AuditRow> = sqlx::query_as(

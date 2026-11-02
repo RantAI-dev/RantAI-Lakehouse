@@ -54,6 +54,25 @@ pub use lakehouse_store::PgPool;
 /// "Access grants" section below), and collects every tenant the user
 /// belongs to.
 ///
+/// # An inactive account has no access, on every path (ADM-4 D4)
+///
+/// `app_user.status` is `'active'` or `'inactive'`, and an inactive
+/// account is refused HERE — the one place every human principal is
+/// built. A local password sign-in, a browser session, and an OIDC
+/// sign-in all end in this function, so refusing here refuses all three
+/// at once, and no later path can forget to check.
+///
+/// The refusal is [`AuthError::NotFound`], the same answer an account
+/// that does not exist gets: "this account cannot act" and "there is no
+/// such account" must not be distinguishable, or the status column
+/// becomes an enumeration oracle (see [`crate::error`]'s non-enumeration
+/// rule).
+///
+/// The question "does this ACCOUNT hold the unrestricted grant?" is a
+/// different one — it is asked about accounts that may not act at all,
+/// and it is answered by [`user_holds_unrestricted`], which has no status
+/// check.
+///
 /// # Access grants (WS7 item E4) widen `permissions`, never `role_names`
 ///
 /// An approved [`lakehouse_store::agents::AccessGrant`] (WS7 item E3) adds
@@ -87,13 +106,29 @@ pub async fn load_principal_for_user(
     provider: String,
     must_change_password: bool,
 ) -> Result<Principal, AuthError> {
-    let name: Option<(String,)> = sqlx::query_as("SELECT name FROM app_user WHERE id = $1")
-        .bind(user_id)
-        .fetch_optional(pool)
-        .await?;
-    let Some((display_name,)) = name else {
+    let row: Option<(String, String)> =
+        sqlx::query_as("SELECT name, status FROM app_user WHERE id = $1")
+            .bind(user_id)
+            .fetch_optional(pool)
+            .await?;
+    let Some((display_name, status)) = row else {
         return Err(AuthError::NotFound);
     };
+
+    // ADM-4 D4: an inactive account has NO access, on EVERY path. This
+    // is the one place every authenticated principal is built — a local
+    // password login, a browser session, an OIDC sign-in — so refusing
+    // here refuses all of them at once, and no later path can forget to
+    // check.
+    //
+    // The refusal is `NotFound`, the same answer an account that does not
+    // exist gets: "this account cannot act" and "there is no such
+    // account" must not be distinguishable, or the status column becomes
+    // an enumeration oracle (see [`crate::error`]'s non-enumeration
+    // rule).
+    if status != "active" {
+        return Err(AuthError::NotFound);
+    }
 
     let (permissions, role_names) = load_user_permissions(pool, user_id).await?;
 
