@@ -51,6 +51,7 @@ use lakehouse_auth::PermissionSet;
 use lakehouse_store::PgPool;
 use lakehouse_store::agents::{self as store_agents, NewApprovalRequest};
 use serde_json::{Map, Value, json};
+use uuid::Uuid;
 
 use super::registry::{Risk, ToolSpec};
 
@@ -213,6 +214,15 @@ const WRITE_HIGH_RISK: &str =
 /// is returned and NOTHING is created — there is nowhere durable to put an
 /// approval a human could later see and act on, so silently allowing the
 /// call through would be worse than refusing it.
+///
+/// `requested_by` is the human who ASKED for the call, when a person did
+/// (`SEC-57`): the signed-in principal's `app_user.id` for the chat loop
+/// and `POST /api/ai/tool`. It is written to
+/// `approval_item.requested_by_user_id` so the API can refuse the requester
+/// deciding their own request (`routes::agents::refuse_own_request`).
+/// `None` when no human asked — a service identity, or a call with no
+/// principal at all. The column's foreign key points at `app_user`, so a
+/// service identity's id must never be written there.
 pub async fn create_write_high_approval(
     pg: Option<&PgPool>,
     actor: &str,
@@ -220,6 +230,7 @@ pub async fn create_write_high_approval(
     raw_args: &Map<String, Value>,
     redacted_args: &Value,
     resource_id: Option<&str>,
+    requested_by: Option<Uuid>,
 ) -> Value {
     let Some(pool) = pg else {
         return json!({
@@ -236,6 +247,7 @@ pub async fn create_write_high_approval(
         reason: &reason,
         risk: WRITE_HIGH_RISK,
         redacted_args,
+        requested_by,
     };
     match store_agents::create_pending_approval(pool, req).await {
         Ok(created) => json!({

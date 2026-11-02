@@ -223,6 +223,11 @@ function StepBody({ step }: { step: ToolStep }) {
     return (
       <div className="mt-1 space-y-2 rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1.5 text-[11px]">
         <p className="text-foreground">{String(res.summary ?? "This action requires approval.")}</p>
+        {/* SEC-57: the person who asked for the action may not approve it
+            themselves, so the card says who has to. */}
+        <p className="text-muted-foreground">
+          Someone else with approval rights must approve it.
+        </p>
         <Link
           href={approvalId ? `/agents/approvals?id=${encodeURIComponent(approvalId)}` : "/agents/approvals"}
           className="inline-flex items-center gap-1 font-medium text-amber-700 underline underline-offset-2 dark:text-amber-400"
