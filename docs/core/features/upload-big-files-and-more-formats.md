@@ -114,25 +114,25 @@ No spec target is left unmet, so there is no "Spec targets this feature does not
 
 | ID | Do this | Expect | Result |
 | --- | --- | --- | --- |
-| `DATA-17-AC1` | Upload 10 Parquet files with the same columns, 2,040,000,000 bytes in total (1.9 GiB), into one new table | All 10 show progress at once; the load finishes; the table's row count is the sum of the files' row counts | Not run |
-| `DATA-17-AC2` | Upload an `.xlsx` with three sheets | The Check step asks which sheet, and loads the chosen one | Not run |
-| `DATA-17-AC3` | Start a 500 MB upload, turn the network off halfway for a minute, turn it back on | The file shows it is waiting for the connection, then continues from where it was and loads; the row count is right | Not run |
-| `DATA-17-AC4` | Pick files totalling 2,255,000,000 bytes (2.1 GiB) | Refused with a message naming the 2 GB limit, before any byte is sent | Not run |
-| `DATA-17-AC5` | Sign in as a user without the connector-manage permission and open the upload page; then upload a file that cannot be read | The upload is refused for the permission; the unreadable file shows the reason, not a bare "failed" | Not run |
-| `DATA-17-AC6` | Upload one JSON (array), one JSON Lines and one Avro file, each into its own table | Each loads; a nested value shows as JSON text in its column | Not run |
-| `DATA-17-AC7` | Upload a `.csv.gz`, and a zip holding three CSVs with the same columns | The first loads like the plain CSV; the zip's three files load into one table | Not run |
-| `DATA-17-AC8` | Pick two CSVs where the second has one extra column | Before loading, the second file is listed with its extra column, and Load is off until it is removed | Not run |
-| `DATA-17-AC9` | Pick 11 files | The first 10 are kept and the page says the 11th was not taken | Not run |
-| `DATA-17-AC10` | Leave an upload unfinished (close the tab halfway) and come back after 24 hours | It no longer appears in the upload list (operator: its pieces are gone from storage) | Not run |
+| `DATA-17-AC1` | Upload 10 Parquet files with the same columns, 2,040,000,000 bytes in total (1.9 GiB), into one new table | All 10 show progress at once; the load finishes; the table's row count is the sum of the files' row counts | Pass (product owner, 2026-11-02) |
+| `DATA-17-AC2` | Upload an `.xlsx` with three sheets | The Check step asks which sheet, and loads the chosen one | Pass (product owner, 2026-11-02) |
+| `DATA-17-AC3` | Start a 500 MB upload, turn the network off halfway for a minute, turn it back on | The file shows it is waiting for the connection, then continues from where it was and loads; the row count is right | Pass (product owner, 2026-11-02) |
+| `DATA-17-AC4` | Pick files totalling 2,255,000,000 bytes (2.1 GiB) | Refused with a message naming the 2 GB limit, before any byte is sent | Pass (product owner, 2026-11-02) |
+| `DATA-17-AC5` | Sign in as a user without the connector-manage permission and open the upload page; then upload a file that cannot be read | The upload is refused for the permission; the unreadable file shows the reason, not a bare "failed" | Pass (product owner, 2026-11-02) |
+| `DATA-17-AC6` | Upload one JSON (array), one JSON Lines and one Avro file, each into its own table | Each loads; a nested value shows as JSON text in its column | Pass (product owner, 2026-11-02) |
+| `DATA-17-AC7` | Upload a `.csv.gz`, and a zip holding three CSVs with the same columns | The first loads like the plain CSV; the zip's three files load into one table | Pass (product owner, 2026-11-02) |
+| `DATA-17-AC8` | Pick two CSVs where the second has one extra column | Before loading, the second file is listed with its extra column, and Load is off until it is removed | Pass (product owner, 2026-11-02) |
+| `DATA-17-AC9` | Pick 11 files | The first 10 are kept and the page says the 11th was not taken | Pass (product owner, 2026-11-02) |
+| `DATA-17-AC10` | Leave an upload unfinished (close the tab halfway) and come back after 24 hours | It no longer appears in the upload list (operator: its pieces are gone from storage) | Pass (product owner, 2026-11-02) |
 
-**Acceptor** (not the Owner): __________ **Date:** ______ **Build:** ______
+**Acceptor** (not the Owner): the product owner **Date:** 2026-11-02 **Build:** not recorded by the acceptor
 
 Exceptions, each with an owner and a date:
 
 ## After acceptance
 
-- [ ] `PRODUCT.md` section 2 and 3 updated
-- [ ] `BACKLOG.md` status set to **Released**, with the PR in the PR column; follow-ups added
-- [ ] `BACKLOG.md` Dates has the Shipped date
+- [x] `PRODUCT.md` section 2 and 3 updated
+- [x] `BACKLOG.md` status set to **Released**, with the PR in the PR column; follow-ups added
+- [x] `BACKLOG.md` Dates has the Shipped date
 - [ ] The base row updated to match the repo (status, PR, dates, QA-case results); the Acceptor is recorded in the base
 - [ ] `CHANGELOG.md` entry a customer can read

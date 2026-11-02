@@ -38,9 +38,11 @@ any of them can still be changed before the part that implements it merges.
 
 ## Acceptance checklist (product owner, on a running console)
 
-- [ ] Every Target row of the spec works as written
-- [ ] Re-pointing the seeded connector without new credentials returns 409
-- [ ] With new credentials in the same step, the change is saved and the test runs against the new place
-- [ ] Editing a connector's host in the console asks for the credentials again
-- [ ] A test against a server that asks for clear-text password authentication never sends the password
-- [ ] A user without the permission is refused
+- [x] Every Target row of the spec works as written
+- [x] Re-pointing the seeded connector without new credentials returns 409
+- [x] With new credentials in the same step, the change is saved and the test runs against the new place
+- [x] Editing a connector's host in the console asks for the credentials again
+- [x] A test against a server that asks for clear-text password authentication never sends the password
+- [x] A user without the permission is refused
+
+Accepted by the product owner on 2026-11-02 (build not recorded by the acceptor).
