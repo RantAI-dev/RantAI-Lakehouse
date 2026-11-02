@@ -805,9 +805,21 @@ impl StateSource for ApiStateSource<'_> {
 /// whoever the rule targets, so no rule author's or caller's own grants
 /// apply to what the recipient sees. A refusal is the engine's fixed,
 /// non-leaking message.
+///
+/// `SEC-50` slice 2 T7 (M1): the TENANT gate runs first, through the same
+/// [`crate::routes::query::StatementGate`] every other slice-2 site asks —
+/// an alert is one more way to read the shared catalog, and it must not
+/// read it from a tenant that may not (`SEC-20`). The actor is the one
+/// `SEC-50` names for the path that built this gate: the deployment's
+/// catalog tenant for `/api/alerts/run` (D3), the calling person for the
+/// assistant's `run_alert_rule` (M6, R4).
+///
+/// The state, not a `pg`/`ch` pair: the gate needs the pool
+/// (`CATALOG_TENANT_ID`, the tenant count) as well as the engine, and
+/// `SEC-50` slice 2 M1 is exactly that the sites carry the whole state.
 pub(in crate::routes) struct ApiSqlGate<'a> {
-    pub(in crate::routes) pg: Option<&'a PgPool>,
-    pub(in crate::routes) ch: &'a lakehouse_clickhouse::ChClient,
+    pub(in crate::routes) state: &'a AppState,
+    pub(in crate::routes) actor: crate::routes::query::GateActor<'a>,
 }
 
 /// Plan 1f: [`LateSource`] backed by Postgres (for the SLA row) and a
@@ -865,7 +877,21 @@ impl LateSource for ApiLateSource<'_> {
 #[async_trait::async_trait]
 impl SqlGate for ApiSqlGate<'_> {
     async fn gate(&self, sql: &str) -> Result<String, String> {
-        let obligations = crate::policy_engine::PolicyEngineObligations::new(self.pg, self.ch);
+        // `SEC-50` slice 2 T7 (M1/M2): the tenant gate first, before the
+        // rewrite and before the engine. A refusal keeps the gate's own
+        // fixed sentence (never upstream text, `AGENTS.md` principle 4) as
+        // the `Err`, which the alerts crate records as the rule's failed
+        // check (`lakehouse-alerts` `lib.rs`, `run_one` → `settle`) and
+        // then goes on with the next rule — one tenant's refusal must not
+        // stop the deployment's other rules.
+        crate::routes::query::StatementGate::clickhouse(self.state, self.actor)
+            .check(sql)
+            .await
+            .map_err(|err| err.to_string())?;
+        let obligations = crate::policy_engine::PolicyEngineObligations::new(
+            self.state.pg.as_deref(),
+            &self.state.clickhouse,
+        );
         crate::policy_engine::rewrite_sql_for_roles(
             sql,
             &sqlparser::dialect::ClickHouseDialect {},
@@ -881,9 +907,13 @@ impl SqlGate for ApiSqlGate<'_> {
     async fn board_restricted(&self, board_id: &str) -> bool {
         // BI-19 B1 review R6: fail closed, a store that cannot answer counts as
         // restricted (the digest is skipped, not sent).
-        crate::routes::dashboard_access::board_is_restricted(self.pg, self.ch, board_id)
-            .await
-            .unwrap_or(true)
+        crate::routes::dashboard_access::board_is_restricted(
+            self.state.pg.as_deref(),
+            &self.state.clickhouse,
+            board_id,
+        )
+        .await
+        .unwrap_or(true)
     }
 }
 
@@ -1155,8 +1185,11 @@ pub async fn run(
     let silence_source = state.pg.as_deref().map(|pg| ApiSilenceSource { pg });
     let state_source = state.pg.as_deref().map(|pg| ApiStateSource { pg });
     let gate = ApiSqlGate {
-        pg: state.pg.as_deref(),
-        ch: &state.clickhouse,
+        // `SEC-50` slice 2 T7 (D3): this route is the scheduled run — a run
+        // token or a service identity (`check_run_token`), never a person's
+        // browser session — so it acts as the deployment's catalog tenant.
+        state: &state,
+        actor: crate::routes::query::GateActor::CatalogTenant,
     };
 
     let mut results = lakehouse_alerts::run_rules(
@@ -1684,6 +1717,15 @@ mod tests {
             let mut env = HashMap::new();
             env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
             env.insert("CH_URL".to_owned(), ch_url.to_owned());
+            // `SEC-50` slice 2 M11: the rule reads the shared catalog, so the
+            // deployment must have a tenant that owns it — the seeded one this
+            // test's rule reads `serving.route_test_mart` through. Without it,
+            // D6 refuses the rule (several tenants, no `CATALOG_TENANT_ID`) and
+            // the test would be about the gate instead of the silence.
+            env.insert(
+                "CATALOG_TENANT_ID".to_owned(),
+                "11111111-1111-4111-8111-000000000001".to_owned(),
+            );
             let config = Config::from_map(&env).expect("a valid test Config");
             AppState::new(config)
         }
@@ -2202,14 +2244,55 @@ mod sql_gate_enforcement {
 
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+    use std::collections::HashMap;
+
     use lakehouse_alerts::SqlGate;
-    use lakehouse_clickhouse::ChClient;
     use lakehouse_store::PgPool;
     use lakehouse_store::governance::{self, CreatePolicyInput};
     use wiremock::matchers::{body_string_contains, method};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::ApiSqlGate;
+
+    /// The tenant that owns the shared catalog in these tests — the first
+    /// one `0002_seed_identity.sql` creates (`SEC-50` slice 2 M11).
+    pub(super) const CATALOG_TENANT: &str = "11111111-1111-4111-8111-000000000001";
+
+    /// An [`AppState`] with `pool` as its Postgres and a `ClickHouse` at
+    /// `ch_url`, built through `Config` (the production path), naming the
+    /// catalog's own tenant so the shared catalog has one (`SEC-50` slice 2
+    /// D2/M11) — without it every `serving.*` statement is refused
+    /// (`CATALOG_TENANT_ID` names the tenant that owns the shared catalog).
+    pub(super) fn state_for(pool: &PgPool, ch_url: &str) -> super::AppState {
+        state_for_with(pool, ch_url, Some(CATALOG_TENANT))
+    }
+
+    /// The same state, with `CATALOG_TENANT_ID` set only when
+    /// `catalog_tenant` names one — a deployment with several tenants and no
+    /// catalog tenant is its own case (`SEC-50` D6).
+    pub(super) fn state_for_with(
+        pool: &PgPool,
+        ch_url: &str,
+        catalog_tenant: Option<&str>,
+    ) -> super::AppState {
+        let options = pool.connect_options();
+        let url = format!(
+            "postgres://{}:postgres@{}:{}/{}",
+            options.get_username(),
+            options.get_host(),
+            options.get_port(),
+            options
+                .get_database()
+                .expect("#[sqlx::test] always targets a named database"),
+        );
+        let mut env = HashMap::new();
+        env.insert("DATABASE_URL".to_owned(), url);
+        env.insert("CH_URL".to_owned(), ch_url.to_owned());
+        if let Some(tenant) = catalog_tenant {
+            env.insert("CATALOG_TENANT_ID".to_owned(), tenant.to_owned());
+        }
+        super::AppState::new(super::Config::from_map(&env).expect("a valid test Config"))
+    }
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn a_digest_or_alert_statement_is_masked_for_the_dashboard_viewer_role(
@@ -2250,10 +2333,11 @@ mod sql_gate_enforcement {
             })))
             .mount(&server)
             .await;
-        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let state = state_for(&pool, &server.uri());
         let gate = ApiSqlGate {
-            pg: Some(&pool),
-            ch: &ch,
+            // `SEC-50` slice 2 T7: the run route acts as the catalog tenant.
+            state: &state,
+            actor: crate::routes::query::GateActor::CatalogTenant,
         };
 
         let governed = gate
@@ -2273,10 +2357,10 @@ mod sql_gate_enforcement {
         pool: PgPool,
     ) -> sqlx::Result<()> {
         let server = MockServer::start().await;
-        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let state = state_for(&pool, &server.uri());
         let gate = ApiSqlGate {
-            pg: Some(&pool),
-            ch: &ch,
+            state: &state,
+            actor: crate::routes::query::GateActor::CatalogTenant,
         };
 
         let err = gate
@@ -2286,6 +2370,184 @@ mod sql_gate_enforcement {
 
         assert!(!err.contains("example.com"), "{err}");
         assert!(server.received_requests().await.unwrap().is_empty());
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod alert_run_tenant_scope {
+    //! `SEC-50` slice 2 T7: the scheduled run asks the tenant gate before it
+    //! reads anything (`SEC-20`), as the deployment's catalog tenant (D3).
+    //!
+    //! A deployment with several tenants and no `CATALOG_TENANT_ID` has no
+    //! tenant whose reach covers the shared catalog, so a mart rule's
+    //! statement is refused with D6's sentence — and the run goes on with
+    //! the next rule instead of aborting (`lakehouse-alerts`
+    //! `lib.rs`, `run_one`). With the setting set, the same rule reads its
+    //! value.
+    //!
+    //! Two rules, one `ClickHouse` mock that records every statement: the
+    //! refusal is proven BOTH by the sentence and by the engine never being
+    //! asked for `serving.*`.
+
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use uuid::Uuid;
+    use wiremock::matchers::{body_string_contains, method};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::sql_gate_enforcement::{state_for, state_for_with};
+    use super::*;
+    use crate::routes::query::JOB_NEEDS_CATALOG_TENANT;
+
+    /// The cron that calls `/api/alerts/run` (the run-token guard lets a
+    /// service identity through with no token configured).
+    fn cron() -> Principal {
+        Principal {
+            id: PrincipalId::Service(Uuid::nil()),
+            tenant_ids: Vec::new(),
+            display_name: "alerts-cron".to_owned(),
+            permissions: lakehouse_auth::PermissionSet::default(),
+            provider: "service".to_owned(),
+            must_change_password: false,
+            role_names: Vec::new(),
+        }
+    }
+
+    /// One enabled mart rule, in the shape `row_to_rule` reads.
+    fn rule_row(id: &str, mart: &str) -> Value {
+        json!({
+            "id": id,
+            "name": id,
+            "type": "alert",
+            "mart": mart,
+            "measure": "v",
+            "agg": "sum",
+            "op": ">",
+            "threshold": "10",
+            "board": "",
+            // No `SMTP_HOST` in the test config: the delivery attempt is
+            // refused locally ("email not configured"), never dialled. The
+            // value and the threshold decision are what these tests assert.
+            "channel": "email",
+            "target": "ops@example.com",
+            "enabled": "1",
+            "created_at": "",
+            "severity": "high",
+        })
+    }
+
+    /// A `ClickHouse` serving both rules and a value far over their
+    /// threshold, recording every statement it is sent.
+    async fn engine_for(mart_value: &str) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("FROM console.alert_rule"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "meta": [],
+                "data": [rule_row("al-tenant-scope-1", "mart_a"),
+                         rule_row("al-tenant-scope-2", "mart_b")],
+                "rows": 2,
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("FROM serving."))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "meta": [], "data": [{ "v": mart_value }], "rows": 1
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// The statements the engine was sent that read a mart.
+    async fn mart_statements(server: &MockServer) -> Vec<String> {
+        server
+            .received_requests()
+            .await
+            .expect("mock records requests")
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .filter(|sql| sql.contains("FROM serving."))
+            .collect()
+    }
+
+    /// `SEC-50` slice 2 T7 (D3/D6): several tenants and no catalog tenant —
+    /// every mart rule's check is failed with D6's sentence, the run goes on
+    /// to the next rule, and the engine is never asked for a `serving.*`
+    /// row.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn every_mart_rule_is_refused_with_d6_and_the_next_rule_still_runs(
+        pool: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        let server = engine_for("999").await;
+        // The catalog's tenant is NOT named, and the seeded deployment holds
+        // four tenants: no tenant's reach covers the shared catalog.
+        let state = state_for_with(&pool, &server.uri(), None);
+
+        let response = run(
+            State(state),
+            HeaderMap::new(),
+            Query(RunQuery {
+                id: None,
+                token: None,
+            }),
+            Some(Extension(cron())),
+        )
+        .await
+        .expect("a service identity passes the run-token guard");
+
+        let results = response.0["results"].as_array().expect("a list").clone();
+        assert_eq!(results.len(), 2, "both rules were evaluated: {results:?}");
+        for result in &results {
+            assert_eq!(
+                result["skipped"], JOB_NEEDS_CATALOG_TENANT,
+                "the refusal is D6's own sentence: {result}"
+            );
+            assert_eq!(result["fired"], false, "{result}");
+        }
+        assert!(
+            mart_statements(&server).await.is_empty(),
+            "the refusal precedes the engine: no mart may be read"
+        );
+        Ok(())
+    }
+
+    /// `SEC-50` slice 2 T7 (D3): with the catalog's tenant named, the same
+    /// rule reads its value from the shared catalog.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_named_catalog_tenant_reads_the_mart(pool: sqlx::PgPool) -> sqlx::Result<()> {
+        let server = engine_for("999").await;
+        let state = state_for(&pool, &server.uri());
+
+        let response = run(
+            State(state),
+            HeaderMap::new(),
+            Query(RunQuery {
+                id: Some("al-tenant-scope-1".to_owned()),
+                token: None,
+            }),
+            Some(Extension(cron())),
+        )
+        .await
+        .expect("a service identity passes the run-token guard");
+
+        let result = &response.0["results"][0];
+        assert!(
+            result.get("skipped").is_none(),
+            "the catalog's tenant reads the shared catalog: {result}"
+        );
+        assert_eq!(result["value"], 999.0, "{result}");
+        assert_eq!(
+            mart_statements(&server).await.len(),
+            1,
+            "exactly the one rule's statement reached the engine"
+        );
         Ok(())
     }
 }
